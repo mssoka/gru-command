@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { lstatSync, readFileSync } from 'node:fs';
+import { repositoryGitEnv } from './artifacts.js';
 import type { CanonicalReviewVerdict, VerifiedFinding } from './types.js';
 
 /**
@@ -320,7 +321,7 @@ export function deltaSince(repoPath: string, fromSha: string, toSha: string): De
   let diff: string;
   try {
     diff = execFileSync('git', ['-C', repoPath, 'diff', '--no-ext-diff', '--no-color', '--unified=3', fromSha, toSha, '--'], {
-      encoding: 'utf8', maxBuffer: 128 * 1024 * 1024, timeout: GIT_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'],
+      encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 128 * 1024 * 1024, timeout: GIT_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'],
     });
   } catch (error) {
     throw new Error(`delta since ${fromSha.slice(0, 12)} could not be read: ${String(error)}`);

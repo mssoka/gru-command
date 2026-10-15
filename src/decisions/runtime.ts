@@ -18,6 +18,7 @@ import { KEYLESS_CREDENTIAL, validateProviderProfile } from './profile.js';
 import { assertEnforceGate, EnforceGateError } from './enforce.js';
 import { deterministicOutcome, DeterministicDecisionService } from './service.js';
 import { buildShadowRecord, type ShadowRecorder } from './shadow.js';
+import { DECISION_SURFACE_EVENT_TRIAGE, DECISION_SURFACE_SUPERVISION } from './questions.js';
 import type {
   DecisionFailureReason,
   DecisionOutcome,
@@ -30,6 +31,28 @@ import type {
 } from './types.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
+
+/** Provider failures that heal on their own (a slow or briefly unreachable
+ * provider), as opposed to credential/auth/config/schema faults a human
+ * must fix. */
+const TRANSIENT_REASONS: ReadonlySet<DecisionFailureReason> = new Set<DecisionFailureReason>([
+  'timeout',
+  'network_error',
+  'provider_degraded',
+]);
+
+/** Consecutive transient default-profile shadow misses before the runtime
+ * degrades. A single slow shadow ask is evidence, not an incident: on
+ * 2026-10-06 one 2 s timeout on a fire-and-forget escalation-triage ask
+ * paged the owner and stopped all shadow collection. */
+export const SHADOW_MISS_DEGRADE_THRESHOLD = 3;
+
+/** Bounded recovery after a transient degradation: automatic rechecks at
+ * base x these factors (default base 60 s: 1, 5, 15 and 60 min), then a
+ * human Recheck or a config change. Each recheck is one tiny probe; there
+ * is no unbounded retry/poll/spend loop. */
+export const TRANSIENT_RECHECK_FACTORS: readonly number[] = [1, 5, 15, 60];
+const DEFAULT_TRANSIENT_RECHECK_BASE_MS = 60_000;
 
 export type DecisionHealthState = 'disabled' | 'checking' | 'ready' | 'degraded';
 
@@ -56,8 +79,9 @@ export interface DecisionRuntimeOptions {
   readonly fetchImpl?: typeof globalThis.fetch;
   readonly watchConfig?: boolean;
   readonly loadConfig?: (env: NodeJS.ProcessEnv, home: string) => GruCommandConfig;
-  /** Test seam: delay before the one bounded automatic recheck after a
-   * transient degradation (default 5000 ms). */
+  /** Base delay of the bounded automatic rechecks after a transient
+   * degradation; attempt k waits base x TRANSIENT_RECHECK_FACTORS[k]
+   * (default 60000 ms: 1, 5, 15, 60 min). Test seam. */
   readonly transientRecoveryMs?: number;
   /** Durable/status-bus projection; failures are isolated from routing. */
   readonly onStatusChange?: (status: DecisionRuntimeStatus) => void;
@@ -190,18 +214,27 @@ export class DecisionRuntime implements DecisionService {
   private eventWatcher: FSWatcher | null = null;
   private recheckInFlight: Promise<DecisionRuntimeStatus> | null = null;
   private recheckTrailing = false;
-  /** One bounded automatic recheck per transient degradation incident; a
-   * still-down provider then waits for a human recheck or a config change
-   * (no unbounded retry/poll/spend loop). Re-armed by every ready/disable. */
+  /** Bounded automatic rechecks per transient degradation incident
+   * (TRANSIENT_RECHECK_FACTORS); a still-down provider then waits for a
+   * human recheck or a config change (no unbounded retry/poll/spend loop).
+   * Reset by every ready/disable. */
   private transientRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
-  private autoRecheckArmed = true;
+  private autoRechecksUsed = 0;
+  /** Consecutive transient default-profile shadow misses (reset on any
+   * successful shadow ask and on every ready/disable). */
+  private shadowMisses = 0;
   private currentStatus: DecisionRuntimeStatus;
 
   constructor(initial: DecisionsConfig, options: DecisionRuntimeOptions) {
     this.options = options;
     this.env = options.env ?? process.env;
     this.home = options.home ?? homedir();
-    this.log = options.log ?? (() => {});
+    const log = options.log ?? (() => {});
+    this.log = (level, msg, fields) => {
+      // Diagnostic sinks must never block deterministic routing, ledger
+      // recording or lifecycle recovery, including a closed stderr stream.
+      try { log(level, msg, fields); } catch { /* isolated telemetry failure */ }
+    };
     this.configFile = configPathFor(options.instanceDir);
     this.currentConfig = initial;
     this.service = new DeterministicDecisionService(thresholdsOf(initial), 'disabled');
@@ -434,6 +467,7 @@ export class DecisionRuntime implements DecisionService {
     if (this.disposed || generation !== this.generation || selected !== (this.profileServices.get(profileName) ?? this.service)) {
       return deterministicOutcome(request, thresholdsOf(this.currentConfig), 'stale_generation');
     }
+    this.logProviderFallback(outcome, profileName, opts?.surface);
     // A live default-profile call failing degrades the runtime (existing
     // semantics — one health, one incident stream). Failures of any other
     // profile fall back deterministically per call, are logged for the
@@ -444,7 +478,8 @@ export class DecisionRuntime implements DecisionService {
       if (profileName === DEFAULT_DECISION_PROFILE && this.primary !== null) {
         const reason = outcome.provenance.fallbackReason ?? 'provider_degraded';
         if (reason !== 'capacity_limited') this.degrade(reason);
-        return deterministicOutcome(request, thresholdsOf(this.currentConfig), reason);
+        // Preserve the attempted request's elapsed time and diagnostics.
+        return outcome;
       }
       if (profileName !== DEFAULT_DECISION_PROFILE) {
         this.log('warn', 'decision profile fell back; deterministic answer served', {
@@ -492,16 +527,37 @@ export class DecisionRuntime implements DecisionService {
     ) {
       return deterministicOutcome(request, thresholds, 'stale_generation');
     }
+    this.logProviderFallback(providerOutcome, context.profileName, opts?.surface);
     if (providerOutcome.provenance.source === 'deterministic') {
       if (context.profileName === DEFAULT_DECISION_PROFILE && this.primary !== null) {
         const reason = providerOutcome.provenance.fallbackReason ?? 'provider_degraded';
-        if (reason !== 'capacity_limited') this.degrade(reason);
+        if (TRANSIENT_REASONS.has(reason)) {
+          // A transient shadow miss is evidence, not an incident: its answer
+          // was never going to be served. Only a run of misses degrades.
+          this.shadowMisses += 1;
+          if (this.shadowMisses >= SHADOW_MISS_DEGRADE_THRESHOLD) {
+            this.shadowMisses = 0;
+            this.degrade(reason);
+          } else {
+            this.log('warn', 'Jev shadow ask missed; runtime stays ready', {
+              reason,
+              surface: opts?.surface ?? null,
+              consecutive_misses: this.shadowMisses,
+              degrade_at: SHADOW_MISS_DEGRADE_THRESHOLD,
+            });
+          }
+        } else if (reason !== 'capacity_limited') {
+          this.shadowMisses = 0;
+          this.degrade(reason);
+        }
       } else if (context.profileName !== DEFAULT_DECISION_PROFILE) {
         this.log('warn', 'decision profile fell back during a shadow ask; deterministic answer recorded', {
           profile: context.profileName,
           reason: providerOutcome.provenance.fallbackReason ?? 'provider_degraded',
         });
       }
+    } else if (context.profileName === DEFAULT_DECISION_PROFILE) {
+      this.shadowMisses = 0;
     }
     try {
       context.record(buildShadowRecord({
@@ -510,11 +566,29 @@ export class DecisionRuntime implements DecisionService {
         request,
         providerOutcome,
         deterministicOutcome: deterministic,
+        thresholds,
       }));
     } catch (error) {
       this.log('error', 'decisions.shadow record failed; routing state remains usable', { error: String(error) });
     }
     return deterministic;
+  }
+
+  /** Report attempted failures/refusals even when local capacity does not
+   * degrade provider health. Deterministic stand-ins have no request timing;
+   * their reason remains visible in the shadow record instead. */
+  private logProviderFallback<Q extends QuestionSet>(
+    outcome: DecisionOutcome<Q>,
+    profile: string,
+    surface?: string,
+  ): void {
+    if (outcome.provenance.source !== 'deterministic' || outcome.provenance.diagnostics === undefined) return;
+    this.log('warn', 'decision provider request fell back', {
+      profile, surface: surface ?? null,
+      reason: outcome.provenance.fallbackReason,
+      latency_ms: outcome.provenance.latencyMs,
+      request_diagnostics: outcome.provenance.diagnostics,
+    });
   }
 
   /** Dispose every generation-owned service (idempotent per service;
@@ -589,7 +663,8 @@ export class DecisionRuntime implements DecisionService {
       this.signalStatus();
       const resolved = this.resolveDegradedIncidents();
       if ((!initial && previous !== 'disabled') || resolved > 0) this.postResolved('disabled');
-      this.autoRecheckArmed = true;
+      this.autoRechecksUsed = 0;
+      this.shadowMisses = 0;
       return this.status();
     }
 
@@ -662,6 +737,7 @@ export class DecisionRuntime implements DecisionService {
       return this.status();
     }
     if (probe.provenance.source !== 'jev') {
+      this.logProviderFallback(probe, DEFAULT_DECISION_PROFILE);
       candidate.dispose();
       return this.degrade(probe.provenance.fallbackReason ?? 'provider_degraded', credentialSource);
     }
@@ -696,6 +772,7 @@ export class DecisionRuntime implements DecisionService {
       profiles: [...this.profileServices.keys()].sort(),
       credential_source: credentialSource,
       latency_ms: probe.provenance.latencyMs,
+      request_diagnostics: probe.provenance.diagnostics,
       usage: probe.provenance.usage,
     });
     this.signalStatus();
@@ -709,7 +786,8 @@ export class DecisionRuntime implements DecisionService {
       detail: `Startup check passed; model ${this.currentStatus.model}.`,
       dedupe: 'all',
     }));
-    this.autoRecheckArmed = true;
+    this.autoRechecksUsed = 0;
+    this.shadowMisses = 0;
     return this.status();
   }
 
@@ -749,14 +827,19 @@ export class DecisionRuntime implements DecisionService {
     };
     this.log('warn', 'Jev decision service degraded; deterministic fallback active', { reason });
     this.signalStatus();
+    const ownerAction = this.ownerActionRequired(reason);
     this.notificationEffect('degraded notification', () => this.options.notifications?.postIncident({
       kind: `decisions.degraded.${reason}`,
-      // Owner-only remediation (provider credentials/quota), so this is
-      // human-facing: FOR YOU + bell, never a machine wake.
-      routing: 'needs-owner',
+      // Owner remediation (credentials, auth, config) or a surface that ACTS
+      // on Jev: FOR YOU + bell. A transient miss while every acting surface
+      // is shadow/off changes no behavior: board feed only. Never a machine
+      // wake either way.
+      routing: ownerAction ? 'needs-owner' : 'fyi',
       severity: 'error',
       title: 'Jev degraded — deterministic fallback active',
-      detail: `${reason}. Run the local credentials command if needed, then use Recheck; Gru Command remains usable.`,
+      detail: ownerAction
+        ? `${reason}. Run the local credentials command if needed, then use Recheck; Gru Command remains usable.`
+        : `${reason}. Every acting Jev surface is in shadow, so behavior is unchanged; Gru Command rechecks automatically on a bounded backoff. No action needed.`,
       // Acknowledgement records that a human saw the incident; it does not
       // resolve the still-degraded system state. Keep one active row until
       // recovery/disable resolves it, then allow a later recurrence.
@@ -768,20 +851,43 @@ export class DecisionRuntime implements DecisionService {
     return this.status();
   }
 
-  /** One bounded automatic recheck per transient degradation incident: a
-   * single provider blip heals without operator action, and a second
-   * consecutive failure consumes the arm so no retry/poll/spend loop can
-   * form. Re-arm happens on every recovery (ready) or disable. */
+  /** Bounded automatic rechecks per transient degradation incident: a
+   * provider blip heals without operator action, a longer outage gets a few
+   * spaced attempts (TRANSIENT_RECHECK_FACTORS), and then the incident waits
+   * for a human Recheck or a config change, so no retry/poll/spend loop can
+   * form. The budget resets on every recovery (ready) or disable. */
   private scheduleTransientRecovery(): void {
-    if (this.disposed || !this.autoRecheckArmed || this.transientRecoveryTimer !== null) return;
-    this.autoRecheckArmed = false;
+    if (this.disposed || this.transientRecoveryTimer !== null) return;
+    if (this.autoRechecksUsed >= TRANSIENT_RECHECK_FACTORS.length) return;
+    const factor = TRANSIENT_RECHECK_FACTORS[this.autoRechecksUsed] ?? 1;
+    this.autoRechecksUsed += 1;
+    const attempt = this.autoRechecksUsed;
+    const baseMs = this.options.transientRecoveryMs ?? DEFAULT_TRANSIENT_RECHECK_BASE_MS;
     this.transientRecoveryTimer = setTimeout(() => {
       this.transientRecoveryTimer = null;
       if (this.disposed) return;
-      this.log('info', 'transient degradation — performing the one bounded automatic recheck', {});
+      this.log('info', 'transient degradation — performing a bounded automatic recheck', {
+        attempt,
+        of: TRANSIENT_RECHECK_FACTORS.length,
+      });
       void this.recheck();
-    }, this.options.transientRecoveryMs ?? 5_000);
+    }, baseMs * factor);
     this.transientRecoveryTimer.unref?.();
+  }
+
+  /** An owner page is warranted only when a human must act (credentials,
+   * auth, config, schema) or when a live surface ACTS on Jev's answer:
+   * `enforce`, or a modeless (pre-#223) event_triage/supervision_guidance
+   * host. A transient miss while every acting surface is shadow/off changes
+   * no behavior. */
+  private ownerActionRequired(reason: DecisionFailureReason): boolean {
+    if (!TRANSIENT_REASONS.has(reason)) return true;
+    const surfaces = this.currentConfig.surfaces;
+    for (const host of [DECISION_SURFACE_EVENT_TRIAGE, DECISION_SURFACE_SUPERVISION]) {
+      const mode = surfaces[host]?.mode;
+      if (mode !== 'shadow' && mode !== 'off') return true;
+    }
+    return Object.values(surfaces).some((entry) => entry.mode === 'enforce');
   }
 
   /** The single shape for "Jev off": zero credential claims, one reason. */

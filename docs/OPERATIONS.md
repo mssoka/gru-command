@@ -178,10 +178,7 @@ Preconditions (all enforced; every refusal is a loud no-effect failure):
   refused;
 - no target-owned live work: spawning/streaming worker turns, non-terminal
   tracked child workers, pending/live review rounds or unsettled
-  verification runs. A supervisor-recorded stop (state stopped or breaker
-  open) is not live work: it short-circuits that agent's remaining clauses
-  (disposal after a stop is best-effort), and a live handle behind a stop
-  does not block.
+  verification runs.
 
 Request (pairing token in `Authorization: Bearer`):
 
@@ -201,11 +198,6 @@ curl -sS -X POST "http://127.0.0.1:<port>/api/jobs/<job-id>/closeout" \
     "reason": "<why this administrative closure is authorized>"
   }'
 ```
-
-`closed_at` may be omitted entirely — the audit then records `null`.
-An explicit JSON `null` is refused (`400`) at both the HTTP and ledger
-boundaries: the typed contract accepts a real ISO-8601 UTC timestamp or
-an absent field.
 
 - `200` — the job is `done`; the response carries the job, the
   `job.admin-closeout` audit event (seq + payload) and `idempotent: false`.
@@ -228,63 +220,56 @@ in PR/review work. The operation performs no other side effect — no worker
 spawn, re-brief, review arm, verification launch, worktree release, PR
 write or notification ACK.
 
-## Owner cancellation of the exact listed parked legacy lanes
+## Binning a job (terminal discard)
 
-The owner amendment j-1117 (`owner-close-seventeen-parked-20261006`)
-authorizes administrative abandonment of EXACTLY these named parked
-lanes — they have no registered PR and NULL legacy report metadata, so
-they take the cancellation form, never a fabricated provider receipt:
+When the owner/chief discards a lane that will never resume (superseded,
+cancelled, obsolete), close it as **binned** — the terminal discarded
+state, distinct from the resumable `parked` hold. Binning works from any
+non-terminal status (`dispatched`, `working`, `delivered`, `in-review`,
+`blocked`, `parked`); `merged`/`done` lanes refuse it, and a binned lane
+can never move again (no resume, re-brief, amendment, directive or
+review). The prior status and every historical event stay on the record;
+applicable obligations close as `job-terminal` abandonment in the same
+transaction — binning is a disposition, never a success or cleanup
+claim.
 
-`gc-freeze-heat-evidence`, `silas-context-rotation`,
-`pr135-r12-review-blind-hunter-7465b69`, `repo-status-mockups`,
-`abort-evidence-verification`, `abort-evidence-edge`,
-`pr142-verification-bounded-20260930`, `dashboard-header-mockups`,
-`pr151-independent-blind-90ab1b4-20261001`,
-`pr142-whole-adversarial-09ed-20261002-admission2`,
-`pr142-whole-adversarial-09ed-fresh-after-length-20261002`,
-`continuous-followthrough-gap-audit-20261002`,
-`perkins-abort-census-20261002`, `pr148-whole-adversarial-900-20261003`,
-`pr148-whole-edge-900-20261003`, `pr148-whole-verification-900-20261003`,
-`pr144-review-packet-recovery-743b57e-20261003`.
+Preconditions (Gru's shipped role teaches this same action; no new endpoint
+or automatic binning — the write itself is the ordinary status surface):
 
-This is an exact action allowlist, never a scan set: one named job per
-request, anything else is refused (`not-listed`), and there is no batch
-apply. The guard also requires the lane to be `parked`, PR-free and
-report-metadata-free, and refuses when any target-owned work is actually
-live — including a ledger-`idle` worker with an open supervisor turn, or
-a live registry-owned session. A supervisor-recorded stop (stopped or
-breaker open) is not live work, as above. Cancellation is an abandonment record,
-never a passing review or successful implementation: it does not touch
-branches, worktrees, transcripts, report findings, directives, UNKNOWN
-producer/admission evidence or preservation holds, and it mints no owner
-ACK.
+- confirm the lane is genuinely discarded and will not be resumed;
+- inspect live ownership first (`GET /api/board`, `/health`): binning
+  does NOT stop a running worker, cancel a queue entry, release a
+  worktree, delete artifacts or ack notifications. The status transaction
+  refuses target-owned open worker turns, unfinished child workers,
+  pending/live review rounds, unsettled verification runs, and in-flight
+  initial dispatch, directive or provider-recovery admission, with no
+  status or event mutation. A historical claimed wait/directive intent
+  does not hold the lane after its runtime attempt settles. Stop live work through its own authorized
+  surfaces first — the board keeps showing the live producer and the
+  worktree stays on the record. A `working` label alone is not proof of
+  a live producer; idle `working` jobs remain bin-eligible.
 
 Request (pairing token in `Authorization: Bearer`):
 
 ```bash
-curl -sS -X POST "http://127.0.0.1:<port>/api/jobs/<listed-job-id>/owner-cancellation" \
+curl -sS -X POST "http://127.0.0.1:<port>/api/jobs/<job-id>/status" \
   -H "Authorization: Bearer $GRU_TOKEN" -H 'content-type: application/json' \
-  -d '{
-    "expected_status": "parked",
-    "authority_reference": "j-1117 owner-close-seventeen-parked-20261006",
-    "reason": "<why this owner cancellation is authorized>"
-  }'
+  -d '{"status":"binned"}'
 ```
 
-- `200` — the job is `done`; the response carries the job, the
-  `job.owner-cancellation` audit event (prior + terminal identity, owner
-  authority, reason) and `idempotent: false`. Re-sending the identical
-  request returns the SAME event with `idempotent: true`.
-- `409 cancellation_refused` — `code` names the guard: `not-listed`,
-  `not-parked`, `not-cancellable-shape` (a PR or report metadata is
-  present — use the right form), `live-work`, `already-closed`; nothing
-  changed.
-- `400` malformed body · `401` missing/bad token · `404` unknown job.
+- `200` — the job is `binned`; the ordinary `job.status` event records
+  `<prior> → binned`. On the board, COLD is count-only by default:
+  expand COLD (“Show records”), then the “Show N binned records”
+  disclosure inside it reveals the discarded row.
+- `400` — illegal transition (from `merged`/`done`, or any DIFFERENT
+  status after `binned`), live-work refusal, or unknown status; nothing changed. Re-sending
+  `{"status":"binned"}` to an already-binned lane is an idempotent
+  200 no-op (the generic same-status write never mints a duplicate
+  event) — a timed-out retry is safe.
+- `401` missing/bad token · `404` unknown job.
 
-Read back with the idempotent replay plus `GET /api/board`: `done`,
-`prState: null`, no executable parked work. The PR165 closeout above
-remains a distinct disposition: it keeps its provider evidence and must
-not be folded into owner cancellation.
+There is no unbin: a mistaken bin is corrected by recording the honest
+next action as a NEW lane/job, never by rewriting the closed record.
 
 ## Backups & restore
 

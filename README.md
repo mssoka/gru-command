@@ -2,7 +2,7 @@
 
 A standalone, installable multi-agent orchestrator. One Node.js service
 hosts every agent as a headless session behind a pluggable runtime
-adapter (`pi` or Claude Code), with a web front-end for chat with the
+adapter (Claude Code, the default for new installs, or `pi`), with a web front-end for chat with the
 single Gru, the live heist board, and per-agent transcripts. The browser
 is the only required window.
 
@@ -21,6 +21,11 @@ waves), and OS service install — see [docs/EPICS.md](docs/EPICS.md).
   workspace files, phone camera/gallery files, or clipboard images through
   one path-based flow; text-only models decline image interpretation
   visibly instead of guessing ([CHAT.md](docs/CHAT.md)).
+- **Review source intake** — preview GitHub issues, specs and BMAD documents
+  in the existing chat without executing them. Edit immutable concrete plans,
+  select dependency-complete work, explicitly approve into the existing pipeline,
+  and recover accepted identities after reconnects ([INTAKE.md](docs/INTAKE.md)).
+  No BMAD installation is required; imported statuses are data, not authority.
 - **The live board** — repo-grouped job cards, per-agent state chips,
   review rounds with per-lens live chips, notification center
   ([BOARD.md](docs/BOARD.md)).
@@ -46,7 +51,7 @@ waves), and OS service install — see [docs/EPICS.md](docs/EPICS.md).
   deduplicated bible with provenance; briefings and directives carry
   pointer lines only, and agents read the pointed section on demand
   ([LESSONS.md](docs/LESSONS.md)).
-- **Pluggable runtimes** — `pi` (reference) and Claude Code adapters;
+- **Pluggable runtimes** — Claude Code (default for new installs) and `pi` adapters;
   models/thinking default to each runtime's own configuration
   ([RUNTIMES.md](docs/RUNTIMES.md)).
 - **Robustness** — durable sessions with resume, restart ladders,
@@ -90,8 +95,9 @@ GitHub signal ingestion is poll-only — no webhooks, no inbound tunnel.
    and `repos/{owner}/{repo}/commits/{sha}/check-runs` for the latest
    check-run conclusions. Each observed state CHANGE applies exactly
    once: a merged PR closes its lane (`github.pr-merged`), a conflicting
-   PR (`mergeable_state: dirty`) cascades an action-required
-   notification, a CI failure posts a notification carrying the run URL
+   PR (`mergeable_state: dirty`) cascades an fyi notification (mechanical
+   tier — Silas coordinates the conflict integration), a CI failure posts
+   a notification carrying the run URL
    (mechanical checks → fyi, judgment checks → action-required), and CI
    green records the review-gate signal event (`github.ci-green`). The
    per-tick call budget caps usage at 3 000 of the authenticated
@@ -131,7 +137,8 @@ See [the prerequisite decision](docs/decisions/gh-168-darwin-python-review-enume
 That single invocation clones to `~/gru-command`, installs dependencies,
 builds the service and web UI, and runs the setup wizard through
 `/dev/tty` even though the script itself is piped. The wizard detects
-`pi`/Claude Code, selects managed repos, writes the complete commented
+Claude Code/`pi` (new installs default to Claude Code; pick `pi` explicitly if you use it), selects real repository directories for setup validation
+(not a management whitelist; the board discovers workspace repos live), writes the complete commented
 live config at `~/.gru-command/config.toml`, smoke-tests first boot, and
 can register/start the owned OS service. A truly headless environment
 fails immediately with the exact `--no-interact` command instead of
@@ -170,40 +177,51 @@ npm run config:generate                 # refuses an existing file
 npm run config:generate -- --force      # timestamped 0600 backup first
 ```
 
-### Project-local BMAD setup
+### GC-owned delivery resources
 
-For each selected managed repo—not the workspace root and never every
-discovered directory—the wizard offers official BMAD setup, default on
-for fresh repos. This release pins `bmad-method@6.12.0` and installs all
-four approved defaults: `bmm,cis,tea,gds` (core is implicit), with
-external pins `cis=v0.3.2`, `tea=v1.27.2`, `gds=v0.7.2`. Runtime bindings
-follow the selected `pi`/Claude tools. Existing/customized installs
-default to **reuse unchanged**; per-repo skip is always available.
-The pinned set carries `bmad-review` out of the box, and it is a gate:
-0 blockers clear review/fix routing only — the PASS is not a Perkins
-READY — while blockers route back to the implementing minion as fix
-directives, never inform-only. Perkins (GitHub/GitLab) remains the
-stronger gate with exact-head verdicts; the owner holds every merge.
+GC ships directly editable build/planning/review resources with their own
+identity and content integrity in `resources/gc-workflows/`. Both normal and
+small-change paths retain independent tracked review, reasoned fixes,
+verification and ordinary PR handoff, without finding or tool-call quotas.
+The new package resolves with explicit project/job/worktree/artifact/knowledge
+context and no project/global BMAD, Python/uv or external skill dependency.
+See [docs/GC-WORKFLOWS.md](docs/GC-WORKFLOWS.md) for invocation, local manifest
+refresh, packaging tests and retained lane bindings.
 
-Successful setup records exact versions in
-`.gru-command/bmad-install.json`, adds an idempotent owned bootstrap
-block to `.gru-command/worktree.toml`, and uses narrow Git-local excludes
-for generated paths. It does not blanket-ignore `.agents/`, `.claude/`,
-or `_bmad-output/`, and never untracks files. Commit the three
-`.gru-command/` bootstrap files so newly-created worktrees can copy an
-isolated project-local BMAD install and discover the build-workflow
-skill this pinned release provides; generated skills/output remain
-local. Network and prerequisite failures name the
-repo and keep retry or explicit skip; deterministic state failures—a
-broken or partial install, a missing/unsafe module directory, a missing
-runtime binding—offer skip-only with deliberate repair guidance
-(install-repair classes additionally name the official repair path
-`npx bmad-method install` in that repository), never an automatic
-overwrite. No false-ready state.
+New implementation jobs now receive this owned package and explicit registered
+project/job context on both Pi and Claude Code. Operational material is private
+under `<data_dir>/projects/<project-key>/jobs/<job-id>/operational/`; approved
+portable knowledge belongs in the assigned worktree's `gru-output/`. GC-invoked
+fallback review uses a verified owned helper, not a global `bmad-review` install.
+Fallback PASS clears review/fix routing only, never native Perkins READY.
+Independent BMAD installs and historical outputs/bindings remain untouched;
+resumes retain their original package or fail with exact restoration guidance.
+Setup validates Git/GC prerequisites without a BMAD provisioning step. It creates
+no project BMAD files, skills or outputs; obsolete headless `bmad` answers must be
+removed explicitly. User project setup commands remain authoritative. Retire old
+GC-marked bootstrap blocks with the owner-run, backup-first procedure in
+[docs/BMAD-RUNTIME.md](docs/BMAD-RUNTIME.md), not automatic cleanup.
 
-You need the selected runtime CLI (`pi` or `claude`) for agents and `uv`
-for BMAD workflows. Missing prerequisites are reported before a repo is
-marked BMAD-ready.
+### GC-managed BMAD runtime (historical)
+
+The pinned `bmad-method@6.12.0` build package remains available for already-bound
+historical lanes. New jobs select GC-owned delivery resources instead. An upgrade
+never switches a running lane's workflow; missing retained bytes require restoring
+that exact package, not recreating the worker/worktree/PR. Perkins (GitHub/GitLab)
+remains the exact-head native release gate, and the owner performs every final PR
+merge.
+
+You need the selected runtime CLI (`claude` by default, or `pi`) for agents. Setup fails loud, naming the missing CLI and how to select the other runtime, instead of silently falling back. Existing installs keep the runtime their `config.toml` already says; only newly generated configs default to Claude Code. Only retained
+historical BMAD rendering uses `uv`; current setup and owned GC execution do not.
+Installing, breaking or removing independent BMAD does not affect GC setup or
+workflow selection. [docs/BMAD-RUNTIME.md](docs/BMAD-RUNTIME.md) covers:
+
+- the bundled set
+- configuration precedence
+- job binding
+- the deliberate upstream-upgrade procedure
+- license notices
+- the tested commands for retiring an old repo-local `_bmad` install by hand
 
 ## Run
 
@@ -262,6 +280,15 @@ This writes `~/.gru-command/credentials/openrouter.key` (or under `$GRU_COMMAND_
 - **Don't edit the file.** If an editor adds a final newline, that is tolerated; a second line is not.
 - **Environment variable alternative.** An `OPENROUTER_API_KEY` variable in the service environment also works and takes precedence. The file is the recommended store.
 
+**Modes.** Each `[decisions.surfaces.<surface>]` picks one mode. `node dist/decisions/cli.js config-template` prints the full annotated fragment.
+
+| Mode | What Gru Command does |
+|---|---|
+| `off` | Deterministic only; Jev is never asked |
+| `shadow` | Asks Jev and records its answer, but always uses the deterministic answer. **Start here.** |
+| `enforce` | Uses Jev's answer, with deterministic fallback. It refuses to run until a recorded backtest meets its threshold. |
+| *(no mode key)* | Legacy behaviour, for `event_triage` and `supervision_guidance` only: uses Jev's answer with **no** backtest gate. Avoid it by listing those surfaces explicitly. |
+
 **2. Enable Jev in shadow mode.** Add this to `~/.gru-command/config.toml`. The service hot-reloads this section, so no restart is needed. Keep every surface listed explicitly: a surface that isn't listed would act on Jev's answer instead of only recording it.
 
 ```toml
@@ -269,7 +296,7 @@ This writes `~/.gru-command/credentials/openrouter.key` (or under `$GRU_COMMAND_
 enabled = true
 model = "~typesafe/jev-latest"
 endpoint = "https://openrouter.ai/api/alpha/decisions"
-timeout_ms = 2000
+timeout_ms = 5000
 
 [decisions.surfaces.event_triage]
 provider = "openrouter-jev"
@@ -304,6 +331,7 @@ node dist/decisions/cli.js check --json    # one tiny live probe; expect "status
 | `credential_invalid` | The file holds more than one line. Repeat step 1 instead of editing the file. |
 | `credential_unsafe` | Folder or file permissions are too open, or the file is a symlink. Remove `~/.gru-command/credentials` and repeat step 1. |
 | `probe_failed` / `malformed_response` | OpenRouter answered, but not as expected. Check the `model` and `endpoint` values above. |
+| `timeout` | Answers are slower than `timeout_ms`. A single slow shadow ask is only recorded; 3 in a row mark Jev degraded, and it rechecks automatically. If this keeps happening on a healthy network, raise `timeout_ms` (for example to 8000). |
 
 Full reference (provider profiles including TypeSafe direct and a local `/v1/systemone` model, backtests, enforcement): [docs/jev-production-integration.md](docs/jev-production-integration.md).
 

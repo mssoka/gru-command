@@ -38,7 +38,7 @@
   </dict>
 
   <key>ProcessType</key>
-  <string>Background</string>
+  <string>Standard</string>
 
   <key>StandardOutPath</key>
   <string>{{GRU_COMMAND_HOME}}/logs/launchd.out.log</string>

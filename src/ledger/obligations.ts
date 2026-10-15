@@ -23,6 +23,8 @@
  *   never establishes an accepted product gate or heist completion.
  */
 
+import { isTerminalJobStatus, type TerminalJobStatus } from './states.js';
+
 // ------------------------------------------------------------------
 // Identity vocabulary
 // ------------------------------------------------------------------
@@ -49,6 +51,7 @@ export const KNOWN_BLOCKER_CATEGORIES = [
   'verification-failure',
   'review-verdict',
   'lane-unavailable',
+  'restart-recovery',
   'phase-completion',
 ] as const;
 export type KnownBlockerCategory = (typeof KNOWN_BLOCKER_CATEGORIES)[number];
@@ -135,7 +138,7 @@ export type ObligationSettlement =
     }
   | { readonly kind: 'superseded'; readonly byObligationId: string | null; readonly reason: string }
   | { readonly kind: 'cancelled'; readonly reason: string }
-  | { readonly kind: 'job-terminal'; readonly jobStatus: 'done' | 'merged' };
+  | { readonly kind: 'job-terminal'; readonly jobStatus: TerminalJobStatus };
 
 /** The delegated phase's identity an armed receipt expectation may pin
  * itself to. Present ⇒ a receipt event whose payload lacks the matching
@@ -158,6 +161,7 @@ export const FIRING_RULE_IDS = [
   'verification-failure-gru-decision',
   'review-verdict-gru-decision',
   'lane-unavailable-gru-decision',
+  'restart-recovery-gru-decision',
   'phase-completion-gru-decision',
   'unknown-triage-gru',
 ] as const;
@@ -205,6 +209,12 @@ export const FIRING_RULES: readonly FiringRule[] = [
     id: 'lane-unavailable-gru-decision',
     category: { kind: 'known', category: 'lane-unavailable' },
     nextAction: { kind: 'gru-decision', decision: 'lane unavailability requires a recovery ruling' },
+    wakeCondition: { kind: 'sweep' },
+  },
+  {
+    id: 'restart-recovery-gru-decision',
+    category: { kind: 'known', category: 'restart-recovery' },
+    nextAction: { kind: 'gru-decision', decision: 'inspect exact request/native progress; guarded fresh successor or concrete reserved owner decision' },
     wakeCondition: { kind: 'sweep' },
   },
   {
@@ -573,8 +583,8 @@ export function parseSettlement(raw: string): ObligationSettlement {
       return { kind, reason: reqStr(record, 'reason', 'cancelled settlement') };
     case 'job-terminal': {
       const jobStatus = reqStr(record, 'jobStatus', 'job-terminal settlement');
-      if (jobStatus !== 'done' && jobStatus !== 'merged') {
-        throw new Error(`job-terminal settlement jobStatus "${jobStatus}" must be done or merged`);
+      if (!isTerminalJobStatus(jobStatus)) {
+        throw new Error(`job-terminal settlement jobStatus "${jobStatus}" is not a terminal job status`);
       }
       return { kind, jobStatus };
     }

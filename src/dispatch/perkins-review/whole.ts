@@ -6,8 +6,10 @@ import type { AgentSpawner } from '../service.js';
 import type { AgentHandle, NativeAgentTool, PromptOptions } from '../../runtime/types.js';
 import type { PacingGate, PacingLease, PacingEventRecorder, RateLimitBackoffPolicy } from '../../runtime/pacing.js';
 import { withRateLimitRetries, type RateLimitRetryOptions } from '../../runtime/rate-limit-retry.js';
-import { assertFrozenPromptBounds, compatibleReviewIdentity, proveRecoveredBaseMergeability, publishedReportMatches, readReviewArtifact, readReviewCheckpoint, sourceMovementSinceFreeze, SPECIALIST_CHECKPOINT_MAX_BYTES, writeReviewArtifact, type FrozenReview, type SourceMovement, type SourceMovementOptions } from './artifacts.js';
+import { assertFrozenPromptBounds, compatibleReviewIdentity, repositoryGitEnv, proveRecoveredBaseMergeability, publishedReportMatches, readReviewArtifact, readReviewCheckpoint, sourceMovementSinceFreeze, SPECIALIST_CHECKPOINT_MAX_BYTES, writeReviewArtifact, type FrozenReview, type SourceMovement, type SourceMovementOptions } from './artifacts.js';
 import { applyConvergenceDeferral, classifyPriorFindings, convergedVerdict, deltaSince, type DeltaSince, type PriorCarryClassification } from './convergence.js';
+import { MAX_PROPERTY_PROPOSALS_PER_ROUND, MAX_PROPERTY_PROPOSALS_PER_SUBMISSION, parsePropertyContractsSubmission, PROPERTY_CONTRACTS_INPUT_SCHEMA, PROPERTY_CONTRACTS_TOOL_NAME, recordPropertyProposals, renderPropertyContractsGuidance } from './property-contracts.js';
+import { propertyCampaignRunningForReview, propertyEvidenceForReview, renderPropertyCampaignEvidence } from '../../property/pipeline.js';
 import { readFrozenEvidenceBytes, renderEvidencePromptSection } from '../../review-inputs/evidence.js';
 import { finalAssistantText } from './session-output.js';
 import { PERKINS_FINDING_SOURCES, PERKINS_LENSES, type PerkinsFindingSource, type PerkinsLens, type PerkinsPolicy } from './policy.js';
@@ -446,7 +448,7 @@ function headMovedSinceFreeze(review: FrozenReview, movementRef: string, options
   try {
     return execFileSync(
       'git', ['-C', review.manifest.repoPath, 'rev-parse', '--verify', `${movementRef}^{commit}`],
-      { encoding: 'utf8', timeout: GIT_PROOF_TIMEOUT_MS },
+      { encoding: 'utf8', timeout: GIT_PROOF_TIMEOUT_MS, env: repositoryGitEnv(false) },
     ).trim() === review.manifest.targetSha ? null : { cause: 'target-moved', detail: `movement ref ${movementRef} no longer matches ${review.manifest.targetSha}` };
   } catch {
     return { cause: 'target-moved', detail: `movement ref ${movementRef} cannot resolve` };
@@ -549,7 +551,7 @@ function frozenBlob(review: FrozenReview, path: string): string | null {
   let blob: string | null;
   try {
     blob = execFileSync('git', ['-C', review.manifest.repoPath, 'show', `${review.manifest.targetSha}:${path}`], {
-      encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'],
+      encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'],
     });
   } catch {
     blob = null;
@@ -579,7 +581,7 @@ function frozenPathDiff(review: FrozenReview, path: string): string {
     diff = execFileSync('git', [
       '-C', review.manifest.repoPath, 'diff', '--no-ext-diff', '--no-color', '--unified=3',
       review.manifest.diffBaseSha, review.manifest.targetSha, '--', `:(literal)${path}`,
-    ], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] });
+    ], { encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] });
   } catch {
     diff = '';
   }
@@ -1085,6 +1087,8 @@ export class PerkinsWholeReview {
   async run(input: RunWholeReviewInput): Promise<PerkinsWholeResult> {
     const review = input.frozenReview;
     assertFrozenPromptBounds(review);
+    const propertyEvidence = propertyEvidenceForReview(review.manifest.repoPath, review.manifest.targetSha);
+    if (propertyEvidence !== null) writeReviewArtifact(review, 'property/host-evidence.json', propertyEvidence);
     const catalog = input.noSpec
       ? this.policy.portableContract.rules.noSpecLenses
       : this.policy.portableContract.rules.fullLenses;
@@ -1142,6 +1146,8 @@ export class PerkinsWholeReview {
     const results = new Map<string, SpecialistResult>();
     const envelopes: LensEnvelope[] = [];
     const leadArtifacts = new Set<string>();
+    const recordedPropertyProposals: ReturnType<typeof recordPropertyProposals>[] = [];
+    let propertySubmissionsClosed = false;
     const agentIds = new Set<string>();
     const sessionFiles = new Set<string>();
     const failureLog = new Map<string, SpecialistAttemptFailure[]>();
@@ -1979,6 +1985,28 @@ export class PerkinsWholeReview {
       },
     };
 
+    const propertyContractsTool: NativeAgentTool = {
+      name: PROPERTY_CONTRACTS_TOOL_NAME,
+      description: `Submit requirement-grounded property-contract proposals (at most ${MAX_PROPERTY_PROPOSALS_PER_SUBMISSION} per call, ${MAX_PROPERTY_PROPOSALS_PER_ROUND} per round) for findings with a trustworthy executable oracle. UNTRUSTED INPUT: the host validates and records proposals; they are never evidence that tests ran and never authorize merge, execution or dependency installation. Host execution receipts are a separate host-owned artifact.`,
+      inputSchema: PROPERTY_CONTRACTS_INPUT_SCHEMA,
+      execute: async (raw, signal) => {
+        if (input.signal?.aborted === true || signal?.aborted === true) throw new Error('review operation aborted');
+        if (propertySubmissionsClosed || accepted !== null) throw new Error('Perkins property-contract submissions are closed for this round');
+        const proposals = parsePropertyContractsSubmission(raw);
+        const count = recordedPropertyProposals.reduce((total, entry) => total + entry.count, 0);
+        if (count + proposals.length > MAX_PROPERTY_PROPOSALS_PER_ROUND) {
+          throw new Error(`Perkins property-contract round budget is ${MAX_PROPERTY_PROPOSALS_PER_ROUND} proposals`);
+        }
+        const recorded = recordPropertyProposals(proposals);
+        const file = writeReviewArtifact(review, `property/proposals-${recordedPropertyProposals.length + 1}.json`, recorded);
+        recordedPropertyProposals.push(recorded);
+        return {
+          text: JSON.stringify({ recorded: recorded.count, trust: recorded.trust, artifact: file }),
+          details: { recorded: recorded.count, trust: recorded.trust, file, evidenceClass: 'untrusted-reviewer-input' },
+        };
+      },
+    };
+
     const priorRevisionTool: NativeAgentTool | null = priorReview.targetSha === null ? null : {
       name: 'perkins_read_prior_revision',
       description: 'Inspect the frozen delta between the prior round target and this round target: with {} list changed paths, or with {"path":"relative/file"} read one bounded exact-file diff. Read-only investigative material for revisiting prior findings.',
@@ -1996,7 +2024,7 @@ export class PerkinsWholeReview {
           const listing = execFileSync('git', [
             '-C', review.manifest.repoPath, 'diff', '--no-ext-diff', '--no-color', '--find-renames',
             '--name-status', '-z', priorTargetSha, review.manifest.targetSha, '--',
-          ], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] });
+          ], { encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] });
           // Truthful per-status parsing covers every name-status letter
           // git emits for two committed trees (R33): A/D/M/T are
           // single-path entries (T is a type change at the SAME path,
@@ -2042,14 +2070,14 @@ export class PerkinsWholeReview {
           const selectedPaths = execFileSync('git', [
             '-C', review.manifest.repoPath, 'diff', '--name-only', '-z', '--no-ext-diff', '--no-color',
             priorTargetSha, review.manifest.targetSha, '--', `:(literal)${value.path}`,
-          ], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] })
+          ], { encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] })
             .split('\0')
             .filter((entry) => entry !== '');
           const blobIn = (revision: string): boolean => {
             try {
               return execFileSync('git', [
                 '-C', review.manifest.repoPath, 'cat-file', '-t', `${revision}:${value.path}`,
-              ], { encoding: 'utf8', timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] }).trim() === 'blob';
+              ], { encoding: 'utf8', env: repositoryGitEnv(false), timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] }).trim() === 'blob';
             } catch {
               return false;
             }
@@ -2068,7 +2096,7 @@ export class PerkinsWholeReview {
           const diff = execFileSync('git', [
             '-C', review.manifest.repoPath, 'diff', '--no-ext-diff', '--no-color', '--no-textconv', '--text',
             '--unified=3', priorTargetSha, review.manifest.targetSha, '--', `:(literal)${value.path}`,
-          ], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] });
+          ], { encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] });
           payload = JSON.stringify({ priorTargetSha, targetSha: review.manifest.targetSha, path: value.path, diff });
         }
         if (Buffer.byteLength(payload, 'utf8') > MAX_TOOL_RESPONSE_BYTES) {
@@ -2125,7 +2153,12 @@ export class PerkinsWholeReview {
     };
 
     const baseProofIssue = (verdict: string): SubmissionValidationIssue | null => {
-      if (verdict === 'INCOMPLETE' || input.recoveredBaseTips === undefined || input.recoveredBaseTips.length === 0) return null;
+      if (verdict === 'INCOMPLETE') return null;
+      if (reviewScope === 'whole' && verdict === 'READY TO MERGE' && propertyCampaignRunningForReview(review.manifest.repoPath, review.manifest.targetSha)) return { subject: 'submission', rule: 'property-campaign-running', message: 'An approved exact-candidate property campaign is still running; await its host evidence or submit INCOMPLETE' };
+      const currentPropertyEvidence = propertyEvidenceForReview(review.manifest.repoPath, review.manifest.targetSha);
+      if (currentPropertyEvidence !== propertyEvidence) return { subject: 'submission', rule: 'property-evidence-moved', message: 'Host property evidence changed across the review boundary; restart or submit INCOMPLETE' };
+      if (reviewScope === 'whole' && propertyEvidence?.blocking === true && verdict === 'READY TO MERGE') return { subject: 'submission', rule: 'qualified-property-counterexample', message: 'An exact-candidate, qualified, replayed candidate-only counterexample remains in enforced mode. Retain and explain it as a finding; PBT never grants merge authority.' };
+      if (input.recoveredBaseTips === undefined || input.recoveredBaseTips.length === 0) return null;
       try {
         proveRecoveredBaseMergeability(review, input.recoveredBaseTips);
         return null;
@@ -2428,6 +2461,7 @@ export class PerkinsWholeReview {
     const leadTools = [
       runTool,
       artifactTool,
+      propertyContractsTool,
       ...(priorRevisionTool === null ? [] : [priorRevisionTool]),
       preflightTool,
       submitTool,
@@ -2437,6 +2471,8 @@ export class PerkinsWholeReview {
       '',
       '--- PRODUCT-NATIVE TOOL CONTRACT ---',
       'Use perkins_run_specialists to start optional whole-change specialist children; use perkins_store_artifact only for optional lead notes; use perkins_preflight_submission to validate a candidate terminal submission without spending a terminal attempt; finish by calling perkins_submit_review.',
+      renderPropertyContractsGuidance(),
+      renderPropertyCampaignEvidence(propertyEvidence),
       ...(priorReview.targetSha === null ? [] : ['On a re-review use perkins_read_prior_revision to list prior-target changes and read bounded path diffs while revisiting prior findings.']),
       'Specialists never inherit these tools. You, the lead, own every retained finding, every prior-finding disposition, and the verdict. Do not write implementation files.',
     ].join('\n');
@@ -2561,9 +2597,11 @@ export class PerkinsWholeReview {
         preflightCalls: preflightAttempts,
         specialistRuns: specialistsStarted,
         nativeTools: leadTools.map((tool) => tool.name),
+        propertyContractProposals: recordedPropertyProposals.reduce((total, entry) => total + entry.count, 0),
       });
       return accepted;
     } finally {
+      propertySubmissionsClosed = true;
       try {
         unsubscribe();
         await disposeLead();

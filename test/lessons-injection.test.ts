@@ -120,6 +120,20 @@ describe('progressive-disclosure injection', () => {
     expect(omitted).toContain('commit your work to the branch');
   });
 
+  it('tells a child-capable minion to name its own job as each reviewer\'s parent', () => {
+    const briefing = renderMinionBriefing({
+      jobId: 'impl-42',
+      repoName: 'repo',
+      branch: 'gru/impl-42',
+      worktreePath: '/tmp/wt',
+      sha: 'abc123',
+      briefing: 'build it',
+      childWorkerTools: true,
+    });
+    expect(briefing).toContain('`"parent_job_id": "impl-42"`');
+    expect(briefing).toContain('(a megaminion)');
+  });
+
   it('omits the section entirely when there are no pointers', () => {
     const briefing = renderMinionBriefing({
       jobId: 'job-1',
@@ -136,7 +150,7 @@ describe('progressive-disclosure injection', () => {
     const dataDir = tmpDir('gru-command-injection-');
     const ledgerDb = new LedgerDb(dataDir);
     const ledger = new LedgerApi(ledgerDb.handle, { bus: new EventBus({}) });
-    const worktrees = new InMemoryWorktreePort(join(dataDir, 'wt'));
+    const worktrees = new InMemoryWorktreePort(join(dataDir, 'wt'), ledger);
     const prompts: string[] = [];
     const dispatch = new DispatchService({
       ledger,
@@ -184,7 +198,7 @@ describe('progressive-disclosure injection', () => {
     const ledger = new LedgerApi(ledgerDb.handle, { bus: new EventBus() });
     const repoPath = join(root, 'repo');
     mkdirSync(repoPath);
-    const worktrees = new InMemoryWorktreePort(join(root, 'lanes'));
+    const worktrees = new InMemoryWorktreePort(join(root, 'lanes'), ledger);
     ledger.addJob({ id: 'job-resume', repo: 'fixture', title: 'resume', briefing: 'original implementation contract' });
     await worktrees.createJobWorktree({ repoPath, jobId: 'job-resume' });
     ledger.registerAgent({ id: 'old-minion', role: 'minion', jobId: 'job-resume', sessionFile: join(root, 'old-session.jsonl') });
@@ -223,7 +237,7 @@ describe('progressive-disclosure injection', () => {
     const ledger = new LedgerApi(ledgerDb.handle, { bus: new EventBus({}) });
     const repoPath = join(root, 'repo');
     mkdirSync(repoPath, { recursive: true });
-    const worktrees = new InMemoryWorktreePort(join(root, 'wt'));
+    const worktrees = new InMemoryWorktreePort(join(root, 'wt'), ledger);
     ledger.addJob({ id: 'job-3', repo: 'fixture', title: 'directive', briefing: 'original contract' });
     await worktrees.createJobWorktree({ repoPath, jobId: 'job-3' });
     const prompts: string[] = [];

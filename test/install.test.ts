@@ -166,6 +166,17 @@ describe('install.sh --print rendering', () => {
     }
   });
 
+  it('the service runs at normal priority on macOS and Linux — never throttled as a background job (owner decision 2026-10-07)', () => {
+    // A launchd ProcessType of Background throttled the service and every
+    // minion it spawned; the event-loop stalls it caused were logged as
+    // "system sleep" and spent the Perkins admission budget.
+    const plist = readFileSync(join(repoRoot, 'install', 'launchd', 'com.gru-command.service.plist.template'), 'utf-8');
+    expect(plist).toMatch(/<key>ProcessType<\/key>\s*<string>Standard<\/string>/u);
+    expect(plist).not.toContain('<string>Background</string>');
+    const unit = readFileSync(join(repoRoot, 'install', 'systemd', 'gru-command.service.template'), 'utf-8');
+    expect(unit).not.toMatch(/^\s*(?:Nice=\s*[1-9]|CPUSchedulingPolicy=\s*(?:idle|batch)|IOSchedulingClass=\s*idle)/mu);
+  });
+
   it('renders a launchd PATH with stable Node/npm after the session bin disappears', () => {
     const home = mkdtempSync(join(tmpdir(), 'gru-command-launchd-path-'));
     cleanupDirs.push(home);

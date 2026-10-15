@@ -1,11 +1,14 @@
+import { GruMailbox } from '../gru-mailbox/service.js';
+import type { MailboxSnapshot } from '../ledger/mailbox.js';
 import type { Role } from '../config.js';
 import type { LogLevel } from '../logger.js';
-import type { AgentState } from '../runtime/types.js';
+import type { AgentHandle, AgentState } from '../runtime/types.js';
 import type { AgentEventEnvelope } from '../runtime/registry.js';
 import type { EventBus } from '../events/bus.js';
 import type { AgentSupervisionView } from '../supervision/supervisor.js';
 import type { DecisionRuntimeStatus } from '../decisions/runtime.js';
 import type { DeployDriftView } from './deploy-drift.js';
+import type { RepoOverviewView } from '../repos/overview.js';
 import type { VerificationQueueView } from '../verify/scheduler.js';
 import type { PacingGateView } from '../runtime/pacing.js';
 import type { PipelineBoardView } from '../ledger/pipeline.js';
@@ -24,7 +27,7 @@ import {
   type RoundRecord,
 } from '../ledger/api.js';
 import { LIVE_DIRECTIVE_STATES } from '../ledger/directives.js';
-import type { JobStatus } from '../ledger/states.js';
+import { isJobTerminal, type JobStatus } from '../ledger/states.js';
 import type { EventRecord } from '../ledger/api.js';
 
 /** Newest closed receipts kept in every snapshot (D3): older ones are
@@ -104,6 +107,9 @@ export interface JobView {
   readonly lane: LaneView | null;
   /** Newest lastActivity across the job's bound agents (null when none). */
   readonly lastAgentActivity: string | null;
+  /** The commissioning job when this one is a megaminion (a specialist a
+   * minion dispatched); null for a top-level heist. */
+  readonly parentJobId: string | null;
 }
 
 /** Issue #171 runtime ownership: the agent ids the LIVE process owns
@@ -253,13 +259,15 @@ export interface ActiveDecisionView {
 }
 
 export interface BoardSnapshot {
+  readonly mailbox: MailboxSnapshot;
   readonly repos: readonly { readonly name: string; readonly jobs: readonly JobView[] }[];
   readonly agents: readonly AgentView[];
   readonly notifications: readonly NotificationView[];
   readonly decisions: DecisionRuntimeStatus;
   /** NEEDS GRU: machine-attention rows still awaiting a disposition
    * (self-clearing machine queue; never rings the owner bell). Counted
-   * LIVE: rows bound to a terminal (merged/done) job are closed receipts —
+   * LIVE: rows bound to a terminal (merged/done/binned) job are closed
+   * receipts —
    * the record keeps them, this count (and the banding) does not. Read
    * from the table, not the 30-row feed window, so the tracker is true. */
   readonly unackedActionRequired: number;
@@ -280,6 +288,11 @@ export interface BoardSnapshot {
   };
   /** Running build vs origin/main (null when the tracker is unwired). */
   readonly build: DeployDriftView | null;
+  /** Managed repository overview (owner-approved compact rows A): the
+   * read-only projection of the configured managed-repo registry. Null
+   * until the tracker's first refresh pass or when unwired — the web
+   * hides the section rather than claiming an empty registry. */
+  readonly repoOverview: RepoOverviewView | null;
   /** Silas ops health, derived from the ledger event stream. */
   readonly silas: SilasView;
   /** Verification scheduler queue (null until its API is wired). */
@@ -370,6 +383,10 @@ const SILAS_ACTION_KINDS = [
   // it actually advanced durable work (a generic phase-completion or
   // obligation event from an unrelated lane is deliberately NOT counted).
   'silas.reconcile-advanced',
+  // `silas.directive-retired` is deliberately NOT counted here: retirement
+  // is an operator/owner control closure (no work was advanced, no turn
+  // ran) — counting it as Silas follow-through yield would misattribute
+  // activity the record explicitly declines to claim as progress.
 ] as const;
 
 /** PR state from the record: a terminal `merged` job is merged; a
@@ -406,10 +423,11 @@ interface MutableChildCounts {
 
 function prStateOf(job: Pick<JobRecord, 'status' | 'prUrl'>): JobView['prState'] {
   if (job.status === 'merged') return 'merged';
-  // A terminal `done` lane (including a closed-without-merge administrative
-  // closeout) is a closed receipt: its registered PR is never presented as
-  // open, and closure never infers a merge.
-  if (job.status === 'done') return null;
+  // A terminal non-merge lane — `done` (including a closed-without-merge
+  // administrative closeout) or `binned` (discarded, never resuming) — is
+  // a closed receipt: its registered PR is never presented as open, and
+  // closure never infers a merge.
+  if (isJobTerminal(job.status)) return null;
   if (job.prUrl !== null) return 'open';
   return null;
 }
@@ -461,6 +479,9 @@ export interface BoardEngineOptions {
   readonly decisionsStatus?: () => DecisionRuntimeStatus;
   /** Board UX v4: deploy drift view (late-bound tracker). */
   readonly buildDrift?: () => DeployDriftView | null;
+  /** Managed repository overview (late-bound tracker; null until its
+   * first refresh pass, and when the feature is not wired). */
+  readonly repoOverview?: () => RepoOverviewView | null;
   /** Board UX v4: verification queue view (late-bound scheduler). */
   readonly verifyQueue?: () => VerificationQueueView | null;
   /** Provider pacing: gate view (late-bound; null when the feature is off). */
@@ -474,6 +495,7 @@ export interface BoardEngineOptions {
 }
 
 export class BoardEngine {
+  readonly mailbox: GruMailbox;
   private readonly ledger: LedgerApi;
   private readonly bus: EventBus;
   private readonly log: Log;
@@ -482,6 +504,7 @@ export class BoardEngine {
 
   constructor(opts: BoardEngineOptions) {
     this.ledger = opts.ledger;
+    this.mailbox = new GruMailbox(opts.ledger, opts.now);
     this.bus = opts.bus;
     this.log = opts.log ?? (() => {});
     this.supervisionFor = opts.supervisionFor ?? (() => null);
@@ -500,6 +523,7 @@ export class BoardEngine {
       generation: 0,
     }));
     this.buildDrift = opts.buildDrift ?? (() => null);
+    this.repoOverview = opts.repoOverview ?? (() => null);
     this.verifyQueue = opts.verifyQueue ?? (() => null);
     this.pacing = opts.pacing ?? (() => null);
     this.pipeline = opts.pipeline ?? (() => null);
@@ -516,11 +540,14 @@ export class BoardEngine {
   private readonly membershipWired: boolean;
   private readonly decisionsStatus: () => DecisionRuntimeStatus;
   private readonly buildDrift: () => DeployDriftView | null;
+  private readonly repoOverview: () => RepoOverviewView | null;
   private readonly verifyQueue: () => VerificationQueueView | null;
   private readonly pacing: () => PacingGateView | null;
   private readonly pipeline: () => PipelineBoardView | null;
   private readonly selfHeal: () => SelfHealView | null;
   private readonly now: () => number;
+  private readonly runtimeSources = new Map<string, symbol>();
+  private readonly runtimeHandleSources = new WeakMap<AgentHandle, symbol>();
 
   /** Fired after any event that may have changed the board. */
   onChange(listener: () => void): () => void {
@@ -546,14 +573,34 @@ export class BoardEngine {
 
   onRuntimeEvent(envelope: AgentEventEnvelope): void {
     try {
+      // A logical id survives replacement; the old object's late disposal
+      // must not retire the newer writer's durable session/state.
+      const current = this.runtimeSources.get(envelope.agentId);
+      const source = envelope.handle === undefined ? undefined : this.runtimeHandleSources.get(envelope.handle);
+      if (envelope.handle !== undefined && envelope.phase === 'spawned') {
+        if (source !== undefined && current !== undefined && source !== current) return;
+        const token = source ?? Symbol();
+        this.runtimeHandleSources.set(envelope.handle, token);
+        this.runtimeSources.set(envelope.agentId, token);
+      } else if (current !== undefined && source !== current) {
+        return;
+      } else if (envelope.handle !== undefined && current === undefined) {
+        const token = source ?? Symbol();
+        this.runtimeHandleSources.set(envelope.handle, token);
+        this.runtimeSources.set(envelope.agentId, token);
+      }
       switch (envelope.phase) {
-        case 'spawned':
+        case 'spawned': {
+          const known = this.ledger.getAgent(envelope.agentId);
           this.ledger.registerAgent({
             id: envelope.agentId,
-            role: envelope.role,
+            // A controlled recovery may have explicitly restored a job-bound
+            // fallback role before granting this neutral registration tap.
+            role: envelope.handle !== undefined && known?.jobId != null ? known.role : envelope.role,
             sessionFile: envelope.sessionFile,
           });
           break;
+        }
         case 'disposed':
           if (this.ledger.getAgent(envelope.agentId) !== null) {
             this.ledger.setAgentState(envelope.agentId, 'disposed');
@@ -746,9 +793,10 @@ export class BoardEngine {
       attemptsByRound.set(roundId, ledgerLenses);
     }
     // Closed-receipt rule (owner decisions D1/D3): a machine row bound
-    // through an agent to a merged/done job is a receipt, not live work.
+    // through an agent to a terminal (merged/done/binned) job is a
+    // receipt, not live work.
     const concludedJobs = new Set(
-      jobs.filter((job) => job.status === 'merged' || job.status === 'done').map((job) => job.id),
+      jobs.filter((job) => isJobTerminal(job.status)).map((job) => job.id),
     );
     const agentJob = new Map(
       agentRows.filter((agent) => agent.jobId !== null).map((agent) => [agent.id, agent.jobId as string]),
@@ -787,6 +835,7 @@ export class BoardEngine {
     );
     return {
       repos,
+      mailbox: this.mailbox.snapshot(),
       agents,
       notifications: this.notifications(isReceipt),
       decisions: this.decisionsStatus(),
@@ -798,6 +847,7 @@ export class BoardEngine {
         deferred: this.deferredWakes(),
       },
       build: this.buildDrift(),
+      repoOverview: this.repoOverview(),
       children: {
         queued: childrenQueued,
         active: childrenActive,
@@ -889,6 +939,18 @@ export class BoardEngine {
             ? null : review.payload as { readonly finalPassRequired?: unknown };
           if (payload?.finalPassRequired === true) return null;
         }
+        // READY is bound to the REVIEWED requirements too (owner rules
+        // 2026-10-08): an approved material correction pending delivery, or
+        // one the approved round never froze, withholds the merge offer.
+        const revision = this.ledger.workRevisionState(job.id);
+        if (revision.required > revision.delivered) return null;
+        if (revision.required > 0 && newest !== undefined) {
+          const frozen = this.ledger.latestRoundEvent(newest.id, 'round.review-inputs-frozen');
+          const acceptance = typeof frozen?.payload === 'object' && frozen.payload !== null
+            ? (frozen.payload as { readonly acceptance?: { readonly version?: unknown } | null }).acceptance : undefined;
+          const version = acceptance?.version;
+          if (typeof version !== 'number' || version < revision.required) return null;
+        }
         return ownerReadyPr(job, readBranchEvidence(this.ledger, job.id));
       })
       .filter((row): row is OwnerPrView => row !== null)
@@ -949,6 +1011,25 @@ export class BoardEngine {
       if (directive !== undefined) {
         return `directive ${directive.requestId}: ${directive.state} (${directive.jobId})`;
       }
+      // A retirement's open continuation hold is durable debt too: the lane
+      // will not self-continue, and the board must say so truthfully. A
+      // hold on a terminal job is inert (terminal lanes take no work and
+      // can never accept the releasing request) — showing it would name a
+      // dead lane forever and mask newer live holds.
+      const damaged: string[] = [];
+      const hold = this.ledger.listDirectiveRecoveryHolds({ openOnly: true,
+        onMalformed: (requestId, jobId, error) => {
+          this.log?.('error', 'silas health: retired directive audit is inconsistent', { requestId, jobId, error: String(error) });
+          damaged.push(`directive ${requestId}: inconsistent retirement audit requires repair (${jobId})`);
+        },
+      }).find((candidate) => {
+        const job = this.ledger.getJob(candidate.jobId);
+        return job !== null && !isJobTerminal(job.status);
+      });
+      if (hold !== undefined) {
+        return `directive ${hold.requestId}: retired — continuation requires a fresh request (${hold.jobId})`;
+      }
+      if (damaged.length > 0) return damaged[0] ?? null;
     } catch (error) {
       // One malformed directive row must never take the board down; the
       // malformed debt stays visible to the boot reconciler instead.
@@ -1040,6 +1121,7 @@ export class BoardEngine {
           ? null
           : { branch: lane.branch, sha: lane.sha, status: lane.status, createdAt: lane.createdAt },
       lastAgentActivity,
+      parentJobId: job.parentJobId,
     };
   }
 
@@ -1132,15 +1214,16 @@ export class BoardEngine {
   /**
    * The closed-receipt rule (owner decisions D1/D3) for out-of-band
    * callers (the paged receipt route): a row bound through an agent to a
-   * merged/done job. The snapshot scan uses a map-built predicate instead
-   * so the unbounded walk stays one query per page.
+   * terminal (merged/done/binned) job. The snapshot scan uses a
+   * map-built predicate instead so the unbounded walk stays one query
+   * per page.
    */
   isClosedReceipt(agentId: string | null): boolean {
     if (agentId === null) return false;
     const agent = this.ledger.getAgent(agentId);
     if (agent === null || agent.jobId === null) return false;
     const job = this.ledger.getJob(agent.jobId);
-    return job !== null && (job.status === 'merged' || job.status === 'done');
+    return job !== null && isJobTerminal(job.status);
   }
 
   /**

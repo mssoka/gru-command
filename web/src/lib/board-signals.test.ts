@@ -269,8 +269,8 @@ describe('unackedByJob', () => {
     // on the ledger side must be mirrored here too; the companion test
     // below reads the ledger declaration and makes drift FAIL instead of
     // relying on this checklist being remembered.
-    const statuses = ['dispatched', 'working', 'delivered', 'in-review', 'blocked', 'parked', 'merged', 'done'];
-    expect(statuses.filter((status) => isJobConcluded(status))).toEqual(['merged', 'done']);
+    const statuses = ['dispatched', 'working', 'delivered', 'in-review', 'blocked', 'parked', 'merged', 'done', 'binned'];
+    expect(statuses.filter((status) => isJobConcluded(status))).toEqual(['merged', 'done', 'binned']);
     expect(isJobConcluded('working')).toBe(false);
   });
 
@@ -286,7 +286,7 @@ describe('unackedByJob', () => {
       fileURLToPath(new URL('../../../src/ledger/states.ts', import.meta.url)),
       'utf-8',
     );
-    const declaration = /JOB_TERMINAL\s*(?::[^=]*)?=\s*new Set[^(]*\(\s*\[([^\]]*)\]\s*\)/.exec(statesSource);
+    const declaration = /TERMINAL_JOB_STATUS_LIST\s*(?::[^=]*)?=\s*\[([^\]]*)\]\s*as const/.exec(statesSource);
     expect(declaration, 'the ledger terminal declaration moved or changed shape').not.toBeNull();
     const terminal = [...declaration![1]!.matchAll(/'([^']+)'/g)].map((match) => match[1]!);
     expect(terminal.length).toBeGreaterThan(0);
@@ -297,7 +297,7 @@ describe('unackedByJob', () => {
     // (tracked-review A6): the web twin must conclude EXACTLY the ledger's
     // terminal set. A web-only addition would otherwise keep counting rows
     // the web reclassifies as receipts while every test stayed green.
-    const knownStatuses = ['dispatched', 'working', 'delivered', 'in-review', 'blocked', 'parked', 'merged', 'done'];
+    const knownStatuses = ['dispatched', 'working', 'delivered', 'in-review', 'blocked', 'parked', 'merged', 'done', 'binned'];
     const webConcluded = knownStatuses.filter((status) => isJobConcluded(status)).sort();
     expect(webConcluded).toEqual([...terminal].sort());
   });

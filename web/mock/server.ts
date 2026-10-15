@@ -1,3 +1,4 @@
+import type { BoardSnapshot, MailboxItemView } from '../src/lib/board-protocol.js';
 /**
  * ──────────────────────────── DEV TOOLING ONLY ────────────────────────────
  * Mock Gru chat socket for frontend development (E5). Implements the WS
@@ -239,8 +240,21 @@ function mergedReceiptStamp(): string {
 }
 
 function sampleSnapshot(): unknown {
-  const snapshot = defaultSampleSnapshot();
-  return boardMode === 'clear-needs-you' ? clearNeedsYouVariant(snapshot) : snapshot;
+  const snapshot = defaultSampleSnapshot() as BoardSnapshot;
+  const source = (boardMode === 'clear-needs-you' ? clearNeedsYouVariant(snapshot) : snapshot) as BoardSnapshot;
+  const jobs = source.repos.flatMap((repo) => repo.jobs);
+  const descriptors = boardMode === 'clear-needs-you' ? [] : [
+    { id: 'demo-api-payment-fix', labels: ['lens failed', 'action-required'] },
+    { id: 'demo-api-conflict-probe', labels: ['PR conflicting'] },
+  ];
+  const items: MailboxItemView[] = descriptors.map(({ id, labels }) => {
+    const job = jobs.find((candidate) => candidate.id === id)!;
+    return { id: `job:${id}`, jobId: id, subject: `job:${id}`, title: job.title, kind: 'job', basis: `mock-basis:${id}`,
+      reasons: labels.map((label) => ({ label, signal: label.replaceAll(' ', '-'), basis: `mock-reason:${label}` })),
+      state: 'needs-gru', owner: 'gru', disposition: null, receipt: null, notificationIds: id === 'demo-api-payment-fix' ? ['mock-n5'] : [],
+      producerOwned: false, references: [], restrictions: [], attentionKey: `mock-attention:${id}` };
+  });
+  return { ...source, mailbox: { items, counts: { threads: items.length, incidents: 0, notifications: boardMode === 'clear-needs-you' ? 0 : 1, needsGru: items.length } } };
 }
 
 /** The clear variant: drop the live machine row, settle the needs-you
@@ -392,7 +406,7 @@ function defaultSampleSnapshot(): unknown {
             prUrl: 'https://github.com/acme/demo-api/pull/43',
             prState: 'conflicting',
             baseBranch: 'main',
-            note: 'PR conflicts with main — rebase owed',
+            note: 'PR conflicts with main — integration owed',
             rounds: [],
             lane: null,
             lastAgentActivity: new Date(Date.now() - 300_000).toISOString(),
@@ -447,6 +461,44 @@ function defaultSampleSnapshot(): unknown {
             updatedAt: new Date(Date.now() - 600_000).toISOString(),
             prUrl: 'https://gitlab.demo.invalid/sample/sample-site/-/merge_requests/42',
             prState: 'open',
+            baseBranch: 'main',
+            note: null,
+            rounds: [],
+            lane: null,
+            lastAgentActivity: null,
+          },
+          {
+            // Megaminions: specialists the copy-pass minion commissioned
+            // nest under that heist (one still reviewing, one delivered)
+            // and never count as heists of their own.
+            id: 'sample-site-copy-pass-review-blind',
+            repo: 'sample-site',
+            title: 'Review the copy refresh (blind)',
+            parentJobId: 'sample-site-copy-pass',
+            status: 'working',
+            updatedAt: new Date(Date.now() - 60_000).toISOString(),
+            prUrl: null,
+            prState: null,
+            baseBranch: 'main',
+            note: null,
+            rounds: [],
+            lane: {
+              branch: 'gru/sample-site-copy-pass-review-blind',
+              sha: 'c3f3b35deadbeef',
+              status: 'active',
+              createdAt: new Date(Date.now() - 300_000).toISOString(),
+            },
+            lastAgentActivity: new Date(Date.now() - 30_000).toISOString(),
+          },
+          {
+            id: 'sample-site-copy-pass-review-edge',
+            repo: 'sample-site',
+            title: 'Review the copy refresh (edge cases)',
+            parentJobId: 'sample-site-copy-pass',
+            status: 'delivered',
+            updatedAt: new Date(Date.now() - 120_000).toISOString(),
+            prUrl: null,
+            prState: null,
             baseBranch: 'main',
             note: null,
             rounds: [],

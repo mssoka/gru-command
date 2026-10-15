@@ -54,12 +54,13 @@ coerced and no event is written for a rejected change.
 ```text
 job:    dispatched → working → delivered → in-review → merged | done
         (any non-terminal ⇄ blocked / parked as recoverable side-states;
-         merged/done are terminal; a PR registered before the turn
+         merged/done/binned are terminal; a PR registered before the turn
          settles keeps working → in-review legal)
+        discard: ANY non-terminal → binned (terminal, no outbound edges;
+         merged/done can NOT be binned)
         administrative closeout: parked → done ONLY through
-         `adminCloseParkedJob` (PR-backed, audited, evidence-bound) or
-         `adminCancelListedParkedJob` (exact owner-listed legacy lanes,
-         audited abandonment) — never the generic status write
+         `adminCloseParkedJob` (audited, evidence-bound — never the
+         generic status write)
 
 round:  pending → live → verdict-posted | aborted   (terminal: the last two)
 
@@ -75,41 +76,47 @@ lens:   pending → live → done | error               (terminal: the last two)
 - `merged` has **no internal writer**: merge detection belongs to the
   external sweep (Silas) — the remaining external caller of the job
   machine. Nothing in the ledger infers a merge.
+- **`binned` is the terminal DISCARDED state** (owner/chief cancelled a
+  lane): every non-terminal status may be binned through the ordinary
+  authenticated `POST /api/jobs/<id>/status` write WHEN no target-owned
+  producer remains. The same status transaction refuses open worker turns,
+  non-terminal children, pending/live rounds, unsettled verification
+  runs, and active initial dispatch, directive or provider-recovery
+  admissions that have not registered their worker yet; an idle `working`
+  job can still be binned. Historical directive intents and claimed
+  provider waits are not perpetual runtime blockers after the attempt
+  settles; last-side-effect guards also refuse late prompts if a job
+  became terminal during an asynchronous boundary. Gru's shipped role
+  teaches this intentional action through its permitted shell and the
+  configured service token; no background process automatically bins
+  work. `binned` never leaves — it shares the terminal contract with `merged`/`done`
+  (`isJobTerminal`, `TERMINAL_JOB_STATUSES`). The transition appends the
+  ordinary `job.status` `{from, to}` event (the prior status and every
+  earlier event stay on the record) and settles the lane's applicable
+  obligations as `job-terminal` abandonment in the SAME transaction.
+  Binning is a disposition, NOT evidence: it never means the work
+  succeeded, a PR merged, a gate passed, an obligation was satisfied, a
+  worktree was destroyed or a live process stopped. `merged`/`done`
+  lanes cannot be binned (their history is closed), and a binned lane
+  can never resume, be re-briefed, amended, directed or re-reviewed.
 - **Administrative closeout** (`adminCloseParkedJob`, owner ruling
-  j-1115) is the first of the guarded exception paths that close a parked
-  PR-backed lane without faking a hop: the generic machine still refuses
-  parked → done, and only these guarded operations admit the direct
-  `parked → done` edge (the owner-cancellation form below is the other).
+  j-1115) is the ONE exception path that closes a parked PR-backed lane
+  without faking a hop: the generic machine still refuses parked → done,
+  and only this guarded operation admits the direct `parked → done` edge.
   (A lane resumed through its normal lifecycle still reaches `done` by
-  the ordinary route — this edge exists for a lane that never resumes.)
-  It requires an explicit expected status + PR url + head, the job's
-  LATEST recorded `github.branch-state` observation to say the PR is
-  CLOSED and not merged at exactly that url/head, and no target-owned
-  live work. ONE transaction appends the `job.admin-closeout` audit
-  (request evidence + the cited observation seq), records the direct
-  status hop, and closes the applicable obligations `job-terminal`
-  (abandonment, never a success claim). A repeated identical request
-  returns the recorded closeout idempotently; a changed request is
-  refused — the recorded one is never overwritten. Idle/historical
-  bookkeeping rows and the separate directive/re-brief control rows are
-  neither read nor rewritten.
-- **Owner cancellation** (`adminCancelListedParkedJob`, owner amendment
-  j-1117) is the second, narrower audited closeout form: it admits ONLY
-  the exact frozen allowlist of 17 named parked legacy lanes
-  (`src/ledger/owner-cancellation.ts`), requires no provider receipt
-  (those lanes have no PR and NULL report metadata — no value is ever
-  invented), and records an `owner-cancelled-abandoned` terminal
-  disposition carrying the owner authority reference and the exact prior
-  identity. There is no scan/batch mode. Both forms share the
-  authoritative live-work fence: durable execution markers plus (when
-  wired) the live registry handle set and the supervisor's open
-  turn/control/tool view, so a ledger `idle` row with an effective open
-  turn refuses. An explicit supervision stop is not live execution —
-  the recorded stop wins over a lingering live handle (disposal after a
-  stop is best-effort), so a stopped/breaker-open lane can be closed
-  even if its process has not exited yet; the registry's handle ids bind
-  through the lane's ledger agent rows. Directive/re-brief/report/
-  verification history and worktrees are never rewritten by either form.
+  the ordinary route — this edge exists for a lane that never resumes.) It requires an
+  explicit expected status + PR url + head, the job's LATEST recorded
+  `github.branch-state` observation to say the PR is CLOSED and not
+  merged at exactly that url/head, and no target-owned live work
+  (spawning/streaming worker turns, non-terminal child workers,
+  pending/live rounds, unsettled verification runs). ONE transaction
+  appends the `job.admin-closeout` audit (request evidence + the cited
+  observation seq), records the direct status hop, and closes the
+  applicable obligations `job-terminal` (abandonment, never a success
+  claim). A repeated identical request returns the recorded closeout
+  idempotently; a changed request is refused — the recorded one is never
+  overwritten. Idle/historical bookkeeping rows and the separate
+  directive/re-brief control rows are neither read nor rewritten.
 - `setRoundVerdict` also transitions the round to `verdict-posted` — a
   posted verdict IS that state (and a verdict on a still-`pending` round
   fails loud, machine and all, leaving no trace).
@@ -135,24 +142,29 @@ publishes it on the in-process event bus (`src/events/bus.ts`).
 | Kind | Payload (essentials) |
 |---|---|
 | `job.created` | repo, title, display_name |
-| `job.status` / `job.note` / `job.pr` / `job.target` | from→to / note / url / ref |
+| `job.status` / `job.note` / `job.pr` / `job.target` | from→to / note / url / ref (`binned` uses the ordinary from→to event) |
 | `job.admin-closeout` | disposition (`closed-without-merge`), expected status/url, provider evidence (state/merged/head/closed_at), the cited `github.branch-state` observation (event seq + identity), reason, request sha256 |
-| `job.owner-cancellation` | disposition (`owner-cancelled-abandoned`), expected status, owner authority (ruling + reference), exact prior identity (status/pr_url/deliverable/commissioner/targets/updated_at), terminal status, reason, request sha256 |
 | `round.created` / `round.status` / `round.verdict` / `round.target` | seq, lenses / from→to / verdict / ref |
 | `lens.bound` / `lens.status` | agentId / from→to (+note) |
 | `agent.spawned` / `agent.state` / `agent.error` | role, label / from→to (+error) / error, fatal |
-| `verification.started` / `verification.completed` | run id, scope, command, sha, workers, queued ms / ok, exit code, duration, bounded output hash+tail |
+| `verification.started` / `verification.completed` | run id, scope, command, sha, workers, queued ms / ok, exit code, duration, bounded output hash+tail, per-check status (`passed`/`failed`/`reused`/`not-run`). A `reused` build step never ran; a same-lane build already in flight is refused as `build-in-flight` |
 | `verification.requested` / `verification.attached` | admitted single-flight attempt: request id, run id, dedupe key (job+lane+scope+head+command) / a duplicate submission attached to that producer |
 | `verification.reconciled` | a completed request identity replayed its recorded outcome — no rerun |
 | `verification.lock-timeout` / `verification.stale-released` | wait ms + holder counts + request id / pid, reason (`holder-dead` \| `no-runner` \| `max-age`), age, interrupted request ids |
 | `branch-idle.refused` / `branch-idle.forced` | phase (`arm`/`freeze`), targetBranch, blockers — the review-arm branch-idle guard (forced rounds also carry the tag in their frozen manifest). The fallback route's two RECORD-EMITTING arm checks are the intake guard and the post-pre-flight re-entry, so a forced fallback admission records TWO `arm`-phase override records where the native route records `arm` + `freeze`. The running gate's boundary re-proofs (round intake, default-reviewer worker admission) emit NO branch-idle rows — a stop there is a `job.fallback-review` phase `aborted` |
 | `silas.review-deferred` | target_branch, phase, blockers — Silas defers a refused arm to its next sweep; `reason: fallback_unavailable` + `note` when Perkins pre-flight failed and the fallback gate could not engage, or `reason: fallback_failed` when the gate engaged and already terminated (`blocked`/`aborted`) before the receipt (the clean-abort provenance travels here, non-consuming) |
 | `silas.review-triggered` | route, and `round_id` + `rule_id`/`source_round_id` ONLY when a Perkins round is actually armed — the consuming clean-abort receipt; fallback/queued routes record the route without the provenance |
-| `job.amendment-accepted` / `job.amendment-rejected` | amendment id, version, body sha256+bytes, supersedes, approval by/reference, previous/effective contract hashes, idempotency key / refusal code+reason + current hash/version |
+| `job.amendment-accepted` / `job.amendment-rejected` | amendment id, version, body sha256+bytes, supersedes, approval by/reference, `effect` (`material`/`administrative`), `required_work_revision`, previous/effective contract hashes, idempotency key / refusal code+reason + current hash/version |
+| `job.delivered` `work_revision` | the required work revision the answered request was composed with (dispatch 0; directive intent; re-brief marker) — the service-bound acknowledgement of that revision; review admission requires `work_revision` ≥ the job's highest material amendment version (owner rule 2, 2026-10-08) |
+| `round.superseded` | reason, by, the round's status/target at supersession, `settled_specialists` (lens, attempt, checkpoint sha256) and `artifact_directory` — written BEFORE the abort; partial findings stay on disk |
+| `round.supersession-confirmed` / `round.supersession-unconfirmed` | by (+ `detail` naming what was not proven stopped: unsettled operations, non-terminal rounds, live review sessions) — an unconfirmed stop also escalates action-required and refuses the writer |
+| `job.review-superseded` / `job.review-supersession-confirmed` / `job.review-supersession-unconfirmed` | the same supersession for a review operation that owns no round (the bmad-review fallback gate) |
+| `job.review-handoff-withdrawn` | requestSeq, reason — a queued review request withdrawn because an approved material change made its candidate obsolete (terminal for restart resume) |
 | `round.review-inputs-frozen` | acceptance version/base+effective hashes/amendment ids, evidence attachment hashes (no pixels, no paths), bound CI record state |
 | `round.admission-preflight` | ok, full check list (`head-binding`, `frozen-packet:<file>`, `spec-context`, `verification-evidence`, `ci-evidence`, `evidence:<id>`), and on refusal the exhaustive named missing-input list — recorded after the freeze receipts and BEFORE any lead/child spawn (gh-169) |
 | `round.parent-incident` | exactly ONE per parent-aborted round: note, startedAttempts, startedLenses, notStartedLenses — a lead disconnect is one parent incident; never-started lenses keep their `pending` chip (not-started ≠ failed execution) (gh-169) |
 | `job.review-handoff-conflict` / `job.review-handoff-superseded` | request seq + folded scope; a differing evidence set is recorded as count + opaque request fingerprint, never paths |
+| `job.review-source-verified` | the admission binding recorded AFTER the review-source preflight proves the actual selected object store, BEFORE any job row/worktree/spawn completes: `object_store` (canonical git common dir), `target_sha` (resolved full oid), `target_base`, `range_commits`, `inputs` (path/lens/blob), `source` (`repository`/`source-package`), `package_sha256` — issue #317 |
 
 Events are appended for **state changes**; idempotent enrichment writes
 (re-registering an agent, same-state activity refreshes) update rows
@@ -168,9 +180,7 @@ row, appends the event, and (with a bus attached) publishes it:
 
 - jobs: `addJob` · `setJobStatus` · `noteJob` · `setJobPr` · `setJobTargetRef` ·
   `adminCloseParkedJob` (guarded administrative closeout, owner ruling
-  j-1115: evidence-bound parked → done for a closed-without-merge PR) ·
-  `adminCancelListedParkedJob` (owner amendment j-1117: audited
-  abandonment of the exact listed parked legacy lanes)
+  j-1115: evidence-bound parked → done for a closed-without-merge PR)
 - rounds: `addRound` · `setRoundStatus` · `setRoundVerdict` · `setRoundTarget`
 - lenses: `bindLens` · `setLensOutcome` · `markLensLive`
 - agents: `registerAgent` (upsert) · `setAgentState`
@@ -179,8 +189,12 @@ row, appends the event, and (with a bus attached) publishes it:
   `listPendingRebriefs` · `clearPendingRebriefs` · `retirePendingRebriefs`
   (the only cancellation seam: identity-checked deletion + one terminal
   `silas.rebrief-retired` audit in the same transaction)
-- amendments: `addJobAmendment` · `listJobAmendments` · `effectiveContract`
-  (append-only, expected-contract-hash concurrency, per-refusal audit)
+- amendments: `addJobAmendment` (required `effect`) · `listJobAmendments` ·
+  `effectiveContract` · `workRevisionState` (required vs delivered work
+  revision) · `correctiveVerificationDebt` (the corrective delivery's
+  unpaid exact-head verification, option A) — append-only,
+  expected-contract-hash concurrency, per-refusal audit. Migration 24 adds `job_amendments.effect` (NULL = unclassified
+  history) and `pending_directives.work_revision`.
 - reads: `getJob` · `listJobs(repo?)` · `getRound` · `listRounds` ·
   `getAgent` · `listAgents`
 
@@ -217,13 +231,14 @@ the request `payload` (note + briefing) and its sha256 `payload_hash`,
 the `baseline_seq` event watermark the request must post-date, the bound
 worker (`agent_id`, `session_file`), and `requested_at`. The marker pair
 is written BEFORE any worker spawns and cleared when its events land — or
-retired administratively when the job is already `merged`/`done` (below);
+retired administratively when the job is already `merged`/`done`/`binned`
+(below);
 `UNIQUE (job_id, kind)` means a newer request supersedes an older
 marker. Boot reconciliation (`src/dispatch/rebrief-recovery.ts`)
 consumes leftovers: resume the interrupted session (or re-dispatch fresh
 on the same lane), record the missing events, or escalate
 action-required when recovery fails. A leftover whose job has since
-reached `merged`/`done` is instead retired administratively: the
+reached `merged`/`done`/`binned` is instead retired administratively: the
 identity-checked marker deletion and a single `silas.rebrief-retired`
 audit commit in one transaction, with no spawn and no escalation.
 Retirement fires wherever the terminal state is met — the boot scan, a
@@ -337,6 +352,7 @@ is ADMISSION-UNKNOWN — never read as safe to retry. States:
 | `admitted` | a correlated `silas.directive-sent` event bound an actual awaited turn; terminal receipt pending |
 | `settled` | the correlated `job.delivered` terminal receipt was recorded |
 | `failed` | a durable positive no-effect failure was recorded; resubmit changed work under a NEW request id |
+| `retired` | **control ownership closed** by the guarded, evidence-fenced retirement after server-verified writer cessation; no delivery and no no-effect outcome is claimed, the work remains unfinished, and the request id is consumed |
 
 `POST /api/silas/directive` returns **202** with the stable `request_id`
 once the durable intent is accepted — accepted ≠ admitted. The async
@@ -359,6 +375,39 @@ not permission. The live-request duplicate guard and the boot pass
 both query the LIVE states directly, and the boot pass pages by
 `request_id` cursor — terminal history can never crowd a live request
 out of examination.
+
+**Guarded retirement (migration 23, owner approval j-1348).** When a
+prompt was delivered and the worker ceased mid-turn with no correlated
+terminal receipt, the request's CONTROL ownership can be closed without
+claiming success or no-effect: `POST
+/api/silas/directives/{request_id}/retire` runs one ledger transaction
+that re-verifies every live-ownership mark (open agent turns, child
+workers, in-process admissions, re-brief markers, other live requests,
+provider waits, verification runs, review rounds, live lane processes,
+unconfirmed restart-cleanup custody),
+binds the caller's `expected_job_id` / `expected_state` /
+`expected_payload_hash` / `expected_head` (freshly resolved from the
+lane) and therefore refuses stale or conflicting intent, preserves any
+correlated admission evidence by binding it first
+(`admitted-without-terminal`), refuses a correlated terminal receipt so
+normal settlement owns it, flips the state to `retired`, appends exactly
+one `silas.directive-retired` audit event, and CLOSES (never completes)
+an awaiting phase handoff. The row keeps a durable continuation hold
+(`hold_released_by`/`hold_released_at`): while open it fences review
+arming, digest offers and stall offers exactly like a live request, and
+only a fresh accepted directive/re-brief identity releases it. Unknown,
+stale or missing evidence fails closed; replays of the same canonical
+intent are idempotent with one audit transition. No worker is spawned,
+no job/obligation/approval is rewritten, and activation remains a
+separate owner decision — see [DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md).
+Restart-cleanup custody is **generation-bound**: a refused replacement's
+unconfirmed pending entry, refusal audit or fallback (unjournaled) audit
+refuses retirement until the ORIGINAL native owner records a disposal
+acknowledgment plus positive cessation proof carrying the same exact
+physical generation. A same-id successor's clean disposal mints its own
+generation and never releases the predecessor; an ACK, a restart or a
+successor cleanup are not proof, and a hard crash that loses the original
+owner leaves the debt fenced (fail closed).
 
 ### Explicit phase-completion handoffs (migration 12, pr136-chief-handoff)
 
@@ -599,3 +648,140 @@ decision id that held the incident, `duplicate` the incident key already
 woken, `failed` the bounded-retry exhaustion that escalated. The board
 wakes tracker and the #214 yield report (wakes/day, avoided share) read
 this stream; nothing avoids a wake silently.
+
+### Exact directive/rebrief restart progress
+
+Migration 26 (`directive-native-progress`) is additive/nullable. Historical
+request rows retain NULL request kind/contract SHA/native target/native admission/
+checkpoint/authority epoch: NULL is unprovable, not safe-to-replay. New
+requests bind kind, immutable contract snapshot, revision and native
+control epoch at acceptance. Exact native target and admission binding
+cannot be replaced; actual admission and per-turn terminal readback are
+adapter-owned, not inferred from spawn, turn-start, health or Promise
+fulfillment. Native association precedes the ledger callback, so restart
+can restore a lost ledger bind without repeating a consumed request.
+
+A durable recovery checkpoint claim has no expiry-based retry. Recovery
+judgment is a generation-fenced `restart-recovery` Gru obligation, settled
+only by correlated actual handoff/completion or a concrete reserved-owner
+decision. `silas.directive-recovery-decided` plus the retired request and
+fresh successor acceptance commit transactionally. Historical marker
+recovery uses `rebrief_recovery_decisions` for exact decision replay and
+records the marker pair in `silas.rebrief-retired` audit; the fresh
+`silas.rebrief-recovery-handoff` advances the control epoch. No historical
+outcomes, native transcripts, verification run IDs/partial UNKNOWN
+captures, or review readiness are rewritten. Native error/abort is not a
+successful delivery, and retirement is neither completion nor no-effect.
+See `DIRECTIVE-RECOVERY.md` for readback and authenticated decision fields.
+
+Current-approved revision/contract expectations are distinct from the
+predecessor generation/hash. Amendment acceptance fences the old native
+request through the control epoch. Only an amendment-only mismatch can
+permit exact retirement plus a fresh current-snapshot successor; stops,
+holds and other/unprovable control changes do not. Durable
+`silas.directive-producer-unknown` cleanup events continue to fence the
+lane across restart, until an actual adapter cessation query records the
+matching `silas.directive-producer-ceased`; disposal fulfillment alone
+cannot release that ownership or mint readiness.
+
+### Restart-recovery historical evidence and reserved-owner lineage
+
+Migration 26 adds nullable native progress and latest recovery pointers without inferring old facts. Immutable `silas.{directive,rebrief}-recovery-decided` events are uniquely indexed by exact subject + debt generation; pointers are compatibility/latest views, never mutable history. Audits retain canonical decision fingerprint, full exact marker/native subject snapshot, versioned legacy accepted/unproven receipt evidence and any concrete reserved-owner target binding.
+
+Legacy receipt SHA is server-computed and compared inside judgment transactions; clocks/watermarks alone are not correlation. Missing historical HEAD/revision are never supplied from current state. `silas.rebrief-control-closed` is non-executing administrative closure of proven-completed control with absent delivery facts: full immutable evidence remains; a concrete current-inspection obligation owns the next fresh directive/verification action. No historical delivery/current revision/verification/READY is emitted by closure.
+
+`ruling.recorded` with permission `fresh-current-approved-recovery-successor` and separate `silas.recovery-owner-stop-confirmed` are explicit owner-attributed records bound to transfer/subject/target generation/plan/current scope/stop lineage. Shared bearer attribution is not independently verified identity. Confirmation legally resumes/settles only its exact suspended real owner target; neither writer changes job parking, notification Ack, other holds or execution. Nongenuine target closure/plan changes create new suspended Gru incarnations, not permission. Original-generation decision replay remains immutable after subsequent incarnations.
+
+### GH-286 physical restart and verification evidence
+
+`silas.directive-producer-reserved` is only a pre-effect dispatch reservation.
+`silas.directive-producer-started` binds a prepared physical native incarnation
+(UUID/host/PID/request/session plus accepted authority); neither proves prompt
+admission. The exact native user receipt owns `silas.directive-sent` admission.
+Cleanup receipts consume only their exact producer start, or an explicitly
+named original UNKNOWN receipt. Logical minion reuse cannot erase older debt.
+The adapter's append-only `.producers.jsonl` journal precedes native execution;
+legacy, torn, live, foreign-host and uncertain tool evidence stays unknown.
+Original host ESRCH plus a safe persisted checkpoint and independent producer
+fences permits bounded same-session continuation, never original prompt replay.
+
+`verification.no-start` durably settles only scheduler-owned queued/granted
+attempts that shutdown revoked before spawn. Original request/run IDs remain
+readable across restart; no completion/PASS is invented. Same-ID terminal
+readback may append `verification.process-reconciled` and close a matching
+registry PID row only when both original PID and detached process group are
+absent. Terminal failures/SIGTERM, partial output and native review provenance
+are unchanged. Unsupported historical evidence stays actionable UNKNOWN.
+These controls authorize no owner Ack, production restart/deploy or merge.
+
+## FOR GRU mailbox metadata (GH-305)
+
+Migration 25 adds `gru_mailbox` only. Reconciliation changes metadata, never
+jobs, rounds, obligations, directives, notification lifecycle or owner stops.
+The forward-only migration runs with the ordinary ledger boot; this change
+performs no installed-ledger migration, deployment or restart.
+
+Authenticated `GET /api/mailbox?limit=50&cursor=<last item id>` returns `items`,
+`counts` and `nextCursor` (null at the end). Limit is 1–200; item ordering is
+stable locale ID order (cursor comparison uses the same ordering). Each item carries stable identity/subject, reason-specific
+bases and aggregate `basis`, next-action `owner`, lifecycle `state`, restrictions,
+control/follow-up references, disposition and delivery receipt. Terminal source
+receipts are retained; a merged parent never settles a child's mailbox item.
+
+`POST /api/mailbox/{encoded id}/disposition` accepts JSON:
+
+```json
+{
+  "basis": "exact basis returned by GET",
+  "state": "waiting",
+  "owner": "owner",
+  "detail": "continuation requires an explicit owner ruling",
+  "dependency": "owner continuation decision",
+  "recheckAt": "2026-11-01T00:00:00.000Z",
+  "references": [{ "kind": "decision", "id": "existing hold id" }]
+}
+```
+
+States are `needs-gru`, `delegated`, `waiting`, `resolved`. References are
+`decision`, `directive`, `obligation`, `agent` or `event`, validated against the
+same subject at the transactional boundary. Waiting/delegation require a real
+next-action owner, dependency and future canonical ISO recheck. Delegation also
+requires actual live control/work owned by that minion and an open follow-up
+obligation. Resolution requires an exact-basis acted/dismissed/superseded
+decision covering **every** reason, or a scoped correlated settled-obligation
+receipt accounting for the entire item. Generic read/wake receipts and wildcard
+holds cannot certify resolution. Producer-owned incident closure is refused.
+Malformed input returns 400; stale basis/references or unsupported resolution
+returns 409; unknown items return 404. Identical dispositions replay without
+minting another follow-up incarnation, including identical replay after the
+original deadline expires. Supporting references are revalidated on reads;
+cleared decisions and ended work cannot keep suppressing unresolved debt.
+Captured delivery receipts persist original reasons, source IDs, basis,
+incarnation and acceptance time even after source changes. Idempotent recovery
+never suppresses newer evidence; delivery without a next-action disposition
+rechecks five minutes after original acceptance. Due follow-ups reopen
+attention, not operational authority.
+
+Previously surfaced exact live obligations remain source-derived
+waiting/delegated metadata under their actual owner/dependency. Optional nested
+`disposition.sourceObligationId` cites the real obligation and is server-owned:
+disposition POST rejects caller-supplied provenance. Quiet code-only monitoring
+of non-Gru debt is distinct from a genuinely recorded Gru follow-up. Neither
+ownership transition nor a temporarily future-due obligation implies settlement.
+
+Malformed source evidence returns HTTP 503 `board_unavailable`, separate from
+input errors. WebSocket snapshot failures send a nonfatal error then close 1011;
+valid pairing tokens remain valid. Retained web rows/counts are explicitly
+last-known/unavailable until fresh evidence arrives. Notification IDs may use
+`mailbox:` and other ordinary prefixes; NUL characters are rejected before
+writes because Node SQLite cannot round-trip that identity.
+
+The shared bearer token authenticates access, not a caller's claimed role.
+Mailbox metadata adds no new operational capabilities or impersonated owner
+approval. Existing lifecycle/control boundaries remain authoritative.
+
+Obligation-only admission is restricted to live `gru-decision` debt: an open
+unscheduled/due decision or an actually due waiting receipt/dependency with
+recorded Gru follow-up. Healthy Silas-mechanical, owner-decision and
+external-wait debt alone do not widen FOR GRU. Independently eligible threads
+retain all applicable obligations and their follow-up clocks.

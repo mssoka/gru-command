@@ -33,16 +33,16 @@ restart produce the same truth without data edits.
 | `GET /api/transcripts` | session transcript list (newest first; ledger-bound agents carry ids/labels) |
 | `GET /api/transcripts/file?file=<rel>[&q=&before=&limit=]` | one transcript: paged entries (`before` = exclusive upper index, newest-first, `nextCursor`) or case-insensitive search — newest-first scan under a bounded cap, `scanned`/`total` disclose truncation |
 | `POST /api/jobs` | `{id, repo, title, baseBranch?}` → job (`dispatched`) |
-| `POST /api/jobs/:id/status` | `{status}` — validated against the [job machine](./LEDGER.md) |
+| `POST /api/jobs/:id/status` | `{status}` — validated against the [job machine](./LEDGER.md); `binned` is the terminal discard (any non-terminal source; never resumable) |
 | `POST /api/jobs/:id/closeout` | `{expected_status, expected_pr_url, provider, reason}` — guarded administrative closeout of a parked PR-backed lane whose recorded provider observation is CLOSED-without-merge; audited, idempotent, refusals are `409 closeout_refused` + `code` ([OPERATIONS.md](./OPERATIONS.md)) |
-| `POST /api/jobs/:id/owner-cancellation` | `{expected_status, authority_reference, reason}` — guarded administrative abandonment of an EXACT owner-listed parked legacy lane (no PR/report metadata); audited, idempotent, refusals are `409 cancellation_refused` + `code` ([OPERATIONS.md](./OPERATIONS.md)) |
 | `POST /api/rounds` | `{jobId, lenses? (default 9), targetRef?}` → round (`pending`) |
 | `POST /api/rounds/:id/status` / `:id/verdict` | `{status}` / `{verdict}` |
 | `POST /api/agents` | `{id, role, label?, jobId?, roundId?, sessionFile?}` (upsert) |
 | `POST /api/agents/state` | `{id, state}` |
+| `POST /api/notifications/needs-owner` | `{title (1-500), detail (1-4000), idempotencyKey? (1-128 of [A-Za-z0-9._:-])}` — Gru's owner escalation into FOR YOU (decision #100, 2026-10-12). Without a key every valid request is its own row. With a key the key names ONE escalation: a retry with the same key and same title/detail returns the existing row (`200`, no second row or bell; first creation is `201`); the same key with a changed title/detail is `409 idempotency_conflict`; a new key is a new decision. Retry an uncertain outcome with the SAME key |
 | `POST /api/notifications/:id/shown` | `{surface}` — display receipt (idempotent per surface; the shown:true doctrine) |
 | `POST /api/notifications/:id/ack` | `{by?}` — owner/FYI ack; refuses machine rows (400), and owner ack re-arms an open breaker |
-| `POST /api/notifications/:id/disposition` | `{detail}` — authenticated Gru disposition for an action-required ID after substantive action; resolves it with a ledger event and closes any unresolved-attention owner follow-up; never clears unrelated owner stops |
+| `POST /api/notifications/:id/disposition` | `{detail, actor?}` — authenticated Gru disposition for an action-required ID after substantive action; resolves it with a ledger event and closes any unresolved-attention owner follow-up; never clears unrelated owner stops. **Actorship (decision #99, 2026-10-12):** the board has ONE shared bearer for owner and agent callers, so the credential proves a paired caller, not Gru. `by: 'gru'` in the ledger names the disposition *role*; the `notification.resolved` event also records `credential: 'shared-bearer'` and the caller-declared `declaredActor` (`null` when omitted). `actor` may only be omitted or `"gru"` (anything else is 400). Neither value is proof of identity; a separate owner credential is deliberately not introduced (no new auth framework). Owner Ack (`/ack`) is likewise shared-bearer and its `by` is caller-declared; when omitted the server records `web` |
 | `POST /api/lenses/bind` | `{roundId, lens, agentId}` — chip follows the agent's events |
 | `POST /api/lenses/outcome` | `{roundId, lens, state: done\|error, note?}` (live derives from agent events — never posted) |
 
@@ -50,13 +50,19 @@ restart produce the same truth without data edits.
 token exists (empty token = locked door, never open). Illegal
 transitions and unknown entities are 400/404 with the reason in
 `detail`; a guarded closeout refusal is a typed `409 closeout_refused`
-and an owner-cancellation refusal is a typed `409 cancellation_refused`,
-each with a `code` naming the refusing guard. Bodies are capped (200 KB).
+whose `code` names the refusing guard. Bodies are capped (200 KB).
 
 PR state derives from the record: a `merged` job reports `merged`; a
-terminal `done` job is a closed receipt — its registered PR is never
-presented or counted as open (and closure never infers a merge); any
-other lane with a registered URL reports `open`.
+terminal non-merge job (`done`, including a closed-without-merge
+administrative closeout, and `binned`, a discarded lane) is a closed
+receipt — its registered PR is never presented or counted as open (and
+closure never infers a merge); any other lane with a registered URL
+reports `open`. A binned row renders with the distinct dashed muted
+`binned` badge and stays in COLD behind an explicit “Show N binned
+records” disclosure (the band's complete count includes it; opening the
+disclosure is inspection only — never an ACK, a transition or an
+approval). Binned rows keep their full round history in the expanded
+body: the discard is inspected, not erased.
 
 ## Board WebSocket — `/board/ws`
 
@@ -188,22 +194,50 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   `silas.directive-sent`, `silas.rebrief`, `silas.escalated`,
   `silas.wake`) — visible in the event stream like every other
   transition.
+- **Managed repository overview (owner-approved compact rows A):** below
+  the CREW list, one read-only module per configured managed repository
+  (the workspace root's depth-1 `.git` registry — the same rule the setup
+  wizard uses). Each compact row shows the repository identity (an https
+  link only when the origin remote proves a safe GitHub identity,
+  otherwise an explicit not-linked reason), exact repo-wide open-PR and
+  open-issue counts (issues EXCLUDING PRs, via GitHub's aggregate search;
+  zero is a real count and unknown is never shown as zero), and the newest
+  Actions run on the repository's discovered default branch as
+  `workflow · branch` plus a status badge (passed/failed/timed-out/
+  startup-failure/cancelled/skipped/neutral/action-required/stale-run/
+  running/queued/no-workflow/never-run/no-branch/unknown; Actions-disabled
+  rows read unavailable — text and glyph, never colour alone) with a
+  safe run link and the checked age. This is default-branch CI context,
+  never deployment health, aggregate CI or merge readiness. The server
+  tracker refreshes every 5 minutes (bounded per-refresh call budget and
+  wall-clock phases, search calls paced to the sustained quota, coalesced,
+  server-side `gh` auth only; the browser never polls GitHub)
+  and the row's `checkedAt` is the last SUCCESSFUL fetch: cached data kept
+  after a failure or older than three cadences renders as `STALE · last …`
+  with the age and the failure, so an old green never reads as current.
+  The snapshot field is additive (`repoOverview`; absent/null hides the
+  module). Rows live in their own bounded scroll list under the crew's
+  independent scroll; the module follows the CREW tab and disappears with
+  it on TRANSCRIPTS. Reads and disclosures are display-only — nothing
+  here acks, executes or changes GitHub state.
 - **Notification center (E7; routing split 2026-09-23; section truth
   2026-09-29):** the bell panel renders the durable notification log in
   three bands — FOR YOU (all pending needs-owner rows, even older than the
   bounded latest feed: owner-only decisions and stops whose ack re-arms
   supervision), NEEDS GRU (all pending machine rows, including those older
   than the recent feed; it wakes Gru once and refuses human Ack. Rows bound
-  to a terminal merged/done lane are CLOSED RECEIPTS: they render under
-  FEED, never as live queue entries, and the live unacked chip does not
-  count them), and FEED (FYI rows plus closed receipts). The bell
+  to a terminal merged/done/binned lane are CLOSED RECEIPTS: they render
+  under FEED, never as live queue entries, and the live unacked chip does
+  not count them), and FEED (FYI rows plus closed receipts). The bell
   is the alert/history surface: it shares the SAME authoritative owner
   projection as the board's permanent FOR YOU band — pending acks AND
   ready PRs, so the two surfaces never disagree about what the owner
   owes (the badge and toasts still count needs-owner notifications
-  only); opening it never completes an obligation. A machine
-  alert left unresolved 30 minutes after delivery opens a separate
-  owner-only follow-up in FOR YOU; Gru's later disposition resolves it. The badge and live
+  only); opening it never completes an obligation. There is no
+  timed escalation: a machine alert is never promoted to the owner by age
+  (docs/FLOW.md forbids promotion by age). It stays in NEEDS GRU for Gru to
+  triage and dispose; only genuine owner decisions are posted to FOR YOU, and
+  those rows persist until the owner's Ack. The badge and live
   toasts serve needs-owner only; every displayed row earns a shown receipt
   per surface (a display receipt is not an acknowledgement); acking an
   owner row clears it where an ack has meaning (a breaker row re-arms
@@ -249,3 +283,19 @@ names anywhere, ever.
 - E2E (`web/e2e/`): mock board render + transcript drawer; real-service
   board (API-seeded jobs, live push, crew rail, real transcript open +
   search, 401 doors, phone board-first).
+
+## Shared FOR GRU mailbox (GH-305)
+
+The server's `mailbox` snapshot is the only FOR GRU membership authority.
+Job threads aggregate exact-basis reasons (blocked/error, current review failure,
+PR conflict, machine alerts and live obligations); unbound incidents have their
+own rows. A concluded parent never hides a blocked child. The header separately
+counts **threads**, **incidents**, and source **notifications**. Waiting and
+delegated items remain inspectable with their owner, dependency, recheck,
+control/follow-up references, restrictions and delivery receipt. Source job
+statuses and child reports are never rewritten by mailbox reconciliation.
+
+An absent mailbox means **unavailable**, not guessed eligibility or a clean
+queue. FOR YOU, notification acknowledgements, and other bands keep their
+existing authority. The mailbox is read-only on the board; disclosure does not
+acknowledge or resolve anything.

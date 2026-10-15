@@ -1,4 +1,5 @@
 import type { BusEvent } from '../events/bus.js';
+import { isJobTerminal } from '../ledger/states.js';
 import type { LedgerApi, PhaseHandoffRecord } from '../ledger/api.js';
 import type { LogLevel } from '../logger.js';
 
@@ -411,6 +412,12 @@ function phaseAdmissionValid(
       );
     }
     case 'silas-rebrief':
+      if (phase.requestId !== null) {
+        const request = ledger.getDirective(phase.requestId);
+        return payload['request_id'] === phase.requestId && request?.jobId === phase.jobId && request.requestKind === 'rebrief' &&
+          (request.state === 'admitted' || request.state === 'settled');
+      }
+      // Historical marker-only re-brief phases retain their original proof.
       // The re-brief request records its own `silas.rebrief` event (with
       // this phase id) BEFORE the delivery; an interrupted/failed re-brief
       // records none and can never complete. (When the marker pair still
@@ -542,8 +549,7 @@ function finishPhaseHandoff(
     deps.ledger.markPhaseHandoffObligation({ phaseId: phase.phaseId, obligationId: obligation.id });
   }
   const obligationId = obligation.id;
-  const terminal = job.status === 'done' || job.status === 'merged';
-  if (terminal) {
+  if (isJobTerminal(job.status)) {
     if (obligation.state === 'open' || obligation.state === 'waiting' || obligation.state === 'suspended') {
       deps.ledger.settleObligation({
         obligationId,
@@ -722,7 +728,7 @@ function reconcileOnePhase(
     // No completion evidence: a terminal job can never complete, so
     // close the stale intent (no hand-back — the lane is finished).
     const job = deps.ledger.getJob(phase.jobId);
-    if (job !== null && (job.status === 'done' || job.status === 'merged')) {
+    if (job !== null && isJobTerminal(job.status)) {
       deps.ledger.closePhaseHandoff({
         phaseId: phase.phaseId,
         reason: `job reached ${job.status} with no completion evidence`,

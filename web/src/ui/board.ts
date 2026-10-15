@@ -21,6 +21,7 @@
 
 import {
   agentActivityOf,
+  ARCHIVED_LESSON_SLUG,
   agentRailBand,
   agentRuntimeOf,
   agentStateTone,
@@ -32,9 +33,13 @@ import {
   jobStatusTone,
   lensChipState,
   lensChipTone,
+  LESSONS_PROPOSAL_KIND,
   type AgentView,
   type BoardSnapshot,
   type JobView,
+  type LessonChangeView,
+  type LessonProposalView,
+  type RemovedLessonView,
   type NotificationView,
   type PipelineEntryView,
   type RoundView,
@@ -42,7 +47,6 @@ import {
 import { loadExpandedJobs, saveExpandedJobs } from '../lib/board-collapse.js';
 import {
   BAND_LABELS,
-  liveWorkerStampsByJob,
   stoppedWorkersByJob,
   workerStopLabel,
   type BandId,
@@ -58,17 +62,20 @@ import {
   sectionNav,
   settledJobs,
   settledPreview,
+  snapshotSections,
   IN_FLIGHT_PREVIEW_SIZE,
   PIPELINE_PREVIEW_SIZE,
   SETTLED_PREVIEW_SIZE,
   type SectionId,
 } from '../lib/board-sections.js';
 import { railChips, type RailChip } from '../lib/board-rail.js';
-import { BOARD_WORDS, heistCount } from '../lib/board-vocabulary.js';
+import { BOARD_WORDS, heistCount, megaminionCount } from '../lib/board-vocabulary.js';
+import { familyStatusBreakdown, isLiveMegaminion } from '../lib/board-family.js';
 import { formatAge } from '../lib/board-time.js';
 import { prLinkLabel } from '../lib/pr-link.js';
 import {
   jobSignal,
+  mailboxSignal,
   pluralCount,
   roundSummary,
   terminalBoundNotificationIds,
@@ -81,6 +88,7 @@ import {
   safePrUrl,
   type OwnerAckRow,
   type OwnerPrRow,
+  type OwnerProposalRow,
 } from '../lib/owner-band.js';
 
 /** Truthful lens progress for whole-PR rounds: show what actually ran —
@@ -96,10 +104,11 @@ function lensProgressLabel(summary: RoundSummary): string {
   }
   return parts.join(' · ');
 }
-import type { BoardClient } from '../lib/board-client.js';
+import { BoardApiError, type BoardClient } from '../lib/board-client.js';
 import type { StorageLike } from '../theme.js';
 import { DECISION_LABELS, decisionChipTone } from './decisions-status.js';
 import { el, mustGet } from './dom.js';
+import { RepoOverviewPanel } from './repo-overview.js';
 
 const ROLE_EMOJI: Readonly<Record<string, string>> = {
   gru: '🧠',
@@ -128,6 +137,9 @@ export class BoardView {
   private readonly boardNav: HTMLElement;
   private readonly chipRail: HTMLElement;
   private readonly agentsCount: HTMLElement;
+  /** Managed repository overview (compact rows A) — rendered below the
+   * crew list inside the same rail panel. */
+  private readonly repoOverview: RepoOverviewPanel;
   private readonly notificationBell: HTMLButtonElement;
   private readonly notificationBadge: HTMLElement;
   private readonly notificationPanel: HTMLElement;
@@ -162,13 +174,28 @@ export class BoardView {
    * the mock feed carries ack-ready rows without a client; rebound on
    * re-pair). */
   private boardClient: BoardClient | null;
+  /** Lesson proposal rows' UI state by notification id, shared by the band
+   * and the bell and kept across snapshot re-renders (review disclosure,
+   * fetched review, in-flight decision, last refusal). Pruned when the
+   * proposal leaves FOR YOU; cleared on re-pair. */
+  private readonly proposalStates = new Map<string, ProposalRowState>();
+  /** Bumped on every re-pair: work started for an older client never
+   * changes state, re-renders, or posts through the new one. */
+  private clientGeneration = 0;
   /** Toast + browser-notification surface (E7). */
   private onToast: ((notification: NotificationView) => void) | null = null;
   private snapshot: BoardSnapshot | null = null;
+  private unavailableReason: string | null = null;
   /** ONE sections derivation per render (classification truth is shared
    * by the shortcut strip and the section bodies — computed from the SAME
    * stopped/live-worker inputs so they can never disagree). */
   private currentSections: ReturnType<typeof boardSections> | null = null;
+  /** The per-render signal maps a nested megaminion row reads (the same
+   * maps its parent's section passed to the parent row). */
+  private jobSignals: {
+    readonly unacked: ReadonlyMap<string, number>;
+    readonly stoppedWorkers: ReadonlyMap<string, WorkerStopView>;
+  } | null = null;
   /** D3: older receipt pages fetched on demand (merged into FEED). */
   private extraReceipts: NotificationView[] = [];
   private receiptsNextOffset = 0;
@@ -190,6 +217,9 @@ export class BoardView {
   private pipelineExpanded = false;
   private forGruExpanded = false;
   private coldExpanded = false;
+  /** Binned rows inside COLD stay behind their own explicit disclosure
+   * (default view hides them; the head count still carries them). */
+  private binnedExpanded = false;
   /** v5: job ids already on screen (new rows slide in; old ones do not). */
   private readonly knownJobIds = new Set<string>();
   private firstJobsRender = true;
@@ -215,6 +245,9 @@ export class BoardView {
     }
     this.chipRail = mustGet('chip-rail');
     this.agentsCount = mustGet('rail-agents-count');
+    this.repoOverview = new RepoOverviewPanel(mustGet('board-repos'), {
+      ageNode: (className, since, prefix, suffix) => this.ageNode(className, since, prefix, suffix),
+    });
     this.notificationBell = mustGet<HTMLButtonElement>('notification-bell');
     this.notificationBadge = mustGet('notification-badge');
     this.notificationPanel = mustGet('notification-panel');
@@ -256,6 +289,8 @@ export class BoardView {
    * previous server's fetched receipts or resume its pagination cursor. */
   bindClient(client: BoardClient): void {
     this.boardClient = client;
+    this.clientGeneration += 1;
+    this.proposalStates.clear();
     this.sentShown.clear();
     this.extraReceipts = [];
     this.receiptsNextOffset = 0;
@@ -264,12 +299,27 @@ export class BoardView {
   }
 
   render(snapshot: BoardSnapshot): void {
+    this.unavailableReason = null;
+    this.renderSnapshot(snapshot);
+  }
+
+  markUnavailable(message: string): void {
+    this.unavailableReason = message;
+    if (this.snapshot !== null) this.renderSnapshot(this.snapshot);
+  }
+
+  private renderSnapshot(snapshot: BoardSnapshot): void {
     const previous = this.snapshot;
     this.snapshot = snapshot;
+    const pendingProposals = new Set(
+      ownerRows(snapshot).filter((row) => row.kind === 'proposal').map((row) => row.notification.id),
+    );
+    for (const id of this.proposalStates.keys()) if (!pendingProposals.has(id)) this.proposalStates.delete(id);
     // Focus preservation across live pushes: the control the operator was
     // on keeps its place (stable focus keys), so a snapshot update never
     // steals focus or resets a disclosure mid-interaction.
     const focusKey = this.captureFocusKey();
+    const ownerFocus = captureOwnerFocusKey();
     this.currentSections = null; // one fresh derivation per render
     this.renderOwnerActions(snapshot);
     this.renderRail(snapshot);
@@ -277,7 +327,9 @@ export class BoardView {
     this.renderJobs(snapshot);
     this.restoreFocusKey(focusKey);
     this.renderAgents(snapshot.agents);
+    this.repoOverview.render(snapshot.repoOverview);
     this.renderNotifications(snapshot);
+    restoreOwnerFocusKey(ownerFocus);
     this.surfaceNewNotifications(previous, snapshot.notifications);
   }
 
@@ -296,7 +348,7 @@ export class BoardView {
     const nav = this.boardNav;
     nav.hidden = false;
     nav.replaceChildren();
-    for (const row of sectionNav(sections.counts, sections.pipelineAvailable)) {
+    for (const row of sectionNav(sections.counts, sections.pipelineAvailable, sections.mailboxAvailable)) {
       const link = document.createElement('a');
       link.className = 'board-nav__link';
       link.href = row.href;
@@ -309,6 +361,7 @@ export class BoardView {
       link.title = row.counted
         ? `${row.label}: ${row.count} — jump to section`
         : `${row.label}: not hosted on this server`;
+      if (row.id === 'for-gru' && this.unavailableReason !== null) link.title = `${row.label}: last-known count — current mailbox unavailable`;
       nav.append(link);
     }
     this.measureNav();
@@ -373,7 +426,11 @@ export class BoardView {
     // shortcut — one gesture away, never an unrelated section.
     const sectionKey = /^section:([a-z-]+)$/u.exec(key);
     if (sectionKey !== null) {
-      this.boardNav.querySelector<HTMLElement>(`.board-nav__link[data-nav="${sectionKey[1]}"]`)?.focus();
+      // The binned disclosure lives INSIDE COLD but carries its own focus
+      // key; if it vanished mid-render, focus falls back to the COLD
+      // shortcut, never <body>.
+      const navId = sectionKey[1] === 'cold-binned' ? 'cold' : sectionKey[1];
+      this.boardNav.querySelector<HTMLElement>(`.board-nav__link[data-nav="${navId}"]`)?.focus();
       return;
     }
     let jobId: string | null = null;
@@ -454,6 +511,8 @@ export class BoardView {
       for (const row of window.rows) {
         if (row.kind === 'ack') {
           list.append(this.ownerAckRow(row, bandVisible));
+        } else if (row.kind === 'proposal') {
+          list.append(this.ownerProposalRow(row, bandVisible));
         } else {
           list.append(this.ownerPrRow(row));
         }
@@ -465,7 +524,7 @@ export class BoardView {
         more.setAttribute('aria-expanded', String(this.ownerExpanded));
         more.addEventListener('click', () => {
           this.ownerExpanded = true;
-          if (this.snapshot !== null) this.render(this.snapshot);
+          if (this.snapshot !== null) this.renderSnapshot(this.snapshot);
         });
         mount.append(more);
       }
@@ -526,6 +585,255 @@ export class BoardView {
     // doctrine) — a receipt is proof of display, never of completion.
     if (bandVisible) this.sendShown(item, 'web-board');
     return node;
+  }
+
+  /** A Book of Lessons proposal (owner decision 2026-10-07): the owner
+   * reviews every change — lesson text, metadata, removals, index entries —
+   * then Accept writes it or Reject discards it. The row's state lives in
+   * proposalStates, shared by the band and the bell, so a snapshot push
+   * never closes a disclosure, drops the fetched text, moves focus, or
+   * re-enables an in-flight decision. Work begun for an older client (before
+   * a re-pair) is dropped. Like Ack, only the authoritative snapshot closes
+   * the row. */
+  private ownerProposalRow(row: OwnerProposalRow, bandVisible: boolean): HTMLElement {
+    const item = row.notification;
+    let state = this.proposalStates.get(item.id);
+    if (state === undefined) {
+      state = { open: false, review: null, loading: null, inFlight: null, recorded: null, message: null, loadFailed: false, nested: new Set() };
+      this.proposalStates.set(item.id, state);
+    }
+    const current = state;
+    const focusBase = `owner-proposal:${item.id}`;
+    const node = el('article', 'board-owner__row board-owner__row--proposal');
+    node.dataset.proposalId = item.id;
+    node.append(
+      el('div', 'board-owner__title', `📖 ${item.title}`),
+      el(
+        'div',
+        'board-owner__meta lbl',
+        `${formatTs(item.ts)} · owner decision owed${item.detail !== null && item.detail !== '' ? ` — ${item.detail}` : ''}`,
+      ),
+      el('div', 'lbl board-owner__consequence', row.consequence),
+    );
+    const review = document.createElement('details');
+    review.className = 'board-owner__review';
+    const summary = document.createElement('summary');
+    summary.textContent = 'Review changes';
+    summary.dataset.ownerFocusKey = `${focusBase}:review`;
+    const body = el('div', 'board-owner__review-body lbl');
+    if (current.review !== null) body.replaceChildren(renderProposalReview(current.review, current.nested, focusBase));
+    else body.textContent = current.loading !== null ? 'loading…' : 'not loaded — close and reopen to retry';
+    review.append(summary, body);
+    review.open = current.open;
+    const generation = this.clientGeneration;
+    const live = (): boolean => generation === this.clientGeneration;
+    const load = (): Promise<LessonProposalView> => {
+      if (current.review !== null) return Promise.resolve(current.review);
+      if (current.loading !== null) return current.loading;
+      const client = this.boardClient;
+      const pending: Promise<LessonProposalView> =
+        client === null
+          ? Promise.reject(new Error('board is not connected'))
+          : client.getLessonProposal().then((proposal) => {
+            if (proposal.notificationId !== item.id) {
+              throw new Error('this notice belongs to an older proposal — the next snapshot retires it');
+            }
+            return proposal;
+          });
+      current.loading = pending.then(
+        (proposal) => {
+          if (!live()) throw new Error('re-paired');
+          current.review = proposal;
+          current.loading = null;
+          if (current.loadFailed) {
+            // A retry that worked: the earlier failure no longer applies.
+            current.loadFailed = false;
+            current.message = null;
+          }
+          if (proposal.decision !== null) {
+            // Recorded elsewhere (another device, or before a restart): only
+            // the same decision can finish it.
+            const recorded = proposal.decision.kind === 'accepted' ? 'accept' : 'reject';
+            current.recorded = recorded;
+            current.message ??= recordedMessage(recorded, proposal.recovery?.conflict ?? null);
+          }
+          this.rerenderOwner();
+          return proposal;
+        },
+        (error: unknown) => {
+          if (!live()) throw error;
+          current.loading = null; // a later open/decision retries the fetch
+          current.loadFailed = true;
+          if (error instanceof BoardApiError && error.status === 404) {
+            // Decided elsewhere before this page loaded it: an unknown
+            // outcome, not a failure — refresh to show what happened.
+            current.message = describeDecisionFailure(error, current.recorded);
+            client?.wake();
+          } else {
+            current.message = `Couldn’t load the proposal: ${describeProposalError(error)}`;
+          }
+          this.rerenderOwner();
+          throw error;
+        },
+      );
+      return current.loading;
+    };
+    review.addEventListener('toggle', () => {
+      // Only the owner opening it fetches: restoring an open disclosure on
+      // re-render (which also fires toggle) must never refetch in a loop.
+      const wasOpen = current.open;
+      current.open = review.open;
+      if (review.open && !wasOpen) void load().catch(() => {});
+    });
+    const actions = el('div', 'board-owner__actions');
+    const accept = document.createElement('button');
+    accept.type = 'button';
+    accept.className = 'board-owner__ack board-owner__accept';
+    accept.dataset.actionId = row.actionId;
+    accept.dataset.ownerFocusKey = `${focusBase}:accept`;
+    const reject = document.createElement('button');
+    reject.type = 'button';
+    reject.className = 'board-owner__ack board-owner__reject';
+    reject.dataset.ownerFocusKey = `${focusBase}:reject`;
+    accept.textContent = current.inFlight === 'accept' ? 'accepting…' : 'Accept';
+    reject.textContent = current.inFlight === 'reject' ? 'rejecting…' : 'Reject';
+    // A recorded decision can only be finished, never flipped.
+    accept.disabled = current.inFlight !== null || current.recorded === 'reject';
+    reject.disabled = current.inFlight !== null || current.recorded === 'accept';
+    /** An unconfirmed decision (#277): the cached proposal metadata may be
+     * stale — the server may have recorded the choice and lost only the
+     * reply. Reload it; the FETCHED durable decision (never the choice
+     * attempted here) locks the opposite button and replaces the outdated
+     * uncertainty wording. No recorded decision leaves the row undecided,
+     * with the uncertainty wording as it was. */
+    const reconcile = (uncertain: string): void => {
+      const previous = current.review;
+      current.review = null;
+      void load()
+        .then((proposal) => {
+          if (!live() || proposal.decision === null || current.recorded === null) return;
+          if (current.message === uncertain) current.message = recordedMessage(current.recorded, proposal.recovery?.conflict ?? null);
+          this.rerenderOwner();
+        })
+        .catch((error: unknown) => {
+          if (!live()) return;
+          current.review ??= previous; // nothing newer was learned: keep what the owner was reading
+          // A 404 already carries its own, more specific explanation.
+          if (error instanceof BoardApiError && error.status === 404) return;
+          // The reload itself failed (the network is still down): the
+          // decision stays unconfirmed — say so, not "couldn't load".
+          current.loadFailed = false;
+          current.message = uncertain;
+          this.rerenderOwner();
+        });
+    };
+    const decide = (decision: 'accept' | 'reject'): void => {
+      if (current.inFlight !== null) return;
+      const client = this.boardClient;
+      if (client === null) return;
+      current.inFlight = decision;
+      current.message = null;
+      this.rerenderOwner();
+      void load()
+        .then((proposal) => {
+          if (!live()) throw new Error('re-paired');
+          if (current.recorded !== null && current.recorded !== decision) return null; // never flip a recorded decision
+          return client.decideLessonProposal(proposal.id, decision);
+        })
+        .then((result) => {
+          if (!live()) return;
+          if (result === null) {
+            current.inFlight = null;
+            this.rerenderOwner();
+            return;
+          }
+          if (result.incomplete === true) {
+            current.inFlight = null;
+            current.recorded = decision;
+            current.message =
+              `Your ${decision === 'accept' ? 'Accept' : 'Reject'} is recorded, but finishing it hit a problem` +
+              `${result.detail !== undefined ? ` (${result.detail})` : ''}. Press ${decision === 'accept' ? 'Accept' : 'Reject'} again to finish it.`;
+            this.rerenderOwner();
+            return;
+          }
+          // Success is NOT completion — the row closes only when the
+          // authoritative snapshot carries the resolution (any device). Ask
+          // for that snapshot now rather than wait for a push.
+          client.wake();
+        })
+        .catch((error: unknown) => {
+          if (!live()) return;
+          current.inFlight = null;
+          // Decided elsewhere: drop the cached review so the next load
+          // brings the recorded decision (and its lock) with it.
+          if (error instanceof BoardApiError && error.code === 'proposal_decided') current.review = null;
+          // Gone, or an outcome nobody confirmed: maybe decided here (a
+          // lost reply) or on another device — refresh, so the snapshot
+          // shows what actually happened. A recorded intent is kept.
+          const proven = error instanceof BoardApiError &&
+            ['proposal_stale', 'proposal_decided', 'proposal_mismatch'].includes(error.code ?? '');
+          if (!proven) client.wake();
+          current.message = describeDecisionFailure(error, current.recorded);
+          const uncertain = current.message;
+          this.rerenderOwner();
+          if (!proven) reconcile(uncertain);
+        });
+    };
+    accept.addEventListener('click', () => decide('accept'));
+    reject.addEventListener('click', () => decide('reject'));
+    actions.append(accept, reject);
+    node.append(review, actions);
+    if (current.message !== null) {
+      const message = el('div', 'board-owner__error', current.message);
+      message.setAttribute('role', 'alert');
+      node.append(message);
+    }
+    if (bandVisible) this.sendShown(item, 'web-board');
+    return node;
+  }
+
+  /** The bell's copy of a lesson proposal is a pointer, not a control
+   * (owner decision 2026-10-07): the review and the decision live only in
+   * the For You band, so the two can never disagree. */
+  private ownerProposalPointer(row: OwnerProposalRow): HTMLElement {
+    const item = row.notification;
+    const node = el('article', 'board-owner__row board-owner__row--pointer');
+    node.append(
+      el('div', 'board-owner__title', `📖 ${item.title}`),
+      el('div', 'board-owner__meta lbl', `${formatTs(item.ts)} · waiting for you in For You — review the changes and decide there`),
+    );
+    const go = document.createElement('button');
+    go.type = 'button';
+    go.className = 'board-owner__goto';
+    go.textContent = 'Go to For You';
+    go.addEventListener('click', () => {
+      this.notificationPanel.hidden = true;
+      this.notificationBell.dataset.open = 'false';
+      // C3: an older proposal can sit behind the band's window — reveal the
+      // whole owner list before looking for it.
+      if (!this.ownerExpanded) {
+        this.ownerExpanded = true;
+        this.rerenderOwner();
+      }
+      const target = document.querySelector<HTMLElement>(`#board-owner [data-proposal-id="${CSS.escape(item.id)}"]`);
+      const landing = target?.querySelector<HTMLElement>('.board-owner__review > summary') ?? null;
+      if (target === null || landing === null) {
+        // Nothing to land on (already decided): focus never stays inside
+        // the hidden panel.
+        this.notificationBell.focus();
+        return;
+      }
+      target.scrollIntoView?.({ block: 'center' });
+      landing.focus();
+    });
+    node.append(go);
+    return node;
+  }
+
+  /** Re-render the owner surfaces from the last snapshot (proposal state
+   * changed between pushes). */
+  private rerenderOwner(): void {
+    if (this.snapshot !== null) this.renderSnapshot(this.snapshot);
   }
 
   /** One evidence-bound ready PR: affected heist, the exact head every
@@ -653,7 +961,7 @@ export class BoardView {
     // the only human-facing surface.
     const needsGru = snapshot.unackedActionRequired;
     this.unackedChip.hidden = needsGru === 0;
-    this.unackedChip.textContent = `🛠 ${needsGru} needs Gru`;
+    this.unackedChip.textContent = `🛠 ${needsGru} notifications · needs Gru`;
     this.unackedChip.title = `${needsGru} live machine-attention notification${needsGru === 1 ? '' : 's'} awaiting a Gru disposition — the live queue clears itself; closed receipts stay in the record and the owner bell is not rung.`;
     // Wake tracker: every autonomous wake is a durable `gru.wake` event;
     // the count/last fire stamp makes the wake path visible on the board.
@@ -732,11 +1040,8 @@ export class BoardView {
    * classification — stopped/live-worker truth included — so their counts
    * cannot drift apart between renders. */
   private sectionsFor(snapshot: BoardSnapshot): ReturnType<typeof boardSections> {
-    if (this.currentSections === null) {
-      const stoppedWorkers = stoppedWorkersByJob(snapshot.agents);
-      const liveWorkerStamps = liveWorkerStampsByJob(snapshot.agents);
-      this.currentSections = boardSections(snapshot, Date.now(), { stoppedWorkers, liveWorkerStamps });
-    }
+    // The same snapshot-only derivation the TRACKERS chip counts from.
+    this.currentSections ??= snapshotSections(snapshot, Date.now());
     return this.currentSections;
   }
 
@@ -752,13 +1057,15 @@ export class BoardView {
     // strip counts and section bodies can never disagree).
     const sections = this.sectionsFor(snapshot);
     const stoppedWorkers = stoppedWorkersByJob(snapshot.agents);
+    this.jobSignals = { unacked, stoppedWorkers };
     this.mount.append(this.jobsSection('in-flight', sections.bands.get('in-flight') ?? [], unacked, stoppedWorkers));
     this.mount.append(this.pipelineSection(sections));
-    this.mount.append(this.forGruSection(sections.bands.get('needs-you') ?? [], unacked, stoppedWorkers));
+    this.mount.append(this.forGruSection(sections.bands.get('needs-you') ?? [], unacked, stoppedWorkers, snapshot));
     this.mount.append(this.jobsSection('settled', settledJobs(sections.bands.get('settled') ?? []), unacked, stoppedWorkers));
     this.mount.append(this.coldSection(sections.bands.get('cold') ?? [], unacked, stoppedWorkers));
     const seenIds = new Set<string>();
     for (const group of sections.bands.values()) for (const entry of group) seenIds.add(entry.job.id);
+    for (const group of sections.children.values()) for (const entry of group) seenIds.add(entry.job.id);
     for (const id of seenIds) this.knownJobIds.add(id);
     this.firstJobsRender = false;
   }
@@ -804,7 +1111,7 @@ export class BoardView {
   }
 
   private rerender(): void {
-    if (this.snapshot !== null) this.render(this.snapshot);
+    if (this.snapshot !== null) this.renderSnapshot(this.snapshot);
   }
 
   private emptyLine(text: string): HTMLElement {
@@ -916,15 +1223,27 @@ export class BoardView {
     jobs: readonly BandedJob[],
     unacked: ReadonlyMap<string, number>,
     stoppedWorkers: ReadonlyMap<string, WorkerStopView>,
+    snapshot: BoardSnapshot,
   ): HTMLElement {
     const { section, head, body, bodyId } = this.sectionShell(
       'for-gru',
       'needs-you',
       BAND_LABELS['needs-you'],
-      heistCount(jobs.length),
+      snapshot.mailbox === undefined || snapshot.mailbox === null ? 'unavailable' : `${this.unavailableReason === null ? '' : 'last-known · '}${snapshot.mailbox.counts.threads} threads · ${snapshot.mailbox.counts.incidents} incidents · ${snapshot.mailbox.counts.notifications} notifications`,
     );
-    if (jobs.length === 0) {
-      body.append(this.clearForGru());
+    if (this.unavailableReason !== null) {
+      section.dataset.mailboxStatus = 'last-known';
+      const warning = this.emptyLine(`FOR GRU unavailable — rows and counts are last-known. ${this.unavailableReason}`);
+      warning.setAttribute('role', 'status');
+      section.insertBefore(warning, body); // Visible even when the cached queue is collapsed.
+    }
+    if (snapshot.mailbox === undefined || snapshot.mailbox === null) {
+      body.append(this.emptyLine('FOR GRU mailbox unavailable on this server'));
+      return section;
+    }
+    const incidents = snapshot.mailbox.items.filter((item) => item.kind === 'incident' && item.state !== 'resolved');
+    if (jobs.length === 0 && incidents.length === 0) {
+      body.append(this.unavailableReason === null ? this.clearForGru() : this.emptyLine('Last-known mailbox was empty; current membership is unavailable.'));
       return section;
     }
     const toggle = this.sectionToggle({
@@ -944,17 +1263,38 @@ export class BoardView {
     }
     const rows = el('div', 'board-band__rows');
     for (const entry of jobs) {
-      rows.append(
-        this.jobRow(entry.job, unacked.get(entry.job.id) ?? 0, entry.stale, 'needs-you', stoppedWorkers.get(entry.job.id) ?? null),
-      );
+      const jobRow = this.jobRow(entry.job, unacked.get(entry.job.id) ?? 0, entry.stale, 'needs-you', stoppedWorkers.get(entry.job.id) ?? null);
+      const item = snapshot.mailbox.items.find((row) => row.jobId === entry.job.id);
+      if (item !== undefined) jobRow.append(this.mailboxDetail(item));
+      rows.append(jobRow);
+    }
+    for (const item of incidents) {
+      const incident = el('article', 'mailbox-incident');
+      incident.dataset.mailboxId = item.id;
+      incident.append(el('strong', '', item.title), this.mailboxDetail(item));
+      rows.append(incident);
     }
     body.append(rows);
     return section;
   }
 
+  private mailboxDetail(item: NonNullable<BoardSnapshot['mailbox']>['items'][number]): HTMLElement {
+    const detail = el('div', 'mailbox-detail');
+    detail.append(el('span', '', `${item.state === 'needs-gru' ? 'needs Gru' : item.state} · owner: ${item.owner} · ${item.reasons.map((reason) => reason.label).join(' · ')}`));
+    detail.append(el('div', '', `dependency: ${item.disposition?.dependency ?? 'next action owed'} · recheck: ${item.disposition?.recheckAt ?? item.followUpAt?.join(', ') ?? 'not recorded'}`));
+    detail.append(el('div', '', `receipt: ${item.receipt === null ? 'not delivered' : `${item.receipt.source} ${item.receipt.receivedAt}`} · basis: ${item.basis}`));
+    if (item.references.length > 0) detail.append(el('div', '', `controls/follow-up: ${item.references.map((ref) => `${ref.kind}:${ref.id}`).join(', ')}`));
+    if (item.restrictions.length > 0) detail.append(el('div', '', item.restrictions.join(' · ')));
+    return detail;
+  }
+
   /** Cold: COUNT ONLY by default — zero job rows render until the
    * operator deliberately expands; expansion shows the retained records
-   * and can be collapsed again. Never a deletion or a completion. */
+   * and can be collapsed again. Binned rows are terminal DISCARDED lanes:
+   * they stay in this band (and in its complete count) but their rows sit
+   * behind their own explicit disclosure — the default view never shows
+   * them, and opening the disclosure is inspection only (no ACK, no
+   * transition, no approval). Never a deletion or a completion. */
   private coldSection(
     jobs: readonly BandedJob[],
     unacked: ReadonlyMap<string, number>,
@@ -980,13 +1320,45 @@ export class BoardView {
       body.hidden = true;
       return section;
     }
-    const rows = el('div', 'board-band__rows');
-    for (const entry of jobs) {
-      rows.append(
-        this.jobRow(entry.job, unacked.get(entry.job.id) ?? 0, entry.stale, 'cold', stoppedWorkers.get(entry.job.id) ?? null),
-      );
+    const binned = jobs.filter((entry) => entry.job.status === 'binned');
+    const visible = jobs.filter((entry) => entry.job.status !== 'binned');
+    if (visible.length > 0) {
+      const rows = el('div', 'board-band__rows');
+      for (const entry of visible) {
+        rows.append(
+          this.jobRow(entry.job, unacked.get(entry.job.id) ?? 0, entry.stale, 'cold', stoppedWorkers.get(entry.job.id) ?? null),
+        );
+      }
+      body.append(rows);
     }
-    body.append(rows);
+    if (binned.length > 0) {
+      this.nextRegionId += 1;
+      const binnedBodyId = `${bodyId}-binned-${this.nextRegionId}`;
+      const binnedToggle = el('button', 'board-band__more board-band__more--binned');
+      binnedToggle.type = 'button';
+      binnedToggle.dataset.focusKey = 'section:cold-binned';
+      binnedToggle.setAttribute('aria-expanded', String(this.binnedExpanded));
+      binnedToggle.setAttribute('aria-controls', binnedBodyId);
+      binnedToggle.textContent = this.binnedExpanded
+        ? 'Hide binned'
+        : `Show ${binned.length} binned ${binned.length === 1 ? 'record' : 'records'}`;
+      binnedToggle.addEventListener('click', () => {
+        this.binnedExpanded = !this.binnedExpanded;
+        this.rerender();
+      });
+      body.append(binnedToggle);
+      const binnedRows = el('div', 'board-band__rows board-band__rows--binned');
+      binnedRows.id = binnedBodyId;
+      binnedRows.hidden = !this.binnedExpanded;
+      if (this.binnedExpanded) {
+        for (const entry of binned) {
+          binnedRows.append(
+            this.jobRow(entry.job, unacked.get(entry.job.id) ?? 0, entry.stale, 'cold', stoppedWorkers.get(entry.job.id) ?? null),
+          );
+        }
+      }
+      body.append(binnedRows);
+    }
     return section;
   }
 
@@ -1036,6 +1408,12 @@ export class BoardView {
    * repo + branch + lane age + agent age + PR link. Clicking anywhere on
    * the summary expands the v3 detail inline — the row is never a card
    * until it is expanded. Error/failing rows carry the alert accent.
+   *
+   * Megaminions: a heist's nested specialists render inside its row — the
+   * live ones as indented sub-rows under the meta line, the concluded ones
+   * inside the expanded body — and the meta line carries the family chip.
+   * A nested row (`child`) drops the repo (its parent's) and its worker
+   * reads `megaminion`, never `minion`.
    */
   private jobRow(
     job: JobView,
@@ -1043,8 +1421,9 @@ export class BoardView {
     stale: boolean,
     band: BandId,
     workerStop: WorkerStopView | null,
+    child = false,
   ): HTMLElement {
-    const row = el('article', 'board-job');
+    const row = el('article', child ? 'board-job board-job--child' : 'board-job');
     row.dataset.jobId = job.id;
     row.dataset.band = band;
     row.dataset.status = job.status;
@@ -1077,7 +1456,8 @@ export class BoardView {
       flag.title = 'working with no minion frames past the stall window';
       toggle.append(flag);
     }
-    const signal = jobSignal(job, unackedActionRequired);
+    const signal = this.snapshot?.mailbox !== undefined && this.snapshot.mailbox !== null
+      ? mailboxSignal(this.snapshot, job.id) ?? jobSignal(job, 0) : jobSignal(job, 0);
     if (signal !== null) {
       const chip = el('span', `pp-chip board-job__signal pp-chip--${signal.tone}`, signal.label);
       chip.title = signal.title;
@@ -1088,6 +1468,9 @@ export class BoardView {
       `pp-chip board-job__status ${waiting ? 'pp-chip--park' : jobChipTone(job.status)}`,
       waiting ? workerStopLabel(workerStop) : job.status,
     );
+    if (job.status === 'binned') {
+      status.title = 'discarded — terminal and never resuming; not a merge, a completion or a passed gate';
+    }
     if (waiting && workerStop !== null) {
       status.title =
         `worker stopped by supervision` +
@@ -1099,12 +1482,37 @@ export class BoardView {
     head.append(toggle);
     row.append(head);
 
+    // A surfaced megaminion (top-level by the NEEDS-YOU exception) still
+    // names the heist it belongs to.
+    const surfacedParent = child ? undefined : this.currentSections?.surfacedParents.get(job.id);
+    const workerWord = child || surfacedParent !== undefined ? BOARD_WORDS.megaminion : BOARD_WORDS.minion;
+    const family = child ? [] : (this.currentSections?.children.get(job.id) ?? []);
+    if (child || surfacedParent !== undefined) row.dataset.megaminion = 'true';
+
     const meta = el('div', 'board-job__meta lbl');
-    meta.append(el('span', 'board-job__repo', `📦 ${job.repo}`));
+    if (!child) meta.append(el('span', 'board-job__repo', `📦 ${job.repo}`));
+    if (surfacedParent !== undefined) {
+      // The ↳ link jumps to the heist this specialist belongs to (opening
+      // the section that holds it), like the crew rail's parent link.
+      const parentName = surfacedParent.displayName ?? surfacedParent.title;
+      const of = el('button', 'board-job__parent', `↳ ${BOARD_WORDS.megaminion} of ${parentName}`);
+      of.type = 'button';
+      of.dataset.focusKey = `job-parent:${job.id}`;
+      of.title = `${BOARD_WORDS.megaminion} of ${surfacedParent.title} (${surfacedParent.id}) — show that ${BOARD_WORDS.heist}`;
+      of.addEventListener('click', (event) => {
+        event.stopPropagation();
+        this.revealJob(surfacedParent.id);
+      });
+      meta.append(of);
+    }
     if (job.lane !== null) {
       meta.append(el('span', 'board-job__branch', `🌿 ${job.lane.branch ?? 'detached'}`));
-      meta.append(this.ageNode('board-job__age board-job__lane-age', job.lane.createdAt, `${BOARD_WORDS.heist} `, ''));
-      meta.append(this.ageNode('board-job__age board-job__agent-age', job.lastAgentActivity, `${BOARD_WORDS.minion} `, ''));
+      // A nested specialist is not a heist: its parent row carries the
+      // heist age, the nested row only its own worker's activity.
+      if (!child) {
+        meta.append(this.ageNode('board-job__age board-job__lane-age', job.lane.createdAt, `${BOARD_WORDS.heist} `, ''));
+      }
+      meta.append(this.ageNode('board-job__age board-job__agent-age', job.lastAgentActivity, `${workerWord} `, ''));
     } else if (job.baseBranch !== null) {
       meta.append(el('span', 'board-job__branch', `⌂ ${job.baseBranch}`));
     }
@@ -1119,13 +1527,17 @@ export class BoardView {
       link.addEventListener('click', (event) => event.stopPropagation());
       meta.append(link);
     }
+    if (family.length > 0) meta.append(this.familyChip(family));
     meta.title = `${job.repo}${job.lane !== null ? ` · ${job.lane.branch ?? 'detached'}` : ''} · ${job.id}`;
     row.append(meta);
+    const liveFamily = family.filter((entry) => isLiveMegaminion(entry.job));
+    const concludedFamily = family.filter((entry) => !isLiveMegaminion(entry.job));
+    if (liveFamily.length > 0) row.append(this.familyRows(liveFamily, 'live'));
 
     let body: HTMLElement | null = null;
     const setExpanded = (expanded: boolean, persist = true): void => {
       if (expanded) {
-        body ??= this.jobBody(job);
+        body ??= this.jobBody(job, concludedFamily, workerWord, child);
         row.append(body);
         toggle.setAttribute('aria-controls', body.id);
       } else if (body !== null) {
@@ -1139,11 +1551,14 @@ export class BoardView {
     const flip = (): void => setExpanded(row.dataset.expanded !== 'true');
     toggle.addEventListener('click', flip);
     // Whole-row click target for the summary face; interactive children
-    // (PR link, controls) and the expanded body keep their own behavior.
+    // (PR link, controls), the expanded body and nested megaminion rows
+    // keep their own behavior. Only matches INSIDE this row count: a
+    // megaminion row nested in its parent's body must still flip itself.
     row.addEventListener('click', (event) => {
       const target = event.target;
       if (!(target instanceof HTMLElement)) return;
-      if (target.closest('a, button, .board-job__body') !== null) return;
+      const inner = target.closest('a, button, .board-job__body, .board-job__family');
+      if (inner !== null && row.contains(inner)) return;
       flip();
     });
     setExpanded(this.expandedJobs.has(job.id), false);
@@ -1151,10 +1566,16 @@ export class BoardView {
   }
 
   /** Expanded detail (the v2/v3 surface): lane strip, note, condensed
-   * rounds. Concluded jobs (merged/done) suppress their round history
-   * here — a merged job's aborted round is noise, not live state
-   * (v4.1 stale-pill suppression). */
-  private jobBody(job: JobView): HTMLElement {
+   * rounds. merged/done suppress their round history here — a merged
+   * job's aborted round is noise, not live state (v4.1 stale-pill
+   * suppression); a binned (discarded) lane deliberately keeps its full
+   * history inspectable. */
+  private jobBody(
+    job: JobView,
+    concludedFamily: readonly BandedJob[] = [],
+    workerWord: string = BOARD_WORDS.minion,
+    child = false,
+  ): HTMLElement {
     const body = el('div', 'board-job__body');
     this.nextRegionId += 1;
     body.id = `board-job-body-${this.nextRegionId}`;
@@ -1163,22 +1584,57 @@ export class BoardView {
       lane.append(
         el('span', 'pp-chip board-lane__branch', `🌿 ${job.lane.branch ?? 'detached'}`),
         el('span', 'board-lane__base lbl', `⌂ ${job.lane.sha.slice(0, 8)}`),
-        this.ageNode('board-lane__age lbl', job.lane.createdAt, `${BOARD_WORDS.heist} `, ''),
-        this.ageNode('board-lane__activity lbl', job.lastAgentActivity, `${BOARD_WORDS.minion} `, ''),
       );
+      if (!child) lane.append(this.ageNode('board-lane__age lbl', job.lane.createdAt, `${BOARD_WORDS.heist} `, ''));
+      lane.append(this.ageNode('board-lane__activity lbl', job.lastAgentActivity, `${workerWord} `, ''));
       if (job.lane.status !== 'active') {
         lane.append(el('span', 'pp-chip pp-chip--park board-lane__status', job.lane.status));
       }
       body.append(lane);
     }
     if (job.note !== null && job.note !== '') body.append(el('div', 'board-job__note', job.note));
-    const concluded = isJobConcluded(job.status);
-    const rounds = concluded ? job.rounds.slice(-1) : job.rounds;
-    for (const round of rounds) body.append(this.roundRow(round, concluded));
-    if (concluded && rounds.length > 0) {
+    // merged/done are quiescent: only their newest round is glanceable
+    // (older review noise). A binned lane is DISCARDED history the
+    // operator may still need to inspect in full — it keeps every round.
+    const quiescent = job.status === 'merged' || job.status === 'done';
+    const rounds = quiescent ? job.rounds.slice(-1) : job.rounds;
+    for (const round of rounds) body.append(this.roundRow(round, quiescent));
+    if (quiescent && rounds.length > 0) {
       body.append(el('div', 'lbl board-job__reviewed', 'review history on the ledger'));
     }
+    if (concludedFamily.length > 0) body.append(this.familyRows(concludedFamily, 'concluded'));
     return body;
+  }
+
+  /** `↳ 3 megaminions · 2 working · 1 delivered` on the parent heist. */
+  private familyChip(family: readonly BandedJob[]): HTMLElement {
+    const breakdown = familyStatusBreakdown(family.map((entry) => entry.job))
+      .map(({ status, count }) => `${count} ${status}`)
+      .join(' · ');
+    const chip = el('span', 'board-job__family-chip', `↳ ${megaminionCount(family.length)} · ${breakdown}`);
+    chip.title = `specialists this heist's minion commissioned: ${family.map((entry) => entry.job.title).join(', ')}`;
+    return chip;
+  }
+
+  /** Nested megaminion rows: the live ones always visible under the
+   * parent's meta line, the concluded ones inside its expanded body. */
+  private familyRows(family: readonly BandedJob[], kind: 'live' | 'concluded'): HTMLElement {
+    const rows = el('div', `board-job__family board-job__family--${kind}`);
+    if (kind === 'concluded') rows.append(el('div', 'lbl board-job__family-label', BOARD_WORDS.megaminions));
+    const signals = this.jobSignals;
+    for (const entry of family) {
+      rows.append(
+        this.jobRow(
+          entry.job,
+          signals?.unacked.get(entry.job.id) ?? 0,
+          entry.stale,
+          entry.band,
+          signals?.stoppedWorkers.get(entry.job.id) ?? null,
+          true,
+        ),
+      );
+    }
+    return rows;
   }
 
   /** One round header row: `round N` chip + status + verdict + lens
@@ -1260,6 +1716,30 @@ export class BoardView {
       chips.append(node);
     }
     return chips;
+  }
+
+  /** Show one heist row: open the section (or preview window) holding
+   * it, re-render, then bring the row into view with its toggle focused.
+   * Opening is the same reversible disclosure the operator would click. */
+  private revealJob(jobId: string): void {
+    const sections = this.currentSections;
+    if (sections === null) return;
+    for (const [band, entries] of sections.bands) {
+      const entry = entries.find((candidate) => candidate.job.id === jobId);
+      if (entry === undefined) continue;
+      if (band === 'in-flight') this.inFlightExpanded = true;
+      if (band === 'settled') this.settledExpanded = true;
+      if (band === 'needs-you') this.forGruExpanded = true;
+      if (band === 'cold') {
+        this.coldExpanded = true;
+        if (entry.job.status === 'binned') this.binnedExpanded = true;
+      }
+      break;
+    }
+    this.rerender();
+    const row = this.mount.querySelector<HTMLElement>(`.board-job[data-job-id="${CSS.escape(jobId)}"]`);
+    row?.scrollIntoView?.({ block: 'nearest' });
+    row?.querySelector<HTMLButtonElement>(':scope > .board-job__head .board-job__toggle')?.focus();
   }
 
   private setJobExpanded(jobId: string, expanded: boolean): void {
@@ -1620,7 +2100,13 @@ export class BoardView {
       forYou.append(el('div', 'board-notification-section__empty lbl', 'nothing needs you'));
     } else {
       for (const row of ownerRowsForBell) {
-        forYou.append(row.kind === 'ack' ? this.notificationRow(row.notification) : this.ownerPrRow(row));
+        forYou.append(
+          row.kind === 'ack'
+            ? this.notificationRow(row.notification)
+            : row.kind === 'proposal'
+              ? this.ownerProposalPointer(row)
+              : this.ownerPrRow(row),
+        );
       }
     }
     list.append(forYou);
@@ -1716,7 +2202,14 @@ export class BoardView {
     // Gru records a machine disposition through the authenticated API
     // after acting; a human click must not silently clear NEEDS GRU.
     // A closed receipt is machine-attention history: same rule, no Ack.
-    if (item.routing !== 'action-required' && item.ackedAt === null && item.resolvedAt === null) {
+    // A lesson proposal closes only through Accept/Reject (its own row);
+    // the server refuses a plain ack for it.
+    if (
+      item.routing !== 'action-required' &&
+      item.kind !== LESSONS_PROPOSAL_KIND &&
+      item.ackedAt === null &&
+      item.resolvedAt === null
+    ) {
       const ack = document.createElement('button');
       ack.type = 'button';
       ack.className = 'board-notification__ack';
@@ -1798,8 +2291,9 @@ export class BoardView {
 /** A row is "failing" when the record itself says so: blocked/error
  * status, an aborted newest round, or errored lenses in a round that has
  * not posted a verdict. Conflicting-PR-only rows stay calm — the band
- * already shouts. A CONCLUDED job (merged/done) is a closed receipt: its
- * history renders quiescent and never carries the alert accent. */
+ * already shouts. A CONCLUDED job (merged/done/binned) is a closed
+ * receipt: its history renders quiescent and never carries the alert
+ * accent. */
 export function jobFailing(job: JobView): boolean {
   if (isJobConcluded(job.status)) return false;
   if (job.status === 'blocked' || job.status === 'error') return true;
@@ -1987,4 +2481,213 @@ function formatTs(iso: string): string {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return iso;
   return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+/** UI state of one lesson proposal row (see BoardView.proposalStates). */
+interface ProposalRowState {
+  open: boolean;
+  review: LessonProposalView | null;
+  loading: Promise<LessonProposalView> | null;
+  inFlight: 'accept' | 'reject' | null;
+  /** A decision the server recorded but has not finished (202). */
+  recorded: 'accept' | 'reject' | null;
+  message: string | null;
+  /** The message is a failed review load (cleared by a successful retry). */
+  loadFailed: boolean;
+  /** Open nested "before" disclosures, by chapter/lesson key. */
+  nested: Set<string>;
+}
+
+/** Owner-surface focus (FOR YOU band + bell): stable keys survive the
+ * re-render a snapshot push causes, so focus never falls to <body>. */
+function captureOwnerFocusKey(): string | null {
+  const active = document.activeElement;
+  return active instanceof HTMLElement ? active.dataset.ownerFocusKey ?? null : null;
+}
+
+function restoreOwnerFocusKey(key: string | null): void {
+  if (key === null) return;
+  const target = [...document.querySelectorAll<HTMLElement>('[data-owner-focus-key]')].find(
+    (node) => node.dataset.ownerFocusKey === key,
+  );
+  if (target !== undefined && document.activeElement !== target) target.focus();
+}
+
+/** A decision the server holds but has not finished: what to press. */
+function recordedMessage(recorded: 'accept' | 'reject', conflict: string | null): string {
+  const label = recorded === 'accept' ? 'Accept' : 'Reject';
+  return conflict === null
+    ? `Your ${label} is recorded but not finished — press ${label} to finish it.`
+    : `Your ${label} is recorded but blocked — ${conflict}. See the conflict notice, then press ${label} again.`;
+}
+
+function describeProposalError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** The owner-facing reason a decision did not land: the server's refusal
+ * (stale, already decided, mismatched), a proposal that is gone — whose
+ * outcome is unknown, not refused — or an ambiguous network failure. A
+ * decision that is recorded but blocked arrives as 202 incomplete instead. */
+function describeDecisionFailure(error: unknown, recorded: 'accept' | 'reject' | null): string {
+  if (error instanceof BoardApiError) {
+    // "Not applied" only where the server PROVED nothing happened (C8).
+    if (error.code === 'proposal_stale') {
+      return `Not applied — ${error.detail ?? 'the Book of Lessons changed'}. A fresh proposal will follow.`;
+    }
+    if (error.code === 'proposal_decided') return `Not applied — ${error.detail ?? 'this proposal was already decided'}.`;
+    if (error.code === 'proposal_mismatch') return `Not applied — ${error.detail ?? 'this is not the pending proposal'}.`;
+    if (error.status === 404) {
+      return 'This proposal is no longer pending — it may already have been decided, here or on another device. ' +
+        'The board is refreshing; check the Book of Lessons or the receipt for what happened.';
+    }
+  }
+  const reason = error instanceof BoardApiError
+    ? `the server failed (${error.status}${error.detail !== null ? `: ${error.detail}` : ''})`
+    : describeProposalError(error);
+  if (recorded !== null) {
+    const label = recorded === 'accept' ? 'Accept' : 'Reject';
+    return `Your ${label} is recorded, but finishing it could not be confirmed (${reason}). The board is refreshing; press ${label} again to finish it.`;
+  }
+  return `Couldn’t confirm the decision (${reason}) — it may or may not have been recorded. The board is refreshing; check the book or retry.`;
+}
+
+const tagsLine = (tags: readonly string[]): string => tags.join(', ') || '—';
+
+/** The owner's review of a lesson proposal: per chapter, every change the
+ * Accept would make — title, summary and tag changes, new and updated
+ * lessons with their exact text (the prior text one click away), every
+ * lesson that would disappear — and every INDEX entry it changes. */
+function renderProposalReview(proposal: LessonProposalView, nested: Set<string>, focusBase: string): HTMLElement {
+  const root = el('div', 'board-owner__review-list');
+  root.append(
+    el(
+      'div',
+      'lbl',
+      `distilled from ${proposal.entries} journal entr${proposal.entries === 1 ? 'y' : 'ies'} (through #${proposal.throughSeq})`,
+    ),
+  );
+  if (proposal.chapters.length === 0 && proposal.index.length === 0) root.append(el('div', 'lbl', 'no chapter changes'));
+  for (const chapter of proposal.chapters) {
+    const section = el('section', 'board-owner__review-chapter');
+    if (chapter.retired) {
+      section.append(
+        el(
+          'div',
+          'board-owner__review-heading',
+          `${chapter.title.after} — chapter retired (${chapter.removed.length} lesson${chapter.removed.length === 1 ? '' : 's'} removed)`,
+        ),
+      );
+      // What the retirement takes away beyond the lessons.
+      if (chapter.summary.before !== null && chapter.summary.before !== '') {
+        section.append(el('div', 'lbl board-owner__review-meta', `summary removed: ${chapter.summary.before}`));
+      }
+      if (chapter.tags.before.length > 0) {
+        section.append(el('div', 'lbl board-owner__review-meta', `tags removed: ${tagsLine(chapter.tags.before)}`));
+      }
+    } else {
+      const heading =
+        chapter.title.before === null
+          ? `${chapter.title.after} — new chapter`
+          : chapter.title.before !== chapter.title.after
+            ? `${chapter.title.before} → ${chapter.title.after} (renamed)`
+            : chapter.title.after;
+      section.append(el('div', 'board-owner__review-heading', heading));
+      if (chapter.summary.before !== chapter.summary.after) {
+        section.append(
+          el(
+            'div',
+            'lbl board-owner__review-meta',
+            chapter.summary.before === null
+              ? `summary: ${chapter.summary.after}`
+              : `summary: ${chapter.summary.before} → ${chapter.summary.after}`,
+          ),
+        );
+      }
+      if (chapter.tags.before.join('\u0000') !== chapter.tags.after.join('\u0000')) {
+        section.append(el('div', 'lbl board-owner__review-meta', `tags: ${tagsLine(chapter.tags.before)} → ${tagsLine(chapter.tags.after)}`));
+      }
+    }
+    for (const lesson of chapter.added) section.append(reviewLesson(`new · recurred ${lesson.recurred}`, lesson, chapter.slug, nested, focusBase));
+    for (const lesson of chapter.changed) {
+      const recurrence = lesson.previousRecurred !== null && lesson.previousRecurred !== lesson.recurred
+        ? `recurred ${lesson.previousRecurred} → ${lesson.recurred}`
+        : `recurred ${lesson.recurred}`;
+      section.append(reviewLesson(`updated · ${recurrence}`, lesson, chapter.slug, nested, focusBase));
+    }
+    for (const lesson of chapter.removed) section.append(reviewRemoved(lesson));
+    const notes: string[] = [];
+    if (chapter.provenanceTrimmed > 0) notes.push(`${chapter.provenanceTrimmed} oldest journal handle(s) released to fit`);
+    if (chapter.bodiesTrimmed > 0) notes.push(`${chapter.bodiesTrimmed} lesson(s) trimmed to fit`);
+    if (notes.length > 0) section.append(el('div', 'lbl', notes.join(' · ')));
+    root.append(section);
+  }
+  if (proposal.index.length > 0) {
+    const section = el('section', 'board-owner__review-chapter');
+    section.append(el('div', 'board-owner__review-heading', 'INDEX.md (what briefings see)'));
+    for (const entry of proposal.index) {
+      const line =
+        entry.before === null
+          ? `+ ${entry.slug}: ${entry.after!.summary} (tags: ${tagsLine(entry.after!.tags)})`
+          : entry.after === null
+            ? `− ${entry.slug}: ${entry.before.summary} (tags: ${tagsLine(entry.before.tags)})`
+            : `~ ${entry.slug}: ${entry.before.summary} (tags: ${tagsLine(entry.before.tags)}) → ${entry.after.summary} (tags: ${tagsLine(entry.after.tags)})`;
+      section.append(el('div', 'board-owner__review-text', line));
+    }
+    root.append(section);
+  }
+  return root;
+}
+
+/** How the review names a record: the archive record says what it is. */
+function reviewName(slug: string): string {
+  return slug === ARCHIVED_LESSON_SLUG ? 'archive record (journal handles of dropped lessons)' : slug;
+}
+
+function reviewLesson(label: string, lesson: LessonChangeView, chapterSlug: string, nested: Set<string>, focusBase: string): HTMLElement {
+  const node = el('div', 'board-owner__review-lesson');
+  node.append(
+    el('div', 'lbl board-owner__review-label', `${label} · ${reviewName(lesson.slug)}`),
+    el('div', 'board-owner__review-text', lesson.body),
+  );
+  if (lesson.previousTags === null) {
+    if (lesson.tags.length > 0) node.append(el('div', 'lbl board-owner__review-meta', `tags: ${lesson.tags.join(', ')}`));
+  } else if (lesson.previousTags.join('\u0000') !== lesson.tags.join('\u0000')) {
+    node.append(el('div', 'lbl board-owner__review-meta', `tags: ${tagsLine(lesson.previousTags)} → ${tagsLine(lesson.tags)}`));
+  }
+  if (lesson.previousBody !== null && lesson.previousBody !== lesson.body) {
+    const key = `${chapterSlug}/${lesson.slug}`;
+    const before = document.createElement('details');
+    const toggle = document.createElement('summary');
+    toggle.textContent = 'before';
+    toggle.dataset.ownerFocusKey = `${focusBase}:before:${key}`;
+    before.append(toggle, el('div', 'board-owner__review-text board-owner__review-text--before', lesson.previousBody));
+    before.open = nested.has(key);
+    before.addEventListener('toggle', () => {
+      if (before.open) nested.add(key);
+      else nested.delete(key);
+    });
+    node.append(before);
+  }
+  return node;
+}
+
+const REMOVED_LABEL: Readonly<Record<RemovedLessonView['reason'], string>> = {
+  cap: 'removed to fit the cap',
+  retired: 'removed with the chapter',
+  discarded: 'new, but left out to fit the cap',
+};
+
+function reviewRemoved(lesson: RemovedLessonView): HTMLElement {
+  const node = el('div', 'board-owner__review-lesson board-owner__review-lesson--removed');
+  node.append(
+    el(
+      'div',
+      'lbl board-owner__review-label',
+      `${REMOVED_LABEL[lesson.reason]} · ${reviewName(lesson.slug)} (recurred ${lesson.recurred})`,
+    ),
+    el('div', 'board-owner__review-text', lesson.body),
+  );
+  if (lesson.tags.length > 0) node.append(el('div', 'lbl board-owner__review-meta', `tags: ${tagsLine(lesson.tags)}`));
+  return node;
 }

@@ -47,6 +47,7 @@ function amendment(
     supersedes: [],
     approval: { by: 'owner', reference: 'epoch12 seq194760 client_msg_id feaf620e' },
     expectedContractSha256: contractSha,
+    effect: 'material',
     ...overrides,
   });
 }
@@ -153,6 +154,7 @@ describe('canonical job amendments', () => {
       approval: { by: 'owner', reference: 'j-969' },
       expectedContractSha256: sha256(BRIEFING),
       idempotencyKey: 'retry-1',
+      effect: 'material' as const,
     };
     const first = accepted(api.addJobAmendment(request));
     const retry = accepted(api.addJobAmendment(request));
@@ -175,6 +177,7 @@ describe('canonical job amendments', () => {
       body: 'x',
       approval: { by: 'owner', reference: '   ' },
       expectedContractSha256: hash,
+      effect: 'material',
     });
     expect(blankReference.status).toBe('rejected');
     const unknownSupersede = api.addJobAmendment({
@@ -183,6 +186,7 @@ describe('canonical job amendments', () => {
       supersedes: ['amendment:does-not-exist'],
       approval: { by: 'owner', reference: 'j-969' },
       expectedContractSha256: hash,
+      effect: 'material',
     });
     expect(unknownSupersede.status).toBe('rejected');
     const badAnchor = api.addJobAmendment({
@@ -191,6 +195,7 @@ describe('canonical job amendments', () => {
       supersedes: ['Goal'],
       approval: { by: 'owner', reference: 'j-969' },
       expectedContractSha256: hash,
+      effect: 'material',
     });
     expect(badAnchor.status).toBe('rejected');
     const empty = amendment(api, hash, '   ');
@@ -210,12 +215,21 @@ describe('canonical job amendments', () => {
     expect(terminal.status).toBe('rejected');
     if (terminal.status !== 'rejected') throw new Error('unreachable');
     expect(terminal.code).toBe('job-terminal');
+    // A binned (discarded) lane is terminal on the same contract.
+    api.addJob({ id: 'job-3', repo: 'repo', title: 'discarded', briefing: BRIEFING });
+    api.setJobStatus('job-3', 'working');
+    api.setJobStatus('job-3', 'binned');
+    const discarded = amendment(api, sha256(BRIEFING), 'too late', { jobId: 'job-3' });
+    expect(discarded.status).toBe('rejected');
+    if (discarded.status !== 'rejected') throw new Error('unreachable');
+    expect(discarded.code).toBe('job-terminal');
     api.addJob({ id: 'job-2', repo: 'repo', title: 'no briefing' });
     const noBriefing = api.addJobAmendment({
       jobId: 'job-2',
       body: 'x',
       approval: { by: 'owner', reference: 'j-969' },
       expectedContractSha256: sha256(''),
+      effect: 'material',
     });
     expect(noBriefing.status).toBe('rejected');
     if (noBriefing.status !== 'rejected') throw new Error('unreachable');

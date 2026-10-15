@@ -1,8 +1,10 @@
+import { bindOriginalRebriefSdkOwner } from './helpers/directive-native-fixture.js';
 import { afterAll, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventBus } from '../src/events/bus.js';
+import { admitNativeDirectiveFixture } from './helpers/directive-native-fixture.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { parseCompletionHandoffIntent } from '../src/ledger/obligations.js';
@@ -12,6 +14,7 @@ import { finalizeRebriefRequest } from '../src/dispatch/rebrief-recovery.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import type { AgentCapabilities, AgentHandle } from '../src/runtime/types.js';
+import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 
 /**
  * Explicit phase-completion handoffs (pr136-chief-handoff). Deterministic:
@@ -33,7 +36,9 @@ const FAKE_CAPABILITIES: AgentCapabilities = {
 };
 
 const cleanupDirs: string[] = [];
+const cleanupRepos: FixtureRepo[] = [];
 afterAll(() => {
+  for (const repo of cleanupRepos) repo.cleanup();
   for (const dir of cleanupDirs) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -80,6 +85,26 @@ function fakeMinion(
     },
     async dispose() {},
   };
+}
+
+/** Fixture an admitted, completed ORIGINAL legacy turn before reconciliation.
+ * Its explicit receipt owns the historical HEAD/revision; today's lane is
+ * deliberately allowed to move before finalization. */
+async function seedOriginalRebriefCompletion(ledger: LedgerApi, jobId: string, minionId: string, sha: string, cwd: string) {
+  const markers = ledger.listPendingRebriefs({ jobId });
+  const marker = markers.find((row) => row.kind === 'silas.rebrief')!;
+  expect(marker.phaseId).not.toBeNull();
+  expect(marker.workRevision).toBeTypeOf('number');
+  await bindOriginalRebriefSdkOwner(ledger, markers, { cwd, dataDir: tmpDir(), agentId: minionId });
+  ledger.bindPhaseHandoffMinion({ phaseId: marker.phaseId!, minionId });
+  const bound = ledger.listPendingRebriefs({ jobId }).find((row) => row.id === marker.id)!;
+  const receipt = ledger.appendCustomEvent({ kind: 'silas.rebrief', jobId, agentId: minionId, payload: {
+    minion_id: minionId, sha, work_revision: bound.workRevision,
+    marker_id: bound.id, payload_hash: bound.payloadHash, phase_id: bound.phaseId,
+    note: bound.note,
+  } });
+  expect(ledger.pendingRebriefReceipt(bound)).toEqual(receipt);
+  return { receipt, marker: bound };
 }
 
 function payloadOf(event: { payload: unknown }): Record<string, unknown> {
@@ -157,9 +182,10 @@ describe('explicit phase-completion handoff (fresh dispatch and same-head rebrie
     expect(observeFollowUpDelivery({ ledger: h.ledger, notifications: h.notifications }, legacy)?.created).toBe(true);
   });
 
-  it('a marked re-brief hands back on blocked AND nonblocked lanes without double publication', () => {
+  it('a marked re-brief hands back on blocked AND nonblocked lanes without double publication', async () => {
     const h = makeHarness();
     const worktrees = new InMemoryWorktreePort(join(tmpDir(), 'wt'));
+    const repo = makeFixtureRepo('phase-rebrief-original'); cleanupRepos.push(repo);
     // Blocked lane: the legacy observer would fire for an unmarked delivery;
     // the marked delivery belongs to the phase path alone.
     seedJob(h.ledger, 'job-ph-rb1', 'blocked');
@@ -172,24 +198,44 @@ describe('explicit phase-completion handoff (fresh dispatch and same-head rebrie
     const phaseId = markers.find((marker) => marker.phaseId !== null)?.phaseId ?? null;
     expect(phaseId).not.toBeNull();
     expect(h.ledger.getPhaseHandoff(phaseId!)?.state).toBe('awaiting');
-    finalizeRebriefRequest({
+    expect(() => finalizeRebriefRequest({ ledger: h.ledger, worktrees, jobId: 'job-ph-rb1',
+      minionId: 'minion-rb1', lanePath: repo.path, note: 'same head; finish the audit' }))
+      .toThrow('historical rebrief completion is unproven');
+    expect(h.ledger.listPendingRebriefs({ jobId: 'job-ph-rb1' })).toEqual(markers);
+    expect(h.ledger.getPhaseHandoff(phaseId!)?.state).toBe('awaiting');
+    expect(h.ledger.latestJobEvent('job-ph-rb1', 'silas.rebrief')).toBeNull();
+    expect(h.ledger.latestJobEvent('job-ph-rb1', 'job.delivered')).toBeNull();
+    const original = await seedOriginalRebriefCompletion(h.ledger, 'job-ph-rb1', 'minion-rb1', repo.head(), repo.path);
+    repo.commitFile('later-checkout.txt', 'not historical completion');
+    const finalized = finalizeRebriefRequest({
       ledger: h.ledger,
       worktrees,
       jobId: 'job-ph-rb1',
       minionId: 'minion-rb1',
-      lanePath: null,
+      lanePath: repo.path,
       note: 'same head; finish the audit',
     });
+    expect(finalized).toMatchObject({ rebriefRecorded: false, deliveryRecorded: true, superseded: false });
     const rebriefEvent = h.ledger.latestJobEvent('job-ph-rb1', 'silas.rebrief');
-    expect(payloadOf(rebriefEvent!)['phase_id']).toBe(phaseId);
+    expect(rebriefEvent).toEqual(original.receipt); // immutable actual completion, never synthesized
     const delivery = h.ledger.latestJobEvent('job-ph-rb1', 'job.delivered');
-    expect(payloadOf(delivery!)['phase_id']).toBe(phaseId);
+    expect(payloadOf(delivery!)).toMatchObject({
+      phase_id: phaseId, agentId: 'minion-rb1', sha: payloadOf(original.receipt)['sha'],
+      work_revision: original.marker.workRevision,
+      provenance: { kind: 'original-correlated-completion', event_seq: original.receipt.seq },
+    });
+    expect(payloadOf(delivery!)['sha']).not.toBe(repo.head());
+    expect(h.ledger.listPendingRebriefs({ jobId: 'job-ph-rb1' })).toHaveLength(0);
     const result = observePhaseCompletion({ ledger: h.ledger, notifications: h.notifications }, delivery!);
     expect(result?.created).toBe(true);
     expect(observeFollowUpDelivery({ ledger: h.ledger, notifications: h.notifications }, delivery!)).toBeNull();
     expect(
       h.ledger.listNotifications({ limit: 200 }).filter((row) => row.kind.includes('phase-handback')),
     ).toHaveLength(1);
+
+    expect(h.ledger.getPhaseHandoff(phaseId!)?.state).toBe('completed');
+    expect(reconcilePhaseHandoffs({ ledger: h.ledger, notifications: h.notifications }).published).toBe(0);
+    expect(h.ledger.listJobEventsByKinds('job-ph-rb1', ['silas.rebrief', 'job.delivered'])).toEqual([delivery, original.receipt]);
 
     // Nonblocked lane: same-head completion still hands back.
     seedJob(h.ledger, 'job-ph-rb2', 'working');
@@ -199,17 +245,31 @@ describe('explicit phase-completion handoff (fresh dispatch and same-head rebrie
       briefing: 'b',
       handoff: { kind: 'gru-decision', decision: 'rule on the nonblocked lane' },
     });
-    finalizeRebriefRequest({
+    const original2 = await seedOriginalRebriefCompletion(h.ledger, 'job-ph-rb2', 'minion-rb2', repo.head(), repo.path);
+    repo.commitFile('later-checkout.txt', 'still not historical completion');
+    const finalized2 = finalizeRebriefRequest({
       ledger: h.ledger,
       worktrees,
       jobId: 'job-ph-rb2',
       minionId: 'minion-rb2',
-      lanePath: null,
+      lanePath: repo.path,
       note: 'finish it',
     });
+    expect(finalized2).toMatchObject({ rebriefRecorded: false, deliveryRecorded: true, superseded: false });
     const delivery2 = h.ledger.latestJobEvent('job-ph-rb2', 'job.delivered');
+    expect(payloadOf(delivery2!)).toMatchObject({
+      agentId: 'minion-rb2', sha: payloadOf(original2.receipt)['sha'], work_revision: original2.marker.workRevision,
+      provenance: { kind: 'original-correlated-completion', event_seq: original2.receipt.seq },
+    });
+    expect(payloadOf(delivery2!)['sha']).not.toBe(repo.head());
     expect(observePhaseCompletion({ ledger: h.ledger, notifications: h.notifications }, delivery2!)?.created).toBe(true);
+    expect(observeFollowUpDelivery({ ledger: h.ledger, notifications: h.notifications }, delivery2!)).toBeNull();
     expect(h.ledger.getJob('job-ph-rb2')?.status).toBe('working'); // not blocked, still handed back
+    expect(h.ledger.getPhaseHandoff(original2.marker.phaseId!)?.state).toBe('completed');
+    expect(reconcilePhaseHandoffs({ ledger: h.ledger, notifications: h.notifications }).published).toBe(0);
+    expect(h.ledger.listPendingRebriefs({ jobId: 'job-ph-rb2' })).toHaveLength(0);
+    expect(h.ledger.listJobEventsByKinds('job-ph-rb2', ['silas.rebrief', 'job.delivered'])).toEqual([delivery2, original2.receipt]);
+    expect(h.ledger.listNotifications({ limit: 200 }).filter((row) => row.kind.includes('phase-handback'))).toHaveLength(2);
   });
 
   it('a marked directive completes only after its request is admitted; boot reconciliation closes the gap', () => {
@@ -234,12 +294,7 @@ describe('explicit phase-completion handoff (fresh dispatch and same-head rebrie
     expect(h.ledger.getPhaseHandoff(phase!.phaseId)?.state).toBe('awaiting');
     // The correlated native admission lands, then the boot backstop
     // completes the phase from the already-committed delivery.
-    const sent = h.ledger.appendCustomEvent({
-      kind: 'silas.directive-sent',
-      jobId: 'job-ph-dir',
-      payload: { request_id: 'req-ph-dir', minion_id: 'minion-d' },
-    });
-    h.ledger.recordDirectiveAdmission({ requestId: 'req-ph-dir', minionId: 'minion-d', eventSeq: sent.seq });
+    admitNativeDirectiveFixture(h.ledger, 'req-ph-dir', 'minion-d', join(tmpDir(), 'minion-d.jsonl'));
     const report = reconcilePhaseHandoffs({ ledger: h.ledger, notifications: h.notifications });
     expect(report.completed).toBe(1);
     expect(report.published).toBe(1);
@@ -405,10 +460,11 @@ describe('phase-handoff reconciliation, guards and disposition', () => {
     expect(fourth.published).toBe(0);
   });
 
-  it('a newer request is never completed by an older receipt; a superseded phase stays closed', () => {
+  it('a newer request is never completed by an older receipt; a superseded phase stays closed', async () => {
     const h = makeHarness();
     const worktrees = new InMemoryWorktreePort(join(tmpDir(), 'wt'));
     seedJob(h.ledger, 'job-ph-sup', 'blocked');
+    const repo = makeFixtureRepo('phase-superseded-original'); cleanupRepos.push(repo);
     const first = h.ledger.beginPendingRebrief({
       jobId: 'job-ph-sup',
       note: 'one',
@@ -416,6 +472,8 @@ describe('phase-handoff reconciliation, guards and disposition', () => {
       handoff: { kind: 'gru-decision', decision: 'first' },
     });
     const firstPhaseId = first.find((marker) => marker.phaseId !== null)?.phaseId ?? null;
+    const original = await seedOriginalRebriefCompletion(h.ledger, 'job-ph-sup', 'minion-old', repo.head(), repo.path);
+    const oldDeliveryMarker = h.ledger.listPendingRebriefs({ jobId: 'job-ph-sup' }).find((row) => row.kind === 'job.delivered')!;
     const second = h.ledger.beginPendingRebrief({
       jobId: 'job-ph-sup',
       note: 'two',
@@ -444,28 +502,48 @@ describe('phase-handoff reconciliation, guards and disposition', () => {
     const late = h.ledger.appendCustomEvent({
       kind: 'job.delivered',
       jobId: 'job-ph-sup',
-      payload: { source: 'silas-rebrief', phase_id: firstPhaseId },
+      agentId: 'minion-old',
+      payload: { source: 'silas-rebrief', phase_id: firstPhaseId, agentId: 'minion-old',
+        marker_id: oldDeliveryMarker.id, payload_hash: oldDeliveryMarker.payloadHash,
+        sha: payloadOf(original.receipt)['sha'], work_revision: original.marker.workRevision },
     });
     expect(observePhaseCompletion({ ledger: h.ledger, notifications: h.notifications }, late)).toBeNull();
     expect(h.ledger.getPhaseHandoff(firstPhaseId!)?.state).toBe('closed');
     expect(h.ledger.getPhaseHandoff(secondPhaseId!)?.state).toBe('awaiting');
-    // The newer request's own turn finalizes normally and completes ITS phase.
+    // Even a genuine old completion cannot prove this replacement's turn.
+    const currentBeforeAdmission = h.ledger.listPendingRebriefs({ jobId: 'job-ph-sup' }).find((row) => row.kind === 'silas.rebrief')!;
+    expect(h.ledger.pendingRebriefReceipt(currentBeforeAdmission)).toBeNull();
+    const currentOriginal = await seedOriginalRebriefCompletion(h.ledger, 'job-ph-sup', 'minion-new', repo.head(), repo.path);
+    repo.commitFile('later-checkout.txt', 'not either historical completion');
+    // The newer request's own proven turn finalizes and completes ITS phase.
     const currentFinalize = finalizeRebriefRequest({
       ledger: h.ledger,
       worktrees,
       jobId: 'job-ph-sup',
       minionId: 'minion-new',
-      lanePath: null,
+      lanePath: repo.path,
       note: 'two',
       expectedPhaseId: secondPhaseId,
     });
     expect(currentFinalize.superseded).toBe(false);
+    expect(currentFinalize.rebriefRecorded).toBe(false);
     expect(currentFinalize.deliveryRecorded).toBe(true);
     expect(h.ledger.listPendingRebriefs({ jobId: 'job-ph-sup' })).toHaveLength(0);
     const delivery = h.ledger.latestJobEvent('job-ph-sup', 'job.delivered');
+    expect(payloadOf(delivery!)).toMatchObject({
+      phase_id: secondPhaseId, agentId: 'minion-new', sha: payloadOf(currentOriginal.receipt)['sha'],
+      work_revision: currentOriginal.marker.workRevision,
+      provenance: { kind: 'original-correlated-completion', event_seq: currentOriginal.receipt.seq },
+    });
+    expect(payloadOf(delivery!)['sha']).not.toBe(repo.head());
     const completed = observePhaseCompletion({ ledger: h.ledger, notifications: h.notifications }, delivery!);
     expect(completed?.created).toBe(true);
     expect(completed?.phaseId).toBe(secondPhaseId);
+    expect(h.ledger.getPhaseHandoff(firstPhaseId!)?.state).toBe('closed');
+    expect(h.ledger.getPhaseHandoff(secondPhaseId!)?.state).toBe('completed');
+    expect(reconcilePhaseHandoffs({ ledger: h.ledger, notifications: h.notifications }).published).toBe(0);
+    expect(h.ledger.listJobEventsByKinds('job-ph-sup', ['silas.rebrief', 'job.delivered']))
+      .toEqual([delivery, currentOriginal.receipt, late, original.receipt]);
     expect(
       h.ledger.listNotifications({ limit: 200 }).filter((row) => row.kind.includes('phase-handback')),
     ).toHaveLength(1);
@@ -493,6 +571,45 @@ describe('phase-handoff reconciliation, guards and disposition', () => {
     expect(res?.notificationId).toBeNull();
     expect(h.ledger.getPhaseHandoff(pt.phaseId)?.state).toBe('closed');
     expect(h.ledger.getObligation(res!.obligationId!)?.state).toBe('closed'); // job-terminal settlement
+
+    // A binned (discarded) lane closes the stale intent the same way: no
+    // live card, job-terminal abandonment.
+    seedJob(h.ledger, 'job-ph-bin', 'working');
+    h.ledger.beginPhaseHandoff({
+      jobId: 'job-ph-bin',
+      source: 'dispatch',
+      intent: { kind: 'gru-decision', decision: 'b' },
+    });
+    const pb = h.ledger.listPhaseHandoffs({ jobId: 'job-ph-bin' })[0]!;
+    h.ledger.bindPhaseHandoffMinion({ phaseId: pb.phaseId, minionId: 'mb' });
+    h.ledger.setJobStatus('job-ph-bin', 'binned');
+    const dbEvent = h.ledger.appendCustomEvent({
+      kind: 'job.delivered',
+      jobId: 'job-ph-bin',
+      payload: { source: 'dispatch', agentId: 'mb', phase_id: pb.phaseId },
+    });
+    const resB = observePhaseCompletion({ ledger: h.ledger, notifications: h.notifications }, dbEvent);
+    expect(resB).not.toBeNull();
+    expect(resB?.notificationId).toBeNull();
+    expect(h.ledger.getPhaseHandoff(pb.phaseId)?.state).toBe('closed');
+    expect(h.ledger.getObligation(resB!.obligationId!)?.state).toBe('closed');
+    expect(h.ledger.getObligation(resB!.obligationId!)?.settlement).toEqual({
+      kind: 'job-terminal', jobStatus: 'binned',
+    });
+
+    // The BOOT RECONCILE closes a discarded lane's awaiting intent with no
+    // delivery evidence (job-terminal abandonment), same as done/merged.
+    seedJob(h.ledger, 'job-ph-recon', 'working');
+    h.ledger.beginPhaseHandoff({
+      jobId: 'job-ph-recon',
+      source: 'dispatch',
+      intent: { kind: 'gru-decision', decision: 'r' },
+    });
+    const preconcile = h.ledger.listPhaseHandoffs({ jobId: 'job-ph-recon' })[0]!;
+    h.ledger.setJobStatus('job-ph-recon', 'binned');
+    const reconcile = reconcilePhaseHandoffs({ ledger: h.ledger, notifications: h.notifications });
+    expect(reconcile.closed).toBeGreaterThanOrEqual(1);
+    expect(h.ledger.getPhaseHandoff(preconcile.phaseId)?.state).toBe('closed');
 
     // Parked + owner hold: the debt suspends, no wake, no auto-ACK.
     seedJob(h.ledger, 'job-ph-park', 'working');

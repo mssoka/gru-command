@@ -95,12 +95,27 @@ export interface DecisionUsage {
   readonly costUsd: number | null;
 }
 
+/** Client-side milestones, never provider inference timings. `request`
+ * includes local scheduling, connection setup and waiting for headers;
+ * fetch does not expose separate DNS/TCP/TLS/model timings here. */
+export interface DecisionRequestDiagnostics {
+  readonly phase: 'not_started' | 'request' | 'response_headers' | 'response_body' | 'response_validation';
+  readonly timeoutMs: number;
+  readonly deadlineExpired: boolean;
+  /** Elapsed from request start, not durations of individual phases. */
+  readonly headersMs: number | null;
+  readonly bodyMs: number | null;
+  readonly httpStatus: number | null;
+}
+
 export interface DecisionProvenance {
   readonly source: 'deterministic' | 'jev';
   readonly fallbackReason: DecisionFailureReason | null;
   readonly model: string | null;
   readonly latencyMs: number;
   readonly usage: DecisionUsage | null;
+  /** Present for provider calls/refusals; absent for deterministic stand-ins. */
+  readonly diagnostics?: DecisionRequestDiagnostics;
   /** The `[decisions.providers]` profile that produced (or was attempted
    * for) this outcome; null for deterministic fallbacks that never named
    * one. */
@@ -151,12 +166,26 @@ export interface ShadowDecisionRecord {
   readonly routes: unknown;
   /** The deterministic baseline answers — what actually happened. */
   readonly deterministic_answers: unknown;
+  /** The deterministic baseline routes. Absent on rows recorded before
+   * 2026-10-11; the yield report rebuilds those from the answers. */
+  readonly deterministic_routes: unknown;
+  /** The thresholds both outcomes' routes were banded at. Absent on rows
+   * recorded before 2026-10-11; the yield report assumes the defaults. */
+  readonly thresholds: ThresholdsConfig;
   readonly latency_ms: number;
   readonly cost: number | null;
   readonly provenance_source: 'jev' | 'deterministic';
-  /** True when the provider's routes would have differed from the
-   * deterministic baseline's routes on at least one question. */
-  readonly disagrees: boolean;
+  /** Exact cause of a fallback, null when Jev answered. Historical rows
+   * predating this field have unknown causes — never infer timeout from 0 ms. */
+  readonly fallback_reason: DecisionFailureReason | null;
+  readonly request_diagnostics: DecisionRequestDiagnostics | null;
+  /** True when the surface's consumer would have acted differently on the
+   * provider's outcome than on the baseline's (`shadowEffectDisagreement`);
+   * null when no consumer effect is defined for the surface or the outcome
+   * does not carry the questions that effect reads. Rows recorded
+   * before 2026-10-11 carry an older band-only flag, so the yield report
+   * recomputes from the recorded answers and routes and never reads it. */
+  readonly disagrees: boolean | null;
 }
 
 export interface DecisionRequest<Q extends QuestionSet> {

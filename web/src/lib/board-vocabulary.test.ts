@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { BOARD_WORDS, heistCount } from './board-vocabulary.js';
+import { BOARD_WORDS, heistCount, megaminionCount } from './board-vocabulary.js';
 
 /**
  * The v6.1 display vocabulary (owner ruling 2026-09-23): lane/job render
@@ -12,8 +12,16 @@ describe('board display vocabulary', () => {
       heist: 'heist',
       heists: 'heists',
       minion: 'minion',
+      megaminion: 'megaminion',
+      megaminions: 'megaminions',
       crew: 'crew',
     });
+  });
+
+  it('counts megaminions with the right plural (never the #161 "sub-minion" word)', () => {
+    expect(megaminionCount(1)).toBe('1 megaminion');
+    expect(megaminionCount(3)).toBe('3 megaminions');
+    expect(Object.values(BOARD_WORDS).join(' ')).not.toMatch(/sub-?minion/i);
   });
 
   it('counts heists with the right plural', () => {

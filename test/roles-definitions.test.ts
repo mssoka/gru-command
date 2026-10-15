@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { existsSync, readFileSync } from 'node:fs';
 import { ROLE_DEFINITIONS, requireSpawnCwd } from '../src/roles.js';
+import { loadSilasSkills } from '../src/dispatch/silas-driver.js';
 import { ROLES } from '../src/config.js';
 
 /**
@@ -54,11 +55,12 @@ describe('role definitions (E8)', () => {
       'ambient skills',
       'general shell/task tools',
       'tampered assets fail closed',
-      'bmad-review',
+      'gc-owned fallback review',
       'never a silent downgrade',
     ]) expect(silas).toContain(clause);
-    expect(silas).toContain('never\nmerge');
     expect(silas).toContain('service-restart clean abort');
+    // Silas-dispatched reports on a lane nest under it as megaminions.
+    expect(silas.replace(/\s+/gu, ' ')).toContain('names that lane\'s job id as `"parent_job_id"`');
     expect(silas).toContain('owner-held');
   });
 
@@ -69,6 +71,29 @@ describe('role definitions (E8)', () => {
     const silas = ROLE_DEFINITIONS['silas'].systemPrompt.replace(/\s+/gu, ' ');
     expect(silas).toContain('New pull requests are ordinary');
     expect(silas).toContain('existing drafts are left untouched');
+  });
+
+  it('pins the minion owning main-conflict resolution in its own worktree', () => {
+    const minion = ROLE_DEFINITIONS['minion'].systemPrompt.replace(/\s+/gu, ' ');
+    expect(minion).toContain('Main moves; your lane stays');
+    expect(minion).toContain('never a reason to restart, replace or re-branch your work');
+    expect(minion).toContain('resolve the conflict in your own worktree');
+    expect(minion).toContain('do not revert what main already has');
+    expect(minion).toContain("Main's newer features are not part of your scope");
+    // Merge boundary (owner ruling 2026-10-10): same-branch integration is
+    // ordinary worker execution without an owner checkpoint; the final PR
+    // merge is never the worker's.
+    expect(minion).toContain('merge main into your task branch');
+    expect(minion).toContain('record the actual input SHAs');
+    expect(minion).toContain('needs no separate owner permission');
+    expect(minion).toContain('never moves a branch under an active review freeze');
+    expect(minion).toContain('the owner performs every final PR merge');
+    expect(minion).not.toContain('merging belongs to the review verdict');
+    // Regression hardening (native r2 warning): the original unqualified
+    // owner-every/ALL-merges bans must not return in any case variant.
+    const minionLower = minion.toLowerCase();
+    expect(minionLower).not.toContain('owner holds every merge');
+    expect(minionLower).not.toContain('owner holds all merges');
   });
 
   it('maps cwd policy per ruling 17: chat/ops/memory at workspace root, workers rooted in projects', () => {
@@ -106,14 +131,82 @@ describe('role definitions (E8)', () => {
   });
 });
 
+describe('merge authority boundary (owner ruling 2026-10-10)', () => {
+  const flat = (role: 'gru' | 'silas' | 'minion'): string =>
+    ROLE_DEFINITIONS[role].systemPrompt.replace(/\s+/gu, ' ');
+  const opsSkill = (): string => {
+    const skill = loadSilasSkills().find((candidate) => candidate.name === 'ops-dispatch');
+    if (skill === undefined) throw new Error('the shipped ops-dispatch skill is missing');
+    return skill.body.replace(/\s+/gu, ' ');
+  };
+
+  it('Gru: branch integration is worker execution; the owner holds every final PR merge', () => {
+    const gru = flat('gru');
+    // Permitted: the conflict is resolved in the worker's own lane.
+    expect(gru).toContain('merging main into the task branch');
+    expect(gru).toContain('not a merge-authority');
+    expect(gru).toContain('Main advancing never by itself justifies replacing a worktree, branch or PR');
+    // Forbidden: no agent merges the PR; the owner does, after final CI and
+    // exact-final-head review clearance.
+    expect(gru).toContain('The owner holds every final PR merge, everywhere');
+    expect(gru).toContain('no agent merges a PR');
+    expect(gru).toContain('required final CI');
+    expect(gru).toContain('exact-final-head native Perkins READY');
+    // The blanket wording that read as covering both operations is gone.
+    expect(gru).not.toContain('The owner holds every merge, everywhere');
+    expect(gru.toLowerCase()).not.toContain('owner holds every merge');
+    expect(gru.toLowerCase()).not.toContain('owner holds all merges');
+  });
+
+  it('Silas: integration is coordinated mechanical work; final PR merges stay owner-only in every repository', () => {
+    const silas = flat('silas');
+    expect(silas).toContain('integrates main into the existing task branch');
+    expect(silas).toContain('needs no owner permission question');
+    expect(silas).toContain('The owner performs every final PR merge, in every repository');
+    expect(silas).toContain('No agent merges a PR');
+    expect(silas).toContain('never moves a head under an active review freeze');
+    expect(silas).not.toContain('owner holds ALL merges');
+    expect(silas).not.toContain('Gru no longer merges anything');
+    expect(silas.toLowerCase()).not.toContain('owner holds every merge');
+  });
+
+  it('the minion: same-branch integration needs no owner checkpoint; the final PR merge is not theirs', () => {
+    const minion = flat('minion');
+    expect(minion).toContain('merge main into your task branch');
+    expect(minion).toContain('record the actual input SHAs');
+    expect(minion).toContain('needs no separate owner permission');
+    expect(minion).toContain('the owner performs every final PR merge');
+    expect(minion).not.toContain('merging belongs to the review verdict');
+    expect(minion.toLowerCase()).not.toContain('owner holds every merge');
+    expect(minion.toLowerCase()).not.toContain('owner holds all merges');
+  });
+
+  it('the shipped ops skill drops the chief-merge exception and the rebase-default conflict path', () => {
+    const ops = opsSkill();
+    expect(ops).toContain('The owner performs every final PR merge, in every repository');
+    expect(ops).toContain('gru-command included');
+    expect(ops).toContain('merge the PR base into your task branch');
+    expect(ops).toContain('never rebase, reset or force-push');
+    expect(ops).toContain('`pr-conflict-rebase`');
+    expect(ops).not.toContain('The chief holds merge authority');
+    expect(ops).not.toContain('"directive":"rebase');
+    expect(ops.toLowerCase()).not.toContain('owner holds every merge');
+    expect(ops.toLowerCase()).not.toContain('owner holds all merges');
+    expect(ops.toLowerCase()).not.toContain('gru no longer merges anything');
+  });
+});
+
 describe('build-workflow playbook (owner ruling 2026-10-02; j-761 capability amendment)', () => {
   const minion = ROLE_DEFINITIONS.minion.systemPrompt.replace(/\s+/gu, ' ');
   const silas = ROLE_DEFINITIONS.silas.systemPrompt.replace(/\s+/gu, ' ');
 
-  it('the worker selects the installed build-workflow skill by capability and owns the cycle end to end', () => {
-    expect(minion).toContain("the PROJECT's actual installed skill catalog/metadata");
-    expect(minion).toContain('task-relevant BMAD skills by capability');
-    expect(minion).toContain('never by a fixed skill name, a remembered file path, or a hand-maintained rename table');
+  it('the worker follows the bound GC-owned workflow and owns the cycle end to end', () => {
+    expect(minion).toContain('GC-owned build workflow bound to your registered lane');
+    expect(minion).toContain('explicit project/job artifact context');
+    expect(minion).toContain('takes precedence over same-named copies');
+    expect(minion).toContain('approved portable specs/decisions/docs');
+    expect(minion).toContain('`gru-output/`');
+    expect(minion).toContain('Honor project AGENTS.md');
     expect(minion).toContain('You own the');
     expect(minion).toContain('no per-phase hand-back and no source-only hand-back');
     // The literal fixed-name requirement is retired (j-761): no bmad-* token
@@ -128,17 +221,26 @@ describe('build-workflow playbook (owner ruling 2026-10-02; j-761 capability ame
     expect(minion).toContain('a separate tracked job with its own session and worktree');
     expect(minion).toContain('read-only brief');
     expect(minion).toContain('"deliverable": "review"');
+    // Each reviewer names the commissioning job so the board nests it
+    // under that heist as a megaminion instead of a peer heist.
+    expect(minion.replace(/\s+/gu, ' ')).toContain('name your own job id (the one in your briefing header) as `"parent_job_id"`');
+    expect(minion).toContain('megaminion');
+    // The commissioning minion owes each reviewer's disposition.
+    const flatMinion = minion.replace(/\s+/gu, ' ');
+    expect(flatMinion).toContain("makes your job each reviewer's commissioner");
+    expect(flatMinion).toContain('POST /api/jobs/<review job id>/disposition');
     expect(minion).toContain('an inline self-review is not a substitute');
-    // The loud missing-capability stop names the official onboarding path.
-    expect(minion).toContain("Project-local BMAD");
+    expect(minion).toContain('Restore the retained package for the same worker/lane');
+    expect(minion).toContain('not BMAD onboarding');
+    expect(minion).not.toContain("setup wizard's BMAD provisioning step");
     expect(minion).not.toContain('pi -p');
     expect(minion).not.toContain('claude -p');
   });
 
-  it('the ops persona carries the minion-owned build cycle without fixed names', () => {
+  it('the ops persona carries the minion-owned GC build cycle', () => {
     expect(silas).toContain('Minion-owned build cycle');
-    expect(silas).toContain("selects the task-relevant BMAD skills from the project's actual installed catalog");
-    expect(silas).toContain('never demand a fixed skill name');
+    expect(silas).toContain('GC-owned build workflow and explicit project/job artifact context');
+    expect(silas).toContain('Do not pull that work back between phases');
     expect(silas).toContain('"deliverable": "review"');
     expect(silas).toContain('exact-final-head READY');
     expect(silas).not.toContain('bmad-build');

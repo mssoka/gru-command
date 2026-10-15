@@ -13,12 +13,14 @@ import { DEFAULT_INSTANCE_PORT, expandTilde, ROLES, RUNTIME_IDS, type Role, type
  * nothing written.
  */
 
-export type BmadRepoAction = 'install' | 'reuse' | 'skip';
+/** Runtime NEW installs default to. Existing configs keep what they say
+ * (seedAnswersFromConfig); the code-level fallback in config.ts is separate. */
+export const DEFAULT_NEW_INSTALL_RUNTIME: RuntimeId = 'claude-code';
 
 export interface WizardAnswers {
   /** Raw workspace-root string as answered (`~`-form preserved in output). */
   readonly workspaceRoot: string;
-  /** Managed-repo names picked under the workspace root (informational —
+  /** Repo names selected for setup validation (not a management whitelist —
    * the config schema has no repos key; the board discovers repos live). */
   readonly repos: readonly string[];
   readonly runtime: RuntimeId;
@@ -33,8 +35,6 @@ export interface WizardAnswers {
   readonly token: string;
   readonly registerService: boolean;
   readonly smoke: boolean;
-  /** Per-selected-repo BMAD action. Fresh defaults to install; existing to reuse. */
-  readonly bmad: Readonly<Record<string, BmadRepoAction>>;
 }
 
 /** Error class for answers validation — message is the whole UX. */
@@ -57,7 +57,6 @@ const ANSWER_KEYS = [
   'token',
   'register_service',
   'smoke',
-  'bmad',
 ] as const;
 
 export const DEFAULT_WORKSPACE_ROOT = '~/code';
@@ -218,6 +217,13 @@ export function parseAnswers(json: string, home: string = homedir()): WizardAnsw
   if (!isPlainObject(raw)) {
     throw new AnswersError('--answers must be a JSON object');
   }
+  if (Object.hasOwn(raw, 'bmad')) {
+    throw new AnswersError(
+      'answers.bmad is retired: GC setup no longer provisions or configures BMAD. ' +
+        'Remove the bmad key from --answers and re-run GC setup; independent BMAD installations stay untouched. ' +
+        'For old GC bootstrap references, see docs/BMAD-RUNTIME.md.',
+    );
+  }
   for (const key of Object.keys(raw)) {
     if (!(ANSWER_KEYS as readonly string[]).includes(key)) {
       throw new AnswersError(
@@ -261,7 +267,7 @@ export function parseAnswers(json: string, home: string = homedir()): WizardAnsw
     }
   }
 
-  let runtime: RuntimeId = 'pi';
+  let runtime: RuntimeId = DEFAULT_NEW_INSTALL_RUNTIME;
   if (raw['runtime'] !== undefined) {
     const id = requireString(raw['runtime'], 'runtime');
     if (!(RUNTIME_IDS as readonly string[]).includes(id)) {
@@ -326,30 +332,6 @@ export function parseAnswers(json: string, home: string = homedir()): WizardAnsw
     }
   }
 
-  const bmad: Record<string, BmadRepoAction> = {};
-  const workspaceAbs = expandTilde(workspaceRoot, home);
-  for (const repo of repos) {
-    bmad[repo] = existsSync(join(workspaceAbs, repo, '_bmad', '_config', 'manifest.yaml'))
-      ? 'reuse'
-      : 'install';
-  }
-  if (raw['bmad'] !== undefined) {
-    if (!isPlainObject(raw['bmad'])) {
-      throw new AnswersError('answers.bmad must be an object of selected repo → install | reuse | skip');
-    }
-    for (const [repo, action] of Object.entries(raw['bmad'])) {
-      if (!repos.includes(repo)) {
-        throw new AnswersError(`answers.bmad names unselected repo \`${repo}\``);
-      }
-      if (!['install', 'reuse', 'skip'].includes(String(action))) {
-        throw new AnswersError(
-          `answers.bmad.${repo} must be "install", "reuse", or "skip", got: ${JSON.stringify(action)}`,
-        );
-      }
-      bmad[repo] = action as BmadRepoAction;
-    }
-  }
-
   return {
     workspaceRoot,
     repos,
@@ -362,6 +344,5 @@ export function parseAnswers(json: string, home: string = homedir()): WizardAnsw
     token,
     registerService: raw['register_service'] === true,
     smoke: raw['smoke'] !== false,
-    bmad,
   };
 }

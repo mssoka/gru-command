@@ -1,9 +1,11 @@
-import { execFile as execFileCallback, execFileSync } from 'node:child_process';
+import { execFile as execFileCallback, execFileSync, spawn, spawnSync } from 'node:child_process';
+import { readFile as readFileAsync, readdir as readdirAsync } from 'node:fs/promises';
 import { promisify } from 'node:util';
 
 const execFileAsPromised = promisify(execFileCallback);
 import { createHash } from 'node:crypto';
-import { closeSync, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, unlinkSync, writeFileSync, constants } from 'node:fs';
+import { closeSync, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, rmSync, unlinkSync, writeFileSync, constants } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { BranchIdleTag } from '../branch-idle.js';
 import type { CiEvidenceRecord } from '../../review-inputs/ci-evidence.js';
@@ -132,22 +134,636 @@ export interface FrozenReview {
   };
 }
 
-function gitRaw(repoPath: string, args: readonly string[], timeoutMs = 30_000): string {
+function gitRaw(
+  repoPath: string,
+  args: readonly string[],
+  timeoutMs = 30_000,
+  killSignal: 'SIGTERM' | 'SIGKILL' = 'SIGTERM',
+  /** Diagnostics in the C locale, so an expected refusal is recognized by
+   * git's own words. */
+  cLocale = false,
+): string {
   return execFileSync('git', ['-C', repoPath, ...args], {
     encoding: 'utf8',
     maxBuffer: GIT_MAX_BUFFER,
     timeout: timeoutMs,
+    killSignal,
     stdio: ['ignore', 'pipe', 'pipe'],
+    env: repositoryGitEnv(cLocale),
   });
+}
+
+/** The exit code and diagnostics of a failed git step — async (`code`) or
+ * sync (`status`) alike. A spawn failure or a kill has no numeric code. */
+function gitFailure(error: unknown): { readonly code: number | null; readonly stderr: string } {
+  const failed = error as { code?: unknown; status?: unknown; stderr?: unknown; message?: unknown } | null;
+  const code = typeof failed?.code === 'number' ? failed.code : typeof failed?.status === 'number' ? failed.status : null;
+  const stderr = typeof failed?.stderr === 'string' && failed.stderr !== ''
+    ? failed.stderr
+    : Buffer.isBuffer(failed?.stderr) && failed.stderr.length > 0
+      ? failed.stderr.toString('utf8')
+      : typeof failed?.message === 'string' ? failed.message : '';
+  return { code, stderr };
+}
+
+/** `git check-ref-format --branch <name>` refused THIS NAME — git's own
+ * complete invalid-name diagnostic for exactly this spelling (exit 128, C
+ * locale). Any other failure — an unreadable repository also exits 128, and
+ * its path may even contain those words — is operational; so is a
+ * diagnostic cut at its bound (R7-2): the lost tail could be the
+ * operational part. */
+export function refusedBranchName(error: unknown, name: string): boolean {
+  if ((error as { stderrTruncated?: unknown } | null)?.stderrTruncated === true) return false;
+  const { code, stderr } = gitFailure(error);
+  // The WHOLE diagnostic, with at most its terminal newline: a refusal line
+  // embedded in a longer (operational) diagnostic proves nothing.
+  return code === 128 && stderr.replace(/\n$/u, '') === `fatal: '${name}' is not a valid branch name`;
+}
+
+/** `git rev-parse --verify <ref>^{commit}` found no such commit — git's own
+ * complete diagnostic (exit 128, C locale). Any other failure, a cut
+ * diagnostic included, is operational (R8-11): a timeout, spawn or I/O
+ * error proves nothing about the ref. */
+export function refUnresolved(error: unknown): boolean {
+  if ((error as { stderrTruncated?: unknown } | null)?.stderrTruncated === true) return false;
+  const { code, stderr } = gitFailure(error);
+  return code === 128 && stderr.replace(/\n$/u, '') === 'fatal: Needed a single revision';
+}
+
+/** `git check-ref-format <ref>` refused the FORMAT: exit 1 is its only
+ * "invalid" answer; 128 and every other failure are operational. */
+export function refusedRefFormat(error: unknown): boolean {
+  return gitFailure(error).code === 1;
+}
+
+/** Ceiling on what one probe step may print (a ref listing, a name). */
+const PROBE_MAX_OUTPUT_BYTES = 1024 * 1024;
+/** Diagnostics kept per step; anything longer is marked truncated. */
+const STDERR_MAX_BYTES = 64 * 1024;
+
+/** After the group was SIGKILLed, how long its cessation may take to
+ * observe before the step is refused as "cleanup unconfirmed" (owner
+ * decision 2026-10-07, R6-5: bounded refusal — never an unbounded wait).
+ * Every inspection is charged against this one deadline (R8-4). */
+const KILL_SETTLE_MS = 1_000;
+
+/** Environment variables that route git to ANOTHER repository (R8-22):
+ * `git rev-parse --local-env-vars` less its config carriers, plus the
+ * discovery controls. They are removed for every review git step, so the
+ * repository git touches is exactly the one passed with -C. Transport and
+ * auth settings (GIT_SSH*, GIT_ASKPASS, credential helpers, config
+ * parameters) are kept. */
+const GIT_ROUTING_ENV = [
+  'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
+  'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_IMPLICIT_WORK_TREE', 'GIT_PREFIX',
+  'GIT_SHALLOW_FILE', 'GIT_GRAFT_FILE', 'GIT_REPLACE_REF_BASE', 'GIT_NO_REPLACE_OBJECTS',
+  'GIT_CEILING_DIRECTORIES', 'GIT_DISCOVERY_ACROSS_FILESYSTEM', 'GIT_QUARANTINE_PATH',
+] as const;
+
+/** The environment of a review git step: the service's own, minus every
+ * repository-routing override (R8-22); C-locale diagnostics on request. */
+export function repositoryGitEnv(cLocale: boolean): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const name of GIT_ROUTING_ENV) delete env[name];
+  return cLocale ? { ...env, LC_ALL: 'C' } : env;
+}
+
+export type GroupMember = { readonly pid: number; readonly state: string };
+
+/** Process-state flags `ps` appends to its state letter (macOS and Linux). */
+const PS_STATE = /^[RSDZTIUXWK][<>ANELSsVWXJlp+]*$/u;
+/** A `/proc/<pid>/stat` state is exactly one letter. */
+const PROC_STATE = /^[RSDZTtWXxKPI]$/u;
+/** Only a valid Z or X state — zombie or dead — is a stopped member. */
+const STOPPED_STATE = /^[ZX][<>ANELSsVWXJlp+]*$/u;
+const DIGITS = /^\d+$/u;
+
+/** `state` and group of a `/proc/<pid>/stat` record, or null unless every
+ * token needed is present and well formed (#263): a blank or non-numeric
+ * group is unknown — never converted to 0 — while a legitimate group 0
+ * (a kernel thread) is accepted. */
+function parseProcStat(stat: string): { readonly state: string; readonly group: number } | null {
+  const close = stat.lastIndexOf(')');
+  if (close === -1) return null;
+  const fields = stat.slice(close + 2).split(' ');
+  const [state, parent, groupText] = fields;
+  if (state === undefined || !PROC_STATE.test(state)) return null;
+  if (parent === undefined || !DIGITS.test(parent)) return null;
+  if (groupText === undefined || !DIGITS.test(groupText)) return null;
+  const group = Number(groupText);
+  return Number.isSafeInteger(group) ? { state, group } : null;
+}
+
+export type ProcFs = { readonly list: () => string[]; readonly read: (path: string) => string };
+const REAL_PROC_FS: ProcFs = { list: () => readdirSync('/proc'), read: (path) => readFileSync(path, 'utf8') };
+/** The same /proc view without blocking the event loop (#264). */
+export type ProcFsAsync = { readonly list: () => Promise<string[]>; readonly read: (path: string) => Promise<string> };
+const REAL_PROC_FS_ASYNC: ProcFsAsync = { list: () => readdirAsync('/proc'), read: (path) => readFileAsync(path, 'utf8') };
+
+/** Members of process group `pgid` from /proc, or null when membership
+ * cannot be established completely: only a process that ENDED while being
+ * listed may be skipped — an unreadable or malformed entry might be a live
+ * member (R8-3). `fs` is a test seam. */
+export function procGroupMembers(
+  pgid: number,
+  fs: ProcFs = OWNED_GIT_SEAMS.procFs,
+  expired: () => boolean = () => false,
+): GroupMember[] | null {
+  let entries: string[];
+  try {
+    entries = fs.list();
+  } catch {
+    return null;
+  }
+  const members: GroupMember[] = [];
+  for (const entry of entries) {
+    if (!/^\d+$/u.test(entry)) continue;
+    if (expired()) return null; // an expired scan is incomplete, so unknown (#264)
+    let stat: string;
+    try {
+      stat = fs.read(`/proc/${entry}/stat`);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ESRCH') continue; // ended while listing
+      return null;
+    }
+    const record = parseProcStat(stat);
+    if (record === null) return null; // a record that cannot be read in full might be a live member (#263)
+    if (record.group === pgid) members.push({ pid: Number(entry), state: record.state });
+  }
+  return expired() ? null : members;
+}
+
+/** procGroupMembers without blocking the event loop (#264): every entry is
+ * read asynchronously, and the scan stops — unknown — once `expired()`. */
+export async function procGroupMembersAsync(
+  pgid: number,
+  fs: ProcFsAsync = OWNED_GIT_SEAMS.procFsAsync,
+  expired: () => boolean = () => false,
+): Promise<GroupMember[] | null> {
+  let entries: string[];
+  try {
+    entries = await fs.list();
+  } catch {
+    return null;
+  }
+  const members: GroupMember[] = [];
+  for (const entry of entries) {
+    if (!/^\d+$/u.test(entry)) continue;
+    if (expired()) return null;
+    let stat: string;
+    try {
+      stat = await fs.read(`/proc/${entry}/stat`);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ESRCH') continue; // ended while listing
+      return null;
+    }
+    const record = parseProcStat(stat);
+    if (record === null) return null;
+    if (record.group === pgid) members.push({ pid: Number(entry), state: record.state });
+  }
+  return expired() ? null : members;
+}
+
+/** Members of group `pgid` from `ps -A -o pid=,pgid=,stat=` output, or null
+ * when any line cannot be read (R8-3). */
+export function psGroupMembers(stdout: string, pgid: number): GroupMember[] | null {
+  const members: GroupMember[] = [];
+  for (const line of stdout.split('\n')) {
+    if (line.trim() === '') continue;
+    const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s*$/u.exec(line);
+    if (match === null || !PS_STATE.test(match[3]!)) return null;
+    const pid = Number(match[1]);
+    const group = Number(match[2]);
+    if (!Number.isSafeInteger(pid) || !Number.isSafeInteger(group)) return null;
+    if (group === pgid) members.push({ pid, state: match[3]! });
+  }
+  return members;
+}
+
+/** Does group `pgid` exist at all? 'gone' only on ESRCH: EPERM means a
+ * member exists that is not ours to signal. Signal 0 never acts. */
+function groupExists(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+/** Unknown membership, or any member not a zombie (R7-9): still running. */
+export const executingMember = (members: readonly GroupMember[] | null): boolean =>
+  members === null || members.some((member) => !STOPPED_STATE.test(member.state));
+
+/** Is a member of group `pgid` still EXECUTING — not merely a zombie
+ * awaiting its reaper (R7-9)? Membership that cannot be established within
+ * `budgetMs` — or completely — counts as yes: cessation is never assumed
+ * (R8-3, R8-4). Synchronous: the sync runner's settle only. */
+export function groupHasLiveMember(pgid: number, budgetMs: number): boolean {
+  if (!Number.isSafeInteger(pgid) || pgid <= 0) return false;
+  if (!groupExists(pgid)) return false;
+  if (OWNED_GIT_SEAMS.platform === 'linux') {
+    // The synchronous scan is bounded on its own (#264): out of budget, membership is unknown, so live.
+    const until = OWNED_GIT_SEAMS.now() + budgetMs;
+    return executingMember(procGroupMembers(pgid, OWNED_GIT_SEAMS.procFs, () => OWNED_GIT_SEAMS.now() >= until));
+  }
+  const listed = spawnSync('/bin/ps', ['-A', '-o', 'pid=,pgid=,stat='], {
+    encoding: 'utf8', timeout: Math.max(1, Math.floor(budgetMs)), killSignal: 'SIGKILL',
+  });
+  if (listed.status !== 0 || typeof listed.stdout !== 'string') return true;
+  return executingMember(psGroupMembers(listed.stdout, pgid));
+}
+
+/** groupHasLiveMember without blocking the event loop (R8-4): `ps` runs as
+ * an async child bounded by the remaining budget. */
+export async function groupHasLiveMemberAsync(pgid: number, budgetMs: number): Promise<boolean> {
+  if (!Number.isSafeInteger(pgid) || pgid <= 0) return false;
+  if (!groupExists(pgid)) return false;
+  if (OWNED_GIT_SEAMS.platform === 'linux') {
+    // Asynchronous and charged to the remaining settle budget (#264).
+    const until = OWNED_GIT_SEAMS.now() + budgetMs;
+    return executingMember(await procGroupMembersAsync(pgid, OWNED_GIT_SEAMS.procFsAsync, () => OWNED_GIT_SEAMS.now() >= until));
+  }
+  try {
+    const { stdout } = await execFileAsPromised('/bin/ps', ['-A', '-o', 'pid=,pgid=,stat='], {
+      encoding: 'utf8', timeout: Math.max(1, Math.floor(budgetMs)), killSignal: 'SIGKILL',
+    });
+    return executingMember(psGroupMembers(stdout, pgid));
+  } catch {
+    return true;
+  }
+}
+
+/** Test seam: how a finished step's group is observed and its private
+ * directory removed — production always uses the functions here; a test
+ * can stand in an unkillable group or a failing removal. */
+export const OWNED_GIT_SEAMS: {
+  groupHasLiveMember: (pgid: number, budgetMs: number) => boolean;
+  groupHasLiveMemberAsync: (pgid: number, budgetMs: number) => Promise<boolean>;
+  removePrivateDir: (dir: string) => void;
+  platform: NodeJS.Platform;
+  procFs: ProcFs;
+  procFsAsync: ProcFsAsync;
+  /** Monotonic milliseconds: the settle deadline's clock. */
+  now: () => number;
+  /** How a runner is started (a test can stand in a child that never exits). */
+  spawn: typeof spawn;
+  /** Grace past a step's own bound before the outer guard acts on a runner that has not exited. */
+  guardSlackMs: number;
+} = {
+  spawn,
+  guardSlackMs: 5_000,
+  platform: process.platform,
+  procFs: REAL_PROC_FS,
+  procFsAsync: REAL_PROC_FS_ASYNC,
+  now: () => performance.now(),
+  groupHasLiveMember,
+  groupHasLiveMemberAsync,
+  removePrivateDir: (dir) => {
+    rmSync(dir, { recursive: true, force: true });
+  },
+};
+
+/** A git step whose process group was still running after KILL_SETTLE_MS:
+ * refused, never retried, and escalated naming the group (owner decision
+ * 2026-10-08) — nothing is quarantined. */
+function cleanupUnconfirmed(pgid: number, message: string): Error {
+  // The verdict leads: refusal details are cut to a bounded length.
+  return Object.assign(
+    new Error(`cleanup unconfirmed: process group ${pgid} still running — ${message}`),
+    { cleanupUnconfirmed: true, pgid },
+  );
+}
+
+/** The probe runner. Its parent starts it detached, so it LEADS its own
+ * process group, and git (spawned normally) joins that group. It enforces
+ * the step's rules itself — natural end, the buffered-output drain, time
+ * and output bounds — writes its outcome to a private result file, then
+ * SIGKILLs its whole group, itself included. It is the group's anchor: it
+ * is alive while it signals, so the group id cannot be anyone else's
+ * (R8-6), and its own timer bounds the step even if its parent dies (the
+ * service crashing mid-step). Its stdio is ignored, so nothing git spawned
+ * can hold the parent's pipes. */
+const OWNED_GROUP_RUNNER = `
+const { spawn } = require('node:child_process');
+const { writeFileSync, readSync } = require('node:fs');
+const [resultFile, limit, maxBytes, maxErrBytes, file, ...args] = process.argv.slice(1);
+const self = process.pid;
+try { process.kill(-self, 0); } catch {
+  writeFileSync(resultFile, JSON.stringify({ outcome: 'spawn-error', message: 'the probe runner does not lead its own process group' }), { mode: 0o600 });
+  process.exit(127);
+}
+const child = spawn(file, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+const out = []; const err = []; let outBytes = 0; let errBytes = 0; let done = false;
+const report = (result) => {
+  if (done) return; done = true;
+  const stderr = Buffer.concat(err).toString('utf8');
+  try { writeFileSync(resultFile, JSON.stringify({ ...result, stderr, stderrTruncated: errBytes > Number(maxErrBytes) }), { mode: 0o600 }); } catch {}
+  try { process.kill(-self, 'SIGKILL'); } catch {}
+  process.exit(125);
+};
+setTimeout(() => report({ outcome: 'timeout' }), Number(limit));
+child.stdout.on('data', (chunk) => { outBytes += chunk.length; if (outBytes > Number(maxBytes)) report({ outcome: 'overflow' }); else out.push(chunk); });
+child.stderr.on('data', (chunk) => { errBytes += chunk.length; if (errBytes <= Number(maxErrBytes)) err.push(chunk); });
+child.on('error', (error) => report({ outcome: 'spawn-error', message: String(error) }));
+child.on('exit', (code, signal) => {
+  if (done) return;
+  // Only what is already in the pipes when git exits can complete its
+  // answer (#262): read it synchronously, without ever waiting. A pipe that
+  // is not at end-of-file by the first would-block is still held open by
+  // another process, possibly still writing — the answer is incomplete, and
+  // later data or EOF can never revive it. No writer is waited for or signalled.
+  const drain = (stream, take) => {
+    if (stream.destroyed || stream.readableEnded) return true;
+    const fd = stream._handle && stream._handle.fd;
+    if (typeof fd !== 'number' || fd < 0) return false;
+    const buffer = Buffer.allocUnsafe(65536);
+    for (;;) {
+      let n;
+      try { n = readSync(fd, buffer, 0, buffer.length, null); } catch { return false; }
+      if (n === 0) return true;
+      take(Buffer.from(buffer.subarray(0, n)));
+      if (done) return true;
+    }
+  };
+  const outEof = drain(child.stdout, (chunk) => { outBytes += chunk.length; if (outBytes > Number(maxBytes)) report({ outcome: 'overflow' }); else out.push(chunk); });
+  const errEof = drain(child.stderr, (chunk) => { errBytes += chunk.length; if (errBytes > Number(maxBytes)) report({ outcome: 'overflow' }); else if (errBytes <= Number(maxErrBytes)) err.push(chunk); });
+  if (done) return;
+  if (!outEof || !errEof) return report({ outcome: 'incomplete' });
+  report({ outcome: code === 0 ? 'ok' : 'failed', code, signal, stdout: code === 0 ? Buffer.concat(out).toString('utf8') : '' });
+});
+`;
+
+/** Block for `ms` without spinning (the sync probe's bounded settle). */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/** A private 0700 directory for one runner's result (it can carry raw
+ * diagnostics — R7-4), the runner's argv, and its environment. */
+function runnerLaunch(repoPath: string, args: readonly string[], timeoutMs: number, maxBytes: number) {
+  const privateDir = mkdtempSync(join(tmpdir(), 'gru-probe-'));
+  const resultFile = join(privateDir, 'result.json');
+  const argv = ['-e', OWNED_GROUP_RUNNER, resultFile, String(timeoutMs), String(maxBytes), String(STDERR_MAX_BYTES),
+    'git', '-C', repoPath, ...args];
+  return { privateDir, resultFile, argv, env: repositoryGitEnv(true) };
+}
+
+type RunnerReport = {
+  outcome?: unknown; code?: unknown; signal?: unknown; stdout?: unknown; stderr?: unknown; stderrTruncated?: unknown; message?: unknown;
+};
+
+function readRunnerReport(resultFile: string): RunnerReport | null {
+  try {
+    return JSON.parse(readFileSync(resultFile, 'utf8')) as RunnerReport;
+  } catch {
+    return null;
+  }
+}
+
+/** A runner's report as the step's answer — or the step's failure, which
+ * carries `ownedStopped`: its whole group was observed gone. */
+function runnerAnswer(
+  report: RunnerReport | null,
+  command: string,
+  timeoutMs: number,
+  maxBytes: number,
+  launch: { readonly started: boolean; readonly error?: string },
+): string {
+  const stopped = { ownedStopped: true };
+  if (report === null) {
+    throw Object.assign(new Error(
+      `${command}: the probe runner ${launch.started ? 'ended without a result' : 'could not be started'}` +
+        `${launch.error !== undefined ? ` (${launch.error})` : ''}`,
+    ), stopped);
+  }
+  const stderr = typeof report.stderr === 'string' ? report.stderr : '';
+  switch (report.outcome) {
+    case 'ok':
+      return typeof report.stdout === 'string' ? report.stdout : '';
+    case 'failed':
+      throw Object.assign(new Error(stderr.trim() || `${command} exited ${String(report.code ?? report.signal)}`), {
+        ...(typeof report.code === 'number' ? { code: report.code, status: report.code } : { status: null }),
+        signal: report.signal ?? null,
+        stderr,
+        ...(report.stderrTruncated === true ? { stderrTruncated: true } : {}),
+        ...stopped,
+      });
+    case 'timeout':
+      throw Object.assign(new Error(`${command} timed out after ${timeoutMs} ms`), { killed: true, ...stopped });
+    case 'overflow':
+      throw Object.assign(new Error(`${command} printed more than ${maxBytes} bytes`), stopped);
+    case 'incomplete':
+      throw Object.assign(new Error(`${command} exited, but its output was still held open — the answer is incomplete`), stopped);
+    default:
+      throw Object.assign(new Error(`${command}: ${typeof report.message === 'string' ? report.message : 'the probe runner failed'}`), stopped);
+  }
+}
+
+type StepOutcome<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: unknown };
+
+/** Removes a step's private directory, then publishes its outcome (R9-14).
+ * A removal failure never replaces a failure — a cleanup-unconfirmed
+ * verdict keeps its group — and is attached to it instead; after a
+ * success it fails the step, whose group was already proven stopped. */
+function afterPrivateDirRemoved<T>(privateDir: string, command: string, outcome: StepOutcome<T>): T {
+  let removal: string | null = null;
+  try {
+    OWNED_GIT_SEAMS.removePrivateDir(privateDir);
+  } catch (error) {
+    removal = error instanceof Error ? error.message : String(error);
+  }
+  if (!outcome.ok) {
+    if (removal !== null && outcome.error instanceof Error) Object.assign(outcome.error, { privateDirRemovalError: removal });
+    throw outcome.error;
+  }
+  if (removal !== null) {
+    throw Object.assign(new Error(`${command}: its private directory ${privateDir} could not be removed (${removal})`), { ownedStopped: true });
+  }
+  return outcome.value;
+}
+
+/** One read-only git step in its OWN process group, led by the runner (see
+ * OWNED_GROUP_RUNNER), without blocking the event loop. The runner ends
+ * every outcome by SIGKILLing its group; this side only OBSERVES the group
+ * afterwards (R8-6) — within KILL_SETTLE_MS, or the step is refused as
+ * "cleanup unconfirmed". Should the runner itself wedge, it is still this
+ * process's unreaped child, so its group is provably ours: killed here.
+ * Contract (owner decision 2026-10-07, R5-4): cleanup covers the step's
+ * process group; a helper that deliberately detaches into its own session
+ * is outside it and left alone — and if it holds the output, the answer is
+ * refused as incomplete. Diagnostics are in the C locale. Rejections carry
+ * the numeric exit `code`, `stderr` (with `stderrTruncated` when cut), and
+ * `ownedStopped` — proof the step's group stopped; a timeout, kill, spawn
+ * failure or incomplete answer has no code. */
+export function runOwnedGit(repoPath: string, args: readonly string[], timeoutMs: number, maxBytes = PROBE_MAX_OUTPUT_BYTES): Promise<string> {
+  const command = `git ${args.join(' ')}`;
+  const launch = runnerLaunch(repoPath, args, timeoutMs, maxBytes);
+  return new Promise<string>((resolve, reject) => {
+    const runner = OWNED_GIT_SEAMS.spawn(process.execPath, launch.argv, { detached: true, stdio: 'ignore', env: launch.env });
+    // R7-1: only a real process id names a group; 0 or absent never does.
+    const pid = runner.pid !== undefined && Number.isSafeInteger(runner.pid) && runner.pid > 0 ? runner.pid : null;
+    let spawnError: string | undefined;
+    let ended = false;
+    let exited = false;
+    // The outer guard (#265): a runner that has not exited by now — stuck in
+    // uninterruptible I/O, say — is SIGKILLed while still unreaped (its group
+    // id is still ours), and cleanup is observed WITHOUT waiting for an
+    // `exit` that may never come. Once the runner has exited, ownership of the
+    // group id is lost and nothing is ever signalled.
+    const guard = setTimeout(() => {
+      if (pid !== null && !exited) {
+        try {
+          process.kill(-pid, 'SIGKILL');
+        } catch {
+          /* already gone */
+        }
+        settle();
+      }
+    }, timeoutMs + OWNED_GIT_SEAMS.guardSlackMs);
+    const settle = (): void => {
+      if (ended) return;
+      ended = true;
+      clearTimeout(guard);
+      // R9-14: the private directory is removed BEFORE the outcome is
+      // published, inside the one observed settlement — a removal failure
+      // can never surface as an unhandled rejection.
+      const answer = async (): Promise<StepOutcome<string>> => {
+        try {
+          const report = readRunnerReport(launch.resultFile);
+          if (pid !== null) {
+            const until = OWNED_GIT_SEAMS.now() + KILL_SETTLE_MS;
+            const unconfirmed = (): Error =>
+              cleanupUnconfirmed(pid, `${command} did not stop after SIGKILL (${String(report?.outcome ?? 'runner ended')})`);
+            for (;;) {
+              // The absolute deadline is checked before every inspection and
+              // after its answer: a "stopped" observed late is never published (#264).
+              const before = OWNED_GIT_SEAMS.now();
+              if (before >= until) throw unconfirmed();
+              const live = await OWNED_GIT_SEAMS.groupHasLiveMemberAsync(pid, until - before);
+              if (OWNED_GIT_SEAMS.now() >= until) throw unconfirmed();
+              if (!live) break;
+              await new Promise((wait) => setTimeout(wait, 25));
+            }
+          }
+          return { ok: true, value: runnerAnswer(report, command, timeoutMs, maxBytes, {
+            started: pid !== null, ...(spawnError !== undefined ? { error: spawnError } : {}),
+          }) };
+        } catch (error) {
+          return { ok: false, error };
+        }
+      };
+      void answer().then((outcome) => {
+        try {
+          resolve(afterPrivateDirRemoved(launch.privateDir, command, outcome));
+        } catch (error) {
+          reject(error);
+        }
+      });
+    };
+    runner.on('error', (error) => {
+      spawnError = error.message;
+      if (pid === null) settle();
+    });
+    runner.on('exit', () => {
+      exited = true;
+      settle();
+    });
+  });
+}
+
+/** runOwnedGit, synchronously (the submission gate and the admission's
+ * local checks run inside synchronous code). The runner is STARTED and
+ * OBSERVED, never waited on to die (#265): it stays unreaped here, so its
+ * process group is still provably ours, but this side never signals the
+ * GROUP (R8-6) — it only observes the group stop within KILL_SETTLE_MS,
+ * or refuses the step as "cleanup unconfirmed". The outer guard is a
+ * backstop for a wedged runner only: it cuts off that runner alone, then
+ * the group is observed the same way. The runner's own timer bounds the
+ * step. */
+export function runOwnedGitSync(
+  repoPath: string,
+  args: readonly string[],
+  timeoutMs: number,
+  outerTimeoutMs = timeoutMs + 5_000,
+  maxBytes = PROBE_MAX_OUTPUT_BYTES,
+): string {
+  const command = `git ${args.join(' ')}`;
+  const launch = runnerLaunch(repoPath, args, timeoutMs, maxBytes);
+  let outcome: StepOutcome<string>;
+  try {
+    // `detached` makes the runner lead its own process group; it refuses to
+    // run git if it does not. The runner is STARTED here and observed, never
+    // waited on to die (#265): its unreaped corpse keeps the group id ours
+    // until control returns to the event loop, where Node reaps it.
+    const runner = OWNED_GIT_SEAMS.spawn(process.execPath, launch.argv, { detached: true, stdio: 'ignore', env: launch.env });
+    runner.on('error', () => { /* a failed start leaves no pid; the step reports it */ });
+    // R7-1: a failed spawn has no pid — never a group to observe.
+    const pid = typeof runner.pid === 'number' && Number.isSafeInteger(runner.pid) && runner.pid > 0 ? runner.pid : null;
+    let report: RunnerReport | null = null;
+    if (pid !== null) {
+      const guardUntil = performance.now() + outerTimeoutMs;
+      let nextLiveness = performance.now() + 250;
+      for (;;) {
+        report = readRunnerReport(launch.resultFile);
+        if (report !== null) break;
+        const now = performance.now();
+        if (now >= guardUntil) {
+          // The runner is wedged: only the runner is cut off, as before — its
+          // group is then observed, refused if still running, never signalled.
+          try {
+            process.kill(pid, 'SIGKILL');
+          } catch {
+            /* already gone */
+          }
+          break;
+        }
+        // A runner that died without a report is a group with nothing executing.
+        if (now >= nextLiveness) {
+          if (!OWNED_GIT_SEAMS.groupHasLiveMember(pid, 250)) break;
+          nextLiveness = performance.now() + 250;
+        }
+        sleepSync(2);
+      }
+      report = report ?? readRunnerReport(launch.resultFile);
+    }
+    if (pid !== null) {
+      const until = OWNED_GIT_SEAMS.now() + KILL_SETTLE_MS;
+      const unconfirmed = (): Error =>
+        cleanupUnconfirmed(pid, `${command} did not stop after SIGKILL (${String(report?.outcome ?? 'runner ended')})`);
+      for (;;) {
+        const before = OWNED_GIT_SEAMS.now();
+        if (before >= until) throw unconfirmed();
+        const live = OWNED_GIT_SEAMS.groupHasLiveMember(pid, until - before);
+        if (OWNED_GIT_SEAMS.now() >= until) throw unconfirmed();
+        if (!live) break;
+        sleepSync(25);
+      }
+    }
+    outcome = { ok: true, value: runnerAnswer(report, command, timeoutMs, maxBytes, { started: pid !== null }) };
+  } catch (error) {
+    outcome = { ok: false, error };
+  }
+  return afterPrivateDirRemoved(launch.privateDir, command, outcome);
 }
 
 function git(repoPath: string, args: readonly string[], timeoutMs = 30_000): string {
   return gitRaw(repoPath, args, timeoutMs).trimEnd();
 }
 
-export function resolveGitCommit(repoPath: string, ref: string): string {
+/** One synchronous git step of a movement check: plain (execFileSync), or
+ * owned (R7-7) — its whole process group proven stopped, so a failure can
+ * carry that proof. Diagnostics in the C locale either way. */
+type MovementGit = (repoPath: string, args: readonly string[]) => string;
+const plainMovementGit: MovementGit = (repoPath, args) => gitRaw(repoPath, args, 30_000, 'SIGTERM', true);
+const ownedMovementGit: MovementGit = (repoPath, args) => runOwnedGitSync(repoPath, args, 30_000, undefined, GIT_MAX_BUFFER);
+
+export function resolveGitCommit(repoPath: string, ref: string, run?: MovementGit): string {
   if (ref.trim() === '') throw new Error('git ref must be non-empty');
-  return git(repoPath, ['rev-parse', '--verify', `${ref}^{commit}`]);
+  const args = ['rev-parse', '--verify', `${ref}^{commit}`];
+  return (run === undefined ? gitRaw(repoPath, args) : run(repoPath, args)).trimEnd();
 }
 
 /** Resolve an explicit base, otherwise use the repository's real default branch. */
@@ -254,8 +870,9 @@ function assertFrozenTreeHasNoSymlinks(repoPath: string, targetSha: string): voi
   }
 }
 
-function assertReviewCheckoutClean(repoPath: string): void {
-  const status = gitRaw(repoPath, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching']);
+function assertReviewCheckoutClean(repoPath: string, run?: MovementGit): void {
+  const args = ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching'];
+  const status = run === undefined ? gitRaw(repoPath, args) : run(repoPath, args);
   if (status !== '') {
     const first = status.split('\0').find(Boolean)?.slice(0, 300) ?? 'unknown checkout mutation';
     throw new Error(`detached review checkout is not pristine (tracked/staged/untracked/ignored content: ${first})`);
@@ -470,6 +1087,34 @@ export type SourceMovementCause = 'target-moved' | 'base-rewritten' | 'base-unre
 export interface SourceMovement {
   readonly cause: SourceMovementCause;
   readonly detail: string;
+  /** A killed git step would not stop: never retried; escalated naming its
+   * process group (owner decision 2026-10-08). */
+  readonly cleanupUnconfirmed?: true;
+  /** The unconfirmed step's process group id, structured so it survives
+   * any cut of the detail text. */
+  readonly processGroup?: number;
+  /** Proof the failed step's whole process group stopped (owned execution,
+   * R7-7): only such a failure may be retried. */
+  readonly stopped?: true;
+}
+
+function isUnstopped(error: unknown): boolean {
+  return (error as { cleanupUnconfirmed?: unknown } | null)?.cleanupUnconfirmed === true;
+}
+
+/** A failed probe step as fail-closed movement — carrying, when the step
+ * would not stop, that nothing may retry while it might live, and when it
+ * provably stopped, that proof. */
+function failedCheck(error: unknown): SourceMovement {
+  const failed = movement('check-failed', gitErrorDetail(error));
+  const facts = error as { cleanupUnconfirmed?: unknown; ownedStopped?: unknown; pgid?: unknown } | null;
+  if (facts?.cleanupUnconfirmed === true) {
+    return {
+      ...failed, cleanupUnconfirmed: true,
+      ...(typeof facts.pgid === 'number' && Number.isSafeInteger(facts.pgid) ? { processGroup: facts.pgid } : {}),
+    };
+  }
+  return facts?.ownedStopped === true ? { ...failed, stopped: true } : failed;
 }
 
 function movement(cause: SourceMovementCause, detail: string): SourceMovement {
@@ -487,23 +1132,27 @@ function gitErrorDetail(error: unknown): string {
 
 /** Only the local base is read: an advance is valid while the frozen
  * merge-base remains reachable; no remote base tip is consulted or fetched. */
-function baseMovementSinceFreeze(review: FrozenReview): SourceMovement | null {
+function baseMovementSinceFreeze(review: FrozenReview, run: MovementGit): SourceMovement | null {
   const { repoPath, baseRef, baseRefSha, diffBaseSha } = review.manifest;
   let live: string;
   try {
-    live = resolveGitCommit(repoPath, baseRef);
+    live = resolveGitCommit(repoPath, baseRef, run);
   } catch (error) {
+    // Only git's own "no such commit" is a base that is gone; a timeout,
+    // spawn or I/O failure is operational — retryable once proven stopped
+    // (R8-11) — and a step that would not stop is never hidden.
+    if (!refUnresolved(error)) return failedCheck(error);
     return movement('base-unresolvable', `base ${baseRef} cannot resolve: ${gitErrorDetail(error)}`);
   }
   if (live === baseRefSha) return null;
   try {
-    gitRaw(repoPath, ['merge-base', '--is-ancestor', diffBaseSha, live]);
+    run(repoPath, ['merge-base', '--is-ancestor', diffBaseSha, live]);
     return null;
   } catch (error) {
     if ((error as { status?: unknown } | null)?.status === 1) {
       return movement('base-rewritten', `base ${baseRef} no longer descends from ${diffBaseSha}`);
     }
-    return movement('check-failed', gitErrorDetail(error));
+    return failedCheck(error);
   }
 }
 
@@ -520,7 +1169,7 @@ function baseMovementSinceFreeze(review: FrozenReview): SourceMovement | null {
  * like origin/v1 resolves to refs/tags/… and never names an advertised
  * branch. Both now correctly skip this check; their pins still bind through
  * the local resolution and pristine-checkout proofs. */
-function advertisedRemoteBranch(repoPath: string, ref: string): { remote: string; branch: string } | null {
+function advertisedRemoteBranch(repoPath: string, ref: string, run: MovementGit): { remote: string; branch: string } | null {
   let remoteRef: string;
   if (ref.startsWith('refs/remotes/')) {
     // gh-169 P9: a fully-qualified spelling is not automatically a tracking
@@ -529,9 +1178,10 @@ function advertisedRemoteBranch(repoPath: string, ref: string): { remote: string
     // short spelling. Validate the ref format before treating the prefix
     // as proof; a genuine tracking ref keeps its advertised-tip check.
     try {
-      gitRaw(repoPath, ['check-ref-format', ref]);
-    } catch {
-      return null;
+      run(repoPath, ['check-ref-format', ref]);
+    } catch (error) {
+      if (refusedRefFormat(error)) return null; // git refused the format: an expression, not a tracking ref
+      throw error; // an operational failure proves nothing — fail closed
     }
     remoteRef = ref.slice('refs/remotes/'.length);
   } else {
@@ -541,19 +1191,16 @@ function advertisedRemoteBranch(repoPath: string, ref: string): { remote: string
     // A valid branch spelling only: revision operators (~ ^ : .. @{}) make
     // the ref an EXPRESSION, not the branch itself.
     try {
-      gitRaw(repoPath, ['check-ref-format', '--branch', ref]);
-    } catch {
-      return null;
+      run(repoPath, ['check-ref-format', '--branch', ref]);
+    } catch (error) {
+      if (refusedBranchName(error, ref)) return null; // git refused the name: not a branch spelling
+      throw error; // an operational failure proves nothing — fail closed
     }
     // The ref must actually RESOLVE to a remote-tracking ref — a tag whose
     // name carries a slash (origin/v1) resolves to refs/tags/origin/v1 and
-    // never names an advertised branch.
-    let fullName: string;
-    try {
-      fullName = git(repoPath, ['rev-parse', '--symbolic-full-name', '--verify', ref]);
-    } catch {
-      return null;
-    }
+    // never names an advertised branch. A ref that no longer resolves at
+    // all is not "unadvertised": the frozen target vanished — fail closed.
+    const fullName = run(repoPath, ['rev-parse', '--symbolic-full-name', '--verify', ref]).trimEnd();
     if (!fullName.startsWith('refs/remotes/')) return null;
     remoteRef = fullName.slice('refs/remotes/'.length);
   }
@@ -561,7 +1208,7 @@ function advertisedRemoteBranch(repoPath: string, ref: string): { remote: string
   if (slash <= 0 || slash === remoteRef.length - 1) return null;
   const remote = remoteRef.slice(0, slash);
   const branch = remoteRef.slice(slash + 1);
-  return git(repoPath, ['remote']).split('\n').includes(remote) ? { remote, branch } : null;
+  return run(repoPath, ['remote']).trimEnd().split('\n').includes(remote) ? { remote, branch } : null;
 }
 
 /** Compare the locally resolved base ancestry, movement ref (local and
@@ -580,40 +1227,65 @@ export interface SourceMovementOptions {
    * async result — gh-169 R4-6: request-time admission probes the remote
    * OFF the event loop and injects the outcome). */
   readonly skipRemoteProbe?: boolean;
+  /** Run every local step owned (R7-7): admission retries a failure only
+   * with proof its process group stopped. */
+  readonly ownedLocalSteps?: boolean;
 }
 
 export function sourceMovementSinceFreeze(review: FrozenReview, options?: SourceMovementOptions): SourceMovement | null {
   const { repoPath, targetRef, targetSha } = review.manifest;
+  const run = options?.ownedLocalSteps === true ? ownedMovementGit : plainMovementGit;
   try {
-    const base = baseMovementSinceFreeze(review);
+    const base = baseMovementSinceFreeze(review, run);
     if (base !== null) return base;
     let localTarget: string;
     try {
-      localTarget = resolveGitCommit(repoPath, targetRef);
+      localTarget = resolveGitCommit(repoPath, targetRef, run);
     } catch (error) {
+      if (!refUnresolved(error)) return failedCheck(error); // operational (R8-11)
       return movement('target-moved', `target ${targetRef} cannot resolve: ${gitErrorDetail(error)}`);
     }
     if (localTarget !== targetSha) return movement('target-moved', `target ${targetRef} is ${localTarget}, frozen at ${targetSha}`);
+    // Perkins captures fully-qualified canonical identity in targetRef at
+    // freeze. SHA/expression pins have no named authority to rediscover.
+    if (targetRef.startsWith('refs/')) {
+      let named = true;
+      try { run(repoPath, ['check-ref-format', targetRef]); }
+      catch (error) { if (refusedRefFormat(error)) named = false; else throw error; }
+      if (named) {
+        let identity: string;
+        try { identity = run(repoPath, ['rev-parse', '--symbolic-full-name', '--verify', targetRef]).trim(); }
+        catch (error) {
+          if (!isUnstopped(error) && refUnresolved(error)) return movement('target-moved', `named identity ${targetRef} cannot resolve`);
+          throw error;
+        }
+        if (!identity.startsWith('refs/')) throw new Error(`canonical named identity for ${targetRef} is unverifiable`);
+        if (identity !== targetRef) return movement('target-moved', `named identity ${targetRef} changed to ${identity}`);
+      }
+    }
     // A push may move the host tip without moving the local tracking ref.
     if (options?.skipRemoteProbe === true) {
       // The caller owns the advertised-tip proof (async path).
     } else {
-      const remoteTarget = advertisedRemoteBranch(repoPath, targetRef);
+      const remoteTarget = advertisedRemoteBranch(repoPath, targetRef, run);
       if (remoteTarget !== null) {
-      const advertised = gitRaw(
+      // An owned process group, killed at its bound: this call blocks the
+      // event loop, so neither a SIGTERM-ignoring git (or wrapper) nor
+      // anything it spawned may outlive the bound.
+      const advertised = runOwnedGitSync(
         repoPath,
         ['ls-remote', '--exit-code', remoteTarget.remote, `refs/heads/${remoteTarget.branch}`],
-          options?.remoteProbeTimeoutMs,
-        ).trim();
+        options?.remoteProbeTimeoutMs ?? 30_000,
+      ).trim();
         const tip = advertised.split(/\s+/u)[0] ?? '';
         if (tip !== targetSha) return movement('target-moved', `advertised ${remoteTarget.remote}/${remoteTarget.branch} is ${tip}, frozen at ${targetSha}`);
       }
     }
-    if (resolveGitCommit(repoPath, 'HEAD') !== targetSha) {
+    if (resolveGitCommit(repoPath, 'HEAD', run) !== targetSha) {
       return movement('checkout-changed', `review checkout HEAD no longer matches ${targetSha}`);
     }
     try {
-      assertReviewCheckoutClean(repoPath);
+      assertReviewCheckoutClean(repoPath, run);
     } catch (error) {
       if (error instanceof Error && error.message.startsWith('detached review checkout is not pristine')) {
         return movement('checkout-changed', error.message);
@@ -622,8 +1294,154 @@ export function sourceMovementSinceFreeze(review: FrozenReview, options?: Source
     }
     return null;
   } catch (error) {
-    return movement('check-failed', gitErrorDetail(error));
+    return failedCheck(error);
   }
+}
+
+/** Where a probe started, on every clock the OS suspend evidence needs. */
+export interface ProbeStart {
+  /** Wall clock (epoch ms) — compared with macOS's kernel wake time. */
+  readonly wallMs: number;
+  /** The budget clock. */
+  readonly monoMs: number;
+  /** Linux boot clock (ms, counts suspend), when available. */
+  readonly bootMs: number | null;
+}
+
+/** The OS boundary the suspend evidence is read from. Production reads
+ * the real kernel; tests substitute only these inputs, so the evidence
+ * logic itself always runs. */
+export interface SuspendEvidenceIo {
+  readonly platform: NodeJS.Platform;
+  /** Wall clock (epoch ms). */
+  readonly wallNow: () => number;
+  /** `sysctl -n kern.waketime` output (macOS), bounded by `timeoutMs`. */
+  readonly kernWaketime: (timeoutMs: number) => Promise<string>;
+  /** Raw `/proc/uptime` text (Linux; its first field keeps counting through
+   * suspend). Rejects when unreadable. Asynchronous, so a stalled read can
+   * never block the evidence allowance's timer. */
+  readonly procUptime: () => Promise<string>;
+}
+
+/** Test seams for the admission probe; production uses the defaults. */
+export interface AdmissionProbeSeams {
+  /** Budget clock (default performance.now). */
+  readonly now?: () => number;
+  /** One bounded git invocation (default execFile, killed at timeoutMs). */
+  readonly exec?: (repoPath: string, args: readonly string[], timeoutMs: number) => Promise<string>;
+  /** Where suspend evidence is read (default: the real OS). */
+  readonly evidence?: SuspendEvidenceIo;
+}
+
+/** How long a FAILED probe may spend reading suspend evidence (owner
+ * decision 2026-10-07, round 3: a separate, bounded allowance — the probe's
+ * own budget is usually what the suspend spent, so the evidence cannot be
+ * made to fit inside it). Git never gets a renewed budget without positive
+ * evidence. */
+export const SUSPEND_EVIDENCE_ALLOWANCE_MS = 1_000;
+
+/** Whole milliseconds left for the next git step, or null once the budget
+ * is spent. execFile rejects a fractional timeout (ERR_OUT_OF_RANGE), and
+ * rounding down could pass 0, which disables the kill — so round up. */
+export function remainingTimeoutMs(deadline: number, now: number): number | null {
+  const remaining = deadline - now;
+  return remaining > 0 ? Math.ceil(remaining) : null;
+}
+
+/** Every admission git step is read-only (check-ref-format, rev-parse,
+ * remote, ls-remote) and runs in its own process group, SIGKILLed at its
+ * bound and when it ends: neither a git or wrapper that ignores SIGTERM nor
+ * anything it spawned can hold admission open or overlap a retry. */
+export const defaultProbeExec = (repoPath: string, args: readonly string[], timeoutMs: number): Promise<string> =>
+  runOwnedGit(repoPath, args, timeoutMs);
+
+/** `sysctl -n kern.waketime` by absolute path — the service's PATH need
+ * not include /usr/sbin. */
+export const readKernWaketime = async (timeoutMs: number): Promise<string> =>
+  (await execFileAsPromised('/usr/sbin/sysctl', ['-n', 'kern.waketime'], {
+    encoding: 'utf8', timeout: timeoutMs, killSignal: 'SIGKILL',
+  })).stdout;
+
+/** Linux CLOCK_BOOTTIME in ms from `/proc/uptime` text (its first field,
+ * seconds, keeps counting through suspend, unlike Node's CLOCK_MONOTONIC).
+ * Null when the text is not that. */
+export function parseProcUptimeMs(text: string): number | null {
+  const match = /^\s*(\d+(?:\.\d+)?)\s/u.exec(text);
+  if (match === null) return null;
+  const ms = Number(match[1]) * 1000;
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/** The Linux boot clock, read within the evidence allowance; null when it
+ * cannot be read in time. */
+async function bootClockMs(io: SuspendEvidenceIo, now: () => number, deadline?: number): Promise<number | null> {
+  try {
+    return parseProcUptimeMs(await withinEvidenceAllowance(() => io.procUptime(), now, deadline));
+  } catch {
+    return null;
+  }
+}
+
+/** Parse `sysctl -n kern.waketime` ("{ sec = 1790944289, usec = 208542 } …"). */
+export function parseKernWaketime(output: string): number | null {
+  const match = /sec\s*=\s*(\d+),\s*usec\s*=\s*(\d+)/u.exec(output);
+  return match === null ? null : Number(match[1]) * 1000 + Math.floor(Number(match[2]) / 1000);
+}
+
+const OS_EVIDENCE: SuspendEvidenceIo = {
+  platform: process.platform,
+  wallNow: () => Date.now(),
+  kernWaketime: readKernWaketime,
+  procUptime: () => readFileAsync('/proc/uptime', 'utf8'),
+};
+
+/** The reader's answer only if it arrives inside the evidence allowance:
+ * the deadline and the timer exist BEFORE the reader runs, and an answer
+ * that lands at or past the deadline (a slow reader, a stalled event loop)
+ * is no evidence. */
+async function withinEvidenceAllowance<T>(
+  read: () => Promise<T>,
+  now: () => number,
+  deadline: number = now() + SUSPEND_EVIDENCE_ALLOWANCE_MS,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error('suspend evidence unavailable within its allowance')),
+      Math.max(0, deadline - now()),
+    );
+  });
+  try {
+    const reading = read();
+    reading.catch(() => {}); // a late failure after the timer won is not unhandled
+    const value = await Promise.race([reading, expired]);
+    if (now() >= deadline) throw new Error('suspend evidence arrived after its allowance');
+    return value;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Real OS evidence that the machine suspended after `start` — never a
+ * timer-lateness guess, so a long event-loop stall is not mistaken for
+ * sleep and a short sleep is not missed. macOS: the kernel's last wake is
+ * after the start. Linux: the boot clock ran ahead of the monotonic clock
+ * by more than a second. Anything unreadable, or not read within the
+ * allowance, is "no evidence" (fail closed: no retry). */
+async function osSuspendedSince(start: ProbeStart, now: () => number, io: SuspendEvidenceIo): Promise<boolean> {
+  try {
+    if (io.platform === 'darwin') {
+      const wakeMs = parseKernWaketime(await withinEvidenceAllowance(() => io.kernWaketime(SUSPEND_EVIDENCE_ALLOWANCE_MS), now));
+      return wakeMs !== null && wakeMs > start.wallMs;
+    }
+    if (io.platform === 'linux' && start.bootMs !== null) {
+      const bootNow = await bootClockMs(io, now);
+      return bootNow !== null && (bootNow - start.bootMs) - (now() - start.monoMs) > 1_000;
+    }
+  } catch {
+    /* no evidence */
+  }
+  return false;
 }
 
 /** Async advertised-tip probe (gh-169 R4-6): the SAME fail-closed
@@ -631,32 +1449,84 @@ export function sourceMovementSinceFreeze(review: FrozenReview, options?: Source
  * non-blocking execFile so a stalled remote never blocks the service
  * event loop at request-time admission. Null = no movement; errors and
  * timeouts return an explicit check-failed movement (fail-closed,
- * retryable), never silence and never a stall. */
+ * retryable), never silence and never a stall.
+ *
+ * Suspend (owner incident 2026-10-07, owner decision "retry once on real
+ * sleep evidence"): on macOS every Node clock — performance.now() and the
+ * timers that kill a git step — keeps counting through sleep (libuv uses
+ * mach_continuous_time); on Linux the clock pauses but a suspend can still
+ * break a git step's connection. When the OS proves it suspended during a
+ * probe that failed, the probe re-runs ONCE with a fresh budget and that
+ * second outcome is final. Without that evidence — a genuine stall, or an
+ * event loop blocked by the service's own work — the probe is refused
+ * within the single deadline (R7-3), plus at most the bounded evidence
+ * allowance (SUSPEND_EVIDENCE_ALLOWANCE_MS) spent looking for a suspend. */
 export async function probeAdvertisedTipMovementAsync(
   review: FrozenReview,
   timeoutMs: number,
+  seams: AdmissionProbeSeams = {},
+): Promise<SourceMovement | null> {
+  const now = seams.now ?? (() => performance.now());
+  const exec = seams.exec ?? defaultProbeExec;
+  const io = seams.evidence ?? OS_EVIDENCE;
+  // The first attempt's budget starts NOW: reading the Linux baseline is
+  // charged against it (R6-4), so it can never add to the bound.
+  const firstDeadline = now() + timeoutMs;
+  const start: ProbeStart = {
+    wallMs: io.wallNow(),
+    monoMs: now(),
+    bootMs: io.platform === 'linux' ? await bootClockMs(io, now, firstDeadline) : null,
+  };
+  const first = await probeAdvertisedTipOnce(review, firstDeadline, now, exec);
+  if (first === null || first.cause !== 'check-failed') return first;
+  // A git step that would not stop may still be running: never start
+  // another while it might live (owner decision 2026-10-07, R6-5).
+  if (first.cleanupUnconfirmed === true) return first;
+  if (!(await osSuspendedSince(start, now, io))) return first;
+  return probeAdvertisedTipOnce(review, now() + timeoutMs, now, exec);
+}
+
+async function probeAdvertisedTipOnce(
+  review: FrozenReview,
+  deadline: number,
+  now: () => number,
+  exec: NonNullable<AdmissionProbeSeams['exec']>,
 ): Promise<SourceMovement | null> {
   const { targetRef, targetSha } = review.manifest;
-  // R6-4: ONE cumulative admission budget across every async step — each
-  // call gets only the remaining time and exhaustion fails closed.
-  const deadline = Date.now() + timeoutMs;
+  // R6-4: ONE cumulative admission budget (an absolute deadline) across
+  // every async step — each call gets only the remaining time, and
+  // exhaustion fails closed both before a step starts and after it settles
+  // (a step that finishes past the deadline proves nothing, success or git
+  // rejection alike).
   const run = async (args: readonly string[]): Promise<string> => {
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) {
-      throw new Error(`admission remote-probe budget exhausted before: git ${args.join(' ')}`);
+    const timeout = remainingTimeoutMs(deadline, now());
+    if (timeout === null) {
+      // Nothing was started, so nothing can still be running.
+      throw Object.assign(new Error(`admission remote-probe budget exhausted before: git ${args.join(' ')}`), { ownedStopped: true });
     }
-    const { stdout } = await execFileAsPromised('git', ['-C', review.manifest.repoPath, ...args], {
-      encoding: 'utf8', timeout: remaining, maxBuffer: 1024 * 1024,
-    });
+    const late = (stopped: boolean): Error => Object.assign(
+      new Error(`admission remote-probe budget exhausted after: git ${args.join(' ')}`),
+      stopped ? { ownedStopped: true } : {},
+    );
+    let stdout: string;
+    try {
+      stdout = await exec(review.manifest.repoPath, args, timeout);
+    } catch (error) {
+      // A step that might still be running keeps saying so (R6-5): the
+      // late-budget message must never launder it into a retryable one —
+      // nor claim a stop the step did not prove.
+      if (isUnstopped(error)) throw error;
+      if (now() >= deadline) throw late((error as { ownedStopped?: unknown } | null)?.ownedStopped === true);
+      throw error;
+    }
+    // The step returned: an owned step returns only once its group stopped.
+    if (now() >= deadline) throw late(true);
     return stdout;
   };
-  // R6-3: only an ESTABLISHED non-zero exit (git itself answered
-  // "invalid spelling") may skip the remote proof; timeouts, kills and
-  // spawn failures fail closed.
-  const establishedRejection = (error: unknown): boolean => {
-    const code = (error as { code?: unknown } | null)?.code;
-    return typeof code === 'number';
-  };
+  // R6-3 / round 4: only git's OWN refusal of the spelling may skip the
+  // remote proof — the invalid-name answer of check-ref-format --branch, or
+  // exit 1 of check-ref-format. Any other failure (an unreadable repository
+  // exits 128 too), every timeout, kill and spawn failure fails closed.
   // Round-5 P3: EVERY preparation step is async and bounded — the sync
   // advertisedRemoteBranch helper (30 s execFileSync defaults) is never
   // touched at admission, so no slow config/filesystem/helper step can
@@ -669,16 +1539,12 @@ export async function probeAdvertisedTipMovementAsync(
       try {
         await run(['check-ref-format', '--branch', targetRef]);
       } catch (error) {
-        if (establishedRejection(error)) return null; // not a branch spelling (e.g. origin/topic~1)
-        throw error; // timeout/kill/spawn failure — fail closed
+        if (refusedBranchName(error, targetRef)) return null; // not a branch spelling (e.g. origin/topic~1)
+        throw error; // operational failure, timeout, kill, spawn failure — fail closed
       }
-      let fullName: string;
-      try {
-        fullName = (await run(['rev-parse', '--symbolic-full-name', '--verify', targetRef])).trimEnd();
-      } catch (error) {
-        if (establishedRejection(error)) return null; // the ref resolves to nothing — not advertised
-        throw error;
-      }
+      // A target ref that no longer resolves did not become "unadvertised":
+      // the frozen target vanished — fail closed.
+      const fullName = (await run(['rev-parse', '--symbolic-full-name', '--verify', targetRef])).trimEnd();
       if (!fullName.startsWith('refs/remotes/')) return null;
       const remoteRef = fullName.slice('refs/remotes/'.length);
       const slash = remoteRef.indexOf('/');
@@ -690,7 +1556,7 @@ export async function probeAdvertisedTipMovementAsync(
     try {
       await run(['check-ref-format', targetRef]);
     } catch (error) {
-      if (establishedRejection(error)) return null; // a qualified revision expression, not a tracking ref
+      if (refusedRefFormat(error)) return null; // a qualified revision expression, not a tracking ref
       throw error;
     }
     const remoteRef = targetRef.slice('refs/remotes/'.length);
@@ -704,7 +1570,7 @@ export async function probeAdvertisedTipMovementAsync(
   try {
     remoteTarget = await identify();
   } catch (error) {
-    return movement('check-failed', gitErrorDetail(error));
+    return failedCheck(error);
   }
   if (remoteTarget === null) return null;
   try {
@@ -718,7 +1584,7 @@ export async function probeAdvertisedTipMovementAsync(
     }
     return null;
   } catch (error) {
-    return movement('check-failed', gitErrorDetail(error));
+    return failedCheck(error);
   }
 }
 
@@ -844,7 +1710,7 @@ export function proveRecoveredBaseMergeability(review: FrozenReview, priorBaseTi
     throw new Error('recovered base changed the frozen merge-base');
   }
   const mergedTree = execFileSync('git', ['-C', repoPath, 'merge-tree', '--write-tree', baseRefSha, targetSha], {
-    encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'],
+    encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 1024 * 1024, timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
   if (!/^[0-9a-f]{40}$/u.test(mergedTree) || git(repoPath, ['cat-file', '-t', mergedTree]) !== 'tree') {
     throw new Error('recovered base mergeability proof did not produce one verified tree');

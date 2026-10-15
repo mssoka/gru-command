@@ -12,6 +12,10 @@
     {
       "id": "job-done",
       "status": "done"
+    },
+    {
+      "id": "job-binned",
+      "status": "binned"
     }
   ],
   "agents": [
@@ -26,6 +30,10 @@
     {
       "id": "a-done",
       "jobId": "job-done"
+    },
+    {
+      "id": "a-binned",
+      "jobId": "job-binned"
     }
   ],
   "notifications": [
@@ -64,6 +72,12 @@
       "agentId": "a-ghost",
       "kind": "review-escalation",
       "routing": "action-required"
+    },
+    {
+      "id": "n-bound-binned",
+      "agentId": "a-binned",
+      "kind": "review-escalation",
+      "routing": "action-required"
     }
   ],
   "expected": {
@@ -73,7 +87,8 @@
     },
     "receiptIds": [
       "n-bound-merged",
-      "n-bound-done"
+      "n-bound-done",
+      "n-bound-binned"
     ]
   }
 }

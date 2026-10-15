@@ -6,16 +6,10 @@ import {
   type DecisionsConfig,
 } from '../config.js';
 import { resolveCredential } from './credentials.js';
+import { servedAnswers } from './effects.js';
 import { ProfileDecisionService, ProfileProvider } from './provider.js';
 import { KEYLESS_CREDENTIAL, validateProviderProfile } from './profile.js';
-import type {
-  Answer,
-  AnswersFor,
-  DecisionOutcome,
-  DecisionRequest,
-  DecisionRoute,
-  QuestionSet,
-} from './types.js';
+import type { Answer, DecisionRoute } from './types.js';
 import { requestFromCase, surfaceCaseSpec, type LabelledCase } from './cases/registry.js';
 import { BACKTEST_RECORD_SCHEMA_VERSION, backtestMeetsThreshold, type BacktestRecord, type BacktestThreshold } from './enforce.js';
 
@@ -142,13 +136,6 @@ function ratio(numerator: number, denominator: number): number {
   return denominator === 0 ? 0 : numerator / denominator;
 }
 
-function servedAnswers<Q extends QuestionSet>(request: DecisionRequest<Q>, outcome: DecisionOutcome<Q>): AnswersFor<Q> {
-  return Object.fromEntries(Object.keys(request.questions).map((id) => [
-    id,
-    outcome.routes[id]?.path === 'fallback' ? request.fallback[id] : outcome.answers[id],
-  ])) as AnswersFor<Q>;
-}
-
 // ------------------------------------------------------------------
 // Run
 // ------------------------------------------------------------------
@@ -247,7 +234,7 @@ export async function runBacktest(input: BacktestRunOptions): Promise<BacktestRe
           ? `replay run produced a fallback for case ${JSON.stringify(testCase.id)} (index ${caseIndex}); the recording set is incomplete — rerun with --record over the same cases/config`
           : `live backtest provider fell back for case ${JSON.stringify(testCase.id)} (index ${caseIndex}); fix the provider and rerun before saving enforce evidence`);
       }
-      const predicted = spec.answerAction(servedAnswers(request, outcome) as Record<string, Answer>);
+      const predicted = spec.answerAction(servedAnswers(request.fallback, outcome) as Record<string, Answer>);
       if (predicted === spec.answerAction(request.fallback as Record<string, Answer>)) agree += 1;
       const actual = spec.labelAction(testCase.label);
       actions[predicted].predicted += 1;

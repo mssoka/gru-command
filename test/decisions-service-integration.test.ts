@@ -50,7 +50,21 @@ describe('compiled service Jev credential lifecycle', () => {
         const db = new DatabaseSync(join(home, 'ledger', 'ledger.db'), { readOnly: true });
         try {
           const rows = db.prepare("SELECT payload FROM events WHERE kind = 'decisions.shadow'").all() as { payload: string }[];
-          expect(rows.some((row) => JSON.parse(row.payload).surface === 'event_triage')).toBe(true);
+          const record = rows.map((row) => JSON.parse(row.payload) as {
+            surface: string; latency_ms: number;
+            request_diagnostics: { headersMs: number; bodyMs: number };
+          }).find((row) => row.surface === 'event_triage');
+          expect(record).toMatchObject({
+            provenance_source: 'jev', fallback_reason: null,
+            request_diagnostics: {
+              phase: 'response_validation', httpStatus: 200, deadlineExpired: false,
+              headersMs: expect.any(Number), bodyMs: expect.any(Number),
+            },
+          });
+          expect(record!.request_diagnostics.headersMs).toBeGreaterThanOrEqual(0);
+          expect(record!.request_diagnostics.bodyMs).toBeGreaterThanOrEqual(record!.request_diagnostics.headersMs);
+          expect(record!.latency_ms).toBeGreaterThanOrEqual(record!.request_diagnostics.bodyMs);
+          expect(JSON.stringify(record)).not.toContain('FILE-CREDENTIAL-CANARY');
         } finally { db.close(); }
       });
     } finally { await service.stop(); }

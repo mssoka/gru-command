@@ -57,7 +57,8 @@ export function roundSummary(round: RoundView): RoundSummary {
 }
 
 /** The attribution index the live/receipt split rides on: notification
- * agent → job, plus the set of terminal (merged/done) job ids. Unknown
+ * agent → job, plus the set of concluded (merged/done/binned) job ids.
+ * Unknown
  * bindings are simply absent — never guessed. */
 function jobAttribution(snapshot: BoardSnapshot): {
   readonly jobByAgent: ReadonlyMap<string, string>;
@@ -81,7 +82,7 @@ function jobAttribution(snapshot: BoardSnapshot): {
  * rail's agent bindings (notifications carry an agent; agents carry the
  * job). A notification with no agent binding stays global — the tracker
  * chip above the board still counts it. Rows bound to a TERMINAL job
- * (merged/done) are closed receipts: they never attribute to the banded
+ * (merged/done/binned) are closed receipts: they never attribute to the banded
  * view (the bell keeps them as receipts; machine-row lifecycle stays
  * with dispositions) so a merged lane can never re-enter NEEDS YOU
  * through a leftover escalation.
@@ -103,7 +104,7 @@ export function unackedByJob(snapshot: BoardSnapshot): Map<string, number> {
 
 /**
  * Ids of unresolved action-required rows bound (agent → job) to a
- * terminal (merged/done) job: closed receipts. The record keeps them;
+ * terminal (merged/done/binned) job: closed receipts. The record keeps them;
  * the bell renders them under FEED as receipts, never as entries in the
  * live NEEDS GRU queue. Unbound rows and bindings to unknown jobs stay
  * live — the board never guesses a receipt.
@@ -137,7 +138,8 @@ export function pluralCount(count: number, noun: string): string {
  * or pending round's blockers/errored lenses, or an aborted round. A
  * verdict-posted round's verdict already carried its outcome.
  *
- * v5: a merged/done card also suppresses REVIEW LIVENESS pills ("round N
+ * v5: a concluded (merged/done/binned) card also suppresses REVIEW
+ * LIVENESS pills ("round N
  * live/pending") — a concluded job cannot have a review in flight; the
  * pill is stale data, not a live state.
  *
@@ -195,4 +197,15 @@ export function jobSignal(job: JobView, unackedActionRequired: number): JobSigna
   if (parts.length === 0) return null;
   const tone: JobSignal['tone'] = attention ? 'alert' : round?.status === 'live' ? 'work' : 'park';
   return { label: parts.join(' · '), tone, title: details.join(' · ') };
+}
+
+/** The mailbox lifecycle is authoritative; notification counters remain notification units. */
+export function mailboxSignal(snapshot: BoardSnapshot, jobId: string): JobSignal | null {
+  const item = snapshot.mailbox?.items.find((row) => row.jobId === jobId && row.state !== 'resolved');
+  if (item === undefined) return null;
+  const job = snapshot.repos.flatMap((repo) => repo.jobs).find((row) => row.id === jobId);
+  const review = job === undefined ? null : jobSignal(job, 0);
+  return { label: `${item.state === 'needs-gru' ? 'needs Gru' : item.state} · ${item.owner}${review === null ? '' : ` · ${review.label}`}`,
+    tone: item.state === 'needs-gru' ? 'alert' : 'park',
+    title: `${item.reasons.map((reason) => reason.label).join(' · ')}; owner: ${item.owner}; ${item.disposition?.dependency ?? 'next action owed'}; recheck: ${item.disposition?.recheckAt ?? 'not recorded'}` };
 }

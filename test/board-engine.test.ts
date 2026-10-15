@@ -10,6 +10,7 @@ import { NotificationCenter } from '../src/notifications/center.js';
 import type { AgentEventEnvelope } from '../src/runtime/registry.js';
 import type { Role } from '../src/config.js';
 import type { DecisionRuntimeStatus } from '../src/decisions/runtime.js';
+import type { RepoOverviewView } from '../src/repos/overview.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -325,6 +326,23 @@ describe('board engine — liveness-first rail and job trackers', () => {
     expect(engine.snapshot().agents.find((row) => row.id === 'full-worker-uuid-dec9')).toMatchObject({ jobId: job.id, state: 'disposed', sessionFile: '/session' });
   });
 
+  it('projects the parent job of a megaminion (and null for a top-level heist)', () => {
+    const { api, engine } = fresh();
+    api.addJob({ id: 'impl', repo: 'fixture', title: 'Implementation' });
+    api.addJob({
+      id: 'impl-review-blind',
+      repo: 'fixture',
+      title: 'Review (blind)',
+      deliverable: 'review',
+      targetRef: 'https://github.com/acme/fixture/pull/1',
+      targetSha: 'c3f3b35',
+      parentJobId: 'impl',
+    });
+    const jobs = engine.snapshot().repos.flatMap((repo) => repo.jobs);
+    expect(jobs.find((row) => row.id === 'impl')?.parentJobId).toBeNull();
+    expect(jobs.find((row) => row.id === 'impl-review-blind')?.parentJobId).toBe('impl');
+  });
+
   it('sorts the rail by liveness before role: disposed gru BELOW streaming perkins; streaming above idle', () => {
     const { api, engine } = fresh();
     api.registerAgent({ id: 'chat-gru', role: 'gru' });
@@ -525,7 +543,7 @@ describe('board engine — liveness-first rail and job trackers', () => {
     expect(engine.snapshot().unackedActionRequired).toBe(0);
   });
 
-  it('unackedActionRequired counts LIVE rows only — rows bound to merged/done jobs are closed receipts', () => {
+  it('unackedActionRequired counts LIVE rows only — rows bound to terminal (merged/done/binned) jobs are closed receipts', () => {
     const { api, engine } = fresh();
     // An unbound row stays global (no job → cannot be terminal).
     api.recordNotification({ id: 'n-global', kind: 'test.notice', routing: 'action-required', severity: 'error', title: 'Global' });
@@ -604,9 +622,9 @@ describe('board engine — liveness-first rail and job trackers', () => {
         readonly routing: string;
         readonly agentId: string | null;
       }[];
-      readonly expected: { readonly liveCount: number };
+      readonly expected: { readonly liveCount: number; readonly receiptIds: readonly string[] };
     };
-    const { api } = fresh();
+    const { api, engine } = fresh();
     for (const job of fixture.jobs) {
       api.addJob({ id: job.id, repo: 'fixture', title: job.id, briefing: 'b' });
       if (job.status === 'working') api.setJobStatus(job.id, 'working');
@@ -619,6 +637,10 @@ describe('board engine — liveness-first rail and job trackers', () => {
         api.setJobStatus(job.id, 'delivered');
         api.setJobStatus(job.id, 'in-review');
         api.setJobStatus(job.id, 'merged');
+      }
+      if (job.status === 'binned') {
+        api.setJobStatus(job.id, 'working');
+        api.setJobStatus(job.id, 'binned');
       }
     }
     for (const agent of fixture.agents) {
@@ -635,8 +657,12 @@ describe('board engine — liveness-first rail and job trackers', () => {
       });
     }
     expect(api.countLivePendingActionRequired()).toBe(fixture.expected.liveCount);
-    // The durable record keeps the terminal-bound receipts: live + 2.
-    expect(api.countPendingActionRequiredIncludingReceipts()).toBe(fixture.expected.liveCount + 2);
+    // The snapshot classification rides the same rule (SQL + engine agree).
+    expect(engine.snapshot().unackedActionRequired).toBe(fixture.expected.liveCount);
+    // The durable record keeps the terminal-bound receipts.
+    expect(api.countPendingActionRequiredIncludingReceipts()).toBe(
+      fixture.expected.liveCount + fixture.expected.receiptIds.length,
+    );
   });
 
   it('counts needs-owner rows separately (the FOR YOU band never borrows the machine queue)', () => {
@@ -978,5 +1004,61 @@ describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
       db.close();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('board engine — managed repository overview wiring', () => {
+  it('carries the late-bound repository overview view additively and defaults to null when unwired', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-repo-overview-'));
+    const db = new LedgerDb(dir);
+    const bus = new EventBus();
+    const ledger = new LedgerApi(db.handle, { bus });
+    try {
+      const view: RepoOverviewView = { rows: [] };
+      const wired = new BoardEngine({ ledger, bus, repoOverview: () => view });
+      expect(wired.snapshot().repoOverview).toEqual(view);
+      const unwired = new BoardEngine({ ledger, bus });
+      expect(unwired.snapshot().repoOverview).toBeNull();
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('the main assembly binds, starts and stops the managed repository overview tracker (assembly alarm)', () => {
+    // The same source-drift alarm shape as the supervisor-stop binding: the
+    // engine unit tests inject their own producer, so dropping the
+    // production tracker stayed green without this pin.
+    const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
+    expect(mainSource).toMatch(/new ManagedRepoOverviewTracker\(\{[\s\S]*?workspaceRoot:\s*config\.workspaceRoot/);
+    expect(mainSource).toMatch(/repoOverview:\s*\(\)\s*=>\s*repoOverview\.view\(\)/);
+    expect(mainSource).toMatch(/repoOverview\.start\(\)/);
+    // The stop moved into the extracted shutdown orchestration (issue #341),
+    // which main.ts invokes; the alarm follows the production wiring.
+    const shutdownSource = readFileSync(join(import.meta.dirname, '..', 'src', 'service-shutdown.ts'), 'utf8');
+    expect(shutdownSource).toMatch(/state\.repoOverview\?\.stop\(\)/);
+  });
+});
+
+
+describe('GH-305 shared mailbox board readback', () => {
+  it('projects child attention independently of terminal parent and keeps delivery-only receipts unresolved', () => {
+    const db = new LedgerDb(tmpDir());
+    const bus = new EventBus();
+    const api = new LedgerApi(db.handle, { bus });
+    try {
+      api.addJob({ id: 'parent', repo: 'r', title: 'parent' });
+      api.setJobStatus('parent', 'working');
+      api.setJobStatus('parent', 'done');
+      api.addJob({ id: 'child', repo: 'r', title: 'child', parentJobId: 'parent', deliverable: 'review' });
+      api.setJobStatus('child', 'blocked');
+      const engine = new BoardEngine({ ledger: api, bus });
+      const item = engine.snapshot().mailbox.items[0]!;
+      expect(item.jobId).toBe('child');
+      engine.mailbox.received(item.id, item.basis, 'wake', 'accepted-turn');
+      expect(engine.snapshot().mailbox.items[0]?.state).toBe('needs-gru');
+      expect(engine.snapshot().mailbox.counts).toMatchObject({ threads: 1, incidents: 0, notifications: 0 });
+      expect(engine.snapshot().mailbox).toEqual(engine.mailbox.snapshot());
+    } finally { db.close(); }
   });
 });

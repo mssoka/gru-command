@@ -1,0 +1,68 @@
+import { describe, expect, it } from 'vitest';
+import {
+  EXPECTED_BASELINE_REASON,
+  EXPECTED_BASELINE_TITLE,
+  assertVerificationHistoryBaseline,
+} from '../tools/assert-verification-history-baseline.mjs';
+
+const TITLE = EXPECTED_BASELINE_TITLE;
+
+function red(messages: readonly string[] = [`AssertionError: promise rejected "Error: ${EXPECTED_BASELINE_REASON} …"`]) {
+  return { title: TITLE, status: 'failed', failureMessages: messages };
+}
+
+function report(...assertions: readonly Record<string, unknown>[]) {
+  return {
+    numFailedTests: assertions.filter((entry) => entry['status'] === 'failed').length,
+    testResults: [{ assertionResults: assertions }],
+  };
+}
+
+describe('verification-history fail-before classifier', () => {
+  it('accepts the named 208-run regression failing with the recorded window reason', () => {
+    expect(assertVerificationHistoryBaseline(report(red()))).toBe(TITLE);
+    // The REAL Vitest JSON shape: the top message is the promise-rejection
+    // assertion with the reason truncated by an ellipsis.
+    expect(assertVerificationHistoryBaseline(report(red([
+      'Error: promise rejected "Error: verification history window exceed…" instead of resolving',
+    ])))).toBe(TITLE);
+  });
+
+  it('refuses an unexpected GREEN baseline', () => {
+    expect(() => assertVerificationHistoryBaseline(report({ title: TITLE, status: 'passed', failureMessages: [] })))
+      .toThrow(/did not fail/u);
+  });
+
+  it('refuses a collection/setup failure, an unlisted failure and a lost reason', () => {
+    expect(() => assertVerificationHistoryBaseline({
+      numFailedTests: 0,
+      testResults: [{ status: 'failed', message: 'Failed to load url …', assertionResults: [] }],
+    })).toThrow(/not behavioral RED/u);
+    expect(() => assertVerificationHistoryBaseline(report(red(), { title: 'unrelated timeout', status: 'failed', failureMessages: ['Error: waitFor timed out'] })))
+      .toThrow(/unlisted failure/u);
+    expect(() => assertVerificationHistoryBaseline(report(red(['AssertionError: expected 1 to be 1']))))
+      .toThrow(/recorded window reason/u);
+    expect(() => assertVerificationHistoryBaseline(report(red(['TypeError: Cannot read properties of undefined']))))
+      .toThrow(/before its assertion/u);
+  });
+
+  it('refuses a second error hiding behind the expected window assertion, and zero messages', () => {
+    // The window assertion PLUS a separate teardown error is not a clean
+    // before-proof: messages are validated individually, never joined.
+    expect(() =>
+      assertVerificationHistoryBaseline(
+        report(red([
+          'Error: promise rejected "Error: verification history window exceed…" instead of resolving',
+          'TypeError: cleanup failed after the assertion',
+        ])),
+      )
+    ).toThrow(/2 failure message\(s\); exactly one assertion failure/u);
+    expect(() => assertVerificationHistoryBaseline(report({ title: TITLE, status: 'failed', failureMessages: [] })))
+      .toThrow(/0 failure message\(s\)/u);
+  });
+
+  it('refuses an unparseable report and a missing named regression', () => {
+    expect(() => assertVerificationHistoryBaseline(null)).toThrow(/not behavioral RED/u);
+    expect(() => assertVerificationHistoryBaseline(report())).toThrow(/not collected/u);
+  });
+});

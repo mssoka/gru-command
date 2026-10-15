@@ -1,3 +1,4 @@
+import { bindOriginalRebriefSdkOwner } from './helpers/directive-native-fixture.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -59,6 +60,7 @@ class HookedWorktreePort implements WorktreePort {
   async resolveReviewTarget(input: { repoPath: string; ref: string }): Promise<{
     readonly sha: string;
     readonly baseSource: WorktreeBaseSource | null;
+    readonly trackingRef: string | null;
   }> {
     return this.delegate.resolveReviewTarget(input);
   }
@@ -143,7 +145,7 @@ async function boot(opts: {
   const bus = new EventBus({});
   const ledger = new LedgerApi(db.handle, { bus });
   const notifications = new NotificationCenter({ ledger, bus });
-  const basePort = new InMemoryWorktreePort(join(dir, 'wtroot'));
+  const basePort = new InMemoryWorktreePort(join(dir, 'wtroot'), ledger);
   const worktrees: WorktreePort =
     opts.onReviewLane !== undefined ? new HookedWorktreePort(basePort, opts.onReviewLane) : basePort;
   const spawnCalls: { role: Role; cwd: string | undefined }[] = [];
@@ -205,6 +207,7 @@ async function boot(opts: {
       : {}),
   });
   const server = createDispatchServer({
+    pendingProducerBlockers: () => [],
     config: cfg,
     dispatch,
     wave,
@@ -251,7 +254,6 @@ async function createLaneJob(
   repo: FixtureRepo,
   input: { jobId: string; status: 'working' | 'delivered' | 'in-review' },
 ): Promise<WorktreeLane> {
-  const lane = await h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: input.jobId });
   h.ledger.addJob({
     id: input.jobId,
     repo: 'fixture',
@@ -259,6 +261,7 @@ async function createLaneJob(
     baseBranch: 'main',
     briefing: 'review this lane',
   });
+  const lane = await h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: input.jobId });
   h.ledger.setJobStatus(input.jobId, 'working');
   if (input.status !== 'working') h.ledger.setJobStatus(input.jobId, input.status);
   writeFileSync(join(lane.path, `deliverable-${input.jobId}.txt`), 'delivered\n');
@@ -330,6 +333,8 @@ function pendingMarker(
     sessionFile: null,
     ruleId: null,
     sourceRoundId: null,
+    source: null,
+    workRevision: null,
     // Ordinary re-brief (no explicit completion intent): PR136's
     // phase-handoff identity is optional and null here.
     phaseId: null,
@@ -403,6 +408,7 @@ function jobRecord(id: string, status: JobStatus): JobRecord {
     commissioner: null,
     targetRef: null,
     targetSha: null,
+    parentJobId: null,
     status,
     baseBranch: 'main',
     prUrl: null,
@@ -455,6 +461,20 @@ describe('branch-idle guard', () => {
       ['repair-delivered', [start, delivery, repairStart, eventRecord(4, 'job.delivered', { sha: 'sha-2' })]],
       ['recovery-claim', [start, delivery, eventRecord(3, 'provider.recovery-claimed', { wait_id: 'w' })]],
       ['dispatch-live', [start, delivery]],
+      // A refused review round flips working → in-review and its setup
+      // restore flips back: the SAME attempt resumes (it settled at 2).
+      ['setup-restored', [start, delivery, eventRecord(3, 'job.status', { from: 'working', to: 'in-review' }),
+        eventRecord(4, 'job.status', { from: 'in-review', to: 'working', restoredAfterRound: 'r1', attemptStartSeq: 1 })]],
+      // ...and the next round's flip resolves through that restore.
+      ['setup-restored-reflipped', [start, delivery, eventRecord(3, 'job.status', { from: 'working', to: 'in-review' }),
+        eventRecord(4, 'job.status', { from: 'in-review', to: 'working', restoredAfterRound: 'r1', attemptStartSeq: 1 }),
+        eventRecord(5, 'job.status', { from: 'working', to: 'in-review' })]],
+      // A restore of an attempt still open before the round stays open.
+      ['setup-restored-open', [start, eventRecord(2, 'job.status', { from: 'working', to: 'in-review' }),
+        eventRecord(3, 'job.status', { from: 'in-review', to: 'working', restoredAfterRound: 'r1', attemptStartSeq: 1 })]],
+      // A marker that does not point behind its hop is not a resume.
+      ['setup-restored-forged', [start, delivery,
+        eventRecord(3, 'job.status', { from: 'in-review', to: 'working', restoredAfterRound: 'r1', attemptStartSeq: 3 })]],
     ]);
     const ledger = {
       listJobs: () => [
@@ -471,7 +491,12 @@ describe('branch-idle guard', () => {
         jobRecord('repair-delivered', 'working'),
         jobRecord('recovery-claim', 'working'),
         jobRecord('dispatch-live', 'working'),
+        jobRecord('setup-restored', 'working'),
+        jobRecord('setup-restored-reflipped', 'in-review'),
+        jobRecord('setup-restored-open', 'working'),
+        jobRecord('setup-restored-forged', 'working'),
       ],
+      latestCandidateDelivery: (jobId: string): EventRecord | null => (events.get(jobId) ?? []).filter((event) => event.kind === 'job.delivered').at(-1) ?? null,
       latestJobEvent: (jobId: string, kind: string): EventRecord | null =>
         (events.get(jobId) ?? []).filter((event) => event.kind === kind).at(-1) ?? null,
       listJobEvents: (jobId: string): readonly EventRecord[] =>
@@ -482,6 +507,9 @@ describe('branch-idle guard', () => {
           ? ([{ requestId: 'r-live', jobId: opts.jobId, state: 'dispatching' }] as unknown as readonly DirectiveRequestRecord[])
           : [],
       hasUnsettledVerificationRun: (): boolean => false,
+      hasOpenDirectiveRecoveryHold: (): boolean => false,
+      workRevisionState: () => ({ required: 0, delivered: 0 }),
+      correctiveVerificationDebt: () => null,
     };
     const busy = (id: string): boolean => laneIsBusy(ledger, ledger.listJobs().find((job) => job.id === id)!);
     expect(busy('never-started')).toBe(true);
@@ -506,6 +534,12 @@ describe('branch-idle guard', () => {
     expect(busy('repair-delivered')).toBe(false);
     // An accepted but not-yet-admitted directive already owns the lane.
     expect(busy('dispatch-live')).toBe(true);
+    // A refused round's setup restore is not a reopened lane (2026-10-08):
+    // the delivery that settled the interrupted attempt still settles it.
+    expect(busy('setup-restored')).toBe(false);
+    expect(busy('setup-restored-reflipped')).toBe(false);
+    expect(busy('setup-restored-open')).toBe(true);
+    expect(busy('setup-restored-forged')).toBe(true);
 
     const lanes = [
       laneRecord('reopened', 'reopened', 'gru/reopened'),
@@ -539,6 +573,7 @@ describe('branch-idle guard', () => {
     ];
     const paged = {
       listJobs: () => [jobRecord('paged', 'in-review')],
+      latestCandidateDelivery: (): EventRecord | null => pagedHistory.filter((event) => event.kind === 'job.delivered').at(-1) ?? null,
       latestJobEvent: (_jobId: string, kind: string): EventRecord | null =>
         pagedHistory.filter((event) => event.kind === kind).at(-1) ?? null,
       listJobEvents: (_jobId: string, opts?: { readonly limit?: number }): readonly EventRecord[] =>
@@ -546,6 +581,9 @@ describe('branch-idle guard', () => {
       listPendingRebriefs: (): readonly PendingRebriefRecord[] => [],
       listPendingDirectives: (): readonly DirectiveRequestRecord[] => [],
       hasUnsettledVerificationRun: (): boolean => false,
+      hasOpenDirectiveRecoveryHold: (): boolean => false,
+      workRevisionState: () => ({ required: 0, delivered: 0 }),
+      correctiveVerificationDebt: () => null,
     };
     expect(laneIsBusy(paged, paged.listJobs()[0]!)).toBe(false);
 
@@ -560,6 +598,7 @@ describe('branch-idle guard', () => {
     ];
     const capped = {
       listJobs: () => [jobRecord('capped', 'in-review')],
+      latestCandidateDelivery: (): EventRecord | null => cappedHistory.filter((event) => event.kind === 'job.delivered').at(-1) ?? null,
       latestJobEvent: (_jobId: string, kind: string): EventRecord | null =>
         cappedHistory.filter((event) => event.kind === kind).at(-1) ?? null,
       listJobEvents: (_jobId: string, opts?: { readonly limit?: number }): readonly EventRecord[] =>
@@ -567,6 +606,9 @@ describe('branch-idle guard', () => {
       listPendingRebriefs: (): readonly PendingRebriefRecord[] => [],
       listPendingDirectives: (): readonly DirectiveRequestRecord[] => [],
       hasUnsettledVerificationRun: (): boolean => false,
+      hasOpenDirectiveRecoveryHold: (): boolean => false,
+      workRevisionState: () => ({ required: 0, delivered: 0 }),
+      correctiveVerificationDebt: () => null,
     };
     expect(laneIsBusy(capped, capped.listJobs()[0]!)).toBe(false);
   });
@@ -775,6 +817,7 @@ describe('branch-idle guard', () => {
       ['blocked-pending', [start]],
       ['parked-pending', [start]],
       ['done-pending', [start, delivery, toInReview]],
+      ['binned-pending', [start]],
       ['settled', [start, delivery]],
     ]);
     const pending = new Map<string, PendingRebriefRecord[]>([
@@ -788,6 +831,7 @@ describe('branch-idle guard', () => {
       ['blocked-pending', [pendingMarker('blocked-pending')]],
       ['parked-pending', [pendingMarker('parked-pending')]],
       ['done-pending', [pendingMarker('done-pending')]],
+      ['binned-pending', [pendingMarker('binned-pending')]],
     ]);
     const ledger = {
       listJobs: () => [
@@ -798,8 +842,10 @@ describe('branch-idle guard', () => {
         jobRecord('blocked-pending', 'blocked'),
         jobRecord('parked-pending', 'parked'),
         jobRecord('done-pending', 'done'),
+        jobRecord('binned-pending', 'binned'),
         jobRecord('settled', 'delivered'),
       ],
+      latestCandidateDelivery: (jobId: string): EventRecord | null => (events.get(jobId) ?? []).filter((event) => event.kind === 'job.delivered').at(-1) ?? null,
       latestJobEvent: (jobId: string, kind: string): EventRecord | null =>
         (events.get(jobId) ?? []).filter((event) => event.kind === kind).at(-1) ?? null,
       listJobEvents: (jobId: string): readonly EventRecord[] =>
@@ -808,6 +854,9 @@ describe('branch-idle guard', () => {
         opts.jobId === undefined ? [...pending.values()].flat() : (pending.get(opts.jobId) ?? []),
       listPendingDirectives: (): readonly DirectiveRequestRecord[] => [],
       hasUnsettledVerificationRun: (): boolean => false,
+      hasOpenDirectiveRecoveryHold: (): boolean => false,
+      workRevisionState: () => ({ required: 0, delivered: 0 }),
+      correctiveVerificationDebt: () => null,
     };
     const busy = (id: string): boolean => laneIsBusy(ledger, ledger.listJobs().find((job) => job.id === id)!);
     expect(busy('working-pending')).toBe(true);
@@ -824,6 +873,9 @@ describe('branch-idle guard', () => {
     expect(busy('blocked-pending')).toBe(true);
     expect(busy('parked-pending')).toBe(true);
     expect(busy('done-pending')).toBe(false);
+    // A stale marker on a BINNED (discarded) lane must not resurrect it as
+    // a blocker either — terminal on the same contract.
+    expect(busy('binned-pending')).toBe(false);
   });
 
   it('a pending re-brief refuses the arm before preflight; a late delivery and a partial marker set cannot clear it', async () => {
@@ -887,6 +939,32 @@ describe('branch-idle guard', () => {
     }
   });
 
+  /** Original legacy admission/receipt fixture; no present-HEAD inference
+   * is delegated to finalization or observation. */
+  function seedOriginalReceipt(ledger: LedgerApi, jobId: string, kind: 'silas.rebrief' | 'job.delivered', minionId: string, sha: string) {
+    const markers = ledger.listPendingRebriefs({ jobId });
+    ledger.bindPendingRebriefWorker({ ids: markers.map((row) => row.id), agentId: minionId,
+      sessionFile: markers.find((row) => row.kind === 'silas.rebrief')?.sessionFile ?? null });
+    const marker = ledger.listPendingRebriefs({ jobId }).find((row) => row.kind === kind)!;
+    const receipt = ledger.appendCustomEvent({ kind, jobId, agentId: minionId, payload: {
+      ...(kind === 'silas.rebrief' ? { minion_id: minionId, note: marker.note } : { agentId: minionId, source: 'silas-rebrief' }),
+      sha, work_revision: marker.workRevision, marker_id: marker.id, payload_hash: marker.payloadHash,
+    } });
+    expect(ledger.pendingRebriefReceipt(marker)).toEqual(receipt);
+    return receipt;
+  }
+
+  /** Lost-delivery positives own a real, actually disposed original SDK turn.
+   * Capture it before the original completion receipt, never in recovery. */
+  async function seedOriginalSdkCompletion(h: Harness, jobId: string, minionId: string, sha: string) {
+    const lane = h.worktrees.listWorktrees({ jobId }).find((row) => row.kind === 'job');
+    if (lane === undefined) throw new Error(`original completion fixture requires the job lane for ${jobId}`);
+    await bindOriginalRebriefSdkOwner(h.ledger, h.ledger.listPendingRebriefs({ jobId }), {
+      cwd: lane.path, dataDir: dirname(h.artifactRoot), agentId: minionId,
+    });
+    return seedOriginalReceipt(h.ledger, jobId, 'silas.rebrief', minionId, sha);
+  }
+
   it('genuine finalization with a fresh settled delivery releases the target for digest and admission', async () => {
     const repo = makeFixtureRepo('branch-idle-rebrief-finalize');
     cleanupRepos.push(repo);
@@ -906,9 +984,10 @@ describe('branch-idle guard', () => {
       expect((await postReview(h, { job_id: 'rebrief-finalize' })).status).toBe(409);
       expect(preflights).toBe(0);
 
-      // The REAL finalizer (the same one the /api/silas/rebrief endpoint
-      // and boot recovery call) records both guarded events — including the
-      // settled turn's OWN fresh delivery — and clears the markers only then.
+      // Historical finalization reconstructs only this genuine original
+      // completion's lost delivery, then clears its exact markers.
+      const original = await seedOriginalSdkCompletion(h, 'rebrief-finalize', 'minion-fresh',
+        execFileSync('git', ['-C', lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim());
       const finalized = finalizeRebriefRequest({
         ledger: h.ledger,
         worktrees: h.worktrees,
@@ -917,11 +996,13 @@ describe('branch-idle guard', () => {
         lanePath: lane.path,
         note: 'same blocker',
       });
-      expect(finalized).toMatchObject({ rebriefRecorded: true, deliveryRecorded: true });
+      expect(finalized).toMatchObject({ rebriefRecorded: false, deliveryRecorded: true });
       expect(h.ledger.listPendingRebriefs({ jobId: 'rebrief-finalize' })).toHaveLength(0);
       const delivered = h.ledger.latestJobEvent('rebrief-finalize', 'job.delivered');
       expect(delivered).not.toBeNull();
-      expect((delivered?.payload as { sha?: string }).sha).toBeTruthy();
+      expect(delivered?.payload).toMatchObject({ sha: (original.payload as { sha: string }).sha,
+        provenance: { kind: 'original-correlated-completion', event_seq: original.seq } });
+      expect(h.ledger.latestJobEvent('rebrief-finalize', 'silas.rebrief')).toEqual(original);
 
       // Digest eligibility returns for exactly this target...
       expect((await digestOf(h)).prWithoutReview.map((row) => row.jobId)).toEqual(['rebrief-finalize']);
@@ -1035,12 +1116,14 @@ describe('branch-idle guard', () => {
       const queued = await postReview(h, { job_id: 'finalizer-replay', by: 'minion' });
       expect(queued.json).toMatchObject({ route: 'queued' });
       h.ledger.beginPendingRebrief({ jobId: 'finalizer-replay', note: 'n', briefing: 'b' });
+      await seedOriginalSdkCompletion(h, 'finalizer-replay', 'minion-fresh',
+        execFileSync('git', ['-C', lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim());
       const startedPromise = joinJobEvent(h, 'finalizer-replay', 'job.review-handoff-started');
       const finalized = finalizeRebriefRequest({
         ledger: h.ledger, worktrees: h.worktrees, jobId: 'finalizer-replay',
         minionId: 'minion-fresh', lanePath: lane.path, note: 'n',
       });
-      expect(finalized).toMatchObject({ rebriefRecorded: true, deliveryRecorded: true });
+      expect(finalized).toMatchObject({ rebriefRecorded: false, deliveryRecorded: true });
       const started = await startedPromise;
       expect(started.payload).toMatchObject({ requestSeq: queued.json['request_seq'], route: 'perkins' });
       expect(h.ledger.listPendingRebriefs({ jobId: 'finalizer-replay' })).toHaveLength(0);
@@ -1073,6 +1156,9 @@ describe('branch-idle guard', () => {
       const queued = await postReview(h, { job_id: jobId, by: 'minion' });
       expect(queued.json).toMatchObject({ route: 'queued' });
       h.ledger.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
+      const original = await seedOriginalSdkCompletion(h, jobId, 'minion-fresh',
+        execFileSync('git', ['-C', lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim());
+      const boundMarkers = h.ledger.listPendingRebriefs({ jobId });
 
       const restore = failSettlementPublication(h.ledger, new Error('settlement publication failed'));
       try {
@@ -1084,8 +1170,8 @@ describe('branch-idle guard', () => {
       // The completion rolled back as one: markers stay, the guarded
       // events stay, and the queued handoff was NOT woken by a stranded
       // half-completion (no started marker, no settlement).
-      expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(2);
-      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).not.toBeNull();
+      expect(h.ledger.listPendingRebriefs({ jobId })).toEqual(boundMarkers);
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toEqual(original);
       expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).not.toBeNull();
       expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-settled')).toBeNull();
       expect(h.ledger.latestJobEvent(jobId, 'job.review-handoff-started')).toBeNull();
@@ -1184,7 +1270,7 @@ describe('branch-idle guard', () => {
     } finally { release.release(); await h.close(); }
   });
 
-  async function assertBootRecoveryReplay(path: 'already-landed' | 'delivery-only'): Promise<void> {
+  async function assertBootRecoveryReplay(path: 'already-landed' | 'lost-delivery'): Promise<void> {
     const repo = makeFixtureRepo(`branch-idle-boot-replay-${path}`);
     cleanupRepos.push(repo);
     const h = await boot();
@@ -1194,23 +1280,24 @@ describe('branch-idle guard', () => {
       expect((await postReview(h, { job_id: jobId, by: 'minion' })).json).toMatchObject({ route: 'queued' });
       h.ledger.setJobStatus(jobId, 'delivered');
       h.ledger.beginPendingRebrief({ jobId, note: 'recover', briefing: 'b' });
-      h.ledger.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { minion_id: 'restored' } });
-      if (path === 'already-landed') {
-        const sha = execFileSync('git', ['-C', lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
-        h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha, source: 'silas-rebrief' } });
-      }
+      const sha = execFileSync('git', ['-C', lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      const original = await seedOriginalSdkCompletion(h, jobId, 'restored', sha);
+      if (path === 'already-landed') seedOriginalReceipt(h.ledger, jobId, 'job.delivered', 'restored', sha);
       const startedPromise = joinJobEvent(h, jobId, 'job.review-handoff-started');
       const report = await reconcilePendingRebriefs({
         ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications,
         registry: { getHandle: () => null,
           spawn: async () => { throw new Error('boot recovery must not spawn a minion on this path'); },
           disposeHandle: async () => {} },
-      }, { bootAt: new Date(Date.now() + 60_000) });
+      }, { limit: 100 });
       await report.settled;
       expect(report.completed).toBe(1);
       expect((await startedPromise).jobId).toBe(jobId);
       expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
       expect(h.ledger.listRounds(jobId)).toHaveLength(1);
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toEqual(original);
+      expect(h.ledger.listJobEventsByKinds(jobId, ['job.delivered']).filter((event) =>
+        (event.payload as { source?: string }).source === 'silas-rebrief')).toHaveLength(1);
     } finally { await h.close(); }
   }
 
@@ -1218,8 +1305,33 @@ describe('branch-idle guard', () => {
     await assertBootRecoveryReplay('already-landed');
   });
 
-  it('delivery-only boot recovery starts a queued handoff without a manual sweep', async () => {
-    await assertBootRecoveryReplay('delivery-only');
+  it('proven completion with a lost delivery starts a queued handoff without a manual sweep', async () => {
+    await assertBootRecoveryReplay('lost-delivery');
+  });
+
+  it('a lone exact historical delivery remains partial and never wakes its queued review handoff', async () => {
+    const repo = makeFixtureRepo('branch-idle-partial-only'); cleanupRepos.push(repo);
+    const h = await boot(); const jobId = 'partial-only-replay';
+    try {
+      const lane = await createLaneJob(h, repo, { jobId, status: 'working' });
+      expect((await postReview(h, { job_id: jobId, by: 'minion' })).json).toMatchObject({ route: 'queued' });
+      h.ledger.setJobStatus(jobId, 'delivered');
+      h.ledger.beginPendingRebrief({ jobId, note: 'partial history', briefing: 'b' });
+      const sha = execFileSync('git', ['-C', lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      const delivery = seedOriginalReceipt(h.ledger, jobId, 'job.delivered', 'original-minion', sha);
+      const markers = h.ledger.listPendingRebriefs({ jobId });
+      const report = await reconcilePendingRebriefs({ ledger: h.ledger, worktrees: h.worktrees,
+        notifications: h.notifications, registry: { getHandle: () => null,
+          spawn: async () => { throw new Error('partial history must never execute'); }, disposeHandle: async () => {} } });
+      await report.settled;
+      expect(report).toMatchObject({ completed: 0, redispatched: 0 });
+      expect(h.ledger.listPendingRebriefs({ jobId })).toEqual(markers);
+      expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toEqual(delivery);
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toBeNull();
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-settled')).toBeNull();
+      expect(h.ledger.latestJobEvent(jobId, 'job.review-handoff-started')).toBeNull();
+      expect(h.ledger.listRounds(jobId)).toHaveLength(0);
+    } finally { await h.close(); }
   });
 
   it('a re-brief admitted during a failing pre-flight refuses the fallback arm (normal request)', async () => {
@@ -1406,6 +1518,7 @@ describe('branch-idle guard', () => {
     ]);
     const ledger = {
       listJobs: () => [jobRecord('marker-owner', 'delivered'), jobRecord('plain-lane', 'delivered')],
+      latestCandidateDelivery: (jobId: string): EventRecord | null => (events.get(jobId) ?? []).filter((event) => event.kind === 'job.delivered').at(-1) ?? null,
       latestJobEvent: (jobId: string, kind: string): EventRecord | null =>
         (events.get(jobId) ?? []).filter((event) => event.kind === kind).at(-1) ?? null,
       listJobEvents: (jobId: string): readonly EventRecord[] =>
@@ -1414,6 +1527,9 @@ describe('branch-idle guard', () => {
         opts.jobId === undefined ? [...pending.values()].flat() : (pending.get(opts.jobId) ?? []),
       listPendingDirectives: (): readonly DirectiveRequestRecord[] => [],
       hasUnsettledVerificationRun: (): boolean => false,
+      hasOpenDirectiveRecoveryHold: (): boolean => false,
+      workRevisionState: () => ({ required: 0, delivered: 0 }),
+      correctiveVerificationDebt: () => null,
     };
     const lanes = [
       laneRecord('marker-owner', 'marker-owner', 'gru/marker-owner'),
@@ -1611,6 +1727,11 @@ describe('branch-idle guard', () => {
       expect(review.status).toBe(202);
       await entered.promise;
       h.ledger.beginPendingRebrief({ jobId: 'fallback-settled-race', note: 'n', briefing: 'b' });
+      const sha = execFileSync('git', ['-C', lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      // Already completed historical effects are observed during this review;
+      // no new worker is permitted to overlap the live fallback reviewer.
+      seedOriginalReceipt(h.ledger, 'fallback-settled-race', 'silas.rebrief', 'minion-fresh', sha);
+      seedOriginalReceipt(h.ledger, 'fallback-settled-race', 'job.delivered', 'minion-fresh', sha);
       finalizeRebriefRequest({ ledger: h.ledger, worktrees: h.worktrees, jobId: 'fallback-settled-race',
         minionId: 'minion-fresh', lanePath: lane.path, note: 'n' });
       expect(h.ledger.listPendingRebriefs({ jobId: 'fallback-settled-race' })).toHaveLength(0);
@@ -1791,7 +1912,10 @@ describe('branch-idle guard', () => {
       await createLaneJob(h, repo, { jobId: 'terminal-done', status: 'delivered' });
       h.ledger.beginPendingRebrief({ jobId: 'terminal-done', note: 'n', briefing: 'b' });
       h.ledger.setJobStatus('terminal-done', 'done');
-      for (const [jobId, status] of [['terminal-merged', 'merged'], ['terminal-done', 'done']] as const) {
+      await createLaneJob(h, repo, { jobId: 'terminal-binned', status: 'delivered' });
+      h.ledger.beginPendingRebrief({ jobId: 'terminal-binned', note: 'n', briefing: 'b' });
+      h.ledger.setJobStatus('terminal-binned', 'binned');
+      for (const [jobId, status] of [['terminal-merged', 'merged'], ['terminal-done', 'done'], ['terminal-binned', 'binned']] as const) {
         const refused = await postReview(h, { job_id: jobId });
         expect(refused.status).toBe(400);
         expect((refused.json as { detail?: string }).detail).toContain(

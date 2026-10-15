@@ -896,4 +896,161 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX idx_jobs_pr_url ON jobs(pr_url);
     `,
   },
+  {
+    // Job family (megaminions): a job commissioned by another job's minion
+    // — the build workflow's specialist reviewers — records the commissioning
+    // job as its parent so the board nests it under that heist instead of
+    // counting it as a peer. One level deep: a child never parents a child.
+    // The backfill links only what the ledger proves exactly, and only
+    // report-type children under PR-owing parents (so no row can become a
+    // grandchild): (1) a commissioner that names a job in the same repo, and
+    // (2) a target_ref equal to exactly ONE PR-owing job's pr_url in the
+    // same repo. Ambiguous or unmatched rows stay top-level — nothing guessed.
+    // LANDING COLLISION (same convention as migrations 10-21): id 22 is a
+    // branch-local next-contiguous number for an UNSHIPPED feature; if
+    // owner-merged main lands first, re-number ONLY this never-applied
+    // migration (never a hole).
+    id: 22,
+    name: 'job-parent',
+    sql: `
+      ALTER TABLE jobs ADD COLUMN parent_job_id TEXT REFERENCES jobs(id);
+      CREATE INDEX idx_jobs_parent ON jobs(parent_job_id);
+      UPDATE jobs SET parent_job_id = commissioner
+       WHERE deliverable IN ('review', 'artifact', 'investigation')
+         AND commissioner IS NOT NULL AND commissioner <> id
+         AND EXISTS (
+           SELECT 1 FROM jobs parent
+            WHERE parent.id = jobs.commissioner AND parent.repo = jobs.repo
+              AND (parent.deliverable IS NULL OR parent.deliverable = 'pr')
+         );
+      UPDATE jobs SET parent_job_id = (
+           SELECT parent.id FROM jobs parent
+            WHERE parent.pr_url = jobs.target_ref AND parent.repo = jobs.repo
+              AND (parent.deliverable IS NULL OR parent.deliverable = 'pr')
+         )
+       WHERE parent_job_id IS NULL
+         AND deliverable IN ('review', 'artifact', 'investigation')
+         AND target_ref IS NOT NULL
+         AND (
+           SELECT COUNT(*) FROM jobs parent
+            WHERE parent.pr_url = jobs.target_ref AND parent.repo = jobs.repo
+              AND (parent.deliverable IS NULL OR parent.deliverable = 'pr')
+         ) = 1;
+    `,
+  },
+  {
+    // Guarded interrupted-directive recovery (owner approval j-1348): the
+    // terminal `retired` control closure keeps its audit facts and a
+    // durable continuation hold on the request row. The hold is released
+    // only by a fresh accepted directive/re-brief identity; NULL means
+    // open. Additive and nullable: pre-existing rows keep exact meaning.
+    // LANDING COLLISION (same convention as migrations 10-22): id 23 is a
+    // branch-local next-contiguous number for an UNSHIPPED feature; if
+    // owner-merged main lands first, re-number ONLY this never-applied
+    // migration (never a hole).
+    id: 23,
+    name: 'directive-retirement',
+    sql: `
+      ALTER TABLE pending_directives ADD COLUMN retired_at TEXT;
+      ALTER TABLE pending_directives ADD COLUMN retired_by TEXT;
+      ALTER TABLE pending_directives ADD COLUMN retire_reason TEXT;
+      ALTER TABLE pending_directives ADD COLUMN retire_fingerprint TEXT;
+      ALTER TABLE pending_directives ADD COLUMN retire_expected_state TEXT;
+      ALTER TABLE pending_directives ADD COLUMN retire_expected_head TEXT;
+      ALTER TABLE pending_directives ADD COLUMN hold_released_by TEXT;
+      ALTER TABLE pending_directives ADD COLUMN hold_released_at TEXT;
+      CREATE INDEX idx_pending_directives_hold ON pending_directives(job_id, state, hold_released_by);
+    `,
+  },
+  {
+    // Supersede-and-resume (owner rules 2026-10-08): every new amendment
+    // declares whether it requires implementation (`material`) or not
+    // (`administrative`); pre-existing rows stay NULL = unclassified and
+    // never gate review. A directive request records the required work
+    // revision it was composed with, so its delivery carries that revision
+    // as the service-bound acknowledgement. Additive and nullable.
+    // LANDING COLLISION (same convention as migrations 10-23): renumber
+    // ONLY this never-applied migration if main lands id 24 first.
+    id: 24,
+    name: 'work-revision',
+    sql: `
+      ALTER TABLE job_amendments ADD COLUMN effect TEXT CHECK (effect IS NULL OR effect IN ('material','administrative'));
+      ALTER TABLE pending_directives ADD COLUMN work_revision INTEGER;
+    `,
+  },
+  {
+    id: 25,
+    name: 'gru-mailbox',
+    sql: `
+      CREATE TABLE gru_mailbox (
+        id TEXT PRIMARY KEY,
+        item TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `,
+  },
+  {
+    id: 26,
+    name: 'intake-review-acceptance',
+    sql: `
+      CREATE TABLE intake_reviews (
+        token TEXT PRIMARY KEY,
+        repo_path TEXT NOT NULL,
+        intake_id TEXT NOT NULL,
+        revision_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('reviewed','rejected','approved')),
+        record TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX intake_one_approval ON intake_reviews(repo_path, intake_id, revision_id) WHERE status = 'approved';
+      CREATE TABLE intake_review_heads (
+        repo_path TEXT NOT NULL,
+        intake_id TEXT NOT NULL,
+        token TEXT NOT NULL REFERENCES intake_reviews(token),
+        PRIMARY KEY(repo_path, intake_id)
+      );
+    `,
+  },
+  {
+    id: 27,
+    name: 'intake-recovery-query-indexes',
+    sql: `
+      CREATE INDEX idx_intake_reviews_scope ON intake_reviews(repo_path, intake_id, revision_id);
+      CREATE INDEX idx_pipeline_enqueued_entry ON events(json_extract(payload, '$.entry_id'))
+        WHERE kind = 'pipeline.enqueued' AND json_valid(payload);
+    `,
+  },
+  {
+    // Approved GH-286 integration-only ordinal change: unshipped candidate
+    // 26 becomes 28; landed main 25–27 and original native SQL stay intact.
+    id: 28,
+    name: 'directive-native-progress',
+    sql: `
+      ALTER TABLE pending_directives ADD COLUMN request_kind TEXT CHECK (request_kind IS NULL OR request_kind IN ('directive','rebrief'));
+      ALTER TABLE pending_directives ADD COLUMN source_context TEXT;
+      ALTER TABLE pending_directives ADD COLUMN authority_epoch INTEGER;
+      ALTER TABLE pending_directives ADD COLUMN contract_snapshot TEXT;
+      ALTER TABLE pending_directives ADD COLUMN contract_sha256 TEXT;
+      ALTER TABLE pending_directives ADD COLUMN dispatch_started_at TEXT;
+      ALTER TABLE pending_directives ADD COLUMN native_target TEXT;
+      ALTER TABLE pending_directives ADD COLUMN native_binding TEXT;
+      ALTER TABLE pending_directives ADD COLUMN recovery_checkpoint TEXT;
+      ALTER TABLE pending_directives ADD COLUMN recovery_decision TEXT;
+      CREATE TABLE rebrief_recovery_decisions (
+        marker_id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id),
+        fingerprint TEXT NOT NULL, successor_id TEXT, event_seq INTEGER NOT NULL
+      );
+      CREATE UNIQUE INDEX directive_recovery_generation ON events(
+        json_extract(payload, '$.request_id'), json_extract(payload, '$.generation'))
+        WHERE kind = 'silas.directive-recovery-decided';
+      CREATE UNIQUE INDEX rebrief_recovery_generation ON events(
+        json_extract(payload, '$.marker_id'), json_extract(payload, '$.generation'))
+        WHERE kind = 'silas.rebrief-recovery-decided';
+      CREATE UNIQUE INDEX recovery_owner_resolution_identity ON events(
+        json_extract(payload, '$.subject_kind'), json_extract(payload, '$.subject_id'), json_extract(payload, '$.resolution_id'))
+        WHERE kind = 'ruling.recorded' AND json_extract(payload, '$.permission') = 'fresh-current-approved-recovery-successor';
+      CREATE UNIQUE INDEX recovery_owner_confirmation_identity ON events(
+        json_extract(payload, '$.subject_kind'), json_extract(payload, '$.subject_id'), json_extract(payload, '$.resolution_id'))
+        WHERE kind = 'silas.recovery-owner-stop-confirmed';
+    `,
+  },
 ];

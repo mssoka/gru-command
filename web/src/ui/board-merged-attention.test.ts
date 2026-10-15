@@ -1,4 +1,5 @@
 // @vitest-environment happy-dom
+import { withMailboxFixture } from '../lib/mailbox-fixture.test-support.js';
 
 // Rendered regression (owner ruling 2026-09-26): concluded merged/done
 // jobs whose newest historical review round is aborted — or whose newest
@@ -108,7 +109,7 @@ function agent(id: string, overrides: Partial<AgentView> = {}): AgentView {
 function snapshot(
   options: { jobs?: readonly JobView[]; agents?: readonly AgentView[]; notifications?: readonly NotificationView[] } = {},
 ): BoardSnapshot {
-  return {
+  return withMailboxFixture({
     repos: [{ name: 'demo', jobs: options.jobs ?? [] }],
     agents: options.agents ?? [],
     notifications: options.notifications ?? [],
@@ -131,7 +132,7 @@ function snapshot(
     silas: null,
     verify: null,
     selfHeal: null,
-  };
+  });
 }
 
 function mountBoardDom(): void {
@@ -147,6 +148,7 @@ function mountBoardDom(): void {
     <section id="board-owner" hidden></section>
     <div id="board-jobs"></div>
     <div id="board-agents"></div>
+    <section id="board-repos" data-rail-panel="agents"></section>
     <span id="rail-agents-count">0</span>
     <button id="notification-bell"><span id="notification-badge">0</span></button>
     <div id="notification-panel"><div id="notification-list"></div></div>

@@ -17,11 +17,16 @@ The config file is always `<instance dir>/config.toml`.
 
 The setup wizard (`npm run wizard`, or `node dist/wizard/main.js`) is
 the supported installation path. It reads prompts from `/dev/tty`, so a
-`curl | bash` install remains one invocation, probes runtime CLIs, asks
-for managed repos, offers per-repo BMAD onboarding, and writes the same
+`curl | bash` install remains one invocation, probes runtime CLIs, defaults new installs to Claude Code (`pi` stays selectable; a missing CLI for the chosen runtime stops setup with the fix, never a silent fallback; an existing config keeps its runtime), asks
+which real repository directories to validate during setup, checks Git roots and GC worktree setup without provisioning
+or inspecting independent BMAD ([BMAD-RUNTIME.md](./BMAD-RUNTIME.md)), and writes the same
 **complete teaching config** as the generator below. Every concrete
 default is active; optional role/runtime overrides are shown commented
-because activating a placeholder would change precedence.
+because activating a placeholder would change precedence. The selection is not
+a management whitelist: the board discovers workspace Git entries live. Interactive
+setup excludes linked repo entries from validation defaults, without changing their
+links or the board's discovery behavior; explicit headless selection of a linked
+repo still fails before writes.
 
 True headless use is explicit: `--no-interact` accepts documented
 defaults, and optional `--answers '<json>'` may contain only non-secret
@@ -107,7 +112,8 @@ port = 7665
 token = "a-random-pairing-token"
 
 [runtimes]
-# Session host runtime: "pi" or "claude-code".
+# Session host runtime: "claude-code" (default for new installs) or "pi".
+# Existing installs keep whatever is set here; switch by editing this line.
 default = "pi"
 
 [runtimes.roles]
@@ -252,6 +258,8 @@ wake_quiet_hours = ""
 # opening a turn; breakers, provider walls and needs-owner rows always
 # wake. false restores waking for covered incidents.
 wake_defer_covered = true
+# Code-only FOR GRU mailbox recovery; startup/events/ticks use existing wake gates.
+mailbox_reconcile_interval_ms = 300000
 # First delivered block after this much quiet time carries a "while you
 # were away" digest (wakes, actions, merges, staged PRs). 0 disables it.
 morning_digest_gap_ms = 28800000
@@ -298,8 +306,10 @@ sweep_interval_ms = 300000
 # Sweep wake gate (issue #217): a sweep whose digest fingerprint is
 # unchanged does not re-wake Silas until this much time has passed
 # since the last delivered wake (a bounded safety re-look). 0 = never
-# re-wake on an unchanged digest; a changed digest, an event trigger
-# or a passed decision recheck always wakes. The wake prompt carries
+# re-wake on an unchanged digest; a changed digest, an event whose
+# digest is non-empty, or a passed decision recheck always wakes (an
+# empty digest never wakes on its own; a due decision recheck still
+# does). The wake prompt carries
 # digest DELTA rows plus a pointer to GET /api/silas/digest, and the
 # static operating brief (orders, ops surface, skills) is injected
 # once per session — re-injected only when the brief hash changes,
@@ -309,8 +319,9 @@ unchanged_rewake_ms = 21600000
 # every tracked branch is read through authenticated `gh api` — merged
 # PR state, mergeable_state conflicts, and check-run conclusions — and
 # the state-change mappings apply once per observed change (merged PR
-# closes the lane; conflict cascades an action-required notification;
-# CI failure posts a tiered notification with the run URL; CI green
+# closes the lane; conflict cascades an fyi notification (mechanical
+# tier — Silas coordinates the conflict integration); CI failure posts
+# a tiered notification with the run URL; CI green
 # records the review-gate signal event). 0 disables the poll; requires
 # an authenticated `gh` (see README Prerequisites). Rate-limit headroom:
 # calls are capped per tick — at most 3000 of the authenticated 5000/h.
@@ -319,6 +330,17 @@ stall_threshold_ms = 1800000
 directive_at = 2
 rebrief_at = 3
 escalate_at = 4
+
+[silas.autopilot]
+# Issue #243: the unambiguous rule families executed in code, BEFORE any
+# LLM wake. `enabled` is the global kill switch (default off); every rule
+# defaults to `dry-run`, so enabling the autopilot never enforces a family
+# by itself.
+enabled = false
+
+[silas.autopilot.rules]
+# Per-family mode: "off" (records nothing, calls nothing), "dry-run"
+# (records the would-call), or "enforce" (performs exactly one call).
 
 [provider_recovery]
 # Provider-recovery sensor (owner-approved 2026-09-28): watches EXPLICIT
@@ -463,3 +485,13 @@ built) and the chat socket. `/health` surfaces a summary
 semantics, and the session-store contract, and
 [SUPERVISION.md](./SUPERVISION.md) for the supervision policy the
 `[supervision]` table drives plus the log-rotation knobs.
+
+### Mailbox recovery cadence
+
+`[chat].mailbox_reconcile_interval_ms` is an integer **1–2147483647** in
+milliseconds, default **300000**; larger values are rejected before Node can
+clamp them into a one-millisecond timer. Recovery also runs at startup and on coalesced ledger source
+events. It executes metadata reconciliation only; actual model turns still pass
+all existing Gru admission gates. `notify_wake = "never"` remains passive-only
+and records explicit admission deferrals. Rechecks do not grant owner-stop,
+merge, deployment or restart authority.

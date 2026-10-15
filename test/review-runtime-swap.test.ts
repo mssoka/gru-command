@@ -513,7 +513,12 @@ it('refuses a hard-linked public executable before reading or hashing credential
 
 it('rejects unproven executable and imported JSON names before reading or hashing them', async () => {
   const { reviewRuntimeVersion } = await import('../src/runtime/review-build-identity.js');
-  for (const relative of ['credential-looking-secret.js', 'providers/data/credential-looking-secret.json']) {
+  for (const relative of [
+    'credential-looking-secret.js', 'providers/data/credential-looking-secret.json',
+    'dispatch/directive-progress-unknown.js', 'dispatch/recovery-owner-unknown.js',
+    'ledger/rebrief-evidence-unknown.js', 'ledger/recovery-owner-unknown.js',
+    'runtime/directive-checkpoint-unknown.js',
+  ]) {
     const root = fixture();
     const file = join(root, 'dist', relative);
     mkdirSync(dirname(file), { recursive: true });

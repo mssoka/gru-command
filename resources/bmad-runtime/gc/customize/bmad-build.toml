@@ -1,0 +1,55 @@
+# Gru Command customization layer for bmad-build (gru-command-bmad).
+#
+# Merged after the upstream skill defaults (skills/bmad-build/customize.toml)
+# and before the project's own _bmad/custom/bmad-build.toml overrides. Review
+# layers are keyed by `id`, so these tables replace only the Blind Hunter
+# layer of the normal and oneshot routes; the Edge Case Hunter and
+# Verification Gap layers stay exactly as upstream ships them.
+#
+# Why: upstream asks the Blind Hunter for a minimum number of findings sized
+# from the diff and forbids an empty result. That floor turns a clean change
+# into invented, low-signal findings. The reviewer below is the same
+# independent, context-free review without a quota: a clean change may
+# legitimately produce no actionable findings. No tool-call or review-round
+# ceiling replaces the floor.
+
+[[workflow.review_layers]]
+id = "blind-hunter"
+name = "Blind Hunter"
+instruction = """
+Launch a context-free subagent with this prompt:
+
+Conduct a review of CONTENT.
+Look for what's missing, not only what's wrong.
+Report every real issue you find to fix or improve, and only real issues. There is no minimum and no quota: never pad the list to reach a count or invent a finding to avoid an empty result.
+Output a Markdown list of findings only — no severity, priority, or ranking.
+If the content is empty, stop and say so.
+When you find no actionable issues, output exactly this single line, not an empty response:
+`No actionable findings.`
+
+CONTENT: the unified diff at `{diff_file}`. Read that file — it is the content under review.
+
+Do not invoke any skill, and do not spawn subagents of your own — you are the reviewer. Return your findings as text in your final message; do not route them through any findings-reporting tool the host may offer.
+
+"""
+
+[[workflow.oneshot_review_layers]]
+id = "blind-hunter"
+name = "Blind Hunter"
+instruction = """
+Launch a context-free subagent with this prompt:
+
+Conduct a review of CONTENT.
+Look for what's missing, not only what's wrong.
+Report every real issue you find to fix or improve, and only real issues. There is no minimum and no quota: never pad the list to reach a count or invent a finding to avoid an empty result.
+Output a Markdown list of findings only — no severity, priority, or ranking.
+If the content is empty, stop and say so.
+When you find no actionable issues, output exactly this single line, not an empty response:
+`No actionable findings.`
+
+CONTENT:
+The changed files in the current worktree. Inspect them directly before reviewing.
+
+Do not invoke any skill, and do not spawn subagents of your own — you are the reviewer. Return your findings as text in your final message; do not route them through any findings-reporting tool the host may offer.
+
+"""

@@ -1,6 +1,7 @@
+import { capturePortLaneHandoff } from '../src/worktrees/handoff.js';
 import { PacingGate, type RetrySettlement } from '../src/runtime/pacing.js';
 import { execFileSync, spawn } from 'node:child_process';
-import { createHash, generateKeyPairSync } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -8,6 +9,7 @@ import { basename, dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   AutoVerdictPoster,
+  DefiniteNonDeliveryError,
   GhPrPoster,
   publicationProviderKindFor,
   GitLabMrPoster,
@@ -50,6 +52,86 @@ function settleLane(ledger: LedgerApi, jobId: string): void {
   ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: 'fixture-settled' } });
 }
 
+/** A syntactically complete `verification.completed` payload carrying every
+ * receipt binding `renderRecordedVerification` requires. */
+function completedRunPayload(
+  sha: string,
+  runId: string,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    sha,
+    scope: 'full',
+    command: 'npm test',
+    ok: true,
+    exit_code: 0,
+    duration_ms: 1000,
+    workers: 2,
+    run_id: runId,
+    output_bytes: 4096,
+    output_sha256: createHash('sha256').update(runId).digest('hex'),
+    ...overrides,
+  };
+}
+
+/** Complete persisted `verification.completed` rows for the named jobs — the
+ * read-only before/after proof that host selection neither adds, deletes,
+ * reorders nor rewrites historical verification records (j-1594 acceptance 4).
+ * Read through a kind-scoped list (never the iterator under test) with a
+ * limit above any fixture history, so truncation cannot fake equality. */
+function persistedVerificationRows(ledger: LedgerApi, jobIds: readonly string[]): Record<string, unknown> {
+  const rows: Record<string, unknown> = {};
+  for (const jobId of jobIds) {
+    rows[jobId] = ledger.listJobEventsByKinds(jobId, ['verification.completed'], { limit: 1000 });
+  }
+  return rows;
+}
+
+/** A delivered job lane whose target is a fresh commit on its own branch —
+ * the fixture shape the recorded-verification wave pins use. The caller
+ * appends the synthetic verification history through the returned ledger. */
+async function verificationHistoryLane(id: string, prefix: string, prNumber: number): Promise<{
+  readonly ledger: LedgerApi;
+  readonly job: ReturnType<LedgerApi['addJob']>;
+  readonly target: string;
+  readonly branch: string;
+  readonly artifacts: string;
+  readonly sessions: string;
+  readonly port: GitReviewPort;
+}> {
+  const repo = makeFixtureRepo(`${prefix}-repo`);
+  repos.push(repo);
+  const branch = `feature/${prefix}`;
+  repo.git(['checkout', '-b', branch]);
+  const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+  const root = mkdtempSync(join(tmpdir(), `${prefix}-port-`));
+  const artifacts = mkdtempSync(join(tmpdir(), `${prefix}-artifacts-`));
+  const sessions = mkdtempSync(join(tmpdir(), `${prefix}-sessions-`));
+  dirs.push(root, artifacts, sessions);
+  const db = new LedgerDb(mkdtempSync(join(tmpdir(), `${prefix}-db-`)));
+  dbs.push(db);
+  const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+  const port = new GitReviewPort(root, branch, target, ledger);
+  await port.createJobWorktree({ repoPath: repo.path, jobId: id });
+  const job = ledger.addJob({ id, repo: 'fixture', title: prefix, baseBranch: 'main', briefing: 'review' });
+  ledger.setJobStatus(job.id, 'working');
+  settleLane(ledger, job.id);
+  ledger.setJobPr(job.id, `https://git.example.invalid/acme/fixture/pull/${prNumber}`);
+  attachOrigin(repo, branch, root);
+  return { ledger, job, target, branch, artifacts, sessions, port };
+}
+
+function waveFor(lane: Awaited<ReturnType<typeof verificationHistoryLane>>): WaveRunner {
+  const underlying = makeSpawner(lane.sessions, []);
+  return new WaveRunner({
+    ledger: lane.ledger,
+    worktrees: lane.port,
+    spawner: (role, options) => underlying(role, options),
+    reviewArtifactRoot: lane.artifacts,
+    prHeadProbe: localHeadProbe(lane.branch),
+  });
+}
+
 
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from '../src/dispatch/worktree-port.js';
 import type { WorktreeBaseSource } from '../src/ledger/api.js';
@@ -58,6 +140,8 @@ import type { AgentHandle } from '../src/runtime/types.js';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { PERKINS_LENSES } from '../src/dispatch/perkins-review/policy.js';
+import { laneIsBusy } from '../src/dispatch/branch-idle.js';
+import { OWNED_GIT_SEAMS } from '../src/dispatch/perkins-review/artifacts.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { FALLBACK_REVIEW_TIMEOUT_MS, lensAgentLabel } from '../src/dispatch/perkins.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
@@ -81,6 +165,7 @@ class DeferredReviewPort implements WorktreePort {
   async resolveReviewTarget(input: { repoPath: string; ref: string }): Promise<{
     readonly sha: string;
     readonly baseSource: WorktreeBaseSource | null;
+    readonly trackingRef: string | null;
   }> {
     return this.delegate.resolveReviewTarget(input);
   }
@@ -105,6 +190,63 @@ class DeferredReviewPort implements WorktreePort {
   getWorktree(id: string): WorktreeLane | null { return this.delegate.getWorktree(id); }
   listWorktrees(options: { jobId?: string } = {}): readonly WorktreeLane[] { return this.delegate.listWorktrees(options); }
   release(input: { worktreeId: string }): Promise<WorktreeSweepResult> { return this.delegate.release(input); }
+}
+
+/** A review port whose sweep is slow (R7-15): a retry must not fire into the
+ * setup it is unwinding. */
+class SlowReleasePort implements WorktreePort {
+  constructor(private readonly delegate: WorktreePort, private readonly releaseMs: number) {}
+  createJobWorktree(input: { repoPath: string; jobId: string }): Promise<WorktreeLane> { return this.delegate.createJobWorktree(input); }
+  resolveReviewTarget(input: { repoPath: string; ref: string }): Promise<{ readonly sha: string; readonly baseSource: WorktreeBaseSource | null; readonly trackingRef: string | null }> {
+    return this.delegate.resolveReviewTarget(input);
+  }
+  createReviewWorktree(input: { repoPath: string; roundId: string; ref: string; jobId?: string }): Promise<WorktreeLane> {
+    return this.delegate.createReviewWorktree(input);
+  }
+  createChildWorktree(input: { repoPath: string; jobId: string; childId: string; parentPath: string; authority: 'read-only' | 'writer' }): Promise<WorktreeLane> {
+    return this.delegate.createChildWorktree(input);
+  }
+  getWorktree(id: string): WorktreeLane | null { return this.delegate.getWorktree(id); }
+  listWorktrees(options: { jobId?: string } = {}): readonly WorktreeLane[] { return this.delegate.listWorktrees(options); }
+  async release(input: { worktreeId: string }): Promise<WorktreeSweepResult> {
+    await new Promise((resolve) => setTimeout(resolve, this.releaseMs));
+    return this.delegate.release(input);
+  }
+}
+
+/** A review port whose release can be held (R9-8): while `hold` is set, a
+ * sweep records that it entered and waits for `open()`. */
+class GatedReleasePort implements WorktreePort {
+  hold = false;
+  entered = 0;
+  private gate: (() => void) | null = null;
+  constructor(private readonly delegate: WorktreePort) {}
+  createJobWorktree(input: { repoPath: string; jobId: string }): Promise<WorktreeLane> { return this.delegate.createJobWorktree(input); }
+  resolveReviewTarget(input: { repoPath: string; ref: string }): Promise<{ readonly sha: string; readonly baseSource: WorktreeBaseSource | null; readonly trackingRef: string | null }> {
+    return this.delegate.resolveReviewTarget(input);
+  }
+  createReviewWorktree(input: { repoPath: string; roundId: string; ref: string; jobId?: string }): Promise<WorktreeLane> {
+    return this.delegate.createReviewWorktree(input);
+  }
+  createChildWorktree(input: { repoPath: string; jobId: string; childId: string; parentPath: string; authority: 'read-only' | 'writer' }): Promise<WorktreeLane> {
+    return this.delegate.createChildWorktree(input);
+  }
+  getWorktree(id: string): WorktreeLane | null { return this.delegate.getWorktree(id); }
+  listWorktrees(options: { jobId?: string } = {}): readonly WorktreeLane[] { return this.delegate.listWorktrees(options); }
+  async release(input: { worktreeId: string }): Promise<WorktreeSweepResult> {
+    if (this.hold) {
+      this.entered += 1;
+      await new Promise<void>((resolve) => {
+        this.gate = resolve;
+      });
+    }
+    return this.delegate.release(input);
+  }
+  open(): void {
+    this.hold = false;
+    this.gate?.();
+    this.gate = null;
+  }
 }
 
 /** Attach a fetchable bare origin inside the test's port root and push the
@@ -457,7 +599,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     dbs.push(db);
     const bus = new EventBus();
     const ledger = new LedgerApi(db.handle, { bus });
-    const port = new GitReviewPort(root, 'main', repo.head());
+    const port = new GitReviewPort(root, 'main', repo.head(), ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-handoff' });
     const job = ledger.addJob({ id: 'job-handoff', repo: 'fixture', title: 'handoff', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -494,7 +636,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-residency-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/review', target);
+    const port = new GitReviewPort(root, 'feature/review', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-residency' });
     const job = ledger.addJob({
       id: 'job-residency', repo: 'fixture', title: 'residency', baseBranch: 'main', briefing: 'review this',
@@ -557,7 +699,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db2 = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-residency-db2-')));
     dbs.push(db2);
     const ledger2 = new LedgerApi(db2.handle, { bus: new EventBus() });
-    const port2 = new GitReviewPort(mkdtempSync(join(tmpdir(), 'perkins-residency-port2-')), 'feature/review', target);
+    const port2 = new GitReviewPort(mkdtempSync(join(tmpdir(), 'perkins-residency-port2-')), 'feature/review', target, ledger2);
     await port2.createJobWorktree({ repoPath: repo.path, jobId: 'job-residency-2' });
     const job2 = ledger2.addJob({
       id: 'job-residency-2', repo: 'fixture', title: 'residency cancel', baseBranch: 'main', briefing: 'review this',
@@ -590,7 +732,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-policy-setup-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'main', target);
+    const port = new GitReviewPort(root, 'main', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-policy-error' });
     const job = ledger.addJob({
       id: 'job-policy-error', repo: 'fixture', title: 'policy error', baseBranch: 'main', briefing: 'review this',
@@ -620,7 +762,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-empty-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'main', target);
+    const port = new GitReviewPort(root, 'main', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-empty' });
     const job = ledger.addJob({
       id: 'job-empty', repo: 'fixture', title: 'empty review', baseBranch: 'main', briefing: 'review this',
@@ -649,7 +791,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-setup-shutdown-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const delegate = new GitReviewPort(root, 'feature/setup-shutdown', target);
+    const delegate = new GitReviewPort(root, 'feature/setup-shutdown', target, ledger);
     let markCreated!: () => void;
     const created = new Promise<void>((resolve) => { markCreated = resolve; });
     let releaseCreate!: () => void;
@@ -697,7 +839,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-blocked-shutdown-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/blocked-shutdown', target);
+    const port = new GitReviewPort(root, 'feature/blocked-shutdown', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-blocked-shutdown' });
     const job = ledger.addJob({
       id: 'job-blocked-shutdown', repo: 'fixture', title: 'blocked shutdown', baseBranch: 'main', briefing: 'review',
@@ -750,7 +892,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-li-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/lead-incomplete', target);
+    const port = new GitReviewPort(root, 'feature/lead-incomplete', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-lead-incomplete' });
     const job = ledger.addJob({ id: 'job-lead-incomplete', repo: 'fixture', title: 'lead incomplete', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -813,7 +955,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-refused-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/admission-refused', target);
+    const port = new GitReviewPort(root, 'feature/admission-refused', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-refused' });
     const job = ledger.addJob({ id: 'job-refused', repo: 'fixture', title: 'admission refused', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -876,7 +1018,7 @@ describe('WaveRunner built-in Perkins production path', () => {
       }
     }
     const ledger = new VerdictExplodingLedger(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/finalization-explode', target);
+    const port = new GitReviewPort(root, 'feature/finalization-explode', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-fe' });
     const job = ledger.addJob({ id: 'job-fe', repo: 'fixture', title: 'finalization explode', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -932,7 +1074,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-hrf-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/host-report-fail', target);
+    const port = new GitReviewPort(root, 'feature/host-report-fail', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-hrf' });
     const job = ledger.addJob({ id: 'job-hrf', repo: 'fixture', title: 'host report fail', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -974,7 +1116,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-ul-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/unsettled-lens', target);
+    const port = new GitReviewPort(root, 'feature/unsettled-lens', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-ul' });
     const job = ledger.addJob({ id: 'job-ul', repo: 'fixture', title: 'unsettled lens', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -1038,7 +1180,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-vnr-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/verification-noroom', target);
+    const port = new GitReviewPort(root, 'feature/verification-noroom', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-vnr' });
     const job = ledger.addJob({ id: 'job-vnr', repo: 'fixture', title: 'verification no room', baseBranch: 'main', briefing: 'x'.repeat(256 * 1024 - 10) });
     ledger.setJobStatus(job.id, 'working');
@@ -1074,7 +1216,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-obr-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/oversized-bound-run', target);
+    const port = new GitReviewPort(root, 'feature/oversized-bound-run', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-obr' });
     // A COMPLETED verification run at the exact target with long host
     // strings (scope/command) so its rendered block is large.
@@ -1138,7 +1280,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-sa-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/stalled-admission', target);
+    const port = new GitReviewPort(root, 'feature/stalled-admission', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-sa' });
     const job = ledger.addJob({ id: 'job-sa', repo: 'fixture', title: 'stalled admission', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -1161,12 +1303,15 @@ describe('WaveRunner built-in Perkins production path', () => {
     let ticks = 0;
     const ticker = setInterval(() => { ticks += 1; }, 25);
     try {
-      await expect(wave.runRound({ jobId: job.id })).rejects.toThrow(/head-binding/u);
+      await expect(wave.runRound({ jobId: job.id })).rejects.toThrow(/head-binding.*automatic retry 1 of 2 is scheduled/u);
     } finally {
       clearInterval(ticker);
       if (oldPath === undefined) delete process.env.PATH;
       else process.env.PATH = oldPath;
+      await wave.shutdown(); // the scheduled retry stays durable, never fired here
     }
+    // A stall is transient: one durable retry is scheduled a minute out.
+    expect(ledger.listJobEventsByKinds(job.id, ['round.admission-retry-scheduled'])).toHaveLength(1);
     // Unrelated event-loop work ran THROUGHOUT the stalled probe (the
     // admission probe is off-loop), and the refusal is fail-closed without
     // any spawn.
@@ -1199,7 +1344,7 @@ describe('WaveRunner built-in Perkins production path', () => {
       }
     }
     const ledger = new SecondChipExplodingLedger(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/partial-chip-failure', target);
+    const port = new GitReviewPort(root, 'feature/partial-chip-failure', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-pcf' });
     const job = ledger.addJob({ id: 'job-pcf', repo: 'fixture', title: 'partial chip failure', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -1251,7 +1396,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-df-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/dual-failure', target);
+    const port = new GitReviewPort(root, 'feature/dual-failure', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-df' });
     const job = ledger.addJob({ id: 'job-df', repo: 'fixture', title: 'dual failure', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -1302,7 +1447,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-roa-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/remote-only-advance', target);
+    const port = new GitReviewPort(root, 'feature/remote-only-advance', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-roa' });
     const job = ledger.addJob({ id: 'job-roa', repo: 'fixture', title: 'remote only advance', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -1342,7 +1487,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-pmc-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/posted-missing-ci', target);
+    const port = new GitReviewPort(root, 'feature/posted-missing-ci', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-pmc' });
     const job = ledger.addJob({ id: 'job-pmc', repo: 'fixture', title: 'posted missing ci', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -1383,7 +1528,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-ma-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/mixed-attempts', target);
+    const port = new GitReviewPort(root, 'feature/mixed-attempts', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-ma' });
     const job = ledger.addJob({ id: 'job-ma', repo: 'fixture', title: 'mixed attempts', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -1448,7 +1593,7 @@ describe('WaveRunner built-in Perkins production path', () => {
       }
     }
     const ledger = new TransientChipLedger(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/transient-chip-failure', target);
+    const port = new GitReviewPort(root, 'feature/transient-chip-failure', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-tcf' });
     const job = ledger.addJob({ id: 'job-tcf', repo: 'fixture', title: 'transient chip failure', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -1499,7 +1644,7 @@ describe('WaveRunner built-in Perkins production path', () => {
       }
     }
     const ledger = new ReviewEventExplodingLedger(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/event-write-failure', target);
+    const port = new GitReviewPort(root, 'feature/event-write-failure', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-ewf' });
     const job = ledger.addJob({ id: 'job-ewf', repo: 'fixture', title: 'event write failure', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -1557,7 +1702,7 @@ describe('WaveRunner built-in Perkins production path', () => {
       }
     }
     const ledger = new IncompleteEventExplodingLedger(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/incomplete-event-failure', target);
+    const port = new GitReviewPort(root, 'feature/incomplete-event-failure', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-ief' });
     const job = ledger.addJob({ id: 'job-ief', repo: 'fixture', title: 'incomplete event failure', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -1605,7 +1750,7 @@ describe('WaveRunner built-in Perkins production path', () => {
       }
     }
     const ledger = new ReceiptSuppressingLedger(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/missing-receipt', target);
+    const port = new GitReviewPort(root, 'feature/missing-receipt', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-mr' });
     const job = ledger.addJob({ id: 'job-mr', repo: 'fixture', title: 'missing receipt', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -1633,7 +1778,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-bv-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/binding-verification', target);
+    const port = new GitReviewPort(root, 'feature/binding-verification', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-bv' });
     const job = ledger.addJob({ id: 'job-bv', repo: 'fixture', title: 'binding verification', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -1685,7 +1830,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-tc-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/two-charged', target);
+    const port = new GitReviewPort(root, 'feature/two-charged', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-tc2' });
     const job = ledger.addJob({ id: 'job-tc2', repo: 'fixture', title: 'two charged', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -1732,7 +1877,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-bvw-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/busy-verification-window', target);
+    const port = new GitReviewPort(root, 'feature/busy-verification-window', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-bvw' });
     const job = ledger.addJob({ id: 'job-bvw', repo: 'fixture', title: 'busy verification window', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -1766,6 +1911,157 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(frozenSpec).not.toContain('NO BOUND VERIFICATION RUN');
   });
 
+  it('reviews a job with 208 completed verification runs: the newest binding run freezes without a lifetime-window exception (j-1594)', async () => {
+    const lane = await verificationHistoryLane('job-lh-208', 'perkins-long-history-208', 70);
+    const { ledger, job, target } = lane;
+    // 207 completed runs for OTHER shas, then the binding run as the NEWEST.
+    // The old lifetime ceiling threw on the total before any search happened.
+    for (let index = 0; index < 207; index += 1) {
+      ledger.appendCustomEvent({
+        kind: 'verification.completed', jobId: job.id,
+        payload: completedRunPayload('f'.repeat(40), `run-noise-${index}`),
+      });
+    }
+    ledger.appendCustomEvent({
+      kind: 'verification.completed', jobId: job.id,
+      payload: completedRunPayload(target, 'run-binding-newest'),
+    });
+    // Another job's completed history is kind/job-scoped noise here.
+    for (let index = 0; index < 210; index += 1) {
+      ledger.appendCustomEvent({
+        kind: 'verification.completed', jobId: 'job-other',
+        payload: completedRunPayload(target, `run-other-${index}`),
+      });
+    }
+    expect(ledger.listJobEventsByKinds(job.id, ['verification.completed'], { limit: 1000 })).toHaveLength(208);
+    // BEFORE: every persisted verification row of BOTH jobs (the reviewed
+    // lane and the other job's unrelated history).
+    const verificationBefore = persistedVerificationRows(ledger, [job.id, 'job-other']);
+    const wave = waveFor(lane);
+    await expect(wave.runRound({ jobId: job.id })).resolves.toBeTruthy();
+    // AFTER: host selection is read-only — the complete persisted history of
+    // both jobs is identical row-for-row (same seqs, order, payloads and
+    // outcomes). An added, deleted or rewritten receipt (including an OLDER
+    // one) fails here, while ordinary round/status bookkeeping — different
+    // event kinds — cannot mask it.
+    expect(persistedVerificationRows(ledger, [job.id, 'job-other'])).toEqual(verificationBefore);
+    const round = ledger.listRounds(job.id)[0]!;
+    const frozenSpec = readFileSync(join(lane.artifacts, round.id, 'spec-context.md'), 'utf8');
+    expect(frozenSpec).toContain('result: PASS (exit 0)');
+    expect(frozenSpec).toContain('run_id: run-binding-newest');
+    expect(frozenSpec).not.toContain('NO BOUND VERIFICATION RUN');
+    // Exactly ONE verification section, and the round really bound the
+    // target — not a vacuous "the exception text is absent" check.
+    expect(frozenSpec.match(/--- HOST-RECORDED VERIFICATION \(ledger-backed/gu)).toHaveLength(1);
+    expect(round.targetRef).toBe(target);
+  });
+
+  it('finds a binding run behind more than 200 newer nonqualifying completed runs (j-1594)', async () => {
+    const lane = await verificationHistoryLane('job-lh-old', 'perkins-long-history-old', 71);
+    const { ledger, job, target } = lane;
+    // The binding run is the OLDEST; the newest-first scan must page past the
+    // first page (200 rows) of newer other-sha runs to reach it.
+    ledger.appendCustomEvent({
+      kind: 'verification.completed', jobId: job.id,
+      payload: completedRunPayload(target, 'run-binding-old'),
+    });
+    for (let index = 0; index < 205; index += 1) {
+      ledger.appendCustomEvent({
+        kind: 'verification.completed', jobId: job.id,
+        payload: completedRunPayload('e'.repeat(40), `run-newer-${index}`),
+      });
+    }
+    const verificationBefore = persistedVerificationRows(ledger, [job.id]);
+    const wave = waveFor(lane);
+    await expect(wave.runRound({ jobId: job.id })).resolves.toBeTruthy();
+    // Paging past two pages to the oldest row rewrote nothing.
+    expect(persistedVerificationRows(ledger, [job.id])).toEqual(verificationBefore);
+    const round = ledger.listRounds(job.id)[0]!;
+    const frozenSpec = readFileSync(join(lane.artifacts, round.id, 'spec-context.md'), 'utf8');
+    expect(frozenSpec).toContain('run_id: run-binding-old');
+    expect(frozenSpec).not.toContain('NO BOUND VERIFICATION RUN');
+  });
+
+  it('renders the explicit UNAVAILABLE section only after a complete long-history selection finds no binding run (j-1594)', async () => {
+    const lane = await verificationHistoryLane('job-lh-none', 'perkins-long-history-none', 72);
+    const { ledger, job } = lane;
+    for (let index = 0; index < 205; index += 1) {
+      ledger.appendCustomEvent({
+        kind: 'verification.completed', jobId: job.id,
+        payload: completedRunPayload('d'.repeat(40), `run-absent-${index}`),
+      });
+    }
+    // A second job's unrelated completed history must survive an exhausted
+    // absence proof untouched, too.
+    for (let index = 0; index < 3; index += 1) {
+      ledger.appendCustomEvent({
+        kind: 'verification.completed', jobId: 'job-other-absent',
+        payload: completedRunPayload('c'.repeat(40), `run-absent-other-${index}`),
+      });
+    }
+    const verificationBefore = persistedVerificationRows(ledger, [job.id, 'job-other-absent']);
+    const wave = waveFor(lane);
+    await expect(wave.runRound({ jobId: job.id })).resolves.toBeTruthy();
+    // Exhausted absence is still read-only: no record was added to fill the
+    // gap, none deleted to shorten the search, none rewritten to look absent.
+    expect(persistedVerificationRows(ledger, [job.id, 'job-other-absent'])).toEqual(verificationBefore);
+    const round = ledger.listRounds(job.id)[0]!;
+    const frozenSpec = readFileSync(join(lane.artifacts, round.id, 'spec-context.md'), 'utf8');
+    expect(frozenSpec).toContain('state: UNAVAILABLE — NO BOUND VERIFICATION RUN');
+    expect(frozenSpec).not.toContain('result: PASS');
+  });
+
+  it('a verification-history read failure during iteration aborts the freeze loudly and never fabricates absence or a pass (j-1594)', async () => {
+    const lane = await verificationHistoryLane('job-lh-fail', 'perkins-long-history-fail', 73);
+    const { ledger, job, target } = lane;
+    ledger.appendCustomEvent({
+      kind: 'verification.completed', jobId: job.id,
+      payload: completedRunPayload(target, 'run-binding-ok'),
+    });
+    // The real read is a generator: it cannot fail at the call expression —
+    // a storage failure surfaces while the selector iterates. Yield one
+    // non-binding run, then fail on the next pull.
+    const noise = ledger.appendCustomEvent({
+      kind: 'verification.completed', jobId: job.id,
+      payload: completedRunPayload('f'.repeat(40), 'run-noise-before-failure'),
+    });
+    vi.spyOn(ledger, 'iterateJobVerificationCompleted').mockImplementation(function* failingRead() {
+      yield noise;
+      throw new Error('simulated mid-iteration verification-history read failure');
+    });
+    const wave = waveFor(lane);
+    await expect(wave.runRound({ jobId: job.id })).rejects.toThrow(/simulated mid-iteration verification-history read failure/u);
+    const round = ledger.listRounds(job.id)[0]!;
+    expect(round.status).toBe('aborted');
+    // Round-scoped receipt read — never a global newest-N window.
+    expect(ledger.latestRoundEvent(round.id, 'round.review-no-spawn')).not.toBeNull();
+    expect(ledger.listAgents().filter((agent) => agent.roundId === round.id)).toEqual([]);
+    expect(ledger.latestJobEvent(job.id, 'round.verdict')).toBeNull();
+  });
+
+  it('freezes a baseline-red binding run as its honest recorded FAIL with its scope, never relabeled PASS (j-1594)', async () => {
+    const lane = await verificationHistoryLane('job-lh-red', 'perkins-long-history-red', 74);
+    const { ledger, job, target } = lane;
+    ledger.appendCustomEvent({
+      kind: 'verification.completed', jobId: job.id,
+      payload: completedRunPayload(target, 'run-red', { ok: false, exit_code: 1, scope: 'fast' }),
+    });
+    for (let index = 0; index < 203; index += 1) {
+      ledger.appendCustomEvent({
+        kind: 'verification.completed', jobId: job.id,
+        payload: completedRunPayload('c'.repeat(40), `run-red-noise-${index}`),
+      });
+    }
+    const wave = waveFor(lane);
+    await expect(wave.runRound({ jobId: job.id })).resolves.toBeTruthy();
+    const round = ledger.listRounds(job.id)[0]!;
+    const frozenSpec = readFileSync(join(lane.artifacts, round.id, 'spec-context.md'), 'utf8');
+    expect(frozenSpec).toContain('run_id: run-red');
+    expect(frozenSpec).toContain('result: FAIL (exit 1)');
+    expect(frozenSpec).toContain('scope: fast');
+    expect(frozenSpec).not.toContain('NO BOUND VERIFICATION RUN');
+  });
+
   it('refuses admission on a conflicting duplicate freeze receipt (gh-169 R8-3)', async () => {
     const repo = makeFixtureRepo('perkins-duplicate-receipt');
     repos.push(repo);
@@ -1790,7 +2086,7 @@ describe('WaveRunner built-in Perkins production path', () => {
       }
     }
     const ledger = new ReceiptDuplicatingLedger(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/duplicate-receipt', target);
+    const port = new GitReviewPort(root, 'feature/duplicate-receipt', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-dr' });
     const job = ledger.addJob({ id: 'job-dr', repo: 'fixture', title: 'duplicate receipt', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -1817,7 +2113,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-sca-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/settled-checkpoint-abort', target);
+    const port = new GitReviewPort(root, 'feature/settled-checkpoint-abort', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-sca' });
     const job = ledger.addJob({ id: 'job-sca', repo: 'fixture', title: 'settled checkpoint abort', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -1864,7 +2160,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-lead-conn-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/lead-connection-error', target);
+    const port = new GitReviewPort(root, 'feature/lead-connection-error', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-lead-conn' });
     const job = ledger.addJob({ id: 'job-lead-conn', repo: 'fixture', title: 'lead connection error', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -1951,7 +2247,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-pac-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/parent-after-child', target);
+    const port = new GitReviewPort(root, 'feature/parent-after-child', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-pac' });
     const job = ledger.addJob({ id: 'job-pac', repo: 'fixture', title: 'parent after child', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -2006,7 +2302,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-restart-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/restart', target);
+    const port = new GitReviewPort(root, 'feature/restart', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-restart' });
     const job = ledger.addJob({ id: 'job-restart', repo: 'fixture', title: 'restart', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -2102,7 +2398,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     dirs.push(artifacts);
     const portRoot = mkdtempSync(join(tmpdir(), 'perkins-missing-lane-port-'));
     dirs.push(portRoot);
-    const port = new GitReviewPort(portRoot, 'main', 'abc123');
+    const port = new GitReviewPort(portRoot, 'main', 'abc123', ledger);
     const wave = new WaveRunner({ ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner, reviewArtifactRoot: artifacts });
     expect(await wave.recoverInterruptedRounds()).toBe(1);
     expect(ledger.getRound(round.id)?.status).toBe('aborted');
@@ -2131,7 +2427,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-charged-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/restart-charged', target);
+    const port = new GitReviewPort(root, 'feature/restart-charged', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-charged' });
     const job = ledger.addJob({ id: 'job-charged', repo: 'fixture', title: 'charged restart', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -2173,7 +2469,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-swept-pending-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'main', target);
+    const port = new GitReviewPort(root, 'main', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-swept-pending' });
     const job = ledger.addJob({ id: 'job-swept-pending', repo: 'fixture', title: 'swept pending', baseBranch: 'main', briefing: 'review' });
     const round = ledger.addRound({ jobId: job.id, lenses: ['blind'], targetRef: target });
@@ -2196,7 +2492,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-terminal-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/terminal-cleanup', target);
+    const port = new GitReviewPort(root, 'feature/terminal-cleanup', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-terminal-cleanup' });
     const job = ledger.addJob({ id: 'job-terminal-cleanup', repo: 'fixture', title: 'terminal', baseBranch: 'main', briefing: 'review' });
     const round = ledger.addRound({ jobId: job.id, lenses: ['blind'], targetRef: target });
@@ -2219,7 +2515,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-post-recovery-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/post-recovery', target);
+    const port = new GitReviewPort(root, 'feature/post-recovery', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-post-recovery' });
     const job = ledger.addJob({ id: 'job-post-recovery', repo: 'fixture', title: 'post recovery', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -2261,7 +2557,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db2 = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-post-recovery-bound-db-')));
     dbs.push(db2);
     const ledger2 = new LedgerApi(db2.handle, { bus: new EventBus() });
-    const port2 = new GitReviewPort(root2, 'feature/post-recovery-bound', target2);
+    const port2 = new GitReviewPort(root2, 'feature/post-recovery-bound', target2, ledger2);
     await port2.createJobWorktree({ repoPath: repo2.path, jobId: 'job-post-recovery-bound' });
     const job2 = ledger2.addJob({ id: 'job-post-recovery-bound', repo: 'fixture', title: 'bound recovery', baseBranch: 'main', briefing: 'review' });
     ledger2.setJobStatus(job2.id, 'working');
@@ -2311,7 +2607,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-workflow-error-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/workflow-error', target);
+    const port = new GitReviewPort(root, 'feature/workflow-error', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-workflow-error' });
     const job = ledger.addJob({ id: 'job-workflow-error', repo: 'fixture', title: 'workflow error', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -2376,7 +2672,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-fail-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/specialist-failed', target);
+    const port = new GitReviewPort(root, 'feature/specialist-failed', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-specialist-failed' });
     const job = ledger.addJob({
       id: 'job-specialist-failed', repo: 'fixture', title: 'specialist failed', baseBranch: 'main', briefing: 'review',
@@ -2445,7 +2741,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-prior-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/prior-continuity', target);
+    const port = new GitReviewPort(root, 'feature/prior-continuity', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-prior-continuity' });
     const job = ledger.addJob({
       id: 'job-prior-continuity', repo: 'fixture', title: 'prior continuity', baseBranch: 'main', briefing: 'review',
@@ -2546,6 +2842,246 @@ describe('WaveRunner built-in Perkins production path', () => {
     }
   }, 180_000);
 
+  it('a final whole pass refused transiently is notified once — its automatic retry, not an action-required duplicate (R7-16)', async () => {
+    const repo = makeFixtureRepo('perkins-wave-final-pass-refused');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/final-refused']);
+    repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-final-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-final-artifacts-'));
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-final-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/final-refused', repo.head(), ledger);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-final-refused' });
+    const job = ledger.addJob({
+      id: 'job-final-refused', repo: 'fixture', title: 'final pass', baseBranch: 'main', briefing: 'review',
+    });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/39');
+    attachOrigin(repo, 'feature/final-refused', root);
+    const receiptPoster = {
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
+        reviewId: '9002', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+        headSha: call.targetSha, baseSha: 'b'.repeat(40),
+        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+      })),
+    };
+    const escalations: string[] = [];
+    const recoveryPreflight = async () => ({
+      ok: true as const, failures: [],
+      reviewModel: { role: 'perkins' as const, modelRef: 'fixture-model-v1', settings: {}, authEnv: {}, routingSha256: 'fixture-safe-route' },
+    });
+    const recoveryRuntime = () => ({ id: 'pi', version: 'test-runtime-v1' });
+
+    // Round 1 (whole): one warning; the round concludes READY.
+    const first = asWave(await new WaveRunner({
+      reviewPreflight: recoveryPreflight, reviewRuntimeIdentity: recoveryRuntime,
+      ledger, worktrees: port, poster: receiptPoster,
+      reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/final-refused'),
+      spawner: fakeWholeSpawner(mkdtempSync(join(tmpdir(), 'perkins-final-s1-')), {
+        childAnswer: () => '[]', specialists: [],
+        leadFinding: groundedFinding('lead', 'warning', { location: 'src/main.ts:1', evidence: 'export function answer(): number {' }),
+      }).spawner,
+    }).runRound({ jobId: job.id }));
+    expect(first.canonicalVerdict).toBe('READY TO MERGE');
+
+    // Round 2 (delta): a blocker INSIDE the delta holds the PR.
+    repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 44;\n}\n');
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/final-refused']);
+    const secondFake = fakeWholeSpawner(mkdtempSync(join(tmpdir(), 'perkins-final-s2-')), {
+      childAnswer: () => '[]', specialists: [],
+      leadFinding: groundedFinding('lead', 'blocker', { location: 'src/main.ts:2', title: 'delta blocker' }),
+    });
+    const second = asWave(await new WaveRunner({
+      reviewPreflight: recoveryPreflight, reviewRuntimeIdentity: recoveryRuntime,
+      ledger, worktrees: port, spawner: secondFake.spawner, poster: receiptPoster,
+      reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/final-refused'),
+    }).runRound({ jobId: job.id }));
+    expect(second.round.seq).toBe(2);
+    expect(second.canonicalVerdict).toBe('NEEDS CHANGES');
+
+    // Round 3 (delta): every prior and the new blocker sit OUTSIDE this
+    // delta, so the convergence rule files them as follow-ups, recomputes
+    // the verdict to READY, and the wave AUTO-CHAINS the final whole pass
+    // (round 4), which re-holds the untouched blocker.
+    repo.commitFile('src/third.ts', 'export const third = 3;\n');
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/final-refused']);
+    const thirdFake = fakeWholeSpawner(mkdtempSync(join(tmpdir(), 'perkins-final-s3-')), {
+      childAnswer: () => '[]', specialists: [],
+      leadFinding: groundedFinding('lead', 'blocker', { location: 'src/main.ts:1', title: 'outside delta blocker' }),
+      verdictOverride: 'NEEDS CHANGES',
+    });
+    // The chained final pass's local admission check fails, transiently.
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const shimDir = mkdtempSync(join(tmpdir(), 'perkins-final-refused-shim-'));
+    dirs.push(shimDir);
+    writeFileSync(join(shimDir, 'git'), `#!/bin/sh\ncase " $* " in *" status "*) echo "fatal: index file locked" >&2; exit 128;; esac\nexec "${realGit}" "$@"\n`);
+    chmodSync(join(shimDir, 'git'), 0o755);
+    const oldPath = process.env.PATH;
+    const informs: string[] = [];
+    const third = new WaveRunner({
+      reviewPreflight: recoveryPreflight, reviewRuntimeIdentity: recoveryRuntime, admissionRetryDelaysMs: [60_000],
+      inform: (title, detail) => informs.push(`${title}: ${detail}`),
+      reviewFreezeObserver: (frozen) => {
+        if (frozen.manifest.roundId.endsWith('-r4')) process.env.PATH = `${shimDir}:${oldPath ?? ''}`;
+      },
+      reconcileReviewAgent: async () => true,
+      ledger, worktrees: port, spawner: thirdFake.spawner, poster: receiptPoster,
+      reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/final-refused'),
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    let outcome: WaveOutcome;
+    let pendingRetry: unknown;
+    try {
+      outcome = asWave(await third.runRound({ jobId: job.id }));
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+      // The in-memory retry (owner decision 2026-10-08), before shutdown drops it.
+      pendingRetry = (third as unknown as { admissionRetries: Map<string, { readonly input: unknown }> }).admissionRetries.get(job.id)?.input;
+      await third.shutdown();
+    }
+    // The delta round's READY stands; the refused final pass retries on its own.
+    expect(outcome.round.seq).toBe(3);
+    expect(ledger.listRounds(job.id).map((round) => round.status).at(-1)).toBe('aborted');
+    expect(ledger.listJobEventsByKinds(job.id, ['round.final-pass-failed'], { limit: 5 })).toHaveLength(1);
+    expect(escalations.some((entry) => entry.includes('still owes its final whole-change pass'))).toBe(false);
+    expect(escalations.some((entry) => entry.includes('refused admission before any specialist started'))).toBe(false);
+    expect(informs.some((entry) => entry.includes('automatic retry 1 of 1 is scheduled'))).toBe(true);
+    const scheduled = ledger.latestJobEvent(job.id, 'round.admission-retry-scheduled');
+    expect(scheduled?.payload).toMatchObject({ attempt: 1 });
+    expect(scheduled?.roundId).toBe(ledger.listRounds(job.id).at(-1)!.id);
+    expect(pendingRetry).toMatchObject({ jobId: job.id, targetRef: repo.head() }); // the final pass's own target
+  }, 120_000);
+
+  it('a final whole pass refused for a stuck git whose rollback sweep pauses raises exactly ONE action-required alert (#269)', async () => {
+    const repo = makeFixtureRepo('perkins-wave-final-pass-stuck');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/final-stuck']);
+    repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-final-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-final-artifacts-'));
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-final-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/final-stuck', repo.head(), ledger);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-final-stuck' });
+    const job = ledger.addJob({
+      id: 'job-final-stuck', repo: 'fixture', title: 'final pass', baseBranch: 'main', briefing: 'review',
+    });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/39');
+    attachOrigin(repo, 'feature/final-stuck', root);
+    const receiptPoster = {
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
+        reviewId: '9002', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+        headSha: call.targetSha, baseSha: 'b'.repeat(40),
+        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+      })),
+    };
+    const escalations: string[] = [];
+    const recoveryPreflight = async () => ({
+      ok: true as const, failures: [],
+      reviewModel: { role: 'perkins' as const, modelRef: 'fixture-model-v1', settings: {}, authEnv: {}, routingSha256: 'fixture-safe-route' },
+    });
+    const recoveryRuntime = () => ({ id: 'pi', version: 'test-runtime-v1' });
+
+    // Round 1 (whole): one warning; the round concludes READY.
+    const first = asWave(await new WaveRunner({
+      reviewPreflight: recoveryPreflight, reviewRuntimeIdentity: recoveryRuntime,
+      ledger, worktrees: port, poster: receiptPoster,
+      reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/final-stuck'),
+      spawner: fakeWholeSpawner(mkdtempSync(join(tmpdir(), 'perkins-final-s1-')), {
+        childAnswer: () => '[]', specialists: [],
+        leadFinding: groundedFinding('lead', 'warning', { location: 'src/main.ts:1', evidence: 'export function answer(): number {' }),
+      }).spawner,
+    }).runRound({ jobId: job.id }));
+    expect(first.canonicalVerdict).toBe('READY TO MERGE');
+
+    // Round 2 (delta): a blocker INSIDE the delta holds the PR.
+    repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 44;\n}\n');
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/final-stuck']);
+    const secondFake = fakeWholeSpawner(mkdtempSync(join(tmpdir(), 'perkins-final-s2-')), {
+      childAnswer: () => '[]', specialists: [],
+      leadFinding: groundedFinding('lead', 'blocker', { location: 'src/main.ts:2', title: 'delta blocker' }),
+    });
+    const second = asWave(await new WaveRunner({
+      reviewPreflight: recoveryPreflight, reviewRuntimeIdentity: recoveryRuntime,
+      ledger, worktrees: port, spawner: secondFake.spawner, poster: receiptPoster,
+      reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/final-stuck'),
+    }).runRound({ jobId: job.id }));
+    expect(second.round.seq).toBe(2);
+    expect(second.canonicalVerdict).toBe('NEEDS CHANGES');
+
+    // Round 3 (delta): every prior and the new blocker sit OUTSIDE this
+    // delta, so the convergence rule files them as follow-ups, recomputes
+    // the verdict to READY, and the wave AUTO-CHAINS the final whole pass
+    // (round 4), which re-holds the untouched blocker.
+    repo.commitFile('src/third.ts', 'export const third = 3;\n');
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/final-stuck']);
+    const thirdFake = fakeWholeSpawner(mkdtempSync(join(tmpdir(), 'perkins-final-s3-')), {
+      childAnswer: () => '[]', specialists: [],
+      leadFinding: groundedFinding('lead', 'blocker', { location: 'src/main.ts:1', title: 'outside delta blocker' }),
+      verdictOverride: 'NEEDS CHANGES',
+    });
+    // The chained final pass's local admission check fails, transiently.
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const shimDir = mkdtempSync(join(tmpdir(), 'perkins-final-stuck-shim-'));
+    dirs.push(shimDir);
+    const stuckFile = join(shimDir, 'groups');
+    writeFileSync(join(shimDir, 'git'), `#!/bin/sh\ncase " $* " in *" status "*) ps -o pgid= -p $$ | tr -d ' ' >> "${stuckFile}"; echo "fatal: index file locked" >&2; exit 128;; esac\nexec "${realGit}" "$@"\n`);
+    chmodSync(join(shimDir, 'git'), 0o755);
+    const oldPath = process.env.PATH;
+    const informs: string[] = [];
+    const stuck = (pgid: number): boolean => existsSync(stuckFile) && readFileSync(stuckFile, 'utf8').split('\n').includes(String(pgid));
+    const realSync = OWNED_GIT_SEAMS.groupHasLiveMember;
+    const realAsync = OWNED_GIT_SEAMS.groupHasLiveMemberAsync;
+    const syncSeam = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMember').mockImplementation((pgid, budget) => stuck(pgid) || realSync(pgid, budget));
+    const asyncSeam = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMemberAsync').mockImplementation(async (pgid, budget) => stuck(pgid) || realAsync(pgid, budget));
+    const realRelease = port.release.bind(port);
+    let pausedReleases = 0;
+    const releaseSpy = vi.spyOn(port, 'release').mockImplementation(async (input) => {
+      const real = await realRelease(input);
+      if (!input.worktreeId.includes('-r4')) return real;
+      pausedReleases += 1;
+      return { status: 'paused' as const, processes: [{ pid: 4242, command: 'git ls-remote origin', evidence: 'cwd in review tree' }], preserved: null, note: 'live git' };
+    });
+    const third = new WaveRunner({
+      reviewPreflight: recoveryPreflight, reviewRuntimeIdentity: recoveryRuntime, admissionRetryDelaysMs: [60_000],
+      inform: (title, detail) => informs.push(`${title}: ${detail}`),
+      reviewFreezeObserver: (frozen) => {
+        if (frozen.manifest.roundId.endsWith('-r4')) process.env.PATH = `${shimDir}:${oldPath ?? ''}`;
+      },
+      reconcileReviewAgent: async () => true,
+      ledger, worktrees: port, spawner: thirdFake.spawner, poster: receiptPoster,
+      reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/final-stuck'),
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    let outcome: WaveOutcome;
+    try {
+      outcome = asWave(await third.runRound({ jobId: job.id }));
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+      syncSeam.mockRestore();
+      asyncSeam.mockRestore();
+      releaseSpy.mockRestore();
+      await third.shutdown();
+    }
+    // The delta round's READY stands; the stuck final pass is refused and escalated ONCE.
+    expect(outcome.round.seq).toBe(3);
+    expect(ledger.listJobEventsByKinds(job.id, ['round.final-pass-failed'], { limit: 5 })).toHaveLength(1);
+    expect(pausedReleases).toBeGreaterThan(0); // the paused release really happened
+    // (The delta round's own deferred-follow-ups notice is a separate, ordinary alert.)
+    const stuckAlerts = escalations.filter((line) => line.includes('refused admission') || line.includes('paused on live processes') || line.includes('final whole-change pass'));
+    expect(stuckAlerts, escalations.join('\n')).toHaveLength(1);
+    expect(stuckAlerts[0]).toMatch(/refused admission before any specialist started: .*cleanup unconfirmed: process group \d+ still running/u);
+    expect(ledger.listJobEventsByKinds(job.id, ['round.admission-retry-scheduled'], { limit: 5 })).toEqual([]);
+  }, 120_000);
+
   it('Stage-5: a delta READY chains the final whole pass; deferred follow-ups are durable', async () => {
     const repo = makeFixtureRepo('perkins-wave-stage5-final-pass');
     repos.push(repo);
@@ -2556,7 +3092,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-final-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/final-pass', repo.head());
+    const port = new GitReviewPort(root, 'feature/final-pass', repo.head(), ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-final-pass' });
     const job = ledger.addJob({
       id: 'job-final-pass', repo: 'fixture', title: 'final pass', baseBranch: 'main', briefing: 'review',
@@ -2681,7 +3217,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(dbDir);
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/historical-head', newTarget);
+    const port = new GitReviewPort(root, 'feature/historical-head', newTarget, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-historical-head' });
     const job = ledger.addJob({ id: 'job-historical-head', repo: 'fixture', title: 'historical head',
       baseBranch: 'main', briefing: 'review' });
@@ -2710,7 +3246,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(dbDir);
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, `feature/${name}`, target);
+    const port = new GitReviewPort(root, `feature/${name}`, target, ledger);
     const jobId = `job-${name}`;
     const prepare = async () => {
       await port.createJobWorktree({ repoPath: repo.path, jobId });
@@ -3350,7 +3886,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(dbDir);
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/intervening-identity', target);
+    const port = new GitReviewPort(root, 'feature/intervening-identity', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-intervening-identity' });
     const job = ledger.addJob({
       id: 'job-intervening-identity', repo: 'fixture', title: 'intervening identity',
@@ -3402,7 +3938,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), `perkins-post-${mode}-db-`)));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, `feature/post-${mode}`, target);
+    const port = new GitReviewPort(root, `feature/post-${mode}`, target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: `job-post-${mode}` });
     const job = ledger.addJob({
       id: `job-post-${mode}`, repo: 'fixture', title: 'delivery gate', baseBranch: 'main', briefing: 'review',
@@ -3451,7 +3987,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-wave-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/review', target);
+    const port = new GitReviewPort(root, 'feature/review', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-built-in' });
     const job = ledger.addJob({
       id: 'job-built-in', repo: 'fixture', title: 'full review', baseBranch: 'main',
@@ -3549,7 +4085,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-evidence-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/evidence', target);
+    const port = new GitReviewPort(root, 'feature/evidence', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-evidence' });
     const job = ledger.addJob({
       id: 'job-evidence', repo: 'fixture', title: 'evidence', baseBranch: 'main',
@@ -3606,7 +4142,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-wave-move-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/review', target);
+    const port = new GitReviewPort(root, 'feature/review', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-head-move' });
     const job = ledger.addJob({
       id: 'job-head-move', repo: 'fixture', title: 'movement', baseBranch: 'main', briefing: 'review',
@@ -3687,7 +4223,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
       const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-forged-db-')));
       dbs.push(db);
       const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-      const port = new GitReviewPort(root, 'feature/forged', target);
+      const port = new GitReviewPort(root, 'feature/forged', target, ledger);
       await port.createJobWorktree({ repoPath: repo.path, jobId: `job-forged` });
       const job = ledger.addJob({ id: `job-forged`, repo: 'fixture', title: 'forged receipt', baseBranch: 'main', briefing: 'review' });
       ledger.setJobStatus(job.id, 'working');
@@ -3723,7 +4259,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-reconcile-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/reconcile', target);
+    const port = new GitReviewPort(root, 'feature/reconcile', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-reconcile' });
     const job = ledger.addJob({ id: 'job-reconcile', repo: 'fixture', title: 'reconcile', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -3766,7 +4302,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-rabs-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/reconcile-absent', target);
+    const port = new GitReviewPort(root, 'feature/reconcile-absent', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-rabs' });
     const job = ledger.addJob({ id: 'job-rabs', repo: 'fixture', title: 'reconcile absent', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -3792,6 +4328,103 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     expect(escalations.some((line) => line.includes('verify manually before any retry'))).toBe(true);
   });
 
+  it('skips the ambiguous lookup and duplication caution for a provable non-delivery (#340)', async () => {
+    const repo = makeFixtureRepo('perkins-definite-nondelivery');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/definite-nondelivery']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-dnd-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-dnd-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-dnd-sessions-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-dnd-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/definite-nondelivery', target, ledger);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-dnd' });
+    const job = ledger.addJob({ id: 'job-dnd', repo: 'fixture', title: 'definite non-delivery', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/38');
+    attachOrigin(repo, 'feature/definite-nondelivery', root);
+    // A failure that PROVES no POST was sent (the stale-token refusal).
+    const post = vi.fn(async () => {
+      throw new DefiniteNonDeliveryError('installation token expired or expires too soon before the review POST (it was valid when minted; the pre-POST identity and head probes outlasted it) — review not delivered; no POST was sent');
+    });
+    // A MATCHING review: if the code wrongly consulted the lookup it would be
+    // credited, so the assertions below fail loudly instead of silently.
+    const reconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
+      reviewId: '9009', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      headSha: call.targetSha, baseSha: 'b'.repeat(40),
+      bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+    }));
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: makeSpawner(sessions, []), poster: { post, reconcile }, reviewArtifactRoot: artifacts,
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      prHeadProbe: localHeadProbe('feature/definite-nondelivery'),
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id }));
+    expect(outcome.posted).toBe(false);
+    expect(outcome.verdict).toBeNull();
+    expect(outcome.canonicalVerdict).toBe('INCOMPLETE');
+    // No POST was sent, so the ambiguous-publication lookup is skipped.
+    expect(reconcile).not.toHaveBeenCalled();
+    const escalation = escalations.find((line) => line.includes('provably NOT posted')) ?? '';
+    expect(escalation).toContain('no POST was sent');
+    expect(escalation).toContain('a retry cannot duplicate a publication');
+    // The remediation must not contradict the embedded diagnosis: the token
+    // was valid when minted, so there is no credential to repair — a retry
+    // mints a fresh one.
+    expect(escalation).toContain('re-publish (the retry mints a fresh token');
+    expect(escalation).not.toContain('fix the credential');
+    // The false duplication caution is never attached.
+    expect(escalation).not.toContain('verify manually before any retry');
+    expect(escalation).not.toContain('could duplicate a real publication');
+    const incomplete = ledger.latestRoundEvent(outcome.round.id, 'round.perkins-incomplete')?.payload as { reason?: string; error?: string };
+    expect(incomplete?.reason).toBe('report_not_posted');
+    expect(incomplete?.error).toContain('no POST was sent');
+    expect(incomplete?.error).not.toContain('could duplicate a real publication');
+  });
+
+  it('keeps an ordinary transport failure on the ambiguous path: lookup plus duplication caution (#340)', async () => {
+    const repo = makeFixtureRepo('perkins-transport-ambiguous');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/transport-ambiguous']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-tamb-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-tamb-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-tamb-sessions-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-tamb-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/transport-ambiguous', target, ledger);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-tamb' });
+    const job = ledger.addJob({ id: 'job-tamb', repo: 'fixture', title: 'transport ambiguous', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/39');
+    attachOrigin(repo, 'feature/transport-ambiguous', root);
+    // A client timeout is an UNKNOWN outcome, not definite non-delivery.
+    const post = vi.fn(async () => { throw new Error('review POST timed out after the request left the client'); });
+    const reconcile = vi.fn(async () => null);
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: makeSpawner(sessions, []), poster: { post, reconcile }, reviewArtifactRoot: artifacts,
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      prHeadProbe: localHeadProbe('feature/transport-ambiguous'),
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id }));
+    expect(outcome.posted).toBe(false);
+    expect(outcome.canonicalVerdict).toBe('INCOMPLETE');
+    // The ambiguous path still reconciles once and keeps the caution.
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    const escalation = escalations.find((line) => line.includes('NOT posted safely')) ?? '';
+    expect(escalation).toContain('verify manually before any retry');
+    expect(escalation).toContain('could duplicate a real publication');
+  });
+
   it('refuses a provider receipt without a base binding and stays honestly unposted (R34)', async () => {
     const repo = makeFixtureRepo('perkins-missing-base-receipt');
     repos.push(repo);
@@ -3804,7 +4437,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-mbase-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/missing-base-receipt', target);
+    const port = new GitReviewPort(root, 'feature/missing-base-receipt', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-mbase' });
     const job = ledger.addJob({ id: 'job-mbase', repo: 'fixture', title: 'missing base receipt', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -3848,7 +4481,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-rcfail-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/reconcile-failure', target);
+    const port = new GitReviewPort(root, 'feature/reconcile-failure', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-rcfail' });
     const job = ledger.addJob({ id: 'job-rcfail', repo: 'fixture', title: 'reconcile failure', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -3906,7 +4539,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), `${name}-db-`)));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, branch, target);
+    const port = new GitReviewPort(root, branch, target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: `job-${name}` });
     const job = ledger.addJob({ id: `job-${name}`, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -4120,7 +4753,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-pmiss-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/prior-missing', target);
+    const port = new GitReviewPort(root, 'feature/prior-missing', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-pmiss' });
     const job = ledger.addJob({ id: 'job-pmiss', repo: 'fixture', title: 'prior missing', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -4176,7 +4809,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-appendix-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/appendix', target);
+    const port = new GitReviewPort(root, 'feature/appendix', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-appendix' });
     const job = ledger.addJob({ id: 'job-appendix', repo: 'fixture', title: 'appendix', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -4270,7 +4903,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-nospec-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/nospec-appendix', target);
+    const port = new GitReviewPort(root, 'feature/nospec-appendix', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-nospec' });
     const job = ledger.addJob({ id: 'job-nospec', repo: 'fixture', title: 'nospec appendix', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -4399,7 +5032,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-app-seam-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/app-seam', target);
+    const port = new GitReviewPort(root, 'feature/app-seam', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-app-seam' });
     const job = ledger.addJob({ id: 'job-app-seam', repo: 'fixture', title: 'app seam', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -4446,7 +5079,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-adapt-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/adapter-reconcile', target);
+    const port = new GitReviewPort(root, 'feature/adapter-reconcile', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-adapt' });
     const job = ledger.addJob({ id: 'job-adapt', repo: 'fixture', title: 'adapter reconcile', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -4531,7 +5164,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-crash-db-')));
     dbs.push(db);
     const ledger = new CrashBeforeVerdictLedger(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/crash-recovery', target);
+    const port = new GitReviewPort(root, 'feature/crash-recovery', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-crash' });
     const job = ledger.addJob({ id: 'job-crash', repo: 'fixture', title: 'crash recovery', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -4613,7 +5246,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
       repos.push(repo);
       repo.git(['checkout', '-b', `feature/t3-${label.replace(/\W+/gu, '-')}`]);
       const commit = repo.commitFile('src/main.ts', 'export const three = 3;\n');
-      const port = new GitReviewPort(root, `feature/t3-${label.replace(/\W+/gu, '-')}`, commit);
+      const port = new GitReviewPort(root, `feature/t3-${label.replace(/\W+/gu, '-')}`, commit, ledger);
       await port.createJobWorktree({ repoPath: repo.path, jobId: `job-t3-${label.replace(/\W+/gu, '-')}` });
       const job = ledger.addJob({ id: `job-t3-${label.replace(/\W+/gu, '-')}`, repo: 'fixture', title: 't3', baseBranch: 'main', briefing: 'review' });
       ledger.setJobStatus(job.id, 'working');
@@ -4746,7 +5379,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
         dbs.push(db);
         return new LedgerApi(db.handle, { bus: new EventBus() });
       });
-      const port = new GitReviewPort(root, branch, target);
+      const port = new GitReviewPort(root, branch, target, ledger);
       await t4Step(leg, 'fixture/worktree-create', () => port.createJobWorktree({ repoPath: repo.path, jobId: `job-${name}` }));
       const job = await t4Step(leg, 'fixture/lane-register', () => {
         const job = ledger.addJob({ id: `job-${name}`, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
@@ -4923,7 +5556,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
         dbs.push(db);
         return new LedgerApi(db.handle, { bus: new EventBus() });
       });
-      const port = new GitReviewPort(root, branch, target);
+      const port = new GitReviewPort(root, branch, target, ledger);
       await t4Step(leg, 'fixture/worktree-create', () => port.createJobWorktree({ repoPath: repo.path, jobId: `job-${name}` }));
       const job = await t4Step(leg, 'fixture/lane-register', () => {
         const job = ledger.addJob({ id: `job-${name}`, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
@@ -5000,7 +5633,7 @@ describe('bmad-review fallback gate (user amendment 2026-09-20, fork-3)', () => 
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-gate-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/fallback', target);
+    const port = new GitReviewPort(root, 'feature/fallback', target, ledger);
     const escalations: string[] = [];
     const reviews: number[] = [];
     const directives: string[] = [];
@@ -5176,7 +5809,7 @@ describe('bmad-review fallback gate (user amendment 2026-09-20, fork-3)', () => 
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-gate-noskill-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'main', repo.head());
+    const port = new GitReviewPort(root, 'main', repo.head(), ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-no-skill' });
     const job = ledger.addJob({ id: 'job-no-skill', repo: 'fixture', title: 'no skill', baseBranch: 'main' });
     settleLane(ledger, job.id);
@@ -5203,7 +5836,8 @@ describe('bmad-review fallback gate (user amendment 2026-09-20, fork-3)', () => 
       expect(outcome.skillInstalled).toBe(false);
       expect(outcome.clearToMerge).toBe(false);
       expect(reviewed).toBe(0);
-      expect(outcome.note).toContain('install the BMAD review skill via onboarding');
+      expect(outcome.note).toContain('restore the job\'s exact retained GC workflow package/context');
+      expect(outcome.note).toContain('never install or borrow an ambient BMAD skill');
       expect(outcome.note).toContain('[review] enabled = true');
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -5432,16 +6066,22 @@ describe('GitLab SHA-bound merge-request delivery', () => {
 });
 
 describe('orphan review-lane recovery', () => {
-  it('sweeps a review lane whose ledger round is missing', async () => {
-    const repo = makeFixtureRepo('perkins-orphan-lane');
+  it('delegates missing-round orphan recovery to its configured fixture port, not real-manager cleanup authority', async () => {
+    const repo = makeFixtureRepo('perkins-orphan-lane'); repos.push(repo);
     const root = mkdtempSync(join(tmpdir(), 'perkins-orphan-port-'));
     const artifacts = mkdtempSync(join(tmpdir(), 'perkins-orphan-artifacts-'));
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-orphan-db-')));
     dbs.push(db);
     dirs.push(root, artifacts);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'main', repo.head());
-    await port.createReviewWorktree({ repoPath: repo.path, roundId: 'orphan-round', ref: 'HEAD' });
+    const port = new GitReviewPort(root, 'main', repo.head(), ledger);
+    const orphan = await port.createUnissuedOrphanReview({ repoPath: repo.path, roundId: 'orphan-round', ref: 'HEAD' });
+    expect(() => capturePortLaneHandoff(port, orphan)()).toThrow(/handoff unresolved/);
+    expect(ledger.getRound(orphan.id)).toBeNull(); expect(ledger.getWorktree(orphan.id)).toBeNull();
+    expect(ledger.countEvents('worktree.handoff-completed')).toBe(0);
+    // This fake port tears down only its exact owned checkout; a real manager
+    // retains an unknown orphan. This test proves delegation, not permission.
+    const release = vi.spyOn(port, 'release');
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner: makeSpawner(mkdtempSync(join(tmpdir(), 'perkins-orphan-sessions-')), []),
       reviewArtifactRoot: artifacts,
@@ -5450,6 +6090,7 @@ describe('orphan review-lane recovery', () => {
     const recovered = await wave.recoverInterruptedRounds();
     expect(recovered).toBeGreaterThanOrEqual(1);
     expect(port.getWorktree('orphan-round')?.status).toBe('swept');
+    expect(release).toHaveBeenCalledExactlyOnceWith({ worktreeId: 'orphan-round' });
   });
 });
 
@@ -5464,14 +6105,15 @@ describe('WaveRunner request guards', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-guards-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'main', repo.head());
+    const port = new GitReviewPort(root, 'main', repo.head(), ledger);
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner: makeSpawner(sessions, []), reviewArtifactRoot: artifacts,
     });
-    for (const status of ['merged', 'done'] as const) {
+    for (const status of ['merged', 'done', 'binned'] as const) {
       await port.createJobWorktree({ repoPath: repo.path, jobId: `job-${status}` });
       const job = ledger.addJob({ id: `job-${status}`, repo: 'fixture', title: status, baseBranch: 'main', briefing: 'b' });
-      // Legal path into the terminal states is via in-review.
+      // Legal path into the terminal states is via in-review (binned is
+      // also directly reachable from working).
       ledger.setJobStatus(job.id, 'working');
       ledger.setJobStatus(job.id, 'in-review');
       ledger.setJobStatus(job.id, status);
@@ -5499,7 +6141,7 @@ describe('WaveRunner request guards', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-no-pr-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/no-pr', target);
+    const port = new GitReviewPort(root, 'feature/no-pr', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-no-pr' });
     const job = ledger.addJob({ id: 'job-no-pr', repo: 'fixture', title: 'no pr', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -5590,7 +6232,7 @@ describe('poster transport negatives and fallback-gate terminals', () => {
     dbs.push(db);
     dirs.push(root, artifacts);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'main', repo.head());
+    const port = new GitReviewPort(root, 'main', repo.head(), ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-unconfigured' });
     const job = ledger.addJob({ id: 'job-unconfigured', repo: 'fixture', title: 'unconfigured', baseBranch: 'main' });
     settleLane(ledger, job.id);
@@ -5615,6 +6257,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
   async function makeProductionGateHarness(options: {
     findingToWrite: readonly Record<string, string>[];
     skillContent?: string;
+    resolveReviewResources?: (jobId: string) => { readonly skillPath: string; readonly artifactRoot: string };
     workerGate?: PacingGate;
     /** Provider pacing: the bounded retry settlement to report for a
      * delivered fallback-review turn. Absent = no interlock. */
@@ -5622,9 +6265,15 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     /** Make the fallback turn reject after writing its report (a transport
      * rejection whose automatic retry may still recover the delivery). */
     failPrompt?: boolean;
+    inBandError?: boolean;
+    missingReportTool?: boolean;
+    conflictingReport?: boolean;
+    onPrompt?: () => void;
     /** Hold every fallback minion turn open until the test releases it, so a
      * transport wait slice can expire while the review is genuinely live. */
     promptHold?: { readonly release: Promise<void> };
+    /** Live session health, read at every wait slice (default idle). */
+    healthState?: () => 'idle' | 'disposed' | 'error';
   }): Promise<{
     wave: WaveRunner;
     job: { readonly id: string };
@@ -5636,6 +6285,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     repo: FixtureRepo;
     skillPath: string;
     prompts: string[];
+    systemPrompts: string[];
     spawnCwds: string[];
     escalations: string[];
     disposed: string[];
@@ -5651,7 +6301,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-prod-gate-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/prod-gate', repo.head());
+    const port = new GitReviewPort(root, 'feature/prod-gate', repo.head(), ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-prod-gate' });
     const job = ledger.addJob({ id: 'job-prod-gate', repo: 'fixture', title: 'prod gate', baseBranch: 'main' });
     settleLane(ledger, job.id);
@@ -5659,11 +6309,13 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     mkdirSync(dirname(skillPath), { recursive: true });
     writeFileSync(skillPath, options.skillContent ?? '---\nname: bmad-review\n---\nreview skill bytes', 'utf8');
     const prompts: string[] = [];
+    const systemPrompts: string[] = [];
     const spawnCwds: string[] = [];
     const escalations: string[] = [];
     const disposed: string[] = [];
     const spawner: AgentSpawner = async (role, spawnOptions = {}) => {
       spawnCwds.push(spawnOptions.cwd ?? '');
+      systemPrompts.push(spawnOptions.isolatedReview?.systemPrompt ?? '');
       const file = join(sessions, `prod-${spawnCwds.length}.jsonl`);
       writeFileSync(file, '', 'utf8');
       return {
@@ -5671,21 +6323,26 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
         id: `prod-minion-${spawnCwds.length}`,
         sessionFile: file,
         capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
-        reviewIsolation: undefined,
+        reviewIsolation: true,
+        reviewTools: options.missingReportTool === true ? [] : spawnOptions.isolatedReview?.nativeTools?.map((tool) => tool.name),
         async prompt(text: string) {
           prompts.push(text);
-          // The minion writes the findings JSON to the requested report file
-          const reportMatch = /Write your findings as ONE JSON array to exactly this file: (.+)$/mu.exec(text);
-          if (reportMatch !== null) {
-            writeFileSync(reportMatch[1]!, JSON.stringify(options.findingToWrite), 'utf8');
+          // Exercise the host closure, never grant the fake model file writes.
+          const submit = spawnOptions.isolatedReview!.nativeTools![0]!;
+          await submit.execute({ findings: options.findingToWrite });
+          if (options.conflictingReport === true) {
+            try { await submit.execute({ findings: [{ title: 'Late blocker', category: 'correctness', location: 'src/prod.ts:1', evidence: 'prod = 1', detail: 'A corrected report must not be ignored.' }] }); }
+            catch { /* Model ignores the native tool error and replies DONE. */ }
           }
+          options.onPrompt?.();
           if (options.promptHold !== undefined) await options.promptHold.release;
           if (options.failPrompt === true) throw new Error('429 too many requests');
         },
         async steer() {},
         async followUp() {},
         subscribe() { return () => {}; },
-        health() { return { state: 'idle', lastActivity: null, sessionFile: file }; },
+        health() { return { state: options.healthState?.() ?? (options.inBandError === true ? 'error' : 'idle'), lastActivity: null, sessionFile: file,
+          ...(options.inBandError === true ? { error: 'review turn failed in-band after submitting' } : {}) }; },
         async dispose() { disposed.push(`prod-minion-${spawnCwds.length}`); },
       };
     };
@@ -5703,12 +6360,240 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
       // NO runFallbackReview — the production default runs
       fallbackGate: {
         skillPath,
+        ...(options.resolveReviewResources !== undefined ? { resolveReviewResources: options.resolveReviewResources } : {}),
         fixDirectiveSink: async () => ({ delivered: true, minionId: 'prod-1' }),
       },
       escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
     });
-    return { wave, job, ledger, port, root, artifacts, sessions, repo, skillPath, prompts, spawnCwds, escalations, disposed };
+    return { wave, job, ledger, port, root, artifacts, sessions, repo, skillPath, prompts, systemPrompts, spawnCwds, escalations, disposed };
   }
+
+  it('production resource resolver wins over ambient skill fixtures and sends reports to the owned job root without native clearance', async () => {
+    const { makeWorkflowLane } = await import('./helpers/workflow-lane.js');
+    const { createWorkflowSessionBinder, ownedFallbackReviewResources } = await import('../src/workflows/session.js');
+    const f = makeWorkflowLane('job-prod-gate'); dirs.push(f.root);
+    const bound = createWorkflowSessionBinder(f.dataDir, () => f.lane)({ cwd: f.lane.path });
+    const resources = ownedFallbackReviewResources(bound, f.dataDir);
+    const ids: string[] = [];
+    const h = await makeProductionGateHarness({ findingToWrite: [], resolveReviewResources: (jobId) => { ids.push(jobId); return resources; } });
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(ids).toEqual([h.job.id]);
+    expect(outcome.skillInstalled).toBe(true);
+    expect(outcome.clearToMerge).toBe(true);
+    expect(outcome.reportFiles[0]).toContain(join(resources.artifactRoot, 'fallback-gate'));
+    expect(h.prompts[0]).toContain(resources.skillPath);
+    expect(h.prompts[0]).not.toContain(h.skillPath);
+    expect(h.prompts[0]).toContain('never discover or invoke project/global BMAD');
+    expect(h.ledger.listRounds(h.job.id)).toEqual([]);
+    expect(h.escalations.join('\n')).toContain('not a Perkins READY');
+  });
+
+  it('uses verified helper bytes captured at resolution even when its later pathname is corrupted', async () => {
+    const { makeWorkflowLane } = await import('./helpers/workflow-lane.js');
+    const { createWorkflowSessionBinder, ownedFallbackReviewResources } = await import('../src/workflows/session.js');
+    const f = makeWorkflowLane('job-prod-gate'); dirs.push(f.root);
+    const bound = createWorkflowSessionBinder(f.dataDir, () => f.lane)({ cwd: f.lane.path });
+    const resources = ownedFallbackReviewResources(bound, f.dataDir);
+    const h = await makeProductionGateHarness({ findingToWrite: [], resolveReviewResources: () => {
+      chmodSync(resources.skillPath, 0o600); writeFileSync(resources.skillPath, 'UNVERIFIED HELPER OVERRIDE');
+      return resources;
+    } });
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(true);
+    expect(h.systemPrompts[0]).toContain(resources.skillContent);
+    expect(h.systemPrompts[0]).not.toContain('UNVERIFIED HELPER OVERRIDE');
+  });
+
+  it('ignores inherited Git routing variables and reviews only the assigned working tree', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [] });
+    const foreign = join(h.root, 'foreign-worktree');
+    h.repo.git(['worktree', 'add', '-q', '-b', 'feature/foreign-env', foreign, 'main']);
+    writeFileSync(join(foreign, 'foreign.ts'), 'export const foreignEnvironment = true;\n');
+    const gitDir = h.repo.git(['rev-parse', '--absolute-git-dir']);
+    const keys = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE'] as const;
+    const before = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    try {
+      process.env.GIT_DIR = gitDir; process.env.GIT_WORK_TREE = foreign;
+      process.env.GIT_INDEX_FILE = join(h.root, 'foreign-index');
+      const outcome = await h.wave.runRound({ jobId: h.job.id });
+      if (!('route' in outcome)) throw new Error('expected fallback route');
+      expect(outcome.clearToMerge).toBe(true);
+      expect(h.prompts[0]).toContain('export const prod = 1;');
+      expect(h.prompts[0]).not.toContain('foreignEnvironment');
+    } finally {
+      for (const key of keys) { if (before[key] === undefined) delete process.env[key]; else process.env[key] = before[key]; }
+    }
+  });
+
+  it('missing/corrupt owned fallback resources record an actionable blocked result, never borrowed ambient skill bytes', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [], resolveReviewResources: () => { throw new Error('retained owned helper corrupt: restore exact package'); } });
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.skillInstalled).toBe(false);
+    expect(outcome.note).toContain('retained owned helper corrupt');
+    expect(h.prompts).toEqual([]);
+    expect(h.ledger.listRounds(h.job.id)).toEqual([]);
+    expect(h.ledger.listEvents().some((event) => event.kind === 'job.fallback-review' && event.jobId === h.job.id)).toBe(true);
+  });
+
+  it('blocks oversized complete diffs before spawning rather than passing a truncated prefix', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [] });
+    h.repo.commitFile('large.md', `start\n${'x'.repeat(600 * 1024)}\ntail-defect\n`);
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain('no truncated review can pass');
+    expect(h.spawnCwds).toEqual([]);
+    expect(h.prompts).toEqual([]);
+    expect(h.ledger.listRounds(h.job.id)).toEqual([]);
+  });
+
+  it('records exact base/HEAD and complete diff digest including uncommitted bytes', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [] });
+    writeFileSync(join(h.repo.path, 'src/prod.ts'), 'export const prod = 2;\n');
+    const baseRef = h.repo.git(['rev-parse', 'main']); const headRef = h.repo.head();
+    const diff = execFileSync('git', ['-C', h.repo.path, 'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--binary', '--full-index', baseRef], { encoding: 'utf8' });
+    const diffSha256 = createHash('sha256').update(diff).digest('hex');
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(true);
+    expect(h.prompts[0]).toContain(`canonical base: ${baseRef}; checkout HEAD: ${headRef}; complete working diff SHA-256: ${diffSha256}`);
+    expect(h.prompts[0]).toContain(diff);
+    const triaged = h.ledger.listEvents({ limit: 100 }).find((event) => event.kind === 'job.fallback-review' && (event.payload as { phase?: string }).phase === 'triaged');
+    expect(triaged?.payload).toMatchObject({ baseRef, headRef, diffSha256, completeDiff: true });
+  });
+
+  it('aborts if working bytes or HEAD move during a fallback turn without a ledger event', async () => {
+    for (const change of ['working-bytes', 'head-only']) {
+      let mutate = () => {};
+      const h = await makeProductionGateHarness({ findingToWrite: [], onPrompt: () => mutate() });
+      mutate = () => {
+        if (change === 'working-bytes') writeFileSync(join(h.repo.path, 'src/prod.ts'), 'export const prod = 3;\n');
+        else h.repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '--allow-empty', '-qm', 'head moved without content change']);
+      };
+      const outcome = await h.wave.runRound({ jobId: h.job.id });
+      if (!('route' in outcome)) throw new Error('expected fallback route');
+      expect(outcome.clearToMerge).toBe(false);
+      expect(outcome.note).toContain('working diff or HEAD changed');
+      expect(h.ledger.listEvents({ limit: 100 }).some((event) => event.kind === 'job.fallback-review' && (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
+    }
+  });
+
+  it('aborts if an untracked file appears during a fallback turn without a ledger event (#188)', async () => {
+    let mutate = () => {};
+    const h = await makeProductionGateHarness({ findingToWrite: [], onPrompt: () => mutate() });
+    mutate = () => writeFileSync(join(h.repo.path, 'src/sneaky-untracked.ts'), 'export const sneaky = true;\n');
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain('working diff or HEAD changed');
+    expect(h.ledger.listEvents({ limit: 100 }).some((event) => (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
+  });
+
+  it('never reviews or passes a truncated working diff: oversize capture fails closed (#188)', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [] });
+    writeFileSync(join(h.repo.path, 'src/huge.ts'), `export const huge = "${'x'.repeat(600 * 1024)}";\n`);
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain('no truncated review can pass');
+    expect(h.prompts).toEqual([]);
+    expect(h.spawnCwds).toEqual([]);
+  });
+
+  it('fails closed when the working diff cannot be captured at all (#188)', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [] });
+    writeFileSync(join(h.repo.path, '.git/index.lock'), '');
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(h.prompts).toEqual([]);
+  });
+
+  it('invalidates binary mutations even when their abbreviated Git blob identities collide', async () => {
+    let mutate = () => {};
+    const h = await makeProductionGateHarness({ findingToWrite: [], onPrompt: () => mutate() });
+    const path = join(h.repo.path, 'binary.bin');
+    const first = Buffer.from('\0' + '00006161'); const second = Buffer.from('\0' + '00031931');
+    writeFileSync(path, Buffer.from('\0base')); h.repo.git(['add', 'binary.bin']); h.repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-qm', 'binary baseline']);
+    // Both candidate payloads stay uncommitted, so Git's object database
+    // cannot widen their same-prefix abbreviated identities to disambiguate.
+    writeFileSync(path, first);
+    const shortBefore = h.repo.git(['diff', 'main', '--']);
+    mutate = () => {
+      writeFileSync(path, second);
+      // Deterministic SHA-1-prefix collision: old/default diff text is identical.
+      expect(h.repo.git(['diff', 'main', '--'])).toBe(shortBefore);
+    };
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain('working diff or HEAD changed');
+    expect(h.prompts[0]).toContain('GIT binary patch');
+  });
+
+  it('never lets configured textconv hide working-byte movement from the complete input identity', async () => {
+    let mutate = () => {};
+    const h = await makeProductionGateHarness({ findingToWrite: [], onPrompt: () => mutate() });
+    h.repo.git(['update-ref', 'refs/heads/main', 'HEAD']);
+    h.repo.git(['config', 'diff.hidden.textconv', `node -e 'process.stdout.write("constant\\n")'`]);
+    h.repo.commitFile('.gitattributes', 'src/prod.ts diff=hidden\n');
+    const convertedBefore = h.repo.git(['diff', 'main', '--']);
+    mutate = () => {
+      writeFileSync(join(h.repo.path, 'src/prod.ts'), 'export const prod = 4;\n');
+      expect(h.repo.git(['diff', 'main', '--'])).toBe(convertedBefore);
+    };
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain('working diff or HEAD changed');
+  });
+
+  it('never passes a submitted empty report when the fulfilled turn settled in-band error', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [], inBandError: true });
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain('fallback reviewer turn did not successfully complete');
+    expect(h.ledger.listEvents({ limit: 100 }).some((event) => event.kind === 'job.fallback-review' && (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
+  });
+
+  it('blocks when intent-to-add preparation fails instead of claiming an incomplete diff is complete', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [] });
+    writeFileSync(join(h.repo.path, 'untracked.ts'), 'export const missed = true;\n');
+    const lock = h.repo.git(['rev-parse', '--path-format=absolute', '--git-path', 'index.lock']);
+    writeFileSync(lock, 'held by another writer');
+    try {
+      const outcome = await h.wave.runRound({ jobId: h.job.id });
+      if (!('route' in outcome)) throw new Error('expected fallback route');
+      expect(outcome.clearToMerge).toBe(false);
+      expect(outcome.note).toContain('cannot prepare the complete fallback working diff');
+      expect(h.prompts).toEqual([]);
+      expect(h.spawnCwds).toEqual([]);
+    } finally { rmSync(lock); }
+  });
+
+  it('blocks contradictory findings even when the model ignores the report-tool error', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [], conflictingReport: true });
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain('conflicting findings submissions');
+    expect(readFileSync(outcome.reportFiles[0]!, 'utf8').trim()).toBe('[]');
+  });
+
+  it('blocks a fallback runtime that did not actually expose its scoped report tool', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [], missingReportTool: true });
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain('required host-bound findings tool');
+    expect(h.prompts).toEqual([]);
+    expect(h.disposed).toHaveLength(1);
+  });
 
   it('spawns a minion with the skill prompt, parses findings, and reports clear-to-merge on clean', async () => {
     const h = await makeProductionGateHarness({ findingToWrite: [] });
@@ -5765,6 +6650,149 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
       rmSync(h.artifacts, { recursive: true, force: true });
       rmSync(h.sessions, { recursive: true, force: true });
     }
+  });
+
+  async function fallbackCase1(terminal: 'disposed' | 'error'): Promise<void> {
+    let rejectPrompt!: (reason: Error) => void;
+    const hold = { release: new Promise<void>((_resolve, reject) => { rejectPrompt = reject; }) };
+    let state: 'idle' | 'disposed' | 'error' = 'idle';
+    let openSettlement!: () => void;
+    const settlementOpen = new Promise<void>((resolve) => { openSettlement = resolve; });
+    let settlementEntered = false;
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const h = await makeProductionGateHarness({
+      findingToWrite: [], promptHold: hold, workerGate: gate, healthState: () => state,
+      retrySettlement: async () => { settlementEntered = true; await settlementOpen; return 'none'; },
+    });
+    vi.useFakeTimers();
+    try {
+      const running = h.wave.runRound({ jobId: h.job.id });
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+      state = terminal;
+      await vi.advanceTimersByTimeAsync(FALLBACK_REVIEW_TIMEOUT_MS + 1);
+      // Diagnosed, lease released, session still awaiting retry settlement.
+      expect(settlementEntered).toBe(true);
+      expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
+      expect(h.disposed).toEqual([]);
+      // The still-pending prompt now rejects LATE: it must not replace the diagnosis.
+      rejectPrompt(new Error('LATE-PROMPT-REJECTION'));
+      await vi.advanceTimersByTimeAsync(0);
+      openSettlement();
+      const outcome = await running;
+      if (!('route' in outcome)) throw new Error('expected fallback route');
+      expect(outcome.clearToMerge).toBe(false);
+      expect(outcome.note).toContain(`entered terminal state "${terminal}"`);
+      expect(outcome.note).not.toContain('LATE-PROMPT-REJECTION');
+      expect(h.ledger.listEvents({ limit: 100 }).some((event) => (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
+      expect(h.disposed).toHaveLength(1);
+      expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
+    } finally {
+      vi.useRealTimers();
+      rmSync(h.root, { recursive: true, force: true });
+      rmSync(h.artifacts, { recursive: true, force: true });
+      rmSync(h.sessions, { recursive: true, force: true });
+    }
+  }
+  it('keeps the first diagnosed disposed terminal error when the held prompt rejects late during retry settlement (#176)', () => fallbackCase1('disposed'));
+  it('keeps the first diagnosed error terminal error when the held prompt rejects late during retry settlement (#176)', () => fallbackCase1('error'));
+
+
+  async function abortDuringWait(afterSlice: boolean): Promise<void> {
+    const hold = { release: new Promise<void>(() => {}) };
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const h = await makeProductionGateHarness({ findingToWrite: [], promptHold: hold, workerGate: gate });
+    const stillRunning = (): number => h.ledger.listEvents({ limit: 200 })
+      .filter((event) => (event.payload as { phase?: string }).phase === 'still-running').length;
+    vi.useFakeTimers();
+    try {
+      const running = h.wave.runRound({ jobId: h.job.id });
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+      if (afterSlice) {
+        await vi.advanceTimersByTimeAsync(FALLBACK_REVIEW_TIMEOUT_MS + 1);
+        expect(stillRunning()).toBe(1);
+      }
+      const reportedBefore = stillRunning();
+      await h.wave.shutdown();
+      const outcome = await running;
+      if (!('route' in outcome)) throw new Error('expected fallback route');
+      expect(outcome.clearToMerge).toBe(false);
+      expect(outcome.note).toContain('review operation aborted');
+      expect(outcome.note).not.toMatch(/timed out|timeout/i);
+      expect(h.disposed).toEqual(['prod-minion-1']);
+      expect(h.prompts).toHaveLength(1);
+      expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
+      // No timer survives and no further wait slice is ever reported.
+      // (shutdown() itself leaves only its own 5 s drain race timer; let it
+      // lapse, then nothing — notably no 15 min wait-slice timer — remains.)
+      await vi.advanceTimersByTimeAsync(5_001);
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(FALLBACK_REVIEW_TIMEOUT_MS * 3);
+      expect(stillRunning()).toBe(reportedBefore);
+      expect(h.ledger.listEvents({ limit: 200 }).some((event) => (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
+    } finally {
+      vi.useRealTimers();
+      rmSync(h.root, { recursive: true, force: true });
+      rmSync(h.artifacts, { recursive: true, force: true });
+      rmSync(h.sessions, { recursive: true, force: true });
+    }
+  }
+  it('explicit abort before an expired wait slice reports cancellation, disposes the session and leaves no timer or still-running event (#177)', () => abortDuringWait(false));
+  it('explicit abort after an expired wait slice reports cancellation, disposes the session and leaves no timer or still-running event (#177)', () => abortDuringWait(true));
+
+  async function holdCase1(status: 'blocked' | 'parked'): Promise<void> {
+    let release!: () => void;
+    const hold = { release: new Promise<void>((resolve) => { release = resolve; }) };
+    const h = await makeProductionGateHarness({ findingToWrite: [], promptHold: hold });
+    const running = h.wave.runRound({ jobId: h.job.id });
+    await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+    h.ledger.setJobStatus(h.job.id, status);
+    release();
+    const outcome = await running;
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain(`is ${status}`);
+    expect(h.ledger.listEvents({ limit: 100 }).some((event) => (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
+    expect(h.disposed).toHaveLength(1);
+  }
+  it('a direct fallback gate moved to blocked while its reviewer is held never passes (#186)', () => holdCase1('blocked'));
+  it('a direct fallback gate moved to parked while its reviewer is held never passes (#186)', () => holdCase1('parked'));
+
+  async function holdCase2(status: 'blocked' | 'parked'): Promise<void> {
+    let release!: () => void;
+    const hold = { release: new Promise<void>((resolve) => { release = resolve; }) };
+    const h = await makeProductionGateHarness({ findingToWrite: [], promptHold: hold });
+    const running = h.wave.runRound({ jobId: h.job.id, force: true });
+    await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+    h.ledger.setJobStatus(h.job.id, status);
+    release();
+    const outcome = await running;
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain(`is ${status}`);
+  }
+  it('a force flag does not waive a blocked revocation while the reviewer is held (#186)', () => holdCase2('blocked'));
+  it('a force flag does not waive a parked revocation while the reviewer is held (#186)', () => holdCase2('parked'));
+
+  async function holdCase3(status: 'blocked' | 'parked'): Promise<void> {
+    const h = await makeProductionGateHarness({ findingToWrite: [] });
+    h.ledger.setJobStatus(h.job.id, status);
+    await expect(h.wave.runRound({ jobId: h.job.id })).rejects.toThrow(`is ${status}`);
+    expect(h.spawnCwds).toEqual([]);
+    expect(h.prompts).toEqual([]);
+  }
+  it('a direct fallback request on a blocked job is refused at round intake before any reviewer spawns (#186)', () => holdCase3('blocked'));
+  it('a direct fallback request on a parked job is refused at round intake before any reviewer spawns (#186)', () => holdCase3('parked'));
+
+  it('an unchanged review-eligible direct gate with a held reviewer still passes (#186 control)', async () => {
+    let release!: () => void;
+    const hold = { release: new Promise<void>((resolve) => { release = resolve; }) };
+    const h = await makeProductionGateHarness({ findingToWrite: [], promptHold: hold });
+    const running = h.wave.runRound({ jobId: h.job.id });
+    await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+    release();
+    const outcome = await running;
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(true);
   });
 
   it('the production fallback review takes a worker pacing slot before it spawns', async () => {
@@ -5841,7 +6869,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-prod-gate-nores-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'main', makeFixtureRepo('perkins-prod-gate-nores-repo').head());
+    const port = new GitReviewPort(root, 'main', makeFixtureRepo('perkins-prod-gate-nores-repo').head(), ledger);
     await port.createJobWorktree({ repoPath: makeFixtureRepo('perkins-prod-gate-nores-repo2').path, jobId: 'job-nores' });
     const job = ledger.addJob({ id: 'job-nores', repo: 'fixture', title: 'no report', baseBranch: 'main' });
     settleLane(ledger, job.id);
@@ -5851,11 +6879,12 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     const wave = new WaveRunner({
       ledger,
       worktrees: port,
-      spawner: async (role) => {
+      spawner: async (role, options = {}) => {
         const file = join(sessions, 'prod-nres.jsonl');
         writeFileSync(file, '', 'utf8');
         return {
           role, id: 'prod-nres', sessionFile: file,
+          reviewTools: options.isolatedReview?.nativeTools?.map((tool) => tool.name),
           capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
           async prompt(text: string) { promptText = text; /* deliberately does NOT write the report */ },
           async steer() {}, async followUp() {},
@@ -5902,7 +6931,7 @@ describe('fallback diff includes untracked files (V3 revert-mutation pin)', () =
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-untracked-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/untracked', repo.head());
+    const port = new GitReviewPort(root, 'feature/untracked', repo.head(), ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-untracked-fix' });
     const job = ledger.addJob({ id: 'job-untracked-fix', repo: 'fixture', title: 'untracked', baseBranch: 'main' });
     settleLane(ledger, job.id);
@@ -6355,7 +7384,7 @@ describe('repair pass 3: restart recovery binding contract (R1/R2/R21)', () => {
       const db = new LedgerDb(mkdtempSync(join(tmpdir(), `${name}-db-`)));
       dbs.push(db);
       ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-      port = new GitReviewPort(root, `feature/${name}`, commit);
+      port = new GitReviewPort(root, `feature/${name}`, commit, ledger);
     }
     await port.createJobWorktree({ repoPath: repo.path, jobId: `job-${name}` });
     const job = ledger.addJob({ id: `job-${name}`, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
@@ -6913,7 +7942,7 @@ describe('repair pass 3: publication completeness, GitLab wording, and v2 integr
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'p3-overflow-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/p3-overflow', target);
+    const port = new GitReviewPort(root, 'feature/p3-overflow', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-p3-overflow' });
     const job = ledger.addJob({ id: 'job-p3-overflow', repo: 'fixture', title: 'overflow', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -6969,7 +7998,7 @@ describe('repair pass 3: publication completeness, GitLab wording, and v2 integr
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'p3-ro-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/p3-redact-overflow', target);
+    const port = new GitReviewPort(root, 'feature/p3-redact-overflow', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-p3-ro' });
     const job = ledger.addJob({ id: 'job-p3-ro', repo: 'fixture', title: 'redaction overflow', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -7009,7 +8038,7 @@ describe('repair pass 3: publication completeness, GitLab wording, and v2 integr
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'p3-lu-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/p3-ledger-undelivered', target);
+    const port = new GitReviewPort(root, 'feature/p3-ledger-undelivered', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-p3-lu' });
     const job = ledger.addJob({ id: 'job-p3-lu', repo: 'fixture', title: 'ledger undelivered', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -7064,7 +8093,7 @@ describe('repair pass 3: publication completeness, GitLab wording, and v2 integr
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'p3-gl-note-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/p3-gitlab-note', target);
+    const port = new GitReviewPort(root, 'feature/p3-gitlab-note', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-p3-gl-note' });
     const job = ledger.addJob({ id: 'job-p3-gl-note', repo: 'fixture', title: 'gitlab note', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -7114,7 +8143,7 @@ describe('repair pass 3: publication completeness, GitLab wording, and v2 integr
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'p3-v2-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/p3-v2-prior', target);
+    const port = new GitReviewPort(root, 'feature/p3-v2-prior', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-p3-v2' });
     const job = ledger.addJob({ id: 'job-p3-v2', repo: 'fixture', title: 'v2 prior', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -7254,7 +8283,7 @@ describe('repair pass 3: real child-process crash recovery (R19/R16)', () => {
     const db = new LedgerDb(dbPath);
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new PersistedReviewPort(root, 'feature/p3-crash-child', target);
+    const port = new PersistedReviewPort(root, 'feature/p3-crash-child', target, ledger);
     expect(port.getWorktree(roundId)?.status, 'crash-time lane must be active (unswept)').toBe('active');
     const crashed = ledger.getRound(roundId);
     expect(crashed?.status).toBe('live');
@@ -7325,7 +8354,7 @@ describe('repair pass 3: real child-process crash recovery (R19/R16)', () => {
     const db = new LedgerDb(dbPath);
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new PersistedReviewPort(root, 'feature/selective-crash', target);
+    const port = new PersistedReviewPort(root, 'feature/selective-crash', target, ledger);
     expect(ledger.listRoundSpecialistStarts(roundId)).toHaveLength(2);
     const recordedOwner = ledger.latestRoundEvent(roundId, 'round.review-owner')?.payload as {
       roundId: string; runtimeId: string; pid: number; generation: string;
@@ -7403,7 +8432,7 @@ describe('durable handoff admission: perkins route, re-busy re-queue, crash/term
     // waking the wave's own listener, then drive the deterministic pass
     // itself — the realistic settled-lane fixture.
     const ledger = new LedgerApi(db.handle, { bus: opts.isolateLedgerBus === true ? new EventBus() : bus });
-    const port = new GitReviewPort(root, 'feature/review', target);
+    const port = new GitReviewPort(root, 'feature/review', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId });
     const job = ledger.addJob({ id: jobId, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review this' });
     ledger.setJobStatus(jobId, 'working');
@@ -7643,24 +8672,27 @@ describe('durable handoff admission: perkins route, re-busy re-queue, crash/term
   }, 120_000);
 
   it('skips replay for a terminal job truthfully, without failure or escalation', async () => {
-    const f = await handoffFixture('handoff-terminal', 'job-handoff-terminal');
-    f.ledger.setJobStatus('job-handoff-terminal', 'in-review');
-    f.ledger.setJobStatus('job-handoff-terminal', 'merged');
-    f.ledger.appendCustomEvent({
-      kind: 'job.review-handoff-queued', jobId: 'job-handoff-terminal',
-      payload: { input: { jobId: 'job-handoff-terminal' } },
-    });
-    const spawner = vi.fn() as unknown as AgentSpawner;
-    const escalate = vi.fn();
-    const wave = new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner, bus: f.bus, escalate });
-    wave.resumeQueuedHandoffs();
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    const skipped = f.ledger.latestJobEvent('job-handoff-terminal', 'job.review-handoff-skipped');
-    expect(skipped?.payload).toMatchObject({ reason: 'terminal-job', status: 'merged' });
-    expect(f.ledger.latestJobEvent('job-handoff-terminal', 'job.review-handoff-failed')).toBeNull();
-    expect(escalate).not.toHaveBeenCalled();
-    expect(spawner).not.toHaveBeenCalled();
-    await wave.shutdown();
+    // merged and binned are both terminal: neither may admit a handoff.
+    for (const status of ['merged', 'binned'] as const) {
+      const f = await handoffFixture(`handoff-terminal-${status}`, `job-handoff-terminal-${status}`);
+      f.ledger.setJobStatus(`job-handoff-terminal-${status}`, 'in-review');
+      f.ledger.setJobStatus(`job-handoff-terminal-${status}`, status);
+      f.ledger.appendCustomEvent({
+        kind: 'job.review-handoff-queued', jobId: `job-handoff-terminal-${status}`,
+        payload: { input: { jobId: `job-handoff-terminal-${status}` } },
+      });
+      const spawner = vi.fn() as unknown as AgentSpawner;
+      const escalate = vi.fn();
+      const wave = new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner, bus: f.bus, escalate });
+      wave.resumeQueuedHandoffs();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const skipped = f.ledger.latestJobEvent(`job-handoff-terminal-${status}`, 'job.review-handoff-skipped');
+      expect(skipped?.payload).toMatchObject({ reason: 'terminal-job', status });
+      expect(f.ledger.latestJobEvent(`job-handoff-terminal-${status}`, 'job.review-handoff-failed')).toBeNull();
+      expect(escalate).not.toHaveBeenCalled();
+      expect(spawner).not.toHaveBeenCalled();
+      await wave.shutdown();
+    }
   }, 120_000);
 });
 
@@ -7675,7 +8707,7 @@ describe('provider pacing through WaveRunner', () => {
     const sessions = mkdtempSync(join(tmpdir(), 'pacing-wave-sessions-'));
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'pacing-wave-db-'))); dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/pacing-wave', target);
+    const port = new GitReviewPort(root, 'feature/pacing-wave', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'pacing-wave' });
     ledger.addJob({ id: 'pacing-wave', repo: 'fixture', title: 'pacing wave', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus('pacing-wave', 'working'); settleLane(ledger, 'pacing-wave');
@@ -7725,6 +8757,1109 @@ describe('provider pacing through WaveRunner', () => {
       jitter.mockRestore();
       await wave.shutdown();
       for (const dir of [root, artifacts, sessions]) rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('automatic admission retry (owner decisions 2026-10-08: in memory; a stuck git escalates)', () => {
+  /** A delivered lane whose advertised-tip probe fails at once while the
+   * shim's `remote-down` flag exists — git's own failure, so the refusal is
+   * the transient check-failed kind that retries. With `remote-slow`
+   * instead, the probe marks `slowStarted`, waits, then answers truthfully. */
+  async function transientFixture(name: string, opts: { readonly probeDelaySeconds?: number; readonly stuckFile?: string } = {}) {
+    const repo = makeFixtureRepo(`perkins-retry-${name}`);
+    repos.push(repo);
+    const branch = `feature/retry-${name}`;
+    repo.git(['checkout', '-b', branch]);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-retry-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-retry-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-retry-sessions-'));
+    const shimDir = mkdtempSync(join(tmpdir(), 'perkins-retry-shim-'));
+    dirs.push(sessions, shimDir);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-retry-db-')));
+    dbs.push(db);
+    const bus = new EventBus();
+    const ledger = new LedgerApi(db.handle, { bus });
+    const port = new GitReviewPort(root, branch, target, ledger);
+    const jobId = `job-retry-${name}`;
+    await port.createJobWorktree({ repoPath: repo.path, jobId });
+    ledger.addJob({ id: jobId, repo: 'fixture', title: 'admission retry', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(jobId, 'working');
+    settleLane(ledger, jobId);
+    ledger.setJobPr(jobId, 'https://github.com/acme/fixture/pull/61');
+    attachOrigin(repo, branch, root);
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const flag = join(shimDir, 'remote-down');
+    const slow = join(shimDir, 'remote-slow');
+    const slowStarted = join(shimDir, 'slow-started');
+    writeFileSync(flag, '');
+    const delay = opts.probeDelaySeconds !== undefined ? `sleep ${opts.probeDelaySeconds}; ` : '';
+    // stuckFile: the remote step hangs, recording its process group.
+    const remoteDown = opts.stuckFile !== undefined
+      ? `ps -o pgid= -p $$ | tr -d ' ' >> "${opts.stuckFile}"; exec sleep 30`
+      : `${delay}echo "fatal: unable to access the remote" >&2; exit 128`;
+    writeFileSync(join(shimDir, 'git'), [
+      '#!/bin/sh',
+      `if [ -e "${flag}" ]; then case " $* " in *" ls-remote "*) ${remoteDown};; esac; fi`,
+      `if [ -e "${slow}" ]; then case " $* " in *" ls-remote "*) touch "${slowStarted}"; sleep 1;; esac; fi`,
+      `exec "${realGit}" "$@"`,
+      '',
+    ].join('\n'));
+    chmodSync(join(shimDir, 'git'), 0o755);
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${shimDir}:${oldPath ?? ''}`;
+    const restorePath = (): void => {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+    };
+    return { repo, ledger, bus, port, jobId, sessions, artifacts, flag, slow, slowStarted, branch, target, restorePath };
+  }
+
+  const kinds = (ledger: LedgerApi, jobId: string, kind: string) =>
+    ledger.listJobEventsByKinds(jobId, [kind], { limit: 50 }).slice().reverse();
+  const payloads = (ledger: LedgerApi, jobId: string, kind: string) => kinds(ledger, jobId, kind).map((event) => event.payload as Record<string, unknown>);
+  const settled = (ledger: LedgerApi, jobId: string) => payloads(ledger, jobId, 'round.admission-retry-settled');
+  async function until(predicate: () => boolean, timeoutMs = 30_000): Promise<void> {
+    await vi.waitFor(() => expect(predicate()).toBe(true), { timeout: timeoutMs, interval: 20 });
+  }
+
+  it('retries a transient refusal twice — an FYI per retry, the action-required escalation only after the last; zero delays never race the rollback (R7-15)', async () => {
+    const { ledger, port, jobId, sessions, artifacts, branch, restorePath } = await transientFixture('exhausted');
+    const informs: string[] = [];
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      // A slow sweep: a zero-delay retry must still wait for the rollback.
+      ledger, worktrees: new SlowReleasePort(port, 150), spawner: makeSpawner(sessions, []), reviewArtifactRoot: artifacts,
+      prHeadProbe: localHeadProbe(branch), admissionRetryDelaysMs: [0, 0],
+      inform: (title, detail) => informs.push(`${title}: ${detail}`),
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    try {
+      await expect(wave.requestReview({ jobId })).rejects.toThrow(
+        /\[head-binding\].*check-failed.*automatic retry 1 of 2 is scheduled for \d{4}-/u,
+      );
+      expect(escalations).toEqual([]);
+      await until(() => escalations.length === 1 && settled(ledger, jobId).length === 2);
+    } finally {
+      restorePath();
+      await wave.shutdown();
+    }
+    const rounds = ledger.listRounds(jobId);
+    expect(rounds.map((round) => round.status)).toEqual(['aborted', 'aborted', 'aborted']);
+    expect(ledger.listAgents().filter((agent) => agent.roundId !== null)).toEqual([]);
+    const scheduled = kinds(ledger, jobId, 'round.admission-retry-scheduled');
+    expect(scheduled.map((event) => [event.roundId, (event.payload as { attempt: number }).attempt]))
+      .toEqual([[rounds[0]!.id, 1], [rounds[1]!.id, 2]]);
+    expect(settled(ledger, jobId)).toEqual([
+      { attempt: 1, scheduledSeq: scheduled[0]!.seq, outcome: 'refused' },
+      { attempt: 2, scheduledSeq: scheduled[1]!.seq, outcome: 'refused' },
+    ]);
+    expect(informs).toHaveLength(2);
+    expect(escalations[0]).toContain('automatic retry 2 of 2 was refused too — no retries remain');
+  });
+
+  it('a retry is skipped when the job moved on — newer delivery, status, successor round, busy branch — with an FYI and no escalation (R7-22)', async () => {
+    const cases: readonly { readonly name: string; readonly move: (f: Awaited<ReturnType<typeof transientFixture>>) => void; readonly reason: RegExp }[] = [
+      { name: 'delivery', move: (f) => { f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: f.jobId, payload: { sha: 'newer' } }); }, reason: /a newer delivery replaced the refused one/u },
+      { name: 'status', move: (f) => { f.ledger.setJobStatus(f.jobId, 'blocked'); }, reason: /the job is blocked/u },
+      { name: 'successor', move: (f) => { f.ledger.addRound({ jobId: f.jobId, lenses: [...PERKINS_LENSES], targetRef: f.target }); }, reason: /a newer review round already started/u },
+      { name: 'busy', move: (f) => { f.ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId: f.jobId, payload: { request_id: 'repair-1' } }); }, reason: /the branch is busy again/u },
+    ];
+    for (const entry of cases) {
+      const f = await transientFixture(`moved-${entry.name}`);
+      const informs: string[] = [];
+      const escalations: string[] = [];
+      const wave = new WaveRunner({
+        ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts,
+        prHeadProbe: localHeadProbe(f.branch), admissionRetryDelaysMs: [150],
+        inform: (title, detail) => informs.push(`${title}: ${detail}`),
+        escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      });
+      try {
+        await expect(wave.requestReview({ jobId: f.jobId })).rejects.toThrow(/automatic retry 1 of 1 is scheduled/u);
+        const roundsBefore = f.ledger.listRounds(f.jobId).length;
+        entry.move(f);
+        await until(() => informs.some((line) => line.includes('skipped')));
+        expect(informs.at(-1), entry.name).toMatch(entry.reason);
+        expect(settled(f.ledger, f.jobId), entry.name).toEqual([expect.objectContaining({ outcome: 'skipped', reason: expect.stringMatching(entry.reason) })]);
+        expect(f.ledger.listRounds(f.jobId).length, entry.name).toBe(roundsBefore + (entry.name === 'successor' ? 1 : 0));
+        expect(escalations, entry.name).toEqual([]);
+      } finally {
+        f.restorePath();
+        await wave.shutdown();
+      }
+    }
+  });
+
+  it('work that makes the branch busy DURING the probe stops the review before any admission effect — a request is refused busy, a forced one too for a blocker its arm never audited, a retry skipped with an FYI (R8-16)', async () => {
+    for (const route of ['request', 'forced', 'retry'] as const) {
+      const f = await transientFixture(`busy-probe-${route}`);
+      const informs: string[] = [];
+      const escalations: string[] = [];
+      // Armed rounds: the freeze has passed its branch-idle check; the
+      // admission probe (slow, and it would pass) starts next — a repair
+      // directive lands while it runs.
+      let armed = route !== 'retry';
+      let landed = false;
+      const wave = new WaveRunner({
+        ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts,
+        prHeadProbe: localHeadProbe(f.branch), admissionRetryDelaysMs: [100],
+        reviewFreezeObserver: () => {
+          if (!armed) return;
+          setTimeout(() => {
+            if (route === 'forced') {
+              // Another job's lane on the same branch starts working.
+              const sibling = `${f.jobId}-sibling`;
+              void f.port.createJobWorktree({ repoPath: f.repo.path, jobId: sibling }).then(() => {
+                f.ledger.addJob({ id: sibling, repo: 'fixture', title: 'sibling', baseBranch: 'main', briefing: 'sibling' });
+                f.ledger.setJobStatus(sibling, 'working');
+                landed = true;
+              });
+              return;
+            }
+            f.ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId: f.jobId, payload: { request_id: 'repair-during-probe' } });
+            landed = true;
+          }, 300);
+        },
+        inform: (title, detail) => informs.push(`${title}: ${detail}`),
+        escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      });
+      try {
+        if (route !== 'retry') {
+          rmSync(f.flag);
+          writeFileSync(f.slow, '');
+          await expect(wave.requestReview({ jobId: f.jobId, ...(route === 'forced' ? { force: true } : {}) }))
+            .rejects.toThrow(route === 'forced' ? new RegExp(`is busy \\(${f.jobId}-sibling: working\\)`, 'u') : /is busy/u);
+          expect(landed).toBe(true);
+        } else {
+          await expect(wave.requestReview({ jobId: f.jobId })).rejects.toThrow(/automatic retry 1 of 1 is scheduled/u);
+          rmSync(f.flag);
+          writeFileSync(f.slow, '');
+          armed = true;
+          await until(() => settled(f.ledger, f.jobId).length === 1);
+          expect(landed).toBe(true);
+          expect(settled(f.ledger, f.jobId)[0]).toMatchObject({ outcome: 'skipped', reason: expect.stringContaining('the branch is busy again') });
+          expect(informs.at(-1)).toContain('skipped');
+        }
+      } finally {
+        f.restorePath();
+        await wave.shutdown();
+      }
+      const rounds = f.ledger.listRounds(f.jobId);
+      expect(rounds.every((round) => round.status === 'aborted'), route).toBe(true);
+      expect(f.ledger.listAgents().filter((agent) => agent.roundId !== null), route).toEqual([]);
+      const refused = kinds(f.ledger, f.jobId, 'branch-idle.refused').at(-1);
+      expect(refused?.roundId, route).toBe(rounds.at(-1)!.id);
+      expect(escalations, route).toEqual([]);
+    }
+  });
+
+  it('a forced review authorizes only the work present at its arm: the same job\'s NEXT repair — landing during setup or during the probe — is refused busy, not waved through as already audited (#267)', async () => {
+    for (const phase of ['setup', 'probe'] as const) {
+      const f = await transientFixture(`force-generation-${phase}`);
+      const escalations: string[] = [];
+      // Repair A is open at the arm: the lane is busy and the force audits it.
+      f.ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId: f.jobId, payload: { request_id: 'repair-a' } });
+      // A delivers and a NEW repair B starts on the same job.
+      const replaceGeneration = (): void => {
+        settleLane(f.ledger, f.jobId);
+        f.ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId: f.jobId, payload: { request_id: 'repair-b' } });
+      };
+      const wave = new WaveRunner({
+        ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts,
+        prHeadProbe: localHeadProbe(f.branch), admissionRetryDelaysMs: [100],
+        ...(phase === 'setup' ? { reviewPreflight: async () => { replaceGeneration(); return { ok: true as const, failures: [] }; } } : {}),
+        reviewFreezeObserver: () => { if (phase === 'probe') setTimeout(replaceGeneration, 300); },
+        escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      });
+      try {
+        rmSync(f.flag);
+        writeFileSync(f.slow, '');
+        await expect(wave.requestReview({ jobId: f.jobId, force: true }), phase).rejects.toThrow(/is busy/u);
+      } finally {
+        f.restorePath();
+        await wave.shutdown();
+      }
+      const rounds = f.ledger.listRounds(f.jobId);
+      expect(rounds.every((round) => round.status === 'aborted'), phase).toBe(true);
+      expect(f.ledger.listAgents().filter((agent) => agent.roundId !== null), phase).toEqual([]);
+      expect(kinds(f.ledger, f.jobId, 'branch-idle.refused').at(-1)?.roundId, phase).toBe(rounds.at(-1)!.id);
+      expect(escalations, phase).toEqual([]);
+    }
+  });
+
+  it('a retry that comes due while a fresh request is still in preflight is skipped with one FYI — never a second parallel request (#268)', async () => {
+    const f = await transientFixture('due-in-preflight');
+    const informs: string[] = [];
+    const escalations: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let calls = 0;
+    let gatedStarted = false;
+    const wave = new WaveRunner({
+      ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts,
+      prHeadProbe: localHeadProbe(f.branch), admissionRetryDelaysMs: [100],
+      reviewPreflight: async () => {
+        calls += 1;
+        if (calls === 2) { gatedStarted = true; await gate; }
+        return { ok: true as const, failures: [] };
+      },
+      inform: (title, detail) => informs.push(`${title}: ${detail}`),
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    try {
+      await expect(wave.requestReview({ jobId: f.jobId })).rejects.toThrow(/automatic retry 1 of 1 is scheduled/u);
+      // A fresh ordinary request sits in preflight (in neither roundAdmission nor handoffs).
+      const fresh = wave.requestReview({ jobId: f.jobId });
+      const freshOutcome = fresh.then(() => 'admitted', (error: unknown) => String(error));
+      await until(() => gatedStarted);
+      await until(() => informs.some((line) => line.includes('skipped')));
+      release();
+      expect(await freshOutcome).toMatch(/automatic retry 1 of 1 is scheduled/u); // not RoundAdmissionInProgress
+      expect(informs.filter((line) => line.includes('skipped'))).toHaveLength(1);
+      expect(informs.find((line) => line.includes('skipped'))).toContain('another review request for the job is under way');
+      expect(calls).toBe(2); // the retry never reached preflight
+      expect(f.ledger.listRounds(f.jobId)).toHaveLength(2);
+      expect(escalations).toEqual([]);
+    } finally {
+      release();
+      f.restorePath();
+      await wave.shutdown();
+    }
+  });
+
+  it('a fresh request refused while a retry waits keeps it — same attempt and due time — so neither the retry nor the final escalation is lost (R7-11)', async () => {
+    const { ledger, bus, port, jobId, sessions, artifacts, branch, restorePath } = await transientFixture('takeover');
+    const escalations: string[] = [];
+    const unsubscribers: (() => void)[] = [];
+    const retrySettlement = (attempt: number): Promise<void> => new Promise((resolve) => {
+      const unsubscribe = bus.subscribe((event) => {
+        if (event.jobId === jobId && event.kind === 'round.admission-retry-settled'
+          && (event.payload as { attempt: number }).attempt === attempt) {
+          unsubscribe();
+          resolve();
+        }
+      });
+      unsubscribers.push(unsubscribe);
+    });
+    const dueDuringSetup: Promise<void>[] = [];
+    const wave: WaveRunner = new WaveRunner({
+      ledger, worktrees: port, spawner: makeSpawner(sessions, []), reviewArtifactRoot: artifacts,
+      prHeadProbe: localHeadProbe(branch), admissionRetryDelaysMs: [0, 600],
+      reviewFreezeObserver: () => {
+        if (ledger.listRounds(jobId).length !== 3) return;
+        // Fire the exact waiting retry while this fresh setup owns admission,
+        // without relying on OS probe speed relative to a 600 ms timer.
+        const seam = wave as unknown as { admissionRetries: Map<string, { attempt: number; timer: NodeJS.Timeout | null }>;
+          fireAdmissionRetry(retry: unknown): Promise<void> };
+        const waiting = seam.admissionRetries.get(jobId)!;
+        expect(waiting.attempt).toBe(2);
+        if (waiting.timer !== null) clearTimeout(waiting.timer);
+        dueDuringSetup.push(seam.fireAdmissionRetry(waiting));
+      },
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    // This case is specifically a fresh refusal BEFORE the pending retry is due.
+    // Real Git/rollback work can exceed 600 ms under suite load; control only the
+    // clock/timers, leaving subprocess I/O real. The following R9-8 case covers
+    // the distinct due-during-rollback transition with an explicit release gate.
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    try {
+      await expect(wave.requestReview({ jobId })).rejects.toThrow(/automatic retry 1 of 2 is scheduled/u);
+      // Let retry 1 and its real Git rollback finish without advancing retry 2's clock.
+      const firstSettled = retrySettlement(1);
+      await vi.advanceTimersByTimeAsync(0);
+      await firstSettled;
+      expect(kinds(ledger, jobId, 'round.admission-retry-scheduled')).toHaveLength(2);
+      const waiting = kinds(ledger, jobId, 'round.admission-retry-scheduled')[1]!;
+      expect(waiting.payload).toMatchObject({ attempt: 2 });
+      expect(Date.now()).toBeLessThan(Date.parse((waiting.payload as { dueAt: string }).dueAt));
+      // A fresh request refused meanwhile keeps THAT retry — attempt 2, same due time.
+      await expect(wave.requestReview({ jobId })).rejects.toThrow(/automatic retry 2 of 2 is scheduled/u);
+      await Promise.all(dueDuringSetup);
+      expect(dueDuringSetup).toHaveLength(1);
+      const taken = kinds(ledger, jobId, 'round.admission-retry-scheduled')[2]!;
+      expect(taken.roundId).toBe(ledger.listRounds(jobId)[2]!.id);
+      expect(taken.payload).toMatchObject({ attempt: 2, dueAt: (waiting.payload as { dueAt: string }).dueAt });
+      const finalSettled = retrySettlement(2);
+      await vi.advanceTimersByTimeAsync(600);
+      await finalSettled;
+      expect(escalations).toHaveLength(1);
+    } finally {
+      for (const unsubscribe of unsubscribers) unsubscribe();
+      restorePath();
+      try { await wave.shutdown(); }
+      finally { vi.useRealTimers(); }
+    }
+    expect(ledger.listRounds(jobId)).toHaveLength(4); // request, retry 1, fresh request, retry 2
+    expect(escalations[0]).toContain('automatic retry 2 of 2 was refused too — no retries remain');
+  });
+
+  it('a waiting retry that comes due while a fresh refusal is still rolling back is kept, and runs once the rollback ends (R9-8)', async () => {
+    const { ledger, port, jobId, sessions, artifacts, branch, restorePath } = await transientFixture('rebind-rollback');
+    const gated = new GatedReleasePort(port);
+    const escalations: string[] = [];
+    const informs: string[] = [];
+    const delay = 3_000;
+    const wave = new WaveRunner({
+      ledger, worktrees: gated, spawner: makeSpawner(sessions, []), reviewArtifactRoot: artifacts,
+      prHeadProbe: localHeadProbe(branch), admissionRetryDelaysMs: [delay],
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      inform: (title, detail) => informs.push(`${title}: ${detail}`),
+    });
+    try {
+      await expect(wave.requestReview({ jobId })).rejects.toThrow(/automatic retry 1 of 1 is scheduled/u);
+      const dueAt = Date.parse((payloads(ledger, jobId, 'round.admission-retry-scheduled')[0] as { dueAt: string }).dueAt);
+      // A fresh request is refused while the retry waits; its rollback is held.
+      gated.hold = true;
+      const fresh = wave.requestReview({ jobId });
+      fresh.catch(() => undefined);
+      await until(() => gated.entered === 1, delay);
+      expect(Date.now(), 'the fresh refusal must reach its rollback before the retry is due').toBeLessThan(dueAt);
+      expect(kinds(ledger, jobId, 'round.admission-retry-scheduled')).toHaveLength(2); // the fresh refusal took the retry over
+      // The retry comes due while the rollback is still held.
+      await until(() => Date.now() > dueAt + 300, delay + 2_000);
+      expect(settled(ledger, jobId)).toEqual([]);
+      gated.open();
+      await expect(fresh).rejects.toThrow(/automatic retry 1 of 1 is scheduled/u);
+      // Armed after the rollback (already due): it runs — and, the remote still down, is refused for the last time.
+      await until(() => escalations.length === 1);
+    } finally {
+      gated.open();
+      restorePath();
+      await wave.shutdown();
+    }
+    expect(informs.filter((line) => line.includes('skipped'))).toEqual([]);
+    expect(settled(ledger, jobId)).toEqual([expect.objectContaining({ attempt: 1, outcome: 'refused' })]);
+    expect(ledger.listRounds(jobId)).toHaveLength(3); // request, fresh request, the retry
+    expect(escalations[0]).toContain('automatic retry 1 of 1 was refused too — no retries remain');
+  }, 60_000);
+
+  it('a retry binds the delivery its round reviewed, never one that landed during the probe (R7-14)', async () => {
+    const { ledger, port, jobId, sessions, artifacts, branch, restorePath } = await transientFixture('probe-delivery', { probeDelaySeconds: 0.4 });
+    const informs: string[] = [];
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: makeSpawner(sessions, []), reviewArtifactRoot: artifacts,
+      prHeadProbe: localHeadProbe(branch), admissionRetryDelaysMs: [50],
+      inform: (title, detail) => informs.push(`${title}: ${detail}`),
+    });
+    const reviewed = ledger.latestJobEvent(jobId, 'job.delivered')!.seq;
+    try {
+      const request = wave.requestReview({ jobId });
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: 'landed-during-probe' } });
+      await expect(request).rejects.toThrow(/automatic retry 1 of 1 is scheduled/u);
+      expect(payloads(ledger, jobId, 'round.admission-retry-scheduled')[0]).toMatchObject({ deliverySeq: reviewed });
+      await until(() => informs.some((line) => line.includes('a newer delivery replaced the refused one')));
+    } finally {
+      restorePath();
+      await wave.shutdown();
+    }
+  });
+
+  it('a minion handoff refused transiently is notified once (FYI), and its retries run after the handoff settles (R7-15, R7-16)', async () => {
+    const f = await transientFixture('handoff');
+    const informs: string[] = [];
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts, bus: f.bus,
+      prHeadProbe: localHeadProbe(f.branch), admissionRetryDelaysMs: [0, 0],
+      inform: (title, detail) => informs.push(`${title}: ${detail}`),
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    try {
+      // The minion is still in its turn: the lane is busy, so the request queues.
+      f.ledger.setJobStatus(f.jobId, 'blocked');
+      f.ledger.setJobStatus(f.jobId, 'working');
+      expect((await wave.requestReview({ jobId: f.jobId, handoff: true })).route).toBe('queued');
+      f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: f.jobId, payload: { sha: f.target } });
+      await until(() => escalations.length === 1 && settled(f.ledger, f.jobId).length === 2);
+    } finally {
+      f.restorePath();
+      await wave.shutdown();
+    }
+    expect(f.ledger.latestJobEvent(f.jobId, 'job.review-handoff-failed')).not.toBeNull();
+    expect(escalations[0]).toContain('no retries remain'); // the only action-required notice
+    expect(escalations.some((line) => line.includes('Queued review handoff failed'))).toBe(false);
+    expect(settled(f.ledger, f.jobId).map((entry) => entry['outcome'])).toEqual(['refused', 'refused']);
+    expect(f.ledger.listRounds(f.jobId)).toHaveLength(3);
+  });
+
+  it('a shutdown in the middle of a retry starts nothing — no fallback gate — and the next start escalates it instead of resuming (R7-12, R7-17)', async () => {
+    const f = await transientFixture('interrupted');
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let entered = false;
+    let calls = 0;
+    const escalations: string[] = [];
+    const options = {
+      ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts,
+      prHeadProbe: localHeadProbe(f.branch), admissionRetryDelaysMs: [50],
+      escalate: (title: string, detail: string) => escalations.push(`${title}: ${detail}`),
+    };
+    const first = new WaveRunner({
+      ...options,
+      reviewPreflight: async () => {
+        calls += 1;
+        if (calls === 1) return { ok: true as const, failures: [] };
+        entered = true;
+        await held; // the retry's pre-flight is in flight when the service stops
+        return { ok: false as const, failures: [preflightFailure('review-policy', 'disabled')] };
+      },
+    });
+    await expect(first.requestReview({ jobId: f.jobId })).rejects.toThrow(/automatic retry 1 of 1/u);
+    await until(() => entered);
+    const stopping = first.shutdown();
+    release();
+    await stopping;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(f.ledger.listJobEventsByKinds(f.jobId, ['job.fallback-review'], { limit: 10 })).toEqual([]);
+    expect(settled(f.ledger, f.jobId)).toEqual([]);
+    // Restart: nothing resumes the retry — it escalates, once.
+    rmSync(f.flag);
+    const second = new WaveRunner(options);
+    try {
+      expect(second.escalateInterruptedAdmissionRetries()).toBe(1);
+      expect(second.escalateInterruptedAdmissionRetries()).toBe(0);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    } finally {
+      f.restorePath();
+      await second.shutdown();
+    }
+    expect(escalations).toEqual([expect.stringMatching(new RegExp(`^Automatic review retry for job ${f.jobId} was interrupted by a restart: Retry 1 after refused round ${f.ledger.listRounds(f.jobId)[0]!.id} was due at`, 'u'))]);
+    expect(settled(f.ledger, f.jobId)).toEqual([expect.objectContaining({ attempt: 1, outcome: 'interrupted' })]);
+    expect(f.ledger.listRounds(f.jobId)).toHaveLength(1); // never re-run
+  });
+
+  it('a retry refused while the service stops is settled as refused — the next start does not escalate it again', async () => {
+    const f = await transientFixture('refused-at-shutdown');
+    const escalations: string[] = [];
+    const options = {
+      ledger: f.ledger, worktrees: new SlowReleasePort(f.port, 400), spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts,
+      prHeadProbe: localHeadProbe(f.branch), admissionRetryDelaysMs: [0],
+      escalate: (title: string, detail: string) => escalations.push(`${title}: ${detail}`),
+    };
+    const first = new WaveRunner(options);
+    try {
+      await expect(first.requestReview({ jobId: f.jobId })).rejects.toThrow(/automatic retry 1 of 1/u);
+      await until(() => escalations.length === 1); // the retry's final refusal, its setup still unwinding
+      await first.shutdown();
+      await until(() => settled(f.ledger, f.jobId).length === 1);
+      expect(settled(f.ledger, f.jobId)[0]).toMatchObject({ outcome: 'refused' });
+      const second = new WaveRunner(options);
+      expect(second.escalateInterruptedAdmissionRetries()).toBe(0);
+      await second.shutdown();
+    } finally {
+      f.restorePath();
+    }
+    expect(escalations).toHaveLength(1);
+  });
+
+  it('startup escalates only a retry that was really interrupted: never a settled one, a terminal job’s, or one a newer round already answers', async () => {
+    const f = await transientFixture('startup-check');
+    const escalations: string[] = [];
+    const wave = new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), escalate: (title) => escalations.push(title) });
+    const schedule = (roundId: string) => f.ledger.appendCustomEvent({ kind: 'round.admission-retry-scheduled', jobId: f.jobId, roundId,
+      payload: { attempt: 1, of: 2, dueAt: new Date().toISOString(), deliverySeq: 0 } });
+    try {
+      const refused = f.ledger.addRound({ jobId: f.jobId, lenses: [...PERKINS_LENSES], targetRef: f.target });
+      const first = schedule(refused.id);
+      f.ledger.appendCustomEvent({ kind: 'round.admission-retry-settled', jobId: f.jobId, roundId: refused.id,
+        payload: { attempt: 1, scheduledSeq: first.seq, outcome: 'ran' } });
+      expect(wave.escalateInterruptedAdmissionRetries()).toBe(0); // settled
+      schedule(refused.id);
+      f.ledger.addRound({ jobId: f.jobId, lenses: [...PERKINS_LENSES], targetRef: f.target });
+      expect(wave.escalateInterruptedAdmissionRetries()).toBe(0); // a newer round answers it
+      expect(settled(f.ledger, f.jobId).at(-1)).toMatchObject({ outcome: 'interrupted' });
+      const latest = f.ledger.listRounds(f.jobId).at(-1)!;
+      schedule(latest.id);
+      f.ledger.setJobStatus(f.jobId, 'done');
+      expect(wave.escalateInterruptedAdmissionRetries()).toBe(0); // terminal
+      expect(escalations).toEqual([]);
+    } finally {
+      f.restorePath();
+      await wave.shutdown();
+    }
+  });
+
+  it('production waits: one minute, then five — never earlier; an unsupported delay is refused up front (R8-19, R7-18)', async () => {
+    const f = await transientFixture('default-delays');
+    expect(() => new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), admissionRetryDelaysMs: [2_147_483_648] }))
+      .toThrow(/admissionRetryDelaysMs must be whole milliseconds from 0 to 2147483647/u);
+    const timers = vi.spyOn(globalThis, 'setTimeout');
+    const wave = new WaveRunner({
+      ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts, prHeadProbe: localHeadProbe(f.branch),
+    });
+    /** The retry timer armed since `from`: its callback and delay. */
+    const armed = (from: number): { readonly fire: () => void; readonly ms: number } => {
+      const calls = timers.mock.calls.slice(from).filter(([, ms]) => typeof ms === 'number' && ms > 30_000);
+      expect(calls).toHaveLength(1);
+      return { fire: calls[0]![0] as () => void, ms: calls[0]![1] as number };
+    };
+    try {
+      // Freeze Date only: real Git/rollback latency must not be included
+      // in the production retry delay. Timers and async polling stay real.
+      vi.setSystemTime(Date.now());
+      expect(vi.isFakeTimers()).toBe(false);
+      let mark = timers.mock.calls.length;
+      let refusedAt = Date.now();
+      await expect(wave.requestReview({ jobId: f.jobId })).rejects.toThrow(/automatic retry 1 of 2 is scheduled/u);
+      const first = armed(mark);
+      expect(first.ms).toBe(60_000);
+      const due1 = Date.parse((payloads(f.ledger, f.jobId, 'round.admission-retry-scheduled')[0] as { dueAt: string }).dueAt);
+      expect(due1 - refusedAt).toBe(60_000);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(f.ledger.listRounds(f.jobId)).toHaveLength(1); // no early dispatch
+      // The minute is up: fire it (standing in for the clock).
+      mark = timers.mock.calls.length;
+      vi.setSystemTime(due1);
+      refusedAt = Date.now();
+      first.fire();
+      await until(() => kinds(f.ledger, f.jobId, 'round.admission-retry-scheduled').length === 2);
+      await until(() => timers.mock.calls.slice(mark).some(([, ms]) => typeof ms === 'number' && ms > 30_000));
+      const second = armed(mark);
+      expect(second.ms).toBe(300_000);
+      const due2 = Date.parse((payloads(f.ledger, f.jobId, 'round.admission-retry-scheduled')[1] as { dueAt: string }).dueAt);
+      expect(due2 - refusedAt).toBe(300_000);
+      expect(f.ledger.listRounds(f.jobId)).toHaveLength(2);
+    } finally {
+      timers.mockRestore();
+      vi.useRealTimers();
+      f.restorePath();
+      await wave.shutdown();
+    }
+  });
+
+  it('default delays on a controlled clock: dueAt is exactly T+60,000 then T2+300,000, the armed delays are exact, nothing dispatches at dueAt-1 and one request dispatches at dueAt (R9-15)', async () => {
+    const f = await transientFixture('controlled-clock');
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    /** The controlled clock's scheduler: long (retry-sized) timers are held
+     * here with the delay they were armed with and fire only when the test
+     * advances the clock; everything else runs on real timers. */
+    const held: Array<{ readonly handle: object; readonly dueAt: number; readonly delay: number; readonly fn: () => void }> = [];
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: () => void, ms?: number, ...args: unknown[]) => {
+      if (typeof ms !== 'number' || ms <= 30_000) return (realSetTimeout as (...all: unknown[]) => NodeJS.Timeout)(fn, ms, ...args);
+      const handle = { unref: () => handle, ref: () => handle, hasRef: () => false, refresh: () => handle };
+      held.push({ handle, dueAt: Date.now() + ms, delay: ms, fn });
+      return handle as unknown as NodeJS.Timeout;
+    }) as unknown as typeof setTimeout);
+    const clearTimeoutSpy = vi.spyOn(globalThis, 'clearTimeout').mockImplementation(((handle?: Parameters<typeof clearTimeout>[0]) => {
+      const index = held.findIndex((entry) => entry.handle === (handle as unknown));
+      if (index >= 0) held.splice(index, 1);
+      else realClearTimeout(handle);
+    }) as typeof clearTimeout);
+    const wave = new WaveRunner({
+      ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts,
+      prHeadProbe: localHeadProbe(f.branch), // default options: the production delays
+    });
+    const requests = vi.spyOn(wave, 'requestReview');
+    /** Move the clock to `at`, firing every held timer that is due by then. */
+    const advanceTo = (at: number): void => {
+      vi.setSystemTime(at);
+      for (const entry of held.filter((candidate) => candidate.dueAt <= at)) {
+        held.splice(held.indexOf(entry), 1);
+        entry.fn();
+      }
+    };
+    const scheduled = (): Array<{ dueAt: string; attempt: number }> =>
+      payloads(f.ledger, f.jobId, 'round.admission-retry-scheduled') as Array<{ dueAt: string; attempt: number }>;
+    try {
+      const T = 1_900_000_000_000;
+      vi.setSystemTime(T);
+      await expect(wave.requestReview({ jobId: f.jobId })).rejects.toThrow(/automatic retry 1 of 2 is scheduled/u);
+      expect(requests).toHaveBeenCalledTimes(1);
+      expect(scheduled()).toHaveLength(1);
+      const due1 = Date.parse(scheduled()[0]!.dueAt);
+      expect(due1).toBe(T + 60_000);
+      expect(held.map((entry) => ({ delay: entry.delay, dueAt: entry.dueAt }))).toEqual([{ delay: 60_000, dueAt: T + 60_000 }]);
+
+      advanceTo(due1 - 1);
+      await new Promise((resolve) => realSetTimeout(resolve, 200));
+      expect(requests).toHaveBeenCalledTimes(1);
+      expect(f.ledger.listRounds(f.jobId)).toHaveLength(1);
+
+      advanceTo(due1);
+      await vi.waitFor(() => expect(scheduled()).toHaveLength(2), { timeout: 30_000, interval: 20 });
+      expect(requests).toHaveBeenCalledTimes(2); // exactly ONE request dispatched at dueAt
+      const due2 = Date.parse(scheduled()[1]!.dueAt);
+      expect(due2).toBe(due1 + 300_000); // T2 is the retry's own refusal time, the frozen due1
+      await vi.waitFor(() => expect(held.length).toBe(1), { timeout: 30_000, interval: 20 });
+      expect(held.map((entry) => ({ delay: entry.delay, dueAt: entry.dueAt }))).toEqual([{ delay: 300_000, dueAt: due1 + 300_000 }]);
+
+      advanceTo(due2 - 1);
+      await new Promise((resolve) => realSetTimeout(resolve, 200));
+      expect(requests).toHaveBeenCalledTimes(2);
+      expect(f.ledger.listRounds(f.jobId)).toHaveLength(2);
+
+      advanceTo(due2);
+      await vi.waitFor(() => expect(settled(f.ledger, f.jobId).map((entry) => entry['outcome'])).toEqual(['refused', 'refused']), { timeout: 30_000, interval: 20 });
+      expect(requests).toHaveBeenCalledTimes(3);
+      expect(held).toHaveLength(0); // no third retry exists: the last refusal escalated
+    } finally {
+      setTimeoutSpy.mockRestore();
+      clearTimeoutSpy.mockRestore();
+      vi.useRealTimers();
+      f.restorePath();
+      await wave.shutdown();
+    }
+  }, 120_000);
+
+  it('a clean-abort re-arm keeps its delivered-head fence through the retry (R7-23)', async () => {
+    const f = await transientFixture('bound-head');
+    const wave = new WaveRunner({
+      ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts,
+      prHeadProbe: localHeadProbe(f.branch), admissionRetryDelaysMs: [30],
+    });
+    const seen = vi.spyOn(wave, 'requestReview');
+    f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: f.jobId, payload: { sha: f.target } }); // the head the re-arm proved
+    try {
+      const targetRef = `origin/${f.branch}`; // the tracking branch the re-arm names
+      await expect(wave.requestReview({ jobId: f.jobId, targetRef, boundDeliveredSha: f.target })).rejects.toThrow(/automatic retry 1 of 1/u);
+      await until(() => settled(f.ledger, f.jobId).length === 1);
+      expect(seen.mock.calls[1]![0]).toMatchObject({ targetRef, boundDeliveredSha: f.target, admissionRetry: expect.any(Object) });
+    } finally {
+      f.restorePath();
+      await wave.shutdown();
+    }
+  });
+
+  it('a retry re-submits the request exactly — private evidence bytes, scope, delivered-head fence — and never its force (R7-21, R8-21)', async () => {
+    const f = await transientFixture('evidence');
+    const uploads = mkdtempSync(join(tmpdir(), 'retry-evidence-uploads-'));
+    dirs.push(uploads);
+    const uploadPath = join(uploads, '1791057000000-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-reference.png');
+    const pixels = minimalPng(Buffer.from('retry-evidence-pixels'));
+    writeFileSync(uploadPath, pixels);
+    const fake = fakeWholeSpawner(f.sessions, { images: true, childAnswer: () => '[]' });
+    const wave = new WaveRunner({
+      ledger: f.ledger, worktrees: f.port, spawner: fake.spawner, reviewArtifactRoot: f.artifacts, evidenceUploadsDir: uploads,
+      prHeadProbe: localHeadProbe(f.branch), admissionRetryDelaysMs: [100],
+    });
+    const seen = vi.spyOn(wave, 'requestReview');
+    const evidence = [{ uploadPath, purpose: 'owner reference for the retried review', consentRef: 'owner approval j-1001' }];
+    const targetRef = `origin/${f.branch}`;
+    try {
+      // A forced arm: its force covers only the blockers present at ITS arm.
+      await expect(wave.requestReview({ jobId: f.jobId, targetRef, evidence, force: true })).rejects.toThrow(/automatic retry 1 of 1/u);
+      rmSync(f.flag); // the remote answers before the retry is due
+      await until(() => settled(f.ledger, f.jobId).length === 1, 60_000);
+      const outcome = settled(f.ledger, f.jobId)[0]!;
+      expect(outcome).toMatchObject({ outcome: 'ran', route: 'perkins' });
+      const retried = seen.mock.calls[1]![0];
+      expect(retried).not.toHaveProperty('force');
+      expect(retried).toMatchObject({ jobId: f.jobId, targetRef, evidence });
+      const roundId = String(outcome['ranRoundId']);
+      const manifest = JSON.parse(readFileSync(join(f.artifacts, roundId, 'manifest.json'), 'utf8')) as {
+        branchIdle?: unknown;
+        reviewEvidence: { attachments: Array<{ purpose: string; consentRef: string; sha256: string }> };
+      };
+      expect(manifest.branchIdle).toBeUndefined(); // not forced
+      expect(manifest.reviewEvidence.attachments).toEqual([expect.objectContaining({
+        purpose: 'owner reference for the retried review', consentRef: 'owner approval j-1001',
+        sha256: createHash('sha256').update(pixels).digest('hex'),
+      })]);
+      await until(() => fake.leadCalls.length > 0, 10_000);
+      expect(fake.leadCalls[0]!.images).toHaveLength(1);
+      expect(createHash('sha256').update(Buffer.from(fake.leadCalls[0]!.images![0]!.data, 'base64')).digest('hex'))
+        .toBe(createHash('sha256').update(pixels).digest('hex')); // the bytes the lead received
+    } finally {
+      f.restorePath();
+      await wave.shutdown();
+    }
+  });
+
+  it('a retry re-submits noSpec with its canonical catalog and genuine claimed priors, which still reach mandatory re-verification (R9-16)', async () => {
+    const f = await transientFixture('identity-matrix');
+    const noSpecCatalog = ['blind', 'edge', 'security', 'architecture', 'codebase', 'tests', 'performance', 'operations'];
+    const receiptPoster = {
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
+        reviewId: '9003', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+        headSha: call.targetSha, baseSha: 'b'.repeat(40),
+        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+      })),
+    };
+    const options = (spawner: ReturnType<typeof fakeWholeSpawner>['spawner']): ConstructorParameters<typeof WaveRunner>[0] => ({
+      ledger: f.ledger, worktrees: f.port, spawner, reviewArtifactRoot: f.artifacts,
+      prHeadProbe: localHeadProbe(f.branch), admissionRetryDelaysMs: [100], reconcileReviewAgent: async () => true,
+      poster: receiptPoster,
+    });
+    // Round 1 (whole, remote up): one blocker on a file the next delta never touches.
+    rmSync(f.flag);
+    const first = fakeWholeSpawner(f.sessions, { childAnswer: () => '[]', specialists: [], leadFinding: groundedFinding('lead', 'blocker', { location: 'src/main.ts:1', title: 'prior blocker' }) });
+    const firstWave = new WaveRunner(options(first.spawner));
+    await firstWave.runRound({ jobId: f.jobId });
+    await firstWave.shutdown();
+    expect(f.ledger.listRounds(f.jobId)).toHaveLength(1);
+    f.repo.commitFile('src/other.ts', 'export const other = 1;\n');
+    f.repo.git(['push', '--quiet', 'origin', `refs/heads/${f.branch}`]);
+
+    const second = fakeWholeSpawner(f.sessions, { childAnswer: () => '[]', specialists: [] });
+    const wave = new WaveRunner(options(second.spawner));
+    const seen = vi.spyOn(wave, 'requestReview');
+    const request = { jobId: f.jobId, noSpec: true, lenses: noSpecCatalog, claimedFixedPriors: [0] };
+    try {
+      writeFileSync(f.flag, ''); // the remote is down for the first attempt only
+      await expect(wave.requestReview(request)).rejects.toThrow(/automatic retry 1 of 1/u);
+      rmSync(f.flag);
+      await until(() => settled(f.ledger, f.jobId).length === 1, 60_000);
+      const outcome = settled(f.ledger, f.jobId)[0]!;
+      expect(outcome).toMatchObject({ outcome: 'ran', route: 'perkins' });
+      // The retry carried every field of the refused request, verbatim.
+      expect(seen.mock.calls).toHaveLength(2);
+      expect(seen.mock.calls[1]![0]).toMatchObject(request);
+      expect(seen.mock.calls[1]![0]).not.toHaveProperty('force');
+      const roundId = String(outcome['ranRoundId']);
+      const ranRound = f.ledger.listRounds(f.jobId).find((round) => round.id === roundId)!;
+      expect(ranRound.seq).toBe(3); // round 2 was the refused admission
+      // noSpec reached the round: its own chips are the no-spec catalog, no acceptance.
+      expect(ranRound.lenses.map((chip) => chip.lens)).toEqual(noSpecCatalog);
+      // The claim reached the delta round: prior 0 sits in an UNTOUCHED file with
+      // unchanged evidence, so without the claim it would have been host-carried.
+      await until(() => second.leadCalls.length > 0, 30_000);
+      await until(() => existsSync(join(f.artifacts, roundId, 'consolidated.json')), 30_000);
+      const consolidated = JSON.parse(readFileSync(join(f.artifacts, roundId, 'consolidated.json'), 'utf8')) as {
+        convergence: { reviewScope: string; carriedPriors?: number[]; reverifyPriors?: number[] };
+      };
+      expect(consolidated.convergence).toMatchObject({ reviewScope: 'delta', reverifyPriors: [0] });
+      expect(consolidated.convergence.carriedPriors).toBeUndefined();
+    } finally {
+      f.restorePath();
+      await wave.shutdown();
+    }
+  }, 120_000);
+
+  it('a git group that would not stop refuses its round, escalates ONCE naming the group, is never retried — and quarantines nothing (owner decision 2026-10-08, R8-25)', async () => {
+    const f = await transientFixture('stuck-git');
+    let stuckGroup: number | null = null;
+    const escalations: string[] = [];
+    const informs: string[] = [];
+    const stuck = (pgid: number): boolean => pgid === stuckGroup;
+    const realSync = OWNED_GIT_SEAMS.groupHasLiveMember;
+    const realAsync = OWNED_GIT_SEAMS.groupHasLiveMemberAsync;
+    const sync = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMember').mockImplementation((pgid, budget) => stuck(pgid) || realSync(pgid, budget));
+    const async = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMemberAsync').mockImplementation(async (pgid, budget) => {
+      // Fault exactly one real OWNED runner at the actual observation seam.
+      // A deadline may kill its git child before a shell marker ever runs;
+      // child startup/marker timing must not decide group cessation proof.
+      stuckGroup ??= pgid;
+      return stuck(pgid) || realAsync(pgid, budget);
+    });
+    const wave = new WaveRunner({
+      ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts, bus: f.bus,
+      prHeadProbe: localHeadProbe(f.branch), admissionRetryDelaysMs: [0, 0],
+      escalate: (title: string, detail: string) => escalations.push(`${title}: ${detail}`),
+      inform: (title: string, detail: string) => informs.push(`${title}: ${detail}`),
+    });
+    try {
+      // Through a queued minion handoff: its wrapper must not alert a second time.
+      f.ledger.setJobStatus(f.jobId, 'blocked');
+      f.ledger.setJobStatus(f.jobId, 'working');
+      expect((await wave.requestReview({ jobId: f.jobId, handoff: true })).route).toBe('queued');
+      f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: f.jobId, payload: { sha: f.target } });
+      await until(() => f.ledger.latestJobEvent(f.jobId, 'job.review-handoff-failed') !== null, 60_000);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(escalations).toHaveLength(1);
+      expect(escalations[0]).toMatch(/refused admission before any specialist started: .*cleanup unconfirmed: process group \d+ still running/u);
+      expect(stuckGroup).toBeGreaterThan(0);
+      expect(escalations[0]).toContain(`process group ${stuckGroup} still running`);
+      expect(informs).toEqual([]);
+      expect(kinds(f.ledger, f.jobId, 'round.admission-retry-scheduled')).toEqual([]); // never a retry
+      // No quarantine: once the remote answers, the next request is admitted.
+      sync.mockRestore();
+      async.mockRestore();
+      rmSync(f.flag);
+      const admitted = await wave.requestReview({ jobId: f.jobId });
+      expect(admitted.route).toBe('perkins');
+    } finally {
+      sync.mockRestore();
+      async.mockRestore();
+      f.restorePath();
+      await wave.shutdown();
+    }
+  }, 120_000);
+
+  it('a stuck-git refusal whose rollback sweep pauses on live processes still raises ONE action-required alert — through a queued handoff (#269)', async () => {
+    const stuckFile = join(mkdtempSync(join(tmpdir(), 'perkins-retry-stuck-')), 'groups');
+    dirs.push(dirname(stuckFile));
+    const f = await transientFixture('stuck-paused-handoff', { stuckFile });
+    const escalations: string[] = [];
+    const stuck = (pgid: number): boolean => existsSync(stuckFile) && readFileSync(stuckFile, 'utf8').split('\n').includes(String(pgid));
+    const realSync = OWNED_GIT_SEAMS.groupHasLiveMember;
+    const realAsync = OWNED_GIT_SEAMS.groupHasLiveMemberAsync;
+    const sync = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMember').mockImplementation((pgid, budget) => stuck(pgid) || realSync(pgid, budget));
+    const async = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMemberAsync').mockImplementation(async (pgid, budget) => stuck(pgid) || realAsync(pgid, budget));
+    // The surviving git is rooted in the review worktree: its release pauses.
+    const realRelease = f.port.release.bind(f.port);
+    const release = vi.spyOn(f.port, 'release').mockImplementation(async (input) => {
+      await realRelease(input);
+      return { status: 'paused' as const, processes: [{ pid: 4242, command: 'git ls-remote origin', evidence: 'cwd in review tree' }], preserved: null, note: 'live git' };
+    });
+    const wave = new WaveRunner({
+      ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts, bus: f.bus,
+      prHeadProbe: localHeadProbe(f.branch), admissionRetryDelaysMs: [0, 0],
+      escalate: (title: string, detail: string) => escalations.push(`${title}: ${detail}`),
+    });
+    try {
+      f.ledger.setJobStatus(f.jobId, 'blocked');
+      f.ledger.setJobStatus(f.jobId, 'working');
+      expect((await wave.requestReview({ jobId: f.jobId, handoff: true })).route).toBe('queued');
+      f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: f.jobId, payload: { sha: f.target } });
+      await until(() => f.ledger.latestJobEvent(f.jobId, 'job.review-handoff-failed') !== null, 60_000);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(release).toHaveBeenCalled(); // the safety sweep still ran
+      expect(escalations).toHaveLength(1);
+      expect(escalations[0]).toMatch(/refused admission before any specialist started: .*cleanup unconfirmed: process group \d+ still running/u);
+    } finally {
+      sync.mockRestore();
+      async.mockRestore();
+      release.mockRestore();
+      f.restorePath();
+      await wave.shutdown();
+    }
+  }, 120_000);
+
+  it('an UNRELATED paused sweep keeps its own alert beside an ordinary admission refusal (#269)', async () => {
+    const f = await transientFixture('unrelated-paused');
+    const escalations: string[] = [];
+    const realRelease = f.port.release.bind(f.port);
+    const release = vi.spyOn(f.port, 'release').mockImplementation(async (input) => {
+      await realRelease(input);
+      return { status: 'paused' as const, processes: [{ pid: 4242, command: 'sleep', evidence: 'cwd in review tree' }], preserved: null, note: 'live' };
+    });
+    const wave = new WaveRunner({
+      ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts,
+      prHeadProbe: localHeadProbe(f.branch), admissionRetryDelaysMs: [],
+      escalate: (title: string, detail: string) => escalations.push(`${title}: ${detail}`),
+    });
+    try {
+      // The remote is merely down (a stopped, retryable failure — no retries configured): not a stuck git.
+      await expect(wave.requestReview({ jobId: f.jobId })).rejects.toThrow(/admission preflight refused/u);
+      expect(escalations.filter((line) => line.includes('refused admission'))).toHaveLength(1);
+      expect(escalations.filter((line) => line.includes('paused on live processes'))).toHaveLength(1);
+    } finally {
+      release.mockRestore();
+      f.restorePath();
+      await wave.shutdown();
+    }
+  });
+
+  it('a git group that would not stop is escalated naming it even when the branch turned busy during the probe — a busy refusal never masks it (R9-6)', async () => {
+    for (const route of ['request', 'forced'] as const) {
+      const f = await transientFixture(`stuck-busy-${route}`);
+      let stuckGroup: number | null = null;
+      const escalations: string[] = [];
+      const informs: string[] = [];
+      const stuck = (pgid: number): boolean => pgid === stuckGroup;
+      const realSync = OWNED_GIT_SEAMS.groupHasLiveMember;
+      const realAsync = OWNED_GIT_SEAMS.groupHasLiveMemberAsync;
+      const sync = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMember').mockImplementation((pgid, budget) => stuck(pgid) || realSync(pgid, budget));
+      const async = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMemberAsync').mockImplementation(async (pgid, budget) => {
+        // Fault exactly one real OWNED runner at the actual observation seam.
+        // A deadline may kill its git child before a shell marker ever runs;
+        // child startup/marker timing must not decide group cessation proof.
+        stuckGroup ??= pgid;
+        return stuck(pgid) || realAsync(pgid, budget);
+      });
+      let landed = false;
+      const wave = new WaveRunner({
+        ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts,
+        prHeadProbe: localHeadProbe(f.branch), admissionRetryDelaysMs: [0, 0],
+        // New work lands while the stuck remote probe runs.
+        reviewFreezeObserver: () => {
+          setTimeout(() => {
+            if (route === 'forced') {
+              const sibling = `${f.jobId}-sibling`;
+              void f.port.createJobWorktree({ repoPath: f.repo.path, jobId: sibling }).then(() => {
+                f.ledger.addJob({ id: sibling, repo: 'fixture', title: 'sibling', baseBranch: 'main', briefing: 'sibling' });
+                f.ledger.setJobStatus(sibling, 'working');
+                landed = true;
+              });
+              return;
+            }
+            f.ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId: f.jobId, payload: { request_id: 'repair-during-stuck-probe' } });
+            landed = true;
+          }, 300);
+        },
+        escalate: (title: string, detail: string) => escalations.push(`${title}: ${detail}`),
+        inform: (title: string, detail: string) => informs.push(`${title}: ${detail}`),
+      });
+      try {
+        await expect(wave.requestReview({ jobId: f.jobId, ...(route === 'forced' ? { force: true } : {}) }))
+          .rejects.toThrow(/cleanup unconfirmed: process group \d+ still running/u);
+        expect(landed, route).toBe(true);
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      } finally {
+        sync.mockRestore();
+        async.mockRestore();
+        f.restorePath();
+        await wave.shutdown();
+      }
+      const round = f.ledger.listRounds(f.jobId).at(-1)!;
+      expect(round.status, route).toBe('aborted');
+      expect(escalations, route).toHaveLength(1);
+      expect(escalations[0], route).toMatch(/refused admission before any specialist started: .*cleanup unconfirmed: process group \d+ still running/u);
+      expect(stuckGroup, route).toBeGreaterThan(0);
+      expect(escalations[0], route).toContain(`process group ${stuckGroup} still running`);
+      expect(informs, route).toEqual([]);
+      expect(kinds(f.ledger, f.jobId, 'round.admission-retry-scheduled'), route).toEqual([]);
+      expect(payloads(f.ledger, f.jobId, 'round.admission-preflight').at(-1), route).toMatchObject({
+        ok: false, missing: [expect.objectContaining({ input: 'head-binding', cleanupUnconfirmed: true })],
+      });
+      expect(kinds(f.ledger, f.jobId, 'branch-idle.refused').filter((event) => event.roundId === round.id), route).toEqual([]);
+    }
+  }, 120_000);
+
+  it('a review blocked before any round — its PR head unverifiable — through a queued handoff alerts once, never again as a failed handoff (R8-25)', async () => {
+    const f = await transientFixture('blocked-head');
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts, bus: f.bus,
+      // The code host reports a head the fetched branch tip does not match.
+      prHeadProbe: async () => ({ headRefName: f.branch, headSha: '0'.repeat(40) }),
+      escalate: (title: string, detail: string) => escalations.push(`${title}: ${detail}`),
+    });
+    try {
+      f.ledger.setJobStatus(f.jobId, 'blocked');
+      f.ledger.setJobStatus(f.jobId, 'working');
+      expect((await wave.requestReview({ jobId: f.jobId, handoff: true })).route).toBe('queued');
+      f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: f.jobId, payload: { sha: f.target } });
+      await until(() => f.ledger.latestJobEvent(f.jobId, 'job.review-handoff-failed') !== null);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    } finally {
+      f.restorePath();
+      await wave.shutdown();
+    }
+    expect(f.ledger.latestJobEvent(f.jobId, 'job.review-freeze-blocked')).not.toBeNull();
+    expect(escalations).toHaveLength(1);
+    expect(escalations[0]).toContain('was blocked before any round: the PR head could not be verified');
+    expect(f.ledger.listRounds(f.jobId)).toEqual([]);
+  });
+
+  it('a refused round restores only its own status flip — a reopened attempt in between is never concealed, even one written as the flip is published (R7-10, R8-10)', async () => {
+    const f = await transientFixture('restore-cas');
+    const round = f.ledger.admitReviewRound({
+      jobId: f.jobId, expectedLatestRoundId: null, expectedJobStatus: 'working', lenses: [...PERKINS_LENSES], targetRef: f.target,
+    });
+    const flip = f.ledger.latestJobEvent(f.jobId, 'job.status')!.seq;
+    // While the round set up, the lane reopened (a fix turn) and was linked again.
+    f.ledger.setJobStatus(f.jobId, 'working');
+    f.ledger.setJobStatus(f.jobId, 'in-review');
+    f.ledger.abortReviewSetupWithoutSpawn(round.id);
+    const before = f.ledger.latestJobEvent(f.jobId, 'job.status')!.seq;
+    expect(f.ledger.restoreReviewSetupStatus({ jobId: f.jobId, roundId: round.id, priorStatus: 'working', attemptStartSeq: 1, expectedStatusSeq: flip })).toBe(false);
+    expect(f.ledger.latestJobEvent(f.jobId, 'job.status')!.seq).toBe(before);
+    expect(laneIsBusy(f.ledger, f.ledger.getJob(f.jobId)!)).toBe(true); // the reopened attempt has not delivered
+    f.restorePath();
+
+    // R8-10: a subscriber reopens the lane SYNCHRONOUSLY when the flip is
+    // published — before admission even returns. The token is the flip
+    // itself, read inside the admission transaction.
+    const g = await transientFixture('restore-publication');
+    let reopened = false;
+    const stop = g.bus.subscribe((event) => {
+      const payload = event.payload as { to?: unknown } | null;
+      if (reopened || event.jobId !== g.jobId || event.kind !== 'job.status' || payload?.to !== 'in-review') return;
+      reopened = true;
+      g.ledger.setJobStatus(g.jobId, 'working');
+      g.ledger.setJobStatus(g.jobId, 'in-review');
+    });
+    const wave = new WaveRunner({
+      ledger: g.ledger, worktrees: g.port, spawner: makeSpawner(g.sessions, []), reviewArtifactRoot: g.artifacts,
+      prHeadProbe: localHeadProbe(g.branch), admissionRetryDelaysMs: [],
+    });
+    try {
+      await expect(wave.requestReview({ jobId: g.jobId })).rejects.toThrow();
+      expect(reopened).toBe(true);
+      const statuses = kinds(g.ledger, g.jobId, 'job.status');
+      expect(statuses.some((event) => (event.payload as { restoredAfterRound?: unknown }).restoredAfterRound !== undefined)).toBe(false);
+      expect(g.ledger.getJob(g.jobId)!.status).toBe('in-review');
+      expect(laneIsBusy(g.ledger, g.ledger.getJob(g.jobId)!)).toBe(true);
+    } finally {
+      stop();
+      g.restorePath();
+      await wave.shutdown();
+    }
+  });
+
+  it('a shutdown during freeze-target resolution starts nothing — no round, no review worktree (R8-18)', async () => {
+    const f = await transientFixture('shutdown-resolution');
+    rmSync(f.flag);
+    let entered = false;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const probe = localHeadProbe(f.branch);
+    const wave = new WaveRunner({
+      ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts,
+      prHeadProbe: async (input) => {
+        entered = true;
+        await held;
+        return probe(input);
+      },
+    });
+    const created = vi.spyOn(f.port, 'createReviewWorktree');
+    try {
+      const request = wave.requestReview({ jobId: f.jobId });
+      await until(() => entered);
+      const stopping = wave.shutdown();
+      release();
+      await expect(request).rejects.toThrow(/shut down during review setup|shutting down/u);
+      await stopping;
+    } finally {
+      f.restorePath();
+    }
+    expect(f.ledger.listRounds(f.jobId)).toEqual([]);
+    expect(created).not.toHaveBeenCalled();
+    expect(f.ledger.getJob(f.jobId)!.status).toBe('working');
+  });
+
+  it('a shutdown during resolution reconciles no earlier owner; one during that reconciliation still creates no round (R8-18)', async () => {
+    for (const during of ['resolution', 'reconciliation'] as const) {
+      const f = await transientFixture(`shutdown-${during}`);
+      rmSync(f.flag);
+      // An earlier round whose owner marker must be reconciled before a replacement.
+      const old = f.ledger.addRound({ jobId: f.jobId, lenses: [...PERKINS_LENSES], targetRef: f.target });
+      f.ledger.setRoundStatus(old.id, 'aborted');
+      f.ledger.appendCustomEvent({ kind: 'round.review-owner', jobId: f.jobId, roundId: old.id,
+        payload: { roundId: old.id, targetSha: f.target, runtimeId: 'pi', pid: process.pid, generation: randomUUID() } });
+      let entered = false;
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const reconciled: string[] = [];
+      const probe = localHeadProbe(f.branch);
+      const wave = new WaveRunner({
+        ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts,
+        prHeadProbe: async (input) => {
+          if (during === 'resolution') {
+            entered = true;
+            await held;
+          }
+          return probe(input);
+        },
+        reconcileReviewAgent: async (agentId) => {
+          reconciled.push(agentId);
+          if (during === 'reconciliation') {
+            entered = true;
+            await held;
+          }
+          return true;
+        },
+      });
+      const created = vi.spyOn(f.port, 'createReviewWorktree');
+      try {
+        const request = wave.requestReview({ jobId: f.jobId });
+        await until(() => entered);
+        const stopping = wave.shutdown();
+        release();
+        await expect(request, during).rejects.toThrow(/shut down during review setup|shutting down/u);
+        await stopping;
+      } finally {
+        f.restorePath();
+      }
+      expect(f.ledger.listRounds(f.jobId).map((round) => round.id), during).toEqual([old.id]);
+      expect(created, during).not.toHaveBeenCalled();
+      expect(reconciled, during).toEqual(during === 'resolution' ? [] : ['']);
     }
   });
 });

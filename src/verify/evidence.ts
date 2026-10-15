@@ -25,6 +25,33 @@ function num(value: unknown): number | null {
 }
 
 /**
+ * Per-step evidence lines (issue #318): which checks really executed and how
+ * each ended. A reused step is labelled as NOT executed; it is never a PASS.
+ * Absent or malformed lists render nothing (historical records unchanged).
+ */
+function renderChecks(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const lines: string[] = [];
+  for (const item of value as unknown[]) {
+    if (item === null || typeof item !== 'object') return [];
+    const check = item as Record<string, unknown>;
+    const command = str(check['command']);
+    const status = str(check['status']);
+    if (command === null || status === null) return [];
+    const exit = num(check['exitCode']);
+    const from = str(check['reusedFromRunId']);
+    lines.push(
+      status === 'reused'
+        ? `check: reused (not executed; build from run ${from ?? 'unknown'}) ${command.slice(0, 200)}`
+        : status === 'not-run'
+          ? `check: not-run ${command.slice(0, 200)}`
+          : `check: ${status}${exit === null ? '' : ` (exit ${exit})`} ${command.slice(0, 200)}`,
+    );
+  }
+  return lines;
+}
+
+/**
  * Render the ledger-recorded verification run as a clearly-delimited,
  * untrusted-evidence block for the frozen spec context, or null when no
  * run binds to `targetSha`.
@@ -48,6 +75,7 @@ export function renderRecordedVerification(
   const exitCode = num(payload['exit_code']);
   const signal = str(payload['signal']);
   const durationMs = num(payload['duration_ms']);
+  const queuedMs = num(payload['queued_ms']);
   const workers = num(payload['workers']);
   const outputBytes = num(payload['output_bytes']);
   const outputSha256 = str(payload['output_sha256']);
@@ -76,14 +104,36 @@ export function renderRecordedVerification(
     `sha: ${targetSha} (matches the frozen review target)`,
     `recorded_at: ${event.ts}`,
   ];
+  // Queue wait and execution are different facts (issue #318).
+  if (queuedMs !== null) lines.push(`queued_ms: ${queuedMs}`);
   if (durationMs !== null) lines.push(`duration_ms: ${durationMs}`);
   if (workers !== null) lines.push(`workers: ${workers}`);
   lines.push(`run_id: ${runId}`);
   lines.push(`output_bytes: ${String(outputBytes)}`);
   lines.push(`output_sha256: ${outputSha256}`);
   if (runError !== null) lines.push(`error: ${runError.slice(0, 300)}`);
+  lines.push(...renderChecks(payload['checks']));
   lines.push('--- END HOST-RECORDED VERIFICATION ---');
   return lines.join('\n');
+}
+
+/**
+ * The newest completed verification event, in ledger sequence order, that
+ * binds `targetSha` — the first event whose rendering under
+ * `renderRecordedVerification` is non-null. `events` streams newest-first
+ * and is consumed lazily: the scan stops at the first bound run, so a long
+ * history is never walked past the evidence it proves. Null means the
+ * stream was exhausted with no binding run — complete absence, never
+ * truncation. (j-1594 correction of gh-169 R8-2.)
+ */
+export function selectNewestBoundVerification(
+  events: Iterable<Pick<EventRecord, 'ts' | 'payload'>>,
+  targetSha: string,
+): Pick<EventRecord, 'ts' | 'payload'> | null {
+  for (const event of events) {
+    if (renderRecordedVerification(event, targetSha) !== null) return event;
+  }
+  return null;
 }
 
 /**

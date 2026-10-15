@@ -15,14 +15,27 @@ import {
   backtestRecordPath,
   EnforceGateError,
 } from '../src/decisions/enforce.js';
-import { eventDecisionRequest } from '../src/decisions/questions.js';
-import { DecisionRuntime } from '../src/decisions/runtime.js';
+import { eventDecisionRequest, supervisionDecisionRequest } from '../src/decisions/questions.js';
+import { DecisionRuntime, SHADOW_MISS_DEGRADE_THRESHOLD } from '../src/decisions/runtime.js';
 import { backtestRecordFromReport, saveBacktestRecord, type BacktestReport } from '../src/decisions/backtest.js';
 import { EventBus, type BusEvent } from '../src/events/bus.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { NotificationCenter } from '../src/notifications/center.js';
-import type { ShadowDecisionRecord } from '../src/decisions/types.js';
+import { buildShadowRecord } from '../src/decisions/shadow.js';
+import { computeDecisionShadowMeasures } from '../src/telemetry/yield.js';
+import { decisionRoute, deterministicOutcome } from '../src/decisions/service.js';
+import { requestFromCase, surfaceCaseSpec } from '../src/decisions/cases/registry.js';
+import type {
+  Answer,
+  AnswersFor,
+  ChoiceAnswer,
+  DecisionOutcome,
+  DecisionRequest,
+  QuestionSet,
+  RiskClass,
+  ShadowDecisionRecord,
+} from '../src/decisions/types.js';
 
 const cleanups: string[] = [];
 afterEach(() => {
@@ -356,5 +369,259 @@ describe('the enforce gate (issue #223)', () => {
     const runtime = await startedRuntime({ [surface]: surfaceEntry(profile, 'enforce') });
     await expect(runtime.decide(eventRequest(), { surface })).rejects.toThrow(/no data directory is available/u);
     runtime.dispose();
+  });
+});
+
+describe('shadow misses are evidence, not incidents (2026-10-06 owner page)', () => {
+  type Step = 'ok' | 'timeout' | 'auth';
+
+  /** Call 1 is the default profile's startup probe; each later call is one
+   * shadow ask. A timeout is the provider's own abort, as in production. */
+  function scriptedFetch(steps: readonly Step[]): typeof fetch {
+    let call = 0;
+    return (async (_url: string | URL | Request, init?: RequestInit) => {
+      const step = steps[call] ?? 'ok';
+      call += 1;
+      if (step === 'timeout') throw Object.assign(new Error('This operation was aborted'), { name: 'AbortError' });
+      if (step === 'auth') return new Response('denied', { status: 401 });
+      return new Response(JSON.stringify(answerEnvelope(String(init?.body))), { status: 200 });
+    }) as unknown as typeof fetch;
+  }
+
+  function notificationStub(): { readonly center: NotificationCenter; readonly postIncident: ReturnType<typeof vi.fn> } {
+    const postIncident = vi.fn();
+    const center = { postIncident, post: vi.fn(), resolveIncidents: vi.fn(() => []) } as unknown as NotificationCenter;
+    return { center, postIncident };
+  }
+
+  async function shadowRuntime(
+    surfaces: DecisionsConfig['surfaces'],
+    steps: readonly Step[],
+    sinks: { readonly notifications: NotificationCenter; readonly records: ShadowDecisionRecord[] },
+  ): Promise<DecisionRuntime> {
+    const runtime = new DecisionRuntime(configWithSurfaces(surfaces), {
+      instanceDir: temp('gru-decisions-shadow-misses-'),
+      env: { OPENROUTER_API_KEY: 'test-key' },
+      fetchImpl: scriptedFetch(steps),
+      watchConfig: false,
+      notifications: sinks.notifications,
+      onShadowRecord: (record) => sinks.records.push(record),
+    });
+    expect(await runtime.start()).toMatchObject({ status: 'ready' });
+    return runtime;
+  }
+
+  const ALL_SHADOW: DecisionsConfig['surfaces'] = {
+    event_triage: surfaceEntry('openrouter-jev', 'shadow'),
+    supervision_guidance: surfaceEntry('openrouter-jev', 'shadow'),
+  };
+
+  it('one transient shadow miss is recorded: the runtime stays ready and nobody is paged', async () => {
+    const { center, postIncident } = notificationStub();
+    const records: ShadowDecisionRecord[] = [];
+    const runtime = await shadowRuntime(ALL_SHADOW, ['ok', 'timeout'], { notifications: center, records });
+    postIncident.mockClear(); // drop the startup "ready" FYI
+    const outcome = await runtime.decide(eventRequest(), { surface: 'event_triage' });
+    expect(outcome.provenance).toMatchObject({ source: 'deterministic', fallbackReason: 'shadow_mode' });
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({ provenance_source: 'deterministic', model: null });
+    expect(runtime.status()).toMatchObject({ status: 'ready', reason: null });
+    expect(postIncident).not.toHaveBeenCalled();
+    runtime.dispose();
+  });
+
+  it(`degrades only after ${SHADOW_MISS_DEGRADE_THRESHOLD} consecutive transient misses; a success resets the run`, async () => {
+    const { center } = notificationStub();
+    const records: ShadowDecisionRecord[] = [];
+    const runtime = await shadowRuntime(
+      ALL_SHADOW,
+      ['ok', 'timeout', 'timeout', 'ok', 'timeout', 'timeout', 'timeout'],
+      { notifications: center, records },
+    );
+    await runtime.decide(eventRequest(), { surface: 'event_triage' }); // miss 1
+    await runtime.decide(eventRequest(), { surface: 'event_triage' }); // miss 2
+    expect(runtime.status()).toMatchObject({ status: 'ready' });
+    await runtime.decide(eventRequest(), { surface: 'event_triage' }); // success → reset
+    await runtime.decide(eventRequest(), { surface: 'event_triage' }); // miss 1
+    await runtime.decide(eventRequest(), { surface: 'event_triage' }); // miss 2
+    expect(runtime.status()).toMatchObject({ status: 'ready' });
+    await runtime.decide(eventRequest(), { surface: 'event_triage' }); // miss 3 → degrade
+    expect(runtime.status()).toMatchObject({ status: 'degraded', reason: 'timeout' });
+    expect(records).toHaveLength(6);
+    runtime.dispose();
+  });
+
+  it('a transient degrade with every acting surface in shadow goes to the board feed, not the owner bell', async () => {
+    const { center, postIncident } = notificationStub();
+    const runtime = await shadowRuntime(ALL_SHADOW, ['ok', 'timeout', 'timeout', 'timeout'], { notifications: center, records: [] });
+    postIncident.mockClear();
+    for (let i = 0; i < SHADOW_MISS_DEGRADE_THRESHOLD; i += 1) {
+      await runtime.decide(eventRequest(), { surface: 'event_triage' });
+    }
+    expect(runtime.status()).toMatchObject({ status: 'degraded', reason: 'timeout' });
+    expect(postIncident).toHaveBeenCalledTimes(1);
+    expect(postIncident.mock.calls[0]![0]).toMatchObject({ kind: 'decisions.degraded.timeout', routing: 'fyi' });
+    runtime.dispose();
+  });
+
+  it('still pages the owner when a modeless (pre-#223) host acts on Jev or when the failure needs a human', async () => {
+    // supervision_guidance has no mode: it ACTS on Jev's answer, so even a
+    // transient degrade is owner-visible.
+    const legacy = notificationStub();
+    const actingRuntime = await shadowRuntime(
+      { event_triage: surfaceEntry('openrouter-jev', 'shadow') },
+      ['ok', 'timeout', 'timeout', 'timeout'],
+      { notifications: legacy.center, records: [] },
+    );
+    legacy.postIncident.mockClear();
+    for (let i = 0; i < SHADOW_MISS_DEGRADE_THRESHOLD; i += 1) {
+      await actingRuntime.decide(eventRequest(), { surface: 'event_triage' });
+    }
+    expect(legacy.postIncident.mock.calls[0]![0]).toMatchObject({ routing: 'needs-owner' });
+    actingRuntime.dispose();
+
+    // An auth failure needs a human: it degrades on the FIRST shadow miss
+    // and pages the owner even when every surface is in shadow.
+    const auth = notificationStub();
+    const authRuntime = await shadowRuntime(ALL_SHADOW, ['ok', 'auth'], { notifications: auth.center, records: [] });
+    auth.postIncident.mockClear();
+    await authRuntime.decide(eventRequest(), { surface: 'event_triage' });
+    expect(authRuntime.status()).toMatchObject({ status: 'degraded', reason: 'auth_rejected' });
+    expect(auth.postIncident.mock.calls[0]![0]).toMatchObject({ kind: 'decisions.degraded.auth_rejected', routing: 'needs-owner' });
+    authRuntime.dispose();
+  });
+});
+
+describe('shadow record disagreement is what the consumer would do (2026-10-11)', () => {
+  const thresholds = DEFAULT_DECISIONS_CONFIG.thresholds;
+
+  // Routes come from the real banding, exactly as the provider service
+  // would assign them for these answers.
+  function jevOutcome<Q extends QuestionSet>(request: DecisionRequest<Q>, answers: AnswersFor<Q>): DecisionOutcome<Q> {
+    const routes = Object.fromEntries(Object.keys(request.questions).map((id) => [
+      id,
+      decisionRoute((answers as Record<string, Answer>)[id]!, (request.risks as Record<string, RiskClass>)[id]!, thresholds),
+    ])) as DecisionOutcome<Q>['routes'];
+    return {
+      answers,
+      routes,
+      provenance: { source: 'jev', fallbackReason: null, model: 'laya-421m-test', latencyMs: 10, usage: null, profile: 'local' },
+    };
+  }
+
+  function recordFor<Q extends QuestionSet>(surface: string, request: DecisionRequest<Q>, answers: AnswersFor<Q>): ShadowDecisionRecord {
+    return buildShadowRecord({
+      surface,
+      provider: 'local',
+      request,
+      providerOutcome: jevOutcome(request, answers),
+      deterministicOutcome: deterministicOutcome(request, thresholds, 'shadow_mode'),
+      thresholds,
+    });
+  }
+
+  const pathOf = (record: ShadowDecisionRecord, id: string): string =>
+    (record.routes as Record<string, { path: string }>)[id]!.path;
+
+  it('event triage disagrees only when the notification would be promoted to action-required', () => {
+    const request = eventRequest();
+    const { fallback } = request;
+    // Class and severity differ in the act band, but needs_action stays in
+    // the fallback band: the notification stays FYI; only its detail text
+    // would change.
+    const detailOnly = recordFor('event_triage', request, {
+      needs_action: { type: 'noul', noul: 0.2 },
+      event_class: { ...fallback.event_class, choice: 'operator_attention', confidence: 0.9 },
+      severity: { ...fallback.severity, score: 1.1, confidence: 0.9 },
+    });
+    expect(pathOf(detailOnly, 'event_class')).toBe('act');
+    expect(pathOf(detailOnly, 'needs_action')).toBe('fallback');
+    expect(detailOnly.disagrees).toBe(false);
+    // A confirm-band needs_action (0.6 on operational) routes it UP.
+    const promoted = recordFor('event_triage', request, { ...fallback, needs_action: { type: 'noul', noul: 0.6 } });
+    expect(pathOf(promoted, 'needs_action')).toBe('confirm');
+    expect(promoted.disagrees).toBe(true);
+    // The baseline routes and the thresholds they were banded at travel
+    // with the record.
+    expect((promoted.deterministic_routes as Record<string, { path: string }>)['event_class']!.path).toBe('act');
+    expect(promoted.thresholds).toEqual(thresholds);
+  });
+
+  it('supervision disagrees only when the supervisor would stop instead of restart, or for another reason', () => {
+    // The ladder restarts a network failure: baseline restart_advised 1 (act).
+    const request = supervisionDecisionRequest({ reason: 'socket hang up: network unreachable', agentId: 'm1', role: 'minion', restartCount: 0, breakerLimit: 3 });
+    const { fallback } = request;
+    expect(fallback.failure_class.choice).toBe('network_failure');
+    const record = (failureClass: string, classConfidence: number, restart: number, severityScore = fallback.severity.score) =>
+      recordFor('supervision_guidance', request, {
+        failure_class: { ...fallback.failure_class, choice: failureClass as typeof fallback.failure_class.choice, confidence: classConfidence },
+        restart_advised: { type: 'noul', noul: restart },
+        severity: { ...fallback.severity, score: severityScore },
+      });
+    // Agrees a restart helps, below the act band: the human gate owns it.
+    const confirmGated = record('network_failure', 0.9, 0.6);
+    expect(pathOf(confirmGated, 'restart_advised')).toBe('confirm');
+    expect(confirmGated.disagrees).toBe(true);
+    // Uncertain restart advice (fallback band) restarts via the ladder, and
+    // a different non-wall class changes nothing the supervisor does.
+    const ladder = record('unknown', 0.9, 0.3);
+    expect(pathOf(ladder, 'restart_advised')).toBe('fallback');
+    expect(ladder.disagrees).toBe(false);
+    // The supervisor never reads the severity answer.
+    expect(record('network_failure', 0.9, 0.9, 2).disagrees).toBe(false);
+    // A model-classified wall stops the agent the ladder would restart.
+    expect(record('quota_wall', 0.9, 0.1).disagrees).toBe(true);
+  });
+
+  it('records the thresholds the runtime banded at, and the report measures the record at them', async () => {
+    const records: ShadowDecisionRecord[] = [];
+    // The stub answers needs_action 0.96: act at the defaults (0.75), but
+    // only confirm at an operational act threshold of 0.97.
+    const configured = {
+      ...configWithSurfaces({ event_triage: surfaceEntry('local', 'shadow') }),
+      thresholds: { ...thresholds, operational: { act: 0.97, confirm: 0.3, requireConfirmOnAct: false } },
+    };
+    const runtime = new DecisionRuntime(configured, {
+      instanceDir: temp('gru-decisions-shadow-thresholds-'),
+      env: { OPENROUTER_API_KEY: 'test-key' },
+      fetchImpl: stubFetch(),
+      watchConfig: false,
+      onShadowRecord: (record) => records.push(record),
+    });
+    await runtime.start();
+    await runtime.decide(eventRequest(), { surface: 'event_triage' });
+    runtime.dispose();
+    expect(records).toHaveLength(1);
+    const record = records[0]!;
+    expect(record.thresholds).toEqual(configured.thresholds);
+    expect(pathOf(record, 'needs_action')).toBe('confirm');
+    const measures = computeDecisionShadowMeasures([
+      { seq: 1, ts: '2026-10-11T00:00:00.000Z', kind: 'decisions.shadow', jobId: null, payload: JSON.parse(JSON.stringify(record)) as Record<string, unknown> },
+    ]);
+    expect(measures.bySurfaceProvider[0]).toMatchObject({ answered: 1, unmeasured: 0, assumedThresholds: 0, disagreements: 1 });
+  });
+
+  it('escalation triage and same-blocker disagree only when their case-spec action differs', () => {
+    // Baseline: every escalation needs a ruling (wake Gru) at confidence 1.
+    const escalation = requestFromCase(surfaceCaseSpec('escalation_triage'), 'escalation state');
+    const baselineTriage = escalation.fallback['triage'] as ChoiceAnswer;
+    const triage = (choice: string, confidence: number) => recordFor('escalation_triage', escalation, {
+      ...escalation.fallback,
+      triage: { ...baselineTriage, choice, confidence },
+    } as AnswersFor<QuestionSet>);
+    // Agrees less confidently (confirm band on operational): still a ruling.
+    const lessConfident = triage('needs_ruling', 0.6);
+    expect(pathOf(lessConfident, 'triage')).toBe('confirm');
+    expect(lessConfident.disagrees).toBe(false);
+    // Another ruling class is the same action.
+    expect(triage('needs_owner', 0.9).disagrees).toBe(false);
+    // Covered by an open item: no ruling owed.
+    expect(triage('covered_by_open_item', 0.9).disagrees).toBe(true);
+    // Baseline: different fingerprints are different defects (act on it).
+    const sameBlocker = requestFromCase(surfaceCaseSpec('same_blocker'), 'blocker pair');
+    const sameDefect = (noul: number) =>
+      recordFor('same_blocker', sameBlocker, { same_defect: { type: 'noul', noul } } as AnswersFor<QuestionSet>);
+    expect(sameDefect(0.6).disagrees).toBe(true);
+    expect(sameDefect(0.45).disagrees).toBe(false);
   });
 });

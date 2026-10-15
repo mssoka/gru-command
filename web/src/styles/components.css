@@ -64,6 +64,10 @@ body {
 /* A lens the lead did not use is settled, not a pass: the same neutral
    gray as a pending chip, and never the success fill. */
 .pp-chip--unused { background: var(--park); color: var(--ink); }
+/* A binned lane is DISCARDED (terminal, never resuming): a dashed muted
+   receipt, distinct from the parked fill (resumable) and the success
+   fill (merged/done). Existing tokens only — no palette addition. */
+.pp-chip--binned { background: var(--paper); color: var(--muted); border-style: dashed; }
 .pp-chip--perkins { background: var(--perkins); color: var(--on-state); }
 
 .pp-btn {
@@ -690,9 +694,10 @@ body {
 
 .chat-panel {
   display: grid;
-  /* Pane face: head, scrollable log, context controls, compose. Inside
-     the overlay sheet the head hides and row 1 collapses to 0. */
-  grid-template-rows: auto minmax(0, 1fr) auto auto;
+  container-type: size;
+  /* Pane face: head, compact intake, scrollable log, context controls,
+     compose. In the overlay sheet the head hides and row 1 collapses. */
+  grid-template-rows: auto auto minmax(0, 1fr) auto auto;
   overflow: hidden;
   position: relative;
 }
@@ -711,9 +716,10 @@ body {
    capped scroll box and grow to its full content height (which also
    broke the bottom-distance math that drives auto-follow). */
 .chat-panel > .chat-panel__head { grid-area: 1 / 1; }
-.chat-panel > .chat-log { grid-area: 2 / 1; }
-.chat-panel > .chat-context { grid-area: 3 / 1; }
-.chat-panel > .chat-compose { grid-area: 4 / 1; }
+.chat-panel > #intake-mount { grid-area: 2 / 1; }
+.chat-panel > .chat-log { grid-area: 3 / 1; }
+.chat-panel > .chat-context { grid-area: 4 / 1; }
+.chat-panel > .chat-compose { grid-area: 5 / 1; }
 
 /* The pane head: 🧠 Gru + the collapse affordance (v5). */
 .chat-panel__head {
@@ -805,7 +811,7 @@ body {
    disengaged (the reader is in history). It sits in the log's grid cell
    and never takes layout from the message column. */
 .chat-jump {
-  grid-area: 2 / 1;
+  grid-area: 3 / 1;
   align-self: end;
   justify-self: center;
   z-index: 2;
@@ -1131,7 +1137,9 @@ body {
   flex: 1 1 0;
 }
 
-.chat-context__status--busy .chat-context__status-label {
+/* Working only (rotating phrase visible): compacting/resetting are also
+   busy but show no phrase, so their factual label must stay on screen. */
+.chat-context__status--working .chat-context__status-label {
   position: absolute;
   width: 1px;
   height: 1px;
@@ -1283,6 +1291,7 @@ body {
 
 /* The mount constrains the panel; the log scrolls inside it. */
 .chat-sheet #chat-sheet-mount {
+  grid-area: 2 / 1;
   min-height: 0;
   display: grid;
 }
@@ -1290,7 +1299,7 @@ body {
 .chat-sheet .chat-panel {
   height: 100%;
   min-height: 0;
-  grid-template-rows: auto minmax(0, 1fr) auto auto;
+  grid-template-rows: auto auto minmax(0, 1fr) auto auto;
   border: none;
   border-radius: 0;
   box-shadow: none;
@@ -1852,6 +1861,70 @@ body {
   cursor: default;
 }
 
+/* Book of Lessons proposal (owner decision 2026-10-07): the review spans
+   the row under the copy; Accept/Reject sit together in the action slot. */
+.board-owner__row--proposal {
+  grid-template-areas:
+    'title action'
+    'meta action'
+    'note action'
+    'review review'
+    'error error';
+}
+
+.board-owner__error {
+  grid-area: error;
+  margin-top: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--alert);
+  overflow-wrap: anywhere;
+}
+
+.board-owner__actions {
+  grid-area: action;
+  display: flex;
+  gap: 6px;
+  align-self: center;
+}
+
+.board-owner__review {
+  grid-area: review;
+  margin-top: 6px;
+  min-width: 0;
+}
+
+.board-owner__review > summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.board-owner__review-chapter {
+  margin-top: 8px;
+}
+
+.board-owner__review-heading {
+  font-weight: 800;
+  font-size: 12px;
+}
+
+.board-owner__review-lesson {
+  margin-top: 6px;
+  padding-left: 8px;
+  border-left: 2px solid color-mix(in srgb, var(--line) 40%, transparent);
+}
+
+.board-owner__review-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.board-owner__review-text--before {
+  color: var(--muted);
+}
+
 .board-owner__open {
   display: inline-flex;
   align-items: center;
@@ -1880,6 +1953,18 @@ body {
       'note'
       'action';
     row-gap: 6px;
+  }
+
+  /* A proposal row keeps its review area in the single column — without
+     it the review becomes an implicit column and squeezes the title. */
+  .board-owner__row--proposal {
+    grid-template-areas:
+      'title'
+      'meta'
+      'note'
+      'review'
+      'action'
+      'error';
   }
 
   .board-owner__ack,
@@ -2031,6 +2116,7 @@ body {
 .board-job__dot--done { background: var(--done); }
 .board-job__dot--alert { background: var(--alert); }
 .board-job__dot--park { background: var(--park); }
+.board-job__dot--binned { background: var(--muted); }
 
 .board-job__name {
   font-weight: 800;
@@ -2104,6 +2190,56 @@ body {
   font-size: 11px;
   font-weight: 800;
   color: var(--ink);
+}
+
+/* Megaminions: the specialists a heist's minion commissioned nest under
+   it — a family chip on the parent's meta line, live specialists as
+   indented sub-rows hung off one guide line (├/└ ticks), concluded ones
+   inside the expanded body. A nested row is a quieter, single-indent
+   twin of the parent row. */
+.board-job__family-chip,
+.board-job__parent {
+  font-weight: 800;
+  color: var(--ink);
+}
+
+.board-job__family {
+  display: grid;
+  margin: 2px 0 0 42px;
+  border-left: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+  cursor: auto;
+}
+
+.board-job__family--concluded {
+  margin-left: 0;
+  border-top: 1px solid color-mix(in srgb, var(--line) 30%, transparent);
+  padding-top: 8px;
+}
+
+.board-job__family-label {
+  padding-left: 12px;
+  font-size: 10px;
+  color: var(--faint);
+  text-transform: uppercase;
+}
+
+.board-job--child {
+  position: relative;
+  padding: 4px 6px 5px 12px;
+  border-bottom: 0;
+}
+
+.board-job--child::before {
+  content: '';
+  position: absolute;
+  top: 15px;
+  left: 0;
+  width: 8px;
+  border-top: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+}
+
+.board-job--child .board-job__meta {
+  padding-left: 30px;
 }
 
 /* The expanded row: the v3 detail in one box — the only card allowed. */
@@ -2534,6 +2670,198 @@ body {
   font-style: italic;
 }
 
+/* ── Managed repository overview (owner-approved compact rows A) ──
+   A read-only module below the crew list: one shared-border list, rows
+   in the same rhythm (identity + status chip, two exact counts, CI
+   context + checked age, optional disclosure). The list scrolls inside
+   its own bound so a growing registry never displaces the crew list's
+   independent scroll; the section follows the CREW tab's visibility. */
+.repo-overview {
+  display: grid;
+  gap: 7px;
+  align-content: start;
+  min-width: 0;
+}
+
+/* No data (feature unwired or first refresh pending): no section at all. */
+.repo-overview:empty {
+  display: none;
+}
+
+.repo-overview__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.repo-overview__title {
+  font-size: 13px;
+  font-weight: 900;
+  letter-spacing: 0.01em;
+  min-width: 0;
+}
+
+.repo-overview__sub {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.repo-overview__empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.repo-overview__list {
+  min-width: 0;
+  border: var(--outline-thin);
+  border-radius: var(--radius-sm);
+  background: var(--card);
+  max-height: min(52vh, 460px);
+  overflow-y: auto;
+}
+
+.repo-row {
+  min-width: 0;
+  padding: 8px 9px 9px;
+}
+
+.repo-row + .repo-row {
+  border-top: 1px solid color-mix(in srgb, var(--line) 38%, transparent);
+}
+
+.repo-row__top {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
+}
+
+.repo-row__name {
+  font-size: 12px;
+  font-weight: 900;
+  line-height: 1.24;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--ink);
+  text-decoration: none;
+}
+
+a.repo-row__name:hover {
+  text-decoration: underline;
+}
+
+.repo-row__name:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 1px;
+}
+
+.repo-row__badge {
+  flex: none;
+  font-size: 9px;
+  letter-spacing: 0.03em;
+  padding: 1px 7px;
+  gap: 3px;
+  line-height: 1.4;
+}
+
+.repo-row__badge-glyph {
+  font-size: 9.5px;
+}
+
+.repo-row__metrics {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 5px;
+  margin: 6px 0 4px;
+  min-width: 0;
+}
+
+.repo-row__metric {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  min-width: 0;
+}
+
+.repo-row__metric-count {
+  font-size: 15px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  flex: none;
+}
+
+.repo-row__metric-label {
+  font-size: 9.5px;
+  font-weight: 800;
+  color: var(--muted);
+  line-height: 1.15;
+  letter-spacing: 0.02em;
+  min-width: 0;
+}
+
+.repo-row__metric-sub {
+  display: block;
+  font-style: normal;
+  font-weight: 700;
+}
+
+.repo-row__meta {
+  display: flex;
+  flex-wrap: wrap;
+  column-gap: 6px;
+  row-gap: 1px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.3;
+  min-width: 0;
+}
+
+.repo-row__meta b {
+  color: var(--ink);
+  font-weight: 700;
+}
+
+.repo-row__ci {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.repo-row__ci-link {
+  color: var(--ink);
+  font-weight: 700;
+}
+
+.repo-row__ci-link:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 1px;
+}
+
+.repo-row__age {
+  white-space: normal;
+  min-width: 0;
+}
+
+.repo-row__note {
+  margin: 4px 0 0;
+  font-size: 9.5px;
+  line-height: 1.3;
+  font-weight: 700;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.repo-row__note--grey {
+  color: var(--muted);
+}
+
 .board-bell {
   position: relative;
 }
@@ -2605,10 +2933,16 @@ body {
   display: inline-block;
 }
 
+/* position: fixed (not absolute): a document-absolute panel slid under the
+   sticky command bar as soon as the board scrolled (#28). Its top is
+   derived from the MEASURED chrome height (--chrome-h), so a nav that
+   wraps to 2 or 3 rows still clears at every width. */
 .notification-panel {
-  position: absolute;
+  position: fixed;
   right: 16px;
   top: calc(var(--chrome-h, 100px) + 8px);
+  max-height: calc(100vh - var(--chrome-h, 100px) - 16px);
+  overflow-y: auto;
   width: min(420px, calc(100vw - 32px));
   z-index: 40;
   display: grid;
@@ -2913,6 +3247,10 @@ body {
   overflow-wrap: anywhere;
 }
 
+.notice-line--multiline {
+  white-space: pre-wrap;
+}
+
 .board-notification__ack {
   margin-top: 6px;
   align-self: flex-start;
@@ -3173,3 +3511,21 @@ body {
     font-size: 15px;
   }
 }
+
+/* Compact review stays in the one chat pane, with bounded scroll estate. */
+/* Container units bind the cap to the pane, not the intake's own auto
+   grid row (a percentage there clips even the collapsed summary). */
+#intake-mount { min-height: 0; max-height: 52cqh; overflow: auto; }
+.intake { padding: 8px 12px; border-bottom: 1px solid var(--border); font-size: 12px; }
+.intake summary { cursor: pointer; }
+.intake-body { display: grid; gap: 8px; padding-top: 8px; min-width: 0; }
+.intake-body .pp-input { width: 100%; min-width: 0; }
+.intake-review pre { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+.intake-review p { overflow-wrap: anywhere; }
+.intake-editor { min-height: 160px; resize: vertical; font-family: monospace; }
+.intake-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.intake-selection { display: flex; align-items: center; gap: 6px; }
+.intake-status { overflow-wrap: anywhere; }
+
+.mailbox-detail { padding: .5rem 1rem; font-size: .8rem; color: var(--muted); overflow-wrap: anywhere; }
+.mailbox-incident { padding: .75rem; border: 1px solid currentColor; border-radius: .4rem; }

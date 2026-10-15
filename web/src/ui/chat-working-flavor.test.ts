@@ -350,6 +350,27 @@ describe('working flavor a11y and controls', () => {
     expect(announcement.textContent).toBe('Context compacted successfully');
   });
 
+  it('keeps the factual label on screen while compacting or starting a new chat', () => {
+    // Only the rotating-phrase state may visually hide the label. Compacting
+    // and resetting have no phrase, so hiding the label there left a bare
+    // pulsing dot with no status text (owner report 2026-10-07).
+    const view = new ChatView(() => true, { random: seededRandom(99) });
+    showBusy(view);
+    expect(status().classList.contains('chat-context__status--busy')).toBe(true);
+    expect(status().classList.contains('chat-context__status--working')).toBe(true);
+
+    for (const [state, text] of [
+      ['compacting', 'Compacting context…'],
+      ['resetting', 'Starting new chat…'],
+    ] as const) {
+      view.setContext(context({ state }));
+      expect(status().classList.contains('chat-context__status--busy')).toBe(true);
+      expect(status().classList.contains('chat-context__status--working')).toBe(false);
+      expect(label().textContent).toBe(text);
+      expect(flavor().hidden).toBe(true);
+    }
+  });
+
   it('preserves control enablement and restores the factual chip on idle', () => {
     vi.useFakeTimers();
     const view = new ChatView(() => true, { random: seededRandom(88) });
@@ -380,9 +401,12 @@ describe('working flavor stylesheet contract', () => {
     expect(spans).toMatch(/text-overflow:\s*ellipsis/);
     expect(spans).toMatch(/min-width:\s*0/);
 
-    const busyLabel = ruleBody('.chat-context__status--busy .chat-context__status-label');
-    expect(busyLabel).toMatch(/position:\s*absolute/);
-    expect(busyLabel).toMatch(/clip:\s*rect\(0, 0, 0, 0\)/);
+    const workingLabel = ruleBody('.chat-context__status--working .chat-context__status-label');
+    expect(workingLabel).toMatch(/position:\s*absolute/);
+    expect(workingLabel).toMatch(/clip:\s*rect\(0, 0, 0, 0\)/);
+    // The broad busy class also covers compacting/resetting, whose label is
+    // the only visible status text — it must never hide the label.
+    expect(COMPONENTS_CSS).not.toMatch(/\.chat-context__status--busy\s+\.chat-context__status-label/);
   });
 
   it('never wraps the status strip on console/tablet widths', () => {

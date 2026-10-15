@@ -38,6 +38,14 @@ baseline while still serving the deterministic answer: behavior cannot
 change until the #223 enforce gate is met AND the owner records a
 decision per surface.
 
+**Shadow misses are evidence, not incidents.** A transient failure of a
+default-profile shadow ask (`timeout`, `network_error`,
+`provider_degraded`) is recorded (`decisions.shadow`, provenance
+`deterministic`, model `null`) and logged; the runtime stays `ready`.
+Only **3 consecutive** transient misses degrade it, and a successful ask
+resets the count. Credential, auth, config and schema failures still
+degrade on the first miss.
+
 | Surface | Question | Fires at | Deterministic baseline |
 |---|---|---|---|
 | `escalation_triage` | choice `triage` (`needs_ruling`, `needs_owner`, `status_report`, `covered_by_open_item`) + noul `needs_decision` | the awareness layer's wake-delivery receipt, for Silas-authored escalation rows (`silas.escalation`, `silas.escalated:<jobId>`) inside the delivered batch — the exact point the labelled extractor links on | every escalation reaches Gru (`needs_ruling`, noul 1 — fail toward a wake) |
@@ -90,7 +98,7 @@ The complete default-off fragment is:
 enabled = false
 model = "~typesafe/jev-latest"
 endpoint = "https://openrouter.ai/api/alpha/decisions"
-timeout_ms = 2000
+timeout_ms = 5000
 
 [decisions.thresholds.read_only]
 act = 0.60
@@ -150,7 +158,7 @@ protocol = "systemone"
 endpoint = "https://api.typesafe.ai/v1/systemone"
 model = "jev-latest"
 credential = "typesafe"
-timeout_ms = 2000
+timeout_ms = 5000
 
 [decisions.surfaces]
 event_triage = "typesafe-direct"
@@ -204,7 +212,26 @@ Routing rules:
   "report": "...\\n**Verdict: READY TO MERGE**" }`. Perkins
   `consolidated.json` review rounds are not report-type handbacks; verdict
   lines are removed from the request state. Yield telemetry (#214) reports
-  shadow disagreement rates per surface and provider.
+  shadow disagreement rates per surface and provider: the share of
+  answered asks on which the surface's consumer would have acted
+  differently than on the deterministic baseline (`src/decisions/effects.ts`,
+  the same functions the consumers call). `event_triage` disagrees when
+  the notification would be promoted to action-required (class and
+  severity only annotate its detail text); `supervision_guidance` when the
+  supervisor would stop instead of restart, or stop for a different
+  reason; `escalation_triage` and `same_blocker` when their case spec's
+  `answerAction` differs. Provider misses are counted separately and kept
+  out of the share and the latency quantiles; they are broken down by
+  reason and kind: attempted (the provider call began and failed, with
+  its elapsed time per reason), refused (locally, before starting),
+  stand-in (no provider call recorded, normally while degraded) and
+  unrecorded (no readable cause). Every answered measure is split per
+  model. Records carry the thresholds their routes were banded at; rows
+  recorded before 2026-10-11 are measured at the default thresholds and
+  counted as such. An answered row whose answers fail production
+  validation, or whose routes are not exactly what its questions' risk
+  classes and those thresholds band its answers to, stays in its group
+  (with its cost and latency) as unmeasurable.
 - Production callers pass stable surface names: event/notification triage
   uses `event_triage`; supervisor runtime-health guidance uses
   `supervision_guidance`.
@@ -236,6 +263,57 @@ Routing rules:
 
 Provenance gains `profile` (the profile name that produced a `jev` outcome;
 null on deterministic fallbacks).
+
+## Request deadlines and failure evidence
+
+`timeout_ms` bounds the **client-side exchange**, from immediately before
+fetch through response-body consumption and validation. It is not the model's
+inference time. Header wait includes local scheduling, connection setup and
+provider processing; this fetch integration does not separately measure
+DNS, TCP, TLS, gateway queueing or inference. An unauthenticated fast `401`
+probe measures a different path from an authenticated decision and does not
+exonerate either the client or the provider for a historical slow request.
+
+The provider races the whole exchange against its own deadline, in addition
+to signaling transport abort. Even an abort-ignoring fetch/body cannot keep
+its caller or one of the four admission slots pending beyond the local
+deadline. Late response bodies are cancelled best-effort; late answers cannot
+route a decision. Disposal cancels as `disposed`, not `timeout`, and runtime
+generation checks prevent shutdown/reconfiguration from recording a stale
+shadow ask as a new timeout. Cancellation cannot guarantee an uncooperative
+underlying transport has stopped. JavaScript timers need an event-loop turn;
+if the loop is blocked, expiry can run late, but elapsed-time checks also
+reject a response that arrives after the deadline before the timer runs.
+
+New `decisions.shadow` records include `fallback_reason` and
+`request_diagnostics`. Attempted failures retain their actual elapsed
+`latency_ms` rather than replacing it with zero. The diagnostics contain:
+
+- `phase`: `not_started` for an admission refusal, `request` while waiting
+  for headers, `response_headers` while checking HTTP status and declared
+  response size (without reading rejected or oversized bodies),
+  `response_body` while reading an accepted response's body, or
+  `response_validation` while parsing/checking a completed body;
+- `timeoutMs` and `deadlineExpired`: configured client budget and whether
+  this request's own deadline expired (an upstream abort can be classified
+  as `timeout` without our local deadline having expired);
+- `headersMs` and `bodyMs`: elapsed milestones from the same request start,
+  not individual phase durations; `null` means that milestone was not observed
+  before the bounded request settled, not proof a response never arrived later;
+- `httpStatus`: observed HTTP status, or `null` before headers.
+
+`fallback_reason = "capacity_limited"` means the four local admission slots
+were occupied: that ask never contacted the provider. It is logged as a
+`decision provider request fell back` warning with profile, surface, elapsed
+time and diagnostics, but does **not** degrade remote-provider health or
+count as a transient miss. Deterministic stand-ins (for example a missing key
+or an already-degraded runtime) have their actual fallback reason and null
+request diagnostics. These records contain no request state, credentials,
+raw error text or raw provider bodies.
+
+Historical rows without these new fields have **unknown causes**: a
+`deterministic` source and `latency_ms = 0` alone cannot establish a timeout,
+a capacity refusal, a DNS fault, or a long-lived slot deadlock.
 
 ## Credentials
 
@@ -297,8 +375,12 @@ Authenticated service surfaces:
 The Settings page shows only `disabled`, `ready`, or `degraded`, sanitized
 reason text, model/endpoint, credential presence/source, last-check time, and
 the per-process generation. It never shows key material. A degraded
-transition creates one durable action-required notification; a recovery (or
-an explicit disable) resolves it with a durable FYI notification. Repeated
+transition creates one durable notification: FOR YOU (`needs-owner`) when a
+human must act (credential, auth, config, schema) or a surface acts on Jev
+(`enforce`, or a modeless `event_triage`/`supervision_guidance`), and a board
+FYI when the failure is transient and every acting surface is `shadow`/`off`.
+A recovery (or an explicit disable) resolves it with a durable FYI
+notification. Repeated
 restarts deduplicate the same unresolved incident instead of flooding copies.
 
 ## Decision boundaries
@@ -327,8 +409,8 @@ schemes, URL userinfo, opaque key formats, private-key blocks).
 | `credential_invalid` | Remove whitespace/empty environment input or rewrite one non-empty line through the CLI. |
 | `credential_unsafe` | Remove symlinks; set the credentials directory to `0700` and key file to `0600`; re-provision if ownership is uncertain. |
 | `auth_rejected` / `forbidden` | Verify the OpenRouter credential and access, then recheck. |
-| `provider_degraded` | One automatic recheck runs after a transient degradation; if still degraded, wait for provider/rate-limit recovery and use Recheck — deterministic behavior remains active. |
-| `timeout` / `network_error` | One automatic recheck runs after a transient degradation; if still degraded, verify DNS/TLS/connectivity to `openrouter.ai` (the request timeout is intentionally bounded) and use Recheck. |
+| `provider_degraded` | Transient: automatic rechecks run on a bounded backoff (1, 5, 15, 60 min); if still degraded after the last one, wait for provider/rate-limit recovery and use Recheck — deterministic behavior remains active. |
+| `timeout` / `network_error` | Transient: automatic rechecks run on a bounded backoff (1, 5, 15, 60 min); if still degraded, verify DNS/TLS/connectivity to `openrouter.ai` and use Recheck. Inspect the shadow record's `fallback_reason`, or the request warning's `reason` for any mode, plus elapsed time and `request_diagnostics`, before changing `timeout_ms` (default 5000). The section hot-reloads, but increasing the budget is not a diagnosis and will not explain local capacity refusals. |
 | `malformed_response` | Leave deterministic fallback active and inspect the configured model/endpoint compatibility. |
 | `malformed_request` | The provider rejected the request shape (HTTP 422). Check the surface wiring/model name; this is a caller bug, not provider health. |
 | `endpoint_untrusted` | Restore the verified HTTPS endpoint. Resolved portable credentials are never sent elsewhere. |

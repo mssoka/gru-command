@@ -1,8 +1,23 @@
+import { projectMailbox, mailboxBasis } from '../gru-mailbox/projection.js';
+import { MailboxConflictError, validateMailboxDisposition, type MailboxItem, type MailboxDelivery, type MailboxReceipt, type MailboxDisposition } from './mailbox.js';
 import { createHash, randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { hostname } from 'node:os';
+import { loadWorktreeManifest, resolveVerifyCommand } from '../worktrees/manifest.js';
+import { readGitState } from '../verify/scheduler.js';
+import { planCommand } from '../verify/build-reuse.js';
+import { FROZEN_MANIFEST_MAX_BYTES, readReviewCheckpointBytes, type FrozenReviewInputs } from '../dispatch/perkins-review/artifacts.js';
+import { canonicalRebriefEvidence, type RebriefReceiptEvidence } from './rebrief-evidence.js';
+import type { RecoverySubject, RecoverySubjectKind, RecoveryOwnerTransfer, RecoveryDecisionHistory, RecoveryOwnerActionInput } from './recovery-owner.js';
+import type { IntakeReviewRecord } from '../intake/types.js';
+import { canonical as canonicalIntake, digest as intakeDigest, IntakeError } from '../intake/types.js';
 import type { DatabaseSync } from 'node:sqlite';
 import type { BusEvent, EventBus } from '../events/bus.js';
 import type { Role } from '../config.js';
+import type { WorktreeLane } from '../dispatch/worktree-port.js';
 import type { AgentState } from '../runtime/types.js';
+import { isDeepStrictEqual } from 'node:util';
+import { DirectiveCheckpointError, directiveProducerLockBlocker, directiveSessionLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader, validateDirectiveIdentity, type DirectiveNativeBinding, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
 import {
   assertAdminCloseoutTransition,
   assertJobTransition,
@@ -17,6 +32,7 @@ import {
   isRoundVerdict,
   TERMINAL_JOB_STATUSES,
   type JobStatus,
+  type TerminalJobStatus,
   type LensState,
   type ObligationState,
   type RoundStatus,
@@ -27,11 +43,16 @@ import {
   AMENDMENT_MAX_IDEMPOTENCY_KEY_CHARS,
   amendmentBodySha256,
   amendmentRequestSha256,
+  deliveredWorkRevision,
+  isAmendmentEffect,
   renderEffectiveContract,
+  requiredWorkRevision,
   validateAmendmentDraft,
+  type AmendmentEffect,
   type EffectiveContract,
   type JobAmendmentApproval,
   type JobAmendmentRecord,
+  type WorkRevisionState,
 } from '../review-inputs/amendments.js';
 import {
   canonicalIsoTimestamp,
@@ -80,16 +101,18 @@ import {
   type ResolvedObligation,
 } from './obligations.js';
 import {
+  directiveAdmissionClass,
+  directiveRetirementFingerprint,
+  DirectiveRetirementError,
   isDirectiveState,
   isDirectiveTerminal,
   LIVE_DIRECTIVE_STATES,
+  type DirectiveRecoveryHold,
   type DirectiveRequestRecord,
   type DirectiveState,
+  type DirectiveRetirementIntent,
+  type LiveDirectiveState,
 } from './directives.js';
-import {
-  isOwnerCancellationListed,
-  OWNER_CANCELLATION_RULING,
-} from './owner-cancellation.js';
 import {
   evaluatePipelineEntry,
   isPipelineState,
@@ -124,8 +147,14 @@ import {
 } from './decision-memory.js';
 
 const VERIFICATION_KIND = 'verification.completed';
+const MAX_REBRIEF_RECEIPT_EVIDENCE_EVENTS = 4_096;
+const MAX_REBRIEF_RECEIPT_EVIDENCE_BYTES = 8 * 1024 * 1024;
+// Native process readback retains the same complete-receipt inspection bounds.
+const MAX_VERIFICATION_PROCESS_RECEIPT_EVENTS = MAX_REBRIEF_RECEIPT_EVIDENCE_EVENTS;
+const MAX_VERIFICATION_PROCESS_RECEIPT_BYTES = MAX_REBRIEF_RECEIPT_EVIDENCE_BYTES;
 export type { JobStatus, RoundStatus, RoundVerdict, LensState } from './states.js';
-export type { DirectiveRequestRecord, DirectiveState } from './directives.js';
+export type { DirectiveRecoveryHold, DirectiveRequestRecord, DirectiveRetirementRefusalCode, DirectiveState } from './directives.js';
+export { DirectiveRetirementError } from './directives.js';
 export type {
   DecisionActor,
   DecisionKind,
@@ -201,6 +230,10 @@ export interface JobRecord {
    * a PR-owing lane (or a target-less artifact/investigation job). */
   readonly targetRef: string | null;
   readonly targetSha: string | null;
+  /** The job whose minion commissioned this one (a megaminion's parent
+   * heist). One level deep. `null` = a top-level job, or a ledger older
+   * than migration job-parent. */
+  readonly parentJobId: string | null;
   readonly status: JobStatus;
   readonly baseBranch: string | null;
   readonly prUrl: string | null;
@@ -381,6 +414,47 @@ export type NotificationRouting = (typeof NOTIFICATION_ROUTINGS)[number];
 export const NOTIFICATION_SEVERITIES = ['info', 'error'] as const;
 export type NotificationSeverity = (typeof NOTIFICATION_SEVERITIES)[number];
 
+/** Alerts only their producer closes (owner decision 2026-10-08): a failing
+ * lesson dream's incident resolves when a dream pass completes. A Gru
+ * disposition would close it while nothing recovered — and restart the
+ * failure streak at pass 1 on the next failing beat. Value: what closes it. */
+const PRODUCER_RESOLVED_KINDS: Readonly<Record<string, string>> = {
+  'lessons.dream-failed': 'a completed dream pass',
+};
+
+// The alias d is an immutable delivery. A protected root must cite its
+// complete original bytes and a genuinely settled native row/duty. Binding
+// and identity object key order cannot hide a candidacy refusal.
+const ORIGINAL_NATIVE_GATE_DEBT_SQL = `EXISTS (SELECT 1 FROM events r
+  WHERE r.job_id = d.job_id AND r.kind = 'silas.directive-current-gates-owed' AND r.seq > d.seq
+    AND json_extract(r.payload, '$.root_kind') = 'original-native-completion' AND json_extract(r.payload, '$.delivery_seq') = d.seq
+    AND json_extract(r.payload, '$.request_id') = json_extract(d.payload, '$.request_id')
+    AND json_extract(r.payload, '$.native_completion') = d.payload
+    AND json_extract(r.payload, '$.sha') IS json_extract(d.payload, '$.sha')
+    AND EXISTS (SELECT 1 FROM pending_directives p JOIN job_obligations o ON o.id = json_extract(r.payload, '$.obligation_id')
+      WHERE p.request_id = json_extract(r.payload, '$.request_id') AND p.job_id = d.job_id AND p.delivery_seq = d.seq AND p.state = 'settled'
+        AND p.native_binding IS NOT NULL AND p.payload_hash = json_extract(r.payload, '$.identity.payloadHash')
+        AND p.contract_sha256 = json_extract(r.payload, '$.identity.contractSha256') AND p.work_revision = json_extract(r.payload, '$.identity.workRevision')
+        AND p.authority_epoch = json_extract(r.payload, '$.identity.authorityEpoch') AND p.job_id = json_extract(r.payload, '$.identity.jobId')
+        AND p.request_id = json_extract(r.payload, '$.identity.requestId')
+        AND o.job_id = d.job_id AND o.incident_key = 'directive-current-gates:' || p.request_id AND o.generation = json_extract(r.payload, '$.generation')
+        AND o.first_origin_seq = d.seq AND o.next_action = json_extract(r.payload, '$.next_action')))`;
+
+// A modern delivery requires the ledger's independently checked settlement
+// decision. Later obligation generations cannot turn a rejected publisher
+// flag into eligibility. Old/missing modern decisions remain unproven.
+const UNPROVEN_NATIVE_CANDIDATE_SQL = `EXISTS (SELECT 1 FROM pending_directives p WHERE p.job_id = d.job_id
+  AND p.request_id = json_extract(d.payload, '$.request_id') AND p.request_kind IS NOT NULL
+  AND (p.state != 'settled' OR p.delivery_seq IS NOT d.seq OR COALESCE((SELECT json_extract(s.payload, '$.candidate_delivery_proven')
+    FROM events s WHERE s.job_id = d.job_id AND s.kind = 'silas.directive-settled'
+      AND json_extract(s.payload, '$.request_id') = p.request_id AND json_extract(s.payload, '$.delivery_seq') = d.seq
+    ORDER BY s.seq DESC LIMIT 1), 0) != 1))`;
+
+/** What closes a producer-resolved alert kind, or null for any other kind. */
+export function producerResolvedBy(kind: string): string | null {
+  return Object.hasOwn(PRODUCER_RESOLVED_KINDS, kind) ? PRODUCER_RESOLVED_KINDS[kind]! : null;
+}
+
 export function isOwnerHeldNotificationKind(kind: string): boolean {
   // NOTE (provider-recovery machine-ownership amendment, 2026-09-29): the
   // `supervision.provider-wall.*` family is deliberately NOT force-held
@@ -389,8 +463,10 @@ export function isOwnerHeldNotificationKind(kind: string): boolean {
   // — no owner chime, no ACK required, resolved by the wait lifecycle),
   // and every ineligible/failed classification posts `needs-owner` as the
   // conservative fallback (the supervisor passes that routing explicitly).
+  // `lessons.proposal`: a Book of Lessons update the owner alone approves
+  // (owner decision 2026-10-07).
   return kind.startsWith('decisions.degraded.') ||
-    ['supervision.breaker', 'port-squat', 'roll-port-squat', 'worktree-sweep-paused'].includes(kind);
+    ['supervision.breaker', 'port-squat', 'roll-port-squat', 'worktree-sweep-paused', 'lessons.proposal'].includes(kind);
 }
 
 export function isNotificationRouting(value: string): value is NotificationRouting {
@@ -423,6 +499,13 @@ export interface NotificationRecord {
 
 /** Marker for not-found failures the HTTP surface maps to 404 (typed —
  * never grepped from error text). */
+export class NotificationIdentityError extends Error {
+  constructor() {
+    super('notification id contains NUL; SQLite cannot round-trip this identity — use an ID without NUL characters');
+    this.name = 'NotificationIdentityError';
+  }
+}
+
 export class RecordNotFound extends Error {
   constructor(message: string) {
     super(message);
@@ -467,7 +550,7 @@ export interface AdminCloseoutProviderEvidence {
   readonly headSha: string;
   /** The provider's close timestamp when the caller has one (recorded
    * verbatim; never compared — the observation event is the binding). */
-  readonly closedAt?: string;
+  readonly closedAt?: string | null;
 }
 
 export interface AdminCloseoutInput {
@@ -484,77 +567,6 @@ export interface AdminCloseoutInput {
 export interface AdminCloseoutResult {
   readonly job: JobRecord;
   /** The `job.admin-closeout` audit event (the ORIGINAL on a replay). */
-  readonly event: EventRecord;
-  readonly idempotent: boolean;
-}
-
-// ------------------------------------------------------------------
-// Authoritative runtime facts (issue #171) for closeout live-work
-// guards. The ledger cannot infer execution from its own rows: a real
-// observed row was ledger `idle` while effective status was `streaming`
-// with an open turn. The service supplies the live registry handle set
-// and the supervisor's per-agent view at the commit boundary.
-// ------------------------------------------------------------------
-
-/** The supervisor's view for one agent, reduced to liveness facts. The
- * state union mirrors the supervisor's real set (watching/restarting/
- * stopped) so a new state cannot silently pass through the guard. */
-export interface CloseoutSupervisionView {
-  readonly state: 'watching' | 'restarting' | 'stopped';
-  readonly breakerOpen: boolean;
-  readonly openTurn: boolean;
-  /** Optional because stopped/remembered views may omit it; an UNKNOWN
-   * value on a view that is not explicitly stopped fails closed (blocks). */
-  readonly openControl?: boolean;
-  readonly openToolCalls: number;
-}
-
-/** Authoritative liveness facts at the commit boundary. `liveHandleIds`
- * is null when the caller cannot answer ownership; durable supervision
- * stops are deliberately NOT ownership (a stopped lane stays current in
- * the board's union, but it is not live execution). */
-export interface CloseoutRuntimeProbe {
-  readonly liveHandleIds: ReadonlySet<string> | null;
-  readonly supervisionFor: (agentId: string) => CloseoutSupervisionView | null;
-}
-
-/** Why an owner-listed administrative cancellation was refused. Each
- * refusal is a loud no-effect failure. */
-export type AdminCancellationRefusalCode =
-  | 'not-listed'
-  | 'not-parked'
-  | 'not-cancellable-shape'
-  | 'live-work'
-  | 'already-closed';
-
-/** A guarded owner-cancellation refused by a durable-state fact. */
-export class AdminCancellationRefusal extends Error {
-  constructor(
-    readonly code: AdminCancellationRefusalCode,
-    message: string,
-  ) {
-    super(message);
-    this.name = 'AdminCancellationRefusal';
-  }
-}
-
-/** The owner-cancellation form (owner amendment j-1117): administrative
- * abandonment of an EXACT allowlisted parked legacy lane that carries no
- * registered PR and no report metadata. */
-export interface AdminCancellationInput {
-  readonly jobId: string;
-  /** Optimistic concurrency: the only admitted source state. */
-  readonly expectedStatus: 'parked';
-  /** The explicit owner authority this request stands on (recorded
-   * verbatim; the allowlist membership is the executable guard). */
-  readonly authorityReference: string;
-  /** Why the cancellation is requested (recorded verbatim; bounded). */
-  readonly reason: string;
-}
-
-export interface AdminCancellationResult {
-  readonly job: JobRecord;
-  /** The `job.owner-cancellation` audit event (the ORIGINAL on a replay). */
   readonly event: EventRecord;
   readonly idempotent: boolean;
 }
@@ -600,6 +612,16 @@ export class DirectiveConflictError extends Error {
  * The lane is single-writer: ANY different request id (identified or not)
  * fails closed with the live request named — only a replay of that same id
  * proceeds, so a fresh id never starts a second concurrent turn. */
+/** Owner rule 5 (2026-10-08): the lane has exactly one writer request at a
+ * time. A directive is refused while a re-brief request stands, and a
+ * re-brief while a directive request is live — never two writers. */
+export class LaneWriterConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'LaneWriterConflictError';
+  }
+}
+
 export class AmbiguousDirectiveError extends Error {
   constructor(message: string) {
     super(message);
@@ -615,6 +637,16 @@ export class PhaseHandoffConflictError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'PhaseHandoffConflictError';
+  }
+}
+
+/** A job named a parent (the megaminion family link) the ledger cannot
+ * accept: unknown, itself, another repo's, a child itself, or a child
+ * that is not a report-type specialist. Thrown before any row is written. */
+export class JobParentError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'JobParentError';
   }
 }
 
@@ -889,6 +921,15 @@ export interface PendingRebriefRecord {
    * because the marker is the durable request. */
   readonly ruleId: string | null;
   readonly sourceRoundId: string | null;
+  /** The autopilot provenance (issue #243 M3): `'silas-autopilot'` when the
+   * durable request was minted by the code autopilot, null for LLM Silas's
+   * own re-brief. The finalizer replays it onto the `silas.rebrief` receipt
+   * so #214 can attribute the action. */
+  readonly source: string | null;
+  /** The required work revision the request was composed with (owner rule
+   * 4); the re-brief delivery carries it as its receipt. null = a request
+   * accepted before work revisions existed. */
+  readonly workRevision: number | null;
   readonly requestedAt: string;
 }
 
@@ -980,9 +1021,19 @@ function isRealIsoUtcTimestamp(value: string): boolean {
   return Number.isFinite(ms) && new Date(ms).toISOString() === normalized;
 }
 
+const DIRECTIVE_CONTROL_SQL = `kind IN ('silas.directive-retired', 'silas.directive-recovery-handoff', 'silas.rebrief-recovery-handoff', 'job.amendment-accepted')
+  OR (kind = 'job.status' AND json_extract(payload, '$.to') IN ('parked', 'blocked', 'needs-owner', 'merged', 'done', 'binned'))
+  OR (kind = 'job.obligation-recorded' AND json_extract(payload, '$.next_action.kind') = 'owner-decision')
+  OR (kind = 'ruling.recorded' AND json_extract(payload, '$.permission') = 'fresh-current-approved-recovery-successor')
+  OR kind IN ('silas.recovery-owner-stop-confirmed', 'silas.rebrief-control-closed')`;
+
 export class LedgerApi {
   private readonly db: DatabaseSync;
   private readonly bus: EventBus | null;
+  /** Process-local ownership across the asynchronous gap BEFORE a worker
+   * has a registered spawning turn. Historical durable requests are NOT a
+   * permanent blocker after their runtime attempt settles or crashes. */
+  private readonly activeJobAdmissions = new Set<{ readonly jobId: string; readonly kind: string }>();
 
   constructor(db: DatabaseSync, opts: { bus?: EventBus } = {}) {
     this.db = db;
@@ -1007,6 +1058,7 @@ export class LedgerApi {
       result = write();
       this.db.exec('COMMIT');
     } catch (error) {
+      this.mailboxProjectionCache = null;
       this.pendingEvents.length = 0; // rolled back — phantom events are never published
       this.db.exec('ROLLBACK');
       throw error;
@@ -1026,6 +1078,8 @@ export class LedgerApi {
     lens?: string | null;
     payload?: unknown;
   }): BusEvent {
+    if (fields.kind === 'silas.directive-settled' && typeof fields.payload === 'object' && fields.payload !== null &&
+        Object.hasOwn(fields.payload, 'candidate_delivery_proven')) this.assertNativeSettlementCandidate(fields.jobId ?? null, fields.payload as Record<string, unknown>);
     const ts = nowIso();
     const info = this.db
       .prepare(
@@ -1209,22 +1263,42 @@ export class LedgerApi {
     ).map((row) => this.eventFromRow(row));
   }
 
-  /** R8-2 (gh-169): a job's completed verification runs, KIND-SCOPED and
-   * newest-first — the binding-target search must not be truncated by a
-   * generic all-kind event window. The bound is a loud ceiling: a job with
-   * more completed verification runs than this window throws instead of
-   * letting absence masquerade as "no binding run". */
-  listJobVerificationCompleted(jobId: string, limit = 200): readonly EventRecord[] {
-    const rows = this.db
-      .prepare('SELECT COUNT(*) AS total FROM events WHERE job_id = ? AND kind = ?')
-      .all(jobId, VERIFICATION_KIND) as Row[];
-    const total = typeof rows[0]?.total === 'number' ? (rows[0] as { total: number }).total : 0;
-    if (total > limit) {
-      throw new Error(`verification history window exceeded for job ${jobId} (${total} completed runs > ${limit}) — cannot prove the newest target-bound run from a truncated search`);
+  /** R8-2 (gh-169, corrected by j-1594 native-verification-history-search):
+   * a job's completed verification runs, KIND-SCOPED and newest-first — the
+   * binding-target search must not be truncated by a generic all-kind event
+   * window. The history is read in bounded keyset pages over the COMPLETE
+   * record: there is NO finite per-job lifetime ceiling, so any history
+   * length is reviewable. The scan is lazy — the caller may stop at the
+   * first binding run, so the common case fetches one page, while proving
+   * absence exhausts every page. Each fetch is bounded by `pageSize`; a
+   * storage failure throws while the caller iterates, so a partial read can
+   * never masquerade as an empty history. A first-captured `MAX(seq)`
+   * watermark bounds every page (`cursor` starts one past it and only
+   * decreases), so the page set stays stable and each row is visited
+   * exactly once. The returned iterator is single-use — consume it once
+   * inside the caller's loop (a second pass yields nothing). The page-size
+   * refusal and the watermark read are taken on the FIRST pull, not at the
+   * call (a generator body does not run until then). */
+  *iterateJobVerificationCompleted(jobId: string, pageSize = 200): Generator<EventRecord, void, void> {
+    if (!Number.isInteger(pageSize) || pageSize <= 0) {
+      throw new Error(`iterateJobVerificationCompleted pageSize must be a positive integer (got ${String(pageSize)})`);
     }
-    return (this.db
-      .prepare('SELECT * FROM events WHERE job_id = ? AND kind = ? ORDER BY seq DESC LIMIT ?')
-      .all(jobId, VERIFICATION_KIND, limit) as Row[]).map((row) => this.eventFromRow(row));
+    const ceilingRow = this.db
+      .prepare('SELECT MAX(seq) AS ceiling FROM events WHERE job_id = ? AND kind = ?')
+      .get(jobId, VERIFICATION_KIND) as Row | undefined;
+    const ceiling = ceilingRow?.ceiling;
+    if (ceiling === null || ceiling === undefined) return;
+    const watermark = Number(ceiling);
+    let cursor = watermark + 1;
+    for (;;) {
+      const rows = this.db
+        .prepare('SELECT * FROM events WHERE job_id = ? AND kind = ? AND seq <= ? AND seq < ? ORDER BY seq DESC LIMIT ?')
+        .all(jobId, VERIFICATION_KIND, watermark, cursor, pageSize) as Row[];
+      if (rows.length === 0) return;
+      for (const row of rows) yield this.eventFromRow(row);
+      if (rows.length < pageSize) return;
+      cursor = Number(rows[rows.length - 1]!.seq);
+    }
   }
 
   /** True while any verification RUN for the job is unsettled: its latest
@@ -1239,17 +1313,111 @@ export class LedgerApi {
         `SELECT 1 AS unsettled FROM (
            SELECT json_extract(payload, '$.run_id') AS run_id,
                   MAX(CASE WHEN kind IN ('verification.requested', 'verification.started') THEN seq ELSE 0 END) AS open_seq,
-                  MAX(CASE WHEN kind IN ('verification.completed', 'verification.stale-released', 'verification.reconciled', 'verification.lock-timeout') THEN seq ELSE 0 END) AS settled_seq
+                  MAX(CASE WHEN kind IN ('verification.completed', 'verification.stale-released', 'verification.reconciled', 'verification.lock-timeout', 'verification.no-start') THEN seq ELSE 0 END) AS settled_seq
            FROM events
            WHERE job_id = ? AND kind IN (
              'verification.requested', 'verification.started', 'verification.completed',
-             'verification.stale-released', 'verification.reconciled', 'verification.lock-timeout'
+             'verification.stale-released', 'verification.reconciled', 'verification.lock-timeout', 'verification.no-start'
            )
            GROUP BY run_id
          ) WHERE open_seq > settled_seq LIMIT 1`,
       )
       .get(jobId) as Row | undefined;
     return row !== undefined;
+  }
+
+  /** Authoritative terminal readback may close only absent matching physical
+   * registry rows. Process-group absence prevents detached children being lost;
+   * live, EPERM, PID reuse and foreign commands remain untouched. */
+  reconcileVerificationProcesses(input: { readonly jobId: string; readonly runId: string; readonly requestId: string;
+    readonly command: string; readonly cwd: string; readonly worktreeId: string }): void {
+    const absent = (pid: number): boolean => {
+      try { process.kill(pid, 0); return false; }
+      catch (error) { return (error as NodeJS.ErrnoException).code === 'ESRCH'; }
+    };
+    this.transaction(() => {
+      const lane = this.getWorktree(input.worktreeId);
+      if (lane?.jobId !== input.jobId || lane.path !== input.cwd) return;
+      const terminal = this.db.prepare(`SELECT seq FROM events WHERE job_id = ?
+        AND (kind = 'verification.completed' OR kind = 'verification.reconciled' AND json_extract(payload, '$.state') = 'completed')
+        AND json_extract(payload, '$.run_id') = ? ORDER BY seq DESC LIMIT 1`).get(input.jobId, input.runId) as Row | undefined;
+      const conflictingTerminal = this.db.prepare(`SELECT 1 FROM events WHERE job_id = ? AND kind = 'verification.completed'
+        AND json_extract(payload, '$.run_id') = ? AND
+        (json_extract(payload, '$.command') IS NOT ? OR json_extract(payload, '$.cwd') IS NOT ?) LIMIT 1`)
+        .get(input.jobId, input.runId, input.command, input.cwd);
+      if (conflictingTerminal !== undefined) return;
+      if (terminal === undefined || !this.hasJobEventWithPayloadValues(input.jobId, ['verification.requested', 'verification.attached'],
+        [{ key: 'run_id', value: input.runId }, { key: 'request_id', value: input.requestId }], 0)) return;
+      const evidence = this.db.prepare(`SELECT seq, kind,
+        CASE WHEN length(CAST(payload AS BLOB)) <= ? THEN payload ELSE NULL END AS payload,
+        length(CAST(payload AS BLOB)) AS payload_bytes FROM events WHERE job_id = ?
+        AND kind IN ('verification.started', 'verification.process-started')
+        AND json_extract(payload, '$.run_id') = ? ORDER BY seq LIMIT ?`)
+        .iterate(MAX_VERIFICATION_PROCESS_RECEIPT_BYTES, input.jobId, input.runId, MAX_VERIFICATION_PROCESS_RECEIPT_EVENTS + 1);
+      const receipts: Row[] = [];
+      let receiptBytes = 0;
+      for (const row of evidence) {
+        receiptBytes += Number(row.payload_bytes);
+        if (receipts.length === MAX_VERIFICATION_PROCESS_RECEIPT_EVENTS || row.payload === null ||
+            receiptBytes > MAX_VERIFICATION_PROCESS_RECEIPT_BYTES) {
+          throw new DirectiveCheckpointError('verification process receipt inspection exceeds the original complete-evidence bounds; physical ownership remains UNKNOWN');
+        }
+        receipts.push(row);
+      }
+      const starts = receipts.filter((row) => row.kind === 'verification.started');
+      const started = starts[0];
+      if (started === undefined || Number(started.seq) >= Number(terminal.seq)) return;
+      const physical = JSON.parse(str(started.payload)) as { pid?: unknown; command?: unknown; cwd?: unknown; sha?: unknown };
+      if (!Number.isSafeInteger(physical.pid) || Number(physical.pid) <= 0 || physical.command !== input.command || physical.cwd !== input.cwd ||
+          starts.some((event) => { const facts = JSON.parse(str(event.payload)) as typeof physical;
+            return Number(event.seq) >= Number(terminal.seq) || facts.pid !== physical.pid || facts.command !== input.command || facts.cwd !== input.cwd; })) return;
+      const nativeStarts = receipts.filter((row) => row.kind === 'verification.process-started');
+      const identities: Array<{ readonly seq: number; readonly pid: number; readonly command: string }> = [];
+      if (nativeStarts.length === 0) {
+        // Prior whole-command receipts stay valid exactly as recorded. A null
+        // reuse start never gets today's PID or step facts backfilled here.
+        identities.push({ seq: Number(started.seq), pid: Number(physical.pid), command: `/bin/sh -c ${input.command}` });
+      } else {
+        const plan = planCommand(input.command);
+        const steps = plan.buildIndex !== null && plan.refusal === null ? plan.steps : [input.command];
+        const indices = new Set<number>();
+        const pids = new Set<number>();
+        let stepCount: number | null = null;
+        for (const event of nativeStarts) {
+          const facts = JSON.parse(str(event.payload)) as { pid?: unknown; command?: unknown; cwd?: unknown; sha?: unknown;
+            process_command?: unknown; step_command?: unknown; step_index?: unknown; step_count?: unknown };
+          const index = Number(facts.step_index);
+          const count = Number(facts.step_count);
+          const pid = Number(facts.pid);
+          const monolithic = count === 1 && index === 0 && facts.step_command === input.command;
+          if (!Number.isSafeInteger(facts.pid) || pid <= 0 || !Number.isSafeInteger(facts.step_index) || !Number.isSafeInteger(facts.step_count) ||
+              index < 0 || count <= 0 || index >= count || indices.has(index) || pids.has(pid) ||
+              Number(event.seq) >= Number(terminal.seq) || facts.command !== input.command || facts.cwd !== input.cwd || facts.sha !== physical.sha ||
+              facts.process_command !== `/bin/sh -c ${String(facts.step_command)}` ||
+              (!monolithic && (count !== steps.length || facts.step_command !== steps[index])) ||
+              (stepCount !== null && count !== stepCount)) return;
+          stepCount = count;
+          indices.add(index); pids.add(pid);
+          identities.push({ seq: Number(event.seq), pid, command: String(facts.process_command) });
+        }
+        if (identities[0]?.pid !== physical.pid) return;
+      }
+      for (const identity of identities) {
+        // Both old and per-step receipts of another run fence PID reuse.
+        const conflicting = this.db.prepare(`SELECT 1 FROM events WHERE kind IN ('verification.started', 'verification.process-started')
+          AND json_extract(payload, '$.pid') = ? AND (job_id IS NOT ? OR json_extract(payload, '$.run_id') IS NOT ?) LIMIT 1`)
+          .get(identity.pid, input.jobId, input.runId);
+        if (conflicting !== undefined) continue;
+        for (const row of this.listWorktreeProcesses(input.worktreeId)) {
+          if (row.pid !== identity.pid || row.state !== 'live' || row.evidence !== 'registry' || row.command !== identity.command || !absent(row.pid) || !absent(-row.pid)) continue;
+          this.db.prepare(`UPDATE worktree_processes SET state = 'killed', last_seen = ? WHERE worktree_id = ? AND pid = ? AND state = 'live'`).run(nowIso(), input.worktreeId, row.pid);
+          this.appendEvent({ kind: 'verification.process-reconciled', jobId: input.jobId, payload: {
+            request_id: input.requestId, run_id: input.runId, started_event_seq: identity.seq, terminal_event_seq: Number(terminal.seq), worktree_id: input.worktreeId,
+            pid: row.pid, command: row.command, evidence: 'original-pid-and-process-group-absent',
+          } });
+        }
+      }
+    });
   }
 
   /** Latest durable event for one job/kind (ops follow-through checks). */
@@ -1276,6 +1444,30 @@ export class LedgerApi {
         .prepare(`SELECT * FROM events WHERE job_id = ? AND kind IN (${placeholders}) ORDER BY seq DESC LIMIT ?`)
         .all(jobId, ...(kinds as string[]), limit) as Row[]
     ).map((row) => this.eventFromRow(row));
+  }
+
+  /** A job's lifetime counters for one event kind: how many such events
+   * exist, and the summed length of a JSON-array payload field across them.
+   * Both are SQL aggregates over the COMPLETE record, so a value can never
+   * age out of a fixed newest-N window — `total > 0` stays true however many
+   * later events of the same kind follow. `field` is a fixed payload key
+   * supplied by the caller (never request data). */
+  countJobEventsAndArrayFieldLength(
+    jobId: string,
+    kind: string,
+    field: string,
+  ): { readonly events: number; readonly total: number } {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(field)) {
+      throw new Error(`payload field must be a simple JSON key (got ${JSON.stringify(field)})`);
+    }
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS events,
+                COALESCE(SUM(COALESCE(json_array_length(json_extract(payload, '$.${field}')), 0)), 0) AS total
+           FROM events WHERE job_id = ? AND kind = ?`,
+      )
+      .get(jobId, kind) as { events: number; total: number };
+    return { events: Number(row.events), total: Number(row.total) };
   }
 
   /** A marked request's guarded event, however many newer unrelated job
@@ -1426,6 +1618,11 @@ export class LedgerApi {
     commissioner?: string | null;
     targetRef?: string | null;
     targetSha?: string | null;
+    /** The commissioning job (a megaminion's parent heist). Only a
+     * report-type job (review/artifact/investigation) may name one, and
+     * the parent must exist, share the repo, and itself be top-level;
+     * every refusal is a JobParentError. */
+    parentJobId?: string | null;
   }): JobRecord {
     if (input.id === '' || input.repo === '' || input.title === '') {
       throw new Error('job id, repo, and title must be non-empty');
@@ -1474,6 +1671,28 @@ export class LedgerApi {
     if (!isReportKind && (input.targetRef !== undefined || input.targetSha !== undefined)) {
       throw new Error(`job target_ref/target_sha are report-job fields — job "${input.id}" is not a report-type deliverable`);
     }
+    // Job family (migration job-parent): same upgrade-fixture rule — a
+    // caller that SUPPLIES a parent on an older schema fails loud.
+    const parentJobId = input.parentJobId ?? null;
+    if (parentJobId !== null) {
+      if (!this.jobsColumns().has('parent_job_id')) {
+        throw new JobParentError('job parent requires migration job-parent (the column is missing on this database)');
+      }
+      if (parentJobId.trim() === '') {
+        throw new JobParentError('job parent_job_id must be a non-empty string when present');
+      }
+      if (parentJobId === input.id) {
+        throw new JobParentError(`job "${input.id}" cannot name itself as its parent job`);
+      }
+      // A megaminion is a specialist handing back a report; a PR-owing
+      // lane is a heist in its own right and never hides under another.
+      if (input.deliverable === undefined || input.deliverable === null || !isReportDeliverable(input.deliverable)) {
+        throw new JobParentError(
+          `job "${input.id}" names parent job "${parentJobId}" but is not a report-type job — ` +
+            'only review/artifact/investigation specialists nest under a heist',
+        );
+      }
+    }
     if (input.displayName !== undefined && input.displayName !== null && input.displayName.trim() === '') {
       throw new Error('job display name must be a non-empty string');
     }
@@ -1503,6 +1722,23 @@ export class LedgerApi {
           `job id "${input.id}" is reserved by an accepted pipeline entry (${reserved.state}) — a direct job cannot take it`,
         );
       }
+      if (parentJobId !== null) {
+        const parent = this.getJob(parentJobId);
+        if (parent === null) {
+          throw new JobParentError(`job "${input.id}" names parent job "${parentJobId}", which does not exist`);
+        }
+        if (parent.repo !== input.repo) {
+          throw new JobParentError(
+            `job "${input.id}" (repo ${input.repo}) names parent job "${parentJobId}" from another repo (${parent.repo})`,
+          );
+        }
+        if (parent.parentJobId !== null) {
+          throw new JobParentError(
+            `job "${input.id}" names parent job "${parentJobId}", which is itself a child of "${parent.parentJobId}" — ` +
+              'job families are one level deep; commission it from the top-level job instead',
+          );
+        }
+      }
       const ts = nowIso();
       this.db
         .prepare(
@@ -1523,6 +1759,9 @@ export class LedgerApi {
             : []),
           ts, ts,
         );
+      if (parentJobId !== null) {
+        this.db.prepare('UPDATE jobs SET parent_job_id = ? WHERE id = ?').run(parentJobId, input.id);
+      }
       this.appendEvent({
         kind: 'job.created',
         jobId: input.id,
@@ -1533,6 +1772,7 @@ export class LedgerApi {
           ...(isReportKind
             ? { commissioner: input.commissioner ?? null, target_ref: input.targetRef ?? null, target_sha: input.targetSha ?? null }
             : {}),
+          ...(parentJobId !== null ? { parent_job_id: parentJobId } : {}),
         },
       });
       return this.getJob(input.id) as JobRecord;
@@ -1575,9 +1815,9 @@ export class LedgerApi {
   /** The one jobs-row status write + `job.status` event. Callers assert
    * their own transition first (the generic machine vs. the audited
    * administrative-closeout edge); the write shape lives in one place. */
-  private writeJobStatus(id: string, from: JobStatus, to: JobStatus): EventRecord {
+  private writeJobStatus(id: string, from: JobStatus, to: JobStatus, extra?: Readonly<Record<string, unknown>>): EventRecord {
     this.db.prepare('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?').run(to, nowIso(), id);
-    return this.appendEvent({ kind: 'job.status', jobId: id, payload: { from, to } });
+    return this.appendEvent({ kind: 'job.status', jobId: id, payload: { ...extra, from, to } });
   }
 
   setJobStatus(id: string, status: string, context?: BlockerContext): JobRecord {
@@ -1590,6 +1830,15 @@ export class LedgerApi {
       if (current === null) throw new RecordNotFound(`job "${id}" not found`);
       if (current.status !== status) {
         assertJobTransition(current.status, status);
+        if (status === 'binned') {
+          // A discard closes debt but does NOT stop its producers. Refuse
+          // atomically until the owner/chief has stopped target-owned work;
+          // a bare status write must never conceal a live worker or review.
+          const blockers = this.terminalLiveWorkBlockers(id);
+          if (blockers.length > 0) {
+            throw new Error(`job "${id}" has target-owned live work — stop it before binning: ${blockers.join('; ')}`);
+          }
+        }
         const event = this.writeJobStatus(id, current.status, status);
         // Status/obligation consistency lives AT this transactional boundary
         // (chief ruling A): every writer — dispatch, HTTP API, future hooks —
@@ -1605,7 +1854,7 @@ export class LedgerApi {
           );
         } else if (status === 'parked') {
           this.suspendApplicableObligations(id, 'job parked — obligation suspended by explicit durable state');
-        } else if (status === 'done' || status === 'merged') {
+        } else if (isJobTerminal(status)) {
           this.closeApplicableObligations(id, status);
         }
       } else if (status === 'blocked' && context !== undefined) {
@@ -1644,7 +1893,7 @@ export class LedgerApi {
    * silently folded into the recorded one. Directive/re-brief rows,
    * worktrees, rounds, agents and children are never rewritten — historical
    * uncertain-control rows stay truthful history. */
-  adminCloseParkedJob(input: AdminCloseoutInput, runtime: CloseoutRuntimeProbe | null = null): AdminCloseoutResult {
+  adminCloseParkedJob(input: AdminCloseoutInput): AdminCloseoutResult {
     if (input.expectedStatus !== 'parked') {
       throw new Error(
         `administrative closeout admits expected_status "parked" only (got ${JSON.stringify(input.expectedStatus)})`,
@@ -1690,8 +1939,8 @@ export class LedgerApi {
     if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u.test(headSha)) {
       throw new Error(`provider head_sha must be a full 40- or 64-character hex commit sha (got ${JSON.stringify(evidence.headSha)})`);
     }
-    const closedAt = evidence.closedAt;
-    if (closedAt !== undefined && (typeof closedAt !== 'string' || !isRealIsoUtcTimestamp(closedAt))) {
+    const closedAt = evidence.closedAt ?? null;
+    if (closedAt !== null && (typeof closedAt !== 'string' || !isRealIsoUtcTimestamp(closedAt))) {
       throw new Error(`provider closed_at must be a real ISO-8601 UTC timestamp when present (got ${JSON.stringify(closedAt)})`);
     }
     const reason = input.reason.trim();
@@ -1713,7 +1962,7 @@ export class LedgerApi {
             job_id: job.id,
             expected_status: 'parked',
             expected_pr_url: expectedPrUrl,
-            provider: { provider: 'github', state: 'closed', merged: false, head_sha: headSha, closed_at: closedAt ?? null },
+            provider: { provider: 'github', state: 'closed', merged: false, head_sha: headSha, closed_at: closedAt },
             reason,
           }),
         )
@@ -1844,7 +2093,7 @@ export class LedgerApi {
       }
 
       // Live-work fence: refusal names every durable execution blocker.
-      const blockers = this.closeoutLiveWorkBlockers(job.id, runtime);
+      const blockers = this.terminalLiveWorkBlockers(job.id);
       if (blockers.length > 0) {
         throw new AdminCloseoutRefusal(
           'live-work',
@@ -1862,7 +2111,7 @@ export class LedgerApi {
           disposition: 'closed-without-merge',
           expected_status: 'parked',
           expected_pr_url: expectedPrUrl,
-          provider: { provider: 'github', state: 'closed', merged: false, head_sha: headSha, closed_at: closedAt ?? null },
+          provider: { provider: 'github', state: 'closed', merged: false, head_sha: headSha, closed_at: closedAt },
           observation: {
             event_seq: observationEvent.seq,
             observed_at: observationEvent.ts,
@@ -1883,64 +2132,24 @@ export class LedgerApi {
     });
   }
 
-  /** The authoritative live-work fence for both closeout forms. Durable
-   * execution markers (open worker turns, non-terminal tracked children,
-   * live review rounds, unsettled verification runs) block. With the
-   * runtime probe wired, the supervisor's open turn/control/tool activity
-   * and openControl block even when the ledger row reads `idle` (the
-   * observed false-idle case), and a LIVE registry handle for a job-bound
-   * agent blocks as live task ownership. An explicit supervision stop
-   * (state stopped or breaker open) SHORT-CIRCUITS the agent's remaining
-   * clauses: the recorded stop is the runtime's own cessation signal, so
-   * a durable `streaming` row or a not-yet-disposed handle behind it is
-   * stale bookkeeping, not execution (disposal after a stop is
-   * best-effort; the stop precedence is documented in docs/LEDGER.md).
-   * Without a probe, only the durable markers answer. Idle/disposed/
-   * historical bookkeeping rows are never execution evidence; directive/
-   * re-brief control rows are owned by their own reconcilers and are
-   * neither read nor rewritten. */
-  private closeoutLiveWorkBlockers(jobId: string, runtime: CloseoutRuntimeProbe | null): readonly string[] {
+  /** Durable execution blockers for an irreversible terminal disposition:
+   * open worker turns, non-terminal tracked children, live review rounds
+   * and unsettled verification runs. Idle/disposed/historical bookkeeping
+   * rows are NOT execution evidence (issue #171 ownership classifies
+   * leftovers at the runtime boundary; a historical gap must not block a
+   * truthful closure) and directive/re-brief control rows are owned by
+   * their own reconcilers — neither is read here. */
+  private terminalLiveWorkBlockers(jobId: string): readonly string[] {
     const blockers: string[] = [];
-    const openTurns: string[] = [];
-    const ownedSessions: string[] = [];
-    for (const agent of this.listAgents()) {
-      if (agent.jobId !== jobId) continue;
-      const view = runtime?.supervisionFor(agent.id) ?? null;
-      if (view !== null) {
-        // The supervisor's state set is watching|restarting|stopped; live
-        // execution is an open turn/control/tool call or an active restart.
-        // An UNKNOWN openControl on a view that is not explicitly stopped
-        // fails closed (the reclaim probe treats the same absence as
-        // non-reclaimable).
-        const explicitlyStopped = view.state === 'stopped' || view.breakerOpen === true;
-        const openWork =
-          view.openTurn === true ||
-          view.openControl === true ||
-          (!explicitlyStopped && view.openControl === undefined) ||
-          view.openToolCalls > 0 ||
-          view.state === 'restarting';
-        if (openWork) {
-          openTurns.push(
-            `${agent.id} (supervision ${view.state}${view.openTurn ? ', openTurn' : ''}${view.openControl ? ', openControl' : ''}${view.openToolCalls > 0 ? `, ${view.openToolCalls} open tool call(s)` : ''})`,
-          );
-          continue;
-        }
-        if (explicitlyStopped) continue; // explicitly stopped — not live execution
-      }
-      if (agent.state === 'spawning' || agent.state === 'streaming') {
-        openTurns.push(`${agent.id} (${agent.state})`);
-        continue;
-      }
-      const liveHandles = runtime?.liveHandleIds ?? null;
-      if (liveHandles !== null && liveHandles.has(agent.id)) {
-        ownedSessions.push(`${agent.id} (${agent.state})`);
-      }
-    }
+    const openTurns = this.listAgents().filter(
+      (agent) => agent.jobId === jobId && (agent.state === 'spawning' || agent.state === 'streaming'),
+    );
     if (openTurns.length > 0) {
-      blockers.push(`open worker turn(s): ${openTurns.join(', ')}`);
+      blockers.push(`open worker turn(s): ${openTurns.map((agent) => `${agent.id} (${agent.state})`).join(', ')}`);
     }
-    if (ownedSessions.length > 0) {
-      blockers.push(`runtime-owned live session(s): ${ownedSessions.join(', ')}`);
+    const admissions = [...this.activeJobAdmissions].filter((entry) => entry.jobId === jobId);
+    if (admissions.length > 0) {
+      blockers.push(`in-flight admission(s): ${admissions.map((entry) => entry.kind).join(', ')}`);
     }
     const children = this.listChildWorkers({ jobId }).filter((child) => child.resultState === null);
     if (children.length > 0) {
@@ -1954,152 +2163,6 @@ export class LedgerApi {
       blockers.push('unsettled verification run(s) hold the lane');
     }
     return blockers;
-  }
-
-  /** Owner cancellation (owner amendment j-1117): the ONE audited path
-   * that administratively abandons an EXACT allowlisted parked legacy
-   * lane. Unlike the PR closeout it requires no provider receipt — these
-   * lanes have no registered PR and NULL legacy report metadata, and the
-   * amendment forbids inventing those values — but it is narrower: the
-   * job id must be on the frozen owner list, the lane must be parked,
-   * PR-free and report-metadata-free, and no target-owned work may be
-   * live. The audit records the owner authority reference, the exact
-   * prior identity, and the terminal disposition
-   * (`owner-cancelled-abandoned` → `done`); obligations close with
-   * `job-terminal` abandonment semantics. History, control rows, report
-   * evidence, worktrees and preservation holds are never rewritten, and
-   * cancellation is never a passing review, successful implementation or
-   * merge receipt. */
-  adminCancelListedParkedJob(
-    input: AdminCancellationInput,
-    runtime: CloseoutRuntimeProbe | null = null,
-  ): AdminCancellationResult {
-    if (input.expectedStatus !== 'parked') {
-      throw new Error(
-        `owner cancellation admits expected_status "parked" only (got ${JSON.stringify(input.expectedStatus)})`,
-      );
-    }
-    const authorityReference =
-      typeof input.authorityReference === 'string' ? input.authorityReference.trim() : '';
-    if (
-      authorityReference === '' ||
-      authorityReference.length > 200 ||
-      /[\p{Cc}]/u.test(authorityReference.replaceAll('\n', '').replaceAll('\t', ''))
-    ) {
-      throw new Error('authority_reference must be bounded printable text (1-200 characters)');
-    }
-    const reason = input.reason.trim();
-    if (reason === '' || reason.length > 2_000 || /[\p{Cc}]/u.test(reason.replaceAll('\n', '').replaceAll('\t', ''))) {
-      throw new Error('reason must be bounded printable text (1-2000 characters)');
-    }
-
-    return this.transaction(() => {
-      const job = this.getJob(input.jobId);
-      if (job === null) throw new RecordNotFound(`job "${input.jobId}" not found`);
-      // Exact allowlist first: an unlisted batch target never reaches any
-      // other guard, whatever its state.
-      if (!isOwnerCancellationListed(job.id)) {
-        throw new AdminCancellationRefusal(
-          'not-listed',
-          `job "${job.id}" is not on the owner-authorized cancellation list (ruling ${OWNER_CANCELLATION_RULING}) — no batch scan applies`,
-        );
-      }
-      // Replay identity covers every validated request field in a fixed
-      // order; it is checked before the current-row shape guards so an
-      // identical retry still returns the recorded event.
-      const requestSha256 = createHash('sha256')
-        .update(
-          JSON.stringify({
-            job_id: job.id,
-            form: 'owner-cancellation',
-            expected_status: 'parked',
-            authority_reference: authorityReference,
-            reason,
-          }),
-        )
-        .digest('hex');
-      if (job.status === 'done') {
-        const recorded = this.latestJobEvent(job.id, 'job.owner-cancellation');
-        const recordedSha =
-          recorded !== null && typeof recorded.payload === 'object' && recorded.payload !== null
-            ? (recorded.payload as { request_sha256?: unknown }).request_sha256
-            : undefined;
-        if (recorded !== null && recordedSha === requestSha256) {
-          return { job, event: recorded, idempotent: true };
-        }
-        const prCloseout = this.latestJobEvent(job.id, 'job.admin-closeout');
-        throw new AdminCancellationRefusal(
-          'already-closed',
-          recorded === null
-            ? `job "${job.id}" is already done${prCloseout === null ? '' : ` (PR closeout event ${prCloseout.seq})`} — not by this cancellation request; re-read the record`
-            : typeof recordedSha !== 'string'
-              ? `job "${job.id}" is already cancelled and its recorded event (${recorded.seq}) carries no readable request identity — inspect the recorded event before retrying`
-              : `job "${job.id}" is already cancelled under a DIFFERENT request (event ${recorded.seq}); a changed request never overwrites the recorded one`,
-        );
-      }
-      if (job.status !== 'parked') {
-        throw new AdminCancellationRefusal(
-          'not-parked',
-          `job "${job.id}" is ${job.status} — owner cancellation admits only a parked lane (expected_status "parked")`,
-        );
-      }
-      // The cancellation form is for the named legacy lanes' exact shape:
-      // no registered PR and no report metadata. Anything else is a
-      // different disposition and stays with its own form.
-      if (job.prUrl !== null) {
-        throw new AdminCancellationRefusal(
-          'not-cancellable-shape',
-          `job "${job.id}" registers PR "${job.prUrl}" — a PR-backed lane uses the provider closeout form, never owner cancellation`,
-        );
-      }
-      if (job.deliverable !== null || job.commissioner !== null || job.targetRef !== null || job.targetSha !== null) {
-        throw new AdminCancellationRefusal(
-          'not-cancellable-shape',
-          `job "${job.id}" carries report metadata (deliverable ${JSON.stringify(job.deliverable)}, commissioner ${JSON.stringify(job.commissioner)}) — report lanes are outside owner cancellation`,
-        );
-      }
-
-      const blockers = this.closeoutLiveWorkBlockers(job.id, runtime);
-      if (blockers.length > 0) {
-        throw new AdminCancellationRefusal(
-          'live-work',
-          `job "${job.id}" has target-owned live work — cancellation would orphan or conceal it: ${blockers.join('; ')}`,
-        );
-      }
-
-      // ONE transaction: audit first (owner authority + exact prior and
-      // terminal identity), then the direct parked → done hop, then
-      // obligation closure as terminal abandonment.
-      assertAdminCloseoutTransition(job.status, 'done');
-      const event = this.appendEvent({
-        kind: 'job.owner-cancellation',
-        jobId: job.id,
-        payload: {
-          disposition: 'owner-cancelled-abandoned',
-          expected_status: 'parked',
-          authority: {
-            kind: 'owner-cancellation',
-            ruling: OWNER_CANCELLATION_RULING,
-            reference: authorityReference,
-          },
-          prior: {
-            status: job.status,
-            pr_url: job.prUrl,
-            deliverable: job.deliverable,
-            commissioner: job.commissioner,
-            target_ref: job.targetRef,
-            target_sha: job.targetSha,
-            updated_at: job.updatedAt,
-          },
-          terminal: { status: 'done' },
-          reason,
-          request_sha256: requestSha256,
-        },
-      });
-      this.writeJobStatus(job.id, 'parked', 'done');
-      this.closeApplicableObligations(job.id, 'done');
-      return { job: this.getJob(job.id) as JobRecord, event, idempotent: false };
-    });
   }
 
   noteJob(id: string, note: string): JobRecord {
@@ -2173,6 +2236,9 @@ export class LedgerApi {
     readonly approval: JobAmendmentApproval;
     readonly expectedContractSha256: string;
     readonly idempotencyKey?: string | null;
+    /** Required (owner rule 1, 2026-10-08): does the approved change need
+     * implementation (`material`) or not (`administrative`)? */
+    readonly effect: AmendmentEffect;
   }): AddJobAmendmentResult {
     return this.transaction(() => {
       const job = this.getJob(input.jobId);
@@ -2181,7 +2247,7 @@ export class LedgerApi {
         // even when the named job never existed.
         return this.rejectAmendment(input.jobId, 'job-not-found', `job "${input.jobId}" not found`, input);
       }
-      if (job.status === 'merged' || job.status === 'done') {
+      if (isJobTerminal(job.status)) {
         return this.rejectAmendment(input.jobId, 'job-terminal', `job "${input.jobId}" is ${job.status} — terminal lanes take no amendments`, input);
       }
       if (job.briefing === null || job.briefing.trim() === '') {
@@ -2204,11 +2270,20 @@ export class LedgerApi {
           return this.rejectAmendment(input.jobId, 'invalid', 'idempotency_key must be bounded printable text', input);
         }
       }
+      if (!isAmendmentEffect(input.effect)) {
+        return this.rejectAmendment(
+          input.jobId,
+          'invalid',
+          'effect must be "material" (the change requires implementation) or "administrative" (no implementation)',
+          input,
+        );
+      }
       const requestSha = amendmentRequestSha256({
         body: input.body,
         supersedes,
         approval: input.approval,
         expectedContractSha256: input.expectedContractSha256,
+        effect: input.effect,
       });
       // Retry determinism outranks staleness: the same idempotency key and
       // request fingerprint always resolves to the same accepted amendment,
@@ -2270,6 +2345,7 @@ export class LedgerApi {
         bodySha256: amendmentBodySha256(input.body),
         supersedes: [...supersedes],
         approval: { by: input.approval.by, reference: input.approval.reference },
+        effect: input.effect,
         previousContractSha256: current.contractSha256,
         contractSha256: '',
         requestSha256: requestSha,
@@ -2292,8 +2368,8 @@ export class LedgerApi {
           `INSERT INTO job_amendments (
              id, job_id, version, body, body_sha256, supersedes,
              approval_by, approval_reference, previous_contract_sha256,
-             contract_sha256, request_sha256, idempotency_key, created_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             contract_sha256, request_sha256, idempotency_key, created_at, effect
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           amendment.id,
@@ -2309,7 +2385,9 @@ export class LedgerApi {
           amendment.requestSha256,
           amendment.idempotencyKey,
           amendment.createdAt,
+          amendment.effect,
         );
+      const revision = requiredWorkRevision([...existing, amendment]);
       this.appendEvent({
         kind: 'job.amendment-accepted',
         jobId: input.jobId,
@@ -2324,6 +2402,8 @@ export class LedgerApi {
           approval_by: amendment.approval.by,
           approval_reference: amendment.approval.reference,
           idempotency_key: amendment.idempotencyKey,
+          effect: amendment.effect,
+          required_work_revision: revision,
         },
       });
       return { status: 'accepted' as const, amendment, contract: rendered, idempotent: false };
@@ -2340,6 +2420,7 @@ export class LedgerApi {
       readonly approval: JobAmendmentApproval;
       readonly expectedContractSha256: string;
       readonly idempotencyKey?: string | null;
+      readonly effect?: unknown;
     },
     current?: { readonly currentContractSha256: string; readonly currentVersion: number },
   ): AddJobAmendmentResult {
@@ -2356,6 +2437,7 @@ export class LedgerApi {
         approval_by: input.approval.by.slice(0, 200),
         approval_reference: input.approval.reference.slice(0, 500),
         ...(input.idempotencyKey != null ? { idempotency_key: input.idempotencyKey.slice(0, 200) } : {}),
+        ...(isAmendmentEffect(input.effect) ? { effect: input.effect } : {}),
         ...(current !== undefined
           ? { current_contract_sha256: current.currentContractSha256, current_version: current.currentVersion }
           : {}),
@@ -2369,6 +2451,103 @@ export class LedgerApi {
         ? { currentContractSha256: current.currentContractSha256, currentVersion: current.currentVersion }
         : {}),
     };
+  }
+
+  private amendmentEffectFromRow(row: Row): AmendmentEffect | null {
+    const raw = nstr(row.effect);
+    if (raw === null) return null;
+    if (!isAmendmentEffect(raw)) throw new Error(`job_amendments row ${str(row.id)} has unknown effect "${raw}"`);
+    return raw;
+  }
+
+  /** The job's work revisions (owner rule 2): `required` is the highest
+   * material amendment version (0 when none); `delivered` is the revision
+   * the newest candidate `job.delivered` carried (0 when it carried none). A review
+   * may freeze only when delivered >= required. */
+  workRevisionState(jobId: string): WorkRevisionState {
+    const required = requiredWorkRevision(this.listJobAmendments(jobId));
+    return { required, delivered: deliveredWorkRevision(this.latestCandidateDelivery(jobId)) };
+  }
+
+  latestCandidateDelivery(jobId: string): EventRecord | null {
+    return this.latestDeliveryForGates(jobId, true);
+  }
+
+  /** Non-candidate history still owes its separate current-candidate gate.
+   * Only freshness/revision projections exclude it. */
+  private latestDeliveryForGates(jobId: string, candidateOnly: boolean): EventRecord | null {
+    const row = this.db.prepare(`SELECT d.* FROM events d WHERE d.job_id = ? AND d.kind = 'job.delivered'
+      AND (? = 0 OR COALESCE(json_extract(d.payload, '$.candidate_delivery_proven'), 1) != 0)
+      AND (? = 0 OR NOT ${UNPROVEN_NATIVE_CANDIDATE_SQL})
+      AND (? = 0 OR NOT ${ORIGINAL_NATIVE_GATE_DEBT_SQL}) ORDER BY d.seq DESC LIMIT 1`)
+      .get(jobId, candidateOnly ? 1 : 0, candidateOnly ? 1 : 0, candidateOnly ? 1 : 0) as Row | undefined;
+    return row === undefined ? null : this.eventFromRow(row);
+  }
+
+  /** Owner decision 2026-10-09 (option A): a CORRECTIVE delivery — the
+   * first delivery that carried the job's current work revision (> 0) —
+   * owes a passing scheduler verification on its exact head before any
+   * review arms. The debt follows the newest delivery while it lasts (a
+   * repair of a failed verification owes its own pass) and is discharged
+   * once a review round ADMITTED after the corrective delivery (went live). Null =
+   * no debt; otherwise the revision and the head that must be verified
+   * (null when the delivery could not resolve its head: any later pass on
+   * the job counts). */
+  correctiveVerificationDebt(jobId: string): { readonly revision: number; readonly head: string | null } | null {
+    const newest = this.latestDeliveryForGates(jobId, false);
+    if (newest === null) return null;
+    const native = (typeof newest.payload === 'object' && newest.payload !== null ? newest.payload : {}) as { candidate_delivery_proven?: unknown; work_revision?: unknown };
+    if (native.candidate_delivery_proven === false || this.db.prepare(`SELECT 1 FROM events d WHERE d.seq = ? AND (${ORIGINAL_NATIVE_GATE_DEBT_SQL} OR ${UNPROVEN_NATIVE_CANDIDATE_SQL})`).get(newest.seq) !== undefined) {
+      // Historical completion is a fact, not candidate authority. A later
+      // proven current delivery must identify the candidate before review.
+      return { revision: typeof native.work_revision === 'number' ? native.work_revision : 0, head: null };
+    }
+    const revision = deliveredWorkRevision(newest);
+    if (revision === 0) return null;
+    const first = this.db.prepare(
+      `SELECT MIN(seq) AS seq FROM events
+        WHERE job_id = ? AND kind = 'job.delivered' AND json_extract(payload, '$.work_revision') = ?`,
+    ).get(jobId, revision) as { seq: number | null } | undefined;
+    const correctiveSeq = first?.seq ?? newest.seq;
+    // Only the delivery that FIRST carried this revision is corrective: an
+    // earlier delivery at the same or a higher revision means the revision
+    // is not new (revisions are monotonic per job).
+    // Discharged only by a review that actually ADMITTED the corrected work
+    // (its round went live) — a round created and then refused at
+    // admission/preflight reviewed nothing.
+    const payload = typeof newest.payload === 'object' && newest.payload !== null
+      ? (newest.payload as { sha?: unknown }) : {};
+    const head = typeof payload.sha === 'string' && payload.sha !== '' ? payload.sha : null;
+    // A live round of a head delivered at or after the corrective delivery
+    // (any head when the newest is unknown) admitted the corrected work; a
+    // forced round of an unrelated target admits nothing.
+    const reviewedSince = this.db.prepare(
+      `SELECT 1 FROM events e JOIN rounds r ON r.id = e.round_id
+        WHERE e.job_id = ? AND e.kind = 'round.status' AND json_extract(e.payload, '$.to') = 'live' AND e.seq > ?
+          AND (? IS NULL OR r.target_ref IN (
+            SELECT json_extract(d.payload, '$.sha') FROM events d
+             WHERE d.job_id = ? AND d.kind = 'job.delivered' AND d.seq >= ?)) LIMIT 1`,
+    ).get(jobId, correctiveSeq, head, jobId, correctiveSeq) !== undefined;
+    if (reviewedSince) return null;
+    // The pass must post-date the approved correction it answers: a run of
+    // the same bytes recorded before the amendment proves nothing about it.
+    const amendmentSeq = (this.db.prepare(
+      `SELECT MAX(seq) AS seq FROM events WHERE job_id = ? AND kind = 'job.amendment-accepted'
+         AND json_extract(payload, '$.version') = ?`,
+    ).get(jobId, revision) as { seq: number | null } | undefined)?.seq ?? 0;
+    // The LATEST clean run decides: a later failure on the same head
+    // re-fences review even after an earlier pass.
+    const latest = (head !== null
+      ? this.db.prepare(
+        `SELECT json_extract(payload, '$.ok') AS ok FROM events WHERE job_id = ? AND kind = 'verification.completed'
+           AND json_extract(payload, '$.sha') = ? AND seq > ?
+           AND COALESCE(json_extract(payload, '$.tracked_dirty'), 0) != 1 ORDER BY seq DESC LIMIT 1`,
+      ).get(jobId, head, amendmentSeq)
+      : this.db.prepare(
+        `SELECT json_extract(payload, '$.ok') AS ok FROM events WHERE job_id = ? AND kind = 'verification.completed'
+           AND seq > ? AND COALESCE(json_extract(payload, '$.tracked_dirty'), 0) != 1 ORDER BY seq DESC LIMIT 1`,
+      ).get(jobId, newest.seq)) as { ok: number | null } | undefined;
+    return latest?.ok === 1 ? null : { revision, head };
   }
 
   private amendmentFromRow(row: Row): JobAmendmentRecord {
@@ -2389,6 +2568,7 @@ export class LedgerApi {
       bodySha256: str(row.body_sha256),
       supersedes: supersedes as string[],
       approval: { by: str(row.approval_by), reference: str(row.approval_reference) },
+      effect: this.amendmentEffectFromRow(row),
       previousContractSha256: str(row.previous_contract_sha256),
       contractSha256: str(row.contract_sha256),
       requestSha256: str(row.request_sha256),
@@ -2615,6 +2795,9 @@ export class LedgerApi {
     return this.transaction(() => {
       const job = this.getJob(input.jobId);
       if (job === null) throw new RecordNotFound(`job "${input.jobId}" not found`);
+      if (isJobTerminal(job.status)) {
+        throw new Error(`cannot create a review round for terminal job "${input.jobId}" (${job.status})`);
+      }
       let seq = input.seq;
       if (seq === undefined) {
         const row = this.db
@@ -2670,12 +2853,35 @@ export class LedgerApi {
     });
   }
 
+  /** {@link admitReviewRound}, also returning the round's OWN provisional
+   * status event (null when the job was not flipped) — read inside the
+   * transaction, so a subscriber that writes another status when the flip
+   * is published can never be mistaken for it (R8-10). */
+  admitReviewRoundWithFlip(input: Parameters<LedgerApi['admitReviewRound']>[0]): { readonly round: RoundRecord; readonly flipSeq: number | null } {
+    return this.transaction(() => {
+      const before = this.latestJobEvent(input.jobId, 'job.status')?.seq ?? 0;
+      const round = this.admitReviewRound(input);
+      const flip = this.db.prepare(
+        "SELECT seq FROM events WHERE job_id = ? AND kind = 'job.status' AND seq > ? ORDER BY seq ASC LIMIT 1",
+      ).get(input.jobId, before) as { seq: number } | undefined;
+      return { round, flipSeq: flip === undefined ? null : Number(flip.seq) };
+    });
+  }
+
   /** Undo only this round's provisional status flip. An admitted successor
    * owns the job status now: an older setup failure must not roll it back. */
   restoreReviewSetupStatus(input: {
     readonly jobId: string;
     readonly roundId: string;
     readonly priorStatus: 'working' | 'blocked';
+    /** The open attempt the round interrupted (`openAttemptStartSeq` at its
+     * flip). A restored `working` hop resumes that attempt — it is not a
+     * reopened lane, so its earlier delivery still settles it. */
+    readonly attemptStartSeq?: number;
+    /** This round's own provisional status event (R7-10): restore only
+     * while it is still the job's latest status event — a generation
+     * written since (a reopened attempt) is never undone or concealed. */
+    readonly expectedStatusSeq?: number;
   }): boolean {
     return this.transaction(() => {
       const job = this.getJob(input.jobId);
@@ -2684,7 +2890,16 @@ export class LedgerApi {
         .get(input.jobId) as { id: string } | undefined;
       if (job?.status !== 'in-review' || round?.jobId !== input.jobId ||
         round.status !== 'aborted' || latest?.id !== input.roundId) return false;
-      this.setJobStatus(input.jobId, input.priorStatus);
+      if (input.expectedStatusSeq !== undefined &&
+        this.latestJobEvent(input.jobId, 'job.status')?.seq !== input.expectedStatusSeq) return false;
+      if (input.priorStatus === 'working' && input.attemptStartSeq !== undefined) {
+        assertJobTransition(job.status, 'working');
+        this.writeJobStatus(input.jobId, job.status, 'working', {
+          restoredAfterRound: input.roundId, attemptStartSeq: input.attemptStartSeq,
+        });
+      } else {
+        this.setJobStatus(input.jobId, input.priorStatus);
+      }
       return true;
     });
   }
@@ -3013,6 +3228,12 @@ export class LedgerApi {
       )
       .all(jobId) as Row[];
     return rows.map((row) => this.agentFromRow(row));
+  }
+
+  latestSupervisionEvent(agentId: string): EventRecord | null {
+    const row = this.db.prepare(`SELECT * FROM events WHERE agent_id = ?
+      AND kind IN ('supervision.escalated', 'supervision.breaker', 'supervision.rearmed') ORDER BY seq DESC LIMIT 1`).get(agentId) as Row | undefined;
+    return row === undefined ? null : this.eventFromRow(row);
   }
 
   setAgentState(id: string, state: AgentState, error?: string): AgentRecord {
@@ -3463,16 +3684,19 @@ export class LedgerApi {
     lens?: string | null;
     payload?: unknown;
   }): BusEvent {
-    return this.transaction(() =>
-      this.appendEvent({
+    return this.transaction(() => {
+      if (fields.kind === 'silas.directive-producer-ceased' || fields.kind === 'silas.directive-producer-unknown') {
+        this.validateDirectiveProducerReceipt(fields.jobId ?? null, fields.payload);
+      }
+      return this.appendEvent({
         kind: fields.kind,
         agentId: fields.agentId ?? null,
         jobId: fields.jobId ?? null,
         roundId: fields.roundId ?? null,
         lens: fields.lens ?? null,
         payload: fields.payload,
-      }),
-    );
+      });
+    });
   }
 
   /** Delivery-only crash recovery: check the exact admitted markers and
@@ -3517,18 +3741,26 @@ export class LedgerApi {
     handoff?: CompletionHandoffIntent;
     /** Firing-rule provenance (issue #117): the named Silas rule and the
      * round it consumes. Persisted in the marker payload so the receipt
-     * carries them even when a restart replays the request. */
+     * carries them even when a restart replays the request. `source`
+     * (issue #243 M3) rides the same payload so an autopilot-minted
+     * re-brief's receipt is attributable. */
     ruleId?: string;
     sourceRoundId?: string;
+    source?: string;
   }): readonly PendingRebriefRecord[] {
-    const payload = JSON.stringify({
-      note: input.note,
-      briefing: input.briefing,
-      ...(input.ruleId !== undefined ? { rule_id: input.ruleId } : {}),
-      ...(input.sourceRoundId !== undefined ? { source_round_id: input.sourceRoundId } : {}),
-    });
-    const payloadHash = createHash('sha256').update(payload).digest('hex');
     return this.transaction(() => {
+      // The revision is bound in the SAME transaction as the marker: the
+      // fresh worker's prompt carries the effective contract at exactly this
+      // revision, and the re-brief delivery carries it as its receipt.
+      const payload = JSON.stringify({
+        note: input.note,
+        briefing: input.briefing,
+        ...(input.ruleId !== undefined ? { rule_id: input.ruleId } : {}),
+        ...(input.sourceRoundId !== undefined ? { source_round_id: input.sourceRoundId } : {}),
+        ...(input.source !== undefined ? { source: input.source } : {}),
+        work_revision: requiredWorkRevision(this.listJobAmendments(input.jobId)),
+      });
+      const payloadHash = createHash('sha256').update(payload).digest('hex');
       // The HTTP caller pre-checks, but admission is the boundary of
       // record: a terminal transition between that check and the write is
       // refused HERE, so a terminal lane can never receive a fresh marker
@@ -3540,6 +3772,16 @@ export class LedgerApi {
       if (isJobTerminal(job.status)) {
         throw new Error(`job "${input.jobId}" is ${job.status} — terminal lanes are never re-briefed`);
       }
+      // One writer per lane (owner rule 5): a live directive request may
+      // already be prompting the lane's minion.
+      const liveDirective = this.listPendingDirectives({ jobId: input.jobId, states: LIVE_DIRECTIVE_STATES, limit: 1 })[0];
+      if (liveDirective !== undefined) {
+        throw new LaneWriterConflictError(
+          `job "${input.jobId}" has a live directive request (${liveDirective.requestId}, ${liveDirective.state}) — ` +
+            'it owns the lane; wait for it to settle or retire it before re-briefing',
+        );
+      }
+      this.assertNoProviderProducer(input.jobId);
       let phaseId: string | null = null;
       if (input.handoff !== undefined) {
         for (const prior of this.listPhaseHandoffs({
@@ -3578,7 +3820,13 @@ export class LedgerApi {
       for (const kind of PENDING_REBRIEF_KINDS) {
         upsert.run(randomUUID(), input.jobId, kind, payload, payloadHash, baselineSeq, phaseId, ts, ts);
       }
-      return this.listPendingRebriefs({ jobId: input.jobId });
+      // A fresh accepted re-brief is a separately authorized, identity-
+      // checked handoff too: it supersedes an open retirement hold on this
+      // lane, and its marker id is the recorded releaser.
+      const markers = this.listPendingRebriefs({ jobId: input.jobId });
+      const releaser = markers[0]?.id ?? `rebrief:${input.jobId}`;
+      this.releaseDirectiveRecoveryHolds(input.jobId, releaser);
+      return markers;
     });
   }
 
@@ -3607,6 +3855,228 @@ export class LedgerApi {
             .prepare('SELECT * FROM pending_rebriefs WHERE job_id = ? ORDER BY kind')
             .all(opts.jobId) as Row[]);
     return rows.map((row) => this.pendingRebriefFromRow(row));
+  }
+
+  /** Page whole historical job generations, never half a marker pair.
+   * The row cursor is observation fairness only, not effect/work authority. */
+  listPendingRebriefGroups(input: { readonly afterRowid: number; readonly limit: number }): readonly {
+    readonly jobId: string; readonly cursor: number;
+  }[] {
+    if (!Number.isSafeInteger(input.afterRowid) || input.afterRowid < 0 ||
+        !Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 1000) {
+      throw new Error('historical rebrief observation requires a nonnegative row cursor and a job limit of 1–1000');
+    }
+    const rows = this.db.prepare(`SELECT job_id, MIN(rowid) AS cursor FROM pending_rebriefs
+      GROUP BY job_id HAVING MIN(rowid) > ? ORDER BY cursor LIMIT ?`).all(input.afterRowid, input.limit) as Row[];
+    return rows.map((row) => ({ jobId: str(row.job_id), cursor: Number(row.cursor) }));
+  }
+
+  /** Exact historical receipt interpretation shared by observation,
+   * transactional settlement, retirement audit and guarded Gru decisions.
+   * A sequence watermark alone is never request correlation. */
+  pendingRebriefReceipt(marker: PendingRebriefRecord, eventSeq?: number): EventRecord | null {
+    const raw = this.db.prepare('SELECT * FROM pending_rebriefs WHERE id = ?').get(marker.id) as Row | undefined;
+    if (raw === undefined || str(raw.job_id) !== marker.jobId || str(raw.kind) !== marker.kind ||
+        Number(raw.baseline_seq) !== marker.baselineSeq || nstr(raw.phase_id) !== marker.phaseId ||
+        nstr(raw.agent_id) !== marker.agentId || str(raw.payload_hash) !== marker.payloadHash ||
+        createHash('sha256').update(str(raw.payload)).digest('hex') !== marker.payloadHash) return null;
+    const phase = marker.phaseId === null ? null : this.getPhaseHandoff(marker.phaseId);
+    if (marker.phaseId !== null && (phase === null || phase.jobId !== marker.jobId ||
+        phase.source !== 'silas-rebrief' || phase.intentSeq !== marker.baselineSeq ||
+        phase.requestId !== null && phase.requestId !== marker.id ||
+        phase.minionId !== null && marker.agentId !== null && phase.minionId !== marker.agentId)) return null;
+    const peers = this.db.prepare('SELECT * FROM pending_rebriefs WHERE job_id = ? AND baseline_seq = ? AND payload_hash = ? AND phase_id IS ?')
+      .all(marker.jobId, marker.baselineSeq, marker.payloadHash, marker.phaseId) as Row[];
+    const minions = new Set([marker.agentId, phase?.minionId ?? null, ...peers.map((peer) => nstr(peer.agent_id))].filter((id): id is string => id !== null));
+    if (minions.size > 1) return null;
+    const expectedMinion = [...minions][0] ?? null;
+    // An unmarked receipt needs all original identity facts; none may be
+    // borrowed from today's approval or a newer worker/session.
+    if (expectedMinion === null || phase === null && marker.workRevision === null) return null;
+    const revisions = new Set([marker.workRevision, ...peers.map((peer) => this.pendingRebriefFromRow(peer).workRevision)]
+      .filter((revision): revision is number => revision !== null));
+    if (revisions.size > 1) return null;
+    const expectedRevision = [...revisions][0] ?? null;
+    if (phase !== null && expectedRevision !== null) {
+      // Old production silas.rebrief receipts did not duplicate revision.
+      // The immutable original phase supplies correlation, not today's
+      // revision. Every available same-generation receipt must agree.
+      const conflicting = this.db.prepare(`SELECT seq FROM events WHERE job_id = ? AND seq > ?
+        AND kind IN ('silas.rebrief', 'job.delivered') AND json_extract(payload, '$.phase_id') = ?
+        AND json_type(payload, '$.work_revision') IS NOT NULL
+        AND (json_type(payload, '$.work_revision') != 'integer' OR json_extract(payload, '$.work_revision') != ?)
+        AND (json_type(payload, '$.payload_hash') IS NULL OR json_extract(payload, '$.payload_hash') = ?)
+        AND (json_type(payload, '$.marker_id') IS NULL OR json_extract(payload, '$.marker_id') IN (${peers.map(() => '?').join(',')})) LIMIT 1`)
+        .get(marker.jobId, marker.baselineSeq, marker.phaseId, expectedRevision, marker.payloadHash, ...peers.map((peer) => str(peer.id)));
+      if (conflicting !== undefined) return null;
+    }
+    const where = ['job_id = ?', 'kind = ?', 'seq > ?'];
+    const params: (string | number | null)[] = [marker.jobId, marker.kind, marker.baselineSeq];
+    if (phase === null) {
+      where.push("json_extract(payload, '$.marker_id') = ?", "json_extract(payload, '$.payload_hash') = ?",
+        "(json_type(payload, '$.phase_id') IS NULL OR json_extract(payload, '$.phase_id') IS NULL)");
+      params.push(marker.id, marker.payloadHash);
+    } else {
+      where.push("json_extract(payload, '$.phase_id') = ?",
+        "(json_type(payload, '$.marker_id') IS NULL OR json_extract(payload, '$.marker_id') = ?)",
+        "(json_type(payload, '$.payload_hash') IS NULL OR json_extract(payload, '$.payload_hash') = ?)");
+      params.push(marker.phaseId, marker.id, marker.payloadHash);
+    }
+    const minionKey = marker.kind === 'silas.rebrief' ? 'minion_id' : 'agentId';
+    where.push(`json_type(payload, '$.${minionKey}') = 'text'`, `length(json_extract(payload, '$.${minionKey}')) > 0`);
+    if (expectedMinion !== null) {
+      where.push(`json_extract(payload, '$.${minionKey}') = ?`);
+      params.push(expectedMinion);
+    }
+    if (expectedRevision !== null) {
+      where.push(phase === null || marker.kind === 'job.delivered' ?
+        "(json_type(payload, '$.work_revision') = 'integer' AND json_extract(payload, '$.work_revision') = ?)" :
+        "(json_type(payload, '$.work_revision') IS NULL OR (json_type(payload, '$.work_revision') = 'integer' AND json_extract(payload, '$.work_revision') = ?))");
+      params.push(expectedRevision);
+    }
+    const predicate = where.join(' AND ');
+    const row = this.db.prepare(`SELECT * FROM events WHERE ${predicate}${eventSeq === undefined ? '' : ' AND seq = ?'} ORDER BY seq DESC LIMIT 1`)
+      .get(...params, ...(eventSeq === undefined ? [] : [eventSeq])) as Row | undefined;
+    if (row === undefined) return null;
+    const receipt = this.eventFromRow(row);
+    const head = (receipt.payload as { readonly sha?: unknown } | null)?.sha;
+    // A requested event seq is a readback selector, not permission to hide
+    // another correlated receipt's contradictory original completion HEAD.
+    const conflict = this.db.prepare(`SELECT seq FROM events WHERE ${predicate}
+      AND json_type(payload, '$.sha') IS NOT NULL AND json_extract(payload, '$.sha') IS NOT ? LIMIT 1`)
+      .get(...params, typeof head === 'string' ? head : null);
+    return conflict === undefined ? receipt : null;
+  }
+
+  originalRebriefDeliveryFacts(markerId: string): { readonly completionSeq: number; readonly minionId: string; readonly sha: string; readonly workRevision: number } | null {
+    const marker = this.listPendingRebriefs().find((row) => row.id === markerId && row.kind === 'silas.rebrief');
+    if (marker === undefined) return null;
+    const receipt = this.pendingRebriefReceipt(marker);
+    const payload = receipt?.payload as { minion_id?: unknown; sha?: unknown; work_revision?: unknown } | undefined;
+    // pendingRebriefReceipt independently correlates the exact original
+    // phase/generation/minion and every available revision. Old marked
+    // completions need not duplicate their original marker's revision.
+    // An unmarked or unknown original must never borrow today's revision.
+    const workRevision = payload?.work_revision === undefined && marker.phaseId !== null
+      ? marker.workRevision : payload?.work_revision;
+    if (receipt === null || typeof payload?.minion_id !== 'string' || typeof payload.sha !== 'string' ||
+        !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(payload.sha) || typeof workRevision !== 'number' ||
+        !Number.isSafeInteger(workRevision) || workRevision < 0) return null;
+    return { completionSeq: receipt.seq, minionId: payload.minion_id, sha: payload.sha, workRevision };
+  }
+
+  /** Current eligibility is separate from immutable historical outcome.
+   * Only the original successful native HEAD/identity plus an exact clean
+   * current job lane can establish candidate proof; caller flags cannot. */
+  private rebriefCurrentCandidateProof(marker: PendingRebriefRecord,
+    facts: NonNullable<ReturnType<LedgerApi['originalRebriefDeliveryFacts']>>, lane?: WorktreeLane) {
+    if (lane === undefined || lane.kind !== 'job' || lane.status !== 'active' || lane.jobId !== marker.jobId || marker.sessionFile === null) return null;
+    const binding = readDirectiveBinding(marker.sessionFile, marker.id);
+    if (binding === null || binding.agentId !== facts.minionId || binding.identity.jobId !== marker.jobId ||
+        binding.identity.payloadHash !== marker.payloadHash || binding.identity.workRevision !== facts.workRevision) return null;
+    const proof = inspectDirectiveCheckpoint(marker.sessionFile, binding.identity);
+    if (proof.state !== 'terminal' || !proof.ok || !isDeepStrictEqual(proof.binding, binding)) return null;
+    const receipt = readDirectiveCompletion(marker.sessionFile, binding.identity, proof.checkpointId);
+    if (receipt === null || receipt.head !== facts.sha) return null;
+    const header = readDirectiveSessionHeader(marker.sessionFile);
+    if (header.cwd !== lane.path || header.id !== binding.sessionId) return null;
+    const current = this.directiveCurrentAuthority(marker.jobId);
+    if (current.workRevision !== facts.workRevision || current.contractSha256 !== binding.identity.contractSha256 ||
+        current.authorityEpoch !== binding.identity.authorityEpoch) return null;
+    try { this.assertRecoveryJobPermission(marker.jobId); }
+    catch (error) { if (error instanceof DirectiveCheckpointError) return null; throw error; }
+    const git = readGitState(lane.path, { includeUntracked: true });
+    if (git.sha !== facts.sha || git.trackedDirty || lane.branch === null) return null;
+    try {
+      const branch = execFileSync('git', ['-C', lane.path, 'symbolic-ref', '--short', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }).trim();
+      if (branch !== lane.branch) return null;
+    } catch { return null; } // unavailable branch proves no candidacy; original completion is retained separately
+    return { lane_id: lane.id, lane_path: lane.path, sha: facts.sha, identity: binding.identity,
+      checkpoint_id: proof.checkpointId, binding, receipt };
+  }
+
+  /** Reconstruct only explicit ORIGINAL facts. Today's branch or approval
+   * never supplies a historical SHA/revision. Optional current-lane proof
+   * determines candidate eligibility separately, without executing work. */
+  reconstructCompletedRebriefDelivery(expected: readonly PendingRebriefRecord[], currentLane?: WorktreeLane): EventRecord | null {
+    return this.transaction(() => {
+      const jobId = expected[0]?.jobId;
+      if (jobId === undefined || !this.matchesPendingRebriefGeneration(jobId, expected)) throw new PendingRebriefNoLongerCurrent('superseded');
+      const job = this.getJob(jobId);
+      if (job === null || isJobTerminal(job.status)) throw new PendingRebriefNoLongerCurrent('terminal');
+      const completion = expected.find((row) => row.kind === 'silas.rebrief');
+      const delivery = expected.find((row) => row.kind === 'job.delivered');
+      if (completion === undefined || delivery === undefined) throw new DirectiveCheckpointError('historical lost delivery requires a coherent exact generation');
+      const existing = this.pendingRebriefReceipt(delivery);
+      if (existing !== null) return existing;
+      const facts = this.originalRebriefDeliveryFacts(completion.id);
+      if (facts === null) return null;
+      // This is ledger-only reconstruction from immutable original facts:
+      // no current checkout is needed, but every job/lane producer remains
+      // fenced by the same complete retirement ownership predicate.
+      const blockers = this.rebriefProgressBlockers(completion.id, jobId);
+      if (blockers.length > 0) throw new DirectiveCheckpointError(`original delivery reconstruction producer cessation unproven: ${blockers.join('; ')}`);
+      if (!this.matchesPendingRebriefGeneration(jobId, expected)) throw new PendingRebriefNoLongerCurrent('superseded');
+      const currentJob = this.getJob(jobId);
+      if (currentJob === null || isJobTerminal(currentJob.status)) throw new PendingRebriefNoLongerCurrent('terminal');
+      const candidateProof = this.rebriefCurrentCandidateProof(completion, facts, currentLane);
+      const finalBlockers = candidateProof === null ? [] : this.rebriefProgressBlockers(completion.id, jobId);
+      if (finalBlockers.length > 0) throw new DirectiveCheckpointError(`current candidate producer cessation unproven: ${finalBlockers.join('; ')}`);
+      const reconstructed = this.appendEvent({ kind: 'job.delivered', jobId, agentId: facts.minionId,
+        payload: { agentId: facts.minionId, source: 'silas-rebrief', sha: facts.sha, work_revision: facts.workRevision,
+          candidate_delivery_proven: candidateProof !== null, historical_bookkeeping_only: true, current_candidate_proof: candidateProof,
+          marker_id: delivery.id, payload_hash: delivery.payloadHash, ...(delivery.phaseId === null ? {} : { phase_id: delivery.phaseId }),
+          provenance: { kind: 'original-correlated-completion', event_seq: facts.completionSeq } } });
+      this.ensureReportHandback(jobId, reconstructed.seq);
+      return reconstructed;
+    });
+  }
+
+  /** Versioned stale-input fence, not completion/cessation/permission proof.
+   * Potentially relevant conflicting receipts remain explicitly unproven;
+   * explicit other generations/jobs do not perturb this subject. */
+  rebriefReceiptEvidence(markerId: string): RebriefReceiptEvidence {
+    const markerRow = this.db.prepare('SELECT * FROM pending_rebriefs WHERE id = ?').get(markerId) as Row | undefined;
+    if (markerRow === undefined) throw new RecordNotFound(`rebrief marker "${markerId}" not found`);
+    const marker = this.pendingRebriefFromRow(markerRow);
+    const group = this.listPendingRebriefs({ jobId: marker.jobId });
+    const markers = group.map(({ id, jobId, kind, payloadHash, baselineSeq, phaseId, agentId, sessionFile, workRevision }) =>
+      ({ id, jobId, kind, payloadHash, baselineSeq, phaseId, agentId, sessionFile, workRevision }));
+    const phaseRow = marker.phaseId === null ? null : this.getPhaseHandoff(marker.phaseId);
+    const phase = phaseRow === null ? null : { phaseId: phaseRow.phaseId, jobId: phaseRow.jobId, source: phaseRow.source,
+      requestId: phaseRow.requestId, generation: phaseRow.generation, intentSeq: phaseRow.intentSeq, minionId: phaseRow.minionId };
+    const ids = group.map((row) => row.id);
+    const evidenceRows = this.db.prepare(`SELECT seq, ts, kind, agent_id, job_id, round_id, lens,
+      CASE WHEN length(CAST(payload AS BLOB)) <= ? THEN payload ELSE NULL END AS payload
+      FROM events WHERE job_id = ? AND seq > ?
+      AND kind IN ('silas.rebrief', 'job.delivered') AND (
+        json_extract(payload, '$.marker_id') IN (${ids.map(() => '?').join(',')})
+        OR json_extract(payload, '$.request_id') IN (${ids.map(() => '?').join(',')})
+        OR json_extract(payload, '$.phase_id') = ?
+        OR (json_extract(payload, '$.marker_id') IS NULL AND json_extract(payload, '$.request_id') IS NULL
+          AND json_extract(payload, '$.phase_id') IS NULL)) ORDER BY seq LIMIT ?`).iterate(
+            MAX_REBRIEF_RECEIPT_EVIDENCE_BYTES, marker.jobId, Math.min(...group.map((row) => row.baselineSeq)),
+            ...ids, ...ids, marker.phaseId, MAX_REBRIEF_RECEIPT_EVIDENCE_EVENTS + 1);
+    const rows: Row[] = [];
+    let payloadBytes = 0;
+    for (const row of evidenceRows) {
+      if (rows.length === MAX_REBRIEF_RECEIPT_EVIDENCE_EVENTS) {
+        throw new DirectiveCheckpointError(`rebrief receipt evidence exceeds the ${MAX_REBRIEF_RECEIPT_EVIDENCE_EVENTS}-event inspection limit; complete history cannot be established`);
+      }
+      if (row.payload !== null) payloadBytes += Buffer.byteLength(str(row.payload), 'utf8');
+      if (row.payload === null || payloadBytes > MAX_REBRIEF_RECEIPT_EVIDENCE_BYTES) {
+        throw new DirectiveCheckpointError(`rebrief receipt evidence exceeds the ${MAX_REBRIEF_RECEIPT_EVIDENCE_BYTES}-byte inspection limit; complete history cannot be established`);
+      }
+      rows.push(row);
+    }
+    const receipts = rows.map((row) => {
+      const event = this.eventFromRow(row);
+      return { seq: event.seq, kind: event.kind, jobId: event.jobId, agentId: event.agentId,
+        classification: group.some((candidate) => candidate.kind === event.kind && this.pendingRebriefReceipt(candidate, event.seq) !== null)
+          ? 'accepted' as const : 'unproven' as const, payload: event.payload };
+    });
+    const facts = { version: 1 as const, markers, phase, receipts };
+    return { ...facts, sha256: createHash('sha256').update(canonicalRebriefEvidence(facts)).digest('hex') };
   }
 
   /** Clear markers ONLY once their guarded events landed. Deleting is the
@@ -3642,14 +4112,53 @@ export class LedgerApi {
    * event row commits with the clear; delivery to a given live bus listener
    * afterwards is the bus's own contract (a failing listener drops that
    * event for itself and restart recovery re-arms from `job.delivered`). */
+  private closeOrdinaryRebriefRecovery(markers: readonly PendingRebriefRecord[], eventSeq: number, eventKind: string): void {
+    for (const marker of markers) {
+      if (this.recoveryOwnerBasis('rebrief', marker.id).owned) continue;
+      const debts = this.listObligations({ jobId: marker.jobId }).filter((debt) => debt.incidentKey === `rebrief-recovery:${marker.id}` &&
+        (debt.state === 'open' || debt.state === 'waiting') && debt.nextAction.kind === 'gru-decision');
+      for (const debt of debts) this.settleObligation({ obligationId: debt.id, settlement: { kind: 'executed-action',
+        action: eventKind === 'silas.rebrief-retired' ? 'exact terminal legacy control administratively retired, not completed' : 'exact original guarded receipt pair settled', evidenceEventSeq: eventSeq, evidenceEventKind: eventKind } });
+      const card = this.findNotificationByKindAndRouting(`silas.rebrief-unreconciled.${marker.jobId}`, 'action-required', 'active');
+      // The production incident is job-keyed and deduplicated across generations.
+      // Its producer-issued recovery pointer correlates only the routine card;
+      // it is not authority/effect evidence and never releases an owner hold.
+      const correlated = debts.some((debt) => card?.detail?.includes(`/api/silas/rebriefs/${marker.id}, then POST its /recover with expected_generation ${debt.generation}, expected_payload_hash ${marker.payloadHash},`));
+      if (correlated && card?.routing === 'action-required' && (card.agentId === null || card.agentId === marker.agentId)) this.resolveNotificationById(card.id, 'rebrief-recovery-evidence');
+    }
+  }
+
+  private assertOrdinaryRebriefResolutionReleased(markers: readonly PendingRebriefRecord[]): void {
+    for (const marker of markers) {
+      const basis = this.recoveryOwnerBasis('rebrief', marker.id);
+      const history = this.recoveryDecisionHistory('rebrief', marker.id).at(-1);
+      const transfer = history?.ownerTransfer;
+      if (basis.owned) throw new DirectiveCheckpointError('original legacy resolution remains owned by its transferred owner reservation');
+      if (transfer != null) {
+        const target = this.getObligation(transfer.target.id);
+        const confirmation = target?.settlement?.kind === 'executed-action' ? this.getEvent(target.settlement.evidenceEventSeq) : null;
+        const facts = confirmation?.payload as { transfer_event_seq?: unknown; subject_kind?: unknown; subject_id?: unknown; target?: { id?: unknown; generation?: unknown; planRevision?: unknown } } | undefined;
+        const explicitlyReleased = target?.state === 'settled' && confirmation?.kind === 'silas.recovery-owner-stop-confirmed' && confirmation.jobId === marker.jobId &&
+          facts?.transfer_event_seq === history!.eventSeq && facts.subject_kind === 'rebrief' && facts.subject_id === marker.id && facts.target?.id === target.id &&
+          facts.target.generation === target.generation && facts.target.planRevision === target.planRevision;
+        if (!explicitlyReleased && !isJobTerminal(this.getJob(marker.jobId)!.status)) throw new DirectiveCheckpointError('original legacy owner transfer is unresolved or changed; new receipts are not owner release');
+      }
+      const retained = this.listObligations({ jobId: marker.jobId }).some((debt) => debt.incidentKey === `rebrief-recovery:${marker.id}` &&
+        (debt.state === 'suspended' || (debt.state === 'open' || debt.state === 'waiting') && debt.claim !== null));
+      if (retained) throw new DirectiveCheckpointError('exact original legacy recovery resolution remains suspended or claimed');
+    }
+  }
+
   clearPendingRebriefsIfCurrentAndSettle(expected: readonly PendingRebriefRecord[]): boolean {
     const jobId = expected[0]?.jobId;
     if (jobId === undefined) throw new Error('settling a re-brief generation requires markers');
     return this.transaction(() => {
       if (!this.matchesPendingRebriefGeneration(jobId, expected)) return false;
       this.assertSettleableRebriefGeneration(jobId, expected);
+      this.assertOrdinaryRebriefResolutionReleased(expected);
+      const event = this.appendEvent({ kind: 'silas.rebrief-settled', jobId, payload: { markers: expected } });
+      this.closeOrdinaryRebriefRecovery(expected, event.seq, event.kind);
       this.clearPendingRebriefs(expected.map((marker) => marker.id));
-      this.appendEvent({ kind: 'silas.rebrief-settled', jobId });
       return true;
     });
   }
@@ -3669,13 +4178,7 @@ export class LedgerApi {
       throw new Error(`job "${jobId}" cannot settle a re-brief: the marker pair is incomplete or incoherent — settlement requires one marker per guarded kind with identical phase id, payload hash, and baseline watermark`);
     }
     for (const marker of expected) {
-      const landed = marker.phaseId === null
-        ? (this.latestJobEvent(marker.jobId, marker.kind)?.seq ?? 0) > marker.baselineSeq
-        : this.db.prepare(
-          `SELECT 1 FROM events
-           WHERE job_id = ? AND kind = ? AND seq > ? AND json_extract(payload, '$.phase_id') = ?
-           LIMIT 1`,
-        ).get(marker.jobId, marker.kind, marker.baselineSeq, marker.phaseId) !== undefined;
+      const landed = this.pendingRebriefReceipt(marker) !== null;
       if (!landed) {
         throw new Error(`job "${jobId}" cannot settle a re-brief: the guarded event ${marker.kind} has not landed past the request watermark — markers must clear only when their events exist`);
       }
@@ -3745,13 +4248,7 @@ export class LedgerApi {
           skippedIds.push(candidate.id);
           continue;
         }
-        const landed = row.phaseId === null
-          ? (this.latestJobEvent(row.jobId, row.kind)?.seq ?? 0) > row.baselineSeq
-          : this.db.prepare(
-            `SELECT 1 FROM events
-             WHERE job_id = ? AND kind = ? AND seq > ? AND json_extract(payload, '$.phase_id') = ?
-             LIMIT 1`,
-          ).get(row.jobId, row.kind, row.baselineSeq, row.phaseId) !== undefined;
+        const landed = this.pendingRebriefReceipt(row) !== null;
         guardedEventLanded.set(row.id, landed);
         retired.push(row);
       }
@@ -3766,9 +4263,8 @@ export class LedgerApi {
           retired.every((row) => guardedEventLanded.get(row.id) === true)) {
         return refused('events-already-landed');
       }
-      const remove = this.db.prepare('DELETE FROM pending_rebriefs WHERE id = ?');
-      for (const row of retired) remove.run(row.id);
-      this.appendEvent({
+      this.assertOrdinaryRebriefResolutionReleased(retired);
+      const event = this.appendEvent({
         kind: 'silas.rebrief-retired',
         jobId: input.jobId,
         payload: {
@@ -3788,6 +4284,9 @@ export class LedgerApi {
           skipped_ids: skippedIds,
         },
       });
+      this.closeOrdinaryRebriefRecovery(retired, event.seq, event.kind);
+      const remove = this.db.prepare('DELETE FROM pending_rebriefs WHERE id = ?');
+      for (const row of retired) remove.run(row.id);
       return { retired, skippedIds, refused: null };
     });
   }
@@ -3917,6 +4416,35 @@ export class LedgerApi {
       .prepare(`SELECT * FROM provider_waits${where} ORDER BY created_at, id`)
       .all(...params) as Row[];
     return rows.map((row) => this.providerWaitFromRow(row));
+  }
+
+  /** Reserve one runtime admission BEFORE its first await. The status
+   * transaction sees this ownership until the attempt finishes; a restart
+   * loses only process-local ownership, not historical intent/events. */
+  beginJobAdmission(jobId: string, kind: string): () => void {
+    const job = this.getJob(jobId);
+    if (job === null || isJobTerminal(job.status)) {
+      throw new Error(`cannot admit ${kind} for job "${jobId}" (${job?.status ?? 'missing'})`);
+    }
+    const prior = this.listJobAdmissions(jobId);
+    // The one admission that may nest under a `property repair` allocation is
+    // a directive whose durable request is held by that same repair service.
+    const ownRepairDirective = kind.startsWith('directive ') && prior.filter((entry) => entry.startsWith('property ')).every((entry) => entry.startsWith('property repair ')) &&
+      this.getDirective(kind.slice('directive '.length))?.claim?.holder === 'property-contract-repair';
+    if (!ownRepairDirective && ((kind.startsWith('property ') && prior.length > 0) || (prior.some((entry) => entry.startsWith('property ')) && !kind.startsWith('provider wait establishment ')))) throw new LaneWriterConflictError(`job "${jobId}" has a competing property/producer admission — wait for its proven settlement`);
+    const admission = { jobId, kind };
+    this.activeJobAdmissions.add(admission);
+    return () => { this.activeJobAdmissions.delete(admission); };
+  }
+
+  /** A durable claimed wait is permission to attempt ONE runtime recovery,
+   * not a permanent live producer after its turn settles. */
+  beginProviderContinuation(waitId: string, jobId: string): () => void {
+    const wait = this.getProviderWait(waitId);
+    if (wait === null || wait.status !== 'claimed' || wait.waiterKind !== 'job-minion' || wait.jobId !== jobId) {
+      throw new Error(`provider continuation ${waitId} must belong to a claimed job-minion wait for "${jobId}"`);
+    }
+    return this.beginJobAdmission(jobId, `provider continuation ${waitId}`);
   }
 
   /** r1 #10: ATOMIC claim-before-spawn. Compare-and-set
@@ -4242,6 +4770,7 @@ export class LedgerApi {
     if (input.id === '' || input.title === '') {
       throw new Error('notification id and title must be non-empty');
     }
+    if (input.id.includes('\u0000')) throw new NotificationIdentityError();
     return this.transaction(() => {
       if (this.getNotification(input.id) !== null) {
         throw new Error(`notification "${input.id}" already exists`);
@@ -4310,7 +4839,8 @@ export class LedgerApi {
   }
 
   /** The LIVE form of the count above: unacked action-required rows whose
-   * agent binding does NOT belong to a terminal (merged/done) job. A row
+   * agent binding does NOT belong to a terminal (merged/done/binned) job.
+   * A row
    * bound to a terminal job is a closed receipt — the record keeps it
    * (nothing is acked or resolved here), but it is not live Gru work, so
    * the queue count does not count it. Rows with no agent binding stay
@@ -4373,6 +4903,13 @@ export class LedgerApi {
     return row === undefined ? null : this.notificationFromRow(row);
   }
 
+  /** Report replacements are ordered by insertion, including same-timestamp UUID ties. */
+  latestReportHandbackNotification(jobId: string): NotificationRecord | null {
+    const row = this.db.prepare('SELECT * FROM notifications WHERE kind = ? ORDER BY rowid DESC LIMIT 1')
+      .get(`silas.report-handback.${jobId}`) as Row | undefined;
+    return row === undefined ? null : this.notificationFromRow(row);
+  }
+
   /**
    * Routing-scoped open-incident lookup (Perkins R1/R2, gh-97): the plain
    * kind lookup ties-break by id (ts DESC, id ASC), so a legacy
@@ -4431,6 +4968,20 @@ export class LedgerApi {
   }
 
   /** Resolve one exact incident ID without acknowledging it for the owner. */
+  /** Replace an OPEN notification's detail (and, when given, title) in place — id, acknowledgement
+   * and routing unchanged (a long-running incident refreshing its latest
+   * cause). A resolved or missing row is left as-is and returned (or null). */
+  updateNotificationDetail(id: string, detail: string, title?: string): NotificationRecord | null {
+    return this.transaction(() => {
+      const current = this.getNotification(id);
+      const nextTitle = title ?? current?.title;
+      if (current === null || current.resolvedAt !== null || (current.detail === detail && current.title === nextTitle)) return current;
+      this.db.prepare('UPDATE notifications SET detail = ?, title = ? WHERE id = ?').run(detail, nextTitle ?? current.title, id);
+      this.appendEvent({ kind: 'notification.updated', agentId: current.agentId, payload: { id } });
+      return this.getNotification(id);
+    });
+  }
+
   resolveNotificationById(id: string, by: string): NotificationRecord | null {
     if (by.trim() === '') throw new Error('resolution by must be non-empty');
     return this.transaction(() => {
@@ -4473,8 +5024,17 @@ export class LedgerApi {
   }
 
   /** Explicit machine disposition, distinct from the owner's Ack.
-   * A successful wake prompt by itself never calls this method. */
-  disposeMachineNotification(id: string, detail: string): NotificationRecord | null {
+   * A successful wake prompt by itself never calls this method.
+   *
+   * `by: 'gru'` names the disposition ROLE (machine rows are Gru's to
+   * dispose); it is NOT proof of who held the pen. The audit event carries
+   * the credential class that authorised the call and any caller-declared
+   * actor so the record never claims provenance it cannot prove (#99). */
+  disposeMachineNotification(
+    id: string,
+    detail: string,
+    provenance: { readonly credential: string; readonly declaredActor: string | null } = { credential: 'internal', declaredActor: null },
+  ): NotificationRecord | null {
     if (detail.trim() === '') throw new Error('machine disposition detail must be non-empty');
     return this.transaction(() => {
       const current = this.getNotification(id);
@@ -4482,10 +5042,14 @@ export class LedgerApi {
       if (current.routing !== 'action-required') {
         throw new Error('only action-required notifications accept a Gru disposition; owner stops require owner acknowledgement');
       }
+      const closer = producerResolvedBy(current.kind);
+      if (closer !== null) {
+        throw new Error(`${current.kind} closes itself on ${closer} — fix its cause and leave the alert open; a disposition is refused`);
+      }
       if (current.resolvedAt !== null || current.ackedAt !== null) return current;
       this.db.prepare('UPDATE notifications SET resolved_at = ?, resolved_by = ? WHERE id = ?')
         .run(nowIso(), 'gru', id);
-      this.appendEvent({ kind: 'notification.resolved', agentId: current.agentId, payload: { id, by: 'gru', detail } });
+      this.appendEvent({ kind: 'notification.resolved', agentId: current.agentId, payload: { id, by: 'gru', detail, credential: provenance.credential, declaredActor: provenance.declaredActor } });
       return this.getNotification(id) as NotificationRecord;
     });
   }
@@ -4526,6 +5090,7 @@ export class LedgerApi {
       commissioner: nstr(row.commissioner),
       targetRef: nstr(row.target_ref),
       targetSha: nstr(row.target_sha),
+      parentJobId: nstr(row.parent_job_id),
       status: str(row.status) as JobStatus,
       baseBranch: nstr(row.base_branch),
       prUrl: nstr(row.pr_url),
@@ -5143,6 +5708,119 @@ export class LedgerApi {
    * rather than being vetoed by it. History is preserved (the row and
    * its events stay); settled/closed are terminal — a recurring incident
    * is a NEW obligation. */
+  /** Follow only this inspection gate duty's durable supersession lineage. */
+  private currentGateDutyAction(obligationId: string): ObligationNextAction | null {
+    const row = this.getObligation(obligationId); if (row === null) return null;
+    const roots = this.db.prepare("SELECT payload FROM events WHERE job_id = ? AND kind IN ('silas.rebrief-current-gates-owed', 'silas.directive-current-gates-owed') ORDER BY seq").all(row.jobId) as Row[];
+    for (const root of roots) {
+      const payload = JSON.parse(root.payload as string) as { obligation_id: string; next_action: ObligationNextAction };
+      if (typeof payload.obligation_id !== 'string' || payload.next_action?.kind !== 'gru-decision') throw new DirectiveCheckpointError('current gate action lineage is malformed');
+      let cursor: string | null = payload.obligation_id; const seen = new Set<string>();
+      while (cursor !== null) {
+        if (seen.has(cursor)) throw new DirectiveCheckpointError('current gate action transfer lineage is cyclic');
+        seen.add(cursor); if (cursor === obligationId) return payload.next_action;
+        const settlement: ObligationSettlement | undefined = this.getObligation(cursor)?.settlement ?? undefined;
+        cursor = settlement?.kind === 'superseded' ? settlement.byObligationId : null;
+      }
+    }
+    return null;
+  }
+
+  /** Bounded completion of this protected recovery duty, never a universal receipt. */
+  private assertCurrentGateDutyCompleted(row: ObligationRecord, action: ObligationNextAction, evidenceSeq: number): void {
+    const refuse = (message: string): never => { throw new DirectiveCheckpointError(`current gate duty ${message}`); };
+    const citedReview = this.getEvent(evidenceSeq);
+    if (citedReview?.kind !== 'round.perkins-review') refuse('cannot be discharged by generic evidence, inspection, historical receipts or prose');
+    this.assertRecoveryJobPermission(row.jobId);
+    if (row.state === 'suspended' || row.claim !== null) refuse('retains suspended or claimed ownership');
+    const roots = this.db.prepare("SELECT * FROM events WHERE job_id = ? AND kind IN ('silas.rebrief-current-gates-owed', 'silas.directive-current-gates-owed') ORDER BY seq").all(row.jobId) as Row[];
+    const root = roots.map((record) => this.eventFromRow(record)).find((event) => isDeepStrictEqual((event.payload as { next_action?: unknown }).next_action, action));
+    if (root === undefined || root.seq >= evidenceSeq) refuse('requires exact original action before evidence');
+    const origin = root!.payload as { identity: DirectiveTurnIdentity; delivery_seq: number; sha: string | null };
+    validateDirectiveIdentity(origin.identity);
+    const original = this.getDirective(origin.identity.requestId);
+    const delivery = this.getEvent(origin.delivery_seq);
+    if (original?.nativeTarget === null || original?.nativeTarget === undefined || original.nativeBinding === null || delivery?.jobId !== row.jobId || delivery.kind !== 'job.delivered' || !isDeepStrictEqual(this.directiveTurnIdentity(original.requestId), origin.identity)) refuse('original accepted delivery binding is unavailable');
+    const delivered = delivery!.payload as { native_completion?: { identity?: unknown; binding?: unknown }; sha?: unknown };
+    if (delivered.sha !== origin.sha || !isDeepStrictEqual(delivered.native_completion?.identity, origin.identity) || !isDeepStrictEqual(delivered.native_completion?.binding, original!.nativeBinding)) refuse('original delivery provenance changed');
+    const originalProof = inspectDirectiveCheckpoint(original!.nativeTarget!.sessionFile, origin.identity);
+    const originalCompletion = originalProof.state === 'terminal' && originalProof.ok ? readDirectiveCompletion(original!.nativeTarget!.sessionFile, origin.identity, originalProof.checkpointId) : null;
+    const physical = inspectDirectiveProducers(original!.nativeTarget!.sessionFile, origin.identity);
+    if ((originalCompletion?.head ?? null) !== origin.sha || !(originalProof.state === 'terminal' && originalProof.ok && isDeepStrictEqual(originalProof.binding, original!.nativeBinding)) ||
+        !physical.some(({ producer }) => isDeepStrictEqual(producer.identity, origin.identity) && producer.agentId === original!.nativeBinding!.agentId && producer.sessionId === original!.nativeBinding!.sessionId) ||
+        physical.some(({ evidence }) => evidence === 'unknown') || directiveSessionLockBlocker(original!.nativeTarget!.sessionFile) !== null) refuse('original proof or physical ownership remains UNKNOWN');
+    const candidate = this.latestCandidateDelivery(row.jobId);
+    const facts = candidate?.payload as { sha?: unknown; work_revision?: unknown; candidate_delivery_proven?: unknown; native_completion?: { identity?: DirectiveTurnIdentity; binding?: unknown } } | undefined;
+    const identity = facts?.native_completion?.identity;
+    const current = identity === undefined ? null : this.getDirective(identity.requestId);
+    const required = requiredWorkRevision(this.listJobAmendments(row.jobId));
+    if (candidate === null || typeof facts?.sha !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(facts.sha) || facts.candidate_delivery_proven !== true || facts.work_revision !== required || identity === undefined || current?.deliverySeq !== candidate.seq || current.nativeTarget === null || !isDeepStrictEqual(this.directiveTurnIdentity(current.requestId), identity) || !isDeepStrictEqual(current.nativeBinding, facts.native_completion?.binding)) refuse('requires positively established current native candidate');
+    if (citedReview!.seq <= candidate!.seq) refuse('review evidence predates the current candidate delivery');
+    if (candidate!.seq !== delivery!.seq) {
+      const starts = this.db.prepare("SELECT * FROM events WHERE job_id = ? AND kind = 'silas.directive-producer-ceased' AND json_extract(payload, '$.request_id') = ? ORDER BY seq").all(row.jobId, original!.requestId) as Row[];
+      const originalCeased = starts.map((event) => this.eventFromRow(event)).find((event) => {
+        const fields = event.payload as { producer_start_seq?: number; producer_identity?: unknown; native_producer?: unknown };
+        const start = fields.producer_start_seq === undefined ? null : this.getEvent(fields.producer_start_seq);
+        return start?.kind === 'silas.directive-producer-started' && start.jobId === row.jobId && start.seq < event.seq &&
+          isDeepStrictEqual(fields.producer_identity, origin.identity) && physical.some(({ producer }) => isDeepStrictEqual(producer.identity, origin.identity) && isDeepStrictEqual(fields.native_producer, producer) &&
+            isDeepStrictEqual((start.payload as { native_producer?: unknown }).native_producer, producer));
+      });
+      const anchor = Math.min(root!.seq, originalCeased?.seq ?? root!.seq);
+      if (current!.baselineSeq < anchor || current!.admissionSeq === null || current!.admissionSeq <= anchor) refuse('current native acceptance does not establish original-to-current causal chronology');
+    }
+    const currentProof = inspectDirectiveCheckpoint(current!.nativeTarget!.sessionFile, identity!);
+    const currentCompletion = currentProof.state === 'terminal' && currentProof.ok ? readDirectiveCompletion(current!.nativeTarget!.sessionFile, identity!, currentProof.checkpointId) : null;
+    if (currentCompletion?.head !== facts!.sha || !(currentProof.state === 'terminal' && isDeepStrictEqual(currentProof.binding, current!.nativeBinding))) refuse('current candidate original completion is unproven');
+    const currentPhysical = inspectDirectiveProducers(current!.nativeTarget!.sessionFile, identity!);
+    if (currentPhysical.length === 0 || currentPhysical.some(({ evidence }) => evidence !== 'ceased') || directiveSessionLockBlocker(current!.nativeTarget!.sessionFile) !== null) refuse('current candidate physical ownership remains UNKNOWN');
+    const lanes = this.listWorktrees({ jobId: row.jobId }).filter((lane) => lane.kind === 'job' && lane.status !== 'swept');
+    if (lanes.length !== 1) refuse('requires exact current candidate lane');
+    const lane = lanes[0]!;
+    const blockers = this.directiveRetirementBlockers(original!, lane.id);
+    if (blockers.length > 0) refuse(`producer ownership remains: ${blockers.join('; ')}`);
+    const declared = loadWorktreeManifest(lane.path);
+    if (declared === null) refuse('requires host declared full verification scope');
+    const command = resolveVerifyCommand(declared!, 'full');
+    const git = readGitState(lane.path, { includeUntracked: true });
+    if (git.sha !== facts!.sha || git.trackedDirty) refuse('current candidate HEAD moved or tracked/untracked input tree is dirty');
+    const attempts = this.db.prepare("SELECT * FROM events WHERE job_id = ? AND kind = 'verification.requested' AND json_extract(payload, '$.scope') = 'full' ORDER BY seq DESC LIMIT 1").get(row.jobId) as Row | undefined;
+    if (attempts === undefined) refuse('requires declared full scheduler attempt');
+    const requested = this.eventFromRow(attempts!); const request = requested.payload as Record<string, unknown>;
+    const amendedAt = this.latestJobEvent(row.jobId, 'job.amendment-accepted')?.seq ?? 0;
+    if (requested.seq <= Math.max(root!.seq, amendedAt, candidate!.seq) || request['command'] !== command || request['cwd'] !== lane.path || request['head'] !== facts!.sha || typeof request['request_id'] !== 'string' || typeof request['run_id'] !== 'string') refuse('newest full scheduler request has stale or foreign bindings or predates the current candidate delivery');
+    const latestFull = this.db.prepare("SELECT payload FROM events WHERE job_id = ? AND kind IN ('verification.requested', 'verification.started', 'verification.completed', 'verification.reconciled', 'verification.no-start', 'verification.stale-released', 'verification.lock-timeout') AND json_extract(payload, '$.scope') = 'full' ORDER BY seq DESC LIMIT 1").get(row.jobId) as Row | undefined;
+    if (latestFull === undefined || (JSON.parse(str(latestFull.payload)) as { run_id?: unknown }).run_id !== request['run_id']) refuse('newer relevant full attempt is failed or UNKNOWN');
+    const lifecycle = this.db.prepare("SELECT * FROM events WHERE job_id = ? AND kind LIKE 'verification.%' AND json_extract(payload, '$.run_id') = ? ORDER BY seq").all(row.jobId, request['run_id'] as string) as Row[];
+    const events = lifecycle.map((event) => this.eventFromRow(event));
+    const starts = events.filter((event) => event.kind === 'verification.started');
+    const completedReadback = (event: EventRecord): boolean => {
+      if (event.kind !== 'verification.reconciled') return false;
+      const readback = event.payload as Record<string, unknown>;
+      if (readback['state'] !== 'completed' || readback['scope'] !== 'full' || readback['head'] !== facts!.sha || typeof readback['request_id'] !== 'string') return false;
+      // Read-only replays of a bound request are not additional executions.
+      // Contradictory or unbound readbacks remain terminal refusal evidence.
+      return events.some((bound) => {
+        const binding = bound.payload as Record<string, unknown>;
+        return ['verification.requested', 'verification.attached'].includes(bound.kind) && bound.seq < event.seq &&
+          binding['request_id'] === readback['request_id'] && binding['scope'] === 'full' && binding['head'] === facts!.sha;
+      });
+    };
+    const terminals = events.filter((event) => ['verification.completed', 'verification.reconciled', 'verification.no-start', 'verification.stale-released', 'verification.lock-timeout'].includes(event.kind) && !completedReadback(event));
+    const terminal = terminals[0]; const start = starts[0]; const run = terminal?.payload as Record<string, unknown> | undefined;
+    const started = start?.payload as Record<string, unknown> | undefined;
+    if (starts.length !== 1 || terminals.length !== 1 || terminal?.kind !== 'verification.completed' || start!.seq <= requested.seq || terminal.seq <= start!.seq || terminal.seq >= evidenceSeq || !Number.isSafeInteger(started?.['pid']) || Number(started?.['pid']) <= 0 || started?.['command'] !== command || started['cwd'] !== lane.path || started['sha'] !== facts!.sha || run?.['command'] !== command || run['scope'] !== 'full' || run['cwd'] !== lane.path || run['sha'] !== facts!.sha || run['tracked_dirty'] !== false || run['ok'] !== true || run['exit_code'] !== 0 || run['signal'] !== null || run['error'] !== null || run['timed_out'] !== false || !Number.isSafeInteger(run['output_bytes']) || Number(run['output_bytes']) < 0 || typeof run['output_sha256'] !== 'string' || !/^[0-9a-f]{64}$/.test(run['output_sha256'])) refuse('newest full scheduler start/terminal/output capture is incomplete, failed or UNKNOWN');
+    const round = this.listRounds(row.jobId).at(-1);
+    const review = citedReview;
+    const reviewed = review?.payload as Record<string, unknown> | undefined;
+    if (round === undefined || round.status !== 'verdict-posted' || round.verdict !== 'approved' || review === null || review.seq <= candidate!.seq || review.roundId !== round.id || review.jobId !== row.jobId || review.kind !== 'round.perkins-review' || this.latestRoundEvent(round.id, 'round.perkins-review')?.seq !== review.seq || reviewed?.['canonicalVerdict'] !== 'READY TO MERGE' || reviewed['blockers'] !== 0 || reviewed['complete'] !== true || reviewed['headMoved'] !== false || reviewed['reviewScope'] !== 'whole' || reviewed['finalPassRequired'] === true || reviewed['targetSha'] !== facts!.sha || typeof reviewed['artifactDirectory'] !== 'string') refuse('requires newest actual complete approved whole-change review after the current candidate delivery');
+    const bytes = readReviewCheckpointBytes(reviewed!['artifactDirectory'] as string, 'manifest.json', FROZEN_MANIFEST_MAX_BYTES);
+    const manifest = JSON.parse(bytes.toString('utf8')) as FrozenReviewInputs;
+    const receipt = this.latestRoundEvent(round!.id, 'round.freeze-manifest');
+    const acceptance = this.effectiveContract(row.jobId);
+    const reviewLanes = this.listWorktrees({ jobId: row.jobId }).filter((worktree) => worktree.kind === 'review' && worktree.roundId === round!.id);
+    if (receipt === null || receipt.seq >= review!.seq || (receipt.payload as { sha256?: unknown }).sha256 !== createHash('sha256').update(bytes).digest('hex') || manifest.roundId !== round!.id || reviewLanes.length !== 1 || manifest.repoPath !== reviewLanes[0]!.path || manifest.targetSha !== facts!.sha || manifest.schemaVersion !== 2 || manifest.recoveryIdentity === null || manifest.recoveryIdentity.jobId !== row.jobId || acceptance === null || !isDeepStrictEqual(manifest.acceptance, { version: acceptance.version, baseSha256: acceptance.baseSha256, contractSha256: acceptance.contractSha256, amendmentIds: acceptance.amendmentIds })) refuse('frozen current acceptance/provenance is missing or changed');
+  }
+
   settleObligation(input: {
     obligationId: string;
     settlement: ObligationSettlement;
@@ -5151,6 +5829,21 @@ export class LedgerApi {
     return this.transaction(() => {
       const row = this.getObligation(input.obligationId);
       if (row === null) throw new RecordNotFound(`obligation "${input.obligationId}" not found`);
+      const gateDuty = this.currentGateDutyAction(row.id);
+      if (gateDuty !== null) {
+        const disposition = input.settlement;
+        if (disposition.kind === 'job-terminal') {
+          if (!isJobTerminal(this.getJob(row.jobId)?.status as JobStatus) || this.getJob(row.jobId)?.status !== disposition.jobStatus) throw new DirectiveCheckpointError('current gate duty requires actual matching terminal job state');
+        } else if (disposition.kind === 'superseded') {
+          const recipient = disposition.byObligationId === null ? null : this.getObligation(disposition.byObligationId);
+          if (recipient === null || recipient.id === row.id || recipient.jobId !== row.jobId || ['settled', 'closed'].includes(recipient.state) || this.currentGateDutyAction(recipient.id) !== null ||
+              !['gru-decision', 'owner-decision'].includes(recipient.nextAction.kind) || !('decision' in recipient.nextAction) || !('decision' in gateDuty) || recipient.nextAction.decision !== gateDuty.decision) {
+            throw new DirectiveCheckpointError('current gate duty requires a distinct live same-job action transfer preserving exact still-owed bindings');
+          }
+        } else if (disposition.kind === 'executed-action' || disposition.kind === 'accepted-evidence') {
+          this.assertCurrentGateDutyCompleted(row, gateDuty, disposition.evidenceEventSeq);
+        } else throw new DirectiveCheckpointError('current gate duty cannot be discharged by generic evidence, inspection, historical receipts or prose');
+      }
       const target: ObligationState =
         input.settlement.kind === 'executed-action' || input.settlement.kind === 'accepted-evidence'
           ? 'settled'
@@ -5348,6 +6041,7 @@ export class LedgerApi {
       const superseded: ObligationRecord[] = [];
       const successors: ObligationRecord[] = [];
       for (const row of applicable) {
+        if (this.currentGateDutyAction(row.id) !== null) continue; // already attention-only; its sealed duty survives newer inputs
         // The successor is the same incident's debt re-derived under the
         // newer truth: attention-only (no carried authority), fresh
         // generation, unclaimed. The old row closes LINKED to it — the
@@ -5429,6 +6123,10 @@ export class LedgerApi {
     const resolved = resolveObligation(context, jobId);
     const now = nowIso();
     const active = this.activeIncarnation(jobId, resolved.logicalStep, resolved.incidentKey);
+    if (active !== null) {
+      const gateDuty = this.currentGateDutyAction(active.id);
+      if (gateDuty !== null && !isDeepStrictEqual(active.nextAction, resolved.nextAction)) throw new DirectiveCheckpointError('current gate action plan cannot mutate or launder sealed remaining duty bindings');
+    }
     if (active !== null) {
       return this.coalesceObservation(active, resolved, context, now);
     }
@@ -5677,7 +6375,7 @@ export class LedgerApi {
 
   /** Close the job's applicable obligations (open/waiting/suspended) on a
    * terminal transition — settled rows and history stay untouched. */
-  private closeApplicableObligations(jobId: string, terminal: 'done' | 'merged'): void {
+  private closeApplicableObligations(jobId: string, terminal: TerminalJobStatus): void {
     for (const row of this.listApplicableObligations(jobId, ['open', 'waiting', 'suspended'])) {
       this.settleObligation({
         obligationId: row.id,
@@ -5931,6 +6629,20 @@ export class LedgerApi {
     // tie-break against its own repost and leave that repost outstanding.
     const card = this.findNotificationByKind(`silas.report-handback.${jobId}`, 'active');
     if (card !== null) this.resolveNotificationById(card.id, by);
+  }
+
+  /** Ensure a durable report handback accompanies every correlated report
+   * delivery. Called inside the owning ledger transaction so a failed open
+   * cannot settle the directive while losing the handback. */
+  private ensureReportHandback(jobId: string, deliveredSeq: number): void {
+    if (this.latestCandidateDelivery(jobId)?.seq !== deliveredSeq) return;
+    const job = this.getJob(jobId);
+    if (job === null || job.deliverable === null || !isReportDeliverable(job.deliverable)) return;
+    const opened = this.openReportObligation({ jobId, observedAtSeq: deliveredSeq });
+    if (opened.created) {
+      this.appendEvent({ kind: 'job.report-handback', jobId,
+        payload: { obligation_id: opened.obligation.id, delivered_seq: deliveredSeq } });
+    }
   }
 
   /** One job's rowid (keyset pagination anchor). */
@@ -6593,23 +7305,43 @@ export class LedgerApi {
     blockerFingerprint?: string;
     holder: string;
     requestId?: string;
+    kind?: 'directive' | 'rebrief';
+    sourceContext?: { readonly ruleId?: string; readonly sourceRoundId?: string; readonly source?: string };
     /** Explicit completion intent; omitted = ordinary directive. */
     handoff?: CompletionHandoffIntent;
   }): { readonly record: DirectiveRequestRecord; readonly created: boolean } {
     if (input.directive.trim() === '') throw new Error('directive text must be non-empty');
     if (input.holder.trim() === '') throw new Error('directive intent requires a non-empty holder');
+    if (input.requestId !== undefined) {
+      const reserved = this.db.prepare(`SELECT * FROM events WHERE kind = 'silas.rebrief-control-closed'
+        AND json_extract(payload, '$.inspection_request_id') = ? ORDER BY seq DESC LIMIT 1`).get(input.requestId) as Row | undefined;
+      if (reserved !== undefined) {
+        const closure = this.eventFromRow(reserved);
+        const facts = closure.payload as { inspection_directive: unknown };
+        if (closure.jobId !== input.jobId || facts.inspection_directive !== input.directive || input.kind === 'rebrief') {
+          throw new DirectiveCheckpointError('reserved current inspection identity requires this job’s exact separately authorized current-inspection directive');
+        }
+      }
+    }
     const job = this.getJob(input.jobId);
     if (job === null) throw new RecordNotFound(`job "${input.jobId}" not found`);
-    if (job.status === 'merged' || job.status === 'done') {
+    if (isJobTerminal(job.status)) {
       throw new Error(`job "${input.jobId}" is ${job.status} — terminal lanes take no directives`);
     }
-    const payload = JSON.stringify({ directive: input.directive, blocker_fingerprint: input.blockerFingerprint ?? null });
+    const normalizeSourceContext = (context: { readonly ruleId?: string; readonly sourceRoundId?: string; readonly source?: string } | null | undefined) =>
+      context === null || context === undefined || context.ruleId === undefined && context.sourceRoundId === undefined && context.source === undefined ? null :
+        { ...(context.ruleId === undefined ? {} : { ruleId: context.ruleId }), ...(context.sourceRoundId === undefined ? {} : { sourceRoundId: context.sourceRoundId }),
+          // Autopilot provenance (issue #243 M3): replayed onto the receipts.
+          ...(context.source === undefined ? {} : { source: context.source }) };
+    const sourceContext = normalizeSourceContext(input.sourceContext);
+    const payload = JSON.stringify({ directive: input.directive, blocker_fingerprint: input.blockerFingerprint ?? null,
+      ...(input.kind === 'rebrief' ? { request_kind: 'rebrief', rule_id: sourceContext?.ruleId ?? null, source_round_id: sourceContext?.sourceRoundId ?? null, ...(sourceContext?.source === undefined ? {} : { source: sourceContext.source }) } : {}) });
     const payloadHash = createHash('sha256').update(payload).digest('hex');
     return this.transaction(() => {
       if (input.requestId !== undefined) {
         const existing = this.getDirective(input.requestId);
         if (existing !== null) {
-          if (existing.payloadHash !== payloadHash) {
+          if (existing.payloadHash !== payloadHash || !isDeepStrictEqual(normalizeSourceContext(existing.sourceContext), sourceContext)) {
             throw new DirectiveConflictError(
               `directive request "${input.requestId}" was accepted with a different payload — ` +
                 'a request id identifies one exact request; submit the changed work under a new id',
@@ -6625,7 +7357,7 @@ export class LedgerApi {
             // intent for THIS request — same request identity, idempotent.
             this.beginPhaseHandoff({
               jobId: input.jobId,
-              source: 'silas-directive',
+              source: input.kind === 'rebrief' ? 'silas-rebrief' : 'silas-directive',
               intent: input.handoff,
               requestId: existing.requestId,
             });
@@ -6654,13 +7386,28 @@ export class LedgerApi {
             'a different request id never starts a second concurrent turn on the lane',
         );
       }
+      // One writer per lane (owner rule 5): an unresolved re-brief request
+      // owns the lane until it genuinely settles.
+      if (this.listPendingRebriefs({ jobId: input.jobId }).length > 0) {
+        throw new LaneWriterConflictError(
+          `job "${input.jobId}" has an unresolved re-brief request — it owns the lane until it settles; ` +
+            'wait for its settlement (or its boot reconciliation) before sending a directive',
+        );
+      }
+      // The owner-approved property repair service holds its own `property
+      // repair` allocation across its directive turns; that is the one
+      // admission a property-repair directive may coexist with.
+      this.assertNoProviderProducer(input.jobId, input.holder === 'property-contract-repair' ? (kind) => kind.startsWith('property repair ') : undefined);
       const requestId = input.requestId ?? randomUUID();
       const ts = nowIso();
+      // The revision is bound in the SAME transaction as the intent: the
+      // prompt composed for this request carries exactly these amendments.
+      const workRevision = requiredWorkRevision(this.listJobAmendments(input.jobId));
       this.db
         .prepare(
           `INSERT INTO pending_directives
-             (request_id, job_id, payload, payload_hash, state, baseline_seq, claim, attempts, created_at, updated_at)
-           VALUES (?, ?, ?, ?, 'dispatching', ?, ?, 0, ?, ?)`,
+             (request_id, job_id, payload, payload_hash, state, baseline_seq, claim, attempts, created_at, updated_at, work_revision, authority_epoch, contract_snapshot, contract_sha256, request_kind, source_context)
+           VALUES (?, ?, ?, ?, 'dispatching', ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           requestId,
@@ -6671,22 +7418,45 @@ export class LedgerApi {
           JSON.stringify({ holder: input.holder, since: ts }),
           ts,
           ts,
+          workRevision,
+          this.directiveRecoveryEpoch(input.jobId),
+          this.effectiveContract(input.jobId)?.text ?? null,
+          this.effectiveContract(input.jobId)?.contractSha256 ?? createHash('sha256').update('').digest('hex'),
+          input.kind ?? 'directive',
+          sourceContext === null ? null : JSON.stringify(sourceContext),
         );
+      // A fresh accepted directive is the separately authorized, identity-
+      // checked handoff that supersedes an open retirement hold on this
+      // lane (the hold's own release record names THIS request).
+      this.releaseDirectiveRecoveryHolds(input.jobId, requestId);
+      this.db.prepare('UPDATE pending_directives SET authority_epoch = ? WHERE request_id = ?').run(this.directiveRecoveryEpoch(input.jobId), requestId);
       this.appendEvent({
         kind: 'silas.directive-intent',
         jobId: input.jobId,
-        payload: { request_id: requestId, holder: input.holder, directive_bytes: Buffer.byteLength(input.directive, 'utf-8') },
+        payload: {
+          request_id: requestId,
+          holder: input.holder,
+          directive_bytes: Buffer.byteLength(input.directive, 'utf-8'),
+          work_revision: workRevision,
+        },
       });
       if (input.handoff !== undefined) {
         this.beginPhaseHandoff({
           jobId: input.jobId,
-          source: 'silas-directive',
+          source: input.kind === 'rebrief' ? 'silas-rebrief' : 'silas-directive',
           intent: input.handoff,
           requestId,
         });
       }
       return { record: this.getDirective(requestId) as DirectiveRequestRecord, created: true };
     });
+  }
+
+  beginRebriefIntent(input: { readonly jobId: string; readonly note: string; readonly holder: string; readonly requestId?: string;
+    readonly handoff?: CompletionHandoffIntent; readonly sourceContext?: { readonly ruleId?: string; readonly sourceRoundId?: string; readonly source?: string } }): ReturnType<LedgerApi['beginDirectiveIntent']> {
+    return this.beginDirectiveIntent({ jobId: input.jobId, directive: input.note, holder: input.holder, kind: 'rebrief',
+      ...(input.requestId === undefined ? {} : { requestId: input.requestId }), ...(input.handoff === undefined ? {} : { handoff: input.handoff }),
+      ...(input.sourceContext === undefined ? {} : { sourceContext: input.sourceContext }) });
   }
 
   getDirective(requestId: string): DirectiveRequestRecord | null {
@@ -6759,6 +7529,836 @@ export class LedgerApi {
     return row === undefined ? null : Number(row._rowid);
   }
 
+  directiveTurnIdentity(requestId: string): DirectiveTurnIdentity {
+    const row = this.getDirective(requestId);
+    if (row === null) throw new RecordNotFound(`directive request "${requestId}" not found`);
+    if (row.authorityEpoch === null || row.workRevision === null || row.contractSha256 === null) throw new DirectiveCheckpointError('legacy directive authority is unprovable — Gru decision required');
+    return { requestId, jobId: row.jobId, payloadHash: row.payloadHash, workRevision: row.workRevision, contractSha256: row.contractSha256, authorityEpoch: row.authorityEpoch };
+  }
+
+  assertDirectiveAuthority(identity: DirectiveTurnIdentity): void {
+    validateDirectiveIdentity(identity);
+    const row = this.getDirective(identity.requestId);
+    const job = this.getJob(identity.jobId);
+    if (row === null || !isDeepStrictEqual(this.directiveTurnIdentity(row.requestId), identity) || isDirectiveTerminal(row.state) ||
+        job === null || isJobTerminal(job.status) || job.status === 'parked' ||
+        this.hasOpenDirectiveRecoveryHold(identity.jobId) || this.directiveRecoveryEpoch(identity.jobId) !== identity.authorityEpoch) {
+      throw new DirectiveCheckpointError('directive authority is terminal, held or superseded — no work is authorized');
+    }
+    if (requiredWorkRevision(this.listJobAmendments(identity.jobId)) !== identity.workRevision ||
+        (this.effectiveContract(identity.jobId)?.contractSha256 ?? createHash('sha256').update('').digest('hex')) !== identity.contractSha256) {
+      throw new DirectiveCheckpointError('accepted directive revision/contract is superseded — original continuation is forbidden');
+    }
+    if (row.nativeTarget !== null && !this.listImplementerMinions(identity.jobId).some((agent) =>
+      agent.id === row.nativeTarget!.agentId && agent.sessionFile === row.nativeTarget!.sessionFile && agent.parentage !== 'child')) {
+      throw new DirectiveCheckpointError('original logical minion/session authority changed — continuation is forbidden');
+    }
+    this.assertRecoveryJobPermission(identity.jobId);
+  }
+
+  assertRecoveryJobPermission(jobId: string): void {
+    const job = this.getJob(jobId);
+    if (!job || isJobTerminal(job.status) || job.status === 'parked' || this.hasOpenDirectiveRecoveryHold(jobId)) throw new DirectiveCheckpointError('recovery job is terminal, parked or held');
+    if (this.listObligations({ jobId: jobId }).some((debt) =>
+      (debt.state === 'open' || debt.state === 'waiting' || debt.state === 'suspended') && debt.nextAction.kind === 'owner-decision')) {
+      throw new DirectiveCheckpointError('owner-only decision holds this job — recovery cannot acknowledge it');
+    }
+    if (this.db.prepare(`SELECT 1 FROM notifications n JOIN agents a ON a.id = n.agent_id
+      WHERE a.job_id = ? AND n.routing = 'needs-owner' AND n.acked_at IS NULL AND n.resolved_at IS NULL LIMIT 1`).get(jobId)) {
+      throw new DirectiveCheckpointError('owner-only stop holds this job — recovery cannot acknowledge it');
+    }
+  }
+
+  claimDirectiveDispatch(requestId: string): boolean {
+    return this.transaction(() => {
+      const identity = this.directiveTurnIdentity(requestId);
+      const cleanupBlockers = this.directiveCleanupBlockers(identity.jobId);
+      if (cleanupBlockers.length > 0) throw new DirectiveCheckpointError(`original producer cessation unproven: ${cleanupBlockers.join('; ')}`);
+      this.assertDirectiveAuthority(identity);
+      const row = this.getDirective(requestId)!;
+      if (row.dispatchStartedAt !== null && !this.hasDirectiveDispatchDeferral(requestId)) return false;
+      this.appendEvent({ kind: 'silas.directive-producer-reserved', jobId: identity.jobId, payload: { fact: 'reservation', request_id: requestId, producer_identity: identity } });
+      this.db.prepare('UPDATE pending_directives SET dispatch_started_at = ? WHERE request_id = ?').run(nowIso(), requestId);
+      this.appendEvent({ kind: 'silas.directive-dispatch-started', jobId: row.jobId, payload: { request_id: requestId } });
+      return true;
+    });
+  }
+
+  /** Exact positive no-native-effect receipt, never inferred from missing
+   * targets, claim age, spawn errors or a missing onPrepared callback. */
+  recordDirectiveDispatchDeferral(identity: DirectiveTurnIdentity, dispatchStartSeq: number, reason: string): void {
+    this.transaction(() => {
+      this.assertDirectiveAuthority(identity);
+      const row = this.getDirective(identity.requestId)!;
+      const start = this.latestJobEventByRequestId(identity.jobId, 'silas.directive-dispatch-started', identity.requestId);
+      if (row.state !== 'dispatching' || row.nativeTarget !== null || row.nativeBinding !== null || row.recoveryCheckpoint !== null ||
+          start?.seq !== dispatchStartSeq || !reason.trim()) throw new DirectiveCheckpointError('pre-native deferral does not bind the exact unconsumed dispatch reservation');
+      this.appendEvent({ kind: 'silas.directive-dispatch-deferred', jobId: identity.jobId,
+        payload: { request_id: identity.requestId, dispatch_start_seq: dispatchStartSeq, identity, reason, native_effects: 'none' } });
+    });
+  }
+
+  hasDirectiveDispatchDeferral(requestId: string): boolean {
+    const row = this.getDirective(requestId);
+    if (row === null || row.state !== 'dispatching' || row.nativeTarget !== null || row.nativeBinding !== null || row.recoveryCheckpoint !== null) return false;
+    const start = this.latestJobEventByRequestId(row.jobId, 'silas.directive-dispatch-started', requestId);
+    const deferred = this.latestJobEventByRequestId(row.jobId, 'silas.directive-dispatch-deferred', requestId);
+    const facts = deferred?.payload as { dispatch_start_seq?: unknown; identity?: unknown; native_effects?: unknown } | undefined;
+    return start !== null && deferred !== null && deferred.seq > start.seq && facts?.dispatch_start_seq === start.seq &&
+      facts.native_effects === 'none' && isDeepStrictEqual(facts.identity, this.directiveTurnIdentity(requestId));
+  }
+
+  prepareDirectiveTarget(requestId: string, target: { readonly agentId: string; readonly sessionFile: string }): void {
+    this.transaction(() => {
+      const identity = this.directiveTurnIdentity(requestId);
+      this.assertDirectiveAuthority(identity);
+      const row = this.getDirective(requestId)!;
+      const agent = this.getAgent(target.agentId);
+      if (agent?.jobId !== row.jobId || agent.sessionFile !== target.sessionFile || agent.parentage === 'child') throw new DirectiveCheckpointError('native directive target does not match the logical job minion/session');
+      if (row.nativeTarget !== null && !isDeepStrictEqual(row.nativeTarget, target)) throw new DirectiveCheckpointError('native directive target cannot be replaced');
+      this.db.prepare('UPDATE pending_directives SET native_target = ? WHERE request_id = ?').run(JSON.stringify(target), requestId);
+    });
+  }
+
+  bindDirectiveNativeAdmission(binding: DirectiveNativeBinding): DirectiveRequestRecord {
+    return this.transaction(() => {
+      validateDirectiveIdentity(binding.identity);
+      const row = this.getDirective(binding.identity.requestId);
+      if (row === null || isDirectiveTerminal(row.state) || !isDeepStrictEqual(this.directiveTurnIdentity(row.requestId), binding.identity)) throw new DirectiveCheckpointError('native admission does not match a live accepted request');
+      if (binding.runtime !== 'pi' || !binding.sessionId || !binding.userEntryId || !/^[a-f0-9]{64}$/.test(binding.promptHash) ||
+          row.nativeTarget?.agentId !== binding.agentId || row.nativeTarget?.sessionFile !== binding.sessionFile) throw new DirectiveCheckpointError('actual native admission identity is incomplete/mismatched');
+      const actual = inspectDirectiveAdmission(binding.sessionFile, binding.identity);
+      if (!isDeepStrictEqual(actual, binding)) throw new DirectiveCheckpointError('native admission does not match actual durable user readback');
+      if (row.nativeBinding !== null) {
+        if (!isDeepStrictEqual(row.nativeBinding, binding)) throw new DirectiveCheckpointError('actual native admission cannot be rebound');
+        return row;
+      }
+      const sent = this.appendEvent({ kind: 'silas.directive-sent', jobId: row.jobId,
+        payload: { request_id: row.requestId, minion_id: binding.agentId, native_binding: binding,
+          ...(row.sourceContext?.ruleId === undefined ? {} : { rule_id: row.sourceContext.ruleId }),
+          ...(row.sourceContext?.sourceRoundId === undefined ? {} : { source_round_id: row.sourceContext.sourceRoundId }),
+          ...(row.sourceContext?.source === undefined ? {} : { source: row.sourceContext.source }),
+          blocker_fingerprint: (JSON.parse(row.payload) as { blocker_fingerprint?: unknown }).blocker_fingerprint ?? null } });
+      this.db.prepare('UPDATE pending_directives SET native_binding = ? WHERE request_id = ?').run(JSON.stringify(binding), row.requestId);
+      const admitted = this.recordDirectiveAdmission({ requestId: row.requestId, minionId: binding.agentId, eventSeq: sent.seq });
+      // Fresh accepted successor admission is a real handoff, not retirement.
+      const predecessors = this.db.prepare("SELECT request_id FROM pending_directives WHERE job_id = ? AND json_extract(recovery_decision, '$.successorId') = ?").all(row.jobId, row.requestId) as Row[];
+      for (const predecessor of predecessors) this.settleDirectiveRecoveryDebt(str(predecessor.request_id), sent.seq, 'silas.directive-sent');
+      const rebriefs = this.db.prepare('SELECT marker_id FROM rebrief_recovery_decisions WHERE successor_id = ?').all(row.requestId) as Row[];
+      for (const marker of rebriefs) {
+        const debt = this.recoveryObligation(row.jobId, 'rebrief', str(marker.marker_id));
+        if (debt !== null && (debt.state === 'open' || debt.state === 'waiting')) {
+          this.settleObligation({ obligationId: debt.id, settlement: { kind: 'executed-action', action: 'actual rebrief recovery successor admission', evidenceEventSeq: sent.seq, evidenceEventKind: sent.kind } });
+          const card = this.findNotificationByKind(`silas.rebrief-unreconciled.${row.jobId}`, 'active');
+          if (card?.routing === 'action-required') this.resolveNotificationById(card.id, 'rebrief-recovery-evidence');
+        }
+      }
+      return admitted;
+    });
+  }
+
+  appendCustomEventIfCurrentDirective(fields: { readonly kind: string; readonly jobId: string; readonly payload: unknown }, identity: DirectiveTurnIdentity): EventRecord {
+    return this.transaction(() => { this.assertDirectiveAuthority(identity); return this.appendEvent(fields); });
+  }
+
+  startDirectiveProducer(identity: DirectiveTurnIdentity, producer: DirectiveProducer): number {
+    return this.transaction(() => {
+      this.assertDirectiveAuthority(identity);
+      const target = this.getDirective(identity.requestId)!.nativeTarget;
+      if (!isDeepStrictEqual(producer.identity, identity) || producer.agentId !== target?.agentId || producer.sessionFile !== target.sessionFile ||
+          !producer.incarnation || !producer.sessionId || !producer.host || !Number.isSafeInteger(producer.pid) || producer.pid <= 0) {
+        throw new DirectiveCheckpointError('native producer start must bind the exact prepared physical request/session authority');
+      }
+      const blockers = this.directiveCleanupBlockers(identity.jobId);
+      if (blockers.length > 0) throw new DirectiveCheckpointError(`original producer cessation unproven: ${blockers.join('; ')}`);
+      this.appendEvent({ kind: 'silas.directive-producer-started', jobId: identity.jobId,
+        payload: { request_id: identity.requestId, producer_identity: identity, native_producer: producer } });
+      return this.directiveProducerStart(identity);
+    });
+  }
+
+  directiveProducerStart(identity: DirectiveTurnIdentity): number {
+    const event = this.latestJobEventByRequestId(identity.jobId, 'silas.directive-producer-started', identity.requestId);
+    const payload = event?.payload as { producer_identity?: unknown } | undefined;
+    if (event === null || !isDeepStrictEqual(payload?.producer_identity, identity)) throw new DirectiveCheckpointError('exact directive producer start receipt missing');
+    return event.seq;
+  }
+
+  private validateDirectiveProducerReceipt(jobId: string | null, raw: unknown): void {
+    const payload = raw as { producer_start_seq?: unknown; producer_identity?: DirectiveTurnIdentity; request_id?: unknown; agent_id?: unknown; session_file?: unknown } | undefined;
+    if (payload?.producer_start_seq === undefined) return; // legacy records cannot consume a new start fence
+    const start = typeof payload.producer_start_seq === 'number' ? this.getEvent(payload.producer_start_seq) : null;
+    const identity = payload.producer_identity;
+    const row = typeof payload.request_id === 'string' ? this.getDirective(payload.request_id) : null;
+    if (identity === undefined || row === null || start?.kind !== 'silas.directive-producer-started' || start.jobId !== jobId || row.jobId !== jobId ||
+        !isDeepStrictEqual((start.payload as { producer_identity?: unknown }).producer_identity, identity) ||
+        !isDeepStrictEqual(this.directiveTurnIdentity(row.requestId), identity) || identity.requestId !== payload.request_id ||
+        row.nativeTarget?.agentId !== payload.agent_id || row.nativeTarget?.sessionFile !== payload.session_file ||
+        !isDeepStrictEqual((start.payload as { native_producer?: unknown }).native_producer, (raw as { native_producer?: unknown }).native_producer)) {
+      throw new DirectiveCheckpointError('producer cleanup receipt does not bind the exact original start/request/minion/session authority');
+    }
+  }
+
+  private directiveCleanupBlockers(jobId: string, ownProducerStartSeq?: number): readonly string[] {
+    const rows = this.db.prepare(`SELECT seq, kind, payload FROM events e WHERE e.job_id = ?
+      AND e.kind IN ('silas.directive-producer-unknown', 'silas.directive-producer-ceased')
+      AND NOT EXISTS (SELECT 1 FROM events newer WHERE newer.job_id = e.job_id AND newer.seq > e.seq
+        AND newer.kind IN ('silas.directive-producer-unknown', 'silas.directive-producer-ceased')
+        AND json_extract(newer.payload, '$.request_id') = json_extract(e.payload, '$.request_id')
+        AND json_extract(newer.payload, '$.agent_id') = json_extract(e.payload, '$.agent_id')
+        AND json_extract(newer.payload, '$.session_file') IS json_extract(e.payload, '$.session_file')
+        AND ((json_extract(e.payload, '$.producer_start_seq') IS NOT NULL
+          AND json_extract(newer.payload, '$.producer_start_seq') = json_extract(e.payload, '$.producer_start_seq'))
+          OR json_extract(newer.payload, '$.producer_unknown_seq') = e.seq))`).all(jobId) as Row[];
+    type CleanupReceipt = { readonly request_id?: unknown; readonly agent_id?: unknown; readonly session_file?: unknown;
+      readonly producer_start_seq?: unknown; readonly producer_identity?: unknown; readonly native_producer?: DirectiveProducer };
+    const ceasedByStart = new Map<number, readonly { readonly seq: number; readonly receipt: CleanupReceipt }[]>();
+    for (const row of rows) {
+      if (row.kind !== 'silas.directive-producer-ceased') continue;
+      const receipt = JSON.parse(str(row.payload)) as CleanupReceipt;
+      if (typeof receipt.producer_start_seq !== 'number') continue;
+      ceasedByStart.set(receipt.producer_start_seq, [...(ceasedByStart.get(receipt.producer_start_seq) ?? []), { seq: Number(row.seq), receipt }]);
+    }
+    const starts = this.db.prepare(`SELECT seq, payload FROM events WHERE job_id = ? AND kind = 'silas.directive-producer-started'`).all(jobId) as Row[];
+    const pending = starts.filter((row) => {
+      if (Number(row.seq) === ownProducerStartSeq) return false;
+      const start = JSON.parse(str(row.payload)) as CleanupReceipt;
+      // The write boundary accepts structural identity, not JSON property
+      // order. Readback must keep that same exact physical start contract.
+      return !(ceasedByStart.get(Number(row.seq)) ?? []).some(({ seq, receipt }) => seq > Number(row.seq) && start.native_producer !== undefined &&
+        receipt.request_id === start.request_id && receipt.agent_id === start.native_producer.agentId &&
+        receipt.session_file === start.native_producer.sessionFile &&
+        isDeepStrictEqual(receipt.producer_identity, start.producer_identity) &&
+        isDeepStrictEqual(receipt.native_producer, start.native_producer));
+    }).map((row) => {
+      const payload = JSON.parse(str(row.payload)) as { request_id: string };
+      return `unproven producer cleanup: request ${payload.request_id}, start ${Number(row.seq)} — original-owner cessation receipt required; inspect exact native/controller evidence before Gru judgment`;
+    });
+    return [...pending, ...rows.filter((row) => row.kind === 'silas.directive-producer-unknown').map((row) => {
+      const payload = JSON.parse(str(row.payload)) as { request_id: string; agent_id: string };
+      return `unproven producer cleanup: minion ${payload.agent_id}, request ${payload.request_id}`;
+    })];
+  }
+
+  directiveProgressBlockers(requestId: string, laneId: string, ownSpawningAgentId?: string, ownProducerStartSeq?: number, ownNativeProducer?: DirectiveProducer): readonly string[] {
+    const row = this.getDirective(requestId);
+    if (row === null) throw new RecordNotFound(`directive request "${requestId}" not found`);
+    if (ownProducerStartSeq !== undefined && this.directiveProducerStart(this.directiveTurnIdentity(requestId)) !== ownProducerStartSeq) {
+      throw new DirectiveCheckpointError('current producer token does not match this exact request start');
+    }
+    if (ownNativeProducer !== undefined) {
+      const start = ownProducerStartSeq === undefined ? null : this.getEvent(ownProducerStartSeq);
+      const identity = this.directiveTurnIdentity(requestId);
+      const agent = this.getAgent(ownNativeProducer.agentId);
+      if (start === null || !isDeepStrictEqual((start.payload as { native_producer?: unknown }).native_producer, ownNativeProducer) ||
+          !isDeepStrictEqual(ownNativeProducer.identity, identity) || ownNativeProducer.pid !== process.pid || ownNativeProducer.host !== hostname() ||
+          agent?.jobId !== row.jobId || agent.parentage === 'child' || agent.sessionFile !== ownNativeProducer.sessionFile ||
+          row.nativeTarget?.agentId !== ownNativeProducer.agentId || row.nativeTarget.sessionFile !== ownNativeProducer.sessionFile ||
+          agent.state === 'streaming' && row.nativeBinding === null ||
+          row.nativeBinding !== null && row.nativeBinding.sessionId !== ownNativeProducer.sessionId) {
+        throw new DirectiveCheckpointError('active native producer does not bind the exact current physical request/session/start token');
+      }
+      const physical = inspectDirectiveProducers(ownNativeProducer.sessionFile);
+      const current = physical.find(({ producer }) => isDeepStrictEqual(producer, ownNativeProducer));
+      if (current?.evidence !== 'unknown' || physical.some(({ producer, evidence }) => producer.incarnation !== ownNativeProducer.incarnation && evidence === 'unknown')) {
+        throw new DirectiveCheckpointError('active native producer is ceased/unbound or another physical incarnation remains UNKNOWN');
+      }
+    }
+    return this.directiveRetirementBlockers(row, laneId, ownSpawningAgentId, ownProducerStartSeq, ownNativeProducer);
+  }
+
+  claimDirectiveCheckpoint(identity: DirectiveTurnIdentity, checkpointId: string): void {
+    if (checkpointId.trim() === '') throw new DirectiveCheckpointError('native checkpoint id required');
+    this.transaction(() => {
+      this.assertDirectiveAuthority(identity);
+      const row = this.getDirective(identity.requestId)!;
+      if (row.nativeBinding === null || row.recoveryCheckpoint !== null) throw new DirectiveCheckpointError('native continuation already claimed or admission unproven — reconcile actual native progress, never retry by age');
+      this.db.prepare('UPDATE pending_directives SET recovery_checkpoint = ? WHERE request_id = ?').run(checkpointId, row.requestId);
+      this.appendEvent({ kind: 'silas.directive-continuation-claimed', jobId: row.jobId,
+        payload: { request_id: row.requestId, checkpoint_id: checkpointId, native_binding: row.nativeBinding } });
+    });
+  }
+
+  recoveryDecisionHistory(kind: RecoverySubjectKind, subjectId: string): readonly RecoveryDecisionHistory[] {
+    const eventKind = kind === 'directive' ? 'silas.directive-recovery-decided' : 'silas.rebrief-recovery-decided';
+    const key = kind === 'directive' ? 'request_id' : 'marker_id';
+    const rows = this.db.prepare(`SELECT * FROM events WHERE kind = ? AND json_extract(payload, '$.${key}') = ? ORDER BY seq`)
+      .all(eventKind, subjectId) as Row[];
+    return rows.map((row) => {
+      const event = this.eventFromRow(row);
+      const payload = event.payload as { fingerprint: string; generation: number; decision: { kind: string; requestId?: string }; owner_transfer?: RecoveryOwnerTransfer; current_inspection_obligation_id?: string };
+      if (typeof payload.fingerprint !== 'string') throw new DirectiveCheckpointError('recovery decision history lacks its immutable fingerprint');
+      return { eventSeq: event.seq, fingerprint: payload.fingerprint, generation: payload.generation,
+        successorId: payload.decision.kind === 'successor' ? payload.decision.requestId ?? null : null,
+        ownerTransfer: payload.owner_transfer ?? null, currentInspectionObligationId: payload.current_inspection_obligation_id ?? null };
+    });
+  }
+
+  rebriefCurrentActionObligationLineages(markerId: string): readonly {
+    readonly decisionEvent: EventRecord;
+    readonly gateEvents: readonly EventRecord[];
+    readonly obligations: readonly ObligationRecord[];
+    readonly currentObligation: ObligationRecord;
+  }[] {
+    return this.recoveryDecisionHistory('rebrief', markerId).filter((history) => history.currentInspectionObligationId !== null).map((history) => {
+      const decisionEvent = this.getEvent(history.eventSeq);
+      if (decisionEvent === null || decisionEvent.jobId === null) throw new DirectiveCheckpointError('current action lineage original decision is unavailable');
+      const root = this.getObligation(history.currentInspectionObligationId!);
+      if (root === null || root.jobId !== decisionEvent.jobId || root.incidentKey !== `rebrief-current-inspection:${markerId}`) throw new DirectiveCheckpointError('current action lineage inspection root is missing or foreign');
+      const obligations: ObligationRecord[] = []; const seen = new Set<string>(); let cursor = root;
+      while (true) {
+        if (seen.has(cursor.id)) throw new DirectiveCheckpointError('current action obligation lineage is cyclic');
+        seen.add(cursor.id); obligations.push(cursor);
+        if (cursor.settlement?.kind !== 'superseded') break;
+        if (cursor.settlement.byObligationId === null) throw new DirectiveCheckpointError('current action obligation lineage loses its owed successor');
+        const next = this.getObligation(cursor.settlement.byObligationId);
+        if (next === null || next.jobId !== root.jobId) throw new DirectiveCheckpointError('current action obligation lineage successor is missing or foreign');
+        const protectedAction = this.currentGateDutyAction(next.id);
+        if (protectedAction === null || !('decision' in protectedAction) || !('decision' in next.nextAction) || next.nextAction.decision !== protectedAction.decision) throw new DirectiveCheckpointError('current action obligation lineage successor bindings changed or are unproven');
+        cursor = next;
+      }
+      const gateRows = this.db.prepare("SELECT * FROM events WHERE job_id = ? AND kind = 'silas.rebrief-current-gates-owed' AND json_extract(payload, '$.marker_id') = ? ORDER BY seq").all(root.jobId, markerId) as Row[];
+      const gateEvents = gateRows.map((row) => this.eventFromRow(row)).filter((event) =>
+        obligations.some((row) => row.id === (event.payload as { obligation_id?: unknown }).obligation_id));
+      return { decisionEvent, gateEvents, obligations, currentObligation: cursor };
+    });
+  }
+
+  recoverySubject(kind: RecoverySubjectKind, subjectId: string): RecoverySubject {
+    let jobId: string;
+    let snapshot: unknown;
+    if (kind === 'directive') {
+      const row = this.getDirective(subjectId);
+      if (row === null) throw new RecordNotFound(`directive request "${subjectId}" not found`);
+      jobId = row.jobId;
+      snapshot = { requestId: row.requestId, jobId, payloadHash: row.payloadHash, baselineSeq: row.baselineSeq,
+        workRevision: row.workRevision, contractSha256: row.contractSha256, authorityEpoch: row.authorityEpoch,
+        nativeTarget: row.nativeTarget, nativeBinding: row.nativeBinding, admissionSeq: row.admissionSeq,
+        admissionMinion: row.admissionMinion, deliverySeq: row.deliverySeq, recoveryCheckpoint: row.recoveryCheckpoint };
+    } else {
+      const evidence = this.rebriefReceiptEvidence(subjectId);
+      jobId = evidence.markers[0]!.jobId;
+      snapshot = evidence;
+    }
+    return { kind, id: subjectId, jobId, snapshot, snapshotSha256: createHash('sha256').update(canonicalRebriefEvidence(snapshot)).digest('hex') };
+  }
+
+  private ownerRecoveryTarget(id: string, jobId: string): ObligationRecord {
+    const target = this.getObligation(id);
+    if (target === null || target.jobId !== jobId || target.logicalStep !== 'operation' ||
+        target.category.kind !== 'known' || target.category.category !== 'owner-hold' ||
+        target.nextAction.kind !== 'owner-decision' || !['open', 'waiting', 'suspended'].includes(target.state)) {
+      throw new DirectiveCheckpointError('owner transfer requires this job’s real live job-wide operation owner-hold; generic, limited or foreign decisions cannot qualify');
+    }
+    return target;
+  }
+
+  private makeOwnerRecoveryTransfer(subject: RecoverySubject, debt: ObligationRecord, targetId: string): RecoveryOwnerTransfer {
+    const target = this.ownerRecoveryTarget(targetId, subject.jobId);
+    const { id, jobId, logicalStep, generation, planRevision, category, authority, nextAction, firstOriginSeq, lastOriginSeq } = target;
+    return { subject, debtId: debt.id, generation: debt.generation,
+      target: { id, jobId, logicalStep, generation, planRevision, category, authority, nextAction, firstOriginSeq, lastOriginSeq },
+      epoch: this.directiveRecoveryEpoch(subject.jobId) };
+  }
+
+  private closeOwnerTransferredRecoveryDebt(debt: ObligationRecord, transfer: RecoveryOwnerTransfer, event: EventRecord): void {
+    this.settleObligation({ obligationId: debt.id, settlement: debt.state === 'suspended'
+      ? { kind: 'superseded', byObligationId: transfer.target.id, reason: `exact recovery subject transferred by event ${event.seq}` }
+      : { kind: 'executed-action', action: `exact recovery subject transferred to owner obligation ${transfer.target.id}`,
+        evidenceEventSeq: event.seq, evidenceEventKind: event.kind } });
+  }
+
+  private recoveryOwnerLineage(transfer: RecoveryOwnerTransfer): { readonly sha256: string; readonly events: readonly EventRecord[] } {
+    const snapshot = transfer.subject.snapshot as { authorityEpoch?: number; baselineSeq?: number; markers?: readonly { baselineSeq: number }[] };
+    const from = snapshot.authorityEpoch ?? snapshot.baselineSeq ?? Math.min(...(snapshot.markers ?? []).map((marker) => marker.baselineSeq));
+    const rows = this.db.prepare(`SELECT * FROM events WHERE job_id = ? AND seq > ? AND
+      ((${DIRECTIVE_CONTROL_SQL}) OR (kind IN ('job.obligation-state', 'job.obligation-settled', 'job.obligation-updated') AND json_extract(payload, '$.id') = ?)) ORDER BY seq`)
+      .all(transfer.subject.jobId, from, transfer.target.id) as Row[];
+    const events = rows.map((row) => this.eventFromRow(row));
+    const facts = events.map(({ seq, kind, jobId, payload }) => ({ seq, kind, jobId, payload }));
+    return { events, sha256: createHash('sha256').update(canonicalRebriefEvidence(facts)).digest('hex') };
+  }
+
+  private ownerLineagePermits(transfer: RecoveryOwnerTransfer, events: readonly EventRecord[]): boolean {
+    return events.every((event) => {
+      const payload = event.payload as Record<string, unknown>;
+      if (event.kind === 'job.amendment-accepted') return true;
+      if (event.kind.startsWith('job.obligation-')) return payload['id'] === transfer.target.id;
+      if (event.kind === 'job.status') return event.seq >= transfer.target.firstOriginSeq &&
+        (payload['to'] === 'parked' || payload['to'] === 'blocked');
+      if (event.kind === 'ruling.recorded' || event.kind === 'silas.recovery-owner-stop-confirmed') {
+        const recorded = this.recoveryDecisionHistory(transfer.subject.kind, transfer.subject.id)
+          .find((decision) => decision.eventSeq === payload['transfer_event_seq']);
+        // Earlier exact owner actions remain immutable lineage, not a
+        // grant for this new incarnation/plan. A current ruling and its
+        // genuine confirmation are still separately required below.
+        return payload['by'] === 'owner' && payload['subject_id'] === transfer.subject.id &&
+          payload['subject_kind'] === transfer.subject.kind && recorded?.ownerTransfer?.target.id === transfer.target.id;
+      }
+      return false;
+    });
+  }
+
+  recoveryOwnerResolution(kind: RecoverySubjectKind, subjectId: string, resolutionId?: string): EventRecord | null {
+    const row = this.db.prepare(`SELECT * FROM events WHERE kind = 'ruling.recorded'
+      AND json_extract(payload, '$.permission') = 'fresh-current-approved-recovery-successor'
+      AND json_extract(payload, '$.subject_kind') = ? AND json_extract(payload, '$.subject_id') = ?
+      ${resolutionId === undefined ? '' : "AND json_extract(payload, '$.resolution_id') = ?"} ORDER BY seq DESC LIMIT 1`)
+      .get(kind, subjectId, ...(resolutionId === undefined ? [] : [resolutionId])) as Row | undefined;
+    return row === undefined ? null : this.eventFromRow(row);
+  }
+
+  recoveryOwnerReadback(kind: RecoverySubjectKind, subjectId: string): {
+    readonly history: readonly RecoveryDecisionHistory[]; readonly transfer: RecoveryDecisionHistory | null;
+    readonly target: ObligationRecord | null; readonly lineageSha256: string | null;
+    readonly resolution: EventRecord | null; readonly confirmation: EventRecord | null;
+    readonly ownerActionRecipe: unknown;
+  } {
+    const history = this.recoveryDecisionHistory(kind, subjectId);
+    const latest = history.at(-1) ?? null;
+    const transfer = latest?.ownerTransfer === null ? null : latest;
+    const target = transfer?.ownerTransfer === undefined || transfer.ownerTransfer === null ? null : this.getObligation(transfer.ownerTransfer.target.id);
+    const resolution = this.recoveryOwnerResolution(kind, subjectId);
+    const row = this.db.prepare(`SELECT * FROM events WHERE kind = 'silas.recovery-owner-stop-confirmed'
+      AND json_extract(payload, '$.subject_kind') = ? AND json_extract(payload, '$.subject_id') = ? ORDER BY seq DESC LIMIT 1`)
+      .get(kind, subjectId) as Row | undefined;
+    return { history, transfer, target,
+      lineageSha256: transfer?.ownerTransfer == null ? null : this.recoveryOwnerLineage(transfer.ownerTransfer).sha256,
+      resolution, confirmation: row === undefined ? null : this.eventFromRow(row),
+      ownerActionRecipe: transfer?.ownerTransfer == null ? null : {
+        recordPath: `/api/silas/${kind === 'directive' ? 'directives' : 'rebriefs'}/${encodeURIComponent(subjectId)}/owner-resolution`,
+        confirmPath: `/api/silas/${kind === 'directive' ? 'directives' : 'rebriefs'}/${encodeURIComponent(subjectId)}/owner-resolution/confirm-stop`,
+        explicitAttribution: 'owner', confirmIntent: true, stableResolutionIdRequired: true,
+        transferEventSeq: transfer.eventSeq, transferFingerprint: transfer.fingerprint,
+        subjectSha256: transfer.ownerTransfer.subject.snapshotSha256, targetId: transfer.ownerTransfer.target.id,
+        targetGeneration: transfer.ownerTransfer.target.generation, targetPlanRevision: transfer.ownerTransfer.target.planRevision,
+        lineageSha256: this.recoveryOwnerLineage(transfer.ownerTransfer).sha256,
+        currentAuthority: this.directiveCurrentAuthority(transfer.ownerTransfer.subject.jobId),
+        currentEpoch: this.directiveRecoveryEpoch(transfer.ownerTransfer.subject.jobId),
+        warning: 'Shared bearer attribution is not independently verified identity. Record permission, separately affirm/confirm the real governing target, then explicitly unpark the job if intended. No action executes work or proves original effects/cessation/completion. A separate fresh Gru generation/judgment is required.' } };
+  }
+
+  private validateRecoveryOwnerAction(input: RecoveryOwnerActionInput): { readonly subject: RecoverySubject; readonly transfer: RecoveryDecisionHistory; readonly target: ObligationRecord; readonly lineage: { readonly sha256: string; readonly events: readonly EventRecord[] } } {
+    const subject = this.recoverySubject(input.kind, input.subjectId);
+    const transfer = this.recoveryDecisionHistory(input.kind, input.subjectId).at(-1);
+    if (transfer?.ownerTransfer == null || transfer.eventSeq !== input.transferEventSeq ||
+        transfer.fingerprint !== input.expectedTransferFingerprint || subject.snapshotSha256 !== input.expectedSubjectSha256 ||
+        transfer.ownerTransfer.subject.snapshotSha256 !== subject.snapshotSha256) throw new DirectiveCheckpointError('owner resolution transfer/subject snapshot is stale or unproven');
+    const target = this.ownerRecoveryTarget(transfer.ownerTransfer.target.id, subject.jobId);
+    if (target.generation !== input.expectedTargetGeneration || target.planRevision !== input.expectedTargetPlanRevision ||
+        target.generation !== transfer.ownerTransfer.target.generation || target.planRevision !== transfer.ownerTransfer.target.planRevision) {
+      throw new DirectiveCheckpointError('owner resolution target generation/plan changed — separately fenced transfer required');
+    }
+    const lineage = this.recoveryOwnerLineage(transfer.ownerTransfer);
+    if (lineage.sha256 !== input.expectedLineageSha256 || !this.ownerLineagePermits(transfer.ownerTransfer, lineage.events) ||
+        this.directiveRecoveryEpoch(subject.jobId) !== input.expectedEpoch || !input.reason.trim()) throw new DirectiveCheckpointError('owner resolution stop lineage/epoch is stale, unrelated or incomplete');
+    const job = this.getJob(subject.jobId);
+    if (job === null || isJobTerminal(job.status)) throw new DirectiveCheckpointError('terminal work cannot receive a recovery owner grant');
+    this.assertFreshRecoveryContract(subject.jobId, input.expectedWorkRevision, input.expectedContractSha256);
+    return { subject, transfer, target, lineage };
+  }
+
+  /** Explicit owner-attributed input only. This records narrowly scoped
+   * permission, never resumes/Acks/stops a producer or executes work. */
+  recordRecoveryOwnerResolution(input: RecoveryOwnerActionInput): { readonly event: EventRecord; readonly idempotent: boolean } {
+    const fingerprint = createHash('sha256').update(canonicalRebriefEvidence({ version: 1, ...input })).digest('hex');
+    return this.transaction(() => {
+      if (!input.resolutionId.trim()) throw new DirectiveCheckpointError('owner resolution requires a stable unused identity');
+      const prior = this.recoveryOwnerResolution(input.kind, input.subjectId, input.resolutionId);
+      if (prior !== null) {
+        if ((prior.payload as { fingerprint?: unknown }).fingerprint !== fingerprint) throw new DirectiveCheckpointError('owner resolution identity conflicts');
+        return { event: prior, idempotent: true };
+      }
+      const { subject, transfer, target, lineage } = this.validateRecoveryOwnerAction(input);
+      const event = this.appendCustomEvent({ kind: 'ruling.recorded', jobId: subject.jobId,
+        payload: { version: 1, by: 'owner', permission: 'fresh-current-approved-recovery-successor', resolution_id: input.resolutionId,
+          ref: `recovery-owner:${input.kind}:${input.subjectId}:${input.resolutionId}`, ruling_version: '1', fingerprint,
+          subject_kind: input.kind, subject_id: input.subjectId, subject, transfer_event_seq: transfer.eventSeq,
+          transfer_fingerprint: transfer.fingerprint, target: transfer.ownerTransfer!.target,
+          stop_lineage: lineage.events.map(({ seq, kind, jobId, payload }) => ({ seq, kind, jobId, payload })),
+          work_revision: input.expectedWorkRevision, contract_sha256: input.expectedContractSha256, head: input.expectedHead,
+          epoch: input.expectedEpoch, reason: input.reason, target_state: target.state } });
+      return { event, idempotent: false };
+    });
+  }
+
+  /** A separate explicit owner action affirms the actual governing stop.
+   * Only this target is legally resumed/settled; parking/cards stay intact. */
+  confirmRecoveryOwnerStop(input: RecoveryOwnerActionInput, expectedResolutionFingerprint: string): { readonly event: EventRecord; readonly idempotent: boolean } {
+    const fingerprint = createHash('sha256').update(canonicalRebriefEvidence({ version: 1, ...input, expectedResolutionFingerprint })).digest('hex');
+    return this.transaction(() => {
+      const priorRow = this.db.prepare(`SELECT * FROM events WHERE kind = 'silas.recovery-owner-stop-confirmed'
+        AND json_extract(payload, '$.subject_kind') = ? AND json_extract(payload, '$.subject_id') = ? AND json_extract(payload, '$.resolution_id') = ?`)
+        .get(input.kind, input.subjectId, input.resolutionId) as Row | undefined;
+      if (priorRow !== undefined) {
+        const prior = this.eventFromRow(priorRow);
+        if ((prior.payload as { fingerprint?: unknown }).fingerprint !== fingerprint) throw new DirectiveCheckpointError('owner stop confirmation identity conflicts');
+        return { event: prior, idempotent: true };
+      }
+      const { subject, transfer, target } = this.validateRecoveryOwnerAction(input);
+      const ruling = this.recoveryOwnerResolution(input.kind, input.subjectId, input.resolutionId);
+      const permission = ruling?.payload as { fingerprint?: unknown; subject?: RecoverySubject; transfer_event_seq?: unknown; work_revision?: unknown; contract_sha256?: unknown; head?: unknown } | undefined;
+      if (ruling === null || permission?.fingerprint !== expectedResolutionFingerprint ||
+          permission.subject?.snapshotSha256 !== subject.snapshotSha256 || permission.transfer_event_seq !== transfer.eventSeq ||
+          permission.work_revision !== input.expectedWorkRevision || permission.contract_sha256 !== input.expectedContractSha256 ||
+          permission.head !== input.expectedHead) throw new DirectiveCheckpointError('owner stop confirmation ruling/scope is missing, stale or conflicting');
+      const event = this.appendCustomEvent({ kind: 'silas.recovery-owner-stop-confirmed', jobId: subject.jobId,
+        payload: { version: 1, by: 'owner', subject_kind: input.kind, subject_id: input.subjectId, subject,
+          resolution_id: input.resolutionId, ruling_event_seq: ruling.seq, ruling_fingerprint: expectedResolutionFingerprint,
+          transfer_event_seq: transfer.eventSeq, target: transfer.ownerTransfer!.target, fingerprint, reason: input.reason } });
+      if (target.state === 'suspended') this.resumeObligation(target.id, `explicit owner stop confirmation ${event.seq}`);
+      this.settleObligation({ obligationId: target.id, settlement: { kind: 'executed-action',
+        action: 'explicit owner confirmed governing recovery stop resolved', evidenceEventSeq: event.seq, evidenceEventKind: event.kind } });
+      return { event, idempotent: false };
+    });
+  }
+
+  recoveryOwnerBasis(kind: RecoverySubjectKind, subjectId: string): {
+    readonly owned: boolean; readonly changed: boolean; readonly confirmed: boolean;
+    readonly observedAtSeq: number; readonly resolutionEventSeq: number | null;
+  } {
+    const view = this.recoveryOwnerReadback(kind, subjectId);
+    const transfer = view.transfer?.ownerTransfer;
+    if (transfer == null) return { owned: false, changed: false, confirmed: false, observedAtSeq: 0, resolutionEventSeq: null };
+    const subject = this.recoverySubject(kind, subjectId);
+    const unchanged = subject.snapshotSha256 === transfer.subject.snapshotSha256 && view.target !== null &&
+      view.target.generation === transfer.target.generation && view.target.planRevision === transfer.target.planRevision;
+    const held = unchanged && view.target!.nextAction.kind === 'owner-decision' &&
+      ['open', 'waiting', 'suspended'].includes(view.target!.state) && this.ownerLineagePermits(transfer, this.recoveryOwnerLineage(transfer).events);
+    const confirmation = view.confirmation?.payload as { transfer_event_seq?: unknown; ruling_event_seq?: unknown; subject?: RecoverySubject; target?: RecoveryOwnerTransfer['target'] } | undefined;
+    const permission = view.resolution?.payload as { transfer_event_seq?: unknown; subject?: RecoverySubject; target?: RecoveryOwnerTransfer['target']; work_revision?: unknown; contract_sha256?: unknown } | undefined;
+    const current = this.directiveCurrentAuthority(subject.jobId);
+    const confirmed = unchanged && view.target?.state === 'settled' && view.target.settlement?.kind === 'executed-action' &&
+      view.target.settlement.evidenceEventSeq === view.confirmation?.seq &&
+      confirmation?.transfer_event_seq === view.transfer!.eventSeq && confirmation.ruling_event_seq === view.resolution?.seq &&
+      confirmation.subject?.snapshotSha256 === subject.snapshotSha256 && permission?.subject?.snapshotSha256 === subject.snapshotSha256 &&
+      permission.transfer_event_seq === view.transfer!.eventSeq && permission.work_revision === current.workRevision &&
+      permission.contract_sha256 === current.contractSha256 && this.ownerLineagePermits(transfer, this.recoveryOwnerLineage(transfer).events);
+    const activity = this.db.prepare(`SELECT MAX(seq) AS seq FROM events WHERE job_id = ? AND (
+      (${DIRECTIVE_CONTROL_SQL}) OR (kind IN ('job.obligation-state', 'job.obligation-settled', 'job.obligation-updated') AND json_extract(payload, '$.id') = ?)
+      OR (kind IN ('silas.directive-sent', 'job.delivered', 'silas.rebrief') AND (json_extract(payload, '$.request_id') = ? OR json_extract(payload, '$.marker_id') = ?)))`)
+      .get(subject.jobId, transfer.target.id, subjectId, subjectId) as Row;
+    const awaitingExplicitUnpark = confirmed && this.getJob(subject.jobId)?.status === 'parked';
+    return { owned: held || awaitingExplicitUnpark, changed: !held && !awaitingExplicitUnpark, confirmed, observedAtSeq: Math.max(Number(activity.seq ?? 0), view.transfer!.eventSeq),
+      resolutionEventSeq: confirmed ? view.resolution!.seq : null };
+  }
+
+  private observeRecoveryDebt(kind: RecoverySubjectKind, subjectId: string, jobId: string, baselineSeq: number, context: BlockerContext): ObligationRecord {
+    const basis = this.recoveryOwnerBasis(kind, subjectId);
+    const debt = this.recordBlockedObservation(jobId, { ...context, observedAtSeq: basis.changed ? Math.max(baselineSeq, basis.observedAtSeq) : baselineSeq });
+    const parked = this.preserveParkedRecoveryDebt(debt);
+    if (basis.changed && !basis.confirmed && (parked.state === 'open' || parked.state === 'waiting')) {
+      return this.suspendObligation(parked.id, 'recorded owner transfer changed without genuine governing owner resolution — no work authority');
+    }
+    return parked;
+  }
+
+  /** Exact live recovery identity, including owner-suspended debt. A bounded
+   * UI history page is not an identity lookup or a generation fence. */
+  recoveryObligation(jobId: string, kind: RecoverySubjectKind, subjectId: string): ObligationRecord | null {
+    return this.activeIncarnation(jobId, 'operation', `${kind}-recovery:${subjectId}`);
+  }
+
+  openDirectiveRecoveryDebt(requestId: string, reason: string): ObligationRecord {
+    const row = this.getDirective(requestId);
+    if (row === null || isDirectiveTerminal(row.state)) throw new DirectiveCheckpointError('only live directive requests owe recovery judgment');
+    return this.transaction(() => this.observeRecoveryDebt('directive', requestId, row.jobId, row.baselineSeq, {
+      logicalStep: 'operation', incidentKey: `directive-recovery:${requestId}`,
+      category: { kind: 'known', category: 'restart-recovery' }, observedAtSeq: row.baselineSeq,
+      description: `Request ${requestId}; hash ${row.payloadHash}; revision ${String(row.workRevision)}; epoch ${String(row.authorityEpoch)}; ${reason}`,
+      nextAction: { kind: 'gru-decision', decision: this.directiveCleanupBlockers(row.jobId).length > 0
+        ? 'inspect the exact original producer start and native/controller evidence; obtain original producer cessation attestation before guarded retirement/successor; if inaccessible, report the missing restart capability — never replay or infer cessation'
+        : 'inspect exact native request evidence; choose a guarded fresh successor or name the reserved owner decision' } }));
+  }
+
+  settleDirectiveRecoveryDebt(requestId: string, eventSeq: number, eventKind: string): void {
+    const row = this.getDirective(requestId);
+    if (row === null) throw new RecordNotFound(`directive request "${requestId}" not found`);
+    const event = this.getEvent(eventSeq);
+    const payload = event?.payload as { request_id?: unknown; decision?: { kind?: unknown; obligationId?: unknown } } | undefined;
+    const successor = row.recoveryDecision?.successorId === null || row.recoveryDecision === null ? null : this.getDirective(row.recoveryDecision.successorId);
+    const admission = eventKind === 'silas.directive-sent' && successor !== null && successor.nativeBinding !== null && successor.admissionSeq === eventSeq && payload?.request_id === successor.requestId;
+    const delivery = eventKind === 'job.delivered' && (payload?.request_id === row.requestId && row.deliverySeq === eventSeq || successor !== null && payload?.request_id === successor.requestId && successor.deliverySeq === eventSeq);
+    const owner = eventKind === 'silas.directive-recovery-decided' && row.recoveryDecision?.eventSeq === eventSeq && row.recoveryDecision.successorId === null && payload?.decision?.kind === 'owner-decision';
+    if (event?.jobId !== row.jobId || event.kind !== eventKind || (!admission && !delivery && !owner)) throw new DirectiveCheckpointError('recovery debt requires actual correlated successor admission, completion or a consumed reserved-owner decision');
+    const debt = this.recoveryObligation(row.jobId, 'directive', requestId);
+    if (debt !== null && (debt.state === 'open' || debt.state === 'waiting')) {
+      this.settleObligation({ obligationId: debt.id, settlement: { kind: 'executed-action', action: 'directive recovery handoff/completion or reserved owner decision', evidenceEventSeq: eventSeq, evidenceEventKind: eventKind } });
+    }
+    const card = this.findNotificationByKind(`silas.directive-unreconciled.${requestId}`, 'active');
+    if (card?.routing === 'action-required') this.resolveNotificationById(card.id, 'directive-recovery-evidence');
+  }
+
+  openRebriefRecoveryDebt(markerId: string, reason: string): ObligationRecord {
+    const marker = this.listPendingRebriefs().find((row) => row.id === markerId);
+    if (marker === undefined) throw new RecordNotFound(`rebrief marker "${markerId}" not found`);
+    return this.transaction(() => this.observeRecoveryDebt('rebrief', markerId, marker.jobId, marker.baselineSeq, {
+      logicalStep: 'operation', incidentKey: `rebrief-recovery:${markerId}`,
+      category: { kind: 'known', category: 'restart-recovery' }, observedAtSeq: marker.baselineSeq,
+      description: `Rebrief ${markerId}; hash ${marker.payloadHash}; baseline ${marker.baselineSeq}; ${reason}`,
+      nextAction: { kind: 'gru-decision', decision: 'guarded retirement of this exact legacy marker generation plus fresh named successor, or concrete reserved owner decision' } }));
+  }
+
+  /** Discovery after parking must not create an executable routine debt;
+   * repeated observation also never resumes an already-suspended row. */
+  private preserveParkedRecoveryDebt(debt: ObligationRecord): ObligationRecord {
+    return this.getJob(debt.jobId)?.status === 'parked' && (debt.state === 'open' || debt.state === 'waiting')
+      ? this.suspendObligation(debt.id, 'job parked — recovery judgment remains owner-suspended') : debt;
+  }
+
+  isRecoverySuccessor(requestId: string): boolean {
+    return this.db.prepare("SELECT 1 FROM pending_directives WHERE json_extract(recovery_decision, '$.successorId') = ? UNION ALL SELECT 1 FROM rebrief_recovery_decisions WHERE successor_id = ? LIMIT 1").get(requestId, requestId) !== undefined;
+  }
+
+  getRebriefRecoveryDecision(markerId: string, generation?: number): { readonly fingerprint: string; readonly successorId: string | null; readonly eventSeq: number } | null {
+    if (generation !== undefined) return this.recoveryDecisionHistory('rebrief', markerId).find((decision) => decision.generation === generation) ?? null;
+    const row = this.db.prepare('SELECT * FROM rebrief_recovery_decisions WHERE marker_id = ?').get(markerId) as Row | undefined;
+    return row === undefined ? null : { fingerprint: str(row.fingerprint), successorId: nstr(row.successor_id), eventSeq: Number(row.event_seq) };
+  }
+
+  rebriefProgressBlockers(markerId: string, laneId: string): readonly string[] {
+    const marker = this.listPendingRebriefs().find((row) => row.id === markerId);
+    if (marker === undefined) throw new RecordNotFound(`rebrief marker "${markerId}" not found`);
+    const blockers = this.directiveRetirementBlockers({ jobId: marker.jobId, requestId: markerId }, laneId)
+      .filter((blocker) => blocker !== 'unresolved re-brief request(s) own the lane');
+    const peers = this.listPendingRebriefs({ jobId: marker.jobId }).filter((row) => row.payloadHash === marker.payloadHash && row.baselineSeq === marker.baselineSeq && row.phaseId === marker.phaseId);
+    if (marker.agentId === null || marker.sessionFile === null || marker.workRevision === null || peers.some((row) => row.agentId !== marker.agentId || row.sessionFile !== marker.sessionFile)) return [...blockers, 'original historical native session ownership is unbound/UNKNOWN'];
+    try {
+      const header = readDirectiveSessionHeader(marker.sessionFile);
+      const owners = inspectDirectiveProducers(marker.sessionFile);
+      const epoch = Number((this.db.prepare(`SELECT COALESCE(MAX(seq), 0) AS epoch FROM events WHERE job_id = ? AND seq <= ? AND (${DIRECTIVE_CONTROL_SQL})`).get(marker.jobId, marker.baselineSeq) as Row).epoch);
+      const original = owners.filter(({ producer }) => peers.some((row) => row.id === producer.identity.requestId) && producer.identity.jobId === marker.jobId &&
+        producer.identity.payloadHash === marker.payloadHash && producer.identity.workRevision === marker.workRevision && producer.identity.authorityEpoch === epoch &&
+        producer.agentId === marker.agentId && producer.sessionFile === marker.sessionFile && producer.sessionId === header.id);
+      for (const { producer } of original) {
+        const association = readDirectiveBinding(marker.sessionFile, producer.identity.requestId);
+        if (association === null || !isDeepStrictEqual(association.identity, producer.identity) || association.agentId !== marker.agentId || association.sessionId !== header.id || association.sessionFile !== marker.sessionFile) throw new DirectiveCheckpointError('original historical accepted identity/association is unavailable or changed');
+        inspectDirectiveAdmission(marker.sessionFile, producer.identity);
+        const checkpoint = inspectDirectiveCheckpoint(marker.sessionFile, producer.identity);
+        if (checkpoint.state === 'unknown' || checkpoint.state === 'terminal' && !checkpoint.ok) blockers.push('original historical native effects/checkpoint remain UNKNOWN');
+      }
+      if (header.type !== 'session' || original.length === 0 || owners.some(({ evidence }) => evidence !== 'ceased')) blockers.push('original historical native physical cessation remains UNKNOWN');
+      const last = owners.at(-1); if (last !== undefined) { const lock = directiveProducerLockBlocker(last.producer); if (lock !== null) blockers.push(lock); }
+    } catch (error) { blockers.push(`original historical native ownership unreadable: ${String(error)}`); }
+    return blockers;
+  }
+
+  /** Internal read-only control preflight for stopping an obsolete review.
+   * This is never cessation, admission or execution authority. Exact consumed
+   * generations skip clearance; the original transactional decision still
+   * revalidates every producer/permission predicate after the awaited stop. */
+  validateRecoverySuccessorBeforeWriterClearance(input: (
+    ({ readonly subjectKind: 'directive' } & Parameters<LedgerApi['consumeDirectiveRecoveryDecision']>[0]) |
+    ({ readonly subjectKind: 'rebrief' } & Parameters<LedgerApi['consumeRebriefRecoveryDecision']>[0])
+  ) & { readonly decision: { readonly kind: 'successor'; readonly requestId: string; readonly directive: string } }): string | null {
+    if (input.subjectKind === 'directive') {
+      const row = this.getDirective(input.requestId);
+      if (row === null) throw new RecordNotFound(`directive request "${input.requestId}" not found`);
+      if (this.recoveryDecisionHistory('directive', row.requestId).some((entry) => entry.generation === input.generation)) return null;
+      const debt = this.recoveryObligation(row.jobId, 'directive', row.requestId);
+      if (debt?.state === 'suspended' || debt?.generation !== input.generation || row.payloadHash !== input.expectedPayloadHash || this.directiveRecoveryEpoch(row.jobId) !== input.expectedEpoch ||
+          input.expectedHead !== input.lane.resolvedHead || !input.reason.trim()) throw new DirectiveCheckpointError('recovery generation/hash/head/epoch decision is stale or incomplete');
+      const job = this.getJob(row.jobId);
+      if (job === null || isJobTerminal(job.status) || isDirectiveTerminal(row.state)) throw new DirectiveCheckpointError('terminal work cannot be revived by recovery');
+      const owner = this.recoveryOwnerBasis('directive', row.requestId);
+      if (owner.changed && !owner.confirmed) throw new DirectiveCheckpointError('governing owner stop has no genuine confirmed resolution — fresh work remains forbidden');
+      this.assertRecoveryJobPermission(row.jobId);
+      this.assertFreshRecoveryContract(row.jobId, input.expectedWorkRevision, input.expectedContractSha256);
+      if (row.authorityEpoch !== null && row.authorityEpoch !== input.expectedEpoch) {
+        const changes = this.db.prepare(`SELECT kind FROM events WHERE job_id = ? AND seq > ? AND seq <= ? AND (${DIRECTIVE_CONTROL_SQL})`).all(row.jobId, row.authorityEpoch, input.expectedEpoch) as Row[];
+        if (!owner.confirmed && (changes.length === 0 || changes.some((event) => event.kind !== 'job.amendment-accepted'))) throw new DirectiveCheckpointError('non-amendment authority change cannot revive the old request');
+      }
+      if (input.decision.requestId === row.requestId || !input.decision.requestId.trim() || !input.decision.directive.trim() || this.getDirective(input.decision.requestId) !== null) throw new DirectiveCheckpointError('successor must name a fresh unused request and nonempty directive');
+      this.assertNoCompletedNativeRetirement(row);
+      return row.jobId;
+    }
+    if (this.getRebriefRecoveryDecision(input.markerId, input.generation) !== null) return null;
+    if (!/^[a-f0-9]{64}$/.test(input.expectedReceiptEvidenceSha256)) throw new DirectiveCheckpointError('legacy recovery requires expected_receipt_evidence_sha256 from authenticated readback');
+    const marker = this.listPendingRebriefs().find((entry) => entry.id === input.markerId);
+    if (marker === undefined) throw new RecordNotFound(`rebrief marker "${input.markerId}" not found`);
+    const group = this.listPendingRebriefs({ jobId: marker.jobId });
+    if (group.length !== 2 || !group.some((entry) => entry.kind === 'silas.rebrief') || !group.some((entry) => entry.kind === 'job.delivered') ||
+        !group.every((entry) => entry.payloadHash === marker.payloadHash && entry.baselineSeq === marker.baselineSeq && entry.phaseId === marker.phaseId)) throw new DirectiveCheckpointError('legacy rebrief marker generation is incoherent — explicit owner evidence repair required');
+    if (this.rebriefReceiptEvidence(marker.id).sha256 !== input.expectedReceiptEvidenceSha256) throw new DirectiveCheckpointError('legacy receipt evidence changed — read the exact generation again before judging');
+    const debt = this.recoveryObligation(marker.jobId, 'rebrief', marker.id);
+    const job = this.getJob(marker.jobId);
+    if (debt?.state === 'suspended' || debt?.generation !== input.generation || marker.payloadHash !== input.expectedPayloadHash || this.directiveRecoveryEpoch(marker.jobId) !== input.expectedEpoch ||
+        input.expectedHead !== input.lane.resolvedHead || !input.reason.trim() || job === null || isJobTerminal(job.status)) throw new DirectiveCheckpointError('legacy rebrief decision is stale, terminal or incomplete');
+    const owner = this.recoveryOwnerBasis('rebrief', marker.id);
+    if (owner.changed && !owner.confirmed) throw new DirectiveCheckpointError('governing owner stop has no genuine confirmed resolution — fresh work remains forbidden');
+    this.assertRecoveryJobPermission(marker.jobId);
+    this.assertFreshRecoveryContract(marker.jobId, input.expectedWorkRevision, input.expectedContractSha256);
+    if (!input.decision.requestId.trim() || !input.decision.directive.trim() || this.getDirective(input.decision.requestId) !== null) throw new DirectiveCheckpointError('legacy rebrief successor must name a fresh unused request and nonempty directive');
+    const completed = group.find((entry) => entry.kind === 'silas.rebrief');
+    if (completed !== undefined && this.pendingRebriefReceipt(completed) !== null) throw new DirectiveCheckpointError('legacy rebrief has guarded completion evidence — settlement owns it');
+    return marker.jobId;
+  }
+
+  consumeRebriefRecoveryDecision(input: {
+    readonly markerId: string; readonly generation: number; readonly expectedPayloadHash: string; readonly expectedHead: string;
+    readonly expectedReceiptEvidenceSha256: string;
+    readonly expectedEpoch: number; readonly expectedWorkRevision?: number; readonly expectedContractSha256?: string; readonly lane: { readonly id: string; readonly resolvedHead: string }; readonly reason: string;
+    readonly decision: { readonly kind: 'successor'; readonly requestId: string; readonly directive: string } |
+      { readonly kind: 'owner-decision'; readonly obligationId: string } |
+      { readonly kind: 'reconcile-completed'; readonly inspectionRequestId: string };
+  }): { readonly successor: DirectiveRequestRecord | null; readonly idempotent: boolean } {
+    if (!/^[a-f0-9]{64}$/.test(input.expectedReceiptEvidenceSha256)) throw new DirectiveCheckpointError('legacy recovery requires expected_receipt_evidence_sha256 from authenticated readback');
+    const fingerprint = createHash('sha256').update(canonicalRebriefEvidence([1, input.markerId, input.generation, input.expectedPayloadHash, input.expectedHead, input.expectedEpoch, input.expectedWorkRevision, input.expectedContractSha256, input.expectedReceiptEvidenceSha256, input.reason, input.decision])).digest('hex');
+    return this.transaction(() => {
+      const prior = this.getRebriefRecoveryDecision(input.markerId, input.generation);
+      if (prior !== null) {
+        if (prior.fingerprint !== fingerprint) throw new DirectiveCheckpointError('legacy rebrief recovery decision conflicts');
+        return { successor: prior.successorId === null ? null : this.getDirective(prior.successorId), idempotent: true };
+      }
+      const marker = this.listPendingRebriefs().find((row) => row.id === input.markerId);
+      if (marker === undefined) throw new RecordNotFound(`rebrief marker "${input.markerId}" not found`);
+      const group = this.listPendingRebriefs({ jobId: marker.jobId });
+      if (input.decision.kind !== 'owner-decision' && (group.length !== 2 || !group.some((row) => row.kind === 'silas.rebrief') || !group.some((row) => row.kind === 'job.delivered') ||
+          !group.every((row) => row.payloadHash === marker.payloadHash && row.baselineSeq === marker.baselineSeq && row.phaseId === marker.phaseId))) throw new DirectiveCheckpointError('legacy rebrief marker generation is incoherent — explicit owner evidence repair required');
+      const receiptEvidence = this.rebriefReceiptEvidence(input.markerId);
+      if (receiptEvidence.sha256 !== input.expectedReceiptEvidenceSha256) throw new DirectiveCheckpointError('legacy receipt evidence changed — read the exact generation again before judging');
+      const currentDebt = this.recoveryObligation(marker.jobId, 'rebrief', input.markerId);
+      const debt = currentDebt !== null && (currentDebt.state === 'open' || currentDebt.state === 'waiting' || input.decision.kind !== 'successor' && currentDebt.state === 'suspended') ? currentDebt : null;
+      const job = this.getJob(marker.jobId);
+      if (!debt || debt.generation !== input.generation || marker.payloadHash !== input.expectedPayloadHash ||
+          input.expectedEpoch !== this.directiveRecoveryEpoch(marker.jobId) || input.expectedHead !== input.lane.resolvedHead || !input.reason.trim() ||
+          !job || isJobTerminal(job.status)) throw new DirectiveCheckpointError('legacy rebrief decision is stale, terminal or incomplete');
+      let successor: DirectiveRequestRecord | null = null;
+      let ownerTransfer: RecoveryOwnerTransfer | null = null;
+      let currentInspectionDebt: ObligationRecord | null = null;
+      const ownerBasis = this.recoveryOwnerBasis('rebrief', marker.id);
+      if (input.decision.kind === 'successor') {
+        if (ownerBasis.changed && !ownerBasis.confirmed) throw new DirectiveCheckpointError('governing owner stop has no genuine confirmed resolution — fresh work remains forbidden');
+        this.assertRecoveryJobPermission(marker.jobId);
+        this.assertFreshRecoveryContract(marker.jobId, input.expectedWorkRevision, input.expectedContractSha256);
+        const blockers = this.rebriefProgressBlockers(marker.id, input.lane.id);
+        if (blockers.length > 0) throw new DirectiveCheckpointError(`legacy rebrief producer cessation unproven: ${blockers.join('; ')}`);
+        if (this.getDirective(input.decision.requestId) !== null) throw new DirectiveCheckpointError('legacy rebrief successor must name a fresh unused request');
+        // Completion-first: exact rebrief completion can reconcile its lost
+        // delivery. A lone delivery remains partial history, not proof that
+        // the original turn completed or should be repeated.
+        const completed = group.find((row) => row.kind === 'silas.rebrief');
+        if (completed !== undefined && this.pendingRebriefReceipt(completed) !== null) throw new DirectiveCheckpointError('legacy rebrief has guarded completion evidence — settlement owns it');
+        this.db.prepare('DELETE FROM pending_rebriefs WHERE job_id = ? AND payload_hash = ? AND baseline_seq = ?').run(marker.jobId, marker.payloadHash, marker.baselineSeq);
+        if (marker.phaseId !== null) this.closePhaseHandoff({ phaseId: marker.phaseId, reason: `legacy rebrief retired without completion: ${input.reason}` });
+        this.appendEvent({ kind: 'silas.rebrief-retired', jobId: marker.jobId, payload: { markers: group, reason: input.reason, by: 'gru-recovery', expected_head: input.expectedHead, lane_id: input.lane.id,
+          receipt_evidence: receiptEvidence, receipt_evidence_sha256: receiptEvidence.sha256,
+          guarded_event_landed: group.map((row) => ({ marker_id: row.id, kind: row.kind,
+            landed: receiptEvidence.receipts.some((receipt) => receipt.kind === row.kind && receipt.classification === 'accepted') })) } });
+        this.appendEvent({ kind: 'silas.rebrief-recovery-handoff', jobId: marker.jobId, payload: { marker_id: marker.id, request_id: input.decision.requestId } });
+        successor = this.beginDirectiveIntent({ jobId: marker.jobId, requestId: input.decision.requestId, directive: input.decision.directive, holder: 'gru-recovery' }).record;
+      } else if (input.decision.kind === 'reconcile-completed') {
+        if (ownerBasis.changed && !ownerBasis.confirmed) throw new DirectiveCheckpointError('governing owner stop has no genuine confirmed resolution — current inspection remains forbidden');
+        this.assertFreshRecoveryContract(marker.jobId, input.expectedWorkRevision, input.expectedContractSha256);
+        const blockers = this.rebriefProgressBlockers(marker.id, input.lane.id);
+        if (blockers.length > 0) throw new DirectiveCheckpointError(`completed control closure producer cessation unproven: ${blockers.join('; ')}`);
+        const completion = group.find((row) => row.kind === 'silas.rebrief');
+        const completedReceipt = completion === undefined ? null : this.pendingRebriefReceipt(completion);
+        if (completedReceipt === null) throw new DirectiveCheckpointError('non-executing completed reconciliation requires exact original completion proof');
+        if (this.originalRebriefDeliveryFacts(completion!.id) !== null || group.every((row) => this.pendingRebriefReceipt(row) !== null)) {
+          throw new DirectiveCheckpointError('legacy rebrief has reconcilable original delivery facts — settlement owns it');
+        }
+        const reservedInspection = this.db.prepare(`SELECT 1 FROM events WHERE kind = 'silas.rebrief-control-closed'
+          AND json_extract(payload, '$.inspection_request_id') = ?`).get(input.decision.inspectionRequestId);
+        if (!input.decision.inspectionRequestId.trim() || this.getDirective(input.decision.inspectionRequestId) !== null || reservedInspection !== undefined) {
+          throw new DirectiveCheckpointError('current artifact inspection requires a distinct unused request identity');
+        }
+        const instruction = `Inspect CURRENT source and artifacts for job ${marker.jobId} after administrative closure of completed historical rebrief ${marker.id}. ` +
+          `Never replay the original prompt, repeat its effects or fabricate its missing delivery/HEAD/revision. Establish new current evidence and request the applicable verification/review gates under the current approved contract; this does not prove historical delivery or READY.`;
+        const closure = this.appendEvent({ kind: 'silas.rebrief-control-closed', jobId: marker.jobId,
+          payload: { version: 1, marker_id: marker.id, markers: group, completion_event_seq: completedReceipt.seq,
+            receipt_evidence: receiptEvidence, receipt_evidence_sha256: receiptEvidence.sha256, by: 'gru', reason: input.reason,
+            inspection_request_id: input.decision.inspectionRequestId, inspection_directive: instruction,
+            current_authority: this.directiveCurrentAuthority(marker.jobId), expected_head: input.expectedHead, lane_id: input.lane.id,
+            note: 'non-executing old control closure only; absent historical facts remain absent' } });
+        currentInspectionDebt = this.recordBlockedObservation(marker.jobId, { logicalStep: 'verification',
+          incidentKey: `rebrief-current-inspection:${marker.id}`, category: { kind: 'known', category: 'restart-recovery' },
+          observedAtSeq: closure.seq, nextAction: { kind: 'gru-decision', decision:
+            `After current permission and every producer fence pass, use POST /api/silas/directive with job_id ${marker.jobId}, request_id ${input.decision.inspectionRequestId}, and exact directive: ${instruction} Then use existing verification/review APIs. These produce CURRENT evidence only.` } });
+        try { this.assertRecoveryJobPermission(marker.jobId); } catch (error) {
+          if (!(error instanceof DirectiveCheckpointError)) throw error;
+          currentInspectionDebt = this.suspendObligation(currentInspectionDebt.id, `current inspection remains stopped: ${error.message}`);
+        }
+        this.db.prepare('DELETE FROM pending_rebriefs WHERE job_id = ? AND payload_hash = ? AND baseline_seq = ?').run(marker.jobId, marker.payloadHash, marker.baselineSeq);
+        if (marker.phaseId !== null) this.closePhaseHandoff({ phaseId: marker.phaseId, reason: 'administrative completed control closure; no historical delivery facts fabricated' });
+      } else {
+        ownerTransfer = this.makeOwnerRecoveryTransfer(this.recoverySubject('rebrief', marker.id), debt, input.decision.obligationId);
+      }
+      const event = this.appendEvent({ kind: 'silas.rebrief-recovery-decided', jobId: marker.jobId,
+        payload: { marker_id: marker.id, markers: group, generation: input.generation, expected_head: input.expectedHead, epoch: input.expectedEpoch, expected_work_revision: input.expectedWorkRevision, expected_contract_sha256: input.expectedContractSha256,
+          fingerprint, receipt_evidence: receiptEvidence, expected_receipt_evidence_sha256: input.expectedReceiptEvidenceSha256,
+          owner_transfer: ownerTransfer, owner_resolution_event_seq: ownerBasis.resolutionEventSeq,
+          current_inspection_obligation_id: currentInspectionDebt?.id ?? null, decision: input.decision, reason: input.reason } });
+      this.db.prepare(`INSERT INTO rebrief_recovery_decisions (marker_id, job_id, fingerprint, successor_id, event_seq) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (marker_id) DO UPDATE SET fingerprint = excluded.fingerprint, successor_id = excluded.successor_id, event_seq = excluded.event_seq`)
+        .run(marker.id, marker.jobId, fingerprint, successor?.requestId ?? null, event.seq);
+      if (currentInspectionDebt !== null) this.settleObligation({ obligationId: debt.id,
+        settlement: { kind: 'superseded', byObligationId: currentInspectionDebt.id, reason: `exact completed control closed by event ${event.seq}; current inspection ${currentInspectionDebt.id} remains owed` } });
+      if (ownerTransfer !== null || currentInspectionDebt !== null) {
+        if (ownerTransfer !== null) this.closeOwnerTransferredRecoveryDebt(debt, ownerTransfer, event);
+        const card = this.findNotificationByKind(`silas.rebrief-unreconciled.${marker.jobId}`, 'active');
+        if (card?.routing === 'action-required') this.resolveNotificationById(card.id, 'rebrief-recovery-evidence');
+      }
+      return { successor, idempotent: false };
+    });
+  }
+
+  /** Synchronous route evidence and the decision/retirement/fresh acceptance
+   * share one transaction. Refusal rolls back every row, hold and audit. */
+  consumeDirectiveRecoveryDecision(input: {
+    readonly requestId: string; readonly generation: number; readonly expectedPayloadHash: string;
+    readonly expectedHead: string; readonly expectedEpoch: number; readonly expectedWorkRevision?: number; readonly expectedContractSha256?: string; readonly lane: { readonly id: string; readonly resolvedHead: string };
+    readonly reason: string;
+    readonly decision: { readonly kind: 'successor'; readonly requestId: string; readonly directive: string } |
+      { readonly kind: 'owner-decision'; readonly obligationId: string };
+  }): { readonly successor: DirectiveRequestRecord | null; readonly idempotent: boolean } {
+    const fingerprint = createHash('sha256').update(JSON.stringify([input.requestId, input.generation, input.expectedPayloadHash, input.expectedHead, input.expectedEpoch, input.expectedWorkRevision, input.expectedContractSha256, input.reason, input.decision])).digest('hex');
+    return this.transaction(() => {
+      const row = this.getDirective(input.requestId);
+      if (row === null) throw new RecordNotFound(`directive request "${input.requestId}" not found`);
+      const prior = this.recoveryDecisionHistory('directive', row.requestId).find((decision) => decision.generation === input.generation);
+      if (prior !== undefined) {
+        if (prior.fingerprint !== fingerprint) throw new DirectiveCheckpointError('recovery decision conflicts with the consumed decision');
+        return { successor: prior.successorId === null ? null : this.getDirective(prior.successorId), idempotent: true };
+      }
+      const currentDebt = this.recoveryObligation(row.jobId, 'directive', row.requestId);
+      const debt = currentDebt !== null && (currentDebt.state === 'open' || currentDebt.state === 'waiting' || input.decision.kind === 'owner-decision' && currentDebt.state === 'suspended') ? currentDebt : null;
+      if (!debt || debt.generation !== input.generation || row.payloadHash !== input.expectedPayloadHash ||
+          this.directiveRecoveryEpoch(row.jobId) !== input.expectedEpoch || input.expectedHead !== input.lane.resolvedHead || !input.reason.trim()) throw new DirectiveCheckpointError('recovery generation/hash/head/epoch decision is stale or incomplete');
+      const job = this.getJob(row.jobId);
+      if (!job || isJobTerminal(job.status) || isDirectiveTerminal(row.state)) throw new DirectiveCheckpointError('terminal work cannot be revived by recovery');
+      let successor: DirectiveRequestRecord | null = null;
+      let ownerTransfer: RecoveryOwnerTransfer | null = null;
+      const ownerBasis = this.recoveryOwnerBasis('directive', row.requestId);
+      if (input.decision.kind === 'successor') {
+        if (ownerBasis.changed && !ownerBasis.confirmed) throw new DirectiveCheckpointError('governing owner stop has no genuine confirmed resolution — fresh work remains forbidden');
+        this.assertRecoveryJobPermission(row.jobId);
+        this.assertFreshRecoveryContract(row.jobId, input.expectedWorkRevision, input.expectedContractSha256);
+        if (row.authorityEpoch !== null && row.authorityEpoch !== input.expectedEpoch) {
+          const changes = this.db.prepare(`SELECT kind FROM events WHERE job_id = ? AND seq > ? AND seq <= ? AND (${DIRECTIVE_CONTROL_SQL})`).all(row.jobId, row.authorityEpoch, input.expectedEpoch) as Row[];
+          if (!ownerBasis.confirmed && (changes.length === 0 || changes.some((event) => event.kind !== 'job.amendment-accepted'))) throw new DirectiveCheckpointError('non-amendment authority change cannot revive the old request');
+        }
+        if (input.decision.requestId === row.requestId || this.getDirective(input.decision.requestId) !== null) throw new DirectiveCheckpointError('successor must name a fresh unused request id');
+        this.retireInterruptedDirective({ requestId: row.requestId, expectedJobId: row.jobId, expectedState: row.state as LiveDirectiveState,
+          expectedPayloadHash: input.expectedPayloadHash, expectedHead: input.expectedHead, lane: input.lane, reason: input.reason, by: 'gru-recovery' });
+        successor = this.beginDirectiveIntent({ jobId: row.jobId, requestId: input.decision.requestId, directive: input.decision.directive, holder: 'gru-recovery' }).record;
+      } else {
+        ownerTransfer = this.makeOwnerRecoveryTransfer(this.recoverySubject('directive', row.requestId), debt, input.decision.obligationId);
+      }
+      const event = this.appendEvent({ kind: 'silas.directive-recovery-decided', jobId: row.jobId,
+        payload: { request_id: row.requestId, generation: input.generation, payload_hash: row.payloadHash, expected_head: input.expectedHead,
+          authority_epoch: input.expectedEpoch, expected_work_revision: input.expectedWorkRevision, expected_contract_sha256: input.expectedContractSha256,
+          fingerprint, owner_transfer: ownerTransfer, owner_resolution_event_seq: ownerBasis.resolutionEventSeq, decision: input.decision, reason: input.reason } });
+      this.db.prepare('UPDATE pending_directives SET recovery_decision = ? WHERE request_id = ?').run(JSON.stringify({ fingerprint, successorId: successor?.requestId ?? null, eventSeq: event.seq }), row.requestId);
+      if (ownerTransfer !== null) {
+        this.closeOwnerTransferredRecoveryDebt(debt, ownerTransfer, event);
+        const card = this.findNotificationByKind(`silas.directive-unreconciled.${row.requestId}`, 'active');
+        if (card?.routing === 'action-required') this.resolveNotificationById(card.id, 'directive-recovery-owner-transfer');
+      }
+      return { successor, idempotent: false };
+    });
+  }
+
   /** Bind a request to its ACTUAL native admission: the correlated
    * `silas.directive-sent` event must exist, carry this request id, sit
    * on this job and postdate the acceptance watermark. Adapter spawn
@@ -6768,7 +8368,10 @@ export class LedgerApi {
     return this.transaction(() => {
       const row = this.getDirective(input.requestId);
       if (row === null) throw new RecordNotFound(`directive request "${input.requestId}" not found`);
-      if (row.state === 'admitted' && row.admissionSeq === input.eventSeq) return row; // idempotent replay
+      if (row.state === 'admitted' && row.admissionSeq === input.eventSeq && row.admissionMinion === input.minionId) {
+        if (row.requestKind !== null && row.nativeBinding === null) throw new DirectiveCheckpointError('current directive requires exact adapter-owned native admission');
+        return row; // exact replay
+      }
       if (row.state !== 'dispatching') {
         throw new Error(`directive request "${input.requestId}" is ${row.state} — admission evidence cannot bind here`);
       }
@@ -6784,6 +8387,9 @@ export class LedgerApi {
         throw new Error(`admission for "${input.requestId}" cites event ${input.eventSeq} at/before the acceptance watermark ${row.baselineSeq}`);
       }
       const payload = (typeof event.payload === 'object' && event.payload !== null ? event.payload : {}) as Record<string, unknown>;
+      if (row.requestKind !== null && (row.nativeBinding === null || !isDeepStrictEqual(payload['native_binding'], row.nativeBinding) ||
+          row.nativeBinding.agentId !== input.minionId)) throw new DirectiveCheckpointError('current directive requires exact adapter-owned native admission');
+      if (payload['minion_id'] !== input.minionId) throw new Error('directive admission minion identity mismatch');
       if (payload['request_id'] !== input.requestId) {
         throw new Error(`admission for "${input.requestId}" cites an event whose payload is not correlated to this request`);
       }
@@ -6792,6 +8398,141 @@ export class LedgerApi {
         .run(input.eventSeq, input.minionId, nowIso(), input.requestId);
       return this.getDirective(input.requestId) as DirectiveRequestRecord;
     });
+  }
+
+  recordHistoricalNativeDirectiveCompletion(identity: DirectiveTurnIdentity, laneId: string): DirectiveRequestRecord {
+    return this.transaction(() => {
+      const row = this.getDirective(identity.requestId);
+      if (row === null || !isDeepStrictEqual(this.directiveTurnIdentity(row.requestId), identity) || row.nativeTarget === null || row.nativeBinding === null || row.state !== 'admitted') throw new DirectiveCheckpointError('historical completion requires exact original admitted native request');
+      const job = this.getJob(row.jobId);
+      const authority = this.directiveCurrentAuthority(row.jobId);
+      if (job === null || job.status !== 'parked' && authority.workRevision === identity.workRevision && authority.contractSha256 === identity.contractSha256 && authority.authorityEpoch === identity.authorityEpoch) throw new DirectiveCheckpointError('historical-only completion requires positively changed or parked current authority');
+      if (this.recoveryOwnerBasis('directive', row.requestId).owned || this.recoveryDecisionHistory('directive', row.requestId).some((history) => history.ownerTransfer !== null)) throw new DirectiveCheckpointError('historical completion cannot release original transferred owner context');
+      if (this.hasOpenDirectiveRecoveryHold(row.jobId) || this.listObligations({ jobId: row.jobId }).some((debt) => ['open', 'waiting', 'suspended'].includes(debt.state) && debt.nextAction.kind === 'owner-decision') ||
+          this.db.prepare("SELECT 1 FROM notifications n JOIN agents a ON a.id = n.agent_id WHERE a.job_id = ? AND n.routing = 'needs-owner' AND n.acked_at IS NULL AND n.resolved_at IS NULL").get(row.jobId) !== undefined) throw new DirectiveCheckpointError('historical completion retains original owner stop');
+      const held = this.listObligations({ jobId: row.jobId }).some((debt) => debt.incidentKey === `directive-recovery:${row.requestId}` && (debt.state === 'suspended' || debt.claim !== null));
+      if (held) throw new DirectiveCheckpointError('historical completion retains suspended or claimed original recovery context');
+      const ownReservations = new Set([`directive ${row.requestId}`, `directive recovery ${row.requestId}`, `rebrief ${row.requestId}`]);
+      const reservations = this.listJobAdmissions(row.jobId).filter((kind) => !ownReservations.has(kind));
+      const blockers = this.directiveRetirementBlockers(row, laneId).filter((blocker) => !blocker.startsWith('in-flight admission(s):'));
+      if (blockers.length + reservations.length > 0) throw new DirectiveCheckpointError(`historical completion producer fences: ${[...blockers, ...reservations].join('; ')}`);
+      const proof = inspectDirectiveCheckpoint(row.nativeTarget.sessionFile, identity);
+      if (proof.state !== 'terminal' || !proof.ok || !isDeepStrictEqual(proof.binding, row.nativeBinding)) throw new DirectiveCheckpointError('historical completion requires exact original successful native ancestry');
+      const completion = readDirectiveCompletion(row.nativeTarget.sessionFile, identity, proof.checkpointId);
+      const physical = inspectDirectiveProducers(row.nativeTarget.sessionFile);
+      const owners = physical.filter(({ producer }) => isDeepStrictEqual(producer.identity, identity));
+      if (owners.length === 0 || owners.some(({ producer }) => producer.agentId !== proof.binding.agentId || producer.sessionId !== proof.binding.sessionId) ||
+          completion !== null && !owners.some(({ producer }) => isDeepStrictEqual(producer, completion.producer)) ||
+          physical.some(({ evidence }) => evidence === 'unknown') || directiveSessionLockBlocker(row.nativeTarget.sessionFile) !== null) throw new DirectiveCheckpointError('historical completion original physical receipt is unbound or UNKNOWN');
+      for (const { producer } of physical) {
+        const association = readDirectiveBinding(row.nativeTarget.sessionFile, producer.identity.requestId);
+        const checkpoint = inspectDirectiveCheckpoint(row.nativeTarget.sessionFile, producer.identity);
+        if (association === null || !isDeepStrictEqual(association.identity, producer.identity) || association.agentId !== producer.agentId || association.sessionId !== producer.sessionId || association.sessionFile !== producer.sessionFile || producer.agentId !== proof.binding.agentId || producer.sessionId !== proof.binding.sessionId || checkpoint.state !== 'terminal' || !checkpoint.ok) throw new DirectiveCheckpointError('historical completion older or foreign native incarnation remains unbound/UNKNOWN');
+      }
+      const phase = this.findPhaseHandoffByRequest({ jobId: row.jobId, requestId: row.requestId });
+      if (row.requestKind === 'rebrief' && this.latestJobEventByRequestId(row.jobId, 'silas.rebrief', row.requestId) === null) this.appendEvent({ kind: 'silas.rebrief', jobId: row.jobId, payload: {
+        request_id: row.requestId, minion_id: proof.binding.agentId, note: (JSON.parse(row.payload) as { directive: string }).directive,
+        ...(phase === null ? {} : { phase_id: phase.phaseId }), ...(row.sourceContext?.ruleId === undefined ? {} : { rule_id: row.sourceContext.ruleId }),
+        ...(row.sourceContext?.sourceRoundId === undefined ? {} : { source_round_id: row.sourceContext.sourceRoundId }),
+        ...(row.sourceContext?.source === undefined ? {} : { source: row.sourceContext.source }),
+      } });
+      const delivery = this.appendEvent({ kind: 'job.delivered', jobId: row.jobId, agentId: proof.binding.agentId,
+        payload: { request_id: row.requestId, agentId: proof.binding.agentId, source: row.requestKind === 'rebrief' ? 'silas-rebrief' : 'silas-directive', sha: completion?.head ?? null,
+          work_revision: identity.workRevision, candidate_delivery_proven: false, historical_bookkeeping_only: true, ...(phase === null ? {} : { phase_id: phase.phaseId }),
+          native_completion: { identity, checkpoint_id: proof.checkpointId, binding: proof.binding, receipt: completion, physical_cessation: physical } } });
+      // The shared settlement boundary retains exactly one protected duty,
+      // including historical-only completions. Do not rotate its generation
+      // by observing the same delivery twice with different reason text.
+      return this.recordDirectiveDelivery({ requestId: row.requestId, eventSeq: delivery.seq });
+    });
+  }
+
+  private retainOriginalNativeGateDebt(row: DirectiveRequestRecord, delivery: EventRecord | BusEvent, reason: string): void {
+    const identity = this.directiveTurnIdentity(row.requestId);
+    const authority = this.directiveCurrentAuthority(row.jobId);
+    const sha = (delivery.payload as { sha: string | null }).sha;
+    const duty = this.preserveParkedRecoveryDebt(this.recordBlockedObservation(row.jobId, { logicalStep: 'verification', incidentKey: `directive-current-gates:${row.requestId}`,
+      observedAtSeq: delivery.seq, category: { kind: 'known', category: 'restart-recovery' }, nextAction: { kind: 'gru-decision', decision: `Original native request ${row.requestId} completed accepted identity ${JSON.stringify(identity)} at recorded HEAD ${sha ?? 'UNPROVEN/null'}, original delivery ${delivery.seq}. Current candidacy is unproven: ${reason}. Current approved inputs ${JSON.stringify(authority)} still require a genuine current candidate and existing POST /api/verify declared full gate plus POST /api/dispatch/review actual complete whole-change review. Historical completion is neither current delivery authority nor PASS/READY.` } }));
+    this.appendEvent({ kind: 'silas.directive-current-gates-owed', jobId: row.jobId, payload: { root_kind: 'original-native-completion', request_id: row.requestId,
+      identity, delivery_seq: delivery.seq, sha, native_completion: delivery.payload, obligation_id: duty.id, generation: duty.generation, next_action: duty.nextAction } });
+  }
+
+  /** Original completion is already proven separately. Current eligibility
+   * is established here, never by the publisher's positive flag. */
+  private nativeCandidateRefusal(row: DirectiveRequestRecord, payload: Record<string, unknown>): string | null {
+    try {
+      this.assertDirectiveAuthority(this.directiveTurnIdentity(row.requestId));
+      if (payload['historical_bookkeeping_only'] === true) return 'publisher retained historical-only bookkeeping';
+      const binding = row.nativeBinding!;
+      const header = readDirectiveSessionHeader(binding.sessionFile);
+      const lanes = this.listWorktrees({ jobId: row.jobId }).filter((lane) => lane.kind === 'job' && lane.status !== 'swept');
+      if (lanes.length !== 1 || header.type !== 'session' || header.id !== binding.sessionId || header.cwd !== lanes[0]!.path) return 'original native session/cwd does not bind the unique current original lane';
+      const lane = lanes[0]!;
+      const own = new Set([`directive ${row.requestId}`, `directive recovery ${row.requestId}`, `rebrief ${row.requestId}`]);
+      const blockers = this.directiveRetirementBlockers(row, lane.id).filter((blocker) => !blocker.startsWith('in-flight admission(s):'));
+      const reservations = this.listJobAdmissions(row.jobId).filter((kind) => !own.has(kind));
+      if (blockers.length + reservations.length > 0) return `current producer fences: ${[...blockers, ...reservations].join('; ')}`;
+      const git = readGitState(lane.path, { includeUntracked: true });
+      if (git.sha === null || git.sha !== payload['sha'] || git.trackedDirty) return 'current original lane HEAD is different, dirty or unproven';
+      const branch = execFileSync('git', ['-C', lane.path, 'symbolic-ref', '--short', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }).trim();
+      if (lane.branch === null || branch !== lane.branch) return 'current branch differs from the original registered lane';
+      return null;
+    } catch (error) { return `current original-lane/authority inspection refused: ${String(error)}`; }
+  }
+
+  /** Custom event writers cannot forge a positive settlement decision or
+   * retrospectively upgrade a completed original request. This guard also
+   * protects the internal append path, not just one public facade. */
+  private assertNativeSettlementCandidate(jobId: string | null, facts: Record<string, unknown>): void {
+    const row = typeof facts['request_id'] === 'string' ? this.getDirective(facts['request_id']) : null;
+    const delivery = Number.isSafeInteger(facts['delivery_seq']) ? this.getEvent(Number(facts['delivery_seq'])) : null;
+    if (row === null || row.state !== 'admitted' || row.requestKind === null || row.jobId !== jobId ||
+        delivery?.kind !== 'job.delivered' || delivery.jobId !== jobId || typeof facts['candidate_delivery_proven'] !== 'boolean') {
+      throw new DirectiveCheckpointError('native settlement candidacy requires its exact original admitted delivery; completed history cannot be upgraded');
+    }
+    const payload = delivery.payload as Record<string, unknown>;
+    if (payload['request_id'] !== row.requestId || payload['work_revision'] !== row.workRevision || payload['agentId'] !== row.nativeBinding?.agentId ||
+        row.admissionSeq === null || delivery.seq <= row.admissionSeq) throw new DirectiveCheckpointError('native settlement candidate receipt has foreign original bindings');
+    this.assertNativeDirectiveDelivery(row, payload);
+    if (facts['candidate_delivery_proven'] && (payload['candidate_delivery_proven'] !== true || this.nativeCandidateRefusal(row, payload) !== null)) {
+      throw new DirectiveCheckpointError('native settlement candidacy lacks independently proven current original-lane/HEAD/authority');
+    }
+  }
+
+  private assertNativeDirectiveDelivery(row: DirectiveRequestRecord, payload: Record<string, unknown>): void {
+    const binding = row.nativeBinding;
+    if (binding === null || row.nativeTarget?.agentId !== binding.agentId || row.nativeTarget.sessionFile !== binding.sessionFile) {
+      throw new DirectiveCheckpointError('current directive delivery lacks its exact original native target');
+    }
+    const owner = this.recoveryOwnerBasis('directive', row.requestId);
+    if (owner.owned || owner.changed && !owner.confirmed) throw new DirectiveCheckpointError('native completion cannot release original transferred owner context without genuine governing owner resolution');
+    const identity = this.directiveTurnIdentity(row.requestId);
+    const proof = inspectDirectiveCheckpoint(binding.sessionFile, identity);
+    if (proof.state !== 'terminal' || !proof.ok || !isDeepStrictEqual(proof.binding, binding)) {
+      throw new DirectiveCheckpointError('current directive delivery requires its exact successful native terminal checkpoint');
+    }
+    const physical = inspectDirectiveProducers(binding.sessionFile);
+    const owners = physical.filter(({ producer }) => isDeepStrictEqual(producer.identity, identity));
+    if (owners.length === 0 || owners.some(({ producer }) => producer.agentId !== binding.agentId || producer.sessionId !== binding.sessionId) ||
+        physical.some(({ evidence }) => evidence === 'unknown') || directiveSessionLockBlocker(binding.sessionFile) !== null) {
+      throw new DirectiveCheckpointError('current directive delivery retains UNKNOWN native physical ownership');
+    }
+    const completion = readDirectiveCompletion(binding.sessionFile, identity, proof.checkpointId);
+    if (completion !== null && !owners.some(({ producer }) => isDeepStrictEqual(producer, completion.producer))) {
+      throw new DirectiveCheckpointError('current directive completion receipt has unbound native physical ownership');
+    }
+    const native = typeof payload['native_completion'] === 'object' && payload['native_completion'] !== null
+      ? payload['native_completion'] as Record<string, unknown> : null;
+    const recorded = native?.['physical_cessation'];
+    if (payload['sha'] !== (completion?.head ?? null) || typeof payload['candidate_delivery_proven'] !== 'boolean' ||
+        payload['candidate_delivery_proven'] && (completion === null || completion.head === null) ||
+        native === null || !isDeepStrictEqual(native['identity'], identity) || native['checkpoint_id'] !== proof.checkpointId ||
+        !isDeepStrictEqual(native['binding'], binding) || !isDeepStrictEqual(native['receipt'], completion) ||
+        !Array.isArray(recorded) || !recorded.every((record) => typeof record === 'object' && record !== null &&
+          ['ceased', 'host-absent'].includes(String(record.evidence)) && physical.some(({ producer }) => isDeepStrictEqual(producer, record.producer))) ||
+        !owners.every(({ producer }) => recorded.some((record) => isDeepStrictEqual(producer, record.producer)))) {
+      throw new DirectiveCheckpointError('current directive delivery does not bind its exact native completion provenance');
+    }
   }
 
   /** Record the request's terminal receipt: the correlated `job.delivered`
@@ -6806,6 +8547,7 @@ export class LedgerApi {
       if (row.state !== 'admitted') {
         throw new Error(`directive request "${input.requestId}" is ${row.state} — terminal delivery requires admitted state`);
       }
+      if (row.requestKind !== null && row.nativeBinding === null) throw new DirectiveCheckpointError('current directive delivery requires exact native admission');
       const event = this.getEvent(input.eventSeq);
       if (event === null) throw new Error(`delivery for "${input.requestId}" cites event seq ${input.eventSeq} which does not exist`);
       if (event.kind !== 'job.delivered') {
@@ -6821,16 +8563,58 @@ export class LedgerApi {
       if (payload['request_id'] !== input.requestId) {
         throw new Error(`delivery for "${input.requestId}" cites an event whose payload is not correlated to this request`);
       }
+      let candidateProven = false;
+      if (row.requestKind !== null) {
+        if (payload['work_revision'] !== row.workRevision || payload['agentId'] !== row.nativeBinding?.agentId) throw new DirectiveCheckpointError('original delivery revision/minion identity differs from accepted native admission');
+        this.assertNativeDirectiveDelivery(row, payload);
+        if (payload['candidate_delivery_proven'] === true) {
+          const reason = this.nativeCandidateRefusal(row, payload);
+          candidateProven = reason === null;
+          if (reason !== null) this.retainOriginalNativeGateDebt(row, event, reason);
+        } else {
+          this.retainOriginalNativeGateDebt(row, event, payload['historical_bookkeeping_only'] === true
+            ? 'current authority is changed or parked'
+            : 'publisher could not establish a current original-lane candidate');
+        }
+      }
+      // Durable action marker and, for modern requests, the independently
+      // checked candidacy decision. All writes publish only after commit.
+      this.appendEvent({ kind: 'silas.directive-settled', jobId: row.jobId,
+        payload: { request_id: input.requestId, delivery_seq: input.eventSeq,
+          ...(row.requestKind === null ? {} : { candidate_delivery_proven: candidateProven }) } });
       this.db
         .prepare("UPDATE pending_directives SET state = 'settled', delivery_seq = ?, updated_at = ? WHERE request_id = ?")
         .run(input.eventSeq, nowIso(), input.requestId);
-      // Durable action marker: a settlement is machine follow-through and
-      // must be visible to health/action projections (issue #163 review).
-      this.appendEvent({
-        kind: 'silas.directive-settled',
-        jobId: row.jobId,
-        payload: { request_id: input.requestId, delivery_seq: input.eventSeq },
-      });
+      // Qualify report handback only after exact terminal readback is visible
+      // inside this transaction. Completion history alone cannot open current
+      // commissioner disposition; replay/landed-delivery recovery remains
+      // idempotent, and every write still publishes only after commit.
+      this.ensureReportHandback(row.jobId, event.seq);
+      this.settleDirectiveRecoveryDebt(row.requestId, input.eventSeq, 'job.delivered');
+      // A separate current inspection may discharge only its explicitly
+      // named current-action debt, never the missing historical delivery.
+      const inspections = this.db.prepare(`SELECT * FROM events WHERE kind = 'silas.rebrief-control-closed' AND job_id = ?
+        AND json_extract(payload, '$.inspection_request_id') = ? AND seq < ?`).all(row.jobId, row.requestId, row.baselineSeq) as Row[];
+      for (const raw of inspections) {
+        const closure = this.eventFromRow(raw);
+        const facts = closure.payload as { marker_id: string; inspection_directive: string };
+        const accepted = JSON.parse(row.payload) as { directive?: unknown };
+        if (typeof accepted.directive !== 'string' || accepted.directive.trim() === '') throw new DirectiveCheckpointError('current inspection accepted payload lacks its canonical directive');
+        if (accepted.directive !== facts.inspection_directive || row.nativeBinding === null) throw new DirectiveCheckpointError('current inspection request is not the exact separately admitted inspection action');
+        const debt = this.listObligations({ jobId: row.jobId }).find((candidate) => candidate.incidentKey === `rebrief-current-inspection:${facts.marker_id}` &&
+          ['open', 'waiting', 'suspended'].includes(candidate.state));
+        if (debt !== undefined) {
+          const identity = this.directiveTurnIdentity(row.requestId);
+          const duty = this.preserveParkedRecoveryDebt(this.recordBlockedObservation(row.jobId, { logicalStep: 'verification',
+            incidentKey: `rebrief-current-gates:${facts.marker_id}`, category: { kind: 'known', category: 'restart-recovery' }, observedAtSeq: event.seq,
+            nextAction: { kind: 'gru-decision', decision: `CURRENT gate actions remain owed after inspection ${row.requestId}, delivery ${event.seq}, original closure ${closure.seq}; accepted identity ${JSON.stringify(identity)}; recorded inspection HEAD ${typeof payload['sha'] === 'string' ? payload['sha'] : 'UNPROVEN/null'}. Use existing POST /api/verify and POST /api/dispatch/review APIs with exact current approved inputs and real applicable verification/review evidence, or a separately explicit guarded safe action transfer. If these inputs are superseded or HEAD unproven, establish fresh current evidence first. Inspection delivery and historical receipts prove neither gates nor READY.` } }));
+          this.appendEvent({ kind: 'silas.rebrief-current-gates-owed', jobId: row.jobId, payload: { marker_id: facts.marker_id, closure_seq: closure.seq,
+            inspection_request_id: row.requestId, delivery_seq: event.seq, identity, sha: typeof payload['sha'] === 'string' ? payload['sha'] : null, obligation_id: duty.id, generation: duty.generation, next_action: duty.nextAction } });
+          this.settleObligation({ obligationId: debt.id, settlement: { kind: 'superseded', byObligationId: duty.id,
+            reason: `actual separately authorized CURRENT inspection ${row.requestId} completed; applicable current verification/review action explicitly remains owned by ${duty.id}` } });
+        }
+      }
+      if (row.requestKind === 'rebrief') this.appendEvent({ kind: 'silas.rebrief-settled', jobId: row.jobId, payload: { request_id: row.requestId, delivery_seq: input.eventSeq } });
       return this.getDirective(input.requestId) as DirectiveRequestRecord;
     });
   }
@@ -6845,6 +8629,9 @@ export class LedgerApi {
     return this.transaction(() => {
       const row = this.getDirective(input.requestId);
       if (row === null) throw new RecordNotFound(`directive request "${input.requestId}" not found`);
+      if (row.state === 'retired') {
+        throw new Error(`directive request "${input.requestId}" is retired — a late failure cannot rewrite a consumed decision`);
+      }
       if (row.state === 'settled') {
         throw new Error(`directive request "${input.requestId}" already settled — a late failure cannot rewrite it`);
       }
@@ -6857,22 +8644,459 @@ export class LedgerApi {
         jobId: row.jobId,
         payload: { request_id: input.requestId, reason: input.reason },
       });
+      const phase = this.findPhaseHandoffByRequest({ jobId: row.jobId, requestId: row.requestId });
+      if (phase?.state === 'awaiting') this.closePhaseHandoff({ phaseId: phase.phaseId, reason: input.reason });
       return this.getDirective(input.requestId) as DirectiveRequestRecord;
     });
   }
 
   /** Bump a request's attempt counter without changing state (durable
    * reconcile passes are bounded and visible; "unknown" never silently
-   * becomes "retried"). */
+   * becomes "retried"). A retired request is a consumed decision — late
+   * reconciliation cannot rewrite it. */
   recordDirectiveReconcile(input: { requestId: string; note: string }): DirectiveRequestRecord {
     return this.transaction(() => {
       const row = this.getDirective(input.requestId);
       if (row === null) throw new RecordNotFound(`directive request "${input.requestId}" not found`);
-      if (row.state === 'settled' || row.state === 'failed') return row;
+      if (isDirectiveTerminal(row.state)) return row;
       this.db
         .prepare('UPDATE pending_directives SET attempts = attempts + 1, fail_reason = ?, updated_at = ? WHERE request_id = ?')
         .run(`reconcile: ${input.note}`, nowIso(), input.requestId);
       return this.getDirective(input.requestId) as DirectiveRequestRecord;
+    });
+  }
+
+  // ------------------------------------------------------------------
+  // Guarded interrupted-directive recovery (owner approval j-1348)
+  //
+  // `retired` closes ONLY an interrupted request's control ownership, and
+  // only after the service itself re-derives a fresh cessation predicate
+  // from durable ownership marks plus the caller's binding expectations.
+  // The caller contributes expectations (job, state, payload hash, head)
+  // and audit labels — never evidence booleans. The transition runs in ONE
+  // transaction: refusal checks, admission preservation, the state flip,
+  // exactly one `silas.directive-retired` audit event, the durable
+  // continuation hold, and the closure (never completion) of an awaiting
+  // phase handoff all commit or roll back together.
+  // ------------------------------------------------------------------
+
+  /** Live ownership that forbids retiring an interrupted request. Every
+   * read is durable state or the process-local admission registry (the
+   * same boundary every producer must reserve before its first await), so
+   * a synchronous check inside the state transaction is authoritative. */
+  private directiveRetirementBlockers(row: Pick<DirectiveRequestRecord, 'requestId' | 'jobId'>, laneId: string, ownSpawningAgentId?: string, ownProducerStartSeq?: number, ownNativeProducer?: DirectiveProducer): readonly string[] {
+    const blockers: string[] = [...this.directiveCleanupBlockers(row.jobId, ownProducerStartSeq)];
+    const target = this.getDirective(row.requestId)?.nativeTarget;
+    if (target != null && ownNativeProducer === undefined) {
+      try {
+        const identity = this.directiveTurnIdentity(row.requestId);
+        const owners = inspectDirectiveProducers(target.sessionFile);
+        const original = owners.filter(({ producer }) => isDeepStrictEqual(producer.identity, identity));
+        const last = owners.at(-1);
+        const lock = last === undefined ? null : directiveProducerLockBlocker(last.producer);
+        if (lock !== null) blockers.push(lock);
+        if (original.length === 0 || owners.some(({ evidence }) => evidence === 'unknown')) blockers.push('original native physical owner cessation remains UNKNOWN');
+        else if (original.some(({ evidence }) => evidence === 'host-absent')) {
+          const checkpoint = inspectDirectiveCheckpoint(target.sessionFile, identity);
+          if (checkpoint.state === 'unknown' || checkpoint.state === 'terminal' && !checkpoint.ok) blockers.push('original host absent but native effects/checkpoint remain UNKNOWN');
+        }
+      } catch (error) { blockers.push(`original native physical ownership unreadable: ${String(error)}`); }
+    }
+    const openTurns = this.listAgents().filter(
+      (agent) => agent.jobId === row.jobId && ((agent.state === 'spawning' && agent.id !== ownSpawningAgentId) ||
+        // Only progress callers can supply a validated current physical owner.
+        // Retirement, generic logical-ID reuse and every other turn still block.
+        agent.state === 'streaming' && !(agent.id === ownNativeProducer?.agentId && agent.sessionFile === ownNativeProducer.sessionFile)),
+    );
+    if (openTurns.length > 0) {
+      blockers.push(`open worker turn(s): ${openTurns.map((agent) => `${agent.id} (${agent.state})`).join(', ')}`);
+    }
+    const admissions = this.listJobAdmissions(row.jobId);
+    if (admissions.length > 0) blockers.push(`in-flight admission(s): ${admissions.join(', ')}`);
+    const children = this.listChildWorkers({ jobId: row.jobId }).filter((child) => child.resultState === null);
+    if (children.length > 0) {
+      blockers.push(`non-terminal child worker(s): ${children.map((child) => `${child.id} (${child.state})`).join(', ')}`);
+    }
+    if (this.listPendingRebriefs({ jobId: row.jobId }).length > 0) {
+      blockers.push('unresolved re-brief request(s) own the lane');
+    }
+    const otherLive = this.listPendingDirectives({ jobId: row.jobId, states: LIVE_DIRECTIVE_STATES }).filter(
+      (other) => other.requestId !== row.requestId,
+    );
+    if (otherLive.length > 0) {
+      blockers.push(`other live directive request(s): ${otherLive.map((other) => `${other.requestId} (${other.state})`).join(', ')}`);
+    }
+    const waits = this.listOpenProviderWaitsForJob(row.jobId);
+    if (waits.length > 0) {
+      blockers.push(`open provider continuation(s): ${waits.map((wait) => `${wait.id} (${wait.status})`).join(', ')}`);
+    }
+    if (this.hasUnsettledVerificationRun(row.jobId)) blockers.push('unsettled verification run(s) hold the lane');
+    const rounds = this.listRounds(row.jobId).filter((round) => round.status === 'pending' || round.status === 'live');
+    if (rounds.length > 0) {
+      blockers.push(`live review round(s): ${rounds.map((round) => `${round.id} (${round.status})`).join(', ')}`);
+    }
+    const liveProcesses = this.db
+      .prepare(
+        `SELECT DISTINCT p.worktree_id AS worktree_id, p.pid AS pid
+           FROM worktree_processes p
+           JOIN worktrees w ON w.id = p.worktree_id
+          WHERE p.state = 'live' AND (w.job_id = ? OR p.worktree_id = ?)
+          ORDER BY p.worktree_id, p.pid`,
+      )
+      .all(row.jobId, laneId) as Row[];
+    if (liveProcesses.length > 0) {
+      blockers.push(
+        `live lane process(es): ${liveProcesses
+          .map((proc) => `${str(proc.worktree_id)} pid ${Number(proc.pid)}`)
+          .join(', ')}`,
+      );
+    }
+    return blockers;
+  }
+
+  /** Native terminal truth owns completion even before its ledger delivery.
+   * Current candidacy and current permission never erase accepted history. */
+  private assertNoCompletedNativeRetirement(row: DirectiveRequestRecord): void {
+    if (row.nativeBinding === null || row.nativeTarget === null) return;
+    const proof = inspectDirectiveCheckpoint(row.nativeBinding.sessionFile, this.directiveTurnIdentity(row.requestId));
+    if (proof.state === 'terminal' && proof.ok && isDeepStrictEqual(proof.binding, row.nativeBinding)) {
+      throw new DirectiveRetirementError('terminal_receipt_present', `directive request "${row.requestId}" has successful native completion — normal settlement owns it; do not clear writers or retire it to execute a successor`);
+    }
+  }
+
+  /** Guarded control closure. See the block comment above for the contract. */
+  retireInterruptedDirective(input: {
+    requestId: string;
+    expectedJobId: string;
+    expectedState: LiveDirectiveState;
+    expectedPayloadHash: string;
+    expectedHead: string;
+    /** Server-resolved lane evidence; required on the live path and
+     * deliberately ignored on the consumed-replay path (the lane may be
+     * gone by then — the decision is already durable). */
+    lane?: { readonly id: string; readonly resolvedHead: string };
+    reason: string;
+    by: string;
+  }): { readonly record: DirectiveRequestRecord; readonly idempotent: boolean; readonly phaseClosed: string | null } {
+    if (input.reason.trim() === '') throw new Error('directive retirement requires a reason');
+    if (input.by.trim() === '') throw new Error('directive retirement requires a by label');
+    const intent: DirectiveRetirementIntent = {
+      requestId: input.requestId,
+      expectedJobId: input.expectedJobId,
+      expectedState: input.expectedState,
+      expectedPayloadHash: input.expectedPayloadHash,
+      expectedHead: input.expectedHead,
+      reason: input.reason,
+      by: input.by,
+    };
+    const fingerprint = directiveRetirementFingerprint(intent);
+    return this.transaction(() => {
+      const row = this.getDirective(input.requestId);
+      if (row === null) throw new RecordNotFound(`directive request "${input.requestId}" not found`);
+      if (row.state === 'retired') {
+        // One logical operation is idempotent; changed intent is a conflict.
+        if (row.retireFingerprint !== fingerprint) {
+          throw new DirectiveRetirementError(
+            'retire_conflict',
+            `directive request "${input.requestId}" was retired by a different decision — ` +
+              'a retirement is one exact logical operation; the recorded outcome stands',
+          );
+        }
+        // The original call may have closed an awaiting phase handoff;
+        // the replay reports the same closure it produced (never null when
+        // THIS retirement closed it).
+        const phase = this.findPhaseHandoffByRequest({ jobId: row.jobId, requestId: row.requestId });
+        const phaseClosed = phase !== null && phase.state === 'closed' &&
+          phase.closeReason !== null && phase.closeReason.startsWith('directive request retired without completion')
+          ? phase.phaseId
+          : null;
+        return { record: row, idempotent: true, phaseClosed };
+      }
+      if (row.state === 'settled' || row.state === 'failed') {
+        throw new DirectiveRetirementError(
+          'directive_not_live',
+          `directive request "${input.requestId}" is ${row.state} — only a live request can be retired`,
+        );
+      }
+      // Binding expectations: identity, payload, expected class and state.
+      if (row.jobId !== input.expectedJobId) {
+        throw new DirectiveRetirementError(
+          'request_mismatch',
+          `directive request "${input.requestId}" belongs to job ${row.jobId}, not ${input.expectedJobId}`,
+        );
+      }
+      if (row.state !== input.expectedState) {
+        throw new DirectiveRetirementError(
+          'request_mismatch',
+          `directive request "${input.requestId}" is ${row.state}, not the expected ${input.expectedState} — read the row again`,
+        );
+      }
+      if (row.payloadHash !== input.expectedPayloadHash) {
+        throw new DirectiveRetirementError(
+          'request_mismatch',
+          `directive request "${input.requestId}" payload hash does not match the accepted request`,
+        );
+      }
+      if (input.lane === undefined) {
+        throw new Error(`retirement of live directive request "${input.requestId}" requires resolved lane evidence`);
+      }
+      if (input.expectedHead !== input.lane.resolvedHead) {
+        throw new DirectiveRetirementError(
+          'stale_head',
+          `directive request "${input.requestId}" retirement bound head ${input.expectedHead} but the lane now resolves ${input.lane.resolvedHead} — ` +
+            're-verify the writer ceased at the current head',
+        );
+      }
+      const blockers = this.directiveRetirementBlockers(row, input.lane.id);
+      if (blockers.length > 0) {
+        throw new DirectiveRetirementError(
+          'live_work',
+          `job "${row.jobId}" still has live ownership — retirement would conceal or orphan it`,
+          blockers,
+        );
+      }
+      this.assertNoCompletedNativeRetirement(row);
+      // A correlated terminal receipt means normal settlement owns this
+      // request; retirement must never overwrite it.
+      const delivered = this.latestJobEventByRequestId(row.jobId, 'job.delivered', row.requestId);
+      if (delivered !== null) {
+        throw new DirectiveRetirementError(
+          'terminal_receipt_present',
+          `directive request "${input.requestId}" has a correlated job.delivered receipt at seq ${delivered.seq} — ` +
+            'normal settlement (or the reconciler) owns it; do not overwrite a terminal receipt',
+        );
+      }
+      // Preserve prior admission information when present: a correlated
+      // admission event binds FIRST through the existing validated
+      // transition, so the retired row truthfully reads
+      // `admitted-without-terminal` instead of erasing the real turn.
+      let current = row;
+      if (current.state === 'dispatching') {
+        const sent = this.latestJobEventByRequestId(row.jobId, 'silas.directive-sent', row.requestId);
+        if (sent !== null) {
+          const payload = (typeof sent.payload === 'object' && sent.payload !== null ? sent.payload : {}) as Record<string, unknown>;
+          const minionId = typeof payload['minion_id'] === 'string' && payload['minion_id'] !== '' ? payload['minion_id'] : null;
+          if (minionId === null) {
+            throw new DirectiveRetirementError(
+              'admission_evidence_incomplete',
+              `directive request "${input.requestId}" has correlated admission evidence at seq ${sent.seq} without a minion identity — ` +
+                'reconcile the actual turn before closing control',
+            );
+          }
+          try {
+            current = this.recordDirectiveAdmission({ requestId: row.requestId, minionId, eventSeq: sent.seq });
+          } catch (error) {
+            throw new DirectiveRetirementError(
+              'admission_evidence_incomplete',
+              `directive request "${input.requestId}" correlated admission evidence is inconsistent: ${String(error)}`,
+            );
+          }
+        }
+      }
+      if (current.state === 'admitted') {
+        const sent = current.admissionSeq === null ? null : this.getEvent(current.admissionSeq);
+        const payload = (typeof sent?.payload === 'object' && sent.payload !== null ? sent.payload : {}) as Record<string, unknown>;
+        if (sent === null || sent.kind !== 'silas.directive-sent' || sent.jobId !== current.jobId ||
+            sent.seq <= current.baselineSeq || payload['request_id'] !== current.requestId ||
+            current.admissionMinion === null || payload['minion_id'] !== current.admissionMinion ||
+            current.requestKind !== null && (current.nativeBinding === null || !isDeepStrictEqual(payload['native_binding'], current.nativeBinding))) {
+          throw new DirectiveRetirementError('admission_evidence_incomplete',
+            `directive request "${current.requestId}" has inconsistent bound admission identity — reconcile the actual turn first`);
+        }
+      }
+      const admissionClass = directiveAdmissionClass(current);
+      const ts = nowIso();
+      this.db
+        .prepare(
+          `UPDATE pending_directives
+              SET state = 'retired', retired_at = ?, retired_by = ?, retire_reason = ?, retire_fingerprint = ?,
+                  retire_expected_state = ?, retire_expected_head = ?, updated_at = ?
+            WHERE request_id = ?`,
+        )
+        .run(ts, input.by, input.reason, fingerprint, input.expectedState, input.expectedHead, ts, row.requestId);
+      // An awaiting phase handoff attached to this request can never
+      // complete from it: close it (never complete it) with the truthful
+      // reason, in the same transaction — and carry the closed id on the
+      // audit event so the durable correlation is one fact, not a lookup.
+      const phase = this.findPhaseHandoffByRequest({ jobId: row.jobId, requestId: row.requestId });
+      let phaseClosed: string | null = null;
+      if (phase !== null && phase.state === 'awaiting') {
+        this.closePhaseHandoff({
+          phaseId: phase.phaseId,
+          reason: `directive request retired without completion: ${input.reason}`,
+        });
+        phaseClosed = phase.phaseId;
+      }
+      this.appendEvent({
+        kind: 'silas.directive-retired',
+        jobId: row.jobId,
+        payload: {
+          request_id: row.requestId,
+          by: input.by,
+          reason: input.reason,
+          admission_class: admissionClass,
+          admission_seq: current.admissionSeq,
+          admission_minion: current.admissionMinion,
+          expected_state: input.expectedState,
+          expected_head: input.expectedHead,
+          lane_id: input.lane.id,
+          phase_handoff_closed: phaseClosed,
+        },
+      });
+      return { record: this.getDirective(row.requestId) as DirectiveRequestRecord, idempotent: false, phaseClosed };
+    });
+  }
+
+  /** Continuation holds created by retirements, oldest first. An OPEN hold
+   * (`releasedBy === null`) fences lane automation until a fresh accepted
+   * directive/re-brief identity supersedes it. */
+  listDirectiveRecoveryHolds(opts: {
+    jobId?: string;
+    openOnly?: boolean;
+    /** Projection-only isolation: report damaged debt loudly, then keep
+     * healthy holds visible. Strict callers still throw on any bad row. */
+    onMalformed?: (requestId: string, jobId: string, error: unknown) => void;
+  } = {}): readonly DirectiveRecoveryHold[] {
+    const where: string[] = ["state = 'retired'"];
+    const params: unknown[] = [];
+    if (opts.jobId !== undefined) {
+      where.push('job_id = ?');
+      params.push(opts.jobId);
+    }
+    if (opts.openOnly === true) where.push('hold_released_by IS NULL');
+    const rows = this.db
+      .prepare(`SELECT * FROM pending_directives WHERE ${where.join(' AND ')} ORDER BY retired_at, request_id`)
+      .all(...(params as never[])) as Row[];
+    return rows.flatMap((row) => {
+      try {
+        const record = this.directiveFromRow(row);
+        if (record.retiredAt === null || record.retiredBy === null || record.retireReason === null) {
+          throw new Error(
+            `pending_directives row "${record.requestId}" is retired but is missing its audit facts — ` +
+              'the record is inconsistent and cannot be projected',
+          );
+        }
+        return [{
+          jobId: record.jobId,
+          requestId: record.requestId,
+          admissionClass: directiveAdmissionClass(record),
+          retiredAt: record.retiredAt,
+          retiredBy: record.retiredBy,
+          reason: record.retireReason,
+          releasedBy: record.holdReleasedBy,
+          releasedAt: record.holdReleasedAt,
+        }];
+      } catch (error) {
+        if (opts.onMalformed === undefined) throw error;
+        opts.onMalformed(str(row.request_id), str(row.job_id), error);
+        return [];
+      }
+    });
+  }
+
+  /** True while an unreleased retirement hold fences the job's automation. */
+  hasOpenDirectiveRecoveryHold(jobId: string): boolean {
+    const row = this.db
+      .prepare("SELECT 1 AS open FROM pending_directives WHERE job_id = ? AND state = 'retired' AND hold_released_by IS NULL LIMIT 1")
+      .get(jobId) as Row | undefined;
+    return row !== undefined;
+  }
+
+  /** Release every open retirement hold for a job from a fresh, audited
+   * producer acceptance (new directive request id or re-brief marker id).
+   * Runs inside the accepting transaction; a replay never releases again. */
+  private releaseDirectiveRecoveryHolds(jobId: string, byIdentity: string): void {
+    const holds = this.listDirectiveRecoveryHolds({ jobId });
+    if (holds.length === 0) return;
+    const ts = nowIso();
+    this.db
+      .prepare(
+        "UPDATE pending_directives SET hold_released_by = ?, hold_released_at = ?, updated_at = ? WHERE job_id = ? AND state = 'retired' AND hold_released_by IS NULL",
+      )
+      .run(byIdentity, ts, ts, jobId);
+    // Exact durable ordering, not wall-clock age. This is an accepted
+    // authority handoff, never a work-delivery or retirement receipt.
+    this.appendEvent({ kind: 'silas.directive-recovery-handoff', jobId,
+      payload: { request_id: byIdentity, retired_request_ids: holds.map((hold) => hold.requestId) } });
+  }
+
+  /** A wait must not carry its saved prompt across a fresh retirement
+   * handoff. Unknown/missing ordered evidence is NOT permission and stays
+   * a blocker; only proven superseded debt can be ignored. */
+  providerWaitRetirementIdentity(wait: Pick<ProviderWaitRecord, 'jobId' | 'id'>): 'current' | 'superseded' | 'unknown' {
+    if (wait.jobId === null) return 'current';
+    const holds = this.listDirectiveRecoveryHolds({ jobId: wait.jobId });
+    if (holds.length === 0) return 'current';
+    if (holds.some((hold) => hold.releasedBy === null)) return 'unknown';
+    const handoff = this.latestJobEvent(wait.jobId, 'silas.directive-recovery-handoff');
+    const payload = (typeof handoff?.payload === 'object' && handoff.payload !== null ? handoff.payload : {}) as Record<string, unknown>;
+    const retiredIds = payload['retired_request_ids'];
+    if (handoff === null || typeof payload['request_id'] !== 'string' ||
+        !Array.isArray(retiredIds) || !holds.every((hold) => retiredIds.includes(hold.requestId))) return 'unknown';
+    const values = [{ key: 'id', value: wait.id }];
+    if (!this.hasJobEventWithPayloadValues(wait.jobId, ['provider.wait-established'], values, 0)) return 'unknown';
+    return this.hasJobEventWithPayloadValues(wait.jobId, ['provider.wait-established'], values, handoff.seq)
+      ? 'current' : 'superseded';
+  }
+
+  directiveCurrentAuthority(jobId: string): { readonly workRevision: number; readonly contractSha256: string; readonly authorityEpoch: number } {
+    if (this.getJob(jobId) === null) throw new RecordNotFound(`job "${jobId}" not found`);
+    return { workRevision: requiredWorkRevision(this.listJobAmendments(jobId)),
+      contractSha256: this.effectiveContract(jobId)?.contractSha256 ?? createHash('sha256').update('').digest('hex'),
+      authorityEpoch: this.directiveRecoveryEpoch(jobId) };
+  }
+
+  private assertFreshRecoveryContract(jobId: string, revision: number | undefined, hash: string | undefined): void {
+    const currentHash = this.effectiveContract(jobId)?.contractSha256 ?? createHash('sha256').update('').digest('hex');
+    if (!Number.isSafeInteger(revision) || revision !== requiredWorkRevision(this.listJobAmendments(jobId)) || hash !== currentHash) {
+      throw new DirectiveCheckpointError('fresh successor approved revision/contract expectations are stale or missing');
+    }
+  }
+
+  /** Native control epoch, not clock age or a caller's authority label. */
+  directiveRecoveryEpoch(jobId: string): number {
+    this.listDirectiveRecoveryHolds({ jobId }); // strict audit validation
+    const row = this.db.prepare(`SELECT COALESCE(MAX(seq), 0) AS epoch FROM events
+      WHERE job_id = ? AND (${DIRECTIVE_CONTROL_SQL})`).get(jobId) as Row;
+    return row['epoch'] as number;
+  }
+
+  private assertNoProviderProducer(jobId: string, exempt?: (kind: string) => boolean): void {
+    const admissions = this.listJobAdmissions(jobId).filter((kind) => (kind.startsWith('provider ') || kind.startsWith('property ')) && exempt?.(kind) !== true);
+    const claims = this.listOpenProviderWaitsForJob(jobId)
+      .filter((wait) => wait.status === 'claimed')
+      .map((wait) => `claimed provider continuation ${wait.id}`);
+    if (admissions.length > 0 || claims.length > 0) {
+      throw new AmbiguousDirectiveError(`job "${jobId}" still has provider ownership (${[...admissions, ...claims].join(', ')}) — wait for native cessation before a fresh directive or re-brief`);
+    }
+  }
+
+  /** The in-flight process-local admissions for one job (the same registry
+   * every producer reserves before its first await). Exposed read-only so
+   * guarded operations can refuse while any producer is between reservation
+   * and registration. */
+  listJobAdmissions(jobId: string): readonly string[] {
+    return [...this.activeJobAdmissions].filter((entry) => entry.jobId === jobId).map((entry) => entry.kind);
+  }
+
+  /** Open provider-recovery ownership for one job: a waiting/claimable or
+   * claimed continuation is live producer evidence and forbids retiring a
+   * request on that lane. */
+  listOpenProviderWaitsForJob(jobId: string): readonly ProviderWaitRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM provider_waits WHERE job_id = ? AND status IN ('waiting','recovered-pending','claimed')
+         ORDER BY created_at, id`,
+      )
+      .all(jobId) as Row[];
+    return rows.map((row) => this.providerWaitFromRow(row)).filter((wait) => {
+      if (wait.status !== 'claimed') return this.providerWaitRetirementIdentity(wait) !== 'superseded';
+      // Superseding permission cannot prove a spawned producer ceased.
+      // Only a closed turn or acknowledged pre-turn disposal is terminal;
+      // spawn/cleanup errors remain unknown even after a newer handoff.
+      return !this.hasJobEventWithPayloadValues(jobId, ['provider.continuation-completed'], [{ key: 'wait_id', value: wait.id }], 0) &&
+        !['turn', 'authorization'].some((stage) => this.hasJobEventWithPayloadValues(jobId, ['provider.continuation-failed'],
+          [{ key: 'wait_id', value: wait.id }, { key: 'stage', value: stage }], 0));
     });
   }
 
@@ -7001,6 +9225,75 @@ export class LedgerApi {
       });
       return { record: this.getPipelineEntry(input.id) as PipelineEntryRecord, created: true };
     });
+  }
+
+  /** Append-only review history plus a transactional CAS head. Frozen
+   * approval identities commit before any individual pipeline enqueue. */
+  recordIntakeReview(record: IntakeReviewRecord): void {
+    this.transaction(() => {
+      const head = this.getIntakeReview(record.repoPath, record.intakeId);
+      const replay = this.getIntakeReview(record.repoPath, record.intakeId, record.token);
+      if (replay !== null) {
+        if (canonicalIntake(replay) !== canonicalIntake(record)) throw new IntakeError('intake_acceptance_conflict', 'Review token already binds different bytes', 409);
+        return;
+      }
+      if ((head?.token ?? null) !== record.previousToken) throw new IntakeError('intake_stale_review', 'Review changed or was rejected; read back before deciding', 409);
+      const rejected = this.db.prepare("SELECT token FROM intake_reviews WHERE repo_path = ? AND intake_id = ? AND revision_id = ? AND status = 'rejected'").get(record.repoPath, record.intakeId, record.revisionId);
+      if (rejected !== undefined) throw new IntakeError('intake_stale_review', 'Rejected revisions cannot be reopened; create a new revision', 409);
+      if (record.status !== 'reviewed' && (head?.status !== 'reviewed' || head.revisionId !== record.revisionId)) throw new IntakeError('intake_stale_review', 'Only the exact currently reviewed revision can be approved or rejected', 409);
+      if (record.status === 'reviewed' && head?.revisionId === record.revisionId && head.status !== 'reviewed') throw new IntakeError('intake_stale_review', 'Rejected or accepted revisions cannot be reopened; create a new revision', 409);
+      const approved = this.db.prepare("SELECT token FROM intake_reviews WHERE repo_path = ? AND intake_id = ? AND revision_id = ? AND status = 'approved'").get(record.repoPath, record.intakeId, record.revisionId);
+      if (approved !== undefined) throw new IntakeError('intake_acceptance_conflict', 'This revision already has an immutable accepted selection; retry its original approval', 409);
+      const serialized = canonicalIntake(record);
+      this.verifyIntakeHistoryBudget(record.repoPath, record.intakeId, Buffer.byteLength(serialized));
+      this.db.prepare('INSERT INTO intake_reviews(token, repo_path, intake_id, revision_id, status, record) VALUES (?, ?, ?, ?, ?, ?)').run(record.token, record.repoPath, record.intakeId, record.revisionId, record.status, serialized);
+      this.db.prepare('INSERT INTO intake_review_heads(repo_path, intake_id, token) VALUES (?, ?, ?) ON CONFLICT(repo_path, intake_id) DO UPDATE SET token = excluded.token').run(record.repoPath, record.intakeId, record.token);
+      this.appendEvent({ kind: `intake.${record.status}`, payload: { intake_id: record.intakeId, revision_id: record.revisionId, token: record.token, selected: record.selected } });
+    });
+  }
+
+  /** Bound total retained verification work before loading/parsing/hashing any
+   * decision. Over-budget history stays intact for restoration/inspection. */
+  private verifyIntakeHistoryBudget(repoPath: string, intakeId: string, additionalBytes = 0): void {
+    const size = this.db.prepare('SELECT COUNT(*) AS count, COALESCE(SUM(length(CAST(record AS BLOB))), 0) AS bytes FROM intake_reviews WHERE repo_path = ? AND intake_id = ?').get(repoPath, intakeId) as { count: number; bytes: number };
+    if (size.count + (additionalBytes > 0 ? 1 : 0) > 4096) throw new IntakeError('intake_storage_error', 'Intake history reached its 4096-decision verification bound; create a new intake for further revisions, retaining this history', 500);
+    if (size.bytes + additionalBytes > 8 * 1024 * 1024) throw new IntakeError('intake_storage_error', 'Intake history reached its 8-MiB byte verification bound; create a new intake for further revisions, retaining this history', 500);
+  }
+
+  getIntakeReview(repoPath: string, intakeId: string, token?: string): IntakeReviewRecord | null {
+    this.verifyIntakeHistoryBudget(repoPath, intakeId);
+    const row = token === undefined
+      ? this.db.prepare('SELECT r.* FROM intake_review_heads h LEFT JOIN intake_reviews r ON r.token = h.token WHERE h.repo_path = ? AND h.intake_id = ?').get(repoPath, intakeId)
+      : this.db.prepare('SELECT * FROM intake_reviews WHERE token = ? AND repo_path = ? AND intake_id = ?').get(token, repoPath, intakeId);
+    if (row === undefined) {
+      if (token === undefined && this.db.prepare('SELECT token FROM intake_reviews WHERE repo_path = ? AND intake_id = ? LIMIT 1').get(repoPath, intakeId) !== undefined) throw new IntakeError('intake_storage_error', 'Review history exists without its coordination head; restore the intake ledger before deciding', 500);
+      return null;
+    }
+    try {
+      let ancestor: Row | undefined = row as Row;
+      let first: IntakeReviewRecord | undefined;
+      const visited = new Set<string>();
+      // Iterative, bounded ancestry verification: a valid head cannot conceal
+      // a deleted rejection or a damaged predecessor beneath it.
+      while (ancestor !== undefined) {
+        if (visited.size >= 4096) throw new Error('Review ancestry exceeds 4096 decisions');
+        const record = JSON.parse(str(ancestor.record)) as IntakeReviewRecord;
+        const { token: savedToken, ...body } = record;
+        if (visited.has(savedToken)) throw new Error('Cyclic review ancestry');
+        if (savedToken !== intakeDigest(canonicalIntake(body)) || savedToken !== ancestor.token || record.repoPath !== repoPath || record.intakeId !== intakeId || ancestor.repo_path !== repoPath || ancestor.intake_id !== intakeId || record.revisionId !== ancestor.revision_id || record.status !== ancestor.status) throw new Error('Review bytes or binding are damaged');
+        visited.add(savedToken); first ??= record;
+        if (record.previousToken === null) break;
+        if (typeof record.previousToken !== 'string' || !/^[a-f0-9]{64}$/u.test(record.previousToken)) throw new Error('Invalid review predecessor');
+        ancestor = this.db.prepare('SELECT * FROM intake_reviews WHERE token = ? AND repo_path = ? AND intake_id = ?').get(record.previousToken, repoPath, intakeId) as Row | undefined;
+        if (ancestor === undefined) throw new Error('Missing review ancestor; restore the intake ledger');
+      }
+      return first!;
+    } catch (error) { throw new IntakeError('intake_storage_error', `Cannot verify durable intake decision: ${String(error)}`, 500); }
+  }
+
+  /** Indexed durable enqueue witness; no event payload list is loaded. */
+  hasPipelineEnqueueEvidence(id: string): boolean {
+    return this.db.prepare("SELECT 1 FROM events WHERE kind = 'pipeline.enqueued' AND json_valid(payload) AND json_extract(payload, '$.entry_id') = ? LIMIT 1").get(id) !== undefined;
   }
 
   getPipelineEntry(id: string): PipelineEntryRecord | null {
@@ -7284,7 +9577,7 @@ export class LedgerApi {
     const ctx: PipelineEvaluationContext = {
       entries,
       jobStatusOf: (jobId) => this.getJob(jobId)?.status ?? null,
-      jobDeliveredOf: (jobId) => this.latestJobEvent(jobId, 'job.delivered') !== null,
+      jobDeliveredOf: (jobId) => this.latestCandidateDelivery(jobId) !== null,
       jobStartedOf: (jobId) => this.jobHasWorkerStart(jobId),
       capacity,
     };
@@ -7374,6 +9667,21 @@ export class LedgerApi {
       }
       claim = { holder, since };
     }
+    const retireExpectedStateRaw = nstr(row.retire_expected_state);
+    if (retireExpectedStateRaw !== null && retireExpectedStateRaw !== 'dispatching' && retireExpectedStateRaw !== 'admitted') {
+      throw new Error(
+        `pending_directives row "${str(row.request_id)}" has unknown retirement expected state "${retireExpectedStateRaw}"`,
+      );
+    }
+    const nativeTarget = row.native_target == null ? null : JSON.parse(str(row.native_target)) as DirectiveRequestRecord['nativeTarget'];
+    const nativeBinding = row.native_binding == null ? null : JSON.parse(str(row.native_binding)) as DirectiveNativeBinding;
+    if (nativeTarget !== null && (!nativeTarget.agentId || !nativeTarget.sessionFile)) throw new DirectiveCheckpointError('malformed directive native target');
+    if (nativeBinding !== null) {
+      validateDirectiveIdentity(nativeBinding.identity);
+      if (nativeBinding.identity.requestId !== row.request_id || nativeBinding.identity.jobId !== row.job_id || nativeBinding.identity.payloadHash !== row.payload_hash ||
+          nativeBinding.identity.workRevision !== row.work_revision || nativeBinding.identity.authorityEpoch !== row.authority_epoch ||
+          nativeBinding.agentId !== nativeTarget?.agentId || nativeBinding.sessionFile !== nativeTarget?.sessionFile || !nativeBinding.userEntryId) throw new DirectiveCheckpointError('malformed/mismatched directive native admission readback');
+    }
     return {
       requestId: str(row.request_id),
       jobId: str(row.job_id),
@@ -7389,6 +9697,25 @@ export class LedgerApi {
       failReason: nstr(row.fail_reason),
       createdAt: str(row.created_at),
       updatedAt: str(row.updated_at),
+      retiredAt: nstr(row.retired_at),
+      retiredBy: nstr(row.retired_by),
+      retireReason: nstr(row.retire_reason),
+      retireFingerprint: nstr(row.retire_fingerprint),
+      retireExpectedState: retireExpectedStateRaw,
+      retireExpectedHead: nstr(row.retire_expected_head),
+      holdReleasedBy: nstr(row.hold_released_by),
+      holdReleasedAt: nstr(row.hold_released_at),
+      workRevision: row.work_revision === null || row.work_revision === undefined ? null : Number(row.work_revision),
+      requestKind: row.request_kind == null ? null : str(row.request_kind) as DirectiveRequestRecord['requestKind'],
+      sourceContext: row.source_context == null ? null : JSON.parse(str(row.source_context)) as DirectiveRequestRecord['sourceContext'],
+      authorityEpoch: row.authority_epoch == null ? null : Number(row.authority_epoch),
+      contractSnapshot: nstr(row.contract_snapshot),
+      contractSha256: nstr(row.contract_sha256),
+      dispatchStartedAt: nstr(row.dispatch_started_at),
+      nativeTarget,
+      nativeBinding,
+      recoveryCheckpoint: nstr(row.recovery_checkpoint),
+      recoveryDecision: row.recovery_decision == null ? null : JSON.parse(str(row.recovery_decision)) as DirectiveRequestRecord['recoveryDecision'],
     };
   }
   private pendingProviderRecoveryFromRow(row: Row): PendingProviderRecoveryRecord {
@@ -7406,9 +9733,11 @@ export class LedgerApi {
     if (!isPendingRebriefKind(kind)) {
       throw new Error(`pending_rebriefs row has unknown kind "${kind}"`);
     }
-    let payload: { note?: unknown; briefing?: unknown; rule_id?: unknown; source_round_id?: unknown };
+    let payload: { note?: unknown; briefing?: unknown; rule_id?: unknown; source_round_id?: unknown; source?: unknown; work_revision?: unknown };
     try {
-      payload = JSON.parse(str(row.payload)) as { note?: unknown; briefing?: unknown; rule_id?: unknown; source_round_id?: unknown };
+      payload = JSON.parse(str(row.payload)) as {
+        note?: unknown; briefing?: unknown; rule_id?: unknown; source_round_id?: unknown; source?: unknown; work_revision?: unknown;
+      };
     } catch (error) {
       throw new Error(`pending_rebriefs row ${str(row.id)} payload is not valid JSON: ${String(error)}`);
     }
@@ -7425,6 +9754,9 @@ export class LedgerApi {
       phaseId: nstr(row.phase_id),
       ruleId: nstr(payload.rule_id),
       sourceRoundId: nstr(payload.source_round_id),
+      source: nstr(payload.source),
+      workRevision: typeof payload.work_revision === 'number' && Number.isSafeInteger(payload.work_revision) &&
+        payload.work_revision >= 0 ? payload.work_revision : null,
       requestedAt: str(row.requested_at),
     };
   }
@@ -7648,6 +9980,184 @@ export class LedgerApi {
       cleared_at: nstr(row.cleared_at),
       cleared_by: nstr(row.cleared_by),
       cleared_reason: nstr(row.cleared_reason),
+    });
+  }
+
+  private mailboxProjectionCache: { readonly changes: number; readonly version: number; readonly items: readonly MailboxItem[]; readonly nextCheckAt: number } | null = null;
+
+  private mailboxDatabaseRevision(): { readonly changes: number; readonly version: number } {
+    const changes = Number((this.db.prepare('SELECT total_changes() AS changes').get() as Row).changes);
+    const version = Number((this.db.prepare('PRAGMA data_version').get() as Row).data_version);
+    return { changes, version };
+  }
+
+  /** Event watermarks alone cannot detect source writes that emit no event. */
+  private mailboxSourceProjection(now: number): readonly MailboxItem[] {
+    const revision = this.mailboxDatabaseRevision();
+    const cache = this.mailboxProjectionCache;
+    if (cache !== null && now < cache.nextCheckAt && cache.changes === revision.changes && cache.version === revision.version) return cache.items;
+    let nextCheckAt = Infinity;
+    const items = projectMailbox(this, now, (at) => { nextCheckAt = Math.min(nextCheckAt, at); });
+    this.mailboxProjectionCache = { ...revision, items, nextCheckAt };
+    return items;
+  }
+
+  /** Adopt an authenticated pre-GH313 incident wait only when its report source stayed unchanged. */
+  private migrateLegacyReportCustody(source: MailboxItem, previous: ReadonlyMap<string, MailboxItem>, now: string): MailboxItem | null {
+    if (source.kind !== 'incident' || source.reasons.length !== 1) return null;
+    const kind = source.reasons[0]!.label;
+    const jobId = /^silas\.report-handback\.(.+)$/u.exec(kind)?.[1];
+    if (jobId === undefined) return null;
+    const current = this.latestReportHandbackNotification(jobId);
+    const job = this.getJob(jobId);
+    const debt = this.findReportObligation(jobId);
+    if (current === null || job === null || debt === null) return null;
+    const candidates: { readonly item: MailboxItem; readonly seq: number }[] = [];
+    let latestRulingSeq = 0;
+    for (const old of previous.values()) {
+      if (old.kind !== 'incident' || old.notificationIds.length !== 1 || !old.reasons.some((reason) => reason.label === kind)) continue;
+      const row = this.getNotification(old.notificationIds[0]!);
+      if (row === null || row.kind !== kind) continue;
+      const key = `notification:${row.id}`;
+      if (old.id !== `incident:${mailboxBasis(key)}`) continue;
+      const ruling = this.db.prepare(`SELECT seq, payload FROM events WHERE kind = 'mailbox.disposition'
+        AND json_extract(payload, '$.id') = ? ORDER BY seq DESC LIMIT 1`).get(old.id) as Row | undefined;
+      if (ruling === undefined) continue;
+      // Any newer report-wide ruling wins, including explicit needs-gru/resolved rulings.
+      latestRulingSeq = Math.max(latestRulingSeq, Number(ruling.seq));
+      const saved = old.disposition;
+      if (old.subject !== source.subject || saved?.state !== 'waiting' || saved.sourceObligationId !== undefined
+        || saved.basis !== old.basis || row.detail !== current.detail || row.severity !== current.severity) continue;
+      const legacyReason = mailboxBasis([mailboxBasis([key, mailboxBasis([key, row.kind, row.detail, row.severity])]), null]);
+      if (old.basis !== mailboxBasis([[source.reasons[0]!.signal, legacyReason]])) continue;
+      if (JSON.stringify((JSON.parse(str(ruling.payload)) as { disposition: MailboxDisposition }).disposition) !== JSON.stringify(saved)) continue;
+      // Mailbox receipts/dispositions are metadata, never source mutations. Other later job writes
+      // remain unprovable without an old source fingerprint and must restore attention.
+      if (Date.parse(job.updatedAt) > Date.parse(saved.recordedAt) || Date.parse(debt.updatedAt) > Date.parse(saved.recordedAt)
+        || this.db.prepare(`SELECT 1 FROM events WHERE job_id = ? AND seq > ?
+          AND kind NOT IN ('mailbox.disposition', 'mailbox.received', 'mailbox.report-custody-migrated') LIMIT 1`)
+          .get(jobId, Number(ruling.seq)) !== undefined) continue;
+      try { validateMailboxDisposition(this, old, saved, now, true); }
+      catch (error) { if (!(error instanceof MailboxConflictError)) throw error; continue; }
+      candidates.push({ item: old, seq: Number(ruling.seq) });
+    }
+    const old = candidates.find((candidate) => candidate.seq === latestRulingSeq)?.item;
+    if (old === undefined) return null;
+    const disposition = { ...old.disposition!, basis: source.basis };
+    this.appendEvent({ kind: 'mailbox.report-custody-migrated', payload: {
+      from_id: old.id, from_basis: old.basis, id: source.id, basis: source.basis,
+      original_disposition: old.disposition, notification_id: current.id, obligation_id: debt.id,
+    } });
+    return { ...old, id: source.id, basis: source.basis, disposition };
+  }
+
+  /** Additive mailbox metadata only: this path never changes operational rows. */
+  reconcileMailbox(now = nowIso()): readonly MailboxItem[] {
+    return this.transaction(() => {
+      const projected = this.mailboxSourceProjection(Date.parse(now));
+      const previous = new Map(this.listMailboxItems().map((item) => [item.id, item]));
+      const liveIds = new Set(projected.map((item) => item.id));
+      const items = projected.map((source): MailboxItem => {
+        const old = previous.get(source.id) ?? this.migrateLegacyReportCustody(source, previous, now) ?? undefined;
+        const saved = old?.disposition?.sourceObligationId === undefined ? old?.disposition ?? null : null;
+        let supported = saved?.basis === source.basis;
+        if (supported && saved !== null) {
+          try { validateMailboxDisposition(this, source, saved, now, true); }
+          catch (error) { if (!(error instanceof MailboxConflictError)) throw error; supported = false; }
+        }
+        const disposition = supported ? saved : source.disposition ?? saved;
+        const applicable = supported ? saved : source.disposition;
+        const due = applicable !== null && applicable.sourceObligationId === undefined && ((applicable.recheckAt !== null && Date.parse(applicable.recheckAt) <= Date.parse(now))
+          || (source.followUpAt ?? []).some((at) => Date.parse(at) > Date.parse(applicable.recordedAt) && Date.parse(at) <= Date.parse(now)));
+        const state = applicable !== null && !due ? applicable.state : 'needs-gru';
+        const baseAttentionKey = `${source.id}@${mailboxBasis([source.basis, applicable?.recordedAt ?? (saved?.basis === source.basis ? [saved.recordedAt, 'unsupported'] : null), due ? applicable?.recheckAt : null, (source.followUpAt ?? []).filter((at) => Date.parse(at) <= Date.parse(now))])}`;
+        const receipt = old?.receipt ?? null;
+        // Delivery without a next action owes a bounded recheck. Retain its
+        // incarnation through the grace window; only due unhandled debt gets
+        // a new key, so restart and duplicate events cannot create a storm.
+        const sameAttention = receipt?.basis === source.basis && (receipt.attentionKey === baseAttentionKey || receipt.attentionKey.startsWith(`${baseAttentionKey}:unhandled:`));
+        const attentionKey = state === 'needs-gru' && sameAttention
+          ? Date.parse(now) - Date.parse(receipt.receivedAt) >= 300_000
+            ? `${baseAttentionKey}:unhandled:${receipt.receivedAt}` : receipt.attentionKey
+          : baseAttentionKey;
+        const references = [...new Map([...source.references, ...(applicable?.references ?? [])].map((ref) => [`${ref.kind}:${ref.id}`, ref])).values()];
+        return { ...source, references, disposition, state, owner: applicable?.owner ?? 'gru', receipt: old?.receipt ?? null, attentionKey };
+      });
+      for (const old of previous.values()) {
+        if (!liveIds.has(old.id)) items.push({ ...old, state: 'resolved', restrictions: [...old.restrictions.filter((value) => value !== 'Source evidence no longer raises attention'), 'Source evidence no longer raises attention'] });
+      }
+      for (const item of items) {
+        const encoded = JSON.stringify(item);
+        if (JSON.stringify(previous.get(item.id)) === encoded) continue;
+        this.db.prepare(`INSERT INTO gru_mailbox (id, item, updated_at) VALUES (?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET item = excluded.item, updated_at = excluded.updated_at`).run(item.id, encoded, now);
+      }
+      if (this.mailboxProjectionCache !== null) this.mailboxProjectionCache = { ...this.mailboxProjectionCache, ...this.mailboxDatabaseRevision() };
+      return items.sort((a, b) => a.id.localeCompare(b.id));
+    });
+  }
+
+  listMailboxItems(): readonly MailboxItem[] {
+    return (this.db.prepare('SELECT item FROM gru_mailbox ORDER BY id').all() as Row[]).map((row) => JSON.parse(str(row.item)) as MailboxItem);
+  }
+
+  recordMailboxDisposition(id: string, input: unknown, now = nowIso()): MailboxItem {
+    return this.transaction(() => {
+      const item = this.reconcileMailbox(now).find((candidate) => candidate.id === id);
+      if (item === undefined) throw new RecordNotFound(`mailbox item "${id}" not found`);
+      const disposition = validateMailboxDisposition(this, item, input, now, true);
+      if (item.disposition !== null && JSON.stringify({ ...item.disposition, recordedAt: null }) === JSON.stringify({ ...disposition, recordedAt: null })) return item;
+      validateMailboxDisposition(this, item, input, now);
+      const updated: MailboxItem = { ...item, disposition };
+      this.db.prepare('UPDATE gru_mailbox SET item = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(updated), now, id);
+      this.appendEvent({ kind: 'mailbox.disposition', jobId: item.jobId, payload: { id, disposition } });
+      return this.reconcileMailbox(now).find((candidate) => candidate.id === id)!;
+    });
+  }
+
+  recordMailboxReceipt(id: string, basis: string, source: 'chat' | 'wake', deliveryId: string, now = nowIso()): void {
+    return this.transaction(() => {
+      const item = this.reconcileMailbox(now).find((candidate) => candidate.id === id);
+      if (item === undefined || item.basis !== basis) throw new MailboxConflictError('mailbox receipt basis is stale');
+      if (item.receipt?.deliveryId === deliveryId && item.receipt.source === source) return;
+      this.recordCapturedMailboxReceipt({ deliveryKey: `mailbox:${mailboxBasis(item.attentionKey)}`, id, jobId: item.jobId,
+        basis, attentionKey: item.attentionKey, reasons: item.reasons, notificationIds: item.notificationIds }, source, deliveryId, now, now);
+    });
+  }
+
+  /** Historical evidence is durable even when it no longer matches the live attention incarnation. */
+  recordCapturedMailboxReceipt(delivery: MailboxDelivery, source: 'chat' | 'wake', deliveryId: string, receivedAt: string, now = nowIso()): void {
+    if (source !== 'chat' && source !== 'wake') throw new Error('mailbox receipt source must be chat or wake');
+    if (deliveryId.trim() === '') throw new Error('mailbox deliveryId must be nonblank');
+    if (!isRealIsoUtcTimestamp(receivedAt) || new Date(receivedAt).toISOString() !== receivedAt || Date.parse(receivedAt) > Date.parse(now)) {
+      throw new Error('mailbox receivedAt must be a canonical ISO timestamp no later than receipt recovery');
+    }
+    if (delivery.deliveryKey !== `mailbox:${mailboxBasis(delivery.attentionKey)}` || !delivery.attentionKey.startsWith(`${delivery.id}@`)) {
+      throw new Error('mailbox captured delivery identity does not match its attention incarnation');
+    }
+    return this.transaction(() => {
+      const receipt = { basis: delivery.basis, source, deliveryId, receivedAt, attentionKey: delivery.attentionKey };
+      const prior = this.db.prepare(`SELECT payload FROM events WHERE kind = 'mailbox.received'
+        AND json_extract(payload, '$.id') = ? AND json_extract(payload, '$.receipt.source') = ?
+        AND json_extract(payload, '$.receipt.deliveryId') = ? AND json_extract(payload, '$.receipt.attentionKey') = ? LIMIT 1`)
+        .get(delivery.id, source, deliveryId, delivery.attentionKey) as Row | undefined;
+      if (prior !== undefined) {
+        const payload = JSON.parse(str(prior.payload)) as { readonly receipt: MailboxReceipt; readonly delivery?: MailboxDelivery };
+        const sameReceipt = payload.receipt.basis === receipt.basis && payload.receipt.source === source
+          && payload.receipt.deliveryId === deliveryId && payload.receipt.receivedAt === receivedAt && payload.receipt.attentionKey === delivery.attentionKey;
+        const fingerprint = (value: MailboxDelivery): string => mailboxBasis([value.deliveryKey, value.id, value.jobId, value.basis, value.attentionKey,
+          value.reasons.map((reason) => [reason.signal, reason.label, reason.basis]), value.notificationIds]);
+        if (!sameReceipt || (payload.delivery !== undefined && fingerprint(payload.delivery) !== fingerprint(delivery))) {
+          throw new MailboxConflictError('mailbox delivery replay changed captured evidence or original delivery time');
+        }
+        return;
+      }
+      const item = this.reconcileMailbox(now).find((candidate) => candidate.id === delivery.id);
+      if (item !== undefined && item.basis === delivery.basis && item.attentionKey === delivery.attentionKey
+        && (item.receipt === null || Date.parse(item.receipt.receivedAt) <= Date.parse(receivedAt))) {
+        this.db.prepare('UPDATE gru_mailbox SET item = ?, updated_at = ? WHERE id = ?').run(JSON.stringify({ ...item, receipt }), now, item.id);
+      }
+      this.appendEvent({ kind: 'mailbox.received', jobId: delivery.jobId, payload: { id: delivery.id, receipt, reasons: delivery.reasons, delivery } });
     });
   }
 

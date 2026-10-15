@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { TextDecoder } from 'node:util';
 import type { LogLevel } from '../logger.js';
 import type {
   EventRecord,
@@ -8,6 +9,7 @@ import type {
   WorktreeRecord,
 } from '../ledger/api.js';
 import { isGitHubRemote } from './review-path.js';
+import { isJobTerminal } from '../ledger/states.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -22,12 +24,14 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * `repos/{owner}/{repo}/commits/{sha}/check-runs` — and mechanically applies
  * the state-change mappings:
  *
- *   PR merged            -> job in-review -> merged transition + `github.pr-merged`
+ *   PR merged            -> live job in-review -> merged + `github.pr-merged`;
+ *                           an in-flight observation after binning records
+ *                           only a no-effect receipt, never a status hop
  *   PR conflicting       -> `github.pr-conflict` + fyi notification
- *                           (mechanical tier: Silas owns the rebase within
- *                           his existing mandate — the conflict lands in his
- *                           digest's conflictingPrs rows, never as a Gru
- *                           wake; issue #215)
+ *                           (mechanical tier: Silas coordinates the conflict
+ *                           integration within his existing mandate — the
+ *                           conflict lands in his digest's conflictingPrs
+ *                           rows, never as a Gru wake; issue #215)
  *   CI failed (tracked)  -> `github.ci-failed` + notification with the run URL,
  *                           routed by check kind (mechanical -> fyi, Silas may
  *                           act; judgment -> action-required, wake-eligible)
@@ -121,6 +125,12 @@ export interface GhCheckRun {
 /** The outbound GitHub port (real implementation: {@link GhCliApi}). */
 export interface GhApiPort {
   listPulls(input: { readonly repo: RepoRef; readonly limit: number }): Promise<readonly GhPull[]>;
+  /** Open pulls whose head branch is `head` — the `gh pr list --repo <repo>
+   * --head <branch> --state open` filter the delivered→PR registration rule
+   * (issue #243) asks through this port instead of shelling out itself. The
+   * API filters head by `owner:branch`, so the repo's owner is part of the
+   * query, never assumed from the branch name. */
+  listPullsForHead(input: { readonly repo: RepoRef; readonly head: string }): Promise<readonly GhPull[]>;
   getPull(input: { readonly repo: RepoRef; readonly number: number }): Promise<GhPull>;
   listCheckRuns(input: { readonly repo: RepoRef; readonly sha: string }): Promise<readonly GhCheckRun[]>;
 }
@@ -462,16 +472,22 @@ export function trackedLanes(input: {
 // ------------------------------------------------------------------
 
 export class GhApiError extends Error {
-  constructor(message: string) {
+  /** The raw failure detail the message was composed from (gh stderr or a
+   * spawn/timeout detail), kept separate from the annotated label so
+   * classification can never read repository names as provider semantics. */
+  readonly causeText: string | null;
+
+  constructor(message: string, causeText: string | null = null) {
     super(message);
     this.name = 'GhApiError';
+    this.causeText = causeText;
   }
 }
 
 /** A rate-limit response — the tick must stop calling, never hammer. */
 export class GhRateLimitedError extends GhApiError {
-  constructor(message: string) {
-    super(message);
+  constructor(message: string, causeText: string | null = null) {
+    super(message, causeText);
     this.name = 'GhRateLimitedError';
   }
 }
@@ -497,13 +513,39 @@ export type GhCommandRunner = (args: readonly string[]) => Promise<GhCommandResu
 const GH_COMMAND_TIMEOUT_MS = 30_000;
 const GH_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 
-/** Spawn the real `gh` binary; output bounded, timeout kills loud. */
-export function defaultGhRunner(binary = 'gh'): GhCommandRunner {
+export interface GhRunnerLimits {
+  readonly maxOutputBytes?: number;
+  readonly maxStderrBytes?: number;
+  readonly timeoutMs?: number;
+  /** Intake requires exact UTF-8; ordinary shared callers retain replacement decoding. */
+  readonly strictUtf8?: boolean;
+}
+
+/** Spawn the real `gh` binary; byte-bounded output, timeout kills loud.
+ * Decode only complete byte buffers: OS chunks may split UTF-8 codepoints. */
+export function defaultGhRunner(binary = 'gh', limits: GhRunnerLimits = {}): GhCommandRunner {
+  const maxOutputBytes = limits.maxOutputBytes ?? GH_MAX_OUTPUT_BYTES;
+  const maxStderrBytes = limits.maxStderrBytes ?? GH_MAX_OUTPUT_BYTES;
+  const timeoutMs = limits.timeoutMs ?? GH_COMMAND_TIMEOUT_MS;
+  for (const value of [maxOutputBytes, maxStderrBytes, timeoutMs]) {
+    if (!Number.isSafeInteger(value) || value < 1) throw new RangeError('gh runner limits must be positive safe integers');
+  }
   return (args) =>
     new Promise<GhCommandResult>((resolve) => {
       let settled = false;
-      let stdout = '';
-      let stderr = '';
+      const stdout: Buffer[] = [];
+      const stderr: Buffer[] = [];
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
+      const captured = (): { stdout: string; stderr: string; error?: string } => {
+        const bytes = Buffer.concat(stdout, stdoutBytes);
+        const errorText = Buffer.concat(stderr, stderrBytes).toString('utf8');
+        try {
+          return { stdout: limits.strictUtf8 === true ? new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes) : bytes.toString('utf8'), stderr: errorText };
+        } catch {
+          return { stdout: '', stderr: errorText, error: 'gh api output is not valid UTF-8; no exact text snapshot can be captured' };
+        }
+      };
       const child = spawn(binary, [...args], { stdio: ['ignore', 'pipe', 'pipe'] });
       const finish = (result: GhCommandResult): void => {
         if (settled) return;
@@ -513,24 +555,38 @@ export function defaultGhRunner(binary = 'gh'): GhCommandRunner {
       };
       const timer = setTimeout(() => {
         child.kill('SIGKILL');
-        finish({ status: -1, stdout, stderr, error: `gh api timed out after ${GH_COMMAND_TIMEOUT_MS} ms` });
-      }, GH_COMMAND_TIMEOUT_MS);
+        const output = captured();
+        finish({ status: -1, ...output, error: `gh api timed out after ${timeoutMs} ms${output.error === undefined ? '' : `; ${output.error}`}` });
+      }, timeoutMs);
       child.stdout.on('data', (chunk: Buffer) => {
-        if (stdout.length >= GH_MAX_OUTPUT_BYTES) {
+        if (settled) return;
+        if (stdoutBytes + chunk.length > maxOutputBytes) {
           child.kill('SIGKILL');
-          finish({ status: -1, stdout, stderr, error: `gh api output exceeds ${GH_MAX_OUTPUT_BYTES} bytes` });
+          // A truncated response is not an exact source snapshot.
+          finish({ status: -1, stdout: '', stderr: Buffer.concat(stderr, stderrBytes).toString('utf8'), error: `gh api output exceeds ${maxOutputBytes} bytes` });
           return;
         }
-        stdout += chunk.toString('utf-8');
+        stdout.push(chunk);
+        stdoutBytes += chunk.length;
       });
       child.stderr.on('data', (chunk: Buffer) => {
-        if (stderr.length < GH_MAX_OUTPUT_BYTES) stderr += chunk.toString('utf-8');
+        if (settled || stderrBytes >= maxStderrBytes) return;
+        const bounded = chunk.subarray(0, maxStderrBytes - stderrBytes);
+        stderr.push(Buffer.from(bounded));
+        stderrBytes += bounded.length;
       });
       child.on('error', (error) => {
         finish({ status: -1, stdout: '', stderr: '', error: String(error) });
       });
       child.on('close', (code) => {
-        finish({ status: code ?? -1, stdout, stderr });
+        if (!settled) {
+          const output = captured();
+          if (output.error !== undefined && code !== null && code !== 0) {
+            // Preserve failed-CLI stderr/rate-limit classification, but never
+            // return unrepresentable stdout as an exact source snapshot.
+            finish({ status: code, stdout: '', stderr: output.stderr });
+          } else finish({ status: output.error === undefined ? code ?? -1 : -1, ...output });
+        }
       });
     });
 }
@@ -539,6 +595,36 @@ function record(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
+}
+
+/** Read one `gh api` JSON document with the shared fail-loud rules: a
+ * spawn/unavailable failure is named, a rate-limit response is classified
+ * so the caller can abort instead of hammering, and invalid JSON is a hard
+ * error. Used by the tracked-lane signal poll and the repository overview
+ * (one seam, one classification). */
+export async function ghApiJson(
+  run: GhCommandRunner,
+  binary: string,
+  label: string,
+  host: string,
+  path: string,
+): Promise<unknown> {
+  const result = await run(['api', '--hostname', host, path]);
+  if (result.status !== 0) {
+    const stderr = result.stderr.trim().slice(0, 300);
+    if (result.error !== undefined && result.error !== '') {
+      throw new GhApiError(`${label}: gh is unavailable (${result.error})`, result.error);
+    }
+    if (/rate limit/i.test(stderr)) {
+      throw new GhRateLimitedError(`${label}: GitHub rate limit (${stderr})`, stderr);
+    }
+    throw new GhApiError(`${label}: ${binary} exited ${result.status}: ${stderr}`, stderr);
+  }
+  try {
+    return JSON.parse(result.stdout) as unknown;
+  } catch (error) {
+    throw new GhApiError(`${label}: gh returned invalid JSON (${String(error)})`);
+  }
 }
 
 function strOrNull(value: unknown): string | null {
@@ -595,22 +681,7 @@ export class GhCliApi implements GhApiPort {
   ) {}
 
   private async apiJson(label: string, repo: RepoRef, path: string): Promise<unknown> {
-    const result = await this.run(['api', '--hostname', repo.host, path]);
-    if (result.status !== 0) {
-      const stderr = result.stderr.trim().slice(0, 300);
-      if (result.error !== undefined && result.error !== '') {
-        throw new GhApiError(`${label}: gh is unavailable (${result.error})`);
-      }
-      if (/rate limit/i.test(stderr)) {
-        throw new GhRateLimitedError(`${label}: GitHub rate limit (${stderr})`);
-      }
-      throw new GhApiError(`${label}: ${this.binary} exited ${result.status}: ${stderr}`);
-    }
-    try {
-      return JSON.parse(result.stdout) as unknown;
-    } catch (error) {
-      throw new GhApiError(`${label}: gh returned invalid JSON (${String(error)})`);
-    }
+    return ghApiJson(this.run, this.binary, label, repo.host, path);
   }
 
   async listPulls(input: { readonly repo: RepoRef; readonly limit: number }): Promise<readonly GhPull[]> {
@@ -620,6 +691,17 @@ export class GhCliApi implements GhApiPort {
     const parsed = await this.apiJson(`list pulls ${repoFullName(input.repo)}`, input.repo, path);
     if (!Array.isArray(parsed)) {
       throw new GhApiError(`list pulls ${repoFullName(input.repo)}: expected a JSON array`);
+    }
+    return parsed.map(mapPull).filter((pull): pull is GhPull => pull !== null);
+  }
+
+  async listPullsForHead(input: { readonly repo: RepoRef; readonly head: string }): Promise<readonly GhPull[]> {
+    const path =
+      `repos/${input.repo.owner}/${input.repo.repo}/pulls` +
+      `?state=open&per_page=20&head=${encodeURIComponent(`${input.repo.owner}:${input.head}`)}`;
+    const parsed = await this.apiJson(`list pulls head ${repoFullName(input.repo)}#${input.head}`, input.repo, path);
+    if (!Array.isArray(parsed)) {
+      throw new GhApiError(`list pulls head ${repoFullName(input.repo)}: expected a JSON array`);
     }
     return parsed.map(mapPull).filter((pull): pull is GhPull => pull !== null);
   }
@@ -918,6 +1000,16 @@ export class GitHubSignalPoll {
     checkRunCache: Map<string, CiState | null>,
   ): Promise<BranchObservation | null> {
     let pull = byBranch.get(lane.branch) ?? null;
+    // The tick's lane snapshot may outlive an awaited provider call. A
+    // binned lane cannot start another request; a merge already returned
+    // by THAT request is independent evidence for the no-effect receipt.
+    const terminalObservation = (): BranchObservation | null | undefined => {
+      const job = this.ledger.getJob(lane.jobId);
+      if (job !== null && !isJobTerminal(job.status)) return undefined;
+      return job?.status === 'binned' && pull?.merged === true ? { pull, ci: null } : null;
+    };
+    const atStart = terminalObservation();
+    if (atStart !== undefined) return atStart;
     let detailed = false;
     if (pull === null && lane.prNumber !== null) {
       // The batched window (100 most recently updated PRs) missed the
@@ -927,6 +1019,8 @@ export class GitHubSignalPoll {
         this.api.getPull({ repo: lane.repo, number }),
       );
       detailed = true;
+      const afterLookup = terminalObservation();
+      if (afterLookup !== undefined) return afterLookup;
     }
     // The list endpoint returns mergeable_state as null; the single-PR
     // endpoint is the only place GitHub computes it. One detail call per
@@ -936,6 +1030,8 @@ export class GitHubSignalPoll {
       pull = await this.call(budget, `get pull ${repoFullName(lane.repo)}#${number}`, () =>
         this.api.getPull({ repo: lane.repo, number }),
       );
+      const afterDetail = terminalObservation();
+      if (afterDetail !== undefined) return afterDetail;
     }
     let ci: CiState | null = null;
     const sha = pull?.headSha ?? null;
@@ -947,6 +1043,8 @@ export class GitHubSignalPoll {
         const runs = await this.call(budget, `check runs ${repoFullName(lane.repo)}@${sha.slice(0, 12)}`, () =>
           this.api.listCheckRuns({ repo: lane.repo, sha }),
         );
+        const afterChecks = terminalObservation();
+        if (afterChecks !== undefined) return afterChecks;
         ci = summarizeCheckRuns(sha, runs);
         checkRunCache.set(cacheKey, ci);
       }
@@ -980,6 +1078,14 @@ export class GitHubSignalPoll {
   // ------------------------------------------------------------------
 
   private applySignal(signal: GitHubSignal): void {
+    // A lane can be discarded while the provider request is in flight.
+    // Only a genuinely observed merge has independent evidence worth a
+    // no-effect receipt; conflict/CI alerts must not wake anyone about
+    // work that is already terminal, particularly an unbound job.
+    if (signal.kind !== 'pr-merged') {
+      const job = this.ledger.getJob(signal.jobId);
+      if (job !== null && isJobTerminal(job.status)) return;
+    }
     switch (signal.kind) {
       case 'pr-merged':
         this.applyMerged(signal);
@@ -1000,8 +1106,9 @@ export class GitHubSignalPoll {
    * The merge map: bring the lane to `in-review` when the hop is legal
    * (merged is terminal truth — a lane whose PR landed while it sat blocked
    * or delivered must not stay open), then `in-review -> merged`, then the
-   * `github.pr-merged` event. An unappliable transition is recorded loud,
-   * never coerced.
+   * `github.pr-merged` event. An unappliable live transition is recorded
+   * loud, never coerced; a binned lane stays terminal even if a request
+   * already in flight independently observes its PR merge.
    */
   private applyMerged(signal: PrMergedSignal): void {
     const job = this.ledger.getJob(signal.jobId);
@@ -1009,7 +1116,6 @@ export class GitHubSignalPoll {
       this.log('warn', 'github poll: merged PR for an unknown job', { job: signal.jobId });
       return;
     }
-    if (job.status === 'merged' || job.status === 'done') return;
     const payload = {
       repo: repoFullName(signal.repo),
       branch: signal.branch,
@@ -1018,6 +1124,20 @@ export class GitHubSignalPoll {
       sha: signal.sha,
       merge_commit_sha: signal.mergeCommitSha,
     };
+    if (isJobTerminal(job.status)) {
+      // A PR observed by an already-running poll may merge while its job
+      // is being discarded. Record the REAL observation once, but neither
+      // resurrect the lane nor call its abandonment a successful closeout.
+      // A job binned before this tick was never tracked, so no extra GitHub
+      // calls are made to discover future merges of discarded work.
+      if (job.status === 'binned' && this.ledger.latestJobEvent(signal.jobId, 'github.pr-merged') === null) {
+        this.ledger.appendCustomEvent({
+          kind: 'github.pr-merged', jobId: signal.jobId,
+          payload: { ...payload, applied: false, reason: 'job is binned' },
+        });
+      }
+      return;
+    }
     try {
       if (job.status !== 'in-review') this.ledger.setJobStatus(signal.jobId, 'in-review');
       this.ledger.setJobStatus(signal.jobId, 'merged');
@@ -1042,14 +1162,15 @@ export class GitHubSignalPoll {
   }
 
   /** Conflict cascade: the event is the record; the fyi notification is
-   * the cascade (mechanical tier — Silas owns the rebase within his
-   * existing mandate, so the row routes fyi into his digest and must
-   * never wake Gru; issue #215, the same tier rule as mechanical CI). */
+   * the cascade (mechanical tier — Silas coordinates the conflict
+   * integration within his existing mandate, so the row routes fyi into
+   * his digest and must never wake Gru; issue #215, the same tier rule as
+   * mechanical CI). */
   private applyConflict(signal: PrConflictSignal): void {
     const prLabel = signal.prNumber !== null ? `#${signal.prNumber}` : '(unknown PR)';
     const detail = [
       `Branch ${signal.branch} of ${repoFullName(signal.repo)} is conflicting with its base.`,
-      `Mechanical tier: Silas owns the rebase within mandate for ${prLabel}; tracked in his digest, not a Gru wake.`,
+      `Mechanical tier: Silas coordinates the conflict integration within mandate for ${prLabel}; tracked in his digest, not a Gru wake.`,
       ...(signal.prUrl !== null ? [signal.prUrl] : []),
     ].join(' ');
     this.ledger.appendCustomEvent({
@@ -1071,7 +1192,8 @@ export class GitHubSignalPoll {
       detail,
       dedupe: 'unacked',
       // Mechanical (fyi) rows never wake Gru; the binding stays so a
-      // merged/done lane's leftover row is classified as a closed
+      // terminal (merged/done/binned) lane's leftover row is classified
+      // as a closed
       // receipt. The job is already validated by the poll; no bound
       // worker → unbound and live (unknown historical rows are never
       // guessed; tracked-review A4).

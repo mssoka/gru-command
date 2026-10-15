@@ -148,7 +148,7 @@ computed per-snapshot.
 - **Action-required** — machine attention for Gru. Eligible rows open a
   rate-limited Gru wake turn; Gru diagnoses and dispositions them. They appear
   in NEEDS GRU (live rows only) and not the owner bell; rows bound to a
-  terminal merged/done lane are closed receipts rendered under FEED. Breakers
+  terminal merged/done/binned lane are closed receipts rendered under FEED. Breakers
   requiring owner re-arm and other owner-only decisions use **needs-owner**,
   not action-required.
 - **Stopped-worker truth (2026-09-29)** — a supervision-stopped or

@@ -1,3 +1,4 @@
+import { capturePortLaneHandoff } from '../worktrees/handoff.js';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import type { LogLevel } from '../logger.js';
@@ -10,6 +11,7 @@ import {
 } from '../ledger/api.js';
 import { isJobTerminal } from '../ledger/states.js';
 import type { AgentHandle, NativeAgentTool, SpawnOptions } from '../runtime/types.js';
+import { adapterCessationEvidence } from '../runtime/types.js';
 import { promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
 import {
   settleRetries,
@@ -319,6 +321,9 @@ export class ChildWorkerService {
       typeof input === 'object' && input !== null && !Array.isArray(input)
         ? (input as Record<string, unknown>)
         : {};
+    const authorityManifest = (capability: string): string => JSON.stringify({ version: 1, capability, parentAgentId: agentId,
+      maxChildrenPerParent: MAX_CHILDREN_PER_PARENT, maxPurposeChars: CHILD_PURPOSE_MAX_CHARS,
+      maxTaskChars: CHILD_TASK_MAX_CHARS, maxIdempotencyKeyChars: CHILD_IDEMPOTENCY_KEY_MAX_CHARS });
     const failureText = (error: unknown): string => {
       const refusal = childRefusalStatus(error);
       return JSON.stringify({
@@ -334,6 +339,7 @@ export class ChildWorkerService {
           'The child gets its own lane, session and durable result; read-only authority cannot write, ' +
           'writer authority gets its own branch. Children cannot spawn children. Use the returned child_id ' +
           'with list_child_workers to discover the result.',
+        authorityManifest: authorityManifest('request-child-worker'),
         inputSchema: {
           type: 'object',
           additionalProperties: false,
@@ -381,6 +387,7 @@ export class ChildWorkerService {
         description:
           'List this session\'s GC-tracked child workers with their lifecycle state and durable result ' +
           '(result_state, result_summary, result_ref). This is how a parent discovers completion or failure.',
+        authorityManifest: authorityManifest('list-child-workers'),
         inputSchema: { type: 'object', additionalProperties: false, properties: {} },
         execute: async () => {
           const children = this.opts.ledger.listChildWorkers({ parentAgentId: agentId }).map((child) => ({
@@ -400,6 +407,7 @@ export class ChildWorkerService {
         description:
           'Cancel one of this session\'s child workers (by child_id). Terminal children are immutable. ' +
           'Cancellation is proof-aware: a session that cannot prove cessation stays non-terminal.',
+        authorityManifest: authorityManifest('cancel-child-worker'),
         inputSchema: {
           type: 'object',
           additionalProperties: false,
@@ -677,6 +685,7 @@ export class ChildWorkerService {
         return;
       }
       lane = await this.ensureLane(record);
+      const assertHandoff = capturePortLaneHandoff(this.opts.worktrees, lane);
       if (this.opts.ledger.getChildWorker(record.id)?.state === 'queued') {
         this.opts.ledger.markChildAdmitted(record.id, { worktreeId: lane.id, branch: lane.branch });
       }
@@ -697,6 +706,7 @@ export class ChildWorkerService {
         residentRelease = await this.opts.reserveResident(childController.signal);
       }
       try {
+        assertHandoff();
         handle = await this.opts.spawner(
           'minion',
           {
@@ -714,6 +724,7 @@ export class ChildWorkerService {
         throw error;
       }
       run.handle = handle;
+      assertHandoff();
       resultRef = handle.sessionFile;
       // The admission row already carries the identity; bind the session
       // file and (idempotently) refresh the parent link.
@@ -725,6 +736,7 @@ export class ChildWorkerService {
         sessionFile: handle.sessionFile,
         parentAgentId: record.parentAgentId,
       });
+      assertHandoff();
       // Resident admission may have waited a long time: revalidate once
       // more before the model acts.
       const postAdmission = this.ineligibility(record);
@@ -778,6 +790,7 @@ export class ChildWorkerService {
         branch: lane.branch,
         baseSha: lane.sha,
       });
+      assertHandoff();
       delivered = true;
       const verdict = await promptWithTerminalVerdict(handle, briefing);
       // Shutdown/cancel takes precedence over a late successful settle:
@@ -861,7 +874,10 @@ export class ChildWorkerService {
             error: String(disposeError),
           });
         }
-        ceased = safeHealthState(handle) === 'disposed';
+        // Cessation proof is adapter-owned (Option A, F60-P3): disposed health
+        // is metadata, never proof. A missing/throwing/UNKNOWN answer keeps the
+        // record non-terminal with durable stop/cleanup debt and its lane.
+        ceased = adapterCessationEvidence(handle) === 'ceased';
       }
       // A recorded result is final. The cancelled path terminalizes ONLY
       // with proven cessation; an unproven stop stays NON-TERMINAL (the
@@ -929,8 +945,18 @@ export class ChildWorkerService {
           },
         });
       }
-      if (terminal) this.live.delete(record.id);
-      else if (handle !== null) run.handle = handle; // stop debt: keep the handle for a proof-aware retry
+      if (terminal) {
+        // A recorded result is IMMUTABLE, but when cessation was NOT proven
+        // the exact handle/lane ownership stays retained as cleanup debt so a
+        // later attributable positive attestation can reconcile it exactly
+        // once (F60-P3). Only a proven stop (or a gone handle) drops the live
+        // entry here; `cancel` on a terminal record runs the proof-aware
+        // reconciliation.
+        if (ceased || handle === null) this.live.delete(record.id);
+        else run.handle = handle;
+      } else if (handle !== null) {
+        run.handle = handle; // stop debt: keep the handle for a proof-aware retry
+      }
       // Read-only children leave nothing behind: their detached lane is
       // swept once the run is terminal AND cessation is proven. A child
       // whose turn was never delivered (fenced, cancelled or aborted
@@ -950,11 +976,45 @@ export class ChildWorkerService {
     }
   }
 
+  /**
+   * Proof-aware LATE reconciliation of a finalized child's retained cleanup
+   * debt (F60-P3). The recorded result is untouched (immutable); only the
+   * retained lane/permit ownership is reconciled, exactly once, once the
+   * adapter attests 'ceased'. A read-only child's detached lane is released;
+   * a writer child's lane stays owner-managed (the delivered/undelivered
+   * distinction is not re-derivable after finalization, so this stays
+   * conservative). A no-op when nothing is retained or the stop is still
+   * unproven — a cached failed/repeated rejection is never proof.
+   */
+  async reconcileCleanup(childId: string): Promise<void> {
+    const run = this.live.get(childId);
+    if (run === undefined) return;
+    const handle = run.handle;
+    if (handle === null) return;
+    if (adapterCessationEvidence(handle) !== 'ceased') return;
+    const record = this.opts.ledger.getChildWorker(childId);
+    if (record === null || record.resultState === null) return; // terminal cleanup debt only
+    // Exactly once: drop the retained ownership BEFORE the await so a
+    // repeat/concurrent call cannot double-release.
+    run.handle = null;
+    this.live.delete(childId);
+    this.opts.ledger.appendCustomEvent({
+      kind: 'child.cleanup-reconciled',
+      agentId: handle.id,
+      jobId: record.jobId,
+      payload: {
+        childId,
+        note: 'adapter attested cessation — retained cleanup debt reconciled exactly once',
+      },
+    });
+    if (record.authority === 'read-only') await this.releaseLaneQuietly(childId);
+  }
+
   /** Reuse a lane that survived a restart; otherwise create the child
    * worker's own lane at the parent lane's current HEAD. */
   private async ensureLane(record: ChildWorkerRecord): Promise<WorktreeLane> {
     const existing = this.opts.worktrees.getWorktree(record.id);
-    if (existing !== null && existing.status !== 'swept') return existing;
+    if (existing !== null && existing.status !== 'swept') { capturePortLaneHandoff(this.opts.worktrees, existing)(); return existing; }
     const parentLane = this.opts.worktrees
       .listWorktrees({ jobId: record.jobId })
       .find((lane) => lane.kind === 'job' && lane.status === 'active');
@@ -963,6 +1023,7 @@ export class ChildWorkerService {
         `job "${record.jobId}" has no active parent lane — a child lane must base on a live parent lane`,
       );
     }
+    capturePortLaneHandoff(this.opts.worktrees, parentLane)();
     return this.opts.worktrees.createChildWorktree({
       repoPath: parentLane.repoPath,
       jobId: record.jobId,
@@ -1000,7 +1061,12 @@ export class ChildWorkerService {
     if (record === null) {
       throw new RecordNotFound(`child worker "${childId}" not found`);
     }
-    if (record.resultState !== null) return record;
+    if (record.resultState !== null) {
+      // A terminal result stays immutable; a retained cleanup debt is
+      // reconciled proof-aware exactly once before answering (F60-P3).
+      await this.reconcileCleanup(childId);
+      return this.opts.ledger.getChildWorker(childId) as ChildWorkerRecord;
+    }
     const run = this.live.get(childId);
     if (run === undefined) {
       // No live run (not started yet, or already finalized): record the

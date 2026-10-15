@@ -1,3 +1,4 @@
+import { standaloneFixtureLedger } from './helpers/fixture-handoff.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -31,7 +32,7 @@ afterEach(() => {
 runWorktreePortContract('in-memory test double', async () => {
   const repo = makeFixtureRepo('fixture-port');
   cleanupRepos.push(repo);
-  const port = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-port-')));
+  const port = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-port-')), standaloneFixtureLedger('contract-job'));
   return {
     port,
     repoPath: repo.path,

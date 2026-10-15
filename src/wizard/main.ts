@@ -20,7 +20,7 @@ import { homedir } from 'node:os';
 import { createInterface } from 'node:readline/promises';
 import { stdout } from 'node:process';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
-import { existsSync, openSync, realpathSync } from 'node:fs';
+import { existsSync, lstatSync, openSync, realpathSync } from 'node:fs';
 import { ReadStream, WriteStream } from 'node:tty';
 import { fileURLToPath } from 'node:url';
 import * as QRCode from 'qrcode';
@@ -32,21 +32,27 @@ import { configPathFor, expandTilde, instanceDirFromEnv, DEFAULT_INSTANCE_PORT, 
 import type { RuntimeProbeResult } from '../runtime/probe.js';
 import {
   AnswersError,
+  DEFAULT_NEW_INSTALL_RUNTIME,
   generateToken,
   parseAnswers,
   resolveBindHost,
   validateWorkspaceRoot,
   type WizardAnswers,
 } from './answers.js';
+import { assertRuntimeCliAvailable } from './runtime-cli.js';
 import {
   buildQrPayload,
+  clearWizardDraft,
   discoverManagedRepos,
   generateConfigToml,
   loadExistingInstanceConfig,
+  loadWizardDraft,
+  saveWizardDraft,
   seedAnswersFromConfig,
+  wizardDraftPath,
   writeConfigText,
 } from './steps.js';
-import { onboardBmadRepo, REUSE_REPAIR_HINT } from './bmad-onboarding.js';
+import { validateRepositorySetup } from './repository-setup.js';
 
 const WIZARD_USAGE =
   'usage: node dist/wizard/main.js [--no-interact] [--answers <json>] [--force]';
@@ -71,17 +77,17 @@ function printProbe(results: readonly RuntimeProbeResult[]): void {
   }
   if (!results.some((result) => result.installed)) {
     stdout.write(
-      '\n⚠ No runtime CLI found (pi / claude). You can proceed — the wizard\n' +
-      '  writes the config anyway, and adapters fail LOUD at spawn time until\n' +
-      '  you install one.\n',
+      '\n⚠ No runtime CLI found (claude / pi). Claude Code (the default) needs its\n' +
+      '  `claude` CLI before setup writes the config; pi can still be configured and\n' +
+      '  fails LOUD at spawn time until you install it.\n',
     );
   }
 }
 
-/** Default runtime pick: first installed probe (pi preferred), else "pi". */
-function defaultRuntimeId(results: readonly RuntimeProbeResult[]): string {
-  const installed = results.find((result) => result.installed);
-  return installed !== undefined ? installed.id : 'pi';
+/** Default runtime pick for a fresh install: Claude Code, never a silent
+ * swap to whichever CLI happens to be installed (a missing CLI fails loud). */
+function defaultRuntimeId(): string {
+  return DEFAULT_NEW_INSTALL_RUNTIME;
 }
 
 interface WizardTerminal {
@@ -117,41 +123,33 @@ async function ask(rl: ReturnType<typeof createInterface>, question: string): Pr
   return (await rl.question(question)).trim();
 }
 
-/** Failure-prompt line where EOF (Ctrl-D / closed stdin) is a first-class
- * outcome: readline/promises' question() never settles once the input
- * stream ends (observed on Node 22), so race it against the interface's
- * close event. A closed prompt must reach the documented skip path, never
- * wedge the wizard. Default prompts keep `ask` and are never offered here. */
-async function askOrEof(
-  rl: ReturnType<typeof createInterface>,
-  question: string,
-): Promise<string | null> {
-  return new Promise<string | null>((resolve) => {
-    let settled = false;
-    const settle = (value: string | null): void => {
-      if (settled) return;
-      settled = true;
-      rl.off('close', onClose);
-      resolve(value);
-    };
-    const onClose = (): void => settle(null);
-    rl.once('close', onClose);
-    void rl.question(question).then(
-      (answer) => settle(answer.trim()),
-      () => settle(null),
-    );
-  });
+/** Stop-first guidance shared by the up-front warning, the port prompt, and
+ * the pre-write abort. */
+function portInUseGuidance(host: string, port: number, holder: string): string {
+  return (
+    `port ${port} on ${host} is already in use — if the previous\n` +
+    '  service still runs, stop it first (./install.sh --uninstall, or\n' +
+    '  systemctl --user stop gru-command / launchctl unload …), then re-run.\n' +
+    `  (listener detected${holder === 'unknown' ? '' : ` at ${holder}`})`
+  );
 }
 
 function yn(value: string): boolean {
   return value.toLowerCase() === 'y' || value.toLowerCase() === 'yes';
 }
 
+interface CollectedAnswers {
+  readonly answers: WizardAnswers;
+  /** The exact JSON handed to parseAnswers — what an interrupted run saves. */
+  readonly draftJson: string;
+}
+
 async function interactiveAnswers(
   probe: readonly RuntimeProbeResult[],
   terminal: WizardTerminal,
   prior: ReturnType<typeof loadExistingInstanceConfig>,
-): Promise<WizardAnswers> {
+  draft: string | null,
+): Promise<CollectedAnswers> {
   const rl = createInterface({ input: terminal.input, output: terminal.output });
   const out = terminal.output;
   out.write('\nGru Command setup — press Enter to accept every [default].\n');
@@ -160,6 +158,32 @@ async function interactiveAnswers(
       `\nExisting config found — Enter keeps its values (round-trip; a timestamped\n` +
         `  backup is written before any rewrite).\n`,
     );
+  }
+
+  // Fail fast (#33): surface a port conflict BEFORE the first question, for
+  // the port this run will default to. It is a warning, not an abort — the
+  // operator may still choose another port at the prompt, which re-checks.
+  const preflightPort = prior?.server.port ?? DEFAULT_INSTANCE_PORT;
+  if (preflightPort !== 0) {
+    const holder = await findPortHolder(prior?.server.host ?? '127.0.0.1', preflightPort);
+    if (holder !== null) {
+      out.write(
+        `\nHeads up before you answer anything: ${portInUseGuidance(prior?.server.host ?? '127.0.0.1', preflightPort, holder)}\n` +
+          '  Or pick a different bind port below — your answers are saved if setup stops.\n',
+      );
+    }
+  }
+
+  // Resume (#33): answers saved by an interrupted run are offered back.
+  if (draft !== null) {
+    const reuse = await ask(
+      rl,
+      '\nFound answers saved from an interrupted setup. Reuse them and skip the questions? [Y/n]: ',
+    );
+    if (reuse.toLowerCase() !== 'n' && reuse.toLowerCase() !== 'no') {
+      rl.close();
+      return { answers: parseAnswers(draft), draftJson: draft };
+    }
   }
 
   let workspaceRoot = prior?.workspaceRoot ?? '~/code';
@@ -178,7 +202,15 @@ async function interactiveAnswers(
   }
 
   const workspaceAbs = workspaceRoot.replace(/^~(?=\/|$)/, homedir());
-  const found = discoverManagedRepos(workspaceAbs);
+  const discovered = discoverManagedRepos(workspaceAbs);
+  // The board still discovers linked entries; setup only validates real
+  // repository directories and must not offer defaults it then rejects.
+  const found = discovered.filter((name) => !lstatSync(join(workspaceAbs, name)).isSymbolicLink());
+  const linked = discovered.filter((name) => !found.includes(name));
+  if (linked.length > 0) {
+    out.write(`\nLinked repo entries excluded from setup validation: ${linked.join(', ')}.\n` +
+      'Use their real directory under the workspace root to validate them; links stay unchanged.\n');
+  }
   let repos: string[] = [];
   if (found.length > 0) {
     out.write('\nRepos under the workspace root:\n');
@@ -186,7 +218,7 @@ async function interactiveAnswers(
     for (;;) {
       const answer = await ask(
         rl,
-        `Managed repos — comma-separated numbers or names [all ${found.length}]: `,
+        `Repos to validate — comma-separated numbers or names [all ${found.length}]: `,
       );
       if (answer === '') {
         repos = [...found];
@@ -210,40 +242,12 @@ async function interactiveAnswers(
     }
   } else {
     out.write(
-      `\nNo git repos found under ${workspaceRoot} yet — the board will be empty\n` +
-        'until you add repos there.\n',
+      `\nNo real repository directories available for setup validation under ${workspaceRoot}.\n` +
+        'The board discovers Git entries independently; add a real repository here to validate it.\n',
     );
   }
 
-  const bmad: Record<string, 'install' | 'reuse' | 'skip'> = {};
-  for (const repo of repos) {
-    const hasBmad = existsSync(join(workspaceAbs, repo, '_bmad', '_config', 'manifest.yaml'));
-    for (;;) {
-      const answer = (
-        await ask(
-          rl,
-          hasBmad
-            ? `BMAD in ${repo}: existing install found; reuse unchanged or skip? [reuse]: `
-            : `BMAD in ${repo}: install official bmm,cis,tea,gds (core implicit)? [Y/n]: `,
-        )
-      ).toLowerCase();
-      if (hasBmad && ['', 'reuse'].includes(answer)) {
-        bmad[repo] = 'reuse';
-        break;
-      }
-      if (!hasBmad && ['', 'y', 'yes'].includes(answer)) {
-        bmad[repo] = 'install';
-        break;
-      }
-      if (['skip', 'n', 'no'].includes(answer)) {
-        bmad[repo] = 'skip';
-        break;
-      }
-      out.write(`  ✗ enter ${hasBmad ? 'reuse or skip' : 'yes or no'}\n`);
-    }
-  }
-
-  const runtimeDefault = prior?.runtimes.default ?? defaultRuntimeId(probe);
+  const runtimeDefault = prior?.runtimes.default ?? defaultRuntimeId();
   let runtime = runtimeDefault;
   for (;;) {
     const answer = await ask(
@@ -292,11 +296,17 @@ async function interactiveAnswers(
   let port = prior?.server.port ?? DEFAULT_INSTANCE_PORT;
   for (;;) {
     const answer = await ask(rl, `Bind port (0 = ephemeral) [${port}]: `);
-    if (answer === '') break;
-    const parsed = Number(answer);
+    const parsed = answer === '' ? port : Number(answer);
     if (Number.isInteger(parsed) && parsed >= 0 && parsed <= 65535) {
-      port = parsed;
-      break;
+      // Check at the prompt (#33): a conflict is found while the operator
+      // is still here, not after the remaining questions.
+      const holder = parsed === 0 ? null : await findPortHolder(host, parsed);
+      if (holder === null) {
+        port = parsed;
+        break;
+      }
+      out.write(`  ✗ ${portInUseGuidance(host, parsed, holder)}\n  Choose another port, or stop that listener and re-run (answers are saved).\n`);
+      continue;
     }
     out.write('  ✗ port must be an integer 0–65535\n');
   }
@@ -314,22 +324,19 @@ async function interactiveAnswers(
   const smoke = smokeAnswer !== 'n' && smokeAnswer !== 'no';
   rl.close();
 
-  const answers = parseAnswers(
-    JSON.stringify({
-      workspace_root: workspaceRoot,
-      repos,
-      bmad,
-      runtime,
-      model,
-      thinking_level: thinkingLevel,
-      host,
-      port,
-      token,
-      register_service: registerService,
-      smoke,
-    }),
-  );
-  return answers;
+  const draftJson = JSON.stringify({
+    workspace_root: workspaceRoot,
+    repos,
+    runtime,
+    model,
+    thinking_level: thinkingLevel,
+    host,
+    port,
+    token,
+    register_service: registerService,
+    smoke,
+  });
+  return { answers: parseAnswers(draftJson), draftJson };
 }
 
 // ---------------------------------------------------------------------------
@@ -590,6 +597,7 @@ async function main(argv: readonly string[]): Promise<number> {
   // is loaded dynamically at its use site.
   let answers: WizardAnswers;
   let terminal: WizardTerminal | null = null;
+  let draftPath: string | null = null;
   if (noInteract) {
     let rawKeys: ReadonlySet<string> = new Set();
     try {
@@ -626,124 +634,71 @@ async function main(argv: readonly string[]): Promise<number> {
     const probe = probeRuntimes();
     printProbe(probe);
     terminal = openWizardTerminal(repoRoot);
-    answers = await interactiveAnswers(probe, terminal, prior);
+    let draft: string | null = null;
+    try {
+      draft = loadWizardDraft(instanceDir);
+      if (draft !== null) parseAnswers(draft);
+    } catch (error) {
+      stdout.write(
+        `\nIgnoring an unreadable saved draft (${wizardDraftPath(instanceDir)}): ${(error as Error).message}\n` +
+          '  It is replaced by this run.\n',
+      );
+      draft = null;
+    }
+    const collected = await interactiveAnswers(probe, terminal, prior, draft);
+    answers = collected.answers;
+    // Everything the operator typed survives any later abort (#33).
+    draftPath = saveWizardDraft(instanceDir, collected.draftJson);
+  }
+  const abortNote = draftPath === null ? '' : `\n  Your answers are saved (${draftPath}); re-running offers to reuse them.`;
+
+  if (prior === null || prior.runtimes.default !== answers.runtime) {
+    try {
+      assertRuntimeCliAvailable(answers.runtime);
+    } catch (error) {
+      fail(`${(error as Error).message}${abortNote}`);
+    }
   }
 
   const configPath = configPathFor(instanceDir);
   if (existsSync(configPath) && !force) {
-    fail(`refusing to overwrite existing ${configPath} without --force`);
+    fail(`refusing to overwrite existing ${configPath} without --force${abortNote}`);
   }
   const configText = generateConfigToml({ answers, instanceDir, prior });
 
   stdout.write(
-    `\nSelected repos for BMAD onboarding: ${answers.repos.length > 0 ? answers.repos.join(', ') : '(none)'}\n`,
+    `\nRepositories selected for setup validation: ${answers.repos.length > 0 ? answers.repos.join(', ') : '(none)'}\n`,
   );
-  if (answers.repos.length > 0) {
-    stdout.write('BMAD per-repo plan (no workspace-root or unselected-repo writes):\n');
-    for (const repo of answers.repos) {
-      stdout.write(`  ${repo}: ${answers.bmad[repo] ?? 'skip'}\n`);
-    }
-  }
 
   if (answers.port !== 0) {
     const holder = await findPortHolder(answers.host, answers.port);
     if (holder !== null) {
-      fail(
-        `port ${answers.port} on ${answers.host} is already in use — if the previous\n` +
-          '  service still runs, stop it first (./install.sh --uninstall, or\n' +
-          '  systemctl --user stop gru-command / launchctl unload …), then re-run.\n' +
-          `  (listener detected${holder === 'unknown' ? '' : ` at ${holder}`})`,
-      );
+      fail(portInUseGuidance(answers.host, answers.port, holder) + abortNote);
     }
   }
 
   const workspaceAbs = expandTilde(answers.workspaceRoot, homedir());
   for (const repo of answers.repos) {
-    let action = answers.bmad[repo] ?? 'skip';
-    for (;;) {
-      const result = onboardBmadRepo(repo, action, { workspaceRoot: workspaceAbs, answers });
-      if (result.ready) {
-        stdout.write(`BMAD ready in ${repo}: ${result.message}\n`);
-        stdout.write(
-          `  Commit ${repo}/.gru-command/{worktree.toml,bmad-bootstrap.mjs,bmad-install.json} ` +
-            'so fresh worktrees receive the project-local binding.\n',
-        );
-        break;
-      }
-      if (action === 'skip') {
-        stdout.write(`BMAD not ready in ${repo}: ${result.message}; repo remains managed.\n`);
-        break;
-      }
-      if (result.deterministic) {
-        // Deterministic state failure (gh-32): the check ran against
-        // unchanged on-disk state, so another identical retry can never
-        // succeed. Offer skip-only plus the class-appropriate deliberate
-        // repair path — install-repair classes keep the official-installer
-        // hint, other classes fall back to neutral wording. The wizard
-        // never repairs or overwrites an existing install itself.
-        const repairHint = result.repairHint ??
-          'Repair the reported condition deliberately, then re-run the wizard';
-        if (terminal === null) {
-          // Headless guidance names the JSON values this mode actually
-          // offers: a reuse-class refusal is unblocked by asking for reuse
-          // again, not by an interactive prompt the mode does not have.
-          const headlessEscape = result.repairHint === REUSE_REPAIR_HINT
-            ? ` Headless: set answers.bmad.${repo}="reuse" to preserve it, or "skip" to leave the repo managed.`
-            : `, or explicitly set answers.bmad.${repo}="skip".`;
-          fail(
-            `BMAD setup for ${repo} is not ready (deterministic failure — retrying cannot fix it): ${result.message}\n` +
-              `${repairHint}${headlessEscape}`,
-          );
-        }
-        terminal.output.write(
-          `BMAD setup for ${repo} failed (deterministic — retrying cannot fix it): ${result.message}\n` +
-            `  ${repairHint}; Gru never repairs an existing install automatically.\n`,
-        );
-        for (;;) {
-          const skipRl = createInterface({ input: terminal.input, output: terminal.output });
-          const answer = await askOrEof(skipRl, 'Skip this repo? [skip]: ');
-          skipRl.close();
-          if (answer === null) {
-            terminal.output.write('  input closed (EOF) — taking the skip path\n');
-          }
-          const choice = (answer ?? 'skip').toLowerCase();
-          if (['', 'skip', 's', 'y', 'yes'].includes(choice)) {
-            action = 'skip';
-            break;
-          }
-          terminal.output.write('  ✗ this failure is deterministic — retry cannot fix it; enter skip\n');
-        }
-        continue;
-      }
-      if (terminal === null) {
-        fail(
-          `BMAD setup for ${repo} is not ready: ${result.message}\n` +
-            `Retry after fixing it, or explicitly set answers.bmad.${repo}="skip".`,
-        );
-      }
-      terminal.output.write(`BMAD setup for ${repo} failed: ${result.message}\n`);
-      const retryRl = createInterface({ input: terminal.input, output: terminal.output });
-      const answer = await askOrEof(retryRl, 'Retry or skip this repo? [retry/skip]: ');
-      retryRl.close();
-      if (answer === null) {
-        terminal.output.write('  input closed (EOF) — taking the skip path\n');
-      }
-      const choice = (answer ?? 'skip').toLowerCase();
-      action = choice === 'skip' ? 'skip' : action;
+    try {
+      validateRepositorySetup(workspaceAbs, repo);
+    } catch (error) {
+      fail((error as Error).message + abortNote);
     }
+    stdout.write(`Repository ready in ${repo}: GC setup validated; project files unchanged.\n`);
   }
 
-  // BMAD setup may take minutes. Recheck the fixed port immediately
+  // Recheck the fixed port immediately
   // before writing config so a late listener cannot turn a completed
   // setup into a knowingly unbootable instance.
   if (answers.port !== 0) {
     const holder = await findPortHolder(answers.host, answers.port);
     if (holder !== null) {
-      fail(`port ${answers.port} on ${answers.host} became occupied during setup; config was not written`);
+      fail(`port ${answers.port} on ${answers.host} became occupied during setup; config was not written${abortNote}`);
     }
   }
 
   const write = writeConfigText(instanceDir, configText, { force });
+  clearWizardDraft(instanceDir);
   stdout.write(`\nWrote ${write.configPath}\n`);
   if (write.backupPath !== null) stdout.write(`Previous config backed up: ${write.backupPath}\n`);
 

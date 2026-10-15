@@ -1,3 +1,4 @@
+import { withMailboxFixture } from './mailbox-fixture.test-support.js';
 import { describe, expect, it } from 'vitest';
 import type { BoardSnapshot, JobView, PipelineEntryView } from './board-protocol.js';
 import {
@@ -51,7 +52,7 @@ function pipelineEntry(id: string, overrides: Partial<PipelineEntryView> = {}): 
 }
 
 function snapshot(options: { jobs?: readonly JobView[]; pipeline?: BoardSnapshot['pipeline'] } = {}): BoardSnapshot {
-  return {
+  return withMailboxFixture({
     repos: [{ name: 'demo', jobs: options.jobs ?? [] }],
     agents: [],
     notifications: [],
@@ -71,7 +72,7 @@ function snapshot(options: { jobs?: readonly JobView[]; pipeline?: BoardSnapshot
     unackedNeedsOwner: 0,
     wakes: { count: 0, lastAt: null },
     ...(options.pipeline !== undefined ? { pipeline: options.pipeline } : {}),
-  };
+  });
 }
 
 describe('board sections — approved order and counts', () => {
@@ -113,6 +114,27 @@ describe('board sections — approved order and counts', () => {
     expect(nav.map((row) => row.count)).toEqual([0, 7, 6, 1, 5, 4]);
     expect(nav.map((row) => row.href)).toEqual(SECTION_ORDER.map((id) => `#${SECTION_TARGET_IDS[id]}`));
     expect(nav.every((row) => row.counted)).toBe(true);
+  });
+
+  it('keeps binned rows in the COLD band and its complete count — filtering happens at render, never in the count', () => {
+    const sections = boardSections(
+      snapshot({
+        jobs: [
+          job('cold-done', 'done'),
+          job('cold-binned', 'binned'),
+          job('cold-parked', 'parked'),
+        ],
+      }),
+    );
+    expect(sections.counts.cold).toBe(3);
+    const coldIds = (sections.bands.get('cold') ?? []).map((entry) => entry.job.id).sort();
+    expect(coldIds).toEqual(['cold-binned', 'cold-done', 'cold-parked']);
+    // No other section silently absorbs (or drops) the discarded lane.
+    expect(sections.counts['in-flight']).toBe(0);
+    expect(sections.counts.settled).toBe(0);
+    expect(sections.counts['for-gru']).toBe(0);
+    const nav = sectionNav(sections.counts, sections.pipelineAvailable);
+    expect(nav.find((row) => row.id === 'cold')?.count).toBe(3);
   });
 
   it('marks the pipeline count unknown (not a false zero) when the server ships no block', () => {

@@ -2,7 +2,9 @@ import { spawnSync } from 'node:child_process';
 import type { DirectiveRequestRecord, EventRecord, JobRecord, PendingRebriefRecord } from '../ledger/api.js';
 import { isJobTerminal, type JobStatus } from '../ledger/states.js';
 import { LIVE_DIRECTIVE_STATES, type DirectiveState } from '../ledger/directives.js';
+import type { WorkRevisionState } from '../review-inputs/amendments.js';
 import type { WorktreeLane } from './worktree-port.js';
+import { repositoryGitEnv } from './perkins-review/artifacts.js';
 
 /**
  * Branch-idle guard (proven 2026-09-23; cost: two wasted review rounds): a
@@ -32,13 +34,34 @@ import type { WorktreeLane } from './worktree-port.js';
  *    reconciled. A status flip to delivered/in-review and a late
  *    `job.delivered` from the pre-re-brief worker cannot clear a newer
  *    request; the marker clears only when the request genuinely settles
- *    (`finalizeRebriefRequest` / boot reconciliation).
+ *    (`finalizeRebriefRequest` / boot reconciliation); or
+ * 3. a CORRECTION is pending (owner rule 2, 2026-10-08): an accepted
+ *    material amendment raised the job's required work revision above the
+ *    revision its newest delivery carried. The delivered candidate is
+ *    outdated — no review may freeze it until a continuation carrying the
+ *    revision delivers. Verification and active writers are covered by the
+ *    fences below, so "review begins only after the latest required
+ *    revision delivered, verification complete, no active writer" is one
+ *    predicate; or
+ * 4. a CORRECTIVE delivery owes its verification (owner decision
+ *    2026-10-09, option A): the first delivery carrying a new work revision
+ *    may be reviewed only after a passing scheduler verification on its
+ *    exact head. Ordinary deliveries keep the in-flight check only.
  *
- * Terminal (`merged`/`done`) jobs are never busy: a stale marker left on a
- * terminal job must not block an unrelated review or resurrect the job.
+ * Terminal (`merged`/`done`/`binned`) jobs are never busy: a stale marker
+ * left on a terminal job must not block an unrelated review or resurrect
+ * the job.
  */
 
-export const BRANCH_BUSY_HINT = 'wait for lane delivery or re-brief request settlement, or dispatch with force';
+export const BRANCH_BUSY_HINT =
+  'wait for lane delivery, re-brief request settlement, a continuation delivering the pending contract revision, ' +
+  'or a passing verification of a corrective delivery\'s head; or dispatch with force';
+
+/** The hint when a blocker is a pending material correction: force never
+ * reviews an obsolete candidate (owner rule 2), so it is not offered. */
+export const BRANCH_BUSY_REVISION_HINT =
+  'an approved material correction is pending delivery — send ONE continuation carrying the contract revision ' +
+  '(the service attaches the amendments); force cannot review an obsolete candidate';
 
 /** Statuses whose lane may be mid-flight (dispatched = the lane is about to
  * be created and pushed; working = the attempt is open; in-review = a PR
@@ -50,12 +73,26 @@ export interface BranchIdleBlocker {
   readonly jobId: string;
   readonly status: JobStatus;
   readonly branch: string;
+  /** Present when the lane is busy because a material correction is
+   * pending delivery (owner rule 2): the revision review requires and the
+   * revision the newest delivery carried. */
+  readonly revision?: WorkRevisionState;
+  /** Present when a corrective delivery still owes its passing
+   * verification on this head (owner decision 2026-10-09, option A). */
+  readonly verification?: { readonly revision: number; readonly head: string | null };
 }
 
 /** The 409 body shape (snake_case: this is the wire contract). */
 export interface BranchBusyResponse {
   readonly error: 'branch_busy';
-  readonly blockers: readonly { readonly job_id: string; readonly status: JobStatus; readonly branch: string }[];
+  readonly blockers: readonly {
+    readonly job_id: string;
+    readonly status: JobStatus;
+    readonly branch: string;
+    readonly required_revision?: number;
+    readonly delivered_revision?: number;
+    readonly verification_required_head?: string | null;
+  }[];
   readonly hint: string;
 }
 
@@ -79,8 +116,12 @@ export function branchBusyPayload(input: {
       job_id: blocker.jobId,
       status: blocker.status,
       branch: blocker.branch,
+      ...(blocker.revision !== undefined
+        ? { required_revision: blocker.revision.required, delivered_revision: blocker.revision.delivered }
+        : {}),
+      ...(blocker.verification !== undefined ? { verification_required_head: blocker.verification.head } : {}),
     })),
-    hint: BRANCH_BUSY_HINT,
+    hint: input.blockers.some((blocker) => blocker.revision !== undefined) ? BRANCH_BUSY_REVISION_HINT : BRANCH_BUSY_HINT,
   };
 }
 
@@ -94,7 +135,7 @@ export class BranchBusyError extends Error {
     super(
       `branch "${targetBranch}" is busy (${blockers
         .map((blocker) => `${blocker.jobId}: ${blocker.status}`)
-        .join(', ')}); ${BRANCH_BUSY_HINT}`,
+        .join(', ')}); ${blockers.some((blocker) => blocker.revision !== undefined) ? BRANCH_BUSY_REVISION_HINT : BRANCH_BUSY_HINT}`,
     );
     this.name = 'BranchBusyError';
     this.targetBranch = targetBranch;
@@ -109,8 +150,11 @@ export class BranchBusyError extends Error {
 
 /** Ledger surface the guard reads (the real LedgerApi satisfies it). */
 export interface BranchIdleLedger {
+  /** Process-local property ownership is never imported from audit JSON. */
+  listJobAdmissions?(jobId: string): readonly string[];
   listJobs(): readonly JobRecord[];
   latestJobEvent(jobId: string, kind: string): EventRecord | null;
+  latestCandidateDelivery(jobId: string): EventRecord | null;
   /** Newest-first bounded history; the guard pages back to the `working`
    * hop behind an `in-review` flip. */
   listJobEvents(jobId: string, opts?: { readonly limit?: number }): readonly EventRecord[];
@@ -123,9 +167,27 @@ export interface BranchIdleLedger {
     readonly jobId?: string;
     readonly states?: readonly DirectiveState[];
   }): readonly DirectiveRequestRecord[];
+  /** True while any retirement continuation hold for the job is unreleased:
+   * the lane stays fenced — no review may freeze, no offer may fire. */
+  hasOpenDirectiveRecoveryHold(jobId: string): boolean;
   /** True while any verification run for the job is unsettled: it owns the
    * checkout and no review may freeze the same head. */
   hasUnsettledVerificationRun(jobId: string): boolean;
+  /** The job's required vs delivered work revision (owner rule 2). */
+  workRevisionState(jobId: string): WorkRevisionState;
+  /** A corrective delivery's unpaid verification (option A), or null. */
+  correctiveVerificationDebt(jobId: string): { readonly revision: number; readonly head: string | null } | null;
+}
+
+/** The pending correction, when one fences the lane: required > delivered
+ * (owner rule 2). Terminal jobs never carry one. */
+export function pendingWorkRevision(
+  ledger: Pick<BranchIdleLedger, 'workRevisionState'>,
+  job: Pick<JobRecord, 'id' | 'status'>,
+): WorkRevisionState | null {
+  if (isJobTerminal(job.status)) return null;
+  const state = ledger.workRevisionState(job.id);
+  return state.required > state.delivered ? state : null;
 }
 
 /** The branch a job lane is created on (worktree manager convention; also
@@ -156,7 +218,7 @@ export function branchNameForRef(repoPath: string | null, ref: string): string |
     const result = spawnSync(
       'git',
       ['-C', repoPath, 'rev-parse', '--symbolic-full-name', '--verify', ref],
-      { encoding: 'utf-8', timeout: 10_000 },
+      { encoding: 'utf-8', timeout: 10_000, env: repositoryGitEnv(false) },
     );
     if (result.error !== undefined || result.status !== 0) return null;
     resolved = (result.stdout ?? '').trim();
@@ -189,16 +251,43 @@ export function resolveReviewTargetBranch(input: {
  * flip can only follow the `working` hop that started the attempt, so the
  * newest older status event IS that hop. Paged because the ledger exposes
  * only a limit-bounded newest-first window. */
-function previousStatusSeq(ledger: BranchIdleLedger, jobId: string, flipSeq: number): number | null {
+function previousStatusEvent(ledger: BranchIdleLedger, jobId: string, flipSeq: number): EventRecord | null {
   let limit = 200;
   for (;;) {
     const events = ledger.listJobEvents(jobId, { limit });
     const previous = events.find((event) => event.seq < flipSeq && event.kind === 'job.status');
-    if (previous !== undefined) return previous.seq;
+    if (previous !== undefined) return previous;
     // Fewer rows than requested means the history is exhausted.
     if (events.length < limit || limit >= 12_800) return null;
     limit *= 4;
   }
+}
+
+/** The job's status event with exactly this seq, found by paging the
+ * newest-first history (the ledger exposes only a limit-bounded window);
+ * null when it is not in the reachable history. */
+export function jobStatusEventAtSeq(ledger: Pick<BranchIdleLedger, 'listJobEvents'>, jobId: string, seq: number): EventRecord | null {
+  let limit = 200;
+  for (;;) {
+    const events = ledger.listJobEvents(jobId, { limit });
+    const found = events.find((event) => event.seq === seq && event.kind === 'job.status');
+    if (found !== undefined) return found;
+    if (events.length < limit || limit >= 12_800 || (events.at(-1)?.seq ?? 0) < seq) return null;
+    limit *= 4;
+  }
+}
+
+/** The attempt a `→ working` hop belongs to: its own, unless it is a
+ * refused review round's restore — that resumes the attempt the round
+ * interrupted (nothing ran on the lane, so the delivery that settled it
+ * still does). */
+function workingHopAttemptStart(hop: EventRecord): number {
+  const payload = typeof hop.payload === 'object' && hop.payload !== null
+    ? (hop.payload as { restoredAfterRound?: unknown; attemptStartSeq?: unknown })
+    : {};
+  const resumed = payload.attemptStartSeq;
+  return typeof payload.restoredAfterRound === 'string' && typeof resumed === 'number' &&
+    Number.isSafeInteger(resumed) && resumed < hop.seq ? resumed : hop.seq;
 }
 
 /** Seq of the job's current attempt start (0 when none is open). The
@@ -213,15 +302,15 @@ export function openAttemptStartSeq(ledger: BranchIdleLedger, jobId: string): nu
   const payload = typeof latest.payload === 'object' && latest.payload !== null
     ? (latest.payload as { from?: unknown; to?: unknown })
     : {};
-  if (payload.to === 'working') return latest.seq;
+  if (payload.to === 'working') return workingHopAttemptStart(latest);
   if (payload.to === 'in-review' && payload.from === 'working') {
-    const hop = previousStatusSeq(ledger, jobId, latest.seq);
-    if (hop !== null) return hop;
+    const hop = previousStatusEvent(ledger, jobId, latest.seq);
+    if (hop !== null) return workingHopAttemptStart(hop);
     // The status history is unreachable past the page cap. A delivery newer
     // than the flip settles the attempt the flip belongs to, so the lane
     // clears; otherwise fail closed and treat the attempt as open (a later
     // delivery clears it — never a permanent busy).
-    const delivered = ledger.latestJobEvent(jobId, 'job.delivered');
+    const delivered = ledger.latestCandidateDelivery(jobId);
     return delivered !== null && delivered.seq > latest.seq ? 0 : Number.MAX_SAFE_INTEGER;
   }
   return 0;
@@ -232,7 +321,7 @@ export function openAttemptStartSeq(ledger: BranchIdleLedger, jobId: string): nu
  * continuation (`provider.recovery-claimed`). The digest's stalled-phase
  * detector reads the same events; review admission must not arm on a head
  * whose repair is still open (issue #162). */
-function latestRepairStartSeq(ledger: Pick<BranchIdleLedger, 'latestJobEvent'>, jobId: string): number {
+export function latestRepairStartSeq(ledger: Pick<BranchIdleLedger, 'latestJobEvent'>, jobId: string): number {
   let newest = 0;
   for (const kind of ['silas.directive-sent', 'provider.recovery-claimed']) {
     const event = ledger.latestJobEvent(jobId, kind);
@@ -247,18 +336,29 @@ export function laneIsBusy(ledger: BranchIdleLedger, job: JobRecord): boolean {
   // Terminal lanes are never busy: the marker retirement lane owns stale
   // terminal markers, and they must not block anything in the meantime.
   if (isJobTerminal(job.status)) return false;
+  if (ledger.listJobAdmissions?.(job.id).some((kind) => kind.startsWith('property '))) return true;
   // An unresolved re-brief fences the lane regardless of delivery or status:
   // the worker's turn may push a new head after this check. Deliberately
   // presence-based — a late delivery event from the previous worker cannot
   // answer a newer request, so it must not release this fence.
   if (ledger.listPendingRebriefs({ jobId: job.id }).length > 0) return true;
+  // A material correction accepted after the newest delivery makes that
+  // candidate outdated (owner rule 2): no status, delivery or head fact
+  // releases this fence — only a delivery carrying the revision does.
+  if (pendingWorkRevision(ledger, job) !== null) return true;
+  // A corrective delivery is reviewed only on a verified head (option A).
+  if (ledger.correctiveVerificationDebt(job.id) !== null) return true;
   // An accepted directive request may already be prompting a writer before
   // its admission event lands: review must not arm on that head (issue #162).
   if (ledger.listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES }).length > 0) return true;
+  // A retirement's continuation hold is the same runtime fence for a request
+  // whose control ownership was closed without completion: no review may arm
+  // on the lane until a fresh accepted request supersedes the hold.
+  if (ledger.hasOpenDirectiveRecoveryHold(job.id)) return true;
   // A verification run owns the checkout for its whole life; a review must
   // not freeze the head it is verifying.
   if (ledger.hasUnsettledVerificationRun(job.id)) return true;
-  const delivered = ledger.latestJobEvent(job.id, 'job.delivered');
+  const delivered = ledger.latestCandidateDelivery(job.id);
   // A repair admitted after the delivery keeps the lane busy even when no
   // status hop recorded it, and even while the stale status still reads
   // `delivered` (a claimed provider continuation) — fallback and recovery
@@ -307,7 +407,91 @@ export function findBusyLanes(input: {
         ? normalizeBranch(lane.branch)
         : laneBranch(job.id);
     if (branch !== target) continue;
-    blockers.push({ jobId: job.id, status, branch });
+    const revision = pendingWorkRevision(input.ledger, job);
+    // A verification debt only matters once no revision is pending: an
+    // outdated head is never verified for review.
+    const verification = revision === null ? input.ledger.correctiveVerificationDebt(job.id) : null;
+    blockers.push({
+      jobId: job.id, status, branch,
+      ...(revision !== null ? { revision } : {}),
+      ...(verification !== null ? { verification } : {}),
+    });
   }
   return blockers;
+}
+
+/** The identity of the work that owns one job's lane at a moment: which
+ * attempt, which repair, which pending directive / re-brief requests and
+ * which verification debt or run. A forced review (#267) snapshots this at
+ * its arm for every blocker it overrides; later work on the same job is a
+ * different generation and was never authorized. */
+export interface BranchIdleWorkGeneration {
+  readonly branch: string;
+  readonly deliverySeq: number;
+  readonly directiveSeq: number;
+  readonly providerRecoverySeq: number;
+  readonly attemptStartSeq: number;
+  readonly repairStartSeq: number;
+  readonly directiveIds: readonly string[];
+  readonly rebriefIds: readonly string[];
+  readonly verification: { readonly revision: number; readonly head: string | null } | null;
+  /** Newest verification run start/request: a new run is new work. */
+  readonly verificationRunSeq: number;
+}
+
+/** What one forced request authorized at its arm, per job (in memory only;
+ * never carried into an automatic retry). */
+export type ForceAuthorization = ReadonlyMap<string, BranchIdleWorkGeneration>;
+
+export function branchIdleWorkGeneration(ledger: BranchIdleLedger, jobId: string, branch: string): BranchIdleWorkGeneration {
+  let verificationRunSeq = 0;
+  for (const kind of ['verification.requested', 'verification.started']) {
+    verificationRunSeq = Math.max(verificationRunSeq, ledger.latestJobEvent(jobId, kind)?.seq ?? 0);
+  }
+  return {
+    branch: normalizeBranch(branch),
+    deliverySeq: ledger.latestJobEvent(jobId, 'job.delivered')?.seq ?? 0,
+    directiveSeq: ledger.latestJobEvent(jobId, 'silas.directive-sent')?.seq ?? 0,
+    providerRecoverySeq: ledger.latestJobEvent(jobId, 'provider.recovery-claimed')?.seq ?? 0,
+    attemptStartSeq: openAttemptStartSeq(ledger, jobId),
+    repairStartSeq: latestRepairStartSeq(ledger, jobId),
+    directiveIds: ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).map((entry) => entry.requestId).sort(),
+    rebriefIds: ledger.listPendingRebriefs({ jobId }).map((entry) => entry.id).sort(),
+    verification: ledger.correctiveVerificationDebt(jobId),
+    verificationRunSeq,
+  };
+}
+
+/** Snapshot the generation of every job the force overrides at its arm. */
+export function snapshotForceAuthorization(
+  ledger: BranchIdleLedger,
+  blockers: readonly Pick<BranchIdleBlocker, 'jobId' | 'branch'>[],
+): ForceAuthorization {
+  return new Map(blockers.map((blocker) => [blocker.jobId, branchIdleWorkGeneration(ledger, blocker.jobId, blocker.branch)] as const));
+}
+
+/** Does the arm-time snapshot cover this blocker? Only work that already
+ * existed then does: nothing newer may have started, and every pending
+ * request now must have been pending at the arm. A pending material
+ * correction is never covered (owner rule 2). */
+export function forceCoversBlocker(
+  ledger: BranchIdleLedger,
+  authorization: ForceAuthorization,
+  blocker: BranchIdleBlocker,
+  now = branchIdleWorkGeneration(ledger, blocker.jobId, blocker.branch),
+): boolean {
+  const armed = authorization.get(blocker.jobId);
+  if (armed === undefined || blocker.revision !== undefined || ledger.listJobAdmissions?.(blocker.jobId).some((kind) => kind.startsWith('property '))) return false;
+  return now.branch === armed.branch &&
+    now.deliverySeq <= armed.deliverySeq &&
+    now.directiveSeq <= armed.directiveSeq &&
+    now.providerRecoverySeq <= armed.providerRecoverySeq &&
+    now.attemptStartSeq <= armed.attemptStartSeq &&
+    now.repairStartSeq <= armed.repairStartSeq &&
+    now.verificationRunSeq <= armed.verificationRunSeq &&
+    now.directiveIds.every((id) => armed.directiveIds.includes(id)) &&
+    now.rebriefIds.every((id) => armed.rebriefIds.includes(id)) &&
+    (now.verification === null ||
+      (armed.verification !== null && now.verification.revision === armed.verification.revision &&
+        now.verification.head === armed.verification.head));
 }

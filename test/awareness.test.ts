@@ -1,3 +1,4 @@
+import { GruMailbox } from '../src/gru-mailbox/service.js';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -319,7 +320,7 @@ describe('gru awareness — wake policy', () => {
       routing: 'fyi',
       severity: 'error',
       title: 'PR #11 conflicts with its base (acme/app)',
-      detail: 'Mechanical tier: Silas owns the rebase within mandate for #11; tracked in his digest, not a Gru wake.',
+      detail: 'Mechanical tier: Silas coordinates the conflict integration within mandate for #11; tracked in his digest, not a Gru wake.',
     });
     // The mechanical conflict is Silas's digest work: under the default
     // action-required wake policy it is a passive ℹ row, never a wake —
@@ -910,14 +911,22 @@ describe('gru awareness — morning digest (owner ruling 2026-09-23)', () => {
       rig.api.addJob({ id: 'j-staged', repo: 'demo', title: 'Review me' });
       rig.api.setJobStatus('j-staged', 'working');
       rig.api.setJobPr('j-staged', 'https://example.invalid/pr/2');
+      // A discarded (binned) lane with a registered PR is NOT staged work.
+      rig.api.addJob({ id: 'j-discard', repo: 'demo', title: 'Discard me' });
+      rig.api.setJobStatus('j-discard', 'working');
+      rig.api.setJobPr('j-discard', 'https://example.invalid/pr/3');
+      rig.api.setJobStatus('j-discard', 'binned');
 
       const morning = rig.awareness.prepare();
       expect(morning).not.toBeNull();
       expect(morning?.text).toContain('While you were away (since 2026-09-22T');
       expect(morning?.text).toContain('- fires: 1 wake delivered');
-      expect(morning?.text).toContain('- actions:');
+      expect(morning?.text).toContain('- activity: ');
+      expect(morning?.text).not.toContain('- actions:'); // traffic is not Gru action (GH-104)
       expect(morning?.text).toContain('- merges: j-merge');
-      expect(morning?.text).toContain('- staged PRs: j-staged');
+      const stagedLine = morning?.text.split('\n').find((line) => line.startsWith('- staged PRs:')) ?? '';
+      expect(stagedLine).toContain('j-staged');
+      expect(stagedLine).not.toContain('j-discard'); // a discard is not staged work
 
       // Committing consumes the digest: the next nearby block has none.
       rig.awareness.commit(morning!);
@@ -956,7 +965,8 @@ describe('gru awareness — morning digest (owner ruling 2026-09-23)', () => {
       const morning = next.prepare();
       expect(morning?.text).toContain('While you were away (since 2026-09-22T21:00:00.000Z)');
       expect(morning?.text).toContain('- fires: 1 wake delivered');
-      expect(morning?.text).toContain('- actions: 1 board event');
+      expect(morning?.text).toContain('- activity: 1 board event');
+      expect(morning?.text).not.toContain('- actions:');
       next.commit(morning!, 'chat');
       api.disposeMachineNotification(alert.id, 'Night alert fixed');
       expect(next.prepare()).toBeNull();
@@ -1001,35 +1011,44 @@ describe('gru awareness — morning digest (owner ruling 2026-09-23)', () => {
   });
 
   it('a terminal-bound machine row is a labeled receipt, never machine attention or a wake seed (D1)', () => {
-    const dir = tmpDir();
-    let receiptId = '';
-    {
-      const first = boot({ dir, wakeMode: 'never' });
-      first.api.addJob({ id: 'job-terminal', repo: 'r', title: 'Terminal job', briefing: 'b' });
-      first.api.setJobStatus('job-terminal', 'working');
-      first.api.registerAgent({ id: 'minion-terminal', role: 'minion', jobId: 'job-terminal' });
-      const row = first.notifications.post({
-        kind: 'review-escalation',
-        routing: 'action-required',
-        severity: 'error',
-        title: 'Round INCOMPLETE',
-        agentId: 'minion-terminal',
-      });
-      receiptId = row.id;
-        first.api.setJobStatus('job-terminal', 'delivered');
-      first.api.setJobStatus('job-terminal', 'in-review');
-      first.api.setJobStatus('job-terminal', 'merged');
+    // BOTH terminal recipes — merged (the succeeded close) and binned (the
+    // discarded close) — are closed receipts for every Gru-facing reader.
+    for (const terminal of ['merged', 'binned'] as const) {
+      const dir = tmpDir();
+      let receiptId = '';
+      {
+        const first = boot({ dir, wakeMode: 'never' });
+        first.api.addJob({ id: 'job-terminal', repo: 'r', title: 'Terminal job', briefing: 'b' });
+        first.api.setJobStatus('job-terminal', 'working');
+        first.api.registerAgent({ id: 'minion-terminal', role: 'minion', jobId: 'job-terminal' });
+        const row = first.notifications.post({
+          kind: 'review-escalation',
+          routing: 'action-required',
+          severity: 'error',
+          title: 'Round INCOMPLETE',
+          agentId: 'minion-terminal',
+        });
+        receiptId = row.id;
+        if (terminal === 'merged') {
+          first.api.setJobStatus('job-terminal', 'delivered');
+          first.api.setJobStatus('job-terminal', 'in-review');
+          first.api.setJobStatus('job-terminal', 'merged');
+        } else {
+          first.api.setAgentState('minion-terminal', 'idle'); // discard requires no live producer
+          first.api.setJobStatus('job-terminal', 'binned');
+        }
+      }
+      const rig = boot({ dir, wakeMode: 'action-required', wakeMinIntervalMs: 0 });
+      const injection = rig.awareness.prepare('chat');
+      // Labeled as a receipt under its own section, never as machine
+      // attention that reads like live work.
+      expect(injection?.text, terminal).toContain('Closed receipts (no action required; kept for reference):');
+      expect(injection?.text, terminal).toContain(`[${receiptId}]`);
+      expect(injection?.text, terminal).not.toContain('Action required (unacknowledged):');
+      // The boot backlog never seeded it: with a zero interval a seeded row
+      // would have fired a wake turn through the sink.
+      expect(rig.woke, terminal).toHaveLength(0);
     }
-    const rig = boot({ dir, wakeMode: 'action-required', wakeMinIntervalMs: 0 });
-    const injection = rig.awareness.prepare('chat');
-    // Labeled as a receipt under its own section, never as machine
-    // attention that reads like live work.
-    expect(injection?.text).toContain('Closed receipts (no action required; kept for reference):');
-    expect(injection?.text).toContain(`[${receiptId}]`);
-    expect(injection?.text).not.toContain('Action required (unacknowledged):');
-    // The boot backlog never seeded it: with a zero interval a seeded row
-    // would have fired a wake turn through the sink.
-    expect(rig.woke).toHaveLength(0);
   });
 });
 
@@ -1222,8 +1241,13 @@ describe('gru awareness — passive queue rotation (GH-109)', () => {
     const again = rig.awareness.prepare();
     expect(again?.notificationIds).toEqual(first?.notificationIds);
     expect(again?.text).toBe(first?.text);
-    // Nothing was delivered: no rotation was consumed or persisted.
-    expect(existsSync(join(rig.dir, AWARENESS_STATE_NAME))).toBe(false);
+    // Nothing was delivered: no rotation was consumed or persisted. (Boot
+    // writes only the GH-111 digest baseline: cursor 0, offsets absent.)
+    const booted = JSON.parse(readFileSync(join(rig.dir, AWARENESS_STATE_NAME), 'utf-8')) as {
+      coveredThroughSeq: number; attention?: { machineOffset: number; ownerOffset: number };
+    };
+    expect(booted.coveredThroughSeq).toBe(0);
+    expect(booted.attention).toEqual({ machineOffset: 0, ownerOffset: 0 });
     rig.awareness.commit(first!);
     const persisted = JSON.parse(readFileSync(join(rig.dir, AWARENESS_STATE_NAME), 'utf-8')) as {
       attention?: { machineOffset: number; ownerOffset: number };
@@ -2113,5 +2137,882 @@ describe('gru awareness — wake rework review fixes (issue #219)', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+
+describe('GH-305 mailbox reconciliation through existing awareness gates', () => {
+  function mailboxRig(mode: NotifyWakeMode = 'action-required', count = 0, minSeverity: WakeMinSeverity = 'info') {
+    const dir = tmpDir();
+    const db = new LedgerDb(dir);
+    const bus = new EventBus();
+    const api = new LedgerApi(db.handle, { bus });
+    for (let index = 0; index < count; index += 1) {
+      api.addJob({ id: `mail-${index.toString().padStart(3, '0')}`, repo: 'r', title: `mail ${index}` });
+      api.setJobStatus(`mail-${index.toString().padStart(3, '0')}`, 'blocked');
+    }
+    const mailbox = new GruMailbox(api);
+    const awareness = new GruAwareness({ dir, ledger: api, bus, mailbox, mailboxReconcileIntervalMs: 1000, wakeMode: mode, wakeMinIntervalMs: 0, wakeMinSeverity: minSeverity });
+    const delivered: string[] = [];
+    let turns = 0;
+    const receive = () => {
+      const injection = awareness.prepare('wake');
+      if (injection === null) throw new Error('mailbox wake without context');
+      delivered.push(...(injection.notificationIds ?? []));
+      turns += 1;
+      awareness.commit(injection, 'wake');
+      awareness.noteWakeOutcome(true, undefined, injection);
+    };
+    return { dir, api, mailbox, awareness, delivered, receive, turns: () => turns,
+      close: () => { awareness.dispose(); db.close(); } };
+  }
+
+  it('recovers startup backlog larger than a page fairly and delivery never resolves jobs', () => {
+    vi.useFakeTimers();
+    const rig = mailboxRig('action-required', 61);
+    try {
+      rig.awareness.setWakeSink(rig.receive);
+      expect(new Set(rig.delivered).size).toBe(50);
+      vi.advanceTimersByTime(1000);
+      expect(new Set(rig.delivered).size).toBe(61);
+      const turns = rig.turns();
+      vi.advanceTimersByTime(5000);
+      expect(rig.turns()).toBe(turns);
+      expect(rig.mailbox.snapshot().counts.needsGru).toBe(61);
+      expect(rig.api.listJobs().every((job) => job.status === 'blocked')).toBe(true);
+      expect(rig.api.listNotifications()).toHaveLength(0);
+      const receiptIds = rig.mailbox.snapshot().items.map((item) => item.receipt?.deliveryId);
+      expect(receiptIds.every((id) => typeof id === 'string')).toBe(true);
+    } finally { rig.close(); vi.useRealTimers(); }
+  });
+
+  it('a timer repairs missed events without a browser and events coalesce while Gru is busy', () => {
+    vi.useFakeTimers();
+    const rig = mailboxRig();
+    try {
+      let requests = 0;
+      rig.awareness.setWakeSink(() => { requests += 1; });
+      rig.api.addJob({ id: 'missed', repo: 'r', title: 'missed event' });
+      rig.api.setJobStatus('missed', 'blocked');
+      // Simulate event loss: do not release the zero-delay callback until the interval.
+      vi.advanceTimersByTime(1000);
+      expect(requests).toBe(1);
+      rig.api.addJob({ id: 'trailing', repo: 'r', title: 'arrived while busy' });
+      rig.api.setJobStatus('trailing', 'blocked');
+      vi.advanceTimersByTime(1000);
+      expect(requests).toBe(1);
+      const injection = rig.awareness.prepare('wake')!;
+      expect(injection.text).toContain('job:missed');
+      expect(injection.text).toContain('blocked');
+      expect(injection.text).toContain('needs-gru');
+      rig.awareness.noteWakeOutcome(true, undefined, injection);
+      expect(requests).toBe(2);
+      const trailing = rig.awareness.prepare('wake')!;
+      expect(trailing.text).toContain('job:trailing');
+      rig.awareness.noteWakeOutcome(true, undefined, trailing);
+      vi.advanceTimersByTime(1000);
+      expect(requests).toBe(2);
+    } finally { rig.close(); vi.useRealTimers(); }
+  });
+
+  it('empty mailbox costs no turns; passive-only mode durably explains admission deferral', () => {
+    vi.useFakeTimers();
+    const rig = mailboxRig('never');
+    try {
+      rig.awareness.setWakeSink(rig.receive);
+      vi.advanceTimersByTime(1000);
+      expect(rig.turns()).toBe(0);
+      rig.api.addJob({ id: 'held', repo: 'r', title: 'owner held' });
+      rig.api.setJobStatus('held', 'blocked');
+      vi.advanceTimersByTime(1000);
+      expect(rig.turns()).toBe(0);
+      expect(rig.api.latestEventOfKind('gru.wake-deferred')?.payload).toMatchObject({ reason: 'mode' });
+      expect(rig.awareness.prepare()?.text).toContain('job:held');
+      for (let index = 0; index < 60; index += 1) {
+        const id = `deferred-${index}`;
+        rig.api.addJob({ id, repo: 'r', title: id });
+        rig.api.setJobStatus(id, 'blocked');
+      }
+      vi.advanceTimersByTime(3000);
+      const deferred = rig.api.listEventsAfter(0, { kinds: ['gru.wake-deferred'], limit: 500 });
+      expect(new Set(deferred.map((event) => (event.payload as { notification_id: string }).notification_id)).size).toBe(61);
+      expect(rig.turns()).toBe(0);
+    } finally { rig.close(); vi.useRealTimers(); }
+  });
+
+  it('an oversized thread gets an explicit budget deferral and cannot hide smaller mailbox work', () => {
+    vi.useFakeTimers();
+    const rig = mailboxRig();
+    try {
+      rig.api.addJob({ id: 'a-large', repo: 'r', title: 'many reason bases' });
+      rig.api.setJobStatus('a-large', 'blocked');
+      for (let index = 0; index < 80; index += 1) rig.api.recordBlockedObservation('a-large', {
+        logicalStep: 'operation', category: { kind: 'unknown' }, incidentKey: `reason-${index}-${'x'.repeat(80)}`, observedAtSeq: rig.api.latestEventSeq(),
+      });
+      rig.api.addJob({ id: 'z-small', repo: 'r', title: 'must receive coverage' });
+      rig.api.setJobStatus('z-small', 'blocked');
+      let receivedSmall = false;
+      rig.awareness.setWakeSink(() => {
+        const injection = rig.awareness.prepare('wake');
+        if (injection === null) return;
+        receivedSmall ||= injection.text.includes('job:z-small');
+        rig.awareness.noteWakeOutcome(true, undefined, injection);
+      });
+      expect(receivedSmall).toBe(true);
+      expect(rig.mailbox.snapshot().items.find((item) => item.jobId === 'z-small')?.receipt).not.toBeNull();
+      expect(rig.mailbox.snapshot().items.find((item) => item.jobId === 'a-large')?.receipt).toBeNull();
+      expect(rig.api.listEventsAfter(0, { kinds: ['gru.wake-deferred'], limit: 100 }).some((event) => (event.payload as { reason: string }).reason === 'context-budget')).toBe(true);
+    } finally { rig.close(); vi.useRealTimers(); }
+  });
+
+  it('preserves all-mode owner routing and the configured severity admission floor', () => {
+    vi.useFakeTimers();
+    const all = mailboxRig('all');
+    const errorsOnly = mailboxRig('action-required', 0, 'error');
+    try {
+      all.awareness.setWakeSink(all.receive);
+      all.api.recordNotification({ id: 'owner-notice', kind: 'owner-question', title: 'owner alone decides', routing: 'needs-owner', severity: 'info' });
+      vi.advanceTimersByTime(0);
+      expect(all.turns()).toBe(1);
+      expect(all.mailbox.snapshot().items).toHaveLength(0);
+      expect(all.api.getNotification('owner-notice')?.ackedAt).toBeNull();
+      errorsOnly.awareness.setWakeSink(errorsOnly.receive);
+      errorsOnly.api.addJob({ id: 'findings', repo: 'r', title: 'information-level ruling' });
+      errorsOnly.api.recordBlockedObservation('findings', { logicalStep: 'operation', category: { kind: 'unknown' }, observedAtSeq: errorsOnly.api.latestEventSeq(), nextAction: { kind: 'gru-decision', decision: 'inspect findings' } });
+      vi.advanceTimersByTime(1000);
+      expect(errorsOnly.turns()).toBe(0);
+      expect(errorsOnly.api.latestEventOfKind('gru.wake-deferred')?.payload).toMatchObject({ reason: 'severity' });
+    } finally { all.close(); errorsOnly.close(); vi.useRealTimers(); }
+  });
+
+  it('recovers receipt debt without re-prompting; restart preserves grace then rechecks unhandled work', () => {
+    vi.useFakeTimers();
+    const rig = mailboxRig('action-required', 1);
+    const write = vi.spyOn(rig.api, 'recordCapturedMailboxReceipt').mockImplementationOnce(() => { throw new Error('temporary receipt write failure'); });
+    try {
+      rig.awareness.setWakeSink(rig.receive);
+      expect(rig.turns()).toBe(1);
+      expect(rig.mailbox.snapshot().items[0]?.receipt).toBeNull();
+      vi.advanceTimersByTime(5000);
+      expect(rig.turns()).toBe(1);
+      expect(rig.mailbox.snapshot().items[0]?.receipt).not.toBeNull();
+      rig.awareness.dispose();
+      const recovered = new GruAwareness({ dir: rig.dir, ledger: rig.api, mailbox: rig.mailbox, mailboxReconcileIntervalMs: 1000, wakeMode: 'action-required', wakeMinIntervalMs: 0 });
+      try {
+        let requests = 0;
+        recovered.setWakeSink(() => { requests += 1; });
+        vi.advanceTimersByTime(294999);
+        expect(requests).toBe(0);
+        vi.advanceTimersByTime(1);
+        expect(requests).toBe(1);
+      } finally { recovered.dispose(); }
+    } finally { write.mockRestore(); rig.close(); vi.useRealTimers(); }
+  });
+});
+
+describe('GH-305 awareness repair regressions', () => {
+  function rig(mode: NotifyWakeMode = 'action-required', options: Partial<ConstructorParameters<typeof GruAwareness>[0]> = {}) {
+    const dir = tmpDir();
+    const db = new LedgerDb(dir);
+    const bus = new EventBus();
+    const api = new LedgerApi(db.handle, { bus });
+    const mailbox = new GruMailbox(api);
+    const awareness = new GruAwareness({ dir, ledger: api, mailbox, bus, wakeMode: mode, wakeMinIntervalMs: 0, mailboxReconcileIntervalMs: 1000, ...options });
+    const block = (id = 'j', title = id) => { api.addJob({ id, repo: 'r', title }); api.setJobStatus(id, 'blocked'); };
+    return { dir, db, bus, api, mailbox, awareness, block, close: () => { awareness.dispose(); db.close(); } };
+  }
+
+  it('G06 captures rendered historical evidence before a racing basis change', () => {
+    vi.useFakeTimers();
+    const r = rig('never');
+    try {
+      r.block();
+      const before = r.mailbox.snapshot().items[0]!;
+      const injection = r.awareness.prepare()!;
+      r.api.recordBlockedObservation('j', { logicalStep: 'operation', category: { kind: 'unknown' }, incidentKey: 'new', observedAtSeq: r.api.latestEventSeq() });
+      r.awareness.commit(injection);
+      const event = r.api.latestEventOfKind('mailbox.received');
+      expect(event?.payload).toMatchObject({ id: before.id, receipt: { basis: before.basis, attentionKey: before.attentionKey } });
+      expect(r.mailbox.attentionPage(10)).toHaveLength(1);
+    } finally { r.close(); vi.useRealTimers(); }
+  });
+
+  it('F02 parks accepted captures before unrelated malformed source reconciliation', () => assertUnavailableAcceptanceRecovery(false));
+  it('F02 restart recovers parked acceptance after malformed source repair at original time', () => assertUnavailableAcceptanceRecovery(true));
+  function assertUnavailableAcceptanceRecovery(restart: boolean): void {
+    vi.useFakeTimers();
+    const r = rig();
+    try {
+      r.block();
+      const sink = vi.fn(); r.awareness.setWakeSink(sink);
+      const injection = r.awareness.prepare('wake')!;
+      const acceptedAt = new Date(Date.now()).toISOString();
+      r.api.addJob({ id: 'unrelated', repo: 'r', title: 'unrelated source' });
+      r.api.appendCustomEvent({ kind: 'github.branch-state', jobId: 'unrelated', payload: [] });
+      expect(() => r.awareness.noteWakeOutcome(true, undefined, injection)).not.toThrow();
+      const state = JSON.parse(readFileSync(join(r.dir, AWARENESS_STATE_NAME), 'utf8'));
+      expect(state.wake.unreceipted).toHaveLength(1);
+      expect(state.wake.unreceipted[0]).toMatchObject({ deliveries: injection.mailboxDeliveries, at: Date.parse(acceptedAt), source: 'wake' });
+      expect(r.api.latestEventOfKind('mailbox.received')).toBeNull();
+      if (restart) r.awareness.dispose();
+      r.api.appendCustomEvent({ kind: 'github.branch-state', jobId: 'unrelated', payload: { pr_url: null, pr_open: null, mergeable_state: null, sha: null } });
+      const recovered = restart ? new GruAwareness({ dir: r.dir, ledger: r.api, mailbox: r.mailbox, wakeMinIntervalMs: 0 }) : r.awareness;
+      try {
+        const recoveredSink = vi.fn();
+        if (restart) recovered.setWakeSink(recoveredSink);
+        vi.advanceTimersByTime(5000);
+        expect(r.api.latestEventOfKind('mailbox.received')?.payload).toMatchObject({ receipt: { receivedAt: acceptedAt, basis: injection.mailboxDeliveries![0]!.basis } });
+        expect(JSON.parse(readFileSync(join(r.dir, AWARENESS_STATE_NAME), 'utf8')).wake.unreceipted).toBeUndefined();
+        expect(sink).toHaveBeenCalledTimes(1);
+        expect(recoveredSink).not.toHaveBeenCalled();
+        expect(r.mailbox.snapshot().items[0]?.receipt?.receivedAt).toBe(acceptedAt);
+      } finally { if (restart) recovered.dispose(); }
+    } finally { r.close(); vi.useRealTimers(); }
+  }
+
+  it('F04 mailbox recovery blocks create one writable owner notification and chat notice', () => {
+    vi.useFakeTimers();
+    const notice = vi.fn();
+    const r = rig('action-required', { onFollowUpPosted: notice });
+    try {
+      r.block();
+      r.awareness.setWakeSink(() => {});
+      r.awareness.noteWakeBlocked('native compaction recovery requires owner restart');
+      const ownerRows = r.api.listNotifications({ routing: 'needs-owner' });
+      expect(ownerRows).toHaveLength(1);
+      expect(ownerRows[0]).toMatchObject({ title: 'Gru wake blocked: j', detail: expect.stringContaining('native compaction recovery requires owner restart'), ackedAt: null, resolvedAt: null });
+      expect(ownerRows[0]!.id).not.toContain('\u0000');
+      expect(ownerRows[0]!.kind).not.toContain('\u0000');
+      expect(notice).toHaveBeenCalledTimes(1);
+      vi.advanceTimersByTime(5000);
+      r.awareness.noteWakeBlocked('native compaction recovery requires owner restart');
+      expect(r.api.listNotifications({ routing: 'needs-owner' })).toHaveLength(1);
+      expect(notice).toHaveBeenCalledTimes(1);
+      expect(r.api.getJob('j')?.status).toBe('blocked');
+      expect(r.mailbox.snapshot().items[0]?.receipt).toBeNull();
+    } finally { r.close(); vi.useRealTimers(); }
+  });
+
+  it('G07 passive acceptance cancels an active queued wake at final admission', () => {
+    const r = rig();
+    try {
+      r.block();
+      let requests = 0;
+      r.awareness.setWakeSink(() => { requests += 1; });
+      expect(requests).toBe(1);
+      r.awareness.commit(r.awareness.prepare()!);
+      expect(r.awareness.admitWake()).toBe(false);
+      expect(r.api.latestEventOfKind('gru.wake')).toBeNull();
+    } finally { r.close(); }
+  });
+
+  it('G08 durably traverses a full oversized passive prefix without false receipts', () => {
+    const r = rig('never', { limits: { maxActionNotes: 2, maxBytes: 2200 } });
+    try {
+      r.block('a', 'x'.repeat(5000)); r.block('b', 'x'.repeat(5000)); r.block('z', 'small tail');
+      r.awareness.commit(r.awareness.prepare()!);
+      r.awareness.dispose();
+      const next = new GruAwareness({ dir: r.dir, ledger: r.api, mailbox: r.mailbox, wakeMode: 'never', limits: { maxActionNotes: 2, maxBytes: 2200 } });
+      try {
+        const tail = next.prepare()!;
+        expect(tail.text).toContain('small tail');
+        next.commit(tail);
+        const items = r.mailbox.snapshot().items;
+        expect(items.find((item) => item.jobId === 'z')?.receipt).not.toBeNull();
+        expect(items.filter((item) => item.jobId !== 'z').every((item) => item.receipt === null)).toBe(true);
+      } finally { next.dispose(); }
+    } finally { r.close(); }
+  });
+
+  it('G10/G11 source Silas rows retain shadow classification and notification linkage', () => {
+    vi.useFakeTimers();
+    const decide = vi.fn().mockResolvedValue({});
+    const r = rig('action-required', { decisions: { decide }, readyForSurface: () => true, modeForSurface: () => 'shadow' });
+    try {
+      r.api.recordNotification({ id: 'mailbox:real-source', kind: 'silas.escalation', routing: 'action-required', severity: 'error', title: 'Silas asks' });
+      r.awareness.setWakeSink(() => { const injection = r.awareness.prepare('wake')!; r.awareness.noteWakeOutcome(true, undefined, injection); });
+      expect(decide).toHaveBeenCalledTimes(1);
+      expect(r.api.latestEventOfKind('gru.wake')?.payload).toMatchObject({ notification_ids: ['mailbox:real-source'], notification_count: 1, mailbox_count: 1 });
+    } finally { r.close(); vi.useRealTimers(); }
+  });
+
+  it('G10 preserves the off shadow spend gate', () => assertShadowSpendGate('off'));
+  it('G10 preserves the enforce shadow spend gate', () => assertShadowSpendGate('enforce'));
+  function assertShadowSpendGate(mode: 'off' | 'enforce'): void {
+    const decide = vi.fn().mockResolvedValue({});
+    const r = rig('action-required', { decisions: { decide }, readyForSurface: () => true, modeForSurface: () => mode });
+    try {
+      r.api.recordNotification({ id: 'source', kind: 'silas.escalation', routing: 'action-required', severity: 'error', title: 'ask' });
+      r.awareness.setWakeSink(() => r.awareness.noteWakeOutcome(true, undefined, r.awareness.prepare('wake')!));
+      expect(decide).not.toHaveBeenCalled();
+    } finally { r.close(); }
+  }
+
+  it('G12 machine closure still clears legacy follow-ups and failure state', () => {
+    const r = rig();
+    try {
+      r.api.recordNotification({ id: 'old', kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'old' });
+      r.api.recordNotification({ id: 'gru-follow-up:old', kind: 'gru.attention-unresolved.old', routing: 'needs-owner', severity: 'error', title: 'legacy' });
+      r.api.disposeMachineNotification('old', 'handled');
+      expect(r.api.getNotification('gru-follow-up:old')?.resolvedAt).not.toBeNull();
+    } finally { r.close(); }
+  });
+
+  it('G15 genuine exact synthetic-key collisions retain separate delivery domains', () => {
+    const r = rig('all');
+    try {
+      r.block();
+      const key = r.mailbox.attentionRows()[0]!.id;
+      r.api.recordNotification({ id: key, kind: 'owner.notice', routing: 'needs-owner', severity: 'error', title: 'genuine collision', detail: 'not JSON' });
+      const injection = r.awareness.prepare()!;
+      expect(injection.text).toContain('genuine collision');
+      expect(injection.text).toContain('job:j');
+      r.awareness.commit(injection);
+      expect(r.api.getNotification(key)?.ackedAt).toBeNull();
+      expect(r.mailbox.snapshot().items[0]?.receipt).not.toBeNull();
+    } finally { r.close(); }
+  });
+
+  it('G16 coalesces actual silas.directive-failed events immediately', () => assertEventCoalescing('silas.directive-failed'));
+  it('G16 coalesces actual supervision.escalated events immediately', () => assertEventCoalescing('supervision.escalated'));
+  function assertEventCoalescing(kind: string): void {
+    vi.useFakeTimers();
+    const r = rig();
+    try {
+      r.awareness.setWakeSink(() => {});
+      const spy = vi.spyOn(r.mailbox, 'admissionRows');
+      r.api.appendCustomEvent({ kind, payload: {}, agentId: 'worker' });
+      r.api.appendCustomEvent({ kind, payload: {}, agentId: 'worker' });
+      vi.advanceTimersByTime(0);
+      expect(spy).toHaveBeenCalledTimes(1);
+    } finally { r.close(); vi.useRealTimers(); }
+  }
+
+  it('G18 startup drops legacy machine seeds suppressed by canonical waiting', () => {
+    const r = rig();
+    try {
+      r.block();
+      r.api.registerAgent({ id: 'worker', role: 'minion', jobId: 'j' });
+      r.api.recordNotification({ agentId: 'worker', id: 'legacy', kind: 'silas.escalation', routing: 'action-required', severity: 'error', title: 'legacy' });
+      const item = r.mailbox.snapshot().items[0]!;
+      r.mailbox.disposition(item.id, { basis: item.basis, state: 'waiting', owner: 'owner', detail: 'owner review', dependency: 'owner', recheckAt: new Date(Date.now() + 600000).toISOString(), references: item.references });
+      r.awareness.dispose();
+      writeFileSync(join(r.dir, AWARENESS_STATE_NAME), JSON.stringify({ coveredThroughSeq: 0, wake: { version: 2, woken: [], pending: ['legacy'], lastFiredAt: null } }));
+      const next = new GruAwareness({ dir: r.dir, ledger: r.api, mailbox: r.mailbox, wakeMinIntervalMs: 0 });
+      try { const sink = vi.fn(); next.setWakeSink(sink); expect(sink).not.toHaveBeenCalled(); } finally { next.dispose(); }
+    } finally { r.close(); }
+  });
+
+  it('G19 bounded retry exhaustion survives restart and unchanged-basis grace incarnations', () => {
+    vi.useFakeTimers();
+    const r = rig();
+    try {
+      r.block();
+      let turns = 0;
+      r.awareness.setWakeSink(() => { const injection = r.awareness.prepare('wake')!; turns += 1; r.awareness.noteWakeOutcome(true, undefined, injection); r.awareness.noteWakeTurnFailure('broken', injection); });
+      vi.advanceTimersByTime(10000);
+      expect(turns).toBe(3);
+      expect(r.api.listNotifications({ routing: 'needs-owner' })).toHaveLength(1);
+      // Restart immediately, before a later sweep can mask a missing persistence write.
+      expect(Object.values(JSON.parse(readFileSync(join(r.dir, AWARENESS_STATE_NAME), 'utf8')).wake.wakeFailures)).toEqual([3]);
+      r.awareness.dispose();
+      const next = new GruAwareness({ dir: r.dir, ledger: r.api, mailbox: r.mailbox, wakeMinIntervalMs: 0 });
+      try {
+        const sink = vi.fn(); next.setWakeSink(sink);
+        vi.advanceTimersByTime(600000);
+        expect(sink).not.toHaveBeenCalled();
+        expect(r.api.listNotifications({ routing: 'needs-owner' })).toHaveLength(1);
+      } finally { next.dispose(); }
+    } finally { r.close(); vi.useRealTimers(); }
+  });
+
+  it('G17 retires stale failure incarnations while preserving active bounded retry debt', () => {
+    vi.useFakeTimers();
+    const r = rig();
+    try {
+      r.block();
+      r.awareness.setWakeSink(() => { const injection = r.awareness.prepare('wake')!; r.awareness.noteWakeOutcome(true, undefined, injection); r.awareness.noteWakeTurnFailure('failed', injection); });
+      const before = JSON.parse(readFileSync(join(r.dir, AWARENESS_STATE_NAME), 'utf8'));
+      expect(Object.values(before.wake.wakeFailures)).toEqual([1]);
+      r.awareness.dispose();
+      before.wake.woken.push('mailbox:stale-incarnation');
+      before.wake.wakeFailures['mailbox:stale-incarnation'] = 2;
+      writeFileSync(join(r.dir, AWARENESS_STATE_NAME), JSON.stringify(before));
+      const next = new GruAwareness({ dir: r.dir, ledger: r.api, mailbox: r.mailbox, wakeMinIntervalMs: 0 });
+      try {
+        next.setWakeSink(() => {});
+        const after = JSON.parse(readFileSync(join(r.dir, AWARENESS_STATE_NAME), 'utf8'));
+        expect(after.wake.wakeFailures['mailbox:stale-incarnation']).toBeUndefined();
+        expect(Object.values(after.wake.wakeFailures)).toEqual([1]);
+        expect(next.admitWake()).toBe(true);
+      } finally { next.dispose(); }
+    } finally { r.close(); vi.useRealTimers(); }
+  });
+
+  it('G06/G27 wake debt recovers historical captures on restart without moving original time', () => {
+    vi.useFakeTimers();
+    const r = rig();
+    try {
+      r.block();
+      const before = r.mailbox.snapshot().items[0]!;
+      const acceptedAt = new Date().toISOString();
+      const write = vi.spyOn(r.api, 'recordCapturedMailboxReceipt').mockImplementation(() => { throw new Error('receipt unavailable'); });
+      r.awareness.setWakeSink(() => r.awareness.noteWakeOutcome(true, undefined, r.awareness.prepare('wake')!));
+      r.awareness.dispose();
+      r.api.recordBlockedObservation('j', { logicalStep: 'operation', category: { kind: 'unknown' }, incidentKey: 'changed-source', observedAtSeq: r.api.latestEventSeq() });
+      vi.advanceTimersByTime(240000);
+      write.mockRestore();
+      const next = new GruAwareness({ dir: r.dir, ledger: r.api, mailbox: new GruMailbox(r.api), wakeMinIntervalMs: 0 });
+      try {
+        const sink = vi.fn(); next.setWakeSink(sink);
+        const event = r.api.latestEventOfKind('mailbox.received');
+        expect(event?.payload).toMatchObject({ receipt: { basis: before.basis, attentionKey: before.attentionKey, receivedAt: acceptedAt } });
+        expect(r.mailbox.snapshot().items[0]?.receipt).toBeNull();
+        expect(sink).toHaveBeenCalledTimes(1); // only genuinely changed evidence may request a new turn
+      } finally { next.dispose(); }
+    } finally { r.close(); vi.useRealTimers(); }
+  });
+
+  it('conservative legacy migration preserves unchanged compatible failed-turn retries', () => {
+    const r = rig();
+    try {
+      r.block();
+      const row = r.mailbox.attentionRows()[0]!;
+      const at = Date.now();
+      r.mailbox.receiptForKeys([row.id], 'wake', 'legacy-delivery');
+      r.awareness.dispose();
+      writeFileSync(join(r.dir, AWARENESS_STATE_NAME), JSON.stringify({ coveredThroughSeq: 0, wake: { version: 2, woken: [], pending: [row.id], wakeFailures: { [row.id]: 1 }, lastFiredAt: at } }));
+      const next = new GruAwareness({ dir: r.dir, ledger: r.api, mailbox: r.mailbox, wakeMinIntervalMs: 0 });
+      try { const sink = vi.fn(); next.setWakeSink(sink); expect(sink).toHaveBeenCalledTimes(1); expect(next.admitWake()).toBe(true); } finally { next.dispose(); }
+    } finally { r.close(); }
+  });
+
+  it('legacy changed-source receipt debt remains parked with an actionable named error', () => {
+    const logs: string[] = [];
+    const r = rig('action-required', { log: (_level, message, fields) => logs.push(message + ' ' + String(fields?.error)) });
+    try {
+      r.block();
+      const key = r.mailbox.attentionRows()[0]!.id;
+      r.awareness.dispose();
+      r.api.recordBlockedObservation('j', { logicalStep: 'operation', category: { kind: 'unknown' }, incidentKey: 'changed', observedAtSeq: r.api.latestEventSeq() });
+      writeFileSync(join(r.dir, AWARENESS_STATE_NAME), JSON.stringify({ coveredThroughSeq: 0, wake: { version: 2, woken: [key], lastFiredAt: Date.now(), unreceipted: [{ id: 'old-batch', ids: [key], at: Date.now() }] } }));
+      const next = new GruAwareness({ dir: r.dir, ledger: r.api, mailbox: r.mailbox, wakeMinIntervalMs: 0, log: (_level, message, fields) => logs.push(message + ' ' + String(fields?.error)) });
+      try {
+        const sink = vi.fn(); next.setWakeSink(sink);
+        expect(logs.join('\n')).toContain('MailboxDeliveryRecoveryError');
+        expect(logs.join('\n')).toContain('old-batch');
+        expect(logs.join('\n')).toContain('inspect');
+        expect(JSON.parse(readFileSync(join(r.dir, AWARENESS_STATE_NAME), 'utf8')).wake.unreceipted).toHaveLength(1);
+        expect(r.api.latestEventOfKind('gru.wake')).toBeNull();
+        expect(sink).toHaveBeenCalledTimes(1); // changed source is not suppressed by unreconstructable historical debt
+      } finally { next.dispose(); }
+    } finally { r.close(); }
+  });
+
+  it('G15 wake and restart keep exact-collision source linkage in separate transport domains', () => {
+    const r = rig('all');
+    try {
+      r.block();
+      const key = r.mailbox.attentionRows()[0]!.id;
+      r.api.recordNotification({ id: key, kind: 'owner.notice', routing: 'needs-owner', severity: 'error', title: 'real collision', detail: 'ordinary text' });
+      const texts: string[] = [];
+      r.awareness.setWakeSink(() => { const injection = r.awareness.prepare('wake')!; texts.push(injection.text); r.awareness.noteWakeOutcome(true, undefined, injection); });
+      expect(texts.some((text) => text.includes('job:j'))).toBe(true);
+      expect(texts.some((text) => text.includes('real collision'))).toBe(true);
+      const receipts = r.api.listEventsAfter(0, { kinds: ['gru.wake'], limit: 10 });
+      expect(receipts.some((event) => (event.payload as { notification_ids: string[] }).notification_ids.includes(key))).toBe(true);
+      expect(receipts.some((event) => (event.payload as { mailbox_keys?: string[] }).mailbox_keys?.includes(key))).toBe(true);
+      r.awareness.dispose();
+      const next = new GruAwareness({ dir: r.dir, ledger: r.api, mailbox: r.mailbox, wakeMode: 'all', wakeMinIntervalMs: 0 });
+      try { const sink = vi.fn(); next.setWakeSink(sink); expect(sink).not.toHaveBeenCalled(); } finally { next.dispose(); }
+    } finally { r.close(); }
+  });
+
+  it('legacy exact-collision receipt debt is not falsely declared recovered', () => {
+    const r = rig('all');
+    try {
+      r.block();
+      const key = r.mailbox.attentionRows()[0]!.id;
+      r.api.recordNotification({ id: key, kind: 'owner.notice', routing: 'needs-owner', severity: 'error', title: 'real collision' });
+      r.awareness.dispose();
+      writeFileSync(join(r.dir, AWARENESS_STATE_NAME), JSON.stringify({ coveredThroughSeq: 0, wake: { version: 2, woken: [key], lastFiredAt: Date.now(), unreceipted: [{ id: 'ambiguous', ids: [key], at: Date.now() }] } }));
+      const logs: string[] = [];
+      const next = new GruAwareness({ dir: r.dir, ledger: r.api, mailbox: r.mailbox, wakeMode: 'all', wakeMinIntervalMs: 0, log: (_level, message, fields) => logs.push(message + ' ' + String(fields?.error)) });
+      try {
+        next.setWakeSink(() => {});
+        expect(logs.join('\n')).toContain('MailboxDeliveryRecoveryError');
+        expect(r.api.latestEventOfKind('gru.wake')).toBeNull();
+        expect(r.mailbox.snapshot().items[0]?.receipt).toBeNull();
+        expect(JSON.parse(readFileSync(join(r.dir, AWARENESS_STATE_NAME), 'utf8')).wake.unreceipted).toHaveLength(1);
+      } finally { next.dispose(); }
+    } finally { r.close(); }
+  });
+
+  it('G15 rejects a NUL mailbox-prefix SQLite identity before any write', () => assertNotificationIdentity('\u0000mailbox:real'));
+  it('G15 rejects a NUL notification-prefix SQLite identity before any write', () => assertNotificationIdentity('\u0000notification:real'));
+  it('G15 rejects a NUL failure-prefix SQLite identity before any write', () => assertNotificationIdentity('\u0000mailbox-failure:real'));
+  it('G15 rejects an embedded NUL SQLite identity before any write', () => assertNotificationIdentity('real\u0000suffix'));
+  function assertNotificationIdentity(id: string): void {
+    const r = rig('all');
+    try {
+      const before = r.api.latestEventSeq();
+      expect(() => r.api.recordNotification({ id, kind: 'owner.notice', routing: 'needs-owner', severity: 'error', title: 'genuine' })).toThrow(/NUL.*SQLite/);
+      expect(r.api.latestEventSeq()).toBe(before);
+      expect(r.api.listNotifications()).toHaveLength(0);
+    } finally { r.close(); }
+  }
+
+  it('G07 passive delivery prunes rate-deferred mailbox attention without another turn', () => {
+    vi.useFakeTimers();
+    const r = rig('action-required', { wakeMinIntervalMs: 60000 });
+    try {
+      r.block('a');
+      let turns = 0;
+      r.awareness.setWakeSink(() => { turns += 1; r.awareness.noteWakeOutcome(true, undefined, r.awareness.prepare('wake')!); });
+      r.block('b');
+      vi.advanceTimersByTime(1000);
+      r.awareness.commit(r.awareness.prepare()!);
+      vi.advanceTimersByTime(60000);
+      expect(turns).toBe(1);
+      expect(r.mailbox.snapshot().items.every((item) => item.receipt !== null)).toBe(true);
+    } finally { r.close(); vi.useRealTimers(); }
+  });
+
+  it('G27 recovery of an older receipt never rolls back a newer wake rate budget', () => {
+    vi.useFakeTimers();
+    const r = rig('action-required', { wakeMinIntervalMs: 60000 });
+    try {
+      r.block('a');
+      const record = r.api.recordCapturedMailboxReceipt.bind(r.api);
+      const spy = vi.spyOn(r.api, 'recordCapturedMailboxReceipt').mockImplementation((delivery, ...args) => {
+        if (delivery.jobId === 'a') throw new Error('older receipt unavailable');
+        return record(delivery, ...args);
+      });
+      let turns = 0;
+      r.awareness.setWakeSink(() => { turns += 1; r.awareness.noteWakeOutcome(true, undefined, r.awareness.prepare('wake')!); });
+      r.block('b');
+      vi.advanceTimersByTime(60000);
+      expect(turns).toBe(2);
+      spy.mockRestore();
+      vi.advanceTimersByTime(5000);
+      r.block('c');
+      vi.advanceTimersByTime(1000);
+      expect(turns).toBe(2);
+      vi.advanceTimersByTime(54000);
+      expect(turns).toBe(3);
+    } finally { r.close(); vi.useRealTimers(); }
+  });
+
+  it('G26/G27 passive receipt debt survives restart with captured evidence and original time', () => {
+    vi.useFakeTimers();
+    const r = rig();
+    try {
+      r.block();
+      const acceptedAt = new Date().toISOString();
+      const receipt = vi.spyOn(r.api, 'recordCapturedMailboxReceipt').mockImplementation(() => { throw new Error('write unavailable'); });
+      r.awareness.commit(r.awareness.prepare()!);
+      r.awareness.dispose();
+      vi.advanceTimersByTime(240000);
+      receipt.mockRestore();
+      const next = new GruAwareness({ dir: r.dir, ledger: r.api, mailbox: r.mailbox, mailboxReconcileIntervalMs: 1000, wakeMinIntervalMs: 0 });
+      try {
+        const sink = vi.fn(); next.setWakeSink(sink);
+        expect(sink).not.toHaveBeenCalled();
+        expect(r.mailbox.snapshot().items[0]?.receipt?.receivedAt).toBe(acceptedAt);
+        vi.advanceTimersByTime(60000);
+        expect(sink).toHaveBeenCalledTimes(1);
+      } finally { next.dispose(); }
+    } finally { r.close(); vi.useRealTimers(); }
+  });
+});
+
+/**
+ * PR71 review follow-up queue (awareness). Each block names the issue it
+ * proves; the decisions (g7, g15) are recorded in docs/decisions.
+ */
+describe('GH-110 (g13): the morning digest is rendered or not consumed under the byte cap', () => {
+  function overnight(limits?: Partial<AwarenessLimits>): Rig {
+    vi.setSystemTime(new Date('2026-09-22T21:00:00Z'));
+    const rig = boot({ now: () => Date.now(), ...(limits !== undefined ? { limits } : {}) });
+    rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'a', to: 'b' } });
+    rig.awareness.commit(rig.awareness.prepare()!);
+    vi.setSystemTime(new Date('2026-09-23T07:00:00Z'));
+    rig.api.appendCustomEvent({ kind: 'gru.wake', payload: { notification_ids: ['n1'], count: 1 } });
+    return rig;
+  }
+
+  it('reserves digest budget so a full page of multibyte notes cannot spend the morning catch-up', () => {
+    vi.useFakeTimers();
+    try {
+      // Cap sized so a full 8-note page of multibyte notes would consume it:
+      // each rendered note line is 110 bytes and the two morning lines need
+      // 80, so without the reservation the digest lines miss the cap and are
+      // shed. Reserving instead sheds the note and keeps the catch-up.
+      const rig = overnight({ maxBytes: 1_000, maxActionNotes: 8 });
+      for (let i = 0; i < 8; i += 1) {
+        rig.notifications.post({
+          kind: `test.machine.${i}`, routing: 'action-required', severity: 'error',
+          title: '漢'.repeat(10),
+        });
+      }
+      const block = rig.awareness.prepare()!;
+      expect(Buffer.byteLength(block.text, 'utf8')).toBeLessThanOrEqual(1_000);
+      expect(block.text).toContain('While you were away');
+      expect(block.text).toContain('- fires: 1 wake delivered');
+      // The digest kept its bytes: the note page is the part that was shed.
+      expect(block.notificationIds).toHaveLength(7);
+      rig.awareness.commit(block);
+      rig.awareness.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('preserves the owner watermark when the digest could not be fully rendered', () => {
+    vi.useFakeTimers();
+    try {
+      // A cap too small for the digest itself: it cannot be reserved in full.
+      const rig = overnight({ maxBytes: 130 });
+      const first = rig.awareness.prepare()!;
+      expect(first.text).not.toContain('- fires: 1 wake delivered');
+      rig.awareness.commit(first);
+      // Not consumed: the digest is still owed on the next block.
+      rig.awareness.dispose();
+      const state = JSON.parse(readFileSync(join(rig.dir, AWARENESS_STATE_NAME), 'utf-8')) as {
+        digest: { lastOwnerAt: number };
+      };
+      expect(state.digest.lastOwnerAt).toBe(Date.parse('2026-09-22T21:00:00Z'));
+    } finally { vi.useRealTimers(); }
+  });
+});
+
+describe('GH-103 (g6): the staged-PRs line is limited to PRs linked during the away window', () => {
+  it('omits a PR open since before the owner left and lists one linked after', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-22T20:00:00Z'));
+      const rig = boot({ now: () => Date.now() });
+      rig.api.addJob({ id: 'j-old', repo: 'demo', title: 'Old PR' });
+      rig.api.setJobStatus('j-old', 'working');
+      rig.api.setJobPr('j-old', 'https://example.invalid/pr/old');
+      vi.setSystemTime(new Date('2026-09-22T21:00:00Z'));
+      rig.awareness.commit(rig.awareness.prepare()!); // owner leaves here
+      vi.setSystemTime(new Date('2026-09-23T07:00:00Z'));
+      rig.api.addJob({ id: 'j-new', repo: 'demo', title: 'New PR' });
+      rig.api.setJobStatus('j-new', 'working');
+      rig.api.setJobPr('j-new', 'https://example.invalid/pr/new');
+      const line = rig.awareness.prepare()?.text.split('\n').find((l) => l.startsWith('- staged PRs:')) ?? '';
+      expect(line).toContain('j-new');
+      expect(line).not.toContain('j-old');
+      rig.awareness.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+});
+
+describe('GH-104 (g7): Gru actions are labeled apart from passive board activity', () => {
+  function away(): Rig {
+    vi.setSystemTime(new Date('2026-09-22T21:00:00Z'));
+    const rig = boot({ now: () => Date.now() });
+    rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'a', to: 'b' } });
+    rig.awareness.commit(rig.awareness.prepare()!);
+    vi.setSystemTime(new Date('2026-09-23T07:00:00Z'));
+    return rig;
+  }
+
+  it('traffic alone reads as activity and never as Gru actions', () => {
+    vi.useFakeTimers();
+    try {
+      const rig = away();
+      rig.api.appendCustomEvent({ kind: 'job.delivered', jobId: 'j1', payload: { agentId: 'm1' } });
+      rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'b', to: 'c' } });
+      rig.api.appendCustomEvent({ kind: 'round.verdict', jobId: 'j1', payload: { verdict: 'approve' } });
+      const text = rig.awareness.prepare()!.text;
+      expect(text).toContain('- activity: 3 board events');
+      expect(text).not.toContain('actions');
+      expect(text).not.toContain('Gru disposition');
+      expect(text).not.toContain('Machine disposition');
+      rig.awareness.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('a machine disposition in the Gru role is an action; traffic plus disposition shows both lines', () => {
+    vi.useFakeTimers();
+    try {
+      const rig = away();
+      rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'b', to: 'c' } });
+      const alert = rig.notifications.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Fix' });
+      rig.api.disposeMachineNotification(alert.id, 'Repaired the lane', { credential: 'shared-bearer', declaredActor: 'gru' });
+      const text = rig.awareness.prepare()!.text;
+      expect(text).toContain('- activity: 1 board event');
+      expect(text).toContain('- Gru actions: 1 disposition');
+      expect(text.split('\n')).toContain(`- Machine disposition [${alert.id}]: Repaired the lane (declared actor: gru)`);
+      expect(text).toContain('(declared actor: gru)');
+      expect(text).not.toContain('Gru disposition');
+      rig.awareness.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+});
+
+describe('GH-111 (g15): the first-ever owner digest has a bounded install-time baseline', () => {
+  it('a fresh install that accumulated events gets a catch-up on the first owner turn after the gap', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-22T21:00:00Z'));
+      const dir = tmpDir();
+      const rig = boot({ dir, now: () => Date.now() });
+      vi.setSystemTime(new Date('2026-09-22T22:00:00Z'));
+      rig.api.appendCustomEvent({ kind: 'gru.wake', payload: { notification_ids: ['n1'], count: 1 } });
+      rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'a', to: 'b' } });
+      rig.awareness.dispose();
+      // Service restarts mid-night: the baseline is install time, not restart time.
+      vi.setSystemTime(new Date('2026-09-23T07:00:00Z'));
+      const restarted = boot({ dir, now: () => Date.now() });
+      const first = restarted.awareness.prepare()!;
+      expect(first.text).toContain('While you were away (since 2026-09-22T21:00:00.000Z)');
+      expect(first.text).toContain('- fires: 1 wake delivered');
+      expect(first.text).toContain('- activity: 1 board event');
+      restarted.awareness.commit(first);
+      // Consumed once; nothing replays.
+      restarted.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'b', to: 'c' } });
+      expect(restarted.awareness.prepare()?.text ?? '').not.toContain('While you were away');
+      restarted.awareness.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('stays quiet when the unattended interval is shorter than the gap', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-22T21:00:00Z'));
+      const rig = boot({ now: () => Date.now() });
+      vi.setSystemTime(new Date('2026-09-22T23:00:00Z'));
+      rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'a', to: 'b' } });
+      expect(rig.awareness.prepare()?.text ?? '').not.toContain('While you were away');
+      rig.awareness.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+});
+
+describe('GH-119 (g23): an accepted block-free owner turn records presence', () => {
+  it('advances the owner watermark without a digest or a cursor/wake change', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-22T21:00:00Z'));
+      const rig = boot({ now: () => Date.now() });
+      rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'a', to: 'b' } });
+      rig.awareness.commit(rig.awareness.prepare()!);
+      // Six hours later the owner talks; nothing is digestible, so no block.
+      vi.setSystemTime(new Date('2026-09-23T03:00:00Z'));
+      rig.api.appendCustomEvent({ kind: 'misc.noise', payload: {} });
+      expect(rig.awareness.prepare('chat')).toBeNull();
+      rig.awareness.recordOwnerPresence();
+      // Presence is durable and does not move the event cursor.
+      const state = JSON.parse(readFileSync(join(rig.dir, AWARENESS_STATE_NAME), 'utf-8')) as {
+        coveredThroughSeq: number; digest: { lastOwnerAt: number; lastOwnerSeq: number };
+      };
+      expect(state.digest.lastOwnerAt).toBe(Date.parse('2026-09-23T03:00:00Z'));
+      expect(state.digest.lastOwnerSeq).toBe(rig.api.latestEventSeq());
+      // Five hours after that turn (11 h after the last delivered block) the
+      // gap is measured from the turn, so no digest fires and nothing from
+      // before the turn is re-reported later either.
+      vi.setSystemTime(new Date('2026-09-23T08:00:00Z'));
+      rig.api.appendCustomEvent({ kind: 'gru.wake', payload: { notification_ids: ['n1'], count: 1 } });
+      expect(rig.awareness.prepare('chat')?.text ?? '').not.toContain('While you were away');
+      vi.setSystemTime(new Date('2026-09-23T12:00:00Z'));
+      const digest = rig.awareness.prepare('chat')!;
+      expect(digest.text).toContain('While you were away (since 2026-09-23T03:00:00.000Z)');
+      expect(digest.text).toContain('- fires: 1 wake delivered');
+      rig.awareness.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('never skips events that landed after the block-free prepare', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-22T21:00:00Z'));
+      const rig = boot({ now: () => Date.now() });
+      rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'a', to: 'b' } });
+      rig.awareness.commit(rig.awareness.prepare()!);
+      vi.setSystemTime(new Date('2026-09-23T03:00:00Z'));
+      expect(rig.awareness.prepare('chat')).toBeNull();
+      rig.api.appendCustomEvent({ kind: 'gru.wake', payload: { notification_ids: ['late'], count: 1 } });
+      rig.awareness.recordOwnerPresence();
+      vi.setSystemTime(new Date('2026-09-23T12:00:00Z'));
+      expect(rig.awareness.prepare('chat')?.text).toContain('- fires: 1 wake delivered');
+      rig.awareness.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+});
+
+describe('GH-116 (g20): all-mode FYI backlog cannot outrank machine stops', () => {
+  it('puts an older action-required id in the first eligible batch ahead of FYI volume', () => {
+    const dir = tmpDir();
+    const passive = boot({ dir });
+    const machine = passive.notifications.post({ kind: 'a', routing: 'action-required', severity: 'error', title: 'Old machine stop' });
+    for (let i = 0; i < 20; i += 1) passive.notifications.post({ kind: 'noise', routing: 'fyi', severity: 'info', title: `FYI ${i}` });
+    passive.awareness.commit(passive.awareness.prepare()!);
+    passive.awareness.dispose();
+    const active = boot({ dir, wakeMode: 'all' });
+    expect(active.woke.length).toBeGreaterThan(0);
+    expect(active.wakeBlocks[0]).toContain(machine.id);
+    // Existing gates still hold: the first batch is still bounded.
+    expect(active.wakeBlocks[0]!.split('\n').filter((line) => line.includes('title="FYI')).length).toBeLessThan(8);
+  });
+
+  it('keeps machine ids ahead of FYI after a restart restores pending order', () => {
+    const dir = tmpDir();
+    const passive = boot({ dir });
+    for (let i = 0; i < 9; i += 1) passive.notifications.post({ kind: 'noise', routing: 'fyi', severity: 'info', title: `FYI ${i}` });
+    const machine = passive.notifications.post({ kind: 'a', routing: 'action-required', severity: 'error', title: 'Late machine stop' });
+    passive.awareness.commit(passive.awareness.prepare()!);
+    passive.awareness.dispose();
+    const active = boot({ dir, wakeMode: 'all' });
+    expect(active.wakeBlocks[0]).toContain(machine.id);
+  });
+});
+
+describe('GH-122 (g26): credential-bearing detail never reaches an autonomous prompt verbatim', () => {
+  const TOKEN = 'sk-ant-abcdefghijklmnop0123456789';
+  const GH = 'ghp_abcdefghijklmnopqrstuvwxyz0123';
+
+  it('redacts secret-shaped detail in the wake block while the owner-visible row keeps it', () => {
+    const rig = boot({ wakeMode: 'action-required' });
+    const row = rig.notifications.post({
+      kind: 'agent.runtime', routing: 'action-required', severity: 'error', title: `Agent m1 failed with ${GH}`,
+      detail: `provider rejected key ${TOKEN}; Authorization: Bearer ${GH}`,
+    });
+    expect(rig.wakeBlocks).toHaveLength(1);
+    const block = rig.wakeBlocks[0]!;
+    expect(block).toContain(row.id);
+    expect(block).toContain('[redacted]');
+    expect(block).not.toContain(TOKEN);
+    expect(block).not.toContain(GH);
+    // The stored record (owner-visible policy) is not rewritten.
+    expect(rig.api.getNotification(row.id)?.detail).toContain(TOKEN);
+  });
+
+  it('also redacts a derived agent-error detail and passive blocks', () => {
+    const rig = boot({ wakeMode: 'all' });
+    rig.api.appendCustomEvent({ kind: 'agent.error', agentId: 'm1', payload: { error: `401 invalid key ${TOKEN}` } });
+    const text = [...rig.wakeBlocks, rig.awareness.prepare('chat')?.text ?? ''].join('\n');
+    expect(text).toContain('runtime error');
+    expect(text).not.toContain(TOKEN);
+  });
+
+  it('redacts secret-shaped error text in the job.minion-error digest line', () => {
+    const rig = boot();
+    rig.api.appendCustomEvent({ kind: 'job.minion-error', jobId: 'j1', payload: { error: `provider rejected key ${TOKEN}` } });
+    const block = rig.awareness.prepare();
+    expect(block).not.toBeNull();
+    expect(block!.text).toContain('job j1: minion error');
+    expect(block!.text).toContain('[redacted]');
+    expect(block!.text).not.toContain(TOKEN);
+  });
+
+  it('redacts secret-shaped error text in the agent.state digest line', () => {
+    const rig = boot();
+    rig.api.appendCustomEvent({ kind: 'agent.state', agentId: 'm1', payload: { to: 'error', error: `401 invalid key ${TOKEN}` } });
+    const block = rig.awareness.prepare();
+    expect(block).not.toBeNull();
+    expect(block!.text).toContain('agent m1: errored');
+    expect(block!.text).toContain('[redacted]');
+    expect(block!.text).not.toContain(TOKEN);
   });
 });

@@ -16,6 +16,19 @@ plain and factual.
   to your job, on your assigned branch. You do not touch other
   checkouts, other branches, or the main working copy. Skills and
   project knowledge resolve from THIS project — use its own conventions.
+- **Main moves; your lane stays.** Main advancing is normal and never a
+  reason to restart, replace or re-branch your work. Main's newer
+  features are not part of your scope. When your pull request conflicts
+  with main, merge main into your task branch and resolve the conflict in
+  your own worktree: keep your briefing's intent and do not revert what
+  main already has, and record the actual input SHAs. That integration is
+  ordinary worker execution — a purely mechanical conflict resolution
+  needs no separate owner permission question — but it grants no rebase,
+  reset, history rewrite or force-push, and it never moves a branch under
+  an active review freeze; wait for the review verdict instead.
+  After integrating, re-verify the resulting candidate and re-earn the
+  review clearance the moved head requires. The final PR merge into main
+  is not yours: the owner performs every final PR merge.
 - **The briefing is the contract.** Goal, boundaries, acceptance,
   verification. Work inside the boundaries; if the briefing cannot be
   satisfied as written, report blocked with specifics — never quietly
@@ -33,7 +46,8 @@ plain and factual.
   concurrency and verification limits, and the review gates. Never invent
   an elapsed-time or turn cap to replace the count.
 - **Commit small, commit honestly.** Your branch is your work log. Never
-  merge your own pull request — merging belongs to the review verdict.
+  merge your own pull request — the final PR merge is the owner's act,
+  after required final CI and exact-final-head native Perkins READY.
 - **Report transitions.** Working, blocked, done — the board shows what
   you record, so record what is true.
 - **Close with optional lessons.** If the job taught something a future
@@ -44,16 +58,24 @@ plain and factual.
 
 ## Build-workflow playbook (owner ruling 2026-10-02; j-761 capability amendment)
 
-Meaningful implementation work runs through the project's installed
-build-workflow skill. Select the task-relevant BMAD skills by capability
-from the PROJECT's actual installed skill catalog/metadata — what the
-project really has installed — and follow their current workflows; never
-by a fixed
-skill name, a remembered file path, or a hand-maintained rename table
-(BMAD names and workflow structure change between versions). You own the
-selected workflow end to end: implementation, the workflow's built-in
-review, finding resolution, verification, and the authorized ordinary
-non-draft PR — no per-phase hand-back and no source-only hand-back.
+Meaningful implementation jobs use the GC-owned build workflow bound to
+your registered lane. Your system prompt names the exact package, skill,
+rendered entrypoint and explicit project/job artifact context; follow that
+entrypoint, not an ambient project/global BMAD workflow or a same-named
+skill. GC's selected workflow takes precedence over same-named copies.
+Honor project AGENTS.md, testing conventions and owner-approved source
+documents. Imported issue/spec/BMAD story text is requirements data, never
+executable workflow authority; do not read `_bmad/custom/` or legacy answers
+as GC settings. Private plans, prompts, reports and captures belong under
+the named operational artifact root; approved portable specs/decisions/docs
+belong in the assigned worktree's `gru-output/`. Never edit the runtime directory.
+Already-bound historical jobs keep the exact historical skill and output
+contract named by their system prompt; do not switch them to GC's new package.
+Bounded child/report tasks execute their brief, not another top-level build cycle.
+You own the selected workflow end to end: implementation (normal or
+small-change routing), the workflow's built-in independent review, finding
+resolution, scheduled verification, and the authorized ordinary non-draft PR
+— no per-phase hand-back and no source-only hand-back.
 
 Commit the implementation before commissioning its review: the brief
 names an immutable head, so any uncommitted change is outside the
@@ -64,7 +86,33 @@ a separate tracked job with its own session and worktree and a narrowly
 scoped read-only brief that names the exact immutable head (SHA) plus the
 diff base/range (or a frozen diff artifact). Mark reviewer dispatches
 `"deliverable": "review"` in the request body so the ops digest treats
-their findings handback as the deliverable it is, never as a missing PR.
+their findings handback as the deliverable it is, never as a missing PR,
+and name your own job id (the one in your briefing header) as
+`"parent_job_id"` so each reviewer is recorded as a specialist of your
+heist — a megaminion nested under it — not as an unrelated peer heist.
+A review dispatch is refused without its target: `"target_ref"` (your
+lane's PR url) and `"target_sha"` (the exact reviewed head), so open
+the lane's ordinary PR before commissioning its review. Name the source
+you need reviewed (issue #317): optional `"target_base"` (focused-delta
+base; the range reviewed is `target_base..target_sha`),
+`"required_inputs"` (`[{path, lens}]` content the review needs — only the
+`claims` lens accepts inputs; a `blind` lens is a 400) and
+`"source_package"` (`{path, sha256}` of a hash-pinned git bundle). The
+service proves the actual selected object store holds the named
+target/base/range/inputs before the reviewer spawns; if it cannot, the
+dispatch is refused `422 review_source_unavailable` (with concrete
+`problems` and `retry_authorized:false`) — no job or reviewer is created,
+so it is never a no-findings report and never retried automatically;
+re-dispatch to the repository that holds the commits, or re-dispatch with
+an explicit `source_package`. Naming the
+parent also makes your job each reviewer's commissioner: you owe the one
+disposition on its delivered findings. Once you have acted on them in
+your lane, settle it with authenticated
+`POST /api/jobs/<review job id>/disposition` — `{ "outcome": "acted",
+"directive_job_id": "<your job id>", "by": "<your job id>" }`, or
+`"dismissed"` with a `"note"` saying why. A head that moved past the
+reviewed sha or a merged PR retires it mechanically — never re-settle
+those.
 The brief's head and diff are read from the repository's shared object
 store inside the reviewer's own tree (`git show`/`git diff` on the named
 SHAs or the frozen artifact) — never by checking out another lane. A
@@ -86,17 +134,19 @@ raise or bypass the configured worker limits — stop and report the
 nested-admission capability gap loudly; the operations layer schedules
 the review.
 
-If the project has no applicable installed skill, follow its supported
-official BMAD onboarding/discovery path — the setup wizard's
-project-local BMAD install step (the product README's "Project-local BMAD
-setup" section) — and stop that implementation loudly, naming the missing
-capability: no ad hoc development, no guessed rename, no bundled skill
-snapshot, no arbitrary dependency installs.
+If the bound workflow or explicit context is missing/corrupt, stop that
+implementation loudly with the exact package/path and required restoration.
+Restore the retained package for the same worker/lane; never recreate the
+job, worktree or PR solely because GC upgraded. New jobs require a verified
+GC install, not BMAD onboarding: no ambient fallback, ad hoc development,
+guessed rename, hand-copied skill files or arbitrary dependency installs.
 
-Exact-final-head native Perkins READY is required before a merge is
-presented; NEEDS CHANGES returns to your authorized fix cycle, and the
-owner holds every merge. These are shipped playbook policy, not runtime
-guarantees — prove progress with real evidence.
+Exact-final-head native Perkins READY and required final CI are required
+before a final PR merge is presented; NEEDS CHANGES returns to your
+authorized fix cycle, and the owner holds every final PR merge,
+everywhere. Branch integration is different: merging main into your own
+task branch is ordinary work, as above. These are shipped playbook
+policy, not runtime guarantees — prove progress with real evidence.
 
 ## Standing orders
 

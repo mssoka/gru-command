@@ -67,7 +67,7 @@ describe('review-input handoff through the real wave freeze', () => {
     const db = new LedgerDb(temp('review-inputs-wave-db-'));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/review', target);
+    const port = new GitReviewPort(root, 'feature/review', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-wave' });
     const briefing = 'Goal: ship the label fix.\nAcceptance 1: use the fixed bmad-build entry point.';
     const job = ledger.addJob({ id: 'job-wave', repo: 'fixture', title: 'review inputs', baseBranch: 'main', briefing });
@@ -104,6 +104,8 @@ describe('review-input handoff through the real wave freeze', () => {
       supersedes: ['original:Acceptance 1'],
       approval: { by: 'owner', reference: 'epoch12 seq194760' },
       expectedContractSha256: base.contractSha256,
+      // A clarification: no implementation owed, so the review still runs.
+      effect: 'administrative',
     });
     expect(added.status).toBe('accepted');
     if (added.status !== 'accepted') throw new Error('unreachable');

@@ -13,8 +13,19 @@
  * adds the pipeline block's server-evaluated rows.
  */
 
-import { bucketSnapshot, jobRecency, type BandedJob, type WorkerStopView } from './board-bands.js';
-import type { BoardSnapshot, PipelineEntryView, PipelineView } from './board-protocol.js';
+import {
+  bandedJob,
+  bucketJobs,
+  jobRecency,
+  mailboxJobs,
+  liveWorkerStampsByJob,
+  snapshotFamilies,
+  stoppedWorkersByJob,
+  type BandedJob,
+  type BucketOptions,
+  type WorkerStopView,
+} from './board-bands.js';
+import type { BoardSnapshot, JobView, PipelineEntryView, PipelineView } from './board-protocol.js';
 import { unackedByJob } from './board-signals.js';
 import { ownerPendingCount } from './owner-band.js';
 
@@ -70,10 +81,20 @@ export interface SectionNavRow {
  * nav, the sections and the tests all read). */
 export interface BoardSections {
   readonly bands: ReadonlyMap<string, readonly BandedJob[]>;
+  /** Every top-level row the bands hold (heists plus surfaced
+   * megaminions) — the one population the HEISTS tracker counts. */
+  readonly topLevel: readonly JobView[];
+  /** Nested megaminions per parent job id, each with its own band and
+   * stall flag (they render under the parent row, never in a band). */
+  readonly children: ReadonlyMap<string, readonly BandedJob[]>;
+  /** Megaminions surfaced top-level by NEEDS-YOU → their parent job. */
+  readonly surfacedParents: ReadonlyMap<string, JobView>;
   readonly counts: SectionCounts;
   /** Full pipeline entry list in server order; empty when unwired. */
   readonly pipelineEntries: readonly PipelineEntryView[];
   readonly pipelineAvailable: boolean;
+  readonly mailbox: BoardSnapshot['mailbox'];
+  readonly mailboxAvailable: boolean;
 }
 
 export function boardSections(
@@ -88,42 +109,68 @@ export function boardSections(
     readonly liveWorkerStamps?: ReadonlyMap<string, number>;
   } = {},
 ): BoardSections {
-  const groups = bucketSnapshot(snapshot, {
+  const bucketOpts: BucketOptions = {
     now,
+    mailboxJobs: mailboxJobs(snapshot),
     unackedByJob: unackedByJob(snapshot),
     ...(opts.stoppedWorkers !== undefined ? { stoppedWorkers: opts.stoppedWorkers } : {}),
     ...(opts.liveWorkerStamps !== undefined ? { liveWorkerStamps: opts.liveWorkerStamps } : {}),
-  });
+  };
+  // One family derivation feeds the bands (heists only) and the nested
+  // rows, so a megaminion is either under its parent or in a band — never
+  // both, never neither.
+  const families = snapshotFamilies(snapshot, bucketOpts);
+  const groups = bucketJobs(families.topLevel, bucketOpts);
   const byBand = new Map<string, readonly BandedJob[]>();
   for (const group of groups) byBand.set(group.band, group.jobs);
+  const children = new Map<string, readonly BandedJob[]>();
+  for (const [parentId, jobs] of families.childrenByParent) {
+    children.set(parentId, jobs.map((job) => bandedJob(job, bucketOpts)));
+  }
   const pipeline: PipelineView | null = snapshot.pipeline ?? null;
   return {
     bands: byBand,
+    topLevel: families.topLevel,
+    children,
+    surfacedParents: families.surfacedParents,
     counts: {
       'for-you': ownerPendingCount(snapshot),
       'in-flight': byBand.get('in-flight')?.length ?? 0,
       pipeline: pipeline?.pending ?? 0,
       // The section's own authoritative count is the machine band it
       // contains (the global unacked tracker stays a separate chip).
-      'for-gru': byBand.get('needs-you')?.length ?? 0,
+      'for-gru': (snapshot.mailbox?.counts.threads ?? 0) + (snapshot.mailbox?.counts.incidents ?? 0),
       settled: byBand.get('settled')?.length ?? 0,
       cold: byBand.get('cold')?.length ?? 0,
     },
     pipelineEntries: pipeline?.entries ?? [],
     pipelineAvailable: pipeline !== null,
+    mailbox: snapshot.mailbox,
+    mailboxAvailable: snapshot.mailbox !== undefined && snapshot.mailbox !== null,
   };
+}
+
+/** The board's worker-aware sections derivation from a snapshot alone:
+ * the stopped-worker and live-worker truth come from its own agent rows.
+ * The section bodies, the shortcut strip and the TRACKERS chip all read
+ * this, so their classification can never drift apart. */
+export function snapshotSections(snapshot: BoardSnapshot, now = Date.now()): BoardSections {
+  return boardSections(snapshot, now, {
+    stoppedWorkers: stoppedWorkersByJob(snapshot.agents),
+    liveWorkerStamps: liveWorkerStampsByJob(snapshot.agents),
+  });
 }
 
 /** The sticky shortcut strip's rows — labelled, uncapped counts, one per
  * section in the approved order. */
-export function sectionNav(counts: SectionCounts, pipelineAvailable = true): readonly SectionNavRow[] {
+export function sectionNav(counts: SectionCounts, pipelineAvailable = true, mailboxAvailable = true): readonly SectionNavRow[] {
   return SECTION_ORDER.map((id) => ({
     id,
     label: SECTION_LABELS[id],
     count: counts[id],
     targetId: SECTION_TARGET_IDS[id],
     href: `#${SECTION_TARGET_IDS[id]}`,
-    counted: id !== 'pipeline' || pipelineAvailable,
+    counted: id === 'pipeline' ? pipelineAvailable : id === 'for-gru' ? mailboxAvailable : true,
   }));
 }
 

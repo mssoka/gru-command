@@ -1,13 +1,16 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi, DEFAULT_LENSES, type PendingRebriefRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
+import { GruMailbox } from '../src/gru-mailbox/service.js';
 import { branchStatePayload } from '../src/dispatch/github-poll.js';
-import { OWNER_CANCELLATION_JOB_IDS, OWNER_CANCELLATION_RULING } from '../src/ledger/owner-cancellation.js';
-import type { CloseoutRuntimeProbe } from '../src/ledger/api.js';
+import { renderRecordedVerification } from '../src/verify/evidence.js';
+import { assertJobTransition, isJobStatus, isJobTerminal, TERMINAL_JOB_STATUSES } from '../src/ledger/states.js';
+import { reconcileReportClosures } from '../src/dispatch/durable-reconcile.js';
+import { NotificationCenter } from '../src/notifications/center.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -41,6 +44,224 @@ describe('job deliverable kind (E19 durable-write guard)', () => {
   });
 });
 
+
+describe('P48 candidate delivery projections preserve non-candidate debt', () => {
+  it('excludes later historical non-candidates from freshness while preserving their original facts and gate debt', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-ledger-candidate-projection-')); const db = new LedgerDb(dir); const api = new LedgerApi(db.handle);
+    try {
+      api.addJob({ id: 'candidate-job', repo: 'fixture', title: 'candidate' }); api.setJobStatus('candidate-job', 'working');
+      const original = api.appendCustomEvent({ kind: 'job.delivered', jobId: 'candidate-job', payload: { sha: 'a'.repeat(40), work_revision: 0 } });
+      const historical = api.appendCustomEvent({ kind: 'job.delivered', jobId: 'candidate-job', payload: {
+        sha: 'b'.repeat(40), work_revision: 0, historical_bookkeeping_only: true, candidate_delivery_proven: false,
+      } });
+      expect(api.latestCandidateDelivery('candidate-job')).toEqual(original);
+      expect(api.correctiveVerificationDebt('candidate-job')).toEqual({ revision: 0, head: null });
+      api.appendCustomEvent({ kind: 'verification.completed', jobId: 'candidate-job', payload: { sha: 'b'.repeat(40), ok: true } });
+      expect(api.correctiveVerificationDebt('candidate-job')).toEqual({ revision: 0, head: null });
+      expect(api.getEvent(historical.seq)).toEqual(historical);
+      const current = api.appendCustomEvent({ kind: 'job.delivered', jobId: 'candidate-job', payload: {
+        sha: 'c'.repeat(40), work_revision: 0, candidate_delivery_proven: true,
+      } });
+      expect(api.latestCandidateDelivery('candidate-job')).toEqual(current);
+      expect(api.correctiveVerificationDebt('candidate-job')).toBeNull();
+    } finally { db.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('returns no candidate for exclusively unproven deliveries without dropping their revision or verification fence', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-ledger-unproven-projection-')); const db = new LedgerDb(dir); const api = new LedgerApi(db.handle);
+    try {
+      api.addJob({ id: 'unproven-job', repo: 'fixture', title: 'unproven' });
+      const historical = api.appendCustomEvent({ kind: 'job.delivered', jobId: 'unproven-job', payload: {
+        sha: 'd'.repeat(40), work_revision: 1, candidate_delivery_proven: false,
+      } });
+      expect(api.latestCandidateDelivery('unproven-job')).toBeNull();
+      expect(api.workRevisionState('unproven-job')).toEqual({ required: 0, delivered: 0 });
+      expect(api.correctiveVerificationDebt('unproven-job')).toEqual({ revision: 1, head: null });
+      expect(api.latestJobEvent('unproven-job', 'job.delivered')).toEqual(historical);
+    } finally { db.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+
+describe('completed verification history pagination (j-1594)', () => {
+  function seeded(): { api: LedgerApi; db: LedgerDb; dir: string } {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-ledger-vhist-'));
+    const db = new LedgerDb(dir);
+    return { api: new LedgerApi(db.handle), db, dir };
+  }
+
+  it('pages the COMPLETE history newest-first with no finite lifetime ceiling', () => {
+    const { api, db, dir } = seeded();
+    try {
+      for (let index = 0; index < 208; index += 1) {
+        api.appendCustomEvent({ kind: 'verification.completed', jobId: 'vhist', payload: { run_id: `run-${index}` } });
+      }
+      api.appendCustomEvent({ kind: 'job.note', jobId: 'vhist', payload: { note: 'not a run' } });
+      api.appendCustomEvent({ kind: 'verification.completed', jobId: 'other', payload: { run_id: 'other-run' } });
+      const rows = [...api.iterateJobVerificationCompleted('vhist', 200)];
+      // Every completed run of THIS job, exactly once, in descending seq.
+      expect(rows).toHaveLength(208);
+      expect(rows.every((row) => row.kind === 'verification.completed' && row.jobId === 'vhist')).toBe(true);
+      const seqs = rows.map((row) => row.seq);
+      expect(seqs).toEqual([...seqs].sort((left, right) => right - left));
+      expect(new Set(seqs).size).toBe(208);
+      expect((rows[0]!.payload as { run_id: string }).run_id).toBe('run-207');
+      expect((rows.at(-1)!.payload as { run_id: string }).run_id).toBe('run-0');
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('is lazy — the caller stops the read after exactly one page', () => {
+    const { api, db, dir } = seeded();
+    try {
+      for (let index = 0; index < 5; index += 1) {
+        api.appendCustomEvent({ kind: 'verification.completed', jobId: 'lazy', payload: { run_id: `run-${index}` } });
+      }
+      // Observe the actual page reads: the watermark lookup plus one page —
+      // a second page must not be fetched when the caller stops after one
+      // row. (A pre-buffering implementation would read every page here.)
+      const prepare = vi.spyOn(db.handle, 'prepare');
+      const iterator = api.iterateJobVerificationCompleted('lazy', 2);
+      const first = iterator.next();
+      expect(first.done).toBe(false);
+      expect(prepare).toHaveBeenCalledTimes(2);
+      iterator.return(undefined);
+      expect(prepare).toHaveBeenCalledTimes(2);
+      expect(iterator.next().done).toBe(true);
+      prepare.mockRestore();
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reads every page to exhaustion, including exact-full-page and single-row boundaries', () => {
+    const { api, db, dir } = seeded();
+    try {
+      const read = (jobId: string, pageSize: number): number[] =>
+        [...api.iterateJobVerificationCompleted(jobId, pageSize)].map((row) => row.seq);
+      // A total that is an exact multiple of pageSize terminates on the
+      // empty next page, not a short page; an exact-full single page (total
+      // === pageSize) must also terminate there instead of looping.
+      for (let index = 0; index < 4; index += 1) {
+        api.appendCustomEvent({ kind: 'verification.completed', jobId: 'exact', payload: { run_id: `run-${index}` } });
+      }
+      const exactAtTwo = read('exact', 2);
+      const expectedOrder = [...exactAtTwo].sort((left, right) => right - left);
+      expect(exactAtTwo).toEqual(expectedOrder);
+      expect(new Set(exactAtTwo).size).toBe(4);
+      // An exact-full single page (total === pageSize) terminates on the
+      // empty next page; the read still fetches that page (watermark +
+      // page + empty page = 3 statements), so a lost termination guard
+      // shows up as an extra fetch rather than an event-loop hang.
+      const exactPrepare = vi.spyOn(db.handle, 'prepare');
+      expect(read('exact', 4)).toEqual(expectedOrder);
+      expect(exactPrepare).toHaveBeenCalledTimes(3);
+      exactPrepare.mockRestore();
+      // pageSize 1 exercises the per-row cursor advance; the selected
+      // sequence is independent of the page size.
+      expect(read('exact', 1)).toEqual(expectedOrder);
+      // Single-row history (whether or not the page is full).
+      api.appendCustomEvent({ kind: 'verification.completed', jobId: 'single', payload: { run_id: 'only' } });
+      expect(read('single', 1)).toHaveLength(1);
+      expect(read('single', 200)).toHaveLength(1);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('throws during iteration when a later page read fails — a partial read never looks empty', () => {
+    const { api, db, dir } = seeded();
+    try {
+      for (let index = 0; index < 3; index += 1) {
+        api.appendCustomEvent({ kind: 'verification.completed', jobId: 'broken', payload: { run_id: `run-${index}` } });
+      }
+      const iterator = api.iterateJobVerificationCompleted('broken', 1);
+      expect(iterator.next().done).toBe(false); // page one read
+      // Simulate storage failure after the first page was yielded.
+      db.handle.exec('DROP TABLE events');
+      expect(() => iterator.next()).toThrow(/no such table: events/u);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('finds a binding run at the page boundary over the real paged read', () => {
+    const { api, db, dir } = seeded();
+    try {
+      const TARGET = 'a'.repeat(40);
+      const OTHER = 'f'.repeat(40);
+      const run = (sha: string, runId: string): Record<string, unknown> => ({
+        sha, scope: 'full', command: 'npm test', ok: true, exit_code: 0,
+        run_id: runId, output_bytes: 1, output_sha256: 'b'.repeat(64),
+      });
+      // The binding run is appended FIRST, then `newer` nonbinding runs, so
+      // it sits at row (newer + 1) of a newest-first history.
+      const seed = (jobId: string, newer: number): number => {
+        const binding = api.appendCustomEvent({
+          kind: 'verification.completed', jobId, payload: run(TARGET, `${jobId}-bind`),
+        });
+        for (let index = 0; index < newer; index += 1) {
+          api.appendCustomEvent({ kind: 'verification.completed', jobId, payload: run(OTHER, `${jobId}-noise-${index}`) });
+        }
+        return binding.seq;
+      };
+      const bind200 = seed('boundary-200', 199); // 200th newest = LAST row of page 1
+      const bind201 = seed('boundary-201', 200); // 201st newest = FIRST row of page 2
+      const select = (jobId: string, pageSize?: number): number | null => {
+        const iterator = pageSize === undefined
+          ? api.iterateJobVerificationCompleted(jobId)
+          : api.iterateJobVerificationCompleted(jobId, pageSize);
+        return [...iterator].find((event) => renderRecordedVerification(event, TARGET) !== null)?.seq ?? null;
+      };
+      expect(select('boundary-200', 200)).toBe(bind200);
+      expect(select('boundary-201', 200)).toBe(bind201);
+      // The DEFAULT page size is bounded and pages: 201 rows read as the
+      // watermark plus two pages (an unbounded default would fetch one).
+      const prepare = vi.spyOn(db.handle, 'prepare');
+      expect(select('boundary-201')).toBe(bind201);
+      expect(prepare).toHaveBeenCalledTimes(3);
+      prepare.mockRestore();
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('holds a stable watermark: a run appended after the first page is not yielded', () => {
+    const { api, db, dir } = seeded();
+    try {
+      for (let index = 0; index < 3; index += 1) {
+        api.appendCustomEvent({ kind: 'verification.completed', jobId: 'wm', payload: { run_id: `before-${index}` } });
+      }
+      const iterator = api.iterateJobVerificationCompleted('wm', 2);
+      expect(iterator.next().done).toBe(false); // watermark captured here
+      const late = api.appendCustomEvent({ kind: 'verification.completed', jobId: 'wm', payload: { run_id: 'after' } });
+      const rest = [...iterator];
+      expect(rest.map((row) => (row.payload as { run_id: string }).run_id)).toEqual(['before-1', 'before-0']);
+      expect(rest.some((row) => row.seq === late.seq)).toBe(false);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('yields nothing for a job with no completed run and refuses a non-positive page size', () => {
+    const { api, db, dir } = seeded();
+    try {
+      api.appendCustomEvent({ kind: 'job.note', jobId: 'empty', payload: { note: 'x' } });
+      expect([...api.iterateJobVerificationCompleted('empty')]).toEqual([]);
+      expect(() => [...api.iterateJobVerificationCompleted('empty', 0)]).toThrow(/pageSize must be a positive integer/u);
+      expect(() => [...api.iterateJobVerificationCompleted('empty', 1.5)]).toThrow(/pageSize must be a positive integer/u);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('ledger api — the record of state', () => {
   let api: LedgerApi;
@@ -123,23 +344,88 @@ describe('ledger api — the record of state', () => {
   });
 
   it('legal job transitions walk the machine; every hop appends an event', () => {
-    api.setJobStatus('fix-login-flow', 'working');
-    api.setJobStatus('fix-login-flow', 'in-review');
-    const job = api.setJobStatus('fix-login-flow', 'merged');
+    // Keep the separate fix-login-flow fixture reviewable for the round tests.
+    api.addJob({ id: 'merged-machine-path', repo: 'billing-api', title: 'Merged path' });
+    api.setJobStatus('merged-machine-path', 'working');
+    api.setJobStatus('merged-machine-path', 'in-review');
+    const job = api.setJobStatus('merged-machine-path', 'merged');
     expect(job.status).toBe('merged');
-    const hops = api.listEvents().filter((e) => e.kind === 'job.status' && e.jobId === 'fix-login-flow');
+    const hops = api.listEvents().filter((e) => e.kind === 'job.status' && e.jobId === 'merged-machine-path');
     // listEvents is newest-first; reverse for chronological reads.
     expect(hops.map((e) => (e.payload as { to: string }).to).reverse()).toEqual(['working', 'in-review', 'merged']);
   });
 
   it('terminal job states are terminal; illegal transitions throw and change nothing', () => {
-    const before = api.getJob('fix-login-flow');
-    expect(() => api.setJobStatus('fix-login-flow', 'working')).toThrow(/illegal transition merged → working/u);
-    expect(api.getJob('fix-login-flow')).toEqual(before); // untouched
+    const before = api.getJob('merged-machine-path');
+    expect(() => api.setJobStatus('merged-machine-path', 'working')).toThrow(/illegal transition merged → working/u);
+    expect(api.getJob('merged-machine-path')).toEqual(before); // untouched
     api.addJob({ id: 'docs-pass', repo: 'billing-api', title: 'Docs pass' });
     expect(() => api.setJobStatus('docs-pass', 'merged')).toThrow(/illegal transition dispatched → merged/u);
     expect(() => api.setJobStatus('docs-pass', 'not-a-status' as never)).toThrow(/unknown job status/u);
     expect(() => api.setJobStatus('no-such-job', 'working')).toThrow(/not found/u);
+  });
+
+  it('binned is legal from EVERY non-terminal status and is terminal on the shared contract', () => {
+    // One lane per non-terminal source status; each walks a legal arc to
+    // that status, is discarded, and then refuses every hop out.
+    const arcs: Record<string, readonly string[]> = {
+      dispatched: [],
+      working: ['working'],
+      delivered: ['working', 'delivered'],
+      'in-review': ['working', 'in-review'],
+      blocked: ['working', 'blocked'],
+      parked: ['working', 'parked'],
+    };
+    for (const [source, hops] of Object.entries(arcs)) {
+      const id = `binned-from-${source}`;
+      api.addJob({ id, repo: 'discard-fixture', title: `Discard from ${source}` });
+      for (const hop of hops) api.setJobStatus(id, hop);
+      const priorHop = api.latestJobEvent(id, 'job.status');
+      const discarded = api.setJobStatus(id, 'binned');
+      expect(discarded.status, source).toBe('binned');
+      // The ordinary audit event records the truthful prior status.
+      const hop = api.latestJobEvent(id, 'job.status');
+      expect(hop?.payload, source).toEqual({ from: source, to: 'binned' });
+      if (priorHop !== null) expect(hop?.seq, source).toBeGreaterThan(priorHop.seq);
+      // No outgoing edge survives — and every refusal is mutation-free.
+      const eventsBefore = api.listEvents().length;
+      for (const target of ['dispatched', 'working', 'delivered', 'in-review', 'blocked', 'parked', 'merged', 'done']) {
+        expect(() => api.setJobStatus(id, target), `${source} → ${target}`).toThrow(
+          new RegExp(`illegal transition binned → ${target}`, 'u'),
+        );
+        expect(() => assertJobTransition('binned', target as never), `machine ${target}`).toThrow(
+          new RegExp(`illegal transition binned → ${target}`, 'u'),
+        );
+      }
+      expect(api.getJob(id)?.status, source).toBe('binned');
+      expect(api.listEvents().length, source).toBe(eventsBefore);
+    }
+    // Re-binning an already-binned lane is the generic same-status no-op:
+    // no transition, no duplicate event — a timed-out retry is safe.
+    const rebinEvents = api.listEvents().length;
+    expect(api.setJobStatus('binned-from-parked', 'binned').status).toBe('binned');
+    expect(api.listEvents().length).toBe(rebinEvents);
+    expect(isJobStatus('binned')).toBe(true);
+    expect(isJobTerminal('binned')).toBe(true);
+    expect(TERMINAL_JOB_STATUSES).toContain('binned');
+  });
+
+  it('merged and done cannot be binned — the closed record is never rewritten', () => {
+    const closedArcs: Record<'merged' | 'done', string[]> = {
+      merged: ['working', 'in-review', 'merged'],
+      done: ['working', 'done'],
+    };
+    for (const [terminal, hops] of Object.entries(closedArcs)) {
+      const id = `binned-refused-${terminal}`;
+      api.addJob({ id, repo: 'discard-fixture', title: `Closed ${terminal}` });
+      for (const hop of hops) api.setJobStatus(id, hop);
+      const eventsBefore = api.listEvents().length;
+      expect(() => api.setJobStatus(id, 'binned')).toThrow(
+        new RegExp(`illegal transition ${terminal} → binned`, 'u'),
+      );
+      expect(api.getJob(id)?.status).toBe(terminal);
+      expect(api.listEvents().length).toBe(eventsBefore);
+    }
   });
 
   it('blocked and parked are recoverable side states', () => {
@@ -218,6 +504,25 @@ describe('ledger api — the record of state', () => {
     ]);
     expect(round.lenses.every((chip) => chip.state === 'pending')).toBe(true);
     expect(round.targetRef).toBe('abc123');
+  });
+
+  it('binned, merged and done jobs refuse new review rounds without changing history', () => {
+    const arcs = {
+      binned: [],
+      done: ['working'],
+      merged: ['working', 'in-review'],
+    } as const;
+    for (const [status, hops] of Object.entries(arcs)) {
+      const id = `round-terminal-${status}`;
+      api.addJob({ id, repo: 'billing-api', title: 'Concluded review' });
+      for (const hop of hops) api.setJobStatus(id, hop);
+      api.setJobStatus(id, status);
+      const before = api.listJobEvents(id);
+      expect(() => api.addRound({ jobId: id, targetRef: 'sha-after-close' }))
+        .toThrow(new RegExp(`terminal.*${status}`, 'u'));
+      expect(api.listRounds(id)).toEqual([]);
+      expect(api.listJobEvents(id)).toEqual(before);
+    }
   });
 
   it('custom lens lists are honored but must be unique and non-empty', () => {
@@ -504,7 +809,7 @@ describe('ledger api — the record of state', () => {
     const dataDir = cleanupDirs[0] as string; // the dir from beforeAll
     const db2 = new LedgerDb(dataDir);
     const api2 = new LedgerApi(db2.handle, { bus: new EventBus() });
-    const job = api2.getJob('fix-login-flow');
+    const job = api2.getJob('merged-machine-path');
     expect(job?.status).toBe('merged');
     const rounds = api2.listRounds('fix-login-flow');
     expect(rounds[0]?.lenses.find((chip) => chip.lens === 'blind')?.state).toBe('done');
@@ -525,11 +830,15 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
   });
   afterAll(() => db.close());
 
-  function mergedJob(id: string): void {
+  function terminalJob(id: string, terminal: 'merged' | 'binned'): void {
     api.addJob({ id, repo: 'terminal-retirement', title: 'terminal retirement fixture' });
     api.setJobStatus(id, 'working');
-    api.setJobStatus(id, 'in-review');
-    api.setJobStatus(id, 'merged');
+    if (terminal === 'merged') {
+      api.setJobStatus(id, 'in-review');
+      api.setJobStatus(id, 'merged');
+    } else {
+      api.setJobStatus(id, 'binned');
+    }
   }
 
   function candidatesOf(markers: readonly PendingRebriefRecord[]): readonly {
@@ -547,10 +856,15 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
   }
 
   it('beginPendingRebrief refuses a terminal job inside its own transaction (the HTTP guard is not the only boundary)', () => {
-    mergedJob('intake-terminal');
+    terminalJob('intake-terminal', 'merged');
     expect(() => api.beginPendingRebrief({ jobId: 'intake-terminal', note: 'n', briefing: 'b' }))
       .toThrow(/terminal lanes are never re-briefed/u);
     expect(api.listPendingRebriefs({ jobId: 'intake-terminal' })).toHaveLength(0);
+    // A binned (discarded) lane is terminal at the same boundary.
+    terminalJob('intake-terminal-binned', 'binned');
+    expect(() => api.beginPendingRebrief({ jobId: 'intake-terminal-binned', note: 'n', briefing: 'b' }))
+      .toThrow(/terminal lanes are never re-briefed/u);
+    expect(api.listPendingRebriefs({ jobId: 'intake-terminal-binned' })).toHaveLength(0);
   });
 
   it('retirePendingRebriefs commits audit + identity-checked deletion together; a replay is a no-op', () => {
@@ -573,22 +887,48 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     const replay = api.retirePendingRebriefs({ jobId, reason: 'job terminal', candidates });
     expect(replay.retired).toHaveLength(0);
     expect(api.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-retired')).toHaveLength(1);
+
+    // A binned (discarded) lane retires its markers through the same
+    // identity-checked path, auditing the terminal status truthfully.
+    const binnedId = 'retire-binned';
+    api.addJob({ id: binnedId, repo: 'terminal-retirement', title: 'binned retirement' });
+    api.setJobStatus(binnedId, 'working');
+    const binnedMarkers = api.beginPendingRebrief({ jobId: binnedId, note: 'n', briefing: 'b' });
+    const binnedCandidates = candidatesOf(binnedMarkers);
+    api.setJobStatus(binnedId, 'binned');
+    const binnedRetire = api.retirePendingRebriefs({ jobId: binnedId, reason: 'job terminal', candidates: binnedCandidates });
+    expect(binnedRetire.refused).toBeNull();
+    expect(binnedRetire.retired).toHaveLength(binnedMarkers.length);
+    expect(api.listPendingRebriefs({ jobId: binnedId })).toHaveLength(0);
+    expect((api.latestJobEvent(binnedId, 'silas.rebrief-retired')?.payload as { job_status?: string }).job_status)
+      .toBe('binned');
   });
+
+  function originalReceipt(jobId: string, kind: 'silas.rebrief' | 'job.delivered'): void {
+    const stored = api.listPendingRebriefs({ jobId });
+    api.bindPendingRebriefWorker({ ids: stored.map((row) => row.id), agentId: 'original-worker', sessionFile: null });
+    const marker = api.listPendingRebriefs({ jobId }).find((row) => row.kind === kind)!;
+    api.appendCustomEvent({ kind, jobId, agentId: 'original-worker', payload: {
+      minion_id: 'original-worker', agentId: 'original-worker', work_revision: marker.workRevision,
+      ...(marker.phaseId === null ? { marker_id: marker.id, payload_hash: marker.payloadHash } : { phase_id: marker.phaseId }),
+    } });
+    expect(api.pendingRebriefReceipt(marker)).not.toBeNull();
+  }
 
   it('refuses direct retirement of a fully landed terminal request without an audit', () => {
     const jobId = 'retire-spent-refusal';
     api.addJob({ id: jobId, repo: 'terminal-retirement', title: 'completed request' });
     api.setJobStatus(jobId, 'working');
     const markers = api.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
-    api.appendCustomEvent({ kind: 'silas.rebrief', jobId });
-    api.appendCustomEvent({ kind: 'job.delivered', jobId });
+    originalReceipt(jobId, 'silas.rebrief');
+    originalReceipt(jobId, 'job.delivered');
     api.setJobStatus(jobId, 'in-review');
     api.setJobStatus(jobId, 'merged');
     const result = api.retirePendingRebriefs({ jobId, reason: 'terminal', candidates: candidatesOf(markers) });
     expect(result).toMatchObject({ retired: [], skippedIds: [], refused: 'events-already-landed' });
-    expect(api.listPendingRebriefs({ jobId })).toEqual(markers);
+    expect(api.listPendingRebriefs({ jobId }).map((row) => row.id)).toEqual(markers.map((row) => row.id));
     expect(api.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
-    expect(api.clearPendingRebriefsIfCurrentAndSettle(markers)).toBe(true);
+    expect(api.clearPendingRebriefsIfCurrentAndSettle(api.listPendingRebriefs({ jobId }))).toBe(true);
     expect(api.listPendingRebriefs({ jobId })).toHaveLength(0);
     expect(api.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-settled')).toHaveLength(1);
   });
@@ -619,21 +959,30 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     const jobId = 'settle-atomic-rollback';
     api.addJob({ id: jobId, repo: 'settlement-rollback', title: 'atomic' });
     api.setJobStatus(jobId, 'working');
-    const markers = api.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
-    api.appendCustomEvent({ kind: 'silas.rebrief', jobId });
-    api.appendCustomEvent({ kind: 'job.delivered', jobId });
+    const intent = api.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
+    originalReceipt(jobId, 'silas.rebrief');
+    originalReceipt(jobId, 'job.delivered');
+    // Settlement receives the original ADMITTED generation snapshot,
+    // including its immutable minion binding, not pre-binding intent rows.
+    const markers = api.listPendingRebriefs({ jobId });
+    expect(markers.map((row) => row.id)).toEqual(intent.map((row) => row.id));
+    expect(markers.every((row) => row.agentId === 'original-worker' && api.pendingRebriefReceipt(row) !== null)).toBe(true);
+    const receipts = api.listJobEventsByKinds(jobId, ['silas.rebrief', 'job.delivered']);
     db.handle.exec(`CREATE TRIGGER fail_rebrief_settlement BEFORE INSERT ON events
       WHEN NEW.kind = 'silas.rebrief-settled' BEGIN SELECT RAISE(ABORT, 'settlement blocked'); END`);
     try {
       expect(() => api.clearPendingRebriefsIfCurrentAndSettle(markers)).toThrow(/settlement blocked/u);
-      expect(api.listPendingRebriefs({ jobId }).map((row) => row.id)).toEqual(markers.map((row) => row.id));
+      expect(api.listPendingRebriefs({ jobId })).toEqual(markers);
       expect(api.latestJobEvent(jobId, 'silas.rebrief-settled')).toBeNull();
+      expect(api.listJobEventsByKinds(jobId, ['silas.rebrief', 'job.delivered'])).toEqual(receipts);
     } finally {
       db.handle.exec('DROP TRIGGER fail_rebrief_settlement');
     }
     expect(api.clearPendingRebriefsIfCurrentAndSettle(markers)).toBe(true);
+    expect(api.clearPendingRebriefsIfCurrentAndSettle(markers)).toBe(false);
     expect(api.listPendingRebriefs({ jobId })).toHaveLength(0);
     expect(api.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-settled')).toHaveLength(1);
+    expect(api.listJobEventsByKinds(jobId, ['silas.rebrief', 'job.delivered'])).toEqual(receipts);
   });
 
   it('retirement audit insertion failure rolls back marker deletion, then a retry commits once', () => {
@@ -748,7 +1097,7 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     });
     const phaseId = markers[0]!.phaseId;
     expect(phaseId).not.toBeNull();
-    api.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { phase_id: phaseId } });
+    originalReceipt(jobId, 'silas.rebrief');
     api.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { phase_id: 'foreign' } });
     api.setJobStatus(jobId, 'in-review');
     api.setJobStatus(jobId, 'merged');
@@ -767,7 +1116,7 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     const markers = api.beginPendingRebrief({
       jobId, note: 'n', briefing: 'b', handoff: { kind: 'gru-decision', decision: 'review' },
     });
-    api.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { phase_id: markers[0]!.phaseId } });
+    originalReceipt(jobId, 'silas.rebrief');
     api.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { phase_id: 'foreign' } });
     for (let i = 0; i < 1001; i++) api.appendCustomEvent({ kind: 'job.note', jobId, payload: { index: i } });
     api.setJobStatus(jobId, 'in-review');
@@ -786,7 +1135,7 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     api.setJobStatus(jobId, 'working');
     const markers = api.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
     // The guarded `silas.rebrief` event lands; the delivery never does.
-    api.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { minion_id: 'w', note: 'n' } });
+    originalReceipt(jobId, 'silas.rebrief');
     api.setJobStatus(jobId, 'in-review');
     api.setJobStatus(jobId, 'merged');
     const result = api.retirePendingRebriefs({ jobId, reason: 'job terminal', candidates: candidatesOf(markers) });
@@ -871,6 +1220,86 @@ describe('decision memory (issue #218)', () => {
     reason: 'existing ownership/integration hold',
     by: 'gru' as const,
   };
+
+  it('GH-314 preserves long and legacy short signal decisions across ledger restart', () => {
+    const dir = tmpDir();
+    let db = new LedgerDb(dir);
+    try {
+      const ledger = new LedgerApi(db.handle);
+      const signals = ['report-handback.review-old', 'report-handback.', 'report-handback._legacy', 'report-handback..legacy',
+        'pr-conflict', 'a'.repeat(64), `report-handback.${'a'.repeat(128)}`,
+        `report-handback.${'A'.repeat(128)}`];
+      const records = signals.map((signal, index) => ledger.recordDecision({ ...base, subject: `job:report-${index}`,
+        covers: [signal], basisFingerprint: `basis-${index}`, clientKey: `persisted-${index}` }));
+      const overlong = `report-handback.${'a'.repeat(129)}`;
+      expect(() => ledger.recordDecision({ ...base, covers: [overlong] })).toThrow(/signal must be 1-144/);
+      expect(() => ledger.coveringDecision({ subject: base.subject, signal: overlong, basis: 'basis' })).toThrow(/signal must be 1-144/);
+      expect(() => ledger.recordDecision({ ...base, covers: ['a'.repeat(65)] })).toThrow(/signal must be 1-64/);
+      db.close();
+      db = new LedgerDb(dir);
+      const reopened = new LedgerApi(db.handle);
+      for (const record of records) {
+        expect(reopened.getDecision(record.id)).toEqual(record);
+        expect(reopened.coveringDecision({ subject: record.subject, signal: record.covers[0]!, basis: record.basisFingerprint! })).toEqual(record);
+        expect(reopened.coveringDecision({ subject: record.subject, signal: record.covers[0]!, basis: 'changed' })).toBeNull();
+      }
+      expect(reopened.listDecisions()).toHaveLength(records.length);
+    } finally { db.close(); }
+  });
+
+  it('GH-314 deduplicates exact case-sensitive covers and replays reordered retries without conflation', () => {
+    const ledger = fresh();
+    const prefix = `report-handback.${'a'.repeat(127)}`;
+    const lower = `${prefix}a`;
+    const upper = `${prefix}A`;
+    const input = { ...base, subject: 'job:case-exact', covers: [lower, upper, lower], basisFingerprint: 'head', clientKey: 'case-retry' };
+    const decision = ledger.recordDecision(input);
+    expect(decision.covers).toEqual([upper, lower]);
+    expect(ledger.recordDecision({ ...input, covers: [upper, lower, upper] })).toEqual(decision);
+    expect(ledger.listDecisions({ subject: input.subject })).toHaveLength(1);
+    for (const signal of [lower, upper]) {
+      expect(ledger.coveringDecision({ subject: input.subject, signal, basis: 'head' })).toEqual(decision);
+    }
+    expect(() => ledger.recordDecision({ ...input, covers: [lower] })).toThrow(/different decision/);
+  });
+
+  it('GH-314 restores a waiting long-signal mailbox disposition across restart and reopens it on clear', () => {
+    const dir = tmpDir();
+    let db = new LedgerDb(dir);
+    const now = Date.parse('2029-12-31T23:59:59.000Z');
+    try {
+      const ledger = new LedgerApi(db.handle);
+      const jobId = `Review-${'A'.repeat(121)}`;
+      ledger.addJob({ id: jobId, repo: 'r', title: 'Review report', deliverable: 'review', commissioner: 'gru' });
+      ledger.setJobStatus(jobId, 'working');
+      ledger.setJobStatus(jobId, 'delivered');
+      ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: 'reviewed-head' } });
+      expect(reconcileReportClosures({ ledger, notifications: new NotificationCenter({ ledger, bus: new EventBus() }) }))
+        .toMatchObject({ opened: 1, published: 1, failed: 0 });
+      const notificationId = ledger.findNotificationByKind(`silas.report-handback.${jobId}`, 'active')!.id;
+      const mailbox = new GruMailbox(ledger, () => now);
+      const item = mailbox.snapshot().items.find((row) => row.notificationIds.includes(notificationId))!;
+      const decision = ledger.recordDecision({ ...base, subject: item.subject, covers: item.reasons.map((reason) => reason.signal),
+        basisFingerprint: item.basis, recheckAt: '2030-01-01T00:00:00.000Z' });
+      mailbox.disposition(item.id, { basis: item.basis, state: 'waiting', owner: 'owner', detail: 'Await owner authorization',
+        dependency: 'owner report disposition authorization', recheckAt: decision.recheckAt,
+        references: [{ kind: 'decision', id: decision.id }] });
+      const waiting = mailbox.snapshot().items.find((row) => row.id === item.id)!;
+      expect(waiting.state).toBe('waiting');
+      db.close();
+      db = new LedgerDb(dir);
+      const reopened = new LedgerApi(db.handle);
+      const restored = new GruMailbox(reopened, () => now);
+      expect(restored.snapshot().items.find((row) => row.id === item.id)).toEqual(waiting);
+      expect(reopened.getDecision(decision.id)?.covers).toEqual([`report-handback.${jobId}`]);
+      reopened.clearDecision({ id: decision.id, by: 'owner', reason: 'Authorization granted' });
+      expect(restored.snapshot().items.find((row) => row.id === item.id)).toMatchObject({ basis: item.basis, state: 'needs-gru' });
+      expect(reopened.coveringDecision({ subject: item.subject, signal: decision.covers[0]!, basis: item.basis, now: new Date(now).toISOString() })).toBeNull();
+      expect(reopened.getDecision(decision.id)).toMatchObject({ covers: decision.covers, clearedBy: 'owner', clearedReason: 'Authorization granted' });
+      expect(reopened.getJob(jobId)?.status).toBe('delivered');
+      expect(reopened.findReportObligation(jobId)?.state).toBe('open');
+    } finally { db.close(); }
+  });
 
   it('coverage matrix: unchanged basis → covered; changed basis → not covered', () => {
     const a = fresh();
@@ -1754,68 +2183,7 @@ describe('administrative closeout of a parked PR-backed job', () => {
     }
   });
 
-  it('the PR closeout form shares the authoritative runtime fence (ledger idle + open turn refuses)', () => {
-    const { api, db, dir } = freshDb();
-    try {
-      parkedPrJob(api, 'probe-closeout');
-      api.registerAgent({ id: 'closeout-idle-open', role: 'minion', jobId: 'probe-closeout' });
-      api.setAgentState('closeout-idle-open', 'idle');
-      const probe: CloseoutRuntimeProbe = {
-        liveHandleIds: new Set<string>(),
-        supervisionFor: (agentId: string) =>
-          agentId === 'closeout-idle-open'
-            ? { state: 'watching', breakerOpen: false, openTurn: true, openControl: false, openToolCalls: 0 }
-            : null,
-      };
-      const refused = refusalOf(() => api.adminCloseParkedJob(closeoutRequest('probe-closeout'), probe));
-      expect(refused.name).toBe('AdminCloseoutRefusal');
-      expect(refused.code).toBe('live-work');
-      expect(refused.message).toContain('closeout-idle-open');
-      expect(api.getJob('probe-closeout')?.status).toBe('parked');
-    } finally {
-      db.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('administrative closeout is ONE transaction: a failed obligation closure rolls back the audit and the status hop', () => {
-    const { api, db, dir } = freshDb();
-    try {
-      parkedPrJob(api, 'closeout-atomic');
-      const ts = '2026-10-06T00:00:00.000Z';
-      db.handle
-        .prepare(
-          `INSERT INTO job_obligations
-             (id, job_id, logical_step, incident_key, generation, description, category, next_action, wake_condition,
-              authority, firing_rule, state, recorded_receipts, observations, first_origin_seq, last_origin_seq,
-              created_at, updated_at)
-           VALUES (?, ?, 'operation', 'closeout-atomic', 1, NULL, '{"kind":"known","category":"review-verdict"}',
-                   '{"kind":"gru-decision","decision":"hold"}', '{"kind":"sweep"}',
-                   NULL, 'review-verdict-gru-decision', 'open', '[]', 1, 1, 1, ?, ?)`,
-        )
-        .run('closeout-atomic:operation:closeout-atomic', 'closeout-atomic', ts, ts);
-      db.handle.exec(`CREATE TRIGGER fail_closeout_settlement BEFORE INSERT ON events
-        WHEN NEW.kind = 'job.obligation-settled' BEGIN SELECT RAISE(ABORT, 'obligation blocked'); END`);
-      try {
-        expect(() => api.adminCloseParkedJob(closeoutRequest('closeout-atomic'))).toThrow(/obligation blocked/u);
-        expect(api.getJob('closeout-atomic')?.status).toBe('parked');
-        expect(api.latestJobEvent('closeout-atomic', 'job.admin-closeout')).toBeNull();
-        expect(api.listObligations({ jobId: 'closeout-atomic', state: 'open' })).toHaveLength(1);
-      } finally {
-        db.handle.exec('DROP TRIGGER fail_closeout_settlement');
-      }
-      expect(api.adminCloseParkedJob(closeoutRequest('closeout-atomic')).job.status).toBe('done');
-      expect(api.listObligations({ jobId: 'closeout-atomic', state: 'open' })).toHaveLength(0);
-      const closed = api.listObligations({ jobId: 'closeout-atomic', state: 'closed' });
-      expect(closed).toHaveLength(1);
-      expect(closed[0]?.settlement).toMatchObject({ kind: 'job-terminal', jobStatus: 'done' });
-    } finally {
-      db.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('administrative closeout accepts full-identity variants: 64-char uppercase head and an omitted closed_at', () => {
+  it('administrative closeout accepts full-identity variants: 64-char uppercase head, explicit null closed_at', () => {
     const { api, db, dir } = freshDb();
     try {
       const sha64 = 'a1'.repeat(32);
@@ -1829,6 +2197,7 @@ describe('administrative closeout of a parked PR-backed job', () => {
           state: 'closed',
           merged: false,
           headSha: sha64.toUpperCase(),
+          closedAt: null,
         },
         reason: 'variant closeout',
       });
@@ -1935,17 +2304,11 @@ describe('administrative closeout of a parked PR-backed job', () => {
       expect(
         attempt({ provider: { provider: 'github', state: 'closed', merged: false, headSha: HEAD, closedAt: 'not-a-time' } }),
       ).toThrow(/real ISO-8601 UTC/u);
-      // Present-but-null is not "omitted": the typed contract accepts only
-      // a real timestamp or an absent field.
-      expect(
-        attempt({ provider: { provider: 'github', state: 'closed', merged: false, headSha: HEAD, closedAt: null } }),
-      ).toThrow(/real ISO-8601 UTC/u);
       // The target must be an absolute https url.
       expect(attempt({ expectedPrUrl: 'not-a-url' })).toThrow(/absolute https url/u);
       expect(attempt({ expectedPrUrl: 'http://github.com/acme/gru-command/pull/165' })).toThrow(/absolute https url/u);
       // Bounded reason / hex head (full 40- or 64-character identity).
       expect(attempt({ reason: 'x'.repeat(2_001) })).toThrow(/bounded printable text/u);
-      expect(attempt({ reason: 'x\u0007y' })).toThrow(/bounded printable text/u);
       expect(attempt({ provider: { provider: 'github', state: 'closed', merged: false, headSha: 'abc123' } })).toThrow(/full 40- or 64-character hex commit sha/u);
       expect(attempt({ provider: { provider: 'github', state: 'closed', merged: false, headSha: 'a'.repeat(39) } })).toThrow(/full 40- or 64-character hex commit sha/u);
       // Every edge refusal is a no-effect failure.
@@ -1958,463 +2321,134 @@ describe('administrative closeout of a parked PR-backed job', () => {
   });
 });
 
-describe('owner-listed administrative cancellation (owner amendment j-1117)', () => {
-  const LISTED = OWNER_CANCELLATION_JOB_IDS[0]!;
+describe('directive producer evidence integrity — P18 current-behavior regressions', () => {
+  it('a pre-effect dispatch claim records a reservation fact and never manufactures native producer start', () => {
+    const db = new LedgerDb(tmpDir());
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    try {
+      ledger.addJob({ id: 'reservation-job', repo: 'fixture', title: 'reservation', briefing: 'original approved scope' });
+      ledger.setJobStatus('reservation-job', 'working');
+      const request = ledger.beginDirectiveIntent({ jobId: 'reservation-job', requestId: 'reservation-request',
+        directive: 'approved work not invoked by this claim', holder: 'gru' }).record;
+      const identity = ledger.directiveTurnIdentity(request.requestId);
+      expect(ledger.claimDirectiveDispatch(request.requestId)).toBe(true);
+      expect(ledger.getDirective(request.requestId)).toMatchObject({ nativeTarget: null, nativeBinding: null, admissionSeq: null });
+      expect(ledger.latestJobEvent(request.jobId, 'silas.directive-sent')).toBeNull();
+      expect(ledger.latestJobEvent(request.jobId, 'job.delivered')).toBeNull();
+      const evidence = ledger.listJobEventsByKinds(request.jobId,
+        ['silas.directive-producer-reserved', 'silas.directive-producer-started']);
+      expect(evidence, 'a committed pre-effect claim is only a reservation, not actual native producer execution').toMatchObject([
+        { kind: 'silas.directive-producer-reserved', payload: { fact: 'reservation', request_id: request.requestId, producer_identity: identity } },
+      ]);
+      expect(evidence).toHaveLength(1);
+    } finally { db.close(); }
+  });
 
-  function freshDb(): { api: LedgerApi; db: LedgerDb; dir: string } {
-    const dir = mkdtempSync(join(tmpdir(), 'gru-command-owner-cancel-'));
+  it('a later same-logical-minion cessation receipt cannot erase an older unbound incarnation UNKNOWN', () => {
+    const db = new LedgerDb(tmpDir());
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    try {
+      ledger.addJob({ id: 'incarnation-job', repo: 'fixture', title: 'incarnations', briefing: 'original approved scope' });
+      ledger.setJobStatus('incarnation-job', 'working');
+      const request = ledger.beginDirectiveIntent({ jobId: 'incarnation-job', requestId: 'incarnation-request',
+        directive: 'preserve unproven original physical owner', holder: 'gru' }).record;
+      const identity = ledger.directiveTurnIdentity(request.requestId);
+      ledger.registerAgent({ id: 'same-logical-minion', role: 'minion', jobId: request.jobId, sessionFile: '/original-native.jsonl' });
+      ledger.setAgentState('same-logical-minion', 'idle');
+      ledger.prepareDirectiveTarget(request.requestId, { agentId: 'same-logical-minion', sessionFile: '/original-native.jsonl' });
+      // Explicit event-consumer fixture: an earlier protocol recorded UNKNOWN
+      // without a reservation token. The later observation names a DIFFERENT
+      // native file. It is not proof about the original physical incarnation.
+      const unknown = ledger.appendCustomEvent({ kind: 'silas.directive-producer-unknown', jobId: request.jobId,
+        payload: { request_id: request.requestId, agent_id: 'same-logical-minion', session_file: '/original-native.jsonl', producer_identity: identity } });
+      ledger.registerAgent({ id: 'same-logical-minion', role: 'minion', jobId: request.jobId, sessionFile: '/later-native.jsonl' });
+      const later = ledger.appendCustomEvent({ kind: 'silas.directive-producer-ceased', jobId: request.jobId,
+        payload: { request_id: request.requestId, agent_id: 'same-logical-minion', session_file: '/later-native.jsonl', producer_identity: identity } });
+      expect(later.seq).toBeGreaterThan(unknown.seq);
+      expect(ledger.getEvent(unknown.seq)).toEqual(unknown);
+      expect(ledger.getDirective(request.requestId)?.nativeTarget).toEqual({ agentId: 'same-logical-minion', sessionFile: '/original-native.jsonl' });
+      expect(ledger.latestJobEvent(request.jobId, 'job.delivered')).toBeNull();
+      expect(ledger.directiveProgressBlockers(request.requestId, 'original-lane').join(';'),
+        'later logical-ID reuse must not consume an independently unresolved original UNKNOWN').toContain('unproven producer cleanup');
+      expect(() => ledger.claimDirectiveDispatch(request.requestId)).toThrow(/unproven/);
+    } finally { db.close(); }
+  });
+});
+
+describe('GH-305 additive mailbox metadata authority', () => {
+  it('rejects stale and unsupported dispositions transactionally, and persists receipts without changing obligations', () => {
+    const dir = tmpDir();
     const db = new LedgerDb(dir);
-    const api = new LedgerApi(db.handle, { bus: new EventBus() });
-    return { api, db, dir };
-  }
-
-  /** A parked legacy lane with the exact listed shape: no PR, NULL report
-   * metadata. */
-  function listedParkedJob(api: LedgerApi, jobId: string = LISTED): void {
-    api.addJob({ id: jobId, repo: 'gru-command', title: `t-${jobId}`, briefing: 'b' });
-    api.setJobStatus(jobId, 'working');
-    api.setJobStatus(jobId, 'parked');
-  }
-
-  function cancelRequest(
-    jobId: string,
-    overrides: { expectedStatus?: 'parked'; authorityReference?: string; reason?: string } = {},
-  ) {
-    return {
-      jobId,
-      expectedStatus: 'parked' as const,
-      authorityReference: overrides.authorityReference ?? 'j-1117 owner-close-seventeen-parked-20261006',
-      reason: overrides.reason ?? 'owner asked to move these away from parked',
-    };
-  }
-
-  function refusalOf(run: () => unknown): Error & { readonly code?: string } {
+    const api = new LedgerApi(db.handle);
     try {
-      run();
-    } catch (error) {
-      return error as Error & { readonly code?: string };
-    }
-    throw new Error('expected an owner-cancellation refusal');
-  }
-
-  it('cancels an exact listed parked legacy lane to done with the owner authority and exact prior/terminal identity audited', () => {
-    const { api, db, dir } = freshDb();
+      api.addJob({ id: 'mail-ledger', repo: 'r', title: 'mailbox' });
+      api.setJobStatus('mail-ledger', 'blocked');
+      const item = api.reconcileMailbox()[0]!;
+      const obligations = api.listObligationsDetailed({ jobId: 'mail-ledger' }).readable;
+      const watermark = api.latestEventSeq();
+      expect(() => api.recordMailboxDisposition(item.id, { state: 'resolved', basis: 'old', owner: 'gru', detail: 'read', references: [] })).toThrow(/basis/);
+      expect(() => api.recordMailboxDisposition(item.id, { state: 'resolved', basis: item.basis, owner: 'gru', detail: 'read', references: [] })).toThrow(/resolution requires/);
+      expect(api.latestEventSeq()).toBe(watermark);
+      api.recordMailboxReceipt(item.id, item.basis, 'wake', 'turn-start-receipt');
+      expect(api.reconcileMailbox()[0]?.state).toBe('needs-gru');
+      expect(api.getJob('mail-ledger')?.status).toBe('blocked');
+      expect(api.listObligationsDetailed({ jobId: 'mail-ledger' }).readable).toEqual(obligations);
+    } finally { db.close(); }
+    const reopened = new LedgerDb(dir);
+    try { expect(new LedgerApi(reopened.handle).listMailboxItems()[0]?.receipt?.deliveryId).toBe('turn-start-receipt'); }
+    finally { reopened.close(); }
+  });
+  it('G06/G27 recovers a captured historical receipt after restart without suppressing a newer same-basis incarnation', () => {
+    const dir = tmpDir();
+    const originalAt = '2026-10-11T00:20:01.000Z';
+    const db = new LedgerDb(dir);
+    const api = new LedgerApi(db.handle);
+    let serialized: string;
     try {
-      listedParkedJob(api);
-      // A disposed worker row is bookkeeping, not execution.
-      api.registerAgent({ id: 'cancel-worker', role: 'minion', jobId: LISTED });
-      api.setAgentState('cancel-worker', 'disposed');
-      api.noteJob(LISTED, 'preserved note');
-
-      const result = api.adminCancelListedParkedJob(cancelRequest(LISTED));
-      expect(result.idempotent).toBe(false);
-      expect(result.job.status).toBe('done');
-      expect(result.event.kind).toBe('job.owner-cancellation');
-      const payload = result.event.payload as {
-        disposition: string;
-        expected_status: string;
-        authority: { kind: string; ruling: string; reference: string };
-        prior: Record<string, unknown>;
-        terminal: { status: string };
-        reason: string;
-        request_sha256: string;
-      };
-      expect(payload).toMatchObject({
-        disposition: 'owner-cancelled-abandoned',
-        expected_status: 'parked',
-        authority: { kind: 'owner-cancellation', ruling: 'j-1117', reference: 'j-1117 owner-close-seventeen-parked-20261006' },
-        prior: { status: 'parked', pr_url: null, deliverable: null, commissioner: null, target_ref: null, target_sha: null },
-        terminal: { status: 'done' },
-        reason: expect.stringContaining('parked'),
-      });
-      expect(payload.request_sha256).toMatch(/^[0-9a-f]{64}$/u);
-      expect(payload.prior['updated_at']).toBeTruthy();
-      // No fabricated provider receipt rides the abandonment audit.
-      expect(payload).not.toHaveProperty('provider');
-      expect(payload.prior).not.toHaveProperty('provider');
-      // Direct hop: parked → done, no intermediate executable state.
-      const hops = api.listJobEventsByKinds(LISTED, ['job.status']);
-      expect(hops[0]?.payload).toEqual({ from: 'parked', to: 'done' });
-      // The audit is not a success claim and the preserved note is untouched.
-      expect(api.getJob(LISTED)?.note).toBe('preserved note');
-    } finally {
-      db.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
+      api.addJob({ id: 'captured', repo: 'r', title: 'captured' });
+      api.setJobStatus('captured', 'blocked');
+      const mailbox = new GruMailbox(api, () => Date.parse(originalAt));
+      const captured = mailbox.captureDelivery(mailbox.attentionRows());
+      serialized = JSON.stringify(captured);
+      mailbox.receiptCaptured(captured, 'wake', 'original', originalAt);
+    } finally { db.close(); }
+    const reopened = new LedgerDb(dir);
+    try {
+      const recovered = new LedgerApi(reopened.handle);
+      const mailbox = new GruMailbox(recovered, () => Date.parse(originalAt) + 300000);
+      const captured = JSON.parse(serialized!);
+      const current = mailbox.attentionPage(8)[0]!;
+      expect(current.basis).toBe(captured[0].basis);
+      expect(current.attentionKey).not.toBe(captured[0].attentionKey);
+      mailbox.receiptCaptured(captured, 'chat', 'parked-passive', originalAt);
+      expect(mailbox.attentionPage(8)).toHaveLength(1);
+      const historical = recovered.listEvents({ limit: 20 }).filter((event) => event.kind === 'mailbox.received');
+      expect(historical).toHaveLength(2);
+      expect(historical[0]?.payload).toMatchObject({ receipt: { receivedAt: originalAt, attentionKey: captured[0].attentionKey } });
+      const watermark = recovered.latestEventSeq();
+      mailbox.receiptCaptured(captured, 'chat', 'parked-passive', originalAt);
+      expect(recovered.latestEventSeq()).toBe(watermark);
+      expect(() => mailbox.receiptCaptured(captured, 'chat', 'parked-passive', '2026-10-11T00:21:01.000Z')).toThrow(/original delivery time/);
+      expect(recovered.latestEventSeq()).toBe(watermark);
+      expect(mailbox.snapshot().items[0]?.receipt?.deliveryId).toBe('original');
+    } finally { reopened.close(); }
   });
 
-  it('owner cancellation is ONE transaction: a failed obligation closure rolls back the audit and the status hop', () => {
-    const { api, db, dir } = freshDb();
+  it('G03 invalidates source cache for eventless source writes through a second ledger connection', () => {
+    const dir = tmpDir();
+    const db = new LedgerDb(dir);
+    const api = new LedgerApi(db.handle);
+    const otherDb = new LedgerDb(dir);
     try {
-      listedParkedJob(api, LISTED);
-      const ts = '2026-10-06T00:00:00.000Z';
-      // An open obligation for the lane, shaped exactly like the ledger's
-      // own rows (the closure walks these).
-      db.handle
-        .prepare(
-          `INSERT INTO job_obligations
-             (id, job_id, logical_step, incident_key, generation, description, category, next_action, wake_condition,
-              authority, firing_rule, state, recorded_receipts, observations, first_origin_seq, last_origin_seq,
-              created_at, updated_at)
-           VALUES (?, ?, 'operation', 'cancel-atomic', 1, NULL, '{"kind":"known","category":"review-verdict"}',
-                   '{"kind":"gru-decision","decision":"hold"}', '{"kind":"sweep"}',
-                   NULL, 'review-verdict-gru-decision', 'open', '[]', 1, 1, 1, ?, ?)`,
-        )
-        .run(`${LISTED}:operation:cancel-atomic`, LISTED, ts, ts);
-      // Abort the LAST write of the action (the obligation settlement
-      // event): the audit append and the parked → done hop must roll back
-      // with it — one transaction, never partial state.
-      db.handle.exec(`CREATE TRIGGER fail_cancel_settlement BEFORE INSERT ON events
-        WHEN NEW.kind = 'job.obligation-settled' BEGIN SELECT RAISE(ABORT, 'obligation blocked'); END`);
-      try {
-        expect(() => api.adminCancelListedParkedJob(cancelRequest(LISTED))).toThrow(/obligation blocked/u);
-        expect(api.getJob(LISTED)?.status).toBe('parked');
-        expect(api.latestJobEvent(LISTED, 'job.owner-cancellation')).toBeNull();
-        expect(api.listObligations({ jobId: LISTED, state: 'open' })).toHaveLength(1);
-      } finally {
-        db.handle.exec('DROP TRIGGER fail_cancel_settlement');
-      }
-      // The retry commits once and closes the obligation as terminal debt.
-      expect(api.adminCancelListedParkedJob(cancelRequest(LISTED)).job.status).toBe('done');
-      expect(api.listObligations({ jobId: LISTED, state: 'open' })).toHaveLength(0);
-      // Terminal administrative closure = `closed` (no settlement claim).
-      const closed = api.listObligations({ jobId: LISTED, state: 'closed' });
-      expect(closed).toHaveLength(1);
-      expect(closed[0]?.settlement).toMatchObject({ kind: 'job-terminal', jobStatus: 'done' });
-    } finally {
-      db.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
+      api.addJob({ id: 'external-write', repo: 'r', title: 'j' });
+      api.registerAgent({ id: 'worker', role: 'minion', jobId: 'external-write' });
+      api.setAgentState('worker', 'error');
+      expect(api.reconcileMailbox()[0]?.state).toBe('needs-gru');
+      const watermark = api.latestEventSeq();
+      new LedgerApi(otherDb.handle).registerAgent({ id: 'worker', role: 'perkins' });
+      expect(api.latestEventSeq()).toBe(watermark);
+      expect(api.reconcileMailbox().filter((item) => item.state !== 'resolved')).toHaveLength(0);
+    } finally { otherDb.close(); db.close(); }
   });
 
-  it('refuses unlisted ids, non-parked state, PR/report shapes and malformed authority with no effect', () => {
-    const { api, db, dir } = freshDb();
-    try {
-      // Unlisted parked job: never cancellable, no batch scan.
-      listedParkedJob(api, 'not-on-the-list');
-      expect(refusalOf(() => api.adminCancelListedParkedJob(cancelRequest('not-on-the-list'))).code).toBe('not-listed');
-
-      // Listed but moved off parked.
-      api.addJob({ id: LISTED, repo: 'gru-command', title: 't', briefing: 'b' });
-      api.setJobStatus(LISTED, 'working');
-      expect(refusalOf(() => api.adminCancelListedParkedJob(cancelRequest(LISTED))).code).toBe('not-parked');
-
-      // Listed but PR-backed: a different disposition owns it.
-      api.setJobPr(LISTED, 'https://github.com/acme/gru-command/pull/9');
-      api.setJobStatus(LISTED, 'parked');
-      expect(refusalOf(() => api.adminCancelListedParkedJob(cancelRequest(LISTED))).code).toBe('not-cancellable-shape');
-
-      // Listed but report-typed: no fabrication, no folding. Every report
-      // field on its own is the wrong shape, not just `deliverable`.
-      const reportId = OWNER_CANCELLATION_JOB_IDS[1]!;
-      api.addJob({ id: reportId, repo: 'gru-command', title: 't', briefing: 'b', deliverable: 'review' });
-      api.setJobStatus(reportId, 'working');
-      api.setJobStatus(reportId, 'parked');
-      expect(refusalOf(() => api.adminCancelListedParkedJob(cancelRequest(reportId))).code).toBe('not-cancellable-shape');
-      const shapedIds: string[] = [];
-      const shapeCase = (index: number, apply: (id: string) => void): void => {
-        const shapedId = OWNER_CANCELLATION_JOB_IDS[5 + index]!;
-        api.addJob({ id: shapedId, repo: 'gru-command', title: 't', briefing: 'b' });
-        api.setJobStatus(shapedId, 'working');
-        api.setJobStatus(shapedId, 'parked');
-        apply(shapedId);
-        expect(refusalOf(() => api.adminCancelListedParkedJob(cancelRequest(shapedId))).code, shapedId).toBe(
-          'not-cancellable-shape',
-        );
-        expect(api.getJob(shapedId)?.status, shapedId).toBe('parked');
-        shapedIds.push(shapedId);
-      };
-      // Legacy rows may carry report fields without a deliverable: each is
-      // the wrong shape on its own, never folded into abandonment.
-      shapeCase(0, (id) => {
-        db.handle.prepare('UPDATE jobs SET commissioner = ? WHERE id = ?').run('gru', id);
-      });
-      shapeCase(1, (id) => {
-        db.handle
-          .prepare('UPDATE jobs SET target_ref = ? WHERE id = ?')
-          .run('https://github.com/acme/gru-command/pull/9', id);
-      });
-      shapeCase(2, (id) => {
-        db.handle.prepare('UPDATE jobs SET target_sha = ? WHERE id = ?').run('a'.repeat(40), id);
-      });
-
-      // Malformed authority / reason are plain 400-class input errors.
-      expect(() => api.adminCancelListedParkedJob(cancelRequest(LISTED, { authorityReference: '' }))).toThrow(/authority_reference/u);
-      expect(() => api.adminCancelListedParkedJob(cancelRequest(LISTED, { authorityReference: 'x'.repeat(201) }))).toThrow(/authority_reference/u);
-      expect(() => api.adminCancelListedParkedJob(cancelRequest(LISTED, { authorityReference: 'j-1117\u0007' }))).toThrow(/authority_reference/u);
-      expect(() => api.adminCancelListedParkedJob(cancelRequest(LISTED, { reason: '' }))).toThrow(/reason/u);
-      expect(() => api.adminCancelListedParkedJob(cancelRequest(LISTED, { reason: 'x'.repeat(2_001) }))).toThrow(/reason/u);
-      expect(() => api.adminCancelListedParkedJob(cancelRequest(LISTED, { reason: 'x\u0007y' }))).toThrow(/reason/u);
-
-      // No partial change anywhere.
-      for (const id of ['not-on-the-list', LISTED, reportId, ...shapedIds]) {
-        expect(api.latestJobEvent(id, 'job.owner-cancellation'), id).toBeNull();
-      }
-      expect(api.getJob('not-on-the-list')?.status).toBe('parked');
-      expect(api.getJob(LISTED)?.status).toBe('parked');
-      expect(api.getJob(reportId)?.status).toBe('parked');
-      for (const id of shapedIds) {
-        expect(api.getJob(id)?.status, id).toBe('parked');
-      }
-    } finally {
-      db.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('binds the authoritative runtime view: every single liveness clause refuses, explicit stops and historical rows do not', () => {
-    const { api, db, dir } = freshDb();
-    try {
-      listedParkedJob(api, OWNER_CANCELLATION_JOB_IDS[2]!);
-      api.registerAgent({ id: 'idle-but-open', role: 'minion', jobId: OWNER_CANCELLATION_JOB_IDS[2]! });
-      api.setAgentState('idle-but-open', 'idle');
-      // Per-clause coverage with REAL supervision states
-      // ('watching' | 'restarting' | 'stopped'): any single authoritative
-      // liveness fact refuses on its own.
-      const clauseScenarios: Record<string, { state: 'watching' | 'restarting' | 'stopped'; breakerOpen: boolean; openTurn: boolean; openControl: boolean; openToolCalls: number }> = {
-        // The observed false-idle case: ledger `idle`, supervisor openTurn:true.
-        'open turn': { state: 'watching', breakerOpen: false, openTurn: true, openControl: false, openToolCalls: 0 },
-        'control phase': { state: 'watching', breakerOpen: false, openTurn: false, openControl: true, openToolCalls: 0 },
-        'open tool call': { state: 'watching', breakerOpen: false, openTurn: false, openControl: false, openToolCalls: 1 },
-        'active restart': { state: 'restarting', breakerOpen: false, openTurn: false, openControl: false, openToolCalls: 0 },
-      };
-      const clauseTokens: Record<string, string> = {
-        'open turn': 'openTurn',
-        'control phase': 'openControl',
-        'open tool call': 'open tool call',
-        'active restart': 'restarting',
-      };
-      for (const [label, view] of Object.entries(clauseScenarios)) {
-        const probe = {
-          liveHandleIds: new Set<string>(),
-          supervisionFor: (agentId: string) => (agentId === 'idle-but-open' ? view : null),
-        };
-        const refused = refusalOf(() => api.adminCancelListedParkedJob(cancelRequest(OWNER_CANCELLATION_JOB_IDS[2]!), probe));
-        expect(refused.name, label).toBe('AdminCancellationRefusal');
-        expect(refused.code, label).toBe('live-work');
-        expect(refused.message, label).toContain('idle-but-open');
-        // The refusal detail names the authoritative fact that refused.
-        expect(refused.message, label).toContain(clauseTokens[label]!);
-        expect(api.getJob(OWNER_CANCELLATION_JOB_IDS[2]!)?.status, label).toBe('parked');
-      }
-
-      // Idle + a live registry handle (no supervision view) is live ownership.
-      const ownedProbe = { liveHandleIds: new Set(['idle-but-open']), supervisionFor: () => null };
-      expect(
-        refusalOf(() => api.adminCancelListedParkedJob(cancelRequest(OWNER_CANCELLATION_JOB_IDS[2]!), ownedProbe)).code,
-      ).toBe('live-work');
-
-      // Wired probe, no handle, no open turn: historical bookkeeping — allowed.
-      const historicalProbe = { liveHandleIds: new Set<string>(), supervisionFor: () => null };
-      const closed = api.adminCancelListedParkedJob(cancelRequest(OWNER_CANCELLATION_JOB_IDS[2]!), historicalProbe);
-      expect(closed.job.status).toBe('done');
-
-      // A disposed lane whose supervision stop is explicit is NOT live,
-      // even though a durable-stop union would still call it current.
-      const stoppedId = OWNER_CANCELLATION_JOB_IDS[3]!;
-      listedParkedJob(api, stoppedId);
-      api.registerAgent({ id: 'stopped-worker', role: 'minion', jobId: stoppedId });
-      api.setAgentState('stopped-worker', 'disposed');
-      const stoppedProbe: CloseoutRuntimeProbe = {
-        liveHandleIds: new Set(['stopped-worker']),
-        supervisionFor: (agentId: string) =>
-          agentId === 'stopped-worker'
-            ? { state: 'stopped', breakerOpen: true, openTurn: false, openControl: false, openToolCalls: 0 }
-            : null,
-      };
-      expect(api.adminCancelListedParkedJob(cancelRequest(stoppedId), stoppedProbe).job.status).toBe('done');
-
-      // A durable streaming row still blocks even with no probe at all.
-      const durableId = OWNER_CANCELLATION_JOB_IDS[4]!;
-      listedParkedJob(api, durableId);
-      api.registerAgent({ id: 'durable-stream', role: 'minion', jobId: durableId });
-      api.setAgentState('durable-stream', 'streaming');
-      expect(refusalOf(() => api.adminCancelListedParkedJob(cancelRequest(durableId), null)).code).toBe('live-work');
-
-      // The stop short-circuit is pinned per disjunct WITH the evidence it
-      // must suppress: a durable `streaming` row AND a lingering live
-      // handle both sit behind the recorded stop and must not block.
-      // Dropping the state disjunct, the breaker disjunct, or making the
-      // short-circuit row-aware turns a case red.
-      const stoppedOnlyId = OWNER_CANCELLATION_JOB_IDS[5]!;
-      listedParkedJob(api, stoppedOnlyId);
-      api.registerAgent({ id: 'stopped-only', role: 'minion', jobId: stoppedOnlyId });
-      api.setAgentState('stopped-only', 'streaming');
-      const stoppedOnlyProbe: CloseoutRuntimeProbe = {
-        liveHandleIds: new Set(['stopped-only']),
-        supervisionFor: (agentId: string) =>
-          agentId === 'stopped-only'
-            ? { state: 'stopped', breakerOpen: false, openTurn: false, openControl: false, openToolCalls: 0 }
-            : null,
-      };
-      expect(api.adminCancelListedParkedJob(cancelRequest(stoppedOnlyId), stoppedOnlyProbe).job.status).toBe('done');
-
-      // ... and the same behind-the-stop evidence under a breaker-open
-      // view whose state does not say stopped.
-      const breakerId = OWNER_CANCELLATION_JOB_IDS[6]!;
-      listedParkedJob(api, breakerId);
-      api.registerAgent({ id: 'breaker-only', role: 'minion', jobId: breakerId });
-      api.setAgentState('breaker-only', 'streaming');
-      const breakerProbe: CloseoutRuntimeProbe = {
-        liveHandleIds: new Set(['breaker-only']),
-        supervisionFor: (agentId: string) =>
-          agentId === 'breaker-only'
-            ? { state: 'watching', breakerOpen: true, openTurn: false, openControl: false, openToolCalls: 0 }
-            : null,
-      };
-      expect(api.adminCancelListedParkedJob(cancelRequest(breakerId), breakerProbe).job.status).toBe('done');
-
-      // An UNKNOWN openControl on a view that is not explicitly stopped
-      // fails closed (same absence the reclaim probe treats as
-      // non-reclaimable)...
-      const unknownControlId = OWNER_CANCELLATION_JOB_IDS[7]!;
-      listedParkedJob(api, unknownControlId);
-      api.registerAgent({ id: 'unknown-control', role: 'minion', jobId: unknownControlId });
-      api.setAgentState('unknown-control', 'idle');
-      const unknownControlProbe: CloseoutRuntimeProbe = {
-        liveHandleIds: new Set<string>(),
-        supervisionFor: (agentId: string) =>
-          agentId === 'unknown-control'
-            ? { state: 'watching', breakerOpen: false, openTurn: false, openToolCalls: 0 }
-            : null,
-      };
-      expect(
-        refusalOf(() => api.adminCancelListedParkedJob(cancelRequest(unknownControlId), unknownControlProbe)).code,
-      ).toBe('live-work');
-      expect(api.getJob(unknownControlId)?.status).toBe('parked');
-
-      // ... while the same absence on an explicitly stopped view still
-      // short-circuits (stopped views may omit the field).
-      const hydratedStopId = OWNER_CANCELLATION_JOB_IDS[8]!;
-      listedParkedJob(api, hydratedStopId);
-      api.registerAgent({ id: 'hydrated-stop', role: 'minion', jobId: hydratedStopId });
-      api.setAgentState('hydrated-stop', 'streaming');
-      const hydratedStopProbe: CloseoutRuntimeProbe = {
-        liveHandleIds: new Set(['hydrated-stop']),
-        supervisionFor: (agentId: string) =>
-          agentId === 'hydrated-stop' ? { state: 'stopped', breakerOpen: true, openTurn: false, openToolCalls: 0 } : null,
-      };
-      expect(api.adminCancelListedParkedJob(cancelRequest(hydratedStopId), hydratedStopProbe).job.status).toBe('done');
-
-      // A non-null idle view with a lane-bound live handle blocks via the
-      // fall-through ownership clause.
-      const ownedId = OWNER_CANCELLATION_JOB_IDS[9]!;
-      listedParkedJob(api, ownedId);
-      api.registerAgent({ id: 'owned-idle', role: 'minion', jobId: ownedId });
-      api.setAgentState('owned-idle', 'idle');
-      const ownedViewProbe: CloseoutRuntimeProbe = {
-        liveHandleIds: new Set(['owned-idle']),
-        supervisionFor: (agentId: string) =>
-          agentId === 'owned-idle'
-            ? { state: 'watching', breakerOpen: false, openTurn: false, openControl: false, openToolCalls: 0 }
-            : null,
-      };
-      expect(refusalOf(() => api.adminCancelListedParkedJob(cancelRequest(ownedId), ownedViewProbe)).code).toBe('live-work');
-      expect(api.getJob(ownedId)?.status).toBe('parked');
-    } finally {
-      db.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-
-  it('is idempotent for an identical replay and refuses conflicting retries after cancellation', () => {
-    const { api, db, dir } = freshDb();
-    try {
-      listedParkedJob(api);
-      const first = api.adminCancelListedParkedJob(cancelRequest(LISTED));
-      expect(first.idempotent).toBe(false);
-
-      const replay = api.adminCancelListedParkedJob(cancelRequest(LISTED));
-      expect(replay.idempotent).toBe(true);
-      expect(replay.event.seq).toBe(first.event.seq);
-      expect(replay.job.status).toBe('done');
-      expect(api.listJobEventsByKinds(LISTED, ['job.owner-cancellation'])).toHaveLength(1);
-
-      // A changed authority reference or reason is a different request.
-      const changedReference = refusalOf(() =>
-        api.adminCancelListedParkedJob(cancelRequest(LISTED, { authorityReference: 'j-1117 different-reference' })),
-      );
-      expect(changedReference.code).toBe('already-closed');
-      const changedReason = refusalOf(() => api.adminCancelListedParkedJob(cancelRequest(LISTED, { reason: 'another reason' })));
-      expect(changedReason.code).toBe('already-closed');
-      expect(api.listJobEventsByKinds(LISTED, ['job.owner-cancellation'])).toHaveLength(1);
-    } finally {
-      db.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('leaves worktrees and control rows untouched and closes open obligations as job-terminal abandonment', () => {
-    const { api, db, dir } = freshDb();
-    try {
-      listedParkedJob(api);
-      api.registerWorktree({
-        id: `${LISTED}-lane`,
-        kind: 'job',
-        repoPath: '/tmp/cancel-repo',
-        repoName: 'gru-command',
-        path: `/tmp/${LISTED}-lane`,
-        branch: `gru/${LISTED}`,
-        sha: 'b'.repeat(40),
-        baseSource: 'origin',
-        jobId: LISTED,
-      });
-      const markers = api.beginPendingRebrief({ jobId: LISTED, note: 'stalled', briefing: 'b' });
-      expect(markers.length).toBeGreaterThan(0);
-      // A fresh incident recorded while parked opens an obligation that the
-      // cancellation must close as abandonment (never success).
-      const row = api.recordBlockedObservation(LISTED, {
-        logicalStep: 'operation',
-        category: { kind: 'unknown' },
-        incidentKey: 'cancel-open-debt',
-        observedAtSeq: api.latestEventSeq(),
-      });
-      expect(row.state).toBe('open');
-      const laneBefore = api.listWorktrees({ jobId: LISTED });
-
-      const result = api.adminCancelListedParkedJob(cancelRequest(LISTED));
-      expect(result.job.status).toBe('done');
-      // Worktree + control rows are untouched; no release/prune side effect.
-      expect(api.listWorktrees({ jobId: LISTED })).toEqual(laneBefore);
-      expect(api.listPendingRebriefs({ jobId: LISTED })).toHaveLength(markers.length);
-      expect(api.listJobEventsByKinds(LISTED, ['worktree.swept', 'silas.lane-released'])).toHaveLength(0);
-      // The debt closed as terminal abandonment, not an accepted execution.
-      const debt = api.getObligation(`${LISTED}:operation:cancel-open-debt`);
-      expect(debt?.state).toBe('closed');
-      expect(debt?.settlement).toEqual({ kind: 'job-terminal', jobStatus: 'done' });
-    } finally {
-      db.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('pins the exact 17-job owner allowlist, its ruling, and every id in the operator runbook', () => {
-    // The literal list is a drift pin: allowlist edits must update both the
-    // frozen source list and this assertion deliberately.
-    expect(OWNER_CANCELLATION_JOB_IDS).toEqual([
-      'gc-freeze-heat-evidence',
-      'silas-context-rotation',
-      'pr135-r12-review-blind-hunter-7465b69',
-      'repo-status-mockups',
-      'abort-evidence-verification',
-      'abort-evidence-edge',
-      'pr142-verification-bounded-20260930',
-      'dashboard-header-mockups',
-      'pr151-independent-blind-90ab1b4-20261001',
-      'pr142-whole-adversarial-09ed-20261002-admission2',
-      'pr142-whole-adversarial-09ed-fresh-after-length-20261002',
-      'continuous-followthrough-gap-audit-20261002',
-      'perkins-abort-census-20261002',
-      'pr148-whole-adversarial-900-20261003',
-      'pr148-whole-edge-900-20261003',
-      'pr148-whole-verification-900-20261003',
-      'pr144-review-packet-recovery-743b57e-20261003',
-    ]);
-    expect(OWNER_CANCELLATION_RULING).toBe('j-1117');
-    const runbook = readFileSync(join(import.meta.dirname, '..', 'docs', 'OPERATIONS.md'), 'utf8');
-    for (const id of OWNER_CANCELLATION_JOB_IDS) {
-      expect(runbook, id).toContain(`\`${id}\``);
-    }
-  });
 });

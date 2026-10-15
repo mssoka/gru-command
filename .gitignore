@@ -1,3 +1,6 @@
+# macOS
+.DS_Store
+
 # Build output
 dist/
 web/dist/
@@ -9,6 +12,7 @@ coverage/
 web/playwright-report/
 web/test-results/
 web/test-results-crew/
+web/test-results-repo-overview/
 # Logs
 *.log
 # Local env — never commit secrets
@@ -18,3 +22,10 @@ web/test-results-crew/
 .lavish/
 _bmad-output/
 _bmad/render/
+# GH350 real-tool fixture provisioning (Root-approved 2026-10-14): the
+# committed lock identity is the source of truth; node_modules and the
+# per-stage evidence area are materialized locally and never committed.
+test/fixtures/property/real-tool/node_modules/
+test/fixtures/property/real-tool/.provisioning/
+# GH350 lane cold-start inputs (positively copied per worktree; see lane board)
+_bmad-inputs/

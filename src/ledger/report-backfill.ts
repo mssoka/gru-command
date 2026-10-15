@@ -262,6 +262,9 @@ export function planLegacyReportBackfill(
     // by re-review. A later implementation lane, an undelivered dispatch,
     // and a different report kind (an artifact does not replace a review's
     // findings) are all NOT evidence.
+    // A DISCARDED (binned) newer report deliberately does not supersede:
+    // the discard voids the coverage claim, so the older debt stays
+    // visible rather than being erased by work that was thrown away.
     const newer = siblings
       .filter(
         (candidate) =>

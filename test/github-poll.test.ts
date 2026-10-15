@@ -1,9 +1,21 @@
-import { describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { execFileSync, spawn } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { createHash } from 'node:crypto';
+import { captureSources, INTAKE_MAX_SOURCE_BYTES } from '../src/intake/sources.js';
+
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return { ...actual, spawn: vi.fn(() => { throw new Error('test refuses unmocked child spawn; no live gh calls'); }) };
+});
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { IntakeService } from '../src/intake/service.js';
+import { digest } from '../src/intake/types.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   BRANCH_STATE_EVENT,
+  defaultGhRunner,
   GhApiError,
   GhCliApi,
   GhRateLimitedError,
@@ -332,6 +344,8 @@ describe('tracked lanes', () => {
       mkJob('job-no-lane', 'in-review', 'https://github.com/acme/app/pull/8');
       mkJob('job-merged', 'done', 'https://github.com/acme/app/pull/9');
       register('job-merged', 'gru/job-merged', '/repos/app');
+      mkJob('job-binned', 'binned', 'https://github.com/acme/app/pull/10');
+      register('job-binned', 'gru/job-binned', '/repos/app');
 
       const remotes = new Map<string, RepoRef>([
         ['/repos/app', REPO],
@@ -437,6 +451,36 @@ describe('gh CLI adapter', () => {
     ]);
   });
 
+  it('listPullsForHead asks the owner-qualified head filter and returns only that head (issue #243 R2-M5)', async () => {
+    const asked: string[] = [];
+    const runner: GhCommandRunner = async (args) => {
+      const path = args[args.length - 1] ?? '';
+      asked.push(path);
+      // Query-dependent: only the requested owner:branch returns a pull, so
+      // a dropped `head` parameter would change the returned identity.
+      const matches = path.includes('head=acme%3Agru%2Fjob-1');
+      const pulls = [
+        {
+          number: matches ? 11 : 12,
+          head: { ref: matches ? 'gru/job-1' : 'other', sha: matches ? 'sha-a' : 'sha-b' },
+          state: 'open',
+          merged_at: null,
+          mergeable_state: null,
+          merge_commit_sha: null,
+          html_url: matches
+            ? 'https://github.com/acme/app/pull/11'
+            : 'https://github.com/acme/app/pull/12',
+        },
+      ];
+      return { status: 0, stdout: JSON.stringify(pulls), stderr: '' };
+    };
+    const api = new GhCliApi(runner);
+    const pulls = await api.listPullsForHead({ repo: REPO, head: 'gru/job-1' });
+    expect(pulls.map((pull) => pull.number)).toEqual([11]);
+    expect(asked[0]).toContain('head=acme%3Agru%2Fjob-1');
+    expect(asked[0]).toContain('state=open');
+  });
+
   it('fails loud on unavailability, rate limits, and malformed responses', async () => {
     const unavailable = new GhCliApi(async () => ({ status: -1, stdout: '', stderr: '', error: 'spawn gh ENOENT' }));
     await expect(unavailable.listPulls({ repo: REPO, limit: 1 })).rejects.toThrow(/gh is unavailable/);
@@ -463,7 +507,7 @@ describe('gh CLI adapter', () => {
 // ------------------------------------------------------------------
 
 interface FakeCall {
-  readonly kind: 'listPulls' | 'getPull' | 'listCheckRuns';
+  readonly kind: 'listPulls' | 'listPullsForHead' | 'getPull' | 'listCheckRuns';
   readonly repo: string;
   readonly arg: number | string | null;
 }
@@ -482,6 +526,16 @@ class FakeGhApi implements GhApiPort {
     const failure = this.failList.get(repo);
     if (failure !== undefined) throw failure;
     return this.pulls.get(repo) ?? [];
+  }
+
+  async listPullsForHead(input: { repo: RepoRef; head: string }): Promise<readonly GhPull[]> {
+    const repo = repoFullName(input.repo);
+    this.calls.push({ kind: 'listPullsForHead', repo, arg: input.head });
+    const failure = this.failList.get(repo);
+    if (failure !== undefined) throw failure;
+    // The fake's `pulls` map is the repo's pull set; the head filter is the
+    // only extra behaviour the api-shaped method adds.
+    return (this.pulls.get(repo) ?? []).filter((pull) => pull.headRef === input.head);
   }
 
   async getPull(input: { repo: RepoRef; number: number }): Promise<GhPull> {
@@ -568,6 +622,146 @@ function eventCount(ledger: LedgerApi, jobId: string, kind: string): number {
 }
 
 describe('github signal poll tick', () => {
+  it('a previously binned PR is not polled or assumed merged without independent evidence', async () => {
+    const h = makeLedger();
+    try {
+      addTrackedJob(h.ledger, 'job-no-proof', 'https://github.com/acme/app/pull/13');
+      h.ledger.setJobStatus('job-no-proof', 'binned');
+      const api = new FakeGhApi();
+      api.pulls.set('acme/app', [pull({ number: 13, headRef: 'gru/job-no-proof', merged: true })]);
+      const result = await makePoll({ ledger: h.ledger, api }).pollOnce();
+      expect(result.tracked).toBe(0);
+      expect(result.calls).toBe(0);
+      expect(api.calls).toEqual([]);
+      expect(h.ledger.getJob('job-no-proof')?.status).toBe('binned');
+      expect(h.ledger.latestJobEvent('job-no-proof', 'github.pr-merged')).toBeNull();
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('an in-flight batched fetch never starts fresh detail/CI calls for a now-binned lane', async () => {
+    const h = makeLedger();
+    try {
+      addTrackedJob(h.ledger, 'job-binned-before-detail', 'https://github.com/acme/app/pull/15');
+      const api = new FakeGhApi();
+      api.pulls.set('acme/app', [pull({ number: 15, headRef: 'gru/job-binned-before-detail', headSha: 'sha-15' })]);
+      const originalList = api.listPulls.bind(api);
+      api.listPulls = async (input) => {
+        const pulls = await originalList(input);
+        h.ledger.setJobStatus('job-binned-before-detail', 'binned');
+        return pulls;
+      };
+      const result = await makePoll({ ledger: h.ledger, api }).pollOnce();
+      expect(result.tracked).toBe(1); // the lane was live at tick start
+      expect(result.calls).toBe(1); // the already-running batched fetch only
+      expect(api.calls.map((call) => call.kind)).toEqual(['listPulls']);
+      expect(result.signals).toEqual([]);
+      expect(h.ledger.latestJobEvent('job-binned-before-detail', 'github.branch-state')).toBeNull();
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('binning during an in-flight detail request stops subsequent CI calls but retains an observed merge', async () => {
+    for (const merged of [false, true]) {
+      const h = makeLedger();
+      try {
+        const id = `job-detail-${String(merged)}`;
+        addTrackedJob(h.ledger, id, 'https://github.com/acme/app/pull/16');
+        const api = new FakeGhApi();
+        api.pulls.set('acme/app', [pull({ number: 16, headRef: `gru/${id}`, headSha: 'sha-16' })]);
+        api.details.set('acme/app#16', pull({ number: 16, headRef: `gru/${id}`, headSha: 'sha-16',
+          merged, mergeCommitSha: merged ? 'real-mc-16' : null }));
+        const originalGet = api.getPull.bind(api);
+        api.getPull = async (input) => {
+          const detail = await originalGet(input);
+          h.ledger.setJobStatus(id, 'binned');
+          return detail;
+        };
+        const result = await makePoll({ ledger: h.ledger, api }).pollOnce();
+        expect(api.calls.map((call) => call.kind)).toEqual(['listPulls', 'getPull']);
+        expect(result.calls).toBe(2);
+        expect(result.signals.map((signal) => signal.kind))
+          .toEqual(merged ? ['pr-merged'] : []);
+        expect(h.ledger.getJob(id)?.status).toBe('binned');
+        if (merged) {
+          expect(h.ledger.latestJobEvent(id, 'github.pr-merged')?.payload)
+            .toMatchObject({ applied: false, merge_commit_sha: 'real-mc-16' });
+        } else {
+          expect(h.ledger.latestJobEvent(id, 'github.pr-merged')).toBeNull();
+        }
+      } finally {
+        h.cleanup();
+      }
+    }
+  });
+
+  it('a merge genuinely observed in-flight after binning records one no-effect receipt without resurrecting the lane', async () => {
+    const h = makeLedger();
+    try {
+      // The lane is trackable when the tick starts and is DISCARDED (binned)
+      // during the fetch — the apply-time race the defensive skip owns.
+      addTrackedJob(h.ledger, 'job-binned', 'https://github.com/acme/app/pull/12');
+      const api = new FakeGhApi();
+      api.pulls.set('acme/app', [
+        pull({ number: 12, headRef: 'gru/job-binned', headSha: 'sha-12', merged: true, mergeCommitSha: 'mc-12', url: 'https://github.com/acme/app/pull/12' }),
+      ]);
+      const originalList = api.listPulls.bind(api);
+      let discarded = false;
+      api.listPulls = async (input) => {
+        const pulls = await originalList(input);
+        if (!discarded) {
+          discarded = true;
+          h.ledger.setJobStatus('job-binned', 'binned');
+        }
+        return pulls;
+      };
+      const logs: string[] = [];
+      const poll = makePoll({ ledger: h.ledger, api, logs });
+      const result = await poll.pollOnce();
+      expect(discarded).toBe(true);
+      expect(result.signals.map((signal) => signal.kind)).toEqual(['pr-merged']);
+      // A real fetched merge is evidence, but never success or a status hop
+      // on a discarded lane. The durable no-effect receipt survives retry.
+      expect(h.ledger.getJob('job-binned')?.status).toBe('binned');
+      expect(h.ledger.latestJobEvent('job-binned', 'github.pr-merged')?.payload).toMatchObject({
+        pr: 12, merge_commit_sha: 'mc-12', applied: false, reason: 'job is binned',
+      });
+      expect(logs.filter((line) => line.includes('could not close the lane'))).toEqual([]);
+      await poll.pollOnce();
+      expect(eventCount(h.ledger, 'job-binned', 'github.pr-merged')).toBe(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a check-run result arriving after binning never posts a stale judgment CI alert', async () => {
+    const h = makeLedger();
+    try {
+      addTrackedJob(h.ledger, 'job-binned-ci', 'https://github.com/acme/app/pull/14');
+      const api = new FakeGhApi();
+      api.pulls.set('acme/app', [pull({ number: 14, headRef: 'gru/job-binned-ci', headSha: 'sha-14' })]);
+      api.details.set('acme/app#14', pull({ number: 14, headRef: 'gru/job-binned-ci', headSha: 'sha-14', mergeableState: 'clean' }));
+      api.checks.set('acme/app@sha-14', [{ name: 'Perkins review', status: 'completed', conclusion: 'failure', url: 'https://runs/14' }]);
+      const originalChecks = api.listCheckRuns.bind(api);
+      api.listCheckRuns = async (input) => {
+        const runs = await originalChecks(input);
+        h.ledger.setJobStatus('job-binned-ci', 'binned');
+        return runs;
+      };
+      const notifications = new FakeNotifications();
+      const result = await makePoll({ ledger: h.ledger, api, notifications }).pollOnce();
+      expect(api.calls.map((call) => call.kind)).toEqual(['listPulls', 'getPull', 'listCheckRuns']);
+      expect(result.signals).toEqual([]);
+      expect(h.ledger.getJob('job-binned-ci')?.status).toBe('binned');
+      expect(eventCount(h.ledger, 'job-binned-ci', 'github.ci-failed')).toBe(0);
+      expect(notifications.posts).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('one tick applies the merged and conflict mappings against a real ledger, with one cursor event per change', async () => {
     const h = makeLedger();
     try {
@@ -620,8 +814,10 @@ describe('github signal poll tick', () => {
         dedupe: 'unacked',
         agentId: 'minion-conflict',
       });
-      expect(notifications.posts[0]?.detail).toContain('rebase');
-      expect(notifications.posts[0]?.detail).toContain('Silas owns the rebase within mandate');
+      // Merge boundary (owner ruling 2026-10-10): the mechanical conflict
+      // tier coordinates integration, never a rebase.
+      expect(notifications.posts[0]?.detail).toContain('Silas coordinates the conflict integration within mandate');
+      expect(notifications.posts[0]?.detail).not.toContain('rebase');
 
       // one dedupe cursor per job, recording the observed state
       for (const jobId of ['job-merge', 'job-conflict']) {
@@ -974,4 +1170,153 @@ describe('github signal poll tick', () => {
       h.cleanup();
     }
   });
+});
+
+describe('byte-correct bounded gh command transport', () => {
+  afterEach(() => { vi.useRealTimers(); vi.mocked(spawn).mockClear(); });
+  function childFixture() {
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new EventEmitter(), stderr: new EventEmitter(), kill: vi.fn(() => true),
+    });
+    vi.mocked(spawn).mockReturnValueOnce(child as never);
+    return child;
+  }
+
+  it('preserves split UTF-8 codepoints, BOM bytes and the exact intake response byte hash', async () => {
+    const child = childFixture();
+    const bytes = Buffer.from('\uFEFF' + JSON.stringify({ number: 296, html_url: 'https://github.com/owner/demo/issues/296', title: '雪🙂', body: 'café', updated_at: '2026-10-10T12:00:00Z' }) + '\n');
+    const captured = captureSources('/explicit-repo', { kind: 'issue', reference: '#296' }, {
+      uploadsDir: '/explicit-uploads', remote: () => ({ host: 'github.com', owner: 'owner', repo: 'demo' }),
+    });
+    // Every byte is a distinct OS chunk: deterministic splits inside both
+    // three- and four-byte codepoints, not timing-dependent child writes.
+    for (const byte of bytes) child.stdout.emit('data', Buffer.from([byte]));
+    child.emit('close', 0);
+    const capture = await captured;
+    expect(capture.gaps).toEqual([]);
+    expect(capture.snapshots[0]?.raw).toBe(bytes.toString('utf8'));
+    expect(capture.snapshots[0]?.sha256).toBe(createHash('sha256').update(bytes).digest('hex'));
+    expect(capture.snapshots[0]?.text).toBe('雪🙂\n\ncafé');
+    expect(spawn).toHaveBeenCalledWith('gh', ['api', '--hostname', 'github.com', 'repos/owner/demo/issues/296'], { stdio: ['ignore', 'pipe', 'pipe'] });
+  });
+
+  it('kills intake transport immediately at 256 KiB and bounds stderr without preserving a truncated snapshot', async () => {
+    const child = childFixture();
+    const captured = captureSources('/explicit-repo', { kind: 'issue', reference: '#296' }, {
+      uploadsDir: '/explicit-uploads', remote: () => ({ host: 'github.com', owner: 'owner', repo: 'demo' }),
+    });
+    child.stderr.emit('data', Buffer.alloc(8192, 'e'));
+    child.stdout.emit('data', Buffer.alloc(INTAKE_MAX_SOURCE_BYTES, 'a'));
+    expect(child.kill).not.toHaveBeenCalled();
+    child.stdout.emit('data', Buffer.from('é'));
+    expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+    // More bytes and close cannot change the already-settled refusal.
+    child.stdout.emit('data', Buffer.alloc(INTAKE_MAX_SOURCE_BYTES, 'b'));
+    child.emit('close', 0);
+    const capture = await captured;
+    expect(capture.snapshots).toEqual([]);
+    expect(capture.gaps[0]).toMatchObject({ code: 'GhApiError' });
+    expect(capture.gaps[0]?.question).toContain('exceeds 262144 bytes');
+    const bounded = childFixture();
+    const result = defaultGhRunner('gh', { maxOutputBytes: 8, maxStderrBytes: 4 })([]);
+    bounded.stderr.emit('data', Buffer.from('abcdef'));
+    bounded.emit('close', 1);
+    expect((await result).stderr).toBe('abcd');
+  });
+
+  it('retains the shared 16 MiB output and 30-second timeout defaults with optional narrower timeout', async () => {
+    vi.useFakeTimers();
+    const shared = childFixture();
+    const result = defaultGhRunner()([]);
+    shared.stdout.emit('data', Buffer.alloc(INTAKE_MAX_SOURCE_BYTES + 1, 'a'));
+    expect(shared.kill).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(29999);
+    expect(shared.kill).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(shared.kill).toHaveBeenCalledWith('SIGKILL');
+    expect((await result).error).toContain('30000 ms');
+    const narrow = childFixture();
+    const limited = defaultGhRunner('gh', { timeoutMs: 25 })([]);
+    await vi.advanceTimersByTimeAsync(25);
+    expect(narrow.kill).toHaveBeenCalledWith('SIGKILL');
+    expect((await limited).error).toContain('25 ms');
+    const full = childFixture();
+    const fullResult = defaultGhRunner()([]);
+    full.stdout.emit('data', Buffer.alloc(16 * 1024 * 1024, 'a'));
+    expect(full.kill).not.toHaveBeenCalled();
+    full.stdout.emit('data', Buffer.from('b'));
+    expect(full.kill).toHaveBeenCalledWith('SIGKILL');
+    expect((await fullResult).error).toContain('16777216 bytes');
+  });
+
+  it('refuses invalid intake UTF-8 byte chunks while retaining the request and inventing no snapshot or requirements', async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'gc-intake-invalid-utf8-')));
+    try {
+      const repoPath = join(root, 'workspace', 'demo');
+      mkdirSync(repoPath, { recursive: true });
+      execFileSync('git', ['init', '-q', repoPath]);
+      const dataDir = join(root, 'private-home');
+      const service = new IntakeService({ dataDir, workspaceRoot: join(root, 'workspace'), uploadsDir: join(dataDir, 'uploads'), remote: () => ({ host: 'github.com', owner: 'owner', repo: 'demo' }) });
+      const request = { repoPath, intakeId: 'intake-296', requestId: 'r1', source: { kind: 'issue' as const, reference: '#296' } };
+      const child = childFixture();
+      const pending = service.preview(request);
+      const bytes = Buffer.concat([Buffer.from('{"number":296,"html_url":"https://github.com/owner/demo/issues/296","title":"Issue","body":"'), Buffer.from([0xc3, 0x28]), Buffer.from('","updated_at":"2026-10-10T12:00:00Z"}')]);
+      for (const byte of bytes) child.stdout.emit('data', Buffer.from([byte]));
+      child.emit('close', 0);
+      const proposal = await pending;
+      expect(proposal.gaps[0]).toMatchObject({ code: 'GhApiError', question: expect.stringContaining('not valid UTF-8') });
+      expect(proposal.snapshots).toEqual([]);
+      expect(proposal.requirements).toEqual([]);
+      expect(proposal.plan.heists).toEqual([]);
+      expect(proposal.executable).toBe(false);
+      const prefix = join(dataDir, 'projects', digest(repoPath), 'intakes', request.intakeId, 'operational', 'requests/r1');
+      expect(JSON.parse(readFileSync(join(prefix, 'input.json'), 'utf8')).source).toEqual({ ...request.source, commentIds: [] });
+      expect(JSON.parse(readFileSync(join(prefix, 'capture.json'), 'utf8')).snapshots).toEqual([]);
+      const limited = childFixture();
+      const retry = service.preview({ ...request, requestId: 'r2', source: { ...request.source, commentIds: [91] } });
+      limited.stdout.emit('data', bytes);
+      limited.stderr.emit('data', Buffer.from('API rate limit exceeded'));
+      limited.emit('close', 1);
+      const stopped = await retry;
+      expect(stopped.snapshots).toEqual([]);
+      expect(stopped.requirements).toEqual([]);
+      expect(stopped.gaps.map((gap) => gap.code)).toEqual(['GhRateLimitedError', 'intake_supporting_source_unattempted']);
+      expect(stopped.gaps[0]?.question).toContain('rate limit');
+      expect(spawn).toHaveBeenCalledTimes(2); // never attempts the selected comment
+      expect(existsSync(join(dataDir, 'jobs'))).toBe(false);
+      expect(execFileSync('git', ['-C', repoPath, 'worktree', 'list', '--porcelain'], { encoding: 'utf8' }).match(/^worktree /gmu)).toHaveLength(1);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('leaves ordinary shared replacement decoding unchanged while offering strict intake-only decoding', async () => {
+    const shared = childFixture();
+    const ordinary = defaultGhRunner()([]);
+    shared.stdout.emit('data', Buffer.from([0xc3, 0x28]));
+    shared.emit('close', 0);
+    expect(await ordinary).toEqual({ status: 0, stdout: '\uFFFD(', stderr: '' });
+    const strict = childFixture();
+    const exact = defaultGhRunner('gh', { strictUtf8: true })([]);
+    strict.stdout.emit('data', Buffer.from([0xc3]));
+    strict.stdout.emit('data', Buffer.from([0x28]));
+    strict.emit('close', 0);
+    expect(await exact).toMatchObject({ status: -1, stdout: '', error: expect.stringContaining('not valid UTF-8') });
+  });
+
+  it('retains exact valid timeout-prefix evidence without any complete-source identity or planning text', async () => {
+    vi.useFakeTimers();
+    const child = childFixture();
+    const raw = '\uFEFF{"number":296,"title":"雪🙂"';
+    const captured = captureSources('/explicit-repo', { kind: 'issue', reference: '#296' }, {
+      uploadsDir: '/explicit-uploads', remote: () => ({ host: 'github.com', owner: 'owner', repo: 'demo' }),
+    });
+    for (const byte of Buffer.from(raw)) child.stdout.emit('data', Buffer.from([byte]));
+    await vi.advanceTimersByTimeAsync(30_000);
+    const capture = await captured;
+    expect(capture.gaps[0]).toMatchObject({ code: 'GhApiError', question: expect.stringContaining('30000 ms') });
+    expect(capture.snapshots).toHaveLength(1);
+    expect(capture.snapshots[0]).toMatchObject({ raw, sha256: digest(Buffer.from(raw)), revision: `sha256:${digest(Buffer.from(raw))}`, text: '', identifiers: {} });
+    expect(capture.requirements).toEqual([]);
+    expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+  });
+
 });

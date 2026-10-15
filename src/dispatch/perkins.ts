@@ -1,4 +1,6 @@
-import type { AgentHandle } from '../runtime/types.js';
+import { capturePortLaneHandoff } from '../worktrees/handoff.js';
+import type { AgentHandle, PromptTurnVerdict } from '../runtime/types.js';
+import { promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -7,14 +9,19 @@ import type { LogLevel } from '../logger.js';
 import { DEFAULT_REVIEW_CHILDREN } from '../config.js';
 import type { JobStatus, LedgerApi, RoundRecord, RoundVerdict } from '../ledger/api.js';
 import { requireSafeRecordId } from '../ledger/api.js';
-import { isJobTerminal } from '../ledger/states.js';
+import { isJobTerminal, isRoundTerminal } from '../ledger/states.js';
 import type { WorktreeLane, WorktreePort } from './worktree-port.js';
 import {
   BranchBusyError,
   findBusyLanes,
+  forceCoversBlocker,
+  snapshotForceAuthorization,
+  type ForceAuthorization,
   laneIsBusy,
   laneBranch,
   normalizeBranch,
+  openAttemptStartSeq,
+  pendingWorkRevision,
   resolveReviewTargetBranch,
   type BranchIdleBlocker,
   type BranchIdlePhase,
@@ -38,6 +45,7 @@ import {
   probeAdvertisedTipMovementAsync,
   sourceMovementSinceFreeze,
   resolveGitCommit,
+  repositoryGitEnv,
   resolveReviewBaseRef,
   reviewArtifactDirectory,
   readReviewCheckpointBytes,
@@ -56,11 +64,12 @@ import {
   CI_GREEN_EVENT,
   type CiEvidenceRecord,
 } from '../review-inputs/ci-evidence.js';
-import { admissionPreflight, ADMISSION_REMOTE_PROBE_TIMEOUT_MS, ReviewAdmissionError } from './perkins-review/admission.js';
+import { admissionPreflight, ADMISSION_REMOTE_PROBE_TIMEOUT_MS, ReviewAdmissionError, type AdmissionMissingInput } from './perkins-review/admission.js';
 import { evidenceRequestFingerprint, type ReviewEvidenceRequest } from '../review-inputs/evidence.js';
 import { parseGitHubPrUrl } from './github-poll.js';
 import {
   boundedDiff,
+  fallbackReviewPolicy,
   isGitHubRemote,
   isGitLabRemote,
   parseFallbackFindingsReport,
@@ -75,6 +84,7 @@ import {
 import {
   appendRecordedVerification,
   renderRecordedVerification,
+  selectNewestBoundVerification,
 } from '../verify/evidence.js';
 import {
   PrHeadVerificationError,
@@ -462,6 +472,20 @@ export interface VerdictPosterInput {
  * its prior provider-proved semantics; the unannotated call is fully
  * backward-compatible. */
 export type VerdictReconcileContext = { readonly reason: 'post-failure' };
+
+/** A publication failure that PROVES no POST reached the provider — e.g. an
+ * installation token that went stale at the pre-POST boundary, before any
+ * bytes were sent. Distinct from an unknown outcome (a timeout or a lost
+ * response AFTER the request left the client): because nothing was sent, a
+ * retry cannot duplicate a publication, so the WaveRunner failure path skips
+ * the ambiguous-publication lookup and its duplication caution and reports a
+ * definite non-delivery instead. */
+export class DefiniteNonDeliveryError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DefiniteNonDeliveryError';
+  }
+}
 
 export interface VerdictPoster {
   post(input: VerdictPosterInput): Promise<PostedReviewReceipt>;
@@ -1253,9 +1277,13 @@ export interface FallbackReviewRunInput {
   readonly jobId: string;
   readonly lanePath: string;
   readonly baseRef: string;
+  readonly headRef: string;
+  readonly diffSha256: string;
   readonly diff: string;
   readonly skillPath: string;
-  /** Where the session must write ONE JSON findings array. */
+  /** Verified package bytes frozen at resource resolution, not a late file read. */
+  readonly skillContent?: string;
+  /** Host-bound destination for ONE JSON findings array. */
   readonly reportFile: string;
   readonly iteration: number;
   readonly signal: AbortSignal;
@@ -1286,8 +1314,14 @@ export interface FallbackGateState {
 }
 
 export interface FallbackGateOptions {
-  /** Installed bmad-review skill file (never bundled with the product). */
-  readonly skillPath: string;
+  /** Explicit helper path for injected fixtures/legacy integrations; never discovered. */
+  readonly skillPath?: string;
+  /** Production selection verifies GC-owned resources and the job's private context. */
+  readonly resolveReviewResources?: (jobId: string) => {
+    readonly skillPath: string;
+    readonly skillContent?: string;
+    readonly artifactRoot: string;
+  };
   /** Review rounds before the gate reports blocked; default 4 (3 fix rounds + final). */
   readonly maxReviewRounds?: number;
   /** Runs one bmad-review pass and returns its findings. */
@@ -1295,6 +1329,12 @@ export interface FallbackGateOptions {
   /** Routes blocker findings back to the implementing minion session. */
   readonly fixDirectiveSink: FixDirectiveSink;
 }
+
+type ResolvedFallbackGateOptions = FallbackGateOptions & {
+  readonly skillPath: string;
+  readonly skillContent?: string;
+  readonly artifactRoot?: string;
+};
 
 export interface FallbackGateOutcome {
   readonly route: 'bmad-review-fallback';
@@ -1376,6 +1416,22 @@ export interface WaveRunnerOptions {
   readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
   readonly poster?: VerdictPoster;
   readonly escalate?: (title: string, detail: string, context?: EscalationContext) => void;
+  /** FYI channel, never action-required: an automatic admission retry was
+   * scheduled or skipped. Absent = the durable ledger trail only. */
+  readonly inform?: (title: string, detail: string, context?: EscalationContext) => void;
+  /** Supersession proof (owner rule 3): which of these review session ids
+   * still hold a live runtime handle. Production wires the runtime
+   * registry; absent = the ledger agent state is the only session proof. */
+  readonly liveReviewSessions?: (agentIds: readonly string[]) => readonly string[];
+  /** Bound on waiting for a superseded review to stop (default
+   * {@link REVIEW_SUPERSESSION_DEADLINE_MS}); past it the stop is
+   * unconfirmed and the writer is refused, never started alongside. */
+  readonly supersessionDeadlineMs?: number;
+  /** Bounded automatic retry of a TRANSIENT admission refusal (owner
+   * decision 2026-10-08): the wait before each retry, in order. Default
+   * {@link ADMISSION_RETRY_DELAYS_MS}; the action-required escalation
+   * follows only the refusal of the last retry. */
+  readonly admissionRetryDelaysMs?: readonly number[];
   /** Stable service-owned root. Required for every production review. */
   readonly reviewArtifactRoot?: string;
   /** The service uploads dir (`<data_dir>/uploads`): the ONLY namespace an
@@ -1431,6 +1487,33 @@ class FallbackSafetyRefusal extends Error {
   }
 }
 
+/** The existing working-tree intake, now fail-closed at every Git boundary.
+ * Capturing again after a reviewer settles binds its report to actual bytes,
+ * not just ledger events. Untracked and uncommitted changes are included. */
+function captureFallbackInput(lanePath: string, baseRef: string): Pick<FallbackReviewRunInput, 'headRef' | 'diff' | 'diffSha256'> {
+  const headRef = resolveGitCommit(lanePath, 'HEAD');
+  const env = repositoryGitEnv(false);
+  const prepared = spawnSync('git', ['-C', lanePath, 'add', '-N', '.'], { encoding: 'utf8', env, timeout: 10_000 });
+  if (prepared.error !== undefined || prepared.status !== 0) {
+    throw new Error(`cannot prepare the complete fallback working diff: ${prepared.error?.message ?? prepared.stderr.trim().slice(0, 200)}`);
+  }
+  const result = spawnSync('git', ['-C', lanePath, 'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--binary', '--full-index', baseRef],
+    { encoding: 'utf8', env, maxBuffer: 64 * 1024 * 1024, timeout: 30_000 });
+  const restored = spawnSync('git', ['-C', lanePath, 'reset', '-q', '--'], { encoding: 'utf8', env, timeout: 10_000 });
+  if (restored.error !== undefined || restored.status !== 0) {
+    throw new Error(`cannot restore fallback diff intake markers: ${restored.error?.message ?? restored.stderr.trim().slice(0, 200)}`);
+  }
+  if (result.error !== undefined || result.status !== 0) {
+    throw new Error(`cannot compute the complete fallback working diff: ${result.error?.message ?? result.stderr.trim().slice(0, 200)}`);
+  }
+  if (resolveGitCommit(lanePath, 'HEAD') !== headRef) throw new FallbackSafetyRefusal('fallback HEAD changed while capturing its working diff');
+  const diff = result.stdout;
+  if (boundedDiff(diff) !== diff) {
+    throw new Error('complete working diff exceeds the fallback transport size; no truncated review can pass. Restore native Perkins review or reduce the candidate scope');
+  }
+  return { headRef, diff, diffSha256: createHash('sha256').update(diff).digest('hex') };
+}
+
 /** A late delivered STATUS after an already-recorded delivery is harmless.
  * A working hop hidden by a later status is not: the old diff is obsolete.
  * If the bounded history cannot prove no hop occurred, fail closed. */
@@ -1442,6 +1525,175 @@ function fallbackWorkingStartedSince(ledger: LedgerApi, jobId: string, baselineS
   return events.some((event) => event.seq > baselineSeq && event.kind === 'job.status' &&
     typeof event.payload === 'object' && event.payload !== null &&
     (event.payload as { to?: unknown }).to === 'working');
+}
+
+/** Owner decision 2026-10-08: two automatic retries, one and five minutes
+ * after a transient admission refusal. */
+export const ADMISSION_RETRY_DELAYS_MS: readonly number[] = [60_000, 300_000];
+
+/** Node's setTimeout ceiling (2^31 - 1 ms): no retry delay may exceed it. */
+const MAX_TIMER_MS = 2_147_483_647;
+
+/** The request an automatic admission retry re-submits — never `force`,
+ * which authorizes only the blockers present at its own arm. A clean-abort
+ * re-arm keeps its delivered-head fence (R7-23). */
+interface AdmissionRetryInput {
+  readonly jobId: string;
+  readonly targetRef?: string;
+  readonly boundDeliveredSha?: string;
+  readonly lenses?: readonly string[];
+  readonly noSpec?: boolean;
+  readonly evidence?: readonly ReviewEvidenceRequest[];
+  readonly claimedFixedPriors?: readonly number[];
+  /** Issue #243 H2/M2: the caller's LAST admission guard is carried through
+   * the in-memory automatic retry so EVERY readmission re-proves the
+   * original family/basis owner hold and the latest repo/PR/SHA-bound green.
+   * The closure re-reads the ledger when invoked, so it never becomes stale
+   * evidence; a first-attempt guard is not lifetime coverage. */
+  readonly finalAdmissionGuard?: () => void;
+}
+
+/** One job's automatic admission retry, held IN MEMORY only (owner decision
+ * 2026-10-08, revised the same day): the refused request, re-submitted as
+ * it was; the refusal it answers; and which retry it is. Nothing resumes it
+ * after a restart — startup escalates instead
+ * ({@link WaveRunner.escalateInterruptedAdmissionRetries}). */
+interface AdmissionRetry {
+  readonly input: AdmissionRetryInput;
+  readonly roundId: string;
+  readonly deliverySeq: number;
+  /** 1-based: the retry this entry runs. */
+  readonly attempt: number;
+  /** When it is due (epoch ms). */
+  readonly dueAt: number;
+  /** Its `round.admission-retry-scheduled` record — bookkeeping only, so a
+   * restart can tell an interrupted retry from a settled one. */
+  readonly scheduledSeq: number;
+  timer: NodeJS.Timeout | null;
+  /** Its own request is running: that request's refusal continues the chain. */
+  running: boolean;
+}
+
+function admissionRetryInput(input: AdmissionRetryInput): AdmissionRetryInput {
+  return {
+    jobId: input.jobId,
+    ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
+    ...(input.boundDeliveredSha !== undefined ? { boundDeliveredSha: input.boundDeliveredSha } : {}),
+    ...(input.lenses !== undefined ? { lenses: input.lenses } : {}),
+    ...(input.noSpec !== undefined ? { noSpec: input.noSpec } : {}),
+    ...(input.evidence !== undefined ? { evidence: input.evidence } : {}),
+    ...(input.claimedFixedPriors !== undefined ? { claimedFixedPriors: input.claimedFixedPriors } : {}),
+    ...(input.finalAdmissionGuard !== undefined ? { finalAdmissionGuard: input.finalAdmissionGuard } : {}),
+  };
+}
+
+/** Errors already escalated to Gru where they arose: a wrapper that
+ * reports failures never alerts for them twice (R7-16, R8-25). */
+const ALREADY_NOTIFIED = Symbol('already-notified');
+
+function markNotified<T extends Error>(error: T): T {
+  Object.defineProperty(error, ALREADY_NOTIFIED, { value: true });
+  return error;
+}
+
+function alreadyNotified(error: unknown): boolean {
+  return error instanceof ReviewAdmissionError ||
+    (error instanceof Error && (error as Error & { [ALREADY_NOTIFIED]?: boolean })[ALREADY_NOTIFIED] === true);
+}
+
+/** Another setup for the same job is already running. */
+class RoundAdmissionInProgress extends Error {
+  constructor(jobId: string) {
+    super(`review round admission for job ${jobId} is already in progress; retry after setup settles`);
+    this.name = 'RoundAdmissionInProgress';
+  }
+}
+
+/** Default bound on a superseded review's stop (owner rule 3). */
+export const REVIEW_SUPERSESSION_DEADLINE_MS = 120_000;
+
+/** The abort reason a superseded review operation carries: an approved
+ * material change made its candidate obsolete (owner rule 3). Routine — a
+ * superseded round is history, never an action-required incident. */
+export class ReviewSupersededError extends Error {
+  constructor(readonly jobId: string, readonly reason: string) {
+    super(`review superseded for job ${jobId}: ${reason}`);
+    this.name = 'ReviewSupersededError';
+  }
+}
+
+/** A writer asked for a lane whose review is running and whose candidate
+ * is still current (no material correction pending): the delivered branch
+ * stays frozen until the verdict (owner clarification 2026-10-08). */
+export class ReviewInProgressError extends Error {
+  constructor(readonly jobId: string, readonly roundIds: readonly string[]) {
+    super(
+      `job ${jobId} is under review${roundIds.length > 0 ? ` (round ${roundIds.join(', ')})` : ''} and no approved ` +
+        'material change makes its candidate obsolete — the delivered branch stays frozen until the verdict; ' +
+        'send this after the verdict, or record the approved change as a material amendment to supersede the review',
+    );
+    this.name = 'ReviewInProgressError';
+  }
+}
+
+/** A superseded review could not be PROVEN stopped within the bound: the
+ * writer is refused (never started alongside) and Gru is escalated. */
+export class ReviewSupersessionUnconfirmedError extends Error {
+  constructor(readonly jobId: string, readonly detail: string) {
+    super(`review supersession for job ${jobId} is unconfirmed: ${detail}`);
+    this.name = 'ReviewSupersessionUnconfirmedError';
+  }
+}
+
+/** The settled result of one supersession pass. */
+export interface ReviewSupersession {
+  readonly jobId: string;
+  /** Rounds this pass superseded (pending = withdrawn, live = cancelled). */
+  readonly roundIds: readonly string[];
+  /** Tracked review operations aborted (setup, run or fallback gate). */
+  readonly operations: number;
+  /** True when every operation settled, every round is terminal and no
+   * review session is still alive. */
+  readonly confirmed: boolean;
+  readonly detail: string | null;
+}
+
+/** One live review operation on a job (setup, Perkins run or fallback). */
+interface ReviewOperation {
+  readonly kind: 'setup' | 'perkins' | 'fallback';
+  readonly roundId: string | null;
+  readonly controller: AbortController;
+  settled: Promise<unknown>;
+}
+
+/** A review request (internal fields are never accepted from the public HTTP endpoint). */
+export interface ReviewRequestInput {
+    jobId: string;
+    targetRef?: string;
+    /** Internal: a clean-abort re-arm's request-time delivered head; the
+     * freeze boundary refuses when a newer delivery superseded it. */
+    boundDeliveredSha?: string;
+    lenses?: readonly string[];
+    noSpec?: boolean;
+    force?: boolean;
+    /** Authorized private evidence attachments (service upload identities). */
+    evidence?: readonly ReviewEvidenceRequest[];
+    /** Prior indexes the implementing minion claimed fixed (fix-directive
+     * receipt); Stage-5 carry-forward always re-verifies claimed priors. */
+    claimedFixedPriors?: readonly number[];
+    /** Worker tool handoff: acknowledge without waiting for its own turn. */
+    handoff?: boolean;
+    /** Internal replay marker; never accepted from the public HTTP endpoint. */
+    fromHandoff?: boolean;
+    /** Internal: the automatic admission retry this request carries out;
+     * never accepted from the public HTTP endpoint. */
+    admissionRetry?: AdmissionRetry;
+    /** Internal: the caller's LAST admission guard (issue #243 F-H2/M2). It is
+     * invoked after every awaited setup/probe step and immediately before any
+     * admission effect, so an owner hold or a CI change that landed during
+     * the awaits refuses the round instead of arming stale work. Never accepted
+     * from the public HTTP endpoint. */
+    finalAdmissionGuard?: () => void;
 }
 
 export class WaveRunner {
@@ -1462,10 +1714,29 @@ export class WaveRunner {
   }>();
   private readonly stopHandoffListener: () => void;
   private shuttingDown = false;
+  /** Automatic admission retries, one per job — in memory only. */
+  private readonly admissionRetries = new Map<string, AdmissionRetry>();
+  private readonly admissionRetryDelaysMs: readonly number[];
+  /** Every live review operation per job (owner rule 5): the one place a
+   * writer learns what review owns its lane, and what supersession stops. */
+  private readonly reviewOperations = new Map<string, Set<ReviewOperation>>();
+  /** Rounds deliberately superseded: their incident traffic is routine. */
+  private readonly supersededRounds = new Set<string>();
+  /** Jobs whose RUNNING fallback gate was superseded: its terminal record
+   * is a routine supersession, not a BLOCKED/ABORTED incident. Cleared
+   * when that gate operation settles. */
+  private readonly supersededFallbackGates = new Set<string>();
+  /** One supersession pass per job at a time; a second caller joins it. */
+  private readonly supersessions = new Map<string, Promise<ReviewSupersession>>();
 
   constructor(opts: WaveRunnerOptions) {
     this.opts = opts;
     this.log = opts.log ?? (() => {});
+    const delays = opts.admissionRetryDelaysMs ?? ADMISSION_RETRY_DELAYS_MS;
+    if (delays.some((delay) => !Number.isSafeInteger(delay) || delay < 0 || delay > MAX_TIMER_MS)) {
+      throw new Error(`admissionRetryDelaysMs must be whole milliseconds from 0 to ${MAX_TIMER_MS}, got [${delays.join(', ')}]`);
+    }
+    this.admissionRetryDelaysMs = delays;
     this.stopHandoffListener = opts.bus?.subscribe((event) => {
       if (event.jobId === null) return;
       const pending = this.handoffs.get(event.jobId);
@@ -1477,6 +1748,10 @@ export class WaveRunner {
         if (pending.starting) pending.settlementReplayRequested = true;
         else void this.startHandoff(event.jobId, pending);
       } else if (event.kind === 'job.delivered' && event.seq > pending.seq) {
+        void this.startHandoff(event.jobId, pending);
+      } else if (event.kind === 'verification.completed' && event.seq > pending.seq) {
+        // Option A (owner, 2026-10-09): a corrective delivery waits for a
+        // passing verification on its head; that pass re-offers the request.
         void this.startHandoff(event.jobId, pending);
       }
     }) ?? (() => {});
@@ -1490,12 +1765,23 @@ export class WaveRunner {
       if (queued === null) continue;
       const started = this.opts.ledger.latestJobEvent(job.id, 'job.review-handoff-started');
       const failed = this.opts.ledger.latestJobEvent(job.id, 'job.review-handoff-failed');
-      if ((started?.seq ?? 0) > queued.seq || (failed?.seq ?? 0) > queued.seq) continue;
+      // A request an approved material change withdrew (owner rule 3) is
+      // terminal: a restart never replays it against the obsolete candidate.
+      const withdrawn = this.opts.ledger.latestJobEvent(job.id, 'job.review-handoff-withdrawn');
+      if ((started?.seq ?? 0) > queued.seq || (failed?.seq ?? 0) > queued.seq || (withdrawn?.seq ?? 0) > queued.seq) continue;
+      if (this.materialAmendmentSince(job.id, queued.seq)) {
+        this.opts.ledger.appendCustomEvent({
+          kind: 'job.review-handoff-withdrawn',
+          jobId: job.id,
+          payload: { requestSeq: queued.seq, reason: 'an approved material amendment was accepted after this review request' },
+        });
+        continue;
+      }
       if (this.handoffs.has(job.id)) continue;
       // A terminal job or a swept lane can never admit this handoff: skip
       // truthfully (no failure, no escalation) instead of a spurious retry.
       const jobNow = this.opts.ledger.getJob(job.id);
-      if (jobNow !== null && (jobNow.status === 'merged' || jobNow.status === 'done')) {
+      if (jobNow !== null && isJobTerminal(jobNow.status)) {
         this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-skipped', jobId: job.id,
           payload: { requestSeq: queued.seq, reason: 'terminal-job', status: jobNow.status },
         });
@@ -1527,7 +1813,7 @@ export class WaveRunner {
         this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-failed', jobId: job.id,
           payload: { requestSeq: queued.seq, claimedSeq: claimed.seq, error },
         });
-        this.opts.escalate?.(`Queued review handoff for job ${job.id} needs reconciliation`, error, { jobId: job.id });
+        this.escalate(`Queued review handoff for job ${job.id} needs reconciliation`, error, { jobId: job.id });
         continue;
       }
       const payload = queued.payload as { input?: unknown } | null;
@@ -1538,7 +1824,7 @@ export class WaveRunner {
         this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-failed', jobId: job.id,
           payload: { requestSeq: queued.seq, error },
         });
-        this.opts.escalate?.(`Queued review handoff failed for job ${job.id}`, error, { jobId: job.id });
+        this.escalate(`Queued review handoff failed for job ${job.id}`, error, { jobId: job.id });
         continue;
       }
       const pending = this.trackHandoff(input as { jobId: string }, queued.seq);
@@ -1546,8 +1832,13 @@ export class WaveRunner {
       if (startedFor !== undefined && startedFor !== queued.seq) {
         // A terminal marker for a DIFFERENT request does not satisfy this one.
       }
-      const delivered = this.opts.ledger.latestJobEvent(job.id, 'job.delivered');
-      if (delivered !== null && delivered.seq > queued.seq) void this.startHandoff(job.id, pending);
+      const delivered = this.opts.ledger.latestCandidateDelivery(job.id);
+      // A pass that paid a corrective delivery's verification (option A)
+      // re-offers the request just like a delivery does.
+      const verifiedAfter = this.opts.ledger.latestJobEvent(job.id, 'verification.completed');
+      if ((delivered !== null && delivered.seq > queued.seq) || (verifiedAfter !== null && verifiedAfter.seq > queued.seq)) {
+        void this.startHandoff(job.id, pending);
+      }
     }
   }
 
@@ -1556,6 +1847,10 @@ export class WaveRunner {
     for (const pending of this.handoffs.values()) pending.resolve();
     this.handoffs.clear();
     this.shuttingDown = true;
+    // A scheduled admission retry stays durable: the next start resumes it.
+    // In memory only: a restart's startup check escalates what was pending.
+    for (const retry of this.admissionRetries.values()) if (retry.timer !== null) clearTimeout(retry.timer);
+    this.admissionRetries.clear();
     const deadline = Date.now() + 30_000;
     while (this.activeOperations.size > 0) {
       for (const controller of this.activeControllers) controller.abort();
@@ -1567,13 +1862,366 @@ export class WaveRunner {
         this.log('error', 'shutdown deadline exceeded with operations still active', {
           count: this.activeOperations.size,
         });
-        this.opts.escalate?.(
+        this.escalate(
           'Perkins review shutdown deadline exceeded',
           `${this.activeOperations.size} review operation(s) ignored cancellation; forcing shutdown. Rounds terminalize as INCOMPLETE via startup recovery.`,
         );
         return;
       }
     }
+  }
+
+  /** Escalation of record. A deliberately superseded round's own incident
+   * traffic (INCOMPLETE, cancelled finalization, disposal) is routine FYI
+   * (owner: routine supersession needs no Ack); an unconfirmed stop still
+   * escalates action-required from the supersession itself. */
+  private escalate(title: string, detail: string, context?: EscalationContext): void {
+    // Durable too: a round whose supersession a restart interrupted is
+    // recovered as routine history, never an action-required incident.
+    if (context?.roundId !== undefined && (this.supersededRounds.has(context.roundId) ||
+        this.opts.ledger.latestRoundEvent(context.roundId, 'round.superseded') !== null)) {
+      this.opts.inform?.(`${title} (superseded)`, detail, context);
+      return;
+    }
+    this.opts.escalate?.(title, detail, context);
+  }
+
+  /** Track a review operation against its job, so supersession can find,
+   * abort and await it (owner rules 3 and 5). */
+  private trackReview<T>(
+    jobId: string,
+    kind: ReviewOperation['kind'],
+    roundId: string | null,
+    operation: Promise<T>,
+    controller: AbortController,
+  ): Promise<T> {
+    const entry: ReviewOperation = { kind, roundId, controller, settled: Promise.resolve() };
+    let set = this.reviewOperations.get(jobId);
+    if (set === undefined) {
+      set = new Set();
+      this.reviewOperations.set(jobId, set);
+    }
+    set.add(entry);
+    const tracked = this.track(operation, controller).finally(() => {
+      const current = this.reviewOperations.get(jobId);
+      current?.delete(entry);
+      if (current !== undefined && current.size === 0) this.reviewOperations.delete(jobId);
+      if (kind === 'fallback') this.supersededFallbackGates.delete(jobId);
+    });
+    entry.settled = tracked.then(() => undefined, () => undefined);
+    return tracked;
+  }
+
+  /** The review that owns a job's lane right now: rounds the ledger holds
+   * pending/live, plus tracked operations (a setup that has not created its
+   * round, a fallback gate). Null when no review owns the lane. */
+  activeReview(jobId: string): { readonly roundIds: readonly string[]; readonly operations: number } | null {
+    // A superseded round whose stop was never PROVEN still owns the lane
+    // (owner rule 3): its sessions may run, so a later writer re-proves it
+    // instead of trusting the round's terminal status.
+    const roundIds = this.opts.ledger.listRounds(jobId)
+      .filter((round) => !isRoundTerminal(round.status) || this.supersessionUnproven(round.id))
+      .map((round) => round.id);
+    const operations = this.reviewOperations.get(jobId)?.size ?? 0;
+    // An unproven fallback stop still owns the lane after its operation
+    // settled or a restart forgot it.
+    const unprovenFallback = this.fallbackSupersessionUnproven(jobId);
+    return roundIds.length === 0 && operations === 0 && !unprovenFallback ? null : { roundIds, operations };
+  }
+
+  /** True while a superseded round's stop is not PROVEN: no confirmation
+   * newer than its supersession (or its last unconfirmed re-proof). A
+   * restart that interrupted the pass leaves exactly this shape. */
+  private supersessionUnproven(roundId: string): boolean {
+    const superseded = this.opts.ledger.latestRoundEvent(roundId, 'round.superseded');
+    if (superseded === null) return false;
+    const unconfirmed = this.opts.ledger.latestRoundEvent(roundId, 'round.supersession-unconfirmed')?.seq ?? 0;
+    const confirmed = this.opts.ledger.latestRoundEvent(roundId, 'round.supersession-confirmed')?.seq ?? 0;
+    return confirmed < Math.max(superseded.seq, unconfirmed);
+  }
+
+  /** The same debt for a superseded review that owned no round (the
+   * bmad-review fallback gate), kept durably on the job. */
+  private fallbackSupersessionUnproven(jobId: string): boolean {
+    const superseded = this.opts.ledger.latestJobEvent(jobId, 'job.review-superseded');
+    if (superseded === null) return false;
+    const unconfirmed = this.opts.ledger.latestJobEvent(jobId, 'job.review-supersession-unconfirmed')?.seq ?? 0;
+    const confirmed = this.opts.ledger.latestJobEvent(jobId, 'job.review-supersession-confirmed')?.seq ?? 0;
+    return confirmed < Math.max(superseded.seq, unconfirmed);
+  }
+
+  /** The cessation proof the next round's setup already demands of every
+   * prior round (owner rule 3): a trusted no-spawn receipt, or the runtime
+   * proving the round's owner marker and every registered session ceased.
+   * Null when proven; otherwise what is unproven. */
+  private async roundCessationProblem(roundId: string): Promise<string | null> {
+    const round = this.opts.ledger.getRound(roundId);
+    if (round === null) return `round ${roundId} is missing`;
+    if (!isRoundTerminal(round.status)) return `round ${roundId} is still ${round.status}`;
+    const marker = this.reviewOwnerMarker(round);
+    const agents = this.opts.ledger.listAgents().filter((entry) => entry.roundId === round.id);
+    const receipt = this.opts.ledger.uniqueRoundNoSpawnReceipt(round.id);
+    const proof = receipt?.payload as { roundId?: unknown; generation?: unknown; ownerGeneration?: unknown } | null;
+    const noSpawn = agents.length === 0 && receipt?.jobId === round.jobId && receipt.roundId === round.id &&
+      proof?.roundId === round.id && validReviewOwnerGeneration(proof.generation) &&
+      proof.ownerGeneration === (marker?.generation ?? null) &&
+      (marker !== null || this.opts.ledger.latestRoundEvent(round.id, 'round.review-owner') === null) &&
+      this.opts.ledger.listRoundSpecialistStarts(round.id).length === 0;
+    if (noSpawn) return null;
+    if (marker === null && agents.length === 0) {
+      return `round ${round.id} has neither a no-spawn proof nor an owner marker — a spawn before registration cannot be ruled out`;
+    }
+    if (marker !== null && agents.length === 0 && await this.opts.reconcileReviewAgent?.('', marker) !== true) {
+      return `round ${round.id}'s review owner may still run before agent registration`;
+    }
+    const running: string[] = [];
+    for (const agent of agents) {
+      if (await this.opts.reconcileReviewAgent?.(agent.id, marker) !== true) running.push(agent.id);
+    }
+    return running.length === 0 ? null : `round ${round.id} review session(s) ${running.join(', ')} not proven ceased`;
+  }
+
+  /** True when a MATERIAL amendment was accepted after `seq`: anything
+   * requested before it concerned a candidate that is now obsolete. */
+  private materialAmendmentSince(jobId: string, seq: number): boolean {
+    return this.opts.ledger.listJobEventsByKinds(jobId, ['job.amendment-accepted']).some((event) =>
+      event.seq > seq && typeof event.payload === 'object' && event.payload !== null &&
+      (event.payload as { effect?: unknown }).effect === 'material');
+  }
+
+  /** Owner rule 3: a queued review request made before an approved
+   * material change asked for a candidate that is now obsolete — withdraw
+   * it (durably, so a restart never replays it). The next review of the
+   * corrected candidate is requested through the ordinary rows. */
+  private withdrawQueuedHandoff(jobId: string, reason: string): boolean {
+    const pending = this.handoffs.get(jobId);
+    if (pending === undefined) return false;
+    this.handoffs.delete(jobId);
+    this.opts.ledger.appendCustomEvent({
+      kind: 'job.review-handoff-withdrawn',
+      jobId,
+      payload: { requestSeq: pending.seq, reason: reason.slice(0, 500) },
+    });
+    pending.resolve();
+    return true;
+  }
+
+  /** Writer admission (owner rules 3 and 5), checked synchronously in the
+   * SAME tick the writer's durable intent is written: a live review whose
+   * candidate is still current refuses the writer (the branch stays frozen
+   * until the verdict); a live review made obsolete by a pending material
+   * correction is superseded by the writer's gate before any prompt. */
+  assertWriterAdmissible(jobId: string): void {
+    const active = this.activeReview(jobId);
+    if (active === null) return;
+    const job = this.opts.ledger.getJob(jobId);
+    if (job !== null && pendingWorkRevision(this.opts.ledger, job) !== null) return;
+    throw new ReviewInProgressError(jobId, active.roundIds);
+  }
+
+  /** Writer gate (owner rule 3): before a writer prompts the lane's minion,
+   * every review that owns the lane is superseded and PROVEN stopped. An
+   * unconfirmed stop throws — the writer must not start alongside it. */
+  async clearLaneForWriter(input: { readonly jobId: string; readonly writer: string }): Promise<ReviewSupersession> {
+    const outcome = await this.supersedeReviews({
+      jobId: input.jobId,
+      reason: `writer ${input.writer} owns the lane — the reviewed candidate is obsolete`,
+      by: input.writer,
+    });
+    if (!outcome.confirmed) throw new ReviewSupersessionUnconfirmedError(input.jobId, outcome.detail ?? 'stop not proven');
+    return outcome;
+  }
+
+  /** Supersede every review that owns the job's lane (owner rule 3):
+   * record the supersession (with the settled specialist checkpoints — the
+   * partial findings stay on disk), withdraw a queued round or cancel a
+   * running one with its specialists, drop an in-memory admission retry,
+   * and confirm within a bound that everything stopped. Unconfirmed → one
+   * action-required escalation; the caller must not start a writer. */
+  async supersedeReviews(input: { readonly jobId: string; readonly reason: string; readonly by: string }): Promise<ReviewSupersession> {
+    const inFlight = this.supersessions.get(input.jobId);
+    if (inFlight !== undefined) {
+      const joined = await inFlight;
+      // A pass that finished cleanly may be followed by a fresh review only
+      // through the fences; re-run when anything still owns the lane.
+      if (!joined.confirmed || this.activeReview(input.jobId) === null) return joined;
+    }
+    const pass = this.runSupersession(input);
+    this.supersessions.set(input.jobId, pass);
+    try {
+      return await pass;
+    } finally {
+      if (this.supersessions.get(input.jobId) === pass) this.supersessions.delete(input.jobId);
+    }
+  }
+
+  private async runSupersession(input: { readonly jobId: string; readonly reason: string; readonly by: string }): Promise<ReviewSupersession> {
+    const deadline = Date.now() + (this.opts.supersessionDeadlineMs ?? REVIEW_SUPERSESSION_DEADLINE_MS);
+    const retry = this.admissionRetries.get(input.jobId);
+    if (retry !== undefined) this.dropAdmissionRetry(retry, { outcome: 'superseded', reason: input.reason.slice(0, 300) });
+    const jobRow = this.opts.ledger.getJob(input.jobId);
+    if (jobRow !== null && pendingWorkRevision(this.opts.ledger, jobRow) !== null) {
+      this.withdrawQueuedHandoff(input.jobId, input.reason);
+    }
+    const roundIds = new Set<string>();
+    let operations = 0;
+    // Every tracked operation this pass saw — including one an earlier pass
+    // already aborted that has not settled: it still must be proven gone.
+    let operationsSeen = 0;
+    const sessionRoundIds = new Set<string>();
+    // A fallback gate owns no round: its stop is proven on the job, and an
+    // earlier unproven fallback stop is re-proven by this pass.
+    let fallbackInvolved = this.fallbackSupersessionUnproven(input.jobId);
+    // A setup that passed its last fence before the writer's intent landed
+    // becomes a round + run synchronously: re-collect until nothing new
+    // appears (bounded — each pass only aborts what exists).
+    for (let pass = 0; pass < 4; pass += 1) {
+      const active = this.activeReview(input.jobId);
+      if (active === null) break;
+      for (const roundId of active.roundIds) {
+        if (roundIds.has(roundId)) continue;
+        roundIds.add(roundId);
+        this.supersededRounds.add(roundId);
+        // One durable receipt per round: a re-proof of an earlier
+        // unconfirmed stop (or a second caller) does not re-supersede it.
+        if (this.opts.ledger.latestRoundEvent(roundId, 'round.superseded') === null) {
+          this.recordRoundSupersession(input, roundId);
+        }
+      }
+      const ops = [...(this.reviewOperations.get(input.jobId) ?? [])];
+      operationsSeen = Math.max(operationsSeen, ops.length);
+      // A run whose round is already terminal (finishing its cleanup) still
+      // owns sessions: prove them too, without re-superseding the round.
+      for (const op of ops) if (op.roundId !== null) sessionRoundIds.add(op.roundId);
+      if (ops.length === 0 && active.roundIds.every((id) => roundIds.has(id)) && pass > 0) break;
+      for (const op of ops) {
+        if (!op.controller.signal.aborted) {
+          if (op.kind === 'fallback') {
+            this.supersededFallbackGates.add(input.jobId);
+            fallbackInvolved = true;
+            // Durable debt FIRST (as for rounds): a crash after the abort
+            // can never lose the fact that this stop is owed a proof.
+            this.opts.ledger.appendCustomEvent({
+              kind: 'job.review-superseded', jobId: input.jobId,
+              payload: { route: 'bmad-review-fallback', reason: input.reason.slice(0, 500), by: input.by },
+            });
+          }
+          op.controller.abort(new ReviewSupersededError(input.jobId, input.reason));
+          operations += 1;
+        }
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      let timer: NodeJS.Timeout | undefined;
+      await Promise.race([
+        Promise.all(ops.map((op) => op.settled)),
+        new Promise<void>((resolve) => { timer = setTimeout(resolve, remaining); }),
+      ]);
+      if (timer !== undefined) clearTimeout(timer);
+    }
+    if (roundIds.size === 0 && operationsSeen === 0 && !fallbackInvolved) {
+      return { jobId: input.jobId, roundIds: [], operations: 0, confirmed: true, detail: null };
+    }
+    // Debt already reported action-required (an earlier unconfirmed stop
+    // still unproven): a re-proof that fails again is an FYI, not a second
+    // alert for the same stuck review.
+    // The job-level receipt carries a stop that owns no round (a setup
+    // before its round, a fallback gate).
+    const jobLevel = roundIds.size === 0 || fallbackInvolved;
+    const jobAlreadyReported = (this.opts.ledger.latestJobEvent(input.jobId, 'job.review-supersession-unconfirmed')?.seq ?? 0) >
+      (this.opts.ledger.latestJobEvent(input.jobId, 'job.review-supersession-confirmed')?.seq ?? 0);
+    const alreadyReported = [...roundIds].every((id) =>
+      (this.opts.ledger.latestRoundEvent(id, 'round.supersession-unconfirmed')?.seq ?? 0) >
+        (this.opts.ledger.latestRoundEvent(id, 'round.supersession-confirmed')?.seq ?? 0)) &&
+      (!jobLevel || jobAlreadyReported);
+    // Confirmation: no tracked operation left, every superseded round is
+    // terminal, and no review session of those rounds still holds a live
+    // runtime handle. Anything less is unproven — never "probably stopped".
+    const problems: string[] = [];
+    const leftover = this.reviewOperations.get(input.jobId)?.size ?? 0;
+    if (leftover > 0) problems.push(`${leftover} review operation(s) did not settle within the bound`);
+    for (const roundId of roundIds) {
+      const problem = await this.roundCessationProblem(roundId);
+      if (problem !== null) problems.push(problem);
+    }
+    // Round sessions, plus the job's fallback reviewer sessions when a
+    // fallback gate was superseded (they register without a round id).
+    const sessions = this.opts.ledger.listAgents()
+      .filter((agent) => agent.role === 'perkins' && (
+        (agent.roundId !== null && (roundIds.has(agent.roundId) || sessionRoundIds.has(agent.roundId))) ||
+        (fallbackInvolved && agent.roundId === null && agent.jobId === input.jobId && agent.label === 'fallback-review')));
+    const live = this.opts.liveReviewSessions !== undefined
+      ? this.opts.liveReviewSessions(sessions.map((agent) => agent.id))
+      : sessions.filter((agent) => agent.state !== 'disposed' && agent.state !== 'error').map((agent) => agent.id);
+    if (live.length > 0) problems.push(`review session(s) ${live.join(', ')} still alive`);
+    const confirmed = problems.length === 0;
+    const detail = confirmed ? null : problems.join('; ');
+    for (const roundId of roundIds) {
+      this.opts.ledger.appendCustomEvent({
+        kind: confirmed ? 'round.supersession-confirmed' : 'round.supersession-unconfirmed',
+        jobId: input.jobId,
+        roundId,
+        payload: { by: input.by, ...(detail !== null ? { detail } : {}) },
+      });
+    }
+    if (roundIds.size === 0 || fallbackInvolved) {
+      this.opts.ledger.appendCustomEvent({
+        kind: confirmed ? 'job.review-supersession-confirmed' : 'job.review-supersession-unconfirmed',
+        jobId: input.jobId,
+        payload: { by: input.by, operations, ...(detail !== null ? { detail } : {}) },
+      });
+    }
+    if (confirmed) {
+      this.opts.inform?.(
+        `Review of job ${input.jobId} superseded`,
+        `${input.reason}. Stopped: ${roundIds.size > 0 ? [...roundIds].join(', ') : `${operations} review operation(s)`}. ` +
+          'Partial findings stay in the round artifacts; the next candidate gets a fresh review.',
+        { jobId: input.jobId },
+      );
+    } else if (alreadyReported) {
+      this.opts.inform?.(
+        `Review of job ${input.jobId} is still not proven stopped — writer refused again`,
+        `${input.reason}. ${detail}. Already escalated; the writer stays refused until the stop is proven.`,
+        { jobId: input.jobId },
+      );
+    } else {
+      this.opts.escalate?.(
+        `Review of job ${input.jobId} could not be confirmed stopped — its writer is blocked`,
+        `${input.reason}. ${detail}. The writer was refused (never started alongside the review). ` +
+          'Reconcile the review (or restart the service, which terminalizes live rounds), then resend the request.',
+        { jobId: input.jobId, ...(roundIds.size === 1 ? { roundId: [...roundIds][0]! } : {}) },
+      );
+    }
+    return { jobId: input.jobId, roundIds: [...roundIds], operations, confirmed, detail };
+  }
+
+  /** The durable supersession receipt, written BEFORE any abort: the
+   * settled specialist checkpoints (partial findings) and where they live. */
+  private recordRoundSupersession(input: { readonly jobId: string; readonly reason: string; readonly by: string }, roundId: string): void {
+    const round = this.opts.ledger.getRound(roundId);
+    const settled = this.opts.ledger.listRoundSpecialistSettlements(roundId).map((event) => {
+      const payload = (event.payload ?? {}) as { lens?: unknown; attempt?: unknown; sha256?: unknown };
+      return { lens: payload.lens ?? null, attempt: payload.attempt ?? null, sha256: payload.sha256 ?? null };
+    });
+    let artifactDirectory: string | null = null;
+    try {
+      if (this.opts.reviewArtifactRoot !== undefined) artifactDirectory = reviewArtifactDirectory(this.opts.reviewArtifactRoot, roundId);
+    } catch {
+      artifactDirectory = null;
+    }
+    this.opts.ledger.appendCustomEvent({
+      kind: 'round.superseded',
+      jobId: input.jobId,
+      roundId,
+      payload: {
+        reason: input.reason.slice(0, 500),
+        by: input.by,
+        status: round?.status ?? null,
+        target_sha: round?.targetRef ?? null,
+        settled_specialists: settled,
+        artifact_directory: artifactDirectory,
+      },
+    });
   }
 
   private track<T>(operation: Promise<T>, controller: AbortController): Promise<T> {
@@ -1833,7 +2481,7 @@ export class WaveRunner {
       if (laneId !== null) await this.sweepReviewWorktree(laneId);
       return 'promoted';
     }
-    this.opts.escalate?.(
+    this.escalate(
       `Review round ${round.id} carries a posted verdict without a provider-bound receipt`,
       `restart recovery cannot verify the delivery of an unbound round.posted event (${bindingProblem ?? actorProblem ?? 'the preserved publication artifact did not match the posted digest'}); the round terminalizes as interrupted rather than promoting an unverifiable approval`,
       { jobId: round.jobId, roundId: round.id },
@@ -1874,14 +2522,17 @@ export class WaveRunner {
       // its journal write was lost to the crash (P5).
       const preAbortFacts = this.interruptedExecutionFacts(round, round.lenses.map((chip) => chip.lens as PerkinsLens));
       this.abortRound(round, note);
-      const artifacts = this.writeInterruptedArtifacts(round.id, 'service_restart', note, preAbortFacts);
+      // A round a restart caught mid-supersession (owner rule 3) keeps its
+      // true classification: superseded, never a clean service restart.
+      const restartReason = this.opts.ledger.latestRoundEvent(round.id, 'round.superseded') !== null ? 'superseded' : 'service_restart';
+      const artifacts = this.writeInterruptedArtifacts(round.id, restartReason, note, preAbortFacts);
       this.opts.ledger.appendCustomEvent({
         kind: 'round.perkins-incomplete',
         jobId: round.jobId,
         roundId: round.id,
-        payload: { reason: 'service_restart', artifactDirectory: artifacts.directory, reportFile: artifacts.reportFile },
+        payload: { reason: restartReason, artifactDirectory: artifacts.directory, reportFile: artifacts.reportFile },
       });
-      this.opts.escalate?.(`Review round ${round.id} is INCOMPLETE after service restart`, note, { jobId: round.jobId, roundId: round.id });
+      this.escalate(`Review round ${round.id} is INCOMPLETE after service restart`, note, { jobId: round.jobId, roundId: round.id });
       await this.sweepReviewWorktree(lane.id);
       recovered += 1;
       } catch (error) {
@@ -1893,7 +2544,7 @@ export class WaveRunner {
           round: lane.roundId,
           error: String(error),
         });
-        this.opts.escalate?.(
+        this.escalate(
           `Review round ${String(lane.roundId)} could not be processed during startup recovery`,
           `${String(error)} — the round is left as recorded for inspection; other rounds continue to recover`,
           {
@@ -1919,18 +2570,20 @@ export class WaveRunner {
         const note = 'review interrupted before its detached worktree was durably registered; required proof is incomplete';
         const preAbortFacts = this.interruptedExecutionFacts(round, round.lenses.map((chip) => chip.lens as PerkinsLens));
         this.abortRound(round, note);
-        const artifacts = this.writeInterruptedArtifacts(round.id, 'service_restart_missing_review_lane', note, preAbortFacts);
+        const restartReason = this.opts.ledger.latestRoundEvent(round.id, 'round.superseded') !== null
+          ? 'superseded' : 'service_restart_missing_review_lane';
+        const artifacts = this.writeInterruptedArtifacts(round.id, restartReason, note, preAbortFacts);
         this.opts.ledger.appendCustomEvent({
           kind: 'round.perkins-incomplete',
           jobId: round.jobId,
           roundId: round.id,
           payload: {
-            reason: 'service_restart_missing_review_lane',
+            reason: restartReason,
             artifactDirectory: artifacts.directory,
             reportFile: artifacts.reportFile,
           },
         });
-        this.opts.escalate?.(`Review round ${round.id} is INCOMPLETE after service restart`, note, { jobId: round.jobId, roundId: round.id });
+        this.escalate(`Review round ${round.id} is INCOMPLETE after service restart`, note, { jobId: round.jobId, roundId: round.id });
         recovered += 1;
       }
     }
@@ -2045,33 +2698,37 @@ export class WaveRunner {
   /** Review-path selection (user amendment 2026-09-20): the fail-closed
    * four-leg pre-flight runs at request time. All legs pass -> Perkins
    * (the gate). Any leg failing -> the bmad-review fallback gate. */
-  async requestReview(input: {
-    jobId: string;
-    targetRef?: string;
-    /** Internal: a clean-abort re-arm's request-time delivered head; the
-     * freeze boundary refuses when a newer delivery superseded it. */
-    boundDeliveredSha?: string;
-    lenses?: readonly string[];
-    noSpec?: boolean;
-    force?: boolean;
-    /** Authorized private evidence attachments (service upload identities). */
-    evidence?: readonly ReviewEvidenceRequest[];
-    /** Prior indexes the implementing minion claimed fixed (fix-directive
-     * receipt); Stage-5 carry-forward always re-verifies claimed priors. */
-    claimedFixedPriors?: readonly number[];
-    /** Worker tool handoff: acknowledge without waiting for its own turn. */
-    handoff?: boolean;
-    /** Internal replay marker; never accepted from the public HTTP endpoint. */
-    fromHandoff?: boolean;
-  }): Promise<ReviewRequestOutcome> {
+  /** Every review request is tracked per job from entry until it settles
+   * (#268), so a due automatic admission retry sees one still in preflight. */
+  async requestReview(input: ReviewRequestInput): Promise<ReviewRequestOutcome> {
+    this.requestsInFlight.set(input.jobId, (this.requestsInFlight.get(input.jobId) ?? 0) + 1);
+    try {
+      return await this.performReviewRequest(input);
+    } finally {
+      const remaining = (this.requestsInFlight.get(input.jobId) ?? 1) - 1;
+      if (remaining <= 0) this.requestsInFlight.delete(input.jobId);
+      else this.requestsInFlight.set(input.jobId, remaining);
+    }
+  }
+
+  private async performReviewRequest(input: ReviewRequestInput): Promise<ReviewRequestOutcome> {
     if (this.shuttingDown) throw new Error('Perkins review service is shutting down');
     // Branch-idle still gates the freeze. A minion's own busy turn may
     // acknowledge an intent now; it is armed only after job.delivered.
+    let armedTargetRef: string | undefined;
+    let idleRequest: ReviewRequestInput = input;
+    let forceAuthorization: ForceAuthorization | undefined;
     try {
-      this.enforceBranchIdleForRequest(input);
+      this.refuseOwnUnwaivableReviewDebt(input.jobId);
+      armedTargetRef = this.resolveLocalRequestTarget(input);
+      idleRequest = { ...input, ...(armedTargetRef !== undefined ? { targetRef: armedTargetRef } : {}) };
+      forceAuthorization = this.enforceBranchIdleForRequest(idleRequest);
     } catch (error) {
       if (!(error instanceof BranchBusyError) || input.handoff !== true || input.force === true ||
-        error.blockers.length === 0 || error.blockers.some((blocker) => blocker.jobId !== input.jobId)) throw error;
+        error.blockers.length === 0 || error.blockers.some((blocker) => blocker.jobId !== input.jobId) ||
+        // Owner rule 2: a request for a candidate an approved material
+        // change already made obsolete is refused, never queued.
+        error.blockers.some((blocker) => blocker.revision !== undefined)) throw error;
       if (this.opts.bus === undefined) throw new Error('worker review handoff requires a ledger event bus');
       const existing = this.handoffs.get(input.jobId);
       if (existing !== undefined) {
@@ -2131,7 +2788,7 @@ export class WaveRunner {
     const jobLaneAtArm = lanesAtArm.find((lane) => lane.kind === 'job' && lane.jobId === input.jobId && lane.status !== 'swept') ?? null;
     const targetBranch = resolveReviewTargetBranch({
       jobId: input.jobId,
-      ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
+      ...(idleRequest.targetRef !== undefined ? { targetRef: idleRequest.targetRef } : {}),
       lanePath: jobLaneAtArm?.path ?? null,
       laneBranch: jobLaneAtArm?.branch ?? null,
     });
@@ -2140,16 +2797,15 @@ export class WaveRunner {
       .map((lane) => ({
         jobId: lane.jobId!, path: lane.path,
         statusSeq: this.opts.ledger.latestJobEvent(lane.jobId!, 'job.status')?.seq ?? 0,
-        deliverySeq: this.opts.ledger.latestJobEvent(lane.jobId!, 'job.delivered')?.seq ?? 0,
+        deliverySeq: this.opts.ledger.latestCandidateDelivery(lane.jobId!)?.seq ?? 0,
         markerIds: this.opts.ledger.listPendingRebriefs({ jobId: lane.jobId! }).map((marker) => marker.id),
       }));
     const fallbackBaseline = {
       targetBranch,
       branchOwners,
-      busyJobIds: findBusyLanes({ ledger: this.opts.ledger, lanes: lanesAtArm, targetBranch })
-        .map((blocker) => blocker.jobId),
+      forceAuthorization: forceAuthorization ?? new Map(),
       markerIds: this.opts.ledger.listPendingRebriefs({ jobId: input.jobId }).map((marker) => marker.id),
-      deliverySeq: this.opts.ledger.latestJobEvent(input.jobId, 'job.delivered')?.seq ?? 0,
+      deliverySeq: this.opts.ledger.latestCandidateDelivery(input.jobId)?.seq ?? 0,
       statusSeq: this.opts.ledger.latestJobEvent(input.jobId, 'job.status')?.seq ?? 0,
       settlementSeq: this.opts.ledger.latestJobEvent(input.jobId, 'silas.rebrief-settled')?.seq ?? 0,
     };
@@ -2157,6 +2813,9 @@ export class WaveRunner {
     const result: ReviewPreflightResult = preflight !== undefined && repoPath !== null
       ? await preflight({ repoPath })
       : { ok: true, failures: [] };
+    // R7-17: a shutdown during the awaited pre-flight starts nothing — no
+    // fallback gate, no round.
+    if (this.shuttingDown) throw new Error('Perkins review service is shutting down');
     if (!result.ok) {
       // The canonical terminal refusal owns terminal lanes FIRST: terminal
       // jobs are never busy, so a stale pending marker must not mask the
@@ -2177,7 +2836,7 @@ export class WaveRunner {
       // A forced request must FIRST reject newly arrived blockers; logging
       // another override before that proof would misstate what the owner
       // authorized at the original arm.
-      if (input.force !== true) this.enforceBranchIdleForRequest(input);
+      if (input.force !== true) this.enforceBranchIdleForRequest(idleRequest);
       // The shared guard early-returns without a job lane, so re-prove the
       // CURRENT lane/marker/authorization facts directly at this seam
       // (fail closed on a missing lane instead of reusing the pre-await
@@ -2194,7 +2853,7 @@ export class WaveRunner {
       }
       const admission = { lanePath, ...fallbackBaseline };
       this.assertFallbackIterationCurrent(input, admission);
-      if (input.force === true) this.enforceBranchIdleForRequest(input);
+      if (input.force === true) this.enforceBranchIdleForRequest({ ...idleRequest, forceAuthorization: forceAuthorization ?? new Map() });
       // The fallback gate cannot deliver private evidence: refuse the arm
       // rather than run the fallback review without the promised material.
       if (input.evidence !== undefined && input.evidence.length > 0) {
@@ -2208,8 +2867,10 @@ export class WaveRunner {
       const pending = this.handoffs.get(input.jobId);
       this.assertHandoffAuthorized(input.jobId, pending?.seq ?? -1);
     }
-    const begun = await this.beginPerkinsRound({ ...input, reviewModel: result.reviewModel,
-      reviewThinkingLevel: result.reviewThinkingLevel });
+    const begun = await this.beginPerkinsRound({ ...input,
+      ...(armedTargetRef !== undefined ? { armedTargetRef } : {}), reviewModel: result.reviewModel,
+      reviewThinkingLevel: result.reviewThinkingLevel,
+      ...(forceAuthorization !== undefined ? { forceAuthorization } : {}) });
     return { route: 'perkins', round: begun.round, run: begun.run };
   }
 
@@ -2225,6 +2886,9 @@ export class WaveRunner {
    * a current head are NOT authorization: a job that became blocked/parked/
    * cancelled/owner-held/terminal after the durable request was accepted
    * is HELD for reconciliation attention, never auto-reviewed. */
+  /** Recoverable hold statuses that revoke an in-flight fallback review. */
+  private static readonly FALLBACK_REVOKING_STATUSES: ReadonlySet<string> = new Set(['blocked', 'parked']);
+
   private static readonly HANDOFF_AUTHORIZED_STATUSES: ReadonlySet<string> = new Set(['working', 'delivered', 'in-review']);
 
   /** Fence: throws when the CURRENT job state does not authorize this
@@ -2239,6 +2903,13 @@ export class WaveRunner {
 
   private async startHandoff(jobId: string, pending: NonNullable<ReturnType<WaveRunner['trackHandoff']>>): Promise<void> {
     if (pending.starting || pending.held || this.shuttingDown || this.handoffs.get(jobId) !== pending) return;
+    // Owner rule 3: a request queued before an approved material change
+    // asked for an obsolete candidate — even when its withdrawal was lost
+    // (a crash between the amendment and the supersession pass).
+    if (this.materialAmendmentSince(jobId, pending.seq)) {
+      this.withdrawQueuedHandoff(jobId, 'an approved material amendment was accepted after this review request');
+      return;
+    }
     pending.starting = true;
     let requeued = false;
     let held = false;
@@ -2276,11 +2947,26 @@ export class WaveRunner {
         this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-held', jobId,
           payload: { requestSeq: pending.seq, reason: `job-status-${error.status}` },
         });
-        this.opts.escalate?.(
+        this.escalate(
           `Queued review handoff for job ${jobId} is held`,
           `The durable review request can no longer be authorized automatically: job status is ${error.status}. Re-request the review after the hold clears.`,
           { jobId },
         );
+        return;
+      }
+      // Owner rule 3: a replay whose setup an approved material change
+      // superseded was withdrawn on purpose — a routine terminal, never a
+      // failure or an action-required incident.
+      if (error instanceof ReviewSupersededError) {
+        const withdrawn = this.opts.ledger.latestJobEvent(jobId, 'job.review-handoff-withdrawn');
+        const recorded = typeof withdrawn?.payload === 'object' && withdrawn.payload !== null &&
+          (withdrawn.payload as { requestSeq?: unknown }).requestSeq === pending.seq;
+        if (!recorded) {
+          this.opts.ledger.appendCustomEvent({
+            kind: 'job.review-handoff-withdrawn', jobId,
+            payload: { requestSeq: pending.seq, reason: error.reason.slice(0, 500) },
+          });
+        }
         return;
       }
       // Same-job re-busy preserves the durable intent: re-queue for the
@@ -2295,7 +2981,11 @@ export class WaveRunner {
       }
       if (!this.shuttingDown) {
         this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-failed', jobId, payload: { requestSeq: pending.seq, error: String(error) } });
-        this.opts.escalate?.(`Queued review handoff failed for job ${jobId}`, String(error), { jobId });
+        // R7-16/R8-25: a refusal already notified (an admission refusal's
+        // FYI or escalation, a blocked freeze) — never twice.
+        if (!alreadyNotified(error)) {
+          this.escalate(`Queued review handoff failed for job ${jobId}`, String(error), { jobId });
+        }
       }
     } finally {
       pending.starting = false;
@@ -2375,7 +3065,10 @@ export class WaveRunner {
      * receipt); Stage-5 carry-forward always re-verifies claimed priors. */
     claimedFixedPriors?: readonly number[];
   }): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
-    this.enforceBranchIdleForRequest(input);
+    this.refuseOwnUnwaivableReviewDebt(input.jobId);
+    const armedTargetRef = this.resolveLocalRequestTarget(input);
+    const forceAuthorization = this.enforceBranchIdleForRequest({ ...input,
+      ...(armedTargetRef !== undefined ? { targetRef: armedTargetRef } : {}) });
     let reviewModel: ReviewPreflightResult['reviewModel'];
     let reviewThinkingLevel: string | undefined;
     if (this.opts.reviewPreflight !== undefined) {
@@ -2387,7 +3080,9 @@ export class WaveRunner {
         reviewThinkingLevel = result.reviewThinkingLevel;
       }
     }
-    return this.beginPerkinsRound({ ...input, reviewModel, reviewThinkingLevel });
+    return this.beginPerkinsRound({ ...input,
+      ...(armedTargetRef !== undefined ? { armedTargetRef } : {}), reviewModel, reviewThinkingLevel,
+      ...(forceAuthorization !== undefined ? { forceAuthorization } : {}) });
   }
 
   private resolveReviewRequestRepo(input: { jobId: string }): string | null {
@@ -2399,6 +3094,32 @@ export class WaveRunner {
     return lane?.path ?? null;
   }
 
+  /** Preserve named local targets before preflight can admit a shadowing tag.
+   * Origin spellings retain their existing fetch/live-PR classification. */
+  private resolveLocalRequestTarget(input: { readonly jobId: string; readonly targetRef?: string }): string | undefined {
+    const job = this.opts.ledger.getJob(input.jobId);
+    if (job === null || isJobTerminal(job.status)) return undefined;
+    // A default PR lane branch is only a hint; the live PR head is authority.
+    if (job.prUrl !== null && input.targetRef === undefined) return undefined;
+    const lane = this.opts.worktrees.listWorktrees({ jobId: input.jobId }).find((entry) => entry.kind === 'job');
+    if (lane === undefined) return undefined;
+    const ref = input.targetRef ?? lane.branch ?? lane.sha;
+    if (isExactOriginBranchSpelling(ref)) return undefined;
+    return this.localTargetIdentity(lane.path, ref) ?? undefined;
+  }
+
+  /** Own recovery/material debt is unwaivable regardless of target validity.
+   * Use the existing refusal/audit path before inspecting a caller's ref. */
+  private refuseOwnUnwaivableReviewDebt(jobId: string): void {
+    const job = this.opts.ledger.getJob(jobId);
+    if (job === null || isJobTerminal(job.status) ||
+      (!this.opts.ledger.hasOpenDirectiveRecoveryHold(jobId) && pendingWorkRevision(this.opts.ledger, job) === null)) return;
+    const jobLane = this.opts.worktrees.listWorktrees({ jobId }).find((lane) => lane.kind === 'job') ?? null;
+    if (jobLane === null) return; // Preserve setup's canonical missing-lane refusal.
+    this.enforceBranchIdle({ job, jobLane, phase: 'arm',
+      targetBranch: normalizeBranch(jobLane.branch ?? laneBranch(jobId)) });
+  }
+
   /** Arm-intake branch-idle check. An unknown job is left to the round setup
    * (it reports the canonical not-found error), and so is a job with no job
    * lane yet — without a lane there is no target branch to protect, and the
@@ -2408,20 +3129,24 @@ export class WaveRunner {
     jobId: string;
     targetRef?: string;
     force?: boolean;
-  }): void {
+    forceAuthorization?: ForceAuthorization;
+  }): ForceAuthorization | undefined {
     const job = this.opts.ledger.getJob(input.jobId);
-    if (job === null) return;
+    if (job === null) return undefined;
     const jobLane = this.opts.worktrees
       .listWorktrees({ jobId: input.jobId })
       .find((candidate) => candidate.kind === 'job') ?? null;
-    if (jobLane === null) return;
-    this.enforceBranchIdle({
+    if (jobLane === null) return undefined;
+    const armed = this.enforceBranchIdle({
       job,
       jobLane,
       ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
       ...(input.force !== undefined ? { force: input.force } : {}),
       phase: 'arm',
+      ...(input.forceAuthorization !== undefined ? { forceAuthorization: input.forceAuthorization } : {}),
     });
+    // #267: what a force authorizes is the work present at THIS arm.
+    return input.force === true ? armed.authorization : undefined;
   }
 
   /** Branch-idle guard for one review target (rule 2026-09-23): resolve the
@@ -2430,9 +3155,12 @@ export class WaveRunner {
    * human `force` override. A forced arm is tagged in the event log here;
    * the freeze-phase caller also writes the manifest tag. Runs before any
    * route decision so every caller inherits one rule. */
-  private enforceBranchIdle(input: {
+  /** The branch-idle blockers of a request, without auditing or refusing. */
+  private branchIdleBlockers(input: {
     job: { readonly id: string };
     jobLane: WorktreeLane | null;
+    /** Authoritative resolved branch; never DWIM the caller spelling again. */
+    targetBranch?: string | undefined;
     targetRef?: string | undefined;
     force?: boolean | undefined;
     phase: BranchIdlePhase;
@@ -2442,7 +3170,7 @@ export class WaveRunner {
      * mask the lane it moved. */
     reviewedStatus?: { readonly jobId: string; readonly status: JobStatus } | undefined;
   }): { readonly targetBranch: string; readonly blockers: readonly BranchIdleBlocker[] } {
-    const targetBranch = resolveReviewTargetBranch({
+    const targetBranch = input.targetBranch ?? resolveReviewTargetBranch({
       jobId: input.job.id,
       ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
       lanePath: input.jobLane?.path ?? null,
@@ -2461,11 +3189,18 @@ export class WaveRunner {
     // never busy (the canonical terminal refusal owns them).
     const blockers: BranchIdleBlocker[] = [...laneMatched];
     const jobNow = this.opts.ledger.getJob(input.job.id);
+    // Owner rule 2: the job's own pending correction fences ANY target —
+    // a review of an explicit ref cannot stand in for the outdated lane.
+    const revision = jobNow === null ? null : pendingWorkRevision(this.opts.ledger, jobNow);
+    const verification = jobNow === null || isJobTerminal(jobNow.status) || revision !== null
+      ? null : this.opts.ledger.correctiveVerificationDebt(input.job.id);
     if (
       jobNow !== null &&
       !isJobTerminal(jobNow.status) &&
       !blockers.some((blocker) => blocker.jobId === input.job.id) &&
-      this.opts.ledger.listPendingRebriefs({ jobId: input.job.id }).length > 0
+      (this.opts.ledger.listPendingRebriefs({ jobId: input.job.id }).length > 0 ||
+        this.opts.ledger.hasOpenDirectiveRecoveryHold(input.job.id) ||
+        revision !== null || verification !== null)
     ) {
       blockers.push({
         jobId: input.job.id,
@@ -2473,24 +3208,76 @@ export class WaveRunner {
         branch: input.jobLane?.branch != null && input.jobLane.branch.trim() !== ''
           ? normalizeBranch(input.jobLane.branch)
           : laneBranch(input.job.id),
+        ...(revision !== null ? { revision } : {}),
+        ...(verification !== null ? { verification } : {}),
       });
     }
-    if (blockers.length === 0 && input.force !== true) return { targetBranch, blockers };
-    this.opts.ledger.appendCustomEvent({
-      kind: input.force === true ? 'branch-idle.forced' : 'branch-idle.refused',
-      jobId: input.job.id,
-      ...(input.roundId !== undefined ? { roundId: input.roundId } : {}),
-      payload: { phase: input.phase, forced: input.force === true, targetBranch, blockers },
-    });
-    if (input.force !== true) throw new BranchBusyError(targetBranch, blockers, input.phase);
     return { targetBranch, blockers };
   }
 
+  private refuseUnauditedBlockers(
+    jobId: string, roundId: string, idle: { readonly targetBranch: string; readonly blockers: readonly BranchIdleBlocker[] },
+    authorization: ForceAuthorization,
+  ): void {
+    const unaudited = idle.blockers.filter((blocker) => blocker.revision !== undefined ||
+      this.opts.ledger.hasOpenDirectiveRecoveryHold(blocker.jobId) ||
+      !forceCoversBlocker(this.opts.ledger, authorization, blocker));
+    if (unaudited.length === 0) return;
+    this.opts.ledger.appendCustomEvent({
+      kind: 'branch-idle.refused', jobId, roundId,
+      payload: { phase: 'freeze', forced: false, targetBranch: idle.targetBranch, blockers: unaudited },
+    });
+    throw new BranchBusyError(idle.targetBranch, unaudited, 'freeze');
+  }
+
+  private enforceBranchIdle(input: {
+    job: { readonly id: string };
+    jobLane: WorktreeLane | null;
+    /** Authoritative resolved branch; never DWIM the caller spelling again. */
+    targetBranch?: string | undefined;
+    targetRef?: string | undefined;
+    force?: boolean | undefined;
+    phase: BranchIdlePhase;
+    roundId?: string;
+    /** Pre-setup status when this round itself flipped the reviewed job
+     * (working|blocked → in-review): the flip is bookkeeping and must not
+     * mask the lane it moved. */
+    reviewedStatus?: { readonly jobId: string; readonly status: JobStatus } | undefined;
+    /** A forced check covers only the work its arm snapshot holds (#267). */
+    forceAuthorization?: ForceAuthorization;
+  }): { readonly targetBranch: string; readonly blockers: readonly BranchIdleBlocker[]; readonly authorization: ForceAuthorization } {
+    const { targetBranch, blockers } = this.branchIdleBlockers(input);
+    // Snapshot before publishing an audit: synchronous ledger observers can
+    // admit new work while that event is delivered, but cannot inherit it.
+    const authorization = snapshotForceAuthorization(this.opts.ledger, blockers);
+    // A retirement hold is a fresh-authorization boundary, not ordinary
+    // branch activity. Neither force nor a foreign target may waive it. A
+    // pending material correction is the same (owner rule 2): the candidate
+    // is outdated by an approved change, and no override reviews it.
+    const held = blockers.some((blocker) =>
+      blocker.revision !== undefined || this.opts.ledger.hasOpenDirectiveRecoveryHold(blocker.jobId));
+    if (blockers.length === 0 && input.force !== true) return { targetBranch, blockers, authorization };
+    const forced = input.force === true && !held && (input.forceAuthorization === undefined ||
+      blockers.every((blocker) => forceCoversBlocker(this.opts.ledger, input.forceAuthorization!, blocker, authorization.get(blocker.jobId))));
+    this.opts.ledger.appendCustomEvent({
+      kind: forced ? 'branch-idle.forced' : 'branch-idle.refused',
+      jobId: input.job.id,
+      ...(input.roundId !== undefined ? { roundId: input.roundId } : {}),
+      payload: { phase: input.phase, forced, targetBranch, blockers },
+    });
+    if (!forced) throw new BranchBusyError(targetBranch, blockers, input.phase);
+    return { targetBranch, blockers, authorization };
+  }
+
   private readonly roundAdmission = new Set<string>();
+  /** In-flight requestReview calls per job (#268), counted. */
+  private readonly requestsInFlight = new Map<string, number>();
 
   private async beginPerkinsRound(input: {
     jobId: string;
     targetRef?: string;
+    /** Canonical local name sampled before awaited preflight; never a replacement force authority. */
+    armedTargetRef?: string;
     /** Clean-abort re-arm: the exact delivered head proved at request time;
      * re-proved at the freeze boundary before any lens runs. */
     boundDeliveredSha?: string;
@@ -2502,18 +3289,222 @@ export class WaveRunner {
     claimedFixedPriors?: readonly number[];
     reviewModel?: ReviewPreflightResult['reviewModel'];
     reviewThinkingLevel?: string;
+    /** The automatic admission retry this round carries out. */
+    admissionRetry?: AdmissionRetry;
+    /** What a forced request authorized at its original arm (#267): the
+     * freeze and post-probe checks cover only that work. In memory only. */
+    forceAuthorization?: ForceAuthorization;
+    /** Issue #243 F-H2/M2: the caller's last admission guard (see
+     * ReviewRequestInput.finalAdmissionGuard). */
+    finalAdmissionGuard?: () => void;
   }): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
     if (this.shuttingDown) throw new Error('Perkins review service is shutting down');
-    if (this.roundAdmission.has(input.jobId)) {
-      throw new Error(`review round admission for job ${input.jobId} is already in progress; retry after setup settles`);
-    }
+    if (this.roundAdmission.has(input.jobId)) throw new RoundAdmissionInProgress(input.jobId);
     this.roundAdmission.add(input.jobId);
     const controller = new AbortController();
     try {
-      return await this.track(this.setupRound(input, controller.signal), controller);
+      return await this.trackReview(input.jobId, 'setup', null, this.setupRound(input, controller.signal), controller);
     } finally {
       this.roundAdmission.delete(input.jobId);
+      // R7-15: the setup (rollback included) has unwound — only now may a
+      // retry it scheduled be armed.
+      const scheduled = this.admissionRetries.get(input.jobId);
+      if (scheduled !== undefined && scheduled.timer === null && !scheduled.running) this.armAdmissionRetry(scheduled);
     }
+  }
+
+  /** A refused admission (owner decision 2026-10-08). A TRANSIENT refusal —
+   * every missing input a head-binding git step that failed and PROVED its
+   * process group stopped — schedules the next automatic retry (in memory)
+   * and informs; any other refusal, or the last retry's, escalates
+   * action-required. A fresh request refused while a retry waits keeps
+   * that retry (R7-11): same attempt, same due time, now answering THIS
+   * refusal. The retry is armed once the setup unwound (R7-15). */
+  private refuseAdmission(
+    roundId: string,
+    input: AdmissionRetryInput & { readonly admissionRetry?: AdmissionRetry },
+    missing: readonly AdmissionMissingInput[],
+    reviewedDeliverySeq: number,
+  ): ReviewAdmissionError {
+    const { jobId } = input;
+    const title = `Perkins review for job ${jobId} refused admission before any specialist started`;
+    const delays = this.admissionRetryDelaysMs;
+    const transient = missing.every((entry) => entry.retryable === true);
+    const current = this.admissionRetries.get(jobId);
+    const own = input.admissionRetry;
+    const waiting = own === undefined && current !== undefined && !current.running ? current : undefined;
+    const attempt = own !== undefined ? own.attempt + 1 : waiting?.attempt ?? 1;
+    if (!transient || attempt > delays.length) {
+      if (waiting !== undefined) this.dropAdmissionRetry(waiting, { outcome: 'superseded', roundId });
+      const refusal = new ReviewAdmissionError(missing, transient && delays.length > 0
+        ? `automatic retry ${delays.length} of ${delays.length} was refused too — no retries remain`
+        : undefined);
+      this.escalate(
+        `Perkins review for job ${jobId} refused admission before any specialist started`,
+        refusal.message,
+        { jobId, roundId },
+      );
+      return refusal;
+    }
+    const dueAt = waiting?.dueAt ?? Date.now() + delays[attempt - 1]!;
+    const refusal = new ReviewAdmissionError(missing, `automatic retry ${attempt} of ${delays.length} is scheduled for ${new Date(dueAt).toISOString()}`);
+    const scheduled = this.opts.ledger.appendCustomEvent({
+      kind: 'round.admission-retry-scheduled', jobId, roundId,
+      payload: { attempt, of: delays.length, dueAt: new Date(dueAt).toISOString(), deliverySeq: reviewedDeliverySeq },
+    });
+    // R9-8: the replacement keeps the waiting retry's attempt and due time,
+    // never its timer — that timer could come due while this refusal is
+    // still rolling back. Setup's finally arms the replacement afterwards
+    // (immediately, if it is already due).
+    if (waiting?.timer != null) clearTimeout(waiting.timer);
+    this.admissionRetries.set(jobId, {
+      input: admissionRetryInput(input), roundId, deliverySeq: reviewedDeliverySeq, attempt, dueAt,
+      scheduledSeq: scheduled.seq, timer: null, running: false,
+    });
+    this.opts.inform?.(title, refusal.message, { jobId, roundId });
+    return refusal;
+  }
+
+  /** Forget a retry that will not run, recording why. */
+  private dropAdmissionRetry(retry: AdmissionRetry, settlement: Readonly<Record<string, unknown>>): void {
+    const { jobId } = retry.input;
+    if (retry.timer !== null) clearTimeout(retry.timer);
+    retry.timer = null;
+    if (this.admissionRetries.get(jobId) === retry) this.admissionRetries.delete(jobId);
+    this.settleAdmissionRetry(retry, settlement);
+  }
+
+  /** Bookkeeping only: this retry will not be pending after a restart. */
+  private settleAdmissionRetry(retry: AdmissionRetry, settlement: Readonly<Record<string, unknown>>): void {
+    this.opts.ledger.appendCustomEvent({
+      kind: 'round.admission-retry-settled', jobId: retry.input.jobId, roundId: retry.roundId,
+      payload: { attempt: retry.attempt, scheduledSeq: retry.scheduledSeq, ...settlement },
+    });
+  }
+
+  private armAdmissionRetry(retry: AdmissionRetry): void {
+    if (this.shuttingDown) return; // the next start's check escalates it
+    const { jobId } = retry.input;
+    const timer = setTimeout(() => {
+      // Only the timer this job's retry still holds fires it.
+      const current = this.admissionRetries.get(jobId);
+      if (current === undefined || current.timer !== timer) return;
+      this.fireAdmissionRetry(current).catch((error: unknown) => {
+        this.log('error', 'automatic admission retry crashed', { job: jobId, error: String(error) });
+        this.escalate(
+          `Automatic review retry for job ${jobId} crashed`,
+          `Retry ${current.attempt} after refused round ${current.roundId}: ${String(error)}`,
+          { jobId, roundId: current.roundId },
+        );
+      });
+    }, Math.max(0, retry.dueAt - Date.now()));
+    timer.unref();
+    retry.timer = timer;
+  }
+
+  /** Why a due retry is no longer wanted — the job moved on, or another
+   * request for it is already under way — or null. */
+  private admissionRetrySkipReason(retry: AdmissionRetry): string | null {
+    const job = this.opts.ledger.getJob(retry.input.jobId);
+    if (job === null) return 'the job no longer exists';
+    if (!WaveRunner.HANDOFF_AUTHORIZED_STATUSES.has(job.status)) return `the job is ${job.status}`;
+    const deliverySeq = this.opts.ledger.latestCandidateDelivery(job.id)?.seq ?? 0;
+    if (deliverySeq !== retry.deliverySeq) return 'a newer delivery replaced the refused one';
+    const rounds = this.opts.ledger.listRounds(job.id);
+    if (rounds[rounds.length - 1]?.id !== retry.roundId) return 'a newer review round already started';
+    if (this.roundAdmission.has(job.id) || this.handoffs.has(job.id) || this.requestsInFlight.has(job.id)) {
+      return 'another review request for the job is under way';
+    }
+    return null;
+  }
+
+  /** A due retry: checked ONCE that its job is still where it was refused,
+   * then re-submitted as an ordinary review request — every ordinary fence
+   * applies from there (owner decision 2026-10-08: no durable claim, no
+   * lifecycle). A busy branch or a job that moved on skips it with an FYI;
+   * a shutdown leaves it to the next start's check. */
+  private async fireAdmissionRetry(retry: AdmissionRetry): Promise<void> {
+    const { jobId } = retry.input;
+    retry.timer = null;
+    if (this.shuttingDown) return;
+    const context = { jobId, roundId: retry.roundId };
+    const skip = (reason: string): void => {
+      this.dropAdmissionRetry(retry, { outcome: 'skipped', reason });
+      this.opts.inform?.(`Automatic review retry for job ${jobId} skipped`,
+        `Retry ${retry.attempt} after refused round ${retry.roundId} did not run: ${reason}.`, context);
+    };
+    // A new setup may still refuse and take this exact waiting retry over.
+    // Its provisional round/status are not a completed successor. Leave the
+    // original attempt/due time intact; setup's finally re-arms after rollback
+    // (or the usual successor proof then skips it after real admission).
+    if (this.roundAdmission.has(jobId)) return;
+    const skipped = this.admissionRetrySkipReason(retry);
+    if (skipped !== null) return skip(skipped);
+    retry.running = true;
+    try {
+      const result = await this.requestReview({ ...retry.input, admissionRetry: retry });
+      this.dropAdmissionRetry(retry, result.route === 'perkins'
+        ? { outcome: 'ran', route: result.route, ranRoundId: result.round.id }
+        : { outcome: 'ran', route: result.route });
+      void result.run.catch((error: unknown) => {
+        this.log('error', 'automatic admission retry failed after admission', { job: jobId, error: String(error) });
+      });
+    } catch (error) {
+      retry.running = false;
+      if (error instanceof ReviewAdmissionError) {
+        // Its refusal already scheduled the next retry, or escalated.
+        this.settleAdmissionRetry(retry, { outcome: 'refused' });
+        if (this.admissionRetries.get(jobId) === retry) this.admissionRetries.delete(jobId);
+      } else if (this.shuttingDown) {
+        return; // the next start's check escalates it
+      } else if (error instanceof BranchBusyError) {
+        skip(`the branch is busy again (${error.message})`);
+      } else if (error instanceof RoundAdmissionInProgress) {
+        skip('another review request for the job is under way');
+      } else {
+        this.dropAdmissionRetry(retry, { outcome: 'failed', detail: String(error).slice(0, 300) });
+        if (!alreadyNotified(error)) {
+          this.escalate(
+            `Automatic review retry for job ${jobId} could not start`,
+            `Retry ${retry.attempt} after refused round ${retry.roundId} failed before admission: ${String(error)}`,
+            { jobId, roundId: retry.roundId },
+          );
+        }
+      }
+    }
+  }
+
+  /** Startup (owner decision 2026-10-08): automatic retries live in memory,
+   * so one that was pending when the service stopped never resumes — each
+   * job's latest scheduled retry that never settled, whose refused round is
+   * still the job's latest, escalates action-required once instead. */
+  escalateInterruptedAdmissionRetries(): number {
+    let escalated = 0;
+    for (const job of this.opts.ledger.listJobs()) {
+      if (isJobTerminal(job.status)) continue;
+      const scheduled = this.opts.ledger.latestJobEvent(job.id, 'round.admission-retry-scheduled');
+      if (scheduled === null || scheduled.roundId === null) continue;
+      const settled = this.opts.ledger
+        .listJobEventsByKinds(job.id, ['round.admission-retry-settled'], { limit: 50 })
+        .some((event) => (event.payload as { scheduledSeq?: unknown } | null)?.scheduledSeq === scheduled.seq);
+      if (settled) continue;
+      const rounds = this.opts.ledger.listRounds(job.id);
+      const payload = scheduled.payload as { attempt?: unknown; dueAt?: unknown } | null;
+      this.opts.ledger.appendCustomEvent({
+        kind: 'round.admission-retry-settled', jobId: job.id, roundId: scheduled.roundId,
+        payload: { attempt: payload?.attempt ?? null, scheduledSeq: scheduled.seq, outcome: 'interrupted' },
+      });
+      if (rounds[rounds.length - 1]?.id !== scheduled.roundId) continue; // a newer round already answers it
+      this.escalate(
+        `Automatic review retry for job ${job.id} was interrupted by a restart`,
+        `Retry ${String(payload?.attempt ?? '?')} after refused round ${scheduled.roundId} was due at ` +
+          `${String(payload?.dueAt ?? 'an unknown time')}, but the service stopped first. Retries are not resumed after a ` +
+          'restart — request the review again.',
+        { jobId: job.id, roundId: scheduled.roundId },
+      );
+      escalated += 1;
+    }
+    return escalated;
   }
 
   /** Direct, lane-independent re-proof of the CURRENT fallback-admission
@@ -2558,6 +3549,25 @@ export class WaveRunner {
         }
       }
     }
+    // Owner rule 2: a pending material correction refuses fallback
+    // admission even under force — the candidate is outdated.
+    const jobRow = this.opts.ledger.getJob(input.jobId);
+    const revision = jobRow === null ? null : pendingWorkRevision(this.opts.ledger, jobRow);
+    if (jobRow !== null && revision !== null) {
+      const targetBranch = resolveReviewTargetBranch({
+        jobId: input.jobId,
+        ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
+        lanePath: lane.path,
+        laneBranch: lane.branch,
+      });
+      const blockers: readonly BranchIdleBlocker[] = [{ jobId: input.jobId, status: jobRow.status, branch: targetBranch, revision }];
+      this.opts.ledger.appendCustomEvent({
+        kind: 'branch-idle.refused',
+        jobId: input.jobId,
+        payload: { phase: 'arm', forced: false, targetBranch, blockers },
+      });
+      throw new BranchBusyError(targetBranch, blockers, 'arm');
+    }
     if (input.fromHandoff === true) {
       const pending = this.handoffs.get(input.jobId);
       this.assertHandoffAuthorized(input.jobId, pending?.seq ?? -1);
@@ -2587,7 +3597,7 @@ export class WaveRunner {
       readonly deliverySeq: number;
       readonly markerIds: readonly string[];
     }[];
-    readonly busyJobIds: readonly string[];
+    readonly forceAuthorization: ForceAuthorization;
     readonly markerIds: readonly string[];
     readonly deliverySeq: number;
     readonly statusSeq: number;
@@ -2619,8 +3629,18 @@ export class WaveRunner {
         `a new or unresolved re-brief request owns job "${input.jobId}" — the fallback gate stops before the next review round`,
       );
     }
+    // Owner rule 2: a material correction accepted while the gate runs makes
+    // its diff obsolete — no override carries the gate past it.
+    if (this.opts.ledger.hasOpenDirectiveRecoveryHold(input.jobId)) {
+      throw new FallbackSafetyRefusal(`job "${input.jobId}" has a recovery hold — fallback requires fresh authorization`);
+    }
+    if (jobNow !== null && pendingWorkRevision(this.opts.ledger, jobNow) !== null) {
+      throw new FallbackSafetyRefusal(
+        `an approved material correction for job "${input.jobId}" is pending delivery — the old diff cannot pass`,
+      );
+    }
     if (fallbackWorkingStartedSince(this.opts.ledger, input.jobId, admission.statusSeq) ||
-        (this.opts.ledger.latestJobEvent(input.jobId, 'job.delivered')?.seq ?? 0) !== admission.deliverySeq ||
+        (this.opts.ledger.latestCandidateDelivery(input.jobId)?.seq ?? 0) !== admission.deliverySeq ||
         (this.opts.ledger.latestJobEvent(input.jobId, 'silas.rebrief-settled')?.seq ?? 0) !== admission.settlementSeq ||
         (input.force !== true && jobNow !== null && laneIsBusy(this.opts.ledger, jobNow))) {
       throw new FallbackSafetyRefusal(
@@ -2637,6 +3657,15 @@ export class WaveRunner {
         );
       }
     }
+    // Every fallback gate — direct or handoff, forced or not — must stay
+    // review-eligible: a hold (blocked/parked) revokes the review and no
+    // force flag waives it. The handoff's own authorization proof above
+    // is additional, never replaced.
+    if (jobNow !== null && WaveRunner.FALLBACK_REVOKING_STATUSES.has(jobNow.status)) {
+      throw new FallbackSafetyRefusal(
+        `job "${input.jobId}" is ${jobNow.status} — held lanes are not review-eligible, so the fallback gate stops fail-closed`,
+      );
+    }
     const lanesNow = this.opts.worktrees.listWorktrees();
     const ownersNow = lanesNow.filter((candidate) => candidate.kind === 'job' && candidate.status !== 'swept' &&
       candidate.jobId !== null && normalizeBranch(candidate.branch ?? laneBranch(candidate.jobId)) === admission.targetBranch);
@@ -2644,7 +3673,7 @@ export class WaveRunner {
       const owner = admission.branchOwners.find((entry) => entry.jobId === candidate.jobId && entry.path === candidate.path);
       if (owner === undefined) return true;
       return fallbackWorkingStartedSince(this.opts.ledger, owner.jobId, owner.statusSeq) ||
-        (this.opts.ledger.latestJobEvent(owner.jobId, 'job.delivered')?.seq ?? 0) !== owner.deliverySeq ||
+        (this.opts.ledger.latestCandidateDelivery(owner.jobId)?.seq ?? 0) !== owner.deliverySeq ||
         JSON.stringify(this.opts.ledger.listPendingRebriefs({ jobId: owner.jobId }).map((marker) => marker.id)) !==
           JSON.stringify(owner.markerIds);
     })) {
@@ -2652,8 +3681,15 @@ export class WaveRunner {
         `a lane on branch "${admission.targetBranch}" changed after fallback admission — the old diff cannot pass`,
       );
     }
-    const busyNow = findBusyLanes({ ledger: this.opts.ledger, lanes: lanesNow, targetBranch: admission.targetBranch });
-    if (busyNow.some((blocker) => input.force !== true || !admission.busyJobIds.includes(blocker.jobId))) {
+    // Fallback reviews THIS checkout, even when target_ref names another
+    // branch. Its own live work cannot disappear behind target filtering.
+    const busyNow = [
+      ...findBusyLanes({ ledger: this.opts.ledger, lanes: lanesNow, targetBranch: admission.targetBranch }),
+      ...findBusyLanes({ ledger: this.opts.ledger, lanes: [lane], targetBranch: normalizeBranch(lane.branch ?? laneBranch(input.jobId)) }),
+    ];
+    if (busyNow.some((blocker) => input.force !== true || blocker.revision !== undefined ||
+      this.opts.ledger.hasOpenDirectiveRecoveryHold(blocker.jobId) ||
+      !forceCoversBlocker(this.opts.ledger, admission.forceAuthorization, blocker))) {
       throw new FallbackSafetyRefusal(
         `a new busy lane owns branch "${admission.targetBranch}" — the fallback gate stops before the next review round`,
       );
@@ -2666,28 +3702,38 @@ export class WaveRunner {
     repoPath: string | null,
     recheck?: () => void,
   ): Promise<FallbackGateOutcome> {
+    if (this.shuttingDown) throw new Error('Perkins review service is shutting down');
     const job = this.opts.ledger.getJob(input.jobId);
     if (job === null || repoPath === null) throw new Error(`job "${input.jobId}" not found — nothing to review`);
-    if (job.status === 'merged' || job.status === 'done') {
+    if (isJobTerminal(job.status)) {
       throw new Error(`job "${input.jobId}" is ${job.status} — terminal lanes do not go back under review`);
     }
     // Validate BEFORE the outcome returns: a failure after the 202 response
     // would be swallowed by the response path with no durable record.
     requireSafeRecordId(job.id, 'job id');
-    const gate = this.opts.fallbackGate;
-    const present = gate !== undefined && skillInstalled(gate.skillPath);
+    const configured = this.opts.fallbackGate;
+    let gate: ResolvedFallbackGateOptions | undefined;
+    let resourceFailure: string | undefined;
+    try {
+      const resources = configured?.resolveReviewResources?.(job.id);
+      const skillPath = resources?.skillPath ?? configured?.skillPath;
+      if (configured !== undefined && skillPath !== undefined) gate = { ...configured, ...resources, skillPath };
+    } catch (error) {
+      resourceFailure = `GC-owned fallback resources are unavailable: ${String(error)}`;
+    }
+    const present = gate !== undefined && (gate.skillContent !== undefined || skillInstalled(gate.skillPath));
     if (gate === undefined || !present) {
-      const note = gate === undefined
+      const note = resourceFailure ?? (configured === undefined
         ? 'the bmad-review fallback gate is not configured on this service'
-        : `the bmad-review skill is not installed at ${gate.skillPath}`;
-      const guidance = `Options: (1) install the BMAD review skill via onboarding; (2) restore the Perkins gate — ${failedLegs.map((leg) => leg.remediation).join(' ')}`;
+        : `the GC-owned fallback review helper is unavailable at ${gate?.skillPath ?? 'the configured assignment'}`);
+      const guidance = `Options: (1) restore the job's exact retained GC workflow package/context or rebuild/reinstall GC for a new job; never install or borrow an ambient BMAD skill; (2) restore the Perkins gate — ${failedLegs.map((leg) => leg.remediation).join(' ')}`;
       const message = `${note} ${guidance}`;
       this.opts.ledger.appendCustomEvent({
         kind: 'job.fallback-review',
         jobId: job.id,
         payload: { phase: 'unavailable', gate: true, skillInstalled: present, failedLegs, note },
       });
-      this.opts.escalate?.(
+      this.escalate(
         `Review for job ${job.id} cannot gate: Perkins is unavailable and the fallback is not installed`,
         message,
         { jobId: job.id },
@@ -2707,7 +3753,10 @@ export class WaveRunner {
       note: 'bmad-review fallback gate engaged',
     };
     this.activeFallbackGates.add(job.id);
-    const run = this.track(
+    const run = this.trackReview(
+      job.id,
+      'fallback',
+      null,
       this.runFallbackGate(job, repoPath, baseRef, failedLegs, gate, controller.signal, state, recheck)
         .finally(() => this.activeFallbackGates.delete(job.id)),
       controller,
@@ -2743,19 +3792,19 @@ export class WaveRunner {
     lanePath: string,
     baseRef: string,
     failedLegs: readonly ReviewCapabilityFailure[],
-    gate: FallbackGateOptions,
+    gate: ResolvedFallbackGateOptions,
     signal: AbortSignal,
     state: FallbackGateState,
     recheck?: () => void,
   ): Promise<void> {
     const maxRounds = gate.maxReviewRounds ?? 4;
-    const directory = join(this.artifactRoot(), 'fallback-gate', `${job.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+    const directory = join(gate.artifactRoot ?? this.artifactRoot(), 'fallback-gate', `${job.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     const fallbackEvent = (payload: Record<string, unknown>): void => {
       this.opts.ledger.appendCustomEvent({ kind: 'job.fallback-review', jobId: job.id, payload: { gate: true, ...payload } });
     };
     fallbackEvent({ phase: 'started', failedLegs, skill: gate.skillPath });
-    this.opts.escalate?.(
+    this.escalate(
       `Perkins gate unavailable for job ${job.id} — the bmad-review gate is engaged`,
       failedLegs.map((leg) => `${leg.leg}: ${leg.detail}`).join('; '),
       { jobId: job.id },
@@ -2763,7 +3812,16 @@ export class WaveRunner {
     let blockers = 0;
     let notes = 0;
     for (let iteration = 1; iteration <= maxRounds; iteration += 1) {
-      if (signal.aborted) throw new Error('review operation aborted');
+      if (signal.aborted) {
+        // A superseded gate (owner rule 3) — e.g. cancelled while its fix
+        // directive ran — still records its routine terminal; shutdown keeps
+        // its existing unrecorded stop.
+        if (this.supersededFallbackGates.has(job.id)) {
+          this.terminalFallbackSuperseded(job.id, `cancelled before round ${iteration}`, iteration, [...state.reportFiles], fallbackEvent, state);
+          return;
+        }
+        throw new Error('review operation aborted');
+      }
       // The gate can outlive its admission by many rounds (review → fix
       // directive → re-review). Re-prove the CURRENT lane/marker/
       // authorization facts before this round's diff intake: a re-brief
@@ -2793,35 +3851,35 @@ export class WaveRunner {
         }
       };
       const reportFile = join(directory, `review-${iteration}.json`);
-      // Re-read the lane's working diff every round: the fix directive may
-      // have changed the tree, and the next review must see those bytes.
-      // Working-tree diff against the base commit: uncommitted minion fixes
-      // MUST be visible to the re-review round.
-      // Mark untracked files as intent-to-add so `git diff` sees them, then
-      // undo the markers — the gate reviews the full working tree.
-      spawnSync('git', ['-C', lanePath, 'add', '-N', '.'], { timeout: 10_000 });
-      const diffResult = spawnSync(
-        'git', ['-C', lanePath, 'diff', '--no-ext-diff', '--no-color', baseRef],
-        { encoding: 'utf-8', maxBuffer: 64 * 1024 * 1024, timeout: 30_000 },
-      );
-      spawnSync('git', ['-C', lanePath, 'reset', '-q', '--'], { timeout: 10_000 });
-      if (diffResult.error !== undefined || diffResult.status !== 0) {
-        this.terminalFallbackBlocked(
-          job.id,
-          `cannot compute the working diff for fallback round ${iteration}: ${(diffResult.stderr ?? '').trim().slice(0, 200)}`,
-          iteration, [...state.reportFiles], fallbackEvent, state,
-        );
+      let captured: ReturnType<typeof captureFallbackInput>;
+      try {
+        captured = captureFallbackInput(lanePath, baseRef);
+      } catch (error) {
+        if (error instanceof FallbackSafetyRefusal) {
+          this.terminalFallbackAborted(job.id, error.message, iteration, [...state.reportFiles], fallbackEvent, state);
+        } else {
+          this.terminalFallbackBlocked(job.id, `fallback round ${iteration} input failed: ${sanitizeErrorLog(error)}`, iteration, [...state.reportFiles], fallbackEvent, state);
+        }
         return;
       }
-      const diff = boundedDiff(diffResult.stdout ?? '');
+      const { headRef, diff, diffSha256 } = captured;
       let findings: readonly FallbackFinding[];
       try {
         findings = gate.runFallbackReview !== undefined
-          ? await gate.runFallbackReview({ jobId: job.id, lanePath, baseRef, diff, skillPath: gate.skillPath, reportFile, iteration, signal })
-          : await this.defaultFallbackReview({ jobId: job.id, lanePath, baseRef, diff, skillPath: gate.skillPath, reportFile, iteration, signal }, recheckRound);
+          ? await gate.runFallbackReview({ jobId: job.id, lanePath, baseRef, headRef, diffSha256, diff, skillPath: gate.skillPath, ...(gate.skillContent !== undefined ? { skillContent: gate.skillContent } : {}), reportFile, iteration, signal })
+          : await this.defaultFallbackReview({ jobId: job.id, lanePath, baseRef, headRef, diffSha256, diff, skillPath: gate.skillPath, ...(gate.skillContent !== undefined ? { skillContent: gate.skillContent } : {}), reportFile, iteration, signal }, recheckRound);
         // A completed review of an older diff is not a PASS on a lane that
         // acquired and possibly settled a newer request while it ran.
         recheckRound();
+        // A reviewer that answers after cancellation (supersession, owner
+        // rule 3, or shutdown) never records a verdict on that diff.
+        if (signal.aborted) {
+          throw new FallbackSafetyRefusal(`the fallback gate for job "${job.id}" was cancelled while its reviewer ran — its findings are not a verdict`);
+        }
+        const current = captureFallbackInput(lanePath, baseRef);
+        if (current.headRef !== headRef || current.diffSha256 !== diffSha256) {
+          throw new FallbackSafetyRefusal(`fallback working diff or HEAD changed during round ${iteration}; the old report cannot pass`);
+        }
       } catch (error) {
         if (existsSync(reportFile)) state.reportFiles.push(reportFile);
         if (error instanceof FallbackSafetyRefusal) {
@@ -2838,11 +3896,11 @@ export class WaveRunner {
       notes = triaged.notes.length;
       state.blockers = blockers;
       state.notes = notes;
-      fallbackEvent({ phase: 'triaged', iteration, blockers, notes, reportFile });
+      fallbackEvent({ phase: 'triaged', iteration, blockers, notes, reportFile, baseRef, headRef, diffSha256, completeDiff: true });
       if (blockers === 0) {
         state.clearToMerge = true;
         fallbackEvent({ phase: 'pass', iteration, notes, reportFile, clearToMerge: true, merge: 'user-held' });
-        this.opts.escalate?.(
+        this.escalate(
           `bmad-review gate PASS for job ${job.id} — review/fix routing cleared (not a Perkins READY; merge stays user-held)`,
           `${notes} note(s) across ${iteration} review round(s). Reports: ${state.reportFiles.join(', ')}`,
           { jobId: job.id },
@@ -2852,6 +3910,11 @@ export class WaveRunner {
       if (iteration === maxRounds) break;
       let delivery: { readonly delivered: boolean; readonly minionId?: string; readonly note?: string };
       try {
+        // No fix directive leaves a cancelled gate: the lane's writer now
+        // belongs to whoever superseded it.
+        if (signal.aborted) {
+          throw new FallbackSafetyRefusal(`the fallback gate for job "${job.id}" was cancelled before its fix directive`);
+        }
         delivery = await gate.fixDirectiveSink({
           jobId: job.id,
           directive: renderFixDirective(triaged.blockers, iteration),
@@ -2860,6 +3923,10 @@ export class WaveRunner {
           signal,
         });
       } catch (error) {
+        if (error instanceof FallbackSafetyRefusal) {
+          this.terminalFallbackAborted(job.id, error.message, iteration, [...state.reportFiles], fallbackEvent, state);
+          return;
+        }
         this.terminalFallbackBlocked(
           job.id,
           `fix directive for round ${iteration} failed: ${sanitizeErrorLog(error)}`,
@@ -2883,6 +3950,25 @@ export class WaveRunner {
     this.terminalFallbackBlocked(job.id, `release blockers remain after ${maxRounds} bmad-review rounds`, maxRounds, [...state.reportFiles], fallbackEvent, state);
   }
 
+  /** A superseded gate's terminal record (owner rule 3): routine history
+   * with an FYI, never a BLOCKED/ABORTED action-required incident. */
+  private terminalFallbackSuperseded(
+    jobId: string,
+    reason: string,
+    iteration: number,
+    reports: readonly string[],
+    fallbackEvent: (payload: Record<string, unknown>) => void,
+    state?: FallbackGateState,
+  ): void {
+    if (state !== undefined) state.note = `bmad-review gate superseded: ${reason}`;
+    fallbackEvent({ phase: 'aborted', iteration, reason: `superseded — ${reason}`, reports, clearToMerge: false, superseded: true });
+    this.opts.inform?.(
+      `bmad-review gate superseded for job ${jobId}`,
+      `An approved change or the lane writer superseded this gate (${reason}). The next candidate gets a fresh review.`,
+      { jobId },
+    );
+  }
+
   private terminalFallbackBlocked(
     jobId: string,
     reason: string,
@@ -2891,12 +3977,16 @@ export class WaveRunner {
     fallbackEvent: (payload: Record<string, unknown>) => void,
     state?: FallbackGateState,
   ): void {
+    if (this.supersededFallbackGates.has(jobId)) {
+      this.terminalFallbackSuperseded(jobId, reason, iterations, reports, fallbackEvent, state);
+      return;
+    }
     if (state !== undefined) {
       state.iterations = iterations;
       state.note = `bmad-review gate blocked: ${reason}`;
     }
     fallbackEvent({ phase: 'blocked', iterations, reason, reports, clearToMerge: false });
-    this.opts.escalate?.(
+    this.escalate(
       `bmad-review gate BLOCKED for job ${jobId}`,
       `${reason}. Reports: ${reports.join(', ')}. Merge is NOT clear; restore the Perkins gate for autonomous gating.`,
       { jobId },
@@ -2911,9 +4001,13 @@ export class WaveRunner {
     fallbackEvent: (payload: Record<string, unknown>) => void,
     state?: FallbackGateState,
   ): void {
+    if (this.supersededFallbackGates.has(jobId)) {
+      this.terminalFallbackSuperseded(jobId, reason, iteration, reports, fallbackEvent, state);
+      return;
+    }
     if (state !== undefined) state.note = `bmad-review gate aborted: ${reason}`;
     fallbackEvent({ phase: 'aborted', iteration, reason, reports, clearToMerge: false });
-    this.opts.escalate?.(
+    this.escalate(
       `bmad-review gate ABORTED for job ${jobId}`,
       `${reason}. No further review round ran; merge is NOT clear. Restore the Perkins gate for autonomous gating.`,
       { jobId },
@@ -2932,10 +4026,19 @@ export class WaveRunner {
       // start an obsolete reviewer. The lease releases in the finally on
       // throw.
       if (recheck !== undefined) recheck();
-      handle = await this.opts.spawner('minion', { cwd: input.lanePath, signal: input.signal });
-      // Spawning is asynchronous too: a newly owned lane must not receive
-      // an obsolete review prompt just because the worker was allocated.
+      const policy = fallbackReviewPolicy(input.skillPath, input.reportFile, input.skillContent);
+      handle = await this.opts.spawner('minion', { cwd: input.lanePath, signal: input.signal,
+        // Reuse the existing ambient-free read-only host on both runtimes.
+        // The scoped submission closure, never ordinary write, captures a report.
+        roleTools: ['read', 'grep', 'find', 'ls'],
+        isolatedReview: policy,
+      });
+      // Revocation after asynchronous allocation takes precedence even if the
+      // adapter also failed to expose a capability: no obsolete prompt can run.
       recheck?.();
+      if (!handle.reviewTools?.includes('gc_submit_fallback_findings')) {
+        throw new Error('fallback runtime did not expose the required host-bound findings tool; restore that native adapter capability before retrying');
+      }
       // The ledger role is the review-worker role on purpose (Gru ruling
       // 2026-09-29): this session runs ONE review pass and is forbidden
       // from implementation edits, so it must never win an implementer
@@ -2948,9 +4051,11 @@ export class WaveRunner {
         jobId: input.jobId,
       });
       const prompt = [
-        `Read ${input.skillPath} completely and follow it to review the CURRENT working diff of this repository against base ${input.baseRef}.`,
+        `Apply the verified GC-owned review helper ${input.skillPath}, supplied completely in your system instructions, to this complete host-captured CURRENT working diff.`,
+        `Host-verified canonical base: ${input.baseRef}; checkout HEAD: ${input.headRef}; complete working diff SHA-256: ${input.diffSha256}. Uncommitted bytes are included, so HEAD alone is not the candidate.`,
+        'This helper is product-owned authority; never discover or invoke project/global BMAD skills, renderers, config resolvers or onboarding.',
         'This session runs ONE review pass inside a release gate. The host performs triage and every gate decision afterwards: do NOT approve, merge, or gate anything yourself, and do not modify implementation code.',
-        `Write your findings as ONE JSON array to exactly this file: ${input.reportFile}`,
+        `Submit findings as ONE JSON array using gc_submit_fallback_findings({ findings: [...] }). The host alone writes ${input.reportFile}; you have no filesystem write tool.`,
         'Each element: { "title": string, "category": string, "location": string, "evidence": string, "detail": string }. Use a release-safety category (correctness, security, data-loss, broken-build, build-failure, crash, regression, vulnerability, injection, secret-leak) only for real release-safety defects; use any other short tag for everything else. An empty array [] is valid.',
         'Then reply DONE.',
         '',
@@ -2960,6 +4065,7 @@ export class WaveRunner {
       if (input.signal.aborted) throw new Error('review operation aborted');
       const session = handle;
       let promptError: unknown = null;
+      let terminalVerdict: PromptTurnVerdict | null = null;
       try {
         // The transport wait is a still-running REPORT boundary, never a
         // worker lifetime: a live review turn keeps running on its own
@@ -2970,10 +4076,12 @@ export class WaveRunner {
         let sliceTimer: ReturnType<typeof setTimeout> | null = null;
         let abortListener: (() => void) | null = null;
         try {
-          const settled = new Promise<'settled'>((resolve) => {
-            void session.prompt(prompt, { owner: 'bmad-review-gate' }).then(
-              () => resolve('settled'),
-              (error) => { promptError = error; resolve('settled'); },
+          const settled = new Promise<PromptTurnVerdict | null>((resolve) => {
+            void promptWithTerminalVerdict(session, prompt, { owner: 'bmad-review-gate' }).then(
+              resolve,
+              // First diagnosis wins: a rejection that lands after the wait
+              // loop already diagnosed a terminal failure must not replace it.
+              (error) => { if (promptError === null) promptError = error; resolve(null); },
             );
           });
           const aborted = new Promise<never>((_resolve, reject) => {
@@ -2986,7 +4094,7 @@ export class WaveRunner {
               sliceTimer = setTimeout(() => resolve('slice'), FALLBACK_REVIEW_TIMEOUT_MS);
               sliceTimer.unref?.();
             });
-            let outcome: 'settled' | 'slice';
+            let outcome: PromptTurnVerdict | null | 'slice';
             try {
               outcome = await Promise.race([settled, aborted, slice]);
             } finally {
@@ -2995,7 +4103,7 @@ export class WaveRunner {
                 sliceTimer = null;
               }
             }
-            if (outcome === 'settled') break;
+            if (outcome !== 'slice') { terminalVerdict = outcome; break; }
             waitedMs += FALLBACK_REVIEW_TIMEOUT_MS;
             const sessionState = session.health().state;
             if (sessionState === 'disposed' || sessionState === 'error') {
@@ -3016,7 +4124,7 @@ export class WaveRunner {
           if (abortListener !== null) input.signal.removeEventListener('abort', abortListener);
         }
       } catch (error) {
-        promptError = error;
+        if (promptError === null) promptError = error;
       } finally {
         // Release before the settlement wait: the retry reacquires the slot.
         lease?.release();
@@ -3031,6 +4139,10 @@ export class WaveRunner {
       // report file the retried turn wrote is parsed below; only a
       // rejection with no recovered retry keeps the fail-loud throw.
       if (promptError !== null && disposition !== 'recovered') throw promptError;
+      if (disposition !== 'recovered' && terminalVerdict?.ok !== true) {
+        throw new Error(`fallback reviewer turn did not successfully complete: ${terminalVerdict?.error ?? 'no terminal completion evidence'}`);
+      }
+      policy.assertReportValid();
     } finally {
       try { await handle?.dispose(); } finally { lease?.release(); }
     }
@@ -3040,6 +4152,8 @@ export class WaveRunner {
   private async setupRound(input: {
     jobId: string;
     targetRef?: string;
+    /** Canonical local name sampled before awaited preflight; never a replacement force authority. */
+    armedTargetRef?: string;
     /** Clean-abort re-arm: the exact delivered head proved at request time;
      * re-proved at the freeze boundary before any lens runs. */
     boundDeliveredSha?: string;
@@ -3051,12 +4165,23 @@ export class WaveRunner {
     claimedFixedPriors?: readonly number[];
     reviewModel?: ReviewPreflightResult['reviewModel'];
     reviewThinkingLevel?: string;
+    /** The automatic admission retry this round carries out. */
+    admissionRetry?: AdmissionRetry;
+    /** What a forced request authorized at its original arm (#267): the
+     * freeze and post-probe checks cover only that work. In memory only. */
+    forceAuthorization?: ForceAuthorization;
+    /** Issue #243 F-H2/M2: the caller's last admission guard (see
+     * ReviewRequestInput.finalAdmissionGuard). */
+    finalAdmissionGuard?: () => void;
   }, setupSignal: AbortSignal): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
     if (this.shuttingDown || setupSignal.aborted) throw new Error('Perkins review service is shutting down');
+    // R7-14: the delivery THIS round reviews — fixed before any await, so a
+    // delivery that lands during the probe never becomes a retry's baseline.
+    const reviewedDeliverySeq = this.opts.ledger.latestCandidateDelivery(input.jobId)?.seq ?? 0;
     const policy = (this.opts.reviewPolicyLoader ?? loadPerkinsPolicy)();
     const job = this.opts.ledger.getJob(input.jobId);
     if (job === null) throw new Error(`job "${input.jobId}" not found — nothing to review`);
-    if (job.status === 'merged' || job.status === 'done') {
+    if (isJobTerminal(job.status)) {
       throw new Error(`job "${input.jobId}" is ${job.status} — terminal lanes do not go back under review`);
     }
     const jobWorktree = this.opts.worktrees
@@ -3068,6 +4193,7 @@ export class WaveRunner {
     if (job.briefing === null && input.noSpec !== true) {
       throw new Error('complete review requires the job briefing/spec or explicit noSpec=true');
     }
+    const originalJobHandoff = capturePortLaneHandoff(this.opts.worktrees, jobWorktree);
     const canonicalLenses = input.noSpec === true
       ? [...policy.portableContract.rules.noSpecLenses]
       : [...policy.portableContract.rules.fullLenses];
@@ -3075,13 +4201,21 @@ export class WaveRunner {
       throw new Error('Perkins review lens set is canonical and cannot be reduced or reordered');
     }
     const artifactRoot = this.artifactRoot();
-    const candidateRef = input.targetRef ?? jobWorktree.branch ?? jobWorktree.sha;
-    const { targetSha, movementRef } = await this.resolveFreezeTarget({
+    const candidateRef = input.armedTargetRef ?? input.targetRef ?? jobWorktree.branch ?? jobWorktree.sha;
+    const { targetSha, movementRef, targetBranch } = await this.resolveFreezeTarget({
       job,
       jobWorktree,
       candidateRef,
+      ...(input.armedTargetRef !== undefined ? { armedTargetRef: input.armedTargetRef } : {}),
       explicitTarget: input.targetRef !== undefined && input.targetRef.trim() !== '',
     });
+    if (input.armedTargetRef !== undefined) this.assertNamedTargetIdentity(jobWorktree.path, input.armedTargetRef);
+    // R8-18: a shutdown during resolution starts nothing — no round, no worktree.
+    if (this.shuttingDown || setupSignal.aborted) {
+      throw setupSignal.reason instanceof ReviewSupersededError
+        ? setupSignal.reason
+        : new Error('Perkins review service shut down during review setup');
+    }
     const baseRef = resolveReviewBaseRef(jobWorktree.path, job.baseBranch);
     // Effective acceptance + exact-target CI are read AS LATE AS POSSIBLE —
     // immediately before the freeze — so an amendment or CI observation
@@ -3127,13 +4261,18 @@ export class WaveRunner {
         // R7-5: the newest run BINDING THIS TARGET governs — a newer
         // completed run for a DIFFERENT sha must not erase an older clean
         // run for the reviewed head (and never fabricates one).
-        // R8-2: KIND-SCOPED history with a loud window bound — the search
-        // for the newest binding run cannot be truncated by unrelated job
-        // events, and an over-window history fails loud instead of
-        // masquerading as absence.
-        const bindingVerification = this.opts.ledger
-          .listJobVerificationCompleted(job.id)
-          .find((event) => renderRecordedVerification(event, targetSha) !== null) ?? null;
+        // R8-2 (corrected, j-1594): the KIND-SCOPED history is read in
+        // bounded keyset pages over the COMPLETE record with NO lifetime
+        // ceiling — a job with more completed runs than one page stays
+        // reviewable. The scan stops at the newest binding run; absence is
+        // rendered only after the history is exhausted.
+        // The iterable is newest-first: the ledger read orders by seq DESC
+        // (the selector takes the FIRST binding element, so ordering governs
+        // which run is "newest").
+        const bindingVerification = selectNewestBoundVerification(
+          this.opts.ledger.iterateJobVerificationCompleted(job.id),
+          targetSha,
+        );
         const evidence = renderRecordedVerification(bindingVerification, targetSha);
         // Verification evidence is ALWAYS explicit (gh-169): a binding run
         // renders its block; no binding run freezes the UNAVAILABLE
@@ -3194,16 +4333,45 @@ export class WaveRunner {
       throw new Error('review ownership changed during reconciliation; retry after the active round settles');
     }
     const flippedFrom = job.status === 'working' || job.status === 'blocked' ? job.status : null;
+    // A setup failure restores `working` as the SAME attempt, never a reopen.
+    const attemptStartSeq = flippedFrom === 'working' ? openAttemptStartSeq(this.opts.ledger, job.id) : undefined;
+    // R8-18: nor after the reconciliation awaits.
+    if (this.shuttingDown || setupSignal.aborted) {
+      throw setupSignal.reason instanceof ReviewSupersededError
+        ? setupSignal.reason
+        : new Error('Perkins review service shut down during review setup');
+    }
     // The local admission guard covers this runner's awaited setup. The
     // ledger CAS covers other runner instances (or processes) sharing its
     // database: a replaced predecessor or status cannot mint two writers.
-    const round = this.opts.ledger.admitReviewRound({
+    // R7-10/R8-10: the admission returns this round's OWN provisional
+    // status event, read inside its transaction — the restore below undoes
+    // exactly it, never a generation a subscriber wrote on publication.
+    if (input.armedTargetRef !== undefined) this.assertNamedTargetIdentity(jobWorktree.path, input.armedTargetRef);
+    const { round, flipSeq } = this.opts.ledger.admitReviewRoundWithFlip({
       jobId: job.id, expectedLatestRoundId: predecessor?.id ?? null,
       expectedJobStatus: job.status, lenses: canonicalLenses, targetRef: targetSha,
     });
 
     let reviewWorktree: Awaited<ReturnType<WorktreePort['createReviewWorktree']>> | undefined;
     let frozenReview: FrozenReview;
+    let originalReviewHandoff: (() => void) | null = null;
+    // Keep the arm's immutable map and canonical target through execution.
+    // Later guards refuse new work; they never publish another force audit.
+    const assertReviewAuthority = (): void => {
+      originalJobHandoff();
+      if (originalReviewHandoff === null) throw new Error('original review handoff is unavailable');
+      originalReviewHandoff();
+      if (input.armedTargetRef !== undefined) this.assertNamedTargetIdentity(jobWorktree.path, input.armedTargetRef);
+      this.assertNamedTargetIdentity(jobWorktree.path, movementRef);
+      const recheck = {
+        job, jobLane: jobWorktree, targetBranch, phase: 'freeze' as const, roundId: round.id,
+        ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
+        ...(flippedFrom !== null ? { reviewedStatus: { jobId: job.id, status: flippedFrom } } : {}),
+      };
+      const current = input.force === true ? this.branchIdleBlockers(recheck) : this.enforceBranchIdle(recheck);
+      this.refuseUnauditedBlockers(job.id, round.id, current, input.forceAuthorization ?? new Map());
+    };
     try {
       reviewWorktree = await this.opts.worktrees.createReviewWorktree({
         repoPath: jobWorktree.repoPath,
@@ -3211,24 +4379,32 @@ export class WaveRunner {
         ref: targetSha,
         jobId: job.id,
       });
+      originalReviewHandoff = capturePortLaneHandoff(this.opts.worktrees, reviewWorktree);
       if (this.shuttingDown || setupSignal.aborted) {
-        throw new Error('Perkins review service shut down during review setup');
+        throw setupSignal.reason instanceof ReviewSupersededError
+          ? setupSignal.reason
+          : new Error('Perkins review service shut down during review setup');
       }
       const jobAtFreeze = this.opts.ledger.getJob(job.id);
       if (jobAtFreeze !== null && isJobTerminal(jobAtFreeze.status)) {
         throw new Error(`job "${job.id}" is ${jobAtFreeze.status} — terminal lanes do not go back under review`);
       }
+      if (input.armedTargetRef !== undefined) this.assertNamedTargetIdentity(jobWorktree.path, input.armedTargetRef);
+      this.assertNamedTargetIdentity(jobWorktree.path, movementRef);
       // Freeze-time close of the race window: a lane may have re-opened
       // between the arm intake and this freeze. The same refusal applies.
-      const idle = this.enforceBranchIdle({
+      const idleInput = {
         job,
         jobLane: jobWorktree,
+        targetBranch,
         ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
         ...(input.force !== undefined ? { force: input.force } : {}),
-        phase: 'freeze',
+        ...(input.force === true ? { forceAuthorization: input.forceAuthorization ?? new Map() } : {}),
+        phase: 'freeze' as const,
         roundId: round.id,
         ...(flippedFrom !== null ? { reviewedStatus: { jobId: job.id, status: flippedFrom } } : {}),
-      });
+      };
+      const idle = this.enforceBranchIdle(idleInput);
       // A clean-abort re-arm proved ONE delivered head at request time; the
       // awaited pre-flight/capacity/setup window can admit a newer delivery.
       // Re-prove the unchanged-head precondition here, at the last boundary
@@ -3236,7 +4412,7 @@ export class WaveRunner {
       // under the clean-abort provenance (the next digest sweep offers the
       // changed-head re-review instead).
       if (input.boundDeliveredSha !== undefined) {
-        const deliveredNow = this.opts.ledger.latestJobEvent(job.id, 'job.delivered');
+        const deliveredNow = this.opts.ledger.latestCandidateDelivery(job.id);
         const shaNow = deliveredNow === null ? null : deliveredTargetSha(deliveredNow);
         if (shaNow !== input.boundDeliveredSha) {
           throw new Error(
@@ -3353,11 +4529,63 @@ export class WaveRunner {
       const receiptValid = uniqueReceipt !== null && uniqueReceipt.jobId === job.id &&
         uniqueReceipt.roundId === round.id && typeof receiptPayload?.sha256 === 'string' &&
         /^[a-f0-9]{64}$/u.test(receiptPayload.sha256);
+      // The read-only preflight runs synchronously, so nothing in this
+      // service can change between it and the branch recheck below.
       const admission = admissionPreflight(frozenReview, movementRef, {
         precomputedRemoteMovement,
         frozenManifestReceiptRequired: true,
         ...(receiptValid ? { frozenManifestSha256: (uniqueReceipt!.payload as { sha256: string }).sha256 } : {}),
       });
+      // R9-6: a git step that would not stop is refused and escalated
+      // naming its group FIRST — a branch that turned busy meanwhile never
+      // masks it. Any other outcome takes the busy check before admission
+      // records anything.
+      if (!admission.missing.some((entry) => entry.cleanupUnconfirmed === true)) {
+        // R8-16: work that made the branch busy DURING the probe stops the
+        // review before any admission effect — the same shared predicate as
+        // the freeze. A forced round's audited blockers stay authorized; a new
+        // one never is.
+        const recheck = {
+          job,
+          jobLane: jobWorktree,
+          targetBranch,
+          ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
+          phase: 'freeze' as const,
+          roundId: round.id,
+          ...(flippedFrom !== null ? { reviewedStatus: { jobId: job.id, status: flippedFrom } } : {}),
+        };
+        // Unforced: the ordinary refusal (audited). Forced: its audit already
+        // stands — only a blocker it never covered is refused (audited below).
+        const afterProbe = input.force === true ? this.branchIdleBlockers(recheck) : this.enforceBranchIdle(recheck);
+        this.refuseUnauditedBlockers(job.id, round.id, afterProbe, input.forceAuthorization ?? new Map());
+        // Owner rule 3: a setup superseded while it awaited (an approved
+        // material change, or a writer that owns the lane) withdraws here,
+        // before any admission effect — the rollback below unwinds it.
+        if (setupSignal.reason instanceof ReviewSupersededError) throw setupSignal.reason;
+        if (input.armedTargetRef !== undefined) this.assertNamedTargetIdentity(jobWorktree.path, input.armedTargetRef);
+        this.assertNamedTargetIdentity(jobWorktree.path, movementRef);
+      }
+      // Issue #243 F-H7: the recorded-delivery ledger is INDEPENDENT of
+      // branch idleness — a completed same-revision delivery B can leave the
+      // lane idle while an explicitly pinned SHA A stays immutable, so the
+      // post-probe branch recheck above cannot see the drift. Re-prove the
+      // bound delivered head HERE, at the last boundary before any admission
+      // effect, so A never freezes after B arrived during the final probe.
+      if (input.boundDeliveredSha !== undefined) {
+        const deliveredNow = this.opts.ledger.latestJobEvent(job.id, 'job.delivered');
+        const shaNow = deliveredNow === null ? null : deliveredTargetSha(deliveredNow);
+        if (shaNow !== input.boundDeliveredSha) {
+          throw new Error(
+            `the bound delivered head moved during the final admission probe (${input.boundDeliveredSha} -> ${shaNow ?? 'none'}) — request the review again`,
+          );
+        }
+      }
+      // Issue #243 F-H2/M2: the caller's LAST admission guard runs here,
+      // after every awaited setup/probe step and immediately before any
+      // admission effect — a family/basis owner hold or a CI observation that
+      // landed during the awaits refuses instead of arming stale work. This is
+      // a caller-supplied guard (no private schema/ingress invented here).
+      input.finalAdmissionGuard?.();
       this.opts.ledger.appendCustomEvent({
         kind: 'round.admission-preflight',
         jobId: job.id,
@@ -3368,29 +4596,25 @@ export class WaveRunner {
           ...(admission.missing.length > 0 ? { missing: admission.missing } : {}),
         },
       });
-      if (admission.missing.length > 0) {
-        const refusal = new ReviewAdmissionError(admission.missing);
-        this.opts.escalate?.(
-          `Perkins review for job ${job.id} refused admission before any specialist started`,
-          refusal.message,
-          { jobId: job.id, roundId: round.id },
-        );
-        throw refusal;
-      }
+      if (admission.missing.length > 0) throw this.refuseAdmission(round.id, input, admission.missing, reviewedDeliverySeq);
     } catch (error) {
       const failures: unknown[] = [error];
       const interrupted = this.shuttingDown || setupSignal.aborted;
+      // Owner rule 3: a superseded setup is withdrawn, not a shutdown.
+      const superseded = setupSignal.reason instanceof ReviewSupersededError;
       try {
         if (interrupted) {
-          const note = 'review setup interrupted by service shutdown; frozen proof is incomplete';
+          const note = superseded
+            ? 'review setup withdrawn: an approved material change or the lane writer superseded this candidate'
+            : 'review setup interrupted by service shutdown; frozen proof is incomplete';
           this.opts.ledger.abortReviewSetupWithoutSpawn(round.id);
-          const artifacts = this.writeInterruptedArtifacts(round.id, 'service_shutdown_setup', note);
+          const artifacts = this.writeInterruptedArtifacts(round.id, superseded ? 'superseded' : 'service_shutdown_setup', note);
           this.opts.ledger.appendCustomEvent({
             kind: 'round.perkins-incomplete',
             jobId: job.id,
             roundId: round.id,
             payload: {
-              reason: 'service_shutdown_setup',
+              reason: superseded ? 'superseded' : 'service_shutdown_setup',
               artifactDirectory: artifacts.directory,
               reportFile: artifacts.reportFile,
             },
@@ -3405,7 +4629,13 @@ export class WaveRunner {
       }
       if (reviewWorktree !== undefined) {
         try {
-          await this.sweepReviewWorktree(reviewWorktree.id);
+          // #269: a cleanup-unconfirmed refusal already escalated naming its
+          // process group — its rollback sweep must not alert again for the
+          // same event.
+          await this.sweepReviewWorktree(reviewWorktree.id, {
+            alreadyNotified: error instanceof ReviewAdmissionError &&
+              error.missing.some((entry) => entry.cleanupUnconfirmed === true),
+          });
         } catch (cleanupError) {
           failures.push(cleanupError);
         }
@@ -3414,6 +4644,8 @@ export class WaveRunner {
         try {
           this.opts.ledger.restoreReviewSetupStatus({
             jobId: job.id, roundId: round.id, priorStatus: flippedFrom,
+            ...(attemptStartSeq !== undefined ? { attemptStartSeq } : {}),
+            ...(flipSeq !== null ? { expectedStatusSeq: flipSeq } : {}),
           });
         } catch (restoreError) {
           failures.push(restoreError);
@@ -3437,7 +4669,10 @@ export class WaveRunner {
       workflow: 'perkins-whole-pr',
     });
     const runController = new AbortController();
-    const run = this.track(
+    const run = this.trackReview(
+      job.id,
+      'perkins',
+      round.id,
       (async (): Promise<WaveOutcome> => {
         const outcome = await this.runBuiltInReview(
           job,
@@ -3449,6 +4684,7 @@ export class WaveRunner {
           frozenReview,
           policy,
           runController.signal,
+          assertReviewAuthority,
           input.reviewModel,
           input.claimedFixedPriors,
         );
@@ -3482,11 +4718,15 @@ export class WaveRunner {
           } catch {
             // The escalation below still carries the durable fact.
           }
-          this.opts.escalate?.(
-            `Perkins delta READY for job ${input.jobId} still owes its final whole-change pass`,
-            `${detail}. The delta round stays recorded, but no approval can be credited until a whole-scope round closes at this target.`,
-            { jobId: input.jobId, roundId: round.id },
-          );
+          // R7-16/R8-25: a refusal of the pass was already notified (and,
+          // when transient, retries on its own).
+          if (!alreadyNotified(error)) {
+            this.escalate(
+              `Perkins delta READY for job ${input.jobId} still owes its final whole-change pass`,
+              `${detail}. The delta round stays recorded, but no approval can be credited until a whole-scope round closes at this target.`,
+              { jobId: input.jobId, roundId: round.id },
+            );
+          }
           return outcome;
         }
       })(),
@@ -3515,9 +4755,49 @@ export class WaveRunner {
     const result = spawnSync('git', ['-C', repoPath, 'rev-parse', '--symbolic-full-name', '--verify', ref], {
       encoding: 'utf-8',
       timeout: 30_000,
+      env: repositoryGitEnv(false),
     });
     const name = result.status === 0 ? (result.stdout ?? '').trim() : '';
     return name === '' ? null : name;
+  }
+
+  /** Names require canonical Git identity; pins require explicit revision
+   * syntax or one uniquely identified object, never merely empty output.
+   * C-locale diagnostics make ambiguity errors distinguishable from tracing. */
+  private localTargetIdentity(repoPath: string, ref: string): string | null {
+    const options = { encoding: 'utf-8' as const, timeout: 30_000,
+      env: { ...repositoryGitEnv(false), LC_ALL: 'C' } };
+    const result = spawnSync('git', ['-C', repoPath, '-c', 'core.warnAmbiguousRefs=true',
+      'rev-parse', '--symbolic-full-name', '--verify', ref], options);
+    const name = (result.stdout ?? '').trim();
+    const failIdentity = (): never => {
+      throw new Error(`review target identity for ${ref} is lost, ambiguous or unverifiable — retry with an exact named ref or intentional commit pin`);
+    };
+    const failedDiagnostic = /(?:^|\n)(?:error|fatal):|(?:^|\n)warning:[^\n]*\bambiguous\b/u;
+    if (result.error !== undefined || result.status !== 0 || failedDiagnostic.test(result.stderr ?? '')) failIdentity();
+    if (/^refs\/[^\r\n]+$/u.test(name)) return name;
+    if (name === ref && /^[A-Z_]+$/u.test(name)) return null; // Source-bound Git pseudo-ref.
+    if (name !== '') failIdentity();
+    if (/^[a-f0-9]{4,64}$/iu.test(ref)) {
+      const objects = spawnSync('git', ['-C', repoPath, 'rev-parse', `--disambiguate=${ref.toLowerCase()}`], options);
+      if (objects.error === undefined && objects.status === 0 && !failedDiagnostic.test(objects.stderr ?? '') &&
+        /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u.test((objects.stdout ?? '').trim())) return null;
+    } else {
+      // A verified revision whose syntax cannot name a ref is an intentional
+      // expression pin. Valid-but-missing/ambiguous names never take this path.
+      const shape = spawnSync('git', ['-C', repoPath, 'check-ref-format', '--allow-onelevel', ref], options);
+      if (shape.error === undefined && shape.status === 1 && !failedDiagnostic.test(shape.stderr ?? '')) return null;
+    }
+    return failIdentity();
+  }
+
+  /** Same OID is insufficient when a named ref becomes an alias to a
+   * different identity. Retain the captured name; never authorize its replacement. */
+  private assertNamedTargetIdentity(repoPath: string, expectedRef: string): void {
+    if (!expectedRef.startsWith('refs/')) return;
+    if (this.localTargetIdentity(repoPath, expectedRef) !== expectedRef) {
+      throw new Error(`review target identity for ${expectedRef} changed before admission — refusing replacement authority`);
+    }
   }
 
   /** True when origin currently advertises a branch by that name — the
@@ -3528,6 +4808,7 @@ export class WaveRunner {
     const result = spawnSync('git', ['-C', repoPath, 'ls-remote', '--refs', 'origin', `refs/heads/${branch}`], {
       encoding: 'utf-8',
       timeout: 30_000,
+      env: repositoryGitEnv(false),
     });
     if (result.status !== 0) return true;
     return (result.stdout ?? '').trim() !== '';
@@ -3537,12 +4818,17 @@ export class WaveRunner {
     job: { readonly id: string; readonly prUrl: string | null };
     jobWorktree: { readonly path: string; readonly repoPath: string };
     candidateRef: string;
+    readonly armedTargetRef?: string;
     /** True when the caller explicitly named `candidateRef` (target_ref). */
     explicitTarget: boolean;
-  }): Promise<{ readonly targetSha: string; readonly movementRef: string }> {
-    const candidateBranch = input.job.prUrl === null
-      ? null
-      : prBranchCandidate(input.jobWorktree.repoPath, input.candidateRef);
+  }): Promise<{ readonly targetSha: string; readonly movementRef: string; readonly targetBranch?: string }> {
+    // A PR refresh moves the review target, never the identity the request
+    // originally named. Remote-only/default PR hints have no captured name.
+    if (input.armedTargetRef !== undefined) this.assertNamedTargetIdentity(input.jobWorktree.path, input.armedTargetRef);
+    const armedTargetBranch = input.armedTargetRef !== undefined && /^(?:refs\/heads\/|refs\/remotes\/origin\/)/u.test(input.armedTargetRef)
+      ? normalizeBranch(input.armedTargetRef) : null;
+    const candidateBranch = input.job.prUrl === null ? null : input.armedTargetRef !== undefined
+      ? armedTargetBranch : prBranchCandidate(input.jobWorktree.repoPath, input.candidateRef);
     // An EXACT origin branch spelling is NEVER an explicit pin (Perkins
     // R3/R5): a remote-only origin/topic is invisible to prBranchCandidate
     // (nothing local resolves), but it still names a REMOTE BRANCH, and
@@ -3602,12 +4888,26 @@ export class WaveRunner {
         });
         return {
           targetSha: resolved.sha,
-          movementRef: input.candidateRef,
+          movementRef: resolved.trackingRef ?? input.candidateRef,
+          ...(resolved.trackingRef !== null ? { targetBranch: normalizeBranch(resolved.trackingRef) } : {}),
         };
       }
+      const identity = this.localTargetIdentity(input.jobWorktree.path, input.candidateRef);
+      if (input.armedTargetRef !== undefined && identity !== input.armedTargetRef) {
+        throw new Error(`review target identity for ${input.armedTargetRef} changed before freeze — refusing replacement authority`);
+      }
+      const targetSha = resolveGitCommit(input.jobWorktree.path, identity ?? input.candidateRef);
+      if (identity !== null && this.localTargetIdentity(input.jobWorktree.path, identity) !== identity) {
+        throw new Error(`review target identity for ${identity} changed during commit resolution — refusing replacement authority`);
+      }
+      const movementRef = identity ?? targetSha;
       return {
-        targetSha: resolveGitCommit(input.jobWorktree.path, input.candidateRef),
-        movementRef: input.candidateRef,
+        targetSha,
+        ...(/^(?:refs\/heads\/|refs\/remotes\/)/u.test(movementRef) ? { targetBranch: normalizeBranch(movementRef) } : {}),
+        // Named refs retain movement proof in the shared object store.
+        // Revision expressions and commit pins bind once in the source
+        // lane, never against HEAD of the detached target checkout.
+        movementRef,
       };
     }
     try {
@@ -3628,7 +4928,7 @@ export class WaveRunner {
         fetched: fresh.targetSha,
         movementRef: fresh.movementRef,
       });
-      return { targetSha: fresh.targetSha, movementRef: fresh.movementRef };
+      return { targetSha: fresh.targetSha, movementRef: fresh.movementRef, targetBranch: fresh.prHeadRefName };
     } catch (error) {
       if (error instanceof PrHeadVerificationError) {
         const detail = error.message.replace(/[\r\n]+/gu, ' ').slice(0, 1000);
@@ -3643,11 +4943,12 @@ export class WaveRunner {
             detail,
           },
         });
-        this.opts.escalate?.(
+        this.escalate(
           `Perkins review for job ${input.job.id} was blocked before any round: the PR head could not be verified`,
           detail,
           { jobId: input.job.id },
         );
+        throw markNotified(error);
       }
       throw error;
     }
@@ -3663,6 +4964,7 @@ export class WaveRunner {
     frozenReview: FrozenReview,
     policy: PerkinsPolicy,
     signal: AbortSignal,
+    assertReviewAuthority: () => void,
     reviewModel?: ReviewPreflightResult['reviewModel'],
     claimedFixedPriors?: readonly number[],
   ): Promise<WaveOutcome> {
@@ -3678,6 +4980,7 @@ export class WaveRunner {
       }
     };
     try {
+      assertReviewAuthority(); // after the admission publication's synchronous observers
       reservation = this.opts.reserveReviewRound === undefined
         ? undefined : await this.opts.reserveReviewRound(signal);
       if (reservation !== undefined) {
@@ -3690,7 +4993,8 @@ export class WaveRunner {
           payload: { reason: 'lead and child resident slots admitted' },
         });
       }
-      const outcome = await this.runOwnedReview(job, round, lenses, movementRef, noSpec, frozenReview, policy, signal, reviewModel, beginSpawn, () => spawnInitiated, reservation, claimedFixedPriors);
+      assertReviewAuthority(); // residency awaits and residency-admitted observers
+      const outcome = await this.runOwnedReview(job, round, lenses, movementRef, noSpec, frozenReview, policy, signal, assertReviewAuthority, reviewModel, beginSpawn, () => spawnInitiated, reservation, claimedFixedPriors);
       settledOutcome = outcome;
       return outcome;
     } catch (error) {
@@ -3718,7 +5022,7 @@ export class WaveRunner {
       } catch (closeError) {
         this.log('error', 'review reservation disposal failed', { round: round.id, error: String(closeError) });
         if (settledOutcome !== null) {
-          this.opts.escalate?.(
+          this.escalate(
             `Review round ${round.id} disposal failed after completion`,
             `The settled review outcome was preserved, but releasing its resident handles failed: ${String(closeError)}`,
             { jobId: job.id, roundId: round.id },
@@ -3739,6 +5043,7 @@ export class WaveRunner {
     frozenReview: FrozenReview,
     policy: PerkinsPolicy,
     signal: AbortSignal,
+    assertReviewAuthority: () => void,
     reviewModel: ReviewPreflightResult['reviewModel'] | undefined,
     beginSpawn: () => void,
     spawnInitiated: () => boolean,
@@ -3757,7 +5062,7 @@ export class WaveRunner {
       })).digest('hex') !== frozenReview.manifest.recoveryIdentity.modelSettingsSha256) {
       throw new Error('review thinking/model settings changed since freeze — a new review is required');
     }
-    const spawnWithOptions: AgentSpawner = (role, options) => {
+    const spawnWithOptions: AgentSpawner = async (role, options) => {
       if (frozenThinking !== undefined && this.opts.reviewThinkingLevel?.() !== frozenThinking) {
         throw new Error('review thinking level changed since freeze — a new review is required');
       }
@@ -3772,10 +5077,26 @@ export class WaveRunner {
         ...(reviewModel !== undefined && (options?.isolatedReview !== undefined || options?.reviewLead !== undefined)
           ? { reviewModel } : {}),
       };
+      assertReviewAuthority(); // after provider pacing, before invoking any spawner
       beginSpawn();
-      return reservation === undefined
+      assertReviewAuthority(); // the live-status observer cannot transfer authority
+      const handle = await (reservation === undefined
         ? this.opts.spawner(role, resolved)
-        : reservation.spawn(resolved);
+        : reservation.spawn(resolved));
+      // The same guard applies after spawn/agent observers and every pacing
+      // retry of an existing session. Disposal remains the original owner's.
+      const guarded = new Map<PropertyKey, (...args: unknown[]) => unknown>();
+      return new Proxy(handle, {
+        get(target, property) {
+          const value: unknown = Reflect.get(target, property);
+          if (typeof value !== 'function') return value;
+          if (['prompt', 'promptWithVerdict', 'steer', 'followUp', 'compact'].includes(String(property))) {
+            if (!guarded.has(property)) guarded.set(property, (...args: unknown[]) => { assertReviewAuthority(); return Reflect.apply(value, target, args); });
+            return guarded.get(property);
+          }
+          return value.bind(target);
+        },
+      });
     };
     const workflow = new PerkinsWholeReview({
       spawner: spawnWithOptions,
@@ -4028,13 +5349,15 @@ export class WaveRunner {
         jobId: job.id,
         roundId: round.id,
         payload: {
-          reason: signal.aborted ? 'cancelled' : 'workflow_error',
+          // A superseded round (owner rule 3) is routine history, never a
+          // clean-abort re-arm candidate or an action-required incident.
+          reason: signal.reason instanceof ReviewSupersededError ? 'superseded' : signal.aborted ? 'cancelled' : 'workflow_error',
           error: detail.slice(0, 500),
           reportFile,
           executionFacts,
         },
       });
-      this.opts.escalate?.(`Review round ${round.id} is INCOMPLETE`, `${detail}\n${executionFacts}`, { jobId: job.id, roundId: round.id });
+      this.escalate(`Review round ${round.id} is INCOMPLETE`, `${detail}\n${executionFacts}`, { jobId: job.id, roundId: round.id });
       return {
         round: this.opts.ledger.getRound(round.id) as RoundRecord,
         // P5 (round 5): a PRE-SPAWN failure returns setup-refusal notes —
@@ -4205,6 +5528,13 @@ export class WaveRunner {
         if (duringDelivery !== null) throw new Error(`source changed while the report was being delivered (${duringDelivery.cause}: ${duringDelivery.detail})`);
         recordDelivery(delivered, publicationFile, publicationSha256, false);
       } catch (error) {
+        // A failure that PROVES no POST was sent (e.g. a stale installation
+        // token refused at the pre-POST boundary) is NOT an ambiguous
+        // publication: there is nothing to reconcile and a retry cannot
+        // duplicate a publication, so both the bounded lookup and the
+        // duplication caution are skipped in favour of a definite
+        // non-delivery outcome.
+        const definiteNonDelivery = error instanceof DefiniteNonDeliveryError;
         // Ambiguous publication (the provider may have committed our POST
         // before the failure): reconcile once against provider evidence
         // bound to the frozen head and the exact published body. A verified
@@ -4213,7 +5543,7 @@ export class WaveRunner {
         let reconciledDelivery: PostedReviewReceipt | null = null;
         let reconciliationFailure: unknown;
         let recordFailure: unknown;
-        if (typeof poster.reconcile === 'function' && !signal.aborted) {
+        if (!definiteNonDelivery && typeof poster.reconcile === 'function' && !signal.aborted) {
           try {
             const { prUrl, publicationBody } = deliveryInput();
             const publicationSha256 = createHash('sha256').update(publicationBody).digest('hex');
@@ -4265,7 +5595,7 @@ export class WaveRunner {
                 } catch (artifactError) {
                   if (!(artifactError instanceof Error && 'code' in artifactError && (artifactError as { code?: string }).code === 'EEXIST')) throw artifactError;
                 }
-                this.opts.escalate?.(
+                this.escalate(
                   `Perkins report for round ${round.id} reconciled a provider review but did NOT record it`,
                   `${reason}; the remote comment is preserved as unrecorded evidence and the round stays honestly unposted — the changed head was not reviewed`,
                   { jobId: round.jobId, roundId: round.id },
@@ -4296,7 +5626,21 @@ export class WaveRunner {
             this.log('error', 'Perkins report delivery reconciliation failed', { round: round.id, error: String(reconcileError) });
           }
         }
-        if (reconciledDelivery === null) {
+        if (definiteNonDelivery) {
+          // Provable non-delivery: no POST was sent, so the ambiguous-post
+          // caution below would be false. Surface the refusal directly —
+          // remediation is re-publishing: the retry mints a fresh token, so
+          // there is no credential to repair.
+          deliveryError = new Error(
+            `${String(error)}; the failure proved no POST was sent, so a retry cannot duplicate a publication — re-publish (the retry mints a fresh token; check probe latency if expiry recurs)`,
+          );
+          this.escalate(
+            `Perkins report for round ${round.id} was recorded and provably NOT posted to the pull request`,
+            String(deliveryError),
+            { jobId: round.jobId, roundId: round.id },
+          );
+          this.log('error', 'Perkins report delivery was provably never sent', { round: round.id, error: String(deliveryError) });
+        } else if (reconciledDelivery === null) {
           // R31: an unresolved ambiguous post must always carry the
           // manual-verification warning — a following lookup that found
           // nothing, could not run, or could not be recorded does not make
@@ -4311,7 +5655,7 @@ export class WaveRunner {
           deliveryError = followUpFailure === null
             ? new Error(`${String(error)}; ${caution}`)
             : new Error(`${caution}; ${followUpFailure}; original post failure: ${String(error)}`);
-          this.opts.escalate?.(
+          this.escalate(
             `Perkins report for round ${round.id} was recorded but NOT posted safely to the pull request`,
             String(deliveryError),
             { jobId: round.jobId, roundId: round.id },
@@ -4324,14 +5668,14 @@ export class WaveRunner {
       // can never become a completed published round.
       deliveryFailureKind = 'no_pr_link';
       deliveryError = new Error('the job has no pull request link; a conclusive review cannot be published');
-      this.opts.escalate?.(
+      this.escalate(
         `Perkins report for round ${round.id} was recorded but has NO pull request to publish to`,
         'the job has no pull request link; a conclusive review cannot be published',
         { jobId: round.jobId, roundId: round.id },
       );
     } else if (canonical !== 'INCOMPLETE' && job.prUrl !== null) {
       deliveryError = new Error('the PR poster is unavailable');
-      this.opts.escalate?.(
+      this.escalate(
         `Perkins report for round ${round.id} was recorded but NOT posted to the pull request`,
         'the PR poster is unavailable',
         { jobId: round.jobId, roundId: round.id },
@@ -4456,7 +5800,7 @@ export class WaveRunner {
         const followupTitles = review.findings
           .filter((finding) => finding.deferredFollowup === true)
           .map((finding) => `${finding.severity}: ${finding.title} (${finding.location})`);
-        this.opts.escalate?.(
+        this.escalate(
           `Perkins review for job ${job.id} deferred ${followupTitles.length} follow-up finding(s)`,
           `Deferred by the Stage-5 convergence rule (outside this round's delta hunks; they cannot hold the PR): ${followupTitles.join('; ')}. ` +
           `Filed as review follow-ups with full records in ${join(review.artifactDirectory, 'followups-deferred.json')}, the round.followups-deferred ledger event, the round's consolidated record and the PR review appendix — never dropped, and never another review round.`,
@@ -4535,13 +5879,13 @@ export class WaveRunner {
         this.log('error', 'could not persist the round.perkins-incomplete event', {
           round: round.id, error: String(incompleteEventError),
         });
-        this.opts.escalate?.(
+        this.escalate(
           `Review round ${round.id} INCOMPLETE record event could not be persisted`,
           `The lead's completed INCOMPLETE classification stands (report: ${reportFile}); the durable round.perkins-incomplete event could not be written: ${String(incompleteEventError).slice(0, 300)}`,
           { jobId: job.id, roundId: round.id },
         );
       }
-      this.opts.escalate?.(
+      this.escalate(
         `Review round ${round.id} is INCOMPLETE`,
         `coverage of the round's selected lenses, verification, source stability, or delivery proof did not complete. ` +
         (hostReportWriteFailed !== null
@@ -4663,7 +6007,7 @@ export class WaveRunner {
           round: round.id, error: String(retryError),
         });
       }
-      this.opts.escalate?.(
+      this.escalate(
         `Review round ${round.id} finalization artifact failed after its verdict committed`,
         `The round's ${committed.verdict} verdict and lens chips stand as committed; a later finalization write failed and was not reclassified: ${detail}`,
         { jobId: job.id, roundId: round.id },
@@ -4739,7 +6083,7 @@ export class WaveRunner {
         round: round.id, error: String(ledgerError),
       });
     }
-    this.opts.escalate?.(`Review round ${round.id} is INCOMPLETE`, `${detail}\n${executionFacts}`, { jobId: job.id, roundId: round.id });
+    this.escalate(`Review round ${round.id} is INCOMPLETE`, `${detail}\n${executionFacts}`, { jobId: job.id, roundId: round.id });
     let moved = true;
     try {
       moved = refMovedSinceFreeze(frozenReview);
@@ -4905,18 +6249,26 @@ export class WaveRunner {
     }
   }
 
-  private async sweepReviewWorktree(worktreeId: string): Promise<void> {
+  /** `alreadyNotified`: the owner was already alerted about this very event
+   * (#269). A paused release keeps its safety pause and evidence (the
+   * worktree manager's own needs-owner confirmation) but raises no second
+   * action-required alert; unrelated sweep failures still alert. */
+  private async sweepReviewWorktree(worktreeId: string, context: { readonly alreadyNotified?: boolean } = {}): Promise<void> {
     try {
       const result = await this.opts.worktrees.release({ worktreeId });
-      if (result.status === 'paused') {
-        this.opts.escalate?.(
+      if (result.status === 'paused' && context.alreadyNotified === true) {
+        this.log('warn', 'review worktree release paused on live processes; the refusal already escalated', {
+          round: worktreeId, processes: result.processes.map((entry) => entry.pid),
+        });
+      } else if (result.status === 'paused') {
+        this.escalate(
           `Review worktree for round ${worktreeId} paused on live processes`,
           'the sweep found live processes rooted in the review tree — acknowledge to finish cleanup',
         );
       }
     } catch (error) {
       this.log('error', 'review worktree sweep failed', { round: worktreeId, error: String(error) });
-      this.opts.escalate?.(`Review worktree for round ${worktreeId} could not be swept`, String(error));
+      this.escalate(`Review worktree for round ${worktreeId} could not be swept`, String(error));
     }
   }
 }

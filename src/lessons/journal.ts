@@ -30,6 +30,8 @@ export const JOURNAL_MAX_TAGS = 16;
 export const JOURNAL_MAX_TAG_CHARS = 64;
 
 const SOURCE_PATTERN = /^[a-z0-9][a-z0-9._-]*(?::[A-Za-z0-9][A-Za-z0-9._-]*)?$/;
+/** Strict UTF-8, BOM kept as read (a BOM line stays invalid JSON, as before). */
+const JOURNAL_UTF8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
 export interface JournalAppendInput {
   readonly kind: JournalKind;
@@ -100,6 +102,12 @@ export class JournalStore {
       .slice(0, limit);
   }
 
+  /** Every physical record in ONE read, oldest first — unpaged, so a
+   * consistency check sees every record, duplicates included. */
+  entries(): readonly JournalEntry[] {
+    return this.readAll();
+  }
+
   /** The current high-water sequence (0 for an empty journal). */
   latestSeq(): number {
     if (this.seq === null) {
@@ -149,17 +157,27 @@ export class JournalStore {
     const entries: JournalEntry[] = [];
     for (const name of names.filter((candidate) => candidate.endsWith('.jsonl')).sort()) {
       const file = join(this.dir, name);
-      let text: string;
+      let raw: Buffer;
       try {
-        text = readFileSync(file, 'utf-8');
+        raw = readFileSync(file);
       } catch (error) {
         throw new JournalError(`journal file ${file} is unreadable: ${String(error)}`);
       }
-      const lines = text.split('\n');
-      for (let index = 0; index < lines.length; index += 1) {
-        const line = lines[index] ?? '';
-        if (line.trim() === '') continue;
-        entries.push(this.parseEntry(file, index + 1, line));
+      // Line by line, fatally (R9-02, R10-03): invalid bytes are never
+      // replaced by U+FFFD — which would make two differently corrupt
+      // records read as identical — and the damaged line is named. No UTF-8
+      // sequence contains the LF byte, so splitting the bytes first is exact.
+      for (let start = 0, line = 1; start <= raw.length; line += 1) {
+        const newline = raw.indexOf(0x0a, start);
+        const end = newline === -1 ? raw.length : newline;
+        let text: string;
+        try {
+          text = JOURNAL_UTF8.decode(raw.subarray(start, end));
+        } catch {
+          throw new JournalError(`journal file ${file}:${line} is not valid UTF-8 — repair or remove the line`);
+        }
+        if (text.trim() !== '') entries.push(this.parseEntry(file, line, text));
+        start = end + 1;
       }
     }
     entries.sort((a, b) => a.seq - b.seq);

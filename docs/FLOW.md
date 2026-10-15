@@ -41,8 +41,12 @@ worker identity. Older jobs without it use a shortened title on minion cards:
    'local-head-fallback'` recorded, never silently). Status `working`.
 3. **Minion** — a fresh agent session spawned with `cwd` = the worktree
    (SPEC ruling 17: dispatch cwd is the PROJECT root on every runtime;
-   the minion discovers the project's own skills/bmad from there). The
-   briefing prompt is delivered as the session's first turn.
+   project conventions remain applicable there). New jobs receive the
+   GC-owned workflow plus explicit registered job/private artifact context;
+   ambient BMAD does not select execution settings. The lane keeps its exact
+   binding for its life; historical BMAD jobs retain their original contract
+   ([GC-WORKFLOWS.md](./GC-WORKFLOWS.md)). The briefing prompt is
+   delivered as the session's first turn.
 
 Failures are loud and leave no half lanes: a spawn failure sweeps the
 fresh worktree back out and blocks the job with a note.
@@ -66,7 +70,11 @@ freezes one exact target/base/diff/spec set in a detached review worktree. An
 arm may carry private evidence uploads; the frozen round binds the effective
 amended acceptance and the exact-target CI receipt, and the amendment/contract
 endpoints (`POST /api/dispatch/amendment`,
-`GET /api/dispatch/jobs/<id>/contract`) manage that acceptance. See
+`GET /api/dispatch/jobs/<id>/contract`) manage that acceptance. A
+**material** amendment (owner rules 2026-10-08) makes the delivered candidate
+outdated: review stays fenced until a continuation carrying that revision
+delivers, and a review already owning the lane is superseded — proven stopped
+before any directive or re-brief prompts the minion (REVIEW-INPUTS.md §4). See
 [REVIEW-INPUTS.md](./REVIEW-INPUTS.md); a private-evidence arm is refused on
 the bmad-review fallback route rather than silently reviewed without it. The arm
 first passes the **branch-idle guard**: while any lane is actively
@@ -82,9 +90,9 @@ the same way. The guard compares a lane's RECORDED branch (or the
 checks out its own branch but pushes a FOREIGN PR branch (a rebase/
 salvage lane) is invisible to that comparison — no lane declares a push
 target yet (issue #121 records the evidence and the declared-push-target
-extension). Silas's standing freeze-r1 rule — never arm while a known
-rebase/force-push lane is active on the target — is the control for that
-class. The same recheck runs after a failed pre-flight and before
+extension). Silas's standing freeze-r1 rule — never arm while any known
+lane is actively moving/pushing the target (rebase/force-push or
+integration) — is the control for that class. The same recheck runs after a failed pre-flight and before
 the bmad-review fallback gate admits — a re-brief or lane re-open landing
 during the awaited pre-flight refuses the fallback arm (409, or a queued
 replay re-queue) instead of starting a fallback reviewer; the fallback
@@ -105,8 +113,8 @@ emit no branch-idle audit rows: at admission a replay whose job is
 blocked/parked is HELD (`job.review-handoff-held` plus escalation,
 requiring a new validated request), while after admission the gate stops
 as `job.fallback-review` phase `aborted` with a free-text reason and no
-held identity. Terminal (`merged`/`done`) jobs take the canonical
-terminal refusal before any busy check — a stale marker never answers
+held identity. Terminal (`merged`/`done`/`binned`) jobs take the
+canonical terminal refusal before any busy check — a stale marker never answers
 `branch_busy` and never resurrects the job. The reviewed job's OWN
 unresolved request fences the review regardless of an explicit
 `target_ref` naming another lane; unrelated foreign lanes keep their own
@@ -267,8 +275,9 @@ route:
 4. **Review policy enabled** — `[review] enabled = true` in config.
 
 All legs pass → Perkins review (the gate). Any leg fails → the request
-routes to the bmad-review skill **if installed** (never bundled with the
-product). The fallback carries FULL GATE semantics: the session returns
+routes to GC's verified owned fallback review helper. The stable API route is
+still `bmad-review-fallback`; no external BMAD skill is discovered or required.
+The fallback carries FULL GATE semantics: the session returns
 findings; the host triages them (release-safety categories — correctness,
 security, data loss, broken builds, and related crash/regression/
 vulnerability/injection/secret-leak tags — are BLOCKERS; the rest are
@@ -277,14 +286,17 @@ session, the lane's working diff is re-read, and the gate re-reviews after
 fixes (bounded rounds); 0 blockers = PASS that clears review/fix routing
 only — the fallback PASS is the review gate of record for routing and
 fixes, never a Perkins READY and never merge clearance. The
-fallback session is a full-capability minion by design — it must load the
-ambient BMAD skill — and is instructed never to gate, approve, merge, or
+fallback session is a bounded minion report task with read tools and one JSON
+report write, without build-workflow injection, implementation edit or shell tools.
+It reads the owned helper and is instructed never to gate, approve, merge, or
 modify implementation code; every gate decision is the host's. The fallback
-never records a Perkins verdict and never moves merge authority: only an
-exact-head Perkins READY can authorize a merge, and the owner holds every
-merge, everywhere — this repository included. A failed pre-flight is never a silent downgrade — the failed
-legs, their remediations, and both recovery options (install BMAD via
-onboarding / restore Perkins) are escalated and recorded on the job as
+never records a Perkins verdict and never moves merge authority: only
+required final CI plus an exact-head Perkins READY can authorize a final
+PR merge, and the owner performs every final PR merge, everywhere — this
+repository included. A failed pre-flight is never a silent downgrade — the failed
+legs, their remediations, and both recovery options (restore the exact retained
+owned package/context or repair a new GC install / restore Perkins) are escalated
+and recorded on the job as
 `job.fallback-review` events. GitLab merge requests get the same SHA-bound
 delivery discipline as GitHub (the frozen HEAD is verified before a note is
 posted; a PR's recorded base is refreshed into the delivery record rather
@@ -346,8 +358,10 @@ verification budget.
   refuses a rerun — a re-verification mints a NEW request id.
 - **Capture is exclusive and receipted.** The shipped capture helper
   (`dist/verify/capture-cli.js`, named in Silas's wake prompt) opens a
-  unique `wx` sink BEFORE the POST, streams every NDJSON frame to EOF,
-  and writes `<sink>.receipt.json` binding run id, true head/dirty state,
+  unique `wx` sink BEFORE the POST, streams every NDJSON frame to EOF
+  (transport `ping` frames included — the receipt records them as
+  `pings`, separate from the producer-frame `frames` count), and writes
+  `<sink>.receipt.json` binding run id, true head/dirty state,
   exit/outcome and output length/hash. A stream without a valid terminal
   completion, with torn/foreign records, or whose single run identity does
   not hold across the whole stream is `unknown` and is never promoted to
@@ -361,6 +375,13 @@ verification budget.
   `[verify] worker_budget` (default: CPU cores − 2), enforced by the run
   wrapper through the vitest pool knobs and `GRU_VERIFY_*` variables for
   other runners.
+- **Compatible gates reuse one build.** A declared `npm run build` step
+  may be satisfied by the immediately preceding successful build in the
+  same lane when head, clean tree, configuration, environment and the
+  whole `dist/` tree digest are all unchanged — every other step still
+  runs and is reported. A second gate that arrives while that lane's
+  build is in flight never inherits it (`build-in-flight`) and runs its
+  own build.
 - **Project harness budgets compose with the run budget.** A repo may
   classify process-heavy integration files with their own finite ceilings
   and a smaller worker cap (gru-command: 120s and two workers, see
@@ -380,8 +401,70 @@ verification budget.
   frozen review target SHA (clean tracked tree), the host freezes a
   clearly-delimited evidence block into the review spec context, so the
   tests lens weighs ledger-backed evidence instead of a pasted report.
+  The job's COMPLETE `verification.completed` history is read in bounded
+  keyset pages with no finite lifetime window: the newest run binding the
+  frozen target governs, a long history never refuses a review, and the
+  explicit absence section appears only after the whole history is read.
 - **Progress streams** back as NDJSON: `queued` → `started` → `output…`
-  → `completed` (or `error`).
+  → `completed` (or `error`), with transport `ping` frames interleaved
+  into any silence. A duplicate submission to an in-flight run instead
+  begins with `attached` and then receives only that run's later frames
+  (an already-running attach has no `queued`/`started`; a terminal
+  attach gets `attached` → `completed`). While the body would otherwise
+  be silent —
+  a queued slot wait (up to `lock_wait_timeout_ms`), or a producer that
+  has not written yet — the surface emits application-level `ping`
+  frames (default every 15 s, worst-case gap 2 × cadence ≈ 30 s) so a
+  streaming client's default 300 s HTTP body-idle timeout does not
+  truncate a valid run. A `ping` is transport liveness only: no run
+  identity, never producer output, never a terminal frame, and never
+  written after `completed`/`error`. A `ping` may be the FIRST body
+  frame when the first producer frame is delayed past one cadence, so a
+  consumer must tolerate a leading `ping` (and must never count it as a
+  producer frame). The protection assumes the event loop services the
+  timer; a stall longer than the client's idle limit is outside it.
+
+- **Workers cannot bypass a declared contract (issue #315).** A job lane
+  whose `.gru-command/worktree.toml` declares `[verify]` scopes carries a
+  host-owned admission policy into both runtime adapters. A normal worker
+  Bash call that runs a known unscheduled producer (the raw `npm test`,
+  `npx vitest run …`, declared `npm run …` scripts, or their bare/local-bin
+  equivalents) is refused BEFORE any child process starts: the pi runtime
+  blocks the SDK `tool_call`, and claude-code loads a private PreToolUse
+  hook plus native Bash ask routing to the host policy. The refusal names the declared
+  scopes and the authenticated capture helper's `run`/`status` actions, so
+  the supported path and the timeout-reconcile step are always one message
+  away. The guard never rewrites the command string, never submits a run
+  itself and never infers coverage; ordinary reads, Git operations and the
+  capture helper run normally. It is a bounded refusal for the known
+  conventional producer forms, NOT a general-purpose shell sandbox — opaque
+  scripts, interpreters and adversarial evasion are out of scope.
+
+  Claude's private native `permissions.ask: ["Bash"]` routes each Bash
+  permission to an original-child-bound host stdio handler, including in
+  bypass mode and when the explanatory hook fails or is unavailable. The host
+  applies the immutable manifest policy, returning unchanged valid input for
+  source/Git/helper/diagnostic reads and denying known producers; malformed,
+  foreign or failed permission transport fails closed. No MCP authority or new
+  tools are granted. Private files survive disposal until every original
+  policy child actually closes. Error settlement and deadlines are not close.
+
+  Supported conventional normalization includes assignments, nested simple
+  env/command/time/exec/nohup/nice wrappers, npm aliases/options/workspace
+  operands, npx flags and known lane-local tool paths. Literal quoted text and
+  plaintext heredoc bodies remain data; supported executable substitutions in
+  expanding text are checked. Help/config inspection (including `vitest run
+  --help`) remains an ordinary read; `--` ends option interpretation. This
+  bounded grammar does not inspect arbitrary script/interpreter bodies.
+
+  The independent offline CLI double proves raw corpus dispositions, settings
+  and stdio wiring, not execution by a vendor CLI or paid model. The declared
+  native component scope exercises installed Claude 2.1.296 with the configured
+  `gpt-6-luna`/`max`, isolated state, fake credentials and deterministic
+  loopback upstream; it verifies matching successful Bash read results and
+  zero refused producer starts. That is actual vendor permission-engine
+  evidence for its captured exact head, not paid-model behavior or native
+  Perkins READY. Final integrated/FULL/remote CI acceptance remains separate.
 
 Managed repos still own their CI: this endpoint coordinates LOCAL
 verification runs inside lane worktrees — the orchestrator never hosts a
@@ -509,11 +592,12 @@ ledger surfaces remain runtime-agnostic).
 
 ## 4f. Minion-owned build cycle (owner ruling 2026-10-02)
 
-Implementation briefings hand the worker the whole job. The minion selects
-the task-relevant BMAD skills by capability from the PROJECT's actual
-installed skill catalog/metadata and follows their current workflows —
-names and workflow structure change between BMAD versions, so brief by
-the task, never by a fixed skill name. The selected workflow's built-in
+Implementation briefings hand the worker the whole job. The minion follows the
+GC-owned workflow and explicit registered job context named in its system prompt.
+Private operational material stays under the configured GC data home; approved
+portable knowledge stays in the assigned `gru-output/`. Project conventions remain
+applicable, but ambient BMAD skills/config cannot select GC execution authority.
+Historical lane bindings and output references remain unchanged. The workflow's built-in
 review runs on fresh, context-free reviewer contexts the minion
 commissions as separately tracked review jobs — each with its own session
 and worktree, a read-only brief, and the immutable diff head; never an
@@ -523,7 +607,7 @@ resolution, verification, the authorized ordinary non-draft PR); Silas
 gives goal/boundaries/acceptance, coordinates capacity and expensive
 verification through the existing scheduler, and arms native Perkins on
 the exact final settled PR head. NEEDS CHANGES returns to the same
-implementing worker; the owner holds every merge.
+implementing worker; the owner performs every final PR merge.
 
 **Policy vs implemented.** These obligations ship in the installed
 playbook, and the deliverable kind is implemented: reviewer, artifact and
@@ -617,8 +701,10 @@ the judgment; the dispatch surface is the mechanical hand.
   prompted them), and driver start seeds the gate from the newest
   delivered event, so a restart never re-wakes what Silas has already
   seen. A queued event trigger is never displaced by a later sweep —
-  only a newer event supersedes it. Event triggers always deliver,
-  whatever the gate says.
+  only a newer event supersedes it. An event trigger whose digest is empty
+  does not wake either (issue #243): with the autopilot enforced the code
+  already handled the rows the event raised, and LLM Silas wakes only when
+  rows remain that need judgment.
 - **The GitHub signal poll (POLL-ONLY; owner ruling 2026-09-23)** rides
   the same driver on its own faster interval (`[silas] poll_interval_ms`,
   default 60 s; 0 disables) and needs no model turn: every tracked job
@@ -629,8 +715,8 @@ the judgment; the dispatch surface is the mechanical hand.
   applies exactly once: PR merged → `in-review → merged` transition plus
   a `github.pr-merged` event; PR conflicting (`mergeable_state: dirty`) →
   `github.pr-conflict` plus an fyi notification (mechanical tier — Silas
-  owns the rebase within mandate; the conflict lands in his digest's
-  `conflictingPrs` rows and never wakes Gru, issue #215); CI
+  coordinates the conflict integration within mandate; the conflict lands
+  in his digest's `conflictingPrs` rows and never wakes Gru, issue #215); CI
   failed → `github.ci-failed` plus a notification carrying the run URL,
   routed by check kind (mechanical → fyi, judgment → wake-eligible
   action-required); CI green → `github.ci-green` review-gate signal.
@@ -671,7 +757,7 @@ the judgment; the dispatch surface is the mechanical hand.
   `blocked`/`aborted` answer nothing, so the same abort reappears for the
   next sweep. Conflicting PR heads (issue #215) are digest rows too: a
   live PR-owing lane whose open head is dirty against its base is Silas's
-  mechanical rebase work — suppressed while a directive, re-brief or
+  mechanical conflict-integration work — suppressed while a directive, re-brief or
   verification owns the lane, and never a Gru wake. NEEDS CHANGES
   verdicts awaiting follow-through, with per-blocker recurrence analysis;
   working lanes whose minion has been silent past `stall_threshold_ms`;
@@ -725,8 +811,8 @@ the judgment; the dispatch surface is the mechanical hand.
   events when that turn settles; a failed recovery escalates
   action-required and keeps the markers for the next boot, so the lane
   can never stall silently on a lost turn. A leftover marker whose job
-  has since reached terminal (`merged`/`done`) before the request was
-  honored cannot be served: the boot scan — or a settling turn or
+  has since reached terminal (`merged`/`done`/`binned`) before the request
+  was honored cannot be served: the boot scan — or a settling turn or
   re-dispatch boundary that meets the terminal job — retires it
   administratively (the identity-checked deletion and one
   `silas.rebrief-retired` audit commit together, with no spawn and no
@@ -738,8 +824,8 @@ the judgment; the dispatch surface is the mechanical hand.
   counts `examined` in markers but `completed`/`redispatched`/`retired`
   in jobs, so one retired pair reads `examined: 2 … retired: 1` by design.
 - **Authority boundaries are unchanged** (`roles/silas.md`): dispatch,
-  track, close; never product code; never merge; preserve before remove;
-  escalate with pointers. Silas acts only through the authenticated ops
+  track, close; never product code; never merge a PR (the owner performs
+  every final PR merge); preserve before remove; escalate with pointers. Silas acts only through the authenticated ops
   surface — the pairing token is read from the instance config at call
   time, never echoed.
 - **Skills** — `ops-dispatch` and `ledger-closeout` ship in-repo under
@@ -819,8 +905,9 @@ IDs remain pending for rate-limited retry.
 **Mandate — act (tier-2).** A wake is machine attention meant to be acted
 on in-turn: Gru diagnoses the incident and takes one substantive step per
 incident (a fix lane, a re-arm, a disposition) within budget, staging the
-rest; novel failures and judgment calls stay with Gru. Gru holds merge
-authority for this repository; the owner retains it elsewhere. The owner
+rest; novel failures and judgment calls stay with Gru. Every final PR merge is
+the owner's, in this repository and everywhere else; no agent merges a
+PR. The owner
 is reached only through `needs-owner` — and sparingly; an empty FOR YOU
 band is the healthy state.
 
@@ -831,7 +918,7 @@ next user-directed context block:
 | routing | meaning | surface |
 |---|---|---|
 | `action-required` | machine attention: Gru resolves/acts in-turn | NEEDS GRU queue (live rows only; terminal-job rows are closed receipts under FEED); wakes Gru; never rings the owner bell |
-| `needs-owner` | owner-only decisions (merges outside this repo, budget, destructive ops) and anything Gru escalates | FOR YOU band + owner bell + morning digest |
+| `needs-owner` | owner-only decisions (every final PR merge, budget, destructive ops) and anything Gru escalates | FOR YOU band + owner bell + morning digest |
 | `fyi` | standing feed | board feed only |
 
 **Unresolved follow-up.** A successful prompt is delivery, not resolution.
@@ -866,10 +953,12 @@ actual resolutions and job events must be counted separately.
 **Silas mandate split** (same lane). Mechanical reactions move to Silas's
 ops driver — re-arm review rounds after clean aborts, pattern respins for
 known failure classes, sweep acks under recorded rules. Gru keeps the
-judgments: rulings, merges, and novel failures. One standing rule from the
-2026-09-23 freeze: never auto-arm a review round on a branch while a
-rebase/force-push lane is active on the same target (the round races the
-push and dies obsolete); arm only after the lane genuinely settles — the
+judgments: rulings, merge presentations, and novel failures. One standing
+rule from the
+2026-09-23 freeze: never auto-arm a review round on a branch while any
+lane is actively moving/pushing the target (rebase/force-push or an
+ordinary integration push; the round races the push and dies obsolete);
+arm only after the lane genuinely settles — the
 attempt delivered AND no unresolved re-brief request standing (marker/
 control settlement, not delivery alone; see the branch-idle guard
 section). Service restarts remain manual until self-roll-34 lands.

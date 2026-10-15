@@ -12,6 +12,7 @@ import {
 } from '../src/dispatch/durable-reconcile.js';
 import { settleDirectivesFromEvidence } from '../src/dispatch/rebrief-recovery.js';
 import type { FollowThroughNotifications } from '../src/dispatch/obligations.js';
+import { markHistoricalDirectiveFixture } from './helpers/directive-native-fixture.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -44,6 +45,7 @@ function fakeNotifications(posts: Post[]): FollowThroughNotifications {
 /** A live directive request whose correlated admission+delivery exist. */
 function seedCorrelatedDirective(api: LedgerApi, jobId: string, requestId: string, directive = 'repair the thing'): void {
   api.beginDirectiveIntent({ jobId, directive, holder: 'silas-ops', requestId });
+  markHistoricalDirectiveFixture(api, requestId); // explicit historical event-only decoding
   const sent = api.appendCustomEvent({
     kind: 'silas.directive-sent',
     jobId,
@@ -225,6 +227,36 @@ describe('durable reconciliation pass (issue #163)', () => {
     expect(api.listEvents({ limit: 200 }).filter((event) => event.jobId === 'job-busy' && event.seq > before)).toEqual([]);
   });
 
+  it('a binned target keeps report debt until an independently observed real PR merge', () => {
+    const { api } = freshLedger();
+    const posts: Post[] = [];
+    const url = 'https://github.com/acme/app/pull/77';
+    api.addJob({ id: 'discarded-target', repo: 'demo', title: 'Target', briefing: 'b' });
+    api.setJobPr('discarded-target', url);
+    api.setJobStatus('discarded-target', 'binned');
+    api.addJob({ id: 'report-on-discard', repo: 'demo', title: 'Review', briefing: 'b',
+      deliverable: 'review', commissioner: 'gru', targetRef: url, targetSha: 'reviewed-sha' });
+    api.setJobStatus('report-on-discard', 'working');
+    api.setJobStatus('report-on-discard', 'delivered');
+    const receipt = api.appendCustomEvent({ kind: 'job.delivered', jobId: 'report-on-discard', payload: { sha: 'reviewed-sha' } });
+    api.openReportObligation({ jobId: 'report-on-discard', observedAtSeq: receipt.seq });
+
+    const unproven = reconcileDurableWork({ ledger: api, notifications: fakeNotifications(posts) });
+    expect(unproven.reports.superseded).toBe(0);
+    expect(api.getJob('report-on-discard')?.status).toBe('delivered');
+    expect(api.findReportObligation('report-on-discard')?.state).toBe('open');
+    // This event is only emitted by an existing in-flight GitHub observation;
+    // binning and URL alone did not produce it.
+    api.appendCustomEvent({ kind: 'github.pr-merged', jobId: 'discarded-target',
+      payload: { pr: 77, merge_commit_sha: 'real-merge-sha', applied: false, reason: 'job is binned' } });
+    const proven = reconcileDurableWork({ ledger: api, notifications: fakeNotifications(posts) });
+    expect(proven.reports.superseded).toBe(1);
+    expect(api.getJob('discarded-target')?.status).toBe('binned');
+    expect(api.getJob('report-on-discard')?.status).toBe('done');
+    expect(api.latestJobEvent('report-on-discard', 'report.superseded')?.payload)
+      .toMatchObject({ target_ref: url });
+  });
+
   it('an uncorrelated or stale-head delivery never advances an awaiting phase', () => {
     const { api } = freshLedger();
     const posts: Post[] = [];
@@ -325,6 +357,7 @@ describe('durable reconciliation pass (issue #163)', () => {
     api.addJob({ id: 'job-dir-fail', repo: 'demo', title: 't', briefing: 'b' });
     api.setJobStatus('job-dir-fail', 'working');
     api.beginDirectiveIntent({ jobId: 'job-dir-fail', directive: 'waiting', holder: 'silas-ops', requestId: 'req-fail' });
+    markHistoricalDirectiveFixture(api, 'req-fail');
     // A ledger read failure for the evidence lookup: the row failure is
     // counted (never a green heartbeat) and stays live for the next pass.
     const failing = new Proxy(api, {

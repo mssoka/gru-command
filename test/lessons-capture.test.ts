@@ -130,7 +130,7 @@ describe('minion lessons capture', () => {
     sessionFile(session, [`delivery\n${BLOCK_A}`]);
     const ledgerDb = new LedgerDb(join(dir, 'data'));
     const ledger = new LedgerApi(ledgerDb.handle, { bus: new EventBus({}) });
-    const worktrees = new InMemoryWorktreePort(join(dir, 'wt'));
+    const worktrees = new InMemoryWorktreePort(join(dir, 'wt'), ledger);
     const handle: AgentHandle = {
       role: 'minion',
       id: 'minion-1',

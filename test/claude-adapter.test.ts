@@ -1,4 +1,9 @@
+import { PassThrough } from 'node:stream';
+import * as childProcesses from 'node:child_process';
+import { BUILD_INCIDENT, FULL_INCIDENT, WEB_INCIDENT, authenticatedCaptureStatus, verificationLane } from './helpers/worker-verification.js';
 import type { ModelRuntime } from '@earendil-works/pi-coding-agent';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -6,12 +11,15 @@ import { pathToFileURL } from 'node:url';
 import { createConnection } from 'node:net';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { configPathFor, loadConfig } from '../src/config.js';
+import type { WorkerVerificationPolicy } from '../src/runtime/worker-verification-policy.js';
 import {
   CLAUDE_CODE_CAPABILITIES,
   ClaudeCodeRuntime,
   mapRoleTools,
 } from '../src/runtime/claude-adapter.js';
-import { RuntimeRegistry } from '../src/runtime/registry.js';
+import { RuntimeRegistry, serviceRegistryOptions } from '../src/runtime/registry.js';
+import { makeWorkflowLane } from './helpers/workflow-lane.js';
+import { makeFallbackRuntimeHarness } from './helpers/fallback-runtime.js';
 import {
   ClaudeControlTranslator,
   ClaudeTurnTranslator,
@@ -35,6 +43,9 @@ import { makeFixtureRepo } from './helpers/fixture-repo.js';
 
 const DOUBLE = join(import.meta.dirname, 'helpers', 'claude-double.mjs');
 const DOUBLE_ENV_KEYS = [
+  'CLAUDE_DOUBLE_PERMISSION_MALFORMED',
+  'CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL',
+  'CLAUDE_DOUBLE_COMPACT_VERIFICATION',
   'CLAUDE_DOUBLE_LOG',
   'CLAUDE_DOUBLE_NO_PARTIALS',
   'CLAUDE_DOUBLE_TOOL_HOLD_MS',
@@ -83,7 +94,7 @@ interface Fixture {
   runtime: ClaudeCodeRuntime;
 }
 
-function fixture(knobs: { killGraceMs?: number; modelRuntime?: ModelRuntime; toolHeartbeatMs?: number; reviewSettingsFile?: string } = {}): Fixture {
+function fixture(knobs: { killGraceMs?: number; modelRuntime?: ModelRuntime; toolHeartbeatMs?: number; reviewSettingsFile?: string; spawnProcess?: typeof spawn } = {}): Fixture {
   const home = mkdtempSync(join(tmpdir(), 'gru-command-claude-'));
   const workspace = mkdtempSync(join(tmpdir(), 'gru-command-ws-'));
   cleanupDirs.push(home, workspace);
@@ -97,6 +108,7 @@ function fixture(knobs: { killGraceMs?: number; modelRuntime?: ModelRuntime; too
     config,
     store,
     binary: DOUBLE,
+    ...(knobs.spawnProcess !== undefined ? { spawnProcess: knobs.spawnProcess } : {}),
     ...(knobs.killGraceMs !== undefined ? { killGraceMs: knobs.killGraceMs } : {}),
     ...(knobs.toolHeartbeatMs !== undefined ? { toolHeartbeatMs: knobs.toolHeartbeatMs } : {}),
     ...(knobs.modelRuntime !== undefined ? { modelRuntime: knobs.modelRuntime } : {}),
@@ -1211,6 +1223,109 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     );
   });
 
+  it('default fallback reaches Claude CLI and MCP with no shell/edit/write authority', async () => {
+    const fx = fixture();
+    const dataDir = realpathSync(fx.home);
+    const h = makeFallbackRuntimeHarness((role, opts) => registry.spawn(role, opts), dataDir);
+    class ClaudeRegistry extends RuntimeRegistry { override runtimeIdFor() { return 'claude-code' as const; } }
+    const registry = new ClaudeRegistry({ ...serviceRegistryOptions({ config: loadConfig({ GRU_COMMAND_HOME: dataDir }), store: fx.store,
+      workflowLaneFor: h.authority.workflowLaneFor, workflowBuildFor: h.authority.workflowBuildFor }),
+      claude: { binary: DOUBLE, reviewSettingsFile: join(dataDir, 'absent-review-settings.json') },
+    });
+    try {
+      const outcome = await h.wave.runRound({ jobId: h.job.id });
+      if (!('route' in outcome)) throw new Error('expected fallback');
+      expect(outcome.clearToMerge, outcome.note).toBe(true);
+      const [record] = doubleInvocations(fx);
+      const tools = record!.argv[record!.argv.indexOf('--tools') + 1]!;
+      const allowed = record!.argv[record!.argv.indexOf('--allowedTools') + 1]!;
+      expect(tools.split(',')).toEqual(['Read', 'Grep', 'Glob', 'LS', 'mcp__gru_perkins__gc_submit_fallback_findings']);
+      expect(allowed).toContain('mcp__gru_perkins__gc_submit_fallback_findings');
+      expect(allowed).not.toMatch(/Bash|Edit|Write/u);
+      expect(record!.argv).toContain('--strict-mcp-config');
+      expect(record!.argv).not.toContain('--plugin-dir');
+      expect(record!.argv[record!.argv.indexOf('--setting-sources') + 1]).toBe('');
+      expect(record!.argv[record!.argv.indexOf('--system-prompt') + 1]).toContain('VERIFIED OWNED HELPER');
+      expect(realpathSync(record!.cwd)).toBe(h.lane.path);
+      expect(readFileSync(outcome.reportFiles[0]!, 'utf8').trim()).toBe('[]');
+      expect(outcome.reportFiles[0]).toContain(join(dataDir, 'projects'));
+      expect(readFileSync(join(h.lane.path, 'candidate.ts'), 'utf8')).toBe('export const candidate = 1;\n');
+      expect(h.ledger.listRounds(h.job.id)).toEqual([]);
+    } finally { await h.wave.shutdown(); await registry.dispose(); await fx.runtime.dispose(); h.close(); }
+  });
+
+  it('production owned workflow reaches Claude plugin/prompt/cwd and retains the same binding on resume', async () => {
+    const fx = fixture(); const f = makeWorkflowLane(); cleanupDirs.push(f.root);
+    const config = loadConfig({ GRU_COMMAND_HOME: f.dataDir });
+    mkdirSync(join(f.lane.path, '_bmad/custom'), { recursive: true });
+    writeFileSync(join(f.lane.path, '_bmad/custom/config.toml'), 'NOT TOML');
+    class ClaudeRegistry extends RuntimeRegistry { override runtimeIdFor() { return 'claude-code' as const; } }
+    const claude = new ClaudeRegistry({ ...serviceRegistryOptions({ config, store: new SessionStore(f.dataDir),
+      workflowLaneFor: () => f.lane }), claude: { binary: DOUBLE } });
+    const first = await claude.spawn('minion', { cwd: f.lane.path, agentId: 'same-worker' });
+    try {
+      await first.prompt('build'); await first.dispose();
+      const resumed = await claude.spawn('minion', { agentId: 'same-worker', resumeFile: first.sessionFile! });
+      try { expect(resumed.id).toBe(first.id); await resumed.prompt('continue'); } finally { await resumed.dispose(); }
+      const [build, resume] = doubleInvocations(fx);
+      expect(resume!.argv).toContain('--resume');
+      const plugin = build!.argv[build!.argv.indexOf('--plugin-dir') + 1]!;
+      expect(plugin).toContain(join(f.dataDir, 'bmad-runtime/gru-command-workflows-'));
+      for (const turn of [build!, resume!]) {
+        expect(turn.cwd).toBe(f.lane.path);
+        expect(turn.argv[turn.argv.indexOf('--plugin-dir') + 1]).toBe(plugin);
+        const note = turn.argv[turn.argv.indexOf('--append-system-prompt') + 1]!;
+        expect(note).toContain('`gru-command-workflows:gc-build`');
+        expect(note).toContain(join(f.dataDir, 'projects'));
+        expect(note).toContain(join(f.lane.path, 'gru-output'));
+        expect(note).toContain('workflow-context.json');
+        // Bound-workflow boundary (native r2 blocker): the appended prompt
+        // composes the corrected role plus the note, qualifying owner-held
+        // merges to final PR merges only.
+        expect(note).toContain('worker agent');
+        expect(note).toContain('merge main into your task branch');
+        expect(note).toContain('final PR merges remain owner-held');
+        expect(note).not.toContain('READY; merges remain owner-held');
+      }
+      expect(readFileSync(join(f.lane.path, '_bmad/custom/config.toml'), 'utf8')).toBe('NOT TOML');
+      expect(existsSync(join(f.lane.path, '_bmad/render'))).toBe(false);
+    } finally { await first.dispose(); await claude.dispose(); }
+  });
+
+  it('a lane-bound managed BMAD runtime loads as a session plugin named in the prompt; reviews never get it', async () => {
+    const fx = fixture();
+    const managedSkills = {
+      source: 'gru-command-bmad',
+      runtimeId: 'bmad-method@6.12.0+gru-command-bmad.1',
+      contentSha256: 'b'.repeat(64),
+      root: join(fx.workspace, 'runtime-root'),
+      skillsDir: join(fx.workspace, 'runtime-root', 'skills'),
+      skills: ['bmad-build'],
+      laneBound: true,
+    };
+    const minion = await fx.runtime.spawn('minion', { managedSkills });
+    await minion.prompt('build this');
+    await minion.prompt('keep building');
+    await minion.dispose();
+    const review = await fx.runtime.spawn('perkins', {
+      managedSkills,
+      isolatedReview: { systemPrompt: 'isolated policy', tools: [] },
+    });
+    await review.prompt('frozen diff only');
+    await review.dispose();
+    const [build, resumed, isolated] = doubleInvocations(fx);
+    // Every turn re-launches the CLI; the resumed turn keeps the plugin too.
+    expect(resumed!.argv).toContain('--resume');
+    for (const turn of [build!, resumed!]) expect(turn.argv[turn.argv.indexOf('--plugin-dir') + 1]).toBe(managedSkills.root);
+    const prompt = build!.argv[build!.argv.indexOf('--append-system-prompt') + 1]!;
+    expect(prompt).toContain('worker agent');
+    expect(prompt).toContain('## Gru Command BMAD runtime');
+    expect(prompt).toContain('`gru-command-bmad:bmad-build`');
+    expect(prompt).toContain('not a repo-local or global skill with the same base name');
+    expect(isolated!.argv).not.toContain('--plugin-dir');
+    expect(isolated!.argv[isolated!.argv.indexOf('--system-prompt') + 1]).toBe('isolated policy');
+  });
+
   it('enforces isolated-review tools and disables ambient Claude resources in argv', async () => {
     const fx = fixture();
     const handle = await fx.runtime.spawn('perkins', {
@@ -2315,4 +2430,580 @@ describe('ReviewMcpBridge fail-closed guards', () => {
       rmSync(staged, { recursive: true, force: true });
     }
   });
+
+  it('issue #315: an ordinary minion carries the private verification settings, never a review session', async () => {
+    const policy: WorkerVerificationPolicy = {
+      jobId: 'job-915', laneId: 'job-915', cwd: '/lane', scopes: ['full'],
+      producerPrefixes: [['npm', 'test']], helper: '/pkg/dist/verify/capture-cli.js', configFile: '/instance/config.toml',
+    };
+    const fx = fixture();
+    const handle = await fx.runtime.spawn('gru', { workerVerification: policy });
+    const owned = handle as unknown as { params: { verificationSettingsFile?: string; isolatedReview?: boolean } };
+    const file = owned.params.verificationSettingsFile;
+    expect(file).toBeDefined();
+    expect(existsSync(file as string)).toBe(true);
+    const settings = JSON.parse(readFileSync(file as string, 'utf8')) as { permissions?: { ask?: string[] } };
+    expect(settings.permissions?.ask?.length ?? 0).toBeGreaterThan(0);
+    await handle.dispose();
+    // A child that never started ceases immediately: the private dir is cleaned.
+    expect(existsSync(file as string)).toBe(false);
+    const isolated = await fx.runtime.spawn('gru', { isolatedReview: { systemPrompt: 'frozen native policy', tools: [] } });
+    expect((isolated as unknown as { params: { verificationSettingsFile?: string } }).params.verificationSettingsFile).toBeUndefined();
+    await isolated.dispose();
+    await fx.runtime.dispose();
+  });
+
+  describe('issue #315: private verification-file custody', () => {
+    const policy: WorkerVerificationPolicy = {
+      jobId: 'job-915', laneId: 'job-915', cwd: '/lane', scopes: ['full'],
+      producerPrefixes: [['npm', 'test']], helper: '/pkg/dist/verify/capture-cli.js', configFile: '/instance/config.toml',
+    };
+
+    async function settingsLifetime(outcome: 'deadline' | 'error'): Promise<void> {
+      const fx = fixture({ killGraceMs: 5 });
+      const handle = await fx.runtime.spawn('gru', { workerVerification: policy });
+      const owned = handle as unknown as {
+        params: { verificationSettingsFile?: string };
+        live: ChildProcess | null;
+        cessationKind: string;
+      };
+      const file = owned.params.verificationSettingsFile as string;
+      const policyFile = join(dirname(file), 'policy.json');
+      const original = Object.assign(new EventEmitter(), {
+        exitCode: null, signalCode: null, kill: vi.fn(() => true),
+      }) as unknown as ChildProcess;
+      owned.live = original;
+      vi.useFakeTimers();
+      try {
+        const disposing = handle.dispose();
+        const settled = disposing.then(() => 'fulfilled', () => 'rejected');
+        if (outcome === 'error') original.emit('error', new Error('owned fixture transport error'));
+        await vi.advanceTimersByTimeAsync(40);
+        expect(await settled).toBe('fulfilled');
+        // Cessation is UNKNOWN: the original child never reported a close.
+        expect(handle.cessationEvidence!()).toBe('unknown');
+        expect(existsSync(file)).toBe(true);
+        expect(existsSync(policyFile)).toBe(true);
+        // Only the identity-bound original close releases the private files.
+        original.emit('close', 0, null);
+        expect(existsSync(file)).toBe(false);
+        expect(existsSync(policyFile)).toBe(false);
+      } finally {
+        original.emit('close', 0, null);
+        vi.useRealTimers();
+        await fx.runtime.dispose();
+      }
+    }
+
+    it('retains private verification files through an unknown deadline until late close', async () => {
+      await settingsLifetime('deadline');
+    });
+
+    it('retains private verification files through a child error until actual close', async () => {
+      await settingsLifetime('error');
+    });
+
+    /** A controllable policy child: the spawn seam returns it for the turn so
+     * an owned error can clear the live slot without a real close. */
+    function policyChild(): ChildProcess & { kill: ReturnType<typeof vi.fn> } {
+      const child = new EventEmitter() as unknown as ChildProcess & { stdout: EventEmitter; stderr: EventEmitter };
+      Object.assign(child, {
+        stdout: new EventEmitter(), stderr: new EventEmitter(), exitCode: null, signalCode: null,
+        kill: vi.fn(() => true),
+      });
+      return child as ChildProcess & { kill: ReturnType<typeof vi.fn> };
+    }
+
+    it('registers the policy child at spawn so a pre-disposal error keeps the files (N4/R2-V2)', async () => {
+      const child = policyChild();
+      const fx = fixture({ killGraceMs: 5, spawnProcess: (() => child) as unknown as typeof spawn });
+      const handle = await fx.runtime.spawn('gru', { workerVerification: policy });
+      const owned = handle as unknown as { params: { verificationSettingsFile?: string }; live: ChildProcess | null };
+      const file = owned.params.verificationSettingsFile as string;
+      const policyFile = join(dirname(file), 'policy.json');
+      const turn = handle.prompt('run the declared checks').catch(() => 'rejected');
+      await waitFor(() => owned.live === child);
+      // An owned transport error clears the live slot BEFORE dispose runs.
+      child.emit('error', new Error('owned fixture transport error'));
+      expect(await turn).toBe('rejected');
+      expect(owned.live).toBeNull();
+      await handle.dispose();
+      // Spawn-time registration keeps the tracked original owned, so the files
+      // survive and the evidence is honestly UNKNOWN.
+      expect(handle.cessationEvidence!()).toBe('unknown');
+      expect(existsSync(file)).toBe(true);
+      expect(existsSync(policyFile)).toBe(true);
+      // Only the identity-bound original close releases them.
+      child.emit('close', 0, null);
+      expect(existsSync(file)).toBe(false);
+      expect(existsSync(policyFile)).toBe(false);
+      await fx.runtime.dispose();
+    });
+
+    it('signals a tracked policy child after the live slot cleared (N10)', async () => {
+      const child = policyChild();
+      const fx = fixture({ killGraceMs: 5, spawnProcess: (() => child) as unknown as typeof spawn });
+      const handle = await fx.runtime.spawn('gru', { workerVerification: policy });
+      const owned = handle as unknown as { live: ChildProcess | null };
+      const turn = handle.prompt('run the declared checks').catch(() => 'rejected');
+      await waitFor(() => owned.live === child);
+      child.emit('error', new Error('owned fixture transport error'));
+      expect(await turn).toBe('rejected');
+      expect(owned.live).toBeNull();
+      await handle.dispose();
+      // The identity-bound original is still a disposal target even though the
+      // live slot was cleared: the same bounded termination applies.
+      expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+      child.emit('close', 0, null);
+      await fx.runtime.dispose();
+    });
+  });
+});
+describe('scheduled verification ordinary Claude Bash', () => {
+  async function refuses(input: string | ((cwd: string) => string), quality = false) {
+    const lane = verificationLane(quality); cleanupDirs.push(lane.root);
+    const command = typeof input === 'string' ? input : input(lane.lane.path);
+    const oldPath = process.env['PATH']; process.env['PATH'] = `${lane.bin}:${oldPath ?? ''}`;
+    const f = fixture();
+    try {
+      const handle = await f.runtime.spawn('minion', lane.session);
+      await handle.prompt(`verification-bash:${command}`);
+      expect(existsSync(lane.starts)).toBe(false);
+      const transcript = readFileSync(handle.sessionFile!, 'utf8');
+      expect(transcript).toContain('capture-cli.js');
+      expect(transcript).toContain('focused, full');
+      expect(transcript).toContain('no receipt was created');
+      const record = JSON.parse(readFileSync(f.doubleLog, 'utf8').trim().split('\n')[0]!);
+      const settingsFile = record.argv[record.argv.indexOf('--settings') + 1];
+      expect(existsSync(settingsFile)).toBe(true);
+      expect(record.argv).toContain('bypassPermissions');
+      expect(record.argv).toContain('--permission-prompt-tool');
+      expect(record.argv).not.toContain('--mcp-config');
+      await handle.dispose();
+      expect(existsSync(settingsFile)).toBe(false);
+    } finally { process.env['PATH'] = oldPath; await f.runtime.dispose(); }
+  }
+  it('scheduled verification guard refuses the exact web incident before any producer', async () => refuses(WEB_INCIDENT));
+  it('scheduled verification guard refuses the exact npm test incident before any producer', async () => refuses(FULL_INCIDENT));
+  it('scheduled verification guard refuses the entire exact build compound before its first producer', async () => refuses(BUILD_INCIDENT));
+  it('scheduled verification native denial survives non-blocking hook failure for all incident forms', async () => {
+    process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL'] = '1';
+    try { for (const command of [WEB_INCIDENT, FULL_INCIDENT, BUILD_INCIDENT]) await refuses(command); }
+    finally { delete process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL']; }
+  });
+
+  it('review-1 standalone lint refuses before any producer', async () => refuses('npm run lint'));
+  it('review-1 standalone typecheck refuses before any producer', async () => refuses('npm run typecheck'));
+  it('review-1 standalone build refuses before any producer', async () => refuses('npm run build'));
+  it('review-1 standalone build:web refuses before any producer', async () => refuses('npm run build:web'));
+  it('review-1 backend script refuses before any producer', async () => refuses('npm run test:backend'));
+  it('review-1 heavy backend script refuses before any producer', async () => refuses('npm run test:backend:heavy'));
+  it('review-1 web script refuses in a minimal lane', async () => refuses('npm run test:web'));
+  it('review-1 npm prefix normalization refuses before any producer', async () => refuses('npm --prefix web test'));
+  it('review-1 npx option normalization refuses before any producer', async () => refuses('npx --no-install vitest run'));
+  it('review-1 assignment-prefixed declared custom script refuses', async () => refuses('CI=1 npm run quality', true));
+  it('review-1 wrapper nesting and options refuse before any producer', async () => {
+    for (const command of ['env -i PATH="$PATH" npm test', 'env -u UNUSED command -p env --ignore-environment PATH="$PATH" npm test', 'command -- env --unset=UNUSED npm test']) await refuses(command);
+  });
+  it('review-1 adjacent redirects refuse before any producer', async () => {
+    for (const command of ['npm test>test.log', 'npm test 2>test.log', 'npm test>>test.log']) await refuses(command);
+  });
+  it('review-1 known direct local-bin paths refuse before any producer', async () => {
+    for (const command of ['./node_modules/.bin/vitest run', 'cd web && ../node_modules/.bin/vitest run']) await refuses(command);
+    await refuses((cwd) => `${join(cwd, 'node_modules/.bin/vitest')} run`);
+    await refuses((cwd) => `${join(cwd, 'web/node_modules/.bin/vitest')} run`);
+  });
+  it('review-1 executable producers outside literal heredocs refuse whole calls', async () => {
+    await refuses("cat <<'EOF'\nnpm test\nEOF\nnpm run build:web");
+    await refuses("npm test; cat <<'EOF'\nnpx vitest run\nEOF");
+  });
+  it('review-1 each conventional direct tool independently refuses', async () => {
+    for (const producer of ['vitest run', 'jest', 'tsc --noEmit', 'eslint .', 'vite build', 'playwright test']) {
+      await refuses(producer); await refuses(`npx ${producer}`);
+    }
+  });
+  it('scheduled verification preserves source/Git/quoted-text and normal helper execution', async () => {
+    const lane = verificationLane(); cleanupDirs.push(lane.root);
+    const capture = await authenticatedCaptureStatus(lane);
+    const f = fixture();
+    try {
+      const handle = await f.runtime.spawn('minion', lane.session);
+      await handle.prompt(`verification-bash:git status --short; printf '%s' 'npm test'; ${capture.command}`);
+      const transcript = readFileSync(handle.sessionFile!, 'utf8');
+      expect(capture.requests).toEqual(['GET /api/verify/status?request_id=existing']);
+      expect(transcript).toContain('existing');
+      expect(transcript).not.toContain('Minion verification refused');
+      await handle.dispose();
+    } finally { await f.runtime.dispose(); await capture.close(); }
+  });
+  it('review-1 literal source heredocs and development/setup actions remain normal Bash', async () => {
+    const lane = verificationLane(); cleanupDirs.push(lane.root);
+    const oldPath = process.env['PATH']; process.env['PATH'] = `${lane.bin}:${oldPath ?? ''}`;
+    const f = fixture();
+    try {
+      const handle = await f.runtime.spawn('minion', lane.session);
+      await handle.prompt("verification-bash:cat > source.txt <<'EOF'\nnpm test && npx vitest run\nEOF\ncat source.txt; vite; vite dev; npx vite preview; playwright install; npx playwright install-deps");
+      expect(existsSync(join(lane.lane.path, 'source.txt'))).toBe(true);
+      expect(readFileSync(join(lane.lane.path, 'source.txt'), 'utf8')).toBe('npm test && npx vitest run\n');
+      expect(readFileSync(lane.starts, 'utf8').trim().split('\n')).toHaveLength(5);
+      expect(readFileSync(handle.sessionFile!, 'utf8')).not.toContain('Minion verification refused');
+      await handle.dispose();
+    } finally { process.env['PATH'] = oldPath; await f.runtime.dispose(); }
+  });
+  it('review-1 second and disposed/reopened turns preserve native guards with zero producer starts', async () => {
+    const lane = verificationLane(); cleanupDirs.push(lane.root);
+    const oldPath = process.env['PATH']; process.env['PATH'] = `${lane.bin}:${oldPath ?? ''}`;
+    const f = fixture();
+    process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL'] = '1';
+    try {
+      const handle = await f.runtime.spawn('minion', lane.session);
+      await handle.prompt(`verification-bash:${FULL_INCIDENT}`);
+      await handle.prompt('verification-bash:npm run build:web');
+      const file = handle.sessionFile!; await handle.dispose();
+      const reopened = await f.runtime.spawn('minion', { ...lane.session, resumeFile: file });
+      await reopened.prompt('verification-bash:npx --no-install vitest run');
+      expect(existsSync(lane.starts)).toBe(false);
+      const records = doubleInvocations(f);
+      expect(records).toHaveLength(3);
+      for (const record of records) {
+        expect(record.argv).toContain('--settings'); expect(record.argv).toContain('--permission-prompt-tool');
+        expect(record.cwd).toBe(lane.lane.path);
+      }
+      expect(records[1]!.argv).toContain('--resume'); expect(records[2]!.argv).toContain('--resume');
+      expect(reopened.id).toBe(handle.id);
+      expect(readFileSync(file, 'utf8')).toContain('capture-cli.js');
+      await reopened.dispose();
+    } finally { delete process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL']; process.env['PATH'] = oldPath; await f.runtime.dispose(); }
+  });
+  it('review-1 native fallback independently covers conventional flags and local-bin paths', async () => {
+    process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL'] = '1';
+    try {
+      for (const command of ['npm --prefix web test', 'npx --no-install vitest run', './node_modules/.bin/vitest run', 'cd web && ../node_modules/.bin/vitest run', 'npm test>test.log', 'env -i PATH="$PATH" command -p npm test']) await refuses(command);
+      await refuses('CI=1 npm run quality', true);
+      await refuses((cwd) => `${join(cwd, 'node_modules/.bin/vitest')} run`);
+    } finally { delete process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL']; }
+  });
+
+  async function settingsLifetime(outcome: 'deadline' | 'error' | 'dispose-error') {
+    const lane = verificationLane(); cleanupDirs.push(lane.root);
+    const f = fixture({ killGraceMs: 5 });
+    const handle = await f.runtime.spawn('minion', lane.session);
+    const owned = handle as unknown as {
+      params: { verificationSettingsFile: string }; live: ChildProcess | null;
+    };
+    const original = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null, kill: vi.fn(() => true) }) as unknown as ChildProcess;
+    const foreign = new EventEmitter();
+    owned.live = original;
+    const file = owned.params.verificationSettingsFile;
+    const policyFile = join(dirname(file), 'policy.json');
+    const release = outcome === 'dispose-error' ? vi.spyOn(f.store, 'releaseLock').mockImplementationOnce(() => { throw new Error('owned fixture release fault'); }) : null;
+    vi.useFakeTimers();
+    try {
+      const disposing = handle.dispose();
+      const settled = disposing.then(() => 'fulfilled', () => 'rejected');
+      if (outcome === 'error') original.emit('error', new Error('owned fixture transport error'));
+      await vi.advanceTimersByTimeAsync(30);
+      expect(await settled).toBe(outcome === 'dispose-error' ? 'rejected' : 'fulfilled');
+      expect(handle.cessationEvidence!()).toBe('unknown');
+      expect(existsSync(file)).toBe(true); expect(existsSync(policyFile)).toBe(true);
+      foreign.emit('close', 0, null);
+      expect(existsSync(file)).toBe(true);
+      original.emit('close', 0, null);
+      expect(existsSync(file)).toBe(false); expect(existsSync(policyFile)).toBe(false);
+    } finally {
+      original.emit('close', 0, null); release?.mockRestore(); vi.useRealTimers(); await f.runtime.dispose();
+    }
+  }
+  it('review-1 verification files survive unknown deadline until identity-bound late close', async () => settingsLifetime('deadline'));
+  it('review-1 verification files survive child error until identity-bound actual close', async () => settingsLifetime('error'));
+  it('review-1 verification files survive disposal rejection until identity-bound actual close', async () => settingsLifetime('dispose-error'));
+
+  it('review-2 npm aliases refuse independently before producer start', async () => {
+    for (const command of ['npm tst', 'npm run-script lint', 'npm exec -- vitest run', 'npm x -- vitest run', 'npm rum lint', 'npm urn lint']) await refuses(command);
+  });
+  it('review-2 conventional option positions refuse independently', async () => {
+    for (const command of ['npm --loglevel error test', 'npm run --if-present lint', 'npm --loglevel error run --if-present lint']) await refuses(command);
+  });
+  it('review-2 exact declared script words refuse independently', async () => {
+    for (const command of ['npm run test.unit', 'npm run-script check/unit']) await refuses(command, true);
+  });
+  it('review-2 root-relative web bin paths refuse independently', async () => {
+    for (const command of ['web/node_modules/.bin/vitest run', './web/node_modules/.bin/vitest run']) await refuses(command);
+  });
+  it('review-2 bounded control prefixes refuse entire calls', async () => {
+    for (const command of ['! npm test', '! printf ok | npm test', 'if npm test; then printf ok; fi', '( npm test )', '{ npm test; }']) await refuses(command);
+  });
+
+  it('review-2 plain unquoted source heredocs and diagnostic reads execute normally', async () => {
+    const lane = verificationLane(); cleanupDirs.push(lane.root);
+    const oldPath = process.env['PATH']; process.env['PATH'] = `${lane.bin}:${oldPath ?? ''}`;
+    const f = fixture();
+    try {
+      const handle = await f.runtime.spawn('minion', lane.session);
+      await handle.prompt("verification-bash:cat > source.txt <<EOF\nnpm test && npx vitest run\nEOF\ncat source.txt; tsc --version; tsc --showConfig; eslint --help; npx --no-install tsc --version; npm exec -- tsc --showConfig");
+      expect(existsSync(join(lane.lane.path, 'source.txt'))).toBe(true);
+      expect(readFileSync(join(lane.lane.path, 'source.txt'), 'utf8')).toBe('npm test && npx vitest run\n');
+      expect(readFileSync(lane.starts, 'utf8').trim().split('\n')).toEqual(['tsc', 'tsc', 'eslint', 'npx', 'npm']);
+      expect(readFileSync(handle.sessionFile!, 'utf8')).not.toContain('Minion verification refused');
+      await handle.dispose();
+    } finally { process.env['PATH'] = oldPath; await f.runtime.dispose(); }
+  });
+  it('review-2 independent raw corpus exercises native refusal and allow with hook unavailable', async () => {
+    const { nativeCorpus } = await import('./helpers/verification-native-corpus.mjs');
+    const lane = verificationLane(true); cleanupDirs.push(lane.root);
+    const oldPath = process.env['PATH']; process.env['PATH'] = `${lane.bin}:${oldPath ?? ''}`;
+    const f = fixture(); process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL'] = '1';
+    try {
+      const handle = await f.runtime.spawn('minion', lane.session);
+      for (const row of nativeCorpus) {
+        const before = existsSync(lane.starts) ? readFileSync(lane.starts, 'utf8') : '';
+        await handle.prompt(`verification-bash:${row.raw}`);
+        const after = existsSync(lane.starts) ? readFileSync(lane.starts, 'utf8') : '';
+        if (row.refused) expect(after, row.raw).toBe(before);
+        // The per-turn transcript tool_result attests native simulated
+        // disposition independently of the model's final text.
+        const frames = readFileSync(handle.sessionFile!, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+        const result = frames.filter((frame) => frame.type === 'user').at(-1);
+        expect(result.message.content[0].is_error, row.raw).toBe(row.refused);
+      }
+      await handle.dispose();
+    } finally { delete process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL']; process.env['PATH'] = oldPath; await f.runtime.dispose(); }
+  });
+
+  async function startedChildCustody(operation: 'prompt' | 'compact') {
+    const lane = verificationLane(); cleanupDirs.push(lane.root);
+    const startProcess = vi.fn(childProcesses.spawn);
+    const f = fixture({ killGraceMs: 5, spawnProcess: startProcess as unknown as typeof childProcesses.spawn });
+    const handle = await f.runtime.spawn('minion', lane.session);
+    if (operation === 'compact') await handle.prompt('establish owned session');
+    const owned = handle as unknown as { params: { verificationSettingsFile: string }; live: ChildProcess | null; cessationKind: string };
+    const original = Object.assign(new EventEmitter(), {
+      exitCode: null, signalCode: null, kill: vi.fn(() => true), stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+    }) as unknown as ChildProcess;
+    const foreign = new EventEmitter();
+    startProcess.mockClear();
+    const spy = startProcess.mockReturnValueOnce(original as ReturnType<typeof childProcesses.spawn>);
+    try {
+      const running = operation === 'prompt' ? handle.prompt('owned failing transport') : handle.compact!();
+      const rejected = expect(running).rejects.toThrow(/process failed to spawn/);
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(owned.live).toBe(original);
+      original.emit('error', new Error('owned pre-disposal transport error'));
+      await rejected;
+      expect(owned.live).toBeNull();
+      const file = owned.params.verificationSettingsFile;
+      expect(existsSync(file)).toBe(true);
+      await handle.dispose();
+      expect(handle.cessationEvidence!()).toBe('unknown');
+      expect(owned.cessationKind).toBe('live');
+      expect(existsSync(file)).toBe(true);
+      foreign.emit('close', 0, null);
+      expect(handle.cessationEvidence!()).toBe('unknown');
+      expect(existsSync(file)).toBe(true);
+      original.emit('close', 0, null);
+      expect(handle.cessationEvidence!()).toBe('ceased');
+      expect(existsSync(file)).toBe(false);
+      expect(existsSync(join(dirname(file), 'policy.json'))).toBe(false);
+    } finally { original.emit('close', 0, null); await f.runtime.dispose(); }
+  }
+  it('review-2 actual prompt registration retains pre-disposal errored original until delayed close', async () => startedChildCustody('prompt'));
+  it('review-2 actual compaction registration retains pre-disposal errored original until delayed close', async () => startedChildCustody('compact'));
+
+  it('review-8 Claude host refuses option-terminator and heredoc-FD producers with hook unavailable', async () => {
+    process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL'] = '1';
+    try { for (const command of ['npm exec -- vitest run -- --help', 'npm 0<<EOF test\nEOF\n']) await refuses(command); }
+    finally { delete process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL']; }
+  });
+  it('strict repair every retained producing raw case refuses ordinary Claude with hook unavailable', async () => {
+    const { nativeCorpus } = await import('./helpers/verification-native-corpus.mjs');
+    process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL'] = '1';
+    try { for (const row of nativeCorpus.filter((row) => row.refused)) await refuses(row.raw, true); }
+    finally { delete process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL']; }
+  });
+  it('strict repair policy-bearing compaction refuses native Bash with zero producer starts', async () => {
+    const lane = verificationLane(); cleanupDirs.push(lane.root);
+    const f = fixture(); process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL'] = '1';
+    try {
+      const handle = await f.runtime.spawn('minion', lane.session); await handle.prompt('establish');
+      for (const incident of [WEB_INCIDENT, FULL_INCIDENT, BUILD_INCIDENT]) {
+        process.env['CLAUDE_DOUBLE_COMPACT_VERIFICATION'] = incident;
+        await handle.compact!();
+      }
+      expect(existsSync(lane.starts)).toBe(false);
+      for (const invocation of doubleInvocations(f).slice(1)) {
+        expect(invocation.argv).toContain('--resume'); expect(invocation.argv).toContain('--permission-prompt-tool');
+        expect(invocation.cwd).toBe(lane.lane.path);
+      }
+      await handle.dispose();
+    } finally { delete process.env['CLAUDE_DOUBLE_COMPACT_VERIFICATION']; delete process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL']; await f.runtime.dispose(); }
+  });
+  it('strict repair disposal signals every unresolved original while a different policy child is live', async () => {
+    const lane = verificationLane(); cleanupDirs.push(lane.root);
+    const controlled = () => Object.assign(new EventEmitter(), {
+      exitCode: null, signalCode: null, kill: vi.fn(() => true), stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+    }) as unknown as ChildProcess;
+    const a = controlled(); const b = controlled();
+    const start = vi.fn(spawn).mockReturnValueOnce(a as ReturnType<typeof spawn>).mockReturnValueOnce(b as ReturnType<typeof spawn>);
+    const f = fixture({ killGraceMs: 5, spawnProcess: start as unknown as typeof spawn });
+    const handle = await f.runtime.spawn('minion', lane.session);
+    const turnA = handle.prompt('A'); const rejectedA = expect(turnA).rejects.toThrow(/process failed to spawn/);
+    a.emit('error', new Error('owned error without close')); await rejectedA;
+    const turnB = handle.prompt('B'); const rejectedB = expect(turnB).rejects.toThrow(/disposed/);
+    vi.useFakeTimers();
+    try {
+      const disposal = handle.dispose(); await vi.advanceTimersByTimeAsync(30); await disposal; await rejectedB;
+      for (const child of [a, b]) {
+        expect(child.kill).toHaveBeenCalledWith('SIGTERM'); expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+      }
+      const file = (handle as unknown as { params: { verificationSettingsFile: string } }).params.verificationSettingsFile;
+      b.emit('close', null, 'SIGKILL'); expect(handle.cessationEvidence!()).toBe('unknown'); expect(existsSync(file)).toBe(true);
+      a.emit('close', null, 'SIGKILL'); expect(handle.cessationEvidence!()).toBe('ceased'); expect(existsSync(file)).toBe(false);
+    } finally { a.emit('close', 0, null); b.emit('close', 0, null); vi.useRealTimers(); await f.runtime.dispose(); }
+  });
+  it('strict repair a proven-closed original cannot be re-registered during asynchronous settlement', async () => {
+    const lane = verificationLane(); cleanupDirs.push(lane.root);
+    const child = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null, kill: vi.fn(() => true), stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() }) as unknown as ChildProcess;
+    const f = fixture({ killGraceMs: 5, spawnProcess: vi.fn(() => child) as unknown as typeof spawn });
+    const handle = await f.runtime.spawn('minion', lane.session);
+    const pending = handle.prompt('owned'); const rejection = expect(pending).rejects.toThrow(/disposed/);
+    child.emit('close', 0, null);
+    await handle.dispose(); await rejection;
+    expect(handle.cessationEvidence!()).toBe('ceased');
+    const file = (handle as unknown as { params: { verificationSettingsFile: string } }).params.verificationSettingsFile;
+    expect(existsSync(file)).toBe(false); expect(child.kill).not.toHaveBeenCalled();
+    await f.runtime.dispose();
+  });
+  it('strict repair SIGTERM-resistant post-error original actually dies on existing SIGKILL escalation', async () => {
+    const lane = verificationLane(); cleanupDirs.push(lane.root);
+    const start = vi.fn(spawn); const f = fixture({ killGraceMs: 30, spawnProcess: start as unknown as typeof spawn });
+    process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
+    const handle = await f.runtime.spawn('minion', lane.session);
+    const pending = handle.prompt(`hold:${join(lane.root, 'never-created')}`);
+    const rejection = expect(pending).rejects.toThrow(/process failed to spawn/);
+    await vi.waitFor(() => expect(existsSync(f.doubleLog)).toBe(true));
+    const child = start.mock.results[0]!.value as ChildProcess;
+    const close = new Promise<{ code: number | null; signal: string | null }>((resolve) => child.once('close', (code: number | null, signal: NodeJS.Signals | null) => resolve({ code, signal })));
+    const signals = vi.spyOn(child, 'kill'); child.emit('error', new Error('owned pre-disposal transport error')); await rejection;
+    await handle.dispose();
+    expect(await close).toEqual({ code: null, signal: 'SIGKILL' });
+    expect(signals).toHaveBeenCalledWith('SIGTERM'); expect(signals).toHaveBeenCalledWith('SIGKILL');
+    expect(handle.cessationEvidence!()).toBe('ceased');
+    expect(existsSync((handle as unknown as { params: { verificationSettingsFile: string } }).params.verificationSettingsFile)).toBe(false);
+    delete process.env['CLAUDE_DOUBLE_IGNORE_TERM']; await f.runtime.dispose();
+  });
+
+  it('strict repair expanding escaped source plaintext and help diagnostics execute ordinary Claude', async () => {
+    const lane = verificationLane(); cleanupDirs.push(lane.root);
+    const oldPath = process.env['PATH']; process.env['PATH'] = `${lane.bin}:${oldPath ?? ''}`;
+    const f = fixture(); process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL'] = '1';
+    try {
+      const handle = await f.runtime.spawn('minion', lane.session);
+      await handle.prompt("verification-bash:cat > escaped.txt <<EOF\n\\$(npm test)\n\\`npm test\\`\nEOF\ncat > empty.txt <<''\nnpm test\n\ncat escaped.txt empty.txt; tsc --pretty false --showConfig; npx vitest run --help");
+      expect(readFileSync(join(lane.lane.path, 'escaped.txt'), 'utf8')).toBe('$(npm test)\n`npm test`\n');
+      expect(readFileSync(join(lane.lane.path, 'empty.txt'), 'utf8')).toBe('npm test\n');
+      expect(readFileSync(lane.starts, 'utf8').trim().split('\n')).toEqual(['tsc', 'npx']);
+      expect(readFileSync(handle.sessionFile!, 'utf8')).not.toContain('Minion verification refused'); await handle.dispose();
+    } finally { delete process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL']; process.env['PATH'] = oldPath; await f.runtime.dispose(); }
+  });
+
+  it('review-8 ordinary pre-ACK Bash is denied before prompt and compaction side effects', async () => {
+    for (const operation of ['prompt', 'compact'] as const) {
+      const lane = verificationLane(); cleanupDirs.push(lane.root);
+      const marker = join(lane.lane.path, 'ordinary-pre-ack-side-effect');
+      const start = vi.fn(spawn); const f = fixture({ spawnProcess: start as unknown as typeof spawn });
+      const handle = await f.runtime.spawn('minion', lane.session);
+      if (operation === 'compact') await handle.prompt('establish original conversation');
+      const original = Object.assign(new EventEmitter(), {
+        exitCode: null, signalCode: null, kill: vi.fn(() => true), stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+      }) as unknown as ChildProcess;
+      const wire: Record<string, unknown>[] = [];
+      original.stdin!.on('data', (chunk: Buffer) => {
+        const frame = JSON.parse(chunk.toString('utf8')) as Record<string, unknown>; wire.push(frame);
+        const response = frame['response'] as Record<string, unknown> | undefined;
+        const decision = response?.['response'] as Record<string, unknown> | undefined;
+        // The ordinary shell acts only on its original host's approval.
+        if (decision?.['behavior'] === 'allow') {
+          const input = decision['updatedInput'] as { readonly command: string };
+          const execution = childProcesses.spawnSync('/bin/sh', ['-c', input.command], { cwd: lane.lane.path, encoding: 'utf8' });
+          expect(execution.status, execution.stderr).toBe(0);
+        }
+      });
+      start.mockReturnValueOnce(original as ReturnType<typeof spawn>);
+      let running: Promise<void> | undefined;
+      try {
+        running = operation === 'compact' ? handle.compact!() : handle.prompt('ordinary Bash before initialization acknowledgement');
+        const outcome = running.then(() => 'resolved', (error: unknown) => String(error));
+        expect(wire.map((frame) => frame['type'])).toEqual(['control_request', 'user']);
+        original.stdout!.emit('data', Buffer.from(JSON.stringify({
+          type: 'control_request', request_id: 'ordinary-pre-ack-request',
+          request: { subtype: 'can_use_tool', tool_name: 'Bash', tool_use_id: 'ordinary-pre-ack-tool', input: { command: 'touch ordinary-pre-ack-side-effect' } },
+        }) + '\n'));
+        const responseFrame = wire.find((frame) => frame['type'] === 'control_response');
+        const response = responseFrame?.['response'] as Record<string, unknown> | undefined;
+        expect(response?.['request_id']).toBe('ordinary-pre-ack-request');
+        expect(existsSync(marker)).toBe(false);
+        expect(response?.['response']).toMatchObject({ behavior: 'deny' });
+        original.emit('close', 0, null);
+        expect(await outcome).toContain('malformed or foreign worker verification permission request');
+      } finally {
+        original.emit('close', 0, null); await running?.catch(() => undefined);
+        await handle.dispose(); expect(handle.cessationEvidence!()).toBe('ceased');
+        await f.runtime.dispose();
+      }
+    }
+  });
+
+  async function initializationOrdering(operation: 'prompt' | 'compact', inspectDelivery: boolean): Promise<void> {
+    const lane = verificationLane(); cleanupDirs.push(lane.root);
+    const start = vi.fn(spawn); const f = fixture({ spawnProcess: start as unknown as typeof spawn });
+    const handle = await f.runtime.spawn('minion', lane.session);
+    if (operation === 'compact') await handle.prompt('establish original conversation');
+    const original = Object.assign(new EventEmitter(), {
+      exitCode: null, signalCode: null, kill: vi.fn(() => true), stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+    }) as unknown as ChildProcess;
+    const wire: Record<string, unknown>[] = [];
+    original.stdin!.on('data', (chunk: Buffer) => wire.push(JSON.parse(chunk.toString('utf8')) as Record<string, unknown>));
+    start.mockReturnValueOnce(original as ReturnType<typeof spawn>);
+    const owned = handle as unknown as { params: { sessionId: string; verificationSettingsFile: string } };
+    let running: Promise<void> | undefined;
+    try {
+      running = operation === 'compact' ? handle.compact!() : handle.prompt('owned prompt before initialization reply');
+      // Observe rejection immediately; do not create an unhandled promise if
+      // a delivery assertion fails on the archived, pre-fix implementation.
+      const outcome = running.then(() => 'resolved', (error: unknown) => String(error));
+      expect(existsSync(owned.params.verificationSettingsFile)).toBe(true);
+      expect(wire[0]?.['type']).toBe('control_request');
+      if (inspectDelivery) {
+        expect(wire.map((frame) => frame['type'])).toEqual(['control_request', 'user']);
+        const message = wire[1]?.['message'] as { readonly content?: string };
+        expect(message.content).toBe(operation === 'compact' ? '/compact' : 'owned prompt before initialization reply');
+      }
+      // A valid session/result is not initialization of the permission
+      // transport. Missing reply must remain fail-loud even without Bash.
+      original.stdout!.emit('data', Buffer.from(JSON.stringify({ type: 'system', subtype: 'init', session_id: owned.params.sessionId }) + '\n'));
+      original.stdout!.emit('data', Buffer.from(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'ordinary text', session_id: owned.params.sessionId }) + '\n'));
+      original.emit('close', 0, null);
+      expect(await outcome).toContain('worker verification permission initialization did not complete before result');
+      expect(existsSync(lane.starts)).toBe(false);
+    } finally {
+      original.emit('close', 0, null); await running?.catch(() => undefined);
+      await handle.dispose(); expect(handle.cessationEvidence!()).toBe('ceased');
+      await f.runtime.dispose();
+    }
+  }
+  it('review-4 initialization prompt pipelines after original binding without waiting for a reply', async () => initializationOrdering('prompt', true));
+  it('review-4 initialization compaction pipelines after original binding without waiting for a reply', async () => initializationOrdering('compact', true));
+  it('review-4 initialization unanswered transport cannot accept a text-only terminal turn', async () => initializationOrdering('prompt', false));
+
+  it('strict repair malformed native permission transport fails ordinary Claude closed with zero starts', async () => {
+    const lane = verificationLane(); cleanupDirs.push(lane.root);
+    const f = fixture(); process.env['CLAUDE_DOUBLE_PERMISSION_MALFORMED'] = '1'; process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL'] = '1';
+    try {
+      const handle = await f.runtime.spawn('minion', lane.session);
+      await expect(handle.prompt('verification-bash:npm test')).rejects.toThrow(/malformed or foreign worker verification permission request/);
+      expect(existsSync(lane.starts)).toBe(false); await handle.dispose();
+      expect(handle.cessationEvidence!()).toBe('ceased');
+    } finally { delete process.env['CLAUDE_DOUBLE_PERMISSION_MALFORMED']; delete process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL']; await f.runtime.dispose(); }
+  });
+
 });

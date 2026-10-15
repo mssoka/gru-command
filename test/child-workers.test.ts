@@ -103,6 +103,10 @@ function writeSession(path: string, assistantTexts: readonly string[]): void {
 interface FakeHandle extends AgentHandle {
   readonly prompts: string[];
   disposed: boolean;
+  /** Adapter-owned cessation evidence (Option A): 'ceased' only after this
+   * fake adapter's own disposal completed; tests may leave it 'unknown' (or
+   * point at a throwing method) to model an unproven stop. */
+  evidence: 'ceased' | 'unknown';
 }
 
 interface Harness {
@@ -149,6 +153,10 @@ function makeHarness(
     retrySettlement?: (agentId: string) => Promise<'none' | 'recovered' | 'exhausted' | 'superseded'>;
     /** dispose() rejects and health stays non-disposed (unproven stop). */
     failDispose?: boolean;
+    /** dispose() FULFILLS and health becomes disposed, but the adapter cannot
+     * attest cessation: disposed metadata + UNKNOWN evidence (the new Pi
+     * idle-timeout shape) must still be treated as debt. */
+    unprovenEvidence?: boolean;
     /** The turn writes an interim message followed by a tool result. */
     interimOnly?: boolean;
     /** The session file path never exists (unreadable baseline). */
@@ -171,7 +179,7 @@ function makeHarness(
       ownedAgentIds: new Set(handles.filter((handle) => !handle.disposed).map((handle) => handle.id)),
     }),
   });
-  const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'));
+  const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'), ledger);
   const sessionDir = join(dir, 'sessions');
   mkdirSync(sessionDir, { recursive: true });
 
@@ -260,6 +268,8 @@ function makeHarness(
         capabilities: FAKE_CAPABILITIES,
         prompts,
         disposed: false,
+        evidence: 'unknown',
+        cessationEvidence: () => handle.evidence,
         async prompt(text: string, _options?: PromptOptions) {
           prompts.push(text);
           if (turnGate !== null) await turnGate;
@@ -291,6 +301,9 @@ function makeHarness(
           if (failDispose) throw new Error('dispose rejected (unproven cessation)');
           state = 'disposed';
           handle.disposed = true;
+          // A disposed HEALTH is metadata, never proof: this fixture attests
+          // 'ceased' only when it is modelling a completed stop.
+          if (opts.unprovenEvidence !== true) handle.evidence = 'ceased';
         },
       };
       handles.push(handle);
@@ -482,6 +495,12 @@ describe('tracked child workers: admission (issue #161)', () => {
     // A terminal lane is an expired parent (checked before the fanout cap).
     h.ledger.setJobStatus('job-1', 'done');
     expect(refusalOf(() => h.request({ idempotencyKey: 'k-expired' })).code).toBe('parent_expired');
+    // A binned (discarded) lane is an expired parent too.
+    const discarded = makeHarness();
+    discarded.ledger.setAgentState('parent-1', 'idle');
+    discarded.ledger.setJobStatus('job-1', 'binned');
+    expect(refusalOf(() => discarded.request({ idempotencyKey: 'k-expired-binned' })).code).toBe('parent_expired');
+    discarded.close();
     h.close();
   });
 
@@ -580,6 +599,23 @@ describe('tracked child workers: admission (issue #161)', () => {
       () => h.worktrees.getWorktree(admission.record.id)?.status === 'swept',
       'the fenced writer lane to be swept',
     );
+
+    // A queued child owns this lane: binning must refuse rather than hide
+    // it. Once that producer has actually settled, the chief can discard.
+    const discarded = makeHarness();
+    const releaseDiscarded = discarded.setSpawnGate();
+    const discardedAdmission = discarded.request({ authority: 'writer', idempotencyKey: 'key-binned' });
+    await waitForChild(discarded, discardedAdmission.record.id, (state) => state === 'admitted');
+    const beforeDiscard = discarded.ledger.listJobEvents('job-1');
+    expect(() => discarded.ledger.setJobStatus('job-1', 'binned')).toThrow(/live work/u);
+    expect(discarded.ledger.listJobEvents('job-1')).toEqual(beforeDiscard);
+    releaseDiscarded();
+    await waitForChild(discarded, discardedAdmission.record.id, (state) => state === 'done');
+    discarded.ledger.setAgentState(discardedAdmission.record.id, 'disposed');
+    discarded.ledger.setAgentState('parent-1', 'idle');
+    discarded.ledger.setJobStatus('job-1', 'binned');
+    expect(discarded.ledger.getJob('job-1')?.status).toBe('binned');
+    discarded.close();
     h.close();
   });
 
@@ -717,6 +753,48 @@ describe('tracked child workers: lifecycle, results and recovery', () => {
     h.close();
   });
 
+  it('a DISPOSED child whose adapter attests UNKNOWN keeps its lane and cleanup debt (F60-P3)', async () => {
+    const h = makeHarness({ unprovenEvidence: true });
+    const admission = h.request();
+    await waitForChild(h, admission.record.id, (state) => state === 'done');
+    const record = h.ledger.getChildWorker(admission.record.id)!;
+    // The turn's work outcome is truthful and recorded...
+    expect(record.resultSummary).toContain('child report');
+    // ...but terminal HEALTH is not cessation: the successful turn's cleanup
+    // stays debt and the read-only lane is retained.
+    expect(h.ledger.latestEventOfKind('child.cleanup-debt')).not.toBeNull();
+    expect(h.worktrees.getWorktree(admission.record.id)?.status).not.toBe('swept');
+    h.close();
+  });
+
+  it('reconciles a finalized read-only child\'s cleanup debt exactly once on a later positive attestation (F60-P3)', async () => {
+    const h = makeHarness({ unprovenEvidence: true });
+    try {
+      const admission = h.request();
+      await waitForChild(h, admission.record.id, (state) => state === 'done');
+      const recorded = h.ledger.getChildWorker(admission.record.id)!;
+      expect(recorded.resultSummary).toContain('child report');
+      expect(h.ledger.latestEventOfKind('child.cleanup-debt')).not.toBeNull();
+      expect(h.worktrees.getWorktree(admission.record.id)?.status).not.toBe('swept');
+      // Attributable LATE positive: the adapter now attests cessation.
+      h.handles[0]!.evidence = 'ceased';
+      await h.service.cancel(admission.record.id, 'late positive cessation proof');
+      // The recorded successful result is IMMUTABLE...
+      const after = h.ledger.getChildWorker(admission.record.id)!;
+      expect(after.resultState).toBe('done');
+      expect(after.resultSummary).toBe(recorded.resultSummary);
+      // ...while the retained cleanup debt reconciles exactly once.
+      expect(h.ledger.latestEventOfKind('child.cleanup-reconciled')).not.toBeNull();
+      expect(h.worktrees.getWorktree(admission.record.id)?.status).toBe('swept');
+      // A repeat is a no-op: still exactly one reconciliation.
+      await h.service.cancel(admission.record.id, 'repeat');
+      const reconciled = h.ledger.listEvents({ limit: 200 }).filter((e) => e.kind === 'child.cleanup-reconciled');
+      expect(reconciled).toHaveLength(1);
+    } finally {
+      h.close();
+    }
+  });
+
   it('keeps an uncancelled failed run non-terminal when cessation is unproven', async () => {
     const h = makeHarness({ failDispose: true });
     h.nextVerdict = { ok: false, error: 'model refused the task' };
@@ -754,6 +832,7 @@ describe('tracked child workers: lifecycle, results and recovery', () => {
       'list_child_workers',
       'cancel_child_worker',
     ]);
+    expect(tools.every((tool) => typeof tool.authorityManifest === 'string' && tool.authorityManifest.length > 0)).toBe(true);
     const requestTool = tools.find((tool) => tool.name === 'request_child_worker')!;
     const created = JSON.parse(
       (await requestTool.execute({
@@ -785,9 +864,9 @@ describe('tracked child workers: lifecycle, results and recovery', () => {
     expect(listed.children[0]!.result_summary).toContain('child report');
     // ANOTHER parent's tools cannot cancel this child.
     h.ledger.registerAgent({ id: 'parent-2', role: 'minion', jobId: 'job-1', parentage: 'top-level' });
-    const foreignCancel = h.service
-      .parentTools('parent-2')
-      .find((tool) => tool.name === 'cancel_child_worker')!;
+    const siblingTools = h.service.parentTools('parent-2');
+    expect(siblingTools.map((tool) => tool.authorityManifest)).not.toEqual(tools.map((tool) => tool.authorityManifest));
+    const foreignCancel = siblingTools.find((tool) => tool.name === 'cancel_child_worker')!;
     const denied = JSON.parse((await foreignCancel.execute({ child_id: created.child_id })).text) as {
       error: string;
     };
@@ -1061,6 +1140,7 @@ describe('tracked child workers: board and API surfaces', () => {
     );
     const config = loadConfig({ GRU_COMMAND_HOME: h.dir }, '/home/tester');
     const server = createDispatchServer({
+      pendingProducerBlockers: () => [],
       config,
       dispatch: {} as DispatchService,
       wave: {} as WaveRunner,

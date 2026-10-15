@@ -3,6 +3,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { parse } from 'smol-toml';
 import type { LogLevel } from '../logger.js';
+import { repositoryGitEnv } from '../dispatch/perkins-review/artifacts.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -16,8 +17,8 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * Schema (all arrays optional, all entries validated fail-loud):
  *
  *   [[link]]                 # symlink created IN the worktree
- *   at   = "_bmad"           #   path inside the fresh worktree (relative, no ..)
- *   to   = "_bmad"           #   target: repo-root-relative (.. allowed) or absolute
+ *   at   = "fixtures/large"  #   path inside the fresh worktree (relative, no ..)
+ *   to   = "fixtures/large"  #   target: repo-root-relative (.. allowed) or absolute
  *
  *   [[copy]]                 # file copied FROM the source checkout
  *   from = ".env.local"      #   repo-root-relative (no ..)
@@ -62,6 +63,8 @@ export interface WorktreeManifest {
   readonly copies: readonly ManifestCopy[];
   readonly setup: readonly ManifestSetup[];
   readonly verify: ManifestVerify;
+  /** Historical manifests remain readable for already-running jobs; creation refuses this obsolete GC bootstrap. */
+  readonly retiredGcBmadBootstrap?: true;
 }
 
 /** A path that must stay inside the given root — resolve + containment. */
@@ -153,7 +156,24 @@ export function parseWorktreeManifest(text: string, source = MANIFEST_PATH): Wor
     }
   }
 
-  return { links, copies, setup, verify: verifyEntries };
+  // Distinguish actual comment markers from the same text inside a user's
+  // multiline setup string. Removing a comment cannot alter parsed TOML.
+  const retired = [...text.matchAll(/^[\t ]*#[\t ]*(?:BEGIN|END)[\t ]+GRU[\t ]+COMMAND[\t ]+BMAD[\t ]+BOOTSTRAP\b[^\r\n]*/gmu)].some((match) => {
+    const withoutLine = text.slice(0, match.index) + text.slice(match.index + match[0].length);
+    try { return JSON.stringify(parse(withoutLine)) === JSON.stringify(raw); } catch { return false; }
+  });
+  return { links, copies, setup, verify: verifyEntries, ...(retired ? { retiredGcBmadBootstrap: true as const } : {}) };
+}
+
+/** Creation-only guard: historical jobs can still resolve their original verification commands. */
+export function assertWorktreeBootstrapSupported(manifest: WorktreeManifest, source = MANIFEST_PATH): void {
+  if (manifest.retiredGcBmadBootstrap) {
+    throw new Error(
+      `worktree manifest ${source} contains a retired GC-managed BMAD bootstrap; ` +
+        'use the owner-run preview/backup/retirement steps in docs/BMAD-RUNTIME.md ' +
+        '("Retire only the GC bootstrap"). Preserve edited/foreign blocks for deliberate repair; no files were changed',
+    );
+  }
 }
 
 /**
@@ -226,6 +246,7 @@ export async function applyWorktreeManifest(
   opts: ApplyManifestOptions,
 ): Promise<void> {
   const log = opts.log ?? (() => {});
+  assertWorktreeBootstrapSupported(manifest);
 
   for (const link of manifest.links) {
     const dest = insidePath(opts.worktreePath, link.at, `link.at "${link.at}"`);
@@ -305,6 +326,7 @@ async function execSetupCommand(command: string, cwd: string, timeoutMs: number)
   try {
     child = spawn('/bin/sh', ['-c', command], {
       cwd,
+      env: repositoryGitEnv(false),
       detached: true, // own process group: the timeout kill reaps children too
       stdio: ['ignore', 'pipe', 'pipe'],
     });

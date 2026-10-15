@@ -1,11 +1,10 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { WebSocket, type RawData } from 'ws';
-import { createScanner, ScriptTarget, SyntaxKind } from 'typescript';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { WebSocket, WebSocketServer, type RawData } from 'ws';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { BoardEngine } from '../src/board/engine.js';
 import { createBoardServer } from '../src/board/server.js';
@@ -16,6 +15,12 @@ import { NotificationCenter } from '../src/notifications/center.js';
 import { TranscriptService } from '../src/transcripts/service.js';
 import { loadConfig } from '../src/config.js';
 import { DecisionRuntime } from '../src/decisions/runtime.js';
+import { DREAM_FAILED_KIND, dreamFailureIncidents } from '../src/lessons/dream.js';
+import { ROLE_DEFINITIONS } from '../src/roles.js';
+import type { RepoOverviewView } from '../src/repos/overview.js';
+import type { DecisionRecord } from '../src/ledger/decision-memory.js';
+import type { MailboxItem } from '../src/ledger/mailbox.js';
+import { reconcileReportClosures } from '../src/dispatch/durable-reconcile.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -30,12 +35,16 @@ function tmpDir(): string {
 
 async function boot(
   token: string,
-  overrides: Partial<Parameters<typeof createBoardServer>[0]> = {},
+  overrides: Partial<{
+    heartbeatMs: number;
+    repoOverview: () => RepoOverviewView | null;
+  }> = {},
 ): Promise<{
   port: number;
   api: LedgerApi;
   bus: EventBus;
   board: ReturnType<typeof createBoardServer>;
+  engine: BoardEngine;
   close: () => Promise<void>;
 }> {
   const dir = tmpDir();
@@ -55,7 +64,12 @@ async function boot(
   const db = new LedgerDb(dir);
   const bus = new EventBus();
   const api = new LedgerApi(db.handle, { bus });
-  const engine = new BoardEngine({ ledger: api, bus });
+  const { repoOverview, ...serverOverrides } = overrides;
+  const engine = new BoardEngine({
+    ledger: api,
+    bus,
+    ...(repoOverview !== undefined ? { repoOverview } : {}),
+  });
   const notifications = new NotificationCenter({ ledger: api, bus });
   const decisions = new DecisionRuntime(cfg.decisions, {
     instanceDir: cfg.instanceDir,
@@ -73,7 +87,7 @@ async function boot(
     decisionsStatus: () => decisions.status(),
     onDecisionsRecheck: () => decisions.recheck(),
     pushDebounceMs: 10,
-    ...overrides,
+    ...serverOverrides,
   });
   const http: HttpServer = createServer((req, res) => {
     if (board.requestHook(req, res, new URL(req.url ?? '/', 'http://localhost').pathname)) return;
@@ -88,6 +102,7 @@ async function boot(
     api,
     bus,
     board,
+    engine,
     async close() {
       decisions.dispose();
       await board.dispose();
@@ -143,6 +158,27 @@ class BoardClient {
     this.socket.close();
     return this.closed;
   }
+
+  terminate(): Promise<number> {
+    this.socket.terminate();
+    return this.closed;
+  }
+}
+
+/** Capture the actual server peer to assert auth callback containment synchronously:
+ * an escaped exception must fail an assertion, not strand ws's receiver teardown. */
+async function openBoardPeer(client: BoardClient): Promise<WebSocket> {
+  let peer: WebSocket | undefined;
+  const emit = WebSocketServer.prototype.emit;
+  const observer = vi.spyOn(WebSocketServer.prototype, 'emit').mockImplementation(function (this: WebSocketServer, event, ...args) {
+    if (event === 'connection') peer = args[0] as WebSocket;
+    return Reflect.apply(emit, this, [event, ...args]) as boolean;
+  });
+  try {
+    await client.open();
+    if (peer === undefined) throw new Error('board server peer was not connected');
+    return peer;
+  } finally { observer.mockRestore(); }
 }
 
 async function getJson(port: number, path: string, token: string | null): Promise<{ status: number; body: unknown }> {
@@ -177,6 +213,72 @@ describe('board server — HTTP API', () => {
     harness = await boot('board-test-token');
   });
 
+  it('G24 authenticated disposition succeeds and GET reads back durable ownership without changing job authority', async () => {
+    const isolated = await boot('disposition-token');
+    try {
+      isolated.api.addJob({ id: 'disposition-job', repo: 'r', title: 'waiting for owner' });
+      isolated.api.setJobStatus('disposition-job', 'blocked');
+      const initial = await getJson(isolated.port, '/api/mailbox', 'disposition-token');
+      const item = (initial.body as { items: { id: string; basis: string }[] }).items[0]!;
+      const decision = isolated.api.recordDecision({ subject: item.id, decision: 'hold', covers: ['blocked'], reason: 'owner must authorize continuation', by: 'owner' });
+      const input = { basis: item.basis, state: 'waiting', owner: 'owner', detail: 'do not restart', dependency: 'owner authorization', recheckAt: new Date(Date.now() + 60_000).toISOString(), references: [{ kind: 'decision', id: decision.id }] };
+      const notificationsBefore = isolated.api.listNotifications();
+      const written = await postJson(isolated.port, `/api/mailbox/${encodeURIComponent(item.id)}/disposition`, 'disposition-token', input);
+      expect(written.status).toBe(200);
+      expect(written.body).toMatchObject({ id: item.id, basis: item.basis, state: 'waiting', owner: 'owner', disposition: input, receipt: null });
+      const page = await getJson(isolated.port, '/api/mailbox', 'disposition-token');
+      expect(page.status).toBe(200);
+      expect((page.body as { items: unknown[] }).items).toEqual([written.body]);
+      const board = await getJson(isolated.port, '/api/board', 'disposition-token');
+      expect((board.body as { mailbox: { items: unknown[] } }).mailbox.items).toEqual([written.body]);
+      expect(isolated.api.getJob('disposition-job')?.status).toBe('blocked');
+      expect(isolated.api.listNotifications()).toEqual(notificationsBefore);
+    } finally { await isolated.close(); }
+  });
+
+  it('G09 malformed source evidence returns observable unavailability from /api/board', () => assertSourceUnavailable('/api/board'));
+  it('G09 malformed source evidence returns observable unavailability from /api/mailbox', () => assertSourceUnavailable('/api/mailbox'));
+  it('F03 malformed object fields make /api/board unavailable rather than clear', () => assertSourceUnavailable('/api/board', { pr_url: null, pr_open: 'true', mergeable_state: null, sha: null }));
+  it('F03 malformed object fields make /api/mailbox unavailable rather than clear', () => assertSourceUnavailable('/api/mailbox', { pr_url: null, pr_open: 'true', mergeable_state: null, sha: null }));
+  async function assertSourceUnavailable(path: string, payload: unknown = []): Promise<void> {
+    const isolated = await boot('malformed-token');
+    try {
+      isolated.api.addJob({ id: 'malformed-job', repo: 'r', title: 'malformed evidence' });
+      isolated.api.appendCustomEvent({ kind: 'github.branch-state', jobId: 'malformed-job', payload });
+      expect(() => isolated.engine.mailbox.snapshot()).toThrow(/malformed PR evidence/);
+      expect((await getJson(isolated.port, path, null)).status).toBe(401);
+      const result = await getJson(isolated.port, path, 'malformed-token');
+      expect(result.status).toBe(503);
+      expect(result.body).toMatchObject({ error: 'board_unavailable', detail: expect.stringContaining('malformed PR evidence') });
+      expect(result.body).not.toHaveProperty('mailbox');
+      const write = await postJson(isolated.port, '/api/mailbox/job%3Amalformed-job/disposition', 'malformed-token', {});
+      expect(write.status).toBe(503);
+      expect(write.body).toMatchObject({ error: 'board_unavailable' });
+      expect(isolated.api.getJob('malformed-job')?.status).toBe('dispatched');
+    } finally { await isolated.close(); }
+  }
+
+  it('GH-305 mailbox HTTP shares board identities, pages durably, and fences stale/invalid writes behind auth', async () => {
+    const isolated = await boot('mailbox-test-token');
+    try {
+      isolated.api.addJob({ id: 'mail-http', repo: 'r', title: 'mailbox HTTP' });
+      isolated.api.setJobStatus('mail-http', 'blocked');
+      expect((await getJson(isolated.port, '/api/mailbox', null)).status).toBe(401);
+      const page = await getJson(isolated.port, '/api/mailbox?limit=1', 'mailbox-test-token');
+      expect(page.status).toBe(200);
+      const item = (page.body as { items: { id: string; basis: string }[] }).items[0]!;
+      const board = await getJson(isolated.port, '/api/board', 'mailbox-test-token');
+      expect((board.body as { mailbox: { items: unknown[] } }).mailbox.items).toEqual((page.body as { items: unknown[] }).items);
+      expect((await getJson(isolated.port, '/api/mailbox?limit=0', 'mailbox-test-token')).status).toBe(400);
+      const path = `/api/mailbox/${encodeURIComponent(item.id)}/disposition`;
+      const input = { basis: 'stale', state: 'waiting', owner: 'owner', detail: 'needs owner ruling', references: [] };
+      expect((await postJson(isolated.port, path, null, input)).status).toBe(401);
+      expect((await postJson(isolated.port, path, 'mailbox-test-token', input)).status).toBe(409);
+      expect((await postJson(isolated.port, path, 'mailbox-test-token', { ...input, basis: item.basis })).status).toBe(400);
+      expect(isolated.api.getJob('mail-http')?.status).toBe('blocked');
+    } finally { await isolated.close(); }
+  });
+
   it('GET /api/board: 401 without token, 401 with a bad token, snapshot with a valid one', async () => {
     const anon = await getJson(harness.port, '/api/board', null);
     expect(anon.status).toBe(401);
@@ -188,6 +290,50 @@ describe('board server — HTTP API', () => {
     expect(ok.body).toHaveProperty('agents');
     expect(ok.body).toHaveProperty('notifications');
     expect(ok.body).toHaveProperty('decisions', expect.objectContaining({ status: 'disabled' }));
+    // Managed repository overview rides the same authenticated snapshot
+    // additively; unwired producers render null (the web hides the section).
+    expect(ok.body).toHaveProperty('repoOverview', null);
+  });
+
+  it('GET /api/board carries the additive repoOverview projection when wired', async () => {
+    const view: RepoOverviewView = {
+      rows: [
+        {
+          key: 'alpha',
+          displayName: 'alpha',
+          linked: true,
+          host: 'github.com',
+          link: 'https://github.com/acme/alpha',
+          linkReason: null,
+          fullName: 'acme/alpha',
+          openPrs: 2,
+          openIssues: 3,
+          run: {
+            state: 'passed',
+            status: 'completed',
+            conclusion: 'success',
+            workflow: 'CI',
+            branch: 'main',
+            runNumber: 4,
+            url: 'https://github.com/acme/alpha/actions/runs/4',
+            runCreatedAt: '2026-10-07T10:00:00.000Z',
+            runStartedAt: '2026-10-07T10:00:00.000Z',
+            runUpdatedAt: '2026-10-07T10:05:00.000Z',
+          },
+          freshness: 'fresh',
+          checkedAt: '2026-10-07T10:06:00.000Z',
+          lastAttemptAt: '2026-10-07T10:06:00.000Z',
+          error: null,
+        },
+      ],
+    };
+    const wired = await boot('board-test-token', { repoOverview: () => view });
+    try {
+      const body = (await getJson(wired.port, '/api/board', 'board-test-token')).body as { repoOverview: unknown };
+      expect(body.repoOverview).toEqual(view);
+    } finally {
+      await wired.close();
+    }
   });
 
   it('machine disposition is authenticated, requires an action detail, and never resolves an owner stop', async () => {
@@ -211,6 +357,30 @@ describe('board server — HTTP API', () => {
     ]);
   });
 
+  it('disposition audit records bearer provenance honestly and validates a declared actor (#99)', async () => {
+    const { api, port } = harness;
+    const mk = (id: string) => api.recordNotification({ id, kind: 'test', routing: 'action-required', severity: 'error', title: id });
+    const events = (id: string) => api.listEventsAfter(0, { kinds: ['notification.resolved'] }).filter((e) => (e.payload as { id?: string }).id === id);
+    const undeclared = mk('actor-undeclared');
+    await postJson(port, `/api/notifications/${undeclared.id}/disposition`, 'board-test-token', { detail: 'Handled' });
+    expect(events(undeclared.id)).toMatchObject([
+      { payload: { by: 'gru', credential: 'shared-bearer', declaredActor: null } },
+    ]);
+    const declared = mk('actor-declared');
+    await postJson(port, `/api/notifications/${declared.id}/disposition`, 'board-test-token', { detail: 'Handled', actor: 'gru' });
+    expect(events(declared.id)).toMatchObject([
+      { payload: { by: 'gru', credential: 'shared-bearer', declaredActor: 'gru' } },
+    ]);
+    // A caller declaring itself as something else cannot produce a Gru disposition.
+    const forged = mk('actor-forged');
+    for (const actor of ['owner', 'web', 5]) {
+      const refused = await postJson(port, `/api/notifications/${forged.id}/disposition`, 'board-test-token', { detail: 'x', actor });
+      expect(refused.status).toBe(400);
+    }
+    expect(api.getNotification(forged.id)?.resolvedAt).toBeNull();
+    expect(events(forged.id)).toEqual([]);
+  });
+
   it('validates authenticated Gru owner escalation and places it only in FOR YOU', async () => {
     const { api, port } = harness;
     const path = '/api/notifications/needs-owner';
@@ -227,6 +397,39 @@ describe('board server — HTTP API', () => {
     const row = created.body as { id: string };
     expect(api.getNotification(row.id)).toMatchObject({ detail: 'Approve external merge', shownAt: null });
     expect((await getJson(port, '/api/board', 'board-test-token')).body).toMatchObject({ unackedNeedsOwner: expect.any(Number) });
+  });
+
+  it('needs-owner escalation retries with the same idempotency key yield one row; distinct escalations stay distinct (#100)', async () => {
+    const { api, port } = harness;
+    const path = '/api/notifications/needs-owner';
+    const count = () => api.listNotifications({ limit: 500 }).filter((n) => n.kind === 'gru.owner-escalation').length;
+    const start = count();
+    const body = { title: 'Retry call', detail: 'Approve merge', idempotencyKey: 'esc-1' };
+    const first = await postJson(port, path, 'board-test-token', body);
+    const retry = await postJson(port, path, 'board-test-token', body);
+    expect(first.status).toBe(201);
+    expect(retry.status).toBe(200);
+    expect((retry.body as { id: string }).id).toBe((first.body as { id: string }).id);
+    expect(count()).toBe(start + 1);
+    // Same key, changed request: refused, the recorded one is never overwritten.
+    const changed = await postJson(port, path, 'board-test-token', { ...body, detail: 'Different decision' });
+    expect(changed.status).toBe(409);
+    expect(count()).toBe(start + 1);
+    // A different key is a genuinely new decision, even with identical text.
+    const other = await postJson(port, path, 'board-test-token', { ...body, idempotencyKey: 'esc-2' });
+    expect(other.status).toBe(201);
+    expect((other.body as { id: string }).id).not.toBe((first.body as { id: string }).id);
+    // No key: every valid request is its own row (unchanged behavior).
+    const a = await postJson(port, path, 'board-test-token', { title: 'No key', detail: 'same' });
+    const b = await postJson(port, path, 'board-test-token', { title: 'No key', detail: 'same' });
+    expect([a.status, b.status]).toEqual([201, 201]);
+    expect((a.body as { id: string }).id).not.toBe((b.body as { id: string }).id);
+    expect(count()).toBe(start + 4);
+    // Malformed keys fail loud.
+    for (const key of ['', 'has space', 'x'.repeat(129), 7]) {
+      expect((await postJson(port, path, 'board-test-token', { title: 't', detail: 'd', idempotencyKey: key })).status).toBe(400);
+    }
+    expect(count()).toBe(start + 4);
   });
 
   it('decision status and recheck are authenticated and return the durable disabled state', async () => {
@@ -272,6 +475,132 @@ describe('board server — HTTP API', () => {
     expect(snapshot.repos.find((r) => r.name === 'demo-repo')?.jobs.some((j) => j.id === 'api-job')).toBe(true);
   });
 
+  it('a binned discard is audited end-to-end; auth/malformed/illegal attempts never mutate', async () => {
+    const { api, port } = harness;
+    api.addJob({ id: 'audit-binned', repo: 'demo-repo', title: 'Audit the discard' });
+    const eventsBefore = api.listJobEvents('audit-binned').length;
+    // A caller-provided `by` is NOT authentication.
+    const unauth = await postJson(port, '/api/jobs/audit-binned/status', null, { status: 'binned', by: 'gru' });
+    expect(unauth.status).toBe(401);
+    expect(api.getJob('audit-binned')?.status).toBe('dispatched');
+    expect(api.listJobEvents('audit-binned').length).toBe(eventsBefore);
+
+    const malformed = await postJson(port, '/api/jobs/audit-binned/status', 'board-test-token', { status: 'discarded' });
+    expect(malformed.status).toBe(400);
+    expect(api.getJob('audit-binned')?.status).toBe('dispatched');
+    expect(api.listJobEvents('audit-binned').length).toBe(eventsBefore);
+
+    const legal = await postJson(port, '/api/jobs/audit-binned/status', 'board-test-token', { status: 'binned' });
+    expect(legal.status).toBe(200);
+    expect((legal.body as { status: string }).status).toBe('binned');
+    // The ordinary audit event preserves the truthful prior status.
+    expect(api.latestJobEvent('audit-binned', 'job.status')?.payload).toEqual({ from: 'dispatched', to: 'binned' });
+    // A repeated identical write is an idempotent 200 no-op (no event).
+    const rebinEvents = api.listJobEvents('audit-binned').length;
+    const rebin = await postJson(port, '/api/jobs/audit-binned/status', 'board-test-token', { status: 'binned' });
+    expect(rebin.status).toBe(200);
+    expect(api.listJobEvents('audit-binned').length).toBe(rebinEvents);
+
+    // Terminal: no resumption, and a closed merged lane refuses binning.
+    const resume = await postJson(port, '/api/jobs/audit-binned/status', 'board-test-token', { status: 'working' });
+    expect(resume.status).toBe(400);
+    expect((resume.body as { detail: string }).detail).toMatch(/illegal transition binned → working/u);
+    expect(api.getJob('audit-binned')?.status).toBe('binned');
+    api.addJob({ id: 'audit-merged', repo: 'demo-repo', title: 'Already merged' });
+    api.setJobStatus('audit-merged', 'working');
+    api.setJobStatus('audit-merged', 'in-review');
+    api.setJobStatus('audit-merged', 'merged');
+    const refuse = await postJson(port, '/api/jobs/audit-merged/status', 'board-test-token', { status: 'binned' });
+    expect(refuse.status).toBe(400);
+    expect((refuse.body as { detail: string }).detail).toMatch(/illegal transition merged → binned/u);
+    expect(api.getJob('audit-merged')?.status).toBe('merged');
+
+    // The board snapshot carries the discarded lane as a closed receipt.
+    const snapshot = (await getJson(port, '/api/board', 'board-test-token')).body as {
+      repos: { name: string; jobs: { id: string; status: string; prState: string | null }[] }[];
+    };
+    const row = snapshot.repos.flatMap((repo) => repo.jobs).find((job) => job.id === 'audit-binned');
+    expect(row?.status).toBe('binned');
+    expect(row?.prState).toBeNull();
+  });
+
+  it('Gru loaded action bins a named abandoned heist through auth with truthful history and no revival', async () => {
+    const { api, port } = harness;
+    const prompt = ROLE_DEFINITIONS.gru.systemPrompt;
+    expect(ROLE_DEFINITIONS.gru.tools).toContain('bash');
+    // This test reads the actual shipped Gru prompt, extracts its action,
+    // then executes that path against the real HTTP write surface (never a
+    // live instance). A status enum or operator-only manual cannot pass.
+    const action = prompt.match(/authenticated `POST (\/api\/jobs\/<job-id>\/status)` with JSON `(\{ "status": "binned" \})`/u);
+    expect(action, 'Gru must be taught the precise authenticated discard action').not.toBeNull();
+    if (action === null) return;
+    expect(prompt).toContain('Do not automatically bin');
+    expect(prompt).toContain('live worker');
+    const jobId = 'gru-bin-heist';
+    const path = action[1]!.replace('<job-id>', jobId);
+    const body = JSON.parse(action[2]!) as { status: string };
+    const liveId = 'gru-bin-live';
+    const livePath = action[1]!.replace('<job-id>', liveId);
+    api.addJob({ id: liveId, repo: 'demo-repo', title: 'Still running' });
+    api.setJobStatus(liveId, 'working');
+    api.registerAgent({ id: 'live-gru-worker', role: 'minion', jobId: liveId });
+    api.setAgentState('live-gru-worker', 'streaming');
+    const liveBefore = api.listJobEvents(liveId);
+    const refused = await postJson(port, livePath, 'board-test-token', body);
+    expect(refused.status).toBe(400);
+    expect((refused.body as { detail: string }).detail).toMatch(/live work|open worker/u);
+    expect(api.getJob(liveId)?.status).toBe('working');
+    expect(api.listJobEvents(liveId)).toEqual(liveBefore);
+    api.setAgentState('live-gru-worker', 'idle');
+    expect((await postJson(port, livePath, 'board-test-token', body)).status).toBe(200);
+
+    api.addJob({ id: jobId, repo: 'demo-repo', title: 'Discarded by Gru' });
+    api.setJobStatus(jobId, 'working');
+    api.setJobStatus(jobId, 'blocked');
+    const before = api.listJobEvents(jobId);
+    expect(api.listObligations({ jobId }).some((row) => row.state === 'open')).toBe(true);
+    expect((await postJson(port, path, null, body)).status).toBe(401);
+    expect(api.listJobEvents(jobId)).toEqual(before);
+    const accepted = await postJson(port, path, 'board-test-token', body);
+    expect(accepted.status).toBe(200);
+    expect(accepted.body).toMatchObject({ id: jobId, status: 'binned' });
+    const after = api.listJobEvents(jobId);
+    expect(after.slice(-before.length)).toEqual(before);
+    expect(after.filter((event) => event.kind === 'job.status' &&
+      (event.payload as { to?: string }).to === 'binned'))
+      .toHaveLength(1);
+    expect(api.latestJobEvent(jobId, 'job.status')?.payload).toEqual({ from: 'blocked', to: 'binned' });
+    expect(api.listObligations({ jobId }).every((row) => row.state === 'closed')).toBe(true);
+    expect(api.listObligations({ jobId }).some((row) =>
+      row.settlement?.kind === 'job-terminal' && row.settlement.jobStatus === 'binned')).toBe(true);
+    expect((await postJson(port, path, 'board-test-token', { status: 'working' })).status).toBe(400);
+    expect(api.getJob(jobId)?.status).toBe('binned');
+    expect(api.listJobEvents(jobId)).toEqual(after);
+  });
+
+  it('Gru bin refuses pending review and unsettled verification with no partial status or debt mutation', async () => {
+    const { api, port } = harness;
+    for (const [id, kind] of [
+      ['gru-bin-round', 'round'],
+      ['gru-bin-verify', 'verification'],
+    ] as const) {
+      api.addJob({ id, repo: 'demo-repo', title: 'Active producer' });
+      api.setJobStatus(id, 'working');
+      api.setJobStatus(id, 'blocked');
+      if (kind === 'round') api.addRound({ jobId: id });
+      else api.appendCustomEvent({ kind: 'verification.started', jobId: id, payload: { run_id: 'ongoing' } });
+      const beforeEvents = api.listJobEvents(id);
+      const beforeDebts = api.listObligations({ jobId: id });
+      const refusal = await postJson(port, `/api/jobs/${id}/status`, 'board-test-token', { status: 'binned' });
+      expect(refusal.status, kind).toBe(400);
+      expect((refusal.body as { detail: string }).detail, kind)
+        .toMatch(kind === 'round' ? /live review round/u : /unsettled verification/u);
+      expect(api.getJob(id)?.status).toBe('blocked');
+      expect(api.listJobEvents(id)).toEqual(beforeEvents);
+      expect(api.listObligations({ jobId: id })).toEqual(beforeDebts);
+    }
+  });
+
   it('closeout endpoint: auth, malformed bodies, missing jobs and guard refusals fail loud without changes', async () => {
     const { api, port } = harness;
     const head = '3c44e87e2e9e64cbc3301d7806540df6273438e6';
@@ -292,9 +621,6 @@ describe('board server — HTTP API', () => {
       { ...validBody, provider: { ...validBody.provider, head_sha: 'nope' } },
       { ...validBody, provider: { ...validBody.provider, closed_at: 'not-a-time' } },
       { ...validBody, provider: { ...validBody.provider, closed_at: '' } },
-      // Present-but-null is not "omitted": the typed contract accepts a
-      // real timestamp or an absent field, at BOTH boundaries.
-      { ...validBody, provider: { ...validBody.provider, closed_at: null } },
       { ...validBody, expected_pr_url: '' },
       { ...validBody, expected_pr_url: 'not-a-url' },
       { ...validBody, reason: '' },
@@ -458,228 +784,15 @@ describe('board server — HTTP API', () => {
     ).toBeNull();
   });
 
-  it('closeout endpoint passes the authoritative runtime probe: a ledger idle row with an open turn refuses', async () => {
-    const head = '3c44e87e2e9e64cbc3301d7806540df6273438e6';
-    const prUrl = 'https://github.com/acme/gru-command/pull/179';
-    const local = await boot('closeout-probe-token', {
-      closeoutRuntime: () => ({
-        liveHandleIds: new Set<string>(),
-        supervisionFor: (agentId: string) =>
-          agentId === 'closeout-probe-idle-open'
-            ? { state: 'watching', breakerOpen: false, openTurn: true, openControl: false, openToolCalls: 0 }
-            : null,
-      }),
-    });
-    try {
-      const jobId = 'closeout-probe';
-      local.api.addJob({ id: jobId, repo: 'demo-repo', title: 'Closeout probe lane' });
-      local.api.setJobStatus(jobId, 'working');
-      local.api.setJobPr(jobId, prUrl);
-      local.api.setJobStatus(jobId, 'in-review');
-      local.api.setJobStatus(jobId, 'parked');
-      local.api.appendCustomEvent({
-        kind: 'github.branch-state',
-        jobId,
-        payload: branchStatePayload(
-          { jobId, repo: { host: 'github.com', owner: 'acme', repo: 'gru-command' }, branch: `gru/${jobId}`, prNumber: 179, prUrl },
-          { sha: head, merged: false, prOpen: false, mergeableState: 'dirty', ci: null, prNumber: 179, prUrl, mergeCommitSha: null },
-        ),
-      });
-      local.api.registerAgent({ id: 'closeout-probe-idle-open', role: 'minion', jobId });
-      local.api.setAgentState('closeout-probe-idle-open', 'idle');
-      const refused = await postJson(local.port, `/api/jobs/${jobId}/closeout`, 'closeout-probe-token', {
-        expected_status: 'parked',
-        expected_pr_url: prUrl,
-        provider: { provider: 'github', state: 'closed', merged: false, head_sha: head },
-        reason: 'probe forwarding',
-      });
-      expect(refused.status).toBe(409);
-      expect(refused.body).toMatchObject({ error: 'closeout_refused', code: 'live-work' });
-      expect(local.api.getJob(jobId)?.status).toBe('parked');
-    } finally {
-      await local.close();
-    }
-  });
-
-  it('owner cancellation endpoint: auth, malformed bodies, unlisted refusals and the audited idempotent success', async () => {
-    const { api, port } = harness;
-    const listed = 'gc-freeze-heat-evidence';
-    const body = {
-      expected_status: 'parked',
-      authority_reference: 'j-1117 owner-close-seventeen-parked-20261006',
-      reason: 'owner asked to move these away from parked',
-    };
-    expect((await postJson(port, `/api/jobs/${listed}/owner-cancellation`, null, body)).status).toBe(401);
-    expect((await postJson(port, `/api/jobs/${listed}/owner-cancellation`, 'wrong-token', body)).status).toBe(401);
-    for (const bad of [
-      {},
-      { ...body, expected_status: 'working' },
-      { ...body, authority_reference: '' },
-      { ...body, reason: '' },
-    ]) {
-      const response = await postJson(port, `/api/jobs/${listed}/owner-cancellation`, 'board-test-token', bad);
-      expect(response.status, JSON.stringify(bad)).toBe(400);
-    }
-    const nullBody = await postJson(port, `/api/jobs/${listed}/owner-cancellation`, 'board-test-token', null);
-    expect(nullBody.status).toBe(400);
-    expect((await postJson(port, '/api/jobs/ghost/owner-cancellation', 'board-test-token', body)).status).toBe(404);
-
-    // An unlisted parked job is refused with the typed code and no effect.
-    api.addJob({ id: 'unlisted-cancel', repo: 'demo-repo', title: 'Unlisted' });
-    api.setJobStatus('unlisted-cancel', 'working');
-    api.setJobStatus('unlisted-cancel', 'parked');
-    const unlisted = await postJson(port, '/api/jobs/unlisted-cancel/owner-cancellation', 'board-test-token', body);
-    expect(unlisted.status).toBe(409);
-    expect(unlisted.body).toMatchObject({ error: 'cancellation_refused', code: 'not-listed' });
-    expect(api.getJob('unlisted-cancel')?.status).toBe('parked');
-
-    // A listed parked legacy lane cancels in one audited, idempotent hop.
-    api.addJob({ id: listed, repo: 'demo-repo', title: 'Listed legacy lane' });
-    api.setJobStatus(listed, 'working');
-    api.setJobStatus(listed, 'parked');
-    const accepted = await postJson(port, `/api/jobs/${listed}/owner-cancellation`, 'board-test-token', body);
-    expect(accepted.status).toBe(200);
-    const acceptedBody = accepted.body as { job: { status: string }; event: { kind: string; seq: number }; idempotent: boolean };
-    expect(acceptedBody.job.status).toBe('done');
-    expect(acceptedBody.event.kind).toBe('job.owner-cancellation');
-    expect(acceptedBody.idempotent).toBe(false);
-    const replay = await postJson(port, `/api/jobs/${listed}/owner-cancellation`, 'board-test-token', body);
-    expect(replay.status).toBe(200);
-    expect(replay.body).toMatchObject({ idempotent: true, event: { seq: acceptedBody.event.seq }, job: { status: 'done' } });
-    const settled = await postJson(port, `/api/jobs/${listed}/owner-cancellation`, 'board-test-token', { ...body, reason: 'a different reason' });
-    expect(settled.status).toBe(409);
-    expect(settled.body).toMatchObject({ error: 'cancellation_refused', code: 'already-closed' });
-    const snapshot = (await getJson(port, '/api/board', 'board-test-token')).body as {
-      repos: { jobs: { id: string; status: string; prState: string | null }[] }[];
-    };
-    const job = snapshot.repos.flatMap((repo) => repo.jobs).find((candidate) => candidate.id === listed);
-    expect(job).toMatchObject({ status: 'done', prState: null });
-  });
-
-  it('owner cancellation endpoint passes the authoritative runtime probe: a ledger idle row with an open turn refuses', async () => {
-    const local = await boot('cancel-probe-token', {
-      closeoutRuntime: () => ({
-        liveHandleIds: new Set<string>(),
-        supervisionFor: (agentId: string) =>
-          agentId === 'probe-idle-open'
-            ? { state: 'watching', breakerOpen: false, openTurn: true, openControl: false, openToolCalls: 0 }
-            : null,
-      }),
-    });
-    try {
-      const listed = 'silas-context-rotation';
-      local.api.addJob({ id: listed, repo: 'demo-repo', title: 'Probe lane' });
-      local.api.setJobStatus(listed, 'working');
-      local.api.setJobStatus(listed, 'parked');
-      local.api.registerAgent({ id: 'probe-idle-open', role: 'minion', jobId: listed });
-      local.api.setAgentState('probe-idle-open', 'idle');
-      const refused = await postJson(local.port, `/api/jobs/${listed}/owner-cancellation`, 'cancel-probe-token', {
-        expected_status: 'parked',
-        authority_reference: 'j-1117 owner-close-seventeen-parked-20261006',
-        reason: 'owner asked',
-      });
-      expect(refused.status).toBe(409);
-      expect(refused.body).toMatchObject({ error: 'cancellation_refused', code: 'live-work' });
-      expect(local.api.getJob(listed)?.status).toBe('parked');
-    } finally {
-      await local.close();
-    }
-  });
-
-  /** Strip line and block comments with the TypeScript scanner (never a
-   * regex over raw text), keeping the newlines so line anchors stay
-   * meaningful. A commented-out wiring must not satisfy the assembly
-   * alarm below. */
-  function stripSourceComments(text: string): string {
-    const scanner = createScanner(ScriptTarget.Latest, false, undefined, text);
-    let out = '';
-    let last = 0;
-    for (let kind = scanner.scan(); kind !== SyntaxKind.EndOfFileToken; kind = scanner.scan()) {
-      if (kind === SyntaxKind.SingleLineCommentTrivia || kind === SyntaxKind.MultiLineCommentTrivia) {
-        out += text.slice(last, scanner.getTokenPos());
-        out += text.slice(scanner.getTokenPos(), scanner.getTextPos()).replace(/[^\n]/gu, ' ');
-        last = scanner.getTextPos();
-      }
-    }
-    out += text.slice(last);
-    return out;
-  }
-
-  /** Findings from the closeoutRuntime assembly alarm for one source
-   * text: an empty list means the wiring is present, active and correctly
-   * mapped. Exposed for the synthetic-fixture test below so a revert of
-   * the comment-stripping/scoping hardening goes red. */
-  function closeoutWiringFindings(source: string): string[] {
-    const stripped = stripSourceComments(source);
-    const findings: string[] = [];
-    const wiringLines = stripped.split('\n').filter((line) => /^\s*closeoutRuntime:/.test(line));
-    if (wiringLines.length !== 1) findings.push(`wiring count ${String(wiringLines.length)}`);
-    if (wiringLines.length === 1 && !/^\s*closeoutRuntime:\s*\(\)\s*=>\s*\(\{/u.test(wiringLines[0]!)) {
-      findings.push('wiring shape');
-    }
-    const start = stripped.search(/^\s*closeoutRuntime:/mu);
-    const block = start < 0 ? '' : stripped.slice(start, start + 1_500);
-    const expressions: readonly (readonly [string, RegExp])[] = [
-      ['liveHandleIds', /^\s*liveHandleIds:\s*new Set\(registry\.listHandles\(\)\.map\(\(handle\) => handle\.id\)\),/mu],
-      ['supervisionFor', /^\s*supervisionFor:\s*\(agentId\)\s*=>\s*\{/mu],
-      ['viewFor', /^\s*const view = supervisorLive\.viewFor\(agentId\);/mu],
-      ['state', /^\s*state:\s*view\.state,/mu],
-      ['breakerOpen', /^\s*breakerOpen:\s*view\.breakerOpen,/mu],
-      ['openTurn', /^\s*openTurn:\s*view\.openTurn,/mu],
-      ['openControl', /^\s*openControl:\s*view\.openControl,/mu],
-      ['openToolCalls', /^\s*openToolCalls:\s*view\.openToolCalls,/mu],
-    ];
-    for (const [label, expression] of expressions) {
-      if (!expression.test(block)) findings.push(`mapping ${label}`);
-    }
-    return findings;
-  }
-
-  it('the main assembly wires the authoritative closeout runtime probe (assembly alarm)', () => {
-    // The behavior has unit coverage but the production composition does
-    // not: dropping this wiring — or wiring a falsified constant instead
-    // of the live view value — would silently fall back to durable markers
-    // only and no behavioral test would fail (same alarm pattern as the
-    // supervisor-stop wiring pin). The alarm strips comments and scopes
-    // the match to the property's block; the synthetic fixtures below keep
-    // that hardening from regressing.
-    const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
-    expect(closeoutWiringFindings(mainSource)).toEqual([]);
-  });
-
-  it('the assembly alarm rejects commented, decoy, removed and falsified wiring (synthetic fixtures)', () => {
-    const goodWiring = [
-      'const x = createBoardServer({',
-      '  closeoutRuntime: () => ({',
-      '    liveHandleIds: new Set(registry.listHandles().map((handle) => handle.id)),',
-      '    supervisionFor: (agentId) => {',
-      '      const view = supervisorLive.viewFor(agentId);',
-      '      return view === null ? null : {',
-      '        state: view.state,',
-      '        breakerOpen: view.breakerOpen,',
-      '        openTurn: view.openTurn,',
-      '        openControl: view.openControl,',
-      '        openToolCalls: view.openToolCalls,',
-      '      };',
-      '    },',
-      '  }),',
-      '});',
-    ].join('\n');
-    expect(closeoutWiringFindings(goodWiring)).toEqual([]);
-    const lines = goodWiring.split('\n');
-    const propertyLines = lines.map((line, index) => (index >= 1 && index <= 13 ? `// ${line}` : line)).join('\n');
-    expect(closeoutWiringFindings(propertyLines), '//-commented wiring').not.toEqual([]);
-    const wrappedLines = [...lines.slice(0, 1), '/*', ...lines.slice(1, 14), '*/', ...lines.slice(14)].join('\n');
-    expect(closeoutWiringFindings(wrappedLines), 'block-commented wiring').not.toEqual([]);
-    const removed = lines.filter((_line, index) => index < 1 || index > 13).join('\n');
-    expect(closeoutWiringFindings(removed), 'removed wiring').not.toEqual([]);
-    const decoy = `${goodWiring}\n  closeoutRuntime: () => ({ liveHandleIds: new Set(), supervisionFor: () => null }),`;
-    expect(closeoutWiringFindings(decoy), 'second closeoutRuntime property').toContain('wiring count 2');
-    const withoutViewFor = lines.filter((_line, index) => index !== 4).join('\n');
-    const unscopedDecoy = `const view = supervisorLive.viewFor(agentId);\n${withoutViewFor}`;
-    expect(closeoutWiringFindings(unscopedDecoy), 'decoy viewFor outside the block').not.toEqual([]);
-    const falsified = lines.map((line) => line.replace('openTurn: view.openTurn,', 'openTurn: false,')).join('\n');
-    expect(closeoutWiringFindings(falsified), 'falsified constant').toContain('mapping openTurn');
+  it('authenticated round creation refuses binned jobs without creating an event', async () => {
+    const jobId = 'binned-round-http';
+    harness.api.addJob({ id: jobId, repo: 'demo-repo', title: 'Discarded review' });
+    harness.api.setJobStatus(jobId, 'binned');
+    const before = harness.api.listJobEvents(jobId);
+    const refused = await postJson(harness.port, '/api/rounds', 'board-test-token', { jobId });
+    expect(refused.status).toBe(400);
+    expect(harness.api.listRounds(jobId)).toEqual([]);
+    expect(harness.api.listJobEvents(jobId)).toEqual(before);
   });
 
   it('write endpoints reject bad bodies and missing entities', async () => {
@@ -779,6 +892,78 @@ describe('board server — WS push', () => {
     harness = await boot('ws-board-token');
   });
 
+  it('G09 contains malformed evidence during auth snapshot push', () => assertSnapshotUnavailable('auth'));
+  it('G09 contains malformed evidence during event snapshot push', () => assertSnapshotUnavailable('event'));
+  it('F03 object-shaped malformed evidence is contained during auth snapshot push', () => assertSnapshotUnavailable('auth', { pr_url: null, pr_open: 'true', mergeable_state: null, sha: null }));
+  it('F03 object-shaped malformed evidence is contained during event snapshot push', () => assertSnapshotUnavailable('event', { pr_url: null, pr_open: 'true', mergeable_state: null, sha: null }));
+  async function assertSnapshotUnavailable(boundary: 'auth' | 'event', payload: unknown = []): Promise<void> {
+    const isolated = await boot('malformed-ws-token', { heartbeatMs: 0 });
+    const client = new BoardClient(isolated.port);
+    try {
+      const addJob = () => isolated.api.addJob({ id: 'malformed-ws-job', repo: 'r', title: 'invalid evidence' });
+      const corrupt = () => isolated.api.appendCustomEvent({ kind: 'github.branch-state', jobId: 'malformed-ws-job', payload });
+      const peer = await openBoardPeer(client);
+      if (boundary === 'auth') {
+        addJob(); corrupt();
+        expect(() => peer.emit('message', Buffer.from(JSON.stringify({ type: 'auth', token: 'malformed-ws-token' })))).not.toThrow();
+      } else {
+        client.send({ type: 'auth', token: 'malformed-ws-token' });
+        await client.waitFor((frame) => frame.type === 'board', 'initial valid snapshot');
+        addJob();
+        await client.waitFor(() => client.frames.some((frame) => frame.type === 'board' &&
+          (frame.snapshot as { repos: { jobs: { id: string }[] }[] }).repos.some((repo) => repo.jobs.some((job) => job.id === 'malformed-ws-job'))), 'job source push');
+        corrupt();
+      }
+      const previousBoards = client.frames.filter((frame) => frame.type === 'board').length;
+      await client.waitFor((frame) => frame.type === 'error', 'unavailable snapshot').catch(() => {});
+      expect(client.frames.find((frame) => frame.type === 'error')).toMatchObject({ type: 'error', fatal: false, message: expect.stringContaining('board unavailable') });
+      expect(client.frames.filter((frame) => frame.type === 'board')).toHaveLength(previousBoards);
+      expect(await client.closed).toBe(1011);
+      expect(() => isolated.engine.mailbox.snapshot()).toThrow(/malformed PR evidence/);
+      expect((await getJson(isolated.port, '/api/board', 'malformed-ws-token')).status).toBe(503);
+      const prUrl = 'https://github.com/org/repo/pull/305';
+      isolated.api.setJobPr('malformed-ws-job', prUrl);
+      isolated.api.appendCustomEvent({ kind: 'github.branch-state', jobId: 'malformed-ws-job', payload: branchStatePayload(
+        { jobId: 'malformed-ws-job', repo: { host: 'github.com', owner: 'org', repo: 'repo' }, branch: 'mailbox', prNumber: 305, prUrl },
+        { sha: 'recovered-head', merged: false, prNumber: 305, prUrl, prOpen: true, mergeableState: 'dirty', mergeCommitSha: null, ci: null },
+      ) });
+      const recovered = new BoardClient(isolated.port);
+      try {
+        await recovered.open();
+        recovered.send({ type: 'auth', token: 'malformed-ws-token' });
+        await recovered.waitFor((frame) => frame.type === 'board', 'same-token recovered snapshot');
+        const frame = recovered.frames.find((frame) => frame.type === 'board')!;
+        expect(frame.snapshot).toMatchObject({ mailbox: { counts: { threads: 1, needsGru: 1 }, items: [{ jobId: 'malformed-ws-job', state: 'needs-gru' }] } });
+        expect(recovered.frames.some((frame) => frame.type === 'error')).toBe(false);
+        expect((await getJson(isolated.port, '/api/board', 'malformed-ws-token')).status).toBe(200);
+      } finally { await recovered.close(); }
+    } finally { await client.terminate(); await isolated.close(); }
+  }
+
+  it('G09 contains unexpected runtime snapshot errors at auth without fabricating board data', async () => {
+    const isolated = await boot('runtime-ws-token', { heartbeatMs: 0 });
+    const client = new BoardClient(isolated.port);
+    const snapshot = vi.spyOn(isolated.engine, 'snapshot').mockImplementation(() => { throw new Error('snapshot source unavailable'); });
+    try {
+      const peer = await openBoardPeer(client);
+      expect(() => peer.emit('message', Buffer.from(JSON.stringify({ type: 'auth', token: 'runtime-ws-token' })))).not.toThrow();
+      await client.waitFor((frame) => frame.type === 'error', 'runtime error').catch(() => {});
+      expect(client.frames.find((frame) => frame.type === 'error')).toMatchObject({ fatal: false, message: expect.stringContaining('snapshot source unavailable') });
+      expect(client.frames.some((frame) => frame.type === 'board')).toBe(false);
+      expect(await client.closed).toBe(1011);
+      expect((await getJson(isolated.port, '/api/board', 'runtime-ws-token')).status).toBe(503);
+      snapshot.mockRestore();
+      const recovered = new BoardClient(isolated.port);
+      try {
+        await recovered.open();
+        recovered.send({ type: 'auth', token: 'runtime-ws-token' });
+        await recovered.waitFor((frame) => frame.type === 'board', 'runtime recovery with same token');
+        expect(recovered.frames.some((frame) => frame.type === 'error')).toBe(false);
+        expect((await getJson(isolated.port, '/api/board', 'runtime-ws-token')).status).toBe(200);
+      } finally { await recovered.close(); }
+    } finally { snapshot.mockRestore(); await client.terminate(); await isolated.close(); }
+  });
+
   it('auth → auth_ok → immediate snapshot; changes push fresh snapshots', async () => {
     const client = new BoardClient(harness.port);
     await client.open();
@@ -794,6 +979,37 @@ describe('board server — WS push', () => {
       .at(-1) as unknown as { snapshot: { repos: { jobs: { id: string }[] }[] } };
     expect(last.snapshot.repos.some((r) => r.jobs.some((j) => j.id === 'push-job'))).toBe(true);
     await client.close();
+  });
+
+  it('a refreshed incident detail reaches a connected board at once — same id, first failure kept, no heartbeat needed', async () => {
+    const quiet = await boot('ws-refresh-token', { heartbeatMs: 0 });
+    try {
+      const notifications = new NotificationCenter({ ledger: quiet.api, bus: quiet.bus });
+      const times = ['2026-10-07T09:00:00.000Z', '2026-10-07T21:00:00.000Z'];
+      let tick = 0;
+      const hooks = dreamFailureIncidents(notifications, 'REPAIR', () => new Date(times[tick++]!));
+      hooks.onFailure(new Error('first outage'));
+      const client = new BoardClient(quiet.port);
+      await client.open();
+      client.send({ type: 'auth', token: 'ws-refresh-token' });
+      await client.waitFor((f) => f.type === 'board', 'initial snapshot');
+      type Row = { id: string; kind: string; detail: string | null };
+      const incident = (frame: { type: string }): Row | undefined =>
+        frame.type === 'board'
+          ? (frame as unknown as { snapshot: { notifications: Row[] } }).snapshot.notifications.find((row) => row.kind === DREAM_FAILED_KIND)
+          : undefined;
+      const initial = incident(client.frames.filter((f) => f.type === 'board').at(-1)!)!;
+      expect(initial.detail).toContain('failed pass 1');
+      hooks.onFailure(new Error('second outage'));
+      await client.waitFor((f) => (incident(f)?.detail ?? '').includes('failed pass 2'), 'refreshed incident detail');
+      const refreshed = client.frames.map(incident).filter((row): row is Row => row !== undefined).at(-1)!;
+      expect(refreshed.id).toBe(initial.id);
+      expect(refreshed.detail).toContain(`First failure (${times[0]}): Error: first outage`);
+      expect(refreshed.detail).toContain(`Latest failure (${times[1]}, failed pass 2): Error: second outage`);
+      await client.close();
+    } finally {
+      await quiet.close();
+    }
   });
 
   it('a bad token is a fatal error + close; a non-auth first frame likewise', async () => {
@@ -934,6 +1150,32 @@ describe('board server — empty token config locks every door', () => {
       // Unknown id → 404.
       const missing = await postJson(port, '/api/notifications/nope/ack', 'ack-token', { by: 'web' });
       expect(missing.status).toBe(404);
+      // A Book of Lessons proposal closes only through Accept/Reject (owner
+      // decision 2026-10-07): a plain ack is refused and fires no hook.
+      const proposal = notifications.post({
+        kind: 'lessons.proposal',
+        routing: 'fyi',
+        severity: 'info',
+        title: 'Book of Lessons: 1 lesson change proposed',
+      });
+      expect(proposal.routing).toBe('needs-owner');
+      const refused = await postJson(port, `/api/notifications/${proposal.id}/ack`, 'ack-token', { by: 'web' });
+      expect(refused.status).toBe(409);
+      expect(refused.body).toMatchObject({ error: 'decision_required' });
+      expect(api.getNotification(proposal.id)).toMatchObject({ ackedAt: null, resolvedAt: null });
+      expect(acked).toEqual([row.id]);
+      // A failing dream's incident closes only on a completed pass (owner
+      // decision 2026-10-08): Gru's disposition is refused, the row stays open.
+      const dreamFailed = notifications.post({
+        kind: 'lessons.dream-failed',
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Lesson dream is failing — the Book of Lessons is not being updated',
+      });
+      const disposed = await postJson(port, `/api/notifications/${dreamFailed.id}/disposition`, 'ack-token', { detail: 'opened a repair lane' });
+      expect(disposed.status).toBe(409);
+      expect(disposed.body).toMatchObject({ error: 'producer_resolved', detail: expect.stringContaining('a completed dream pass') });
+      expect(api.getNotification(dreamFailed.id)).toMatchObject({ resolvedAt: null, ackedAt: null });
     } finally {
       await board.dispose();
       await new Promise<void>((resolveClose) => {
@@ -992,6 +1234,190 @@ describe('board server — empty token config locks every door', () => {
     } finally {
       await harness.close();
     }
+  });
+});
+
+describe('board server — report-handback decision signals (issue #314)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2029-12-31T23:59:59.000Z'));
+  });
+  afterEach(() => { vi.useRealTimers(); });
+
+  function publishReport(harness: Awaited<ReturnType<typeof boot>>, jobId: string): string {
+    harness.api.addJob({ id: jobId, repo: 'r', title: 'Review report', deliverable: 'review', commissioner: 'gru' });
+    harness.api.setJobStatus(jobId, 'working');
+    harness.api.setJobStatus(jobId, 'delivered');
+    harness.api.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: 'reviewed-head' } });
+    const result = reconcileReportClosures({
+      ledger: harness.api,
+      notifications: new NotificationCenter({ ledger: harness.api, bus: harness.bus }),
+    });
+    expect(result).toMatchObject({ opened: 1, published: 1, failed: 0 });
+    return harness.api.findNotificationByKind(`silas.report-handback.${jobId}`, 'active')!.id;
+  }
+
+  async function reportItem(harness: Awaited<ReturnType<typeof boot>>, notificationId: string): Promise<MailboxItem> {
+    const page = await getJson(harness.port, '/api/mailbox', 'report-signal-token');
+    expect(page.status).toBe(200);
+    const item = (page.body as { items: MailboxItem[] }).items.find((row) => row.notificationIds.includes(notificationId));
+    expect(item).toBeDefined();
+    return item!;
+  }
+
+  function holdInput(item: MailboxItem) {
+    return { subject: item.subject, decision: 'hold', covers: item.reasons.map((reason) => reason.signal),
+      basis_fingerprint: item.basis, reason: 'Await the correlated report disposition', by: 'gru',
+      recheck_at: '2030-01-01T00:00:00.000Z', client_key: `hold-${item.id}` };
+  }
+
+  async function roundTrip(jobId: string): Promise<void> {
+    const harness = await boot('report-signal-token');
+    try {
+      const notificationId = publishReport(harness, jobId);
+      const item = await reportItem(harness, notificationId);
+      const signal = `report-handback.${jobId}`;
+      expect(item.reasons.map((reason) => reason.signal)).toEqual([signal]);
+      expect(item.state).toBe('needs-gru');
+      const input = holdInput(item);
+      expect((await postJson(harness.port, '/api/decisions', null, input)).status).toBe(401);
+      expect((await postJson(harness.port, '/api/decisions', 'wrong-token', input)).status).toBe(401);
+      expect(harness.api.listDecisions()).toHaveLength(0);
+      const written = await postJson(harness.port, '/api/decisions', 'report-signal-token', input);
+      expect(written.status).toBe(201);
+      const decision = written.body as DecisionRecord;
+      expect(decision).toMatchObject({ subject: item.subject, covers: [signal], basisFingerprint: item.basis });
+      const retry = await postJson(harness.port, '/api/decisions', 'report-signal-token', input);
+      expect(retry.body).toEqual(decision);
+      const listed = await getJson(harness.port, `/api/decisions?subject=${encodeURIComponent(item.subject)}`, 'report-signal-token');
+      expect(listed.body).toMatchObject({ decisions: [decision] });
+      const query = { subject: item.subject, signal, basis: item.basis, now: '2029-12-31T23:59:59.000Z' };
+      expect(harness.api.coveringDecision(query)?.id).toBe(decision.id);
+      expect(harness.api.coveringDecision({ ...query, basis: 'changed-basis' })).toBeNull();
+      expect(harness.api.coveringDecision({ ...query, now: input.recheck_at })).toBeNull();
+      const disposition = await postJson(harness.port, `/api/mailbox/${encodeURIComponent(item.id)}/disposition`, 'report-signal-token', {
+        basis: item.basis, state: 'waiting', owner: 'owner', detail: 'Hold on this exact report',
+        dependency: 'owner authorization for report disposition', recheckAt: input.recheck_at,
+        references: [{ kind: 'decision', id: decision.id }],
+      });
+      expect(disposition.status).toBe(200);
+      expect(await reportItem(harness, notificationId)).toMatchObject({ basis: item.basis, state: 'waiting' });
+      expect(harness.api.reconcileMailbox(input.recheck_at).find((row) => row.id === item.id)?.state).toBe('needs-gru');
+      // New source evidence invalidates the exact-basis disposition, not its durable history.
+      harness.api.updateNotificationDetail(notificationId, 'Changed report evidence');
+      const changed = await reportItem(harness, notificationId);
+      expect(changed.basis).not.toBe(item.basis);
+      expect(changed.state).toBe('needs-gru');
+      expect(harness.api.coveringDecision({ ...query, basis: changed.basis })).toBeNull();
+      expect(harness.api.getJob(jobId)?.status).toBe('delivered');
+      expect(harness.api.findReportObligation(jobId)?.state).toBe('open');
+    } finally { await harness.close(); }
+  }
+
+  it('round-trips the 59-character reported fixture through the authenticated API', () => roundTrip(`review-${'a'.repeat(52)}`));
+  it('round-trips the 128-character job boundary through the authenticated API', () => roundTrip(`review-${'a'.repeat(120)}a`));
+  it('round-trips the case-sensitive and punctuation job boundary through the authenticated API', () => roundTrip(`Review-${'a'.repeat(117)}A._9`));
+  it('round-trips the existing short signal through the authenticated API', () => roundTrip('review-old'));
+
+  async function sharedPrefix(suffix: string): Promise<void> {
+    const harness = await boot('report-signal-token');
+    try {
+      const prefix = `review-${'a'.repeat(120)}`;
+      const firstNotice = publishReport(harness, `${prefix}a`);
+      const secondNotice = publishReport(harness, `${prefix}${suffix}`);
+      const first = await reportItem(harness, firstNotice);
+      const second = await reportItem(harness, secondNotice);
+      expect(first.subject).not.toBe(second.subject);
+      expect(first.reasons[0]!.signal).not.toBe(second.reasons[0]!.signal);
+      const written = await postJson(harness.port, '/api/decisions', 'report-signal-token', holdInput(first));
+      expect(written.status).toBe(201);
+      const decision = written.body as DecisionRecord;
+      const query = { subject: first.subject, signal: first.reasons[0]!.signal, basis: first.basis };
+      expect(harness.api.coveringDecision(query)?.id).toBe(decision.id);
+      expect(harness.api.coveringDecision({ ...query, subject: second.subject })).toBeNull();
+      expect(harness.api.coveringDecision({ ...query, signal: second.reasons[0]!.signal })).toBeNull();
+      expect(harness.api.coveringDecision({ subject: second.subject, signal: second.reasons[0]!.signal, basis: second.basis })).toBeNull();
+      expect((await reportItem(harness, secondNotice)).state).toBe('needs-gru');
+    } finally { await harness.close(); }
+  }
+
+  it('keeps long shared-prefix identities independent', () => sharedPrefix('b'));
+  it('keeps case-distinct shared-prefix identities independent', () => sharedPrefix('A'));
+
+  it('clearing a long mixed-case decision preserves history and reopens its waiting mailbox item', async () => {
+    const harness = await boot('report-signal-token');
+    try {
+      const jobId = `Review-${'A'.repeat(121)}`;
+      const notificationId = publishReport(harness, jobId);
+      const item = await reportItem(harness, notificationId);
+      const input = holdInput(item);
+      const written = await postJson(harness.port, '/api/decisions', 'report-signal-token', input);
+      expect(written.status).toBe(201);
+      const decision = written.body as DecisionRecord;
+      const disposition = await postJson(harness.port, `/api/mailbox/${encodeURIComponent(item.id)}/disposition`, 'report-signal-token', {
+        basis: item.basis, state: 'waiting', owner: 'owner', detail: 'Await owner authorization',
+        dependency: 'owner authorization for report disposition', recheckAt: input.recheck_at,
+        references: [{ kind: 'decision', id: decision.id }],
+      });
+      expect(disposition.status).toBe(200);
+      expect((await reportItem(harness, notificationId)).state).toBe('waiting');
+      const clear = await postJson(harness.port, `/api/decisions/${decision.id}/clear`, 'report-signal-token', { by: 'owner', reason: 'Authorization granted' });
+      expect(clear.status).toBe(200);
+      expect(harness.api.getDecision(decision.id)).toMatchObject({ subject: item.subject, covers: decision.covers,
+        basisFingerprint: item.basis, clearedAt: '2029-12-31T23:59:59.000Z', clearedBy: 'owner' });
+      expect(harness.api.coveringDecision({ subject: item.subject, signal: decision.covers[0]!, basis: item.basis })).toBeNull();
+      expect(await reportItem(harness, notificationId)).toMatchObject({ basis: item.basis, state: 'needs-gru' });
+      expect(harness.api.getJob(jobId)?.status).toBe('delivered');
+    } finally { await harness.close(); }
+  });
+
+  async function rejectAttentionOnlyReportClosure(decisionKind: 'acted' | 'dismissed'): Promise<void> {
+    const harness = await boot('report-signal-token');
+    try {
+      const jobId = `Review-${'A'.repeat(121)}`;
+      const notificationId = publishReport(harness, jobId);
+      const item = await reportItem(harness, notificationId);
+      const written = await postJson(harness.port, '/api/decisions', 'report-signal-token', { ...holdInput(item), decision: decisionKind });
+      expect(written.status).toBe(201);
+      const decision = written.body as DecisionRecord;
+      expect(decision.covers).toEqual([`report-handback.${jobId}`]);
+      const resolved = await postJson(harness.port, `/api/mailbox/${encodeURIComponent(item.id)}/disposition`, 'report-signal-token', {
+        basis: item.basis, state: 'resolved', owner: 'gru', detail: 'Exact report attention accounted',
+        references: [{ kind: 'decision', id: decision.id }],
+      });
+      // GH-313 made this item producer-owned custody: a valid long-key
+      // decision is readable coverage, never proof that the report settled.
+      expect(resolved.status).toBe(409);
+      expect(resolved.body).toMatchObject({ error: 'mailbox_conflict', detail: expect.stringContaining('producer-owned') });
+      expect(await reportItem(harness, notificationId)).toMatchObject({ basis: item.basis, state: 'needs-gru', producerOwned: true });
+      expect(harness.api.coveringDecision({ subject: item.subject, signal: decision.covers[0]!, basis: item.basis })?.id).toBe(decision.id);
+      expect(harness.api.getDecision(decision.id)).toEqual(decision);
+      expect(harness.api.getNotification(notificationId)).toMatchObject({ ackedAt: null, resolvedAt: null });
+      expect(harness.api.getJob(jobId)?.status).toBe('delivered');
+      expect(harness.api.findReportObligation(jobId)).toMatchObject({ state: 'open', settlement: null });
+    } finally { await harness.close(); }
+  }
+
+  it('an acted long mixed-case decision cannot close producer-owned report custody', () => rejectAttentionOnlyReportClosure('acted'));
+  it('a dismissed long mixed-case decision cannot close producer-owned report custody', () => rejectAttentionOnlyReportClosure('dismissed'));
+
+  it('rejects malformed and oversized signals without persisting a decision', async () => {
+    const harness = await boot('report-signal-token');
+    try {
+      const item = await reportItem(harness, publishReport(harness, 'review-validation'));
+      for (const signal of ['', 'a'.repeat(65), `report-handback.${'a'.repeat(129)}`, 'Report-handback.valid',
+        `report-handback._${'a'.repeat(100)}`, `report-handback..${'a'.repeat(100)}`, 'report-handback.Unsafe/Path',
+        'report-handback.unsafe id', 'report-handback.bad\nvalue', 'report-handback.bad\n', 'report-handback.é', 'PR-CONFLICT']) {
+        const rejected = await postJson(harness.port, '/api/decisions', 'report-signal-token', { ...holdInput(item), covers: [signal] });
+        expect(rejected.status, signal).toBe(400);
+        expect(rejected.body).toMatchObject({ error: 'bad_request', detail: expect.stringContaining('decision signal') });
+        if (signal === 'report-handback.Unsafe/Path') {
+          expect(rejected.body).toMatchObject({ detail: expect.stringContaining('suffix must be a safe job id') });
+        }
+      }
+      expect(harness.api.listDecisions()).toHaveLength(0);
+      expect((await reportItem(harness, item.notificationIds[0]!)).state).toBe('needs-gru');
+    } finally { await harness.close(); }
   });
 });
 

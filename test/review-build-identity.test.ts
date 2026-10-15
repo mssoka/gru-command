@@ -1,6 +1,6 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, cpSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { request } from 'node:http';
 import { dirname, join, sep } from 'node:path';
@@ -15,7 +15,6 @@ import { LedgerApi } from '../src/ledger/api.js';
 import { WorktreeManager } from '../src/worktrees/manager.js';
 import { EventBus } from '../src/events/bus.js';
 import { attachBareOrigin, makeFixtureRepo } from './helpers/fixture-repo.js';
-import { PersistedReviewPort } from './helpers/persisted-review-port.js';
 import { fakeWholeSpawner, groundedFinding } from './helpers/perkins-whole-double.js';
 
 const roots: string[] = [];
@@ -291,20 +290,64 @@ describe('installed Perkins runtime identity', () => {
     }
   }, 90_000);
 
+  it('fails closed on the npm-ci esbuild hard link until the packaged postinstall unshares it', () => {
+    // Owner incident 2026-10-07: esbuild's postinstall hard-links its
+    // platform binary over esbuild/bin/esbuild, and every real npm ci keeps
+    // that link. The copy-built fixture above breaks hard links, which hid
+    // it; reproduce the real install layout here.
+    const { root } = packageIdentity();
+    const platformSuffix = join('@esbuild', `${process.platform}-${process.arch}`, 'bin', 'esbuild');
+    const pairs = (readdirSync(root, { recursive: true }) as string[])
+      .filter((path) => path.endsWith(platformSuffix))
+      .map((path) => {
+        const modules = dirname(dirname(dirname(dirname(join(root, path)))));
+        return { platform: join(root, path), bin: join(modules, 'esbuild', 'bin', 'esbuild') };
+      })
+      .filter(({ bin }) => existsSync(bin));
+    expect(pairs.length, 'the installed review closure ships an esbuild platform binary').toBeGreaterThan(0);
+    // Baseline: the same bytes as independent files (what unsharing yields).
+    for (const { bin, platform } of pairs) {
+      rmSync(bin);
+      copyFileSync(platform, bin);
+    }
+    const unsharedIdentity = reviewRuntimeVersion(root);
+    for (const { bin, platform } of pairs) {
+      rmSync(bin);
+      linkSync(platform, bin);
+    }
+    expect(() => reviewRuntimeVersion(root)).toThrow('review runtime file must be bounded, regular and single-linked');
+
+    execFileSync(process.execPath, [join(root, 'tools', 'unshare-review-hardlinks.mjs'), root]);
+
+    for (const { bin, platform } of pairs) {
+      expect(statSync(bin).nlink).toBe(1);
+      expect(statSync(platform).nlink).toBe(1);
+      expect(readFileSync(bin).equals(readFileSync(platform))).toBe(true);
+    }
+    // Same bytes, single-linked: the strict check passes, digest unchanged.
+    expect(reviewRuntimeVersion(root)).toBe(unsharedIdentity);
+  }, 300_000);
+
   it('freezes an actual installed service-configured round and restores checked lenses through a fresh installed runner', async () => {
     const { root } = packageIdentity();
     const { createServiceReviewWave } = await import(pathToFileURL(join(root, 'dist', 'dispatch', 'service-review-wave.js')).href) as
       typeof import('../src/dispatch/service-review-wave.js');
+    const { WorktreeManager: InstalledWorktreeManager } = await import(pathToFileURL(join(root, 'dist', 'worktrees', 'manager.js')).href) as
+      typeof import('../src/worktrees/manager.js');
     const repo = makeFixtureRepo('installed-service-freeze');
     const db = new LedgerDb(fixture('installed-service-ledger-'));
+    let manager: WorktreeManager | undefined;
     try {
+      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+      // Keep trusted manager/ledger associations in the installed module graph.
+      const port = new InstalledWorktreeManager({ ledger, root: fixture('installed-service-port-'),
+        preserveRoot: fixture('installed-service-preserve-'), setupTimeoutMs: 30_000, enumerateProcesses: () => [] });
+      manager = port;
       repo.git(['checkout', '-b', 'feature/installed-service']);
       const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
       attachBareOrigin(repo);
       repo.git(['push', '-u', 'origin', 'main', 'feature/installed-service']);
-      const port = new PersistedReviewPort(fixture('installed-service-port-'), 'feature/installed-service', target);
       const artifacts = fixture('installed-service-artifacts-');
-      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
       const job = ledger.addJob({ id: 'installed-service-job', repo: 'fixture', title: 'installed service review',
         baseBranch: 'main', briefing: 'check the exact changed function' });
       ledger.setJobStatus(job.id, 'working');
@@ -353,8 +396,8 @@ describe('installed Perkins runtime identity', () => {
       expect(ledger.listRoundSpecialistStarts(second.round.id)).toHaveLength(5);
       expect(second.canonicalVerdict).toBe('INCOMPLETE');
     } finally {
-      db.close();
-      repo.cleanup();
+      try { if (manager !== undefined && manager.getWorktree('installed-service-job') !== null) await manager.release({ worktreeId: 'installed-service-job' }); }
+      finally { db.close(); repo.cleanup(); }
     }
   }, 90_000);
 

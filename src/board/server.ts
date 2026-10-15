@@ -1,3 +1,4 @@
+import { MailboxConflictError } from '../ledger/mailbox.js';
 import type { IncomingMessage, Server as HttpServer } from 'node:http';
 import type { Duplex } from 'node:stream';
 import { WebSocket, WebSocketServer } from 'ws';
@@ -5,7 +6,7 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import { ROLES, type GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { EventBus } from '../events/bus.js';
-import { LedgerApi, RecordNotFound, AdminCloseoutRefusal, AdminCancellationRefusal, type CloseoutRuntimeProbe, type DecisionActor, type DecisionKind, type NotificationRecord } from '../ledger/api.js';
+import { LedgerApi, RecordNotFound, AdminCloseoutRefusal, producerResolvedBy, type DecisionActor, type DecisionKind, type NotificationRecord } from '../ledger/api.js';
 import { isDecisionActor, isDecisionKind } from '../ledger/decision-memory.js';
 import { isJobStatus, isRoundStatus, isRoundVerdict } from '../ledger/states.js';
 import { isAgentState } from '../runtime/types.js';
@@ -16,6 +17,18 @@ import type { BoardEngine } from './engine.js';
 import type { DecisionRuntimeStatus } from '../decisions/runtime.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
+
+class BoardUnavailableError extends Error {
+  constructor(cause: unknown) {
+    super(`board unavailable: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+    this.name = 'BoardUnavailableError';
+  }
+}
+
+/** Source rejection is a service failure, never a clean empty projection or bad client input. */
+function readEvidence<T>(read: () => T): T {
+  try { return read(); } catch (error) { throw new BoardUnavailableError(error); }
+}
 
 /**
  * Board server (EPICS E6 stories 2–4 surface): the HTTP API of record's
@@ -40,11 +53,6 @@ export interface BoardServerOptions {
   readonly decisionsStatus?: () => DecisionRuntimeStatus;
   readonly onDecisionsRecheck?: () => Promise<DecisionRuntimeStatus>;
   readonly log?: Log;
-  /** Owned by main for the closeout forms: authoritative runtime facts
-   * (live registry handles + the supervisor's per-agent view) read at the
-   * commit boundary. Absent = the ledger falls back to its durable
-   * execution markers alone. */
-  readonly closeoutRuntime?: () => CloseoutRuntimeProbe | null;
   /** First-frame-must-be-auth deadline (chat parity: 5 s). */
   readonly authDeadlineMs?: number;
   /** Upgrade paths owned by SIBLING ws surfaces (the chat /ws) — the board
@@ -215,7 +223,7 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
         // --- reads -----------------------------------------------------
         if (req.method === 'GET' && path === '/api/board') {
           if (!authed(req, res)) return;
-          json(res, 200, engine.snapshot());
+          json(res, 200, readEvidence(() => engine.snapshot()));
           return;
         }
         if (req.method === 'GET' && path === '/api/notifications/receipts') {
@@ -329,6 +337,23 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
         }
 
         // --- writes (the thin record API; authorship UI is E8) ----------
+        if (req.method === 'GET' && path === '/api/mailbox') {
+          if (!authed(req, res)) return;
+          const query = new URL(req.url ?? path, 'http://localhost').searchParams;
+          // Separate strict source rejection from the page's client-input validation.
+          readEvidence(() => engine.mailbox.snapshot());
+          const limit = query.get('limit');
+          json(res, 200, engine.mailbox.page(query.get('cursor') ?? '', limit === null ? 50 : Number(limit)));
+          return;
+        }
+        if (req.method === 'POST' && path.startsWith('/api/mailbox/') && path.endsWith('/disposition')) {
+          if (!authed(req, res)) return;
+          const id = decodeURIComponent(path.slice('/api/mailbox/'.length, -'/disposition'.length));
+          const body = await readBody(req);
+          readEvidence(() => engine.mailbox.snapshot());
+          json(res, 200, engine.mailbox.disposition(id, body));
+          return;
+        }
         if (req.method === 'POST' && path === '/api/decisions/recheck') {
           if (!authed(req, res)) return;
           if (options.onDecisionsRecheck === undefined) {
@@ -532,59 +557,19 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
           json(
             res,
             200,
-            ledger.adminCloseParkedJob(
-              {
-                jobId: id,
-                expectedStatus: 'parked',
-                expectedPrUrl,
-                provider: {
-                  provider: 'github',
-                  state: 'closed',
-                  merged: false,
-                  headSha,
-                  ...(closedAt !== undefined ? { closedAt } : {}),
-                },
-                reason,
+            ledger.adminCloseParkedJob({
+              jobId: id,
+              expectedStatus: 'parked',
+              expectedPrUrl,
+              provider: {
+                provider: 'github',
+                state: 'closed',
+                merged: false,
+                headSha,
+                ...(closedAt !== undefined ? { closedAt } : {}),
               },
-              options.closeoutRuntime?.() ?? null,
-            ),
-          );
-          return;
-        }
-        // Owner cancellation (owner amendment j-1117): administrative
-        // abandonment of an EXACT allowlisted parked legacy lane with no
-        // registered PR and NULL report metadata. Same authenticated
-        // boundary; typed 409 refusals; never a fabricated provider
-        // receipt and never a batch scan.
-        if (req.method === 'POST' && path.startsWith('/api/jobs/') && path.endsWith('/owner-cancellation')) {
-          if (!authed(req, res)) return;
-          const id = decodeURIComponent(path.slice('/api/jobs/'.length, -'/owner-cancellation'.length));
-          if (id === '') {
-            json(res, 400, { error: 'bad_request', detail: 'job id path segment is required' });
-            return;
-          }
-          const body = (await readBody(req)) as Record<string, unknown>;
-          if (typeof body !== 'object' || body === null || Array.isArray(body)) {
-            throw new Error('request body must be a JSON object');
-          }
-          const expectedStatus = strField(body, 'expected_status');
-          if (expectedStatus !== 'parked') {
-            throw new Error(`expected_status must be "parked" (got "${expectedStatus}")`);
-          }
-          const authorityReference = strField(body, 'authority_reference');
-          const reason = strField(body, 'reason');
-          json(
-            res,
-            200,
-            ledger.adminCancelListedParkedJob(
-              {
-                jobId: id,
-                expectedStatus: 'parked',
-                authorityReference,
-                reason,
-              },
-              options.closeoutRuntime?.() ?? null,
-            ),
+              reason,
+            }),
           );
           return;
         }
@@ -612,6 +597,32 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
           const detail = strField(body, 'detail').trim();
           if (title === '' || title.length > 500 || detail === '' || detail.length > 4_000) {
             throw new Error('owner escalation title (1-500) and detail (1-4000) must be non-blank');
+          }
+          // Retry identity (decision #100, 2026-10-12): an optional client-
+          // supplied idempotency key names ONE escalation. The same key with
+          // the same title/detail returns the existing row (200, no second
+          // FOR YOU item or bell); the same key with a changed request is
+          // refused (409). Without a key every request is a distinct decision.
+          const rawKey = body.idempotencyKey;
+          if (rawKey !== undefined && (typeof rawKey !== 'string' || !/^[A-Za-z0-9._:-]{1,128}$/.test(rawKey))) {
+            throw new Error('idempotencyKey must be 1-128 chars of [A-Za-z0-9._:-]');
+          }
+          if (typeof rawKey === 'string') {
+            const id = `owner-escalation:${rawKey}`;
+            const existing = ledger.getNotification(id);
+            if (existing !== null) {
+              if (existing.title !== title || existing.detail !== detail) {
+                json(res, 409, {
+                  error: 'idempotency_conflict',
+                  detail: `idempotencyKey "${rawKey}" already names a different escalation; use a new key for a new decision`,
+                });
+                return;
+              }
+              json(res, 200, existing);
+              return;
+            }
+            json(res, 201, notifications.post({ id, kind: 'gru.owner-escalation', routing: 'needs-owner', severity: 'error', title, detail }));
+            return;
           }
           const row = notifications.post({ kind: 'gru.owner-escalation', routing: 'needs-owner', severity: 'error', title, detail });
           json(res, 201, row);
@@ -641,7 +652,26 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
           }
           if (suffix === '/disposition') {
             const detail = strField(body, 'detail');
-            const row = ledger.disposeMachineNotification(id, detail);
+            // The board has ONE shared bearer for owner and agent callers, so
+            // the credential proves "a paired caller", not "Gru". A caller may
+            // declare its actor; only 'gru' is a valid declaration for a
+            // machine disposition, and the audit labels it caller-declared.
+            const declaredActor = optStrField(body, 'actor') ?? null;
+            if (declaredActor !== null && declaredActor !== 'gru') {
+              json(res, 400, { error: 'bad_request', detail: `actor "${declaredActor}" cannot produce a Gru disposition; omit actor or declare "gru"` });
+              return;
+            }
+            const target = ledger.getNotification(id);
+            const closer = target === null ? null : producerResolvedBy(target.kind);
+            if (target !== null && closer !== null) {
+              // Only its producer closes this alert (owner decision 2026-10-08).
+              json(res, 409, {
+                error: 'producer_resolved',
+                detail: `${target.kind} closes itself on ${closer} — fix its cause and leave the alert open`,
+              });
+              return;
+            }
+            const row = ledger.disposeMachineNotification(id, detail, { credential: 'shared-bearer', declaredActor });
             if (row === null) {
               json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });
               return;
@@ -649,7 +679,17 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             json(res, 200, row);
             return;
           }
-          const before = ledger.getNotification(id)?.ackedAt ?? null;
+          const existing = ledger.getNotification(id);
+          if (existing?.kind === 'lessons.proposal') {
+            // A lesson proposal closes only through an owner decision — an
+            // ack would hide it without writing or consuming anything.
+            json(res, 409, {
+              error: 'decision_required',
+              detail: 'lesson proposals are decided with Accept or Reject (POST /api/lessons/proposal/:id/accept|reject)',
+            });
+            return;
+          }
+          const before = existing?.ackedAt ?? null;
           const row = notifications.ack(id, optStrField(body, 'by') ?? 'web');
           if (row === null) {
             json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });
@@ -667,21 +707,24 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
         // Typed mapping: the ledger and transcript layers throw
         // RecordNotFound for missing entities; a missing/unreadable
         // transcript FILE is also a not-found. Everything else is a 400
-        // except a guarded closeout/cancellation refusal, a typed 409.
-        const closeoutRefused = error instanceof AdminCloseoutRefusal;
-        const cancellationRefused = error instanceof AdminCancellationRefusal;
-        if (closeoutRefused) {
-          json(res, 409, { error: 'closeout_refused', code: error.code, detail: message });
+        // except a guarded closeout refusal, which is a typed 409.
+        if (error instanceof BoardUnavailableError) {
+          log('error', 'board evidence unavailable', { method: req.method, path, error: message });
+          json(res, 503, { error: 'board_unavailable', detail: message });
           return;
         }
-        if (cancellationRefused) {
-          json(res, 409, { error: 'cancellation_refused', code: error.code, detail: message });
+        const refused = error instanceof AdminCloseoutRefusal;
+        if (error instanceof MailboxConflictError) {
+          json(res, 409, { error: 'mailbox_conflict', detail: message });
           return;
         }
         const notFound =
-          error instanceof RecordNotFound ||
-          (error instanceof Error && error.message.includes('transcript unreadable'));
-        json(res, notFound ? 404 : 400, { error: notFound ? 'not_found' : 'bad_request', detail: message });
+          !refused &&
+          (error instanceof RecordNotFound ||
+            (error instanceof Error && error.message.includes('transcript unreadable')));
+        json(res, refused ? 409 : notFound ? 404 : 400, refused
+          ? { error: 'closeout_refused', code: error.code, detail: message }
+          : { error: notFound ? 'not_found' : 'bad_request', detail: message });
       }
     })().catch((error: unknown) => {
       log('error', 'board api handler failed', { error: String(error) });
@@ -698,7 +741,20 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
   // ------------------------------------------------------------------
 
   function pushSnapshot(): void {
-    const snapshot = engine.snapshot();
+    let snapshot: ReturnType<BoardEngine['snapshot']>;
+    try {
+      snapshot = readEvidence(() => engine.snapshot());
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log('error', 'board evidence unavailable', { error: message });
+      for (const client of clients) {
+        if (!client.authed) continue;
+        // Source failure is recoverable; a fatal frame would revoke valid web pairing.
+        send(client.socket, { type: 'error', message, fatal: false });
+        client.socket.close(1011, 'board unavailable');
+      }
+      return;
+    }
     for (const client of clients) {
       if (client.authed) send(client.socket, { type: 'board', snapshot });
     }

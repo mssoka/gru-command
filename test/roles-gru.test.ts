@@ -29,15 +29,29 @@ describe('gru role definition', () => {
     expect(prompt).toContain('UNTRUSTED DATA');
     expect(prompt).toContain('POST /api/notifications/needs-owner');
     expect(prompt).toContain('exact-final-head native Perkins READY');
-    expect(prompt).toContain('The owner holds every merge, everywhere');
-    expect(prompt).toContain('merge yourself');
+    expect(prompt).toContain('The owner holds every final PR merge, everywhere');
+    expect(prompt).toContain('no agent merges a PR');
   });
 
   it('the chief hands workers the whole build and presents merges only on exact-final-head Perkins READY', () => {
     const gru = ROLE_DEFINITIONS.gru.systemPrompt.replace(/\s+/gu, ' ');
     expect(gru).toContain('Hand workers the whole build');
-    expect(gru).toContain('the owner holds');
-    expect(gru).toContain('every merge');
+    expect(gru).toContain('The owner holds every final PR merge, everywhere');
+    expect(gru).toContain('main-into-task-branch integration');
+  });
+
+  it('the chief owns the briefing, keeps acceptance on fixed targets, and lets lanes outlive a moving main', () => {
+    const gru = ROLE_DEFINITIONS.gru.systemPrompt.replace(/\s+/gu, ' ');
+    expect(gru).toContain('The briefing is yours');
+    expect(gru).toContain('never bring routine engineering choices back to the owner');
+    expect(gru).toContain('Every requirement traces to the goal');
+    expect(gru).toContain('without it, the agreed outcome fails');
+    expect(gru).toContain('never a moving one like "current main"');
+    expect(gru).toContain("An amendment you write is your judgment, not the owner's ruling");
+    expect(gru).toContain('Main moving on is normal');
+    expect(gru).toContain('never by itself justifies replacing a worktree, branch or PR');
+    expect(gru).toContain('Ask the question, not your workaround');
+    expect(gru).toContain('holds only the step it gates');
   });
 
   it('the role config maps the permission set (tools + workspace cwd)', () => {
@@ -51,9 +65,11 @@ describe('gru role definition', () => {
     // ship in the product-native role — the persona PATTERN only. The
     // regex is assembled from parts so this guard does not itself carry
     // the literal paths (the repo-wide hygiene gate greps the tree).
+    // Worktrees and the ledger are product concepts (src/worktrees,
+    // src/ledger), not instance specifics, so the persona may name them.
     const forbidden = new RegExp(
       ['\\/Use', 'rs\\/', '|\\/ho', 'me\\/', '|~\\/', '|he', 'rdr'].join('') +
-        '|_bmad|ledger|worktree|\\bpi\\b|claude',
+        '|_bmad|\\bpi\\b|claude',
       'i',
     );
     expect(forbidden.test(prompt)).toBe(false);

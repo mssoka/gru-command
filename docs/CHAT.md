@@ -43,7 +43,7 @@ never logged or replayed.
 | `delta` | `text`, `seq` | streamed reply chunk |
 | `tool` | `name`, `state: start\|end`, `seq` | live tool activity |
 | `turn` | `state: start\|end`, `seq` | reply lifecycle |
-| `notice` | `text`, `seq` | product notice surfaced in chat (E7, SPEC ruling 13; routing split 2026-09-23): needs-owner items ("🔔 For you: …") and supervisor restart notices. Logged + replayed; never fatal, never a turn |
+| `notice` | `text`, `seq` | product notice surfaced in chat (E7, SPEC ruling 13; routing split 2026-09-23): needs-owner items ("🔔 For you: …" — the only *notification-routing* kind) and operational service events (supervisor restart, vision-unavailable, rejected-input notices; see "Notice routing" below). Logged + replayed; never fatal, never a turn |
 | `error` | `message`, `fatal?`, `seq?` | see the error classes below |
 | `context` | `epoch`, `replay_floor_seq`, `state: idle\|busy\|compacting\|resetting`, `usage`, `compact_supported`, `session_active`, `writer` | fresh server-owned snapshot after auth and on every control/writer/runtime-state transition. `usage` is provider-owned or `null`, never a frontend estimate |
 | `control_result` | `action`, `request_id`, `ok`, `epoch`, `code?`, `message?` | terminal result for exactly one request; failures distinguish `busy`, `unsupported`, `read_only`, `no_session`, and runtime/persistence `failed` |
@@ -343,11 +343,16 @@ relaying it. Two mechanisms share one boundary:
   a separate owner cursor, so autonomous turns cannot consume it. Capped
   counts are shown as lower bounds (e.g. `100+`).
 
-The client-facing `notice` frame is now the needs-owner channel only:
+**Notice routing.** The client-facing `notice` frame carries two distinct
+things: (1) *notification routing* — needs-owner is the only notification
+channel, and (2) operational service events (e.g. the supervisor-restart
+notice) that are not notifications and never ring the bell. The rest of this
+paragraph is about (1) only: the `notice` frame is now the needs-owner
+notification channel only:
 action-required rows never render in a human-facing band or ring the owner
 bell — they wake Gru and live in the board's NEEDS GRU machine queue
-(live rows only: rows bound to a terminal merged/done lane are closed
-receipts rendered under FEED), while needs-owner rows (“🔔 For you: …”) stay
+(live rows only: rows bound to a terminal merged/done/binned lane are
+closed receipts rendered under FEED), while needs-owner rows (“🔔 For you: …”) stay
 the human's durable banner.
 
 **Clean-chat rendering** (owner clause 2026-09-23): consecutive
@@ -356,6 +361,26 @@ collapsed band — "⚙️ N service events — expand" — while conversation
 frames (user messages, reply deltas, errors) stay visible and close the
 run. The session/turn mechanism is unchanged: single stream, single pen,
 and the ledger remains the durable log.
+
+## Untrusted metadata: acceptance record (#126)
+
+Question: will a model obey malicious notification metadata despite the
+data-only boundary? A live-model answer needs authorized adversarial
+evidence against a real model and is **not** produced here. What is proven
+offline (`test/awareness-adversarial.test.ts`, plus the metadata fixtures in
+`test/awareness.test.ts`): hostile titles/details (instruction text, forged
+service headers, forged owner lines, CR/LF and U+2028/2029 separators,
+embedded quotes) render as one JSON-quoted, line-escaped string on a single
+bullet line of the wake block and can never open a line of their own or
+forge the `[gru awareness …]` header; and `roles/gru.md` names notification
+titles, details, check names and digest text as UNTRUSTED DATA that is never
+followed. **Decision (recorded 2026-10-12, Gru; owner to confirm):** accept
+the current controls — quoting/escaping, the role's data-only clause, and the
+action boundary that destructive or approval-bearing steps need owner
+authority — as sufficient. Residual risk is model compliance under a
+quoted-data block; it is not an established defect. Revisit only with
+authorized live adversarial evidence; content redaction is the separate
+defect g26.
 
 ## Limits and notes
 
@@ -370,3 +395,69 @@ and the ledger remains the durable log.
   boot-settle closes anything left open.
 - v1 is LAN-only, no TLS. The token is the whole credential — treat it
   like one.
+
+## Durable mailbox attention (GH-305)
+
+Gru's existing conversation consumes the same server mailbox as the board.
+Startup, coalesced source events and `[chat].mailbox_reconcile_interval_ms`
+(default 300000; accepted range 1–2147483647 ms) recover attention without a browser. Reconciliation is code
+only, executes no work, and admits through the existing routing/severity,
+quiet-hour, rate, owner-stop and busy-session gates. Busy sessions retain one
+trailing wake; policy deferrals are durable `gru.wake-deferred` observations.
+Fair admission pages use a durable cursor, including policy-deferred pages.
+
+Accepted delivery records an exact-basis mailbox receipt, **not a disposition**.
+Duplicate delivered evidence stays quiet within a five-minute grace window.
+Without a next-action disposition, unresolved debt becomes eligible again on
+the first reconciliation at or after that bound; restart preserves the bound.
+Waiting/delegated/resolved exact-basis dispositions stay quiet until changed
+head/round/control/failure evidence or a due follow-up restores attention.
+Unresolved items remain visible in passive context and on the board.
+Report-handback custody (GH-313) follows the producer's report/job identity and
+actual report/obligation evidence, not replacement notification IDs. Re-posting
+an unchanged `silas.report-handback.<job>` card preserves its recorded owner,
+dependency and original recheck. A temporary gap after notification disposition
+retains already-surfaced open/waiting report debt; it does not mark the report
+collected or settled. Material report/target/plan/receipt changes or the due
+recheck restore attention through the same admission path. Missing or invalid
+custody remains actionable; actual report settlement closes custody. Report
+custody cannot be marked resolved using an attention-only decision. Replacement
+evidence follows insertion order, including timestamp ties and older cards that
+remain active; display-title and transport-agent changes are not new reports.
+Pre-upgrade waiting metadata is adopted only when its original durable ruling
+and unchanged source can be authenticated, with a
+`mailbox.report-custody-migrated` audit event; original decisions and recheck
+clocks are never rewritten. Unprovable compatibility surfaces debt instead.
+Both passive and wake acceptance durably park immutable rendered identity,
+reason bases, source notification IDs, batch identity and original acceptance
+time before receipt writes. Recovery records historical evidence even if the
+source changed; only a matching live incarnation receives suppression. The
+five-minute clock starts at acceptance, not retry. Receipt-only recovery never
+opens another prompt or rolls back a newer autonomous rate budget. Legacy debt
+without reconstructable captures remains parked with an actionable
+`MailboxDeliveryRecoveryError`, never fabricated history.
+An empty mailbox opens no turn. Individual context-budget overflows are
+explicit durable deferrals, never coverage receipts, and cannot hide smaller
+items behind them; full evidence remains available through paged GET. Wake
+events distinguish `mailbox_keys` and
+`mailbox_count` from real `notification_ids` / `notification_count`; genuine
+source IDs remain linked for yield and training. Privately branded adapters
+and domain-qualified internal `attention_keys` distinguish real notifications
+even when their displayed IDs exactly collide with mailbox keys. Failed-turn
+budgets follow exact item/basis across unhandled grace incarnations and restart;
+exhaustion never automatically rearms owner escalation.
+
+A previously surfaced live obligation remains waiting/delegated when its
+follow-up moves into the future or to a different actual owner. Optional
+server-owned `disposition.sourceObligationId` identifies this source-derived
+metadata, not a Gru ruling. Code-only non-Gru monitoring stays quiet; a genuine
+explicit Gru recheck (mailbox disposition or applicable decision memory)
+restores attention when due without changing the operational owner.
+
+Mailbox delivery keys are not notification IDs. Inspect authenticated
+`GET /api/mailbox` before acting and use its stable item `id` and `basis` with
+`POST /api/mailbox/{id}/disposition`. References reuse actual controls,
+obligations and decision memory. A recheck grants no permission to acknowledge
+an owner stop, merge, restart, duplicate a writer, or infer a child's completion
+from a parent/similarly named successor. Producer-owned incidents (including
+`lessons.dream-failed`) stay open until producer success.

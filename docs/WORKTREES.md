@@ -12,8 +12,8 @@ Each project repo declares its fresh-worktree needs in-repo at
 
 ```toml
 [[link]]                 # symlink created in the fresh worktree
-at = "_bmad"             #   worktree-relative (no ..)
-to = "_bmad"             #   target: repo-root-relative (.. allowed) or absolute
+at = "fixtures/large"    #   worktree-relative (no ..)
+to = "fixtures/large"    #   target: repo-root-relative (.. allowed) or absolute
 
 [[copy]]                 # file copied from the source checkout
 from = ".env.local"      #   repo-root-relative (no ..)
@@ -30,6 +30,18 @@ quick = "npm run lint"
 A missing manifest is a no-op; a malformed one fails loud and rolls the
 worktree back **all the way** (worktree AND the branch the failed call
 created — a leftover `gru/<job>` would wedge the job id forever).
+
+GC-owned workflows need no BMAD manifest entry or project/global installation.
+New lanes bind the owned workflow and explicit artifact context when the minion
+spawns; approved portable knowledge lives in `gru-output/`. Independent user BMAD
+and explicit project setup commands remain user-owned and are honored unchanged.
+
+GC-marked `GRU COMMAND BMAD BOOTSTRAP` blocks are retired: new bootstrap refuses
+them before executing any links, copies or commands. Use the precise, owner-run
+preview/backup/retirement procedure in [BMAD-RUNTIME.md](./BMAD-RUNTIME.md); edited
+or uncertain blocks require deliberate repair, never automatic cleanup. Existing
+jobs still resolve verification commands from their original manifests and keep
+their original runtime bindings and paths.
 
 ## 2. Registry (18b)
 

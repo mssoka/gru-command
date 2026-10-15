@@ -1,6 +1,9 @@
+import { capturePortLaneHandoff } from '../worktrees/handoff.js';
 import { randomUUID } from 'node:crypto';
+import { requireArtifactJobId } from '../artifacts/context.js';
 import type { LogLevel } from '../logger.js';
 import type { JobDeliverable, LedgerApi, JobRecord } from '../ledger/api.js';
+import { requireSafeRecordId } from '../ledger/api.js';
 import type { CompletionHandoffIntent } from '../ledger/obligations.js';
 import { isJobTerminal } from '../ledger/states.js';
 import type { Role } from '../config.js';
@@ -15,8 +18,27 @@ import { isPromptTurnVerdict, promptVerdictFromHealth } from '../runtime/prompt-
 import type { PromptTurnVerdict } from '../runtime/types.js';
 import { settleRetries, RetrySettlementUnavailableError, type PacingGate, type PacingLease, type RetrySettlement } from '../runtime/pacing.js';
 import { WORKER_RULE_BLOCKS } from './worker-rules.js';
+import {
+  assertLaneUsesBoundStore,
+  renderReviewSourceBlock,
+  type ReviewRequiredInput,
+  type ReviewSourceBinding,
+  type ReviewSourcePackage,
+  type ReviewSourcePreflight,
+} from './review-source.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
+
+import {
+  admitBlindReview,
+  blindCoverageOf,
+  observeBlindSessionAccess,
+  readSessionToolResults,
+  recordBlindAdmission,
+  recordObservedAccess,
+  type BlindCoverage,
+} from './blind-review.js';
+import type { BlindInputPackage, ObservedToolResult } from './blind-input.js';
 
 /**
  * Dispatch flow (EPICS E8 story 2; SPEC rulings 2/17/18): the Gru-authored
@@ -68,6 +90,13 @@ export interface DispatchServiceOptions {
    * parent session (request/list/cancel child workers, bound to the
    * parent's agent id by closure). Absent = no child-request path. */
   readonly parentTools?: (agentId: string) => readonly NativeAgentTool[];
+  /** Issue #317: the review-source preflight (git against the actual
+   * selected object store). Absent = report reviews carry no source proof
+   * and may not name a base, required inputs or a source package. */
+  readonly reviewSource?: ReviewSourcePreflight;
+  /** Issue #316: reads a finished blind reviewer's tool results from its
+   * session file (default: the session jsonl on disk). null = unobservable. */
+  readonly sessionToolResults?: (sessionFile: string | null) => readonly ObservedToolResult[] | null;
   readonly log?: Log;
 }
 
@@ -92,6 +121,8 @@ export function renderMinionBriefing(input: {
    *  nothing, and an unmodified tree is the expected result; artifact and
    *  investigation jobs hand back their artifacts without opening a PR. */
   deliverable?: JobDeliverable;
+  /** Issue #317: the preflight-verified review source, bound verbatim. */
+  reviewSource?: ReviewSourceBinding;
 }): string {
   const lessonsSection = renderLessonsSection(input.lessons ?? []);
   return [
@@ -103,6 +134,7 @@ export function renderMinionBriefing(input: {
     '',
     'BRIEFING:',
     input.briefing,
+    ...(input.reviewSource === undefined ? [] : ['', ...renderReviewSourceBlock(input.reviewSource)]),
     ...(lessonsSection === '' ? [] : ['', lessonsSection]),
     ...WORKER_RULE_BLOCKS.flatMap((block) => ['', block]),
     '',
@@ -114,9 +146,10 @@ export function renderMinionBriefing(input: {
           '`list_child_workers` to discover its durable result, and',
           '`cancel_child_worker` to stop it. This is NOT the build workflow\'s',
           'independent reviewer: that review runs as its own tracked review job',
-          'commissioned through `POST /api/dispatch` with',
-          '`"deliverable": "review"` — never as a generic child. Children cannot',
-          'commission children; never launch external or headless agents yourself.',
+          '(a megaminion) commissioned through `POST /api/dispatch` with',
+          `\`"deliverable": "review"\` and \`"parent_job_id": "${input.jobId}"\` — never as a`,
+          'generic child. Children cannot commission children; never launch',
+          'external or headless agents yourself.',
           '',
         ]
       : []),
@@ -171,14 +204,34 @@ export class DispatchService {
     deliverable?: JobDeliverable;
     /** Issue #220 report-job closure: who commissioned this report (the
      * disposition debtor) and what it reviewed. The commissioner defaults
-     * to `gru` on report-type jobs; a review job WITHOUT a target fails
+     * to the parent job on a megaminion (the minion that asked for the
+     * review acts on it — owner ruling 2026-10-08), else to `gru` on
+     * report-type jobs; a review job WITHOUT a target fails
      * loud — findings that cannot name what they reviewed are not a
      * commissioned report. Rejected on PR-owing lanes (the lane's own PR
      * is the deliverable, recorded via recordPr). */
     commissioner?: string;
     targetRef?: string;
     targetSha?: string;
+    /** Issue #317 review-source preflight inputs (review jobs only): the
+     * focused-delta base, content the review needs (claims lenses), and an
+     * optional hash-pinned git bundle authorizing a source repair. */
+    targetBase?: string;
+    requiredInputs?: readonly ReviewRequiredInput[];
+    sourcePackage?: ReviewSourcePackage;
+    /** The commissioning job: a minion dispatching a specialist
+     * (megaminion) names its own job so the child nests under that heist. */
+    parentJobId?: string;
     briefing: string;
+    /** Issue #316: `blind` (isolated input, validated before spawn) or
+     * `claims` (a reviewer that legitimately needs claims — a separate
+     * contract). Omitted = inferred from a lane named blind, else unclassified. */
+    reviewRole?: string;
+    /** Issue #316: the blind reviewer's exact immutable input package. */
+    inputPackage?: BlindInputPackage;
+    /** Issue #316: the parent contract hash the child was composed against;
+     * a stale hash is refused so a clarification cannot be missed. */
+    parentContractSha256?: string;
     /** Explicit completion intent: when present, the phase-handoff guard
      * row is persisted BEFORE any side effect and this exact phase's
      * validated completion owes the named decision durably. Omitted =
@@ -188,6 +241,10 @@ export class DispatchService {
     if (input.jobId.trim() === '' || input.title.trim() === '' || input.briefing.trim() === '') {
       throw new Error('dispatch requires a non-empty job id, title, and briefing');
     }
+    // Preserve the existing public identifier diagnostics before applying
+    // the narrower new-artifact storage precondition, both before effects.
+    requireSafeRecordId(input.jobId, 'job id');
+    requireArtifactJobId(input.jobId);
     const isReportKind = input.deliverable !== undefined && input.deliverable !== 'pr';
     if (isReportKind) {
       if (input.targetRef !== undefined && input.targetRef.trim() === '') {
@@ -209,10 +266,61 @@ export class DispatchService {
         `job "${input.jobId}" is a PR-owing lane — target_ref/target_sha are report-job fields`,
       );
     }
-    const commissioner = isReportKind ? (input.commissioner?.trim() || 'gru') : undefined;
+    // An explicit commissioner always wins; a megaminion's default debtor
+    // is its parent job (owner ruling 2026-10-08), never Gru by default.
+    const commissioner = isReportKind
+      ? (input.commissioner?.trim() || input.parentJobId?.trim() || 'gru')
+      : undefined;
     const targetRef = isReportKind ? input.targetRef?.trim() : undefined;
     const targetSha = isReportKind ? input.targetSha?.trim() : undefined;
     const repoName = input.repoPath.split('/').filter(Boolean).pop() ?? input.repoPath;
+
+    // (0b) Issue #317: prove the ACTUAL selected object store holds the
+    // review inputs BEFORE any job row, worktree or reviewer turn exists. A
+    // refusal throws ReviewSourceUnavailableError — never a report.
+    const namesSourceFields = input.targetBase !== undefined || input.requiredInputs !== undefined || input.sourcePackage !== undefined;
+    if (namesSourceFields && input.deliverable !== 'review') {
+      throw new Error(`job "${input.jobId}": target_base/required_inputs/source_package only apply to review jobs`);
+    }
+    if (namesSourceFields && this.opts.reviewSource === undefined) {
+      throw new Error(`job "${input.jobId}": review source preflight is not wired — refusing to admit a review whose source cannot be proven`);
+    }
+    const reviewSource: ReviewSourceBinding | null =
+      input.deliverable === 'review' && targetSha !== undefined && this.opts.reviewSource !== undefined
+        ? this.opts.reviewSource({
+            jobId: input.jobId,
+            repoPath: input.repoPath,
+            targetSha,
+            ...(input.targetBase !== undefined ? { targetBase: input.targetBase.trim() } : {}),
+            ...(input.requiredInputs !== undefined ? { requiredInputs: input.requiredInputs } : {}),
+            ...(input.sourcePackage !== undefined ? { sourcePackage: input.sourcePackage } : {}),
+          })
+        : null;
+
+    // The durable record binds the RESOLVED commit the preflight proved,
+    // never the caller's possibly-abbreviated spelling: durable-reconcile
+    // compares the recorded target_sha to full oids by exact string. The
+    // raw value is the fallback only when no preflight ran.
+    const recordedTargetSha = reviewSource?.targetSha ?? targetSha;
+
+    // (0) Issue #316: a blind reviewer's input is validated against the
+    // parent's EFFECTIVE isolation rule before any job, worktree or reviewer
+    // exists. A refusal spends no reviewer turn and names its correction.
+    const blindAdmission = admitBlindReview({
+      ledger: this.opts.ledger,
+      jobId: input.jobId,
+      title: input.title,
+      displayName: input.displayName,
+      deliverable: input.deliverable,
+      reviewRole: input.reviewRole,
+      briefing: input.briefing,
+      targetRef: input.targetRef,
+      targetSha: input.targetSha,
+      parentJobId: input.parentJobId,
+      repoName,
+      inputPackage: input.inputPackage,
+      parentContractSha256: input.parentContractSha256,
+    });
 
     // (1) The job row: the briefing IS the contract (recorded verbatim).
     const job = this.opts.ledger.addJob({
@@ -224,8 +332,27 @@ export class DispatchService {
       ...(input.deliverable !== undefined ? { deliverable: input.deliverable } : {}),
       ...(commissioner !== undefined ? { commissioner } : {}),
       ...(targetRef !== undefined ? { targetRef } : {}),
-      ...(targetSha !== undefined ? { targetSha } : {}),
+      ...(recordedTargetSha !== undefined ? { targetSha: recordedTargetSha } : {}),
+      ...(input.parentJobId !== undefined ? { parentJobId: input.parentJobId } : {}),
     });
+
+    if (reviewSource !== null) {
+      this.opts.ledger.appendCustomEvent({
+        kind: 'job.review-source-verified',
+        jobId: job.id,
+        payload: {
+          object_store: reviewSource.objectStore,
+          target_sha: reviewSource.targetSha,
+          target_base: reviewSource.targetBase,
+          range_commits: reviewSource.rangeCommits,
+          inputs: reviewSource.inputs,
+          source: reviewSource.source,
+          package_sha256: reviewSource.packageSha256,
+        },
+      });
+    }
+
+    if (blindAdmission !== null) recordBlindAdmission(this.opts.ledger, job.id, blindAdmission);
 
     // (2) Ops handoff: dispatched → working, on the record.
     this.opts.ledger.appendCustomEvent({
@@ -240,6 +367,18 @@ export class DispatchService {
     // evidence already exists (the boot reconciler finishes it instead).
     let deliveredRecorded = false;
     let workerLease: PacingLease | null = null;
+    let releaseAdmission: (() => void) | null = null;
+    const releaseJobAdmission = (): void => {
+      const release = releaseAdmission;
+      releaseAdmission = null;
+      release?.();
+    };
+    const assertAdmissible = (): void => {
+      const current = this.opts.ledger.getJob(job.id);
+      if (current === null || isJobTerminal(current.status) || current.status === 'parked' || current.status === 'blocked') {
+        throw new Error(`initial dispatch refused — job "${job.id}" is ${current?.status ?? 'missing'}`);
+      }
+    };
     const releaseWorker = (): void => {
       const lease = workerLease;
       workerLease = null;
@@ -247,6 +386,10 @@ export class DispatchService {
     };
     try {
       const working = this.opts.ledger.setJobStatus(job.id, 'working');
+      // No registered agent exists yet while worktree/pacing/spawn awaits.
+      // Reserve that runtime side effect so a concurrent bin cannot close
+      // the lane then receive a late briefing.
+      releaseAdmission = this.opts.ledger.beginJobAdmission(job.id, 'initial dispatch');
 
       // (2b) Explicit completion intent BEFORE admission/side effects: the
       // durable guard row exists before any worktree or spawn, so a crash
@@ -264,6 +407,15 @@ export class DispatchService {
         repoPath: input.repoPath,
         jobId: job.id,
       });
+      const assertHandoff = capturePortLaneHandoff(this.opts.worktrees, worktree);
+      if (reviewSource !== null) {
+        try {
+          assertLaneUsesBoundStore(job.id, reviewSource, worktree.path);
+        } catch (error) {
+          await this.sweepQuietly(worktree.id);
+          throw error;
+        }
+      }
 
       // (4) The minion: a fresh agent session rooted in the PROJECT
       // worktree (ruling 17: dispatch cwd = project root, all runtimes).
@@ -296,6 +448,8 @@ export class DispatchService {
       }
       let handle: AgentHandle;
       try {
+        assertHandoff();
+        assertAdmissible();
         const cwd = requireSpawnCwd('minion', worktree.path);
         // Issue #161: a dispatched parent gets a product-owned identity and
         // the GC-mediated child tools bound to it — no bearer secret ever
@@ -310,6 +464,13 @@ export class DispatchService {
           ...(parentAgentId !== undefined ? { agentId: parentAgentId } : {}),
           ...(parentNativeTools.length > 0 ? { nativeTools: parentNativeTools } : {}),
         });
+        try {
+          assertHandoff();
+        assertAdmissible();
+        } catch (error) {
+          await handle.dispose();
+          throw error;
+        }
       } catch (error) {
         // The lane cannot start — release the pacing slot, sweep the fresh
         // worktree (preserve first, per ruling 18c) and block the job.
@@ -329,6 +490,7 @@ export class DispatchService {
         jobId: job.id,
         parentage: 'top-level',
       });
+      try { assertHandoff(); } catch (error) { await handle.dispose(); throw error; }
       // Bind the admitted worker to the marked phase BEFORE its prompt runs:
       // a delivery from any other worker can never complete this phase.
       if (handoffPhaseId !== null) {
@@ -458,6 +620,9 @@ export class DispatchService {
           disposition === 'recovered'
             ? ({ ok: true, error: null } as const)
             : (verdict ?? promptVerdictFromHealth(handle));
+        // Issue #316: whatever the reviewer's tools actually returned is
+        // judged against the rule it was admitted under, success or not.
+        this.observeBlindSession(job.id, handle.sessionFile);
         if (!evidence.ok) {
           return this.recordTurnFailure(
             job.id,
@@ -467,9 +632,12 @@ export class DispatchService {
             evidence.error ?? 'runtime settled the briefing turn with an in-band error',
           );
         }
+        // The initial briefing carries the original contract only — revision
+        // 0. A material amendment accepted while this turn ran stays pending
+        // until a continuation carrying it delivers (owner rule 2).
         const delivery = recordFollowUpDelivery({ ledger: this.opts.ledger,
           worktrees: this.opts.worktrees, jobId: job.id, agentId: handle.id, source: 'dispatch',
-          ...(handoffPhaseId !== null ? { phaseId: handoffPhaseId } : {}) });
+          ...(handoffPhaseId !== null ? { phaseId: handoffPhaseId } : {}), workRevision: 0 });
         deliveredRecorded = true;
         if (delivery.note !== null) this.log('warn', 'initial delivery has no resolvable lane head', {
           job: job.id, note: delivery.note, lane: delivery.lanePath,
@@ -492,12 +660,23 @@ export class DispatchService {
         sha: worktree.sha,
         briefing: input.briefing,
         ...(input.deliverable !== undefined ? { deliverable: input.deliverable } : {}),
+        ...(reviewSource !== null ? { reviewSource } : {}),
         agentId: handle.id,
         ...(this.opts.parentTools !== undefined && this.opts.parentTools(handle.id).length > 0
           ? { childWorkerTools: true }
           : {}),
         ...(lessons.length > 0 ? { lessons } : {}),
       });
+      // A synchronous spawn listener can change job state before briefing.
+      // No await separates this last check from actual prompt delivery.
+      try {
+        assertHandoff();
+        assertAdmissible();
+      } catch (error) {
+        await handle.dispose();
+        this.opts.ledger.setAgentState(handle.id, 'disposed');
+        throw error;
+      }
       const promptRun: Promise<unknown> =
         handle.promptWithVerdict !== undefined
           ? handle.promptWithVerdict(briefing, { owner: `dispatch:${job.id}` })
@@ -513,13 +692,18 @@ export class DispatchService {
         )
         .finally(() => {
           releaseWorker();
+          releaseJobAdmission();
         });
 
       return { job: working, worktree, agentId: handle.id, settled };
     } catch (error) {
       releaseWorker();
-      this.opts.ledger.setJobStatus(job.id, 'blocked');
-      this.opts.ledger.noteJob(job.id, `dispatch failed: ${String(error)}`);
+      releaseJobAdmission();
+      const current = this.opts.ledger.getJob(job.id);
+      if (current !== null && !isJobTerminal(current.status) && current.status !== 'parked') {
+        this.opts.ledger.setJobStatus(job.id, 'blocked');
+        this.opts.ledger.noteJob(job.id, `dispatch failed: ${String(error)}`);
+      }
       this.closeHandoffQuietly(handoffPhaseId, `dispatch failed before admission: ${String(error)}`);
       throw error;
     }
@@ -566,6 +750,37 @@ export class DispatchService {
     }
   }
 
+  /** Issue #316/#339: record the finished blind reviewer's observed tool
+   * access. This is the dispatch settle seam AND the observer the
+   * resume/re-brief settle seam is wired to (so a prohibited read during a
+   * continuation invalidates coverage). An unreadable session records nothing
+   * (never a fabricated clean pass); a failure here is logged and never
+   * blocks the report's delivery. */
+  observeBlindSession(jobId: string, sessionFile: string | null): void {
+    try {
+      observeBlindSessionAccess(
+        this.opts.ledger,
+        jobId,
+        sessionFile,
+        this.opts.sessionToolResults ?? readSessionToolResults,
+      );
+    } catch (error) {
+      this.log('error', 'blind review access observation failed', { job: jobId, error: String(error) });
+    }
+  }
+
+  /** Issue #316: blind-coverage validity of one review job (derived from the
+   * admission and observed access — never from settlement). */
+  blindCoverage(jobId: string): BlindCoverage {
+    return blindCoverageOf(this.opts.ledger, jobId);
+  }
+
+  /** Issue #316: record tool results observed outside the settle path (a
+   * LATER read by the same reviewer still invalidates its coverage). */
+  observeBlindAccess(jobId: string, results: readonly ObservedToolResult[]): BlindCoverage {
+    return recordObservedAccess(this.opts.ledger, jobId, results, 'operator');
+  }
+
   /** Capture the minion's opt-in lessons block (a bonus, never the
    * delivery contract — a failure is logged, not surfaced). */
   private captureLessons(handle: AgentHandle, jobId: string): void {
@@ -579,8 +794,8 @@ export class DispatchService {
 
   /** Record the PR link (the minion's lane artifact; merging is review's).
    * A registered PR opens the review window: working|delivered → in-review.
-   * Later states (blocked/parked/merged/done) are left as-is — a link
-   * never resurrects a lane. Merge DETECTION is not here: nothing in this
+   * Later states (blocked/parked/merged/done/binned) are left as-is — a
+   * link never resurrects a lane. Merge DETECTION is not here: nothing in this
    * service writes 'merged'; that stays the external sweep's (Silas's)
    * call — the remaining external caller of the job machine. */
   recordPr(jobId: string, url: string): JobRecord {

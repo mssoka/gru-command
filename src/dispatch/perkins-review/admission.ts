@@ -59,6 +59,17 @@ export interface AdmissionMissingInput {
   readonly input: string;
   /** Actionable detail naming exactly what is missing/inaccessible. */
   readonly detail: string;
+  /** Present only on a transient head-binding failure: a git step failed
+   * or timed out AND was confirmed stopped. The same request may be
+   * re-admitted later; every other refusal needs a person. */
+  readonly retryable?: true;
+  /** Present only when a git step that would not stop vetoed head binding:
+   * the refusal escalates naming its process group, is never retried, and
+   * no later check — a branch that turned busy — may mask it (R9-6). */
+  readonly cleanupUnconfirmed?: true;
+  /** Every unconfirmed process group, structured (never cut with the
+   * detail text). Present only with `cleanupUnconfirmed`. */
+  readonly processGroups?: readonly number[];
 }
 
 /** One executed check (pass or fail); `missing` is the failed subset. */
@@ -79,19 +90,22 @@ export interface AdmissionPreflightResult {
  * per-input DETAIL is elided when the bound demands it. */
 export class ReviewAdmissionError extends Error {
   readonly missing: readonly AdmissionMissingInput[];
-  constructor(missing: readonly AdmissionMissingInput[]) {
+  /** `note` (e.g. the scheduled automatic retry) follows the bounded list. */
+  constructor(missing: readonly AdmissionMissingInput[], note?: string) {
     // Names are stable machine identifiers (bounded set, bounded length):
     // they are never cut. Details are bounded per input and elided as a
     // group when the whole message would overflow — the elision marker
     // says so explicitly instead of silently dropping later inputs.
-    const names = missing.map((entry) => `[${entry.input}]`).join(' ');
+    const names = missing
+      .map((entry) => `[${entry.input}${entry.processGroups === undefined ? '' : ` (unconfirmed process group${entry.processGroups.length === 1 ? '' : 's'} ${entry.processGroups.join(', ')})`}]`)
+      .join(' ');
     const detailBudget = 1_400;
     let details = missing.map((entry) => `${entry.input}: ${entry.detail.slice(0, 160)}`).join('; ');
     if (Buffer.byteLength(details, 'utf8') > detailBudget) {
       details = `${details.slice(0, detailBudget)}… (remaining details elided; every missing input name is listed)`;
     }
     super(
-      `review admission preflight refused: ${missing.length} missing input(s): ${names} — ${details}`,
+      `review admission preflight refused: ${missing.length} missing input(s): ${names} — ${details}${note === undefined ? '' : ` — ${note}`}`,
     );
     this.name = 'ReviewAdmissionError';
     this.missing = missing;
@@ -182,9 +196,14 @@ function ciRecordShapeProblem(value: unknown): string | null {
 export function admissionPreflight(review: FrozenReview, movementRef: string, options?: AdmissionPreflightOptions): AdmissionPreflightResult {
   const checks: AdmissionCheck[] = [];
   const missing: AdmissionMissingInput[] = [];
-  const fail = (input: string, detail: string): void => {
+  const fail = (input: string, detail: string, retryable = false, cleanupVeto: readonly number[] | boolean = false): void => {
     checks.push({ name: input, ok: false, detail: sanitizeDetail(detail) });
-    missing.push({ input, detail: sanitizeDetail(detail) });
+    missing.push({
+      input, detail: sanitizeDetail(detail),
+      ...(retryable ? { retryable: true } : {}),
+      ...(cleanupVeto !== false ? { cleanupUnconfirmed: true } : {}),
+      ...(Array.isArray(cleanupVeto) && cleanupVeto.length > 0 ? { processGroups: cleanupVeto } : {}),
+    });
   };
   const pass = (name: string): void => {
     checks.push({ name, ok: true, detail: null });
@@ -204,16 +223,37 @@ export function admissionPreflight(review: FrozenReview, movementRef: string, op
   // R4-6: with a precomputed ASYNC probe result the sync path skips its
   // own remote lookup entirely; the merged outcome keeps the identical
   // fail-closed semantics.
-  const movement = options?.precomputedRemoteMovement !== undefined
-    ? ((): SourceMovement | null => {
-        const local = headMovedSinceFreeze(review, movementRef, { skipRemoteProbe: true });
-        return local ?? options.precomputedRemoteMovement ?? null;
-      })()
-    : headMovedSinceFreeze(review, movementRef, {
+  // R7-7: every local step runs owned, so a failure can prove it stopped.
+  const local = headMovedSinceFreeze(review, movementRef, options?.precomputedRemoteMovement !== undefined
+    ? { skipRemoteProbe: true, ownedLocalSteps: true }
+    : {
+        ownedLocalSteps: true,
         ...(options?.remoteProbeTimeoutMs !== undefined ? { remoteProbeTimeoutMs: options.remoteProbeTimeoutMs } : { remoteProbeTimeoutMs: ADMISSION_REMOTE_PROBE_TIMEOUT_MS }),
       });
-  if (movement === null) pass('head-binding');
-  else fail('head-binding', `${movement.cause}: ${movement.detail}`);
+  const remote = options?.precomputedRemoteMovement ?? null;
+  // R7-6 / #266: EVERY non-null probe outcome is combined, never one picked.
+  // A cleanup veto from either probe wins and names every unconfirmed
+  // process group (owner decision 2026-10-08); without a veto a real
+  // branch move wins over an operational (check-failed) failure; and head
+  // binding is transient only when every failing probe is a check-failed
+  // that PROVED its git stopped.
+  const probes = [local, remote].filter((entry): entry is SourceMovement => entry !== null);
+  const vetoes = probes.filter((entry) => entry.cleanupUnconfirmed === true);
+  const moves = probes.filter((entry) => entry.cause !== 'check-failed');
+  const reported = vetoes.length > 0 ? vetoes : moves.length > 0 ? moves : probes;
+  if (probes.length === 0) pass('head-binding');
+  else {
+    const groups = [...new Set(vetoes.flatMap((entry) => entry.processGroup === undefined ? [] : [entry.processGroup]))];
+    // The group ids lead: the detail text is cut downstream, they are not.
+    // Each veto's own leading verdict is folded into that one prefix.
+    const detail = groups.length > 0
+      ? `cleanup unconfirmed: process group${groups.length === 1 ? '' : 's'} ${groups.join(', ')} still running — ${
+        reported.map((entry) => `${entry.cause}: ${entry.detail.replace(/^cleanup unconfirmed: process group \d+ still running — /u, '')}`).join('; ')}`
+      : reported.map((entry) => `${entry.cause}: ${entry.detail}`).join('; ');
+    fail('head-binding', detail,
+      vetoes.length === 0 && moves.length === 0 && probes.every((entry) => entry.stopped === true),
+      vetoes.length > 0 ? groups : false);
+  }
 
   // 2. Frozen packet completeness: every declared artifact is re-read from
   //    the frozen copy and proven byte-identical to its manifest digest.

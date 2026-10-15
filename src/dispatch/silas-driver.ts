@@ -6,19 +6,23 @@ import type { SilasConfig } from '../config.js';
 import type { EventBus } from '../events/bus.js';
 import type {
   AgentRecord,
+  DecisionRecord,
   DirectiveRequestRecord,
   EventRecord,
   JobRecord,
   JobStatus,
   LedgerApi,
   PendingRebriefRecord,
+  ProviderWaitRecord,
   RoundRecord,
 } from '../ledger/api.js';
 import { LIVE_DIRECTIVE_STATES, type DirectiveState } from '../ledger/directives.js';
+import { isJobTerminal, type TerminalJobStatus } from '../ledger/states.js';
 import type { LogLevel } from '../logger.js';
 import { DECISION_SURFACE_SAME_BLOCKER, fileOfLocation, sameBlockerDecisionRequest } from '../decisions/questions.js';
 import type { DecisionService } from '../decisions/types.js';
-import { openAttemptStartSeq } from './branch-idle.js';
+import { jobStatusEventAtSeq, openAttemptStartSeq, pendingWorkRevision } from './branch-idle.js';
+import type { JobAmendmentRecord, WorkRevisionState } from '../review-inputs/amendments.js';
 import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
 import type { AgentSupervisionView } from '../supervision/supervisor.js';
 import type { GitHubPollTickResult } from './github-poll.js';
@@ -45,8 +49,9 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  *   0 disables) observes tracked branches through authenticated `gh api`
  *   (POLL-ONLY — the webhook route is descoped) and mechanically applies
  *   the GitHub state-change mappings: a merged PR closes its lane, a
- *   conflicting PR cascades an action-required notification, CI failure
- *   posts a tiered notification with the run URL, CI green records the
+ *   conflicting PR cascades an fyi notification (mechanical tier — Silas
+ *   coordinates the conflict integration); CI failure posts a tiered
+ *   notification with the run URL; CI green records the
  *   review-gate signal event. Dedupe is by observed state-change; the tier
  *   ladder and the wake kinds are unchanged.
  * - Concurrency follows the decisions runtime's one-slot replay: a trigger
@@ -78,6 +83,11 @@ export interface RoundBlocker {
    * part of the base fingerprint (it churns every round) — it only breaks
    * same-key ties inside roundBlockerKeys. */
   readonly evidence?: string;
+  /** The reviewer's recommended fix, when the report carried one. The
+   * autopilot's templated directive (issue #243) is the only consumer: a
+   * bullet without one refuses and leaves the row to LLM Silas. Never
+   * part of the fingerprint or of the digest row's decision projection. */
+  readonly recommendedFix?: string;
   /** Severity and detail ride along when the source report carries them —
    * they are PROJECTED OUT of the digest rows (kept byte-stable below)
    * but the #224 same-blocker shadow ask uses the fuller facts so its
@@ -284,6 +294,7 @@ export interface DigestLedger {
     sinceSeq: number,
   ): boolean;
   latestJobEvent(jobId: string, kind: string): EventRecord | null;
+  latestCandidateDelivery(jobId: string): EventRecord | null;
   latestRoundEvent(roundId: string, kind: string): EventRecord | null;
   listAgents(): readonly AgentRecord[];
   /** Implementer minions only (Gru ruling 2026-09-29): review-only
@@ -292,6 +303,13 @@ export interface DigestLedger {
   /** Durable re-brief markers; any row for a job is an unresolved request
    * that fences the job's review-eligibility rows (see the digest below). */
   listPendingRebriefs(opts?: { readonly jobId?: string }): readonly PendingRebriefRecord[];
+  /** The job's required vs delivered work revision (owner rule 2). */
+  workRevisionState(jobId: string): WorkRevisionState;
+  /** A corrective delivery's unpaid verification (option A), or null. */
+  correctiveVerificationDebt(jobId: string): { readonly revision: number; readonly head: string | null } | null;
+  /** Accepted amendments (version order): the revision-continuation row
+   * names the material versions its one continuation carries. */
+  listJobAmendments(jobId: string): readonly JobAmendmentRecord[];
   /** Accepted directive requests still owing completion (`dispatching` or
    * `admitted`). Presence is the lane's single-writer fence: no competing
    * continuation may be offered while one may still be driving the lane. */
@@ -299,6 +317,13 @@ export interface DigestLedger {
     readonly jobId?: string;
     readonly states?: readonly DirectiveState[];
   }): readonly DirectiveRequestRecord[];
+  /** True while a retirement's continuation hold is unreleased: the lane is
+   * fenced exactly like a live request — no competing continuation may be
+   * offered, armed or woken until a fresh accepted request supersedes it. */
+  hasOpenDirectiveRecoveryHold(jobId: string): boolean;
+  listDirectiveRecoveryHolds: LedgerApi['listDirectiveRecoveryHolds'];
+  providerWaitRetirementIdentity: LedgerApi['providerWaitRetirementIdentity'];
+  getProviderWait(id: string): ProviderWaitRecord | null;
   /** Tracked child workers (issue #161/#117): the releaseEligible sweep-ack
    * row fences on non-terminal children exactly like the release endpoint's
    * own refusal — the digest never offers a release that would 409. */
@@ -311,15 +336,16 @@ export interface DigestLedger {
   hasUnsettledVerificationRun(jobId: string): boolean;
   listProviderWaits?(opts?: { status?: string }): readonly unknown[];
   listPendingProviderRecoveries?(): readonly unknown[];
-  /** Active decision rows (issue #218): the sweep gate wakes on a passed
-   * `recheckAt` even when the digest fingerprint is unchanged. Optional
-   * because the digest itself never reads decisions. */
+  /** Active decision rows (issue #218): exact verification-failure
+   * dismissals retire repair attention, never verification debt. The sweep
+   * gate also wakes on a passed `recheckAt`. An absent reader grants no
+   * dismissal. */
   listDecisions?(opts?: {
     readonly subject?: string;
     readonly activeOnly?: boolean;
     readonly limit?: number;
     readonly offset?: number;
-  }): readonly { readonly recheckAt: string | null }[];
+  }): readonly Pick<DecisionRecord, 'id' | 'decision' | 'covers' | 'basisFingerprint' | 'recheckAt'>[];
 }
 
 /** Blockers of one round, with an explicit loud note instead of a silent
@@ -372,6 +398,15 @@ export function consolidatedBlockersFor(ledger: DigestLedger): BlockersForRound 
             : {}),
           ...(typeof finding.detail === 'string' && finding.detail.trim() !== ''
             ? { detail: finding.detail }
+            : {}),
+          // The reviewer's recommended fix (issue #243): carried for the
+          // autopilot's templated directive only — out of the fingerprint
+          // and out of the digest row projection, so provenance and the
+          // wake gate stay byte-stable. The consolidated report writes the
+          // finding field as `recommended_fix` (perkins-review types).
+          ...(typeof (finding as { recommended_fix?: unknown }).recommended_fix === 'string' &&
+          ((finding as { recommended_fix?: string }).recommended_fix ?? '').trim() !== ''
+            ? { recommendedFix: (finding as { recommended_fix: string }).recommended_fix }
             : {}),
         }));
       return Promise.resolve({ blockers, note: null });
@@ -477,11 +512,12 @@ export interface ProviderRecoveryPendingRow {
 }
 
 /** An open PR whose head is dirty against its base (issue #215): the
- * rebase is Silas's mechanical work, derived from the job's latest
+ * conflict integration is Silas's mechanical work, derived from the job's latest
  * `github.branch-state` cursor. Suppressed while any accepted operation
  * owns the lane (a live directive, a pending re-brief, an in-flight
- * verification) or a rebase directive for this exact head has landed
- * after the conflict — uncertain ownership fails closed to no row. */
+ * verification) or a conflict-integration directive for this exact head
+ * has landed after the conflict — uncertain ownership fails closed to no
+ * row. */
 export interface ConflictingPrRow {
   readonly jobId: string;
   readonly repo: string;
@@ -495,7 +531,7 @@ export interface ConflictingPrRow {
   readonly firstSeenAt: string | null;
 }
 
-/** A terminal job (merged/done) still holding its own lane worktree
+/** A terminal job (merged/done/binned) still holding its own lane worktree
  * (issue #117, g21): the sweep-ack rule's firing surface. Swept-only work
  * now APPEARS in the digest — Silas releases the lane through the worktree
  * surface with `by=silas` + `rule_id=sweep-ack`, and the release records
@@ -507,8 +543,42 @@ export interface ReleaseEligibleRow {
   readonly jobId: string;
   readonly repo: string;
   /** The terminal state the close-out rule releases on. */
-  readonly status: 'merged' | 'done';
+  readonly status: TerminalJobStatus;
   readonly branch: string | null;
+}
+
+/** A lane whose accepted MATERIAL amendments have not been delivered
+ * (owner rules 2 and 4, 2026-10-08): the candidate is outdated and review
+ * is fenced until a delivery carries the required revision. ONE
+ * continuation directive is owed — the service attaches every pending
+ * amendment's canonical text to it and stamps the revision, so the
+ * directive itself only needs to ask for the implementation. Offered only
+ * while no writer owns the lane (no live directive, no unresolved re-brief,
+ * no open attempt, no in-flight verification); retires when a delivery
+ * carries the revision. */
+export interface RevisionContinuationRow {
+  readonly jobId: string;
+  readonly repo: string;
+  readonly requiredRevision: number;
+  readonly deliveredRevision: number;
+  /** The material amendment versions the continuation will carry. */
+  readonly pendingVersions: readonly number[];
+}
+
+/** A CORRECTIVE delivery (the first carrying a new work revision) that
+ * still owes a passing verification on its exact head before review may
+ * arm (owner decision 2026-10-09, option A). Silas schedules that
+ * verification through the capture helper pinned to `head`; a failure
+ * surfaces as the ordinary verificationFailures row. Offered only while no
+ * writer owns the lane and no verification is in flight; retires on a
+ * passing run on the head (or once a review round admitted it). */
+export interface VerificationOwedRow {
+  readonly jobId: string;
+  readonly repo: string;
+  readonly revision: number;
+  /** The delivered head to verify (null: the delivery could not resolve
+   * it — verify the lane's current head). */
+  readonly head: string | null;
 }
 
 export interface SilasOpsDigest {
@@ -524,9 +594,11 @@ export interface SilasOpsDigest {
   readonly providerRecoveryPending: readonly ProviderRecoveryPendingRow[];
   readonly conflictingPrs: readonly ConflictingPrRow[];
   readonly releaseEligible: readonly ReleaseEligibleRow[];
+  readonly revisionContinuations: readonly RevisionContinuationRow[];
+  readonly verificationsOwed: readonly VerificationOwedRow[];
 }
 
-/** Count of actionable rows (event triggers wake even at zero; sweeps do not). */
+/** Count of actionable rows (an empty digest never wakes, issue #243). */
 export function digestActionCount(digest: SilasOpsDigest): number {
   return (
     digest.deliveredWithoutPr.length +
@@ -538,7 +610,9 @@ export function digestActionCount(digest: SilasOpsDigest): number {
     digest.verificationWaits.length +
     digest.providerRecoveryPending.length +
     digest.conflictingPrs.length +
-    digest.releaseEligible.length
+    digest.releaseEligible.length +
+    digest.revisionContinuations.length +
+    digest.verificationsOwed.length
   );
 }
 
@@ -558,6 +632,8 @@ const DIGEST_ROW_CATEGORIES = [
   'providerRecoveryPending',
   'conflictingPrs',
   'releaseEligible',
+  'revisionContinuations',
+  'verificationsOwed',
 ] as const;
 
 export type DigestRowCategory = (typeof DIGEST_ROW_CATEGORIES)[number];
@@ -573,7 +649,9 @@ export type DigestRow =
   | VerificationWaitingRow
   | ProviderRecoveryPendingRow
   | ConflictingPrRow
-  | ReleaseEligibleRow;
+  | ReleaseEligibleRow
+  | RevisionContinuationRow
+  | VerificationOwedRow;
 
 /**
  * Decision-relevant projection of a digest row (issue #217): identity and
@@ -657,6 +735,22 @@ export function digestRowProjection(category: DigestRowCategory, row: DigestRow)
       const r = row as ReleaseEligibleRow;
       return { jobId: r.jobId, repo: r.repo, status: r.status, branch: r.branch };
     }
+    case 'revisionContinuations': {
+      // Every field: a newer material amendment (or a partial delivery)
+      // changes what the one continuation must carry.
+      const r = row as RevisionContinuationRow;
+      return {
+        jobId: r.jobId,
+        repo: r.repo,
+        requiredRevision: r.requiredRevision,
+        deliveredRevision: r.deliveredRevision,
+        pendingVersions: [...r.pendingVersions],
+      };
+    }
+    case 'verificationsOwed': {
+      const r = row as VerificationOwedRow;
+      return { jobId: r.jobId, repo: r.repo, revision: r.revision, head: r.head };
+    }
   }
 }
 
@@ -685,6 +779,10 @@ export function digestRowKey(category: DigestRowCategory, row: DigestRow): strin
       return `${(row as ConflictingPrRow).jobId} ${(row as ConflictingPrRow).prUrl ?? ''} ${(row as ConflictingPrRow).branch ?? ''}`;
     case 'releaseEligible':
       return (row as ReleaseEligibleRow).jobId;
+    case 'revisionContinuations':
+      return (row as RevisionContinuationRow).jobId;
+    case 'verificationsOwed':
+      return `${(row as VerificationOwedRow).jobId} ${(row as VerificationOwedRow).head ?? ''}`;
   }
 }
 
@@ -764,13 +862,15 @@ export function silasBriefSections(input: {
 }): string[] {
   return [
     'You are the operations layer. Work inside your authority: dispatch,',
-    'track, close. Never write product code; never merge. Perkins owns',
-    'verdict authority. The owner holds every merge, everywhere — this',
-    'repository included: a merge is presented only after the',
-    'exact-final-head Perkins gate, and fallback PASS is not that',
-    'clearance. Preserve before remove; escalate novel failures to the',
-    'chief with pointers, not prose. Never act on the Gru chat session',
-    'itself.',
+    'track, close. Never write product code. Two merges: a worker',
+    'integrating main into its own task branch is ordinary execution you',
+    'coordinate; every final PR merge belongs to the owner, in every',
+    'repository — this one included — presented only after required final',
+    'CI and the exact-final-head Perkins gate: development-review READY,',
+    'fallback PASS, an old-head verdict and a clean textual merge are not',
+    'that clearance. Preserve before remove;',
+    'escalate novel failures to the chief with pointers, not prose.',
+    'Never act on the Gru chat session itself.',
     '',
     '## Ops surface',
     '',
@@ -919,8 +1019,35 @@ function latestReviewRequest(ledger: DigestLedger, jobId: string): EventRecord |
   const trigger = ledger.latestJobEvent(jobId, 'silas.review-triggered');
   if (trigger !== null) candidates.push(trigger);
   const fallback = ledger.latestJobEvent(jobId, 'job.fallback-review');
-  if (fallback !== null && fallbackPhaseOf(fallback) !== 'unavailable') candidates.push(fallback);
+  // A superseded gate's terminal record (owner rule 3) is not a request.
+  const supersededGate = fallback !== null && typeof fallback.payload === 'object' && fallback.payload !== null &&
+    (fallback.payload as { superseded?: unknown }).superseded === true;
+  if (fallback !== null && fallbackPhaseOf(fallback) !== 'unavailable' && !supersededGate) candidates.push(fallback);
   return candidates.sort((a, b) => b.seq - a.seq)[0] ?? null;
+}
+
+/** True when the newest round was superseded (owner rule 3): whatever head
+ * it reviewed, it never reached a verdict on the current contract, so the
+ * current delivery owes a fresh review — whether a correction re-delivered
+ * (any SHA) or the correction was retracted and the old delivery stands.
+ * The revision and verification fences gate the offer until it is due. */
+function supersededBefore(ledger: DigestLedger, round: RoundRecord, _delivered: EventRecord): boolean {
+  if (round.status !== 'aborted') return false;
+  return ledger.latestRoundEvent(round.id, 'round.superseded') !== null;
+}
+
+/** True when the delivery carries a work revision the round never froze
+ * (owner rule 2): even a posted verdict — READY included — judged an older
+ * contract, so the corrected delivery owes a fresh review on any SHA. */
+function revisionNewerThanRound(ledger: DigestLedger, round: RoundRecord, delivered: EventRecord): boolean {
+  const revision = typeof delivered.payload === 'object' && delivered.payload !== null
+    ? (delivered.payload as { work_revision?: unknown }).work_revision : undefined;
+  if (typeof revision !== 'number' || revision <= 0) return false;
+  const frozen = ledger.latestRoundEvent(round.id, 'round.review-inputs-frozen');
+  const acceptance = typeof frozen?.payload === 'object' && frozen.payload !== null
+    ? (frozen.payload as { acceptance?: { version?: unknown } | null }).acceptance : undefined;
+  const version = acceptance?.version;
+  return typeof version === 'number' && revision > version;
 }
 
 /** Fallback-gate lifecycle phases that answer nothing: the gate never
@@ -935,6 +1062,8 @@ const HANDOFF_UNARMED_KINDS: ReadonlySet<string> = new Set([
   'job.review-handoff-failed',
   'job.review-handoff-held',
   'job.review-handoff-skipped',
+  // Owner rule 3: an approved material change withdrew the queued request.
+  'job.review-handoff-withdrawn',
 ]);
 
 /** The job's latest handoff lifecycle event (null when none was recorded). */
@@ -944,6 +1073,7 @@ function latestHandoffEvent(ledger: DigestLedger, jobId: string): EventRecord | 
     'job.review-handoff-failed',
     'job.review-handoff-held',
     'job.review-handoff-skipped',
+    'job.review-handoff-withdrawn',
     'job.review-handoff-requeued',
   ];
   return kinds
@@ -1088,7 +1218,15 @@ function currentPhaseStart(ledger: DigestLedger, jobId: string): CurrentPhaseSta
   const statusHopSeq = openAttemptStartSeq(ledger, jobId);
   const statusEvent = ledger.latestJobEvent(jobId, 'job.status');
   let seq = statusHopSeq;
-  let event: EventRecord | null = statusEvent !== null && statusEvent.seq === statusHopSeq ? statusEvent : null;
+  // The latest status event is not always the attempt start: a refused
+  // review's admission flip and restore sit after it (#271). Then the
+  // start event itself — with its ORIGINAL timestamp, never the restore's —
+  // is looked up in the job history.
+  let event: EventRecord | null = statusEvent !== null && statusEvent.seq === statusHopSeq
+    ? statusEvent
+    : statusHopSeq > 0 && statusHopSeq < Number.MAX_SAFE_INTEGER
+      ? jobStatusEventAtSeq(ledger, jobId, statusHopSeq)
+      : null;
   let repairStartSeq = 0;
   for (const kind of ['silas.directive-sent', 'provider.recovery-claimed']) {
     const repair = ledger.latestJobEvent(jobId, kind);
@@ -1154,10 +1292,13 @@ function stallStillEligible(
   if ((ledger.listJobEvents(jobId, { limit: 1 })[0]?.seq ?? 0) !== jobSeqAtCompute) return false;
   const phaseStart = currentPhaseStart(ledger, jobId);
   if (phaseStart.seq !== phaseSeqAtCompute) return false;
-  const delivered = ledger.latestJobEvent(jobId, 'job.delivered');
+  const delivered = ledger.latestCandidateDelivery(jobId);
   if (delivered !== null && delivered.seq > phaseStart.seq) return false;
   if (ledger.listPendingRebriefs({ jobId }).length > 0) return false;
   if (ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length > 0) return false;
+  // A retirement's continuation hold fences exactly like a live request:
+  // no woken offer may duplicate work behind a closed control decision.
+  if (ledger.hasOpenDirectiveRecoveryHold(jobId)) return false;
   if (verificationInFlight(ledger, jobId)) return false;
   const review = latestAnsweringReviewRequest(ledger, jobId);
   if (review !== null && review.seq > phaseStart.seq) return false;
@@ -1235,7 +1376,7 @@ function stallStillEligible(
  * reconsideration — so completion/dependency transitions reach the sweep
  * without a fresh owner message; the conflictingPrs rows (issue
  * #215) — a live PR-owing lane whose open head is dirty against its
- * base, Silas's mechanical rebase work, suppressed while an accepted
+ * base, Silas's mechanical conflict-integration work, suppressed while an accepted
  * operation owns the lane and never a Gru wake; and the releaseEligible
  * rows (issue #117, g21) — a terminal job still holding its own lane,
  * the sweep-ack rule's digest surface, fenced while non-terminal child
@@ -1261,6 +1402,8 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     providerRecoveryPending: ProviderRecoveryPendingRow[];
     conflictingPrs: ConflictingPrRow[];
     releaseEligible: ReleaseEligibleRow[];
+    revisionContinuations: RevisionContinuationRow[];
+    verificationsOwed: VerificationOwedRow[];
   } = {
     computedAt: new Date(now()).toISOString(),
     trigger: input.trigger,
@@ -1274,6 +1417,8 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     providerRecoveryPending: [],
     conflictingPrs: [],
     releaseEligible: [],
+    revisionContinuations: [],
+    verificationsOwed: [],
   };
   // One unresolved re-brief request fences the target: a marker exists while
   // a re-brief worker runs (or a restart-recovered request waits for boot
@@ -1300,7 +1445,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     // release endpoint's own durable-record refusal (issue #161): a lane
     // with a non-terminal child is never offered, so the row can always be
     // acted on. Terminal jobs reach no other row — this replaces the skip.
-    if (job.status === 'merged' || job.status === 'done') {
+    if (isJobTerminal(job.status)) {
       const lane = (input.worktrees?.listWorktrees({ jobId: job.id }) ?? []).find(
         (candidate) => candidate.kind === 'job' && candidate.status !== 'swept',
       );
@@ -1314,13 +1459,17 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     }
     const rounds = [...input.ledger.listRounds(job.id)].sort((a, b) => b.seq - a.seq);
     const newestRound = rounds[0] ?? null;
-    const delivered = input.ledger.latestJobEvent(job.id, 'job.delivered');
+    const delivered = input.ledger.latestCandidateDelivery(job.id);
     const minionError = input.ledger.latestJobEvent(job.id, 'job.minion-error');
     // A request retires only the state it answered: it must postdate the
     // latest delivery, so a later unreviewed delivery re-arms the row.
     const reviewRequest = latestReviewRequest(input.ledger, job.id);
+    // A review superseded by an approved change (owner rule 3) answered
+    // nothing: the request that started it no longer retires the row — a
+    // retracted correction must re-offer the standing delivery.
+    const supersededSeq = input.ledger.listJobEventsByKinds(job.id, ['round.superseded', 'job.review-superseded'], { limit: 1 })[0]?.seq ?? 0;
     const reviewAlreadyRequested =
-      reviewRequest !== null && (delivered === null || reviewRequest.seq > delivered.seq);
+      reviewRequest !== null && (delivered === null || reviewRequest.seq > delivered.seq) && reviewRequest.seq > supersededSeq;
     const abortProof = newestRound?.status === 'aborted'
       ? input.ledger.latestRoundEvent(newestRound.id, 'round.perkins-incomplete') : null;
     const abortReason = abortProof !== null && abortProof.roundId === newestRound?.id && typeof abortProof.payload === 'object' && abortProof.payload !== null
@@ -1332,6 +1481,9 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     const answeringRequest = latestAnsweringReviewRequest(input.ledger, job.id);
     const cleanAbort = newestRound !== null && delivered !== null &&
       newestRound.status === 'aborted' &&
+      // A superseded round reviewed an obsolete candidate (owner rule 3),
+      // even when a restart interrupted its supersession: never re-armed.
+      input.ledger.latestRoundEvent(newestRound.id, 'round.superseded') === null &&
       (abortReason === 'service_restart' || abortReason === 'service_restart_missing_review_lane') &&
       deliveredTargetSha(delivered) !== null && deliveredTargetSha(delivered) === newestRound.targetRef &&
       !(answeringRequest !== null && answeringRequest.seq > (abortProof?.seq ?? 0));
@@ -1356,15 +1508,45 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     // unresolved re-brief owns the lane.
     const rebriefPending = pendingRebriefJobIds.has(job.id);
     const liveDirectiveOwns = input.ledger
-      .listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES }).length > 0;
+      .listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
+      input.ledger.hasOpenDirectiveRecoveryHold(job.id);
     const reviewPending = reviewEligibleStatus(job.status);
+    // Owner rules 2/4: an accepted material amendment the newest delivery
+    // did not carry makes the candidate outdated. Review is fenced (the
+    // shared busy predicate refuses it), so no review row is offered; the
+    // lane owes ONE continuation instead — offered only while no writer
+    // owns the lane.
+    const revision = pendingWorkRevision(input.ledger, job);
+    if (revision !== null && reviewPending && !rebriefPending && !liveDirectiveOwns &&
+        currentPhaseDelivered && !verificationInFlight(input.ledger, job.id)) {
+      digest.revisionContinuations.push({
+        jobId: job.id,
+        repo: job.repo,
+        requiredRevision: revision.required,
+        deliveredRevision: revision.delivered,
+        pendingVersions: input.ledger.listJobAmendments(job.id)
+          .filter((amendment) => amendment.effect === 'material' &&
+            amendment.version > revision.delivered && amendment.version <= revision.required)
+          .map((amendment) => amendment.version),
+      });
+    }
+    // Option A (owner, 2026-10-09): a corrective delivery is reviewed only
+    // on a verified head. While that verification is owed, the PR/review
+    // offers are withheld and the verification itself is the owed action.
+    const verificationDebt = revision === null ? input.ledger.correctiveVerificationDebt(job.id) : null;
+    if (verificationDebt !== null && reviewPending && !rebriefPending && !liveDirectiveOwns &&
+        currentPhaseDelivered && !verificationInFlight(input.ledger, job.id)) {
+      digest.verificationsOwed.push({ jobId: job.id, repo: job.repo, revision: verificationDebt.revision, head: verificationDebt.head });
+    }
 
     // (1) Delivered, no PR yet. Only PR-owing lanes (deliverable
     // null/'pr', E19) belong here: a delivered review/artifact/
     // investigation job completes at its handback, so flagging it as
     // PR-overdue would manufacture ops work and false missing-PR alarms.
+    // A pending material correction (owner rule 2) withholds the PR/review
+    // offer for the outdated candidate until the corrective delivery.
     if (delivered !== null && currentPhaseDelivered && reviewPending && !rebriefPending && !liveDirectiveOwns &&
-        job.prUrl === null && rounds.length === 0 &&
+        revision === null && verificationDebt === null && job.prUrl === null && rounds.length === 0 &&
         (job.deliverable === null || job.deliverable === 'pr')) {
       const lane = (input.worktrees?.listWorktrees({ jobId: job.id }) ?? []).find((candidate) => candidate.kind === 'job');
       // ATTRIBUTION, not routing: this pick names the implementer whose
@@ -1391,7 +1573,8 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     // An unresolved re-brief fences every row: the open re-brief turn is the
     // lane's target-owned work, so an OLDER delivery is never offered for
     // first review, re-review or clean-abort rearm.
-    if (currentPhaseDelivered && !liveDirectiveOwns && job.prUrl !== null && reviewPending && !rebriefPending) {
+    if (currentPhaseDelivered && !liveDirectiveOwns && job.prUrl !== null && reviewPending && !rebriefPending &&
+        revision === null && verificationDebt === null) {
       if (cleanAbort && newestRound !== null) {
         digest.prWithoutReview.push({ jobId: job.id, repo: job.repo, prUrl: job.prUrl,
           priorRounds: rounds.length, cleanAbort: { roundId: newestRound.id, ruleId: 'clean-abort-service-restart' } });
@@ -1400,7 +1583,11 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       } else if (
         newestRound !== null &&
         delivered !== null &&
-        followUpChangedTarget(delivered, newestRound) &&
+        // A superseded round reviewed an obsolete contract (owner rule 3):
+        // the delivery after it owes a fresh review even on the same SHA
+        // (a correction needing no code change, or an unresolved head).
+        (followUpChangedTarget(delivered, newestRound) || supersededBefore(input.ledger, newestRound, delivered) ||
+          revisionNewerThanRound(input.ledger, newestRound, delivered)) &&
         !reviewAlreadyRequested
       ) {
         digest.prWithoutReview.push({
@@ -1458,6 +1645,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
             title: blocker.title,
             location: blocker.location,
             ...(blocker.evidence !== undefined ? { evidence: blocker.evidence } : {}),
+            ...(blocker.recommendedFix !== undefined ? { recommendedFix: blocker.recommendedFix } : {}),
             fingerprint,
             consecutiveRounds,
             advice: adviseFollowThrough(consecutiveRounds, input.config),
@@ -1830,12 +2018,13 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     // is exactly as live as an in-review lane's — substituting zero here
     // would retract every delivered-lane row (issue #215 review). A phase
     // that opened during an await still retracts the offer.
-    return job !== null && job.status !== 'merged' && job.status !== 'done' &&
+    return job !== null && !isJobTerminal(job.status) &&
       currentPhaseStart(input.ledger, jobId).seq === phaseSeqByJob.get(jobId) &&
       jobSeqUnchanged(jobId) &&
       !verificationInFlight(input.ledger, jobId) &&
       input.ledger.listPendingRebriefs({ jobId }).length === 0 &&
-      input.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length === 0;
+      input.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length === 0 &&
+      !input.ledger.hasOpenDirectiveRecoveryHold(jobId);
   };
   const reviewOfferFencesHold = (jobId: string): boolean => {
     const job = input.ledger.getJob(jobId);
@@ -1848,15 +2037,114 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       phaseUnchanged(jobId) &&
       jobSeqUnchanged(jobId) &&
       !verificationInFlight(input.ledger, jobId) &&
+      // Owner rule 2: a material correction accepted during the compute
+      // withdraws the PR/review offer for the outdated candidate; a
+      // corrective delivery owing its verification (option A) likewise.
+      pendingWorkRevision(input.ledger, job) === null &&
+      input.ledger.correctiveVerificationDebt(jobId) === null &&
       input.ledger.listPendingRebriefs({ jobId }).length === 0 &&
-      input.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length === 0;
+      input.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length === 0 &&
+      !input.ledger.hasOpenDirectiveRecoveryHold(jobId);
   };
+  // Retirement closes control, never grants another turn. Every channel
+  // that can wake a continuation must honor the hold, including old
+  // verdict/verification debt and late provider evidence. Recheck after
+  // all awaits; a hold can open after the candidate was computed.
+  const continuationAllowed = (row: { readonly jobId: string }): boolean =>
+    !input.ledger.hasOpenDirectiveRecoveryHold(row.jobId) &&
+    (input.ledger.listDirectiveRecoveryHolds({ jobId: row.jobId }).length === 0 ||
+      (jobSeqUnchanged(row.jobId) &&
+       input.ledger.listPendingDirectives({ jobId: row.jobId, states: LIVE_DIRECTIVE_STATES }).length === 0 &&
+       input.ledger.listPendingRebriefs({ jobId: row.jobId }).length === 0));
+  // GH-302: only actionable repairs suppress corrective verification. Read
+  // exact scope/run dispositions at this final, no-await boundary, once per
+  // job and through every page. Other scopes are independent; the generic
+  // subject/signal covering query deliberately has different semantics.
+  const failureDecisions = new Map<string, Map<string, Pick<DecisionRecord, 'id' | 'decision' | 'recheckAt'>>>();
+  const dispositionNow = now();
+  const failureAttention = (failure: VerificationFailureRow): readonly VerificationFailureRow[] => {
+    if (failure.scope === null || failure.runId === null || input.ledger.listDecisions === undefined) return [failure];
+    let decisions = failureDecisions.get(failure.jobId);
+    if (decisions === undefined) {
+      decisions = new Map();
+      const pageSize = 500;
+      pages: for (let offset = 0;; offset += pageSize) {
+        const page = input.ledger.listDecisions({ subject: `job:${failure.jobId}`, activeOnly: true, limit: pageSize, offset });
+        for (const decision of page) {
+          if (!decision.covers.includes('verification-failure')) continue;
+          // A newer ANY-basis decision cannot authorize dismissal of an
+          // older exact failure. Preserve that fence, never borrow it.
+          if (decision.basisFingerprint === null) break pages;
+          if (!decisions.has(decision.basisFingerprint)) decisions.set(decision.basisFingerprint, decision);
+        }
+        if (page.length < pageSize) break;
+      }
+      failureDecisions.set(failure.jobId, decisions);
+    }
+    const decision = decisions.get(`verification-failure:${failure.scope}@${failure.runId}`);
+    if (decision?.decision !== 'dismissed') return [failure];
+    if (decision.recheckAt === null) return [];
+    const recheck = Date.parse(decision.recheckAt);
+    if (!Number.isFinite(recheck)) {
+      // Corrupt dismissal evidence fails closed for THIS repair, loudly,
+      // without stranding unrelated jobs by failing the whole digest.
+      return [{ ...failure, detail: `${failure.detail}; decision "${decision.id}" has an unparseable recheck_at "${decision.recheckAt}" — correct or clear the decision before reusing its dismissal` }];
+    }
+    return recheck > dispositionNow ? [] : [failure];
+  };
+  const verificationFailures = digest.verificationFailures.filter(continuationAllowed).flatMap(failureAttention);
+  // Issue #243 F-M1: an accepted directive or re-brief producer owns the
+  // lane from its durable request until its completion receipt. While that
+  // ownership is unresolved the recomputed verdict row is NOT actionable —
+  // code already owns the work — so publishing it only buys a redundant
+  // max-thinking model wake. This is the ledger's own writer-ownership test,
+  // not the earlier recovery-hold history.
+  const liveWriterOwns = (jobId: string): boolean =>
+    input.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
+    input.ledger.listPendingRebriefs({ jobId }).length > 0;
   return {
     ...digest,
+    // Issue #243 original-M2 carry-forward: the publish boundary must not
+    // offer a verdict row while a verification owns the lane. The digest
+    // computed the row before that verification settled in; without this
+    // fence a verdict row leaks to LLM Silas (a model wake) even though
+    // every autopilot verdict planner refuses it. Re-read at this final,
+    // no-await boundary like the sibling fences.
+    verdictsAwaitingDirective: digest.verdictsAwaitingDirective.filter(
+      (row) => continuationAllowed(row) && !verificationInFlight(input.ledger, row.jobId) && !liveWriterOwns(row.jobId),
+    ),
+    verificationFailures,
+    verificationWaits: digest.verificationWaits.filter(continuationAllowed),
+    minionErrors: digest.minionErrors.filter(continuationAllowed),
+    providerRecoveryPending: digest.providerRecoveryPending.filter((row) => {
+      if (row.jobId === null) return true;
+      if (!continuationAllowed({ jobId: row.jobId }) ||
+          input.ledger.listPendingDirectives({ jobId: row.jobId, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
+          input.ledger.listPendingRebriefs({ jobId: row.jobId }).length > 0) return false;
+      const wait = input.ledger.getProviderWait(row.waitId);
+      return wait !== null && input.ledger.providerWaitRetirementIdentity(wait) === 'current';
+    }),
     deliveredWithoutPr: digest.deliveredWithoutPr.filter((row) => {
       if (!reviewOfferFencesHold(row.jobId)) return false;
       const job = input.ledger.getJob(row.jobId);
       return job !== null && job.prUrl === null;
+    }),
+    verificationsOwed: digest.verificationsOwed.filter((row) => {
+      // An unresolved failure on this head owes a REPAIR, not another
+      // verification of the same bytes. Exact attention dismissal never
+      // clears the ledger's corrective verification debt or FAILED receipt.
+      if (verificationFailures.some((failure) => failure.jobId === row.jobId && failure.head === row.head)) return false;
+      if (!continuationAllowed(row) || !jobSeqUnchanged(row.jobId) || verificationInFlight(input.ledger, row.jobId) ||
+          input.ledger.listPendingDirectives({ jobId: row.jobId, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
+          input.ledger.listPendingRebriefs({ jobId: row.jobId }).length > 0) return false;
+      return input.ledger.correctiveVerificationDebt(row.jobId) !== null;
+    }),
+    revisionContinuations: digest.revisionContinuations.filter((row) => {
+      if (!continuationAllowed(row) || !jobSeqUnchanged(row.jobId) ||
+          input.ledger.listPendingDirectives({ jobId: row.jobId, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
+          input.ledger.listPendingRebriefs({ jobId: row.jobId }).length > 0) return false;
+      const job = input.ledger.getJob(row.jobId);
+      return job !== null && pendingWorkRevision(input.ledger, job) !== null;
     }),
     prWithoutReview: digest.prWithoutReview.filter((row) => {
       if (!reviewOfferFencesHold(row.jobId)) return false;
@@ -1950,6 +2238,7 @@ export type SilasTriggerKind =
   | 'provider.restored'
   | 'verification.completed'
   | 'verification.lock-timeout'
+  | 'job.amendment-accepted'
   | 'sweep';
 
 export interface SilasTrigger {
@@ -2058,6 +2347,12 @@ const SILAS_WAKE_EVENTS: readonly string[] = ['job.delivered', 'job.minion-error
 export function silasWakeEvent(event: { readonly kind: string; readonly payload?: unknown }): boolean {
   if (SILAS_WAKE_EVENTS.includes(event.kind)) return true;
   if (event.kind === 'verification.lock-timeout') return true;
+  // Owner rule 4: an accepted MATERIAL amendment owes one continuation now,
+  // not at the next sweep (administrative ones owe nothing).
+  if (event.kind === 'job.amendment-accepted') {
+    return typeof event.payload === 'object' && event.payload !== null &&
+      (event.payload as Record<string, unknown>)['effect'] === 'material';
+  }
   if (event.kind === 'verification.completed') {
     const payload =
       typeof event.payload === 'object' && event.payload !== null
@@ -2486,13 +2781,14 @@ export class SilasDriver {
   }
 
   /** Compute the digest; wake the slot only when there is something to
-   * do. Sweeps skip empty digests AND digests whose decision-relevant
-   * fingerprint is unchanged (issue #217) — unless the bounded safety
-   * re-look elapsed (`[silas] unchanged_rewake_ms`) or a recorded
-   * decision recheck passed since the last delivered wake (#218; a due
-   * recheck wakes even when the digest is empty, because the decision
-   * that stopped covering may be re-suppressing rows). Event wakes
-   * always deliver — the event itself is context Silas should see. */
+   * do. An empty digest is suppressed for EVERY trigger (issue #243): with
+   * the autopilot enforced, an event whose rows the code already handled
+   * must not buy a max-thinking turn. Sweeps additionally skip digests
+   * whose decision-relevant fingerprint is unchanged (issue #217) — unless
+   * the bounded safety re-look elapsed (`[silas] unchanged_rewake_ms`) or a
+   * recorded decision recheck passed since the last delivered wake (#218; a
+   * due recheck wakes even when the digest is empty, because the decision
+   * that stopped covering may be re-suppressing rows). */
   private async runWake(trigger: SilasTrigger): Promise<void> {
     let digest: SilasOpsDigest;
     try {
@@ -2514,12 +2810,17 @@ export class SilasDriver {
     }
     const actionable = digestActionCount(digest);
     const fingerprint = digestFingerprint(digest);
+    const recheckDue = this.decisionRecheckDue();
+    if (actionable === 0 && !recheckDue) {
+      // Issue #243: with families enforced the autopilot has already handled
+      // the rows an event raised, so the recomputed digest is empty and the
+      // event must not buy a max-thinking turn. LLM Silas wakes only when
+      // rows remain that need judgment. A due #218 decision recheck still
+      // wakes (the decision that stopped covering may re-suppress rows).
+      this.log('info', 'silas wake found nothing actionable', { trigger: trigger.kind });
+      return;
+    }
     if (trigger.kind === 'sweep') {
-      const recheckDue = this.decisionRecheckDue();
-      if (actionable === 0 && !recheckDue) {
-        this.log('info', 'silas sweep found nothing actionable', {});
-        return;
-      }
       const unchanged = this.lastDeliveredFingerprint === fingerprint;
       if (unchanged && !recheckDue) {
         const sinceDelivered =
