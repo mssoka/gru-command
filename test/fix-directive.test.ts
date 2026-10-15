@@ -1,3 +1,4 @@
+import { standaloneFixtureLedger } from './helpers/fixture-handoff.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -315,7 +316,7 @@ it('P40 preserves historical native HEADs without labeling them current candidat
 it('P40 marks original native HEAD as a candidate only on one matching clean unswept job lane', async () => {
   const repo = makeFixtureRepo('P40-native-current-candidate'); cleanupRepos.push(repo);
   const root = mkdtempSync(join(tmpdir(), 'gru-command-native-current-candidate-')); cleanupDirs.push(root);
-  const backing = new InMemoryWorktreePort(root);
+  const backing = new InMemoryWorktreePort(root, standaloneFixtureLedger('P40-current'));
   const lane = await backing.createJobWorktree({ repoPath: repo.path, jobId: 'P40-current' });
   const head = execFileSync('git', ['-C', lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
   let lanes: readonly WorktreeLane[] = [lane];
@@ -354,7 +355,7 @@ describe('recordFollowUpDelivery (the loop-closing signal)', () => {
     cleanupRepos.push(repo);
     const root = mkdtempSync(join(tmpdir(), 'gru-command-followup-lanes-'));
     cleanupDirs.push(root);
-    const worktrees = new InMemoryWorktreePort(root);
+    const worktrees = new InMemoryWorktreePort(root, standaloneFixtureLedger('job-1'));
     const lane = await worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'job-1' });
     writeFileSync(join(lane.path, 'fix.txt'), 'fixed\n');
     execFileSync('git', ['-C', lane.path, 'add', 'fix.txt']);
@@ -408,7 +409,7 @@ describe('recordFollowUpDelivery (the loop-closing signal)', () => {
     cleanupRepos.push(repo);
     const root = mkdtempSync(join(tmpdir(), 'gru-command-followup-active-'));
     cleanupDirs.push(root);
-    const worktrees = new InMemoryWorktreePort(root);
+    const worktrees = new InMemoryWorktreePort(root, standaloneFixtureLedger('job-1'));
     const lane = await worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'job-1' });
     const head = execFileSync('git', ['-C', lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
 
@@ -528,7 +529,7 @@ describe('eviction-safe fix directives (phase 3)', () => {
     const { WorkerDisposalInProgressError } = await import('../src/runtime/registry.js');
     const { registry, controller, calls } = stubRegistry(new WorkerDisposalInProgressError());
     const root = mkdtempSync(join(tmpdir(), 'fix-directive-evict-'));
-    const worktrees = new InMemoryWorktreePort(root);
+    const worktrees = new InMemoryWorktreePort(root, standaloneFixtureLedger('job-evict'));
     const repo = makeFixtureRepo('fixture-fix-evict');
     cleanupRepos.push(repo);
     await worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'job-evict' });
@@ -553,7 +554,7 @@ describe('eviction-safe fix directives (phase 3)', () => {
     const { WorkerDisposalInProgressError } = await import('../src/runtime/registry.js');
     const { registry, controller, prompted } = stubRegistry(new WorkerDisposalInProgressError());
     const root = mkdtempSync(join(tmpdir(), 'fix-directive-resume-'));
-    const worktrees = new InMemoryWorktreePort(root);
+    const worktrees = new InMemoryWorktreePort(root, standaloneFixtureLedger('job-resume'));
     const repo = makeFixtureRepo('fixture-fix-resume');
     cleanupRepos.push(repo);
     await worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'job-resume' });
@@ -601,7 +602,7 @@ describe('the non-draft PR rule on follow-up directives', () => {
         registerAgent: () => {},
         getJob: () => ({ briefing: 'original contract' }),
       } as never,
-      worktrees: {} as never,
+      worktrees: { listWorktrees: () => [] } as never,
       jobId: 'job-live',
       directive: 'open the PR for the finished fix',
       signal: new AbortController().signal,
@@ -1436,7 +1437,7 @@ describe('per-prompt terminal verdict capture (r5 blocker 1)', () => {
           registerAgent: () => {},
           getJob: () => activeJobRecord('job-queued'),
         } as never,
-        worktrees: {} as never,
+        worktrees: { listWorktrees: () => [] } as never,
         jobId: 'job-queued',
         directive: 'fix the race',
         signal: new AbortController().signal,

@@ -81,6 +81,8 @@ export interface WorktreePort {
   resolveReviewTarget(input: { repoPath: string; ref: string }): Promise<{
     readonly sha: string;
     readonly baseSource: WorktreeBaseSource | null;
+    /** Exact fetched tracking identity; null for intentional local pins. */
+    readonly trackingRef: string | null;
   }>;
   createJobWorktree(input: { repoPath: string; jobId: string }): Promise<WorktreeLane>;
   createReviewWorktree(input: {
@@ -126,7 +128,7 @@ export const WORKTREE_PORT_UNAVAILABLE =
  * registry") instead of naming the missing subsystem.
  */
 export class UnavailableWorktreePort implements WorktreePort {
-  async resolveReviewTarget(): Promise<{ readonly sha: string; readonly baseSource: WorktreeBaseSource | null }> {
+  async resolveReviewTarget(): Promise<{ readonly sha: string; readonly baseSource: WorktreeBaseSource | null; readonly trackingRef: string | null }> {
     throw new Error(WORKTREE_PORT_UNAVAILABLE);
   }
   async createJobWorktree(): Promise<WorktreeLane> {

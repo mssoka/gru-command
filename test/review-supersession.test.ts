@@ -302,8 +302,8 @@ async function heldReview(input: {
   repos.push(repo);
   repo.git(['checkout', '-b', 'feature/review']);
   const target = repo.commitFile('src/main.ts', 'export const rows = 1;\n');
-  const port = new GitReviewPort(temp('supersession-port-'), 'feature/review', target);
   const { ledger } = bootLedger();
+  const port = new GitReviewPort(temp('supersession-port-'), 'feature/review', target, ledger);
   const jobId = 'job-held';
   await port.createJobWorktree({ repoPath: repo.path, jobId });
   ledger.addJob({ id: jobId, repo: 'fixture', title: 'held', baseBranch: 'main', briefing: BRIEFING });
@@ -443,8 +443,8 @@ describe('rule 3 — the bmad-review fallback gate is a review too', () => {
     repos.push(repo);
     repo.git(['checkout', '-b', 'feature/review']);
     const target = repo.commitFile('src/main.ts', 'export const rows = 1;\n');
-    const port = new GitReviewPort(temp('supersession-fallback-port-'), 'feature/review', target);
     const { ledger } = bootLedger();
+    const port = new GitReviewPort(temp('supersession-fallback-port-'), 'feature/review', target, ledger);
     const jobId = 'job-fallback';
     await port.createJobWorktree({ repoPath: repo.path, jobId });
     ledger.addJob({ id: jobId, repo: 'fixture', title: 'fallback', baseBranch: 'main', briefing: BRIEFING });
@@ -867,11 +867,11 @@ async function plainLane(jobId = 'job-plain'): Promise<ReviewHarness> {
   repos.push(repo);
   repo.git(['checkout', '-b', 'feature/review']);
   const target = repo.commitFile('src/main.ts', 'export const rows = 1;\n');
-  const port = new GitReviewPort(temp('supersession-plain-port-'), 'feature/review', target);
   const db = new LedgerDb(temp('gru-supersession-plain-db-'));
   closers.push(async () => db.close());
   const bus = new EventBus();
   const ledger = new LedgerApi(db.handle, { bus });
+  const port = new GitReviewPort(temp('supersession-plain-port-'), 'feature/review', target, ledger);
   await port.createJobWorktree({ repoPath: repo.path, jobId });
   ledger.addJob({ id: jobId, repo: 'fixture', title: 'plain', baseBranch: 'main', briefing: BRIEFING });
   ledger.setJobStatus(jobId, 'working');
@@ -1682,13 +1682,27 @@ describe('review round 5 — nothing strands the heist', () => {
     const h = await plainLane('job-foreign-target');
     deliver(h.ledger, h.jobId);
     amend(h.ledger, h.jobId, 'material', 'Approved correction.');
-    for (const force of [false, true]) {
-      await expect(h.wave.requestReview({ jobId: h.jobId, targetRef: 'main', ...(force ? { force: true } : {}) }))
-        .rejects.toThrow(/force cannot review an obsolete candidate/);
+    h.repo.git(['tag', 'feature/review', h.repo.head()]);
+    const refs = h.repo.git(['show-ref']);
+    const lanes = h.port.listWorktrees();
+    for (const targetRef of ['main', 'gru/nonexistent', 'feature/review']) {
+      for (const force of [false, true]) {
+        const input = { jobId: h.jobId, targetRef, ...(force ? { force: true } : {}) };
+        for (const entry of ['requestReview', 'beginRound'] as const) {
+          const request = h.wave[entry](input);
+          await expect(request).rejects.toMatchObject({ name: 'BranchBusyError' });
+          await expect(request).rejects.toThrow(/force cannot review an obsolete candidate/);
+        }
+      }
     }
     const refusal = h.ledger.latestJobEvent(h.jobId, 'branch-idle.refused');
     expect(refusal?.payload).toMatchObject({ forced: false, blockers: [{ jobId: h.jobId, revision: { required: 1, delivered: 0 } }] });
+    expect(h.ledger.latestJobEvent(h.jobId, 'branch-idle.forced')).toBeNull();
+    expect(h.ledger.latestJobEvent(h.jobId, 'round.admission-preflight')).toBeNull();
+    expect(h.ledger.latestJobEvent(h.jobId, 'job.review-handoff-queued')).toBeNull();
     expect(h.ledger.listRounds(h.jobId)).toHaveLength(0);
+    expect(h.port.listWorktrees()).toEqual(lanes);
+    expect(h.repo.git(['show-ref'])).toBe(refs);
   });
 });
 
@@ -1836,11 +1850,11 @@ describe('review round 7 — latest evidence and quiet withdrawal', () => {
         return super.createReviewWorktree(input);
       }
     }
-    const port = new HeldSetupPort(temp('supersession-held-setup-port-'), 'feature/review', target);
     const db = new LedgerDb(temp('gru-supersession-held-setup-db-'));
     closers.push(async () => db.close());
     const bus = new EventBus();
     const ledger = new LedgerApi(db.handle, { bus });
+    const port = new HeldSetupPort(temp('supersession-held-setup-port-'), 'feature/review', target, ledger);
     const jobId = 'job-held-setup';
     await port.createJobWorktree({ repoPath: repo.path, jobId });
     ledger.addJob({ id: jobId, repo: 'fixture', title: 'held setup', baseBranch: 'main', briefing: BRIEFING });

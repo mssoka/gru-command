@@ -149,7 +149,7 @@ class ClaimHarness {
   readonly ledger: LedgerApi;
   readonly notifications: NotificationCenter;
   readonly registry = new FakeRegistry();
-  readonly worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'pr-wt-')));
+  readonly worktrees: InMemoryWorktreePort;
   readonly slotReArmCalls: { agentId: string; waitId: string }[] = [];
   slotReArmResult = true;
 
@@ -159,6 +159,7 @@ class ClaimHarness {
     const db = new LedgerDb(dir);
     const bus = new EventBus();
     this.ledger = new LedgerApi(db.handle, { bus });
+    this.worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'pr-wt-')), this.ledger);
     this.notifications = new NotificationCenter({ ledger: this.ledger, bus });
     cleanupDirs.push(this.worktrees.root);
   }
@@ -218,13 +219,13 @@ class ClaimHarness {
   async recoveredMinionWait(opts: { sessionFile?: string | null; jobId?: string; writeSession?: boolean } = {}): Promise<string> {
     const jobId = opts.jobId ?? `job-${++ClaimHarness.jobs}`;
     const repo = fixtureRepo();
-    await this.worktrees.createJobWorktree({ repoPath: repo.path, jobId });
     this.ledger.addJob({
       id: jobId,
       repo: repo.path,
       title: `job ${jobId}`,
       briefing: 'do the work',
     });
+    await this.worktrees.createJobWorktree({ repoPath: repo.path, jobId });
     this.ledger.setJobStatus(jobId, 'working');
     this.ledger.registerAgent({ id: `agent-${jobId}`, role: 'minion', jobId });
     const sessionFile = opts.sessionFile ?? null;

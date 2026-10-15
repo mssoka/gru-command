@@ -104,7 +104,6 @@ describe('compiled service: the production blind observer is installed at startu
     const sessionDir = mkdtempSync(join(tmpdir(), 'gru-blind-http-session-'));
     cleanup.push(home, workspace, sessionDir);
     const repo = makeFixtureRepo('fixture-blind-http'); cleanupRepos.push(repo);
-    const worktrees = new InMemoryWorktreePort(join(workspace, 'wtroot'));
     const jobId = 'job-blind-http';
     const agentId = 'minion-blind-http';
     const targetSha = 'f'.repeat(40);
@@ -118,8 +117,9 @@ describe('compiled service: the production blind observer is installed at startu
       ledger.addJob({ id: jobId, repo: 'fixture', title: 'blind review', deliverable: 'review',
         commissioner: 'fixture-owner', targetRef: targetSha, targetSha });
       ledger.setJobStatus(jobId, 'working');
+      const worktrees = new InMemoryWorktreePort(join(workspace, 'wtroot'), ledger);
       const lane = await worktrees.createJobWorktree({ repoPath: repo.path, jobId });
-      ledger.registerWorktree(lane);
+      if (ledger.getWorktree(lane.id) === null) ledger.registerWorktree(lane);
       writeFileSync(sessionFile, `${JSON.stringify({ type: 'session', id: 'blind-http-session', version: 3, cwd: lane.path })}\n`);
       ledger.registerAgent({ id: agentId, role: 'minion', jobId, sessionFile });
       ledger.setAgentState(agentId, 'idle');

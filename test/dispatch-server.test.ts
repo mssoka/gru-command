@@ -118,10 +118,10 @@ async function boot(opts: {
   const rawLedger = new LedgerApi(db.handle, { bus });
   const ledger = opts.wrapLedger === undefined ? rawLedger : opts.wrapLedger(rawLedger);
   const notifications = new NotificationCenter({ ledger, bus });
-  const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'));
+  const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'), ledger);
   const createJobLane = worktrees.createJobWorktree.bind(worktrees);
   vi.spyOn(worktrees, 'createJobWorktree').mockImplementation(async (input) => {
-    const lane = await createJobLane(input); ledger.registerWorktree(lane); return lane;
+    const lane = await createJobLane(input); if (ledger.getWorktree(lane.id) === null) ledger.registerWorktree(lane); return lane;
   }); // original lane creation, not recovery evidence
   const spawns: { role: Role; options: SpawnOptions }[] = [];
   const reviewSessions = join(dir, 'review-sessions');

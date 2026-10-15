@@ -1,3 +1,4 @@
+import { issueFixtureHandoff, standaloneFixtureLedger } from './fixture-handoff.js';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -5,7 +6,7 @@ import { join } from 'node:path';
 import type { WorktreeLane } from '../../src/dispatch/worktree-port.js';
 
 /** Real linked assignment, no origin, model, ambient BMAD or production state. */
-export function makeWorkflowLane(jobId = 'j-owned'): { readonly root: string; readonly lane: WorktreeLane; readonly dataDir: string } {
+export function makeWorkflowLane(jobId = 'j-owned', kind: WorktreeLane['kind'] = 'job'): { readonly root: string; readonly lane: WorktreeLane; readonly dataDir: string } {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'gc-workflow-session-')));
   const repoPath = join(root, 'app');
   mkdirSync(repoPath);
@@ -19,6 +20,6 @@ export function makeWorkflowLane(jobId = 'j-owned'): { readonly root: string; re
   git(['worktree', 'add', '-q', '-b', branch, path]);
   const dataDir = join(root, 'private-data');
   mkdirSync(dataDir, { mode: 0o700 });
-  return { root, dataDir, lane: { id: jobId, jobId, kind: 'job', repoPath, repoName: 'app', path,
-    branch, sha: git(['rev-parse', 'HEAD']), roundId: null, status: 'active' } };
+  return { root, dataDir, lane: issueFixtureHandoff({ id: jobId, jobId, kind, repoPath, repoName: 'app', path,
+    branch, sha: git(['rev-parse', 'HEAD']), roundId: null, status: 'active' }, standaloneFixtureLedger(jobId)) };
 }

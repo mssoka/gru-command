@@ -129,6 +129,7 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
   { file: 'review-supersession.test.ts', workload: 'real git lane lifecycle and held resident review cancellation/cessation gates over HTTP' },
   { file: 'restart-recovery-progress.test.ts', workload: 'persisted native/ledger recovery and pre-native deferral transactions over real git lanes, including physical child-host exit and frozen-owner proofs' },
   { file: 'rehearsal.test.ts', workload: 'package/build/install rehearsal with real npm' },
+  { file: 'review-git-environment.test.ts', workload: 'real review admission, canonical Git identities, invocation-custody races, worktree lifecycle and environment isolation' },
   { file: 'service-port-guard.test.ts', workload: 'real service spawns and port behavior' },
   { file: 'shutdown.test.ts', workload: 'real service signal lifecycle' },
   {

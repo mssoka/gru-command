@@ -18,6 +18,7 @@ import { recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRout
 import { reconcilePendingLegacyDirectives, reconcilePendingRebriefs, settleDirectivesFromEvidence } from '../src/dispatch/rebrief-recovery.js';
 import type { AgentHandle, SpawnOptions } from '../src/runtime/types.js';
 import { recordFollowUpDelivery, type DirectiveRegistry } from '../src/dispatch/fix-directive.js';
+import { rememberManagedLane } from '../src/worktrees/handoff.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { makeFixtureRepo } from './helpers/fixture-repo.js';
 import { resolveGitCommit } from '../src/dispatch/perkins-review/artifacts.js';
@@ -98,7 +99,7 @@ async function fixture(kind: 'directive' | 'rebrief' = 'directive', nativeCwd = 
   const bus = new EventBus({});
   const ledger = new LedgerApi(db.handle, { bus });
   const notifications = new NotificationCenter({ ledger, bus });
-  const worktrees = new InMemoryWorktreePort(join(dir, 'lanes'));
+  const worktrees = new InMemoryWorktreePort(join(dir, 'lanes'), ledger);
   const store = new SessionStore(dir);
   ledger.addJob({ id: 'approved-job', repo: 'fixture', title: 'approved', briefing: 'approved original contract', ...(report ? { deliverable: 'review' as const, commissioner: 'gru' } : {}) });
   ledger.setJobStatus('approved-job', 'working');
@@ -156,7 +157,7 @@ function originalDeliveryPayload(f: Awaited<ReturnType<typeof fixture>>) {
 
 describe('restart-recovery-progress — exact native request matrix', () => {
   async function pr334CompletedOriginalWithRecoveryDebt() {
-    const f = await fixture(); f.ledger.registerWorktree(f.lane);
+    const f = await fixture(); void (f.ledger.getWorktree(f.lane.id) ?? f.ledger.registerWorktree(f.lane));
     expect(f.ledger.claimDirectiveDispatch(f.intent.requestId)).toBe(true);
     f.ledger.prepareDirectiveTarget(f.intent.requestId, { agentId: 'logical-minion', sessionFile: f.file });
     prepareDirectiveBinding({ identity: f.identity, runtime: 'pi', agentId: 'logical-minion', sessionId: f.native.sessionId,
@@ -291,7 +292,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
   });
 
   it('PR334 cessation older ceased incarnations do not misidentify the exact latest absent host lock', async () => {
-    const f = await fixture(); f.ledger.registerWorktree(f.lane); f.seed();
+    const f = await fixture(); void (f.ledger.getWorktree(f.lane.id) ?? f.ledger.registerWorktree(f.lane)); f.seed();
     const first = inspectDirectiveProducers(f.file, f.identity)[0]!.producer;
     const firstStart = f.ledger.startDirectiveProducer(f.identity, first);
     f.ledger.appendCustomEvent({ kind: 'silas.directive-producer-ceased', jobId: f.intent.jobId, payload: {
@@ -341,7 +342,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
 
   it('PR334 cessation a fresh ledger reconciles only its own exact proven UNKNOWN cleanup before settlement', async () => {
     for (const independentUnknown of [false, true]) {
-      const f = await fixture(); f.ledger.registerWorktree(f.lane);
+      const f = await fixture(); void (f.ledger.getWorktree(f.lane.id) ?? f.ledger.registerWorktree(f.lane));
       f.ledger.prepareDirectiveTarget(f.intent.requestId, { agentId: 'logical-minion', sessionFile: f.file });
       prepareDirectiveBinding({ identity: f.identity, runtime: 'pi', agentId: 'logical-minion', sessionId: f.native.sessionId,
         sessionFile: f.file, text: 'original admitted native turn', authorityManifest: 'original authority' });
@@ -467,7 +468,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
 
   async function completeBeforeOriginalOwnerPark(report = false, parkAfterCompletion = true) {
     const f = await fixture('directive', true, report);
-    f.ledger.registerWorktree(f.lane); // actual original setup, before native execution
+    void (f.ledger.getWorktree(f.lane.id) ?? f.ledger.registerWorktree(f.lane)); // actual original setup, before native execution
     f.seed(); f.native.finish();
     const completed = inspectDirectiveCheckpoint(f.file, f.identity);
     if (completed.state !== 'terminal' || !completed.ok) throw new Error('original fixture must really reach its terminal before owner control');
@@ -803,6 +804,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     const original = f.ledger.getDirective(f.intent.requestId)!;
     f.db.close(); const db = new LedgerDb(f.dir); cleanups.push(() => db.close());
     const bus = new EventBus({}); const ledger = new LedgerApi(db.handle, { bus }); f.supervised([]);
+    for (const lane of ledger.listWorktrees()) rememberManagedLane(lane, ledger); // the reopened service re-associates its persisted lanes
     const registry: DirectiveRegistry = { getHandle: () => null, spawn: async (_role, options = {}) => {
       f.spawns.push(options);
       const handle = new PiAgentHandle('minion', f.native, f.file, PI_CAPABILITIES, false, [], f.store, () => {}, () => {}, 60000,
@@ -906,7 +908,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(f.ledger.getEvent(event.seq)).toEqual(event);
   });
   async function assertFalsePublisherDebt(mode: 'null-head' | 'dirty' | 'head-moved') {
-    const f = await fixture(); f.ledger.registerWorktree(f.lane); // before original native execution
+    const f = await fixture(); void (f.ledger.getWorktree(f.lane.id) ?? f.ledger.registerWorktree(f.lane)); // before original native execution
     f.seed(); f.native.finish(); f.ledger.bindDirectiveNativeAdmission(inspectDirectiveAdmission(f.file, f.identity));
     const proof = inspectDirectiveCheckpoint(f.file, f.identity);
     if (proof.state !== 'terminal' || !proof.ok) throw new Error('original successful native completion required');
@@ -964,6 +966,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     const nativeBytes = readFileSync(f.file, 'utf8');
     let worktrees = { listWorktrees: () => [f.lane] };
     if (mode === 'replacement') {
+      f.ledger.addJob({ id: 'different-original-lane', repo: 'fixture', title: 'different original lane' });
       const replacement = await f.worktrees.createJobWorktree({ repoPath: f.repo.path, jobId: 'different-original-lane' });
       expect(resolveGitCommit(replacement.path, 'HEAD')).toBe(head);
       worktrees = { listWorktrees: () => [{ ...f.lane, status: 'swept' as const }, { ...replacement, jobId: f.intent.jobId }] };
@@ -986,7 +989,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
 
   async function assertLedgerCandidate(mode: 'current' | 'head-moved' | 'dirty' | 'untracked' | 'replacement' | 'missing-cwd' | 'amended' | 'parked' | 'actor-moved') {
     const f = await fixture('directive', mode !== 'missing-cwd');
-    f.ledger.registerWorktree(f.lane); // original lane registration, before original native execution
+    void (f.ledger.getWorktree(f.lane.id) ?? f.ledger.registerWorktree(f.lane)); // original lane registration, before original native execution
     f.seed(); f.native.finish(); f.ledger.bindDirectiveNativeAdmission(inspectDirectiveAdmission(f.file, f.identity));
     const proof = inspectDirectiveCheckpoint(f.file, f.identity);
     if (proof.state !== 'terminal' || !proof.ok) throw new Error('original fixture terminal is required');
@@ -1002,7 +1005,10 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     if (mode === 'untracked') writeFileSync(join(f.lane.path, 'untracked-approved-input.ts'), 'export const materialInput = true;\n');
     if (mode === 'replacement') {
       f.ledger.setWorktreeStatus(f.lane.id, 'swept');
-      const replacement = await f.worktrees.createJobWorktree({ repoPath: f.repo.path, jobId: 'replacement-lane' });
+      // A same-SHA checkout the ledger attributes to the original job, distinct from the issued original lane.
+      const attributedPath = join(f.dir, 'replacement-attributed');
+      f.repo.git(['worktree', 'add', '--detach', attributedPath, head], f.repo.path);
+      const replacement = { ...f.lane, id: 'replacement-attributed', path: attributedPath };
       f.ledger.registerWorktree({ ...replacement, jobId: f.intent.jobId });
       expect(resolveGitCommit(replacement.path, 'HEAD')).toBe(head);
     }
@@ -1090,7 +1096,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
 
   it('P54 exact successful host-absent delivery retries after a ledger settlement failure without native replay', () => {
     return (async () => {
-      const f = await fixture(); f.ledger.registerWorktree(f.lane);
+      const f = await fixture(); void (f.ledger.getWorktree(f.lane.id) ?? f.ledger.registerWorktree(f.lane));
       f.ledger.prepareDirectiveTarget(f.intent.requestId, { agentId: 'logical-minion', sessionFile: f.file });
       prepareDirectiveBinding({ identity: f.identity, runtime: 'pi', agentId: 'logical-minion', sessionId: f.native.sessionId, sessionFile: f.file, text: 'original user', authorityManifest: 'original authority' });
       const producer = prepareDirectiveProducer({ identity: f.identity, agentId: 'logical-minion', sessionId: f.native.sessionId, sessionFile: f.file });
@@ -1225,12 +1231,14 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       import { LedgerApi } from ${JSON.stringify(`${process.cwd()}/dist/ledger/api.js`)};
       import { EventBus } from ${JSON.stringify(`${process.cwd()}/dist/events/bus.js`)};
       import { SessionStore } from ${JSON.stringify(`${process.cwd()}/dist/sessions/store.js`)};
+      import { rememberManagedLane } from ${JSON.stringify(`${process.cwd()}/dist/worktrees/handoff.js`)};
       import { PiAgentHandle, PI_CAPABILITIES } from ${JSON.stringify(`${process.cwd()}/dist/runtime/pi-adapter.js`)};
       import { executeAcceptedDirective } from ${JSON.stringify(`${process.cwd()}/dist/dispatch/directive-progress.js`)};
       function deferred() { let resolve; const promise = new Promise((done) => { resolve = done; }); return { promise, resolve }; }
       const NativeFixture = ${NativeFixture.toString().replace(/__vite_ssr_import_\d+__\./g, '')};
       const db = new LedgerDb(${JSON.stringify(f.dir)});
       const ledger = new LedgerApi(db.handle, { bus: new EventBus({}) });
+      for (const lane of ledger.listWorktrees()) rememberManagedLane(lane, ledger);
       const store = new SessionStore(${JSON.stringify(f.dir)});
       const native = new NativeFixture(${JSON.stringify(f.file)}); native.autoFinish = false;
       const manifest = ${JSON.stringify(JSON.stringify({ role: 'minion', cwd: f.lane.path, tools: ['read', 'bash'], model: 'fixture/model' }))};

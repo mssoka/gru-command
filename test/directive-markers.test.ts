@@ -494,12 +494,12 @@ describe('directive requests — the real service path (HTTP 202 + readback)', (
     const bus = new EventBus({});
     const ledger = new LedgerApi(db.handle, { bus });
     const notifications = new NotificationCenter({ ledger, bus });
-    const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'));
+    const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'), ledger);
     ledger.addJob({ id: 'job-h1', repo: 'r', title: 'Job H1' });
     ledger.setJobStatus('job-h1', 'working');
     const repo = makeFixtureRepo('directive-http-original-lane');
     const lane = await worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'job-h1' });
-    ledger.registerWorktree(lane);
+    if (ledger.getWorktree(lane.id) === null) ledger.registerWorktree(lane);
     const registry = new FakeMinions(lane.path);
     registry.register('minion-h1');
     ledger.registerAgent({ id: 'minion-h1', role: 'minion', sessionFile: registry.getHandle('minion-h1')!.sessionFile, jobId: 'job-h1' });

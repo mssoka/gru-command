@@ -704,7 +704,7 @@ class DispatchSeamHarness {
     const bus = new EventBus();
     this.ledger = new LedgerApi(db.handle, { bus });
     this.notifications = new NotificationCenter({ ledger: this.ledger, bus });
-    this.worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'pr-dispatch-seam-wt-')));
+    this.worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'pr-dispatch-seam-wt-')), this.ledger);
     cleanupDirs.push(this.worktrees.root);
     this.repoPath = mkdtempSync(join(tmpdir(), 'pr-dispatch-seam-repo-'));
     cleanupDirs.push(this.repoPath);

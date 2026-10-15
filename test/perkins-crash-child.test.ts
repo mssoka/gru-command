@@ -50,7 +50,7 @@ describe.skipIf(payloadPath === undefined)('perkins crash child (R19)', () => {
 
     const db = new LedgerDb(spec.dbPath);
     const ledger = new CrashBeforeVerdictLedger(db.handle, { bus: new EventBus() });
-    const port = new PersistedReviewPort(spec.portRoot, spec.branch, spec.target);
+    const port = new PersistedReviewPort(spec.portRoot, spec.branch, spec.target, ledger);
     await port.createJobWorktree({ repoPath: spec.repoPath, jobId: 'job-p3-crash' });
     const job = ledger.addJob({ id: 'job-p3-crash', repo: 'fixture', title: 'crash child', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');

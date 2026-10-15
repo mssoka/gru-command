@@ -1402,12 +1402,12 @@ function idleHandle(id: string, opts: { fail?: Error } = {}): AgentHandle {
 
 /** A real job lane (a git worktree on its own branch) — the native directive
  * executor refuses fresh effects without a registered, checked-out lane. */
-async function nativeLanes(jobId: string): Promise<InMemoryWorktreePort> {
+async function nativeLanes(jobId: string, ledger: LedgerApi): Promise<InMemoryWorktreePort> {
   const repo = makeFixtureRepo();
   repos.push(repo);
   const laneRoot = mkdtempSync(join(tmpdir(), 'autopilot-native-lanes-'));
   dirs.push(laneRoot);
-  const lanes = new InMemoryWorktreePort(laneRoot);
+  const lanes = new InMemoryWorktreePort(laneRoot, ledger);
   await lanes.createJobWorktree({ repoPath: repo.path, jobId });
   return lanes;
 }
@@ -1552,8 +1552,8 @@ describe('the production directive settlement keeps unknown admission live (issu
     repos.push(repo);
     const laneRoot = mkdtempSync(join(tmpdir(), 'autopilot-lanes-'));
     dirs.push(laneRoot);
-    const lanes = new InMemoryWorktreePort(laneRoot);
     const ledger = newRealLedger();
+    const lanes = new InMemoryWorktreePort(laneRoot, ledger);
     const job = ledger.addJob({ id: 'job-m9', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
     ledger.setJobStatus(job.id, 'working');
     await lanes.createJobWorktree({ repoPath: repo.path, jobId: job.id });
@@ -1596,8 +1596,8 @@ describe('the production directive settlement keeps unknown admission live (issu
     repos.push(repo);
     const laneRoot = mkdtempSync(join(tmpdir(), 'autopilot-lanes-'));
     dirs.push(laneRoot);
-    const lanes = new InMemoryWorktreePort(laneRoot);
     const ledger = newRealLedger();
+    const lanes = new InMemoryWorktreePort(laneRoot, ledger);
     const job = ledger.addJob({ id: 'job-h3', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'original' });
     ledger.setJobStatus(job.id, 'working');
     await lanes.createJobWorktree({ repoPath: repo.path, jobId: job.id });
@@ -1648,8 +1648,8 @@ describe('the production re-brief finalization carries autopilot provenance (iss
     repos.push(repo);
     const laneRoot = mkdtempSync(join(tmpdir(), 'autopilot-lanes-'));
     dirs.push(laneRoot);
-    const lanes = new InMemoryWorktreePort(laneRoot);
     const ledger = newRealLedger();
+    const lanes = new InMemoryWorktreePort(laneRoot, ledger);
     const job = ledger.addJob({ id: 'job-m10', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
     ledger.setJobStatus(job.id, 'working');
     await lanes.createJobWorktree({ repoPath: repo.path, jobId: job.id });
@@ -2248,7 +2248,7 @@ describe('R2-H9 service-stop ownership of directive/re-brief producers', () => {
     const ledger = newRealLedger();
     const job = ledger.addJob({ id: 'job-r2h9b', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
     ledger.setJobStatus(job.id, 'working');
-    const lanes = await nativeLanes(job.id);
+    const lanes = await nativeLanes(job.id, ledger);
     const handle = nativeHandle(idleHandle('min-r2h9'), lanes, job.id);
     ledger.registerAgent({ id: 'min-r2h9', role: 'minion', jobId: job.id, sessionFile: handle.sessionFile });
     ledger.setAgentState('min-r2h9', 'idle');
@@ -2372,9 +2372,9 @@ describe('R2-M4 production ops drive a REAL WaveRunner admission/freeze', () => 
     const artifacts = mkdtempSync(join(tmpdir(), `r2m4-${name}-art-`));
     dirs.push(artifacts);
     const ledger = newRealLedger();
-    const port = new GitReviewPort(root, 'feature/r2m4', deliveredSha);
-    await port.createJobWorktree({ repoPath: repo.path, jobId: name });
+    const port = new GitReviewPort(root, 'feature/r2m4', deliveredSha, ledger);
     const job = ledger.addJob({ id: name, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review this' });
+    await port.createJobWorktree({ repoPath: repo.path, jobId: name });
     ledger.setJobStatus(job.id, 'working');
     ledger.appendCustomEvent({ kind: 'job.delivered', jobId: job.id, payload: { sha: deliveredSha } });
     return { jobId: name, deliveredSha, liveHeadB, artifacts, ledger, port };
@@ -2842,7 +2842,7 @@ describe('F-H3 verification ownership is re-proved after the pacing wait', () =>
     ledger.registerAgent({ id: 'min-fh3', role: 'minion', jobId: job.id });
     ledger.setAgentState('min-fh3', 'idle');
     let prompted = 0;
-    const lanes = await nativeLanes(job.id);
+    const lanes = await nativeLanes(job.id, ledger);
     const handle = nativeHandle({
       ...idleHandle('min-fh3'),
       async prompt() {
@@ -2885,8 +2885,8 @@ describe('F-H4 the shutdown producer join settles after disposal releases the ha
     repos.push(repo);
     const laneRoot = mkdtempSync(join(tmpdir(), 'fh4-rebrief-lanes-'));
     dirs.push(laneRoot);
-    const lanes = new InMemoryWorktreePort(laneRoot);
     const ledger = newRealLedger();
+    const lanes = new InMemoryWorktreePort(laneRoot, ledger);
     const job = ledger.addJob({ id: 'job-fh4r', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
     ledger.setJobStatus(job.id, 'working');
     await lanes.createJobWorktree({ repoPath: repo.path, jobId: job.id });
@@ -3055,7 +3055,7 @@ describe('F-M1 the real driver does not wake for verdict work an accepted produc
     const ledger = newRealLedger();
     const jobId = 'job-fm1w';
     seedVerdictJob(ledger, jobId);
-    const lanes = await nativeLanes(jobId);
+    const lanes = await nativeLanes(jobId, ledger);
     let entered = false;
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
@@ -3102,8 +3102,8 @@ describe('F-M1 the real driver does not wake for verdict work an accepted produc
     repos.push(repo);
     const laneRoot = mkdtempSync(join(tmpdir(), 'fm1-rebrief-lanes-'));
     dirs.push(laneRoot);
-    const lanes = new InMemoryWorktreePort(laneRoot);
     const ledger = newRealLedger();
+    const lanes = new InMemoryWorktreePort(laneRoot, ledger);
     const jobId = 'job-fm1rebrief';
     seedVerdictJob(ledger, jobId);
     await lanes.createJobWorktree({ repoPath: repo.path, jobId });
@@ -3143,8 +3143,8 @@ describe('F-H3 verification ownership re-proved at the fresh-spawn and re-brief 
     repos.push(repo);
     const laneRoot = mkdtempSync(join(tmpdir(), 'fh3-fresh-lanes-'));
     dirs.push(laneRoot);
-    const lanes = new InMemoryWorktreePort(laneRoot);
     const ledger = newRealLedger();
+    const lanes = new InMemoryWorktreePort(laneRoot, ledger);
     const job = ledger.addJob({ id: 'job-fh3-fresh', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
     ledger.setJobStatus(job.id, 'working');
     await lanes.createJobWorktree({ repoPath: repo.path, jobId: job.id });
@@ -3188,8 +3188,8 @@ describe('F-H3 verification ownership re-proved at the fresh-spawn and re-brief 
     repos.push(repo);
     const laneRoot = mkdtempSync(join(tmpdir(), 'fh3-rebrief-lanes-'));
     dirs.push(laneRoot);
-    const lanes = new InMemoryWorktreePort(laneRoot);
     const ledger = newRealLedger();
+    const lanes = new InMemoryWorktreePort(laneRoot, ledger);
     const job = ledger.addJob({ id: 'job-fh3-rebrief', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
     ledger.setJobStatus(job.id, 'working');
     await lanes.createJobWorktree({ repoPath: repo.path, jobId: job.id });

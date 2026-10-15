@@ -1230,6 +1230,23 @@ export function sourceMovementSinceFreeze(review: FrozenReview, options?: Source
       return movement('target-moved', `target ${targetRef} cannot resolve: ${gitErrorDetail(error)}`);
     }
     if (localTarget !== targetSha) return movement('target-moved', `target ${targetRef} is ${localTarget}, frozen at ${targetSha}`);
+    // Perkins captures fully-qualified canonical identity in targetRef at
+    // freeze. SHA/expression pins have no named authority to rediscover.
+    if (targetRef.startsWith('refs/')) {
+      let named = true;
+      try { run(repoPath, ['check-ref-format', targetRef]); }
+      catch (error) { if (refusedRefFormat(error)) named = false; else throw error; }
+      if (named) {
+        let identity: string;
+        try { identity = run(repoPath, ['rev-parse', '--symbolic-full-name', '--verify', targetRef]).trim(); }
+        catch (error) {
+          if (!isUnstopped(error) && refUnresolved(error)) return movement('target-moved', `named identity ${targetRef} cannot resolve`);
+          throw error;
+        }
+        if (!identity.startsWith('refs/')) throw new Error(`canonical named identity for ${targetRef} is unverifiable`);
+        if (identity !== targetRef) return movement('target-moved', `named identity ${targetRef} changed to ${identity}`);
+      }
+    }
     // A push may move the host tip without moving the local tracking ref.
     if (options?.skipRemoteProbe === true) {
       // The caller owns the advertised-tip proof (async path).

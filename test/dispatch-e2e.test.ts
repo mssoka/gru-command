@@ -103,7 +103,7 @@ function makeDispatchHarness(opts: {
   const bus = new EventBus({});
   const ledger = new LedgerApi(ledgerDb.handle, { bus });
   const engine = new BoardEngine({ ledger, bus });
-  const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-e2ewt-')));
+  const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-e2ewt-')), ledger);
   const spawns: { role: Role; options: SpawnOptions }[] = [];
   const handles: FakeHandle[] = [];
   const reviewSessions = join(dataDir, 'review-sessions');
@@ -325,7 +325,7 @@ describe('end-to-end dispatch (E8 story 4)', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'gru-command-e2efail-'));
     const ledgerDb = new LedgerDb(dataDir);
     const ledger = new LedgerApi(ledgerDb.handle, { bus: new EventBus({}) });
-    const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-e2efailwt-')));
+    const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-e2efailwt-')), ledger);
     const dispatch = new DispatchService({
       ledger,
       worktrees,

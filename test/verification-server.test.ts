@@ -107,7 +107,7 @@ async function boot(opts: {
   const config = loadConfig({ GRU_COMMAND_HOME: dir }, '/home/tester');
   let db = new LedgerDb(dir);
   let ledger = new LedgerApi(db.handle, { bus: new EventBus({}) });
-  const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'));
+  const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'), ledger);
   const repo = makeFixtureRepo('verify-app');
   repos.push(repo);
   if (opts.manifest !== null) {
@@ -219,7 +219,7 @@ describe('POST /api/verify', () => {
     const started = h.ledger.latestJobEvent(h.jobId, 'verification.started')!;
     const facts = started.payload as { pid: number; command: string; cwd: string };
     const lane = h.worktrees.listWorktrees({ jobId: h.jobId })[0]!;
-    h.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: h.repo.path, path: lane.path, branch: lane.branch,
+    if (h.ledger.getWorktree(lane.id) === null) h.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: h.repo.path, path: lane.path, branch: lane.branch,
       sha: h.repo.head(), kind: 'job', jobId: h.jobId });
     h.ledger.recordWorktreeProcesses({ worktreeId: lane.id, state: 'live', processes: [{ pid: facts.pid, command: `/bin/sh -c ${facts.command}`, evidence: 'registry' }] });
     for (let i = 0; i < 2; i += 1) h.ledger.appendCustomEvent({ kind: 'verification.process-started', jobId: h.jobId,
@@ -467,7 +467,7 @@ describe('verification single-flight + reconcile (issue #159)', () => {
     const first = await pending;
     const outcome = outcomeOf(completedFrame(first.frames)); expect(outcome['ok']).toBe(false); expect(outcome['signal']).toBe('SIGTERM');
     const lane = harness.worktrees.listWorktrees({ jobId: harness.jobId })[0]!;
-    harness.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: harness.repo.path, path: lane.path, branch: lane.branch, sha: harness.repo.head(), kind: 'job', jobId: harness.jobId });
+    if (harness.ledger.getWorktree(lane.id) === null) harness.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: harness.repo.path, path: lane.path, branch: lane.branch, sha: harness.repo.head(), kind: 'job', jobId: harness.jobId });
     const started = harness.ledger.latestJobEvent(harness.jobId, 'verification.started')!;
     const payload = started.payload as { pid: number; command: string };
     const live = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
@@ -508,7 +508,7 @@ describe('verification single-flight + reconcile (issue #159)', () => {
     } });
     const lane = h.worktrees.listWorktrees({ jobId: h.jobId })[0]!;
     // Original lane facts precede any acceptance or native process registration.
-    h.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: h.repo.path, path: lane.path, branch: lane.branch,
+    if (h.ledger.getWorktree(lane.id) === null) h.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: h.repo.path, path: lane.path, branch: lane.branch,
       sha: h.repo.head(), kind: 'job', jobId: h.jobId });
     if (mode === 'reused-build') {
       const prime = await call(h.port, { job_id: h.jobId, scope: 'prime', request_id: 'r15-original-prime' });
@@ -581,7 +581,7 @@ describe('verification single-flight + reconcile (issue #159)', () => {
     const started = h.ledger.latestJobEvent(h.jobId, 'verification.started')!;
     const facts = started.payload as { pid: number; command: string; cwd: string };
     const lane = h.worktrees.listWorktrees({ jobId: h.jobId })[0]!;
-    h.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: h.repo.path, path: lane.path, branch: lane.branch, sha: h.repo.head(), kind: 'job', jobId: h.jobId });
+    if (h.ledger.getWorktree(lane.id) === null) h.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: h.repo.path, path: lane.path, branch: lane.branch, sha: h.repo.head(), kind: 'job', jobId: h.jobId });
     h.ledger.recordWorktreeProcesses({ worktreeId: lane.id, state: 'live', processes: [{ pid: facts.pid, command: `/bin/sh -c ${facts.command}`, evidence: 'registry' }] });
     if (fault === 'unbound') h.db.handle.prepare('DELETE FROM events WHERE seq = ?').run(started.seq);
     if (fault === 'conflicting-start') h.ledger.appendCustomEvent({ jobId: h.jobId, kind: 'verification.started', payload: { ...facts, run_id: runId, pid: facts.pid + 1 } });

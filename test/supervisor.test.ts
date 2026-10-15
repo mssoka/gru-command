@@ -5314,7 +5314,7 @@ describe('worker delivery settlement under automatic rate-limit retry', () => {
       h.registry.adopt(handle);
       const service = new DispatchService({
         ledger: h.api,
-        worktrees: new InMemoryWorktreePort(root),
+        worktrees: new InMemoryWorktreePort(root, h.api),
         spawner: async () => handle,
         workerGate: gate,
         retrySettlement: (agentId) => h.supervisor.awaitRetrySettlement(agentId),
@@ -5367,7 +5367,7 @@ describe('worker delivery settlement under automatic rate-limit retry', () => {
       h.registry.adopt(handle);
       const service = new DispatchService({
         ledger: h.api,
-        worktrees: new InMemoryWorktreePort(root),
+        worktrees: new InMemoryWorktreePort(root, h.api),
         spawner: async () => handle,
         workerGate: gate,
         retrySettlement: (agentId) => h.supervisor.awaitRetrySettlement(agentId),

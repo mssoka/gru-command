@@ -1,3 +1,4 @@
+import { capturePortLaneHandoff } from '../worktrees/handoff.js';
 import { randomUUID } from 'node:crypto';
 import { requireArtifactJobId } from '../artifacts/context.js';
 import type { LogLevel } from '../logger.js';
@@ -406,6 +407,7 @@ export class DispatchService {
         repoPath: input.repoPath,
         jobId: job.id,
       });
+      const assertHandoff = capturePortLaneHandoff(this.opts.worktrees, worktree);
       if (reviewSource !== null) {
         try {
           assertLaneUsesBoundStore(job.id, reviewSource, worktree.path);
@@ -446,6 +448,7 @@ export class DispatchService {
       }
       let handle: AgentHandle;
       try {
+        assertHandoff();
         assertAdmissible();
         const cwd = requireSpawnCwd('minion', worktree.path);
         // Issue #161: a dispatched parent gets a product-owned identity and
@@ -462,7 +465,8 @@ export class DispatchService {
           ...(parentNativeTools.length > 0 ? { nativeTools: parentNativeTools } : {}),
         });
         try {
-          assertAdmissible();
+          assertHandoff();
+        assertAdmissible();
         } catch (error) {
           await handle.dispose();
           throw error;
@@ -486,6 +490,7 @@ export class DispatchService {
         jobId: job.id,
         parentage: 'top-level',
       });
+      try { assertHandoff(); } catch (error) { await handle.dispose(); throw error; }
       // Bind the admitted worker to the marked phase BEFORE its prompt runs:
       // a delivery from any other worker can never complete this phase.
       if (handoffPhaseId !== null) {
@@ -665,6 +670,7 @@ export class DispatchService {
       // A synchronous spawn listener can change job state before briefing.
       // No await separates this last check from actual prompt delivery.
       try {
+        assertHandoff();
         assertAdmissible();
       } catch (error) {
         await handle.dispose();

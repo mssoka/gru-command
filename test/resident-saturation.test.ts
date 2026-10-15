@@ -1,3 +1,4 @@
+import { issueFixtureHandoff, standaloneFixtureLedger } from './helpers/fixture-handoff.js';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -38,6 +39,9 @@ describe('four-busy-minion saturation and complete whole-PR Perkins coverage', (
     });
     const lane = join(dir, 'job-lane');
     repo.git(['worktree', 'add', '-b', 'gru/job-saturation', lane, 'feature/review']);
+    issueFixtureHandoff({ id: 'job-saturation', kind: 'job', jobId: 'job-saturation', roundId: null,
+      repoPath: repo.path, repoName: 'saturation-fixture', path: lane, branch: 'gru/job-saturation', sha: repo.head(), status: 'active' },
+    standaloneFixtureLedger('job-saturation'));
     const deliverable = join(lane, 'deliverable.untracked');
     writeFileSync(deliverable, 'preserved by residency release\n');
     const script = fakeWholeSpawner(sessions, { childAnswer: () => '[]' });

@@ -1,3 +1,4 @@
+import { issueFixtureHandoff } from './helpers/fixture-handoff.js';
 import { verificationLane } from './helpers/worker-verification.js';
 import { execFileSync } from 'node:child_process';
 import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -154,7 +155,7 @@ describe('production owned workflow session binding', () => {
       override async createJobWorktree(input?: { jobId: string }) {
         if (input === undefined) throw new Error('fixture dispatch requires a job identity');
         const f = [a, b, c].find((item) => item.lane.id === input.jobId)!;
-        return ledger.registerWorktree(f.lane);
+        return issueFixtureHandoff(f.lane, ledger);
       }
       override getWorktree(id: string) { return ledger.getWorktree(id); }
       override listWorktrees(options?: { jobId?: string }) { return ledger.listWorktrees(options); }
@@ -200,7 +201,7 @@ describe('production owned workflow session binding', () => {
     const ledger = new LedgerApi(db.handle);
     for (const f of [a, b, historical]) {
       ledger.addJob({ id: f.lane.id, repo: 'app', title: 'review', baseBranch: 'main' });
-      ledger.registerWorktree(f.lane);
+      issueFixtureHandoff(f.lane, ledger);
       ledger.appendCustomEvent({ kind: 'job.delivered', jobId: f.lane.id, payload: {} });
     }
     const first = serviceWorkflowAuthority(a.dataDir, () => ledger).resolveReviewResources(a.lane.id);
@@ -333,7 +334,8 @@ describe('production owned workflow session binding', () => {
     const bb = createWorkflowSessionBinder(a.dataDir, () => b.lane)({ cwd: b.lane.path }).managedSkills!;
     expect(aa.workflow!.context.artifactRoot).not.toBe(bb.workflow!.context.artifactRoot);
     expect(() => createWorkflowSessionBinder(a.dataDir, () => null)({})).toThrow(/live registered assignment/u);
-    expect(createWorkflowSessionBinder(a.dataDir, () => ({ ...a.lane, kind: 'child' }))({ cwd: a.lane.path })).toEqual({ cwd: a.lane.path });
+    const child = makeWorkflowLane('bounded-child', 'child'); roots.push(child.root);
+    expect(createWorkflowSessionBinder(child.dataDir, () => child.lane)({ cwd: child.lane.path })).toEqual({ cwd: child.lane.path });
     expect(createWorkflowSessionBinder(a.dataDir, () => a.lane)({ roleTools: ['read', 'write'] })).toEqual({ cwd: a.lane.path });
     expect(createWorkflowSessionBinder(a.dataDir, () => a.lane, undefined, () => false)({ resumeFile: '/report-session.jsonl' })).toEqual({ cwd: a.lane.path });
     chmodSync(aa.workflow!.context.artifactRoot, 0o755);
@@ -365,14 +367,14 @@ describe('production owned workflow session binding', () => {
     for (const mode of ['fix', 'rebrief'] as const) for (const parentage of [null, 'top-level'] as const) {
       const f = fixture(); const db = new LedgerDb(f.dataDir); const ledger = new LedgerApi(db.handle);
       ledger.addJob({ id: f.lane.id, repo: f.lane.repoName, title: 'original job', briefing: 'original contract' });
-      ledger.registerWorktree(f.lane);
+      issueFixtureHandoff(f.lane, ledger);
       ledger.registerAgent({ id: 'original-minion', role: 'minion', jobId: f.lane.id, sessionFile: null, parentage });
       const authority = serviceWorkflowAuthority(f.dataDir, () => ledger);
       authority.resolveReviewResources(f.lane.id);
       const retained = readBmadRuntimeBinding(f.lane.path, join(f.dataDir, 'bmad-runtime'))!;
       class Port extends UnavailableWorktreePort {
-        override getWorktree(id: string) { return id === f.lane.id ? f.lane : null; }
-        override listWorktrees() { return [f.lane]; }
+        override getWorktree(id: string) { return ledger.getWorktree(id); }
+        override listWorktrees() { return ledger.listWorktrees(); }
       }
       const h = host('pi', f, authority); const worktrees = new Port();
       try {
@@ -439,7 +441,14 @@ describe('registered scheduled verification policy transport', () => {
         isolatedReview: { systemPrompt: 'isolated', tools: ['read'] } });
       expect(h.seen[1]!.workerVerification).toBeUndefined();
       await review.dispose();
-      const child = createWorkflowSessionBinder(f.dataDir, () => ({ ...f.lane, kind: 'child' }))({ roleTools: ['read'] });
+      // A job receipt cannot authorize a kind-spread child. Use an actually
+      // issued child with the same declaration so exclusion is non-vacuous.
+      const childFixture = makeWorkflowLane('verification-child', 'child'); roots.push(childFixture.root);
+      mkdirSync(join(childFixture.lane.path, '.gru-command'), { recursive: true });
+      writeFileSync(join(childFixture.lane.path, '.gru-command/worktree.toml'),
+        readFileSync(join(f.lane.path, '.gru-command/worktree.toml')));
+      const child = createWorkflowSessionBinder(childFixture.dataDir, () => childFixture.lane,
+        undefined, undefined, undefined, f.session.workerVerification!.configFile)({ roleTools: ['read'] });
       expect(child.workerVerification).toBeUndefined();
     } finally { await h.registry.dispose(); }
   });
