@@ -241,7 +241,7 @@ describe('review Git repository environment isolation (GH-270)', () => {
       const prompt = vi.fn(async () => { writeFileSync(sessionFile, JSON.stringify({ type: 'message', message: { role: 'assistant', content: [{ type: 'text', text: 'Final report: completed isolated task.' }] } }) + '\n'); });
       const spawner = vi.fn(async (role: Role, options?: { agentId?: string }): Promise<AgentHandle> => ({ id: options?.agentId ?? 'child', role, sessionFile,
         capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
-        prompt, steer: async () => {}, followUp: async () => {}, subscribe: () => () => {},
+        prompt, steer: async () => {}, followUp: async () => {}, cessationEvidence: () => (ceased ? 'ceased' as const : 'unknown' as const), subscribe: () => () => {},
         health: () => ({ state: ceased ? 'disposed' : 'idle', lastActivity: null, sessionFile }), dispose: async () => { ceased = true; } }));
       const createChild = vi.spyOn(h.worktrees, 'createChildWorktree');
       const children = new ChildWorkerService({ ledger: h.ledger, worktrees: h.worktrees, spawner });
@@ -436,7 +436,7 @@ describe('review Git repository environment isolation (GH-270)', () => {
         const listeners = new Set<RuntimeEventListener>();
         const id = `descendant-minion-${++spawnCount}`;
         return { id, role, sessionFile: null, capabilities: adapter.capabilities, prompt: prompted,
-          steer: async () => {}, followUp: async () => {}, health: () => ({ state: ceased ? 'disposed' : 'idle', lastActivity: null, sessionFile: null }),
+          steer: async () => {}, followUp: async () => {}, cessationEvidence: () => (ceased ? 'ceased' as const : 'unknown' as const), health: () => ({ state: ceased ? 'disposed' : 'idle', lastActivity: null, sessionFile: null }),
           hasLiveProcess: () => !ceased, isCompacting: () => false,
           subscribe: (listener: RuntimeEventListener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
           dispose: async () => { ceased = true; for (const listener of listeners) listener({ type: 'state', state: 'disposed' }); } };
@@ -993,10 +993,10 @@ describe('review Git repository environment isolation (GH-270)', () => {
           const target = options.cwd === lane.path;
           let ceased = false;
           const listeners = new Set<RuntimeEventListener>();
-          const cease = () => { ceased = true; for (const listener of listeners) listener({ type: 'state', state: 'disposed' }); };
+          const cease = () => { ceased = true; for (const listener of listeners) { listener({ type: 'state', state: 'disposed' }); if (ceased) listener({ type: 'cessation_evidence', evidence: 'ceased' }); }; };
           const probe = () => { if (mode === 'throwing' && target) throw new Error('probe unknown'); return target && mode !== 'terminal' && mode !== 'false-probes'; };
           const handle: AgentHandle = { id: `r9-resident-${controls.length}`, role, sessionFile: null, capabilities: adapter.capabilities, prompt,
-            steer: async () => {}, followUp: async () => {}, subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
+            steer: async () => {}, followUp: async () => {}, cessationEvidence: () => (ceased ? 'ceased' as const : 'unknown' as const), subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
             health: () => ({ state: ceased ? 'disposed' : 'idle', lastActivity: null, sessionFile: null }),
             ...(target && mode === 'missing' ? {} : { hasLiveProcess: probe, isCompacting: probe }),
             dispose: async () => { if (!target || mode === 'terminal') cease(); else if (mode === 'rejected') throw new Error('stop unknown'); } };
@@ -1031,7 +1031,7 @@ describe('review Git repository environment isolation (GH-270)', () => {
       expect(prompt).not.toHaveBeenCalled();
       expect(unrelated.health().state).toBe('idle');
       const target = controls[controls.length - 1]!;
-      const positive = mode === 'terminal' || mode === 'false-probes';
+      const positive = mode === 'terminal'; // Option A (#341): explicit-false probes without adapter 'ceased' evidence remain debt
       if (round !== null) {
         if (!positive) {
           expect(round.cleanupDebt()).toContain(target.handle.id);
@@ -1071,12 +1071,12 @@ describe('review Git repository environment isolation (GH-270)', () => {
           let ceased = false;
           const listeners = new Set<RuntimeEventListener>();
           const id = `forwarded-${controls.length}`;
-          const cease = () => { ceased = true; for (const listener of listeners) listener({ type: 'state', state: 'disposed' }); };
+          const cease = () => { ceased = true; for (const listener of listeners) { listener({ type: 'state', state: 'disposed' }); if (ceased) listener({ type: 'cessation_evidence', evidence: 'ceased' }); }; };
           controls.push({ id, cease });
           const admin = git(options.cwd!, ['rev-parse', '--absolute-git-dir']);
           await Promise.resolve(); writeFileSync(join(admin, 'locked'), 'foreign post-adapter custody');
           return { id, role, sessionFile: null, capabilities: adapter.capabilities, prompt: prompted,
-            steer: async () => {}, followUp: async () => {}, subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
+            steer: async () => {}, followUp: async () => {}, cessationEvidence: () => (ceased ? 'ceased' as const : 'unknown' as const), subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
             health: () => ({ state: ceased ? 'disposed' : 'idle', lastActivity: null, sessionFile: null }),
             hasLiveProcess: () => !ceased, isCompacting: () => false,
             dispose: async () => { if (stop === 'terminal') cease(); } };
@@ -1260,11 +1260,11 @@ describe('review Git repository environment isolation (GH-270)', () => {
           const target = options.cwd !== undefined;
           let ceased = false;
           const listeners = new Set<RuntimeEventListener>();
-          const event = () => { for (const listener of listeners) listener({ type: 'state', state: 'disposed' }); };
+          const event = () => { for (const listener of listeners) { listener({ type: 'state', state: 'disposed' }); if (ceased) listener({ type: 'cessation_evidence', evidence: 'ceased' }); }; };
           const id = `contrary-${controls.length}`;
           controls.push({ id, event, cease: () => { ceased = true; event(); } });
           const handle: AgentHandle = { id, role, sessionFile: null, capabilities: adapter.capabilities, prompt: prompted,
-            steer: async () => {}, followUp: async () => {}, subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
+            steer: async () => {}, followUp: async () => {}, cessationEvidence: () => (ceased ? 'ceased' as const : 'unknown' as const), subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
             health: () => {
               if (!ceased && target && mode === 'health-throwing') throw new Error('unknown health');
               const snapshot = { state: ceased ? 'disposed' as const : 'idle' as const, lastActivity: null, sessionFile: null };
@@ -1330,7 +1330,7 @@ describe('review Git repository environment isolation (GH-270)', () => {
       const adapter: AgentRuntime = { id: 'pi', capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
         health: () => ({ state: 'ok' }), dispose: async () => {}, spawn: async (role) => ({
           id: `union-${seam}-${stop}`, role, sessionFile: null, capabilities: adapter.capabilities, prompt,
-          steer: async () => {}, followUp: async () => {}, dispose: async () => { if (stop === 'rejected') throw new Error('owned disposal rejected'); },
+          steer: async () => {}, followUp: async () => {}, cessationEvidence: () => (ceased ? 'ceased' as const : 'unknown' as const), dispose: async () => { if (stop === 'rejected') throw new Error('owned disposal rejected'); },
           subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
           health: () => { if (!ceased && stop === 'throwing') throw new Error('unknown health'); return { state: ceased ? 'disposed' : 'idle', lastActivity: null, sessionFile: null }; },
           ...(stop === 'unknown' ? {} : { hasLiveProcess: () => !ceased, isCompacting: () => false }),
@@ -1379,7 +1379,7 @@ describe('review Git repository environment isolation (GH-270)', () => {
       expect(registry.residencySnapshot().occupied).toBe(1);
       expect(registry.residencySnapshot().handles).toContainEqual(expect.objectContaining({ agentId: handle.id }));
       ceased = true;
-      for (const listener of listeners) listener({ type: 'state', state: 'disposed' });
+      for (const listener of listeners) { listener({ type: 'state', state: 'disposed' }); if (ceased) listener({ type: 'cessation_evidence', evidence: 'ceased' }); };
       expect(registry.residencySnapshot().occupied).toBe(0);
       expect(acknowledgements).toEqual([stop !== 'rejected']);
       stopSettlement(); stopTap();

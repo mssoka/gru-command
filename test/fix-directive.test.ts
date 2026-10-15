@@ -316,7 +316,7 @@ it('P40 preserves historical native HEADs without labeling them current candidat
 it('P40 marks original native HEAD as a candidate only on one matching clean unswept job lane', async () => {
   const repo = makeFixtureRepo('P40-native-current-candidate'); cleanupRepos.push(repo);
   const root = mkdtempSync(join(tmpdir(), 'gru-command-native-current-candidate-')); cleanupDirs.push(root);
-  const backing = new InMemoryWorktreePort(root);
+  const backing = new InMemoryWorktreePort(root, standaloneFixtureLedger('P40-current'));
   const lane = await backing.createJobWorktree({ repoPath: repo.path, jobId: 'P40-current' });
   const head = execFileSync('git', ['-C', lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
   let lanes: readonly WorktreeLane[] = [lane];
