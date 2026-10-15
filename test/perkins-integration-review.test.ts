@@ -2,7 +2,7 @@ import { readFileSync, rmSync, mkdtempSync, mkdirSync, writeFileSync, existsSync
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { freezeReviewInputs, reviewArtifactDirectory, type FrozenReview } from '../src/dispatch/perkins-review/artifacts.js';
 import { loadPerkinsPolicy } from '../src/dispatch/perkins-review/policy.js';
 import { PerkinsWholeReview, type PerkinsWholeResult } from '../src/dispatch/perkins-review/whole.js';
@@ -19,6 +19,12 @@ import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
  * errors.
  */
 
+const propertyGate = vi.hoisted(() => ({ campaignRunning: false }));
+vi.mock('../src/property/pipeline.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/property/pipeline.js')>();
+  return { ...actual, propertyCampaignRunningForReview: (...args: Parameters<typeof actual.propertyCampaignRunningForReview>) => propertyGate.campaignRunning || actual.propertyCampaignRunningForReview(...args) };
+});
+
 const repos: FixtureRepo[] = [];
 const temporaryDirectories: string[] = [];
 function temp(prefix: string): string {
@@ -27,6 +33,7 @@ function temp(prefix: string): string {
   return directory;
 }
 afterEach(() => {
+  propertyGate.campaignRunning = false;
   while (repos.length > 0) repos.pop()!.cleanup();
   while (temporaryDirectories.length > 0) rmSync(temporaryDirectories.pop()!, { recursive: true, force: true });
 });
@@ -180,6 +187,21 @@ describe('native integration review retains prior coverage', () => {
     expect(round2.convergence?.coverageComplete).toBe(true);
     expect(round2.convergence?.finalPassRequired).toBeUndefined();
     expect(round2.canonicalVerdict).toBe('READY TO MERGE');
+  });
+
+  it('holds a whole-complete integration READY to the property-campaign gate that a final whole pass would enforce', async () => {
+    const harness = makeEngine({ childAnswer: () => '[]', specialists: [] });
+    const { h0 } = featureHead(harness.repo, 'src/feature.ts', 'export const feature = 1;\n');
+    const frozen1 = freeze(harness, 'int-prop-1', h0);
+    await runRound(harness, { roundId: 'int-prop-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
+    const consolidated1 = join(reviewArtifactDirectory(harness.root, 'int-prop-1'), 'consolidated.json');
+    const { h1 } = integrateClean(harness.repo);
+    const frozen2 = freeze(harness, 'int-prop-2', h1);
+    propertyGate.campaignRunning = true;
+    await expect(runRound(harness, {
+      roundId: 'int-prop-2', roundNumber: 2, frozen: frozen2,
+      reviewScope: 'integration', priorConsolidatedFile: consolidated1,
+    })).rejects.toThrow(/property-campaign-running/);
   });
 
   it('reviews an actual conflict resolution and keeps a boundary defect blocking across the resolution hunk at round 3', async () => {
@@ -534,7 +556,8 @@ describe('native integration review retains prior coverage', () => {
     expect(unlinked.priorCoverageComplete).toBe(false);
   });
 
-  it('gives the specialist lenses the integration unit in their prompt', async () => {    const harness = makeEngine({ childAnswer: () => '[]', specialists: ['blind'] });
+  it('gives the specialist lenses the integration unit in their prompt', async () => {
+    const harness = makeEngine({ childAnswer: () => '[]', specialists: ['blind'] });
     featureHead(harness.repo, 'src/shared.ts', 'export const shared = "feature";\n');
     const covered = harness.repo.head();
     const frozen1 = freeze(harness, 'sp-round-1', covered);

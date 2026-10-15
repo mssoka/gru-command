@@ -2296,12 +2296,18 @@ export class PerkinsWholeReview {
       },
     };
 
+    // A round whose READY is the terminal authority for the candidate: a whole
+    // round, or an integration round whose retained coverage is whole-complete
+    // and which discarded no reviewed feature work (no final whole pass follows).
+    // The whole-pass property gates below must hold for exactly these rounds.
+    const coversWholeCandidate = reviewScope === 'whole' ||
+      (reviewScope === 'integration' && priorCoveredWhole && integrationDroppedPaths.length === 0);
     const baseProofIssue = (verdict: string): SubmissionValidationIssue | null => {
       if (verdict === 'INCOMPLETE') return null;
-      if (reviewScope === 'whole' && verdict === 'READY TO MERGE' && propertyCampaignRunningForReview(review.manifest.repoPath, review.manifest.targetSha)) return { subject: 'submission', rule: 'property-campaign-running', message: 'An approved exact-candidate property campaign is still running; await its host evidence or submit INCOMPLETE' };
+      if (coversWholeCandidate && verdict === 'READY TO MERGE' && propertyCampaignRunningForReview(review.manifest.repoPath, review.manifest.targetSha)) return { subject: 'submission', rule: 'property-campaign-running', message: 'An approved exact-candidate property campaign is still running; await its host evidence or submit INCOMPLETE' };
       const currentPropertyEvidence = propertyEvidenceForReview(review.manifest.repoPath, review.manifest.targetSha);
       if (currentPropertyEvidence !== propertyEvidence) return { subject: 'submission', rule: 'property-evidence-moved', message: 'Host property evidence changed across the review boundary; restart or submit INCOMPLETE' };
-      if (reviewScope === 'whole' && propertyEvidence?.blocking === true && verdict === 'READY TO MERGE') return { subject: 'submission', rule: 'qualified-property-counterexample', message: 'An exact-candidate, qualified, replayed candidate-only counterexample remains in enforced mode. Retain and explain it as a finding; PBT never grants merge authority.' };
+      if (coversWholeCandidate && propertyEvidence?.blocking === true && verdict === 'READY TO MERGE') return { subject: 'submission', rule: 'qualified-property-counterexample', message: 'An exact-candidate, qualified, replayed candidate-only counterexample remains in enforced mode. Retain and explain it as a finding; PBT never grants merge authority.' };
       if (input.recoveredBaseTips === undefined || input.recoveredBaseTips.length === 0) return null;
       try {
         proveRecoveredBaseMergeability(review, input.recoveredBaseTips);
@@ -2507,8 +2513,7 @@ export class PerkinsWholeReview {
           // the prior record's durable bit, never a scope label). A delta
           // round never does. A round that ended INCOMPLETE or on a moved
           // head certifies nothing.
-          const coversWhole = reviewScope === 'whole' ||
-            (reviewScope === 'integration' && priorCoveredWhole && integrationDroppedPaths.length === 0);
+          const coversWhole = coversWholeCandidate;
           const convergence: ReviewConvergence = {
             reviewScope,
             ...(scopeReason !== null ? { scopeReason } : {}),
