@@ -977,19 +977,20 @@ test('essential text and numbers hold >=4.5:1 contrast in both themes', async ({
       await page.locator('#theme-toggle').click();
       await expect(page.locator('html')).toHaveClass(/dark/);
       // Measure the THEME, never a mid-animation blend: body color and the
-      // surface backgrounds transition on different elements, so wait until
-      // no CSS transition is still RUNNING before reading computed colors.
-      // A transition cancelled mid-flip resolves as finished (its
-      // replacement is re-checked on the next pass), so a cancellation
-      // can never reject this wait or race the measurement.
-      await page.evaluate(async () => {
+      // surface backgrounds transition on different elements. Each running
+      // CSS transition is jumped to its END state (finish()) rather than
+      // awaited — headless Chromium on Linux can stall a transition's
+      // `finished` promise past the test timeout (#402) — and the check
+      // repeats until nothing is still running.
+      await page.evaluate(() => {
         for (let pass = 0; pass < 60; pass += 1) {
           const running = document
             .getAnimations()
             .filter((a) => a instanceof CSSTransition && a.playState === 'running');
           if (running.length === 0) return;
-          await Promise.all(running.map((a) => a.finished.catch(() => undefined)));
+          for (const transition of running) transition.finish();
         }
+        throw new Error('CSS transitions kept restarting; the theme never settled');
       });
     }
     const ratios = await measure();

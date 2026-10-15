@@ -207,25 +207,25 @@ test('real native compact preserves history and New chat starts unresumed behind
   await pair(page);
   await sendAndWaitReply(page, 'real context control old words');
   const pointerFile = join(durableHome, 'chat', 'gru-session.json');
+  const readPointer = (): { sessionFile: string; epoch: number } =>
+    JSON.parse(readFileSync(pointerFile, 'utf-8')) as { sessionFile: string; epoch: number };
 
   await expect(page.locator('#chat-compact')).toBeEnabled();
   await page.locator('#chat-compact').click();
   await expect(page.locator('.notice-line', { hasText: 'context compacted' })).toBeVisible();
   await expect(page.locator('.msg--user', { hasText: 'real context control old words' })).toHaveCount(1);
-  const oldPointer = JSON.parse(readFileSync(pointerFile, 'utf-8')) as {
-    sessionFile: string;
-    epoch: number;
-  };
+  const oldPointer = readPointer();
   const oldBytes = readFileSync(oldPointer.sessionFile);
 
   page.once('dialog', (dialog) => dialog.accept());
   await page.locator('#chat-new').click();
   await expect(page.locator('.msg--user', { hasText: 'real context control old words' })).toHaveCount(0);
-  const freshPointer = JSON.parse(readFileSync(pointerFile, 'utf-8')) as {
-    sessionFile: string;
-    epoch: number;
-  };
-  expect(freshPointer.epoch).toBe(oldPointer.epoch + 1);
+  // The UI clears before the service has necessarily persisted the new
+  // epoch pointer (the write is asynchronous): wait for the durable advance
+  // rather than reading once — reading once made this test order/timing
+  // sensitive (#402).
+  await expect.poll(() => readPointer().epoch, { timeout: 10_000 }).toBe(oldPointer.epoch + 1);
+  const freshPointer = readPointer();
   expect(freshPointer.sessionFile).not.toBe(oldPointer.sessionFile);
   expect(readFileSync(oldPointer.sessionFile)).toEqual(oldBytes);
 

@@ -358,17 +358,24 @@ interface HitTarget {
 
 /** Center hit-target + viewport containment for one selector: the live
  * occlusion check (sticky chrome, drawer or any other element covering
- * the control fails the hit test). */
+ * the control fails the hit test). Containment allows LESS than one CSS
+ * pixel: browsers scroll in whole pixels while layout positions are
+ * fractional, so a focus/scroll that aligns an edge can leave a sub-pixel
+ * sliver outside (Linux font metrics put the 1440 SETTLED and 768 PIPELINE
+ * disclosures 0.1875px past the bottom edge — #402). The hit test still
+ * fails on any real occluder. */
 async function hitTarget(page: Page, selector: string): Promise<HitTarget> {
   return page.evaluate((sel) => {
     const element = document.querySelector<HTMLElement>(sel);
     if (element === null) return { found: false, inViewport: false, hit: false };
     const rect = element.getBoundingClientRect();
     const topmost = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    const subpixel = 1;
     return {
       found: true,
       inViewport:
-        rect.left >= 0 && rect.top >= 0 && rect.right <= window.innerWidth && rect.bottom <= window.innerHeight,
+        rect.left > -subpixel && rect.top > -subpixel &&
+        rect.right < window.innerWidth + subpixel && rect.bottom < window.innerHeight + subpixel,
       hit: topmost !== null && (topmost === element || element.contains(topmost)),
     };
   }, selector);
