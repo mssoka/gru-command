@@ -197,7 +197,7 @@ async function interactiveAnswers(
     );
     if (reuse.toLowerCase() !== 'n' && reuse.toLowerCase() !== 'no') {
       rl.close();
-      return { answers: parseAnswers(draft), draftJson: draft };
+      return { answers: parseAnswers(draft), draftJson: draft, reposInherited: false };
     }
   }
 

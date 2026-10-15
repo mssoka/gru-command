@@ -41,7 +41,7 @@ import {
 } from './provider-recovery/composition.js';
 import { claimProviderRecoveryContinuation } from './provider-recovery/resume.js';
 import { GhCliApi, GitHubSignalPoll, type LaneRemoteResolver } from './dispatch/github-poll.js';
-import { GhRepoOverviewApi, type ManagedRepoOverviewTracker } from './repos/overview.js';
+import { GhRepoOverviewApi } from './repos/overview.js';
 import { createManagedRepoOverviewTracker } from './repos/runtime.js';
 import { createManagedRepoIntakeResolver } from './repos/managed-names.js';
 import { routeFixDirectiveToMinion } from './dispatch/fix-directive.js';
