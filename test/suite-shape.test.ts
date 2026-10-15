@@ -154,7 +154,7 @@ const PINS: Record<string, number> = {
   'resident-budget.test.ts': 7,
   'resident-saturation.test.ts': 2,
   'runtime-disposal-aggregation.test.ts': 12,
-  'review-build-identity.test.ts': 7,
+  'review-build-identity.test.ts': 9,
   'review-git-environment.test.ts': 87,
   'review-ci-evidence.test.ts': 13,
   'review-directory-entries.test.ts': 3,
@@ -234,9 +234,9 @@ const PINS: Record<string, number> = {
   'obligations-handback.test.ts': 9,
   'perkins-github-app.test.ts': 164,
   'prompt-verdict.test.ts': 6,
-  'test-budgets.test.ts': 9,
+  'test-budgets.test.ts': 10,
   'tool-call-policy.test.ts': 12,
-  'verification-capture.test.ts': 28,
+  'verification-capture.test.ts': 36,
 
 };
 

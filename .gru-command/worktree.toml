@@ -92,7 +92,7 @@ handoff-wave = "npx vitest run --config vitest.heavy.config.ts test/perkins-buil
 # exact-target CI receipts, audited canonical amendments. Invoked only via
 # the authenticated /api/verify scheduler at unchanged budgets/thresholds —
 # a plain vitest invocation with the approved RPC patch prerequisite.
-review-inputs = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/review-evidence-intake.test.ts test/review-ci-evidence.test.ts test/job-amendments.test.ts test/review-inputs-handoff.test.ts test/review-inputs-wave.test.ts test/dispatch-review-inputs.test.ts test/verification-evidence.test.ts test/github-poll.test.ts test/ledger-api.test.ts test/ledger-db.test.ts"
+review-inputs = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/review-inputs-wave.test.ts && npx vitest run test/review-evidence-intake.test.ts test/review-ci-evidence.test.ts test/job-amendments.test.ts test/review-inputs-handoff.test.ts test/dispatch-review-inputs.test.ts test/verification-evidence.test.ts test/github-poll.test.ts test/ledger-api.test.ts test/ledger-db.test.ts"
 
 # Review-input handoff lane regression + full-run failure isolation: the
 # seam-adjacent suites, plus the exact files whose timing-sensitive tests
@@ -965,3 +965,10 @@ gh315-r8-candidates = "sh tools/scheduled-verification-review8.sh"
 gh315-r8-version = "sh tools/scheduled-verification-review8.sh version"
 gh315-r8-focused = "sh tools/scheduled-verification-review8.sh focused"
 gh315-r8-preack-mutant = "sh tools/scheduled-verification-review8-preack-mutant.sh"
+
+# Owner-correction verification repair (2026-10-06): the long-running
+# files whose fixture cost starved the full gate's fast phase, plus the
+# whole fast phase for wall-time measurement. Committed scheduler scopes;
+# plain vitest invocations at unchanged budgets, RPC patch first.
+parked-closeout-repair = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/review-inputs-wave.test.ts && npx vitest run test/review-build-identity.test.ts test/review-inputs-handoff.test.ts"
+repair-fast-phase = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run"
