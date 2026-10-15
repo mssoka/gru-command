@@ -260,11 +260,14 @@ export function reviewRuntimeVersion(packageRoot: string): string {
       // Only the leading `..` steps of a normalized relative path climb
       // above the installation. A directory reached that way is a SHARED
       // ancestor (for example /tmp): unrelated siblings legitimately change
-      // its mtime/ctime, so it gets no change bracket (#399). Its identity
-      // cannot change under the held descriptor, and checkRoot() around every
-      // step re-resolves the installation by pathname, so a re-parented or
-      // replaced ancestor still refuses. Every directory below the first
-      // non-`..` component (a dependency location) keeps the full bracket.
+      // its mtime/ctime, so it gets no change bracket (#399). Each `..` is
+      // resolved fresh from a held descendant, so the climb follows the same
+      // current tree Node's own pathname lookup would; checkRoot() around
+      // every step re-resolves the installation by pathname, and the first
+      // `..` is held to the root's recorded parent, so replacing the
+      // installation or its parent still refuses. Every directory below the
+      // first non-`..` component (a dependency location) keeps the full
+      // bracket.
       let parentIsAncestor = false;
       const opened: number[] = [];
       try {

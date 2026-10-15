@@ -109,7 +109,8 @@ async function releaseAndAwaitEnd(release: string, helperFile: string): Promise<
     try {
       process.kill(helper, 0);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ESRCH') return; // it ended by itself
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ESRCH' || code === 'EPERM') return; // it ended by itself (EPERM: the pid now names another user's process)
       throw error;
     }
     if (Date.now() > deadline) throw new Error(`gated helper ${helper} did not end after its release`);

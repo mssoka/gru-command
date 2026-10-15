@@ -12,6 +12,7 @@ const seam = vi.hoisted(() => ({
   invalidReadIno: 0, invalidRead: false, updatesAfterInvalid: 0,
   addAtDigest: '', addFile: '', additions: 0,
   ancestorIno: 0, ancestorSibling: '', ancestorAdditions: 0, ancestorFiles: [] as string[],
+  bracketIno: 0, bracketSibling: '', bracketAdditions: 0,
 }));
 vi.mock('node:fs', async (importOriginal) => {
   const fs = await importOriginal<typeof import('node:fs')>();
@@ -22,6 +23,15 @@ vi.mock('node:fs', async (importOriginal) => {
       // #399: an unrelated sibling appears in a shared ancestor exactly while
       // the walk climbs `..` out of it (where a change bracket used to sit).
       const ancestorChild = seam.ancestorIno !== 0 ? /^\/proc\/self\/fd\/(\d+)\/\.\.$/u.exec(path) : null;
+      // A hoisted dependency directory (below a `..`) changes between the
+      // walk's receipt of it and its post-open check.
+      const bracketChild = seam.bracketIno !== 0 ? /^\/proc\/self\/fd\/(\d+)\/([^/]+)$/u.exec(path) : null;
+      if (bracketChild !== null && bracketChild[2] !== '..' && fs.fstatSync(Number(bracketChild[1])).ino === seam.bracketIno) {
+        seam.bracketAdditions += 1;
+        const sibling = `${seam.bracketSibling}-${seam.bracketAdditions}`;
+        seam.ancestorFiles.push(sibling);
+        fs.writeFileSync(sibling, '');
+      }
       if (ancestorChild !== null && fs.fstatSync(Number(ancestorChild[1])).ino === seam.ancestorIno) {
         seam.ancestorAdditions += 1;
         const sibling = `${seam.ancestorSibling}-${seam.ancestorAdditions}`;
@@ -98,7 +108,7 @@ afterEach(() => {
     rewriteIno: 0, rewriteFile: '', rewriteBytes: '', rewriteAtDigest: '', rewrites: 0,
     invalidReadIno: 0, invalidRead: false, updatesAfterInvalid: 0,
     addAtDigest: '', addFile: '', additions: 0,
-    ancestorIno: 0, ancestorSibling: '', ancestorAdditions: 0 });
+    ancestorIno: 0, ancestorSibling: '', ancestorAdditions: 0, bracketIno: 0, bracketSibling: '', bracketAdditions: 0 });
   for (const root of [...roots.splice(0), ...seam.ancestorFiles.splice(0)]) rmSync(root, { recursive: true, force: true });
 });
 
@@ -172,7 +182,7 @@ it.skipIf(process.platform !== 'linux')('still refuses when an ancestor is repla
   Object.assign(seam, { target: ':hoisted-parent', checked: outer, saved: join(base, 'outer-held'),
     foreign: replacement, checkedIno: statSync(outer).ino, triggerAt: 1, matchingOpens: 0, swapCount: 0, holdSwap: true });
   try {
-    expect(() => reviewRuntimeVersion(root)).toThrow(/installed root changed|changed parents|directory changed|no such file/u);
+    expect(() => reviewRuntimeVersion(root)).toThrow('review runtime installed root changed during fingerprint');
     expect(seam.swapCount).toBe(1);
     expect(seam.unknownDigestUpdates).toBe(0);
   } finally {
@@ -182,6 +192,26 @@ it.skipIf(process.platform !== 'linux')('still refuses when an ancestor is repla
       renameSync(seam.saved, outer);
     }
   }
+});
+
+it.skipIf(process.platform !== 'linux')('keeps the change bracket on a hoisted dependency directory below a shared ancestor (#399)', async () => {
+  const { reviewRuntimeVersion } = await import('../src/runtime/review-build-identity.js');
+  const base = fixture();
+  const root = join(base, 'pkg');
+  mkdirSync(join(root, 'dist'), { recursive: true });
+  writeFileSync(join(root, 'dist', 'review-dependency-identity.json'), JSON.stringify({ schemaVersion: 1, dependencySha256: 'a'.repeat(64) }));
+  writeFileSync(join(root, 'package.json'), JSON.stringify({ dependencies: { tslib: '1.0.0' } }));
+  // tslib is hoisted into the ancestor's node_modules: reached via `..`.
+  const hoisted = join(base, 'node_modules', 'tslib');
+  mkdirSync(hoisted, { recursive: true });
+  writeFileSync(join(hoisted, 'package.json'), JSON.stringify({ name: 'tslib', version: '1.0.0' }));
+  writeFileSync(join(hoisted, 'tslib.js'), 'export const checked = true;');
+  expect(reviewRuntimeVersion(root)).toMatch(/^[a-f0-9]{64}$/u);
+  // A new entry appears in that dependency directory mid-selection: unlike a
+  // shared ancestor, a dependency location keeps its change bracket.
+  Object.assign(seam, { bracketIno: statSync(join(base, 'node_modules')).ino, bracketSibling: join(base, 'node_modules', 'intruder') });
+  expect(() => reviewRuntimeVersion(root)).toThrow('review runtime directory changed during child selection');
+  expect(seam.bracketAdditions).toBeGreaterThan(0);
 });
 
 it.skipIf(process.platform !== 'darwin')('rejects a real-directory swap at file open before reading or hashing foreign bytes', async () => {
