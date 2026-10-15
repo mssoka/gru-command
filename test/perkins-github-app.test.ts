@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { createHash, createVerify, generateKeyPairSync } from 'node:crypto';
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, chownSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, chai, describe, expect, it, vi } from 'vitest';
@@ -498,14 +498,23 @@ describe('bundle file safety', () => {
   it('rejects a bundle directory carrying setuid/setgid/sticky bits — exact 0700 includes the high bits', () => {
     const fixture = bundleFixture('app_id=424242\nkey_path=app-key.pem\ninstallation_id_acme=164552969\n');
     const dir = join(fixture.home, 'perkins');
-    chmodSync(dir, 0o2700);
-    try {
-      // The chmod must actually carry the special bit; otherwise this
-      // oracle would silently prove nothing.
-      expect(lstatSync(dir).mode & 0o7777).toBe(0o2700);
-      expect(() => loadPerkinsAppBundle(fixture.home)).toThrow(/mode 0700 exactly \(found 2700\)/u);
-    } finally {
-      chmodSync(dir, 0o700);
+    // An unprivileged chmod silently clears setgid when the directory's
+    // group is not one of this process's groups, and a group-inheriting
+    // (setgid or BSD-semantics) TMPDIR hands the fixture such a group
+    // (#354). Own the group explicitly so every special bit is observable.
+    if (process.getuid !== undefined && process.getegid !== undefined) {
+      chownSync(dir, process.getuid(), process.getegid());
+    }
+    for (const [mode, found] of [[0o4700, '4700'], [0o2700, '2700'], [0o1700, '1700']] as const) {
+      chmodSync(dir, mode);
+      try {
+        // The chmod must actually carry the special bit; otherwise this
+        // oracle would silently prove nothing.
+        expect(lstatSync(dir).mode & 0o7777, found).toBe(mode);
+        expect(() => loadPerkinsAppBundle(fixture.home), found).toThrow(new RegExp(`mode 0700 exactly \\(found ${found}\\)`, 'u'));
+      } finally {
+        chmodSync(dir, 0o700);
+      }
     }
   });
 
