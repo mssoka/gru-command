@@ -1,0 +1,202 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterAll, describe, expect, it } from 'vitest';
+import { configPathFor, loadConfig } from '../src/config.js';
+import { LedgerApi } from '../src/ledger/api.js';
+import { LedgerDb } from '../src/ledger/db.js';
+import { PiRuntime } from '../src/runtime/pi-adapter.js';
+import { SessionStore } from '../src/sessions/store.js';
+import { createSilasModelActionTool, SILAS_MODEL_ACTION_TOOL } from '../src/dispatch/silas-model-action.js';
+import type { SilasOpsDigest } from '../src/dispatch/silas-driver.js';
+import { makeStubModelRuntime, StubScript } from './helpers/stub-model.js';
+import type { AgentHandle, NativeAgentToolResult } from '../src/runtime/types.js';
+
+/**
+ * Issue #243 H6 — the product-owned native Silas model-action tool.
+ *
+ * The real installed SDK model turn dispatches `silas_action` through the
+ * adapter's actual `createAgentSession({ customTools })` path; the host binds
+ * it to the live handle/session incarnation + `pendingTurn`, observes the
+ * canonical digest, and records a durable host-callback receipt. The SDK's
+ * ephemeral tool-call id is deliberately NOT used as identity.
+ */
+
+const cleanup: string[] = [];
+afterAll(() => {
+  for (const dir of cleanup.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+const temp = (prefix: string): string => {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  cleanup.push(dir);
+  return dir;
+};
+
+const emptyDigest = (): SilasOpsDigest => ({
+  computedAt: '2026-10-14T00:00:00.000Z',
+  trigger: 'api',
+  deliveredWithoutPr: [],
+  prWithoutReview: [],
+  verdictsAwaitingDirective: [],
+  stalledWorking: [],
+  minionErrors: [],
+  verificationFailures: [],
+  verificationWaits: [],
+  providerRecoveryPending: [],
+  conflictingPrs: [],
+  releaseEligible: [],
+  revisionContinuations: [],
+  verificationsOwed: [],
+});
+
+function makeLedger(): { ledger: LedgerApi; eventKinds: () => { kind: string; payload: unknown }[] } {
+  const db = new LedgerDb(temp('h6-db-'));
+  const ledger = new LedgerApi(db.handle, {});
+  return {
+    ledger,
+    eventKinds: () =>
+      db.handle
+        .prepare("select kind, payload from events where kind like 'silas.model-%' order by seq")
+        .all() as { kind: string; payload: unknown }[],
+  };
+}
+
+describe('H6 silas_action tool bindings (unit seams)', () => {
+  it('refuses when unbound and when no live turn owns the session', async () => {
+    const { ledger } = makeLedger();
+    const job = ledger.addJob({ id: 'job-unbound', repo: 'r', title: 't', baseBranch: 'main', briefing: 'b' });
+    ledger.setJobStatus(job.id, 'working');
+    const unbound = createSilasModelActionTool({ getHandle: () => null, ledger, digest: async () => emptyDigest() });
+    const unboundResult = JSON.parse((await unbound.execute({ action: 'hold', jobId: job.id })).text) as {
+      ok: boolean;
+      reason: string;
+    };
+    expect(unboundResult).toMatchObject({ ok: false, reason: 'unbound' });
+
+    const noTurn: AgentHandle = {
+      id: 'silas-no-turn',
+      role: 'silas',
+      sessionFile: null,
+      async prompt() {},
+      capabilities: {
+        streaming: true,
+        steer: 'native',
+        resume: 'file',
+        images: false,
+        thinking: false,
+        thinkingLevelControl: false,
+        followUp: false,
+      },
+      async steer() {},
+      async followUp() {},
+      subscribe() {
+        return () => {};
+      },
+      health() {
+        return { state: 'idle' as const, lastActivity: null, sessionFile: null };
+      },
+      async dispose() {},
+    };
+    const noTurnTool = createSilasModelActionTool({ getHandle: () => noTurn, ledger, digest: async () => emptyDigest() });
+    expect(JSON.parse((await noTurnTool.execute({ action: 'hold', jobId: job.id })).text)).toMatchObject({
+      ok: false,
+      reason: 'no-live-turn',
+    });
+  });
+
+  it('refuses an unknown job row instead of inventing one', async () => {
+    const { ledger } = makeLedger();
+    const handle = {
+      id: 'silas-x',
+      pendingTurn: () => ({ text: 'live', owner: 'silas' }),
+    } as unknown as AgentHandle;
+    const tool = createSilasModelActionTool({ getHandle: () => handle, ledger, digest: async () => emptyDigest() });
+    expect(JSON.parse((await tool.execute({ action: 'dispatch', jobId: 'nope' })).text)).toMatchObject({
+      ok: false,
+      reason: 'unknown-job',
+    });
+  });
+
+  it('binds the EXACT incarnation: two spawns get distinct tools, never a late lookup', async () => {
+    const { ledger, eventKinds } = makeLedger();
+    const job = ledger.addJob({ id: 'job-inc', repo: 'r', title: 't', baseBranch: 'main', briefing: 'b' });
+    ledger.setJobStatus(job.id, 'working');
+    let boundA: AgentHandle | null = null;
+    let boundB: AgentHandle | null = null;
+    const toolA = createSilasModelActionTool({ getHandle: () => boundA, ledger, digest: async () => emptyDigest() });
+    const toolB = createSilasModelActionTool({ getHandle: () => boundB, ledger, digest: async () => emptyDigest() });
+    boundA = { id: 'silas-inc-a', pendingTurn: () => ({ text: 'a', owner: 'silas' }) } as unknown as AgentHandle;
+    boundB = { id: 'silas-inc-b', pendingTurn: () => ({ text: 'b', owner: 'silas' }) } as unknown as AgentHandle;
+    const resultA = (await toolA.execute({ action: 'hold', jobId: job.id })) as NativeAgentToolResult;
+    expect(JSON.parse(resultA.text)).toMatchObject({ ok: true });
+    const resultB = (await toolB.execute({ action: 'hold', jobId: job.id })) as NativeAgentToolResult;
+    expect(JSON.parse(resultB.text)).toMatchObject({ ok: true });
+    // Each tool recorded ITS OWN incarnation, even though both are bound here.
+    const rows = eventKinds();
+    const observations = rows
+      .filter((row) => row.kind === 'silas.model-observation')
+      .map((row) => JSON.parse(String(row.payload)) as Record<string, unknown>);
+    expect(observations).toHaveLength(2);
+    expect(observations[0]!['handle_id']).toBe('silas-inc-a');
+    expect(observations[1]!['handle_id']).toBe('silas-inc-b');
+  });
+});
+
+describe('H6 real installed-runtime model dispatch through customTools', () => {
+  it('executes silas_action from a genuine model turn and records a host-bound durable receipt', async () => {
+    const home = temp('h6-home-');
+    const workspace = temp('h6-ws-');
+    const agentDir = temp('h6-agentdir-');
+    const { ledger, eventKinds } = makeLedger();
+    const job = ledger.addJob({ id: 'job-h6', repo: 'r', title: 't', baseBranch: 'main', briefing: 'b' });
+    ledger.setJobStatus(job.id, 'working');
+    writeFileSync(
+      configPathFor(home),
+      `workspace_root = "${workspace}"\n[models]\ndefault = "gru-stub/stub-model"\n`,
+      'utf-8',
+    );
+    mkdirSync(agentDir, { recursive: true });
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    const store = new SessionStore(config.dataDir);
+    const script = new StubScript([
+      { deltas: [], toolCall: { id: 'sdk-call-1', name: SILAS_MODEL_ACTION_TOOL, args: { action: 'hold', jobId: job.id } } },
+      { deltas: ['action recorded'] },
+    ]);
+    const runtime = new PiRuntime({ config, store, agentDir, modelRuntime: await makeStubModelRuntime(script) });
+    // Exactly the main.ts per-spawn binding: the closure assigns the handle
+    // returned by THIS spawn.
+    let bound: AgentHandle | null = null;
+    const inner = createSilasModelActionTool({ getHandle: () => bound, ledger, digest: async () => emptyDigest() });
+    let lastResult: NativeAgentToolResult | null = null;
+    const tool = {
+      ...inner,
+      execute: async (input: unknown, signal?: AbortSignal) => {
+        const result = await inner.execute(input, signal);
+        lastResult = result;
+        return result;
+      },
+    };
+    const handle = await runtime.spawn('silas', { cwd: workspace, nativeTools: [tool] });
+    bound = handle;
+    await handle.prompt('record the current arbitration');
+    expect(lastResult).not.toBeNull();
+    const result = lastResult as unknown as NativeAgentToolResult;
+    const details = result.details as { ok: boolean; host_callback_invocation_id: number; event_seq: number };
+    expect(details.ok).toBe(true);
+    const events = eventKinds();
+    expect(events.map((event) => event.kind)).toEqual(['silas.model-observation', 'silas.model-action']);
+    const action = JSON.parse(String(events[1]!.payload)) as Record<string, unknown>;
+    expect(action).toMatchObject({
+      action: 'hold',
+      job_id: job.id,
+      sdk_tool_call_id: null,
+      host_callback_invocation_id: details.host_callback_invocation_id,
+    });
+    expect(action['action_id']).toBe(`silas-action:${details.host_callback_invocation_id}`);
+    // The recorded agent id is the REAL live handle, not the raw SDK call id.
+    expect(action['action_id']).not.toContain('sdk-call-1');
+    await handle.dispose();
+    store.dispose();
+  }, 60_000);
+});

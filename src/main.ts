@@ -27,6 +27,7 @@ import { createReviewEscalationNotifier } from './dispatch/escalation-identity.j
 import { createStartupVerdictPoster } from './dispatch/perkins-github-app.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { SilasDriver, computeSilasDigest, consolidatedBlockersFor, supervisionLookup } from './dispatch/silas-driver.js';
+import { createSilasModelActionTool } from './dispatch/silas-model-action.js';
 import { composeDeterministicPass, createSilasAutopilotHook } from './dispatch/silas-autopilot-pass.js';
 import { createSilasAutopilotOps, type SilasAutopilotOpsHandle } from './dispatch/silas-autopilot-ops.js';
 import { createProductionDeterministicPass } from './dispatch/durable-reconcile.js';
@@ -96,7 +97,7 @@ import {
   runRuntimeReviewPreflight,
 } from './dispatch/review-path.js';
 import { loadPerkinsPolicy } from './dispatch/perkins-review/policy.js';
-import type { NativeAgentTool, SpawnOptions } from './runtime/types.js';
+import type { AgentHandle, NativeAgentTool, SpawnOptions } from './runtime/types.js';
 import { serviceWorkflowAuthority } from './workflows/session.js';
 
 /** The process LISTENING on the configured instance port when it is not us
@@ -374,6 +375,23 @@ async function main(): Promise<number> {
       process.exit(exitCode);
     }
     const handle = state.handle;
+    // Issue #243 F-H4: a DURABLE checkpoint BEFORE the first potentially-
+    // unbounded await below (the chat/board/wave/child/verify/registry and
+    // producer joins). It records the still-owned pending autopilot producers
+    // plus the last-seen session sizes while locks and the ledger remain OPEN,
+    // reusing the normal durable mechanics WITHOUT replacing the original
+    // final snapshot. It never changes the watchdog/deadline/exit ordering,
+    // never releases a lock, and never claims cessation.
+    try {
+      const pending = state.autopilot?.pendingSnapshot() ?? [];
+      state.store?.writeShutdownCheckpoint({ pending });
+      ledger.appendCustomEvent({
+        kind: 'silas.shutdown-checkpoint',
+        payload: { pending_count: pending.length, pending },
+      });
+    } catch (error) {
+      logger.error('shutdown checkpoint failed — pending ownership retained', { error: String(error) });
+    }
     void Promise.resolve()
       .then(async () => {
         // Each stage isolated: a failure in one must never skip lock
@@ -1453,14 +1471,50 @@ async function main(): Promise<number> {
   // supervised slot follows the gru-main / bob-consolidator pattern exactly
   // — model and thinking resolve from config ([models.roles] silas /
   // [thinking.roles] silas) at spawn, never hardcoded here.
+  // Issue #243 H6: the digest the model-action tool observes is computed with
+  // the SAME seams the API digest endpoint uses. It is assigned below, once
+  // those seams exist; the tool only ever runs inside a live turn, long after
+  // boot, so the placeholder is never reachable in practice.
+  let silasActionDigest: () => Promise<Awaited<ReturnType<typeof computeSilasDigest>>> = () =>
+    Promise.reject(new Error('silas action digest is not initialised'));
   const silasSlot = config.silas.enabled
     ? supervisorLive.declareSlot({
         id: 'silas-ops',
         role: 'silas',
-        spawn: (spawnOptions) => registry.spawn('silas', spawnOptions ?? {}),
+        spawn: (spawnOptions) => {
+          // Bind the model-action tool to THIS spawn's exact handle: `bound` is
+          // assigned when the spawn resolves, so a re-spawn gets its own tool
+          // bound to its own incarnation (never a late lookup of the current
+          // slot). The tool runs only during a live model turn.
+          let bound: AgentHandle | null = null;
+          const actionTool = createSilasModelActionTool({
+            getHandle: () => bound,
+            ledger,
+            digest: () => silasActionDigest(),
+            log: (level, msg, fields) => logger.log(level, msg, fields),
+          });
+          return registry
+            .spawn('silas', {
+              ...(spawnOptions ?? {}),
+              nativeTools: [...(spawnOptions?.nativeTools ?? []), actionTool],
+            })
+            .then((handle) => {
+              bound = handle;
+              return handle;
+            });
+        },
       })
     : null;
   const intake = new IntakeService({ dataDir: config.dataDir, workspaceRoot: config.workspaceRoot, uploadsDir });
+  silasActionDigest = () =>
+    computeSilasDigest({
+      ledger,
+      worktrees: worktreeManager,
+      blockersForRound: consolidatedBlockersFor(ledger),
+      config: config.silas,
+      trigger: 'api',
+      supervisionFor: supervisionLookup(() => supervisor),
+    });
   const dispatchServer = createDispatchServer({
     config,
     intake,
@@ -1498,15 +1552,7 @@ async function main(): Promise<number> {
             // delta pointer resolves here, computed with the SAME seams the
             // driver uses (worktrees, blockers port, supervision stop
             // truth) so the API can never disagree with what wakes Silas.
-            digest: () =>
-              computeSilasDigest({
-                ledger,
-                worktrees: worktreeManager,
-                blockersForRound: consolidatedBlockersFor(ledger),
-                config: config.silas,
-                trigger: 'api',
-                supervisionFor: supervisionLookup(() => supervisor),
-              }),
+            digest: silasActionDigest,
           },
         }
       : {}),

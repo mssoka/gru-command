@@ -113,6 +113,25 @@ export interface SilasAutopilotOpsHandle extends SilasAutopilotOps {
    * settles under the EXISTING approved shutdown watchdog rather than a new
    * invented timer. */
   drain(): Promise<{ readonly settled: boolean; readonly pending: number }>;
+  /** Issue #243 F-H4 (durable pre-wait checkpoint): an INSTANTANEOUS,
+   * non-joining snapshot of the still-owned background producers with their
+   * immutable job/operation/request/rule identity. It does NOT settle,
+   * remove or release any producer, never claims cessation, and reports a
+   * null `agentId` honestly while a queued producer's worker identity is not
+   * yet known. It exists so the REAL shutdown path can checkpoint pending
+   * ownership BEFORE its first potentially-unbounded await. */
+  pendingSnapshot(): readonly PendingProducerIdentity[];
+}
+
+/** Immutable ownership identity of one in-flight background producer.
+ * `requestRefs` are durable request/marker identities (a directive request
+ * id or re-brief marker ids); `agentId` is the worker id once known. */
+export interface PendingProducerIdentity {
+  readonly operation: 'directive' | 'rebrief';
+  readonly jobId: string;
+  readonly ruleId: SilasAutopilotRuleId;
+  readonly requestRefs: readonly string[];
+  readonly agentId: string | null;
 }
 
 /** The extension of a `silas.*` receipt payload that marks it as the
@@ -141,17 +160,26 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
   };
 
   // The in-flight background producers the assembly drains at shutdown
-  // (issue #243 R2-H9). A producer is registered here and removed when it
-  // settles; `drain` joins them, it never asserts they ceased.
+  // (issue #243 R2-H9). A producer is registered here with its immutable
+  // ownership identity and removed when it settles; `drain` joins them, it
+  // never asserts they ceased.
   const producers = new Set<Promise<unknown>>();
-  const ownProducer = (run: Promise<unknown>): void => {
+  const producerIdentities = new Map<Promise<unknown>, PendingProducerIdentity>();
+  const ownProducer = (run: Promise<unknown>, identity: PendingProducerIdentity): void => {
     const settled = run.then(
       () => undefined,
       () => undefined,
     );
     producers.add(settled);
-    void settled.then(() => producers.delete(settled));
+    producerIdentities.set(settled, identity);
+    void settled.then(() => {
+      producers.delete(settled);
+      producerIdentities.delete(settled);
+    });
   };
+  /** Issue #243 F-H4: instantaneous non-joining pending snapshot (never
+   * settles/releases a producer, never claims cessation). */
+  const pendingSnapshot = (): readonly PendingProducerIdentity[] => [...producerIdentities.values()];
   const drain = async (): Promise<{ readonly settled: boolean; readonly pending: number }> => {
     // Issue #243 F-H4 (corrected): a plain join with NO invented grace/ceiling.
     // The caller disposes the producers' handles BEFORE awaiting this
@@ -559,7 +587,15 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
       deps.ledger.recordDirectiveDelivery({ requestId: intent.requestId, eventSeq: followUp.eventSeq });
     })();
     background('directive', input.jobId, run);
-    ownProducer(run);
+    ownProducer(run, {
+      operation: 'directive',
+      jobId: input.jobId,
+      ruleId: input.ruleId,
+      requestRefs: [intent.requestId],
+      // The worker identity is not yet known while the directive turn is
+      // admitted/queued — reported honestly as null, never guessed.
+      agentId: null,
+    });
     run.finally(() => releaseAdmission()).catch(() => {});
   };
 
@@ -680,7 +716,15 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
       }
     })();
     background('re-brief', input.jobId, run);
-    ownProducer(run);
+    ownProducer(run, {
+      operation: 'rebrief',
+      jobId: input.jobId,
+      ruleId: input.ruleId,
+      requestRefs: markers.map((marker) => marker.id),
+      // The fresh worker identity is not yet known while the re-brief turn is
+      // admitted/queued — reported honestly as null, never guessed.
+      agentId: null,
+    });
   };
 
   const releaseLane = async (input: {
@@ -764,5 +808,5 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
     });
   };
 
-  return { listOpenPrsForHead, registerPr, triggerReview, sendDirective, sendRebrief, releaseLane, drain };
+  return { listOpenPrsForHead, registerPr, triggerReview, sendDirective, sendRebrief, releaseLane, drain, pendingSnapshot };
 }
