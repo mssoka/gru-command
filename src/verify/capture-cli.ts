@@ -487,7 +487,7 @@ async function commandRun(
   }
   // After every usage refusal above, before this command's first side effect.
   const fetchImpl = transportFor(deps);
-  if (ownerRead.kind === 'owner') removeCaptureOwner(ownerPath); // stale claim: the probe found the owner gone
+  if (ownerRead.kind === 'owner' && !ownerAlive) removeCaptureOwner(ownerPath); // stale claim: the probe found the owner gone
 
   // Exclusive sink BEFORE the POST (a second capture for the same path is
   // a typed refusal, never a truncating interleave).

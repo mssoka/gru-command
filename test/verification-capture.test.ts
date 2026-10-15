@@ -686,6 +686,7 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
   });
 
   const BAD_BOUND = /responseHeadersTimeoutMs must be a number of milliseconds from 1 to 2147483647/u;
+  const MISSING_TOKEN = /--token \(or GRU_OPS_TOKEN\), or --config pointing at a config with \[auth\] token, is required/u;
   const OPS = ['--url', 'http://127.0.0.1:9', '--token', 't'] as const;
   const deadProbe = { alive: false, startTime: null, cwd: null, command: null };
 
@@ -729,14 +730,15 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
       vi.stubEnv('GRU_OPS_URL', undefined);
       vi.stubEnv('GRU_OPS_TOKEN', undefined);
       vi.stubEnv('GRU_COMMAND_CONFIG', undefined);
+      expect([process.env['GRU_OPS_URL'], process.env['GRU_OPS_TOKEN'], process.env['GRU_COMMAND_CONFIG']]).toEqual([undefined, undefined, undefined]);
       const usageCases: readonly (readonly [readonly string[], RegExp])[] = [
         [['--help'], /^usage:/u], [['-h'], /^usage:/u], [[], /^usage:/u],
         [['run', '--bogus'], /--bogus requires a value/u], [['frobnicate'], /unknown command "frobnicate"/u],
         [['run'], /--job is required/u], [['status'], /--request-id is required/u],
         [[...BASE_ARGS, '--sink', join(dir, 'no-ops.ndjson')], /--url \(or GRU_OPS_URL\) is required/u],
         [['status', '--request-id', 'req-no-ops'], /--url \(or GRU_OPS_URL\) is required/u],
-        [['status', '--request-id', 'req-no-token', '--url', 'http://127.0.0.1:9'], /--token \(or GRU_OPS_TOKEN\), or --config pointing at a config with \[auth\] token, is required/u],
-        [[...BASE_ARGS, '--sink', join(dir, 'no-token.ndjson'), '--url', 'http://127.0.0.1:9'], /--token \(or GRU_OPS_TOKEN\), or --config pointing at a config with \[auth\] token, is required/u],
+        [['status', '--request-id', 'req-no-token', '--url', 'http://127.0.0.1:9'], MISSING_TOKEN],
+        [[...BASE_ARGS, '--sink', join(dir, 'no-token.ndjson'), '--url', 'http://127.0.0.1:9'], MISSING_TOKEN],
       ];
       for (const [argv, message] of usageCases) {
         const usage: string[] = [];
@@ -748,15 +750,23 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
       vi.unstubAllEnvs();
     }
     expect(fetchImpl).not.toHaveBeenCalled();
+    // The run-side refusals created nothing.
+    for (const name of ['no-ops.ndjson', 'no-token.ndjson']) {
+      expect(existsSync(join(dir, name)), name).toBe(false);
+      expect(existsSync(captureOwnerPath(join(dir, name))), name).toBe(false);
+    }
   });
 
   it('owner refusals precede the bound check, and the stale-owner removal follows it (#389)', async () => {
     const dir = tempDir();
     const fetchImpl = vi.fn();
-    const probed: number[] = [];
-    const run = (sink: string, requestId: string, probe: ProcessProbe, stderr: (text: string) => void) => runCaptureCli(
-      [...BASE_ARGS, '--sink', sink, '--request-id', requestId, ...OPS],
-      { ...deps({ probe: (pid: number) => { probed.push(pid); return probe; } }), fetchImpl: fetchImpl as never, responseHeadersTimeoutMs: 0, stderr });
+    let probed: number[] = [];
+    const run = (sink: string, requestId: string, probe: ProcessProbe, stderr: (text: string) => void) => {
+      probed = []; // one probe record per scenario
+      return runCaptureCli(
+        [...BASE_ARGS, '--sink', sink, '--request-id', requestId, ...OPS],
+        { ...deps({ probe: (pid: number) => { probed.push(pid); return probe; } }), fetchImpl: fetchImpl as never, responseHeadersTimeoutMs: 0, stderr });
+    };
     // Malformed owner: its usage refusal, the record untouched.
     const malformedSink = join(dir, 'malformed.ndjson');
     writeFileSync(captureOwnerPath(malformedSink), 'not an owner record');
@@ -783,6 +793,7 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
     writeCaptureOwner(captureOwnerPath(staleSink), ownerRecord(staleSink));
     const staleRecord = readFileSync(captureOwnerPath(staleSink), 'utf-8');
     await expect(run(staleSink, 'req-owner-stale', deadProbe, () => {})).rejects.toThrow(BAD_BOUND);
+    expect(probed, 'the stale owner was probed before the bound check').toEqual([ownerRecord(staleSink).pid]);
     expect(readFileSync(captureOwnerPath(staleSink), 'utf-8')).toBe(staleRecord);
     expect(existsSync(staleSink)).toBe(false);
     expect(fetchImpl).not.toHaveBeenCalled();
@@ -790,22 +801,21 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
 
   it('with a valid bound, a stale owner is removed and the run proceeds through the injected transport (#389)', async () => {
     const dir = tempDir();
-    const sinkPath = join(dir, 'stale-valid.ndjson');
-    writeCaptureOwner(captureOwnerPath(sinkPath), ownerRecord(sinkPath));
     const fetchImpl = vi.fn(async (): Promise<Response> => { throw new Error('fixture transport unreachable'); });
-    for (const bound of [1, 2_147_483_647]) {
-      const run = await runCaptureCli([...BASE_ARGS, '--sink', sinkPath.replace('.ndjson', `-${String(bound)}.ndjson`), '--request-id', `req-stale-${String(bound)}`, ...OPS],
+    for (const bound of [1, 30_000, 2_147_483_647]) {
+      const sinkPath = join(dir, `stale-valid-${String(bound)}.ndjson`);
+      writeCaptureOwner(captureOwnerPath(sinkPath), ownerRecord(sinkPath));
+      const code = await runCaptureCli([...BASE_ARGS, '--sink', sinkPath, '--request-id', `req-stale-${String(bound)}`, ...OPS],
         { ...deps({ probe: () => deadProbe }), fetchImpl, responseHeadersTimeoutMs: bound, stdout: () => {}, stderr: () => {} });
-      expect(run, String(bound)).toBe(CAPTURE_EXIT.unknown);
+      // The run proceeded (an owner still on disk would have refused its
+      // exclusive ownership write with a usage exit) to an UNKNOWN outcome.
+      expect(code, String(bound)).toBe(CAPTURE_EXIT.unknown);
+      expect(existsSync(captureReceiptPath(sinkPath)), String(bound)).toBe(true);
+      // The dead claim was replaced by this run's OWN ownership, kept for
+      // reconciliation after an UNKNOWN outcome.
+      expect(JSON.parse(readFileSync(captureOwnerPath(sinkPath), 'utf-8')), String(bound)).toMatchObject({ request_id: `req-stale-${String(bound)}` });
     }
-    const code = await runCaptureCli([...BASE_ARGS, '--sink', sinkPath, '--request-id', 'req-stale-valid', ...OPS],
-      { ...deps({ probe: () => deadProbe }), fetchImpl, responseHeadersTimeoutMs: 30_000, stdout: () => {}, stderr: () => {} });
-    expect(code).toBe(CAPTURE_EXIT.unknown);
     expect(fetchImpl).toHaveBeenCalledTimes(3);
-    // The dead claim was cleared and replaced by this run's OWN ownership
-    // (kept for reconciliation after an UNKNOWN outcome); its receipt exists.
-    expect(existsSync(captureReceiptPath(sinkPath))).toBe(true);
-    expect(JSON.parse(readFileSync(captureOwnerPath(sinkPath), 'utf-8'))).toMatchObject({ request_id: 'req-stale-valid' });
   });
 
   it('accepts the bound at both timer edges and uses the injected transport (#389)', async () => {
