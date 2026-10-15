@@ -627,7 +627,10 @@ describe('supervisor ⇄ sensor seam', () => {
     // Factory-only tests cannot catch a replaced main wiring: the repo's
     // source-drift alarm pattern.
     const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
-    expect(mainSource).not.toMatch(/\w*supervisor\w*[!?]?\s*\.\s*start\b/i);
+    // A heuristic tripwire (bracket access, destructuring or an alias
+    // without "supervisor" in its name would evade it): supervision starts
+    // only through handBackThenStartSupervision.
+    expect(mainSource).not.toMatch(/supervisor\w*[!?]?\s*\.\s*start\b/i);
     const handBack = mainSource.indexOf('handBackThenStartSupervision(providerRecoverySensor, supervisorLive,');
     expect(handBack).toBeGreaterThan(-1);
     expect(handBack).toBeLessThan(mainSource.indexOf('await service.start()'));

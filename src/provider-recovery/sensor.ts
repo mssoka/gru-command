@@ -75,6 +75,8 @@ export interface SensorNotifications {
     dedupe: 'unacked' | 'active' | 'all';
   }): { id: string };
   resolveIncidents(kindPrefix: string, by: string): unknown;
+  /** Refresh an open incident's detail in place (same id). */
+  updateDetail(id: string, detail: string): unknown;
 }
 
 /** The Silas wake surface: the existing durable wake mechanism (the
@@ -261,6 +263,13 @@ export function bootProviderRecovery(sensor: ProviderRecoverySensor, log: Log): 
 
 /** The single notice for a boot hand-back pass that failed or kept a wait. */
 const HAND_BACK_FAILED = 'provider-recovery.hand-back-failed';
+
+/** When a boot hand-back failure notice was last reported: the time its
+ * detail carries (it is refreshed in place by each failing boot), else its
+ * insert time — NaN when unreadable, which the caller counts as reported. */
+function lastReportedAt(row: { readonly ts: string; readonly detail: string | null }): number {
+  return Date.parse(row.detail?.match(/Last reported (\S+?)\.$/u)?.[1] ?? row.ts);
+}
 
 /** The `[provider_recovery]` switch that governs a provider. */
 function switchFor(provider: string): 'claude_native' | 'enabled' {
@@ -860,8 +869,8 @@ export class ProviderRecoverySensor {
    * reconciliation never hands back. A wait it cannot hand back is kept for
    * the NEXT boot, never cancelled after hydration (that would resolve a row
    * the supervisor already bound as the lane's re-arm control). A pass that
-   * fails outright or keeps any wait tells Gru — one open notice, raised
-   * afresh by each such boot, so no lane is left stopped in silence (a kept
+   * fails outright or keeps any wait tells Gru — one open notice, refreshed
+   * (or raised) by each such boot, so no lane is left stopped in silence (a kept
    * wait may have no notice of its own) — and only a pass that keeps none
    * retires it. */
   handBackAtBoot(): number {
@@ -871,11 +880,11 @@ export class ProviderRecoverySensor {
     try {
       pass = this.handBackPass();
     } catch (error) {
-      this.announceHandBackFailure();
+      this.announceHandBackFailure('failed');
       throw error;
     }
     if (pass.kept > 0) {
-      this.announceHandBackFailure();
+      this.announceHandBackFailure('failed');
     } else {
       try {
         this.notifications.resolveIncidents(HAND_BACK_FAILED, 'provider-recovery-sensor');
@@ -892,30 +901,46 @@ export class ProviderRecoverySensor {
     return this.bootHandBackRan;
   }
 
-  /** A boot whose hand-back was never attempted: Gru is told as for a failed
-   * pass (best effort), so no lane is left stopped in silence. */
+  /** A boot whose hand-back was never attempted: Gru is told (best effort),
+   * so no lane is left stopped in silence, and the hand-back is latched off
+   * for this process — an attempt after hydration would resolve rows the
+   * supervisor already bound; the next boot runs it. */
   noteBootHandBackSkipped(): void {
-    this.announceHandBackFailure();
+    this.bootHandBackRan = true;
+    this.announceHandBackFailure('skipped');
   }
 
   /** The action-required notice for a boot pass that failed outright or kept
-   * a wait, raised AFRESH by every such boot (the previous one resolved
-   * first): Gru is woken for each boot that strands lanes, and the newest
-   * row's time marks the latest failure for the repeat marker. Best effort:
-   * a failed post is logged, never thrown. */
-  private announceHandBackFailure(): void {
+   * a wait, or for a boot that never attempted the hand-back — ONE write per
+   * boot, so a failure between steps never leaves Gru without it: an open
+   * notice is refreshed in place (its detail changes, which wakes Gru again,
+   * and says Gru was told before); with none open a fresh one is posted. Its
+   * detail ends with the report time the repeat marker reads. Best effort: a
+   * failed write is logged, never thrown. */
+  private announceHandBackFailure(cause: 'failed' | 'skipped'): void {
     try {
-      this.notifications.resolveIncidents(HAND_BACK_FAILED, 'provider-recovery-sensor');
-      this.notifications.postIncident({
-        kind: HAND_BACK_FAILED,
-        routing: 'action-required',
-        severity: 'error',
-        title: 'Provider waits not handed back at boot',
-        detail: 'Handing back the open waits of providers whose automatic recovery is off failed at boot (for some or ' +
-          'all of them), so any such lane stays stopped until a restart\'s hand-back succeeds — see the service log.',
-        agentId: null,
-        dedupe: 'active',
-      });
+      const open = this.ledger.findNotificationByKind(HAND_BACK_FAILED, 'active');
+      const what = cause === 'failed'
+        ? 'Handing back the open waits of providers whose automatic recovery is off failed at boot (for some or all of them)'
+        : 'The boot hand-back of providers whose automatic recovery is off was never attempted (a wiring fault — see the ' +
+          '"had not been attempted" log line)';
+      const told = open === null ? ''
+        : ` Gru was told before (first reported ${open.ts}) — check whether the lanes already resumed before you act.`;
+      const detail = `${what}, so any such lane stays stopped until a restart's hand-back succeeds — see the service log.${told} ` +
+        `Last reported ${new Date().toISOString()}.`;
+      if (open !== null) {
+        this.notifications.updateDetail(open.id, detail);
+      } else {
+        this.notifications.postIncident({
+          kind: HAND_BACK_FAILED,
+          routing: 'action-required',
+          severity: 'error',
+          title: 'Provider waits not handed back at boot',
+          detail,
+          agentId: null,
+          dedupe: 'active',
+        });
+      }
     } catch (error) {
       this.log('error', 'the hand-back failure notice could not be posted', { error: String(error) });
     }
@@ -1049,13 +1074,12 @@ export class ProviderRecoverySensor {
         : 'resume it (dispose its re-arm control once a live agent is adopted) or re-dispatch the job';
       // Told before — this wait's own notice (Gru disposed of it while the
       // wait stayed open, or the switch was on again in between), or a boot
-      // hand-back failure reported since the wait opened (the newest such
-      // row, resolved or not: Gru may have acted on it; an unreadable
-      // timestamp counts as reported): say so, so a re-dispatch is never
-      // doubled.
+      // hand-back failure reported since the wait opened (its last report
+      // time, resolved or not: Gru may have acted on it; an unreadable time
+      // counts as reported): say so, so a re-dispatch is never doubled.
       const announced = this.ledger.findNotificationByKind(`provider-recovery.recovery-off.${wait.id}`, 'any') !== null;
       const failure = this.ledger.findNotificationByKind(HAND_BACK_FAILED, 'any');
-      const failureSince = failure !== null && !(Date.parse(failure.ts) < Date.parse(wait.createdAt));
+      const failureSince = failure !== null && !(lastReportedAt(failure) < Date.parse(wait.createdAt));
       const repeat = announced
         ? 'Announced before and the wait is still open — check whether the lane already resumed before you act. '
         : failureSince
