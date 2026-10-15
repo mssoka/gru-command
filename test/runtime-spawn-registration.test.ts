@@ -579,12 +579,17 @@ describe('registry publication and production consumer custody (GH-280)', () => 
       await expect(routing).resolves.toMatchObject({ outcome: 'completed', minionId: 'original' });
       expect(h.controls[2]!.prompts).toHaveLength(2);
       expect(h.controls[2]!.prompts[1]).toBe(h.controls[2]!.prompts[0]);
-      // The native caller records these only AFTER the truthful retry result.
-      for (const kind of ['silas.rebrief', 'job.delivered']) {
-        expect(h.ledger.appendCustomEventIfCurrentRebrief({ kind, jobId: h.jobId,
-          payload: { minion_id: 'original', sha: 'fixture-completed-work' } }, native.markers)).not.toBeNull();
+      // The native caller records these only AFTER the truthful retry result,
+      // using the original generation's persisted post-spawn worker binding.
+      const completedMarkers = h.ledger.listPendingRebriefs({ jobId: h.jobId });
+      expect(completedMarkers.map((marker) => marker.id)).toEqual(native.markers.map((marker) => marker.id));
+      for (const marker of completedMarkers) {
+        expect(h.ledger.appendCustomEventIfCurrentRebrief({ kind: marker.kind, jobId: h.jobId, payload: {
+          marker_id: marker.id, payload_hash: marker.payloadHash, work_revision: marker.workRevision,
+          ...(marker.kind === 'silas.rebrief' ? { minion_id: 'original' } : { agentId: 'original' }), sha: 'a'.repeat(40),
+        } }, completedMarkers)).not.toBeNull();
       }
-      expect(h.ledger.clearPendingRebriefsIfCurrentAndSettle(native.markers)).toBe(true);
+      expect(h.ledger.clearPendingRebriefsIfCurrentAndSettle(completedMarkers)).toBe(true);
       expect(h.supervisor.pendingProducerBlockers(h.jobId).join(' ')).toContain('restart in flight');
       const successor = h.registry.getHandle('original')!;
       h.releaseSpawn.resolve();

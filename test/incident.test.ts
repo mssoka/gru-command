@@ -95,3 +95,8 @@ describe('incident identity — review additions (issue #219)', () => {
     );
   });
 });
+
+it('concrete directive and historical rebrief recovery debt cannot be covered by a generic Ops hold', () => {
+  expect(isHardFloorRow({ kind: 'silas.directive-unreconciled.request-286', title: 'recovery owed', routing: 'action-required' })).toBe(true);
+  expect(isHardFloorRow({ kind: 'silas.rebrief-unreconciled.job-286', title: 'recovery owed', routing: 'action-required' })).toBe(true);
+});

@@ -92,3 +92,36 @@ describe('Silas deterministic-pass seam drives actual handoff reconsideration', 
     driver.stop();
   }, 30_000);
 });
+
+it('P34 real pending original native directive is reconsidered through the production driver seam once without a model wake', async () => {
+  const { DirectiveProgressService } = await import('../src/dispatch/directive-progress.js');
+  const { DirectiveNativeFixture } = await import('./helpers/directive-native-fixture.js');
+  const root = mkdtempSync(join(tmpdir(), 'directive-driver-seam-')); dirs.push(root);
+  const db = new LedgerDb(root); const ledger = new LedgerApi(db.handle); const bus = new EventBus();
+  const worktrees = new GitReviewPort(root, 'main', 'a'.repeat(40));
+  const job = ledger.addJob({ id: 'original-driver-directive', repo: 'fixture', title: 'original', briefing: 'approved original' }); ledger.setJobStatus(job.id, 'working');
+  await worktrees.createJobWorktree({ repoPath: root, jobId: job.id });
+  const file = join(root, 'original-native.jsonl'); const native = new DirectiveNativeFixture(file, 'original-driver-minion');
+  ledger.registerAgent({ id: 'original-driver-minion', role: 'minion', jobId: job.id, sessionFile: file }); ledger.setAgentState('original-driver-minion', 'idle');
+  const row = ledger.beginDirectiveIntent({ jobId: job.id, requestId: 'original-seam-request', directive: 'original approved task', holder: 'gru' }).record;
+  ledger.prepareDirectiveTarget(row.requestId, { agentId: 'original-driver-minion', sessionFile: file });
+  native.begin('original approved task', { directive: { identity: ledger.directiveTurnIdentity(row.requestId), beforeAdmission: () => {}, onAdmitted: (binding) => { ledger.bindDirectiveNativeAdmission(binding); } } });
+  native.end(); native.ceased();
+  const notifications = { postIncident: () => ({ id: 'seam-notice' }) }; const spawn = vi.fn(async () => { throw new Error('terminal original must not spawn'); });
+  const progress = new DirectiveProgressService({ ledger, worktrees, notifications, signal: new AbortController().signal,
+    registry: { getHandle: () => null, spawn, disposeHandle: async () => {} }, pendingProducerBlockers: () => [] });
+  let sweep: (() => void) | null = null;
+  const driver = new SilasDriver({ ledger: { appendCustomEvent: () => ({ seq: 1 }) } as never, worktrees: { listWorktrees: () => [] } as never,
+    slot: { ensure: async () => { throw new Error('no model wake'); }, viewFor: () => null } as never, bus,
+    ops: { baseUrl: 'http://127.0.0.1:0', configPath: 'unused' }, skills: [],
+    config: { enabled: true, sweepIntervalMs: 60_000, pollIntervalMs: 0, directiveAt: 2, rebriefAt: 3, escalateAt: 4, stallThresholdMs: 1_800_000, unchangedRewakeMs: 21_600_000 },
+    setInterval: ((callback: () => void) => { sweep = callback; return 1; }) as unknown as typeof setInterval, clearInterval: (() => {}) as never,
+    onDeterministicPass: createProductionDeterministicPass({ ledger, notifications, getWave: () => undefined, directiveProgress: progress }) });
+  try {
+    driver.start(); bus.publish({ seq: 1, ts: '0', kind: 'job.delivered', jobId: 'unrelated', agentId: null, roundId: null, lens: null, payload: null });
+    await new Promise<void>((resolve) => setImmediate(resolve)); await progress.settled();
+    expect(ledger.getDirective(row.requestId)?.state).toBe('settled'); expect(spawn).not.toHaveBeenCalled();
+    (sweep as (() => void) | null)?.(); await new Promise<void>((resolve) => setImmediate(resolve)); await progress.settled();
+    expect(ledger.listJobEventsByKinds(job.id, ['job.delivered'])).toHaveLength(1);
+  } finally { driver.stop(); await progress.dispose(); db.close(); }
+});

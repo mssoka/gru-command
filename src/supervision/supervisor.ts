@@ -1,4 +1,6 @@
 import { existsSync, statSync } from 'node:fs';
+import { isDeepStrictEqual } from 'node:util';
+import type { DirectiveProducer } from '../runtime/directive-checkpoint.js';
 import type { Role, SupervisionConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { AgentHandle, AgentState, PendingTurn, RuntimeEvent, SpawnOptions } from '../runtime/types.js';
@@ -27,6 +29,7 @@ import {
 import { WorkerDisposalInProgressError } from '../runtime/worker-errors.js';
 import { stageSpawnRegistration } from '../runtime/spawn-registration.js';
 import { promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
+import { surfaceDirectiveRecovery } from '../dispatch/directive-progress.js';
 import { observeDisposalSettlement } from '../runtime/disposal-observation.js';
 import { RestartCleanupJournal, restartCleanupDiagnostic, type RestartCleanupDebt } from './restart-cleanup.js';
 
@@ -419,6 +422,7 @@ export type SupervisorRestartPolicy =
   | { readonly refuse: string };
 
 export class Supervisor {
+  private readonly retainedDirectiveProducers = new Map<AgentHandle, string>(); // original job, independent of logical-agent reassociation
   private readonly cfg: SupervisionConfig;
   private readonly registry: SupervisorRegistry;
   private readonly ledger: LedgerApi;
@@ -1410,6 +1414,11 @@ export class Supervisor {
       // shutdown) while we waited — the identity check is the cancellation.
       if (this.disposed || agent.rateLimitRetry !== incident) return;
       if (this.agents.get(agent.agentId) !== agent) return;
+      if (incident.pending.directive !== undefined) {
+        surfaceDirectiveRecovery({ ledger: this.ledger, notifications: this.notifications }, incident.pending.directive.identity.requestId, 'provider retry cannot replay a consumed native directive; inspect its checkpoint');
+        this.clearRateLimitRetry(agent, 'superseded');
+        return;
+      }
       const handle = agent.handle;
       if (handle === null || agent.breakerOpen) {
         this.clearRateLimitRetry(agent, 'superseded');
@@ -2029,6 +2038,12 @@ export class Supervisor {
       this.clearRecoveryAdmission(agent);
       const captured = this.captureInterruptedTurn(old, agent);
       if (captured !== null) agent.pendingRecovery = captured;
+      const interruptedDirective = agent.pendingRecovery?.pending?.directive;
+      // Capture original ownership before disposal can await or re-associate
+      // the logical row. No cleanup fulfillment/row mutation proves cessation.
+      if (old !== null && interruptedDirective !== undefined && !this.retainedDirectiveProducers.has(old)) {
+        this.retainedDirectiveProducers.set(old, interruptedDirective.identity.jobId);
+      }
       // Exact-handle filtering now ignores the retiring object's tap once
       // detached. Conclude its retry explicitly before dropping its handle.
       this.clearRateLimitRetry(agent, 'superseded');
@@ -2047,6 +2062,22 @@ export class Supervisor {
         }
       }
 
+      if (interruptedDirective !== undefined) {
+        const requestId = interruptedDirective.identity.requestId;
+        if (old?.cessationEvidence?.() !== 'ceased') {
+          agent.handle = old;
+          agent.state = 'stopped';
+          this.log('error', 'directive cleanup has unknown cessation — explicit supervisor ownership retained', { agent_id: agent.agentId, request_id: requestId });
+          surfaceDirectiveRecovery({ ledger: this.ledger, notifications: this.notifications }, requestId, 'supervisor cleanup retains unknown producer ownership');
+          return;
+        }
+        if (old !== null) this.retainedDirectiveProducers.delete(old); // positive original physical cessation
+        if (agent.pendingRecovery?.pending?.directive === interruptedDirective) agent.pendingRecovery = null;
+        agent.state = 'watching';
+        surfaceDirectiveRecovery({ ledger: this.ledger, notifications: this.notifications }, requestId, 'supervisor ceased the interrupted turn; service must inspect native completion/checkpoint, never replay');
+        return;
+      }
+      if (!this.recoveryAuthorityCurrent(agent, agent.pendingRecovery)) return;
       if (restartSlot !== null && restartSlot.generation !== restartGeneration) return;
 
       // Issue #161: the owning subsystem may specialize or refuse a restart
@@ -2128,6 +2159,7 @@ export class Supervisor {
         flight.handle = spawned;
         if (
           this.disposed ||
+          !this.recoveryAuthorityCurrent(agent, agent.pendingRecovery) ||
           (restartSlot !== null &&
             (this.slots.get(restartSlot.id) !== restartSlot ||
               restartSlot.generation !== restartGeneration))
@@ -2544,6 +2576,10 @@ export class Supervisor {
     agent.pendingRecovery = null;
     const laneAgentId = recovery.originAgentId;
     const pending = recovery.pending;
+    if (pending?.directive !== undefined) {
+      surfaceDirectiveRecovery({ ledger: this.ledger, notifications: this.notifications }, pending.directive.identity.requestId, 'native directive continuation belongs to the service checkpoint coordinator');
+      return;
+    }
     if (
       pending !== null &&
       (pending.text.trim() !== '' || (pending.images !== undefined && pending.images.length > 0))
@@ -3018,7 +3054,13 @@ export class Supervisor {
   /** Synchronous cessation evidence for guarded control closure. A timer,
    * queued retry or undecided recovery is still producer ownership even
    * while its durable agent row says idle/error/disposed. */
-  pendingProducerBlockers(jobId: string): readonly string[] {
+  pendingProducerBlockers(jobId: string, currentNative?: { readonly handle: AgentHandle; readonly producer: DirectiveProducer }): readonly string[] {
+    const retained: string[] = [];
+    for (const [handle, originalJobId] of this.retainedDirectiveProducers) {
+      if (originalJobId !== jobId) continue;
+      if (handle.cessationEvidence?.() === 'ceased') this.retainedDirectiveProducers.delete(handle);
+      else retained.push(`unproven directive producer cessation: ${handle.id}`);
+    }
     const unjournaled: string[] = [];
     for (const [handle, cleanup] of this.rejectedRestartCleanup) {
       if (cleanup.jobId !== jobId) continue;
@@ -3040,12 +3082,22 @@ export class Supervisor {
       const pending = agent.inRestart || agent.backoffTimer !== null || agent.decisionPending ||
         agent.queuedRecovery !== null || agent.rateLimitRetry !== null || agent.recoveryAdmission !== null ||
         (agent.state !== 'stopped' && !agent.breakerOpen && agent.pendingRecovery !== null);
-      const open = agent.openTurn || agent.openControl || agent.openToolCalls.size > 0;
+      const directive = currentNative === undefined ? null : this.ledger.getDirective(currentNative.producer.identity.requestId);
+      const start = currentNative === undefined ? null : this.ledger.latestJobEventByRequestId(jobId, 'silas.directive-producer-started', currentNative.producer.identity.requestId);
+      const ownNative = currentNative !== undefined && agent.handle === currentNative.handle && this.registry.getHandle(row.id) === currentNative.handle &&
+        currentNative.producer.agentId === row.id && currentNative.producer.identity.jobId === jobId && currentNative.handle.sessionFile === row.sessionFile &&
+        currentNative.producer.sessionFile === row.sessionFile && directive?.nativeTarget?.agentId === row.id && directive.nativeTarget.sessionFile === row.sessionFile &&
+        directive.nativeBinding?.sessionId === currentNative.producer.sessionId &&
+        isDeepStrictEqual(currentNative.handle.pendingTurn?.()?.directive?.identity, currentNative.producer.identity) &&
+        isDeepStrictEqual((start?.payload as { native_producer?: unknown } | undefined)?.native_producer, currentNative.producer);
+      // Only this exact admitted physical turn's own tools are allowed.
+      // Restart/retry/control, competing producers and cleanup fences remain.
+      const open = agent.openControl || !ownNative && (agent.openTurn || agent.openToolCalls.size > 0);
       return pending || open ? [`supervised producer: ${row.id} (${pending ? 'pending recovery/retry' : 'open turn/control/tool'})`] : [];
     });
     const flights = [...this.restartingAgents].flatMap(([agent, flight]) =>
       flight.authority?.jobId === jobId ? [`restart in flight: ${agent.agentId}`] : []);
-    return [...rejected, ...unjournaled, ...supervised, ...flights];
+    return [...retained, ...rejected, ...unjournaled, ...supervised, ...flights];
   }
 
   /** Board feed: supervision view for one agent id (or null). */

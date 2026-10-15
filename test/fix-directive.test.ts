@@ -293,6 +293,61 @@ function minionRecord(id: string, jobId: string | null, sessionFile: string | nu
   };
 }
 
+it('P40 preserves historical native HEADs without labeling them current candidates when no live lane matches', () => {
+  const appendCustomEvent = vi.fn<LedgerApi['appendCustomEvent']>().mockReturnValue({ seq: 1 } as ReturnType<LedgerApi['appendCustomEvent']>);
+  const getJob = vi.fn(() => null); const openReportObligation = vi.fn();
+  const ledger = { appendCustomEvent, getJob, openReportObligation };
+  const worktrees = new InMemoryWorktreePort(join(tmpdir(), 'P40-no-lane-sampling'));
+  const deliver = (sha: string | null) => recordFollowUpDelivery({ ledger, worktrees, jobId: 'P40-original', agentId: 'original-minion', source: 'silas-directive', workRevision: 1,
+    nativeCompletion: { sha, provenance: { original: 'immutable original receipt' } } });
+  for (const sha of ['a'.repeat(41), 'b'.repeat(48), 'c'.repeat(63), { toString: () => 'a'.repeat(40) } as unknown as string]) {
+    expect(() => deliver(sha)).toThrow(/exact 40\/64/);
+    expect(appendCustomEvent).not.toHaveBeenCalled(); expect(getJob).not.toHaveBeenCalled(); expect(openReportObligation).not.toHaveBeenCalled();
+  }
+  for (const sha of ['a'.repeat(40), 'b'.repeat(64), null]) {
+    const result = deliver(sha);
+    expect(result.sha).toBe(sha);
+    expect(appendCustomEvent).toHaveBeenLastCalledWith(expect.objectContaining({ payload: expect.objectContaining({ sha, candidate_delivery_proven: false }) }));
+    if (sha !== null) expect(result.note).toMatch(/no unique live job lane/u);
+  }
+});
+
+it('P40 marks original native HEAD as a candidate only on one matching clean unswept job lane', async () => {
+  const repo = makeFixtureRepo('P40-native-current-candidate'); cleanupRepos.push(repo);
+  const root = mkdtempSync(join(tmpdir(), 'gru-command-native-current-candidate-')); cleanupDirs.push(root);
+  const backing = new InMemoryWorktreePort(root);
+  const lane = await backing.createJobWorktree({ repoPath: repo.path, jobId: 'P40-current' });
+  const head = execFileSync('git', ['-C', lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  let lanes: readonly WorktreeLane[] = [lane];
+  const worktrees = { listWorktrees: () => lanes };
+  const appendCustomEvent = vi.fn<LedgerApi['appendCustomEvent']>().mockReturnValue({ seq: 1 } as ReturnType<LedgerApi['appendCustomEvent']>);
+  const ledger = { appendCustomEvent, getJob: () => null, openReportObligation: vi.fn() };
+  // Unit-level original cwd evidence is recorded before any delivery. The
+  // ledger/native integration suites own terminal and physical proof.
+  const sessionFile = join(root, 'original-native.jsonl'); const sessionId = 'original-native-session';
+  writeFileSync(sessionFile, `${JSON.stringify({ type: 'session', id: sessionId, cwd: lane.path })}\n`);
+  const deliver = () => recordFollowUpDelivery({ ledger, worktrees, jobId: 'P40-current', agentId: 'original-minion', source: 'silas-directive', workRevision: 1,
+    nativeCompletion: { sha: head, provenance: { original: 'immutable completion receipt',
+      binding: { sessionFile, sessionId, agentId: 'original-minion' } } } });
+  expect(deliver().sha).toBe(head);
+  expect(appendCustomEvent).toHaveBeenLastCalledWith(expect.objectContaining({ payload: expect.objectContaining({ sha: head, candidate_delivery_proven: true }) }));
+  writeFileSync(join(lane.path, 'src/main.ts'), 'export function answer(): number { return 43; }\n');
+  const dirty = deliver();
+  expect(dirty.sha).toBe(head); expect(dirty.note).toMatch(/tracked tree is dirty/u);
+  expect(appendCustomEvent).toHaveBeenLastCalledWith(expect.objectContaining({ payload: expect.objectContaining({ sha: head, candidate_delivery_proven: false }) }));
+  writeFileSync(join(lane.path, 'src/main.ts'), 'export function answer(): number {\n  return 42;\n}\n');
+  writeFileSync(join(lane.path, 'moved.txt'), 'moved\n');
+  execFileSync('git', ['-C', lane.path, 'add', 'moved.txt']);
+  execFileSync('git', ['-C', lane.path, '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'move current head'], { stdio: 'ignore' });
+  const moved = deliver();
+  expect(moved.sha).toBe(head); expect(moved.note).toMatch(/HEAD moved/u);
+  expect(appendCustomEvent).toHaveBeenLastCalledWith(expect.objectContaining({ payload: expect.objectContaining({ sha: head, candidate_delivery_proven: false }) }));
+  lanes = [{ ...lane, status: 'swept' as const }];
+  expect(deliver().note).toMatch(/no unique live job lane/u);
+  lanes = [];
+  expect(deliver().note).toMatch(/no unique live job lane/u);
+});
+
 describe('recordFollowUpDelivery (the loop-closing signal)', () => {
   it('records job.delivered with the lane head the settled turn produced', async () => {
     const repo = makeFixtureRepo('fixture-followup-delivery');
@@ -1408,5 +1463,79 @@ describe('per-prompt terminal verdict capture (r5 blocker 1)', () => {
     } finally {
       await handle.dispose();
     }
+  });
+});
+
+describe('fix directive cleanup failure provenance — P18 current-behavior regressions', () => {
+  function failureMessages(error: unknown): string[] {
+    return [String(error),
+      ...(error instanceof AggregateError ? error.errors.flatMap((nested: unknown) => failureMessages(nested)) : []),
+      ...(error instanceof Error && error.cause !== undefined ? failureMessages(error.cause) : [])];
+  }
+
+  async function assertSimultaneousCleanupFailures(prior: boolean): Promise<void> {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-fix-cleanup-errors-'));
+    cleanupDirs.push(dir);
+    const db = new LedgerDb(dir);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const worktrees = new InMemoryWorktreePort(join(dir, 'lanes'));
+    const promptFailure = new Error('original fresh native prompt failure');
+    const disposalFailure = new Error(prior ? 'original prior rebrief disposal failure' : 'original fresh disposal failure');
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 1 });
+    const target: AgentHandle = {
+      id: 'cleanup-minion', role: 'minion', sessionFile: '/controlled-cleanup-native.jsonl',
+      capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+      prompt: vi.fn(async () => { throw promptFailure; }),
+      async steer() {}, async followUp() {},
+      subscribe() { return () => {}; },
+      health() { return { state: 'idle', lastActivity: null, sessionFile: this.sessionFile }; },
+      // The controlled cleanup really rejects; it never reports disposal or
+      // cessation just because the prompt operation rejected/settled.
+      dispose: vi.fn(async () => { throw disposalFailure; }),
+      cessationEvidence: () => 'unknown',
+    };
+    const spawn = vi.fn(async () => target);
+    const onCleanup = vi.fn((handle: AgentHandle) => {
+      ledger.appendCustomEvent({ kind: 'silas.directive-producer-unknown', jobId: 'cleanup-job',
+        payload: { request_id: 'cleanup-request', agent_id: handle.id, session_file: handle.sessionFile } });
+    });
+    try {
+      ledger.addJob({ id: 'cleanup-job', repo: 'fixture', title: 'cleanup', briefing: 'original contract' });
+      ledger.setJobStatus('cleanup-job', 'working');
+      await worktrees.createJobWorktree({ repoPath: dir, jobId: 'cleanup-job' });
+      if (prior) {
+        ledger.registerAgent({ id: target.id, role: 'minion', jobId: 'cleanup-job', sessionFile: target.sessionFile });
+        ledger.setAgentState(target.id, 'idle');
+      }
+      db.handle.exec(`CREATE TRIGGER reject_cleanup_journal BEFORE INSERT ON events
+        WHEN NEW.kind = 'silas.directive-producer-unknown'
+        BEGIN SELECT RAISE(FAIL, 'original cleanup journal storage failure'); END`);
+      const error = await routeFixDirectiveToMinion({ ledger,
+        registry: { getHandle: (id) => prior && id === target.id ? target : null, spawn,
+          disposeHandle: async (handle) => { await handle.dispose(); } },
+        worktrees,
+        jobId: 'cleanup-job', directive: 'preserve all original failures', signal: new AbortController().signal,
+        freshSession: prior, workerGate: gate, onCleanup,
+      }).then(() => null, (failure: unknown) => failure);
+      expect(target.dispose).toHaveBeenCalledTimes(1); expect(onCleanup).toHaveBeenCalledTimes(1);
+      expect(target.cessationEvidence!()).toBe('unknown');
+      expect(gate.view().worker.running).toBe(0);
+      expect(ledger.latestJobEvent('cleanup-job', 'silas.directive-producer-ceased')).toBeNull();
+      expect(ledger.latestJobEvent('cleanup-job', 'job.delivered')).toBeNull();
+      if (prior) { expect(target.prompt).not.toHaveBeenCalled(); expect(spawn).not.toHaveBeenCalled(); }
+      else { expect(target.prompt).toHaveBeenCalledTimes(1); expect(spawn).toHaveBeenCalledTimes(1); }
+      const messages = failureMessages(error);
+      expect(messages, 'cleanup journaling must not replace the original disposal failure').toContain(String(disposalFailure));
+      if (!prior) expect(messages, 'fresh finally must also retain the original prompt failure').toContain(String(promptFailure));
+      expect(messages.join(';')).toContain('original cleanup journal storage failure');
+    } finally { db.close(); }
+  }
+
+  it('fresh prompt disposal and real SQLite journal failures retain every original failure', async () => {
+    await assertSimultaneousCleanupFailures(false);
+  });
+
+  it('prior rebrief disposal and real SQLite journal failures preserve the original owner failure without spawning', async () => {
+    await assertSimultaneousCleanupFailures(true);
   });
 });

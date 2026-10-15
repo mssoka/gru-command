@@ -153,6 +153,7 @@ export interface BranchIdleLedger {
   listJobAdmissions?(jobId: string): readonly string[];
   listJobs(): readonly JobRecord[];
   latestJobEvent(jobId: string, kind: string): EventRecord | null;
+  latestCandidateDelivery(jobId: string): EventRecord | null;
   /** Newest-first bounded history; the guard pages back to the `working`
    * hop behind an `in-review` flip. */
   listJobEvents(jobId: string, opts?: { readonly limit?: number }): readonly EventRecord[];
@@ -308,7 +309,7 @@ export function openAttemptStartSeq(ledger: BranchIdleLedger, jobId: string): nu
     // than the flip settles the attempt the flip belongs to, so the lane
     // clears; otherwise fail closed and treat the attempt as open (a later
     // delivery clears it — never a permanent busy).
-    const delivered = ledger.latestJobEvent(jobId, 'job.delivered');
+    const delivered = ledger.latestCandidateDelivery(jobId);
     return delivered !== null && delivered.seq > latest.seq ? 0 : Number.MAX_SAFE_INTEGER;
   }
   return 0;
@@ -356,7 +357,7 @@ export function laneIsBusy(ledger: BranchIdleLedger, job: JobRecord): boolean {
   // A verification run owns the checkout for its whole life; a review must
   // not freeze the head it is verifying.
   if (ledger.hasUnsettledVerificationRun(job.id)) return true;
-  const delivered = ledger.latestJobEvent(job.id, 'job.delivered');
+  const delivered = ledger.latestCandidateDelivery(job.id);
   // A repair admitted after the delivery keeps the lane busy even when no
   // status hop recorded it, and even while the stale status still reads
   // `delivered` (a claimed provider continuation) — fallback and recovery
