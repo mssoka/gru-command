@@ -158,7 +158,7 @@ describe('service shutdown orchestration (issue #341, R3-2 executable)', () => {
     expect(run.forced()).toBe(false);
     // The registry failure must never skip lock/store release or the snapshot.
     expect(order).toEqual(['registry.dispose', 'store.dispose', 'store.snapshot', 'ledger.close', 'handle.stop']);
-    expect(run.lines.some((line) => line.msg === 'registry dispose failed')).toBe(true);
+    expect(run.lines.some((line) => line.msg === 'directive progress/registry dispose failed')).toBe(true);
   });
 
   it('a genuinely stuck stage still reaches forced exit at the guard budget', async () => {

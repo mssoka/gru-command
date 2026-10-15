@@ -832,6 +832,7 @@ describe('tracked child workers: lifecycle, results and recovery', () => {
       'list_child_workers',
       'cancel_child_worker',
     ]);
+    expect(tools.every((tool) => typeof tool.authorityManifest === 'string' && tool.authorityManifest.length > 0)).toBe(true);
     const requestTool = tools.find((tool) => tool.name === 'request_child_worker')!;
     const created = JSON.parse(
       (await requestTool.execute({
@@ -863,9 +864,9 @@ describe('tracked child workers: lifecycle, results and recovery', () => {
     expect(listed.children[0]!.result_summary).toContain('child report');
     // ANOTHER parent's tools cannot cancel this child.
     h.ledger.registerAgent({ id: 'parent-2', role: 'minion', jobId: 'job-1', parentage: 'top-level' });
-    const foreignCancel = h.service
-      .parentTools('parent-2')
-      .find((tool) => tool.name === 'cancel_child_worker')!;
+    const siblingTools = h.service.parentTools('parent-2');
+    expect(siblingTools.map((tool) => tool.authorityManifest)).not.toEqual(tools.map((tool) => tool.authorityManifest));
+    const foreignCancel = siblingTools.find((tool) => tool.name === 'cancel_child_worker')!;
     const denied = JSON.parse((await foreignCancel.execute({ child_id: created.child_id })).text) as {
       error: string;
     };

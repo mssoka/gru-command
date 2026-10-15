@@ -184,6 +184,7 @@ function piHandle(opts: {
     pendingBash: opts.pendingBash ?? false,
   };
   let settleIdle: () => void = () => {};
+  let releaseCompact: () => void = () => {};
   const session: PiSession = {
     sessionId: 'pi-session-341',
     sessionFile: undefined,
@@ -196,8 +197,8 @@ function piHandle(opts: {
     steer: async () => {},
     followUp: async () => {},
     subscribe: () => () => {},
-    dispose: () => { state.disposed = true; state.disposeCalls += 1; },
-    compact: async () => (opts.compactNeverSettles === true ? new Promise<unknown>(() => {}) : {}),
+    dispose: () => { state.disposed = true; state.disposeCalls += 1; releaseCompact(); },
+    compact: async () => (opts.compactNeverSettles === true ? new Promise<unknown>((resolve) => { releaseCompact = () => resolve({}); }) : {}),
     getContextUsage: () => undefined,
     ...(mode === 'absent' ? {} : {
       waitForIdle: async () => {
@@ -300,10 +301,14 @@ describe('pi adapter cessation evidence requires a bounded idle proof (#341, Opt
       await vi.advanceTimersByTimeAsync(CESSATION_IDLE_TIMEOUT_MS);
       expect(await first).toBeInstanceOf(CessationIdleTimeoutError);
       expect(await concurrent).toBeInstanceOf(CessationIdleTimeoutError);
-      // Retry AFTER the rejection: the cached failure is returned again — no
-      // silent degrade-to-dispose-only success shape.
-      await expect(handle.dispose()).rejects.toBeInstanceOf(CessationIdleTimeoutError);
-      expect(session.waitForIdleCalls).toBe(1); // one proof attempt, shared
+      expect(session.waitForIdleCalls).toBe(1); // one proof attempt, shared by both callers
+      // Retry AFTER the rejection performs a REAL second proof attempt (main's
+      // retryable ownership contract) and, still hung, fails with the named
+      // error again — never a success-shaped bypass.
+      const retry = handle.dispose().catch((error: unknown) => error as Error);
+      await vi.advanceTimersByTimeAsync(CESSATION_IDLE_TIMEOUT_MS);
+      expect(await retry).toBeInstanceOf(CessationIdleTimeoutError);
+      expect(session.waitForIdleCalls).toBe(2);
       expect(handle.cessationEvidence()).toBe('unknown');
     } finally {
       vi.useRealTimers();
@@ -312,14 +317,7 @@ describe('pi adapter cessation evidence requires a bounded idle proof (#341, Opt
 
   it('rejects a rejecting waitForIdle as an unproven idle (no dispose-only fallback)', async () => {
     const { handle, events } = piHandle({ waitForIdleMode: 'reject' });
-    await expect(handle.dispose()).rejects.toBeInstanceOf(CessationIdleTimeoutError);
-    expect(handle.cessationEvidence()).toBe('unknown');
-    expect(events.some((event) => event.type === 'cessation_evidence' && event.evidence === 'ceased')).toBe(false);
-  });
-
-  it('rejects a session with no waitForIdle rather than claiming ceased from dispose alone', async () => {
-    const { handle, events } = piHandle({ waitForIdleMode: 'absent' });
-    await expect(handle.dispose()).rejects.toBeInstanceOf(CessationIdleTimeoutError);
+    await expect(handle.dispose()).rejects.toThrow('idle wait rejected');
     expect(handle.cessationEvidence()).toBe('unknown');
     expect(events.some((event) => event.type === 'cessation_evidence' && event.evidence === 'ceased')).toBe(false);
   });
@@ -370,7 +368,7 @@ describe('pi adapter cessation evidence requires a bounded idle proof (#341, Opt
         void handle.dispose();
       }
     });
-    void handle.compact(); // compaction stays pending -> disposal aborts it synchronously
+    void handle.compact().catch(() => {}); // compaction stays pending -> disposal aborts it synchronously
     await handle.dispose();
     expect(reentered).toBe(true);
     expect(events.filter((event) => event.type === 'compaction_end').length).toBe(1);
@@ -378,7 +376,7 @@ describe('pi adapter cessation evidence requires a bounded idle proof (#341, Opt
     expect(handle.cessationEvidence()).toBe('ceased');
   });
 
-  it('the timed-out session lock is released and re-acquirable (no leak on the failure path)', async () => {
+  it('the timed-out session retains its writer lock (ownership is released only on proven cessation)', async () => {
     vi.useFakeTimers();
     try {
       const { handle, store, sessionFile } = piHandle({ waitForIdleMode: 'never' });
@@ -387,10 +385,8 @@ describe('pi adapter cessation evidence requires a bounded idle proof (#341, Opt
       const settled = handle.dispose().catch((error: unknown) => error as Error);
       await vi.advanceTimersByTimeAsync(CESSATION_IDLE_TIMEOUT_MS);
       expect(await settled).toBeInstanceOf(CessationIdleTimeoutError);
-      // The named failure must not guard releaseLock on a proven idle, or the
-      // timed-out session leaks its lock and blocks reopen/replacement.
-      expect(store.isHeld(sessionFile)).toBe(false);
-      store.acquireLock(sessionFile); // re-acquirable: no leaked lock
+      // GH286 ownership contract: no idle proof, no release — a still-running
+      // turn must keep exclusive writer ownership of its session file.
       expect(store.isHeld(sessionFile)).toBe(true);
       store.releaseLock(sessionFile);
     } finally {

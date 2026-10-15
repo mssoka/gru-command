@@ -44,6 +44,7 @@ import {
 import { appendWorkerRules } from '../src/dispatch/worker-rules.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { makeFixtureRepo } from './helpers/fixture-repo.js';
+import { admitNativeDirectiveFixture, nativeDirectiveFixtureDeliveryProof } from './helpers/directive-native-fixture.js';
 import type { WorktreePort } from '../src/dispatch/worktree-port.js';
 
 /**
@@ -965,6 +966,38 @@ describe('supervisor — watchdog + restart ladder', () => {
   });
 });
 
+it('R13 retained UNKNOWN producer inventory follows its original job after logical-agent reassociation', async () => {
+  const h = boot();
+  try {
+    const jobId = 'r13-original-producer-job';
+    h.api.addJob({ id: jobId, repo: 'fixture', title: 'original approved job' }); h.api.setJobStatus(jobId, 'working');
+    h.api.addJob({ id: 'r13-other-job', repo: 'fixture', title: 'separate job' });
+    const handle = new FakeHandle('minion', 'r13-retained-producer', null);
+    let ceased = false;
+    Object.assign(handle, { cessationEvidence: () => ceased ? 'ceased' : 'unknown' });
+    h.api.registerAgent({ id: handle.id, role: 'minion', jobId });
+    const request = h.api.beginDirectiveIntent({ jobId, requestId: 'r13-retained-request', directive: 'original accepted turn', holder: 'gru' }).record;
+    handle.pendingTurnSnapshot = { text: 'original accepted turn', owner: `dispatch:${jobId}`, directive: {
+      identity: h.api.directiveTurnIdentity(request.requestId), beforeAdmission: () => {}, onAdmitted: () => {},
+    } };
+    let release!: () => void; const disposalGate = new Promise<void>((resolveGate) => { release = resolveGate; });
+    let entered!: () => void; const disposalStarted = new Promise<void>((resolveGate) => { entered = resolveGate; });
+    const dispose = h.registry.disposeHandle.bind(h.registry);
+    const held = vi.spyOn(h.registry, 'disposeHandle').mockImplementation(async (target) => { entered(); await disposalGate; await dispose(target); });
+    h.registry.adopt(handle); hang(handle); h.advance(60);
+    try {
+      await disposalStarted;
+      h.api.registerAgent({ id: handle.id, role: 'minion', jobId: 'r13-other-job' });
+      expect(h.supervisor.pendingProducerBlockers(jobId).join('; ')).toContain(`unproven directive producer cessation: ${handle.id}`);
+    } finally { release(); held.mockRestore(); }
+    await vi.waitFor(() => expect(h.supervisor.viewFor(handle.id)?.state).toBe('stopped'));
+    expect(h.supervisor.pendingProducerBlockers(jobId).join('; ')).toContain(`unproven directive producer cessation: ${handle.id}`);
+    expect(handle.promptCount).toBe(0); expect(h.registry.spawnCalls).toEqual([]);
+    ceased = true; // positive original physical cessation, not the reassociation
+    expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([]);
+  } finally { h.dispose(); }
+});
+
 describe('supervisor — durable restart association', () => {
   it('reports failed-restart backoff as producer ownership before any pacing entry exists', async () => {
     vi.useFakeTimers();
@@ -1321,9 +1354,16 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
     const f = await deferredDispatchRestart();
     try {
       if (kind === 'settled-rebrief') {
-        const markers = f.rig.api.beginPendingRebrief({ jobId: f.jobId, note: 'successor completed', briefing: null });
-        for (const eventKind of ['silas.rebrief', 'job.delivered']) {
-          f.rig.api.appendCustomEventIfCurrentRebrief({ kind: eventKind, jobId: f.jobId, payload: { sha: 'successor-head' } }, markers);
+        const accepted = f.rig.api.beginPendingRebrief({ jobId: f.jobId, note: 'successor completed', briefing: null });
+        f.rig.api.bindPendingRebriefWorker({ ids: accepted.map((marker) => marker.id), agentId: 'successor', sessionFile: null });
+        const markers = f.rig.api.listPendingRebriefs({ jobId: f.jobId });
+        // Historical unit receipts retain the exact persisted generation,
+        // worker and revision; they claim no current candidate authority.
+        for (const marker of markers) {
+          f.rig.api.appendCustomEventIfCurrentRebrief({ kind: marker.kind, jobId: f.jobId, payload: {
+            marker_id: marker.id, payload_hash: marker.payloadHash, work_revision: marker.workRevision,
+            ...(marker.kind === 'silas.rebrief' ? { minion_id: 'successor' } : { agentId: 'successor' }), sha: 'a'.repeat(40),
+          } }, markers);
         }
         expect(f.rig.api.clearPendingRebriefsIfCurrentAndSettle(markers)).toBe(true);
       } else {
@@ -1331,10 +1371,17 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
         f.rig.api.beginDirectiveIntent({ jobId: f.jobId, directive: 'successor work', holder: 'silas-ops', requestId });
         if (kind === 'failed-directive') f.rig.api.failDirective({ requestId, reason: 'explicit successor failure' });
         else {
-          const sent = f.rig.api.appendCustomEvent({ kind: 'silas.directive-sent', jobId: f.jobId, payload: { request_id: requestId, minion_id: 'successor' } });
-          f.rig.api.recordDirectiveAdmission({ requestId, minionId: 'successor', eventSeq: sent.seq });
-          const delivered = f.rig.api.appendCustomEvent({ kind: 'job.delivered', jobId: f.jobId, payload: { request_id: requestId, sha: 'successor-head' } });
+          const dir = tmpDir();
+          admitNativeDirectiveFixture(f.rig.api, requestId, 'successor', join(dir, 'successor.jsonl'), { head: null, cwd: dir });
+          const delivered = f.rig.api.appendCustomEvent({ kind: 'job.delivered', jobId: f.jobId, payload: {
+            request_id: requestId, agentId: 'successor', work_revision: f.rig.api.getDirective(requestId)!.workRevision, sha: null,
+            ...nativeDirectiveFixtureDeliveryProof(f.rig.api, requestId),
+          } });
           f.rig.api.recordDirectiveDelivery({ requestId, eventSeq: delivered.seq });
+          expect(f.rig.api.getDirective(requestId)?.state).toBe('settled');
+          // The known successor's original admission registers its own row.
+          // Only subsequent stale-rung publication is under observation.
+          f.register.mockClear();
         }
       }
       expect(f.rig.api.directiveRecoveryEpoch(f.jobId)).toBe(0);

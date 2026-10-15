@@ -28,6 +28,7 @@ import { createStartupVerdictPoster } from './dispatch/perkins-github-app.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { SilasDriver, computeSilasDigest, consolidatedBlockersFor, supervisionLookup } from './dispatch/silas-driver.js';
 import { createProductionDeterministicPass } from './dispatch/durable-reconcile.js';
+import { DirectiveProgressService } from './dispatch/directive-progress.js';
 import { ProviderRecoverySensor, establishProviderWait } from './provider-recovery/sensor.js';
 import { ModelRuntimeProbe } from './provider-recovery/probe.js';
 import {
@@ -39,7 +40,7 @@ import { claimProviderRecoveryContinuation } from './provider-recovery/resume.js
 import { GhCliApi, GitHubSignalPoll, type LaneRemoteResolver } from './dispatch/github-poll.js';
 import { GhRepoOverviewApi, ManagedRepoOverviewTracker } from './repos/overview.js';
 import { routeFixDirectiveToMinion } from './dispatch/fix-directive.js';
-import { reconcilePendingRebriefs, reconcilePendingDirectives } from './dispatch/rebrief-recovery.js';
+import { reconcilePendingLegacyDirectives, reconcilePendingRebriefs } from './dispatch/rebrief-recovery.js';
 import { adoptBlockedLanes, observeFollowUpDelivery, observePhaseCompletion, reconcilePhaseHandoffs, reconcileUnmarkedHandbacks } from './dispatch/obligations.js';
 import { createDispatchServer } from './dispatch/server.js';
 import { PipelineService } from './dispatch/pipeline.js';
@@ -1123,13 +1124,9 @@ async function main(): Promise<number> {
   // Automatic admission retries live in memory (owner decision 2026-10-08):
   // one pending when the service stopped escalates now instead of resuming.
   wave.escalateInterruptedAdmissionRetries();
-  // Re-brief restart safety (Silas finding 2026-09-23): a re-brief request
-  // mid-flight at restart left no events and no worker. The durable
-  // markers written before each worker spawned are consumed here — the
-  // interrupted session is resumed (or a fresh worker re-dispatched on the
-  // same lane) and the missing events are recorded when that turn settles.
-  // Never awaited beyond dispatch: a re-brief turn is long; failures
-  // escalate action-required from the background.
+  // Historical re-brief markers never authorize replay. Observe a bounded
+  // page for genuine spent/terminal evidence or concrete Gru judgment;
+  // DirectiveProgressService ticks fairly visit the remaining generations.
   const rebriefRecovery = await reconcilePendingRebriefs({
     registry,
     ledger,
@@ -1143,12 +1140,13 @@ async function main(): Promise<number> {
     log: (level, msg, fields) => logger.log(level, msg, fields),
     stopping: () => shuttingDown,
   });
-  if (rebriefRecovery.examined > 0) {
+  if (rebriefRecovery.examined > 0 || rebriefRecovery.failed > 0) {
     logger.info('re-brief reconciliation', {
       examined: rebriefRecovery.examined,
       completed: rebriefRecovery.completed,
       redispatched: rebriefRecovery.redispatched,
       retired: rebriefRecovery.retired,
+      failed: rebriefRecovery.failed,
     });
   }
   // Child-worker restart safety (issue #161): a child that never bound a
@@ -1159,23 +1157,27 @@ async function main(): Promise<number> {
   if (childRecovery.resumed > 0 || childRecovery.failed > 0) {
     logger.info('child worker reconciliation', childRecovery);
   }
-  // Directive-request restart safety (phase 3): a request accepted before
-  // the crash reconciles from correlated evidence when it exists; when
-  // admission or the terminal receipt is UNKNOWN, one bounded escalation
-  // names it for a Gru reconciliation — never an automatic retry
-  // (admission-unknown is not no-effect proof).
-  const directiveRecovery = reconcilePendingDirectives({
-    ledger,
-    notifications,
+  // Preserve event-only recovery for pre-native protocol rows at boot.
+  // Current requests are reconciled below only through their exact native
+  // checkpoint and producer-cessation evidence.
+  const legacyDirectiveRecovery = reconcilePendingLegacyDirectives({ ledger, notifications,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
-  if (directiveRecovery.examined > 0) {
-    logger.info('directive reconciliation', {
-      examined: directiveRecovery.examined,
-      completed: directiveRecovery.completed,
-      escalated: directiveRecovery.escalated,
+  if (legacyDirectiveRecovery.examined > 0) {
+    logger.info('legacy directive reconciliation', {
+      examined: legacyDirectiveRecovery.examined,
+      completed: legacyDirectiveRecovery.completed,
+      escalated: legacyDirectiveRecovery.escalated,
     });
   }
+  const directiveProgress = new DirectiveProgressService({ ledger, registry, worktrees: worktreeManager, notifications, observeBlindTurn,
+    clearLaneForWriter: (input) => wave.clearLaneForWriter(input),
+    pendingProducerBlockers: (jobId, currentNative) => supervisorLive.pendingProducerBlockers(jobId, currentNative), signal: serviceStop.signal,
+    workerGate: pacing.gate, retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId), parentTools: parentToolsFor,
+    ...(config.lessons.enabled ? { lessons: lessonReferences } : {}),
+  });
+  state.directiveProgress = directiveProgress;
+  directiveProgress.reconsider();
   // Explicit phase-handoff restart safety (pr136-chief-handoff): closes
   // crash windows after the correlated delivery commit and before/after
   // the obligation write and the notification publication. Runs AFTER the
@@ -1288,7 +1290,7 @@ async function main(): Promise<number> {
     ledger,
     childWorkers,
     workerGate: pacing.gate,
-    pendingProducerBlockers: (jobId) => supervisorLive.pendingProducerBlockers(jobId),
+    pendingProducerBlockers: (jobId, currentNative) => supervisorLive.pendingProducerBlockers(jobId, currentNative),
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     observeBlindTurn,
     ...(pipeline !== null ? { pipeline } : {}),
@@ -1523,6 +1525,7 @@ async function main(): Promise<number> {
         notifications,
         log: (level, msg, fields) => logger.log(level, msg, fields),
         getWave: () => state.wave,
+        directiveProgress,
       }),
       githubPoll: new GitHubSignalPoll({
         ledger,

@@ -155,25 +155,23 @@ describe('real spawned Pi timeout retirement (F60-P6)', () => {
       expect(error).toBeInstanceOf(CessationIdleTimeoutError);
       expect(error).toBe(original);
       expect(adapterCessationEvidence(raw)).toBe('unknown');
-      // The PRODUCTION retirement callback ran: native + active-file membership
-      // are gone (retirement is bookkeeping, NOT capacity cessation).
-      expect(native.handles.size).toBe(0);
-      expect(native.activeFiles.has(sessionFile)).toBe(false);
-      // The session lock was released and is re-acquirable.
-      expect(store.isHeld(sessionFile)).toBe(false);
-      store.acquireLock(sessionFile);
+      // GH286 ownership contract (main): a disposal without native
+      // quiescence RETAINS writer ownership — native + active-file membership
+      // and the session lock stay held until a retry proves cessation.
+      expect(native.handles.size).toBe(1);
+      expect(native.activeFiles.has(sessionFile)).toBe(true);
       expect(store.isHeld(sessionFile)).toBe(true);
-      store.releaseLock(sessionFile);
       // UNKNOWN evidence keeps the resident permit as debt.
       expect(registry.residents.occupied).toBe(1);
-      // A second registry disposal re-attributes the SAME cached named failure
-      // to the resident id ONLY: the adapter phase traverses an empty native
-      // set, so no adapter-only duplicate is produced.
+      // A second registry disposal RETRIES the retained handle (still hung, so
+      // it fails again with a fresh named failure) and attributes it to the
+      // resident id; the adapter phase must not add an adapter-only duplicate
+      // for the same handle.
       const second = await registry.dispose().then(() => null, (reason: unknown) => reason);
       expect(second).toBeInstanceOf(AggregateError);
       const aggregate = second as AggregateError;
       expect(aggregate.errors.length).toBe(1);
-      expect((aggregate.errors[0] as Error).cause).toBe(original); // exact ORIGINAL object identity
+      expect((aggregate.errors[0] as Error).cause).toBeInstanceOf(CessationIdleTimeoutError);
       expect((aggregate.errors[0] as Error).message.startsWith(`${resident.id}:`)).toBe(true);
     } finally {
       await runtime.dispose().then(() => null, () => null);
@@ -211,16 +209,18 @@ describe('registry resident ownership is adapter-evidence gated (F60-P1/P4)', ()
       await vi.advanceTimersByTimeAsync(CESSATION_IDLE_TIMEOUT_MS);
       const error = await settled;
       expect(error).toBeInstanceOf(CessationIdleTimeoutError);
-      // The adapter reports disposed health but explicitly UNKNOWN evidence:
-      // lock release / native retirement already ran and are NOT proof.
-      expect(handle.health().state).toBe('disposed');
+      // Writer ownership is retained (health is not 'disposed') and the
+      // evidence is explicitly UNKNOWN.
+      expect(handle.health().state).not.toBe('disposed');
       expect(adapterCessationEvidence(handle)).toBe('unknown');
       // Ownership is retained as VISIBLE debt — no replacement is licensed.
       expect(registry.getHandle(resident.id)).toBe(resident);
       expect(registry.residents.occupied).toBe(1);
-      // Shutdown still disposes the debt handle; the cached named failure is
-      // re-attributed (attribution, never a capacity release).
-      await registry.dispose().then(() => null, () => null);
+      // Shutdown retries the debt handle (still hung -> fails again; never a
+      // capacity release).
+      const again = registry.dispose().then(() => null, () => null);
+      await vi.advanceTimersByTimeAsync(CESSATION_IDLE_TIMEOUT_MS);
+      await again;
     } finally {
       vi.useRealTimers();
     }

@@ -17,6 +17,7 @@ import type { createVerificationServer } from './verify/server.js';
 import type { PipelineService } from './dispatch/pipeline.js';
 import type { DeployDriftTracker } from './board/deploy-drift.js';
 import type { ManagedRepoOverviewTracker } from './repos/overview.js';
+import { disposeDirectiveResources, type DirectiveProgressService } from './dispatch/directive-progress.js';
 import { SHUTDOWN_FORCE_EXIT_MS } from './shutdown-budget.js';
 
 /**
@@ -46,6 +47,7 @@ export interface ServiceShutdownState {
   verify?: ReturnType<typeof createVerificationServer>;
   pipeline?: PipelineService;
   deployDrift?: DeployDriftTracker;
+  directiveProgress?: DirectiveProgressService;
   repoOverview?: ManagedRepoOverviewTracker;
 }
 
@@ -206,12 +208,10 @@ export function startServiceShutdown(options: ServiceShutdownOptions): void {
       // loss #341 exists to contain (issue #341).
       clearTimeout(forceExit);
       forceExit = armForceExit();
-      if (state.registry !== undefined) {
-        try {
-          await state.registry.dispose();
-        } catch (error) {
-          logger.error('registry dispose failed', { error: String(error) });
-        }
+      try {
+        await disposeDirectiveResources(state.directiveProgress, state.registry);
+      } catch (error) {
+        logger.error('directive progress/registry dispose failed', { error: String(error) });
       }
       if (state.store !== undefined) {
         try {
