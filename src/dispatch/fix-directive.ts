@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { isHostPropertyRepairDirective, type PropertyRepairDirective } from '../property/pipeline.js';
 import type { Role } from '../config.js';
 import type { LedgerApi } from '../ledger/api.js';
 import { isJobTerminal } from '../ledger/states.js';
@@ -24,6 +25,20 @@ import { settleRetries, type PacingGate, type PacingLease, type RetrySettlement 
  * silas ops surface — so "route a directive to the minion" can never drift
  * between them.
  */
+
+/** Bind property repair to the SAME job/minion routing, pacing, cancellation
+ * and single-writer rules as ordinary fix directives. Only the host campaign
+ * can issue these inputs; caller-authored repair stories are not evidence. */
+export function createPropertyFixDirectiveSink(deps: DirectiveRoutingDeps, jobId: string, signal: AbortSignal, receipt?: (delivery: Awaited<ReturnType<typeof routeFixDirectiveToMinion>>) => void): (directive: PropertyRepairDirective) => Promise<void> {
+  const consumed = new WeakSet<PropertyRepairDirective>();
+  return async (directive) => {
+    if (!isHostPropertyRepairDirective(directive) || consumed.has(directive)) throw new Error('property repair refused: unissued, changed or already delivered directive');
+    consumed.add(directive);
+    const result = await routeFixDirectiveToMinion({ ...deps, jobId, signal, directive: directive.text, owner: 'property-contract-repair', contract: 'effectiveContract' in deps.ledger ? (deps.ledger as LedgerApi).effectiveContract(jobId)?.text ?? null : null });
+    receipt?.(result);
+    if (!result.delivered || result.outcome === 'error') throw new Error(`property repair directive did not complete: ${result.error ?? result.note ?? 'no delivery proof'}`);
+  };
+}
 
 /** The product-owned identity + GC-mediated child tools for a
  * (re)dispatched parent session (issue #161). A fresh physical session
@@ -92,10 +107,24 @@ function verdictFields(verdict: PromptTurnVerdict): { readonly outcome: 'complet
     : { outcome: 'error', error: verdict.error ?? 'runtime settled the turn with an in-band error' };
 }
 
-function assertDirectiveJobActive(ledger: Pick<LedgerApi, 'getJob'>, jobId: string): void {
+/** A ledger the directive admission can re-check. `hasUnsettledVerificationRun`
+ * is used when the ledger exposes it (the real LedgerApi does); a narrow
+ * fake omits it and the check is skipped.
+ *
+ * Issue #243 F-H3: this is called at EVERY post-wait boundary (after the
+ * pacing acquire, around spawn/resume, and immediately before the prompt) —
+ * an initial check before the waits cannot see a verification that took
+ * ownership of the lane while the producer queued. */
+type DirectiveAdmissionLedger = Pick<LedgerApi, 'getJob'> &
+  Partial<Pick<LedgerApi, 'hasUnsettledVerificationRun'>>;
+
+function assertDirectiveJobActive(ledger: DirectiveAdmissionLedger, jobId: string): void {
   const job = ledger.getJob(jobId);
   if (job === null || isJobTerminal(job.status)) {
     throw new Error(`directive refused — job "${jobId}" is ${job?.status ?? 'missing'}`);
+  }
+  if (ledger.hasUnsettledVerificationRun?.(jobId) === true) {
+    throw new Error(`directive refused — a verification run owns lane "${jobId}"`);
   }
 }
 
@@ -127,6 +156,11 @@ export async function routeFixDirectiveToMinion(
      * resumed session gets `block` (the canonical bodies); a fresh session
      * already reads them in the effective contract and gets `freshNote`. */
     continuation?: { readonly block: string; readonly freshNote: string };
+    /** Issue #243 F-H2: re-prove the family/basis coverage identity at every
+     * post-wait admission boundary (after the pacing acquire, around
+     * spawn/resume, immediately before the prompt). A hold that arrives while
+     * the producer queues must refuse BEFORE any durable/prompt effect. */
+    beforeWriterSideEffect?: () => void;
   },
 ): Promise<{
   delivered: boolean;
@@ -194,6 +228,12 @@ export async function routeFixDirectiveToMinion(
   const observe = (sessionFile: string | null): void =>
     input.observeBlindTurn?.(input.jobId, sessionFile);
   let evictedSessionFile: string | null = null;
+  // Every post-wait boundary runs the caller's coverage re-proof first, then
+  // the ledger's own terminality/verification admission check (F-H2/F-H3).
+  const assertAdmissible = (): void => {
+    input.beforeWriterSideEffect?.();
+    assertDirectiveJobActive(input.ledger, input.jobId);
+  };
   for (const minion of minions) {
     const handle = input.registry.getHandle(minion.id);
     if (handle !== null) {
@@ -223,7 +263,7 @@ export async function routeFixDirectiveToMinion(
         // A refusal before prompt is positive no-admission proof, not a
         // prompt error eligible for retry recovery. It must still release
         // the pacing lease acquired after the asynchronous wait above.
-        assertDirectiveJobActive(input.ledger, input.jobId);
+        assertAdmissible();
         guard();
         nativeAttempted = true;
         input.onPrepared?.(handle);
@@ -331,7 +371,7 @@ export async function routeFixDirectiveToMinion(
       `Fresh minion re-brief for job ${input.jobId}. Effective contract (original briefing plus accepted amendments):\n${contract}\n\nCurrent fix directive:\n${compose(input.continuation?.freshNote ?? '')}`;
     let prompt = resumeFile === null && input.contract != null && input.freshSession !== true ? freshPrompt(input.contract) : directive;
     try {
-      assertDirectiveJobActive(input.ledger, input.jobId);
+      assertAdmissible();
       guard();
       nativeAttempted = true; // a rejected spawn is still uncertain, never a deferral
       handle = await input.registry.spawn('minion', {
@@ -346,7 +386,7 @@ export async function routeFixDirectiveToMinion(
       if (job == null || contract == null) {
         throw new Error(`cannot resume prior minion session for job ${input.jobId} and no original briefing is available to re-brief: ${String(error)}`);
       }
-      assertDirectiveJobActive(input.ledger, input.jobId);
+      assertAdmissible();
       guard();
       nativeAttempted = true;
       handle = await input.registry.spawn('minion', { cwd: lane.path, signal: input.signal, ...identity });
@@ -355,7 +395,7 @@ export async function routeFixDirectiveToMinion(
       // alone (owner rule 4).
       prompt = freshPrompt(contract);
     }
-    assertDirectiveJobActive(input.ledger, input.jobId);
+    assertAdmissible();
     guard();
     let promptError: unknown = null;
     let verdict: PromptTurnVerdict | null = null;
@@ -374,7 +414,7 @@ export async function routeFixDirectiveToMinion(
       registrationFailed = true;
       throw error; // the single cleanup owner below preserves registration AND cleanup failures
     }
-    assertDirectiveJobActive(input.ledger, input.jobId);
+    assertAdmissible();
     guard(handle);
     nativeAttempted = true;
     input.onPrepared?.(handle);

@@ -149,6 +149,8 @@ export class BranchBusyError extends Error {
 
 /** Ledger surface the guard reads (the real LedgerApi satisfies it). */
 export interface BranchIdleLedger {
+  /** Process-local property ownership is never imported from audit JSON. */
+  listJobAdmissions?(jobId: string): readonly string[];
   listJobs(): readonly JobRecord[];
   latestJobEvent(jobId: string, kind: string): EventRecord | null;
   latestCandidateDelivery(jobId: string): EventRecord | null;
@@ -333,6 +335,7 @@ export function laneIsBusy(ledger: BranchIdleLedger, job: JobRecord): boolean {
   // Terminal lanes are never busy: the marker retirement lane owns stale
   // terminal markers, and they must not block anything in the meantime.
   if (isJobTerminal(job.status)) return false;
+  if (ledger.listJobAdmissions?.(job.id).some((kind) => kind.startsWith('property '))) return true;
   // An unresolved re-brief fences the lane regardless of delivery or status:
   // the worker's turn may push a new head after this check. Deliberately
   // presence-based — a late delivery event from the previous worker cannot
@@ -468,7 +471,7 @@ export function forceCoversBlocker(
   blocker: BranchIdleBlocker,
 ): boolean {
   const armed = authorization.get(blocker.jobId);
-  if (armed === undefined || blocker.revision !== undefined) return false;
+  if (armed === undefined || blocker.revision !== undefined || ledger.listJobAdmissions?.(blocker.jobId).some((kind) => kind.startsWith('property '))) return false;
   const now = branchIdleWorkGeneration(ledger, blocker.jobId);
   return now.attemptStartSeq <= armed.attemptStartSeq &&
     now.repairStartSeq <= armed.repairStartSeq &&

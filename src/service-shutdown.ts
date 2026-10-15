@@ -12,11 +12,14 @@ import type { DreamScheduler } from './lessons/dream.js';
 import type { SilasDriver } from './dispatch/silas-driver.js';
 import type { ProviderRecoverySensor } from './provider-recovery/sensor.js';
 import type { WaveRunner } from './dispatch/perkins.js';
+import type { PropertyCampaignService } from './dispatch/property-campaigns.js';
 import type { ChildWorkerService } from './dispatch/child-workers.js';
 import type { createVerificationServer } from './verify/server.js';
 import type { PipelineService } from './dispatch/pipeline.js';
 import type { DeployDriftTracker } from './board/deploy-drift.js';
 import type { ManagedRepoOverviewTracker } from './repos/overview.js';
+import type { SilasAutopilotOpsHandle } from './dispatch/silas-autopilot-ops.js';
+import type { LedgerApi } from './ledger/api.js';
 import { disposeDirectiveResources, type DirectiveProgressService } from './dispatch/directive-progress.js';
 import { SHUTDOWN_FORCE_EXIT_MS } from './shutdown-budget.js';
 
@@ -41,8 +44,13 @@ export interface ServiceShutdownState {
   bob?: BobScheduler;
   dream?: DreamScheduler;
   silas?: SilasDriver;
+  /** Issue #243: the autopilot ops the shutdown checkpoints and drains. */
+  autopilot?: SilasAutopilotOpsHandle;
+  /** Issue #243 F-H4: the ledger the pre-wait checkpoint event lands in. */
+  ledger?: Pick<LedgerApi, 'appendCustomEvent'>;
   providerRecovery?: ProviderRecoverySensor;
   wave?: WaveRunner;
+  propertyCampaigns?: PropertyCampaignService;
   childWorkers?: ChildWorkerService;
   verify?: ReturnType<typeof createVerificationServer>;
   pipeline?: PipelineService;
@@ -54,6 +62,7 @@ export interface ServiceShutdownState {
 /** The logger surface the shutdown path uses; `Logger` satisfies it. */
 export interface ServiceShutdownLogger {
   info(msg: string, fields?: Record<string, unknown>): void;
+  warn?(msg: string, fields?: Record<string, unknown>): void;
   error(msg: string, fields?: Record<string, unknown>): void;
 }
 
@@ -98,6 +107,23 @@ export function startServiceShutdown(options: ServiceShutdownOptions): void {
     return;
   }
   const handle = state.handle;
+  // Issue #243 F-H4: a DURABLE checkpoint BEFORE the first potentially-
+  // unbounded await below (the chat/board/wave/child/verify/registry and
+  // producer joins). It records the still-owned pending autopilot producers
+  // plus the last-seen session sizes while locks and the ledger remain OPEN,
+  // reusing the normal durable mechanics WITHOUT replacing the original
+  // final snapshot. It never changes the watchdog/deadline/exit ordering,
+  // never releases a lock, and never claims cessation.
+  try {
+    const pending = state.autopilot?.pendingSnapshot() ?? [];
+    state.store?.writeShutdownCheckpoint({ pending });
+    state.ledger?.appendCustomEvent({
+      kind: 'silas.shutdown-checkpoint',
+      payload: { pending_count: pending.length, pending },
+    });
+  } catch (error) {
+    logger.error('shutdown checkpoint failed — pending ownership retained', { error: String(error) });
+  }
   void Promise.resolve()
     .then(async () => {
       // Each stage isolated: a failure in one must never skip lock
@@ -171,6 +197,13 @@ export function startServiceShutdown(options: ServiceShutdownOptions): void {
           logger.error('provider-recovery sensor stop failed', { error: String(error) });
         }
       }
+      if (state.propertyCampaigns !== undefined) {
+        try {
+          await state.propertyCampaigns.dispose();
+        } catch (error) {
+          logger.error('property campaign shutdown failed', { error: String(error) });
+        }
+      }
       if (state.wave !== undefined) {
         try {
           await state.wave.shutdown();
@@ -212,6 +245,22 @@ export function startServiceShutdown(options: ServiceShutdownOptions): void {
         await disposeDirectiveResources(state.directiveProgress, state.registry);
       } catch (error) {
         logger.error('directive progress/registry dispose failed', { error: String(error) });
+      }
+      // Issue #243 F-H4 (corrected): registry disposal has released the
+      // running producers' handles, so this plain join settles under the
+      // existing approved shutdown watchdog; an unsettled producer is
+      // reported, never fabricated as ceased.
+      if (state.autopilot !== undefined) {
+        try {
+          const drained = await state.autopilot.drain();
+          if (!drained.settled) {
+            logger.warn?.('silas autopilot producers unsettled after disposal — ownership retained for boot reconciliation', {
+              pending: drained.pending,
+            });
+          }
+        } catch (error) {
+          logger.error('silas autopilot drain failed', { error: String(error) });
+        }
       }
       if (state.store !== undefined) {
         try {

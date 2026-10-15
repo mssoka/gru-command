@@ -169,7 +169,7 @@ export interface DirectiveRequestRecord {
   readonly workRevision: number | null;
   /** NULL remains legacy/unprovable, never inferred from current authority. */
   readonly requestKind: 'directive' | 'rebrief' | null;
-  readonly sourceContext: { readonly ruleId?: string; readonly sourceRoundId?: string } | null;
+  readonly sourceContext: { readonly ruleId?: string; readonly sourceRoundId?: string; readonly source?: string } | null;
   readonly authorityEpoch: number | null;
   readonly contractSha256: string | null;
   readonly contractSnapshot: string | null;

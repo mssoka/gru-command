@@ -702,8 +702,10 @@ the judgment; the dispatch surface is the mechanical hand.
   prompted them), and driver start seeds the gate from the newest
   delivered event, so a restart never re-wakes what Silas has already
   seen. A queued event trigger is never displaced by a later sweep —
-  only a newer event supersedes it. Event triggers always deliver,
-  whatever the gate says.
+  only a newer event supersedes it. An event trigger whose digest is empty
+  does not wake either (issue #243): with the autopilot enforced the code
+  already handled the rows the event raised, and LLM Silas wakes only when
+  rows remain that need judgment.
 - **The GitHub signal poll (POLL-ONLY; owner ruling 2026-09-23)** rides
   the same driver on its own faster interval (`[silas] poll_interval_ms`,
   default 60 s; 0 disables) and needs no model turn: every tracked job

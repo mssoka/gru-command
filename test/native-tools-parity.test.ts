@@ -243,6 +243,7 @@ describe('native-tools harness parity (whole double → both real adapters)', ()
         'perkins_run_specialists',
         'perkins_store_artifact',
         'perkins_preflight_submission',
+        'perkins_submit_property_contracts',
         'perkins_submit_review',
       ]));
       // Children never see the lead's orchestration tools.

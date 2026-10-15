@@ -861,6 +861,9 @@ describe('dispatch config (E8)', () => {
       directiveAt: 2,
       rebriefAt: 3,
       escalateAt: 4,
+      // The autopilot is OFF by default (the owner's kill switch) and every
+      // family would default to dry-run once it is on (issue #243).
+      autopilot: { enabled: false, rules: {} },
     });
   });
 
@@ -876,6 +879,7 @@ describe('dispatch config (E8)', () => {
       directiveAt: 1,
       rebriefAt: 2,
       escalateAt: 3,
+      autopilot: { enabled: false, rules: {} },
     });
     const bad: readonly string[] = [
       '[silas]\nunknown = 1\n',
@@ -888,12 +892,51 @@ describe('dispatch config (E8)', () => {
       '[silas]\nenabled = "yes"\n',
       '[silas]\nunchanged_rewake_ms = -1\n',
       '[silas]\nunchanged_rewake_ms = 1.5\n',
+      '[silas.autopilot]\nenabled = true\n\n[silas.autopilot.rules]\nnot-a-family = "enforce"\n',
+      '[silas.autopilot]\nenabled = true\n\n[silas.autopilot.rules]\nverdict-rung-escalate = "enforce"\n',
+      '[silas.autopilot]\nenabled = true\n\n[silas.autopilot.rules]\nsweep-ack = "shadow"\n',
+      '[silas.autopilot]\nenabled = "yes"\n',
+      '[silas.autopilot]\nunknown_key = 1\n',
     ];
     for (const text of bad) {
       const h2 = tmpHome();
       writeFileSync(join(h2, 'config.toml'), text, 'utf-8');
       expect(() => loadConfig({ GRU_COMMAND_HOME: h2 }, '/home/tester'), text).toThrow(ConfigError);
     }
+  });
+
+  it('the [silas.autopilot] kill switch defaults OFF and every family defaults to dry-run', () => {
+    const home = tmpHome();
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').silas.autopilot).toEqual({
+      enabled: false,
+      rules: {},
+    });
+  });
+
+  it('parses one spelling per family mode, and names the invalid field on refusal', () => {
+    const home = tmpHome();
+    writeConfig(
+      home,
+      '[silas.autopilot]\nenabled = true\n\n[silas.autopilot.rules]\n' +
+        'verdict-rung-directive = "enforce"\ndelivered-pr-register = "off"\nsweep-ack = "dry-run"\n',
+    );
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').silas.autopilot).toEqual({
+      enabled: true,
+      rules: {
+        'verdict-rung-directive': 'enforce',
+        'delivered-pr-register': 'off',
+        'sweep-ack': 'dry-run',
+      },
+    });
+    const badHome = tmpHome();
+    writeConfig(badHome, '[silas.autopilot]\n\n[silas.autopilot.rules]\nsweep-ack = "enforce2"\n');
+    let field: string | undefined;
+    try {
+      loadConfig({ GRU_COMMAND_HOME: badHome }, '/home/tester');
+    } catch (error) {
+      field = (error as ConfigError).field;
+    }
+    expect(field).toBe('silas.autopilot.rules.sweep-ack');
   });
 });
 

@@ -22,7 +22,9 @@ export type SilasActionRuleId =
   | 'verification-repair'
   | 'pr-conflict-rebase'
   | 'revision-continuation'
-  | 'sweep-ack';
+  | 'sweep-ack'
+  | 'delivered-pr-register'
+  | 'pr-review-trigger';
 
 /** Gate rules: standing fences, not triggers. A gate's receipt proves the
  * fence FIRED (a refusal), never that work was triggered. */
@@ -117,6 +119,27 @@ export const SILAS_RULES: readonly SilasRuleSpec[] = [
       'Release the lane through the worktree surface with by=silas + rule_id=sweep-ack; the release records the receipt on the job.',
   },
   {
+    id: 'delivered-pr-register',
+    kind: 'action',
+    firesOn:
+      'deliveredWithoutPr row on a PR-owing lane: `gh pr list --repo <repo> --head <branch> --state open` reports ' +
+      'exactly ONE open PR for the delivered branch',
+    receipt: ['silas.pr-registered'],
+    summary:
+      'Register that one PR through the same function POST /api/dispatch/pr calls; the receipt carries rule_id + url.',
+  },
+  {
+    id: 'pr-review-trigger',
+    kind: 'action',
+    firesOn:
+      'prWithoutReview row (no cleanAbort) whose delivered head carries github.ci-green and passes the review ' +
+      'eligibility recheck',
+    receipt: ['silas.review-triggered'],
+    summary:
+      'Trigger ONE review on the delivered head through the same function POST /api/dispatch/review calls; ' +
+      'the receipt carries rule_id.',
+  },
+  {
     id: 'freeze-r1',
     kind: 'gate',
     firesOn:
@@ -126,6 +149,23 @@ export const SILAS_RULES: readonly SilasRuleSpec[] = [
       'Defer the arm to the next sweep; the deferral receipt carries gate=freeze-r1 proving the fence fired. Never force.',
   },
 ] as const;
+
+/** The rule families the Silas autopilot (issue #243) executes in code —
+ * every one reuses a landed action rule id. A family is added here AND to
+ * the skill only with firing-surface/receipt tests, exactly like the
+ * registry itself. */
+export const SILAS_AUTOPILOT_RULE_IDS = [
+  'clean-abort-service-restart',
+  'verdict-rung-directive',
+  'verdict-rung-rebrief',
+  'verification-repair',
+  'pr-conflict-rebase',
+  'sweep-ack',
+  'delivered-pr-register',
+  'pr-review-trigger',
+] as const satisfies readonly SilasActionRuleId[];
+
+export type SilasAutopilotRuleId = (typeof SILAS_AUTOPILOT_RULE_IDS)[number];
 
 const RULES_BY_ID: ReadonlyMap<string, SilasRuleSpec> = new Map(SILAS_RULES.map((rule) => [rule.id, rule]));
 
@@ -161,16 +201,20 @@ export const SILAS_RULE_ROUTES: Readonly<{
   directive: ReadonlySet<string>;
   rebrief: ReadonlySet<string>;
   escalate: ReadonlySet<string>;
+  pr: ReadonlySet<string>;
+  review: ReadonlySet<string>;
 }> = {
   directive: new Set(['verdict-rung-directive', 'verification-repair', 'pr-conflict-rebase', 'revision-continuation']),
   rebrief: new Set(['verdict-rung-rebrief']),
   escalate: new Set(['verdict-rung-escalate']),
+  pr: new Set(['delivered-pr-register']),
+  review: new Set(['clean-abort-service-restart', 'pr-review-trigger']),
 };
 
 /** Validate a rule id for a specific route: known action rule AND allowed
  * on that route. Absent input → null; anything else refuses loud. */
 export function parseSilasRouteRuleId(
-  route: 'directive' | 'rebrief' | 'escalate',
+  route: 'directive' | 'rebrief' | 'escalate' | 'pr' | 'review',
   raw: string | undefined,
 ): SilasActionRuleId | null {
   const parsed = parseSilasActionRuleId(raw);

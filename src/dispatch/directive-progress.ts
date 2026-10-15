@@ -26,7 +26,13 @@ export interface DirectiveProgressDeps {
   readonly parentTools?: (agentId: string) => readonly NativeAgentTool[];
   readonly lessons?: LessonsReferencePort;
   readonly observeBlindTurn?: (jobId: string, sessionFile: string | null) => void;
+  /** Job-admission kinds owned by the calling service that legitimately span this directive (e.g. an owner-approved property repair allocation). */
+  readonly ownAdmissionKinds?: readonly string[];
   readonly clearLaneForWriter?: (input: { readonly jobId: string; readonly writer: string }) => Promise<unknown>;
+  /** Issue #243 F-H2/F-H3: an optional caller re-proof (owner hold, verification
+   * ownership) run at every post-wait writer admission boundary inside the
+   * route. A throw refuses BEFORE any prompt/durable effect. */
+  readonly beforeWriterSideEffect?: () => void;
 }
 function check(deps: DirectiveProgressDeps, identity: DirectiveTurnIdentity): void {
   if (deps.signal.aborted) throw new DirectiveCheckpointError('service stopping — directive recovery cancelled');
@@ -124,7 +130,7 @@ function checkAdmissionFences(deps: DirectiveProgressDeps, identity: DirectiveTu
   const ownNativeProducer = handle?.id === producer?.agentId && handle?.sessionFile === producer?.sessionFile ? producer : undefined;
   const durable = deps.ledger.directiveProgressBlockers(identity.requestId, lane?.id ?? '', ownSpawningAgentId, producerStartSeq, ownNativeProducer)
     .filter((blocker) => !blocker.startsWith('in-flight admission(s):'));
-  const own = new Set([`directive ${identity.requestId}`, `directive recovery ${identity.requestId}`, `rebrief ${identity.requestId}`]);
+  const own = new Set([`directive ${identity.requestId}`, `directive recovery ${identity.requestId}`, `rebrief ${identity.requestId}`, ...(deps.ownAdmissionKinds ?? [])]);
   const reservations = deps.ledger.listJobAdmissions(identity.jobId).filter((kind) => !own.has(kind));
   const supervised = [...deps.pendingProducerBlockers(identity.jobId, handle !== undefined && ownNativeProducer !== undefined ? { handle, producer: ownNativeProducer } : undefined), ...cleanupOwnershipBlockers(deps.ledger, identity.jobId)];
   if (durable.length + reservations.length + supervised.length > 0) throw new DirectiveCheckpointError(`directive producer fences: ${[...durable, ...reservations, ...supervised].join('; ')}`);
@@ -363,6 +369,7 @@ export function settleNativeDirective(deps: DirectiveProgressDeps, identity: Dir
       ...(phase === null ? {} : { phase_id: phase.phaseId }),
       ...(row.sourceContext?.ruleId === undefined ? {} : { rule_id: row.sourceContext.ruleId }),
       ...(row.sourceContext?.sourceRoundId === undefined ? {} : { source_round_id: row.sourceContext.sourceRoundId }),
+      ...(row.sourceContext?.source === undefined ? {} : { source: row.sourceContext.source }),
     } }, identity);
   }
   const delivery = recordFollowUpDelivery({ ledger: {

@@ -38,6 +38,7 @@ import type { PacingGate, RetrySettlement } from '../runtime/pacing.js';
 import { childRefusalStatus, type ChildWorkerService } from './child-workers.js';
 import { REVIEW_EVIDENCE_MAX_FILES, type ReviewEvidenceRequest } from '../review-inputs/evidence.js';
 import { BlindInputRefusal, parseBlindInputPackage } from './blind-input.js';
+import type { PropertyCampaignService } from './property-campaigns.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -96,6 +97,8 @@ export interface DispatchServerOptions {
   /** Preview remains read-only; approval is a separate explicit boundary. */
   readonly intake?: IntakeService;
   readonly intakeApproval?: IntakeApprovalService;
+  /** Owner pairing-token actions only; never exposed as reviewer tools. */
+  readonly propertyCampaigns?: PropertyCampaignService;
   /** Book of Lessons injection for directives/re-briefs (pointers only). */
   readonly lessons?: LessonsReferencePort;
   /** Observe the actual continued physical session through the shared
@@ -421,6 +424,19 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
   }
 
   async function handleApi(req: IncomingMessage, res: ServerResponse, path: string): Promise<boolean> {
+    const property = /^\/api\/jobs\/([^/]+)\/property-campaigns(?:\/([^/]+)(?:\/(execute|repair|retain))?)?$/u.exec(path);
+    if (property !== null) {
+      if (!authed(req, res)) return true;
+      const service = options.propertyCampaigns;
+      if (service === undefined) { json(res, 503, { error: 'property_campaigns_not_hosted' }); return true; }
+      const jobId = decodeURIComponent(property[1]!);
+      const id = property[2] === undefined ? undefined : decodeURIComponent(property[2]);
+      const action = property[3] as 'execute' | 'repair' | 'retain' | undefined;
+      if (req.method === 'GET' && id !== undefined && action === undefined) { json(res, 200, service.read(jobId, id)); return true; }
+      if (req.method === 'POST' && id === undefined) { json(res, 201, service.propose(jobId, await readBody(req))); return true; }
+      if (req.method === 'POST' && id !== undefined && action !== undefined) { json(res, 200, await service.decide(jobId, id, action, await readBody(req))); return true; }
+      return false;
+    }
     if (path === '/api/intake' || path.startsWith('/api/intake/')) {
       if (!authed(req, res)) return true;
       const intake = options.intake;
@@ -633,12 +649,21 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const body = await readBody(req);
       const by = byField(body);
       const jobId = strField(body, 'job_id');
+      // Firing-rule provenance (issue #243): the delivered-pr-register rule
+      // fires here when Silas registers the one PR the lane actually has.
+      const prRuleId = parseSilasRouteRuleId('pr', strictOptStrField(body, 'rule_id')) ?? undefined;
+      if (prRuleId !== undefined && by !== 'silas') {
+        throw new Error(`rule_id "${prRuleId}" fires only on a silas request`);
+      }
       const job = options.dispatch.recordPr(jobId, strField(body, 'url'));
       if (by === 'silas') {
         options.ledger.appendCustomEvent({
           kind: 'silas.pr-registered',
           jobId,
-          payload: { url: job.prUrl },
+          payload: {
+            url: job.prUrl,
+            ...(prRuleId === undefined ? {} : { rule_id: prRuleId }),
+          },
         });
       }
       json(res, 200, job);
@@ -691,13 +716,25 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const body = await readBody(req);
       const by = byField(body);
       const force = optBoolField(body, 'force');
-      const ruleId = optStrField(body, 'rule_id');
-      const sourceRoundId = optStrField(body, 'source_round_id');
+      const ruleField = strictOptStrField(body, 'rule_id');
+      // The route validator answers `null` for an absent rule; the rest of
+      // this handler keys on `undefined` (an absent field never mints a
+      // `rule_id: null` on the deferral receipt).
+      const ruleId = parseSilasRouteRuleId('review', ruleField) ?? undefined;
+      const sourceRoundId = strictOptStrField(body, 'source_round_id');
       const requestedTargetRef = optStrField(body, 'target_ref');
       const evidenceRefs = optEvidenceField(body);
-      if ((ruleId === undefined) !== (sourceRoundId === undefined) ||
-          (ruleId !== undefined && (by !== 'silas' || ruleId !== 'clean-abort-service-restart'))) {
-        throw new Error('rule_id/source_round_id must be paired and only silas may use clean-abort-service-restart');
+      if (ruleId !== undefined && by !== 'silas') {
+        throw new Error(`rule_id "${ruleId}" fires only on a silas request`);
+      }
+      if (sourceRoundId !== undefined && ruleId === undefined) {
+        throw new Error('source_round_id must be paired with a rule_id');
+      }
+      if (ruleId === 'clean-abort-service-restart' && sourceRoundId === undefined) {
+        throw new Error('rule_id "clean-abort-service-restart" consumes a round — source_round_id is required');
+      }
+      if (ruleId === 'pr-review-trigger' && sourceRoundId !== undefined) {
+        throw new Error('rule_id "pr-review-trigger" is a first/re-review request — it carries no source round');
       }
       const jobId = strField(body, 'job_id');
       // The clean-abort re-arm freezes EXACTLY the proved delivered head:
@@ -825,6 +862,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
               route: outcome.route,
               ...(armed && ruleId !== undefined ? { rule_id: ruleId, source_round_id: sourceRoundId } : {}),
               ...(outcome.route === 'perkins' ? { round_id: outcome.round.id } : {}),
+              // Issue #243 F-H5: the frozen head the round actually armed on,
+              // so #214 can match a predicted bound head to the real target.
+              ...(outcome.route === 'perkins' ? { target_ref: outcome.round.targetRef } : {}),
             },
           });
         }
@@ -1987,7 +2027,8 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // report disposition endpoint this hook adds — claim only that exact
       // shape, or /api/jobs/{id}/status and friends would 404 here.
       const isDisposition = path.startsWith('/api/jobs/') && path.endsWith('/disposition');
-      if (!path.startsWith('/api/dispatch') && !path.startsWith('/api/silas') && !path.startsWith('/api/pipeline') && path !== '/api/intake' && !path.startsWith('/api/intake/') && !isDisposition) {
+      const isProperty = /^\/api\/jobs\/[^/]+\/property-campaigns(?:\/|$)/u.test(path);
+      if (!isProperty && !path.startsWith('/api/dispatch') && !path.startsWith('/api/silas') && !path.startsWith('/api/pipeline') && path !== '/api/intake' && !path.startsWith('/api/intake/') && !isDisposition) {
         return false;
       }
       const startedAt = Date.now();
@@ -2017,6 +2058,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // Abort any in-flight directive/re-brief turns so shutdown cannot
       // stall on a wedged minion session; tracked lanes settle on abort.
       for (const controller of directiveControllers) controller.abort();
+      void options.propertyCampaigns?.dispose();
     },
   };
 }
