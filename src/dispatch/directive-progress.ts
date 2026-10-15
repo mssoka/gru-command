@@ -40,6 +40,16 @@ function check(deps: DirectiveProgressDeps, identity: DirectiveTurnIdentity): vo
 }
 /** The target minion's runtime cannot host a native directive at all. Raised
  * before any target binding, header read or prompt — positive no-effect. */
+/** A caller's admission re-check (`beforeWriterSideEffect`) refused at a
+ * post-wait boundary — after pacing, around spawn/resume or immediately
+ * before the prompt, so ALWAYS before any prompt (#364). Once every cleanup
+ * settled and any prepared native target has proven cessation, that is a
+ * positive no-effect: the request fails by name instead of staying live for
+ * reconciliation and fencing the lane. */
+export class DirectivePromptRefusedError extends Error {
+  constructor(message: string) { super(message); this.name = 'DirectivePromptRefusedError'; }
+}
+
 class DirectiveRuntimeUnsupportedError extends DirectiveCheckpointError {
   constructor(message: string) { super(message); this.name = 'DirectiveRuntimeUnsupportedError'; }
 }
@@ -241,10 +251,13 @@ export async function executeAcceptedDirective(deps: DirectiveProgressDeps, requ
       try { recordCleanup(deps, identity, preparedHandle, producerStartSeq); } catch (journalError) { failures.push(journalError); }
     }
     const failure = failures.length === 1 ? error : new AggregateError(failures, `directive execution/cleanup failed: ${failures.map(String).join('; ')}`);
-    if (error instanceof DirectiveRuntimeUnsupportedError && failures.length === 1 && !deps.signal.aborted) {
-      // Refused before any target binding or prompt, and every cleanup
-      // settled: a positive no-effect. Retrying cannot change the runtime.
-      deps.ledger.failDirective({ requestId, reason: error.message });
+    const promptRefused = error instanceof DirectivePromptRefusedError &&
+      (preparedHandle === undefined || preparedHandle.cessationEvidence?.() === 'ceased');
+    if ((error instanceof DirectiveRuntimeUnsupportedError || promptRefused) && failures.length === 1 && !deps.signal.aborted) {
+      // Refused before any prompt, every cleanup settled and no prepared
+      // producer outlives it: a positive no-effect. A runtime refusal cannot
+      // change on retry; an admission refusal is the caller's fresh decision.
+      deps.ledger.failDirective({ requestId, reason: promptRefused ? `refused before any prompt: ${error.message}` : error.message });
     } else if (!deps.signal.aborted) {
       deps.ledger.recordDirectiveReconcile({ requestId, note: String(failure) });
       surfaceDirectiveRecovery(deps, requestId, String(failure));

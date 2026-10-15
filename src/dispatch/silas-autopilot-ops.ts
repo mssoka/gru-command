@@ -29,7 +29,7 @@ import { BranchBusyError } from './branch-idle.js';
 import type { DirectiveRegistry } from './fix-directive.js';
 import { ReviewInProgressError, ReviewSupersessionUnconfirmedError, type ReviewRequestInput, type ReviewRequestOutcome } from './perkins.js';
 import type { RecoveryNotifications } from './rebrief-recovery.js';
-import { executeAcceptedDirective, type DirectiveProgressDeps } from './directive-progress.js';
+import { DirectivePromptRefusedError, executeAcceptedDirective, type DirectiveProgressDeps } from './directive-progress.js';
 import { deliveredTargetSha } from './silas-driver.js';
 import {
   AUTOPILOT_SOURCE,
@@ -479,10 +479,16 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
       pendingProducerBlockers: deps.pendingProducerBlockers,
       signal: controller.signal,
       clearLaneForWriter: (input) => deps.wave.clearLaneForWriter(input),
-      // F-H2/F-H3: re-proved at every post-wait writer boundary.
+      // F-H2/F-H3: re-proved at every post-wait writer boundary. A refusal
+      // here is always before any prompt (#364): typed so the executor fails
+      // the request by name rather than leaving it live for reconcile.
       beforeWriterSideEffect: () => {
-        requireHoldUncovered(jobId, hold, label);
-        requireNoUnsettledVerification(jobId, label);
+        try {
+          requireHoldUncovered(jobId, hold, label);
+          requireNoUnsettledVerification(jobId, label);
+        } catch (error) {
+          throw new DirectivePromptRefusedError(String(error instanceof Error ? error.message : error));
+        }
       },
       ...(deps.workerGate === undefined ? {} : { workerGate: deps.workerGate }),
       ...(deps.retrySettlement === undefined ? {} : { retrySettlement: deps.retrySettlement }),

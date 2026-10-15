@@ -13,6 +13,7 @@ import {
   type AutopilotLedger,
   type SilasAutopilotOps,
 } from '../src/dispatch/silas-autopilot.js';
+import { BranchBusyError } from '../src/dispatch/branch-idle.js';
 import { createSilasAutopilotOps, type SilasAutopilotOpsDeps } from '../src/dispatch/silas-autopilot-ops.js';
 import { composeDeterministicPass, createSilasAutopilotHook } from '../src/dispatch/silas-autopilot-pass.js';
 import { ReviewInProgressError, WaveRunner } from '../src/dispatch/perkins.js';
@@ -145,8 +146,12 @@ class FakeLedger {
     return this.state.directives.get(requestId) ?? null;
   }
 
-  listJobEventsByKinds(jobId: string, kinds: readonly string[]): FakeEvent[] {
-    return this.state.events.filter((event) => event.jobId === jobId && kinds.includes(event.kind));
+  /** Newest first and capped, exactly like the real ledger's query. */
+  listJobEventsByKinds(jobId: string, kinds: readonly string[], opts: { limit?: number } = {}): FakeEvent[] {
+    return this.state.events
+      .filter((event) => event.jobId === jobId && kinds.includes(event.kind))
+      .reverse()
+      .slice(0, opts.limit ?? 200);
   }
 
   listPendingRebriefs(opts: { jobId?: string } = {}): readonly unknown[] {
@@ -395,7 +400,33 @@ describe('autopilot mode resolution (kill switch + per-family modes)', () => {
         hold_basis: 'status:done',
       },
       mode: 'dry-run',
+      fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/u),
     });
+  });
+
+  it('records a persisting row decision ONCE per (rule, job, fingerprint); a changed decision records anew (#369)', async () => {
+    const ledger = new FakeLedger().job('job-release', 'done');
+    const ops = fakeOps();
+    const pass = (mode?: 'enforce') => runSilasAutopilot({
+      digest: digest({ releaseEligible: [releaseRow()] }),
+      config: mode === undefined ? enabled() : enabled({ 'sweep-ack': mode }),
+      ledger: ledger.port,
+      ops: ops.ops,
+    });
+    // The same unchanged row across three passes is ONE decision event...
+    for (let index = 0; index < 3; index += 1) expect((await pass()).decisions).toBe(1);
+    expect(ledger.decisions()).toHaveLength(1);
+    // ...while a changed decision (here the family's mode) records anew.
+    await pass('enforce');
+    expect(ledger.decisions()).toHaveLength(2);
+    expect(ledger.decisions().map((event) => (event.payload as { mode: string }).mode)).toEqual(['dry-run', 'enforce']);
+    // Another job's decision for the same rule never masks this one.
+    ledger.job('job-other', 'done');
+    await runSilasAutopilot({
+      digest: digest({ releaseEligible: [releaseRow({ jobId: 'job-other' })] }),
+      config: enabled(), ledger: ledger.port, ops: ops.ops,
+    });
+    expect(ledger.decisions().filter((event) => event.jobId === 'job-other')).toHaveLength(1);
   });
 
   it('enforce performs exactly one call per decision, and reports the failure of one', async () => {
@@ -2834,6 +2865,62 @@ describe('F-H2 the admission boundary re-proves a hold that lands after planning
   });
 });
 
+describe('#368 review admission receipts and the final pull-request binding', () => {
+  const A = 'f'.repeat(40);
+  const base = (requestReview: SilasAutopilotOpsDeps['wave']['requestReview'], prUrl: string | null = null) => {
+    const ledger = newRealLedger();
+    const job = ledger.addJob({ id: 'job-368', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
+    ledger.setJobStatus(job.id, 'working');
+    ledger.setJobStatus(job.id, 'delivered');
+    if (prUrl !== null) ledger.setJobPr(job.id, prUrl);
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: job.id, payload: { sha: A } });
+    const ops = createSilasAutopilotOps({
+      ...nativeSeams,
+      ledger,
+      wave: waveStub({ requestReview }),
+      registry: {} as never,
+      worktrees: { listWorktrees: () => [] } as never,
+      dispatch: { recordPr: () => ({ prUrl: null }) },
+      gh: { listPullsForHead: async () => [] },
+      resolveRemote: () => null,
+    });
+    return { ledger, job, ops };
+  };
+
+  it('a busy branch defers the review with a durable receipt instead of failing the pass', async () => {
+    const { ledger, job, ops } = base(async () => {
+      throw new BranchBusyError('gru/job-368', [{ jobId: 'job-other', status: 'working', branch: 'gru/job-368' } as never], 'arm');
+    });
+    await ops.triggerReview({ jobId: job.id, ruleId: 'pr-review-trigger', targetRef: A, boundDeliveredSha: A });
+    const deferred = ledger.latestJobEvent(job.id, 'silas.review-deferred');
+    expect(deferred?.payload).toMatchObject({ phase: 'arm', blockers: [expect.objectContaining({ job_id: 'job-other', status: 'working' })] });
+    expect(ledger.latestJobEvent(job.id, 'silas.review-triggered')).toBeNull();
+  });
+
+  it('a non-Perkins route is recorded as deferred, never as an armed review', async () => {
+    const { ledger, job, ops } = base(async () => ({ route: 'bmad-review-fallback', failedLegs: [], skillInstalled: false, clearToMerge: false, run: Promise.resolve() }) as never);
+    await ops.triggerReview({ jobId: job.id, ruleId: 'pr-review-trigger', targetRef: A, boundDeliveredSha: A });
+    expect(ledger.latestJobEvent(job.id, 'silas.review-deferred')?.payload).toMatchObject({ route: 'bmad-review-fallback' });
+    expect(ledger.latestJobEvent(job.id, 'silas.review-triggered')).toBeNull();
+  });
+
+  it('the final admission guard binds the CI observation to the job pull request: none or another PR refuses', async () => {
+    let guard: (() => void) | undefined;
+    const { ledger, job, ops } = base(async (input) => {
+      guard = input.finalAdmissionGuard;
+      throw new Error('captured');
+    }, 'https://github.com/mssoka/gru-command/pull/42');
+    await expect(ops.triggerReview({ jobId: job.id, ruleId: 'pr-review-trigger', targetRef: A, boundDeliveredSha: A })).rejects.toThrow('captured');
+    expect(guard).toBeDefined();
+    ledger.appendCustomEvent({ kind: 'github.ci-green', jobId: job.id, payload: { sha: A } });
+    expect(() => guard!()).toThrow(/carries no pull-request binding/);
+    ledger.appendCustomEvent({ kind: 'github.ci-green', jobId: job.id, payload: { sha: A, pr: 7 } });
+    expect(() => guard!()).toThrow(/belongs to a different pull request/);
+    ledger.appendCustomEvent({ kind: 'github.ci-green', jobId: job.id, payload: { sha: A, pr: 42 } });
+    expect(() => guard!()).not.toThrow();
+  });
+});
+
 describe('F-H3 verification ownership is re-proved after the pacing wait', () => {
   it('a directive queued behind pacing never prompts after a verification takes the lane', async () => {
     const ledger = newRealLedger();
@@ -2875,7 +2962,12 @@ describe('F-H3 verification ownership is re-proved after the pacing wait', () =>
     await ops.drain();
     expect(prompted).toBe(0);
     expect(ledger.latestJobEvent(job.id, 'silas.directive-sent')).toBeNull();
-    expect(ledger.listPendingDirectives({ jobId: job.id })[0]?.state).not.toBe('settled');
+    // #364: the post-wait refusal is before any prompt — a positive no-effect,
+    // so the request FAILS by name and never stays live fencing the lane.
+    const [request] = ledger.listPendingDirectives({ jobId: job.id });
+    expect(request?.state).toBe('failed');
+    expect(request?.failReason).toMatch(/^refused before any prompt: .*verification/);
+    expect(ledger.listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES, limit: 5 })).toEqual([]);
   });
 });
 

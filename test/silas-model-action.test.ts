@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -7,10 +7,10 @@ import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { PiRuntime } from '../src/runtime/pi-adapter.js';
 import { SessionStore } from '../src/sessions/store.js';
-import { createSilasModelActionTool, SILAS_MODEL_ACTION_TOOL } from '../src/dispatch/silas-model-action.js';
+import { createSilasModelActionTool, SILAS_ACTION_LIMITS, SILAS_MODEL_ACTION_TOOL, spawnSilasWithActionTool } from '../src/dispatch/silas-model-action.js';
 import type { SilasOpsDigest } from '../src/dispatch/silas-driver.js';
 import { makeStubModelRuntime, StubScript } from './helpers/stub-model.js';
-import type { AgentHandle, NativeAgentToolResult } from '../src/runtime/types.js';
+import type { AgentHandle, NativeAgentTool, NativeAgentToolResult, SpawnOptions } from '../src/runtime/types.js';
 
 /**
  * Issue #243 H6 — the product-owned native Silas model-action tool.
@@ -118,6 +118,54 @@ describe('H6 silas_action tool bindings (unit seams)', () => {
     });
   });
 
+  it('is advisory, bounds every free-text field and accepts only a full commit SHA as head (#369)', async () => {
+    const { ledger, eventKinds } = makeLedger();
+    const job = ledger.addJob({ id: 'job-bounds', repo: 'r', title: 't', baseBranch: 'main', briefing: 'b' });
+    ledger.setJobStatus(job.id, 'working');
+    const handle = { id: 'silas-b', pendingTurn: () => ({ text: 'live', owner: 'silas' }) } as unknown as AgentHandle;
+    const tool = createSilasModelActionTool({ getHandle: () => handle, ledger, digest: async () => emptyDigest() });
+    expect(tool.description).toMatch(/ADVISORY/);
+    expect(tool.description).toMatch(/executes nothing/);
+    const reason = async (input: Record<string, unknown>) => (JSON.parse((await tool.execute(input)).text) as { reason?: string; ok: boolean });
+    for (const [field, limit] of Object.entries(SILAS_ACTION_LIMITS)) {
+      if (field === 'jobId') continue;
+      expect(await reason({ action: 'hold', jobId: job.id, [field]: 'x'.repeat(limit + 1) }), field).toMatchObject({ ok: false, reason: 'bad-field' });
+      expect(await reason({ action: 'hold', jobId: job.id, [field]: 'x'.repeat(limit) }), field).toMatchObject({ ok: true });
+    }
+    expect(await reason({ action: 'hold', jobId: 'j'.repeat(SILAS_ACTION_LIMITS.jobId + 1) })).toMatchObject({ ok: false, reason: 'bad-field' });
+    for (const head of ['HEAD', 'abc123', 'A'.repeat(40), 7]) {
+      expect(await reason({ action: 'hold', jobId: job.id, head }), String(head)).toMatchObject({ ok: false, reason: 'bad-field' });
+    }
+    expect(await reason({ action: 'hold', jobId: job.id, head: 'a'.repeat(40) })).toMatchObject({ ok: true });
+    // Refusals record nothing; only the accepted calls left receipts.
+    expect(eventKinds().filter((row) => row.kind === 'silas.model-action')).toHaveLength(4);
+  });
+
+  it('refuses a missing or unknown action and a missing job, and a failed digest leaves no receipt (#368)', async () => {
+    const { ledger, eventKinds } = makeLedger();
+    const job = ledger.addJob({ id: 'job-branches', repo: 'r', title: 't', baseBranch: 'main', briefing: 'b' });
+    ledger.setJobStatus(job.id, 'working');
+    const handle = { id: 'silas-r', pendingTurn: () => ({ text: 'live', owner: 'silas' }) } as unknown as AgentHandle;
+    const tool = createSilasModelActionTool({ getHandle: () => handle, ledger, digest: async () => emptyDigest() });
+    const reason = async (input: unknown) => JSON.parse((await tool.execute(input as Record<string, unknown>)).text) as { reason?: string; ok: boolean };
+    for (const action of [undefined, 'launch', 7, '']) {
+      expect(await reason({ action, jobId: job.id }), String(action)).toMatchObject({ ok: false, reason: 'bad-action' });
+    }
+    expect(await reason(undefined)).toMatchObject({ ok: false, reason: 'bad-action' });
+    for (const jobId of [undefined, 42]) {
+      expect(await reason({ action: 'hold', jobId }), String(jobId)).toMatchObject({ ok: false, reason: 'bad-job' });
+    }
+    const failing = createSilasModelActionTool({
+      getHandle: () => handle,
+      ledger,
+      digest: async () => {
+        throw new Error('digest unavailable');
+      },
+    });
+    await expect(failing.execute({ action: 'hold', jobId: job.id })).rejects.toThrow('digest unavailable');
+    expect(eventKinds()).toEqual([]);
+  });
+
   it('binds the EXACT incarnation: two spawns get distinct tools, never a late lookup', async () => {
     const { ledger, eventKinds } = makeLedger();
     const job = ledger.addJob({ id: 'job-inc', repo: 'r', title: 't', baseBranch: 'main', briefing: 'b' });
@@ -140,6 +188,42 @@ describe('H6 silas_action tool bindings (unit seams)', () => {
     expect(observations).toHaveLength(2);
     expect(observations[0]!['handle_id']).toBe('silas-inc-a');
     expect(observations[1]!['handle_id']).toBe('silas-inc-b');
+  });
+});
+
+describe('H6 the Silas slot spawn wiring (#368)', () => {
+  it('appends silas_action to the caller tools and binds each spawn to its own handle', async () => {
+    const { ledger, eventKinds } = makeLedger();
+    const job = ledger.addJob({ id: 'job-wire', repo: 'r', title: 't', baseBranch: 'main', briefing: 'b' });
+    ledger.setJobStatus(job.id, 'working');
+    const spawned: { readonly role: string; readonly options: SpawnOptions | undefined }[] = [];
+    let next = 0;
+    const registry = {
+      spawn: async (role: string, options?: SpawnOptions): Promise<AgentHandle> => {
+        spawned.push({ role, options });
+        next += 1;
+        return { id: `silas-${String(next)}`, sessionFile: null, pendingTurn: () => ({ text: 'live', owner: 'silas' }) } as unknown as AgentHandle;
+      },
+    };
+    const existing = { name: 'existing_tool' } as unknown as NativeAgentTool;
+    const first = await spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() }, { cwd: '/w', nativeTools: [existing] });
+    const second = await spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() });
+    expect(spawned.map((row) => row.role)).toEqual(['silas', 'silas']);
+    expect(spawned[0]?.options?.cwd).toBe('/w');
+    expect(spawned[0]?.options?.nativeTools?.map((tool) => tool.name)).toEqual(['existing_tool', SILAS_MODEL_ACTION_TOOL]);
+    expect(spawned[1]?.options?.nativeTools?.map((tool) => tool.name)).toEqual([SILAS_MODEL_ACTION_TOOL]);
+    const firstTool = spawned[0]!.options!.nativeTools![1]!;
+    const secondTool = spawned[1]!.options!.nativeTools![0]!;
+    await firstTool.execute({ action: 'hold', jobId: job.id });
+    await secondTool.execute({ action: 'hold', jobId: job.id });
+    const receipts = eventKinds().filter((row) => row.kind === 'silas.model-observation')
+      .map((row) => (JSON.parse(String(row.payload)) as { handle_id: string }).handle_id);
+    expect(receipts).toEqual([first.id, second.id]);
+  });
+
+  it('is the spawn main.ts declares for the Silas slot (wiring alarm)', () => {
+    const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
+    expect(mainSource).toMatch(/id: 'silas-ops',[\s\S]{0,200}spawn: \(spawnOptions\) => spawnSilasWithActionTool\(/);
   });
 });
 

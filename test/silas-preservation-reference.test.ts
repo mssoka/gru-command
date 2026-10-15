@@ -221,6 +221,64 @@ describe('resolvePreservationReference — fail-closed refusals', () => {
   });
 });
 
+describe('resolvePreservationReference — fails loud and never follows links (#367)', () => {
+  const resolve = (record: { recordPath: string; recordSha256: string }) => resolvePreservationReference({
+    reference: { recordPath: record.recordPath, recordSha256: record.recordSha256 }, jobId: 'job-h1',
+  });
+
+  it('refuses a missing, malformed or non-object link-preservation manifest — never "nothing to verify"', () => {
+    for (const damage of ['missing', 'malformed', 'array', 'no-entries'] as const) {
+      const root = tempRoot();
+      const record = writeRecord(root, { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's' });
+      const manifest = join(root, 'link-preservation-manifest.json');
+      if (damage === 'missing') rmSync(manifest);
+      if (damage === 'malformed') writeFileSync(manifest, '{ not json');
+      if (damage === 'array') writeFileSync(manifest, '[]');
+      if (damage === 'no-entries') writeFileSync(manifest, JSON.stringify({ original_tree: record.treePath, archive_sha256: '' }));
+      const verdict = resolve(record);
+      expect(verdict.reusable, damage).toBe(false);
+      expect(verdict.guidance, damage).toMatch(/link-preservation manifest/);
+    }
+  });
+
+  it('refuses a declared archive that is absent, and a malformed archive digest', () => {
+    const absent = tempRoot();
+    const record = writeRecord(absent, { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's', archive: Buffer.from('bytes') });
+    rmSync(join(absent, 'current-ignored-untracked-deliverables-links-preserved.tar.gz'));
+    expect(resolve(record)).toMatchObject({ reusable: false, guidance: expect.stringMatching(/declared opaque archive is missing/) });
+    const malformed = tempRoot();
+    const second = writeRecord(malformed, { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's' });
+    writeFileSync(join(malformed, 'link-preservation-manifest.json'), JSON.stringify({ original_tree: second.treePath, relative_entries: [], archive_sha256: 'not-a-digest' }));
+    expect(resolve(second)).toMatchObject({ reusable: false, guidance: expect.stringMatching(/malformed archive digest/) });
+  });
+
+  it('never reads a record or asset through a symlink', () => {
+    const root = tempRoot();
+    const record = writeRecord(root, { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's' });
+    const outside = tempRoot();
+    writeFileSync(join(outside, 'report.md'), 'r');
+    rmSync(join(root, 'complete-original-report.md'));
+    symlinkSync(join(outside, 'report.md'), join(root, 'complete-original-report.md'));
+    expect(resolve(record)).toMatchObject({ reusable: false, guidance: expect.stringMatching(/complete-original-report\.md is unreadable/) });
+  });
+
+  it('decides link-entry containment on realpaths and exact ".." segments', () => {
+    // A symlinked directory inside the tree cannot carry an entry outside it.
+    const root = tempRoot();
+    const outside = tempRoot();
+    const tree = join(root, 'tree');
+    mkdirSync(tree, { recursive: true });
+    symlinkSync(outside, join(tree, 'escape-dir'));
+    const escaping = writeRecord(root, { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's', treePath: tree, linkEntries: ['escape-dir/node_modules'] });
+    expect(resolve(escaping)).toMatchObject({ reusable: false, guidance: expect.stringMatching(/escapes the original tree/) });
+    // A name merely CONTAINING ".." is not a parent segment; an archive-only
+    // entry (no parent on disk) is still checked, not refused for absence.
+    const fine = tempRoot();
+    const ok = writeRecord(fine, { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's', linkEntries: ['a..b', 'only/in/archive/link'] });
+    expect(resolve(ok).reusable).toBe(true);
+  });
+});
+
 describe('the production release ingress consumes the preservation reference (issue #243 F-H1)', () => {
   const ledgerFor = (): LedgerApi => {
     const dir = mkdtempSync(join(tmpdir(), 'silas-preservation-ops-'));
@@ -290,6 +348,44 @@ describe('the production release ingress consumes the preservation reference (is
         preservationReference: { recordPath: record.recordPath, recordSha256: record.recordSha256 },
       }),
     ).rejects.toThrow(/preservation reuse refused/);
+    expect(release).not.toHaveBeenCalled();
+    expect(ledger.latestJobEvent(job.id, 'silas.preservation-reuse')).toBeNull();
+  });
+
+  it('records the selector once per record digest across a retried release (#368)', async () => {
+    const ledger = ledgerFor();
+    const job = ledger.addJob({ id: 'job-h1', repo: 'fixture-repo', title: 't', baseBranch: 'main', briefing: 'b' });
+    ledger.setJobStatus(job.id, 'working');
+    ledger.setJobStatus(job.id, 'done');
+    const record = writeRecord(tempRoot(), { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's', archive: Buffer.from('a') });
+    let attempts = 0;
+    const ops = opsFor(ledger, async () => {
+      attempts += 1;
+      if (attempts === 1) return { status: 'paused', processes: [], preserved: null, note: 'a process is using the tree' };
+      return { status: 'swept', preserved: null, branch: 'none', freshHead: 'a'.repeat(40) };
+    });
+    const reference = { recordPath: record.recordPath, recordSha256: record.recordSha256 };
+    await expect(ops.releaseLane({ jobId: job.id, ruleId: 'sweep-ack', preservationReference: reference })).rejects.toThrow(/paused/);
+    await ops.releaseLane({ jobId: job.id, ruleId: 'sweep-ack', preservationReference: reference });
+    expect(attempts).toBe(2);
+    expect(ledger.listJobEventsByKinds(job.id, ['silas.preservation-reuse'])).toHaveLength(1);
+  });
+
+  it('refuses a record that names another repository than the release job (#368)', async () => {
+    const ledger = ledgerFor();
+    const job = ledger.addJob({ id: 'job-h1', repo: 'fixture-repo', title: 't', baseBranch: 'main', briefing: 'b' });
+    ledger.setJobStatus(job.id, 'working');
+    ledger.setJobStatus(job.id, 'done');
+    const record = writeRecord(tempRoot(), { jobId: 'job-h1', repo: 'other-repo', report: 'r', session: 's', archive: Buffer.from('a') });
+    const release = vi.fn(async () => ({ status: 'swept', preserved: null, branch: 'none', freshHead: 'a'.repeat(40) }));
+    const ops = opsFor(ledger, release);
+    await expect(
+      ops.releaseLane({
+        jobId: job.id,
+        ruleId: 'sweep-ack',
+        preservationReference: { recordPath: record.recordPath, recordSha256: record.recordSha256 },
+      }),
+    ).rejects.toThrow(/different repository/);
     expect(release).not.toHaveBeenCalled();
     expect(ledger.latestJobEvent(job.id, 'silas.preservation-reuse')).toBeNull();
   });

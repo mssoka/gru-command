@@ -19,7 +19,18 @@
  *  - it never extracts an archive — the archive is hashed only, and stays
  *    opaque;
  *  - any missing / unreadable / changed / tampered / escaping asset makes the
- *    reference NOT reusable and returns precise restoration guidance.
+ *    reference NOT reusable and returns precise restoration guidance — the
+ *    link-preservation manifest included: a missing or malformed manifest,
+ *    or a declared archive that is absent, never verifies as reusable (#367);
+ *  - every read is no-follow: the record, its assets and the archive must be
+ *    single-link regular files (a symlink or FIFO is refused, never read
+ *    through), and containment is decided on realpaths with exact `..`
+ *    segments, never a lexical prefix (#367).
+ *
+ * Wiring (#367): the selector is reachable only through the autopilot
+ * release seam's explicit `preservationReference`; no plan supplies one, so
+ * using it remains a deliberate caller decision — this resolver is safe to
+ * wire because it fails closed on every missing or malformed input.
  *
  * The complete original input/context/source inventory and all live-release
  * safety proofs remain SEPARATE obligations: a reusable verdict here only
@@ -27,8 +38,8 @@
  * release.
  */
 import { createHash } from 'node:crypto';
-import { lstatSync, readFileSync } from 'node:fs';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 
 /** The explicit caller-supplied selector. */
 export interface PreservationReference {
@@ -64,12 +75,46 @@ const refuse = (guidance: string, verifiedAssets: readonly string[] = [], record
   recordSha256,
 });
 
-const sha256 = (path: string): string => createHash('sha256').update(readFileSync(path)).digest('hex');
+/** Bytes of a SINGLE-LINK REGULAR file, never read through a symlink, FIFO
+ * or other entry (#367): lstat decides what the path names before any read. */
+function regularFileBytes(path: string): Buffer {
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.nlink !== 1) throw new Error(`${path} is not a single-link regular file`);
+  return readFileSync(path);
+}
 
-/** A candidate path must resolve strictly inside `root` (no escape). */
+const sha256 = (path: string): string => createHash('sha256').update(regularFileBytes(path)).digest('hex');
+
+/** A path carrying an exact `..` segment (never a lexical substring match). */
+const hasParentSegment = (path: string): boolean => path.split(/[\\/]/u).includes('..');
+
+/** `candidate` resolves strictly inside `root`, decided on REALPATHS (#367):
+ * the deepest EXISTING ancestor of the candidate is resolved (so a symlinked
+ * directory cannot carry an entry outside the tree) and the remaining,
+ * not-yet-existing segments — already free of exact `..` — are appended.
+ * The candidate itself is never followed (it may BE a preserved link). */
 function contained(root: string, candidate: string): boolean {
-  const rel = relative(root, candidate);
-  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+  let realRoot: string;
+  try {
+    realRoot = realpathSync(root);
+  } catch {
+    return false;
+  }
+  const rest: string[] = [basename(candidate)];
+  let ancestor = dirname(candidate);
+  let realAncestor: string | null = null;
+  while (realAncestor === null) {
+    try {
+      realAncestor = realpathSync(ancestor);
+    } catch {
+      const parent = dirname(ancestor);
+      if (parent === ancestor) return false;
+      rest.unshift(basename(ancestor));
+      ancestor = parent;
+    }
+  }
+  const rel = relative(realRoot, join(realAncestor, ...rest));
+  return rel === '' || (!hasParentSegment(rel) && !isAbsolute(rel));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -82,7 +127,7 @@ export function resolvePreservationReference(input: {
   readonly expectedRepo?: string | null;
 }): PreservationVerdict {
   const { reference, jobId } = input;
-  if (!isAbsolute(reference.recordPath) || reference.recordPath.includes('..')) {
+  if (!isAbsolute(reference.recordPath) || hasParentSegment(reference.recordPath)) {
     return refuse('the preservation reference must be an explicit absolute path without ".." segments');
   }
   if (!/^[a-f0-9]{64}$/u.test(reference.recordSha256)) {
@@ -101,7 +146,7 @@ export function resolvePreservationReference(input: {
   }
   let record: Record<string, unknown>;
   try {
-    record = JSON.parse(readFileSync(reference.recordPath, 'utf-8')) as Record<string, unknown>;
+    record = JSON.parse(regularFileBytes(reference.recordPath).toString('utf-8')) as Record<string, unknown>;
   } catch (error) {
     return refuse(`the supplied preservation record is not valid JSON (${String(error)})`, [], actualRecordSha);
   }
@@ -157,24 +202,32 @@ export function resolvePreservationReference(input: {
     }
     verifiedAssets.push(asset.name);
   }
-  // The link-preservation manifest (optional): declared dependency LINKS are
-  // preserved as links and never dereferenced; every entry must stay inside
-  // the original tree; the archive is hashed only and stays opaque.
+  // The link-preservation manifest is REQUIRED (#367): declared dependency
+  // LINKS are preserved as links and never dereferenced; every entry must
+  // stay inside the original tree; the archive is hashed only and stays
+  // opaque. A missing, unreadable or malformed manifest is never "nothing
+  // to verify" — it refuses.
   const manifestPath = join(recordDir, LINK_MANIFEST_ASSET);
-  let manifest: Record<string, unknown> | null = null;
+  let manifest: Record<string, unknown>;
   try {
-    const parsed = JSON.parse(readFileSync(manifestPath, 'utf-8')) as unknown;
-    manifest = isRecord(parsed) ? parsed : null;
-  } catch {
-    manifest = null;
+    const parsed = JSON.parse(regularFileBytes(manifestPath).toString('utf-8')) as unknown;
+    if (!isRecord(parsed)) {
+      return refuse('the link-preservation manifest is not an object — the tree is retained', verifiedAssets, actualRecordSha);
+    }
+    manifest = parsed;
+  } catch (error) {
+    return refuse(`the link-preservation manifest is missing, unreadable or malformed (${String(error)}) — the tree is retained`, verifiedAssets, actualRecordSha);
   }
-  if (manifest !== null) {
+  {
     if (manifest['original_tree'] !== treePath) {
       return refuse('the link-preservation manifest names a different original tree — the tree is retained', verifiedAssets, actualRecordSha);
     }
-    const entries = Array.isArray(manifest['relative_entries']) ? manifest['relative_entries'] : [];
+    if (!Array.isArray(manifest['relative_entries'])) {
+      return refuse('the link-preservation manifest carries no relative_entries list — the tree is retained', verifiedAssets, actualRecordSha);
+    }
+    const entries: readonly unknown[] = manifest['relative_entries'];
     for (const entry of entries) {
-      if (typeof entry !== 'string' || entry === '' || isAbsolute(entry) || entry.includes('..')) {
+      if (typeof entry !== 'string' || entry === '' || isAbsolute(entry) || hasParentSegment(entry)) {
         return refuse(`a link-preservation entry escapes the original tree ("${String(entry)}") — the tree is retained`, verifiedAssets, actualRecordSha);
       }
       const entryPath = join(treePath, entry);
@@ -196,18 +249,25 @@ export function resolvePreservationReference(input: {
         verifiedAssets.push(`link:${entry}`);
       }
     }
+    // `archive_sha256` is "" when no archive was retained; anything else must
+    // be a digest whose archive bytes are present and match (#367): a
+    // declared-but-absent archive is unverified, never reusable.
     const archiveSha = manifest['archive_sha256'];
-    if (typeof archiveSha === 'string' && /^[a-f0-9]{64}$/u.test(archiveSha)) {
+    if (archiveSha !== '' && (typeof archiveSha !== 'string' || !/^[a-f0-9]{64}$/u.test(archiveSha))) {
+      return refuse('the link-preservation manifest declares a malformed archive digest — the tree is retained', verifiedAssets, actualRecordSha);
+    }
+    if (archiveSha !== '') {
       const archivePath = join(recordDir, 'current-ignored-untracked-deliverables-links-preserved.tar.gz');
+      let actualArchive: string;
       try {
-        if (sha256(archivePath) !== archiveSha) {
-          return refuse('the preserved opaque archive does not match its recorded digest — the tree is retained', verifiedAssets, actualRecordSha);
-        }
-        verifiedAssets.push('archive(current-ignored-untracked-deliverables-links-preserved.tar.gz)');
-      } catch {
-        // No archive bytes present: the manifest's declared hash is the only
-        // witness and remains UNKNOWN — never fabricated.
+        actualArchive = sha256(archivePath);
+      } catch (error) {
+        return refuse(`the declared opaque archive is missing or unreadable (${String(error)}) — the tree is retained`, verifiedAssets, actualRecordSha);
       }
+      if (actualArchive !== archiveSha) {
+        return refuse('the preserved opaque archive does not match its recorded digest — the tree is retained', verifiedAssets, actualRecordSha);
+      }
+      verifiedAssets.push('archive(current-ignored-untracked-deliverables-links-preserved.tar.gz)');
     }
   }
   return { reusable: true, guidance: null, verifiedAssets, recordSha256: actualRecordSha };

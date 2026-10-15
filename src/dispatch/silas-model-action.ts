@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
 import type { LedgerApi } from '../ledger/api.js';
 import type { SilasOpsDigest } from './silas-driver.js';
-import type { AgentHandle, NativeAgentTool, NativeAgentToolResult } from '../runtime/types.js';
+import type { Role } from '../config.js';
+import type { AgentHandle, NativeAgentTool, NativeAgentToolResult, SpawnOptions } from '../runtime/types.js';
 
 /**
  * Issue #243 H6 — the product-owned native tool a SILAS model turn may call.
@@ -38,23 +39,30 @@ const refusal = (reason: string, message: string): NativeAgentToolResult => ({
 const str = (value: unknown): string | null =>
   typeof value === 'string' && value.length > 0 ? value : null;
 
+/** Bounds on the model's free text (#369): the record is advisory audit
+ * material, so an over-long field is refused by name, never truncated. */
+export const SILAS_ACTION_LIMITS = { jobId: 200, family: 128, debt: 128, rationale: 2000 } as const;
+const HEAD_SHA = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u;
+
 export function createSilasModelActionTool(deps: SilasModelActionToolDeps): NativeAgentTool {
   return {
     name: SILAS_MODEL_ACTION_TOOL,
     description:
-      'Record ONE Silas arbitration action (dispatch | escalate | hold) for a canonical job. ' +
-      'The host binds it to the live model turn, the observed digest and the actual job row, ' +
-      'and returns a durable action id.',
+      'Record ONE ADVISORY Silas arbitration action (dispatch | escalate | hold) for a canonical job. ' +
+      'It executes nothing: the host only binds the record to the live model turn, the observed digest ' +
+      'and the actual job row, and returns a durable action id. Perform the operation through its own ' +
+      'endpoint. Free text is bounded (rationale ' + String(SILAS_ACTION_LIMITS.rationale) + ' chars) and ' +
+      'head must be a full commit SHA.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
       properties: {
         action: { type: 'string', enum: [...ACTIONS] },
-        jobId: { type: 'string' },
-        family: { type: 'string' },
-        debt: { type: 'string' },
-        head: { type: 'string' },
-        rationale: { type: 'string' },
+        jobId: { type: 'string', maxLength: SILAS_ACTION_LIMITS.jobId },
+        family: { type: 'string', maxLength: SILAS_ACTION_LIMITS.family },
+        debt: { type: 'string', maxLength: SILAS_ACTION_LIMITS.debt },
+        head: { type: 'string', pattern: HEAD_SHA.source },
+        rationale: { type: 'string', maxLength: SILAS_ACTION_LIMITS.rationale },
       },
       required: ['action', 'jobId'],
     },
@@ -74,6 +82,16 @@ export function createSilasModelActionTool(deps: SilasModelActionToolDeps): Nati
       }
       const jobId = str(args['jobId']);
       if (jobId === null) return refusal('bad-job', 'jobId is required');
+      for (const field of ['jobId', 'family', 'debt', 'rationale'] as const) {
+        const value = args[field];
+        if (value !== undefined && (typeof value !== 'string' || value.length > SILAS_ACTION_LIMITS[field])) {
+          return refusal('bad-field', `${field} must be a string of at most ${String(SILAS_ACTION_LIMITS[field])} characters`);
+        }
+      }
+      const head = str(args['head']);
+      if (args['head'] !== undefined && (head === null || !HEAD_SHA.test(head))) {
+        return refusal('bad-field', 'head must be a full lowercase commit SHA (40 or 64 hex characters)');
+      }
       const job = deps.ledger.getJob(jobId);
       if (job === null) return refusal('unknown-job', `no canonical job row for ${jobId}`);
       const digest = await deps.digest();
@@ -103,7 +121,7 @@ export function createSilasModelActionTool(deps: SilasModelActionToolDeps): Nati
           job_id: jobId,
           family: str(args['family']),
           debt: str(args['debt']),
-          head: str(args['head']),
+          head,
           rationale: str(args['rationale']),
           digest_sha256: digestSha256,
         },
@@ -125,4 +143,34 @@ export function createSilasModelActionTool(deps: SilasModelActionToolDeps): Nati
       };
     },
   };
+}
+
+/**
+ * The Silas slot's spawn (issue #243 H6, pinned by #368): appends a model-action
+ * tool to the caller's native tools and binds it to THIS spawn's handle once
+ * the spawn resolves — a re-spawn gets its own tool, never a late lookup of
+ * whichever incarnation is current.
+ */
+export function spawnSilasWithActionTool(
+  deps: Omit<SilasModelActionToolDeps, 'getHandle'> & {
+    readonly registry: { spawn(role: Role, options?: SpawnOptions): Promise<AgentHandle> };
+  },
+  spawnOptions?: SpawnOptions,
+): Promise<AgentHandle> {
+  let bound: AgentHandle | null = null;
+  const actionTool = createSilasModelActionTool({
+    getHandle: () => bound,
+    ledger: deps.ledger,
+    digest: deps.digest,
+    ...(deps.log !== undefined ? { log: deps.log } : {}),
+  });
+  return deps.registry
+    .spawn('silas', {
+      ...(spawnOptions ?? {}),
+      nativeTools: [...(spawnOptions?.nativeTools ?? []), actionTool],
+    })
+    .then((handle) => {
+      bound = handle;
+      return handle;
+    });
 }
