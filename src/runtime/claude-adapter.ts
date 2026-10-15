@@ -873,8 +873,8 @@ function withoutCrBeforeLf(bytes: Buffer): Buffer {
 
 /** Whether a server name the CLI reports may be logged. Names come straight
  * from config — the CLI does not apply its own name rule to config files, so a
- * key can be a credential URL — so only a label is logged: a letter or digit
- * of any script, then letters, digits and combining marks with `_ . -`,
+ * key can be a credential URL — so only a label is logged: a letter or number
+ * of any script, then letters, numbers and combining marks with `_ . -`,
  * parentheses (the CLI's own `claude.ai X (2)`) and spaces, or the CLI's own
  * `plugin:<plugin>:<server>` form, up to 80 characters (code points); never a
  * URL or an address (`/`, `@`, any other `:`), and never a credential-shaped

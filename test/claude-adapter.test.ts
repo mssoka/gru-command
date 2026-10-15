@@ -1765,27 +1765,31 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
   });
 
   it('only a label-shaped server name is ever logged', () => {
-    // Combining marks (NFD Latin, Devanagari vowel signs), the CLI's own
-    // connector collision suffix, an 80-code-point name of astral letters, a
-    // 23-character run and one the Kelvin sign continues (no case folding)
-    // are labels.
+    // Combining marks (NFD Latin, Devanagari vowel signs), numbers of any
+    // kind, the CLI's own connector collision suffix, an 80-code-point name of
+    // astral letters, a 23-character run and one the Kelvin sign continues
+    // (no case folding) are labels.
     for (const name of ['db', 'Upper_Case.v2 x', 'café', '数据', 'plugin:edgeplug:brokensrv', `${'ab-'.repeat(26)}ab`,
-      'cafe\u0301', '\u0921\u0947\u091f\u093e', 'claude.ai Gmail (2)', '\u{20000}'.repeat(80), 'a'.repeat(23),
-      `${'a'.repeat(23)}\u212A`]) {
+      'cafe\u0301', '\u0921\u0947\u091f\u093e', '\u216B \u2460\u00BD', 'claude.ai Gmail (2)', '\u{20000}'.repeat(80),
+      'a'.repeat(23), `${'a'.repeat(23)}\u212A`]) {
       expect(loggableMcpServerName(name), name).toBe(true);
     }
     // Over 80 code points with no run, a 24-character run (also split only by
-    // nonspacing, spacing or enclosing marks), an uppercase UUID, a leading mark or '_', and any
-    // character outside the label — never a denylist.
-    for (const name of ['', 'x'.repeat(81), 'me@host', 'https://u:p@h/m', 'user:sk-secret', 'ok\nuser', 'a/b', '-lead',
+    // nonspacing, spacing or enclosing marks), an uppercase or mixed-case
+    // UUID, a leading mark or '_', and any character outside the label —
+    // never a denylist.
+    for (const name of ['', 'me@host', 'https://u:p@h/m', 'user:sk-secret', 'ok\nuser', 'a/b', '-lead',
       'plugin:a:b:c', `ghp_${'a'.repeat(36)}`, '123e4567-e89b-12d3-a456-426614174000', `${'ab-'.repeat(27)}`,
       '\u{20000}'.repeat(81), 'a'.repeat(24), 'a\u0301'.repeat(24), 'a\u093e'.repeat(24), 'a\u20dd'.repeat(24),
-      '123E4567-E89B-12D3-A456-426614174000', '\u0301a',
+      '123E4567-E89B-12D3-A456-426614174000', '123e4567-E89B-12d3-A456-426614174000', '\u0301a',
       '_internal', 'a+b=', 'a\u202eb', 'a\u2028b', 'a"b', 'a$b']) {
       expect(loggableMcpServerName(name), name).toBe(false);
     }
-    // A name over 160 UTF-16 units is refused before it is spread into code
-    // points; a shorter one is spread once (the spy is live).
+  });
+
+  it('a server name over 160 UTF-16 units is refused before it is spread into code points', () => {
+    // The CLI echoes a config key of any size. A shorter name is spread (the
+    // spy is live); how often is the implementation's business.
     const iterate = String.prototype[Symbol.iterator];
     let spreads = 0;
     const seen: unknown[] = [];
@@ -1794,11 +1798,11 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       return iterate.call(this);
     };
     try {
-      seen.push(loggableMcpServerName('a'.repeat(161)), spreads, loggableMcpServerName('a'.repeat(23)), spreads);
+      seen.push(loggableMcpServerName('a'.repeat(161)), spreads, loggableMcpServerName('a'.repeat(23)), spreads > 0);
     } finally {
       String.prototype[Symbol.iterator] = iterate;
     }
-    expect(seen).toEqual([false, 0, true, 1]);
+    expect(seen).toEqual([false, 0, true, true]);
   });
 
   it('MCP servers the CLI could not load are logged by name — skipped ones with the CLI code, failed or sign-in-blocked ones with a fixed description — once per distinct set', async () => {

@@ -182,8 +182,8 @@ logged by name with the CLI's own skip code (or `unknown reason` when the code
 is not code-shaped or holds a credential-shaped run) — never its free text,
 which can echo rejected values; one it keeps but cannot start, or that needs a
 sign-in a headless session cannot give, is logged by name with a fixed
-description. A name is logged only when it is a label (a letter or digit of
-any script, then letters, digits and combining marks with `_ . -`, parentheses
+description. A name is logged only when it is a label (a letter or number of
+any script, then letters, numbers and combining marks with `_ . -`, parentheses
 and spaces, or the CLI's `plugin:<plugin>:<server>` form, up to 80 code points)
 with no credential-shaped run (24+ ASCII letters and digits in a row, or a
 UUID); any other — a key can be a credential URL — is logged as
