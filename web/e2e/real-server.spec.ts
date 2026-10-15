@@ -63,6 +63,9 @@ function newestInvocationContaining(text: string): AgentInvocation | null {
       if (index === last) continue; // torn: still being appended
       throw error;
     }
+    if (record === null || typeof record !== 'object') {
+      throw new SyntaxError(`double log line ${String(index + 1)} is not a record: ${line.slice(0, 80)}`);
+    }
     if (typeof record.prompt === 'string' && record.prompt.includes(text)) return record;
   }
   return null;
@@ -95,6 +98,7 @@ async function agentPromptContaining(text: string): Promise<AgentInvocation> {
     })
     .toBe(true);
   if (fatal !== null) throw fatal;
+  // Invariant: the poll only passes with a record or a fatal error.
   if (found === null) throw new Error(`no double log record carries ${JSON.stringify(text)}`);
   return found;
 }
