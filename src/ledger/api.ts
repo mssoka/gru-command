@@ -4982,6 +4982,16 @@ export class LedgerApi {
     return row === undefined ? null : this.notificationFromRow(row);
   }
 
+  /** The ledger event sequence of a provider wait's establishment (its
+   * `provider.wait-established` event) — insertion order, never wall-clock
+   * time — or null when it has none. */
+  providerWaitEstablishedSeq(id: string): number | null {
+    const row = this.db
+      .prepare("SELECT seq FROM events WHERE kind = 'provider.wait-established' AND json_extract(payload, '$.id') = ? ORDER BY seq LIMIT 1")
+      .get(id) as Row | undefined;
+    return row === undefined ? null : Number(row.seq);
+  }
+
   /** The most recently INSERTED notification of an exact kind — insertion
    * order, never wall-clock ts, so a clock step back cannot reorder it. */
   latestNotificationByKind(kind: string): NotificationRecord | null {
