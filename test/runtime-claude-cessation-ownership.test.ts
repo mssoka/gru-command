@@ -132,18 +132,17 @@ describe('Claude Code cessation through the registry (runtime-neutral contract)'
     const fx = claudeRegistry(child);
     const { registry } = fx;
     const resident = await spawnBusy(fx);
-    vi.useFakeTimers();
     const exits: number[] = [];
     startServiceShutdown({
       signal: 'SIGTERM', exitCode: 0, serviceStop: new AbortController(), exit: (code) => { exits.push(code); },
       logger: { info: () => {}, error: () => {} },
       state: { registry, handle: { stop: async () => {} } as never },
     });
-    // The kill-grace timers are armed several microtask hops after the
-    // shutdown starts, so one fixed advance can finish before they exist.
-    // Advance in small steps until the real exit signal arrives (bounded well
-    // under the force-exit guard, so a guard exit(1) would still fail below).
-    for (let step = 0; step < 100 && exits.length === 0; step += 1) await vi.advanceTimersByTimeAsync(10);
+    // Shutdown awaits real async work (transcript stream teardown, registry
+    // disposal) that fake timers cannot advance, so wait on the REAL exit
+    // signal. The kill-grace here is 5ms; the force-exit guard (which would
+    // record exit(1)) is far beyond this wait, so a guard exit still fails.
+    await vi.waitFor(() => expect(exits).toHaveLength(1), { timeout: 10_000, interval: 5 });
     expect(exits).toEqual([0]);
     expect(adapterCessationEvidence(resident)).toBe('unknown');
     expect(registry.residents.occupied).toBe(1); // unconfirmed exit stays visible debt
