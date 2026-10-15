@@ -149,6 +149,7 @@ export interface WorkRevisionState {
  * with). */
 export function deliveredWorkRevision(event: { readonly payload: unknown } | null): number {
   if (event === null || typeof event.payload !== 'object' || event.payload === null) return 0;
+  if ((event.payload as { candidate_delivery_proven?: unknown }).candidate_delivery_proven === false) return 0;
   const raw = (event.payload as { work_revision?: unknown }).work_revision;
   return typeof raw === 'number' && Number.isSafeInteger(raw) && raw > 0 ? raw : 0;
 }

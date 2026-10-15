@@ -18,6 +18,7 @@ import {
   type ContextControlState,
   type ContextEventFrame,
   type ContextFrame,
+  type ControlAction,
   type ControlFrame,
   type ControlResultCode,
   type ErrorFrame,
@@ -42,6 +43,16 @@ const CHAT_OWNER = 'chat';
 const MAX_CONTROL_MESSAGE_CHARS = 240;
 const MAX_DEFERRED_CONTROL_FRAMES = 128;
 const MAX_PENDING_NOTICES = 128;
+/** Wording shared (byte for byte) with the web view's immediate band line,
+ * which uses it to dedupe the logged echo (GH-105). */
+function failedControlNoticeText(action: ControlAction, code: ControlResultCode | undefined, message: string | undefined): string {
+  const label = action === 'compact' ? 'compact context' : 'new chat';
+  const detail = message !== undefined && message !== '' ? boundedControlMessage(message) : code ?? 'unknown error';
+  return `⚠️ ${label} failed: ${detail}`;
+}
+
+/** Bound on the wake context a replayable service notice carries (GH-114). */
+const WAKE_CONTEXT_NOTICE_CHARS = 1_500;
 
 function boundedControlMessage(message: string): string {
   if (message.length <= MAX_CONTROL_MESSAGE_CHARS) return message;
@@ -685,6 +696,19 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         ? { message: boundedControlMessage(message) }
         : {}),
     });
+    // GH-105: the requester's result is ephemeral, but a failed control is
+    // durable service machinery — log the outcome as a typed `notice` so a
+    // reload or full replay rebuilds the failed-control band. The live
+    // requester keeps its immediate result; its view dedupes this echo.
+    // A read-only client's refused attempt is its own, not conversation
+    // history: it stays ephemeral.
+    if (!ok && code !== 'read_only') {
+      try {
+        emitLogged({ type: 'notice', text: failedControlNoticeText(frame.action, code, message) });
+      } catch (error) {
+        log('error', 'failed to log a failed control outcome', { error: errorMessage(error) });
+      }
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -693,15 +717,33 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
 
   /** Awareness context for one prompt; fail-soft — a broken awareness layer
    * must never take message delivery down. */
+  let awarenessPrepareFailed = false;
   function awarenessPrepare(source: 'chat' | 'wake' = 'chat'): AwarenessInjection | null {
+    awarenessPrepareFailed = false;
     if (options.awareness === undefined) return null;
     try {
       return options.awareness.prepare(source);
     } catch (error) {
+      awarenessPrepareFailed = true;
       log('error', 'gru awareness prepare failed — delivering without service context', {
         error: errorMessage(error),
       });
       return null;
+    }
+  }
+
+  /** GH-114: the wake's service context reaches the model as a synthetic
+   * prompt; log the bounded context (never the wake instruction) as a typed
+   * `notice` frame at the accepted boundary so replay reconstructs what
+   * triggered Gru's reply in the existing collapsed service band. */
+  function logWakeContext(injection: AwarenessInjection): void {
+    try {
+      const body = injection.text.split('\n').slice(1).join('\n').trim();
+      if (body === '') return;
+      const bounded = body.length > WAKE_CONTEXT_NOTICE_CHARS ? `${body.slice(0, WAKE_CONTEXT_NOTICE_CHARS - 1)}…` : body;
+      emitLogged({ type: 'notice', text: `Wake context — minions raised service events:\n${bounded}` });
+    } catch (error) {
+      log('error', 'failed to log the wake service context', { error: errorMessage(error) });
     }
   }
 
@@ -929,11 +971,24 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
               acceptAwarenessTurn = { source: gru, accept: () => {
                 if (wake) {
                   acceptedWakeInjection = injection;
+                  logWakeContext(injection);
                   awarenessCommit(injection, 'wake');
                   options.awareness?.noteWakeOutcome?.(true, undefined, injection);
                 } else {
                   acceptedPassive = true;
                   awarenessCommit(injection);
+                }
+              } };
+            }
+            if (injection === null && !wake && !awarenessPrepareFailed && options.awareness?.recordOwnerPresence !== undefined) {
+              // GH-119: a block-free owner turn still proves presence.
+              acceptAwarenessTurn = { source: gru, accept: () => {
+                try {
+                  options.awareness?.recordOwnerPresence?.();
+                } catch (error) {
+                  log('error', 'gru awareness presence record failed — digest gap may overstate absence', {
+                    error: errorMessage(error),
+                  });
                 }
               } };
             }

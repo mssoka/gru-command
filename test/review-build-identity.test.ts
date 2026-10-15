@@ -15,7 +15,6 @@ import { LedgerApi } from '../src/ledger/api.js';
 import { WorktreeManager } from '../src/worktrees/manager.js';
 import { EventBus } from '../src/events/bus.js';
 import { attachBareOrigin, makeFixtureRepo } from './helpers/fixture-repo.js';
-import { PersistedReviewPort } from './helpers/persisted-review-port.js';
 import { fakeWholeSpawner, groundedFinding } from './helpers/perkins-whole-double.js';
 
 /** The enacted provider state a fixture publisher reports for the intent the
@@ -230,16 +229,22 @@ describe('installed Perkins runtime identity', () => {
     const { root } = packageIdentity();
     const { createServiceReviewWave } = await import(pathToFileURL(join(root, 'dist', 'dispatch', 'service-review-wave.js')).href) as
       typeof import('../src/dispatch/service-review-wave.js');
+    const { WorktreeManager: InstalledWorktreeManager } = await import(pathToFileURL(join(root, 'dist', 'worktrees', 'manager.js')).href) as
+      typeof import('../src/worktrees/manager.js');
     const repo = makeFixtureRepo('installed-service-freeze');
     const db = new LedgerDb(fixture('installed-service-ledger-'));
+    let manager: WorktreeManager | undefined;
     try {
+      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+      // Keep trusted manager/ledger associations in the installed module graph.
+      const port = new InstalledWorktreeManager({ ledger, root: fixture('installed-service-port-'),
+        preserveRoot: fixture('installed-service-preserve-'), setupTimeoutMs: 30_000, enumerateProcesses: () => [] });
+      manager = port;
       repo.git(['checkout', '-b', 'feature/installed-service']);
       const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
       attachBareOrigin(repo);
       repo.git(['push', '-u', 'origin', 'main', 'feature/installed-service']);
-      const port = new PersistedReviewPort(fixture('installed-service-port-'), 'feature/installed-service', target);
       const artifacts = fixture('installed-service-artifacts-');
-      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
       const job = ledger.addJob({ id: 'installed-service-job', repo: 'fixture', title: 'installed service review',
         baseBranch: 'main', briefing: 'check the exact changed function' });
       ledger.setJobStatus(job.id, 'working');
@@ -288,8 +293,8 @@ describe('installed Perkins runtime identity', () => {
       expect(ledger.listRoundSpecialistStarts(second.round.id)).toHaveLength(5);
       expect(second.canonicalVerdict).toBe('INCOMPLETE');
     } finally {
-      db.close();
-      repo.cleanup();
+      try { if (manager !== undefined && manager.getWorktree('installed-service-job') !== null) await manager.release({ worktreeId: 'installed-service-job' }); }
+      finally { db.close(); repo.cleanup(); }
     }
   }, 90_000);
 

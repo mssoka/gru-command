@@ -202,7 +202,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ts.forEachChild(node, visit);
     };
     visit(file);
-    // Of the 35 pre-existing wave sites, 32 carry bounded context; the
+    // Of the 36 pre-existing wave sites, 33 carry bounded context; the
     // three null rows are sanctioned residuals (shutdown deadline,
     // live-process pause, sweep error) that stay context-free and live (A7
     // rejection stands; a worktree id is never coerced into a round identity).
@@ -254,6 +254,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Review round ${round.id} disposal failed after completion`', '{ jobId: job.id, roundId: round.id }'],
       ['`Review round ${round.id} is INCOMPLETE`', '{ jobId: job.id, roundId: round.id }'],
       ['`Perkins report for round ${round.id} reconciled a provider review but did NOT record it`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins report for round ${round.id} was recorded and provably NOT posted to the pull request`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Perkins report for round ${round.id} was recorded but NOT posted safely to the pull request`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Perkins report for round ${round.id} was recorded but has NO pull request to publish to`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Perkins report for round ${round.id} was recorded but NOT posted to the pull request`', '{ jobId: round.jobId, roundId: round.id }'],
@@ -266,10 +267,10 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Review worktree for round ${worktreeId} could not be swept`', null],
     ];
     expect(sites.map((site) => [site.title, site.context])).toEqual(expected);
-    // 35 pre-existing wave call sites + the 13 durable-publication-recovery
+    // 36 pre-existing wave call sites + the 13 durable-publication-recovery
     // escalations added by the PR #289 native correction cycle, its
     // amendments and the native R2 byte/identity fences.
-    expect(sites).toHaveLength(48);
-    expect(sites.filter((site) => site.context !== null)).toHaveLength(45);
+    expect(sites).toHaveLength(49);
+    expect(sites.filter((site) => site.context !== null)).toHaveLength(46);
   });
 });

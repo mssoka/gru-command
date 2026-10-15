@@ -88,7 +88,7 @@ describe('worker admission through dispatch (FIFO queue, honest queue note, rele
     dirs.push(laneRoot);
     const { api, close } = ledgerIn();
     try {
-      const worktrees = new InMemoryWorktreePort(laneRoot);
+      const worktrees = new InMemoryWorktreePort(laneRoot, api);
       const events: string[] = [];
       const recordingGate = new PacingGate({
         enabled: true,
@@ -408,7 +408,7 @@ describe('pacing plumbing and failure cleanup', () => {
     try {
       const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
       vi.spyOn(api, 'registerAgent').mockImplementationOnce(() => { throw new Error('register unavailable'); });
-      const service = new DispatchService({ ledger: api, worktrees: new InMemoryWorktreePort(root), workerGate: gate,
+      const service = new DispatchService({ ledger: api, worktrees: new InMemoryWorktreePort(root, api), workerGate: gate,
         spawner: async () => makeFakeMinion('spawned').handle });
       await expect(service.dispatch({ jobId: 'job-bad', repoPath: repo.path, title: 'bad', briefing: 'brief' })).rejects.toThrow('register unavailable');
       expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
@@ -422,7 +422,7 @@ describe('pacing plumbing and failure cleanup', () => {
     const { api, close } = ledgerIn();
     try {
       const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
-      const service = new DispatchService({ ledger: api, worktrees: new InMemoryWorktreePort(root), workerGate: gate,
+      const service = new DispatchService({ ledger: api, worktrees: new InMemoryWorktreePort(root, api), workerGate: gate,
         spawner: async () => { throw new Error('spawn refused'); } });
       await expect(service.dispatch({ jobId: 'job-bad', repoPath: repo.path, title: 'bad', briefing: 'brief' })).rejects.toThrow('spawn refused');
       expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
@@ -486,7 +486,7 @@ describe('worker delivery settlement through the dispatcher', () => {
       const minion = makeFakeMinion('minion-exhausted');
       const service = new DispatchService({
         ledger: api,
-        worktrees: new InMemoryWorktreePort(root),
+        worktrees: new InMemoryWorktreePort(root, api),
         spawner: async () => minion.handle,
         retrySettlement: async () => 'exhausted',
       });
@@ -511,7 +511,7 @@ describe('worker delivery settlement through the dispatcher', () => {
       const minion = makeFakeMinion('minion-rejected');
       const service = new DispatchService({
         ledger: api,
-        worktrees: new InMemoryWorktreePort(root),
+        worktrees: new InMemoryWorktreePort(root, api),
         spawner: async () => minion.handle,
         retrySettlement: async () => 'recovered',
       });
@@ -538,7 +538,7 @@ describe('worker delivery settlement through the dispatcher', () => {
       const entered = new Promise<void>((resolve) => { hookEntered = resolve; });
       const service = new DispatchService({
         ledger: api,
-        worktrees: new InMemoryWorktreePort(root),
+        worktrees: new InMemoryWorktreePort(root, api),
         spawner: async () => minion.handle,
         stopSignal: controller.signal,
         retrySettlement: () => { hookEntered(); return new Promise<'recovered'>(() => {}); },
@@ -570,7 +570,7 @@ describe('worker delivery settlement through the dispatcher', () => {
       const minion = makeFakeMinion('minion-fault');
       const service = new DispatchService({
         ledger: api,
-        worktrees: new InMemoryWorktreePort(root),
+        worktrees: new InMemoryWorktreePort(root, api),
         spawner: async () => minion.handle,
         retrySettlement: () => { throw new Error('wiring fault'); },
       });

@@ -81,6 +81,8 @@ export interface WorktreePort {
   resolveReviewTarget(input: { repoPath: string; ref: string }): Promise<{
     readonly sha: string;
     readonly baseSource: WorktreeBaseSource | null;
+    /** Exact fetched tracking identity; null for intentional local pins. */
+    readonly trackingRef: string | null;
   }>;
   createJobWorktree(input: { repoPath: string; jobId: string }): Promise<WorktreeLane>;
   createReviewWorktree(input: {
@@ -104,7 +106,14 @@ export interface WorktreePort {
   }): Promise<WorktreeLane>;
   getWorktree(id: string): WorktreeLane | null;
   listWorktrees(opts?: { jobId?: string }): readonly WorktreeLane[];
-  release(input: { worktreeId: string; confirmKill?: boolean; baseBranch?: string }): Promise<WorktreeSweepResult>;
+  release(input: {
+    worktreeId: string;
+    confirmKill?: boolean;
+    baseBranch?: string;
+    /** Issue #243 F-H1: an unattended release proves tracked cleanliness and
+     * fresh required containment before any forced removal. */
+    requireReleaseProofs?: boolean;
+  }): Promise<WorktreeSweepResult>;
 }
 
 export const WORKTREE_PORT_UNAVAILABLE =
@@ -119,7 +128,7 @@ export const WORKTREE_PORT_UNAVAILABLE =
  * registry") instead of naming the missing subsystem.
  */
 export class UnavailableWorktreePort implements WorktreePort {
-  async resolveReviewTarget(): Promise<{ readonly sha: string; readonly baseSource: WorktreeBaseSource | null }> {
+  async resolveReviewTarget(): Promise<{ readonly sha: string; readonly baseSource: WorktreeBaseSource | null; readonly trackingRef: string | null }> {
     throw new Error(WORKTREE_PORT_UNAVAILABLE);
   }
   async createJobWorktree(): Promise<WorktreeLane> {

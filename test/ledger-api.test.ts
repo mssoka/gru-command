@@ -9,6 +9,8 @@ import { GruMailbox } from '../src/gru-mailbox/service.js';
 import { branchStatePayload } from '../src/dispatch/github-poll.js';
 import { renderRecordedVerification } from '../src/verify/evidence.js';
 import { assertJobTransition, isJobStatus, isJobTerminal, TERMINAL_JOB_STATUSES } from '../src/ledger/states.js';
+import { reconcileReportClosures } from '../src/dispatch/durable-reconcile.js';
+import { NotificationCenter } from '../src/notifications/center.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -39,6 +41,43 @@ describe('job deliverable kind (E19 durable-write guard)', () => {
       db.close();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+
+describe('P48 candidate delivery projections preserve non-candidate debt', () => {
+  it('excludes later historical non-candidates from freshness while preserving their original facts and gate debt', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-ledger-candidate-projection-')); const db = new LedgerDb(dir); const api = new LedgerApi(db.handle);
+    try {
+      api.addJob({ id: 'candidate-job', repo: 'fixture', title: 'candidate' }); api.setJobStatus('candidate-job', 'working');
+      const original = api.appendCustomEvent({ kind: 'job.delivered', jobId: 'candidate-job', payload: { sha: 'a'.repeat(40), work_revision: 0 } });
+      const historical = api.appendCustomEvent({ kind: 'job.delivered', jobId: 'candidate-job', payload: {
+        sha: 'b'.repeat(40), work_revision: 0, historical_bookkeeping_only: true, candidate_delivery_proven: false,
+      } });
+      expect(api.latestCandidateDelivery('candidate-job')).toEqual(original);
+      expect(api.correctiveVerificationDebt('candidate-job')).toEqual({ revision: 0, head: null });
+      api.appendCustomEvent({ kind: 'verification.completed', jobId: 'candidate-job', payload: { sha: 'b'.repeat(40), ok: true } });
+      expect(api.correctiveVerificationDebt('candidate-job')).toEqual({ revision: 0, head: null });
+      expect(api.getEvent(historical.seq)).toEqual(historical);
+      const current = api.appendCustomEvent({ kind: 'job.delivered', jobId: 'candidate-job', payload: {
+        sha: 'c'.repeat(40), work_revision: 0, candidate_delivery_proven: true,
+      } });
+      expect(api.latestCandidateDelivery('candidate-job')).toEqual(current);
+      expect(api.correctiveVerificationDebt('candidate-job')).toBeNull();
+    } finally { db.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('returns no candidate for exclusively unproven deliveries without dropping their revision or verification fence', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-ledger-unproven-projection-')); const db = new LedgerDb(dir); const api = new LedgerApi(db.handle);
+    try {
+      api.addJob({ id: 'unproven-job', repo: 'fixture', title: 'unproven' });
+      const historical = api.appendCustomEvent({ kind: 'job.delivered', jobId: 'unproven-job', payload: {
+        sha: 'd'.repeat(40), work_revision: 1, candidate_delivery_proven: false,
+      } });
+      expect(api.latestCandidateDelivery('unproven-job')).toBeNull();
+      expect(api.workRevisionState('unproven-job')).toEqual({ required: 0, delivered: 0 });
+      expect(api.correctiveVerificationDebt('unproven-job')).toEqual({ revision: 1, head: null });
+      expect(api.latestJobEvent('unproven-job', 'job.delivered')).toEqual(historical);
+    } finally { db.close(); rmSync(dir, { recursive: true, force: true }); }
   });
 });
 
@@ -865,20 +904,31 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
       .toBe('binned');
   });
 
+  function originalReceipt(jobId: string, kind: 'silas.rebrief' | 'job.delivered'): void {
+    const stored = api.listPendingRebriefs({ jobId });
+    api.bindPendingRebriefWorker({ ids: stored.map((row) => row.id), agentId: 'original-worker', sessionFile: null });
+    const marker = api.listPendingRebriefs({ jobId }).find((row) => row.kind === kind)!;
+    api.appendCustomEvent({ kind, jobId, agentId: 'original-worker', payload: {
+      minion_id: 'original-worker', agentId: 'original-worker', work_revision: marker.workRevision,
+      ...(marker.phaseId === null ? { marker_id: marker.id, payload_hash: marker.payloadHash } : { phase_id: marker.phaseId }),
+    } });
+    expect(api.pendingRebriefReceipt(marker)).not.toBeNull();
+  }
+
   it('refuses direct retirement of a fully landed terminal request without an audit', () => {
     const jobId = 'retire-spent-refusal';
     api.addJob({ id: jobId, repo: 'terminal-retirement', title: 'completed request' });
     api.setJobStatus(jobId, 'working');
     const markers = api.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
-    api.appendCustomEvent({ kind: 'silas.rebrief', jobId });
-    api.appendCustomEvent({ kind: 'job.delivered', jobId });
+    originalReceipt(jobId, 'silas.rebrief');
+    originalReceipt(jobId, 'job.delivered');
     api.setJobStatus(jobId, 'in-review');
     api.setJobStatus(jobId, 'merged');
     const result = api.retirePendingRebriefs({ jobId, reason: 'terminal', candidates: candidatesOf(markers) });
     expect(result).toMatchObject({ retired: [], skippedIds: [], refused: 'events-already-landed' });
-    expect(api.listPendingRebriefs({ jobId })).toEqual(markers);
+    expect(api.listPendingRebriefs({ jobId }).map((row) => row.id)).toEqual(markers.map((row) => row.id));
     expect(api.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
-    expect(api.clearPendingRebriefsIfCurrentAndSettle(markers)).toBe(true);
+    expect(api.clearPendingRebriefsIfCurrentAndSettle(api.listPendingRebriefs({ jobId }))).toBe(true);
     expect(api.listPendingRebriefs({ jobId })).toHaveLength(0);
     expect(api.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-settled')).toHaveLength(1);
   });
@@ -909,21 +959,30 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     const jobId = 'settle-atomic-rollback';
     api.addJob({ id: jobId, repo: 'settlement-rollback', title: 'atomic' });
     api.setJobStatus(jobId, 'working');
-    const markers = api.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
-    api.appendCustomEvent({ kind: 'silas.rebrief', jobId });
-    api.appendCustomEvent({ kind: 'job.delivered', jobId });
+    const intent = api.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
+    originalReceipt(jobId, 'silas.rebrief');
+    originalReceipt(jobId, 'job.delivered');
+    // Settlement receives the original ADMITTED generation snapshot,
+    // including its immutable minion binding, not pre-binding intent rows.
+    const markers = api.listPendingRebriefs({ jobId });
+    expect(markers.map((row) => row.id)).toEqual(intent.map((row) => row.id));
+    expect(markers.every((row) => row.agentId === 'original-worker' && api.pendingRebriefReceipt(row) !== null)).toBe(true);
+    const receipts = api.listJobEventsByKinds(jobId, ['silas.rebrief', 'job.delivered']);
     db.handle.exec(`CREATE TRIGGER fail_rebrief_settlement BEFORE INSERT ON events
       WHEN NEW.kind = 'silas.rebrief-settled' BEGIN SELECT RAISE(ABORT, 'settlement blocked'); END`);
     try {
       expect(() => api.clearPendingRebriefsIfCurrentAndSettle(markers)).toThrow(/settlement blocked/u);
-      expect(api.listPendingRebriefs({ jobId }).map((row) => row.id)).toEqual(markers.map((row) => row.id));
+      expect(api.listPendingRebriefs({ jobId })).toEqual(markers);
       expect(api.latestJobEvent(jobId, 'silas.rebrief-settled')).toBeNull();
+      expect(api.listJobEventsByKinds(jobId, ['silas.rebrief', 'job.delivered'])).toEqual(receipts);
     } finally {
       db.handle.exec('DROP TRIGGER fail_rebrief_settlement');
     }
     expect(api.clearPendingRebriefsIfCurrentAndSettle(markers)).toBe(true);
+    expect(api.clearPendingRebriefsIfCurrentAndSettle(markers)).toBe(false);
     expect(api.listPendingRebriefs({ jobId })).toHaveLength(0);
     expect(api.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-settled')).toHaveLength(1);
+    expect(api.listJobEventsByKinds(jobId, ['silas.rebrief', 'job.delivered'])).toEqual(receipts);
   });
 
   it('retirement audit insertion failure rolls back marker deletion, then a retry commits once', () => {
@@ -1038,7 +1097,7 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     });
     const phaseId = markers[0]!.phaseId;
     expect(phaseId).not.toBeNull();
-    api.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { phase_id: phaseId } });
+    originalReceipt(jobId, 'silas.rebrief');
     api.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { phase_id: 'foreign' } });
     api.setJobStatus(jobId, 'in-review');
     api.setJobStatus(jobId, 'merged');
@@ -1057,7 +1116,7 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     const markers = api.beginPendingRebrief({
       jobId, note: 'n', briefing: 'b', handoff: { kind: 'gru-decision', decision: 'review' },
     });
-    api.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { phase_id: markers[0]!.phaseId } });
+    originalReceipt(jobId, 'silas.rebrief');
     api.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { phase_id: 'foreign' } });
     for (let i = 0; i < 1001; i++) api.appendCustomEvent({ kind: 'job.note', jobId, payload: { index: i } });
     api.setJobStatus(jobId, 'in-review');
@@ -1076,7 +1135,7 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     api.setJobStatus(jobId, 'working');
     const markers = api.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
     // The guarded `silas.rebrief` event lands; the delivery never does.
-    api.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { minion_id: 'w', note: 'n' } });
+    originalReceipt(jobId, 'silas.rebrief');
     api.setJobStatus(jobId, 'in-review');
     api.setJobStatus(jobId, 'merged');
     const result = api.retirePendingRebriefs({ jobId, reason: 'job terminal', candidates: candidatesOf(markers) });
@@ -1161,6 +1220,86 @@ describe('decision memory (issue #218)', () => {
     reason: 'existing ownership/integration hold',
     by: 'gru' as const,
   };
+
+  it('GH-314 preserves long and legacy short signal decisions across ledger restart', () => {
+    const dir = tmpDir();
+    let db = new LedgerDb(dir);
+    try {
+      const ledger = new LedgerApi(db.handle);
+      const signals = ['report-handback.review-old', 'report-handback.', 'report-handback._legacy', 'report-handback..legacy',
+        'pr-conflict', 'a'.repeat(64), `report-handback.${'a'.repeat(128)}`,
+        `report-handback.${'A'.repeat(128)}`];
+      const records = signals.map((signal, index) => ledger.recordDecision({ ...base, subject: `job:report-${index}`,
+        covers: [signal], basisFingerprint: `basis-${index}`, clientKey: `persisted-${index}` }));
+      const overlong = `report-handback.${'a'.repeat(129)}`;
+      expect(() => ledger.recordDecision({ ...base, covers: [overlong] })).toThrow(/signal must be 1-144/);
+      expect(() => ledger.coveringDecision({ subject: base.subject, signal: overlong, basis: 'basis' })).toThrow(/signal must be 1-144/);
+      expect(() => ledger.recordDecision({ ...base, covers: ['a'.repeat(65)] })).toThrow(/signal must be 1-64/);
+      db.close();
+      db = new LedgerDb(dir);
+      const reopened = new LedgerApi(db.handle);
+      for (const record of records) {
+        expect(reopened.getDecision(record.id)).toEqual(record);
+        expect(reopened.coveringDecision({ subject: record.subject, signal: record.covers[0]!, basis: record.basisFingerprint! })).toEqual(record);
+        expect(reopened.coveringDecision({ subject: record.subject, signal: record.covers[0]!, basis: 'changed' })).toBeNull();
+      }
+      expect(reopened.listDecisions()).toHaveLength(records.length);
+    } finally { db.close(); }
+  });
+
+  it('GH-314 deduplicates exact case-sensitive covers and replays reordered retries without conflation', () => {
+    const ledger = fresh();
+    const prefix = `report-handback.${'a'.repeat(127)}`;
+    const lower = `${prefix}a`;
+    const upper = `${prefix}A`;
+    const input = { ...base, subject: 'job:case-exact', covers: [lower, upper, lower], basisFingerprint: 'head', clientKey: 'case-retry' };
+    const decision = ledger.recordDecision(input);
+    expect(decision.covers).toEqual([upper, lower]);
+    expect(ledger.recordDecision({ ...input, covers: [upper, lower, upper] })).toEqual(decision);
+    expect(ledger.listDecisions({ subject: input.subject })).toHaveLength(1);
+    for (const signal of [lower, upper]) {
+      expect(ledger.coveringDecision({ subject: input.subject, signal, basis: 'head' })).toEqual(decision);
+    }
+    expect(() => ledger.recordDecision({ ...input, covers: [lower] })).toThrow(/different decision/);
+  });
+
+  it('GH-314 restores a waiting long-signal mailbox disposition across restart and reopens it on clear', () => {
+    const dir = tmpDir();
+    let db = new LedgerDb(dir);
+    const now = Date.parse('2029-12-31T23:59:59.000Z');
+    try {
+      const ledger = new LedgerApi(db.handle);
+      const jobId = `Review-${'A'.repeat(121)}`;
+      ledger.addJob({ id: jobId, repo: 'r', title: 'Review report', deliverable: 'review', commissioner: 'gru' });
+      ledger.setJobStatus(jobId, 'working');
+      ledger.setJobStatus(jobId, 'delivered');
+      ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: 'reviewed-head' } });
+      expect(reconcileReportClosures({ ledger, notifications: new NotificationCenter({ ledger, bus: new EventBus() }) }))
+        .toMatchObject({ opened: 1, published: 1, failed: 0 });
+      const notificationId = ledger.findNotificationByKind(`silas.report-handback.${jobId}`, 'active')!.id;
+      const mailbox = new GruMailbox(ledger, () => now);
+      const item = mailbox.snapshot().items.find((row) => row.notificationIds.includes(notificationId))!;
+      const decision = ledger.recordDecision({ ...base, subject: item.subject, covers: item.reasons.map((reason) => reason.signal),
+        basisFingerprint: item.basis, recheckAt: '2030-01-01T00:00:00.000Z' });
+      mailbox.disposition(item.id, { basis: item.basis, state: 'waiting', owner: 'owner', detail: 'Await owner authorization',
+        dependency: 'owner report disposition authorization', recheckAt: decision.recheckAt,
+        references: [{ kind: 'decision', id: decision.id }] });
+      const waiting = mailbox.snapshot().items.find((row) => row.id === item.id)!;
+      expect(waiting.state).toBe('waiting');
+      db.close();
+      db = new LedgerDb(dir);
+      const reopened = new LedgerApi(db.handle);
+      const restored = new GruMailbox(reopened, () => now);
+      expect(restored.snapshot().items.find((row) => row.id === item.id)).toEqual(waiting);
+      expect(reopened.getDecision(decision.id)?.covers).toEqual([`report-handback.${jobId}`]);
+      reopened.clearDecision({ id: decision.id, by: 'owner', reason: 'Authorization granted' });
+      expect(restored.snapshot().items.find((row) => row.id === item.id)).toMatchObject({ basis: item.basis, state: 'needs-gru' });
+      expect(reopened.coveringDecision({ subject: item.subject, signal: decision.covers[0]!, basis: item.basis, now: new Date(now).toISOString() })).toBeNull();
+      expect(reopened.getDecision(decision.id)).toMatchObject({ covers: decision.covers, clearedBy: 'owner', clearedReason: 'Authorization granted' });
+      expect(reopened.getJob(jobId)?.status).toBe('delivered');
+      expect(reopened.findReportObligation(jobId)?.state).toBe('open');
+    } finally { db.close(); }
+  });
 
   it('coverage matrix: unchanged basis → covered; changed basis → not covered', () => {
     const a = fresh();
@@ -2182,6 +2321,59 @@ describe('administrative closeout of a parked PR-backed job', () => {
   });
 });
 
+describe('directive producer evidence integrity — P18 current-behavior regressions', () => {
+  it('a pre-effect dispatch claim records a reservation fact and never manufactures native producer start', () => {
+    const db = new LedgerDb(tmpDir());
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    try {
+      ledger.addJob({ id: 'reservation-job', repo: 'fixture', title: 'reservation', briefing: 'original approved scope' });
+      ledger.setJobStatus('reservation-job', 'working');
+      const request = ledger.beginDirectiveIntent({ jobId: 'reservation-job', requestId: 'reservation-request',
+        directive: 'approved work not invoked by this claim', holder: 'gru' }).record;
+      const identity = ledger.directiveTurnIdentity(request.requestId);
+      expect(ledger.claimDirectiveDispatch(request.requestId)).toBe(true);
+      expect(ledger.getDirective(request.requestId)).toMatchObject({ nativeTarget: null, nativeBinding: null, admissionSeq: null });
+      expect(ledger.latestJobEvent(request.jobId, 'silas.directive-sent')).toBeNull();
+      expect(ledger.latestJobEvent(request.jobId, 'job.delivered')).toBeNull();
+      const evidence = ledger.listJobEventsByKinds(request.jobId,
+        ['silas.directive-producer-reserved', 'silas.directive-producer-started']);
+      expect(evidence, 'a committed pre-effect claim is only a reservation, not actual native producer execution').toMatchObject([
+        { kind: 'silas.directive-producer-reserved', payload: { fact: 'reservation', request_id: request.requestId, producer_identity: identity } },
+      ]);
+      expect(evidence).toHaveLength(1);
+    } finally { db.close(); }
+  });
+
+  it('a later same-logical-minion cessation receipt cannot erase an older unbound incarnation UNKNOWN', () => {
+    const db = new LedgerDb(tmpDir());
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    try {
+      ledger.addJob({ id: 'incarnation-job', repo: 'fixture', title: 'incarnations', briefing: 'original approved scope' });
+      ledger.setJobStatus('incarnation-job', 'working');
+      const request = ledger.beginDirectiveIntent({ jobId: 'incarnation-job', requestId: 'incarnation-request',
+        directive: 'preserve unproven original physical owner', holder: 'gru' }).record;
+      const identity = ledger.directiveTurnIdentity(request.requestId);
+      ledger.registerAgent({ id: 'same-logical-minion', role: 'minion', jobId: request.jobId, sessionFile: '/original-native.jsonl' });
+      ledger.setAgentState('same-logical-minion', 'idle');
+      ledger.prepareDirectiveTarget(request.requestId, { agentId: 'same-logical-minion', sessionFile: '/original-native.jsonl' });
+      // Explicit event-consumer fixture: an earlier protocol recorded UNKNOWN
+      // without a reservation token. The later observation names a DIFFERENT
+      // native file. It is not proof about the original physical incarnation.
+      const unknown = ledger.appendCustomEvent({ kind: 'silas.directive-producer-unknown', jobId: request.jobId,
+        payload: { request_id: request.requestId, agent_id: 'same-logical-minion', session_file: '/original-native.jsonl', producer_identity: identity } });
+      ledger.registerAgent({ id: 'same-logical-minion', role: 'minion', jobId: request.jobId, sessionFile: '/later-native.jsonl' });
+      const later = ledger.appendCustomEvent({ kind: 'silas.directive-producer-ceased', jobId: request.jobId,
+        payload: { request_id: request.requestId, agent_id: 'same-logical-minion', session_file: '/later-native.jsonl', producer_identity: identity } });
+      expect(later.seq).toBeGreaterThan(unknown.seq);
+      expect(ledger.getEvent(unknown.seq)).toEqual(unknown);
+      expect(ledger.getDirective(request.requestId)?.nativeTarget).toEqual({ agentId: 'same-logical-minion', sessionFile: '/original-native.jsonl' });
+      expect(ledger.latestJobEvent(request.jobId, 'job.delivered')).toBeNull();
+      expect(ledger.directiveProgressBlockers(request.requestId, 'original-lane').join(';'),
+        'later logical-ID reuse must not consume an independently unresolved original UNKNOWN').toContain('unproven producer cleanup');
+      expect(() => ledger.claimDirectiveDispatch(request.requestId)).toThrow(/unproven/);
+    } finally { db.close(); }
+  });
+});
 
 describe('GH-305 additive mailbox metadata authority', () => {
   it('rejects stale and unsupported dispositions transactionally, and persists receipts without changing obligations', () => {

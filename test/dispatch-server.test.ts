@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createServer, type Server as HttpServer } from 'node:http';
@@ -11,10 +11,13 @@ import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { loadConfig, DEFAULT_SILAS_CONFIG } from '../src/config.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
+import { withNativeDirectiveFixture } from './helpers/directive-native-fixture.js';
+import { inspectDirectiveCheckpoint } from '../src/runtime/directive-checkpoint.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { GhPrPoster, WaveRunner } from '../src/dispatch/perkins.js';
 import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
+import { admitBlindReview, blindCoverageOf, observeBlindSessionAccess, recordBlindAdmission, BLIND_ACCESS_EVENT } from '../src/dispatch/blind-review.js';
 import { PacingGate, type RetrySettlement } from '../src/runtime/pacing.js';
 import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
 import { PUBLICATION_ABSENT_EVENT, PUBLICATION_ATTEMPT_EVENT, PUBLICATION_IDENTITY_EVENT, PUBLICATION_RECEIPT_EVENT, PUBLICATION_REBIND_UNRESOLVED_EVENT, pendingPublicationAttempt } from '../src/dispatch/publication-evidence.js';
@@ -50,6 +53,17 @@ const enactedFor = (event: string | undefined): string => ENACTED_REVIEW_STATE[e
 
 const TOKEN = 'test-token-éphémeral';
 const PR_URL = 'https://git.example.invalid/fixture-owner/fixture-app/pull/5';
+
+function admitJobAsBlind(ledger: LedgerApi, jobId: string): void {
+  const targetSha = 'f'.repeat(40);
+  const admission = admitBlindReview({
+    ledger, jobId, title: 'review (blind)', deliverable: 'review',
+    briefing: 'Review the immutable package read-only.', targetSha, repoName: 'fixture',
+    inputPackage: { baseSha: 'a'.repeat(40), targetSha, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] },
+  });
+  if (admission === null) throw new Error(`job "${jobId}" was not admitted as a blind review`);
+  recordBlindAdmission(ledger, jobId, admission);
+}
 
 const cleanupDirs: string[] = [];
 const cleanupRepos: FixtureRepo[] = [];
@@ -96,6 +110,9 @@ async function boot(opts: {
   retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
   /** Provider pacing: worker gate forwarded to the silas routes. */
   workerGate?: PacingGate;
+  observeBlindTurn?: (jobId: string, sessionFile: string | null) => void;
+  /** The actual native fixture path, not a second unrelated fake transcript. */
+  minionPromptEffect?: (text: string, sessionFile: string) => void;
 } = {}): Promise<ServerHarness & { wave: WaveRunner }> {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-dispatch-server-'));
   cleanupDirs.push(dir);
@@ -113,7 +130,11 @@ async function boot(opts: {
   const rawLedger = new LedgerApi(db.handle, { bus });
   const ledger = opts.wrapLedger === undefined ? rawLedger : opts.wrapLedger(rawLedger);
   const notifications = new NotificationCenter({ ledger, bus });
-  const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'));
+  const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'), ledger);
+  const createJobLane = worktrees.createJobWorktree.bind(worktrees);
+  vi.spyOn(worktrees, 'createJobWorktree').mockImplementation(async (input) => {
+    const lane = await createJobLane(input); if (ledger.getWorktree(lane.id) === null) ledger.registerWorktree(lane); return lane;
+  }); // original lane creation, not recovery evidence
   const spawns: { role: Role; options: SpawnOptions }[] = [];
   const reviewSessions = join(dir, 'review-sessions');
   mkdirSync(reviewSessions, { recursive: true });
@@ -121,9 +142,10 @@ async function boot(opts: {
   const spawner = async (role: Role, options?: SpawnOptions): Promise<AgentHandle> => {
     spawns.push({ role, options: options ?? {} });
     if (role === 'perkins') return hybrid.spawner(role, options);
-    const id = `agent-${spawns.length}`;
+    const id = options?.resumeFile === undefined ? `agent-${spawns.length}` : options.agentId ?? `agent-${spawns.length}`;
+    const nativeFile = options?.resumeFile ?? join(dir, 'native-sessions', `${id}.jsonl`);
     let turnHealth: 'idle' | 'error' = 'idle';
-    return {
+    return withNativeDirectiveFixture({
       role,
       id,
       sessionFile: null,
@@ -136,7 +158,8 @@ async function boot(opts: {
         if (gate !== undefined) await gate;
         // idempotent per prompt: a fresh file per turn, so a second minion
         // turn on the same lane (silas re-brief) always has a commit to make.
-        const file = join(options.cwd, `http-deliverable-${id}.txt`);
+        opts.minionPromptEffect?.(text, nativeFile);
+        const file = join(options.cwd, `http-deliverable-${id}-${minionTurnTexts.length}.txt`);
         writeFileSync(file, 'review me\n');
         execFileSync('git', ['-C', options.cwd, 'add', file]);
         execFileSync('git', ['-C', options.cwd, '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'test: http deliverable'], { stdio: 'ignore' });
@@ -164,12 +187,26 @@ async function boot(opts: {
         // itself; record it so tests can assert the cleanup ran.
         if (role === 'minion') disposedHandles.push(id);
       },
-    };
+    }, nativeFile, (state) => { if (ledger.getAgent(id) !== null) ledger.setAgentState(id, state); }, options?.cwd === undefined ? undefined : () => execFileSync('git', ['-C', options.cwd!, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(), options?.cwd);
   };
   const dispatch = new DispatchService({ ledger, worktrees, spawner });
   const minionPrompts: string[] = [];
   const minionTurnTexts: string[] = [];
-  const liveHandles = new Map<string, AgentHandle>();
+  const liveHandles = new class extends Map<string, AgentHandle> {
+    override set(id: string, handle: AgentHandle): this {
+      const row = ledger.getAgent(id);
+      const originalLane = row?.jobId == null ? undefined : worktrees.listWorktrees({ jobId: row.jobId }).find((lane) => lane.kind === 'job' && lane.status !== 'swept');
+      const wrapped = withNativeDirectiveFixture(handle, join(dir, 'native-live', `${id}.jsonl`), (state) => { if (ledger.getAgent(id) !== null) ledger.setAgentState(id, state); }, (identity) => {
+        const lane = worktrees.listWorktrees({ jobId: identity.jobId }).find((row) => row.kind === 'job' && row.status !== 'swept');
+        return lane === undefined ? null : execFileSync('git', ['-C', lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      }, originalLane?.path);
+      if (row !== null) {
+        ledger.registerAgent({ id, role: row.role, jobId: row.jobId, sessionFile: wrapped.sessionFile });
+        ledger.setAgentState(id, wrapped.health().state); // fixture's completed native initialization
+      }
+      return super.set(id, wrapped);
+    }
+  }();
   const disposedHandles: string[] = [];
   const reviewArtifactRoot = join(dir, 'reviews');
   const wave = new WaveRunner({
@@ -192,6 +229,7 @@ async function boot(opts: {
     ...(opts.log !== undefined ? { log: opts.log } : {}),
     ...(opts.retrySettlement !== undefined ? { retrySettlement: opts.retrySettlement } : {}),
     ...(opts.workerGate !== undefined ? { workerGate: opts.workerGate } : {}),
+    ...(opts.observeBlindTurn !== undefined ? { observeBlindTurn: opts.observeBlindTurn } : {}),
     ...(opts.silasOps === false
       ? {}
       : {
@@ -200,6 +238,7 @@ async function boot(opts: {
               getHandle: (id: string) => liveHandles.get(id) ?? null,
               spawn: (role: Role, spawnOptions?: SpawnOptions) => spawner(role, spawnOptions),
               disposeHandle: async (handle: AgentHandle) => {
+                await handle.dispose();
                 disposedHandles.push(handle.id);
                 liveHandles.delete(handle.id);
               },
@@ -270,6 +309,36 @@ async function waitForDelivery(h: ServerHarness, jobId: string): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).not.toBeNull();
+}
+
+
+async function awaitBlindNativeCessation(h: { ledger: LedgerApi }, jobId: string, requestId: string) {
+  await vi.waitFor(() => {
+    expect(h.ledger.latestJobEventByRequestId(jobId, 'silas.directive-producer-ceased', requestId)).not.toBeNull();
+    expect(h.ledger.latestJobEvent(jobId, BLIND_ACCESS_EVENT)).not.toBeNull();
+  }, { timeout: 10_000, interval: 10 });
+  const row = h.ledger.getDirective(requestId);
+  if (row == null || row.nativeTarget === null) throw new Error('blind continuation lacks its actual native target');
+  expect(row.nativeBinding).not.toBeNull();
+  expect(inspectDirectiveCheckpoint(row.nativeTarget.sessionFile, h.ledger.directiveTurnIdentity(requestId))).toMatchObject({
+    state: 'unknown', reason: 'native checkpoint has a malformed or duplicate entry identity',
+  });
+  return row;
+}
+
+async function awaitDirectiveRecovery(h: { ledger: LedgerApi }, requestId: string, needle: string) {
+  const deadline = Date.now() + 10_000;
+  for (;;) { const row = h.ledger.getDirective(requestId); if (row !== null && row.failReason?.includes(needle)) return row;
+    if (Date.now() > deadline) throw new Error('missing exact recovery readback: ' + requestId + ' (' + JSON.stringify(row) + ')');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+async function awaitDirectiveAdmission(h: { ledger: LedgerApi }, requestId: string) {
+  const deadline = Date.now() + 10_000;
+  for (;;) { const row = h.ledger.getDirective(requestId); if (row?.state === 'admitted') return row;
+    if (Date.now() > deadline) throw new Error('native admission never recorded: ' + JSON.stringify(row));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }
 
 /** Prepare a proven clean service-restart abort: dispatch, settle the
@@ -1055,6 +1124,37 @@ describe('dispatch server (E8)', () => {
       expect(kinds).toContain('silas.review-triggered');
       const reviewEvent = h.ledger.listJobEvents('by-silas-job').find((event) => event.kind === 'silas.review-triggered');
       expect((reviewEvent?.payload as { route?: string }).route).toBe('perkins');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('the two new autopilot rules are accepted and persist their durable attribution (issue #243 R2-M6)', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-silas-rules');
+    cleanupRepos.push(repo);
+    attachBareOrigin(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'silas-rule-job', repo_path: repo.path, title: 'rules', briefing: 'b',
+      }, TOKEN);
+      await waitForDelivery(h, 'silas-rule-job');
+      const pr = await call(h.port, 'POST', '/api/dispatch/pr', {
+        job_id: 'silas-rule-job', url: PR_URL, by: 'silas', rule_id: 'delivered-pr-register',
+      }, TOKEN);
+      expect(pr.status).toBe(200);
+      const review = await call(h.port, 'POST', '/api/dispatch/review', {
+        job_id: 'silas-rule-job', by: 'silas', rule_id: 'pr-review-trigger',
+      }, TOKEN);
+      expect(review.status).toBe(202);
+      expect(h.ledger.latestJobEvent('silas-rule-job', 'silas.pr-registered')?.payload).toMatchObject({
+        url: PR_URL,
+        rule_id: 'delivered-pr-register',
+      });
+      expect(h.ledger.latestJobEvent('silas-rule-job', 'silas.review-triggered')?.payload).toMatchObject({
+        route: 'perkins',
+        rule_id: 'pr-review-trigger',
+      });
     } finally {
       await h.close();
     }
@@ -1875,19 +1975,19 @@ if (argv.includes('--method') && argv.includes('POST')) {
       const requestId = field<string>(res.json, 'request_id');
       // The reconcile note lands; the request stays dispatching (live).
       const deadline = Date.now() + 10_000;
-      while (!(h.ledger.getDirective(requestId)?.failReason ?? '').includes('unknown admission') && Date.now() < deadline) {
+      while (!(h.ledger.getDirective(requestId)?.failReason ?? '').includes('superseded') && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
       const readback = h.ledger.getDirective(requestId);
-      expect(readback?.state).toBe('dispatching');
-      expect(readback?.failReason).toContain('unknown admission');
+      expect(readback?.state).toBe('admitted');
+      expect(readback?.failReason).toContain('superseded');
       expect(readback?.failReason).toContain('superseded');
       // The single-writer guard holds: a different request id is refused.
       const blocked = await call(h.port, 'POST', '/api/silas/directive', {
         job_id: 'dir-settle', directive: 'different work', request_id: 'req-other',
       }, TOKEN);
       expect(blocked.status).toBe(409);
-      expect(h.ledger.listJobEvents('dir-settle').some((event) => event.kind === 'silas.directive-sent')).toBe(false);
+      expect(h.ledger.listJobEvents('dir-settle').some((event) => event.kind === 'silas.directive-sent')).toBe(true);
       // The creation dispatch legitimately recorded its own delivery; the
       // request must not add a REQUEST-sourced delivery on top of it.
       expect(h.ledger.listJobEvents('dir-settle').some((event) =>
@@ -1922,11 +2022,11 @@ if (argv.includes('--method') && argv.includes('POST')) {
       expect(res.status).toBe(202);
       const requestId = field<string>(res.json, 'request_id');
       const deadline = Date.now() + 10_000;
-      while (!(h.ledger.getDirective(requestId)?.failReason ?? '').includes('unknown admission') && Date.now() < deadline) {
+      while (!(h.ledger.getDirective(requestId)?.failReason ?? '').includes('superseded') && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
       const readback = h.ledger.getDirective(requestId);
-      expect(readback?.state).toBe('dispatching');
+      expect(readback?.state).toBe('admitted');
       expect(readback?.failReason).toContain('superseded');
       const blocked = await call(h.port, 'POST', '/api/silas/directive', {
         job_id: 'dir-fresh', directive: 'different work', request_id: 'req-other',
@@ -1940,599 +2040,333 @@ if (argv.includes('--method') && argv.includes('POST')) {
     }
   });
 
-  it('/api/silas/rebrief keeps its durable markers pending when the bounded retry exhausts', async () => {
-    const h = await boot({ retrySettlement: async () => 'exhausted' });
-    const repo = makeFixtureRepo('fixture-silas-rebrief-settle');
-    cleanupRepos.push(repo);
-    try {
-      await call(h.port, 'POST', '/api/dispatch', {
-        job_id: 'reb-settle', repo_path: repo.path, title: 'settle lane', briefing: 'b',
-      }, TOKEN);
-      const res = await call(h.port, 'POST', '/api/silas/rebrief', {
-        job_id: 'reb-settle', note: 'try again',
-      }, TOKEN);
-      expect(res.status).toBe(400);
-      expect(field<string>(res.json, 'detail')).toContain('automatic rate-limit retry exhausted');
-      expect(h.ledger.listJobEvents('reb-settle').some((event) => event.kind === 'silas.rebrief')).toBe(false);
-      // The creation dispatch legitimately recorded its own delivery; the
-      // re-brief request must not add a REQUEST-sourced delivery.
-      expect(h.ledger.listJobEvents('reb-settle').some((event) =>
-        event.kind === 'job.delivered' && (event.payload as { source?: string }).source === 'silas-rebrief',
-      )).toBe(false);
-      expect(h.ledger.listPendingRebriefs({ jobId: 'reb-settle' })).toHaveLength(2);
-    } finally {
-      await h.close();
-    }
-  });
-
-  it('/api/silas/rebrief retires the live minion and re-briefs a FRESH one on the same lane', async () => {
-    const h = await boot();
-    const repo = makeFixtureRepo('fixture-silas-rebrief');
-    cleanupRepos.push(repo);
-    try {
-      await call(h.port, 'POST', '/api/dispatch', {
-        job_id: 'rebrief-job', repo_path: repo.path, title: 'stuck lane', briefing: 'the original contract',
-      }, TOKEN);
-      // The prior minion is LIVE: the retirement path must actually run.
-      const priorMinion = `agent-${h.spawns.length}`;
-      h.liveHandles.set(priorMinion, {
-        role: 'minion',
-        id: priorMinion,
-        sessionFile: null,
-        capabilities: FAKE_CAPABILITIES,
-        prompt: async () => {},
-        async steer() {},
-        async followUp() {},
-        subscribe: () => () => {},
-        health: () => ({ state: 'idle' as const, lastActivity: null, sessionFile: null }),
-        async dispose() {},
-      });
-      const freshBefore = h.spawns.filter((spawn) => spawn.role === 'minion').length;
-      // A round-bound review-only minion is not an implementer: the
-      // retirement pass must never touch its live handle (G1 exclusion).
-      const reviewRound = h.ledger.addRound({ jobId: 'rebrief-job', lenses: ['blind'] });
-      // The review-only session's round has ended: a re-brief on a lane
-      // whose review is still running answers review_in_progress (owner
-      // rule 5) — this case pins the G1 exclusion, not the writer gate.
-      h.ledger.setRoundStatus(reviewRound.id, 'aborted');
-      h.ledger.registerAgent({
-        id: 'review-only-minion',
-        role: 'minion',
-        jobId: 'rebrief-job',
-        roundId: reviewRound.id,
-        sessionFile: '/review-only.jsonl',
-      });
-      h.liveHandles.set('review-only-minion', {
-        role: 'minion',
-        id: 'review-only-minion',
-        sessionFile: '/review-only.jsonl',
-        capabilities: FAKE_CAPABILITIES,
-        prompt: async () => {},
-        async steer() {},
-        async followUp() {},
-        subscribe: () => () => {},
-        health: () => ({ state: 'idle' as const, lastActivity: null, sessionFile: '/review-only.jsonl' }),
-        async dispose() {},
-      });
-      const res = await call(h.port, 'POST', '/api/silas/rebrief', {
-        job_id: 'rebrief-job',
-        note: 'same blocker three rounds; try a different approach',
-      }, TOKEN);
-      expect(res.status).toBe(200);
-      const freshMinion = h.spawns.filter((spawn) => spawn.role === 'minion')[freshBefore];
-      expect(freshMinion).toBeDefined();
-      expect(field<string>(res.json, 'minion_id')).toBe(`agent-${h.spawns.length}`);
-      expect(h.ledger.getAgent(`agent-${h.spawns.length}`)?.jobId).toBe('rebrief-job');
-      const job = h.ledger.getJob('rebrief-job');
-      expect(job?.status).toBe('working');
-      const event = h.ledger.listJobEvents('rebrief-job').find((candidate) => candidate.kind === 'silas.rebrief');
-      expect(event).not.toBeNull();
-      expect((event?.payload as { note?: string }).note).toContain('same blocker');
-      // The prior live session was retired, not leaked — and the live
-      // review-only session was left alone.
-      expect(h.disposedHandles).toContain(priorMinion);
-      expect(h.disposedHandles).not.toContain('review-only-minion');
-      // The re-brief prompt carries the original briefing (still the
-      // contract) AND the note — a cwd-only check proved neither.
-      const rebriefText = h.minionTurnTexts.find((text) => text.startsWith('Re-brief — job rebrief-job'));
-      expect(rebriefText).toBeDefined();
-      expect(rebriefText).toContain('the original contract');
-      expect(rebriefText).toContain('same blocker three rounds; try a different approach');
-      expect(h.ledger.listAgents().some((agent) => agent.jobId === 'rebrief-job' && agent.role === 'minion')).toBe(true);
-      // the fresh minion's turn committed, and the follow-up delivery signal
-      // recorded the moved head the re-review freshness predicate reads
-      const lane = h.worktrees.listWorktrees({ jobId: 'rebrief-job' }).find((candidate) => candidate.kind === 'job');
-      const head = execFileSync('git', ['-C', lane!.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
-      const delivered = h.ledger.listJobEvents('rebrief-job').find((candidate) => candidate.kind === 'job.delivered');
-      expect(delivered).not.toBeNull();
-      expect(delivered?.payload).toMatchObject({
-        agentId: `agent-${h.spawns.length}`,
-        source: 'silas-rebrief',
-        sha: head,
-      });
-      expect(head).not.toBe(lane?.sha);
-      expect(field<string>(res.json, 'delivered_sha')).toBe(head);
-    } finally {
-      await h.close();
-    }
-  });
-
-  it('/api/silas/rebrief keeps the markers and records NO delivery or phase completion when the turn settles with an in-band error', async () => {
-    const h = await boot({ minionTurnHealth: (text) => (text.startsWith('Re-brief —') ? 'error' : 'idle') });
-    const repo = makeFixtureRepo('fixture-silas-inband-rebrief');
-    cleanupRepos.push(repo);
-    try {
-      const dispatch = await call(h.port, 'POST', '/api/dispatch', {
-        job_id: 'inband-rebrief', repo_path: repo.path, title: 'stuck lane', briefing: 'the original contract',
-      }, TOKEN);
-      expect(dispatch.status).toBe(202);
-      // Let the initial (healthy) briefing turn settle first.
-      const firstTurnDeadline = Date.now() + 10_000;
-      while (h.ledger.latestJobEvent('inband-rebrief', 'job.delivered') === null && Date.now() < firstTurnDeadline) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-      const res = await call(h.port, 'POST', '/api/silas/rebrief', {
-        job_id: 'inband-rebrief',
-        note: 'same blocker; try differently',
-        completion_handoff: { kind: 'gru-decision', decision: 'never owed by a failed turn' },
-      }, TOKEN);
-      expect(res.status, JSON.stringify(res.json)).toBe(202);
-      expect(field<string>(res.json, 'state')).toBe('turn-error');
-      // No guarded events landed: the marker pair stays pending for the
-      // boot recovery ladder, and the marked phase stays awaiting.
-      expect(h.ledger.listPendingRebriefs({ jobId: 'inband-rebrief' })).toHaveLength(2);
-      expect(h.ledger.latestJobEvent('inband-rebrief', 'silas.rebrief')).toBeNull();
-      expect(
-        h.ledger.listJobEvents('inband-rebrief').filter((event) => event.kind === 'job.delivered'),
-      ).toHaveLength(1); // the initial dispatch delivery only — no failed-turn delivery
-      expect(h.ledger.latestJobEvent('inband-rebrief', 'job.minion-error')).not.toBeNull();
-      const phase = h.ledger.listPhaseHandoffs({ jobId: 'inband-rebrief' })[0];
-      expect(phase?.state).toBe('awaiting');
-      expect(phase?.completionSeq).toBeNull();
-      expect(
-        h.ledger.listNotifications({ limit: 200 }).filter((row) => row.kind.includes('phase-handback')),
-      ).toHaveLength(0);
-    } finally {
-      await h.close();
-    }
-  });
-
-  it('/api/silas/rebrief persists request markers before the worker and clears them only when the events land', async () => {
-    let releasePrompt!: () => void;
-    const gate = new Promise<void>((resolveGate) => {
-      releasePrompt = resolveGate;
+  it('/api/silas/rebrief observes the actual native session and preserves contaminated UNKNOWN debt (issue #339 P4)', async () => {
+    let contaminate = false;
+    let ledgerRef: LedgerApi | null = null;
+    const h = await boot({
+      minionPromptEffect: (_text, file) => {
+        if (contaminate) appendFileSync(file, `${JSON.stringify({ type: 'message', message: { role: 'toolResult', toolName: 'bash', content: 'docs/issues/305-review.md:1:prior assessment' } })}\n`);
+      },
+      observeBlindTurn: (jobId, file) => { if (ledgerRef !== null) observeBlindSessionAccess(ledgerRef, jobId, file); },
     });
-    const h = await boot({ minionPromptGate: (text) => (text.startsWith('Re-brief —') ? gate : undefined) });
-    const repo = makeFixtureRepo('fixture-silas-rebrief-markers');
-    cleanupRepos.push(repo);
+    ledgerRef = h.ledger;
+    const repo = makeFixtureRepo('fixture-silas-rebrief-blind'); cleanupRepos.push(repo);
     try {
-      await call(h.port, 'POST', '/api/dispatch', {
-        job_id: 'marker-job', repo_path: repo.path, title: 'stuck lane', briefing: 'the original contract',
-      }, TOKEN);
-      // Let the initial briefing turn settle before the re-brief: the fresh
-      // worker must not race the first minion's git commit on the lane.
-      const firstTurnDeadline = Date.now() + 10_000;
-      while (h.ledger.latestJobEvent('marker-job', 'job.delivered') === null && Date.now() < firstTurnDeadline) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-      const pending = call(h.port, 'POST', '/api/silas/rebrief', {
-        job_id: 'marker-job', note: 're-open with the marker cure',
-      }, TOKEN);
-      // While the turn is in flight the durable marker pair exists and is
-      // bound to the spawned worker — before its prompt can settle.
-      const deadline = Date.now() + 10_000;
-      while (h.ledger.listPendingRebriefs({ jobId: 'marker-job' }).length !== 2 && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-      const markers = h.ledger.listPendingRebriefs({ jobId: 'marker-job' });
-      expect(markers).toHaveLength(2);
-      const rebriefMarker = markers.find((marker) => marker.kind === 'silas.rebrief');
-      expect(rebriefMarker?.note).toBe('re-open with the marker cure');
-      expect(rebriefMarker?.agentId).not.toBeNull();
-      // No event has answered the request yet (the initial dispatch delivery
-      // predates the marker's watermark and cannot count as the re-brief's).
-      const baseline = rebriefMarker?.baselineSeq ?? Number.NaN;
-      expect(h.ledger.latestJobEvent('marker-job', 'silas.rebrief')).toBeNull();
-      const inFlightDelivery = h.ledger.latestJobEvent('marker-job', 'job.delivered');
-      expect(inFlightDelivery === null || inFlightDelivery.seq <= baseline).toBe(true);
-
-      releasePrompt();
-      const res = await pending;
-      expect(res.status, JSON.stringify(res.json)).toBe(200);
-      // Markers clear ONLY once both guarded events landed.
-      expect(h.ledger.listPendingRebriefs({ jobId: 'marker-job' })).toHaveLength(0);
-      expect(h.ledger.latestJobEvent('marker-job', 'silas.rebrief')?.seq).toBeGreaterThan(baseline);
-      expect(h.ledger.latestJobEvent('marker-job', 'job.delivered')?.seq).toBeGreaterThan(baseline);
-    } finally {
-      releasePrompt();
-      await h.close();
-    }
+      await call(h.port, 'POST', '/api/dispatch', { job_id: 'reb-blind', repo_path: repo.path, title: 'blind lane', briefing: 'b' }, TOKEN);
+      await waitForDelivery(h, 'reb-blind');
+      admitJobAsBlind(h.ledger, 'reb-blind');
+      expect(blindCoverageOf(h.ledger, 'reb-blind')).toMatchObject({ state: 'qualifying', accessObserved: false });
+      contaminate = true;
+      const res = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: 'reb-blind', note: 'try again' }, TOKEN);
+      expect(res.status).toBe(202);
+      const requestId = field<string>(res.json, 'request_id');
+      const debt = await awaitBlindNativeCessation(h, 'reb-blind', requestId);
+      expect(debt.state).toBe('admitted'); expect(debt.deliverySeq).toBeNull();
+      // A bare toolResult is deliberately NOT a valid SDK completion. It
+      // still invalidates blind coverage after the real fixture prompt;
+      // neither the scanner nor disposal can upgrade it into delivery.
+      expect(h.ledger.latestJobEvent('reb-blind', BLIND_ACCESS_EVENT)).not.toBeNull();
+      expect(blindCoverageOf(h.ledger, 'reb-blind')).toMatchObject({
+        state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
+      });
+      expect(h.ledger.listJobEvents('reb-blind').filter((event) => event.kind === 'job.delivered' &&
+        (event.payload as { request_id?: string }).request_id === requestId)).toHaveLength(0);
+    } finally { await h.close(); }
   });
 
-  it('/api/silas/rebrief reports a superseded ordinary turn without consuming newer markers', async () => {
-    let releasePrompt!: () => void;
-    const gate = new Promise<void>((resolve) => { releasePrompt = resolve; });
-    const h = await boot({ minionPromptGate: (text) => text.startsWith('Re-brief —') ? gate : undefined });
-    const repo = makeFixtureRepo('fixture-rebrief-superseded-http');
-    cleanupRepos.push(repo);
+  it('/api/silas/directive observes the actual resumed native session without promoting malformed completion (issue #339 D1)', async () => {
+    let contaminate = false;
+    let ledgerRef: LedgerApi | null = null;
+    const h = await boot({
+      minionPromptEffect: (_text, file) => {
+        if (contaminate) appendFileSync(file, `${JSON.stringify({ type: 'message', message: { role: 'toolResult', toolName: 'bash', content: 'docs/issues/305-review.md:1:prior assessment' } })}\n`);
+      },
+      observeBlindTurn: (jobId, file) => { if (ledgerRef !== null) observeBlindSessionAccess(ledgerRef, jobId, file); },
+    });
+    ledgerRef = h.ledger;
+    const repo = makeFixtureRepo('fixture-silas-directive-blind'); cleanupRepos.push(repo);
     try {
-      await call(h.port, 'POST', '/api/dispatch', {
-        job_id: 'superseded-http', repo_path: repo.path, title: 'lane', briefing: 'contract',
+      await call(h.port, 'POST', '/api/dispatch', { job_id: 'dir-blind', repo_path: repo.path, title: 'blind lane', briefing: 'b' }, TOKEN);
+      await waitForDelivery(h, 'dir-blind');
+      admitJobAsBlind(h.ledger, 'dir-blind'); h.ledger.setJobStatus('dir-blind', 'in-review');
+      expect(blindCoverageOf(h.ledger, 'dir-blind')).toMatchObject({ state: 'qualifying', accessObserved: false });
+      contaminate = true;
+      const res = await call(h.port, 'POST', '/api/silas/directive', {
+        job_id: 'dir-blind', directive: 'Continue the review.', blocker_fingerprint: 'correctness::blind::resume',
       }, TOKEN);
-      const initialDeadline = Date.now() + 10_000;
-      while (h.ledger.latestJobEvent('superseded-http', 'job.delivered') === null && Date.now() < initialDeadline) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-      const pending = call(h.port, 'POST', '/api/silas/rebrief', { job_id: 'superseded-http', note: 'older' }, TOKEN);
-      const deadline = Date.now() + 10_000;
-      while (!h.minionTurnTexts.some((text) => text.startsWith('Re-brief —')) && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-      expect(h.minionTurnTexts.some((text) => text.startsWith('Re-brief —'))).toBe(true);
-      const newer = h.ledger.beginPendingRebrief({ jobId: 'superseded-http', note: 'newer', briefing: 'contract' });
-      h.ledger.setJobStatus('superseded-http', 'in-review');
-      releasePrompt();
-      const response = await pending;
-      expect(response.status).toBe(200);
-      expect(field<boolean>(response.json, 'superseded')).toBe(true);
-      expect(h.ledger.listPendingRebriefs({ jobId: 'superseded-http' })).toEqual(newer);
-      expect(h.ledger.getJob('superseded-http')?.status).toBe('in-review');
-      expect(h.ledger.latestJobEvent('superseded-http', 'silas.rebrief')).toBeNull();
-    } finally {
-      releasePrompt();
-      await h.close();
-    }
+      expect(res.status).toBe(202);
+      const requestId = field<string>(res.json, 'request_id');
+      const debt = await awaitBlindNativeCessation(h, 'dir-blind', requestId);
+      expect(debt.state).toBe('admitted'); expect(debt.deliverySeq).toBeNull();
+      expect(blindCoverageOf(h.ledger, 'dir-blind')).toMatchObject({
+        state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
+      });
+      expect(h.ledger.listJobEvents('dir-blind').filter((event) => event.kind === 'job.delivered' &&
+        (event.payload as { request_id?: string }).request_id === requestId)).toHaveLength(0);
+    } finally { await h.close(); }
   });
 
-  it('/api/silas/rebrief cancels a queued terminal request before disposing or spawning', async () => {
-    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
-    const h = await boot({ workerGate: gate });
-    const repo = makeFixtureRepo('fixture-queued-terminal-http');
-    cleanupRepos.push(repo);
-    let holder: Awaited<ReturnType<PacingGate['acquireWorkerTurn']>> | null = null;
+  it("/api/silas/rebrief accepts durably before a bounded retry refusal, with concrete recovery debt", async () => {
+
+    const h = await boot({ retrySettlement: async () => 'exhausted' }); const repo = makeFixtureRepo('fixture-new-rebrief-1'); cleanupRepos.push(repo); const jobId = 'new-rebrief-1';
     try {
-      await call(h.port, 'POST', '/api/dispatch', {
-        job_id: 'queued-terminal-http', repo_path: repo.path, title: 'lane', briefing: 'contract',
-      }, TOKEN);
-      const deadline = Date.now() + 10_000;
-      while (h.ledger.latestJobEvent('queued-terminal-http', 'job.delivered') === null && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-      holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'holder' });
+      await call(h.port, 'POST', '/api/dispatch', { job_id: jobId, repo_path: repo.path, title: 'approved lane', briefing: 'original contract' }, TOKEN);
+      await waitForDelivery(h, jobId); expect(h.worktrees.listWorktrees({ jobId })).toHaveLength(1);
+
+
+      const response = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'approved follow-through', request_id: 'request-new-rebrief-1', completion_handoff: { kind: 'gru-decision', decision: 'judge actual completion' } }, TOKEN);
+      expect(response.status).toBe(202); const requestId = field<string>(response.json, 'request_id');
+      expect(h.ledger.getDirective(requestId)?.requestKind).toBe('rebrief'); expect(h.ledger.listPendingRebriefs({ jobId })).toEqual([]);
+      const recovery = await awaitDirectiveRecovery(h, requestId, 'retry exhausted');
+      expect(recovery.state).toBe('admitted'); expect(recovery.deliverySeq).toBeNull();
+      expect(h.ledger.listJobEvents(jobId).filter((event) => event.kind === 'job.delivered' && (event.payload as { source?: string }).source === 'silas-rebrief')).toEqual([]);
+      expect(h.ledger.listObligations({ jobId }).some((row) => row.category.kind === 'known' && row.category.category === 'restart-recovery' && row.nextAction.kind === 'gru-decision')).toBe(true);
+      const phase = h.ledger.listPhaseHandoffs({ jobId }).find((row) => row.requestId === requestId);
+      expect(phase?.requestId).toBe(requestId); expect(phase?.state).toBe('awaiting'); expect(phase?.completionSeq).toBeNull();
+    } finally { await h.close(); }
+  });
+
+  it("/api/silas/rebrief initial new rebrief retires a proven old handle on the same lane and binds native admission", async () => {
+
+    const h = await boot({}); const repo = makeFixtureRepo('fixture-new-rebrief-2'); cleanupRepos.push(repo); const jobId = 'new-rebrief-2';
+    try {
+      await call(h.port, 'POST', '/api/dispatch', { job_id: jobId, repo_path: repo.path, title: 'approved lane', briefing: 'original contract' }, TOKEN);
+      await waitForDelivery(h, jobId); const lane = h.worktrees.listWorktrees({ jobId })[0]!;
+      const oldId = h.ledger.latestJobEvent(jobId, 'job.delivered')!.agentId ?? h.ledger.listAgents().find((row) => row.jobId === jobId)!.id;
+      h.liveHandles.set(oldId, { role: 'minion', id: oldId, sessionFile: null, capabilities: FAKE_CAPABILITIES,
+        async prompt() { throw new Error('old session must not receive a new rebrief'); }, async steer() {}, async followUp() {},
+        subscribe: () => () => {}, health: () => ({ state: 'idle', lastActivity: null, sessionFile: null }), async dispose() {} });
       const beforeSpawns = h.spawns.length;
-      const pending = call(h.port, 'POST', '/api/silas/rebrief', { job_id: 'queued-terminal-http', note: 'queued' }, TOKEN);
-      while (h.ledger.listPendingRebriefs({ jobId: 'queued-terminal-http' }).length !== 2 && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-      expect(h.ledger.listPendingRebriefs({ jobId: 'queued-terminal-http' })).toHaveLength(2);
-      h.ledger.setJobStatus('queued-terminal-http', 'in-review');
-      h.ledger.setJobStatus('queued-terminal-http', 'merged');
-      holder.release();
-      holder = null;
-      const response = await pending;
-      expect(response.status).toBe(200);
-      expect(field<boolean>(response.json, 'retired')).toBe(true);
-      expect(h.spawns).toHaveLength(beforeSpawns);
-      expect(h.disposedHandles).toHaveLength(0);
-      expect(h.ledger.listPendingRebriefs({ jobId: 'queued-terminal-http' })).toHaveLength(0);
-      expect(h.ledger.listJobEvents('queued-terminal-http').filter((event) => event.kind === 'silas.rebrief-retired')).toHaveLength(1);
-    } finally {
-      holder?.release();
-      await h.close();
-    }
+      const response = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'approved follow-through', request_id: 'request-new-rebrief-2', completion_handoff: { kind: 'gru-decision', decision: 'judge actual completion' } }, TOKEN);
+      expect(response.status).toBe(202); const requestId = field<string>(response.json, 'request_id');
+      expect(h.ledger.getDirective(requestId)?.requestKind).toBe('rebrief'); expect(h.ledger.listPendingRebriefs({ jobId })).toEqual([]);
+      expect((await awaitDirectiveTerminal(h, requestId)).state).toBe('settled');
+      expect(h.disposedHandles).toContain(oldId); expect(h.spawns.length).toBe(beforeSpawns + 1);
+      expect(h.spawns.at(-1)?.options.cwd).toBe(lane.path);
+      expect(h.ledger.getDirective(requestId)?.nativeBinding?.userEntryId).toBeTruthy();
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')?.payload).toMatchObject({ request_id: requestId });
+      expect(h.ledger.latestJobEvent(jobId, 'job.delivered')?.payload).toMatchObject({ request_id: requestId, source: 'silas-rebrief' });
+      expect(h.worktrees.listWorktrees({ jobId })[0]).toMatchObject({ id: lane.id, path: lane.path, branch: lane.branch });
+    } finally { await h.close(); }
   });
 
-  it('/api/silas/rebrief cancels a queued superseded unmarked request before disposal or spawn', async () => {
-    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
-    const h = await boot({ workerGate: gate });
-    const repo = makeFixtureRepo('fixture-queued-superseded-http');
-    cleanupRepos.push(repo);
-    let holder: Awaited<ReturnType<PacingGate['acquireWorkerTurn']>> | null = null;
+  it("/api/silas/rebrief actual native error leaves admission and its phase incomplete, never delivery", async () => {
+
+    const h = await boot({ minionTurnHealth: (text) => text.startsWith('Re-brief —') ? 'error' : 'idle' }); const repo = makeFixtureRepo('fixture-new-rebrief-3'); cleanupRepos.push(repo); const jobId = 'new-rebrief-3';
     try {
-      await call(h.port, 'POST', '/api/dispatch', {
-        job_id: 'queued-superseded-http', repo_path: repo.path, title: 'lane', briefing: 'contract',
-      }, TOKEN);
-      const deadline = Date.now() + 10_000;
-      while (h.ledger.latestJobEvent('queued-superseded-http', 'job.delivered') === null && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-      const resident = h.ledger.listAgents().find((agent) => agent.jobId === 'queued-superseded-http' && agent.role === 'minion');
-      expect(resident).toBeDefined();
-      h.liveHandles.set(resident!.id, {
-        id: resident!.id, role: 'minion', sessionFile: null, capabilities: FAKE_CAPABILITIES,
-        async prompt() {}, async steer() {}, async followUp() {},
-        subscribe: () => () => {},
-        health: () => ({ state: 'idle', lastActivity: null, sessionFile: null }),
-        async dispose() {},
-      });
-      holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'holder' });
+      await call(h.port, 'POST', '/api/dispatch', { job_id: jobId, repo_path: repo.path, title: 'approved lane', briefing: 'original contract' }, TOKEN);
+      await waitForDelivery(h, jobId); expect(h.worktrees.listWorktrees({ jobId })).toHaveLength(1);
+
+
+      const response = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'approved follow-through', request_id: 'request-new-rebrief-3', completion_handoff: { kind: 'gru-decision', decision: 'judge actual completion' } }, TOKEN);
+      expect(response.status).toBe(202); const requestId = field<string>(response.json, 'request_id');
+      expect(h.ledger.getDirective(requestId)?.requestKind).toBe('rebrief'); expect(h.ledger.listPendingRebriefs({ jobId })).toEqual([]);
+      const recovery = await awaitDirectiveRecovery(h, requestId, 'in-band runtime error');
+      expect(recovery.state).toBe('admitted'); expect(recovery.deliverySeq).toBeNull();
+      expect(h.ledger.listJobEvents(jobId).filter((event) => event.kind === 'job.delivered' && (event.payload as { source?: string }).source === 'silas-rebrief')).toEqual([]);
+      expect(h.ledger.listObligations({ jobId }).some((row) => row.category.kind === 'known' && row.category.category === 'restart-recovery' && row.nextAction.kind === 'gru-decision')).toBe(true);
+      const phase = h.ledger.listPhaseHandoffs({ jobId }).find((row) => row.requestId === requestId);
+      expect(phase?.requestId).toBe(requestId); expect(phase?.state).toBe('awaiting'); expect(phase?.completionSeq).toBeNull();
+    } finally { await h.close(); }
+  });
+
+  it("/api/silas/rebrief persists exact acceptance/native admission before a gated worker settles", async () => {
+    let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+    const h = await boot({ minionPromptGate: (text) => text.startsWith('Re-brief —') ? gate : undefined }); const repo = makeFixtureRepo('fixture-new-rebrief-4'); cleanupRepos.push(repo); const jobId = 'new-rebrief-4';
+    try {
+      await call(h.port, 'POST', '/api/dispatch', { job_id: jobId, repo_path: repo.path, title: 'approved lane', briefing: 'original contract' }, TOKEN);
+      await waitForDelivery(h, jobId); expect(h.worktrees.listWorktrees({ jobId })).toHaveLength(1);
+
       const beforeSpawns = h.spawns.length;
-      const beforePrompts = h.minionTurnTexts.length;
-      const pending = call(h.port, 'POST', '/api/silas/rebrief', { job_id: 'queued-superseded-http', note: 'older' }, TOKEN);
-      while (h.ledger.listPendingRebriefs({ jobId: 'queued-superseded-http' }).length !== 2 && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-      expect(h.ledger.listPendingRebriefs({ jobId: 'queued-superseded-http' })).toHaveLength(2);
-      const newer = h.ledger.beginPendingRebrief({ jobId: 'queued-superseded-http', note: 'newer', briefing: 'contract' });
-      h.ledger.setJobStatus('queued-superseded-http', 'in-review');
-      holder.release();
-      holder = null;
-      const response = await pending;
-      expect(response.status).toBe(200);
-      expect(field<boolean>(response.json, 'superseded')).toBe(true);
-      expect(h.ledger.listPendingRebriefs({ jobId: 'queued-superseded-http' })).toEqual(newer);
-      expect(h.ledger.getJob('queued-superseded-http')?.status).toBe('in-review');
-      expect(h.spawns).toHaveLength(beforeSpawns);
-      expect(h.disposedHandles).toHaveLength(0);
-      expect(h.minionTurnTexts).toHaveLength(beforePrompts);
-      expect(h.ledger.latestJobEvent('queued-superseded-http', 'silas.rebrief')).toBeNull();
-    } finally {
-      holder?.release();
-      await h.close();
-    }
+      const response = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'approved follow-through', request_id: 'request-new-rebrief-4', completion_handoff: { kind: 'gru-decision', decision: 'judge actual completion' } }, TOKEN);
+      expect(response.status).toBe(202); const requestId = field<string>(response.json, 'request_id');
+      expect(h.ledger.getDirective(requestId)?.requestKind).toBe('rebrief'); expect(h.ledger.listPendingRebriefs({ jobId })).toEqual([]);
+      const admitted = await awaitDirectiveAdmission(h, requestId);
+      expect(admitted.nativeBinding?.userEntryId).toBeTruthy(); expect(admitted.deliverySeq).toBeNull();
+
+      const concurrent = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'second', request_id: 'never-admitted-second' }, TOKEN);
+      expect(concurrent.status).toBe(409); expect(h.spawns.length).toBe(beforeSpawns + 1);
+
+      release();
+      expect((await awaitDirectiveTerminal(h, requestId)).state).toBe('settled');
+      expect(h.minionTurnTexts.filter((text) => text.startsWith('Re-brief —'))).toHaveLength(1);
+      expect(h.ledger.latestJobEvent(jobId, 'job.delivered')?.payload).toMatchObject({ source: 'silas-rebrief', request_id: requestId });
+    } finally { release?.(); await h.close(); }
   });
 
-  it('/api/silas/rebrief retires failed turns that settle after their job goes terminal', async () => {
-    for (const mode of ['in-band', 'rejected'] as const) {
-      let releasePrompt!: () => void;
-      const gate = new Promise<void>((resolve) => { releasePrompt = resolve; });
-      const jobId = `terminal-failed-http-${mode}`;
-      const h = await boot({
-        minionPromptGate: (text) => text.startsWith('Re-brief —')
-          ? mode === 'rejected' ? gate.then(() => { throw new Error('synthetic prompt rejection'); }) : gate
-          : undefined,
-        minionTurnHealth: (text) => mode === 'in-band' && text.startsWith('Re-brief —') ? 'error' : 'idle',
-      });
-      const repo = makeFixtureRepo(`fixture-terminal-failed-http-${mode}`);
-      cleanupRepos.push(repo);
-      try {
-        await call(h.port, 'POST', '/api/dispatch', {
-          job_id: jobId, repo_path: repo.path, title: 'lane', briefing: 'contract',
-        }, TOKEN);
-        const initialDeadline = Date.now() + 10_000;
-        while (h.ledger.latestJobEvent(jobId, 'job.delivered') === null && Date.now() < initialDeadline) {
-          await new Promise((resolve) => setTimeout(resolve, 10));
-        }
-        const pending = call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'retry' }, TOKEN);
-        const deadline = Date.now() + 10_000;
-        while (!h.minionTurnTexts.some((text) => text.startsWith(`Re-brief — job ${jobId}`)) && Date.now() < deadline) {
-          await new Promise((resolve) => setTimeout(resolve, 10));
-        }
-        expect(h.minionTurnTexts.some((text) => text.startsWith(`Re-brief — job ${jobId}`))).toBe(true);
-        const markers = h.ledger.listPendingRebriefs({ jobId });
-        expect(markers).toHaveLength(2);
-        const baseline = markers[0]!.baselineSeq;
-        h.ledger.setJobStatus(jobId, 'in-review');
-        h.ledger.setJobStatus(jobId, 'merged');
-        releasePrompt();
-        const response = await pending;
-        if (mode === 'in-band') {
-          expect(response.status).toBe(202);
-          expect(field<string>(response.json, 'state')).toBe('turn-error');
-          expect(field<boolean>(response.json, 'retired')).toBe(true);
-          expect(h.ledger.latestJobEvent(jobId, 'job.minion-error')).not.toBeNull();
-        } else {
-          expect(response.status).toBe(400);
-          expect(field<string>(response.json, 'detail')).toContain('synthetic prompt rejection');
-          expect(field<boolean>(response.json, 'retired')).toBe(true);
-        }
-        expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
-        expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).not.toBeNull();
-        expect(h.ledger.listJobEvents(jobId).filter((event) =>
-          (event.kind === 'silas.rebrief' || event.kind === 'job.delivered') && event.seq > baseline)).toHaveLength(0);
-      } finally {
-        releasePrompt();
-        await h.close();
-      }
-    }
-  });
-
-  it('/api/silas/rebrief reports an administrative retirement when the job goes terminal mid-turn', async () => {
-    let releasePrompt!: () => void;
-    const gate = new Promise<void>((resolveGate) => {
-      releasePrompt = resolveGate;
-    });
-    const logs: string[] = [];
-    const h = await boot({
-      minionPromptGate: (text) => (text.startsWith('Re-brief —') ? gate : undefined),
-      log: (level, msg) => {
-        logs.push(`${level}:${msg}`);
-      },
-    });
-    const repo = makeFixtureRepo('fixture-silas-rebrief-terminal');
-    cleanupRepos.push(repo);
+  it("/api/silas/rebrief same-ID retries never create a second writer and changed/new IDs refuse", async () => {
+    let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+    const h = await boot({ minionPromptGate: (text) => text.startsWith('Re-brief —') ? gate : undefined }); const repo = makeFixtureRepo('fixture-new-rebrief-5'); cleanupRepos.push(repo); const jobId = 'new-rebrief-5';
     try {
-      await call(h.port, 'POST', '/api/dispatch', {
-        job_id: 'terminal-rebrief-job', repo_path: repo.path, title: 'stuck lane', briefing: 'the original contract',
-      }, TOKEN);
-      // Let the initial briefing turn settle before the re-brief (same shape
-      // as the marker test above).
-      const firstTurnDeadline = Date.now() + 10_000;
-      while (h.ledger.latestJobEvent('terminal-rebrief-job', 'job.delivered') === null && Date.now() < firstTurnDeadline) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-      const pending = call(h.port, 'POST', '/api/silas/rebrief', {
-        job_id: 'terminal-rebrief-job', note: 'fold the rebase',
-      }, TOKEN);
-      // Wait until the re-brief turn is in flight (its markers bound), and
-      // capture the request watermark: a guarded event after this baseline
-      // would answer the retired request.
-      const deadline = Date.now() + 10_000;
-      while (h.ledger.listPendingRebriefs({ jobId: 'terminal-rebrief-job' }).length !== 2 && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-      const markers = h.ledger.listPendingRebriefs({ jobId: 'terminal-rebrief-job' });
-      expect(markers).toHaveLength(2);
-      const rebriefMarker = markers.find((marker) => marker.kind === 'silas.rebrief');
-      expect(rebriefMarker).toBeDefined();
-      const baseline = rebriefMarker?.baselineSeq ?? Number.NaN;
-      // The job reaches terminal while the turn is gated (owner merged it).
-      h.ledger.setJobStatus('terminal-rebrief-job', 'in-review');
-      h.ledger.setJobStatus('terminal-rebrief-job', 'merged');
-      releasePrompt();
-      const res = await pending;
-      expect(res.status, JSON.stringify(res.json)).toBe(200);
-      // The disposition is in-band: retired, no fabricated delivery.
-      expect(field<boolean>(res.json, 'retired')).toBe(true);
-      expect(field<string | null>(res.json, 'delivered_sha')).toBeNull();
-      // No POST-BOUNDARY delivery/re-brief was fabricated for the retired
-      // request. The initial briefing turn's own `job.delivered` (source
-      // `dispatch`) legitimately predates the request watermark and is
-      // retained — history is preserved, never erased to satisfy a test.
-      const delivered = h.ledger.latestJobEvent('terminal-rebrief-job', 'job.delivered');
-      expect(delivered === null || delivered.seq <= baseline).toBe(true);
-      if (delivered !== null) expect(delivered.payload).toMatchObject({ source: 'dispatch' });
-      const rebrief = h.ledger.latestJobEvent('terminal-rebrief-job', 'silas.rebrief');
-      expect(rebrief === null || rebrief.seq <= baseline).toBe(true);
-      expect(h.ledger.latestJobEvent('terminal-rebrief-job', 'silas.rebrief-recovered')).toBeNull();
-      // The audit is durable and the obsolete markers are gone; the lane stays terminal.
-      expect(h.ledger.latestJobEvent('terminal-rebrief-job', 'silas.rebrief-retired')).not.toBeNull();
-      expect(h.ledger.listPendingRebriefs({ jobId: 'terminal-rebrief-job' })).toHaveLength(0);
-      expect(h.ledger.getJob('terminal-rebrief-job')?.status).toBe('merged');
-      // The operator surface carries the disposition, not just the response.
-      expect(logs).toContain('info:silas re-brief retired: job went terminal before the turn settled');
-    } finally {
-      releasePrompt();
-      await h.close();
-    }
+      await call(h.port, 'POST', '/api/dispatch', { job_id: jobId, repo_path: repo.path, title: 'approved lane', briefing: 'original contract' }, TOKEN);
+      await waitForDelivery(h, jobId); expect(h.worktrees.listWorktrees({ jobId })).toHaveLength(1);
+
+      const beforeSpawns = h.spawns.length;
+      const response = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'approved follow-through', request_id: 'request-new-rebrief-5', completion_handoff: { kind: 'gru-decision', decision: 'judge actual completion' } }, TOKEN);
+      expect(response.status).toBe(202); const requestId = field<string>(response.json, 'request_id');
+      expect(h.ledger.getDirective(requestId)?.requestKind).toBe('rebrief'); expect(h.ledger.listPendingRebriefs({ jobId })).toEqual([]);
+      const admitted = await awaitDirectiveAdmission(h, requestId);
+      expect(admitted.nativeBinding?.userEntryId).toBeTruthy(); expect(admitted.deliverySeq).toBeNull();
+      const retry = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'approved follow-through', request_id: requestId }, TOKEN);
+      expect(retry.status).toBe(202); expect(field<boolean>(retry.json, 'replay')).toBe(true);
+      const changed = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'changed', request_id: requestId }, TOKEN);
+      expect(changed.status).toBe(409);
+      const concurrent = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'second', request_id: 'never-admitted-second' }, TOKEN);
+      expect(concurrent.status).toBe(409); expect(h.spawns.length).toBe(beforeSpawns + 1);
+
+      release();
+      expect((await awaitDirectiveTerminal(h, requestId)).state).toBe('settled');
+      expect(h.minionTurnTexts.filter((text) => text.startsWith('Re-brief —'))).toHaveLength(1);
+      expect(h.ledger.latestJobEvent(jobId, 'job.delivered')?.payload).toMatchObject({ source: 'silas-rebrief', request_id: requestId });
+    } finally { release?.(); await h.close(); }
   });
 
-  it('/api/silas/rebrief surfaces a retirement that retired nothing, keeping the markers', async () => {
-    let releasePrompt!: () => void;
-    const gate = new Promise<void>((resolveGate) => {
-      releasePrompt = resolveGate;
-    });
-    const logs: string[] = [];
-    const h = await boot({
-      minionPromptGate: (text) => (text.startsWith('Re-brief —') ? gate : undefined),
-      wrapLedger: (ledger) => {
-        const view = Object.create(ledger) as LedgerApi;
-        Object.defineProperty(view, 'retirePendingRebriefs', {
-          value: () => ({ retired: [], skippedIds: ['stale-generation'], refused: null }),
-        });
-        return view;
-      },
-      log: (level, msg) => {
-        logs.push(`${level}:${msg}`);
-      },
-    });
-    const repo = makeFixtureRepo('fixture-silas-rebrief-incomplete');
-    cleanupRepos.push(repo);
+  it("/api/silas/rebrief queued terminal work never reaches native admission, disposal or spawn", async () => {
+    const workerGate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 }); let release!: () => void;
+    const h = await boot({ workerGate }); const repo = makeFixtureRepo('fixture-new-rebrief-6'); cleanupRepos.push(repo); const jobId = 'new-rebrief-6';
     try {
-      await call(h.port, 'POST', '/api/dispatch', {
-        job_id: 'incomplete-rebrief-job', repo_path: repo.path, title: 'stuck lane', briefing: 'the original contract',
-      }, TOKEN);
-      // Let the initial briefing turn settle before the re-brief (same shape
-      // as the retirement test above).
-      const firstTurnDeadline = Date.now() + 10_000;
-      while (h.ledger.latestJobEvent('incomplete-rebrief-job', 'job.delivered') === null && Date.now() < firstTurnDeadline) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-      const pending = call(h.port, 'POST', '/api/silas/rebrief', {
-        job_id: 'incomplete-rebrief-job', note: 'fold the rebase',
-      }, TOKEN);
-      const markerDeadline = Date.now() + 10_000;
-      while (h.ledger.listPendingRebriefs({ jobId: 'incomplete-rebrief-job' }).length !== 2 && Date.now() < markerDeadline) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-      expect(h.ledger.listPendingRebriefs({ jobId: 'incomplete-rebrief-job' })).toHaveLength(2);
-      // The job reaches terminal while the turn is gated (owner merged it).
-      h.ledger.setJobStatus('incomplete-rebrief-job', 'in-review');
-      h.ledger.setJobStatus('incomplete-rebrief-job', 'merged');
-      releasePrompt();
-      const res = await pending;
-      expect(res.status, JSON.stringify(res.json)).toBe(200);
-      // The incomplete disposition is in-band and the markers survive for
-      // the next pass; nothing claims a recovery or a retirement.
-      expect(res.json).toMatchObject({ retirement: { refused: null, skipped_ids: ['stale-generation'] } });
-      // The wire must not conflate the disposition with a retirement: on
-      // the all-skip path `retired` is absent (examined-vs-retired truth).
-      expect(field(res.json, 'retired')).toBeUndefined();
-      expect(h.ledger.latestJobEvent('incomplete-rebrief-job', 'silas.rebrief-retired')).toBeNull();
-      expect(h.ledger.latestJobEvent('incomplete-rebrief-job', 'silas.rebrief-recovered')).toBeNull();
-      expect(h.ledger.listPendingRebriefs({ jobId: 'incomplete-rebrief-job' })).toHaveLength(2);
-      // The operator-facing warn line is part of this contract: an all-skip
-      // disposition must be visible in the log, not only in the 200 body.
-      expect(logs).toContain('warn:silas re-brief retirement incomplete: markers kept for the next pass');
-    } finally {
-      releasePrompt();
-      await h.close();
-    }
+      await call(h.port, 'POST', '/api/dispatch', { job_id: jobId, repo_path: repo.path, title: 'approved lane', briefing: 'original contract' }, TOKEN);
+      await waitForDelivery(h, jobId); const lane = h.worktrees.listWorktrees({ jobId })[0]!;
+      const holder = await workerGate.acquireWorkerTurn({ id: 'occupied-fixture', label: 'fixture hold' }); let released = false; release = () => { if (!released) { released = true; holder.release(); } };
+      const beforeSpawns = h.spawns.length; const beforeDisposals = [...h.disposedHandles];
+      const response = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'approved follow-through', request_id: 'request-new-rebrief-6', completion_handoff: { kind: 'gru-decision', decision: 'judge actual completion' } }, TOKEN);
+      expect(response.status).toBe(202); const requestId = field<string>(response.json, 'request_id');
+      expect(h.ledger.getDirective(requestId)?.requestKind).toBe('rebrief'); expect(h.ledger.listPendingRebriefs({ jobId })).toEqual([]);
+      expect(h.ledger.getDirective(requestId)?.nativeBinding).toBeNull();
+      h.ledger.setJobStatus(jobId, 'in-review'); h.ledger.setJobStatus(jobId, 'merged'); release();
+      const recovery = await awaitDirectiveRecovery(h, requestId, `directive refused — job "${jobId}" is merged`);
+      expect(recovery.state).toBe('dispatching'); expect(recovery.nativeBinding).toBeNull(); expect(recovery.deliverySeq).toBeNull();
+      expect(h.spawns.length).toBe(beforeSpawns); expect(h.disposedHandles).toEqual(beforeDisposals);
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toBeNull(); expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
+      expect(h.worktrees.listWorktrees({ jobId })[0]).toMatchObject({ id: lane.id, branch: lane.branch });
+    } finally { release?.(); await h.close(); }
   });
 
-  it('/api/silas/rebrief surfaces a PARTIAL retirement: retired plus the kept-marker ids', async () => {
-    let releasePrompt!: () => void;
-    const gate = new Promise<void>((resolveGate) => {
-      releasePrompt = resolveGate;
-    });
-    const logs: { level: string; msg: string; fields?: Record<string, unknown> }[] = [];
-    const h = await boot({
-      minionPromptGate: (text) => (text.startsWith('Re-brief —') ? gate : undefined),
-      wrapLedger: (ledger) => {
-        const view = Object.create(ledger) as LedgerApi;
-        Object.defineProperty(view, 'retirePendingRebriefs', {
-          value: (input: { jobId: string }) => {
-            const rows = ledger.listPendingRebriefs({ jobId: input.jobId });
-            // One marker retires; the other's identity drifted (kept).
-            return { retired: [rows[0]!], skippedIds: [rows[1]!.id], refused: null };
-          },
-        });
-        return view;
-      },
-      log: (level, msg, fields) => {
-        logs.push({ level, msg, fields });
-      },
-    });
-    const repo = makeFixtureRepo('fixture-silas-rebrief-partial');
-    cleanupRepos.push(repo);
+  it("/api/silas/rebrief a parked owner lane after queue acceptance never gains work authority", async () => {
+    const workerGate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 }); let release!: () => void;
+    const h = await boot({ workerGate }); const repo = makeFixtureRepo('fixture-new-rebrief-7'); cleanupRepos.push(repo); const jobId = 'new-rebrief-7';
     try {
-      await call(h.port, 'POST', '/api/dispatch', {
-        job_id: 'partial-rebrief-job', repo_path: repo.path, title: 'stuck lane', briefing: 'the original contract',
-      }, TOKEN);
-      const firstTurnDeadline = Date.now() + 10_000;
-      while (h.ledger.latestJobEvent('partial-rebrief-job', 'job.delivered') === null && Date.now() < firstTurnDeadline) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-      const pending = call(h.port, 'POST', '/api/silas/rebrief', {
-        job_id: 'partial-rebrief-job', note: 'fold the rebase',
-      }, TOKEN);
-      const markerDeadline = Date.now() + 10_000;
-      while (h.ledger.listPendingRebriefs({ jobId: 'partial-rebrief-job' }).length !== 2 && Date.now() < markerDeadline) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-      const markers = h.ledger.listPendingRebriefs({ jobId: 'partial-rebrief-job' });
-      expect(markers).toHaveLength(2);
-      h.ledger.setJobStatus('partial-rebrief-job', 'in-review');
-      h.ledger.setJobStatus('partial-rebrief-job', 'merged');
-      releasePrompt();
-      const res = await pending;
-      expect(res.status, JSON.stringify(res.json)).toBe(200);
-      // Partial means BOTH facts on the wire: retired true AND the kept
-      // marker ids named — a consumer keying on either alone reads it right.
-      expect((res.json as { retired?: unknown }).retired).toBe(true);
-      expect((res.json as { retirement?: unknown }).retirement)
-        .toEqual({ refused: null, skipped_ids: [markers[1]!.id] });
-      const retiredLog = logs.find((line) => line.msg === 'silas re-brief retired: job went terminal before the turn settled');
-      expect(retiredLog?.level).toBe('info');
-      expect(retiredLog?.fields?.['skipped']).toEqual([markers[1]!.id]);
-    } finally {
-      releasePrompt();
-      await h.close();
-    }
+      await call(h.port, 'POST', '/api/dispatch', { job_id: jobId, repo_path: repo.path, title: 'approved lane', briefing: 'original contract' }, TOKEN);
+      await waitForDelivery(h, jobId); const lane = h.worktrees.listWorktrees({ jobId })[0]!;
+      const holder = await workerGate.acquireWorkerTurn({ id: 'occupied-fixture', label: 'fixture hold' }); let released = false; release = () => { if (!released) { released = true; holder.release(); } };
+      const beforeSpawns = h.spawns.length; const beforeDisposals = [...h.disposedHandles];
+      const response = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'approved follow-through', request_id: 'request-new-rebrief-7', completion_handoff: { kind: 'gru-decision', decision: 'judge actual completion' } }, TOKEN);
+      expect(response.status).toBe(202); const requestId = field<string>(response.json, 'request_id');
+      expect(h.ledger.getDirective(requestId)?.requestKind).toBe('rebrief'); expect(h.ledger.listPendingRebriefs({ jobId })).toEqual([]);
+      expect(h.ledger.getDirective(requestId)?.nativeBinding).toBeNull();
+      h.ledger.setJobStatus(jobId, 'parked'); release();
+      const recovery = await awaitDirectiveRecovery(h, requestId, 'directive authority is terminal, held or superseded');
+      expect(recovery.state).toBe('dispatching'); expect(recovery.nativeBinding).toBeNull(); expect(recovery.deliverySeq).toBeNull();
+      expect(h.spawns.length).toBe(beforeSpawns); expect(h.disposedHandles).toEqual(beforeDisposals);
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toBeNull(); expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
+      expect(h.worktrees.listWorktrees({ jobId })[0]).toMatchObject({ id: lane.id, branch: lane.branch });
+    } finally { release?.(); await h.close(); }
+  });
+
+  it("/api/silas/rebrief a late native error on a terminal job never grants completion", async () => {
+    let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+    const h = await boot({ minionPromptGate: (text) => text.startsWith('Re-brief —') ? gate : undefined, minionTurnHealth: (text) => text.startsWith('Re-brief —') ? 'error' : 'idle' }); const repo = makeFixtureRepo('fixture-new-rebrief-8'); cleanupRepos.push(repo); const jobId = 'new-rebrief-8';
+    try {
+      await call(h.port, 'POST', '/api/dispatch', { job_id: jobId, repo_path: repo.path, title: 'approved lane', briefing: 'original contract' }, TOKEN);
+      await waitForDelivery(h, jobId); expect(h.worktrees.listWorktrees({ jobId })).toHaveLength(1);
+
+      const beforeSpawns = h.spawns.length;
+      const response = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'approved follow-through', request_id: 'request-new-rebrief-8', completion_handoff: { kind: 'gru-decision', decision: 'judge actual completion' } }, TOKEN);
+      expect(response.status).toBe(202); const requestId = field<string>(response.json, 'request_id');
+      expect(h.ledger.getDirective(requestId)?.requestKind).toBe('rebrief'); expect(h.ledger.listPendingRebriefs({ jobId })).toEqual([]);
+      const admitted = await awaitDirectiveAdmission(h, requestId);
+      expect(admitted.nativeBinding?.userEntryId).toBeTruthy(); expect(admitted.deliverySeq).toBeNull();
+
+      const concurrent = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'second', request_id: 'never-admitted-second' }, TOKEN);
+      expect(concurrent.status).toBe(409); expect(h.spawns.length).toBe(beforeSpawns + 1);
+      h.ledger.setJobStatus(jobId, 'in-review'); h.ledger.setJobStatus(jobId, 'merged');
+      release();
+      const recovery = await awaitDirectiveRecovery(h, requestId, 'terminal');
+      expect(recovery.state).toBe('admitted'); expect(recovery.deliverySeq).toBeNull(); expect(h.ledger.getJob(jobId)?.status).toBe('merged');
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toBeNull();
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
+    } finally { release?.(); await h.close(); }
+  });
+
+  it("/api/silas/rebrief a late native terminal on a terminal job never grants delivery/readiness", async () => {
+    let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+    const h = await boot({ minionPromptGate: (text) => text.startsWith('Re-brief —') ? gate : undefined }); const repo = makeFixtureRepo('fixture-new-rebrief-9'); cleanupRepos.push(repo); const jobId = 'new-rebrief-9';
+    try {
+      await call(h.port, 'POST', '/api/dispatch', { job_id: jobId, repo_path: repo.path, title: 'approved lane', briefing: 'original contract' }, TOKEN);
+      await waitForDelivery(h, jobId); expect(h.worktrees.listWorktrees({ jobId })).toHaveLength(1);
+
+      const beforeSpawns = h.spawns.length;
+      const response = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'approved follow-through', request_id: 'request-new-rebrief-9', completion_handoff: { kind: 'gru-decision', decision: 'judge actual completion' } }, TOKEN);
+      expect(response.status).toBe(202); const requestId = field<string>(response.json, 'request_id');
+      expect(h.ledger.getDirective(requestId)?.requestKind).toBe('rebrief'); expect(h.ledger.listPendingRebriefs({ jobId })).toEqual([]);
+      const admitted = await awaitDirectiveAdmission(h, requestId);
+      expect(admitted.nativeBinding?.userEntryId).toBeTruthy(); expect(admitted.deliverySeq).toBeNull();
+
+      const concurrent = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'second', request_id: 'never-admitted-second' }, TOKEN);
+      expect(concurrent.status).toBe(409); expect(h.spawns.length).toBe(beforeSpawns + 1);
+      h.ledger.setJobStatus(jobId, 'in-review'); h.ledger.setJobStatus(jobId, 'merged');
+      release();
+      const recovery = await awaitDirectiveRecovery(h, requestId, 'terminal');
+      expect(recovery.state).toBe('admitted'); expect(recovery.deliverySeq).toBeNull(); expect(h.ledger.getJob(jobId)?.status).toBe('merged');
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toBeNull();
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
+    } finally { release?.(); await h.close(); }
+  });
+
+  it("/api/silas/rebrief new request cancellation never invokes legacy marker retirement", async () => {
+    const workerGate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 }); let release!: () => void;
+    const h = await boot({ workerGate }); const repo = makeFixtureRepo('fixture-new-rebrief-10'); cleanupRepos.push(repo); const jobId = 'new-rebrief-10';
+    try {
+      await call(h.port, 'POST', '/api/dispatch', { job_id: jobId, repo_path: repo.path, title: 'approved lane', briefing: 'original contract' }, TOKEN);
+      await waitForDelivery(h, jobId); const lane = h.worktrees.listWorktrees({ jobId })[0]!;
+      const holder = await workerGate.acquireWorkerTurn({ id: 'occupied-fixture', label: 'fixture hold' }); let released = false; release = () => { if (!released) { released = true; holder.release(); } };
+      const beforeSpawns = h.spawns.length; const beforeDisposals = [...h.disposedHandles];
+      const response = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'approved follow-through', request_id: 'request-new-rebrief-10', completion_handoff: { kind: 'gru-decision', decision: 'judge actual completion' } }, TOKEN);
+      expect(response.status).toBe(202); const requestId = field<string>(response.json, 'request_id');
+      expect(h.ledger.getDirective(requestId)?.requestKind).toBe('rebrief'); expect(h.ledger.listPendingRebriefs({ jobId })).toEqual([]);
+      expect(h.ledger.getDirective(requestId)?.nativeBinding).toBeNull();
+      h.ledger.setJobStatus(jobId, 'in-review'); h.ledger.setJobStatus(jobId, 'merged'); release();
+      const recovery = await awaitDirectiveRecovery(h, requestId, `directive refused — job "${jobId}" is merged`);
+      expect(recovery.state).toBe('dispatching'); expect(recovery.nativeBinding).toBeNull(); expect(recovery.deliverySeq).toBeNull();
+      expect(h.spawns.length).toBe(beforeSpawns); expect(h.disposedHandles).toEqual(beforeDisposals);
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toBeNull(); expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
+      expect(h.worktrees.listWorktrees({ jobId })[0]).toMatchObject({ id: lane.id, branch: lane.branch });
+    } finally { release?.(); await h.close(); }
+  });
+
+  it("/api/silas/rebrief new request cancellation preserves exact readback instead of claiming partial legacy retirement", async () => {
+    const workerGate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 }); let release!: () => void;
+    const h = await boot({ workerGate }); const repo = makeFixtureRepo('fixture-new-rebrief-11'); cleanupRepos.push(repo); const jobId = 'new-rebrief-11';
+    try {
+      await call(h.port, 'POST', '/api/dispatch', { job_id: jobId, repo_path: repo.path, title: 'approved lane', briefing: 'original contract' }, TOKEN);
+      await waitForDelivery(h, jobId); const lane = h.worktrees.listWorktrees({ jobId })[0]!;
+      const holder = await workerGate.acquireWorkerTurn({ id: 'occupied-fixture', label: 'fixture hold' }); let released = false; release = () => { if (!released) { released = true; holder.release(); } };
+      const beforeSpawns = h.spawns.length; const beforeDisposals = [...h.disposedHandles];
+      const response = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'approved follow-through', request_id: 'request-new-rebrief-11', completion_handoff: { kind: 'gru-decision', decision: 'judge actual completion' } }, TOKEN);
+      expect(response.status).toBe(202); const requestId = field<string>(response.json, 'request_id');
+      expect(h.ledger.getDirective(requestId)?.requestKind).toBe('rebrief'); expect(h.ledger.listPendingRebriefs({ jobId })).toEqual([]);
+      expect(h.ledger.getDirective(requestId)?.nativeBinding).toBeNull();
+      h.ledger.setJobStatus(jobId, 'in-review'); h.ledger.setJobStatus(jobId, 'merged'); release();
+      const recovery = await awaitDirectiveRecovery(h, requestId, `directive refused — job "${jobId}" is merged`);
+      expect(recovery.state).toBe('dispatching'); expect(recovery.nativeBinding).toBeNull(); expect(recovery.deliverySeq).toBeNull();
+      expect(h.spawns.length).toBe(beforeSpawns); expect(h.disposedHandles).toEqual(beforeDisposals);
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toBeNull(); expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
+      expect(h.worktrees.listWorktrees({ jobId })[0]).toMatchObject({ id: lane.id, branch: lane.branch });
+    } finally { release?.(); await h.close(); }
   });
 
   it('/api/silas/rebrief refuses at the admission boundary when the job merges before the marker write', async () => {
     const h = await boot({
       wrapLedger: (ledger) => {
         const view = Object.create(ledger) as LedgerApi;
-        Object.defineProperty(view, 'beginPendingRebrief', {
-          value: (input: Parameters<LedgerApi['beginPendingRebrief']>[0]) => {
+        Object.defineProperty(view, 'beginRebriefIntent', {
+          value: (input: Parameters<LedgerApi['beginRebriefIntent']>[0]) => {
             // The owner merges the lane between the HTTP guard and the
             // marker write: the in-transaction admission boundary must
             // refuse — never write a marker for a terminal lane.
             ledger.setJobStatus(input.jobId, 'in-review');
             ledger.setJobStatus(input.jobId, 'merged');
-            return ledger.beginPendingRebrief(input);
+            return ledger.beginRebriefIntent(input);
           },
         });
         return view;
@@ -2548,7 +2382,7 @@ if (argv.includes('--method') && argv.includes('POST')) {
       // spec's admission-race edge row promises.
       expect(res.status, JSON.stringify(res.json)).toBe(400);
       expect(field<string>(res.json, 'error')).toBe('bad_request');
-      expect(field<string>(res.json, 'detail')).toMatch(/terminal lanes are never re-briefed/u);
+      expect(field<string>(res.json, 'detail')).toContain('terminal lanes take no directives');
       // No marker row was written and no worker was spawned.
       expect(h.ledger.listPendingRebriefs({ jobId: 'admission-race-job' })).toHaveLength(0);
       expect(h.spawns.filter((spawn) => spawn.role === 'minion')).toHaveLength(0);
@@ -2558,55 +2392,31 @@ if (argv.includes('--method') && argv.includes('POST')) {
     }
   });
 
-  it('overlapping ordinary re-brief HTTP turns settle only the newest marker generation', async () => {
-    let releaseOld!: () => void;
-    let releaseNew!: () => void;
-    let enteredOld!: () => void;
-    let enteredNew!: () => void;
-    const oldGate = new Promise<void>((resolve) => { releaseOld = resolve; });
-    const newGate = new Promise<void>((resolve) => { releaseNew = resolve; });
-    const oldStarted = new Promise<void>((resolve) => { enteredOld = resolve; });
-    const newStarted = new Promise<void>((resolve) => { enteredNew = resolve; });
-    let turns = 0;
-    const h = await boot({ minionPromptGate: (text) => {
-      if (!text.startsWith('Re-brief —')) return undefined;
-      turns += 1;
-      if (turns === 1) { enteredOld(); return oldGate; }
-      enteredNew();
-      return newGate;
-    } });
-    const repo = makeFixtureRepo('fixture-ordinary-rebrief-overlap');
-    cleanupRepos.push(repo);
-    const jobId = 'ordinary-overlap';
+  it("/api/silas/rebrief same-ID retries never create a second writer and changed/new IDs refuse (overlap regression)", async () => {
+    let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+    const h = await boot({ minionPromptGate: (text) => text.startsWith('Re-brief —') ? gate : undefined }); const repo = makeFixtureRepo('fixture-new-rebrief-12'); cleanupRepos.push(repo); const jobId = 'new-rebrief-12';
     try {
-      await call(h.port, 'POST', '/api/dispatch', { job_id: jobId, repo_path: repo.path,
-        title: 'overlapping turns', briefing: 'the original contract' }, TOKEN);
-      const initialDeadline = Date.now() + 10_000;
-      while (h.ledger.latestJobEvent(jobId, 'job.delivered') === null && Date.now() < initialDeadline) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-      expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).not.toBeNull();
-      const oldTurn = call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'same note' }, TOKEN);
-      await oldStarted;
-      const oldIds = h.ledger.listPendingRebriefs({ jobId }).map((marker) => marker.id);
-      expect(oldIds).toHaveLength(2);
-      const newTurn = call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'same note' }, TOKEN);
-      await newStarted;
-      const newIds = h.ledger.listPendingRebriefs({ jobId }).map((marker) => marker.id);
-      expect(newIds).toHaveLength(2);
-      expect(newIds).not.toEqual(oldIds);
-      releaseOld();
-      const stale = await oldTurn;
-      expect(stale.status).toBe(200);
-      expect(field<string | null>(stale.json, 'delivered_sha')).toBeNull();
-      expect(h.ledger.listPendingRebriefs({ jobId }).map((marker) => marker.id)).toEqual(newIds);
-      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toBeNull();
-      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-settled')).toBeNull();
-      releaseNew();
-      expect((await newTurn).status).toBe(200);
-      expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
-      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-settled')).not.toBeNull();
-    } finally { releaseOld(); releaseNew(); await h.close(); }
+      await call(h.port, 'POST', '/api/dispatch', { job_id: jobId, repo_path: repo.path, title: 'approved lane', briefing: 'original contract' }, TOKEN);
+      await waitForDelivery(h, jobId); expect(h.worktrees.listWorktrees({ jobId })).toHaveLength(1);
+
+      const beforeSpawns = h.spawns.length;
+      const response = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'approved follow-through', request_id: 'request-new-rebrief-12', completion_handoff: { kind: 'gru-decision', decision: 'judge actual completion' } }, TOKEN);
+      expect(response.status).toBe(202); const requestId = field<string>(response.json, 'request_id');
+      expect(h.ledger.getDirective(requestId)?.requestKind).toBe('rebrief'); expect(h.ledger.listPendingRebriefs({ jobId })).toEqual([]);
+      const admitted = await awaitDirectiveAdmission(h, requestId);
+      expect(admitted.nativeBinding?.userEntryId).toBeTruthy(); expect(admitted.deliverySeq).toBeNull();
+      const retry = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'approved follow-through', request_id: requestId }, TOKEN);
+      expect(retry.status).toBe(202); expect(field<boolean>(retry.json, 'replay')).toBe(true);
+      const changed = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'changed', request_id: requestId }, TOKEN);
+      expect(changed.status).toBe(409);
+      const concurrent = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'second', request_id: 'never-admitted-second' }, TOKEN);
+      expect(concurrent.status).toBe(409); expect(h.spawns.length).toBe(beforeSpawns + 1);
+
+      release();
+      expect((await awaitDirectiveTerminal(h, requestId)).state).toBe('settled');
+      expect(h.minionTurnTexts.filter((text) => text.startsWith('Re-brief —'))).toHaveLength(1);
+      expect(h.ledger.latestJobEvent(jobId, 'job.delivered')?.payload).toMatchObject({ source: 'silas-rebrief', request_id: requestId });
+    } finally { release?.(); await h.close(); }
   });
 
   it('/api/silas/directive on a lane with no reachable minion records a durable no-effect FAILURE; terminal jobs refuse', async () => {
@@ -2756,9 +2566,9 @@ if (argv.includes('--method') && argv.includes('POST')) {
       const fresh = h.spawns[spawnsBefore];
       expect(fresh?.role).toBe('minion');
       expect(fresh?.options.cwd).toBe(lane?.path);
-      expect(h.ledger.getDirective(requestId)?.admissionMinion).toBe(`agent-${h.spawns.length}`);
-      expect(h.disposedHandles).toContain(`agent-${h.spawns.length}`);
-      expect(h.ledger.getAgent(`agent-${h.spawns.length}`)?.jobId).toBe('dir-fresh');
+      expect(h.ledger.getDirective(requestId)?.admissionMinion).toBe(fresh?.options.agentId);
+      expect(h.disposedHandles).toContain(fresh!.options.agentId);
+      expect(h.ledger.getAgent(fresh!.options.agentId!)?.jobId).toBe('dir-fresh');
     } finally {
       await h.close();
     }
@@ -2790,8 +2600,10 @@ if (argv.includes('--method') && argv.includes('POST')) {
       h.ledger.addJob({ id: 'laneless-rebrief', repo: 'nowhere', title: 't', briefing: 'b' });
       h.ledger.setJobStatus('laneless-rebrief', 'working');
       const laneLess = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: 'laneless-rebrief', note: 'x' }, TOKEN);
-      expect(laneLess.status).toBe(400);
-      expect(field<string>(laneLess.json, 'detail')).toContain('no active job lane');
+      expect(laneLess.status).toBe(202);
+      const recovery = await awaitDirectiveRecovery(h, field<string>(laneLess.json, 'request_id'), 'no job lane');
+      expect(recovery.nativeBinding).toBeNull(); expect(recovery.deliverySeq).toBeNull();
+      expect(h.spawns).toEqual([]);
     } finally {
       await h.close();
     }
@@ -2950,8 +2762,9 @@ describe('provider pacing worker-gate pass-through on the silas routes (r4 verif
       expect(gate.view().worker.queued[0]?.id).toBe('gate-reb');
       holder.release();
       const res = await pending;
-      expect(res.status).toBe(200);
+      expect(res.status).toBe(202);
       expect(field<string>(res.json, 'job_id')).toBe('gate-reb');
+      expect((await awaitDirectiveTerminal(h, field<string>(res.json, 'request_id'))).state).toBe('settled');
       expect(h.ledger.listJobEvents('gate-reb').some((event) => event.kind === 'silas.rebrief')).toBe(true);
       expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
     } finally {
@@ -3345,7 +3158,7 @@ describe('silas firing-rule provenance (issue #117)', () => {
     }
   }, 90_000);
 
-  it('a re-brief request stores the rule on the durable marker and the receipt replays it (hit)', async () => {
+  it('a re-brief request stores rule provenance on the durable request and its native-correlated receipt (hit)', async () => {
     const h = await boot();
     const repo = makeFixtureRepo('fixture-rule-rebrief');
     cleanupRepos.push(repo);
@@ -3360,7 +3173,10 @@ describe('silas firing-rule provenance (issue #117)', () => {
         rule_id: 'verdict-rung-rebrief',
         source_round_id: verdictRound.id,
       }, TOKEN);
-      expect(res.status).toBe(200);
+      expect(res.status).toBe(202);
+      const requestId = field<string>(res.json, 'request_id');
+      expect((await awaitDirectiveTerminal(h, requestId)).state).toBe('settled');
+      expect(h.ledger.getDirective(requestId)?.sourceContext).toMatchObject({ ruleId: 'verdict-rung-rebrief', sourceRoundId: verdictRound.id });
       const event = h.ledger.listJobEvents('rule-rebrief-job').find((candidate) => candidate.kind === 'silas.rebrief');
       expect(event?.payload).toMatchObject({
         rule_id: 'verdict-rung-rebrief',

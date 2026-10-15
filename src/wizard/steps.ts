@@ -19,7 +19,7 @@ import {
   renderReferenceConfig,
   tomlString,
 } from '../config-reference.js';
-import type { WizardAnswers } from './answers.js';
+import { DEFAULT_NEW_INSTALL_RUNTIME, type WizardAnswers } from './answers.js';
 
 export { tomlString, discoverManagedRepos };
 
@@ -188,7 +188,7 @@ export function loadExistingInstanceConfig(instanceDir: string): GruCommandConfi
  * prompt defaults; explicit answers and non-default picks always win). */
 const PROMPT_DEFAULTS = {
   workspaceRoot: '~/code',
-  runtime: 'pi' as const,
+  runtime: DEFAULT_NEW_INSTALL_RUNTIME,
   model: 'default',
   thinkingLevel: 'default',
   host: '127.0.0.1',
@@ -264,4 +264,33 @@ export function writeInstanceConfig(options: {
   }
   const text = generateConfigToml({ answers: seeded, instanceDir: options.instanceDir, prior });
   return writeConfigText(options.instanceDir, text, { force: options.force });
+}
+
+/**
+ * Interrupted-setup draft (#33): the collected interactive answers, saved
+ * the moment collection finishes and removed once the config is written. A
+ * port conflict (or any other later abort) therefore never costs the
+ * operator a full re-entry. The file holds the pairing token, so it is
+ * owner-only (0600) inside the 0700 instance directory.
+ */
+export function wizardDraftPath(instanceDir: string): string {
+  return join(instanceDir, 'wizard-draft.json');
+}
+
+export function saveWizardDraft(instanceDir: string, draftJson: string): string {
+  mkdirSync(instanceDir, { recursive: true, mode: 0o700 });
+  const path = wizardDraftPath(instanceDir);
+  writeFileSync(path, draftJson, { encoding: 'utf-8', mode: 0o600 });
+  chmodSync(path, 0o600);
+  return path;
+}
+
+/** The saved draft text, or null when none exists. Unreadable files throw. */
+export function loadWizardDraft(instanceDir: string): string | null {
+  const path = wizardDraftPath(instanceDir);
+  return existsSync(path) ? readFileSync(path, 'utf-8') : null;
+}
+
+export function clearWizardDraft(instanceDir: string): void {
+  rmSync(wizardDraftPath(instanceDir), { force: true });
 }

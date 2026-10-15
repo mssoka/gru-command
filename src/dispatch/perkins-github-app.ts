@@ -2,7 +2,7 @@ import { createHash, createPrivateKey, createSign } from 'node:crypto';
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import type { PostedReviewReceipt, PrIdentity, VerdictPoster, VerdictPosterInput, VerdictReconcileContext } from './perkins.js';
-import { AutoVerdictPoster, cancelAwareSignal, enactedStateFor, GhPrPoster, verifyPostedReceipt } from './perkins.js';
+import { AutoVerdictPoster, cancelAwareSignal, DefiniteNonDeliveryError, enactedStateFor, GhPrPoster, verifyPostedReceipt } from './perkins.js';
 import { repoRemote } from './review-path.js';
 
 /**
@@ -492,6 +492,10 @@ const API_HEADERS = {
   'X-GitHub-Api-Version': '2022-11-28',
 } as const;
 
+/** Minimum remaining installation-token lifetime, checked at mint and again
+ * immediately before the review POST. */
+const TOKEN_MIN_REMAINING_MS = 30_000;
+
 interface TokenGrant {
   readonly token: string;
   readonly expiresAtMs: number;
@@ -616,11 +620,14 @@ function isMatchingAppReviewWithUnverifiableTime(review: ProviderReview, botLogi
  * absent otherwise): an unprovable time on OUR publication is held by the
  * recency rules on its own, and an unrelated review's absent time is not a
  * delivery predicate. */
-function isDecidableReviewEntry(entry: unknown): entry is ProviderReview {
+function isDecidableReviewEntry(entry: unknown, windowed: boolean): entry is ProviderReview {
   if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return false;
   const record = entry as Record<string, unknown>;
   const id = record['id'];
-  if (typeof id !== 'number' || !Number.isFinite(id)) return false;
+  // The same id contract the receipt uses: a finite number, or a bounded
+  // provider-quoted id (so a quoted-id match is decidable and creditable).
+  // Any other string stays malformed and never proves absence.
+  if (!(typeof id === 'number' && Number.isFinite(id)) && !(typeof id === 'string' && usableProviderReviewId(id) !== null)) return false;
   if (!('user' in record)) return false;
   const user = record['user'];
   if (user !== null) {
@@ -638,8 +645,11 @@ function isDecidableReviewEntry(entry: unknown): entry is ProviderReview {
   for (const field of ['state', 'commit_id', 'body'] as const) {
     if (typeof record[field] !== 'string') return false;
   }
+  // submitted_at is a delivery predicate only under a recency bound (the
+  // ambiguous-POST window); the unbounded recovery seam never reads it.
+  // An omitted submitted_at is undecidable there (main's #182 rule).
   const submittedAt = record['submitted_at'];
-  if (!(submittedAt === null || submittedAt === undefined || typeof submittedAt === 'string')) return false;
+  if (windowed && !(submittedAt === null || typeof submittedAt === 'string')) return false;
   return true;
 }
 
@@ -768,6 +778,9 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       throw new PerkinsAppError('review delivery cancelled before the irreversible POST — no review was created');
     }
     const postStartMs = this.now();
+    if (grant.expiresAtMs <= postStartMs + TOKEN_MIN_REMAINING_MS) {
+      throw new DefiniteNonDeliveryError('installation token expired or expires too soon before the review POST (it was valid when minted; the pre-POST identity and head probes outlasted it) — review not delivered; no POST was sent');
+    }
     let review: unknown;
     try {
       review = (await this.callApi('POST review delivery', `${API_ROOT}/repos/${owner}/${repo}/pulls/${prNumber}/reviews`, {
@@ -1046,7 +1059,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       throw new PerkinsAppError('installation token response did not contain a token — review not delivered');
     }
     const expiresAt = typeof parsed?.expires_at === 'string' ? Date.parse(parsed.expires_at) : Number.NaN;
-    if (!Number.isFinite(expiresAt) || expiresAt <= nowMs + 30_000) {
+    if (!Number.isFinite(expiresAt) || expiresAt <= nowMs + TOKEN_MIN_REMAINING_MS) {
       throw new PerkinsAppError('installation token is already expired or expires too soon — review not delivered');
     }
     const granted = parsed?.permissions?.['pull_requests'];
@@ -1400,14 +1413,19 @@ export class PerkinsAppPrPoster implements VerdictPoster {
         // Never report "searched and not found" when no usable list was read.
         throw new PerkinsAppError('review reconciliation lookup returned a malformed list body — delivery stays unresolved; never assume absence');
       }
-      if (list.some((entry) => !isDecidableReviewEntry(entry))) {
-        // A null, primitive, array-valued or otherwise undecidable entry is
-        // a broken list, not absence: a lookup we cannot trust must never
-        // become a certificate.
+      // Positive evidence first: a predicate-complete, receiptable review is
+      // credited even when an unrelated sibling entry is malformed — the
+      // match proves delivery on its own. Only plain records are searched;
+      // the predicates re-check every field they read.
+      const records = list.filter((entry): entry is ProviderReview => entry !== null && typeof entry === 'object' && !Array.isArray(entry));
+      const match = records.find((review) => isMatchingAppReview(review, botLogin, targetSha, body, wantedState, notBeforeMs));
+      if (match === undefined && list.some((entry) => !isDecidableReviewEntry(entry, notBeforeMs !== null))) {
+        // No provable match, and a null, primitive, array-valued or
+        // otherwise undecidable entry is a broken list, not absence: a
+        // lookup we cannot trust must never become a certificate.
         throw new PerkinsAppError('review reconciliation lookup returned a malformed list body — delivery stays unresolved; never assume absence');
       }
-      const reviews = list as readonly ProviderReview[];
-      const match = reviews.find((review) => isMatchingAppReview(review, botLogin, targetSha, body, wantedState, notBeforeMs));
+      const reviews = records;
       if (match !== undefined) {
         return { matched: match, provablyAbsent: false, matchedButUnreceiptable: false, matchedButWrongState: null };
       }

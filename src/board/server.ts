@@ -598,6 +598,32 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
           if (title === '' || title.length > 500 || detail === '' || detail.length > 4_000) {
             throw new Error('owner escalation title (1-500) and detail (1-4000) must be non-blank');
           }
+          // Retry identity (decision #100, 2026-10-12): an optional client-
+          // supplied idempotency key names ONE escalation. The same key with
+          // the same title/detail returns the existing row (200, no second
+          // FOR YOU item or bell); the same key with a changed request is
+          // refused (409). Without a key every request is a distinct decision.
+          const rawKey = body.idempotencyKey;
+          if (rawKey !== undefined && (typeof rawKey !== 'string' || !/^[A-Za-z0-9._:-]{1,128}$/.test(rawKey))) {
+            throw new Error('idempotencyKey must be 1-128 chars of [A-Za-z0-9._:-]');
+          }
+          if (typeof rawKey === 'string') {
+            const id = `owner-escalation:${rawKey}`;
+            const existing = ledger.getNotification(id);
+            if (existing !== null) {
+              if (existing.title !== title || existing.detail !== detail) {
+                json(res, 409, {
+                  error: 'idempotency_conflict',
+                  detail: `idempotencyKey "${rawKey}" already names a different escalation; use a new key for a new decision`,
+                });
+                return;
+              }
+              json(res, 200, existing);
+              return;
+            }
+            json(res, 201, notifications.post({ id, kind: 'gru.owner-escalation', routing: 'needs-owner', severity: 'error', title, detail }));
+            return;
+          }
           const row = notifications.post({ kind: 'gru.owner-escalation', routing: 'needs-owner', severity: 'error', title, detail });
           json(res, 201, row);
           return;
@@ -626,6 +652,15 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
           }
           if (suffix === '/disposition') {
             const detail = strField(body, 'detail');
+            // The board has ONE shared bearer for owner and agent callers, so
+            // the credential proves "a paired caller", not "Gru". A caller may
+            // declare its actor; only 'gru' is a valid declaration for a
+            // machine disposition, and the audit labels it caller-declared.
+            const declaredActor = optStrField(body, 'actor') ?? null;
+            if (declaredActor !== null && declaredActor !== 'gru') {
+              json(res, 400, { error: 'bad_request', detail: `actor "${declaredActor}" cannot produce a Gru disposition; omit actor or declare "gru"` });
+              return;
+            }
             const target = ledger.getNotification(id);
             const closer = target === null ? null : producerResolvedBy(target.kind);
             if (target !== null && closer !== null) {
@@ -636,7 +671,7 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
               });
               return;
             }
-            const row = ledger.disposeMachineNotification(id, detail);
+            const row = ledger.disposeMachineNotification(id, detail, { credential: 'shared-bearer', declaredActor });
             if (row === null) {
               json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });
               return;

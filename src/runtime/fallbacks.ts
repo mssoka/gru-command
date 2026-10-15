@@ -77,6 +77,9 @@ class FallbackHandle implements AgentHandle {
   readonly isCompacting?: () => boolean;
   readonly hasLiveProcess?: () => boolean;
   readonly pendingTurn?: () => PendingTurn | null;
+  readonly prepareDirectiveProducer?: AgentHandle['prepareDirectiveProducer'];
+  readonly inspectDirective?: AgentHandle['inspectDirective'];
+  readonly resumeDirective?: AgentHandle['resumeDirective'];
 
   /** A turn is being delivered by THIS pipeline (set+clear per-path only). */
   private inFlight = false;
@@ -111,6 +114,19 @@ class FallbackHandle implements AgentHandle {
     if (inner.pendingTurn !== undefined) {
       this.pendingTurn = () => inner.pendingTurn!();
     }
+    if (inner.prepareDirectiveProducer !== undefined) this.prepareDirectiveProducer = (identity) => {
+      this.assertLive();
+      if (this.busy || this.queue.length > 0) throw new Error('native directive producer requires an idle, unqueued session');
+      return inner.prepareDirectiveProducer!(identity);
+    };
+    if (inner.inspectDirective !== undefined) this.inspectDirective = (identity) => inner.inspectDirective!(identity);
+    if (inner.resumeDirective !== undefined) this.resumeDirective = async (identity, checkpointId, beforeContinuation, claimContinuation) => {
+      this.assertLive();
+      if (this.busy || this.queue.length > 0) throw new Error('directive continuation requires an idle, unqueued session');
+      this.inFlight = true;
+      try { return await inner.resumeDirective!(identity, checkpointId, beforeContinuation, claimContinuation); }
+      finally { this.inFlight = false; void this.pump(); }
+    };
     if (inner.getContextUsage !== undefined) {
       this.getContextUsage = () => inner.getContextUsage!();
     }

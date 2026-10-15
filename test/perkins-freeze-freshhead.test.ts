@@ -1,3 +1,4 @@
+import { issueFixtureHandoff } from './helpers/fixture-handoff.js';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
@@ -41,6 +42,7 @@ class LaneWorktreePort implements WorktreePort {
   constructor(
     private readonly delegate: GitReviewPort,
     private readonly lanePath: string,
+    private readonly ledger: LedgerApi,
   ) {}
 
   private withLanePath(lane: WorktreeLane): WorktreeLane {
@@ -49,7 +51,7 @@ class LaneWorktreePort implements WorktreePort {
 
   async createJobWorktree(input: { repoPath: string; jobId: string }): Promise<WorktreeLane> {
     const lane = await this.delegate.createJobWorktree(input);
-    this.jobLane = { ...lane, path: this.lanePath };
+    this.jobLane = issueFixtureHandoff({ ...lane, path: this.lanePath }, this.ledger);
     return this.jobLane;
   }
 
@@ -174,7 +176,7 @@ describe('fresh PR head resolution (freeze source of truth)', () => {
     });
     expect(fresh.targetSha).toBe(tip);
     expect(fresh.prHeadSha).toBe(tip);
-    expect(fresh.movementRef).toBe('origin/feature/lane');
+    expect(fresh.movementRef).toBe('refs/remotes/origin/feature/lane');
     expect(repo.git(['rev-parse', 'refs/remotes/origin/feature/lane'])).toBe(tip);
     // The recorded local ref is a hint only: it is never rewritten.
     expect(repo.git(['rev-parse', 'refs/heads/feature/lane'])).toBe(stale);
@@ -194,7 +196,7 @@ describe('fresh PR head resolution (freeze source of truth)', () => {
       probe: fixedProbe('feature/lane', tip),
     });
     expect(fresh.targetSha).toBe(tip);
-    expect(fresh.movementRef).toBe('origin/feature/lane');
+    expect(fresh.movementRef).toBe('refs/remotes/origin/feature/lane');
   });
 
   it('rejects a fetched tip that disagrees with the live code-host head', async () => {
@@ -235,7 +237,7 @@ describe('fresh PR head resolution (freeze source of truth)', () => {
     });
     expect(fresh.prHeadRefName).toBe('gru/pr-head');
     expect(fresh.targetSha).toBe(tip);
-    expect(fresh.movementRef).toBe('origin/gru/pr-head');
+    expect(fresh.movementRef).toBe('refs/remotes/origin/gru/pr-head');
     expect(repo.git(['rev-parse', 'refs/remotes/origin/gru/pr-head'])).toBe(tip);
   });
 
@@ -312,7 +314,7 @@ describe('freeze-time integration on PR rounds', () => {
     const artifacts = tempDir('gru-freeze-artifacts-');
     const sessions = tempDir('gru-freeze-sessions-');
     const ledger = makeLedger();
-    const port = new GitReviewPort(root, 'feature/lane', stale);
+    const port = new GitReviewPort(root, 'feature/lane', stale, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-fresh' });
     const job = ledger.addJob({
       id: 'job-fresh', repo: 'fixture', title: 'fresh head', baseBranch: 'main',
@@ -344,7 +346,7 @@ describe('freeze-time integration on PR rounds', () => {
       readFileSync(join(artifacts, outcome.round.id, 'manifest.json'), 'utf8'),
     ) as { readonly targetSha: string; readonly targetRef: string };
     expect(manifest.targetSha).toBe(tip);
-    expect(manifest.targetRef).toBe('origin/feature/lane');
+    expect(manifest.targetRef).toBe('refs/remotes/origin/feature/lane');
     expect(poster.post).toHaveBeenCalledTimes(1);
     expect(poster.post.mock.calls[0]![0]).toMatchObject({ targetSha: tip });
   });
@@ -354,7 +356,7 @@ describe('freeze-time integration on PR rounds', () => {
     const root = tempDir('gru-freeze-abort-port-');
     const artifacts = tempDir('gru-freeze-abort-artifacts-');
     const ledger = makeLedger();
-    const port = new GitReviewPort(root, 'feature/lane', stale);
+    const port = new GitReviewPort(root, 'feature/lane', stale, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-abort' });
     const job = ledger.addJob({
       id: 'job-abort', repo: 'fixture', title: 'mystery sha', baseBranch: 'main',
@@ -398,7 +400,7 @@ describe('freeze-time integration on PR rounds', () => {
     const artifacts = tempDir('gru-freeze-pin-artifacts-');
     const sessions = tempDir('gru-freeze-pin-sessions-');
     const ledger = makeLedger();
-    const port = new GitReviewPort(root, 'feature/lane', pin);
+    const port = new GitReviewPort(root, 'feature/lane', pin, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-pin' });
     const job = ledger.addJob({
       id: 'job-pin', repo: 'fixture', title: 'pinned target', baseBranch: 'main',
@@ -446,7 +448,7 @@ describe('freeze-time integration on PR rounds', () => {
     const artifacts = tempDir('gru-freeze-prhead-artifacts-');
     const sessions = tempDir('gru-freeze-prhead-sessions-');
     const ledger = makeLedger();
-    const port = new GitReviewPort(root, 'gru/job-rebase', laneSha);
+    const port = new GitReviewPort(root, 'gru/job-rebase', laneSha, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-rebase' });
     const job = ledger.addJob({
       id: 'job-rebase', repo: 'fixture', title: 'rebase lane', baseBranch: 'main',
@@ -479,7 +481,7 @@ describe('freeze-time integration on PR rounds', () => {
       readFileSync(join(artifacts, outcome.round.id, 'manifest.json'), 'utf8'),
     ) as { readonly targetSha: string; readonly targetRef: string };
     expect(manifest.targetSha).toBe(tip);
-    expect(manifest.targetRef).toBe('origin/feature/pr-head');
+    expect(manifest.targetRef).toBe('refs/remotes/origin/feature/pr-head');
     expect(poster.post).toHaveBeenCalledTimes(1);
   });
 
@@ -493,7 +495,7 @@ describe('freeze-time integration on PR rounds', () => {
     const artifacts = tempDir('gru-freeze-nopr-artifacts-');
     const sessions = tempDir('gru-freeze-nopr-sessions-');
     const ledger = makeLedger();
-    const port = new GitReviewPort(root, 'feature/lane', laneSha);
+    const port = new GitReviewPort(root, 'feature/lane', laneSha, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-no-pr' });
     const job = ledger.addJob({
       id: 'job-no-pr', repo: 'fixture', title: 'no pr', baseBranch: 'main',
@@ -519,7 +521,7 @@ describe('freeze-time integration on PR rounds', () => {
       readFileSync(join(artifacts, outcome.round.id, 'manifest.json'), 'utf8'),
     ) as { readonly targetSha: string; readonly targetRef: string };
     expect(manifest.targetSha).toBe(laneSha);
-    expect(manifest.targetRef).toBe('feature/lane');
+    expect(manifest.targetRef).toBe('refs/heads/feature/lane');
   });
 
   it('a non-PR origin/topic target FREEZES the fetched tip, never the stale local tracking ref (Perkins blocker)', async () => {
@@ -607,7 +609,7 @@ describe('freeze-time integration on PR rounds', () => {
     const sessions = tempDir('gru-freeze-nopr-untracked-sessions-');
     const ledger = makeLedger();
     const laneSha = repo.git(['rev-parse', 'HEAD']);
-    const port = new GitReviewPort(root, 'feature/lane', laneSha);
+    const port = new GitReviewPort(root, 'feature/lane', laneSha, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-nopr-untracked' });
     const job = ledger.addJob({
       id: 'job-nopr-untracked', repo: 'fixture', title: 'remote-only target', baseBranch: 'main',
@@ -691,12 +693,12 @@ describe('freeze-time integration on PR rounds', () => {
     const artifacts = tempDir('gru-freeze-head-artifacts-');
     const sessions = tempDir('gru-freeze-head-sessions-');
     const ledger = makeLedger();
-    const port = new LaneWorktreePort(new GitReviewPort(root, 'feature/lane', laneCommit), lanePath);
-    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-head-lane' });
+    const port = new LaneWorktreePort(new GitReviewPort(root, 'feature/lane', laneCommit, ledger), lanePath, ledger);
     const job = ledger.addJob({
       id: 'job-head-lane', repo: 'fixture', title: 'explicit head on a diverged lane', baseBranch: 'main',
       briefing: 'Acceptance: laneAhead returns true.',
     });
+    await port.createJobWorktree({ repoPath: repo.path, jobId: job.id });
     ledger.setJobStatus(job.id, 'working');
     settleLane(ledger, job.id);
     const probe = vi.fn(async () => {
@@ -720,7 +722,7 @@ describe('freeze-time integration on PR rounds', () => {
       readFileSync(join(artifacts, outcome.round.id, 'manifest.json'), 'utf8'),
     ) as { readonly targetSha: string; readonly targetRef: string };
     expect(manifest.targetSha).toBe(laneCommit);
-    expect(manifest.targetRef).toBe('HEAD');
+    expect(manifest.targetRef).toBe('refs/heads/feature/lane');
   });
 
   it('a remote-only origin/topic on a linked PR NEVER bypasses PR-head verification — the PR head is frozen (Perkins R3)', async () => {
@@ -749,7 +751,7 @@ describe('freeze-time integration on PR rounds', () => {
     const artifacts = tempDir('gru-freeze-decoy-artifacts-');
     const sessions = tempDir('gru-freeze-decoy-sessions-');
     const ledger = makeLedger();
-    const port = new GitReviewPort(root, 'feature/lane', laneSha);
+    const port = new GitReviewPort(root, 'feature/lane', laneSha, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-decoy-topic' });
     const job = ledger.addJob({
       id: 'job-decoy-topic', repo: 'fixture', title: 'remote-only origin ref on a linked PR', baseBranch: 'main',
@@ -776,7 +778,7 @@ describe('freeze-time integration on PR rounds', () => {
       readFileSync(join(artifacts, outcome.round.id, 'manifest.json'), 'utf8'),
     ) as { readonly targetSha: string; readonly targetRef: string };
     expect(manifest.targetSha).toBe(laneSha);
-    expect(manifest.targetRef).toBe('origin/feature/lane');
+    expect(manifest.targetRef).toBe('refs/remotes/origin/feature/lane');
   });
 
   it('a FULLY-QUALIFIED revision pin (refs/remotes/origin/feature/lane~1) skips the advertised probe — a genuine qualified tracking ref keeps it (gh-169 P9)', async () => {
@@ -795,7 +797,7 @@ describe('freeze-time integration on PR rounds', () => {
     const artifacts = tempDir('gru-freeze-qualified-artifacts-');
     const sessions = tempDir('gru-freeze-qualified-sessions-');
     const ledger = makeLedger();
-    const port = new GitReviewPort(root, 'feature/lane', laneTip);
+    const port = new GitReviewPort(root, 'feature/lane', laneTip, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-pin-qualified' });
     const job = ledger.addJob({
       id: 'job-pin-qualified', repo: 'fixture', title: 'qualified revision pin', baseBranch: 'main',
@@ -864,7 +866,7 @@ describe('freeze-time integration on PR rounds', () => {
     const artifacts = tempDir('gru-freeze-expr-pr-artifacts-');
     const sessions = tempDir('gru-freeze-expr-pr-sessions-');
     const ledger = makeLedger();
-    const port = new GitReviewPort(root, 'feature/lane', laneTip);
+    const port = new GitReviewPort(root, 'feature/lane', laneTip, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-pin-expr-pr' });
     const job = ledger.addJob({
       id: 'job-pin-expr-pr', repo: 'fixture', title: 'origin-prefixed revision pin on a linked PR', baseBranch: 'main',
@@ -893,7 +895,7 @@ describe('freeze-time integration on PR rounds', () => {
       readFileSync(join(artifacts, outcome.round.id, 'manifest.json'), 'utf8'),
     ) as { readonly targetSha: string; readonly targetRef: string };
     expect(manifest.targetSha).toBe(ancestor);
-    expect(manifest.targetRef).toBe('origin/feature/lane~1');
+    expect(manifest.targetRef).toBe(ancestor); // Revision pins bind once in the source lane.
     // gh-169: a revision-expression pin is not a branch spelling — the
     // advertised-branch probe must not false-alarm it into check-failed
     // movement. The round passes admission preflight and finalizes without
@@ -925,7 +927,7 @@ describe('freeze-time integration on PR rounds', () => {
     const artifacts = tempDir('gru-freeze-expr-nopr-artifacts-');
     const sessions = tempDir('gru-freeze-expr-nopr-sessions-');
     const ledger = makeLedger();
-    const port = new GitReviewPort(root, 'feature/lane', laneTip);
+    const port = new GitReviewPort(root, 'feature/lane', laneTip, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-pin-expr-nopr' });
     const job = ledger.addJob({
       id: 'job-pin-expr-nopr', repo: 'fixture', title: 'origin-prefixed revision pin, non-PR', baseBranch: 'main',
@@ -975,7 +977,7 @@ describe('freeze-time integration on PR rounds', () => {
     const artifacts = tempDir('gru-freeze-collide-artifacts-');
     const sessions = tempDir('gru-freeze-collide-sessions-');
     const ledger = makeLedger();
-    const port = new GitReviewPort(root, 'feature/lane', laneTip);
+    const port = new GitReviewPort(root, 'feature/lane', laneTip, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-collide' });
     const job = ledger.addJob({
       id: 'job-collide', repo: 'fixture', title: 'short origin spelling colliding with a remote branch', baseBranch: 'main',
@@ -1022,7 +1024,7 @@ describe('freeze-time integration on PR rounds', () => {
     const artifacts = tempDir('gru-freeze-collideq-artifacts-');
     const sessions = tempDir('gru-freeze-collideq-sessions-');
     const ledger = makeLedger();
-    const port = new GitReviewPort(root, 'feature/lane', laneTip);
+    const port = new GitReviewPort(root, 'feature/lane', laneTip, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-collide-qualified' });
     const job = ledger.addJob({
       id: 'job-collide-qualified', repo: 'fixture', title: 'fully qualified tag pin beside a colliding remote branch', baseBranch: 'main',
@@ -1075,7 +1077,7 @@ describe('freeze-time integration on PR rounds', () => {
     const artifacts = tempDir('gru-freeze-tagpin-artifacts-');
     const sessions = tempDir('gru-freeze-tagpin-sessions-');
     const ledger = makeLedger();
-    const port = new GitReviewPort(root, 'feature/lane', laneTip);
+    const port = new GitReviewPort(root, 'feature/lane', laneTip, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-tag-pin-pr' });
     const job = ledger.addJob({
       id: 'job-tag-pin-pr', repo: 'fixture', title: 'explicit tag pin on a linked PR', baseBranch: 'main',
@@ -1104,7 +1106,7 @@ describe('freeze-time integration on PR rounds', () => {
       readFileSync(join(artifacts, outcome.round.id, 'manifest.json'), 'utf8'),
     ) as { readonly targetSha: string; readonly targetRef: string };
     expect(manifest.targetSha).toBe(tagSha);
-    expect(manifest.targetRef).toBe('origin/v1');
+    expect(manifest.targetRef).toBe('refs/tags/origin/v1');
   });
 
   it('an explicit TAG pin origin/v1 on a non-PR round freezes the tag — consistent routing', async () => {
@@ -1124,7 +1126,7 @@ describe('freeze-time integration on PR rounds', () => {
     const artifacts = tempDir('gru-freeze-tagpin-nopr-artifacts-');
     const sessions = tempDir('gru-freeze-tagpin-nopr-sessions-');
     const ledger = makeLedger();
-    const port = new GitReviewPort(root, 'feature/lane', laneTip);
+    const port = new GitReviewPort(root, 'feature/lane', laneTip, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-tag-pin-nopr' });
     const job = ledger.addJob({
       id: 'job-tag-pin-nopr', repo: 'fixture', title: 'explicit tag pin, non-PR', baseBranch: 'main',
@@ -1156,7 +1158,7 @@ describe('freeze-time integration on PR rounds', () => {
     const root = tempDir('gru-freeze-unfetchable-port-');
     const artifacts = tempDir('gru-freeze-unfetchable-artifacts-');
     const ledger = makeLedger();
-    const port = new GitReviewPort(root, 'gru/job-lane', laneSha);
+    const port = new GitReviewPort(root, 'gru/job-lane', laneSha, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-missing' });
     const job = ledger.addJob({
       id: 'job-missing', repo: 'fixture', title: 'unfetchable head', baseBranch: 'main',

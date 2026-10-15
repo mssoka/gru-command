@@ -2,16 +2,28 @@
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { realpathSync } from 'node:fs';
-import { instanceDirFromEnv } from '../config.js';
+import { instanceDirFromEnv, RUNTIME_IDS, type RuntimeId } from '../config.js';
 import { parseAnswers } from '../wizard/answers.js';
-import { writeInstanceConfig } from '../wizard/steps.js';
+import { assertRuntimeCliAvailable } from '../wizard/runtime-cli.js';
+import { loadExistingInstanceConfig, seedAnswersFromConfig, writeInstanceConfig } from '../wizard/steps.js';
 
-const USAGE = 'usage: node dist/cli/config-generate.js [--force]';
+const USAGE = `usage: node dist/cli/config-generate.js [--force] [--runtime <${RUNTIME_IDS.join('|')}>]`;
 
 export function runConfigGenerate(argv: readonly string[]): number {
   let force = false;
-  for (const arg of argv) {
+  let runtime: RuntimeId | undefined;
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i]!;
     if (arg === '--force') force = true;
+    else if (arg === '--runtime') {
+      const id = argv[i + 1];
+      if (id === undefined || !(RUNTIME_IDS as readonly string[]).includes(id)) {
+        process.stderr.write(`config-generate: --runtime needs one of: ${RUNTIME_IDS.join(', ')}\n${USAGE}\n`);
+        return 2;
+      }
+      runtime = id as RuntimeId;
+      i += 1;
+    }
     else if (arg === '-h' || arg === '--help') {
       process.stdout.write(`${USAGE}\n`);
       return 0;
@@ -22,8 +34,18 @@ export function runConfigGenerate(argv: readonly string[]): number {
   }
 
   const instanceDir = instanceDirFromEnv();
-  const answers = parseAnswers('{}');
-  const result = writeInstanceConfig({ instanceDir, answers, force });
+  const answers = parseAnswers(runtime === undefined ? '{}' : JSON.stringify({ runtime }));
+  // Preflight with the same seeding writeInstanceConfig applies: an existing
+  // config keeps its runtime, so only a runtime this run would newly choose
+  // needs its CLI on PATH.
+  const prior = loadExistingInstanceConfig(instanceDir);
+  const chosen = seedAnswersFromConfig(
+    answers,
+    prior,
+    new Set(runtime === undefined ? [] : ['runtime']),
+  ).runtime;
+  if (prior === null || prior.runtimes.default !== chosen) assertRuntimeCliAvailable(chosen);
+  const result = writeInstanceConfig({ instanceDir, answers, force, prior, ...(runtime === undefined ? {} : { explicitKeys: new Set(['runtime']) }) });
   process.stdout.write(`Wrote complete configuration: ${result.configPath}\n`);
   if (result.backupPath !== null) {
     process.stdout.write(`Previous configuration backed up: ${result.backupPath}\n`);
