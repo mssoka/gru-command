@@ -423,6 +423,32 @@ describe('verification scheduler — global budget', () => {
       expect(errors.length).toBeGreaterThan(0);
     } finally { await resumed.dispose(); db.close(); }
   }
+  it('PR334 anonymous (request-id-less) no-start refusal survives a failed publication and restart', async () => {
+    const dir = tempDir(); const db = new LedgerDb(dir); const ledger = new LedgerApi(db.handle, { bus: new EventBus({}) });
+    ledger.addJob({ id: 'queued-job', repo: 'fixture', title: 'queued' }); ledger.setJobStatus('queued-job', 'working');
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'queued-job', payload: { work_revision: 0 } });
+    const repo = makeRepo(); const storageDir = join(dir, 'verify'); let fail = true;
+    const record = (event: VerificationRecord) => {
+      if (event.kind === 'verification.no-start' && fail) throw new Error('no-start publication refused');
+      if (!ledger.hasJobEventWithPayloadValues(event.jobId, [event.kind], [{ key: 'run_id', value: String(event.payload['run_id']) }], 0)) ledger.appendCustomEvent(event);
+    };
+    const opts = { storageDir, limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 1000, runTimeoutMs: 1000 }, record, log: () => {} };
+    const scheduler = new VerificationScheduler(opts); scheduler.start();
+    const held = await scheduler.acquire(spec('holder'));
+    let queued!: () => void; const boundary = new Promise<void>((resolve) => { queued = resolve; });
+    const pending = scheduler.submit(repoSpec(repo, 'queued-job'), (frame) => { if (frame.type === 'queued') queued(); });
+    const rejected = expect(pending).rejects.toBeInstanceOf(VerificationDisposedError); await boundary;
+    expect(ledger.hasUnsettledVerificationRun('queued-job')).toBe(true);
+    await scheduler.dispose(); await rejected; scheduler.release(held);
+    expect(ledger.hasUnsettledVerificationRun('queued-job')).toBe(true);
+    fail = false;
+    const resumed = new VerificationScheduler(opts); resumed.start();
+    try {
+      expect(ledger.hasUnsettledVerificationRun('queued-job')).toBe(false);
+      expect(ledger.listJobEventsByKinds('queued-job', ['verification.no-start'])).toHaveLength(1);
+    } finally { await resumed.dispose(); db.close(); }
+  });
+
   it('PR334 shutdown during terminal delivery of a childless head-change outcome keeps that outcome', async () => {
     const { scheduler, records } = makeScheduler();
     scheduler.start();

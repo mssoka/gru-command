@@ -1529,7 +1529,10 @@ export class VerificationScheduler {
     if (attempt.started || this.slots.get(attempt.runId)?.child != null || this.noStartSettled.has(attempt.runId)) return;
     if (this.pendingNoStart.has(attempt.runId)) { this.retryNoStart(); return; }
     this.pendingNoStart.set(attempt.runId, { kind: 'verification.no-start', jobId: attempt.spec.jobId, payload: {
-      run_id: attempt.runId, request_ids: [...attempt.requestIds], scope: attempt.spec.scope, command: attempt.spec.command,
+      // The durable identity log is keyed by request id; a request-id-less
+      // submission is persisted under a run-derived id so restart can still
+      // publish its original refusal and release the ledger fence.
+      run_id: attempt.runId, request_ids: attempt.requestIds.size > 0 ? [...attempt.requestIds] : [`anonymous:${attempt.runId}`], scope: attempt.spec.scope, command: attempt.spec.command,
       cwd: attempt.spec.cwd, head: attempt.head, started: false, reason: failure.code, error: failure.message,
     } });
     this.retryNoStart();
