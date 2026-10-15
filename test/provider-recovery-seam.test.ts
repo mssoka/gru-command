@@ -57,6 +57,8 @@ class FakeHandle implements AgentHandle {
   readonly sessionFile: string | null;
   readonly capabilities = FAKE_CAPABILITIES;
   disposed = false;
+  private cessation: 'ceased' | 'unknown' = 'unknown';
+  readonly cessationEvidence = (): 'ceased' | 'unknown' => this.cessation;
   private readonly listeners = new Set<(event: RuntimeEvent) => void>();
   constructor(role: Role, id: string, sessionFile: string | null) {
     this.role = role;
@@ -93,6 +95,7 @@ class FakeHandle implements AgentHandle {
   }
   async dispose(): Promise<void> {
     this.disposed = true;
+    this.cessation = 'ceased';
     this.emit({ type: 'state', state: 'disposed' });
   }
 }

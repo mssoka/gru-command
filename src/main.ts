@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { chmodSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { configPathFor, loadConfig, ConfigError } from './config.js';
 import { loadOrCreateIdentity } from './identity.js';
+import { startServiceShutdown, type ServiceShutdownState } from './service-shutdown.js';
 import { Logger } from './logger.js';
 import { RuntimeRegistry, serviceRegistryOptions } from './runtime/registry.js';
 import { resolvePacingPolicy } from './runtime/pacing.js';
@@ -22,16 +23,15 @@ import { gitReviewSourcePreflight } from './dispatch/review-source.js';
 import { DispatchService } from './dispatch/service.js';
 import { WorktreeManager } from './worktrees/manager.js';
 import { createWorktreeServer } from './worktrees/server.js';
-import type { WaveRunner } from './dispatch/perkins.js';
 import { createReviewEscalationNotifier } from './dispatch/escalation-identity.js';
 import { createStartupVerdictPoster } from './dispatch/perkins-github-app.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { SilasDriver, computeSilasDigest, consolidatedBlockersFor, supervisionLookup } from './dispatch/silas-driver.js';
 import { createSilasModelActionTool } from './dispatch/silas-model-action.js';
 import { composeDeterministicPass, createSilasAutopilotHook } from './dispatch/silas-autopilot-pass.js';
-import { createSilasAutopilotOps, type SilasAutopilotOpsHandle } from './dispatch/silas-autopilot-ops.js';
+import { createSilasAutopilotOps } from './dispatch/silas-autopilot-ops.js';
 import { createProductionDeterministicPass } from './dispatch/durable-reconcile.js';
-import { disposeDirectiveResources, DirectiveProgressService } from './dispatch/directive-progress.js';
+import { DirectiveProgressService } from './dispatch/directive-progress.js';
 import { ProviderRecoverySensor, establishProviderWait } from './provider-recovery/sensor.js';
 import { ModelRuntimeProbe } from './provider-recovery/probe.js';
 import {
@@ -52,7 +52,7 @@ import { IntakeApprovalService } from './intake/approval.js';
 import { ChildWorkerService } from './dispatch/child-workers.js';
 import { createVerificationServer } from './verify/server.js';
 import type { VerificationQueueView } from './verify/scheduler.js';
-import { createService, type ServiceHandle } from './server.js';
+import { createService } from './server.js';
 import { adoptRollMarker, reconcileStaleRoll } from './roll/adopt.js';
 import { RollController, ROLL_SWAP_EXIT_CODE } from './roll/controller.js';
 import { createRollProbes } from './roll/probes.js';
@@ -176,7 +176,7 @@ async function reviewPreflightCheck(
   return preflight.ok && thinking !== undefined ? { ...preflight, reviewThinkingLevel: thinking } : preflight;
 }
 import { ChatFrameLog } from './chat/frame-log.js';
-import { createChatServer, type ChatServer } from './chat/server.js';
+import { createChatServer } from './chat/server.js';
 import { GruAwareness } from './chat/awareness.js';
 import { BOARD_WS_PATH } from './board/frames.js';
 import { GruSessionPointer } from './chat/session-state.js';
@@ -333,30 +333,7 @@ async function main(): Promise<number> {
     process.exit(1);
   });
 
-  const state: {
-    handle?: ServiceHandle;
-    registry?: RuntimeRegistry;
-    store?: SessionStore;
-    chat?: ChatServer;
-    awareness?: GruAwareness;
-    board?: Awaited<ReturnType<typeof createBoardServer>>;
-    ledgerDb?: LedgerDb;
-    supervisor?: Supervisor;
-    decisions?: DecisionRuntime;
-    bob?: BobScheduler;
-    dream?: DreamScheduler;
-    silas?: SilasDriver;
-    /** Issue #243: the autopilot ops the shutdown drains. */
-    autopilot?: SilasAutopilotOpsHandle;
-    providerRecovery?: ProviderRecoverySensor;
-    wave?: WaveRunner;
-    childWorkers?: ChildWorkerService;
-    verify?: ReturnType<typeof createVerificationServer>;
-    pipeline?: PipelineService;
-    deployDrift?: DeployDriftTracker;
-    directiveProgress?: DirectiveProgressService;
-    repoOverview?: ManagedRepoOverviewTracker;
-  } = {};
+  const state: ServiceShutdownState = {};
   let shuttingDown = false;
   /** Service-stopping signal (pacing): aborts QUEUED admission waits and
    * lets delivery settlement observe shutdown instead of hanging. */
@@ -364,194 +341,7 @@ async function main(): Promise<number> {
   const shutdown = (signal: string, exitCode = 0) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    serviceStop.abort();
-    logger.info('shutdown begin', { signal, exit_code: exitCode });
-    const forceExit = setTimeout(() => {
-      logger.error('shutdown timeout — forcing exit', { signal });
-      process.exit(1);
-    }, 5_000);
-    forceExit.unref();
-    if (state.handle === undefined) {
-      clearTimeout(forceExit);
-      logger.info('shutdown complete', { signal, note: 'signal arrived during boot' });
-      process.exit(exitCode);
-    }
-    const handle = state.handle;
-    // Issue #243 F-H4: a DURABLE checkpoint BEFORE the first potentially-
-    // unbounded await below (the chat/board/wave/child/verify/registry and
-    // producer joins). It records the still-owned pending autopilot producers
-    // plus the last-seen session sizes while locks and the ledger remain OPEN,
-    // reusing the normal durable mechanics WITHOUT replacing the original
-    // final snapshot. It never changes the watchdog/deadline/exit ordering,
-    // never releases a lock, and never claims cessation.
-    try {
-      const pending = state.autopilot?.pendingSnapshot() ?? [];
-      state.store?.writeShutdownCheckpoint({ pending });
-      ledger.appendCustomEvent({
-        kind: 'silas.shutdown-checkpoint',
-        payload: { pending_count: pending.length, pending },
-      });
-    } catch (error) {
-      logger.error('shutdown checkpoint failed — pending ownership retained', { error: String(error) });
-    }
-    void Promise.resolve()
-      .then(async () => {
-        // Each stage isolated: a failure in one must never skip lock
-        // release or the final snapshot — the next boot's growth detection
-        // depends on the snapshot reflecting what this process last saw
-        // (SPEC ruling 12). Chat clients go first (1001 going-away) so
-        // they queue before the runtime turns die (E4); the board's
-        // clients follow (E6).
-        if (state.chat !== undefined) {
-          try {
-            await state.chat.dispose();
-          } catch (error) {
-            logger.error('chat server shutdown failed', { error: String(error) });
-          }
-        }
-        // After chat: the awareness layer's deferred-wake timer must not
-        // outlive the sink it would call (idempotent, never fatal).
-        if (state.awareness !== undefined) {
-          try {
-            state.awareness.dispose();
-          } catch (error) {
-            logger.error('awareness shutdown failed', { error: String(error) });
-          }
-        }
-        if (state.board !== undefined) {
-          try {
-            await state.board.dispose();
-          } catch (error) {
-            logger.error('board server shutdown failed', { error: String(error) });
-          }
-        }
-        if (state.decisions !== undefined) {
-          try {
-            state.decisions.dispose();
-          } catch (error) {
-            logger.error('decision runtime dispose failed', { error: String(error) });
-          }
-        }
-        if (state.supervisor !== undefined) {
-          try {
-            state.supervisor.dispose();
-          } catch (error) {
-            logger.error('supervisor dispose failed', { error: String(error) });
-          }
-        }
-        if (state.bob !== undefined) {
-          try {
-            state.bob.stop();
-          } catch (error) {
-            logger.error('bob scheduler stop failed', { error: String(error) });
-          }
-        }
-        if (state.dream !== undefined) {
-          try {
-            state.dream.stop();
-          } catch (error) {
-            logger.error('lesson dream scheduler stop failed', { error: String(error) });
-          }
-        }
-        if (state.silas !== undefined) {
-          try {
-            state.silas.stop();
-          } catch (error) {
-            logger.error('silas driver stop failed', { error: String(error) });
-          }
-        }
-        // Issue #243 F-H4 (corrected): the autopilot producer join runs AFTER
-        // the registry disposal that releases a running producer's handle
-        // (below), so no join here blocks disposal and no new grace/ceiling is
-        // invented. The service-stop signal already aborts QUEUED admissions.
-        if (state.providerRecovery !== undefined) {
-          try {
-            state.providerRecovery.stop();
-          } catch (error) {
-            logger.error('provider-recovery sensor stop failed', { error: String(error) });
-          }
-        }
-        if (state.wave !== undefined) {
-          try {
-            await state.wave.shutdown();
-          } catch (error) {
-            logger.error('Perkins review shutdown failed', { error: String(error) });
-          }
-        }
-        if (state.pipeline !== undefined) {
-          try {
-            state.pipeline.dispose();
-          } catch (error) {
-            logger.error('pipeline dispose failed', { error: String(error) });
-          }
-        }
-        if (state.childWorkers !== undefined) {
-          try {
-            await state.childWorkers.dispose();
-          } catch (error) {
-            logger.error('child worker shutdown failed', { error: String(error) });
-          }
-        }
-        if (state.verify !== undefined) {
-          try {
-            await state.verify.dispose();
-          } catch (error) {
-            logger.error('verification scheduler shutdown failed', { error: String(error) });
-          }
-        }
-        state.deployDrift?.stop();
-        state.repoOverview?.stop();
-        try {
-          await disposeDirectiveResources(state.directiveProgress, state.registry);
-        } catch (error) {
-          logger.error('directive progress/registry dispose failed', { error: String(error) });
-        }
-        // Issue #243 F-H4 (corrected): registry disposal has released the
-        // running producers' handles, so this plain join settles under the
-        // existing approved shutdown watchdog; an unsettled producer is
-        // reported, never fabricated as ceased.
-        if (state.autopilot !== undefined) {
-          try {
-            const drained = await state.autopilot.drain();
-            if (!drained.settled) {
-              logger.warn('silas autopilot producers unsettled after disposal — ownership retained for boot reconciliation', {
-                pending: drained.pending,
-              });
-            }
-          } catch (error) {
-            logger.error('silas autopilot drain failed', { error: String(error) });
-          }
-        }
-        if (state.store !== undefined) {
-          try {
-            state.store.dispose();
-            state.store.persistSnapshot();
-          } catch (error) {
-            logger.error('session store shutdown failed', { error: String(error) });
-          }
-        }
-        if (state.ledgerDb !== undefined) {
-          try {
-            state.ledgerDb.close();
-          } catch (error) {
-            logger.error('ledger shutdown failed', { error: String(error) });
-          }
-        }
-        await handle.stop();
-      })
-      .then(() => {
-        clearTimeout(forceExit);
-        logger.info('shutdown complete', { signal });
-        // A roll swap exits with ROLL_SWAP_EXIT_CODE (75, non-zero): the
-        // shipped launchd/systemd units restart on an unsuccessful exit
-        // and stay down on a clean one. A normal stop keeps exit 0.
-        process.exit(exitCode);
-      })
-      .catch((error: unknown) => {
-        clearTimeout(forceExit);
-        logger.error('shutdown failed', { signal, error: String(error) });
-        process.exit(1);
-      });
+    startServiceShutdown({ signal, exitCode, logger, state, serviceStop, exit: process.exit });
   };
   // Registered before the server starts so a signal in the boot window is
   // still a graceful, logged exit.
@@ -1134,6 +924,7 @@ async function main(): Promise<number> {
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   state.ledgerDb = ledgerDb;
+  state.ledger = ledger;
   state.board = board;
   logger.info('ledger ready', { db_path: ledgerDb.dbPath });
 
