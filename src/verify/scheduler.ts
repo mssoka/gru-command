@@ -806,7 +806,6 @@ export class VerificationScheduler {
         cwd: history.spec.cwd, head: history.head, started: false, reason: history.error!.code, error: history.error!.detail,
       } });
     }
-    this.retryNoStart();
     for (const slot of persisted.slots) {
       // A persisted slot never has an in-process child (this is a fresh
       // scheduler): it is an orphan candidate until proven dead or aged out.
@@ -829,6 +828,9 @@ export class VerificationScheduler {
     }
     this.reconcileStale();
     this.persist();
+    // Persisted live holders are restored first: a retry's persistence must
+    // never publish a holder map that still lacks them.
+    this.retryNoStart();
     this.sweepTimer = setInterval(() => {
       try {
         this.reconcileStale();
@@ -1299,7 +1301,8 @@ export class VerificationScheduler {
       this.sweepTimer = null;
     }
     for (const attempt of this.attempts.values()) {
-      if (!attempt.started) this.settleNoStart(attempt);
+      // An already-produced childless terminal outcome is not a no-start.
+      if (!attempt.started && attempt.outcome === null) this.settleNoStart(attempt);
     }
     for (const waiter of this.waiters.splice(0)) {
       waiter.settled = true;

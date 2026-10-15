@@ -423,6 +423,51 @@ describe('verification scheduler — global budget', () => {
       expect(errors.length).toBeGreaterThan(0);
     } finally { await resumed.dispose(); db.close(); }
   }
+  it('PR334 shutdown during terminal delivery of a childless head-change outcome keeps that outcome', async () => {
+    const { scheduler, records } = makeScheduler();
+    scheduler.start();
+    const repo = makeRepo();
+    let atCompleted!: () => void; const reached = new Promise<void>((resolve) => { atCompleted = resolve; });
+    let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+    const staleHead = 'a'.repeat(40);
+    const running = scheduler.submit(repoSpec(repo, 'job-head', { head: staleHead, requestId: 'pr334-head-change' }), async (frame) => {
+      if (frame.type === 'completed') { atCompleted(); await gate; }
+    });
+    await reached;
+    const disposing = scheduler.dispose();
+    release();
+    const outcome = await running; await disposing;
+    expect(outcome.error).toMatch(/head_changed/);
+    expect(records.filter((record) => record.kind === 'verification.no-start')).toEqual([]);
+    expect(scheduler.attemptStatus({ requestId: 'pr334-head-change' })).toMatchObject({ state: 'completed' });
+  });
+
+  it('PR334 startup retry of a refused no-start never persists an emptied live-holder map', async () => {
+    const storageDir = join(tempDir(), 'verify'); const repo = makeRepo();
+    const limits = { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 1000, runTimeoutMs: 1000 };
+    const records: VerificationRecord[] = [];
+    const first = new VerificationScheduler({ storageDir, limits, record: (event) => { records.push(event); if (event.kind === 'verification.no-start') throw new Error('refused'); }, log: () => {} });
+    first.start();
+    const held = await first.acquire(spec('holder'));
+    const queued = first.submit(repoSpec(repo, 'queued-job', { requestId: 'pr334-startup-holders' }), () => {});
+    const refused = expect(queued).rejects.toBeInstanceOf(VerificationDisposedError);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await first.dispose(); await refused; first.release(held);
+    // The disposed scheduler's holder is a live orphan on disk; a restarted
+    // scheduler whose publication keeps failing must not erase it.
+    const persistedPath = join(storageDir, 'scheduler.json');
+    const written = JSON.parse(readFileSync(persistedPath, 'utf-8')) as { slots: { run_id: string; pid: number }[] };
+    written.slots = [{ run_id: held.runId, job_id: 'holder', scope: 'full', command: 'x', cwd: process.cwd(), head: null, pid: process.pid, granted_at: Date.now(), request_ids: [] } as never];
+    writeFileSync(persistedPath, JSON.stringify(written));
+    const writes: string[] = [];
+    const resumed = new VerificationScheduler({ storageDir, limits, record: () => { writes.push(readFileSync(persistedPath, 'utf-8')); throw new Error('still refused'); }, log: () => {} });
+    try {
+      resumed.start();
+      expect(writes.length).toBeGreaterThan(0);
+      for (const snapshot of writes) expect((JSON.parse(snapshot) as { slots: unknown[] }).slots).toHaveLength(1);
+    } finally { await resumed.dispose(); }
+  });
+
   it('retries original no-start pre-commit failure on persisted restart and releases only its ledger lane fence', () => assertNoStartRecovery('pre-commit'));
   it('retries original no-start post-commit failure on persisted restart and releases only its ledger lane fence', () => assertNoStartRecovery('post-commit'));
   it('retries original no-start state-storage failure on persisted restart and releases only its ledger lane fence', () => assertNoStartRecovery('state-storage'));
