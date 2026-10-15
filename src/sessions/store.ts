@@ -13,13 +13,16 @@ import {
   renameSync,
 } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { hostname } from 'node:os';
 import { join, relative, resolve } from 'node:path';
+import { withSessionLockCoordination } from './lock-coordination.js';
 import type { LogLevel } from '../logger.js';
 
 /** Minimal structured-log sink the store depends on. */
 export type StoreLog = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
 export interface SessionLockInfo {
+  readonly host?: string;
   readonly pid: number;
   readonly bootId: string;
   readonly acquiredAt: string;
@@ -74,7 +77,7 @@ interface SizeSnapshot {
 }
 
 const LOCK_HEARTBEAT_MS = 5_000;
-/** A lock whose heartbeat is older than this is considered abandoned (dead holder). */
+/** Heartbeat age permits bounded inspection, never proves owner absence. */
 const LOCK_STALE_MS = 60_000;
 const BACKUP_INTERVAL_MS = 60 * 60 * 1000; // hourly (SPEC ruling 12)
 const BACKUP_SUFFIX = '.bak';
@@ -132,6 +135,10 @@ export class SessionStore {
     return `${sessionFile}.lock`;
   }
 
+  private unlinkLockFile(lockFile: string): void {
+    unlinkSync(lockFile);
+  }
+
   /** Whether THIS store instance currently holds the file's lock. */
   isHeld(sessionFile: string): boolean {
     return this.heldLocks.has(sessionFile);
@@ -140,14 +147,20 @@ export class SessionStore {
   /**
    * Acquire the exclusive lock for a session file. The lock is a sidecar
    * `.lock` file created with O_EXCL holding pid + heartbeat; a second
-   * writer is rejected loudly (LockBusyError naming the holder), and a
-   * stale lock (heartbeat older than LOCK_STALE_MS) is stolen and logged.
+   * writer is rejected loudly (LockBusyError naming the holder). A stale
+   * heartbeat permits inspection only; reclaim requires a bound local
+   * owner positively absent at the exact unchanged lock pathname.
    */
-  acquireLock(sessionFile: string): void {
+  acquireLock(sessionFile: string, allowStaleTakeover = true): void {
     if (this.disposed) throw new Error('session store disposed');
+    withSessionLockCoordination(sessionFile, () => this.acquireLockWithinCoordination(sessionFile, allowStaleTakeover));
+  }
+
+  private acquireLockWithinCoordination(sessionFile: string, allowStaleTakeover: boolean): void {
     if (this.heldLocks.has(sessionFile)) return; // already ours (re-entrant)
     const lockFile = this.lockFileFor(sessionFile);
     const info: SessionLockInfo = {
+      host: hostname(),
       pid: process.pid,
       bootId: this.bootId,
       acquiredAt: new Date().toISOString(),
@@ -167,6 +180,7 @@ export class SessionStore {
           throw new Error(`cannot acquire session lock ${lockFile}: lock keeps reappearing`);
         }
         steals += 1;
+        if (!allowStaleTakeover) throw new LockBusyError(lockFile, JSON.parse(readFileSync(lockFile, 'utf8')) as SessionLockInfo);
         this.stealIfStale(lockFile);
         continue;
       }
@@ -180,16 +194,18 @@ export class SessionStore {
     this.heldLocks.add(sessionFile);
     const heartbeat = setInterval(() => {
       try {
-        const current = JSON.parse(readFileSync(lockFile, 'utf-8')) as SessionLockInfo;
-        if (current.pid === info.pid && current.bootId === info.bootId) {
-          const next = `${JSON.stringify({ ...current, heartbeatAt: new Date().toISOString() })}\n`;
-          // Fixed-length rewrite keeps the lock file tiny (pid, bootId
-          // and ISO heartbeat timestamps are constant width); O_EXCL
-          // ownership was proven above and the heartbeat owns this file.
-          const wfd = openSync(lockFile, 'r+');
-          writeFileSync(wfd, next, 'utf-8');
-          closeSync(wfd);
-        }
+        withSessionLockCoordination(sessionFile, () => {
+          const current = JSON.parse(readFileSync(lockFile, 'utf-8')) as SessionLockInfo;
+          if (current.host === info.host && current.pid === info.pid && current.bootId === info.bootId) {
+            const next = `${JSON.stringify({ ...current, heartbeatAt: new Date().toISOString() })}\n`;
+            // Fixed-length rewrite keeps the lock file tiny (pid, bootId
+            // and ISO heartbeat timestamps are constant width); O_EXCL
+            // ownership was proven above and the heartbeat owns this file.
+            const wfd = openSync(lockFile, 'r+');
+            writeFileSync(wfd, next, 'utf-8');
+            closeSync(wfd);
+          }
+        });
       } catch {
         // A stolen/unreadable lock file is re-evaluated on release; never
         // take the process down from housekeeping.
@@ -197,6 +213,46 @@ export class SessionStore {
     }, LOCK_HEARTBEAT_MS);
     heartbeat.unref();
     this.heartbeats.set(sessionFile, heartbeat);
+  }
+
+  /** Bounded checkpoint recovery: reclaim only the exact absent original
+   * PID's lock, never heartbeat expiry or logical-minion reuse. */
+  ownedLockIdentity(sessionFile: string): { readonly host: string; readonly pid: number; readonly bootId: string } {
+    return withSessionLockCoordination(sessionFile, () => {
+      const lockFile = this.lockFileFor(sessionFile);
+      const holder = JSON.parse(readFileSync(lockFile, 'utf8')) as SessionLockInfo;
+      if (!this.heldLocks.has(sessionFile) || holder.host !== hostname() || holder.pid !== process.pid || holder.bootId !== this.bootId) {
+        throw new LockBusyError(lockFile, holder);
+      }
+      return { host: holder.host, pid: holder.pid, bootId: holder.bootId };
+    });
+  }
+
+  acquireLockAfterHostExit(sessionFile: string, expectedPid: number, expectedOwner?: { readonly host: string; readonly pid: number; readonly bootId: string }): void {
+    if (this.disposed) throw new Error('session store disposed');
+    withSessionLockCoordination(sessionFile, () => this.acquireLockAfterHostExitWithinCoordination(sessionFile, expectedPid, expectedOwner));
+  }
+
+  private acquireLockAfterHostExitWithinCoordination(sessionFile: string, expectedPid: number,
+    expectedOwner?: { readonly host: string; readonly pid: number; readonly bootId: string }): void {
+    const lockFile = this.lockFileFor(sessionFile);
+    let holder: SessionLockInfo;
+    try { holder = JSON.parse(readFileSync(lockFile, 'utf8')) as SessionLockInfo; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') { this.acquireLockWithinCoordination(sessionFile, false); return; }
+      throw new LockUnreadableError(lockFile, String(error));
+    }
+    const snapshot = statSync(lockFile);
+    if (expectedOwner === undefined || expectedOwner.pid !== expectedPid || expectedOwner.host !== hostname() || holder.host !== expectedOwner.host ||
+        holder.pid !== expectedOwner.pid || holder.bootId !== expectedOwner.bootId) throw new LockBusyError(lockFile, holder);
+    try { process.kill(expectedPid, 0); throw new LockBusyError(lockFile, holder); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+    // Re-read exact content before unlink; the coordinator keeps replacement
+    // owners from entering between this identity check and pathname removal.
+    const current = statSync(lockFile);
+    if (current.ino !== snapshot.ino || current.dev !== snapshot.dev || JSON.stringify(JSON.parse(readFileSync(lockFile, 'utf8'))) !== JSON.stringify(holder)) throw new LockBusyError(lockFile, holder);
+    this.unlinkLockFile(lockFile);
+    this.acquireLockWithinCoordination(sessionFile, false);
   }
 
   private stealIfStale(lockFile: string): void {
@@ -213,54 +269,64 @@ export class SessionStore {
         throw new LockUnreadableError(lockFile, String(secondError ?? firstError));
       }
     }
+    if (typeof holder !== 'object' || holder === null || Array.isArray(holder)) throw new LockUnreadableError(lockFile, 'owner identity is not an object');
     const age = Date.now() - Date.parse(holder.heartbeatAt);
-    // The heartbeat timestamp IS the liveness proof: a heartbeat older
-    // than the steal threshold means the holder is dead or wedged — pid
-    // liveness is irrelevant (pid reuse and frozen-but-alive holders are
-    // both steal cases, not busy cases).
-    if (Number.isFinite(age) && age > LOCK_STALE_MS) {
-      this.log('warn', 'stale session lock stolen', {
-        lockFile,
-        holder_pid: holder.pid,
-        heartbeat_age_ms: age,
-      });
-      try {
-        unlinkSync(lockFile);
-      } catch {
-        /* raced away */
-      }
-      return;
+    if (!Number.isFinite(age) || age <= LOCK_STALE_MS || holder?.host !== hostname() ||
+        !Number.isSafeInteger(holder.pid) || holder.pid <= 0 || typeof holder.bootId !== 'string' || holder.bootId.trim() === '') {
+      throw new LockBusyError(lockFile, holder);
     }
-    throw new LockBusyError(lockFile, holder);
+    const snapshot = statSync(lockFile);
+    try { process.kill(holder.pid, 0); throw new LockBusyError(lockFile, holder); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw new LockBusyError(lockFile, holder);
+    }
+    // The coordinator serializes cooperative owners. Re-read the inode and
+    // complete identity as well: absence of a predecessor never permits
+    // deleting a replacement installed during observation.
+    const current = statSync(lockFile);
+    if (current.ino !== snapshot.ino || current.dev !== snapshot.dev ||
+        JSON.stringify(JSON.parse(readFileSync(lockFile, 'utf8'))) !== JSON.stringify(holder)) {
+      throw new LockBusyError(lockFile, holder);
+    }
+    this.unlinkLockFile(lockFile);
+    this.log('warn', 'stale session lock reclaimed after local owner absence', {
+      lockFile, holder_pid: holder.pid, heartbeat_age_ms: age,
+    });
   }
 
   releaseLock(sessionFile: string): void {
-    const heartbeat = this.heartbeats.get(sessionFile);
-    if (heartbeat !== undefined) {
-      clearInterval(heartbeat);
-      this.heartbeats.delete(sessionFile);
+    if (!this.heldLocks.has(sessionFile) && !this.heartbeats.has(sessionFile)) return;
+    withSessionLockCoordination(sessionFile, () => {
+      const heartbeat = this.heartbeats.get(sessionFile);
+      if (heartbeat !== undefined) {
+        clearInterval(heartbeat);
+        this.heartbeats.delete(sessionFile);
+      }
+      this.releaseLockWithinCoordination(sessionFile);
+    });
+  }
+
+  private releaseLockWithinCoordination(sessionFile: string): void {
+    if (!this.heldLocks.delete(sessionFile)) return;
+    const lockFile = this.lockFileFor(sessionFile);
+    // Only unlink OUR lock: if the lock was stolen while we were
+    // unresponsive, the file now belongs to the stealer — deleting it
+    // would admit a third writer while the second is active.
+    let ours = false;
+    try {
+      const current = JSON.parse(readFileSync(lockFile, 'utf-8')) as SessionLockInfo;
+      ours = current.host === hostname() && current.pid === process.pid && current.bootId === this.bootId;
+    } catch {
+      ours = false; // gone or unreadable — nothing safe to delete
     }
-    if (this.heldLocks.delete(sessionFile)) {
-      const lockFile = this.lockFileFor(sessionFile);
-      // Only unlink OUR lock: if the lock was stolen while we were
-      // unresponsive, the file now belongs to the stealer — deleting it
-      // would admit a third writer while the second is active.
-      let ours = false;
+    if (ours) {
       try {
-        const current = JSON.parse(readFileSync(lockFile, 'utf-8')) as SessionLockInfo;
-        ours = current.pid === process.pid && current.bootId === this.bootId;
+        this.unlinkLockFile(lockFile);
       } catch {
-        ours = false; // gone or unreadable — nothing safe to delete
+        // Already gone — nothing to do.
       }
-      if (ours) {
-        try {
-          unlinkSync(lockFile);
-        } catch {
-          // Already gone — nothing to do.
-        }
-      } else {
-        this.log('warn', 'session lock not released: file is no longer ours', { lockFile });
-      }
+    } else {
+      this.log('warn', 'session lock not released: file is no longer ours', { lockFile });
     }
   }
 
@@ -471,6 +537,10 @@ export class SessionStore {
       clearInterval(this.backupTimer);
       this.backupTimer = null;
     }
-    for (const file of [...this.heldLocks.keys()]) this.releaseLock(file);
+    const failures: unknown[] = [];
+    for (const file of [...this.heldLocks]) {
+      try { this.releaseLock(file); } catch (error) { failures.push(error); }
+    }
+    if (failures.length > 0) throw new AggregateError(failures, 'failed to release every session lock during disposal');
   }
 }

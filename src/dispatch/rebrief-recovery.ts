@@ -1,6 +1,5 @@
-import { capturePortLaneHandoff } from '../worktrees/handoff.js';
-import { existsSync } from 'node:fs';
 import { LIVE_DIRECTIVE_STATES } from '../ledger/directives.js';
+import { surfaceRecoveryOwnerTransfer } from './recovery-owner.js';
 import { isJobTerminal } from '../ledger/states.js';
 import { PendingRebriefNoLongerCurrent } from '../ledger/api.js';
 import type {
@@ -17,8 +16,6 @@ import type {
 import type { LogLevel } from '../logger.js';
 import {
   flipJobToWorking,
-  rebriefFreshMinion,
-  recordFollowUpDelivery,
   type DirectiveRegistry,
 } from './fix-directive.js';
 import type { WorktreePort } from './worktree-port.js';
@@ -27,39 +24,12 @@ import type { NativeAgentTool } from '../runtime/types.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
-/**
- * Re-brief restart safety (Silas finding 2026-09-23): a re-brief request
- * mid-flight at service restart lost BOTH the worker and the event
- * recording — no `silas.rebrief`, no `job.delivered`, nothing to reconcile
- * at boot. The cure is a durable-marker pair written BEFORE the worker is
- * spawned and cleared ONLY when its guarded event lands:
- *
- * - `silas.rebrief` — the request event (the lane was re-briefed), and
- * - `job.delivered` — the follow-up delivery signal (the settled turn's
- *   lane head; what re-arms the digest's re-review freshness predicate).
- *
- * At boot, `reconcilePendingRebriefs` consumes every marker whose guarded
- * event never landed: it prefers to resume the interrupted worker's
- * session (the #42 orphan-cure shape: resume, then re-deliver the prompt),
- * falls back to a fresh worker on the same lane, and records the missing
- * events when that turn settles. A re-dispatch that fails escalates as
- * action-required — visibly stalled, never silently. The marker outlives
- * every failure, so the next boot retries. Completion itself is atomic
- * (issue #189): the identity-checked marker clear and the durable
- * `silas.rebrief-settled` publication (the queued-review release signal)
- * commit in ONE transaction, so a settlement failure can never leave a
- * handoff stranded behind already-cleared markers. A marker whose job has since
- * reached terminal (`merged`/`done`/`binned`) is the exception: the request can
- * never be honored, so boot retires it administratively — one
- * `silas.rebrief-retired` audit committed with the marker deletion —
- * instead of re-dispatching or escalating forever. Spent markers (both
- * guarded events already landed) are not retired: they clear as the
- * completion they are, with no retirement audit.
- *
- * This module owns the recording half of the flow (events + marker
- * clearing); the HTTP endpoint and the boot reconciler both ride it, so
- * the two paths cannot drift.
- */
+/** Historical marker decoding only. New directives and rebriefs use the
+ * shared exact-request/native-checkpoint coordinator. Historical markers
+ * never authorize prompt replay or a fresh-session fallback: known spent
+ * evidence can settle atomically, terminal requests can retire without
+ * execution, and unproven live generations need a concrete guarded Gru
+ * decision. No lease or marker age establishes no-effect authority. */
 
 /** The notifications surface recovery needs (structural — NotificationCenter fits). */
 export interface RecoveryNotifications {
@@ -96,11 +66,9 @@ export interface ReconcileRebriefDeps {
    * shutdown. Absent = settlement remains hook-owned. */
   readonly stopSignal?: AbortSignal;
   /** True while the process is deliberately stopping: a turn killed by
-   * shutdown is not a recovery failure — the next boot retries the marker. */
+   * shutdown is not a recovery failure — the next boot reconsiders evidence. */
   readonly stopping?: () => boolean;
-  /** Issue #339: observe the re-briefed/resumed turn's session at its settle
-   * seam so a prohibited read invalidates blind coverage. Wired by the service
-   * to `DispatchService.observeBlindSession`; absent = no observation. */
+  /** Read-only coverage observation never authorizes historical replay. */
   readonly observeBlindTurn?: (jobId: string, sessionFile: string | null) => void;
 }
 
@@ -153,39 +121,23 @@ export interface ReconcileReport {
    * counted by each scan that retired part of it). A retirement reached
    * mid-turn is logged per job and audited, not counted here. */
   readonly retired: number;
+  /** Failed historical groups retained with exact-generation recovery action
+   * and a durable bounded retry; never reported as completed or replayed. */
+  readonly failed: number;
   /** Settles when every background re-dispatch has settled — resumed,
    * escalated, or abandoned because the process is stopping. Boot does not
    * await it (a re-brief turn is long); tests do. */
   readonly settled: Promise<void>;
 }
 
-/**
- * Has this marker's guarded event landed? The event must post-date the
- * request's sequence watermark — an older event of the same kind cannot
- * answer a newer request. When the marker belongs to a MARKED phase
- * (`phaseId` set), the event must ALSO carry that phase id: an unrelated
- * delivery/re-brief of the same kind can never satisfy this request's
- * marker (an older/other receipt cannot complete or cancel it).
- */
+/** The shared ledger predicate verifies the exact historical generation,
+ * immutable phase or explicit marker/hash correlation, and original facts.
+ * A newer same-job event alone never proves a spent request. */
 export function pendingRebriefEventLanded(
-  ledger: Pick<LedgerApi, 'latestJobEvent' | 'latestJobPhaseEvent'>,
+  ledger: Pick<LedgerApi, 'pendingRebriefReceipt'>,
   marker: PendingRebriefRecord,
 ): boolean {
-  return pendingRebriefGuardedEvent(ledger, marker, marker.phaseId) !== null;
-}
-
-/** The marker's own guarded event, correlated to the phase when marked.
- * Unmarked markers keep the legacy newest-event predicate. */
-function pendingRebriefGuardedEvent(
-  ledger: Pick<LedgerApi, 'latestJobEvent' | 'latestJobPhaseEvent'>,
-  marker: PendingRebriefRecord,
-  phaseId: string | null,
-): EventRecord | null {
-  if (phaseId === null) {
-    const event = ledger.latestJobEvent(marker.jobId, marker.kind);
-    return event !== null && event.seq > marker.baselineSeq ? event : null;
-  }
-  return ledger.latestJobPhaseEvent(marker.jobId, marker.kind, phaseId, marker.baselineSeq);
+  return ledger.pendingRebriefReceipt(marker) !== null;
 }
 
 /**
@@ -283,33 +235,13 @@ export function finalizeRebriefRequest(input: {
   }
   const rebriefMarker = markers.find((marker) => marker.kind === 'silas.rebrief') ?? null;
   const deliveryMarker = markers.find((marker) => marker.kind === 'job.delivered') ?? null;
-  // Host-owned phase identity: when this request carried an explicit
-  // completion intent, every guarded event must carry it so the delivery
-  // can complete exactly this phase (never an event-sequence guess).
-  const phaseId = markers.find((marker) => marker.phaseId !== null)?.phaseId ?? null;
-
-  let rebriefRecorded = false;
+  const rebriefRecorded = false;
   let deliveredSha: string | null = null;
-  let deliveryNote: string | null = null;
+  const deliveryNote: string | null = null;
   let deliveryRecorded = false;
   try {
-    if (rebriefMarker !== null && pendingRebriefGuardedEvent(input.ledger, rebriefMarker, phaseId) === null) {
-      input.ledger.appendCustomEventIfCurrentRebrief({
-        kind: 'silas.rebrief',
-        jobId: input.jobId,
-        payload: {
-          minion_id: input.minionId,
-          lane: input.lanePath,
-          note: input.note,
-          ...(phaseId !== null ? { phase_id: phaseId } : {}),
-          // Firing-rule provenance (issue #117, g21): replayed from the
-          // durable request marker, so a restart mid-turn cannot strip the
-          // receipt of the rule that fired the re-brief.
-          ...(rebriefMarker.ruleId !== null ? { rule_id: rebriefMarker.ruleId } : {}),
-          ...(rebriefMarker.sourceRoundId !== null ? { source_round_id: rebriefMarker.sourceRoundId } : {}),
-        },
-      }, markers);
-      rebriefRecorded = true;
+    if (rebriefMarker !== null && input.ledger.pendingRebriefReceipt(rebriefMarker) === null) {
+      throw new Error('historical rebrief completion is unproven — preserve markers and require a guarded Gru recovery decision');
     }
     if (missing.length > 0) {
       // The re-brief event publishes after COMMIT. Its subscribers may
@@ -318,28 +250,12 @@ export function finalizeRebriefRequest(input: {
       flipJobToWorking(input.ledger, input.jobId);
     }
 
-    const landedDelivery = deliveryMarker === null ? null : pendingRebriefGuardedEvent(input.ledger, deliveryMarker, phaseId);
+    const landedDelivery = deliveryMarker === null ? null : input.ledger.pendingRebriefReceipt(deliveryMarker);
     if (deliveryMarker !== null && landedDelivery === null) {
-      const followUp = recordFollowUpDelivery({
-        ledger: {
-          appendCustomEvent: (fields) => input.ledger.appendCustomEventIfCurrentRebrief(fields, markers),
-          // Issue #220: the report handback's commissioner obligation rides
-          // the delivery. The obligation open is idempotent and validates
-          // the job's own state, so it does not need this rebrief's
-          // freshness fence — a superseded delivery's obligation is the
-          // same per-job debt the next delivery coalesces onto.
-          getJob: (id) => input.ledger.getJob(id),
-          openReportObligation: (args) => input.ledger.openReportObligation(args),
-        },
-        worktrees: input.worktrees,
-        jobId: input.jobId,
-        agentId: input.minionId,
-        source: 'silas-rebrief',
-        ...(phaseId !== null ? { phaseId } : {}),
-        workRevision: deliveryMarker.workRevision ?? 0,
-      });
-      deliveredSha = followUp.sha;
-      deliveryNote = followUp.note;
+      const lanes = input.worktrees.listWorktrees({ jobId: input.jobId }).filter((lane) => lane.kind === 'job' && lane.status !== 'swept');
+      const original = input.ledger.reconstructCompletedRebriefDelivery(markers, lanes.length === 1 ? lanes[0] : undefined);
+      if (original === null) throw new Error('historical completion is proven but original delivery HEAD/revision is absent — use exact legacy reconcile-completed control closure and current inspection, never synthesize historical delivery');
+      deliveredSha = (original.payload as { sha: string }).sha;
       deliveryRecorded = true;
     } else if (landedDelivery !== null) {
       // Reconcile caught a crash window: read the phase-correlated head,
@@ -414,403 +330,184 @@ export function checkRebriefTurn(ledger: Pick<LedgerApi, 'getJob' | 'listPending
 
 /** Markers this process is actively recovering — a second reconcile pass
  * (same boot, or a boot racing an open recovery) never double-dispatches. */
-const activeClaims = new Set<string>();
 
-/**
- * Boot reconciliation: for every pending marker older than this boot whose
- * guarded event never landed, either finish the recording (turn settled,
- * only the delivery record was lost) or re-dispatch a worker — resuming
- * the interrupted session when one exists, fresh otherwise — and record
- * the missing events when it settles. A terminal job's obsolete request is
- * retired with a durable audit instead (it can never be honored).
- * Failures escalate action-required.
- */
+
+/** Boot wrapper reports scoped historical failures without aborting independent initialization. */
 export async function reconcilePendingRebriefs(
   deps: ReconcileRebriefDeps,
-  opts: { readonly bootAt?: Date } = {},
+  opts: { readonly limit?: number } = {},
 ): Promise<ReconcileReport> {
-  const bootAt = opts.bootAt ?? new Date();
-  const markers = deps.ledger
-    .listPendingRebriefs()
-    .filter((marker) => Date.parse(marker.requestedAt) < bootAt.getTime() && !activeClaims.has(marker.id));
-  if (markers.length === 0) {
-    return { examined: 0, completed: 0, redispatched: 0, retired: 0, settled: Promise.resolve() };
-  }
-  const byJob = new Map<string, PendingRebriefRecord[]>();
-  for (const marker of markers) {
-    const group = byJob.get(marker.jobId);
-    if (group === undefined) byJob.set(marker.jobId, [marker]);
-    else group.push(marker);
-  }
+  return observePendingRebriefs(deps, opts);
+}
 
+/** Observe bounded whole historical generations at boot and on ticks.
+ * New protocol writers never create these markers. Timestamps (including
+ * same-millisecond/future-clock records) cannot hide unknown progress or
+ * prove no effects. Only genuine spent evidence or guarded terminal
+ * retirement advances; otherwise exact Gru judgment is owed, never replay. */
+export function observePendingRebriefs(
+  deps: ReconcileRebriefDeps,
+  opts: { readonly limit?: number } = {},
+): ReconcileReport {
+  if (deps.stopSignal?.aborted || deps.stopping?.()) return { examined: 0, completed: 0, redispatched: 0, retired: 0, failed: 0, settled: Promise.resolve() };
+  const scope = 'historical-rebrief-observation';
+  const retryScope = `${scope}-retry`;
+  const limit = opts.limit ?? 100;
+  let cursor = deps.ledger.readReconcileCursor(scope) ?? 0;
+  const groups = deps.ledger.listPendingRebriefGroups({ afterRowid: cursor, limit });
+  // One durable retry slot supplements the fair main page: a failure is
+  // reconsidered on the next pass without starving unrelated generations.
+  const retryCursor = deps.ledger.readReconcileCursor(retryScope) ?? 0;
+  const retryCandidate = retryCursor > 0 ? deps.ledger.listPendingRebriefGroups({ afterRowid: retryCursor - 1, limit: 1 })[0] : undefined;
+  const retryGroup = retryCandidate?.cursor === retryCursor ? retryCandidate : undefined;
+  let nextRetryCursor = retryGroup === undefined ? 0 : retryCursor;
+  const retryOnly = retryGroup !== undefined && !groups.some((group) => group.cursor === retryCursor)
+    ? [{ ...retryGroup, fromMainPage: false }] : [];
+  const workGroups = [...retryOnly, ...groups.map((group) => ({ ...group, fromMainPage: true }))];
+  let examined = 0;
   let completed = 0;
-  let redispatched = 0;
+  const redispatched = 0;
   let retired = 0;
-  const background: Promise<void>[] = [];
-  for (const [jobId, group] of byJob) {
-    const completePair = isCompleteRebriefPair(group);
-    if (!completePair) {
-      // Without both marker kinds we cannot prove completion OR justify an
-      // administrative cancellation. Keep the anomaly visible even if the
-      // job is terminal and the surviving guarded event already landed.
-      escalateRecoveryFailure(deps, jobId, group, incompleteRebriefPairError(jobId));
-      continue;
-    }
-    const missing = group.filter((marker) => !pendingRebriefEventLanded(deps.ledger, marker));
-    if (missing.length === 0) {
-      if (deps.ledger.clearPendingRebriefsIfCurrentAndSettle(group)) {
-        completed += 1;
-      } else deps.log?.('warn', 're-brief spent markers superseded before clearing', { job: jobId });
-      continue;
-    }
-    // A terminal job can never honor the request. Retire it
-    // administratively (audited, identity-checked) instead of fabricating
-    // a delivery or escalating again at every boot. This precedes the
-    // delivery-only crash shortcut on purpose: terminality must never
-    // mint a delivery.
-    const job = deps.ledger.getJob(jobId);
-    if (job !== null && isJobTerminal(job.status)) {
-      const retirement = retireTerminalRebriefs(deps.ledger, job, group);
-      if (retirement.retired.length > 0) {
-        retired += 1;
-        deps.log?.('info', 're-brief request retired: job is terminal', {
-          job: jobId,
-          status: job.status,
-          markers: retirement.retired.map((marker) => `${marker.kind}:${marker.id}`).join(', '),
-          ...(retirement.skippedIds.length > 0 ? { skipped: retirement.skippedIds } : {}),
-        });
-      } else {
-        // Defensive boundary: a refusal or identity drift leaves the markers
-        // for the next pass — surface it rather than skipping in silence.
-        deps.log?.('warn', 're-brief retirement retired nothing', {
-          job: jobId,
-          status: job.status,
-          refused: retirement.refused,
-          skipped: retirement.skippedIds,
-        });
+  const failures: unknown[] = [];
+
+  for (const { jobId, cursor: groupCursor, fromMainPage } of workGroups) {
+    if (deps.stopSignal?.aborted || deps.stopping?.()) break;
+    if (fromMainPage) cursor = groupCursor;
+    if (groupCursor === retryCursor && nextRetryCursor === retryCursor) nextRetryCursor = 0;
+    let expected: readonly PendingRebriefRecord[] | null = null;
+    try {
+      const group = deps.ledger.listPendingRebriefs({ jobId });
+      expected = group;
+      examined += group.length;
+      if (deps.observeBlindTurn !== undefined) {
+        // Observe retained access evidence, not an invented new legacy turn.
+        // Only an exact recorded primary minion/session for this job is read;
+        // coverage observation cannot settle debt or confer work permission.
+        const minions = deps.ledger.listImplementerMinions(jobId);
+        const sessions = new Set(group.flatMap((marker) => marker.sessionFile !== null &&
+          minions.some((agent) => agent.id === marker.agentId && agent.sessionFile === marker.sessionFile)
+          ? [marker.sessionFile] : []));
+        for (const file of sessions) deps.observeBlindTurn(jobId, file);
       }
-      continue;
-    }
-    // The turn settled before the restart and only the follow-up delivery
-    // record was lost (`silas.rebrief` posted first). The lane is already
-    // delivered; record the delivery directly instead of rerunning a turn.
-    // A missing job row must NOT take this shortcut (it would mint a
-    // delivery for a job that does not exist): it falls through to the
-    // re-dispatch boundary, which escalates honestly with the markers kept.
-    if (job !== null && completePair && missing.every((marker) => marker.kind === 'job.delivered')) {
-      const anchor = group.find((marker) => marker.kind === 'job.delivered') ?? group[0];
-      const phaseId = group.find((marker) => marker.phaseId !== null)?.phaseId ?? null;
-      let followUp: ReturnType<typeof recordFollowUpDelivery>;
-      try {
-        followUp = recordFollowUpDelivery({
-          // Lane lookup can invoke an injected port (or take time). The
-          // status/generation guard and event write share one ledger txn.
-          ledger: {
-            appendCustomEvent: (fields) => deps.ledger.appendCustomEventIfCurrentRebrief(fields, group),
-            // Issue #220: see the live-path note — the report obligation is
-            // idempotent per job, safe outside the guarded event write.
-            getJob: (id) => deps.ledger.getJob(id),
-            openReportObligation: (args) => deps.ledger.openReportObligation(args),
-          },
-          worktrees: deps.worktrees,
+      const identityMarker = group.find((marker) => marker.kind === 'silas.rebrief');
+      if (identityMarker !== undefined && deps.ledger.recoveryOwnerBasis('rebrief', identityMarker.id).owned) {
+        surfaceRecoveryOwnerTransfer(deps, 'rebrief', identityMarker.id);
+        continue;
+      }
+      const completePair = isCompleteRebriefPair(group);
+      if (!completePair) {
+        // Without both marker kinds we cannot prove completion OR justify an
+        // administrative cancellation. Keep the anomaly visible even if the
+        // job is terminal and the surviving guarded event already landed.
+        escalateRecoveryFailure(deps, jobId, group, incompleteRebriefPairError(jobId));
+        continue;
+      }
+      const missing = group.filter((marker) => !pendingRebriefEventLanded(deps.ledger, marker));
+      if (missing.length === 0) {
+        if (deps.ledger.clearPendingRebriefsIfCurrentAndSettle(group)) {
+          completed += 1;
+        } else deps.log?.('warn', 're-brief spent markers superseded before clearing', { job: jobId });
+        continue;
+      }
+      // A terminal job can never honor the request. Retire it
+      // administratively (audited, identity-checked) instead of fabricating
+      // a delivery or escalating again at every boot. This precedes the
+      // delivery-only crash shortcut on purpose: terminality must never
+      // mint a delivery.
+      const job = deps.ledger.getJob(jobId);
+      if (job !== null && isJobTerminal(job.status)) {
+        const retirement = retireTerminalRebriefs(deps.ledger, job, group);
+        if (retirement.retired.length > 0) {
+          retired += 1;
+          deps.log?.('info', 're-brief request retired: job is terminal', {
+            job: jobId,
+            status: job.status,
+            markers: retirement.retired.map((marker) => `${marker.kind}:${marker.id}`).join(', '),
+            ...(retirement.skippedIds.length > 0 ? { skipped: retirement.skippedIds } : {}),
+          });
+        } else {
+          // Defensive boundary: a refusal or identity drift leaves the markers
+          // for the next pass — surface it rather than skipping in silence.
+          deps.log?.('warn', 're-brief retirement retired nothing', {
+            job: jobId,
+            status: job.status,
+            refused: retirement.refused,
+            skipped: retirement.skippedIds,
+          });
+        }
+        continue;
+      }
+      // The turn settled before the restart and only the follow-up delivery
+      // record was lost (`silas.rebrief` posted first). The lane is already
+      // delivered; record the delivery directly instead of rerunning a turn.
+      // A missing job row must NOT take this shortcut (it would mint a
+      // delivery for a job that does not exist): it falls through to the
+      // re-dispatch boundary, which escalates honestly with the markers kept.
+      if (job !== null && completePair && missing.every((marker) => marker.kind === 'job.delivered')) {
+        let followUp: ReturnType<LedgerApi['reconstructCompletedRebriefDelivery']>;
+        try {
+          const lanes = deps.worktrees.listWorktrees({ jobId }).filter((lane) => lane.kind === 'job' && lane.status !== 'swept');
+          followUp = deps.ledger.reconstructCompletedRebriefDelivery(group, lanes.length === 1 ? lanes[0] : undefined);
+          if (followUp === null) {
+            escalateRecoveryFailure(deps, jobId, group, new Error('exact original completion has no original delivery HEAD/revision — use legacy reconcile-completed control closure plus separate current artifact inspection; original-work successor and historical fabrication are forbidden'));
+            continue;
+          }
+        } catch (error) {
+          if (!(error instanceof PendingRebriefNoLongerCurrent)) throw error;
+          const finalized = finalizeRebriefRequest({
+            ledger: deps.ledger, worktrees: deps.worktrees, jobId,
+            minionId: null, lanePath: null, note: null, expectedMarkers: group,
+          });
+          if (finalized.retired) retired += 1;
+          deps.log?.('info', 're-brief delivery-only shortcut cancelled before recording', {
+            job: jobId, reason: error.reason, retired: finalized.retired,
+            superseded: finalized.superseded,
+            ...(finalized.retirement !== null ? { refused: finalized.retirement.refused, skipped: finalized.retirement.skippedIds } : {}),
+          });
+          continue;
+        }
+        if (!deps.ledger.clearPendingRebriefsIfCurrentAndSettle(group)) {
+          deps.log?.('warn', 're-brief delivery recorded but request was superseded before clearing', { job: jobId });
+          continue;
+        }
+        deps.ledger.appendCustomEvent({
+          kind: 'silas.rebrief-recovered',
           jobId,
-          agentId: anchor?.agentId ?? null,
-          source: 'silas-rebrief',
-          ...(phaseId !== null ? { phaseId } : {}),
-          workRevision: anchor?.workRevision ?? 0,
+          payload: { path: 'delivery-only', delivered_sha: (followUp.payload as { sha: string }).sha, original_provenance: (followUp.payload as { provenance: unknown }).provenance },
         });
-      } catch (error) {
-        if (!(error instanceof PendingRebriefNoLongerCurrent)) throw error;
-        const finalized = finalizeRebriefRequest({
-          ledger: deps.ledger, worktrees: deps.worktrees, jobId,
-          minionId: null, lanePath: null, note: null, expectedMarkers: group,
-        });
-        if (finalized.retired) retired += 1;
-        deps.log?.('info', 're-brief delivery-only shortcut cancelled before recording', {
-          job: jobId, reason: error.reason, retired: finalized.retired,
-          superseded: finalized.superseded,
-          ...(finalized.retirement !== null ? { refused: finalized.retirement.refused, skipped: finalized.retirement.skippedIds } : {}),
-        });
+        deps.log?.('info', 're-brief delivery recorded from a crash window', { job: jobId });
+        completed += 1;
         continue;
       }
-      if (!deps.ledger.clearPendingRebriefsIfCurrentAndSettle(group)) {
-        deps.log?.('warn', 're-brief delivery recorded but request was superseded before clearing', { job: jobId });
+      if (job === null) {
+        escalateRecoveryFailure(deps, jobId, group, new Error(`job "${jobId}" no longer exists — historical progress is unprovable`));
         continue;
       }
-      deps.ledger.appendCustomEvent({
-        kind: 'silas.rebrief-recovered',
-        jobId,
-        payload: { path: 'delivery-only', delivered_sha: followUp.sha },
-      });
-      deps.log?.('info', 're-brief delivery recorded from a crash window', { job: jobId });
-      completed += 1;
-      continue;
+      escalateRecoveryFailure(deps, jobId, group, new Error('legacy re-brief has no exact native request checkpoint — original prompt and fresh-session fallback are forbidden; concrete Gru recovery decision required'));
+    } catch (error) {
+      failures.push(error);
+      nextRetryCursor = nextRetryCursor === 0 ? groupCursor : Math.min(nextRetryCursor, groupCursor);
+      deps.log?.('error', 'historical re-brief observation failed', { job: jobId, error: String(error) });
+      // Storage inspection or inability to persist an actionable fence is
+      // still a loud shared-precondition failure, not successful recovery.
+      if (expected === null) throw error;
+      const current = deps.ledger.listPendingRebriefs({ jobId });
+      if (sameRebriefGeneration(current, expected) && expected.every((marker) => current.some((row) =>
+        row.id === marker.id && row.agentId === marker.agentId && row.sessionFile === marker.sessionFile && row.workRevision === marker.workRevision))) {
+        escalateRecoveryFailure(deps, jobId, expected, error);
+      }
     }
-    redispatched += 1;
-    background.push(redispatchGroup(deps, jobId, group));
   }
+  deps.ledger.writeReconcileCursor({ scope: retryScope, cursor: nextRetryCursor });
+  deps.ledger.writeReconcileCursor({ scope, cursor: groups.length < limit && !deps.stopSignal?.aborted && !deps.stopping?.() ? 0 : cursor });
   return {
-    examined: markers.length,
+    examined,
     completed,
     redispatched,
     retired,
-    settled: Promise.all(background).then(() => undefined),
+    failed: failures.length,
+    settled: Promise.resolve(),
   };
-}
-
-/** One job's re-dispatch: resume when a session exists, fresh otherwise;
- * record the missing events on settle; escalate when recovery fails. */
-async function redispatchGroup(
-  deps: ReconcileRebriefDeps,
-  jobId: string,
-  group: readonly PendingRebriefRecord[],
-): Promise<void> {
-  for (const marker of group) activeClaims.add(marker.id);
-  let path: 'resumed' | 'redispatched' = 'redispatched';
-  try {
-    const job = deps.ledger.getJob(jobId);
-    if (job === null) throw new Error(`job "${jobId}" no longer exists`);
-    if (isJobTerminal(job.status)) {
-      // Defensive second boundary: the pass that queued this group saw a
-      // nonterminal job. If terminality landed anyway, retire (never
-      // re-dispatch, never escalate an unhonorable request).
-      const currentMarkers = deps.ledger.listPendingRebriefs({ jobId });
-      if (currentMarkers.length > 0 && !isCompleteRebriefPair(currentMarkers)) {
-        throw incompleteRebriefPairError(jobId);
-      }
-      const retirement = retireTerminalRebriefs(deps.ledger, job, group);
-      if (retirement.retired.length > 0) {
-        deps.log?.('info', 're-brief request retired: job terminal before re-dispatch', {
-          job: jobId,
-          status: job.status,
-        });
-      } else {
-        deps.log?.('warn', 're-brief retirement retired nothing before re-dispatch', {
-          job: jobId,
-          status: job.status,
-          refused: retirement.refused,
-          skipped: retirement.skippedIds,
-        });
-      }
-      return;
-    }
-    if (!isCompleteRebriefPair(group)) throw incompleteRebriefPairError(jobId);
-    const lane = deps.worktrees
-      .listWorktrees({ jobId })
-      .find((candidate) => candidate.kind === 'job' && candidate.status !== 'swept');
-    if (lane === undefined) {
-      throw new Error(`job "${jobId}" has no active job lane — a re-brief needs its worktree`);
-    }
-    capturePortLaneHandoff(deps.worktrees, lane)();
-    const rebriefMarker = group.find((marker) => marker.kind === 'silas.rebrief') ?? group[0];
-    const note = rebriefMarker?.note ?? '';
-    const expectedPhaseId = group.find((marker) => marker.phaseId !== null)?.phaseId ?? null;
-    const resumeFile = resolveResumeFile(deps, jobId, group);
-    let result: Awaited<ReturnType<typeof rebriefFreshMinion>>;
-    try {
-      result = await runRebriefTurn(deps, {
-        jobId,
-        note,
-        // The durable request's own contract (the effective contract at
-        // request time — owner rule 4), never a fresh read that could carry
-        // amendments this request's revision stamp does not cover.
-        briefing: rebriefMarker?.briefing ?? job.briefing,
-        group,
-        ...(resumeFile !== null ? { resumeFile } : {}),
-      });
-      throwIfTurnInBandError(result);
-      path = resumeFile !== null ? 'resumed' : 'redispatched';
-    } catch (error) {
-      if (resumeFile === null || error instanceof RebriefTurnCancelled) throw error;
-      deps.log?.('warn', 're-brief resume failed — retrying with a fresh worker', {
-        job: jobId,
-        resume_file: resumeFile,
-        error: String(error),
-      });
-      result = await runRebriefTurn(deps, { jobId, note, briefing: rebriefMarker?.briefing ?? job.briefing, group });
-      throwIfTurnInBandError(result);
-    }
-    const finalized = finalizeRebriefRequest({
-      ledger: deps.ledger,
-      worktrees: deps.worktrees,
-      jobId,
-      minionId: result.minionId,
-      lanePath: result.lanePath,
-      note,
-      expectedPhaseId,
-      expectedMarkers: group,
-    });
-    if (finalized.retired) {
-      // The job reached terminal while the recovered turn was in flight:
-      // the ledger already recorded the retirement, the turn's artifacts
-      // stay on the lane, and no recovery/delivery event is fabricated.
-      // A partial retirement keeps its kept-marker ids visible at this
-      // surface too (the audit is the durable record; the log must not
-      // drop what the caller-reported disposition carries).
-      deps.log?.('info', 're-brief recovery closed: job went terminal mid-turn', {
-        job: jobId,
-        path,
-        minion_id: result.minionId,
-        ...(finalized.retirement !== null
-          ? { refused: finalized.retirement.refused, skipped: finalized.retirement.skippedIds }
-          : {}),
-      });
-      return;
-    }
-    if (finalized.retirement !== null) {
-      // The terminal boundary examined the request but retired nothing
-      // (refusal or identity drift). The markers stay for the next pass and
-      // no recovery event may claim the request was recovered.
-      deps.log?.('warn', 're-brief recovery closed without retirement: markers kept', {
-        job: jobId,
-        path,
-        refused: finalized.retirement.refused,
-        skipped: finalized.retirement.skippedIds,
-      });
-      return;
-    }
-    if (finalized.superseded) {
-      // A newer re-brief request replaced the markers while this recovery
-      // turn ran: record nothing (its own turn owns the lane) and keep the
-      // newer markers pending. The older receipt is evidence only.
-      deps.log?.('warn', 're-brief recovery turn superseded by a newer request — nothing recorded', {
-        job: jobId,
-      });
-      return;
-    }
-    deps.ledger.appendCustomEvent({
-      kind: 'silas.rebrief-recovered',
-      jobId,
-      payload: {
-        path,
-        minion_id: result.minionId,
-        rebrief_recorded: finalized.rebriefRecorded,
-        delivery_recorded: finalized.deliveryRecorded,
-        delivered_sha: finalized.deliveredSha,
-      },
-    });
-    deps.log?.('info', 're-brief recovered after restart', {
-      job: jobId,
-      path,
-      minion_id: result.minionId,
-    });
-  } catch (error) {
-    const currentJob = deps.ledger.getJob(jobId);
-    const currentMarkers = deps.ledger.listPendingRebriefs({ jobId });
-    if (error instanceof IncompleteRebriefPairError || (currentMarkers.length > 0 && !isCompleteRebriefPair(currentMarkers))) {
-      escalateRecoveryFailure(deps, jobId, group, incompleteRebriefPairError(jobId));
-      return;
-    }
-    if (error instanceof RebriefTurnCancelled || (currentJob !== null && isJobTerminal(currentJob.status))) {
-      // A failed turn after a terminal flip is no longer actionable. Close
-      // only the admitted generation; the failure must not resurrect its
-      // markers or raise an obsolete action-required incident.
-      const finalized = finalizeRebriefRequest({
-        ledger: deps.ledger, worktrees: deps.worktrees, jobId,
-        minionId: null, lanePath: null, note: null, expectedMarkers: group,
-      });
-      deps.log?.('info', 're-brief recovery closed after cancellation or terminal turn failure', {
-        job: jobId, error: String(error), retired: finalized.retired,
-        superseded: finalized.superseded,
-        ...(finalized.retirement !== null ? { refused: finalized.retirement.refused, skipped: finalized.retirement.skippedIds } : {}),
-      });
-      return;
-    }
-    if (deps.stopping?.() === true) {
-      // Shutdown killed the turn, not a recovery failure: markers stay for
-      // the next boot, and no incident is posted for a planned restart.
-      deps.log?.('warn', 're-brief recovery interrupted by shutdown — marker kept for the next boot', {
-        job: jobId,
-        error: String(error),
-      });
-      return;
-    }
-    escalateRecoveryFailure(deps, jobId, group, error);
-  } finally {
-    for (const marker of group) activeClaims.delete(marker.id);
-  }
-}
-
-/** Spawn (optionally resuming) the re-brief worker, binding its markers
- * before the prompt is delivered. */
-function runRebriefTurn(
-  deps: ReconcileRebriefDeps,
-  input: {
-    jobId: string;
-    note: string;
-    briefing: string | null;
-    group: readonly PendingRebriefRecord[];
-    resumeFile?: string;
-  },
-): ReturnType<typeof rebriefFreshMinion> {
-  return rebriefFreshMinion({
-    registry: deps.registry,
-    ledger: deps.ledger,
-    worktrees: deps.worktrees,
-    ...(deps.workerGate !== undefined ? { workerGate: deps.workerGate } : {}),
-    ...(deps.retrySettlement !== undefined ? { retrySettlement: deps.retrySettlement } : {}),
-    ...(deps.parentTools !== undefined ? { parentTools: deps.parentTools } : {}),
-    ...(deps.stopSignal !== undefined ? { signal: deps.stopSignal } : {}),
-    jobId: input.jobId,
-    note: input.note,
-    briefing: input.briefing,
-    workRevision: input.group.find((marker) => marker.workRevision !== null)?.workRevision ?? null,
-    ...(input.resumeFile !== undefined ? { resumeFile: input.resumeFile } : {}),
-    ...(deps.observeBlindTurn !== undefined ? { observeBlindTurn: deps.observeBlindTurn } : {}),
-    beforeTurnSideEffect: () => checkRebriefTurn(deps.ledger, input.jobId, input.group),
-    onSpawned: (worker) => {
-      deps.ledger.bindPendingRebriefWorker({
-        ids: input.group.map((marker) => marker.id),
-        agentId: worker.id,
-        sessionFile: worker.sessionFile,
-      });
-    },
-  });
-}
-
-/** A recovery turn that RESOLVED with an in-band runtime error is a
- * failed turn, not a delivery: it must take the same failure ladder as a
- * rejected prompt (resume retry, then a bounded escalation) and never
- * record guarded events or complete a marked phase. */
-function throwIfTurnInBandError(result: Awaited<ReturnType<typeof rebriefFreshMinion>>): void {
-  if (result.outcome === 'error') {
-    throw new Error(`re-brief turn settled with an in-band runtime error: ${result.error ?? 'unknown'}`);
-  }
-}
-
-/** The interrupted worker's session, when one exists on disk: the marker's
- * bound session first, then the job's latest IMPLEMENTER minion (a crash
- * between spawn and marker binding). Review-only sessions (Gru ruling
- * 2026-09-29) are never resume candidates, no matter how new their rows
- * are. No resumable session means a fresh worker. */
-function resolveResumeFile(
-  deps: ReconcileRebriefDeps,
-  jobId: string,
-  group: readonly PendingRebriefRecord[],
-): string | null {
-  const implementers = deps.ledger.listImplementerMinions(jobId);
-  const implementerSessions = new Set(
-    implementers.flatMap((agent) => (agent.sessionFile !== null && agent.sessionFile !== '' ? [agent.sessionFile] : [])),
-  );
-  let markerSession = group.find((marker) => marker.sessionFile !== null)?.sessionFile ?? null;
-  if (markerSession !== null && !implementerSessions.has(markerSession)) {
-    // A marker bound to a REVIEW-ONLY worker's session must never resume a
-    // reviewer (edge review 2026-10-05): legacy markers written before the
-    // implementer-only ruling can carry one. The session's OWNER decides
-    // — a row that is not an implementer rejects the marker session; a
-    // MISSING row (crash between binding and registration, or a swept
-    // record) keeps the legacy resume: the marker is the durable binding
-    // of the spawn that wrote it, and no evidence contradicts it.
-    const owner = deps.ledger.listAgents().find((agent) => agent.sessionFile === markerSession) ?? null;
-    const ownerIsReviewOnly = owner !== null && !implementers.some((agent) => agent.id === owner.id);
-    if (ownerIsReviewOnly) markerSession = null;
-  }
-  const latestMinion = implementers.find((agent) => agent.sessionFile !== null) ?? null;
-  const candidates = [markerSession, latestMinion?.sessionFile ?? null];
-  for (const candidate of candidates) {
-    if (candidate !== null && candidate !== '' && existsSync(candidate)) return candidate;
-  }
-  return null;
 }
 
 /** Stable audit reason: the request is closed administratively because the
@@ -847,6 +544,9 @@ function escalateRecoveryFailure(
   error: unknown,
 ): void {
   const kinds = group.map((marker) => marker.kind).join(', ');
+  const marker = group.find((marker) => marker.kind === 'silas.rebrief') ?? group[0];
+  const job = deps.ledger.getJob(jobId);
+  const debt = marker === undefined || job === null || isJobTerminal(job.status) ? null : deps.ledger.openRebriefRecoveryDebt(marker.id, String(error));
   // Bind the row to the CURRENTLY recorded re-brief worker when one exists
   // (existing agentId semantics) so the escalation is classified as a
   // closed receipt once the lane goes terminal; the in-memory group is a
@@ -868,7 +568,7 @@ function escalateRecoveryFailure(
       detail:
         `A re-brief request was mid-flight at service restart and boot recovery could not ` +
         `safely complete the request: ${String(error)}. Pending markers (${kinds}) remain; the ` +
-        'next boot retries — or re-brief the lane once the cause is cleared.',
+        `original prompt is never replayed. Concrete Gru decision: GET /api/silas/rebriefs/${marker?.id ?? 'unknown'}, then POST its /recover with expected_generation ${debt?.generation ?? 'unknown'}, expected_payload_hash ${marker?.payloadHash ?? 'unknown'}, expected_receipt_evidence_sha256 from that authenticated readback, fresh HEAD, epoch and approved revision/contract. This evidence hash only fences stale intent; lone delivery is partial history, not completion/no effects. If exact original completion lacks original delivery facts, choose legacy-only reconcile-completed with a distinct inspection_request_id: close old control without execution/fabrication and leave a concrete current-inspection obligation, then separately use its existing directive/verification APIs. Suspended/incoherent generations may only transfer exact unknown context to a real job-wide owner hold; successor remains forbidden. A generic hold/prose disposition does not answer this debt.`,
       dedupe: 'unacked',
       agentId: boundAgent,
     });
@@ -920,7 +620,21 @@ export interface DirectiveReconcileReport {
  * dedupe), no provider calls, no worker spawns, no re-dispatch.
  */
 export function reconcilePendingDirectives(deps: ReconcileDirectivesDeps): DirectiveReconcileReport {
-  const live = listAllLiveDirectives(deps.ledger);
+  return reconcilePendingDirectivesForRows(deps, false);
+}
+
+/** Boot-only legacy protocol reconciliation. Current requests are owned by
+ * DirectiveProgressService and require their exact native checkpoint; only
+ * rows predating that protocol may use correlated event-only recovery. */
+export function reconcilePendingLegacyDirectives(deps: ReconcileDirectivesDeps): DirectiveReconcileReport {
+  return reconcilePendingDirectivesForRows(deps, true);
+}
+
+function reconcilePendingDirectivesForRows(
+  deps: ReconcileDirectivesDeps,
+  legacyOnly: boolean,
+): DirectiveReconcileReport {
+  const live = listAllLiveDirectives(deps.ledger).filter((row) => !legacyOnly || row.requestKind === null);
   let completed = 0;
   let escalated = 0;
   for (const row of live) {
@@ -1102,6 +816,10 @@ function listAllLiveDirectives(ledger: LedgerApi): readonly DirectiveRequestReco
  * returns null: unknown stays unknown. */
 function completeDirectiveFromEvidence(ledger: LedgerApi, row: DirectiveRequestRecord): DirectiveRequestRecord | null {
   let current = row;
+  // Event-only decoding belongs solely to rows accepted by the historical
+  // protocol. Every current request requires exact native checkpoint proof,
+  // even if its admission binding has already been persisted.
+  if (current.requestKind !== null) return null;
   if (current.state === 'dispatching') {
     const sent = findCorrelatedEvent(ledger, current.jobId, current.requestId, 'silas.directive-sent', (event) => event.seq > current.baselineSeq);
     if (sent === null) return null;

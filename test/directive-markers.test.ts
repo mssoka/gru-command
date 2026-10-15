@@ -20,8 +20,10 @@ import type { DirectiveRegistry } from '../src/dispatch/fix-directive.js';
 import type { DispatchService } from '../src/dispatch/service.js';
 import type { WaveRunner } from '../src/dispatch/perkins.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
+import { makeFixtureRepo } from './helpers/fixture-repo.js';
+import { DirectiveNativeFixture, markHistoricalDirectiveFixture } from './helpers/directive-native-fixture.js';
 import type { Role } from '../src/config.js';
-import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
+import type { AgentCapabilities, AgentHandle, PromptOptions, SpawnOptions } from '../src/runtime/types.js';
 
 /**
  * Durable directive requests (phase 3 slice). Offline and deterministic:
@@ -54,6 +56,7 @@ function tmpDir(): string {
 /** Drive one directive request to `settled` with real correlated events. */
 function settleDirective(api: LedgerApi, jobId: string, requestId: string, minionId: string): void {
   api.beginDirectiveIntent({ jobId, directive: `settled ${requestId}`, holder: 'silas-ops', requestId });
+  markHistoricalDirectiveFixture(api, requestId);
   const sent = api.appendCustomEvent({
     kind: 'silas.directive-sent',
     jobId,
@@ -97,6 +100,7 @@ describe('directive requests — durable ledger contract', () => {
       directive: 'fix the blocker',
       holder: 'silas-ops',
       requestId: 'req-d1',
+      sourceContext: { ruleId: 'rule-original', sourceRoundId: 'round-original' },
     }).record;
     expect(intent.state).toBe('dispatching');
     expect(intent.claim?.holder).toBe('silas-ops');
@@ -108,6 +112,7 @@ describe('directive requests — durable ledger contract', () => {
       directive: 'fix the blocker',
       holder: 'silas-ops',
       requestId: 'req-d1',
+      sourceContext: { ruleId: 'rule-original', sourceRoundId: 'round-original' },
     }).record;
     expect(replay.requestId).toBe('req-d1');
     expect(replay.payloadHash).toBe(intent.payloadHash);
@@ -116,6 +121,8 @@ describe('directive requests — durable ledger contract', () => {
     expect(() =>
       api.beginDirectiveIntent({ jobId: 'job-d1', directive: 'DIFFERENT work', holder: 'silas-ops', requestId: 'req-d1' }),
     ).toThrow(DirectiveConflictError);
+    expect(() => api.beginDirectiveIntent({ jobId: 'job-d1', directive: 'fix the blocker', holder: 'silas-ops', requestId: 'req-d1',
+      sourceContext: { ruleId: 'different-rule', sourceRoundId: 'round-original' } })).toThrow(DirectiveConflictError);
     // Terminal lanes take no directives.
     api.addJob({ id: 'job-done', repo: 'r', title: 'Done' });
     api.setJobStatus('job-done', 'working');
@@ -185,6 +192,7 @@ describe('directive requests — durable ledger contract', () => {
     api.addJob({ id: 'job-d3x', repo: 'r', title: 'Job D3x' });
     api.setJobStatus('job-d3', 'working');
     api.beginDirectiveIntent({ jobId: 'job-d3', directive: 'run', holder: 'silas-ops', requestId: 'req-d3' });
+    markHistoricalDirectiveFixture(api, 'req-d3'); // legacy event-validation contract
     // Fabricated sequence.
     expect(() => api.recordDirectiveAdmission({ requestId: 'req-d3', minionId: 'm1', eventSeq: 987_654 })).toThrow(
       /does not exist/u,
@@ -261,6 +269,7 @@ describe('directive requests — boot reconciliation (crash windows, bounded, no
       ledger.addJob({ id: 'job-r1', repo: 'r', title: 'Job R1' });
       ledger.setJobStatus('job-r1', 'working');
       ledger.beginDirectiveIntent({ jobId: 'job-r1', directive: 'run', holder: 'silas-ops', requestId: 'req-r1' });
+      markHistoricalDirectiveFixture(ledger, 'req-r1'); // historical event-only crash window
       // The turn DID admit and deliver; the crash hit between the event
       // append and the request-record update.
       const sent = ledger.appendCustomEvent({
@@ -316,6 +325,7 @@ describe('directive requests — boot reconciliation (crash windows, bounded, no
       ledger.addJob({ id: 'job-r3', repo: 'r', title: 'Job R3' });
       ledger.setJobStatus('job-r3', 'working');
       ledger.beginDirectiveIntent({ jobId: 'job-r3', directive: 'run', holder: 'silas-ops', requestId: 'req-r3' });
+      markHistoricalDirectiveFixture(ledger, 'req-r3');
       const sent = ledger.appendCustomEvent({
         kind: 'silas.directive-sent',
         jobId: 'job-r3',
@@ -387,6 +397,7 @@ describe('directive requests — boot reconciliation (crash windows, bounded, no
       ledger.addJob({ id: 'job-w1', repo: 'r', title: 'Job W1' });
       ledger.setJobStatus('job-w1', 'working');
       ledger.beginDirectiveIntent({ jobId: 'job-w1', directive: 'run', holder: 'silas-ops', requestId: 'req-w1' });
+      markHistoricalDirectiveFixture(ledger, 'req-w1');
       // Admission evidence exists; the terminal receipt does not. Boot
       // recovery records the admission from the event, so the card must
       // describe the request as ADMITTED — never as admission-unknown.
@@ -411,6 +422,7 @@ describe('directive requests — boot reconciliation (crash windows, bounded, no
 
 describe('directive requests — the real service path (HTTP 202 + readback)', () => {
   class FakeMinions implements DirectiveRegistry {
+    constructor(private readonly cwd: string) {}
     readonly prompts: { id: string; text: string }[] = [];
     gate: Promise<void> | null = null;
     private readonly handles = new Map<string, AgentHandle>();
@@ -430,21 +442,28 @@ describe('directive requests — the real service path (HTTP 202 + readback)', (
     }
 
     async disposeHandle(handle: AgentHandle): Promise<void> {
+      await handle.dispose();
       this.handles.delete(handle.id);
     }
 
     private handleFor(id: string): AgentHandle {
       const gate = (): Promise<void> | null => this.gate;
       const prompts = this.prompts;
+      let disposed = false;
+      const native = new DirectiveNativeFixture(join(tmpDir(), `${id}.jsonl`), id, undefined, this.cwd);
       return {
         role: 'minion',
         id,
-        sessionFile: null,
+        sessionFile: native.file,
         capabilities: FAKE_CAPABILITIES,
-        async prompt(text: string): Promise<void> {
+        prepareDirectiveProducer: native.prepare,
+        inspectDirective: native.inspect,
+        async prompt(text: string, options?: PromptOptions): Promise<void> {
+          native.begin(text, options);
           prompts.push({ id, text });
           const pending = gate();
           if (pending !== null) await pending;
+          native.end();
         },
         async steer(): Promise<void> {},
         async followUp(): Promise<void> {},
@@ -454,7 +473,8 @@ describe('directive requests — the real service path (HTTP 202 + readback)', (
         health(): { state: 'idle'; lastActivity: null; sessionFile: null } {
           return { state: 'idle', lastActivity: null, sessionFile: null };
         },
-        async dispose(): Promise<void> {},
+        async dispose(): Promise<void> { native.ceased(); disposed = true; },
+        cessationEvidence: () => disposed ? 'ceased' : 'unknown',
       };
     }
   }
@@ -475,11 +495,15 @@ describe('directive requests — the real service path (HTTP 202 + readback)', (
     const ledger = new LedgerApi(db.handle, { bus });
     const notifications = new NotificationCenter({ ledger, bus });
     const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'), ledger);
-    const registry = new FakeMinions();
     ledger.addJob({ id: 'job-h1', repo: 'r', title: 'Job H1' });
     ledger.setJobStatus('job-h1', 'working');
-    ledger.registerAgent({ id: 'minion-h1', role: 'minion', sessionFile: null, jobId: 'job-h1' });
+    const repo = makeFixtureRepo('directive-http-original-lane');
+    const lane = await worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'job-h1' });
+    if (ledger.getWorktree(lane.id) === null) ledger.registerWorktree(lane);
+    const registry = new FakeMinions(lane.path);
     registry.register('minion-h1');
+    ledger.registerAgent({ id: 'minion-h1', role: 'minion', sessionFile: registry.getHandle('minion-h1')!.sessionFile, jobId: 'job-h1' });
+    ledger.setAgentState('minion-h1', 'idle');
     // The directive route touches the silas ops surface + ledger, and asks
     // the review owner whether a review holds the lane (owner rule 5): this
     // lane is never under review, so the writer gate is an idle double.
@@ -505,6 +529,7 @@ describe('directive requests — the real service path (HTTP 202 + readback)', (
       close: async () => {
         server.dispose();
         await new Promise<void>((resolveClose) => http.close(() => resolveClose()));
+        repo.cleanup();
       },
     };
   }
@@ -557,7 +582,7 @@ describe('directive requests — the real service path (HTTP 202 + readback)', (
       // Readback mid-flight: accepted, admission may already be recorded.
       const inflight = await get(h.port, 'req-http-1');
       expect(inflight.status).toBe(200);
-      expect(['dispatching', 'admitted']).toContain(inflight.body['state']);
+      expect(inflight.body['state']).toBe('admitted');
       release();
       const settled = await until(() => {
         const row = h.ledger.getDirective('req-http-1');

@@ -1819,7 +1819,7 @@ export class WaveRunner {
       if (startedFor !== undefined && startedFor !== queued.seq) {
         // A terminal marker for a DIFFERENT request does not satisfy this one.
       }
-      const delivered = this.opts.ledger.latestJobEvent(job.id, 'job.delivered');
+      const delivered = this.opts.ledger.latestCandidateDelivery(job.id);
       // A pass that paid a corrective delivery's verification (option A)
       // re-offers the request just like a delivery does.
       const verifiedAfter = this.opts.ledger.latestJobEvent(job.id, 'verification.completed');
@@ -2784,7 +2784,7 @@ export class WaveRunner {
       .map((lane) => ({
         jobId: lane.jobId!, path: lane.path,
         statusSeq: this.opts.ledger.latestJobEvent(lane.jobId!, 'job.status')?.seq ?? 0,
-        deliverySeq: this.opts.ledger.latestJobEvent(lane.jobId!, 'job.delivered')?.seq ?? 0,
+        deliverySeq: this.opts.ledger.latestCandidateDelivery(lane.jobId!)?.seq ?? 0,
         markerIds: this.opts.ledger.listPendingRebriefs({ jobId: lane.jobId! }).map((marker) => marker.id),
       }));
     const fallbackBaseline = {
@@ -2792,7 +2792,7 @@ export class WaveRunner {
       branchOwners,
       forceAuthorization: forceAuthorization ?? new Map(),
       markerIds: this.opts.ledger.listPendingRebriefs({ jobId: input.jobId }).map((marker) => marker.id),
-      deliverySeq: this.opts.ledger.latestJobEvent(input.jobId, 'job.delivered')?.seq ?? 0,
+      deliverySeq: this.opts.ledger.latestCandidateDelivery(input.jobId)?.seq ?? 0,
       statusSeq: this.opts.ledger.latestJobEvent(input.jobId, 'job.status')?.seq ?? 0,
       settlementSeq: this.opts.ledger.latestJobEvent(input.jobId, 'silas.rebrief-settled')?.seq ?? 0,
     };
@@ -3392,7 +3392,7 @@ export class WaveRunner {
     const job = this.opts.ledger.getJob(retry.input.jobId);
     if (job === null) return 'the job no longer exists';
     if (!WaveRunner.HANDOFF_AUTHORIZED_STATUSES.has(job.status)) return `the job is ${job.status}`;
-    const deliverySeq = this.opts.ledger.latestJobEvent(job.id, 'job.delivered')?.seq ?? 0;
+    const deliverySeq = this.opts.ledger.latestCandidateDelivery(job.id)?.seq ?? 0;
     if (deliverySeq !== retry.deliverySeq) return 'a newer delivery replaced the refused one';
     const rounds = this.opts.ledger.listRounds(job.id);
     if (rounds[rounds.length - 1]?.id !== retry.roundId) return 'a newer review round already started';
@@ -3417,6 +3417,11 @@ export class WaveRunner {
       this.opts.inform?.(`Automatic review retry for job ${jobId} skipped`,
         `Retry ${retry.attempt} after refused round ${retry.roundId} did not run: ${reason}.`, context);
     };
+    // A new setup may still refuse and take this exact waiting retry over.
+    // Its provisional round/status are not a completed successor. Leave the
+    // original attempt/due time intact; setup's finally re-arms after rollback
+    // (or the usual successor proof then skips it after real admission).
+    if (this.roundAdmission.has(jobId)) return;
     const skipped = this.admissionRetrySkipReason(retry);
     if (skipped !== null) return skip(skipped);
     retry.running = true;
@@ -3619,7 +3624,7 @@ export class WaveRunner {
       );
     }
     if (fallbackWorkingStartedSince(this.opts.ledger, input.jobId, admission.statusSeq) ||
-        (this.opts.ledger.latestJobEvent(input.jobId, 'job.delivered')?.seq ?? 0) !== admission.deliverySeq ||
+        (this.opts.ledger.latestCandidateDelivery(input.jobId)?.seq ?? 0) !== admission.deliverySeq ||
         (this.opts.ledger.latestJobEvent(input.jobId, 'silas.rebrief-settled')?.seq ?? 0) !== admission.settlementSeq ||
         (input.force !== true && jobNow !== null && laneIsBusy(this.opts.ledger, jobNow))) {
       throw new FallbackSafetyRefusal(
@@ -3652,7 +3657,7 @@ export class WaveRunner {
       const owner = admission.branchOwners.find((entry) => entry.jobId === candidate.jobId && entry.path === candidate.path);
       if (owner === undefined) return true;
       return fallbackWorkingStartedSince(this.opts.ledger, owner.jobId, owner.statusSeq) ||
-        (this.opts.ledger.latestJobEvent(owner.jobId, 'job.delivered')?.seq ?? 0) !== owner.deliverySeq ||
+        (this.opts.ledger.latestCandidateDelivery(owner.jobId)?.seq ?? 0) !== owner.deliverySeq ||
         JSON.stringify(this.opts.ledger.listPendingRebriefs({ jobId: owner.jobId }).map((marker) => marker.id)) !==
           JSON.stringify(owner.markerIds);
     })) {
@@ -4153,7 +4158,7 @@ export class WaveRunner {
     if (this.shuttingDown || setupSignal.aborted) throw new Error('Perkins review service is shutting down');
     // R7-14: the delivery THIS round reviews — fixed before any await, so a
     // delivery that lands during the probe never becomes a retry's baseline.
-    const reviewedDeliverySeq = this.opts.ledger.latestJobEvent(input.jobId, 'job.delivered')?.seq ?? 0;
+    const reviewedDeliverySeq = this.opts.ledger.latestCandidateDelivery(input.jobId)?.seq ?? 0;
     const policy = (this.opts.reviewPolicyLoader ?? loadPerkinsPolicy)();
     const job = this.opts.ledger.getJob(input.jobId);
     if (job === null) throw new Error(`job "${input.jobId}" not found — nothing to review`);
@@ -4388,7 +4393,7 @@ export class WaveRunner {
       // under the clean-abort provenance (the next digest sweep offers the
       // changed-head re-review instead).
       if (input.boundDeliveredSha !== undefined) {
-        const deliveredNow = this.opts.ledger.latestJobEvent(job.id, 'job.delivered');
+        const deliveredNow = this.opts.ledger.latestCandidateDelivery(job.id);
         const shaNow = deliveredNow === null ? null : deliveredTargetSha(deliveredNow);
         if (shaNow !== input.boundDeliveredSha) {
           throw new Error(

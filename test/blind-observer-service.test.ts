@@ -8,6 +8,8 @@ import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { admitBlindReview, recordBlindAdmission, BLIND_ACCESS_EVENT, type BlindCoverage } from '../src/dispatch/blind-review.js';
 import { pickFreePort, startRealService } from './helpers/real-service.mjs';
+import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 
 /**
  * The production startup observer assembly (issue #339 F3): the real
@@ -20,8 +22,10 @@ import { pickFreePort, startRealService } from './helpers/real-service.mjs';
  */
 
 const cleanup: string[] = [];
+const cleanupRepos: FixtureRepo[] = [];
 afterEach(() => {
   while (cleanup.length > 0) rmSync(cleanup.pop()!, { recursive: true, force: true });
+  while (cleanupRepos.length > 0) cleanupRepos.pop()!.cleanup();
 });
 
 describe('compiled service: the production blind observer is installed at startup (issue #339 F3)', () => {
@@ -99,6 +103,8 @@ describe('compiled service: the production blind observer is installed at startu
     const workspace = mkdtempSync(join(tmpdir(), 'gru-blind-http-ws-'));
     const sessionDir = mkdtempSync(join(tmpdir(), 'gru-blind-http-session-'));
     cleanup.push(home, workspace, sessionDir);
+    const repo = makeFixtureRepo('fixture-blind-http'); cleanupRepos.push(repo);
+    const worktrees = new InMemoryWorktreePort(join(workspace, 'wtroot'));
     const jobId = 'job-blind-http';
     const agentId = 'minion-blind-http';
     const targetSha = 'f'.repeat(40);
@@ -109,9 +115,14 @@ describe('compiled service: the production blind observer is installed at startu
     const db = new LedgerDb(home);
     try {
       const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-      ledger.addJob({ id: jobId, repo: 'fixture', title: 'blind review' });
+      ledger.addJob({ id: jobId, repo: 'fixture', title: 'blind review', deliverable: 'review',
+        commissioner: 'fixture-owner', targetRef: targetSha, targetSha });
       ledger.setJobStatus(jobId, 'working');
+      const lane = await worktrees.createJobWorktree({ repoPath: repo.path, jobId });
+      ledger.registerWorktree(lane);
+      writeFileSync(sessionFile, `${JSON.stringify({ type: 'session', id: 'blind-http-session', version: 3, cwd: lane.path })}\n`);
       ledger.registerAgent({ id: agentId, role: 'minion', jobId, sessionFile });
+      ledger.setAgentState(agentId, 'idle');
       const admission = admitBlindReview({
         ledger,
         jobId,
@@ -165,7 +176,8 @@ describe('compiled service: the production blind observer is installed at startu
         const read = new DatabaseSync(join(home, 'ledger', 'ledger.db'), { readOnly: true });
         try {
           const rows = read.prepare('SELECT payload FROM events WHERE kind = ? AND job_id = ?').all(BLIND_ACCESS_EVENT, jobId) as { payload: string }[];
-          expect(rows).toHaveLength(1);
+          const request = read.prepare('SELECT request_id, state, fail_reason, native_target, native_binding FROM pending_directives WHERE request_id = ?').get(body.request_id!);
+          expect(rows, JSON.stringify(request)).toHaveLength(1);
           const payload = JSON.parse(rows[0]!.payload) as { prohibited?: readonly unknown[] };
           expect(payload.prohibited?.length).toBeGreaterThanOrEqual(1);
         } finally {
@@ -184,8 +196,25 @@ describe('compiled service: the production blind observer is installed at startu
         reportPreserved: true,
       });
       expect(after.prohibitedAccess).toBeGreaterThanOrEqual(1);
-      // reportPreserved is the authenticated projection's metadata, not an
-      // independent assertion about persisted report bytes.
+      const requestResponse = await fetch(`${service.baseUrl}/api/silas/directives/${encodeURIComponent(body.request_id!)}`, {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(requestResponse.status).toBe(200);
+      expect(await requestResponse.json()).toMatchObject({
+        request_id: body.request_id, state: 'admitted', admission_seq: expect.any(Number), delivery_seq: null,
+        native_target: { agentId, sessionFile },
+      });
+      await vi.waitFor(() => {
+        const read = new DatabaseSync(join(home, 'ledger', 'ledger.db'), { readOnly: true });
+        try {
+          const ceased = read.prepare('SELECT payload FROM events WHERE kind = ? AND job_id = ?').all('silas.directive-producer-ceased', jobId) as { payload: string }[];
+          expect(ceased).toHaveLength(1);
+          expect(JSON.parse(ceased[0]!.payload)).toMatchObject({ request_id: body.request_id, agent_id: agentId });
+          expect(read.prepare('SELECT seq FROM events WHERE kind = ? AND job_id = ?').all('job.delivered', jobId)).toHaveLength(0);
+        } finally { read.close(); }
+      }, { timeout: 10_000, interval: 100 });
+      // reportPreserved is projection metadata, not independent report bytes.
+      // The scripted malformed tool result must never count as completion.
     } finally {
       await service.stop();
     }

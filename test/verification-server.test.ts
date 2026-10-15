@@ -1,3 +1,5 @@
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -72,7 +74,9 @@ interface Harness {
   readonly lanePath: string;
   readonly jobId: string;
   readonly server: VerificationServer;
+  readonly db: LedgerDb;
   readonly close: () => Promise<void>;
+  readonly restart: () => Promise<Harness>;
 }
 
 async function boot(opts: {
@@ -101,9 +105,8 @@ async function boot(opts: {
   writeFileSync(join(dir, 'config.toml'), configLines, 'utf-8');
   mkdirSync(join(dir, 'wtroot'));
   const config = loadConfig({ GRU_COMMAND_HOME: dir }, '/home/tester');
-  const db = new LedgerDb(dir);
-  const bus = new EventBus({});
-  const ledger = new LedgerApi(db.handle, { bus });
+  let db = new LedgerDb(dir);
+  let ledger = new LedgerApi(db.handle, { bus: new EventBus({}) });
   const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'), ledger);
   const repo = makeFixtureRepo('verify-app');
   repos.push(repo);
@@ -116,7 +119,7 @@ async function boot(opts: {
   ledger.addJob({ id: jobId, repo: 'verify-app', title: 'verify the lane', baseBranch: 'main', briefing: 'verify' });
   ledger.setJobStatus(jobId, 'working');
   const lane = await worktrees.createJobWorktree({ repoPath: repo.path, jobId });
-  const server = createVerificationServer({
+  let server = createVerificationServer({
     config,
     ledger,
     worktrees,
@@ -138,7 +141,14 @@ async function boot(opts: {
     repo,
     lanePath: lane.path,
     jobId,
-    server,
+    get server() { return server; },
+    get db() { return db; },
+    restart: async () => {
+      await server.dispose(); db.close();
+      db = new LedgerDb(dir); ledger = new LedgerApi(db.handle, { bus: new EventBus({}) });
+      server = createVerificationServer({ config, ledger, worktrees });
+      return { ...harness, ledger, server };
+    },
     close: async () => {
       if (closed) return;
       closed = true;
@@ -202,6 +212,38 @@ async function waitFor(predicate: () => boolean, timeoutMs = 4_000): Promise<voi
 }
 
 describe('POST /api/verify', () => {
+  it('PR334 receipt aggregate verification bounds are enforced without eager payload materialization', async () => {
+    const h = await boot(); const requestId = 'pr334-bounded-receipts';
+    const result = await call(h.port, { job_id: h.jobId, scope: 'full', request_id: requestId });
+    const outcome = outcomeOf(completedFrame(result.frames)); expect(outcome['ok']).toBe(true);
+    const started = h.ledger.latestJobEvent(h.jobId, 'verification.started')!;
+    const facts = started.payload as { pid: number; command: string; cwd: string };
+    const lane = h.worktrees.listWorktrees({ jobId: h.jobId })[0]!;
+    h.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: h.repo.path, path: lane.path, branch: lane.branch,
+      sha: h.repo.head(), kind: 'job', jobId: h.jobId });
+    h.ledger.recordWorktreeProcesses({ worktreeId: lane.id, state: 'live', processes: [{ pid: facts.pid, command: `/bin/sh -c ${facts.command}`, evidence: 'registry' }] });
+    for (let i = 0; i < 2; i += 1) h.ledger.appendCustomEvent({ kind: 'verification.process-started', jobId: h.jobId,
+      payload: { ...(started.payload as Record<string, unknown>), untrusted_padding: 'x'.repeat(4 * 1024 * 1024) } });
+    const before = h.ledger.listWorktreeProcesses(lane.id);
+    const prepare = h.db.handle.prepare.bind(h.db.handle); let eagerMaterializations = 0;
+    const spy = vi.spyOn(h.db.handle, 'prepare').mockImplementation((sql) => {
+      const statement = prepare(sql);
+      if (sql.includes('payload_bytes FROM events') && sql.includes('verification.process-started')) {
+        const all = statement.all.bind(statement);
+        vi.spyOn(statement, 'all').mockImplementation((...parameters) => { eagerMaterializations += 1; return all(...parameters); });
+      }
+      return statement;
+    });
+    try {
+      expect(() => h.ledger.reconcileVerificationProcesses({ jobId: h.jobId, runId: String(outcome['runId']), requestId,
+        command: facts.command, cwd: facts.cwd, worktreeId: lane.id })).toThrow(/complete-evidence bounds/);
+      expect(eagerMaterializations).toBe(0);
+      expect(h.ledger.listWorktreeProcesses(lane.id)).toEqual(before);
+      expect(h.ledger.latestJobEvent(h.jobId, 'verification.process-reconciled')).toBeNull();
+    } finally { spy.mockRestore(); }
+    await h.close();
+  });
+
   it('resolves the checked-in full gate through the same manifest resolver as the endpoint', () => {
     const manifest = loadWorktreeManifest(join(import.meta.dirname, '..'));
     expect(manifest).not.toBeNull();
@@ -414,6 +456,174 @@ describe('verification single-flight + reconcile (issue #159)', () => {
     expect(started).toHaveLength(1);
     expect(completed).toHaveLength(1);
     await harness.close();
+  });
+
+  it('same-ID terminal reconciliation closes only absent exact lane processes while retaining failure and partial capture truth', async () => {
+    let harness = await boot(); const requestId = 'terminal-process-restart';
+    const pending = call(harness.port, { job_id: harness.jobId, scope: 'slow', request_id: requestId });
+    let originalStarted = harness.ledger.latestJobEvent(harness.jobId, 'verification.started');
+    while (originalStarted === null) { await new Promise<void>((resolve) => setImmediate(resolve)); originalStarted = harness.ledger.latestJobEvent(harness.jobId, 'verification.started'); }
+    process.kill(-((originalStarted.payload as { pid: number }).pid), 'SIGTERM');
+    const first = await pending;
+    const outcome = outcomeOf(completedFrame(first.frames)); expect(outcome['ok']).toBe(false); expect(outcome['signal']).toBe('SIGTERM');
+    const lane = harness.worktrees.listWorktrees({ jobId: harness.jobId })[0]!;
+    harness.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: harness.repo.path, path: lane.path, branch: lane.branch, sha: harness.repo.head(), kind: 'job', jobId: harness.jobId });
+    const started = harness.ledger.latestJobEvent(harness.jobId, 'verification.started')!;
+    const payload = started.payload as { pid: number; command: string };
+    const live = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    const foreign = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' }); const foreignPid = foreign.pid!; await once(foreign, 'exit');
+    const capture = join(harness.config.dataDir, 'original-partial-capture.ndjson'); writeFileSync(capture, JSON.stringify({ type: 'started', runId: outcome['runId'] }) + '\n');
+    const bytes = readFileSync(capture, 'utf8'); const completed = harness.ledger.latestJobEvent(harness.jobId, 'verification.completed');
+    harness.ledger.recordWorktreeProcesses({ worktreeId: lane.id, state: 'live', processes: [
+      { pid: payload.pid, command: `/bin/sh -c ${payload.command}`, evidence: 'registry' },
+      { pid: live.pid!, command: `/bin/sh -c ${payload.command}`, evidence: 'registry' },
+      { pid: foreignPid, command: `/bin/sh -c ${payload.command}`, evidence: 'registry' },
+    ] });
+    harness = await harness.restart();
+    try {
+      const replay = await call(harness.port, { job_id: harness.jobId, scope: 'slow', request_id: requestId });
+      expect(replay.frames[0]).toMatchObject({ type: 'completed', reconciled: true }); expect(outcomeOf(replay.frames[0]!)).toEqual(outcome);
+      expect(harness.ledger.listWorktreeProcesses(lane.id)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ pid: payload.pid, state: 'killed' }), expect.objectContaining({ pid: live.pid, state: 'live' }),
+        expect.objectContaining({ pid: foreignPid, state: 'live' }),
+      ]));
+      expect(harness.ledger.latestJobEvent(harness.jobId, 'verification.completed')).toEqual(completed);
+      const audit = harness.ledger.latestJobEvent(harness.jobId, 'verification.process-reconciled');
+      expect(audit?.payload).toMatchObject({ request_id: requestId, run_id: outcome['runId'], pid: payload.pid });
+      harness = await harness.restart();
+      await call(harness.port, { job_id: harness.jobId, scope: 'slow', request_id: requestId });
+      expect(harness.ledger.listJobEventsByKinds(harness.jobId, ['verification.process-reconciled'])).toEqual([audit]);
+      expect(harness.ledger.listJobEventsByKinds(harness.jobId, ['verification.started'])).toEqual([started]);
+      expect(readFileSync(capture, 'utf8')).toBe(bytes); expect(harness.ledger.hasUnsettledVerificationRun(harness.jobId)).toBe(false);
+    } finally { const exit = once(live, 'exit'); live.kill('SIGKILL'); await exit; await harness.close(); }
+  });
+
+  async function assertOriginalStepReadback(mode: 'decomposed' | 'reused-build', receiptFault?: 'missing-first' | 'wrong-step' | 'event-overflow' | 'byte-overflow'): Promise<void> {
+    const h = await boot({ manifest: '[verify]\nprime = "npm run lint && npm run typecheck && npm run build"\ndocs = "npm run build && npm run config:docs"\n', files: {
+      '.gitignore': 'dist/\n',
+      'package.json': JSON.stringify({ type: 'module', scripts: {
+        lint: 'node step.mjs lint', typecheck: 'node step.mjs typecheck', build: 'node step.mjs build', 'config:docs': 'node step.mjs docs',
+      } }),
+      'step.mjs': 'import { mkdirSync, writeFileSync } from "node:fs"; if (process.argv[2] === "build") { mkdirSync("dist", { recursive: true }); writeFileSync("dist/output.js", "// original isolated fixture build\\n"); } console.log(process.argv[2]);\n',
+    } });
+    const lane = h.worktrees.listWorktrees({ jobId: h.jobId })[0]!;
+    // Original lane facts precede any acceptance or native process registration.
+    h.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: h.repo.path, path: lane.path, branch: lane.branch,
+      sha: h.repo.head(), kind: 'job', jobId: h.jobId });
+    if (mode === 'reused-build') {
+      const prime = await call(h.port, { job_id: h.jobId, scope: 'prime', request_id: 'r15-original-prime' });
+      expect(outcomeOf(completedFrame(prime.frames))['ok']).toBe(true);
+    }
+    const originalRecord = h.ledger.recordWorktreeProcesses.bind(h.ledger);
+    const publication = vi.spyOn(h.ledger, 'recordWorktreeProcesses').mockImplementation((input) => {
+      if (input.state === 'killed') throw new Error('R15 original callback interrupted before its killed-row publication');
+      return originalRecord(input);
+    });
+    const append = h.ledger.appendCustomEvent.bind(h.ledger);
+    const nativeReceipt = receiptFault === undefined ? null : vi.spyOn(h.ledger, 'appendCustomEvent').mockImplementation((input) => {
+      if (input.kind !== 'verification.process-started' || (input.payload as { step_index?: unknown }).step_index !== 0) return append(input);
+      if (receiptFault === 'missing-first') throw new Error('R15 original native-step publisher failed before its first receipt');
+      if (receiptFault === 'byte-overflow') return append({ ...input, payload: { ...(input.payload as Record<string, unknown>), untrusted_padding: 'x'.repeat(8 * 1024 * 1024) } });
+      if (receiptFault === 'event-overflow') {
+        const original = append(input);
+        for (let duplicate = 0; duplicate < 4096; duplicate += 1) append({ ...input, payload: { ...(input.payload as Record<string, unknown>), duplicate_claim: duplicate } });
+        return original;
+      }
+      return append({ ...input, payload: { ...(input.payload as Record<string, unknown>), step_command: 'npm run foreign-step' } });
+    });
+    const requestId = `r15-original-${mode}`;
+    let first: Awaited<ReturnType<typeof call>>;
+    try { first = await call(h.port, { job_id: h.jobId, scope: 'docs', request_id: requestId }); }
+    finally { publication.mockRestore(); nativeReceipt?.mockRestore(); }
+    const outcome = outcomeOf(completedFrame(first.frames));
+    expect(outcome['ok']).toBe(true);
+    const runId = String(outcome['runId']);
+    if (mode === 'reused-build') expect(outcome['checks']).toEqual(expect.arrayContaining([expect.objectContaining({ status: 'reused', ran: false })]));
+    const originalRows = h.ledger.listWorktreeProcesses(lane.id).filter((row) => row.state === 'live');
+    expect(originalRows).toHaveLength(mode === 'decomposed' ? 2 : 1);
+    const originalStarts = h.ledger.listJobEventsByKinds(h.jobId, ['verification.started', 'verification.process-started'], { limit: 4100 });
+    const logical = originalStarts.filter((event) => event.kind === 'verification.started' && (event.payload as { run_id?: unknown }).run_id === runId);
+    expect(logical).toHaveLength(1);
+    expect(logical[0]?.payload).toMatchObject({ pid: originalRows[0]?.pid, command: 'npm run build && npm run config:docs', cwd: lane.path });
+    if (receiptFault === undefined) {
+      const native = originalStarts.filter((event) => event.kind === 'verification.process-started' && (event.payload as { run_id?: unknown }).run_id === runId);
+      expect(native).toHaveLength(originalRows.length);
+      for (const row of originalRows) expect(native).toEqual(expect.arrayContaining([expect.objectContaining({ payload: expect.objectContaining({ pid: row.pid, process_command: row.command, cwd: lane.path }) })]));
+    }
+    const completed = h.ledger.latestJobEvent(h.jobId, 'verification.completed');
+    // These rows were published by actual onSpawn. Reconciliation never adds a
+    // PID, cwd, command, admission or completion fact to make them qualify.
+    if (receiptFault === 'event-overflow' || receiptFault === 'byte-overflow') {
+      expect(() => h.ledger.reconcileVerificationProcesses({ jobId: h.jobId, runId, requestId, command: 'npm run build && npm run config:docs', cwd: lane.path, worktreeId: lane.id }))
+        .toThrow('inspection exceeds the original complete-evidence bounds; physical ownership remains UNKNOWN');
+    }
+    const replay = await call(h.port, { job_id: h.jobId, scope: 'docs', request_id: requestId });
+    expect(replay.frames[0]).toMatchObject({ type: 'completed', reconciled: true });
+    expect(outcomeOf(replay.frames[0]!)).toEqual(outcome);
+    for (const row of originalRows) expect(h.ledger.listWorktreeProcesses(lane.id)).toEqual(expect.arrayContaining([expect.objectContaining({ pid: row.pid, command: row.command, state: receiptFault === undefined ? 'killed' : 'live' })]));
+    expect(h.ledger.latestJobEvent(h.jobId, 'verification.completed')).toEqual(completed);
+    expect(h.ledger.listJobEventsByKinds(h.jobId, ['verification.started', 'verification.process-started'], { limit: 4100 })).toEqual(originalStarts);
+    expect(h.ledger.listJobEventsByKinds(h.jobId, ['verification.process-reconciled']).filter((event) => (event.payload as { run_id?: unknown }).run_id === runId)).toHaveLength(receiptFault === undefined ? originalRows.length : 0);
+    await h.close();
+  }
+
+  it('R15 received terminal readback qualifies only the original actually spawned decomposed verification steps', () => assertOriginalStepReadback('decomposed'));
+  it('R15 received first-build reuse preserves exact later spawned verification-step reconciliation', () => assertOriginalStepReadback('reused-build'));
+  it('R15 post-source coverage retains original ownership when first native-step publication failed', () => assertOriginalStepReadback('decomposed', 'missing-first'));
+  it('R15 post-source coverage refuses an original native receipt whose step command does not bind the declared plan', () => assertOriginalStepReadback('decomposed', 'wrong-step'));
+  it('R15 post-source coverage retains complete overflowing native-step event history and UNKNOWN ownership', () => assertOriginalStepReadback('decomposed', 'event-overflow'));
+  it('R15 post-source coverage retains an oversized original native-step receipt and UNKNOWN ownership', () => assertOriginalStepReadback('decomposed', 'byte-overflow'));
+
+  async function assertProcessIdentityRefusal(fault: 'unbound' | 'conflicting-start' | 'unbound-reused-pid' | 'reused-pid' | 'foreign-command' | 'foreign-terminal' | 'EPERM' | 'live-original') {
+    const h = await boot(); const requestId = `process-negative-${fault}`;
+    const result = await call(h.port, { job_id: h.jobId, scope: 'full', request_id: requestId });
+    const outcome = outcomeOf(completedFrame(result.frames)); const runId = String(outcome['runId']);
+    const started = h.ledger.latestJobEvent(h.jobId, 'verification.started')!;
+    const facts = started.payload as { pid: number; command: string; cwd: string };
+    const lane = h.worktrees.listWorktrees({ jobId: h.jobId })[0]!;
+    h.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: h.repo.path, path: lane.path, branch: lane.branch, sha: h.repo.head(), kind: 'job', jobId: h.jobId });
+    h.ledger.recordWorktreeProcesses({ worktreeId: lane.id, state: 'live', processes: [{ pid: facts.pid, command: `/bin/sh -c ${facts.command}`, evidence: 'registry' }] });
+    if (fault === 'unbound') h.db.handle.prepare('DELETE FROM events WHERE seq = ?').run(started.seq);
+    if (fault === 'conflicting-start') h.ledger.appendCustomEvent({ jobId: h.jobId, kind: 'verification.started', payload: { ...facts, run_id: runId, pid: facts.pid + 1 } });
+    if (fault === 'reused-pid') h.ledger.appendCustomEvent({ jobId: h.jobId, kind: 'verification.started', payload: { ...facts, run_id: 'different-run' } });
+    if (fault === 'unbound-reused-pid') h.ledger.appendCustomEvent({ jobId: h.jobId, kind: 'verification.started', payload: facts });
+    if (fault === 'foreign-terminal') h.ledger.appendCustomEvent({ jobId: h.jobId, kind: 'verification.completed', payload: { run_id: runId, command: 'foreign command', cwd: facts.cwd } });
+    const before = h.ledger.listWorktreeProcesses(lane.id); const kill = process.kill.bind(process);
+    const probe = vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+      if (pid === facts.pid && signal === 0 && (fault === 'EPERM' || fault === 'live-original')) {
+        if (fault === 'live-original') return true;
+        throw Object.assign(new Error('ambiguous permission'), { code: 'EPERM' });
+      }
+      return kill(pid, signal);
+    });
+    try {
+      h.ledger.reconcileVerificationProcesses({ jobId: h.jobId, runId, requestId, command: fault === 'foreign-command' ? 'other command' : facts.command, cwd: facts.cwd, worktreeId: lane.id });
+      expect(h.ledger.listWorktreeProcesses(lane.id)).toEqual(before); expect(h.ledger.latestJobEvent(h.jobId, 'verification.process-reconciled')).toBeNull();
+    } finally { probe.mockRestore(); }
+  }
+  it('process reconciliation refuses unbound original identity evidence', () => assertProcessIdentityRefusal('unbound'));
+  it('process reconciliation refuses conflicting-start original identity evidence', () => assertProcessIdentityRefusal('conflicting-start'));
+  it('process reconciliation refuses reused-pid original identity evidence', () => assertProcessIdentityRefusal('reused-pid'));
+  it('process reconciliation refuses unbound-reused-pid original identity evidence', () => assertProcessIdentityRefusal('unbound-reused-pid'));
+  it('process reconciliation refuses foreign-command original identity evidence', () => assertProcessIdentityRefusal('foreign-command'));
+  it('process reconciliation refuses foreign-terminal original identity evidence', () => assertProcessIdentityRefusal('foreign-terminal'));
+  it('process reconciliation refuses EPERM original identity evidence', () => assertProcessIdentityRefusal('EPERM'));
+  it('process reconciliation refuses live-original original identity evidence', () => assertProcessIdentityRefusal('live-original'));
+
+  it('original no-start deduplication survives more than 1000 newer receipts and a real server restart', async () => {
+    let h = await boot();
+    const holder = call(h.port, { job_id: h.jobId, scope: 'slow', request_id: 'dedup-holder' });
+    while (h.ledger.latestJobEvent(h.jobId, 'verification.started') === null) await new Promise<void>((resolve) => setImmediate(resolve));
+    const queued = call(h.port, { job_id: h.jobId, scope: 'full', request_id: 'old-no-start' });
+    while (h.ledger.listJobEventsByKinds(h.jobId, ['verification.requested']).length < 2) await new Promise<void>((resolve) => setImmediate(resolve));
+    await h.server.dispose(); await Promise.all([holder, queued]);
+    const original = h.ledger.latestJobEvent(h.jobId, 'verification.no-start')!; expect(original).not.toBeNull();
+    for (let n = 0; n < 1001; n += 1) h.ledger.appendCustomEvent({ jobId: h.jobId, kind: 'verification.no-start', payload: { run_id: `other-run-${n}` } });
+    h = await h.restart();
+    await call(h.port, { job_id: h.jobId, scope: 'full', request_id: 'old-no-start' });
+    const rows = h.ledger.listJobEventsByKinds(h.jobId, ['verification.no-start'], { limit: 2000 }).filter((row) => (row.payload as { run_id?: unknown }).run_id === (original.payload as { run_id: string }).run_id);
+    expect(rows).toEqual([original]);
+    expect(h.ledger.listJobEventsByKinds(h.jobId, ['verification.started'])).toHaveLength(1);
   });
 
   it('replays a completed request_id instead of rerunning, and reconciles unknown → running → completed', async () => {

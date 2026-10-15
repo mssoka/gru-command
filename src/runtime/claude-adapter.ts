@@ -58,6 +58,7 @@ import type {
 } from './types.js';
 import { ToolHeartbeat, toolHeartbeatIntervalMs } from './tool-heartbeat.js';
 import { CLAUDE_CODE_CAPABILITIES } from './capabilities.js';
+import { DirectiveCheckpointError, type DirectiveCheckpoint, type DirectiveTurnIdentity } from './directive-checkpoint.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -822,8 +823,17 @@ export class ClaudeCodeHandle implements AgentHandle {
     };
   }
 
+  inspectDirective = (_identity: DirectiveTurnIdentity): DirectiveCheckpoint => ({ state: 'unknown', reason: 'claude-code CLI exposes no exact request acceptance/safe checkpoint continuation proof' });
+
+  async resumeDirective(): Promise<never> {
+    throw new DirectiveCheckpointError('claude-code cannot safely continue an interrupted directive without replay — Gru recovery decision required');
+  }
+
   async prompt(text: string, options: PromptOptions = {}): Promise<void> {
     this.assertLive();
+    if (options.directive !== undefined) {
+      throw new DirectiveCheckpointError('claude-code cannot attest actual request admission; directive checkpoint capability unavailable');
+    }
     if (text === '' && (options.images === undefined || options.images.length === 0)) {
       throw new Error('empty prompt: nothing to send (no text, no images)');
     }

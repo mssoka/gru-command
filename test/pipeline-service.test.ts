@@ -99,6 +99,27 @@ function boot(
 }
 
 describe('pipeline service — admission and ordering', () => {
+  it('R13 production pipeline consumer never admits a dependent from historical-only delivery', async () => {
+    const h = boot();
+    try {
+      h.service.enqueue({ id: 'r13-source', repoPath: '/tmp/demo', title: 'Original', briefing: 'original prerequisite' });
+      await h.service.whenIdle();
+      expect(h.calls.map((call) => call.jobId)).toEqual(['r13-source']);
+      h.ledger.setJobStatus('r13-source', 'working'); h.ledger.setJobStatus('r13-source', 'delivered');
+      const historical = h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'r13-source', payload: {
+        sha: 'original-completed-head', candidate_delivery_proven: false, historical_bookkeeping_only: true,
+      } });
+      h.service.enqueue({ id: 'r13-dependent', repoPath: '/tmp/demo', title: 'Dependent', briefing: 'dependent work', prerequisites: [{ id: 'r13-source', milestone: 'delivered' }] });
+      h.service.schedule(); await h.service.whenIdle();
+      expect(h.calls.map((call) => call.jobId)).toEqual(['r13-source']); expect(h.service.entry('r13-dependent')?.state).toBe('waiting');
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'r13-source', payload: { sha: 'later-current-delivered-head' } });
+      h.service.schedule(); await h.service.whenIdle(); h.service.schedule(); await h.service.whenIdle();
+      expect(h.calls.map((call) => call.jobId)).toEqual(['r13-source', 'r13-dependent']);
+      expect(h.service.entry('r13-dependent')?.state).toBe('admitted');
+      expect(h.ledger.getEvent(historical.seq)).toEqual(historical);
+    } finally { h.service.dispose(); h.db.close(); }
+  });
+
   it('enqueues durably without a minion while capacity is full, then admits exactly once on release', async () => {
     const h = boot({ capacity: 4, occupied: 4, queued: 0, available: 0 });
     const receipt = h.service.enqueue({ id: 'pipe-a', repoPath: '/tmp/demo', title: 'Alpha', briefing: 'Do alpha' });
