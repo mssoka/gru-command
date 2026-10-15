@@ -12,6 +12,7 @@ import {
 } from '../src/dispatch/durable-reconcile.js';
 import { settleDirectivesFromEvidence } from '../src/dispatch/rebrief-recovery.js';
 import type { FollowThroughNotifications } from '../src/dispatch/obligations.js';
+import { markHistoricalDirectiveFixture } from './helpers/directive-native-fixture.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -44,6 +45,7 @@ function fakeNotifications(posts: Post[]): FollowThroughNotifications {
 /** A live directive request whose correlated admission+delivery exist. */
 function seedCorrelatedDirective(api: LedgerApi, jobId: string, requestId: string, directive = 'repair the thing'): void {
   api.beginDirectiveIntent({ jobId, directive, holder: 'silas-ops', requestId });
+  markHistoricalDirectiveFixture(api, requestId); // explicit historical event-only decoding
   const sent = api.appendCustomEvent({
     kind: 'silas.directive-sent',
     jobId,
@@ -355,6 +357,7 @@ describe('durable reconciliation pass (issue #163)', () => {
     api.addJob({ id: 'job-dir-fail', repo: 'demo', title: 't', briefing: 'b' });
     api.setJobStatus('job-dir-fail', 'working');
     api.beginDirectiveIntent({ jobId: 'job-dir-fail', directive: 'waiting', holder: 'silas-ops', requestId: 'req-fail' });
+    markHistoricalDirectiveFixture(api, 'req-fail');
     // A ledger read failure for the evidence lookup: the row failure is
     // counted (never a green heartbeat) and stays live for the next pass.
     const failing = new Proxy(api, {

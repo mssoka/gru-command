@@ -427,7 +427,7 @@ export class PipelineService {
     return {
       entries,
       jobStatusOf: (jobId) => this.opts.ledger.getJob(jobId)?.status ?? null,
-      jobDeliveredOf: (jobId) => this.opts.ledger.latestJobEvent(jobId, 'job.delivered') !== null,
+      jobDeliveredOf: (jobId) => this.opts.ledger.latestCandidateDelivery(jobId) !== null,
       jobStartedOf: (jobId) => this.opts.ledger.jobHasWorkerStart(jobId),
       capacity: this.opts.capacity(),
     };

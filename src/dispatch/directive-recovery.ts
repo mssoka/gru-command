@@ -58,7 +58,7 @@ const RETIRABLE_STATES: readonly LiveDirectiveState[] = ['dispatching', 'admitte
  * Zero lanes (never created / swept) and ambiguous multi-lane registry
  * states both fail closed: without a lane there is no head to bind, and a
  * retirement must never be executed against a guessed checkout. */
-function resolveRetirementLane(
+export function resolveRetirementLane(
   worktrees: Pick<WorktreePort, 'listWorktrees'>,
   jobId: string,
 ): WorktreeLane {
@@ -138,4 +138,63 @@ export function retireInterruptedDirectiveFromRoute(input: DirectiveRetirementRe
     );
   }
   return callLedger({ id: lane.id, resolvedHead });
+}
+
+/** Concrete Gru judgment. The same cessation predicates as retirement
+ * precede its atomic transaction; caller expectations never become proof. */
+export function recoverInterruptedDirectiveFromRoute(input: {
+  readonly ledger: LedgerApi;
+  readonly worktrees: Pick<WorktreePort, 'listWorktrees'>;
+  readonly pendingProducerBlockers: (jobId: string) => readonly string[];
+  readonly workerGate?: Pick<PacingGate, 'view'>;
+  readonly requestId: string;
+  readonly generation: number;
+  readonly expectedPayloadHash: string;
+  readonly expectedHead: string;
+  readonly expectedEpoch: number;
+  readonly expectedWorkRevision?: number;
+  readonly expectedContractSha256?: string;
+  readonly reason: string;
+  readonly decision: { readonly kind: 'successor'; readonly requestId: string; readonly directive: string } |
+    { readonly kind: 'owner-decision'; readonly obligationId: string };
+}): ReturnType<LedgerApi['consumeDirectiveRecoveryDecision']> {
+  const row = input.ledger.getDirective(input.requestId);
+  if (row === null) throw new RecordNotFound(`directive request "${input.requestId}" not found`);
+  // A consumed replay is ledger-only: history stands even if HEAD moved.
+  if (input.ledger.recoveryDecisionHistory('directive', row.requestId).some((decision) => decision.generation === input.generation)) return input.ledger.consumeDirectiveRecoveryDecision({ ...input,
+    lane: { id: '', resolvedHead: input.expectedHead } });
+  const lane = resolveRetirementLane(input.worktrees, row.jobId);
+  if (input.decision.kind === 'successor') {
+    const supervised = input.pendingProducerBlockers(row.jobId);
+    const durable = input.ledger.directiveProgressBlockers(row.requestId, lane.id);
+    const ids = new Set(input.ledger.listAgents().filter((agent) => agent.jobId === row.jobId).map((agent) => agent.id));
+    const queued = input.workerGate?.view().worker.queued.filter((entry) => entry.id === row.jobId || ids.has(entry.id)) ?? [];
+    if (supervised.length + durable.length + queued.length > 0) throw new DirectiveRetirementError('live_work',
+      'recovery successor refused: actual producer cessation is not proven', [...supervised, ...durable, ...queued.map((entry) => entry.label)]);
+  }
+  return input.ledger.consumeDirectiveRecoveryDecision({ requestId: input.requestId, generation: input.generation,
+    expectedPayloadHash: input.expectedPayloadHash, expectedHead: input.expectedHead, expectedEpoch: input.expectedEpoch,
+    reason: input.reason, decision: input.decision, expectedWorkRevision: input.expectedWorkRevision, expectedContractSha256: input.expectedContractSha256, lane: { id: lane.id, resolvedHead: resolveGitCommit(lane.path, 'HEAD') } });
+}
+
+
+export function recoverInterruptedRebriefFromRoute(input: Omit<Parameters<typeof recoverInterruptedDirectiveFromRoute>[0], 'requestId' | 'decision'> & {
+  readonly markerId: string; readonly expectedReceiptEvidenceSha256: string;
+  readonly decision: Parameters<LedgerApi['consumeRebriefRecoveryDecision']>[0]['decision'];
+}): ReturnType<LedgerApi['consumeRebriefRecoveryDecision']> {
+  const call = (lane: { readonly id: string; readonly resolvedHead: string }) => input.ledger.consumeRebriefRecoveryDecision({
+    markerId: input.markerId, generation: input.generation, expectedPayloadHash: input.expectedPayloadHash,
+    expectedHead: input.expectedHead, expectedEpoch: input.expectedEpoch, expectedWorkRevision: input.expectedWorkRevision, expectedContractSha256: input.expectedContractSha256,
+    expectedReceiptEvidenceSha256: input.expectedReceiptEvidenceSha256, reason: input.reason, decision: input.decision, lane });
+  if (input.ledger.getRebriefRecoveryDecision(input.markerId, input.generation) !== null) return call({ id: '', resolvedHead: input.expectedHead });
+  const marker = input.ledger.listPendingRebriefs().find((row) => row.id === input.markerId);
+  if (marker === undefined) throw new RecordNotFound(`rebrief marker "${input.markerId}" not found`);
+  const lane = resolveRetirementLane(input.worktrees, marker.jobId);
+  if (input.decision.kind === 'successor' || input.decision.kind === 'reconcile-completed') {
+    const supervised = input.pendingProducerBlockers(marker.jobId);
+    const ids = new Set(input.ledger.listAgents().filter((agent) => agent.jobId === marker.jobId).map((agent) => agent.id));
+    const queued = input.workerGate?.view().worker.queued.filter((entry) => entry.id === marker.jobId || ids.has(entry.id)) ?? [];
+    if (supervised.length + queued.length > 0) throw new DirectiveRetirementError('live_work', 'legacy rebrief recovery requires proven producer cessation', [...supervised, ...queued.map((entry) => entry.label)]);
+  }
+  return call({ id: lane.id, resolvedHead: resolveGitCommit(lane.path, 'HEAD') });
 }

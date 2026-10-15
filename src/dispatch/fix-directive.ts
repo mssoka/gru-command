@@ -11,8 +11,10 @@ import { appendWorkerRules, WORKER_RULE_BLOCKS } from './worker-rules.js';
 import { withRevisionContinuation } from './work-revision.js';
 import { resolveGitCommit } from './perkins-review/artifacts.js';
 import { promptVerdictFromHealth, promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
-import type { PromptTurnVerdict } from '../runtime/types.js';
+import type { PromptOptions, PromptTurnVerdict } from '../runtime/types.js';
 import type { WorktreePort } from './worktree-port.js';
+import { readGitState } from '../verify/scheduler.js';
+import { readDirectiveSessionHeader } from '../runtime/directive-checkpoint.js';
 import { settleRetries, type PacingGate, type PacingLease, type RetrySettlement } from '../runtime/pacing.js';
 
 /**
@@ -111,6 +113,12 @@ function assertDirectiveJobActive(ledger: DirectiveAdmissionLedger, jobId: strin
   }
 }
 
+/** Positive routing proof: this invocation stopped at a guard before any
+ * native spawn, preparation, prompt or cleanup operation was attempted. */
+export class DirectiveDispatchDeferredError extends Error {
+  constructor(readonly original: unknown) { super(`pre-native directive deferred: ${String(original)}`); this.name = 'DirectiveDispatchDeferredError'; }
+}
+
 /** Route a directive to the implementing minion: the live job minion
  * first; otherwise a fresh minion on the job lane. */
 export async function routeFixDirectiveToMinion(
@@ -120,6 +128,11 @@ export async function routeFixDirectiveToMinion(
     signal: AbortSignal;
     /** Prompt owner tag (audit); defaults to the shared routing owner. */
     owner?: string;
+    readonly directiveTurn?: PromptOptions['directive'];
+    readonly beforeTurnSideEffect?: (handle?: AgentHandle) => void;
+    readonly onPrepared?: (handle: AgentHandle) => void;
+    readonly onCleanup?: (handle: AgentHandle) => void;
+    readonly freshSession?: boolean;
     /** The job's effective contract (original briefing plus every accepted
      * amendment): what a FRESH fallback minion is briefed with. Absent =
      * the original briefing (no amendment surface at the caller). */
@@ -151,7 +164,28 @@ export async function routeFixDirectiveToMinion(
    * single-writer guard on this evidence alone. */
   admission?: 'none' | 'unknown';
 }> {
+  const disposeAndRecord = async (handle: AgentHandle, viaRegistry = false): Promise<void> => {
+    const failures: unknown[] = [];
+    try { await (viaRegistry ? input.registry.disposeHandle(handle) : handle.dispose()); } catch (error) { failures.push(error); }
+    try { input.onCleanup?.(handle); } catch (error) { failures.push(error); }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) throw new AggregateError(failures, `directive cleanup failed: ${failures.map(String).join('; ')}`);
+  };
   const owner = input.owner ?? 'fix-directive';
+  let nativeAttempted = false;
+  let priorCleanupPending = false;
+  const guard = (handle?: AgentHandle): void => {
+    try { input.beforeTurnSideEffect?.(handle); }
+    catch (error) {
+      if (input.directiveTurn !== undefined && !nativeAttempted && !priorCleanupPending) throw new DirectiveDispatchDeferredError(error);
+      throw error;
+    }
+  };
+  let minions = input.ledger.listImplementerMinions(input.jobId)
+    .filter((agent) => agent.parentage !== 'child');
+  // Operation-boundary guards below still fence every cleanup, spawn,
+  // preparation and prompt. A structural no-route result attempts none:
+  // it may settle truthful no-effect history without a branch/effect grant.
   // Follow-up turns carry the CURRENT worker rule blocks too (PR creation
   // and the no-call-budget contract): legacy briefing wording must not
   // outrank them on the live/resumed paths.
@@ -162,17 +196,22 @@ export async function routeFixDirectiveToMinion(
     ),
   );
   const directive = compose(input.continuation?.block ?? '');
-  // Issue #339: one call-through to the shared, read-only blind-coverage
-  // observer for every directive continuation — the live minion, the evicted
-  // fallback, and the resumed fallback. Absent port = no observation.
+  if (input.freshSession === true) {
+    for (const minion of minions) {
+      const prior = input.registry.getHandle(minion.id);
+      if (prior === null) continue;
+      guard();
+      priorCleanupPending = true;
+      await disposeAndRecord(prior, true);
+      if (prior.cessationEvidence?.() !== 'ceased') throw new Error(`prior minion ${prior.id} retains unproven producer ownership — rebrief refused`);
+      priorCleanupPending = false; // positive prior cessation is not this request's native attempt
+      guard();
+    }
+    minions = [];
+  }
+  // Observe the actual physical continuation, never its cancellation race.
   const observe = (sessionFile: string | null): void =>
     input.observeBlindTurn?.(input.jobId, sessionFile);
-  const minions = input.ledger
-    .listImplementerMinions(input.jobId)
-    // Defense-in-depth for issue #161's writer rule (the ledger pick
-    // already excludes children): a tracked child is never the primary
-    // lane worker even if a future writer lets one into the table shape.
-    .filter((agent) => agent.parentage !== 'child');
   let evictedSessionFile: string | null = null;
   // Every post-wait boundary runs the caller's coverage re-proof first, then
   // the ledger's own terminality/verification admission check (F-H2/F-H3).
@@ -183,6 +222,7 @@ export async function routeFixDirectiveToMinion(
   for (const minion of minions) {
     const handle = input.registry.getHandle(minion.id);
     if (handle !== null) {
+      guard(); // before even the owned prior retry/pacing awaits
       // Active-incident attribution (B1): if an automatic retry is already
       // covering this handle, wait for its settlement BEFORE prompting.
       // Otherwise the new directive and the retry would deliver overlapping
@@ -190,6 +230,7 @@ export async function routeFixDirectiveToMinion(
       // the other turn's outcome. Await before taking the worker slot — the
       // retry re-acquires its own slot and must not be blocked by ours.
       const pending = await settleRetries(input.retrySettlement, handle.id, input.signal);
+      guard();
       if (pending === 'cancelled') return { delivered: false, note: 'review operation aborted', admission: 'none' };
       let lease: PacingLease | null = null;
       if (input.workerGate !== undefined) {
@@ -207,9 +248,18 @@ export async function routeFixDirectiveToMinion(
         // A refusal before prompt is positive no-admission proof, not a
         // prompt error eligible for retry recovery. It must still release
         // the pacing lease acquired after the asynchronous wait above.
+<<<<<<< HEAD
         assertAdmissible();
+||||||| 6883628e
+        assertDirectiveJobActive(input.ledger, input.jobId);
+=======
+        assertDirectiveJobActive(input.ledger, input.jobId);
+        guard();
+        nativeAttempted = true;
+        input.onPrepared?.(handle);
+>>>>>>> origin/main
         const run = runObservedPrompt(handle, directive, input.signal, owner, () =>
-          observe(handle.sessionFile));
+          observe(handle.sessionFile), input.directiveTurn);
         observation = run.observation;
         try {
           verdict = await run.verdict;
@@ -280,6 +330,7 @@ export async function routeFixDirectiveToMinion(
   if (lane === undefined) {
     return { delivered: false, note: 'no implementing minion session and no job lane', admission: 'none' };
   }
+  guard(); // lane exists: pin original branch before pacing/spawn awaits
   let lease: PacingLease | null = null;
   if (input.workerGate !== undefined) {
     lease = await input.workerGate.acquireWorkerTurn({
@@ -290,6 +341,8 @@ export async function routeFixDirectiveToMinion(
     });
   }
   let handle: AgentHandle | null = null;
+  let registrationFailed = false;
+  const route = async (): Promise<Awaited<ReturnType<typeof routeFixDirectiveToMinion>>> => {
   try {
     // Prefer the CURRENT failing logical session; only when the evicted
     // handle exposed none fall back to the newest session-bearing record —
@@ -307,29 +360,52 @@ export async function routeFixDirectiveToMinion(
     // (owner rule 4) — when the caller supplied one.
     const freshPrompt = (contract: string): string =>
       `Fresh minion re-brief for job ${input.jobId}. Effective contract (original briefing plus accepted amendments):\n${contract}\n\nCurrent fix directive:\n${compose(input.continuation?.freshNote ?? '')}`;
-    let prompt = resumeFile === null && input.contract != null ? freshPrompt(input.contract) : directive;
+    let prompt = resumeFile === null && input.contract != null && input.freshSession !== true ? freshPrompt(input.contract) : directive;
     try {
+<<<<<<< HEAD
       assertAdmissible();
+||||||| 6883628e
+      assertDirectiveJobActive(input.ledger, input.jobId);
+=======
+      assertDirectiveJobActive(input.ledger, input.jobId);
+      guard();
+      nativeAttempted = true; // a rejected spawn is still uncertain, never a deferral
+>>>>>>> origin/main
       handle = await input.registry.spawn('minion', {
         cwd: lane.path, signal: input.signal,
         ...(resumeFile !== null ? { resumeFile } : {}),
         ...identity,
       });
     } catch (error) {
-      if (resumeFile === null || input.signal.aborted) throw error;
+      if (resumeFile === null || input.signal.aborted || input.directiveTurn !== undefined) throw error;
       const job = input.ledger.getJob(input.jobId);
       const contract = input.contract ?? job?.briefing ?? null;
       if (job == null || contract == null) {
         throw new Error(`cannot resume prior minion session for job ${input.jobId} and no original briefing is available to re-brief: ${String(error)}`);
       }
+<<<<<<< HEAD
       assertAdmissible();
+||||||| 6883628e
+      assertDirectiveJobActive(input.ledger, input.jobId);
+=======
+      assertDirectiveJobActive(input.ledger, input.jobId);
+      guard();
+      nativeAttempted = true;
+>>>>>>> origin/main
       handle = await input.registry.spawn('minion', { cwd: lane.path, signal: input.signal, ...identity });
       // A fresh session has no memory of accepted amendments: brief it with
       // the EFFECTIVE contract (original + amendments), never the original
       // alone (owner rule 4).
       prompt = freshPrompt(contract);
     }
+<<<<<<< HEAD
     assertAdmissible();
+||||||| 6883628e
+    assertDirectiveJobActive(input.ledger, input.jobId);
+=======
+    assertDirectiveJobActive(input.ledger, input.jobId);
+    guard();
+>>>>>>> origin/main
     let promptError: unknown = null;
     let verdict: PromptTurnVerdict | null = null;
     const spawnedHandle = handle;
@@ -344,24 +420,24 @@ export async function routeFixDirectiveToMinion(
         ...(input.ledger.getAgent(spawnedHandle.id) === null ? { parentage: 'top-level' as const } : {}),
       });
     } catch (error) {
-      // A registration failure leaves the spawned handle ownerless — an
-      // unbound live worker must never survive the failed directive
-      // setup. Dispose it loudly, preserving the actionable registration
-      // error (mirrors the re-brief setup path's failure ladder).
-      await input.registry.disposeHandle(spawnedHandle).catch((disposeError: unknown) => {
-        throw new Error(
-          `could not dispose the unregistered minion ${spawnedHandle.id} after a failed directive registration: ${String(disposeError)}`,
-          { cause: error },
-        );
-      });
-      throw error;
+      registrationFailed = true;
+      throw error; // the single cleanup owner below preserves registration AND cleanup failures
     }
+<<<<<<< HEAD
     assertAdmissible();
+||||||| 6883628e
+    assertDirectiveJobActive(input.ledger, input.jobId);
+=======
+    assertDirectiveJobActive(input.ledger, input.jobId);
+    guard(handle);
+    nativeAttempted = true;
+    input.onPrepared?.(handle);
+>>>>>>> origin/main
     const continuationSessionFile = handle.sessionFile;
     let observation: Promise<void> = Promise.resolve();
     try {
       const run = runObservedPrompt(handle, prompt, input.signal, owner, () =>
-        observe(continuationSessionFile));
+        observe(continuationSessionFile), input.directiveTurn);
       observation = run.observation;
       try {
         verdict = await run.verdict;
@@ -400,10 +476,19 @@ export async function routeFixDirectiveToMinion(
         ? ({ ok: true, error: null } as const)
         : (verdict ?? promptVerdictFromHealth(handle));
     return { delivered: true, minionId: handle.id, ...verdictFields(evidence) };
-  } finally {
-    lease?.release();
-    if (handle !== null) await handle.dispose();
+  } finally { lease?.release(); }
+  };
+  const failures: unknown[] = [];
+  let result: Awaited<ReturnType<typeof routeFixDirectiveToMinion>> | undefined;
+  try { result = await route(); } catch (error) { failures.push(error); }
+  const owned = handle as AgentHandle | null;
+  if (owned !== null) {
+    try { await disposeAndRecord(owned, registrationFailed); } catch (error) { failures.push(error); }
   }
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) throw new AggregateError(failures, `directive routing/cleanup failed: ${failures.map(String).join('; ')}`);
+  if (result === undefined) throw new Error('directive routing settled without result or failure');
+  return result;
 }
 
 /**
@@ -430,11 +515,12 @@ function runObservedPrompt(
   signal: AbortSignal,
   owner: string,
   observe: () => void,
+  directive?: PromptOptions['directive'],
 ): { readonly verdict: Promise<PromptTurnVerdict>; readonly observation: Promise<void> } {
   if (signal.aborted) {
     return { verdict: Promise.reject(new Error('review operation aborted')), observation: Promise.resolve() };
   }
-  const physical = promptWithTerminalVerdict(handle, text, { owner });
+  const physical = promptWithTerminalVerdict(handle, text, { owner, ...(directive !== undefined ? { directive } : {}) });
   const observation = physical.then(
     () => observe(),
     () => observe(),
@@ -488,15 +574,47 @@ export function recordFollowUpDelivery(input: {
    * no revision. Review admission compares it against the job's required
    * revision (owner rule 2). */
   readonly workRevision: number;
+  /** Correlation for a genuinely completed historical request's lost delivery. */
+  readonly rebriefMarker?: { readonly id: string; readonly payloadHash: string };
+  /** Exact native historical completion: null explicitly means unproven HEAD. */
+  readonly nativeCompletion?: { readonly sha: string | null; readonly provenance: unknown };
 }): { readonly sha: string | null; readonly lanePath: string | null; readonly note: string | null; readonly eventSeq: number } {
   if (!Number.isSafeInteger(input.workRevision) || input.workRevision < 0) {
     throw new Error(`delivery work revision must be a non-negative integer, got ${String(input.workRevision)}`);
   }
   const jobLanes = input.worktrees.listWorktrees({ jobId: input.jobId }).filter((lane) => lane.kind === 'job');
-  const lane = jobLanes.find((candidate) => candidate.status !== 'swept') ?? jobLanes[0];
+  const liveJobLanes = jobLanes.filter((candidate) => candidate.status !== 'swept');
+  const lane = liveJobLanes[0] ?? jobLanes[0];
   let sha: string | null = null;
   let note: string | null = null;
-  if (lane !== undefined) {
+  let candidateDeliveryProven = false;
+  if (input.nativeCompletion !== undefined) {
+    if (!(input.nativeCompletion.sha === null || typeof input.nativeCompletion.sha === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(input.nativeCompletion.sha))) throw new Error('original native completion HEAD must be an exact 40/64 hex object ID or null');
+    sha = input.nativeCompletion.sha;
+    if (sha === null) note = 'original native completion HEAD unproven; current candidate delivery/verification/review remain owed';
+    else if (liveJobLanes.length !== 1 || lane === undefined) note = 'original native completion is preserved, but no unique live job lane proves it is the current candidate';
+    else {
+      const original = typeof input.nativeCompletion.provenance === 'object' && input.nativeCompletion.provenance !== null
+        ? input.nativeCompletion.provenance as { readonly binding?: { readonly sessionFile?: unknown; readonly sessionId?: unknown; readonly agentId?: unknown } } : null;
+      const binding = original?.binding;
+      if (typeof binding?.sessionFile !== 'string' || !binding.sessionFile || typeof binding.sessionId !== 'string' || !binding.sessionId || binding.agentId !== input.agentId) {
+        note = 'original native session/cwd/lane identity is unproven; original completion is preserved but current candidate gates remain owed';
+      } else {
+        try {
+          const header = readDirectiveSessionHeader(binding.sessionFile);
+          if (header.type !== 'session' || header.id !== binding.sessionId || header.cwd !== lane.path) {
+            note = 'original native session cwd does not match the current live job lane; original completion is preserved but current candidate gates remain owed';
+          } else {
+            const current = readGitState(lane.path, { includeUntracked: true });
+            if (current.sha !== sha || current.trackedDirty) note = 'original native completion is preserved, but the live job lane HEAD moved, its tracked tree is dirty, or untracked inputs are present; current candidate delivery/verification/review remain owed';
+            else candidateDeliveryProven = true;
+          }
+        } catch (error) {
+          note = `original native session cwd/lane cannot be verified: ${String(error)}; original completion is preserved but current candidate gates remain owed`;
+        }
+      }
+    }
+  } else if (lane !== undefined) {
     try {
       sha = resolveGitCommit(lane.path, lane.branch !== null && lane.branch !== '' ? lane.branch : 'HEAD');
     } catch (error) {
@@ -516,15 +634,17 @@ export function recordFollowUpDelivery(input: {
       sha,
       ...(input.requestId !== undefined ? { request_id: input.requestId } : {}),
       ...(input.phaseId !== undefined ? { phase_id: input.phaseId } : {}),
+      ...(input.rebriefMarker === undefined ? {} : { marker_id: input.rebriefMarker.id, payload_hash: input.rebriefMarker.payloadHash }),
       work_revision: input.workRevision,
+      ...(input.nativeCompletion === undefined ? {} : { native_completion: input.nativeCompletion.provenance, candidate_delivery_proven: candidateDeliveryProven }),
     },
   });
-  // Issue #220: the report handback's commissioner obligation. A failure
-  // here must never un-record the delivery — the obligation has its own
-  // recovery (the backfill CLI and the deterministic pass read the same
-  // rows) — but it is logged loud, never swallowed silently.
+  // Native completion is published before modern ledger settlement. Only
+  // that exact independently qualified candidate sequence may open report
+  // duty, so native handback belongs to recordDirectiveDelivery's transaction.
+  // Preserve ordinary nonnative report compatibility and its loud retry note.
   const job = input.ledger.getJob(input.jobId);
-  if (job !== null && job.deliverable !== null && job.deliverable !== 'pr') {
+  if (input.nativeCompletion === undefined && job !== null && job.deliverable !== null && job.deliverable !== 'pr') {
     try {
       const opened = input.ledger.openReportObligation({ jobId: input.jobId, observedAtSeq: event.seq });
       if (opened.created) {

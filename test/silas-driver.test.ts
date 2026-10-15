@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import {
   adviseFollowThrough,
   adviseRecurrence,
@@ -38,6 +38,7 @@ import { DECISION_SURFACE_SAME_BLOCKER } from '../src/decisions/questions.js';
 import type { DecisionOutcome, QuestionSet } from '../src/decisions/types.js';
 import type { DecisionService } from '../src/decisions/types.js';
 import { EventBus } from '../src/events/bus.js';
+import { admitNativeDirectiveFixture } from './helpers/directive-native-fixture.js';
 import { createDurableReconcileHook, reconcileDurableWork } from '../src/dispatch/durable-reconcile.js';
 import type { FollowThroughNotifications } from '../src/dispatch/obligations.js';
 import { FIRING_RULES } from '../src/ledger/obligations.js';
@@ -408,10 +409,7 @@ describe('silas digest conflictingPrs rows (issue #215)', () => {
           if (!raced) {
             raced = true;
             const intent = h.ledger.beginDirectiveIntent({ jobId: 'job-race-conf', directive: 'rebase', holder: 'silas-ops' });
-            const sent = h.ledger.appendCustomEvent({
-              kind: 'silas.directive-sent', jobId: 'job-race-conf', payload: { request_id: intent.record.requestId, minion_id: 'min-race' },
-            });
-            h.ledger.recordDirectiveAdmission({ requestId: intent.record.requestId, minionId: 'min-race', eventSeq: sent.seq });
+            admitNativeDirectiveFixture(h.ledger, intent.record.requestId, 'min-race', join(dirname(h.db.dbPath), 'min-race.jsonl'));
           }
           return { blockers: [], note: null };
         },
@@ -2261,12 +2259,7 @@ describe('silas digest: stalled current phases (issue #162)', () => {
       const at = farFuture();
       // `dispatching` = side effects possible, admission unknown: reconcile, never duplicate.
       expect((await digestAt(h, at)).stalledWorking).toEqual([]);
-      const sent = h.ledger.appendCustomEvent({
-        kind: 'silas.directive-sent',
-        jobId: 'job-directive',
-        payload: { request_id: intent.record.requestId, minion_id: 'min-live' },
-      });
-      h.ledger.recordDirectiveAdmission({ requestId: intent.record.requestId, minionId: 'min-live', eventSeq: sent.seq });
+      admitNativeDirectiveFixture(h.ledger, intent.record.requestId, 'min-live', join(dirname(h.db.dbPath), 'min-live.jsonl'));
       // `admitted` = a bound turn is still in flight: same fence.
       expect((await digestAt(h, at)).stalledWorking).toEqual([]);
       // A durable failure with positive no-effect proof releases the fence.
@@ -4866,6 +4859,29 @@ describe('report-job auto-supersede in the deterministic pass (issue #220)', () 
     } finally {
       h.cleanup();
     }
+  });
+
+  it('R13 production report backstop ignores historical-only delivery then opens exactly one current-candidate handback', async () => {
+    const h0 = makeLedger();
+    const center = new NotificationCenter({ ledger: h0.ledger, bus: h0.bus });
+    const h = makeDriverWithProductionPass(h0, { notifications: center });
+    try {
+      const jobId = 'r13-report-backstop';
+      h.ledger.addJob({ id: jobId, repo: 'fixture-app', title: 'original report', briefing: 'approved report', deliverable: 'review', commissioner: 'gru' });
+      h.ledger.setJobStatus(jobId, 'working'); h.ledger.setJobStatus(jobId, 'delivered');
+      const historical = h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: {
+        sha: 'original-historical-head', candidate_delivery_proven: false, historical_bookkeeping_only: true,
+      } });
+      await h.driver.trigger({ kind: 'sweep' }); await h.driver.trigger({ kind: 'sweep' });
+      expect(h.ledger.listObligations({ jobId })).toEqual([]);
+      expect(h.ledger.findNotificationByKind(`silas.report-handback.${jobId}`, 'any')).toBeNull();
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: 'later-current-report-head' } });
+      await h.driver.trigger({ kind: 'sweep' }); await h.driver.trigger({ kind: 'sweep' });
+      expect(h.ledger.listObligations({ jobId })).toHaveLength(1);
+      expect(h.ledger.listObligations({ jobId })[0]).toMatchObject({ state: 'open', incidentKey: `report:${jobId}` });
+      expect(h.ledger.listNotifications({ limit: 100 }).filter((row) => row.kind === `silas.report-handback.${jobId}`)).toHaveLength(1);
+      expect(h.ledger.getEvent(historical.seq)).toEqual(historical);
+    } finally { h.cleanup(); }
   });
 
   it('the pass backstops a delivered report whose obligation open was lost — and never touches legacy NULL rows', async () => {

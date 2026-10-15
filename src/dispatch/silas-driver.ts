@@ -294,6 +294,7 @@ export interface DigestLedger {
     sinceSeq: number,
   ): boolean;
   latestJobEvent(jobId: string, kind: string): EventRecord | null;
+  latestCandidateDelivery(jobId: string): EventRecord | null;
   latestRoundEvent(roundId: string, kind: string): EventRecord | null;
   listAgents(): readonly AgentRecord[];
   /** Implementer minions only (Gru ruling 2026-09-29): review-only
@@ -1291,7 +1292,7 @@ function stallStillEligible(
   if ((ledger.listJobEvents(jobId, { limit: 1 })[0]?.seq ?? 0) !== jobSeqAtCompute) return false;
   const phaseStart = currentPhaseStart(ledger, jobId);
   if (phaseStart.seq !== phaseSeqAtCompute) return false;
-  const delivered = ledger.latestJobEvent(jobId, 'job.delivered');
+  const delivered = ledger.latestCandidateDelivery(jobId);
   if (delivered !== null && delivered.seq > phaseStart.seq) return false;
   if (ledger.listPendingRebriefs({ jobId }).length > 0) return false;
   if (ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length > 0) return false;
@@ -1458,7 +1459,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     }
     const rounds = [...input.ledger.listRounds(job.id)].sort((a, b) => b.seq - a.seq);
     const newestRound = rounds[0] ?? null;
-    const delivered = input.ledger.latestJobEvent(job.id, 'job.delivered');
+    const delivered = input.ledger.latestCandidateDelivery(job.id);
     const minionError = input.ledger.latestJobEvent(job.id, 'job.minion-error');
     // A request retires only the state it answered: it must postdate the
     // latest delivery, so a later unreviewed delivery re-arms the row.

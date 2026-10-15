@@ -31,6 +31,7 @@ import { createSilasModelActionTool } from './dispatch/silas-model-action.js';
 import { composeDeterministicPass, createSilasAutopilotHook } from './dispatch/silas-autopilot-pass.js';
 import { createSilasAutopilotOps, type SilasAutopilotOpsHandle } from './dispatch/silas-autopilot-ops.js';
 import { createProductionDeterministicPass } from './dispatch/durable-reconcile.js';
+import { disposeDirectiveResources, DirectiveProgressService } from './dispatch/directive-progress.js';
 import { ProviderRecoverySensor, establishProviderWait } from './provider-recovery/sensor.js';
 import { ModelRuntimeProbe } from './provider-recovery/probe.js';
 import {
@@ -42,7 +43,7 @@ import { claimProviderRecoveryContinuation } from './provider-recovery/resume.js
 import { GhCliApi, GitHubSignalPoll, type LaneRemoteResolver } from './dispatch/github-poll.js';
 import { GhRepoOverviewApi, ManagedRepoOverviewTracker } from './repos/overview.js';
 import { routeFixDirectiveToMinion } from './dispatch/fix-directive.js';
-import { reconcilePendingRebriefs, reconcilePendingDirectives } from './dispatch/rebrief-recovery.js';
+import { reconcilePendingLegacyDirectives, reconcilePendingRebriefs } from './dispatch/rebrief-recovery.js';
 import { adoptBlockedLanes, observeFollowUpDelivery, observePhaseCompletion, reconcilePhaseHandoffs, reconcileUnmarkedHandbacks } from './dispatch/obligations.js';
 import { createDispatchServer } from './dispatch/server.js';
 import { PipelineService } from './dispatch/pipeline.js';
@@ -353,6 +354,7 @@ async function main(): Promise<number> {
     verify?: ReturnType<typeof createVerificationServer>;
     pipeline?: PipelineService;
     deployDrift?: DeployDriftTracker;
+    directiveProgress?: DirectiveProgressService;
     repoOverview?: ManagedRepoOverviewTracker;
   } = {};
   let shuttingDown = false;
@@ -499,12 +501,10 @@ async function main(): Promise<number> {
         }
         state.deployDrift?.stop();
         state.repoOverview?.stop();
-        if (state.registry !== undefined) {
-          try {
-            await state.registry.dispose();
-          } catch (error) {
-            logger.error('registry dispose failed', { error: String(error) });
-          }
+        try {
+          await disposeDirectiveResources(state.directiveProgress, state.registry);
+        } catch (error) {
+          logger.error('directive progress/registry dispose failed', { error: String(error) });
         }
         // Issue #243 F-H4 (corrected): registry disposal has released the
         // running producers' handles, so this plain join settles under the
@@ -1337,13 +1337,9 @@ async function main(): Promise<number> {
   // Automatic admission retries live in memory (owner decision 2026-10-08):
   // one pending when the service stopped escalates now instead of resuming.
   wave.escalateInterruptedAdmissionRetries();
-  // Re-brief restart safety (Silas finding 2026-09-23): a re-brief request
-  // mid-flight at restart left no events and no worker. The durable
-  // markers written before each worker spawned are consumed here — the
-  // interrupted session is resumed (or a fresh worker re-dispatched on the
-  // same lane) and the missing events are recorded when that turn settles.
-  // Never awaited beyond dispatch: a re-brief turn is long; failures
-  // escalate action-required from the background.
+  // Historical re-brief markers never authorize replay. Observe a bounded
+  // page for genuine spent/terminal evidence or concrete Gru judgment;
+  // DirectiveProgressService ticks fairly visit the remaining generations.
   const rebriefRecovery = await reconcilePendingRebriefs({
     registry,
     ledger,
@@ -1357,12 +1353,13 @@ async function main(): Promise<number> {
     log: (level, msg, fields) => logger.log(level, msg, fields),
     stopping: () => shuttingDown,
   });
-  if (rebriefRecovery.examined > 0) {
+  if (rebriefRecovery.examined > 0 || rebriefRecovery.failed > 0) {
     logger.info('re-brief reconciliation', {
       examined: rebriefRecovery.examined,
       completed: rebriefRecovery.completed,
       redispatched: rebriefRecovery.redispatched,
       retired: rebriefRecovery.retired,
+      failed: rebriefRecovery.failed,
     });
   }
   // Child-worker restart safety (issue #161): a child that never bound a
@@ -1373,23 +1370,27 @@ async function main(): Promise<number> {
   if (childRecovery.resumed > 0 || childRecovery.failed > 0) {
     logger.info('child worker reconciliation', childRecovery);
   }
-  // Directive-request restart safety (phase 3): a request accepted before
-  // the crash reconciles from correlated evidence when it exists; when
-  // admission or the terminal receipt is UNKNOWN, one bounded escalation
-  // names it for a Gru reconciliation — never an automatic retry
-  // (admission-unknown is not no-effect proof).
-  const directiveRecovery = reconcilePendingDirectives({
-    ledger,
-    notifications,
+  // Preserve event-only recovery for pre-native protocol rows at boot.
+  // Current requests are reconciled below only through their exact native
+  // checkpoint and producer-cessation evidence.
+  const legacyDirectiveRecovery = reconcilePendingLegacyDirectives({ ledger, notifications,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
-  if (directiveRecovery.examined > 0) {
-    logger.info('directive reconciliation', {
-      examined: directiveRecovery.examined,
-      completed: directiveRecovery.completed,
-      escalated: directiveRecovery.escalated,
+  if (legacyDirectiveRecovery.examined > 0) {
+    logger.info('legacy directive reconciliation', {
+      examined: legacyDirectiveRecovery.examined,
+      completed: legacyDirectiveRecovery.completed,
+      escalated: legacyDirectiveRecovery.escalated,
     });
   }
+  const directiveProgress = new DirectiveProgressService({ ledger, registry, worktrees: worktreeManager, notifications, observeBlindTurn,
+    clearLaneForWriter: (input) => wave.clearLaneForWriter(input),
+    pendingProducerBlockers: (jobId, currentNative) => supervisorLive.pendingProducerBlockers(jobId, currentNative), signal: serviceStop.signal,
+    workerGate: pacing.gate, retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId), parentTools: parentToolsFor,
+    ...(config.lessons.enabled ? { lessons: lessonReferences } : {}),
+  });
+  state.directiveProgress = directiveProgress;
+  directiveProgress.reconsider();
   // Explicit phase-handoff restart safety (pr136-chief-handoff): closes
   // crash windows after the correlated delivery commit and before/after
   // the obligation write and the notification publication. Runs AFTER the
@@ -1538,7 +1539,7 @@ async function main(): Promise<number> {
     ledger,
     childWorkers,
     workerGate: pacing.gate,
-    pendingProducerBlockers: (jobId) => supervisorLive.pendingProducerBlockers(jobId),
+    pendingProducerBlockers: (jobId, currentNative) => supervisorLive.pendingProducerBlockers(jobId, currentNative),
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     observeBlindTurn,
     ...(pipeline !== null ? { pipeline } : {}),
@@ -1805,10 +1806,33 @@ async function main(): Promise<number> {
       // Chief phase-3 seam: every deterministic Silas pass runs the
       // production hook — the in-memory review-handoff reconsideration
       // plus the bounded durable reconciliation (issue #163) — BEFORE any
+<<<<<<< HEAD
       // LLM wake, and then the autopilot (issue #243). The composition is
       // the exported factory (issue #243 F-M4) so the asymmetric failure
       // behavior is behaviorally tested through a real driver, not a regex.
       onDeterministicPass: composeDeterministicPass(durablePass, autopilotHook),
+||||||| 6883628e
+      // LLM wake. The factory is behaviorally tested with a real ledger
+      // and driver; a wiring regression fails a behavioral test, not just
+      // a source regex.
+      onDeterministicPass: createProductionDeterministicPass({
+        ledger,
+        notifications,
+        log: (level, msg, fields) => logger.log(level, msg, fields),
+        getWave: () => state.wave,
+      }),
+=======
+      // LLM wake. The factory is behaviorally tested with a real ledger
+      // and driver; a wiring regression fails a behavioral test, not just
+      // a source regex.
+      onDeterministicPass: createProductionDeterministicPass({
+        ledger,
+        notifications,
+        log: (level, msg, fields) => logger.log(level, msg, fields),
+        getWave: () => state.wave,
+        directiveProgress,
+      }),
+>>>>>>> origin/main
       githubPoll: new GitHubSignalPoll({
         ledger,
         notifications,

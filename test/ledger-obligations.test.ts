@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
+import { admitNativeDirectiveFixture } from './helpers/directive-native-fixture.js';
 import {
   ClaimHeldError,
   LedgerApi,
@@ -901,12 +902,7 @@ describe('obligations — restart persistence, reclassification, authority valid
     expect(api.verifyObligationAuthority(id)).toMatchObject({ executable: false }); // no such request
     api.beginDirectiveIntent({ jobId: 'job-k', directive: 'fix it', holder: 'silas-ops', requestId: 'req-op-1' });
     expect(api.verifyObligationAuthority(id)).toMatchObject({ executable: false }); // accepted, not yet admitted
-    const sent = api.appendCustomEvent({
-      kind: 'silas.directive-sent',
-      jobId: 'job-k',
-      payload: { request_id: 'req-op-1', minion_id: 'minion-7' },
-    });
-    api.recordDirectiveAdmission({ requestId: 'req-op-1', minionId: 'minion-7', eventSeq: sent.seq });
+    admitNativeDirectiveFixture(api, 'req-op-1', 'minion-7', join(tmpDir(), 'minion-7.jsonl'));
     expect(api.verifyObligationAuthority(id)).toMatchObject({ executable: true });
   });
 
