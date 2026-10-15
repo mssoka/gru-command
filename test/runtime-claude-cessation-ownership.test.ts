@@ -140,10 +140,7 @@ describe('Claude Code cessation through the registry (runtime-neutral contract)'
       state: { registry, handle: { stop: async () => {} } as never },
     });
     await vi.advanceTimersByTimeAsync(200);
-    // Teardown also awaits real I/O the fake clock cannot advance; poll rather
-    // than assume it finished inside a fixed number of microtask turns (flaked
-    // under CPU load). Bounded well below the 15s force-exit guard.
-    await vi.waitFor(() => expect(exits).toEqual([0]), { timeout: 3_000 });
+    expect(exits).toEqual([0]);
     expect(adapterCessationEvidence(resident)).toBe('unknown');
     expect(registry.residents.occupied).toBe(1); // unconfirmed exit stays visible debt
   });
