@@ -1751,6 +1751,9 @@ async function main(): Promise<number> {
       workerGate: pacing.gate,
       retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
       parentTools: parentToolsFor,
+      notifications,
+      pendingProducerBlockers: (jobId, currentNative) => supervisorLive.pendingProducerBlockers(jobId, currentNative),
+      observeBlindTurn,
       ...(config.lessons.enabled ? { lessons: lessonReferences } : {}),
       // Service-stop ownership (issue #243 R2-H9): the shutdown signal aborts
       // a QUEUED directive/re-brief admission so a stopped service never
@@ -1780,6 +1783,7 @@ async function main(): Promise<number> {
       notifications,
       log: (level, msg, fields) => logger.log(level, msg, fields),
       getWave: () => state.wave,
+      directiveProgress,
     });
     const silas = new SilasDriver({
       slot: silasSlot,
@@ -1806,33 +1810,10 @@ async function main(): Promise<number> {
       // Chief phase-3 seam: every deterministic Silas pass runs the
       // production hook — the in-memory review-handoff reconsideration
       // plus the bounded durable reconciliation (issue #163) — BEFORE any
-<<<<<<< HEAD
       // LLM wake, and then the autopilot (issue #243). The composition is
       // the exported factory (issue #243 F-M4) so the asymmetric failure
       // behavior is behaviorally tested through a real driver, not a regex.
       onDeterministicPass: composeDeterministicPass(durablePass, autopilotHook),
-||||||| 6883628e
-      // LLM wake. The factory is behaviorally tested with a real ledger
-      // and driver; a wiring regression fails a behavioral test, not just
-      // a source regex.
-      onDeterministicPass: createProductionDeterministicPass({
-        ledger,
-        notifications,
-        log: (level, msg, fields) => logger.log(level, msg, fields),
-        getWave: () => state.wave,
-      }),
-=======
-      // LLM wake. The factory is behaviorally tested with a real ledger
-      // and driver; a wiring regression fails a behavioral test, not just
-      // a source regex.
-      onDeterministicPass: createProductionDeterministicPass({
-        ledger,
-        notifications,
-        log: (level, msg, fields) => logger.log(level, msg, fields),
-        getWave: () => state.wave,
-        directiveProgress,
-      }),
->>>>>>> origin/main
       githubPoll: new GitHubSignalPoll({
         ledger,
         notifications,

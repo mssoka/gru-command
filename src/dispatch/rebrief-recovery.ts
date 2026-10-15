@@ -240,50 +240,8 @@ export function finalizeRebriefRequest(input: {
   const deliveryNote: string | null = null;
   let deliveryRecorded = false;
   try {
-<<<<<<< HEAD
-    if (rebriefMarker !== null && pendingRebriefGuardedEvent(input.ledger, rebriefMarker, phaseId) === null) {
-      input.ledger.appendCustomEventIfCurrentRebrief({
-        kind: 'silas.rebrief',
-        jobId: input.jobId,
-        payload: {
-          minion_id: input.minionId,
-          lane: input.lanePath,
-          note: input.note,
-          ...(phaseId !== null ? { phase_id: phaseId } : {}),
-          // Firing-rule provenance (issue #117, g21): replayed from the
-          // durable request marker, so a restart mid-turn cannot strip the
-          // receipt of the rule that fired the re-brief.
-          ...(rebriefMarker.ruleId !== null ? { rule_id: rebriefMarker.ruleId } : {}),
-          ...(rebriefMarker.sourceRoundId !== null ? { source_round_id: rebriefMarker.sourceRoundId } : {}),
-          // Autopilot provenance (issue #243 M3): a marker minted by the code
-          // autopilot replays `source: 'silas-autopilot'` onto the receipt,
-          // so #214's agreement read can attribute it.
-          ...(rebriefMarker.source !== null ? { source: rebriefMarker.source } : {}),
-        },
-      }, markers);
-      rebriefRecorded = true;
-||||||| 6883628e
-    if (rebriefMarker !== null && pendingRebriefGuardedEvent(input.ledger, rebriefMarker, phaseId) === null) {
-      input.ledger.appendCustomEventIfCurrentRebrief({
-        kind: 'silas.rebrief',
-        jobId: input.jobId,
-        payload: {
-          minion_id: input.minionId,
-          lane: input.lanePath,
-          note: input.note,
-          ...(phaseId !== null ? { phase_id: phaseId } : {}),
-          // Firing-rule provenance (issue #117, g21): replayed from the
-          // durable request marker, so a restart mid-turn cannot strip the
-          // receipt of the rule that fired the re-brief.
-          ...(rebriefMarker.ruleId !== null ? { rule_id: rebriefMarker.ruleId } : {}),
-          ...(rebriefMarker.sourceRoundId !== null ? { source_round_id: rebriefMarker.sourceRoundId } : {}),
-        },
-      }, markers);
-      rebriefRecorded = true;
-=======
     if (rebriefMarker !== null && input.ledger.pendingRebriefReceipt(rebriefMarker) === null) {
       throw new Error('historical rebrief completion is unproven — preserve markers and require a guarded Gru recovery decision');
->>>>>>> origin/main
     }
     if (missing.length > 0) {
       // The re-brief event publishes after COMMIT. Its subscribers may
@@ -355,7 +313,7 @@ function sameRebriefGeneration(current: readonly PendingRebriefRecord[], expecte
 }
 
 export class RebriefTurnCancelled extends Error {
-  constructor(readonly reason: 'terminal' | 'superseded' | 'refused') {
+  constructor(readonly reason: 'terminal' | 'superseded') {
     super(`re-brief turn cancelled before admission: ${reason}`);
     this.name = 'RebriefTurnCancelled';
   }

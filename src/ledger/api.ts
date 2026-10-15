@@ -7300,7 +7300,7 @@ export class LedgerApi {
     holder: string;
     requestId?: string;
     kind?: 'directive' | 'rebrief';
-    sourceContext?: { readonly ruleId?: string; readonly sourceRoundId?: string };
+    sourceContext?: { readonly ruleId?: string; readonly sourceRoundId?: string; readonly source?: string };
     /** Explicit completion intent; omitted = ordinary directive. */
     handoff?: CompletionHandoffIntent;
   }): { readonly record: DirectiveRequestRecord; readonly created: boolean } {
@@ -7322,12 +7322,14 @@ export class LedgerApi {
     if (isJobTerminal(job.status)) {
       throw new Error(`job "${input.jobId}" is ${job.status} — terminal lanes take no directives`);
     }
-    const normalizeSourceContext = (context: { readonly ruleId?: string; readonly sourceRoundId?: string } | null | undefined) =>
-      context === null || context === undefined || context.ruleId === undefined && context.sourceRoundId === undefined ? null :
-        { ...(context.ruleId === undefined ? {} : { ruleId: context.ruleId }), ...(context.sourceRoundId === undefined ? {} : { sourceRoundId: context.sourceRoundId }) };
+    const normalizeSourceContext = (context: { readonly ruleId?: string; readonly sourceRoundId?: string; readonly source?: string } | null | undefined) =>
+      context === null || context === undefined || context.ruleId === undefined && context.sourceRoundId === undefined && context.source === undefined ? null :
+        { ...(context.ruleId === undefined ? {} : { ruleId: context.ruleId }), ...(context.sourceRoundId === undefined ? {} : { sourceRoundId: context.sourceRoundId }),
+          // Autopilot provenance (issue #243 M3): replayed onto the receipts.
+          ...(context.source === undefined ? {} : { source: context.source }) };
     const sourceContext = normalizeSourceContext(input.sourceContext);
     const payload = JSON.stringify({ directive: input.directive, blocker_fingerprint: input.blockerFingerprint ?? null,
-      ...(input.kind === 'rebrief' ? { request_kind: 'rebrief', rule_id: sourceContext?.ruleId ?? null, source_round_id: sourceContext?.sourceRoundId ?? null } : {}) });
+      ...(input.kind === 'rebrief' ? { request_kind: 'rebrief', rule_id: sourceContext?.ruleId ?? null, source_round_id: sourceContext?.sourceRoundId ?? null, ...(sourceContext?.source === undefined ? {} : { source: sourceContext.source }) } : {}) });
     const payloadHash = createHash('sha256').update(payload).digest('hex');
     return this.transaction(() => {
       if (input.requestId !== undefined) {
@@ -7442,7 +7444,7 @@ export class LedgerApi {
   }
 
   beginRebriefIntent(input: { readonly jobId: string; readonly note: string; readonly holder: string; readonly requestId?: string;
-    readonly handoff?: CompletionHandoffIntent; readonly sourceContext?: { readonly ruleId?: string; readonly sourceRoundId?: string } }): ReturnType<LedgerApi['beginDirectiveIntent']> {
+    readonly handoff?: CompletionHandoffIntent; readonly sourceContext?: { readonly ruleId?: string; readonly sourceRoundId?: string; readonly source?: string } }): ReturnType<LedgerApi['beginDirectiveIntent']> {
     return this.beginDirectiveIntent({ jobId: input.jobId, directive: input.note, holder: input.holder, kind: 'rebrief',
       ...(input.requestId === undefined ? {} : { requestId: input.requestId }), ...(input.handoff === undefined ? {} : { handoff: input.handoff }),
       ...(input.sourceContext === undefined ? {} : { sourceContext: input.sourceContext }) });
@@ -7626,6 +7628,7 @@ export class LedgerApi {
         payload: { request_id: row.requestId, minion_id: binding.agentId, native_binding: binding,
           ...(row.sourceContext?.ruleId === undefined ? {} : { rule_id: row.sourceContext.ruleId }),
           ...(row.sourceContext?.sourceRoundId === undefined ? {} : { source_round_id: row.sourceContext.sourceRoundId }),
+          ...(row.sourceContext?.source === undefined ? {} : { source: row.sourceContext.source }),
           blocker_fingerprint: (JSON.parse(row.payload) as { blocker_fingerprint?: unknown }).blocker_fingerprint ?? null } });
       this.db.prepare('UPDATE pending_directives SET native_binding = ? WHERE request_id = ?').run(JSON.stringify(binding), row.requestId);
       const admitted = this.recordDirectiveAdmission({ requestId: row.requestId, minionId: binding.agentId, eventSeq: sent.seq });
@@ -8422,6 +8425,7 @@ export class LedgerApi {
         request_id: row.requestId, minion_id: proof.binding.agentId, note: (JSON.parse(row.payload) as { directive: string }).directive,
         ...(phase === null ? {} : { phase_id: phase.phaseId }), ...(row.sourceContext?.ruleId === undefined ? {} : { rule_id: row.sourceContext.ruleId }),
         ...(row.sourceContext?.sourceRoundId === undefined ? {} : { source_round_id: row.sourceContext.sourceRoundId }),
+        ...(row.sourceContext?.source === undefined ? {} : { source: row.sourceContext.source }),
       } });
       const delivery = this.appendEvent({ kind: 'job.delivered', jobId: row.jobId, agentId: proof.binding.agentId,
         payload: { request_id: row.requestId, agentId: proof.binding.agentId, source: row.requestKind === 'rebrief' ? 'silas-rebrief' : 'silas-directive', sha: completion?.head ?? null,

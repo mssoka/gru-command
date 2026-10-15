@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { nativeSeams } from './helpers/silas-native-seams.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -84,6 +85,7 @@ describe('F-H4 pending ownership snapshot (production ops seam)', () => {
       },
     } satisfies AgentHandle;
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: waveStub() as never,
       registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} } as never,
@@ -127,6 +129,7 @@ describe('F-H4 pending ownership snapshot (production ops seam)', () => {
       },
     } satisfies AgentHandle;
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: waveStub() as never,
       registry: { getHandle: () => null, spawn: async () => gated, disposeHandle: async () => {} } as never,

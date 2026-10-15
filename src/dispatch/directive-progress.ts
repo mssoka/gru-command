@@ -27,6 +27,10 @@ export interface DirectiveProgressDeps {
   readonly lessons?: LessonsReferencePort;
   readonly observeBlindTurn?: (jobId: string, sessionFile: string | null) => void;
   readonly clearLaneForWriter?: (input: { readonly jobId: string; readonly writer: string }) => Promise<unknown>;
+  /** Issue #243 F-H2/F-H3: an optional caller re-proof (owner hold, verification
+   * ownership) run at every post-wait writer admission boundary inside the
+   * route. A throw refuses BEFORE any prompt/durable effect. */
+  readonly beforeWriterSideEffect?: () => void;
 }
 function check(deps: DirectiveProgressDeps, identity: DirectiveTurnIdentity): void {
   if (deps.signal.aborted) throw new DirectiveCheckpointError('service stopping — directive recovery cancelled');
@@ -339,6 +343,7 @@ export function settleNativeDirective(deps: DirectiveProgressDeps, identity: Dir
       ...(phase === null ? {} : { phase_id: phase.phaseId }),
       ...(row.sourceContext?.ruleId === undefined ? {} : { rule_id: row.sourceContext.ruleId }),
       ...(row.sourceContext?.sourceRoundId === undefined ? {} : { source_round_id: row.sourceContext.sourceRoundId }),
+      ...(row.sourceContext?.source === undefined ? {} : { source: row.sourceContext.source }),
     } }, identity);
   }
   const delivery = recordFollowUpDelivery({ ledger: {

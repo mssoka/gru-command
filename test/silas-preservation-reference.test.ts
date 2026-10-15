@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { nativeSeams } from './helpers/silas-native-seams.js';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -229,6 +230,7 @@ describe('the production release ingress consumes the preservation reference (is
 
   const opsFor = (ledger: LedgerApi, release: () => Promise<unknown>) =>
     createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: {
         assertWriterAdmissible: () => {},

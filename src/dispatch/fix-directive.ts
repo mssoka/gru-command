@@ -248,16 +248,10 @@ export async function routeFixDirectiveToMinion(
         // A refusal before prompt is positive no-admission proof, not a
         // prompt error eligible for retry recovery. It must still release
         // the pacing lease acquired after the asynchronous wait above.
-<<<<<<< HEAD
         assertAdmissible();
-||||||| 6883628e
-        assertDirectiveJobActive(input.ledger, input.jobId);
-=======
-        assertDirectiveJobActive(input.ledger, input.jobId);
         guard();
         nativeAttempted = true;
         input.onPrepared?.(handle);
->>>>>>> origin/main
         const run = runObservedPrompt(handle, directive, input.signal, owner, () =>
           observe(handle.sessionFile), input.directiveTurn);
         observation = run.observation;
@@ -362,15 +356,9 @@ export async function routeFixDirectiveToMinion(
       `Fresh minion re-brief for job ${input.jobId}. Effective contract (original briefing plus accepted amendments):\n${contract}\n\nCurrent fix directive:\n${compose(input.continuation?.freshNote ?? '')}`;
     let prompt = resumeFile === null && input.contract != null && input.freshSession !== true ? freshPrompt(input.contract) : directive;
     try {
-<<<<<<< HEAD
       assertAdmissible();
-||||||| 6883628e
-      assertDirectiveJobActive(input.ledger, input.jobId);
-=======
-      assertDirectiveJobActive(input.ledger, input.jobId);
       guard();
       nativeAttempted = true; // a rejected spawn is still uncertain, never a deferral
->>>>>>> origin/main
       handle = await input.registry.spawn('minion', {
         cwd: lane.path, signal: input.signal,
         ...(resumeFile !== null ? { resumeFile } : {}),
@@ -383,29 +371,17 @@ export async function routeFixDirectiveToMinion(
       if (job == null || contract == null) {
         throw new Error(`cannot resume prior minion session for job ${input.jobId} and no original briefing is available to re-brief: ${String(error)}`);
       }
-<<<<<<< HEAD
       assertAdmissible();
-||||||| 6883628e
-      assertDirectiveJobActive(input.ledger, input.jobId);
-=======
-      assertDirectiveJobActive(input.ledger, input.jobId);
       guard();
       nativeAttempted = true;
->>>>>>> origin/main
       handle = await input.registry.spawn('minion', { cwd: lane.path, signal: input.signal, ...identity });
       // A fresh session has no memory of accepted amendments: brief it with
       // the EFFECTIVE contract (original + amendments), never the original
       // alone (owner rule 4).
       prompt = freshPrompt(contract);
     }
-<<<<<<< HEAD
     assertAdmissible();
-||||||| 6883628e
-    assertDirectiveJobActive(input.ledger, input.jobId);
-=======
-    assertDirectiveJobActive(input.ledger, input.jobId);
     guard();
->>>>>>> origin/main
     let promptError: unknown = null;
     let verdict: PromptTurnVerdict | null = null;
     const spawnedHandle = handle;
@@ -423,16 +399,10 @@ export async function routeFixDirectiveToMinion(
       registrationFailed = true;
       throw error; // the single cleanup owner below preserves registration AND cleanup failures
     }
-<<<<<<< HEAD
     assertAdmissible();
-||||||| 6883628e
-    assertDirectiveJobActive(input.ledger, input.jobId);
-=======
-    assertDirectiveJobActive(input.ledger, input.jobId);
     guard(handle);
     nativeAttempted = true;
     input.onPrepared?.(handle);
->>>>>>> origin/main
     const continuationSessionFile = handle.sessionFile;
     let observation: Promise<void> = Promise.resolve();
     try {

@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { LedgerApi } from '../src/ledger/api.js';
+import { LIVE_DIRECTIVE_STATES } from '../src/ledger/directives.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import {
   AUTOPILOT_DECISION_EVENT,
@@ -21,7 +22,9 @@ import { PacingGate } from '../src/runtime/pacing.js';
 import type { WorktreeSweepResult } from '../src/dispatch/worktree-port.js';
 import type { AgentCapabilities, AgentHandle } from '../src/runtime/types.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
+import { withNativeDirectiveFixture } from './helpers/directive-native-fixture.js';
 import { GitReviewPort } from './helpers/git-review-port.js';
+import { nativeSeams } from './helpers/silas-native-seams.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import type { SilasAutopilotConfig } from '../src/config.js';
 import {
@@ -1080,6 +1083,7 @@ describe('the production ops binding writes receipts that carry rule_id and sour
     const job = ledger.addJob({ id: 'job-pr', repo: 'gru-command', title: 'pr', baseBranch: 'main', briefing: 'x' });
     ledger.setJobStatus(job.id, 'working');
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: { assertWriterAdmissible: () => {}, clearLaneForWriter: async () => undefined, requestReview: async () => Promise.reject(new Error('unused')) },
       registry: {} as never,
@@ -1108,6 +1112,7 @@ describe('the production ops binding writes receipts that carry rule_id and sour
     ledger.setJobStatus(job.id, 'done');
     let swept = false;
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: { assertWriterAdmissible: () => {}, clearLaneForWriter: async () => undefined, requestReview: async () => Promise.reject(new Error('unused')) },
       registry: {} as never,
@@ -1134,6 +1139,7 @@ describe('the production ops binding writes receipts that carry rule_id and sour
     pausedLedger.setJobStatus(pausedJob.id, 'working');
     pausedLedger.setJobStatus(pausedJob.id, 'done');
     const pausedOps = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger: pausedLedger,
       wave: { assertWriterAdmissible: () => {}, clearLaneForWriter: async () => undefined, requestReview: async () => Promise.reject(new Error('unused')) },
       registry: {} as never,
@@ -1154,6 +1160,7 @@ describe('the production ops binding writes receipts that carry rule_id and sour
     const job = ledger.addJob({ id: 'job-live', repo: 'gru-command', title: 'live', baseBranch: 'main', briefing: 'x' });
     const release = vi.fn();
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: { assertWriterAdmissible: () => {}, clearLaneForWriter: async () => undefined, requestReview: async () => Promise.reject(new Error('unused')) },
       registry: {} as never,
@@ -1170,6 +1177,7 @@ describe('the production ops binding writes receipts that carry rule_id and sour
     const ledger = tempLedger();
     const asked: { head: string }[] = [];
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: { assertWriterAdmissible: () => {}, clearLaneForWriter: async () => undefined, requestReview: async () => Promise.reject(new Error('unused')) },
       registry: {} as never,
@@ -1392,6 +1400,27 @@ function idleHandle(id: string, opts: { fail?: Error } = {}): AgentHandle {
   } satisfies AgentHandle;
 }
 
+/** A real job lane (a git worktree on its own branch) — the native directive
+ * executor refuses fresh effects without a registered, checked-out lane. */
+async function nativeLanes(jobId: string): Promise<InMemoryWorktreePort> {
+  const repo = makeFixtureRepo();
+  repos.push(repo);
+  const laneRoot = mkdtempSync(join(tmpdir(), 'autopilot-native-lanes-'));
+  dirs.push(laneRoot);
+  const lanes = new InMemoryWorktreePort(laneRoot);
+  await lanes.createJobWorktree({ repoPath: repo.path, jobId });
+  return lanes;
+}
+
+/** Wrap a fake handle with the native directive attestation the production
+ * runtime provides, bound to the job lane's cwd. */
+function nativeHandle(base: AgentHandle, lanes: InMemoryWorktreePort, jobId: string): AgentHandle {
+  const lane = lanes.listWorktrees({ jobId })[0]!;
+  const dir = mkdtempSync(join(tmpdir(), 'autopilot-native-session-'));
+  dirs.push(dir);
+  return withNativeDirectiveFixture(base, join(dir, `${base.id}.jsonl`), () => {}, () => null, lane.path);
+}
+
 function newRealLedger(): LedgerApi {
   const dir = mkdtempSync(join(tmpdir(), 'autopilot-ops-real-'));
   dirs.push(dir);
@@ -1425,6 +1454,7 @@ describe('the production ops binding re-proves writer admission (issue #243 H1)'
     ledger.setJobStatus(job.id, 'in-review');
     let superseded = false;
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: {
         assertWriterAdmissible: () => {
@@ -1458,6 +1488,7 @@ describe('the production ops binding re-proves writer admission (issue #243 H1)'
     ledger.setJobStatus(job.id, 'in-review');
     let superseded = false;
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: {
         assertWriterAdmissible: () => {
@@ -1493,6 +1524,7 @@ describe('the production directive settlement keeps unknown admission live (issu
     ledger.registerAgent({ id: 'min-h2', role: 'minion', jobId: job.id });
     const handle = idleHandle('min-h2', { fail: new Error('transport dropped after the prompt call') });
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: waveStub(),
       registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
@@ -1525,12 +1557,14 @@ describe('the production directive settlement keeps unknown admission live (issu
     const job = ledger.addJob({ id: 'job-m9', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
     ledger.setJobStatus(job.id, 'working');
     await lanes.createJobWorktree({ repoPath: repo.path, jobId: job.id });
-    ledger.registerAgent({ id: 'min-m9', role: 'minion', jobId: job.id });
-    const handle = idleHandle('min-m9');
+    const handle = nativeHandle(idleHandle('min-m9'), lanes, job.id);
+    ledger.registerAgent({ id: 'min-m9', role: 'minion', jobId: job.id, sessionFile: handle.sessionFile });
+    ledger.setAgentState('min-m9', 'idle');
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: waveStub(),
-      registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
+      registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async (target) => { await target.dispose(); } },
       worktrees: lanes,
       dispatch: { recordPr: () => ({ prUrl: null }) },
       gh: { listPullsForHead: async () => [] },
@@ -1543,7 +1577,7 @@ describe('the production directive settlement keeps unknown admission live (issu
       sourceRoundId: 'round-m9',
       blockerFingerprint: 'verdict:round-m9',
     });
-    await vi.waitFor(() => expect(ledger.latestJobEvent(job.id, 'silas.directive-settled')).not.toBeNull());
+    await vi.waitFor(() => expect(ledger.listPendingDirectives({ jobId: job.id })[0]?.state).toBe('settled'));
     expect(ledger.latestJobEvent(job.id, 'silas.directive-sent')?.payload).toMatchObject({
       rule_id: 'verdict-rung-directive',
       source: AUTOPILOT_SOURCE,
@@ -1567,14 +1601,15 @@ describe('the production directive settlement keeps unknown admission live (issu
     const job = ledger.addJob({ id: 'job-h3', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'original' });
     ledger.setJobStatus(job.id, 'working');
     await lanes.createJobWorktree({ repoPath: repo.path, jobId: job.id });
-    ledger.registerAgent({ id: 'min-h3', role: 'minion', jobId: job.id });
     const prompted: string[] = [];
-    const handle = {
+    const handle = nativeHandle({
       ...idleHandle('min-h3'),
       async prompt(text: string) {
         prompted.push(text);
       },
-    } satisfies AgentHandle;
+    }, lanes, job.id);
+    ledger.registerAgent({ id: 'min-h3', role: 'minion', jobId: job.id, sessionFile: handle.sessionFile });
+    ledger.setAgentState('min-h3', 'idle');
     const amendment = ledger.addJobAmendment({
       jobId: job.id,
       body: 'ALSO: fix the retry path before you push.',
@@ -1584,9 +1619,10 @@ describe('the production directive settlement keeps unknown admission live (issu
     });
     expect(amendment.status).toBe('accepted');
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: waveStub(),
-      registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
+      registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async (target) => { await target.dispose(); } },
       worktrees: lanes,
       dispatch: { recordPr: () => ({ prUrl: null }) },
       gh: { listPullsForHead: async () => [] },
@@ -1598,7 +1634,7 @@ describe('the production directive settlement keeps unknown admission live (issu
       ruleId: 'verdict-rung-directive',
       sourceRoundId: 'round-h3',
     });
-    await vi.waitFor(() => expect(ledger.latestJobEvent(job.id, 'silas.directive-settled')).not.toBeNull());
+    await vi.waitFor(() => expect(ledger.listPendingDirectives({ jobId: job.id })[0]?.state).toBe('settled'));
     // The approved amendment body travels ONCE with the directive turn…
     expect(prompted.join('\n')).toContain('ALSO: fix the retry path before you push.');
     // …and the delivery that settles the turn stamps that exact revision.
@@ -1617,8 +1653,9 @@ describe('the production re-brief finalization carries autopilot provenance (iss
     const job = ledger.addJob({ id: 'job-m10', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
     ledger.setJobStatus(job.id, 'working');
     await lanes.createJobWorktree({ repoPath: repo.path, jobId: job.id });
-    const handle = idleHandle('fresh-m10');
+    const handle = nativeHandle(idleHandle('fresh-m10'), lanes, job.id);
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: waveStub(),
       registry: { getHandle: () => null, spawn: async () => handle, disposeHandle: async () => {} },
@@ -1639,7 +1676,7 @@ describe('the production re-brief finalization carries autopilot provenance (iss
       source_round_id: 'round-m10',
       source: AUTOPILOT_SOURCE,
     });
-    expect(ledger.listPendingRebriefs({ jobId: job.id })).toHaveLength(0);
+    expect(ledger.listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES, limit: 5 })).toEqual([]);
   });
 });
 
@@ -1817,6 +1854,7 @@ describe('R2-H1 decision holds cover sweep-ack and delivered-pr-register', () =>
     });
     let released = false;
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: waveStub(),
       registry: {} as never,
@@ -1848,6 +1886,7 @@ describe('R2-H1 decision holds cover sweep-ack and delivered-pr-register', () =>
     });
     let linked = false;
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: waveStub(),
       registry: {} as never,
@@ -1894,6 +1933,7 @@ describe('R2-H2 verification ownership fences the conflict writer', () => {
       payload: { scope: 'full', run_id: 'run-r2h2', head: 'a'.repeat(40) },
     });
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: waveStub(),
       registry: {} as never,
@@ -1920,14 +1960,14 @@ describe('R2-H3 a stale re-brief never replaces a newer pending request', () => 
     const job = ledger.addJob({ id: 'job-r2h3', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
     ledger.setJobStatus(job.id, 'working');
     // A newer request admitted during this producer's awaited supersession.
-    ledger.beginPendingRebrief({
+    const newer = ledger.beginRebriefIntent({
       jobId: job.id,
       note: 'newer admitted request',
-      briefing: 'b',
-      ruleId: 'verdict-rung-rebrief',
-      sourceRoundId: 'round-newer',
-    });
+      holder: 'silas-ops',
+      sourceContext: { ruleId: 'verdict-rung-rebrief', sourceRoundId: 'round-newer' },
+    }).record;
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: waveStub(),
       registry: {} as never,
@@ -1938,11 +1978,11 @@ describe('R2-H3 a stale re-brief never replaces a newer pending request', () => 
     });
     await expect(
       ops.sendRebrief({ jobId: job.id, note: 'stale request', ruleId: 'verdict-rung-rebrief', sourceRoundId: 'round-stale' }),
-    ).rejects.toThrow(/newer re-brief request pending/);
+    ).rejects.toThrow(/is already live/);
     // The newer generation survives byte-for-byte.
-    const markers = ledger.listPendingRebriefs({ jobId: job.id });
-    expect(markers).toHaveLength(2);
-    expect(markers.find((marker) => marker.kind === 'silas.rebrief')?.note).toBe('newer admitted request');
+    expect(ledger.getDirective(newer.requestId)?.state).toBe(newer.state);
+    expect(ledger.listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES, limit: 5 }).map((row) => row.requestId))
+      .toEqual([newer.requestId]);
   });
 });
 
@@ -1970,6 +2010,7 @@ describe('R2-H4 clean-abort carries the proved head through admission (real ledg
     const { jobId, roundId } = seedCleanAbort(ledger, 'job-r2h4');
     const captured: Record<string, unknown>[] = [];
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: waveStub({
         requestReview: (async (input: Record<string, unknown>) => {
@@ -2035,6 +2076,7 @@ describe('R2-H5 the post-lookup / mutation boundary re-proves ownership', () => 
     ledger.setJobStatus(job.id, 'done');
     let linked = false;
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: waveStub(),
       registry: {} as never,
@@ -2065,6 +2107,7 @@ describe('R2-H5 the post-lookup / mutation boundary re-proves ownership', () => 
     });
     let linked = false;
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: waveStub(),
       registry: {} as never,
@@ -2101,6 +2144,7 @@ describe('R2-M1 review admission is awaited through admission', () => {
       releaseReview = resolve;
     });
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: waveStub({
         requestReview: (async () => {
@@ -2184,6 +2228,7 @@ describe('R2-H9 service-stop ownership of directive/re-brief producers', () => {
     const stop = new AbortController();
     stop.abort();
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: waveStub(),
       registry: {} as never,
@@ -2203,16 +2248,19 @@ describe('R2-H9 service-stop ownership of directive/re-brief producers', () => {
     const ledger = newRealLedger();
     const job = ledger.addJob({ id: 'job-r2h9b', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
     ledger.setJobStatus(job.id, 'working');
-    ledger.registerAgent({ id: 'min-r2h9', role: 'minion', jobId: job.id });
-    const handle = idleHandle('min-r2h9');
+    const lanes = await nativeLanes(job.id);
+    const handle = nativeHandle(idleHandle('min-r2h9'), lanes, job.id);
+    ledger.registerAgent({ id: 'min-r2h9', role: 'minion', jobId: job.id, sessionFile: handle.sessionFile });
+    ledger.setAgentState('min-r2h9', 'idle');
     const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
     const holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'hold the pool' });
     const stop = new AbortController();
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: waveStub(),
       registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
-      worktrees: { listWorktrees: () => [] } as never,
+      worktrees: lanes,
       dispatch: { recordPr: () => ({ prUrl: null }) },
       gh: { listPullsForHead: async () => [] },
       resolveRemote: () => null,
@@ -2237,6 +2285,7 @@ describe('R2-H9 service-stop ownership of directive/re-brief producers', () => {
 describe('sweep-ack custody: the autopilot mints no fabricated preservation evidence', () => {
   const custodyOps = (ledger: LedgerApi, release: () => Promise<WorktreeSweepResult>, status = 'active') =>
     createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: waveStub(),
       registry: {} as never,
@@ -2333,6 +2382,7 @@ describe('R2-M4 production ops drive a REAL WaveRunner admission/freeze', () => 
 
   const opsFor = (f: { readonly ledger: LedgerApi; readonly port: GitReviewPort }, wave: WaveRunner) =>
     createSilasAutopilotOps({
+      ...nativeSeams,
       ledger: f.ledger,
       wave,
       registry: {} as never,
@@ -2726,6 +2776,7 @@ describe('F-H2 the admission boundary re-proves a hold that lands after planning
       },
     });
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave,
       registry: {} as never,
@@ -2738,7 +2789,7 @@ describe('F-H2 the admission boundary re-proves a hold that lands after planning
       ops.sendRebrief({ jobId: job.id, note: 'n', ruleId: 'verdict-rung-rebrief', sourceRoundId: 'round-late', hold }),
     ).rejects.toThrow(/covers verdict-rung-rebrief/);
     expect(held).toBe(true);
-    expect(ledger.listPendingRebriefs({ jobId: job.id })).toHaveLength(0);
+    expect(ledger.listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES, limit: 5 })).toEqual([]);
   });
 
   it('refuses a directive when its coverage hold lands during the awaited supersession', async () => {
@@ -2762,6 +2813,7 @@ describe('F-H2 the admission boundary re-proves a hold that lands after planning
       },
     });
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave,
       registry: {} as never,
@@ -2784,20 +2836,23 @@ describe('F-H3 verification ownership is re-proved after the pacing wait', () =>
     const job = ledger.addJob({ id: 'job-fh3', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
     ledger.setJobStatus(job.id, 'working');
     ledger.registerAgent({ id: 'min-fh3', role: 'minion', jobId: job.id });
+    ledger.setAgentState('min-fh3', 'idle');
     let prompted = 0;
-    const handle = {
+    const lanes = await nativeLanes(job.id);
+    const handle = nativeHandle({
       ...idleHandle('min-fh3'),
       async prompt() {
         prompted += 1;
       },
-    } satisfies AgentHandle;
+    }, lanes, job.id);
     const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
     const holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'hold the pool' });
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: waveStub(),
       registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
-      worktrees: { listWorktrees: () => [] } as never,
+      worktrees: lanes,
       dispatch: { recordPr: () => ({ prUrl: null }) },
       gh: { listPullsForHead: async () => [] },
       resolveRemote: () => null,
@@ -2840,7 +2895,7 @@ describe('F-H4 the shutdown producer join settles after disposal releases the ha
     // The running re-brief awaits its prompt directly; only DISPOSING the
     // handle (production: registry.dispose()) rejects it — the stop signal
     // does not reach this open await.
-    const handle = {
+    const handle = nativeHandle({
       ...idleHandle('min-fh4r'),
       async prompt() {
         entered = true;
@@ -2851,8 +2906,9 @@ describe('F-H4 the shutdown producer join settles after disposal releases the ha
         disposed = true;
         openPrompt();
       },
-    } satisfies AgentHandle;
+    }, lanes, job.id);
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: waveStub(),
       registry: {
@@ -2881,8 +2937,8 @@ describe('F-H4 the shutdown producer join settles after disposal releases the ha
     expect(drained.settled).toBe(true);
     expect(drained.pending).toBe(0);
     // Honest accounting: the PRODUCER settled, but the unresolved request
-    // markers remain (ownership retained, never fabricated as ceased).
-    expect(ledger.listPendingRebriefs({ jobId: job.id }).length).toBeGreaterThan(0);
+    // request remains live (ownership retained, never fabricated as ceased).
+    expect(ledger.listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES, limit: 5 }).length).toBeGreaterThan(0);
   }, 30_000);
 });
 
@@ -2995,24 +3051,27 @@ describe('F-M1 the real driver does not wake for verdict work an accepted produc
     const ledger = newRealLedger();
     const jobId = 'job-fm1w';
     seedVerdictJob(ledger, jobId);
-    ledger.registerAgent({ id: 'min-fm1w', role: 'minion', jobId });
+    const lanes = await nativeLanes(jobId);
     let entered = false;
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
-    const handle = {
+    const handle = nativeHandle({
       ...idleHandle('min-fm1w'),
       async prompt() {
         entered = true;
         await gate;
       },
-    } satisfies AgentHandle;
+    }, lanes, jobId);
+    ledger.registerAgent({ id: 'min-fm1w', role: 'minion', jobId, sessionFile: handle.sessionFile });
+    ledger.setAgentState('min-fm1w', 'idle');
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: waveStub(),
       registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
-      worktrees: { listWorktrees: () => [] } as never,
+      worktrees: lanes,
       dispatch: { recordPr: () => ({ prUrl: null }) },
       gh: { listPullsForHead: async () => [] },
       resolveRemote: () => null,
@@ -3049,14 +3108,15 @@ describe('F-M1 the real driver does not wake for verdict work an accepted produc
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
-    const handle = {
+    const handle = nativeHandle({
       ...idleHandle('min-fm1rebrief'),
       async prompt() {
         entered = true;
         await gate;
       },
-    } satisfies AgentHandle;
+    }, lanes, jobId);
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: waveStub(),
       registry: { getHandle: () => null, spawn: async () => handle, disposeHandle: async () => {} },
@@ -3069,7 +3129,7 @@ describe('F-M1 the real driver does not wake for verdict work an accepted produc
     await vi.waitFor(() => expect(entered).toBe(true));
     expect(await driveWakes(ledger, jobId)).toBe(0);
     release();
-    await vi.waitFor(() => expect(ledger.listPendingRebriefs({ jobId })).toHaveLength(0));
+    await vi.waitFor(() => expect(ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES, limit: 5 })).toHaveLength(0));
   }, 30_000);
 });
 
@@ -3088,6 +3148,7 @@ describe('F-H3 verification ownership re-proved at the fresh-spawn and re-brief 
     const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
     const holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'hold the pool' });
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: waveStub(),
       registry: {
@@ -3132,6 +3193,7 @@ describe('F-H3 verification ownership re-proved at the fresh-spawn and re-brief 
     const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
     const holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'hold the pool' });
     const ops = createSilasAutopilotOps({
+      ...nativeSeams,
       ledger,
       wave: waveStub(),
       registry: {
