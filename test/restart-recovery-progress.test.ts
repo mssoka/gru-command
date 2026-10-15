@@ -156,7 +156,7 @@ function originalDeliveryPayload(f: Awaited<ReturnType<typeof fixture>>) {
 
 describe('restart-recovery-progress — exact native request matrix', () => {
   async function pr334CompletedOriginalWithRecoveryDebt() {
-    const f = await fixture(); (f.ledger.getWorktree(f.lane.id) ?? f.ledger.registerWorktree(f.lane));
+    const f = await fixture(); void (f.ledger.getWorktree(f.lane.id) ?? f.ledger.registerWorktree(f.lane));
     expect(f.ledger.claimDirectiveDispatch(f.intent.requestId)).toBe(true);
     f.ledger.prepareDirectiveTarget(f.intent.requestId, { agentId: 'logical-minion', sessionFile: f.file });
     prepareDirectiveBinding({ identity: f.identity, runtime: 'pi', agentId: 'logical-minion', sessionId: f.native.sessionId,
@@ -291,7 +291,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
   });
 
   it('PR334 cessation older ceased incarnations do not misidentify the exact latest absent host lock', async () => {
-    const f = await fixture(); (f.ledger.getWorktree(f.lane.id) ?? f.ledger.registerWorktree(f.lane)); f.seed();
+    const f = await fixture(); void (f.ledger.getWorktree(f.lane.id) ?? f.ledger.registerWorktree(f.lane)); f.seed();
     const first = inspectDirectiveProducers(f.file, f.identity)[0]!.producer;
     const firstStart = f.ledger.startDirectiveProducer(f.identity, first);
     f.ledger.appendCustomEvent({ kind: 'silas.directive-producer-ceased', jobId: f.intent.jobId, payload: {
@@ -341,7 +341,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
 
   it('PR334 cessation a fresh ledger reconciles only its own exact proven UNKNOWN cleanup before settlement', async () => {
     for (const independentUnknown of [false, true]) {
-      const f = await fixture(); (f.ledger.getWorktree(f.lane.id) ?? f.ledger.registerWorktree(f.lane));
+      const f = await fixture(); void (f.ledger.getWorktree(f.lane.id) ?? f.ledger.registerWorktree(f.lane));
       f.ledger.prepareDirectiveTarget(f.intent.requestId, { agentId: 'logical-minion', sessionFile: f.file });
       prepareDirectiveBinding({ identity: f.identity, runtime: 'pi', agentId: 'logical-minion', sessionId: f.native.sessionId,
         sessionFile: f.file, text: 'original admitted native turn', authorityManifest: 'original authority' });
@@ -467,7 +467,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
 
   async function completeBeforeOriginalOwnerPark(report = false, parkAfterCompletion = true) {
     const f = await fixture('directive', true, report);
-    (f.ledger.getWorktree(f.lane.id) ?? f.ledger.registerWorktree(f.lane)); // actual original setup, before native execution
+    void (f.ledger.getWorktree(f.lane.id) ?? f.ledger.registerWorktree(f.lane)); // actual original setup, before native execution
     f.seed(); f.native.finish();
     const completed = inspectDirectiveCheckpoint(f.file, f.identity);
     if (completed.state !== 'terminal' || !completed.ok) throw new Error('original fixture must really reach its terminal before owner control');
@@ -907,7 +907,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(f.ledger.getEvent(event.seq)).toEqual(event);
   });
   async function assertFalsePublisherDebt(mode: 'null-head' | 'dirty' | 'head-moved') {
-    const f = await fixture(); (f.ledger.getWorktree(f.lane.id) ?? f.ledger.registerWorktree(f.lane)); // before original native execution
+    const f = await fixture(); void (f.ledger.getWorktree(f.lane.id) ?? f.ledger.registerWorktree(f.lane)); // before original native execution
     f.seed(); f.native.finish(); f.ledger.bindDirectiveNativeAdmission(inspectDirectiveAdmission(f.file, f.identity));
     const proof = inspectDirectiveCheckpoint(f.file, f.identity);
     if (proof.state !== 'terminal' || !proof.ok) throw new Error('original successful native completion required');
@@ -988,7 +988,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
 
   async function assertLedgerCandidate(mode: 'current' | 'head-moved' | 'dirty' | 'untracked' | 'replacement' | 'missing-cwd' | 'amended' | 'parked' | 'actor-moved') {
     const f = await fixture('directive', mode !== 'missing-cwd');
-    (f.ledger.getWorktree(f.lane.id) ?? f.ledger.registerWorktree(f.lane)); // original lane registration, before original native execution
+    void (f.ledger.getWorktree(f.lane.id) ?? f.ledger.registerWorktree(f.lane)); // original lane registration, before original native execution
     f.seed(); f.native.finish(); f.ledger.bindDirectiveNativeAdmission(inspectDirectiveAdmission(f.file, f.identity));
     const proof = inspectDirectiveCheckpoint(f.file, f.identity);
     if (proof.state !== 'terminal' || !proof.ok) throw new Error('original fixture terminal is required');
@@ -1095,7 +1095,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
 
   it('P54 exact successful host-absent delivery retries after a ledger settlement failure without native replay', () => {
     return (async () => {
-      const f = await fixture(); (f.ledger.getWorktree(f.lane.id) ?? f.ledger.registerWorktree(f.lane));
+      const f = await fixture(); void (f.ledger.getWorktree(f.lane.id) ?? f.ledger.registerWorktree(f.lane));
       f.ledger.prepareDirectiveTarget(f.intent.requestId, { agentId: 'logical-minion', sessionFile: f.file });
       prepareDirectiveBinding({ identity: f.identity, runtime: 'pi', agentId: 'logical-minion', sessionId: f.native.sessionId, sessionFile: f.file, text: 'original user', authorityManifest: 'original authority' });
       const producer = prepareDirectiveProducer({ identity: f.identity, agentId: 'logical-minion', sessionId: f.native.sessionId, sessionFile: f.file });
