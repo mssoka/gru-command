@@ -1,3 +1,4 @@
+import { capturePortLaneHandoff } from '../worktrees/handoff.js';
 import type { AgentHandle, PromptTurnVerdict } from '../runtime/types.js';
 import { promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
 import { spawnSync } from 'node:child_process';
@@ -2714,9 +2715,14 @@ export class WaveRunner {
     if (this.shuttingDown) throw new Error('Perkins review service is shutting down');
     // Branch-idle still gates the freeze. A minion's own busy turn may
     // acknowledge an intent now; it is armed only after job.delivered.
+    let armedTargetRef: string | undefined;
+    let idleRequest: ReviewRequestInput = input;
     let forceAuthorization: ForceAuthorization | undefined;
     try {
-      forceAuthorization = this.enforceBranchIdleForRequest(input);
+      this.refuseOwnUnwaivableReviewDebt(input.jobId);
+      armedTargetRef = this.resolveLocalRequestTarget(input);
+      idleRequest = { ...input, ...(armedTargetRef !== undefined ? { targetRef: armedTargetRef } : {}) };
+      forceAuthorization = this.enforceBranchIdleForRequest(idleRequest);
     } catch (error) {
       if (!(error instanceof BranchBusyError) || input.handoff !== true || input.force === true ||
         error.blockers.length === 0 || error.blockers.some((blocker) => blocker.jobId !== input.jobId) ||
@@ -2782,7 +2788,7 @@ export class WaveRunner {
     const jobLaneAtArm = lanesAtArm.find((lane) => lane.kind === 'job' && lane.jobId === input.jobId && lane.status !== 'swept') ?? null;
     const targetBranch = resolveReviewTargetBranch({
       jobId: input.jobId,
-      ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
+      ...(idleRequest.targetRef !== undefined ? { targetRef: idleRequest.targetRef } : {}),
       lanePath: jobLaneAtArm?.path ?? null,
       laneBranch: jobLaneAtArm?.branch ?? null,
     });
@@ -2797,8 +2803,7 @@ export class WaveRunner {
     const fallbackBaseline = {
       targetBranch,
       branchOwners,
-      busyJobIds: findBusyLanes({ ledger: this.opts.ledger, lanes: lanesAtArm, targetBranch })
-        .map((blocker) => blocker.jobId),
+      forceAuthorization: forceAuthorization ?? new Map(),
       markerIds: this.opts.ledger.listPendingRebriefs({ jobId: input.jobId }).map((marker) => marker.id),
       deliverySeq: this.opts.ledger.latestCandidateDelivery(input.jobId)?.seq ?? 0,
       statusSeq: this.opts.ledger.latestJobEvent(input.jobId, 'job.status')?.seq ?? 0,
@@ -2831,7 +2836,7 @@ export class WaveRunner {
       // A forced request must FIRST reject newly arrived blockers; logging
       // another override before that proof would misstate what the owner
       // authorized at the original arm.
-      if (input.force !== true) this.enforceBranchIdleForRequest(input);
+      if (input.force !== true) this.enforceBranchIdleForRequest(idleRequest);
       // The shared guard early-returns without a job lane, so re-prove the
       // CURRENT lane/marker/authorization facts directly at this seam
       // (fail closed on a missing lane instead of reusing the pre-await
@@ -2848,7 +2853,7 @@ export class WaveRunner {
       }
       const admission = { lanePath, ...fallbackBaseline };
       this.assertFallbackIterationCurrent(input, admission);
-      if (input.force === true) this.enforceBranchIdleForRequest(input);
+      if (input.force === true) this.enforceBranchIdleForRequest({ ...idleRequest, forceAuthorization: forceAuthorization ?? new Map() });
       // The fallback gate cannot deliver private evidence: refuse the arm
       // rather than run the fallback review without the promised material.
       if (input.evidence !== undefined && input.evidence.length > 0) {
@@ -2862,7 +2867,8 @@ export class WaveRunner {
       const pending = this.handoffs.get(input.jobId);
       this.assertHandoffAuthorized(input.jobId, pending?.seq ?? -1);
     }
-    const begun = await this.beginPerkinsRound({ ...input, reviewModel: result.reviewModel,
+    const begun = await this.beginPerkinsRound({ ...input,
+      ...(armedTargetRef !== undefined ? { armedTargetRef } : {}), reviewModel: result.reviewModel,
       reviewThinkingLevel: result.reviewThinkingLevel,
       ...(forceAuthorization !== undefined ? { forceAuthorization } : {}) });
     return { route: 'perkins', round: begun.round, run: begun.run };
@@ -3059,7 +3065,10 @@ export class WaveRunner {
      * receipt); Stage-5 carry-forward always re-verifies claimed priors. */
     claimedFixedPriors?: readonly number[];
   }): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
-    const forceAuthorization = this.enforceBranchIdleForRequest(input);
+    this.refuseOwnUnwaivableReviewDebt(input.jobId);
+    const armedTargetRef = this.resolveLocalRequestTarget(input);
+    const forceAuthorization = this.enforceBranchIdleForRequest({ ...input,
+      ...(armedTargetRef !== undefined ? { targetRef: armedTargetRef } : {}) });
     let reviewModel: ReviewPreflightResult['reviewModel'];
     let reviewThinkingLevel: string | undefined;
     if (this.opts.reviewPreflight !== undefined) {
@@ -3071,7 +3080,8 @@ export class WaveRunner {
         reviewThinkingLevel = result.reviewThinkingLevel;
       }
     }
-    return this.beginPerkinsRound({ ...input, reviewModel, reviewThinkingLevel,
+    return this.beginPerkinsRound({ ...input,
+      ...(armedTargetRef !== undefined ? { armedTargetRef } : {}), reviewModel, reviewThinkingLevel,
       ...(forceAuthorization !== undefined ? { forceAuthorization } : {}) });
   }
 
@@ -3084,6 +3094,32 @@ export class WaveRunner {
     return lane?.path ?? null;
   }
 
+  /** Preserve named local targets before preflight can admit a shadowing tag.
+   * Origin spellings retain their existing fetch/live-PR classification. */
+  private resolveLocalRequestTarget(input: { readonly jobId: string; readonly targetRef?: string }): string | undefined {
+    const job = this.opts.ledger.getJob(input.jobId);
+    if (job === null || isJobTerminal(job.status)) return undefined;
+    // A default PR lane branch is only a hint; the live PR head is authority.
+    if (job.prUrl !== null && input.targetRef === undefined) return undefined;
+    const lane = this.opts.worktrees.listWorktrees({ jobId: input.jobId }).find((entry) => entry.kind === 'job');
+    if (lane === undefined) return undefined;
+    const ref = input.targetRef ?? lane.branch ?? lane.sha;
+    if (isExactOriginBranchSpelling(ref)) return undefined;
+    return this.localTargetIdentity(lane.path, ref) ?? undefined;
+  }
+
+  /** Own recovery/material debt is unwaivable regardless of target validity.
+   * Use the existing refusal/audit path before inspecting a caller's ref. */
+  private refuseOwnUnwaivableReviewDebt(jobId: string): void {
+    const job = this.opts.ledger.getJob(jobId);
+    if (job === null || isJobTerminal(job.status) ||
+      (!this.opts.ledger.hasOpenDirectiveRecoveryHold(jobId) && pendingWorkRevision(this.opts.ledger, job) === null)) return;
+    const jobLane = this.opts.worktrees.listWorktrees({ jobId }).find((lane) => lane.kind === 'job') ?? null;
+    if (jobLane === null) return; // Preserve setup's canonical missing-lane refusal.
+    this.enforceBranchIdle({ job, jobLane, phase: 'arm',
+      targetBranch: normalizeBranch(jobLane.branch ?? laneBranch(jobId)) });
+  }
+
   /** Arm-intake branch-idle check. An unknown job is left to the round setup
    * (it reports the canonical not-found error), and so is a job with no job
    * lane yet — without a lane there is no target branch to protect, and the
@@ -3093,6 +3129,7 @@ export class WaveRunner {
     jobId: string;
     targetRef?: string;
     force?: boolean;
+    forceAuthorization?: ForceAuthorization;
   }): ForceAuthorization | undefined {
     const job = this.opts.ledger.getJob(input.jobId);
     if (job === null) return undefined;
@@ -3106,9 +3143,10 @@ export class WaveRunner {
       ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
       ...(input.force !== undefined ? { force: input.force } : {}),
       phase: 'arm',
+      ...(input.forceAuthorization !== undefined ? { forceAuthorization: input.forceAuthorization } : {}),
     });
     // #267: what a force authorizes is the work present at THIS arm.
-    return input.force === true ? snapshotForceAuthorization(this.opts.ledger, armed.blockers) : undefined;
+    return input.force === true ? armed.authorization : undefined;
   }
 
   /** Branch-idle guard for one review target (rule 2026-09-23): resolve the
@@ -3121,6 +3159,8 @@ export class WaveRunner {
   private branchIdleBlockers(input: {
     job: { readonly id: string };
     jobLane: WorktreeLane | null;
+    /** Authoritative resolved branch; never DWIM the caller spelling again. */
+    targetBranch?: string | undefined;
     targetRef?: string | undefined;
     force?: boolean | undefined;
     phase: BranchIdlePhase;
@@ -3130,7 +3170,7 @@ export class WaveRunner {
      * mask the lane it moved. */
     reviewedStatus?: { readonly jobId: string; readonly status: JobStatus } | undefined;
   }): { readonly targetBranch: string; readonly blockers: readonly BranchIdleBlocker[] } {
-    const targetBranch = resolveReviewTargetBranch({
+    const targetBranch = input.targetBranch ?? resolveReviewTargetBranch({
       jobId: input.job.id,
       ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
       lanePath: input.jobLane?.path ?? null,
@@ -3175,9 +3215,26 @@ export class WaveRunner {
     return { targetBranch, blockers };
   }
 
+  private refuseUnauditedBlockers(
+    jobId: string, roundId: string, idle: { readonly targetBranch: string; readonly blockers: readonly BranchIdleBlocker[] },
+    authorization: ForceAuthorization,
+  ): void {
+    const unaudited = idle.blockers.filter((blocker) => blocker.revision !== undefined ||
+      this.opts.ledger.hasOpenDirectiveRecoveryHold(blocker.jobId) ||
+      !forceCoversBlocker(this.opts.ledger, authorization, blocker));
+    if (unaudited.length === 0) return;
+    this.opts.ledger.appendCustomEvent({
+      kind: 'branch-idle.refused', jobId, roundId,
+      payload: { phase: 'freeze', forced: false, targetBranch: idle.targetBranch, blockers: unaudited },
+    });
+    throw new BranchBusyError(idle.targetBranch, unaudited, 'freeze');
+  }
+
   private enforceBranchIdle(input: {
     job: { readonly id: string };
     jobLane: WorktreeLane | null;
+    /** Authoritative resolved branch; never DWIM the caller spelling again. */
+    targetBranch?: string | undefined;
     targetRef?: string | undefined;
     force?: boolean | undefined;
     phase: BranchIdlePhase;
@@ -3188,17 +3245,20 @@ export class WaveRunner {
     reviewedStatus?: { readonly jobId: string; readonly status: JobStatus } | undefined;
     /** A forced check covers only the work its arm snapshot holds (#267). */
     forceAuthorization?: ForceAuthorization;
-  }): { readonly targetBranch: string; readonly blockers: readonly BranchIdleBlocker[] } {
+  }): { readonly targetBranch: string; readonly blockers: readonly BranchIdleBlocker[]; readonly authorization: ForceAuthorization } {
     const { targetBranch, blockers } = this.branchIdleBlockers(input);
+    // Snapshot before publishing an audit: synchronous ledger observers can
+    // admit new work while that event is delivered, but cannot inherit it.
+    const authorization = snapshotForceAuthorization(this.opts.ledger, blockers);
     // A retirement hold is a fresh-authorization boundary, not ordinary
     // branch activity. Neither force nor a foreign target may waive it. A
     // pending material correction is the same (owner rule 2): the candidate
     // is outdated by an approved change, and no override reviews it.
     const held = blockers.some((blocker) =>
       blocker.revision !== undefined || this.opts.ledger.hasOpenDirectiveRecoveryHold(blocker.jobId));
-    if (blockers.length === 0 && input.force !== true) return { targetBranch, blockers };
+    if (blockers.length === 0 && input.force !== true) return { targetBranch, blockers, authorization };
     const forced = input.force === true && !held && (input.forceAuthorization === undefined ||
-      blockers.every((blocker) => forceCoversBlocker(this.opts.ledger, input.forceAuthorization!, blocker)));
+      blockers.every((blocker) => forceCoversBlocker(this.opts.ledger, input.forceAuthorization!, blocker, authorization.get(blocker.jobId))));
     this.opts.ledger.appendCustomEvent({
       kind: forced ? 'branch-idle.forced' : 'branch-idle.refused',
       jobId: input.job.id,
@@ -3206,7 +3266,7 @@ export class WaveRunner {
       payload: { phase: input.phase, forced, targetBranch, blockers },
     });
     if (!forced) throw new BranchBusyError(targetBranch, blockers, input.phase);
-    return { targetBranch, blockers };
+    return { targetBranch, blockers, authorization };
   }
 
   private readonly roundAdmission = new Set<string>();
@@ -3216,6 +3276,8 @@ export class WaveRunner {
   private async beginPerkinsRound(input: {
     jobId: string;
     targetRef?: string;
+    /** Canonical local name sampled before awaited preflight; never a replacement force authority. */
+    armedTargetRef?: string;
     /** Clean-abort re-arm: the exact delivered head proved at request time;
      * re-proved at the freeze boundary before any lens runs. */
     boundDeliveredSha?: string;
@@ -3535,7 +3597,7 @@ export class WaveRunner {
       readonly deliverySeq: number;
       readonly markerIds: readonly string[];
     }[];
-    readonly busyJobIds: readonly string[];
+    readonly forceAuthorization: ForceAuthorization;
     readonly markerIds: readonly string[];
     readonly deliverySeq: number;
     readonly statusSeq: number;
@@ -3569,6 +3631,9 @@ export class WaveRunner {
     }
     // Owner rule 2: a material correction accepted while the gate runs makes
     // its diff obsolete — no override carries the gate past it.
+    if (this.opts.ledger.hasOpenDirectiveRecoveryHold(input.jobId)) {
+      throw new FallbackSafetyRefusal(`job "${input.jobId}" has a recovery hold — fallback requires fresh authorization`);
+    }
     if (jobNow !== null && pendingWorkRevision(this.opts.ledger, jobNow) !== null) {
       throw new FallbackSafetyRefusal(
         `an approved material correction for job "${input.jobId}" is pending delivery — the old diff cannot pass`,
@@ -3616,8 +3681,15 @@ export class WaveRunner {
         `a lane on branch "${admission.targetBranch}" changed after fallback admission — the old diff cannot pass`,
       );
     }
-    const busyNow = findBusyLanes({ ledger: this.opts.ledger, lanes: lanesNow, targetBranch: admission.targetBranch });
-    if (busyNow.some((blocker) => input.force !== true || !admission.busyJobIds.includes(blocker.jobId))) {
+    // Fallback reviews THIS checkout, even when target_ref names another
+    // branch. Its own live work cannot disappear behind target filtering.
+    const busyNow = [
+      ...findBusyLanes({ ledger: this.opts.ledger, lanes: lanesNow, targetBranch: admission.targetBranch }),
+      ...findBusyLanes({ ledger: this.opts.ledger, lanes: [lane], targetBranch: normalizeBranch(lane.branch ?? laneBranch(input.jobId)) }),
+    ];
+    if (busyNow.some((blocker) => input.force !== true || blocker.revision !== undefined ||
+      this.opts.ledger.hasOpenDirectiveRecoveryHold(blocker.jobId) ||
+      !forceCoversBlocker(this.opts.ledger, admission.forceAuthorization, blocker))) {
       throw new FallbackSafetyRefusal(
         `a new busy lane owns branch "${admission.targetBranch}" — the fallback gate stops before the next review round`,
       );
@@ -4080,6 +4152,8 @@ export class WaveRunner {
   private async setupRound(input: {
     jobId: string;
     targetRef?: string;
+    /** Canonical local name sampled before awaited preflight; never a replacement force authority. */
+    armedTargetRef?: string;
     /** Clean-abort re-arm: the exact delivered head proved at request time;
      * re-proved at the freeze boundary before any lens runs. */
     boundDeliveredSha?: string;
@@ -4119,6 +4193,7 @@ export class WaveRunner {
     if (job.briefing === null && input.noSpec !== true) {
       throw new Error('complete review requires the job briefing/spec or explicit noSpec=true');
     }
+    const originalJobHandoff = capturePortLaneHandoff(this.opts.worktrees, jobWorktree);
     const canonicalLenses = input.noSpec === true
       ? [...policy.portableContract.rules.noSpecLenses]
       : [...policy.portableContract.rules.fullLenses];
@@ -4126,13 +4201,15 @@ export class WaveRunner {
       throw new Error('Perkins review lens set is canonical and cannot be reduced or reordered');
     }
     const artifactRoot = this.artifactRoot();
-    const candidateRef = input.targetRef ?? jobWorktree.branch ?? jobWorktree.sha;
-    const { targetSha, movementRef } = await this.resolveFreezeTarget({
+    const candidateRef = input.armedTargetRef ?? input.targetRef ?? jobWorktree.branch ?? jobWorktree.sha;
+    const { targetSha, movementRef, targetBranch } = await this.resolveFreezeTarget({
       job,
       jobWorktree,
       candidateRef,
+      ...(input.armedTargetRef !== undefined ? { armedTargetRef: input.armedTargetRef } : {}),
       explicitTarget: input.targetRef !== undefined && input.targetRef.trim() !== '',
     });
+    if (input.armedTargetRef !== undefined) this.assertNamedTargetIdentity(jobWorktree.path, input.armedTargetRef);
     // R8-18: a shutdown during resolution starts nothing — no round, no worktree.
     if (this.shuttingDown || setupSignal.aborted) {
       throw setupSignal.reason instanceof ReviewSupersededError
@@ -4270,6 +4347,7 @@ export class WaveRunner {
     // R7-10/R8-10: the admission returns this round's OWN provisional
     // status event, read inside its transaction — the restore below undoes
     // exactly it, never a generation a subscriber wrote on publication.
+    if (input.armedTargetRef !== undefined) this.assertNamedTargetIdentity(jobWorktree.path, input.armedTargetRef);
     const { round, flipSeq } = this.opts.ledger.admitReviewRoundWithFlip({
       jobId: job.id, expectedLatestRoundId: predecessor?.id ?? null,
       expectedJobStatus: job.status, lenses: canonicalLenses, targetRef: targetSha,
@@ -4277,6 +4355,23 @@ export class WaveRunner {
 
     let reviewWorktree: Awaited<ReturnType<WorktreePort['createReviewWorktree']>> | undefined;
     let frozenReview: FrozenReview;
+    let originalReviewHandoff: (() => void) | null = null;
+    // Keep the arm's immutable map and canonical target through execution.
+    // Later guards refuse new work; they never publish another force audit.
+    const assertReviewAuthority = (): void => {
+      originalJobHandoff();
+      if (originalReviewHandoff === null) throw new Error('original review handoff is unavailable');
+      originalReviewHandoff();
+      if (input.armedTargetRef !== undefined) this.assertNamedTargetIdentity(jobWorktree.path, input.armedTargetRef);
+      this.assertNamedTargetIdentity(jobWorktree.path, movementRef);
+      const recheck = {
+        job, jobLane: jobWorktree, targetBranch, phase: 'freeze' as const, roundId: round.id,
+        ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
+        ...(flippedFrom !== null ? { reviewedStatus: { jobId: job.id, status: flippedFrom } } : {}),
+      };
+      const current = input.force === true ? this.branchIdleBlockers(recheck) : this.enforceBranchIdle(recheck);
+      this.refuseUnauditedBlockers(job.id, round.id, current, input.forceAuthorization ?? new Map());
+    };
     try {
       reviewWorktree = await this.opts.worktrees.createReviewWorktree({
         repoPath: jobWorktree.repoPath,
@@ -4284,6 +4379,7 @@ export class WaveRunner {
         ref: targetSha,
         jobId: job.id,
       });
+      originalReviewHandoff = capturePortLaneHandoff(this.opts.worktrees, reviewWorktree);
       if (this.shuttingDown || setupSignal.aborted) {
         throw setupSignal.reason instanceof ReviewSupersededError
           ? setupSignal.reason
@@ -4293,18 +4389,22 @@ export class WaveRunner {
       if (jobAtFreeze !== null && isJobTerminal(jobAtFreeze.status)) {
         throw new Error(`job "${job.id}" is ${jobAtFreeze.status} — terminal lanes do not go back under review`);
       }
+      if (input.armedTargetRef !== undefined) this.assertNamedTargetIdentity(jobWorktree.path, input.armedTargetRef);
+      this.assertNamedTargetIdentity(jobWorktree.path, movementRef);
       // Freeze-time close of the race window: a lane may have re-opened
       // between the arm intake and this freeze. The same refusal applies.
-      const idle = this.enforceBranchIdle({
+      const idleInput = {
         job,
         jobLane: jobWorktree,
+        targetBranch,
         ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
         ...(input.force !== undefined ? { force: input.force } : {}),
         ...(input.force === true ? { forceAuthorization: input.forceAuthorization ?? new Map() } : {}),
-        phase: 'freeze',
+        phase: 'freeze' as const,
         roundId: round.id,
         ...(flippedFrom !== null ? { reviewedStatus: { jobId: job.id, status: flippedFrom } } : {}),
-      });
+      };
+      const idle = this.enforceBranchIdle(idleInput);
       // A clean-abort re-arm proved ONE delivered head at request time; the
       // awaited pre-flight/capacity/setup window can admit a newer delivery.
       // Re-prove the unchanged-head precondition here, at the last boundary
@@ -4448,6 +4548,7 @@ export class WaveRunner {
         const recheck = {
           job,
           jobLane: jobWorktree,
+          targetBranch,
           ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
           phase: 'freeze' as const,
           roundId: round.id,
@@ -4456,25 +4557,13 @@ export class WaveRunner {
         // Unforced: the ordinary refusal (audited). Forced: its audit already
         // stands — only a blocker it never covered is refused (audited below).
         const afterProbe = input.force === true ? this.branchIdleBlockers(recheck) : this.enforceBranchIdle(recheck);
-        // A pending material correction is never covered by a force audit
-        // (owner rule 2), even on a job whose other busy fact was audited.
-        // #267: only the work present at the original arm is covered — a
-        // new repair, directive, re-brief or verification on an audited job
-        // is a new generation and never authorized.
-        const authorization = input.forceAuthorization ?? new Map();
-        const unaudited = afterProbe.blockers.filter((blocker) =>
-          !forceCoversBlocker(this.opts.ledger, authorization, blocker));
-        if (unaudited.length > 0) {
-          this.opts.ledger.appendCustomEvent({
-            kind: 'branch-idle.refused', jobId: job.id, roundId: round.id,
-            payload: { phase: 'freeze', forced: false, targetBranch: afterProbe.targetBranch, blockers: unaudited },
-          });
-          throw new BranchBusyError(afterProbe.targetBranch, unaudited, 'freeze');
-        }
+        this.refuseUnauditedBlockers(job.id, round.id, afterProbe, input.forceAuthorization ?? new Map());
         // Owner rule 3: a setup superseded while it awaited (an approved
         // material change, or a writer that owns the lane) withdraws here,
         // before any admission effect — the rollback below unwinds it.
         if (setupSignal.reason instanceof ReviewSupersededError) throw setupSignal.reason;
+        if (input.armedTargetRef !== undefined) this.assertNamedTargetIdentity(jobWorktree.path, input.armedTargetRef);
+        this.assertNamedTargetIdentity(jobWorktree.path, movementRef);
       }
       // Issue #243 F-H7: the recorded-delivery ledger is INDEPENDENT of
       // branch idleness — a completed same-revision delivery B can leave the
@@ -4595,6 +4684,7 @@ export class WaveRunner {
           frozenReview,
           policy,
           runController.signal,
+          assertReviewAuthority,
           input.reviewModel,
           input.claimedFixedPriors,
         );
@@ -4665,9 +4755,49 @@ export class WaveRunner {
     const result = spawnSync('git', ['-C', repoPath, 'rev-parse', '--symbolic-full-name', '--verify', ref], {
       encoding: 'utf-8',
       timeout: 30_000,
+      env: repositoryGitEnv(false),
     });
     const name = result.status === 0 ? (result.stdout ?? '').trim() : '';
     return name === '' ? null : name;
+  }
+
+  /** Names require canonical Git identity; pins require explicit revision
+   * syntax or one uniquely identified object, never merely empty output.
+   * C-locale diagnostics make ambiguity errors distinguishable from tracing. */
+  private localTargetIdentity(repoPath: string, ref: string): string | null {
+    const options = { encoding: 'utf-8' as const, timeout: 30_000,
+      env: { ...repositoryGitEnv(false), LC_ALL: 'C' } };
+    const result = spawnSync('git', ['-C', repoPath, '-c', 'core.warnAmbiguousRefs=true',
+      'rev-parse', '--symbolic-full-name', '--verify', ref], options);
+    const name = (result.stdout ?? '').trim();
+    const failIdentity = (): never => {
+      throw new Error(`review target identity for ${ref} is lost, ambiguous or unverifiable — retry with an exact named ref or intentional commit pin`);
+    };
+    const failedDiagnostic = /(?:^|\n)(?:error|fatal):|(?:^|\n)warning:[^\n]*\bambiguous\b/u;
+    if (result.error !== undefined || result.status !== 0 || failedDiagnostic.test(result.stderr ?? '')) failIdentity();
+    if (/^refs\/[^\r\n]+$/u.test(name)) return name;
+    if (name === ref && /^[A-Z_]+$/u.test(name)) return null; // Source-bound Git pseudo-ref.
+    if (name !== '') failIdentity();
+    if (/^[a-f0-9]{4,64}$/iu.test(ref)) {
+      const objects = spawnSync('git', ['-C', repoPath, 'rev-parse', `--disambiguate=${ref.toLowerCase()}`], options);
+      if (objects.error === undefined && objects.status === 0 && !failedDiagnostic.test(objects.stderr ?? '') &&
+        /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u.test((objects.stdout ?? '').trim())) return null;
+    } else {
+      // A verified revision whose syntax cannot name a ref is an intentional
+      // expression pin. Valid-but-missing/ambiguous names never take this path.
+      const shape = spawnSync('git', ['-C', repoPath, 'check-ref-format', '--allow-onelevel', ref], options);
+      if (shape.error === undefined && shape.status === 1 && !failedDiagnostic.test(shape.stderr ?? '')) return null;
+    }
+    return failIdentity();
+  }
+
+  /** Same OID is insufficient when a named ref becomes an alias to a
+   * different identity. Retain the captured name; never authorize its replacement. */
+  private assertNamedTargetIdentity(repoPath: string, expectedRef: string): void {
+    if (!expectedRef.startsWith('refs/')) return;
+    if (this.localTargetIdentity(repoPath, expectedRef) !== expectedRef) {
+      throw new Error(`review target identity for ${expectedRef} changed before admission — refusing replacement authority`);
+    }
   }
 
   /** True when origin currently advertises a branch by that name — the
@@ -4678,6 +4808,7 @@ export class WaveRunner {
     const result = spawnSync('git', ['-C', repoPath, 'ls-remote', '--refs', 'origin', `refs/heads/${branch}`], {
       encoding: 'utf-8',
       timeout: 30_000,
+      env: repositoryGitEnv(false),
     });
     if (result.status !== 0) return true;
     return (result.stdout ?? '').trim() !== '';
@@ -4687,12 +4818,17 @@ export class WaveRunner {
     job: { readonly id: string; readonly prUrl: string | null };
     jobWorktree: { readonly path: string; readonly repoPath: string };
     candidateRef: string;
+    readonly armedTargetRef?: string;
     /** True when the caller explicitly named `candidateRef` (target_ref). */
     explicitTarget: boolean;
-  }): Promise<{ readonly targetSha: string; readonly movementRef: string }> {
-    const candidateBranch = input.job.prUrl === null
-      ? null
-      : prBranchCandidate(input.jobWorktree.repoPath, input.candidateRef);
+  }): Promise<{ readonly targetSha: string; readonly movementRef: string; readonly targetBranch?: string }> {
+    // A PR refresh moves the review target, never the identity the request
+    // originally named. Remote-only/default PR hints have no captured name.
+    if (input.armedTargetRef !== undefined) this.assertNamedTargetIdentity(input.jobWorktree.path, input.armedTargetRef);
+    const armedTargetBranch = input.armedTargetRef !== undefined && /^(?:refs\/heads\/|refs\/remotes\/origin\/)/u.test(input.armedTargetRef)
+      ? normalizeBranch(input.armedTargetRef) : null;
+    const candidateBranch = input.job.prUrl === null ? null : input.armedTargetRef !== undefined
+      ? armedTargetBranch : prBranchCandidate(input.jobWorktree.repoPath, input.candidateRef);
     // An EXACT origin branch spelling is NEVER an explicit pin (Perkins
     // R3/R5): a remote-only origin/topic is invisible to prBranchCandidate
     // (nothing local resolves), but it still names a REMOTE BRANCH, and
@@ -4752,12 +4888,26 @@ export class WaveRunner {
         });
         return {
           targetSha: resolved.sha,
-          movementRef: input.candidateRef,
+          movementRef: resolved.trackingRef ?? input.candidateRef,
+          ...(resolved.trackingRef !== null ? { targetBranch: normalizeBranch(resolved.trackingRef) } : {}),
         };
       }
+      const identity = this.localTargetIdentity(input.jobWorktree.path, input.candidateRef);
+      if (input.armedTargetRef !== undefined && identity !== input.armedTargetRef) {
+        throw new Error(`review target identity for ${input.armedTargetRef} changed before freeze — refusing replacement authority`);
+      }
+      const targetSha = resolveGitCommit(input.jobWorktree.path, identity ?? input.candidateRef);
+      if (identity !== null && this.localTargetIdentity(input.jobWorktree.path, identity) !== identity) {
+        throw new Error(`review target identity for ${identity} changed during commit resolution — refusing replacement authority`);
+      }
+      const movementRef = identity ?? targetSha;
       return {
-        targetSha: resolveGitCommit(input.jobWorktree.path, input.candidateRef),
-        movementRef: input.candidateRef,
+        targetSha,
+        ...(/^(?:refs\/heads\/|refs\/remotes\/)/u.test(movementRef) ? { targetBranch: normalizeBranch(movementRef) } : {}),
+        // Named refs retain movement proof in the shared object store.
+        // Revision expressions and commit pins bind once in the source
+        // lane, never against HEAD of the detached target checkout.
+        movementRef,
       };
     }
     try {
@@ -4778,7 +4928,7 @@ export class WaveRunner {
         fetched: fresh.targetSha,
         movementRef: fresh.movementRef,
       });
-      return { targetSha: fresh.targetSha, movementRef: fresh.movementRef };
+      return { targetSha: fresh.targetSha, movementRef: fresh.movementRef, targetBranch: fresh.prHeadRefName };
     } catch (error) {
       if (error instanceof PrHeadVerificationError) {
         const detail = error.message.replace(/[\r\n]+/gu, ' ').slice(0, 1000);
@@ -4814,6 +4964,7 @@ export class WaveRunner {
     frozenReview: FrozenReview,
     policy: PerkinsPolicy,
     signal: AbortSignal,
+    assertReviewAuthority: () => void,
     reviewModel?: ReviewPreflightResult['reviewModel'],
     claimedFixedPriors?: readonly number[],
   ): Promise<WaveOutcome> {
@@ -4829,6 +4980,7 @@ export class WaveRunner {
       }
     };
     try {
+      assertReviewAuthority(); // after the admission publication's synchronous observers
       reservation = this.opts.reserveReviewRound === undefined
         ? undefined : await this.opts.reserveReviewRound(signal);
       if (reservation !== undefined) {
@@ -4841,7 +4993,8 @@ export class WaveRunner {
           payload: { reason: 'lead and child resident slots admitted' },
         });
       }
-      const outcome = await this.runOwnedReview(job, round, lenses, movementRef, noSpec, frozenReview, policy, signal, reviewModel, beginSpawn, () => spawnInitiated, reservation, claimedFixedPriors);
+      assertReviewAuthority(); // residency awaits and residency-admitted observers
+      const outcome = await this.runOwnedReview(job, round, lenses, movementRef, noSpec, frozenReview, policy, signal, assertReviewAuthority, reviewModel, beginSpawn, () => spawnInitiated, reservation, claimedFixedPriors);
       settledOutcome = outcome;
       return outcome;
     } catch (error) {
@@ -4890,6 +5043,7 @@ export class WaveRunner {
     frozenReview: FrozenReview,
     policy: PerkinsPolicy,
     signal: AbortSignal,
+    assertReviewAuthority: () => void,
     reviewModel: ReviewPreflightResult['reviewModel'] | undefined,
     beginSpawn: () => void,
     spawnInitiated: () => boolean,
@@ -4908,7 +5062,7 @@ export class WaveRunner {
       })).digest('hex') !== frozenReview.manifest.recoveryIdentity.modelSettingsSha256) {
       throw new Error('review thinking/model settings changed since freeze — a new review is required');
     }
-    const spawnWithOptions: AgentSpawner = (role, options) => {
+    const spawnWithOptions: AgentSpawner = async (role, options) => {
       if (frozenThinking !== undefined && this.opts.reviewThinkingLevel?.() !== frozenThinking) {
         throw new Error('review thinking level changed since freeze — a new review is required');
       }
@@ -4923,10 +5077,26 @@ export class WaveRunner {
         ...(reviewModel !== undefined && (options?.isolatedReview !== undefined || options?.reviewLead !== undefined)
           ? { reviewModel } : {}),
       };
+      assertReviewAuthority(); // after provider pacing, before invoking any spawner
       beginSpawn();
-      return reservation === undefined
+      assertReviewAuthority(); // the live-status observer cannot transfer authority
+      const handle = await (reservation === undefined
         ? this.opts.spawner(role, resolved)
-        : reservation.spawn(resolved);
+        : reservation.spawn(resolved));
+      // The same guard applies after spawn/agent observers and every pacing
+      // retry of an existing session. Disposal remains the original owner's.
+      const guarded = new Map<PropertyKey, (...args: unknown[]) => unknown>();
+      return new Proxy(handle, {
+        get(target, property) {
+          const value: unknown = Reflect.get(target, property);
+          if (typeof value !== 'function') return value;
+          if (['prompt', 'promptWithVerdict', 'steer', 'followUp', 'compact'].includes(String(property))) {
+            if (!guarded.has(property)) guarded.set(property, (...args: unknown[]) => { assertReviewAuthority(); return Reflect.apply(value, target, args); });
+            return guarded.get(property);
+          }
+          return value.bind(target);
+        },
+      });
     };
     const workflow = new PerkinsWholeReview({
       spawner: spawnWithOptions,

@@ -1,7 +1,9 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { WorktreeBaseSource } from '../../src/ledger/api.js';
+import { issueFixtureHandoff } from './fixture-handoff.js';
+import { rememberManagedLane } from '../../src/worktrees/handoff.js';
+import type { LedgerApi, WorktreeBaseSource } from '../../src/ledger/api.js';
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from '../../src/dispatch/worktree-port.js';
 import { resolveReviewTargetReal } from './git-review-port.js';
 
@@ -19,8 +21,10 @@ export class PersistedReviewPort implements WorktreePort {
     private readonly root: string,
     private readonly branch: string,
     private readonly sha: string,
+    private readonly ledger: LedgerApi,
   ) {
     this.registryFile = join(root, 'lanes.json');
+    for (const lane of ledger.listWorktrees()) rememberManagedLane(lane, ledger); // reconstruct, never reissue
   }
 
   private read(): Map<string, WorktreeLane> {
@@ -40,6 +44,7 @@ export class PersistedReviewPort implements WorktreePort {
   async resolveReviewTarget(input: { repoPath: string; ref: string }): Promise<{
     readonly sha: string;
     readonly baseSource: WorktreeBaseSource | null;
+    readonly trackingRef: string | null;
   }> {
     return resolveReviewTargetReal(input.repoPath, input.ref);
   }
@@ -56,16 +61,18 @@ export class PersistedReviewPort implements WorktreePort {
   }
 
   async createReviewWorktree(input: { repoPath: string; roundId: string; ref: string; jobId?: string }): Promise<WorktreeLane> {
+    if (this.ledger.getRound(input.roundId) === null) throw new Error('persisted review fixture requires its actual owning round before issuance');
     const path = join(this.root, input.roundId);
     execFileSync('git', ['-C', input.repoPath, 'worktree', 'add', '--detach', path, input.ref], { stdio: 'ignore' });
     const lanes = this.read();
     const lane: WorktreeLane = {
       id: input.roundId, kind: 'review', repoPath: input.repoPath, repoName: 'fixture', path,
-      branch: null, sha: input.ref, jobId: input.jobId ?? null, roundId: input.roundId, status: 'active',
+      branch: null, sha: execFileSync('git', ['-C', path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(), jobId: input.jobId ?? null, roundId: input.roundId, status: 'active',
     };
-    lanes.set(lane.id, lane);
+    const issued = issueFixtureHandoff(lane, this.ledger);
+    lanes.set(lane.id, issued);
     this.write(lanes);
-    return lane;
+    return issued;
   }
 
   /** Issue #161: real child lanes (detached read-only / branched writer),
@@ -90,9 +97,10 @@ export class PersistedReviewPort implements WorktreePort {
       id: input.childId, kind: 'child', repoPath: input.repoPath, repoName: 'fixture', path,
       branch, sha: base, jobId: input.jobId, roundId: null, status: 'active',
     };
-    lanes.set(lane.id, lane);
+    const issued = issueFixtureHandoff(lane, this.ledger);
+    lanes.set(lane.id, issued);
     this.write(lanes);
-    return lane;
+    return issued;
   }
 
   getWorktree(id: string): WorktreeLane | null {
@@ -113,6 +121,7 @@ export class PersistedReviewPort implements WorktreePort {
         execFileSync('git', ['-C', lane.repoPath, 'branch', '-D', lane.branch], { stdio: 'ignore' });
       }
     }
+    if (this.ledger.getWorktree(lane.id) !== null) this.ledger.setWorktreeStatus(lane.id, 'swept', 'fixture-owned release');
     lanes.set(lane.id, { ...lane, status: 'swept' });
     this.write(lanes);
     return { status: 'swept', preserved: null, branch: 'none', freshHead: this.sha };

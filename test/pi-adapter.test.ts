@@ -4026,11 +4026,11 @@ async function directiveRecoveryLedgerFixture(label: string, materialRevision = 
   const db = new LedgerDb(dir); const bus = new EventBus({});
   const ledger = new LedgerApi(db.handle, { bus });
   const notifications = new NotificationCenter({ ledger, bus });
-  const worktrees = new InMemoryWorktreePort(join(dir, 'lanes'));
+  const worktrees = new InMemoryWorktreePort(join(dir, 'lanes'), ledger);
   ledger.addJob({ id: 'sdk-original-job', repo: 'fixture', title: label, briefing: 'immutable original approved contract' });
   ledger.setJobStatus('sdk-original-job', 'working');
   const lane = await worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'sdk-original-job' });
-  ledger.registerWorktree(lane); // durable lane facts at original creation, never during recovery
+  if (ledger.getWorktree(lane.id) === null) ledger.registerWorktree(lane); // durable lane facts at original creation, never during recovery
   if (materialRevision) expect(ledger.addJobAmendment({ jobId: 'sdk-original-job', body: 'Approved original material scope.', supersedes: [], approval: { by: 'owner', reference: 'GH-286 completion fixture' }, effect: 'material', expectedContractSha256: ledger.directiveCurrentAuthority('sdk-original-job').contractSha256 }).status).toBe('accepted');
   let sourceRoundId: string | undefined;
   if (rebrief) { const source = ledger.addRound({ jobId: 'sdk-original-job', lenses: [] }); ledger.setRoundStatus(source.id, 'aborted'); sourceRoundId = source.id; }

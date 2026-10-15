@@ -179,7 +179,7 @@ function makeHarness(
       ownedAgentIds: new Set(handles.filter((handle) => !handle.disposed).map((handle) => handle.id)),
     }),
   });
-  const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'));
+  const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'), ledger);
   const sessionDir = join(dir, 'sessions');
   mkdirSync(sessionDir, { recursive: true });
 

@@ -98,10 +98,10 @@ async function boot(opts: { completeReview?: boolean; noDirectiveChanges?: boole
   const rawLedger = new LedgerApi(db.handle, { bus });
   const ledger = opts.wrapLedger === undefined ? rawLedger : opts.wrapLedger(rawLedger);
   const notifications = new NotificationCenter({ ledger, bus });
-  const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'));
+  const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'), ledger);
   if (opts.completeReview === true) {
     const recordLane = (lane: WorktreeLane): WorktreeLane => {
-      ledger.registerWorktree({ id: lane.id, kind: lane.kind, repoPath: lane.repoPath, repoName: lane.repoName,
+      if (ledger.getWorktree(lane.id) === null) ledger.registerWorktree({ id: lane.id, kind: lane.kind, repoPath: lane.repoPath, repoName: lane.repoName,
         path: lane.path, branch: lane.branch, sha: lane.sha, jobId: lane.jobId, roundId: lane.roundId });
       return lane;
     };
@@ -847,16 +847,7 @@ describe('directive retirement — live ownership fails closed', () => {
     cleanupRepos.push(repo);
     const h = await boot();
     const { lane } = await seededLiveRequest(h, repo, 'job-p', 'req-p');
-    h.ledger.registerWorktree({
-      id: lane.id,
-      kind: 'job',
-      repoPath: repo.path,
-      repoName: 'fixture-app',
-      path: lane.path,
-      branch: lane.branch,
-      sha: laneHead(lane),
-      jobId: 'job-p',
-    });
+    expect(h.ledger.getWorktree(lane.id)).toMatchObject({ id: lane.id, path: lane.path, jobId: 'job-p' });
     h.ledger.recordWorktreeProcesses({
       worktreeId: lane.id,
       processes: [{ pid: 4242, command: 'node dist/main.js', evidence: 'cwd' }],
@@ -968,7 +959,7 @@ describe('directive retirement — idempotency, conflicts and late evidence', ()
     seedJob(h, jobId, 'working', 'review');
     const repo = makeFixtureRepo('report-handback-open-retry'); cleanupRepos.push(repo);
     const lane = await seedLane(h, repo, jobId);
-    h.ledger.registerWorktree(lane); // genuine original candidate setup before acceptance/completion
+    if (h.ledger.getWorktree(lane.id) === null) h.ledger.registerWorktree(lane); // genuine original candidate setup before acceptance/completion
     const open = vi.spyOn(h.ledger, 'openReportObligation').mockImplementationOnce(() => { throw new Error('transient report obligation write failure'); });
     const accepted = await call(h.port, 'POST', '/api/silas/directive',
       { job_id: jobId, directive: 'complete the approved report task', request_id: 'report-handback-retry-request' }, TOKEN);
@@ -1133,7 +1124,7 @@ describe('directive retirement — continuation boundary and consumers', () => {
     cleanupRepos.push(repo);
     const h = await boot();
     const { lane } = await seededLiveRequest(h, repo, 'job-x', 'req-x');
-    h.ledger.registerWorktree(lane); // original lane setup, before any native execution
+    if (h.ledger.getWorktree(lane.id) === null) h.ledger.registerWorktree(lane); // original lane setup, before any native execution
     // An unrelated phase delivered after the status hop. Once the subject
     // request retires, ONLY its hold keeps this otherwise idle lane busy.
     h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-x', payload: { source: 'previous-phase' } });
@@ -1196,7 +1187,7 @@ describe('directive retirement — continuation boundary and consumers', () => {
     const h = await boot();
     seedJob(h, 'job-z');
     const lane = await seedLane(h, repo, 'job-z');
-    h.ledger.registerWorktree(lane); // positive native candidacy needs the original durable lane
+    if (h.ledger.getWorktree(lane.id) === null) h.ledger.registerWorktree(lane); // positive native candidacy needs the original durable lane
     // A delivered phase with a registered PR that would ordinarily be
     // offered for review.
     h.ledger.appendCustomEvent({
@@ -1501,7 +1492,12 @@ describe('directive retirement — continuation boundary and consumers', () => {
     h.ledger.setJobStatus('job-review-escape', 'delivered');
     h.ledger.setJobPr('job-review-escape', 'https://github.com/example/fixture/pull/1');
     expect((await retire(h, 'req-review-escape', laneHead(lane))).status).toBe(200);
-    for (const extra of [{ force: true }, { target_ref: 'gru/unrelated' }, { force: true, target_ref: 'gru/unrelated' }]) {
+    repo.git(['tag', lane.branch!, laneHead(lane)]); // Same-SHA ambiguity must not mask the own hold either.
+    expect(() => repo.git(['show-ref', '--verify', 'refs/heads/gru/unrelated'])).toThrow();
+    const refs = repo.git(['show-ref']);
+    const lanes = h.worktrees.listWorktrees();
+    for (const extra of [{ force: true }, { target_ref: 'gru/unrelated' }, { force: true, target_ref: 'gru/unrelated' },
+      { target_ref: lane.branch }, { force: true, target_ref: lane.branch }]) {
       const result = await call(h.port, 'POST', '/api/dispatch/review', { job_id: 'job-review-escape', ...extra }, TOKEN);
       expect(result.status).toBe(409);
       expect(field<string>(result.json, 'error')).toBe('branch_busy');
@@ -1510,6 +1506,12 @@ describe('directive retirement — continuation boundary and consumers', () => {
     expect(h.spawns).toEqual([]);
     expect(countEvents(h, 'branch-idle.forced')).toBe(0);
     expect(countEvents(h, 'silas.directive-retired')).toBe(1);
+    expect(countEvents(h, 'round.admission-preflight')).toBe(0);
+    expect(countEvents(h, 'branch-idle.refused')).toBe(5);
+    expect(h.ledger.hasOpenDirectiveRecoveryHold('job-review-escape')).toBe(true);
+    expect(laneHead(lane)).toBe(repo.head());
+    expect(repo.git(['show-ref'])).toBe(refs);
+    expect(h.worktrees.listWorktrees()).toEqual(lanes);
   });
 
   it('refuses pending supervisor ownership even with an idle durable agent', async () => {

@@ -1,3 +1,4 @@
+import { capturePortLaneHandoff } from '../worktrees/handoff.js';
 import { randomUUID } from 'node:crypto';
 import { isHostPropertyRepairDirective, type PropertyRepairDirective } from '../property/pipeline.js';
 import type { Role } from '../config.js';
@@ -187,6 +188,8 @@ export async function routeFixDirectiveToMinion(
     if (failures.length > 1) throw new AggregateError(failures, `directive cleanup failed: ${failures.map(String).join('; ')}`);
   };
   const owner = input.owner ?? 'fix-directive';
+  const assignedLane = input.worktrees.listWorktrees({ jobId: input.jobId }).find((lane) => lane.kind === 'job' && lane.status !== 'swept');
+  const assertHandoff = assignedLane === undefined ? () => {} : capturePortLaneHandoff(input.worktrees, assignedLane);
   let nativeAttempted = false;
   let priorCleanupPending = false;
   const guard = (handle?: AgentHandle): void => {
@@ -263,7 +266,9 @@ export async function routeFixDirectiveToMinion(
         // A refusal before prompt is positive no-admission proof, not a
         // prompt error eligible for retry recovery. It must still release
         // the pacing lease acquired after the asynchronous wait above.
+        assertHandoff();
         assertAdmissible();
+        assertHandoff(); // reprove custody before the physical prompt starts
         guard();
         nativeAttempted = true;
         input.onPrepared?.(handle);
@@ -371,6 +376,7 @@ export async function routeFixDirectiveToMinion(
       `Fresh minion re-brief for job ${input.jobId}. Effective contract (original briefing plus accepted amendments):\n${contract}\n\nCurrent fix directive:\n${compose(input.continuation?.freshNote ?? '')}`;
     let prompt = resumeFile === null && input.contract != null && input.freshSession !== true ? freshPrompt(input.contract) : directive;
     try {
+      assertHandoff();
       assertAdmissible();
       guard();
       nativeAttempted = true; // a rejected spawn is still uncertain, never a deferral
@@ -386,6 +392,7 @@ export async function routeFixDirectiveToMinion(
       if (job == null || contract == null) {
         throw new Error(`cannot resume prior minion session for job ${input.jobId} and no original briefing is available to re-brief: ${String(error)}`);
       }
+      assertHandoff();
       assertAdmissible();
       guard();
       nativeAttempted = true;
@@ -401,6 +408,8 @@ export async function routeFixDirectiveToMinion(
     let verdict: PromptTurnVerdict | null = null;
     const spawnedHandle = handle;
     try {
+      assertHandoff();
+      assertDirectiveJobActive(input.ledger, input.jobId);
       // A fresh fallback minion (the resume attempt failed) is top-level;
       // a resumed row keeps its recorded parentage (never retro-fitted).
       input.ledger.registerAgent({
@@ -410,6 +419,8 @@ export async function routeFixDirectiveToMinion(
         sessionFile: handle.sessionFile,
         ...(input.ledger.getAgent(spawnedHandle.id) === null ? { parentage: 'top-level' as const } : {}),
       });
+      assertHandoff();
+      assertDirectiveJobActive(input.ledger, input.jobId);
     } catch (error) {
       registrationFailed = true;
       throw error; // the single cleanup owner below preserves registration AND cleanup failures
@@ -753,6 +764,7 @@ export async function rebriefFreshMinion(
   if (lane === undefined) {
     throw new Error(`job "${input.jobId}" has no active job lane — a re-brief needs its worktree`);
   }
+  const assertHandoff = capturePortLaneHandoff(input.worktrees, lane);
   const cwd = requireSpawnCwd('minion', lane.path);
   let lease: PacingLease | null = null;
   if (input.workerGate !== undefined) {
@@ -764,6 +776,7 @@ export async function rebriefFreshMinion(
     });
   }
   try {
+    assertHandoff();
     input.beforeTurnSideEffect?.();
     // Retirement/re-brief retires the WRITER sessions only — an active
     // child worker is not the job's minion lane (#161), and review-only
@@ -778,8 +791,10 @@ export async function rebriefFreshMinion(
           `could not retire the prior minion session ${minion.id} before re-briefing: ${String(error)}`,
         );
       });
+      assertHandoff();
       input.beforeTurnSideEffect?.();
     }
+    assertHandoff();
     input.beforeTurnSideEffect?.();
     // Issue #161: a fresh/resumed re-brief parent keeps a product-owned id
     // (its recorded row's id, even without a transcript) plus child tools.
@@ -795,6 +810,7 @@ export async function rebriefFreshMinion(
     });
     let prompt: string;
     try {
+      assertHandoff();
       input.beforeTurnSideEffect?.();
       // A FRESH re-brief session (no prior row) is explicitly top-level;
       // a resumed row keeps its recorded parentage (never retro-fitted).
@@ -818,6 +834,7 @@ export async function rebriefFreshMinion(
       // registerAgent publishes agent.spawned after COMMIT. A subscriber
       // can close the job or replace this request before the prompt; no
       // await may separate this last fence from prompt delivery.
+      assertHandoff();
       input.beforeTurnSideEffect?.();
     } catch (error) {
       try {

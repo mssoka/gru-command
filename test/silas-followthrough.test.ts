@@ -211,10 +211,10 @@ async function bootFollowThrough(input: {
   const db = new LedgerDb(dir);
   const bus = new EventBus({});
   const ledger = new LedgerApi(db.handle, { bus });
-  const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'));
+  const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'), ledger);
   const createJobLane = worktrees.createJobWorktree.bind(worktrees);
   vi.spyOn(worktrees, 'createJobWorktree').mockImplementation(async (input) => {
-    const lane = await createJobLane(input); ledger.registerWorktree(lane); return lane;
+    const lane = await createJobLane(input); if (ledger.getWorktree(lane.id) === null) ledger.registerWorktree(lane); return lane;
   }); // original lane creation, not recovery evidence
 
   const spawns: { role: Role; options: SpawnOptions }[] = [];

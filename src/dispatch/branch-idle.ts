@@ -4,6 +4,7 @@ import { isJobTerminal, type JobStatus } from '../ledger/states.js';
 import { LIVE_DIRECTIVE_STATES, type DirectiveState } from '../ledger/directives.js';
 import type { WorkRevisionState } from '../review-inputs/amendments.js';
 import type { WorktreeLane } from './worktree-port.js';
+import { repositoryGitEnv } from './perkins-review/artifacts.js';
 
 /**
  * Branch-idle guard (proven 2026-09-23; cost: two wasted review rounds): a
@@ -217,7 +218,7 @@ export function branchNameForRef(repoPath: string | null, ref: string): string |
     const result = spawnSync(
       'git',
       ['-C', repoPath, 'rev-parse', '--symbolic-full-name', '--verify', ref],
-      { encoding: 'utf-8', timeout: 10_000 },
+      { encoding: 'utf-8', timeout: 10_000, env: repositoryGitEnv(false) },
     );
     if (result.error !== undefined || result.status !== 0) return null;
     resolved = (result.stdout ?? '').trim();
@@ -425,6 +426,10 @@ export function findBusyLanes(input: {
  * its arm for every blocker it overrides; later work on the same job is a
  * different generation and was never authorized. */
 export interface BranchIdleWorkGeneration {
+  readonly branch: string;
+  readonly deliverySeq: number;
+  readonly directiveSeq: number;
+  readonly providerRecoverySeq: number;
   readonly attemptStartSeq: number;
   readonly repairStartSeq: number;
   readonly directiveIds: readonly string[];
@@ -438,12 +443,16 @@ export interface BranchIdleWorkGeneration {
  * never carried into an automatic retry). */
 export type ForceAuthorization = ReadonlyMap<string, BranchIdleWorkGeneration>;
 
-export function branchIdleWorkGeneration(ledger: BranchIdleLedger, jobId: string): BranchIdleWorkGeneration {
+export function branchIdleWorkGeneration(ledger: BranchIdleLedger, jobId: string, branch: string): BranchIdleWorkGeneration {
   let verificationRunSeq = 0;
   for (const kind of ['verification.requested', 'verification.started']) {
     verificationRunSeq = Math.max(verificationRunSeq, ledger.latestJobEvent(jobId, kind)?.seq ?? 0);
   }
   return {
+    branch: normalizeBranch(branch),
+    deliverySeq: ledger.latestJobEvent(jobId, 'job.delivered')?.seq ?? 0,
+    directiveSeq: ledger.latestJobEvent(jobId, 'silas.directive-sent')?.seq ?? 0,
+    providerRecoverySeq: ledger.latestJobEvent(jobId, 'provider.recovery-claimed')?.seq ?? 0,
     attemptStartSeq: openAttemptStartSeq(ledger, jobId),
     repairStartSeq: latestRepairStartSeq(ledger, jobId),
     directiveIds: ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).map((entry) => entry.requestId).sort(),
@@ -456,9 +465,9 @@ export function branchIdleWorkGeneration(ledger: BranchIdleLedger, jobId: string
 /** Snapshot the generation of every job the force overrides at its arm. */
 export function snapshotForceAuthorization(
   ledger: BranchIdleLedger,
-  blockers: readonly Pick<BranchIdleBlocker, 'jobId'>[],
+  blockers: readonly Pick<BranchIdleBlocker, 'jobId' | 'branch'>[],
 ): ForceAuthorization {
-  return new Map(blockers.map((blocker) => [blocker.jobId, branchIdleWorkGeneration(ledger, blocker.jobId)] as const));
+  return new Map(blockers.map((blocker) => [blocker.jobId, branchIdleWorkGeneration(ledger, blocker.jobId, blocker.branch)] as const));
 }
 
 /** Does the arm-time snapshot cover this blocker? Only work that already
@@ -469,11 +478,15 @@ export function forceCoversBlocker(
   ledger: BranchIdleLedger,
   authorization: ForceAuthorization,
   blocker: BranchIdleBlocker,
+  now = branchIdleWorkGeneration(ledger, blocker.jobId, blocker.branch),
 ): boolean {
   const armed = authorization.get(blocker.jobId);
   if (armed === undefined || blocker.revision !== undefined || ledger.listJobAdmissions?.(blocker.jobId).some((kind) => kind.startsWith('property '))) return false;
-  const now = branchIdleWorkGeneration(ledger, blocker.jobId);
-  return now.attemptStartSeq <= armed.attemptStartSeq &&
+  return now.branch === armed.branch &&
+    now.deliverySeq <= armed.deliverySeq &&
+    now.directiveSeq <= armed.directiveSeq &&
+    now.providerRecoverySeq <= armed.providerRecoverySeq &&
+    now.attemptStartSeq <= armed.attemptStartSeq &&
     now.repairStartSeq <= armed.repairStartSeq &&
     now.verificationRunSeq <= armed.verificationRunSeq &&
     now.directiveIds.every((id) => armed.directiveIds.includes(id)) &&
