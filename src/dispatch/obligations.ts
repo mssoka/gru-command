@@ -412,6 +412,12 @@ function phaseAdmissionValid(
       );
     }
     case 'silas-rebrief':
+      if (phase.requestId !== null) {
+        const request = ledger.getDirective(phase.requestId);
+        return payload['request_id'] === phase.requestId && request?.jobId === phase.jobId && request.requestKind === 'rebrief' &&
+          (request.state === 'admitted' || request.state === 'settled');
+      }
+      // Historical marker-only re-brief phases retain their original proof.
       // The re-brief request records its own `silas.rebrief` event (with
       // this phase id) BEFORE the delivery; an interrupted/failed re-brief
       // records none and can never complete. (When the marker pair still

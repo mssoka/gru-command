@@ -1,8 +1,9 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { configPathFor, loadConfig, ConfigError } from './config.js';
 import { loadOrCreateIdentity } from './identity.js';
+import { startServiceShutdown, type ServiceShutdownState } from './service-shutdown.js';
 import { Logger } from './logger.js';
 import { RuntimeRegistry, serviceRegistryOptions } from './runtime/registry.js';
 import { resolvePacingPolicy } from './runtime/pacing.js';
@@ -18,15 +19,19 @@ import { createServiceReviewWave, liveReviewSessionIds } from './dispatch/servic
 import { NotificationCenter } from './notifications/center.js';
 import { Supervisor } from './supervision/supervisor.js';
 import { TranscriptService } from './transcripts/service.js';
+import { gitReviewSourcePreflight } from './dispatch/review-source.js';
 import { DispatchService } from './dispatch/service.js';
 import { WorktreeManager } from './worktrees/manager.js';
 import { createWorktreeServer } from './worktrees/server.js';
-import type { WaveRunner } from './dispatch/perkins.js';
 import { createReviewEscalationNotifier } from './dispatch/escalation-identity.js';
 import { createStartupVerdictPoster } from './dispatch/perkins-github-app.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { SilasDriver, computeSilasDigest, consolidatedBlockersFor, supervisionLookup } from './dispatch/silas-driver.js';
+import { createSilasModelActionTool } from './dispatch/silas-model-action.js';
+import { composeDeterministicPass, createSilasAutopilotHook } from './dispatch/silas-autopilot-pass.js';
+import { createSilasAutopilotOps } from './dispatch/silas-autopilot-ops.js';
 import { createProductionDeterministicPass } from './dispatch/durable-reconcile.js';
+import { DirectiveProgressService } from './dispatch/directive-progress.js';
 import { ProviderRecoverySensor, establishProviderWait } from './provider-recovery/sensor.js';
 import { ModelRuntimeProbe } from './provider-recovery/probe.js';
 import {
@@ -38,14 +43,17 @@ import { claimProviderRecoveryContinuation } from './provider-recovery/resume.js
 import { GhCliApi, GitHubSignalPoll, type LaneRemoteResolver } from './dispatch/github-poll.js';
 import { GhRepoOverviewApi, ManagedRepoOverviewTracker } from './repos/overview.js';
 import { routeFixDirectiveToMinion } from './dispatch/fix-directive.js';
-import { reconcilePendingRebriefs, reconcilePendingDirectives } from './dispatch/rebrief-recovery.js';
+import { reconcilePendingLegacyDirectives, reconcilePendingRebriefs } from './dispatch/rebrief-recovery.js';
 import { adoptBlockedLanes, observeFollowUpDelivery, observePhaseCompletion, reconcilePhaseHandoffs, reconcileUnmarkedHandbacks } from './dispatch/obligations.js';
 import { createDispatchServer } from './dispatch/server.js';
+import { createPropertyCampaignService } from './dispatch/property-campaigns.js';
 import { PipelineService } from './dispatch/pipeline.js';
+import { IntakeService } from './intake/service.js';
+import { IntakeApprovalService } from './intake/approval.js';
 import { ChildWorkerService } from './dispatch/child-workers.js';
 import { createVerificationServer } from './verify/server.js';
 import type { VerificationQueueView } from './verify/scheduler.js';
-import { createService, type ServiceHandle } from './server.js';
+import { createService } from './server.js';
 import { adoptRollMarker, reconcileStaleRoll } from './roll/adopt.js';
 import { RollController, ROLL_SWAP_EXIT_CODE } from './roll/controller.js';
 import { createRollProbes } from './roll/probes.js';
@@ -91,20 +99,8 @@ import {
   runRuntimeReviewPreflight,
 } from './dispatch/review-path.js';
 import { loadPerkinsPolicy } from './dispatch/perkins-review/policy.js';
-import { getAgentDir } from '@earendil-works/pi-coding-agent';
-import type { NativeAgentTool, SpawnOptions } from './runtime/types.js';
-
-/** Locate the installed bmad-review skill: check both the pi agent dir
- * and ~/.agents (the BMAD default install root) for maximum compatibility. */
-function resolveBmadReviewSkillPath(): string {
-  for (const base of [getAgentDir(), join(homedir(), '.agents')]) {
-    const candidate = join(base, 'skills', 'bmad-review', 'SKILL.md');
-    if (existsSync(candidate)) return candidate;
-  }
-  // Return the pi agent dir path as the default — the gate will report
-  // 'not installed' if neither location has it.
-  return join(getAgentDir(), 'skills', 'bmad-review', 'SKILL.md');
-}
+import type { AgentHandle, NativeAgentTool, SpawnOptions } from './runtime/types.js';
+import { serviceWorkflowAuthority } from './workflows/session.js';
 
 /** The process LISTENING on the configured instance port when it is not us
  * (null: free, ours, ephemeral, or the platform has no probe). Port-squat
@@ -181,7 +177,7 @@ async function reviewPreflightCheck(
   return preflight.ok && thinking !== undefined ? { ...preflight, reviewThinkingLevel: thinking } : preflight;
 }
 import { ChatFrameLog } from './chat/frame-log.js';
-import { createChatServer, type ChatServer } from './chat/server.js';
+import { createChatServer } from './chat/server.js';
 import { GruAwareness } from './chat/awareness.js';
 import { BOARD_WS_PATH } from './board/frames.js';
 import { GruSessionPointer } from './chat/session-state.js';
@@ -338,27 +334,7 @@ async function main(): Promise<number> {
     process.exit(1);
   });
 
-  const state: {
-    handle?: ServiceHandle;
-    registry?: RuntimeRegistry;
-    store?: SessionStore;
-    chat?: ChatServer;
-    awareness?: GruAwareness;
-    board?: Awaited<ReturnType<typeof createBoardServer>>;
-    ledgerDb?: LedgerDb;
-    supervisor?: Supervisor;
-    decisions?: DecisionRuntime;
-    bob?: BobScheduler;
-    dream?: DreamScheduler;
-    silas?: SilasDriver;
-    providerRecovery?: ProviderRecoverySensor;
-    wave?: WaveRunner;
-    childWorkers?: ChildWorkerService;
-    verify?: ReturnType<typeof createVerificationServer>;
-    pipeline?: PipelineService;
-    deployDrift?: DeployDriftTracker;
-    repoOverview?: ManagedRepoOverviewTracker;
-  } = {};
+  const state: ServiceShutdownState = {};
   let shuttingDown = false;
   /** Service-stopping signal (pacing): aborts QUEUED admission waits and
    * lets delivery settlement observe shutdown instead of hanging. */
@@ -366,159 +342,7 @@ async function main(): Promise<number> {
   const shutdown = (signal: string, exitCode = 0) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    serviceStop.abort();
-    logger.info('shutdown begin', { signal, exit_code: exitCode });
-    const forceExit = setTimeout(() => {
-      logger.error('shutdown timeout — forcing exit', { signal });
-      process.exit(1);
-    }, 5_000);
-    forceExit.unref();
-    if (state.handle === undefined) {
-      clearTimeout(forceExit);
-      logger.info('shutdown complete', { signal, note: 'signal arrived during boot' });
-      process.exit(exitCode);
-    }
-    const handle = state.handle;
-    void Promise.resolve()
-      .then(async () => {
-        // Each stage isolated: a failure in one must never skip lock
-        // release or the final snapshot — the next boot's growth detection
-        // depends on the snapshot reflecting what this process last saw
-        // (SPEC ruling 12). Chat clients go first (1001 going-away) so
-        // they queue before the runtime turns die (E4); the board's
-        // clients follow (E6).
-        if (state.chat !== undefined) {
-          try {
-            await state.chat.dispose();
-          } catch (error) {
-            logger.error('chat server shutdown failed', { error: String(error) });
-          }
-        }
-        // After chat: the awareness layer's deferred-wake timer must not
-        // outlive the sink it would call (idempotent, never fatal).
-        if (state.awareness !== undefined) {
-          try {
-            state.awareness.dispose();
-          } catch (error) {
-            logger.error('awareness shutdown failed', { error: String(error) });
-          }
-        }
-        if (state.board !== undefined) {
-          try {
-            await state.board.dispose();
-          } catch (error) {
-            logger.error('board server shutdown failed', { error: String(error) });
-          }
-        }
-        if (state.decisions !== undefined) {
-          try {
-            state.decisions.dispose();
-          } catch (error) {
-            logger.error('decision runtime dispose failed', { error: String(error) });
-          }
-        }
-        if (state.supervisor !== undefined) {
-          try {
-            state.supervisor.dispose();
-          } catch (error) {
-            logger.error('supervisor dispose failed', { error: String(error) });
-          }
-        }
-        if (state.bob !== undefined) {
-          try {
-            state.bob.stop();
-          } catch (error) {
-            logger.error('bob scheduler stop failed', { error: String(error) });
-          }
-        }
-        if (state.dream !== undefined) {
-          try {
-            state.dream.stop();
-          } catch (error) {
-            logger.error('lesson dream scheduler stop failed', { error: String(error) });
-          }
-        }
-        if (state.silas !== undefined) {
-          try {
-            state.silas.stop();
-          } catch (error) {
-            logger.error('silas driver stop failed', { error: String(error) });
-          }
-        }
-        if (state.providerRecovery !== undefined) {
-          try {
-            state.providerRecovery.stop();
-          } catch (error) {
-            logger.error('provider-recovery sensor stop failed', { error: String(error) });
-          }
-        }
-        if (state.wave !== undefined) {
-          try {
-            await state.wave.shutdown();
-          } catch (error) {
-            logger.error('Perkins review shutdown failed', { error: String(error) });
-          }
-        }
-        if (state.pipeline !== undefined) {
-          try {
-            state.pipeline.dispose();
-          } catch (error) {
-            logger.error('pipeline dispose failed', { error: String(error) });
-          }
-        }
-        if (state.childWorkers !== undefined) {
-          try {
-            await state.childWorkers.dispose();
-          } catch (error) {
-            logger.error('child worker shutdown failed', { error: String(error) });
-          }
-        }
-        if (state.verify !== undefined) {
-          try {
-            await state.verify.dispose();
-          } catch (error) {
-            logger.error('verification scheduler shutdown failed', { error: String(error) });
-          }
-        }
-        state.deployDrift?.stop();
-        state.repoOverview?.stop();
-        if (state.registry !== undefined) {
-          try {
-            await state.registry.dispose();
-          } catch (error) {
-            logger.error('registry dispose failed', { error: String(error) });
-          }
-        }
-        if (state.store !== undefined) {
-          try {
-            state.store.dispose();
-            state.store.persistSnapshot();
-          } catch (error) {
-            logger.error('session store shutdown failed', { error: String(error) });
-          }
-        }
-        if (state.ledgerDb !== undefined) {
-          try {
-            state.ledgerDb.close();
-          } catch (error) {
-            logger.error('ledger shutdown failed', { error: String(error) });
-          }
-        }
-        await handle.stop();
-      })
-      .then(() => {
-        clearTimeout(forceExit);
-        logger.info('shutdown complete', { signal });
-        // A roll swap exits with ROLL_SWAP_EXIT_CODE (75, non-zero): the
-        // shipped launchd/systemd units restart on an unsuccessful exit
-        // and stay down on a clean one. A normal stop keeps exit 0.
-        process.exit(exitCode);
-      })
-      .catch((error: unknown) => {
-        clearTimeout(forceExit);
-        logger.error('shutdown failed', { signal, error: String(error) });
-        process.exit(1);
-      });
+    startServiceShutdown({ signal, exitCode, logger, state, serviceStop, exit: process.exit });
   };
   // Registered before the server starts so a signal in the boot window is
   // still a graceful, logged exit.
@@ -529,11 +353,16 @@ async function main(): Promise<number> {
   // BEFORE the server so /health can answer with real signals from the
   // first request. Growth findings also hit the log (SPEC ruling 12).
   const store = new SessionStore(config.dataDir, { log: (level, msg, fields) => logger.log(level, msg, fields) });
-  // Issue #283: the service options carry the binder that gives
-  // build-workflow sessions the GC-managed BMAD runtime of their job lane.
+  // Lazy authoritative records preserve boot order; dispatch and fallback use
+  // the same tested assignment and deliverable-selection wiring.
+  const workflowAuthority = serviceWorkflowAuthority(config.dataDir, () => ledger, undefined, configPathFor(config.instanceDir));
   const registry = new RuntimeRegistry(serviceRegistryOptions({
     config,
     store,
+    verificationConfigFile: configPathFor(config.instanceDir),
+    workflowLaneFor: workflowAuthority.workflowLaneFor,
+    workflowBuildFor: workflowAuthority.workflowBuildFor,
+    workflowAgentFor: workflowAuthority.workflowAgentFor,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   }));
   const growth = registry.boot();
@@ -1024,6 +853,8 @@ async function main(): Promise<number> {
     dir: chatDir,
     ledger,
     bus,
+    mailbox: engine.mailbox,
+    mailboxReconcileIntervalMs: config.chat.mailboxReconcileIntervalMs,
     wakeMode: config.chat.notifyWake,
     wakeMinIntervalMs: config.chat.wakeMinIntervalMs,
     wakeMinSeverity: config.chat.wakeMinSeverity,
@@ -1094,6 +925,7 @@ async function main(): Promise<number> {
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   state.ledgerDb = ledgerDb;
+  state.ledger = ledger;
   state.board = board;
   logger.info('ledger ready', { db_path: ledgerDb.dbPath });
 
@@ -1186,9 +1018,21 @@ async function main(): Promise<number> {
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     stopSignal: serviceStop.signal,
     parentTools: parentToolsFor,
+    reviewSource: gitReviewSourcePreflight,
     ...(config.lessons.enabled ? { lessons: lessonReferences, lessonsCapture } : {}),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+  // Issue #339: a prohibited read during a resume/re-brief invalidates blind
+  // coverage — the same observation the dispatch settle seam runs. One wiring
+  // for every resume/re-brief path (boot re-brief, silas re-brief, provider
+  // recovery), so none can bypass it.
+  const observeBlindTurn = (jobId: string, sessionFile: string | null): void =>
+    dispatcher.observeBlindSession(jobId, sessionFile);
+  // Issue #339: a supervisor restart-recovered turn is a resume too. The
+  // supervisor is built before the dispatcher, so install the same observer
+  // late — otherwise a restarted blind reviewer that reads prohibited
+  // material keeps qualifying coverage.
+  supervisorLive.setObserveBlindTurn(observeBlindTurn);
   // The durable queue's mechanical consumer: one shared-budget-aware
   // reconsider pass over the ledger-backed pipeline, triggered by enqueue,
   // bus transitions and runtime capacity events. No timer, no second
@@ -1245,10 +1089,11 @@ async function main(): Promise<number> {
     evidenceUploadsDir: join(config.dataDir, 'uploads'),
     reviewPreflight: (input) => reviewPreflightCheck(config, registry, input.repoPath),
     fallbackGate: {
-      skillPath: resolveBmadReviewSkillPath(),
+      resolveReviewResources: workflowAuthority.resolveReviewResources,
       fixDirectiveSink: (directiveInput) => routeFixDirectiveToMinion({
         workerGate: pacing.gate,
         retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
+        observeBlindTurn,
         registry,
         ledger,
         worktrees: worktreeManager,
@@ -1284,13 +1129,9 @@ async function main(): Promise<number> {
   // Automatic admission retries live in memory (owner decision 2026-10-08):
   // one pending when the service stopped escalates now instead of resuming.
   wave.escalateInterruptedAdmissionRetries();
-  // Re-brief restart safety (Silas finding 2026-09-23): a re-brief request
-  // mid-flight at restart left no events and no worker. The durable
-  // markers written before each worker spawned are consumed here — the
-  // interrupted session is resumed (or a fresh worker re-dispatched on the
-  // same lane) and the missing events are recorded when that turn settles.
-  // Never awaited beyond dispatch: a re-brief turn is long; failures
-  // escalate action-required from the background.
+  // Historical re-brief markers never authorize replay. Observe a bounded
+  // page for genuine spent/terminal evidence or concrete Gru judgment;
+  // DirectiveProgressService ticks fairly visit the remaining generations.
   const rebriefRecovery = await reconcilePendingRebriefs({
     registry,
     ledger,
@@ -1300,15 +1141,17 @@ async function main(): Promise<number> {
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     parentTools: parentToolsFor,
     stopSignal: serviceStop.signal,
+    observeBlindTurn,
     log: (level, msg, fields) => logger.log(level, msg, fields),
     stopping: () => shuttingDown,
   });
-  if (rebriefRecovery.examined > 0) {
+  if (rebriefRecovery.examined > 0 || rebriefRecovery.failed > 0) {
     logger.info('re-brief reconciliation', {
       examined: rebriefRecovery.examined,
       completed: rebriefRecovery.completed,
       redispatched: rebriefRecovery.redispatched,
       retired: rebriefRecovery.retired,
+      failed: rebriefRecovery.failed,
     });
   }
   // Child-worker restart safety (issue #161): a child that never bound a
@@ -1319,23 +1162,27 @@ async function main(): Promise<number> {
   if (childRecovery.resumed > 0 || childRecovery.failed > 0) {
     logger.info('child worker reconciliation', childRecovery);
   }
-  // Directive-request restart safety (phase 3): a request accepted before
-  // the crash reconciles from correlated evidence when it exists; when
-  // admission or the terminal receipt is UNKNOWN, one bounded escalation
-  // names it for a Gru reconciliation — never an automatic retry
-  // (admission-unknown is not no-effect proof).
-  const directiveRecovery = reconcilePendingDirectives({
-    ledger,
-    notifications,
+  // Preserve event-only recovery for pre-native protocol rows at boot.
+  // Current requests are reconciled below only through their exact native
+  // checkpoint and producer-cessation evidence.
+  const legacyDirectiveRecovery = reconcilePendingLegacyDirectives({ ledger, notifications,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
-  if (directiveRecovery.examined > 0) {
-    logger.info('directive reconciliation', {
-      examined: directiveRecovery.examined,
-      completed: directiveRecovery.completed,
-      escalated: directiveRecovery.escalated,
+  if (legacyDirectiveRecovery.examined > 0) {
+    logger.info('legacy directive reconciliation', {
+      examined: legacyDirectiveRecovery.examined,
+      completed: legacyDirectiveRecovery.completed,
+      escalated: legacyDirectiveRecovery.escalated,
     });
   }
+  const directiveProgress = new DirectiveProgressService({ ledger, registry, worktrees: worktreeManager, notifications, observeBlindTurn,
+    clearLaneForWriter: (input) => wave.clearLaneForWriter(input),
+    pendingProducerBlockers: (jobId, currentNative) => supervisorLive.pendingProducerBlockers(jobId, currentNative), signal: serviceStop.signal,
+    workerGate: pacing.gate, retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId), parentTools: parentToolsFor,
+    ...(config.lessons.enabled ? { lessons: lessonReferences } : {}),
+  });
+  state.directiveProgress = directiveProgress;
+  directiveProgress.reconsider();
   // Explicit phase-handoff restart safety (pr136-chief-handoff): closes
   // crash windows after the correlated delivery commit and before/after
   // the obligation write and the notification publication. Runs AFTER the
@@ -1431,22 +1278,65 @@ async function main(): Promise<number> {
   // supervised slot follows the gru-main / bob-consolidator pattern exactly
   // — model and thinking resolve from config ([models.roles] silas /
   // [thinking.roles] silas) at spawn, never hardcoded here.
+  // Issue #243 H6: the digest the model-action tool observes is computed with
+  // the SAME seams the API digest endpoint uses. It is assigned below, once
+  // those seams exist; the tool only ever runs inside a live turn, long after
+  // boot, so the placeholder is never reachable in practice.
+  let silasActionDigest: () => Promise<Awaited<ReturnType<typeof computeSilasDigest>>> = () =>
+    Promise.reject(new Error('silas action digest is not initialised'));
   const silasSlot = config.silas.enabled
     ? supervisorLive.declareSlot({
         id: 'silas-ops',
         role: 'silas',
-        spawn: (spawnOptions) => registry.spawn('silas', spawnOptions ?? {}),
+        spawn: (spawnOptions) => {
+          // Bind the model-action tool to THIS spawn's exact handle: `bound` is
+          // assigned when the spawn resolves, so a re-spawn gets its own tool
+          // bound to its own incarnation (never a late lookup of the current
+          // slot). The tool runs only during a live model turn.
+          let bound: AgentHandle | null = null;
+          const actionTool = createSilasModelActionTool({
+            getHandle: () => bound,
+            ledger,
+            digest: () => silasActionDigest(),
+            log: (level, msg, fields) => logger.log(level, msg, fields),
+          });
+          return registry
+            .spawn('silas', {
+              ...(spawnOptions ?? {}),
+              nativeTools: [...(spawnOptions?.nativeTools ?? []), actionTool],
+            })
+            .then((handle) => {
+              bound = handle;
+              return handle;
+            });
+        },
       })
     : null;
+  const intake = new IntakeService({ dataDir: config.dataDir, workspaceRoot: config.workspaceRoot, uploadsDir });
+  silasActionDigest = () =>
+    computeSilasDigest({
+      ledger,
+      worktrees: worktreeManager,
+      blockersForRound: consolidatedBlockersFor(ledger),
+      config: config.silas,
+      trigger: 'api',
+      supervisionFor: supervisionLookup(() => supervisor),
+    });
+  const propertyCampaigns = createPropertyCampaignService({ ledger, registry, worktrees: worktreeManager, wave, notifications, observeBlindTurn, artifactsRoot: join(config.dataDir, 'property-campaigns'), pendingProducerBlockers: (jobId) => supervisorLive.pendingProducerBlockers(jobId), workerGate: pacing.gate, retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId), parentTools: parentToolsFor, ...(config.lessons.enabled ? { lessons: lessonReferences } : {}) });
+  state.propertyCampaigns = propertyCampaigns;
   const dispatchServer = createDispatchServer({
     config,
+    intake,
+    intakeApproval: new IntakeApprovalService({ intake, ledger, pipeline }),
+    propertyCampaigns,
     dispatch: dispatcher,
     wave,
     ledger,
     childWorkers,
     workerGate: pacing.gate,
-    pendingProducerBlockers: (jobId) => supervisorLive.pendingProducerBlockers(jobId),
+    pendingProducerBlockers: (jobId, currentNative) => supervisorLive.pendingProducerBlockers(jobId, currentNative),
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
+    observeBlindTurn,
     ...(pipeline !== null ? { pipeline } : {}),
     ...(config.silas.enabled && silasSlot !== null
       ? {
@@ -1463,6 +1353,8 @@ async function main(): Promise<number> {
                     ledger,
                     worktrees: worktreeManager,
                     slotReArm: slotReArmPort,
+                    retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
+                    observeBlindTurn,
                     log: (level, msg, fields) => logger.log(level, msg, fields),
                   },
                   waitId,
@@ -1473,15 +1365,7 @@ async function main(): Promise<number> {
             // delta pointer resolves here, computed with the SAME seams the
             // driver uses (worktrees, blockers port, supervision stop
             // truth) so the API can never disagree with what wakes Silas.
-            digest: () =>
-              computeSilasDigest({
-                ledger,
-                worktrees: worktreeManager,
-                blockersForRound: consolidatedBlockersFor(ledger),
-                config: config.silas,
-                trigger: 'api',
-                supervisionFor: supervisionLookup(() => supervisor),
-              }),
+            digest: silasActionDigest,
           },
         }
       : {}),
@@ -1644,6 +1528,58 @@ async function main(): Promise<number> {
       const remote = remoteCache.get(repoPath) ?? null;
       return remote === null ? null : { host: remote.host, owner: remote.owner, repo: remote.repo };
     };
+    // Silas autopilot (issue #243): the unambiguous rule families executed
+    // in code, before any LLM wake. It reaches the service through the SAME
+    // functions the HTTP endpoints compose (never HTTP), and it is bound to
+    // the SAME seams the driver's own digest uses, so the rows it acts on
+    // are the rows Silas was about to read. `enabled` is the owner's kill
+    // switch (default off); every family defaults to dry-run.
+    const autopilotGh = new GhCliApi();
+    const autopilotOps = createSilasAutopilotOps({
+      ledger,
+      wave,
+      registry,
+      worktrees: worktreeManager,
+      dispatch: dispatcher,
+      gh: autopilotGh,
+      resolveRemote: resolveLaneRemote,
+      workerGate: pacing.gate,
+      retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
+      parentTools: parentToolsFor,
+      notifications,
+      pendingProducerBlockers: (jobId, currentNative) => supervisorLive.pendingProducerBlockers(jobId, currentNative),
+      observeBlindTurn,
+      ...(config.lessons.enabled ? { lessons: lessonReferences } : {}),
+      // Service-stop ownership (issue #243 R2-H9): the shutdown signal aborts
+      // a QUEUED directive/re-brief admission so a stopped service never
+      // starts one; `drain` joins the in-flight producers without claiming
+      // cessation.
+      stopSignal: serviceStop.signal,
+      log: (level, msg, fields) => logger.log(level, msg, fields),
+    });
+    state.autopilot = autopilotOps;
+    const autopilotHook = createSilasAutopilotHook({
+      ledger,
+      config: config.silas.autopilot,
+      ops: autopilotOps,
+      digest: (trigger) =>
+        computeSilasDigest({
+          ledger,
+          worktrees: worktreeManager,
+          blockersForRound: consolidatedBlockersFor(ledger),
+          config: config.silas,
+          trigger,
+          supervisionFor: supervisionLookup(() => supervisor),
+        }),
+      log: (level, msg, fields) => logger.log(level, msg, fields),
+    });
+    const durablePass = createProductionDeterministicPass({
+      ledger,
+      notifications,
+      log: (level, msg, fields) => logger.log(level, msg, fields),
+      getWave: () => state.wave,
+      directiveProgress,
+    });
     const silas = new SilasDriver({
       slot: silasSlot,
       ledger,
@@ -1669,15 +1605,10 @@ async function main(): Promise<number> {
       // Chief phase-3 seam: every deterministic Silas pass runs the
       // production hook — the in-memory review-handoff reconsideration
       // plus the bounded durable reconciliation (issue #163) — BEFORE any
-      // LLM wake. The factory is behaviorally tested with a real ledger
-      // and driver; a wiring regression fails a behavioral test, not just
-      // a source regex.
-      onDeterministicPass: createProductionDeterministicPass({
-        ledger,
-        notifications,
-        log: (level, msg, fields) => logger.log(level, msg, fields),
-        getWave: () => state.wave,
-      }),
+      // LLM wake, and then the autopilot (issue #243). The composition is
+      // the exported factory (issue #243 F-M4) so the asymmetric failure
+      // behavior is behaviorally tested through a real driver, not a regex.
+      onDeterministicPass: composeDeterministicPass(durablePass, autopilotHook),
       githubPoll: new GitHubSignalPoll({
         ledger,
         notifications,

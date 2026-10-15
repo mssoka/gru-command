@@ -134,7 +134,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-int-db-')));
     dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/integration', h0);
+    const port = new GitReviewPort(root, 'feature/integration', h0, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-integration' });
     const job = ledger.addJob({
       id: 'job-integration', repo: 'fixture', title: 'integration', baseBranch: 'main', briefing: 'review',
@@ -207,7 +207,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-intp-db-')));
     dirs.push(root, artifacts); dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/integration', h0);
+    const port = new GitReviewPort(root, 'feature/integration', h0, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-integration-partial' });
     const job = ledger.addJob({
       id: 'job-integration-partial', repo: 'fixture', title: 'integration partial', baseBranch: 'main', briefing: 'review',
@@ -297,7 +297,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-stripped-db-')));
     dirs.push(root, artifacts); dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/stripped', h0);
+    const port = new GitReviewPort(root, 'feature/stripped', h0, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-stripped' });
     const job = ledger.addJob({ id: 'job-stripped', repo: 'fixture', title: 'stripped', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -364,7 +364,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-restore-db-')));
     dirs.push(root, artifacts); dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/restore-debt', target);
+    const port = new GitReviewPort(root, 'feature/restore-debt', target, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-restore-debt' });
     const job = ledger.addJob({ id: 'job-restore-debt', repo: 'fixture', title: 'restore debt', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -441,7 +441,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), `perkins-${name}-db-`)));
     dirs.push(root, artifacts); dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, `feature/${name}`, target);
+    const port = new GitReviewPort(root, `feature/${name}`, target, ledger);
     const job = ledger.addJob({ id: `job-${name}`, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
     ledger.setJobStatus(job.id, 'in-review');
@@ -1231,7 +1231,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-promoted-db-')));
     dirs.push(root, artifacts); dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/integration', h0);
+    const port = new GitReviewPort(root, 'feature/integration', h0, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-promoted' });
     const job = ledger.addJob({ id: 'job-promoted', repo: 'fixture', title: 'promoted', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -1359,7 +1359,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-crash-annotation-db-')));
     dirs.push(root, artifacts); dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/integration', h0);
+    const port = new GitReviewPort(root, 'feature/integration', h0, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-crash-annotation' });
     const job = ledger.addJob({ id: 'job-crash-annotation', repo: 'fixture', title: 'crash annotation', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -1490,7 +1490,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-crash-promotion-db-')));
     dirs.push(root, artifacts); dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/integration', h0);
+    const port = new GitReviewPort(root, 'feature/integration', h0, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-crash-promotion' });
     const job = ledger.addJob({ id: 'job-crash-promotion', repo: 'fixture', title: 'crash promotion', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -1631,7 +1631,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-pin-db-')));
     dirs.push(root, artifacts); dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/integration', h0);
+    const port = new GitReviewPort(root, 'feature/integration', h0, ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-pin-passthrough' });
     const job = ledger.addJob({ id: 'job-pin-passthrough', repo: 'fixture', title: 'pin passthrough', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');

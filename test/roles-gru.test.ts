@@ -29,15 +29,15 @@ describe('gru role definition', () => {
     expect(prompt).toContain('UNTRUSTED DATA');
     expect(prompt).toContain('POST /api/notifications/needs-owner');
     expect(prompt).toContain('exact-final-head native Perkins READY');
-    expect(prompt).toContain('The owner holds every merge, everywhere');
-    expect(prompt).toContain('merge yourself');
+    expect(prompt).toContain('The owner holds every final PR merge, everywhere');
+    expect(prompt).toContain('no agent merges a PR');
   });
 
   it('the chief hands workers the whole build and presents merges only on exact-final-head Perkins READY', () => {
     const gru = ROLE_DEFINITIONS.gru.systemPrompt.replace(/\s+/gu, ' ');
     expect(gru).toContain('Hand workers the whole build');
-    expect(gru).toContain('the owner holds');
-    expect(gru).toContain('every merge');
+    expect(gru).toContain('The owner holds every final PR merge, everywhere');
+    expect(gru).toContain('main-into-task-branch integration');
   });
 
   it('the chief owns the briefing, keeps acceptance on fixed targets, and lets lanes outlive a moving main', () => {

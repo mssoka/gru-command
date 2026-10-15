@@ -39,9 +39,10 @@ restart produce the same truth without data edits.
 | `POST /api/rounds/:id/status` / `:id/verdict` | `{status}` / `{verdict}` |
 | `POST /api/agents` | `{id, role, label?, jobId?, roundId?, sessionFile?}` (upsert) |
 | `POST /api/agents/state` | `{id, state}` |
+| `POST /api/notifications/needs-owner` | `{title (1-500), detail (1-4000), idempotencyKey? (1-128 of [A-Za-z0-9._:-])}` — Gru's owner escalation into FOR YOU (decision #100, 2026-10-12). Without a key every valid request is its own row. With a key the key names ONE escalation: a retry with the same key and same title/detail returns the existing row (`200`, no second row or bell; first creation is `201`); the same key with a changed title/detail is `409 idempotency_conflict`; a new key is a new decision. Retry an uncertain outcome with the SAME key |
 | `POST /api/notifications/:id/shown` | `{surface}` — display receipt (idempotent per surface; the shown:true doctrine) |
 | `POST /api/notifications/:id/ack` | `{by?}` — owner/FYI ack; refuses machine rows (400), and owner ack re-arms an open breaker |
-| `POST /api/notifications/:id/disposition` | `{detail}` — authenticated Gru disposition for an action-required ID after substantive action; resolves it with a ledger event and closes any unresolved-attention owner follow-up; never clears unrelated owner stops |
+| `POST /api/notifications/:id/disposition` | `{detail, actor?}` — authenticated Gru disposition for an action-required ID after substantive action; resolves it with a ledger event and closes any unresolved-attention owner follow-up; never clears unrelated owner stops. **Actorship (decision #99, 2026-10-12):** the board has ONE shared bearer for owner and agent callers, so the credential proves a paired caller, not Gru. `by: 'gru'` in the ledger names the disposition *role*; the `notification.resolved` event also records `credential: 'shared-bearer'` and the caller-declared `declaredActor` (`null` when omitted). `actor` may only be omitted or `"gru"` (anything else is 400). Neither value is proof of identity; a separate owner credential is deliberately not introduced (no new auth framework). Owner Ack (`/ack`) is likewise shared-bearer and its `by` is caller-declared; when omitted the server records `web` |
 | `POST /api/lenses/bind` | `{roundId, lens, agentId}` — chip follows the agent's events |
 | `POST /api/lenses/outcome` | `{roundId, lens, state: done\|error, note?}` (live derives from agent events — never posted) |
 
@@ -232,9 +233,11 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   projection as the board's permanent FOR YOU band — pending acks AND
   ready PRs, so the two surfaces never disagree about what the owner
   owes (the badge and toasts still count needs-owner notifications
-  only); opening it never completes an obligation. A machine
-  alert left unresolved 30 minutes after delivery opens a separate
-  owner-only follow-up in FOR YOU; Gru's later disposition resolves it. The badge and live
+  only); opening it never completes an obligation. There is no
+  timed escalation: a machine alert is never promoted to the owner by age
+  (docs/FLOW.md forbids promotion by age). It stays in NEEDS GRU for Gru to
+  triage and dispose; only genuine owner decisions are posted to FOR YOU, and
+  those rows persist until the owner's Ack. The badge and live
   toasts serve needs-owner only; every displayed row earns a shown receipt
   per surface (a display receipt is not an acknowledgement); acking an
   owner row clears it where an ack has meaning (a breaker row re-arms
@@ -280,3 +283,19 @@ names anywhere, ever.
 - E2E (`web/e2e/`): mock board render + transcript drawer; real-service
   board (API-seeded jobs, live push, crew rail, real transcript open +
   search, 401 doors, phone board-first).
+
+## Shared FOR GRU mailbox (GH-305)
+
+The server's `mailbox` snapshot is the only FOR GRU membership authority.
+Job threads aggregate exact-basis reasons (blocked/error, current review failure,
+PR conflict, machine alerts and live obligations); unbound incidents have their
+own rows. A concluded parent never hides a blocked child. The header separately
+counts **threads**, **incidents**, and source **notifications**. Waiting and
+delegated items remain inspectable with their owner, dependency, recheck,
+control/follow-up references, restrictions and delivery receipt. Source job
+statuses and child reports are never rewritten by mailbox reconciliation.
+
+An absent mailbox means **unavailable**, not guessed eligibility or a clean
+queue. FOR YOU, notification acknowledgements, and other bands keep their
+existing authority. The mailbox is read-only on the board; disclosure does not
+acknowledge or resolve anything.

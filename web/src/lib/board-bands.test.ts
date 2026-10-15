@@ -1,3 +1,4 @@
+import { mailboxFixture } from './mailbox-fixture.test-support.js';
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -11,16 +12,30 @@ import {
   BAND_LABELS,
   JOB_STALLED_AFTER_MS,
   SETTLED_WINDOW_SIZE,
-  bandForJob,
-  bucketJobs,
+  bandForJob as serverBandForJob,
+  bucketJobs as serverBucketJobs,
   isStalledWorking,
   jobRecency,
   liveWorkerStampsByJob,
-  needsYouReasons,
+  needsYouReasons as serverNeedsYouReasons,
   settledWindow,
   stoppedWorkersByJob,
   workerStopLabel,
 } from './board-bands.js';
+
+// These legacy layout cases now explicitly supply mock-server membership.
+function fixtureMembership(jobs: readonly JobView[], unacked?: ReadonlyMap<string, number>) {
+  return new Map(mailboxFixture(jobs, undefined, unacked).items.map((item) => [item.jobId!, item.reasons.map((reason) => reason.label)]));
+}
+function bandForJob(job: JobView, opts: Parameters<typeof serverBandForJob>[1] = {}) {
+  return serverBandForJob(job, { ...opts, mailboxJobs: fixtureMembership([job], opts.unackedByJob) });
+}
+function bucketJobs(jobs: readonly JobView[], opts: Parameters<typeof serverBucketJobs>[1] = {}) {
+  return serverBucketJobs(jobs, { ...opts, mailboxJobs: fixtureMembership(jobs, opts.unackedByJob) });
+}
+function needsYouReasons(job: JobView, unacked: number) {
+  return serverNeedsYouReasons(job, unacked, fixtureMembership([job], new Map([[job.id, unacked]])));
+}
 
 const NOW = new Date(2026, 8, 23, 12, 0, 0).getTime(); // local noon — day-boundary tests stay timezone-robust
 const ISO = (offsetMs: number): string => new Date(NOW + offsetMs).toISOString();

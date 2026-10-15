@@ -198,3 +198,14 @@ export function jobSignal(job: JobView, unackedActionRequired: number): JobSigna
   const tone: JobSignal['tone'] = attention ? 'alert' : round?.status === 'live' ? 'work' : 'park';
   return { label: parts.join(' · '), tone, title: details.join(' · ') };
 }
+
+/** The mailbox lifecycle is authoritative; notification counters remain notification units. */
+export function mailboxSignal(snapshot: BoardSnapshot, jobId: string): JobSignal | null {
+  const item = snapshot.mailbox?.items.find((row) => row.jobId === jobId && row.state !== 'resolved');
+  if (item === undefined) return null;
+  const job = snapshot.repos.flatMap((repo) => repo.jobs).find((row) => row.id === jobId);
+  const review = job === undefined ? null : jobSignal(job, 0);
+  return { label: `${item.state === 'needs-gru' ? 'needs Gru' : item.state} · ${item.owner}${review === null ? '' : ` · ${review.label}`}`,
+    tone: item.state === 'needs-gru' ? 'alert' : 'park',
+    title: `${item.reasons.map((reason) => reason.label).join(' · ')}; owner: ${item.owner}; ${item.disposition?.dependency ?? 'next action owed'}; recheck: ${item.disposition?.recheckAt ?? 'not recorded'}` };
+}

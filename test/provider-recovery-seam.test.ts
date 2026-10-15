@@ -20,6 +20,7 @@ import type {
   SpawnOptions,
 } from '../src/runtime/types.js';
 import type { AgentEventEnvelope } from '../src/runtime/registry.js';
+import { publishSpawnRegistration } from '../src/runtime/spawn-registration.js';
 import { establishProviderWait, ProviderRecoverySensor } from '../src/provider-recovery/sensor.js';
 import { claimProviderRecoveryContinuation } from '../src/provider-recovery/resume.js';
 import { DispatchService } from '../src/dispatch/service.js';
@@ -56,6 +57,8 @@ class FakeHandle implements AgentHandle {
   readonly sessionFile: string | null;
   readonly capabilities = FAKE_CAPABILITIES;
   disposed = false;
+  private cessation: 'ceased' | 'unknown' = 'unknown';
+  readonly cessationEvidence = (): 'ceased' | 'unknown' => this.cessation;
   private readonly listeners = new Set<(event: RuntimeEvent) => void>();
   constructor(role: Role, id: string, sessionFile: string | null) {
     this.role = role;
@@ -74,10 +77,8 @@ class FakeHandle implements AgentHandle {
   readonly prompts: { text: string; owner: string | undefined }[] = [];
   async steer(): Promise<void> {}
   async followUp(): Promise<void> {}
-  readonly pendingTurn = (): PendingTurn | null => ({
-    text: 'the interrupted briefing turn',
-    owner: 'minion-brief',
-  });
+  pendingTurnSnapshot: PendingTurn | null = { text: 'the interrupted briefing turn', owner: 'minion-brief' };
+  readonly pendingTurn = (): PendingTurn | null => this.pendingTurnSnapshot;
   readonly hasLiveProcess = (): boolean => false;
   subscribe(listener: (event: RuntimeEvent) => void): () => void {
     this.listeners.add(listener);
@@ -94,6 +95,7 @@ class FakeHandle implements AgentHandle {
   }
   async dispose(): Promise<void> {
     this.disposed = true;
+    this.cessation = 'ceased';
     this.emit({ type: 'state', state: 'disposed' });
   }
 }
@@ -101,6 +103,8 @@ class FakeHandle implements AgentHandle {
 class FakeRegistry implements SupervisorRegistry {
   private readonly listeners = new Set<(envelope: AgentEventEnvelope) => void>();
   readonly handles = new Map<string, FakeHandle>();
+  private readonly unpublished = new Set<AgentHandle>();
+  private readonly quarantined = new Set<AgentHandle>();
   private next = 0;
   onAgentEvent(listener: (envelope: AgentEventEnvelope) => void): () => void {
     this.listeners.add(listener);
@@ -112,7 +116,11 @@ class FakeRegistry implements SupervisorRegistry {
     for (const listener of this.listeners) listener(envelope);
   }
   getHandle(agentId: string): AgentHandle | null {
-    return this.handles.get(agentId) ?? null;
+    const handle = this.handles.get(agentId);
+    return handle !== undefined && !this.unpublished.has(handle) && !this.quarantined.has(handle) ? handle : null;
+  }
+  quarantineHandle(handle: AgentHandle): void {
+    if (this.handles.get(handle.id) === handle) this.quarantined.add(handle);
   }
   spawns = 0;
   /** Test hook: observe EVERY spawned handle, whichever path spawns it
@@ -124,18 +132,31 @@ class FakeRegistry implements SupervisorRegistry {
     this.spawns += 1;
     const handle = new FakeHandle(role, `agent-${this.next}`, options?.resumeFile ?? null);
     this.handles.set(handle.id, handle);
-    this.emit({ agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'spawned' });
-    this.wireTap(handle, role);
+    this.unpublished.add(handle);
+    let published = false;
+    const buffered: AgentEventEnvelope[] = [];
+    this.wireTap(handle, role, (envelope) => {
+      if (published) this.emit(envelope);
+      else buffered.push(envelope);
+    });
+    publishSpawnRegistration(options ?? {}, handle, () => {
+      published = true;
+      this.unpublished.delete(handle);
+      this.emit({ handle, agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'spawned' });
+      for (const envelope of buffered.splice(0)) this.emit(envelope);
+    });
     this.onSpawn?.(handle);
     return handle;
   }
   /** Mirror the real registry: handle events flow through the tap. */
-  wireTap(handle: FakeHandle, role: Role): void {
+  wireTap(handle: FakeHandle, role: Role, forward: (envelope: AgentEventEnvelope) => void = (envelope) => this.emit(envelope)): void {
     handle.subscribe((event) => {
-      this.emit({ agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'event', event });
+      forward({ handle, agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'event', event });
     });
   }
   async disposeHandle(handle: AgentHandle): Promise<void> {
+    this.unpublished.delete(handle);
+    this.quarantined.delete(handle);
     this.handles.delete(handle.id);
     await handle.dispose();
   }
@@ -170,7 +191,7 @@ class SeamHarness {
   supervisor: Supervisor;
   sensor: ProviderRecoverySensor;
 
-  constructor(pacing: Pick<SupervisorOptions, 'rateLimitBackoff' | 'sleep' | 'jitter'> = {}) {
+  constructor(pacing: Pick<SupervisorOptions, 'rateLimitBackoff' | 'sleep' | 'jitter'> = {}, glmGenerationFallback = false) {
     const dir = mkdtempSync(join(tmpdir(), 'gru-command-pr-seam-'));
     cleanupDirs.push(dir);
     const db = new LedgerDb(dir);
@@ -178,7 +199,7 @@ class SeamHarness {
     this.ledger = new LedgerApi(db.handle, { bus });
     this.notifications = new NotificationCenter({ ledger: this.ledger, bus });
     this.sensor = new ProviderRecoverySensor({
-      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: true },
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: true, glmGenerationFallback },
       ledger: this.ledger,
       probe: this.probe,
       notifications: this.notifications,
@@ -358,6 +379,87 @@ describe('attention surface wiring (acceptance 9)', () => {
 });
 
 describe('supervisor ⇄ sensor seam', () => {
+  async function deferredQuotaContinuation(kind: 'cleared' | 'weak' | 'empty' | 'usable' | 'newer') {
+    const h = new SeamHarness({}, true);
+    const dir = mkdtempSync(join(tmpdir(), 'pr-seam-deferred-'));
+    cleanupDirs.push(dir);
+    const jobId = `deferred-quota-${kind}`;
+    const sessionFile = join(dir, 'session.jsonl');
+    writeFileSync(sessionFile, '{}\n');
+    const exactPrompt = 'exact interrupted investigation body, not the job briefing';
+    h.ledger.addJob({ id: jobId, repo: 'fixture', title: 'Deferred quota', briefing: 'approved contract briefing' });
+    h.ledger.setJobStatus(jobId, 'working');
+    const original = new FakeHandle('minion', `original-${kind}`, sessionFile);
+    original.pendingTurnSnapshot = { text: exactPrompt, owner: 'dispatch:exact-turn' };
+    h.registry.handles.set(original.id, original);
+    h.registry.wireTap(original, 'minion');
+    h.registry.emit({ handle: original, agentId: original.id, role: 'minion', sessionFile, phase: 'spawned' });
+    h.ledger.registerAgent({ id: original.id, role: 'minion', jobId, sessionFile });
+    const quota = { type: 'error', error: '429: {"error":{"code":"1302","message":"usage window limit reached"}}',
+      fatal: false, provider: 'zai-coding-cn', model: 'glm-5.3',
+      typed: { origin: 'provider-message', status: 429, bodyCode: '1302' } } as const;
+    let replacement: FakeHandle | null = null;
+    h.registry.onSpawn = (handle) => {
+      replacement = handle;
+      handle.promptHook = () => {
+        handle.pendingTurnSnapshot = { text: exactPrompt, owner: 'dispatch:exact-turn' };
+        handle.emit({ type: 'turn_start' });
+        handle.emit(quota);
+        handle.pendingTurnSnapshot = kind === 'empty' ? { text: '', owner: null }
+          : kind === 'usable' ? { text: 'usable current native prompt', owner: 'current-turn' } : null;
+        if (kind !== 'weak') handle.emit({ type: 'turn_end' });
+        if (kind === 'newer') {
+          handle.emit({ type: 'turn_start' });
+          handle.emit(quota);
+          handle.emit({ type: 'turn_end' });
+        }
+        throw new Error(quota.error);
+      };
+    };
+    try {
+      original.emit({ type: 'turn_start' });
+      original.emit({ type: 'error', error: 'original transport died', fatal: true });
+      await vi.waitFor(() => expect(h.ledger.listProviderWaits({ status: 'waiting' })).toHaveLength(1));
+      const wait = h.ledger.listProviderWaits({ status: 'waiting' })[0]!;
+      expect(replacement).not.toBeNull();
+      expect(h.ownershipChecks).toHaveLength(1);
+      if (kind === 'newer') expect(wait.continuation).toMatchObject({ promptText: null, promptOwner: null });
+      else expect(wait.continuation).toEqual({ promptText: kind === 'usable' ? 'usable current native prompt' : exactPrompt,
+        promptOwner: kind === 'usable' ? 'current-turn' : 'dispatch:exact-turn', hadOpenTurn: kind !== 'usable' });
+      if (kind === 'newer') expect(h.ownershipChecks[0]?.continuation?.promptText ?? null).toBeNull();
+      else expect(h.ownershipChecks[0]?.continuation).toEqual(wait.continuation);
+      expect(h.ledger.listNotifications({ routing: 'needs-owner' })).toEqual([]);
+      const worktrees = new InMemoryWorktreePort(join(dir, 'worktrees'));
+      await worktrees.createJobWorktree({ repoPath: dir, jobId });
+      h.probe.outcome = { kind: 'completed', evidence: { provider: 'zai-coding-cn', model: 'glm-5.3',
+        stopReason: 'stop', outputTokens: 1, totalTokens: 4, responseId: `response-${kind}`, responseModel: 'glm-5.3',
+        completedAt: '2026-09-28T10:05:00Z' } };
+      await h.sensor.tick();
+      expect(h.ledger.getProviderWait(wait.id)?.status).toBe('recovered-pending');
+      h.registry.onSpawn = (handle) => { handle.pendingTurnSnapshot = null; handle.promptHook = () => { handle.emit({ type: 'turn_start' }); }; };
+      const result = await claimProviderRecoveryContinuation({ registry: h.registry, ledger: h.ledger, worktrees }, wait.id, 'silas');
+      expect(result).toMatchObject({ outcome: 'continued', path: 'resumed' });
+      if (result.outcome !== 'continued') throw new Error(`claim failed: ${JSON.stringify(result)}`);
+      const continued = h.registry.handles.get(result.minionId)!;
+      expect(continued.prompts).toHaveLength(1);
+      if (kind === 'newer') {
+        expect(continued.prompts[0]?.text).not.toContain(exactPrompt);
+        expect(continued.prompts[0]?.text).toContain('approved contract briefing');
+      } else {
+        expect(continued.prompts[0]?.text).toContain(kind === 'usable' ? 'usable current native prompt' : exactPrompt);
+        expect(continued.prompts[0]?.text).not.toContain('approved contract briefing');
+      }
+      expect(h.ledger.getProviderWait(wait.id)?.status).toBe('claimed');
+      expect(h.ledger.listJobEvents(jobId, { limit: 100 }).filter((event) => event.kind === 'provider.continuation-admitted')).toHaveLength(1);
+    } finally { h.supervisor.dispose(); }
+  }
+
+  it('persists the deferred typed-wall canonical prompt after pendingTurn clears and actually claims it (GH-280 residual R11)', () => deferredQuotaContinuation('cleared'));
+  it('does not replace deferred canonical continuation with a weak same-turn recapture (GH-280 residual R11)', () => deferredQuotaContinuation('weak'));
+  it('does not let an empty recapture erase usable canonical continuation (GH-280 residual R11)', () => deferredQuotaContinuation('empty'));
+  it('prefers usable current same-turn capture over deferred canonical continuation (GH-280 residual R11)', () => deferredQuotaContinuation('usable'));
+  it('never borrows the previous prompt for a newer prompt-less native quota turn (GH-280 residual R11)', () => deferredQuotaContinuation('newer'));
+
   it('a structured GLM quota wall stop becomes an explicit provider wait — machine-owned BEFORE any owner stop', async () => {
     const h = new SeamHarness();
     const handle = await h.runMinionIntoQuotaWall('job-seam-1');
@@ -554,7 +656,7 @@ class DispatchSeamHarness {
     const bus = new EventBus();
     this.ledger = new LedgerApi(db.handle, { bus });
     this.notifications = new NotificationCenter({ ledger: this.ledger, bus });
-    this.worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'pr-dispatch-seam-wt-')));
+    this.worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'pr-dispatch-seam-wt-')), this.ledger);
     cleanupDirs.push(this.worktrees.root);
     this.repoPath = mkdtempSync(join(tmpdir(), 'pr-dispatch-seam-repo-'));
     cleanupDirs.push(this.repoPath);

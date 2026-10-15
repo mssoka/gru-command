@@ -1,18 +1,23 @@
+import { captureCwdHandoff } from '../worktrees/handoff.js';
 import { RUNTIME_IDS, resolveSpawnPolicy, type Role, type RuntimeId } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { GrowthReport, SessionStore } from '../sessions/store.js';
 import type { ModelRuntime } from '@earendil-works/pi-coding-agent';
-import { PiRuntime } from './pi-adapter.js';
+import { PiRuntime, normalizeSessionPath } from './pi-adapter.js';
 import { ClaudeCodeRuntime } from './claude-adapter.js';
 import type { ClaudeReviewSnapshot } from './claude-review-settings.js';
 import { isStreamingState, withFallbacks } from './fallbacks.js';
-import type { AgentHandle, AgentRuntime, ManagedSkillSet, RuntimeEvent, SpawnOptions } from './types.js';
+import type { AgentHandle, AgentRuntime, ManagedSkillSet, ManagedWorkflowSession, RuntimeEvent, SpawnOptions } from './types.js';
+import { adapterCessationEvidence } from './types.js';
 import { ROLE_DEFINITIONS } from '../roles.js';
-import { createBmadRuntimeBinder } from '../bmad/runtime.js';
-import { join } from 'node:path';
+import { createWorkflowSessionBinder } from '../workflows/session.js';
+import type { WorktreeLane } from '../dispatch/worktree-port.js';
 import { ResidentBudget } from './resident-budget.js';
 import type { ResidencySnapshot } from './residency-observations.js';
 import { WorkerDisposalInProgressError } from './worker-errors.js';
+import { disposePhases, type DisposableTarget } from './disposal.js';
+import { publishSpawnRegistration } from './spawn-registration.js';
+import { notifyDisposalSettlement } from './disposal-observation.js';
 
 export { WorkerDisposalInProgressError };
 
@@ -43,6 +48,11 @@ export interface RuntimeStatus {
   readonly activeSessions: number;
   /** Per-adapter health — a 'down' adapter flips liveness.healthy false. */
   readonly adapters: readonly { readonly id: string; readonly state: string }[];
+}
+
+interface ResidentClaim {
+  readonly release: () => void;
+  state: 'idle' | 'spawning' | 'owned' | 'released';
 }
 
 /** pi-adapter-only knobs (test seams) — kept out of the agnostic surface. */
@@ -102,17 +112,24 @@ export interface RuntimeRegistryOptions {
    * real binder; omitted = no managed runtime (unit tests).
    */
   readonly bmadRuntime?: (cwd: string) => ManagedSkillSet;
+  /** Production GC-owned selection with an explicit registered assignment. */
+  readonly workflowRuntime?: (options: SpawnOptions) => ManagedWorkflowSession;
 }
 
-/**
- * The service's registry options (main.ts): the base options plus the
- * issue #283 binder that gives build-workflow sessions the GC-managed BMAD
- * runtime of their job lane, materialized under `<dataDir>/bmad-runtime`.
- */
+/** New jobs use GC-owned resources; retained historical bindings keep their bytes.
+ * The caller supplies ledger/registry authority, never a directory-name guess. */
 export function serviceRegistryOptions(
-  base: Pick<RuntimeRegistryOptions, 'config' | 'store' | 'log'> & { readonly config: { readonly dataDir: string } },
+  base: Pick<RuntimeRegistryOptions, 'config' | 'store' | 'log'> & {
+    readonly config: { readonly dataDir: string };
+    readonly workflowLaneFor: (options: SpawnOptions) => WorktreeLane | null;
+    readonly workflowBuildFor?: (lane: WorktreeLane) => boolean;
+    readonly workflowAgentFor?: (options: SpawnOptions) => string | undefined;
+    /** Loaded instance config path for the verification helper next action. */
+    readonly verificationConfigFile?: string;
+  },
 ): RuntimeRegistryOptions {
-  return { ...base, bmadRuntime: createBmadRuntimeBinder(join(base.config.dataDir, 'bmad-runtime')) };
+  const { workflowLaneFor, workflowBuildFor, workflowAgentFor, verificationConfigFile, ...options } = base;
+  return { ...options, workflowRuntime: createWorkflowSessionBinder(base.config.dataDir, workflowLaneFor, undefined, workflowBuildFor, workflowAgentFor, verificationConfigFile) };
 }
 
 /**
@@ -122,6 +139,8 @@ export function serviceRegistryOptions(
  * at tap time (null before the file exists).
  */
 export interface AgentEventEnvelope {
+  /** In-process provenance only; never persisted or serialized as event data. */
+  readonly handle?: AgentHandle;
   readonly agentId: string;
   readonly role: Role;
   readonly sessionFile: string | null;
@@ -167,6 +186,8 @@ export class RuntimeRegistry {
   private readonly adapters = new Map<RuntimeId, AgentRuntime>();
   private readonly nativeAdapters = new Map<RuntimeId, PiRuntime | ClaudeCodeRuntime>();
   private readonly handles = new Set<AgentHandle>();
+  private readonly unpublished = new Set<AgentHandle>();
+  private readonly quarantined = new Set<AgentHandle>();
   private readonly ceasedReviewOwners = new Map<string, string>();
 
   /** Pi isolated review tools and host-native callbacks run inside this
@@ -201,6 +222,7 @@ export class RuntimeRegistry {
    * was PROVEN released so it can re-register demand even after a wake
    * refusal (Perkins r3 blocker 4). */
   private readonly residentReleaseListeners = new Set<() => void>();
+  private readonly residentClaims = new WeakMap<() => void, ResidentClaim>();
 
   constructor(opts: RuntimeRegistryOptions) {
     this.opts = opts;
@@ -220,10 +242,11 @@ export class RuntimeRegistry {
       queued: this.residents.queued,
       reclaimFailures: this.residents.reclaimFailureCount,
       handles: [...this.handles].map((handle) => {
-        const health = handle.health();
+        let state = 'unknown';
+        try { state = handle.health().state ?? 'unknown'; } catch { /* retain unknown resident truth */ }
         return {
           agentId: handle.id, role: handle.role,
-          sessionFile: handle.sessionFile ?? null, state: health.state,
+          sessionFile: handle.sessionFile ?? null, state,
         };
       }),
     };
@@ -335,12 +358,15 @@ export class RuntimeRegistry {
   }
 
   async spawn(role: Role, options: SpawnOptions = {}): Promise<AgentHandle> {
+    const assertHandoff = captureCwdHandoff(options.cwd);
     const release = RESIDENT_EXEMPT_ROLES.has(role)
       ? null : await this.residents.acquire(1, options.signal);
+    let owned = false;
     try {
-      return await this.spawnReserved(role, options, release);
+      assertHandoff();
+      return await this.spawnReserved(role, options, release, () => { owned = true; }, assertHandoff);
     } catch (error) {
-      release?.();
+      if (!owned) release?.();
       throw error;
     }
   }
@@ -349,20 +375,32 @@ export class RuntimeRegistry {
    * FIFO pool `spawn` charges), then spawn against THAT permit — a child
    * admission can no longer race a probe's free-seat observation. */
   async reserveResident(signal?: AbortSignal): Promise<() => void> {
-    return this.residents.acquire(1, signal);
+    const raw = await this.residents.acquire(1, signal);
+    const claim: ResidentClaim = { release: raw, state: 'idle' };
+    const release = (): void => {
+      if (claim.state !== 'idle') return; // in-flight or transferred: only owned settlement may release
+      claim.state = 'released'; raw();
+    };
+    this.residentClaims.set(release, claim);
+    return release;
   }
 
   /** Spawn a session on an already-held resident permit (never charges a
-   * second one). On failure the permit is released. */
+   * second one). Pre-resident failure releases it; owned failures retain proof-aware custody. */
   async spawnWithResident(
     role: Role,
     options: SpawnOptions,
     release: () => void,
   ): Promise<AgentHandle> {
+    const claim = this.residentClaims.get(release);
+    if (claim === undefined) throw new Error('resident reservation is not owned by this registry');
+    if (claim.state !== 'idle') throw new Error('resident reservation is already claimed or released');
+    claim.state = 'spawning';
     try {
-      return await this.spawnReserved(role, options, release);
+      const assertHandoff = captureCwdHandoff(options.cwd);
+      return await this.spawnReserved(role, options, claim.release, () => { claim.state = 'owned'; }, assertHandoff);
     } catch (error) {
-      release();
+      if (claim.state === 'spawning') { claim.state = 'released'; claim.release(); }
       throw error;
     }
   }
@@ -394,24 +432,12 @@ export class RuntimeRegistry {
       /token|secret|password|api[_-]?key|authorization|bearer|basic\s/iu.test(String(error))
         ? 'credential-shaped'
         : 'rejected';
-    /** Probe evidence: explicit false only; missing/undefined/non-boolean/
-     * throwing = unknown. Returns 'false' | 'unknown'. */
-    const probeEvidence = (handle: AgentHandle, probe: keyof AgentHandle): 'false' | 'unknown' => {
-      try {
-        const method = handle[probe] as unknown as (() => unknown) | undefined;
-        if (typeof method !== 'function') return 'unknown';
-        return method.call(handle) === false ? 'false' : 'unknown';
-      } catch { return 'unknown'; }
-    };
-    /** Adapter-owned cessation proof — NO fulfillment shortcut over
-     * contrary/unknown facts (terminal health, or settled dispose AND
-     * explicit-false process/compaction evidence). */
-    const isProvenCeased = (handle: AgentHandle, disposeSettled: boolean): boolean => {
-      if (handle.health().state === 'disposed') return true;
-      return disposeSettled === true &&
-        probeEvidence(handle, 'hasLiveProcess') === 'false' &&
-        probeEvidence(handle, 'isCompacting') === 'false';
-    };
+    /** Adapter-owned cessation proof (Option A, F60-P1): ONLY the adapter's
+     * own 'ceased' evidence proves a member stopped. Terminal health, dispose
+     * fulfillment/rejection settlement, lock release and native retirement are
+     * never proof; a missing/throwing/UNKNOWN answer leaves the member debt. */
+    const isProvenCeased = (handle: AgentHandle): boolean =>
+      adapterCessationEvidence(handle) === 'ceased';
     const everyMemberProven = (): boolean =>
       [...pairMembers].every((handle) => proofOutcomes.get(handle.id) === 'proved');
     /** THE single release edge for the pair: closed, no in-flight pair
@@ -430,30 +456,29 @@ export class RuntimeRegistry {
     const markDebt = (agentId: string): void => {
       proofOutcomes.set(agentId, 'debt');
     };
-    /** Owned disposal of ONE member: contained on every path; fulfillment
-     * alone is never cessation when probes are unknown/contrary. */
+    /** Owned disposal of ONE member: contained on every path; settlement
+     * alone is never cessation — only the adapter's own evidence proves it. */
     const ownedDispose = async (handle: AgentHandle): Promise<void> => {
-      let disposeSettled = false;
       try {
         await handle.dispose();
-        disposeSettled = true;
       } catch (error) {
-        // A rejected disposal may still prove cessation via terminal
-        // health; otherwise the member stays counted debt. Contained.
+        // Contained: attributed, but a rejected (or fulfilled) disposal is
+        // never proof. The member stays counted debt unless the adapter
+        // attests 'ceased' below.
         disposalFailures.push({ agentId: handle.id, reason: reasonCode(error) });
       }
-      if (isProvenCeased(handle, disposeSettled)) {
+      if (isProvenCeased(handle)) {
         prove(handle.id);
       } else {
         markDebt(handle.id);
       }
     };
-    /** Bounded, idempotent reconciliation (health truth only) — the debt
-     * path's production consumer is the registry 'disposed'-event
-     * traversal (no watcher/timer). */
+    /** Bounded, idempotent reconciliation (adapter evidence only) — the debt
+     * path's production consumer is the registry 'disposed'-event traversal
+     * (no watcher/timer). */
     const reconcile = (): void => {
       for (const handle of [...pairMembers]) {
-        if (proofOutcomes.get(handle.id) === 'debt' && isProvenCeased(handle, false)) prove(handle.id);
+        if (proofOutcomes.get(handle.id) === 'debt' && isProvenCeased(handle)) prove(handle.id);
       }
       releasePairIfProven();
     };
@@ -461,6 +486,7 @@ export class RuntimeRegistry {
 
     const spawn = async (options: SpawnOptions): Promise<AgentHandle> => {
       if (closed) throw new Error('review reservation is closed');
+      const assertHandoff = captureCwdHandoff(options.cwd);
       const lead = options.reviewLead !== undefined;
       if (lead && leading) throw new Error('review reservation already has a lead');
       if (lead) leading = true;
@@ -475,7 +501,20 @@ export class RuntimeRegistry {
       const spare = release;
       const isPairSlot = spare === null;
       if (isPairSlot) pairPending += 1;
-      const operation = this.spawnReserved('perkins', options, spare);
+      const ownership: { handle: AgentHandle | null } = { handle: null };
+      const operation = this.spawnReserved('perkins', options, spare, (handle) => {
+        ownership.handle = handle;
+        (isPairSlot ? pairMembers : extraMembers).add(handle);
+        handle.subscribe((event) => {
+          if (event.type === 'state' && event.state === 'disposed') {
+            if (isProvenCeased(handle)) {
+              prove(handle.id);
+              if (!lead && isPairSlot) childRunning = false;
+            }
+            if (closed) reconcile();
+          }
+        });
+      }, assertHandoff);
       spawnPromises.add(operation);
       // Track in-flight settlements for close. The derived chain MUST swallow
       // its rejection: the failed spawn is already owned by the awaiting
@@ -484,40 +523,37 @@ export class RuntimeRegistry {
       // the service through the process-level unhandledRejection handler.
       void operation.finally(() => { spawnPromises.delete(operation); }).catch(() => {});
       // Owned late-settlement observer (attached at spawn time): post-close
-      // resolution enters owned disposal; rejection is adapter-owned
-      // no-admission (positive unused) for pair slots.
+      // resolution enters owned disposal; rejection without an owned resident is
+      // no-admission; post-adapter refusal retains its tracked member.
       void operation.then(
         (handle) => {
           (isPairSlot ? pairMembers : extraMembers).add(handle);
           if (closed) void ownedDispose(handle).then(() => releasePairIfProven(), () => {});
         },
         () => {
-          // Adapter-owned no-admission: a rejected in-flight spawn created
-          // no resident; for a pair slot this is positive unused capacity
-          // and may be the last release blocker.
+          // Actual post-adapter residents were tracked before rejection.
+          // Only a genuine no-resident failure is positive unused capacity.
           if (closed) releasePairIfProven();
         },
       );
       try {
         const handle = await operation;
         (isPairSlot ? pairMembers : extraMembers).add(handle);
-        handle.subscribe((event) => {
-          if (event.type === 'state' && event.state === 'disposed') {
-            if (!lead && isPairSlot) childRunning = false;
-            // OPEN-round retirement is membership-only: nothing releases
-            // while the round is live. CLOSING: event drives reconciliation.
-            if (closed) reconcile();
-          }
-        });
         return handle;
       } catch (error) {
-        if (lead) leading = false;
-        else if (isPairSlot) childRunning = false;
-        spare?.(); // an unconsumed extra permit returns to the round
+        if (ownership.handle === null) {
+          if (lead) leading = false;
+          else if (isPairSlot) childRunning = false;
+          spare?.(); // genuine pre-adapter/no-resident failure only
+        } else if (isProvenCeased(ownership.handle)) {
+          prove(ownership.handle.id);
+          if (lead) leading = false;
+          else if (isPairSlot) childRunning = false;
+        } else markDebt(ownership.handle.id);
         throw error;
       } finally {
         // In-flight ends on BOTH paths: success promotes to membership
-        // (proof pending), rejection leaves positive unused capacity.
+        // (proof pending); owned rejections retain membership/debt.
         if (isPairSlot) pairPending -= 1;
         if (closed) releasePairIfProven();
       }
@@ -606,7 +642,8 @@ export class RuntimeRegistry {
     return managed;
   }
 
-  private async spawnReserved(role: Role, options: SpawnOptions, release: (() => void) | null): Promise<AgentHandle> {
+  private async spawnReserved(role: Role, options: SpawnOptions, release: (() => void) | null,
+    onOwned?: (handle: AgentHandle) => void, beforeSpawn?: () => void): Promise<AgentHandle> {
     if (options.signal?.aborted) throw new Error('resident admission cancelled before spawn');
     if (options.reviewOwnerGeneration !== undefined &&
       ((options.reviewLead ?? options.isolatedReview) === undefined || !validReviewOwnerGeneration(options.reviewOwnerGeneration))) {
@@ -632,12 +669,30 @@ export class RuntimeRegistry {
         : {},
     );
     const thinkingLevel = applyThinkingFallback(adapter, policy.thinkingLevel, this.log);
-    const managedSkills = this.managedSkillsFor(role, options);
+    // Assignment lookup must see the same canonical URI/tilde path that both
+    // adapters lock/open, otherwise a legitimate recorded resume looks unowned.
+    const workflowOptions = options.resumeFile === undefined ? options
+      : { ...options, resumeFile: normalizeSessionPath(options.resumeFile) };
+    const workflowSession = this.opts.workflowRuntime !== undefined && ROLE_DEFINITIONS[role].managedBmadRuntime &&
+      (options.reviewLead ?? options.isolatedReview) === undefined
+      ? this.opts.workflowRuntime(workflowOptions) : undefined;
+    const managedSkills = workflowSession !== undefined ? workflowSession.managedSkills : this.managedSkillsFor(role, options);
+    const cwd = workflowSession?.cwd ?? options.cwd;
+    if (managedSkills !== undefined) this.log('info', 'managed workflow bound', {
+      role, cwd, runtime: managedSkills.runtimeId, content_sha256: managedSkills.contentSha256,
+      artifact_root: managedSkills.workflow?.context.artifactRoot ?? null,
+    });
+    const assertHandoff = options.cwd === undefined ? captureCwdHandoff(cwd) : beforeSpawn ?? captureCwdHandoff(cwd);
+    assertHandoff();
     const handle = await adapter.spawn(role, {
       ...(options.resumeFile !== undefined ? { resumeFile: options.resumeFile } : {}),
-      ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
-      ...(options.agentId !== undefined ? { agentId: options.agentId } : {}),
+      ...(options.directiveRecoveryProducer !== undefined ? { directiveRecoveryProducer: options.directiveRecoveryProducer } : {}),
+      ...(cwd !== undefined ? { cwd } : {}),
+      ...((workflowSession?.agentId ?? options.agentId) !== undefined ? { agentId: workflowSession?.agentId ?? options.agentId } : {}),
       ...(options.roleTools !== undefined ? { roleTools: options.roleTools } : {}),
+      ...((workflowSession?.workerVerification ?? options.workerVerification) !== undefined &&
+        (options.reviewLead ?? options.isolatedReview) === undefined
+        ? { workerVerification: workflowSession?.workerVerification ?? options.workerVerification } : {}),
       ...(options.isolatedReview !== undefined ? { isolatedReview: options.isolatedReview } : {}),
       ...(options.reviewLead !== undefined ? { reviewLead: options.reviewLead } : {}),
       ...(options.reviewModel !== undefined ? { reviewModel: options.reviewModel } : {}),
@@ -651,6 +706,7 @@ export class RuntimeRegistry {
     let disposing: Promise<void> | null = null;
     let disposingNow = false;
     let released = false;
+    let publicationFailure: { readonly error: unknown } | null = null;
     const releaseHandle = (): void => {
       if (released) return;
       released = true;
@@ -662,6 +718,8 @@ export class RuntimeRegistry {
         // Missing or failing adapter evidence remains unknown.
       }
       this.handles.delete(resident);
+      this.unpublished.delete(resident);
+      this.quarantined.delete(resident);
       this.residents.unwatch(resident);
       release?.();
       // AFTER the permit is actually released: notify capacity consumers
@@ -683,32 +741,28 @@ export class RuntimeRegistry {
         if (property === 'dispose') return (): Promise<void> => {
           if (disposing !== null) return disposing;
           disposingNow = true;
-          // Cessation proof, not fulfillment: release requires terminal
-          // 'disposed' health, OR a settled dispose PLUS explicit-false
-          // process/compaction evidence. Unknown/contrary probes retain
-          // the permit (visible debt) — no shortcut over live facts.
-          const ceased = (): boolean => {
-            if (target.health().state === 'disposed') return true;
-            const probe = (probeFn: unknown): 'false' | 'unknown' => {
-              if (typeof probeFn !== 'function') return 'unknown';
-              try { return (probeFn as () => unknown).call(target) === false ? 'false' : 'unknown'; } catch { return 'unknown'; }
-            };
-            return probe(target.hasLiveProcess) === 'false' && probe(target.isCompacting) === 'false';
-          };
+          // Cessation proof, not fulfillment (Option A, F60-P1): the permit is
+          // released ONLY when the adapter itself attests 'ceased'. Terminal
+          // 'disposed' health, a settled or rejected dispose, lock release and
+          // native retirement are never proof — missing/throwing/UNKNOWN
+          // evidence keeps the slot owned as visible debt, reconciled later by
+          // the adapter-evidence event path below if a late positive arrives.
           disposing = Promise.resolve().then(() => target.dispose()).then(
-            () => { if (ceased()) releaseHandle(); },
+            () => {
+              notifyDisposalSettlement(resident, true);
+              if (adapterCessationEvidence(target) === 'ceased') releaseHandle();
+            },
             (error: unknown) => {
-              // A rejected disposal still proves cessation when terminal
-              // health says so; otherwise the slot stays owned/debt.
-              if (target.health().state === 'disposed') releaseHandle();
+              if (adapterCessationEvidence(target) === 'ceased') releaseHandle();
               disposing = null;
               disposingNow = false;
+              notifyDisposalSettlement(resident, false);
               throw error;
             },
           );
           return disposing;
         };
-        if (['prompt', 'steer', 'followUp', 'promptWithVerdict', 'compact'].includes(String(property))) {
+        if (['prompt', 'steer', 'followUp', 'promptWithVerdict', 'compact', 'resumeDirective'].includes(String(property))) {
           if (wrappers.has(String(property))) return wrappers.get(String(property));
           const tracked = String(property);
           const method = Reflect.get(target, property) as ((...args: unknown[]) => Promise<unknown>) | undefined;
@@ -716,19 +770,21 @@ export class RuntimeRegistry {
             // Per-turn evidence is an OPTIONAL capability (r6 architecture):
             // absence means "no attestation", not an adapter defect — callers
             // check for it. Required methods still fail loud.
-            if (tracked === 'promptWithVerdict') return undefined;
+            if (tracked === 'promptWithVerdict' || tracked === 'resumeDirective') return undefined;
             throw new Error(
               `resident handle was asked for "${String(property)}" but its runtime adapter does not implement it`,
             );
           }
           const wrapper = (...args: unknown[]) => {
             if (disposingNow || released) return Promise.reject(new WorkerDisposalInProgressError());
+            if (publicationFailure !== null) return Promise.reject(publicationFailure.error);
             pending += 1;
             budget.changed();
             // Invoke SYNCHRONOUSLY: adapter wrappers (e.g. the claude
             // fallback queue) emit their `queued` events inside the call,
             // and callers observe them immediately after it returns.
             try {
+              assertHandoff();
               const operation = method.apply(target, args);
               return Promise.resolve(operation).finally(() => {
                 pending -= 1;
@@ -768,9 +824,44 @@ export class RuntimeRegistry {
         this.reclaimProbe(handle.id),
       );
     }
-    // E6 event tap: surface spawn/dispose + forward every runtime event to
-    // registry-level subscribers (the board engine's feed).
-    this.emitAgentEvent({ agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'spawned' });
+    // An owned recovery result is invisible to dispatch lookups and EVERY
+    // tap consumer until its owner grants publication. Capacity/cessation
+    // tracking remains live while publication is held, including cleanup.
+    this.unpublished.add(resident);
+    let published = false;
+    let publishing = false;
+    const buffered: AgentEventEnvelope[] = [];
+    const duringPublication: AgentEventEnvelope[] = [];
+    const forward = (envelope: AgentEventEnvelope): void => {
+      if (publicationFailure !== null) return;
+      if (publishing) duringPublication.push(envelope);
+      else if (published) this.emitAgentEvent(envelope);
+      else buffered.push(envelope);
+    };
+    const publish = (): void => {
+      if (publicationFailure !== null) throw publicationFailure.error;
+      if (published || publishing) return;
+      try {
+        if (released || !this.handles.has(resident)) throw new WorkerDisposalInProgressError();
+        assertHandoff();
+        publishing = true;
+        published = true;
+        this.unpublished.delete(resident);
+        this.emitAgentEvent({ handle: resident, agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'spawned' });
+        assertHandoff();
+        publishing = false;
+        // Preserve healthy observer-event ordering, but never forward any
+        // pending event until the post-listener custody proof succeeds.
+        for (const envelope of [...duringPublication.splice(0), ...buffered.splice(0)]) this.emitAgentEvent(envelope);
+      } catch (error) {
+        publicationFailure = { error };
+        published = false;
+        if (this.handles.has(resident)) this.unpublished.add(resident);
+        buffered.length = 0;
+        duringPublication.length = 0;
+        throw error; // delayed Supervisor retries see the same terminal refusal
+      } finally { publishing = false; }
+    };
     // Self-healing membership: a handle disposed by ANY caller leaves the
     // registry set — the status surface must never contradict itself.
     // Registered FIRST (before the emit tap below) so the disposed event
@@ -779,12 +870,19 @@ export class RuntimeRegistry {
     // reconsider pass) must read the budget AFTER the release, or it can
     // see a full pool, exit, and never receive another trigger.
     handle.subscribe((event) => {
-      if (event.type === 'state' && event.state === 'disposed' && !disposingNow) {
-        releaseHandle();
+      // Ownership release is adapter-evidence-only (Option A, F60-P1). A
+      // disposed state OR a late positive cessation event releases the permit
+      // only when the adapter itself attests 'ceased'; metadata never does.
+      if (
+        (event.type === 'state' && event.state === 'disposed' && !disposingNow) ||
+        (event.type === 'cessation_evidence' && event.evidence === 'ceased')
+      ) {
+        if (adapterCessationEvidence(handle) === 'ceased') releaseHandle();
       }
     });
     handle.subscribe((event) => {
-      this.emitAgentEvent({
+      forward({
+        handle: resident,
         agentId: handle.id,
         role,
         sessionFile: handle.sessionFile,
@@ -792,7 +890,7 @@ export class RuntimeRegistry {
         event,
       });
       if (event.type === 'state' && event.state === 'disposed') {
-        this.emitAgentEvent({ agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'disposed' });
+        forward({ handle: resident, agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'disposed' });
         // REAL production traversal: the existing handle-event flow drives
         // registered cleanup-debt reconcilers (no watcher/timer). Observer
         // failure is contained; shutdown stops traversal without clearing
@@ -807,6 +905,17 @@ export class RuntimeRegistry {
         this.residents.changed();
       }
     });
+    onOwned?.(resident);
+    try {
+      assertHandoff();
+      publishSpawnRegistration(options, resident, publish);
+      assertHandoff();
+    } catch (error) {
+      try { await resident.dispose(); } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], `${String(error)}; resident cleanup unconfirmed — capacity retained`);
+      }
+      throw error;
+    }
     return resident;
   }
 
@@ -817,9 +926,18 @@ export class RuntimeRegistry {
   /** Live handle by agent id (E7 supervision feed), or null. */
   getHandle(agentId: string): AgentHandle | null {
     for (const handle of this.handles) {
-      if (handle.id === agentId) return handle;
+      if (handle.id === agentId && !this.unpublished.has(handle) && !this.quarantined.has(handle)) return handle;
     }
     return null;
+  }
+
+  /** Revoke lookup eligibility for a handle its owner rejected: a quarantined
+   * handle is no longer returned by getHandle, so no dispatch/consumer path
+   * can hand a supervisor-refused producer new work while its cleanup is
+   * outstanding (issue #280 AC1). The quarantine is monotonic — disposal, or
+   * registry shutdown, drops the record (and the quarantined handle with it). */
+  quarantineHandle(handle: AgentHandle): void {
+    if (this.handles.has(handle)) this.quarantined.add(handle);
   }
 
   /** The shared offline pi ModelRuntime for read-only consumers (the
@@ -874,9 +992,35 @@ export class RuntimeRegistry {
 
   async dispose(): Promise<void> {
     this.residents.shutdown();
-    for (const handle of [...this.handles]) await this.disposeHandle(handle);
-    for (const adapter of this.adapters.values()) await adapter.dispose();
-    this.adapters.clear();
+    // Contain every handle AND adapter (issue #341) in TWO ordered, internally
+    // concurrent phases. A plain sequential await aborts on the first
+    // CessationIdleTimeoutError, leaving the remaining handles locked and the
+    // adapters' bridges/sockets never torn down; and starting both kinds at
+    // once lets a native adapter snapshot the same underlying handles before
+    // their resident wrappers retire them, re-attributing one handle's
+    // timeout as an adapter-only failure.
+    //
+    // Phase 1 starts every resident handle's disposal concurrently and waits
+    // for ALL of them. Phase 2 then starts every adapter concurrently EVEN IF
+    // phase 1 failed: by then each underlying handle has retired from the
+    // adapter's own set, so the adapter phase does not duplicate the same
+    // failure. disposePhases combines the attributed causes of both phases
+    // (resident ids first, adapter ids second) and reports them once.
+    // Handles go through disposeHandle to preserve the override seam.
+    const residentTargets: DisposableTarget[] = [...this.handles].map((handle) => ({
+      id: handle.id,
+      dispose: (): Promise<void> => this.disposeHandle(handle),
+    }));
+    const adapterTargets: DisposableTarget[] = [...this.adapters.values()].map((adapter) => ({
+      id: adapter.id,
+      dispose: (): Promise<void> => adapter.dispose(),
+    }));
+    try {
+      await disposePhases([residentTargets, adapterTargets]);
+    } finally {
+      this.adapters.clear();
+    }
+    this.quarantined.clear();
   }
 }
 

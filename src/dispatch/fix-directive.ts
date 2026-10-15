@@ -1,4 +1,6 @@
+import { capturePortLaneHandoff } from '../worktrees/handoff.js';
 import { randomUUID } from 'node:crypto';
+import { isHostPropertyRepairDirective, type PropertyRepairDirective } from '../property/pipeline.js';
 import type { Role } from '../config.js';
 import type { LedgerApi } from '../ledger/api.js';
 import { isJobTerminal } from '../ledger/states.js';
@@ -11,8 +13,10 @@ import { appendWorkerRules, WORKER_RULE_BLOCKS } from './worker-rules.js';
 import { withRevisionContinuation } from './work-revision.js';
 import { resolveGitCommit } from './perkins-review/artifacts.js';
 import { promptVerdictFromHealth, promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
-import type { PromptTurnVerdict } from '../runtime/types.js';
+import type { PromptOptions, PromptTurnVerdict } from '../runtime/types.js';
 import type { WorktreePort } from './worktree-port.js';
+import { readGitState } from '../verify/scheduler.js';
+import { readDirectiveSessionHeader } from '../runtime/directive-checkpoint.js';
 import { settleRetries, type PacingGate, type PacingLease, type RetrySettlement } from '../runtime/pacing.js';
 
 /**
@@ -23,21 +27,35 @@ import { settleRetries, type PacingGate, type PacingLease, type RetrySettlement 
  * between them.
  */
 
+/** Bind property repair to the SAME job/minion routing, pacing, cancellation
+ * and single-writer rules as ordinary fix directives. Only the host campaign
+ * can issue these inputs; caller-authored repair stories are not evidence. */
+export function createPropertyFixDirectiveSink(deps: DirectiveRoutingDeps, jobId: string, signal: AbortSignal, receipt?: (delivery: Awaited<ReturnType<typeof routeFixDirectiveToMinion>>) => void): (directive: PropertyRepairDirective) => Promise<void> {
+  const consumed = new WeakSet<PropertyRepairDirective>();
+  return async (directive) => {
+    if (!isHostPropertyRepairDirective(directive) || consumed.has(directive)) throw new Error('property repair refused: unissued, changed or already delivered directive');
+    consumed.add(directive);
+    const result = await routeFixDirectiveToMinion({ ...deps, jobId, signal, directive: directive.text, owner: 'property-contract-repair', contract: 'effectiveContract' in deps.ledger ? (deps.ledger as LedgerApi).effectiveContract(jobId)?.text ?? null : null });
+    receipt?.(result);
+    if (!result.delivered || result.outcome === 'error') throw new Error(`property repair directive did not complete: ${result.error ?? result.note ?? 'no delivery proof'}`);
+  };
+}
+
 /** The product-owned identity + GC-mediated child tools for a
- * (re)dispatched parent session (issue #161). A resumed row keeps its id
- * (one logical worker, one identity); a fresh replacement mints one. */
+ * (re)dispatched parent session (issue #161). A fresh physical session
+ * still belongs to its recorded logical minion; only a job without an
+ * implementer record mints an identity. */
 function parentIdentitySpawnOptions(
   input: {
     readonly parentTools?: (agentId: string) => readonly NativeAgentTool[];
-    readonly ledger: Pick<LedgerApi, 'listAgents'>;
+    readonly ledger: Pick<LedgerApi, 'listImplementerMinions'>;
   },
+  jobId: string,
   resumeFile: string | null,
 ): Pick<SpawnOptions, 'agentId' | 'nativeTools'> {
-  const resumed =
-    resumeFile === null
-      ? undefined
-      : input.ledger.listAgents().find((agent) => agent.sessionFile === resumeFile);
-  const agentId = resumed?.id ?? `minion_${randomUUID()}`;
+  const implementers = input.ledger.listImplementerMinions(jobId);
+  const original = implementers.find((agent) => resumeFile !== null && agent.sessionFile === resumeFile) ?? implementers[0];
+  const agentId = original?.id ?? `minion_${randomUUID()}`;
   const nativeTools = input.parentTools?.(agentId) ?? [];
   return {
     agentId,
@@ -75,6 +93,13 @@ export interface DirectiveRoutingDeps {
    * only for 'none'/'recovered'; the worker lease is released before the
    * wait so the retry can reacquire admission. Absent = no interlock. */
   readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
+  /** Issue #339: observe a directive-continued blind reviewer session so a
+   * prohibited read during the continuation invalidates blind coverage
+   * exactly like the dispatch, re-brief and restart-recovery settle seams.
+   * Forwarded by the caller (the production observer is read-only and owns its
+   * own error boundary); absent = no observation (non-review directives,
+   * tests). */
+  readonly observeBlindTurn?: (jobId: string, sessionFile: string | null) => void;
 }
 
 function verdictFields(verdict: PromptTurnVerdict): { readonly outcome: 'completed' | 'error'; readonly error?: string } {
@@ -83,11 +108,31 @@ function verdictFields(verdict: PromptTurnVerdict): { readonly outcome: 'complet
     : { outcome: 'error', error: verdict.error ?? 'runtime settled the turn with an in-band error' };
 }
 
-function assertDirectiveJobActive(ledger: Pick<LedgerApi, 'getJob'>, jobId: string): void {
+/** A ledger the directive admission can re-check. `hasUnsettledVerificationRun`
+ * is used when the ledger exposes it (the real LedgerApi does); a narrow
+ * fake omits it and the check is skipped.
+ *
+ * Issue #243 F-H3: this is called at EVERY post-wait boundary (after the
+ * pacing acquire, around spawn/resume, and immediately before the prompt) —
+ * an initial check before the waits cannot see a verification that took
+ * ownership of the lane while the producer queued. */
+type DirectiveAdmissionLedger = Pick<LedgerApi, 'getJob'> &
+  Partial<Pick<LedgerApi, 'hasUnsettledVerificationRun'>>;
+
+function assertDirectiveJobActive(ledger: DirectiveAdmissionLedger, jobId: string): void {
   const job = ledger.getJob(jobId);
   if (job === null || isJobTerminal(job.status)) {
     throw new Error(`directive refused — job "${jobId}" is ${job?.status ?? 'missing'}`);
   }
+  if (ledger.hasUnsettledVerificationRun?.(jobId) === true) {
+    throw new Error(`directive refused — a verification run owns lane "${jobId}"`);
+  }
+}
+
+/** Positive routing proof: this invocation stopped at a guard before any
+ * native spawn, preparation, prompt or cleanup operation was attempted. */
+export class DirectiveDispatchDeferredError extends Error {
+  constructor(readonly original: unknown) { super(`pre-native directive deferred: ${String(original)}`); this.name = 'DirectiveDispatchDeferredError'; }
 }
 
 /** Route a directive to the implementing minion: the live job minion
@@ -99,6 +144,11 @@ export async function routeFixDirectiveToMinion(
     signal: AbortSignal;
     /** Prompt owner tag (audit); defaults to the shared routing owner. */
     owner?: string;
+    readonly directiveTurn?: PromptOptions['directive'];
+    readonly beforeTurnSideEffect?: (handle?: AgentHandle) => void;
+    readonly onPrepared?: (handle: AgentHandle) => void;
+    readonly onCleanup?: (handle: AgentHandle) => void;
+    readonly freshSession?: boolean;
     /** The job's effective contract (original briefing plus every accepted
      * amendment): what a FRESH fallback minion is briefed with. Absent =
      * the original briefing (no amendment surface at the caller). */
@@ -107,6 +157,11 @@ export async function routeFixDirectiveToMinion(
      * resumed session gets `block` (the canonical bodies); a fresh session
      * already reads them in the effective contract and gets `freshNote`. */
     continuation?: { readonly block: string; readonly freshNote: string };
+    /** Issue #243 F-H2: re-prove the family/basis coverage identity at every
+     * post-wait admission boundary (after the pacing acquire, around
+     * spawn/resume, immediately before the prompt). A hold that arrives while
+     * the producer queues must refuse BEFORE any durable/prompt effect. */
+    beforeWriterSideEffect?: () => void;
   },
 ): Promise<{
   delivered: boolean;
@@ -125,7 +180,30 @@ export async function routeFixDirectiveToMinion(
    * single-writer guard on this evidence alone. */
   admission?: 'none' | 'unknown';
 }> {
+  const disposeAndRecord = async (handle: AgentHandle, viaRegistry = false): Promise<void> => {
+    const failures: unknown[] = [];
+    try { await (viaRegistry ? input.registry.disposeHandle(handle) : handle.dispose()); } catch (error) { failures.push(error); }
+    try { input.onCleanup?.(handle); } catch (error) { failures.push(error); }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) throw new AggregateError(failures, `directive cleanup failed: ${failures.map(String).join('; ')}`);
+  };
   const owner = input.owner ?? 'fix-directive';
+  const assignedLane = input.worktrees.listWorktrees({ jobId: input.jobId }).find((lane) => lane.kind === 'job' && lane.status !== 'swept');
+  const assertHandoff = assignedLane === undefined ? () => {} : capturePortLaneHandoff(input.worktrees, assignedLane);
+  let nativeAttempted = false;
+  let priorCleanupPending = false;
+  const guard = (handle?: AgentHandle): void => {
+    try { input.beforeTurnSideEffect?.(handle); }
+    catch (error) {
+      if (input.directiveTurn !== undefined && !nativeAttempted && !priorCleanupPending) throw new DirectiveDispatchDeferredError(error);
+      throw error;
+    }
+  };
+  let minions = input.ledger.listImplementerMinions(input.jobId)
+    .filter((agent) => agent.parentage !== 'child');
+  // Operation-boundary guards below still fence every cleanup, spawn,
+  // preparation and prompt. A structural no-route result attempts none:
+  // it may settle truthful no-effect history without a branch/effect grant.
   // Follow-up turns carry the CURRENT worker rule blocks too (PR creation
   // and the no-call-budget contract): legacy briefing wording must not
   // outrank them on the live/resumed paths.
@@ -136,16 +214,33 @@ export async function routeFixDirectiveToMinion(
     ),
   );
   const directive = compose(input.continuation?.block ?? '');
-  const minions = input.ledger
-    .listImplementerMinions(input.jobId)
-    // Defense-in-depth for issue #161's writer rule (the ledger pick
-    // already excludes children): a tracked child is never the primary
-    // lane worker even if a future writer lets one into the table shape.
-    .filter((agent) => agent.parentage !== 'child');
+  if (input.freshSession === true) {
+    for (const minion of minions) {
+      const prior = input.registry.getHandle(minion.id);
+      if (prior === null) continue;
+      guard();
+      priorCleanupPending = true;
+      await disposeAndRecord(prior, true);
+      if (prior.cessationEvidence?.() !== 'ceased') throw new Error(`prior minion ${prior.id} retains unproven producer ownership — rebrief refused`);
+      priorCleanupPending = false; // positive prior cessation is not this request's native attempt
+      guard();
+    }
+    minions = [];
+  }
+  // Observe the actual physical continuation, never its cancellation race.
+  const observe = (sessionFile: string | null): void =>
+    input.observeBlindTurn?.(input.jobId, sessionFile);
   let evictedSessionFile: string | null = null;
+  // Every post-wait boundary runs the caller's coverage re-proof first, then
+  // the ledger's own terminality/verification admission check (F-H2/F-H3).
+  const assertAdmissible = (): void => {
+    input.beforeWriterSideEffect?.();
+    assertDirectiveJobActive(input.ledger, input.jobId);
+  };
   for (const minion of minions) {
     const handle = input.registry.getHandle(minion.id);
     if (handle !== null) {
+      guard(); // before even the owned prior retry/pacing awaits
       // Active-incident attribution (B1): if an automatic retry is already
       // covering this handle, wait for its settlement BEFORE prompting.
       // Otherwise the new directive and the retry would deliver overlapping
@@ -153,6 +248,7 @@ export async function routeFixDirectiveToMinion(
       // the other turn's outcome. Await before taking the worker slot — the
       // retry re-acquires its own slot and must not be blocked by ours.
       const pending = await settleRetries(input.retrySettlement, handle.id, input.signal);
+      guard();
       if (pending === 'cancelled') return { delivered: false, note: 'review operation aborted', admission: 'none' };
       let lease: PacingLease | null = null;
       if (input.workerGate !== undefined) {
@@ -165,13 +261,22 @@ export async function routeFixDirectiveToMinion(
       }
       let promptError: unknown = null;
       let verdict: PromptTurnVerdict | null = null;
+      let observation: Promise<void> = Promise.resolve();
       try {
         // A refusal before prompt is positive no-admission proof, not a
         // prompt error eligible for retry recovery. It must still release
         // the pacing lease acquired after the asynchronous wait above.
-        assertDirectiveJobActive(input.ledger, input.jobId);
+        assertHandoff();
+        assertAdmissible();
+        assertHandoff(); // reprove custody before the physical prompt starts
+        guard();
+        nativeAttempted = true;
+        input.onPrepared?.(handle);
+        const run = runObservedPrompt(handle, directive, input.signal, owner, () =>
+          observe(handle.sessionFile), input.directiveTurn);
+        observation = run.observation;
         try {
-          verdict = await racedPrompt(handle, directive, input.signal, owner);
+          verdict = await run.verdict;
         } catch (error) {
           promptError = error;
         }
@@ -180,6 +285,11 @@ export async function routeFixDirectiveToMinion(
         lease?.release();
         lease = null;
       }
+      // Issue #339 (D1 physical tail): observe the ACTUAL started prompt's
+      // session before any disposition branch. Cancellation returns the race
+      // first while the physical prompt is still running, and a directive turn
+      // has no automatic retry to heal a prohibited read appended afterwards.
+      if (!input.signal.aborted) await observation;
       if (promptError instanceof WorkerDisposalInProgressError) {
         // A resident-budget reclaim may be disposing this handle under us
         // (typed handshake): settle any automatic retry covering it BEFORE
@@ -234,6 +344,7 @@ export async function routeFixDirectiveToMinion(
   if (lane === undefined) {
     return { delivered: false, note: 'no implementing minion session and no job lane', admission: 'none' };
   }
+  guard(); // lane exists: pin original branch before pacing/spawn awaits
   let lease: PacingLease | null = null;
   if (input.workerGate !== undefined) {
     lease = await input.workerGate.acquireWorkerTurn({
@@ -244,6 +355,8 @@ export async function routeFixDirectiveToMinion(
     });
   }
   let handle: AgentHandle | null = null;
+  let registrationFailed = false;
+  const route = async (): Promise<Awaited<ReturnType<typeof routeFixDirectiveToMinion>>> => {
   try {
     // Prefer the CURRENT failing logical session; only when the evicted
     // handle exposed none fall back to the newest session-bearing record —
@@ -253,41 +366,50 @@ export async function routeFixDirectiveToMinion(
       : null;
     const resumeFile = evictedSessionFile ?? fallback;
     // Issue #161: the (re)dispatched parent keeps one product-owned id
-    // (the resumed row's id, else a fresh one) and receives the GC-mediated
+    // (its recorded row's id, even without a transcript) and receives the
     // child tools bound to it — re-briefed parents stay able to commission.
-    const identity = parentIdentitySpawnOptions(input, resumeFile);
+    const identity = parentIdentitySpawnOptions(input, input.jobId, resumeFile);
     // A brand-new session (nothing to resume) has no memory of the contract:
     // brief it with the effective contract like the resume fallback below
     // (owner rule 4) — when the caller supplied one.
     const freshPrompt = (contract: string): string =>
       `Fresh minion re-brief for job ${input.jobId}. Effective contract (original briefing plus accepted amendments):\n${contract}\n\nCurrent fix directive:\n${compose(input.continuation?.freshNote ?? '')}`;
-    let prompt = resumeFile === null && input.contract != null ? freshPrompt(input.contract) : directive;
+    let prompt = resumeFile === null && input.contract != null && input.freshSession !== true ? freshPrompt(input.contract) : directive;
     try {
-      assertDirectiveJobActive(input.ledger, input.jobId);
+      assertHandoff();
+      assertAdmissible();
+      guard();
+      nativeAttempted = true; // a rejected spawn is still uncertain, never a deferral
       handle = await input.registry.spawn('minion', {
         cwd: lane.path, signal: input.signal,
         ...(resumeFile !== null ? { resumeFile } : {}),
         ...identity,
       });
     } catch (error) {
-      if (resumeFile === null || input.signal.aborted) throw error;
+      if (resumeFile === null || input.signal.aborted || input.directiveTurn !== undefined) throw error;
       const job = input.ledger.getJob(input.jobId);
       const contract = input.contract ?? job?.briefing ?? null;
       if (job == null || contract == null) {
         throw new Error(`cannot resume prior minion session for job ${input.jobId} and no original briefing is available to re-brief: ${String(error)}`);
       }
-      assertDirectiveJobActive(input.ledger, input.jobId);
+      assertHandoff();
+      assertAdmissible();
+      guard();
+      nativeAttempted = true;
       handle = await input.registry.spawn('minion', { cwd: lane.path, signal: input.signal, ...identity });
       // A fresh session has no memory of accepted amendments: brief it with
       // the EFFECTIVE contract (original + amendments), never the original
       // alone (owner rule 4).
       prompt = freshPrompt(contract);
     }
-    assertDirectiveJobActive(input.ledger, input.jobId);
+    assertAdmissible();
+    guard();
     let promptError: unknown = null;
     let verdict: PromptTurnVerdict | null = null;
     const spawnedHandle = handle;
     try {
+      assertHandoff();
+      assertDirectiveJobActive(input.ledger, input.jobId);
       // A fresh fallback minion (the resume attempt failed) is top-level;
       // a resumed row keeps its recorded parentage (never retro-fitted).
       input.ledger.registerAgent({
@@ -297,29 +419,35 @@ export async function routeFixDirectiveToMinion(
         sessionFile: handle.sessionFile,
         ...(input.ledger.getAgent(spawnedHandle.id) === null ? { parentage: 'top-level' as const } : {}),
       });
+      assertHandoff();
+      assertDirectiveJobActive(input.ledger, input.jobId);
     } catch (error) {
-      // A registration failure leaves the spawned handle ownerless — an
-      // unbound live worker must never survive the failed directive
-      // setup. Dispose it loudly, preserving the actionable registration
-      // error (mirrors the re-brief setup path's failure ladder).
-      await input.registry.disposeHandle(spawnedHandle).catch((disposeError: unknown) => {
-        throw new Error(
-          `could not dispose the unregistered minion ${spawnedHandle.id} after a failed directive registration: ${String(disposeError)}`,
-          { cause: error },
-        );
-      });
-      throw error;
+      registrationFailed = true;
+      throw error; // the single cleanup owner below preserves registration AND cleanup failures
     }
-    assertDirectiveJobActive(input.ledger, input.jobId);
+    assertAdmissible();
+    guard(handle);
+    nativeAttempted = true;
+    input.onPrepared?.(handle);
+    const continuationSessionFile = handle.sessionFile;
+    let observation: Promise<void> = Promise.resolve();
     try {
-      verdict = await racedPrompt(handle, prompt, input.signal, owner);
-    } catch (error) {
-      promptError = error;
+      const run = runObservedPrompt(handle, prompt, input.signal, owner, () =>
+        observe(continuationSessionFile), input.directiveTurn);
+      observation = run.observation;
+      try {
+        verdict = await run.verdict;
+      } catch (error) {
+        promptError = error;
+      }
     } finally {
       // Release before the settlement wait: the retry reacquires the slot.
       lease?.release();
       lease = null;
     }
+    // Issue #339 (D1 physical tail): observe the ACTUAL started prompt's
+    // session before any disposition branch (see the live path above).
+    if (!input.signal.aborted) await observation;
     const disposition = await settleRetries(input.retrySettlement, handle.id, input.signal);
     if (disposition === 'cancelled') {
       // The prompt call already ran on the fresh minion: UNKNOWN admission.
@@ -344,30 +472,68 @@ export async function routeFixDirectiveToMinion(
         ? ({ ok: true, error: null } as const)
         : (verdict ?? promptVerdictFromHealth(handle));
     return { delivered: true, minionId: handle.id, ...verdictFields(evidence) };
-  } finally {
-    lease?.release();
-    if (handle !== null) await handle.dispose();
+  } finally { lease?.release(); }
+  };
+  const failures: unknown[] = [];
+  let result: Awaited<ReturnType<typeof routeFixDirectiveToMinion>> | undefined;
+  try { result = await route(); } catch (error) { failures.push(error); }
+  const owned = handle as AgentHandle | null;
+  if (owned !== null) {
+    try { await disposeAndRecord(owned, registrationFailed); } catch (error) { failures.push(error); }
   }
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) throw new AggregateError(failures, `directive routing/cleanup failed: ${failures.map(String).join('; ')}`);
+  if (result === undefined) throw new Error('directive routing settled without result or failure');
+  return result;
 }
 
-/** Race a prompt against cancellation so shutdown cannot stall on an
- * in-flight fix-directive turn, carrying the settled turn's captured
- * terminal verdict through the race. */
-function racedPrompt(
+/**
+ * Run ONE directive continuation prompt and hand the caller both the raced
+ * verdict (cancellation returns promptly) and the OBSERVATION lifetime of the
+ * ACTUAL started prompt (issue #339 D1 physical tail).
+ *
+ * The naive race of the real prompt against cancellation has no
+ * physical-completion observer: an abort returns promptly with admission
+ * UNKNOWN while the real prompt keeps running, and a directive turn has no
+ * automatic retry to heal a prohibited read it appends afterwards. The
+ * observation therefore follows the PHYSICAL prompt promise, not the race /
+ * logical disposition: it fires whether the prompt resolves, rejects, is
+ * superseded, or is still running after an abort.
+ *
+ * A pre-aborted call starts NO prompt and observes nothing (never a fabricated
+ * started-turn observation). The returned `observation` never rejects (the
+ * observer port owns its own error boundary), so awaiting it is safe and
+ * never introduces an unhandled rejection.
+ */
+function runObservedPrompt(
   handle: Pick<AgentHandle, 'prompt' | 'health'> & Partial<Pick<AgentHandle, 'promptWithVerdict'>>,
   text: string,
   signal: AbortSignal,
   owner: string,
-): Promise<PromptTurnVerdict> {
-  if (signal.aborted) return Promise.reject(new Error('review operation aborted'));
-  return Promise.race([
-    promptWithTerminalVerdict(handle, text, { owner }),
-    new Promise<never>((_resolve, reject) => {
-      signal.addEventListener('abort', () => reject(new Error('review operation aborted')), { once: true });
-    }),
-  ]);
+  observe: () => void,
+  directive?: PromptOptions['directive'],
+): { readonly verdict: Promise<PromptTurnVerdict>; readonly observation: Promise<void> } {
+  if (signal.aborted) {
+    return { verdict: Promise.reject(new Error('review operation aborted')), observation: Promise.resolve() };
+  }
+  const physical = promptWithTerminalVerdict(handle, text, { owner, ...(directive !== undefined ? { directive } : {}) });
+  const observation = physical.then(
+    () => observe(),
+    () => observe(),
+  ).then(
+    () => undefined,
+    () => undefined,
+  );
+  return {
+    verdict: Promise.race([
+      physical,
+      new Promise<never>((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(new Error('review operation aborted')), { once: true });
+      }),
+    ]),
+    observation,
+  };
 }
-
 /**
  * The follow-up delivery signal (the loop's close, not a blind re-fire):
  * a settled directive or re-brief minion turn IS the implementing minion's
@@ -404,15 +570,47 @@ export function recordFollowUpDelivery(input: {
    * no revision. Review admission compares it against the job's required
    * revision (owner rule 2). */
   readonly workRevision: number;
+  /** Correlation for a genuinely completed historical request's lost delivery. */
+  readonly rebriefMarker?: { readonly id: string; readonly payloadHash: string };
+  /** Exact native historical completion: null explicitly means unproven HEAD. */
+  readonly nativeCompletion?: { readonly sha: string | null; readonly provenance: unknown };
 }): { readonly sha: string | null; readonly lanePath: string | null; readonly note: string | null; readonly eventSeq: number } {
   if (!Number.isSafeInteger(input.workRevision) || input.workRevision < 0) {
     throw new Error(`delivery work revision must be a non-negative integer, got ${String(input.workRevision)}`);
   }
   const jobLanes = input.worktrees.listWorktrees({ jobId: input.jobId }).filter((lane) => lane.kind === 'job');
-  const lane = jobLanes.find((candidate) => candidate.status !== 'swept') ?? jobLanes[0];
+  const liveJobLanes = jobLanes.filter((candidate) => candidate.status !== 'swept');
+  const lane = liveJobLanes[0] ?? jobLanes[0];
   let sha: string | null = null;
   let note: string | null = null;
-  if (lane !== undefined) {
+  let candidateDeliveryProven = false;
+  if (input.nativeCompletion !== undefined) {
+    if (!(input.nativeCompletion.sha === null || typeof input.nativeCompletion.sha === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(input.nativeCompletion.sha))) throw new Error('original native completion HEAD must be an exact 40/64 hex object ID or null');
+    sha = input.nativeCompletion.sha;
+    if (sha === null) note = 'original native completion HEAD unproven; current candidate delivery/verification/review remain owed';
+    else if (liveJobLanes.length !== 1 || lane === undefined) note = 'original native completion is preserved, but no unique live job lane proves it is the current candidate';
+    else {
+      const original = typeof input.nativeCompletion.provenance === 'object' && input.nativeCompletion.provenance !== null
+        ? input.nativeCompletion.provenance as { readonly binding?: { readonly sessionFile?: unknown; readonly sessionId?: unknown; readonly agentId?: unknown } } : null;
+      const binding = original?.binding;
+      if (typeof binding?.sessionFile !== 'string' || !binding.sessionFile || typeof binding.sessionId !== 'string' || !binding.sessionId || binding.agentId !== input.agentId) {
+        note = 'original native session/cwd/lane identity is unproven; original completion is preserved but current candidate gates remain owed';
+      } else {
+        try {
+          const header = readDirectiveSessionHeader(binding.sessionFile);
+          if (header.type !== 'session' || header.id !== binding.sessionId || header.cwd !== lane.path) {
+            note = 'original native session cwd does not match the current live job lane; original completion is preserved but current candidate gates remain owed';
+          } else {
+            const current = readGitState(lane.path, { includeUntracked: true });
+            if (current.sha !== sha || current.trackedDirty) note = 'original native completion is preserved, but the live job lane HEAD moved, its tracked tree is dirty, or untracked inputs are present; current candidate delivery/verification/review remain owed';
+            else candidateDeliveryProven = true;
+          }
+        } catch (error) {
+          note = `original native session cwd/lane cannot be verified: ${String(error)}; original completion is preserved but current candidate gates remain owed`;
+        }
+      }
+    }
+  } else if (lane !== undefined) {
     try {
       sha = resolveGitCommit(lane.path, lane.branch !== null && lane.branch !== '' ? lane.branch : 'HEAD');
     } catch (error) {
@@ -432,15 +630,17 @@ export function recordFollowUpDelivery(input: {
       sha,
       ...(input.requestId !== undefined ? { request_id: input.requestId } : {}),
       ...(input.phaseId !== undefined ? { phase_id: input.phaseId } : {}),
+      ...(input.rebriefMarker === undefined ? {} : { marker_id: input.rebriefMarker.id, payload_hash: input.rebriefMarker.payloadHash }),
       work_revision: input.workRevision,
+      ...(input.nativeCompletion === undefined ? {} : { native_completion: input.nativeCompletion.provenance, candidate_delivery_proven: candidateDeliveryProven }),
     },
   });
-  // Issue #220: the report handback's commissioner obligation. A failure
-  // here must never un-record the delivery — the obligation has its own
-  // recovery (the backfill CLI and the deterministic pass read the same
-  // rows) — but it is logged loud, never swallowed silently.
+  // Native completion is published before modern ledger settlement. Only
+  // that exact independently qualified candidate sequence may open report
+  // duty, so native handback belongs to recordDirectiveDelivery's transaction.
+  // Preserve ordinary nonnative report compatibility and its loud retry note.
   const job = input.ledger.getJob(input.jobId);
-  if (job !== null && job.deliverable !== null && job.deliverable !== 'pr') {
+  if (input.nativeCompletion === undefined && job !== null && job.deliverable !== null && job.deliverable !== 'pr') {
     try {
       const opened = input.ledger.openReportObligation({ jobId: input.jobId, observedAtSeq: event.seq });
       if (opened.created) {
@@ -538,6 +738,14 @@ export async function rebriefFreshMinion(
     /** Recheck request ownership and terminality at the last asynchronous
      * admission boundaries; a running prompt is allowed to settle. */
     beforeTurnSideEffect?: () => void;
+    /** Issue #339: observe the settled continuation session's tool access so
+     * a prohibited read during a resume/re-brief invalidates blind coverage
+     * exactly like one at the first briefing. Runs on EVERY post-settlement
+     * exit (the in-band-error return, the successful return, AND the
+     * cancelled/exhausted/superseded failure exits). The observer owns its
+     * own error handling (a bookkeeping failure must not fail a turn); absent
+     * = no observation (non-review re-briefs, tests). */
+    observeBlindTurn?: (jobId: string, sessionFile: string | null) => void;
   },
 ): Promise<{
   minionId: string;
@@ -556,6 +764,7 @@ export async function rebriefFreshMinion(
   if (lane === undefined) {
     throw new Error(`job "${input.jobId}" has no active job lane — a re-brief needs its worktree`);
   }
+  const assertHandoff = capturePortLaneHandoff(input.worktrees, lane);
   const cwd = requireSpawnCwd('minion', lane.path);
   let lease: PacingLease | null = null;
   if (input.workerGate !== undefined) {
@@ -567,6 +776,7 @@ export async function rebriefFreshMinion(
     });
   }
   try {
+    assertHandoff();
     input.beforeTurnSideEffect?.();
     // Retirement/re-brief retires the WRITER sessions only — an active
     // child worker is not the job's minion lane (#161), and review-only
@@ -581,13 +791,16 @@ export async function rebriefFreshMinion(
           `could not retire the prior minion session ${minion.id} before re-briefing: ${String(error)}`,
         );
       });
+      assertHandoff();
       input.beforeTurnSideEffect?.();
     }
+    assertHandoff();
     input.beforeTurnSideEffect?.();
     // Issue #161: a fresh/resumed re-brief parent keeps a product-owned id
-    // (the resumed row's id, else a fresh one) plus the child tools.
+    // (its recorded row's id, even without a transcript) plus child tools.
     const identity = parentIdentitySpawnOptions(
       input,
+      input.jobId,
       input.resumeFile !== undefined && input.resumeFile !== null ? input.resumeFile : null,
     );
     const handle = await input.registry.spawn('minion', {
@@ -597,6 +810,7 @@ export async function rebriefFreshMinion(
     });
     let prompt: string;
     try {
+      assertHandoff();
       input.beforeTurnSideEffect?.();
       // A FRESH re-brief session (no prior row) is explicitly top-level;
       // a resumed row keeps its recorded parentage (never retro-fitted).
@@ -620,6 +834,7 @@ export async function rebriefFreshMinion(
       // registerAgent publishes agent.spawned after COMMIT. A subscriber
       // can close the job or replace this request before the prompt; no
       // await may separate this last fence from prompt delivery.
+      assertHandoff();
       input.beforeTurnSideEffect?.();
     } catch (error) {
       try {
@@ -649,7 +864,32 @@ export async function rebriefFreshMinion(
     // rate-limited turn whose bounded retry is still carrying the prompt
     // must not land the re-brief/delivery markers early, and a rejection
     // whose retry recovers is a delivery, not a failure.
-    const disposition = await settleRetries(input.retrySettlement, handle.id, input.signal);
+    let disposition: RetrySettlement | 'cancelled' = 'none';
+    const abandonedSettlements: Promise<void>[] = [];
+    try {
+      disposition = await settleRetries(input.retrySettlement, handle.id, input.signal, (abandoned) => {
+        abandonedSettlements.push(abandoned);
+      });
+    } finally {
+      // Issue #339: observe the settled continuation turn's own tool results
+      // at THIS settle seam on EVERY post-settlement exit — including the
+      // failure exits below AND a settlement-hook fault (a named
+      // RetrySettlementUnavailableError propagates only after this runs).
+      // Running it before the cancelled/exhausted/superseded throws keeps a
+      // failed continuation from leaving unscanned prohibited reads behind
+      // (only a future successful resume would otherwise heal it).
+      // `handle.sessionFile` is the resumed session (the whole file,
+      // cumulative), read-only with respect to the review inputs. The
+      // observer owns its error handling (a bookkeeping failure must not fail
+      // a delivered turn).
+      input.observeBlindTurn?.(input.jobId, handle.sessionFile);
+      for (const abandoned of abandonedSettlements) {
+        // Issue #339: cancellation won the race before the retry turn
+        // settled; it can still append prohibited reads AFTER the scan just
+        // above, so chain a FINAL observation onto the abandoned settlement.
+        void abandoned.then(() => input.observeBlindTurn?.(input.jobId, handle.sessionFile));
+      }
+    }
     if (disposition === 'cancelled') {
       throw new Error(`re-brief turn on ${handle.id} was cancelled before its automatic retries settled`);
     }

@@ -217,7 +217,15 @@ latest revision → verify → fresh review. The service enforces it centrally.
   admitted the corrected work, later ordinary deliveries keep today's behavior (no
   verification may be in flight). This debt is a busy fact, so owner `force` may override
   it; it never overrides a pending revision. A pass re-offers a review request that was
-  waiting on it.
+  waiting on it. An active `dismissed` decision for `verification-failure` on
+  `job:<id>`, bound to the exact `verification-failure:<scope>@<run_id>` basis,
+  retires that run's repair attention only. Independent scopes retain their own
+  exact dispositions, but a newer ANY-basis `verification-failure` decision fences
+  older exact dismissals; an ANY-basis dismissal cannot retire a specific run.
+  Cleared or expired exact decisions and newer failures reopen repair.
+  When no unresolved same-head repair remains, the full Silas digest still offers
+  `verificationsOwed`. Dismissal never rewrites FAILED receipts or grants review:
+  the unchanged corrective-verification gate remains until eligible proof exists.
 - **Supersession.** Accepting a material amendment supersedes any review that owns the lane.
   A queued round is withdrawn, or a running round and its specialists are cancelled.
   `round.superseded` is recorded first, with the settled specialist checkpoints. Partial
@@ -346,5 +354,61 @@ or amendments to an existing PR:
 3. For PR165-style renamed-skill corrections, append the approved amendment
    with its real provenance reference, then freeze a new round.
 4. Existing pending source/control records are never replaced; re-arm only
-   through the supported endpoints above. Merges, restarts and deployments
-   stay owner-held.
+   through the supported endpoints above. Final PR merges, restarts and
+   deployments stay owner-held.
+
+## 7. Blind-review input isolation (issue #316)
+
+A clean checkout and a reproducible diff are not proof that a blind reviewer
+stayed blind. Root cause of the repeated invalid rounds: the child's briefing was
+free-form text the parent composed from its ORIGINAL contract; commissioning
+never consulted the parent's EFFECTIVE contract (amendments, administrative
+clarifications included), never inspected the input the child would receive, and
+report settlement (`delivered`/`done`, disposition `acted`) was the only
+lifecycle fact — so a settled report read as independent coverage.
+
+`POST /api/dispatch` with `deliverable: "review"` now carries:
+
+- `review_role`: `"blind"` (isolated input) or `"claims"` (a reviewer that
+  legitimately needs claims, a separate contract). Omitted: a lane titled
+  `blind` is blind, anything else stays unclassified and untouched (historical
+  bindings unchanged).
+- `input_package`: `{base_sha, target_sha, diff?: {text, sha256?},
+  files?: [{path, content, sha256?, blob_sha?}]}`. Validated BEFORE any job row,
+  worktree or reviewer exists. Refused with `422 blind_input_refused`, the
+  exhaustive violations (never the private text) and a correction path when it
+  names private job material (`_bmad-output/**`, `docs/issues/**`,
+  `investigations/**`, `.gru-command/{jobs,reports,reviews,artifacts,journal}/**`,
+  plus anything the parent excludes), carries task-spec / prior-assessment /
+  deferred-work / triage text in a document-like file (extensionless or
+  `.md`/`.markdown`/`.txt`/`.rst`/`.adoc`), or embedded in a larger such document
+  (structure-anchored). Other file types are not content-scanned: they are
+  judged by path only, and a source line merely mentioning a planning path is
+  not exposure. It is also refused when it mismatches its declared digests or git
+  blob ids, or targets another sha. An unfiltered diff is judged per file section.
+- `parent_contract_sha256`: the parent contract hash the package was built
+  against. A stale hash answers `409 stale_parent_contract` with the current hash.
+
+The parent's effective rule comes from `blind-isolation:` lines in its briefing
+or any still-effective amendment: `exclude <glob>`, `permit <path>` (lifts an
+exclusion for versioned `.toml/.json/.yaml/.yml` config only, never private job
+material) and `require-package`. A malformed directive fails loud.
+
+A valid package records `review.blind-input-admitted` with the rule digest, the
+parent contract version/hash and package provenance (base/target sha, per-file
+sha256 and git blob id, diff digest and paths). A refusal records
+`review.blind-input-refused`.
+
+**Validity is not settlement.** `GET /api/dispatch/jobs/<id>/blind-coverage`
+answers `qualifying | invalidated | unattested | not-blind | unclassified`,
+derived only from the admission and `review.blind-access-observed` facts. The
+reviewer's session tool results are scanned at turn settle (grep lines landing
+in excluded paths, paged reads returning history-bearing text), and
+`POST /api/dispatch/blind-access {job_id, tool_results:[{tool_name?, text}]}`
+records a LATER read. Any prohibited observation makes the coverage
+`invalidated`; the report, its findings, its status and its disposition are left
+exactly as recorded (no replay, no debt revival). A blind commission for a target
+whose blind coverage is already `qualifying` under the same parent answers
+`409 blind_coverage_owned` naming the job to reuse; invalidated coverage may be
+replaced and the new admission lists what it replaces.
+

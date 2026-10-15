@@ -6,6 +6,7 @@ import type { SilasConfig } from '../config.js';
 import type { EventBus } from '../events/bus.js';
 import type {
   AgentRecord,
+  DecisionRecord,
   DirectiveRequestRecord,
   EventRecord,
   JobRecord,
@@ -20,7 +21,7 @@ import { isJobTerminal, type TerminalJobStatus } from '../ledger/states.js';
 import type { LogLevel } from '../logger.js';
 import { DECISION_SURFACE_SAME_BLOCKER, fileOfLocation, sameBlockerDecisionRequest } from '../decisions/questions.js';
 import type { DecisionService } from '../decisions/types.js';
-import { openAttemptStartSeq, pendingWorkRevision } from './branch-idle.js';
+import { jobStatusEventAtSeq, openAttemptStartSeq, pendingWorkRevision } from './branch-idle.js';
 import type { JobAmendmentRecord, WorkRevisionState } from '../review-inputs/amendments.js';
 import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
 import type { AgentSupervisionView } from '../supervision/supervisor.js';
@@ -48,8 +49,9 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  *   0 disables) observes tracked branches through authenticated `gh api`
  *   (POLL-ONLY — the webhook route is descoped) and mechanically applies
  *   the GitHub state-change mappings: a merged PR closes its lane, a
- *   conflicting PR cascades an action-required notification, CI failure
- *   posts a tiered notification with the run URL, CI green records the
+ *   conflicting PR cascades an fyi notification (mechanical tier — Silas
+ *   coordinates the conflict integration); CI failure posts a tiered
+ *   notification with the run URL; CI green records the
  *   review-gate signal event. Dedupe is by observed state-change; the tier
  *   ladder and the wake kinds are unchanged.
  * - Concurrency follows the decisions runtime's one-slot replay: a trigger
@@ -81,6 +83,11 @@ export interface RoundBlocker {
    * part of the base fingerprint (it churns every round) — it only breaks
    * same-key ties inside roundBlockerKeys. */
   readonly evidence?: string;
+  /** The reviewer's recommended fix, when the report carried one. The
+   * autopilot's templated directive (issue #243) is the only consumer: a
+   * bullet without one refuses and leaves the row to LLM Silas. Never
+   * part of the fingerprint or of the digest row's decision projection. */
+  readonly recommendedFix?: string;
   /** Severity and detail ride along when the source report carries them —
    * they are PROJECTED OUT of the digest rows (kept byte-stable below)
    * but the #224 same-blocker shadow ask uses the fuller facts so its
@@ -287,6 +294,7 @@ export interface DigestLedger {
     sinceSeq: number,
   ): boolean;
   latestJobEvent(jobId: string, kind: string): EventRecord | null;
+  latestCandidateDelivery(jobId: string): EventRecord | null;
   latestRoundEvent(roundId: string, kind: string): EventRecord | null;
   listAgents(): readonly AgentRecord[];
   /** Implementer minions only (Gru ruling 2026-09-29): review-only
@@ -328,15 +336,16 @@ export interface DigestLedger {
   hasUnsettledVerificationRun(jobId: string): boolean;
   listProviderWaits?(opts?: { status?: string }): readonly unknown[];
   listPendingProviderRecoveries?(): readonly unknown[];
-  /** Active decision rows (issue #218): the sweep gate wakes on a passed
-   * `recheckAt` even when the digest fingerprint is unchanged. Optional
-   * because the digest itself never reads decisions. */
+  /** Active decision rows (issue #218): exact verification-failure
+   * dismissals retire repair attention, never verification debt. The sweep
+   * gate also wakes on a passed `recheckAt`. An absent reader grants no
+   * dismissal. */
   listDecisions?(opts?: {
     readonly subject?: string;
     readonly activeOnly?: boolean;
     readonly limit?: number;
     readonly offset?: number;
-  }): readonly { readonly recheckAt: string | null }[];
+  }): readonly Pick<DecisionRecord, 'id' | 'decision' | 'covers' | 'basisFingerprint' | 'recheckAt'>[];
 }
 
 /** Blockers of one round, with an explicit loud note instead of a silent
@@ -389,6 +398,15 @@ export function consolidatedBlockersFor(ledger: DigestLedger): BlockersForRound 
             : {}),
           ...(typeof finding.detail === 'string' && finding.detail.trim() !== ''
             ? { detail: finding.detail }
+            : {}),
+          // The reviewer's recommended fix (issue #243): carried for the
+          // autopilot's templated directive only — out of the fingerprint
+          // and out of the digest row projection, so provenance and the
+          // wake gate stay byte-stable. The consolidated report writes the
+          // finding field as `recommended_fix` (perkins-review types).
+          ...(typeof (finding as { recommended_fix?: unknown }).recommended_fix === 'string' &&
+          ((finding as { recommended_fix?: string }).recommended_fix ?? '').trim() !== ''
+            ? { recommendedFix: (finding as { recommended_fix: string }).recommended_fix }
             : {}),
         }));
       return Promise.resolve({ blockers, note: null });
@@ -494,11 +512,12 @@ export interface ProviderRecoveryPendingRow {
 }
 
 /** An open PR whose head is dirty against its base (issue #215): the
- * rebase is Silas's mechanical work, derived from the job's latest
+ * conflict integration is Silas's mechanical work, derived from the job's latest
  * `github.branch-state` cursor. Suppressed while any accepted operation
  * owns the lane (a live directive, a pending re-brief, an in-flight
- * verification) or a rebase directive for this exact head has landed
- * after the conflict — uncertain ownership fails closed to no row. */
+ * verification) or a conflict-integration directive for this exact head
+ * has landed after the conflict — uncertain ownership fails closed to no
+ * row. */
 export interface ConflictingPrRow {
   readonly jobId: string;
   readonly repo: string;
@@ -579,7 +598,7 @@ export interface SilasOpsDigest {
   readonly verificationsOwed: readonly VerificationOwedRow[];
 }
 
-/** Count of actionable rows (event triggers wake even at zero; sweeps do not). */
+/** Count of actionable rows (an empty digest never wakes, issue #243). */
 export function digestActionCount(digest: SilasOpsDigest): number {
   return (
     digest.deliveredWithoutPr.length +
@@ -843,13 +862,15 @@ export function silasBriefSections(input: {
 }): string[] {
   return [
     'You are the operations layer. Work inside your authority: dispatch,',
-    'track, close. Never write product code; never merge. Perkins owns',
-    'verdict authority. The owner holds every merge, everywhere — this',
-    'repository included: a merge is presented only after the',
-    'exact-final-head Perkins gate, and fallback PASS is not that',
-    'clearance. Preserve before remove; escalate novel failures to the',
-    'chief with pointers, not prose. Never act on the Gru chat session',
-    'itself.',
+    'track, close. Never write product code. Two merges: a worker',
+    'integrating main into its own task branch is ordinary execution you',
+    'coordinate; every final PR merge belongs to the owner, in every',
+    'repository — this one included — presented only after required final',
+    'CI and the exact-final-head Perkins gate: development-review READY,',
+    'fallback PASS, an old-head verdict and a clean textual merge are not',
+    'that clearance. Preserve before remove;',
+    'escalate novel failures to the chief with pointers, not prose.',
+    'Never act on the Gru chat session itself.',
     '',
     '## Ops surface',
     '',
@@ -1197,7 +1218,15 @@ function currentPhaseStart(ledger: DigestLedger, jobId: string): CurrentPhaseSta
   const statusHopSeq = openAttemptStartSeq(ledger, jobId);
   const statusEvent = ledger.latestJobEvent(jobId, 'job.status');
   let seq = statusHopSeq;
-  let event: EventRecord | null = statusEvent !== null && statusEvent.seq === statusHopSeq ? statusEvent : null;
+  // The latest status event is not always the attempt start: a refused
+  // review's admission flip and restore sit after it (#271). Then the
+  // start event itself — with its ORIGINAL timestamp, never the restore's —
+  // is looked up in the job history.
+  let event: EventRecord | null = statusEvent !== null && statusEvent.seq === statusHopSeq
+    ? statusEvent
+    : statusHopSeq > 0 && statusHopSeq < Number.MAX_SAFE_INTEGER
+      ? jobStatusEventAtSeq(ledger, jobId, statusHopSeq)
+      : null;
   let repairStartSeq = 0;
   for (const kind of ['silas.directive-sent', 'provider.recovery-claimed']) {
     const repair = ledger.latestJobEvent(jobId, kind);
@@ -1263,7 +1292,7 @@ function stallStillEligible(
   if ((ledger.listJobEvents(jobId, { limit: 1 })[0]?.seq ?? 0) !== jobSeqAtCompute) return false;
   const phaseStart = currentPhaseStart(ledger, jobId);
   if (phaseStart.seq !== phaseSeqAtCompute) return false;
-  const delivered = ledger.latestJobEvent(jobId, 'job.delivered');
+  const delivered = ledger.latestCandidateDelivery(jobId);
   if (delivered !== null && delivered.seq > phaseStart.seq) return false;
   if (ledger.listPendingRebriefs({ jobId }).length > 0) return false;
   if (ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length > 0) return false;
@@ -1347,7 +1376,7 @@ function stallStillEligible(
  * reconsideration — so completion/dependency transitions reach the sweep
  * without a fresh owner message; the conflictingPrs rows (issue
  * #215) — a live PR-owing lane whose open head is dirty against its
- * base, Silas's mechanical rebase work, suppressed while an accepted
+ * base, Silas's mechanical conflict-integration work, suppressed while an accepted
  * operation owns the lane and never a Gru wake; and the releaseEligible
  * rows (issue #117, g21) — a terminal job still holding its own lane,
  * the sweep-ack rule's digest surface, fenced while non-terminal child
@@ -1430,7 +1459,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     }
     const rounds = [...input.ledger.listRounds(job.id)].sort((a, b) => b.seq - a.seq);
     const newestRound = rounds[0] ?? null;
-    const delivered = input.ledger.latestJobEvent(job.id, 'job.delivered');
+    const delivered = input.ledger.latestCandidateDelivery(job.id);
     const minionError = input.ledger.latestJobEvent(job.id, 'job.minion-error');
     // A request retires only the state it answered: it must postdate the
     // latest delivery, so a later unreviewed delivery re-arms the row.
@@ -1616,6 +1645,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
             title: blocker.title,
             location: blocker.location,
             ...(blocker.evidence !== undefined ? { evidence: blocker.evidence } : {}),
+            ...(blocker.recommendedFix !== undefined ? { recommendedFix: blocker.recommendedFix } : {}),
             fingerprint,
             consecutiveRounds,
             advice: adviseFollowThrough(consecutiveRounds, input.config),
@@ -2026,10 +2056,64 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       (jobSeqUnchanged(row.jobId) &&
        input.ledger.listPendingDirectives({ jobId: row.jobId, states: LIVE_DIRECTIVE_STATES }).length === 0 &&
        input.ledger.listPendingRebriefs({ jobId: row.jobId }).length === 0));
+  // GH-302: only actionable repairs suppress corrective verification. Read
+  // exact scope/run dispositions at this final, no-await boundary, once per
+  // job and through every page. Other scopes are independent; the generic
+  // subject/signal covering query deliberately has different semantics.
+  const failureDecisions = new Map<string, Map<string, Pick<DecisionRecord, 'id' | 'decision' | 'recheckAt'>>>();
+  const dispositionNow = now();
+  const failureAttention = (failure: VerificationFailureRow): readonly VerificationFailureRow[] => {
+    if (failure.scope === null || failure.runId === null || input.ledger.listDecisions === undefined) return [failure];
+    let decisions = failureDecisions.get(failure.jobId);
+    if (decisions === undefined) {
+      decisions = new Map();
+      const pageSize = 500;
+      pages: for (let offset = 0;; offset += pageSize) {
+        const page = input.ledger.listDecisions({ subject: `job:${failure.jobId}`, activeOnly: true, limit: pageSize, offset });
+        for (const decision of page) {
+          if (!decision.covers.includes('verification-failure')) continue;
+          // A newer ANY-basis decision cannot authorize dismissal of an
+          // older exact failure. Preserve that fence, never borrow it.
+          if (decision.basisFingerprint === null) break pages;
+          if (!decisions.has(decision.basisFingerprint)) decisions.set(decision.basisFingerprint, decision);
+        }
+        if (page.length < pageSize) break;
+      }
+      failureDecisions.set(failure.jobId, decisions);
+    }
+    const decision = decisions.get(`verification-failure:${failure.scope}@${failure.runId}`);
+    if (decision?.decision !== 'dismissed') return [failure];
+    if (decision.recheckAt === null) return [];
+    const recheck = Date.parse(decision.recheckAt);
+    if (!Number.isFinite(recheck)) {
+      // Corrupt dismissal evidence fails closed for THIS repair, loudly,
+      // without stranding unrelated jobs by failing the whole digest.
+      return [{ ...failure, detail: `${failure.detail}; decision "${decision.id}" has an unparseable recheck_at "${decision.recheckAt}" — correct or clear the decision before reusing its dismissal` }];
+    }
+    return recheck > dispositionNow ? [] : [failure];
+  };
+  const verificationFailures = digest.verificationFailures.filter(continuationAllowed).flatMap(failureAttention);
+  // Issue #243 F-M1: an accepted directive or re-brief producer owns the
+  // lane from its durable request until its completion receipt. While that
+  // ownership is unresolved the recomputed verdict row is NOT actionable —
+  // code already owns the work — so publishing it only buys a redundant
+  // max-thinking model wake. This is the ledger's own writer-ownership test,
+  // not the earlier recovery-hold history.
+  const liveWriterOwns = (jobId: string): boolean =>
+    input.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
+    input.ledger.listPendingRebriefs({ jobId }).length > 0;
   return {
     ...digest,
-    verdictsAwaitingDirective: digest.verdictsAwaitingDirective.filter(continuationAllowed),
-    verificationFailures: digest.verificationFailures.filter(continuationAllowed),
+    // Issue #243 original-M2 carry-forward: the publish boundary must not
+    // offer a verdict row while a verification owns the lane. The digest
+    // computed the row before that verification settled in; without this
+    // fence a verdict row leaks to LLM Silas (a model wake) even though
+    // every autopilot verdict planner refuses it. Re-read at this final,
+    // no-await boundary like the sibling fences.
+    verdictsAwaitingDirective: digest.verdictsAwaitingDirective.filter(
+      (row) => continuationAllowed(row) && !verificationInFlight(input.ledger, row.jobId) && !liveWriterOwns(row.jobId),
+    ),
+    verificationFailures,
     verificationWaits: digest.verificationWaits.filter(continuationAllowed),
     minionErrors: digest.minionErrors.filter(continuationAllowed),
     providerRecoveryPending: digest.providerRecoveryPending.filter((row) => {
@@ -2046,9 +2130,10 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       return job !== null && job.prUrl === null;
     }),
     verificationsOwed: digest.verificationsOwed.filter((row) => {
-      // A failed run on this head owes a REPAIR (verificationFailures), not
-      // another verification of the same bytes.
-      if (digest.verificationFailures.some((failure) => failure.jobId === row.jobId && failure.head === row.head)) return false;
+      // An unresolved failure on this head owes a REPAIR, not another
+      // verification of the same bytes. Exact attention dismissal never
+      // clears the ledger's corrective verification debt or FAILED receipt.
+      if (verificationFailures.some((failure) => failure.jobId === row.jobId && failure.head === row.head)) return false;
       if (!continuationAllowed(row) || !jobSeqUnchanged(row.jobId) || verificationInFlight(input.ledger, row.jobId) ||
           input.ledger.listPendingDirectives({ jobId: row.jobId, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
           input.ledger.listPendingRebriefs({ jobId: row.jobId }).length > 0) return false;
@@ -2696,13 +2781,14 @@ export class SilasDriver {
   }
 
   /** Compute the digest; wake the slot only when there is something to
-   * do. Sweeps skip empty digests AND digests whose decision-relevant
-   * fingerprint is unchanged (issue #217) — unless the bounded safety
-   * re-look elapsed (`[silas] unchanged_rewake_ms`) or a recorded
-   * decision recheck passed since the last delivered wake (#218; a due
-   * recheck wakes even when the digest is empty, because the decision
-   * that stopped covering may be re-suppressing rows). Event wakes
-   * always deliver — the event itself is context Silas should see. */
+   * do. An empty digest is suppressed for EVERY trigger (issue #243): with
+   * the autopilot enforced, an event whose rows the code already handled
+   * must not buy a max-thinking turn. Sweeps additionally skip digests
+   * whose decision-relevant fingerprint is unchanged (issue #217) — unless
+   * the bounded safety re-look elapsed (`[silas] unchanged_rewake_ms`) or a
+   * recorded decision recheck passed since the last delivered wake (#218; a
+   * due recheck wakes even when the digest is empty, because the decision
+   * that stopped covering may be re-suppressing rows). */
   private async runWake(trigger: SilasTrigger): Promise<void> {
     let digest: SilasOpsDigest;
     try {
@@ -2724,12 +2810,17 @@ export class SilasDriver {
     }
     const actionable = digestActionCount(digest);
     const fingerprint = digestFingerprint(digest);
+    const recheckDue = this.decisionRecheckDue();
+    if (actionable === 0 && !recheckDue) {
+      // Issue #243: with families enforced the autopilot has already handled
+      // the rows an event raised, so the recomputed digest is empty and the
+      // event must not buy a max-thinking turn. LLM Silas wakes only when
+      // rows remain that need judgment. A due #218 decision recheck still
+      // wakes (the decision that stopped covering may re-suppress rows).
+      this.log('info', 'silas wake found nothing actionable', { trigger: trigger.kind });
+      return;
+    }
     if (trigger.kind === 'sweep') {
-      const recheckDue = this.decisionRecheckDue();
-      if (actionable === 0 && !recheckDue) {
-        this.log('info', 'silas sweep found nothing actionable', {});
-        return;
-      }
       const unchanged = this.lastDeliveredFingerprint === fingerprint;
       if (unchanged && !recheckDue) {
         const sinceDelivered =

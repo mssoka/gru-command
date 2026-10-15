@@ -104,6 +104,9 @@ function seedOfflineNpmFixture(repo: FixtureRepo): void {
     stdio: 'pipe',
   });
   repo.commitFile('package-lock.json', readFileSync(join(repo.path, 'package-lock.json'), 'utf-8'));
+  // The fixture depends only on its local package. Real lane setup must not contact
+  // npm's audit/funding services while proving npm ci actually installs that package.
+  repo.commitFile('.npmrc', 'offline=true\naudit=false\nfund=false\n');
 }
 
 describe('worktree manager: creation (ruling 18a/b/d/e)', () => {
@@ -153,17 +156,82 @@ describe('worktree manager: creation (ruling 18a/b/d/e)', () => {
     expect(row.status).toBe('active');
   });
 
-  it('rejects a configured but invalid BMAD source rather than skipping bootstrap', async () => {
+  it('an invalid historical BMAD source is inert; fresh GC lanes verify normally and preserve old records', async () => {
     const h = harness();
     const repo = h.make('fixture-invalid-bmad');
+    seedOfflineNpmFixture(repo);
     const root = join(import.meta.dirname, '..');
     repo.commitFile('.gru-command/worktree.toml', readFileSync(join(root, '.gru-command', 'worktree.toml'), 'utf-8'));
     repo.commitFile('.gru-command/bmad-bootstrap.mjs', readFileSync(join(root, '.gru-command', 'bmad-bootstrap.mjs'), 'utf-8'));
-    repo.git(['config', '--local', 'gru-command.bmad-source', join(repo.path, 'missing-source')]);
+    const record = '{"managed_by":"foreign","keep":true}\n';
+    repo.commitFile('.gru-command/bmad-install.json', record);
+    const source = join(repo.path, 'missing-source');
+    repo.git(['config', '--local', 'gru-command.bmad-source', source]);
     ledgerJob(h, 'job-invalid-bmad', repo);
-    await expect(h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-invalid-bmad' }))
-      .rejects.toThrow(/worktree setup command exited/);
-    expect(h.ledger.getWorktree('job-invalid-bmad')).toBeNull();
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-invalid-bmad' });
+    expect(row.status).toBe('active');
+    expect(execFileSync('npm', ['test'], { cwd: row.path, encoding: 'utf-8' })).toContain('fixture-wt');
+    expect(repo.git(['config', '--local', '--get', 'gru-command.bmad-source'])).toBe(source);
+    for (const path of [repo.path, row.path]) {
+      expect(readFileSync(join(path, '.gru-command/bmad-install.json'), 'utf-8')).toBe(record);
+      for (const name of ['_bmad', '_bmad-output', '.agents', '.claude']) expect(existsSync(join(path, name)), name).toBe(false);
+    }
+  });
+
+  it('a fetched job HEAD with retired bootstrap is refused even after local source retirement, with complete rollback', async () => {
+    const h = harness();
+    const repo = h.make('fixture-retired-fetched-head');
+    const retired = '# BEGIN GRU COMMAND BMAD BOOTSTRAP\n[[setup]]\ncommand = "node .gru-command/bmad-bootstrap.mjs"\n# END GRU COMMAND BMAD BOOTSTRAP\n';
+    const remoteHead = repo.commitFile('.gru-command/worktree.toml', retired);
+    const origin = attachBareOrigin(repo);
+    repo.git(['push', '--quiet', 'origin', 'main']);
+    repo.git(['symbolic-ref', 'HEAD', 'refs/heads/main'], origin);
+    const clean = '[[setup]]\ncommand = "echo user-setup > .boot-marker"\n';
+    const localHead = repo.commitFile('.gru-command/worktree.toml', clean);
+    expect(localHead).not.toBe(remoteHead);
+    expect(repo.git(['status', '--porcelain'])).toBe('');
+    expect(repo.git(['ls-remote', '--symref', 'origin', 'HEAD'])).toContain(`${remoteHead}\tHEAD`);
+    // A populated remote-tracking ref after refusal must come from the
+    // manager's fetch, not from push or the local checkout's clean HEAD.
+    repo.git(['update-ref', '-d', 'refs/remotes/origin/main']);
+    ledgerJob(h, 'job-retired-head', repo);
+    await expect(h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-retired-head' }))
+      .rejects.toThrow(/retired GC-managed BMAD bootstrap/u);
+    expect(h.ledger.getWorktree('job-retired-head')).toBeNull();
+    expect(repo.git(['worktree', 'list'])).not.toContain('job-retired-head');
+    expect(repo.git(['branch', '--list', 'gru/job-retired-head'])).toBe('');
+    expect(repo.git(['rev-parse', 'refs/remotes/origin/main'])).toBe(remoteHead);
+    expect(repo.head()).toBe(localHead);
+    expect(h.baseFallbacks).toEqual([]);
+    expect(readFileSync(join(repo.path, '.gru-command/worktree.toml'), 'utf-8')).toBe(clean);
+  });
+
+  it('writer children refuse their parent committed retired manifest while read-only and existing lanes remain intact', async () => {
+    const h = harness();
+    const repo = h.make('fixture-retired-parent-head');
+    repo.commitFile('.gru-command/worktree.toml', '[[setup]]\ncommand = "echo user-setup > .boot-marker"\n');
+    ledgerJob(h, 'job-retired-parent', repo);
+    const parent = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-retired-parent' });
+    const retired = '# BEGIN GRU COMMAND BMAD BOOTSTRAP\n[[setup]]\ncommand = "node .gru-command/bmad-bootstrap.mjs"\n# END GRU COMMAND BMAD BOOTSTRAP\n[verify]\nfull = "npm test"\n';
+    writeFileSync(join(parent.path, '.gru-command/worktree.toml'), retired);
+    repo.git(['add', '.gru-command/worktree.toml'], parent.path);
+    repo.git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'historical parent manifest'], parent.path);
+    const gitDir = repo.git(['rev-parse', '--path-format=absolute', '--git-dir'], parent.path);
+    mkdirSync(join(gitDir, 'gru-command'), { recursive: true });
+    const binding = join(gitDir, 'gru-command/bmad-runtime.json');
+    writeFileSync(binding, '{"runtime_id":"historical","keep":true}\n');
+    const before = readFileSync(binding, 'utf-8');
+    await expect(h.manager.createChildWorktree({ repoPath: repo.path, jobId: 'job-retired-parent',
+      childId: 'refused-writer', parentPath: parent.path, authority: 'writer' }))
+      .rejects.toThrow(/retired GC-managed BMAD bootstrap/u);
+    expect(h.ledger.getWorktree('refused-writer')).toBeNull();
+    expect(repo.git(['branch', '--list', 'gru/job-retired-parent-child-refused-writer'])).toBe('');
+    const reader = await h.manager.createChildWorktree({ repoPath: repo.path, jobId: 'job-retired-parent',
+      childId: 'historical-reader', parentPath: parent.path, authority: 'read-only' });
+    expect(readFileSync(join(reader.path, '.gru-command/worktree.toml'), 'utf-8')).toBe(retired);
+    expect(readFileSync(join(parent.path, '.gru-command/worktree.toml'), 'utf-8')).toBe(retired);
+    expect(readFileSync(binding, 'utf-8')).toBe(before);
+    expect(h.ledger.getWorktree(parent.id)?.status).toBe('active');
   });
 
   it('rolls the worktree back when the bootstrap manifest fails', async () => {
@@ -542,14 +610,29 @@ describe('base resolution (owner incident 2026-09-23): the lane branches from FE
     ledgerJob(h, 'job-redact', repo);
     const local = repo.head();
 
-    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-redact' });
-    expect(row.baseSource).toBe('local-head-fallback');
-    expect(row.sha).toBe(local);
-    expect(h.baseFallbacks).toHaveLength(1);
-    // Raw git stderr (carrying the credential-bearing URL) is redacted
-    // before it reaches logs or the persisted notification.
-    expect(h.baseFallbacks[0]?.detail).not.toContain('hunter2');
-    expect(h.baseFallbacks[0]?.detail).toMatch(/redacted|invalid\.example/u);
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf-8' }).trim();
+    const shimDir = mkdtempSync(join(tmpdir(), 'gru-wt-redacted-fetch-'));
+    const shim = join(shimDir, 'git');
+    writeFileSync(shim, '#!/bin/sh\n' +
+      'if [ "$1" = "ls-remote" ] || [ "$1" = "fetch" ]; then\n' +
+      '  echo "fatal: unable to access https://user:hunter2@invalid.example/repo.git: fixture transport refusal" >&2\n' +
+      '  exit 128\nfi\n' +
+      'exec ' + JSON.stringify(realGit) + ' "$@"\n', 'utf-8');
+    chmodSync(shim, 0o755);
+    const priorPath = process.env.PATH;
+    process.env.PATH = `${shimDir}:${priorPath ?? ''}`;
+    try {
+      const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-redact' });
+      expect(row.baseSource).toBe('local-head-fallback');
+      expect(row.sha).toBe(local);
+      expect(h.baseFallbacks).toHaveLength(1);
+      // Exercise the real stderr-redaction boundary, without external DNS/proxy timing.
+      expect(h.baseFallbacks[0]?.detail).not.toContain('hunter2');
+      expect(h.baseFallbacks[0]?.detail).toMatch(/redacted|invalid\.example/u);
+    } finally {
+      process.env.PATH = priorPath;
+      rmSync(shimDir, { recursive: true, force: true });
+    }
   });
 
   it('a review ref naming origin/HEAD REFUSES an UNVERIFIED cache-guessed default (the r6 B1 review arm, pinned)', async () => {
@@ -1880,5 +1963,48 @@ describe('Perkins lane-B r4: a swept row with a surviving branch HEALS on releas
     expect(healed.status).toBe('swept');
     if (healed.status === 'swept') expect(healed.branch).toBe('deleted');
     expect(repo.git(['branch', '--list', row.branch!])).toBe('');
+  });
+});
+
+// ------------------------------------------------------------------
+// Issue #243 F-H1: automatic (unattended) release proofs
+// ------------------------------------------------------------------
+
+describe('issue #243 F-H1 automatic release proofs', () => {
+  it('refuses an UNATTENDED release that would destroy dirty tracked work, retaining the tree', async () => {
+    const h = harness();
+    const repo = h.make();
+    ledgerJob(h, 'job-fh1-dirty', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-fh1-dirty' });
+    // A tracked modification the forced removal would destroy (only `??`
+    // untracked entries are preserved by the sweep).
+    writeFileSync(join(row.path, 'README.md'), 'modified tracked content\n');
+    await expect(
+      h.manager.release({ worktreeId: 'job-fh1-dirty', requireReleaseProofs: true }),
+    ).rejects.toThrow(/automatic sweep refused: 1 tracked change/);
+    // The tree and the registry row are retained for the operator to resolve.
+    expect(existsSync(row.path)).toBe(true);
+    expect(h.ledger.getWorktree('job-fh1-dirty')?.status).toBe('active');
+    expect(readFileSync(join(row.path, 'README.md'), 'utf-8')).toBe('modified tracked content\n');
+  });
+
+  it('sweeps an UNATTENDED release of a clean lane (intact-positive control)', async () => {
+    const h = harness();
+    const repo = h.make();
+    ledgerJob(h, 'job-fh1-clean', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-fh1-clean' });
+    const result = await h.manager.release({ worktreeId: 'job-fh1-clean', requireReleaseProofs: true });
+    expect(result.status).toBe('swept');
+    expect(existsSync(row.path)).toBe(false);
+  });
+
+  it('keeps the operator path authoritative: no proof flag still sweeps a dirty lane', async () => {
+    const h = harness();
+    const repo = h.make();
+    ledgerJob(h, 'job-fh1-oper', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-fh1-oper' });
+    writeFileSync(join(row.path, 'README.md'), 'operator chose to discard this\n');
+    const result = await h.manager.release({ worktreeId: 'job-fh1-oper' });
+    expect(result.status).toBe('swept');
   });
 });

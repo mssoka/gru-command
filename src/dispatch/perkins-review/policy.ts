@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 
 export const PERKINS_POLICY_ID = 'perkins-code-review';
 export const PERKINS_CANONICAL_SOURCE_SHA256 = 'f38c28ffb10b4e44fa1f87f260a08507bb0a5c8872de2cf47e05a985c5eb92e7';
-export const PERKINS_POLICY_SHA256 = '097be56ca2f6ecb6e1c75e1b320c6d3b50e481cc39a439ccd80134ea665d040d';
+export const PERKINS_POLICY_SHA256 = '6cb9705b6839692681d9cf4c4fa8e7fc54171d2ef7678e74b94629e132d71d38';
 
 export const PERKINS_LENSES = [
   'blind',
@@ -158,6 +158,9 @@ export function loadPerkinsPolicy(file = PERKINS_POLICY_FILE): PerkinsPolicy {
   }
   if (typeof policy.portableContract.leadWorkflow !== 'string' || !policy.portableContract.leadWorkflow.includes('perkins_submit_review')) {
     throw new Error(`bundled ${PERKINS_POLICY_ID} resource is missing the whole-PR lead workflow`);
+  }
+  if (!policy.portableContract.leadWorkflow.includes('perkins_submit_property_contracts')) {
+    throw new Error(`bundled ${PERKINS_POLICY_ID} lead workflow is missing the property-contract proposal tool guidance`);
   }
   const outputContracts = policy.portableContract.outputContracts;
   for (const key of ['text', 'blindText', 'nativeTool', 'blindNativeTool'] as const) {

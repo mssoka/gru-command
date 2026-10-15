@@ -48,10 +48,10 @@ function git(repo: string, args: readonly string[]): string {
 }
 
 /** The fenced `sh` block whose first line is `# bmad-retire:<step>`. */
-function docBlock(step: string): string {
+function docBlock(step: string, prefix = 'bmad-retire'): string {
   const blocks = [...doc.matchAll(/```sh\n([\s\S]*?)```/gu)].map((match) => match[1]!);
-  const found = blocks.filter((block) => block.startsWith(`# bmad-retire:${step}\n`));
-  if (found.length !== 1) throw new Error(`docs/BMAD-RUNTIME.md must hold exactly one bmad-retire:${step} block`);
+  const found = blocks.filter((block) => block.startsWith(`# ${prefix}:${step}\n`));
+  if (found.length !== 1) throw new Error(`docs/BMAD-RUNTIME.md must hold exactly one ${prefix}:${step} block`);
   return found[0]!;
 }
 
@@ -227,7 +227,8 @@ function retirementFlow(shell: string): void {
   expect(preview.out).toContain('keep installer answers for reference in _bmad/custom/legacy-install/');
   expect(preview.out).toContain('LEFT IN PLACE (not part of the supported layout): _bmad/_memory');
   expect(preview.out).toContain(`LANE: ${lane}`);
-  expect(preview.out).toContain('.gru-command/bmad-install.json, .gru-command/bmad-bootstrap.mjs, worktree.toml block, local exclude block, git config gru-command.bmad-source');
+  expect(preview.out).toContain('historical bootstrap records/copiers: preserved in place');
+  expect(preview.out).toContain('worktree.toml block, local exclude block, git config gru-command.bmad-source');
   // The preview changed nothing in the repository.
   expect(tree(repo)).toEqual(original);
   git(repo, ['worktree', 'remove', '--force', lane]);
@@ -246,7 +247,7 @@ function retirementFlow(shell: string): void {
   expect(readdirSync(join(repo, '.claude', 'skills')).sort()).toEqual(['bmad-help', 'gds-empty', 'other-tool']);
   expect(readlinkSync(join(repo, '.agents', 'skills', 'bmad-extra', 'assets'))).toBe(join(workspace, 'user-assets'));
   for (const rel of ['_bmad/_config/manifest.yaml', '_bmad/gds/config.yaml', '_bmad/scripts/render_skill.py', '_bmad/config.toml', '.agents/skills/bmad-build/SKILL.md',
-    '.agents/skills/gds-quick-dev/workflow.md', '.claude/skills/bmad-build/SKILL.md', '.gru-command/bmad-install.json', '.gru-command/bmad-bootstrap.mjs']) {
+    '.agents/skills/gds-quick-dev/workflow.md', '.claude/skills/bmad-build/SKILL.md']) {
     expect(readFileSync(join(backup, 'moved', rel)).toString('base64'), rel).toBe(original.get(rel));
   }
   // GC-owned bootstrap references are gone; user-owned content is byte-identical.
@@ -257,7 +258,7 @@ function retirementFlow(shell: string): void {
   for (const rel of ['_bmad-output/implementation-artifacts/spec-gh-1.md', '_bmad-output/planning-artifacts/prd.md',
     '_bmad/bmm/project-notes.md', '_bmad/cis/config.yaml',
     '_bmad/custom/bmad-build.toml', '_bmad/custom/.gitignore', '_bmad/_memory/notes.md', '.agents/skills/my-skill/SKILL.md',
-    '.claude/skills/other-tool/SKILL.md', '.claude/skills/bmad-help/SKILL.md', 'README.md']) {
+    '.claude/skills/other-tool/SKILL.md', '.claude/skills/bmad-help/SKILL.md', '.gru-command/bmad-install.json', '.gru-command/bmad-bootstrap.mjs', 'README.md']) {
     expect(readFileSync(join(repo, rel)).toString('base64'), rel).toBe(original.get(rel));
   }
   // Legacy answers that differ from GC defaults were re-homed into _bmad/custom/.
@@ -424,5 +425,21 @@ describe('retiring a repo-local BMAD install with the documented commands', () =
     const unrecorded = legacyRepo(unrecordedWs);
     rmSync(join(unrecorded, '_bmad', '_config', 'files-manifest.csv'));
     expect(previewOf(unrecorded, unrecordedWs).stderr).toContain('STOP: _bmad/_config/files-manifest.csv is missing');
+    // The historical full procedure also must not infer ownership from
+    // marker text inside a user string, or silently skip edited markers.
+    for (const manifest of [
+      `[[setup]]\ncommand = '''\n${BLOCK}\n'''\n`,
+      BLOCK.replaceAll('# BEGIN', '#  BEGIN').replaceAll('# END', '#END'),
+    ]) {
+      const foreignWs = tempDir('gru-command-retire-foreign-marker-');
+      const foreign = legacyRepo(foreignWs);
+      writeFileSync(join(foreign, '.gru-command', 'worktree.toml'), manifest);
+      const before = tree(foreign);
+      const refused = previewOf(foreign, foreignWs);
+      expect(refused.status).not.toBe(0);
+      expect(refused.stderr).toContain('STOP:');
+      expect(tree(foreign)).toEqual(before);
+      expect(existsSync(join(foreignWs, 'backup/plan.json'))).toBe(false);
+    }
   });
 });

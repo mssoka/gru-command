@@ -40,11 +40,13 @@
  *   CLAUDE_DOUBLE_COMPACT_MALFORMED_RESULT=1 omit required result fields
  *   CLAUDE_DOUBLE_COMPACT_HOLD_FILE=/path wait during /compact until disposed
  *   CLAUDE_DOUBLE_WORKFLOW_CANDIDATE=1 emit one security finding plus verifier response
+ *   CLAUDE_DOUBLE_GRU_ACT={baseUrl,token,detail} on a wake prompt, POST the
+ *                               notification disposition itself (Gru-authored action)
  */
 import process from 'node:process';
 import { Buffer } from 'node:buffer';
 import { appendFileSync, existsSync, readFileSync, statSync } from 'node:fs';
-import { spawn as childSpawn } from 'node:child_process';
+import { spawnSync, spawn as childSpawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
 import { clearTimeout as clearTimer, setTimeout as setTimer } from 'node:timers';
@@ -78,15 +80,32 @@ const streamEvent = (event) => out({ type: 'stream_event', session_id: sessionId
 
 let stdinText = '';
 process.stdin.setEncoding('utf8');
+let pendingInput = ''; let running = false;
+const responses = new Map();
+const headlessHost = flagValue('--permission-prompt-tool') === 'stdio';
+const launch = () => {
+  if (running) return;
+  running = true;
+  run().catch((error) => { process.stderr.write(`double failure: ${String(error)}\n`); process.exit(2); });
+};
 process.stdin.on('data', (chunk) => {
   stdinText += chunk;
+  if (!headlessHost) return;
+  pendingInput += chunk;
+  let at;
+  while ((at = pendingInput.indexOf('\n')) >= 0) {
+    const line = pendingInput.slice(0, at); pendingInput = pendingInput.slice(at + 1);
+    if (!line.trim()) continue;
+    const frame = JSON.parse(line);
+    if (frame.type === 'control_request' && frame.request?.subtype === 'initialize') {
+      out({ type: 'control_response', response: { subtype: 'success', request_id: frame.request_id, response: {} } });
+    } else if (frame.type === 'control_response') {
+      responses.get(frame.response.request_id)?.(frame.response.response);
+      responses.delete(frame.response.request_id);
+    } else if (frame.type === 'user') launch();
+  }
 });
-process.stdin.on('end', () => {
-  run().catch((error) => {
-    process.stderr.write(`double failure: ${String(error)}\n`);
-    process.exit(2);
-  });
-});
+process.stdin.on('end', () => { if (!headlessHost) launch(); });
 
 function promptFromStdin() {
   let prompt = '';
@@ -341,7 +360,9 @@ async function run() {
   }
   recordInvocation(prompt, images);
 
-  if (prompt.includes('crash')) {
+  // The real fallback brief names the release-safety category "crash"; that
+  // structured task is not the test double's deliberate crash sentinel.
+  if (prompt.includes('crash') && !prompt.includes('gc_submit_fallback_findings({ findings: [...] })')) {
     process.stderr.write('double crash requested\n');
     process.exit(2);
   }
@@ -363,6 +384,67 @@ async function run() {
     out(initFrame());
   }
 
+  const gruAct = process.env['CLAUDE_DOUBLE_GRU_ACT'];
+  if (gruAct !== undefined && prompt.includes('[gru awareness · service context') &&
+      prompt.includes('started by the service wake policy')) {
+    // GH-124: the MODEL's turn performs the authorized disposition itself,
+    // through the live HTTP API, exactly as a tool-capable Gru would.
+    const spec = JSON.parse(gruAct);
+    // Mailbox-delivered wakes carry the real notification ids inside the item
+    // JSON; legacy notes carry `- <icon> [<id>]`.
+    const mailboxItem = /^- \[mailbox:[^\]]+\] (\{.*\})$/m.exec(prompt)?.[1];
+    const id = mailboxItem !== undefined
+      ? JSON.parse(mailboxItem).notificationIds?.[0]
+      : /^- \S+ \[([^\]]+)\]/m.exec(prompt)?.[1];
+    if (id === undefined) throw new Error('wake prompt carried no notification id to disposition');
+    const response = await globalThis.fetch(`${spec.baseUrl}/api/notifications/${id}/disposition`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${spec.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ detail: spec.detail }),
+    });
+    if (response.status !== 200) throw new Error(`disposition failed: ${response.status} ${await response.text()}`);
+    await emitToolTurn('Bash');
+    out(resultFrame(`dispositioned ${id}`, false));
+    return;
+  }
+
+  if (prompt.startsWith('verification-bash:') || (prompt === '/compact' && process.env.CLAUDE_DOUBLE_COMPACT_VERIFICATION !== undefined)) {
+    const command = prompt === '/compact' ? process.env.CLAUDE_DOUBLE_COMPACT_VERIFICATION : prompt.slice('verification-bash:'.length);
+    const settingsFile = flagValue('--settings');
+    const settings = settingsFile ? JSON.parse(readFileSync(settingsFile, 'utf8')) : {};
+    let reason = '';
+    const hook = settings.hooks?.PreToolUse?.[0]?.hooks?.[0]?.command;
+    if (hook && process.env.CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL !== '1') {
+      const result = spawnSync('/bin/sh', ['-c', hook], { input: JSON.stringify({ tool_name: 'Bash', tool_input: { command } }), encoding: 'utf8' });
+      if (result.status === 0) reason = JSON.parse(result.stdout).hookSpecificOutput?.permissionDecisionReason ?? '';
+    }
+    if (settings.permissions?.ask?.includes('Bash')) {
+      if (!headlessHost) reason = 'native ask has no host';
+      else {
+        const requestId = 'owned-permission';
+        const decision = await new Promise((resolve) => {
+          responses.set(requestId, resolve);
+          out({ type: 'control_request', request_id: requestId, request: { subtype: 'can_use_tool', tool_name: 'Bash', tool_use_id: 'verification-call', input: process.env.CLAUDE_DOUBLE_PERMISSION_MALFORMED === '1' ? {} : { command } } });
+        });
+        if (decision?.behavior !== 'allow') reason = decision?.message ?? 'native host denied';
+        else if (decision.updatedInput.command !== command) throw new Error('host rewrote command');
+      }
+    } else {
+      const { simulatedNativeDenial } = await import('./verification-native-corpus.mjs');
+      if (simulatedNativeDenial(command, settings.permissions?.deny ?? [])) reason ||= 'native deny';
+    }
+    let answer = reason;
+    if (!reason) {
+      const execution = spawnSync('/bin/bash', ['-c', command], { cwd: process.cwd(), encoding: 'utf8', env: process.env });
+      answer = execution.stdout + execution.stderr;
+      if (execution.status !== 0) reason = answer;
+    }
+    out(assistantFrame([{ type: 'tool_use', id: 'verification-call', name: 'Bash', input: { command } }]));
+    out({ type: 'user', session_id: sessionId, message: { role: 'user', content: [
+      { type: 'tool_result', tool_use_id: 'verification-call', content: answer, is_error: !!reason },
+    ] } });
+    if (prompt !== '/compact') { await emitTextTurn('verification attempt settled'); out(resultFrame('verification attempt settled', false)); return; }
+  }
   if (prompt === '/compact') {
     if (process.env['CLAUDE_DOUBLE_COMPACT_CONTENT'] === '1') {
       await emitThinkingTurn('compact command chatter');
@@ -420,6 +502,22 @@ async function run() {
       }
       if (process.env['CLAUDE_DOUBLE_COMPACT_EXIT_ERROR'] === '1') process.exitCode = 7;
     }
+    return;
+  }
+
+  if (prompt.includes('gc_submit_fallback_findings({ findings: [...] })')) {
+    const configFile = flagValue('--mcp-config');
+    if (configFile === undefined) throw new Error('fallback prompt requires its scoped MCP report tool');
+    const session = await mcpSession(configFile);
+    try {
+      const listed = await session.call('tools/list', {});
+      const names = listed.result.tools.map((tool) => tool.name);
+      if (names.length !== 1 || names[0] !== 'gc_submit_fallback_findings') throw new Error('fallback exposes unexpected native authority');
+      const response = await session.call('tools/call', { name: names[0], arguments: { findings: [] } });
+      if (!mcpToolText(response).includes('captured by the host')) throw new Error('fallback submission failed');
+      await emitTextTurn('DONE');
+      out(resultFrame('DONE', false));
+    } finally { session.close(); }
     return;
   }
 

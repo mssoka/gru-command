@@ -383,6 +383,57 @@ describe('board client', () => {
     pipeline: { entries: [], pending: 0 },
   } as unknown as BoardSnapshot);
 
+  it('G09 nonfatal source errors preserve pairing and do not advertise open before fresh data', async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    class FakeSocket {
+      onopen: (() => void) | null = null;
+      onmessage: ((event: { data: string }) => void) | null = null;
+      onclose: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      readonly sent: string[] = [];
+      constructor() { sockets.push(this); }
+      send(message: string): void { this.sent.push(message); }
+      close(): void {}
+    }
+    const unavailable = vi.fn(); const fatal = vi.fn(); const received = vi.fn();
+    const tracked = new BoardClient(
+      { token: TOKEN, host: 'localhost', fetchImpl: (() => new Promise<Response>(() => {})) as typeof fetch, webSocketCtor: FakeSocket as unknown as new (url: string) => WebSocket },
+      { connection: () => {}, snapshot: received, fatal, unavailable },
+    );
+    try {
+      tracked.connect();
+      const first = sockets[0]!;
+      first.onopen!(); first.onmessage!({ data: JSON.stringify({ type: 'auth_ok' }) });
+      expect(tracked.getState()).not.toBe('open');
+      first.onmessage!({ data: JSON.stringify({ type: 'board', snapshot: tagged('known') }) });
+      expect(tracked.getState()).toBe('open');
+      first.onmessage!({ data: JSON.stringify({ type: 'error', fatal: false, message: 'board unavailable: malformed evidence' }) });
+      expect(unavailable).toHaveBeenCalledWith('board unavailable: malformed evidence');
+      expect(fatal).not.toHaveBeenCalled();
+      first.onclose!();
+      await vi.advanceTimersByTimeAsync(800);
+      const second = sockets[1]!;
+      second.onopen!(); second.onmessage!({ data: JSON.stringify({ type: 'auth_ok' }) });
+      expect(JSON.parse(second.sent[0]!).token).toBe(TOKEN);
+      expect(tracked.getState()).not.toBe('open');
+      second.onmessage!({ data: JSON.stringify({ type: 'board', snapshot: tagged('recovered') }) });
+      expect(tracked.getState()).toBe('open');
+      expect(received).toHaveBeenLastCalledWith(tagged('recovered'));
+      expect(fatal).not.toHaveBeenCalled();
+    } finally { tracked.stop(); vi.useRealTimers(); }
+  });
+
+  it('G09 HTTP source failure explicitly marks snapshots unavailable without revoking pairing', async () => {
+    vi.useFakeTimers();
+    const unavailable = vi.fn(); const fatal = vi.fn();
+    const tracked = new BoardClient(
+      { token: TOKEN, host: 'localhost', fetchImpl: (async () => new Response(JSON.stringify({ error: 'board_unavailable', detail: 'corrupt obligation' }), { status: 503 })) as typeof fetch },
+      { connection: () => {}, snapshot: () => {}, fatal, unavailable },
+    );
+    try { await tracked.refetchSnapshot(); expect(unavailable).toHaveBeenCalled(); expect(fatal).not.toHaveBeenCalled(); } finally { tracked.stop(); vi.useRealTimers(); }
+  });
+
   it('an older HTTP snapshot never overwrites newer truth — reverse-order replies, and a push that came after the request', async () => {
     const answers: Array<(response: Response) => void> = [];
     const fetchImpl = vi.fn(() => new Promise<Response>((resolve) => { answers.push(resolve); })) as unknown as typeof fetch;
@@ -698,6 +749,67 @@ describe('board client', () => {
       expect(requests[7]!.signal?.aborted).toBe(true);
     } finally {
       vi.useRealTimers();
+    }
+  });
+
+  it('an ordinary success retires a hung trailing request that was overtaken — a fresh failure recovers at once, the old continuation never starts a chain, timers drain; before and after the backoff was spent (#275)', async () => {
+    for (const spent of [false, true]) {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        const { client, requests, delivered, settle, open } = scriptedClient();
+        const push = await open();
+        // A refresh loses to a push: a trailing refetch (run 1) is asked for.
+        void client.refetchSnapshot();
+        push('stale-1');
+        requests[1]!.answer(tagged('discarded-1'));
+        await settle();
+        expect(requests).toHaveLength(3);
+        if (spent) {
+          // The burst of two is spent: run 2 is discarded too, run 3 waits out its 1 s backoff.
+          push('stale-2');
+          requests[2]!.answer(tagged('discarded-2'));
+          await settle();
+          expect(requests).toHaveLength(4);
+          push('stale-3');
+          requests[3]!.answer(tagged('discarded-3'));
+          await settle();
+          expect(requests).toHaveLength(4);
+          await vi.advanceTimersByTimeAsync(1_000);
+          expect(requests).toHaveLength(5);
+        }
+        const hung = requests.length - 1; // the trailing request nobody ever answers
+        // An ordinary refresh now delivers an authoritative snapshot.
+        void client.refetchSnapshot();
+        requests[hung + 1]!.answer(tagged('ordinary'));
+        await settle();
+        expect(delivered.at(-1)).toBe('ordinary');
+        const before = requests.length;
+        // A later failure must start a fresh chain AT ONCE, not after the hung request's deadline.
+        void client.refetchSnapshot();
+        requests[before]!.fail();
+        await settle();
+        expect(requests, `spent=${spent}: recovery starts at once`).toHaveLength(before + 2);
+        // The fresh chain has its whole burst again: the 2nd run is immediate, the 3rd backs off.
+        requests[before + 1]!.fail();
+        await settle();
+        expect(requests, `spent=${spent}: burst reset`).toHaveLength(before + 3);
+        requests[before + 2]!.fail();
+        await settle();
+        expect(requests, `spent=${spent}: third waits`).toHaveLength(before + 3);
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(requests).toHaveLength(before + 4);
+        requests[before + 3]!.answer(tagged('authoritative'));
+        await settle();
+        expect(delivered.at(-1)).toBe('authoritative');
+        // The overtaken request reaches its deadline: cancelled, and it starts nothing.
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(requests[hung]!.signal?.aborted, `spent=${spent}`).toBe(true);
+        expect(requests, `spent=${spent}: no old continuation`).toHaveLength(before + 4);
+        expect(vi.getTimerCount(), `spent=${spent}: timers drained`).toBe(0);
+        client.stop();
+      } finally {
+        vi.useRealTimers();
+      }
     }
   });
 

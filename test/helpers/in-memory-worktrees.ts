@@ -1,7 +1,8 @@
+import { issueFixtureHandoff } from './fixture-handoff.js';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import type { WorktreeBaseSource } from '../../src/ledger/api.js';
+import type { LedgerApi, WorktreeBaseSource } from '../../src/ledger/api.js';
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from '../../src/dispatch/worktree-port.js';
 import { resolveReviewTargetReal } from './git-review-port.js';
 
@@ -18,13 +19,14 @@ export class InMemoryWorktreePort implements WorktreePort {
   private readonly lanes = new Map<string, WorktreeLane>();
   private n = 0;
 
-  constructor(root: string) {
+  constructor(root: string, private readonly ledger?: LedgerApi) {
     this.root = root;
   }
 
   async resolveReviewTarget(input: { repoPath: string; ref: string }): Promise<{
     readonly sha: string;
     readonly baseSource: WorktreeBaseSource | null;
+    readonly trackingRef: string | null;
   }> {
     // Git-backed fixtures resolve with the production discipline; the
     // non-git contract fixtures keep the fabricated identity this double
@@ -36,7 +38,7 @@ export class InMemoryWorktreePort implements WorktreePort {
       stdio: 'ignore',
     });
     if (probe.status === 0) return resolveReviewTargetReal(input.repoPath, input.ref);
-    return { sha: `sha-${input.ref}`, baseSource: null };
+    return { sha: `sha-${input.ref}`, baseSource: null, trackingRef: null };
   }
 
   async createJobWorktree(input: { repoPath: string; jobId: string }): Promise<WorktreeLane> {
@@ -112,6 +114,7 @@ export class InMemoryWorktreePort implements WorktreePort {
       // Contract-only tests intentionally use non-git fixture directories.
     }
     if (isGitRepo) {
+      if (this.ledger === undefined) throw new Error('Git-backed worktree fixture requires its actual test ledger issuer');
       mkdirSync(dirname(path), { recursive: true });
       const args = branch !== null
         ? ['-C', repoPath, 'worktree', 'add', '-b', branch, path, gitRef]
@@ -133,9 +136,10 @@ export class InMemoryWorktreePort implements WorktreePort {
       roundId,
       status: 'active',
     };
-    this.lanes.set(id, lane);
+    const issued = isGitRepo && this.ledger !== undefined ? issueFixtureHandoff(lane, this.ledger) : lane;
+    this.lanes.set(id, issued);
     this.n += 1;
-    return lane;
+    return issued;
   }
 
   getWorktree(id: string): WorktreeLane | null {

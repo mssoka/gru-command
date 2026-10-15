@@ -1,3 +1,4 @@
+import { withMailboxFixture } from '../src/lib/mailbox-fixture.test-support.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
@@ -208,7 +209,7 @@ function proofSnapshot(): BoardSnapshot {
     entry('p5', { priority: 3, enqueueSeq: 5, reason: 'exclusive scope "repo:pipeline-proof" held by p1' }),
     entry('p6', { priority: 4, enqueueSeq: 6, reason: 'waiting for p-ghost — not enqueued' }),
   ];
-  return {
+  return withMailboxFixture({
     repos: [{ name: 'pipeline-proof', jobs }],
     agents: [],
     notifications: [OWNER_NOTICE],
@@ -228,7 +229,7 @@ function proofSnapshot(): BoardSnapshot {
     unackedNeedsOwner: 1,
     wakes: { count: 0, lastAt: null },
     pipeline: { entries, pending: entries.length },
-  };
+  });
 }
 
 interface Seed {
@@ -267,7 +268,7 @@ function largeSnapshot(): BoardSnapshot {
       title: `Approved brief ${index + 1} — ${LONG_TOKEN}`,
     }),
   );
-  return {
+  return withMailboxFixture({
     repos: [{ name: 'pipeline-proof', jobs }],
     agents: [],
     notifications: [OWNER_NOTICE],
@@ -287,7 +288,7 @@ function largeSnapshot(): BoardSnapshot {
     unackedNeedsOwner: 1,
     wakes: { count: 0, lastAt: null },
     pipeline: { entries, pending: entries.length },
-  };
+  });
 }
 
 /** Seed BOTH board channels so a later HTTP refetch cannot replace the
@@ -602,7 +603,7 @@ async function largeCountsProof(browser: Browser, viewportCase: ViewportCase): P
     // (5/5/3/0/0) and an unbreakable 120-char token in every label.
     await expect(page.locator('.board-band--in-flight .board-band__count')).toHaveText('26 heists');
     await expect(page.locator('.board-band--pipeline .board-band__count')).toHaveText('26 queued');
-    await expect(page.locator('.board-band--needs-you .board-band__count')).toHaveText('9 heists');
+    await expect(page.locator('.board-band--needs-you .board-band__count')).toHaveText('9 threads · 0 incidents · 0 notifications');
     await expect(page.locator('.board-band--settled .board-band__count')).toHaveText('21 heists');
     await expect(page.locator('.board-band--cold .board-band__count')).toHaveText('12 heists');
     await expect(page.locator('#board-nav .board-nav__link[data-nav="pipeline"] .board-nav__count')).toHaveText('26');
@@ -662,7 +663,7 @@ test.describe('compact owner-first board — synthetic geometry proof', () => {
     await expect(page.locator('.board-band--cold .board-job')).toHaveCount(0);
     await expect(page.locator('.board-band--in-flight .board-band__count')).toHaveText('7 heists');
     await expect(page.locator('.board-band--pipeline .board-band__count')).toHaveText('6 queued');
-    await expect(page.locator('.board-band--needs-you .board-band__count')).toHaveText('3 heists');
+    await expect(page.locator('.board-band--needs-you .board-band__count')).toHaveText('3 threads · 0 incidents · 0 notifications');
     await expect(page.locator('.board-band--cold .board-band__count')).toHaveText('4 heists');
 
     // Waiting reasons are exact plain text; the ready row carries no reason.

@@ -78,6 +78,14 @@ integrated. Other users can install it on their laptops from GitHub.
     for a runtime that validates models; adapters that cannot set
     thinking declare the capability gap (fallback: warn + proceed).
 
+> **Current amendment — issues #294/#295:** The BMAD requirement, wizard
+> provisioning and default BMAD workflow binding in ruling 17 below are
+> superseded. GC setup validates selected Git repositories and GC manifests
+> only; independently installed BMAD is optional and untouched. New GC-owned
+> workflow/artifact contracts are documented in [GC-WORKFLOWS.md](GC-WORKFLOWS.md).
+> Existing historical bindings remain unchanged. The original approved text
+> is retained below as history, not a current setup prerequisite.
+
 17. **Per-project bmad/skills (`.agents/skills` + `_bmad` folders) —
     never at the workspace root.** Every managed repo carries its own
     project skills (`.agents/skills`) and BMAD project state (`_bmad`:

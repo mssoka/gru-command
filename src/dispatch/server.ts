@@ -9,22 +9,36 @@ import { isJobTerminal } from '../ledger/states.js';
 import { isReportDispositionOutcome, parseCompletionHandoffIntent, type CompletionHandoffIntent } from '../ledger/obligations.js';
 import { parsePipelinePrerequisites, type PipelinePrerequisite } from '../ledger/pipeline.js';
 import type { PipelineService } from './pipeline.js';
+import type { IntakeService } from '../intake/service.js';
+import { IntakeError } from '../intake/types.js';
+import { IntakePartialFailure, type IntakeApprovalService } from '../intake/approval.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { DispatchService } from './service.js';
 import { ReviewInProgressError, ReviewSupersessionUnconfirmedError, type WaveRunner } from './perkins.js';
-import { amendmentSupersessions, isAmendmentEffect, pendingMaterialAmendments, type AmendmentEffect } from '../review-inputs/amendments.js';
-import { renderFreshRevisionNote, renderRevisionContinuation } from './work-revision.js';
-import { flipJobToWorking, rebriefFreshMinion, recordFollowUpDelivery, routeFixDirectiveToMinion, type DirectiveRegistry } from './fix-directive.js';
-import { checkRebriefTurn, finalizeRebriefRequest, RebriefTurnCancelled } from './rebrief-recovery.js';
-import { retireInterruptedDirectiveFromRoute } from './directive-recovery.js';
+import { isAmendmentEffect, type AmendmentEffect } from '../review-inputs/amendments.js';
+import type { DirectiveRegistry } from './fix-directive.js';
+import { recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute, resolveRetirementLane, retireInterruptedDirectiveFromRoute } from './directive-recovery.js';
+import { executeAcceptedDirective, type DirectiveProgressDeps } from './directive-progress.js';
+import { surfaceRecoveryOwnerTransfer } from './recovery-owner.js';
+import { resolveGitCommit } from './perkins-review/artifacts.js';
+import type { RecoveryOwnerActionInput } from '../ledger/recovery-owner.js';
+import { DirectiveCheckpointError } from '../runtime/directive-checkpoint.js';
 import type { LessonsReferencePort } from '../lessons/types.js';
 import { BranchBusyError } from './branch-idle.js';
 import { deliveredTargetSha, type SilasOpsDigest } from './silas-driver.js';
 import { isVerdictRungRule, parseSilasRouteRuleId, strictOptStrField } from './silas-rules.js';
 import type { WorktreePort } from './worktree-port.js';
+import {
+  REVIEW_INPUT_LENSES,
+  ReviewSourceUnavailableError,
+  type ReviewRequiredInput,
+  type ReviewSourcePackage,
+} from './review-source.js';
 import type { PacingGate, RetrySettlement } from '../runtime/pacing.js';
 import { childRefusalStatus, type ChildWorkerService } from './child-workers.js';
 import { REVIEW_EVIDENCE_MAX_FILES, type ReviewEvidenceRequest } from '../review-inputs/evidence.js';
+import { BlindInputRefusal, parseBlindInputPackage } from './blind-input.js';
+import type { PropertyCampaignService } from './property-campaigns.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -67,7 +81,7 @@ export interface DispatchServerOptions {
    * deliveries and re-briefs. Absent = off. */
   readonly workerGate?: PacingGate;
   /** Supervisor's fresh queued/backoff producer ownership for retirement. */
-  readonly pendingProducerBlockers: (jobId: string) => readonly string[];
+  readonly pendingProducerBlockers: DirectiveProgressDeps['pendingProducerBlockers'];
   /** Provider pacing: bounded settlement of an automatic rate-limit retry
    * covering a just-delivered directive/re-brief turn (supervisor-backed
    * in production). The route records delivered only for 'none'/'recovered'. */
@@ -80,8 +94,16 @@ export interface DispatchServerOptions {
   /** Durable pipeline queue surface (approved j-239/j-1064); absent =
    * /api/pipeline/* answers 503 (queue not hosted in this build). */
   readonly pipeline?: PipelineService;
+  /** Preview remains read-only; approval is a separate explicit boundary. */
+  readonly intake?: IntakeService;
+  readonly intakeApproval?: IntakeApprovalService;
+  /** Owner pairing-token actions only; never exposed as reviewer tools. */
+  readonly propertyCampaigns?: PropertyCampaignService;
   /** Book of Lessons injection for directives/re-briefs (pointers only). */
   readonly lessons?: LessonsReferencePort;
+  /** Observe the actual continued physical session through the shared
+   * read-only blind-coverage port; absent = no observation. */
+  readonly observeBlindTurn?: (jobId: string, sessionFile: string | null) => void;
   readonly log?: Log;
 }
 
@@ -212,6 +234,39 @@ function optEvidenceField(body: Record<string, unknown>): readonly ReviewEvidenc
   });
 }
 
+/** Issue #317: `required_inputs` — [{path, lens}] content the review needs.
+ * Only claims-needed lenses may declare inputs; a blind lens is refused here
+ * so a missing spec can never become a reason to feed claims to it (#316). */
+function optRequiredInputs(body: Record<string, unknown>): readonly ReviewRequiredInput[] | undefined {
+  const value = body['required_inputs'];
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length === 0) throw new Error('required_inputs must be a non-empty array when supplied');
+  return value.map((entry, index) => {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) throw new Error(`required_inputs[${index}] must be an object`);
+    const { path, lens, ...rest } = entry as Record<string, unknown>;
+    if (Object.keys(rest).length > 0) throw new Error(`required_inputs[${index}] has unknown field "${Object.keys(rest)[0]}"`);
+    if (typeof path !== 'string' || path.trim() === '' || path.startsWith('/') || path.split('/').includes('..')) {
+      throw new Error(`required_inputs[${index}].path must be a non-empty repo-relative path`);
+    }
+    if (typeof lens !== 'string' || !(REVIEW_INPUT_LENSES as readonly string[]).includes(lens)) {
+      throw new Error(`required_inputs[${index}].lens must be one of ${REVIEW_INPUT_LENSES.join('|')} (blind lenses never receive claims inputs)`);
+    }
+    return { path, lens: lens as ReviewRequiredInput['lens'] };
+  });
+}
+
+/** Issue #317: `source_package` — {path, sha256} of a hash-pinned bundle. */
+function optSourcePackage(body: Record<string, unknown>): ReviewSourcePackage | undefined {
+  const value = body['source_package'];
+  if (value === undefined) return undefined;
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error('source_package must be an object');
+  const { path, sha256, ...rest } = value as Record<string, unknown>;
+  if (Object.keys(rest).length > 0) throw new Error(`source_package has unknown field "${Object.keys(rest)[0]}"`);
+  if (typeof path !== 'string' || !path.startsWith('/')) throw new Error('source_package.path must be an absolute path');
+  if (typeof sha256 !== 'string' || !/^[0-9a-f]{64}$/iu.test(sha256)) throw new Error('source_package.sha256 must be 64 hex characters');
+  return { path, sha256 };
+}
+
 /** The optional explicit completion intent on phase-authorizing requests.
  * Absent = ordinary flow; malformed = fail loud (the handler answers 400
  * BEFORE any job/side effect runs). */
@@ -297,7 +352,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
     return true;
   }
 
-  function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+  function readBody(req: IncomingMessage, destroyOnLimit = true): Promise<Record<string, unknown>> {
     return new Promise((resolveBody, rejectBody) => {
       let seen = 0;
       const chunks: Buffer[] = [];
@@ -307,8 +362,10 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         seen += chunk.length;
         if (seen > 512 * 1024) {
           rejected = true;
+          chunks.length = 0;
           rejectBody(new Error('request body exceeds 512 KiB'));
-          req.destroy();
+          if (destroyOnLimit) req.destroy();
+          else req.pause();
           return;
         }
         chunks.push(chunk);
@@ -367,6 +424,85 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
   }
 
   async function handleApi(req: IncomingMessage, res: ServerResponse, path: string): Promise<boolean> {
+    const property = /^\/api\/jobs\/([^/]+)\/property-campaigns(?:\/([^/]+)(?:\/(execute|repair|retain))?)?$/u.exec(path);
+    if (property !== null) {
+      if (!authed(req, res)) return true;
+      const service = options.propertyCampaigns;
+      if (service === undefined) { json(res, 503, { error: 'property_campaigns_not_hosted' }); return true; }
+      const jobId = decodeURIComponent(property[1]!);
+      const id = property[2] === undefined ? undefined : decodeURIComponent(property[2]);
+      const action = property[3] as 'execute' | 'repair' | 'retain' | undefined;
+      if (req.method === 'GET' && id !== undefined && action === undefined) { json(res, 200, service.read(jobId, id)); return true; }
+      if (req.method === 'POST' && id === undefined) { json(res, 201, service.propose(jobId, await readBody(req))); return true; }
+      if (req.method === 'POST' && id !== undefined && action !== undefined) { json(res, 200, await service.decide(jobId, id, action, await readBody(req))); return true; }
+      return false;
+    }
+    if (path === '/api/intake' || path.startsWith('/api/intake/')) {
+      if (!authed(req, res)) return true;
+      const intake = options.intake;
+      if (intake === undefined) {
+        json(res, 503, { error: 'intake_not_hosted', detail: 'native intake preview is not hosted on this service' });
+        return true;
+      }
+      try {
+        if (req.method === 'POST' && ['/api/intake/preview', '/api/intake/revision', '/api/intake/review', '/api/intake/reject', '/api/intake/approve'].includes(path)) {
+          let body: Record<string, unknown>;
+          try { body = await readBody(req, false); } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            throw new IntakeError('intake_invalid_request', message, message.includes('exceeds 512 KiB') ? 413 : 400);
+          }
+          if (path === '/api/intake/preview' || path === '/api/intake/revision') {
+            json(res, 200, await (path.endsWith('/preview') ? intake.preview(body) : intake.revise(body)) as unknown as Record<string, unknown>);
+          } else {
+            const approval = options.intakeApproval;
+            if (approval === undefined) throw new IntakeError('intake_approval_not_hosted', 'Explicit intake approval is not hosted on this service', 503);
+            const result = path.endsWith('/approve') ? approval.approve(body) : path.endsWith('/reject') ? approval.reject(body) : approval.review(body);
+            json(res, 200, result as unknown as Record<string, unknown>);
+          }
+          return true;
+        }
+        const reviewRead = /^\/api\/intake\/([^/]+)\/review$/u.exec(path);
+        if (req.method === 'GET' && reviewRead !== null) {
+          if ((req.url?.length ?? 0) > 8192) throw new IntakeError('intake_invalid_request', 'intake URL exceeds 8 KiB');
+          const params = new URL(req.url ?? '/', 'http://localhost').searchParams;
+          for (const key of params.keys()) if (!['repoPath', 'token'].includes(key) || params.getAll(key).length !== 1) throw new IntakeError('intake_invalid_request', 'unsupported or duplicated review query parameter');
+          if (!params.get('repoPath')) throw new IntakeError('intake_invalid_request', 'missing repoPath');
+          if (options.intakeApproval === undefined) throw new IntakeError('intake_approval_not_hosted', 'Explicit intake approval is not hosted on this service', 503);
+          json(res, 200, options.intakeApproval.read(params.get('repoPath')!, decodeURIComponent(reviewRead[1]!), params.get('token') ?? undefined) as unknown as Record<string, unknown>);
+          return true;
+        }
+        const read = /^\/api\/intake\/([^/]+)\/requests\/([^/]+)$/u.exec(path);
+        const diff = /^\/api\/intake\/([^/]+)\/diff$/u.exec(path);
+        if (req.method === 'GET' && (read !== null || diff !== null)) {
+          if ((req.url?.length ?? 0) > 8192) throw new IntakeError('intake_invalid_request', 'intake URL exceeds 8 KiB');
+          const params = new URL(req.url ?? '/', 'http://localhost').searchParams;
+          const keys = read !== null ? ['repoPath'] : ['repoPath', 'from', 'to'];
+          for (const key of params.keys()) {
+            if (!keys.includes(key) || params.getAll(key).length !== 1) throw new IntakeError('intake_invalid_request', 'unsupported or duplicated intake query parameter');
+          }
+          for (const key of keys) if (!params.get(key)) throw new IntakeError('intake_invalid_request', `missing intake query parameter ${key}`);
+          const result = read !== null
+            ? intake.read(params.get('repoPath')!, decodeURIComponent(read[1]!), decodeURIComponent(read[2]!))
+            : intake.diff(params.get('repoPath')!, decodeURIComponent(diff![1]!), params.get('from')!, params.get('to')!);
+          json(res, 200, result as unknown as Record<string, unknown>);
+          return true;
+        }
+        json(res, 404, { error: 'intake_not_found', detail: 'unsupported intake route' });
+      } catch (error) {
+        if (error instanceof IntakeError) {
+          if (error.status === 413) {
+            res.setHeader('connection', 'close');
+            const socket = req.socket;
+            // Flush the named response, then terminate even an unfinished
+            // chunked sender. Merely pausing/draining leaves it alive forever.
+            res.once('finish', () => socket.destroySoon());
+          }
+          json(res, error.status, { error: error.code, detail: error.message, ...(error instanceof IntakePartialFailure ? { readback: error.readback } : {}) });
+        } else if (error instanceof URIError) json(res, 400, { error: 'intake_invalid_request', detail: 'malformed percent escape in intake identity' });
+        else json(res, 500, { error: 'intake_failed', detail: error instanceof Error ? error.message : String(error) });
+      }
+      return true;
+    }
     if (req.method === 'POST' && path === '/api/dispatch') {
       if (!authed(req, res)) return true;
       const body = await readBody(req);
@@ -391,19 +527,64 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // its own job id so the board nests the child under that heist. The
       // ledger refuses an unknown, cross-repo, self, or grandchild parent.
       const parentJobId = parentJobIdField(body);
-      const outcome = await options.dispatch.dispatch({
-        jobId: strField(body, 'job_id'),
-        repoPath: strField(body, 'repo_path'),
-        title: strField(body, 'title'),
-        ...(displayName !== undefined ? { displayName } : {}),
-        ...(deliverable !== undefined ? { deliverable } : {}),
-        ...(commissioner !== undefined ? { commissioner } : by !== undefined ? { commissioner: by } : {}),
-        ...(targetRef !== undefined ? { targetRef } : {}),
-        ...(targetSha !== undefined ? { targetSha } : {}),
-        ...(parentJobId !== undefined ? { parentJobId } : {}),
-        briefing: strField(body, 'briefing'),
-        ...(completionHandoff !== undefined ? { completionHandoff } : {}),
-      });
+      const targetBase = optStrFieldStrict(body, 'target_base');
+      const requiredInputs = optRequiredInputs(body);
+      const sourcePackage = optSourcePackage(body);
+      // Issue #316: blind-review input isolation fields. Present-but-
+      // malformed is a named refusal, never a silent drop.
+      const reviewRole = optStrFieldStrict(body, 'review_role');
+      const parentContractSha256 = optStrFieldStrict(body, 'parent_contract_sha256');
+      let outcome: Awaited<ReturnType<DispatchService['dispatch']>>;
+      try {
+        const inputPackage = Object.hasOwn(body, 'input_package') ? parseBlindInputPackage(body['input_package']) : undefined;
+        outcome = await options.dispatch.dispatch({
+          jobId: strField(body, 'job_id'),
+          repoPath: strField(body, 'repo_path'),
+          title: strField(body, 'title'),
+          ...(displayName !== undefined ? { displayName } : {}),
+          ...(deliverable !== undefined ? { deliverable } : {}),
+          ...(commissioner !== undefined ? { commissioner } : by !== undefined ? { commissioner: by } : {}),
+          ...(targetRef !== undefined ? { targetRef } : {}),
+          ...(targetSha !== undefined ? { targetSha } : {}),
+          ...(targetBase !== undefined ? { targetBase } : {}),
+          ...(requiredInputs !== undefined ? { requiredInputs } : {}),
+          ...(sourcePackage !== undefined ? { sourcePackage } : {}),
+          ...(parentJobId !== undefined ? { parentJobId } : {}),
+          briefing: strField(body, 'briefing'),
+          ...(completionHandoff !== undefined ? { completionHandoff } : {}),
+          ...(reviewRole !== undefined ? { reviewRole } : {}),
+          ...(inputPackage !== undefined ? { inputPackage } : {}),
+          ...(parentContractSha256 !== undefined ? { parentContractSha256 } : {}),
+        });
+      } catch (error) {
+        // Issue #317: the selected source cannot provide the named review
+        // inputs. No job, lane or reviewer exists; this is a refusal, not a
+        // report, and grants no automatic retry.
+        if (error instanceof ReviewSourceUnavailableError) {
+          log('warn', 'review source preflight refused dispatch', { problems: error.problems });
+          json(res, 422, {
+            error: 'review_source_unavailable',
+            detail: error.message,
+            problems: error.problems,
+            retry_authorized: false,
+          });
+          return true;
+        }
+        // Issue #316: named refusal BEFORE any reviewer spawned: the
+        // correction path is part of the answer, and the violations never
+        // carry private text.
+        if (error instanceof BlindInputRefusal) {
+          json(res, error.status, {
+            error: error.code,
+            detail: error.message,
+            correction: error.correction,
+            violations: error.violations,
+            ...error.details,
+          });
+          return true;
+        }
+        throw error;
+      }
       // The minion's turn runs in the background; the board carries the
       // lifecycle. Track it so dispose() never orphans a live lane.
       track(outcome.settled);
@@ -468,12 +649,21 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const body = await readBody(req);
       const by = byField(body);
       const jobId = strField(body, 'job_id');
+      // Firing-rule provenance (issue #243): the delivered-pr-register rule
+      // fires here when Silas registers the one PR the lane actually has.
+      const prRuleId = parseSilasRouteRuleId('pr', strictOptStrField(body, 'rule_id')) ?? undefined;
+      if (prRuleId !== undefined && by !== 'silas') {
+        throw new Error(`rule_id "${prRuleId}" fires only on a silas request`);
+      }
       const job = options.dispatch.recordPr(jobId, strField(body, 'url'));
       if (by === 'silas') {
         options.ledger.appendCustomEvent({
           kind: 'silas.pr-registered',
           jobId,
-          payload: { url: job.prUrl },
+          payload: {
+            url: job.prUrl,
+            ...(prRuleId === undefined ? {} : { rule_id: prRuleId }),
+          },
         });
       }
       json(res, 200, job);
@@ -526,13 +716,25 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const body = await readBody(req);
       const by = byField(body);
       const force = optBoolField(body, 'force');
-      const ruleId = optStrField(body, 'rule_id');
-      const sourceRoundId = optStrField(body, 'source_round_id');
+      const ruleField = strictOptStrField(body, 'rule_id');
+      // The route validator answers `null` for an absent rule; the rest of
+      // this handler keys on `undefined` (an absent field never mints a
+      // `rule_id: null` on the deferral receipt).
+      const ruleId = parseSilasRouteRuleId('review', ruleField) ?? undefined;
+      const sourceRoundId = strictOptStrField(body, 'source_round_id');
       const requestedTargetRef = optStrField(body, 'target_ref');
       const evidenceRefs = optEvidenceField(body);
-      if ((ruleId === undefined) !== (sourceRoundId === undefined) ||
-          (ruleId !== undefined && (by !== 'silas' || ruleId !== 'clean-abort-service-restart'))) {
-        throw new Error('rule_id/source_round_id must be paired and only silas may use clean-abort-service-restart');
+      if (ruleId !== undefined && by !== 'silas') {
+        throw new Error(`rule_id "${ruleId}" fires only on a silas request`);
+      }
+      if (sourceRoundId !== undefined && ruleId === undefined) {
+        throw new Error('source_round_id must be paired with a rule_id');
+      }
+      if (ruleId === 'clean-abort-service-restart' && sourceRoundId === undefined) {
+        throw new Error('rule_id "clean-abort-service-restart" consumes a round — source_round_id is required');
+      }
+      if (ruleId === 'pr-review-trigger' && sourceRoundId !== undefined) {
+        throw new Error('rule_id "pr-review-trigger" is a first/re-review request — it carries no source round');
       }
       const jobId = strField(body, 'job_id');
       // The clean-abort re-arm freezes EXACTLY the proved delivered head:
@@ -546,7 +748,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         const reason = typeof proof?.payload === 'object' && proof.payload !== null
           ? (proof.payload as { reason?: unknown }).reason : null;
         const newestRound = options.ledger.listRounds(jobId).at(-1);
-        const delivered = options.ledger.latestJobEvent(jobId, 'job.delivered');
+        const delivered = options.ledger.latestCandidateDelivery(jobId);
         const sha = delivered === null ? null : deliveredTargetSha(delivered);
         if (round?.jobId !== jobId || round.status !== 'aborted' ||
             newestRound?.id !== sourceRoundId || sha === null || sha !== round.targetRef ||
@@ -660,6 +862,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
               route: outcome.route,
               ...(armed && ruleId !== undefined ? { rule_id: ruleId, source_round_id: sourceRoundId } : {}),
               ...(outcome.route === 'perkins' ? { round_id: outcome.round.id } : {}),
+              // Issue #243 F-H5: the frozen head the round actually armed on,
+              // so #214 can match a predicted bound head to the real target.
+              ...(outcome.route === 'perkins' ? { target_ref: outcome.round.targetRef } : {}),
             },
           });
         }
@@ -852,6 +1057,42 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       if (!authed(req, res)) return true;
       const rows = options.dispatch.worktreesFor(decodeURIComponent(worktreesMatch[1] ?? ''));
       json(res, 200, { worktrees: rows });
+      return true;
+    }
+    // Issue #316: blind-review validity. Derived from the admission and the
+    // reviewer's observed access — settlement/disposition are not inputs.
+    const blindCoverageMatch = /^\/api\/dispatch\/jobs\/([^/]+)\/blind-coverage$/.exec(path);
+    if (req.method === 'GET' && blindCoverageMatch !== null) {
+      if (!authed(req, res)) return true;
+      const jobId = decodeURIComponent(blindCoverageMatch[1] ?? '');
+      if (options.ledger.getJob(jobId) === null) {
+        json(res, 404, { error: 'job_not_found', detail: `job "${jobId}" not found` });
+        return true;
+      }
+      json(res, 200, options.dispatch.blindCoverage(jobId) as unknown as Record<string, unknown>);
+      return true;
+    }
+    if (req.method === 'POST' && path === '/api/dispatch/blind-access') {
+      if (!authed(req, res)) return true;
+      const body = await readBody(req);
+      const jobId = strField(body, 'job_id');
+      const raw = body['tool_results'];
+      if (!Array.isArray(raw) || raw.length === 0) {
+        json(res, 400, { error: 'bad_request', detail: 'tool_results must be a non-empty array of {tool_name?, text}' });
+        return true;
+      }
+      const results = raw.map((entry, index) => {
+        if (typeof entry !== 'object' || entry === null || typeof (entry as { text?: unknown }).text !== 'string') {
+          throw new Error(`tool_results[${index}].text must be a string`);
+        }
+        const toolName = (entry as { tool_name?: unknown }).tool_name;
+        return { index, toolName: typeof toolName === 'string' ? toolName : null, text: (entry as { text: string }).text };
+      });
+      if (options.ledger.getJob(jobId) === null) {
+        json(res, 404, { error: 'job_not_found', detail: `job "${jobId}" not found` });
+        return true;
+      }
+      json(res, 200, options.dispatch.observeBlindAccess(jobId, results) as unknown as Record<string, unknown>);
       return true;
     }
     // Canonical job amendments (owner ruling j-969): authenticated,
@@ -1117,6 +1358,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           jobId,
           directive,
           holder: 'silas-ops',
+          sourceContext: { ...(ruleId === null ? {} : { ruleId }), ...(sourceRoundId === undefined ? {} : { sourceRoundId }) },
           ...(fingerprint !== undefined ? { blockerFingerprint: fingerprint } : {}),
           ...(requestIdField !== undefined ? { requestId: requestIdField } : {}),
           ...(completionHandoff !== undefined ? { handoff: completionHandoff } : {}),
@@ -1189,25 +1431,6 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // bin cannot close the job before any minion row exists. A stale
       // historical intent after a crash is NOT permanent runtime ownership.
       const releaseAdmission = options.ledger.beginJobAdmission(jobId, `directive ${intent.requestId}`);
-      // The contract a FRESH fallback session reads is fixed in the same tick
-      // as the intent's revision stamp (owner rule 4): an amendment accepted
-      // while the writer gate waits travels with the NEXT continuation.
-      const contractAtIntent = options.ledger.effectiveContract(jobId)?.text ?? null;
-      // Owner rule 4: the approved material amendments this lane has not
-      // delivered travel ONCE with this request — canonical text, version
-      // order, stamped with the revision the intent recorded, and rendered
-      // from the amendment set of the SAME tick (a later supersession can
-      // never withhold a body the stamp claims).
-      const workRevision = intent.workRevision ?? 0;
-      const deliveredRevision = options.ledger.workRevisionState(jobId).delivered;
-      const amendmentsAtIntent = options.ledger.listJobAmendments(jobId);
-      const continuation = renderRevisionContinuation({
-        jobId,
-        revision: workRevision,
-        deliveredRevision,
-        pending: pendingMaterialAmendments(amendmentsAtIntent, deliveredRevision, workRevision),
-        supersededBy: amendmentSupersessions(amendmentsAtIntent),
-      });
       // The async turn stays owned and tracked by THIS server instance
       // (the existing directiveControllers/inFlight coordinator — no
       // detached helper, no second chief). Late errors surface durably.
@@ -1234,169 +1457,16 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           });
           return;
         }
-        let delivery: Awaited<ReturnType<typeof routeFixDirectiveToMinion>>;
-        try {
-          delivery = await routeFixDirectiveToMinion({
-            registry: ops.registry,
-            ledger: options.ledger,
-            worktrees: ops.worktrees,
-            jobId,
-            directive,
-            ...(continuation !== ''
-              ? { continuation: { block: continuation, freshNote: renderFreshRevisionNote(workRevision) } }
-              : {}),
-            contract: contractAtIntent,
-            signal: controller.signal,
-            owner: 'silas-ops',
-            ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
-            ...(options.retrySettlement !== undefined ? { retrySettlement: options.retrySettlement } : {}),
-            ...(options.lessons !== undefined ? { lessons: options.lessons } : {}),
-            ...(options.childWorkers !== undefined
-              ? { parentTools: (agentId: string) => options.childWorkers!.parentTools(agentId) }
-              : {}),
-          });
-        } catch (error) {
-          // The turn errored with no positive outcome. A prompt may or may
-          // not have been delivered (shutdown abort vs prompt failure):
-          // admission stays UNKNOWN — record the attempt, never fabricate
-          // an outcome, never auto-retry (boot reconciliation reconciles).
-          options.ledger.recordDirectiveReconcile({
-            requestId: intent.requestId,
-            note: `turn interrupted before admission evidence: ${String(error)}`,
-          });
-          log('error', 'silas directive turn interrupted — request left for reconciliation', {
-            job: jobId,
-            request: intent.requestId,
-            error: String(error),
-          });
-          return;
-        } finally {
-          directiveControllers.delete(controller);
-        }
-        if (!delivery.delivered) {
-          if (delivery.admission === 'unknown') {
-            // The router cannot prove non-admission: cancellation or a
-            // spent/superseded retry AFTER the prompt call. Marking the
-            // request failed would release the single-writer guard while a
-            // prior writer's recovery may still be live. Keep it live with
-            // a durable reconcile note — boot reconciliation escalates it
-            // for a Gru decision, never an automatic retry.
-            options.ledger.recordDirectiveReconcile({
-              requestId: intent.requestId,
-              note:
-                `turn interrupted with unknown admission: ${delivery.note ?? 'no proof of non-delivery'}` +
-                ' — no delivery recorded; reconcile settlement/cessation before releasing the request',
-            });
-            log('warn', 'silas directive turn interrupted — request left live for reconciliation', {
-              job: jobId,
-              request: intent.requestId,
-              note: delivery.note ?? null,
-            });
-            return;
-          }
-          // Positive no-effect proof (no live minion and no job lane): a
-          // durable failure is honest; the caller resubmits fresh work.
-          const reason = delivery.note ?? 'no implementing minion session and no job lane';
-          options.ledger.failDirective({
-            requestId: intent.requestId,
-            reason,
-          });
-          // A marked phase whose request failed with positive no-effect
-          // proof can never complete: close the guard row (no hand-back).
-          const phase = options.ledger.findPhaseHandoffByRequest({ jobId, requestId: intent.requestId });
-          if (phase !== null && phase.state === 'awaiting') {
-            options.ledger.closePhaseHandoff({ phaseId: phase.phaseId, reason: `directive request failed: ${reason}` });
-          }
-          log('warn', 'silas directive undelivered — durable no-effect failure recorded', {
-            job: jobId,
-            request: intent.requestId,
-            note: delivery.note ?? null,
-          });
-          return;
-        }
-        const sent = options.ledger.appendCustomEvent({
-          kind: 'silas.directive-sent',
-          jobId,
-          payload: {
-            request_id: intent.requestId,
-            minion_id: delivery.minionId ?? null,
-            ...(fingerprint !== undefined ? { blocker_fingerprint: fingerprint } : {}),
-            ...(ruleId !== null ? { rule_id: ruleId } : {}),
-            ...(sourceRoundId !== undefined ? { source_round_id: sourceRoundId } : {}),
-            directive_bytes: Buffer.byteLength(directive, 'utf-8'),
-          },
-        });
-        if (delivery.minionId === undefined) {
-          // Admission evidence without the actor identity cannot bind the
-          // request: leave it live for reconciliation, never guess.
-          options.ledger.recordDirectiveReconcile({
-            requestId: intent.requestId,
-            note: 'admission evidence lacked minion identity',
-          });
-          return;
-        }
-        // Native admission evidence: the request is now bound to an actual
-        // awaited turn — recordDirectiveAdmission validates the event.
-        options.ledger.recordDirectiveAdmission({
-          requestId: intent.requestId,
-          minionId: delivery.minionId,
-          eventSeq: sent.seq,
-        });
-        // In-band runtime error (resolved-but-failed: Claude result.isError,
-        // Pi stopReason 'error'): the prompt WAS admitted, so the admission
-        // evidence stands — but there is no successful delivery and NO
-        // phase completion. The request stays admitted with a durable
-        // reconcile note (the boot pass escalates it for a Gru
-        // reconciliation); the recovery decision is preserved without
-        // claiming phase evidence and without auto-retry.
-        if (delivery.outcome === 'error') {
-          options.ledger.appendCustomEvent({
-            kind: 'job.minion-error',
-            jobId,
-            payload: { agentId: delivery.minionId, error: delivery.error ?? 'runtime error' },
-          });
-          options.ledger.recordDirectiveReconcile({
-            requestId: intent.requestId,
-            note:
-              'admitted turn settled with an in-band runtime error' +
-              `${delivery.error === undefined ? '' : `: ${delivery.error}`} — no delivery recorded; reconcile before recording completion`,
-          });
-          log('warn', 'silas directive turn settled with an in-band error — no delivery/completion recorded', {
-            job: jobId,
-            request: intent.requestId,
-            error: delivery.error ?? null,
-          });
-          return;
-        }
-        flipJobToWorking(options.ledger, jobId);
-        // The follow-up delivery signal: the directive turn settled, so record
-        // the delivery (with the lane head it produced) that re-arms review —
-        // correlated to THIS request, so a later unrelated delivery cannot
-        // clear this marker.
-        const markedPhase = options.ledger.findPhaseHandoffByRequest({ jobId, requestId: intent.requestId });
-        const markedPhaseId = markedPhase?.phaseId ?? null;
-        const followUp = recordFollowUpDelivery({
-          ledger: options.ledger,
-          worktrees: ops.worktrees,
-          jobId,
-          agentId: delivery.minionId,
-          source: 'silas-directive',
-          requestId: intent.requestId,
-          // A marked phase carries its host-owned phase id on the delivery:
-          // the completion observer matches on that id, never the event seq.
-          ...(markedPhaseId !== null ? { phaseId: markedPhaseId } : {}),
-          // The service-bound acknowledgement of the revision this request
-          // carried (owner rule 4).
-          workRevision,
-        });
-        if (followUp.note !== null) {
-          log('warn', 'silas follow-up delivery has no resolvable lane head', {
-            job: jobId,
-            lane: followUp.lanePath,
-            note: followUp.note,
-          });
-        }
-        options.ledger.recordDirectiveDelivery({ requestId: intent.requestId, eventSeq: followUp.eventSeq });
+        await executeAcceptedDirective({
+          registry: ops.registry, ledger: options.ledger, worktrees: ops.worktrees,
+          notifications: ops.notifications, pendingProducerBlockers: options.pendingProducerBlockers,
+          signal: controller.signal,
+          ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
+          ...(options.retrySettlement !== undefined ? { retrySettlement: options.retrySettlement } : {}),
+          ...(options.observeBlindTurn !== undefined ? { observeBlindTurn: options.observeBlindTurn } : {}),
+          ...(options.lessons !== undefined ? { lessons: options.lessons } : {}),
+          ...(options.childWorkers !== undefined ? { parentTools: (agentId: string) => options.childWorkers!.parentTools(agentId) } : {}),
+        }, intent.requestId);
       })().catch((error: unknown) => {
         log('error', 'silas directive bookkeeping failed after admission', {
           job: jobId,
@@ -1413,6 +1483,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           // committed; boot reconciliation reads it.
         }
       }).finally(() => {
+        directiveControllers.delete(controller);
         releaseAdmission();
       });
       track(run);
@@ -1426,6 +1497,171 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         work_revision: intent.workRevision ?? 0,
         note: 'accepted — dispatching is not admission; read back GET /api/silas/directives/{request_id}',
       });
+      return true;
+    }
+    const rebriefReadback = /^\/api\/silas\/rebriefs\/([^/]+)$/.exec(path);
+    if (req.method === 'GET' && rebriefReadback !== null) {
+      if (!authed(req, res)) return true;
+      const markerId = decodeURIComponent(rebriefReadback[1]!);
+      const marker = options.ledger.listPendingRebriefs().find((row) => row.id === markerId);
+      const decision = options.ledger.getRebriefRecoveryDecision(markerId);
+      if (marker === undefined && decision === null) { json(res, 404, { error: 'not_found' }); return true; }
+      json(res, 200, { marker_id: markerId, markers: marker === undefined ? [] : options.ledger.listPendingRebriefs({ jobId: marker.jobId }),
+        recovery_decision: decision, recovery_owner: options.ledger.recoveryOwnerReadback('rebrief', markerId),
+        recovery_decision_events: options.ledger.recoveryDecisionHistory('rebrief', markerId).map((history) => options.ledger.getEvent(history.eventSeq)),
+        current_inspection_obligations: options.ledger.recoveryDecisionHistory('rebrief', markerId)
+          .filter((history) => history.currentInspectionObligationId !== null).map((history) => options.ledger.getObligation(history.currentInspectionObligationId!)),
+        current_action_obligation_lineages: options.ledger.rebriefCurrentActionObligationLineages(markerId),
+        receipt_evidence: marker === undefined ? null : options.ledger.rebriefReceiptEvidence(markerId),
+        receipt_evidence_sha256: marker === undefined ? null : options.ledger.rebriefReceiptEvidence(markerId).sha256,
+        current_approved_authority: marker === undefined ? null : options.ledger.directiveCurrentAuthority(marker.jobId),
+        recovery_subject_sha256: marker === undefined ? null : options.ledger.recoverySubject('rebrief', markerId).snapshotSha256,
+        current_authority_epoch: marker === undefined ? null : options.ledger.directiveRecoveryEpoch(marker.jobId),
+        recovery_obligation: marker === undefined ? null : options.ledger.recoveryObligation(marker.jobId, 'rebrief', markerId) });
+      return true;
+    }
+    const ownerResolution = /^\/api\/silas\/(directives|rebriefs)\/([^/]+)\/owner-resolution(?:\/(confirm-stop))?$/.exec(path);
+    if (req.method === 'POST' && ownerResolution !== null) {
+      if (!authed(req, res)) return true;
+      const ops = silasOpsOr503(res);
+      if (ops === null) return true;
+      const body = await readBody(req);
+      if (body['by'] !== 'owner' || body['confirm_intent'] !== true) {
+        json(res, 400, { error: 'bad_request', detail: 'explicit owner attribution and confirm_intent=true are required; shared bearer attribution is not verified identity' });
+        return true;
+      }
+      const number = (key: string): number => {
+        const value = body[key];
+        if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw new DirectiveCheckpointError(`owner action requires ${key}`);
+        return value;
+      };
+      try {
+        const input: RecoveryOwnerActionInput = { kind: ownerResolution[1] === 'directives' ? 'directive' : 'rebrief',
+          subjectId: decodeURIComponent(ownerResolution[2]!), resolutionId: strField(body, 'resolution_id'),
+          transferEventSeq: number('expected_transfer_event_seq'), expectedTransferFingerprint: strField(body, 'expected_transfer_fingerprint'),
+          expectedSubjectSha256: strField(body, 'expected_subject_sha256'), expectedTargetGeneration: number('expected_target_generation'),
+          expectedTargetPlanRevision: number('expected_target_plan_revision'), expectedLineageSha256: strField(body, 'expected_lineage_sha256'),
+          expectedEpoch: number('expected_epoch'), expectedHead: strField(body, 'expected_head'), expectedWorkRevision: number('expected_work_revision'),
+          expectedContractSha256: strField(body, 'expected_contract_sha256'), reason: strField(body, 'reason') };
+        // Consumed identity replay is ledger-only: a later HEAD/stop cannot
+        // rewrite or re-execute the original explicit owner action.
+        const priorPermission = options.ledger.recoveryOwnerResolution(input.kind, input.subjectId, input.resolutionId);
+        const priorConfirmation = options.ledger.recoveryOwnerReadback(input.kind, input.subjectId).confirmation;
+        const confirmationIdentity = (priorConfirmation?.payload as { resolution_id?: unknown } | undefined)?.resolution_id;
+        const consumed = ownerResolution[3] === 'confirm-stop' ? confirmationIdentity === input.resolutionId : priorPermission !== null;
+        if (!consumed) {
+          const subject = options.ledger.recoverySubject(input.kind, input.subjectId);
+          const lanes = ops.worktrees.listWorktrees({ jobId: subject.jobId }).filter((lane) => lane.kind === 'job' && lane.status !== 'swept');
+          if (lanes.length !== 1 || resolveGitCommit(lanes[0]!.path, 'HEAD') !== input.expectedHead) throw new DirectiveCheckpointError('owner action original lane/HEAD is stale or unavailable');
+        }
+        const outcome = ownerResolution[3] === 'confirm-stop'
+          ? options.ledger.confirmRecoveryOwnerStop(input, strField(body, 'expected_resolution_fingerprint'))
+          : options.ledger.recordRecoveryOwnerResolution(input);
+        json(res, 200, { event_seq: outcome.event.seq, idempotent: outcome.idempotent, receipt: outcome.event,
+          note: 'recorded explicit owner action only — job parking, notification Ack, other holds and work execution are unchanged' });
+      } catch (error) {
+        if (!(error instanceof DirectiveCheckpointError || error instanceof DirectiveRetirementError)) throw error;
+        json(res, 409, { error: 'owner_resolution_refused', detail: error.message });
+      }
+      return true;
+    }
+    const directiveRecovery = /^\/api\/silas\/(directives|rebriefs)\/([^/]+)\/recover$/.exec(path);
+    if (req.method === 'POST' && directiveRecovery !== null) {
+      if (!authed(req, res)) return true;
+      const ops = silasOpsOr503(res);
+      if (ops === null) return true;
+      const body = await readBody(req);
+      const requestId = decodeURIComponent(directiveRecovery[2]!);
+      const decision = body['decision'];
+      const generation = body['expected_generation'];
+      const epoch = body['expected_epoch'];
+      if (typeof generation !== 'number' || !Number.isSafeInteger(generation) || generation < 0 ||
+          typeof epoch !== 'number' || !Number.isSafeInteger(epoch) || epoch < 0 ||
+          typeof decision !== 'object' || decision === null || Array.isArray(decision)) {
+        json(res, 400, { error: 'bad_request', detail: 'recover requires expected_generation, expected_epoch and a concrete decision' });
+        return true;
+      }
+      const choice = decision as Record<string, unknown>;
+      if (body['by'] !== 'gru' || (choice['kind'] !== 'successor' && choice['kind'] !== 'owner-decision' &&
+          !(directiveRecovery[1] === 'rebriefs' && choice['kind'] === 'reconcile-completed'))) {
+        json(res, 400, { error: 'bad_request', detail: 'concrete recovery judgment must be attributed to Gru; generic Ops holds are not decisions' });
+        return true;
+      }
+      const revision = body['expected_work_revision'];
+      if (choice['kind'] !== 'owner-decision' && (typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 0 ||
+          typeof body['expected_contract_sha256'] !== 'string' || !/^[a-f0-9]{64}$/.test(body['expected_contract_sha256']))) {
+        json(res, 400, { error: 'bad_request', detail: 'successor requires current expected_work_revision and expected_contract_sha256' });
+        return true;
+      }
+      try {
+        const recoveryInput = { ledger: options.ledger, worktrees: ops.worktrees,
+          pendingProducerBlockers: options.pendingProducerBlockers,
+          ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
+          requestId, generation, expectedPayloadHash: strField(body, 'expected_payload_hash'),
+          expectedHead: strField(body, 'expected_head'), expectedEpoch: epoch,
+          ...(choice['kind'] !== 'owner-decision' ? { expectedWorkRevision: revision as number, expectedContractSha256: strField(body, 'expected_contract_sha256') } : {}), reason: strField(body, 'reason'),
+        } as const;
+        let outcome: ReturnType<typeof recoverInterruptedDirectiveFromRoute>;
+        if (choice['kind'] === 'reconcile-completed') {
+          outcome = recoverInterruptedRebriefFromRoute({ ...recoveryInput, markerId: requestId,
+            decision: { kind: 'reconcile-completed', inspectionRequestId: strField(choice, 'inspection_request_id') },
+            expectedReceiptEvidenceSha256: strField(body, 'expected_receipt_evidence_sha256') });
+        } else {
+          const nativeDecision = choice['kind'] === 'successor'
+            ? { kind: 'successor' as const, requestId: strField(choice, 'request_id'), directive: strField(choice, 'directive') }
+            : { kind: 'owner-decision' as const, obligationId: strField(choice, 'obligation_id') };
+          const direct = directiveRecovery[1] === 'directives';
+          const receiptSha256 = direct ? undefined : strField(body, 'expected_receipt_evidence_sha256');
+          if (nativeDecision.kind === 'successor') {
+            // Consumed generations are ledger-only, even after the lane is
+            // gone. Neither an exact nor a conflicting replay may stop work.
+            const consumed = direct
+              ? options.ledger.recoveryDecisionHistory('directive', requestId).some((entry) => entry.generation === generation)
+              : options.ledger.getRebriefRecoveryDecision(requestId, generation) !== null;
+            const subject = direct ? options.ledger.getDirective(requestId) : options.ledger.listPendingRebriefs().find((entry) => entry.id === requestId);
+            if (!consumed && subject != null && options.wave.activeReview(subject.jobId) !== null) {
+              const lane = resolveRetirementLane(ops.worktrees, subject.jobId);
+              const resolved = { id: lane.id, resolvedHead: resolveGitCommit(lane.path, 'HEAD') };
+              const jobId = options.ledger.validateRecoverySuccessorBeforeWriterClearance(direct
+                ? { ...recoveryInput, subjectKind: 'directive', decision: nativeDecision, lane: resolved }
+                : { ...recoveryInput, subjectKind: 'rebrief', markerId: requestId, expectedReceiptEvidenceSha256: receiptSha256!, decision: nativeDecision, lane: resolved });
+              if (jobId !== null) {
+                try {
+                  options.wave.assertWriterAdmissible(jobId); // only approved obsolete candidates
+                  await options.wave.clearLaneForWriter({ jobId, writer: `directive ${nativeDecision.requestId}` });
+                } catch (error) { throw new DirectiveCheckpointError(`obsolete review writer clearance remains unproven: ${String(error)}`); }
+              }
+            }
+          }
+          // Re-resolve/revalidate after the awaited positive stop. The
+          // retirement/decision predicates are unchanged; clearance grants
+          // neither cessation of any other producer nor fresh work permission.
+          outcome = direct ? recoverInterruptedDirectiveFromRoute({ ...recoveryInput, decision: nativeDecision }) :
+            recoverInterruptedRebriefFromRoute({ ...recoveryInput, markerId: requestId, decision: nativeDecision,
+              expectedReceiptEvidenceSha256: receiptSha256! });
+        }
+        if (choice['kind'] === 'owner-decision') surfaceRecoveryOwnerTransfer({ ledger: options.ledger, notifications: ops.notifications },
+          directiveRecovery[1] === 'directives' ? 'directive' : 'rebrief', requestId);
+        // Execution is owned by the same server and scheduled once only.
+        if (!outcome.idempotent && outcome.successor !== null) {
+          const controller = new AbortController();
+          directiveControllers.add(controller);
+          const run = executeAcceptedDirective({ registry: ops.registry, ledger: options.ledger, worktrees: ops.worktrees,
+            notifications: ops.notifications, pendingProducerBlockers: options.pendingProducerBlockers, signal: controller.signal,
+            ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
+            ...(options.retrySettlement !== undefined ? { retrySettlement: options.retrySettlement } : {}),
+            ...(options.observeBlindTurn !== undefined ? { observeBlindTurn: options.observeBlindTurn } : {}),
+            ...(options.lessons !== undefined ? { lessons: options.lessons } : {}),
+            ...(options.childWorkers !== undefined ? { parentTools: (agentId: string) => options.childWorkers!.parentTools(agentId) } : {}),
+          }, outcome.successor.requestId).finally(() => directiveControllers.delete(controller));
+          track(run);
+        }
+        json(res, !outcome.idempotent && outcome.successor !== null ? 202 : 200,
+          { request_id: requestId, idempotent: outcome.idempotent, successor_request_id: outcome.successor?.requestId ?? null });
+      } catch (error) {
+        if (!(error instanceof DirectiveCheckpointError || error instanceof DirectiveRetirementError)) throw error;
+        json(res, 409, { error: 'recovery_refused', detail: error.message });
+      }
       return true;
     }
     const directiveRetirement = /^\/api\/silas\/directives\/([^/]+)\/retire$/.exec(path);
@@ -1529,7 +1765,20 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         fail_reason: record.failReason,
         // The contract revision this request carried (owner rule 4); null
         // for a request accepted before work revisions existed.
+        request_kind: record.requestKind,
+        source_context: record.sourceContext,
         work_revision: record.workRevision,
+        authority_epoch: record.authorityEpoch,
+        current_authority_epoch: options.ledger.directiveRecoveryEpoch(record.jobId),
+        current_approved_authority: options.ledger.directiveCurrentAuthority(record.jobId),
+        contract_sha256: record.contractSha256,
+        native_target: record.nativeTarget,
+        native_binding: record.nativeBinding,
+        recovery_checkpoint: record.recoveryCheckpoint,
+        recovery_decision: record.recoveryDecision,
+        recovery_owner: options.ledger.recoveryOwnerReadback('directive', requestId),
+        recovery_subject_sha256: options.ledger.recoverySubject('directive', requestId).snapshotSha256,
+        recovery_obligation: options.ledger.recoveryObligation(record.jobId, 'directive', record.requestId),
         ...(record.state === 'retired'
           ? {
               admission_class: directiveAdmissionClass(record),
@@ -1586,248 +1835,48 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       if (isJobTerminal(job.status)) {
         throw new Error(`job "${jobId}" is ${job.status} — terminal lanes are never re-briefed`);
       }
-      // Owner rules 3/5: same writer admission as a directive — a lane under
-      // review takes a re-brief only when an approved material change made
-      // the reviewed candidate obsolete. That review is superseded and
-      // PROVEN stopped before the durable request exists (a re-brief marker
-      // cannot be withdrawn without fabricating its guarded events), then
-      // admission is re-proved synchronously with the marker write.
-      const admitWriter = (): boolean => {
-        try {
-          options.wave.assertWriterAdmissible(jobId);
-          return true;
-        } catch (error) {
-          if (error instanceof ReviewInProgressError) {
-            json(res, 409, { error: 'review_in_progress', detail: error.message, round_ids: error.roundIds });
-            return false;
-          }
-          throw error;
+      const requestId = strictOptStrField(body, 'request_id');
+      if (requestId === undefined || options.ledger.getDirective(requestId) === null) {
+        try { options.wave.assertWriterAdmissible(jobId); }
+        catch (error) {
+          if (!(error instanceof ReviewInProgressError)) throw error;
+          json(res, 409, { error: 'review_in_progress', detail: error.message }); return true;
         }
-      };
-      if (!admitWriter()) return true;
+      }
+      let begun;
       try {
-        await options.wave.clearLaneForWriter({ jobId, writer: `re-brief for job ${jobId}` });
+        begun = options.ledger.beginRebriefIntent({ jobId, note, holder: 'silas-ops',
+          ...(requestId === undefined ? {} : { requestId }), ...(completionHandoff === undefined ? {} : { handoff: completionHandoff }),
+          sourceContext: { ...(ruleId === null ? {} : { ruleId }), ...(sourceRoundId === undefined ? {} : { sourceRoundId }) } });
       } catch (error) {
-        if (!(error instanceof ReviewSupersessionUnconfirmedError)) throw error;
-        log('warn', 'silas re-brief refused: the superseded review could not be proven stopped', {
-          job: jobId, detail: error.detail,
-        });
-        json(res, 409, { error: 'review_supersession_unconfirmed', detail: error.message });
+        if (!(error instanceof LaneWriterConflictError || error instanceof AmbiguousDirectiveError || error instanceof DirectiveConflictError || error instanceof PhaseHandoffConflictError)) throw error;
+        json(res, 409, { error: 'writer_conflict', detail: error.message }); return true;
+      }
+      const intent = begun.record;
+      if (!begun.created) {
+        json(res, intent.state === 'dispatching' || intent.state === 'admitted' ? 202 : 200,
+          { request_id: intent.requestId, job_id: jobId, state: intent.state, replay: true });
         return true;
       }
-      const jobAtMarker = options.ledger.getJob(jobId);
-      if (jobAtMarker === null) throw new Error(`job "${jobId}" not found`);
-      if (isJobTerminal(jobAtMarker.status)) {
-        throw new Error(`job "${jobId}" is ${jobAtMarker.status} — terminal lanes are never re-briefed`);
-      }
-      if (!admitWriter()) return true;
-      // A fresh worker has no memory of accepted amendments: it is briefed
-      // with the EFFECTIVE contract (owner rule 4), recorded on the durable
-      // marker so a restart re-delivers exactly this contract.
-      const contract = options.ledger.effectiveContract(jobId)?.text ?? jobAtMarker.briefing;
-      // Restart-safe by construction: the request markers are durable
-      // BEFORE any worker exists, and clear only when their events land.
-      // A restart mid-turn leaves them for the boot reconciler.
-      let markers: ReturnType<typeof options.ledger.beginPendingRebrief>;
-      try {
-        markers = options.ledger.beginPendingRebrief({
-          jobId,
-          note,
-          briefing: contract,
-          ...(ruleId !== null ? { ruleId } : {}),
-          ...(sourceRoundId !== undefined ? { sourceRoundId } : {}),
-          ...(completionHandoff !== undefined ? { handoff: completionHandoff } : {}),
-        });
-      } catch (error) {
-        if (error instanceof LaneWriterConflictError) {
-          json(res, 409, { error: 'writer_conflict', detail: error.message });
-          return true;
-        }
-        throw error;
-      }
-      const workRevision = markers.find((marker) => marker.workRevision !== null)?.workRevision ?? 0;
-      const rebriefPhaseId = markers.find((marker) => marker.phaseId !== null)?.phaseId ?? null;
-      const closeFailedTerminalTurn = (error: unknown): ReturnType<typeof finalizeRebriefRequest> | null => {
-        const currentJob = options.ledger.getJob(jobId);
-        if (currentJob === null || !isJobTerminal(currentJob.status)) return null;
-        // Failure evidence remains, but the obsolete request cannot be
-        // retried on a terminal job. Close only the admitted generation.
-        const closed = finalizeRebriefRequest({
-          ledger: options.ledger, worktrees: ops.worktrees, jobId,
-          minionId: null, lanePath: null, note, expectedMarkers: markers,
-        });
-        log('info', 'silas re-brief failed after terminality — request closed', {
-          job: jobId, error: String(error), retired: closed.retired,
-          superseded: closed.superseded,
-          ...(closed.retirement !== null ? { refused: closed.retirement.refused, skipped: closed.retirement.skippedIds } : {}),
-        });
-        return closed;
-      };
+      const release = options.ledger.beginJobAdmission(jobId, `rebrief ${intent.requestId}`);
       const controller = new AbortController();
       directiveControllers.add(controller);
-      let result: Awaited<ReturnType<typeof rebriefFreshMinion>>;
-      try {
-        result = await rebriefFreshMinion({
-          registry: ops.registry,
-          ledger: options.ledger,
-          worktrees: ops.worktrees,
-          signal: controller.signal,
-          ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
-          ...(options.retrySettlement !== undefined ? { retrySettlement: options.retrySettlement } : {}),
-          ...(options.childWorkers !== undefined
-            ? { parentTools: (agentId: string) => options.childWorkers!.parentTools(agentId) }
-            : {}),
-          jobId,
-          note,
-          briefing: contract,
-          workRevision,
-          beforeTurnSideEffect: () => checkRebriefTurn(options.ledger, jobId, markers),
-          onSpawned: (worker) => {
-            options.ledger.bindPendingRebriefWorker({
-              ids: markers.map((marker) => marker.id),
-              agentId: worker.id,
-              sessionFile: worker.sessionFile,
-            });
-          },
-          ...(options.lessons !== undefined ? { lessons: options.lessons } : {}),
-        });
-      } catch (error) {
-        if (!(error instanceof RebriefTurnCancelled)) {
-          let closed: ReturnType<typeof finalizeRebriefRequest> | null = null;
-          try {
-            closed = closeFailedTerminalTurn(error);
-          } catch (closureError) {
-            log('error', 'silas re-brief failure could not close terminal request', {
-              job: jobId, error: String(error), closure_error: String(closureError),
-            });
-          }
-          if (closed === null && !isJobTerminal(options.ledger.getJob(jobId)?.status ?? 'working')) throw error;
-          json(res, 400, {
-            error: 'bad_request',
-            detail: String(error instanceof Error ? error.message : error),
-            ...(closed?.retired === true ? { retired: true } : {}),
-            ...(closed?.superseded === true ? { superseded: true } : {}),
-            ...(closed?.retirement !== undefined && closed.retirement !== null
-              ? { retirement: { refused: closed.retirement.refused, skipped_ids: closed.retirement.skippedIds } } : {}),
-          });
-          return true;
-        }
-        const cancelled = finalizeRebriefRequest({
-          ledger: options.ledger, worktrees: ops.worktrees, jobId,
-          minionId: null, lanePath: null, note, expectedMarkers: markers,
-        });
-        log('info', 'silas re-brief cancelled before admission', {
-          job: jobId, reason: error.reason, retired: cancelled.retired,
-          superseded: cancelled.superseded,
-          ...(cancelled.retirement !== null
-            ? { refused: cancelled.retirement.refused, skipped: cancelled.retirement.skippedIds } : {}),
-        });
-        json(res, 200, {
-          job_id: jobId, minion_id: null, delivered_sha: null,
-          ...(cancelled.retired ? { retired: true } : {}),
-          ...(cancelled.superseded ? { superseded: true } : {}),
-          ...(cancelled.retirement !== null
-            ? { retirement: { refused: cancelled.retirement.refused, skipped_ids: cancelled.retirement.skippedIds } } : {}),
-        });
-        return true;
-      } finally {
-        directiveControllers.delete(controller);
-      }
-      if (result.outcome === 'error') {
-        // In-band runtime error: the re-brief turn resolved but failed. No
-        // delivery, no `silas.rebrief`, no phase completion — the durable
-        // markers stay pending for the boot recovery ladder, and the error
-        // is on the record honestly. The request was NOT a successful
-        // completion and must never complete a marked phase.
-        options.ledger.appendCustomEvent({
-          kind: 'job.minion-error',
-          jobId,
-          payload: { agentId: result.minionId, error: result.error ?? 'runtime error' },
-        });
-        const closed = closeFailedTerminalTurn(result.error ?? 'runtime error');
-        log('warn', 're-brief turn settled with an in-band error — no delivery recorded', {
-          job: jobId,
-          minion: result.minionId,
-          error: result.error ?? null,
-          retired: closed?.retired ?? false,
-        });
-        json(res, 202, {
-          job_id: jobId,
-          minion_id: result.minionId,
-          state: 'turn-error',
-          error: result.error ?? null,
-          ...(closed?.retired === true ? { retired: true } : {}),
-          ...(closed?.superseded === true ? { superseded: true } : {}),
-          ...(closed?.retirement !== undefined && closed.retirement !== null
-            ? { retirement: { refused: closed.retirement.refused, skipped_ids: closed.retirement.skippedIds } } : {}),
-          note:
-            'the re-brief turn settled with an in-band runtime error; no delivery or phase completion ' +
-            (closed?.retired === true
-              ? 'was recorded and the terminal request was retired'
-              : 'was recorded and the request markers stay pending for restart reconciliation'),
-        });
-        return true;
-      }
-      // The follow-up delivery signal: the fresh minion's re-brief turn
-      // settled; record the delivery that re-arms the re-review. Both
-      // events land before their markers clear (idempotent on replay).
-      const followUp = finalizeRebriefRequest({
-        ledger: options.ledger,
-        worktrees: ops.worktrees,
-        jobId,
-        minionId: result.minionId,
-        lanePath: result.lanePath,
-        note,
-        expectedPhaseId: rebriefPhaseId,
-        expectedMarkers: markers,
-      });
-      if (followUp.retired) {
-        // The job reached terminal while the turn was in flight: the
-        // request was administratively retired; no events were fabricated.
-        // A partial retirement carries its kept-marker ids here too — the
-        // response already carries `retirement`, and this log must not
-        // silently drop the same disposition.
-        log('info', 'silas re-brief retired: job went terminal before the turn settled', {
-          job: jobId,
-          minion_id: result.minionId,
-          ...(followUp.retirement !== null
-            ? { refused: followUp.retirement.refused, skipped: followUp.retirement.skippedIds }
-            : {}),
-        });
-      } else if (followUp.retirement !== null) {
-        // A defensive boundary refused the retirement or the marker identity
-        // drifted: the markers stay for the next pass and nothing was
-        // fabricated. Surface it instead of an unexplained ordinary 200.
-        log('warn', 'silas re-brief retirement incomplete: markers kept for the next pass', {
-          job: jobId,
-          refused: followUp.retirement.refused,
-          skipped: followUp.retirement.skippedIds,
-        });
-      }
-      if (followUp.superseded) {
-        log('warn', 're-brief request superseded while its turn ran — newer request owns the lane', {
-          job: jobId,
-          request_phase: rebriefPhaseId,
-        });
-      }
-      if (followUp.deliveryNote !== null) {
-        log('warn', 'silas follow-up delivery has no resolvable lane head', {
-          job: jobId,
-          lane: result.lanePath,
-          note: followUp.deliveryNote,
-        });
-      }
-      json(res, 200, {
-        job_id: jobId,
-        minion_id: result.minionId,
-        lane: result.lanePath,
-        delivered_sha: followUp.deliveredSha,
-        ...(followUp.retired ? { retired: true } : {}),
-        ...(followUp.superseded ? { superseded: true } : {}),
-        ...(followUp.retirement !== null
-          ? { retirement: { refused: followUp.retirement.refused, skipped_ids: followUp.retirement.skippedIds } }
-          : {}),
-      });
+      const run = (async () => {
+        await executeAcceptedDirective({ registry: ops.registry, ledger: options.ledger, worktrees: ops.worktrees,
+          clearLaneForWriter: (input) => options.wave.clearLaneForWriter(input),
+          notifications: ops.notifications, pendingProducerBlockers: options.pendingProducerBlockers, signal: controller.signal,
+          ...(options.workerGate === undefined ? {} : { workerGate: options.workerGate }),
+          ...(options.retrySettlement === undefined ? {} : { retrySettlement: options.retrySettlement }),
+          ...(options.observeBlindTurn === undefined ? {} : { observeBlindTurn: options.observeBlindTurn }),
+          ...(options.lessons === undefined ? {} : { lessons: options.lessons }),
+          ...(options.childWorkers === undefined ? {} : { parentTools: (agentId: string) => options.childWorkers!.parentTools(agentId) }),
+        }, intent.requestId);
+      })().catch((error: unknown) => {
+        options.ledger.recordDirectiveReconcile({ requestId: intent.requestId, note: String(error) });
+      }).finally(() => { release(); directiveControllers.delete(controller); });
+      track(run);
+      json(res, 202, { request_id: intent.requestId, job_id: jobId, state: intent.state, work_revision: intent.workRevision,
+        note: 'accepted rebrief — exact native admission/completion readable via GET /api/silas/directives/{request_id}' });
       return true;
     }
     if (req.method === 'POST' && path === '/api/silas/escalate') {
@@ -1978,7 +2027,8 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // report disposition endpoint this hook adds — claim only that exact
       // shape, or /api/jobs/{id}/status and friends would 404 here.
       const isDisposition = path.startsWith('/api/jobs/') && path.endsWith('/disposition');
-      if (!path.startsWith('/api/dispatch') && !path.startsWith('/api/silas') && !path.startsWith('/api/pipeline') && !isDisposition) {
+      const isProperty = /^\/api\/jobs\/[^/]+\/property-campaigns(?:\/|$)/u.test(path);
+      if (!isProperty && !path.startsWith('/api/dispatch') && !path.startsWith('/api/silas') && !path.startsWith('/api/pipeline') && path !== '/api/intake' && !path.startsWith('/api/intake/') && !isDisposition) {
         return false;
       }
       const startedAt = Date.now();
@@ -2008,6 +2058,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // Abort any in-flight directive/re-brief turns so shutdown cannot
       // stall on a wedged minion session; tracked lanes settle on abort.
       for (const controller of directiveControllers) controller.abort();
+      void options.propertyCampaigns?.dispose();
     },
   };
 }

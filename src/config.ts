@@ -5,6 +5,7 @@ import { parse, type TomlPrimitive } from 'smol-toml';
 import { parseQuietHours } from './chat/wake-policy.js';
 import { DEFAULT_INPUT_PRICE_PER_MTOK, validateProviderProfile } from './decisions/profile.js';
 import type { SurfaceMode } from './decisions/types.js';
+import { SILAS_AUTOPILOT_RULE_IDS } from './dispatch/silas-rules.js';
 
 /** Roles are product-native and runtime-agnostic (SPEC ruling 15). */
 export const ROLES = ['gru', 'silas', 'minion', 'perkins', 'bob'] as const;
@@ -181,6 +182,8 @@ export interface ChatConfig {
    * provider walls, needs-owner) always wake regardless. false restores
    * pre-#219 behavior. */
   readonly wakeDeferCovered: boolean;
+  /** Code-only durable mailbox recovery cadence; no browser required. */
+  readonly mailboxReconcileIntervalMs: number;
   /** Morning digest gap (ms): the first delivered block after this much
    * quiet time carries a "while you were away" digest (fires, actions,
    * merges, staged PRs) so the chief catches up without the owner
@@ -262,8 +265,10 @@ export interface SilasConfig {
   /** Sweep wake gate (issue #217): a sweep whose digest fingerprint is
    * unchanged does not re-wake Silas until this much time has passed
    * since the last delivered wake (a bounded safety re-look). 0 = never
-   * re-wake on an unchanged digest; a changed digest, an event trigger
-   * or a passed decision recheck always wakes. */
+   * re-wake on an unchanged digest; a changed digest, an event whose
+   * digest is non-empty, or a passed decision recheck always wakes (an
+   * empty digest never wakes on its own — a due decision recheck still
+   * does, issue #243). */
   readonly unchangedRewakeMs: number;
   /** Consecutive same-blocker rounds before a fix directive is advised. */
   readonly directiveAt: number;
@@ -271,7 +276,27 @@ export interface SilasConfig {
   readonly rebriefAt: number;
   /** Consecutive same-blocker rounds before escalation to the chief. */
   readonly escalateAt: number;
+  /** Silas autopilot (issue #243): the unambiguous rule families executed
+   * in code before any LLM wake. */
+  readonly autopilot: SilasAutopilotConfig;
 }
+
+/** One rule family's mode. `dry-run` records the decision and makes no
+ * call; `enforce` performs exactly one call; `off` does neither. */
+export type SilasAutopilotRuleMode = 'off' | 'dry-run' | 'enforce';
+
+/**
+ * Silas autopilot policy (issue #243). `enabled` is the global kill switch
+ * — default OFF, so no autopilot decision is recorded or acted on until an
+ * owner turns it on. `rules` overlays per-family modes on the `dry-run`
+ * default: enabling the autopilot never enforces a family by itself.
+ */
+export interface SilasAutopilotConfig {
+  readonly enabled: boolean;
+  readonly rules: Readonly<Record<string, SilasAutopilotRuleMode>>;
+}
+
+export const DEFAULT_SILAS_AUTOPILOT_CONFIG: SilasAutopilotConfig = { enabled: false, rules: {} };
 
 export const DEFAULT_SILAS_CONFIG: SilasConfig = {
   enabled: true,
@@ -282,6 +307,7 @@ export const DEFAULT_SILAS_CONFIG: SilasConfig = {
   directiveAt: 2,
   rebriefAt: 3,
   escalateAt: 4,
+  autopilot: DEFAULT_SILAS_AUTOPILOT_CONFIG,
 };
 
 /** Provider pacing is independent of resident-session [concurrency].
@@ -965,6 +991,7 @@ export function loadConfig(
     wakeMinSeverity: 'info',
     wakeQuietHours: null,
     wakeDeferCovered: true,
+    mailboxReconcileIntervalMs: 300_000,
     morningDigestGapMs: 28_800_000,
   };
   let worktrees: WorktreesConfig | null = null;
@@ -1198,6 +1225,7 @@ export function loadConfig(
         'wake_min_severity',
         'wake_quiet_hours',
         'wake_defer_covered',
+        'mailbox_reconcile_interval_ms',
         'morning_digest_gap_ms',
       ];
       for (const key of Object.keys(table)) {
@@ -1232,6 +1260,9 @@ export function loadConfig(
           table['wake_defer_covered'] !== undefined
             ? requireBool(table['wake_defer_covered'], file, 'chat.wake_defer_covered')
             : chat.wakeDeferCovered,
+        mailboxReconcileIntervalMs: table['mailbox_reconcile_interval_ms'] !== undefined
+          ? requireTimerInterval(requirePositiveInt(table['mailbox_reconcile_interval_ms'], file, 'chat.mailbox_reconcile_interval_ms'), file, 'chat.mailbox_reconcile_interval_ms')
+          : chat.mailboxReconcileIntervalMs,
         morningDigestGapMs:
           table['morning_digest_gap_ms'] !== undefined
             ? requireNonNegativeInt(table['morning_digest_gap_ms'], file, 'chat.morning_digest_gap_ms')
@@ -1321,7 +1352,7 @@ export function loadConfig(
     }
     if (raw['silas'] !== undefined) {
       const table = requireTable(raw['silas'], file, 'silas');
-      const VALID = ['enabled', 'sweep_interval_ms', 'unchanged_rewake_ms', 'poll_interval_ms', 'stall_threshold_ms', 'directive_at', 'rebrief_at', 'escalate_at'];
+      const VALID = ['enabled', 'sweep_interval_ms', 'unchanged_rewake_ms', 'poll_interval_ms', 'stall_threshold_ms', 'directive_at', 'rebrief_at', 'escalate_at', 'autopilot'];
       for (const key of Object.keys(table)) {
         if (!VALID.includes(key)) {
           throw new ConfigError(
@@ -1359,6 +1390,10 @@ export function loadConfig(
         directiveAt,
         rebriefAt,
         escalateAt,
+        autopilot:
+          table['autopilot'] !== undefined
+            ? readSilasAutopilotConfig(table['autopilot'], file)
+            : silas.autopilot,
       };
     }
     if (raw['provider_recovery'] !== undefined) {
@@ -1602,6 +1637,55 @@ const PACING_KEYS = [
   'max_auto_retries',
   'providers',
 ] as const;
+
+/** Parse the `[silas.autopilot]` table (issue #243): the global kill
+ * switch plus per-family modes. Both levels fail loud — an unknown rule id
+ * or an unknown mode must never silently fall back to the dry-run default,
+ * which is exactly the mistake a rollout relies on this parser to catch. */
+function readSilasAutopilotConfig(value: unknown, file: string): SilasAutopilotConfig {
+  const table = requireTable(value, file, 'silas.autopilot');
+  const VALID = ['enabled', 'rules'];
+  for (const key of Object.keys(table)) {
+    if (!VALID.includes(key)) {
+      throw new ConfigError(
+        `unknown key \`${key}\` in [silas.autopilot] (valid keys: ${VALID.join(', ')})`,
+        file,
+        `silas.autopilot.${key}`,
+      );
+    }
+  }
+  const enabled =
+    table['enabled'] !== undefined
+      ? requireBool(table['enabled'], file, 'silas.autopilot.enabled')
+      : DEFAULT_SILAS_AUTOPILOT_CONFIG.enabled;
+  if (table['rules'] === undefined) return { enabled, rules: {} };
+  const rulesTable = requireTable(table['rules'], file, 'silas.autopilot.rules');
+  // Null-prototype map: a rule id like "__proto__" must land as an own
+  // entry, never mutate the map's prototype or vanish silently.
+  const rules: Record<string, SilasAutopilotRuleMode> = Object.create(null) as Record<
+    string,
+    SilasAutopilotRuleMode
+  >;
+  for (const [ruleId, mode] of Object.entries(rulesTable)) {
+    if (!(SILAS_AUTOPILOT_RULE_IDS as readonly string[]).includes(ruleId)) {
+      throw new ConfigError(
+        `silas.autopilot.rules names \`${ruleId}\`, which is not an autopilot rule family ` +
+          `(known: ${SILAS_AUTOPILOT_RULE_IDS.join(', ')})`,
+        file,
+        `silas.autopilot.rules.${ruleId}`,
+      );
+    }
+    if (mode !== 'off' && mode !== 'dry-run' && mode !== 'enforce') {
+      throw new ConfigError(
+        `silas.autopilot.rules.${ruleId} must be one of "off", "dry-run", "enforce", got: ${JSON.stringify(mode)}`,
+        file,
+        `silas.autopilot.rules.${ruleId}`,
+      );
+    }
+    rules[ruleId] = mode;
+  }
+  return { enabled, rules };
+}
 
 /** Parse a [pacing] table. Fail loud on unknown
  * keys, wrong types, non-compiling patterns, and an inverted backoff

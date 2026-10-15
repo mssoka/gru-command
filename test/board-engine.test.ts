@@ -1088,6 +1088,32 @@ describe('board engine — managed repository overview wiring', () => {
     expect(mainSource).toMatch(/new ManagedRepoOverviewTracker\(\{[\s\S]*?workspaceRoot:\s*config\.workspaceRoot/);
     expect(mainSource).toMatch(/repoOverview:\s*\(\)\s*=>\s*repoOverview\.view\(\)/);
     expect(mainSource).toMatch(/repoOverview\.start\(\)/);
-    expect(mainSource).toMatch(/state\.repoOverview\?\.stop\(\)/);
+    // The stop moved into the extracted shutdown orchestration (issue #341),
+    // which main.ts invokes; the alarm follows the production wiring.
+    const shutdownSource = readFileSync(join(import.meta.dirname, '..', 'src', 'service-shutdown.ts'), 'utf8');
+    expect(shutdownSource).toMatch(/state\.repoOverview\?\.stop\(\)/);
+  });
+});
+
+
+describe('GH-305 shared mailbox board readback', () => {
+  it('projects child attention independently of terminal parent and keeps delivery-only receipts unresolved', () => {
+    const db = new LedgerDb(tmpDir());
+    const bus = new EventBus();
+    const api = new LedgerApi(db.handle, { bus });
+    try {
+      api.addJob({ id: 'parent', repo: 'r', title: 'parent' });
+      api.setJobStatus('parent', 'working');
+      api.setJobStatus('parent', 'done');
+      api.addJob({ id: 'child', repo: 'r', title: 'child', parentJobId: 'parent', deliverable: 'review' });
+      api.setJobStatus('child', 'blocked');
+      const engine = new BoardEngine({ ledger: api, bus });
+      const item = engine.snapshot().mailbox.items[0]!;
+      expect(item.jobId).toBe('child');
+      engine.mailbox.received(item.id, item.basis, 'wake', 'accepted-turn');
+      expect(engine.snapshot().mailbox.items[0]?.state).toBe('needs-gru');
+      expect(engine.snapshot().mailbox.counts).toMatchObject({ threads: 1, incidents: 0, notifications: 0 });
+      expect(engine.snapshot().mailbox).toEqual(engine.mailbox.snapshot());
+    } finally { db.close(); }
   });
 });

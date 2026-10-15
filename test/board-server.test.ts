@@ -3,8 +3,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { WebSocket, type RawData } from 'ws';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { WebSocket, WebSocketServer, type RawData } from 'ws';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { BoardEngine } from '../src/board/engine.js';
 import { createBoardServer } from '../src/board/server.js';
@@ -18,6 +18,9 @@ import { DecisionRuntime } from '../src/decisions/runtime.js';
 import { DREAM_FAILED_KIND, dreamFailureIncidents } from '../src/lessons/dream.js';
 import { ROLE_DEFINITIONS } from '../src/roles.js';
 import type { RepoOverviewView } from '../src/repos/overview.js';
+import type { DecisionRecord } from '../src/ledger/decision-memory.js';
+import type { MailboxItem } from '../src/ledger/mailbox.js';
+import { reconcileReportClosures } from '../src/dispatch/durable-reconcile.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -41,6 +44,7 @@ async function boot(
   api: LedgerApi;
   bus: EventBus;
   board: ReturnType<typeof createBoardServer>;
+  engine: BoardEngine;
   close: () => Promise<void>;
 }> {
   const dir = tmpDir();
@@ -98,6 +102,7 @@ async function boot(
     api,
     bus,
     board,
+    engine,
     async close() {
       decisions.dispose();
       await board.dispose();
@@ -153,6 +158,27 @@ class BoardClient {
     this.socket.close();
     return this.closed;
   }
+
+  terminate(): Promise<number> {
+    this.socket.terminate();
+    return this.closed;
+  }
+}
+
+/** Capture the actual server peer to assert auth callback containment synchronously:
+ * an escaped exception must fail an assertion, not strand ws's receiver teardown. */
+async function openBoardPeer(client: BoardClient): Promise<WebSocket> {
+  let peer: WebSocket | undefined;
+  const emit = WebSocketServer.prototype.emit;
+  const observer = vi.spyOn(WebSocketServer.prototype, 'emit').mockImplementation(function (this: WebSocketServer, event, ...args) {
+    if (event === 'connection') peer = args[0] as WebSocket;
+    return Reflect.apply(emit, this, [event, ...args]) as boolean;
+  });
+  try {
+    await client.open();
+    if (peer === undefined) throw new Error('board server peer was not connected');
+    return peer;
+  } finally { observer.mockRestore(); }
 }
 
 async function getJson(port: number, path: string, token: string | null): Promise<{ status: number; body: unknown }> {
@@ -185,6 +211,72 @@ describe('board server — HTTP API', () => {
 
   beforeAll(async () => {
     harness = await boot('board-test-token');
+  });
+
+  it('G24 authenticated disposition succeeds and GET reads back durable ownership without changing job authority', async () => {
+    const isolated = await boot('disposition-token');
+    try {
+      isolated.api.addJob({ id: 'disposition-job', repo: 'r', title: 'waiting for owner' });
+      isolated.api.setJobStatus('disposition-job', 'blocked');
+      const initial = await getJson(isolated.port, '/api/mailbox', 'disposition-token');
+      const item = (initial.body as { items: { id: string; basis: string }[] }).items[0]!;
+      const decision = isolated.api.recordDecision({ subject: item.id, decision: 'hold', covers: ['blocked'], reason: 'owner must authorize continuation', by: 'owner' });
+      const input = { basis: item.basis, state: 'waiting', owner: 'owner', detail: 'do not restart', dependency: 'owner authorization', recheckAt: new Date(Date.now() + 60_000).toISOString(), references: [{ kind: 'decision', id: decision.id }] };
+      const notificationsBefore = isolated.api.listNotifications();
+      const written = await postJson(isolated.port, `/api/mailbox/${encodeURIComponent(item.id)}/disposition`, 'disposition-token', input);
+      expect(written.status).toBe(200);
+      expect(written.body).toMatchObject({ id: item.id, basis: item.basis, state: 'waiting', owner: 'owner', disposition: input, receipt: null });
+      const page = await getJson(isolated.port, '/api/mailbox', 'disposition-token');
+      expect(page.status).toBe(200);
+      expect((page.body as { items: unknown[] }).items).toEqual([written.body]);
+      const board = await getJson(isolated.port, '/api/board', 'disposition-token');
+      expect((board.body as { mailbox: { items: unknown[] } }).mailbox.items).toEqual([written.body]);
+      expect(isolated.api.getJob('disposition-job')?.status).toBe('blocked');
+      expect(isolated.api.listNotifications()).toEqual(notificationsBefore);
+    } finally { await isolated.close(); }
+  });
+
+  it('G09 malformed source evidence returns observable unavailability from /api/board', () => assertSourceUnavailable('/api/board'));
+  it('G09 malformed source evidence returns observable unavailability from /api/mailbox', () => assertSourceUnavailable('/api/mailbox'));
+  it('F03 malformed object fields make /api/board unavailable rather than clear', () => assertSourceUnavailable('/api/board', { pr_url: null, pr_open: 'true', mergeable_state: null, sha: null }));
+  it('F03 malformed object fields make /api/mailbox unavailable rather than clear', () => assertSourceUnavailable('/api/mailbox', { pr_url: null, pr_open: 'true', mergeable_state: null, sha: null }));
+  async function assertSourceUnavailable(path: string, payload: unknown = []): Promise<void> {
+    const isolated = await boot('malformed-token');
+    try {
+      isolated.api.addJob({ id: 'malformed-job', repo: 'r', title: 'malformed evidence' });
+      isolated.api.appendCustomEvent({ kind: 'github.branch-state', jobId: 'malformed-job', payload });
+      expect(() => isolated.engine.mailbox.snapshot()).toThrow(/malformed PR evidence/);
+      expect((await getJson(isolated.port, path, null)).status).toBe(401);
+      const result = await getJson(isolated.port, path, 'malformed-token');
+      expect(result.status).toBe(503);
+      expect(result.body).toMatchObject({ error: 'board_unavailable', detail: expect.stringContaining('malformed PR evidence') });
+      expect(result.body).not.toHaveProperty('mailbox');
+      const write = await postJson(isolated.port, '/api/mailbox/job%3Amalformed-job/disposition', 'malformed-token', {});
+      expect(write.status).toBe(503);
+      expect(write.body).toMatchObject({ error: 'board_unavailable' });
+      expect(isolated.api.getJob('malformed-job')?.status).toBe('dispatched');
+    } finally { await isolated.close(); }
+  }
+
+  it('GH-305 mailbox HTTP shares board identities, pages durably, and fences stale/invalid writes behind auth', async () => {
+    const isolated = await boot('mailbox-test-token');
+    try {
+      isolated.api.addJob({ id: 'mail-http', repo: 'r', title: 'mailbox HTTP' });
+      isolated.api.setJobStatus('mail-http', 'blocked');
+      expect((await getJson(isolated.port, '/api/mailbox', null)).status).toBe(401);
+      const page = await getJson(isolated.port, '/api/mailbox?limit=1', 'mailbox-test-token');
+      expect(page.status).toBe(200);
+      const item = (page.body as { items: { id: string; basis: string }[] }).items[0]!;
+      const board = await getJson(isolated.port, '/api/board', 'mailbox-test-token');
+      expect((board.body as { mailbox: { items: unknown[] } }).mailbox.items).toEqual((page.body as { items: unknown[] }).items);
+      expect((await getJson(isolated.port, '/api/mailbox?limit=0', 'mailbox-test-token')).status).toBe(400);
+      const path = `/api/mailbox/${encodeURIComponent(item.id)}/disposition`;
+      const input = { basis: 'stale', state: 'waiting', owner: 'owner', detail: 'needs owner ruling', references: [] };
+      expect((await postJson(isolated.port, path, null, input)).status).toBe(401);
+      expect((await postJson(isolated.port, path, 'mailbox-test-token', input)).status).toBe(409);
+      expect((await postJson(isolated.port, path, 'mailbox-test-token', { ...input, basis: item.basis })).status).toBe(400);
+      expect(isolated.api.getJob('mail-http')?.status).toBe('blocked');
+    } finally { await isolated.close(); }
   });
 
   it('GET /api/board: 401 without token, 401 with a bad token, snapshot with a valid one', async () => {
@@ -265,6 +357,30 @@ describe('board server — HTTP API', () => {
     ]);
   });
 
+  it('disposition audit records bearer provenance honestly and validates a declared actor (#99)', async () => {
+    const { api, port } = harness;
+    const mk = (id: string) => api.recordNotification({ id, kind: 'test', routing: 'action-required', severity: 'error', title: id });
+    const events = (id: string) => api.listEventsAfter(0, { kinds: ['notification.resolved'] }).filter((e) => (e.payload as { id?: string }).id === id);
+    const undeclared = mk('actor-undeclared');
+    await postJson(port, `/api/notifications/${undeclared.id}/disposition`, 'board-test-token', { detail: 'Handled' });
+    expect(events(undeclared.id)).toMatchObject([
+      { payload: { by: 'gru', credential: 'shared-bearer', declaredActor: null } },
+    ]);
+    const declared = mk('actor-declared');
+    await postJson(port, `/api/notifications/${declared.id}/disposition`, 'board-test-token', { detail: 'Handled', actor: 'gru' });
+    expect(events(declared.id)).toMatchObject([
+      { payload: { by: 'gru', credential: 'shared-bearer', declaredActor: 'gru' } },
+    ]);
+    // A caller declaring itself as something else cannot produce a Gru disposition.
+    const forged = mk('actor-forged');
+    for (const actor of ['owner', 'web', 5]) {
+      const refused = await postJson(port, `/api/notifications/${forged.id}/disposition`, 'board-test-token', { detail: 'x', actor });
+      expect(refused.status).toBe(400);
+    }
+    expect(api.getNotification(forged.id)?.resolvedAt).toBeNull();
+    expect(events(forged.id)).toEqual([]);
+  });
+
   it('validates authenticated Gru owner escalation and places it only in FOR YOU', async () => {
     const { api, port } = harness;
     const path = '/api/notifications/needs-owner';
@@ -281,6 +397,39 @@ describe('board server — HTTP API', () => {
     const row = created.body as { id: string };
     expect(api.getNotification(row.id)).toMatchObject({ detail: 'Approve external merge', shownAt: null });
     expect((await getJson(port, '/api/board', 'board-test-token')).body).toMatchObject({ unackedNeedsOwner: expect.any(Number) });
+  });
+
+  it('needs-owner escalation retries with the same idempotency key yield one row; distinct escalations stay distinct (#100)', async () => {
+    const { api, port } = harness;
+    const path = '/api/notifications/needs-owner';
+    const count = () => api.listNotifications({ limit: 500 }).filter((n) => n.kind === 'gru.owner-escalation').length;
+    const start = count();
+    const body = { title: 'Retry call', detail: 'Approve merge', idempotencyKey: 'esc-1' };
+    const first = await postJson(port, path, 'board-test-token', body);
+    const retry = await postJson(port, path, 'board-test-token', body);
+    expect(first.status).toBe(201);
+    expect(retry.status).toBe(200);
+    expect((retry.body as { id: string }).id).toBe((first.body as { id: string }).id);
+    expect(count()).toBe(start + 1);
+    // Same key, changed request: refused, the recorded one is never overwritten.
+    const changed = await postJson(port, path, 'board-test-token', { ...body, detail: 'Different decision' });
+    expect(changed.status).toBe(409);
+    expect(count()).toBe(start + 1);
+    // A different key is a genuinely new decision, even with identical text.
+    const other = await postJson(port, path, 'board-test-token', { ...body, idempotencyKey: 'esc-2' });
+    expect(other.status).toBe(201);
+    expect((other.body as { id: string }).id).not.toBe((first.body as { id: string }).id);
+    // No key: every valid request is its own row (unchanged behavior).
+    const a = await postJson(port, path, 'board-test-token', { title: 'No key', detail: 'same' });
+    const b = await postJson(port, path, 'board-test-token', { title: 'No key', detail: 'same' });
+    expect([a.status, b.status]).toEqual([201, 201]);
+    expect((a.body as { id: string }).id).not.toBe((b.body as { id: string }).id);
+    expect(count()).toBe(start + 4);
+    // Malformed keys fail loud.
+    for (const key of ['', 'has space', 'x'.repeat(129), 7]) {
+      expect((await postJson(port, path, 'board-test-token', { title: 't', detail: 'd', idempotencyKey: key })).status).toBe(400);
+    }
+    expect(count()).toBe(start + 4);
   });
 
   it('decision status and recheck are authenticated and return the durable disabled state', async () => {
@@ -743,6 +892,78 @@ describe('board server — WS push', () => {
     harness = await boot('ws-board-token');
   });
 
+  it('G09 contains malformed evidence during auth snapshot push', () => assertSnapshotUnavailable('auth'));
+  it('G09 contains malformed evidence during event snapshot push', () => assertSnapshotUnavailable('event'));
+  it('F03 object-shaped malformed evidence is contained during auth snapshot push', () => assertSnapshotUnavailable('auth', { pr_url: null, pr_open: 'true', mergeable_state: null, sha: null }));
+  it('F03 object-shaped malformed evidence is contained during event snapshot push', () => assertSnapshotUnavailable('event', { pr_url: null, pr_open: 'true', mergeable_state: null, sha: null }));
+  async function assertSnapshotUnavailable(boundary: 'auth' | 'event', payload: unknown = []): Promise<void> {
+    const isolated = await boot('malformed-ws-token', { heartbeatMs: 0 });
+    const client = new BoardClient(isolated.port);
+    try {
+      const addJob = () => isolated.api.addJob({ id: 'malformed-ws-job', repo: 'r', title: 'invalid evidence' });
+      const corrupt = () => isolated.api.appendCustomEvent({ kind: 'github.branch-state', jobId: 'malformed-ws-job', payload });
+      const peer = await openBoardPeer(client);
+      if (boundary === 'auth') {
+        addJob(); corrupt();
+        expect(() => peer.emit('message', Buffer.from(JSON.stringify({ type: 'auth', token: 'malformed-ws-token' })))).not.toThrow();
+      } else {
+        client.send({ type: 'auth', token: 'malformed-ws-token' });
+        await client.waitFor((frame) => frame.type === 'board', 'initial valid snapshot');
+        addJob();
+        await client.waitFor(() => client.frames.some((frame) => frame.type === 'board' &&
+          (frame.snapshot as { repos: { jobs: { id: string }[] }[] }).repos.some((repo) => repo.jobs.some((job) => job.id === 'malformed-ws-job'))), 'job source push');
+        corrupt();
+      }
+      const previousBoards = client.frames.filter((frame) => frame.type === 'board').length;
+      await client.waitFor((frame) => frame.type === 'error', 'unavailable snapshot').catch(() => {});
+      expect(client.frames.find((frame) => frame.type === 'error')).toMatchObject({ type: 'error', fatal: false, message: expect.stringContaining('board unavailable') });
+      expect(client.frames.filter((frame) => frame.type === 'board')).toHaveLength(previousBoards);
+      expect(await client.closed).toBe(1011);
+      expect(() => isolated.engine.mailbox.snapshot()).toThrow(/malformed PR evidence/);
+      expect((await getJson(isolated.port, '/api/board', 'malformed-ws-token')).status).toBe(503);
+      const prUrl = 'https://github.com/org/repo/pull/305';
+      isolated.api.setJobPr('malformed-ws-job', prUrl);
+      isolated.api.appendCustomEvent({ kind: 'github.branch-state', jobId: 'malformed-ws-job', payload: branchStatePayload(
+        { jobId: 'malformed-ws-job', repo: { host: 'github.com', owner: 'org', repo: 'repo' }, branch: 'mailbox', prNumber: 305, prUrl },
+        { sha: 'recovered-head', merged: false, prNumber: 305, prUrl, prOpen: true, mergeableState: 'dirty', mergeCommitSha: null, ci: null },
+      ) });
+      const recovered = new BoardClient(isolated.port);
+      try {
+        await recovered.open();
+        recovered.send({ type: 'auth', token: 'malformed-ws-token' });
+        await recovered.waitFor((frame) => frame.type === 'board', 'same-token recovered snapshot');
+        const frame = recovered.frames.find((frame) => frame.type === 'board')!;
+        expect(frame.snapshot).toMatchObject({ mailbox: { counts: { threads: 1, needsGru: 1 }, items: [{ jobId: 'malformed-ws-job', state: 'needs-gru' }] } });
+        expect(recovered.frames.some((frame) => frame.type === 'error')).toBe(false);
+        expect((await getJson(isolated.port, '/api/board', 'malformed-ws-token')).status).toBe(200);
+      } finally { await recovered.close(); }
+    } finally { await client.terminate(); await isolated.close(); }
+  }
+
+  it('G09 contains unexpected runtime snapshot errors at auth without fabricating board data', async () => {
+    const isolated = await boot('runtime-ws-token', { heartbeatMs: 0 });
+    const client = new BoardClient(isolated.port);
+    const snapshot = vi.spyOn(isolated.engine, 'snapshot').mockImplementation(() => { throw new Error('snapshot source unavailable'); });
+    try {
+      const peer = await openBoardPeer(client);
+      expect(() => peer.emit('message', Buffer.from(JSON.stringify({ type: 'auth', token: 'runtime-ws-token' })))).not.toThrow();
+      await client.waitFor((frame) => frame.type === 'error', 'runtime error').catch(() => {});
+      expect(client.frames.find((frame) => frame.type === 'error')).toMatchObject({ fatal: false, message: expect.stringContaining('snapshot source unavailable') });
+      expect(client.frames.some((frame) => frame.type === 'board')).toBe(false);
+      expect(await client.closed).toBe(1011);
+      expect((await getJson(isolated.port, '/api/board', 'runtime-ws-token')).status).toBe(503);
+      snapshot.mockRestore();
+      const recovered = new BoardClient(isolated.port);
+      try {
+        await recovered.open();
+        recovered.send({ type: 'auth', token: 'runtime-ws-token' });
+        await recovered.waitFor((frame) => frame.type === 'board', 'runtime recovery with same token');
+        expect(recovered.frames.some((frame) => frame.type === 'error')).toBe(false);
+        expect((await getJson(isolated.port, '/api/board', 'runtime-ws-token')).status).toBe(200);
+      } finally { await recovered.close(); }
+    } finally { snapshot.mockRestore(); await client.terminate(); await isolated.close(); }
+  });
+
   it('auth → auth_ok → immediate snapshot; changes push fresh snapshots', async () => {
     const client = new BoardClient(harness.port);
     await client.open();
@@ -1013,6 +1234,190 @@ describe('board server — empty token config locks every door', () => {
     } finally {
       await harness.close();
     }
+  });
+});
+
+describe('board server — report-handback decision signals (issue #314)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2029-12-31T23:59:59.000Z'));
+  });
+  afterEach(() => { vi.useRealTimers(); });
+
+  function publishReport(harness: Awaited<ReturnType<typeof boot>>, jobId: string): string {
+    harness.api.addJob({ id: jobId, repo: 'r', title: 'Review report', deliverable: 'review', commissioner: 'gru' });
+    harness.api.setJobStatus(jobId, 'working');
+    harness.api.setJobStatus(jobId, 'delivered');
+    harness.api.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: 'reviewed-head' } });
+    const result = reconcileReportClosures({
+      ledger: harness.api,
+      notifications: new NotificationCenter({ ledger: harness.api, bus: harness.bus }),
+    });
+    expect(result).toMatchObject({ opened: 1, published: 1, failed: 0 });
+    return harness.api.findNotificationByKind(`silas.report-handback.${jobId}`, 'active')!.id;
+  }
+
+  async function reportItem(harness: Awaited<ReturnType<typeof boot>>, notificationId: string): Promise<MailboxItem> {
+    const page = await getJson(harness.port, '/api/mailbox', 'report-signal-token');
+    expect(page.status).toBe(200);
+    const item = (page.body as { items: MailboxItem[] }).items.find((row) => row.notificationIds.includes(notificationId));
+    expect(item).toBeDefined();
+    return item!;
+  }
+
+  function holdInput(item: MailboxItem) {
+    return { subject: item.subject, decision: 'hold', covers: item.reasons.map((reason) => reason.signal),
+      basis_fingerprint: item.basis, reason: 'Await the correlated report disposition', by: 'gru',
+      recheck_at: '2030-01-01T00:00:00.000Z', client_key: `hold-${item.id}` };
+  }
+
+  async function roundTrip(jobId: string): Promise<void> {
+    const harness = await boot('report-signal-token');
+    try {
+      const notificationId = publishReport(harness, jobId);
+      const item = await reportItem(harness, notificationId);
+      const signal = `report-handback.${jobId}`;
+      expect(item.reasons.map((reason) => reason.signal)).toEqual([signal]);
+      expect(item.state).toBe('needs-gru');
+      const input = holdInput(item);
+      expect((await postJson(harness.port, '/api/decisions', null, input)).status).toBe(401);
+      expect((await postJson(harness.port, '/api/decisions', 'wrong-token', input)).status).toBe(401);
+      expect(harness.api.listDecisions()).toHaveLength(0);
+      const written = await postJson(harness.port, '/api/decisions', 'report-signal-token', input);
+      expect(written.status).toBe(201);
+      const decision = written.body as DecisionRecord;
+      expect(decision).toMatchObject({ subject: item.subject, covers: [signal], basisFingerprint: item.basis });
+      const retry = await postJson(harness.port, '/api/decisions', 'report-signal-token', input);
+      expect(retry.body).toEqual(decision);
+      const listed = await getJson(harness.port, `/api/decisions?subject=${encodeURIComponent(item.subject)}`, 'report-signal-token');
+      expect(listed.body).toMatchObject({ decisions: [decision] });
+      const query = { subject: item.subject, signal, basis: item.basis, now: '2029-12-31T23:59:59.000Z' };
+      expect(harness.api.coveringDecision(query)?.id).toBe(decision.id);
+      expect(harness.api.coveringDecision({ ...query, basis: 'changed-basis' })).toBeNull();
+      expect(harness.api.coveringDecision({ ...query, now: input.recheck_at })).toBeNull();
+      const disposition = await postJson(harness.port, `/api/mailbox/${encodeURIComponent(item.id)}/disposition`, 'report-signal-token', {
+        basis: item.basis, state: 'waiting', owner: 'owner', detail: 'Hold on this exact report',
+        dependency: 'owner authorization for report disposition', recheckAt: input.recheck_at,
+        references: [{ kind: 'decision', id: decision.id }],
+      });
+      expect(disposition.status).toBe(200);
+      expect(await reportItem(harness, notificationId)).toMatchObject({ basis: item.basis, state: 'waiting' });
+      expect(harness.api.reconcileMailbox(input.recheck_at).find((row) => row.id === item.id)?.state).toBe('needs-gru');
+      // New source evidence invalidates the exact-basis disposition, not its durable history.
+      harness.api.updateNotificationDetail(notificationId, 'Changed report evidence');
+      const changed = await reportItem(harness, notificationId);
+      expect(changed.basis).not.toBe(item.basis);
+      expect(changed.state).toBe('needs-gru');
+      expect(harness.api.coveringDecision({ ...query, basis: changed.basis })).toBeNull();
+      expect(harness.api.getJob(jobId)?.status).toBe('delivered');
+      expect(harness.api.findReportObligation(jobId)?.state).toBe('open');
+    } finally { await harness.close(); }
+  }
+
+  it('round-trips the 59-character reported fixture through the authenticated API', () => roundTrip(`review-${'a'.repeat(52)}`));
+  it('round-trips the 128-character job boundary through the authenticated API', () => roundTrip(`review-${'a'.repeat(120)}a`));
+  it('round-trips the case-sensitive and punctuation job boundary through the authenticated API', () => roundTrip(`Review-${'a'.repeat(117)}A._9`));
+  it('round-trips the existing short signal through the authenticated API', () => roundTrip('review-old'));
+
+  async function sharedPrefix(suffix: string): Promise<void> {
+    const harness = await boot('report-signal-token');
+    try {
+      const prefix = `review-${'a'.repeat(120)}`;
+      const firstNotice = publishReport(harness, `${prefix}a`);
+      const secondNotice = publishReport(harness, `${prefix}${suffix}`);
+      const first = await reportItem(harness, firstNotice);
+      const second = await reportItem(harness, secondNotice);
+      expect(first.subject).not.toBe(second.subject);
+      expect(first.reasons[0]!.signal).not.toBe(second.reasons[0]!.signal);
+      const written = await postJson(harness.port, '/api/decisions', 'report-signal-token', holdInput(first));
+      expect(written.status).toBe(201);
+      const decision = written.body as DecisionRecord;
+      const query = { subject: first.subject, signal: first.reasons[0]!.signal, basis: first.basis };
+      expect(harness.api.coveringDecision(query)?.id).toBe(decision.id);
+      expect(harness.api.coveringDecision({ ...query, subject: second.subject })).toBeNull();
+      expect(harness.api.coveringDecision({ ...query, signal: second.reasons[0]!.signal })).toBeNull();
+      expect(harness.api.coveringDecision({ subject: second.subject, signal: second.reasons[0]!.signal, basis: second.basis })).toBeNull();
+      expect((await reportItem(harness, secondNotice)).state).toBe('needs-gru');
+    } finally { await harness.close(); }
+  }
+
+  it('keeps long shared-prefix identities independent', () => sharedPrefix('b'));
+  it('keeps case-distinct shared-prefix identities independent', () => sharedPrefix('A'));
+
+  it('clearing a long mixed-case decision preserves history and reopens its waiting mailbox item', async () => {
+    const harness = await boot('report-signal-token');
+    try {
+      const jobId = `Review-${'A'.repeat(121)}`;
+      const notificationId = publishReport(harness, jobId);
+      const item = await reportItem(harness, notificationId);
+      const input = holdInput(item);
+      const written = await postJson(harness.port, '/api/decisions', 'report-signal-token', input);
+      expect(written.status).toBe(201);
+      const decision = written.body as DecisionRecord;
+      const disposition = await postJson(harness.port, `/api/mailbox/${encodeURIComponent(item.id)}/disposition`, 'report-signal-token', {
+        basis: item.basis, state: 'waiting', owner: 'owner', detail: 'Await owner authorization',
+        dependency: 'owner authorization for report disposition', recheckAt: input.recheck_at,
+        references: [{ kind: 'decision', id: decision.id }],
+      });
+      expect(disposition.status).toBe(200);
+      expect((await reportItem(harness, notificationId)).state).toBe('waiting');
+      const clear = await postJson(harness.port, `/api/decisions/${decision.id}/clear`, 'report-signal-token', { by: 'owner', reason: 'Authorization granted' });
+      expect(clear.status).toBe(200);
+      expect(harness.api.getDecision(decision.id)).toMatchObject({ subject: item.subject, covers: decision.covers,
+        basisFingerprint: item.basis, clearedAt: '2029-12-31T23:59:59.000Z', clearedBy: 'owner' });
+      expect(harness.api.coveringDecision({ subject: item.subject, signal: decision.covers[0]!, basis: item.basis })).toBeNull();
+      expect(await reportItem(harness, notificationId)).toMatchObject({ basis: item.basis, state: 'needs-gru' });
+      expect(harness.api.getJob(jobId)?.status).toBe('delivered');
+    } finally { await harness.close(); }
+  });
+
+  async function rejectAttentionOnlyReportClosure(decisionKind: 'acted' | 'dismissed'): Promise<void> {
+    const harness = await boot('report-signal-token');
+    try {
+      const jobId = `Review-${'A'.repeat(121)}`;
+      const notificationId = publishReport(harness, jobId);
+      const item = await reportItem(harness, notificationId);
+      const written = await postJson(harness.port, '/api/decisions', 'report-signal-token', { ...holdInput(item), decision: decisionKind });
+      expect(written.status).toBe(201);
+      const decision = written.body as DecisionRecord;
+      expect(decision.covers).toEqual([`report-handback.${jobId}`]);
+      const resolved = await postJson(harness.port, `/api/mailbox/${encodeURIComponent(item.id)}/disposition`, 'report-signal-token', {
+        basis: item.basis, state: 'resolved', owner: 'gru', detail: 'Exact report attention accounted',
+        references: [{ kind: 'decision', id: decision.id }],
+      });
+      // GH-313 made this item producer-owned custody: a valid long-key
+      // decision is readable coverage, never proof that the report settled.
+      expect(resolved.status).toBe(409);
+      expect(resolved.body).toMatchObject({ error: 'mailbox_conflict', detail: expect.stringContaining('producer-owned') });
+      expect(await reportItem(harness, notificationId)).toMatchObject({ basis: item.basis, state: 'needs-gru', producerOwned: true });
+      expect(harness.api.coveringDecision({ subject: item.subject, signal: decision.covers[0]!, basis: item.basis })?.id).toBe(decision.id);
+      expect(harness.api.getDecision(decision.id)).toEqual(decision);
+      expect(harness.api.getNotification(notificationId)).toMatchObject({ ackedAt: null, resolvedAt: null });
+      expect(harness.api.getJob(jobId)?.status).toBe('delivered');
+      expect(harness.api.findReportObligation(jobId)).toMatchObject({ state: 'open', settlement: null });
+    } finally { await harness.close(); }
+  }
+
+  it('an acted long mixed-case decision cannot close producer-owned report custody', () => rejectAttentionOnlyReportClosure('acted'));
+  it('a dismissed long mixed-case decision cannot close producer-owned report custody', () => rejectAttentionOnlyReportClosure('dismissed'));
+
+  it('rejects malformed and oversized signals without persisting a decision', async () => {
+    const harness = await boot('report-signal-token');
+    try {
+      const item = await reportItem(harness, publishReport(harness, 'review-validation'));
+      for (const signal of ['', 'a'.repeat(65), `report-handback.${'a'.repeat(129)}`, 'Report-handback.valid',
+        `report-handback._${'a'.repeat(100)}`, `report-handback..${'a'.repeat(100)}`, 'report-handback.Unsafe/Path',
+        'report-handback.unsafe id', 'report-handback.bad\nvalue', 'report-handback.bad\n', 'report-handback.é', 'PR-CONFLICT']) {
+        const rejected = await postJson(harness.port, '/api/decisions', 'report-signal-token', { ...holdInput(item), covers: [signal] });
+        expect(rejected.status, signal).toBe(400);
+        expect(rejected.body).toMatchObject({ error: 'bad_request', detail: expect.stringContaining('decision signal') });
+        if (signal === 'report-handback.Unsafe/Path') {
+          expect(rejected.body).toMatchObject({ detail: expect.stringContaining('suffix must be a safe job id') });
+        }
+      }
+      expect(harness.api.listDecisions()).toHaveLength(0);
+      expect((await reportItem(harness, item.notificationIds[0]!)).state).toBe('needs-gru');
+    } finally { await harness.close(); }
   });
 });
 

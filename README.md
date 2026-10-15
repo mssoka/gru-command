@@ -2,7 +2,7 @@
 
 A standalone, installable multi-agent orchestrator. One Node.js service
 hosts every agent as a headless session behind a pluggable runtime
-adapter (`pi` or Claude Code), with a web front-end for chat with the
+adapter (Claude Code, the default for new installs, or `pi`), with a web front-end for chat with the
 single Gru, the live heist board, and per-agent transcripts. The browser
 is the only required window.
 
@@ -21,6 +21,11 @@ waves), and OS service install — see [docs/EPICS.md](docs/EPICS.md).
   workspace files, phone camera/gallery files, or clipboard images through
   one path-based flow; text-only models decline image interpretation
   visibly instead of guessing ([CHAT.md](docs/CHAT.md)).
+- **Review source intake** — preview GitHub issues, specs and BMAD documents
+  in the existing chat without executing them. Edit immutable concrete plans,
+  select dependency-complete work, explicitly approve into the existing pipeline,
+  and recover accepted identities after reconnects ([INTAKE.md](docs/INTAKE.md)).
+  No BMAD installation is required; imported statuses are data, not authority.
 - **The live board** — repo-grouped job cards, per-agent state chips,
   review rounds with per-lens live chips, notification center
   ([BOARD.md](docs/BOARD.md)).
@@ -46,7 +51,7 @@ waves), and OS service install — see [docs/EPICS.md](docs/EPICS.md).
   deduplicated bible with provenance; briefings and directives carry
   pointer lines only, and agents read the pointed section on demand
   ([LESSONS.md](docs/LESSONS.md)).
-- **Pluggable runtimes** — `pi` (reference) and Claude Code adapters;
+- **Pluggable runtimes** — Claude Code (default for new installs) and `pi` adapters;
   models/thinking default to each runtime's own configuration
   ([RUNTIMES.md](docs/RUNTIMES.md)).
 - **Robustness** — durable sessions with resume, restart ladders,
@@ -90,8 +95,9 @@ GitHub signal ingestion is poll-only — no webhooks, no inbound tunnel.
    and `repos/{owner}/{repo}/commits/{sha}/check-runs` for the latest
    check-run conclusions. Each observed state CHANGE applies exactly
    once: a merged PR closes its lane (`github.pr-merged`), a conflicting
-   PR (`mergeable_state: dirty`) cascades an action-required
-   notification, a CI failure posts a notification carrying the run URL
+   PR (`mergeable_state: dirty`) cascades an fyi notification (mechanical
+   tier — Silas coordinates the conflict integration), a CI failure posts
+   a notification carrying the run URL
    (mechanical checks → fyi, judgment checks → action-required), and CI
    green records the review-gate signal event (`github.ci-green`). The
    per-tick call budget caps usage at 3 000 of the authenticated
@@ -131,7 +137,8 @@ See [the prerequisite decision](docs/decisions/gh-168-darwin-python-review-enume
 That single invocation clones to `~/gru-command`, installs dependencies,
 builds the service and web UI, and runs the setup wizard through
 `/dev/tty` even though the script itself is piped. The wizard detects
-`pi`/Claude Code, selects managed repos, writes the complete commented
+Claude Code/`pi` (new installs default to Claude Code; pick `pi` explicitly if you use it), selects real repository directories for setup validation
+(not a management whitelist; the board discovers workspace repos live), writes the complete commented
 live config at `~/.gru-command/config.toml`, smoke-tests first boot, and
 can register/start the owned OS service. A truly headless environment
 fails immediately with the exact `--no-interact` command instead of
@@ -170,37 +177,44 @@ npm run config:generate                 # refuses an existing file
 npm run config:generate -- --force      # timestamped 0600 backup first
 ```
 
-### GC-managed BMAD runtime
+### GC-owned delivery resources
 
-Gru Command ships the BMAD framework its build workflow uses: a pinned
-`bmad-method@6.12.0` `bmad-build` skill, unchanged, plus a small GC
-customization layer. A managed repository needs no BMAD installation of
-its own. Every job lane binds to the runtime it started with, so a GC
-update never switches a running job's workflow instructions. The bundled
-review layers carry no finding quota: a clean change may get no
-actionable findings. The bmad-review fallback gate still uses an installed
-`bmad-review` skill: 0 blockers clear review/fix routing only (the PASS is
-not a Perkins READY), while blockers route back to the implementing minion
-as fix directives. Perkins (GitHub/GitLab) remains the stronger gate with
-exact-head verdicts, and the owner holds every merge.
+GC ships directly editable build/planning/review resources with their own
+identity and content integrity in `resources/gc-workflows/`. Both normal and
+small-change paths retain independent tracked review, reasoned fixes,
+verification and ordinary PR handoff, without finding or tool-call quotas.
+The new package resolves with explicit project/job/worktree/artifact/knowledge
+context and no project/global BMAD, Python/uv or external skill dependency.
+See [docs/GC-WORKFLOWS.md](docs/GC-WORKFLOWS.md) for invocation, local manifest
+refresh, packaging tests and retained lane bindings.
 
-For each selected managed repo (not the workspace root, and never every
-discovered directory), the wizard offers to **provision** the project
-state the runtime uses. It is on by default, and per-repo skip is always
-available. Provisioning creates only what is missing: `_bmad/custom/`
-(project settings: `config.toml` for the team, `*.user.toml` for you,
-ignored), a self-ignoring `_bmad/render/`, and the configured output
-folders under `_bmad-output/`. It never modifies existing files, an
-existing repo-local BMAD install, or unrelated skills. Commit
-`_bmad/custom/` when fresh worktrees should share team settings.
-Deterministic state failures (a symlinked or wrongly typed project path,
-a malformed settings file) offer skip-only with deliberate repair
-guidance. Prerequisite and I/O failures keep retry or explicit skip. No
-false-ready state.
+New implementation jobs now receive this owned package and explicit registered
+project/job context on both Pi and Claude Code. Operational material is private
+under `<data_dir>/projects/<project-key>/jobs/<job-id>/operational/`; approved
+portable knowledge belongs in the assigned worktree's `gru-output/`. GC-invoked
+fallback review uses a verified owned helper, not a global `bmad-review` install.
+Fallback PASS clears review/fix routing only, never native Perkins READY.
+Independent BMAD installs and historical outputs/bindings remain untouched;
+resumes retain their original package or fail with exact restoration guidance.
+Setup validates Git/GC prerequisites without a BMAD provisioning step. It creates
+no project BMAD files, skills or outputs; obsolete headless `bmad` answers must be
+removed explicitly. User project setup commands remain authoritative. Retire old
+GC-marked bootstrap blocks with the owner-run, backup-first procedure in
+[docs/BMAD-RUNTIME.md](docs/BMAD-RUNTIME.md), not automatic cleanup.
 
-You need the selected runtime CLI (`pi` or `claude`) for agents and `uv`
-for BMAD workflows. Missing prerequisites are reported before a repo is
-marked BMAD-ready. [docs/BMAD-RUNTIME.md](docs/BMAD-RUNTIME.md) covers:
+### GC-managed BMAD runtime (historical)
+
+The pinned `bmad-method@6.12.0` build package remains available for already-bound
+historical lanes. New jobs select GC-owned delivery resources instead. An upgrade
+never switches a running lane's workflow; missing retained bytes require restoring
+that exact package, not recreating the worker/worktree/PR. Perkins (GitHub/GitLab)
+remains the exact-head native release gate, and the owner performs every final PR
+merge.
+
+You need the selected runtime CLI (`claude` by default, or `pi`) for agents. Setup fails loud, naming the missing CLI and how to select the other runtime, instead of silently falling back. Existing installs keep the runtime their `config.toml` already says; only newly generated configs default to Claude Code. Only retained
+historical BMAD rendering uses `uv`; current setup and owned GC execution do not.
+Installing, breaking or removing independent BMAD does not affect GC setup or
+workflow selection. [docs/BMAD-RUNTIME.md](docs/BMAD-RUNTIME.md) covers:
 
 - the bundled set
 - configuration precedence

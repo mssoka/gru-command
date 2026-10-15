@@ -206,3 +206,7 @@
   verification lens (F2/F3), pinned as refusals.
 - R9-deferred warnings (empty-finding baseline auth, ordinary delta digest
   coupling, retry annotation blocker count) remain native-deferred, untouched.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-merge-authority-boundary.md`
+  summary: The BMAD-onboarding rehearsal script still describes the fallback as "clear to merge" and Perkins as carrying "autonomous-merge authority".
+  evidence: `scripts/rehearsal-bmad-onboarding.mjs:62-66` — repo-internal rehearsal harness (not shipped in the package, not session-reaching). The round-3 concluding review flagged it as a follow-up on untouched code; the shipped boundary (a fallback PASS is not a Perkins READY; no agent merges a PR) already governs real sessions.

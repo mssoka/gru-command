@@ -75,6 +75,7 @@ import { formatAge } from '../lib/board-time.js';
 import { prLinkLabel } from '../lib/pr-link.js';
 import {
   jobSignal,
+  mailboxSignal,
   pluralCount,
   roundSummary,
   terminalBoundNotificationIds,
@@ -184,6 +185,7 @@ export class BoardView {
   /** Toast + browser-notification surface (E7). */
   private onToast: ((notification: NotificationView) => void) | null = null;
   private snapshot: BoardSnapshot | null = null;
+  private unavailableReason: string | null = null;
   /** ONE sections derivation per render (classification truth is shared
    * by the shortcut strip and the section bodies — computed from the SAME
    * stopped/live-worker inputs so they can never disagree). */
@@ -297,6 +299,16 @@ export class BoardView {
   }
 
   render(snapshot: BoardSnapshot): void {
+    this.unavailableReason = null;
+    this.renderSnapshot(snapshot);
+  }
+
+  markUnavailable(message: string): void {
+    this.unavailableReason = message;
+    if (this.snapshot !== null) this.renderSnapshot(this.snapshot);
+  }
+
+  private renderSnapshot(snapshot: BoardSnapshot): void {
     const previous = this.snapshot;
     this.snapshot = snapshot;
     const pendingProposals = new Set(
@@ -336,7 +348,7 @@ export class BoardView {
     const nav = this.boardNav;
     nav.hidden = false;
     nav.replaceChildren();
-    for (const row of sectionNav(sections.counts, sections.pipelineAvailable)) {
+    for (const row of sectionNav(sections.counts, sections.pipelineAvailable, sections.mailboxAvailable)) {
       const link = document.createElement('a');
       link.className = 'board-nav__link';
       link.href = row.href;
@@ -349,6 +361,7 @@ export class BoardView {
       link.title = row.counted
         ? `${row.label}: ${row.count} — jump to section`
         : `${row.label}: not hosted on this server`;
+      if (row.id === 'for-gru' && this.unavailableReason !== null) link.title = `${row.label}: last-known count — current mailbox unavailable`;
       nav.append(link);
     }
     this.measureNav();
@@ -511,7 +524,7 @@ export class BoardView {
         more.setAttribute('aria-expanded', String(this.ownerExpanded));
         more.addEventListener('click', () => {
           this.ownerExpanded = true;
-          if (this.snapshot !== null) this.render(this.snapshot);
+          if (this.snapshot !== null) this.renderSnapshot(this.snapshot);
         });
         mount.append(more);
       }
@@ -687,6 +700,33 @@ export class BoardView {
     // A recorded decision can only be finished, never flipped.
     accept.disabled = current.inFlight !== null || current.recorded === 'reject';
     reject.disabled = current.inFlight !== null || current.recorded === 'accept';
+    /** An unconfirmed decision (#277): the cached proposal metadata may be
+     * stale — the server may have recorded the choice and lost only the
+     * reply. Reload it; the FETCHED durable decision (never the choice
+     * attempted here) locks the opposite button and replaces the outdated
+     * uncertainty wording. No recorded decision leaves the row undecided,
+     * with the uncertainty wording as it was. */
+    const reconcile = (uncertain: string): void => {
+      const previous = current.review;
+      current.review = null;
+      void load()
+        .then((proposal) => {
+          if (!live() || proposal.decision === null || current.recorded === null) return;
+          if (current.message === uncertain) current.message = recordedMessage(current.recorded, proposal.recovery?.conflict ?? null);
+          this.rerenderOwner();
+        })
+        .catch((error: unknown) => {
+          if (!live()) return;
+          current.review ??= previous; // nothing newer was learned: keep what the owner was reading
+          // A 404 already carries its own, more specific explanation.
+          if (error instanceof BoardApiError && error.status === 404) return;
+          // The reload itself failed (the network is still down): the
+          // decision stays unconfirmed — say so, not "couldn't load".
+          current.loadFailed = false;
+          current.message = uncertain;
+          this.rerenderOwner();
+        });
+    };
     const decide = (decision: 'accept' | 'reject'): void => {
       if (current.inFlight !== null) return;
       const client = this.boardClient;
@@ -734,7 +774,9 @@ export class BoardView {
             ['proposal_stale', 'proposal_decided', 'proposal_mismatch'].includes(error.code ?? '');
           if (!proven) client.wake();
           current.message = describeDecisionFailure(error, current.recorded);
+          const uncertain = current.message;
           this.rerenderOwner();
+          if (!proven) reconcile(uncertain);
         });
     };
     accept.addEventListener('click', () => decide('accept'));
@@ -791,7 +833,7 @@ export class BoardView {
   /** Re-render the owner surfaces from the last snapshot (proposal state
    * changed between pushes). */
   private rerenderOwner(): void {
-    if (this.snapshot !== null) this.render(this.snapshot);
+    if (this.snapshot !== null) this.renderSnapshot(this.snapshot);
   }
 
   /** One evidence-bound ready PR: affected heist, the exact head every
@@ -919,7 +961,7 @@ export class BoardView {
     // the only human-facing surface.
     const needsGru = snapshot.unackedActionRequired;
     this.unackedChip.hidden = needsGru === 0;
-    this.unackedChip.textContent = `🛠 ${needsGru} needs Gru`;
+    this.unackedChip.textContent = `🛠 ${needsGru} notifications · needs Gru`;
     this.unackedChip.title = `${needsGru} live machine-attention notification${needsGru === 1 ? '' : 's'} awaiting a Gru disposition — the live queue clears itself; closed receipts stay in the record and the owner bell is not rung.`;
     // Wake tracker: every autonomous wake is a durable `gru.wake` event;
     // the count/last fire stamp makes the wake path visible on the board.
@@ -1018,7 +1060,7 @@ export class BoardView {
     this.jobSignals = { unacked, stoppedWorkers };
     this.mount.append(this.jobsSection('in-flight', sections.bands.get('in-flight') ?? [], unacked, stoppedWorkers));
     this.mount.append(this.pipelineSection(sections));
-    this.mount.append(this.forGruSection(sections.bands.get('needs-you') ?? [], unacked, stoppedWorkers));
+    this.mount.append(this.forGruSection(sections.bands.get('needs-you') ?? [], unacked, stoppedWorkers, snapshot));
     this.mount.append(this.jobsSection('settled', settledJobs(sections.bands.get('settled') ?? []), unacked, stoppedWorkers));
     this.mount.append(this.coldSection(sections.bands.get('cold') ?? [], unacked, stoppedWorkers));
     const seenIds = new Set<string>();
@@ -1069,7 +1111,7 @@ export class BoardView {
   }
 
   private rerender(): void {
-    if (this.snapshot !== null) this.render(this.snapshot);
+    if (this.snapshot !== null) this.renderSnapshot(this.snapshot);
   }
 
   private emptyLine(text: string): HTMLElement {
@@ -1181,15 +1223,27 @@ export class BoardView {
     jobs: readonly BandedJob[],
     unacked: ReadonlyMap<string, number>,
     stoppedWorkers: ReadonlyMap<string, WorkerStopView>,
+    snapshot: BoardSnapshot,
   ): HTMLElement {
     const { section, head, body, bodyId } = this.sectionShell(
       'for-gru',
       'needs-you',
       BAND_LABELS['needs-you'],
-      heistCount(jobs.length),
+      snapshot.mailbox === undefined || snapshot.mailbox === null ? 'unavailable' : `${this.unavailableReason === null ? '' : 'last-known · '}${snapshot.mailbox.counts.threads} threads · ${snapshot.mailbox.counts.incidents} incidents · ${snapshot.mailbox.counts.notifications} notifications`,
     );
-    if (jobs.length === 0) {
-      body.append(this.clearForGru());
+    if (this.unavailableReason !== null) {
+      section.dataset.mailboxStatus = 'last-known';
+      const warning = this.emptyLine(`FOR GRU unavailable — rows and counts are last-known. ${this.unavailableReason}`);
+      warning.setAttribute('role', 'status');
+      section.insertBefore(warning, body); // Visible even when the cached queue is collapsed.
+    }
+    if (snapshot.mailbox === undefined || snapshot.mailbox === null) {
+      body.append(this.emptyLine('FOR GRU mailbox unavailable on this server'));
+      return section;
+    }
+    const incidents = snapshot.mailbox.items.filter((item) => item.kind === 'incident' && item.state !== 'resolved');
+    if (jobs.length === 0 && incidents.length === 0) {
+      body.append(this.unavailableReason === null ? this.clearForGru() : this.emptyLine('Last-known mailbox was empty; current membership is unavailable.'));
       return section;
     }
     const toggle = this.sectionToggle({
@@ -1209,12 +1263,29 @@ export class BoardView {
     }
     const rows = el('div', 'board-band__rows');
     for (const entry of jobs) {
-      rows.append(
-        this.jobRow(entry.job, unacked.get(entry.job.id) ?? 0, entry.stale, 'needs-you', stoppedWorkers.get(entry.job.id) ?? null),
-      );
+      const jobRow = this.jobRow(entry.job, unacked.get(entry.job.id) ?? 0, entry.stale, 'needs-you', stoppedWorkers.get(entry.job.id) ?? null);
+      const item = snapshot.mailbox.items.find((row) => row.jobId === entry.job.id);
+      if (item !== undefined) jobRow.append(this.mailboxDetail(item));
+      rows.append(jobRow);
+    }
+    for (const item of incidents) {
+      const incident = el('article', 'mailbox-incident');
+      incident.dataset.mailboxId = item.id;
+      incident.append(el('strong', '', item.title), this.mailboxDetail(item));
+      rows.append(incident);
     }
     body.append(rows);
     return section;
+  }
+
+  private mailboxDetail(item: NonNullable<BoardSnapshot['mailbox']>['items'][number]): HTMLElement {
+    const detail = el('div', 'mailbox-detail');
+    detail.append(el('span', '', `${item.state === 'needs-gru' ? 'needs Gru' : item.state} · owner: ${item.owner} · ${item.reasons.map((reason) => reason.label).join(' · ')}`));
+    detail.append(el('div', '', `dependency: ${item.disposition?.dependency ?? 'next action owed'} · recheck: ${item.disposition?.recheckAt ?? item.followUpAt?.join(', ') ?? 'not recorded'}`));
+    detail.append(el('div', '', `receipt: ${item.receipt === null ? 'not delivered' : `${item.receipt.source} ${item.receipt.receivedAt}`} · basis: ${item.basis}`));
+    if (item.references.length > 0) detail.append(el('div', '', `controls/follow-up: ${item.references.map((ref) => `${ref.kind}:${ref.id}`).join(', ')}`));
+    if (item.restrictions.length > 0) detail.append(el('div', '', item.restrictions.join(' · ')));
+    return detail;
   }
 
   /** Cold: COUNT ONLY by default — zero job rows render until the
@@ -1385,7 +1456,8 @@ export class BoardView {
       flag.title = 'working with no minion frames past the stall window';
       toggle.append(flag);
     }
-    const signal = jobSignal(job, unackedActionRequired);
+    const signal = this.snapshot?.mailbox !== undefined && this.snapshot.mailbox !== null
+      ? mailboxSignal(this.snapshot, job.id) ?? jobSignal(job, 0) : jobSignal(job, 0);
     if (signal !== null) {
       const chip = el('span', `pp-chip board-job__signal pp-chip--${signal.tone}`, signal.label);
       chip.title = signal.title;

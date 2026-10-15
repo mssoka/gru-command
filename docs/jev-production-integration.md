@@ -212,7 +212,26 @@ Routing rules:
   "report": "...\\n**Verdict: READY TO MERGE**" }`. Perkins
   `consolidated.json` review rounds are not report-type handbacks; verdict
   lines are removed from the request state. Yield telemetry (#214) reports
-  shadow disagreement rates per surface and provider.
+  shadow disagreement rates per surface and provider: the share of
+  answered asks on which the surface's consumer would have acted
+  differently than on the deterministic baseline (`src/decisions/effects.ts`,
+  the same functions the consumers call). `event_triage` disagrees when
+  the notification would be promoted to action-required (class and
+  severity only annotate its detail text); `supervision_guidance` when the
+  supervisor would stop instead of restart, or stop for a different
+  reason; `escalation_triage` and `same_blocker` when their case spec's
+  `answerAction` differs. Provider misses are counted separately and kept
+  out of the share and the latency quantiles; they are broken down by
+  reason and kind: attempted (the provider call began and failed, with
+  its elapsed time per reason), refused (locally, before starting),
+  stand-in (no provider call recorded, normally while degraded) and
+  unrecorded (no readable cause). Every answered measure is split per
+  model. Records carry the thresholds their routes were banded at; rows
+  recorded before 2026-10-11 are measured at the default thresholds and
+  counted as such. An answered row whose answers fail production
+  validation, or whose routes are not exactly what its questions' risk
+  classes and those thresholds band its answers to, stays in its group
+  (with its cost and latency) as unmeasurable.
 - Production callers pass stable surface names: event/notification triage
   uses `event_triage`; supervisor runtime-health guidance uses
   `supervision_guidance`.

@@ -1,0 +1,28 @@
+{
+  "numTotalTestSuites": 1,
+  "numTotalTests": 2,
+  "numPassedTests": 2,
+  "numFailedTests": 0,
+  "numPendingTests": 0,
+  "numTodoTests": 0,
+  "success": true,
+  "testResults": [
+    {
+      "name": "/repo/test/property/ratio.test.ts",
+      "status": "passed",
+      "message": "",
+      "assertionResults": [
+        {
+          "status": "passed",
+          "fullName": "ratio stays within the declared bounds",
+          "failureMessages": []
+        },
+        {
+          "status": "passed",
+          "fullName": "ratio respects the denominator sign",
+          "failureMessages": []
+        }
+      ]
+    }
+  ]
+}
