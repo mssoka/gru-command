@@ -77,8 +77,9 @@ function printProbe(results: readonly RuntimeProbeResult[]): void {
   }
   if (!results.some((result) => result.installed)) {
     stdout.write(
-      '\n⚠ No runtime CLI found (claude / pi). Setup refuses to write a config for a\n' +
-      '  runtime whose CLI is missing; install one or pick the runtime you have.\n',
+      '\n⚠ No runtime CLI found (claude / pi). Claude Code (the default) needs its\n' +
+      '  `claude` CLI before setup writes the config; pi can still be configured and\n' +
+      '  fails LOUD at spawn time until you install it.\n',
     );
   }
 }

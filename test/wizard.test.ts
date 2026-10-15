@@ -573,6 +573,8 @@ describe('wizard CLI surface', () => {
     expect(failed.status, text).toBe(1);
     expect(text).toContain('`claude` was not found on PATH');
     expect(text).toContain('"runtime":"pi"');
+    expect(failed.stdout).toContain('pi can still be configured');
+    expect(failed.stdout).not.toContain('refuses to write a config for a');
     expect(existsSync(join(instance, 'config.toml'))).toBe(false);
 
     const pi = await run({ runtime: 'pi' });
