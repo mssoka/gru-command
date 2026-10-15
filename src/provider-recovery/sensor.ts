@@ -266,14 +266,14 @@ export function bootProviderRecovery(sensor: ProviderRecoverySensor, log: Log): 
 /** The single notice for a boot hand-back pass that failed or kept a wait. */
 const HAND_BACK_FAILED = 'provider-recovery.hand-back-failed';
 
-/** When a boot hand-back failure notice was last reported: the time its
- * detail ends with (it is refreshed in place by each failing boot). A detail
- * without one is unreadable — NaN, which the caller counts as reported; only
- * a row with no detail at all falls back to its insert time. */
-function lastReportedAt(row: { readonly ts: string; readonly detail: string | null }): number {
-  if (row.detail === null) return Date.parse(row.ts);
-  const stamp = row.detail.match(/Last reported (\S+?)\.$/u)?.[1];
-  return stamp === undefined ? Number.NaN : Date.parse(stamp);
+/** The ledger event sequence a boot hand-back failure notice was last
+ * reported after — its detail ends with it, and each failing boot refreshes
+ * it. Sequence order, never wall-clock time, so no clock step back can
+ * reorder a report against a wait. NaN when missing or unreadable (no detail
+ * at all, or another format), which the caller counts as reported. */
+function lastReportedAfterSeq(row: { readonly detail: string | null }): number {
+  const seq = row.detail?.match(/\(after ledger event (\d+)\)\.$/u)?.[1];
+  return seq === undefined ? Number.NaN : Number(seq);
 }
 
 /** The `[provider_recovery]` switch that governs a provider. */
@@ -939,8 +939,11 @@ export class ProviderRecoverySensor {
       const since = prior?.detail?.match(/previously reported (\S+?)\)/u)?.[1] ?? prior?.ts;
       const told = prior === null ? ''
         : ` Gru was told before (previously reported ${since}) — check whether the lanes already resumed before you act.`;
+      // Stamped with the ledger's event sequence BEFORE this write: every wait
+      // established earlier has a sequence at or below it, every later one
+      // above it (the write itself appends the next event).
       const detail = `${what}, so any such lane stays stopped until a restart's hand-back succeeds — see the service log.${told} ` +
-        `Last reported ${new Date().toISOString()}.`;
+        `Last reported ${new Date().toISOString()} (after ledger event ${this.ledger.latestEventSeq()}).`;
       // Refresh the open notice in place; with none open — or one closed
       // between the read and the write — post a fresh one.
       const refreshed = open !== null ? this.notifications.updateDetail(open.id, detail) : null;
@@ -1090,19 +1093,18 @@ export class ProviderRecoverySensor {
       // wait stayed open, or the switch was on again in between), or a boot
       // hand-back failure reported since the wait opened, resolved or not
       // (Gru may have acted on it): say so, so a re-dispatch is not doubled.
-      // The open, the most recently inserted and the newest-ts notice are
-      // each asked, so a clock step back in either direction between two
-      // notices still marks (conservatively); an unreadable time counts as
-      // reported. Report times are wall-clock against the wait's creation
-      // time, so a step back between a wait opening and a report can still
-      // leave it unmarked — waits record no event order to compare against.
+      // "Since the wait opened" is ledger event order — the report's stamp
+      // against the wait's `provider.wait-established` event — never
+      // wall-clock time, so a clock step back in any direction cannot hide
+      // a report. The latest stamp is on the most recently inserted notice:
+      // only the open notice is ever refreshed, a new one is posted only when
+      // none is open, and no notice is ever reopened. An unreadable stamp, or
+      // a wait with no establishment event, counts as reported
+      // (conservative).
       const announced = this.ledger.findNotificationByKind(`provider-recovery.recovery-off.${wait.id}`, 'any') !== null;
-      const opened = Date.parse(wait.createdAt);
-      const failureSince = [
-        this.ledger.findNotificationByKind(HAND_BACK_FAILED, 'active'),
-        this.ledger.latestNotificationByKind(HAND_BACK_FAILED),
-        this.ledger.findNotificationByKind(HAND_BACK_FAILED, 'any'),
-      ].some((row) => row !== null && !(lastReportedAt(row) < opened));
+      const opened = this.ledger.providerWaitEstablishedSeq(wait.id);
+      const failure = this.ledger.latestNotificationByKind(HAND_BACK_FAILED);
+      const failureSince = failure !== null && (opened === null || !(lastReportedAfterSeq(failure) < opened));
       const repeat = announced
         ? 'Announced before and the wait is still open — check whether the lane already resumed before you act. '
         : failureSince
