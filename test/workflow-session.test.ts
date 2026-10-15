@@ -36,6 +36,9 @@ function host(runtimeId: RuntimeId, f: ReturnType<typeof fixture>, authority?: P
       seen.push(opts);
       return { id: opts.agentId ?? `worker-${seen.length}`, role, sessionFile: join(f.dataDir, 'worker.jsonl'), capabilities: caps,
         health: () => ({ state: 'idle', lastActivity: null, sessionFile: join(f.dataDir, 'worker.jsonl') }),
+        // Adapter-owned cessation evidence (Option A): this fixture's disposal
+        // is a completed stop, so it explicitly attests 'ceased'.
+        cessationEvidence: () => 'ceased',
         subscribe: () => () => {}, prompt: async () => {}, steer: async () => {}, followUp: async () => {},
         hasLiveProcess: () => false, isCompacting: () => false, dispose: async () => {},
       };

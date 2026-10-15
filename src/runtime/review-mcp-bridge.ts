@@ -26,7 +26,9 @@ export interface ReviewMcpRetention {
 }
 const MAX_BUNDLED_SERVER_BYTES = 2 * 1024 * 1024;
 const MAX_BRIDGE_CONNECTIONS = 16;
-const BRIDGE_CLOSE_TIMEOUT_MS = 5_000;
+/** Cap on bridge teardown during disposal. Exported so the service shutdown
+ * force-exit budget can be reconciled with the bounded teardown (issue #341). */
+export const BRIDGE_CLOSE_TIMEOUT_MS = 5_000;
 export const PERKINS_MCP_SERVER_SHA256 = '06e42a2dfd7330c6b2a7377c0423371907956d52ba56baeb5227caf3e21e1618';
 
 interface BridgeRequest {

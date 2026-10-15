@@ -433,6 +433,31 @@ export interface AgentHandle {
   dispose(): Promise<void>;
 }
 
+/**
+ * Contained adapter-owned cessation query (issue #341, Option A; F60-P1/P2/P3).
+ * Ownership (resident permits, review-pair proof, child lane/terminal
+ * finalization, restart replacement) may be released ONLY when the adapter
+ * itself attests `'ceased'`. A missing method, a throwing adapter, or any
+ * other value is `'unknown'` — never proof. Terminal health, disposed
+ * metadata, dispose fulfillment/rejection settlement, lock release and native
+ * retirement are NEVER evidence of cessation.
+ *
+ * Runtime-neutral: each adapter owns its own proof. pi: a bounded native
+ * abort/waitForIdle plus an inactive independent-bash controller set
+ * (`CESSATION_IDLE_TIMEOUT_MS`). claude-code: the ORIGINAL child's observed
+ * `close` (live, or late after the kill deadline) with the review bridge
+ * settled; an error/deadline exit stays 'unknown' until a late close.
+ */
+export function adapterCessationEvidence(
+  handle: Pick<AgentHandle, 'cessationEvidence'>,
+): 'ceased' | 'unknown' {
+  try {
+    return handle.cessationEvidence?.() === 'ceased' ? 'ceased' : 'unknown';
+  } catch {
+    return 'unknown'; // throwing evidence is unknown, never false
+  }
+}
+
 /** A runtime adapter (pi today; claude-code in E3). */
 export interface AgentRuntime {
   readonly id: string;
