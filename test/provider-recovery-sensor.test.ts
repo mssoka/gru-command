@@ -1641,6 +1641,12 @@ describe('native Claude quota walls (claude-code lanes)', () => {
     expect(resolves).toBe(1); // the seen-set ends the loop at the first repeat
     expect(logs).toContain('retiring a handed-back route failed');
     expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(2);
+    // The next boot, with resolves working again, finishes the retirement.
+    vi.restoreAllMocks();
+    sensor.handBackDisabledWaits();
+    expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(0);
+    expect(h.ledger.findNotificationByKind('provider.waiting.legacy-route', 'active')).toBeNull();
+    expect(h.ledger.getNotification('watch-neighbor')).toMatchObject({ resolvedAt: null });
   });
 
   it('one failing hand-back never stalls boot reconciliation for the rest', async () => {

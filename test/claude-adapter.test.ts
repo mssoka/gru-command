@@ -18,6 +18,7 @@ import {
   claudeInBandError,
   gitFailure,
   isProjectMcpCopyName,
+  redactMcpDiagnostic,
   mapRoleTools,
 } from '../src/runtime/claude-adapter.js';
 import { isRateLimitErrorText } from '../src/runtime/pacing.js';
@@ -1763,6 +1764,20 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     ]);
   });
 
+  it('a CLI diagnostic never carries an echoed value: any quote style, URLs, token-like runs', () => {
+    expect(redactMcpDiagnostic('url: invalid "https://user:sk-secret@example.invalid/mcp"')).toBe('url: invalid "…"');
+    expect(redactMcpDiagnostic("type 'sk-secret-value' unknown")).toBe("type '…' unknown");
+    expect(redactMcpDiagnostic('bad `sk-secret` value')).toBe('bad `…` value');
+    expect(redactMcpDiagnostic('url: invalid https://user:sk-secret@example.invalid/mcp')).toBe('url: invalid <url>');
+    expect(redactMcpDiagnostic('{"t":"sk-x"} at "a\\"b" end')).toBe('{"…":"…"} at "…" end');
+    expect(redactMcpDiagnostic('token abcdefghijklmnopqrstuvwxyz0123 leaked')).toBe('token … leaked');
+    expect(redactMcpDiagnostic('command: expected string, received number')).toBe('command: expected string, received number');
+    // An unescaped quote inside a value (the CLI pastes some raw) never
+    // exposes the rest of the value.
+    expect(redactMcpDiagnostic('Skipped — unknown MCP server type "sk"secret-in-type" for server "q-type"'))
+      .toBe('Skipped — unknown MCP server type "…');
+  });
+
   it('MCP servers the CLI skipped are logged by name, once per distinct set', async () => {
     const fx = fixture();
     const lane = mkdtempSync(join(tmpdir(), 'gru-command-lane-'));
@@ -1788,24 +1803,37 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         { name: 'api', type: 'invalid_config', message: 'url: invalid "https://user:sk-secret@example.invalid/mcp"' },
         { name: 'bare' },
         { name: 'typed', type: 'invalid_config' },
+        'a bare string from the CLI',
       ]);
       await handle.prompt('five');
       expect(skippedLogs()).toHaveLength(3);
-      expect(skippedLogs()[2]?.fields?.['servers']).toEqual(['api: url: invalid "…"', 'bare: unknown reason', 'typed: invalid_config']);
+      expect(skippedLogs()[2]?.fields?.['servers']).toEqual(['api: url: invalid "…"', 'bare: unknown reason', 'typed: invalid_config',
+        '?: a bare string from the CLI']);
       expect(JSON.stringify(skippedLogs())).not.toContain('sk-secret');
       // A server the CLI kept but could not start (status "failed": a missing
       // env var, and every user-mode problem) is logged too.
       delete process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'];
-      process.env['CLAUDE_DOUBLE_MCP_SERVERS'] = JSON.stringify([{ name: 'ok', status: 'connected' }, { name: 'needs-env', status: 'failed' }]);
+      process.env['CLAUDE_DOUBLE_MCP_SERVERS'] = JSON.stringify([{ name: 'ok', status: 'connected' }, { name: 'needs-env', status: 'failed' },
+        { name: 'starting', status: 'pending' }, { name: 'connector', status: 'needs-auth', source: 'claudeai' },
+        { name: 'off', status: 'disabled' }, { name: 'hosted', status: 'needs-auth', source: 'dynamic' }]);
       await handle.prompt('six');
-      expect(skippedLogs()[3]?.fields).toMatchObject({ servers: ['needs-env: failed to start'], total: 1 });
-      // A flood is capped: the first 20 entries, each cut short, plus the total.
+      expect(skippedLogs()[3]?.fields).toMatchObject({
+        servers: ['needs-env: failed to start', 'hosted: needs authentication (a headless session cannot sign in)'], total: 2,
+      });
+      // A flood is capped: the first 20 entries, each cut short, plus the total;
+      // a long name never cuts off the reason.
       process.env['CLAUDE_DOUBLE_MCP_SERVERS'] = JSON.stringify(Array.from({ length: 25 }, (_, i) => ({ name: `s${i}${'x'.repeat(300)}`, status: 'failed' })));
       await handle.prompt('seven');
       const flood = skippedLogs()[4]?.fields as { servers: string[]; total: number };
       expect(flood.total).toBe(25);
       expect(flood.servers).toHaveLength(20);
-      expect(flood.servers.every((line) => line.length <= 200)).toBe(true);
+      expect(flood.servers.every((entry) => entry.length <= 242 && entry.endsWith(': failed to start'))).toBe(true);
+      // One init frame with both kinds (as the real CLI emits for one file):
+      // skipped lines first, then failed ones; a long reason is cut, not the name.
+      process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'] = JSON.stringify([{ name: 'x', type: 'invalid_config', message: 'word '.repeat(60) }]);
+      process.env['CLAUDE_DOUBLE_MCP_SERVERS'] = JSON.stringify([{ name: 'ok', status: 'failed' }]);
+      await handle.prompt('eight');
+      expect(skippedLogs()[5]?.fields).toMatchObject({ servers: [`x: ${'word '.repeat(60).slice(0, 160)}`, 'ok: failed to start'], total: 2 });
     } finally {
       delete process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'];
       delete process.env['CLAUDE_DOUBLE_MCP_SERVERS'];
@@ -2006,19 +2034,22 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         // which may carry a token.
         crlf.commitFile('.mcp.json', '{"mcpServers":{"x":{"env":{"TOKEN":"sk-secret-value"}}} oops');
         const syntax = await checkedInProjectMcpConfig(crlf.path);
-        expect(syntax).toEqual({ reason: 'the committed .mcp.json is not valid JSON (at character 56)' });
+        expect(syntax).toEqual({ reason: 'the committed .mcp.json is not valid JSON (at line 1, column 57)' });
         expect(JSON.stringify(syntax)).not.toContain('sk-secret');
         // ...counted in the file, BOM included; a parser message with no
         // position (V8 quotes the source instead) yields no location at all.
         crlf.commitFile('.mcp.json', '\uFEFF{"mcpServers":{}} oops');
-        expect(await checkedInProjectMcpConfig(crlf.path)).toEqual({ reason: 'the committed .mcp.json is not valid JSON (at character 19)' });
+        expect(await checkedInProjectMcpConfig(crlf.path)).toEqual({ reason: 'the committed .mcp.json is not valid JSON (at line 1, column 19)' });
         crlf.commitFile('.mcp.json', 'sk-secret-token');
         expect(await checkedInProjectMcpConfig(crlf.path)).toEqual({ reason: 'the committed .mcp.json is not valid JSON' });
         // Digits inside V8's quoted snippet are never taken for a position.
         crlf.commitFile('.mcp.json', 'position 48213377');
         expect(await checkedInProjectMcpConfig(crlf.path)).toEqual({ reason: 'the committed .mcp.json is not valid JSON' });
-        // A server entry the CLI only skips is not fatal: the file loads, and
-        // the skip is logged from the init frame.
+        crlf.commitFile('.mcp.json', 'x at position 99'); // V8 quotes it: still never a location
+        expect(await checkedInProjectMcpConfig(crlf.path)).toEqual({ reason: 'the committed .mcp.json is not valid JSON' });
+        // A server entry the CLI only skips is not fatal (CLI 2.1.300 skips
+        // it and reports it in the init frame — logging that is pinned by
+        // the skipped-servers test): the file loads.
         crlf.commitFile('.mcp.json', '{"mcpServers":{"x":5}}');
         expect(await checkedInProjectMcpConfig(crlf.path)).toMatchObject({ config: expect.anything() });
         for (const content of ['["a list"]', 'null', '42', '"a string"', 'true']) {

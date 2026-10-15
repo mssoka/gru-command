@@ -791,8 +791,8 @@ export async function checkedInProjectMcpConfig(
   // The working file is read through ONE no-follow descriptor, bounded by the
   // largest size a line-ending conversion of the committed bytes could have:
   // a file grown or swapped after the first look is never read past it.
-  const text = committed.toString('utf8');
-  const limit = committed.length + (text.split('\n').length - 1) - (text.split('\r\n').length - 1);
+  const committedText = committed.toString('utf8');
+  const limit = committed.length + (committedText.split('\n').length - 1) - (committedText.split('\r\n').length - 1);
   let working: Buffer;
   try {
     // O_NONBLOCK: a FIFO swapped in after the first look never blocks the
@@ -820,19 +820,21 @@ export async function checkedInProjectMcpConfig(
   // Only what the CLI treats as FATAL is refused here: unparseable JSON, a
   // non-object, or no `mcpServers` object — it would exit on every turn. A
   // server entry it cannot load is skipped by the CLI itself, never fatal,
-  // and logged from the init frame (noteMcpServerErrors).
-  const bom = text.startsWith('\uFEFF') ? 1 : 0;
+  // and logged from the init frame (noteMcpServerProblems).
+  const bom = committedText.startsWith('\uFEFF') ? 1 : 0;
   let parsed: unknown;
   try {
     // One leading BOM is stripped, exactly as the CLI reads the file.
-    parsed = JSON.parse(text.slice(bom));
+    parsed = JSON.parse(committedText.slice(bom));
   } catch (error) {
     // Never the parser's message: V8 quotes source text, and .mcp.json files
-    // carry tokens. Only a character position (in the file, BOM included),
-    // when the parser gives one.
-    // Anchored to V8's own suffix: a quoted source snippet never supplies it.
-    const position = / at position (\d+)(?: \(line \d+ column \d+\))?$/u.exec(error instanceof Error ? error.message : '')?.[1];
-    return { reason: `the committed .mcp.json is not valid JSON${position === undefined ? '' : ` (at character ${Number(position) + bom})`}` };
+    // carry tokens. Only the location from V8's own anchored suffix (never
+    // digits from its quoted snippet): line and column as an editor shows
+    // them, else the character offset in the file (BOM included).
+    const at = / at position (\d+)(?: \(line (\d+) column (\d+)\))?$/u.exec(error instanceof Error ? error.message : '');
+    const where = at === null ? '' : at[2] !== undefined && at[3] !== undefined
+      ? ` (at line ${at[2]}, column ${at[3]})` : ` (at character ${Number(at[1]) + bom})`;
+    return { reason: `the committed .mcp.json is not valid JSON${where}` };
   }
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
     return { reason: 'the committed .mcp.json is not a JSON object' };
@@ -843,6 +845,23 @@ export async function checkedInProjectMcpConfig(
     return { reason: 'the committed .mcp.json has no "mcpServers" object' };
   }
   return { config: committed };
+}
+
+/** A CLI diagnostic with every value it may echo removed: quoted spans of
+ * any quote style (escapes included), URLs, and long token-like runs. The
+ * CLI pastes some values in unescaped, so a quote style with an odd count
+ * cannot be paired safely: everything from its first quote is dropped. */
+export function redactMcpDiagnostic(text: string): string {
+  let safe = text;
+  for (const quote of ['"', "'", '`']) {
+    const at: number[] = [];
+    for (let i = 0; i < safe.length; i += 1) if (safe[i] === quote && safe[i - 1] !== '\\') at.push(i);
+    if (at.length % 2 === 1) safe = `${safe.slice(0, at[0])}${quote}…`;
+  }
+  return safe
+    .replace(/(["'`])(?:\\.|(?!\1)[^\\])*\1/gu, '$1…$1')
+    .replace(/\b[a-z][a-z0-9+.-]*:\/\/\S+/giu, '<url>')
+    .replace(/[A-Za-z0-9_-]{24,}/gu, '…');
 }
 
 /** The refusal for a working file that is not the committed bytes. The
@@ -958,7 +977,7 @@ export class ClaudeCodeHandle implements AgentHandle {
   /** This handle's own project-MCP copy (see projectMcpCopyPath). */
   private readonly projectMcpCopy: string;
   private projectMcpSwept = false;
-  /** The last distinct set of skipped MCP servers logged (see noteMcpServerErrors). */
+  /** The last distinct set of MCP load problems logged (see noteMcpServerProblems). */
   private mcpServerErrorsNote: string | null = null;
   /** A turn is resolving its params (the project-MCP git check): the
    * operation slot is held exactly as by a live child. */
@@ -1227,25 +1246,34 @@ export class ClaudeCodeHandle implements AgentHandle {
     });
   }
 
-  /** Log the MCP servers the CLI reported it skipped, once per distinct set
-   * (a set that clears resets, so a later recurrence is logged again). */
-  private noteMcpServerErrors(errors: unknown, servers: unknown): void {
+  /** Log the MCP servers the CLI could not load — skipped entries
+   * (mcp_server_errors) and servers it kept but could not start (status
+   * "failed") — once per distinct set (a set that clears resets, so a later
+   * recurrence is logged again). */
+  private noteMcpServerProblems(errors: unknown, servers: unknown): void {
     const record = (value: unknown): Record<string, unknown> =>
       typeof value === 'object' && value !== null ? value as Record<string, unknown> : {};
-    const named = (entry: Record<string, unknown>): string => typeof entry['name'] === 'string' ? entry['name'] : '?';
-    // The CLI's own words, with any quoted value redacted (a message may
-    // quote a rejected value) and cut short.
+    // A name is cut on its own, so the reason always survives.
+    const line = (name: unknown, why: string): string =>
+      `${typeof name === 'string' ? name.slice(0, 80) : '?'}: ${redactMcpDiagnostic(why).slice(0, 160)}`;
+    // The CLI's own words, redacted: a message may quote a rejected value.
     const skipped = (Array.isArray(errors) ? errors : []).map((error: unknown) => {
+      if (typeof error === 'string') return line(undefined, error);
       const entry = record(error);
       const why = typeof entry['message'] === 'string' ? entry['message']
         : typeof entry['type'] === 'string' ? entry['type'] : 'unknown reason';
-      return `${named(entry)}: ${why.replace(/"[^"]*"/gu, '"…"')}`.slice(0, 200);
+      return line(entry['name'], why);
     });
     // A server the CLI kept but could not start (a missing env var, a broken
-    // command — and every user-mode problem, which never reaches
-    // mcp_server_errors) shows only as status "failed".
-    const failed = (Array.isArray(servers) ? servers : []).map(record)
-      .filter((entry) => entry['status'] === 'failed').map((entry) => `${named(entry)}: failed to start`.slice(0, 200));
+    // command) shows only as status "failed"; one from GC's own config that
+    // needs OAuth ("needs-auth", source "dynamic") can never sign in from a
+    // headless session. The operator's own connectors (user mode, other
+    // sources) are not GC's to report. In user mode an entry the CLI's
+    // validation rejects leaves no signal at all, so it cannot be logged.
+    const failed = (Array.isArray(servers) ? servers : []).map(record).flatMap((entry) =>
+      entry['status'] === 'failed' ? [line(entry['name'], 'failed to start')]
+        : entry['status'] === 'needs-auth' && entry['source'] === 'dynamic'
+          ? [line(entry['name'], 'needs authentication (a headless session cannot sign in)')] : []);
     const problems = [...skipped, ...failed];
     if (problems.length === 0) {
       this.mcpServerErrorsNote = null;
@@ -1740,7 +1768,7 @@ export class ClaudeCodeHandle implements AgentHandle {
           // reserved name: mcp_server_errors, --mcp-config only) or kept but
           // could not start (status "failed") are logged once per distinct
           // set, so none just disappears.
-          this.noteMcpServerErrors(frame['mcp_server_errors'], frame['mcp_servers']);
+          this.noteMcpServerProblems(frame['mcp_server_errors'], frame['mcp_servers']);
           // Record what this turn was asked right after its verified identity
           // frame: stdout carries only claude's side of the conversation. Not
           // the CLI's --replay-user-messages: it also echoes the permission

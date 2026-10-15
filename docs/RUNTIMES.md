@@ -177,8 +177,9 @@ run lane-configured filters — so an autocrlf-converted checkout gets its own
 line-ending reason. A git or file failure is logged at warn with its own
 reason; git runs without inherited repository-routing variables. A file the
 CLI itself would refuse on every turn (not JSON, not an object, no
-`mcpServers` object) is refused with its reason; a server entry the CLI only
-skips is logged by name, with quoted values redacted. HEAD is
+`mcpServers` object) is refused with its reason; a server the CLI only skips,
+or keeps but cannot start, is logged by name with any echoed value (quoted
+span, URL, token-like run) redacted. HEAD is
 lane state a session with a shell can commit to, so only roles whose own
 tools include a shell load project servers (a server is a command such a
 session could already run); a read-only role never runs a command another
