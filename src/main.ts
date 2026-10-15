@@ -43,6 +43,7 @@ import { routeFixDirectiveToMinion } from './dispatch/fix-directive.js';
 import { reconcilePendingLegacyDirectives, reconcilePendingRebriefs } from './dispatch/rebrief-recovery.js';
 import { adoptBlockedLanes, observeFollowUpDelivery, observePhaseCompletion, reconcilePhaseHandoffs, reconcileUnmarkedHandbacks } from './dispatch/obligations.js';
 import { createDispatchServer } from './dispatch/server.js';
+import { createPropertyCampaignService } from './dispatch/property-campaigns.js';
 import { PipelineService } from './dispatch/pipeline.js';
 import { IntakeService } from './intake/service.js';
 import { IntakeApprovalService } from './intake/approval.js';
@@ -1281,10 +1282,13 @@ async function main(): Promise<number> {
       })
     : null;
   const intake = new IntakeService({ dataDir: config.dataDir, workspaceRoot: config.workspaceRoot, uploadsDir });
+  const propertyCampaigns = createPropertyCampaignService({ ledger, registry, worktrees: worktreeManager, wave, notifications, observeBlindTurn, artifactsRoot: join(config.dataDir, 'property-campaigns'), pendingProducerBlockers: (jobId) => supervisorLive.pendingProducerBlockers(jobId), workerGate: pacing.gate, retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId), parentTools: parentToolsFor, ...(config.lessons.enabled ? { lessons: lessonReferences } : {}) });
+  state.propertyCampaigns = propertyCampaigns;
   const dispatchServer = createDispatchServer({
     config,
     intake,
     intakeApproval: new IntakeApprovalService({ intake, ledger, pipeline }),
+    propertyCampaigns,
     dispatch: dispatcher,
     wave,
     ledger,

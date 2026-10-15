@@ -1,5 +1,6 @@
 import { capturePortLaneHandoff } from '../worktrees/handoff.js';
 import { randomUUID } from 'node:crypto';
+import { isHostPropertyRepairDirective, type PropertyRepairDirective } from '../property/pipeline.js';
 import type { Role } from '../config.js';
 import type { LedgerApi } from '../ledger/api.js';
 import { isJobTerminal } from '../ledger/states.js';
@@ -25,6 +26,20 @@ import { settleRetries, type PacingGate, type PacingLease, type RetrySettlement 
  * silas ops surface — so "route a directive to the minion" can never drift
  * between them.
  */
+
+/** Bind property repair to the SAME job/minion routing, pacing, cancellation
+ * and single-writer rules as ordinary fix directives. Only the host campaign
+ * can issue these inputs; caller-authored repair stories are not evidence. */
+export function createPropertyFixDirectiveSink(deps: DirectiveRoutingDeps, jobId: string, signal: AbortSignal, receipt?: (delivery: Awaited<ReturnType<typeof routeFixDirectiveToMinion>>) => void): (directive: PropertyRepairDirective) => Promise<void> {
+  const consumed = new WeakSet<PropertyRepairDirective>();
+  return async (directive) => {
+    if (!isHostPropertyRepairDirective(directive) || consumed.has(directive)) throw new Error('property repair refused: unissued, changed or already delivered directive');
+    consumed.add(directive);
+    const result = await routeFixDirectiveToMinion({ ...deps, jobId, signal, directive: directive.text, owner: 'property-contract-repair', contract: 'effectiveContract' in deps.ledger ? (deps.ledger as LedgerApi).effectiveContract(jobId)?.text ?? null : null });
+    receipt?.(result);
+    if (!result.delivered || result.outcome === 'error') throw new Error(`property repair directive did not complete: ${result.error ?? result.note ?? 'no delivery proof'}`);
+  };
+}
 
 /** The product-owned identity + GC-mediated child tools for a
  * (re)dispatched parent session (issue #161). A fresh physical session
