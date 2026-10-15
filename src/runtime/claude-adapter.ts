@@ -1,11 +1,10 @@
-import { execFile, execFileSync, spawn, spawnSync } from 'node:child_process';
+import { execFile, spawn, spawnSync } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import {
   closeSync,
   createWriteStream,
-  lstatSync,
   mkdirSync,
   openSync,
   readSync,
@@ -14,6 +13,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import type { WriteStream } from 'node:fs';
+import { lstat, readFile, rm, writeFile } from 'node:fs/promises';
 import { basename, isAbsolute, join, relative } from 'node:path';
 import { finished } from 'node:stream/promises';
 import type { GruCommandConfig, Role } from '../config.js';
@@ -69,7 +69,6 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
 // runtime probe can report it without loading this adapter's SDK graph; the
 // re-export keeps every existing import surface (and object identity) intact.
 export { CLAUDE_CODE_CAPABILITIES };
-
 
 /**
  * Role tool ids (pi-flavored, src/roles.ts) → claude built-in tool names
@@ -428,12 +427,19 @@ export class ClaudeCodeRuntime implements AgentRuntime {
       // Claude configuration (claude.ai connectors included) would run under
       // bypassPermissions regardless of the role's declared tools.
       // A narrowed tool set (a bounded child worker) never gains ambient MCP:
-      // those tools would sidestep its narrowed roleTools. Project mode is
-      // resolved per turn (each turn is a fresh CLI process).
+      // those tools would sidestep its narrowed roleTools. Project servers are
+      // lane content: only a role whose own tools include a shell (it could
+      // run any such command already) loads them — see
+      // checkedInProjectMcpConfig. Project mode is resolved per turn (each
+      // turn is a fresh CLI process).
       const mcpMode = this.config.runtimes.policies['claude-code']?.mcp ?? DEFAULT_CLAUDE_MCP_MODE;
+      const shellRole = roleDef.tools.includes('bash');
       const ambientMcp: HandleParams['ambientMcp'] =
         reviewMode !== undefined || mcpMode === 'none' || options.roleTools !== undefined ? { mode: 'none' }
-          : mcpMode === 'user' ? { mode: 'user' } : { mode: 'project' };
+          : mcpMode === 'user' ? { mode: 'user' } : shellRole ? { mode: 'project' } : { mode: 'none' };
+      if (reviewMode === undefined && mcpMode === 'project' && options.roleTools === undefined && !shellRole) {
+        this.log('info', 'mcp = "project": a role without a shell loads no project MCP servers', { role });
+      }
       const declaredNativeTools = reviewMode !== undefined ? reviewMode.nativeTools : undefined;
       if (declaredNativeTools !== undefined && declaredNativeTools.length > 0) {
         reviewBridge = await ReviewMcpBridge.start(declaredNativeTools);
@@ -693,7 +699,6 @@ export function claudeTurnArgs(params: HandleParams, resume: boolean): string[] 
   return args;
 }
 
-
 /**
  * The in-band error for a turn whose result reports `is_error`. When the CLI
  * attached a provider failure (synthetic API-error message / result
@@ -725,32 +730,71 @@ export function claudeInBandError(
   };
 }
 
+/** The first stderr line (or the spawn/timeout failure) of a failed git run. */
+function gitFailure(error: unknown): string {
+  const failure = error as { readonly stderr?: Buffer | string; readonly signal?: string | null; readonly message?: string };
+  const stderr = failure.stderr === undefined ? '' : String(failure.stderr).trim().split('\n')[0] ?? '';
+  if (stderr !== '') return stderr;
+  if (failure.signal !== undefined && failure.signal !== null) return `git killed by ${failure.signal}`;
+  return failure.message ?? String(error);
+}
+
 /**
- * `mcp = "project"` loads checked-in servers only: the cwd's `.mcp.json`
- * when it is a regular file (never a symlink) that git tracks UNMODIFIED at
- * HEAD. An untracked, edited or symlinked file — e.g. one a session wrote
- * into its own lane — never loads under bypassPermissions.
+ * `mcp = "project"` loads the cwd's checked-in servers: the `.mcp.json` blob
+ * committed at HEAD, and only while the working file is a regular file
+ * (never a symlink) byte-identical to it. An untracked, staged-only, edited
+ * or symlinked file never loads, and the CLI reads a private copy of the
+ * verified bytes — never the lane path, which a later write could swap.
+ *
+ * Trust boundary: HEAD is lane state, and a session with a shell can commit
+ * its own `.mcp.json` (every git ref is writable from a worktree, so no ref
+ * is safe from it). That grants such a session nothing it lacks — a project
+ * server is a command it could already run — which is why only roles whose
+ * own tools include a shell load project servers at all: a read-only role
+ * never runs a command another session committed.
  */
-export function checkedInProjectMcpConfig(cwd: string): { readonly file: string } | { readonly reason: string } {
+export async function checkedInProjectMcpConfig(cwd: string): Promise<{ readonly config: Buffer } | { readonly reason: string }> {
   const file = join(cwd, '.mcp.json');
-  let isFile: boolean;
   try {
-    isFile = lstatSync(file).isFile();
-  } catch {
-    return { reason: 'no .mcp.json in the session cwd' };
+    if (!(await lstat(file)).isFile()) return { reason: '.mcp.json is not a regular file (symlink or other)' };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { reason: 'no .mcp.json in the session cwd' };
+    return { reason: `.mcp.json cannot be inspected: ${String(error)}` };
   }
-  if (!isFile) return { reason: '.mcp.json is not a regular file (symlink or other)' };
-  const git = (args: readonly string[]): boolean => {
-    try {
-      execFileSync('git', args, { cwd, stdio: 'ignore', timeout: 10_000, windowsHide: true });
-      return true;
-    } catch {
-      return false;
-    }
-  };
-  if (!git(['ls-files', '--error-unmatch', '--', '.mcp.json'])) return { reason: '.mcp.json is not tracked by git' };
-  if (!git(['diff', '--quiet', 'HEAD', '--', '.mcp.json'])) return { reason: '.mcp.json differs from its committed version' };
-  return { file };
+  const git = async (args: readonly string[]): Promise<Buffer> =>
+    (await execFileAsync('git', [...args], { cwd, encoding: 'buffer', timeout: 10_000, maxBuffer: 1 << 20, windowsHide: true })).stdout;
+  let entry: string;
+  try {
+    entry = (await git(['ls-tree', '-z', 'HEAD', '--', '.mcp.json'])).toString('utf8');
+  } catch (error) {
+    return { reason: `git cannot read HEAD in the session cwd: ${gitFailure(error)}` };
+  }
+  if (entry === '') return { reason: '.mcp.json is not committed at HEAD' };
+  // "<mode> <type> <object>\t<path>\0" — a committed symlink (120000), tree
+  // or submodule is never a server list.
+  const committedEntry = /^(100644|100755) blob ([0-9a-f]+)\t/u.exec(entry);
+  if (committedEntry === null) return { reason: 'the committed .mcp.json is not a regular file' };
+  let committed: Buffer;
+  try {
+    committed = await git(['cat-file', 'blob', committedEntry[2]!]);
+  } catch (error) {
+    return { reason: `git cannot read the committed .mcp.json: ${gitFailure(error)}` };
+  }
+  let working: Buffer;
+  try {
+    working = await readFile(file);
+  } catch (error) {
+    return { reason: `.mcp.json cannot be read: ${String(error)}` };
+  }
+  if (!working.equals(committed)) return { reason: '.mcp.json differs from its committed version' };
+  return { config: committed };
+}
+
+/** The private copy of the verified project servers handed to --mcp-config:
+ * beside the session's own transcript (GC-owned; the store lists only
+ * `.jsonl`), owner-only, rewritten every turn and removed at disposal. */
+export function projectMcpCopyPath(sessionFile: string): string {
+  return `${sessionFile}.project-mcp.json`;
 }
 
 /** The stdin user frame for one prompt (image blocks first, then text). */
@@ -817,6 +861,9 @@ export class ClaudeCodeHandle implements AgentHandle {
   private disposalPromise: Promise<void> | null = null;
   /** Last logged reason project MCP loaded nothing (logged once per change). */
   private projectMcpNote: string | null = null;
+  /** A turn is resolving its params (the project-MCP git check): the
+   * operation slot is held exactly as by a live child. */
+  private preparingTurn = false;
 
   constructor(
     role: Role,
@@ -888,7 +935,7 @@ export class ClaudeCodeHandle implements AgentHandle {
     if (text === '' && (options.images === undefined || options.images.length === 0)) {
       throw new Error('empty prompt: nothing to send (no text, no images)');
     }
-    if (this.live !== null || this.compacting) {
+    if (this.live !== null || this.preparingTurn || this.compacting) {
       throw new Error(
         'claude-code turn in flight or control active — one operation at a time per session ' +
           '(the interface fallback serializes product callers; direct callers must wait)',
@@ -908,7 +955,7 @@ export class ClaudeCodeHandle implements AgentHandle {
   }
 
   canCompact = (): boolean =>
-    !this.disposed && this.sessionEstablished && this.live === null && !this.compacting;
+    !this.disposed && this.sessionEstablished && this.live === null && !this.preparingTurn && !this.compacting;
 
   isCompacting = (): boolean => this.compacting;
 
@@ -921,7 +968,7 @@ export class ClaudeCodeHandle implements AgentHandle {
     if (!this.sessionEstablished) {
       throw new Error('claude-code session is not established; nothing can be compacted');
     }
-    if (this.live !== null || this.compacting) {
+    if (this.live !== null || this.preparingTurn || this.compacting) {
       throw new Error('agent session is busy; compaction requires an idle session');
     }
     this.compacting = true;
@@ -1058,6 +1105,7 @@ export class ClaudeCodeHandle implements AgentHandle {
         this.setState('disposed');
         this.onDispose();
         this.cleanupVerificationSettings();
+        this.cleanupProjectMcpCopy();
         this.emitEvidence();
       }
     }
@@ -1076,6 +1124,15 @@ export class ClaudeCodeHandle implements AgentHandle {
       }
       this.cleanupVerificationSettings();
       if (this.disposed) this.emitEvidence();
+    });
+  }
+
+  /** The private project-servers copy lives only as long as the session. */
+  private cleanupProjectMcpCopy(): void {
+    if (this.params.ambientMcp?.mode !== 'project') return;
+    const copy = projectMcpCopyPath(this.params.sessionFile);
+    void rm(copy, { force: true }).catch((error: unknown) => {
+      this.log('warn', 'project MCP copy cleanup failed', { file: copy, error: String(error) });
     });
   }
 
@@ -1133,27 +1190,65 @@ export class ClaudeCodeHandle implements AgentHandle {
     }
   }
 
-  /** This turn's params: project MCP is re-resolved every turn (each turn is
-   * a fresh CLI process, and the lane's file may have changed since). */
-  private turnParams(): HandleParams {
-    if (this.params.ambientMcp?.mode !== 'project') return this.params;
-    const resolved = checkedInProjectMcpConfig(this.params.cwd);
+  /** `mcp = "project"` servers for this operation: re-resolved every turn
+   * and compaction (each is a fresh CLI process, and the lane's file may
+   * have changed since). Every other session spawns synchronously from its
+   * fixed params and never comes here. */
+  private async projectTurnParams(): Promise<HandleParams> {
+    const resolved = await checkedInProjectMcpConfig(this.params.cwd);
+    const copy = projectMcpCopyPath(this.params.sessionFile);
     if ('reason' in resolved) {
+      await rm(copy, { force: true });
       if (this.projectMcpNote !== resolved.reason) {
         this.projectMcpNote = resolved.reason;
         this.log('info', 'mcp = "project": no project MCP servers loaded', { cwd: this.params.cwd, reason: resolved.reason });
       }
       return { ...this.params, ambientMcp: { mode: 'project' } };
     }
+    await writeFile(copy, resolved.config, { mode: 0o600 });
     this.projectMcpNote = null;
-    return { ...this.params, ambientMcp: { mode: 'project', file: resolved.file } };
+    return { ...this.params, ambientMcp: { mode: 'project', file: copy } };
+  }
+
+  /** Run one CLI process with this operation's params. A project-mode check
+   * runs off the event loop while the session's one operation slot stays
+   * held; the slot is released, and disposal re-checked, in the same step
+   * that spawns — never a window for a second operation or a post-disposal
+   * child. A failed check fails the operation loudly. */
+  private withTurnParams(
+    spawnWith: (params: HandleParams) => Promise<void>,
+    onPrepareFailure?: (detail: string) => void,
+  ): Promise<void> {
+    if (this.params.ambientMcp?.mode !== 'project') return spawnWith(this.params);
+    this.preparingTurn = true;
+    return this.projectTurnParams().then(
+      (params) => {
+        this.preparingTurn = false;
+        if (this.disposed) {
+          // Disposal's own cleanup may have run before this check wrote.
+          this.cleanupProjectMcpCopy();
+          throw new Error('agent session disposed');
+        }
+        return spawnWith(params);
+      },
+      (error: unknown) => {
+        this.preparingTurn = false;
+        if (this.disposed) throw new Error('agent session disposed');
+        const detail = `claude turn could not be prepared: ${error instanceof Error ? error.message : String(error)}`;
+        onPrepareFailure?.(detail);
+        throw new Error(detail);
+      },
+    );
   }
 
   /** A dedicated, resumed native slash-command process. Its machine frames
    * remain in the native transcript for forensics, but content events are
    * intentionally discarded so `/compact` output can never become chat text. */
   private runCompactionControl(): Promise<void> {
-    const params = this.turnParams();
+    return this.withTurnParams((params) => this.spawnCompaction(params));
+  }
+
+  private spawnCompaction(params: HandleParams): Promise<void> {
     const translator = new ClaudeControlTranslator();
 
     return new Promise<void>((resolve, reject) => {
@@ -1353,7 +1448,15 @@ export class ClaudeCodeHandle implements AgentHandle {
 
   private runTurn(text: string, owner: string | null, images?: PromptOptions['images']): Promise<void> {
     this.setState('spawning');
-    const params = this.turnParams();
+    return this.withTurnParams((params) => this.spawnTurn(params, text, owner, images), (detail) => {
+      if (!this.disposed) {
+        this.emit({ type: 'error', error: detail, fatal: false });
+        this.setState('error', detail);
+      }
+    });
+  }
+
+  private spawnTurn(params: HandleParams, text: string, owner: string | null, images?: PromptOptions['images']): Promise<void> {
     const translator = new ClaudeTurnTranslator();
     let turnStarted = false;
     this.livePrompt = {

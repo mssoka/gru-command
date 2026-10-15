@@ -1219,27 +1219,32 @@ describe('native Claude quota walls (claude-code lanes)', () => {
     expect(await off.establishMinionWait(claudeWall)).toBeNull();
   });
 
-  it('a Claude-only sensor never probes, settles or re-wakes routes of providers that are off', async () => {
-    // GLM routes recorded while the owner had GLM recovery armed: one already
-    // recovered with its delivery still pending (lost across a restart)...
-    const h = new Harness();
+  /** GLM debt recorded while the owner had GLM recovery armed: one route
+   * already recovered with its delivery pending, one still waiting. */
+  async function glmDebt(h: Harness) {
     h.makeJob('job-1');
     h.makeJob('job-2');
+    h.ledger.registerAgent({ id: 'agent-minion-1', role: 'minion', jobId: 'job-1' });
+    h.ledger.registerAgent({ id: 'agent-minion-2', role: 'minion', jobId: 'job-2' });
     const recovered = await h.establishMinionWait();
     h.advance(Math.max(0, Date.parse(h.ledger.getProviderRoute(recovered!.routeKey)!.nextCheckAt) - h.now) + 1);
     h.probe.queueCompleted();
     await h.sensor.tick();
     expect(h.ledger.getProviderWait(recovered!.id)?.status).toBe('recovered-pending');
     expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(1);
-    // ...and one still waiting on its own route.
     const waiting = await h.establishMinionWait({ agentId: 'agent-minion-2', jobId: 'job-2', model: 'glm-5.3-flash',
       sessionFile: '/tmp/minion-2.jsonl', incidentId: 'supervision.provider-wall.agent-minion-2.quota_wall' });
     expect(waiting?.routeKey).not.toBe(recovered!.routeKey);
-    const wakes = h.wakes.length;
-    const calls = h.probe.calls.length;
-    // A service now running with GLM off (Claude only) leaves both alone.
-    const claudeOnly = new ProviderRecoverySensor({
-      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: false, claudeNative: true },
+    return { recovered: recovered!, waiting: waiting! };
+  }
+
+  /** A service restarted with only Claude recovery on (GLM's switch off),
+   * sharing the ledger, an hour on so every GLM route is due. */
+  function claudeOnlySensor(h: Harness) {
+    return new ProviderRecoverySensor({
+      // The GLM fallback stays armed so a GLM check WOULD reach the fake
+      // probe: only the provider switch keeps it away.
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, glmGenerationFallback: true, enabled: false, claudeNative: true },
       ledger: h.ledger,
       probe: h.probe,
       notifications: h.notifications,
@@ -1248,14 +1253,71 @@ describe('native Claude quota walls (claude-code lanes)', () => {
       silasHosted: () => true,
       now: () => h.now + 3_600_000,
     });
+  }
+
+  it('a Claude-only sensor tick never probes, settles or re-wakes routes of providers that are off', async () => {
+    const h = new Harness();
+    const { recovered, waiting } = await glmDebt(h);
+    // The recovered waiter left its batch: the pending marker is now
+    // settleable — by a sensor whose switch covers the route.
+    h.ledger.setProviderWaitStatus(recovered.id, 'cancelled', { why: 'test: batch member gone' });
+    const route = h.ledger.getProviderRoute(waiting.routeKey);
+    const wakes = h.wakes.length;
+    const calls = h.probe.calls.length;
+    await claudeOnlySensor(h).tick();
+    expect(h.probe.calls).toHaveLength(calls);
+    expect(h.wakes).toHaveLength(wakes);
+    expect(h.ledger.getProviderRoute(waiting.routeKey)).toEqual(route);
+    expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(1);
+    expect(h.ledger.getProviderWait(waiting.id)?.status).toBe('waiting');
+    // Control: a GLM-armed sensor checks the due route and settles the marker.
+    h.advance(3_600_000);
+    await h.sensor.tick();
+    expect(h.probe.calls.length).toBeGreaterThan(calls);
+    expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(0);
+  });
+
+  it('boot hands the open waits of a provider that is now off back to the owner — never stranded', async () => {
+    const h = new Harness();
+    const { recovered, waiting } = await glmDebt(h);
+    // The supervisor's machine-owned stop for the waiting lane (linked the
+    // way main wires it); the recovered lane's stop link was never written.
+    const stop = h.notifications.postIncident({ kind: 'supervision.provider-wall.agent-minion-2.quota_wall', routing: 'action-required',
+      severity: 'error', title: 'Agent agent-minion-2 stopped: quota wall', agentId: 'agent-minion-2', dedupe: 'unacked' });
+    h.ledger.setProviderWaitIncident(waiting.id, stop.id);
+    const wakes = h.wakes.length;
+    const calls = h.probe.calls.length;
+    const claudeOnly = claudeOnlySensor(h);
     expect(await claudeOnly.reconcileAtBoot()).toEqual({ rewoken: 0 });
-    await claudeOnly.tick();
+    expect(h.ledger.getProviderWait(waiting.id)?.status).toBe('cancelled');
+    expect(h.ledger.getProviderWait(recovered.id)?.status).toBe('cancelled');
+    // The linked stop is now the owner's (open, needs-owner), not resolved.
+    expect(h.ledger.getNotification(stop.id)).toMatchObject({ routing: 'needs-owner', resolvedAt: null, ackedAt: null });
+    expect(h.ledger.getNotification(stop.id)?.detail).toContain('[provider_recovery] enabled = false');
+    // The unlinked lane gets its own needs-owner stop.
+    const notice = h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${recovered.id}`, 'unacked');
+    expect(notice).toMatchObject({ routing: 'needs-owner', agentId: 'agent-minion-1' });
+    expect(h.ledger.countPendingNeedsOwner()).toBe(2);
     expect(h.wakes).toHaveLength(wakes);
     expect(h.probe.calls).toHaveLength(calls);
-    expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(1);
-    expect(h.ledger.getProviderWait(waiting!.id)?.status).toBe('waiting');
-    // Control: the same pending delivery IS re-woken by a GLM-armed sensor.
-    expect(await h.sensor.reconcileAtBoot()).toEqual({ rewoken: 1 });
+    // Idempotent: a second boot hands nothing back and posts nothing new.
+    expect(claudeOnly.handBackDisabledWaits()).toBe(0);
+    expect(h.ledger.countPendingNeedsOwner()).toBe(2);
+  });
+
+  it('a boot interrupted between re-routing and cancelling never posts a second owner stop', async () => {
+    const h = new Harness();
+    const { waiting } = await glmDebt(h);
+    const stop = h.notifications.postIncident({ kind: 'supervision.provider-wall.agent-minion-2.quota_wall', routing: 'action-required',
+      severity: 'error', title: 'Agent agent-minion-2 stopped: quota wall', agentId: 'agent-minion-2', dedupe: 'unacked' });
+    h.ledger.setProviderWaitIncident(waiting.id, stop.id);
+    h.ledger.updateNotificationTriage(stop.id, 'needs-owner', 'already handed back before a crash');
+    const before = h.ledger.countPendingNeedsOwner();
+    expect(claudeOnlySensor(h).handBackDisabledWaits()).toBe(2);
+    expect(h.ledger.getProviderWait(waiting.id)?.status).toBe('cancelled');
+    expect(h.ledger.getNotification(stop.id)?.detail).toBe('already handed back before a crash');
+    // Only the other (unlinked) lane gained a stop.
+    expect(h.ledger.countPendingNeedsOwner()).toBe(before + 1);
   });
 
   it('enabled = true never overrides claude_native = false: no Claude wait and no keychain read', async () => {
@@ -1271,6 +1333,47 @@ describe('native Claude quota walls (claude-code lanes)', () => {
     // GLM still recovers under its own switch.
     expect(await h.establishMinionWait({ agentId: 'agent-minion-2', jobId: 'job-2', sessionFile: '/tmp/minion-2.jsonl',
       incidentId: 'supervision.provider-wall.agent-minion-2.quota_wall' })).not.toBeNull();
+  });
+
+  it('Claude waits left by the defaults are never read or re-woken once claude_native = false, even with enabled = true', async () => {
+    const reads: string[] = [];
+    const usage = JSON.stringify({ windows: {
+      five_hour: { utilization: 0.2, resetsAtUtc: '2026-09-28T15:40:00Z' },
+      seven_day: { utilization: 0.1, resetsAtUtc: '2026-09-29T19:00:00Z' },
+    } });
+    const fetch: MetadataFetchPort = { get: ({ url }) => { reads.push(url); return Promise.resolve({ status: 200, body: usage }); } };
+    const h = new Harness({ enabled: false, claudeNative: true, glmGenerationFallback: false }, readers(false, keychain, fetch));
+    h.probe.resolveRouteImpl = () => Promise.resolve(null);
+    h.makeJob('job-1');
+    h.makeJob('job-2');
+    const recovered = await h.establishMinionWait(claudeWall);
+    h.advance(Math.max(0, Date.parse(h.ledger.getProviderRoute(recovered!.routeKey)!.nextCheckAt) - h.now) + 1);
+    await h.sensor.tick();
+    expect(h.ledger.getProviderWait(recovered!.id)?.status).toBe('recovered-pending');
+    const waiting = await h.establishMinionWait({ ...claudeWall, agentId: 'agent-minion-2', jobId: 'job-2',
+      sessionFile: '/tmp/minion-2.jsonl', incidentId: 'supervision.provider-wall.agent-minion-2.quota_wall' });
+    expect(waiting?.status).toBe('waiting');
+    const readsBefore = reads.length;
+    const wakes = h.wakes.length;
+    // The owner opts Claude out (and arms GLM/Codex) across a restart.
+    const off = new ProviderRecoverySensor({
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: true, claudeNative: false },
+      ledger: h.ledger, probe: h.probe, notifications: h.notifications, wake: h.wakePort(), slotReArm: h.reArmPort(),
+      silasHosted: () => true, metadataReaders: readers(false, keychain, fetch), now: () => h.now + 3_600_000,
+    });
+    await off.tick();
+    expect(reads).toHaveLength(readsBefore);
+    expect(h.probe.calls).toEqual([]);
+    expect(h.wakes).toHaveLength(wakes);
+    expect(h.ledger.getProviderWait(waiting!.id)?.status).toBe('waiting');
+    expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(1);
+    expect(await off.reconcileAtBoot()).toEqual({ rewoken: 0 });
+    expect(h.wakes).toHaveLength(wakes);
+    expect(reads).toHaveLength(readsBefore);
+    expect(h.ledger.getProviderWait(recovered!.id)?.status).toBe('cancelled');
+    expect(h.ledger.getProviderWait(waiting!.id)?.status).toBe('cancelled');
+    expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${waiting!.id}`, 'unacked')?.detail)
+      .toContain('[provider_recovery] claude_native = false');
   });
 
   it('a Claude wait under the shipped defaults reads claude.ai usage and recovers the lane', async () => {

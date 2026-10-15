@@ -359,9 +359,9 @@ export function parseTranscriptContent(content: string): {
       continue;
     }
     entries.push(...claudeFrameEntries(entry, entries.length, claudeToolNames));
-    // else: claude-code raw stream frames (init metadata, stream_event
-    // deltas) are duplicate representations of the assistant/user message
-    // entries already rendered — skipping them is dedupe, not data loss.
+    // claude-code raw stream frames (init metadata, stream_event deltas)
+    // yield no entries: they duplicate the assistant/user message entries
+    // already rendered — skipping them is dedupe, not data loss.
   }
   return { entries, tornLines };
 }

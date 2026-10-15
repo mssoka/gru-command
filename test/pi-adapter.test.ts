@@ -2498,6 +2498,26 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     await expect(fx.runtime.spawn('perkins', { model: 'default' }).then(async (handle) => handle.dispose())).resolves.toBeUndefined();
   });
 
+  it('an anthropic review model on api.anthropic.com is reusable by id SHAPE — never credential-shaped ids', async () => {
+    const fx = await fixture([], ['text'], { configExtra: '[models.roles]\nperkins = "default"\n' });
+    writeFileSync(join(fx.agentDir, 'settings.json'), JSON.stringify({ defaultProvider: 'gru-stub', defaultModel: 'stub-model' }));
+    const getModel = fx.modelRuntime.getModel.bind(fx.modelRuntime);
+    const checkAuth = fx.modelRuntime.checkAuth.bind(fx.modelRuntime);
+    vi.spyOn(fx.modelRuntime, 'checkAuth').mockImplementation(() => checkAuth('gru-stub'));
+    const routingFor = async (id: string) => {
+      vi.spyOn(fx.modelRuntime, 'getModel').mockImplementation(() => ({ ...getModel('gru-stub', 'stub-model')!,
+        provider: 'anthropic', id, api: 'anthropic-messages', baseUrl: 'https://api.anthropic.com' }));
+      const snapshot = await fx.runtime.prepareReviewModel('perkins');
+      expect(snapshot.modelRef).toBe(`anthropic/${id}`);
+      return snapshot.routingSha256;
+    };
+    // A current model no published-name list carried is reusable...
+    expect(await routingFor('claude-opus-5-5')).toMatch(/^[a-f0-9]{64}$/u);
+    // ...credential-shaped ids never are (mixed case; a long lowercase run).
+    expect(await routingFor('sk-ant-api03-Xy7Qk9LmN2pR4tVb8wZ1')).toBeUndefined();
+    expect(await routingFor('claude-9f86d081884c7d659a2feaa0c55ad015')).toBeUndefined();
+  });
+
   it('resolves a live-catalog model through ONE bounded refresh (deepseek-flash shape)', async () => {
     // Reproduces the owner report: the offline catalog misses the model
     // (`getModel` returns undefined) while the live catalog has it. The

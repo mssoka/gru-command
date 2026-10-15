@@ -3,7 +3,7 @@ import * as childProcesses from 'node:child_process';
 import { BUILD_INCIDENT, FULL_INCIDENT, WEB_INCIDENT, authenticatedCaptureStatus, verificationLane } from './helpers/worker-verification.js';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -14,8 +14,10 @@ import type { WorkerVerificationPolicy } from '../src/runtime/worker-verificatio
 import {
   CLAUDE_CODE_CAPABILITIES,
   ClaudeCodeRuntime,
+  checkedInProjectMcpConfig,
   claudeInBandError,
   mapRoleTools,
+  projectMcpCopyPath,
 } from '../src/runtime/claude-adapter.js';
 import { isRateLimitErrorText } from '../src/runtime/pacing.js';
 import { deterministicFailureClass } from '../src/decisions/questions.js';
@@ -1674,40 +1676,121 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     );
   });
 
-  it('mcp = "project" loads only a checked-in, unmodified, regular .mcp.json — re-checked every turn', async () => {
+  it('mcp = "project" hands the CLI a private copy of the .mcp.json committed at HEAD — re-checked every turn and compaction', async () => {
     const fx = fixture({ configToml: '[runtimes.claude-code]\nmcp = "project"\n' });
     const repo = makeFixtureRepo('mcp-project');
     try {
       const file = join(repo.path, '.mcp.json');
+      const committed = JSON.stringify({ mcpServers: {} });
       const handle = await fx.runtime.spawn('minion', { cwd: repo.path });
-      const turn = async (): Promise<string | null> => {
-        await handle.prompt('which servers');
-        const argv = doubleInvocations(fx).at(-1)!.argv;
+      const copy = projectMcpCopyPath(handle.sessionFile!);
+      const mcpConfig = (argv: readonly string[]): string | null => {
         expect(argv).toContain('--strict-mcp-config');
         return argv.includes('--mcp-config') ? argv[argv.indexOf('--mcp-config') + 1]! : null;
       };
+      const turn = async (): Promise<string | null> => {
+        await handle.prompt('which servers');
+        return mcpConfig(doubleInvocations(fx).at(-1)!.argv);
+      };
       expect(await turn()).toBeNull(); // no file
-      writeFileSync(file, JSON.stringify({ mcpServers: {} }));
+      writeFileSync(file, committed);
       expect(await turn()).toBeNull(); // untracked: e.g. a session wrote it into its lane
-      repo.commitFile('.mcp.json', JSON.stringify({ mcpServers: {} }));
-      expect(await turn()).toBe(file); // checked in: loads on the next turn, no respawn
+      repo.git(['add', '.mcp.json']);
+      expect(await turn()).toBeNull(); // staged, never committed
+      repo.commitFile('.mcp.json', committed);
+      expect(await turn()).toBe(copy); // checked in: loads on the next turn, no respawn
+      // The CLI reads a private, owner-only copy of the verified bytes — never
+      // the lane path a later write could swap.
+      expect(readFileSync(copy, 'utf-8')).toBe(committed);
+      expect(statSync(copy).mode & 0o777).toBe(0o600);
+      // Compaction is a fresh CLI process too: it re-resolves the same way.
+      await handle.compact?.();
+      expect(doubleInvocations(fx).at(-1)!.prompt).toBe('/compact');
+      expect(mcpConfig(doubleInvocations(fx).at(-1)!.argv)).toBe(copy);
       writeFileSync(file, JSON.stringify({ mcpServers: { injected: { command: 'sh' } } }));
       expect(await turn()).toBeNull(); // edited after commit
+      expect(existsSync(copy)).toBe(false); // never a stale copy left to load
+      repo.git(['add', '.mcp.json']);
+      expect(await turn()).toBeNull(); // edit staged, not committed: still not HEAD's bytes
+      repo.git(['reset', '-q', '--', '.mcp.json']);
       repo.git(['checkout', '--', '.mcp.json']);
-      expect(await turn()).toBe(file);
+      expect(await turn()).toBe(copy);
       rmSync(file);
       symlinkSync(join(repo.path, 'package.json'), file);
       expect(await turn()).toBeNull(); // a symlink never loads
       rmSync(file);
       expect(await turn()).toBeNull(); // removed mid-session: never a dangling --mcp-config
+      writeFileSync(file, committed);
+      expect(await turn()).toBe(copy);
       await handle.dispose();
+      await vi.waitFor(() => expect(existsSync(copy)).toBe(false)); // the copy lives only as long as the session
       expect(fx.logs.filter((entry) => entry.msg.includes('no project MCP servers loaded')).map((entry) => entry.fields?.['reason'])).toEqual([
         'no .mcp.json in the session cwd',
-        '.mcp.json is not tracked by git',
+        '.mcp.json is not committed at HEAD',
         '.mcp.json differs from its committed version',
         '.mcp.json is not a regular file (symlink or other)',
         'no .mcp.json in the session cwd',
       ]);
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('mcp = "project" never loads lane servers for a role without a shell', async () => {
+    const fx = fixture({ configToml: '[runtimes.claude-code]\nmcp = "project"\n' });
+    const repo = makeFixtureRepo('mcp-project-read-only');
+    try {
+      repo.commitFile('.mcp.json', JSON.stringify({ mcpServers: { lane: { command: 'sh' } } }));
+      const reader = await fx.runtime.spawn('perkins', { cwd: repo.path });
+      await reader.prompt('which servers');
+      const argv = doubleInvocations(fx).at(-1)!.argv;
+      expect(argv).toContain('--strict-mcp-config');
+      expect(argv).not.toContain('--mcp-config');
+      expect(existsSync(projectMcpCopyPath(reader.sessionFile!))).toBe(false);
+      await reader.dispose();
+      expect(fx.logs.some((entry) => entry.msg === 'mcp = "project": a role without a shell loads no project MCP servers' &&
+        entry.fields?.['role'] === 'perkins')).toBe(true);
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('the project-MCP check names infrastructure failures and refuses a committed non-file', async () => {
+    const plain = mkdtempSync(join(tmpdir(), 'gru-command-not-a-repo-'));
+    cleanupDirs.push(plain);
+    writeFileSync(join(plain, '.mcp.json'), '{}');
+    const outside = await checkedInProjectMcpConfig(plain);
+    expect('reason' in outside && outside.reason).toMatch(/^git cannot read HEAD in the session cwd: .*not a git repository/u);
+    const repo = makeFixtureRepo('mcp-project-committed-link');
+    try {
+      symlinkSync('package.json', join(repo.path, '.mcp.json'));
+      repo.git(['add', '.mcp.json']);
+      repo.git(['commit', '-q', '-m', 'link']);
+      rmSync(join(repo.path, '.mcp.json'));
+      writeFileSync(join(repo.path, '.mcp.json'), '{}');
+      expect(await checkedInProjectMcpConfig(repo.path)).toEqual({ reason: 'the committed .mcp.json is not a regular file' });
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('holds the session slot across the async project-MCP check and never spawns after disposal', async () => {
+    const fx = fixture({ configToml: '[runtimes.claude-code]\nmcp = "project"\n' });
+    const repo = makeFixtureRepo('mcp-project-slot');
+    try {
+      repo.commitFile('.mcp.json', JSON.stringify({ mcpServers: {} }));
+      const handle = await fx.runtime.spawn('minion', { cwd: repo.path });
+      const first = handle.prompt('first');
+      await expect(handle.prompt('second')).rejects.toThrow(/one operation at a time/);
+      expect(handle.canCompact?.()).toBe(false);
+      await first;
+      const before = doubleInvocations(fx).length;
+      const late = handle.prompt('raced by disposal');
+      await handle.dispose();
+      await expect(late).rejects.toThrow('agent session disposed');
+      expect(doubleInvocations(fx)).toHaveLength(before);
+      // The check that finished after disposal leaves no copy behind.
+      await vi.waitFor(() => expect(existsSync(projectMcpCopyPath(handle.sessionFile!))).toBe(false));
     } finally {
       repo.cleanup();
     }

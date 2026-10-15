@@ -94,7 +94,7 @@ claude -p --output-format stream-json --input-format stream-json \
   (--session-id <uuid> | --resume <uuid>) [--model M] [--effort E] \
   --permission-mode bypassPermissions --tools <role tools> \
   --append-system-prompt <role prompt> \
-  [--strict-mcp-config [--mcp-config <cwd>/.mcp.json]]
+  [--strict-mcp-config [--mcp-config <session>.jsonl.project-mcp.json]]
 ```
 
 fed with ONE stdin user frame (text, or image blocks + text) followed by
@@ -117,13 +117,15 @@ because it also echoes the worker-verification permission responses).
 API failures carry the CLI's typed failure (`api_error_status` + `error`
 code, e.g. `429`/`rate_limit` for a claude.ai usage limit) as typed
 provider-response provenance with provider `anthropic-claude-native` and the
-CLI-resolved model; the error text ends `(HTTP <status>, <code>)`, so a
+CLI-resolved model; the error text ends `(HTTP <status>[, <code>])`, or
+`(<code>)` when the CLI attached no status, so a
 Claude quota wall takes the same path as a pi lane's: bounded `[pacing]`
 retries, the supervisor's quota-wall stop, and — by default
 (`[provider_recovery] claude_native = true`, independent of the GLM/Codex
 `enabled` switch) — a provider wait read from the claude.ai usage endpoint
 that resumes the lane when the window resets (API-key/override contexts
-stay owner-controlled)
+stay owner-controlled; turning a provider's switch off hands its open waits
+back to the owner at the next boot as needs-owner stops, never stranded)
 (`sessions/<role>/--<dashed-cwd>--<hash8>/<ISO-ts>_<session-uuid>.jsonl`),
 so the lock / hourly backup / boot growth-detection machinery applies
 unchanged (SPEC ruling 12). Resume by `resumeFile` reads the session id
@@ -163,10 +165,17 @@ system prompt rides `--append-system-prompt`. `--tools` restricts built-ins
 only, so MCP servers are governed separately by `[runtimes.claude-code] mcp`
 (owner decision 2026-10-15, off by default): `"none"` (default) passes
 `--strict-mcp-config`, so a session gets exactly its role's tools, like pi;
-`"project"` loads only the session cwd's checked-in `.mcp.json` — a regular
-file (never a symlink) that git tracks unmodified at HEAD, re-checked every
-turn (each turn is a fresh CLI process); an untracked, edited or missing
-file loads nothing that turn (logged); `"user"` loads the operator's own
+`"project"` loads only the session cwd's checked-in `.mcp.json` — the blob
+committed at HEAD (a regular file, never a symlink), while the working file
+is byte-identical to it — re-checked every turn and compaction (each is a
+fresh CLI process) off the event loop. The CLI reads a private owner-only
+copy of those verified bytes beside the session transcript, never the lane
+path. An untracked, staged-only, edited, symlinked or missing file loads
+nothing that turn, and a git failure is logged with its own reason. HEAD is
+lane state a session with a shell can commit to, so only roles whose own
+tools include a shell load project servers (a server is a command such a
+session could already run); a read-only role never runs a command another
+session committed. `"user"` loads the operator's own
 Claude MCP configuration (claude.ai connectors included), all without
 prompts. Isolated review sessions and sessions with a narrowed role-tool
 override (bounded child workers) are always strict regardless. The richer
@@ -181,8 +190,11 @@ for any name, alias or `"default"`). An explicit `"provider/model"` reference st
 the provider segment for `--model` (`anthropic/claude-x` → `claude-x`;
 Bedrock-style dotted ids survive: `bedrock/us.anthropic.claude-x` →
 `us.anthropic.claude-x`). Thinking maps to `--effort`; claude accepts
-`low | medium | high | xhigh | max | ultracode` — anything else (e.g. pi's
-`minimal`) fails loud at spawn naming the valid set. `--effort` is a
+`low | medium | high | xhigh | max | ultracode`. A pi-only level in the
+shared `[thinking]` tiers (`minimal`) is passed over like a pi model ref;
+anything else — an explicit `[runtimes.claude-code]` level or spawn option
+outside the set, or a typo in any tier — fails loud at spawn naming the
+valid set. `--effort` is a
 recent CLI flag: a too-old binary fails at startup with a stderr naming
 the flag, which surfaces as a loud transport failure at the first prompt.
 

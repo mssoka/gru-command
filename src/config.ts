@@ -659,12 +659,16 @@ export interface SpawnPolicy {
  * at spawn). The single source for the adapter, resolution and docs. */
 export const CLAUDE_CODE_THINKING_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode'] as const;
 
+/** Thinking levels pi's session API accepts (fail-loud on others at spawn).
+ * The single source for resolution, review identity and docs. */
+export const PI_THINKING_LEVELS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+
 /**
  * Claude Code is always Anthropic (owner ruling 2026-10-15). A reference in
  * the runtime-agnostic [models] tiers applies to claude-code only when it
  * names no provider, the `anthropic` provider, or carries an Anthropic
- * cloud-route id SHAPE: a Bedrock id ("anthropic.…", "us.anthropic.…") or a
- * Vertex id ("claude-…@YYYYMMDD"). Any other provider — resellers serving
+ * cloud-route id SHAPE: a Bedrock id ("anthropic.…", "us.anthropic.…",
+ * "us-gov.anthropic.…") or a Vertex id ("claude-…@YYYYMMDD"). Any other provider — resellers serving
  * Claude under their own ids ("github-copilot/claude-sonnet-4.6") included —
  * makes it a pi reference, which claude-code resolution passes over. Shapes,
  * never model names. Explicit [runtimes.claude-code] entries and spawn
@@ -675,7 +679,7 @@ export function appliesToClaudeCode(ref: string): boolean {
   if (slash < 0) return true;
   if (ref.slice(0, slash) === 'anthropic') return true;
   const id = ref.slice(slash + 1);
-  return /^(?:[a-z]+\.)?anthropic\.[a-z0-9.:-]+$/u.test(id) || /^claude-[a-z0-9-]+@\d{8}$/u.test(id);
+  return /^(?:[a-z]+(?:-[a-z]+)*\.)?anthropic\.[a-z0-9.:-]+$/u.test(id) || /^claude-[a-z0-9-]+@\d{8}$/u.test(id);
 }
 
 function normalizeSentinel(value: string | undefined): string {
@@ -713,9 +717,12 @@ export function resolveSpawnPolicy(
       : runtimeRole?.model ?? shared(`models.roles.${role}`, config.models.roles[role]) ?? policy?.model ??
         shared('models.default', config.models.default);
   // A pi-only thinking level (e.g. "minimal") in the shared tiers would fail
-  // every claude-code spawn: pass over it exactly like a pi model ref.
+  // every claude-code spawn: pass over it exactly like a pi model ref. Only a
+  // level pi accepts and the claude CLI does not is a pi reference — any
+  // other value (a typo) still reaches the adapter's fail-loud check.
   const sharedThinking = (tier: string, level: string | undefined): string | undefined => {
-    if (level === undefined || runtimeId !== 'claude-code' || level.trim() === '' || level === MODEL_DEFAULT_SENTINEL ||
+    if (level === undefined || runtimeId !== 'claude-code' ||
+      !(PI_THINKING_LEVELS as readonly string[]).includes(level) ||
       (CLAUDE_CODE_THINKING_LEVELS as readonly string[]).includes(level)) return level;
     passedOver.push({ tier, ref: level });
     return undefined;

@@ -1626,15 +1626,16 @@ async function main(): Promise<number> {
   // Silas's model availability: its timer starts after listen (same
   // pattern as the drivers) and its boot reconciliation re-wakes any
   // recovery whose delivery was lost across a restart — never silently
-  // re-baselined away.
+  // re-baselined away. Boot reconciliation runs even with the sensor off: a
+  // provider switch turned off hands its open waits back to the owner.
   if (providerRecoverySensor.enabled) {
     providerRecoverySensor.start();
-    void providerRecoverySensor.reconcileAtBoot().catch((error: unknown) => {
-      logger.error('provider-recovery boot reconciliation failed', { error: String(error) });
-    });
   } else {
     logger.info('provider-recovery sensor disabled — owner activation stays manual', {});
   }
+  void providerRecoverySensor.reconcileAtBoot().catch((error: unknown) => {
+    logger.error('provider-recovery boot reconciliation failed', { error: String(error) });
+  });
 
   logger.info('listening', { host: handle.host, port: handle.port });
   return new Promise<number>(() => {

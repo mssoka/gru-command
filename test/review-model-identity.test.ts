@@ -32,6 +32,12 @@ describe('publicRecoveryModelIdentity (claude-code)', () => {
     expect(claude('claude-opus-5-5', { settingsModel: 'sk-proj-AbCdEfGhIjKl' })).toBe(false);
     expect(isPublicModelToken('claude-opus-5-5')).toBe(true);
     expect(isPublicModelToken('Claude-Opus-5-5')).toBe(false);
+    // Lowercase credential shapes are refused too: a long unbroken
+    // alphanumeric run (hex/base32 keys, digests) or a UUID.
+    expect(isPublicModelToken('9f86d081884c7d659a2feaa0c55ad015a3bf4f1b')).toBe(false);
+    expect(claude('anthropic/claude-5d41402abc4b2a76b9719d911017c592')).toBe(false);
+    expect(claude('claude-opus-5-5', { settingsModel: '123e4567-e89b-12d3-a456-426614174000' })).toBe(false);
+    expect(isPublicModelToken('us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0')).toBe(true);
     expect(claude('claude-opus-5-5', { settingsModel: 'has space' })).toBe(false);
     expect(claude('claude-opus-5-5', { thinkingLevel: 'turbo' })).toBe(false);
     expect(publicRecoveryModelIdentity({ runtimeId: 'claude-code', modelRef: 'opus', routingSha256: 'x' })).toBe(false);

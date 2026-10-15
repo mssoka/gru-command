@@ -126,7 +126,7 @@ default = "pi"
 # bob = "pi"
 
 [models]
-# Default model reference. pi takes an explicit "provider/model" reference as-is. claude-code is always Anthropic and needs no provider: use the CLI's own names ("opus", "claude-opus-5-5"); a provider segment, if present, is stripped for its --model flag (bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"); a shared [models] entry naming another provider is a pi reference that claude-code passes over. The literal "default" means the runtime's own configuration (SPEC ruling 16).
+# Default model reference. pi takes an explicit "provider/model" reference as-is. claude-code is always Anthropic and needs no provider: use the CLI's own names ("opus", "claude-opus-5-5"); a provider segment, if present, is stripped for its --model flag (bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"); a shared [models] entry naming another provider is a pi reference that claude-code passes over, unless its id has an Anthropic cloud shape (Bedrock "[region.]anthropic.…", Vertex "claude-…@YYYYMMDD"); resellers serving Claude under their own ids ("github-copilot/claude-…") are passed over too, as is a pi-only shared [thinking] level ("minimal"). The literal "default" means the runtime's own configuration (SPEC ruling 16).
 default = "default"
 
 [models.roles]
@@ -156,7 +156,7 @@ default = "default"
 # [runtimes.pi]
 # # Optional runtime-wide policy; omitted keys inherit [models]/[thinking].
 # # Thinking levels accepted: minimal | low | medium | high | xhigh | max.
-# # pi takes an explicit "provider/model" reference as-is. claude-code is always Anthropic and needs no provider: use the CLI's own names ("opus", "claude-opus-5-5"); a provider segment, if present, is stripped for its --model flag (bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"); a shared [models] entry naming another provider is a pi reference that claude-code passes over. The literal "default" means the runtime's own configuration (SPEC ruling 16).
+# # pi takes an explicit "provider/model" reference as-is. claude-code is always Anthropic and needs no provider: use the CLI's own names ("opus", "claude-opus-5-5"); a provider segment, if present, is stripped for its --model flag (bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"); a shared [models] entry naming another provider is a pi reference that claude-code passes over, unless its id has an Anthropic cloud shape (Bedrock "[region.]anthropic.…", Vertex "claude-…@YYYYMMDD"); resellers serving Claude under their own ids ("github-copilot/claude-…") are passed over too, as is a pi-only shared [thinking] level ("minimal"). The literal "default" means the runtime's own configuration (SPEC ruling 16).
 # # Full per-runtime semantics (binding, session flags, effort mapping, resolution order): docs/RUNTIMES.md.
 # # model = "default"
 # # thinking_level = "default"
@@ -177,13 +177,14 @@ default = "default"
 # [runtimes.claude-code]
 # # Optional runtime-wide policy; omitted keys inherit [models]/[thinking].
 # # Thinking levels accepted: low | medium | high | xhigh | max | ultracode (mapped to the CLI --effort; anything else fails loud at spawn naming the valid set).
-# # pi takes an explicit "provider/model" reference as-is. claude-code is always Anthropic and needs no provider: use the CLI's own names ("opus", "claude-opus-5-5"); a provider segment, if present, is stripped for its --model flag (bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"); a shared [models] entry naming another provider is a pi reference that claude-code passes over. The literal "default" means the runtime's own configuration (SPEC ruling 16).
+# # pi takes an explicit "provider/model" reference as-is. claude-code is always Anthropic and needs no provider: use the CLI's own names ("opus", "claude-opus-5-5"); a provider segment, if present, is stripped for its --model flag (bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"); a shared [models] entry naming another provider is a pi reference that claude-code passes over, unless its id has an Anthropic cloud shape (Bedrock "[region.]anthropic.…", Vertex "claude-…@YYYYMMDD"); resellers serving Claude under their own ids ("github-copilot/claude-…") are passed over too, as is a pi-only shared [thinking] level ("minimal"). The literal "default" means the runtime's own configuration (SPEC ruling 16).
 # # Full per-runtime semantics (binding, session flags, effort mapping, resolution order): docs/RUNTIMES.md.
 # # model = "default"
 # # thinking_level = "default"
 # # MCP servers for non-review sessions: "none" = only the role's tools
-# # (like pi); "project" = only the cwd's checked-in .mcp.json; "user" = your
-# # own Claude MCP configuration, connectors included, without prompts.
+# # (like pi); "project" = only the cwd's .mcp.json as committed at HEAD,
+# # for roles with a shell; "user" = your own Claude MCP configuration,
+# # connectors included, without prompts.
 # # mcp = "none"
 
 # [runtimes.claude-code.roles]
@@ -363,6 +364,8 @@ enabled = false
 # waits on the claude.ai usage endpoint and resumes when the window
 # resets. ON by default, independent of `enabled`; false keeps Claude
 # quota walls owner-controlled. API-key logins always stay owner-controlled.
+# Turning either switch off hands that provider's open waits back to you
+# at the next boot (needs-owner stops) — never stranded.
 claude_native = true
 # Sensor tick (how often routes are re-examined). The check cadence
 # itself cannot go below the approved 300 s floor.

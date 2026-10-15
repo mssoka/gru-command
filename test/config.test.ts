@@ -508,6 +508,35 @@ silas = "max"
     expect(resolveSpawnPolicy(shapesConfig, 'claude-code', 'minion').model).toBe('amazon-bedrock/global.anthropic.claude-opus-5-5-v1:0');
     // pi keeps every shared value, including its own "minimal".
     expect(resolveSpawnPolicy(shapesConfig, 'pi', 'gru')).toEqual({ model: 'github-copilot/claude-sonnet-4.6', thinkingLevel: 'minimal' });
+
+    // GovCloud's hyphenated Bedrock region prefix is a cloud route too; a
+    // per-role pi-only level passes over to the claude-code runtime tier;
+    // a level NEITHER runtime accepts (a typo) is never passed over — it
+    // reaches the adapter's fail-loud check.
+    const tiers = tmpHome();
+    writeConfig(tiers, `
+[models]
+default = "bedrock/us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0"
+
+[thinking]
+default = "hgih"
+
+[thinking.roles]
+gru = "minimal"
+
+[runtimes.claude-code]
+thinking_level = "high"
+`);
+    const tiersConfig = loadConfig({ GRU_COMMAND_HOME: tiers }, '/home/tester');
+    expect(resolveSpawnPolicy(tiersConfig, 'claude-code', 'gru')).toEqual({
+      model: 'bedrock/us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0',
+      thinkingLevel: 'high',
+      passedOver: [{ tier: 'thinking.roles.gru', ref: 'minimal' }],
+    });
+    const typo = tmpHome();
+    writeConfig(typo, '[thinking]\ndefault = "hgih"\n');
+    expect(resolveSpawnPolicy(loadConfig({ GRU_COMMAND_HOME: typo }, '/home/tester'), 'claude-code', 'gru'))
+      .toEqual({ model: 'default', thinkingLevel: 'hgih' });
   });
 
   it('treats empty strings as the default sentinel (E1 configs keep working)', () => {
