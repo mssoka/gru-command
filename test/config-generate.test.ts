@@ -13,6 +13,8 @@ import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { parse } from 'smol-toml';
 import { loadConfig, ROLES, RUNTIME_IDS } from '../src/config.js';
+import { parseAnswers } from '../src/wizard/answers.js';
+import { generateConfigToml } from '../src/wizard/steps.js';
 import {
   CONFIG_ACTIVE_TABLES,
   CONFIG_SECTION_HEADERS,
@@ -57,6 +59,15 @@ function run(instance: string, args: readonly string[] = [], env: NodeJS.Process
 }
 
 describe('config-generate CLI', () => {
+  it('config generation persists the explicit selected repository list', () => {
+    const root = tempDir('gru-command-config-selected-');
+    const workspace = join(root, 'workspace');
+    for (const name of ['alpha', 'gamma']) mkdirSync(join(workspace, name, '.git'), { recursive: true });
+    const answers = parseAnswers(JSON.stringify({ workspace_root: workspace, repos: ['alpha', 'gamma'] }));
+    const text = generateConfigToml({ answers, instanceDir: join(root, 'instance') });
+    expect((parse(text) as Record<string, unknown>).managed_repos).toEqual(['alpha', 'gamma']);
+  });
+
   it('writes the complete teaching config to the actual application read path', () => {
     const root = tempDir('gru-command-config-generate-');
     const instance = join(root, 'instance');
@@ -68,6 +79,7 @@ describe('config-generate CLI', () => {
 
     expect(Object.keys(raw)).toEqual([
       'workspace_root',
+      'managed_repos',
       'data_dir',
       'server',
       'auth',
@@ -115,6 +127,7 @@ describe('config-generate CLI', () => {
     const loaded = loadConfig({ GRU_COMMAND_HOME: instance }, root);
     expect(loaded.sourceFile).toBe(file);
     expect(loaded.dataDir).toBe(instance);
+    expect(loaded.managedRepos).toEqual([]);
     expect(loaded.models.default).toBe('default');
     expect(loaded.thinking.default).toBe('default');
     // Issue #221 headline default, pinned at the generator: a fresh install
@@ -247,6 +260,7 @@ describe('config-generate CLI', () => {
     mkdirSync(instance, { recursive: true });
     const prior = [
       `workspace_root = ${JSON.stringify(managed)}`,
+      'managed_repos = ["alpha", "gamma"]',
       `data_dir = ${JSON.stringify(state)}`,
       '[server]',
       'host = "192.168.1.23"',
@@ -296,6 +310,7 @@ describe('config-generate CLI', () => {
     expect((raw.runtimes as { default: string }).default).toBe('claude-code');
     // Unprompted sections/keys: preserved ACTIVE, never silently dropped.
     expect(raw.data_dir).toBe(state);
+    expect(raw.managed_repos).toEqual(['alpha', 'gamma']);
     expect((raw.runtimes as { roles: Record<string, string> }).roles.minion).toBe('pi');
     expect((raw.models as { roles: Record<string, string> }).roles.gru).toBe('provider/model-b');
     expect((raw.thinking as { roles: Record<string, string> }).roles.perkins).toBe('max');
@@ -313,6 +328,7 @@ describe('config-generate CLI', () => {
     // Fail-loud-clean: the round-tripped file boots through the REAL loader.
     const loaded = loadConfig({ GRU_COMMAND_HOME: instance }, root);
     expect(loaded.workspaceRoot).toBe(managed); // seeded + preserved
+    expect(loaded.managedRepos).toEqual(['alpha', 'gamma']);
     expect(loaded.server.host).toBe('192.168.1.23');
     expect(loaded.auth.token).toBe('prior-secret-token');
     expect(loaded.dispatch.bobIntervalMs).toBe(120000);

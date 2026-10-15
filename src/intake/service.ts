@@ -1,8 +1,7 @@
 import { ArtifactContextError, createPreviewArtifactContext, type PreviewArtifactContext } from '../artifacts/context.js';
-import { discoverManagedRepos } from '../repos/discovery.js';
 import { loadBundledWorkflowRuntime, type BundledWorkflowRuntime } from '../workflows/runtime.js';
 import { REQUIRED_INTAKE_WORKFLOW_FILE } from '../workflows/manifest.js';
-import { join, isAbsolute, resolve } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
 import { canonicalManagedRepo, captureSources, INTAKE_MAX_DOCUMENTS, INTAKE_MAX_AGGREGATE_BYTES, INTAKE_MAX_REQUIREMENTS, type SourcePorts } from './sources.js';
 import { conservativePlan, validatePlan } from './planner.js';
 import { canonical, boundedCanonical, digest, IntakeError, type Capture, type DocumentInput, type IntakePlanner, type IntakeRequest, type IntakeSource, type Proposal } from './types.js';
@@ -12,10 +11,17 @@ export const INTAKE_MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
 export interface IntakeServiceOptions extends SourcePorts {
   readonly dataDir: string;
   readonly workspaceRoot: string;
-  /** Explicit managed registry seam; never an ambient cwd. */
-  readonly managedRepos?: () => readonly string[];
+  /** Required explicit per-request managed-root registry; never inferred by discovery. */
+  readonly managedRepos: (requestedRepoPath: string) => readonly string[];
   readonly workflow?: () => BundledWorkflowRuntime;
   readonly planner?: IntakePlanner;
+}
+
+/** One synchronous API operation's explicit-root snapshot. Do not retain it
+ * across requests; its methods reuse the same bounded registry validation. */
+export interface IntakeRequestScope {
+  readonly validateIdentity: () => void;
+  readonly read: (requestId: string) => Proposal;
 }
 function invalid(message: string): never { throw new IntakeError('intake_invalid_request', message); }
 function record(value: unknown, label: string, keys: readonly string[]): Record<string, unknown> {
@@ -75,10 +81,22 @@ export function parseIntakeRequest(value: unknown): IntakeRequest {
 /** Read-only proposals only: this service intentionally has no ledger,
  * scheduler, dispatch, model, BMAD runner or approval port. */
 export class IntakeService {
-  constructor(private readonly options: IntakeServiceOptions) {}
+  constructor(private readonly options: IntakeServiceOptions) {
+    if (typeof options.managedRepos !== 'function') {
+      throw new IntakeError('intake_invalid_request', 'IntakeService requires an explicit managed repository registry');
+    }
+  }
 
-  private context(repoPath: string, intakeId: string, existingOnly = false): PreviewArtifactContext {
-    const registered = (this.options.managedRepos ?? (() => discoverManagedRepos(this.options.workspaceRoot).map((name) => join(this.options.workspaceRoot, name))))();
+  private managedRepoPaths(repoPath: string): readonly string[] {
+    return this.options.managedRepos(repoPath);
+  }
+
+  private context(
+    repoPath: string,
+    intakeId: string,
+    existingOnly: boolean,
+    registered: readonly string[],
+  ): PreviewArtifactContext {
     const repo = canonicalManagedRepo(repoPath, registered);
     let runtime: BundledWorkflowRuntime;
     try { runtime = (this.options.workflow ?? loadBundledWorkflowRuntime)(); } catch (error) {
@@ -101,8 +119,16 @@ export class IntakeService {
     }
   }
 
+  createRequestScope(repoPath: string, intakeId: string): IntakeRequestScope {
+    const registered = this.managedRepoPaths(repoPath);
+    return {
+      validateIdentity: () => { this.storage(() => this.context(repoPath, intakeId, true, registered), false); },
+      read: (requestId) => this.readWithRegisteredRepos(repoPath, intakeId, requestId, registered),
+    };
+  }
+
   validateIdentity(repoPath: string, intakeId: string): void {
-    this.storage(() => this.context(repoPath, intakeId, true), false);
+    this.createRequestScope(repoPath, intakeId).validateIdentity();
   }
 
   /** Refinement keeps captured bytes; source refresh is a separate preview. */
@@ -112,19 +138,25 @@ export class IntakeService {
     const repoPath = text(raw['repoPath'], 'repoPath');
     const intakeId = requestId(raw['intakeId'], 'intakeId');
     const previousRequestId = requestId(raw['previousRequestId'], 'previousRequestId');
-    const previous = this.read(repoPath, intakeId, previousRequestId);
+    const registered = this.managedRepoPaths(repoPath);
+    const previous = this.readWithRegisteredRepos(repoPath, intakeId, previousRequestId, registered);
     if (previous.revisionId !== raw['revisionId']) throw new IntakeError('intake_stale_revision', 'Revision does not bind the exact captured proposal', 409);
     if (raw['plan'] === undefined) invalid('revision requires an explicit plan');
-    const context = this.storage(() => this.context(repoPath, intakeId, true), false);
+    const context = this.storage(() => this.context(repoPath, intakeId, true, registered), false);
     const original = this.storage(() => parseIntakeRequest(JSON.parse(context.readOperational(`requests/${previousRequestId}/input.json`))), false);
-    return this.previewCaptured({ ...original, requestId: requestId(raw['requestId'], 'requestId'), previousRequestId, plan: raw['plan'] }, previous);
+    return this.previewCaptured({ ...original, requestId: requestId(raw['requestId'], 'requestId'), previousRequestId, plan: raw['plan'] }, previous, registered);
   }
 
   async preview(value: unknown): Promise<Proposal> { return this.previewCaptured(value); }
 
-  private async previewCaptured(value: unknown, retained?: Capture): Promise<Proposal> {
+  private async previewCaptured(
+    value: unknown,
+    retained?: Capture,
+    registered?: readonly string[],
+  ): Promise<Proposal> {
     const request = parseIntakeRequest(value);
-    const context = this.storage(() => this.context(request.repoPath, request.intakeId));
+    const requestRegistry = registered ?? this.managedRepoPaths(request.repoPath);
+    const context = this.storage(() => this.context(request.repoPath, request.intakeId, false, requestRegistry));
     const prefix = `requests/${request.requestId}`;
     const write = (path: string, value: unknown, sources: Proposal['snapshots'] = [], contents = canonical(value)): void => {
       this.storage(() => context.writeOperational({ path, contents, sources: sources.map(({ kind, locator, revision, sha256 }) => ({ kind, locator, revision, sha256 })) }));
@@ -135,7 +167,9 @@ export class IntakeService {
     };
     // Preserve the explicit request before attempting any external source read.
     write(`${prefix}/input.json`, request);
-    if (request.previousRequestId !== undefined) this.read(request.repoPath, request.intakeId, request.previousRequestId);
+    if (request.previousRequestId !== undefined) {
+      this.readWithRegisteredRepos(request.repoPath, request.intakeId, request.previousRequestId, requestRegistry);
+    }
     const capture = retained === undefined ? await captureSources(request.repoPath, request.source, this.options) : { snapshots: retained.snapshots, gaps: retained.gaps, requirements: retained.requirements };
     write(`${prefix}/capture.json`, capture, capture.snapshots);
     let plan: Proposal['plan'];
@@ -175,7 +209,16 @@ export class IntakeService {
   }
 
   read(repoPath: string, intakeId: string, id: string): Proposal {
-    const context = this.storage(() => this.context(repoPath, intakeId, true), false);
+    return this.createRequestScope(repoPath, intakeId).read(id);
+  }
+
+  private readWithRegisteredRepos(
+    repoPath: string,
+    intakeId: string,
+    id: string,
+    registered: readonly string[],
+  ): Proposal {
+    const context = this.storage(() => this.context(repoPath, intakeId, true, registered), false);
     const prefix = `requests/${requestId(id, 'requestId')}`;
     if (!this.storage(() => context.hasOperational(`${prefix}/proposal.json`), false)) throw new IntakeError('intake_not_found', 'no completed preview for this explicit repository/intake/request identity', 404);
     const proposal = this.storage(() => JSON.parse(context.readOperational(`${prefix}/proposal.json`)) as Proposal, false);
@@ -193,8 +236,9 @@ export class IntakeService {
   }
 
   diff(repoPath: string, intakeId: string, from: string, to: string): Readonly<Record<string, unknown>> {
-    const before = this.read(repoPath, intakeId, from);
-    const after = this.read(repoPath, intakeId, to);
+    const request = this.createRequestScope(repoPath, intakeId);
+    const before = request.read(from);
+    const after = request.read(to);
     const changes = <T extends { readonly id: string }>(old: readonly T[], current: readonly T[]): readonly unknown[] => {
       const ids = [...new Set([...old, ...current].map((item) => item.id))];
       return ids.flatMap((id) => {

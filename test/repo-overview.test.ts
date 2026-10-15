@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { isValidSnapshot } from '../web/src/lib/board-protocol.js';
@@ -12,6 +12,12 @@ import {
   type GhCommandRunner,
   type RepoRef,
 } from '../src/dispatch/github-poll.js';
+import { repoRemote } from '../src/dispatch/review-path.js';
+import {
+  gitProbeEnvironment,
+  resolveManagedRepoPath,
+  resolveManagedRepoPathSync,
+} from '../src/repos/managed-names.js';
 import {
   GhRepoOverviewApi,
   ManagedRepoOverviewTracker,
@@ -131,7 +137,9 @@ interface Harness {
   readonly refs: Map<string, RepoRef | null>;
   /** Per-repo gates that postpone (or fail) remote resolution. */
   readonly resolveGates: Map<string, Promise<void>>;
+  readonly unavailableNames: Set<string>;
   resolveError: boolean;
+  resolveRootError: boolean;
   resolveDelayMs: number;
   readonly clock: { ms: number };
   readonly sleeps: number[];
@@ -163,7 +171,9 @@ function harness(options: {
     names,
     refs,
     resolveGates: new Map<string, Promise<void>>(),
+    unavailableNames: new Set<string>(),
     resolveError: false,
+    resolveRootError: false,
     resolveDelayMs: 0,
     clock,
     sleeps,
@@ -172,8 +182,15 @@ function harness(options: {
   };
   state.tracker = new ManagedRepoOverviewTracker({
     workspaceRoot: '/ws',
+    managedRepos: names,
     api,
     scanRepos: () => state.names,
+    resolveRepoPath: (_workspaceRoot, name) => {
+      if (state.resolveRootError) throw new Error('temporary Git root probe failure');
+      return state.unavailableNames.has(name)
+        ? { kind: 'unavailable', reason: 'selected repository is unavailable under workspace_root' }
+        : { kind: 'available', path: `/ws/${name}` };
+    },
     resolveRemote: async (repoPath) => {
       const name = repoPath.split('/').pop() as string;
       const gate = state.resolveGates.get(name);
@@ -272,6 +289,35 @@ describe('managed repo overview tracker — registry and identity', () => {
     expect(entry.link).toBe('https://github.com/acme/alpha');
     expect(entry.linkReason).toBeNull();
     expect(entry.fullName).toBe('acme/alpha');
+  });
+
+  it('preserves cached observations and withholds provider polling after a transient root-probe failure', async () => {
+    const api = new FakeApi().set('alpha', { openPrs: 7, openIssues: 8 });
+    const h = harness({ api });
+    const successful = await h.tracker.refresh();
+    const original = row(successful, 'alpha');
+    const callsBeforeFailure = api.calls.length;
+
+    h.clock.ms += 1_000;
+    h.resolveRootError = true;
+    const failed = await h.tracker.refresh();
+    const stale = row(failed, 'alpha');
+    expect(stale.linked).toBe(true);
+    expect(stale.fullName).toBe(original.fullName);
+    expect(stale.openPrs).toBe(original.openPrs);
+    expect(stale.openIssues).toBe(original.openIssues);
+    expect(stale.run).toEqual(original.run);
+    expect(stale.checkedAt).toBe(original.checkedAt);
+    expect(stale.lastAttemptAt).not.toBe(original.lastAttemptAt);
+    expect(stale.error).toContain('temporary Git root probe failure');
+    expect(stale.freshness).toBe('stale');
+    expect(api.calls).toHaveLength(callsBeforeFailure);
+
+    h.resolveRootError = false;
+    const recovered = await h.tracker.refresh();
+    expect(row(recovered, 'alpha').freshness).toBe('fresh');
+    expect(row(recovered, 'alpha').error).toBeNull();
+    expect(api.calls.length).toBeGreaterThan(callsBeforeFailure);
   });
 
   it('drops the previous observation when the remote identity changes or disappears', async () => {
@@ -1064,7 +1110,7 @@ describe('managed repo overview tracker — review-round guarantees', () => {
     expect(result.value[1]?.updatedAt).toBe('2026-10-07T10:05:00.000Z');
   });
 
-  it('drives the production default registry scan and origin resolver over a real workspace', async () => {
+  it('drives the configured registry and origin resolver over a real workspace without enrolling siblings', async () => {
     const root = mkdtempSync(join(tmpdir(), 'gru-repo-overview-defaults-'));
     try {
       execFileSync('git', ['init', '-q', join(root, 'alpha')]);
@@ -1074,12 +1120,19 @@ describe('managed repo overview tracker — review-round guarantees', () => {
       execFileSync('git', ['-C', join(root, 'gitlab-repo'), 'remote', 'add', 'origin', 'https://gitlab.com/acme/gl.git']);
       mkdirSync(join(root, 'broken'));
       writeFileSync(join(root, 'broken', '.git'), 'gitdir: /nonexistent/gru-repo-overview-test\n');
+      execFileSync('git', ['init', '-q', join(root, 'unselected')]);
       mkdirSync(join(root, 'plain'));
       const api = new FakeApi().set('alpha', { openPrs: 1, openIssues: 2, workflows: { kind: 'ok', value: 0 } });
-      const tracker = new ManagedRepoOverviewTracker({ workspaceRoot: root, api, now: () => T0, sleep: async () => {} });
+      const tracker = new ManagedRepoOverviewTracker({
+        workspaceRoot: root,
+        managedRepos: ['alpha', 'broken', 'gitlab-repo', 'no-origin'],
+        api,
+        now: () => T0,
+        sleep: async () => {},
+      });
       const view = await tracker.refresh();
-      // The production default scan discovers only real `.git` entries.
       expect(view?.rows.map((entry) => entry.key)).toEqual(['alpha', 'broken', 'gitlab-repo', 'no-origin']);
+      expect(view?.rows.some((entry) => entry.key === 'unselected')).toBe(false);
       const entry = row(view, 'alpha');
       expect(entry.linked).toBe(true);
       expect(entry.fullName).toBe('acme/alpha');
@@ -1089,9 +1142,9 @@ describe('managed repo overview tracker — review-round guarantees', () => {
       // The default resolver's failure paths through the REAL seam:
       expect(row(view, 'no-origin').linkReason).toBe('no usable origin remote');
       expect(row(view, 'gitlab-repo').linkReason).toBe('non-GitHub remote');
-      // A corrupt/unreadable repository is a READ failure, not evidence
-      // the user never configured an origin.
-      expect(row(view, 'broken').linkReason).toBe('origin remote could not be read yet');
+      // A stale worktree pointer is unavailable, never an origin-read failure
+      // that could preserve or classify a remote identity.
+      expect(row(view, 'broken').linkReason).toBe('selected repository is unavailable under workspace_root');
       expect(api.calls.every((call) => call.endsWith('acme/alpha'))).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -1181,6 +1234,40 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     expect(after.freshness).toBe('stale');
   });
 
+  it('withholds provider polling and marks cached data stale until origin resolution recovers', async () => {
+    const api = new FakeApi().set('alpha', { openPrs: 7, openIssues: 3 });
+    const h = harness({ names: ['alpha'], api });
+    const initial = await h.tracker.refresh();
+    const before = row(initial, 'alpha');
+    const initialCallCount = h.api.calls.length;
+    expect(before.freshness).toBe('fresh');
+
+    h.resolveError = true;
+    h.api.set('alpha', { openPrs: 99, openIssues: 101 });
+    h.clock.ms += 1;
+    const failed = await h.tracker.refresh();
+    const stale = row(failed, 'alpha');
+    expect(h.api.calls).toHaveLength(initialCallCount);
+    expect(stale.link).toBe(before.link);
+    expect(stale.openPrs).toBe(before.openPrs);
+    expect(stale.openIssues).toBe(before.openIssues);
+    expect(stale.checkedAt).toBe(before.checkedAt);
+    expect(stale.freshness).toBe('stale');
+    expect(stale.error).toContain('origin resolution failed');
+    expect(stale.lastAttemptAt).not.toBeNull();
+
+    h.resolveError = false;
+    h.clock.ms += 1;
+    const recovered = await h.tracker.refresh();
+    const current = row(recovered, 'alpha');
+    expect(h.api.calls.length).toBeGreaterThan(initialCallCount);
+    expect(current.openPrs).toBe(99);
+    expect(current.openIssues).toBe(101);
+    expect(current.freshness).toBe('fresh');
+    expect(current.error).toBeNull();
+    expect(current.checkedAt).not.toBe(before.checkedAt);
+  });
+
   it('discloses a global abort on every repository the pass never reached', async () => {
     const api = new FakeApi()
       .set('alpha', {
@@ -1204,8 +1291,10 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
       const api = new FakeApi().set('alpha', { openPrs: 1 });
       const tracker = new ManagedRepoOverviewTracker({
         workspaceRoot: '/ws',
+        managedRepos: ['alpha'],
         api,
         scanRepos: () => ['alpha'],
+        resolveRepoPath: (_workspaceRoot, name) => ({ kind: 'available', path: `/ws/${name}` }),
         resolveRemote: () => githubRef('alpha'),
         intervalMs: 25,
         now: () => T0,
@@ -1229,7 +1318,7 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     }
   });
 
-  it('renders an invisible-only registry name as visible escapes the web validator accepts', async () => {
+  it('renders invisible-only names and separator spaces as visible escapes the web validator accepts', async () => {
     const h = harness({ names: ['\u200b'] });
     const view = await h.tracker.refresh();
     expect(isValidSnapshot(validBoardSnapshot(view))).toBe(true);
@@ -1238,12 +1327,26 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     expect(entry.displayName.length).toBeGreaterThan(0);
     // A bidi override beside visible text is escaped, so the name cannot
     // spoof its display; combining marks in a visible name survive.
-    h.names.splice(0, h.names.length, 'repo\u202E', 'caf\u0065\u0301');
+    const leadingMarkName = '\u0301alpha';
+    h.names.splice(0, h.names.length, 'repo\u202E', 'caf\u0065\u0301', leadingMarkName);
     h.refs.set('repo\u202E', githubRef('repo-e'));
     h.refs.set('caf\u0065\u0301', githubRef('cafe'));
+    h.refs.set(leadingMarkName, githubRef('marked'));
     const second = await h.tracker.refresh();
+    expect(isValidSnapshot(validBoardSnapshot(second))).toBe(true);
     expect(row(second, 'repo\u202E').displayName).toBe('repo\\u{202e}');
     expect(row(second, 'caf\u0065\u0301').displayName).toBe('caf\u0065\u0301');
+    expect(row(second, leadingMarkName).displayName).toBe('\\u{301}alpha');
+
+    const thinSpaceName = 'alpha\u2009';
+    const nbspName = 'alpha\u00a0';
+    h.names.splice(0, h.names.length, thinSpaceName, nbspName);
+    h.refs.set(thinSpaceName, githubRef('alpha-thin'));
+    h.refs.set(nbspName, githubRef('alpha-nbsp'));
+    const third = await h.tracker.refresh();
+    expect(isValidSnapshot(validBoardSnapshot(third))).toBe(true);
+    expect(row(third, thinSpaceName).displayName).toBe('alpha\\u{2009}');
+    expect(row(third, nbspName).displayName).toBe('alpha\\u{a0}');
   });
 
   it('leaves a .github-suffixed host with unsafe characters unlinked instead of freezing the board', async () => {
@@ -1259,6 +1362,22 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     expect(h.api.calls).toEqual([]);
   });
 
+  it('does not poll a cached identity when its selected root was skipped by the resolution budget', async () => {
+    const h = harness({ names: ['alpha', 'beta', 'gamma'] });
+    await h.tracker.refresh();
+    expect(row(h.tracker.view(), 'gamma').linked).toBe(true);
+
+    h.api.calls.length = 0;
+    h.unavailableNames.add('gamma');
+    h.resolveDelayMs = REPO_OVERVIEW_RESOLVE_BUDGET_MS + 10_000;
+    const view = await h.tracker.refresh();
+
+    // The resolver budget expires on the first attempted root; gamma is
+    // never revalidated and must not be polled using its cached origin.
+    expect(row(view, 'gamma').linked).toBe(true);
+    expect(h.api.calls.some((call) => call.endsWith(':acme/gamma'))).toBe(false);
+  });
+
   it('keeps every managed repo visible with a read-failure reason when resolution fails', async () => {
     const h = harness({ names: ['alpha', 'beta'] });
     h.resolveError = true;
@@ -1271,6 +1390,36 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
       expect(entry.openPrs).toBeNull();
       expect(entry.run).toBeNull();
     }
+    expect(h.api.calls).toEqual([]);
+    expect(isValidSnapshot(validBoardSnapshot(view))).toBe(true);
+  });
+
+  it('keeps first-refresh unavailable roots within the board protocol shape', async () => {
+    const h = harness({ names: ['alpha'] });
+    h.unavailableNames.add('alpha');
+    const view = await h.tracker.refresh();
+    const entry = row(view, 'alpha');
+
+    expect(entry.linked).toBe(false);
+    expect(entry.linkReason).toBe('selected repository is unavailable under workspace_root');
+    expect(entry.freshness).toBe('unchecked');
+    expect(entry.lastAttemptAt).toBeNull();
+    expect(entry.error).toBeNull();
+    expect(h.api.calls).toEqual([]);
+    expect(isValidSnapshot(validBoardSnapshot(view))).toBe(true);
+  });
+
+  it('keeps first-refresh root-probe failures distinct and valid under the board protocol', async () => {
+    const h = harness({ names: ['alpha'] });
+    h.resolveRootError = true;
+    const view = await h.tracker.refresh();
+    const entry = row(view, 'alpha');
+
+    expect(entry.linked).toBe(false);
+    expect(entry.linkReason).toBe('origin remote could not be read yet');
+    expect(entry.freshness).toBe('unchecked');
+    expect(entry.lastAttemptAt).toBeNull();
+    expect(entry.error).toBeNull();
     expect(h.api.calls).toEqual([]);
     expect(isValidSnapshot(validBoardSnapshot(view))).toBe(true);
   });
@@ -1300,12 +1449,119 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
       mkdirSync(join(root, 'target', '.git'));
       symlinkSync(join(root, 'target'), join(root, 'repo-link'));
       symlinkSync(join(root, 'missing'), join(root, 'broken-link'));
-      const expected = ['repo-dir', 'repo-file', 'repo-link', 'target'];
+      const expected = ['.hidden', 'repo-dir', 'repo-file', 'repo-link', 'target'];
       expect(discoverManagedRepos(root)).toEqual(expected);
       expect(await discoverManagedReposAsync(root)).toEqual(expected);
       expect(discoverManagedRepos(join(root, 'absent'))).toEqual([]);
       expect(await discoverManagedReposAsync(join(root, 'absent'))).toEqual([]);
     } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps inherited Git routing and command-scope config from selecting an unconfigured origin for provider calls', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gru-repo-overview-git-routing-'));
+    const selected = join(root, 'selected');
+    const foreign = join(root, 'foreign');
+    const trustedHome = join(root, 'trusted-home');
+    mkdirSync(trustedHome);
+    const environmentForTrustedHome = gitProbeEnvironment as unknown as (
+      home: string,
+    ) => NodeJS.ProcessEnv;
+    const trustedEnvironment = environmentForTrustedHome(trustedHome);
+    try {
+      execFileSync('git', ['init', '-q', selected]);
+      execFileSync('git', ['-C', selected, 'remote', 'add', 'origin', 'https://github.com/acme/selected.git']);
+      execFileSync('git', ['init', '-q', foreign]);
+      execFileSync('git', ['-C', foreign, 'remote', 'add', 'origin', 'https://github.com/acme/foreign.git']);
+      const expectSelectedProviderCalls = async (): Promise<void> => {
+        expect(repoRemote(selected, 'git', trustedEnvironment)).toEqual({ host: 'github.com', owner: 'acme', repo: 'selected' });
+        const api = new FakeApi();
+        const tracker = new ManagedRepoOverviewTracker({
+          workspaceRoot: root,
+          managedRepos: ['selected'],
+          api,
+          intervalMs: 0,
+          resolveRemote: async (path) => {
+            const remote = repoRemote(path, 'git', trustedEnvironment);
+            return remote === null ? null : { host: remote.host, owner: remote.owner, repo: remote.repo };
+          },
+        });
+        const view = await tracker.refresh();
+        expect(row(view, 'selected').fullName).toBe('acme/selected');
+        expect(api.calls).toContain('fetchRepo:acme/selected');
+        expect(api.calls.some((call) => call.endsWith(':acme/foreign'))).toBe(false);
+      };
+
+      vi.stubEnv('GIT_DIR', join(foreign, '.git'));
+      vi.stubEnv('GIT_WORK_TREE', selected);
+      vi.stubEnv('GIT_CONFIG_COUNT', '1');
+      vi.stubEnv('GIT_CONFIG_KEY_0', 'remote.origin.url');
+      vi.stubEnv('GIT_CONFIG_VALUE_0', 'https://github.com/acme/foreign.git');
+      await expectSelectedProviderCalls();
+      vi.unstubAllEnvs();
+
+      vi.stubEnv('GIT_CONFIG_PARAMETERS', "'remote.origin.url'='https://github.com/acme/foreign.git'");
+      await expectSelectedProviderCalls();
+      vi.unstubAllEnvs();
+
+      vi.stubEnv('git_dir', join(foreign, '.git'));
+      vi.stubEnv('git_work_tree', selected);
+      vi.stubEnv('git_config_count', '1');
+      vi.stubEnv('git_config_key_0', 'remote.origin.url');
+      vi.stubEnv('git_config_value_0', 'https://github.com/acme/foreign.git');
+      const inheritedGitNames = Object.keys(gitProbeEnvironment()).map((name) => name.toUpperCase());
+      expect(inheritedGitNames).not.toContain('GIT_DIR');
+      expect(inheritedGitNames).not.toContain('GIT_WORK_TREE');
+      expect(inheritedGitNames.some((name) => /^GIT_CONFIG_(?:COUNT|(?:KEY|VALUE)_\d+)$/u.test(name))).toBe(false);
+      await expectSelectedProviderCalls();
+      vi.unstubAllEnvs();
+
+      const homeRoot = join(root, 'home');
+      mkdirSync(homeRoot);
+      execFileSync('git', ['config', '--file', join(homeRoot, '.gitconfig'), 'url.https://github.com/acme/foreign.git.insteadOf', 'https://github.com/acme/selected.git']);
+      const redirectedHome = execFileSync('git', ['-C', selected, 'remote', 'get-url', 'origin'], {
+        encoding: 'utf8', env: { ...process.env, HOME: homeRoot },
+      }).trim();
+      expect(redirectedHome).toBe('https://github.com/acme/foreign.git');
+      vi.stubEnv('HOME', homeRoot);
+      expect(gitProbeEnvironment()).toHaveProperty('HOME', userInfo().homedir);
+      await expectSelectedProviderCalls();
+      vi.unstubAllEnvs();
+
+      const rewriteConfig = join(root, 'rewrite.gitconfig');
+      execFileSync('git', ['config', '--file', rewriteConfig, 'url.https://github.com/acme/foreign.git.insteadOf', 'https://github.com/acme/selected.git']);
+      for (const variable of ['GIT_CONFIG_GLOBAL'] as const) {
+        const redirected = execFileSync('git', ['-C', selected, 'remote', 'get-url', 'origin'], {
+          encoding: 'utf8', env: { ...process.env, HOME: root, GIT_CONFIG_NOSYSTEM: '1', [variable]: rewriteConfig },
+        }).trim();
+        expect(redirected).toBe('https://github.com/acme/foreign.git');
+        vi.stubEnv('HOME', root);
+        vi.stubEnv('GIT_CONFIG_NOSYSTEM', '1');
+        vi.stubEnv(variable, rewriteConfig);
+        await expectSelectedProviderCalls();
+        vi.unstubAllEnvs();
+      }
+
+      const xdgConfigRoot = join(root, 'xdg');
+      mkdirSync(join(xdgConfigRoot, 'git'), { recursive: true });
+      const xdgConfig = join(xdgConfigRoot, 'git', 'config');
+      execFileSync('git', ['config', '--file', xdgConfig, 'url.https://github.com/acme/foreign.git.insteadOf', 'https://github.com/acme/selected.git']);
+      const redirectedXdg = execFileSync('git', ['-C', selected, 'remote', 'get-url', 'origin'], {
+        encoding: 'utf8', env: { ...process.env, HOME: root, GIT_CONFIG_NOSYSTEM: '1', XDG_CONFIG_HOME: xdgConfigRoot },
+      }).trim();
+      expect(redirectedXdg).toBe('https://github.com/acme/foreign.git');
+      vi.stubEnv('HOME', root);
+      vi.stubEnv('GIT_CONFIG_NOSYSTEM', '1');
+      vi.stubEnv('XDG_CONFIG_HOME', xdgConfigRoot);
+      await expectSelectedProviderCalls();
+      vi.unstubAllEnvs();
+
+      vi.stubEnv('GIT_CONFIG_NOSYSTEM', '1');
+      expect(gitProbeEnvironment()).not.toHaveProperty('GIT_CONFIG_NOSYSTEM');
+      vi.unstubAllEnvs();
+    } finally {
+      vi.unstubAllEnvs();
       rmSync(root, { recursive: true, force: true });
     }
   });
@@ -1324,6 +1580,358 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
       rmSync(root, { recursive: true, force: true });
       rmSync(emptyPath, { recursive: true, force: true });
     }
+  });
+
+  it('preserves trusted global Git config while replacing inherited home and config overrides', () => {
+    const root = mkdtempSync(join(tmpdir(), 'gru-repo-overview-trusted-git-home-'));
+    const workspace = join(root, 'workspace');
+    const trustedHome = join(root, 'account-home');
+    const inheritedHome = join(root, 'inherited-home');
+    const selected = join(workspace, 'selected');
+    try {
+      mkdirSync(workspace);
+      mkdirSync(trustedHome);
+      mkdirSync(inheritedHome);
+      execFileSync('git', ['init', '-q', selected]);
+      execFileSync('git', ['-C', selected, 'remote', 'add', 'origin', 'https://github.com/acme/selected.git']);
+      const globalConfig = join(trustedHome, '.gitconfig');
+      execFileSync('git', ['config', '--file', globalConfig, 'safe.directory', selected]);
+      execFileSync('git', [
+        'config', '--file', globalConfig,
+        'url.https://github.com/acme/rewritten.git.insteadOf',
+        'https://github.com/acme/selected.git',
+      ]);
+
+      vi.stubEnv('HOME', inheritedHome);
+      vi.stubEnv('XDG_CONFIG_HOME', join(inheritedHome, 'xdg'));
+      vi.stubEnv('GIT_CONFIG_GLOBAL', join(inheritedHome, 'foreign.gitconfig'));
+      vi.stubEnv('GIT_CONFIG_NOSYSTEM', '1');
+      vi.stubEnv('GIT_TEST_ASSUME_DIFFERENT_OWNER', '1');
+      vi.stubEnv('LANG', 'fr_FR.UTF-8');
+      vi.stubEnv('LC_ALL', 'fr_FR.UTF-8');
+      const environmentForTrustedHome = gitProbeEnvironment as unknown as (
+        home: string,
+      ) => NodeJS.ProcessEnv;
+      const env = environmentForTrustedHome(trustedHome);
+      expect(env.HOME).toBe(trustedHome);
+      const invalidRepo = join(workspace, 'invalid-marker');
+      mkdirSync(invalidRepo);
+      writeFileSync(join(invalidRepo, '.git'), 'not-a-gitdir\n');
+      const invalidRepoResolution = resolveManagedRepoPathSync(workspace, 'invalid-marker');
+      expect({ locale: env.LC_ALL, invalidRepoKind: invalidRepoResolution.kind }).toEqual({
+        locale: 'C',
+        invalidRepoKind: 'unavailable',
+      });
+      expect(env).not.toHaveProperty('XDG_CONFIG_HOME');
+      expect(env).not.toHaveProperty('GIT_CONFIG_GLOBAL');
+      expect(env).not.toHaveProperty('GIT_CONFIG_NOSYSTEM');
+      expect(env.GIT_TEST_ASSUME_DIFFERENT_OWNER).toBe('1');
+
+      const validatedRoot = execFileSync('git', ['-C', selected, 'rev-parse', '--show-toplevel'], {
+        encoding: 'utf8', env,
+      }).trim();
+      expect(validatedRoot).toBe(realpathSync(selected));
+      const rewritten = execFileSync('git', ['-C', selected, 'remote', 'get-url', 'origin'], {
+        encoding: 'utf8', env,
+      }).trim();
+      expect(rewritten).toBe('https://github.com/acme/rewritten.git');
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('retains cached overview as stale when a previously valid .git directory becomes unreadable', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gru-repo-overview-git-permission-'));
+    const repo = join(root, 'alpha');
+    const gitDir = join(repo, '.git');
+    try {
+      execFileSync('git', ['init', '-q', repo]);
+      execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/acme/alpha.git']);
+      const api = new FakeApi().set('alpha', { openPrs: 4, openIssues: 2 });
+      const clock = { ms: T0 };
+      const tracker = new ManagedRepoOverviewTracker({
+        workspaceRoot: root,
+        managedRepos: ['alpha'],
+        api,
+        now: () => clock.ms,
+        sleep: async () => {},
+        intervalMs: 300_000,
+      });
+
+      const initial = row(await tracker.refresh(), 'alpha');
+      expect(initial).toMatchObject({ linked: true, freshness: 'fresh', openPrs: 4, openIssues: 2 });
+      const callsBeforeFailure = api.calls.length;
+
+      chmodSync(gitDir, 0);
+      expect(resolveManagedRepoPathSync(root, 'alpha')).toMatchObject({ kind: 'error' });
+      clock.ms += 1;
+      const unreadable = row(await tracker.refresh(), 'alpha');
+      expect(unreadable).toMatchObject({ linked: true, freshness: 'stale', openPrs: 4, openIssues: 2 });
+      expect(unreadable.error).toMatch(/EACCES|permission denied/iu);
+      expect(api.calls).toHaveLength(callsBeforeFailure);
+
+      chmodSync(gitDir, 0o755);
+      clock.ms += 1;
+      const recovered = row(await tracker.refresh(), 'alpha');
+      expect(recovered).toMatchObject({ linked: true, freshness: 'fresh', openPrs: 4, openIssues: 2 });
+      expect(api.calls.length).toBeGreaterThan(callsBeforeFailure);
+    } finally {
+      if (existsSync(gitDir)) chmodSync(gitDir, 0o755);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('retains cached overview when a linked-worktree gitdir becomes unreadable', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gru-repo-overview-worktree-permission-'));
+    const seed = join(root, 'seed');
+    const repo = join(root, 'alpha');
+    let gitDirPath = '';
+    try {
+      execFileSync('git', ['init', '-q', seed]);
+      execFileSync('git', [
+        '-C', seed, '-c', 'user.name=Test User', '-c', 'user.email=test@example.invalid',
+        'commit', '--allow-empty', '-m', 'initial',
+      ]);
+      execFileSync('git', ['-C', seed, 'remote', 'add', 'origin', 'https://github.com/acme/alpha.git']);
+      execFileSync('git', ['-C', seed, 'worktree', 'add', '--detach', repo, 'HEAD']);
+      gitDirPath = execFileSync(
+        'git',
+        ['-C', repo, 'rev-parse', '--absolute-git-dir'],
+        { encoding: 'utf8' },
+      ).trim();
+
+      const api = new FakeApi().set('alpha', { openPrs: 7, openIssues: 3 });
+      const clock = { ms: T0 };
+      const tracker = new ManagedRepoOverviewTracker({
+        workspaceRoot: root,
+        managedRepos: ['alpha'],
+        api,
+        now: () => clock.ms,
+        sleep: async () => {},
+        intervalMs: 300_000,
+      });
+
+      const initial = row(await tracker.refresh(), 'alpha');
+      expect(initial).toMatchObject({ linked: true, freshness: 'fresh', openPrs: 7, openIssues: 3 });
+      const callsBeforeFailure = api.calls.length;
+
+      chmodSync(gitDirPath, 0);
+      expect(resolveManagedRepoPathSync(root, 'alpha')).toMatchObject({ kind: 'error' });
+      clock.ms += 1;
+      const unreadable = row(await tracker.refresh(), 'alpha');
+      expect(unreadable).toMatchObject({
+        linked: true,
+        freshness: 'stale',
+        openPrs: 7,
+        openIssues: 3,
+      });
+      expect(unreadable.error).toMatch(/EACCES|permission denied/iu);
+      expect(api.calls).toHaveLength(callsBeforeFailure);
+
+      chmodSync(gitDirPath, 0o755);
+      clock.ms += 1;
+      const recovered = row(await tracker.refresh(), 'alpha');
+      expect(recovered).toMatchObject({ linked: true, freshness: 'fresh', openPrs: 7, openIssues: 3 });
+      expect(api.calls.length).toBeGreaterThan(callsBeforeFailure);
+    } finally {
+      if (gitDirPath !== '' && existsSync(gitDirPath)) chmodSync(gitDirPath, 0o755);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('classifies Git root-probe spawn failures as read errors, not confirmed unavailable roots', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gru-repo-overview-root-spawn-'));
+    const emptyPath = mkdtempSync(join(tmpdir(), 'gru-repo-overview-root-empty-path-'));
+    const workspace = join(root, 'workspace');
+    const repo = join(workspace, 'alpha');
+    const savedPath = process.env.PATH;
+    try {
+      mkdirSync(workspace);
+      execFileSync('git', ['init', '-q', repo]);
+      process.env.PATH = emptyPath;
+      await expect(resolveManagedRepoPath(workspace, 'alpha')).resolves.toMatchObject({ kind: 'error' });
+      expect(resolveManagedRepoPathSync(workspace, 'alpha')).toMatchObject({ kind: 'error' });
+    } finally {
+      process.env.PATH = savedPath;
+      rmSync(root, { recursive: true, force: true });
+      rmSync(emptyPath, { recursive: true, force: true });
+    }
+  });
+
+  it('classifies Git root-probe timeouts as read errors rather than unavailable roots', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gru-repo-overview-root-timeout-'));
+    const fakeBin = join(root, 'bin');
+    const workspace = join(root, 'workspace');
+    const repo = join(workspace, 'alpha');
+    mkdirSync(fakeBin);
+    mkdirSync(workspace);
+    execFileSync('git', ['init', '-q', repo]);
+    writeFileSync(join(fakeBin, 'git'), '#!/bin/sh\nexec /bin/sleep 5\n', { mode: 0o755 });
+    try {
+      vi.stubEnv('PATH', fakeBin);
+      await expect(resolveManagedRepoPath(workspace, 'alpha')).resolves.toMatchObject({ kind: 'error' });
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('bounds stalled managed-root validation and resumes on a later refresh', async () => {
+    vi.useFakeTimers();
+    const api = new FakeApi();
+    const clock = { ms: T0 };
+    const rootAttempts: string[] = [];
+    let alphaStalls = true;
+    const tracker = new ManagedRepoOverviewTracker({
+      workspaceRoot: '/ws',
+      managedRepos: ['alpha', 'beta'],
+      api,
+      intervalMs: 0,
+      now: () => clock.ms,
+      sleep: async () => {},
+      resolveRepoPath: (_workspaceRoot, name) => {
+        rootAttempts.push(name);
+        return name === 'alpha' && alphaStalls
+          ? new Promise(() => {})
+          : { kind: 'available', path: `/ws/${name}` };
+      },
+      resolveRemote: async (path) => githubRef(path.split('/').at(-1) as string),
+    });
+    try {
+      const completes = tracker.refresh().then((view) => ({ kind: 'completed' as const, view }));
+      const guard = new Promise<{ kind: 'guard' }>((resolve) => {
+        setTimeout(() => resolve({ kind: 'guard' }), REPO_OVERVIEW_RESOLVE_BUDGET_MS * 2);
+      });
+      const outcomePromise = Promise.race([completes, guard]);
+      await vi.advanceTimersByTimeAsync(REPO_OVERVIEW_RESOLVE_BUDGET_MS * 2);
+      const outcome = await outcomePromise;
+      expect(outcome.kind).toBe('completed');
+      if (outcome.kind !== 'completed') return;
+      const alpha = row(outcome.view, 'alpha');
+      expect(alpha.linked).toBe(false);
+      expect(alpha.linkReason).toBe('origin remote could not be read yet');
+      expect(alpha.freshness).toBe('unchecked');
+      expect(alpha.checkedAt).toBeNull();
+      expect(alpha.lastAttemptAt).toBeNull();
+      expect(alpha.error).toBeNull();
+      expect(isValidSnapshot(validBoardSnapshot(outcome.view))).toBe(true);
+      expect(api.calls).toHaveLength(0);
+
+      alphaStalls = false;
+      const recovered = await tracker.refresh();
+      expect(rootAttempts.slice(1, 3)).toEqual(['beta', 'alpha']);
+      expect(row(recovered, 'alpha').linked).toBe(true);
+      expect(row(recovered, 'beta').linked).toBe(true);
+      expect(api.calls.length).toBeGreaterThan(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('retains cached data as stale while managed-root validation stalls and recovers later', async () => {
+    vi.useFakeTimers();
+    const api = new FakeApi().set('alpha', { openPrs: 7, openIssues: 3 });
+    const clock = { ms: T0 };
+    const rootAttempts: string[] = [];
+    let alphaStalls = false;
+    const tracker = new ManagedRepoOverviewTracker({
+      workspaceRoot: '/ws',
+      managedRepos: ['alpha'],
+      api,
+      intervalMs: 0,
+      now: () => clock.ms,
+      sleep: async () => {},
+      resolveRepoPath: (_workspaceRoot, name) => {
+        rootAttempts.push(name);
+        return name === 'alpha' && alphaStalls
+          ? new Promise(() => {})
+          : { kind: 'available', path: `/ws/${name}` };
+      },
+      resolveRemote: async (path) => githubRef(path.split('/').at(-1) as string),
+    });
+    try {
+      const initial = await tracker.refresh();
+      const initialAlpha = row(initial, 'alpha');
+      expect(initialAlpha.linked).toBe(true);
+      expect(initialAlpha.openPrs).toBe(7);
+      expect(initialAlpha.openIssues).toBe(3);
+      expect(initialAlpha.run).not.toBeNull();
+      expect(initialAlpha.checkedAt).not.toBeNull();
+      const callsAfterInitial = api.calls.length;
+      expect(callsAfterInitial).toBeGreaterThan(0);
+
+      alphaStalls = true;
+      const completes = tracker.refresh().then((view) => ({ kind: 'completed' as const, view }));
+      const guard = new Promise<{ kind: 'guard' }>((resolve) => {
+        setTimeout(() => resolve({ kind: 'guard' }), REPO_OVERVIEW_RESOLVE_BUDGET_MS * 4);
+      });
+      const outcomePromise = Promise.race([completes, guard]);
+      await vi.advanceTimersByTimeAsync(REPO_OVERVIEW_RESOLVE_BUDGET_MS * 5);
+      const outcome = await outcomePromise;
+      expect(outcome.kind).toBe('completed');
+      if (outcome.kind !== 'completed') return;
+
+      const stalledAlpha = row(outcome.view, 'alpha');
+      expect(stalledAlpha.linked).toBe(true);
+      expect(stalledAlpha.freshness).toBe('stale');
+      expect(stalledAlpha.openPrs).toBe(initialAlpha.openPrs);
+      expect(stalledAlpha.openIssues).toBe(initialAlpha.openIssues);
+      expect(stalledAlpha.run).toEqual(initialAlpha.run);
+      expect(stalledAlpha.checkedAt).toBe(initialAlpha.checkedAt);
+      expect(stalledAlpha.lastAttemptAt).not.toBeNull();
+      expect(stalledAlpha.error).toContain('root validation exceeded the origin-resolution budget');
+      expect(api.calls).toHaveLength(callsAfterInitial);
+      expect(isValidSnapshot(validBoardSnapshot(outcome.view))).toBe(true);
+
+      alphaStalls = false;
+      clock.ms += 1;
+      const recovered = await tracker.refresh();
+      expect(rootAttempts).toEqual(['alpha', 'alpha', 'alpha']);
+      expect(row(recovered, 'alpha').linked).toBe(true);
+      expect(row(recovered, 'alpha').freshness).toBe('fresh');
+      expect(row(recovered, 'alpha').error).toBeNull();
+      expect(api.calls.length).toBeGreaterThan(callsAfterInitial);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('coordinates root validation and provider cursors so joint budgets eventually observe every selected root', async () => {
+    const names = Array.from({ length: 60 }, (_value, index) => `repo-${String(index).padStart(2, '0')}`);
+    const api = new FakeApi();
+    const clock = { ms: T0 };
+    const validatedThisRefresh = new Set<string>();
+    const tracker = new ManagedRepoOverviewTracker({
+      workspaceRoot: '/ws',
+      managedRepos: names,
+      api,
+      intervalMs: 0,
+      maxCallsPerRefresh: 100,
+      now: () => clock.ms,
+      sleep: async () => {},
+      resolveRepoPath: (_workspaceRoot, name) => ({ kind: 'available', path: `/ws/${name}` }),
+      resolveRemote: async (path) => {
+        const name = path.split('/').at(-1) as string;
+        validatedThisRefresh.add(name);
+        clock.ms += 2_001;
+        return githubRef(name);
+      },
+    });
+    const providerObserved = new Set<string>();
+    for (let pass = 0; pass < 10 && providerObserved.size < names.length; pass += 1) {
+      validatedThisRefresh.clear();
+      const before = api.calls.length;
+      await tracker.refresh();
+      const calls = api.calls.slice(before);
+      for (const call of calls) {
+        const fullName = call.slice(call.indexOf(':') + 1);
+        const name = fullName.split('/').at(-1) as string;
+        expect(validatedThisRefresh.has(name), `${call} had no same-pass validated root`).toBe(true);
+        if (call.startsWith('fetchRepo:')) providerObserved.add(name);
+      }
+    }
+    expect([...providerObserved].sort()).toEqual(names);
   });
 
   it('rotates the classification start when the resolution budget cuts a pass short', async () => {
@@ -1351,8 +1959,10 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     const attempted: string[] = [];
     const tracker = new ManagedRepoOverviewTracker({
       workspaceRoot: '/ws',
+      managedRepos: ['alpha', 'beta', 'gamma'],
       api,
       scanRepos: () => ['alpha', 'beta', 'gamma'],
+      resolveRepoPath: (_workspaceRoot, name) => ({ kind: 'available', path: `/ws/${name}` }),
       resolveRemote: async (repoPath) => {
         attempted.push(repoPath.split('/').pop() as string);
         clock.ms += REPO_OVERVIEW_RESOLVE_BUDGET_MS + 1;
@@ -1407,8 +2017,10 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     const clock = { ms: T0 };
     const tracker = new ManagedRepoOverviewTracker({
       workspaceRoot: '/ws',
+      managedRepos: ['alpha'],
       api,
       scanRepos: () => ['alpha'],
+      resolveRepoPath: (_workspaceRoot, name) => ({ kind: 'available', path: `/ws/${name}` }),
       resolveRemote: () => githubRef('alpha'),
       intervalMs: 0,
       now: () => clock.ms,
@@ -1453,8 +2065,10 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     const sleeps: number[] = [];
     const tracker = new ManagedRepoOverviewTracker({
       workspaceRoot: '/ws',
+      managedRepos: ['alpha', 'beta'],
       api,
       scanRepos: () => ['alpha', 'beta'],
+      resolveRepoPath: (_workspaceRoot, name) => ({ kind: 'available', path: `/ws/${name}` }),
       resolveRemote: (repoPath) => githubRef(repoPath.split('/').pop() as string),
       now: () => 0,
       sleep: async (ms) => {
@@ -1661,8 +2275,10 @@ describe('managed repo overview tracker — run timestamp semantics', () => {
     // older run has the later start time (never PASSED in its place).
     const tracker = new ManagedRepoOverviewTracker({
       workspaceRoot: '/ws',
+      managedRepos: ['alpha'],
       api: adapter,
       scanRepos: () => ['alpha'],
+      resolveRepoPath: (_workspaceRoot, name) => ({ kind: 'available', path: `/ws/${name}` }),
       resolveRemote: () => githubRef('alpha'),
       now: () => T0,
       sleep: async () => {},

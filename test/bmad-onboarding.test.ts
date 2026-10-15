@@ -151,7 +151,17 @@ describe('BMAD-agnostic GC repository setup (#295)', () => {
     rmSync(join(f.repo, '.git'), { recursive: true });
     mkdirSync(join(f.repo, '.git'));
     const other = fixture();
-    for (const env of [{}, { GIT_DIR: join(other.repo, '.git'), GIT_WORK_TREE: other.repo }]) {
+    for (const env of [
+      {},
+      { GIT_DIR: join(other.repo, '.git'), GIT_WORK_TREE: other.repo },
+      {
+        GIT_DIR: join(other.repo, '.git'),
+        GIT_WORK_TREE: f.repo,
+        GIT_CONFIG_COUNT: '1',
+        GIT_CONFIG_KEY_0: 'core.worktree',
+        GIT_CONFIG_VALUE_0: f.repo,
+      },
+    ]) {
       const result = run(f, {}, env);
       expect(result.status).toBe(1);
       expect(result.stderr).toContain('GC repository setup');

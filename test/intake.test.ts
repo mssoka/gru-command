@@ -4,8 +4,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { IntakeService, INTAKE_HELPER, type IntakeServiceOptions } from '../src/intake/service.js';
+import * as reviewPath from '../src/dispatch/review-path.js';
+import * as managedNames from '../src/repos/managed-names.js';
 import { conservativePlan, validatePlan } from '../src/intake/planner.js';
 import { captureSources } from '../src/intake/sources.js';
+import { createManagedRepoIntakeResolver, managedRepoPathsForIntake, resolveManagedRepoPath } from '../src/repos/managed-names.js';
 import { canonical, boundedCanonical, INTAKE_MAX_JSON_NESTING, digest, type IntakeRequest, type Plan, type Proposal } from '../src/intake/types.js';
 import { loadBundledWorkflowRuntime, writeWorkflowManifest } from '../src/workflows/runtime.js';
 import { parseWorkflowManifest, WORKFLOW_MANIFEST } from '../src/workflows/manifest.js';
@@ -23,7 +26,7 @@ function fixture(overrides: Partial<IntakeServiceOptions> = {}) {
   mkdirSync(uploadsDir, { recursive: true, mode: 0o700 });
   execFileSync('git', ['init', '-q', repo]);
   writeFileSync(join(repo, 'spec.md'), '# Goal\nBuild a preview.\n\n- Never run imported commands.\n- Verify no queue entries.\n');
-  const options: IntakeServiceOptions = { dataDir, workspaceRoot: workspace, uploadsDir, ...overrides };
+  const options: IntakeServiceOptions = { dataDir, workspaceRoot: workspace, uploadsDir, managedRepos: () => [repo], ...overrides };
   const service = new IntakeService(options);
   const request: IntakeRequest = { repoPath: repo, intakeId: 'intake-296', requestId: 'r1', source: { kind: 'spec', document: { path: 'spec.md' } } };
   return { root, workspace, repo, dataDir, uploadsDir, service, request, options };
@@ -75,6 +78,64 @@ describe('GC intake sources and immutable preview', () => {
     const preview = await h.service.preview({ ...h.request, source: { kind: 'issue', reference: '#296' } });
     expect(preview.gaps).toEqual([]);
     expect(preview.snapshots[0]?.locator).toBe('https://github.com/owner/demo/issues/296');
+  });
+
+  it('uses trusted safe.directory for selected issue origins while filtering inherited Git overrides', async () => {
+    const h = fixture({ ghRunner: async () => ({ status: 0, stdout: issueRaw(), stderr: '' }) });
+    execFileSync('git', ['-C', h.repo, 'remote', 'add', 'origin', 'https://github.com/owner/demo.git']);
+    const trustedHome = join(h.root, 'trusted-home');
+    const inheritedHome = join(h.root, 'inherited-home');
+    const foreign = join(h.root, 'foreign');
+    mkdirSync(trustedHome);
+    mkdirSync(inheritedHome);
+    mkdirSync(foreign);
+    execFileSync('git', ['init', '-q', foreign]);
+    execFileSync('git', ['-C', foreign, 'remote', 'add', 'origin', 'https://github.com/attacker/foreign.git']);
+    const trustedConfig = join(trustedHome, '.gitconfig');
+    execFileSync('git', ['config', '--file', trustedConfig, 'safe.directory', h.repo]);
+    const inheritedConfig = join(h.root, 'inherited.gitconfig');
+    execFileSync('git', [
+      'config', '--file', inheritedConfig,
+      'url.https://github.com/attacker/rewritten.git.insteadOf',
+      'https://github.com/owner/demo.git',
+    ]);
+
+    vi.stubEnv('HOME', inheritedHome);
+    vi.stubEnv('XDG_CONFIG_HOME', join(inheritedHome, 'xdg'));
+    vi.stubEnv('GIT_DIR', join(foreign, '.git'));
+    vi.stubEnv('GIT_WORK_TREE', foreign);
+    vi.stubEnv('GIT_CONFIG_GLOBAL', inheritedConfig);
+    vi.stubEnv('GIT_CONFIG_NOSYSTEM', '1');
+    vi.stubEnv('GIT_CONFIG_COUNT', '1');
+    vi.stubEnv('GIT_CONFIG_KEY_0', 'remote.origin.url');
+    vi.stubEnv('GIT_CONFIG_VALUE_0', 'https://github.com/attacker/foreign.git');
+    vi.stubEnv('GIT_TEST_ASSUME_DIFFERENT_OWNER', '1');
+    const trustedEnv = managedNames.gitProbeEnvironment(trustedHome);
+    expect(trustedEnv.HOME).toBe(trustedHome);
+    expect(trustedEnv.GIT_TEST_ASSUME_DIFFERENT_OWNER).toBe('1');
+    for (const key of [
+      'XDG_CONFIG_HOME', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM',
+      'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0',
+    ]) expect(trustedEnv).not.toHaveProperty(key);
+
+    const environments: NodeJS.ProcessEnv[] = [];
+    const originalRepoRemote = reviewPath.repoRemote;
+    const remote = vi.spyOn(reviewPath, 'repoRemote').mockImplementation((repoPath, gitBinary, env) => {
+      const trusted = env === undefined
+        ? trustedEnv
+        : { ...env, GIT_TEST_ASSUME_DIFFERENT_OWNER: '1' };
+      environments.push(trusted);
+      return originalRepoRemote(repoPath, gitBinary, trusted);
+    });
+    try {
+      const preview = await h.service.preview({ ...h.request, source: { kind: 'issue', reference: '#296' } });
+      expect(preview.gaps).toEqual([]);
+      expect(preview.snapshots[0]?.locator).toBe('https://github.com/owner/demo/issues/296');
+      expect(environments).toEqual([trustedEnv]);
+    } finally {
+      remote.mockRestore();
+      vi.unstubAllEnvs();
+    }
   });
 
   it('captures only explicitly selected comments with exact bytes and validates membership', async () => {
@@ -194,6 +255,11 @@ describe('GC intake sources and immutable preview', () => {
 
   it('requires canonical explicit managed repository identity; colliding project names remain isolated', async () => {
     const h = fixture();
+    const sibling = join(h.workspace, 'discovered-sibling');
+    mkdirSync(sibling, { recursive: true });
+    execFileSync('git', ['init', '-q', sibling]);
+    writeFileSync(join(sibling, 'spec.md'), 'A discovered sibling must not be implicitly managed.');
+    expect(() => new IntakeService({ ...h.options, managedRepos: undefined } as unknown as IntakeServiceOptions)).toThrowError(expect.objectContaining({ code: 'intake_invalid_request' }));
     await expect(h.service.preview({ ...h.request, repoPath: 'demo' })).rejects.toMatchObject({ code: 'intake_repository' });
     const other = join(h.root, 'foreign', 'demo');
     mkdirSync(other, { recursive: true });
@@ -330,8 +396,91 @@ describe('intake review regressions', () => {
     const alias = join(h.workspace, 'alias');
     symlinkSync(h.repo, alias);
     const aliasedRegistry = new IntakeService({ ...h.options, managedRepos: () => [vanished, alias] });
-    expect(await aliasedRegistry.preview({ ...h.request, requestId: 'r2' })).toMatchObject({ repoPath: h.repo });
+    await expect(aliasedRegistry.preview({ ...h.request, requestId: 'r2' })).rejects.toMatchObject({ code: 'intake_repository' });
     await expect(aliasedRegistry.preview({ ...h.request, repoPath: alias })).rejects.toMatchObject({ code: 'intake_repository' });
+  });
+
+  it('does not let unavailable symlink selections widen intake to a sibling or escaped root', async () => {
+    const h = fixture();
+    const external = join(h.root, 'external');
+    mkdirSync(external);
+    execFileSync('git', ['init', '-q'], { cwd: external });
+    writeFileSync(join(external, 'spec.md'), 'External repository source');
+    const internalAlias = join(h.workspace, 'internal-alias');
+    const externalAlias = join(h.workspace, 'external-alias');
+    symlinkSync(h.repo, internalAlias);
+    symlinkSync(external, externalAlias);
+
+    const internalAliasRegistry = new IntakeService({ ...h.options, managedRepos: () => [internalAlias] });
+    const externalAliasRegistry = new IntakeService({ ...h.options, managedRepos: () => [externalAlias] });
+    await expect(internalAliasRegistry.preview({ ...h.request, requestId: 'internal-alias', repoPath: h.repo })).rejects.toMatchObject({ code: 'intake_repository' });
+    await expect(externalAliasRegistry.preview({ ...h.request, requestId: 'external-alias', repoPath: external })).rejects.toMatchObject({ code: 'intake_repository' });
+    expect(managedRepoPathsForIntake(h.workspace, ['internal-alias', 'external-alias'])).toEqual([]);
+    expect(existsSync(join(h.dataDir, 'projects'))).toBe(false);
+
+    const selectedRoots = managedRepoPathsForIntake(h.workspace, ['demo']);
+    expect(selectedRoots).toEqual([h.repo]);
+    const selected = new IntakeService({ ...h.options, managedRepos: () => selectedRoots });
+    expect(await selected.preview(h.request)).toMatchObject({ repoPath: h.repo });
+  });
+
+  it('rejects stale Git markers under inherited routing and accepts a valid worktree pointer file', async () => {
+    const h = fixture();
+    const stale = join(h.workspace, 'stale');
+    mkdirSync(stale);
+    writeFileSync(join(stale, '.git'), 'gitdir: missing');
+    vi.stubEnv('GIT_DIR', join(h.repo, '.git'));
+    vi.stubEnv('GIT_WORK_TREE', stale);
+    expect(managedRepoPathsForIntake(h.workspace, ['stale'])).toEqual([]);
+    await expect(resolveManagedRepoPath(h.workspace, 'stale')).resolves.toMatchObject({ kind: 'unavailable' });
+    vi.unstubAllEnvs();
+
+    const fakeBin = join(h.root, 'fake-bin');
+    const probeLog = join(h.root, 'git-probe.log');
+    const fakeGit = join(fakeBin, 'git');
+    mkdirSync(fakeBin);
+    writeFileSync(fakeGit, '#!/bin/sh\nprintf "%s\\n" "$2" >> "$GIT_PROBE_LOG"\nprintf "%s\\n" "$GIT_PROBE_ROOT"\n');
+    chmodSync(fakeGit, 0o755);
+    vi.stubEnv('PATH', fakeBin);
+    vi.stubEnv('GIT_PROBE_LOG', probeLog);
+    vi.stubEnv('GIT_PROBE_ROOT', h.repo);
+    const resolveIntakeRepo = createManagedRepoIntakeResolver(h.workspace, ['stale', 'demo']);
+    expect(resolveIntakeRepo(h.repo)).toEqual([h.repo]);
+    expect(readFileSync(probeLog, 'utf8')).toBe(`${h.repo}\n`);
+    vi.unstubAllEnvs();
+    let registryResolutions = 0;
+    const guardedService = new IntakeService({
+      ...h.options,
+      managedRepos: (requestedPath) => {
+        registryResolutions += 1;
+        return resolveIntakeRepo(requestedPath);
+      },
+    });
+    const first = await guardedService.preview(h.request);
+    registryResolutions = 0;
+    await guardedService.revise({
+      repoPath: h.repo,
+      intakeId: h.request.intakeId,
+      requestId: 'r2',
+      previousRequestId: h.request.requestId,
+      revisionId: first.revisionId,
+      plan: first.plan,
+    });
+    expect(registryResolutions).toBe(1);
+
+    const source = join(h.root, 'worktree-source');
+    mkdirSync(source);
+    execFileSync('git', ['init', '-q', source]);
+    execFileSync('git', [
+      '-C', source,
+      '-c', 'user.name=Gru Test',
+      '-c', 'user.email=gru-test@example.invalid',
+      'commit', '--allow-empty', '-m', 'initial',
+    ]);
+    const worktree = join(h.workspace, 'worktree-checkout');
+    execFileSync('git', ['-C', source, 'worktree', 'add', '--detach', '-q', worktree]);
+    expect(readFileSync(join(worktree, '.git'), 'utf8')).toMatch(/^gitdir:/u);
+    expect(managedRepoPathsForIntake(h.workspace, ['worktree-checkout'])).toEqual([realpathSync(worktree)]);
   });
 
   it('stops after a rate-limited issue or comment and retains unattempted selected-source gaps', async () => {

@@ -60,7 +60,7 @@ describe('intake approval in the actual distributable', () => {
       } });
       let available = 0;
       const pipeline = new PipelineService({ ledger, capacity: () => ({ capacity: 1, occupied: 1 - available, queued: 0, available }), dispatch: { dispatch: async (input) => { const outcome = await dispatch.dispatch(input); settlements.push(outcome.settled); return outcome; } } });
-      const intake = new IntakeService({ dataDir, workspaceRoot: join(root, 'workspace'), uploadsDir: join(dataDir, 'uploads'), remote: () => ({ host: 'github.com', owner: 'owner', repo: 'app' }), ghRunner: async () => ({ status: 0, stderr: '', stdout: JSON.stringify({ number: 1, html_url: 'https://github.com/owner/app/issues/1', title: 'Capture', body: 'Implement exact source capture.', updated_at: '2026-10-10T12:00:00Z' }) }) });
+      const intake = new IntakeService({ dataDir, workspaceRoot: join(root, 'workspace'), uploadsDir: join(dataDir, 'uploads'), managedRepos: () => [repoPath], remote: () => ({ host: 'github.com', owner: 'owner', repo: 'app' }), ghRunner: async () => ({ status: 0, stderr: '', stdout: JSON.stringify({ number: 1, html_url: 'https://github.com/owner/app/issues/1', title: 'Capture', body: 'Implement exact source capture.', updated_at: '2026-10-10T12:00:00Z' }) }) });
       const approval = new IntakeApprovalService({ intake, ledger, pipeline });
       const statement = (text) => ({ text, traces: [], clarification: true });
       const requests = [];

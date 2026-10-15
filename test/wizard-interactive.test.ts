@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { loadConfig } from '../src/config.js';
+import { parseAnswers } from '../src/wizard/answers.js';
+import { writeInstanceConfig } from '../src/wizard/steps.js';
 
 /** Real PTY front-door coverage. BMAD provisioning/retry prompts are retired (#295). */
 const repoRoot = join(import.meta.dirname, '..');
@@ -54,8 +56,8 @@ function ptyWizard(steps: readonly Step[], env: NodeJS.ProcessEnv, flags: readon
 function expectAvailable(): boolean {
   try { execFileSync('which', ['expect'], { stdio: 'ignore' }); return true; } catch { return false; }
 }
-const WS_PROMPT = 'Workspace root (holds ONLY your managed repos)';
-const REPOS_PROMPT = 'Repos to validate — comma-separated numbers or names';
+const WS_PROMPT = 'Workspace root (shared project directory; may contain unmanaged projects)';
+const REPOS_PROMPT = 'Repos to manage — comma-separated numbers or names';
 const RUNTIME_PROMPT = 'Default runtime — ';
 const MODEL_PROMPT = 'Model reference';
 const THINKING_PROMPT = 'Thinking level';
@@ -87,8 +89,8 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
       { expect: WS_PROMPT, send: workspace }, { expect: REPOS_PROMPT, send: '' }, ...finishSteps(''),
     ], { GRU_COMMAND_HOME: instance });
     expect(status, output).toBe(0);
-    expect(output).toContain('Repositories selected for setup validation: repo-a, repo-b');
-    expect(output).toContain('Linked repo entries excluded from setup validation: repo-link');
+    expect(output).toContain('Managed repositories selected: repo-a, repo-b');
+    expect(output).toContain('Linked repo entries excluded from installer choices: repo-link');
     expect(output).toContain('Smoke green');
     expect(output).toContain('Setup complete');
     expect(output).not.toContain('BMAD in ');
@@ -100,6 +102,119 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     const config = readFileSync(join(instance, 'config.toml'), 'utf-8');
     expect(config).toContain('port = 0');
     expect(config).toContain(`workspace_root = "${workspace}"`);
+    expect(loadConfig({ GRU_COMMAND_HOME: instance }).managedRepos).toEqual(['repo-a', 'repo-b']);
+  }, 90_000);
+
+  it('installer defaults exclude unsupported names, unusable Git roots, and root-probe errors', () => {
+    const workspace = fixtureWorkspace();
+    const hidden = join(workspace, '.repo-hidden');
+    mkdirSync(hidden);
+    execFileSync('git', ['-C', hidden, 'init', '-q']);
+    const invalid = join(workspace, 'repo*');
+    mkdirSync(invalid);
+    execFileSync('git', ['-C', invalid, 'init', '-q']);
+    const probeError = join(workspace, 'repo-bad-config');
+    mkdirSync(probeError);
+    execFileSync('git', ['-C', probeError, 'init', '-q']);
+    writeFileSync(join(probeError, '.git', 'config'), '[core\n');
+    const stale = join(workspace, 'repo-stale');
+    mkdirSync(stale);
+    writeFileSync(join(stale, '.git'), 'gitdir: ../missing-worktree\n');
+    const controlName = 'repo\u001b[31m';
+    const control = join(workspace, controlName);
+    mkdirSync(control);
+    execFileSync('git', ['-C', control, 'init', '-q']);
+    const controlMarkName = 'repo\u0001\u0301hidden';
+    const controlMark = join(workspace, controlMarkName);
+    mkdirSync(controlMark);
+    execFileSync('git', ['-C', controlMark, 'init', '-q']);
+    const whitespaceMarkName = 'repo \u0301hidden';
+    const whitespaceMark = join(workspace, whitespaceMarkName);
+    mkdirSync(whitespaceMark);
+    execFileSync('git', ['-C', whitespaceMark, 'init', '-q']);
+    const nbspName = 'repo-nbsp\u00a0';
+    const nbsp = join(workspace, nbspName);
+    mkdirSync(nbsp);
+    execFileSync('git', ['-C', nbsp, 'init', '-q']);
+    const bidi = join(workspace, 'repo\u202ehidden');
+    mkdirSync(bidi);
+    execFileSync('git', ['-C', bidi, 'init', '-q']);
+    const instance = tempDir('gru-command-pty-invalid-candidate-');
+    const { output, status } = ptyWizard([
+      { expect: WS_PROMPT, send: workspace }, { expect: REPOS_PROMPT, send: '' }, ...finishSteps('n'),
+    ], { GRU_COMMAND_HOME: instance });
+
+    expect(status, output).toBe(0);
+    expect(output).toContain('".repo-hidden": must not start with a dot');
+    expect(output).toContain('"repo*": must not contain wildcard characters');
+    expect(output).toContain('"repo-stale": .git does not identify this exact usable repository root');
+    expect(output).toContain('Git repository entries excluded from installer choices because Git root validation failed:');
+    expect(output).toContain('"repo-bad-config": Git root probe failed');
+    expect(output).toContain('repo\\\\u{1b}[31m');
+    expect(output).toContain('repo\\\\u{1}\\\\u{301}hidden');
+    expect(output).toContain('repo\\\\u{202e}hidden');
+    expect(output).toContain('repo \\u{301}hidden');
+    expect(output).toContain('repo-nbsp\\u{a0}');
+    expect(output).toContain('Managed repositories selected:');
+    const selected = loadConfig({ GRU_COMMAND_HOME: instance }).managedRepos;
+    expect(selected).toHaveLength(4);
+    expect(selected).toContain('repo-a');
+    expect(selected).toContain('repo-b');
+    expect(selected).toContain(whitespaceMarkName);
+    expect(selected).toContain(nbspName);
+  }, 90_000);
+
+  it('renders a mark-only repository name as a visible escape in the wizard', () => {
+    const workspace = tempDir('gru-command-pty-mark-only-ws-');
+    const name = '\u0301';
+    const repo = join(workspace, name);
+    mkdirSync(repo);
+    execFileSync('git', ['-C', repo, 'init', '-q']);
+    const instance = tempDir('gru-command-pty-mark-only-home-');
+    const { output, status } = ptyWizard([
+      { expect: WS_PROMPT, send: workspace }, { expect: REPOS_PROMPT, send: '1' }, ...finishSteps('n'),
+    ], { GRU_COMMAND_HOME: instance });
+
+    expect(status, output).toBe(0);
+    expect(output).toContain('  1. \\u{301}');
+    expect(output).toContain('Managed repositories selected: \\u{301}');
+    expect(loadConfig({ GRU_COMMAND_HOME: instance }).managedRepos).toEqual([name]);
+  }, 90_000);
+
+  it('interactive reruns preserve unavailable names safely and persist an explicit changed choice', () => {
+    const workspace = fixtureWorkspace();
+    const instance = tempDir('gru-command-pty-managed-rerun-');
+    const unavailableName = '\u0301missing';
+    const unavailableRepo = join(workspace, unavailableName);
+    mkdirSync(unavailableRepo);
+    execFileSync('git', ['-C', unavailableRepo, 'init', '-q']);
+    const prior = parseAnswers(JSON.stringify({ workspace_root: workspace, repos: ['repo-a', unavailableName] }));
+    writeInstanceConfig({ instanceDir: instance, answers: prior });
+    rmSync(unavailableRepo, { recursive: true, force: true });
+
+    const preserved = ptyWizard(
+      [{ expect: WS_PROMPT, send: '' }, { expect: REPOS_PROMPT, send: '' }, ...finishSteps('n')],
+      { GRU_COMMAND_HOME: instance },
+      ['--force'],
+    );
+    expect(preserved.status, preserved.output).toBe(0);
+    expect(preserved.output).toContain(
+      'Configured selections not currently available remain selected on Enter: \\u{301}missing.',
+    );
+    expect(preserved.output).toContain('Managed repositories selected: repo-a, \\u{301}missing');
+    expect(preserved.output).toContain(
+      'Previously selected repository \\u{301}missing is currently unavailable; keeping it in managed_repos.',
+    );
+    expect(loadConfig({ GRU_COMMAND_HOME: instance }).managedRepos).toEqual(['repo-a', unavailableName]);
+
+    const changed = ptyWizard(
+      [{ expect: WS_PROMPT, send: '' }, { expect: REPOS_PROMPT, send: '2' }, ...finishSteps('n')],
+      { GRU_COMMAND_HOME: instance },
+      ['--force'],
+    );
+    expect(changed.status, changed.output).toBe(0);
+    expect(changed.output).toContain('Managed repositories selected: repo-b');
+    expect(loadConfig({ GRU_COMMAND_HOME: instance }).managedRepos).toEqual(['repo-b']);
   }, 90_000);
 
   it('an all-linked workspace can complete setup without selecting entries validation must reject', () => {
@@ -112,8 +227,8 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
       { expect: WS_PROMPT, send: workspace }, ...finishSteps(),
     ], { GRU_COMMAND_HOME: instance });
     expect(status, output).toBe(0);
-    expect(output).toContain('Linked repo entries excluded from setup validation: repo-link');
-    expect(output).toContain('Repositories selected for setup validation: (none)');
+    expect(output).toContain('Linked repo entries excluded from installer choices: repo-link');
+    expect(output).toContain('Managed repositories selected: (none)');
     expect(output).not.toContain(REPOS_PROMPT);
     expect(readFileSync(join(outside, 'repo-a', '.git/config'), 'utf-8')).toBe(before);
     expect(existsSync(join(outside, 'repo-a', '_bmad'))).toBe(false);
@@ -144,7 +259,7 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     const workspace = fixtureWorkspace();
     const { output, status } = ptyWizard([
       { expect: WS_PROMPT, send: 'code' }, { expect: WS_PROMPT, send: workspace },
-      { expect: REPOS_PROMPT, send: 'not-a-repo' }, { expect: REPOS_PROMPT, send: '' },
+      { expect: REPOS_PROMPT, send: 'not-a-repo\u202ehidden' }, { expect: REPOS_PROMPT, send: '' },
       { expect: RUNTIME_PROMPT, send: 'vim' }, { expect: RUNTIME_PROMPT, send: '' },
       { expect: MODEL_PROMPT, send: '' }, { expect: THINKING_PROMPT, send: '' },
       { expect: HOST_PROMPT, send: 'not a host!' }, { expect: HOST_PROMPT, send: '' },
@@ -152,9 +267,15 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
       { expect: TOKEN_PROMPT, send: '' }, { expect: REGISTER_PROMPT, send: 'n' }, { expect: SMOKE_PROMPT, send: 'n' },
     ], { GRU_COMMAND_HOME: tempDir('gru-command-pty-retry-') });
     expect(status, output).toBe(0);
-    for (const text of ['workspace_root must be an absolute path', 'not a discovered repo', 'valid runtimes:', 'answers.host must be', 'port must be an integer', 'Setup complete']) {
+    for (const text of ['workspace_root must be an absolute path', 'not an available Git repository candidate', 'valid runtimes:', 'answers.host must be', 'port must be an integer', 'Setup complete']) {
       expect(output).toContain(text);
     }
+    const rejectedRepoLine = output
+      .split('\n')
+      .find((line) => line.includes('not an available Git repository candidate:'));
+    expect(rejectedRepoLine).toBe(
+      '  ✗ not an available Git repository candidate: not-a-repo\\u{202e}hidden',
+    );
   }, 90_000);
 
   it('managed-repo multi-pick by INDEX selects exactly that repo', () => {
@@ -163,8 +284,8 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
       { expect: WS_PROMPT, send: workspace }, { expect: REPOS_PROMPT, send: '1' }, ...finishSteps(),
     ], { GRU_COMMAND_HOME: tempDir('gru-command-pty-index-') });
     expect(status, output).toBe(0);
-    expect(output).toContain('Repositories selected for setup validation: repo-a');
-    expect(output).not.toContain('Repositories selected for setup validation: repo-a, repo-b');
+    expect(output).toContain('Managed repositories selected: repo-a');
+    expect(output).not.toContain('Managed repositories selected: repo-a, repo-b');
   }, 90_000);
 
   it('managed-repo multi-pick by NAME preserves the answered order', () => {
@@ -173,7 +294,7 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
       { expect: WS_PROMPT, send: workspace }, { expect: REPOS_PROMPT, send: 'repo-b, repo-a' }, ...finishSteps(),
     ], { GRU_COMMAND_HOME: tempDir('gru-command-pty-name-') });
     expect(status, output).toBe(0);
-    expect(output).toContain('Repositories selected for setup validation: repo-b, repo-a');
+    expect(output).toContain('Managed repositories selected: repo-b, repo-a');
   }, 90_000);
 
   it('bind host rejects y/n tokens and re-prompts; 0.0.0.0 lands in the config', () => {

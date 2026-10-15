@@ -1,5 +1,4 @@
 import { execFile } from 'node:child_process';
-import { join } from 'node:path';
 import type { LogLevel } from '../logger.js';
 import {
   GhApiError,
@@ -12,7 +11,7 @@ import {
   type RepoRef,
 } from '../dispatch/github-poll.js';
 import { isGitHubRemote, parseRepoRemote } from '../dispatch/review-path.js';
-import { discoverManagedReposAsync } from './discovery.js';
+import { gitProbeEnvironment, resolveManagedRepoPath, type ManagedRepoPath } from './managed-names.js';
 
 /**
  * Managed repository overview (owner-approved compact rows A): a
@@ -21,11 +20,10 @@ import { discoverManagedReposAsync } from './discovery.js';
  * (issues excluding PRs) and the newest Actions run on its discovered
  * default branch, with honest freshness.
  *
- * The registry is the configured workspace root plus the SAME depth-1
- * `.git` discovery rule the setup wizard uses (`src/repos/discovery.ts`)
- * — no hard-coded names, no arbitrary scans. Every row is derived from a
- * repository that actually exists there; a missing/non-GitHub/malformed
- * origin remote stays honestly not-linked and spends no GitHub call.
+ * The registry is the exact root-level `managed_repos` list loaded from
+ * config — never workspace discovery. Each name resolves to its direct
+ * project root; unavailable selections remain honestly visible and spend
+ * no GitHub call. Unselected siblings are never resolved or polled.
  *
  * GitHub reads are server-side through the authenticated `gh` seam,
  * bounded by a per-refresh call budget and a rotating cursor so a large
@@ -124,7 +122,7 @@ export interface RepoOverviewRowView {
   /** Completion time of the last observation attempt (success or failure,
    * ISO) — null when no attempt has completed. */
   readonly lastAttemptAt: string | null;
-  /** Last failed attempt detail (provider text, bounded); null when clean. */
+  /** Last failed attempt detail (root validation or provider text, bounded); null when clean. */
   readonly error: string | null;
 }
 
@@ -338,16 +336,37 @@ const SAFE_HOST = /^[A-Za-z0-9.-]+$/;
  * fail the mirrored web validator and freeze every snapshot, so an
  * invisible-only name is disclosed as visible escapes — never dropped,
  * never used as an identity. Control/format characters (bidi overrides
- * included) are escaped even beside visible text, so a name can never
- * spoof its display; combining marks are escaped only when nothing else
- * is visible (they are legitimate in many scripts). */
+ * included), non-ASCII separator spaces and leading combining marks are
+ * escaped even beside visible text; combining marks after a visible base
+ * remain legitimate in many scripts. */
 const VISIBLE_CHARACTER = /[^\p{Cf}\p{Cc}\p{M}\s]/u;
+const COMBINING_MARK = /\p{M}/u;
 const CONTROL_OR_FORMAT = /[\p{Cf}\p{Cc}]/u;
+const SEPARATOR_SPACE = /\p{Zs}/u;
 
 export function safeDisplayName(name: string): string {
   const escape = (char: string): string => `\\u{${char.codePointAt(0)?.toString(16) ?? '?'}}`;
   if (VISIBLE_CHARACTER.test(name)) {
-    return [...name].map((char) => (CONTROL_OR_FORMAT.test(char) ? escape(char) : char)).join('');
+    let hasVisibleBase = false;
+    return [...name]
+      .map((char) => {
+        if (CONTROL_OR_FORMAT.test(char)) {
+          hasVisibleBase = false;
+          return escape(char);
+        }
+        if (COMBINING_MARK.test(char)) return hasVisibleBase ? char : escape(char);
+        if (SEPARATOR_SPACE.test(char) && char !== ' ') {
+          hasVisibleBase = false;
+          return escape(char);
+        }
+        if (VISIBLE_CHARACTER.test(char)) {
+          hasVisibleBase = true;
+          return char;
+        }
+        hasVisibleBase = false;
+        return char;
+      })
+      .join('');
   }
   const escaped = [...name]
     .map((char) => (VISIBLE_CHARACTER.test(char) ? char : escape(char)))
@@ -616,7 +635,7 @@ async function gitOriginUrl(repoPath: string): Promise<string | null> {
     execFile(
       'git',
       ['-C', repoPath, 'remote', 'get-url', 'origin'],
-      { encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024 },
+      { encoding: 'utf8', env: gitProbeEnvironment(), timeout: 10_000, maxBuffer: 64 * 1024 },
       (error, stdout, stderr) => {
         if (error !== null) {
           const code = (error as NodeJS.ErrnoException).code;
@@ -688,13 +707,36 @@ function emptySourceState(): RepoSourceState {
   };
 }
 
+const ROOT_RESOLUTION_TIMEOUT = Symbol('root resolution timeout');
+
+async function resolveBeforeDeadline<T>(
+  work: () => T | Promise<T>,
+  timeoutMs: number,
+): Promise<T | typeof ROOT_RESOLUTION_TIMEOUT> {
+  if (timeoutMs <= 0) return ROOT_RESOLUTION_TIMEOUT;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(work),
+      new Promise<typeof ROOT_RESOLUTION_TIMEOUT>((resolveTimeout) => {
+        timer = setTimeout(() => resolveTimeout(ROOT_RESOLUTION_TIMEOUT), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
 export interface ManagedRepoOverviewOptions {
-  /** Configured workspace root holding the managed repositories. */
+  /** Configured workspace root containing selected project directories. */
   readonly workspaceRoot: string;
+  /** Explicit config names only; an empty or absent list means no repos. */
+  readonly managedRepos: readonly string[];
   readonly api: RepoOverviewApiPort;
-  /** Test seams; default: canonical discovery + origin-remote resolver.
-   * Both may be async; the tracker awaits them. */
+  /** Test seams. Production membership is always `managedRepos`; no
+   * directory discovery fallback exists. */
   readonly scanRepos?: (workspaceRoot: string) => readonly string[] | Promise<readonly string[]>;
+  readonly resolveRepoPath?: (workspaceRoot: string, name: string) => Promise<ManagedRepoPath> | ManagedRepoPath;
   readonly resolveRemote?: RemoteResolver;
   /** Refresh cadence; default {@link REPO_OVERVIEW_REFRESH_MS}. */
   readonly intervalMs?: number;
@@ -725,6 +767,7 @@ interface ObserveOutcome {
 export class ManagedRepoOverviewTracker {
   private readonly opts: ManagedRepoOverviewOptions;
   private readonly scanRepos: (workspaceRoot: string) => readonly string[] | Promise<readonly string[]>;
+  private readonly resolveRepoPath: (workspaceRoot: string, name: string) => Promise<ManagedRepoPath> | ManagedRepoPath;
   private readonly resolveRemote: RemoteResolver;
   private readonly intervalMs: number;
   private readonly staleAfterMs: number;
@@ -742,7 +785,6 @@ export class ManagedRepoOverviewTracker {
    * repository rotates on so a budget too small to complete any
    * observation still makes fair progress. */
   private priorityName: string | null = null;
-  private classifyCursor = 0;
   private lastSearchAtMs: number | null = null;
   private refreshedOnce = false;
   private started = false;
@@ -751,7 +793,8 @@ export class ManagedRepoOverviewTracker {
 
   constructor(opts: ManagedRepoOverviewOptions) {
     this.opts = opts;
-    this.scanRepos = opts.scanRepos ?? (() => discoverManagedReposAsync(opts.workspaceRoot));
+    this.scanRepos = opts.scanRepos ?? (() => opts.managedRepos);
+    this.resolveRepoPath = opts.resolveRepoPath ?? resolveManagedRepoPath;
     this.resolveRemote = opts.resolveRemote ?? defaultRemoteResolver;
     this.intervalMs = opts.intervalMs ?? REPO_OVERVIEW_REFRESH_MS;
     // A disabled timer (intervalMs 0) must not collapse the freshness
@@ -811,13 +854,13 @@ export class ManagedRepoOverviewTracker {
         link: state.ref !== null ? githubRepoLink(state.ref) : null,
         linkReason: state.ref !== null ? null : state.linkReason,
         fullName: state.ref !== null ? repoFullName(state.ref) : null,
-        openPrs: state.counts?.openPrs ?? null,
-        openIssues: state.counts?.openIssues ?? null,
-        run: state.run,
+        openPrs: linked ? state.counts?.openPrs ?? null : null,
+        openIssues: linked ? state.counts?.openIssues ?? null : null,
+        run: linked ? state.run : null,
         freshness,
-        checkedAt: state.checkedAt,
-        lastAttemptAt: state.lastAttemptAt,
-        error: state.error,
+        checkedAt: linked ? state.checkedAt : null,
+        lastAttemptAt: linked ? state.lastAttemptAt : null,
+        error: linked ? state.error : null,
       } satisfies RepoOverviewRowView;
     });
     return { rows };
@@ -839,6 +882,8 @@ export class ManagedRepoOverviewTracker {
 
   private async runRefresh(): Promise<RepoOverviewView | null> {
     const repos = [...new Set(await this.scanRepos(this.opts.workspaceRoot))].sort();
+    const seenProjectPaths = new Set<string>();
+    const duplicateNames = new Set<string>();
     // Classification is built into a LOCAL map and published only once
     // every remote has been resolved: `view()` (called by board pushes and
     // heartbeats DURING this refresh) must never observe a half-classified
@@ -851,33 +896,61 @@ export class ManagedRepoOverviewTracker {
     const nextStates = new Map<string, RepoSourceState>();
     const resolveDeadline = this.now() + REPO_OVERVIEW_RESOLVE_BUDGET_MS;
     let resolveBudgetSpent = false;
-    // Classification rotates with its own cursor: when the budget cuts a
-    // pass short, the NEXT pass starts where this one stopped, so a slow
-    // mount can never starve the tail of the registry forever.
-    const classifyStart = repos.length === 0 ? 0 : this.classifyCursor % repos.length;
+    let rootResolutionTimedOut = false;
+    // Root validation and provider refresh share one rotation point. The
+    // next pass starts validating where the prior provider work resumes, so
+    // a root that was deferred from provider calls cannot land in the other
+    // half of a repeatedly truncated validation window forever.
+    const pendingIndex = this.priorityName === null ? -1 : repos.indexOf(this.priorityName);
+    const classifyStart = repos.length === 0
+      ? 0
+      : pendingIndex >= 0 ? pendingIndex : this.cursor % repos.length;
     const classifyOrder = [...repos.slice(classifyStart), ...repos.slice(0, classifyStart)];
     // Advances by ATTEMPTED resolutions (successes AND failures), so a
     // prefix of slow-failing origins also rotates away and can never pin
     // the cursor to the same index every pass.
     let attemptedResolutions = 0;
+    const unresolvedThisRefresh = new Set<string>();
     for (const name of classifyOrder) {
       const previous = this.states.get(name);
       const base = previous ?? emptySourceState();
-      const unreadable = (): void => {
+      const unreadable = (
+        skipProviderPoll = false,
+        detail: string | null = null,
+        failureKind = 'root validation failed',
+      ): void => {
+        if (skipProviderPoll) unresolvedThisRefresh.add(name);
         // A read failure (or the resolution budget) is not evidence the
         // remote changed: keep the previous classification and cached
-        // observation when one exists. A never-classified entry is still
-        // PUBLISHED with the explicit read-failure reason — every managed
-        // repo appears, and the row never claims a guessed identity.
+        // observation when one exists. Origin/root-resolution faults disclose
+        // an attempt/error and withhold polling until the identity is validated.
+        // A budget skip keeps its prior freshness untouched, but also
+        // withholds its cached identity from provider polling. A
+        // never-classified entry stays visible with an explicit read-failure
+        // reason — every managed repo appears without guessing identity.
         if (previous !== undefined) {
-          nextStates.set(name, previous);
+          if (detail === null) {
+            nextStates.set(name, previous);
+            return;
+          }
+          const failed = {
+            ...previous,
+            lastAttemptAt: new Date(this.now()).toISOString(),
+            error: (`${failureKind}: ${detail.trim() || 'probe failed without a message'}`).slice(0, 300),
+          };
+          if (previous.ref === null) failed.linkReason = ORIGIN_READ_FAILED_REASON;
+          nextStates.set(name, failed);
           return;
         }
         const row = emptySourceState();
         row.linkReason = ORIGIN_READ_FAILED_REASON;
+        if (detail !== null) {
+          row.lastAttemptAt = new Date(this.now()).toISOString();
+          row.error = (`${failureKind}: ${detail.trim() || 'probe failed without a message'}`).slice(0, 300);
+        }
         nextStates.set(name, row);
       };
-      if (this.now() > resolveDeadline) {
+      if (rootResolutionTimedOut || this.now() > resolveDeadline) {
         if (!resolveBudgetSpent) {
           this.log('warn', 'repo overview: origin-resolution budget spent — remaining repositories keep their prior state', {
             budgetMs: REPO_OVERVIEW_RESOLVE_BUDGET_MS,
@@ -885,20 +958,74 @@ export class ManagedRepoOverviewTracker {
           });
           resolveBudgetSpent = true;
         }
-        unreadable();
+        rootResolutionTimedOut = true;
+        unreadable(true);
         continue;
       }
+      let selectedPath: ManagedRepoPath;
+      try {
+        const pendingPath = await resolveBeforeDeadline(
+          () => this.resolveRepoPath(this.opts.workspaceRoot, name),
+          Math.max(0, resolveDeadline - this.now()),
+        );
+        if (pendingPath === ROOT_RESOLUTION_TIMEOUT || this.now() > resolveDeadline) {
+          attemptedResolutions += 1;
+          rootResolutionTimedOut = true;
+          resolveBudgetSpent = true;
+          const detail = 'root validation exceeded the origin-resolution budget';
+          this.log('warn', 'repo overview: root validation exceeded its deadline — retaining cached observation without provider polling', {
+            repo: name,
+            budgetMs: REPO_OVERVIEW_RESOLVE_BUDGET_MS,
+          });
+          unreadable(true, detail);
+          continue;
+        }
+        selectedPath = pendingPath;
+      } catch (error) {
+        attemptedResolutions += 1;
+        const detail = messageOf(error).slice(0, 300);
+        this.log('warn', 'repo overview: root validation failed — retaining cached observation without provider polling', {
+          repo: name,
+          error: detail,
+        });
+        unreadable(true, detail);
+        continue;
+      }
+      if (selectedPath.kind === 'error') {
+        attemptedResolutions += 1;
+        this.log('warn', 'repo overview: root validation failed — retaining cached observation without provider polling', {
+          repo: name,
+          error: selectedPath.error,
+        });
+        unreadable(true, selectedPath.error);
+        continue;
+      }
+      if (selectedPath.kind === 'unavailable') {
+        const unavailable = emptySourceState();
+        unavailable.linkReason = selectedPath.reason;
+        unavailable.lastAttemptAt = new Date(this.now()).toISOString();
+        nextStates.set(name, unavailable);
+        attemptedResolutions += 1;
+        continue;
+      }
+      if (seenProjectPaths.has(selectedPath.path)) {
+        duplicateNames.add(name);
+        attemptedResolutions += 1;
+        continue;
+      }
+      seenProjectPaths.add(selectedPath.path);
       let resolved: RepoRef | null;
       try {
-        resolved = await this.resolveRemote(join(this.opts.workspaceRoot, name));
+        resolved = await this.resolveRemote(selectedPath.path);
         attemptedResolutions += 1;
       } catch (error) {
         attemptedResolutions += 1;
+        const detail = messageOf(error).slice(0, 300);
         this.log('warn', 'repo overview: origin resolution failed — keeping the previous classification', {
           repo: name,
-          error: messageOf(error).slice(0, 300),
+          error: detail,
         });
-        unreadable();
+        unreadable(true, detail, 'origin resolution failed');
         continue;
       }
       const classification = classifyRemoteValue(resolved);
@@ -925,21 +1052,18 @@ export class ManagedRepoOverviewTracker {
         }
       }
     }
-    this.classifyCursor = repos.length === 0 ? 0 : (classifyStart + attemptedResolutions) % repos.length;
-    this.registry = repos.filter((name) => nextStates.has(name));
+    const classificationResumeIndex = repos.length === 0
+      ? 0
+      : (classifyStart + attemptedResolutions) % repos.length;
+    this.registry = repos.filter((name) => nextStates.has(name) && !duplicateNames.has(name));
     this.states.clear();
     for (const [name, state] of nextStates) this.states.set(name, state);
-    // Resume at the discarded repository when one is pending (and still
-    // linked); otherwise use the rotation cursor.
-    const priorityIndex = this.priorityName !== null ? repos.indexOf(this.priorityName) : -1;
-    const priorityLinked =
-      priorityIndex >= 0 && this.states.get(this.priorityName as string)?.ref != null;
-    const start =
-      repos.length === 0 ? 0 : priorityLinked ? priorityIndex : this.cursor % repos.length;
-    const order = [...repos.slice(start), ...repos.slice(0, start)];
+    // Classification and provider polling share the same start point; an
+    // incomplete observation stays the highest-priority validated row.
+    const order = [...repos.slice(classifyStart), ...repos.slice(0, classifyStart)];
     const fetchable = order.filter((name) => {
       const state = this.states.get(name);
-      return state !== undefined && state.ref !== null;
+      return state !== undefined && state.ref !== null && !unresolvedThisRefresh.has(name);
     });
     // Every registry row now has a classified identity (linked or an
     // explicit reason), so rows are renderable from here on — even if the
@@ -1014,7 +1138,9 @@ export class ManagedRepoOverviewTracker {
     } else {
       this.priorityName = null;
       const resumeName = fetchable[nextIndex] ?? null;
-      this.cursor = resumeName === null ? 0 : Math.max(0, repos.indexOf(resumeName));
+      this.cursor = resumeName === null
+        ? classificationResumeIndex
+        : Math.max(0, repos.indexOf(resumeName));
     }
     if (aborted === 'budget') {
       this.log('warn', 'repo overview refresh: call budget exhausted — remaining repositories defer', {

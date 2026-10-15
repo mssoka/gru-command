@@ -44,7 +44,9 @@ import {
 } from './provider-recovery/composition.js';
 import { claimProviderRecoveryContinuation } from './provider-recovery/resume.js';
 import { GhCliApi, GitHubSignalPoll, type LaneRemoteResolver } from './dispatch/github-poll.js';
-import { GhRepoOverviewApi, ManagedRepoOverviewTracker } from './repos/overview.js';
+import { GhRepoOverviewApi } from './repos/overview.js';
+import { createManagedRepoOverviewTracker } from './repos/runtime.js';
+import { createManagedRepoIntakeResolver } from './repos/managed-names.js';
 import { routeFixDirectiveToMinion } from './dispatch/fix-directive.js';
 import { reconcilePendingLegacyDirectives, reconcilePendingRebriefs } from './dispatch/rebrief-recovery.js';
 import { adoptBlockedLanes, observeFollowUpDelivery, observePhaseCompletion, reconcilePhaseHandoffs, reconcileUnmarkedHandbacks } from './dispatch/obligations.js';
@@ -443,8 +445,7 @@ async function main(): Promise<number> {
   // Own bounded cadence (never per-render, never per-tab), coalesced,
   // server-side through the existing gh auth seam; the snapshot carries
   // the cached view. Rows are absent (null) until the first pass runs.
-  const repoOverview = new ManagedRepoOverviewTracker({
-    workspaceRoot: config.workspaceRoot,
+  const repoOverview = createManagedRepoOverviewTracker(config, {
     api: new GhRepoOverviewApi(),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
@@ -1350,7 +1351,13 @@ async function main(): Promise<number> {
         },
       })
     : null;
-  const intake = new IntakeService({ dataDir: config.dataDir, workspaceRoot: config.workspaceRoot, uploadsDir });
+  const resolveIntakeRepos = createManagedRepoIntakeResolver(config.workspaceRoot, config.managedRepos);
+  const intake = new IntakeService({
+    dataDir: config.dataDir,
+    workspaceRoot: config.workspaceRoot,
+    managedRepos: resolveIntakeRepos,
+    uploadsDir,
+  });
   silasActionDigest = () =>
     computeSilasDigest({
       ledger,
