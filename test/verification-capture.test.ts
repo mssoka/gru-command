@@ -717,19 +717,48 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
       expect(existsSync(captureReceiptPath(sinkPath)), entry.label).toBe(false);
     }
     expect(fetchImpl).not.toHaveBeenCalled();
-    // Usage errors keep their usage exit: help, no command, flag-parse errors,
-    // unknown commands and a known command's missing required flags.
-    for (const argv of [['--help'], ['-h'], [], ['run', '--bogus'], ['frobnicate'], ['run'], ['status']]) {
+    // Usage errors keep their own usage exit and message: help, no command,
+    // flag-parse errors, unknown commands, missing flags and missing ops.
+    vi.stubEnv('GRU_OPS_URL', ''); vi.stubEnv('GRU_OPS_TOKEN', ''); vi.stubEnv('GRU_COMMAND_CONFIG', '');
+    const usageCases: readonly (readonly [readonly string[], RegExp])[] = [
+      [['--help'], /^usage:/u], [['-h'], /^usage:/u], [[], /^usage:/u],
+      [['run', '--bogus'], /--bogus requires a value/u], [['frobnicate'], /unknown command "frobnicate"/u],
+      [['run'], /--job is required/u], [['status'], /--request-id is required/u],
+      [[...BASE_ARGS, '--sink', join(dir, 'no-ops.ndjson')], /--url \(or GRU_OPS_URL\) is required/u],
+    ];
+    for (const [argv, message] of usageCases) {
       const usage: string[] = [];
       expect(await runCaptureCli(argv, { responseHeadersTimeoutMs: 0, fetchImpl: fetchImpl as never, stderr: (text: string) => usage.push(text) }), argv.join(' ')).toBe(CAPTURE_EXIT.usage);
-      expect(usage.join(''), argv.join(' ')).toMatch(/usage:|required|unknown command/u);
+      expect(usage.join(''), argv.join(' ')).toMatch(message);
     }
+    vi.unstubAllEnvs();
+    // Owner refusals come first too; the stale-owner removal (the first side
+    // effect) comes only after the bound check, so a bad bound removes nothing.
+    const malformedSink = join(dir, 'malformed.ndjson');
+    writeFileSync(captureOwnerPath(malformedSink), 'not an owner record');
+    const refusal: string[] = [];
+    expect(await runCaptureCli([...BASE_ARGS, '--sink', malformedSink, '--request-id', 'req-bad-5', '--url', 'http://127.0.0.1:9', '--token', 't'],
+      { ...deps(), responseHeadersTimeoutMs: 0, stderr: (text: string) => refusal.push(text) })).toBe(CAPTURE_EXIT.usage);
+    expect(refusal.join('')).toMatch(/is malformed/u);
+    const staleSink = join(dir, 'stale.ndjson');
+    writeCaptureOwner(captureOwnerPath(staleSink), ownerRecord(staleSink));
+    await expect(runCaptureCli([...BASE_ARGS, '--sink', staleSink, '--request-id', 'req-bad-6', '--url', 'http://127.0.0.1:9', '--token', 't'],
+      { ...deps({ probe: () => ({ alive: false, startTime: null, cwd: null, command: null }) }), responseHeadersTimeoutMs: 0 })).rejects.toThrow(named);
+    expect(existsSync(captureOwnerPath(staleSink))).toBe(true);
+    expect(existsSync(staleSink)).toBe(false);
     expect(fetchImpl).not.toHaveBeenCalled();
+    // The valid edges are accepted at the CLI: the injected transport is used.
+    for (const bound of [1, 2_147_483_647]) {
+      const edgeFetch = vi.fn(async (): Promise<Response> => { throw new Error('fixture transport unreachable'); });
+      expect(await runCaptureCli(['status', '--request-id', 'req-edge', '--url', 'http://127.0.0.1:9', '--token', 't'],
+        { responseHeadersTimeoutMs: bound, fetchImpl: edgeFetch, stdout: () => {}, stderr: () => {} }), String(bound)).toBe(CAPTURE_EXIT.unknown);
+      expect(edgeFetch, String(bound)).toHaveBeenCalledTimes(1);
+    }
     // withdraw makes no request: a bad bound never blocks owner recovery.
     const withdraw: string[] = [];
-    const ownerPath = join(dir, 'absent.owner.json');
-    await expect(runCaptureCli(['withdraw', '--owner', ownerPath], { responseHeadersTimeoutMs: 0, stdout: (text: string) => withdraw.push(text), stderr: (text: string) => withdraw.push(text) }))
-      .resolves.not.toBe(undefined);
+    expect(await runCaptureCli(['withdraw', '--owner', join(dir, 'absent.owner.json')],
+      { responseHeadersTimeoutMs: 0, stdout: (text: string) => withdraw.push(text), stderr: (text: string) => withdraw.push(text) })).toBe(CAPTURE_EXIT.usage);
+    expect(withdraw.join('')).toMatch(/withdrawal refused: no owner record at this path/u);
     expect(withdraw.join('')).not.toMatch(named);
   });
 

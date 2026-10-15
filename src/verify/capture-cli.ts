@@ -249,12 +249,14 @@ export function nodeStreamFetch(input: string, init?: RequestInit, options: Node
   });
 }
 
-/** The transport of every command that talks to the verify service. A
- * headers bound that cannot time correctly is a programming error in the
- * caller's deps: it fails loud here — after the command's own usage checks,
- * before any sink, request or receipt exists, whatever transport is injected
- * — and never surfaces as an UNKNOWN receipt mid-run (#389). Commands that
- * make no request (withdraw) never consult it. */
+/** The transport of every command that talks to the verify service (run,
+ * status). A headers bound that cannot time correctly is a programming error
+ * in the caller's deps: it fails loud here — after the command's flag and
+ * owner usage refusals, before its first side effect (stale-owner removal,
+ * sink, request or receipt) — and never surfaces as an UNKNOWN receipt
+ * mid-run (#389). An injected `fetchImpl` is used as-is: the bound is still
+ * validated, but only the default transport applies it. Commands that make
+ * no request (withdraw) never consult it. */
 function transportFor(deps: CaptureCliDeps): FetchLike {
   if (deps.responseHeadersTimeoutMs !== undefined) checkResponseHeadersTimeoutMs(deps.responseHeadersTimeoutMs);
   return deps.fetchImpl ?? ((input, init) => nodeStreamFetch(input, init, { responseHeadersTimeoutMs: deps.responseHeadersTimeoutMs }));
@@ -463,7 +465,6 @@ async function commandRun(
   const expectedHead = flags.get('expected-head') ?? null;
   const { baseUrl, token } = resolveOps(flags);
   const probe = deps.probe ?? systemProcessProbe;
-  const fetchImpl = transportFor(deps);
   const now = deps.now ?? Date.now;
   const ownerPath = captureOwnerPath(sinkPath);
 
@@ -485,8 +486,10 @@ async function commandRun(
       );
       return CAPTURE_EXIT.usage;
     }
-    removeCaptureOwner(ownerPath); // stale claim: the owner is gone
   }
+  // After every usage refusal above, before this command's first side effect.
+  const fetchImpl = transportFor(deps);
+  if (ownerRead.kind === 'owner') removeCaptureOwner(ownerPath); // stale claim: the owner is gone
 
   // Exclusive sink BEFORE the POST (a second capture for the same path is
   // a typed refusal, never a truncating interleave).
