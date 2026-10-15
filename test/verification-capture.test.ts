@@ -702,6 +702,7 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
       { label: 'run/default transport', argv: (sink: string) => [...BASE_ARGS, '--sink', sink, '--request-id', 'req-bad-1', '--url', 'http://127.0.0.1:9', '--token', 't'], extra: { responseHeadersTimeoutMs: 0 } },
       { label: 'run/injected transport', argv: (sink: string) => [...BASE_ARGS, '--sink', sink, '--request-id', 'req-bad-2', '--url', 'http://127.0.0.1:9', '--token', 't'], extra: { fetchImpl: fetchImpl as never, responseHeadersTimeoutMs: 0.5 } },
       { label: 'status', argv: () => ['status', '--request-id', 'req-bad-3', '--url', 'http://127.0.0.1:9', '--token', 't'], extra: { fetchImpl: fetchImpl as never, responseHeadersTimeoutMs: 0 } },
+      { label: 'withdraw', argv: (sink: string) => ['withdraw', '--owner', `${sink}.owner.json`], extra: { responseHeadersTimeoutMs: Number.NaN } },
     ] as const;
     for (const [index, entry] of cases.entries()) {
       const sinkPath = join(dir, `bad-bound-${String(index)}.ndjson`);
@@ -713,9 +714,12 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
       expect(existsSync(captureReceiptPath(sinkPath)), entry.label).toBe(false);
     }
     expect(fetchImpl).not.toHaveBeenCalled();
-    const help: string[] = [];
-    expect(await runCaptureCli(['--help'], { responseHeadersTimeoutMs: 0, stderr: (text: string) => help.push(text) })).toBe(CAPTURE_EXIT.usage);
-    expect(help.join('')).not.toBe('');
+    // Help, no command, flag-parse errors and unknown commands keep their usage exit.
+    for (const argv of [['--help'], ['-h'], [], ['run', '--bogus'], ['frobnicate']]) {
+      const help: string[] = [];
+      expect(await runCaptureCli(argv, { responseHeadersTimeoutMs: 0, stderr: (text: string) => help.push(text) }), argv.join(' ')).toBe(CAPTURE_EXIT.usage);
+      expect(help.join(''), argv.join(' ')).not.toBe('');
+    }
   });
 
   it('the headers bound ends at the response: a body quiet for longer than it still streams to EOF (#389)', async () => {

@@ -715,11 +715,13 @@ export async function runCaptureCli(argv: readonly string[], deps: CaptureCliDep
     return CAPTURE_EXIT.usage;
   }
   // A headers bound that cannot time correctly is a programming error in
-  // the caller's deps: it fails loud here, before any command runs and
-  // whatever transport is injected — no sink, request or receipt exists, and
-  // it never surfaces as an UNKNOWN receipt mid-run (#389). Help and usage
-  // errors above stay reachable.
-  if (deps.responseHeadersTimeoutMs !== undefined) checkResponseHeadersTimeoutMs(deps.responseHeadersTimeoutMs);
+  // the caller's deps: it fails loud before any known command runs, whatever
+  // transport is injected — no sink, request or receipt exists, and it never
+  // surfaces as an UNKNOWN receipt mid-run (#389). Help, flag-parse and
+  // unknown-command usage exits stay reachable.
+  if (deps.responseHeadersTimeoutMs !== undefined && (command === 'run' || command === 'status' || command === 'withdraw')) {
+    checkResponseHeadersTimeoutMs(deps.responseHeadersTimeoutMs);
+  }
   try {
     switch (command) {
       case 'run':
