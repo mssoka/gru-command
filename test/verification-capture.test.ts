@@ -720,26 +720,41 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
     // Usage errors keep their own usage exit and message: help, no command,
     // flag-parse errors, unknown commands, missing flags and missing ops.
     vi.stubEnv('GRU_OPS_URL', ''); vi.stubEnv('GRU_OPS_TOKEN', ''); vi.stubEnv('GRU_COMMAND_CONFIG', '');
-    const usageCases: readonly (readonly [readonly string[], RegExp])[] = [
-      [['--help'], /^usage:/u], [['-h'], /^usage:/u], [[], /^usage:/u],
-      [['run', '--bogus'], /--bogus requires a value/u], [['frobnicate'], /unknown command "frobnicate"/u],
-      [['run'], /--job is required/u], [['status'], /--request-id is required/u],
-      [[...BASE_ARGS, '--sink', join(dir, 'no-ops.ndjson')], /--url \(or GRU_OPS_URL\) is required/u],
-    ];
-    for (const [argv, message] of usageCases) {
-      const usage: string[] = [];
-      expect(await runCaptureCli(argv, { responseHeadersTimeoutMs: 0, fetchImpl: fetchImpl as never, stderr: (text: string) => usage.push(text) }), argv.join(' ')).toBe(CAPTURE_EXIT.usage);
-      expect(usage.join(''), argv.join(' ')).toMatch(message);
+    try {
+      const usageCases: readonly (readonly [readonly string[], RegExp])[] = [
+        [['--help'], /^usage:/u], [['-h'], /^usage:/u], [[], /^usage:/u],
+        [['run', '--bogus'], /--bogus requires a value/u], [['frobnicate'], /unknown command "frobnicate"/u],
+        [['run'], /--job is required/u], [['status'], /--request-id is required/u],
+        [[...BASE_ARGS, '--sink', join(dir, 'no-ops.ndjson')], /--url \(or GRU_OPS_URL\) is required/u],
+        [['status', '--request-id', 'req-no-ops'], /--url \(or GRU_OPS_URL\) is required/u],
+      ];
+      for (const [argv, message] of usageCases) {
+        const usage: string[] = [];
+        expect(await runCaptureCli(argv, { responseHeadersTimeoutMs: 0, fetchImpl: fetchImpl as never, stderr: (text: string) => usage.push(text) }), argv.join(' ')).toBe(CAPTURE_EXIT.usage);
+        expect(usage.join(''), argv.join(' ')).toMatch(message);
+      }
+    } finally {
+      vi.unstubAllEnvs();
     }
-    vi.unstubAllEnvs();
     // Owner refusals come first too; the stale-owner removal (the first side
     // effect) comes only after the bound check, so a bad bound removes nothing.
     const malformedSink = join(dir, 'malformed.ndjson');
     writeFileSync(captureOwnerPath(malformedSink), 'not an owner record');
     const refusal: string[] = [];
     expect(await runCaptureCli([...BASE_ARGS, '--sink', malformedSink, '--request-id', 'req-bad-5', '--url', 'http://127.0.0.1:9', '--token', 't'],
-      { ...deps(), responseHeadersTimeoutMs: 0, stderr: (text: string) => refusal.push(text) })).toBe(CAPTURE_EXIT.usage);
+      { ...deps(), fetchImpl: fetchImpl as never, responseHeadersTimeoutMs: 0, stderr: (text: string) => refusal.push(text) })).toBe(CAPTURE_EXIT.usage);
     expect(refusal.join('')).toMatch(/is malformed/u);
+    expect(readFileSync(captureOwnerPath(malformedSink), 'utf-8')).toBe('not an owner record');
+    expect(existsSync(malformedSink)).toBe(false);
+    const liveSink = join(dir, 'live.ndjson');
+    writeCaptureOwner(captureOwnerPath(liveSink), ownerRecord(liveSink));
+    const liveOwner = readFileSync(captureOwnerPath(liveSink), 'utf-8');
+    const liveRefusal: string[] = [];
+    expect(await runCaptureCli([...BASE_ARGS, '--sink', liveSink, '--request-id', 'req-bad-7', '--url', 'http://127.0.0.1:9', '--token', 't'],
+      { ...deps(), fetchImpl: fetchImpl as never, responseHeadersTimeoutMs: 0, stderr: (text: string) => liveRefusal.push(text) })).toBe(CAPTURE_EXIT.usage);
+    expect(liveRefusal.join('')).toMatch(/owned by live helper/u);
+    expect(readFileSync(captureOwnerPath(liveSink), 'utf-8')).toBe(liveOwner);
+    expect(existsSync(liveSink)).toBe(false);
     const staleSink = join(dir, 'stale.ndjson');
     writeCaptureOwner(captureOwnerPath(staleSink), ownerRecord(staleSink));
     await expect(runCaptureCli([...BASE_ARGS, '--sink', staleSink, '--request-id', 'req-bad-6', '--url', 'http://127.0.0.1:9', '--token', 't'],

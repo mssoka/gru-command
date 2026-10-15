@@ -476,6 +476,7 @@ async function commandRun(
     stderr(`capture: ${ownerPath} is malformed (${ownerRead.detail}) — withdraw it explicitly first\n`);
     return CAPTURE_EXIT.usage;
   }
+  const staleOwner = ownerRead.kind === 'owner';
   if (ownerRead.kind === 'owner') {
     const live = probe(ownerRead.record.pid);
     if (live.alive) {
@@ -489,7 +490,7 @@ async function commandRun(
   }
   // After every usage refusal above, before this command's first side effect.
   const fetchImpl = transportFor(deps);
-  if (ownerRead.kind === 'owner') removeCaptureOwner(ownerPath); // stale claim: the owner is gone
+  if (staleOwner) removeCaptureOwner(ownerPath); // stale claim: the owner is gone
 
   // Exclusive sink BEFORE the POST (a second capture for the same path is
   // a typed refusal, never a truncating interleave).
