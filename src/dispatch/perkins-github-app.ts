@@ -619,8 +619,16 @@ function isMatchingAppReviewWithUnverifiableTime(review: ProviderReview, botLogi
  * keeps its documented three-way shape (string when serialized, null or
  * absent otherwise): an unprovable time on OUR publication is held by the
  * recency rules on its own, and an unrelated review's absent time is not a
- * delivery predicate. */
-function isDecidableReviewEntry(entry: unknown, windowed: boolean): entry is ProviderReview {
+ * delivery predicate.
+ *
+ * An explicit provider `null` in state/commit_id/body is a typed non-value
+ * (GitHub nulls a review's commit_id once its commit is garbage-collected):
+ * it can never satisfy a delivery predicate, so on a review provably NOT
+ * authored by our App bot it is a decidable non-match and an unrelated
+ * review cannot hold the walk unresolved forever (#390, main's #182 rule).
+ * On a review whose login is our bot's it may be this publication with a
+ * nulled field, so it stays undecidable. */
+function isDecidableReviewEntry(entry: unknown, windowed: boolean, botLogin: string): entry is ProviderReview {
   if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return false;
   const record = entry as Record<string, unknown>;
   const id = record['id'];
@@ -642,8 +650,12 @@ function isDecidableReviewEntry(entry: unknown, windowed: boolean): entry is Pro
       if (typeof author[field] !== 'string') return false;
     }
   }
+  const mayBeOurs = user !== null && (user as Record<string, unknown>)['login'] === botLogin;
   for (const field of ['state', 'commit_id', 'body'] as const) {
-    if (typeof record[field] !== 'string') return false;
+    const value = record[field];
+    if (typeof value === 'string') continue;
+    if (value === null && !mayBeOurs) continue;
+    return false;
   }
   // submitted_at is a delivery predicate only under a recency bound (the
   // ambiguous-POST window); the unbounded recovery seam never reads it.
@@ -1419,7 +1431,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       // the predicates re-check every field they read.
       const records = list.filter((entry): entry is ProviderReview => entry !== null && typeof entry === 'object' && !Array.isArray(entry));
       const match = records.find((review) => isMatchingAppReview(review, botLogin, targetSha, body, wantedState, notBeforeMs));
-      if (match === undefined && list.some((entry) => !isDecidableReviewEntry(entry, notBeforeMs !== null))) {
+      if (match === undefined && list.some((entry) => !isDecidableReviewEntry(entry, notBeforeMs !== null, botLogin))) {
         // No provable match, and a null, primitive, array-valued or
         // otherwise undecidable entry is a broken list, not absence: a
         // lookup we cannot trust must never become a certificate.

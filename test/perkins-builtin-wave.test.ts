@@ -6,8 +6,10 @@ import { performance } from 'node:perf_hooks';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
-import { AssertionError as ChaiAssertionError } from 'chai';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, chai, describe, expect, it, vi } from 'vitest';
+
+/** Vitest's bundled chai: no separate chai devDependency (#391). */
+const ChaiAssertionError = chai.AssertionError;
 import {
   AutoVerdictPoster,
   DefiniteNonDeliveryError,

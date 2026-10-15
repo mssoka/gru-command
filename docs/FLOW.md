@@ -379,7 +379,12 @@ verification budget.
   not hold across the whole stream is `unknown` and is never promoted to
   success; a replayed terminal receipt is marked `reconciled` and is an
   honest failure (the outcome is known, the original full capture is not
-  reconstructable, and a rerun to recover logs is refused). Owned helpers are withdrawn only with identity validation
+  reconstructable, and a rerun to recover logs is refused). Connecting
+  and receiving the response headers are bounded (60 s, #389): a
+  service that is unreachable or never answers yields an `unknown`
+  receipt whose error names the timeout (`ERESPONSETIMEOUT`) instead of
+  a hung helper; the body itself has no idle timeout, so a long quiet run
+  is never cut off. Owned helpers are withdrawn only with identity validation
   (pid + start time + command/cwd); malformed pid records, crashes and
   stale owners are cleared without touching unrelated processes, and
   sinks/receipts are preserved.

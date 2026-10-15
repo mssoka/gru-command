@@ -64,6 +64,16 @@ export type CaptureExitCode = (typeof CAPTURE_EXIT)[keyof typeof CAPTURE_EXIT];
 
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
+/** Connect + response-headers bound for the capture transport (#389). */
+export const CAPTURE_RESPONSE_HEADERS_TIMEOUT_MS = 60_000;
+/** The errno-style code a response-headers timeout carries into the receipt. */
+export const CAPTURE_RESPONSE_TIMEOUT_CODE = 'ERESPONSETIMEOUT';
+
+export interface NodeStreamFetchOptions {
+  /** Test seam; production uses CAPTURE_RESPONSE_HEADERS_TIMEOUT_MS. */
+  readonly responseHeadersTimeoutMs?: number;
+}
+
 /**
  * The production streaming transport. Deliberately NOT global fetch:
  * undici's default 5-minute body inactivity timeout can abort a verify
@@ -74,8 +84,15 @@ type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
  * — and real socket errors reach the receipt with their errno/cause.
  * The surface matches the FetchLike seam the tests inject: `ok`,
  * `status`, `body` (a byte stream) and `text()`.
+ *
+ * Connecting and receiving the response HEADERS are bounded (#389): the
+ * verify service writes its 200 before any queue wait, so this bound only
+ * ends a service that is unreachable or accepted the connection and never
+ * answered — a named transport error in the receipt instead of a hang. The
+ * body stays unbounded: a long quiet run is never cut off.
  */
-export function nodeStreamFetch(input: string, init?: RequestInit): Promise<Response> {
+export function nodeStreamFetch(input: string, init?: RequestInit, options: NodeStreamFetchOptions = {}): Promise<Response> {
+  const responseHeadersTimeoutMs = options.responseHeadersTimeoutMs ?? CAPTURE_RESPONSE_HEADERS_TIMEOUT_MS;
   return new Promise((resolve, reject) => {
     const url = new URL(input);
     const requestFn = url.protocol === 'https:' ? httpsRequest : httpRequest;
@@ -105,7 +122,14 @@ export function nodeStreamFetch(input: string, init?: RequestInit): Promise<Resp
       reject(new Error('nodeStreamFetch supports only string or Buffer request bodies'));
       return;
     }
-    const request = requestFn(url, { method: init?.method ?? 'GET', headers }, (response) => {
+    const method = init?.method ?? 'GET';
+    let headersTimer: ReturnType<typeof setTimeout> | null = null;
+    const clearHeadersTimer = (): void => {
+      if (headersTimer !== null) clearTimeout(headersTimer);
+      headersTimer = null;
+    };
+    const request = requestFn(url, { method, headers }, (response) => {
+      clearHeadersTimer();
       let cachedBody: ReadableStream<Uint8Array> | null = null;
       let bodyAccessed = false;
       let consumedByText = false;
@@ -173,7 +197,20 @@ export function nodeStreamFetch(input: string, init?: RequestInit): Promise<Resp
       };
       resolve(result as unknown as Response);
     });
-    request.on('error', (error: Error) => reject(error));
+    request.on('error', (error: Error) => {
+      clearHeadersTimer();
+      reject(error);
+    });
+    headersTimer = setTimeout(() => {
+      headersTimer = null;
+      request.destroy(Object.assign(
+        new Error(
+          `${method} ${url.origin}${url.pathname}: no response within ${String(responseHeadersTimeoutMs)} ms ` +
+            '(connect + response headers) — the service is unreachable or hung',
+        ),
+        { code: CAPTURE_RESPONSE_TIMEOUT_CODE },
+      ));
+    }, responseHeadersTimeoutMs);
     const signal = init?.signal;
     if (signal !== undefined && signal !== null) {
       if (signal.aborted) {
@@ -185,6 +222,11 @@ export function nodeStreamFetch(input: string, init?: RequestInit): Promise<Resp
     if (bodyText !== null) request.write(bodyText);
     request.end();
   });
+}
+
+/** The production transport, with the deps' headers bound when given. */
+function defaultTransport(deps: CaptureCliDeps): FetchLike {
+  return (input, init) => nodeStreamFetch(input, init, { responseHeadersTimeoutMs: deps.responseHeadersTimeoutMs });
 }
 
 /** Transport errors keep the primary message and add the underlying code
@@ -208,6 +250,8 @@ export function describeTransportError(error: unknown): string {
 
 export interface CaptureCliDeps {
   readonly fetchImpl?: FetchLike;
+  /** Test seam for the default transport's connect + headers bound. */
+  readonly responseHeadersTimeoutMs?: number;
   readonly now?: () => number;
   readonly probe?: (pid: number) => ProcessProbe;
   readonly signal?: (pid: number, signal: NodeJS.Signals) => void;
@@ -388,7 +432,7 @@ async function commandRun(
   const expectedHead = flags.get('expected-head') ?? null;
   const { baseUrl, token } = resolveOps(flags);
   const probe = deps.probe ?? systemProcessProbe;
-  const fetchImpl: FetchLike = deps.fetchImpl ?? nodeStreamFetch;
+  const fetchImpl: FetchLike = deps.fetchImpl ?? defaultTransport(deps);
   const now = deps.now ?? Date.now;
   const ownerPath = captureOwnerPath(sinkPath);
 
@@ -571,7 +615,7 @@ async function commandStatus(
 ): Promise<CaptureExitCode> {
   const requestId = required(flags, 'request-id');
   const { baseUrl, token } = resolveOps(flags);
-  const fetchImpl: FetchLike = deps.fetchImpl ?? nodeStreamFetch;
+  const fetchImpl: FetchLike = deps.fetchImpl ?? defaultTransport(deps);
   let response: Response;
   try {
     response = await fetchImpl(

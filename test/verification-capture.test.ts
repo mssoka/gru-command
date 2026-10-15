@@ -25,6 +25,8 @@ import {
 } from '../src/verify/capture.js';
 import {
   CAPTURE_EXIT,
+  CAPTURE_RESPONSE_HEADERS_TIMEOUT_MS,
+  CAPTURE_RESPONSE_TIMEOUT_CODE,
   describeTransportError,
   nodeStreamFetch,
   parsePsOutput,
@@ -633,6 +635,65 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
       expect(answers.join('')).toContain('running');
     } finally {
       vi.unstubAllGlobals();
+      server.closeAllConnections();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    }
+  });
+
+  it('bounds connect + response headers: a service that never answers is a named transport error, never a hang (#389)', async () => {
+    expect(CAPTURE_RESPONSE_HEADERS_TIMEOUT_MS).toBe(60_000);
+    const hung = createServer(() => {
+      // Accepts the connection and never answers.
+    });
+    await new Promise<void>((resolveListen) => hung.listen(0, '127.0.0.1', resolveListen));
+    try {
+      const base = `http://127.0.0.1:${String((hung.address() as AddressInfo).port)}`;
+      const started = Date.now();
+      const error = await nodeStreamFetch(`${base}/api/verify`, { method: 'POST', body: '{}' }, { responseHeadersTimeoutMs: 150 })
+        .then(() => null, (cause: unknown) => cause as NodeJS.ErrnoException);
+      expect(error?.message).toMatch(/POST http:\/\/127\.0\.0\.1:\d+\/api\/verify: no response within 150 ms \(connect \+ response headers\)/u);
+      expect(error?.code).toBe(CAPTURE_RESPONSE_TIMEOUT_CODE);
+      expect(Date.now() - started).toBeLessThan(5_000);
+
+      // The capture command records it in the receipt as UNKNOWN — never a hang.
+      const dir = tempDir();
+      const sinkPath = join(dir, 'hung.ndjson');
+      const code = await runCaptureCli(
+        [...BASE_ARGS, '--sink', sinkPath, '--request-id', 'req-cli-hung', '--url', base, '--token', 't'],
+        deps({ stdout: () => {}, responseHeadersTimeoutMs: 150 }),
+      );
+      expect(code).toBe(CAPTURE_EXIT.unknown);
+      const receipt = JSON.parse(readFileSync(captureReceiptPath(sinkPath), 'utf-8')) as CaptureReceipt;
+      expect(receipt.outcome).toBe('unknown');
+      expect(receipt.error).toContain('no response within 150 ms');
+      expect(receipt.error).toContain(CAPTURE_RESPONSE_TIMEOUT_CODE);
+
+      // `status` uses the same bounded transport.
+      const errors: string[] = [];
+      const status = await runCaptureCli(
+        ['status', '--request-id', 'req-cli-hung', '--url', base, '--token', 't'],
+        { responseHeadersTimeoutMs: 150, stdout: () => {}, stderr: (text: string) => errors.push(text) },
+      );
+      expect(status).toBe(CAPTURE_EXIT.unknown);
+      expect(errors.join('')).toContain('no response within 150 ms');
+    } finally {
+      hung.closeAllConnections();
+      await new Promise<void>((resolveClose) => hung.close(() => resolveClose()));
+    }
+  });
+
+  it('the headers bound ends at the response: a body quiet for longer than it still streams to EOF (#389)', async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+      res.write('first\n');
+      setTimeout(() => res.end('second\n'), 400);
+    });
+    await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const response = await nodeStreamFetch(`http://127.0.0.1:${String(port)}/quiet`, undefined, { responseHeadersTimeoutMs: 100 });
+      expect(await response.text()).toBe('first\nsecond\n');
+    } finally {
       server.closeAllConnections();
       await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
     }

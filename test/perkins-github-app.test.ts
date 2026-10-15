@@ -3,8 +3,10 @@ import { createHash, createVerify, generateKeyPairSync } from 'node:crypto';
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { AssertionError as ChaiAssertionError } from 'chai';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, chai, describe, expect, it, vi } from 'vitest';
+
+/** Vitest's bundled chai: no separate chai devDependency (#391). */
+const ChaiAssertionError = chai.AssertionError;
 import {
   createGithubVerdictPoster,
   createStartupVerdictPoster,
@@ -1619,6 +1621,51 @@ describe('bounded ambiguous-POST reconciliation', () => {
         await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }), omitted).rejects.toThrow(PerkinsAppError);
       }
       expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews')), omitted).toHaveLength(1);
+    }
+  });
+
+  it('certifies absence past an unrelated review whose predicate field is an explicit provider null (#390)', async () => {
+    // GitHub nulls commit_id once a review's commit is garbage-collected: a
+    // human's review on an old, force-pushed head must not hold every later
+    // walk unresolved. A typed null can never match a delivery predicate.
+    for (const author of [{ login: 'other-user', type: 'User' }, null] as const) {
+      for (const nulled of ['state', 'commit_id', 'body'] as const) {
+        const label = `${author === null ? 'ghost' : author.login}:${nulled}`;
+        const foreign = {
+          id: 3133,
+          user: author,
+          commit_id: HEAD,
+          state: 'COMMENTED',
+          body: 'someone else\n',
+          submitted_at: new Date(NOW + 60_000).toISOString(),
+          [nulled]: null,
+        };
+        const fixture = bundleFixture();
+        const { poster, calls } = posterWith(fixture, [
+          { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+          { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [foreign] }) },
+        ]);
+        await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }), label).rejects.toThrow(/did not land/u);
+        await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }), label).resolves.toBeNull();
+        expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews')), label).toHaveLength(1);
+      }
+    }
+  });
+
+  it('keeps an explicit null on a review by our own App bot login undecidable — never absence, no second POST (#390)', async () => {
+    for (const nulled of ['state', 'commit_id', 'body'] as const) {
+      // It may be this round's publication with a nulled field.
+      const ours = { ...MATCHING_REVIEW, id: 3134, [nulled]: null };
+      const fixture = bundleFixture();
+      const { poster, calls } = posterWith(fixture, [
+        { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+        { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [ours] }) },
+      ]);
+      const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
+      expect(error?.message ?? '', nulled).toMatch(/delivery stays unproven/u);
+      expect(error?.message ?? '', nulled).not.toMatch(/did not land/u);
+      await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }), nulled).rejects.toThrow(/malformed list body/u);
+      expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews')), nulled).toHaveLength(1);
     }
   });
 
