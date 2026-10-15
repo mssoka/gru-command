@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { createServer } from 'node:http';
+import { createServer, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -683,23 +683,40 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
     }
   });
 
-  it('refuses a non-positive or non-finite headers bound by name instead of failing every request (#389)', () => {
-    for (const bound of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
-      expect(() => nodeStreamFetch('http://127.0.0.1:9/x', undefined, { responseHeadersTimeoutMs: bound }), String(bound))
-        .toThrow(/responseHeadersTimeoutMs must be a positive finite number/u);
+  it('refuses a headers bound that cannot time correctly by name — a rejection, and before any run starts (#389)', async () => {
+    for (const bound of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 2 ** 31]) {
+      // A Promise-returning transport rejects; it never throws synchronously.
+      const pending = nodeStreamFetch('http://127.0.0.1:9/x', undefined, { responseHeadersTimeoutMs: bound });
+      await expect(pending, String(bound)).rejects.toThrow(/responseHeadersTimeoutMs must be a positive number of milliseconds no greater than 2147483647/u);
     }
+    // The CLI refuses it at the boundary: no sink, no receipt, no request.
+    const dir = tempDir();
+    const sinkPath = join(dir, 'bad-bound.ndjson');
+    await expect(runCaptureCli(
+      [...BASE_ARGS, '--sink', sinkPath, '--request-id', 'req-bad-bound', '--url', 'http://127.0.0.1:9', '--token', 't'],
+      deps({ stdout: () => {}, responseHeadersTimeoutMs: 0 }),
+    )).rejects.toThrow(RangeError);
+    expect(existsSync(sinkPath)).toBe(false);
+    expect(existsSync(captureReceiptPath(sinkPath))).toBe(false);
   });
 
   it('the headers bound ends at the response: a body quiet for longer than it still streams to EOF (#389)', async () => {
+    const bound = 200;
+    let held: ServerResponse | null = null;
     const server = createServer((_req, res) => {
       res.writeHead(200, { 'content-type': 'application/x-ndjson' });
       res.write('first\n');
-      setTimeout(() => res.end('second\n'), 1_500);
+      held = res;
     });
     await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
     try {
       const port = (server.address() as AddressInfo).port;
-      const response = await nodeStreamFetch(`http://127.0.0.1:${String(port)}/quiet`, undefined, { responseHeadersTimeoutMs: 750 });
+      const response = await nodeStreamFetch(`http://127.0.0.1:${String(port)}/quiet`, undefined, { responseHeadersTimeoutMs: bound });
+      // The body stays quiet past the bound by construction: it is released
+      // only after the bound has elapsed SINCE the headers arrived.
+      await new Promise((resolveWait) => setTimeout(resolveWait, bound * 3));
+      expect(held).not.toBeNull();
+      held!.end('second\n');
       expect(await response.text()).toBe('first\nsecond\n');
     } finally {
       server.closeAllConnections();

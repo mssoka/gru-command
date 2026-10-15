@@ -69,6 +69,21 @@ export const CAPTURE_RESPONSE_HEADERS_TIMEOUT_MS = 60_000;
 /** The errno-style code a response-headers timeout carries into the receipt. */
 export const CAPTURE_RESPONSE_TIMEOUT_CODE = 'ERESPONSETIMEOUT';
 
+/** Node's setTimeout ceiling: a larger delay overflows and fires at once. */
+const MAX_TIMER_MS = 2_147_483_647;
+
+/** A headers bound that cannot time correctly is refused by name (#389):
+ * zero/negative/NaN/infinite or past the timer ceiling would fire at once
+ * and fail every request with a misleading timeout. */
+export function checkResponseHeadersTimeoutMs(ms: number): number {
+  if (!Number.isFinite(ms) || ms <= 0 || ms > MAX_TIMER_MS) {
+    throw new RangeError(
+      `responseHeadersTimeoutMs must be a positive number of milliseconds no greater than ${String(MAX_TIMER_MS)} (got ${String(ms)})`,
+    );
+  }
+  return ms;
+}
+
 export interface NodeStreamFetchOptions {
   /** Test seam; production uses CAPTURE_RESPONSE_HEADERS_TIMEOUT_MS. */
   readonly responseHeadersTimeoutMs?: number;
@@ -87,17 +102,18 @@ export interface NodeStreamFetchOptions {
  *
  * Connecting and receiving the response HEADERS are bounded (#389): the
  * verify service writes its 200 before any queue wait, so this bound only
- * ends a service that is silently unreachable (a refused connection fails
- * at once with ECONNREFUSED) or accepted the connection and never answered
- * — a named transport error in an UNKNOWN receipt instead of a hang. The
+ * ends a service that never completes the connection (a refused connection
+ * fails at once with ECONNREFUSED) or accepted it and never answered — a
+ * named transport error in an UNKNOWN receipt instead of a hang. The
  * body stays unbounded: a long quiet run is never cut off.
  */
 export function nodeStreamFetch(input: string, init?: RequestInit, options: NodeStreamFetchOptions = {}): Promise<Response> {
-  const responseHeadersTimeoutMs = options.responseHeadersTimeoutMs ?? CAPTURE_RESPONSE_HEADERS_TIMEOUT_MS;
-  if (!Number.isFinite(responseHeadersTimeoutMs) || responseHeadersTimeoutMs <= 0) {
-    // A zero/negative/NaN bound would fire at once and fail every request
-    // with a misleading timeout; refuse the misconfiguration by name.
-    throw new RangeError(`responseHeadersTimeoutMs must be a positive finite number of milliseconds (got ${String(responseHeadersTimeoutMs)})`);
+  let responseHeadersTimeoutMs: number;
+  try {
+    responseHeadersTimeoutMs = checkResponseHeadersTimeoutMs(options.responseHeadersTimeoutMs ?? CAPTURE_RESPONSE_HEADERS_TIMEOUT_MS);
+  } catch (error) {
+    // A Promise-returning transport fails by rejection, never a sync throw.
+    return Promise.reject(error as Error);
   }
   return new Promise((resolve, reject) => {
     const url = new URL(input);
@@ -212,8 +228,8 @@ export function nodeStreamFetch(input: string, init?: RequestInit, options: Node
       request.destroy(Object.assign(
         new Error(
           `${method} ${url.origin}${url.pathname}: no response within ${String(responseHeadersTimeoutMs)} ms ` +
-            '(connect + response headers) — the service is silently unreachable or hung; a sent request may ' +
-            'still have been accepted, so the outcome is unknown (check status with the same request id before rerunning)',
+            '(connect + response headers) — the service is unreachable or hung. If the request reached it, it may ' +
+            'still have been accepted: the outcome is unknown (check status with the same request id before rerunning)',
         ),
         { code: CAPTURE_RESPONSE_TIMEOUT_CODE },
       ));
@@ -231,9 +247,12 @@ export function nodeStreamFetch(input: string, init?: RequestInit, options: Node
   });
 }
 
-/** The production transport, with the deps' headers bound when given. */
+/** The production transport, with the deps' headers bound when given. A
+ * bound that cannot time correctly fails loud here, before any sink or
+ * request exists — never as an UNKNOWN receipt mid-run. */
 function defaultTransport(deps: CaptureCliDeps): FetchLike {
-  return (input, init) => nodeStreamFetch(input, init, { responseHeadersTimeoutMs: deps.responseHeadersTimeoutMs });
+  const bound = deps.responseHeadersTimeoutMs === undefined ? undefined : checkResponseHeadersTimeoutMs(deps.responseHeadersTimeoutMs);
+  return (input, init) => nodeStreamFetch(input, init, { responseHeadersTimeoutMs: bound });
 }
 
 /** Transport errors keep the primary message and add the underlying code

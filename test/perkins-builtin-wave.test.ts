@@ -7,7 +7,6 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, sy
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { afterEach, chai, describe, expect, it, vi } from 'vitest';
-
 import {
   AutoVerdictPoster,
   DefiniteNonDeliveryError,
@@ -175,7 +174,6 @@ import { minimalPng } from './helpers/images.js';
 import { renderRecordedVerification } from '../src/verify/evidence.js';
 import { GitReviewPort } from './helpers/git-review-port.js';
 import { PersistedReviewPort } from './helpers/persisted-review-port.js';
-
 
 class DeferredReviewPort implements WorktreePort {
   constructor(

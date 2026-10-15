@@ -1679,6 +1679,21 @@ describe('bounded ambiguous-POST reconciliation', () => {
       await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }), nulled).rejects.toThrow(/malformed list body/u);
       expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews')), nulled).toHaveLength(1);
     }
+    // Our login with a missing or non-string type is malformed author
+    // evidence, never a decidable non-match, whatever its nulled field.
+    for (const type of [undefined, null, 42] as const) {
+      const { type: _dropped, ...withoutType } = MATCHING_REVIEW.user;
+      const user = type === undefined ? withoutType : { ...withoutType, type };
+      const malformed = { ...MATCHING_REVIEW, id: 3135, user, commit_id: null };
+      const fixture = bundleFixture();
+      const { poster, calls } = posterWith(fixture, [
+        { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+        { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [malformed] }) },
+      ]);
+      const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
+      expect(error?.message ?? '', String(type)).toMatch(/delivery stays unproven/u);
+      expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews')), String(type)).toHaveLength(1);
+    }
   });
 
   it('still certifies absence from a short list whose entry is fully typed and genuinely differs (#182)', async () => {

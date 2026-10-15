@@ -554,8 +554,17 @@ function usableProviderReviewId(id: unknown): string | null {
  * beside an approval intent, an unexpected APPROVED beside a change-request
  * intent) is never a match. A null `wantedState` matches ANY enacted state
  * — the wrong-state evidence test below, never a credit predicate. */
+/** The author check every delivery predicate applies: our App bot's login
+ * on a `Bot` account. One definition, so the decidability guard and the
+ * predicates can never drift apart (#390). */
+function isOurBotAuthor(user: unknown, botLogin: string): boolean {
+  if (user === null || typeof user !== 'object') return false;
+  const author = user as { readonly login?: unknown; readonly type?: unknown };
+  return author.login === botLogin && author.type === 'Bot';
+}
+
 function matchesDeliveryPredicates(review: ProviderReview, botLogin: string, targetSha: string, body: string, wantedState: string | null, notBeforeMs: number | null): boolean {
-  if (review.user?.login !== botLogin || review.user?.type !== 'Bot') return false;
+  if (!isOurBotAuthor(review.user, botLogin)) return false;
   if ((wantedState !== null && review.state !== wantedState) || review.commit_id !== targetSha || review.body !== body) return false;
   if (notBeforeMs === null) return true;
   const submittedAt = typeof review.submitted_at === 'string' ? Date.parse(review.submitted_at) : Number.NaN;
@@ -598,7 +607,7 @@ function isMatchingAppReviewWithUnusableId(review: ProviderReview, botLogin: str
  * POST did not land. A PENDING draft is undelivered and is skipped. */
 function isMatchingAppReviewWithUnverifiableTime(review: ProviderReview, botLogin: string, targetSha: string, body: string, notBeforeMs: number | null): boolean {
   if (notBeforeMs === null) return false;
-  if (review.user?.login !== botLogin || review.user?.type !== 'Bot') return false;
+  if (!isOurBotAuthor(review.user, botLogin)) return false;
   if (review.state === 'PENDING' || review.commit_id !== targetSha || review.body !== body) return false;
   const submittedAt = typeof review.submitted_at === 'string' ? Date.parse(review.submitted_at) : Number.NaN;
   return !Number.isFinite(submittedAt);
@@ -651,9 +660,7 @@ function isDecidableReviewEntry(entry: unknown, windowed: boolean, botLogin: str
       if (typeof author[field] !== 'string') return false;
     }
   }
-  // The same author check every delivery predicate applies (matchesDeliveryPredicates).
-  const mayBeOurs = user !== null && (user as Record<string, unknown>)['login'] === botLogin &&
-    (user as Record<string, unknown>)['type'] === 'Bot';
+  const mayBeOurs = isOurBotAuthor(user, botLogin);
   for (const field of ['state', 'commit_id', 'body'] as const) {
     const value = record[field];
     if (typeof value === 'string') continue;

@@ -379,17 +379,19 @@ verification budget.
   not hold across the whole stream is `unknown` and is never promoted to
   success; a replayed terminal receipt is marked `reconciled` and is an
   honest failure (the outcome is known, the original full capture is not
-  reconstructable, and a rerun to recover logs is refused). Connecting
-  and receiving the response headers are bounded (60 s, #389): a
-  service that is silently unreachable or never answers yields an
-  `unknown` receipt whose error names the timeout (`ERESPONSETIMEOUT`)
-  instead of a hung helper (a refused connection fails at once with
-  `ECONNREFUSED`). A sent request may still have been accepted, so check
-  `status` with the same request id before rerunning; the body itself has
-  no idle timeout, so a long quiet run is never cut off. Owned helpers are withdrawn only with identity validation
-  (pid + start time + command/cwd); malformed pid records, crashes and
-  stale owners are cleared without touching unrelated processes, and
-  sinks/receipts are preserved.
+  reconstructable, and a rerun to recover logs is refused).
+  Connecting and receiving the response headers are bounded (60 s,
+  #389): a service that never completes the connection or never
+  answers yields an `unknown` receipt whose error names the timeout
+  (`ERESPONSETIMEOUT`) instead of a hung helper (a refused connection
+  fails at once with `ECONNREFUSED`). A request that reached the
+  service may still have been accepted, so run the helper's `status`
+  action with the same `--request-id` (recorded in the receipt) before
+  rerunning. The body itself has no idle timeout, so a long quiet run is
+  never cut off. Owned helpers are withdrawn only with identity
+  validation (pid + start time + command/cwd); malformed pid records,
+  crashes and stale owners are cleared without touching unrelated
+  processes, and sinks/receipts are preserved.
 - **One worker budget across runs.** Total test workers stay within
   `[verify] worker_budget` (default: CPU cores − 2), enforced by the run
   wrapper through the vitest pool knobs and `GRU_VERIFY_*` variables for
