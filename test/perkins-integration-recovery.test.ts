@@ -20,10 +20,12 @@ import { BoardEngine } from '../src/board/engine.js';
 import type { AgentSpawner } from '../src/dispatch/service.js';
 import {
   WaveRunner,
+  enactedStateFor,
   hostDisclosureAppendix,
   publicationBodyFor,
   redactReviewForPublication,
   type FallbackGateOutcome,
+  type VerdictReviewEvent,
   type WaveOutcome,
 } from '../src/dispatch/perkins.js';
 import type { PrHeadProbe } from '../src/dispatch/perkins-review/fresh-head.js';
@@ -144,8 +146,8 @@ describe('WaveRunner built-in Perkins production path', () => {
     ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/39');
     attachOrigin(repo, 'feature/integration', root);
     const receiptPoster = {
-      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
-        reviewId: '9003', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent: VerdictReviewEvent }) => ({
+        reviewId: '9003', actor: 'gru-bot', event: enactedStateFor(call.reviewEvent), commitId: call.targetSha,
         headSha: call.targetSha, baseSha: 'b'.repeat(40),
         bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
       })),
@@ -217,8 +219,8 @@ describe('WaveRunner built-in Perkins production path', () => {
     ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/40');
     attachOrigin(repo, 'feature/integration', root);
     const receiptPoster = {
-      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
-        reviewId: '9004', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent: VerdictReviewEvent }) => ({
+        reviewId: '9004', actor: 'gru-bot', event: enactedStateFor(call.reviewEvent), commitId: call.targetSha,
         headSha: call.targetSha, baseSha: 'b'.repeat(40),
         bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
       })),
@@ -305,8 +307,8 @@ describe('WaveRunner built-in Perkins production path', () => {
     ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/44');
     attachOrigin(repo, 'feature/stripped', root);
     const receiptPoster = {
-      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
-        reviewId: '9005', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent: VerdictReviewEvent }) => ({
+        reviewId: '9005', actor: 'gru-bot', event: enactedStateFor(call.reviewEvent), commitId: call.targetSha,
         headSha: call.targetSha, baseSha: 'b'.repeat(40),
         bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
       })),
@@ -1240,8 +1242,8 @@ describe('WaveRunner built-in Perkins production path', () => {
     ledger.setJobPr(job.id, prUrl);
     attachOrigin(repo, 'feature/integration', root);
     const poster = {
-      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
-        reviewId: '9011', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent: VerdictReviewEvent }) => ({
+        reviewId: '9011', actor: 'gru-bot', event: enactedStateFor(call.reviewEvent), commitId: call.targetSha,
         headSha: call.targetSha, baseSha: 'b'.repeat(40),
         bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
       })),
@@ -1368,8 +1370,8 @@ describe('WaveRunner built-in Perkins production path', () => {
     ledger.setJobPr(job.id, prUrl);
     attachOrigin(repo, 'feature/integration', root);
     const poster = {
-      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
-        reviewId: '9015', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent: VerdictReviewEvent }) => ({
+        reviewId: '9015', actor: 'gru-bot', event: enactedStateFor(call.reviewEvent), commitId: call.targetSha,
         headSha: call.targetSha, baseSha: 'b'.repeat(40),
         bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
       })),
@@ -1499,8 +1501,8 @@ describe('WaveRunner built-in Perkins production path', () => {
     ledger.setJobPr(job.id, prUrl);
     attachOrigin(repo, 'feature/integration', root);
     const poster = {
-      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
-        reviewId: '9017', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent: VerdictReviewEvent }) => ({
+        reviewId: '9017', actor: 'gru-bot', event: enactedStateFor(call.reviewEvent), commitId: call.targetSha,
         headSha: call.targetSha, baseSha: 'b'.repeat(40),
         bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
       })),
@@ -1589,7 +1591,10 @@ describe('WaveRunner built-in Perkins production path', () => {
     const recoveryWave = new WaveRunner({
       ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner, reviewArtifactRoot: artifacts, poster,
     });
-    await expect(recoveryWave.recoverInterruptedRounds()).rejects.toThrow(/simulated crash/);
+    // #289's startup recovery isolates a failing row (it escalates and
+    // continues) instead of aborting the whole pass; the crash window is the
+    // same: the verdict is committed and the annotation is missing.
+    await expect(recoveryWave.recoverInterruptedRounds()).resolves.toBe(0);
     appendSpy.mockRestore();
     expect(ledger.getRound(round2.id)).toMatchObject({ status: 'verdict-posted', verdict: 'changes-requested' });
     expect(ledger.latestRoundEvent(round2.id, 'round.post-recovered')).toBeNull();
@@ -1639,8 +1644,8 @@ describe('WaveRunner built-in Perkins production path', () => {
     ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/48');
     attachOrigin(repo, 'feature/integration', root);
     const poster = {
-      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
-        reviewId: '9019', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent: VerdictReviewEvent }) => ({
+        reviewId: '9019', actor: 'gru-bot', event: enactedStateFor(call.reviewEvent), commitId: call.targetSha,
         headSha: call.targetSha, baseSha: 'b'.repeat(40),
         bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
       })),

@@ -6,10 +6,15 @@ GitHub App (`perkins-review[bot]`) instead of whoever is logged into the
 review flow in [FLOW.md](./FLOW.md).
 
 Owner ruling (2026-09-27): the reviewing GitHub identity is the installed
-App, never a personal account. This changes **authorship only** — the
-publication contract stays the COMMENT-only, commit-bound review it has
-always been. No APPROVE/REQUEST_CHANGES semantics, no branch protection,
-and no merge authority are granted or changed.
+App, never a personal account. Owner ruling (2026-10-10, j-1615): the
+publication itself carries the eligible native judgment — a completed
+whole-change READY that owes no final whole-change pass is delivered as a
+formal GitHub **approval**, a confirmed blocker set as a formal **change
+request**, and every other conclusive judgment (a delta READY still owing
+its final pass) as a commit-bound comment. GitLab keeps its note contract.
+No branch protection, and no merge authority, is granted or changed: the
+checkmark GitHub shows is still only the delivery of the review judgment,
+and the owner holds every merge.
 
 ## The runtime bundle
 
@@ -101,11 +106,18 @@ another host requires a separate, explicit publisher decision.
 5. `GET /app` proves the authenticated App is the configured `app_id`;
    its slug derives the expected bot identity `<slug>[bot]`.
 6. The PR head must equal the round's frozen target SHA.
-7. The review POST is `{body, event: "COMMENT", commit_id: <target>}`.
+7. The review POST is `{body, event: <wanted event>, commit_id: <target>}`
+   where the host derives the wanted event from the eligible native
+   judgment: `APPROVE` (formal approval), `REQUEST_CHANGES` (formal change
+   request) or `COMMENT` (non-formal delivery — notably a delta READY that
+   still owes its final whole-change pass).
 8. The response's author must be the verified App bot
-   (`<slug>[bot]`, `type: "Bot"`) on the exact `commit_id` — and a 2xx
-   whose receipt cannot be proved is resolved by the same bounded
-   reconciliation as an unknown POST outcome, never a blind retry.
+   (`<slug>[bot]`, `type: "Bot"`) on the exact `commit_id`, and its enacted
+   state must equal the state the delivery intended (`APPROVED`,
+   `CHANGES_REQUESTED` or `COMMENTED`) — a receipt in any other state is
+   not the delivery, and a 2xx whose receipt cannot be proved is resolved
+   by the same bounded reconciliation as an unknown POST outcome, never a
+   blind retry.
 
 Every request goes to a hard-coded `https://api.github.com` with redirects
 refused; tokens never appear in URLs, logs, or error text. An installation
@@ -125,7 +137,8 @@ that slipped past redirect refusal, an unreadable response, 5xx), a
 only on provider proof:
 
 - the App bot as author (`type: "Bot"`);
-- `COMMENTED` state;
+- the state this delivery intended (`APPROVED`, `CHANGES_REQUESTED` or
+  `COMMENTED`) — an unexpected state is never a match;
 - the exact frozen `commit_id`;
 - a byte-identical body;
 - submitted no earlier than 60 s before this round's POST began — the
@@ -176,8 +189,8 @@ unproven and the review is never blindly re-posted.
 **Runbook for an unproven delivery.** There are exactly three outcomes of
 an ambiguous POST; treat them differently.
 
-1. **Verified positive receipt.** The poster itself found a COMMENT review
-   authored by `<slug>[bot]` (for this App: `perkins-review[bot]`), of
+1. **Verified positive receipt.** The poster itself found a review in the
+   state the round intended (`COMMENT`, `APPROVED` or `CHANGES_REQUESTED`), authored by `<slug>[bot]` (for this App: `perkins-review[bot]`), of
    `type: "Bot"`, on the exact frozen head, whose body matches the one the
    round published, submitted within this round, with a usable provider
    review id. That is the delivery receipt. If the poster could not verify
@@ -206,7 +219,10 @@ an ambiguous POST; treat them differently.
 Recovery across the publisher-identity change: a review attempt from the
 historical personal-identity era whose original author cannot be proved
 stays unresolved rather than being re-attributed or duplicated. Prior
-receipts and reports are preserved unchanged.
+receipts and reports are preserved unchanged. Historical records that
+predate the wanted-event field stay promotable as the comment-era history
+they are; the upgrade never reinterprets them as formal approvals and
+never re-publishes their decisions.
 
 ## Activation and live check (owner-controlled)
 
@@ -216,7 +232,9 @@ receipts and reports are preserved unchanged.
    required.
 3. Restart the service (owner action).
 4. Trigger one authorized review round; the delivered review must show
-   **`perkins-review[bot]`** as the reviewer on the exact frozen head.
+   **`perkins-review[bot]`** as the reviewer on the exact frozen head, in
+   the state the round's native judgment asked for (`APPROVED` for an
+   eligible final READY, `CHANGES_REQUESTED` for confirmed blockers).
 
 Note that App mode changes the **publisher**, not the review preflight:
 the round still routes through the preflight's `gh`-based code-host probe,
