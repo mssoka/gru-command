@@ -75,8 +75,9 @@ export interface SensorNotifications {
     dedupe: 'unacked' | 'active' | 'all';
   }): { id: string };
   resolveIncidents(kindPrefix: string, by: string): unknown;
-  /** Refresh an open incident's detail in place (same id). */
-  updateDetail(id: string, detail: string): unknown;
+  /** Refresh an open incident's detail in place (same id); the row as it
+   * now stands (resolved if it closed first), or null when it is gone. */
+  updateDetail(id: string, detail: string): { readonly resolvedAt: string | null } | null;
 }
 
 /** The Silas wake surface: the existing durable wake mechanism (the
@@ -265,10 +266,13 @@ export function bootProviderRecovery(sensor: ProviderRecoverySensor, log: Log): 
 const HAND_BACK_FAILED = 'provider-recovery.hand-back-failed';
 
 /** When a boot hand-back failure notice was last reported: the time its
- * detail carries (it is refreshed in place by each failing boot), else its
- * insert time — NaN when unreadable, which the caller counts as reported. */
+ * detail ends with (it is refreshed in place by each failing boot). A detail
+ * without one is unreadable — NaN, which the caller counts as reported; only
+ * a row with no detail at all falls back to its insert time. */
 function lastReportedAt(row: { readonly ts: string; readonly detail: string | null }): number {
-  return Date.parse(row.detail?.match(/Last reported (\S+?)\.$/u)?.[1] ?? row.ts);
+  if (row.detail === null) return Date.parse(row.ts);
+  const stamp = row.detail.match(/Last reported (\S+?)\.$/u)?.[1];
+  return stamp === undefined ? Number.NaN : Date.parse(stamp);
 }
 
 /** The `[provider_recovery]` switch that governs a provider. */
@@ -290,7 +294,7 @@ export class ProviderRecoverySensor {
   private readonly slotReArm: SlotReArmPort | null;
   private readonly silasHosted: () => boolean;
   private readonly log: Log;
-  private bootHandBackRan = false;
+  private bootHandBackClosed = false;
   private readonly now: () => number;
   private readonly setIntervalImpl: typeof setInterval;
   private readonly clearIntervalImpl: typeof clearInterval;
@@ -874,8 +878,8 @@ export class ProviderRecoverySensor {
    * wait may have no notice of its own) — and only a pass that keeps none
    * retires it. */
   handBackAtBoot(): number {
-    if (this.bootHandBackRan) return 0;
-    this.bootHandBackRan = true;
+    if (this.bootHandBackClosed) return 0;
+    this.bootHandBackClosed = true;
     let pass: { readonly handedBack: number; readonly kept: number };
     try {
       pass = this.handBackPass();
@@ -895,10 +899,11 @@ export class ProviderRecoverySensor {
     return pass.handedBack;
   }
 
-  /** Whether this sensor's boot hand-back was attempted (main attempts it
-   * before supervision starts; a failed attempt still counts). */
+  /** Whether this sensor's boot hand-back is closed: attempted (main
+   * attempts it before supervision starts; a failed attempt counts) or
+   * latched off by a skipped boot. */
   get bootHandBackAttempted(): boolean {
-    return this.bootHandBackRan;
+    return this.bootHandBackClosed;
   }
 
   /** A boot whose hand-back was never attempted: Gru is told (best effort),
@@ -906,7 +911,7 @@ export class ProviderRecoverySensor {
    * for this process — an attempt after hydration would resolve rows the
    * supervisor already bound; the next boot runs it. */
   noteBootHandBackSkipped(): void {
-    this.bootHandBackRan = true;
+    this.bootHandBackClosed = true;
     this.announceHandBackFailure('skipped');
   }
 
@@ -919,18 +924,20 @@ export class ProviderRecoverySensor {
    * failed write is logged, never thrown. */
   private announceHandBackFailure(cause: 'failed' | 'skipped'): void {
     try {
-      const open = this.ledger.findNotificationByKind(HAND_BACK_FAILED, 'active');
+      // The newest notice, open or not: one Gru disposed of was still seen.
+      const prior = this.ledger.findNotificationByKind(HAND_BACK_FAILED, 'any');
       const what = cause === 'failed'
         ? 'Handing back the open waits of providers whose automatic recovery is off failed at boot (for some or all of them)'
         : 'The boot hand-back of providers whose automatic recovery is off was never attempted (a wiring fault — see the ' +
           '"had not been attempted" log line)';
-      const told = open === null ? ''
-        : ` Gru was told before (first reported ${open.ts}) — check whether the lanes already resumed before you act.`;
+      const told = prior === null ? ''
+        : ` Gru was told before (first reported ${prior.ts}) — check whether the lanes already resumed before you act.`;
       const detail = `${what}, so any such lane stays stopped until a restart's hand-back succeeds — see the service log.${told} ` +
         `Last reported ${new Date().toISOString()}.`;
-      if (open !== null) {
-        this.notifications.updateDetail(open.id, detail);
-      } else {
+      // Refresh the open notice in place; with none open — or one closed
+      // between the read and the write — post a fresh one.
+      const refreshed = prior !== null && prior.resolvedAt === null ? this.notifications.updateDetail(prior.id, detail) : null;
+      if (refreshed === null || refreshed.resolvedAt !== null) {
         this.notifications.postIncident({
           kind: HAND_BACK_FAILED,
           routing: 'action-required',
@@ -942,7 +949,7 @@ export class ProviderRecoverySensor {
         });
       }
     } catch (error) {
-      this.log('error', 'the hand-back failure notice could not be posted', { error: String(error) });
+      this.log('error', 'the hand-back failure notice could not be written', { error: String(error) });
     }
   }
 
