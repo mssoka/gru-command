@@ -80,7 +80,7 @@ jobs:
       # A Linux-only e2e failure is debuggable from its traces/screenshots
       # and the strip specs' evidence captures.
       - name: Upload browser e2e results on failure
-        if: failure() && steps.browser-e2e.outcome == 'failure'
+        if: always() && (steps.browser-e2e.outcome == 'failure' || steps.browser-e2e.outcome == 'cancelled')
         uses: actions/upload-artifact@v4
         with:
           name: playwright-results

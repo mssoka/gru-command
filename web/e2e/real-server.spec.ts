@@ -74,12 +74,24 @@ function newestInvocationContaining(text: string): AgentInvocation | null {
  * unique to its test. */
 async function agentPromptContaining(text: string): Promise<AgentInvocation> {
   let found: AgentInvocation | null = null;
+  // An unreadable or corrupt log ends the poll at once and is rethrown —
+  // never retried for the whole timeout.
+  let fatal: unknown = null;
   await expect
-    .poll(() => (found = newestInvocationContaining(text)) !== null, {
+    .poll(() => {
+      try {
+        found = newestInvocationContaining(text);
+      } catch (error) {
+        fatal = new Error(`claude double log ${DOUBLE_LOG} is unreadable or corrupt`, { cause: error });
+        return true;
+      }
+      return found !== null;
+    }, {
       message: `double logged a prompt carrying ${JSON.stringify(text)}`,
       timeout: 15_000,
     })
     .toBe(true);
+  if (fatal !== null) throw fatal;
   return found!;
 }
 
