@@ -294,14 +294,6 @@ export class BoardView {
   /** FOR YOU: the older pending tail lives behind the expander
    * (session-expanded, like the SETTLED window). */
   private ownerExpanded = false;
-  /** Per-row disclosure state keyed by stable action id; survives
-   * snapshot pushes and retires only when the row itself leaves the full
-   * owner list (a row hidden by the older-pending window keeps state). */
-  private readonly expandedOwnerRows = new Set<string>();
-  /** Collision-free DOM identity: actionId → allocated region id (never
-   * slugged, so `a_b` and `a-b` can never share a region/focus target). */
-  private readonly ownerRegionIds = new Map<string, string>();
-  private nextOwnerRegionId = 0;
 
   constructor(
     onOpenTranscript: (request: TranscriptOpenRequest) => void,
