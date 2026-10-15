@@ -601,14 +601,16 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(() => inspectDirectiveProducers(producer.file, producer.identity)).toThrow(/native producer journal exceeds the entry inspection limit/);
   });
 
+  // Kinds are the registered owner-required ones: the attention registry routes
+  // any unregistered needs-owner request to Gru, which would void the scenario.
   it('an old open owner stop survives 1001 newer unrelated cards without starving another job or automatic acknowledgement', async () => {
     const f = await fixture();
-    const stop = f.notifications.postIncident({ kind: 'original-owner-stop', routing: 'needs-owner', severity: 'error', title: 'owner only', agentId: 'logical-minion', dedupe: 'active' });
+    const stop = f.notifications.postIncident({ kind: 'supervision.restart-cleanup-unconfirmed', routing: 'needs-owner', severity: 'error', title: 'owner only', agentId: 'logical-minion', dedupe: 'active' });
     f.ledger.addJob({ id: 'independent-job', repo: 'fixture', title: 'independent' }); f.ledger.setJobStatus('independent-job', 'working');
-    for (let i = 0; i < 1001; i += 1) f.notifications.postIncident({ kind: `unrelated-${i}`, routing: 'needs-owner', severity: 'info', title: 'unrelated unbound owner card', dedupe: 'active' });
+    for (let i = 0; i < 1001; i += 1) f.notifications.postIncident({ kind: `gru.wake-blocked.unrelated-${i}`, routing: 'needs-owner', severity: 'info', title: 'unrelated unbound owner card', dedupe: 'active' });
     expect(() => f.ledger.assertRecoveryJobPermission(f.intent.jobId)).toThrow(/owner-only stop/);
     expect(() => f.ledger.assertRecoveryJobPermission('independent-job')).not.toThrow();
-    expect(f.ledger.findNotificationByKind('original-owner-stop', 'active')).toMatchObject({ ackedAt: null, resolvedAt: null }); expect(stop).toBeDefined();
+    expect(f.ledger.findNotificationByKind('supervision.restart-cleanup-unconfirmed', 'active')).toMatchObject({ ackedAt: null, resolvedAt: null }); expect(stop).toBeDefined();
   });
 
   async function assertPhysicalRetirementFence(mode: 'live' | 'missing' | 'foreign') {

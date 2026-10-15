@@ -1765,6 +1765,7 @@ body {
   grid-template-areas:
     'title action'
     'meta action'
+    'context action'
     'note action';
   align-items: center;
   column-gap: 12px;
@@ -1833,6 +1834,23 @@ body {
   grid-area: note;
   color: var(--muted);
   overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.board-owner__context,
+.board-owner__pointer-text {
+  /* Own named track: sharing `meta` with the label stacked the prose ON
+     TOP of the uppercase line (both paint in one grid cell). */
+  grid-area: context;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.board-owner__review-body {
+  margin-top: 4px;
+  min-width: 0;
 }
 
 .board-owner__ack,
@@ -1867,6 +1885,7 @@ body {
   grid-template-areas:
     'title action'
     'meta action'
+    'context action'
     'note action'
     'review review'
     'error error';
@@ -1937,6 +1956,26 @@ body {
   filter: brightness(1.05);
 }
 
+.board-owner__goto {
+  grid-area: action;
+  justify-self: end;
+  align-self: center;
+  flex: none;
+  font-size: 12px;
+  font-weight: 800;
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 2px solid var(--ink);
+  background: var(--accent-soft, var(--soft));
+  color: var(--ink);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.board-owner__goto:hover {
+  filter: brightness(1.05);
+}
+
 .board-owner__nolink {
   grid-area: action;
   justify-self: end;
@@ -1950,6 +1989,7 @@ body {
     grid-template-areas:
       'title'
       'meta'
+      'context'
       'note'
       'action';
     row-gap: 6px;
@@ -1961,6 +2001,7 @@ body {
     grid-template-areas:
       'title'
       'meta'
+      'context'
       'note'
       'review'
       'action'
@@ -1969,6 +2010,7 @@ body {
 
   .board-owner__ack,
   .board-owner__open,
+  .board-owner__goto,
   .board-owner__nolink {
     justify-self: start;
   }
@@ -2972,18 +3014,56 @@ a.repo-row__name:hover {
   opacity: 0.6;
 }
 
+/* ── Shared notification cards (owner release 2026-10-11) ──────────────
+ * ONE readable card for FOR YOU / NEEDS GRU / FEED, board band and bell:
+ * mixed-case prose at ordinary reading spacing, a short separate metadata
+ * label, typed decision blocks, and full diagnostics behind Details.
+ * Machine and owner-notice rows carry no control; only real supported
+ * actions render buttons. */
 .board-notification {
   border: var(--outline-thin);
   border-radius: var(--radius-sm);
   padding: 8px 10px;
   display: grid;
-  gap: 3px;
+  gap: 4px;
   font-size: 13px;
+  min-width: 0;
+  background: var(--card);
+  color: var(--ink);
 }
 
 .board-notification--error {
   background: var(--alert);
   color: var(--on-state);
+}
+
+.board-notification--error .board-notification__meta {
+  color: var(--on-state);
+  opacity: 1;
+}
+
+/* The submit-refusal line must stay readable on the alert surface: in the
+ * dark theme --danger IS --alert (1.00:1), and light is below AA. */
+.board-notification--error .board-notification__option-error {
+  color: var(--on-state);
+  opacity: 1;
+}
+
+.board-notification--error .board-notification__context,
+.board-notification--error .board-notification__question,
+.board-notification--error .board-notification__recommendation,
+.board-notification--error .board-notification__why,
+.board-notification--error .board-notification__decided,
+.board-notification--error .board-notification__guidance,
+.board-notification--error .board-notification__discuss,
+.board-notification--error .board-notification__discuss-text,
+.board-notification--error .board-notification__option-label,
+.board-notification--error .board-notification__option-consequence,
+.board-notification--error .board-notification__submission,
+.board-notification--error .board-notification__detail-text,
+.board-notification--error .board-notification__detail-kind {
+  color: var(--on-state);
+  opacity: 1;
 }
 
 /* A closed receipt is record-only history, never live work: keep it
@@ -2995,21 +3075,198 @@ a.repo-row__name:hover {
   border-style: dashed;
 }
 
-/* A receipt keeps the error row's readable ink for its meta line: the
- * rail's faint default on the alert surface composes below the AA floor
- * the palette suite enforces. */
-.board-notification--error.board-notification--receipt .board-notification__meta {
-  color: var(--on-state);
-  opacity: 1;
+.board-notification__head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
+.board-notification__icon {
+  flex: none;
 }
 
 .board-notification__title {
   font-weight: 800;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
+.board-notification__state {
+  margin-left: auto;
+  flex: none;
+  /* State chips may sit inside an error card; an explicit neutral pair
+   * prevents them inheriting dark --on-state ink onto --card. */
+  background: var(--paper);
+  color: var(--ink);
+}
+
+/* Short metadata only (timestamp · attention channel): the .lbl class
+ * provides the compact uppercase treatment, and this line never carries
+ * prose. */
 .board-notification__meta {
+  overflow-wrap: anywhere;
+}
+
+.board-notification__context {
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.board-notification__decision {
+  display: grid;
+  gap: 4px;
+  margin-top: 2px;
+  min-width: 0;
+}
+
+.board-notification__question {
+  font-weight: 800;
+  overflow-wrap: anywhere;
+}
+
+.board-notification__recommendation,
+.board-notification__why,
+.board-notification__decided,
+.board-notification__guidance,
+.board-notification__discuss {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.board-notification__discuss {
+  display: grid;
+  gap: 6px;
+  justify-items: start;
+  min-width: 0;
+}
+
+.board-notification__discuss-open {
+  justify-self: start;
+}
+
+.board-notification__why,
+.board-notification__decided,
+.board-notification__guidance,
+.board-notification__discuss,
+.board-notification__option-consequence,
+.board-notification__option-error {
   font-size: 12px;
-  opacity: 0.85;
+}
+
+.board-notification__options {
+  display: grid;
+  gap: 6px;
+  margin-top: 2px;
+  min-width: 0;
+}
+
+.board-notification__option {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.board-notification__option-button {
+  justify-self: start;
+  max-width: 100%;
+  white-space: normal;
+  text-align: left;
+  font-size: 12px;
+  font-weight: 800;
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 2px solid var(--ink);
+  background: var(--accent-soft, var(--soft));
+  color: var(--ink);
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.board-notification__option-button:disabled,
+.board-notification__option-button[aria-disabled='true'] {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.board-notification__options--readonly .board-notification__option-label {
+  font-size: 12px;
+  font-weight: 800;
+  overflow-wrap: anywhere;
+}
+
+.board-notification__submission {
+  font-size: 12px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.board-notification__submission--submitting {
+  color: var(--muted);
+}
+
+.board-notification__submission--refused,
+.board-notification__submission--unconfirmed {
+  color: var(--danger);
+}
+
+.board-notification__option-consequence {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.board-notification__option-error {
+  color: var(--danger);
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.board-notification__details {
+  min-width: 0;
+}
+
+.board-notification__details > summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.board-notification__detail {
+  display: grid;
+  gap: 4px;
+  margin-top: 4px;
+  min-width: 0;
+}
+
+.board-notification__detail-kind {
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+/* Full diagnostics, verbatim: mixed case preserved, every unbroken job
+ * id / SHA / path wraps instead of clipping. */
+.board-notification__detail-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--ink);
+  max-width: 100%;
+}
+
+/* Band wrappers around the shared card: one child, block layout. */
+.board-owner__row--decision,
+.board-owner__row--notice {
+  display: block;
+  padding: 4px 0 6px;
+  border-bottom: 0;
+}
+
+.board-owner__row--decision.board-owner__row--error,
+.board-owner__row--notice.board-owner__row--error {
+  padding-left: 12px;
 }
 
 /* ── Transcript drawer (E6) ─────────────────────────────── */
@@ -3252,7 +3509,8 @@ a.repo-row__name:hover {
 }
 
 .board-notification__ack {
-  margin-top: 6px;
+  margin-top: 2px;
+  justify-self: start;
   align-self: flex-start;
   font-size: 12px;
   font-weight: 800;
@@ -3262,6 +3520,9 @@ a.repo-row__name:hover {
   background: var(--accent-soft);
   color: var(--ink);
   cursor: pointer;
+  white-space: normal;
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 .board-notification__ack:disabled {

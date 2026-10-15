@@ -619,6 +619,15 @@ describe('phase-handoff reconciliation, guards and disposition', () => {
       severity: 'error',
       title: 'owner stop',
       detail: 'owner-controlled',
+      decision: {
+        question: 'Keep the owner hold?',
+        context: 'A parked lane is held for the owner.',
+        recommendation: null,
+        reservedClass: 'authority-cost',
+        whyNotDelegable: 'Only the owner releases this hold.',
+        options: [{ id: 'keep', label: 'Keep the hold', consequence: 'The lane stays parked.' }],
+        discussion: false,
+      },
     });
     h.ledger.beginPhaseHandoff({
       jobId: 'job-ph-park',

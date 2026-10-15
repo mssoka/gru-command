@@ -246,15 +246,24 @@ function sampleSnapshot(): unknown {
   const descriptors = boardMode === 'clear-needs-you' ? [] : [
     { id: 'demo-api-payment-fix', labels: ['lens failed', 'action-required'] },
     { id: 'demo-api-conflict-probe', labels: ['PR conflicting'] },
+    // The quota-walled lane is a Gru-owned FOR GRU cause too (main's smoke
+    // section-truth test asserts it there): the server mailbox is the only
+    // FOR GRU membership authority, so the fixture must say so.
+    { id: 'demo-api-quota-walled', labels: ['quota wall'] },
   ];
   const items: MailboxItemView[] = descriptors.map(({ id, labels }) => {
     const job = jobs.find((candidate) => candidate.id === id)!;
     return { id: `job:${id}`, jobId: id, subject: `job:${id}`, title: job.title, kind: 'job', basis: `mock-basis:${id}`,
       reasons: labels.map((label) => ({ label, signal: label.replaceAll(' ', '-'), basis: `mock-reason:${label}` })),
-      state: 'needs-gru', owner: 'gru', disposition: null, receipt: null, notificationIds: id === 'demo-api-payment-fix' ? ['mock-n5'] : [],
+      state: 'needs-gru', owner: 'gru', disposition: null, receipt: null,
+      notificationIds:
+        id === 'demo-api-payment-fix' ? ['mock-n5'] : id === 'demo-api-quota-walled' ? ['mock-n4'] : [],
       producerOwned: false, references: [], restrictions: [], attentionKey: `mock-attention:${id}` };
   });
-  return { ...source, mailbox: { items, counts: { threads: items.length, incidents: 0, notifications: boardMode === 'clear-needs-you' ? 0 : 1, needsGru: items.length } } };
+  // Counts mirror the server projection: distinct live notification ids the
+  // items carry (the chip and the FOR GRU head must agree).
+  const attached = new Set(items.flatMap((item) => item.notificationIds));
+  return { ...source, mailbox: { items, counts: { threads: items.length, incidents: 0, notifications: boardMode === 'clear-needs-you' ? 0 : attached.size, needsGru: items.length } } };
 }
 
 /** The clear variant: drop the live machine row, settle the needs-you
@@ -267,7 +276,7 @@ function clearNeedsYouVariant(snapshot: unknown): unknown {
     notifications: Array<Record<string, unknown>>;
     unackedActionRequired: number;
   };
-  snap.notifications = snap.notifications.filter((row) => row.id !== 'mock-n5');
+  snap.notifications = snap.notifications.filter((row) => row.id !== 'mock-n4' && row.id !== 'mock-n5');
   snap.unackedActionRequired = 0;
   for (const repo of snap.repos) {
     for (const job of repo.jobs) {
@@ -569,10 +578,38 @@ function defaultSampleSnapshot(): unknown {
     notifications: [
       { id: 'mock-n1', ts: new Date().toISOString(), kind: 'job.status', routing: 'fyi', severity: 'error', title: 'Job demo-api-payment-fix blocked', detail: 'waiting on the base sync', agentId: null, shownAt: null, ackedAt: null, resolvedAt: null, resolvedBy: null },
       { id: 'mock-n2', ts: new Date(Date.now() - 120_000).toISOString(), kind: 'round.verdict', routing: 'fyi', severity: 'info', title: 'Round r1 verdict', detail: 'approved', agentId: null, shownAt: new Date().toISOString(), ackedAt: new Date().toISOString(), resolvedAt: null, resolvedBy: null },
-      // Needs-owner stops (ack re-arms supervision) ring the FOR YOU band / bell.
-      { id: 'mock-n3', ts: new Date(Date.now() - 240_000).toISOString(), kind: 'supervision.breaker', routing: 'needs-owner', severity: 'error', title: 'Crash-loop breaker tripped: agent mock-minion stopped', detail: '3 restarts within 600s. The agent is STOPPED — ack this notification to re-arm supervision and resume.', agentId: 'mock-minion', shownAt: new Date().toISOString(), ackedAt: null, resolvedAt: null, resolvedBy: null },
-      // Provider-wall stops are owner-held too: resolve the provider, then ack to re-arm.
-      { id: 'mock-n4', ts: new Date(Date.now() - 900_000).toISOString(), kind: 'supervision.provider-wall.demo-api-quota-walled.quota_wall', routing: 'needs-owner', severity: 'error', title: 'Agent mock-minion-quota stopped: quota wall', detail: 'Blind restart is withheld. Resolve the provider condition, then ack to re-arm the deterministic restart ladder.', agentId: 'mock-minion-quota', shownAt: new Date().toISOString(), ackedAt: null, resolvedAt: null, resolvedBy: null },
+      // A typed owner decision rings the FOR YOU band / bell: the shipped
+      // decision card (question, recommendation, options with consequences,
+      // Details evidence) and a recorded choice — never a generic Ack.
+      {
+        id: 'mock-n3',
+        ts: new Date(Date.now() - 240_000).toISOString(),
+        kind: 'gru.owner-escalation',
+        routing: 'needs-owner',
+        severity: 'error',
+        title: 'Approve the payment retry fix?',
+        detail: 'The fix changes the shared retry path; full evidence is retained behind Details.',
+        agentId: null,
+        shownAt: new Date().toISOString(),
+        ackedAt: null,
+        resolvedAt: null,
+        resolvedBy: null,
+        decision: {
+          question: 'Approve the payment retry fix and re-arm the lane?',
+          context: 'The retry loop fix is ready but touches a shared payment path.',
+          recommendation: 'Approve it; keep the unrelated ledger work separate.',
+          reservedClass: 'scope-design',
+          whyNotDelegable: 'It changes a shared, owner-visible payment behavior.',
+          options: [
+            { id: 'approve', label: 'Approve the fix', consequence: 'Gru re-arms the lane and reports the outcome.' },
+            { id: 'keep', label: 'Keep the current approach', consequence: 'The lane stays parked; nothing is re-armed.' },
+          ],
+          discussion: false,
+        },
+      },
+      // Machine stops live in the self-clearing NEEDS GRU queue with no
+      // human Ack (a Gru disposition is the supported machine control).
+      { id: 'mock-n4', ts: new Date(Date.now() - 900_000).toISOString(), kind: 'supervision.provider-wall.demo-api-quota-walled.quota_wall', routing: 'action-required', severity: 'error', title: 'Agent mock-minion-quota stopped: quota wall', detail: 'Blind restart is withheld: this provider stop is not eligible for automatic recovery. Gru decides the direction before anything re-arms.', agentId: 'mock-minion-quota', shownAt: new Date().toISOString(), ackedAt: null, resolvedAt: null, resolvedBy: null },
       // Machine attention lives in the self-clearing NEEDS GRU queue — a live global row keeps the tracker legible.
       { id: 'mock-n5', ts: new Date(Date.now() - 300_000).toISOString(), kind: 'review-escalation', routing: 'action-required', severity: 'error', title: 'Review round demo-api-payment-fix-r1 is INCOMPLETE', detail: 'lead session aborted — the lane can be re-armed', agentId: null, shownAt: null, ackedAt: null, resolvedAt: null, resolvedBy: null },
       // Section truth: a leftover MACHINE row bound to the merged lane is a
@@ -594,10 +631,10 @@ function defaultSampleSnapshot(): unknown {
     // LIVE machine rows only: the global review escalation (n5) counts;
     // the merged lane's leftover n6 is a closed receipt — the record keeps
     // it, this count (and NEEDS GRU) does not.
-    unackedActionRequired: 1,
-    // Owner stops ring the bell (FOR YOU): the crash-loop stop and the
-    // provider-wall stop await the owner's ack.
-    unackedNeedsOwner: 2,
+    unackedActionRequired: 2,
+    // Owner matters ring the bell (FOR YOU): one typed decision plus the
+    // evidence-bound ready PR below.
+    unackedNeedsOwner: 1,
     // FOR YOU (owner approval 2026-09-28): one evidence-bound ready PR.
     // Generic sample data only — the readiness story is exact-head
     // (approved round + clean + green CI at the same sha); the row's

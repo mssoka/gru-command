@@ -101,7 +101,8 @@ export class GruMailbox {
     const row: NotificationRecord = { id: this.deliveryKey(item), ts: item.receipt?.receivedAt ?? new Date(this.now()).toISOString(),
       kind: this.deliveryKey(item), routing: 'action-required', severity: item.severity ?? 'error', title: item.title,
       detail: JSON.stringify(item),
-      agentId: null, shownAt: null, shownBy: null, ackedAt: null, ackedBy: null, resolvedAt: null, resolvedBy: null };
+      agentId: null, shownAt: null, shownBy: null, ackedAt: null, ackedBy: null, resolvedAt: null, resolvedBy: null,
+      decision: null, decidedAt: null, decidedBy: null, decidedOption: null };
     this.renderedDeliveries.set(row, structuredClone({ deliveryKey: row.id, id: item.id, jobId: item.jobId, basis: item.basis,
       attentionKey: item.attentionKey, reasons: item.reasons, notificationIds: item.notificationIds }));
     return row;

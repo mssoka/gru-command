@@ -51,11 +51,18 @@ function contrast(vars: Map<string, string>, foreground: string, background: str
 
 /** One declaration from the FIRST block matching the given selector. */
 function declarationIn(css: string, selector: string, property: string): string | null {
-  const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const block = new RegExp(`${escaped}\\s*\\{([\\s\\S]*?)\\}`).exec(css);
-  if (block === null) return null;
-  const declaration = new RegExp(`(?:^|;)\\s*${property}\\s*:\\s*([^;]+);`).exec(block[1]!);
-  return declaration === null ? null : declaration[1]!.trim();
+  // Selector LISTS count: the error-surface override declares several
+  // selectors in one rule, and each of them must resolve to the declared
+  // token (a selector in the middle of a list is as real as the last one).
+  const source = css.replace(/\/\*[\s\S]*?\*\//gu, '');
+  const rule = /([^{}]+)\{([^{}]*)\}/gu;
+  for (const match of source.matchAll(rule)) {
+    const selectors = match[1]!.split(',').map((entry) => entry.trim());
+    if (!selectors.includes(selector)) continue;
+    const declaration = new RegExp(`(?:^|;)\\s*${property}\\s*:\\s*([^;]+);`, 'u').exec(match[2]!);
+    return declaration === null ? null : declaration[1]!.trim();
+  }
+  return null;
 }
 
 /** The declared opacity of a selector, or null when it declares none. */
@@ -117,6 +124,7 @@ const TEXT_PAIRS: readonly (readonly [string, string])[] = [
   ['ink', 'accent-soft'], // ack button (v6.1 themed fill)
   ['ink', 'danger-soft'], // error toast (v6.1 themed fill)
   ['muted', 'paper-soft'], // notice line (v6.1 themed fill)
+  ['danger', 'card'], // notification option-submit error line
 ];
 
 describe('palette contrast (v5)', () => {
@@ -130,6 +138,49 @@ describe('palette contrast (v5)', () => {
         const ratio = contrast(vars, foreground, background);
         return { pair: `${foreground} on ${background}`, ratio };
       }).filter(({ ratio }) => ratio < 4.5);
+      expect(failures, JSON.stringify(failures, null, 2)).toEqual([]);
+    });
+  }
+
+  for (const [theme, selector] of [
+    ['light', ':root'],
+    ['dark', '.dark'],
+  ] as const) {
+    it(`the readable card surfaces resolve to AA pairs in the ${theme} theme`, () => {
+      const vars = themeVars(selector);
+      // The card face and its Details block read ink-on-card; secondary
+      // lines (recommendation, why, consequence, guidance) read
+      // muted-on-card; an error row's children are forced to on-state so
+      // they never inherit the faint label color on the alert surface.
+      const errorMetaToken = colorTokenIn(COMPONENTS_CSS, '.board-notification--error .board-notification__meta');
+      expect(errorMetaToken).toBe('on-state');
+      // The submit-refusal line must also stay on-state on the alert surface
+      // (in dark, --danger IS --alert).
+      const errorOptionToken = colorTokenIn(COMPONENTS_CSS, '.board-notification--error .board-notification__option-error');
+      expect(errorOptionToken).toBe('on-state');
+      // The discussion guidance, the submission status line and the
+      // read-only option labels must also stay on-state on the alert
+      // surface (R1: the discuss text was omitted from the override and
+      // failed AA on error cards in both themes).
+      expect(colorTokenIn(COMPONENTS_CSS, '.board-notification--error .board-notification__discuss')).toBe('on-state');
+      expect(colorTokenIn(COMPONENTS_CSS, '.board-notification--error .board-notification__discuss-text')).toBe('on-state');
+      expect(colorTokenIn(COMPONENTS_CSS, '.board-notification--error .board-notification__submission')).toBe('on-state');
+      expect(colorTokenIn(COMPONENTS_CSS, '.board-notification--error .board-notification__option-label')).toBe('on-state');
+      // State chips can appear on an error card but are intentionally
+      // neutral: pin their own AA-safe pair rather than inherited on-state.
+      expect(colorTokenIn(COMPONENTS_CSS, '.board-notification__state')).toBe('ink');
+      expect(declarationIn(COMPONENTS_CSS, '.board-notification__state', 'background')).toBe('var(--paper)');
+      const pairs: readonly (readonly [string, string])[] = [
+        ['ink', 'card'],
+        ['ink', 'paper'],
+        ['muted', 'card'],
+        ['on-state', 'alert'],
+        ['ink', 'accent-soft'],
+        ['danger', 'card'],
+      ];
+      const failures = pairs
+        .map(([foreground, background]) => ({ pair: `${foreground} on ${background}`, ratio: contrast(vars, foreground, background) }))
+        .filter(({ ratio }) => ratio < 4.5);
       expect(failures, JSON.stringify(failures, null, 2)).toEqual([]);
     });
   }
@@ -151,8 +202,10 @@ describe('palette contrast (v5)', () => {
       // because faint-on-alert composes below AA). Every value is read from
       // the real CSS, so a future dimming change fails here.
       const rowAlpha = opacityIn(COMPONENTS_CSS, '.board-notification--receipt') ?? 1;
-      const metaSelector =
-        '.board-notification--error.board-notification--receipt .board-notification__meta';
+      // The error row's children all carry the readable on-state ink
+      // (owner release 2026-10-11 widened the old receipt-only override to
+      // EVERY error-row child line, so live error rows clear AA too).
+      const metaSelector = '.board-notification--error .board-notification__meta';
       const metaAlpha =
         opacityIn(COMPONENTS_CSS, metaSelector) ??
         opacityIn(COMPONENTS_CSS, '.board-notification__meta') ??

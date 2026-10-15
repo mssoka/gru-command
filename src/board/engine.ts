@@ -27,6 +27,7 @@ import {
   type RoundRecord,
 } from '../ledger/api.js';
 import { LIVE_DIRECTIVE_STATES } from '../ledger/directives.js';
+import type { NotificationDecision } from '../ledger/notification-decision.js';
 import { isJobTerminal, type JobStatus } from '../ledger/states.js';
 import type { EventRecord } from '../ledger/api.js';
 
@@ -202,6 +203,13 @@ export interface NotificationView {
   readonly ackedAt: string | null;
   readonly resolvedAt: string | null;
   readonly resolvedBy: string | null;
+  /** Typed owner-decision metadata (owner release 2026-10-11; null on
+   * legacy/machine rows). */
+  readonly decision: NotificationDecision | null;
+  /** A recorded owner decision — distinct from ack and resolution. */
+  readonly decidedAt: string | null;
+  readonly decidedBy: string | null;
+  readonly decidedOption: string | null;
 }
 
 /** Silas ops health (board UX v4, issue #163): the newest wake (sweep or
@@ -271,8 +279,8 @@ export interface BoardSnapshot {
    * the record keeps them, this count (and the banding) does not. Read
    * from the table, not the 30-row feed window, so the tracker is true. */
   readonly unackedActionRequired: number;
-  /** FOR YOU: needs-owner rows still awaiting a human ack — the only
-   * class that rings the bell. */
+  /** FOR YOU: registered needs-owner rows still owed an owner decision or
+   * notice resolution — the only class that rings the bell. */
   readonly unackedNeedsOwner: number;
   /** Autonomous Gru turns recorded as durable `gru.wake` events. */
   readonly wakes: {
@@ -1277,6 +1285,10 @@ export class BoardEngine {
         ackedAt: row.ackedAt,
         resolvedAt: row.resolvedAt,
         resolvedBy: row.resolvedBy,
+        decision: row.decision,
+        decidedAt: row.decidedAt,
+        decidedBy: row.decidedBy,
+        decidedOption: row.decidedOption,
       }));
   }
 

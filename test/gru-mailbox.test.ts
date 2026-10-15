@@ -327,6 +327,15 @@ describe('GH-305 canonical durable mailbox', () => {
     expect(item.references).toContainEqual({ kind: 'event', id: String(stop.seq) });
     ledger.appendCustomEvent({ kind: 'supervision.rearmed', agentId: 'stopped-worker', jobId: 'stopped', payload: {} });
     expect(mailbox.snapshot().items[0]?.restrictions.join(' ')).not.toMatch(/owner restart approval/);
+    const fenced = ledger.appendCustomEvent({
+      kind: 'supervision.rearm-fenced',
+      agentId: 'stopped-worker',
+      jobId: 'stopped',
+      payload: { reason: 'job is parked', stop_reason: 're-arm fenced: job is parked', restarts: 3 },
+    });
+    const fencedItem = mailbox.snapshot().items[0]!;
+    expect(fencedItem.restrictions.join(' ')).toContain('re-arm fenced: job is parked');
+    expect(fencedItem.references).toContainEqual({ kind: 'event', id: String(fenced.seq) });
   });
 
   it('G20 expired identical waiting replay preserves the original deadline and event watermark', () => assertExpiredReplay('waiting'));

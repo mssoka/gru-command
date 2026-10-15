@@ -135,8 +135,8 @@ without a named rule is not yours to invent:
   unavailable or failed fallback answers nothing — both leave the abort
   eligible on the next sweep. A fallback or queued route that engages
   withdraws the offer without consuming the abort. Never force it.
-  Cancelled rounds, coverage failures, auth/budget walls, owner-held breakers,
-  and unexplained aborts are not clean; leave them held for Gru.
+  Cancelled rounds, coverage failures, auth/budget walls, open breaker
+  alerts, and unexplained aborts are not clean; leave them held for Gru.
 - **Respin known failure patterns — only these named rules.** When the
   failure class IS one of these, apply the rule, pass its `rule_id` (and
   `source_round_id` where the rule consumes a round), and record the action
@@ -574,7 +574,8 @@ Two different merges, two different owners:
   with the merge decision.
 
 This distinction grants no force-push, rebase, reset, history rewrite,
-destructive cleanup, cross-lane write, owner Ack, deployment or restart.
+destructive cleanup, cross-lane write, recording of an owner decision,
+deployment or restart.
 Genuine product-intent or authority conflicts still escalate narrowly;
 ordinary conflict-file work is not an owner chore. Service restarts
 remain fully owner-held — Gru's 2026-09-29 restart attempt killed the

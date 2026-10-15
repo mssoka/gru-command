@@ -1,6 +1,7 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { chmodSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { configPathFor, loadConfig, ConfigError } from './config.js';
 import { loadOrCreateIdentity } from './identity.js';
 import { startServiceShutdown, type ServiceShutdownState } from './service-shutdown.js';
@@ -17,6 +18,8 @@ import { DeployDriftTracker } from './board/deploy-drift.js';
 import { defaultPackageRoot, readBuildInfo } from './build-info.js';
 import { createServiceReviewWave, liveReviewSessionIds } from './dispatch/service-review-wave.js';
 import { NotificationCenter } from './notifications/center.js';
+import { reconcileLegacyOwnerAttention } from './notifications/legacy-owner.js';
+import { bindSupervisorNotificationDisposition } from './supervision/notification-disposition.js';
 import { Supervisor } from './supervision/supervisor.js';
 import { TranscriptService } from './transcripts/service.js';
 import { gitReviewSourcePreflight } from './dispatch/review-source.js';
@@ -534,6 +537,28 @@ async function main(): Promise<number> {
     onNeedsOwner: (notification) => surfaceInChat(notification),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+  // Owner-attention migration (owner release 2026-10-11): unacked
+  // needs-owner rows from before the responsibility chain was enforced are
+  // re-triaged to Gru's machine queue with a recorded note (full detail
+  // preserved). Registered owner kinds keep their place; nothing is acked,
+  // resolved, dropped or executed. Bounded and idempotent.
+  try {
+    const ownerReconcile = reconcileLegacyOwnerAttention({
+      ledger,
+      log: (level, msg, fields) => logger.log(level, msg, fields),
+    });
+    if (ownerReconcile.retriaged > 0 || ownerReconcile.failed > 0) {
+      logger.info('legacy owner attention reconciled', {
+        examined: ownerReconcile.examined,
+        retriaged: ownerReconcile.retriaged,
+        kept: ownerReconcile.kept,
+        failed: ownerReconcile.failed,
+      });
+    }
+  } catch (error) {
+    // Never fail boot on the migration; the next boot retries it.
+    logger.warn('legacy owner attention reconciliation failed — retried next boot', { error: String(error) });
+  }
   // Owner-approved Book of Lessons (owner decision 2026-10-07): the dream
   // proposes, the owner decides in For You, and only Accept writes.
   const lessonProposals = new LessonProposals({
@@ -772,7 +797,8 @@ async function main(): Promise<number> {
         if (wait !== null) ledger.setProviderWaitIncident(wait.id, incidentId);
       },
       // The observation report for NON-machine-owned stops (incidentId
-      // null): the sink re-classifies; ineligible classes stay owner-held.
+      // null): the sink re-classifies; ineligible/unknown classes are
+      // machine attention (action-required) — Gru decides the direction.
       onProviderWall: (observation) => {
         void establishProviderWait(providerRecoverySensor, {
           agentId: observation.agentId,
@@ -919,6 +945,7 @@ async function main(): Promise<number> {
     bus,
     notifications,
     onNotificationAck: (id) => supervisorLive.onNotificationAcked(id),
+    onNotificationDisposition: bindSupervisorNotificationDisposition(supervisorLive),
     decisionsStatus: () => decisionRuntime.status(),
     onDecisionsRecheck: () => decisionRuntime.recheck(),
     siblingUpgradePaths: ['/ws'],
@@ -952,18 +979,25 @@ async function main(): Promise<number> {
       });
     },
     onSweepPaused: ({ worktree, processes }) => {
+      // Destructive-op confirmation: the sweep waits for an operator to
+      // verify nothing live is rooted there (preserve-before-remove), so it
+      // is needs-owner — never a machine wake. One row per pause, with a
+      // worktree-scoped id so the completed sweep can resolve its own
+      // notice on positive evidence (owner release 2026-10-11); the legacy
+      // exact kind stays registered for rows written before the change.
       notifications.post({
-        kind: 'worktree-sweep-paused',
-        // Destructive-op confirmation: the sweep waits for the OWNER's
-        // ruling (preserve-before-remove), so it is needs-owner — never a
-        // machine wake and never an auto-clear.
+        kind: `worktree-sweep-paused:${worktree.id}:${randomUUID()}`,
         routing: 'needs-owner',
         severity: 'info',
         title: `Worktree sweep paused: live processes in ${worktree.repoName}`,
         detail:
           `${processes.length} process(es) rooted in ${worktree.path} ` +
-          `(pids ${processes.map((p) => p.pid).join(', ')}) — acknowledge to confirm removal`,
+          `(pids ${processes.map((p) => p.pid).join(', ')}) — confirm nothing live is rooted there before completing the sweep`,
       });
+    },
+    onSwept: ({ worktree }) => {
+      // A completed sweep IS the evidence its pause notice asked for.
+      notifications.resolveIncidents(`worktree-sweep-paused:${worktree.id}:`, 'sweep-completed');
     },
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
@@ -1124,6 +1158,9 @@ async function main(): Promise<number> {
     log: (level, msg, fields) => logger.log(level, msg, fields),
   } });
   state.wave = wave;
+  // Notification-driven re-arms share Perkins' current-candidate writer
+  // fence, including in-flight setup operations that have no round row yet.
+  supervisorLive.setActiveReviewProbe((jobId) => wave.activeReview(jobId) !== null);
   await wave.recoverInterruptedRounds();
   wave.resumeQueuedHandoffs();
   // Automatic admission retries live in memory (owner decision 2026-10-08):
@@ -1498,6 +1535,12 @@ async function main(): Promise<number> {
       return 1;
     }
   }
+  // Owner-only port-squat notices clear on positive evidence (owner release
+  // 2026-10-11): a successful bind proves the squatter is gone, so these
+  // rows resolve themselves instead of waiting for a human Ack. A failed
+  // bind above already posted (or kept) the notice.
+  notifications.resolveExactKind('port-squat', 'service-boot');
+  notifications.resolveExactKind('roll-port-squat', 'service-boot');
   // Post-roll self-check (phase d): the relaunched build logs uptime+sha
   // once the socket is actually serving.
   if (rollAdoption.marker !== null) {

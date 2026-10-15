@@ -210,7 +210,8 @@ Two different merges, two different owners:
   decision; that row is also the live test of the FOR YOU section.
 
 This distinction grants no force-push, rebase, reset, history rewrite,
-destructive cleanup, cross-lane write, owner Ack, deployment or restart.
+destructive cleanup, cross-lane write, recording of an owner decision,
+deployment or restart.
 Genuine product-intent or authority conflicts still escalate narrowly;
 ordinary conflict-file work is not an owner chore. Service restarts
 remain fully owner-held — Gru's 2026-09-29 restart attempt killed the

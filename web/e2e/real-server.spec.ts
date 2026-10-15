@@ -221,7 +221,7 @@ test('service restart drops the socket; reconnect keeps history and flushes the 
     nodeImport: JEV_PRELOAD,
     extraEnv: { JEV_FETCH_LOG, JEV_FETCH_MODE_FILE: JEV_MODE_FILE },
   });
-  await expect(page.locator('#banners .banner')).toBeHidden({ timeout: 15_000 });
+  await expect(page.locator('#banners .banner:visible')).toHaveCount(0, { timeout: 15_000 });
   const flushedReply = echoReplies(page, 'typed while down').last();
   await expect(flushedReply).toBeVisible();
   await expect(flushedReply).toHaveCount(1);
@@ -393,13 +393,10 @@ test.describe('board (E6)', () => {
     const seededRow = board.notifications.find((n: { title: string }) => n.title.includes('e2e-ack-job blocked'));
     expect(seededRow.shownAt).not.toBeNull();
 
-    // The ack button clears the row through the human ack. Two render
-    // phases are both valid: the optimistic button flips to ✓, then the
-    // next snapshot push re-renders the acked row into the FEED band
-    // (title carries ✓, button gone). Assert on the row, not the button,
-    // or a fast push loses the race and the button vanishes mid-poll.
+    // The explicit feed control clears the row through the human ack. The
+    // authoritative record is the truth; a fast snapshot push may re-render
+    // the row into its 'seen' state mid-poll, so don't race the button text.
     await row.locator('.board-notification__ack').click();
-    await expect(row).toContainText('✓');
     const after = await (await page.request.get(`http://127.0.0.1:${REAL_PORT}/api/board`, { headers })).json();
     const ackedRow = after.notifications.find((n: { title: string }) => n.title.includes('e2e-ack-job blocked'));
     expect(ackedRow.ackedAt).not.toBeNull();
@@ -415,34 +412,65 @@ test.describe('board (E6)', () => {
     await expect(page.locator('.toast', { hasText: 'e2e-ack-job-2 blocked' })).toHaveCount(0);
   });
 
-  test('Gru can escalate a machine stop to FOR YOU through the authenticated route', async ({ page }) => {
+  test('Gru escalates a typed owner decision to FOR YOU, the owner records a choice, and follow-through resolves it', async ({ page }) => {
     const headers = { authorization: `Bearer ${REAL_TOKEN}` };
     await pair(page);
     const bell = page.locator('#notification-bell');
     const unreadBefore = Number(await bell.getAttribute('data-unread'));
+    const decision = {
+      question: 'Approve the external merge route?',
+      context: 'The lane needs an owner-controlled integration route before anything moves.',
+      recommendation: 'Approve it; keep the unrelated repair separate.',
+      reservedClass: 'merge',
+      whyNotDelegable: 'Every final merge stays owner-performed.',
+      options: [
+        { id: 'approve', label: 'Approve the merge route', consequence: 'Gru prepares the owner-controlled merge.' },
+        { id: 'keep', label: 'Keep the lane parked', consequence: 'Nothing is re-armed.' },
+      ],
+      discussion: false,
+    };
+    // A bare coordination note is refused; the ask must be a typed decision.
+    expect(
+      (await page.request.post(`http://127.0.0.1:${REAL_PORT}/api/notifications/needs-owner`, {
+        headers, data: { title: 'Owner decision probe', detail: 'Merge outside Gru authority' },
+      })).status(),
+    ).toBe(400);
     const unauthorized = await page.request.post(`http://127.0.0.1:${REAL_PORT}/api/notifications/needs-owner`, {
-      data: { title: 'Owner decision probe', detail: 'Merge outside Gru authority' },
+      data: { title: 'Owner decision probe', detail: 'evidence', decision },
     });
     expect(unauthorized.status()).toBe(401);
     const posted = await page.request.post(`http://127.0.0.1:${REAL_PORT}/api/notifications/needs-owner`, {
-      headers, data: { title: 'Owner decision probe', detail: 'Merge outside Gru authority' },
+      headers, data: { title: 'Owner decision probe', detail: 'evidence', decision },
     });
     expect(posted.status()).toBe(201);
     const row = await posted.json();
-    expect(row).toMatchObject({ routing: 'needs-owner', severity: 'error' });
+    expect(row).toMatchObject({ routing: 'needs-owner', severity: 'error', decision: { reservedClass: 'merge' } });
     await expect.poll(async () => Number(await bell.getAttribute('data-unread'))).toBe(unreadBefore + 1);
     await expect(page.locator('.toast', { hasText: 'Owner decision probe' })).toHaveCount(1);
     await expect(page.locator('#chat-log .service-band', { hasText: 'Owner decision probe' })).toHaveCount(1);
     await bell.click();
-    const ownerRow = page.locator('.board-notification', { hasText: 'Owner decision probe' });
+    // The bell's copy of the shared card (the band renders the same
+    // decision — the strict locator must pick one surface).
+    const ownerRow = page.locator('#notification-list .board-notification', { hasText: 'Owner decision probe' });
     await expect(ownerRow).toBeVisible();
-    await expect(ownerRow.locator('.board-notification__ack')).toBeVisible();
+    await expect(ownerRow.locator('.board-notification__question')).toHaveText('Approve the external merge route?');
+    await expect(ownerRow.locator('.board-notification__ack')).toHaveCount(0);
     const board = await (await page.request.get(`http://127.0.0.1:${REAL_PORT}/api/board`, { headers })).json();
     expect(board.notifications.find((item: { id: string }) => item.id === row.id).shownAt).not.toBeNull();
-    await ownerRow.locator('.board-notification__ack').click();
-    // Same two-phase ack render as the FYI round-trip: the row carries ✓
-    // whether the optimistic button or the push re-render landed first.
-    await expect(ownerRow).toContainText('✓');
+    // Record the choice, then record the follow-through: the two states are
+    // distinct — 'decision recorded' is not completion.
+    await ownerRow.locator('[data-action-id$=":option:approve"]').click();
+    await expect(page.locator('#notification-list .board-notification', { hasText: 'Owner decision probe' })).toContainText('Decision recorded');
+    const decided = await (await page.request.get(`http://127.0.0.1:${REAL_PORT}/api/board`, { headers })).json();
+    const decidedRow = decided.notifications.find((item: { id: string }) => item.id === row.id);
+    expect(decidedRow.decidedOption).toBe('approve');
+    expect(decidedRow.resolvedAt).toBeNull();
+    const followThrough = await page.request.post(`http://127.0.0.1:${REAL_PORT}/api/notifications/${row.id}/disposition`, {
+      headers, data: { detail: 'Owner-approved route prepared by Gru' },
+    });
+    expect(followThrough.status()).toBe(200);
+    const resolved = await followThrough.json();
+    expect(resolved).toMatchObject({ resolvedBy: 'gru', decidedOption: 'approve' });
   });
 
   test('unauthenticated board API is a locked door', async ({ page }) => {
@@ -570,8 +598,12 @@ test('missing-key enabled startup is durable degraded: a browser connected AFTER
     // browser that connected after startup (no CLI-only error, no phantom
     // receipt). The panel lives inside #board-view — open it from the bell.
     await page.locator('#notification-bell').click();
-    await expect(page.locator('.board-notification', { hasText: 'Jev degraded' }).first()).toBeVisible();
-    await expect(page.locator('.board-notification', { hasText: 'Jev degraded' }).first().locator('.board-notification__ack')).toBeVisible();
+    const degraded = page.locator('.board-notification', { hasText: 'Jev degraded' }).first();
+    await expect(degraded).toBeVisible();
+    // Owner-only notice: the manual remediation is named, and no generic
+    // Ack pretends to fix a degraded provider.
+    await expect(degraded.locator('.board-notification__guidance')).toContainText('Fix the decision-provider credential');
+    await expect(degraded.locator('.board-notification__ack')).toHaveCount(0);
   } finally {
     await service.stop();
   }
