@@ -75,9 +75,11 @@ resolves to PATHS, never pasted bytes:
   (`[attached files — read them yourself at these paths]`) — the agent
   always receives paths and reads the files itself. No image bytes ride
   the prompt in this flow.
-- **Vision gating**: each spawned handle projects `images` from the
+- **Vision gating**: each spawned pi handle projects `images` from the
   **resolved model's declared input types**, not from a runtime-wide
-  constant. An `image` chip on a handle whose resolved model does not
+  constant. claude-code handles always declare images — every Claude model
+  accepts them (owner ruling 2026-10-15), so no catalog lookup gates
+  vision there. An `image` chip on a handle whose resolved model does not
   declare image input DECLINES GRACEFULLY — the paths still deliver, a
   logged `notice` tells the user vision is unavailable, and the prompt
   instructs the agent never to guess at image contents. Missing model

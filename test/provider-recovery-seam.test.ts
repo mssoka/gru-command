@@ -21,7 +21,10 @@ import type {
 } from '../src/runtime/types.js';
 import type { AgentEventEnvelope } from '../src/runtime/registry.js';
 import { publishSpawnRegistration } from '../src/runtime/spawn-registration.js';
-import { establishProviderWait, ProviderRecoverySensor } from '../src/provider-recovery/sensor.js';
+import { establishProviderWait, ProviderRecoverySensor, type MetadataReaderPort } from '../src/provider-recovery/sensor.js';
+import { composeMetadataReaders, type NativeCommandPort } from '../src/provider-recovery/composition.js';
+import { CLAUDE_METADATA_ENDPOINT } from '../src/provider-recovery/metadata.js';
+import { claudeInBandError } from '../src/runtime/claude-adapter.js';
 import { claimProviderRecoveryContinuation } from '../src/provider-recovery/resume.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
@@ -191,7 +194,11 @@ class SeamHarness {
   supervisor: Supervisor;
   sensor: ProviderRecoverySensor;
 
-  constructor(pacing: Pick<SupervisorOptions, 'rateLimitBackoff' | 'sleep' | 'jitter'> = {}, glmGenerationFallback = false) {
+  constructor(
+    pacing: Pick<SupervisorOptions, 'rateLimitBackoff' | 'sleep' | 'jitter'> = {},
+    glmGenerationFallback = false,
+    metadataReaders?: Readonly<Record<string, MetadataReaderPort>>,
+  ) {
     const dir = mkdtempSync(join(tmpdir(), 'gru-command-pr-seam-'));
     cleanupDirs.push(dir);
     const db = new LedgerDb(dir);
@@ -209,6 +216,7 @@ class SeamHarness {
         },
       },
       silasHosted: () => true,
+      ...(metadataReaders !== undefined ? { metadataReaders } : {}),
     });
     const sensor = this.sensor;
     this.supervisor = new Supervisor({
@@ -272,8 +280,16 @@ class SeamHarness {
     this.supervisor.start();
   }
 
-  /** A live minion with an open turn, then a structured GLM quota error. */
-  async runMinionIntoQuotaWall(jobId: string): Promise<FakeHandle> {
+  /** A live minion with an open turn, then a structured quota error (GLM
+   * unless the caller supplies the runtime's own event). */
+  async runMinionIntoQuotaWall(jobId: string, error: RuntimeEvent = {
+    type: 'error',
+    error: '429: {"error":{"code":"1302","message":"usage window limit reached"}}',
+    fatal: false,
+    provider: 'zai-coding-cn',
+    model: 'glm-5.3',
+    typed: { origin: 'provider-message', status: 429, bodyCode: '1302' },
+  }): Promise<FakeHandle> {
     const sessionDir = mkdtempSync(join(tmpdir(), 'pr-seam-session-'));
     cleanupDirs.push(sessionDir);
     const sessionFile = join(sessionDir, 'minion.jsonl');
@@ -292,14 +308,7 @@ class SeamHarness {
     this.ledger.registerAgent({ id: handle.id, role: 'minion', jobId, sessionFile });
     // Open turn, then the provider rejection.
     handle.emit({ type: 'turn_start' });
-    handle.emit({
-      type: 'error',
-      error: '429: {"error":{"code":"1302","message":"usage window limit reached"}}',
-      fatal: false,
-      provider: 'zai-coding-cn',
-      model: 'glm-5.3',
-      typed: { origin: 'provider-message', status: 429, bodyCode: '1302' },
-    });
+    handle.emit(error);
     return handle;
   }
 
@@ -484,6 +493,45 @@ describe('supervisor ⇄ sensor seam', () => {
     expect(waits[0]?.continuation?.promptOwner).toBe('minion-brief');
     expect(waits[0]?.incidentId).toBe(incident?.id);
     // The stop itself is unchanged: the handle is disposed.
+    expect(handle.disposed).toBe(true);
+  });
+
+  it('a claude-code usage-limit wall becomes a provider wait on the native claude.ai route — never a stranded lane', async () => {
+    const keychain: NativeCommandPort = {
+      findGenericPassword: () => Promise.resolve({ exitCode: 0, stdout: JSON.stringify({
+        claudeAiOauth: { accessToken: 'claude-access-token', expiresAt: Date.now() + 3_600_000, subscription: 'max' },
+      }) }),
+    };
+    const h = new SeamHarness({}, false, composeMetadataReaders({
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, probeTimeoutMs: 30_000 },
+      fetch: { get: () => Promise.reject(new Error('establishment never reads usage metadata')) },
+      claude: { command: keychain, context: () => ({ overridesPresent: false }), account: () => 'fixture-user' },
+    }));
+    // Production truth: pi's catalog has no route for the native login.
+    h.probe.resolveRoute = () => Promise.resolve(null);
+    // The exact event the claude-code adapter emits for the CLI's
+    // usage-limit frames (synthetic message + api_error_status 429).
+    const text = "You've hit your limit · resets 3pm (UTC)";
+    const claudeWall = claudeInBandError(
+      { subtype: 'success', isError: true, text, apiErrorStatus: 429 },
+      { text, code: 'rate_limit', status: 429 },
+      'claude-opus-5-5',
+    );
+    const handle = await h.runMinionIntoQuotaWall('job-claude-wall', claudeWall);
+    await h.settle();
+    const incident = h.ledger.listNotifications({ unackedOnly: true })
+      .find((n) => n.kind.startsWith('supervision.provider-wall.'));
+    expect(incident?.kind).toBe(`supervision.provider-wall.${handle.id}.quota_wall`);
+    expect(incident?.routing).toBe('action-required');
+    const waits = h.ledger.listProviderWaits({ status: 'waiting' });
+    expect(waits).toHaveLength(1);
+    expect(waits[0]).toMatchObject({
+      agentId: handle.id,
+      provider: 'anthropic-claude-native',
+      model: 'claude-opus-5-5',
+      endpoint: CLAUDE_METADATA_ENDPOINT,
+      incidentId: incident?.id,
+    });
     expect(handle.disposed).toBe(true);
   });
 

@@ -431,6 +431,85 @@ bob = { thinking_level = "medium" }
     ).toEqual({ model: 'default', thinkingLevel: 'max' });
   });
 
+  it('claude-code passes over pi references in the shared [models] tiers (Claude Code is always Anthropic)', () => {
+    const home = tmpHome();
+    // A pi-first config (the owner's shape): every shared ref names a pi provider.
+    writeConfig(home, `
+[models]
+default = "openai-codex/gpt-6.1-sol"
+
+[models.roles]
+gru = "openai-codex/gpt-6-astra"
+silas = "anthropic/claude-sonnet-5-5"
+perkins = "bedrock/us.anthropic.claude-opus-5-5-v1:0"
+bob = "opus"
+`);
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    // pi is untouched.
+    expect(resolveSpawnPolicy(config, 'pi', 'gru').model).toBe('openai-codex/gpt-6-astra');
+    // claude-code skips both pi refs and lands on Claude Code's own model.
+    expect(resolveSpawnPolicy(config, 'claude-code', 'gru')).toEqual({
+      model: 'default',
+      thinkingLevel: 'default',
+      passedOver: [
+        { tier: 'models.roles.gru', ref: 'openai-codex/gpt-6-astra' },
+        { tier: 'models.default', ref: 'openai-codex/gpt-6.1-sol' },
+      ],
+    });
+    // Anthropic refs (prefixed, bare, or an Anthropic id on a cloud route) apply as before.
+    expect(resolveSpawnPolicy(config, 'claude-code', 'silas')).toEqual({ model: 'anthropic/claude-sonnet-5-5', thinkingLevel: 'default' });
+    expect(resolveSpawnPolicy(config, 'claude-code', 'perkins').model).toBe('bedrock/us.anthropic.claude-opus-5-5-v1:0');
+    expect(resolveSpawnPolicy(config, 'claude-code', 'bob').model).toBe('opus');
+
+    // Explicit claude-code tiers are never filtered and win as before.
+    const pinned = tmpHome();
+    writeConfig(pinned, `
+[models]
+default = "openai-codex/gpt-6.1-sol"
+
+[runtimes.claude-code]
+model = "sonnet"
+
+[runtimes.claude-code.roles]
+gru = { model = "opus" }
+`);
+    const pinnedConfig = loadConfig({ GRU_COMMAND_HOME: pinned }, '/home/tester');
+    expect(resolveSpawnPolicy(pinnedConfig, 'claude-code', 'gru')).toEqual({ model: 'opus', thinkingLevel: 'default' });
+    expect(resolveSpawnPolicy(pinnedConfig, 'claude-code', 'minion')).toEqual({ model: 'sonnet', thinkingLevel: 'default' });
+
+    // Cloud routes are recognized by id SHAPE; a reseller's own Claude id is a
+    // pi reference. Pi-only thinking levels in the shared tiers pass over too.
+    const shapes = tmpHome();
+    writeConfig(shapes, `
+[models]
+default = "default"
+
+[models.roles]
+gru = "github-copilot/claude-sonnet-4.6"
+silas = "vertex/claude-opus-4-1@20250805"
+minion = "amazon-bedrock/global.anthropic.claude-opus-5-5-v1:0"
+
+[thinking]
+default = "minimal"
+
+[thinking.roles]
+silas = "max"
+`);
+    const shapesConfig = loadConfig({ GRU_COMMAND_HOME: shapes }, '/home/tester');
+    expect(resolveSpawnPolicy(shapesConfig, 'claude-code', 'gru')).toEqual({
+      model: 'default',
+      thinkingLevel: 'default',
+      passedOver: [
+        { tier: 'models.roles.gru', ref: 'github-copilot/claude-sonnet-4.6' },
+        { tier: 'thinking.default', ref: 'minimal' },
+      ],
+    });
+    expect(resolveSpawnPolicy(shapesConfig, 'claude-code', 'silas')).toEqual({ model: 'vertex/claude-opus-4-1@20250805', thinkingLevel: 'max' });
+    expect(resolveSpawnPolicy(shapesConfig, 'claude-code', 'minion').model).toBe('amazon-bedrock/global.anthropic.claude-opus-5-5-v1:0');
+    // pi keeps every shared value, including its own "minimal".
+    expect(resolveSpawnPolicy(shapesConfig, 'pi', 'gru')).toEqual({ model: 'github-copilot/claude-sonnet-4.6', thinkingLevel: 'minimal' });
+  });
+
   it('treats empty strings as the default sentinel (E1 configs keep working)', () => {
     const home = tmpHome();
     writeConfig(home, '[models]\ndefault = ""\n');
@@ -505,6 +584,20 @@ bob = { thinking_level = "medium" }
     expect(() => loadConfig({ GRU_COMMAND_HOME: home2 }, '/home/tester')).toThrow(
       /unknown key `model_refresh_timeout_ms` in \[runtimes\.claude-code\]/,
     );
+  });
+});
+
+describe('[provider_recovery] claude_native', () => {
+  it('defaults ON (independent of enabled), parses false, and rejects a non-boolean', () => {
+    const fresh = tmpHome();
+    writeConfig(fresh, '');
+    expect(loadConfig({ GRU_COMMAND_HOME: fresh }, '/home/tester').providerRecovery).toMatchObject({ enabled: false, claudeNative: true });
+    const off = tmpHome();
+    writeConfig(off, '[provider_recovery]\nclaude_native = false\n');
+    expect(loadConfig({ GRU_COMMAND_HOME: off }, '/home/tester').providerRecovery).toMatchObject({ enabled: false, claudeNative: false });
+    const bad = tmpHome();
+    writeConfig(bad, '[provider_recovery]\nclaude_native = "yes"\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: bad }, '/home/tester')).toThrow(/provider_recovery\.claude_native/);
   });
 });
 

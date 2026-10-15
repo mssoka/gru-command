@@ -11,7 +11,7 @@ concrete adapter — the interface is the contract (SPEC ruling 4).
 | `streaming` | ✅ | ✅ | text/thinking deltas emitted live (claude: `--include-partial-messages`, with a complete-frame fallback) |
 | `steer` | `native` | `queued` | mid-turn steering; claude's `-p` surface has no mid-turn channel → the interface layer queues-until-idle |
 | `resume` | `file` | `file` | sessions resume from durable state (claude: `--session-id`/`--resume` chaining) |
-| `images` | ✅ | ✅ | image content accepted in prompts (claude: base64 blocks in the stdin user frame) |
+| `images` | ✅ | ✅ | image content accepted in prompts (claude: base64 blocks in the stdin user frame; every Claude model accepts images, so no model metadata gates it) |
 | `thinking` | ✅ | ✅ | thinking output surfaced as events |
 | `thinkingLevelControl` | ✅ | ✅ | thinking level settable per spawn (claude: `--effort`) |
 | `followUp` | ✅ | ❌ | claude has no native followUp channel — queued messages deliver as fresh prompt turns |
@@ -103,7 +103,17 @@ appended verbatim to the session-store file, plus one adapter-written
 `{"type":"user", …, "gc_prompt":true}` frame right after each turn's
 verified `init` recording what the turn was asked (stdout carries only
 claude's side; the CLI's `--replay-user-messages` is deliberately not used
-because it also echoes the worker-verification permission responses)
+because it also echoes the worker-verification permission responses).
+API failures carry the CLI's typed failure (`api_error_status` + `error`
+code, e.g. `429`/`rate_limit` for a claude.ai usage limit) as typed
+provider-response provenance with provider `anthropic-claude-native` and the
+CLI-resolved model; the error text ends `(HTTP <status>, <code>)`, so a
+Claude quota wall takes the same path as a pi lane's: bounded `[pacing]`
+retries, the supervisor's quota-wall stop, and — by default
+(`[provider_recovery] claude_native = true`, independent of the GLM/Codex
+`enabled` switch) — a provider wait read from the claude.ai usage endpoint
+that resumes the lane when the window resets (API-key/override contexts
+stay owner-controlled)
 (`sessions/<role>/--<dashed-cwd>--<hash8>/<ISO-ts>_<session-uuid>.jsonl`),
 so the lock / hourly backup / boot growth-detection machinery applies
 unchanged (SPEC ruling 12). Resume by `resumeFile` reads the session id
@@ -143,18 +153,21 @@ system prompt rides `--append-system-prompt`. `--tools` restricts built-ins
 only, so MCP servers are governed separately by `[runtimes.claude-code] mcp`
 (owner decision 2026-10-15, off by default): `"none"` (default) passes
 `--strict-mcp-config`, so a session gets exactly its role's tools, like pi;
-`"project"` loads only the session cwd's checked-in `.mcp.json`;
-`"user"` loads the operator's own Claude MCP configuration (claude.ai
-connectors included), all without prompts. Isolated review sessions are
-always strict regardless. The richer
+`"project"` loads only the session cwd's checked-in `.mcp.json` — a regular
+file (never a symlink) that git tracks unmodified at HEAD, re-checked every
+turn (each turn is a fresh CLI process); an untracked, edited or missing
+file loads nothing that turn (logged); `"user"` loads the operator's own
+Claude MCP configuration (claude.ai connectors included), all without
+prompts. Isolated review sessions and sessions with a narrowed role-tool
+override (bounded child workers) are always strict regardless. The richer
 per-role permission model is E8 territory; LAN bind + pairing token
 (ruling 9) is the v1 security perimeter.
 
 **Model & thinking.** `"default"` omits both flags (claude's own
 configuration decides). Claude Code is always Anthropic, so a model needs
 no provider: the CLI's own names (`opus`, `claude-opus-5-5`) are the native
-form, and a bare name reads the `anthropic` catalog entry for its declared
-vision support. An explicit `"provider/model"` reference strips
+form, and every Claude model accepts images (no catalog lookup gates vision
+for any name, alias or `"default"`). An explicit `"provider/model"` reference strips
 the provider segment for `--model` (`anthropic/claude-x` → `claude-x`;
 Bedrock-style dotted ids survive: `bedrock/us.anthropic.claude-x` →
 `us.anthropic.claude-x`). Thinking maps to `--effort`; claude accepts
@@ -231,6 +244,18 @@ runs at wizard/boot time, never on a hot path.
   3. `[models.roles]` / `[thinking.roles]`
   4. `[runtimes.<id>]` per-runtime `model` / `thinking_level`
   5. `[models] default` / `[thinking] default`
+
+  Claude Code is always Anthropic: for `claude-code`, a model in the shared
+  tiers 3 and 5 applies only when it names no provider, `anthropic`, or has
+  an Anthropic cloud-route id SHAPE — a Bedrock id (`[region.]anthropic.…`)
+  or a Vertex id (`claude-…@YYYYMMDD`). Any other provider (`openai-codex/…`,
+  or a reseller's own Claude id such as `github-copilot/claude-sonnet-4.6`)
+  is a pi reference that claude-code resolution passes over. A shared-tier
+  thinking level the claude CLI does not accept (pi's `minimal`) is passed
+  over the same way. The registry logs every pass-over where it resolves the
+  policy; resolution ends at `"default"` — Claude Code's own model/effort —
+  when nothing else applies. Explicit `[runtimes.claude-code]` tiers and
+  spawn options are never filtered.
 - **Known limit — resumed sessions (issue #24).** A resumed session's
   persisted model outranks the settings default, so a saved model whose
   provider has no credentials fails at prompt time instead of falling back

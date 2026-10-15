@@ -10,10 +10,15 @@ import { DEFAULT_PROVIDER_RECOVERY_CONFIG, type ProviderRecoveryConfig } from '.
 import {
   establishProviderWait,
   ProviderRecoverySensor,
+  providerOfRouteKey,
+  providerRouteKey,
+  type MetadataReaderPort,
   type ProviderWallObservation,
   type RecoveryWakePort,
   type SlotReArmPort,
 } from '../src/provider-recovery/sensor.js';
+import { claudeSnapshot, composeMetadataReaders, type NativeCommandPort } from '../src/provider-recovery/composition.js';
+import { CLAUDE_METADATA_ENDPOINT, type MetadataFetchPort } from '../src/provider-recovery/metadata.js';
 import type { ProbeOutcome, ProviderProbePort, ProbeRoute } from '../src/provider-recovery/probe.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 
@@ -42,7 +47,7 @@ class Harness {
   silasEnabled = true;
   readonly worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'pr-sensor-wt-')));
 
-  constructor(config: Partial<ProviderRecoveryConfig> = {}) {
+  constructor(config: Partial<ProviderRecoveryConfig> = {}, metadataReaders?: Readonly<Record<string, MetadataReaderPort>>) {
     const dir = mkdtempSync(join(tmpdir(), 'gru-command-pr-sensor-'));
     cleanupDirs.push(dir);
     const db = new LedgerDb(dir);
@@ -67,6 +72,7 @@ class Harness {
       slotReArm: this.reArmPort(),
       silasHosted: () => this.silasEnabled,
       now: () => this.clockMs,
+      ...(metadataReaders !== undefined ? { metadataReaders } : {}),
     });
   }
 
@@ -295,7 +301,9 @@ describe('wait establishment (acceptance 1) — explicit evidence only', () => {
   });
 
   it('disabled config = fully inert recorder', async () => {
-    const h = new Harness({ enabled: false });
+    // Both switches off (claude_native defaults ON since 2026-10-15).
+    const h = new Harness({ enabled: false, claudeNative: false });
+    expect(h.sensor.enabled).toBe(false);
     h.makeJob('job-1');
     expect(await h.establishMinionWait()).toBeNull();
     expect(h.ledger.listProviderWaits()).toHaveLength(0);
@@ -725,7 +733,8 @@ describe('renewed quota + bounded false-recovery escalation (acceptance 7)', () 
 
 describe('sensor lifecycle', () => {
   it('start() is inert when disabled; ticks no-op', async () => {
-    const h = new Harness({ enabled: false });
+    const h = new Harness({ enabled: false, claudeNative: false });
+    expect(h.sensor.enabled).toBe(false);
     h.sensor.start();
     h.makeJob('job-1');
     await h.sensor.tick();
@@ -1145,5 +1154,159 @@ describe('r4 — the notifications port uses the dedupe-capable incident path (f
       .filter((notification) => notification.kind.startsWith('provider.false-recovery.'));
     expect(rows).toHaveLength(1);
     expect(rows[0]?.routing).toBe('action-required');
+  });
+});
+
+describe('native Claude quota walls (claude-code lanes)', () => {
+  const keychain: NativeCommandPort = {
+    findGenericPassword: () => Promise.resolve({ exitCode: 0, stdout: JSON.stringify({
+      claudeAiOauth: { accessToken: 'claude-access-token', expiresAt: Date.now() + 3_600_000, subscription: 'max' },
+    }) }),
+  };
+  const readers = (
+    overridesPresent: boolean,
+    command: NativeCommandPort = keychain,
+    fetch: MetadataFetchPort = { get: () => Promise.reject(new Error('establishment never reads usage metadata')) },
+  ) => composeMetadataReaders({
+    config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, probeTimeoutMs: 30_000 },
+    fetch,
+    claude: { command, context: () => ({ overridesPresent }), account: () => 'fixture-user' },
+  });
+  // Exactly what a claude-code lane's usage-limit error now carries.
+  const claudeWall: Partial<ProviderWallObservation> = {
+    provider: 'anthropic-claude-native',
+    model: 'claude-opus-5-5',
+    typed: { origin: 'provider-message', status: 429, bodyCode: 'rate_limit' },
+    errorMessage: "You've hit your limit · resets 3pm (UTC) (HTTP 429, rate_limit)",
+  };
+
+  it('a claude.ai usage-limit wall establishes a wait bound to the native usage endpoint and keychain credential', async () => {
+    const h = new Harness({}, readers(false));
+    // Production truth: pi's model catalog has no route for the native login.
+    h.probe.resolveRouteImpl = () => Promise.resolve(null);
+    h.makeJob('job-1');
+    const wait = await h.establishMinionWait(claudeWall);
+    const snapshot = await claudeSnapshot({ command: keychain, context: { overridesPresent: false }, account: 'fixture-user' });
+    if (typeof snapshot === 'string') throw new Error('fixture snapshot unexpectedly rejected');
+    expect(wait).toMatchObject({
+      provider: 'anthropic-claude-native',
+      model: 'claude-opus-5-5',
+      endpoint: CLAUDE_METADATA_ENDPOINT,
+      credentialFingerprint: snapshot.credentialFingerprint,
+      jobId: 'job-1',
+    });
+  });
+
+  it('Claude recovery is on by default while GLM/Codex stay owner-activated (claude_native, owner 2026-10-15)', async () => {
+    expect(DEFAULT_PROVIDER_RECOVERY_CONFIG).toMatchObject({ enabled: false, claudeNative: true });
+    // Shipped defaults: the master switch is off.
+    const h = new Harness({ enabled: false, glmGenerationFallback: false }, readers(false));
+    h.probe.resolveRouteImpl = () => Promise.resolve(null);
+    h.makeJob('job-1');
+    h.makeJob('job-2');
+    expect(h.sensor.enabled).toBe(true); // the sensor runs — for Claude
+    expect(h.sensor.enabledFor('anthropic-claude-native')).toBe(true);
+    expect(h.sensor.enabledFor('zai-coding-cn')).toBe(false);
+    expect(h.sensor.enabledFor('openai-codex')).toBe(false);
+    expect(await h.establishMinionWait(claudeWall)).not.toBeNull();
+    // A GLM wall under the same defaults never becomes a wait.
+    expect(await h.establishMinionWait({ agentId: 'agent-minion-2', jobId: 'job-2' })).toBeNull();
+    // claude_native = false keeps Claude owner-controlled too.
+    const off = new Harness({ enabled: false, claudeNative: false }, readers(false));
+    off.probe.resolveRouteImpl = () => Promise.resolve(null);
+    off.makeJob('job-1');
+    expect(off.sensor.enabled).toBe(false);
+    expect(await off.establishMinionWait(claudeWall)).toBeNull();
+  });
+
+  it('a Claude-only sensor never probes, settles or re-wakes routes of providers that are off', async () => {
+    // GLM routes recorded while the owner had GLM recovery armed: one already
+    // recovered with its delivery still pending (lost across a restart)...
+    const h = new Harness();
+    h.makeJob('job-1');
+    h.makeJob('job-2');
+    const recovered = await h.establishMinionWait();
+    h.advance(Math.max(0, Date.parse(h.ledger.getProviderRoute(recovered!.routeKey)!.nextCheckAt) - h.now) + 1);
+    h.probe.queueCompleted();
+    await h.sensor.tick();
+    expect(h.ledger.getProviderWait(recovered!.id)?.status).toBe('recovered-pending');
+    expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(1);
+    // ...and one still waiting on its own route.
+    const waiting = await h.establishMinionWait({ agentId: 'agent-minion-2', jobId: 'job-2', model: 'glm-5.3-flash',
+      sessionFile: '/tmp/minion-2.jsonl', incidentId: 'supervision.provider-wall.agent-minion-2.quota_wall' });
+    expect(waiting?.routeKey).not.toBe(recovered!.routeKey);
+    const wakes = h.wakes.length;
+    const calls = h.probe.calls.length;
+    // A service now running with GLM off (Claude only) leaves both alone.
+    const claudeOnly = new ProviderRecoverySensor({
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: false, claudeNative: true },
+      ledger: h.ledger,
+      probe: h.probe,
+      notifications: h.notifications,
+      wake: h.wakePort(),
+      slotReArm: h.reArmPort(),
+      silasHosted: () => true,
+      now: () => h.now + 3_600_000,
+    });
+    expect(await claudeOnly.reconcileAtBoot()).toEqual({ rewoken: 0 });
+    await claudeOnly.tick();
+    expect(h.wakes).toHaveLength(wakes);
+    expect(h.probe.calls).toHaveLength(calls);
+    expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(1);
+    expect(h.ledger.getProviderWait(waiting!.id)?.status).toBe('waiting');
+    // Control: the same pending delivery IS re-woken by a GLM-armed sensor.
+    expect(await h.sensor.reconcileAtBoot()).toEqual({ rewoken: 1 });
+  });
+
+  it('enabled = true never overrides claude_native = false: no Claude wait and no keychain read', async () => {
+    let keychainReads = 0;
+    const counted: NativeCommandPort = { findGenericPassword: (input) => { keychainReads += 1; return keychain.findGenericPassword(input); } };
+    const h = new Harness({ enabled: true, claudeNative: false }, readers(false, counted));
+    h.makeJob('job-1');
+    h.makeJob('job-2');
+    expect(h.sensor.enabledFor('anthropic-claude-native')).toBe(false);
+    expect(h.sensor.enabledFor('zai-coding-cn')).toBe(true);
+    expect(await h.establishMinionWait(claudeWall)).toBeNull();
+    expect(keychainReads).toBe(0);
+    // GLM still recovers under its own switch.
+    expect(await h.establishMinionWait({ agentId: 'agent-minion-2', jobId: 'job-2', sessionFile: '/tmp/minion-2.jsonl',
+      incidentId: 'supervision.provider-wall.agent-minion-2.quota_wall' })).not.toBeNull();
+  });
+
+  it('a Claude wait under the shipped defaults reads claude.ai usage and recovers the lane', async () => {
+    const usage = JSON.stringify({ windows: {
+      five_hour: { utilization: 0.2, resetsAtUtc: '2026-09-28T15:40:00Z' },
+      seven_day: { utilization: 0.1, resetsAtUtc: '2026-09-29T19:00:00Z' },
+    } });
+    const reads: string[] = [];
+    const h = new Harness({ enabled: false, claudeNative: true, glmGenerationFallback: false }, readers(false, keychain, {
+      get: ({ url }) => { reads.push(url); return Promise.resolve({ status: 200, body: usage }); },
+    }));
+    h.probe.resolveRouteImpl = () => Promise.resolve(null);
+    h.makeJob('job-1');
+    const wait = await h.establishMinionWait(claudeWall);
+    expect(wait?.endpoint).toBe(CLAUDE_METADATA_ENDPOINT);
+    h.advance(Math.max(0, Date.parse(h.ledger.getProviderRoute(wait!.routeKey)!.nextCheckAt) - h.now) + 1);
+    await h.sensor.tick();
+    expect(reads).toEqual([CLAUDE_METADATA_ENDPOINT]); // a usage read, never generation
+    expect(h.probe.calls).toEqual([]);
+    expect(h.ledger.getProviderWait(wait!.id)?.status).toBe('recovered-pending');
+    expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(1);
+    expect(await h.sensor.reconcileAtBoot()).toEqual({ rewoken: 1 });
+    expect(h.wakes.filter((wake) => wake.routeKey === wait!.routeKey).length).toBeGreaterThan(0);
+  });
+
+  it('route keys parse strictly: provider ids never contain "/"', () => {
+    expect(providerOfRouteKey(providerRouteKey('anthropic-claude-native', 'claude-opus-5-5', 'fp'))).toBe('anthropic-claude-native');
+    expect(() => providerOfRouteKey('no-provider-segment')).toThrow(/is not "<provider>\/<model>@<fingerprint>"/);
+  });
+
+  it('API-key/override and missing-keychain contexts resolve no native route — owner control preserved', async () => {
+    for (const reader of [readers(true), readers(false, { findGenericPassword: () => Promise.resolve(null) })]) {
+      const h = new Harness({}, reader);
+      h.probe.resolveRouteImpl = () => Promise.resolve(null);
+      h.makeJob('job-1');
+      expect(await h.establishMinionWait(claudeWall)).toBeNull();
+    }
   });
 });

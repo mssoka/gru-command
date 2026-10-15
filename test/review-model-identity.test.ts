@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { publicRecoveryModelIdentity } from '../src/runtime/review-model-identity.js';
+import { isPublicModelToken, publicRecoveryModelIdentity } from '../src/runtime/review-model-identity.js';
 
 /**
  * Claude review recovery identity: model names are judged by shape, never
@@ -25,6 +25,13 @@ describe('publicRecoveryModelIdentity (claude-code)', () => {
     expect(claude('a/b/c')).toBe(false);
     expect(claude('')).toBe(false);
     expect(claude('claude opus')).toBe(false);
+    // Model ids are lowercase; mixed-case key/token material never enters
+    // the persisted manifest as a "model".
+    expect(claude('sk-ant-api03-Xy7Qk9LmN2pR4tVb8wZ1cD3fG5hJ')).toBe(false);
+    expect(claude('anthropic/ghp_Ab12Cd34Ef56Gh78Ij90')).toBe(false);
+    expect(claude('claude-opus-5-5', { settingsModel: 'sk-proj-AbCdEfGhIjKl' })).toBe(false);
+    expect(isPublicModelToken('claude-opus-5-5')).toBe(true);
+    expect(isPublicModelToken('Claude-Opus-5-5')).toBe(false);
     expect(claude('claude-opus-5-5', { settingsModel: 'has space' })).toBe(false);
     expect(claude('claude-opus-5-5', { thinkingLevel: 'turbo' })).toBe(false);
     expect(publicRecoveryModelIdentity({ runtimeId: 'claude-code', modelRef: 'opus', routingSha256: 'x' })).toBe(false);

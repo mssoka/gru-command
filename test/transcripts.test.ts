@@ -348,6 +348,33 @@ describe('transcript service', () => {
     expect(entries[1]?.thinking).toBe('use ls');
   });
 
+  it('claude-code parallel tool results render one named entry each; an error_* subtype alone flags the result', () => {
+    const { dir, svc } = tmpStore();
+    const file = join(dir, 'sessions', 'minion', 'd', 'parallel.jsonl');
+    mkdirSync(join(dir, 'sessions', 'minion', 'd'), { recursive: true });
+    writeFileSync(
+      file,
+      [
+        JSON.stringify({ type: 'assistant', message: { id: 'm1', role: 'assistant', content: [
+          { type: 'tool_use', id: 'toolu_a', name: 'Read', input: {} },
+          { type: 'tool_use', id: 'toolu_b', name: 'Grep', input: {} },
+        ] }, session_id: 'c1' }),
+        // Parallel calls answer in ONE user frame.
+        JSON.stringify({ type: 'user', message: { role: 'user', content: [
+          { type: 'tool_result', tool_use_id: 'toolu_a', content: 'file body' },
+          { type: 'tool_result', tool_use_id: 'toolu_b', content: 'no matches', is_error: true },
+        ] }, session_id: 'c1' }),
+        JSON.stringify({ type: 'result', subtype: 'error_max_turns' }),
+      ].join('\n') + '\n',
+    );
+    const entries = [...svc.page('minion/d/parallel.jsonl').entries].reverse();
+    expect(entries.map((e) => [e.index, e.kind, e.text, e.toolName, e.isError])).toEqual([
+      [0, 'tool_result', 'file body', 'Read', false],
+      [1, 'tool_result', 'no matches', 'Grep', true],
+      [2, 'system', 'turn result: error_max_turns', null, true],
+    ]);
+  });
+
   it('an empty session file pages cleanly (total 0)', () => {
     const { dir, svc } = tmpStore();
     mkdirSync(join(dir, 'sessions', 'gru', 'd'), { recursive: true });

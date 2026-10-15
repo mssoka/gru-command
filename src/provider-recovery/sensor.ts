@@ -9,6 +9,7 @@ import type {
 } from '../ledger/api.js';
 import type { ProviderRecoveryConfig } from '../config.js';
 import {
+  CLAUDE_NATIVE_PROVIDER,
   classifyProviderRejection,
   providerSupportsSensor,
   type ProviderRejectionEvidence,
@@ -48,6 +49,14 @@ export function providerRouteKey(provider: string, model: string, fingerprint: s
   return `${provider}/${model}@${fingerprint}`;
 }
 
+/** The provider segment of a key built by providerRouteKey (fail-loud on any
+ * other shape: provider ids never contain "/"). */
+export function providerOfRouteKey(routeKey: string): string {
+  const slash = routeKey.indexOf('/');
+  if (slash <= 0) throw new Error(`provider route key "${routeKey}" is not "<provider>/<model>@<fingerprint>"`);
+  return routeKey.slice(0, slash);
+}
+
 /** The notifications surface the sensor needs (NotificationCenter fits).
  * r4 note: this port DECLARES postIncident, not post — the real center's
  * `post` carries no dedupe, so a `dedupe` field there was silently
@@ -81,6 +90,10 @@ export interface SlotReArmPort {
  * (Codex/Claude adapters; zero generation). */
 export interface MetadataReaderPort {
   read(route: ProbeRoute): Promise<import('./probe.js').ProbeOutcome>;
+  /** A provider with no pi catalog route (the native claude.ai route)
+   * resolves its own endpoint + credential fingerprint from the SAME
+   * snapshot its reads verify; absent = the shared runtime catalog. */
+  resolveRoute?(provider: string, model: string): Promise<import('./probe.js').ResolvedRoute | null>;
 }
 
 export interface ProviderRecoverySensorOptions {
@@ -147,6 +160,13 @@ export async function establishProviderWait(
   if (observation.provider === null || observation.model === null) {
     sensor.debugLog('provider wall without structured provider identity — owner control preserved', {
       agent_id: observation.agentId,
+    });
+    return null;
+  }
+  if (!sensor.enabledFor(observation.provider)) {
+    sensor.debugLog('automatic recovery is off for this provider — owner control preserved', {
+      agent_id: observation.agentId,
+      provider: observation.provider,
     });
     return null;
   }
@@ -219,7 +239,7 @@ export class ProviderRecoverySensor {
   private disposed = false;
 
   constructor(opts: ProviderRecoverySensorOptions) {
-    this.enabled = opts.config.enabled;
+    this.enabled = opts.config.enabled || opts.config.claudeNative;
     this.cfg = opts.config;
     this.ledger = opts.ledger;
     this.probe = opts.probe;
@@ -283,7 +303,7 @@ export class ProviderRecoverySensor {
     if (metadata !== undefined) {
       return {
         probe: (route) => metadata.read(route),
-        resolveRoute: (p, m) => this.probe.resolveRoute(p, m),
+        resolveRoute: (p, m) => metadata.resolveRoute?.(p, m) ?? this.probe.resolveRoute(p, m),
       };
     }
     if (provider === 'zai-coding-cn' && this.cfg.glmGenerationFallback) {
@@ -301,6 +321,20 @@ export class ProviderRecoverySensor {
         }),
       resolveRoute: (p, m) => this.probe.resolveRoute(p, m),
     };
+  }
+
+  /** Whether automatic recovery is on for a provider. The two switches are
+   * independent: `claude_native` (on by default) alone governs the native
+   * claude.ai route — `enabled = true` never overrides `claude_native =
+   * false` — and `enabled` governs every other supported route. Routes of a
+   * provider that is off are never waited on, probed or re-woken — exactly
+   * as with the whole sensor off. */
+  enabledFor(provider: string): boolean {
+    return provider === CLAUDE_NATIVE_PROVIDER ? this.cfg.claudeNative : this.cfg.enabled;
+  }
+
+  private routeEnabled(routeKey: string): boolean {
+    return this.enabledFor(providerOfRouteKey(routeKey));
   }
 
   /** Start the deterministic service timer (never an OS daemon). */
@@ -334,7 +368,7 @@ export class ProviderRecoverySensor {
   /** One deterministic observation pass over every waiting route. */
   async tick(): Promise<void> {
     if (this.disposed || !this.enabled) return;
-    const waiting = this.ledger.listProviderWaits({ status: 'waiting' });
+    const waiting = this.ledger.listProviderWaits({ status: 'waiting' }).filter((wait) => this.enabledFor(wait.provider));
     const byRoute = new Map<string, ProviderWaitRecord[]>();
     for (const wait of waiting) {
       const group = byRoute.get(wait.routeKey);
@@ -753,7 +787,7 @@ export class ProviderRecoverySensor {
 
   /** Retire delivery markers whose every waiter settled or was superseded. */
   private async settlePendingRecoveries(): Promise<void> {
-    for (const pending of this.ledger.listPendingProviderRecoveries()) {
+    for (const pending of this.ledger.listPendingProviderRecoveries().filter((p) => this.routeEnabled(p.routeKey))) {
       const open = this.pendingBatchWaits(pending);
       if (open.every((wait) => wait.recoveryBatchId !== null && this.retirementIdentity(wait) === 'superseded')) {
         this.ledger.clearPendingProviderRecovery(pending.id);
@@ -772,7 +806,7 @@ export class ProviderRecoverySensor {
   async reconcileAtBoot(): Promise<{ rewoken: number }> {
     if (!this.enabled) return { rewoken: 0 };
     let rewoken = 0;
-    for (const pending of this.ledger.listPendingProviderRecoveries()) {
+    for (const pending of this.ledger.listPendingProviderRecoveries().filter((p) => this.routeEnabled(p.routeKey))) {
       const open = this.pendingBatchWaits(pending);
       if (open.every((wait) => wait.recoveryBatchId !== null && this.retirementIdentity(wait) === 'superseded')) {
         this.ledger.clearPendingProviderRecovery(pending.id);

@@ -59,7 +59,7 @@ Approved Gru-command work has twice been interrupted by a temporary GLM provider
 - Code ownership: the cap lane (worker-residency-budget) owns shared resident admission/quiescence/disposal; #69 owns worktree/target freezing; #130 owns App credentials/publishing. No editing other lanes, no vendoring their WIP, no second capacity counter, no bypassing normal registry admission. If edits require changing cap-owned behavior, stop at that seam and escalate.
 - No live provider calls during development; tests use fake credentials/transports/homes; no ambient credentials or live keys in tests; reference scripts are never executed.
 - Verification discipline: deterministic fake-clock/deferred/mock-provider tests for the full scenario matrix (gate-matrix.md); ALL broad or service-spawning verification goes through authenticated `/api/verify` with ≥36 GiB free and a real coordinated media/process-safe checkpoint through Silas requested first; every failed attempt preserved; no direct retries after failure, no tail/tee exit laundering, no timeout/pool weakening, no blaming CI for local failures.
-- Gate discipline: fresh independent BMAD final-diff review is separate from exact-final-head CI and required native Perkins; the worker does not self-arm Perkins or force branch idle; no merge/deploy/restart/live config or auth changes/production provider probing; owner activation stays manual.
+- Gate discipline: fresh independent BMAD final-diff review is separate from exact-final-head CI and required native Perkins; the worker does not self-arm Perkins or force branch idle; no merge/deploy/restart/live config or auth changes/production provider probing; owner activation stays manual (GLM/Codex — superseded for the native Claude route on 2026-10-15: on by default, see below).
 
 ## Non-goals
 
@@ -123,12 +123,18 @@ including the real DispatchService ⇄ supervisor ⇄ sensor seam.
 The approved capabilities above remain the contract, not a claim of
 completed acceptance:
 
-- **Native Claude overlay path — DORMANT/UNSHIPPED.** The metadata reader
-  is composed but cannot fire in production: the claude-code runtime
-  emits no provider identity or typed provenance for it, and
-  `anthropic-claude-native` has no resolvable pi catalog route. Grounding
-  it needs a runtime provenance + route-resolution contract (see the gate
-  matrix); the overlay privilege is retained for a later follow-up.
+- **Native Claude overlay path — DORMANT/UNSHIPPED** (at acceptance). The
+  metadata reader was composed but could not fire in production: the
+  claude-code runtime emitted no provider identity or typed provenance for
+  it, and `anthropic-claude-native` had no resolvable pi catalog route.
+  **Superseded 2026-10-15 (PR #382, owner decision):** grounded by both
+  contracts — the claude-code runtime now emits typed provider-response
+  provenance (the CLI's `api_error_status` + `error` code) under provider
+  `anthropic-claude-native` with the CLI-resolved model, and the native
+  reader resolves its own route (fixed usage endpoint + the keychain
+  snapshot's credential fingerprint). Nothing was relaxed (API-key/override
+  contexts still fail closed), and the route is ON by default through its
+  own `[provider_recovery] claude_native` switch, independent of `enabled`.
 - Progress-gated fan-out still has no production consumer (the cap-owned
   runtime emitter is ungrounded).
 

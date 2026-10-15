@@ -125,7 +125,7 @@ default = "pi"
 # bob = "pi"
 
 [models]
-# Default model reference. pi takes an explicit "provider/model" reference as-is. claude-code is always Anthropic and needs no provider: use the CLI's own names ("opus", "claude-opus-5-5"); a provider segment, if present, is stripped for its --model flag (bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"). The literal "default" means the runtime's own configuration (SPEC ruling 16).
+# Default model reference. pi takes an explicit "provider/model" reference as-is. claude-code is always Anthropic and needs no provider: use the CLI's own names ("opus", "claude-opus-5-5"); a provider segment, if present, is stripped for its --model flag (bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"); a shared [models] entry naming another provider is a pi reference that claude-code passes over. The literal "default" means the runtime's own configuration (SPEC ruling 16).
 default = "default"
 
 [models.roles]
@@ -155,7 +155,7 @@ default = "default"
 # [runtimes.pi]
 # # Optional runtime-wide policy; omitted keys inherit [models]/[thinking].
 # # Thinking levels accepted: minimal | low | medium | high | xhigh | max.
-# # pi takes an explicit "provider/model" reference as-is. claude-code is always Anthropic and needs no provider: use the CLI's own names ("opus", "claude-opus-5-5"); a provider segment, if present, is stripped for its --model flag (bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"). The literal "default" means the runtime's own configuration (SPEC ruling 16).
+# # pi takes an explicit "provider/model" reference as-is. claude-code is always Anthropic and needs no provider: use the CLI's own names ("opus", "claude-opus-5-5"); a provider segment, if present, is stripped for its --model flag (bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"); a shared [models] entry naming another provider is a pi reference that claude-code passes over. The literal "default" means the runtime's own configuration (SPEC ruling 16).
 # # Full per-runtime semantics (binding, session flags, effort mapping, resolution order): docs/RUNTIMES.md.
 # # model = "default"
 # # thinking_level = "default"
@@ -176,7 +176,7 @@ default = "default"
 # [runtimes.claude-code]
 # # Optional runtime-wide policy; omitted keys inherit [models]/[thinking].
 # # Thinking levels accepted: low | medium | high | xhigh | max | ultracode (mapped to the CLI --effort; anything else fails loud at spawn naming the valid set).
-# # pi takes an explicit "provider/model" reference as-is. claude-code is always Anthropic and needs no provider: use the CLI's own names ("opus", "claude-opus-5-5"); a provider segment, if present, is stripped for its --model flag (bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"). The literal "default" means the runtime's own configuration (SPEC ruling 16).
+# # pi takes an explicit "provider/model" reference as-is. claude-code is always Anthropic and needs no provider: use the CLI's own names ("opus", "claude-opus-5-5"); a provider segment, if present, is stripped for its --model flag (bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"); a shared [models] entry naming another provider is a pi reference that claude-code passes over. The literal "default" means the runtime's own configuration (SPEC ruling 16).
 # # Full per-runtime semantics (binding, session flags, effort mapping, resolution order): docs/RUNTIMES.md.
 # # model = "default"
 # # thinking_level = "default"
@@ -339,10 +339,17 @@ escalate_at = 4
 # on a shared bounded cadence (a tiny no-history/no-tools generation,
 # ≤64 output tokens, no hidden retries), and on completed producer
 # evidence wakes Silas once to claim guarded continuations — no owner
-# ACK for eligible waits. DISABLED BY DEFAULT: owner activation is
-# manual. Auth/billing/ambiguous failures and unsupported providers
-# always stay owner-controlled.
+# ACK for eligible waits. The openai-codex route and claude-code lanes
+# on the native claude.ai login are checked by read-only usage-metadata
+# reads instead (no generation). GLM/Codex are DISABLED BY DEFAULT: owner
+# activation is manual. Auth/billing/ambiguous failures and unsupported
+# providers always stay owner-controlled.
 enabled = false
+# claude-code lanes on the native claude.ai login: a usage-limit wall
+# waits on the claude.ai usage endpoint and resumes when the window
+# resets. ON by default, independent of `enabled`; false keeps Claude
+# quota walls owner-controlled. API-key logins always stay owner-controlled.
+claude_native = true
 # Sensor tick (how often routes are re-examined). The check cadence
 # itself cannot go below the approved 300 s floor.
 tick_interval_ms = 30000

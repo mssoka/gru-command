@@ -2569,8 +2569,8 @@ it('P28 production job incident from a different rebrief generation remains acti
 });
 
 describe('directive routing to a runtime without native directive checkpoints (claude-code)', () => {
-  async function assertClaudeMinionRefusal(route: 'resident' | 'respawned') {
-    const f = await fixture();
+  async function assertClaudeMinionRefusal(route: 'resident' | 'respawned', kind: 'directive' | 'rebrief' = 'directive') {
+    const f = await fixture(kind);
     // Real claude-code transcripts are raw stream-json frames, never a pi
     // header; with user hooks the first frame carries no cwd at all.
     const first = route === 'resident'
@@ -2606,11 +2606,41 @@ describe('directive routing to a runtime without native directive checkpoints (c
     expect(f.ledger.listObligations({ jobId: f.intent.jobId }).filter((item) => item.state === 'open')).toEqual([]);
     expect(() => f.ledger.assertRecoveryJobPermission(f.intent.jobId)).not.toThrow();
     expect(f.ledger.latestJobEvent(f.intent.jobId, 'job.delivered')).toBeNull();
-    expect(spawned).toBe(route === 'resident' ? 0 : 1); // never a retry loop of replacements
+    expect(f.ledger.listPendingRebriefs({ jobId: f.intent.jobId })).toEqual([]);
+    // A re-brief always starts a fresh session (the resident one is retired
+    // first); a directive reuses the resident. Never a retry loop either way.
+    expect(spawned).toBe(route === 'resident' && kind === 'directive' ? 0 : 1);
     expect(live).toBeNull(); // the prepared/spawned session was disposed
   }
   it('a resident claude-code minion refuses the directive as a positive no-effect failure — never a bound target or owner-only stop', () =>
     assertClaudeMinionRefusal('resident'));
   it('a respawned claude-code minion refuses before the pi session-header read — never a deferral loop or recovery debt', () =>
     assertClaudeMinionRefusal('respawned'));
+  it('a re-brief to a resident claude-code minion fails cleanly as a positive no-effect', () =>
+    assertClaudeMinionRefusal('resident', 'rebrief'));
+  it('a re-brief to a respawned claude-code minion fails cleanly as a positive no-effect', () =>
+    assertClaudeMinionRefusal('respawned', 'rebrief'));
+
+  it('a refusal whose cleanup fails is never claimed as a no-effect: it stays live for reconcile and recovery', async () => {
+    const f = await fixture();
+    writeFileSync(f.file, `${JSON.stringify({ type: 'system', subtype: 'init', session_id: 'claude-session', cwd: f.lane.path })}\n`);
+    f.store.acquireLock(f.file);
+    const live: AgentHandle = new ClaudeCodeHandle('minion', {
+      sessionId: 'claude-session', sessionFile: f.file, cwd: f.lane.path, binary: 'claude-must-never-run',
+      spawnProcess: (() => { throw new Error('no native claude turn may start'); }) as unknown as typeof spawn,
+      tools: ['Read', 'Bash'], systemPrompt: 'minion', killGraceMs: 10, resume: true,
+    }, CLAUDE_CODE_CAPABILITIES, f.store, () => {}, () => {}, () => {}, 60_000, 'logical-minion');
+    const registry: DirectiveRegistry = {
+      getHandle: () => live,
+      async spawn() { throw new Error('a refused runtime must not spawn a replacement'); },
+      async disposeHandle() { throw new Error('fixture cleanup failure'); },
+    };
+    await executeAcceptedDirective({ ...f.deps, registry }, f.intent.requestId);
+    const row = f.ledger.getDirective(f.intent.requestId);
+    expect(row?.state).not.toBe('failed');
+    expect(row?.failReason).toMatch(/^reconcile: .*claude-code.*fixture cleanup failure/s);
+    expect(f.ledger.listObligations({ jobId: f.intent.jobId }).some((item) =>
+      item.incidentKey === `directive-recovery:${f.intent.requestId}` && item.state === 'open')).toBe(true);
+    await live.dispose();
+  });
 });

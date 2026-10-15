@@ -155,7 +155,7 @@ export async function executeAcceptedDirective(deps: DirectiveProgressDeps, requ
     if (branch !== originalLane.branch) throw new DirectiveCheckpointError('original registered branch differs from the checkout; fresh native directive effects are forbidden');
     const prepared = preparedHandle ?? handle;
     if (prepared !== undefined) assertNativeDirectiveRuntime(prepared);
-    if (prepared !== undefined && (prepared.sessionFile === null || readDirectiveSessionHeader(prepared.sessionFile).cwd !== originalLane.path)) {
+    if (prepared !== undefined && readDirectiveSessionHeader(prepared.sessionFile).cwd !== originalLane.path) {
       throw new DirectiveCheckpointError('original native cwd differs from its registered lane; fresh directive effects are forbidden');
     }
     checkAdmissionFences(deps, identity, prepared, producerStartSeq, preparedProducer);

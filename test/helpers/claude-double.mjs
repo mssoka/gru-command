@@ -13,6 +13,8 @@
  *   "no-result-ok"     — exit 0 with no result frame (protocol violation)
  *   "api-error"        — the real CLI's synthetic API-error assistant
  *                        message (is_api_error_message) + is_error result
+ *   "usage-limit"      — the same shape for a claude.ai usage-limit wall
+ *                        (error "rate_limit", api_error_status 429)
  *   "error"            — result frame with is_error:true
  *   "garbage"          — blank/non-JSON lines + a torn final line at EOF
  *   "partial"          — assistant frame written in byte chunks, splitting
@@ -668,7 +670,13 @@ async function run() {
     // assistant message, then an is_error result carrying the same text.
     const text = "There's an issue with the selected model (double-model). It may not exist or you may not have access to it.";
     out({ ...assistantFrame([{ type: 'text', text }]), error: 'model_not_found', is_api_error_message: true, api_error_status: 404 });
-    out({ ...resultFrame(text, true), subtype: 'success' });
+    out({ ...resultFrame(text, true), subtype: 'success', api_error_status: 404 });
+    return;
+  }
+  if (prompt.includes('usage-limit')) {
+    const text = "You've hit your limit · resets 3pm (UTC)";
+    out({ ...assistantFrame([{ type: 'text', text }]), error: 'rate_limit', is_api_error_message: true, api_error_status: 429 });
+    out({ ...resultFrame(text, true), subtype: 'success', api_error_status: 429 });
     return;
   }
   if (prompt.includes('error')) {

@@ -1,10 +1,9 @@
 import { PassThrough } from 'node:stream';
 import * as childProcesses from 'node:child_process';
 import { BUILD_INCIDENT, FULL_INCIDENT, WEB_INCIDENT, authenticatedCaptureStatus, verificationLane } from './helpers/worker-verification.js';
-import type { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -15,8 +14,12 @@ import type { WorkerVerificationPolicy } from '../src/runtime/worker-verificatio
 import {
   CLAUDE_CODE_CAPABILITIES,
   ClaudeCodeRuntime,
+  claudeInBandError,
   mapRoleTools,
 } from '../src/runtime/claude-adapter.js';
+import { isRateLimitErrorText } from '../src/runtime/pacing.js';
+import { deterministicFailureClass } from '../src/decisions/questions.js';
+import { classifyProviderRejection, providerSupportsSensor } from '../src/provider-recovery/classify.js';
 import { RuntimeRegistry, serviceRegistryOptions } from '../src/runtime/registry.js';
 import { makeWorkflowLane } from './helpers/workflow-lane.js';
 import { makeFallbackRuntimeHarness } from './helpers/fallback-runtime.js';
@@ -94,7 +97,7 @@ interface Fixture {
   runtime: ClaudeCodeRuntime;
 }
 
-function fixture(knobs: { killGraceMs?: number; modelRuntime?: ModelRuntime; toolHeartbeatMs?: number; reviewSettingsFile?: string; spawnProcess?: typeof spawn; configToml?: string } = {}): Fixture {
+function fixture(knobs: { killGraceMs?: number; toolHeartbeatMs?: number; reviewSettingsFile?: string; spawnProcess?: typeof spawn; configToml?: string } = {}): Fixture {
   const home = mkdtempSync(join(tmpdir(), 'gru-command-claude-'));
   const workspace = mkdtempSync(join(tmpdir(), 'gru-command-ws-'));
   cleanupDirs.push(home, workspace);
@@ -111,7 +114,6 @@ function fixture(knobs: { killGraceMs?: number; modelRuntime?: ModelRuntime; too
     ...(knobs.spawnProcess !== undefined ? { spawnProcess: knobs.spawnProcess } : {}),
     ...(knobs.killGraceMs !== undefined ? { killGraceMs: knobs.killGraceMs } : {}),
     ...(knobs.toolHeartbeatMs !== undefined ? { toolHeartbeatMs: knobs.toolHeartbeatMs } : {}),
-    ...(knobs.modelRuntime !== undefined ? { modelRuntime: knobs.modelRuntime } : {}),
     reviewSettingsFile: knobs.reviewSettingsFile ?? join(home, 'absent-review-settings.json'),
     log: (level, msg, fields) => logs.push({ level, msg, fields }),
   });
@@ -730,43 +732,20 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     expect(fx.runtime.capabilities).toEqual(CLAUDE_CODE_CAPABILITIES);
   });
 
-  it('a model-metadata cache failure declines vision but does not block the Claude CLI spawn', async () => {
-    const brokenMetadata = {
-      getModel: () => {
-        throw new Error('torn model cache');
-      },
-    } as unknown as ModelRuntime;
-    const fx = fixture({ modelRuntime: brokenMetadata });
-    const handle = await fx.runtime.spawn('gru', { model: 'anthropic/claude-x' });
-    try {
-      expect(handle.capabilities.images).toBe(false);
-      await handle.prompt('metadata is optional');
-      expect(doubleInvocations(fx)).toHaveLength(1);
-      expect(fx.logs.some((entry) => entry.msg.includes('declines conservatively'))).toBe(true);
-    } finally {
-      await handle.dispose();
-    }
-  });
-
-  it('a bare CLI model name needs no provider: it reads the anthropic catalog entry for vision', async () => {
-    const lookups: string[] = [];
-    const catalog = {
-      getModel: (provider: string, id: string) => {
-        lookups.push(`${provider}/${id}`);
-        return provider === 'anthropic' && id === 'claude-opus-5-5' ? { input: ['text', 'image'] } : undefined;
-      },
-    } as unknown as ModelRuntime;
-    const fx = fixture({ modelRuntime: catalog });
-    const handle = await fx.runtime.spawn('gru', { model: 'claude-opus-5-5' });
-    try {
-      expect(handle.capabilities.images).toBe(true);
-      expect(lookups).toEqual(['anthropic/claude-opus-5-5']);
-      await handle.prompt('bare model');
-      const argv = doubleInvocations(fx).at(-1)!.argv;
-      expect(argv[argv.indexOf('--model') + 1]).toBe('claude-opus-5-5');
-      expect(fx.logs.some((entry) => entry.msg.includes('declines conservatively'))).toBe(false);
-    } finally {
-      await handle.dispose();
+  it('every Claude model accepts images and needs no provider — no catalog lookup gates vision', async () => {
+    const fx = fixture();
+    for (const model of [undefined, 'default', 'opus', 'claude-opus-5-5', 'anthropic/claude-opus-5-5']) {
+      const handle = await fx.runtime.spawn('gru', model === undefined ? {} : { model });
+      try {
+        expect(handle.capabilities.images, String(model)).toBe(true);
+        await handle.prompt('see this', { images: [{ mediaType: 'image/png', data: 'aGk=' }] });
+        const record = doubleInvocations(fx).at(-1)!;
+        expect(record.images).toBe(1);
+        const cli = model === undefined || model === 'default' ? undefined : model.replace(/^anthropic\//u, '');
+        expect(record.argv.includes('--model') ? record.argv[record.argv.indexOf('--model') + 1] : undefined).toBe(cli);
+      } finally {
+        await handle.dispose();
+      }
     }
   });
 
@@ -1667,35 +1646,71 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     );
   });
 
-  it('loads no ambient MCP servers by default; [runtimes.claude-code] mcp opts into project or user servers', async () => {
-    const run = async (configToml: string, withProjectFile: boolean) => {
+  it('loads no ambient MCP servers by default; mcp = "user" opts in, but never for a narrowed tool set', async () => {
+    const run = async (configToml: string, roleTools?: readonly string[]) => {
       const fx = fixture({ configToml });
       const lane = mkdtempSync(join(tmpdir(), 'gru-command-lane-'));
       cleanupDirs.push(lane);
-      if (withProjectFile) writeFileSync(join(lane, '.mcp.json'), JSON.stringify({ mcpServers: {} }));
-      const handle = await fx.runtime.spawn('minion', { cwd: lane });
+      const handle = await fx.runtime.spawn('minion', { cwd: lane, ...(roleTools !== undefined ? { roleTools } : {}) });
       await handle.prompt('which servers');
       await handle.dispose();
-      return { argv: doubleInvocations(fx).at(-1)!.argv, projectFile: join(lane, '.mcp.json') };
+      return doubleInvocations(fx).at(-1)!.argv;
     };
-    const byDefault = await run('', true);
-    expect(byDefault.argv).toContain('--strict-mcp-config');
-    expect(byDefault.argv).not.toContain('--mcp-config');
-    const project = await run('[runtimes.claude-code]\nmcp = "project"\n', true);
-    expect(project.argv).toContain('--strict-mcp-config');
-    expect(project.argv[project.argv.indexOf('--mcp-config') + 1]).toBe(project.projectFile);
-    const projectWithoutFile = await run('[runtimes.claude-code]\nmcp = "project"\n', false);
-    expect(projectWithoutFile.argv).toContain('--strict-mcp-config');
-    expect(projectWithoutFile.argv).not.toContain('--mcp-config');
-    const user = await run('[runtimes.claude-code]\nmcp = "user"\n', true);
-    expect(user.argv).not.toContain('--strict-mcp-config');
-    expect(user.argv).not.toContain('--mcp-config');
+    const byDefault = await run('');
+    expect(byDefault).toContain('--strict-mcp-config');
+    expect(byDefault).not.toContain('--mcp-config');
+    const user = await run('[runtimes.claude-code]\nmcp = "user"\n');
+    expect(user).not.toContain('--strict-mcp-config');
+    expect(user).not.toContain('--mcp-config');
+    // A bounded child worker's narrowed tools are never widened by ambient MCP.
+    const narrowed = await run('[runtimes.claude-code]\nmcp = "user"\n', ['read', 'grep', 'find', 'ls']);
+    expect(narrowed).toContain('--strict-mcp-config');
+    expect(narrowed).not.toContain('--mcp-config');
     const badHome = mkdtempSync(join(tmpdir(), 'gru-command-claude-'));
     cleanupDirs.push(badHome);
     writeFileSync(configPathFor(badHome), `workspace_root = "${badHome}"\n[runtimes.claude-code]\nmcp = "all"\n`, 'utf-8');
     expect(() => loadConfig({ GRU_COMMAND_HOME: badHome }, '/home/tester')).toThrow(
       /runtimes\.claude-code\.mcp must be one of "none", "project", "user", got "all"/,
     );
+  });
+
+  it('mcp = "project" loads only a checked-in, unmodified, regular .mcp.json — re-checked every turn', async () => {
+    const fx = fixture({ configToml: '[runtimes.claude-code]\nmcp = "project"\n' });
+    const repo = makeFixtureRepo('mcp-project');
+    try {
+      const file = join(repo.path, '.mcp.json');
+      const handle = await fx.runtime.spawn('minion', { cwd: repo.path });
+      const turn = async (): Promise<string | null> => {
+        await handle.prompt('which servers');
+        const argv = doubleInvocations(fx).at(-1)!.argv;
+        expect(argv).toContain('--strict-mcp-config');
+        return argv.includes('--mcp-config') ? argv[argv.indexOf('--mcp-config') + 1]! : null;
+      };
+      expect(await turn()).toBeNull(); // no file
+      writeFileSync(file, JSON.stringify({ mcpServers: {} }));
+      expect(await turn()).toBeNull(); // untracked: e.g. a session wrote it into its lane
+      repo.commitFile('.mcp.json', JSON.stringify({ mcpServers: {} }));
+      expect(await turn()).toBe(file); // checked in: loads on the next turn, no respawn
+      writeFileSync(file, JSON.stringify({ mcpServers: { injected: { command: 'sh' } } }));
+      expect(await turn()).toBeNull(); // edited after commit
+      repo.git(['checkout', '--', '.mcp.json']);
+      expect(await turn()).toBe(file);
+      rmSync(file);
+      symlinkSync(join(repo.path, 'package.json'), file);
+      expect(await turn()).toBeNull(); // a symlink never loads
+      rmSync(file);
+      expect(await turn()).toBeNull(); // removed mid-session: never a dangling --mcp-config
+      await handle.dispose();
+      expect(fx.logs.filter((entry) => entry.msg.includes('no project MCP servers loaded')).map((entry) => entry.fields?.['reason'])).toEqual([
+        'no .mcp.json in the session cwd',
+        '.mcp.json is not tracked by git',
+        '.mcp.json differs from its committed version',
+        '.mcp.json is not a regular file (symlink or other)',
+        'no .mcp.json in the session cwd',
+      ]);
+    } finally {
+      repo.cleanup();
+    }
   });
 
   it('isolated review sessions stay strict with only their scoped bridge even when mcp = "user"', async () => {
@@ -1738,8 +1753,100 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     await handle.dispose();
     expect(deltas(events, 'text_delta')).toEqual([]);
     const errors = events.filter((e) => e.type === 'error').map((e) => (e as { error: string }).error);
-    expect(errors).toEqual([expect.stringMatching(/issue with the selected model/)]);
+    expect(errors).toEqual([expect.stringMatching(/issue with the selected model.*\(HTTP 404, model_not_found\)$/)]);
     expect(states(events)).toContain('error');
+  });
+
+  it('a role flipped to claude-code in a pi-first config never sends a pi model to the CLI (production registry path)', async () => {
+    const fx = fixture();
+    writeFileSync(configPathFor(fx.home), `workspace_root = "${fx.workspace}"\n[runtimes.roles]\ngru = "claude-code"\n` +
+      '[models]\ndefault = "openai-codex/gpt-6.1-sol"\n[models.roles]\ngru = "openai-codex/gpt-6-astra"\n[thinking]\ndefault = "minimal"\n');
+    const logs: { msg: string; fields?: Record<string, unknown> }[] = [];
+    const registry = new RuntimeRegistry({
+      config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'),
+      store: fx.store,
+      claude: { binary: DOUBLE, reviewSettingsFile: join(fx.home, 'absent-review-settings.json') },
+      log: (_level, msg, fields) => logs.push({ msg, ...(fields !== undefined ? { fields } : {}) }),
+    });
+    try {
+      const handle = await registry.spawn('gru');
+      await handle.prompt('which model');
+      await handle.dispose();
+      const argv = doubleInvocations(fx).at(-1)!.argv;
+      expect(argv).not.toContain('--model'); // Claude Code's own model, not "gpt-6-astra"
+      expect(argv).not.toContain('--effort'); // pi's "minimal" never reaches the CLI either
+      const note = logs.find((entry) => entry.msg.includes('passed over pi references'));
+      expect(note?.fields).toMatchObject({
+        role: 'gru',
+        passed_over: [
+          'models.roles.gru = openai-codex/gpt-6-astra',
+          'models.default = openai-codex/gpt-6.1-sol',
+          'thinking.default = minimal',
+        ],
+        model: 'default',
+        thinking_level: 'default',
+      });
+    } finally {
+      await registry.dispose();
+    }
+  });
+
+  it('a Claude usage-limit wall is a typed quota wall the supervisor and recovery sensor can act on', async () => {
+    const fx = fixture();
+    const handle = await fx.runtime.spawn('minion', { model: 'claude-opus-5-5' });
+    const events = collect(handle);
+    await handle.prompt('usage-limit please');
+    await handle.dispose();
+    expect(deltas(events, 'text_delta')).toEqual([]);
+    const error = events.find((e) => e.type === 'error') as Extract<RuntimeEvent, { type: 'error' }>;
+    expect(error).toEqual({
+      type: 'error',
+      error: "You've hit your limit · resets 3pm (UTC) (HTTP 429, rate_limit)",
+      fatal: false,
+      provider: 'anthropic-claude-native',
+      model: 'claude-opus-5-5', // the CLI-resolved model from init
+      typed: { origin: 'provider-message', status: 429, bodyCode: 'rate_limit' },
+    });
+    // The same deterministic machinery a pi lane's 429 reaches: bounded
+    // rate-limit retry first, then a quota-wall stop (never an unclassified
+    // error that strands the lane), then a temporary-recoverable wait.
+    expect(isRateLimitErrorText(error.error)).toBe(true);
+    expect(deterministicFailureClass(error.error)).toBe('quota_wall');
+    expect(classifyProviderRejection({ provider: error.provider!, model: error.model!, errorMessage: error.error,
+      status: error.typed!.status!, bodyCode: error.typed!.bodyCode! })).toEqual({ kind: 'temporary-recoverable', retryAfterMs: null });
+    expect(providerSupportsSensor(error.provider!)).toBe(true);
+  });
+
+  it('typed provenance and identity are only attached when the CLI reported a provider failure', () => {
+    const result = { subtype: 'error_during_execution', isError: true, text: 'tool loop exploded', apiErrorStatus: null };
+    expect(claudeInBandError(result, null, 'claude-opus-5-5')).toEqual({ type: 'error', error: 'tool loop exploded', fatal: false });
+    const billing = claudeInBandError({ ...result, text: null, apiErrorStatus: 402 },
+      { text: 'Credit balance is too low', code: 'billing_error', status: 402 }, 'claude-opus-5-5');
+    expect(billing).toMatchObject({ error: 'Credit balance is too low (HTTP 402, billing_error)', typed: { status: 402, bodyCode: 'billing_error' } });
+    expect(deterministicFailureClass(billing.error)).toBe('quota_wall');
+    expect(classifyProviderRejection({ provider: billing.provider!, model: billing.model!, errorMessage: billing.error,
+      status: 402, bodyCode: 'billing_error' })).toEqual({ kind: 'owner-controlled', reason: 'billing' });
+    const auth = claudeInBandError({ ...result, text: 'Invalid API key', apiErrorStatus: 401 }, null, null);
+    expect(auth).toEqual({ type: 'error', error: 'Invalid API key (HTTP 401)', fatal: false, typed: { origin: 'provider-message', status: 401 } });
+    expect(deterministicFailureClass(auth.error)).toBe('authentication_wall');
+    // A failure code without an HTTP status still names the provider failure.
+    const overloaded = claudeInBandError({ ...result, text: null }, { text: 'Overloaded', code: 'overloaded', status: null }, 'claude-opus-5-5');
+    expect(overloaded).toEqual({ type: 'error', error: 'Overloaded (overloaded)', fatal: false,
+      provider: 'anthropic-claude-native', model: 'claude-opus-5-5', typed: { origin: 'provider-message', bodyCode: 'overloaded' } });
+  });
+
+  it('a default-model Claude lane (no --model) names the model the CLI reported in init', async () => {
+    const fx = fixture();
+    const handle = await fx.runtime.spawn('minion');
+    const events = collect(handle);
+    await handle.prompt('usage-limit please');
+    await handle.dispose();
+    expect(doubleInvocations(fx).at(-1)!.argv).not.toContain('--model');
+    expect(events.find((e) => e.type === 'error')).toMatchObject({
+      provider: 'anthropic-claude-native',
+      model: 'double-default-model', // from the init frame; nothing was configured
+      typed: { origin: 'provider-message', status: 429, bodyCode: 'rate_limit' },
+    });
   });
 
   it('resumes a previous session file: --resume pinned, same file appended, history intact', async () => {
@@ -2316,7 +2423,7 @@ describe('ClaudeTurnTranslator (pure)', () => {
     expect(
       t.ingest({ type: 'result', subtype: 'success', is_error: false, result: 'done' }),
     ).toEqual([]);
-    expect(t.result).toEqual({ subtype: 'success', isError: false, text: 'done' });
+    expect(t.result).toEqual({ subtype: 'success', isError: false, text: 'done', apiErrorStatus: null });
     // A second result frame is ignored (exactly one per turn).
     t.ingest({ type: 'result', subtype: 'error', is_error: true });
     expect(t.result?.subtype).toBe('success');

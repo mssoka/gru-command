@@ -2434,13 +2434,24 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
         compat: { secretOverride: 'sensitive' } as unknown as NonNullable<typeof selected>['compat'] };
     });
     expect((await registry.prepareReviewModel('perkins'))?.routingSha256).toBeUndefined();
+    // Fallback model ids are judged by SHAPE, never a published-name list
+    // (owner ruling 2026-10-15): a current model the old list lacked is reusable...
+    vi.spyOn(fx.modelRuntime, 'getModel').mockImplementation((provider, id) => {
+      const selected = getModel(provider, id);
+      return selected === undefined ? undefined : { ...selected, api: 'anthropic-messages',
+        baseUrl: 'https://api.anthropic.com', compat: { supportsStrictTools: true,
+          allowedFallbackModels: [{ provider: 'anthropic', model: 'claude-opus-5-5',
+            cost: { input: 5, output: 25, cacheRead: 1, cacheWrite: 2 } }] } };
+    });
+    expect((await registry.prepareReviewModel('perkins'))?.routingSha256).toMatch(/^[a-f0-9]{64}$/u);
+    // ...while credential-shaped (mixed-case key) material never is.
     for (const change of [
       { provider: 'credential-looking-provider' },
       { id: 'credential-looking-model' },
       { api: 'credential-looking-api' },
       { thinkingLevelMap: { high: 'credential-looking-thinking' } },
       { thinkingLevelMap: { 'credential-looking-key': 'high' } },
-      { compat: { allowedFallbackModels: [{ provider: 'anthropic', model: 'claude-credential-looking-token',
+      { compat: { allowedFallbackModels: [{ provider: 'anthropic', model: 'sk-ant-api03-Xy7Qk9LmN2pR4tVb8wZ1',
         cost: { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 } }] } },
     ]) {
       vi.spyOn(fx.modelRuntime, 'getModel').mockImplementation((provider, id) => {

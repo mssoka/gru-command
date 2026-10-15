@@ -358,8 +358,7 @@ export function parseTranscriptContent(content: string): {
       entries.push(entryFromMessage(entries.length, message));
       continue;
     }
-    const claude = claudeFrameEntry(entry, entries.length, claudeToolNames);
-    if (claude !== null) entries.push(claude);
+    entries.push(...claudeFrameEntries(entry, entries.length, claudeToolNames));
     // else: claude-code raw stream frames (init metadata, stream_event
     // deltas) are duplicate representations of the assistant/user message
     // entries already rendered — skipping them is dedupe, not data loss.
@@ -395,21 +394,21 @@ function claudeFrameTs(entry: Record<string, unknown>): number | null {
  * or tool_result blocks; assistant frames carry text/thinking/tool_use
  * blocks (one block per frame with partial messages); result frames mark
  * turn outcomes. Everything else (system init, stream_event deltas)
- * returns null — covered by the message entries. A tool_use-only assistant
- * frame also returns null: the call surfaces as its named tool_result,
- * exactly like a pi session's toolResult entry.
+ * yields no entry — covered by the message entries. A tool_use-only
+ * assistant frame yields none either: the call surfaces as its named
+ * tool_result, exactly like a pi session's toolResult entry.
  */
-function claudeFrameEntry(
+function claudeFrameEntries(
   rawEntry: object,
   index: number,
   toolNames: Map<string, string>,
-): TranscriptEntry | null {
+): readonly TranscriptEntry[] {
   const entry = rawEntry as Record<string, unknown>;
   const type = String(entry['type'] ?? '');
   const ts = claudeFrameTs(entry);
   if (type === 'user' || type === 'assistant') {
     const message = entry['message'];
-    if (typeof message !== 'object' || message === null) return null;
+    if (typeof message !== 'object' || message === null) return [];
     const content = (message as { content?: unknown }).content;
     const blocks = Array.isArray(content)
       ? content.filter((block): block is Record<string, unknown> => typeof block === 'object' && block !== null)
@@ -417,19 +416,23 @@ function claudeFrameEntry(
     if (type === 'user') {
       const results = blocks.filter((block) => block['type'] === 'tool_result');
       if (results.length > 0) {
-        const callId = results[0]!['tool_use_id'];
-        return {
-          index,
-          ts,
-          kind: 'tool_result',
-          role: 'tool',
-          text: results.map((block) => claudeBlocksText(block['content'])).join('\n'),
-          thinking: null,
-          toolName: typeof callId === 'string' ? (toolNames.get(callId) ?? null) : null,
-          isError: results.some((block) => block['is_error'] === true),
-        };
+        // Parallel tool calls answer in ONE frame: one entry per result, each
+        // named by its own call.
+        return results.map((block, offset) => {
+          const callId = block['tool_use_id'];
+          return {
+            index: index + offset,
+            ts,
+            kind: 'tool_result' as const,
+            role: 'tool',
+            text: claudeBlocksText(block['content']),
+            thinking: null,
+            toolName: typeof callId === 'string' ? (toolNames.get(callId) ?? null) : null,
+            isError: block['is_error'] === true,
+          };
+        });
       }
-      return { index, ts, kind: 'user', role: 'user', text: claudeBlocksText(content), thinking: null, toolName: null, isError: false };
+      return [{ index, ts, kind: 'user', role: 'user', text: claudeBlocksText(content), thinking: null, toolName: null, isError: false }];
     }
     let thinking: string | null = null;
     for (const block of blocks) {
@@ -440,8 +443,8 @@ function claudeFrameEntry(
       }
     }
     const text = claudeBlocksText(content);
-    if (text === '' && thinking === null) return null;
-    return {
+    if (text === '' && thinking === null) return [];
+    return [{
       index,
       ts,
       kind: 'assistant',
@@ -451,13 +454,13 @@ function claudeFrameEntry(
       toolName: null,
       // The CLI reports API failures as a synthetic assistant message.
       isError: entry['is_api_error_message'] === true,
-    };
+    }];
   }
   if (type === 'result') {
     const subtype = typeof entry['subtype'] === 'string' ? entry['subtype'] : 'unknown';
     const isError = entry['is_error'] === true || subtype.startsWith('error');
     const detail = isError && typeof entry['result'] === 'string' && entry['result'] !== '' ? ` — ${entry['result']}` : '';
-    return {
+    return [{
       index,
       ts,
       kind: 'system',
@@ -466,9 +469,9 @@ function claudeFrameEntry(
       thinking: null,
       toolName: null,
       isError,
-    };
+    }];
   }
-  return null;
+  return [];
 }
 
 function entryFromMessage(index: number, message: AnyMessage): TranscriptEntry {

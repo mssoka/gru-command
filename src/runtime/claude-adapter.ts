@@ -1,12 +1,11 @@
-import { ModelRuntime } from '@earendil-works/pi-coding-agent';
-import { execFile, spawn, spawnSync } from 'node:child_process';
+import { execFile, execFileSync, spawn, spawnSync } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import {
   closeSync,
   createWriteStream,
-  existsSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readSync,
@@ -18,7 +17,7 @@ import type { WriteStream } from 'node:fs';
 import { basename, isAbsolute, join, relative } from 'node:path';
 import { finished } from 'node:stream/promises';
 import type { GruCommandConfig, Role } from '../config.js';
-import { DEFAULT_CLAUDE_MCP_MODE, resolveSpawnPolicy } from '../config.js';
+import { CLAUDE_CODE_THINKING_LEVELS as CLAUDE_EFFORT_LEVELS, DEFAULT_CLAUDE_MCP_MODE, resolveSpawnPolicy } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import { ROLE_DEFINITIONS } from '../roles.js';
 import { managedSkillsPromptNote } from './managed-skills.js';
@@ -42,9 +41,10 @@ import {
   ClaudeTurnTranslator,
   extractSessionId,
   NdjsonParser,
+  type ApiErrorInfo,
+  type ResultInfo,
   type StreamFrame,
 } from './stream-json.js';
-import { capabilitiesForModelInput } from './types.js';
 import type {
   AgentCapabilities,
   AgentHandle,
@@ -61,6 +61,7 @@ import { ToolHeartbeat, toolHeartbeatIntervalMs } from './tool-heartbeat.js';
 import { disposeAll } from './disposal.js';
 import { CLAUDE_CODE_CAPABILITIES } from './capabilities.js';
 import { DirectiveCheckpointError, type DirectiveCheckpoint, type DirectiveTurnIdentity } from './directive-checkpoint.js';
+import { CLAUDE_NATIVE_PROVIDER } from '../provider-recovery/classify.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -69,8 +70,6 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
 // re-export keeps every existing import surface (and object identity) intact.
 export { CLAUDE_CODE_CAPABILITIES };
 
-/** Thinking levels the claude CLI accepts via --effort (fail-loud on others). */
-const CLAUDE_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode'] as const;
 
 /**
  * Role tool ids (pi-flavored, src/roles.ts) → claude built-in tool names
@@ -147,8 +146,6 @@ export interface ClaudeCodeRuntimeOptions {
   readonly killGraceMs?: number;
   /** Test seam: override the long-tool heartbeat cadence. */
   readonly toolHeartbeatMs?: number;
-  /** Tests may inject an offline catalog; production restores pi's cached model metadata. */
-  readonly modelRuntime?: ModelRuntime;
   /** Test seam for the user Claude settings source (never the review repo). */
   readonly reviewSettingsFile?: string;
   readonly log?: Log;
@@ -191,7 +188,6 @@ export class ClaudeCodeRuntime implements AgentRuntime {
    * window at spawn when unset (construction must not touch config). */
   private readonly toolHeartbeatMs: number | null;
   private readonly handles = new Set<ClaudeCodeHandle>();
-  private modelRuntime: ModelRuntime | undefined;
   /** Normalized session paths currently hosted by this process. */
   private readonly activeFiles = new Set<string>();
   /** Cached binary availability (probed once; re-probed after a failure). */
@@ -206,20 +202,12 @@ export class ClaudeCodeRuntime implements AgentRuntime {
     this.killGraceMs = opts.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
     this.log = opts.log ?? (() => {});
     this.reviewSettingsFile = opts.reviewSettingsFile ?? userClaudeSettingsFile();
-    this.modelRuntime = opts.modelRuntime;
     this.toolHeartbeatMs = opts.toolHeartbeatMs ?? null;
   }
 
   /** Long-tool heartbeat cadence for a new handle (config-derived). */
   private heartbeatMs(): number {
     return this.toolHeartbeatMs ?? toolHeartbeatIntervalMs(this.config.supervision.turnSilenceMs);
-  }
-
-  private async runtime(): Promise<ModelRuntime> {
-    if (this.modelRuntime === undefined) {
-      this.modelRuntime = await ModelRuntime.create({ refreshOnCreate: false });
-    }
-    return this.modelRuntime;
   }
 
   /**
@@ -266,42 +254,10 @@ export class ClaudeCodeRuntime implements AgentRuntime {
     }
   }
 
-  /** The CLI, not pi's catalog, is authoritative for model names.
-   * Metadata is advisory for conservative vision capability reporting. */
-  private async resolveModel(
-    role: Role,
-    override?: string,
-  ): Promise<{ readonly cliModel?: string; readonly input?: readonly ('text' | 'image')[] }> {
-    const ref =
-      override !== undefined
-        ? override
-        : resolveSpawnPolicy(this.config, 'claude-code', role).model;
-    const cliModel = claudeCliModel(ref);
-    if (cliModel === undefined) return {};
-    // Claude Code is always Anthropic: a bare CLI name needs no provider and
-    // reads the anthropic catalog entry (an explicit prefix is honored).
-    const slash = ref.indexOf('/');
-    const provider = slash < 0 ? 'anthropic' : ref.slice(0, slash);
-    const modelId = cliModel;
-    let declared: ReturnType<ModelRuntime['getModel']> = undefined;
-    let metadataError: unknown;
-    try {
-      declared = (await this.runtime()).getModel(provider, modelId);
-    } catch (error) {
-      // Metadata enriches the CLI spawn but is not its transport. A torn
-      // cache must decline vision conservatively, not take Claude offline.
-      metadataError = error;
-    }
-    if (declared === undefined) {
-      this.log('warn', 'claude-code model has no declared input metadata; vision declines conservatively', {
-        model: ref,
-        ...(metadataError !== undefined ? { error: String(metadataError) } : {}),
-      });
-    }
-    return {
-      cliModel,
-      ...(declared !== undefined ? { input: declared.input } : {}),
-    };
+  /** The CLI, not pi's catalog, is authoritative for model names; Claude
+   * Code is always Anthropic, so no provider or catalog lookup is needed. */
+  private resolveModel(role: Role, override?: string): string | undefined {
+    return claudeCliModel(override ?? resolveSpawnPolicy(this.config, 'claude-code', role).model);
   }
 
   /** Probe under the request-owned settings given to this review's lead
@@ -373,12 +329,10 @@ export class ClaudeCodeRuntime implements AgentRuntime {
       throw new Error(`review model override "${options.model}" differs from the preflighted model; re-run preflight with the selected model`);
     }
     // Validation failures are caller-facing, never adapter health.
-    const resolvedModel = await this.resolveModel(role, reviewConfiguration?.modelRef ?? options.model);
-    const model = resolvedModel.cliModel;
-    const handleCapabilities = capabilitiesForModelInput(
-      CLAUDE_CODE_CAPABILITIES,
-      resolvedModel.input,
-    );
+    const model = this.resolveModel(role, reviewConfiguration?.modelRef ?? options.model);
+    // Every Claude model accepts images (owner ruling 2026-10-15): the
+    // adapter's declared capabilities hold for every handle.
+    const handleCapabilities = CLAUDE_CODE_CAPABILITIES;
     const thinkingLevel = this.resolveThinkingLevel(role, options.thinkingLevel);
     const isolatedReview = options.isolatedReview;
     const reviewLead = options.reviewLead;
@@ -473,12 +427,13 @@ export class ClaudeCodeRuntime implements AgentRuntime {
       // built-ins only, so without this every server in the operator's own
       // Claude configuration (claude.ai connectors included) would run under
       // bypassPermissions regardless of the role's declared tools.
+      // A narrowed tool set (a bounded child worker) never gains ambient MCP:
+      // those tools would sidestep its narrowed roleTools. Project mode is
+      // resolved per turn (each turn is a fresh CLI process).
       const mcpMode = this.config.runtimes.policies['claude-code']?.mcp ?? DEFAULT_CLAUDE_MCP_MODE;
-      const projectMcpFile = join(cwd, '.mcp.json');
       const ambientMcp: HandleParams['ambientMcp'] =
-        reviewMode !== undefined || mcpMode === 'none' ? { mode: 'none' }
-          : mcpMode === 'user' ? { mode: 'user' }
-            : existsSync(projectMcpFile) ? { mode: 'project', file: projectMcpFile } : { mode: 'none' };
+        reviewMode !== undefined || mcpMode === 'none' || options.roleTools !== undefined ? { mode: 'none' }
+          : mcpMode === 'user' ? { mode: 'user' } : { mode: 'project' };
       const declaredNativeTools = reviewMode !== undefined ? reviewMode.nativeTools : undefined;
       if (declaredNativeTools !== undefined && declaredNativeTools.length > 0) {
         reviewBridge = await ReviewMcpBridge.start(declaredNativeTools);
@@ -666,8 +621,10 @@ interface HandleParams {
   readonly reviewTools?: readonly string[];
   readonly mcpConfigFile?: string;
   /** MCP servers an ordinary (non-review) session loads; absent = none.
-   * Review sessions always run strict with only their scoped bridge. */
-  readonly ambientMcp?: { readonly mode: 'none' } | { readonly mode: 'user' } | { readonly mode: 'project'; readonly file: string };
+   * Review sessions always run strict with only their scoped bridge. A
+   * project entry carries the checked-in file resolved for THIS turn (no
+   * file = nothing loadable this turn: strict, no --mcp-config). */
+  readonly ambientMcp?: { readonly mode: 'none' } | { readonly mode: 'user' } | { readonly mode: 'project'; readonly file?: string };
   readonly reviewBridge?: ReviewMcpBridge;
   readonly killGraceMs: number;
   readonly resume: boolean;
@@ -722,7 +679,7 @@ export function claudeTurnArgs(params: HandleParams, resume: boolean): string[] 
   if (!params.isolatedReview) {
     const mcp = params.ambientMcp ?? { mode: 'none' };
     if (mcp.mode !== 'user') args.push('--strict-mcp-config');
-    if (mcp.mode === 'project') args.push('--mcp-config', mcp.file);
+    if (mcp.mode === 'project' && mcp.file !== undefined) args.push('--mcp-config', mcp.file);
   }
   if (params.verificationSettingsFile !== undefined && !params.isolatedReview) {
     // Native ask reaches the original-child-bound host, even in bypass mode.
@@ -734,6 +691,66 @@ export function claudeTurnArgs(params: HandleParams, resume: boolean): string[] 
   if (params.model !== undefined) args.push('--model', params.model);
   if (params.thinkingLevel !== undefined) args.push('--effort', params.thinkingLevel);
   return args;
+}
+
+
+/**
+ * The in-band error for a turn whose result reports `is_error`. When the CLI
+ * attached a provider failure (synthetic API-error message / result
+ * `api_error_status`), the event carries typed provider-response provenance
+ * plus the provider/model identity — so a Claude usage limit reaches the
+ * same quota-wall stop, bounded rate-limit retry and provider-recovery wait
+ * as a pi lane, instead of an unclassified error that strands the lane. The
+ * `(HTTP <status>, <code>)` suffix renders those typed facts in the shape the
+ * deterministic classifiers read (the role pi-ai's `429: {…}` lines play).
+ */
+export function claudeInBandError(
+  result: ResultInfo,
+  apiError: ApiErrorInfo | null,
+  model: string | null,
+): Extract<RuntimeEvent, { type: 'error' }> {
+  const text = result.text ?? apiError?.text ?? `turn ended with result subtype "${result.subtype}"`;
+  const status = apiError?.status ?? result.apiErrorStatus;
+  const code = apiError?.code ?? null;
+  // A provider failure is typed whenever the CLI attached either fact — a
+  // code without an HTTP status still names the provider's failure class.
+  if (status === null && code === null) return { type: 'error', error: text, fatal: false };
+  const facts = [status !== null ? `HTTP ${status}` : null, code].filter((fact): fact is string => fact !== null);
+  return {
+    type: 'error',
+    error: `${text} (${facts.join(', ')})`,
+    fatal: false,
+    ...(model !== null && model !== '' ? { provider: CLAUDE_NATIVE_PROVIDER, model } : {}),
+    typed: { origin: 'provider-message', ...(status !== null ? { status } : {}), ...(code !== null ? { bodyCode: code } : {}) },
+  };
+}
+
+/**
+ * `mcp = "project"` loads checked-in servers only: the cwd's `.mcp.json`
+ * when it is a regular file (never a symlink) that git tracks UNMODIFIED at
+ * HEAD. An untracked, edited or symlinked file — e.g. one a session wrote
+ * into its own lane — never loads under bypassPermissions.
+ */
+export function checkedInProjectMcpConfig(cwd: string): { readonly file: string } | { readonly reason: string } {
+  const file = join(cwd, '.mcp.json');
+  let isFile: boolean;
+  try {
+    isFile = lstatSync(file).isFile();
+  } catch {
+    return { reason: 'no .mcp.json in the session cwd' };
+  }
+  if (!isFile) return { reason: '.mcp.json is not a regular file (symlink or other)' };
+  const git = (args: readonly string[]): boolean => {
+    try {
+      execFileSync('git', args, { cwd, stdio: 'ignore', timeout: 10_000, windowsHide: true });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (!git(['ls-files', '--error-unmatch', '--', '.mcp.json'])) return { reason: '.mcp.json is not tracked by git' };
+  if (!git(['diff', '--quiet', 'HEAD', '--', '.mcp.json'])) return { reason: '.mcp.json differs from its committed version' };
+  return { file };
 }
 
 /** The stdin user frame for one prompt (image blocks first, then text). */
@@ -798,6 +815,8 @@ export class ClaudeCodeHandle implements AgentHandle {
   private readonly closedVerificationChildren = new WeakSet<ChildProcess>();
   private verificationCleaned = false;
   private disposalPromise: Promise<void> | null = null;
+  /** Last logged reason project MCP loaded nothing (logged once per change). */
+  private projectMcpNote: string | null = null;
 
   constructor(
     role: Role,
@@ -1114,11 +1133,27 @@ export class ClaudeCodeHandle implements AgentHandle {
     }
   }
 
+  /** This turn's params: project MCP is re-resolved every turn (each turn is
+   * a fresh CLI process, and the lane's file may have changed since). */
+  private turnParams(): HandleParams {
+    if (this.params.ambientMcp?.mode !== 'project') return this.params;
+    const resolved = checkedInProjectMcpConfig(this.params.cwd);
+    if ('reason' in resolved) {
+      if (this.projectMcpNote !== resolved.reason) {
+        this.projectMcpNote = resolved.reason;
+        this.log('info', 'mcp = "project": no project MCP servers loaded', { cwd: this.params.cwd, reason: resolved.reason });
+      }
+      return { ...this.params, ambientMcp: { mode: 'project' } };
+    }
+    this.projectMcpNote = null;
+    return { ...this.params, ambientMcp: { mode: 'project', file: resolved.file } };
+  }
+
   /** A dedicated, resumed native slash-command process. Its machine frames
    * remain in the native transcript for forensics, but content events are
    * intentionally discarded so `/compact` output can never become chat text. */
   private runCompactionControl(): Promise<void> {
-    const params = this.params;
+    const params = this.turnParams();
     const translator = new ClaudeControlTranslator();
 
     return new Promise<void>((resolve, reject) => {
@@ -1318,7 +1353,7 @@ export class ClaudeCodeHandle implements AgentHandle {
 
   private runTurn(text: string, owner: string | null, images?: PromptOptions['images']): Promise<void> {
     this.setState('spawning');
-    const params = this.params;
+    const params = this.turnParams();
     const translator = new ClaudeTurnTranslator();
     let turnStarted = false;
     this.livePrompt = {
@@ -1481,9 +1516,9 @@ export class ClaudeCodeHandle implements AgentHandle {
             if (result.isError) {
               // In-band error (pi W7 parity): the turn COMPLETED with an
               // error — resolve, sticky error state, next turn recovers.
-              const detail = result.text ?? translator.apiError ?? `turn ended with result subtype "${result.subtype}"`;
-              this.emit({ type: 'error', error: detail, fatal: false });
-              this.setState('error', detail);
+              const event = claudeInBandError(result, translator.apiError, translator.init?.model ?? params.model ?? null);
+              this.emit(event);
+              this.setState('error', event.error);
             } else {
               this.setState('idle');
             }

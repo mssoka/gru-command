@@ -4,9 +4,17 @@
  * bare CLI model or the `anthropic/` spelling may enter the manifest. The
  * model itself is checked by SHAPE only — never against a list of published
  * names, which every model release would make stale (owner ruling
- * 2026-10-15). A credential in the model position is not silent: the CLI
- * sends it as the model name and the turn fails at once. */
-const CLAUDE_MODEL_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._:@[\]-]{0,127}$/u;
+ * 2026-10-15). Published model ids are lowercase (`claude-opus-5-5`,
+ * `us.anthropic.claude-…-v1:0`, `claude-…@20251001`, `opus[1m]`) while API
+ * keys and tokens are long mixed-case strings, so the lowercase rule keeps
+ * credential material out of the persisted manifest without naming models. */
+const PUBLIC_MODEL_TOKEN = /^[a-z0-9][a-z0-9._:@[\]-]{0,127}$/u;
+
+/** Shape-only public model id check (shared by the Claude manifest and pi's
+ * review-routing reuse): never a list of published names. */
+export function isPublicModelToken(id: string): boolean {
+  return PUBLIC_MODEL_TOKEN.test(id);
+}
 const PUBLIC_CLAUDE_EFFORT: ReadonlySet<string> = new Set([
   'default', 'low', 'medium', 'high', 'xhigh', 'max', 'ultracode',
 ]);
@@ -32,6 +40,6 @@ export function publicRecoveryModelIdentity(input: {
   const parts = input.modelRef.split('/');
   const model = parts.length === 1 ? parts[0] :
     parts.length === 2 && parts[0] === 'anthropic' ? parts[1] : undefined;
-  return model !== undefined && CLAUDE_MODEL_TOKEN.test(model) &&
-    (input.settingsModel === undefined || CLAUDE_MODEL_TOKEN.test(input.settingsModel));
+  return model !== undefined && isPublicModelToken(model) &&
+    (input.settingsModel === undefined || isPublicModelToken(input.settingsModel));
 }

@@ -681,8 +681,9 @@ async function main(): Promise<number> {
       },
       claude: {
         // Traced native protocol: one bounded `security find-generic-password`
-        // against the ACTUAL selected store/account. Never invoked while the
-        // sensor is disabled; activation runs it under a ruled checkpoint.
+        // against the ACTUAL selected store/account. Never invoked while
+        // recovery for the native Claude route is off
+        // ([provider_recovery] claude_native, on by default since 2026-10-15).
         // Output stays in-process — never logged.
         command: {
           findGenericPassword: async ({ service, account }) => {
@@ -1544,7 +1545,7 @@ async function main(): Promise<number> {
   // pattern as the drivers) and its boot reconciliation re-wakes any
   // recovery whose delivery was lost across a restart — never silently
   // re-baselined away.
-  if (config.providerRecovery.enabled) {
+  if (providerRecoverySensor.enabled) {
     providerRecoverySensor.start();
     void providerRecoverySensor.reconcileAtBoot().catch((error: unknown) => {
       logger.error('provider-recovery boot reconciliation failed', { error: String(error) });

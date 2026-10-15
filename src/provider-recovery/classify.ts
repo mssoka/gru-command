@@ -109,6 +109,10 @@ export function classifyProviderRejection(
   return { kind: 'owner-controlled', reason: 'ambiguous' };
 }
 
+/** Provider id of Claude Code's own Anthropic route (the native claude.ai
+ * login); the claude-code runtime reports its API failures under it. */
+export const CLAUDE_NATIVE_PROVIDER = 'anthropic-claude-native';
+
 /**
  * Providers whose rejections this sensor version understands. The
  * owner-approved overlay extends recovery to openai-codex and the native
@@ -121,7 +125,7 @@ export function classifyProviderRejection(
 export const SENSOR_SUPPORTED_PROVIDERS: ReadonlySet<string> = new Set([
   'zai-coding-cn',
   'openai-codex',
-  'anthropic-claude-native',
+  CLAUDE_NATIVE_PROVIDER,
 ]);
 
 /** Is this provider's evidence eligible for automatic recovery at all? */

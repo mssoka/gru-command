@@ -10,9 +10,12 @@
 > re-bind). Exact head/base, verification receipts and review identities
 > live in the approved delivery record. The coverage table below names
 > existing tests; it is not execution evidence at the final head.
-> **Native Claude overlay: DORMANT/UNSHIPPED** — the composed reader
-> cannot fire (no runtime provider provenance; no resolvable pi catalog
-> route), so no capability claim attaches to it. G11's fan-out gate is
+> **Native Claude overlay: DORMANT/UNSHIPPED** (at acceptance) — the
+> composed reader could not fire (no runtime provider provenance; no
+> resolvable pi catalog route), so no capability claim attached to it.
+> *Superseded 2026-10-15 (PR #382, owner decision): grounded (typed
+> claude-code provenance + native route resolution) and on by default via
+> `[provider_recovery] claude_native`; see SPEC.md.* G11's fan-out gate is
 > still source-only in production (cap-owned emitter ungrounded). Owner
 > activation remains manual; no owner choice is reopened. Exact-final-head
 > CI, fresh independent review, native Perkins and local `/api/verify`
@@ -91,7 +94,7 @@ config, config-generate, suite-shape).
 | w-async-settle | A completed recovery keeps the pre-I/O charged attempt and never reverts `incident_seq` / `false_recovery_count` / `suspended_until` updated mid-check. | `provider-recovery-sensor.test.ts` |
 | w-incident-lifecycle | `claimProviderWaitAtomic` resolves the wait's OWN action-required incident (never an ACK; needs-owner rows stay open; lost CAS resolves nothing). | `provider-recovery-ledger.test.ts` |
 | w-metadata-buckets | Exhausted optional model buckets hold only when they may cover the route model (unknown coverage fails closed); exhausted scoped limits hold; Codex null/empty optional buckets accepted while present unknown buckets fail closed; partial optional buckets fail the read closed. | `provider-recovery-metadata.test.ts` |
-| w-scope-coverage | Native Claude overlay path marked DORMANT/UNSHIPPED in SPEC + gate matrix (no runtime provenance; no resolvable route). | this document + `SPEC.md`; `composition.ts` notice |
+| w-scope-coverage | Native Claude overlay path marked DORMANT/UNSHIPPED in SPEC + gate matrix (no runtime provenance; no resolvable route) — superseded 2026-10-15 (PR #382): grounded and on by default. | this document + `SPEC.md`; `composition.ts` grounding note; `test/provider-recovery-seam.test.ts` (claude-code usage-limit wall → native wait) |
 | n-terminal-replay | A same-incident replay on a terminal wait returns it unchanged (never revives). | `provider-recovery-ledger.test.ts` |
 | n-dedupe | The notifications port uses the dedupe-capable incident post: repeated establishments keep one waiting row; repeated false-recovery escalations reuse one machine row. | `provider-recovery-sensor.test.ts` |
 | n-endpoint-rotation | A catalog endpoint change re-binds the route row and retires stale waiting rows with a recorded reason; the next check probes the re-bound endpoint. | `provider-recovery-sensor.test.ts` |
