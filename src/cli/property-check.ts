@@ -11,7 +11,8 @@ export class PropertyCheckUsageError extends Error {
 export function parseReviewedCampaign(value: unknown): ReviewedPropertyCampaign {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new PropertyCheckUsageError('reviewed campaign must be an object');
   const record = value as Record<string, unknown>;
-  const keys = ['proposal', 'overlayFiles', 'knownBadRoot', 'healthyRoot', 'candidateRoot', 'baselineRoot'];
+  const keys = ['proposal', 'overlayFiles', 'knownBadRoot', 'healthyRoot', 'candidateRoot', 'baselineRoot', ...(record.implementationPaths === undefined ? [] : ['implementationPaths'])];
+  if (record.implementationPaths !== undefined && (!Array.isArray(record.implementationPaths) || record.implementationPaths.length > 128 || !record.implementationPaths.every((path) => typeof path === 'string' && path.length <= 4096))) throw new PropertyCheckUsageError('implementationPaths must be at most 128 exact reviewed file paths');
   if (Object.keys(record).sort().join('\0') !== keys.sort().join('\0')) throw new PropertyCheckUsageError(`reviewed campaign keys must be exactly ${keys.join(', ')}; commands/install requests are never accepted`);
   const path = (key: string): string => {
     const raw = record[key];
@@ -25,7 +26,7 @@ export function parseReviewedCampaign(value: unknown): ReviewedPropertyCampaign 
     if (Object.keys(file).sort().join('\0') !== ['content', 'path'].join('\0') || typeof file.path !== 'string' || typeof file.content !== 'string') throw new PropertyCheckUsageError('overlay file keys must be exactly string path/content');
     return { path: file.path, content: file.content };
   });
-  return { proposal: parsePropertyProposal(record.proposal), overlayFiles, knownBadRoot: path('knownBadRoot'), healthyRoot: path('healthyRoot'), candidateRoot: path('candidateRoot'), baselineRoot: record.baselineRoot === null ? null : path('baselineRoot') };
+  return { proposal: parsePropertyProposal(record.proposal), ...(record.implementationPaths === undefined ? {} : { implementationPaths: record.implementationPaths as string[] }), overlayFiles, knownBadRoot: path('knownBadRoot'), healthyRoot: path('healthyRoot'), candidateRoot: path('candidateRoot'), baselineRoot: record.baselineRoot === null ? null : path('baselineRoot') };
 }
 /** Explicit operator/CI invocation is the artifact-review decision. Never
  * invoke this from a reviewer command string, proposal or repo config. */
@@ -44,7 +45,7 @@ export async function runPropertyCheck(argv: readonly string[]): Promise<{ reado
     const host = createPropertyCampaignHost();
     const report = await host.execute(host.approveReviewedCampaign(spec), { artifactsDir: resolve(artifactsDir), trigger: trigger as 'pull-request' | 'scheduled' });
     const inconclusive = report.mode !== 'disabled' && (report.qualification?.verdict !== 'qualified' || !['pass', 'property-failure'].includes(report.candidateOutcome ?? ''));
-    const exitCode = inconclusive ? 2 : report.blocking ? 1 : 0;
+    const exitCode = report.mode === 'observation' ? 0 : inconclusive ? 2 : report.blocking ? 1 : 0;
     return { exitCode, stdout: JSON.stringify(report, null, 2) };
   } catch (error) {
     return { exitCode: error instanceof PropertyCheckUsageError ? 2 : 1, stdout: `${error instanceof PropertyPipelineError ? error.name : 'property-check refused'}: ${String(error)}\n${USAGE}` };

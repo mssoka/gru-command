@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readlinkSync, readSync, realpathSync } from 'node:fs';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import type {
   CaptureState,
@@ -80,7 +80,54 @@ export function buildSourceIdentity(repoRoot: string): SourceIdentity {
   let statusText: string;
   try {
     sha = propertyGit(repoRoot, ['rev-parse', 'HEAD']).trim();
-    statusText = propertyGit(repoRoot, ['status', '--porcelain', '--untracked-files=no']);
+    // status/diff may execute repository clean/process filters. Plumbing
+    // lists objects only; compare raw worktree blobs ourselves, without Git
+    // attributes, external diff, textconv or any repository command.
+    const tree = propertyGit(repoRoot, ['ls-tree', '-rz', '--full-tree', 'HEAD']).split('\0').filter(Boolean);
+    const index = propertyGit(repoRoot, ['ls-files', '--stage', '-z']).split('\0').filter(Boolean);
+    const expected = new Map(tree.map((entry) => {
+      const match = /^(\d+) blob ([a-f0-9]+)\t([\s\S]+)$/u.exec(entry);
+      if (match === null) throw new Error('property execution does not support submodule/non-blob entries');
+      return [match[3]!, { mode: match[1]!, hash: match[2]! }] as const;
+    }));
+    let dirty = index.length !== expected.size;
+    for (const entry of index) {
+      const match = /^(\d+) ([a-f0-9]+) (\d)\t([\s\S]+)$/u.exec(entry);
+      const object = match === null ? undefined : expected.get(match[4]!);
+      if (object === undefined || match![3] !== '0' || object.mode !== match![1] || object.hash !== match![2]) dirty = true;
+    }
+    if (expected.size > 60_000) throw new Error('tracked identity exceeds 60000 entries');
+    const algorithm = propertyGit(repoRoot, ['rev-parse', '--show-object-format']).trim();
+    if (!['sha1', 'sha256'].includes(algorithm)) throw new Error('unsupported Git object format');
+    const root = realpathSync(repoRoot); let total = 0;
+    for (const [path, object] of expected) {
+      const parts = path.split('/');
+      if (parts.some((part) => !part || part === '.' || part === '..')) throw new Error('unsafe tracked path');
+      let parent = root;
+      for (const part of parts.slice(0, -1)) {
+        parent = join(parent, part);
+        if (!lstatSync(parent, { throwIfNoEntry: false })?.isDirectory()) { dirty = true; break; }
+      }
+      if (dirty) break;
+      const file = join(root, path); const info = lstatSync(file, { throwIfNoEntry: false });
+      if (info === undefined) { dirty = true; break; }
+      const hash = createHash(algorithm);
+      if (object.mode === '120000' && info.isSymbolicLink()) {
+        const target = Buffer.from(readlinkSync(file)); hash.update(`blob ${target.length}\0`).update(target);
+      } else if (info.isFile() && object.mode === ((info.mode & 0o111) === 0 ? '100644' : '100755')) {
+        total += info.size;
+        if (total > 2 * 1024 ** 3) throw new Error('tracked identity exceeds 2GiB');
+        const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+        try {
+          if (fstatSync(fd).size !== info.size) throw new Error('tracked file moved during identity check');
+          hash.update(`blob ${info.size}\0`); const chunk = Buffer.alloc(64 * 1024); let read = 0;
+          while (read < info.size) { const size = readSync(fd, chunk, 0, Math.min(chunk.length, info.size - read), null); if (size === 0) break; hash.update(chunk.subarray(0, size)); read += size; }
+          if (read !== info.size || fstatSync(fd).size !== info.size) throw new Error('tracked file moved during identity check');
+        } finally { closeSync(fd); }
+      } else { dirty = true; break; }
+      if (hash.digest('hex') !== object.hash) { dirty = true; break; }
+    }
+    statusText = dirty ? 'raw tracked/index bytes differ from HEAD' : '';
   } catch (error) {
     throw new GitIdentityUnavailableError(repoRoot, String(error));
   }
@@ -235,11 +282,11 @@ export function extractReplayData(input: {
 }): ReplayData | null {
   const { failures, environmentProfile } = input;
   if (failures.length === 0) return null;
-  const withSeed = failures.find((failure) => failure.seed !== null) ?? null;
-  const seed = withSeed?.seed ?? null;
-  const shrinkPath = failures
-    .flatMap((failure) => [...extractShrinkPath(failure.messageExcerpt)])
-    .slice(0, 64);
+  // One assertion owns all controls; never combine one property's seed
+  // with another property's input/path.
+  const primary = failures[0]!;
+  const seed = primary.seed;
+  const shrinkPath = extractShrinkPath(primary.nativeReplayMessage === undefined ? primary.messageExcerpt : primary.nativeReplayMessage ?? '').slice(0, 64);
   return {
     seed,
     shrinkPath,
@@ -263,10 +310,11 @@ export function retainedCounterexample(input: {
   const { outcome, environmentProfile } = input;
   if (outcome.kind !== 'property-failure' || outcome.failures.length === 0) return null;
   const primary = outcome.failures[0] as PropertyFailureRecord;
-  const extracted = extractCounterexampleInput(primary.messageExcerpt);
-  const replay = extractReplayData({ failures: outcome.failures, environmentProfile, replaySupported: extracted.parsed && primary.seed !== null });
+  const extracted = extractCounterexampleInput(primary.nativeReplayMessage === undefined ? primary.messageExcerpt : primary.nativeReplayMessage ?? '');
+  const replay = extractReplayData({ failures: [primary], environmentProfile, replaySupported: extracted.parsed && primary.seed !== null });
   if (replay === null) return null;
   return {
+    testIdentity: primary.testIdentity,
     minimizedInput: extracted.input,
     replay: extracted.parsed
       ? replay

@@ -27,12 +27,13 @@ import { settleRetries, type PacingGate, type PacingLease, type RetrySettlement 
 /** Bind property repair to the SAME job/minion routing, pacing, cancellation
  * and single-writer rules as ordinary fix directives. Only the host campaign
  * can issue these inputs; caller-authored repair stories are not evidence. */
-export function createPropertyFixDirectiveSink(deps: DirectiveRoutingDeps, jobId: string, signal: AbortSignal): (directive: PropertyRepairDirective) => Promise<void> {
+export function createPropertyFixDirectiveSink(deps: DirectiveRoutingDeps, jobId: string, signal: AbortSignal, receipt?: (delivery: Awaited<ReturnType<typeof routeFixDirectiveToMinion>>) => void): (directive: PropertyRepairDirective) => Promise<void> {
   const consumed = new WeakSet<PropertyRepairDirective>();
   return async (directive) => {
     if (!isHostPropertyRepairDirective(directive) || consumed.has(directive)) throw new Error('property repair refused: unissued, changed or already delivered directive');
     consumed.add(directive);
-    const result = await routeFixDirectiveToMinion({ ...deps, jobId, signal, directive: directive.text, owner: 'property-contract-repair' });
+    const result = await routeFixDirectiveToMinion({ ...deps, jobId, signal, directive: directive.text, owner: 'property-contract-repair', contract: 'effectiveContract' in deps.ledger ? (deps.ledger as LedgerApi).effectiveContract(jobId)?.text ?? null : null });
+    receipt?.(result);
     if (!result.delivered || result.outcome === 'error') throw new Error(`property repair directive did not complete: ${result.error ?? result.note ?? 'no delivery proof'}`);
   };
 }

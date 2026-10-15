@@ -3996,6 +3996,8 @@ export class LedgerApi {
     if (job === null || isJobTerminal(job.status)) {
       throw new Error(`cannot admit ${kind} for job "${jobId}" (${job?.status ?? 'missing'})`);
     }
+    const prior = this.listJobAdmissions(jobId);
+    if ((kind.startsWith('property ') && prior.length > 0) || (prior.some((entry) => entry.startsWith('property ')) && !kind.startsWith('provider wait establishment '))) throw new LaneWriterConflictError(`job "${jobId}" has a competing property/producer admission — wait for its proven settlement`);
     const admission = { jobId, kind };
     this.activeJobAdmissions.add(admission);
     return () => { this.activeJobAdmissions.delete(admission); };
@@ -7382,7 +7384,7 @@ export class LedgerApi {
   }
 
   private assertNoProviderProducer(jobId: string): void {
-    const admissions = this.listJobAdmissions(jobId).filter((kind) => kind.startsWith('provider '));
+    const admissions = this.listJobAdmissions(jobId).filter((kind) => kind.startsWith('provider ') || kind.startsWith('property '));
     const claims = this.listOpenProviderWaitsForJob(jobId)
       .filter((wait) => wait.status === 'claimed')
       .map((wait) => `claimed provider continuation ${wait.id}`);

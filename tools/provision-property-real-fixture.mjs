@@ -84,11 +84,32 @@ function canonicalContainment() {
   return canonical;
 }
 
+function stageDirectory(stage, create = false) {
+  canonicalContainment();
+  let cursor = fixtureDir;
+  for (const part of ['.provisioning', stage]) {
+    cursor = join(cursor, part);
+    const info = lstatSync(cursor, { throwIfNoEntry: false });
+    if (info !== undefined && !info.isDirectory()) fail(`provisioning destination must be an ordinary directory: ${cursor}`);
+    if (info === undefined && create) mkdirSync(cursor);
+  }
+  for (const name of ['home', 'cache', 'tmp']) {
+    const path = join(cursor, name); const info = lstatSync(path, { throwIfNoEntry: false });
+    if (info !== undefined && !info.isDirectory()) fail(`provisioning destination must be an ordinary directory: ${path}`);
+  }
+  return cursor;
+}
+
 function isolatedEnvironment(stage) {
+  stageDirectory(stage);
   const home = join(provisioningDir, stage, 'home');
   const cache = join(provisioningDir, stage, 'cache');
   const tmp = join(provisioningDir, stage, 'tmp');
-  for (const dir of [home, cache, tmp]) mkdirSync(dir, { recursive: true });
+  for (const dir of [home, cache, tmp]) {
+    const info = lstatSync(dir, { throwIfNoEntry: false });
+    if (info !== undefined && !info.isDirectory()) fail(`provisioning destination must be an ordinary directory: ${dir}`);
+    if (info === undefined) mkdirSync(dir);
+  }
   const env = {
     PATH: process.env.PATH ?? '/usr/bin:/bin',
     HOME: home,
@@ -193,11 +214,16 @@ function validateInstalledToolchain() {
 }
 
 const stage = process.argv[2];
+if (stage === 'preflight') {
+  stageDirectory('materialize');
+  process.stdout.write('read-only provisioning destination preflight passed; no installer invoked\n');
+  process.exit(0);
+}
 if (stage === 'resolve') {
   if (!existsSync(join(fixtureDir, 'package.json'))) fail('fixture package.json is missing');
   const lockPath = join(fixtureDir, 'package-lock.json');
   if (existsSync(lockPath)) fail('package-lock.json already exists — the one initial lock resolution was already performed; commit it and use materialize');
-  mkdirSync(join(provisioningDir, 'resolve'), { recursive: true });
+  stageDirectory('resolve', true);
   const outcome = runInstaller('resolve', ['install', '--package-lock-only', '--ignore-scripts', '--no-audit', '--no-fund', `--registry=${registry}`]);
   if (outcome.exitCode !== 0) fail(`resolve stage failed (exit ${outcome.exitCode}) — STOP with evidence at ${join(provisioningDir, 'resolve')}; no retry`);
   assertPublicRegistryLock();
@@ -211,7 +237,7 @@ if (stage === 'materialize') {
   assertPublicRegistryLock();
   const modules = join(fixtureDir, 'node_modules');
   if (existsSync(modules)) fail('node_modules already exists — unexpected existing state; STOP with evidence; no silent reinstall');
-  mkdirSync(join(provisioningDir, 'materialize'), { recursive: true });
+  stageDirectory('materialize', true);
   const outcome = runInstaller('materialize', ['ci', '--ignore-scripts', '--no-audit', '--no-fund', `--registry=${registry}`]);
   if (outcome.exitCode !== 0) {
     // npm ci leaves a partial node_modules on failure — the evidence stays;
@@ -221,4 +247,4 @@ if (stage === 'materialize') {
   validateInstalledToolchain();
   process.exit(0);
 }
-fail(`usage: node tools/provision-property-real-fixture.mjs <resolve|materialize>`);
+fail(`usage: node tools/provision-property-real-fixture.mjs <resolve|materialize|preflight>`);

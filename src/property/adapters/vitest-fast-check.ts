@@ -1,5 +1,5 @@
 import { lstatSync, readFileSync, realpathSync } from 'node:fs';
-import { dirname, isAbsolute, join, relative, sep } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type {
   AdapterSupport,
   PropertyAdapter,
@@ -87,13 +87,13 @@ interface LockfileProvisions {
   readonly source: string | null;
 }
 
-function provisionFromPackageLock(text: string): { readonly vitest: string | null; readonly fastCheck: string | null } {
+function provisionFromPackageLock(text: string, packagePrefix: string): { readonly vitest: string | null; readonly fastCheck: string | null } {
   try {
     const parsed = JSON.parse(text) as { packages?: Record<string, { version?: unknown }> };
     const packages = parsed.packages;
     if (typeof packages !== 'object' || packages === null) return { vitest: null, fastCheck: null };
-    const vitest = packages['node_modules/vitest'];
-    const fastCheck = packages['node_modules/fast-check'];
+    const vitest = packages[`${packagePrefix}node_modules/vitest`] ?? packages['node_modules/vitest'];
+    const fastCheck = packages[`${packagePrefix}node_modules/fast-check`] ?? packages['node_modules/fast-check'];
     return {
       vitest: typeof vitest?.version === 'string' ? vitest.version : null,
       fastCheck: typeof fastCheck?.version === 'string' ? fastCheck.version : null,
@@ -103,12 +103,47 @@ function provisionFromPackageLock(text: string): { readonly vitest: string | nul
   }
 }
 
-function provisionFromPnpmOrYarn(text: string): { readonly vitest: string | null; readonly fastCheck: string | null } {
+function provisionFromPnpmOrYarn(text: string, kind: string, context: PropertyDetectionContext, importer: string): { readonly vitest: string | null; readonly fastCheck: string | null } {
+  const lines = text.split(/\r?\n/u);
+  const unique = (values: readonly string[]): string | null => new Set(values).size === 1 ? values[0]! : null;
+  const deps = { ...(context.manifest?.['dependencies'] as Record<string, unknown> | undefined), ...(context.manifest?.['devDependencies'] as Record<string, unknown> | undefined) };
   const find = (name: string): string | null => {
-    for (const match of text.matchAll(new RegExp(`^\\s*(?:${name})@[^\\s:]+:[\\s\\S]*?version\\s+"?([^"\\n]+)"?`, 'gm'))) {
-      return match[1] ?? null;
+    if (kind === 'pnpm-lock.yaml') {
+      // Prefer the exact workspace importer. A package entry alone may name
+      // several versions and must never guess which one the target uses.
+      const start = lines.findIndex((line) => line === `  ${importer}:` || line === `  '${importer}':`);
+      if (start >= 0) {
+        const end = lines.findIndex((line, index) => index > start && /^\S|^ {2}\S/u.test(line));
+        const block = lines.slice(start + 1, end < 0 ? undefined : end);
+        const dependency = block.findIndex((line) => line === `      ${name}:`);
+        if (dependency >= 0) {
+          for (const line of block.slice(dependency + 1)) {
+            if (/^ {0,6}\S/u.test(line)) break;
+            const version = /^ {8}version: ['"]?(\d+\.\d+\.\d+(?:[-+][\w.-]+)?)/u.exec(line);
+            if (version !== null) return version[1]!;
+          }
+        }
+        return null;
+      }
+      const versions = lines.flatMap((line) => {
+        const header = /^ {2}['"]?\/?([^@/'":]+)(?:@|\/)(\d+\.\d+\.\d+(?:[-+][\w.-]+)?)/u.exec(line);
+        return header?.[1] === name ? [header[2]!] : [];
+      });
+      return unique(versions);
     }
-    return null;
+    const versions: string[] = [];
+    for (let index = 0; index < lines.length; index += 1) {
+      const header = lines[index]!;
+      if (!/^\S.*:\s*$/u.test(header) || !header.includes(`${name}@`)) continue;
+      const requested = deps[name];
+      if (typeof requested === 'string' && !header.includes(`${name}@${requested}`) && !header.includes(`${name}@npm:${requested}`)) continue;
+      for (const line of lines.slice(index + 1)) {
+        if (/^\S/u.test(line)) break;
+        const version = /^ {2}version(?::|\s)\s*['"]?(\d+\.\d+\.\d+(?:[-+][\w.-]+)?)/u.exec(line);
+        if (version !== null) { versions.push(version[1]!); break; }
+      }
+    }
+    return unique(versions);
   };
   return { vitest: find('vitest'), fastCheck: find('fast-check') };
 }
@@ -116,11 +151,13 @@ function provisionFromPnpmOrYarn(text: string): { readonly vitest: string | null
 function lockfileProvisions(context: PropertyDetectionContext): LockfileProvisions {
   for (const lockfile of context.lockfiles) {
     const base = lockfile.path.split('/').pop() ?? '';
+    const target = toPosix(relative(dirname(join(context.repoRoot, lockfile.path)), context.packageDir));
+    const prefix = target === '' ? '' : `${target}/`;
     if (base === 'package-lock.json' || base === 'npm-shrinkwrap.json') {
-      const provisions = provisionFromPackageLock(lockfile.text);
+      const provisions = provisionFromPackageLock(lockfile.text, prefix);
       if (provisions.vitest !== null || provisions.fastCheck !== null) return { ...provisions, source: lockfile.path };
     } else if (base === 'pnpm-lock.yaml' || base === 'yarn.lock') {
-      const provisions = provisionFromPnpmOrYarn(lockfile.text);
+      const provisions = provisionFromPnpmOrYarn(lockfile.text, base, context, target || '.');
       if (provisions.vitest !== null || provisions.fastCheck !== null) return { ...provisions, source: lockfile.path };
     }
   }
@@ -183,6 +220,10 @@ export function detectVitestFastCheck(context: PropertyDetectionContext): Proper
   // Version honesty: an installed/locked vitest outside the probed range is
   // an explicit incompatibility, not a guess.
   const effectiveVitest = installedVitest ?? locked.vitest;
+  for (const [name, declared, effective] of [['vitest', declaredVitest, effectiveVitest], ['fast-check', declaredFastCheck, installedFastCheck ?? locked.fastCheck]]) {
+    const declaredMajor = typeof declared === 'string' ? /^[~^]?(\d+)\./u.exec(declared)?.[1] : undefined;
+    if (declaredMajor !== undefined && effective != null && majorOf(effective) !== Number(declaredMajor)) return { compatible: false, reasons: [`${name} installed/locked version ${effective} does not match target declaration ${declared}`], versions };
+  }
   if (effectiveVitest !== null && !inTestedRange(effectiveVitest, VITEST_TESTED_RANGE)) {
     return {
       compatible: false,
@@ -438,7 +479,7 @@ export function interpretVitestJsonReceipt(raw: RawExecutionReceipt, plan: Prope
   const selectionFilter = toPosix(plan.args[plan.args.length - 1] ?? '');
   const suites = report.testResults.map((suite) => ({
     suite,
-    selected: selectionFilter !== '' && (toPosix(suite.name) === selectionFilter || toPosix(suite.name).endsWith(`/${selectionFilter}`)),
+    selected: selectionFilter !== '' && resolve(plan.cwd, toPosix(suite.name)) === resolve(plan.cwd, selectionFilter),
   }));
   if (report.testResults.length === 0) {
     return { ...base, kind: 'selection-failure', selected: 0, executed: 0, skipped: 0, failed: 0, passed: 0, failures: [], unselectedFailures: [], reasons: ['parsable report contains zero test results — zero selected tests is never a pass'], matchedDiagnostic: null };
@@ -449,6 +490,7 @@ export function interpretVitestJsonReceipt(raw: RawExecutionReceipt, plan: Prope
   let failed = 0;
   let passed = 0;
   let selectedExecuted = 0;
+  const selectedAssertions: { testIdentity: string; status: 'passed' | 'failed' | 'skipped' }[] = [];
   const failures: PropertyFailureRecord[] = [];
   const unselectedFailures: UnselectedFailureRecord[] = [];
   for (const { suite, selected } of suites) {
@@ -456,6 +498,7 @@ export function interpretVitestJsonReceipt(raw: RawExecutionReceipt, plan: Prope
       // handled below as a collection failure candidate
     }
     for (const assertion of suite.assertionResults) {
+      if (selected) selectedAssertions.push({ testIdentity: assertion.fullName, status: assertion.status === 'passed' || assertion.status === 'failed' ? assertion.status : 'skipped' });
       if (assertion.status === 'skipped' || assertion.status === 'todo' || assertion.status === 'pending') {
         skipped += 1;
         continue;
@@ -467,6 +510,7 @@ export function interpretVitestJsonReceipt(raw: RawExecutionReceipt, plan: Prope
         const record = {
           testIdentity: assertion.fullName,
           messageExcerpt: excerpt(assertion.failureMessages.join('\n')),
+          nativeReplayMessage: Buffer.byteLength(assertion.failureMessages.join('\n'), 'utf8') <= 16 * 1024 ? assertion.failureMessages.join('\n') : null,
           seed: extractSeed(assertion.failureMessages),
         };
         if (selected) failures.push(record);
@@ -497,7 +541,7 @@ export function interpretVitestJsonReceipt(raw: RawExecutionReceipt, plan: Prope
 
   // Contradiction checks: the report must be self-consistent and agree with
   // the direct exit code, or it can never yield pass.
-  const totalsConsistent = report.numTotalTests === executed + skipped && executed === passed + failed && report.numFailedTests === failed && report.numPassedTests === passed && report.numPendingTests + report.numTodoTests === skipped;
+  const totalsConsistent = new Set(selectedAssertions.map((assertion) => assertion.testIdentity)).size === selectedAssertions.length && report.numTotalTests === executed + skipped && executed === passed + failed && report.numFailedTests === failed && report.numPassedTests === passed && report.numPendingTests + report.numTodoTests === skipped;
   const exitConsistent = raw.exitCode !== null && raw.signal === null && (raw.exitCode === 0) === report.success && (failed === 0 || !report.success);
   if ((kind === 'pass' || kind === 'property-failure') && (!totalsConsistent || !exitConsistent || (kind === 'pass' && (raw.exitCode !== 0 || unselectedFailures.length > 0 || selectedExecuted === 0 || passed !== executed)))) {
     kind = 'inconclusive';
@@ -514,7 +558,8 @@ export function interpretVitestJsonReceipt(raw: RawExecutionReceipt, plan: Prope
   return {
     ...base,
     kind,
-    selected: suites.some((entry) => entry.selected) ? selectedExecuted : 0,
+    selected: selectedAssertions.length,
+    selectedAssertions,
     executed,
     skipped,
     failed,

@@ -1,6 +1,5 @@
 import { isSealedExecutionReceipt, type ExecutePlanInput, type ExecutePlanResult, type PropertyExecutor } from './executor.js';
 import type { OverlayInputFile } from './overlay.js';
-import { extractCounterexampleInput } from './receipts.js';
 import type { PropertyAdapter, RetainedCounterexample, SealedExecutionReceipt } from './types.js';
 
 /**
@@ -109,19 +108,17 @@ export async function replayRetainedCounterexample(request: ReplayRequest): Prom
     };
   }
   const echoedSeed = failureSeedEchoed(receipt);
-  const replayed = extractCounterexampleInput(
-    (receipt.outcome.failures[0] as { readonly messageExcerpt: string }).messageExcerpt,
-  );
+  const replayed = receipt.counterexample;
   const seedMatches = echoedSeed === seed;
-  const inputMatches = replayed.input === counterexample.minimizedInput;
+  const inputMatches = replayed?.minimizedInput === counterexample.minimizedInput;
+  const assertionMatches = counterexample.testIdentity !== undefined && replayed?.testIdentity === counterexample.testIdentity && receipt.outcome.failures[0]?.testIdentity === counterexample.testIdentity;
   const identityMatches = JSON.stringify(receipt.identity.source) === JSON.stringify(request.originalReceipt.identity.source) && receipt.identity.workspaceTreeSha256 === request.originalReceipt.identity.workspaceTreeSha256 && receipt.identity.dependencyTreeSha256 === request.originalReceipt.identity.dependencyTreeSha256 && receipt.identity.lockIdentity === request.originalReceipt.identity.lockIdentity && receipt.identity.configIdentity === request.originalReceipt.identity.configIdentity && receipt.identity.overlay?.overlaySha256 === request.originalReceipt.identity.overlay?.overlaySha256 && receipt.identity.selectionFilter === request.originalReceipt.identity.selectionFilter && receipt.identity.adapterProfile === request.originalReceipt.identity.adapterProfile;
-  if (seedMatches && inputMatches && replayed.parsed && identityMatches && environmentMatch) {
+  if (seedMatches && inputMatches && assertionMatches && replayed?.replay.replaySupported === true && identityMatches && environmentMatch) {
     return {
       kind: 'reproduced',
       receipt,
       disclosure:
         `replayed counterexample reproduced deterministically: seed ${seed} echoed by the runner, minimized input identical` +
-        (replayed.parsed ? '' : ' (input retained verbatim from an unparsable excerpt)') +
         `.${driftNote}`,
       environmentMatch,
     };
@@ -131,7 +128,7 @@ export async function replayRetainedCounterexample(request: ReplayRequest): Prom
     receipt,
     disclosure:
       `replay did not reproduce the retained counterexample: seed echo ${JSON.stringify(echoedSeed)} (expected ${JSON.stringify(seed)}), ` +
-      `minimized input ${JSON.stringify(replayed.input)} (expected ${JSON.stringify(counterexample.minimizedInput)}) — ` +
+      `minimized input ${JSON.stringify(replayed?.minimizedInput)} (expected ${JSON.stringify(counterexample.minimizedInput)}) — ` +
       `disclosed as nondeterminism or drift, never claimed as reproduction.${driftNote}`,
     environmentMatch,
   };

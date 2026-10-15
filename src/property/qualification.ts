@@ -348,8 +348,17 @@ export function attributeCounterexampleWithHostEvidence(
 ): BaselineAttribution {
   const candidate = resolveSealedEvidence(source, candidateRef, 'candidate run');
   const baseline = baselineRef === null ? null : resolveSealedEvidence(source, baselineRef, 'baseline run');
-  if (baseline !== null) requireCompatibleHarness(candidate, baseline);
-  return attributeCounterexample(candidate.outcome, baseline?.outcome ?? null);
+  if (candidate.outcome.kind !== 'property-failure') throw new PropertyQualificationError('attribution requires a candidate property-failure');
+  if (baseline === null) return 'unattributed';
+  requireCompatibleHarness(candidate, baseline);
+  const example = candidate.counterexample;
+  if (example?.replay.replaySupported !== true || example.testIdentity === undefined || example.replay.seed === null || baseline.replay === null || baseline.replay.seed !== example.replay.seed || JSON.stringify(baseline.replay.shrinkPath) !== JSON.stringify(example.replay.shrinkPath)) return 'unattributed';
+  const assertion = baseline.outcome.selectedAssertions?.find((entry) => entry.testIdentity === example.testIdentity);
+  if (assertion?.status === 'passed' && ['pass', 'property-failure'].includes(baseline.outcome.kind)) return 'candidate-only';
+  const failure = baseline.outcome.failures.find((entry) => entry.testIdentity === example.testIdentity && entry.seed === example.replay.seed);
+  // Another failing assertion is not evidence that this candidate example
+  // failed on baseline. Native replay must name the same original assertion.
+  return assertion?.status === 'failed' && failure !== undefined ? 'baseline-also-fails' : 'unattributed';
 }
 
 /** Verdicts that policy routes to human escalation. */

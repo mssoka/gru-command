@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
-import { lstatSync, readdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { loadWorktreeManifest } from '../worktrees/manifest.js';
+import { closeSync, constants, fstatSync, lstatSync, openSync, readdirSync, readlinkSync, readSync, realpathSync } from 'node:fs';
+import { dirname, isAbsolute, join, relative as relativePath, sep } from 'node:path';
+import { parseWorktreeManifest } from '../worktrees/manifest.js';
 import { matrixRowFor } from './adapters/matrix.js';
 import { detectVitestFastCheck, resolveVitestBinary } from './adapters/vitest-fast-check.js';
 import type {
@@ -79,25 +79,41 @@ function scanDirectory(absolute: string, relativeDir: string): DirectoryScan {
 }
 
 /** Read a bounded regular file; named error for unreadable/oversized. */
-function readBounded(absolute: string, label: string): string {
+function readBounded(absolute: string, label: string, repoRoot: string): string {
+  const root = realpathSync(repoRoot);
+  const logical = relativePath(repoRoot, absolute);
+  const rel = isAbsolute(logical) || logical === '..' || logical.startsWith(`..${sep}`) ? relativePath(root, absolute) : logical;
+  if (isAbsolute(rel) || rel === '..' || rel.startsWith(`..${sep}`)) throw new ResolutionWalkError(`${label} escapes repository`);
+  let cursor = root;
+  for (const part of rel.split(sep).slice(0, -1)) {
+    cursor = join(cursor, part);
+    if (!lstatSync(cursor, { throwIfNoEntry: false })?.isDirectory()) throw new ResolutionWalkError(`${label} parent must be an ordinary directory`);
+  }
+  const path = join(root, rel);
   let info;
   try {
-    info = lstatSync(absolute);
+    info = lstatSync(path);
   } catch (error) {
     throw new ResolutionWalkError(`${label} is unreadable: ${String(error)}`);
   }
-  if (!info.isFile()) throw new ResolutionWalkError(`${label} is not a regular file`);
+  if (!info.isFile() || info.nlink !== 1) throw new ResolutionWalkError(`${label} is not an ordinary unshared regular file`);
   if (info.size > MAX_MANIFEST_BYTES) throw new ResolutionWalkError(`${label} exceeds ${MAX_MANIFEST_BYTES} bytes`);
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
-    return readFileSync(absolute, 'utf8');
+    const opened = fstatSync(fd);
+    if (opened.dev !== info.dev || opened.ino !== info.ino || opened.size !== info.size) throw new ResolutionWalkError(`${label} moved before bounded read`);
+    const bytes = Buffer.alloc(info.size); let count = 0;
+    while (count < bytes.length) { const size = readSync(fd, bytes, count, bytes.length - count, null); if (size === 0) break; count += size; }
+    if (count !== info.size || fstatSync(fd).size !== info.size) throw new ResolutionWalkError(`${label} moved across bounded read`);
+    return bytes.toString('utf8');
   } catch (error) {
     throw new ResolutionWalkError(`${label} could not be read: ${String(error)}`);
-  }
+  } finally { closeSync(fd); }
 }
 
 function evidenceFor(repoRoot: string, relative: string, role: ManifestEvidenceEntry['role']): ManifestEvidenceEntry | null {
   try {
-    return { path: relative, role, sha256: sha256(readBounded(join(repoRoot, relative), relative)) };
+    return { path: relative, role, sha256: sha256(readBounded(role === 'installed-module' ? realpathSync(join(repoRoot, relative)) : join(repoRoot, relative), relative, repoRoot)) };
   } catch {
     return null;
   }
@@ -186,7 +202,7 @@ function resolveNodePackage(
   const manifestPath = packageDir === '' ? NODE_MANIFEST : `${packageDir}/${NODE_MANIFEST}`;
   let manifestText: string;
   try {
-    manifestText = readBounded(join(repoRoot, manifestPath), manifestPath);
+    manifestText = readBounded(join(repoRoot, manifestPath), manifestPath, repoRoot);
   } catch (error) {
     return row(packageDir, 'node-typescript', 'invalid-manifest', null, null, [String(error)], evidence);
   }
@@ -199,11 +215,11 @@ function resolveNodePackage(
     return row(packageDir, 'node-typescript', 'invalid-manifest', null, null, [`${manifestPath} is malformed JSON (${String(error)})`], evidence);
   }
   const lockfiles: { readonly path: string; readonly text: string }[] = [];
-  for (const base of new Set(packageDir === '' ? [''] : ['', packageDir])) {
+  for (const base of new Set(packageDir === '' ? [''] : [packageDir, ''])) {
     for (const lock of NODE_LOCKFILES) {
       const relative = base === '' ? lock : `${base}/${lock}`;
       try {
-        lockfiles.push({ path: relative, text: readBounded(join(repoRoot, relative), relative) });
+        lockfiles.push({ path: relative, text: readBounded(join(repoRoot, relative), relative, repoRoot) });
       } catch {
         // absent lockfile at this location
       }
@@ -212,6 +228,19 @@ function resolveNodePackage(
   const context: PropertyDetectionContext = { repoRoot, packageDir: join(repoRoot, packageDir), manifest, lockfiles, approvedCommands };
   const detected = detectVitestFastCheck(context);
   const ladder = ladderForNode(context, detected);
+  const binary = resolveVitestBinary(repoRoot, context.packageDir);
+  const runner = binary.path === null ? { path: null, reason: binary.reason?.replaceAll(repoRoot, '<repo>') } : { path: relativePath(repoRoot, binary.path), mode: lstatSync(binary.path).mode & 0o777, sha256: sha256(readBounded(binary.path, 'resolved Vitest runner', repoRoot)) };
+  const canonicalRoot = realpathSync(repoRoot);
+  const entries = [...new Set([realpathSync(context.packageDir), canonicalRoot])].flatMap((base) => ['node_modules/.bin/vitest', 'node_modules/vitest/vitest.mjs'].map((name) => {
+    const path = join(base, name); const label = relativePath(canonicalRoot, path);
+    try {
+      const parent = relativePath(canonicalRoot, realpathSync(dirname(path)));
+      if (isAbsolute(parent) || parent === '..' || parent.startsWith(`..${sep}`)) return [label, 'refused-parent'];
+      const info = lstatSync(path);
+      return [label, info.mode, info.isSymbolicLink() ? readlinkSync(path) : 'regular'];
+    } catch { return [label, 'absent-or-unreadable']; }
+  }));
+  const boundEvidence = [...evidence, { path: `${packageDir || '.'}/<runner-state>`, role: 'runner' as const, sha256: sha256(JSON.stringify({ runner, entries, versions: detected.versions })) }];
   const approved = Object.entries(approvedCommands)
     .filter(([, command]) => command.includes('vitest'))
     .map(([scope, command]) => `approved project command names vitest (${scope}: ${command})`);
@@ -222,7 +251,7 @@ function resolveNodePackage(
     ladder.status === 'resolved' || ladder.status === 'ambiguous' ? 'vitest-fast-check' : null,
     ladder.ladder,
     [...ladder.reasons, ...approved],
-    evidence,
+    boundEvidence,
   );
 }
 
@@ -234,7 +263,11 @@ export function resolvePropertyCapabilities(input: {
 }): PropertyCapabilityReport {
   const rootInfo = lstatSync(input.repoRoot);
   if (!rootInfo.isDirectory()) throw new ResolutionWalkError(`repoRoot is not a directory: ${input.repoRoot}`);
-  const approvedCommands = loadWorktreeManifest(input.repoRoot)?.verify ?? {};
+  const configParent = lstatSync(join(input.repoRoot, '.gru-command'), { throwIfNoEntry: false });
+  if (configParent !== undefined && !configParent.isDirectory()) throw new ResolutionWalkError('worktree config parent must be an ordinary directory');
+  const configPath = join(input.repoRoot, '.gru-command/worktree.toml');
+  const configText = configParent !== undefined && lstatSync(configPath, { throwIfNoEntry: false }) !== undefined ? readBounded(configPath, '.gru-command/worktree.toml', input.repoRoot) : null;
+  const approvedCommands = configText === null ? {} : parseWorktreeManifest(configText, configPath).verify ?? {};
   const candidates: { readonly dir: string; readonly manifest: string }[] = [];
   let walked = 0;
 
@@ -263,7 +296,9 @@ export function resolvePropertyCapabilities(input: {
     const normalized = packageDir === '.' ? '' : packageDir;
     return input.scopePaths.some((raw) => {
       const scope = toPosix(raw).replace(/^\.\//u, '');
-      return scope === normalized || (normalized !== '' && scope.startsWith(`${normalized}/`));
+      const owners = candidates.filter(({ dir }) => dir === '' || scope === dir || scope.startsWith(`${dir}/`));
+      const nearest = owners.sort((left, right) => right.dir.length - left.dir.length)[0]?.dir;
+      return nearest === normalized || scope === normalized;
     });
   };
 
@@ -272,7 +307,7 @@ export function resolvePropertyCapabilities(input: {
     const packageDir = candidate.dir === '' ? '.' : candidate.dir;
     if (!inScope(packageDir)) continue;
     if (candidate.manifest === NODE_MANIFEST) {
-      const evidence: ManifestEvidenceEntry[] = [];
+      const evidence: ManifestEvidenceEntry[] = configText === null ? [] : [{ path: '.gru-command/worktree.toml', role: 'config', sha256: sha256(configText) }];
       const bases = packageDir === '.' ? [''] : ['', packageDir];
       for (const base of new Set(bases)) {
         const push = (relative: string, role: ManifestEvidenceEntry['role']): void => {

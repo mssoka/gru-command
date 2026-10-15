@@ -43,6 +43,7 @@ export interface ExecutePlanInput {
   readonly replayPath?: string | null;
 }
 export interface PropertyExecutorOptions {
+  readonly signal?: AbortSignal;
   readonly sandboxExecutable?: string;
   readonly workspaceParentDir?: string;
   readonly workspaceCopyBounds?: { readonly maxFiles: number; readonly maxBytes: number };
@@ -121,6 +122,29 @@ function profile(workspace: string, denied: readonly string[]): string {
   ].join('\n');
 }
 type CopyBounds = { readonly maxFiles: number; readonly maxBytes: number };
+/** Fixed storage: even an endless post-cap stream retains no incoming chunks. */
+export function createBoundedPropertyCapture(maxBytes: number) {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > POLICY.maxMaxOutputBytes) throw new PreExecutionRejectionError('budget-exceeds-policy', 'invalid capture capacity');
+  const buffers = { stdout: Buffer.alloc(maxBytes), stderr: Buffer.alloc(maxBytes) };
+  const sizes = { stdout: 0, stderr: 0 }; const truncated = { stdout: false, stderr: false };
+  return {
+    capacityBytes: maxBytes * 2,
+    push(name: 'stdout' | 'stderr', chunk: Buffer) {
+      const count = Math.min(chunk.length, maxBytes - sizes[name]);
+      if (count > 0) { chunk.copy(buffers[name], sizes[name], 0, count); sizes[name] += count; }
+      if (count < chunk.length) truncated[name] = true;
+    },
+    finish() { return { stdout: buffers.stdout.subarray(0, sizes.stdout).toString('utf8'), stderr: buffers.stderr.subarray(0, sizes.stderr).toString('utf8'), stdoutTruncated: truncated.stdout, stderrTruncated: truncated.stderr, complete: !truncated.stdout && !truncated.stderr }; },
+  };
+}
+/** Read-only current harness identity, never an execution approval. */
+export function propertyWorkspaceIdentity(root: string) { return snapshotWorkspace(realpathSync(root), { maxFiles: 60_000, maxBytes: 2 * 1024 ** 3 }); }
+/** Everything except explicitly owner-approved implementation files is frozen. */
+export function propertyProtectedIdentity(root: string, implementationPaths: readonly string[]): string {
+  const allowed = new Set(implementationPaths);
+  const tracked = new Set(propertyGit(root, ['ls-files', '-z']).split('\0').filter((path) => path !== '' && !allowed.has(path)));
+  return snapshotWorkspace(realpathSync(root), { maxFiles: 60_000, maxBytes: 2 * 1024 ** 3 }, tracked).digest;
+}
 function snapshotWorkspace(root: string, bounds: CopyBounds, tracked = new Set(propertyGit(root, ['ls-files', '-z']).split('\0'))) {
   const parents = new Set(['']);
   for (const path of tracked) { const parts = path.split(sep); while (parts.length > 1) { parts.pop(); parents.add(parts.join(sep)); } }
@@ -178,6 +202,7 @@ export function createPropertyExecutor(options: PropertyExecutorOptions = {}): P
     resolveReceiptRef(ref) { const value = receipts.get(ref?.receiptId); return value !== undefined && isSealedExecutionReceipt(value) ? value : null; },
     async executePlan(input) {
       const { plan, repoRoot, packageDir } = input;
+      if (options.signal?.aborted) return { executed: false, refusal: { kind: 'not-run', reason: 'property host aborted/disposed', backend: 'none-found' } };
       if (running) return { executed: false, refusal: { kind: 'not-run', reason: 'host property concurrency ceiling (one run) is occupied', backend: 'none-found' } };
       const backend = resolveSandboxBackend(options.sandboxExecutable);
       if (!plan.executable || plan.refusalReason !== null || backend.executable === null) return { executed: false, refusal: { kind: 'not-run', reason: plan.refusalReason ?? backend.reason ?? 'plan is not executable', backend: backend.backend } };
@@ -228,28 +253,27 @@ export function createPropertyExecutor(options: PropertyExecutorOptions = {}): P
         const argv = [realpathSync(process.execPath), '--max-old-space-size=256', runner.path, ...plan.args, '--config', configPath, '--configLoader', 'native'];
         const start = Date.now();
         const child = spawn(backend.executable, ['-p', sbpl, ...argv], { cwd: wsPkg, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
-        const capture = { stdout: [] as Buffer[], stderr: [] as Buffer[], stdoutBytes: 0, stderrBytes: 0, stdoutTruncated: false, stderrTruncated: false };
-        for (const name of ['stdout', 'stderr'] as const) child[name]!.on('data', (buf: Buffer) => {
-          const remaining = Math.max(0, plan.budget.maxOutputBytes - capture[`${name}Bytes`]);
-          const part = buf.subarray(0, remaining); capture[name].push(part); capture[`${name}Bytes`] += part.length;
-          if (buf.length > remaining) capture[`${name}Truncated`] = true;
-        });
+        const collector = createBoundedPropertyCapture(plan.budget.maxOutputBytes);
+        for (const name of ['stdout', 'stderr'] as const) child[name]!.on('data', (buf: Buffer) => collector.push(name, buf));
         let timedOut = false;
         const timer = setTimeout(() => { timedOut = true; if (child.pid !== undefined) killGroup(child.pid); }, plan.budget.runTimeoutMs);
+        const abort = () => { if (child.pid !== undefined) killGroup(child.pid); };
+        options.signal?.addEventListener('abort', abort, { once: true });
+        if (options.signal?.aborted) abort();
         try {
           await new Promise<void>((resolve, reject) => {
             let spawnError: Error | null = null;
             child.once('error', (error) => { spawnError = error; });
             child.once('close', () => spawnError === null ? resolve() : reject(spawnError));
           });
-        } catch (error) { throw new SandboxSpawnError(String(error)); } finally { clearTimeout(timer); }
+        } catch (error) { throw new SandboxSpawnError(String(error)); } finally { clearTimeout(timer); options.signal?.removeEventListener('abort', abort); }
         const proven = child.pid !== undefined && !groupAlive(child.pid);
         // No fork permission exists. If the group is nevertheless live, do
         // not issue evidence, release resources, or claim successful cleanup.
         if (!proven) throw new SandboxSpawnError(`cessation unproven; workspace retained at ${workspace}`);
-        const stdout = Buffer.concat(capture.stdout).toString('utf8'); const stderr = Buffer.concat(capture.stderr).toString('utf8');
+        const capture = collector.finish(); const { stdout, stderr } = capture;
         const raw = { stdout, stderr, exitCode: child.exitCode, signal: child.signalCode, timedOut, durationMs: Date.now() - start };
-        let outcome = VITEST_FAST_CHECK_ADAPTER.interpretExecution(raw, plan);
+        let outcome = VITEST_FAST_CHECK_ADAPTER.interpretExecution(raw, { ...plan, cwd: wsPkg });
         if ((capture.stdoutTruncated || capture.stderrTruncated) && outcome.kind === 'pass') outcome = { ...outcome, kind: 'inconclusive', reasons: [...outcome.reasons, 'output capture was truncated'] };
         const environmentProfile = environmentProfileString(env);
         const counterexample = retainedCounterexample({ outcome, environmentProfile });

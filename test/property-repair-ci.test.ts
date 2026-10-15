@@ -37,7 +37,7 @@ function campaign(mode: PropertyMode = 'enforced') {
   candidate.git(['fetch', healthy.root, 'HEAD']); candidate.git(['reset', '--soft', 'FETCH_HEAD']);
   writeFileSync(join(candidate.root, 'test/placeholder'), 'candidate mutation\n'); candidate.git(['add', '.']); candidate.git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'candidate unit mutation']);
   const proposal = { ...ratioProposal(), testArtifactRefs: [{ path, sha256: sha256Hex(content) }] };
-  return { bad, healthy, candidate, reviewed: { proposal, overlayFiles: [{ path, content }], knownBadRoot: bad.root, healthyRoot: healthy.root, candidateRoot: candidate.root, baselineRoot: healthy.root } };
+  return { bad, healthy, candidate, reviewed: { proposal, overlayFiles: [{ path, content }], knownBadRoot: bad.root, healthyRoot: healthy.root, candidateRoot: candidate.root, baselineRoot: healthy.root, implementationPaths: ['test/placeholder'] } };
 }
 async function execute(mode: PropertyMode = 'enforced') {
   const fixture = campaign(mode); const executor = createPropertyExecutor(); const host = createPropertyCampaignHost(executor); const artifactsDir = dir();

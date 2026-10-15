@@ -1,11 +1,13 @@
 import { createServer } from 'node:net';
+import { execFileSync } from 'node:child_process';
 import fs, { existsSync, linkSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createPropertyExecutor, isSealedExecutionReceipt, resolveSandboxBackend, validatePlanAgainstHostApproval } from '../src/property/executor.js';
+import { createBoundedPropertyCapture, createPropertyExecutor, isSealedExecutionReceipt, resolveSandboxBackend, validatePlanAgainstHostApproval } from '../src/property/executor.js';
 import { VITEST_FAST_CHECK_ADAPTER as adapter } from '../src/property/adapters/vitest-fast-check.js';
 import { applyOverlayFiles } from '../src/property/overlay.js';
+import { buildSourceIdentity } from '../src/property/receipts.js';
 import { PASS_RUNNER, scenarioRepo } from './fixtures/property/executor/helpers.js';
 const fixtures: ReturnType<typeof scenarioRepo>[] = [];
 afterEach(() => { for (const f of fixtures.splice(0)) f.cleanup(); });
@@ -21,6 +23,31 @@ async function run(script: string, opts: { readonly timeout?: number; readonly o
   return { ...result, executor, fixture: f };
 }
 describe('host property executor (positive sandbox controls on macOS; other hosts refuse)', () => {
+  it('does not execute repository clean filters while discovering committed source identity', () => {
+    const f = fixture(); const marker = join(f.root, 'filter-executed'); const script = join(f.root, 'owned-filter.mjs');
+    writeFileSync(join(f.root, '.gitattributes'), 'test/placeholder filter=property-owned\n'); f.git(['add', '.gitattributes']); f.git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'owned filter attribute']);
+    writeFileSync(script, `import fs from 'node:fs';fs.writeFileSync(${JSON.stringify(marker)},'executed');process.stdout.write(fs.readFileSync(0));`);
+    f.git(['config', 'filter.property-owned.clean', `${JSON.stringify(process.execPath)} ${JSON.stringify(script)}`]); f.git(['config', 'filter.property-owned.required', 'true']);
+    writeFileSync(join(f.root, 'test/placeholder'), 'tracked\n'); // force an index-stat refresh with identical bytes
+    expect(buildSourceIdentity(f.root).kind).toBe('clean-sha'); expect(existsSync(marker)).toBe(false);
+  });
+  it('retains fixed capture storage under sustained post-cap flooding, not incoming backing allocations', () => {
+    const source = `const POLICY={maxMaxOutputBytes:67108864};const capture=(${createBoundedPropertyCapture.toString()})(1024);global.gc();const before=process.memoryUsage().arrayBuffers;const first=Buffer.from('abc');capture.push('stdout',first);first.fill(122);for(let i=0;i<2000;i++){capture.push('stdout',Buffer.alloc(131072,120));capture.push('stderr',Buffer.alloc(131072,121));}global.gc();global.gc();console.log(JSON.stringify({retained:process.memoryUsage().arrayBuffers-before,capacity:capture.capacityBytes,...capture.finish()}));`;
+    const result = JSON.parse(execFileSync(process.execPath, ['--expose-gc', '--input-type=module', '-e', source], { encoding: 'utf8', timeout: 15_000, env: { PATH: '/usr/bin:/bin', LANG: 'C' } }));
+    expect(result.retained).toBeLessThan(2 * 1024 * 1024); expect(result.capacity).toBe(2048); expect(result.stdout).toHaveLength(1024); expect(result.stderr).toHaveLength(1024); expect(result.stdout.startsWith('abc')).toBe(true); expect(result.complete).toBe(false);
+  });
+  it('aborts an owned process and proves close/group cessation before disposal releases its workspace', async () => {
+    const f = fixture('setInterval(()=>{},1000);'); const controller = new AbortController(); const executor = createPropertyExecutor({ signal: controller.signal });
+    const input = { plan: f.plan, adapter, repoRoot: f.root, packageDir: f.root }; const approval = executor.approvePlan(input);
+    const operation = executor.executePlan({ ...input, approval }); const timer = setTimeout(() => controller.abort(), 30);
+    try {
+      const result = await operation;
+      if (process.platform !== 'darwin') { expect(result.executed).toBe(false); return; }
+      if (!result.executed) throw new Error(result.refusal.reason);
+      expect(result.cleanup).toMatchObject({ proven: true, workspaceRetained: false }); expect(result.receipt.outcome.kind).toBe('infrastructure-error'); expect(existsSync(result.receipt.cwd)).toBe(false);
+      expect(await executor.executePlan({ ...input, approval })).toMatchObject({ executed: false, refusal: { kind: 'not-run', reason: expect.stringContaining('aborted') } });
+    } finally { clearTimeout(timer); }
+  });
   it('refuses unsupported sandbox backends, including unshare', () => {
     expect(resolveSandboxBackend('/usr/bin/unshare')).toMatchObject({ backend: 'none-found', executable: null });
   });

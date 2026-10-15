@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -17,6 +17,7 @@ import { EventBus } from '../src/events/bus.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import type { AgentHandle } from '../src/runtime/types.js';
 import type { PropertyExecutionReceipt } from '../src/property/types.js';
+import { ownerService } from './fixtures/property/owner-service.js';
 
 const fixtures: ReturnType<typeof realToolRepo>[] = [];
 const dirs: string[] = [];
@@ -25,7 +26,7 @@ function root() { const dir = mkdtempSync(join(tmpdir(), 'property-real-campaign
 function spec(vacuous = false) {
   const bad = realToolRepo(true); const healthy = realToolRepo(false); const candidate = realToolRepo(true); fixtures.push(bad, healthy, candidate);
   const content = ratioContract(vacuous);
-  return { bad, healthy, candidate, reviewed: { proposal: ratioProposal(content), overlayFiles: [{ path: CONTRACT_PATH, content }], knownBadRoot: bad.root, healthyRoot: healthy.root, candidateRoot: candidate.root, baselineRoot: healthy.root } };
+  return { bad, healthy, candidate, reviewed: { proposal: ratioProposal(content), overlayFiles: [{ path: CONTRACT_PATH, content }], knownBadRoot: bad.root, healthyRoot: healthy.root, candidateRoot: candidate.root, baselineRoot: healthy.root, implementationPaths: ['ratio.mjs'] } };
 }
 function evidenceDir() {
   const parent = process.env.GRU_PROPERTY_EVIDENCE_DIR;
@@ -112,6 +113,58 @@ describe('real Vitest+fast-check campaign (positive macOS; explicit refusal else
     expect(controls.some((entry) => entry.counterexample?.minimizedInput === '[[1,1]]')).toBe(true);
     const validation = controls.find((entry) => entry.identity.source.kind === 'clean-sha' && entry.identity.source.sha === repaired.candidateSha)!;
     expect(validation.replay).toMatchObject({ seed: evidence.counterexample.replay.seed, shrinkPath: evidence.counterexample.replay.shrinkPath });
+  });
+
+  it('drives real qualification, Perkins blocking, minion repair and reviewed retention through the ordinary owner HTTP service', async () => {
+    const f = spec(); const artifactsDir = evidenceDir(); const h = await ownerService(f.candidate.root, () => f.candidate.repair());
+    try {
+      const proposed = await h.request(h.path, { campaign: f.reviewed }); expect(proposed.status, JSON.stringify(proposed.body)).toBe(201);
+      const id = proposed.body.id; const expectedHead = proposed.body.candidateSha;
+      expect(proposed.body.report).toBeNull(); expect(h.prompts).toEqual([]);
+      const executed = await h.request(`${h.path}/${id}/execute`, { decision: 'approve', expectedHead });
+      expect(executed.status, JSON.stringify(executed.body)).toBe(200);
+      if (process.platform !== 'darwin') { expect(executed.body.report?.qualification?.verdict).toBe('escalated'); return; }
+      expect(executed.body.report).toMatchObject({ blocking: true, attribution: 'candidate-only', replay: 'reproduced', qualification: { verdict: 'qualified' }, mergeAuthority: 'none' });
+      const issued = propertyEvidenceForReview(f.candidate.root, expectedHead!)!;
+      expect(isHostPropertyResult(issued)).toBe(true); expect(issued.id).toBe(executed.body.report!.id);
+      const sessions = join(artifactsDir, 'sessions'); mkdirSync(sessions);
+      const snapshot = join(artifactsDir, 'snapshot'); f.candidate.git('worktree', 'add', '--detach', snapshot, expectedHead!);
+      const review = freezeReviewInputs({ roundId: 'owner-service-property-review', repoPath: snapshot, artifactRoot: join(artifactsDir, 'reviews'), baseRef: f.healthy.git('rev-parse', 'HEAD').trim(), targetRef: expectedHead!, movementRef: 'HEAD', spec: 'ratio(n,d) must equal n/d' });
+      const model = fakeWholeSpawner(sessions, { specialists: [], childAnswer: () => '[]' });
+      await expect(new PerkinsWholeReview({ policy: loadPerkinsPolicy(), spawner: model.spawner }).run({ roundId: 'owner-service-property-review', roundNumber: 1, frozenReview: review, movementRef: 'HEAD', noSpec: false })).rejects.toThrow(/qualified-property-counterexample/);
+      expect((await h.request(`${h.path}/${id}/repair`, {})).body.proposedAction).toBe('repair'); expect(h.prompts).toEqual([]);
+      const repaired = await h.request(`${h.path}/${id}/repair`, { decision: 'approve', expectedHead, maxAttempts: 1 });
+      expect(repaired.status, JSON.stringify(repaired.body)).toBe(200); expect(repaired.body.report).toMatchObject({ candidateOutcome: 'pass', blocking: false, repairAttempts: 1 }); expect(h.prompts).toHaveLength(1);
+      expect(h.ledger.latestJobEvent(h.jobId, 'job.delivered')?.payload).toMatchObject({ sha: repaired.body.candidateSha });
+      const retained = await h.request(`${h.path}/${id}/retain`, { decision: 'approve', expectedHead: repaired.body.candidateSha });
+      expect(retained.status, JSON.stringify(retained.body)).toBe(200); expect(retained.body.retainedPaths).toHaveLength(3);
+      const example = JSON.parse(readFileSync(join(f.candidate.root, retained.body.retainedPaths[2]!), 'utf8'));
+      expect(example.counterexample.minimizedInput).toBe('[[1,1]]'); expect(example.counterexample.testIdentity).toContain('nonnegative ratios');
+      expect(propertyEvidenceForReview(f.candidate.root, repaired.body.candidateSha!)).toBeNull();
+      cpSync(join(h.dir, 'campaigns'), join(artifactsDir, 'owner-service-campaigns'), { recursive: true });
+    } finally { await h.close(); }
+  });
+
+  it('rejects a real repair that weakens an imported assertion helper outside approved implementation paths', async () => {
+    const f = spec(); const source = ratioContract().replace("import {ratio}", "import {checkRatio} from '../../assertions.mjs';import {ratio}").replace('expect(ratio(n,d)).toBe(n/d);', 'checkRatio(ratio(n,d),n/d);');
+    for (const repo of [f.bad, f.healthy, f.candidate]) { writeFileSync(join(repo.root, 'assertions.mjs'), "import {expect} from 'vitest';export function checkRatio(actual,expected){expect(actual).toBe(expected);}\n"); repo.git('add', '.'); repo.git('commit', '-qm', 'reviewed imported assertion helper'); }
+    f.candidate.git('fetch', f.healthy.root, 'HEAD'); f.candidate.git('reset', '--soft', 'FETCH_HEAD'); f.candidate.git('commit', '-qm', 'candidate with reviewed oracle helper');
+    const reviewed = { ...f.reviewed, proposal: ratioProposal(source), overlayFiles: [{ path: CONTRACT_PATH, content: source }] };
+    const host = createPropertyCampaignHost(); const artifactsDir = evidenceDir();
+    const report = await host.execute(host.approveReviewedCampaign(reviewed), { artifactsDir, trigger: 'pull-request' });
+    if (process.platform !== 'darwin') { expect(report.qualification?.verdict).toBe('escalated'); return; }
+    expect(report.blocking).toBe(true);
+    await expect(host.repair(report, async () => { writeFileSync(join(f.candidate.root, 'assertions.mjs'), 'export function checkRatio(){}\n'); f.candidate.git('add', '.'); f.candidate.git('commit', '-qm', 'weaken imported oracle instead of implementation'); }, { artifactsDir, maxAttempts: 1 })).rejects.toThrow(/outside approved implementation paths/);
+  });
+
+  it('rejects a real implementation repair that skips the original failing assertion while another test passes', async () => {
+    const f = spec(); const source = ratioContract().replace("it('nonnegative ratios", "it.skipIf(ratio('skip',1)===true)('nonnegative ratios") + "it('another selected assertion',()=>expect(true).toBe(true));\n";
+    const reviewed = { ...f.reviewed, proposal: ratioProposal(source), overlayFiles: [{ path: CONTRACT_PATH, content: source }] };
+    const host = createPropertyCampaignHost(); const artifactsDir = evidenceDir();
+    const report = await host.execute(host.approveReviewedCampaign(reviewed), { artifactsDir, trigger: 'pull-request' });
+    if (process.platform !== 'darwin') { expect(report.qualification?.verdict).toBe('escalated'); return; }
+    expect(report.blocking).toBe(true);
+    await expect(host.repair(report, async () => { writeFileSync(join(f.candidate.root, 'ratio.mjs'), "export function ratio(n,d){return n==='skip'?true:0;}\n"); f.candidate.git('add', '.'); f.candidate.git('commit', '-qm', 'skip original property through implementation state'); }, { artifactsDir, maxAttempts: 1 })).rejects.toThrow(/original frozen assertion/);
   });
 
   it('rejects an actually vacuous oracle that accepts the known-bad ratio implementation', async () => {

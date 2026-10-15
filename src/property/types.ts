@@ -47,6 +47,8 @@ export const INTERPRETATION_EVIDENCE_CLASS = 'runner-report-classification' as c
 export interface PropertyFailureRecord {
   readonly testIdentity: string;
   readonly messageExcerpt: string;
+  /** Bounded complete native text, separate from the display excerpt. */
+  readonly nativeReplayMessage?: string | null;
   readonly seed: string | null;
 }
 
@@ -70,6 +72,7 @@ export interface PropertyRunOutcome {
   readonly unselectedFailures: readonly UnselectedFailureRecord[];
   readonly reasons: readonly string[];
   readonly matchedDiagnostic: string | null;
+  readonly selectedAssertions?: readonly { readonly testIdentity: string; readonly status: 'passed' | 'failed' | 'skipped' }[];
   readonly receipt: RawExecutionReceipt;
 }
 
@@ -96,7 +99,7 @@ export type PackageResolutionStatus =
 /** What resolution read to reach its verdict (paths repo-relative). */
 export interface ManifestEvidenceEntry {
   readonly path: string;
-  readonly role: 'manifest' | 'lockfile' | 'config' | 'test-config' | 'installed-module';
+  readonly role: 'manifest' | 'lockfile' | 'config' | 'test-config' | 'installed-module' | 'runner';
   readonly sha256: string;
 }
 
@@ -278,6 +281,7 @@ export interface CaptureState {
 
 /** A retained minimized counterexample with its replay controls. */
 export interface RetainedCounterexample {
+  readonly testIdentity?: string;
   readonly minimizedInput: string;
   readonly replay: ReplayData;
 }

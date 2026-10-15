@@ -96,6 +96,7 @@ describe('GH350 property config strict parse', () => {
     for (const mode of ['disabled', 'observation', 'enforced'] as const) {
       const config = parsePropertyConfig(`mode = "${mode}"`);
       expect(config.mode).toBe(mode);
+      expect(config.automation).toBe('proposed');
     }
   });
 
@@ -103,6 +104,12 @@ describe('GH350 property config strict parse', () => {
     const config = loadPropertyConfig(makeRepo('mode = "observation"'));
     expect(config!.budgets).toBeNull();
     expect(config!.adapters).toEqual({});
+  });
+
+  it('accepts only the documented repair-automation opt-in, never a boolean execution approval', () => {
+    expect(parsePropertyConfig('mode="enforced"\nautomation="approved-repair"').automation).toBe('approved-repair');
+    expect(() => parsePropertyConfig('mode="enforced"\nautomation=true')).toThrow(/automation/);
+    expect(() => parsePropertyConfig('mode="enforced"\nautomation="execute-all"')).toThrow(/automation/);
   });
 
   it('requires mode and names the file and key when it is missing', () => {

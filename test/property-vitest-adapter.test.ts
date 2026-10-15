@@ -117,6 +117,8 @@ describe('GH350 vitest adapter interpretation precedence', () => {
     const outcome = interpretVitestJsonReceipt(receipt({ stdout: allSkipped }), plan());
     expect(outcome.kind).toBe('inconclusive');
     expect(outcome.skipped).toBe(1);
+    expect(outcome.selected).toBe(1);
+    expect(outcome.selectedAssertions).toEqual([{ testIdentity: 'ratio holds', status: 'skipped' }]);
     expect(outcome.executed).toBe(0);
     expect(outcome.reasons.join(' ')).toContain('not executed controls');
   });
@@ -205,6 +207,17 @@ describe('GH350 vitest adapter interpretation precedence', () => {
     const stdout = selectedFailure.replace(`/repo/${FILTER}`, `/repo/other${FILTER}`);
     const outcome = interpretVitestJsonReceipt(receipt({ exitCode: 1, stdout }), plan());
     expect(outcome.kind).toBe('inconclusive'); expect(outcome.selected).toBe(0); expect(outcome.failures).toHaveLength(0); expect(outcome.unselectedFailures).toHaveLength(1);
+  });
+
+  it('does not select a different nested file with the same relative suffix', () => {
+    const stdout = selectedFailure.replace(`/repo/${FILTER}`, `/repo/packages/other/${FILTER}`);
+    const outcome = interpretVitestJsonReceipt(receipt({ exitCode: 1, stdout }), plan());
+    expect(outcome.failures).toHaveLength(0); expect(outcome.unselectedFailures).toHaveLength(1); expect(outcome.kind).toBe('inconclusive');
+  });
+
+  it('rejects duplicate selected assertion identities rather than accepting ambiguous replay proof', () => {
+    const stdout = selectedPass.replace('ratio bounded', 'ratio holds');
+    expect(interpretVitestJsonReceipt(receipt({ stdout }), plan()).kind).toBe('inconclusive');
   });
 
   it('returns not-run with the refusal reason for a non-executable plan', () => {

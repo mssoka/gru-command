@@ -27,7 +27,7 @@ export const PROPERTY_CONFIG_CEILINGS = {
 } as const;
 
 const MODES: readonly PropertyMode[] = ['disabled', 'observation', 'enforced'];
-const TOP_LEVEL_KEYS = ['mode', 'budgets', 'adapters'] as const;
+const TOP_LEVEL_KEYS = ['mode', 'budgets', 'adapters', 'automation'] as const;
 const BUDGET_KEYS = ['max_iterations', 'max_shrink_steps', 'run_timeout_ms', 'max_output_bytes'] as const;
 
 export class PropertyConfigValidationError extends Error {
@@ -39,6 +39,9 @@ export class PropertyConfigValidationError extends Error {
 
 export interface PropertyRepoConfig {
   readonly mode: PropertyMode;
+  /** Never execution approval: only opted-in repair automation after a
+   * separate owner-approved campaign AND owner-granted repair allocation. */
+  readonly automation: 'proposed' | 'approved-repair';
   /** Null when the file declares no [budgets] table: the caller applies the
    * approved defaults — this module never invents budget values. */
   readonly budgets: ExecutionBudget | null;
@@ -152,7 +155,9 @@ export function parsePropertyConfig(
     adapters = validated;
   }
 
-  return { mode: rawMode as PropertyMode, budgets, adapters };
+  const automation = raw['automation'] ?? 'proposed';
+  if (automation !== 'proposed' && automation !== 'approved-repair') throw new PropertyConfigValidationError(`${source}: automation must be proposed or approved-repair; configuration never approves execution`);
+  return { mode: rawMode as PropertyMode, budgets, adapters, automation };
 }
 
 /** Load `.gru-command/property.toml` under `repoRoot`. Returns null when

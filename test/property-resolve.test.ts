@@ -1,7 +1,8 @@
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import fs, { chmodSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import { resolvePropertyCapabilities, ResolutionWalkError } from '../src/property/resolve.js';
 
 /**
@@ -203,6 +204,74 @@ describe('GH350 capability resolution', () => {
     expect(row.status).toBe('resolved');
     expect(row.tooling?.executable).toBe(false);
     expect(row.tooling?.reasons.join(' ')).toContain('resolves outside the repository');
+  });
+
+  it('resolves ordinary root files and selects only the nearest nested package owner', () => {
+    const root = makeRoot();
+    nodePackage(root, { vitest: '^3.2.7', fastCheck: '^3.23.2' });
+    nodePackage(join(root, 'packages/a'), { vitest: '^3.2.7', fastCheck: '^3.23.2' });
+    expect(resolvePropertyCapabilities({ repoRoot: root, scopePaths: ['src/index.ts'] }).packages.map((row) => row.packageDir)).toEqual(['.']);
+    expect(resolvePropertyCapabilities({ repoRoot: root, scopePaths: ['packages/a/src/index.ts'] }).packages.map((row) => row.packageDir)).toEqual(['packages/a']);
+  });
+
+  it('recognizes pnpm v9 importer proof without inventing installed tooling', () => {
+    const root = makeRoot(); nodePackage(root, { vitest: '^3.2.7', fastCheck: '^3.23.2' });
+    writeFileSync(join(root, 'pnpm-lock.yaml'), `lockfileVersion: '9.0'\nimporters:\n  .:\n    devDependencies:\n      vitest:\n        specifier: ^3.2.7\n        version: 3.2.7(@types/node@22.0.0)\n      fast-check:\n        specifier: ^3.23.2\n        version: 3.23.2\npackages:\n  vitest@3.2.7:\n    resolution: {integrity: synthetic}\n`);
+    expect(resolvePropertyCapabilities({ repoRoot: root }).packages[0]).toMatchObject({ status: 'resolved', tooling: { runner: 'locked', libraries: { 'fast-check': 'locked' }, executable: false } });
+  });
+
+  it('recognizes quoted Yarn Berry selectors and colon version fields', () => {
+    const root = makeRoot(); nodePackage(root, { vitest: '^3.2.7', fastCheck: '^3.23.2' });
+    writeFileSync(join(root, 'yarn.lock'), `__metadata:\n  version: 8\n\n"vitest@npm:^3.2.7":\n  version: 3.2.7\n  resolution: "vitest@npm:3.2.7"\n\n"fast-check@npm:^3.23.2":\n  version: 3.23.2\n`);
+    expect(resolvePropertyCapabilities({ repoRoot: root }).packages[0]).toMatchObject({ status: 'resolved', tooling: { runner: 'locked', executable: false } });
+  });
+
+  it('never borrows a Yarn version field from the following unrelated block', () => {
+    const root = makeRoot(); nodePackage(root, { vitest: '^3.2.7', fastCheck: '^3.23.2' });
+    writeFileSync(join(root, 'yarn.lock'), `vitest@^3.2.7:\n  resolution "incomplete"\n\nunrelated@^3.2.7:\n  version "3.2.7"\n\nfast-check@^3.23.2:\n  version "3.23.2"\n`);
+    expect(resolvePropertyCapabilities({ repoRoot: root }).packages[0]?.tooling?.runner).not.toBe('locked');
+  });
+
+  it('uses a nested local lock instead of the root lock for unsupported nested versions', () => {
+    const root = makeRoot(); nodePackage(root, { vitest: '^3.2.7', fastCheck: '^3.23.2' }); packageLock(root, '3.2.7', '3.23.2');
+    const nested = join(root, 'packages/a'); nodePackage(nested, { vitest: '^4.0.0', fastCheck: '^3.23.2' }); packageLock(nested, '4.0.0', '3.23.2');
+    const row = resolvePropertyCapabilities({ repoRoot: root, scopePaths: ['packages/a/src/index.ts'] }).packages[0]!;
+    expect(row.status).toBe('ambiguous'); expect(row.reasons.join(' ')).toContain('vitest 4.0.0');
+  });
+
+  it('does not read installed metadata through an escaping node_modules parent alias', () => {
+    const root = makeRoot(); const outside = makeRoot();
+    nodePackage(root, { vitest: '^3.2.7', fastCheck: '^3.23.2' }); installModules(outside);
+    symlinkSync(join(outside, 'node_modules'), join(root, 'node_modules'));
+    const spy = vi.spyOn(fs, 'readFileSync'); syncBuiltinESMExports();
+    try {
+      resolvePropertyCapabilities({ repoRoot: root });
+      expect(spy.mock.calls.some(([path]) => String(path).includes('/node_modules/vitest/package.json'))).toBe(false);
+    } finally { spy.mockRestore(); syncBuiltinESMExports(); }
+  });
+
+  it('preflights worktree configuration size and file/parent aliases before parsing', () => {
+    const outside = makeRoot(); mkdirSync(join(outside, '.gru-command')); writeFileSync(join(outside, '.gru-command/worktree.toml'), '[verify]\nfast="vitest run"\n');
+    for (const variant of ['parent', 'file', 'oversized']) {
+      const root = makeRoot(); nodePackage(root, { vitest: '^3.2.7', fastCheck: '^3.23.2' });
+      if (variant === 'parent') symlinkSync(join(outside, '.gru-command'), join(root, '.gru-command'));
+      else {
+        mkdirSync(join(root, '.gru-command'));
+        if (variant === 'file') symlinkSync(join(outside, '.gru-command/worktree.toml'), join(root, '.gru-command/worktree.toml'));
+        else writeFileSync(join(root, '.gru-command/worktree.toml'), `#${'x'.repeat(2 * 1024 * 1024)}\n`);
+      }
+      expect(() => resolvePropertyCapabilities({ repoRoot: root })).toThrow(/ordinary|regular|exceeds/);
+    }
+  });
+
+  it('invalidates resolution keys for contributing worktree config, runner bytes, mode and link text', () => {
+    const root = makeRoot(); nodePackage(root, { vitest: '^3.2.7', fastCheck: '^3.23.2' }); installModules(root);
+    const key = () => resolvePropertyCapabilities({ repoRoot: root }).packages[0]!.resolutionKey;
+    const keys = [key()]; mkdirSync(join(root, '.gru-command')); writeFileSync(join(root, '.gru-command/worktree.toml'), '[verify]\nfast="vitest run"\n'); keys.push(key());
+    const runner = join(root, 'node_modules/vitest/dist/cli.mjs'); writeFileSync(runner, '#!/usr/bin/env node\n// modified runner\n'); keys.push(key());
+    chmodSync(runner, 0o700); keys.push(key());
+    rmSync(join(root, 'node_modules/.bin/vitest')); symlinkSync('../vitest/./dist/cli.mjs', join(root, 'node_modules/.bin/vitest')); keys.push(key());
+    expect(new Set(keys).size).toBe(keys.length);
   });
 
   it('fails loud on a non-directory repository root', () => {

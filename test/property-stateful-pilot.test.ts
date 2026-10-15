@@ -137,7 +137,23 @@ function applyAll(operations: readonly Operation[]): FakeRuntime {
   const actors = ['alpha', 'beta', 'gamma'];
   for (const operation of operations) {
     if (operation.kind === 'admit') {
-      runtime.requestAdmission(actors[operation.actor]!, actors[operation.decisionActor]!);
+      const prior = runtime.owner === null ? null : { ...runtime.owner };
+      const generation = runtime.generation;
+      const proven = prior !== null && runtime.cessationProof?.actor === prior.actor && runtime.cessationProof.generation === prior.generation;
+      const admitted = runtime.requestAdmission(actors[operation.actor]!, actors[operation.decisionActor]!);
+      if (prior !== null && !proven) {
+        expect(admitted).toBe(false);
+        expect(runtime.owner).toEqual(prior);
+        expect(runtime.generation).toBe(generation);
+      } else if (operation.actor === operation.decisionActor) {
+        expect(admitted).toBe(true);
+        expect(runtime.owner).toEqual({ actor: actors[operation.actor], generation: generation + 1 });
+        expect(runtime.cessationProof).toBeNull();
+      } else {
+        expect(admitted).toBe(false);
+        expect(runtime.owner).toBeNull();
+        expect(runtime.generation).toBe(generation);
+      }
     } else if (operation.kind === 'release') {
       runtime.release(actors[operation.actor]!, operation.ackGeneration);
     } else if (operation.kind === 'complete') {
@@ -152,14 +168,12 @@ function applyAll(operations: readonly Operation[]): FakeRuntime {
 describe(`GH350 stateful pilot invariants (${SIMULATED_EVIDENCE_CLASS} — never native-runtime proof)`, () => {
   it('never admits a second writer while predecessor cessation is unproven', () => {
     fc.assert(fc.property(operationSequence, (raw) => {
-      const runtime = applyAll([...raw].map((value) => operationAt(value as number)));
-      // At most one owner exists at any settled state, and an owner exists
-      // only through the guarded admission path.
-      expect(runtime.owner === null || typeof runtime.owner.actor === 'string').toBe(true);
-      const owners = [...runtime.runs.values()];
-      expect(owners.length).toBeLessThanOrEqual(3);
+      // An unconditional witness makes removal of the predecessor gate fail
+      // deterministically; generated transitions exercise proof/generation
+      // changes rather than merely inspecting the shape of the final owner.
+      applyAll([{ kind: 'admit', actor: 0, decisionActor: 0 }, { kind: 'admit', actor: 1, decisionActor: 1 }, ...[...raw].map((value) => operationAt(value as number))]);
       return true;
-    }), { numRuns: 200 });
+    }), { seed: 424200, numRuns: 200 });
   });
 
   it('cannot release a newer owner with a stale acknowledgement', () => {

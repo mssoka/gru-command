@@ -23,6 +23,7 @@ import {
   UntrustedRunEvidenceError,
 } from '../src/property/qualification.js';
 import type { RunEvidenceSource } from '../src/property/qualification.js';
+import { retainedCounterexample } from '../src/property/receipts.js';
 import { canonicalJson, freeze, verifyFrozen } from '../src/property/freeze.js';
 import type { CurrentOverlayState, FreezeOverlayInput } from '../src/property/freeze.js';
 
@@ -376,10 +377,36 @@ describe('GH350 production qualification accepts only host-issued evidence', () 
     expect(() => qualifyContractWithHostEvidence(proposal, bad, healthy, fake.source)).toThrow(/dependency bytes/);
   });
 
+  it('never attributes a random baseline PASS without the retained candidate replay controls', () => {
+    const fake = fakeEvidenceSource(); const outcome = outcomeFromFixture('known-bad-fails.report.json', 1);
+    const candidate = fake.issue(outcome, 'candidate-random-baseline'); const baseline = fake.issue(outcomeFromFixture('healthy-passes.report.json', 0), 'random-baseline');
+    const example = retainedCounterexample({ outcome, environmentProfile: 'unit' })!;
+    Object.assign(fake.source.resolve(candidate)!, { counterexample: example });
+    expect(attributeCounterexampleWithHostEvidence(candidate, baseline, fake.source)).toBe('unattributed');
+    Object.assign(fake.source.resolve(baseline)!, { replay: example.replay });
+    expect(attributeCounterexampleWithHostEvidence(candidate, baseline, fake.source)).toBe('candidate-only');
+  });
+
+  it('attributes the original assertion rather than treating any unrelated baseline failure as the candidate example', () => {
+    const fake = fakeEvidenceSource(); const outcome = outcomeFromFixture('known-bad-fails.report.json', 1);
+    const candidate = fake.issue(outcome, 'candidate-unrelated'); const example = retainedCounterexample({ outcome, environmentProfile: 'unit' })!;
+    Object.assign(fake.source.resolve(candidate)!, { counterexample: example });
+    const other = { ...outcome.failures[0]!, testIdentity: 'unrelated baseline assertion' };
+    const baseline = fake.issue(bareOutcome({ kind: 'property-failure', failed: 1, passed: 1, failures: [other], selectedAssertions: [{ testIdentity: example.testIdentity!, status: 'passed' }, { testIdentity: other.testIdentity, status: 'failed' }], receipt: { ...outcome.receipt, exitCode: 1 } }), 'baseline-unrelated');
+    Object.assign(fake.source.resolve(baseline)!, { replay: example.replay });
+    expect(attributeCounterexampleWithHostEvidence(candidate, baseline, fake.source)).toBe('candidate-only');
+    Object.assign((fake.source.resolve(baseline) as PropertyExecutionReceipt).outcome, { selectedAssertions: [{ testIdentity: other.testIdentity, status: 'failed' }] });
+    expect(attributeCounterexampleWithHostEvidence(candidate, baseline, fake.source)).toBe('unattributed');
+  });
+
   it('attributes through sealed host evidence (baseline-also-fails via refs)', () => {
     const fake = fakeEvidenceSource();
     const candidateRef = fake.issue(outcomeFromFixture('known-bad-fails.report.json', 1), 'rcpt-candidate');
     const baselineRef = fake.issue(outcomeFromFixture('healthy-fails-contradictory.report.json', 1), 'rcpt-baseline');
+    const candidate = fake.source.resolve(candidateRef) as PropertyExecutionReceipt;
+    const example = retainedCounterexample({ outcome: candidate.outcome, environmentProfile: 'unit' })!;
+    Object.assign(candidate, { counterexample: example });
+    Object.assign(fake.source.resolve(baselineRef)!, { replay: example.replay });
     expect(attributeCounterexampleWithHostEvidence(candidateRef, baselineRef, fake.source)).toBe('baseline-also-fails');
     expect(attributeCounterexampleWithHostEvidence(candidateRef, null, fake.source)).toBe('unattributed');
   });

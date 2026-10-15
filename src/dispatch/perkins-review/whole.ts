@@ -9,7 +9,7 @@ import { withRateLimitRetries, type RateLimitRetryOptions } from '../../runtime/
 import { assertFrozenPromptBounds, compatibleReviewIdentity, repositoryGitEnv, proveRecoveredBaseMergeability, publishedReportMatches, readReviewArtifact, readReviewCheckpoint, sourceMovementSinceFreeze, SPECIALIST_CHECKPOINT_MAX_BYTES, writeReviewArtifact, type FrozenReview, type SourceMovement, type SourceMovementOptions } from './artifacts.js';
 import { applyConvergenceDeferral, classifyPriorFindings, convergedVerdict, deltaSince, type DeltaSince, type PriorCarryClassification } from './convergence.js';
 import { MAX_PROPERTY_PROPOSALS_PER_ROUND, MAX_PROPERTY_PROPOSALS_PER_SUBMISSION, parsePropertyContractsSubmission, PROPERTY_CONTRACTS_INPUT_SCHEMA, PROPERTY_CONTRACTS_TOOL_NAME, recordPropertyProposals, renderPropertyContractsGuidance } from './property-contracts.js';
-import { propertyEvidenceForReview, renderPropertyCampaignEvidence } from '../../property/pipeline.js';
+import { propertyCampaignRunningForReview, propertyEvidenceForReview, renderPropertyCampaignEvidence } from '../../property/pipeline.js';
 import { readFrozenEvidenceBytes, renderEvidencePromptSection } from '../../review-inputs/evidence.js';
 import { finalAssistantText } from './session-output.js';
 import { PERKINS_FINDING_SOURCES, PERKINS_LENSES, type PerkinsFindingSource, type PerkinsLens, type PerkinsPolicy } from './policy.js';
@@ -2154,6 +2154,7 @@ export class PerkinsWholeReview {
 
     const baseProofIssue = (verdict: string): SubmissionValidationIssue | null => {
       if (verdict === 'INCOMPLETE') return null;
+      if (reviewScope === 'whole' && verdict === 'READY TO MERGE' && propertyCampaignRunningForReview(review.manifest.repoPath, review.manifest.targetSha)) return { subject: 'submission', rule: 'property-campaign-running', message: 'An approved exact-candidate property campaign is still running; await its host evidence or submit INCOMPLETE' };
       const currentPropertyEvidence = propertyEvidenceForReview(review.manifest.repoPath, review.manifest.targetSha);
       if (currentPropertyEvidence !== propertyEvidence) return { subject: 'submission', rule: 'property-evidence-moved', message: 'Host property evidence changed across the review boundary; restart or submit INCOMPLETE' };
       if (reviewScope === 'whole' && propertyEvidence?.blocking === true && verdict === 'READY TO MERGE') return { subject: 'submission', rule: 'qualified-property-counterexample', message: 'An exact-candidate, qualified, replayed candidate-only counterexample remains in enforced mode. Retain and explain it as a finding; PBT never grants merge authority.' };
