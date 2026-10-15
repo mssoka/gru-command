@@ -6,5 +6,6 @@ export declare const BASELINE_TITLES: {
   readonly r9: readonly string[];
   readonly r10: readonly string[];
 };
+export declare function frameLocation(line: string): string | undefined;
 export declare function isBehavioralAssertion(message: string): boolean;
 export declare function assertPerkinsIntegrationBaseline(leg: string, report: unknown): readonly string[];

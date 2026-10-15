@@ -450,7 +450,8 @@ describe('native integration review retains prior coverage', () => {
     // head merges main but does not descend from the reviewed H0. A direct
     // engine caller still asks for an integration round.
     const { b1 } = integrateClean(harness.repo);
-    const featureBranch = harness.repo.git(['rev-parse', '--abbrev-ref', 'HEAD']);
+    // symbolic-ref throws on a detached HEAD (repo.git throws on any non-zero exit).
+    const featureBranch = harness.repo.git(['symbolic-ref', '--short', 'HEAD']);
     harness.repo.git(['checkout', '-B', featureBranch, b0]);
     harness.repo.commitFile('src/feature.ts', 'export const feature = 2;\n');
     harness.repo.git(['merge', '--no-ff', '-m', 'merge main', 'main']);

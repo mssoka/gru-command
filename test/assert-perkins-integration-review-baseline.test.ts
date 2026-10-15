@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   BASELINE_TITLES,
   assertPerkinsIntegrationBaseline,
+  frameLocation,
   isBehavioralAssertion,
 } from '../tools/assert-perkins-integration-review-baseline.mjs';
 import { loadWorktreeManifest } from '../src/worktrees/manifest.js';
@@ -135,6 +136,29 @@ describe('perkins integration R4 fail-before classifier', () => {
     expect(isBehavioralAssertion(`${RESOLVED_INSTEAD}\n    at /repo/test/perkins-integration-review.test.ts:77:9`)).toBe(true);
   });
 
+  it('locates frames by their full path, whatever spaces, parentheses or colons the path holds (#394)', () => {
+    for (const [line, location] of [
+      ['    at fn (/repo/test/a.test.ts:3:4)', '/repo/test/a.test.ts'],
+      ['    at /repo/test/helpers/a (copy).test.ts:3:4', '/repo/test/helpers/a (copy).test.ts'],
+      ['    at fn (/repo/a (copy)/x.ts:1:2)', '/repo/a (copy)/x.ts'],
+      ['    at C:\\repo\\test\\a (copy).test.ts:3:4', 'C:\\repo\\test\\a (copy).test.ts'],
+      ['    at Object.<anonymous> (file:///repo/test/a.test.ts:9:1)', '/repo/test/a.test.ts'],
+      ['    at async Promise.all (index 0)', undefined],
+      ['    at <anonymous>', undefined],
+    ] as const) expect(frameLocation(line), line).toBe(location);
+    // A helper path holding parentheses is still a helper.
+    expect(isBehavioralAssertion('AssertionError: x\n    at /repo/test/helpers/a (copy).test.ts:3:4')).toBe(false);
+    // Indented prose in a matcher message is not a stack.
+    expect(isBehavioralAssertion('AssertionError: expected list\n    at least one item was required\n    at /repo/test/a.test.ts:1:2')).toBe(true);
+    expect(isBehavioralAssertion('AssertionError: expected list\n    at least one item was required')).toBe(true);
+    // pnpm layouts of the assertion machinery are machinery too.
+    expect(isBehavioralAssertion([
+      'AssertionError: x',
+      '    at check (file:///repo/node_modules/.pnpm/vitest@3.2.7/node_modules/@vitest/expect/dist/index.js:1:2)',
+      '    at file:///repo/test/a.test.ts:5:6',
+    ].join('\n'))).toBe(true);
+  });
+
   it('judges real Vitest stack shapes: machinery frames skipped, file:// and odd paths located, unlocatable stacks refused (#394)', () => {
     // Real report shape: the assertion machinery's file:// frames come first.
     const machineryFirst = [
@@ -164,9 +188,11 @@ describe('perkins integration R4 fail-before classifier', () => {
     // the manifest (comments never count), and EVERY scope of a leg checks
     // out its uncorrected base, emits a JSON report and selects that leg's
     // named regressions and no other leg's.
-    const manifest = loadWorktreeManifest(join(import.meta.dirname, '..'))!;
+    const manifest = loadWorktreeManifest(join(import.meta.dirname, '..'));
+    if (manifest === null) throw new Error('the repository has no .gru-command/worktree.toml manifest');
     const scopes = Object.entries(manifest.verify).filter(([, command]) => command.includes('assert-perkins-integration-review-baseline.mjs'));
-    const legOf = (command: string): string | undefined => /assert-perkins-integration-review-baseline\.mjs" (\S+) /u.exec(command)?.[1];
+    const legOf = (command: string): string | undefined => /assert-perkins-integration-review-baseline\.mjs["']?\s+([A-Za-z0-9]+)\b/u.exec(command)?.[1];
+    for (const [name, command] of scopes) expect(legOf(command), `${name} names its classifier leg`).toBeDefined();
     for (const [leg, titles] of Object.entries(BASELINE_TITLES)) {
       const own = scopes.filter(([, command]) => legOf(command) === leg);
       expect(own.length, `leg ${leg} has a declared verification scope`).toBeGreaterThan(0);

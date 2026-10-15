@@ -541,7 +541,10 @@ describe('integration unit fail-loud guards (#393)', () => {
     expect(() => parseRawChanges(Buffer.from(`garbage\0:100644 100644 ${sha} ${'b'.repeat(40)} M\0src/a.ts\0`))).toThrow(/unexpected field outside a record/u);
     expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${'b'.repeat(40)} M\0src/a.ts\0\0`))).toThrow(/unexpected field outside a record/u);
     const record = `:100644 100644 ${sha} ${'b'.repeat(40)} M\0src/a.ts\0`;
-    expect(() => parseRawChanges(Buffer.from(record + record))).toThrow(/duplicate path/u);
+    expect(() => parseRawChanges(Buffer.from(record + record))).toThrow(/duplicate path: "src\/a\.ts"/u);
+    // Rename/copy records (two paths) are refused by name, never misparsed.
+    expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${sha} R100\0old.ts\0new.ts\0`))).toThrow(/rename\/copy record/u);
+    expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${sha} C75\0a.ts\0b.ts\0`))).toThrow(/rename\/copy record/u);
   });
 });
 
@@ -1026,7 +1029,9 @@ describe('review scope planning (final whole pass at a READY candidate)', () => 
       expect(bounded2.reason, JSON.stringify(variant)).toContain('still owes the final whole-change pass');
     }
     // Liveness: the bounded whole round records COMPLETE coverage whatever its
-    // verdict, so the next base move retains coverage instead of looping.
+    // verdict (the engine test "records whole-candidate coverage even when the
+    // whole round requests changes" pins that), so the next base move retains
+    // coverage instead of looping.
     expect(scope({ ...meta({ reviewScope: 'whole', canonicalVerdict: 'NEEDS CHANGES' }), coverageComplete: true }, integratedForward).scope).toBe('integration');
   });
 

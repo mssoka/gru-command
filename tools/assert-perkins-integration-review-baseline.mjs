@@ -63,11 +63,26 @@ export const BASELINE_TITLES = {
 
 const ASSERTION_HEAD = /^AssertionError: /u;
 const PROMISE_REPORT_HEAD = /^(?:AssertionError|Error): promise (?:resolved|rejected) .* instead of (?:rejecting|resolving)$/u;
-/** A stack line, and the location of a stack frame that names one: a plain
- * path, a Windows drive path or a file:// URL, with or without a function
- * name; paths may contain parentheses or colons. */
-const STACK_LINE = /^\s+at /u;
-const STACK_FRAME = /^\s+at (?:.*?\()?(?:file:\/\/)?(.+?):\d+:\d+\)?$/u;
+/** A V8 stack frame line: `at <fn> (<location>)`, `at <location>` or
+ * `at <anonymous>`. Indented prose in an assertion message (`  at least 3`)
+ * is not a frame. */
+const STACK_LINE = /^\s+at (?:\S.* \(.+\)|(?:file:\/\/)?\S.*:\d+:\d+|<anonymous>)$/u;
+const LOCATION = /^(?:file:\/\/)?(.+):\d+:\d+$/u;
+/** The source location a frame names, or undefined (`<anonymous>`, `index 0`,
+ * `native`). Paths may contain spaces, parentheses and colons: a framed
+ * location is the remainder after the FIRST " (" that yields one, so
+ * `fn (/repo/a (copy)/x.ts:1:2)` and `/repo/a (copy).test.ts:1:2` both
+ * resolve to their full path. */
+export function frameLocation(line) {
+  const body = line.replace(/^\s+at /u, '');
+  if (body.endsWith(')')) {
+    for (let index = body.indexOf(' ('); index !== -1; index = body.indexOf(' (', index + 1)) {
+      const location = LOCATION.exec(body.slice(index + 2, -1));
+      if (location !== null) return location[1];
+    }
+  }
+  return LOCATION.exec(body)?.[1];
+}
 /** Runtime and assertion-machinery frames sit between a matcher and its
  * caller; they never decide who raised the assertion. */
 const MACHINERY_FRAME = /^node:|\/node_modules\/(?:@vitest\/|vitest\/|chai\/|tinyspy\/|@jest\/expect)/u;
@@ -84,13 +99,13 @@ export function isBehavioralAssertion(message) {
   const [head = '', ...rest] = message.split(/\r?\n/u);
   if (!ASSERTION_HEAD.test(head) && !PROMISE_REPORT_HEAD.test(head)) return false;
   const stack = rest.filter((line) => STACK_LINE.test(line));
-  // A report without any stack lines is judged by its head alone.
+  // A report without any stack frames is judged by its head alone.
   if (stack.length === 0) return true;
   // The first frame outside the runtime and assertion machinery decides. A
-  // stack whose frames are all unparseable or all machinery is refused —
+  // stack whose frames are all unlocatable or all machinery is refused —
   // never an open door for a helper-raised assertion (#394).
   const file = stack
-    .map((line) => STACK_FRAME.exec(line)?.[1]?.replaceAll('\\', '/'))
+    .map((line) => frameLocation(line)?.replaceAll('\\', '/'))
     .find((location) => location !== undefined && !MACHINERY_FRAME.test(location));
   if (file === undefined) return false;
   return /\.test\.[cm]?[jt]s$/u.test(file) && !file.includes('/node_modules/') && !file.includes('/test/helpers/');

@@ -415,7 +415,12 @@ export function parseRawChanges(bytes: Buffer): Map<string, RawChange> {
     // `-z` output ends with a NUL: only that final empty field is skipped;
     // any other stray field is unexpected output and fails closed.
     if (header === '' && index === fields.length - 1) continue;
-    if (!header.startsWith(':')) throw new Error('git diff --raw produced an unexpected field outside a record');
+    if (!header.startsWith(':')) {
+      throw new Error(`git diff --raw produced an unexpected field outside a record: ${JSON.stringify(header.slice(0, 80))}`);
+    }
+    // Rename/copy records carry TWO paths: the caller disables rename
+    // detection, so one here is unexpected output and fails closed by name.
+    if (/ [RC]\d*$/u.test(header)) throw new Error('git diff --raw produced a rename/copy record — rename detection must stay disabled (--no-renames)');
     const match = /^:([0-7]{6}) ([0-7]{6}) ([0-9a-f]{40}) ([0-9a-f]{40}) [A-Z]\d*$/u.exec(header);
     // A header that starts a raw record but does not parse is unexpected
     // output: fail closed (the caller reviews whole) rather than silently
@@ -427,7 +432,7 @@ export function parseRawChanges(bytes: Buffer): Map<string, RawChange> {
     index += 1;
     // One record per path: a repeated path would silently drop a record from
     // the carry-scope comparison, so it fails closed too.
-    if (changes.has(path)) throw new Error('git diff --raw produced a duplicate path');
+    if (changes.has(path)) throw new Error(`git diff --raw produced a duplicate path: ${JSON.stringify(path)}`);
     changes.set(path, { oldMode: match[1]!, newMode: match[2]!, oldSha: match[3]!, newSha: match[4]! });
   }
   return changes;
@@ -733,8 +738,9 @@ export function planReviewScope(input: {
     // defer it forever and the PR would stall (approval is never credited
     // without it). So the chain is bounded at one integration round, whatever
     // the policy or lineage: this round reviews whole, and a whole round
-    // records complete coverage whatever its verdict, so later base moves
-    // retain COMPLETE coverage again.
+    // records complete coverage whatever its verdict (pinned by the engine
+    // test "records whole-candidate coverage even when the whole round
+    // requests changes"), so later base moves retain COMPLETE coverage again.
     if (input.finalWholePassAtReady && prior.reviewScope === 'integration' && !prior.coverageComplete &&
       prior.canonicalVerdict === 'READY TO MERGE') {
       return {
