@@ -360,9 +360,9 @@ export class ProviderRecoverySensor {
   /** A route (pending delivery marker) is judged by the SAME provider as its
    * waits: the recorded provider of a wait on the route, else the key. */
   private routeEnabled(routeKey: string): boolean {
-    const provider = this.ledger.listProviderWaits({ routeKey })[0]?.provider ??
-      (isClaudeNativeRouteKey(routeKey) ? CLAUDE_NATIVE_PROVIDER : routeKey);
-    return this.enabledFor(provider);
+    const provider = this.ledger.listProviderWaits({ routeKey })[0]?.provider;
+    if (provider !== undefined) return this.enabledFor(provider);
+    return isClaudeNativeRouteKey(routeKey) ? this.cfg.claudeNative : this.cfg.enabled;
   }
 
   /** Start the deterministic service timer (never an OS daemon). */
@@ -834,26 +834,49 @@ export class ProviderRecoverySensor {
    * machine-owned stop) and handed to the owner through one needs-owner
    * notice per wait — posted through the notification center, so it surfaces
    * in chat, and deduped by kind, so a crash before the cancel never posts it
-   * twice. No notice is posted when the wait's stop was already acked or
-   * resolved (the lane was handled) or the lane already has an open owner
-   * stop. A route left with no open wait retires its "watching" notice and
+   * twice. No notice is posted when the lane already has an open owner stop
+   * (the owner already holds it); an open wait is never assumed handled. A
+   * route left with no open wait retires its "watching" notice and
    * pending delivery marker. Runs at every boot, even with the sensor off;
    * one failing wait is logged and kept for the next boot, never blocking
    * the rest. */
   handBackDisabledWaits(): number {
     let handedBack = 0;
-    const routes = new Set<string>();
     for (const status of ['waiting', 'recovered-pending'] as const) {
       for (const wait of this.ledger.listProviderWaits({ status })) {
-        if (this.enabledFor(wait.provider)) continue;
         try {
+          if (this.enabledFor(wait.provider)) {
+            // The switch is on (again): the wait is served, so a notice left
+            // by an earlier hand-back that could not cancel it is not true.
+            const stale = this.ledger.findNotificationByKind(`provider-recovery.recovery-off.${wait.id}`, 'active');
+            if (stale !== null) this.ledger.resolveNotificationById(stale.id, 'provider-recovery-sensor');
+            continue;
+          }
           this.handBack(wait);
           handedBack += 1;
-          routes.add(wait.routeKey);
         } catch (error) {
           this.log('error', 'provider wait hand-back failed — kept for the next boot', { wait_id: wait.id, error: String(error) });
         }
       }
+    }
+    this.retireDisabledRoutes();
+    if (handedBack > 0) {
+      this.log('warn', 'provider waits handed back to the owner — automatic recovery is off for their provider', { handed_back: handedBack });
+    }
+    return handedBack;
+  }
+
+  /** From durable state at every boot — whichever boot cancelled the waits,
+   * and even after an interrupted retirement: a route of a provider that is
+   * off, with no open wait left, retires its "watching" notice and pending
+   * delivery markers. */
+  private retireDisabledRoutes(): void {
+    const routes = new Set<string>();
+    for (const wait of this.ledger.listProviderWaits()) {
+      if (!this.enabledFor(wait.provider)) routes.add(wait.routeKey);
+    }
+    for (const pending of this.ledger.listPendingProviderRecoveries()) {
+      if (!this.routeEnabled(pending.routeKey)) routes.add(pending.routeKey);
     }
     for (const routeKey of routes) {
       try {
@@ -866,35 +889,37 @@ export class ProviderRecoverySensor {
         this.log('error', 'retiring a handed-back route failed', { route: routeKey, error: String(error) });
       }
     }
-    if (handedBack > 0) {
-      this.log('warn', 'provider waits handed back to the owner — automatic recovery is off for their provider', { handed_back: handedBack });
-    }
-    return handedBack;
   }
 
   private handBack(wait: ProviderWaitRecord): void {
     const key = switchFor(wait.provider);
-    const who = wait.agentId ?? wait.slotId ?? wait.id;
     const recovered = wait.status === 'recovered-pending';
-    const linked = this.ledger.getNotification(wait.incidentId);
-    const handled = linked !== null && (linked.ackedAt !== null || linked.resolvedAt !== null);
+    // The wait's own quota-wall stop is the only kind a wait is established
+    // for (establishProviderWait requires failureClass quota_wall).
     const ownerStop = wait.agentId === null ? null
       : this.ledger.findNotificationByKind(`supervision.provider-wall.${wait.agentId}.quota_wall`, 'unacked');
-    if (!handled && ownerStop?.routing !== 'needs-owner') {
+    if (ownerStop?.routing !== 'needs-owner') {
+      const slot = wait.waiterKind === 'silas-slot';
+      const subject = slot ? `Silas slot ${wait.slotId ?? wait.id}` : `Agent ${wait.agentId ?? wait.id}`;
+      // A chat message re-arms a stopped slot-bound agent; a job lane needs
+      // Gru (an ack cannot re-arm anything at boot).
+      const resume = slot ? 'send Silas a message to resume it' : 'ask Gru to resume or re-dispatch the job';
       this.notifications.postIncident({
         kind: `provider-recovery.recovery-off.${wait.id}`,
         routing: 'needs-owner',
         severity: 'error',
         title: recovered
-          ? `Agent ${who}: provider recovered, automatic resume off`
-          : `Agent ${who} stopped: provider limit (automatic recovery off)`,
+          ? `${subject}: provider recovered, automatic resume off`
+          : `${subject} stopped: provider limit (automatic recovery off)`,
         detail: recovered
           ? `The ${wait.provider} limit has cleared, but automatic provider recovery is now off ([provider_recovery] ${key} = false), ` +
-            'so the lane was not resumed. Ask Gru to resume or re-dispatch the job.'
-          : `Automatic provider recovery is off for ${wait.provider} ([provider_recovery] ${key} = false), so this lane stays ` +
-            'stopped. Once the provider limit clears, ask Gru to resume or re-dispatch the job.',
+            `so it was not resumed. To resume, ${resume}.`
+          : `Automatic provider recovery is off for ${wait.provider} ([provider_recovery] ${key} = false), so it stays ` +
+            `stopped. Once the provider limit clears, ${resume}.`,
         agentId: wait.agentId,
-        dedupe: 'unacked',
+        // Per-wait kind: posted once ever — an acked notice is never re-posted
+        // by a later boot that retries a wait it could not cancel.
+        dedupe: 'all',
       });
     }
     this.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why: 'recovery-disabled' });

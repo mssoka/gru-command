@@ -4,6 +4,7 @@ import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import {
   closeSync,
+  constants as fsConstants,
   createWriteStream,
   mkdirSync,
   openSync,
@@ -13,8 +14,8 @@ import {
   writeFileSync,
 } from 'node:fs';
 import type { WriteStream } from 'node:fs';
-import { lstat, readFile, rm, writeFile } from 'node:fs/promises';
-import { basename, isAbsolute, join, relative } from 'node:path';
+import { lstat, open, readdir, rm, writeFile } from 'node:fs/promises';
+import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import { finished } from 'node:stream/promises';
 import type { GruCommandConfig, Role } from '../config.js';
 import { repositoryGitEnv } from '../git-env.js';
@@ -758,11 +759,8 @@ export async function checkedInProjectMcpConfig(
   cwd: string,
 ): Promise<{ readonly config: Buffer } | { readonly reason: string; readonly infrastructure?: true }> {
   const file = join(cwd, '.mcp.json');
-  let size: number;
   try {
-    const stat = await lstat(file);
-    if (!stat.isFile()) return { reason: '.mcp.json is not a regular file (symlink or other)' };
-    size = stat.size;
+    if (!(await lstat(file)).isFile()) return { reason: '.mcp.json is not a regular file (symlink or other)' };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { reason: 'no .mcp.json in the session cwd' };
     return { reason: `.mcp.json cannot be inspected: ${String(error)}`, infrastructure: true };
@@ -790,14 +788,30 @@ export async function checkedInProjectMcpConfig(
   } catch (error) {
     return { reason: `git cannot read the committed .mcp.json: ${gitFailure(error)}`, infrastructure: true };
   }
-  // A size mismatch already differs: an arbitrarily large lane file is never
-  // read into the service.
-  const crlfGrowth = committed.toString('utf8').split('\n').length - 1;
-  if (size !== committed.length && size !== committed.length + crlfGrowth) return differsFromCommitted(null, committed);
+  // The working file is read through ONE no-follow descriptor, bounded by the
+  // largest size a line-ending conversion of the committed bytes could have:
+  // a file grown or swapped after the first look is never read past it.
+  const text = committed.toString('utf8');
+  const limit = committed.length + (text.split('\n').length - 1) - (text.split('\r\n').length - 1);
   let working: Buffer;
   try {
-    working = await readFile(file);
+    const handle = await open(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    try {
+      if (!(await handle.stat()).isFile()) return { reason: '.mcp.json is not a regular file (symlink or other)' };
+      const buffer = Buffer.alloc(limit + 1);
+      let length = 0;
+      for (;;) {
+        const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
+        if (bytesRead === 0) break;
+        length += bytesRead;
+        if (length > limit) return { reason: '.mcp.json differs from its committed version' };
+      }
+      working = buffer.subarray(0, length);
+    } finally {
+      await handle.close();
+    }
   } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ELOOP') return { reason: '.mcp.json is not a regular file (symlink or other)' };
     return { reason: `.mcp.json cannot be read: ${String(error)}`, infrastructure: true };
   }
   if (!working.equals(committed)) return differsFromCommitted(working, committed);
@@ -808,8 +822,9 @@ export async function checkedInProjectMcpConfig(
  * comparison is byte-exact (git's eol/smudge conversion is never run — it
  * would execute lane-configured filters), so a line-ending-only difference
  * gets its own reason instead of looking like an edit. */
-function differsFromCommitted(working: Buffer | null, committed: Buffer): { readonly reason: string } {
-  if (working !== null && working.toString('utf8').replaceAll('\r\n', '\n') === committed.toString('utf8').replaceAll('\r\n', '\n')) {
+function differsFromCommitted(working: Buffer, committed: Buffer): { readonly reason: string } {
+  // Either direction: LF committed / CRLF checked out, or the reverse.
+  if (working.toString('utf8').replaceAll('\r\n', '\n') === committed.toString('utf8').replaceAll('\r\n', '\n')) {
     return { reason: '.mcp.json differs from its committed bytes only in line endings (autocrlf/eol conversion); only byte-identical files load' };
   }
   return { reason: '.mcp.json differs from its committed version' };
@@ -890,6 +905,7 @@ export class ClaudeCodeHandle implements AgentHandle {
   private projectMcpNote: string | null = null;
   /** This handle's own project-MCP copy (see projectMcpCopyPath). */
   private readonly projectMcpCopy: string;
+  private projectMcpSwept = false;
   /** A turn is resolving its params (the project-MCP git check): the
    * operation slot is held exactly as by a live child. */
   private preparingTurn = false;
@@ -1157,6 +1173,29 @@ export class ClaudeCodeHandle implements AgentHandle {
     });
   }
 
+  /** A predecessor that crashed (never disposed) left its copy beside the
+   * transcript: this handle holds the session lock and sweeps before its
+   * first write, so every copy of the session is stale and is removed —
+   * failures logged, never fatal. */
+  private async sweepStaleProjectMcpCopies(): Promise<void> {
+    const dir = dirname(this.params.sessionFile);
+    const prefix = `${basename(this.params.sessionFile)}.`;
+    let names: string[];
+    try {
+      names = await readdir(dir);
+    } catch (error) {
+      this.log('warn', 'project MCP copy sweep could not list the session directory', { dir, error: String(error) });
+      return;
+    }
+    for (const name of names) {
+      const path = join(dir, name);
+      if (!name.startsWith(prefix) || !name.endsWith('.project-mcp.json')) continue;
+      await rm(path, { force: true }).catch((error: unknown) => {
+        this.log('warn', 'stale project MCP copy could not be removed', { file: path, error: String(error) });
+      });
+    }
+  }
+
   /** The private project-servers copy lives only as long as the session. */
   private cleanupProjectMcpCopy(): void {
     if (this.params.ambientMcp?.mode !== 'project') return;
@@ -1225,6 +1264,10 @@ export class ClaudeCodeHandle implements AgentHandle {
    * have changed since). Every other session spawns synchronously from its
    * fixed params and never comes here. */
   private async projectTurnParams(): Promise<HandleParams> {
+    if (!this.projectMcpSwept) {
+      this.projectMcpSwept = true;
+      await this.sweepStaleProjectMcpCopies();
+    }
     const resolved = await checkedInProjectMcpConfig(this.params.cwd);
     const copy = this.projectMcpCopy;
     if ('reason' in resolved) {
@@ -1498,11 +1541,13 @@ export class ClaudeCodeHandle implements AgentHandle {
       ...(images !== undefined && images.length > 0 ? { images } : {}),
     };
     return this.withTurnParams((params) => this.spawnTurn(params), (failure) => {
-      this.livePrompt = null;
+      // Error first, exactly as a failed spawn reports: an error-time capture
+      // (the supervisor's restart snapshot) still sees the accepted prompt.
       if (failure !== null) {
         this.emit({ type: 'error', error: failure, fatal: false });
         this.setState('error', failure);
       }
+      this.livePrompt = null;
     });
   }
 

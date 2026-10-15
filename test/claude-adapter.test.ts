@@ -1,9 +1,9 @@
 import { PassThrough } from 'node:stream';
 import * as childProcesses from 'node:child_process';
 import { BUILD_INCIDENT, FULL_INCIDENT, WEB_INCIDENT, authenticatedCaptureStatus, verificationLane } from './helpers/worker-verification.js';
-import { spawn, type ChildProcess } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -1745,6 +1745,22 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     }
   });
 
+  it('an infrastructure failure of the project-MCP check is logged at warn; a content refusal at info', async () => {
+    const fx = fixture({ configToml: '[runtimes.claude-code]\nmcp = "project"\n' });
+    const plain = mkdtempSync(join(tmpdir(), 'gru-command-not-a-repo-'));
+    cleanupDirs.push(plain);
+    const handle = await fx.runtime.spawn('minion', { cwd: plain });
+    await handle.prompt('no file yet');
+    writeFileSync(join(plain, '.mcp.json'), '{}');
+    await handle.prompt('git cannot read HEAD here');
+    await handle.dispose();
+    expect(fx.logs.filter((entry) => entry.msg === 'mcp = "project": no project MCP servers loaded')
+      .map((entry) => [entry.level, String(entry.fields?.['reason']).split(':')[0]])).toEqual([
+      ['info', 'no .mcp.json in the session cwd'],
+      ['warn', 'git cannot read HEAD in the session cwd'],
+    ]);
+  });
+
   it('mcp = "project" never loads lane servers for a role without a shell', async () => {
     const fx = fixture({ configToml: '[runtimes.claude-code]\nmcp = "project"\n' });
     const repo = makeFixtureRepo('mcp-project-read-only');
@@ -1787,6 +1803,18 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     } finally {
       locked.cleanup();
     }
+    // A committed blob git cannot read (its object is gone) is infrastructure too.
+    const broken = makeFixtureRepo('mcp-project-missing-object');
+    try {
+      broken.commitFile('.mcp.json', '{"mcpServers":{"lost":{}}}');
+      const oid = execFileSync('git', ['rev-parse', 'HEAD:.mcp.json'], { cwd: broken.path, encoding: 'utf8' }).trim();
+      rmSync(join(broken.path, '.git', 'objects', oid.slice(0, 2), oid.slice(2)), { force: true });
+      expect(await checkedInProjectMcpConfig(broken.path)).toMatchObject({
+        reason: expect.stringMatching(/^git cannot read the committed \.mcp\.json: /u), infrastructure: true,
+      });
+    } finally {
+      broken.cleanup();
+    }
     // A failed git run is named by its first stderr line, else its signal, else its message.
     expect(gitFailure({ stderr: Buffer.from('fatal: bad object\nmore'), signal: null, message: 'Command failed' })).toBe('fatal: bad object');
     expect(gitFailure({ stderr: Buffer.from(''), signal: 'SIGTERM', message: 'Command failed' })).toBe('git killed by SIGTERM');
@@ -1821,6 +1849,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       const late = expect(handle.prompt('raced by disposal')).rejects.toThrow('agent session disposed');
       await handle.dispose();
       await late;
+      expect(handle.pendingTurn?.()).toBeNull(); // nothing spawned: no pending turn survives disposal
       expect(doubleInvocations(fx)).toHaveLength(before);
       // The check that finished after disposal leaves no copy behind.
       await vi.waitFor(() => expect(copiesOf(handle.sessionFile!)).toEqual([]));
@@ -1843,8 +1872,15 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       rmSync(copy);
       mkdirSync(copy); // the private copy can no longer be written
       const events: RuntimeEvent[] = [];
-      handle.subscribe((event) => events.push(event));
+      const pendingAtError: unknown[] = [];
+      handle.subscribe((event) => {
+        events.push(event);
+        if (event.type === 'error') pendingAtError.push(handle.pendingTurn?.() ?? null);
+      });
       await expect(handle.prompt('cannot prepare')).rejects.toThrow(/^claude turn could not be prepared: /u);
+      // An error-time capture (the supervisor's restart snapshot) still sees
+      // the accepted prompt; only afterwards is it cleared.
+      expect(pendingAtError).toEqual([expect.objectContaining({ text: 'cannot prepare' })]);
       expect(handle.pendingTurn?.()).toBeNull();
       expect(events.some((event) => event.type === 'error' && /could not be prepared/u.test(event.error))).toBe(true);
       expect(handle.health()).toMatchObject({ state: 'error' });
@@ -1880,6 +1916,20 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       });
       writeFileSync(join(repo.path, '.mcp.json'), `${committed}${' '.repeat(4096)}`);
       expect(await checkedInProjectMcpConfig(repo.path)).toEqual({ reason: '.mcp.json differs from its committed version' });
+      // The read is bounded: a 3 GiB (sparse) lane file is refused after a
+      // few bytes — an unbounded read could not even load it.
+      truncateSync(join(repo.path, '.mcp.json'), 3 * 1024 ** 3);
+      expect(await checkedInProjectMcpConfig(repo.path)).toEqual({ reason: '.mcp.json differs from its committed version' });
+      writeFileSync(join(repo.path, '.mcp.json'), committed);
+      // The reverse conversion (CRLF committed, LF checked out) is named too.
+      const crlf = makeFixtureRepo('mcp-project-crlf');
+      try {
+        crlf.commitFile('.mcp.json', committed.replaceAll('\n', '\r\n'));
+        writeFileSync(join(crlf.path, '.mcp.json'), committed);
+        expect(await checkedInProjectMcpConfig(crlf.path)).toMatchObject({ reason: expect.stringContaining('only in line endings') });
+      } finally {
+        crlf.cleanup();
+      }
     } finally {
       if (saved === undefined) delete process.env['GIT_DIR'];
       else process.env['GIT_DIR'] = saved;
@@ -1903,8 +1953,15 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       await resumed.prompt('two');
       const resumedCopy = copyOf();
       expect(resumedCopy).not.toBe(firstCopy);
-      expect(copiesOf(file)).toEqual([resumedCopy]);
+      await vi.waitFor(() => expect(copiesOf(file)).toEqual([resumedCopy]));
       await resumed.dispose();
+      // A predecessor that crashed (never disposed) left its copy behind: the
+      // next handle's first project turn sweeps it.
+      writeFileSync(`${file}.deadbeef.project-mcp.json`, '{}');
+      const next = await fx.runtime.spawn('minion', { cwd: repo.path, resumeFile: file });
+      await next.prompt('three');
+      await vi.waitFor(() => expect(copiesOf(file)).toEqual([copyOf()]));
+      await next.dispose();
     } finally {
       repo.cleanup();
     }

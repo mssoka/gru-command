@@ -137,8 +137,9 @@ completed acceptance:
   own `[provider_recovery] claude_native` switch, independent of `enabled`.
   Turning either switch off hands that provider's open waits back to the
   owner at the next boot: each wait is cancelled (resolving its
-  machine-owned stop) and the owner gets one needs-owner notice per lane,
-  surfaced in chat — boot reconciliation runs even with the sensor off.
+  machine-owned stop) and the owner gets one needs-owner notice per open
+  wait, surfaced in chat, unless the lane already has an open owner stop —
+  boot reconciliation runs even with the sensor off.
 - Progress-gated fan-out still has no production consumer (the cap-owned
   runtime emitter is ungrounded).
 
