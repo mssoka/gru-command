@@ -249,8 +249,9 @@ export function nodeStreamFetch(input: string, init?: RequestInit, options: Node
   });
 }
 
-/** The production transport, with the deps' headers bound when given
- * (validated at the CLI entry, before any command runs). */
+/** The production transport, with the deps' headers bound when given.
+ * `runCaptureCli` refuses a bad bound before any command runs, and
+ * `nodeStreamFetch` rejects one on its own for any other caller. */
 function defaultTransport(deps: CaptureCliDeps): FetchLike {
   return (input, init) => nodeStreamFetch(input, init, { responseHeadersTimeoutMs: deps.responseHeadersTimeoutMs });
 }
@@ -463,7 +464,8 @@ async function commandRun(
   const ownerPath = captureOwnerPath(sinkPath);
 
   // A live owner means ANOTHER capture already watches this sink: never
-  // start a second watcher; reconcile through `status`/same request id.
+  // start a second watcher; reconcile with the status action and the same
+  // --request-id.
   const ownerRead = readCaptureOwner(ownerPath);
   if (ownerRead.kind === 'malformed') {
     stderr(`capture: ${ownerPath} is malformed (${ownerRead.detail}) — withdraw it explicitly first\n`);
@@ -697,11 +699,6 @@ async function commandWithdraw(
 }
 
 export async function runCaptureCli(argv: readonly string[], deps: CaptureCliDeps = {}): Promise<CaptureExitCode> {
-  // A headers bound that cannot time correctly is a programming error in
-  // the caller's deps: it fails loud here, for every command and whatever
-  // transport is injected — before any sink, request or receipt exists,
-  // never as an UNKNOWN receipt mid-run (#389).
-  if (deps.responseHeadersTimeoutMs !== undefined) checkResponseHeadersTimeoutMs(deps.responseHeadersTimeoutMs);
   const stdout = deps.stdout ?? ((text: string) => process.stdout.write(text));
   const stderr = deps.stderr ?? ((text: string) => process.stderr.write(text));
   const [command, ...rest] = argv;
@@ -717,6 +714,12 @@ export async function runCaptureCli(argv: readonly string[], deps: CaptureCliDep
     printUsage(stderr);
     return CAPTURE_EXIT.usage;
   }
+  // A headers bound that cannot time correctly is a programming error in
+  // the caller's deps: it fails loud here, before any command runs and
+  // whatever transport is injected — no sink, request or receipt exists, and
+  // it never surfaces as an UNKNOWN receipt mid-run (#389). Help and usage
+  // errors above stay reachable.
+  if (deps.responseHeadersTimeoutMs !== undefined) checkResponseHeadersTimeoutMs(deps.responseHeadersTimeoutMs);
   try {
     switch (command) {
       case 'run':

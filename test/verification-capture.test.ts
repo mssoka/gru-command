@@ -654,6 +654,7 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
         .then(() => null, (cause: unknown) => cause as NodeJS.ErrnoException);
       expect(error?.message).toMatch(/POST http:\/\/127\.0\.0\.1:\d+\/api\/verify: no response within 150 ms \(connect \+ response headers\)/u);
       expect(error?.message).toContain('outcome is unknown');
+      expect(error?.message).toContain("run the capture helper's status action with the same --request-id");
       expect(error?.code).toBe(CAPTURE_RESPONSE_TIMEOUT_CODE);
       expect(Date.now() - started).toBeLessThan(5_000);
 
@@ -693,28 +694,28 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
       const pending = nodeStreamFetch('http://127.0.0.1:9/x', undefined, { responseHeadersTimeoutMs: bound });
       await expect(pending, String(bound)).rejects.toThrow(/responseHeadersTimeoutMs must be a number of milliseconds from 1 to 2147483647/u);
     }
-    // The CLI refuses it at the boundary for every command, whatever transport
-    // is injected: no sink, no receipt, no request.
+    // The CLI refuses it before any command runs, whatever transport is
+    // injected: no request, no sink, no receipt, no output. Help stays usable.
     const dir = tempDir();
-    const sinkPath = join(dir, 'bad-bound.ndjson');
     const fetchImpl = vi.fn();
-    await expect(runCaptureCli(
-      [...BASE_ARGS, '--sink', sinkPath, '--request-id', 'req-bad-bound', '--url', 'http://127.0.0.1:9', '--token', 't'],
-      deps({ stdout: () => {}, responseHeadersTimeoutMs: 0 }),
-    )).rejects.toThrow(RangeError);
-    await expect(runCaptureCli(
-      [...BASE_ARGS, '--sink', sinkPath, '--request-id', 'req-bad-bound', '--url', 'http://127.0.0.1:9', '--token', 't'],
-      { ...deps({ stdout: () => {} }), fetchImpl: fetchImpl as never, responseHeadersTimeoutMs: 0.5 },
-    )).rejects.toThrow(RangeError);
-    const errors: string[] = [];
-    await expect(runCaptureCli(
-      ['status', '--request-id', 'req-bad-bound', '--url', 'http://127.0.0.1:9', '--token', 't'],
-      { responseHeadersTimeoutMs: 0, stdout: () => {}, stderr: (text: string) => errors.push(text) },
-    )).rejects.toThrow(RangeError);
-    expect(errors).toEqual([]);
+    const cases = [
+      { label: 'run/default transport', argv: (sink: string) => [...BASE_ARGS, '--sink', sink, '--request-id', 'req-bad-1', '--url', 'http://127.0.0.1:9', '--token', 't'], extra: { responseHeadersTimeoutMs: 0 } },
+      { label: 'run/injected transport', argv: (sink: string) => [...BASE_ARGS, '--sink', sink, '--request-id', 'req-bad-2', '--url', 'http://127.0.0.1:9', '--token', 't'], extra: { fetchImpl: fetchImpl as never, responseHeadersTimeoutMs: 0.5 } },
+      { label: 'status', argv: () => ['status', '--request-id', 'req-bad-3', '--url', 'http://127.0.0.1:9', '--token', 't'], extra: { fetchImpl: fetchImpl as never, responseHeadersTimeoutMs: 0 } },
+    ] as const;
+    for (const [index, entry] of cases.entries()) {
+      const sinkPath = join(dir, `bad-bound-${String(index)}.ndjson`);
+      const out: string[] = [];
+      await expect(runCaptureCli(entry.argv(sinkPath), { ...deps({ stdout: (text: string) => out.push(text) }), stderr: (text: string) => out.push(text), ...entry.extra }), entry.label)
+        .rejects.toThrow(RangeError);
+      expect(out, entry.label).toEqual([]);
+      expect(existsSync(sinkPath), entry.label).toBe(false);
+      expect(existsSync(captureReceiptPath(sinkPath)), entry.label).toBe(false);
+    }
     expect(fetchImpl).not.toHaveBeenCalled();
-    expect(existsSync(sinkPath)).toBe(false);
-    expect(existsSync(captureReceiptPath(sinkPath))).toBe(false);
+    const help: string[] = [];
+    expect(await runCaptureCli(['--help'], { responseHeadersTimeoutMs: 0, stderr: (text: string) => help.push(text) })).toBe(CAPTURE_EXIT.usage);
+    expect(help.join('')).not.toBe('');
   });
 
   it('the headers bound ends at the response: a body quiet for longer than it still streams to EOF (#389)', async () => {
