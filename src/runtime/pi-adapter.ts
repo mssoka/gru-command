@@ -7,7 +7,7 @@ import {
   SessionManager,
   SettingsManager,
 } from '@earendil-works/pi-coding-agent';
-import type { ToolDefinition } from '@earendil-works/pi-coding-agent';
+import type { InlineExtension, ToolDefinition } from '@earendil-works/pi-coding-agent';
 import type { Api, Model, ThinkingLevel } from '@earendil-works/pi-ai';
 import { realpathSync } from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -28,6 +28,7 @@ export { normalizeSessionPath, SessionAlreadyActiveError };
 import { capabilitiesForModelInput } from './types.js';
 import { PI_CAPABILITIES } from './capabilities.js';
 import { managedSkillsPromptNote, preferManagedSkills } from './managed-skills.js';
+import { isVerificationProducer, workerVerificationRefusal, type WorkerVerificationPolicy } from './worker-verification-policy.js';
 import { extractProviderRejectionEvidence } from '../provider-recovery/classify.js';
 import type {
   AgentCapabilities,
@@ -49,6 +50,24 @@ import { disposeAll } from './disposal.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 type IsolatedToolName = NonNullable<SpawnOptions['isolatedReview']>['tools'][number];
+
+/**
+ * In-process SDK extension that blocks a known unscheduled verification
+ * producer in the bash tool before it executes (issue #315). It intercepts
+ * the runtime's own `tool_call` boundary, so the refusal happens before any
+ * child process starts and the normal Bash behavior is otherwise unchanged.
+ */
+export function workerVerificationExtension(policy: WorkerVerificationPolicy): InlineExtension {
+  return (pi) => {
+    pi.on('tool_call', (event) => {
+      const command = (event.input as { readonly command?: unknown }).command;
+      if (event.toolName === 'bash' && typeof command === 'string' && isVerificationProducer(command, policy)) {
+        return { block: true, reason: workerVerificationRefusal(policy) };
+      }
+      return undefined;
+    });
+  };
+}
 
 function confinedReviewTools(cwd: string, requested: readonly IsolatedToolName[]): {
   readonly names: string[];
@@ -855,12 +874,16 @@ export class PiRuntime implements AgentRuntime {
       // project's own skills and wins a name collision. Review sessions
       // never carry it (they load no skills at all).
       const managed = reviewMode === undefined ? options.managedSkills : undefined;
+      // Verification admission applies to ordinary worker sessions only;
+      // isolated review sessions keep their ambient-free resource set.
+      const workerVerification = reviewMode === undefined ? options.workerVerification : undefined;
       const systemPrompt = managed === undefined
         ? roleDef.systemPrompt
         : `${roleDef.systemPrompt}\n\n${managedSkillsPromptNote(managed, 'pi')}`;
       const loader = new DefaultResourceLoader({
         cwd,
         agentDir: this.agentDir,
+        ...(workerVerification !== undefined ? { extensionFactories: [workerVerificationExtension(workerVerification)] } : {}),
         ...(isolatedSettings !== undefined ? { settingsManager: isolatedSettings } : {}),
         ...(reviewMode !== undefined
           ? {

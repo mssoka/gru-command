@@ -350,10 +350,11 @@ async function main(): Promise<number> {
   const store = new SessionStore(config.dataDir, { log: (level, msg, fields) => logger.log(level, msg, fields) });
   // Lazy authoritative records preserve boot order; dispatch and fallback use
   // the same tested assignment and deliverable-selection wiring.
-  const workflowAuthority = serviceWorkflowAuthority(config.dataDir, () => ledger);
+  const workflowAuthority = serviceWorkflowAuthority(config.dataDir, () => ledger, undefined, configPathFor(config.instanceDir));
   const registry = new RuntimeRegistry(serviceRegistryOptions({
     config,
     store,
+    verificationConfigFile: configPathFor(config.instanceDir),
     workflowLaneFor: workflowAuthority.workflowLaneFor,
     workflowBuildFor: workflowAuthority.workflowBuildFor,
     workflowAgentFor: workflowAuthority.workflowAgentFor,
