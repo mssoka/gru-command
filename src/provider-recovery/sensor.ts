@@ -238,11 +238,15 @@ export function handBackThenStartSupervision(sensor: ProviderRecoverySensor, sup
 }
 
 /** Service boot for provider recovery: the timer starts only while a switch
- * is on, but boot reconciliation always runs, even with the whole sensor off
- * (the hand-back of a provider whose switch is off ran earlier, before
- * supervision started: `handBackThenStartSupervision`).
+ * is on, and the boot reconciliation re-wakes undelivered recoveries (a no-op
+ * with the whole sensor off). The hand-back of a provider whose switch is off
+ * runs earlier, before supervision starts (`handBackThenStartSupervision`);
+ * a boot that skipped it is logged loudly.
  * Returns the reconciliation so callers (and tests) can observe it settle. */
 export function bootProviderRecovery(sensor: ProviderRecoverySensor, log: Log): Promise<void> {
+  if (!sensor.bootHandBackDone) {
+    log('error', 'provider-recovery boot hand-back did not run before supervision started — open waits of a provider whose recovery is off are kept until a boot that runs it', {});
+  }
   if (sensor.enabled) {
     sensor.start();
   } else {
@@ -253,6 +257,9 @@ export function bootProviderRecovery(sensor: ProviderRecoverySensor, log: Log): 
     (error: unknown) => { log('error', 'provider-recovery boot reconciliation failed', { error: String(error) }); },
   );
 }
+
+/** The single notice for a boot hand-back pass that failed or kept a wait. */
+const HAND_BACK_FAILED = 'provider-recovery.hand-back-failed';
 
 /** The `[provider_recovery]` switch that governs a provider. */
 function switchFor(provider: string): 'claude_native' | 'enabled' {
@@ -274,6 +281,7 @@ export class ProviderRecoverySensor {
   private readonly silasHosted: () => boolean;
   private readonly log: Log;
   private bootHandBackRan = false;
+  private keptAtLastPass = 0;
   private readonly now: () => number;
   private readonly setIntervalImpl: typeof setInterval;
   private readonly clearIntervalImpl: typeof clearInterval;
@@ -852,8 +860,9 @@ export class ProviderRecoverySensor {
    * reconciliation never hands back. A wait it cannot hand back is kept for
    * the NEXT boot, never cancelled after hydration (that would resolve a row
    * the supervisor already bound as the lane's re-arm control). A pass that
-   * fails outright tells Gru, so no lane is left stopped in silence; the next
-   * pass that succeeds retires that notice. */
+   * fails outright or keeps any wait tells Gru — one notice, so no lane is
+   * left stopped in silence (a kept wait may have no notice of its own) — and
+   * only a pass that keeps none retires it. */
   handBackAtBoot(): number {
     if (this.bootHandBackRan) return 0;
     this.bootHandBackRan = true;
@@ -861,29 +870,44 @@ export class ProviderRecoverySensor {
     try {
       handedBack = this.handBackDisabledWaits();
     } catch (error) {
-      try {
-        this.notifications.postIncident({
-          kind: 'provider-recovery.hand-back-failed',
-          routing: 'action-required',
-          severity: 'error',
-          title: 'Provider waits not handed back at boot',
-          detail: 'Handing back the open waits of providers whose automatic recovery is off failed this boot, so any ' +
-            'such lane stays stopped until the next restart retries it — see the service log.',
-          agentId: null,
-          dedupe: 'active',
-        });
-      } catch (postError) {
-        this.log('error', 'the hand-back failure notice could not be posted', { error: String(postError) });
-      }
+      this.announceHandBackFailure();
       throw error;
     }
-    try {
-      const failed = this.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
-      if (failed !== null) this.ledger.resolveNotificationById(failed.id, 'provider-recovery-sensor');
-    } catch (error) {
-      this.log('error', 'retiring the hand-back failure notice failed', { error: String(error) });
+    if (this.keptAtLastPass > 0) {
+      this.announceHandBackFailure();
+    } else {
+      try {
+        this.notifications.resolveIncidents(HAND_BACK_FAILED, 'provider-recovery-sensor');
+      } catch (error) {
+        this.log('error', 'retiring the hand-back failure notice failed', { error: String(error) });
+      }
     }
     return handedBack;
+  }
+
+  /** Whether this sensor's boot hand-back ran (main runs it before
+   * supervision starts). */
+  get bootHandBackDone(): boolean {
+    return this.bootHandBackRan;
+  }
+
+  /** The one action-required notice for a boot pass that failed outright or
+   * kept a wait — best effort: a failed post is logged, never thrown. */
+  private announceHandBackFailure(): void {
+    try {
+      this.notifications.postIncident({
+        kind: HAND_BACK_FAILED,
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Provider waits not handed back at boot',
+        detail: 'Handing back the open waits of providers whose automatic recovery is off failed this boot (for some or ' +
+          'all of them), so any such lane stays stopped until the next restart retries it — see the service log.',
+        agentId: null,
+        dedupe: 'active',
+      });
+    } catch (error) {
+      this.log('error', 'the hand-back failure notice could not be posted', { error: String(error) });
+    }
   }
 
   /** A provider's switch turned off across a restart (`claude_native` or
@@ -906,6 +930,7 @@ export class ProviderRecoverySensor {
    * the rest. */
   handBackDisabledWaits(): number {
     let handedBack = 0;
+    let kept = 0;
     for (const status of ['waiting', 'recovered-pending'] as const) {
       for (const wait of this.ledger.listProviderWaits({ status })) {
         if (this.enabledFor(wait.provider)) {
@@ -923,10 +948,12 @@ export class ProviderRecoverySensor {
           this.handBack(wait);
           handedBack += 1;
         } catch (error) {
+          kept += 1;
           this.log('error', 'provider wait hand-back failed — kept for the next boot', { wait_id: wait.id, error: String(error) });
         }
       }
     }
+    this.keptAtLastPass = kept;
     this.retireDisabledRoutes();
     if (handedBack > 0) {
       this.log('warn', 'open provider waits cancelled — automatic recovery is off for their provider', { cancelled: handedBack });
@@ -1004,11 +1031,14 @@ export class ProviderRecoverySensor {
       const resume = slot
         ? 'send Silas a directive (any Silas turn re-arms its slot)'
         : 'resume it (dispose its re-arm control once a live agent is adopted) or re-dispatch the job';
-      // Announced before (Gru disposed of it while the wait stayed open, or
-      // the switch was on again in between): say so, so a re-dispatch is
-      // never doubled.
-      const repeat = this.ledger.findNotificationByKind(`provider-recovery.recovery-off.${wait.id}`, 'any') === null
-        ? '' : 'Announced before and the wait is still open — check whether the lane already resumed before you act. ';
+      // Announced before — this wait's own notice (Gru disposed of it while
+      // the wait stayed open, or the switch was on again in between), or a
+      // boot hand-back failure raised since the wait opened (Gru may have
+      // acted on it): say so, so a re-dispatch is never doubled.
+      const failure = this.ledger.findNotificationByKind(HAND_BACK_FAILED, 'any');
+      const announced = this.ledger.findNotificationByKind(`provider-recovery.recovery-off.${wait.id}`, 'any') !== null
+        || (failure !== null && Date.parse(failure.ts) >= Date.parse(wait.createdAt));
+      const repeat = announced ? 'Announced before and the wait is still open — check whether the lane already resumed before you act. ' : '';
       this.notifications.postIncident({
         kind: `provider-recovery.recovery-off.${wait.id}`,
         routing: 'action-required',
