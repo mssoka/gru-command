@@ -63,25 +63,37 @@ export const BASELINE_TITLES = {
 
 const ASSERTION_HEAD = /^AssertionError: /u;
 const PROMISE_REPORT_HEAD = /^(?:AssertionError|Error): promise (?:resolved|rejected) .* instead of (?:rejecting|resolving)$/u;
-/** A V8 stack frame line: `at <fn> (<location>)`, `at <location>` or
- * `at <anonymous>`. Indented prose in an assertion message (`  at least 3`)
- * is not a frame. */
-const STACK_LINE = /^\s+at (?:\S.* \(.+\)|(?:file:\/\/)?\S.*:\d+:\d+|<anonymous>)$/u;
-const LOCATION = /^(?:file:\/\/)?(.+):\d+:\d+$/u;
+/** A V8 stack frame line: `at <fn> (<location>)` whose parenthesised part
+ * ends in `:line:col` or is a V8 token (`<anonymous>`, `index N`, `native`),
+ * a bare `at <absolute path or file:// URL>:line:col`, or `at <anonymous>`.
+ * Indented prose in an assertion message — `at least 3 (see docs)`,
+ * `at 12:30:15` — is not a frame. */
+const STACK_LINE = /^\s+at (?:\S.* \((?:.*:\d+:\d+|<anonymous>|index \d+|native)\)|(?:file:\/\/|[A-Za-z]:[\\/]|[\\/]).*:\d+:\d+|<anonymous>)$/u;
+const LOCATION = /^(file:\/\/)?(.+):\d+:\d+$/u;
+/** A location: a file:// URL is decoded (so an encoded `test%2Fhelpers`
+ * segment is judged as the path it names); a plain path is kept as is. */
+function located(match) {
+  if (match === null) return undefined;
+  if (match[1] === undefined) return match[2];
+  try { return decodeURIComponent(match[2]); } catch { return match[2]; }
+}
 /** The source location a frame names, or undefined (`<anonymous>`, `index 0`,
  * `native`). Paths may contain spaces, parentheses and colons: a framed
  * location is the remainder after the FIRST " (" that yields one, so
  * `fn (/repo/a (copy)/x.ts:1:2)` and `/repo/a (copy).test.ts:1:2` both
- * resolve to their full path. */
+ * resolve to their full path. An `eval` frame names the location of the
+ * code that called eval. */
 export function frameLocation(line) {
   const body = line.replace(/^\s+at /u, '');
+  const evalOrigin = /\beval at .*? \(((?:file:\/\/)?[^()]+?:\d+:\d+)\)/u.exec(body);
+  if (evalOrigin !== null) return located(LOCATION.exec(evalOrigin[1]));
   if (body.endsWith(')')) {
     for (let index = body.indexOf(' ('); index !== -1; index = body.indexOf(' (', index + 1)) {
-      const location = LOCATION.exec(body.slice(index + 2, -1));
-      if (location !== null) return location[1];
+      const location = located(LOCATION.exec(body.slice(index + 2, -1)));
+      if (location !== undefined) return location;
     }
   }
-  return LOCATION.exec(body)?.[1];
+  return located(LOCATION.exec(body));
 }
 /** Runtime and assertion-machinery frames sit between a matcher and its
  * caller; they never decide who raised the assertion. */

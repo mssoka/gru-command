@@ -1,5 +1,5 @@
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { isAbsolute, join } from 'node:path';
 import type { FixtureRepo } from './fixture-repo.js';
 
 /** Commits `count` new files under `many/` in one commit. Thousands of new
@@ -7,7 +7,13 @@ import type { FixtureRepo } from './fixture-repo.js';
  * still writing .git while the fixture is removed, so both are disabled
  * first (#393's 4001-path fixtures). */
 export function commitManyPaths(repo: FixtureRepo, count: number, directory = 'many'): void {
-  if (!Number.isSafeInteger(count) || count < 1) throw new Error(`commitManyPaths needs a positive path count (got ${String(count)})`);
+  if (!Number.isSafeInteger(count) || count < 1 || count > 100_000) {
+    throw new Error(`commitManyPaths needs a path count from 1 to 100000 (got ${String(count)})`);
+  }
+  if (directory === '' || isAbsolute(directory) || directory.split(/[\\/]/u).some((part) => part === '..' || part === '.' || part === '')) {
+    throw new Error(`commitManyPaths directory must be a plain relative path inside the fixture (got ${JSON.stringify(directory)})`);
+  }
+  if (existsSync(join(repo.path, directory))) throw new Error(`commitManyPaths directory already exists: ${directory}`);
   repo.git(['config', 'gc.auto', '0']);
   repo.git(['config', 'maintenance.auto', 'false']);
   mkdirSync(join(repo.path, directory), { recursive: true });

@@ -12,6 +12,7 @@ import {
   findingIntersectsDelta,
   integrationSince,
   parseRawChanges,
+  rawChanges,
   planReviewScope,
   planPerkinsReviewScope,
   probeIntegrationLineage,
@@ -528,6 +529,18 @@ describe('integration unit fail-loud guards (#393)', () => {
     expect(() => integrationSince(repo.path, h0, b0, b1, repo.head())).toThrow(/a changed path is not valid UTF-8/u);
   });
 
+  it('reads a real rename as a deletion and an addition: rename detection stays disabled, whatever the repository config (#393)', () => {
+    const { repo } = integratedFeature('perkins-guard-renames');
+    repo.git(['config', 'diff.renames', 'copies']);
+    const before = repo.commitFile('src/moved.ts', 'export const moved = 1;\n'.repeat(20));
+    repo.git(['mv', 'src/moved.ts', 'src/renamed.ts']);
+    repo.git(['commit', '-m', 'rename without content change']);
+    const changes = rawChanges(repo.path, before, repo.head());
+    expect([...changes.keys()].sort()).toEqual(['src/moved.ts', 'src/renamed.ts']);
+    expect(changes.get('src/moved.ts')?.newSha).toBe('0'.repeat(40));
+    expect(changes.get('src/renamed.ts')?.oldSha).toBe('0'.repeat(40));
+  });
+
   it('refuses an unparseable or path-less git diff --raw record', () => {
     const sha = 'a'.repeat(40);
     const ok = parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${'b'.repeat(40)} M\0src/a.ts\0`));
@@ -542,6 +555,14 @@ describe('integration unit fail-loud guards (#393)', () => {
     expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${'b'.repeat(40)} M\0src/a.ts\0\0`))).toThrow(/unexpected field outside a record/u);
     const record = `:100644 100644 ${sha} ${'b'.repeat(40)} M\0src/a.ts\0`;
     expect(() => parseRawChanges(Buffer.from(record + record))).toThrow(/duplicate path: "src\/a\.ts"/u);
+    // Quoted repository text is bounded in the disclosed reason.
+    const long = `src/${'x'.repeat(400)}.ts`;
+    const longRecord = `:100644 100644 ${sha} ${'b'.repeat(40)} M\0${long}\0`;
+    const message = (() => { try { parseRawChanges(Buffer.from(longRecord + longRecord)); return ''; } catch (error) { return String(error); } })();
+    expect(message.length).toBeLessThan(260);
+    expect(message).toContain('…');
+    // A malformed header is unparseable, whatever letter it ends in.
+    expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} short R\0a.ts\0`))).toThrow(/unparseable record/u);
     // Rename/copy records (two paths) are refused by name, never misparsed.
     expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${sha} R100\0old.ts\0new.ts\0`))).toThrow(/rename\/copy record/u);
     expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${sha} C75\0a.ts\0b.ts\0`))).toThrow(/rename\/copy record/u);

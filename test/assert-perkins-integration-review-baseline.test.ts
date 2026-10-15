@@ -145,7 +145,15 @@ describe('perkins integration R4 fail-before classifier', () => {
       ['    at Object.<anonymous> (file:///repo/test/a.test.ts:9:1)', '/repo/test/a.test.ts'],
       ['    at async Promise.all (index 0)', undefined],
       ['    at <anonymous>', undefined],
+      ['    at eval (eval at load (file:///repo/test/helpers/h.ts:4:5), <anonymous>:1:1)', '/repo/test/helpers/h.ts'],
+      ['    at file:///repo/test%2Fhelpers/encoded.ts:1:2', '/repo/test/helpers/encoded.ts'],
     ] as const) expect(frameLocation(line), line).toBe(location);
+    // An eval called from a helper, or an encoded helper URL, is still a helper.
+    expect(isBehavioralAssertion('AssertionError: x\n    at eval (eval at load (file:///repo/test/helpers/h.ts:4:5), <anonymous>:1:1)')).toBe(false);
+    expect(isBehavioralAssertion('AssertionError: x\n    at file:///repo/test%2Fhelpers/encoded.ts:1:2')).toBe(false);
+    // Indented prose with parentheses or a clock time is never a frame.
+    expect(isBehavioralAssertion('AssertionError: expected list\n    at least 3 items (see docs)\n    at 12:30:15 the job ran')).toBe(true);
+    expect(isBehavioralAssertion('AssertionError: expected list\n    at least 3 items (see docs)\n    at /repo/test/a.test.ts:1:2')).toBe(true);
     // A helper path holding parentheses is still a helper.
     expect(isBehavioralAssertion('AssertionError: x\n    at /repo/test/helpers/a (copy).test.ts:3:4')).toBe(false);
     // Indented prose in a matcher message is not a stack.
@@ -191,7 +199,7 @@ describe('perkins integration R4 fail-before classifier', () => {
     const manifest = loadWorktreeManifest(join(import.meta.dirname, '..'));
     if (manifest === null) throw new Error('the repository has no .gru-command/worktree.toml manifest');
     const scopes = Object.entries(manifest.verify).filter(([, command]) => command.includes('assert-perkins-integration-review-baseline.mjs'));
-    const legOf = (command: string): string | undefined => /assert-perkins-integration-review-baseline\.mjs["']?\s+([A-Za-z0-9]+)\b/u.exec(command)?.[1];
+    const legOf = (command: string): string | undefined => /assert-perkins-integration-review-baseline\.mjs["']?(?:\s+--?\S+)*\s+([\w-]+)/u.exec(command)?.[1];
     for (const [name, command] of scopes) expect(legOf(command), `${name} names its classifier leg`).toBeDefined();
     for (const [leg, titles] of Object.entries(BASELINE_TITLES)) {
       const own = scopes.filter(([, command]) => legOf(command) === leg);

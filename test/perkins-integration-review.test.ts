@@ -477,8 +477,11 @@ describe('native integration review retains prior coverage', () => {
   });
 
   it('an integration unit over its path bound falls back to a disclosed whole round, never a truncated unit (#393)', async () => {
-    // (The unit's byte cap is defence in depth: the frozen diff carries the
-    // same cap and refuses first, so the path bound is the reachable guard.)
+    // (The unit's byte cap and strict-UTF-8 guards are defence in depth: the
+    // frozen diff carries the same cap, and a non-UTF-8 path cannot even be
+    // checked out pristine for the freeze, so both refuse before the engine.
+    // Every guard shares the same integrationSince throw → disclosed whole
+    // fallback, so the path bound is the reachable engine-level proof.)
     const harness = makeEngine({ childAnswer: () => '[]', specialists: [] });
     const { h0 } = featureHead(harness.repo, 'src/feature.ts', 'export const feature = 1;\n');
     const frozen1 = freeze(harness, 'bound-round-1', h0);

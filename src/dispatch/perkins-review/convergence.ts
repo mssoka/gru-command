@@ -384,7 +384,7 @@ export interface RawChange {
  * --abbrev=40` change set. The NUL-delimited form needs no C-unquote
  * decoding; a path that does not decode as UTF-8 refuses (the caller falls
  * back to a whole review). Modes are kept so a mode-only change is not lost. */
-function rawChanges(repoPath: string, fromSha: string, toSha: string): Map<string, RawChange> {
+export function rawChanges(repoPath: string, fromSha: string, toSha: string): Map<string, RawChange> {
   let bytes: Buffer;
   try {
     bytes = execFileSync('git', ['-C', repoPath, 'diff', '--raw', '-z', '--no-ext-diff', '--no-renames', '--abbrev=40', fromSha, toSha, '--'], {
@@ -394,6 +394,11 @@ function rawChanges(repoPath: string, fromSha: string, toSha: string): Map<strin
     throw new Error(`change set ${fromSha.slice(0, 12)}..${toSha.slice(0, 12)} could not be read: ${String(error)}`);
   }
   return parseRawChanges(bytes);
+}
+
+/** Repository text quoted into a disclosed fallback reason stays short. */
+function boundedForReason(text: string): string {
+  return JSON.stringify(text.length > 160 ? `${text.slice(0, 160)}…` : text);
 }
 
 /** Parse `git diff --raw -z --abbrev=40` bytes (exported for the guard
@@ -416,23 +421,25 @@ export function parseRawChanges(bytes: Buffer): Map<string, RawChange> {
     // any other stray field is unexpected output and fails closed.
     if (header === '' && index === fields.length - 1) continue;
     if (!header.startsWith(':')) {
-      throw new Error(`git diff --raw produced an unexpected field outside a record: ${JSON.stringify(header.slice(0, 80))}`);
+      throw new Error(`git diff --raw produced an unexpected field outside a record: ${boundedForReason(header)}`);
     }
-    // Rename/copy records carry TWO paths: the caller disables rename
-    // detection, so one here is unexpected output and fails closed by name.
-    if (/ [RC]\d*$/u.test(header)) throw new Error('git diff --raw produced a rename/copy record — rename detection must stay disabled (--no-renames)');
-    const match = /^:([0-7]{6}) ([0-7]{6}) ([0-9a-f]{40}) ([0-9a-f]{40}) [A-Z]\d*$/u.exec(header);
+    const match = /^:([0-7]{6}) ([0-7]{6}) ([0-9a-f]{40}) ([0-9a-f]{40}) ([A-Z])\d*$/u.exec(header);
     // A header that starts a raw record but does not parse is unexpected
     // output: fail closed (the caller reviews whole) rather than silently
     // shrink the reviewed unit and the carry scope.
     if (match === null) throw new Error('git diff --raw produced an unparseable record');
+    // Rename/copy records carry TWO paths: the caller disables rename
+    // detection, so one here is unexpected output and fails closed by name.
+    if (match[5] === 'R' || match[5] === 'C') {
+      throw new Error('git diff --raw produced a rename/copy record — rename detection must stay disabled (--no-renames)');
+    }
     const path = fields[index + 1];
     // A missing/empty path field is the same fail-open class: refuse it.
     if (path === undefined || path === '') throw new Error('git diff --raw produced a record with no path');
     index += 1;
     // One record per path: a repeated path would silently drop a record from
     // the carry-scope comparison, so it fails closed too.
-    if (changes.has(path)) throw new Error(`git diff --raw produced a duplicate path: ${JSON.stringify(path)}`);
+    if (changes.has(path)) throw new Error(`git diff --raw produced a duplicate path: ${boundedForReason(path)}`);
     changes.set(path, { oldMode: match[1]!, newMode: match[2]!, oldSha: match[3]!, newSha: match[4]! });
   }
   return changes;
@@ -738,9 +745,10 @@ export function planReviewScope(input: {
     // defer it forever and the PR would stall (approval is never credited
     // without it). So the chain is bounded at one integration round, whatever
     // the policy or lineage: this round reviews whole, and a whole round
-    // records complete coverage whatever its verdict (pinned by the engine
-    // test "records whole-candidate coverage even when the whole round
-    // requests changes"), so later base moves retain COMPLETE coverage again.
+    // records complete coverage whatever its verdict (pinned in
+    // test/perkins-integration-review.test.ts, "records whole-candidate
+    // coverage even when the whole round requests changes"), so later base
+    // moves retain COMPLETE coverage again.
     if (input.finalWholePassAtReady && prior.reviewScope === 'integration' && !prior.coverageComplete &&
       prior.canonicalVerdict === 'READY TO MERGE') {
       return {
