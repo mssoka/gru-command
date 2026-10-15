@@ -14,13 +14,20 @@
 
 /** A UUID v4 in any context: native `crypto.randomUUID` when the browser
  * provides it (secure contexts), otherwise v4 bytes from `getRandomValues`
- * with the version/variant bits applied. Throws a named error where no
- * Web Crypto exists at all — never a silent fallback. */
+ * with the version/variant bits applied. Throws an Error with a
+ * distinctive, actionable message (this repo names errors by message, not
+ * by class or prefix) where no Web Crypto exists at all — never a silent
+ * fallback.
+ *
+ * A native `randomUUID` that exists but THROWS is deliberately not caught:
+ * no shipping browser has that shape (the method is a [SecureContext]
+ * attribute — present or absent, never present-and-broken), and silently
+ * swapping entropy sources on an exception would hide a real fault. */
 export function uuidV4(): string {
   const crypto = globalThis.crypto;
   if (typeof crypto?.randomUUID === 'function') return crypto.randomUUID();
   if (typeof crypto?.getRandomValues !== 'function') {
-    throw new Error('gru: Web Crypto is unavailable in this context; cannot mint message ids');
+    throw new Error('Web Crypto is unavailable in this context; cannot mint message ids');
   }
   const bytes = crypto.getRandomValues(new Uint8Array(16));
   // RFC 4122 §4.4: version 4 lives in the high nibble of byte 6; the

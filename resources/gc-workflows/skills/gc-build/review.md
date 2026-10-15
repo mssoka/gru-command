@@ -14,7 +14,17 @@ terminal agents. Use `POST /api/dispatch` with `deliverable: "review"`,
 `parent_job_id: "{{context.jobId}}"`, `target_ref` naming this job's ordinary PR and
 `target_sha` naming the exact committed candidate head. If needed, commit the
 verified candidate and publish its reviewable ordinary PR before commissioning;
-never merge it. Retain each reviewer job identity and its recorded findings
+never merge it. Name the exact source for the review (issue #317): optional
+`target_base` (focused-delta base; the range reviewed is
+`target_base..target_sha`), `required_inputs` (`[{path, lens}]` content the
+review needs — only the `claims` lens accepts inputs, a `blind` lens is a 400)
+and `source_package` (`{path, sha256}` of a hash-pinned git bundle authorizing a
+repair). The service proves the actual selected object store holds the named
+target/base/range/inputs before the reviewer spawns; if it cannot, the dispatch
+is refused `422 review_source_unavailable` (`problems`, `retry_authorized:false`)
+— a refusal, not a report, and never an automatic retry. Dispatch to the
+repository that holds the commits, or re-dispatch with an explicit
+`source_package`. Retain each reviewer job identity and its recorded findings
 handback/disposition using the shipped minion playbook.
 
 Independent terminal sessions are permitted only for explicit owner-directed
@@ -23,11 +33,22 @@ minion must not use this exception. The normal route uses all three lenses in
 parallel when the runtime supports it:
 
 - [[gc-resource:skills/gc-build/review-prompts/adversarial.md]] — diff and repository,
-  without the author's explanation or self-review.
+  without the author's explanation or self-review. This is the BLIND lens: commission it
+  with `"review_role": "blind"`, an `"input_package"` (`base_sha`, `target_sha`, the
+  base-to-target `diff` and/or exact target `files`) and `"parent_contract_sha256"` read
+  from `GET /api/dispatch/jobs/{{context.jobId}}/contract`. The service validates the package
+  against this job's effective `blind-isolation:` rule (administrative clarifications
+  included) BEFORE any reviewer spawns, and refuses task specs, prior assessments and
+  deferred/triage text carried by a document-like file (extensionless or `.md`/`.markdown`/
+  `.txt`/`.rst`/`.adoc`, whatever it is named) with a correction path; other file types are
+  path-checked only. Never hand a
+  blind reviewer an unfiltered historical diff, and never count a blind report as
+  independent coverage unless `GET /api/dispatch/jobs/<review job>/blind-coverage` says
+  `qualifying`; settling a report is not validity.
 - [[gc-resource:skills/gc-build/review-prompts/edge-cases.md]] — diff, relevant code and
-  acceptance scenarios; boundary/failure paths.
+  acceptance scenarios; boundary/failure paths. Claims-needed lens: `"review_role": "claims"`.
 - [[gc-resource:skills/gc-build/review-prompts/verification.md]] — diff, approved intent,
-  tests and exact executed verification evidence.
+  tests and exact executed verification evidence. Claims-needed lens: `"review_role": "claims"`.
 
 The small-change route requires the fresh adversarial reviewer; add the other
 lenses when warranted. Never substitute author self-review for a reviewer. If

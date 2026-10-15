@@ -4,6 +4,16 @@ Gru Command hosts every agent session behind the `AgentRuntime` interface
 (`src/runtime/types.ts`). Nothing above the adapter layer may import a
 concrete adapter — the interface is the contract (SPEC ruling 4).
 
+## Default runtime
+
+New installs and generated configs (`config-generate`, the setup wizard) write
+`[runtimes] default = "claude-code"`. `pi` remains fully supported: choose it with
+`config-generate --runtime pi` or `--answers '{"runtime":"pi"}'`. Existing
+`config.toml` files keep whatever they say (including a config with no
+`[runtimes]` table, which still resolves to `pi`); regenerating with `--force`
+adopts the existing runtime unless one is chosen explicitly. Switch an existing
+install by editing `[runtimes] default`.
+
 ## Capability matrix
 
 | Capability | `pi` | `claude-code` | Meaning |
@@ -214,6 +224,10 @@ runs at wizard/boot time, never on a hot path.
   3. `[models.roles]` / `[thinking.roles]`
   4. `[runtimes.<id>]` per-runtime `model` / `thinking_level`
   5. `[models] default` / `[thinking] default`
+- **Known limit — resumed sessions (issue #24).** A resumed session's
+  persisted model outranks the settings default, so a saved model whose
+  provider has no credentials fails at prompt time instead of falling back
+  to the default.
 
 See [CONFIG.md](./CONFIG.md) for the exact schema and examples.
 

@@ -104,6 +104,9 @@ function seedOfflineNpmFixture(repo: FixtureRepo): void {
     stdio: 'pipe',
   });
   repo.commitFile('package-lock.json', readFileSync(join(repo.path, 'package-lock.json'), 'utf-8'));
+  // The fixture depends only on its local package. Real lane setup must not contact
+  // npm's audit/funding services while proving npm ci actually installs that package.
+  repo.commitFile('.npmrc', 'offline=true\naudit=false\nfund=false\n');
 }
 
 describe('worktree manager: creation (ruling 18a/b/d/e)', () => {
@@ -607,14 +610,29 @@ describe('base resolution (owner incident 2026-09-23): the lane branches from FE
     ledgerJob(h, 'job-redact', repo);
     const local = repo.head();
 
-    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-redact' });
-    expect(row.baseSource).toBe('local-head-fallback');
-    expect(row.sha).toBe(local);
-    expect(h.baseFallbacks).toHaveLength(1);
-    // Raw git stderr (carrying the credential-bearing URL) is redacted
-    // before it reaches logs or the persisted notification.
-    expect(h.baseFallbacks[0]?.detail).not.toContain('hunter2');
-    expect(h.baseFallbacks[0]?.detail).toMatch(/redacted|invalid\.example/u);
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf-8' }).trim();
+    const shimDir = mkdtempSync(join(tmpdir(), 'gru-wt-redacted-fetch-'));
+    const shim = join(shimDir, 'git');
+    writeFileSync(shim, '#!/bin/sh\n' +
+      'if [ "$1" = "ls-remote" ] || [ "$1" = "fetch" ]; then\n' +
+      '  echo "fatal: unable to access https://user:hunter2@invalid.example/repo.git: fixture transport refusal" >&2\n' +
+      '  exit 128\nfi\n' +
+      'exec ' + JSON.stringify(realGit) + ' "$@"\n', 'utf-8');
+    chmodSync(shim, 0o755);
+    const priorPath = process.env.PATH;
+    process.env.PATH = `${shimDir}:${priorPath ?? ''}`;
+    try {
+      const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-redact' });
+      expect(row.baseSource).toBe('local-head-fallback');
+      expect(row.sha).toBe(local);
+      expect(h.baseFallbacks).toHaveLength(1);
+      // Exercise the real stderr-redaction boundary, without external DNS/proxy timing.
+      expect(h.baseFallbacks[0]?.detail).not.toContain('hunter2');
+      expect(h.baseFallbacks[0]?.detail).toMatch(/redacted|invalid\.example/u);
+    } finally {
+      process.env.PATH = priorPath;
+      rmSync(shimDir, { recursive: true, force: true });
+    }
   });
 
   it('a review ref naming origin/HEAD REFUSES an UNVERIFIED cache-guessed default (the r6 B1 review arm, pinned)', async () => {
@@ -1945,5 +1963,48 @@ describe('Perkins lane-B r4: a swept row with a surviving branch HEALS on releas
     expect(healed.status).toBe('swept');
     if (healed.status === 'swept') expect(healed.branch).toBe('deleted');
     expect(repo.git(['branch', '--list', row.branch!])).toBe('');
+  });
+});
+
+// ------------------------------------------------------------------
+// Issue #243 F-H1: automatic (unattended) release proofs
+// ------------------------------------------------------------------
+
+describe('issue #243 F-H1 automatic release proofs', () => {
+  it('refuses an UNATTENDED release that would destroy dirty tracked work, retaining the tree', async () => {
+    const h = harness();
+    const repo = h.make();
+    ledgerJob(h, 'job-fh1-dirty', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-fh1-dirty' });
+    // A tracked modification the forced removal would destroy (only `??`
+    // untracked entries are preserved by the sweep).
+    writeFileSync(join(row.path, 'README.md'), 'modified tracked content\n');
+    await expect(
+      h.manager.release({ worktreeId: 'job-fh1-dirty', requireReleaseProofs: true }),
+    ).rejects.toThrow(/automatic sweep refused: 1 tracked change/);
+    // The tree and the registry row are retained for the operator to resolve.
+    expect(existsSync(row.path)).toBe(true);
+    expect(h.ledger.getWorktree('job-fh1-dirty')?.status).toBe('active');
+    expect(readFileSync(join(row.path, 'README.md'), 'utf-8')).toBe('modified tracked content\n');
+  });
+
+  it('sweeps an UNATTENDED release of a clean lane (intact-positive control)', async () => {
+    const h = harness();
+    const repo = h.make();
+    ledgerJob(h, 'job-fh1-clean', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-fh1-clean' });
+    const result = await h.manager.release({ worktreeId: 'job-fh1-clean', requireReleaseProofs: true });
+    expect(result.status).toBe('swept');
+    expect(existsSync(row.path)).toBe(false);
+  });
+
+  it('keeps the operator path authoritative: no proof flag still sweeps a dirty lane', async () => {
+    const h = harness();
+    const repo = h.make();
+    ledgerJob(h, 'job-fh1-oper', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-fh1-oper' });
+    writeFileSync(join(row.path, 'README.md'), 'operator chose to discard this\n');
+    const result = await h.manager.release({ worktreeId: 'job-fh1-oper' });
+    expect(result.status).toBe('swept');
   });
 });

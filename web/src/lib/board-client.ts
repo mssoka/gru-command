@@ -437,13 +437,18 @@ export class BoardClient {
     }
   }
 
-  /** A newest, epoch-matched answer landed: every owed refresh is met, and
-   * a trailing refetch still waiting out its backoff is cancelled (R8-02). */
+  /** A newest, epoch-matched answer landed: every owed refresh is met, a
+   * trailing refetch waiting out its backoff is cancelled (R8-02), and the
+   * whole trailing chain is retired — even one whose request is still in
+   * flight and was overtaken (#275). Advancing the generation means that
+   * request's continuation can never start another chain, and a fresh
+   * failure may start its own at once instead of waiting on the old
+   * request's deadline. */
   private demandMet(): void {
     this.refreshOwed = false;
-    if (this.trailingTimer === null) return;
-    clearTimeout(this.trailingTimer);
+    if (this.trailingTimer !== null) clearTimeout(this.trailingTimer);
     this.trailingTimer = null;
+    this.trailingGeneration += 1;
     this.trailingRefetch = false;
     this.trailingRun = 0;
   }

@@ -76,7 +76,20 @@ implementation lanes omit the field (PR-owing) — an unmarked non-PR
 dispatch is chased as a missing PR. A report-type dispatch also names its
 commissioner and target (issue #220): `"commissioner"` (who owes the
 disposition), `"target_ref"` (the PR url) and `"target_sha"` (the exact
-reviewed head); a review WITHOUT its target is rejected loudly. A report
+reviewed head); a review WITHOUT its target is rejected loudly. A review
+dispatch may also bind its source (issue #317): optional `"target_base"`
+(focused-delta base; the range reviewed is `target_base..target_sha`),
+`"required_inputs"` (`[{path, lens}]` content the review needs — only the
+`claims` lens accepts inputs, a `blind` lens is a 400) and
+`"source_package"` (`{path, sha256}` of a hash-pinned git bundle
+authorizing a repair). The service proves the ACTUAL selected object
+store holds the named target/base/range/inputs before any job, worktree
+or reviewer exists; when it cannot, `POST /api/dispatch` answers `422`
+`{"error":"review_source_unavailable","detail":"...","problems":[...],"retry_authorized":false}`
+— a concrete refusal, never a no-findings report or a completed review,
+and never authority for an automatic retry. Re-dispatch to the repository
+that holds the commits, or re-dispatch with an explicit `source_package`.
+A report
 on a tracked lane also names that lane's job id as `"parent_job_id"`, so
 the board nests the reviewer under its heist as a megaminion instead of
 showing a peer heist (only report-type jobs may name a parent). The
@@ -203,3 +216,22 @@ ordinary conflict-file work is not an owner chore. Service restarts
 remain fully owner-held — Gru's 2026-09-29 restart attempt killed the
 service and failed to relaunch it; do not delegate restarts to agents
 again.
+
+## Evidence-first restart recovery
+
+New directives and rebriefs receive durable request IDs before dispatch;
+202 is acceptance, not native admission. Read their exact request/session/
+checkpoint/approved-revision/authority-epoch evidence through
+`GET /api/silas/directives/<request_id>`. The service inspects correlated
+completion first and safely continues only a proven native checkpoint on
+the original session/lane; it never resends a consumed prompt or creates a
+fresh fallback for unknown effects. Historical marker records stay
+unknown/auditable. Route their concrete guarded recovery judgment to Gru,
+with request/marker ID, generation, hash, checkout HEAD, epoch and producer
+blockers. An Ops hold renewal or prose disposition cannot discharge it.
+Do not bypass owner stops, verification captures or review gates, and do
+not restart production, deploy or merge a PR to recover work.
+
+Observe historical generations in bounded cancellation-aware fair pages, independent of clock age. Interpret exact original receipt identity/phase/minion/revision consistently at observation and transactional settlement. Legacy judgment requires freshly recomputed receipt-evidence SHA including relevant unproven conflicts. Never fill absent historical HEAD/revision from today's branch/current approval/default zero. Exact completion without reconstructible delivery owes non-executing `reconcile-completed` control closure and discoverable current-inspection debt, not replay or a dead generic hold.
+
+Reserved-owner transfer binds full exact recovery context to a real live same-job job-wide known operation owner-hold. Preserve suspended debt via legal closed/superseded transition and immutable per-generation history. Changed/generically closed owner conditions mint suspended fresh Gru incarnations, never permission or old prompt revival. Surface the concrete real owner linkage/explicit recipe, but NEVER automatically call or synthesize owner-resolution or confirm-stop. Shared bearer `by: owner` is explicit attribution, not verified identity. Separate owner confirmation, board unpark, notification Ack and fresh current-fenced Gru successor remain separate; no cessation/completion/READY is implied.

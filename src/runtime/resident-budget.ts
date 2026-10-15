@@ -65,9 +65,11 @@ export class ResidentBudget {
 
   /** Keep an idle resident warm until the oldest safe one is needed. */
   watch(handle: AgentHandle, eligible: () => boolean, at: number = Date.now()): void {
-    this.idle.set(handle, { eligible, at: handle.health().state === 'idle' && eligible() ? at : null,
-      order: this.nextIdleOrder++,
-    });
+    let idleAt: number | null = null;
+    try { if (handle.health().state === 'idle' && eligible()) idleAt = at; } catch {
+      // Unknown health/eligibility retains the resident, never makes it idle.
+    }
+    this.idle.set(handle, { eligible, at: idleAt, order: this.nextIdleOrder++ });
   }
 
   unwatch(handle: AgentHandle): void { this.idle.delete(handle); }
@@ -119,8 +121,12 @@ export class ResidentBudget {
   private drain(): void {
     if (this.stopped) return;
     for (const [handle, record] of this.idle) {
-      if (handle.health().state !== 'idle' || !record.eligible()) record.at = null;
-      else if (record.at === null) { record.at = Date.now(); record.order = this.nextIdleOrder++; }
+      try {
+        if (handle.health().state !== 'idle' || !record.eligible()) record.at = null;
+        else if (record.at === null) { record.at = Date.now(); record.order = this.nextIdleOrder++; }
+      } catch {
+        record.at = null; // unknown observation cannot release or reclaim ownership
+      }
     }
     const head = this.waiting[0];
     if (head === undefined) return;

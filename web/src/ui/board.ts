@@ -851,6 +851,33 @@ export class BoardView {
     // A recorded decision can only be finished, never flipped.
     accept.disabled = current.inFlight !== null || current.recorded === 'reject';
     reject.disabled = current.inFlight !== null || current.recorded === 'accept';
+    /** An unconfirmed decision (#277): the cached proposal metadata may be
+     * stale — the server may have recorded the choice and lost only the
+     * reply. Reload it; the FETCHED durable decision (never the choice
+     * attempted here) locks the opposite button and replaces the outdated
+     * uncertainty wording. No recorded decision leaves the row undecided,
+     * with the uncertainty wording as it was. */
+    const reconcile = (uncertain: string): void => {
+      const previous = current.review;
+      current.review = null;
+      void load()
+        .then((proposal) => {
+          if (!live() || proposal.decision === null || current.recorded === null) return;
+          if (current.message === uncertain) current.message = recordedMessage(current.recorded, proposal.recovery?.conflict ?? null);
+          this.rerenderOwner();
+        })
+        .catch((error: unknown) => {
+          if (!live()) return;
+          current.review ??= previous; // nothing newer was learned: keep what the owner was reading
+          // A 404 already carries its own, more specific explanation.
+          if (error instanceof BoardApiError && error.status === 404) return;
+          // The reload itself failed (the network is still down): the
+          // decision stays unconfirmed — say so, not "couldn't load".
+          current.loadFailed = false;
+          current.message = uncertain;
+          this.rerenderOwner();
+        });
+    };
     const decide = (decision: 'accept' | 'reject'): void => {
       if (current.inFlight !== null) return;
       const client = this.boardClient;
@@ -898,7 +925,9 @@ export class BoardView {
             ['proposal_stale', 'proposal_decided', 'proposal_mismatch'].includes(error.code ?? '');
           if (!proven) client.wake();
           current.message = describeDecisionFailure(error, current.recorded);
+          const uncertain = current.message;
           this.rerenderOwner();
+          if (!proven) reconcile(uncertain);
         });
     };
     accept.addEventListener('click', () => decide('accept'));

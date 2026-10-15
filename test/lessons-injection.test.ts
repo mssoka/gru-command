@@ -150,7 +150,7 @@ describe('progressive-disclosure injection', () => {
     const dataDir = tmpDir('gru-command-injection-');
     const ledgerDb = new LedgerDb(dataDir);
     const ledger = new LedgerApi(ledgerDb.handle, { bus: new EventBus({}) });
-    const worktrees = new InMemoryWorktreePort(join(dataDir, 'wt'));
+    const worktrees = new InMemoryWorktreePort(join(dataDir, 'wt'), ledger);
     const prompts: string[] = [];
     const dispatch = new DispatchService({
       ledger,
@@ -198,7 +198,7 @@ describe('progressive-disclosure injection', () => {
     const ledger = new LedgerApi(ledgerDb.handle, { bus: new EventBus() });
     const repoPath = join(root, 'repo');
     mkdirSync(repoPath);
-    const worktrees = new InMemoryWorktreePort(join(root, 'lanes'));
+    const worktrees = new InMemoryWorktreePort(join(root, 'lanes'), ledger);
     ledger.addJob({ id: 'job-resume', repo: 'fixture', title: 'resume', briefing: 'original implementation contract' });
     await worktrees.createJobWorktree({ repoPath, jobId: 'job-resume' });
     ledger.registerAgent({ id: 'old-minion', role: 'minion', jobId: 'job-resume', sessionFile: join(root, 'old-session.jsonl') });
@@ -237,7 +237,7 @@ describe('progressive-disclosure injection', () => {
     const ledger = new LedgerApi(ledgerDb.handle, { bus: new EventBus({}) });
     const repoPath = join(root, 'repo');
     mkdirSync(repoPath, { recursive: true });
-    const worktrees = new InMemoryWorktreePort(join(root, 'wt'));
+    const worktrees = new InMemoryWorktreePort(join(root, 'wt'), ledger);
     ledger.addJob({ id: 'job-3', repo: 'fixture', title: 'directive', briefing: 'original contract' });
     await worktrees.createJobWorktree({ repoPath, jobId: 'job-3' });
     const prompts: string[] = [];

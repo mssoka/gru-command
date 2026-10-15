@@ -1,0 +1,49 @@
+name: Property contracts
+
+on:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 4 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: property-contracts-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  positive-campaign:
+    name: Real property campaign (macOS, Node 22)
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install Gru test dependencies
+        run: npm ci
+      - name: Materialize the separately locked real-tool fixture
+        run: node tools/provision-property-real-fixture.mjs materialize
+      - name: Typecheck
+        run: node node_modules/typescript/bin/tsc --noEmit -p tsconfig.test.json
+      - name: Build and verify policy pins
+        run: npm run build
+      - name: Bounded positive/security/repair campaign (no unsandboxed fallback)
+        env:
+          GRU_PROPERTY_EVIDENCE_DIR: ${{ runner.temp }}/gh350-property-evidence
+          GRU_PROPERTY_CAMPAIGN_TRIGGER: ${{ github.event_name == 'schedule' && 'scheduled' || 'pull-request' }}
+        run: node node_modules/vitest/vitest.mjs run --config vitest.heavy.config.ts test/property-executor.test.ts test/property-replay.test.ts test/property-repair-ci.test.ts test/property-real-tool-campaign.test.ts
+      - name: Retain counterexamples, shrink paths, replay receipts and metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: property-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/gh350-property-evidence
+          if-no-files-found: error
+          retention-days: 14

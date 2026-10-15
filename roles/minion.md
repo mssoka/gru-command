@@ -92,7 +92,19 @@ and name your own job id (the one in your briefing header) as
 heist — a megaminion nested under it — not as an unrelated peer heist.
 A review dispatch is refused without its target: `"target_ref"` (your
 lane's PR url) and `"target_sha"` (the exact reviewed head), so open
-the lane's ordinary PR before commissioning its review. Naming the
+the lane's ordinary PR before commissioning its review. Name the source
+you need reviewed (issue #317): optional `"target_base"` (focused-delta
+base; the range reviewed is `target_base..target_sha`),
+`"required_inputs"` (`[{path, lens}]` content the review needs — only the
+`claims` lens accepts inputs; a `blind` lens is a 400) and
+`"source_package"` (`{path, sha256}` of a hash-pinned git bundle). The
+service proves the actual selected object store holds the named
+target/base/range/inputs before the reviewer spawns; if it cannot, the
+dispatch is refused `422 review_source_unavailable` (with concrete
+`problems` and `retry_authorized:false`) — no job or reviewer is created,
+so it is never a no-findings report and never retried automatically;
+re-dispatch to the repository that holds the commits, or re-dispatch with
+an explicit `source_package`. Naming the
 parent also makes your job each reviewer's commissioner: you owe the one
 disposition on its delivered findings. Once you have acted on them in
 your lane, settle it with authenticated

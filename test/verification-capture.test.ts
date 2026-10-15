@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -26,6 +27,7 @@ import {
   runCaptureCli,
   type CaptureCliDeps,
 } from '../src/verify/capture-cli.js';
+import { verificationShellQuote } from '../src/runtime/worker-verification-policy.js';
 
 /**
  * Verification capture (issue #159): exclusive sinks, honest receipts,
@@ -589,6 +591,36 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
       stderr: () => {},
     });
     expect(unreachable).toBe(CAPTURE_EXIT.unknown);
+  });
+
+  it('runs the advertised authenticated status action from a relocated config path with literal $ and backtick (N11)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gru-$`instance-'));
+    dirs.push(root);
+    const configPath = join(root, 'config.toml');
+    writeFileSync(configPath, '[auth]\ntoken = "ops-token"\n');
+    let seen: { url: string; auth: string | null } | null = null;
+    const out: string[] = [];
+    const code = await runCaptureCli(
+      ['status', '--request-id', 'req-n11', '--url', 'http://ops', '--config', configPath],
+      {
+        fetchImpl: async (input, init) => {
+          seen = { url: input, auth: new Headers(init?.headers).get('authorization') };
+          return new Response('{"state":"running"}\n', { status: 200 });
+        },
+        stdout: (text: string) => out.push(text),
+        stderr: () => {},
+      },
+    );
+    expect(code).toBe(CAPTURE_EXIT.ok);
+    expect(seen).toEqual({
+      url: 'http://ops/api/verify/status?request_id=req-n11', auth: 'Bearer ops-token',
+    });
+    expect(out.join('')).toContain('running');
+    // The exact path the refusal advertises is shell-safe: quoting it round-trips
+    // through a real shell with the literal `$`/backtick intact.
+    const resolved = spawnSync('/bin/sh', ['-c', `printf %s ${verificationShellQuote(configPath)}`], { encoding: 'utf8' });
+    expect(resolved.status, resolved.stderr).toBe(0);
+    expect(resolved.stdout).toBe(configPath);
   });
 
   it('withdraw subcommand validates identity through injected probes', async () => {

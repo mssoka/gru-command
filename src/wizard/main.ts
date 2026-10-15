@@ -32,18 +32,24 @@ import { configPathFor, expandTilde, instanceDirFromEnv, DEFAULT_INSTANCE_PORT, 
 import type { RuntimeProbeResult } from '../runtime/probe.js';
 import {
   AnswersError,
+  DEFAULT_NEW_INSTALL_RUNTIME,
   generateToken,
   parseAnswers,
   resolveBindHost,
   validateWorkspaceRoot,
   type WizardAnswers,
 } from './answers.js';
+import { assertRuntimeCliAvailable } from './runtime-cli.js';
 import {
   buildQrPayload,
+  clearWizardDraft,
   discoverManagedRepos,
   generateConfigToml,
   loadExistingInstanceConfig,
+  loadWizardDraft,
+  saveWizardDraft,
   seedAnswersFromConfig,
+  wizardDraftPath,
   writeConfigText,
 } from './steps.js';
 import { validateRepositorySetup } from './repository-setup.js';
@@ -71,17 +77,17 @@ function printProbe(results: readonly RuntimeProbeResult[]): void {
   }
   if (!results.some((result) => result.installed)) {
     stdout.write(
-      '\n⚠ No runtime CLI found (pi / claude). You can proceed — the wizard\n' +
-      '  writes the config anyway, and adapters fail LOUD at spawn time until\n' +
-      '  you install one.\n',
+      '\n⚠ No runtime CLI found (claude / pi). Claude Code (the default) needs its\n' +
+      '  `claude` CLI before setup writes the config; pi can still be configured and\n' +
+      '  fails LOUD at spawn time until you install it.\n',
     );
   }
 }
 
-/** Default runtime pick: first installed probe (pi preferred), else "pi". */
-function defaultRuntimeId(results: readonly RuntimeProbeResult[]): string {
-  const installed = results.find((result) => result.installed);
-  return installed !== undefined ? installed.id : 'pi';
+/** Default runtime pick for a fresh install: Claude Code, never a silent
+ * swap to whichever CLI happens to be installed (a missing CLI fails loud). */
+function defaultRuntimeId(): string {
+  return DEFAULT_NEW_INSTALL_RUNTIME;
 }
 
 interface WizardTerminal {
@@ -117,15 +123,33 @@ async function ask(rl: ReturnType<typeof createInterface>, question: string): Pr
   return (await rl.question(question)).trim();
 }
 
+/** Stop-first guidance shared by the up-front warning, the port prompt, and
+ * the pre-write abort. */
+function portInUseGuidance(host: string, port: number, holder: string): string {
+  return (
+    `port ${port} on ${host} is already in use — if the previous\n` +
+    '  service still runs, stop it first (./install.sh --uninstall, or\n' +
+    '  systemctl --user stop gru-command / launchctl unload …), then re-run.\n' +
+    `  (listener detected${holder === 'unknown' ? '' : ` at ${holder}`})`
+  );
+}
+
 function yn(value: string): boolean {
   return value.toLowerCase() === 'y' || value.toLowerCase() === 'yes';
+}
+
+interface CollectedAnswers {
+  readonly answers: WizardAnswers;
+  /** The exact JSON handed to parseAnswers — what an interrupted run saves. */
+  readonly draftJson: string;
 }
 
 async function interactiveAnswers(
   probe: readonly RuntimeProbeResult[],
   terminal: WizardTerminal,
   prior: ReturnType<typeof loadExistingInstanceConfig>,
-): Promise<WizardAnswers> {
+  draft: string | null,
+): Promise<CollectedAnswers> {
   const rl = createInterface({ input: terminal.input, output: terminal.output });
   const out = terminal.output;
   out.write('\nGru Command setup — press Enter to accept every [default].\n');
@@ -134,6 +158,32 @@ async function interactiveAnswers(
       `\nExisting config found — Enter keeps its values (round-trip; a timestamped\n` +
         `  backup is written before any rewrite).\n`,
     );
+  }
+
+  // Fail fast (#33): surface a port conflict BEFORE the first question, for
+  // the port this run will default to. It is a warning, not an abort — the
+  // operator may still choose another port at the prompt, which re-checks.
+  const preflightPort = prior?.server.port ?? DEFAULT_INSTANCE_PORT;
+  if (preflightPort !== 0) {
+    const holder = await findPortHolder(prior?.server.host ?? '127.0.0.1', preflightPort);
+    if (holder !== null) {
+      out.write(
+        `\nHeads up before you answer anything: ${portInUseGuidance(prior?.server.host ?? '127.0.0.1', preflightPort, holder)}\n` +
+          '  Or pick a different bind port below — your answers are saved if setup stops.\n',
+      );
+    }
+  }
+
+  // Resume (#33): answers saved by an interrupted run are offered back.
+  if (draft !== null) {
+    const reuse = await ask(
+      rl,
+      '\nFound answers saved from an interrupted setup. Reuse them and skip the questions? [Y/n]: ',
+    );
+    if (reuse.toLowerCase() !== 'n' && reuse.toLowerCase() !== 'no') {
+      rl.close();
+      return { answers: parseAnswers(draft), draftJson: draft };
+    }
   }
 
   let workspaceRoot = prior?.workspaceRoot ?? '~/code';
@@ -197,7 +247,7 @@ async function interactiveAnswers(
     );
   }
 
-  const runtimeDefault = prior?.runtimes.default ?? defaultRuntimeId(probe);
+  const runtimeDefault = prior?.runtimes.default ?? defaultRuntimeId();
   let runtime = runtimeDefault;
   for (;;) {
     const answer = await ask(
@@ -246,11 +296,17 @@ async function interactiveAnswers(
   let port = prior?.server.port ?? DEFAULT_INSTANCE_PORT;
   for (;;) {
     const answer = await ask(rl, `Bind port (0 = ephemeral) [${port}]: `);
-    if (answer === '') break;
-    const parsed = Number(answer);
+    const parsed = answer === '' ? port : Number(answer);
     if (Number.isInteger(parsed) && parsed >= 0 && parsed <= 65535) {
-      port = parsed;
-      break;
+      // Check at the prompt (#33): a conflict is found while the operator
+      // is still here, not after the remaining questions.
+      const holder = parsed === 0 ? null : await findPortHolder(host, parsed);
+      if (holder === null) {
+        port = parsed;
+        break;
+      }
+      out.write(`  ✗ ${portInUseGuidance(host, parsed, holder)}\n  Choose another port, or stop that listener and re-run (answers are saved).\n`);
+      continue;
     }
     out.write('  ✗ port must be an integer 0–65535\n');
   }
@@ -268,21 +324,19 @@ async function interactiveAnswers(
   const smoke = smokeAnswer !== 'n' && smokeAnswer !== 'no';
   rl.close();
 
-  const answers = parseAnswers(
-    JSON.stringify({
-      workspace_root: workspaceRoot,
-      repos,
-      runtime,
-      model,
-      thinking_level: thinkingLevel,
-      host,
-      port,
-      token,
-      register_service: registerService,
-      smoke,
-    }),
-  );
-  return answers;
+  const draftJson = JSON.stringify({
+    workspace_root: workspaceRoot,
+    repos,
+    runtime,
+    model,
+    thinking_level: thinkingLevel,
+    host,
+    port,
+    token,
+    register_service: registerService,
+    smoke,
+  });
+  return { answers: parseAnswers(draftJson), draftJson };
 }
 
 // ---------------------------------------------------------------------------
@@ -543,6 +597,7 @@ async function main(argv: readonly string[]): Promise<number> {
   // is loaded dynamically at its use site.
   let answers: WizardAnswers;
   let terminal: WizardTerminal | null = null;
+  let draftPath: string | null = null;
   if (noInteract) {
     let rawKeys: ReadonlySet<string> = new Set();
     try {
@@ -579,12 +634,35 @@ async function main(argv: readonly string[]): Promise<number> {
     const probe = probeRuntimes();
     printProbe(probe);
     terminal = openWizardTerminal(repoRoot);
-    answers = await interactiveAnswers(probe, terminal, prior);
+    let draft: string | null = null;
+    try {
+      draft = loadWizardDraft(instanceDir);
+      if (draft !== null) parseAnswers(draft);
+    } catch (error) {
+      stdout.write(
+        `\nIgnoring an unreadable saved draft (${wizardDraftPath(instanceDir)}): ${(error as Error).message}\n` +
+          '  It is replaced by this run.\n',
+      );
+      draft = null;
+    }
+    const collected = await interactiveAnswers(probe, terminal, prior, draft);
+    answers = collected.answers;
+    // Everything the operator typed survives any later abort (#33).
+    draftPath = saveWizardDraft(instanceDir, collected.draftJson);
+  }
+  const abortNote = draftPath === null ? '' : `\n  Your answers are saved (${draftPath}); re-running offers to reuse them.`;
+
+  if (prior === null || prior.runtimes.default !== answers.runtime) {
+    try {
+      assertRuntimeCliAvailable(answers.runtime);
+    } catch (error) {
+      fail(`${(error as Error).message}${abortNote}`);
+    }
   }
 
   const configPath = configPathFor(instanceDir);
   if (existsSync(configPath) && !force) {
-    fail(`refusing to overwrite existing ${configPath} without --force`);
+    fail(`refusing to overwrite existing ${configPath} without --force${abortNote}`);
   }
   const configText = generateConfigToml({ answers, instanceDir, prior });
 
@@ -595,12 +673,7 @@ async function main(argv: readonly string[]): Promise<number> {
   if (answers.port !== 0) {
     const holder = await findPortHolder(answers.host, answers.port);
     if (holder !== null) {
-      fail(
-        `port ${answers.port} on ${answers.host} is already in use — if the previous\n` +
-          '  service still runs, stop it first (./install.sh --uninstall, or\n' +
-          '  systemctl --user stop gru-command / launchctl unload …), then re-run.\n' +
-          `  (listener detected${holder === 'unknown' ? '' : ` at ${holder}`})`,
-      );
+      fail(portInUseGuidance(answers.host, answers.port, holder) + abortNote);
     }
   }
 
@@ -609,7 +682,7 @@ async function main(argv: readonly string[]): Promise<number> {
     try {
       validateRepositorySetup(workspaceAbs, repo);
     } catch (error) {
-      fail((error as Error).message);
+      fail((error as Error).message + abortNote);
     }
     stdout.write(`Repository ready in ${repo}: GC setup validated; project files unchanged.\n`);
   }
@@ -620,11 +693,12 @@ async function main(argv: readonly string[]): Promise<number> {
   if (answers.port !== 0) {
     const holder = await findPortHolder(answers.host, answers.port);
     if (holder !== null) {
-      fail(`port ${answers.port} on ${answers.host} became occupied during setup; config was not written`);
+      fail(`port ${answers.port} on ${answers.host} became occupied during setup; config was not written${abortNote}`);
     }
   }
 
   const write = writeConfigText(instanceDir, configText, { force });
+  clearWizardDraft(instanceDir);
   stdout.write(`\nWrote ${write.configPath}\n`);
   if (write.backupPath !== null) stdout.write(`Previous config backed up: ${write.backupPath}\n`);
 
