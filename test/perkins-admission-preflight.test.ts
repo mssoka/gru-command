@@ -90,16 +90,28 @@ function temp(prefix: string): string {
  * rather than a fixed sleep keeps the pipe held open at git's exit however
  * loaded the runner is (#398): a 100 ms head start was not always enough. */
 function gatedDetachedWriter(helperFile: string, release: string, rest: string): string {
-  return `"${process.execPath}" -e "const c = require('node:child_process').spawn('/bin/sh', ['-c', 'while [ ! -e ${release} ]; do sleep 0.02; done; printf ${rest}'], { detached: true, stdio: 'inherit' }); require('node:fs').writeFileSync('${helperFile}', String(c.pid)); c.unref()"`;
+  // The gate is bounded (~30 s) so a crashed test can never leave the
+  // helper polling forever with git's stdout held open. (`\$` survives the
+  // shim's double-quoted node argument for the helper's own shell.)
+  return `"${process.execPath}" -e "const c = require('node:child_process').spawn('/bin/sh', ['-c', 'i=0; while [ ! -e ${release} ] && [ \\$i -lt 1500 ]; do sleep 0.02; i=\\$((i+1)); done; printf ${rest}'], { detached: true, stdio: 'inherit' }); require('node:fs').writeFileSync('${helperFile}', String(c.pid)); c.unref()"`;
 }
 
-/** Releases a gated helper and waits (bounded) for it to end by itself. */
+/** Releases a gated helper and waits (bounded) for it to end by itself. A
+ * helper that never started (no pid file) is not awaited, so a cleanup can
+ * never mask the step's own failure. */
 async function releaseAndAwaitEnd(release: string, helperFile: string): Promise<void> {
   writeFileSync(release, '');
+  if (!existsSync(helperFile)) return;
   const helper = Number(readFileSync(helperFile, 'utf8'));
+  if (!Number.isSafeInteger(helper) || helper <= 0) return;
   const deadline = Date.now() + 10_000;
   for (;;) {
-    try { process.kill(helper, 0); } catch { return; } // ESRCH: it ended by itself
+    try {
+      process.kill(helper, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ESRCH') return; // it ended by itself
+      throw error;
+    }
     if (Date.now() > deadline) throw new Error(`gated helper ${helper} did not end after its release`);
     await new Promise((resolve) => setTimeout(resolve, 20));
   }

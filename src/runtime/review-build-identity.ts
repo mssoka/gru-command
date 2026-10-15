@@ -37,16 +37,6 @@ function assertDirectoryReceipt(fd: number, expected: DirectoryReceipt): void {
   }
 }
 
-/** An ancestor of the installation (for example /tmp) is shared: unrelated
- * siblings change its mtime/ctime without changing this installation, so
- * only its identity is held (#399). A replaced ancestor still refuses. */
-function assertDirectoryIdentity(fd: number, expected: DirectoryReceipt): void {
-  const current = directoryReceipt(fd);
-  if (current.dev !== expected.dev || current.ino !== expected.ino) {
-    throw new Error('review runtime directory changed during child selection');
-  }
-}
-
 function assertFileReceipt(fd: number, expected: FileReceipt): void {
   const current = fstatSync(fd, { bigint: true });
   if (!current.isFile() || current.dev !== expected.dev || current.ino !== expected.ino ||
@@ -268,8 +258,13 @@ export function reviewRuntimeVersion(packageRoot: string): string {
       // procfs is only a descriptor handle, never a pathname fallback.
       let parentFd = rootFd;
       // Only the leading `..` steps of a normalized relative path climb
-      // above the installation; directories reached that way are its shared
-      // ancestors, held by identity like the root's parent in checkRoot.
+      // above the installation. A directory reached that way is a SHARED
+      // ancestor (for example /tmp): unrelated siblings legitimately change
+      // its mtime/ctime, so it gets no change bracket (#399). Its identity
+      // cannot change under the held descriptor, and checkRoot() around every
+      // step re-resolves the installation by pathname, so a re-parented or
+      // replaced ancestor still refuses. Every directory below the first
+      // non-`..` component (a dependency location) keeps the full bracket.
       let parentIsAncestor = false;
       const opened: number[] = [];
       try {
@@ -277,13 +272,12 @@ export function reviewRuntimeVersion(packageRoot: string): string {
         for (const [index, part] of components.entries()) {
           const last = index === components.length - 1;
           checkRoot();
-          const parentReceipt = directoryReceipt(parentFd);
+          const parentReceipt = parentIsAncestor ? null : directoryReceipt(parentFd);
           const fd = openSync(`/proc/self/fd/${parentFd}/${part}`,
             constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW |
             (last ? 0 : constants.O_DIRECTORY));
           opened.push(fd);
-          if (parentIsAncestor) assertDirectoryIdentity(parentFd, parentReceipt);
-          else assertDirectoryReceipt(parentFd, parentReceipt);
+          if (parentReceipt !== null) assertDirectoryReceipt(parentFd, parentReceipt);
           if (part === '..' && parentFd === rootFd) {
             const selectedParent = directoryReceipt(fd);
             if (selectedParent.dev !== rootParentReceipt!.dev || selectedParent.ino !== rootParentReceipt!.ino) {
