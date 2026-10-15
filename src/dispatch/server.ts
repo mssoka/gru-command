@@ -98,6 +98,9 @@ export interface DispatchServerOptions {
   readonly intakeApproval?: IntakeApprovalService;
   /** Book of Lessons injection for directives/re-briefs (pointers only). */
   readonly lessons?: LessonsReferencePort;
+  /** Observe the actual continued physical session through the shared
+   * read-only blind-coverage port; absent = no observation. */
+  readonly observeBlindTurn?: (jobId: string, sessionFile: string | null) => void;
   readonly log?: Log;
 }
 
@@ -1420,6 +1423,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           signal: controller.signal,
           ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
           ...(options.retrySettlement !== undefined ? { retrySettlement: options.retrySettlement } : {}),
+          ...(options.observeBlindTurn !== undefined ? { observeBlindTurn: options.observeBlindTurn } : {}),
           ...(options.lessons !== undefined ? { lessons: options.lessons } : {}),
           ...(options.childWorkers !== undefined ? { parentTools: (agentId: string) => options.childWorkers!.parentTools(agentId) } : {}),
         }, intent.requestId);
@@ -1606,6 +1610,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
             notifications: ops.notifications, pendingProducerBlockers: options.pendingProducerBlockers, signal: controller.signal,
             ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
             ...(options.retrySettlement !== undefined ? { retrySettlement: options.retrySettlement } : {}),
+            ...(options.observeBlindTurn !== undefined ? { observeBlindTurn: options.observeBlindTurn } : {}),
             ...(options.lessons !== undefined ? { lessons: options.lessons } : {}),
             ...(options.childWorkers !== undefined ? { parentTools: (agentId: string) => options.childWorkers!.parentTools(agentId) } : {}),
           }, outcome.successor.requestId).finally(() => directiveControllers.delete(controller));
@@ -1822,6 +1827,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           notifications: ops.notifications, pendingProducerBlockers: options.pendingProducerBlockers, signal: controller.signal,
           ...(options.workerGate === undefined ? {} : { workerGate: options.workerGate }),
           ...(options.retrySettlement === undefined ? {} : { retrySettlement: options.retrySettlement }),
+          ...(options.observeBlindTurn === undefined ? {} : { observeBlindTurn: options.observeBlindTurn }),
           ...(options.lessons === undefined ? {} : { lessons: options.lessons }),
           ...(options.childWorkers === undefined ? {} : { parentTools: (agentId: string) => options.childWorkers!.parentTools(agentId) }),
         }, intent.requestId);

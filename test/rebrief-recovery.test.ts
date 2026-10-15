@@ -1,6 +1,6 @@
 import { bindOriginalRebriefSdkOwner } from './helpers/directive-native-fixture.js';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,8 +14,39 @@ import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtim
 import type { Role } from '../src/config.js';
 import { finalizeRebriefRequest, reconcilePendingRebriefs } from '../src/dispatch/rebrief-recovery.js';
 import type { DirectiveRegistry } from '../src/dispatch/fix-directive.js';
+import {
+  admitBlindReview,
+  blindCoverageOf,
+  observeBlindSessionAccess,
+  recordBlindAdmission,
+  BLIND_ACCESS_EVENT,
+} from '../src/dispatch/blind-review.js';
 import { PacingGate } from '../src/runtime/pacing.js';
 import { resolveGitCommit } from '../src/dispatch/perkins-review/artifacts.js';
+
+const BASE_SHA = 'a'.repeat(40);
+const TARGET_SHA = 'f'.repeat(40);
+
+/** A pi-session toolResult line (what the reviewer's session jsonl holds). */
+const sessionToolResult = (text: string): string =>
+  `${JSON.stringify({ type: 'message', message: { role: 'toolResult', toolName: 'bash', content: text } })}\n`;
+
+/** Admit `jobId` as a blind review so the re-brief settle seam has an
+ * isolation rule to judge the re-briefed session's tool access against. */
+function admitBlindJob(h: Harness, jobId: string): void {
+  const admission = admitBlindReview({
+    ledger: h.ledger,
+    jobId,
+    title: 'review (blind)',
+    deliverable: 'review',
+    briefing: 'Review the immutable package read-only.',
+    targetSha: TARGET_SHA,
+    repoName: 'fixture',
+    inputPackage: { baseSha: BASE_SHA, targetSha: TARGET_SHA, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] },
+  });
+  if (admission === null) throw new Error(`job "${jobId}" was not admitted as a blind review`);
+  recordBlindAdmission(h.ledger, jobId, admission);
+}
 
 /**
  * Re-brief restart safety (Silas finding 2026-09-23): the durable marker
@@ -65,6 +96,10 @@ class FakeAgents implements DirectiveRegistry {
   healthError: string | null = null;
   /** When set, every minion prompt waits on this gate before settling. */
   gate: Promise<void> | null = null;
+  /** Issue #339: the side effect a real turn has on its session — tests append
+   * the continuation's reads HERE, so a scan placed before delivery reads a
+   * clean file and cannot pass by reading prewritten contamination. */
+  promptEffect: ((text: string) => void) | null = null;
   private readonly expectedSessionFile: string | null;
 
   constructor(expectedSessionFile: string | null = null) {
@@ -92,6 +127,7 @@ class FakeAgents implements DirectiveRegistry {
   private handleFor(record: { id: string; role: Role; options: SpawnOptions; prompts: string[] }): AgentHandle {
     const gate = (): Promise<void> | null => this.gate;
     const failPrompt = (): Error | null => this.failPrompt;
+    const promptEffect = (): ((text: string) => void) | null => this.promptEffect;
     const healthState = (): 'idle' | 'error' => this.healthState;
     const healthError = (): string | null => this.healthError;
     const disposedSpawned = this.disposedSpawned;
@@ -102,6 +138,7 @@ class FakeAgents implements DirectiveRegistry {
       capabilities: FAKE_CAPABILITIES,
       async prompt(text: string): Promise<void> {
         record.prompts.push(text);
+        promptEffect()?.(text);
         const pending = gate();
         if (pending !== null) await pending;
         const failure = failPrompt();
@@ -514,6 +551,44 @@ describe('re-brief restart safety (durable markers)', () => {
 
       expect(readFileSync(file, 'utf8')).toBe('historical native transcript\n');
 
+    } finally { h.close(); }
+  });
+
+  it('boot re-brief observes exact retained blind-session evidence without replay (issue #339 P4)', async () => {
+    const h = makeHarness();
+    const jobId = 'blind-rebrief-job';
+    try {
+      const { path } = await seedPendingRebrief({ h, jobId });
+      await bindOriginalRebriefSdkOwner(h.ledger, h.ledger.listPendingRebriefs({ jobId }), {
+        cwd: path, dataDir: h.dir, agentId: 'reviewer-crashed',
+      });
+      const markers = h.ledger.listPendingRebriefs({ jobId });
+      const sessionFile = markers[0]!.sessionFile!;
+      h.ledger.registerAgent({ id: 'reviewer-crashed', role: 'minion', jobId, sessionFile });
+      h.ledger.setAgentState('reviewer-crashed', 'disposed'); // the original SDK owner genuinely ceased
+      admitBlindJob(h, jobId);
+      expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({ state: 'qualifying', qualifying: true, accessObserved: false });
+      // Retained contamination is evidence to observe, NOT permission to
+      // resume the historical request or fabricate an SDK completion.
+      appendFileSync(sessionFile, sessionToolResult('docs/issues/305-review.md:1:prior assessment'));
+      const bytes = readFileSync(sessionFile);
+      h.registry.failSpawn = new Error('historical blind debt must never spawn');
+      h.registry.failPrompt = new Error('historical blind debt must never prompt');
+      const report = await reconcilePendingRebriefs({
+        registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications,
+        observeBlindTurn: (recoveredJobId, recoveredSession) =>
+          observeBlindSessionAccess(h.ledger, recoveredJobId, recoveredSession),
+      });
+      await report.settled;
+      expect(report.redispatched).toBe(0);
+      expect(h.registry.workers).toHaveLength(0);
+      expect(h.ledger.listPendingRebriefs({ jobId })).toEqual(markers);
+      expect(h.ledger.listJobEvents(jobId).filter((event) => event.kind === 'job.delivered')).toHaveLength(0);
+      expect(readFileSync(sessionFile)).toEqual(bytes);
+      expect(h.ledger.latestJobEvent(jobId, BLIND_ACCESS_EVENT)).not.toBeNull();
+      expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({
+        state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
+      });
     } finally { h.close(); }
   });
 

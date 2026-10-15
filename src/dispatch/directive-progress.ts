@@ -25,6 +25,7 @@ export interface DirectiveProgressDeps {
   readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
   readonly parentTools?: (agentId: string) => readonly NativeAgentTool[];
   readonly lessons?: LessonsReferencePort;
+  readonly observeBlindTurn?: (jobId: string, sessionFile: string | null) => void;
   readonly clearLaneForWriter?: (input: { readonly jobId: string; readonly writer: string }) => Promise<unknown>;
 }
 function check(deps: DirectiveProgressDeps, identity: DirectiveTurnIdentity): void {
@@ -525,10 +526,19 @@ export class DirectiveProgressService {
       producerStartSeq = deps.ledger.startDirectiveProducer(identity, producer);
       if (handle.id !== proof.binding.agentId || handle.sessionFile !== proof.binding.sessionFile || handle.resumeDirective === undefined) throw new DirectiveCheckpointError('runtime did not preserve exact native/logical session continuation capability');
       if (resolveGitCommit(lane.path, 'HEAD') !== head) throw new DirectiveCheckpointError('lane changed during checkpoint spawn');
-      const verdict = await handle.resumeDirective(identity, proof.checkpointId, assertProducerFences, () => {
+      const continuedSession = handle.sessionFile;
+      const continuation = handle.resumeDirective(identity, proof.checkpointId, assertProducerFences, () => {
         assertProducerFences();
         deps.ledger.claimDirectiveCheckpoint(identity, proof.checkpointId);
       });
+      // Observe the actual native continuation on success OR refusal, never
+      // create a second prompt or infer delivery from the observation.
+      const observation = continuation.then(
+        () => deps.observeBlindTurn?.(row.jobId, continuedSession),
+        () => deps.observeBlindTurn?.(row.jobId, continuedSession),
+      ).then(() => undefined, () => undefined);
+      const verdict = await continuation;
+      await observation;
       assertProducerFences();
       if (!verdict.ok) throw new DirectiveCheckpointError(verdict.error ?? 'native continuation failed');
       completed = true;

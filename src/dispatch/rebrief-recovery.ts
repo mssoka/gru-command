@@ -68,6 +68,8 @@ export interface ReconcileRebriefDeps {
   /** True while the process is deliberately stopping: a turn killed by
    * shutdown is not a recovery failure — the next boot reconsiders evidence. */
   readonly stopping?: () => boolean;
+  /** Read-only coverage observation never authorizes historical replay. */
+  readonly observeBlindTurn?: (jobId: string, sessionFile: string | null) => void;
 }
 
 /** The incomplete-attempt disposition when the terminal branch examined
@@ -377,6 +379,16 @@ export function observePendingRebriefs(
       const group = deps.ledger.listPendingRebriefs({ jobId });
       expected = group;
       examined += group.length;
+      if (deps.observeBlindTurn !== undefined) {
+        // Observe retained access evidence, not an invented new legacy turn.
+        // Only an exact recorded primary minion/session for this job is read;
+        // coverage observation cannot settle debt or confer work permission.
+        const minions = deps.ledger.listImplementerMinions(jobId);
+        const sessions = new Set(group.flatMap((marker) => marker.sessionFile !== null &&
+          minions.some((agent) => agent.id === marker.agentId && agent.sessionFile === marker.sessionFile)
+          ? [marker.sessionFile] : []));
+        for (const file of sessions) deps.observeBlindTurn(jobId, file);
+      }
       const identityMarker = group.find((marker) => marker.kind === 'silas.rebrief');
       if (identityMarker !== undefined && deps.ledger.recoveryOwnerBasis('rebrief', identityMarker.id).owned) {
         surfaceRecoveryOwnerTransfer(deps, 'rebrief', identityMarker.id);

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createServer, type Server as HttpServer } from 'node:http';
@@ -12,10 +12,12 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { loadConfig, DEFAULT_SILAS_CONFIG } from '../src/config.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { withNativeDirectiveFixture } from './helpers/directive-native-fixture.js';
+import { inspectDirectiveCheckpoint } from '../src/runtime/directive-checkpoint.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
 import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
+import { admitBlindReview, blindCoverageOf, observeBlindSessionAccess, recordBlindAdmission, BLIND_ACCESS_EVENT } from '../src/dispatch/blind-review.js';
 import { PacingGate, type RetrySettlement } from '../src/runtime/pacing.js';
 import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
 import { NotificationCenter } from '../src/notifications/center.js';
@@ -42,6 +44,17 @@ import { originHeadProbe } from './helpers/pr-head-probe.js';
 
 const TOKEN = 'test-token-éphémeral';
 const PR_URL = 'https://git.example.invalid/fixture-owner/fixture-app/pull/5';
+
+function admitJobAsBlind(ledger: LedgerApi, jobId: string): void {
+  const targetSha = 'f'.repeat(40);
+  const admission = admitBlindReview({
+    ledger, jobId, title: 'review (blind)', deliverable: 'review',
+    briefing: 'Review the immutable package read-only.', targetSha, repoName: 'fixture',
+    inputPackage: { baseSha: 'a'.repeat(40), targetSha, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] },
+  });
+  if (admission === null) throw new Error(`job "${jobId}" was not admitted as a blind review`);
+  recordBlindAdmission(ledger, jobId, admission);
+}
 
 const cleanupDirs: string[] = [];
 const cleanupRepos: FixtureRepo[] = [];
@@ -85,6 +98,9 @@ async function boot(opts: {
   retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
   /** Provider pacing: worker gate forwarded to the silas routes. */
   workerGate?: PacingGate;
+  observeBlindTurn?: (jobId: string, sessionFile: string | null) => void;
+  /** The actual native fixture path, not a second unrelated fake transcript. */
+  minionPromptEffect?: (text: string, sessionFile: string) => void;
 } = {}): Promise<ServerHarness & { wave: WaveRunner }> {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-dispatch-server-'));
   cleanupDirs.push(dir);
@@ -115,6 +131,7 @@ async function boot(opts: {
     spawns.push({ role, options: options ?? {} });
     if (role === 'perkins') return hybrid.spawner(role, options);
     const id = options?.resumeFile === undefined ? `agent-${spawns.length}` : options.agentId ?? `agent-${spawns.length}`;
+    const nativeFile = options?.resumeFile ?? join(dir, 'native-sessions', `${id}.jsonl`);
     let turnHealth: 'idle' | 'error' = 'idle';
     return withNativeDirectiveFixture({
       role,
@@ -129,6 +146,7 @@ async function boot(opts: {
         if (gate !== undefined) await gate;
         // idempotent per prompt: a fresh file per turn, so a second minion
         // turn on the same lane (silas re-brief) always has a commit to make.
+        opts.minionPromptEffect?.(text, nativeFile);
         const file = join(options.cwd, `http-deliverable-${id}-${minionTurnTexts.length}.txt`);
         writeFileSync(file, 'review me\n');
         execFileSync('git', ['-C', options.cwd, 'add', file]);
@@ -157,7 +175,7 @@ async function boot(opts: {
         // itself; record it so tests can assert the cleanup ran.
         if (role === 'minion') disposedHandles.push(id);
       },
-    }, options?.resumeFile ?? join(dir, 'native-sessions', `${id}.jsonl`), (state) => { if (ledger.getAgent(id) !== null) ledger.setAgentState(id, state); }, options?.cwd === undefined ? undefined : () => execFileSync('git', ['-C', options.cwd!, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(), options?.cwd);
+    }, nativeFile, (state) => { if (ledger.getAgent(id) !== null) ledger.setAgentState(id, state); }, options?.cwd === undefined ? undefined : () => execFileSync('git', ['-C', options.cwd!, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(), options?.cwd);
   };
   const dispatch = new DispatchService({ ledger, worktrees, spawner });
   const minionPrompts: string[] = [];
@@ -198,6 +216,7 @@ async function boot(opts: {
     ...(opts.log !== undefined ? { log: opts.log } : {}),
     ...(opts.retrySettlement !== undefined ? { retrySettlement: opts.retrySettlement } : {}),
     ...(opts.workerGate !== undefined ? { workerGate: opts.workerGate } : {}),
+    ...(opts.observeBlindTurn !== undefined ? { observeBlindTurn: opts.observeBlindTurn } : {}),
     ...(opts.silasOps === false
       ? {}
       : {
@@ -278,6 +297,20 @@ async function waitForDelivery(h: ServerHarness, jobId: string): Promise<void> {
   expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).not.toBeNull();
 }
 
+
+async function awaitBlindNativeCessation(h: { ledger: LedgerApi }, jobId: string, requestId: string) {
+  await vi.waitFor(() => {
+    expect(h.ledger.latestJobEventByRequestId(jobId, 'silas.directive-producer-ceased', requestId)).not.toBeNull();
+    expect(h.ledger.latestJobEvent(jobId, BLIND_ACCESS_EVENT)).not.toBeNull();
+  }, { timeout: 10_000, interval: 10 });
+  const row = h.ledger.getDirective(requestId);
+  if (row == null || row.nativeTarget === null) throw new Error('blind continuation lacks its actual native target');
+  expect(row.nativeBinding).not.toBeNull();
+  expect(inspectDirectiveCheckpoint(row.nativeTarget.sessionFile, h.ledger.directiveTurnIdentity(requestId))).toMatchObject({
+    state: 'unknown', reason: 'native checkpoint has a malformed or duplicate entry identity',
+  });
+  return row;
+}
 
 async function awaitDirectiveRecovery(h: { ledger: LedgerApi }, requestId: string, needle: string) {
   const deadline = Date.now() + 10_000;
@@ -1609,6 +1642,72 @@ describe('dispatch server (E8)', () => {
     } finally {
       await h.close();
     }
+  });
+
+  it('/api/silas/rebrief observes the actual native session and preserves contaminated UNKNOWN debt (issue #339 P4)', async () => {
+    let contaminate = false;
+    let ledgerRef: LedgerApi | null = null;
+    const h = await boot({
+      minionPromptEffect: (_text, file) => {
+        if (contaminate) appendFileSync(file, `${JSON.stringify({ type: 'message', message: { role: 'toolResult', toolName: 'bash', content: 'docs/issues/305-review.md:1:prior assessment' } })}\n`);
+      },
+      observeBlindTurn: (jobId, file) => { if (ledgerRef !== null) observeBlindSessionAccess(ledgerRef, jobId, file); },
+    });
+    ledgerRef = h.ledger;
+    const repo = makeFixtureRepo('fixture-silas-rebrief-blind'); cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', { job_id: 'reb-blind', repo_path: repo.path, title: 'blind lane', briefing: 'b' }, TOKEN);
+      await waitForDelivery(h, 'reb-blind');
+      admitJobAsBlind(h.ledger, 'reb-blind');
+      expect(blindCoverageOf(h.ledger, 'reb-blind')).toMatchObject({ state: 'qualifying', accessObserved: false });
+      contaminate = true;
+      const res = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: 'reb-blind', note: 'try again' }, TOKEN);
+      expect(res.status).toBe(202);
+      const requestId = field<string>(res.json, 'request_id');
+      const debt = await awaitBlindNativeCessation(h, 'reb-blind', requestId);
+      expect(debt.state).toBe('admitted'); expect(debt.deliverySeq).toBeNull();
+      // A bare toolResult is deliberately NOT a valid SDK completion. It
+      // still invalidates blind coverage after the real fixture prompt;
+      // neither the scanner nor disposal can upgrade it into delivery.
+      expect(h.ledger.latestJobEvent('reb-blind', BLIND_ACCESS_EVENT)).not.toBeNull();
+      expect(blindCoverageOf(h.ledger, 'reb-blind')).toMatchObject({
+        state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
+      });
+      expect(h.ledger.listJobEvents('reb-blind').filter((event) => event.kind === 'job.delivered' &&
+        (event.payload as { request_id?: string }).request_id === requestId)).toHaveLength(0);
+    } finally { await h.close(); }
+  });
+
+  it('/api/silas/directive observes the actual resumed native session without promoting malformed completion (issue #339 D1)', async () => {
+    let contaminate = false;
+    let ledgerRef: LedgerApi | null = null;
+    const h = await boot({
+      minionPromptEffect: (_text, file) => {
+        if (contaminate) appendFileSync(file, `${JSON.stringify({ type: 'message', message: { role: 'toolResult', toolName: 'bash', content: 'docs/issues/305-review.md:1:prior assessment' } })}\n`);
+      },
+      observeBlindTurn: (jobId, file) => { if (ledgerRef !== null) observeBlindSessionAccess(ledgerRef, jobId, file); },
+    });
+    ledgerRef = h.ledger;
+    const repo = makeFixtureRepo('fixture-silas-directive-blind'); cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', { job_id: 'dir-blind', repo_path: repo.path, title: 'blind lane', briefing: 'b' }, TOKEN);
+      await waitForDelivery(h, 'dir-blind');
+      admitJobAsBlind(h.ledger, 'dir-blind'); h.ledger.setJobStatus('dir-blind', 'in-review');
+      expect(blindCoverageOf(h.ledger, 'dir-blind')).toMatchObject({ state: 'qualifying', accessObserved: false });
+      contaminate = true;
+      const res = await call(h.port, 'POST', '/api/silas/directive', {
+        job_id: 'dir-blind', directive: 'Continue the review.', blocker_fingerprint: 'correctness::blind::resume',
+      }, TOKEN);
+      expect(res.status).toBe(202);
+      const requestId = field<string>(res.json, 'request_id');
+      const debt = await awaitBlindNativeCessation(h, 'dir-blind', requestId);
+      expect(debt.state).toBe('admitted'); expect(debt.deliverySeq).toBeNull();
+      expect(blindCoverageOf(h.ledger, 'dir-blind')).toMatchObject({
+        state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
+      });
+      expect(h.ledger.listJobEvents('dir-blind').filter((event) => event.kind === 'job.delivered' &&
+        (event.payload as { request_id?: string }).request_id === requestId)).toHaveLength(0);
+    } finally { await h.close(); }
   });
 
   it("/api/silas/rebrief accepts durably before a bounded retry refusal, with concrete recovery debt", async () => {

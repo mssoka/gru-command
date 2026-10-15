@@ -77,6 +77,13 @@ export interface DirectiveRoutingDeps {
    * only for 'none'/'recovered'; the worker lease is released before the
    * wait so the retry can reacquire admission. Absent = no interlock. */
   readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
+  /** Issue #339: observe a directive-continued blind reviewer session so a
+   * prohibited read during the continuation invalidates blind coverage
+   * exactly like the dispatch, re-brief and restart-recovery settle seams.
+   * Forwarded by the caller (the production observer is read-only and owns its
+   * own error boundary); absent = no observation (non-review directives,
+   * tests). */
+  readonly observeBlindTurn?: (jobId: string, sessionFile: string | null) => void;
 }
 
 function verdictFields(verdict: PromptTurnVerdict): { readonly outcome: 'completed' | 'error'; readonly error?: string } {
@@ -183,6 +190,9 @@ export async function routeFixDirectiveToMinion(
     }
     minions = [];
   }
+  // Observe the actual physical continuation, never its cancellation race.
+  const observe = (sessionFile: string | null): void =>
+    input.observeBlindTurn?.(input.jobId, sessionFile);
   let evictedSessionFile: string | null = null;
   for (const minion of minions) {
     const handle = input.registry.getHandle(minion.id);
@@ -208,6 +218,7 @@ export async function routeFixDirectiveToMinion(
       }
       let promptError: unknown = null;
       let verdict: PromptTurnVerdict | null = null;
+      let observation: Promise<void> = Promise.resolve();
       try {
         // A refusal before prompt is positive no-admission proof, not a
         // prompt error eligible for retry recovery. It must still release
@@ -216,8 +227,11 @@ export async function routeFixDirectiveToMinion(
         guard();
         nativeAttempted = true;
         input.onPrepared?.(handle);
+        const run = runObservedPrompt(handle, directive, input.signal, owner, () =>
+          observe(handle.sessionFile), input.directiveTurn);
+        observation = run.observation;
         try {
-          verdict = await racedPrompt(handle, directive, input.signal, owner, input.directiveTurn);
+          verdict = await run.verdict;
         } catch (error) {
           promptError = error;
         }
@@ -226,6 +240,11 @@ export async function routeFixDirectiveToMinion(
         lease?.release();
         lease = null;
       }
+      // Issue #339 (D1 physical tail): observe the ACTUAL started prompt's
+      // session before any disposition branch. Cancellation returns the race
+      // first while the physical prompt is still running, and a directive turn
+      // has no automatic retry to heal a prohibited read appended afterwards.
+      if (!input.signal.aborted) await observation;
       if (promptError instanceof WorkerDisposalInProgressError) {
         // A resident-budget reclaim may be disposing this handle under us
         // (typed handshake): settle any automatic retry covering it BEFORE
@@ -359,15 +378,25 @@ export async function routeFixDirectiveToMinion(
     guard(handle);
     nativeAttempted = true;
     input.onPrepared?.(handle);
+    const continuationSessionFile = handle.sessionFile;
+    let observation: Promise<void> = Promise.resolve();
     try {
-      verdict = await racedPrompt(handle, prompt, input.signal, owner, input.directiveTurn);
-    } catch (error) {
-      promptError = error;
+      const run = runObservedPrompt(handle, prompt, input.signal, owner, () =>
+        observe(continuationSessionFile), input.directiveTurn);
+      observation = run.observation;
+      try {
+        verdict = await run.verdict;
+      } catch (error) {
+        promptError = error;
+      }
     } finally {
       // Release before the settlement wait: the retry reacquires the slot.
       lease?.release();
       lease = null;
     }
+    // Issue #339 (D1 physical tail): observe the ACTUAL started prompt's
+    // session before any disposition branch (see the live path above).
+    if (!input.signal.aborted) await observation;
     const disposition = await settleRetries(input.retrySettlement, handle.id, input.signal);
     if (disposition === 'cancelled') {
       // The prompt call already ran on the fresh minion: UNKNOWN admission.
@@ -407,25 +436,53 @@ export async function routeFixDirectiveToMinion(
   return result;
 }
 
-/** Race a prompt against cancellation so shutdown cannot stall on an
- * in-flight fix-directive turn, carrying the settled turn's captured
- * terminal verdict through the race. */
-function racedPrompt(
+/**
+ * Run ONE directive continuation prompt and hand the caller both the raced
+ * verdict (cancellation returns promptly) and the OBSERVATION lifetime of the
+ * ACTUAL started prompt (issue #339 D1 physical tail).
+ *
+ * The naive race of the real prompt against cancellation has no
+ * physical-completion observer: an abort returns promptly with admission
+ * UNKNOWN while the real prompt keeps running, and a directive turn has no
+ * automatic retry to heal a prohibited read it appends afterwards. The
+ * observation therefore follows the PHYSICAL prompt promise, not the race /
+ * logical disposition: it fires whether the prompt resolves, rejects, is
+ * superseded, or is still running after an abort.
+ *
+ * A pre-aborted call starts NO prompt and observes nothing (never a fabricated
+ * started-turn observation). The returned `observation` never rejects (the
+ * observer port owns its own error boundary), so awaiting it is safe and
+ * never introduces an unhandled rejection.
+ */
+function runObservedPrompt(
   handle: Pick<AgentHandle, 'prompt' | 'health'> & Partial<Pick<AgentHandle, 'promptWithVerdict'>>,
   text: string,
   signal: AbortSignal,
   owner: string,
+  observe: () => void,
   directive?: PromptOptions['directive'],
-): Promise<PromptTurnVerdict> {
-  if (signal.aborted) return Promise.reject(new Error('review operation aborted'));
-  return Promise.race([
-    promptWithTerminalVerdict(handle, text, { owner, ...(directive !== undefined ? { directive } : {}) }),
-    new Promise<never>((_resolve, reject) => {
-      signal.addEventListener('abort', () => reject(new Error('review operation aborted')), { once: true });
-    }),
-  ]);
+): { readonly verdict: Promise<PromptTurnVerdict>; readonly observation: Promise<void> } {
+  if (signal.aborted) {
+    return { verdict: Promise.reject(new Error('review operation aborted')), observation: Promise.resolve() };
+  }
+  const physical = promptWithTerminalVerdict(handle, text, { owner, ...(directive !== undefined ? { directive } : {}) });
+  const observation = physical.then(
+    () => observe(),
+    () => observe(),
+  ).then(
+    () => undefined,
+    () => undefined,
+  );
+  return {
+    verdict: Promise.race([
+      physical,
+      new Promise<never>((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(new Error('review operation aborted')), { once: true });
+      }),
+    ]),
+    observation,
+  };
 }
-
 /**
  * The follow-up delivery signal (the loop's close, not a blind re-fire):
  * a settled directive or re-brief minion turn IS the implementing minion's
@@ -630,6 +687,14 @@ export async function rebriefFreshMinion(
     /** Recheck request ownership and terminality at the last asynchronous
      * admission boundaries; a running prompt is allowed to settle. */
     beforeTurnSideEffect?: () => void;
+    /** Issue #339: observe the settled continuation session's tool access so
+     * a prohibited read during a resume/re-brief invalidates blind coverage
+     * exactly like one at the first briefing. Runs on EVERY post-settlement
+     * exit (the in-band-error return, the successful return, AND the
+     * cancelled/exhausted/superseded failure exits). The observer owns its
+     * own error handling (a bookkeeping failure must not fail a turn); absent
+     * = no observation (non-review re-briefs, tests). */
+    observeBlindTurn?: (jobId: string, sessionFile: string | null) => void;
   },
 ): Promise<{
   minionId: string;
@@ -742,7 +807,32 @@ export async function rebriefFreshMinion(
     // rate-limited turn whose bounded retry is still carrying the prompt
     // must not land the re-brief/delivery markers early, and a rejection
     // whose retry recovers is a delivery, not a failure.
-    const disposition = await settleRetries(input.retrySettlement, handle.id, input.signal);
+    let disposition: RetrySettlement | 'cancelled' = 'none';
+    const abandonedSettlements: Promise<void>[] = [];
+    try {
+      disposition = await settleRetries(input.retrySettlement, handle.id, input.signal, (abandoned) => {
+        abandonedSettlements.push(abandoned);
+      });
+    } finally {
+      // Issue #339: observe the settled continuation turn's own tool results
+      // at THIS settle seam on EVERY post-settlement exit — including the
+      // failure exits below AND a settlement-hook fault (a named
+      // RetrySettlementUnavailableError propagates only after this runs).
+      // Running it before the cancelled/exhausted/superseded throws keeps a
+      // failed continuation from leaving unscanned prohibited reads behind
+      // (only a future successful resume would otherwise heal it).
+      // `handle.sessionFile` is the resumed session (the whole file,
+      // cumulative), read-only with respect to the review inputs. The
+      // observer owns its error handling (a bookkeeping failure must not fail
+      // a delivered turn).
+      input.observeBlindTurn?.(input.jobId, handle.sessionFile);
+      for (const abandoned of abandonedSettlements) {
+        // Issue #339: cancellation won the race before the retry turn
+        // settled; it can still append prohibited reads AFTER the scan just
+        // above, so chain a FINAL observation onto the abandoned settlement.
+        void abandoned.then(() => input.observeBlindTurn?.(input.jobId, handle.sessionFile));
+      }
+    }
     if (disposition === 'cancelled') {
       throw new Error(`re-brief turn on ${handle.id} was cancelled before its automatic retries settled`);
     }
