@@ -1473,7 +1473,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         current_approved_authority: marker === undefined ? null : options.ledger.directiveCurrentAuthority(marker.jobId),
         recovery_subject_sha256: marker === undefined ? null : options.ledger.recoverySubject('rebrief', markerId).snapshotSha256,
         current_authority_epoch: marker === undefined ? null : options.ledger.directiveRecoveryEpoch(marker.jobId),
-        recovery_obligation: marker === undefined ? null : options.ledger.listObligations({ jobId: marker.jobId }).find((debt) => debt.incidentKey === `rebrief-recovery:${markerId}`) ?? null });
+        recovery_obligation: marker === undefined ? null : options.ledger.recoveryObligation(marker.jobId, 'rebrief', markerId) });
       return true;
     }
     const ownerResolution = /^\/api\/silas\/(directives|rebriefs)\/([^/]+)\/owner-resolution(?:\/(confirm-stop))?$/.exec(path);
@@ -1733,7 +1733,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         recovery_decision: record.recoveryDecision,
         recovery_owner: options.ledger.recoveryOwnerReadback('directive', requestId),
         recovery_subject_sha256: options.ledger.recoverySubject('directive', requestId).snapshotSha256,
-        recovery_obligation: options.ledger.listObligations({ jobId: record.jobId }).find((debt) => debt.incidentKey === `directive-recovery:${record.requestId}`) ?? null,
+        recovery_obligation: options.ledger.recoveryObligation(record.jobId, 'directive', record.requestId),
         ...(record.state === 'retired'
           ? {
               admission_class: directiveAdmissionClass(record),

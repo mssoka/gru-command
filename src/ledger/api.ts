@@ -7625,8 +7625,8 @@ export class LedgerApi {
       for (const predecessor of predecessors) this.settleDirectiveRecoveryDebt(str(predecessor.request_id), sent.seq, 'silas.directive-sent');
       const rebriefs = this.db.prepare('SELECT marker_id FROM rebrief_recovery_decisions WHERE successor_id = ?').all(row.requestId) as Row[];
       for (const marker of rebriefs) {
-        const debt = this.listObligations({ jobId: row.jobId }).find((debt) => debt.incidentKey === `rebrief-recovery:${str(marker.marker_id)}` && (debt.state === 'open' || debt.state === 'waiting'));
-        if (debt !== undefined) {
+        const debt = this.recoveryObligation(row.jobId, 'rebrief', str(marker.marker_id));
+        if (debt !== null && (debt.state === 'open' || debt.state === 'waiting')) {
           this.settleObligation({ obligationId: debt.id, settlement: { kind: 'executed-action', action: 'actual rebrief recovery successor admission', evidenceEventSeq: sent.seq, evidenceEventKind: sent.kind } });
           const card = this.findNotificationByKind(`silas.rebrief-unreconciled.${row.jobId}`, 'active');
           if (card?.routing === 'action-required') this.resolveNotificationById(card.id, 'rebrief-recovery-evidence');
@@ -8032,6 +8032,12 @@ export class LedgerApi {
     return parked;
   }
 
+  /** Exact live recovery identity, including owner-suspended debt. A bounded
+   * UI history page is not an identity lookup or a generation fence. */
+  recoveryObligation(jobId: string, kind: RecoverySubjectKind, subjectId: string): ObligationRecord | null {
+    return this.activeIncarnation(jobId, 'operation', `${kind}-recovery:${subjectId}`);
+  }
+
   openDirectiveRecoveryDebt(requestId: string, reason: string): ObligationRecord {
     const row = this.getDirective(requestId);
     if (row === null || isDirectiveTerminal(row.state)) throw new DirectiveCheckpointError('only live directive requests owe recovery judgment');
@@ -8054,7 +8060,8 @@ export class LedgerApi {
     const delivery = eventKind === 'job.delivered' && (payload?.request_id === row.requestId && row.deliverySeq === eventSeq || successor !== null && payload?.request_id === successor.requestId && successor.deliverySeq === eventSeq);
     const owner = eventKind === 'silas.directive-recovery-decided' && row.recoveryDecision?.eventSeq === eventSeq && row.recoveryDecision.successorId === null && payload?.decision?.kind === 'owner-decision';
     if (event?.jobId !== row.jobId || event.kind !== eventKind || (!admission && !delivery && !owner)) throw new DirectiveCheckpointError('recovery debt requires actual correlated successor admission, completion or a consumed reserved-owner decision');
-    for (const debt of this.listObligations({ jobId: row.jobId }).filter((debt) => debt.incidentKey === `directive-recovery:${requestId}` && (debt.state === 'open' || debt.state === 'waiting'))) {
+    const debt = this.recoveryObligation(row.jobId, 'directive', requestId);
+    if (debt !== null && (debt.state === 'open' || debt.state === 'waiting')) {
       this.settleObligation({ obligationId: debt.id, settlement: { kind: 'executed-action', action: 'directive recovery handoff/completion or reserved owner decision', evidenceEventSeq: eventSeq, evidenceEventKind: eventKind } });
     }
     const card = this.findNotificationByKind(`silas.directive-unreconciled.${requestId}`, 'active');
@@ -8127,8 +8134,8 @@ export class LedgerApi {
       const row = this.getDirective(input.requestId);
       if (row === null) throw new RecordNotFound(`directive request "${input.requestId}" not found`);
       if (this.recoveryDecisionHistory('directive', row.requestId).some((entry) => entry.generation === input.generation)) return null;
-      const debt = this.listObligations({ jobId: row.jobId }).find((entry) => entry.incidentKey === `directive-recovery:${row.requestId}` && ['open', 'waiting'].includes(entry.state));
-      if (debt?.generation !== input.generation || row.payloadHash !== input.expectedPayloadHash || this.directiveRecoveryEpoch(row.jobId) !== input.expectedEpoch ||
+      const debt = this.recoveryObligation(row.jobId, 'directive', row.requestId);
+      if (debt?.state === 'suspended' || debt?.generation !== input.generation || row.payloadHash !== input.expectedPayloadHash || this.directiveRecoveryEpoch(row.jobId) !== input.expectedEpoch ||
           input.expectedHead !== input.lane.resolvedHead || !input.reason.trim()) throw new DirectiveCheckpointError('recovery generation/hash/head/epoch decision is stale or incomplete');
       const job = this.getJob(row.jobId);
       if (job === null || isJobTerminal(job.status) || isDirectiveTerminal(row.state)) throw new DirectiveCheckpointError('terminal work cannot be revived by recovery');
@@ -8152,9 +8159,9 @@ export class LedgerApi {
     if (group.length !== 2 || !group.some((entry) => entry.kind === 'silas.rebrief') || !group.some((entry) => entry.kind === 'job.delivered') ||
         !group.every((entry) => entry.payloadHash === marker.payloadHash && entry.baselineSeq === marker.baselineSeq && entry.phaseId === marker.phaseId)) throw new DirectiveCheckpointError('legacy rebrief marker generation is incoherent — explicit owner evidence repair required');
     if (this.rebriefReceiptEvidence(marker.id).sha256 !== input.expectedReceiptEvidenceSha256) throw new DirectiveCheckpointError('legacy receipt evidence changed — read the exact generation again before judging');
-    const debt = this.listObligations({ jobId: marker.jobId }).find((entry) => entry.incidentKey === `rebrief-recovery:${marker.id}` && ['open', 'waiting'].includes(entry.state));
+    const debt = this.recoveryObligation(marker.jobId, 'rebrief', marker.id);
     const job = this.getJob(marker.jobId);
-    if (debt?.generation !== input.generation || marker.payloadHash !== input.expectedPayloadHash || this.directiveRecoveryEpoch(marker.jobId) !== input.expectedEpoch ||
+    if (debt?.state === 'suspended' || debt?.generation !== input.generation || marker.payloadHash !== input.expectedPayloadHash || this.directiveRecoveryEpoch(marker.jobId) !== input.expectedEpoch ||
         input.expectedHead !== input.lane.resolvedHead || !input.reason.trim() || job === null || isJobTerminal(job.status)) throw new DirectiveCheckpointError('legacy rebrief decision is stale, terminal or incomplete');
     const owner = this.recoveryOwnerBasis('rebrief', marker.id);
     if (owner.changed && !owner.confirmed) throw new DirectiveCheckpointError('governing owner stop has no genuine confirmed resolution — fresh work remains forbidden');
@@ -8189,8 +8196,8 @@ export class LedgerApi {
           !group.every((row) => row.payloadHash === marker.payloadHash && row.baselineSeq === marker.baselineSeq && row.phaseId === marker.phaseId))) throw new DirectiveCheckpointError('legacy rebrief marker generation is incoherent — explicit owner evidence repair required');
       const receiptEvidence = this.rebriefReceiptEvidence(input.markerId);
       if (receiptEvidence.sha256 !== input.expectedReceiptEvidenceSha256) throw new DirectiveCheckpointError('legacy receipt evidence changed — read the exact generation again before judging');
-      const debt = this.listObligations({ jobId: marker.jobId }).find((debt) => debt.incidentKey === `rebrief-recovery:${input.markerId}` &&
-        (debt.state === 'open' || debt.state === 'waiting' || input.decision.kind !== 'successor' && debt.state === 'suspended'));
+      const currentDebt = this.recoveryObligation(marker.jobId, 'rebrief', input.markerId);
+      const debt = currentDebt !== null && (currentDebt.state === 'open' || currentDebt.state === 'waiting' || input.decision.kind !== 'successor' && currentDebt.state === 'suspended') ? currentDebt : null;
       const job = this.getJob(marker.jobId);
       if (!debt || debt.generation !== input.generation || marker.payloadHash !== input.expectedPayloadHash ||
           input.expectedEpoch !== this.directiveRecoveryEpoch(marker.jobId) || input.expectedHead !== input.lane.resolvedHead || !input.reason.trim() ||
@@ -8220,6 +8227,7 @@ export class LedgerApi {
         this.appendEvent({ kind: 'silas.rebrief-recovery-handoff', jobId: marker.jobId, payload: { marker_id: marker.id, request_id: input.decision.requestId } });
         successor = this.beginDirectiveIntent({ jobId: marker.jobId, requestId: input.decision.requestId, directive: input.decision.directive, holder: 'gru-recovery' }).record;
       } else if (input.decision.kind === 'reconcile-completed') {
+        if (ownerBasis.changed && !ownerBasis.confirmed) throw new DirectiveCheckpointError('governing owner stop has no genuine confirmed resolution — current inspection remains forbidden');
         this.assertFreshRecoveryContract(marker.jobId, input.expectedWorkRevision, input.expectedContractSha256);
         const blockers = this.rebriefProgressBlockers(marker.id, input.lane.id);
         if (blockers.length > 0) throw new DirectiveCheckpointError(`completed control closure producer cessation unproven: ${blockers.join('; ')}`);
@@ -8292,8 +8300,8 @@ export class LedgerApi {
         if (prior.fingerprint !== fingerprint) throw new DirectiveCheckpointError('recovery decision conflicts with the consumed decision');
         return { successor: prior.successorId === null ? null : this.getDirective(prior.successorId), idempotent: true };
       }
-      const debt = this.listObligations({ jobId: row.jobId }).find((debt) => debt.incidentKey === `directive-recovery:${row.requestId}` &&
-        (debt.state === 'open' || debt.state === 'waiting' || input.decision.kind === 'owner-decision' && debt.state === 'suspended'));
+      const currentDebt = this.recoveryObligation(row.jobId, 'directive', row.requestId);
+      const debt = currentDebt !== null && (currentDebt.state === 'open' || currentDebt.state === 'waiting' || input.decision.kind === 'owner-decision' && currentDebt.state === 'suspended') ? currentDebt : null;
       if (!debt || debt.generation !== input.generation || row.payloadHash !== input.expectedPayloadHash ||
           this.directiveRecoveryEpoch(row.jobId) !== input.expectedEpoch || input.expectedHead !== input.lane.resolvedHead || !input.reason.trim()) throw new DirectiveCheckpointError('recovery generation/hash/head/epoch decision is stale or incomplete');
       const job = this.getJob(row.jobId);

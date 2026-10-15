@@ -2205,6 +2205,79 @@ describe('legacy proven completion without fabricated historical delivery', () =
     return { h, lane, jobId, markers, marker, original, debt, route, body };
   }
 
+  it('PR334 recovery completed legacy closure cannot bypass a generically closed transferred owner', async () => {
+    const f = await completedFixture(); const { h } = f;
+    h.ledger.setJobStatus(f.jobId, 'parked');
+    const target = h.ledger.recordBlockedObservation(f.jobId, { logicalStep: 'operation', incidentKey: 'exact-transferred-stop',
+      category: { kind: 'known', category: 'owner-hold' }, observedAtSeq: h.ledger.latestEventSeq(),
+      nextAction: { kind: 'owner-decision', decision: 'owner must resolve this exact original recovery subject' } });
+    const transferred = await call(h.port, 'POST', `${f.route}/recover`, { ...f.body(),
+      decision: { kind: 'owner-decision', obligation_id: target.id } }, TOKEN);
+    expect(transferred.status, JSON.stringify(transferred.json)).toBe(200);
+    h.ledger.settleObligation({ obligationId: target.id, settlement: { kind: 'cancelled', reason: 'generic administrative closure, not governing owner resolution' } });
+    h.ledger.setJobStatus(f.jobId, 'working');
+    const debt = h.ledger.openRebriefRecoveryDebt(f.marker.id, 'generic closure cannot grant new current artifact inspection');
+    expect(debt.state).toBe('suspended');
+    expect(h.ledger.recoveryOwnerBasis('rebrief', f.marker.id)).toMatchObject({ owned: false, changed: true, confirmed: false });
+    const markers = h.ledger.listPendingRebriefs({ jobId: f.jobId }); const owner = h.ledger.recoveryOwnerReadback('rebrief', f.marker.id);
+    const watermark = h.ledger.latestEventSeq();
+    const response = await call(h.port, 'POST', `${f.route}/recover`, { ...f.body(), expected_generation: debt.generation,
+      expected_receipt_evidence_sha256: h.ledger.rebriefReceiptEvidence(f.marker.id).sha256 }, TOKEN);
+    expect(response.status, JSON.stringify(response.json)).toBe(409);
+    expect(response.json).toMatchObject({ detail: expect.stringContaining('governing owner') });
+    expect(h.ledger.latestEventSeq()).toBe(watermark); expect(h.ledger.listPendingRebriefs({ jobId: f.jobId })).toEqual(markers);
+    expect(h.ledger.getObligation(debt.id)).toEqual(debt); expect(h.ledger.recoveryOwnerReadback('rebrief', f.marker.id)).toEqual(owner);
+    expect(h.ledger.latestJobEvent(f.jobId, 'silas.rebrief-control-closed')).toBeNull();
+    expect(h.ledger.listObligations({ jobId: f.jobId }).some((item) => item.incidentKey.startsWith('rebrief-current-inspection:'))).toBe(false);
+    expect(h.ledger.latestJobEvent(f.jobId, 'job.delivered')).toBeNull(); expect(h.spawns).toEqual([]);
+  });
+
+  async function assertCurrentRecoveryReadback(kind: 'directive' | 'rebrief', beyondPage: boolean) {
+    const h = await boot(); const repo = makeFixtureRepo(`active-recovery-${kind}`); cleanupRepos.push(repo);
+    const jobId = `active-recovery-${kind}`; seedJob(h, jobId); const lane = await seedLane(h, repo, jobId);
+    const subjectId = kind === 'directive'
+      ? h.ledger.beginDirectiveIntent({ jobId, requestId: 'original-readback-directive', directive: 'accepted original work', holder: 'gru' }).record.requestId
+      : h.ledger.beginPendingRebrief({ jobId, note: 'original legacy recovery work', briefing: 'accepted original contract' }).find((row) => row.kind === 'silas.rebrief')!.id;
+    const originalDebt = kind === 'directive' ? h.ledger.openDirectiveRecoveryDebt(subjectId, 'original recovery') : h.ledger.openRebriefRecoveryDebt(subjectId, 'original recovery');
+    if (beyondPage) for (let i = 0; i < 201; i += 1) h.ledger.recordBlockedObservation(jobId, {
+      logicalStep: 'operation', incidentKey: `independent-prefix-${i}`, category: { kind: 'known', category: 'restart-recovery' },
+      observedAtSeq: h.ledger.latestEventSeq(), nextAction: { kind: 'gru-decision', decision: 'independent attention, no work permission' } });
+    writeFileSync(join(lane.path, 'later-approved-input.txt'), 'genuine later isolated original-lane input\n');
+    repo.git(['add', 'later-approved-input.txt'], lane.path);
+    repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'later isolated current input'], lane.path);
+    const observation = h.ledger.appendCustomEvent({ kind: 'job.original-lane-head-observed', jobId, payload: { sha: laneHead(lane) } });
+    const changed = h.ledger.invalidateStaleContinuations({ jobId, newerThanSeq: observation.seq, reason: 'genuine later isolated original-lane HEAD re-derives attention without old authority' });
+    const next = changed.successors.find((item) => item.incidentKey === originalDebt.incidentKey)!;
+    expect(next.id).not.toBe(originalDebt.id); expect(next.generation).toBeGreaterThan(originalDebt.generation);
+    const current = h.ledger.suspendObligation(next.id, 'exact current recovery remains owned and suspended');
+    expect(h.ledger.getObligation(originalDebt.id)?.state).toBe('closed');
+    if (beyondPage) expect(h.ledger.listObligations({ jobId }).some((item) => item.id === current.id)).toBe(false);
+    const route = `/api/silas/${kind === 'directive' ? 'directives' : 'rebriefs'}/${subjectId}`;
+    const response = await call(h.port, 'GET', route, undefined, TOKEN); expect(response.status).toBe(200);
+    expect(field<ReturnType<LedgerApi['getObligation']>>(response.json, 'recovery_obligation'))
+      .toMatchObject({ id: current.id, generation: current.generation, state: 'suspended' });
+    const target = h.ledger.recordBlockedObservation(jobId, { logicalStep: 'operation', incidentKey: 'current-readback-owner-stop',
+      category: { kind: 'known', category: 'owner-hold' }, observedAtSeq: h.ledger.latestEventSeq(),
+      nextAction: { kind: 'owner-decision', decision: 'owner takes only this exact suspended current recovery debt' } });
+    const authority = h.ledger.directiveCurrentAuthority(jobId);
+    const payloadHash = kind === 'directive' ? h.ledger.getDirective(subjectId)!.payloadHash
+      : h.ledger.listPendingRebriefs({ jobId }).find((item) => item.id === subjectId)!.payloadHash;
+    const decision = await call(h.port, 'POST', `${route}/recover`, { by: 'gru', expected_generation: current.generation,
+      expected_payload_hash: payloadHash, expected_head: laneHead(lane), expected_epoch: h.ledger.directiveRecoveryEpoch(jobId),
+      expected_work_revision: authority.workRevision, expected_contract_sha256: authority.contractSha256,
+      ...(kind === 'rebrief' ? { expected_receipt_evidence_sha256: h.ledger.rebriefReceiptEvidence(subjectId).sha256 } : {}),
+      reason: 'transfer the actual current readback generation without starting work',
+      decision: { kind: 'owner-decision', obligation_id: target.id } }, TOKEN);
+    expect(decision.status, JSON.stringify(decision.json)).toBe(200);
+    expect(h.ledger.getObligation(current.id)?.state).toBe('closed'); expect(h.ledger.getObligation(target.id)?.state).toBe('open');
+    expect(h.ledger.recoveryOwnerBasis(kind, subjectId).owned).toBe(true);
+    expect(h.spawns).toEqual([]); expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
+  }
+  it('PR334 recovery directive GET selects the active suspended incarnation instead of older closed debt', () => assertCurrentRecoveryReadback('directive', false));
+  it('PR334 recovery legacy GET selects the active suspended incarnation instead of older closed debt', () => assertCurrentRecoveryReadback('rebrief', false));
+  it('PR334 recovery directive GET and owner decision reach the exact generation beyond default pagination', () => assertCurrentRecoveryReadback('directive', true));
+  it('PR334 recovery legacy GET and owner decision reach the exact generation beyond default pagination', () => assertCurrentRecoveryReadback('rebrief', true));
+
   async function verifiedCurrentGateFixture(noDirectiveChanges = false) {
     const f = await completedFixture(true, noDirectiveChanges); const { h } = f;
     expect((await call(h.port, 'POST', `${f.route}/recover`, f.body(), TOKEN)).status).toBe(200);
