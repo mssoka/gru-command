@@ -126,9 +126,10 @@ that durable event — restarts included), the lane no
 longer reads as stopped — its supervision record is retired in-process and
 durably alike — and the fresh re-brief or directive is supervised as a new
 watching record. The event is written first — a failed write refuses and
-changes nothing — with `notification_id`, `job_id`, `captured_epoch`,
-`current_epoch`, `producer_changed`, `had_open_turn`, `prompt_named` and
-`stop_reason`. Any other fence (an active park, a hold, a live producer, a
+changes nothing — with `notification_id` and `job_id` (strings),
+`captured_epoch` and `current_epoch` (integers), `producer_changed`,
+`had_open_turn` and `prompt_named` (booleans) and `stop_reason` (string);
+once it lands the closure stands, and it is never recorded twice. Any other fence (an active park, a hold, a live producer, a
 live handle or restart, an unreadable authority) still refuses with the
 debt retained. A
 service restart also resets breaker state (in-memory by design) — the

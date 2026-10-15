@@ -3196,7 +3196,9 @@ export class Supervisor {
 
   /** Records the closure DURABLY first — a failed append throws and leaves
    * the stop exactly as it was — then retires the supervision record
-   * in-process, so memory and the ledger can never disagree. */
+   * in-process. Once the append has landed the closure stands: retirement
+   * always removes the record (cleanup failures are logged, never rethrown),
+   * and an already-recorded closure is never appended twice. */
   private closeSupersededStop(
     agent: SupervisedAgent,
     notificationId: string,
@@ -3204,7 +3206,7 @@ export class Supervisor {
   ): void {
     const recovery = agent.pendingRecovery;
     const stopReason = `stop closed: its captured turn was superseded on job "${closure.jobId}" — it will never replay; continue the lane with a fresh re-brief or directive`;
-    this.ledger.appendCustomEvent({
+    if (!this.ledger.hasSupervisionStopSuperseded(notificationId)) this.ledger.appendCustomEvent({
       kind: 'supervision.stop-superseded',
       agentId: agent.agentId,
       jobId: closure.jobId,
@@ -3224,13 +3226,18 @@ export class Supervisor {
     // — so the lane no longer reads as stopped and a fresh re-brief/directive
     // adopts a new watching record instead of being disposed and re-alerted.
     // Only a job minion with no live handle and no restart rung gets here.
-    if (agent.backoffTimer !== null) clearTimeout(agent.backoffTimer);
-    agent.backoffTimer = null;
-    this.clearRateLimitRetry(agent, 'superseded');
-    this.clearRecoveryAdmission(agent);
-    this.agents.delete(agent.agentId);
-    this.restoredStops.delete(agent.agentId);
-    this.restoredRearmControls.delete(agent.agentId);
+    try {
+      if (agent.backoffTimer !== null) clearTimeout(agent.backoffTimer);
+      agent.backoffTimer = null;
+      this.clearRateLimitRetry(agent, 'superseded');
+      this.clearRecoveryAdmission(agent);
+    } catch (error) {
+      this.log('error', 'superseded stop retirement cleanup failed — the closure stands', { agent_id: agent.agentId, error: String(error) });
+    } finally {
+      this.agents.delete(agent.agentId);
+      this.restoredStops.delete(agent.agentId);
+      this.restoredRearmControls.delete(agent.agentId);
+    }
     this.log('info', 'breaker stop closed as superseded — the stale captured turn never replays', {
       agent_id: agent.agentId,
       job_id: closure.jobId,
@@ -3507,7 +3514,9 @@ export class Supervisor {
     try {
       if (this.ledger.hasSupervisionStopSuperseded(notificationId)) return { ok: true, rearmed: false, superseded: true };
     } catch (error) {
-      return { ok: false, reason: `superseded closure lookup failed: ${String(error)}` };
+      // No stop is bound to this alert either way: a failed lookup only loses
+      // the "superseded" label of a retry, so it never blocks the record.
+      this.log('warn', 'superseded closure lookup failed — reporting a pure record', { notification_id: notificationId, error: String(error) });
     }
     // No stopped breaker is bound to this alert: the disposition is a pure
     // record. Say so — an accepted outcome must never claim a re-arm that
