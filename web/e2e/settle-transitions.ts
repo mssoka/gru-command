@@ -11,8 +11,10 @@ export const SETTLE_PASSES = 60;
  * transitions that keep restarting, fail loud with EVERY culprit named
  * (element, id, classes, pseudo-element and property).
  */
-export async function settleTransitions(page: Page): Promise<void> {
-  await page.evaluate((passes) => {
+export async function settleTransitions(page: Page, passes = SETTLE_PASSES): Promise<void> {
+  // Let transitions a just-committed style change starts on the next frame begin first.
+  await page.evaluate(() => new Promise<void>((resolve) => { requestAnimationFrame(() => { requestAnimationFrame(() => { resolve(); }); }); }));
+  await page.evaluate((limit) => {
     // Running (pending play included) or paused transitions are unsettled;
     // finished and idle ones are done.
     const unsettled = (): CSSTransition[] => document
@@ -26,19 +28,20 @@ export async function settleTransitions(page: Page): Promise<void> {
         : `non-element target (${target === null ? 'none' : String(target)})`;
       return `${element}${effect?.pseudoElement ?? ''} ${t.transitionProperty}`;
     };
-    const failures: string[] = [];
-    for (let pass = 0; pass < passes; pass += 1) {
-      const live = unsettled();
+    // Every pass finishes everything still live; a transition whose finish()
+    // throws is recorded and skipped, so the others still settle.
+    const failed = new Map<CSSTransition, string>();
+    for (let pass = 0; pass < limit; pass += 1) {
+      const live = unsettled().filter((t) => !failed.has(t));
       if (live.length === 0) break;
       for (const transition of live) {
-        try { transition.finish(); } catch (error) { failures.push(`${nameOf(transition)}: ${String(error)}`); }
+        try { transition.finish(); } catch (error) { failed.set(transition, `${nameOf(transition)}: ${String(error)}`); }
       }
-      if (failures.length > 0) break;
     }
-    const stuck = [...new Set(unsettled().map(nameOf))];
-    if (failures.length > 0) {
-      throw new Error(`a CSS transition could not be finished (${failures.join('; ')}); still unsettled: ${stuck.join(', ') || 'none'}`);
+    const stuck = [...new Set(unsettled().filter((t) => !failed.has(t)).map(nameOf))];
+    if (failed.size > 0) {
+      throw new Error(`a CSS transition could not be finished (${[...failed.values()].join('; ')}); other transitions still unsettled: ${stuck.join(', ') || 'none'}`);
     }
-    if (stuck.length > 0) throw new Error(`CSS transitions kept restarting after ${String(passes)} settle passes: ${stuck.join(', ')}`);
-  }, SETTLE_PASSES);
+    if (stuck.length > 0) throw new Error(`CSS transitions kept restarting after ${String(limit)} settle passes: ${stuck.join(', ')}`);
+  }, passes);
 }

@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { isAbsolute, join } from 'node:path';
+import { join } from 'node:path';
 import { expect, test, type FileChooser, type Page } from '@playwright/test';
 import { pickFreePort, startRealService, type RealServiceHandle } from '../../test/helpers/real-service.mjs';
 
@@ -216,7 +216,8 @@ test('real native compact preserves history and New chat starts unresumed behind
     })();
     const record = typeof value === 'object' && value !== null ? value as { sessionFile?: unknown; epoch?: unknown } : null;
     const epoch = record?.epoch;
-    if (record === null || typeof record.sessionFile !== 'string' || !isAbsolute(record.sessionFile) ||
+    // The same shape the product's own loader accepts (src/chat/session-state.ts).
+    if (record === null || typeof record.sessionFile !== 'string' || record.sessionFile === '' ||
         typeof epoch !== 'number' || !Number.isSafeInteger(epoch) || epoch < 0) {
       throw new Error(`malformed chat session pointer ${pointerFile}: ${raw}`);
     }
@@ -237,18 +238,19 @@ test('real native compact preserves history and New chat starts unresumed behind
   // epoch pointer (the write is asynchronous): wait for the durable advance
   // rather than reading once — reading once made this test order/timing
   // sensitive (#402).
-  // A transient read failure is retried; if the pointer is still unreadable
-  // when the poll gives up, that cause is what the failure reports.
+  // A transient read failure is retried. If the poll gives up, the failure
+  // reports the last epoch actually read AND the last read failure seen
+  // (a later successful read does not erase it).
+  let lastEpoch: number | null = null;
   let lastReadError: string | null = null;
   const polledEpoch = (): number | null => {
-    try { const { epoch } = readPointer(); lastReadError = null; return epoch; } catch (error) { lastReadError = String(error); return null; }
+    try { lastEpoch = readPointer().epoch; return lastEpoch; } catch (error) { lastReadError = String(error); return null; }
   };
   const advanced = 'New chat never durably advanced the chat session epoch pointer';
   try {
     await expect.poll(polledEpoch, { message: advanced, timeout: 10_000 }).toBe(oldPointer.epoch + 1);
   } catch (error) {
-    if (lastReadError !== null) throw new Error(`${advanced}; the pointer was last unreadable: ${lastReadError}`, { cause: error });
-    throw error;
+    throw new Error(`${advanced}: last epoch read ${String(lastEpoch)}, expected ${String(oldPointer.epoch + 1)}; last read failure: ${lastReadError ?? 'none'}`, { cause: error });
   }
   const freshPointer = readPointer();
   expect(freshPointer.sessionFile).not.toBe(oldPointer.sessionFile);

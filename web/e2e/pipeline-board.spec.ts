@@ -372,7 +372,7 @@ async function hitTarget(page: Page, selector: string): Promise<HitTarget> {
     if (element === null) return { found: false, inViewport: false, hit: false };
     const rect = element.getBoundingClientRect();
     const topmost = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
-    const sliver = 0.5 / window.devicePixelRatio;
+    const sliver = 0.5 / (window.devicePixelRatio > 0 ? window.devicePixelRatio : 1);
     return {
       found: true,
       inViewport: rect.width > 0 && rect.height > 0 &&
@@ -680,7 +680,7 @@ test.describe('compact owner-first board — synthetic geometry proof', () => {
       '<div id="past-boundary" style="left:230px;top:250.75px;width:20px;height:50px"></div>',
       '<div id="empty" style="left:100px;top:10px;width:0;height:0"></div>',
     ].join(''));
-    expect(await page.evaluate(() => window.devicePixelRatio), 'this proof runs at 1x').toBe(1);
+    expect(await page.evaluate(() => [window.devicePixelRatio, window.innerWidth, window.innerHeight]), 'this proof runs at 1x in 400×300').toEqual([1, 400, 300]);
     expect(await hitTarget(page, '#sliver')).toEqual({ found: true, inViewport: true, hit: true });
     // Exactly half a device pixel past each edge is still contained and hittable.
     for (const id of ['#boundary', '#right-boundary', '#left-boundary', '#top-boundary']) {
@@ -692,6 +692,23 @@ test.describe('compact owner-first board — synthetic geometry proof', () => {
     }
     expect((await hitTarget(page, '#empty')).hit, 'an empty box is never hit').toBe(false);
     expect(await hitTarget(page, '#missing')).toEqual({ found: false, inViewport: false, hit: false });
+  });
+
+  test('at 2x device pixels the containment sliver is half a DEVICE pixel: 0.25 CSS px in, 0.3 out (#402)', async ({ browser }) => {
+    const context = await browser.newContext({ deviceScaleFactor: 2, viewport: { width: 400, height: 300 } });
+    const page = await context.newPage();
+    try {
+      await page.setContent([
+        '<style>html,body{margin:0;padding:0;overflow:hidden}div{position:fixed;box-sizing:border-box;background:#888}</style>',
+        '<div id="in" style="left:10px;top:250.25px;width:20px;height:50px"></div>',
+        '<div id="out" style="left:40px;top:250.3px;width:20px;height:50px"></div>',
+      ].join(''));
+      expect(await page.evaluate(() => window.devicePixelRatio)).toBe(2);
+      expect((await hitTarget(page, '#in')).inViewport, 'a quarter CSS pixel past the bottom at 2x').toBe(true);
+      expect((await hitTarget(page, '#out')).inViewport, 'past half a device pixel at 2x').toBe(false);
+    } finally {
+      await context.close();
+    }
   });
 
   test('desktop 1440: exact six-section order, bounded previews, reversible disclosures', async ({ page }) => {

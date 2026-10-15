@@ -1214,26 +1214,41 @@ test('A1: the reserved numeric slot is scoped — an unrelated surface keeps the
 });
 
 test('settleTransitions finishes running transitions and names every culprit it cannot finish (#402)', async ({ page }) => {
-  await page.setContent([
-    '<style>.box{width:20px;height:20px;color:rgb(0,0,0);transition:color 30s linear}.box.on{color:rgb(255,0,0)}</style>',
-    '<div id="settles" class="box"></div><div id="stalled" class="box slow"></div>',
-  ].join(''));
+  const start = async () => {
+    await page.setContent([
+      '<style>.box{width:20px;height:20px;color:rgb(0,0,0);transition:color 30s linear}.box.on{color:rgb(255,0,0)}</style>',
+      '<div id="settles" class="box"></div><div id="stalled" class="box"></div>',
+    ].join(''));
+    await page.evaluate(() => {
+      for (const id of ['settles', 'stalled']) {
+        const box = document.getElementById(id)!;
+        void getComputedStyle(box).color; // commit the start style
+        box.classList.add('on');
+      }
+    });
+  };
+  const live = () => page.evaluate(() => document.getAnimations().filter((a) => a instanceof CSSTransition && a.playState !== 'finished' && a.playState !== 'idle').length);
+  await start();
+  // A zero playback rate makes finish() throw InvalidStateError (Web
+  // Animations): the failure is loud and names the culprit, and the OTHER
+  // transition still settles.
   await page.evaluate(() => {
-    for (const id of ['settles', 'stalled']) {
-      const box = document.getElementById(id)!;
-      void getComputedStyle(box).color; // commit the start style
-      box.classList.add('on');
-    }
-  });
-  // A stalled playbackRate makes finish() throw: the failure is loud and
-  // names the element, its classes and the property.
-  await page.evaluate(() => {
-    const stalled = document.getAnimations().find((a) => a instanceof CSSTransition && (a.effect as KeyframeEffect).target === document.getElementById('stalled'))!;
+    const target = document.getElementById('stalled');
+    const stalled = document.getAnimations().find((a) => a instanceof CSSTransition && a.effect instanceof KeyframeEffect && a.effect.target === target);
+    if (stalled === undefined) throw new Error('fixture: no running transition on #stalled');
     stalled.playbackRate = 0;
   });
-  await expect(settleTransitions(page)).rejects.toThrow(/a CSS transition could not be finished \(div#stalled\.box\.slow\.on color: .+\); still unsettled: div#stalled\.box\.slow\.on color/u);
+  const failure = await settleTransitions(page).then(() => null, (error: unknown) => String(error));
+  expect(failure).toContain('a CSS transition could not be finished (div#stalled');
+  for (const part of ['.box', '.on', ' color: ', 'InvalidStateError', 'other transitions still unsettled: none']) expect(failure, part).toContain(part);
+  expect(await page.evaluate(() => getComputedStyle(document.getElementById('settles')!).color)).toBe('rgb(255, 0, 0)');
   // Once nothing is stalled, every transition settles to its END state.
   await page.evaluate(() => { for (const a of document.getAnimations()) a.playbackRate = 1; });
   await settleTransitions(page);
-  expect(await page.evaluate(() => [getComputedStyle(document.getElementById('settles')!).color, document.getAnimations().length])).toEqual(['rgb(255, 0, 0)', 0]);
+  expect(await page.evaluate(() => getComputedStyle(document.getElementById('stalled')!).color)).toBe('rgb(255, 0, 0)');
+  expect(await live()).toBe(0);
+  // Transitions that never settle within the bounded passes fail loud too.
+  await start();
+  await page.evaluate(() => { CSSTransition.prototype.finish = function finishNothing() {}; });
+  await expect(settleTransitions(page, 3)).rejects.toThrow(/CSS transitions kept restarting after 3 settle passes: div#(settles|stalled)\.box\.on color, div#(settles|stalled)\.box\.on color/u);
 });
