@@ -5,6 +5,7 @@ import { materializeBmadRuntime, PACKAGE_ROOT, readBmadRuntimeBinding } from '..
 import type { WorktreeLane, WorktreePort } from '../dispatch/worktree-port.js';
 import type { AgentRecord, JobRecord } from '../ledger/api.js';
 import type { ManagedSkillSet, ManagedWorkflowSession, SpawnOptions } from '../runtime/types.js';
+import { workerVerificationPolicy } from '../runtime/worker-verification-policy.js';
 import { WORKFLOW_SOURCE } from './manifest.js';
 import { verifiedWorkflowResourceText, createWorkflowRuntimeBinder, loadBundledWorkflowRuntime, renderWorkflow, validateWorkflowContext, workflowRuntimeForInvocation, type WorkflowContext } from './runtime.js';
 
@@ -78,6 +79,7 @@ export function createWorkflowSessionBinder(
   packageRoot = PACKAGE_ROOT,
   runsBuildFor: (lane: WorktreeLane) => boolean = () => true,
   agentFor?: (options: SpawnOptions) => string | undefined,
+  verificationConfigFile?: string,
 ): (options: SpawnOptions) => ManagedWorkflowSession {
   const storeRoot = join(dataDir, 'bmad-runtime'); // retain the historical store and private Git binding
   const bind = createWorkflowRuntimeBinder(storeRoot, packageRoot);
@@ -88,7 +90,11 @@ export function createWorkflowSessionBinder(
     }
     captureLaneHandoff(lane)();
     const agentId = agentFor?.(options) ?? options.agentId;
-    const assignment = { cwd: lane.path, ...(agentId !== undefined ? { agentId } : {}) };
+    // Host-owned policy is derived from the registered lane's own declaration,
+    // never from the prompt or the workflow binding (issue #315).
+    const workerVerification = workerVerificationPolicy(lane, verificationConfigFile);
+    const assignment = { cwd: lane.path, ...(agentId !== undefined ? { agentId } : {}),
+      ...(workerVerification !== undefined ? { workerVerification } : {}) };
     const reference = readBmadRuntimeBinding(lane.path, storeRoot);
     let retained: ManagedSkillSet | undefined;
     if (reference !== null) {
@@ -148,7 +154,7 @@ export function serviceWorkflowAuthority(dataDir: string, records: () => Pick<Wo
   getAgent(id: string): WorkflowAgent | null;
   listAgents(): readonly WorkflowAgent[];
   getJob(id: string): Pick<JobRecord, 'id' | 'deliverable'> | null;
-}, packageRoot = PACKAGE_ROOT): {
+}, packageRoot = PACKAGE_ROOT, verificationConfigFile?: string): {
   readonly workflowLaneFor: (options: SpawnOptions) => WorktreeLane | null;
   readonly workflowBuildFor: (lane: WorktreeLane) => boolean;
   readonly workflowAgentFor: (options: SpawnOptions) => string | undefined;
@@ -170,7 +176,7 @@ export function serviceWorkflowAuthority(dataDir: string, records: () => Pick<Wo
       }
       // Resource selection is authorized by the explicit registered JOB, not
       // permission to spawn a replacement implementation worker by its cwd.
-      const session = createWorkflowSessionBinder(dataDir, () => lane, packageRoot)({ cwd: lane.path });
+      const session = createWorkflowSessionBinder(dataDir, () => lane, packageRoot, undefined, undefined, verificationConfigFile)({ cwd: lane.path });
       return ownedFallbackReviewResources(session, dataDir, packageRoot);
     },
   };
