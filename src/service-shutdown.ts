@@ -12,6 +12,7 @@ import type { DreamScheduler } from './lessons/dream.js';
 import type { SilasDriver } from './dispatch/silas-driver.js';
 import type { ProviderRecoverySensor } from './provider-recovery/sensor.js';
 import type { WaveRunner } from './dispatch/perkins.js';
+import type { PropertyCampaignService } from './dispatch/property-campaigns.js';
 import type { ChildWorkerService } from './dispatch/child-workers.js';
 import type { createVerificationServer } from './verify/server.js';
 import type { PipelineService } from './dispatch/pipeline.js';
@@ -49,6 +50,7 @@ export interface ServiceShutdownState {
   ledger?: Pick<LedgerApi, 'appendCustomEvent'>;
   providerRecovery?: ProviderRecoverySensor;
   wave?: WaveRunner;
+  propertyCampaigns?: PropertyCampaignService;
   childWorkers?: ChildWorkerService;
   verify?: ReturnType<typeof createVerificationServer>;
   pipeline?: PipelineService;
@@ -193,6 +195,13 @@ export function startServiceShutdown(options: ServiceShutdownOptions): void {
           state.providerRecovery.stop();
         } catch (error) {
           logger.error('provider-recovery sensor stop failed', { error: String(error) });
+        }
+      }
+      if (state.propertyCampaigns !== undefined) {
+        try {
+          await state.propertyCampaigns.dispose();
+        } catch (error) {
+          logger.error('property campaign shutdown failed', { error: String(error) });
         }
       }
       if (state.wave !== undefined) {

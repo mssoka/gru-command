@@ -35,6 +35,7 @@ import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 const LEAD_TOOL_NAMES = [
   'perkins_run_specialists',
   'perkins_store_artifact',
+  'perkins_submit_property_contracts',
   'perkins_preflight_submission',
   'perkins_submit_review',
 ] as const;

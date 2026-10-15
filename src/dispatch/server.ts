@@ -38,6 +38,7 @@ import type { PacingGate, RetrySettlement } from '../runtime/pacing.js';
 import { childRefusalStatus, type ChildWorkerService } from './child-workers.js';
 import { REVIEW_EVIDENCE_MAX_FILES, type ReviewEvidenceRequest } from '../review-inputs/evidence.js';
 import { BlindInputRefusal, parseBlindInputPackage } from './blind-input.js';
+import type { PropertyCampaignService } from './property-campaigns.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -96,6 +97,8 @@ export interface DispatchServerOptions {
   /** Preview remains read-only; approval is a separate explicit boundary. */
   readonly intake?: IntakeService;
   readonly intakeApproval?: IntakeApprovalService;
+  /** Owner pairing-token actions only; never exposed as reviewer tools. */
+  readonly propertyCampaigns?: PropertyCampaignService;
   /** Book of Lessons injection for directives/re-briefs (pointers only). */
   readonly lessons?: LessonsReferencePort;
   /** Observe the actual continued physical session through the shared
@@ -421,6 +424,19 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
   }
 
   async function handleApi(req: IncomingMessage, res: ServerResponse, path: string): Promise<boolean> {
+    const property = /^\/api\/jobs\/([^/]+)\/property-campaigns(?:\/([^/]+)(?:\/(execute|repair|retain))?)?$/u.exec(path);
+    if (property !== null) {
+      if (!authed(req, res)) return true;
+      const service = options.propertyCampaigns;
+      if (service === undefined) { json(res, 503, { error: 'property_campaigns_not_hosted' }); return true; }
+      const jobId = decodeURIComponent(property[1]!);
+      const id = property[2] === undefined ? undefined : decodeURIComponent(property[2]);
+      const action = property[3] as 'execute' | 'repair' | 'retain' | undefined;
+      if (req.method === 'GET' && id !== undefined && action === undefined) { json(res, 200, service.read(jobId, id)); return true; }
+      if (req.method === 'POST' && id === undefined) { json(res, 201, service.propose(jobId, await readBody(req))); return true; }
+      if (req.method === 'POST' && id !== undefined && action !== undefined) { json(res, 200, await service.decide(jobId, id, action, await readBody(req))); return true; }
+      return false;
+    }
     if (path === '/api/intake' || path.startsWith('/api/intake/')) {
       if (!authed(req, res)) return true;
       const intake = options.intake;
@@ -2011,7 +2027,8 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // report disposition endpoint this hook adds — claim only that exact
       // shape, or /api/jobs/{id}/status and friends would 404 here.
       const isDisposition = path.startsWith('/api/jobs/') && path.endsWith('/disposition');
-      if (!path.startsWith('/api/dispatch') && !path.startsWith('/api/silas') && !path.startsWith('/api/pipeline') && path !== '/api/intake' && !path.startsWith('/api/intake/') && !isDisposition) {
+      const isProperty = /^\/api\/jobs\/[^/]+\/property-campaigns(?:\/|$)/u.test(path);
+      if (!isProperty && !path.startsWith('/api/dispatch') && !path.startsWith('/api/silas') && !path.startsWith('/api/pipeline') && path !== '/api/intake' && !path.startsWith('/api/intake/') && !isDisposition) {
         return false;
       }
       const startedAt = Date.now();
@@ -2041,6 +2058,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // Abort any in-flight directive/re-brief turns so shutdown cannot
       // stall on a wedged minion session; tracked lanes settle on abort.
       for (const controller of directiveControllers) controller.abort();
+      void options.propertyCampaigns?.dispose();
     },
   };
 }

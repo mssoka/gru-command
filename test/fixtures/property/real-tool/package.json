@@ -1,0 +1,14 @@
+{
+  "name": "gh350-real-tool-fixture",
+  "private": true,
+  "description": "GH350 real-tool campaign fixture: locked Vitest+fast-check toolchain for deterministic property-contract testing. Test-only; never a Gru dependency.",
+  "version": "0.0.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "devDependencies": {
+    "fast-check": "^3.23.2",
+    "vitest": "~3.2.7"
+  }
+}
