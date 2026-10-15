@@ -32,11 +32,12 @@ export function standaloneFixtureLedger(jobId: string): LedgerApi {
  * pending/nonce/unlock/service-ledger proof. No ambient receipt capability. */
 export function issueFixtureHandoff(lane: WorktreeLane, ledger: LedgerApi) {
   const git = (args: readonly string[]) => execFileSync('git', [...args], { cwd: lane.path, encoding: 'utf8', env: repositoryGitEnv(false) }).trim();
-  if (git(['rev-parse', 'HEAD']) !== lane.sha || git(['rev-parse', '--symbolic-full-name', 'HEAD']) !== (lane.branch === null ? 'HEAD' : `refs/heads/${lane.branch}`)) {
+  // One Git process for all three identity facts: this fixture runs ~1000 times in the history test.
+  const [head, symbolic, admin] = git(['rev-parse', 'HEAD', '--symbolic-full-name', 'HEAD', '--absolute-git-dir']).split('\n');
+  if (head !== lane.sha || symbolic !== (lane.branch === null ? 'HEAD' : `refs/heads/${lane.branch}`) || admin === undefined || admin === '') {
     throw new Error('fixture issuance requires its actual checkout identity');
   }
   const token = `gru-creation:${randomUUID()}`;
-  const admin = git(['rev-parse', '--absolute-git-dir']);
   const receipt = join(admin, 'gru-creation-handoff.json');
   if (existsSync(receipt)) {
     const earlier = owned.get(receipt);
