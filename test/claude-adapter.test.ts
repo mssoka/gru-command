@@ -1765,11 +1765,20 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
   });
 
   it('only a label-shaped server name is ever logged', () => {
-    for (const name of ['db', 'Upper_Case.v2 x', 'café', '数据', 'plugin:edgeplug:brokensrv', `${'ab-'.repeat(26)}ab`]) {
+    // Combining marks (NFD Latin, Devanagari vowel signs), the CLI's own
+    // connector collision suffix, an 80-code-point name of astral letters and
+    // a 23-character run are labels.
+    for (const name of ['db', 'Upper_Case.v2 x', 'café', '数据', 'plugin:edgeplug:brokensrv', `${'ab-'.repeat(26)}ab`,
+      'cafe\u0301', '\u0921\u0947\u091f\u093e', 'claude.ai Gmail (2)', '\u{20000}'.repeat(80), 'a'.repeat(23)]) {
       expect(loggableMcpServerName(name), name).toBe(true);
     }
+    // Over 80 code points with no run, a 24-character run (also split only by
+    // combining marks), an uppercase UUID, a leading mark or '_', and any
+    // character outside the label — never a denylist.
     for (const name of ['', 'x'.repeat(81), 'me@host', 'https://u:p@h/m', 'user:sk-secret', 'ok\nuser', 'a/b', '-lead',
-      'plugin:a:b:c', `ghp_${'a'.repeat(36)}`, '123e4567-e89b-12d3-a456-426614174000']) {
+      'plugin:a:b:c', `ghp_${'a'.repeat(36)}`, '123e4567-e89b-12d3-a456-426614174000', `${'ab-'.repeat(27)}`,
+      '\u{20000}'.repeat(81), 'a'.repeat(24), 'a\u0301'.repeat(24), '123E4567-E89B-12D3-A456-426614174000', '\u0301a',
+      '_internal', 'a+b=', 'a\u202eb', 'a\u2028b', 'a"b', 'a$b']) {
       expect(loggableMcpServerName(name), name).toBe(false);
     }
   });
@@ -1804,8 +1813,9 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         { name: 'sp', type: 'invalid config' },
         { name: 'colon', type: 'invalid:config' },
         { name: 'upper', type: 'Invalid_config' },
-        { name: 'cap', type: 'a'.repeat(40) },
-        { name: 'long', type: 'a'.repeat(41) },
+        { name: 'cap', type: 'abc_'.repeat(10) },
+        { name: 'long', type: `${'abc_'.repeat(10)}a` },
+        { name: 'tok', type: 'a'.repeat(24) },
         { name: 'https://user:sk-secret-in-name@host.invalid/mcp', type: 'invalid_config' },
         { name: 'Upper_Case.v2 x', type: 'invalid_config' },
         { name: `n${'x'.repeat(80)}`, type: 'invalid_config' },
@@ -1816,7 +1826,8 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       expect(problemLogs()[2]?.fields?.['servers']).toEqual(['api: skipped (invalid_config)', 'q-type: skipped (unknown_type)',
         'bare: skipped (unknown reason)', 'odd: skipped (unknown reason)', 'lc: skipped (unknown reason)',
         'sp: skipped (unknown reason)', 'colon: skipped (unknown reason)', 'upper: skipped (unknown reason)',
-        `cap: skipped (${'a'.repeat(40)})`, 'long: skipped (unknown reason)', '(name withheld #1): skipped (invalid_config)',
+        `cap: skipped (${'abc_'.repeat(10)})`, 'long: skipped (unknown reason)', 'tok: skipped (unknown reason)',
+        '(name withheld #1): skipped (invalid_config)',
         'Upper_Case.v2 x: skipped (invalid_config)', '(name withheld #2): skipped (invalid_config)', '?: skipped (unknown reason)']);
       expect(JSON.stringify(problemLogs())).not.toContain('sk-secret');
       // A server the CLI kept but could not start (status "failed": a missing
@@ -1855,6 +1866,21 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       await handle.prompt('ten');
       expect(problemLogs()).toHaveLength(8);
       expect(problemLogs()[7]?.fields).toMatchObject({ servers: ['(name withheld #1): failed to start'], total: 1 });
+      // Within one entry a withheld name keeps one number...
+      const c = 'https://c:sk-secret@three.invalid/m';
+      const d = 'https://d:sk-secret@four.invalid/m';
+      process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'] = JSON.stringify([{ name: c, type: 'invalid_config' }]);
+      process.env['CLAUDE_DOUBLE_MCP_SERVERS'] = JSON.stringify([{ name: d, status: 'failed' }, { name: c, status: 'failed' }]);
+      await handle.prompt('eleven');
+      expect(problemLogs()).toHaveLength(9);
+      expect(problemLogs()[8]?.fields).toMatchObject({ servers: ['(name withheld #1): skipped (invalid_config)',
+        '(name withheld #2): failed to start', '(name withheld #1): failed to start'], total: 3 });
+      // ...the same set in another order is not logged again, and only a
+      // digest of the raw names is kept.
+      process.env['CLAUDE_DOUBLE_MCP_SERVERS'] = JSON.stringify([{ name: c, status: 'failed' }, { name: d, status: 'failed' }]);
+      await handle.prompt('twelve');
+      expect(problemLogs()).toHaveLength(9);
+      expect((handle as unknown as { mcpServerProblemsNote: string }).mcpServerProblemsNote).toMatch(/^[0-9a-f]{64}$/u);
       expect(JSON.stringify(problemLogs())).not.toContain('sk-secret');
     } finally {
       delete process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'];

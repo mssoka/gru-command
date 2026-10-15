@@ -1,7 +1,7 @@
 import { execFile, spawn, spawnSync } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 import { promisify } from 'node:util';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   closeSync,
   constants as fsConstants,
@@ -873,16 +873,24 @@ function withoutCrBeforeLf(bytes: Buffer): Buffer {
 
 /** Whether a server name the CLI reports may be logged. Names come straight
  * from config — the CLI does not apply its own name rule to config files, so a
- * key can be a credential URL — so only a label is logged: letters and digits
- * of any script with `_ . -` and spaces, or the CLI's own
- * `plugin:<plugin>:<server>` form, up to 80 characters; never a URL or an
- * address (`/`, `@`, any other `:`), and never a credential-shaped run (24+
- * alphanumerics, a UUID). */
+ * key can be a credential URL — so only a label is logged: a letter or digit
+ * of any script, then letters, digits and combining marks with `_ . -`,
+ * parentheses (the CLI's own `claude.ai X (2)`) and spaces, or the CLI's own
+ * `plugin:<plugin>:<server>` form, up to 80 characters (code points); never a
+ * URL or an address (`/`, `@`, any other `:`), and never a credential-shaped
+ * run. */
 export function loggableMcpServerName(name: string): boolean {
-  if (name.length === 0 || name.length > 80) return false;
-  const label = '[\\p{L}\\p{N}][\\p{L}\\p{N}_. -]*';
+  const length = [...name].length;
+  if (length === 0 || length > 80) return false;
+  const label = '[\\p{L}\\p{N}][\\p{L}\\p{M}\\p{N}_. ()-]*';
   if (!new RegExp(`^(?:${label}|plugin:${label}:${label})$`, 'u').test(name)) return false;
-  return !/[A-Za-z0-9]{24}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/iu.test(name);
+  return !credentialShaped(name);
+}
+
+/** 24+ ASCII letters and digits in a row, or a UUID — counted with combining
+ * marks removed, so marks cannot split a run. */
+function credentialShaped(text: string): boolean {
+  return /[A-Za-z0-9]{24}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/iu.test(text.replace(/\p{M}/gu, ''));
 }
 
 /** The private copy of the verified project servers handed to --mcp-config:
@@ -1255,10 +1263,12 @@ export class ClaudeCodeHandle implements AgentHandle {
     // Never the CLI's free text — it pastes rejected values in unescaped, and
     // no redaction of free text is airtight — only its skip-reason code
     // (`invalid_config`, `unknown_type`, …), accepted only when it looks like
-    // one. The CLI's own --debug log carries the details.
+    // one and holds no credential-shaped run. The CLI's own --debug log
+    // carries the details.
     for (const error of Array.isArray(errors) ? errors : []) {
       const entry = record(error);
-      const code = typeof entry['type'] === 'string' && /^[a-z][a-z0-9_-]{0,39}$/u.test(entry['type']) ? entry['type'] : 'unknown reason';
+      const type = entry['type'];
+      const code = typeof type === 'string' && /^[a-z][a-z0-9_-]{0,39}$/u.test(type) && !credentialShaped(type) ? type : 'unknown reason';
       problems.push({ name: named(entry), why: `skipped (${code})` });
     }
     // A server the CLI kept but could not start (a missing env var, a broken
@@ -1277,14 +1287,22 @@ export class ClaudeCodeHandle implements AgentHandle {
       this.mcpServerProblemsNote = null;
       return;
     }
-    // Deduped on the RAW names — held in memory only, never logged — so two
-    // different sets never collapse into one because their names are withheld.
-    const note = JSON.stringify(problems);
+    // Deduped on a digest of the RAW problems in any order — the raw names
+    // are never logged or kept — so two different sets never collapse into
+    // one because their names are withheld.
+    const note = createHash('sha256').update(JSON.stringify(problems.map((problem) => JSON.stringify(problem)).sort())).digest('hex');
     if (note === this.mcpServerProblemsNote) return;
     this.mcpServerProblemsNote = note;
-    let withheld = 0;
-    const lines = problems.map(({ name, why }) =>
-      `${name === null ? '?' : loggableMcpServerName(name) ? name : `(name withheld #${(withheld += 1)})`}: ${why}`);
+    // Withheld names are numbered within this entry, one number per name.
+    const withheld = new Map<string, number>();
+    const shown = (name: string | null): string => {
+      if (name === null) return '?';
+      if (loggableMcpServerName(name)) return name;
+      const ordinal = withheld.get(name) ?? withheld.size + 1;
+      withheld.set(name, ordinal);
+      return `(name withheld #${ordinal})`;
+    };
+    const lines = problems.map(({ name, why }) => `${shown(name)}: ${why}`);
     this.log('warn', 'claude could not load some MCP servers', {
       cwd: this.params.cwd, servers: lines.slice(0, 20), total: lines.length,
     });
