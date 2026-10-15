@@ -909,7 +909,8 @@ export class ProviderRecoverySensor {
         }
         if (row !== null) {
           // A resolve that did not take: loud, and the route keeps its
-          // markers for the next boot rather than half-retiring.
+          // markers (rows resolved before it stay resolved) so the next boot
+          // finishes the retirement.
           throw new Error(`watching notice ${row.id} stayed active after its resolve`);
         }
         for (const id of pendingIds) this.ledger.clearPendingProviderRecovery(id);

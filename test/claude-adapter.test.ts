@@ -64,6 +64,7 @@ const DOUBLE_ENV_KEYS = [
   'CLAUDE_DOUBLE_TOOL_HOLD_MS',
   'CLAUDE_DOUBLE_MISMATCH',
   'CLAUDE_DOUBLE_MCP_SERVER_ERRORS',
+  'CLAUDE_DOUBLE_MCP_SERVERS',
   'CLAUDE_DOUBLE_IGNORE_TERM',
   'CLAUDE_DOUBLE_COMPACT_ERROR',
   'CLAUDE_DOUBLE_COMPACT_STATUS_FAIL',
@@ -1767,7 +1768,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     const lane = mkdtempSync(join(tmpdir(), 'gru-command-lane-'));
     cleanupDirs.push(lane);
     const handle = await fx.runtime.spawn('minion', { cwd: lane });
-    const skippedLogs = () => fx.logs.filter((entry) => entry.msg === 'claude skipped MCP servers it could not load');
+    const skippedLogs = () => fx.logs.filter((entry) => entry.msg === 'claude could not load some MCP servers');
     try {
       process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'] = JSON.stringify([
         { name: 'db', type: 'invalid_config', message: 'Skipped — invalid MCP server config for "db"' },
@@ -1775,14 +1776,39 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       await handle.prompt('one');
       await handle.prompt('two'); // the same set: not logged again
       expect(skippedLogs()).toHaveLength(1);
-      expect(skippedLogs()[0]).toMatchObject({ level: 'warn', fields: { skipped: ['db: Skipped — invalid MCP server config for "db"'] } });
+      expect(skippedLogs()[0]).toMatchObject({ level: 'warn', fields: { servers: ['db: Skipped — invalid MCP server config for "…"'], total: 1 } });
       delete process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'];
       await handle.prompt('three'); // cleared...
       process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'] = JSON.stringify([{ name: 'db', type: 'invalid_config', message: 'Skipped — invalid MCP server config for "db"' }]);
       await handle.prompt('four'); // ...so a recurrence is logged again
       expect(skippedLogs()).toHaveLength(2);
+      // A different set is logged too; quoted values (a rejected URL, a
+      // token) never reach the log, and a reason-less entry says so.
+      process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'] = JSON.stringify([
+        { name: 'api', type: 'invalid_config', message: 'url: invalid "https://user:sk-secret@example.invalid/mcp"' },
+        { name: 'bare' },
+        { name: 'typed', type: 'invalid_config' },
+      ]);
+      await handle.prompt('five');
+      expect(skippedLogs()).toHaveLength(3);
+      expect(skippedLogs()[2]?.fields?.['servers']).toEqual(['api: url: invalid "…"', 'bare: unknown reason', 'typed: invalid_config']);
+      expect(JSON.stringify(skippedLogs())).not.toContain('sk-secret');
+      // A server the CLI kept but could not start (status "failed": a missing
+      // env var, and every user-mode problem) is logged too.
+      delete process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'];
+      process.env['CLAUDE_DOUBLE_MCP_SERVERS'] = JSON.stringify([{ name: 'ok', status: 'connected' }, { name: 'needs-env', status: 'failed' }]);
+      await handle.prompt('six');
+      expect(skippedLogs()[3]?.fields).toMatchObject({ servers: ['needs-env: failed to start'], total: 1 });
+      // A flood is capped: the first 20 entries, each cut short, plus the total.
+      process.env['CLAUDE_DOUBLE_MCP_SERVERS'] = JSON.stringify(Array.from({ length: 25 }, (_, i) => ({ name: `s${i}${'x'.repeat(300)}`, status: 'failed' })));
+      await handle.prompt('seven');
+      const flood = skippedLogs()[4]?.fields as { servers: string[]; total: number };
+      expect(flood.total).toBe(25);
+      expect(flood.servers).toHaveLength(20);
+      expect(flood.servers.every((line) => line.length <= 200)).toBe(true);
     } finally {
       delete process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'];
+      delete process.env['CLAUDE_DOUBLE_MCP_SERVERS'];
       await handle.dispose();
     }
   });
@@ -1980,10 +2006,21 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         // which may carry a token.
         crlf.commitFile('.mcp.json', '{"mcpServers":{"x":{"env":{"TOKEN":"sk-secret-value"}}} oops');
         const syntax = await checkedInProjectMcpConfig(crlf.path);
-        expect(syntax).toMatchObject({ reason: expect.stringMatching(/^the committed \.mcp\.json is not valid JSON( \(at position \d+\))?$/u) });
+        expect(syntax).toEqual({ reason: 'the committed .mcp.json is not valid JSON (at character 56)' });
         expect(JSON.stringify(syntax)).not.toContain('sk-secret');
+        // ...counted in the file, BOM included; a parser message with no
+        // position (V8 quotes the source instead) yields no location at all.
+        crlf.commitFile('.mcp.json', '\uFEFF{"mcpServers":{}} oops');
+        expect(await checkedInProjectMcpConfig(crlf.path)).toEqual({ reason: 'the committed .mcp.json is not valid JSON (at character 19)' });
+        crlf.commitFile('.mcp.json', 'sk-secret-token');
+        expect(await checkedInProjectMcpConfig(crlf.path)).toEqual({ reason: 'the committed .mcp.json is not valid JSON' });
+        // Digits inside V8's quoted snippet are never taken for a position.
+        crlf.commitFile('.mcp.json', 'position 48213377');
+        expect(await checkedInProjectMcpConfig(crlf.path)).toEqual({ reason: 'the committed .mcp.json is not valid JSON' });
+        // A server entry the CLI only skips is not fatal: the file loads, and
+        // the skip is logged from the init frame.
         crlf.commitFile('.mcp.json', '{"mcpServers":{"x":5}}');
-        expect(await checkedInProjectMcpConfig(crlf.path)).toEqual({ reason: 'the committed .mcp.json has an "mcpServers" entry that is not an object' });
+        expect(await checkedInProjectMcpConfig(crlf.path)).toMatchObject({ config: expect.anything() });
         for (const content of ['["a list"]', 'null', '42', '"a string"', 'true']) {
           crlf.commitFile('.mcp.json', content);
           expect(await checkedInProjectMcpConfig(crlf.path), content).toEqual({ reason: 'the committed .mcp.json is not a JSON object' });
@@ -2117,8 +2154,8 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       rmSync(`${file}.abcdef12.project-mcp.json`, { recursive: true });
     } finally {
       const disposed = await Promise.allSettled(handles.map((handle) => handle.dispose()));
-      repo.cleanup();
       disposalFailures = disposed.filter((result): result is PromiseRejectedResult => result.status === 'rejected').map((failure) => failure.reason);
+      repo.cleanup();
     }
     // After the finally: a test failure surfaces as itself; a disposal
     // failure fails an otherwise passing test.

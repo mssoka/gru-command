@@ -817,19 +817,22 @@ export async function checkedInProjectMcpConfig(
     return { reason: `.mcp.json cannot be read: ${String(error)}`, infrastructure: true };
   }
   if (!working.equals(committed)) return differsFromCommitted(working, committed);
-  // The top-level shape the CLI's own config validation requires (a JSON
-  // object whose `mcpServers` maps names to objects) is checked here, so a
-  // file it would reject on every turn is refused with its reason instead.
-  // Each server's own fields are left to the CLI.
+  // Only what the CLI treats as FATAL is refused here: unparseable JSON, a
+  // non-object, or no `mcpServers` object — it would exit on every turn. A
+  // server entry it cannot load is skipped by the CLI itself, never fatal,
+  // and logged from the init frame (noteMcpServerErrors).
+  const bom = text.startsWith('\uFEFF') ? 1 : 0;
   let parsed: unknown;
   try {
     // One leading BOM is stripped, exactly as the CLI reads the file.
-    parsed = JSON.parse(committed.toString('utf8').replace(/^\uFEFF/u, ''));
+    parsed = JSON.parse(text.slice(bom));
   } catch (error) {
     // Never the parser's message: V8 quotes source text, and .mcp.json files
-    // carry tokens. The position alone locates the fault.
-    const position = /position (\d+)/u.exec(error instanceof Error ? error.message : '')?.[1];
-    return { reason: `the committed .mcp.json is not valid JSON${position === undefined ? '' : ` (at position ${position})`}` };
+    // carry tokens. Only a character position (in the file, BOM included),
+    // when the parser gives one.
+    // Anchored to V8's own suffix: a quoted source snippet never supplies it.
+    const position = / at position (\d+)(?: \(line \d+ column \d+\))?$/u.exec(error instanceof Error ? error.message : '')?.[1];
+    return { reason: `the committed .mcp.json is not valid JSON${position === undefined ? '' : ` (at character ${Number(position) + bom})`}` };
   }
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
     return { reason: 'the committed .mcp.json is not a JSON object' };
@@ -838,9 +841,6 @@ export async function checkedInProjectMcpConfig(
   const servers = (parsed as Record<string, unknown>)['mcpServers'];
   if (servers === null || typeof servers !== 'object' || Array.isArray(servers)) {
     return { reason: 'the committed .mcp.json has no "mcpServers" object' };
-  }
-  if (!Object.values(servers).every((server) => server !== null && typeof server === 'object' && !Array.isArray(server))) {
-    return { reason: 'the committed .mcp.json has an "mcpServers" entry that is not an object' };
   }
   return { config: committed };
 }
@@ -1229,19 +1229,34 @@ export class ClaudeCodeHandle implements AgentHandle {
 
   /** Log the MCP servers the CLI reported it skipped, once per distinct set
    * (a set that clears resets, so a later recurrence is logged again). */
-  private noteMcpServerErrors(errors: unknown): void {
-    if (!Array.isArray(errors) || errors.length === 0) {
+  private noteMcpServerErrors(errors: unknown, servers: unknown): void {
+    const record = (value: unknown): Record<string, unknown> =>
+      typeof value === 'object' && value !== null ? value as Record<string, unknown> : {};
+    const named = (entry: Record<string, unknown>): string => typeof entry['name'] === 'string' ? entry['name'] : '?';
+    // The CLI's own words, with any quoted value redacted (a message may
+    // quote a rejected value) and cut short.
+    const skipped = (Array.isArray(errors) ? errors : []).map((error: unknown) => {
+      const entry = record(error);
+      const why = typeof entry['message'] === 'string' ? entry['message']
+        : typeof entry['type'] === 'string' ? entry['type'] : 'unknown reason';
+      return `${named(entry)}: ${why.replace(/"[^"]*"/gu, '"…"')}`.slice(0, 200);
+    });
+    // A server the CLI kept but could not start (a missing env var, a broken
+    // command — and every user-mode problem, which never reaches
+    // mcp_server_errors) shows only as status "failed".
+    const failed = (Array.isArray(servers) ? servers : []).map(record)
+      .filter((entry) => entry['status'] === 'failed').map((entry) => `${named(entry)}: failed to start`.slice(0, 200));
+    const problems = [...skipped, ...failed];
+    if (problems.length === 0) {
       this.mcpServerErrorsNote = null;
       return;
     }
-    const skipped = errors.map((error: unknown) => {
-      const entry = typeof error === 'object' && error !== null ? error as Record<string, unknown> : {};
-      return `${String(entry['name'] ?? '?')}: ${String(entry['message'] ?? entry['type'] ?? error)}`;
-    });
-    const note = JSON.stringify(skipped);
+    const note = JSON.stringify(problems);
     if (note === this.mcpServerErrorsNote) return;
     this.mcpServerErrorsNote = note;
-    this.log('warn', 'claude skipped MCP servers it could not load', { cwd: this.params.cwd, skipped });
+    this.log('warn', 'claude could not load some MCP servers', {
+      cwd: this.params.cwd, servers: problems.slice(0, 20), total: problems.length,
+    });
   }
 
   /** A predecessor that crashed (never disposed) left its copy beside the
@@ -1721,10 +1736,11 @@ export class ClaudeCodeHandle implements AgentHandle {
             }
             return;
           }
-          // The CLI skips (never fails on) a server entry it cannot load — a
-          // bad entry, a missing env var, a reserved name — and says so only
-          // here: logged once per distinct set, so it never just disappears.
-          this.noteMcpServerErrors(frame['mcp_server_errors']);
+          // Servers the CLI skipped (an entry its validation rejects, a
+          // reserved name: mcp_server_errors, --mcp-config only) or kept but
+          // could not start (status "failed") are logged once per distinct
+          // set, so none just disappears.
+          this.noteMcpServerErrors(frame['mcp_server_errors'], frame['mcp_servers']);
           // Record what this turn was asked right after its verified identity
           // frame: stdout carries only claude's side of the conversation. Not
           // the CLI's --replay-user-messages: it also echoes the permission
