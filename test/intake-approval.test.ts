@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { IntakeApprovalService, IntakePartialFailure } from '../src/intake/approval.js';
 import { IntakeService } from '../src/intake/service.js';
+import { createManagedRepoIntakeResolver } from '../src/repos/managed-names.js';
 import { resolvedIntakePlan } from './helpers/intake-plan.js';
 import { PipelineService } from '../src/dispatch/pipeline.js';
 import { LedgerApi } from '../src/ledger/api.js';
@@ -24,7 +25,7 @@ async function fixture(kind: 'issue' | 'spec' | 'bmad' = 'spec') {
   const dispatch = vi.fn(async (_input: { jobId: string; title: string; briefing: string }) => ({ settled: Promise.resolve() }));
   const capacity = { capacity: 1, occupied: 1, available: 0, queued: 0 };
   const pipeline = new PipelineService({ ledger, dispatch: { dispatch }, capacity: () => capacity });
-  const intake = new IntakeService({ dataDir: join(root, 'data'), workspaceRoot: join(root, 'workspace'), uploadsDir: join(root, 'data', 'uploads'), remote: () => ({ host: 'github.com', owner: 'owner', repo: 'demo' }), ghRunner: async () => ({ status: 0, stderr: '', stdout: JSON.stringify({ number: 1, html_url: 'https://github.com/owner/demo/issues/1', title: 'Capture', body: 'Implement native capture.', updated_at: '2026-10-10T12:00:00Z' }) }) });
+  const intake = new IntakeService({ dataDir: join(root, 'data'), workspaceRoot: join(root, 'workspace'), uploadsDir: join(root, 'data', 'uploads'), managedRepos: () => [repoPath], remote: () => ({ host: 'github.com', owner: 'owner', repo: 'demo' }), ghRunner: async () => ({ status: 0, stderr: '', stdout: JSON.stringify({ number: 1, html_url: 'https://github.com/owner/demo/issues/1', title: 'Capture', body: 'Implement native capture.', updated_at: '2026-10-10T12:00:00Z' }) }) });
   const approval = new IntakeApprovalService({ intake, ledger, pipeline });
   cleanups.push(() => { pipeline.dispose(); db.close(); rmSync(root, { recursive: true, force: true }); });
   const source = kind === 'issue' ? { kind, reference: '#1' } : { kind, document: { path: 'spec.md' } };
@@ -37,6 +38,52 @@ async function fixture(kind: 'issue' | 'spec' | 'bmad' = 'spec') {
   return { root, repoPath, db, ledger, pipeline, capacity, dispatch, intake, approval, first, proposal, decision, review, accept, request };
 }
 describe('intake durable recovery integrity', () => {
+  it('resolves one managed root for complete review and approval requests', async () => {
+    const h = await fixture();
+    const nextProposal = await h.intake.revise({
+      repoPath: h.repoPath,
+      intakeId: 'feature',
+      requestId: 'r3',
+      previousRequestId: 'r2',
+      revisionId: h.proposal.revisionId,
+      plan: h.proposal.plan,
+    });
+    let resolutions = 0;
+    const resolveManagedRepo = createManagedRepoIntakeResolver(join(h.root, 'workspace'), ['demo']);
+    const guardedIntake = new IntakeService({
+      dataDir: join(h.root, 'data'),
+      workspaceRoot: join(h.root, 'workspace'),
+      uploadsDir: join(h.root, 'data', 'uploads'),
+      managedRepos: (requestedPath) => {
+        resolutions += 1;
+        return resolveManagedRepo(requestedPath);
+      },
+    });
+    const guardedApproval = new IntakeApprovalService({ intake: guardedIntake, ledger: h.ledger, pipeline: h.pipeline });
+    const reviewed = guardedApproval.review({
+      repoPath: h.repoPath,
+      intakeId: 'feature',
+      requestId: nextProposal.requestId,
+      revisionId: nextProposal.revisionId,
+      expectedToken: h.review.token,
+    });
+    expect(reviewed.review?.status).toBe('reviewed');
+    expect(resolutions).toBe(1);
+
+    resolutions = 0;
+    const approved = guardedApproval.approve({
+      repoPath: h.repoPath,
+      intakeId: 'feature',
+      requestId: nextProposal.requestId,
+      revisionId: nextProposal.revisionId,
+      expectedToken: reviewed.review!.token,
+      selected: nextProposal.plan.heists.map(({ id }) => id),
+    });
+    expect(approved.review?.status).toBe('approved');
+    expect(resolutions).toBe(1);
+    await h.pipeline.whenIdle();
+  });
+
   const missingCommittedRow = async (proof: 'job' | 'enqueue event'): Promise<void> => {
     const h = await fixture();
     const accepted = h.approval.approve(h.accept);
@@ -326,10 +373,18 @@ it('refuses bounded large multi-heist standalone provenance before authority or 
   const reviewed = h.approval.review(d).review!;
   const constructed = new Set<string>();
   const instrumented = { ...p, plan: { ...p.plan, heists: p.plan.heists.map((heist) => ({ ...heist, get title() { constructed.add(heist.id); return heist.title; } })) } };
-  const read = vi.spyOn(h.intake, 'read').mockReturnValue(instrumented);
-  expect(() => h.approval.approve({ ...d, expectedToken: reviewed.token, selected: p.plan.heists.map(({ id }) => id) })).toThrowError(expect.objectContaining({ code: 'intake_output_bounds' }));
-  expect(constructed.size).toBeGreaterThan(0); expect(constructed.size).toBeLessThan(p.plan.heists.length);
-  read.mockRestore();
+  const originalScope = h.intake.createRequestScope.bind(h.intake);
+  const createRequestScope = vi.spyOn(h.intake, 'createRequestScope');
+  createRequestScope.mockImplementation((repoPath, intakeId) => {
+    const request = originalScope(repoPath, intakeId);
+    return { ...request, read: (requestId) => requestId === p.requestId ? instrumented : request.read(requestId) };
+  });
+  try {
+    expect(() => h.approval.approve({ ...d, expectedToken: reviewed.token, selected: p.plan.heists.map(({ id }) => id) })).toThrowError(expect.objectContaining({ code: 'intake_output_bounds' }));
+    expect(constructed.size).toBeGreaterThan(0); expect(constructed.size).toBeLessThan(p.plan.heists.length);
+  } finally {
+    createRequestScope.mockRestore();
+  }
   expect(h.approval.read(h.repoPath, 'feature').review).toEqual(reviewed);
   expect(h.ledger.listPipelineEntries()).toEqual([]); expect(h.dispatch).not.toHaveBeenCalled();
 });

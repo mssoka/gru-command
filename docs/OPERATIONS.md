@@ -17,7 +17,14 @@ schema), [CHAT.md](./CHAT.md) (the chat contract), and
 | `<data_dir>/chat/` | chat frame log (`gru.frames.jsonl`) + the Gru session pointer |
 | `<data_dir>/uploads/` | attach-flow storage home: materialized clipboard/phone content (SPEC ruling 19). 0700, hardened at every boot and on every write; 8 MiB per file (413 beyond), capped at 1 000 files (507 beyond). Allocation is serialized across service processes; names are UTF-8 byte-bounded and never overwrite. Prune manually — nothing deletes user material on its own |
 | `<data_dir>/ledger/ledger.db` | the SQLite record of record (jobs, rounds, agents, events, notifications) |
-| workspace root | YOUR managed repos only (default `~/code`) — never instance state |
+| workspace root | shared project directory (default `~/code`); `managed_repos` in `config.toml` explicitly selects managed children — never instance state |
+
+The workspace root may contain unrelated repositories. An absent or empty
+`managed_repos` list means none; discovery never enrolls siblings. To add
+repositories after installation, edit the exact direct-child names in
+`<data_dir>/config.toml`, keep unrelated settings intact, and restart the
+service through its normal OS service lifecycle. The running process does not
+hot-reload the list. See [CONFIG.md](./CONFIG.md#managed-repositories).
 
 `/health` declares the live values: workspace root, data dir, session
 path, version, install id (the identity fingerprint), and the 3-signal

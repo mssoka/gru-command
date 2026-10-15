@@ -40,6 +40,8 @@ export declare function startRealService(options?: {
   home?: string;
   /** Reuse a prior boot's workspace. */
   workspace?: string;
+  /** Explicit workspace-root child names managed by this test service. */
+  managedRepos?: readonly string[];
   /** Model ref written to config; unknown metadata declines vision conservatively. */
   model?: string;
   /** Write enabled=true into the hermetic decision configuration. */

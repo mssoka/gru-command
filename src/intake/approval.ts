@@ -1,10 +1,10 @@
+import { INTAKE_MAX_OUTPUT_BYTES, type IntakeRequestScope } from './service.js';
 import type { IntakeService } from './service.js';
 import type { LedgerApi } from '../ledger/api.js';
 import type { PipelineService } from '../dispatch/pipeline.js';
 import { conservativePlan } from './planner.js';
 import { boundedCanonical, canonical, digest, IntakeError, type Proposal, type Statement, type IntakeReadback, type IntakeReviewRecord, type FrozenIntakeEntry } from './types.js';
 export type { IntakeReadback, IntakeReviewRecord } from './types.js';
-import { INTAKE_MAX_OUTPUT_BYTES } from './service.js';
 
 export class IntakePartialFailure extends IntakeError {
   constructor(readonly readback: IntakeReadback, message: string) {
@@ -54,19 +54,24 @@ function concrete(proposal: Proposal, selected: readonly string[]): void {
 export class IntakeApprovalService {
   constructor(private readonly options: { readonly intake: IntakeService; readonly ledger: LedgerApi; readonly pipeline: PipelineService }) {}
 
-  private proposal(input: Decision): Proposal {
-    const proposal = this.options.intake.read(input.repoPath, input.intakeId, input.requestId);
+  private proposal(input: Decision, request: IntakeRequestScope): Proposal {
+    const proposal = request.read(input.requestId);
     if (proposal.revisionId !== input.revisionId) throw new IntakeError('intake_stale_revision', 'Proposal bytes changed; read and review the exact revision again', 409);
     return proposal;
   }
   read(repoPath: string, intakeId: string, token?: string): IntakeReadback {
-    this.options.intake.validateIdentity(repoPath, intakeId);
+    const request = this.options.intake.createRequestScope(repoPath, intakeId);
+    return this.readWithRequest(repoPath, intakeId, token, request);
+  }
+
+  private readWithRequest(repoPath: string, intakeId: string, token: string | undefined, request: IntakeRequestScope): IntakeReadback {
+    request.validateIdentity();
     const review = this.options.ledger.getIntakeReview(repoPath, intakeId, token);
     if (review === null) {
       if (token !== undefined) throw new IntakeError('intake_not_found', 'No recorded decision for this token', 404);
       return { review: null, accepted: [], remaining: [] };
     }
-    this.proposal({ ...review, expectedToken: review.previousToken });
+    this.proposal({ ...review, expectedToken: review.previousToken }, request);
     const accepted: IntakeReadback['accepted'][number][] = [];
     const remaining: IntakeReadback['remaining'][number][] = [];
     for (const [index, entry] of review.entries.entries()) {
@@ -88,10 +93,18 @@ export class IntakeApprovalService {
     boundedCanonical(readback, INTAKE_MAX_OUTPUT_BYTES);
     return readback;
   }
-  review(value: unknown): IntakeReadback { return this.decide(parse(value, false), 'reviewed'); }
-  reject(value: unknown): IntakeReadback { return this.decide(parse(value, false), 'rejected'); }
-  private decide(input: Decision, status: IntakeReviewRecord['status']): IntakeReadback {
-    const proposal = this.proposal(input);
+  review(value: unknown): IntakeReadback {
+    const input = parse(value, false);
+    const request = this.options.intake.createRequestScope(input.repoPath, input.intakeId);
+    return this.decide(input, 'reviewed', request);
+  }
+  reject(value: unknown): IntakeReadback {
+    const input = parse(value, false);
+    const request = this.options.intake.createRequestScope(input.repoPath, input.intakeId);
+    return this.decide(input, 'rejected', request);
+  }
+  private decide(input: Decision, status: IntakeReviewRecord['status'], request: IntakeRequestScope): IntakeReadback {
+    const proposal = this.proposal(input, request);
     // Bound both each standalone briefing and the aggregate retained allocation
     // before constructing the final approval/readback envelope.
     let briefingBudget = INTAKE_MAX_OUTPUT_BYTES;
@@ -108,21 +121,22 @@ export class IntakeApprovalService {
     // reserving space for both worst-case recovery identity projections.
     boundedCanonical({ review: record, accepted: entries.map((entry, index) => ({ heistId: record.selected[index], entryId: entry.id, state: 'cancelled' })), remaining: entries.map((entry, index) => ({ heistId: record.selected[index], entryId: entry.id })) }, INTAKE_MAX_OUTPUT_BYTES);
     this.options.ledger.recordIntakeReview(record);
-    return this.read(input.repoPath, input.intakeId, record.token);
+    return this.readWithRequest(input.repoPath, input.intakeId, record.token, request);
   }
   approve(value: unknown): IntakeReadback {
     const input = parse(value, true);
-    const proposal = this.proposal(input);
+    const request = this.options.intake.createRequestScope(input.repoPath, input.intakeId);
+    const proposal = this.proposal(input, request);
     concrete(proposal, input.selected);
-    const frozen = this.decide(input, 'approved');
+    const frozen = this.decide(input, 'approved', request);
     const review = frozen.review!;
     try {
       // Identical enqueue replay checks the pipeline's complete immutable
       // payload, including entries committed before a lost response.
       for (const entry of review.entries) this.options.pipeline.enqueue(entry);
     } catch (error) {
-      throw new IntakePartialFailure(this.read(input.repoPath, input.intakeId, review.token), `Acceptance interrupted: ${error instanceof Error ? error.message : String(error)}. Explicitly retry the identical approval.`);
+      throw new IntakePartialFailure(this.readWithRequest(input.repoPath, input.intakeId, review.token, request), `Acceptance interrupted: ${error instanceof Error ? error.message : String(error)}. Explicitly retry the identical approval.`);
     }
-    return this.read(input.repoPath, input.intakeId, review.token);
+    return this.readWithRequest(input.repoPath, input.intakeId, review.token, request);
   }
 }
