@@ -153,7 +153,7 @@ default = "pi"
 # bob = "pi"
 
 [models]
-# Default model reference. An explicit "provider/model" reference is passed to pi as-is; claude-code strips the provider segment for its CLI --model flag (bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"). The literal "default" means the runtime's own configuration (SPEC ruling 16).
+# Default model reference. pi takes an explicit "provider/model" reference as-is. claude-code is always Anthropic and needs no provider: use the CLI's own names ("opus", "claude-opus-5-5"); a provider segment, if present, is stripped for its --model flag (bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"); a shared [models] entry naming another provider is a pi reference that claude-code passes over, unless its id has an Anthropic cloud shape (Bedrock "[region.]anthropic.…", Vertex "claude-…@YYYYMMDD"); resellers serving Claude under their own ids ("github-copilot/claude-…") are passed over too, as is a pi-only shared [thinking] level ("minimal"). The literal "default" means the runtime's own configuration (SPEC ruling 16).
 default = "default"
 
 [models.roles]
@@ -183,7 +183,7 @@ default = "default"
 # [runtimes.pi]
 # # Optional runtime-wide policy; omitted keys inherit [models]/[thinking].
 # # Thinking levels accepted: minimal | low | medium | high | xhigh | max.
-# # An explicit "provider/model" reference is passed to pi as-is; claude-code strips the provider segment for its CLI --model flag (bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"). The literal "default" means the runtime's own configuration (SPEC ruling 16).
+# # pi takes an explicit "provider/model" reference as-is. claude-code is always Anthropic and needs no provider: use the CLI's own names ("opus", "claude-opus-5-5"); a provider segment, if present, is stripped for its --model flag (bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"); a shared [models] entry naming another provider is a pi reference that claude-code passes over, unless its id has an Anthropic cloud shape (Bedrock "[region.]anthropic.…", Vertex "claude-…@YYYYMMDD"); resellers serving Claude under their own ids ("github-copilot/claude-…") are passed over too, as is a pi-only shared [thinking] level ("minimal"). The literal "default" means the runtime's own configuration (SPEC ruling 16).
 # # Full per-runtime semantics (binding, session flags, effort mapping, resolution order): docs/RUNTIMES.md.
 # # model = "default"
 # # thinking_level = "default"
@@ -204,10 +204,15 @@ default = "default"
 # [runtimes.claude-code]
 # # Optional runtime-wide policy; omitted keys inherit [models]/[thinking].
 # # Thinking levels accepted: low | medium | high | xhigh | max | ultracode (mapped to the CLI --effort; anything else fails loud at spawn naming the valid set).
-# # An explicit "provider/model" reference is passed to pi as-is; claude-code strips the provider segment for its CLI --model flag (bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"). The literal "default" means the runtime's own configuration (SPEC ruling 16).
+# # pi takes an explicit "provider/model" reference as-is. claude-code is always Anthropic and needs no provider: use the CLI's own names ("opus", "claude-opus-5-5"); a provider segment, if present, is stripped for its --model flag (bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"); a shared [models] entry naming another provider is a pi reference that claude-code passes over, unless its id has an Anthropic cloud shape (Bedrock "[region.]anthropic.…", Vertex "claude-…@YYYYMMDD"); resellers serving Claude under their own ids ("github-copilot/claude-…") are passed over too, as is a pi-only shared [thinking] level ("minimal"). The literal "default" means the runtime's own configuration (SPEC ruling 16).
 # # Full per-runtime semantics (binding, session flags, effort mapping, resolution order): docs/RUNTIMES.md.
 # # model = "default"
 # # thinking_level = "default"
+# # MCP servers for non-review sessions: "none" = only the role's tools
+# # (like pi); "project" = only the cwd's .mcp.json as committed at HEAD,
+# # for roles with a shell; "user" = your own Claude MCP configuration,
+# # connectors included, without prompts.
+# # mcp = "none"
 
 # [runtimes.claude-code.roles]
 # # Optional per-role inline tables (at least one field when uncommented).
@@ -376,11 +381,21 @@ enabled = false
 # on a shared bounded cadence (a tiny no-history/no-tools generation,
 # ≤64 output tokens, no hidden retries), and on completed producer
 # evidence wakes Silas once to claim guarded continuations — no owner
-# ACK for eligible waits. DISABLED BY DEFAULT: owner activation is
-# manual. Auth/billing/ambiguous failures and unsupported providers stay
-# machine attention: Gru decides the direction and asks the owner only
-# through a typed reserved decision.
+# ACK for eligible waits. The openai-codex route and claude-code lanes
+# on the native claude.ai login are checked by read-only usage-metadata
+# reads instead (no generation). GLM/Codex are DISABLED BY DEFAULT: owner
+# activation is manual. Auth/billing/ambiguous failures and unsupported
+# providers stay machine attention: Gru decides the direction and asks the
+# owner only through a typed reserved decision.
 enabled = false
+# claude-code lanes on the native claude.ai login: a usage-limit wall
+# waits on the claude.ai usage endpoint and resumes when the window
+# resets. ON by default, independent of `enabled`. Off — and always for
+# API-key/override contexts — Claude quota walls are left to Gru. Turning
+# either switch off hands that provider's open waits to Gru at the next
+# boot (an action-required notice per wait; none where the owner already
+# holds the lane's stop) — never stranded.
+claude_native = true
 # Sensor tick (how often routes are re-examined). The check cadence
 # itself cannot go below the approved 300 s floor.
 tick_interval_ms = 30000
@@ -492,6 +507,7 @@ example.
 | Bad port | `server.port must be an integer between 0 and 65535 (0 = ephemeral)` |
 | Unknown runtime policy key | `unknown key \`x\` in [runtimes.pi] (valid keys: model, thinking_level, model_refresh, model_refresh_timeout_ms, roles)` |
 | Empty runtime role entry | `[runtimes.pi.roles.gru] must set at least one of model, thinking_level` |
+| Bad claude-code MCP mode | `runtimes.claude-code.mcp must be one of "none", "project", "user", got "x"` |
 | Unknown runtime id as a table | `unknown key \`x\` in [runtimes] (valid keys: default, roles, or a runtime id: pi, claude-code)` |
 | Relative `GRU_COMMAND_HOME` | `GRU_COMMAND_HOME must be an absolute path` (an empty value is rejected the same way) |
 | Path not absolute after expansion | `workspace_root must resolve to an absolute path` |

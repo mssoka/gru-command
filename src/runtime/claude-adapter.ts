@@ -1,10 +1,10 @@
-import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { execFile, spawn, spawnSync } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 import { promisify } from 'node:util';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   closeSync,
+  constants as fsConstants,
   createWriteStream,
   mkdirSync,
   openSync,
@@ -14,10 +14,12 @@ import {
   writeFileSync,
 } from 'node:fs';
 import type { WriteStream } from 'node:fs';
-import { basename, isAbsolute, join, relative } from 'node:path';
+import { lstat, open, readdir, rm, writeFile } from 'node:fs/promises';
+import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import { finished } from 'node:stream/promises';
 import type { GruCommandConfig, Role } from '../config.js';
-import { resolveSpawnPolicy } from '../config.js';
+import { repositoryGitEnv } from '../git-env.js';
+import { CLAUDE_CODE_THINKING_LEVELS as CLAUDE_EFFORT_LEVELS, DEFAULT_CLAUDE_MCP_MODE, resolveSpawnPolicy } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import { ROLE_DEFINITIONS } from '../roles.js';
 import { managedSkillsPromptNote } from './managed-skills.js';
@@ -41,9 +43,10 @@ import {
   ClaudeTurnTranslator,
   extractSessionId,
   NdjsonParser,
+  type ApiErrorInfo,
+  type ResultInfo,
   type StreamFrame,
 } from './stream-json.js';
-import { capabilitiesForModelInput } from './types.js';
 import type {
   AgentCapabilities,
   AgentHandle,
@@ -60,6 +63,7 @@ import { ToolHeartbeat, toolHeartbeatIntervalMs } from './tool-heartbeat.js';
 import { disposeAll } from './disposal.js';
 import { CLAUDE_CODE_CAPABILITIES } from './capabilities.js';
 import { DirectiveCheckpointError, type DirectiveCheckpoint, type DirectiveTurnIdentity } from './directive-checkpoint.js';
+import { CLAUDE_NATIVE_PROVIDER } from '../provider-recovery/classify.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -68,14 +72,13 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
 // re-export keeps every existing import surface (and object identity) intact.
 export { CLAUDE_CODE_CAPABILITIES };
 
-/** Thinking levels the claude CLI accepts via --effort (fail-loud on others). */
-const CLAUDE_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode'] as const;
-
 /**
  * Role tool ids (pi-flavored, src/roles.ts) → claude built-in tool names
- * for --tools (a hard restriction of the tool set, enforced in any
+ * for --tools (a hard restriction of the built-in tool set, enforced in any
  * permission mode). An unmapped id fails loud at spawn — silently dropping
- * a restriction is never acceptable.
+ * a restriction is never acceptable. Every target must be a tool the CLI
+ * actually ships: the CLI silently ignores unknown --tools names (it dropped
+ * its `LS` tool), so directory listing maps to Glob, its listing tool.
  */
 const CLAUDE_TOOL_MAP: Readonly<Record<string, string>> = {
   read: 'Read',
@@ -84,18 +87,20 @@ const CLAUDE_TOOL_MAP: Readonly<Record<string, string>> = {
   write: 'Write',
   grep: 'Grep',
   find: 'Glob',
-  ls: 'LS',
+  ls: 'Glob',
 };
 
-/** Map role tool ids to claude built-in tool names (fail-loud on unknown). */
+/** Map role tool ids to claude built-in tool names (fail-loud on unknown;
+ * several role ids may share one claude tool, which is listed once). */
 export function mapRoleTools(role: Role, tools: readonly string[]): string[] {
-  return tools.map((tool) => {
-    const mapped = CLAUDE_TOOL_MAP[tool];
-    if (mapped === undefined) {
+  const mapped = tools.map((tool) => {
+    const name = CLAUDE_TOOL_MAP[tool];
+    if (name === undefined) {
       throw new Error(`role "${role}" tool "${tool}" has no claude-code tool mapping`);
     }
-    return mapped;
+    return name;
   });
+  return [...new Set(mapped)];
 }
 
 /** Default grace between SIGTERM and SIGKILL when disposing a live turn. */
@@ -142,8 +147,6 @@ export interface ClaudeCodeRuntimeOptions {
   readonly killGraceMs?: number;
   /** Test seam: override the long-tool heartbeat cadence. */
   readonly toolHeartbeatMs?: number;
-  /** Tests may inject an offline catalog; production restores pi's cached model metadata. */
-  readonly modelRuntime?: ModelRuntime;
   /** Test seam for the user Claude settings source (never the review repo). */
   readonly reviewSettingsFile?: string;
   readonly log?: Log;
@@ -159,6 +162,7 @@ export interface ClaudeCodeRuntimeOptions {
  *           (--session-id <uuid> | --resume <uuid>) [--model M] [--effort E]
  *           --permission-mode bypassPermissions --tools <role tools>
  *           --append-system-prompt <role prompt>
+ *           [--strict-mcp-config [--mcp-config <session>.jsonl.<handle>.project-mcp.json]]
  * fed with ONE stdin user frame followed by EOF; the turn ends with the
  * `result` frame and the process exits. Session continuity chains through
  * the CLI's own resume substrate keyed by the product-minted session UUID;
@@ -185,7 +189,6 @@ export class ClaudeCodeRuntime implements AgentRuntime {
    * window at spawn when unset (construction must not touch config). */
   private readonly toolHeartbeatMs: number | null;
   private readonly handles = new Set<ClaudeCodeHandle>();
-  private modelRuntime: ModelRuntime | undefined;
   /** Normalized session paths currently hosted by this process. */
   private readonly activeFiles = new Set<string>();
   /** Cached binary availability (probed once; re-probed after a failure). */
@@ -200,20 +203,12 @@ export class ClaudeCodeRuntime implements AgentRuntime {
     this.killGraceMs = opts.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
     this.log = opts.log ?? (() => {});
     this.reviewSettingsFile = opts.reviewSettingsFile ?? userClaudeSettingsFile();
-    this.modelRuntime = opts.modelRuntime;
     this.toolHeartbeatMs = opts.toolHeartbeatMs ?? null;
   }
 
   /** Long-tool heartbeat cadence for a new handle (config-derived). */
   private heartbeatMs(): number {
     return this.toolHeartbeatMs ?? toolHeartbeatIntervalMs(this.config.supervision.turnSilenceMs);
-  }
-
-  private async runtime(): Promise<ModelRuntime> {
-    if (this.modelRuntime === undefined) {
-      this.modelRuntime = await ModelRuntime.create({ refreshOnCreate: false });
-    }
-    return this.modelRuntime;
   }
 
   /**
@@ -260,40 +255,10 @@ export class ClaudeCodeRuntime implements AgentRuntime {
     }
   }
 
-  /** The CLI, not pi's catalog, is authoritative for model names.
-   * Metadata is advisory for conservative vision capability reporting. */
-  private async resolveModel(
-    role: Role,
-    override?: string,
-  ): Promise<{ readonly cliModel?: string; readonly input?: readonly ('text' | 'image')[] }> {
-    const ref =
-      override !== undefined
-        ? override
-        : resolveSpawnPolicy(this.config, 'claude-code', role).model;
-    const cliModel = claudeCliModel(ref);
-    if (cliModel === undefined) return {};
-    const slash = ref.indexOf('/');
-    const provider = slash < 0 ? undefined : ref.slice(0, slash);
-    const modelId = cliModel;
-    let declared: ReturnType<ModelRuntime['getModel']> = undefined;
-    let metadataError: unknown;
-    try {
-      if (provider !== undefined) declared = (await this.runtime()).getModel(provider, modelId);
-    } catch (error) {
-      // Metadata enriches the CLI spawn but is not its transport. A torn
-      // cache must decline vision conservatively, not take Claude offline.
-      metadataError = error;
-    }
-    if (declared === undefined) {
-      this.log('warn', 'claude-code model has no declared input metadata; vision declines conservatively', {
-        model: ref,
-        ...(metadataError !== undefined ? { error: String(metadataError) } : {}),
-      });
-    }
-    return {
-      cliModel,
-      ...(declared !== undefined ? { input: declared.input } : {}),
-    };
+  /** The CLI, not pi's catalog, is authoritative for model names; Claude
+   * Code is always Anthropic, so no provider or catalog lookup is needed. */
+  private resolveModel(role: Role, override?: string): string | undefined {
+    return claudeCliModel(override ?? resolveSpawnPolicy(this.config, 'claude-code', role).model);
   }
 
   /** Probe under the request-owned settings given to this review's lead
@@ -365,12 +330,10 @@ export class ClaudeCodeRuntime implements AgentRuntime {
       throw new Error(`review model override "${options.model}" differs from the preflighted model; re-run preflight with the selected model`);
     }
     // Validation failures are caller-facing, never adapter health.
-    const resolvedModel = await this.resolveModel(role, reviewConfiguration?.modelRef ?? options.model);
-    const model = resolvedModel.cliModel;
-    const handleCapabilities = capabilitiesForModelInput(
-      CLAUDE_CODE_CAPABILITIES,
-      resolvedModel.input,
-    );
+    const model = this.resolveModel(role, reviewConfiguration?.modelRef ?? options.model);
+    // Every Claude model accepts images (owner ruling 2026-10-15): the
+    // adapter's declared capabilities hold for every handle.
+    const handleCapabilities = CLAUDE_CODE_CAPABILITIES;
     const thinkingLevel = this.resolveThinkingLevel(role, options.thinkingLevel);
     const isolatedReview = options.isolatedReview;
     const reviewLead = options.reviewLead;
@@ -460,6 +423,25 @@ export class ClaudeCodeRuntime implements AgentRuntime {
             '(use the pi runtime for parent child-worker tools — declared capability gap, issue #161)',
         );
       }
+      // Owner decision 2026-10-15: ordinary sessions load no ambient MCP
+      // servers unless [runtimes.claude-code] mcp opts in. --tools restricts
+      // built-ins only, so without this every server in the operator's own
+      // Claude configuration (claude.ai connectors included) would run under
+      // bypassPermissions regardless of the role's declared tools.
+      // A narrowed tool set (a bounded child worker) never gains ambient MCP:
+      // those tools would sidestep its narrowed roleTools. Project servers are
+      // lane content: only a role whose own tools include a shell (it could
+      // run any such command already) loads them — see
+      // checkedInProjectMcpConfig. Project mode is resolved per turn (each
+      // turn is a fresh CLI process).
+      const mcpMode = this.config.runtimes.policies['claude-code']?.mcp ?? DEFAULT_CLAUDE_MCP_MODE;
+      const shellRole = roleDef.tools.includes('bash');
+      const ambientMcp: HandleParams['ambientMcp'] =
+        reviewMode !== undefined || mcpMode === 'none' || options.roleTools !== undefined ? { mode: 'none' }
+          : mcpMode === 'user' ? { mode: 'user' } : shellRole ? { mode: 'project' } : { mode: 'none' };
+      if (reviewMode === undefined && mcpMode === 'project' && options.roleTools === undefined && !shellRole) {
+        this.log('info', 'mcp = "project": a role without a shell loads no project MCP servers', { role });
+      }
       const declaredNativeTools = reviewMode !== undefined ? reviewMode.nativeTools : undefined;
       if (declaredNativeTools !== undefined && declaredNativeTools.length > 0) {
         reviewBridge = await ReviewMcpBridge.start(declaredNativeTools);
@@ -545,6 +527,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
           ...(reviewConfiguration !== undefined ? { reviewAuthEnv: claudeReviewProcessEnv(reviewConfiguration) } : {}),
           fileTools,
           nativeTools,
+          ambientMcp,
           ...(reviewBridge !== undefined ? {
               mcpConfigFile: reviewBridge.configFile,
               reviewBridge,
@@ -645,6 +628,11 @@ interface HandleParams {
   /** Raw perkins_* names wired through the bridge (capability declaration). */
   readonly reviewTools?: readonly string[];
   readonly mcpConfigFile?: string;
+  /** MCP servers an ordinary (non-review) session loads; absent = none.
+   * Review sessions always run strict with only their scoped bridge. A
+   * project entry carries the checked-in file resolved for THIS turn (no
+   * file = nothing loadable this turn: strict, no --mcp-config). */
+  readonly ambientMcp?: { readonly mode: 'none' } | { readonly mode: 'user' } | { readonly mode: 'project'; readonly file?: string };
   readonly reviewBridge?: ReviewMcpBridge;
   readonly killGraceMs: number;
   readonly resume: boolean;
@@ -696,6 +684,11 @@ export function claudeTurnArgs(params: HandleParams, resume: boolean): string[] 
     if (allowed.length > 0) args.push('--allowedTools', allowed.join(','));
     if (params.mcpConfigFile !== undefined) args.push('--mcp-config', params.mcpConfigFile);
   }
+  if (!params.isolatedReview) {
+    const mcp = params.ambientMcp ?? { mode: 'none' };
+    if (mcp.mode !== 'user') args.push('--strict-mcp-config');
+    if (mcp.mode === 'project' && mcp.file !== undefined) args.push('--mcp-config', mcp.file);
+  }
   if (params.verificationSettingsFile !== undefined && !params.isolatedReview) {
     // Native ask reaches the original-child-bound host, even in bypass mode.
     args.push('--settings', params.verificationSettingsFile, '--permission-prompt-tool', 'stdio');
@@ -706,6 +699,222 @@ export function claudeTurnArgs(params: HandleParams, resume: boolean): string[] 
   if (params.model !== undefined) args.push('--model', params.model);
   if (params.thinkingLevel !== undefined) args.push('--effort', params.thinkingLevel);
   return args;
+}
+
+/**
+ * The in-band error for a turn whose result reports `is_error`. When the CLI
+ * attached a provider failure (synthetic API-error message / result
+ * `api_error_status`), the event carries typed provider-response provenance
+ * plus the provider/model identity — so a Claude usage limit reaches the
+ * same quota-wall stop, bounded rate-limit retry and provider-recovery wait
+ * as a pi lane, instead of an unclassified error that strands the lane. The
+ * `(HTTP <status>, <code>)` suffix renders those typed facts in the shape the
+ * deterministic classifiers read (the role pi-ai's `429: {…}` lines play).
+ */
+export function claudeInBandError(
+  result: ResultInfo,
+  apiError: ApiErrorInfo | null,
+  model: string | null,
+): Extract<RuntimeEvent, { type: 'error' }> {
+  const text = result.text ?? apiError?.text ?? `turn ended with result subtype "${result.subtype}"`;
+  const status = apiError?.status ?? result.apiErrorStatus;
+  const code = apiError?.code ?? null;
+  // A provider failure is typed whenever the CLI attached either fact — a
+  // code without an HTTP status still names the provider's failure class.
+  if (status === null && code === null) return { type: 'error', error: text, fatal: false };
+  const facts = [status !== null ? `HTTP ${status}` : null, code].filter((fact): fact is string => fact !== null);
+  return {
+    type: 'error',
+    error: `${text} (${facts.join(', ')})`,
+    fatal: false,
+    ...(model !== null && model !== '' ? { provider: CLAUDE_NATIVE_PROVIDER, model } : {}),
+    typed: { origin: 'provider-message', ...(status !== null ? { status } : {}), ...(code !== null ? { bodyCode: code } : {}) },
+  };
+}
+
+/** The first stderr line (or the spawn/timeout failure) of a failed git run. */
+export function gitFailure(error: unknown): string {
+  const failure = error as { readonly stderr?: Buffer | string; readonly signal?: string | null; readonly message?: string };
+  const stderr = failure.stderr === undefined ? '' : String(failure.stderr).trim().split('\n')[0] ?? '';
+  if (stderr !== '') return stderr;
+  if (failure.signal !== undefined && failure.signal !== null) return `git killed by ${failure.signal}`;
+  return failure.message ?? String(error);
+}
+
+/**
+ * `mcp = "project"` loads the cwd's checked-in servers: the `.mcp.json` blob
+ * committed at HEAD, and only while the working file is a regular file
+ * (never a symlink) byte-identical to it. An untracked, staged-only, edited
+ * or symlinked file never loads, and the CLI reads a private copy of the
+ * verified bytes — never the lane path, which a later write could swap.
+ *
+ * Trust boundary: HEAD is lane state, and a session with a shell can commit
+ * its own `.mcp.json` (every git ref is writable from a worktree, so no ref
+ * is safe from it). That grants such a session nothing it lacks — a project
+ * server is a command it could already run — which is why only roles whose
+ * own tools include a shell load project servers at all: a read-only role
+ * never runs a command another session committed.
+ */
+export async function checkedInProjectMcpConfig(
+  cwd: string,
+): Promise<{ readonly config: Buffer } | { readonly reason: string; readonly infrastructure?: true }> {
+  const file = join(cwd, '.mcp.json');
+  try {
+    if (!(await lstat(file)).isFile()) return { reason: '.mcp.json is not a regular file (symlink or other)' };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { reason: 'no .mcp.json in the session cwd' };
+    return { reason: `.mcp.json cannot be inspected: ${String(error)}`, infrastructure: true };
+  }
+  // Routing variables inherited by the service never redirect the check to
+  // another repository: HEAD is the session cwd's own.
+  const git = async (args: readonly string[]): Promise<Buffer> =>
+    (await execFileAsync('git', [...args], {
+      cwd, env: repositoryGitEnv(true), encoding: 'buffer', timeout: 10_000, maxBuffer: 1 << 20, windowsHide: true,
+    })).stdout;
+  let entry: string;
+  try {
+    entry = (await git(['ls-tree', '-z', 'HEAD', '--', '.mcp.json'])).toString('utf8');
+  } catch (error) {
+    return { reason: `git cannot read HEAD in the session cwd: ${gitFailure(error)}`, infrastructure: true };
+  }
+  if (entry === '') return { reason: '.mcp.json is not committed at HEAD' };
+  // "<mode> <type> <object>\t<path>\0" — a committed symlink (120000), tree
+  // or submodule is never a server list.
+  const committedEntry = /^(100644|100755) blob ([0-9a-f]+)\t/u.exec(entry);
+  if (committedEntry === null) return { reason: 'the committed .mcp.json is not a regular file' };
+  let committed: Buffer;
+  try {
+    committed = await git(['cat-file', 'blob', committedEntry[2]!]);
+  } catch (error) {
+    return { reason: `git cannot read the committed .mcp.json: ${gitFailure(error)}`, infrastructure: true };
+  }
+  // The working file is read through ONE no-follow descriptor, bounded by the
+  // largest size a line-ending conversion of the committed bytes could have:
+  // a file grown or swapped after the first look is never read past it.
+  const committedText = committed.toString('utf8');
+  const limit = committed.length + (committedText.split('\n').length - 1) - (committedText.split('\r\n').length - 1);
+  let working: Buffer;
+  try {
+    // O_NONBLOCK: a FIFO swapped in after the first look never blocks the
+    // open — the fstat below refuses it (harmless for a regular file).
+    const handle = await open(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0));
+    try {
+      if (!(await handle.stat()).isFile()) return { reason: '.mcp.json is not a regular file (symlink or other)' };
+      const buffer = Buffer.alloc(limit + 1);
+      let length = 0;
+      for (;;) {
+        const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
+        if (bytesRead === 0) break;
+        length += bytesRead;
+        if (length > limit) return { reason: '.mcp.json differs from its committed version' };
+      }
+      working = buffer.subarray(0, length);
+    } finally {
+      await handle.close();
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ELOOP') return { reason: '.mcp.json is not a regular file (symlink or other)' };
+    return { reason: `.mcp.json cannot be read: ${String(error)}`, infrastructure: true };
+  }
+  if (!working.equals(committed)) return differsFromCommitted(working, committed);
+  // Only what the CLI treats as FATAL is refused here: unparseable JSON, a
+  // non-object, or no `mcpServers` object — it would exit on every turn. A
+  // server entry it cannot load is skipped by the CLI itself, never fatal,
+  // and logged from the init frame (noteMcpServerProblems).
+  const bom = committedText.startsWith('\uFEFF') ? 1 : 0;
+  let parsed: unknown;
+  try {
+    // One leading BOM is stripped, exactly as the CLI reads the file.
+    parsed = JSON.parse(committedText.slice(bom));
+  } catch (error) {
+    // Never the parser's message: V8 quotes source text, and .mcp.json files
+    // carry tokens. Only the location from V8's own anchored suffix (never
+    // digits from its quoted snippet): line and column as an editor shows
+    // them (a BOM is invisible there, so stripping it shifts nothing). A
+    // message without that suffix (V8 quoted the source instead) gives none.
+    const at = / at position \d+ \(line (\d+) column (\d+)\)$/u.exec(error instanceof Error ? error.message : '');
+    return { reason: `the committed .mcp.json is not valid JSON${at === null ? '' : ` (at line ${at[1]}, column ${at[2]})`}` };
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { reason: 'the committed .mcp.json is not a JSON object' };
+  }
+  // The CLI requires an `mcpServers` record and fails every turn without one.
+  const servers = (parsed as Record<string, unknown>)['mcpServers'];
+  if (servers === null || typeof servers !== 'object' || Array.isArray(servers)) {
+    return { reason: 'the committed .mcp.json has no "mcpServers" object' };
+  }
+  return { config: committed };
+}
+
+/** The refusal for a working file that is not the committed bytes. The
+ * comparison is byte-exact (git's eol/smudge conversion is never run — it
+ * would execute lane-configured filters), so a line-ending-only difference
+ * gets its own reason instead of looking like an edit. */
+function differsFromCommitted(working: Buffer, committed: Buffer): { readonly reason: string } {
+  // Either direction (LF committed / CRLF checked out, or the reverse),
+  // compared as BYTES: invalid UTF-8 never decodes into a false match.
+  if (withoutCrBeforeLf(working).equals(withoutCrBeforeLf(committed))) {
+    return { reason: '.mcp.json differs from its committed bytes only in line endings (autocrlf/eol conversion); only byte-identical files load' };
+  }
+  return { reason: '.mcp.json differs from its committed version' };
+}
+
+/** The bytes with every CR that precedes an LF removed (CRLF → LF). */
+function withoutCrBeforeLf(bytes: Buffer): Buffer {
+  const out = Buffer.alloc(bytes.length);
+  let length = 0;
+  for (let i = 0; i < bytes.length; i += 1) {
+    if (bytes[i] === 0x0d && bytes[i + 1] === 0x0a) continue;
+    out[length] = bytes[i]!;
+    length += 1;
+  }
+  return out.subarray(0, length);
+}
+
+/** Whether a server name the CLI reports may be logged. Names come straight
+ * from config — the CLI does not apply its own name rule to config files, so a
+ * key can be a credential URL — so only a label is logged: a letter or number
+ * of any script, then letters, numbers and combining marks with `_ . -`,
+ * parentheses (the CLI's own `claude.ai X (2)`) and spaces, or the CLI's own
+ * `plugin:<plugin>:<server>` form, up to 80 characters (code points); never a
+ * URL or an address (`/`, `@`, any other `:`), and never a credential-shaped
+ * run. */
+export function loggableMcpServerName(name: string): boolean {
+  // 80 code points are at most 160 UTF-16 units, so a longer name — the CLI
+  // echoes a config key of any size — is refused before it is spread.
+  if (name.length === 0 || name.length > 160 || [...name].length > 80) return false;
+  const label = '[\\p{L}\\p{N}][\\p{L}\\p{M}\\p{N}_. ()-]*';
+  if (!new RegExp(`^(?:${label}|plugin:${label}:${label})$`, 'u').test(name)) return false;
+  return !credentialShaped(name);
+}
+
+/** 24+ ASCII letters and digits in a row, or a UUID — counted with combining
+ * marks removed, so marks cannot split a run, and without case folding, so
+ * only ASCII letters count. */
+function credentialShaped(text: string): boolean {
+  return /[A-Za-z0-9]{24}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/u
+    .test(text.replace(/\p{M}/gu, ''));
+}
+
+/** The private copy of the verified project servers handed to --mcp-config:
+ * beside the session's own transcript (GC-owned; the store lists only
+ * `.jsonl`), owner-only, rewritten every turn and removed at disposal. Each
+ * handle has its own token, so a disposed handle's late check never touches
+ * the copy of the handle that resumed the same session. */
+export function projectMcpCopyPath(sessionFile: string, handleToken: string): string {
+  return `${sessionFile}.${handleToken}.project-mcp.json`;
+}
+
+/** One handle's copy token: 8 lowercase hex characters (the single format
+ * the sweep recognizes — see isProjectMcpCopyName). */
+export function projectMcpCopyToken(): string {
+  return randomUUID().slice(0, 8);
+}
+
+/** Whether a directory entry is exactly a project-MCP copy of the session
+ * whose file is `sessionBase` — never its .lock, never another session. */
+export function isProjectMcpCopyName(sessionBase: string, name: string): boolean {
+  return name.startsWith(`${sessionBase}.`) && /^[0-9a-f]{8}\.project-mcp\.json$/u.test(name.slice(sessionBase.length + 1));
 }
 
 /** The stdin user frame for one prompt (image blocks first, then text). */
@@ -770,6 +979,16 @@ export class ClaudeCodeHandle implements AgentHandle {
   private readonly closedVerificationChildren = new WeakSet<ChildProcess>();
   private verificationCleaned = false;
   private disposalPromise: Promise<void> | null = null;
+  /** Last logged reason project MCP loaded nothing (logged once per change). */
+  private projectMcpNote: string | null = null;
+  /** This handle's own project-MCP copy (see projectMcpCopyPath). */
+  private readonly projectMcpCopy: string;
+  private projectMcpSwept = false;
+  /** The last distinct set of MCP load problems logged (see noteMcpServerProblems). */
+  private mcpServerProblemsNote: string | null = null;
+  /** A turn is resolving its params (the project-MCP git check): the
+   * operation slot is held exactly as by a live child. */
+  private preparingTurn = false;
 
   constructor(
     role: Role,
@@ -789,6 +1008,7 @@ export class ClaudeCodeHandle implements AgentHandle {
     this.capabilities = capabilities;
     this.id = agentId ?? params.sessionId;
     this.sessionFile = params.sessionFile;
+    this.projectMcpCopy = projectMcpCopyPath(params.sessionFile, projectMcpCopyToken());
     if (params.isolatedReview) this.reviewIsolation = true;
     if (params.reviewTools !== undefined && params.reviewTools.length > 0) {
       this.reviewTools = [...params.reviewTools];
@@ -841,7 +1061,7 @@ export class ClaudeCodeHandle implements AgentHandle {
     if (text === '' && (options.images === undefined || options.images.length === 0)) {
       throw new Error('empty prompt: nothing to send (no text, no images)');
     }
-    if (this.live !== null || this.compacting) {
+    if (this.live !== null || this.preparingTurn || this.compacting) {
       throw new Error(
         'claude-code turn in flight or control active — one operation at a time per session ' +
           '(the interface fallback serializes product callers; direct callers must wait)',
@@ -861,7 +1081,7 @@ export class ClaudeCodeHandle implements AgentHandle {
   }
 
   canCompact = (): boolean =>
-    !this.disposed && this.sessionEstablished && this.live === null && !this.compacting;
+    !this.disposed && this.sessionEstablished && this.live === null && !this.preparingTurn && !this.compacting;
 
   isCompacting = (): boolean => this.compacting;
 
@@ -874,7 +1094,7 @@ export class ClaudeCodeHandle implements AgentHandle {
     if (!this.sessionEstablished) {
       throw new Error('claude-code session is not established; nothing can be compacted');
     }
-    if (this.live !== null || this.compacting) {
+    if (this.live !== null || this.preparingTurn || this.compacting) {
       throw new Error('agent session is busy; compaction requires an idle session');
     }
     this.compacting = true;
@@ -1011,6 +1231,7 @@ export class ClaudeCodeHandle implements AgentHandle {
         this.setState('disposed');
         this.onDispose();
         this.cleanupVerificationSettings();
+        this.cleanupProjectMcpCopy();
         this.emitEvidence();
       }
     }
@@ -1029,6 +1250,98 @@ export class ClaudeCodeHandle implements AgentHandle {
       }
       this.cleanupVerificationSettings();
       if (this.disposed) this.emitEvidence();
+    });
+  }
+
+  /** Log the MCP servers the CLI could not load — entries it skipped
+   * (mcp_server_errors), servers it kept but could not start (status
+   * "failed") and servers from GC's own config that need sign-in (status
+   * "needs-auth", source "dynamic") — once per distinct set (a set that
+   * clears resets, so a later recurrence is logged again). */
+  private noteMcpServerProblems(errors: unknown, servers: unknown): void {
+    const record = (value: unknown): Record<string, unknown> =>
+      typeof value === 'object' && value !== null ? value as Record<string, unknown> : {};
+    const named = (entry: Record<string, unknown>): string | null => typeof entry['name'] === 'string' ? entry['name'] : null;
+    const problems: { readonly name: string | null; readonly why: string }[] = [];
+    // Never the CLI's free text — it pastes rejected values in unescaped, and
+    // no redaction of free text is airtight — only its skip-reason code
+    // (`invalid_config`, `unknown_type`, …), accepted only when it looks like
+    // one and holds no credential-shaped run. The CLI's own --debug log
+    // carries the details.
+    for (const error of Array.isArray(errors) ? errors : []) {
+      const entry = record(error);
+      const type = entry['type'];
+      const code = typeof type === 'string' && /^[a-z][a-z0-9_-]{0,39}$/u.test(type) && !credentialShaped(type) ? type : 'unknown reason';
+      problems.push({ name: named(entry), why: `skipped (${code})` });
+    }
+    // A server the CLI kept but could not start (a missing env var, a broken
+    // command) shows only as status "failed"; one from GC's own config that
+    // needs OAuth ("needs-auth", source "dynamic") can never sign in from a
+    // headless session. The operator's own connectors (user mode, other
+    // sources) are not GC's to report. In user mode an entry the CLI's
+    // validation rejects leaves no signal at all, so it cannot be logged.
+    for (const entry of (Array.isArray(servers) ? servers : []).map(record)) {
+      if (entry['status'] === 'failed') problems.push({ name: named(entry), why: 'failed to start' });
+      else if (entry['status'] === 'needs-auth' && entry['source'] === 'dynamic') {
+        problems.push({ name: named(entry), why: 'needs authentication (a headless session cannot sign in)' });
+      }
+    }
+    if (problems.length === 0) {
+      this.mcpServerProblemsNote = null;
+      return;
+    }
+    // Deduped on a digest of the RAW problems in any order — the raw names
+    // are never logged or kept — so two different sets never collapse into
+    // one because their names are withheld.
+    const note = createHash('sha256').update(JSON.stringify(problems.map((problem) => JSON.stringify(problem)).sort())).digest('hex');
+    if (note === this.mcpServerProblemsNote) return;
+    this.mcpServerProblemsNote = note;
+    // Withheld names are numbered within this entry, one number per name.
+    const withheld = new Map<string, number>();
+    const shown = (name: string | null): string => {
+      if (name === null) return '?';
+      if (loggableMcpServerName(name)) return name;
+      const ordinal = withheld.get(name) ?? withheld.size + 1;
+      withheld.set(name, ordinal);
+      return `(name withheld #${ordinal})`;
+    };
+    const lines = problems.map(({ name, why }) => `${shown(name)}: ${why}`);
+    this.log('warn', 'claude could not load some MCP servers', {
+      cwd: this.params.cwd, servers: lines.slice(0, 20), total: lines.length,
+    });
+  }
+
+  /** A predecessor that crashed (never disposed) left its copy beside the
+   * transcript: this handle holds the session lock and sweeps before its
+   * first write, so every copy of the session is stale and is removed —
+   * failures logged, never fatal. */
+  private async sweepStaleProjectMcpCopies(): Promise<void> {
+    const dir = dirname(this.params.sessionFile);
+    const base = basename(this.params.sessionFile);
+    let names: string[];
+    try {
+      names = await readdir(dir);
+    } catch (error) {
+      this.log('warn', 'project MCP copy sweep could not list the session directory', { dir, error: String(error) });
+      return;
+    }
+    for (const name of names) {
+      const path = join(dir, name);
+      // Exactly `<this session>.<token>.project-mcp.json` — never a copy of
+      // another session whose file name happens to extend this one.
+      if (!isProjectMcpCopyName(base, name)) continue;
+      await rm(path, { force: true }).catch((error: unknown) => {
+        this.log('warn', 'stale project MCP copy could not be removed', { file: path, error: String(error) });
+      });
+    }
+  }
+
+  /** The private project-servers copy lives only as long as the session. */
+  private cleanupProjectMcpCopy(): void {
+    if (this.params.ambientMcp?.mode !== 'project') return;
+    const copy = this.projectMcpCopy;
+    void rm(copy, { force: true }).catch((error: unknown) => {
+      this.log('warn', 'project MCP copy cleanup failed', { file: copy, error: String(error) });
     });
   }
 
@@ -1086,11 +1399,81 @@ export class ClaudeCodeHandle implements AgentHandle {
     }
   }
 
+  /** `mcp = "project"` servers for this operation: re-resolved every turn
+   * and compaction (each is a fresh CLI process, and the lane's file may
+   * have changed since). Every other session spawns synchronously from its
+   * fixed params and never comes here. */
+  private async projectTurnParams(): Promise<HandleParams> {
+    if (!this.projectMcpSwept) {
+      this.projectMcpSwept = true;
+      await this.sweepStaleProjectMcpCopies();
+    }
+    const resolved = await checkedInProjectMcpConfig(this.params.cwd);
+    const copy = this.projectMcpCopy;
+    if ('reason' in resolved) {
+      await rm(copy, { force: true });
+      if (this.projectMcpNote !== resolved.reason) {
+        this.projectMcpNote = resolved.reason;
+        // Fails closed either way; a git/file failure is the operator's to fix.
+        this.log(resolved.infrastructure === true ? 'warn' : 'info', 'mcp = "project": no project MCP servers loaded', {
+          cwd: this.params.cwd, reason: resolved.reason,
+        });
+      }
+      return { ...this.params, ambientMcp: { mode: 'project' } };
+    }
+    if (this.disposed) throw new Error('agent session disposed');
+    await writeFile(copy, resolved.config, { mode: 0o600 });
+    this.projectMcpNote = null;
+    return { ...this.params, ambientMcp: { mode: 'project', file: copy } };
+  }
+
+  /** Run one CLI process with this operation's params. A project-mode check
+   * runs off the event loop while the session's one operation slot stays
+   * held; the slot is released, and disposal re-checked, in the same step
+   * that spawns — never a window for a second operation or a post-disposal
+   * child. A refused or unreadable `.mcp.json` fails closed (the process runs
+   * with no project servers, logged); only a failure to write or remove the
+   * private copy fails the operation. `onNotSpawned` hears every path that
+   * spawns nothing: disposal (null) or that failure (its detail). */
+  private withTurnParams(
+    spawnWith: (params: HandleParams) => Promise<void>,
+    onNotSpawned?: (failure: string | null) => void,
+  ): Promise<void> {
+    if (this.params.ambientMcp?.mode !== 'project') return spawnWith(this.params);
+    this.preparingTurn = true;
+    return this.projectTurnParams().then(
+      (params) => {
+        this.preparingTurn = false;
+        if (this.disposed) {
+          // Disposal's own cleanup may have run before this check wrote.
+          this.cleanupProjectMcpCopy();
+          onNotSpawned?.(null);
+          throw new Error('agent session disposed');
+        }
+        return spawnWith(params);
+      },
+      (error: unknown) => {
+        this.preparingTurn = false;
+        if (this.disposed) {
+          this.cleanupProjectMcpCopy();
+          onNotSpawned?.(null);
+          throw new Error('agent session disposed');
+        }
+        const detail = `claude turn could not be prepared: ${error instanceof Error ? error.message : String(error)}`;
+        onNotSpawned?.(detail);
+        throw new Error(detail);
+      },
+    );
+  }
+
   /** A dedicated, resumed native slash-command process. Its machine frames
    * remain in the native transcript for forensics, but content events are
    * intentionally discarded so `/compact` output can never become chat text. */
   private runCompactionControl(): Promise<void> {
-    const params = this.params;
+    return this.withTurnParams((params) => this.spawnCompaction(params));
+  }
+
+  private spawnCompaction(params: HandleParams): Promise<void> {
     const translator = new ClaudeControlTranslator();
 
     return new Promise<void>((resolve, reject) => {
@@ -1290,14 +1673,37 @@ export class ClaudeCodeHandle implements AgentHandle {
 
   private runTurn(text: string, owner: string | null, images?: PromptOptions['images']): Promise<void> {
     this.setState('spawning');
-    const params = this.params;
-    const translator = new ClaudeTurnTranslator();
-    let turnStarted = false;
+    // The accepted prompt is the pending turn from this moment — through a
+    // project-mode check too — so a supervisor capture never misses it.
     this.livePrompt = {
       text,
       owner,
       ...(images !== undefined && images.length > 0 ? { images } : {}),
     };
+    const accepted = this.livePrompt;
+    return this.withTurnParams((params) => this.spawnTurn(params), (failure) => {
+      // Error first, exactly as a failed spawn reports: an error-time capture
+      // (the supervisor's restart snapshot) still sees the accepted prompt.
+      if (failure !== null) {
+        this.emit({ type: 'error', error: failure, fatal: false });
+        // A subscriber that re-prompted from the error owns the state now.
+        // Nothing else changes livePrompt during the emit: this path exists
+        // only in project mode, where a re-prompt stays asynchronous, and
+        // disposal never clears it.
+        if (this.livePrompt === accepted) this.setState('error', failure);
+      }
+      // Only this turn's prompt: a subscriber may already have re-prompted.
+      if (this.livePrompt === accepted) this.livePrompt = null;
+    });
+  }
+
+  private spawnTurn(params: HandleParams): Promise<void> {
+    const translator = new ClaudeTurnTranslator();
+    let turnStarted = false;
+    const livePrompt = this.livePrompt;
+    if (livePrompt === null) throw new Error('claude turn spawned without its accepted prompt');
+    const { text } = livePrompt;
+    const images = livePrompt.images;
 
     return new Promise<void>((resolve, reject) => {
       let settled = false;
@@ -1382,6 +1788,23 @@ export class ClaudeCodeHandle implements AgentHandle {
             }
             return;
           }
+          // Servers the CLI skipped (mcp_server_errors, --mcp-config only),
+          // kept but could not start (status "failed"), or that need a
+          // sign-in a headless session cannot give are logged once per
+          // distinct set. (In user mode an entry the CLI's validation
+          // rejects leaves no signal at all.)
+          this.noteMcpServerProblems(frame['mcp_server_errors'], frame['mcp_servers']);
+          // Record what this turn was asked right after its verified identity
+          // frame: stdout carries only claude's side of the conversation. Not
+          // the CLI's --replay-user-messages: it also echoes the permission
+          // control_responses the worker-verification channel writes, which
+          // that channel rightly fails closed on as foreign frames.
+          transcript.write(`${JSON.stringify({
+            ...claudePromptFrame(text, images),
+            session_id: params.sessionId,
+            timestamp: new Date().toISOString(),
+            gc_prompt: true,
+          })}\n`);
           this.setState('streaming');
           this.emit({ type: 'turn_start' });
           this.sessionEstablished = true;
@@ -1442,9 +1865,9 @@ export class ClaudeCodeHandle implements AgentHandle {
             if (result.isError) {
               // In-band error (pi W7 parity): the turn COMPLETED with an
               // error — resolve, sticky error state, next turn recovers.
-              const detail = result.text ?? `turn ended with result subtype "${result.subtype}"`;
-              this.emit({ type: 'error', error: detail, fatal: false });
-              this.setState('error', detail);
+              const event = claudeInBandError(result, translator.apiError, translator.init?.model ?? params.model ?? null);
+              this.emit(event);
+              this.setState('error', event.error);
             } else {
               this.setState('idle');
             }

@@ -668,6 +668,16 @@ export class RuntimeRegistry {
           }
         : {},
     );
+    if (policy.passedOver !== undefined) {
+      // Claude Code is always Anthropic: shared-tier pi references never reach
+      // its CLI. Logged where production resolves the policy (never silent).
+      this.log('info', 'claude-code passed over pi references in shared [models]/[thinking] tiers', {
+        role,
+        passed_over: policy.passedOver.map(({ tier, ref }) => `${tier} = ${ref}`),
+        model: policy.model,
+        thinking_level: policy.thinkingLevel,
+      });
+    }
     const thinkingLevel = applyThinkingFallback(adapter, policy.thinkingLevel, this.log);
     // Assignment lookup must see the same canonical URI/tilde path that both
     // adapters lock/open, otherwise a legitimate recorded resume looks unowned.

@@ -2623,6 +2623,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/dispatch/work-revision.js",
   "dist/dispatch/worktree-port.js",
   "dist/events/bus.js",
+  "dist/git-env.js",
   "dist/gru-mailbox/projection.js",
   "dist/gru-mailbox/service.js",
   "dist/gru-mailbox/types.js",

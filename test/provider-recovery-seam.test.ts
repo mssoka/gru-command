@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
@@ -21,7 +21,10 @@ import type {
 } from '../src/runtime/types.js';
 import type { AgentEventEnvelope } from '../src/runtime/registry.js';
 import { publishSpawnRegistration } from '../src/runtime/spawn-registration.js';
-import { establishProviderWait, ProviderRecoverySensor } from '../src/provider-recovery/sensor.js';
+import { establishProviderWait, handBackThenStartSupervision, ProviderRecoverySensor, type MetadataReaderPort } from '../src/provider-recovery/sensor.js';
+import { composeMetadataReaders, type NativeCommandPort } from '../src/provider-recovery/composition.js';
+import { CLAUDE_METADATA_ENDPOINT } from '../src/provider-recovery/metadata.js';
+import { claudeInBandError } from '../src/runtime/claude-adapter.js';
 import { claimProviderRecoveryContinuation } from '../src/provider-recovery/resume.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
@@ -191,7 +194,11 @@ class SeamHarness {
   supervisor: Supervisor;
   sensor: ProviderRecoverySensor;
 
-  constructor(pacing: Pick<SupervisorOptions, 'rateLimitBackoff' | 'sleep' | 'jitter'> = {}, glmGenerationFallback = false) {
+  constructor(
+    pacing: Pick<SupervisorOptions, 'rateLimitBackoff' | 'sleep' | 'jitter'> = {},
+    glmGenerationFallback = false,
+    metadataReaders?: Readonly<Record<string, MetadataReaderPort>>,
+  ) {
     const dir = mkdtempSync(join(tmpdir(), 'gru-command-pr-seam-'));
     cleanupDirs.push(dir);
     const db = new LedgerDb(dir);
@@ -209,6 +216,7 @@ class SeamHarness {
         },
       },
       silasHosted: () => true,
+      ...(metadataReaders !== undefined ? { metadataReaders } : {}),
     });
     const sensor = this.sensor;
     this.supervisor = new Supervisor({
@@ -293,8 +301,16 @@ class SeamHarness {
     return handle;
   }
 
-  /** A live minion with an open turn, then a structured GLM quota error. */
-  async runMinionIntoQuotaWall(jobId: string): Promise<FakeHandle> {
+  /** A live minion with an open turn, then a structured quota error (GLM
+   * unless the caller supplies the runtime's own event). */
+  async runMinionIntoQuotaWall(jobId: string, error: RuntimeEvent = {
+    type: 'error',
+    error: '429: {"error":{"code":"1302","message":"usage window limit reached"}}',
+    fatal: false,
+    provider: 'zai-coding-cn',
+    model: 'glm-5.3',
+    typed: { origin: 'provider-message', status: 429, bodyCode: '1302' },
+  }): Promise<FakeHandle> {
     const sessionDir = mkdtempSync(join(tmpdir(), 'pr-seam-session-'));
     cleanupDirs.push(sessionDir);
     const sessionFile = join(sessionDir, 'minion.jsonl');
@@ -313,14 +329,7 @@ class SeamHarness {
     this.ledger.registerAgent({ id: handle.id, role: 'minion', jobId, sessionFile });
     // Open turn, then the provider rejection.
     handle.emit({ type: 'turn_start' });
-    handle.emit({
-      type: 'error',
-      error: '429: {"error":{"code":"1302","message":"usage window limit reached"}}',
-      fatal: false,
-      provider: 'zai-coding-cn',
-      model: 'glm-5.3',
-      typed: { origin: 'provider-message', status: 429, bodyCode: '1302' },
-    });
+    handle.emit(error);
     return handle;
   }
 
@@ -508,6 +517,45 @@ describe('supervisor ⇄ sensor seam', () => {
     expect(handle.disposed).toBe(true);
   });
 
+  it('a claude-code usage-limit wall becomes a provider wait on the native claude.ai route — never a stranded lane', async () => {
+    const keychain: NativeCommandPort = {
+      findGenericPassword: () => Promise.resolve({ exitCode: 0, stdout: JSON.stringify({
+        claudeAiOauth: { accessToken: 'claude-access-token', expiresAt: Date.now() + 3_600_000, subscription: 'max' },
+      }) }),
+    };
+    const h = new SeamHarness({}, false, composeMetadataReaders({
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, probeTimeoutMs: 30_000 },
+      fetch: { get: () => Promise.reject(new Error('establishment never reads usage metadata')) },
+      claude: { command: keychain, context: () => ({ overridesPresent: false }), account: () => 'fixture-user' },
+    }));
+    // Production truth: pi's catalog has no route for the native login.
+    h.probe.resolveRoute = () => Promise.resolve(null);
+    // The exact event the claude-code adapter emits for the CLI's
+    // usage-limit frames (synthetic message + api_error_status 429).
+    const text = "You've hit your limit · resets 3pm (UTC)";
+    const claudeWall = claudeInBandError(
+      { subtype: 'success', isError: true, text, apiErrorStatus: 429 },
+      { text, code: 'rate_limit', status: 429 },
+      'claude-opus-5-5',
+    );
+    const handle = await h.runMinionIntoQuotaWall('job-claude-wall', claudeWall);
+    await h.settle();
+    const incident = h.ledger.listNotifications({ unackedOnly: true })
+      .find((n) => n.kind.startsWith('supervision.provider-wall.'));
+    expect(incident?.kind).toBe(`supervision.provider-wall.${handle.id}.quota_wall`);
+    expect(incident?.routing).toBe('action-required');
+    const waits = h.ledger.listProviderWaits({ status: 'waiting' });
+    expect(waits).toHaveLength(1);
+    expect(waits[0]).toMatchObject({
+      agentId: handle.id,
+      provider: 'anthropic-claude-native',
+      model: 'claude-opus-5-5',
+      endpoint: CLAUDE_METADATA_ENDPOINT,
+      incidentId: incident?.id,
+    });
+    expect(handle.disposed).toBe(true);
+  });
+
   it('a jobless Silas notification disposition cannot bypass its open provider wait', async () => {
     const h = new SeamHarness();
     try {
@@ -530,6 +578,62 @@ describe('supervisor ⇄ sensor seam', () => {
       h.supervisor.dispose();
       h.sensor.stop();
     }
+  });
+
+  it('a provider switch turned off across a restart hands the stopped lane to Gru with a re-arm control — the hand-back runs before hydration', async () => {
+    const h = new SeamHarness();
+    const handle = await h.runMinionIntoQuotaWall('job-recovery-off');
+    await h.settle();
+    const wait = h.ledger.openProviderWaitForAgent(handle.id);
+    expect(wait).not.toBeNull();
+    // The service restarts with automatic GLM recovery now off.
+    h.supervisor.dispose();
+    h.sensor.stop();
+    const off = new ProviderRecoverySensor({
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: false },
+      ledger: h.ledger, probe: h.probe, notifications: h.notifications,
+      wake: { trigger: async () => {} }, silasHosted: () => true,
+    });
+    const restarted = new Supervisor({
+      config: { enabled: true, turnSilenceMs: 60_000, restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1_000 },
+      registry: h.registry, ledger: h.ledger, notifications: h.notifications,
+      tickMs: 5_000, now: () => Date.parse('2026-09-28T10:00:00Z'),
+    });
+    try {
+      handBackThenStartSupervision(off, restarted, () => {});
+      (restarted as unknown as { tick(): void }).tick();
+      expect(h.ledger.getProviderWait(wait!.id)?.status).toBe('cancelled');
+      expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${wait!.id}`, 'unacked')?.routing).toBe('action-required');
+      // The stop hydrated with no open control, so Gru holds a fresh re-arm
+      // control — its "resume" — rather than one bound to a resolved row.
+      // Like every restored stop's, it re-arms once a live agent is adopted;
+      // the cancelled wait no longer fences it.
+      const control = h.ledger.findNotificationByKind('supervision.rearm-fenced', 'active');
+      expect(control).toMatchObject({ routing: 'action-required', agentId: handle.id });
+      expect(restarted.onNotificationDisposed(control!.id)).toEqual({ ok: false,
+        reason: 'restored breaker has not been adopted by a live agent yet; keep this control open and retry after adoption' });
+      // Once a live agent is adopted, Gru's disposition re-arms the lane.
+      const live = new FakeHandle('minion', handle.id, handle.sessionFile!);
+      h.registry.handles.set(live.id, live);
+      h.registry.emit({ agentId: live.id, role: 'minion', sessionFile: handle.sessionFile!, phase: 'spawned' });
+      expect(restarted.onNotificationDisposed(control!.id)).toEqual({ ok: true, rearmed: true });
+    } finally {
+      restarted.dispose();
+      off.stop();
+    }
+  });
+
+  it('the main assembly hands provider waits back before supervision starts (assembly alarm)', () => {
+    // Factory-only tests cannot catch a replaced main wiring: the repo's
+    // source-drift alarm pattern.
+    const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
+    // A heuristic tripwire (bracket access, destructuring or an alias
+    // without "supervisor" in its name would evade it): supervision starts
+    // only through handBackThenStartSupervision.
+    expect(mainSource).not.toMatch(/supervisor\w*[!?]?\s*\.\s*start\b/i);
+    const handBack = mainSource.indexOf('handBackThenStartSupervision(providerRecoverySensor, supervisorLive,');
+    expect(handBack).toBeGreaterThan(-1);
+    expect(handBack).toBeLessThan(mainSource.indexOf('await service.start()'));
   });
 
   it('exhausted pacing retries hand the latest typed provider evidence to the recovery sensor', async () => {

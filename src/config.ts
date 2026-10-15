@@ -55,8 +55,26 @@ export interface RuntimeModelPolicy {
   readonly modelRefresh?: boolean;
   /** pi only: deadline for that refresh, in milliseconds (default 10 000). */
   readonly modelRefreshTimeoutMs?: number;
+  /** claude-code only: which MCP servers non-review sessions may load
+   * (default "none" — exactly the role's mapped tools, like pi). */
+  readonly mcp?: ClaudeMcpMode;
   readonly roles: Readonly<Partial<Record<Role, RuntimeRolePolicyEntry>>>;
 }
+
+/**
+ * [runtimes.claude-code] mcp — the MCP servers a non-review claude-code
+ * session loads (owner decision 2026-10-15: off by default, opt-in):
+ *   none    — no MCP servers; the session gets only its role's tools
+ *   project — only the servers in the session cwd's .mcp.json as committed
+ *             at HEAD (byte-identical working file), for roles with a shell
+ *   user    — everything the operator's own Claude configuration loads
+ * Isolated review sessions and narrowed role-tool sets never load ambient
+ * MCP regardless.
+ */
+export const CLAUDE_MCP_MODES = ['none', 'project', 'user'] as const;
+export type ClaudeMcpMode = (typeof CLAUDE_MCP_MODES)[number];
+/** Default for [runtimes.claude-code] mcp. */
+export const DEFAULT_CLAUDE_MCP_MODE: ClaudeMcpMode = 'none';
 
 /** Default for [runtimes.pi] model_refresh (network catalog refresh ON). */
 export const DEFAULT_MODEL_REFRESH = true;
@@ -360,11 +378,18 @@ export const DEFAULT_PACING_CONFIG: PacingConfig = {
  * owner-approval.json). The sensor watches EXPLICIT temporary provider
  * waits on supported routes and resumes approved work through Silas once
  * the provider returns — no owner polling or ACKs for those waits.
- * Owner activation is manual: disabled by default. */
+ * Split defaults (owner decision 2026-10-15): the native Claude route is ON
+ * (`claudeNative`); GLM/Codex stay off until the owner sets `enabled`. */
 export interface ProviderRecoveryConfig {
-  /** Master switch. False (the default) = no waits recorded, no probes,
-   * no wakes — the feature is inert until the owner enables it. */
+  /** Switch for the GLM/Codex routes. False (the default) = no waits
+   * recorded, no probes, no wakes for them — inert until the owner enables
+   * it. It never covers the native Claude route (see `claudeNative`). */
   readonly enabled: boolean;
+  /** Automatic recovery for claude-code lanes on the native claude.ai login
+   * (read-only usage-endpoint checks, never generation). The ONLY switch for
+   * that route, independent of `enabled` either way. ON by default (owner
+   * decision 2026-10-15); false leaves Claude quota walls to Gru. */
+  readonly claudeNative: boolean;
   /** Sensor tick: how often routes are re-examined. The check cadence
    * itself is bounded below by cadenceMinMs. */
   readonly tickIntervalMs: number;
@@ -399,6 +424,7 @@ export interface ProviderRecoveryConfig {
 
 export const DEFAULT_PROVIDER_RECOVERY_CONFIG: ProviderRecoveryConfig = {
   enabled: false,
+  claudeNative: true,
   tickIntervalMs: 30_000,
   cadenceMinMs: 300_000,
   maxAttemptsPerHour: 12,
@@ -629,6 +655,37 @@ export interface SpawnPolicy {
   readonly model: string;
   /** "default" (runtime's own) or an explicit level name. */
   readonly thinkingLevel: string;
+  /** claude-code only: runtime-agnostic [models]/[thinking] values that
+   * resolution passed over (pi references: another provider's model, or a
+   * thinking level the claude CLI does not accept). */
+  readonly passedOver?: readonly { readonly tier: string; readonly ref: string }[];
+}
+
+/** Thinking levels the claude CLI accepts via --effort (fail-loud on others
+ * at spawn). The single source for the adapter, resolution and docs. */
+export const CLAUDE_CODE_THINKING_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode'] as const;
+
+/** Thinking levels pi's session API accepts (fail-loud on others at spawn).
+ * The single source for resolution, review identity and docs. */
+export const PI_THINKING_LEVELS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+
+/**
+ * Claude Code is always Anthropic (owner ruling 2026-10-15). A reference in
+ * the runtime-agnostic [models] tiers applies to claude-code only when it
+ * names no provider, the `anthropic` provider, or carries an Anthropic
+ * cloud-route id SHAPE: a Bedrock id ("anthropic.…", "us.anthropic.…",
+ * "us-gov.anthropic.…") or a Vertex id ("claude-…@YYYYMMDD"). Any other provider — resellers serving
+ * Claude under their own ids ("github-copilot/claude-sonnet-4.6") included —
+ * makes it a pi reference, which claude-code resolution passes over. Shapes,
+ * never model names. Explicit [runtimes.claude-code] entries and spawn
+ * overrides are never filtered.
+ */
+export function appliesToClaudeCode(ref: string): boolean {
+  const slash = ref.indexOf('/');
+  if (slash < 0) return true;
+  if (ref.slice(0, slash) === 'anthropic') return true;
+  const id = ref.slice(slash + 1);
+  return /^(?:[a-z]+(?:-[a-z]+)*\.)?anthropic\.[a-z0-9.:-]+$/u.test(id) || /^claude-[a-z0-9-]+@\d{8}$/u.test(id);
 }
 
 function normalizeSentinel(value: string | undefined): string {
@@ -652,20 +709,41 @@ export function resolveSpawnPolicy(
 ): SpawnPolicy {
   const policy = config.runtimes.policies[runtimeId];
   const runtimeRole = policy?.roles[role];
+  const passedOver: { tier: string; ref: string }[] = [];
+  // The runtime-agnostic tiers hold pi references in a pi-first config:
+  // claude-code passes over the ones naming another provider.
+  const shared = (tier: string, ref: string | undefined): string | undefined => {
+    if (ref === undefined || runtimeId !== 'claude-code' || appliesToClaudeCode(ref)) return ref;
+    passedOver.push({ tier, ref });
+    return undefined;
+  };
   const model =
     overrides.model !== undefined
       ? overrides.model
-      : runtimeRole?.model ?? config.models.roles[role] ?? policy?.model ?? config.models.default;
+      : runtimeRole?.model ?? shared(`models.roles.${role}`, config.models.roles[role]) ?? policy?.model ??
+        shared('models.default', config.models.default);
+  // A pi-only thinking level (e.g. "minimal") in the shared tiers would fail
+  // every claude-code spawn: pass over it exactly like a pi model ref. Only a
+  // level pi accepts and the claude CLI does not is a pi reference — any
+  // other value (a typo) still reaches the adapter's fail-loud check.
+  const sharedThinking = (tier: string, level: string | undefined): string | undefined => {
+    if (level === undefined || runtimeId !== 'claude-code' ||
+      !(PI_THINKING_LEVELS as readonly string[]).includes(level) ||
+      (CLAUDE_CODE_THINKING_LEVELS as readonly string[]).includes(level)) return level;
+    passedOver.push({ tier, ref: level });
+    return undefined;
+  };
   const thinkingLevel =
     overrides.thinkingLevel !== undefined
       ? overrides.thinkingLevel
       : runtimeRole?.thinkingLevel ??
-        config.thinking.roles[role] ??
+        sharedThinking(`thinking.roles.${role}`, config.thinking.roles[role]) ??
         policy?.thinkingLevel ??
-        config.thinking.default;
+        sharedThinking('thinking.default', config.thinking.default);
   return {
     model: normalizeSentinel(model),
     thinkingLevel: normalizeSentinel(thinkingLevel),
+    ...(passedOver.length > 0 ? { passedOver } : {}),
   };
 }
 
@@ -1441,6 +1519,7 @@ export function loadConfig(
         'retry_after_max_ms',
         'probe_timeout_ms',
         'glm_generation_fallback',
+        'claude_native',
       ];
       for (const key of Object.keys(table)) {
         if (!VALID.includes(key)) {
@@ -1488,6 +1567,10 @@ export function loadConfig(
           table['glm_generation_fallback'] !== undefined
             ? requireBool(table['glm_generation_fallback'], file, 'provider_recovery.glm_generation_fallback')
             : providerRecovery.glmGenerationFallback,
+        claudeNative:
+          table['claude_native'] !== undefined
+            ? requireBool(table['claude_native'], file, 'provider_recovery.claude_native')
+            : providerRecovery.claudeNative,
       };
     }
     if (raw['roll'] !== undefined) {
@@ -2095,7 +2178,7 @@ function readDecisionsConfig(
 /** Keys accepted per [runtimes.<id>]; the catalog-refresh knobs are pi-only. */
 const RUNTIME_POLICY_KEYS: Readonly<Record<RuntimeId, readonly string[]>> = {
   pi: ['model', 'thinking_level', 'model_refresh', 'model_refresh_timeout_ms', 'roles'],
-  'claude-code': ['model', 'thinking_level', 'roles'],
+  'claude-code': ['model', 'thinking_level', 'mcp', 'roles'],
 };
 
 /**
@@ -2125,6 +2208,7 @@ function readRuntimePolicy(
   let thinkingLevel: string | undefined;
   let modelRefresh: boolean | undefined;
   let modelRefreshTimeoutMs: number | undefined;
+  let mcp: ClaudeMcpMode | undefined;
   const roles: Partial<Record<Role, RuntimeRolePolicyEntry>> = {};
   if (table['model'] !== undefined) {
     model = requireString(table['model'], file, `${field}.model`);
@@ -2141,6 +2225,17 @@ function readRuntimePolicy(
       file,
       `${field}.model_refresh_timeout_ms`,
     );
+  }
+  if (runtimeId === 'claude-code' && table['mcp'] !== undefined) {
+    const value = requireString(table['mcp'], file, `${field}.mcp`);
+    if (!(CLAUDE_MCP_MODES as readonly string[]).includes(value)) {
+      throw new ConfigError(
+        `${field}.mcp must be one of ${CLAUDE_MCP_MODES.map((mode) => `"${mode}"`).join(', ')}, got "${value}"`,
+        file,
+        `${field}.mcp`,
+      );
+    }
+    mcp = value as ClaudeMcpMode;
   }
   if (table['roles'] !== undefined) {
     const rolesTable = requireTable(table['roles'], file, `${field}.roles`);
@@ -2192,6 +2287,7 @@ function readRuntimePolicy(
     ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
     ...(modelRefresh !== undefined ? { modelRefresh } : {}),
     ...(modelRefreshTimeoutMs !== undefined ? { modelRefreshTimeoutMs } : {}),
+    ...(mcp !== undefined ? { mcp } : {}),
     roles,
   };
 }

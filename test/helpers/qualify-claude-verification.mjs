@@ -53,7 +53,10 @@ const env = { PATH: `${bin}:/usr/bin:/bin`, HOME: home, CLAUDE_CONFIG_DIR: join(
 const identity = { executable, realExecutable: realpathSync(executable), sha256: createHash('sha256').update(readFileSync(executable)).digest('hex'),
   version: execFileSync(executable, ['--version'], { env, cwd: lane, encoding: 'utf8' }).trim(),
   modelRef: 'openai-codex/gpt-6-luna', nativeModel: 'gpt-6-luna', effort: 'max' };
-if (!identity.version.startsWith('2.1.296')) throw new Error(`Unapproved CLI identity: ${JSON.stringify(identity)}`);
+// Claude Code ships every few days and GC users run whatever is installed:
+// qualify the installed CLI and RECORD its exact identity (version + sha256)
+// as the evidence boundary — never refuse a newer release.
+if (!/^\d+\.\d+\.\d+ \(Claude Code\)$/u.test(identity.version)) throw new Error(`Not a Claude Code executable: ${JSON.stringify(identity)}`);
 let command = ''; let sent = false; const upstream = [];
 const server = createServer(async (req, res) => {
   let body = ''; for await (const chunk of req) body += chunk;

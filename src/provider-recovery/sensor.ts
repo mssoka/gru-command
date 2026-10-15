@@ -9,6 +9,7 @@ import type {
 } from '../ledger/api.js';
 import type { ProviderRecoveryConfig } from '../config.js';
 import {
+  CLAUDE_NATIVE_PROVIDER,
   classifyProviderRejection,
   providerSupportsSensor,
   type ProviderRejectionEvidence,
@@ -48,6 +49,16 @@ export function providerRouteKey(provider: string, model: string, fingerprint: s
   return `${provider}/${model}@${fingerprint}`;
 }
 
+/** Whether a route key names the native claude.ai route. Exact and total:
+ * provider ids never contain "/", so a key starts with the native provider
+ * followed by "/" exactly when providerRouteKey built it for that provider.
+ * Any other key (including a legacy or hand-written one) belongs to the
+ * `enabled` switch — it never throws, so one odd persisted key cannot stall
+ * settlement or boot reconciliation for every other route. */
+export function isClaudeNativeRouteKey(routeKey: string): boolean {
+  return routeKey.startsWith(`${CLAUDE_NATIVE_PROVIDER}/`);
+}
+
 /** The notifications surface the sensor needs (NotificationCenter fits).
  * r4 note: this port DECLARES postIncident, not post — the real center's
  * `post` carries no dedupe, so a `dedupe` field there was silently
@@ -56,13 +67,18 @@ export function providerRouteKey(provider: string, model: string, fingerprint: s
 export interface SensorNotifications {
   postIncident(input: {
     kind: string;
-    routing: 'fyi' | 'action-required';
+    routing: 'fyi' | 'action-required' | 'needs-owner';
     severity: 'info' | 'error';
     title: string;
     detail?: string | null;
+    agentId?: string | null;
     dedupe: 'unacked' | 'active' | 'all';
   }): { id: string };
   resolveIncidents(kindPrefix: string, by: string): unknown;
+  /** Refresh an open incident's detail in place (same id); the row as it
+   * now stands — resolved if it closed first, and then never rewritten — or
+   * null when it is gone. */
+  updateDetail(id: string, detail: string): { readonly resolvedAt: string | null } | null;
 }
 
 /** The Silas wake surface: the existing durable wake mechanism (the
@@ -81,6 +97,10 @@ export interface SlotReArmPort {
  * (Codex/Claude adapters; zero generation). */
 export interface MetadataReaderPort {
   read(route: ProbeRoute): Promise<import('./probe.js').ProbeOutcome>;
+  /** A provider with no pi catalog route (the native claude.ai route)
+   * resolves its own endpoint + credential fingerprint from the SAME
+   * snapshot its reads verify; absent = the shared runtime catalog. */
+  resolveRoute?(provider: string, model: string): Promise<import('./probe.js').ResolvedRoute | null>;
 }
 
 export interface ProviderRecoverySensorOptions {
@@ -150,6 +170,13 @@ export async function establishProviderWait(
     });
     return null;
   }
+  if (!sensor.enabledFor(observation.provider)) {
+    sensor.debugLog('automatic recovery is off for this provider — owner control preserved', {
+      agent_id: observation.agentId,
+      provider: observation.provider,
+    });
+    return null;
+  }
   if (observation.typed === null) {
     // r1 #13: no TYPED provider-response provenance (arbitrary turn
     // exception, lost SDK shape) — never an eligible wait.
@@ -197,6 +224,63 @@ export async function establishProviderWait(
   return sensor.resolveAndRecordWait(observation, evidence);
 }
 
+/** Service boot order (owner release 2026-10-11): the supervisor binds each
+ * restored stop's re-arm control to the stop's open provider-wall row when it
+ * starts, and the hand-back resolves that row when it cancels the wait. So
+ * the hand-back runs FIRST: the stop then hydrates with no open control and
+ * the supervisor raises a fresh re-arm control — Gru's "resume" — instead of
+ * binding one the hand-back is about to resolve. A failure is logged, never
+ * fatal, and never retried in this process (a cancel after hydration would
+ * resolve a row the supervisor already bound): the next boot retries it. */
+export function handBackThenStartSupervision(sensor: ProviderRecoverySensor, supervisor: { start(): void }, log: Log): void {
+  try {
+    sensor.handBackAtBoot();
+  } catch (error) {
+    log('error', 'provider wait hand-back failed before supervision start — kept for the next boot', { error: String(error) });
+  }
+  supervisor.start();
+}
+
+/** Service boot for provider recovery: the timer starts only while a switch
+ * is on, and the boot reconciliation re-wakes undelivered recoveries (a no-op
+ * with the whole sensor off). The hand-back of a provider whose switch is off
+ * runs earlier, before supervision starts (`handBackThenStartSupervision`);
+ * a boot that skipped it is logged loudly and tells Gru.
+ * Returns the reconciliation so callers (and tests) can observe it settle. */
+export function bootProviderRecovery(sensor: ProviderRecoverySensor, log: Log): Promise<void> {
+  if (!sensor.bootHandBackClosed) {
+    log('error', 'provider-recovery boot hand-back had not been attempted when provider recovery booted — open waits of a provider whose recovery is off are kept until a boot that runs it', {});
+    sensor.noteBootHandBackSkipped();
+  }
+  if (sensor.enabled) {
+    sensor.start();
+  } else {
+    log('info', 'provider-recovery sensor disabled — owner activation stays manual', {});
+  }
+  return sensor.reconcileAtBoot().then(
+    () => undefined,
+    (error: unknown) => { log('error', 'provider-recovery boot reconciliation failed', { error: String(error) }); },
+  );
+}
+
+/** The single notice for a boot hand-back pass that failed or kept a wait. */
+const HAND_BACK_FAILED = 'provider-recovery.hand-back-failed';
+
+/** When a boot hand-back failure notice was last reported: the time its
+ * detail ends with (it is refreshed in place by each failing boot). A detail
+ * without one is unreadable — NaN, which the caller counts as reported; only
+ * a row with no detail at all falls back to its insert time. */
+function lastReportedAt(row: { readonly ts: string; readonly detail: string | null }): number {
+  if (row.detail === null) return Date.parse(row.ts);
+  const stamp = row.detail.match(/Last reported (\S+?)\.$/u)?.[1];
+  return stamp === undefined ? Number.NaN : Date.parse(stamp);
+}
+
+/** The `[provider_recovery]` switch that governs a provider. */
+function switchFor(provider: string): 'claude_native' | 'enabled' {
+  return provider === CLAUDE_NATIVE_PROVIDER ? 'claude_native' : 'enabled';
+}
+
 /** Rolling budget window (1 h, per the approval's 12/hour pin). */
 const WINDOW_MS = 3_600_000;
 
@@ -211,6 +295,7 @@ export class ProviderRecoverySensor {
   private readonly slotReArm: SlotReArmPort | null;
   private readonly silasHosted: () => boolean;
   private readonly log: Log;
+  private handBackClosed = false;
   private readonly now: () => number;
   private readonly setIntervalImpl: typeof setInterval;
   private readonly clearIntervalImpl: typeof clearInterval;
@@ -219,7 +304,7 @@ export class ProviderRecoverySensor {
   private disposed = false;
 
   constructor(opts: ProviderRecoverySensorOptions) {
-    this.enabled = opts.config.enabled;
+    this.enabled = opts.config.enabled || opts.config.claudeNative;
     this.cfg = opts.config;
     this.ledger = opts.ledger;
     this.probe = opts.probe;
@@ -283,7 +368,7 @@ export class ProviderRecoverySensor {
     if (metadata !== undefined) {
       return {
         probe: (route) => metadata.read(route),
-        resolveRoute: (p, m) => this.probe.resolveRoute(p, m),
+        resolveRoute: (p, m) => metadata.resolveRoute?.(p, m) ?? this.probe.resolveRoute(p, m),
       };
     }
     if (provider === 'zai-coding-cn' && this.cfg.glmGenerationFallback) {
@@ -301,6 +386,24 @@ export class ProviderRecoverySensor {
         }),
       resolveRoute: (p, m) => this.probe.resolveRoute(p, m),
     };
+  }
+
+  /** Whether automatic recovery is on for a provider. The two switches are
+   * independent: `claude_native` (on by default) alone governs the native
+   * claude.ai route — `enabled = true` never overrides `claude_native =
+   * false` — and `enabled` governs every other supported route. Routes of a
+   * provider that is off are never waited on, probed or re-woken — exactly
+   * as with the whole sensor off. */
+  enabledFor(provider: string): boolean {
+    return switchFor(provider) === 'claude_native' ? this.cfg.claudeNative : this.cfg.enabled;
+  }
+
+  /** A route (pending delivery marker) is judged by the SAME provider as its
+   * waits: the recorded provider of a wait on the route, else the key. */
+  private routeEnabled(routeKey: string): boolean {
+    const provider = this.ledger.listProviderWaits({ routeKey })[0]?.provider;
+    if (provider !== undefined) return this.enabledFor(provider);
+    return isClaudeNativeRouteKey(routeKey) ? this.cfg.claudeNative : this.cfg.enabled;
   }
 
   /** Start the deterministic service timer (never an OS daemon). */
@@ -334,7 +437,7 @@ export class ProviderRecoverySensor {
   /** One deterministic observation pass over every waiting route. */
   async tick(): Promise<void> {
     if (this.disposed || !this.enabled) return;
-    const waiting = this.ledger.listProviderWaits({ status: 'waiting' });
+    const waiting = this.ledger.listProviderWaits({ status: 'waiting' }).filter((wait) => this.enabledFor(wait.provider));
     const byRoute = new Map<string, ProviderWaitRecord[]>();
     for (const wait of waiting) {
       const group = byRoute.get(wait.routeKey);
@@ -753,7 +856,7 @@ export class ProviderRecoverySensor {
 
   /** Retire delivery markers whose every waiter settled or was superseded. */
   private async settlePendingRecoveries(): Promise<void> {
-    for (const pending of this.ledger.listPendingProviderRecoveries()) {
+    for (const pending of this.ledger.listPendingProviderRecoveries().filter((p) => this.routeEnabled(p.routeKey))) {
       const open = this.pendingBatchWaits(pending);
       if (open.every((wait) => wait.recoveryBatchId !== null && this.retirementIdentity(wait) === 'superseded')) {
         this.ledger.clearPendingProviderRecovery(pending.id);
@@ -766,13 +869,277 @@ export class ProviderRecoverySensor {
       wait.status === 'recovered-pending' && (wait.recoveryBatchId === pending.id || wait.recoveryBatchId === null));
   }
 
+  /** The boot hand-back: once per sensor instance (main builds one), run by
+   * `handBackThenStartSupervision` before the supervisor hydrates — the boot
+   * reconciliation never hands back. A wait it cannot hand back is kept for
+   * the NEXT boot, never cancelled after hydration (that would resolve a row
+   * the supervisor already bound as the lane's re-arm control). A pass that
+   * fails outright or keeps any wait tells Gru — one open notice, refreshed
+   * (or raised) by each such boot, so no lane is left stopped in silence (a kept
+   * wait may have no notice of its own) — and only a pass that keeps none
+   * retires it. */
+  handBackAtBoot(): number {
+    if (this.handBackClosed) return 0;
+    this.handBackClosed = true;
+    let pass: { readonly handedBack: number; readonly kept: number };
+    try {
+      pass = this.handBackPass();
+    } catch (error) {
+      this.announceHandBackFailure('failed');
+      throw error;
+    }
+    if (pass.kept > 0) {
+      this.announceHandBackFailure('failed');
+    } else {
+      try {
+        this.notifications.resolveIncidents(HAND_BACK_FAILED, 'provider-recovery-sensor');
+      } catch (error) {
+        this.log('error', 'retiring the hand-back failure notice failed', { error: String(error) });
+      }
+    }
+    return pass.handedBack;
+  }
+
+  /** Whether this sensor's boot hand-back is closed: attempted (main
+   * attempts it before supervision starts; a failed attempt counts) or
+   * latched off by a skipped boot. */
+  get bootHandBackClosed(): boolean {
+    return this.handBackClosed;
+  }
+
+  /** A boot whose hand-back was never attempted: Gru is told (best effort),
+   * so no lane is left stopped in silence, and the hand-back is latched off
+   * for this process — an attempt after hydration would resolve rows the
+   * supervisor already bound; the next boot runs it. */
+  noteBootHandBackSkipped(): void {
+    this.handBackClosed = true;
+    this.announceHandBackFailure('skipped');
+  }
+
+  /** The action-required notice for a boot pass that failed outright or kept
+   * a wait, or for a boot that never attempted the hand-back — ONE write per
+   * boot, so a failure between steps never leaves Gru without it: an open
+   * notice is refreshed in place (its detail changes, which wakes Gru again,
+   * and says Gru was told before); with none open a fresh one is posted. Its
+   * detail ends with the report time the repeat marker reads. Best effort: a
+   * failed write is logged, never thrown. */
+  private announceHandBackFailure(cause: 'failed' | 'skipped'): void {
+    try {
+      // The open notice, if any, is the one refreshed and the one the caveat
+      // reads; with none open, the caveat reads the most recently inserted
+      // notice (insertion order — a clock step back cannot reorder it; one
+      // Gru disposed of was still seen).
+      const open = this.ledger.findNotificationByKind(HAND_BACK_FAILED, 'active');
+      const prior = open ?? this.ledger.latestNotificationByKind(HAND_BACK_FAILED);
+      const what = cause === 'failed'
+        ? 'Handing back the open waits of providers whose automatic recovery is off failed at boot (for some or all of them)'
+        : 'The boot hand-back of providers whose automatic recovery is off was never attempted (a wiring fault — see the ' +
+          '"had not been attempted" log line)';
+      // The earliest report carries forward through refreshes and reposts.
+      const since = prior?.detail?.match(/previously reported (\S+?)\)/u)?.[1] ?? prior?.ts;
+      const told = prior === null ? ''
+        : ` Gru was told before (previously reported ${since}) — check whether the lanes already resumed before you act.`;
+      const detail = `${what}, so any such lane stays stopped until a restart's hand-back succeeds — see the service log.${told} ` +
+        `Last reported ${new Date().toISOString()}.`;
+      // Refresh the open notice in place; with none open — or one closed
+      // between the read and the write — post a fresh one.
+      const refreshed = open !== null ? this.notifications.updateDetail(open.id, detail) : null;
+      if (refreshed === null || refreshed.resolvedAt !== null) {
+        this.notifications.postIncident({
+          kind: HAND_BACK_FAILED,
+          routing: 'action-required',
+          severity: 'error',
+          title: 'Provider waits not handed back at boot',
+          detail,
+          agentId: null,
+          dedupe: 'active',
+        });
+      }
+    } catch (error) {
+      this.log('error', 'the hand-back failure notice could not be written', { error: String(error) });
+    }
+  }
+
+  /** A provider's switch turned off across a restart (`claude_native` or
+   * `enabled`) must never strand the waits it left open: each open wait of a
+   * provider that is now off is cancelled (which resolves its own
+   * machine-owned stop) and handed to Gru through one action-required notice
+   * per wait (a provider stop is machine attention: Gru decides the
+   * direction) — posted through the notification center, and deduped by kind
+   * while unresolved, so a crash before the cancel never posts it twice while
+   * it is open (once Gru has disposed of it, a boot that still finds the wait
+   * open tells Gru again: a disposition does not prove the lane resumed; one
+   * resolved because the switch came back on lets a later hand-back be
+   * announced, marked as a repeat). No notice is posted when the owner
+   * already holds the lane's stop (a legacy needs-owner row the boot's
+   * re-triage left in place); an open wait is never assumed handled — a lane Gru already re-dispatched may get a
+   * redundant notice, which is cheaper than a stranded one. A
+   * route left with no open wait retires its "watching" notice and
+   * pending delivery marker. Runs at every boot, even with the sensor off;
+   * one failing wait is logged and kept for the next boot, never blocking
+   * the rest. */
+  handBackDisabledWaits(): number {
+    return this.handBackPass().handedBack;
+  }
+
+  /** One hand-back pass: how many waits it handed back, and how many it
+   * kept for the next boot. */
+  private handBackPass(): { readonly handedBack: number; readonly kept: number } {
+    let handedBack = 0;
+    let kept = 0;
+    for (const status of ['waiting', 'recovered-pending'] as const) {
+      for (const wait of this.ledger.listProviderWaits({ status })) {
+        if (this.enabledFor(wait.provider)) {
+          // The switch is on (again): the wait is served, so a notice left by
+          // an earlier hand-back that could not cancel it is not true.
+          try {
+            const stale = this.ledger.findNotificationByKind(`provider-recovery.recovery-off.${wait.id}`, 'active');
+            if (stale !== null) this.ledger.resolveNotificationById(stale.id, 'provider-recovery-sensor');
+          } catch (error) {
+            this.log('error', 'resolving a stale recovery-off notice failed', { wait_id: wait.id, error: String(error) });
+          }
+          continue;
+        }
+        try {
+          this.handBack(wait);
+          handedBack += 1;
+        } catch (error) {
+          kept += 1;
+          this.log('error', 'provider wait hand-back failed — kept for the next boot', { wait_id: wait.id, error: String(error) });
+        }
+      }
+    }
+    this.retireDisabledRoutes();
+    if (handedBack > 0) {
+      this.log('warn', 'open provider waits cancelled — automatic recovery is off for their provider', { cancelled: handedBack });
+    }
+    return { handedBack, kept };
+  }
+
+  /** From durable state at every boot — whichever boot cancelled the waits,
+   * and even after an interrupted retirement: a route of a provider that is
+   * off, with no open wait left, retires its "watching" notice and pending
+   * delivery markers. */
+  private retireDisabledRoutes(): void {
+    const routes = new Set<string>();
+    for (const wait of this.ledger.listProviderWaits()) {
+      if (!this.enabledFor(wait.provider)) routes.add(wait.routeKey);
+    }
+    const markers = new Map<string, string[]>();
+    for (const pending of this.ledger.listPendingProviderRecoveries()) {
+      markers.set(pending.routeKey, [...(markers.get(pending.routeKey) ?? []), pending.id]);
+      if (!this.routeEnabled(pending.routeKey)) routes.add(pending.routeKey);
+    }
+    for (const routeKey of routes) {
+      try {
+        // An exact-kind (indexed) lookup first: a long-retired route (no
+        // watching notice, no marker) costs one lookup, never a scan.
+        const watching = this.ledger.findNotificationByKind(`provider.waiting.${routeKey}`, 'active');
+        const pendingIds = markers.get(routeKey) ?? [];
+        if (watching === null && pendingIds.length === 0) continue;
+        if (this.ledger.listProviderWaits({ routeKey }).some((wait) => wait.status === 'waiting' || wait.status === 'recovered-pending')) continue;
+        // EXACT kind, every active row of it (never a prefix match: a legacy
+        // key may prefix another live route's key). The center's prefix
+        // resolve is a plain ledger call, so resolving by id loses nothing.
+        // A resolved row leaves the active set; the seen-set bounds the loop
+        // even if a resolve ever failed to take.
+        const resolved = new Set<string>();
+        let row = watching;
+        for (; row !== null && !resolved.has(row.id); row = this.ledger.findNotificationByKind(`provider.waiting.${routeKey}`, 'active')) {
+          resolved.add(row.id);
+          this.ledger.resolveNotificationById(row.id, 'provider-recovery-sensor');
+        }
+        if (row !== null) {
+          // A resolve that did not take: loud, and the route keeps its
+          // markers (rows resolved before it stay resolved) so the next boot
+          // finishes the retirement.
+          throw new Error(`watching notice ${row.id} stayed active after its resolve`);
+        }
+        for (const id of pendingIds) this.ledger.clearPendingProviderRecovery(id);
+      } catch (error) {
+        this.log('error', 'retiring a handed-back route failed', { route: routeKey, error: String(error) });
+      }
+    }
+  }
+
+  private handBack(wait: ProviderWaitRecord): void {
+    const key = switchFor(wait.provider);
+    const recovered = wait.status === 'recovered-pending';
+    // The wait's own quota-wall stop is the only kind a wait is established
+    // for (establishProviderWait requires failureClass quota_wall). Only an
+    // owner-held stop (a needs-owner row the boot's re-triage left in place;
+    // the cancel never resolves owner attention) suppresses the notice. Any
+    // machine stop gets it — linked (the cancel resolves it) or not (a failed
+    // link write can leave the sensor-owned text on it): a redundant notice
+    // to Gru is cheaper than a stranded lane. The center's per-kind dedupe
+    // keeps one open stop per lane, so this one row decides.
+    const laneStop = wait.agentId === null ? null
+      : this.ledger.findNotificationByKind(`supervision.provider-wall.${wait.agentId}.quota_wall`, 'unacked');
+    if (laneStop?.routing !== 'needs-owner') {
+      const slot = wait.waiterKind === 'silas-slot';
+      const subject = slot ? `Silas slot ${wait.slotId ?? wait.id}` : `Agent ${wait.agentId ?? wait.id}`;
+      // Any Silas turn re-arms a stopped slot, so a directive resumes it; a
+      // job lane is resumed through the re-arm control the supervisor raises
+      // for its restored stop, or re-dispatched — a disposition of this
+      // notice alone re-arms nothing. Machine attention: Gru decides, and
+      // asks the owner only through a typed reserved decision.
+      const resume = slot
+        ? 'send Silas a directive (any Silas turn re-arms its slot)'
+        : 'resume it (dispose its re-arm control once a live agent is adopted) or re-dispatch the job';
+      // Told before — this wait's own notice (Gru disposed of it while the
+      // wait stayed open, or the switch was on again in between), or a boot
+      // hand-back failure reported since the wait opened, resolved or not
+      // (Gru may have acted on it): say so, so a re-dispatch is not doubled.
+      // The open, the most recently inserted and the newest-ts notice are
+      // each asked, so a clock step back in either direction between two
+      // notices still marks (conservatively); an unreadable time counts as
+      // reported. Report times are wall-clock against the wait's creation
+      // time, so a step back between a wait opening and a report can still
+      // leave it unmarked — waits record no event order to compare against.
+      const announced = this.ledger.findNotificationByKind(`provider-recovery.recovery-off.${wait.id}`, 'any') !== null;
+      const opened = Date.parse(wait.createdAt);
+      const failureSince = [
+        this.ledger.findNotificationByKind(HAND_BACK_FAILED, 'active'),
+        this.ledger.latestNotificationByKind(HAND_BACK_FAILED),
+        this.ledger.findNotificationByKind(HAND_BACK_FAILED, 'any'),
+      ].some((row) => row !== null && !(lastReportedAt(row) < opened));
+      const repeat = announced
+        ? 'Announced before and the wait is still open — check whether the lane already resumed before you act. '
+        : failureSince
+          ? 'A boot hand-back failure was reported since this wait opened — check whether the lane already resumed before you act. '
+          : '';
+      this.notifications.postIncident({
+        kind: `provider-recovery.recovery-off.${wait.id}`,
+        routing: 'action-required',
+        severity: 'error',
+        title: recovered
+          ? `${subject}: provider recovered, automatic resume off`
+          : `${subject} stopped: provider limit (automatic recovery off)`,
+        detail: recovered
+          ? `${repeat}The ${wait.provider} limit has cleared, but automatic provider recovery is now off ([provider_recovery] ${key} = false), ` +
+            `so it was not resumed — ${resume}.`
+          : `${repeat}Automatic provider recovery is off for ${wait.provider} ([provider_recovery] ${key} = false), so it stays ` +
+            `stopped. Once the provider limit clears, ${resume}.`,
+        agentId: wait.agentId,
+        // Per-wait kind, deduped while unresolved: an open notice is never
+        // re-posted by a later boot retrying a wait it could not cancel, and
+        // one resolved (Gru's disposition, or the switch coming back on)
+        // never blocks a later hand-back of a wait still open.
+        dedupe: 'active',
+      });
+    }
+    this.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why: 'recovery-disabled' });
+  }
+
   /** Boot/restart reconciliation: never silently re-baseline away an
    * outstanding wait or delivery. Routes keep their durable cadence; a
-   * recovery that was recorded but never delivered re-wakes. */
+   * recovery that was recorded but never delivered re-wakes. It runs after
+   * the supervisor hydrates, so it never hands a wait back — that is
+   * `handBackAtBoot`'s, before supervision starts. */
   async reconcileAtBoot(): Promise<{ rewoken: number }> {
     if (!this.enabled) return { rewoken: 0 };
     let rewoken = 0;
-    for (const pending of this.ledger.listPendingProviderRecoveries()) {
+    for (const pending of this.ledger.listPendingProviderRecoveries().filter((p) => this.routeEnabled(p.routeKey))) {
       const open = this.pendingBatchWaits(pending);
       if (open.every((wait) => wait.recoveryBatchId !== null && this.retirementIdentity(wait) === 'superseded')) {
         this.ledger.clearPendingProviderRecovery(pending.id);

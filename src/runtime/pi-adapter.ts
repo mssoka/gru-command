@@ -49,6 +49,7 @@ import type {
 } from './types.js';
 import { ToolHeartbeat, toolHeartbeatIntervalMs } from './tool-heartbeat.js';
 import { disposeAll } from './disposal.js';
+import { isPublicModelToken } from './review-model-identity.js';
 import { DirectiveCheckpointError, inspectDirectiveCheckpoint, inspectDirectiveProducers, flushDirectiveToolIntent, recordDirectiveIndependentController, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveProducerCessation, recordDirectiveCompletion, recordDirectiveToolRefusal, recordDirectiveAuthorityRefusal, inspectDirectiveAdmission, readDirectiveBinding, type DirectiveProducer, type DirectiveTurnIdentity } from './directive-checkpoint.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -647,14 +648,6 @@ export class PiRuntime implements AgentRuntime {
     return model;
   }
 
-  // Finite public catalog spellings, never a lexical pattern over user models.
-  private static readonly PUBLIC_ANTHROPIC_MODELS = new Set([
-    'claude-fable-5', 'claude-fable-5-1', 'claude-haiku-4-5', 'claude-haiku-4-5-20251001',
-    'claude-opus-4-5', 'claude-opus-4-5-20251101', 'claude-opus-4-6', 'claude-opus-4-7',
-    'claude-opus-4-8', 'claude-opus-5', 'claude-sonnet-4-5', 'claude-sonnet-4-5-20250929',
-    'claude-sonnet-4-6', 'claude-sonnet-5',
-  ]);
-
   private safeReviewCompat(compat: unknown, api: string): boolean {
     if (compat === undefined) return true;
     if (api !== 'anthropic-messages' || compat === null || typeof compat !== 'object' || Array.isArray(compat)) return false;
@@ -670,7 +663,7 @@ export class PiRuntime implements AgentRuntime {
         const cost = fallback.cost;
         return Object.keys(fallback).every((field) => ['provider', 'model', 'cost'].includes(field)) &&
           fallback.provider === 'anthropic' && typeof fallback.model === 'string' &&
-          PiRuntime.PUBLIC_ANTHROPIC_MODELS.has(fallback.model) &&
+          isPublicModelToken(fallback.model) &&
           cost !== null && typeof cost === 'object' && !Array.isArray(cost) &&
           Object.keys(cost).every((field) => ['input', 'output', 'cacheRead', 'cacheWrite'].includes(field)) &&
           ['input', 'output', 'cacheRead', 'cacheWrite'].every((field) =>
@@ -702,7 +695,7 @@ export class PiRuntime implements AgentRuntime {
     if (!publicRoutes.has(model.baseUrl) || url.username !== '' || url.password !== '' ||
       url.search !== '' || url.hash !== '') return undefined;
     const isAnthropic = model.provider === 'anthropic' && model.api === 'anthropic-messages' &&
-      PiRuntime.PUBLIC_ANTHROPIC_MODELS.has(model.id) && url.origin === 'https://api.anthropic.com';
+      isPublicModelToken(model.id) && url.origin === 'https://api.anthropic.com';
     const isStub = model.provider === 'gru-stub' && model.id === 'stub-model' &&
       ((model.api === 'gru-stub' && model.baseUrl === 'stub://local') ||
         (model.api === 'anthropic-messages' && url.origin === 'https://api.anthropic.com'));

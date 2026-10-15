@@ -192,8 +192,9 @@ describe('config-generate CLI', () => {
     for (const runtime of RUNTIME_IDS) {
       expect(text).toContain(RUNTIME_THINKING_LEVELS[runtime].join(' | '));
     }
-    // ...the provider-stripping model-reference rule...
-    expect(text).toContain('strips the provider segment for its CLI --model flag');
+    // ...the model-reference rule (claude-code needs no provider; a prefix is stripped)...
+    expect(text).toContain('claude-code is always Anthropic and needs no provider');
+    expect(text).toContain('a provider segment, if present, is stripped for its --model flag');
     // ...the valid role list...
     expect(text).toContain('valid roles: gru, silas, minion, perkins, bob');
     // ...the RUNTIMES.md pointer...
@@ -277,6 +278,7 @@ describe('config-generate CLI', () => {
       '[runtimes.claude-code]',
       'model = "anthropic/claude-x"',
       'thinking_level = "high"',
+      'mcp = "project"',
       '[runtimes.claude-code.roles]',
       'minion = { thinking_level = "low" }',
       '[supervision]',
@@ -289,6 +291,8 @@ describe('config-generate CLI', () => {
       'max_concurrent_children = 6',
       '[worktrees]',
       `root = ${JSON.stringify(join(root, 'lanes'))}`,
+      '[provider_recovery]',
+      'claude_native = false',
     ].join('\n');
     writeFileSync(join(instance, 'config.toml'), `${prior}\n`);
 
@@ -311,7 +315,9 @@ describe('config-generate CLI', () => {
     expect((raw.models as { roles: Record<string, string> }).roles.gru).toBe('provider/model-b');
     expect((raw.thinking as { roles: Record<string, string> }).roles.perkins).toBe('max');
     const claudePolicy = (raw.runtimes as { 'claude-code': Record<string, unknown> })['claude-code'];
-    expect(claudePolicy).toMatchObject({ model: 'anthropic/claude-x', thinking_level: 'high' });
+    expect(claudePolicy).toMatchObject({ model: 'anthropic/claude-x', thinking_level: 'high', mcp: 'project' });
+    // An owner opt-out of Claude auto-recovery must survive regeneration.
+    expect(raw.provider_recovery).toMatchObject({ claude_native: false });
     expect(claudePolicy.roles).toMatchObject({ minion: { thinking_level: 'low' } });
     expect((raw.supervision as Record<string, number>).turn_silence_ms).toBe(600000);
     expect((raw.dispatch as Record<string, number>).bob_interval_ms).toBe(120000);
@@ -329,6 +335,8 @@ describe('config-generate CLI', () => {
     expect(loaded.concurrency.maxWorkers).toBe(8);
     expect(loaded.review.maxConcurrentChildren).toBe(6);
     expect(loaded.worktrees.root).toBe(join(root, 'lanes'));
+    expect(loaded.runtimes.policies['claude-code']?.mcp).toBe('project');
+    expect(loaded.providerRecovery.claudeNative).toBe(false);
   });
 
   it('round trip preserves an active [pacing] section (caps + backoff, never silently dropped)', () => {

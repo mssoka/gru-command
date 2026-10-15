@@ -1,9 +1,12 @@
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import {
+  CLAUDE_CODE_THINKING_LEVELS,
+  DEFAULT_CLAUDE_MCP_MODE,
   DEFAULT_MODEL_REFRESH,
   DEFAULT_MODEL_REFRESH_TIMEOUT_MS,
   MODEL_DEFAULT_SENTINEL,
+  PI_THINKING_LEVELS,
   ROLES,
   RUNTIME_IDS,
   type GruCommandConfig,
@@ -26,14 +29,19 @@ import {
 /** Thinking levels accepted per runtime (docs/RUNTIMES.md). Anything else
  * fails loud at spawn naming the valid set. */
 export const RUNTIME_THINKING_LEVELS: Readonly<Record<RuntimeId, readonly string[]>> = {
-  pi: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
-  'claude-code': ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode'],
+  pi: PI_THINKING_LEVELS,
+  'claude-code': CLAUDE_CODE_THINKING_LEVELS,
 };
 
 export const MODEL_REFERENCE_NOTE =
-  'An explicit "provider/model" reference is passed to pi as-is; ' +
-  'claude-code strips the provider segment for its CLI --model flag ' +
-  '(bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"). ' +
+  'pi takes an explicit "provider/model" reference as-is. ' +
+  'claude-code is always Anthropic and needs no provider: use the CLI\'s own names ' +
+  '("opus", "claude-opus-5-5"); a provider segment, if present, is stripped for its --model flag ' +
+  '(bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"); ' +
+  'a shared [models] entry naming another provider is a pi reference that claude-code passes over, ' +
+  'unless its id has an Anthropic cloud shape (Bedrock "[region.]anthropic.…", Vertex "claude-…@YYYYMMDD"); ' +
+  'resellers serving Claude under their own ids ("github-copilot/claude-…") are passed over too, ' +
+  'as is a pi-only shared [thinking] level ("minimal"). ' +
   'The literal "default" means the runtime\'s own configuration (SPEC ruling 16).';
 
 export const ROLE_LIST_NOTE = `valid roles: ${ROLES.join(', ')}`;
@@ -197,6 +205,20 @@ function runtimePolicyLines(
       refreshTimeout === undefined
         ? `${c}# model_refresh_timeout_ms = ${DEFAULT_MODEL_REFRESH_TIMEOUT_MS}`
         : `${c}model_refresh_timeout_ms = ${refreshTimeout}`,
+    );
+  }
+  if (runtime === 'claude-code') {
+    const mcp = policy?.mcp;
+    lines.push(
+      `${c}# MCP servers for non-review sessions: "none" = only the role's tools`,
+      `${c}# (like pi); "project" = only the cwd's .mcp.json as committed at HEAD,`,
+      `${c}# for roles with a shell; "user" = your own Claude MCP configuration,`,
+      `${c}# connectors included, without prompts.`,
+    );
+    lines.push(
+      mcp === undefined
+        ? `${c}# mcp = ${tomlString(DEFAULT_CLAUDE_MCP_MODE)}`
+        : `${c}mcp = ${tomlString(mcp)}`,
     );
   }
   lines.push('', `${c}[runtimes.${runtime}.roles]`);
@@ -562,11 +584,21 @@ export function renderReferenceConfig(
     '# on a shared bounded cadence (a tiny no-history/no-tools generation,',
     '# ≤64 output tokens, no hidden retries), and on completed producer',
     '# evidence wakes Silas once to claim guarded continuations — no owner',
-    '# ACK for eligible waits. DISABLED BY DEFAULT: owner activation is',
-    '# manual. Auth/billing/ambiguous failures and unsupported providers stay',
-    '# machine attention: Gru decides the direction and asks the owner only',
-    '# through a typed reserved decision.',
+    '# ACK for eligible waits. The openai-codex route and claude-code lanes',
+    '# on the native claude.ai login are checked by read-only usage-metadata',
+    '# reads instead (no generation). GLM/Codex are DISABLED BY DEFAULT: owner',
+    '# activation is manual. Auth/billing/ambiguous failures and unsupported',
+    '# providers stay machine attention: Gru decides the direction and asks the',
+    '# owner only through a typed reserved decision.',
     `enabled = ${preserved?.providerRecovery?.enabled ?? false}`,
+    '# claude-code lanes on the native claude.ai login: a usage-limit wall',
+    '# waits on the claude.ai usage endpoint and resumes when the window',
+    '# resets. ON by default, independent of `enabled`. Off — and always for',
+    '# API-key/override contexts — Claude quota walls are left to Gru. Turning',
+    '# either switch off hands that provider\'s open waits to Gru at the next',
+    '# boot (an action-required notice per wait; none where the owner already',
+    '# holds the lane\'s stop) — never stranded.',
+    `claude_native = ${preserved?.providerRecovery?.claudeNative ?? true}`,
     '# Sensor tick (how often routes are re-examined). The check cadence',
     '# itself cannot go below the approved 300 s floor.',
     `tick_interval_ms = ${preserved?.providerRecovery?.tickIntervalMs ?? 30_000}`,

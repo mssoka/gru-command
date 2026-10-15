@@ -1,19 +1,27 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
+import { projectMailbox } from '../src/gru-mailbox/projection.js';
 import { DEFAULT_PROVIDER_RECOVERY_CONFIG, type ProviderRecoveryConfig } from '../src/config.js';
 import {
   establishProviderWait,
   ProviderRecoverySensor,
+  bootProviderRecovery,
+  handBackThenStartSupervision,
+  isClaudeNativeRouteKey,
+  providerRouteKey,
+  type MetadataReaderPort,
   type ProviderWallObservation,
   type RecoveryWakePort,
   type SlotReArmPort,
 } from '../src/provider-recovery/sensor.js';
+import { claudeSnapshot, composeMetadataReaders, type NativeCommandPort } from '../src/provider-recovery/composition.js';
+import { CLAUDE_METADATA_ENDPOINT, type MetadataFetchPort } from '../src/provider-recovery/metadata.js';
 import type { ProbeOutcome, ProviderProbePort, ProbeRoute } from '../src/provider-recovery/probe.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 
@@ -42,7 +50,7 @@ class Harness {
   silasEnabled = true;
   readonly worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'pr-sensor-wt-')));
 
-  constructor(config: Partial<ProviderRecoveryConfig> = {}) {
+  constructor(config: Partial<ProviderRecoveryConfig> = {}, metadataReaders?: Readonly<Record<string, MetadataReaderPort>>) {
     const dir = mkdtempSync(join(tmpdir(), 'gru-command-pr-sensor-'));
     cleanupDirs.push(dir);
     const db = new LedgerDb(dir);
@@ -67,6 +75,7 @@ class Harness {
       slotReArm: this.reArmPort(),
       silasHosted: () => this.silasEnabled,
       now: () => this.clockMs,
+      ...(metadataReaders !== undefined ? { metadataReaders } : {}),
     });
   }
 
@@ -295,7 +304,9 @@ describe('wait establishment (acceptance 1) — explicit evidence only', () => {
   });
 
   it('disabled config = fully inert recorder', async () => {
-    const h = new Harness({ enabled: false });
+    // Both switches off (claude_native defaults ON since 2026-10-15).
+    const h = new Harness({ enabled: false, claudeNative: false });
+    expect(h.sensor.enabled).toBe(false);
     h.makeJob('job-1');
     expect(await h.establishMinionWait()).toBeNull();
     expect(h.ledger.listProviderWaits()).toHaveLength(0);
@@ -725,7 +736,8 @@ describe('renewed quota + bounded false-recovery escalation (acceptance 7)', () 
 
 describe('sensor lifecycle', () => {
   it('start() is inert when disabled; ticks no-op', async () => {
-    const h = new Harness({ enabled: false });
+    const h = new Harness({ enabled: false, claudeNative: false });
+    expect(h.sensor.enabled).toBe(false);
     h.sensor.start();
     h.makeJob('job-1');
     await h.sensor.tick();
@@ -1145,5 +1157,1210 @@ describe('r4 — the notifications port uses the dedupe-capable incident path (f
       .filter((notification) => notification.kind.startsWith('provider.false-recovery.'));
     expect(rows).toHaveLength(1);
     expect(rows[0]?.routing).toBe('action-required');
+  });
+});
+
+describe('native Claude quota walls (claude-code lanes)', () => {
+  const keychain: NativeCommandPort = {
+    findGenericPassword: () => Promise.resolve({ exitCode: 0, stdout: JSON.stringify({
+      claudeAiOauth: { accessToken: 'claude-access-token', expiresAt: Date.now() + 3_600_000, subscription: 'max' },
+    }) }),
+  };
+  const readers = (
+    overridesPresent: boolean,
+    command: NativeCommandPort = keychain,
+    fetch: MetadataFetchPort = { get: () => Promise.reject(new Error('establishment never reads usage metadata')) },
+  ) => composeMetadataReaders({
+    config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, probeTimeoutMs: 30_000 },
+    fetch,
+    claude: { command, context: () => ({ overridesPresent }), account: () => 'fixture-user' },
+  });
+  // Exactly what a claude-code lane's usage-limit error now carries.
+  const claudeWall: Partial<ProviderWallObservation> = {
+    provider: 'anthropic-claude-native',
+    model: 'claude-opus-5-5',
+    typed: { origin: 'provider-message', status: 429, bodyCode: 'rate_limit' },
+    errorMessage: "You've hit your limit · resets 3pm (UTC) (HTTP 429, rate_limit)",
+  };
+
+  it('a claude.ai usage-limit wall establishes a wait bound to the native usage endpoint and keychain credential', async () => {
+    const h = new Harness({}, readers(false));
+    // Production truth: pi's model catalog has no route for the native login.
+    h.probe.resolveRouteImpl = () => Promise.resolve(null);
+    h.makeJob('job-1');
+    const wait = await h.establishMinionWait(claudeWall);
+    const snapshot = await claudeSnapshot({ command: keychain, context: { overridesPresent: false }, account: 'fixture-user' });
+    if (typeof snapshot === 'string') throw new Error('fixture snapshot unexpectedly rejected');
+    expect(wait).toMatchObject({
+      provider: 'anthropic-claude-native',
+      model: 'claude-opus-5-5',
+      endpoint: CLAUDE_METADATA_ENDPOINT,
+      credentialFingerprint: snapshot.credentialFingerprint,
+      jobId: 'job-1',
+    });
+  });
+
+  it('Claude recovery is on by default while GLM/Codex stay owner-activated (claude_native, owner 2026-10-15)', async () => {
+    expect(DEFAULT_PROVIDER_RECOVERY_CONFIG).toMatchObject({ enabled: false, claudeNative: true });
+    // Shipped defaults: the master switch is off.
+    const h = new Harness({ enabled: false, glmGenerationFallback: false }, readers(false));
+    h.probe.resolveRouteImpl = () => Promise.resolve(null);
+    h.makeJob('job-1');
+    h.makeJob('job-2');
+    expect(h.sensor.enabled).toBe(true); // the sensor runs — for Claude
+    expect(h.sensor.enabledFor('anthropic-claude-native')).toBe(true);
+    expect(h.sensor.enabledFor('zai-coding-cn')).toBe(false);
+    expect(h.sensor.enabledFor('openai-codex')).toBe(false);
+    expect(await h.establishMinionWait(claudeWall)).not.toBeNull();
+    // A GLM wall under the same defaults never becomes a wait.
+    expect(await h.establishMinionWait({ agentId: 'agent-minion-2', jobId: 'job-2' })).toBeNull();
+    // claude_native = false keeps Claude owner-controlled too.
+    const off = new Harness({ enabled: false, claudeNative: false }, readers(false));
+    off.probe.resolveRouteImpl = () => Promise.resolve(null);
+    off.makeJob('job-1');
+    expect(off.sensor.enabled).toBe(false);
+    expect(await off.establishMinionWait(claudeWall)).toBeNull();
+  });
+
+  /** GLM debt recorded while the owner had GLM recovery armed: one route
+   * already recovered with its delivery pending, one still waiting. */
+  async function glmDebt(h: Harness) {
+    h.makeJob('job-1');
+    h.makeJob('job-2');
+    h.ledger.registerAgent({ id: 'agent-minion-1', role: 'minion', jobId: 'job-1' });
+    h.ledger.registerAgent({ id: 'agent-minion-2', role: 'minion', jobId: 'job-2' });
+    const recovered = await h.establishMinionWait();
+    h.advance(Math.max(0, Date.parse(h.ledger.getProviderRoute(recovered!.routeKey)!.nextCheckAt) - h.now) + 1);
+    h.probe.queueCompleted();
+    await h.sensor.tick();
+    expect(h.ledger.getProviderWait(recovered!.id)?.status).toBe('recovered-pending');
+    expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(1);
+    const waiting = await h.establishMinionWait({ agentId: 'agent-minion-2', jobId: 'job-2', model: 'glm-5.3-flash',
+      sessionFile: '/tmp/minion-2.jsonl', incidentId: 'supervision.provider-wall.agent-minion-2.quota_wall' });
+    expect(waiting?.routeKey).not.toBe(recovered!.routeKey);
+    return { recovered: recovered!, waiting: waiting! };
+  }
+
+  /** A service restarted with only Claude recovery on (GLM's switch off),
+   * sharing the ledger, an hour on so every GLM route is due. */
+  function claudeOnlySensor(h: Harness) {
+    return new ProviderRecoverySensor({
+      // The GLM fallback stays armed so a GLM check WOULD reach the fake
+      // probe: only the provider switch keeps it away.
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, glmGenerationFallback: true, enabled: false, claudeNative: true },
+      ledger: h.ledger,
+      probe: h.probe,
+      notifications: h.notifications,
+      wake: h.wakePort(),
+      slotReArm: h.reArmPort(),
+      silasHosted: () => true,
+      now: () => h.now + 3_600_000,
+    });
+  }
+
+  it('a Claude-only sensor tick never probes, settles or re-wakes routes of providers that are off', async () => {
+    const h = new Harness();
+    const { recovered, waiting } = await glmDebt(h);
+    // The recovered waiter left its batch: the pending marker is now
+    // settleable — by a sensor whose switch covers the route.
+    h.ledger.setProviderWaitStatus(recovered.id, 'cancelled', { why: 'test: batch member gone' });
+    const route = h.ledger.getProviderRoute(waiting.routeKey);
+    const wakes = h.wakes.length;
+    const calls = h.probe.calls.length;
+    await claudeOnlySensor(h).tick();
+    expect(h.probe.calls).toHaveLength(calls);
+    expect(h.wakes).toHaveLength(wakes);
+    expect(h.ledger.getProviderRoute(waiting.routeKey)).toEqual(route);
+    expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(1);
+    expect(h.ledger.getProviderWait(waiting.id)?.status).toBe('waiting');
+    // Control: a GLM-armed sensor checks the due route and settles the marker.
+    h.advance(3_600_000);
+    await h.sensor.tick();
+    expect(h.probe.calls.length).toBeGreaterThan(calls);
+    expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(0);
+  });
+
+  /** The claude-only sensor with its own center, so Gru's machine-attention
+   * wake (action-required) is observable — and an owner bell would be too. */
+  function surfacingClaudeOnly(h: Harness) {
+    const surfaced: string[] = [];
+    const logs: { readonly msg: string; readonly fields: Record<string, unknown> | undefined }[] = [];
+    const notifications = new NotificationCenter({ ledger: h.ledger, bus: h.bus,
+      onActionRequired: (record) => surfaced.push(record.kind), onNeedsOwner: (record) => surfaced.push(`owner:${record.kind}`) });
+    const sensor = new ProviderRecoverySensor({
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, glmGenerationFallback: true, enabled: false, claudeNative: true },
+      ledger: h.ledger, probe: h.probe, notifications, wake: h.wakePort(), slotReArm: h.reArmPort(),
+      silasHosted: () => true, now: () => h.now + 3_600_000,
+      log: (_level, msg, fields) => logs.push({ msg, fields }),
+    });
+    return { sensor, surfaced, logs };
+  }
+
+  /** The supervisor's machine-owned stop for a lane, linked to its wait the
+   * way main wires it. */
+  function linkedStop(h: Harness, agentId: string, waitId: string) {
+    const stop = h.notifications.postIncident({ kind: `supervision.provider-wall.${agentId}.quota_wall`, routing: 'action-required',
+      severity: 'error', title: `Agent ${agentId} stopped: quota wall`, agentId, dedupe: 'unacked' });
+    h.ledger.setProviderWaitIncident(waitId, stop.id);
+    return stop;
+  }
+
+  it('boot hands the open waits of a provider that is now off to Gru — never stranded', async () => {
+    const h = new Harness();
+    const { recovered, waiting } = await glmDebt(h);
+    const stop = linkedStop(h, 'agent-minion-2', waiting.id);
+    h.notifications.postIncident({ kind: `provider.waiting.${waiting.routeKey}`, routing: 'fyi', severity: 'info',
+      title: 'watching', detail: 'Automatic recovery watching', dedupe: 'active' });
+    const wakes = h.wakes.length;
+    const calls = h.probe.calls.length;
+    const { sensor, surfaced, logs } = surfacingClaudeOnly(h);
+    expect(sensor.handBackAtBoot()).toBe(2);
+    expect(await sensor.reconcileAtBoot()).toEqual({ rewoken: 0 });
+    expect(logs).toContainEqual({ msg: 'open provider waits cancelled — automatic recovery is off for their provider', fields: { cancelled: 2 } });
+    expect(h.ledger.getProviderWait(waiting.id)?.status).toBe('cancelled');
+    expect(h.ledger.getProviderWait(recovered.id)?.status).toBe('cancelled');
+    // The machine-owned stop is no longer the sensor's: resolved with its wait.
+    expect(h.ledger.getNotification(stop.id)?.resolvedAt).not.toBeNull();
+    // One machine-attention notice per lane, waking Gru (never the owner's
+    // bell: a provider stop is Gru's to direct), naming a real action.
+    const stopped = h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${waiting.id}`, 'unacked');
+    expect(stopped).toMatchObject({ routing: 'action-required', agentId: 'agent-minion-2' });
+    expect(stopped?.detail).toContain('[provider_recovery] enabled = false');
+    expect(stopped?.detail).toContain('Once the provider limit clears, resume it (dispose its re-arm control once a live agent is adopted) or re-dispatch the job.');
+    expect(stopped?.detail).not.toContain('ask Gru');
+    expect(stopped?.detail).not.toContain('Announced before');
+    const resumed = h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${recovered.id}`, 'unacked');
+    expect(resumed?.title).toContain('provider recovered, automatic resume off');
+    expect(resumed?.routing).toBe('action-required');
+    expect(resumed?.detail).toContain('limit has cleared');
+    expect(surfaced.sort()).toEqual([`provider-recovery.recovery-off.${recovered.id}`, `provider-recovery.recovery-off.${waiting.id}`].sort());
+    // Nothing left to watch: the "watching" notice and the pending delivery retire.
+    expect(h.ledger.findNotificationByKind(`provider.waiting.${waiting.routeKey}`, 'active')).toBeNull();
+    expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(0);
+    expect(h.wakes).toHaveLength(wakes);
+    expect(h.probe.calls).toHaveLength(calls);
+    // Idempotent: a second boot hands nothing back and posts nothing new.
+    const open = h.ledger.listNotifications({ unackedOnly: true }).length;
+    expect(sensor.handBackDisabledWaits()).toBe(0);
+    expect(h.ledger.listNotifications({ unackedOnly: true })).toHaveLength(open);
+    expect(surfaced.sort()).toEqual([`provider-recovery.recovery-off.${recovered.id}`, `provider-recovery.recovery-off.${waiting.id}`].sort());
+  });
+
+  it('Gru is told once: never twice after a crash, never beside a legacy owner-held stop', async () => {
+    const h = new Harness();
+    const { recovered, waiting } = await glmDebt(h);
+    // A boot that posted the notice for the waiting lane, then crashed before
+    // cancelling its wait.
+    linkedStop(h, 'agent-minion-2', waiting.id);
+    const { sensor, surfaced } = surfacingClaudeOnly(h);
+    h.notifications.postIncident({ kind: `provider-recovery.recovery-off.${waiting.id}`, routing: 'action-required', severity: 'error',
+      title: 'posted before a crash', agentId: 'agent-minion-2', dedupe: 'unacked' });
+    // The recovered lane's owner still holds a legacy stop (a needs-owner
+    // provider-wall row from before the attention registry, which the boot's
+    // re-triage left in place) — written as history, never through the center.
+    h.ledger.recordNotification({ id: 'legacy-owner-stop', kind: 'supervision.provider-wall.agent-minion-1.quota_wall',
+      routing: 'needs-owner', severity: 'error', title: 'owner stop', agentId: 'agent-minion-1' });
+    expect(sensor.handBackDisabledWaits()).toBe(2);
+    expect(h.ledger.getProviderWait(waiting.id)?.status).toBe('cancelled');
+    expect(h.ledger.getProviderWait(recovered.id)?.status).toBe('cancelled');
+    // The pre-crash notice stands untouched, nothing new wakes Gru, and no
+    // notice joins the legacy owner stop.
+    expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${waiting.id}`, 'unacked')?.title).toBe('posted before a crash');
+    expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${recovered.id}`, 'any')).toBeNull();
+    expect(surfaced).toEqual([]);
+    // A Gru disposition of the machine stop does not prove the lane resumed:
+    // its wait is still open, so Gru is still told (never stranded).
+    const h2 = new Harness();
+    const debt = await glmDebt(h2);
+    const disposed = linkedStop(h2, 'agent-minion-2', debt.waiting.id);
+    expect(h2.ledger.disposeMachineNotification(disposed.id, 'Gru noted the stop')?.resolvedAt).not.toBeNull();
+    expect(surfacingClaudeOnly(h2).sensor.handBackDisabledWaits()).toBe(2);
+    expect(h2.ledger.findNotificationByKind(`provider-recovery.recovery-off.${debt.waiting.id}`, 'unacked')).not.toBeNull();
+    expect(h2.ledger.findNotificationByKind(`provider-recovery.recovery-off.${debt.recovered.id}`, 'unacked')).not.toBeNull();
+    // An unlinked machine stop (a failed link write leaves the sensor-owned
+    // text on it), posted through the center, survives the cancel — and Gru
+    // is still told: a redundant notice is cheaper than a stranded lane.
+    const h3 = new Harness();
+    const debt3 = await glmDebt(h3);
+    h3.notifications.postIncident({ kind: 'supervision.provider-wall.agent-minion-1.quota_wall', routing: 'action-required',
+      severity: 'error', title: 'Agent agent-minion-1 stopped: quota wall', agentId: 'agent-minion-1', dedupe: 'unacked' });
+    const s3 = surfacingClaudeOnly(h3);
+    expect(s3.sensor.handBackDisabledWaits()).toBe(2);
+    expect(h3.ledger.findNotificationByKind('supervision.provider-wall.agent-minion-1.quota_wall', 'unacked')).not.toBeNull();
+    expect(s3.surfaced.sort()).toEqual([`provider-recovery.recovery-off.${debt3.recovered.id}`, `provider-recovery.recovery-off.${debt3.waiting.id}`].sort());
+    // A needs-owner stop LINKED to the wait (the re-triage left it in place):
+    // the cancel never resolves owner attention, so the owner still holds the
+    // lane and no notice joins it.
+    const h5 = new Harness();
+    const debt5 = await glmDebt(h5);
+    h5.ledger.recordNotification({ id: 'linked-owner-stop', kind: 'supervision.provider-wall.agent-minion-2.quota_wall',
+      routing: 'needs-owner', severity: 'error', title: 'owner stop', agentId: 'agent-minion-2' });
+    h5.ledger.setProviderWaitIncident(debt5.waiting.id, 'linked-owner-stop');
+    const s5 = surfacingClaudeOnly(h5);
+    expect(s5.sensor.handBackDisabledWaits()).toBe(2);
+    expect(h5.ledger.findNotificationByKind(`provider-recovery.recovery-off.${debt5.waiting.id}`, 'any')).toBeNull();
+    expect(h5.ledger.getNotification('linked-owner-stop')?.resolvedAt).toBeNull();
+    expect(s5.surfaced).toEqual([`provider-recovery.recovery-off.${debt5.recovered.id}`]);
+    // An owner-ACKED legacy stop is not held (the re-triage skips acked
+    // rows, so it survives as history): the lane is still handed to Gru.
+    const h4 = new Harness();
+    const debt4 = await glmDebt(h4);
+    h4.ledger.recordNotification({ id: 'acked-legacy-stop', kind: 'supervision.provider-wall.agent-minion-1.quota_wall',
+      routing: 'needs-owner', severity: 'error', title: 'owner stop', agentId: 'agent-minion-1' });
+    expect(h4.ledger.ackNotification('acked-legacy-stop', 'owner')?.ackedAt).not.toBeNull();
+    const s4 = surfacingClaudeOnly(h4);
+    expect(s4.sensor.handBackDisabledWaits()).toBe(2);
+    expect(s4.surfaced.sort()).toEqual([`provider-recovery.recovery-off.${debt4.recovered.id}`, `provider-recovery.recovery-off.${debt4.waiting.id}`].sort());
+  });
+
+  it('with the whole sensor off, service boot still hands every open wait back — job lanes and Silas slots', async () => {
+    const h = new Harness();
+    const { recovered, waiting } = await glmDebt(h);
+    const slot = h.ledger.recordProviderWait({ id: 'wait-silas-slot', routeKey: providerRouteKey('zai-coding-cn', 'glm-5.3', 'fp-slot'),
+      provider: 'zai-coding-cn', model: 'glm-5.3', endpoint: 'e', credentialFingerprint: 'fp-slot', waiterKind: 'silas-slot',
+      jobId: null, agentId: null, slotId: 'ops-slot', sessionFile: null, continuation: null, jobStatusAtEstablishment: null,
+      lineageKey: 'slot:ops-slot', incidentId: 'provider-wall.silas', incidentGeneration: 1, reasonClass: 'temporary-limit' });
+    const surfaced: string[] = [];
+    const off = new ProviderRecoverySensor({
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: false, claudeNative: false },
+      ledger: h.ledger, probe: h.probe,
+      notifications: new NotificationCenter({ ledger: h.ledger, bus: h.bus, onActionRequired: (record) => surfaced.push(record.kind) }),
+      wake: h.wakePort(), slotReArm: h.reArmPort(), silasHosted: () => true, now: () => h.now,
+    });
+    expect(off.enabled).toBe(false);
+    const logs: string[] = [];
+    handBackThenStartSupervision(off, { start: () => {} }, (_level, msg) => logs.push(msg));
+    await bootProviderRecovery(off, (_level, msg) => logs.push(msg));
+    expect(logs.filter((msg) => msg.startsWith('provider-recovery boot hand-back had not been attempted'))).toEqual([]);
+    expect(logs).toContain('provider-recovery sensor disabled — owner activation stays manual');
+    for (const wait of [recovered, waiting, slot]) expect(h.ledger.getProviderWait(wait.id)?.status).toBe('cancelled');
+    expect(surfaced).toHaveLength(3);
+    const recoveredSlot = h.ledger.recordProviderWait({ id: 'wait-silas-recovered', routeKey: providerRouteKey('zai-coding-cn', 'glm-5.3', 'fp-slot2'),
+      provider: 'zai-coding-cn', model: 'glm-5.3', endpoint: 'e', credentialFingerprint: 'fp-slot2', waiterKind: 'silas-slot',
+      jobId: null, agentId: null, slotId: 'ops-slot', sessionFile: null, continuation: null, jobStatusAtEstablishment: null,
+      lineageKey: 'slot:ops-slot', incidentId: 'provider-wall.silas2', incidentGeneration: 1, reasonClass: 'temporary-limit' });
+    h.ledger.commitProviderRecoveryBatch({ id: 'batch-silas', routeKey: recoveredSlot.routeKey, incidentGenerations: [1],
+      evidence: { stopReason: 'stop' }, waiters: [{ id: recoveredSlot.id, jobId: null }] });
+    expect(off.handBackDisabledWaits()).toBe(1);
+    const recoveredNotice = h.ledger.findNotificationByKind('provider-recovery.recovery-off.wait-silas-recovered', 'unacked');
+    expect(recoveredNotice?.title).toBe('Silas slot ops-slot: provider recovered, automatic resume off');
+    expect(recoveredNotice?.detail).toContain('so it was not resumed — send Silas a directive (any Silas turn re-arms its slot).');
+    expect(recoveredNotice?.detail).not.toContain('re-dispatch');
+    const slotNotice = h.ledger.findNotificationByKind('provider-recovery.recovery-off.wait-silas-slot', 'unacked');
+    expect(slotNotice).toMatchObject({ routing: 'action-required', agentId: null });
+    expect(slotNotice?.title).toBe('Silas slot ops-slot stopped: provider limit (automatic recovery off)');
+    expect(slotNotice?.detail).toContain('Once the provider limit clears, send Silas a directive (any Silas turn re-arms its slot).');
+    expect(slotNotice?.detail).not.toContain('re-dispatch the job');
+    off.stop();
+  });
+
+  it('a boot hand-back that fails outright is attempted before supervision starts, tells Gru, never blocks supervision, and waits for the next boot', async () => {
+    const h = new Harness();
+    const { waiting } = await glmDebt(h);
+    const { sensor, surfaced } = surfacingClaudeOnly(h);
+    const order: string[] = [];
+    const failing = vi.spyOn(h.ledger, 'listProviderWaits').mockImplementation(() => {
+      order.push('hand-back');
+      throw new Error('ledger read failed');
+    });
+    const errors: string[] = [];
+    handBackThenStartSupervision(sensor, { start: () => { order.push('start'); } }, (_level, msg) => errors.push(msg));
+    failing.mockRestore();
+    expect(order).toEqual(['hand-back', 'start']);
+    expect(errors).toEqual(['provider wait hand-back failed before supervision start — kept for the next boot']);
+    // Gru is told: no lane is left stopped in silence.
+    expect(surfaced).toEqual(['provider-recovery.hand-back-failed']);
+    // The boot reconciliation never hands back (it runs after hydration):
+    // the wait is kept for the next boot's pre-start hand-back.
+    expect(await sensor.reconcileAtBoot()).toEqual({ rewoken: 0 });
+    expect(h.ledger.getProviderWait(waiting.id)?.status).toBe('waiting');
+    // The next boot hands it back and retires the failure notice.
+    expect(h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active')).not.toBeNull();
+    expect(surfacingClaudeOnly(h).sensor.handBackAtBoot()).toBe(2);
+    expect(h.ledger.getProviderWait(waiting.id)?.status).toBe('cancelled');
+    expect(h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active')).toBeNull();
+  });
+
+  it('a wait whose boot hand-back fails is kept for the next boot — the boot reconciliation never cancels it after hydration', async () => {
+    const h = new Harness();
+    const { waiting, recovered } = await glmDebt(h);
+    const { sensor } = surfacingClaudeOnly(h);
+    const original = h.ledger.setProviderWaitStatus.bind(h.ledger);
+    const failing = vi.spyOn(h.ledger, 'setProviderWaitStatus').mockImplementation((id, status, payload) => {
+      if (id === waiting.id) throw new Error('ledger write failed');
+      return original(id, status, payload);
+    });
+    handBackThenStartSupervision(sensor, { start: () => {} }, () => {});
+    failing.mockRestore();
+    expect(h.ledger.getProviderWait(recovered.id)?.status).toBe('cancelled');
+    // A reconciliation never hands back — even on a sensor whose boot
+    // hand-back never ran (no once-guard to hide behind).
+    expect(await surfacingClaudeOnly(h).sensor.reconcileAtBoot()).toEqual({ rewoken: 0 });
+    expect(h.ledger.getProviderWait(waiting.id)?.status).toBe('waiting');
+    // Gru was told before the failed cancel, and the kept wait raised the
+    // boot failure notice (never stranded).
+    expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${waiting.id}`, 'active')).not.toBeNull();
+    expect(h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active')).not.toBeNull();
+  });
+
+  it('the boot failure notice stays while a pass keeps any wait, and the notices after it are marked as repeats', async () => {
+    const h = new Harness();
+    const { waiting, recovered } = await glmDebt(h);
+    // Boot 1 fails outright: Gru is told once.
+    const reads = vi.spyOn(h.ledger, 'listProviderWaits').mockImplementation(() => { throw new Error('ledger read failed'); });
+    expect(() => surfacingClaudeOnly(h).sensor.handBackAtBoot()).toThrow('ledger read failed');
+    reads.mockRestore();
+    const first = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
+    expect(first).not.toBeNull();
+    // Boot 2 keeps the waiting lane (its own notice cannot be written): the
+    // open failure notice is refreshed in place — its detail changes, which
+    // wakes Gru again (the mailbox basis hashes the detail) — and says Gru
+    // was told before.
+    const original = h.ledger.recordNotification.bind(h.ledger);
+    const posts = vi.spyOn(h.ledger, 'recordNotification').mockImplementation((input) => {
+      if (input.kind === `provider-recovery.recovery-off.${waiting.id}`) throw new Error('ledger write failed');
+      return original(input);
+    });
+    expect(surfacingClaudeOnly(h).sensor.handBackAtBoot()).toBe(1);
+    posts.mockRestore();
+    expect(h.ledger.getProviderWait(waiting.id)?.status).toBe('waiting');
+    const refreshed = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
+    expect(refreshed).not.toBeNull();
+    expect(refreshed?.id).toBe(first!.id);
+    expect(refreshed?.detail).not.toBe(first!.detail);
+    expect(refreshed?.detail).toContain(`Gru was told before (previously reported ${first!.ts})`);
+    // Gru was told at boot 1 and may have acted: the recovered lane's notice
+    // says a failure was reported since its wait opened.
+    expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${recovered.id}`, 'active')?.detail)
+      .toContain('A boot hand-back failure was reported since this wait opened');
+    // Boot 3 hands the last wait back — its notice is marked the same way —
+    // and retires the failure notice.
+    expect(surfacingClaudeOnly(h).sensor.handBackAtBoot()).toBe(1);
+    expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${waiting.id}`, 'active')?.detail)
+      .toContain('A boot hand-back failure was reported since this wait opened');
+    expect(h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active')).toBeNull();
+  });
+
+  it('the boot failure notice is raised again after a retirement, and retired by a clean pass that hands nothing back', async () => {
+    const h = new Harness();
+    await glmDebt(h);
+    const failingBoot = (): string[] => {
+      const reads = vi.spyOn(h.ledger, 'listProviderWaits').mockImplementation(() => { throw new Error('ledger read failed'); });
+      try {
+        const { sensor, surfaced } = surfacingClaudeOnly(h);
+        expect(() => sensor.handBackAtBoot()).toThrow('ledger read failed');
+        return surfaced;
+      } finally {
+        reads.mockRestore();
+      }
+    };
+    expect(failingBoot()).toEqual(['provider-recovery.hand-back-failed']);
+    const first = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
+    expect(first).toMatchObject({
+      routing: 'action-required', severity: 'error', agentId: null, title: 'Provider waits not handed back at boot',
+      detail: expect.stringContaining('(for some or all of them)'),
+    });
+    expect(first?.detail).toContain("until a restart's hand-back succeeds — see the service log.");
+    expect(first?.detail).toMatch(/Last reported \S+\.$/u);
+    expect(first?.detail).not.toContain('Gru was told before');
+    // Every provider back on: a clean pass hands nothing back — and retires it.
+    expect(h.sensor.handBackAtBoot()).toBe(0);
+    expect(h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active')).toBeNull();
+    // A later failing boot tells Gru again — a new row, never folded into
+    // the retired one.
+    expect(failingBoot()).toEqual(['provider-recovery.hand-back-failed']);
+    const again = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
+    expect(again).not.toBeNull();
+    expect(again?.id).not.toBe(first!.id);
+    expect(again?.detail).toContain(`Gru was told before (previously reported ${first!.ts})`);
+    expect(h.ledger.getNotification(first!.id)).toMatchObject({ resolvedAt: expect.any(String) });
+  });
+
+  it('a failure reported since a wait opened marks its notice — even once Gru disposed of it — and a wait opened later is unmarked', async () => {
+    try {
+      const h = new Harness();
+      const { waiting } = await glmDebt(h);
+      vi.setSystemTime(new Date(Date.now() + 60_000));
+      const reads = vi.spyOn(h.ledger, 'listProviderWaits').mockImplementation(() => { throw new Error('ledger read failed'); });
+      expect(() => surfacingClaudeOnly(h).sensor.handBackAtBoot()).toThrow('ledger read failed');
+      reads.mockRestore();
+      // Gru acts on the failure and disposes of it.
+      const failure = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
+      expect(failure).not.toBeNull();
+      expect(h.ledger.disposeMachineNotification(failure!.id, 'Gru re-dispatched the stopped lanes'))
+        .toMatchObject({ resolvedAt: expect.any(String) });
+      expect(h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active')).toBeNull();
+      // A wait opened after the failure.
+      vi.setSystemTime(new Date(Date.now() + 60_000));
+      const late = h.ledger.recordProviderWait({ id: 'wait-late-slot', routeKey: providerRouteKey('zai-coding-cn', 'glm-5.3', 'fp-late'),
+        provider: 'zai-coding-cn', model: 'glm-5.3', endpoint: 'e', credentialFingerprint: 'fp-late', waiterKind: 'silas-slot',
+        jobId: null, agentId: null, slotId: 'late-slot', sessionFile: null, continuation: null, jobStatusAtEstablishment: null,
+        lineageKey: 'slot:late-slot', incidentId: 'provider-wall.late', incidentGeneration: 1, reasonClass: 'temporary-limit' });
+      expect(surfacingClaudeOnly(h).sensor.handBackAtBoot()).toBe(3);
+      expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${waiting.id}`, 'active')?.detail)
+        .toContain('A boot hand-back failure was reported since this wait opened');
+      const lateDetail = h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${late.id}`, 'active')?.detail;
+      expect(lateDetail).toContain('Automatic provider recovery is off');
+      expect(lateDetail).not.toContain('reported since');
+      expect(lateDetail).not.toContain('Announced before');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a failure notice whose report time cannot be read counts as reported', async () => {
+    try {
+      const h = new Harness();
+      await glmDebt(h);
+      vi.setSystemTime(new Date(Date.now() + 60_000));
+      const reads = vi.spyOn(h.ledger, 'listProviderWaits').mockImplementation(() => { throw new Error('ledger read failed'); });
+      expect(() => surfacingClaudeOnly(h).sensor.handBackAtBoot()).toThrow('ledger read failed');
+      reads.mockRestore();
+      const failure = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
+      expect(failure).not.toBeNull();
+      // A wait opened after the failure — then the report time is unreadable.
+      vi.setSystemTime(new Date(Date.now() + 60_000));
+      const late = h.ledger.recordProviderWait({ id: 'wait-late-slot', routeKey: providerRouteKey('zai-coding-cn', 'glm-5.3', 'fp-late'),
+        provider: 'zai-coding-cn', model: 'glm-5.3', endpoint: 'e', credentialFingerprint: 'fp-late', waiterKind: 'silas-slot',
+        jobId: null, agentId: null, slotId: 'late-slot', sessionFile: null, continuation: null, jobStatusAtEstablishment: null,
+        lineageKey: 'slot:late-slot', incidentId: 'provider-wall.late', incidentGeneration: 1, reasonClass: 'temporary-limit' });
+      h.ledger.updateNotificationDetail(failure!.id, 'Handing back failed. Last reported not-a-time.');
+      expect(h.ledger.getNotification(failure!.id)?.detail).toBe('Handing back failed. Last reported not-a-time.');
+      expect(surfacingClaudeOnly(h).sensor.handBackAtBoot()).toBe(3);
+      expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${late.id}`, 'active')?.detail)
+        .toContain('A boot hand-back failure was reported since this wait opened');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('every failing boot refreshes the open failure notice in place — a new detail for the Gru mailbox — and a wait stranded between two failing boots is marked', async () => {
+    try {
+      const h = new Harness();
+      await glmDebt(h);
+      const failingBoot = (): string[] => {
+        const reads = vi.spyOn(h.ledger, 'listProviderWaits').mockImplementation(() => { throw new Error('ledger read failed'); });
+        try {
+          const { sensor, surfaced } = surfacingClaudeOnly(h);
+          expect(() => sensor.handBackAtBoot()).toThrow('ledger read failed');
+          return surfaced;
+        } finally {
+          reads.mockRestore();
+        }
+      };
+      vi.setSystemTime(new Date(Date.now() + 60_000));
+      expect(failingBoot()).toEqual(['provider-recovery.hand-back-failed']);
+      const first = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
+      expect(first).not.toBeNull();
+      const mailboxItem = () => projectMailbox(h.ledger).find((item) => item.notificationIds.includes(first!.id));
+      const before = mailboxItem();
+      expect(before).toBeDefined();
+      // A wait opened between the two failing boots.
+      vi.setSystemTime(new Date(Date.now() + 60_000));
+      const between = h.ledger.recordProviderWait({ id: 'wait-between-slot', routeKey: providerRouteKey('zai-coding-cn', 'glm-5.3', 'fp-between'),
+        provider: 'zai-coding-cn', model: 'glm-5.3', endpoint: 'e', credentialFingerprint: 'fp-between', waiterKind: 'silas-slot',
+        jobId: null, agentId: null, slotId: 'between-slot', sessionFile: null, continuation: null, jobStatusAtEstablishment: null,
+        lineageKey: 'slot:between-slot', incidentId: 'provider-wall.between', incidentGeneration: 1, reasonClass: 'temporary-limit' });
+      vi.setSystemTime(new Date(Date.now() + 60_000));
+      // Refreshed in place (one write — never a resolve then a post): no new
+      // post, but the detail changes and with it the Gru mailbox basis —
+      // which is what wakes Gru again.
+      expect(failingBoot()).toEqual([]);
+      const after = mailboxItem();
+      expect(after).toBeDefined();
+      expect(after!.basis).not.toBe(before!.basis);
+      const second = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
+      expect(second).not.toBeNull();
+      expect(second?.id).toBe(first!.id);
+      expect(second?.detail).not.toBe(first!.detail);
+      expect(second?.detail).toContain(`Gru was told before (previously reported ${first!.ts})`);
+      expect(surfacingClaudeOnly(h).sensor.handBackAtBoot()).toBe(3);
+      expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${between.id}`, 'active')?.detail)
+        .toContain('A boot hand-back failure was reported since this wait opened');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a wait whose own notice was posted before reads "Announced before", even with a failure reported since', async () => {
+    const h = new Harness();
+    const { waiting } = await glmDebt(h);
+    // Boot 1 posts the lane's notice, then its cancel fails: the wait is
+    // kept and the failure notice is raised too.
+    const original = h.ledger.setProviderWaitStatus.bind(h.ledger);
+    const cancels = vi.spyOn(h.ledger, 'setProviderWaitStatus').mockImplementation((id, status, payload) => {
+      if (id === waiting.id) throw new Error('ledger write failed');
+      return original(id, status, payload);
+    });
+    surfacingClaudeOnly(h).sensor.handBackAtBoot();
+    cancels.mockRestore();
+    expect(h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active')).not.toBeNull();
+    const own = h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${waiting.id}`, 'active');
+    expect(own).not.toBeNull();
+    // Gru disposes of the lane's own notice; the next boot hands the wait back.
+    expect(h.ledger.disposeMachineNotification(own!.id, 'Gru checked the lane')).toMatchObject({ resolvedAt: expect.any(String) });
+    expect(surfacingClaudeOnly(h).sensor.handBackAtBoot()).toBe(1);
+    expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${waiting.id}`, 'active')?.detail)
+      .toContain('Announced before and the wait is still open');
+  });
+
+  it('a boot whose hand-back was never attempted is logged at error, tells Gru, and latches the hand-back off for the process', async () => {
+    const h = new Harness();
+    const { waiting } = await glmDebt(h);
+    const { sensor, surfaced } = surfacingClaudeOnly(h);
+    const logs: string[] = [];
+    await bootProviderRecovery(sensor, (level, msg) => logs.push(`${level}:${msg}`));
+    expect(logs.filter((line) => line.includes('had not been attempted'))).toEqual(['error:provider-recovery boot hand-back had not been attempted when provider recovery booted — open waits of a provider whose recovery is off are kept until a boot that runs it']);
+    expect(surfaced).toEqual(['provider-recovery.hand-back-failed']);
+    expect(h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active')?.detail).toContain('was never attempted');
+    // Latched: an attempt after hydration would resolve rows the supervisor
+    // already bound — the next boot runs it.
+    expect(sensor.handBackAtBoot()).toBe(0);
+    expect(h.ledger.getProviderWait(waiting.id)?.status).toBe('waiting');
+    expect(h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active')?.detail).toContain('was never attempted');
+  });
+
+  it('in main order a boot hand-back that failed still counts as attempted — no skip alarm, and Gru is told once', async () => {
+    const h = new Harness();
+    await glmDebt(h);
+    const { sensor, surfaced } = surfacingClaudeOnly(h);
+    const reads = vi.spyOn(h.ledger, 'listProviderWaits').mockImplementation(() => { throw new Error('ledger read failed'); });
+    handBackThenStartSupervision(sensor, { start: () => {} }, () => {});
+    reads.mockRestore();
+    const logs: string[] = [];
+    await bootProviderRecovery(sensor, (level, msg) => logs.push(`${level}:${msg}`));
+    expect(logs.filter((line) => line.includes('had not been attempted'))).toEqual([]);
+    expect(surfaced).toEqual(['provider-recovery.hand-back-failed']);
+    // Told once: the notice is the failed pass's, never rewritten that boot.
+    const notice = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active')?.detail;
+    expect(notice).toContain('(for some or all of them)');
+    expect(notice).not.toContain('was never attempted');
+    expect(notice).not.toContain('Gru was told before');
+  });
+
+  it('an open failure notice that cannot be refreshed is logged, never thrown, and stays open; one closed or gone before the refresh is replaced', async () => {
+    const h = new Harness();
+    await glmDebt(h);
+    const earlier = 'earlier. Last reported 2026-01-01T00:00:00.000Z.';
+    const open = h.notifications.postIncident({ kind: 'provider-recovery.hand-back-failed', routing: 'action-required',
+      severity: 'error', title: 'Provider waits not handed back at boot', detail: earlier, dedupe: 'active' });
+    const logs: { readonly msg: string; readonly fields: Record<string, unknown> | undefined }[] = [];
+    const sensorWith = (updateDetail: (id: string, detail: string) => { readonly resolvedAt: string | null } | null,
+      posts: string[] = []) => new ProviderRecoverySensor({
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: false, claudeNative: true },
+      ledger: h.ledger, probe: h.probe, wake: h.wakePort(), slotReArm: h.reArmPort(), silasHosted: () => true, now: () => h.now,
+      notifications: {
+        postIncident: (input) => { posts.push(input.kind); return h.notifications.postIncident(input); },
+        resolveIncidents: (prefix, by) => h.notifications.resolveIncidents(prefix, by),
+        updateDetail,
+      },
+      log: (_level, msg, fields) => logs.push({ msg, fields }),
+    });
+    const reads = vi.spyOn(h.ledger, 'listProviderWaits').mockImplementation(() => { throw new Error('ledger read failed'); });
+    try {
+      expect(() => sensorWith(() => { throw new Error('center down'); }).handBackAtBoot()).toThrow('ledger read failed');
+    } finally {
+      reads.mockRestore();
+    }
+    expect(logs).toContainEqual({ msg: 'the hand-back failure notice could not be written', fields: { error: 'Error: center down' } });
+    expect(h.ledger.getNotification(open.id)).toMatchObject({ resolvedAt: null, detail: earlier });
+    // A refresh that reports the row gone (null) falls through to a post.
+    const posts: string[] = [];
+    sensorWith(() => null, posts).noteBootHandBackSkipped();
+    expect(posts).toEqual(['provider-recovery.hand-back-failed']);
+    // A notice closed between the read and the refresh: a fresh one is
+    // posted, it still says Gru was told before, and the closed row is never
+    // rewritten.
+    const original = h.ledger.updateNotificationDetail.bind(h.ledger);
+    const closing = vi.spyOn(h.ledger, 'updateNotificationDetail').mockImplementation((id, detail, title) => {
+      h.ledger.resolveNotificationById(id, 'gru');
+      return original(id, detail, title);
+    });
+    try {
+      surfacingClaudeOnly(h).sensor.noteBootHandBackSkipped();
+    } finally {
+      closing.mockRestore();
+    }
+    const fresh = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
+    expect(fresh).not.toBeNull();
+    expect(fresh?.id).not.toBe(open.id);
+    expect(fresh?.detail).toContain('was never attempted');
+    expect(fresh?.detail).toContain(`Gru was told before (previously reported ${open.ts})`);
+    expect(h.ledger.getNotification(open.id)).toMatchObject({ resolvedAt: expect.any(String), detail: earlier });
+  });
+
+  it('a failure notice whose detail carries no report time counts as reported; one with no detail at all uses its insert time', async () => {
+    try {
+      const h = new Harness();
+      await glmDebt(h);
+      vi.setSystemTime(new Date(Date.now() + 60_000));
+      const early = h.ledger.recordProviderWait({ id: 'wait-early-slot', routeKey: providerRouteKey('zai-coding-cn', 'glm-5.3', 'fp-early'),
+        provider: 'zai-coding-cn', model: 'glm-5.3', endpoint: 'e', credentialFingerprint: 'fp-early', waiterKind: 'silas-slot',
+        jobId: null, agentId: null, slotId: 'early-slot', sessionFile: null, continuation: null, jobStatusAtEstablishment: null,
+        lineageKey: 'slot:early-slot', incidentId: 'provider-wall.early', incidentGeneration: 1, reasonClass: 'temporary-limit' });
+      vi.setSystemTime(new Date(Date.now() + 60_000));
+      // A row with no detail at all (written as history): its insert time.
+      h.ledger.recordNotification({ id: 'bare-failure', kind: 'provider-recovery.hand-back-failed', routing: 'action-required',
+        severity: 'error', title: 'Provider waits not handed back at boot' });
+      vi.setSystemTime(new Date(Date.now() + 60_000));
+      const late = h.ledger.recordProviderWait({ id: 'wait-late-slot', routeKey: providerRouteKey('zai-coding-cn', 'glm-5.3', 'fp-late'),
+        provider: 'zai-coding-cn', model: 'glm-5.3', endpoint: 'e', credentialFingerprint: 'fp-late', waiterKind: 'silas-slot',
+        jobId: null, agentId: null, slotId: 'late-slot', sessionFile: null, continuation: null, jobStatusAtEstablishment: null,
+        lineageKey: 'slot:late-slot', incidentId: 'provider-wall.late', incidentGeneration: 1, reasonClass: 'temporary-limit' });
+      expect(surfacingClaudeOnly(h).sensor.handBackAtBoot()).toBe(4);
+      expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${early.id}`, 'active')?.detail)
+        .toContain('A boot hand-back failure was reported since this wait opened');
+      expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${late.id}`, 'active')?.detail).not.toContain('reported since');
+      // A detail without its report time is unreadable: counted as reported.
+      const h2 = new Harness();
+      await glmDebt(h2);
+      h2.ledger.recordNotification({ id: 'unstamped-failure', kind: 'provider-recovery.hand-back-failed', routing: 'action-required',
+        severity: 'error', title: 'Provider waits not handed back at boot', detail: 'Handing back failed.' });
+      vi.setSystemTime(new Date(Date.now() + 60_000));
+      const later = h2.ledger.recordProviderWait({ id: 'wait-later-slot', routeKey: providerRouteKey('zai-coding-cn', 'glm-5.3', 'fp-later'),
+        provider: 'zai-coding-cn', model: 'glm-5.3', endpoint: 'e', credentialFingerprint: 'fp-later', waiterKind: 'silas-slot',
+        jobId: null, agentId: null, slotId: 'later-slot', sessionFile: null, continuation: null, jobStatusAtEstablishment: null,
+        lineageKey: 'slot:later-slot', incidentId: 'provider-wall.later', incidentGeneration: 1, reasonClass: 'temporary-limit' });
+      expect(surfacingClaudeOnly(h2).sensor.handBackAtBoot()).toBe(3);
+      expect(h2.ledger.findNotificationByKind(`provider-recovery.recovery-off.${later.id}`, 'active')?.detail)
+        .toContain('A boot hand-back failure was reported since this wait opened');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('after a clock step back the open notice is refreshed, and a wait opened before its latest report is marked', async () => {
+    try {
+      const h = new Harness();
+      await glmDebt(h);
+      const failingBoot = (): void => {
+        const reads = vi.spyOn(h.ledger, 'listProviderWaits').mockImplementation(() => { throw new Error('ledger read failed'); });
+        try {
+          expect(() => surfacingClaudeOnly(h).sensor.handBackAtBoot()).toThrow('ledger read failed');
+        } finally {
+          reads.mockRestore();
+        }
+      };
+      const now = Date.now();
+      vi.setSystemTime(new Date(now + 3_600_000));
+      failingBoot();
+      const ahead = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
+      expect(h.ledger.disposeMachineNotification(ahead!.id, 'Gru re-dispatched the lanes')).toMatchObject({ resolvedAt: expect.any(String) });
+      // The clock steps back: the next notice sorts OLDER than the resolved one.
+      vi.setSystemTime(new Date(now + 60_000));
+      failingBoot();
+      const open = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
+      expect(open).not.toBeNull();
+      expect(open?.id).not.toBe(ahead!.id);
+      expect(h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'any')?.id).toBe(ahead!.id);
+      // A wait opened, then a failing boot reports again — on the open row.
+      vi.setSystemTime(new Date(now + 5_400_000));
+      const late = h.ledger.recordProviderWait({ id: 'wait-late-slot', routeKey: providerRouteKey('zai-coding-cn', 'glm-5.3', 'fp-late'),
+        provider: 'zai-coding-cn', model: 'glm-5.3', endpoint: 'e', credentialFingerprint: 'fp-late', waiterKind: 'silas-slot',
+        jobId: null, agentId: null, slotId: 'late-slot', sessionFile: null, continuation: null, jobStatusAtEstablishment: null,
+        lineageKey: 'slot:late-slot', incidentId: 'provider-wall.late', incidentGeneration: 1, reasonClass: 'temporary-limit' });
+      vi.setSystemTime(new Date(now + 7_200_000));
+      failingBoot();
+      const refreshed = h.ledger.getNotification(open!.id);
+      expect(refreshed?.resolvedAt).toBeNull();
+      expect(refreshed?.detail).not.toBe(open!.detail);
+      expect(h.ledger.latestNotificationByKind('provider-recovery.hand-back-failed')?.id).toBe(open!.id); // nothing new posted
+      // Even once Gru disposed of it too, the wait's notice reads that latest
+      // report (insertion order), though the newest-ts row still predates
+      // the wait.
+      expect(h.ledger.disposeMachineNotification(open!.id, 'Gru checked')).toMatchObject({ resolvedAt: expect.any(String) });
+      expect(h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'any')?.id).toBe(ahead!.id);
+      expect(Date.parse(ahead!.ts)).toBeLessThan(Date.parse(late.createdAt));
+      vi.setSystemTime(new Date(now + 10_800_000));
+      // The two waits glmDebt opened and the late one.
+      expect(surfacingClaudeOnly(h).sensor.handBackAtBoot()).toBe(3);
+      expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${late.id}`, 'active')?.detail)
+        .toContain('A boot hand-back failure was reported since this wait opened');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a clock step back the other way — a report after the wait opened, then a repost that sorts older — still marks the wait', async () => {
+    try {
+      const h = new Harness();
+      await glmDebt(h);
+      const failingBoot = (): void => {
+        const reads = vi.spyOn(h.ledger, 'listProviderWaits').mockImplementation(() => { throw new Error('ledger read failed'); });
+        try {
+          expect(() => surfacingClaudeOnly(h).sensor.handBackAtBoot()).toThrow('ledger read failed');
+        } finally {
+          reads.mockRestore();
+        }
+      };
+      const now = Date.now();
+      vi.setSystemTime(new Date(now + 7_200_000));
+      const late = h.ledger.recordProviderWait({ id: 'wait-late-slot', routeKey: providerRouteKey('zai-coding-cn', 'glm-5.3', 'fp-late'),
+        provider: 'zai-coding-cn', model: 'glm-5.3', endpoint: 'e', credentialFingerprint: 'fp-late', waiterKind: 'silas-slot',
+        jobId: null, agentId: null, slotId: 'late-slot', sessionFile: null, continuation: null, jobStatusAtEstablishment: null,
+        lineageKey: 'slot:late-slot', incidentId: 'provider-wall.late', incidentGeneration: 1, reasonClass: 'temporary-limit' });
+      // A failing boot reports after the wait opened; Gru disposes of it.
+      vi.setSystemTime(new Date(now + 10_800_000));
+      failingBoot();
+      const reported = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
+      expect(h.ledger.disposeMachineNotification(reported!.id, 'Gru checked')).toMatchObject({ resolvedAt: expect.any(String) });
+      // The clock steps back; a failing boot reposts — the latest inserted row
+      // now carries an EARLIER time than the wait.
+      vi.setSystemTime(new Date(now + 60_000));
+      failingBoot();
+      const repost = h.ledger.latestNotificationByKind('provider-recovery.hand-back-failed');
+      expect(repost?.id).not.toBe(reported!.id);
+      expect(Date.parse(repost!.ts)).toBeLessThan(Date.parse(late.createdAt));
+      vi.setSystemTime(new Date(now + 14_400_000));
+      // The two waits glmDebt opened and the late one.
+      expect(surfacingClaudeOnly(h).sensor.handBackAtBoot()).toBe(3);
+      expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${late.id}`, 'active')?.detail)
+        .toContain('A boot hand-back failure was reported since this wait opened');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a failure notice posted after Gru disposed of the previous one still says Gru was told before', async () => {
+    try {
+      const h = new Harness();
+      await glmDebt(h);
+      const failingBoot = (): void => {
+        const reads = vi.spyOn(h.ledger, 'listProviderWaits').mockImplementation(() => { throw new Error('ledger read failed'); });
+        try {
+          expect(() => surfacingClaudeOnly(h).sensor.handBackAtBoot()).toThrow('ledger read failed');
+        } finally {
+          reads.mockRestore();
+        }
+      };
+      vi.setSystemTime(new Date(Date.now() + 60_000));
+      failingBoot();
+      const first = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
+      expect(first).not.toBeNull();
+      expect(h.ledger.disposeMachineNotification(first!.id, 'Gru re-dispatched the lanes')).toMatchObject({ resolvedAt: expect.any(String) });
+      vi.setSystemTime(new Date(Date.now() + 60_000));
+      failingBoot();
+      const second = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
+      expect(second).not.toBeNull();
+      expect(second?.id).not.toBe(first!.id);
+      expect(second?.ts).not.toBe(first!.ts);
+      expect(second?.detail).toContain(`Gru was told before (previously reported ${first!.ts})`);
+      // A further failing boot refreshes that repost in place, and the
+      // earliest report time carries forward (never the repost's own).
+      vi.setSystemTime(new Date(Date.now() + 60_000));
+      failingBoot();
+      const third = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
+      expect(third?.id).toBe(second!.id);
+      expect(third?.detail).not.toBe(second!.detail);
+      expect(third?.detail).toContain(`Gru was told before (previously reported ${first!.ts})`);
+      expect(third?.detail).not.toContain(`previously reported ${second!.ts}`);
+      // Disposed again: the next repost reads the caveat the disposed notice
+      // carried, so the earliest report still carries forward.
+      expect(h.ledger.disposeMachineNotification(second!.id, 'Gru checked again')).toMatchObject({ resolvedAt: expect.any(String) });
+      vi.setSystemTime(new Date(Date.now() + 60_000));
+      failingBoot();
+      const fourth = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
+      expect(fourth).not.toBeNull();
+      expect(fourth?.id).not.toBe(second!.id);
+      expect(fourth?.detail).toContain(`Gru was told before (previously reported ${first!.ts})`);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a boot failure notice that cannot be posted, or retired, is logged with its cause — never thrown in its place', () => {
+    const logs: { readonly msg: string; readonly fields: Record<string, unknown> | undefined }[] = [];
+    const broken = (h: Harness) => new ProviderRecoverySensor({
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: false, claudeNative: true },
+      ledger: h.ledger, probe: h.probe, wake: h.wakePort(), slotReArm: h.reArmPort(), silasHosted: () => true, now: () => h.now,
+      notifications: {
+        postIncident: () => { throw new Error('center down'); },
+        resolveIncidents: () => { throw new Error('center down'); },
+        updateDetail: () => { throw new Error('center down'); },
+      },
+      log: (_level, msg, fields) => logs.push({ msg, fields }),
+    });
+    const h = new Harness();
+    const reads = vi.spyOn(h.ledger, 'listProviderWaits').mockImplementation(() => { throw new Error('ledger read failed'); });
+    expect(() => broken(h).handBackAtBoot()).toThrow('ledger read failed');
+    reads.mockRestore();
+    expect(logs).toContainEqual({ msg: 'the hand-back failure notice could not be written', fields: { error: 'Error: center down' } });
+    // A clean pass whose retirement fails is logged too.
+    expect(broken(new Harness()).handBackAtBoot()).toBe(0);
+    expect(logs).toContainEqual({ msg: 'retiring the hand-back failure notice failed', fields: { error: 'Error: center down' } });
+  });
+
+  it('route retirement works from durable state: a route whose waits an earlier boot cancelled still retires', async () => {
+    const h = new Harness();
+    const { recovered, waiting } = await glmDebt(h);
+    h.notifications.postIncident({ kind: `provider.waiting.${waiting.routeKey}`, routing: 'fyi', severity: 'info',
+      title: 'watching', detail: 'Automatic recovery watching', dedupe: 'active' });
+    // An earlier boot cancelled both waits, then died before retiring routes.
+    h.ledger.setProviderWaitStatus(recovered.id, 'cancelled', { why: 'recovery-disabled' });
+    h.ledger.setProviderWaitStatus(waiting.id, 'cancelled', { why: 'recovery-disabled' });
+    expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(1);
+    const { sensor } = surfacingClaudeOnly(h);
+    expect(sensor.handBackDisabledWaits()).toBe(0);
+    expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(0);
+    expect(h.ledger.findNotificationByKind(`provider.waiting.${waiting.routeKey}`, 'active')).toBeNull();
+  });
+
+  it('a wait kept after a failed cancel is never announced twice while its notice is open, again only after Gru disposed of it, and its notice resolves when the switch is back on', async () => {
+    const h = new Harness();
+    const { waiting } = await glmDebt(h);
+    const { sensor, surfaced } = surfacingClaudeOnly(h);
+    const original = h.ledger.setProviderWaitStatus.bind(h.ledger);
+    const failing = vi.spyOn(h.ledger, 'setProviderWaitStatus').mockImplementation((id, status, payload) => {
+      if (id === waiting.id) throw new Error('ledger write failed');
+      return original(id, status, payload);
+    });
+    sensor.handBackDisabledWaits();
+    const kind = `provider-recovery.recovery-off.${waiting.id}`;
+    const notice = h.ledger.findNotificationByKind(kind, 'unacked');
+    expect(notice).not.toBeNull();
+    sensor.handBackDisabledWaits(); // the next boot retries the kept wait...
+    expect(h.ledger.findNotificationByKind(kind, 'active')?.id).toBe(notice!.id); // ...never posting it twice
+    expect(surfaced.filter((posted) => posted === kind)).toHaveLength(1);
+    expect(h.ledger.findNotificationByKind(kind, 'active')?.detail).not.toContain('Announced before');
+    // Gru disposes of it, but the wait is still open (its cancel failed): a
+    // disposition does not prove the lane resumed, so the next boot tells
+    // Gru again — never stranded.
+    expect(h.ledger.disposeMachineNotification(notice!.id, 'Gru re-dispatched the job')?.resolvedAt).not.toBeNull();
+    sensor.handBackDisabledWaits();
+    const again = h.ledger.findNotificationByKind(kind, 'active');
+    expect(again).not.toBeNull();
+    expect(again?.id).not.toBe(notice!.id);
+    expect(surfaced.filter((posted) => posted === kind)).toHaveLength(2);
+    // ...marked as a repeat, so Gru checks before it re-dispatches anything.
+    expect(again?.detail).toContain('Announced before and the wait is still open — check whether the lane already resumed before you act.');
+    failing.mockRestore();
+    // The owner turns GLM recovery back on: the kept wait is served again,
+    // so its notice is no longer true.
+    expect(h.sensor.handBackDisabledWaits()).toBe(0);
+    expect(h.ledger.getProviderWait(waiting.id)?.status).toBe('waiting');
+    expect(h.ledger.findNotificationByKind(kind, 'active')).toBeNull();
+    // ...and off again: this new hand-back is announced, never silent.
+    expect(sensor.handBackDisabledWaits()).toBe(1);
+    expect(h.ledger.getProviderWait(waiting.id)?.status).toBe('cancelled');
+    expect(h.ledger.findNotificationByKind(kind, 'active')).toMatchObject({ routing: 'action-required' });
+  });
+
+  it('service boot with recovery on starts the timer and re-wakes; a failed reconciliation is logged, never thrown', async () => {
+    const h = new Harness();
+    await glmDebt(h); // one recovered GLM route with its delivery pending
+    const wakes = h.wakes.length;
+    const logs: string[] = [];
+    let intervals = 0;
+    const on = new ProviderRecoverySensor({
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: true, glmGenerationFallback: true },
+      ledger: h.ledger, probe: h.probe, notifications: h.notifications, wake: h.wakePort(), slotReArm: h.reArmPort(),
+      silasHosted: () => true, now: () => h.now, log: (_level, msg) => logs.push(msg),
+      setInterval: ((() => { intervals += 1; return { unref: () => {} }; }) as unknown) as typeof setInterval,
+      clearInterval: (() => {}) as typeof clearInterval,
+    });
+    expect(on.handBackAtBoot()).toBe(0); // main's order: the hand-back runs before boot
+    await bootProviderRecovery(on, (_level, msg) => logs.push(msg));
+    expect(intervals).toBe(1);
+    expect(logs).toContain('provider-recovery sensor started');
+    expect(h.wakes.length).toBe(wakes + 1);
+    on.stop();
+    // A reconciliation that rejects is logged; boot itself never rejects.
+    const failing = new ProviderRecoverySensor({
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: false, claudeNative: false },
+      ledger: h.ledger, probe: h.probe, notifications: h.notifications, wake: h.wakePort(), slotReArm: h.reArmPort(),
+      silasHosted: () => true, now: () => h.now,
+    });
+    vi.spyOn(failing, 'reconcileAtBoot').mockRejectedValue(new Error('ledger unavailable'));
+    const failed: { msg: string; fields?: Record<string, unknown> }[] = [];
+    await expect(bootProviderRecovery(failing, (_level, msg, fields) => failed.push({ msg, ...(fields !== undefined ? { fields } : {}) })))
+      .resolves.toBeUndefined();
+    expect(failed).toContainEqual({ msg: 'provider-recovery boot reconciliation failed', fields: { error: 'Error: ledger unavailable' } });
+  });
+
+  it('a route keeps its watching notice and pending marker while a hand-back on it is still open', async () => {
+    const h = new Harness();
+    h.makeJob('job-1');
+    h.makeJob('job-2');
+    const first = await h.establishMinionWait();
+    const second = await h.establishMinionWait({ agentId: 'agent-minion-2', jobId: 'job-2', sessionFile: '/tmp/minion-2.jsonl',
+      incidentId: 'supervision.provider-wall.agent-minion-2.quota_wall' });
+    expect(second?.routeKey).toBe(first?.routeKey); // one route, two waiters
+    // The route recovered while GLM was armed: both waiters are pending delivery.
+    h.advance(Math.max(0, Date.parse(h.ledger.getProviderRoute(first!.routeKey)!.nextCheckAt) - h.now) + 1);
+    h.probe.queueCompleted();
+    await h.sensor.tick();
+    expect(h.ledger.getProviderWait(second!.id)?.status).toBe('recovered-pending');
+    expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(1);
+    h.notifications.postIncident({ kind: `provider.waiting.${first!.routeKey}`, routing: 'fyi', severity: 'info',
+      title: 'watching', detail: 'Automatic recovery watching', dedupe: 'active' });
+    const original = h.ledger.setProviderWaitStatus.bind(h.ledger);
+    vi.spyOn(h.ledger, 'setProviderWaitStatus').mockImplementation((id, status, payload) => {
+      if (id === second!.id) throw new Error('ledger write failed');
+      return original(id, status, payload);
+    });
+    expect(surfacingClaudeOnly(h).sensor.handBackDisabledWaits()).toBe(1);
+    expect(h.ledger.getProviderWait(second!.id)?.status).toBe('recovered-pending');
+    // The kept wait still needs its route: nothing on it is retired yet.
+    expect(h.ledger.findNotificationByKind(`provider.waiting.${first!.routeKey}`, 'active')).not.toBeNull();
+    expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(1);
+  });
+
+  it('a route is judged by its waits\' recorded provider, not by how its key is spelled', async () => {
+    const h = new Harness({ enabled: false, claudeNative: true });
+    h.makeJob('job-legacy');
+    // A legacy, free-form key whose waiter is the native Claude route.
+    h.ledger.recordProviderWait({ id: 'wait-legacy', routeKey: 'legacy-claude-route', provider: 'anthropic-claude-native',
+      model: 'claude-opus-5-5', endpoint: 'e', credentialFingerprint: 'fp', waiterKind: 'job-minion', jobId: 'job-legacy',
+      agentId: null, slotId: null, sessionFile: null, continuation: null, jobStatusAtEstablishment: 'working', lineageKey: null,
+      incidentId: 'provider-wall.legacy', incidentGeneration: 1, reasonClass: 'temporary-limit' });
+    h.ledger.commitProviderRecoveryBatch({ id: 'batch-legacy', routeKey: 'legacy-claude-route', incidentGenerations: [1],
+      evidence: { stopReason: 'stop' }, waiters: [{ id: 'wait-legacy', jobId: 'job-legacy' }] });
+    // claude_native covers it (its waiter's provider), so boot re-wakes it —
+    // judged by its key alone it would be GLM/Codex's, which is off.
+    expect(await h.sensor.reconcileAtBoot()).toEqual({ rewoken: 1 });
+  });
+
+  it('a route with no waits left is judged by its key: native routes by claude_native, every other by enabled', async () => {
+    const watching = (h: Harness, routeKey: string) => {
+      h.notifications.postIncident({ kind: `provider.waiting.${routeKey}`, routing: 'fyi', severity: 'info',
+        title: 'watching', detail: 'Automatic recovery watching', dedupe: 'active' });
+      h.ledger.commitProviderRecoveryBatch({ id: `batch-${routeKey}`, routeKey, incidentGenerations: [1], evidence: { stopReason: 'stop' }, waiters: [] });
+    };
+    const sensorWith = (h: Harness, config: Partial<ProviderRecoveryConfig>) => new ProviderRecoverySensor({
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, ...config }, ledger: h.ledger, probe: h.probe, notifications: h.notifications,
+      wake: h.wakePort(), slotReArm: h.reArmPort(), silasHosted: () => true, now: () => h.now,
+    });
+    const glmKey = providerRouteKey('zai-coding-cn', 'glm-5.3', 'fp-marker');
+    const claudeKey = providerRouteKey('anthropic-claude-native', 'claude-opus-5-5', 'fp-marker');
+    for (const [config, retiredGlm, retiredClaude] of [
+      [{ enabled: false, claudeNative: true }, true, false],
+      [{ enabled: true, claudeNative: false }, false, true],
+    ] as const) {
+      const h = new Harness();
+      watching(h, glmKey);
+      watching(h, claudeKey);
+      sensorWith(h, config).handBackDisabledWaits();
+      expect(h.ledger.findNotificationByKind(`provider.waiting.${glmKey}`, 'active') === null).toBe(retiredGlm);
+      expect(h.ledger.findNotificationByKind(`provider.waiting.${claudeKey}`, 'active') === null).toBe(retiredClaude);
+      // The pending delivery markers retire with exactly the same routes.
+      expect(h.ledger.listPendingProviderRecoveries().map((pending) => pending.routeKey).sort())
+        .toEqual([...(retiredGlm ? [] : [glmKey]), ...(retiredClaude ? [] : [claudeKey])].sort());
+    }
+  });
+
+  it('a failing stale-notice lookup for a served wait never stops the hand-back of others', async () => {
+    const h = new Harness({ enabled: true, claudeNative: false });
+    h.makeJob('job-1');
+    h.makeJob('job-2');
+    const served = await h.establishMinionWait(); // GLM: its switch is on
+    const offWait = h.ledger.recordProviderWait({ id: 'wait-claude-off', routeKey: providerRouteKey('anthropic-claude-native', 'claude-opus-5-5', 'fp'),
+      provider: 'anthropic-claude-native', model: 'claude-opus-5-5', endpoint: 'e', credentialFingerprint: 'fp', waiterKind: 'job-minion',
+      jobId: 'job-2', agentId: 'agent-minion-2', slotId: null, sessionFile: null, continuation: null, jobStatusAtEstablishment: 'working',
+      lineageKey: null, incidentId: 'provider-wall.claude', incidentGeneration: 1, reasonClass: 'temporary-limit' });
+    const logs: string[] = [];
+    const sensor = new ProviderRecoverySensor({
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: true, claudeNative: false, glmGenerationFallback: true },
+      ledger: h.ledger, probe: h.probe, notifications: h.notifications, wake: h.wakePort(), slotReArm: h.reArmPort(),
+      silasHosted: () => true, now: () => h.now, log: (_level, msg) => logs.push(msg),
+    });
+    const original = h.ledger.findNotificationByKind.bind(h.ledger);
+    vi.spyOn(h.ledger, 'findNotificationByKind').mockImplementation((kind, mode) => {
+      if (kind === `provider-recovery.recovery-off.${served!.id}`) throw new Error('ledger read failed');
+      return original(kind, mode);
+    });
+    expect(sensor.handBackDisabledWaits()).toBe(1);
+    expect(logs).toContain('resolving a stale recovery-off notice failed');
+    expect(h.ledger.getProviderWait(offWait.id)?.status).toBe('cancelled');
+    expect(h.ledger.getProviderWait(served!.id)?.status).toBe('waiting');
+  });
+
+  it('retiring a route never resolves the watching notice of a live route whose key it prefixes', async () => {
+    const h = new Harness({ enabled: false, claudeNative: true });
+    h.makeJob('job-live');
+    for (const routeKey of ['legacy-route', 'legacy-route2']) {
+      h.notifications.postIncident({ kind: `provider.waiting.${routeKey}`, routing: 'fyi', severity: 'info',
+        title: 'watching', detail: 'Automatic recovery watching', dedupe: 'active' });
+    }
+    // legacy-route2 still serves an open Claude wait (claude_native on);
+    // legacy-route is a GLM marker-only route (GLM off): it retires alone.
+    h.ledger.recordProviderWait({ id: 'wait-live', routeKey: 'legacy-route2', provider: 'anthropic-claude-native', model: 'claude-opus-5-5',
+      endpoint: 'e', credentialFingerprint: 'fp', waiterKind: 'job-minion', jobId: 'job-live', agentId: null, slotId: null,
+      sessionFile: null, continuation: null, jobStatusAtEstablishment: 'working', lineageKey: null,
+      incidentId: 'provider-wall.live', incidentGeneration: 1, reasonClass: 'temporary-limit' });
+    h.ledger.commitProviderRecoveryBatch({ id: 'batch-legacy', routeKey: 'legacy-route', incidentGenerations: [1],
+      evidence: { stopReason: 'stop' }, waiters: [] });
+    h.sensor.handBackDisabledWaits();
+    expect(h.ledger.findNotificationByKind('provider.waiting.legacy-route', 'active')).toBeNull();
+    expect(h.ledger.findNotificationByKind('provider.waiting.legacy-route2', 'active')).not.toBeNull();
+  });
+
+  /** A GLM marker-only route (GLM off) with two active watching rows of its
+   * exact kind (written past the center's dedupe, as a legacy or racing
+   * producer could) and two undelivered batches; plus a neighbor kind that
+   * merely extends it. */
+  function retiringRoute(h: Harness) {
+    for (const [id, kind] of [['watch-1', 'provider.waiting.legacy-route'], ['watch-2', 'provider.waiting.legacy-route'],
+      ['watch-neighbor', 'provider.waiting.legacy-route2']] as const) {
+      h.ledger.recordNotification({ id, kind, routing: 'fyi', severity: 'info', title: 'watching' });
+    }
+    for (const [id, generation] of [['batch-legacy-1', 1], ['batch-legacy-2', 2]] as const) {
+      h.ledger.commitProviderRecoveryBatch({ id, routeKey: 'legacy-route', incidentGenerations: [generation], evidence: { stopReason: 'stop' }, waiters: [] });
+    }
+    for (const id of ['watch-1', 'watch-2', 'watch-neighbor']) expect(h.ledger.getNotification(id)).toMatchObject({ resolvedAt: null });
+    expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(2);
+  }
+
+  it('retiring a route resolves every active watching row of its exact kind — never a neighbor kind', () => {
+    const h = new Harness({ enabled: false, claudeNative: true });
+    retiringRoute(h);
+    h.sensor.handBackDisabledWaits();
+    expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(0);
+    expect(h.ledger.getNotification('watch-1')?.resolvedAt).toEqual(expect.any(String));
+    expect(h.ledger.getNotification('watch-2')?.resolvedAt).toEqual(expect.any(String));
+    expect(h.ledger.getNotification('watch-neighbor')).toMatchObject({ resolvedAt: null });
+  });
+
+  it('a watching resolve that does not take ends the loop loudly and keeps the route for the next boot', () => {
+    const logs: string[] = [];
+    const h = new Harness({ enabled: false, claudeNative: true });
+    retiringRoute(h);
+    const sensor = new ProviderRecoverySensor({
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: false, claudeNative: true },
+      ledger: h.ledger, probe: h.probe, notifications: h.notifications, wake: h.wakePort(), slotReArm: h.reArmPort(),
+      silasHosted: () => true, now: () => h.now, log: (_level, msg) => logs.push(msg),
+    });
+    // A resolve that does nothing (bounded, so an unbounded loop fails fast).
+    let resolves = 0;
+    vi.spyOn(h.ledger, 'resolveNotificationById').mockImplementation((id) => {
+      resolves += 1;
+      if (resolves > 10) throw new Error('resolve loop did not stop');
+      return h.ledger.getNotification(id);
+    });
+    sensor.handBackDisabledWaits();
+    expect(resolves).toBe(1); // the seen-set ends the loop at the first repeat
+    expect(logs).toContain('retiring a handed-back route failed');
+    expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(2);
+    // The next boot — a fresh sensor over the same ledger, resolves working
+    // again — finishes the retirement.
+    vi.restoreAllMocks();
+    new ProviderRecoverySensor({
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: false, claudeNative: true },
+      ledger: h.ledger, probe: h.probe, notifications: h.notifications, wake: h.wakePort(), slotReArm: h.reArmPort(),
+      silasHosted: () => true, now: () => h.now,
+    }).handBackDisabledWaits();
+    expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(0);
+    expect(h.ledger.findNotificationByKind('provider.waiting.legacy-route', 'active')).toBeNull();
+    expect(h.ledger.getNotification('watch-neighbor')).toMatchObject({ resolvedAt: null });
+  });
+
+  it('one failing hand-back never stalls the boot hand-back for the rest', async () => {
+    const h = new Harness();
+    const { recovered, waiting } = await glmDebt(h);
+    const { sensor } = surfacingClaudeOnly(h);
+    const original = h.ledger.setProviderWaitStatus.bind(h.ledger);
+    vi.spyOn(h.ledger, 'setProviderWaitStatus').mockImplementation((id, status, payload) => {
+      if (id === waiting.id) throw new Error('ledger write failed');
+      return original(id, status, payload);
+    });
+    expect(sensor.handBackAtBoot()).toBe(1);
+    expect(h.ledger.getProviderWait(recovered.id)?.status).toBe('cancelled');
+    expect(h.ledger.getProviderWait(waiting.id)?.status).toBe('waiting'); // kept for the next boot
+  });
+
+  it('enabled = true never overrides claude_native = false: no Claude wait and no keychain read', async () => {
+    let keychainReads = 0;
+    const counted: NativeCommandPort = { findGenericPassword: (input) => { keychainReads += 1; return keychain.findGenericPassword(input); } };
+    const h = new Harness({ enabled: true, claudeNative: false }, readers(false, counted));
+    h.makeJob('job-1');
+    h.makeJob('job-2');
+    expect(h.sensor.enabledFor('anthropic-claude-native')).toBe(false);
+    expect(h.sensor.enabledFor('zai-coding-cn')).toBe(true);
+    expect(await h.establishMinionWait(claudeWall)).toBeNull();
+    expect(keychainReads).toBe(0);
+    // GLM still recovers under its own switch.
+    expect(await h.establishMinionWait({ agentId: 'agent-minion-2', jobId: 'job-2', sessionFile: '/tmp/minion-2.jsonl',
+      incidentId: 'supervision.provider-wall.agent-minion-2.quota_wall' })).not.toBeNull();
+  });
+
+  it('Claude waits left by the defaults are never read or re-woken once claude_native = false, even with enabled = true', async () => {
+    const reads: string[] = [];
+    const usage = JSON.stringify({ windows: {
+      five_hour: { utilization: 0.2, resetsAtUtc: '2026-09-28T15:40:00Z' },
+      seven_day: { utilization: 0.1, resetsAtUtc: '2026-09-29T19:00:00Z' },
+    } });
+    const fetch: MetadataFetchPort = { get: ({ url }) => { reads.push(url); return Promise.resolve({ status: 200, body: usage }); } };
+    const h = new Harness({ enabled: false, claudeNative: true, glmGenerationFallback: false }, readers(false, keychain, fetch));
+    h.probe.resolveRouteImpl = () => Promise.resolve(null);
+    h.makeJob('job-1');
+    h.makeJob('job-2');
+    const recovered = await h.establishMinionWait(claudeWall);
+    h.advance(Math.max(0, Date.parse(h.ledger.getProviderRoute(recovered!.routeKey)!.nextCheckAt) - h.now) + 1);
+    await h.sensor.tick();
+    expect(h.ledger.getProviderWait(recovered!.id)?.status).toBe('recovered-pending');
+    const waiting = await h.establishMinionWait({ ...claudeWall, agentId: 'agent-minion-2', jobId: 'job-2',
+      sessionFile: '/tmp/minion-2.jsonl', incidentId: 'supervision.provider-wall.agent-minion-2.quota_wall' });
+    expect(waiting?.status).toBe('waiting');
+    const readsBefore = reads.length;
+    const wakes = h.wakes.length;
+    // The owner opts Claude out (and arms GLM/Codex) across a restart.
+    const off = new ProviderRecoverySensor({
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: true, claudeNative: false },
+      ledger: h.ledger, probe: h.probe, notifications: h.notifications, wake: h.wakePort(), slotReArm: h.reArmPort(),
+      silasHosted: () => true, metadataReaders: readers(false, keychain, fetch), now: () => h.now + 3_600_000,
+    });
+    await off.tick();
+    expect(reads).toHaveLength(readsBefore);
+    expect(h.probe.calls).toEqual([]);
+    expect(h.wakes).toHaveLength(wakes);
+    expect(h.ledger.getProviderWait(waiting!.id)?.status).toBe('waiting');
+    expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(1);
+    expect(off.handBackAtBoot()).toBe(2);
+    expect(await off.reconcileAtBoot()).toEqual({ rewoken: 0 });
+    expect(h.wakes).toHaveLength(wakes);
+    expect(reads).toHaveLength(readsBefore);
+    expect(h.ledger.getProviderWait(recovered!.id)?.status).toBe('cancelled');
+    expect(h.ledger.getProviderWait(waiting!.id)?.status).toBe('cancelled');
+    expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${waiting!.id}`, 'unacked')?.detail)
+      .toContain('[provider_recovery] claude_native = false');
+  });
+
+  it('a Claude wait under the shipped defaults reads claude.ai usage and recovers the lane', async () => {
+    const usage = JSON.stringify({ windows: {
+      five_hour: { utilization: 0.2, resetsAtUtc: '2026-09-28T15:40:00Z' },
+      seven_day: { utilization: 0.1, resetsAtUtc: '2026-09-29T19:00:00Z' },
+    } });
+    const reads: string[] = [];
+    const h = new Harness({ enabled: false, claudeNative: true, glmGenerationFallback: false }, readers(false, keychain, {
+      get: ({ url }) => { reads.push(url); return Promise.resolve({ status: 200, body: usage }); },
+    }));
+    h.probe.resolveRouteImpl = () => Promise.resolve(null);
+    h.makeJob('job-1');
+    const wait = await h.establishMinionWait(claudeWall);
+    expect(wait?.endpoint).toBe(CLAUDE_METADATA_ENDPOINT);
+    h.advance(Math.max(0, Date.parse(h.ledger.getProviderRoute(wait!.routeKey)!.nextCheckAt) - h.now) + 1);
+    await h.sensor.tick();
+    expect(reads).toEqual([CLAUDE_METADATA_ENDPOINT]); // a usage read, never generation
+    expect(h.probe.calls).toEqual([]);
+    expect(h.ledger.getProviderWait(wait!.id)?.status).toBe('recovered-pending');
+    expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(1);
+    expect(await h.sensor.reconcileAtBoot()).toEqual({ rewoken: 1 });
+    expect(h.wakes.filter((wake) => wake.routeKey === wait!.routeKey).length).toBeGreaterThan(0);
+  });
+
+  it('route keys classify exactly and never throw: only a native-provider key is the claude_native route', () => {
+    expect(isClaudeNativeRouteKey(providerRouteKey('anthropic-claude-native', 'claude-opus-5-5', 'fp'))).toBe(true);
+    expect(isClaudeNativeRouteKey(providerRouteKey('zai-coding-plan', 'glm-5', 'fp'))).toBe(false);
+    expect(isClaudeNativeRouteKey(providerRouteKey('anthropic-claude-native-x', 'm', 'fp'))).toBe(false);
+    expect(isClaudeNativeRouteKey('no-provider-segment')).toBe(false);
+    expect(isClaudeNativeRouteKey('anthropic-claude-native')).toBe(false);
+  });
+
+  it('API-key/override and missing-keychain contexts resolve no native route — owner control preserved', async () => {
+    for (const reader of [readers(true), readers(false, { findGenericPassword: () => Promise.resolve(null) })]) {
+      const h = new Harness({}, reader);
+      h.probe.resolveRouteImpl = () => Promise.resolve(null);
+      h.makeJob('job-1');
+      expect(await h.establishMinionWait(claudeWall)).toBeNull();
+    }
   });
 });

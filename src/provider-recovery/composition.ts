@@ -10,6 +10,7 @@ import {
   type MetadataReadOutcome,
 } from './metadata.js';
 import type { MetadataReaderPort } from './sensor.js';
+import { CLAUDE_NATIVE_PROVIDER } from './classify.js';
 import type { ProbeOutcome, ProbeRoute } from './probe.js';
 
 /**
@@ -45,12 +46,14 @@ import type { ProbeOutcome, ProbeRoute } from './probe.js';
  *   which could carry token material).
  * - GLM fallback stays a config activation guard (default off).
  *
- * DORMANT (r4 finding 5): the native-claude reader below is composed but
- * cannot fire in production yet — the claude-code runtime does not emit
- * provider/model/typed provenance and `anthropic-claude-native` has no pi
- * catalog route. The overlay path is marked unshipped/dormant in the spec
- * and gate matrix; grounding it needs a runtime provenance + route-
- * resolution contract, not a relaxed fence.
+ * Native-claude grounding (closes r4 finding 5, owner 2026-10-15): the
+ * claude-code runtime now emits typed provider-response provenance (the
+ * CLI's `api_error_status` + `error` code) with provider
+ * `anthropic-claude-native` and the CLI-resolved model, and this reader
+ * resolves its own route (fixed usage endpoint + the snapshot's credential
+ * fingerprint) since the native login has no pi catalog route. Nothing was
+ * relaxed: the snapshot still proves the claude.ai OAuth context and fails
+ * closed for API-key/override contexts, and the sensor stays config-gated.
  */
 
 import { CLAUDE_METADATA_ENDPOINT, CODEX_METADATA_ENDPOINT } from './metadata.js';
@@ -221,7 +224,7 @@ export async function claudeSnapshot(input: {
   // bound to) — an observed identity, never a label.
   const accountClaim = typeof email === 'string' && email !== '' ? email : input.account;
   return {
-    provider: 'anthropic-claude-native',
+    provider: CLAUDE_NATIVE_PROVIDER,
     authorization: `Bearer ${token}`,
     accountClaim,
     credentialFingerprint: fingerprintOf(token),
@@ -316,17 +319,32 @@ export function composeMetadataReaders(input: {
         input.log,
       ).read(route),
   };
-  readers['anthropic-claude-native'] = {
+  const nativeClaudeSnapshot = (): Promise<ProviderCredentialSnapshot | CredentialIssueCategory> =>
+    claudeSnapshot({
+      command: input.claude.command,
+      context: input.claude.context(),
+      account: input.claude.account(),
+    });
+  readers[CLAUDE_NATIVE_PROVIDER] = {
+    // No pi catalog route exists for the native claude.ai login: the wait
+    // binds to the fixed usage endpoint its reads use and to the credential
+    // fingerprint of the SAME snapshot those reads verify (rotation then
+    // fails closed). API-key/override/missing-keychain contexts resolve
+    // nothing — owner control preserved.
+    resolveRoute: async (provider) => {
+      if (provider !== CLAUDE_NATIVE_PROVIDER) return null;
+      const snapshot = await nativeClaudeSnapshot();
+      if (typeof snapshot === 'string') {
+        logCredentialIssue(input.log, snapshot, provider);
+        return null;
+      }
+      return { endpoint: CLAUDE_METADATA_ENDPOINT, credentialFingerprint: snapshot.credentialFingerprint };
+    },
     read: (route) =>
       new BoundMetadataReader(
-        'anthropic-claude-native',
+        CLAUDE_NATIVE_PROVIDER,
         route.credentialFingerprint,
-        () =>
-          claudeSnapshot({
-            command: input.claude.command,
-            context: input.claude.context(),
-            account: input.claude.account(),
-          }),
+        nativeClaudeSnapshot,
         (credential) =>
           new ClaudeUsageAdapter({
             fetch: input.fetch,

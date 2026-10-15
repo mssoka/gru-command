@@ -287,10 +287,14 @@ describe('W5 — LAN-phone send path over the real socket', () => {
   });
 });
 
-describe('B1 — resolved model inputs drive the real-service vision gate', () => {
-  it('an image sent to a declared text-only model emits the decline and never-guess prompt', async () => {
+describe('B1 — the real-service vision gate on a Claude Code Gru', () => {
+  it('every Claude model takes images: a text-only pi model in the shared tiers is passed over, never a decline', async () => {
     const port = await pickFreePort();
-    const token = 'b1-text-only-model-token';
+    const token = 'b1-claude-vision-token';
+    // A pi reference whose catalog entry is text-only. Claude Code is always
+    // Anthropic (owner ruling 2026-10-15): claude-code passes the shared ref
+    // over, and every Claude model accepts images — so the attachment is
+    // delivered as an image, not declined on pi's catalog metadata.
     const model = 'amazon-bedrock/amazon.nova-micro-v1:0';
     const catalog = await ModelRuntime.create({ refreshOnCreate: false });
     expect(catalog.getModel('amazon-bedrock', 'amazon.nova-micro-v1:0')?.input).toEqual(['text']);
@@ -307,32 +311,30 @@ describe('B1 — resolved model inputs drive the real-service vision gate', () =
         method: 'POST',
         headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
         body: JSON.stringify({
-          filename: 'text-only-proof.png',
+          filename: 'claude-vision-proof.png',
           content_base64: Buffer.from('real image-path fixture').toString('base64'),
         }),
       });
       expect(upload.status).toBe(201);
       const stored = (await upload.json()) as { path: string; name: string };
 
-      client.sendWithAttachments('describe this', 'b1-real-decline', [
+      client.sendWithAttachments('describe this', 'b1-claude-image', [
         { path: stored.path, name: stored.name, kind: 'image' },
       ]);
-      const notice = await client.waitFor(
-        (frame) => frame.type === 'notice' && (frame.text ?? '').includes('Vision is unavailable'),
-        'model-derived vision decline',
-      );
-      expect(notice.text).toContain('current model');
       await client.waitFor(
-        (frame) => frame.type === 'ack' && frame.client_msg_id === 'b1-real-decline',
+        (frame) => frame.type === 'ack' && frame.client_msg_id === 'b1-claude-image',
         'attach ack',
       );
       await client.waitFor(
         (frame) => frame.type === 'turn' && frame.state === 'end',
-        'declined-image turn end',
+        'image turn end',
       );
+      // Delivered as an image path Gru reads itself — with no vision decline
+      // notice and no never-guess instruction.
       const delivered = deltaText(client.frames);
-      expect(delivered).toContain(stored.path);
-      expect(delivered).toContain('do NOT guess');
+      expect(delivered).toContain(`${stored.path} (image)`);
+      expect(delivered).not.toContain('do NOT guess');
+      expect(client.frames.some((frame) => frame.type === 'notice' && (frame.text ?? '').includes('Vision is unavailable'))).toBe(false);
       expect(client.frames.some((frame) => frame.type === 'error')).toBe(false);
     } finally {
       client.close();

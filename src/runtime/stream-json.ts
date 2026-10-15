@@ -105,6 +105,23 @@ export interface ResultInfo {
   readonly isError: boolean;
   /** The final result text, when present. */
   readonly text: string | null;
+  /** HTTP status of the API failure that ended the turn, when the CLI
+   * reported one (`api_error_status`). */
+  readonly apiErrorStatus: number | null;
+}
+
+/** The CLI's synthetic API-error message: its text plus the typed failure
+ * the CLI attached (`error` code, e.g. "rate_limit"/"billing_error", and the
+ * provider's HTTP status) — provider-response provenance, never prose. */
+export interface ApiErrorInfo {
+  readonly text: string;
+  readonly code: string | null;
+  readonly status: number | null;
+}
+
+/** A finite HTTP status, or null. */
+function httpStatus(value: unknown): number | null {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 100 && value <= 599 ? value : null;
 }
 
 /** Machine-frame reader for native Claude controls such as `/compact`.
@@ -212,6 +229,7 @@ export class ClaudeTurnTranslator {
   private readonly openBlocks = new Map<number, OpenBlock>();
   private initInfo: InitInfo | null = null;
   private resultInfo: ResultInfo | null = null;
+  private apiErrorInfo: ApiErrorInfo | null = null;
 
   /** The system/init frame's info, once seen. */
   get init(): InitInfo | null {
@@ -221,6 +239,11 @@ export class ClaudeTurnTranslator {
   /** The result frame's info, once seen. */
   get result(): ResultInfo | null {
     return this.resultInfo;
+  }
+
+  /** The CLI's synthetic API-error message, once seen. */
+  get apiError(): ApiErrorInfo | null {
+    return this.apiErrorInfo;
   }
 
   /** Consume one parsed frame; returns the interface events it implies. */
@@ -271,6 +294,7 @@ export class ClaudeTurnTranslator {
       subtype: typeof frame['subtype'] === 'string' ? frame['subtype'] : '',
       isError: frame['is_error'] === true,
       text: typeof frame['result'] === 'string' ? frame['result'] : null,
+      apiErrorStatus: httpStatus(frame['api_error_status']),
     };
     return [];
   }
@@ -280,6 +304,21 @@ export class ClaudeTurnTranslator {
     if (typeof message !== 'object' || message === null) return [];
     const content = (message as StreamFrame)['content'];
     if (!Array.isArray(content)) return [];
+    if (frame['is_api_error_message'] === true) {
+      // The CLI reports an API failure (unknown model, auth, overload) as a
+      // synthetic assistant message. It is not model output: it must never
+      // stream as the agent's words. The turn's error event carries it.
+      const text = content
+        .map((block) => (typeof block === 'object' && block !== null && typeof (block as StreamFrame)['text'] === 'string' ? (block as StreamFrame)['text'] as string : ''))
+        .join('');
+      const code = frame['error'];
+      this.apiErrorInfo = {
+        text,
+        code: typeof code === 'string' && code !== '' ? code : null,
+        status: httpStatus(frame['api_error_status']),
+      };
+      return [];
+    }
     // Dedupe granularity: per message id when partials carry ids, else the
     // turn-global per-kind flags.
     const mid = (message as StreamFrame)['id'];

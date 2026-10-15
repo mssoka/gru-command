@@ -4980,11 +4980,17 @@ export class LedgerApi {
     return row === undefined ? null : this.notificationFromRow(row);
   }
 
+  /** The most recently INSERTED notification of an exact kind — insertion
+   * order, never wall-clock ts, so a clock step back cannot reorder it. */
+  latestNotificationByKind(kind: string): NotificationRecord | null {
+    const row = this.db.prepare('SELECT * FROM notifications WHERE kind = ? ORDER BY rowid DESC LIMIT 1')
+      .get(kind) as Row | undefined;
+    return row === undefined ? null : this.notificationFromRow(row);
+  }
+
   /** Report replacements are ordered by insertion, including same-timestamp UUID ties. */
   latestReportHandbackNotification(jobId: string): NotificationRecord | null {
-    const row = this.db.prepare('SELECT * FROM notifications WHERE kind = ? ORDER BY rowid DESC LIMIT 1')
-      .get(`silas.report-handback.${jobId}`) as Row | undefined;
-    return row === undefined ? null : this.notificationFromRow(row);
+    return this.latestNotificationByKind(`silas.report-handback.${jobId}`);
   }
 
   /**

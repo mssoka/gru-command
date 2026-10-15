@@ -11,6 +11,10 @@
  *                        before completing the turn (25s safety exit 4)
  *   "crash"            — stderr + exit 2, no result frame
  *   "no-result-ok"     — exit 0 with no result frame (protocol violation)
+ *   "api-error"        — the real CLI's synthetic API-error assistant
+ *                        message (is_api_error_message) + is_error result
+ *   "usage-limit"      — the same shape for a claude.ai usage-limit wall
+ *                        (error "rate_limit", api_error_status 429)
  *   "error"            — result frame with is_error:true
  *   "garbage"          — blank/non-JSON lines + a torn final line at EOF
  *   "partial"          — assistant frame written in byte chunks, splitting
@@ -28,6 +32,8 @@
  *   CLAUDE_DOUBLE_TOOL_HOLD_MS=<ms> hold the tool_use open this long before
  *                               emitting its tool_result (long-tool tests)
  *   CLAUDE_DOUBLE_MISMATCH=1    init frame carries a foreign session id
+ *   CLAUDE_DOUBLE_MCP_SERVER_ERRORS=<json> init frame's mcp_server_errors
+ *   CLAUDE_DOUBLE_MCP_SERVERS=<json> init frame's mcp_servers
  *   CLAUDE_DOUBLE_IGNORE_TERM=1 ignore SIGTERM (SIGKILL-path tests)
  *   CLAUDE_DOUBLE_COMPACT_ERROR=1 fail the native /compact control
  *   CLAUDE_DOUBLE_COMPACT_STATUS_FAIL=1 report native failure with a successful command result
@@ -152,7 +158,10 @@ function initFrame() {
     model: flagValue('--model') ?? 'double-default-model',
     permissionMode: flagValue('--permission-mode') ?? 'default',
     tools: toolsFlag !== undefined ? toolsFlag.split(',') : [],
-    mcp_servers: [],
+    mcp_servers: process.env['CLAUDE_DOUBLE_MCP_SERVERS'] !== undefined ? JSON.parse(process.env['CLAUDE_DOUBLE_MCP_SERVERS']) : [],
+    ...(process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'] !== undefined
+      ? { mcp_server_errors: JSON.parse(process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS']) }
+      : {}),
   };
 }
 
@@ -659,6 +668,20 @@ async function run() {
   if (prompt.includes('tool:')) {
     await emitToolTurn(prompt.split('tool:')[1].split(/\s/)[0] || 'Bash');
     out(resultFrame('tool done', false));
+    return;
+  }
+  if (prompt.includes('api-error')) {
+    // Real CLI shape (2.1.x): the API failure arrives as a synthetic
+    // assistant message, then an is_error result carrying the same text.
+    const text = "There's an issue with the selected model (double-model). It may not exist or you may not have access to it.";
+    out({ ...assistantFrame([{ type: 'text', text }]), error: 'model_not_found', is_api_error_message: true, api_error_status: 404 });
+    out({ ...resultFrame(text, true), subtype: 'success', api_error_status: 404 });
+    return;
+  }
+  if (prompt.includes('usage-limit')) {
+    const text = "You've hit your limit · resets 3pm (UTC)";
+    out({ ...assistantFrame([{ type: 'text', text }]), error: 'rate_limit', is_api_error_message: true, api_error_status: 429 });
+    out({ ...resultFrame(text, true), subtype: 'success', api_error_status: 429 });
     return;
   }
   if (prompt.includes('error')) {

@@ -35,7 +35,7 @@ import { composeDeterministicPass, createSilasAutopilotHook } from './dispatch/s
 import { createSilasAutopilotOps } from './dispatch/silas-autopilot-ops.js';
 import { createProductionDeterministicPass } from './dispatch/durable-reconcile.js';
 import { DirectiveProgressService } from './dispatch/directive-progress.js';
-import { ProviderRecoverySensor, establishProviderWait } from './provider-recovery/sensor.js';
+import { ProviderRecoverySensor, bootProviderRecovery, establishProviderWait, handBackThenStartSupervision } from './provider-recovery/sensor.js';
 import { ModelRuntimeProbe } from './provider-recovery/probe.js';
 import {
   composeMetadataReaders,
@@ -711,8 +711,9 @@ async function main(): Promise<number> {
       },
       claude: {
         // Traced native protocol: one bounded `security find-generic-password`
-        // against the ACTUAL selected store/account. Never invoked while the
-        // sensor is disabled; activation runs it under a ruled checkpoint.
+        // against the ACTUAL selected store/account. Never invoked while
+        // recovery for the native Claude route is off
+        // ([provider_recovery] claude_native, on by default since 2026-10-15).
         // Output stays in-process — never logged.
         command: {
           findGenericPassword: async ({ service, account }) => {
@@ -1523,8 +1524,11 @@ async function main(): Promise<number> {
   // Issue #171: supervision hydration (restored durable stops) must land
   // BEFORE the listener serves snapshots — the ownership probe is wired
   // and answering from the first request, so a not-yet-hydrated stop
-  // would classify as historical until some later push corrected it.
-  supervisorLive.start();
+  // would classify as historical until some later push corrected it. A
+  // provider switch turned off hands its open waits to Gru FIRST, so a stop
+  // whose provider-wall row the hand-back resolves hydrates with a fresh
+  // re-arm control rather than one bound to a resolved row.
+  handBackThenStartSupervision(providerRecoverySensor, supervisorLive, (level, msg, fields) => logger.log(level, msg, fields));
   state.handle = await service.start();
   const handle = state.handle;
   chat.attach(handle.httpServer);
@@ -1675,15 +1679,9 @@ async function main(): Promise<number> {
   // Silas's model availability: its timer starts after listen (same
   // pattern as the drivers) and its boot reconciliation re-wakes any
   // recovery whose delivery was lost across a restart — never silently
-  // re-baselined away.
-  if (config.providerRecovery.enabled) {
-    providerRecoverySensor.start();
-    void providerRecoverySensor.reconcileAtBoot().catch((error: unknown) => {
-      logger.error('provider-recovery boot reconciliation failed', { error: String(error) });
-    });
-  } else {
-    logger.info('provider-recovery sensor disabled — owner activation stays manual', {});
-  }
+  // re-baselined away. Boot reconciliation runs even with the sensor off: a
+  // provider switch turned off hands its open waits to Gru.
+  void bootProviderRecovery(providerRecoverySensor, (level, msg, fields) => logger.log(level, msg, fields));
 
   logger.info('listening', { host: handle.host, port: handle.port });
   return new Promise<number>(() => {

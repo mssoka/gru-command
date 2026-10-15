@@ -3529,7 +3529,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     ]));
   }, 180_000);
 
-  it('allows a public Claude model but never persists a credential prefix, model setting or thinking sentinel', async () => {
+  it('allows any well-formed Claude model (no name list) but never persists a credential prefix, raw model setting or thinking sentinel', async () => {
     for (const [name, modelRef, thinking, settingsModel] of [
       ['prefix', 'credential-looking-provider/claude-sonnet-4-6', 'high', undefined],
       ['setting', 'anthropic/claude-sonnet-4-6', 'high', 'credential-looking-model'],
@@ -3541,14 +3541,24 @@ describe('WaveRunner built-in Perkins production path', () => {
       const first = asWave(await fixture.wave('anthropic/claude-sonnet-4-6', earlier.spawner, 'high',
         'fixture-runtime-v1', null, 'claude-code').runRound({ jobId: fixture.jobId }));
       const initialManifest = JSON.parse(readFileSync(join(fixture.artifacts, first.round.id, 'manifest.json'), 'utf8')) as {
-        recoveryIdentity: { modelRef: string } | null;
+        recoveryIdentity: { modelRef: string; modelSettingsSha256: string } | null;
       };
       expect(initialManifest.recoveryIdentity?.modelRef).toBe('anthropic/claude-sonnet-4-6');
       const changed = fixture.fake({ childAnswer: () => '[]', specialists: ['edge'], neverSubmit: true });
       const next = asWave(await fixture.wave(modelRef, changed.spawner, thinking, 'fixture-runtime-v1',
         null, 'claude-code', settingsModel).runRound({ jobId: fixture.jobId }));
       const manifestBytes = readFileSync(join(fixture.artifacts, next.round.id, 'manifest.json'), 'utf8');
-      expect((JSON.parse(manifestBytes) as { recoveryIdentity: unknown }).recoveryIdentity).toBeNull();
+      const identity = (JSON.parse(manifestBytes) as { recoveryIdentity: { modelSettingsSha256: string } | null }).recoveryIdentity;
+      if (name === 'setting') {
+        // Model names are judged by shape, never by a published-name list
+        // (owner ruling 2026-10-15): an unlisted settings model still earns
+        // an identity, persisted only as a hash, and the changed hash means
+        // the earlier round's evidence is never credited.
+        expect(identity).not.toBeNull();
+        expect(identity!.modelSettingsSha256).not.toBe(initialManifest.recoveryIdentity!.modelSettingsSha256);
+      } else {
+        expect(identity).toBeNull();
+      }
       expect(manifestBytes).not.toContain('credential-looking');
       expect(changed.leadCalls[0]?.prompt).not.toContain('RECOVERED SPECIALIST EVIDENCE');
       expect(fixture.ledger.listRoundSpecialistStarts(next.round.id).length).toBeGreaterThan(0);

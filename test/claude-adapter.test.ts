@@ -1,22 +1,29 @@
 import { PassThrough } from 'node:stream';
 import * as childProcesses from 'node:child_process';
 import { BUILD_INCIDENT, FULL_INCIDENT, WEB_INCIDENT, authenticatedCaptureStatus, verificationLane } from './helpers/worker-verification.js';
-import type { ModelRuntime } from '@earendil-works/pi-coding-agent';
-import { spawn, type ChildProcess } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
+import { closeSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createConnection } from 'node:net';
-import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { configPathFor, loadConfig } from '../src/config.js';
 import type { WorkerVerificationPolicy } from '../src/runtime/worker-verification-policy.js';
 import {
   CLAUDE_CODE_CAPABILITIES,
   ClaudeCodeRuntime,
+  checkedInProjectMcpConfig,
+  claudeInBandError,
+  gitFailure,
+  isProjectMcpCopyName,
+  loggableMcpServerName,
   mapRoleTools,
 } from '../src/runtime/claude-adapter.js';
+import { isRateLimitErrorText } from '../src/runtime/pacing.js';
+import { deterministicFailureClass } from '../src/decisions/questions.js';
+import { classifyProviderRejection, providerSupportsSensor } from '../src/provider-recovery/classify.js';
 import { RuntimeRegistry, serviceRegistryOptions } from '../src/runtime/registry.js';
 import { makeWorkflowLane } from './helpers/workflow-lane.js';
 import { makeFallbackRuntimeHarness } from './helpers/fallback-runtime.js';
@@ -35,6 +42,13 @@ import { loadPerkinsPolicy } from '../src/dispatch/perkins-review/policy.js';
 import { freezeReviewInputs } from '../src/dispatch/perkins-review/artifacts.js';
 import { makeFixtureRepo } from './helpers/fixture-repo.js';
 
+/** The project-MCP copies beside a session transcript (one per live handle). */
+function copiesOf(sessionFile: string): string[] {
+  return readdirSync(dirname(sessionFile))
+    .filter((name) => isProjectMcpCopyName(basename(sessionFile), name))
+    .map((name) => join(dirname(sessionFile), name));
+}
+
 /**
  * claude-code adapter tests (EPICS E3): a STUBBED CLI double (executable
  * node script) stands in for `claude` — real child processes, real stdio,
@@ -50,6 +64,8 @@ const DOUBLE_ENV_KEYS = [
   'CLAUDE_DOUBLE_NO_PARTIALS',
   'CLAUDE_DOUBLE_TOOL_HOLD_MS',
   'CLAUDE_DOUBLE_MISMATCH',
+  'CLAUDE_DOUBLE_MCP_SERVER_ERRORS',
+  'CLAUDE_DOUBLE_MCP_SERVERS',
   'CLAUDE_DOUBLE_IGNORE_TERM',
   'CLAUDE_DOUBLE_COMPACT_ERROR',
   'CLAUDE_DOUBLE_COMPACT_STATUS_FAIL',
@@ -94,11 +110,11 @@ interface Fixture {
   runtime: ClaudeCodeRuntime;
 }
 
-function fixture(knobs: { killGraceMs?: number; modelRuntime?: ModelRuntime; toolHeartbeatMs?: number; reviewSettingsFile?: string; spawnProcess?: typeof spawn } = {}): Fixture {
+function fixture(knobs: { killGraceMs?: number; toolHeartbeatMs?: number; reviewSettingsFile?: string; spawnProcess?: typeof spawn; configToml?: string } = {}): Fixture {
   const home = mkdtempSync(join(tmpdir(), 'gru-command-claude-'));
   const workspace = mkdtempSync(join(tmpdir(), 'gru-command-ws-'));
   cleanupDirs.push(home, workspace);
-  writeFileSync(configPathFor(home), `workspace_root = "${workspace}"\n`, 'utf-8');
+  writeFileSync(configPathFor(home), `workspace_root = "${workspace}"\n${knobs.configToml ?? ''}`, 'utf-8');
   const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
   const store = new SessionStore(config.dataDir);
   const logs: Fixture['logs'] = [];
@@ -111,7 +127,6 @@ function fixture(knobs: { killGraceMs?: number; modelRuntime?: ModelRuntime; too
     ...(knobs.spawnProcess !== undefined ? { spawnProcess: knobs.spawnProcess } : {}),
     ...(knobs.killGraceMs !== undefined ? { killGraceMs: knobs.killGraceMs } : {}),
     ...(knobs.toolHeartbeatMs !== undefined ? { toolHeartbeatMs: knobs.toolHeartbeatMs } : {}),
-    ...(knobs.modelRuntime !== undefined ? { modelRuntime: knobs.modelRuntime } : {}),
     reviewSettingsFile: knobs.reviewSettingsFile ?? join(home, 'absent-review-settings.json'),
     log: (level, msg, fields) => logs.push({ level, msg, fields }),
   });
@@ -730,21 +745,20 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     expect(fx.runtime.capabilities).toEqual(CLAUDE_CODE_CAPABILITIES);
   });
 
-  it('a model-metadata cache failure declines vision but does not block the Claude CLI spawn', async () => {
-    const brokenMetadata = {
-      getModel: () => {
-        throw new Error('torn model cache');
-      },
-    } as unknown as ModelRuntime;
-    const fx = fixture({ modelRuntime: brokenMetadata });
-    const handle = await fx.runtime.spawn('gru', { model: 'anthropic/claude-x' });
-    try {
-      expect(handle.capabilities.images).toBe(false);
-      await handle.prompt('metadata is optional');
-      expect(doubleInvocations(fx)).toHaveLength(1);
-      expect(fx.logs.some((entry) => entry.msg.includes('declines conservatively'))).toBe(true);
-    } finally {
-      await handle.dispose();
+  it('every Claude model accepts images and needs no provider — no catalog lookup gates vision', async () => {
+    const fx = fixture();
+    for (const model of [undefined, 'default', 'opus', 'claude-opus-5-5', 'anthropic/claude-opus-5-5']) {
+      const handle = await fx.runtime.spawn('gru', model === undefined ? {} : { model });
+      try {
+        expect(handle.capabilities.images, String(model)).toBe(true);
+        await handle.prompt('see this', { images: [{ mediaType: 'image/png', data: 'aGk=' }] });
+        const record = doubleInvocations(fx).at(-1)!;
+        expect(record.images).toBe(1);
+        const cli = model === undefined || model === 'default' ? undefined : model.replace(/^anthropic\//u, '');
+        expect(record.argv.includes('--model') ? record.argv[record.argv.indexOf('--model') + 1] : undefined).toBe(cli);
+      } finally {
+        await handle.dispose();
+      }
     }
   });
 
@@ -1177,13 +1191,18 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       expect(record.argv.join(' ')).toContain('--output-format stream-json');
       expect(record.argv.join(' ')).toContain('--input-format stream-json');
       expect(record.argv.join(' ')).toContain('--include-partial-messages');
+      // No ambient MCP by default. The CLI replay echo is never used: it
+      // would echo permission control_responses into the verification channel.
+      expect(record.argv).not.toContain('--replay-user-messages');
+      expect(record.argv).toContain('--strict-mcp-config');
+      expect(record.argv).not.toContain('--mcp-config');
       expect(record.argv[record.argv.indexOf('--permission-mode') + 1]).toBe('bypassPermissions');
       const sysAt = record.argv.indexOf('--append-system-prompt');
       expect(record.argv[sysAt + 1]!.length).toBeGreaterThan(20);
       expect(record.argv[record.argv.indexOf('--session-id') + 1]).toBe(record.sessionId);
     }
-    expect(review!.argv[review!.argv.indexOf('--tools') + 1]).toBe('Read,Grep,Glob,LS');
-    expect(build!.argv[build!.argv.indexOf('--tools') + 1]).toBe('Read,Bash,Edit,Write,Grep,Glob,LS');
+    expect(review!.argv[review!.argv.indexOf('--tools') + 1]).toBe('Read,Grep,Glob');
+    expect(build!.argv[build!.argv.indexOf('--tools') + 1]).toBe('Read,Bash,Edit,Write,Grep,Glob');
     // Issue #161: a child worker's bounded authority reaches the CLI's
     // own --tools allowlist, and its product-owned identity is honored.
     const child = await fx.runtime.spawn('minion', {
@@ -1194,7 +1213,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     await child.prompt('audit this');
     await child.dispose();
     const childInvocation = doubleInvocations(fx).at(-1)!;
-    expect(childInvocation.argv[childInvocation.argv.indexOf('--tools') + 1]).toBe('Read,Grep,Glob,LS');
+    expect(childInvocation.argv[childInvocation.argv.indexOf('--tools') + 1]).toBe('Read,Grep,Glob');
     // An override can only NARROW: an undeclared tool refuses loud.
     await expect(
       fx.runtime.spawn('perkins', { roleTools: ['undeclared-tool'] }),
@@ -1239,7 +1258,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       const [record] = doubleInvocations(fx);
       const tools = record!.argv[record!.argv.indexOf('--tools') + 1]!;
       const allowed = record!.argv[record!.argv.indexOf('--allowedTools') + 1]!;
-      expect(tools.split(',')).toEqual(['Read', 'Grep', 'Glob', 'LS', 'mcp__gru_perkins__gc_submit_fallback_findings']);
+      expect(tools.split(',')).toEqual(['Read', 'Grep', 'Glob', 'mcp__gru_perkins__gc_submit_fallback_findings']);
       expect(allowed).toContain('mcp__gru_perkins__gc_submit_fallback_findings');
       expect(allowed).not.toMatch(/Bash|Edit|Write/u);
       expect(record!.argv).toContain('--strict-mcp-config');
@@ -1376,7 +1395,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       // File tools stay the declared read set, mapped to claude built-ins;
       // the enabled list also names the one bridged MCP tool.
       expect((record!.argv[record!.argv.indexOf('--tools') + 1] ?? '').split(',')).toEqual([
-        'Read', 'Grep', 'Glob', 'LS', 'mcp__gru_perkins__perkins_submit_findings',
+        'Read', 'Grep', 'Glob', 'mcp__gru_perkins__perkins_submit_findings',
       ]);
       const configFile = record!.argv[record!.argv.indexOf('--mcp-config') + 1]!;
       bridgeDirectory = dirname(configFile);
@@ -1421,7 +1440,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       const [record] = doubleInvocations(fx);
       expect(record!.argv).not.toContain('--mcp-config');
       const allowed = (record!.argv[record!.argv.indexOf('--allowedTools') + 1] ?? '').split(',');
-      expect(allowed.map((entry) => entry.split('(')[0])).toEqual(['Read', 'Grep', 'Glob', 'LS']);
+      expect(allowed.map((entry) => entry.split('(')[0])).toEqual(['Read', 'Grep', 'Glob']);
       expect(allowed.some((entry) => entry.startsWith('mcp__'))).toBe(false);
     } finally {
       await handle.dispose();
@@ -1618,13 +1637,15 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     })).rejects.toThrow(/must be fresh/);
   });
 
-  it('mapRoleTools maps every known role tool and fails loud on an unknown id', () => {
+  it('mapRoleTools maps every known role tool to a tool the CLI ships and fails loud on an unknown id', () => {
+    // The CLI silently ignores unknown --tools names and no longer ships
+    // `LS`: directory listing maps to Glob, listed once.
     expect(mapRoleTools('perkins', ['read', 'grep', 'find', 'ls'])).toEqual([
       'Read',
       'Grep',
       'Glob',
-      'LS',
     ]);
+    expect(mapRoleTools('perkins', ['ls'])).toEqual(['Glob']);
     expect(mapRoleTools('minion', ['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls'])).toEqual([
       'Read',
       'Bash',
@@ -1632,11 +1653,774 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       'Write',
       'Grep',
       'Glob',
-      'LS',
     ]);
     expect(() => mapRoleTools('minion', ['nope'])).toThrow(
       /role "minion" tool "nope" has no claude-code tool mapping/,
     );
+  });
+
+  it('loads no ambient MCP servers by default; mcp = "user" opts in, but never for a narrowed tool set', async () => {
+    const run = async (configToml: string, roleTools?: readonly string[]) => {
+      const fx = fixture({ configToml });
+      const lane = mkdtempSync(join(tmpdir(), 'gru-command-lane-'));
+      cleanupDirs.push(lane);
+      const handle = await fx.runtime.spawn('minion', { cwd: lane, ...(roleTools !== undefined ? { roleTools } : {}) });
+      await handle.prompt('which servers');
+      await handle.dispose();
+      return doubleInvocations(fx).at(-1)!.argv;
+    };
+    const byDefault = await run('');
+    expect(byDefault).toContain('--strict-mcp-config');
+    expect(byDefault).not.toContain('--mcp-config');
+    const user = await run('[runtimes.claude-code]\nmcp = "user"\n');
+    expect(user).not.toContain('--strict-mcp-config');
+    expect(user).not.toContain('--mcp-config');
+    // A bounded child worker's narrowed tools are never widened by ambient MCP.
+    const narrowed = await run('[runtimes.claude-code]\nmcp = "user"\n', ['read', 'grep', 'find', 'ls']);
+    expect(narrowed).toContain('--strict-mcp-config');
+    expect(narrowed).not.toContain('--mcp-config');
+    const badHome = mkdtempSync(join(tmpdir(), 'gru-command-claude-'));
+    cleanupDirs.push(badHome);
+    writeFileSync(configPathFor(badHome), `workspace_root = "${badHome}"\n[runtimes.claude-code]\nmcp = "all"\n`, 'utf-8');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: badHome }, '/home/tester')).toThrow(
+      /runtimes\.claude-code\.mcp must be one of "none", "project", "user", got "all"/,
+    );
+  });
+
+  it('mcp = "project" hands the CLI a private copy of the .mcp.json committed at HEAD — re-checked every turn and compaction', async () => {
+    const fx = fixture({ configToml: '[runtimes.claude-code]\nmcp = "project"\n' });
+    const repo = makeFixtureRepo('mcp-project');
+    try {
+      const file = join(repo.path, '.mcp.json');
+      const committed = JSON.stringify({ mcpServers: {} });
+      const handle = await fx.runtime.spawn('minion', { cwd: repo.path });
+      let copy = '';
+      const mcpConfig = (argv: readonly string[]): string | null => {
+        expect(argv).toContain('--strict-mcp-config');
+        return argv.includes('--mcp-config') ? argv[argv.indexOf('--mcp-config') + 1]! : null;
+      };
+      const turn = async (): Promise<string | null> => {
+        await handle.prompt('which servers');
+        return mcpConfig(doubleInvocations(fx).at(-1)!.argv);
+      };
+      expect(await turn()).toBeNull(); // no file
+      writeFileSync(file, committed);
+      expect(await turn()).toBeNull(); // untracked: e.g. a session wrote it into its lane
+      repo.git(['add', '.mcp.json']);
+      expect(await turn()).toBeNull(); // staged, never committed
+      repo.commitFile('.mcp.json', committed);
+      copy = (await turn())!; // checked in: loads on the next turn, no respawn
+      expect(copiesOf(handle.sessionFile!)).toEqual([copy]); // this handle's own copy beside the transcript
+      // The CLI reads a private, owner-only copy of the verified bytes — never
+      // the lane path a later write could swap.
+      expect(readFileSync(copy, 'utf-8')).toBe(committed);
+      expect(statSync(copy).mode & 0o777).toBe(0o600);
+      // Compaction is a fresh CLI process too: it re-resolves the same way.
+      await handle.compact?.();
+      expect(doubleInvocations(fx).at(-1)!.prompt).toBe('/compact');
+      expect(mcpConfig(doubleInvocations(fx).at(-1)!.argv)).toBe(copy);
+      writeFileSync(file, JSON.stringify({ mcpServers: { injected: { command: 'sh' } } }));
+      expect(await turn()).toBeNull(); // edited after commit
+      expect(existsSync(copy)).toBe(false); // never a stale copy left to load
+      repo.git(['add', '.mcp.json']);
+      expect(await turn()).toBeNull(); // edit staged, not committed: still not HEAD's bytes
+      repo.git(['reset', '-q', '--', '.mcp.json']);
+      repo.git(['checkout', '--', '.mcp.json']);
+      expect(await turn()).toBe(copy);
+      rmSync(file);
+      symlinkSync(join(repo.path, 'package.json'), file);
+      expect(await turn()).toBeNull(); // a symlink never loads
+      rmSync(file);
+      expect(await turn()).toBeNull(); // removed mid-session: never a dangling --mcp-config
+      writeFileSync(file, committed);
+      expect(await turn()).toBe(copy);
+      await handle.dispose();
+      await vi.waitFor(() => expect(existsSync(copy)).toBe(false)); // the copy lives only as long as the session
+      expect(fx.logs.filter((entry) => entry.msg.includes('no project MCP servers loaded')).map((entry) => entry.fields?.['reason'])).toEqual([
+        'no .mcp.json in the session cwd',
+        '.mcp.json is not committed at HEAD',
+        '.mcp.json differs from its committed version',
+        '.mcp.json is not a regular file (symlink or other)',
+        'no .mcp.json in the session cwd',
+      ]);
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('an infrastructure failure of the project-MCP check is logged at warn; a content refusal at info', async () => {
+    const fx = fixture({ configToml: '[runtimes.claude-code]\nmcp = "project"\n' });
+    const plain = mkdtempSync(join(tmpdir(), 'gru-command-not-a-repo-'));
+    cleanupDirs.push(plain);
+    const handle = await fx.runtime.spawn('minion', { cwd: plain });
+    await handle.prompt('no file yet');
+    writeFileSync(join(plain, '.mcp.json'), '{}');
+    await handle.prompt('git cannot read HEAD here');
+    await handle.dispose();
+    expect(fx.logs.filter((entry) => entry.msg === 'mcp = "project": no project MCP servers loaded')
+      .map((entry) => [entry.level, String(entry.fields?.['reason']).split(':')[0]])).toEqual([
+      ['info', 'no .mcp.json in the session cwd'],
+      ['warn', 'git cannot read HEAD in the session cwd'],
+    ]);
+  });
+
+  it('only a label-shaped server name is ever logged', () => {
+    // Combining marks of every kind (NFD Latin, Devanagari vowel signs, an
+    // enclosing mark), numbers of any kind (a digit, Ⅻ, ①) leading or not, a
+    // digit-led plugin segment, the CLI's own connector collision suffix, an
+    // 80-code-point name of astral letters, a 23-character run, one the Kelvin
+    // sign continues (no case folding) and two 12-letter runs joined by '_'
+    // (a run counts only ASCII letters and digits) are labels.
+    for (const name of ['db', 'Upper_Case.v2 x', 'café', '数据', 'plugin:edgeplug:brokensrv', `${'ab-'.repeat(26)}ab`,
+      'cafe\u0301', 'a\u20dd', '\u0921\u0947\u091f\u093e', '\u216B \u2460\u00BD', '1password', 'plugin:1p:2fa',
+      '\u2460x', 'x\u216B', 'claude.ai Gmail (2)', '\u{20000}'.repeat(80), 'a'.repeat(23), `${'a'.repeat(23)}\u212A`,
+      `${'a'.repeat(12)}_${'a'.repeat(12)}`]) {
+      expect(loggableMcpServerName(name), name).toBe(true);
+    }
+    // Over 80 code points with no run (astral text within 160 UTF-16 units
+    // too); a 24-character run of ASCII letters and digits in either case,
+    // also split only by nonspacing, spacing or enclosing marks; a UUID in any
+    // case, split by a mark or inside a longer name; a name that does not
+    // start with a letter or number ('-', '_', a mark, a space, a symbol, a
+    // control or format character); a plugin name whose segments are not
+    // labels, that lacks its server segment or that does not start the name;
+    // and any character outside the label — never a denylist.
+    for (const name of ['', 'me@host', 'https://u:p@h/m', 'user:sk-secret', 'ok\nuser', 'a/b', '-lead',
+      'plugin:a:b:c', 'plugin:x', 'plugin:_a:b', 'db.plugin:a:b', `ghp_${'a'.repeat(36)}`,
+      '123e4567-e89b-12d3-a456-426614174000', `plugin:p:${'a'.repeat(24)}`, 'plugin:p:123e4567-e89b-12d3-a456-426614174000',
+      `${'ab-'.repeat(27)}`, `${'\u{20000}'.repeat(79)}ab`,
+      'a'.repeat(24), 'zZ9'.repeat(8), 'a\u0301'.repeat(24), 'a\u093e'.repeat(24), 'a\u20dd'.repeat(24),
+      '123E4567-E89B-12D3-A456-426614174000', '123e4567-E89B-12d3-A456-4266141740aF',
+      '123e\u03014567-e89b-12d3-a456-426614174000', 'db-123e4567-e89b-12d3-a456-426614174000',
+      '\u0301a', '\u093ea', '\u20dda', '\na', '\u202ea', '@a', ' a', '.a', '(a', '+15551234567',
+      '_internal', 'a+b=', 'a\u202eb', 'a\u2028b', 'a"b', 'a$b']) {
+      expect(loggableMcpServerName(name), name).toBe(false);
+    }
+  });
+
+  it('a server name over 160 UTF-16 units is refused before it is spread into code points', () => {
+    // The CLI echoes a config key of any size. The long name is label-shaped
+    // and run-free, so only the length can refuse it; a shorter name is
+    // spread (the spy is live) — how often is the implementation's business.
+    const iterate = String.prototype[Symbol.iterator];
+    let spreads = 0;
+    const seen: unknown[] = [];
+    String.prototype[Symbol.iterator] = function (this: string) {
+      spreads += 1;
+      return iterate.call(this);
+    };
+    try {
+      seen.push(loggableMcpServerName(`${'ab-'.repeat(53)}ab`), spreads, loggableMcpServerName('a'.repeat(23)), spreads > 0);
+    } finally {
+      String.prototype[Symbol.iterator] = iterate;
+    }
+    expect(seen).toEqual([false, 0, true, true]);
+  });
+
+  it('MCP servers the CLI could not load are logged by name — skipped ones with the CLI code, failed or sign-in-blocked ones with a fixed description — once per distinct set', async () => {
+    const fx = fixture();
+    const lane = mkdtempSync(join(tmpdir(), 'gru-command-lane-'));
+    cleanupDirs.push(lane);
+    const handle = await fx.runtime.spawn('minion', { cwd: lane });
+    const problemLogs = () => fx.logs.filter((entry) => entry.msg === 'claude could not load some MCP servers');
+    try {
+      process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'] = JSON.stringify([
+        { name: 'db', type: 'invalid_config', message: 'Skipped — invalid MCP server config for "db"' },
+      ]);
+      await handle.prompt('one');
+      await handle.prompt('two'); // the same set: not logged again
+      expect(problemLogs()).toHaveLength(1);
+      expect(problemLogs()[0]).toMatchObject({ level: 'warn', fields: { servers: ['db: skipped (invalid_config)'], total: 1 } });
+      delete process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'];
+      await handle.prompt('three'); // cleared...
+      process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'] = JSON.stringify([{ name: 'db', type: 'invalid_config', message: 'Skipped — invalid MCP server config for "db"' }]);
+      await handle.prompt('four'); // ...so a recurrence is logged again
+      expect(problemLogs()).toHaveLength(2);
+      // A different set is logged too — never the CLI's free text (it pastes
+      // rejected values in unescaped), only a code-shaped reason.
+      process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'] = JSON.stringify([
+        { name: 'api', type: 'invalid_config', message: 'url: invalid "https://user:sk-secret@example.invalid/mcp"' },
+        { name: 'q-type', type: 'unknown_type', message: 'Skipped — unknown MCP server type "sk"secret-in-type" for server "q-type"' },
+        { name: 'bare' },
+        { name: 'odd', type: 'Not A Code: sk-secret' },
+        { name: 'lc', type: 'invalid_config url "https://user:sk-secret@example.invalid/mcp"' },
+        { name: 'sp', type: 'invalid config' },
+        { name: 'colon', type: 'invalid:config' },
+        { name: 'upper', type: 'Invalid_config' },
+        { name: 'cap', type: 'abc_'.repeat(10) },
+        { name: 'long', type: `${'abc_'.repeat(10)}a` },
+        { name: 'tok', type: 'a'.repeat(24) },
+        { name: 'uuid', type: 'a23e4567-e89b-12d3-a456-426614174000' },
+        { name: 'https://user:sk-secret-in-name@host.invalid/mcp', type: 'invalid_config' },
+        { name: 'Upper_Case.v2 x', type: 'invalid_config' },
+        { name: `${'ab-'.repeat(27)}`, type: 'invalid_config' },
+        'a bare string from the CLI with sk-secret',
+      ]);
+      await handle.prompt('five');
+      expect(problemLogs()).toHaveLength(3);
+      expect(problemLogs()[2]?.fields?.['servers']).toEqual(['api: skipped (invalid_config)', 'q-type: skipped (unknown_type)',
+        'bare: skipped (unknown reason)', 'odd: skipped (unknown reason)', 'lc: skipped (unknown reason)',
+        'sp: skipped (unknown reason)', 'colon: skipped (unknown reason)', 'upper: skipped (unknown reason)',
+        `cap: skipped (${'abc_'.repeat(10)})`, 'long: skipped (unknown reason)', 'tok: skipped (unknown reason)',
+        'uuid: skipped (unknown reason)',
+        '(name withheld #1): skipped (invalid_config)',
+        'Upper_Case.v2 x: skipped (invalid_config)', '(name withheld #2): skipped (invalid_config)', '?: skipped (unknown reason)']);
+      expect(JSON.stringify(problemLogs())).not.toContain('sk-secret');
+      // A server the CLI kept but could not start (status "failed": a missing
+      // env var or a broken command) is logged too.
+      delete process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'];
+      process.env['CLAUDE_DOUBLE_MCP_SERVERS'] = JSON.stringify([{ name: 'ok', status: 'connected' }, { name: 'needs-env', status: 'failed' },
+        { name: 'starting', status: 'pending' }, { name: 'connector', status: 'needs-auth', source: 'claudeai' },
+        { name: 'off', status: 'disabled' }, { name: 'hosted', status: 'needs-auth', source: 'dynamic' },
+        { name: 'https://user:sk-secret@host.invalid/mcp', status: 'failed', source: 'dynamic' },
+        { name: 'plugin:edgeplug:brokensrv', status: 'failed', source: 'plugin' },
+        { name: 'me@sk-secret.invalid', status: 'needs-auth', source: 'dynamic' }]);
+      await handle.prompt('six');
+      expect(problemLogs()[3]?.fields).toMatchObject({
+        servers: ['needs-env: failed to start', 'hosted: needs authentication (a headless session cannot sign in)',
+          '(name withheld #1): failed to start', 'plugin:edgeplug:brokensrv: failed to start',
+          '(name withheld #2): needs authentication (a headless session cannot sign in)'], total: 5,
+      });
+      // A flood is capped: the first 20 entries plus the total.
+      process.env['CLAUDE_DOUBLE_MCP_SERVERS'] = JSON.stringify(Array.from({ length: 25 }, (_, i) => ({ name: `s${i}`, status: 'failed' })));
+      await handle.prompt('seven');
+      const flood = problemLogs()[4]?.fields as { servers: string[]; total: number };
+      expect(flood.total).toBe(25);
+      expect(flood.servers).toEqual(Array.from({ length: 20 }, (_, i) => `s${i}: failed to start`));
+      // One init frame with both kinds (as the real CLI emits for one file):
+      // skipped lines first, then failed ones.
+      process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'] = JSON.stringify([{ name: 'x', type: 'invalid_config', message: 'header "sk-secret-in-message"' }]);
+      process.env['CLAUDE_DOUBLE_MCP_SERVERS'] = JSON.stringify([{ name: 'ok', status: 'failed' }]);
+      await handle.prompt('eight');
+      expect(problemLogs()[5]?.fields).toMatchObject({ servers: ['x: skipped (invalid_config)', 'ok: failed to start'], total: 2 });
+      // Two different sets whose names are both withheld are still two sets:
+      // dedupe runs on the raw names (memory only), never the logged form.
+      delete process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'];
+      process.env['CLAUDE_DOUBLE_MCP_SERVERS'] = JSON.stringify([{ name: 'https://a:sk-secret@one.invalid/m', status: 'failed' }]);
+      await handle.prompt('nine');
+      process.env['CLAUDE_DOUBLE_MCP_SERVERS'] = JSON.stringify([{ name: 'https://b:sk-secret@two.invalid/m', status: 'failed' }]);
+      await handle.prompt('ten');
+      expect(problemLogs()).toHaveLength(8);
+      expect(problemLogs()[7]?.fields).toMatchObject({ servers: ['(name withheld #1): failed to start'], total: 1 });
+      // Within one entry a withheld name keeps one number...
+      const c = 'https://c:sk-secret@three.invalid/m';
+      const d = 'https://d:sk-secret@four.invalid/m';
+      process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'] = JSON.stringify([{ name: c, type: 'invalid_config' }]);
+      process.env['CLAUDE_DOUBLE_MCP_SERVERS'] = JSON.stringify([{ name: d, status: 'failed' }, { name: c, status: 'failed' }]);
+      await handle.prompt('eleven');
+      expect(problemLogs()).toHaveLength(9);
+      expect(problemLogs()[8]?.fields).toMatchObject({ servers: ['(name withheld #1): skipped (invalid_config)',
+        '(name withheld #2): failed to start', '(name withheld #1): failed to start'], total: 3 });
+      // ...the same set in another order is not logged again, and only a
+      // digest of the raw names is kept.
+      process.env['CLAUDE_DOUBLE_MCP_SERVERS'] = JSON.stringify([{ name: c, status: 'failed' }, { name: d, status: 'failed' }]);
+      await handle.prompt('twelve');
+      expect(problemLogs()).toHaveLength(9);
+      expect((handle as unknown as { mcpServerProblemsNote: string }).mcpServerProblemsNote).toMatch(/^[0-9a-f]{64}$/u);
+      // The same names with a changed reason are a different set.
+      process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'] = JSON.stringify([{ name: c, type: 'unknown_type' }]);
+      await handle.prompt('thirteen');
+      expect(problemLogs()).toHaveLength(10);
+      expect(problemLogs()[9]?.fields).toMatchObject({ servers: ['(name withheld #1): skipped (unknown_type)',
+        '(name withheld #1): failed to start', '(name withheld #2): failed to start'], total: 3 });
+      expect(JSON.stringify(problemLogs())).not.toContain('sk-secret');
+    } finally {
+      delete process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'];
+      delete process.env['CLAUDE_DOUBLE_MCP_SERVERS'];
+      await handle.dispose();
+    }
+  });
+
+  it('mcp = "project" never loads lane servers for a role without a shell', async () => {
+    const fx = fixture({ configToml: '[runtimes.claude-code]\nmcp = "project"\n' });
+    const repo = makeFixtureRepo('mcp-project-read-only');
+    try {
+      repo.commitFile('.mcp.json', JSON.stringify({ mcpServers: { lane: { command: 'sh' } } }));
+      const reader = await fx.runtime.spawn('perkins', { cwd: repo.path });
+      await reader.prompt('which servers');
+      const argv = doubleInvocations(fx).at(-1)!.argv;
+      expect(argv).toContain('--strict-mcp-config');
+      expect(argv).not.toContain('--mcp-config');
+      expect(copiesOf(reader.sessionFile!)).toEqual([]);
+      await reader.dispose();
+      expect(fx.logs.some((entry) => entry.msg === 'mcp = "project": a role without a shell loads no project MCP servers' &&
+        entry.fields?.['role'] === 'perkins')).toBe(true);
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('the project-MCP check names infrastructure failures and refuses a committed non-file', async () => {
+    const plain = mkdtempSync(join(tmpdir(), 'gru-command-not-a-repo-'));
+    cleanupDirs.push(plain);
+    writeFileSync(join(plain, '.mcp.json'), '{}');
+    const outside = await checkedInProjectMcpConfig(plain);
+    expect('reason' in outside && outside.reason).toMatch(/^git cannot read HEAD in the session cwd: .*not a git repository/u);
+    expect(outside).toMatchObject({ infrastructure: true }); // logged at warn, never as a content refusal
+    // An unreadable file or directory is an infrastructure failure, not "absent".
+    const locked = makeFixtureRepo('mcp-project-locked');
+    try {
+      locked.commitFile('.mcp.json', '{}');
+      chmodSync(join(locked.path, '.mcp.json'), 0o000);
+      expect(await checkedInProjectMcpConfig(locked.path)).toMatchObject({ reason: expect.stringMatching(/^\.mcp\.json cannot be read: .*EACCES/u), infrastructure: true });
+      chmodSync(join(locked.path, '.mcp.json'), 0o644);
+      const inner = join(locked.path, 'inner');
+      mkdirSync(inner);
+      writeFileSync(join(inner, '.mcp.json'), '{}');
+      chmodSync(inner, 0o000);
+      expect(await checkedInProjectMcpConfig(inner)).toMatchObject({ reason: expect.stringMatching(/^\.mcp\.json cannot be inspected: .*EACCES/u), infrastructure: true });
+      chmodSync(inner, 0o755);
+    } finally {
+      locked.cleanup();
+    }
+    // A committed blob git cannot read (its object is gone) is infrastructure too.
+    const broken = makeFixtureRepo('mcp-project-missing-object');
+    try {
+      broken.commitFile('.mcp.json', '{"mcpServers":{"lost":{}}}');
+      const oid = execFileSync('git', ['rev-parse', 'HEAD:.mcp.json'], { cwd: broken.path, encoding: 'utf8' }).trim();
+      rmSync(join(broken.path, '.git', 'objects', oid.slice(0, 2), oid.slice(2)), { force: true });
+      expect(await checkedInProjectMcpConfig(broken.path)).toMatchObject({
+        reason: expect.stringMatching(/^git cannot read the committed \.mcp\.json: /u), infrastructure: true,
+      });
+    } finally {
+      broken.cleanup();
+    }
+    // A failed git run is named by its first stderr line, else its signal, else its message.
+    expect(gitFailure({ stderr: Buffer.from('fatal: bad object\nmore'), signal: null, message: 'Command failed' })).toBe('fatal: bad object');
+    expect(gitFailure({ stderr: Buffer.from(''), signal: 'SIGTERM', message: 'Command failed' })).toBe('git killed by SIGTERM');
+    expect(gitFailure({ message: 'spawn git ENOENT' })).toBe('spawn git ENOENT');
+    const repo = makeFixtureRepo('mcp-project-committed-link');
+    try {
+      symlinkSync('package.json', join(repo.path, '.mcp.json'));
+      repo.git(['add', '.mcp.json']);
+      repo.git(['commit', '-q', '-m', 'link']);
+      rmSync(join(repo.path, '.mcp.json'));
+      writeFileSync(join(repo.path, '.mcp.json'), '{}');
+      expect(await checkedInProjectMcpConfig(repo.path)).toEqual({ reason: 'the committed .mcp.json is not a regular file' });
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('holds the session slot across the async project-MCP check and never spawns after disposal', async () => {
+    const fx = fixture({ configToml: '[runtimes.claude-code]\nmcp = "project"\n' });
+    const repo = makeFixtureRepo('mcp-project-slot');
+    try {
+      repo.commitFile('.mcp.json', JSON.stringify({ mcpServers: {} }));
+      const handle = await fx.runtime.spawn('minion', { cwd: repo.path });
+      await handle.prompt('establish the session');
+      expect(handle.canCompact?.()).toBe(true);
+      const first = handle.prompt('first');
+      await expect(handle.prompt('second')).rejects.toThrow(/one operation at a time/);
+      expect(handle.canCompact?.()).toBe(false);
+      await expect(handle.compact!()).rejects.toThrow(/requires an idle session/);
+      await first;
+      const before = doubleInvocations(fx).length;
+      const late = expect(handle.prompt('raced by disposal')).rejects.toThrow('agent session disposed');
+      await handle.dispose();
+      await late;
+      expect(handle.pendingTurn?.()).toBeNull(); // nothing spawned: no pending turn survives disposal
+      expect(doubleInvocations(fx)).toHaveLength(before);
+      // The check that finished after disposal leaves no copy behind.
+      await vi.waitFor(() => expect(copiesOf(handle.sessionFile!)).toEqual([]));
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('a project-mode turn is the pending turn from acceptance, and a failed copy write fails it loudly', async () => {
+    const fx = fixture({ configToml: '[runtimes.claude-code]\nmcp = "project"\n' });
+    const repo = makeFixtureRepo('mcp-project-pending');
+    try {
+      repo.commitFile('.mcp.json', JSON.stringify({ mcpServers: {} }));
+      const handle = await fx.runtime.spawn('minion', { cwd: repo.path });
+      const first = handle.prompt('accepted before the check');
+      // A supervisor capture during the async check sees the accepted turn.
+      expect(handle.pendingTurn?.()).toMatchObject({ text: 'accepted before the check' });
+      await first;
+      const copy = doubleInvocations(fx).at(-1)!.argv.at(doubleInvocations(fx).at(-1)!.argv.indexOf('--mcp-config') + 1)!;
+      rmSync(copy);
+      mkdirSync(copy); // the private copy can no longer be written
+      const events: RuntimeEvent[] = [];
+      const pendingAtError: unknown[] = [];
+      handle.subscribe((event) => {
+        events.push(event);
+        if (event.type === 'error') pendingAtError.push(handle.pendingTurn?.() ?? null);
+      });
+      await expect(handle.prompt('cannot prepare')).rejects.toThrow(/^claude turn could not be prepared: /u);
+      // An error-time capture (the supervisor's restart snapshot) still sees
+      // the accepted prompt; only afterwards is it cleared.
+      expect(pendingAtError).toEqual([expect.objectContaining({ text: 'cannot prepare' })]);
+      expect(handle.pendingTurn?.()).toBeNull();
+      // A subscriber that re-prompts from the error keeps ITS prompt pending.
+      let again: Promise<unknown> | undefined;
+      const unsubscribe = handle.subscribe((event) => {
+        if (event.type === 'error' && again === undefined) {
+          again = handle.prompt('re-prompted from the error').then(() => 'resolved', (error: unknown) => error);
+        }
+      });
+      await expect(handle.prompt('fails again')).rejects.toThrow(/could not be prepared/u);
+      unsubscribe();
+      expect(handle.pendingTurn?.()).toMatchObject({ text: 're-prompted from the error' });
+      expect(handle.health()).toMatchObject({ state: 'spawning' }); // the re-prompt owns the state
+      expect(String(await again)).toMatch(/could not be prepared/u);
+      expect(handle.pendingTurn?.()).toBeNull();
+      expect(events.some((event) => event.type === 'error' && /could not be prepared/u.test(event.error))).toBe(true);
+      expect(handle.health()).toMatchObject({ state: 'error' });
+      // Compaction fails the same way, as a failed compaction.
+      await expect(handle.compact!()).rejects.toThrow(/^claude turn could not be prepared: /u);
+      expect(events.some((event) => event.type === 'compaction_end' && !event.success)).toBe(true);
+      // Neither failure kept the session's operation slot.
+      rmSync(copy, { recursive: true });
+      expect(handle.canCompact?.()).toBe(true);
+      await handle.prompt('after the failure');
+      expect(doubleInvocations(fx).at(-1)!.prompt).toBe('after the failure');
+      await handle.dispose();
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('the project-MCP check reads the cwd repository only and names line-ending-only differences', async () => {
+    const repo = makeFixtureRepo('mcp-project-routing');
+    const other = makeFixtureRepo('mcp-project-elsewhere');
+    const saved = process.env['GIT_DIR'];
+    try {
+      const committed = '{\n  "mcpServers": {}\n}\n';
+      repo.commitFile('.mcp.json', committed);
+      // An inherited routing variable never points the check at another repo.
+      process.env['GIT_DIR'] = join(other.path, '.git');
+      expect(await checkedInProjectMcpConfig(repo.path)).toEqual({ config: Buffer.from(committed) });
+      if (saved === undefined) delete process.env['GIT_DIR'];
+      else process.env['GIT_DIR'] = saved;
+      writeFileSync(join(repo.path, '.mcp.json'), committed.replaceAll('\n', '\r\n'));
+      expect(await checkedInProjectMcpConfig(repo.path)).toEqual({
+        reason: '.mcp.json differs from its committed bytes only in line endings (autocrlf/eol conversion); only byte-identical files load',
+      });
+      writeFileSync(join(repo.path, '.mcp.json'), `${committed}${' '.repeat(4096)}`);
+      expect(await checkedInProjectMcpConfig(repo.path)).toEqual({ reason: '.mcp.json differs from its committed version' });
+
+      // The reverse conversion (CRLF committed, LF checked out) is named too.
+      const crlf = makeFixtureRepo('mcp-project-crlf');
+      try {
+        crlf.commitFile('.mcp.json', committed.replaceAll('\n', '\r\n'));
+        writeFileSync(join(crlf.path, '.mcp.json'), committed);
+        expect(await checkedInProjectMcpConfig(crlf.path)).toMatchObject({ reason: expect.stringContaining('only in line endings') });
+        // Bytes, not decoded text: invalid UTF-8 never passes for a line-ending
+        // difference (both sides would decode to U+FFFD).
+        const raw = (byte: number, eol: number[]) => Buffer.concat([Buffer.from('{"mcpServers":{},"note":"'), Buffer.from([byte]), Buffer.from('"}'), Buffer.from(eol)]);
+        writeFileSync(join(crlf.path, '.mcp.json'), raw(0xff, [0x0a]));
+        crlf.git(['add', '.mcp.json']);
+        crlf.git(['commit', '-q', '-m', 'raw bytes']);
+        expect(await checkedInProjectMcpConfig(crlf.path)).toMatchObject({ config: expect.anything() });
+        writeFileSync(join(crlf.path, '.mcp.json'), raw(0xfe, [0x0d, 0x0a]));
+        expect(await checkedInProjectMcpConfig(crlf.path)).toEqual({ reason: '.mcp.json differs from its committed version' });
+        // Only a CR right before an LF is a line ending: a lone CR is an edit.
+        crlf.commitFile('.mcp.json', '{}\n');
+        writeFileSync(join(crlf.path, '.mcp.json'), '\r{}\n');
+        expect(await checkedInProjectMcpConfig(crlf.path)).toEqual({ reason: '.mcp.json differs from its committed version' });
+        // A committed file that is not a JSON object is refused at the boundary.
+        // A syntax error is named by position only — never the source text,
+        // which may carry a token.
+        crlf.commitFile('.mcp.json', '{"mcpServers":{"x":{"env":{"TOKEN":"sk-secret-value"}}} oops');
+        const syntax = await checkedInProjectMcpConfig(crlf.path);
+        expect(syntax).toEqual({ reason: 'the committed .mcp.json is not valid JSON (at line 1, column 57)' });
+        expect(JSON.stringify(syntax)).not.toContain('sk-secret');
+        // A pretty-printed file is located by its line, too.
+        crlf.commitFile('.mcp.json', '{"mcpServers":{}}\n\n  oops');
+        expect(await checkedInProjectMcpConfig(crlf.path)).toEqual({ reason: 'the committed .mcp.json is not valid JSON (at line 3, column 3)' });
+        // A BOM is invisible in an editor, so the column is the same with or
+        // without it; a parser message with no location suffix (V8 quotes the
+        // source instead) yields no location at all.
+        crlf.commitFile('.mcp.json', '\uFEFF{"mcpServers":{}} oops');
+        expect(await checkedInProjectMcpConfig(crlf.path)).toEqual({ reason: 'the committed .mcp.json is not valid JSON (at line 1, column 19)' });
+        crlf.commitFile('.mcp.json', 'sk-secret-token');
+        expect(await checkedInProjectMcpConfig(crlf.path)).toEqual({ reason: 'the committed .mcp.json is not valid JSON' });
+        // Digits inside V8's quoted snippet are never taken for a position.
+        crlf.commitFile('.mcp.json', 'position 48213377');
+        expect(await checkedInProjectMcpConfig(crlf.path)).toEqual({ reason: 'the committed .mcp.json is not valid JSON' });
+        crlf.commitFile('.mcp.json', 'x at position 99'); // V8 quotes it: still never a location
+        expect(await checkedInProjectMcpConfig(crlf.path)).toEqual({ reason: 'the committed .mcp.json is not valid JSON' });
+        // A server entry the CLI only skips is not fatal (CLI 2.1.300 skips
+        // it and reports it in the init frame — logging that is pinned by
+        // the skipped-servers test): the file loads.
+        crlf.commitFile('.mcp.json', '{"mcpServers":{"x":5}}');
+        expect(await checkedInProjectMcpConfig(crlf.path)).toMatchObject({ config: expect.anything() });
+        for (const content of ['["a list"]', 'null', '42', '"a string"', 'true']) {
+          crlf.commitFile('.mcp.json', content);
+          expect(await checkedInProjectMcpConfig(crlf.path), content).toEqual({ reason: 'the committed .mcp.json is not a JSON object' });
+        }
+        for (const content of ['{"mcpServers":5}', '{"mcpServers":[]}', '{"mcpServers":null}', '{}', '{"servers":{}}']) {
+          crlf.commitFile('.mcp.json', content);
+          expect(await checkedInProjectMcpConfig(crlf.path), content).toEqual({ reason: 'the committed .mcp.json has no "mcpServers" object' });
+        }
+        // A leading BOM (Windows editors) is valid, exactly as the CLI reads it.
+        crlf.commitFile('.mcp.json', '\uFEFF{"mcpServers":{}}');
+        expect(await checkedInProjectMcpConfig(crlf.path)).toMatchObject({ config: expect.anything() });
+      } finally {
+        crlf.cleanup();
+      }
+    } finally {
+      if (saved === undefined) delete process.env['GIT_DIR'];
+      else process.env['GIT_DIR'] = saved;
+      repo.cleanup();
+      other.cleanup();
+    }
+  });
+
+  it('a .mcp.json swapped or grown while git runs is never blocked on or read past its bound', async () => {
+    const repo = makeFixtureRepo('mcp-project-race');
+    const bin = mkdtempSync(join(tmpdir(), 'gru-command-git-race-'));
+    cleanupDirs.push(bin);
+    const realGit = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+    const savedPath = process.env['PATH'];
+    // Restored even if a check hangs past the test timeout.
+    onTestFinished(() => {
+      if (savedPath === undefined) delete process.env['PATH'];
+      else process.env['PATH'] = savedPath;
+    });
+    const target = join(repo.path, '.mcp.json');
+    const sq = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`; // POSIX single-quote
+    const t = sq(target);
+    // A lane writer racing the check: while git reads the committed blob in
+    // THIS fixture repo (and nowhere else), the working file is replaced.
+    const race = (action: string) => writeFileSync(join(bin, 'git'),
+      `#!/bin/sh\nif [ "$1" = "cat-file" ] && [ "$(pwd -P)" = ${sq(realpathSync(repo.path))} ]; then ${action}; fi\nexec ${sq(realGit)} "$@"\n`, { mode: 0o755 });
+    // A blocking open must fail this test fast, never hang the suite: on
+    // timeout a writer opens the FIFO, releasing any reader blocked on it.
+    const check = async (): Promise<unknown> => {
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        return await Promise.race([
+          checkedInProjectMcpConfig(repo.path),
+          new Promise((_resolve, reject) => {
+            timer = setTimeout(() => {
+              try {
+                if (lstatSync(target).isFIFO()) closeSync(openSync(target, fsConstants.O_WRONLY | fsConstants.O_NONBLOCK));
+              } catch { /* nothing left to release */ }
+              reject(new Error('the check blocked'));
+            }, 5_000);
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+    try {
+      const committed = JSON.stringify({ mcpServers: {} });
+      repo.commitFile('.mcp.json', committed);
+      process.env['PATH'] = `${bin}:${savedPath ?? ''}`;
+      for (const swap of [`rm -f ${t} && mkfifo ${t}`, `rm -f ${t} && ln -s package.json ${t}`, `rm -f ${t} && mkdir ${t}`]) {
+        race(swap);
+        expect(await check(), swap).toEqual({ reason: '.mcp.json is not a regular file (symlink or other)' });
+        rmSync(target, { recursive: true, force: true });
+        writeFileSync(target, committed);
+      }
+      // Grown to a sparse 3 GiB after the first look: refused after a few
+      // bytes — an unbounded read could not even load it.
+      race(`dd if=/dev/null of=${t} bs=1 count=0 seek=3221225472 2>/dev/null`);
+      expect(await check()).toEqual({ reason: '.mcp.json differs from its committed version' });
+    } finally {
+      if (savedPath === undefined) delete process.env['PATH'];
+      else process.env['PATH'] = savedPath;
+      repo.cleanup();
+    }
+  });
+
+  it('each handle owns its project-MCP copy: a resumed session never shares the predecessor copy', async () => {
+    const fx = fixture({ configToml: '[runtimes.claude-code]\nmcp = "project"\n' });
+    const repo = makeFixtureRepo('mcp-project-resume');
+    const handles: AgentHandle[] = [];
+    const track = async (spawned: Promise<AgentHandle>) => { const handle = await spawned; handles.push(handle); return handle; };
+    let disposalFailures: unknown[] = [];
+    try {
+      repo.commitFile('.mcp.json', JSON.stringify({ mcpServers: {} }));
+      const copyOf = () => { const argv = doubleInvocations(fx).at(-1)!.argv; return argv[argv.indexOf('--mcp-config') + 1]!; };
+      const first = await track(fx.runtime.spawn('minion', { cwd: repo.path }));
+      await first.prompt('one');
+      const firstCopy = copyOf();
+      const file = first.sessionFile!;
+      // The copy a handle really writes is the one format the sweep knows.
+      expect(isProjectMcpCopyName(basename(file), basename(firstCopy))).toBe(true);
+      await first.dispose();
+      const resumed = await track(fx.runtime.spawn('minion', { cwd: repo.path, resumeFile: file }));
+      await resumed.prompt('two');
+      const resumedCopy = copyOf();
+      expect(resumedCopy).not.toBe(firstCopy);
+      await vi.waitFor(() => expect(copiesOf(file)).toEqual([resumedCopy]));
+      await resumed.dispose();
+      // A predecessor that crashed (never disposed) left its copy behind: the
+      // next handle's first project turn sweeps it — and nothing else.
+      writeFileSync(`${file}.deadbeef.project-mcp.json`, '{}');
+      // A session whose file name extends this one: its copy is not ours.
+      const extended = `${file}.x.jsonl.deadbeef.project-mcp.json`;
+      writeFileSync(extended, '{}');
+      const notACopy = `${file}.zz.project-mcp.json`; // not a token this code mints
+      writeFileSync(notACopy, '{}');
+      const other = await track(fx.runtime.spawn('minion', { cwd: repo.path }));
+      await other.prompt('another session');
+      const otherCopy = copyOf();
+      const next = await track(fx.runtime.spawn('minion', { cwd: repo.path, resumeFile: file }));
+      await next.prompt('three');
+      await vi.waitFor(() => expect(copiesOf(file)).toEqual([copyOf()]));
+      expect(existsSync(`${file}.lock`)).toBe(true); // the session's own lock is never swept
+      expect(existsSync(otherCopy)).toBe(true); // nor another session's copy
+      expect(existsSync(extended)).toBe(true); // nor one whose name merely extends this session's
+      expect(existsSync(notACopy)).toBe(true); // nor anything that is not exactly a copy name
+      rmSync(extended);
+      rmSync(notACopy);
+      await next.dispose();
+      // A copy the sweep cannot remove is logged, never fatal.
+      mkdirSync(`${file}.abcdef12.project-mcp.json`);
+      const after = await track(fx.runtime.spawn('minion', { cwd: repo.path, resumeFile: file }));
+      await after.prompt('four');
+      expect(doubleInvocations(fx).at(-1)!.prompt).toBe('four');
+      expect(fx.logs.some((entry) => entry.level === 'warn' && entry.msg === 'stale project MCP copy could not be removed')).toBe(true);
+      rmSync(`${file}.abcdef12.project-mcp.json`, { recursive: true });
+    } finally {
+      const disposed = await Promise.allSettled(handles.map((handle) => handle.dispose()));
+      disposalFailures = disposed.filter((result): result is PromiseRejectedResult => result.status === 'rejected').map((failure) => failure.reason);
+      repo.cleanup();
+    }
+    // After the finally: a test failure surfaces as itself; a disposal
+    // failure fails an otherwise passing test.
+    if (disposalFailures.length > 0) throw new AggregateError(disposalFailures, 'handle disposal failed');
+  });
+
+  it('isolated review sessions stay strict with only their scoped bridge even when mcp = "user"', async () => {
+    const fx = fixture({ configToml: '[runtimes.claude-code]\nmcp = "user"\n' });
+    const review = await fx.runtime.spawn('perkins', { isolatedReview: { systemPrompt: 'isolated', tools: ['read'] } });
+    try {
+      await review.prompt('frozen diff only');
+      const record = doubleInvocations(fx).at(-1)!;
+      expect(record.argv).toContain('--strict-mcp-config');
+      expect(record.argv).not.toContain('--mcp-config');
+    } finally {
+      await review.dispose();
+    }
+  });
+
+  it('records each prompt in the product transcript right after its verified init frame', async () => {
+    const fx = fixture();
+    const handle = await fx.runtime.spawn('minion');
+    await handle.prompt('first ask');
+    await handle.prompt('second ask');
+    const file = handle.sessionFile!;
+    await handle.dispose();
+    const frames = readFileSync(file, 'utf-8').trim().split('\n').map((line) => JSON.parse(line) as StreamFrame);
+    const prompts = frames.filter((frame) => frame['type'] === 'user' && frame['gc_prompt'] === true);
+    expect(prompts.map((frame) => (frame['message'] as { content: unknown }).content)).toEqual(['first ask', 'second ask']);
+    expect(prompts.every((frame) => frame['session_id'] === handle.id && typeof frame['timestamp'] === 'string')).toBe(true);
+    for (const prompt of prompts) {
+      expect(frames[frames.indexOf(prompt) - 1]).toMatchObject({ type: 'system', subtype: 'init' });
+    }
+    // Identity stays first: the prompt follows init, so resume still reads
+    // the session id from the transcript head.
+    expect(extractSessionId(readFileSync(file, 'utf-8'))).toBe(handle.id);
+  });
+
+  it('a synthetic API-error message is the turn error, never streamed as the agent\'s words', async () => {
+    const fx = fixture();
+    const handle = await fx.runtime.spawn('gru');
+    const events = collect(handle);
+    await handle.prompt('api-error please');
+    await handle.dispose();
+    expect(deltas(events, 'text_delta')).toEqual([]);
+    const errors = events.filter((e) => e.type === 'error').map((e) => (e as { error: string }).error);
+    expect(errors).toEqual([expect.stringMatching(/issue with the selected model.*\(HTTP 404, model_not_found\)$/)]);
+    expect(states(events)).toContain('error');
+  });
+
+  it('a role flipped to claude-code in a pi-first config never sends a pi model to the CLI (production registry path)', async () => {
+    const fx = fixture();
+    writeFileSync(configPathFor(fx.home), `workspace_root = "${fx.workspace}"\n[runtimes.roles]\ngru = "claude-code"\n` +
+      '[models]\ndefault = "openai-codex/gpt-6.1-sol"\n[models.roles]\ngru = "openai-codex/gpt-6-astra"\n[thinking]\ndefault = "minimal"\n');
+    const logs: { msg: string; fields?: Record<string, unknown> }[] = [];
+    const registry = new RuntimeRegistry({
+      config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'),
+      store: fx.store,
+      claude: { binary: DOUBLE, reviewSettingsFile: join(fx.home, 'absent-review-settings.json') },
+      log: (_level, msg, fields) => logs.push({ msg, ...(fields !== undefined ? { fields } : {}) }),
+    });
+    try {
+      const handle = await registry.spawn('gru');
+      await handle.prompt('which model');
+      await handle.dispose();
+      const argv = doubleInvocations(fx).at(-1)!.argv;
+      expect(argv).not.toContain('--model'); // Claude Code's own model, not "gpt-6-astra"
+      expect(argv).not.toContain('--effort'); // pi's "minimal" never reaches the CLI either
+      const note = logs.find((entry) => entry.msg.includes('passed over pi references'));
+      expect(note?.fields).toMatchObject({
+        role: 'gru',
+        passed_over: [
+          'models.roles.gru = openai-codex/gpt-6-astra',
+          'models.default = openai-codex/gpt-6.1-sol',
+          'thinking.default = minimal',
+        ],
+        model: 'default',
+        thinking_level: 'default',
+      });
+    } finally {
+      await registry.dispose();
+    }
+  });
+
+  it('a Claude usage-limit wall is a typed quota wall the supervisor and recovery sensor can act on', async () => {
+    const fx = fixture();
+    const handle = await fx.runtime.spawn('minion', { model: 'claude-opus-5-5' });
+    const events = collect(handle);
+    await handle.prompt('usage-limit please');
+    await handle.dispose();
+    expect(deltas(events, 'text_delta')).toEqual([]);
+    const error = events.find((e) => e.type === 'error') as Extract<RuntimeEvent, { type: 'error' }>;
+    expect(error).toEqual({
+      type: 'error',
+      error: "You've hit your limit · resets 3pm (UTC) (HTTP 429, rate_limit)",
+      fatal: false,
+      provider: 'anthropic-claude-native',
+      model: 'claude-opus-5-5', // the CLI-resolved model from init
+      typed: { origin: 'provider-message', status: 429, bodyCode: 'rate_limit' },
+    });
+    // The same deterministic machinery a pi lane's 429 reaches: bounded
+    // rate-limit retry first, then a quota-wall stop (never an unclassified
+    // error that strands the lane), then a temporary-recoverable wait.
+    expect(isRateLimitErrorText(error.error)).toBe(true);
+    expect(deterministicFailureClass(error.error)).toBe('quota_wall');
+    expect(classifyProviderRejection({ provider: error.provider!, model: error.model!, errorMessage: error.error,
+      status: error.typed!.status!, bodyCode: error.typed!.bodyCode! })).toEqual({ kind: 'temporary-recoverable', retryAfterMs: null });
+    expect(providerSupportsSensor(error.provider!)).toBe(true);
+  });
+
+  it('typed provenance and identity are only attached when the CLI reported a provider failure', () => {
+    const result = { subtype: 'error_during_execution', isError: true, text: 'tool loop exploded', apiErrorStatus: null };
+    expect(claudeInBandError(result, null, 'claude-opus-5-5')).toEqual({ type: 'error', error: 'tool loop exploded', fatal: false });
+    const billing = claudeInBandError({ ...result, text: null, apiErrorStatus: 402 },
+      { text: 'Credit balance is too low', code: 'billing_error', status: 402 }, 'claude-opus-5-5');
+    expect(billing).toMatchObject({ error: 'Credit balance is too low (HTTP 402, billing_error)', typed: { status: 402, bodyCode: 'billing_error' } });
+    expect(deterministicFailureClass(billing.error)).toBe('quota_wall');
+    expect(classifyProviderRejection({ provider: billing.provider!, model: billing.model!, errorMessage: billing.error,
+      status: 402, bodyCode: 'billing_error' })).toEqual({ kind: 'owner-controlled', reason: 'billing' });
+    const auth = claudeInBandError({ ...result, text: 'Invalid API key', apiErrorStatus: 401 }, null, null);
+    expect(auth).toEqual({ type: 'error', error: 'Invalid API key (HTTP 401)', fatal: false, typed: { origin: 'provider-message', status: 401 } });
+    expect(deterministicFailureClass(auth.error)).toBe('authentication_wall');
+    // A failure code without an HTTP status still names the provider failure.
+    const overloaded = claudeInBandError({ ...result, text: null }, { text: 'Overloaded', code: 'overloaded', status: null }, 'claude-opus-5-5');
+    expect(overloaded).toEqual({ type: 'error', error: 'Overloaded (overloaded)', fatal: false,
+      provider: 'anthropic-claude-native', model: 'claude-opus-5-5', typed: { origin: 'provider-message', bodyCode: 'overloaded' } });
+  });
+
+  it('a default-model Claude lane (no --model) names the model the CLI reported in init', async () => {
+    const fx = fixture();
+    const handle = await fx.runtime.spawn('minion');
+    const events = collect(handle);
+    await handle.prompt('usage-limit please');
+    await handle.dispose();
+    expect(doubleInvocations(fx).at(-1)!.argv).not.toContain('--model');
+    expect(events.find((e) => e.type === 'error')).toMatchObject({
+      provider: 'anthropic-claude-native',
+      model: 'double-default-model', // from the init frame; nothing was configured
+      typed: { origin: 'provider-message', status: 429, bodyCode: 'rate_limit' },
+    });
   });
 
   it('resumes a previous session file: --resume pinned, same file appended, history intact', async () => {
@@ -2213,7 +2997,7 @@ describe('ClaudeTurnTranslator (pure)', () => {
     expect(
       t.ingest({ type: 'result', subtype: 'success', is_error: false, result: 'done' }),
     ).toEqual([]);
-    expect(t.result).toEqual({ subtype: 'success', isError: false, text: 'done' });
+    expect(t.result).toEqual({ subtype: 'success', isError: false, text: 'done', apiErrorStatus: null });
     // A second result frame is ignored (exactly one per turn).
     t.ingest({ type: 'result', subtype: 'error', is_error: true });
     expect(t.result?.subtype).toBe('success');
