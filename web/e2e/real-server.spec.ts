@@ -73,16 +73,19 @@ function newestInvocationContaining(text: string): AgentInvocation | null {
  * exactly the record the poll observed. Every probe text in this file is
  * unique to its test. */
 async function agentPromptContaining(text: string): Promise<AgentInvocation> {
-  let found: AgentInvocation | null = null;
+  // Assigned inside the poll callback, so typed explicitly (no narrowing).
+  let found = null as AgentInvocation | null;
   // An unreadable or corrupt log ends the poll at once and is rethrown —
-  // never retried for the whole timeout.
-  let fatal: unknown = null;
+  // expect.poll would otherwise retry a throwing callback for the whole
+  // timeout and report only its generic message.
+  let fatal = null as Error | null;
   await expect
     .poll(() => {
       try {
         found = newestInvocationContaining(text);
       } catch (error) {
-        fatal = new Error(`claude double log ${DOUBLE_LOG} is unreadable or corrupt`, { cause: error });
+        const what = error instanceof SyntaxError ? 'has a corrupt record' : 'is unreadable';
+        fatal = new Error(`claude double log ${DOUBLE_LOG} ${what}: ${String(error)}`, { cause: error });
         return true;
       }
       return found !== null;
@@ -92,7 +95,8 @@ async function agentPromptContaining(text: string): Promise<AgentInvocation> {
     })
     .toBe(true);
   if (fatal !== null) throw fatal;
-  return found!;
+  if (found === null) throw new Error(`no double log record carries ${JSON.stringify(text)}`);
+  return found;
 }
 
 let service: RealServiceHandle | null = null;

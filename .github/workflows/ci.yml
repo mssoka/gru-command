@@ -78,7 +78,8 @@ jobs:
         run: npx playwright test --ignore-snapshots
 
       # A Linux-only e2e failure is debuggable from its traces/screenshots
-      # and the strip specs' evidence captures.
+      # and the strip specs' evidence captures. always() lifts the implicit
+      # success() gate so a failed OR cancelled browser e2e step uploads.
       - name: Upload browser e2e results on failure
         if: always() && (steps.browser-e2e.outcome == 'failure' || steps.browser-e2e.outcome == 'cancelled')
         uses: actions/upload-artifact@v4
