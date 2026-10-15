@@ -10571,6 +10571,13 @@ describe('formal GitHub publication durability and restart reconciliation', () =
             headSha: fix.target, baseSha: 'b'.repeat(40), bodySha256: attemptPayload.publicationSha256,
           },
           reconciled: false,
+          // Approval promotion requires the authenticated coverage state
+          // (carried by the posted review block, as the live writer persists it).
+          review: {
+            reviewScope: 'whole', coverageComplete: true, finalPassRequired: false, diffBaseSha: 'b'.repeat(40),
+            blockers: 0, retainedFindings: 0,
+            retainedFindingsSha256: createHash('sha256').update('[]').digest('hex'),
+          },
         },
       });
       const post = vi.fn();
