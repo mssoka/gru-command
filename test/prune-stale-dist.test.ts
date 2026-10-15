@@ -53,9 +53,9 @@ describe('prune-stale-dist', () => {
   it('catalogs exactly the live handoff executable and includes its bytes in identity while refusing unknown paths (contained B)', () => {
     expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.has('dist/worktrees/handoff.js')).toBe(true);
     // GH270's handoff path plus main's supervision and scheduled-verification helpers.
-    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5179);
+    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5180);
     expect(createHash('sha256').update(`${[...PUBLIC_REVIEW_EXECUTABLE_PATHS].sort().join('\n')}\n`).digest('hex'))
-      .toBe('a7f5197d0b98ab4c5fb83523cfed082551126828205e3eaf01d87fc928eabbaa');
+      .toBe('92e8cd400bdcdf6a37732e510cfdf64b463c1a16788276bbc0afc6c99e393e99');
     const root = fixtureRoot();
     touch(root, 'src/worktrees/handoff.ts'); touch(root, 'dist/worktrees/handoff.js');
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', dependencies: {} }));
