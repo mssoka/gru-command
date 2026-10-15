@@ -1595,6 +1595,25 @@ describe('native Claude quota walls (claude-code lanes)', () => {
     expect(h.ledger.findNotificationByKind('provider.waiting.legacy-route2', 'active')).not.toBeNull();
   });
 
+  it('retiring a route resolves every active watching row of its exact kind', async () => {
+    const h = new Harness({ enabled: false, claudeNative: true });
+    // Two active rows of one kind (written past the center's dedupe, as a
+    // legacy or racing producer could), on a GLM marker-only route (GLM off).
+    for (const id of ['watch-1', 'watch-2']) {
+      h.ledger.recordNotification({ id, kind: 'provider.waiting.legacy-route', routing: 'fyi', severity: 'info', title: 'watching' });
+    }
+    // ...and two undelivered batches on it: every marker retires too.
+    for (const [id, generation] of [['batch-legacy-1', 1], ['batch-legacy-2', 2]] as const) {
+      h.ledger.commitProviderRecoveryBatch({ id, routeKey: 'legacy-route', incidentGenerations: [generation], evidence: { stopReason: 'stop' }, waiters: [] });
+    }
+    expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(2);
+    h.sensor.handBackDisabledWaits();
+    expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(0);
+    expect(h.ledger.findNotificationByKind('provider.waiting.legacy-route', 'active')).toBeNull();
+    expect(h.ledger.getNotification('watch-1')?.resolvedAt).not.toBeNull();
+    expect(h.ledger.getNotification('watch-2')?.resolvedAt).not.toBeNull();
+  });
+
   it('one failing hand-back never stalls boot reconciliation for the rest', async () => {
     const h = new Harness();
     const { recovered, waiting } = await glmDebt(h);

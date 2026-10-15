@@ -817,15 +817,22 @@ export async function checkedInProjectMcpConfig(
     return { reason: `.mcp.json cannot be read: ${String(error)}`, infrastructure: true };
   }
   if (!working.equals(committed)) return differsFromCommitted(working, committed);
-  // Refused at the boundary, never handed to the CLI to fail the turn.
+  // A server list the CLI could not load is refused here, with its reason —
+  // never handed to the CLI to fail the turn.
   let parsed: unknown;
   try {
-    parsed = JSON.parse(committed.toString('utf8'));
-  } catch {
-    parsed = undefined;
+    // One leading BOM is stripped, exactly as the CLI reads the file.
+    parsed = JSON.parse(committed.toString('utf8').replace(/^\uFEFF/u, ''));
+  } catch (error) {
+    return { reason: `the committed .mcp.json is not valid JSON: ${error instanceof Error ? error.message : String(error)}` };
   }
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
     return { reason: 'the committed .mcp.json is not a JSON object' };
+  }
+  // The CLI requires an `mcpServers` record and fails every turn without one.
+  const servers = (parsed as Record<string, unknown>)['mcpServers'];
+  if (servers === null || typeof servers !== 'object' || Array.isArray(servers)) {
+    return { reason: 'the committed .mcp.json has no "mcpServers" object' };
   }
   return { config: committed };
 }
@@ -1585,8 +1592,9 @@ export class ClaudeCodeHandle implements AgentHandle {
       // (the supervisor's restart snapshot) still sees the accepted prompt.
       if (failure !== null) {
         this.emit({ type: 'error', error: failure, fatal: false });
-        // A subscriber that re-prompted from the error owns the state now.
-        if (this.livePrompt === accepted) this.setState('error', failure);
+        // A subscriber that re-prompted from the error owns the state now;
+        // otherwise (still this prompt, or none) the handle is in error.
+        if (this.livePrompt === accepted || this.livePrompt === null) this.setState('error', failure);
       }
       // Only this turn's prompt: a subscriber may already have re-prompted.
       if (this.livePrompt === accepted) this.livePrompt = null;

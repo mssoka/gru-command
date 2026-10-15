@@ -899,7 +899,11 @@ export class ProviderRecoverySensor {
         // EXACT kind, every active row of it (never a prefix match: a legacy
         // key may prefix another live route's key). The center's prefix
         // resolve is a plain ledger call, so resolving by id loses nothing.
-        for (let row = watching; row !== null; row = this.ledger.findNotificationByKind(`provider.waiting.${routeKey}`, 'active')) {
+        // A resolved row leaves the active set; the seen-set bounds the loop
+        // even if a resolve ever failed to take.
+        const resolved = new Set<string>();
+        for (let row = watching; row !== null && !resolved.has(row.id); row = this.ledger.findNotificationByKind(`provider.waiting.${routeKey}`, 'active')) {
+          resolved.add(row.id);
           this.ledger.resolveNotificationById(row.id, 'provider-recovery-sensor');
         }
         for (const id of pendingIds) this.ledger.clearPendingProviderRecovery(id);
