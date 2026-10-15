@@ -32,6 +32,7 @@
  *   CLAUDE_DOUBLE_TOOL_HOLD_MS=<ms> hold the tool_use open this long before
  *                               emitting its tool_result (long-tool tests)
  *   CLAUDE_DOUBLE_MISMATCH=1    init frame carries a foreign session id
+ *   CLAUDE_DOUBLE_MCP_SERVER_ERRORS=<json> init frame's mcp_server_errors
  *   CLAUDE_DOUBLE_IGNORE_TERM=1 ignore SIGTERM (SIGKILL-path tests)
  *   CLAUDE_DOUBLE_COMPACT_ERROR=1 fail the native /compact control
  *   CLAUDE_DOUBLE_COMPACT_STATUS_FAIL=1 report native failure with a successful command result
@@ -157,6 +158,9 @@ function initFrame() {
     permissionMode: flagValue('--permission-mode') ?? 'default',
     tools: toolsFlag !== undefined ? toolsFlag.split(',') : [],
     mcp_servers: [],
+    ...(process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'] !== undefined
+      ? { mcp_server_errors: JSON.parse(process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS']) }
+      : {}),
   };
 }
 

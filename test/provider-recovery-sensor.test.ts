@@ -1595,23 +1595,52 @@ describe('native Claude quota walls (claude-code lanes)', () => {
     expect(h.ledger.findNotificationByKind('provider.waiting.legacy-route2', 'active')).not.toBeNull();
   });
 
-  it('retiring a route resolves every active watching row of its exact kind', async () => {
-    const h = new Harness({ enabled: false, claudeNative: true });
-    // Two active rows of one kind (written past the center's dedupe, as a
-    // legacy or racing producer could), on a GLM marker-only route (GLM off).
-    for (const id of ['watch-1', 'watch-2']) {
-      h.ledger.recordNotification({ id, kind: 'provider.waiting.legacy-route', routing: 'fyi', severity: 'info', title: 'watching' });
+  /** A GLM marker-only route (GLM off) with two active watching rows of its
+   * exact kind (written past the center's dedupe, as a legacy or racing
+   * producer could) and two undelivered batches; plus a neighbor kind that
+   * merely extends it. */
+  function retiringRoute(h: Harness) {
+    for (const [id, kind] of [['watch-1', 'provider.waiting.legacy-route'], ['watch-2', 'provider.waiting.legacy-route'],
+      ['watch-neighbor', 'provider.waiting.legacy-route2']] as const) {
+      h.ledger.recordNotification({ id, kind, routing: 'fyi', severity: 'info', title: 'watching' });
     }
-    // ...and two undelivered batches on it: every marker retires too.
     for (const [id, generation] of [['batch-legacy-1', 1], ['batch-legacy-2', 2]] as const) {
       h.ledger.commitProviderRecoveryBatch({ id, routeKey: 'legacy-route', incidentGenerations: [generation], evidence: { stopReason: 'stop' }, waiters: [] });
     }
+    for (const id of ['watch-1', 'watch-2', 'watch-neighbor']) expect(h.ledger.getNotification(id)).toMatchObject({ resolvedAt: null });
     expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(2);
+  }
+
+  it('retiring a route resolves every active watching row of its exact kind — never a neighbor kind', () => {
+    const h = new Harness({ enabled: false, claudeNative: true });
+    retiringRoute(h);
     h.sensor.handBackDisabledWaits();
     expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(0);
-    expect(h.ledger.findNotificationByKind('provider.waiting.legacy-route', 'active')).toBeNull();
-    expect(h.ledger.getNotification('watch-1')?.resolvedAt).not.toBeNull();
-    expect(h.ledger.getNotification('watch-2')?.resolvedAt).not.toBeNull();
+    expect(h.ledger.getNotification('watch-1')?.resolvedAt).toEqual(expect.any(String));
+    expect(h.ledger.getNotification('watch-2')?.resolvedAt).toEqual(expect.any(String));
+    expect(h.ledger.getNotification('watch-neighbor')).toMatchObject({ resolvedAt: null });
+  });
+
+  it('a watching resolve that does not take ends the loop loudly and keeps the route for the next boot', () => {
+    const logs: string[] = [];
+    const h = new Harness({ enabled: false, claudeNative: true });
+    retiringRoute(h);
+    const sensor = new ProviderRecoverySensor({
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: false, claudeNative: true },
+      ledger: h.ledger, probe: h.probe, notifications: h.notifications, wake: h.wakePort(), slotReArm: h.reArmPort(),
+      silasHosted: () => true, now: () => h.now, log: (_level, msg) => logs.push(msg),
+    });
+    // A resolve that does nothing (bounded, so an unbounded loop fails fast).
+    let resolves = 0;
+    vi.spyOn(h.ledger, 'resolveNotificationById').mockImplementation((id) => {
+      resolves += 1;
+      if (resolves > 10) throw new Error('resolve loop did not stop');
+      return h.ledger.getNotification(id);
+    });
+    sensor.handBackDisabledWaits();
+    expect(resolves).toBe(1); // the seen-set ends the loop at the first repeat
+    expect(logs).toContain('retiring a handed-back route failed');
+    expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(2);
   });
 
   it('one failing hand-back never stalls boot reconciliation for the rest', async () => {

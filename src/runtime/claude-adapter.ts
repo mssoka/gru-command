@@ -817,14 +817,19 @@ export async function checkedInProjectMcpConfig(
     return { reason: `.mcp.json cannot be read: ${String(error)}`, infrastructure: true };
   }
   if (!working.equals(committed)) return differsFromCommitted(working, committed);
-  // A server list the CLI could not load is refused here, with its reason —
-  // never handed to the CLI to fail the turn.
+  // The top-level shape the CLI's own config validation requires (a JSON
+  // object whose `mcpServers` maps names to objects) is checked here, so a
+  // file it would reject on every turn is refused with its reason instead.
+  // Each server's own fields are left to the CLI.
   let parsed: unknown;
   try {
     // One leading BOM is stripped, exactly as the CLI reads the file.
     parsed = JSON.parse(committed.toString('utf8').replace(/^\uFEFF/u, ''));
   } catch (error) {
-    return { reason: `the committed .mcp.json is not valid JSON: ${error instanceof Error ? error.message : String(error)}` };
+    // Never the parser's message: V8 quotes source text, and .mcp.json files
+    // carry tokens. The position alone locates the fault.
+    const position = /position (\d+)/u.exec(error instanceof Error ? error.message : '')?.[1];
+    return { reason: `the committed .mcp.json is not valid JSON${position === undefined ? '' : ` (at position ${position})`}` };
   }
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
     return { reason: 'the committed .mcp.json is not a JSON object' };
@@ -833,6 +838,9 @@ export async function checkedInProjectMcpConfig(
   const servers = (parsed as Record<string, unknown>)['mcpServers'];
   if (servers === null || typeof servers !== 'object' || Array.isArray(servers)) {
     return { reason: 'the committed .mcp.json has no "mcpServers" object' };
+  }
+  if (!Object.values(servers).every((server) => server !== null && typeof server === 'object' && !Array.isArray(server))) {
+    return { reason: 'the committed .mcp.json has an "mcpServers" entry that is not an object' };
   }
   return { config: committed };
 }
@@ -950,6 +958,8 @@ export class ClaudeCodeHandle implements AgentHandle {
   /** This handle's own project-MCP copy (see projectMcpCopyPath). */
   private readonly projectMcpCopy: string;
   private projectMcpSwept = false;
+  /** The last distinct set of skipped MCP servers logged (see noteMcpServerErrors). */
+  private mcpServerErrorsNote: string | null = null;
   /** A turn is resolving its params (the project-MCP git check): the
    * operation slot is held exactly as by a live child. */
   private preparingTurn = false;
@@ -1215,6 +1225,23 @@ export class ClaudeCodeHandle implements AgentHandle {
       this.cleanupVerificationSettings();
       if (this.disposed) this.emitEvidence();
     });
+  }
+
+  /** Log the MCP servers the CLI reported it skipped, once per distinct set
+   * (a set that clears resets, so a later recurrence is logged again). */
+  private noteMcpServerErrors(errors: unknown): void {
+    if (!Array.isArray(errors) || errors.length === 0) {
+      this.mcpServerErrorsNote = null;
+      return;
+    }
+    const skipped = errors.map((error: unknown) => {
+      const entry = typeof error === 'object' && error !== null ? error as Record<string, unknown> : {};
+      return `${String(entry['name'] ?? '?')}: ${String(entry['message'] ?? entry['type'] ?? error)}`;
+    });
+    const note = JSON.stringify(skipped);
+    if (note === this.mcpServerErrorsNote) return;
+    this.mcpServerErrorsNote = note;
+    this.log('warn', 'claude skipped MCP servers it could not load', { cwd: this.params.cwd, skipped });
   }
 
   /** A predecessor that crashed (never disposed) left its copy beside the
@@ -1592,9 +1619,11 @@ export class ClaudeCodeHandle implements AgentHandle {
       // (the supervisor's restart snapshot) still sees the accepted prompt.
       if (failure !== null) {
         this.emit({ type: 'error', error: failure, fatal: false });
-        // A subscriber that re-prompted from the error owns the state now;
-        // otherwise (still this prompt, or none) the handle is in error.
-        if (this.livePrompt === accepted || this.livePrompt === null) this.setState('error', failure);
+        // A subscriber that re-prompted from the error owns the state now.
+        // Nothing else changes livePrompt during the emit: this path exists
+        // only in project mode, where a re-prompt stays asynchronous, and
+        // disposal never clears it.
+        if (this.livePrompt === accepted) this.setState('error', failure);
       }
       // Only this turn's prompt: a subscriber may already have re-prompted.
       if (this.livePrompt === accepted) this.livePrompt = null;
@@ -1692,6 +1721,10 @@ export class ClaudeCodeHandle implements AgentHandle {
             }
             return;
           }
+          // The CLI skips (never fails on) a server entry it cannot load — a
+          // bad entry, a missing env var, a reserved name — and says so only
+          // here: logged once per distinct set, so it never just disappears.
+          this.noteMcpServerErrors(frame['mcp_server_errors']);
           // Record what this turn was asked right after its verified identity
           // frame: stdout carries only claude's side of the conversation. Not
           // the CLI's --replay-user-messages: it also echoes the permission

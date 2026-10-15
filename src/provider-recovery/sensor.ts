@@ -902,9 +902,15 @@ export class ProviderRecoverySensor {
         // A resolved row leaves the active set; the seen-set bounds the loop
         // even if a resolve ever failed to take.
         const resolved = new Set<string>();
-        for (let row = watching; row !== null && !resolved.has(row.id); row = this.ledger.findNotificationByKind(`provider.waiting.${routeKey}`, 'active')) {
+        let row = watching;
+        for (; row !== null && !resolved.has(row.id); row = this.ledger.findNotificationByKind(`provider.waiting.${routeKey}`, 'active')) {
           resolved.add(row.id);
           this.ledger.resolveNotificationById(row.id, 'provider-recovery-sensor');
+        }
+        if (row !== null) {
+          // A resolve that did not take: loud, and the route keeps its
+          // markers for the next boot rather than half-retiring.
+          throw new Error(`watching notice ${row.id} stayed active after its resolve`);
         }
         for (const id of pendingIds) this.ledger.clearPendingProviderRecovery(id);
       } catch (error) {

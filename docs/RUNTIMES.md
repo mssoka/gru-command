@@ -175,7 +175,10 @@ An untracked, staged-only, edited, symlinked or missing file loads nothing
 that turn. The comparison is byte-exact — git's eol/smudge conversion would
 run lane-configured filters — so an autocrlf-converted checkout gets its own
 line-ending reason. A git or file failure is logged at warn with its own
-reason; git runs without inherited repository-routing variables. HEAD is
+reason; git runs without inherited repository-routing variables. A file
+without an `mcpServers` object of object entries (what the CLI itself requires)
+is refused with its reason, and any server the CLI then skips (e.g. an entry
+its own validation rejects) is logged by name. HEAD is
 lane state a session with a shell can commit to, so only roles whose own
 tools include a shell load project servers (a server is a command such a
 session could already run); a read-only role never runs a command another

@@ -3,7 +3,7 @@ import * as childProcesses from 'node:child_process';
 import { BUILD_INCIDENT, FULL_INCIDENT, WEB_INCIDENT, authenticatedCaptureStatus, verificationLane } from './helpers/worker-verification.js';
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { closeSync, constants as fsConstants, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
+import { closeSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -63,6 +63,7 @@ const DOUBLE_ENV_KEYS = [
   'CLAUDE_DOUBLE_NO_PARTIALS',
   'CLAUDE_DOUBLE_TOOL_HOLD_MS',
   'CLAUDE_DOUBLE_MISMATCH',
+  'CLAUDE_DOUBLE_MCP_SERVER_ERRORS',
   'CLAUDE_DOUBLE_IGNORE_TERM',
   'CLAUDE_DOUBLE_COMPACT_ERROR',
   'CLAUDE_DOUBLE_COMPACT_STATUS_FAIL',
@@ -1761,6 +1762,31 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     ]);
   });
 
+  it('MCP servers the CLI skipped are logged by name, once per distinct set', async () => {
+    const fx = fixture();
+    const lane = mkdtempSync(join(tmpdir(), 'gru-command-lane-'));
+    cleanupDirs.push(lane);
+    const handle = await fx.runtime.spawn('minion', { cwd: lane });
+    const skippedLogs = () => fx.logs.filter((entry) => entry.msg === 'claude skipped MCP servers it could not load');
+    try {
+      process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'] = JSON.stringify([
+        { name: 'db', type: 'invalid_config', message: 'Skipped — invalid MCP server config for "db"' },
+      ]);
+      await handle.prompt('one');
+      await handle.prompt('two'); // the same set: not logged again
+      expect(skippedLogs()).toHaveLength(1);
+      expect(skippedLogs()[0]).toMatchObject({ level: 'warn', fields: { skipped: ['db: Skipped — invalid MCP server config for "db"'] } });
+      delete process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'];
+      await handle.prompt('three'); // cleared...
+      process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'] = JSON.stringify([{ name: 'db', type: 'invalid_config', message: 'Skipped — invalid MCP server config for "db"' }]);
+      await handle.prompt('four'); // ...so a recurrence is logged again
+      expect(skippedLogs()).toHaveLength(2);
+    } finally {
+      delete process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'];
+      await handle.dispose();
+    }
+  });
+
   it('mcp = "project" never loads lane servers for a role without a shell', async () => {
     const fx = fixture({ configToml: '[runtimes.claude-code]\nmcp = "project"\n' });
     const repo = makeFixtureRepo('mcp-project-read-only');
@@ -1950,13 +1976,19 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         writeFileSync(join(crlf.path, '.mcp.json'), '\r{}\n');
         expect(await checkedInProjectMcpConfig(crlf.path)).toEqual({ reason: '.mcp.json differs from its committed version' });
         // A committed file that is not a JSON object is refused at the boundary.
-        crlf.commitFile('.mcp.json', 'not json');
-        expect(await checkedInProjectMcpConfig(crlf.path)).toMatchObject({ reason: expect.stringMatching(/^the committed \.mcp\.json is not valid JSON: /u) });
+        // A syntax error is named by position only — never the source text,
+        // which may carry a token.
+        crlf.commitFile('.mcp.json', '{"mcpServers":{"x":{"env":{"TOKEN":"sk-secret-value"}}} oops');
+        const syntax = await checkedInProjectMcpConfig(crlf.path);
+        expect(syntax).toMatchObject({ reason: expect.stringMatching(/^the committed \.mcp\.json is not valid JSON( \(at position \d+\))?$/u) });
+        expect(JSON.stringify(syntax)).not.toContain('sk-secret');
+        crlf.commitFile('.mcp.json', '{"mcpServers":{"x":5}}');
+        expect(await checkedInProjectMcpConfig(crlf.path)).toEqual({ reason: 'the committed .mcp.json has an "mcpServers" entry that is not an object' });
         for (const content of ['["a list"]', 'null', '42', '"a string"', 'true']) {
           crlf.commitFile('.mcp.json', content);
           expect(await checkedInProjectMcpConfig(crlf.path), content).toEqual({ reason: 'the committed .mcp.json is not a JSON object' });
         }
-        for (const content of ['{"mcpServers":5}', '{"mcpServers":[]}', '{}', '{"servers":{}}']) {
+        for (const content of ['{"mcpServers":5}', '{"mcpServers":[]}', '{"mcpServers":null}', '{}', '{"servers":{}}']) {
           crlf.commitFile('.mcp.json', content);
           expect(await checkedInProjectMcpConfig(crlf.path), content).toEqual({ reason: 'the committed .mcp.json has no "mcpServers" object' });
         }
@@ -1994,13 +2026,24 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       `#!/bin/sh\nif [ "$1" = "cat-file" ] && [ "$(pwd -P)" = ${sq(realpathSync(repo.path))} ]; then ${action}; fi\nexec ${sq(realGit)} "$@"\n`, { mode: 0o755 });
     // A blocking open must fail this test fast, never hang the suite: on
     // timeout a writer opens the FIFO, releasing any reader blocked on it.
-    const check = (): Promise<unknown> => Promise.race([
-      checkedInProjectMcpConfig(repo.path),
-      new Promise((_resolve, reject) => setTimeout(() => {
-        try { closeSync(openSync(target, fsConstants.O_WRONLY | fsConstants.O_NONBLOCK)); } catch { /* not a FIFO */ }
-        reject(new Error('the check blocked'));
-      }, 5_000).unref()),
-    ]);
+    const check = async (): Promise<unknown> => {
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        return await Promise.race([
+          checkedInProjectMcpConfig(repo.path),
+          new Promise((_resolve, reject) => {
+            timer = setTimeout(() => {
+              try {
+                if (lstatSync(target).isFIFO()) closeSync(openSync(target, fsConstants.O_WRONLY | fsConstants.O_NONBLOCK));
+              } catch { /* nothing left to release */ }
+              reject(new Error('the check blocked'));
+            }, 5_000);
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    };
     try {
       const committed = JSON.stringify({ mcpServers: {} });
       repo.commitFile('.mcp.json', committed);
@@ -2027,6 +2070,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     const repo = makeFixtureRepo('mcp-project-resume');
     const handles: AgentHandle[] = [];
     const track = async (spawned: Promise<AgentHandle>) => { const handle = await spawned; handles.push(handle); return handle; };
+    let disposalFailures: unknown[] = [];
     try {
       repo.commitFile('.mcp.json', JSON.stringify({ mcpServers: {} }));
       const copyOf = () => { const argv = doubleInvocations(fx).at(-1)!.argv; return argv[argv.indexOf('--mcp-config') + 1]!; };
@@ -2072,12 +2116,13 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       expect(fx.logs.some((entry) => entry.level === 'warn' && entry.msg === 'stale project MCP copy could not be removed')).toBe(true);
       rmSync(`${file}.abcdef12.project-mcp.json`, { recursive: true });
     } finally {
-      try {
-        await Promise.allSettled(handles.map((handle) => handle.dispose()));
-      } finally {
-        repo.cleanup();
-      }
+      const disposed = await Promise.allSettled(handles.map((handle) => handle.dispose()));
+      repo.cleanup();
+      disposalFailures = disposed.filter((result): result is PromiseRejectedResult => result.status === 'rejected').map((failure) => failure.reason);
     }
+    // After the finally: a test failure surfaces as itself; a disposal
+    // failure fails an otherwise passing test.
+    if (disposalFailures.length > 0) throw new AggregateError(disposalFailures, 'handle disposal failed');
   });
 
   it('isolated review sessions stay strict with only their scoped bridge even when mcp = "user"', async () => {
