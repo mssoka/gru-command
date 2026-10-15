@@ -358,24 +358,24 @@ interface HitTarget {
 
 /** Center hit-target + viewport containment for one selector: the live
  * occlusion check (sticky chrome, drawer or any other element covering
- * the control fails the hit test). Containment allows LESS than one CSS
- * pixel: browsers scroll in whole pixels while layout positions are
- * fractional, so a focus/scroll that aligns an edge can leave a sub-pixel
- * sliver outside (Linux font metrics put the 1440 SETTLED and 768 PIPELINE
- * disclosures 0.1875px past the bottom edge — #402). The hit test still
- * fails on any real occluder. */
+ * the control fails the hit test). Containment allows a sliver of at most
+ * half a CSS pixel on any edge: browsers scroll in whole pixels while layout
+ * positions are fractional, so a focus/scroll that aligns an edge can leave
+ * a sub-pixel sliver outside (Linux font metrics put the 1440 SETTLED and
+ * 768 PIPELINE disclosures 0.1875px past the bottom edge — #402). A real
+ * overhang, an empty box or any occluder still fails (pinned below). */
 async function hitTarget(page: Page, selector: string): Promise<HitTarget> {
   return page.evaluate((sel) => {
     const element = document.querySelector<HTMLElement>(sel);
     if (element === null) return { found: false, inViewport: false, hit: false };
     const rect = element.getBoundingClientRect();
     const topmost = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
-    const subpixel = 1;
+    const sliver = 0.5;
     return {
       found: true,
-      inViewport:
-        rect.left > -subpixel && rect.top > -subpixel &&
-        rect.right < window.innerWidth + subpixel && rect.bottom < window.innerHeight + subpixel,
+      inViewport: rect.width > 0 && rect.height > 0 &&
+        rect.left >= -sliver && rect.top >= -sliver &&
+        rect.right <= window.innerWidth + sliver && rect.bottom <= window.innerHeight + sliver,
       hit: topmost !== null && (topmost === element || element.contains(topmost)),
     };
   }, selector);
@@ -662,6 +662,20 @@ async function largeCountsProof(browser: Browser, viewportCase: ViewportCase): P
 }
 
 test.describe('compact owner-first board — synthetic geometry proof', () => {
+  test('containment tolerates only a sub-pixel sliver: a real overhang or an empty box fails (#402)', async ({ page }) => {
+    await page.setViewportSize({ width: 400, height: 300 });
+    await page.setContent([
+      '<div id="sliver" style="position:fixed;left:10px;top:250.1875px;width:20px;height:50px"></div>',
+      '<div id="overhang" style="position:fixed;left:60px;top:251px;width:20px;height:50px"></div>',
+      '<div id="left-overhang" style="position:fixed;left:-1px;top:10px;width:20px;height:20px"></div>',
+      '<div id="empty" style="position:fixed;left:100px;top:10px;width:0;height:0"></div>',
+    ].join(''));
+    expect((await hitTarget(page, '#sliver')).inViewport).toBe(true);
+    expect((await hitTarget(page, '#overhang')).inViewport).toBe(false);
+    expect((await hitTarget(page, '#left-overhang')).inViewport).toBe(false);
+    expect((await hitTarget(page, '#empty')).inViewport).toBe(false);
+  });
+
   test('desktop 1440: exact six-section order, bounded previews, reversible disclosures', async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 900 });
     const seed = await seedBoard(page, proofSnapshot());

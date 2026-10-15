@@ -207,8 +207,13 @@ test('real native compact preserves history and New chat starts unresumed behind
   await pair(page);
   await sendAndWaitReply(page, 'real context control old words');
   const pointerFile = join(durableHome, 'chat', 'gru-session.json');
-  const readPointer = (): { sessionFile: string; epoch: number } =>
-    JSON.parse(readFileSync(pointerFile, 'utf-8')) as { sessionFile: string; epoch: number };
+  const readPointer = (): { sessionFile: string; epoch: number } => {
+    const value = JSON.parse(readFileSync(pointerFile, 'utf-8')) as { sessionFile?: unknown; epoch?: unknown };
+    if (typeof value.sessionFile !== 'string' || !Number.isSafeInteger(value.epoch)) {
+      throw new Error(`malformed chat session pointer ${pointerFile}: ${JSON.stringify(value)}`);
+    }
+    return { sessionFile: value.sessionFile, epoch: value.epoch as number };
+  };
 
   await expect(page.locator('#chat-compact')).toBeEnabled();
   await page.locator('#chat-compact').click();
@@ -224,7 +229,10 @@ test('real native compact preserves history and New chat starts unresumed behind
   // epoch pointer (the write is asynchronous): wait for the durable advance
   // rather than reading once — reading once made this test order/timing
   // sensitive (#402).
-  await expect.poll(() => readPointer().epoch, { timeout: 10_000 }).toBe(oldPointer.epoch + 1);
+  await expect.poll(() => readPointer().epoch, {
+    message: 'New chat never durably advanced the chat session epoch pointer',
+    timeout: 10_000,
+  }).toBe(oldPointer.epoch + 1);
   const freshPointer = readPointer();
   expect(freshPointer.sessionFile).not.toBe(oldPointer.sessionFile);
   expect(readFileSync(oldPointer.sessionFile)).toEqual(oldBytes);

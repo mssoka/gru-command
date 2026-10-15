@@ -983,14 +983,22 @@ test('essential text and numbers hold >=4.5:1 contrast in both themes', async ({
       // `finished` promise past the test timeout (#402) — and the check
       // repeats until nothing is still running.
       await page.evaluate(() => {
+        // Every unsettled transition — running (pending play included) or
+        // paused — is jumped to its end; finished and idle ones are done.
+        const unsettled = (): CSSTransition[] => document
+          .getAnimations()
+          .filter((a): a is CSSTransition => a instanceof CSSTransition && a.playState !== 'finished' && a.playState !== 'idle');
         for (let pass = 0; pass < 60; pass += 1) {
-          const running = document
-            .getAnimations()
-            .filter((a) => a instanceof CSSTransition && a.playState === 'running');
-          if (running.length === 0) return;
-          for (const transition of running) transition.finish();
+          const live = unsettled();
+          if (live.length === 0) return;
+          for (const transition of live) transition.finish();
         }
-        throw new Error('CSS transitions kept restarting; the theme never settled');
+        const culprits = unsettled().map((t) => {
+          const target = t.effect instanceof KeyframeEffect ? t.effect.target : null;
+          const name = target instanceof Element ? `${target.tagName.toLowerCase()}${target.id === '' ? '' : `#${target.id}`}` : 'unknown';
+          return `${name} ${t.transitionProperty}`;
+        });
+        throw new Error(`CSS transitions kept restarting after 60 settle passes; the theme never settled: ${culprits.join(', ')}`);
       });
     }
     const ratios = await measure();
