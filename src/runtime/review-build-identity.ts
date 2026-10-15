@@ -257,18 +257,30 @@ export function reviewRuntimeVersion(packageRoot: string): string {
       // hoisted node_modules lookup, from the same held installation FD.
       // procfs is only a descriptor handle, never a pathname fallback.
       let parentFd = rootFd;
+      // Only the leading `..` steps of a normalized relative path climb
+      // above the installation. A directory reached that way is a SHARED
+      // ancestor (for example /tmp): unrelated siblings legitimately change
+      // its mtime/ctime, so it gets no change bracket (#399). Each `..` is
+      // resolved fresh from a held descendant, so the climb follows the same
+      // current tree Node's own pathname lookup would; checkRoot() around
+      // every step re-resolves the installation by pathname, and the first
+      // `..` is held to the root's recorded parent, so replacing the
+      // installation or its parent still refuses. Every directory below the
+      // first non-`..` component (a dependency location) keeps the full
+      // bracket.
+      let parentIsAncestor = false;
       const opened: number[] = [];
       try {
         const components = withinRoot.split('/');
         for (const [index, part] of components.entries()) {
           const last = index === components.length - 1;
           checkRoot();
-          const parentReceipt = directoryReceipt(parentFd);
+          const parentReceipt = parentIsAncestor ? null : directoryReceipt(parentFd);
           const fd = openSync(`/proc/self/fd/${parentFd}/${part}`,
             constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW |
             (last ? 0 : constants.O_DIRECTORY));
           opened.push(fd);
-          assertDirectoryReceipt(parentFd, parentReceipt);
+          if (parentReceipt !== null) assertDirectoryReceipt(parentFd, parentReceipt);
           if (part === '..' && parentFd === rootFd) {
             const selectedParent = directoryReceipt(fd);
             if (selectedParent.dev !== rootParentReceipt!.dev || selectedParent.ino !== rootParentReceipt!.ino) {
@@ -276,6 +288,7 @@ export function reviewRuntimeVersion(packageRoot: string): string {
             }
           }
           checkRoot();
+          parentIsAncestor = part === '..' && (parentFd === rootFd || parentIsAncestor);
           parentFd = fd;
         }
         const result = opened.pop()!;
