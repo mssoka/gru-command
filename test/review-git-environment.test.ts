@@ -55,7 +55,9 @@ function fixture(name: string): FixtureRepo {
 /** Fixture reads must not repeat the product's environment-routing defect. */
 function git(repoPath: string, args: readonly string[]): string {
   return execFileSync('git', ['-C', repoPath, ...args], {
-    encoding: 'utf8', env: repositoryGitEnv(false), stdio: ['ignore', 'pipe', 'pipe'],
+    // CI runners have no global identity; fixture commits must not depend on one.
+    encoding: 'utf8', env: { ...repositoryGitEnv(false), GIT_AUTHOR_NAME: 'Fixture', GIT_AUTHOR_EMAIL: 'fixture@example.invalid', GIT_COMMITTER_NAME: 'Fixture', GIT_COMMITTER_EMAIL: 'fixture@example.invalid' },
+    stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
 }
 
