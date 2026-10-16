@@ -525,6 +525,18 @@ describe('eviction-safe fix directives (phase 3)', () => {
     }
   });
 
+  it('refuses a native directive turn without onPrepared before any spawn or prompt (#362)', async () => {
+    const { registry, controller, calls, prompted } = stubRegistry(null);
+    const ledger = { getAgent: () => null, listAgents: () => [], listImplementerMinions: () => [], registerAgent: () => {}, getJob: () => ({ briefing: 'b' }) };
+    await expect(routeFixDirectiveToMinion({
+      registry: registry as never, ledger: ledger as never, worktrees: { listWorktrees: () => [] } as unknown as WorktreePort,
+      jobId: 'job-no-prepare', directive: 'repair', signal: controller.signal,
+      directiveTurn: { identity: {} as never, beforeAdmission: () => {}, onAdmitted: () => {} },
+    })).rejects.toThrow(/a native directive turn needs onPrepared/u);
+    expect(calls).toEqual([]);
+    expect(prompted).toEqual([]);
+  });
+
   it('falls through a typed eviction rejection and resumes the FAILING logical session', async () => {
     const { WorkerDisposalInProgressError } = await import('../src/runtime/registry.js');
     const { registry, controller, calls } = stubRegistry(new WorkerDisposalInProgressError());

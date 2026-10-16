@@ -180,6 +180,12 @@ export async function routeFixDirectiveToMinion(
    * single-writer guard on this evidence alone. */
   admission?: 'none' | 'unknown';
 }> {
+  // A native directive turn is admitted only with its target and producer
+  // start committed first (#362): without onPrepared nothing would commit
+  // them before the prompt, so the route refuses before any effect.
+  if (input.directiveTurn !== undefined && input.onPrepared === undefined) {
+    throw new Error('a native directive turn needs onPrepared: its target and producer start must commit before the prompt');
+  }
   const disposeAndRecord = async (handle: AgentHandle, viaRegistry = false): Promise<void> => {
     const failures: unknown[] = [];
     try { await (viaRegistry ? input.registry.disposeHandle(handle) : handle.dispose()); } catch (error) { failures.push(error); }

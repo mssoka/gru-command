@@ -853,63 +853,106 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     finally { await service.dispose(); }
   });
 
-  it('#362 the prompt never runs before the durable native target and producer start commit', async () => {
+  /** Before the physical prompt starts, the native target and the producer
+   * start are COMMITTED: read back from a fresh connection to a consistent
+   * copy of the ledger, not from the writer's own state (#362). */
+  async function assertPreparedBeforePrompt(route: 'fresh' | 'resident') {
     const f = await fixture();
-    const seen: { target: unknown; started: boolean }[] = [];
+    if (route === 'resident') await f.registry.spawn('minion', { agentId: 'logical-minion' });
+    const seen: { readonly target: unknown; readonly started: boolean }[] = [];
     const prompt = f.native.prompt.bind(f.native);
     f.native.prompt = async (text: string, options?: unknown) => {
-      let started = true;
-      try { f.ledger.directiveProducerStart(f.identity); } catch { started = false; }
-      seen.push({ target: f.ledger.getDirective(f.intent.requestId)?.nativeTarget ?? null, started });
+      const db = new LedgerDb(crashSnapshot(f));
+      try {
+        const durable = new LedgerApi(db.handle, { bus: new EventBus({}) });
+        seen.push({
+          target: durable.getDirective(f.intent.requestId)?.nativeTarget ?? null,
+          started: durable.latestJobEventByRequestId(f.intent.jobId, 'silas.directive-producer-started', f.intent.requestId) !== null,
+        });
+      } finally { db.close(); }
       return prompt(text, options);
     };
     await executeAcceptedDirective(f.deps, f.intent.requestId);
-    expect(seen).toEqual([{ target: { agentId: 'logical-minion', sessionFile: f.file }, started: true }]);
-  });
+    expect(f.spawns, route).toHaveLength(route === 'resident' ? 1 : 1);
+    expect(seen, route).toEqual([{ target: { agentId: 'logical-minion', sessionFile: f.file }, started: true }]);
+  }
+  it('#362 the fresh route prompts only after the durable native target and producer start commit', () => assertPreparedBeforePrompt('fresh'));
+  it('#362 the resident route prompts only after the durable native target and producer start commit', () => assertPreparedBeforePrompt('resident'));
 
-  it('#362 a crash after spawn but before onPrepared is never replayed, and its successor waits only for the open turn', async () => {
+  /** The durable ledger exactly as it stands NOW — what a process killed at
+   * this instant leaves behind (a consistent online copy, never a guess). */
+  function crashSnapshot(f: Awaited<ReturnType<typeof fixture>>): string {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-crash-snapshot-'));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    mkdirSync(join(dir, 'ledger'));
+    f.db.handle.exec(`VACUUM INTO '${join(dir, 'ledger', 'ledger.db').replaceAll("'", "''")}'`);
+    return dir;
+  }
+
+  /** Runs the REAL executor and snapshots the ledger at a crash window between
+   * registry.spawn() and onPrepared, then recovers from that snapshot as a
+   * restarted service would (#362). */
+  async function recoverFromCrash(window: 'inside-spawn' | 'after-registration') {
     const f = await fixture(); void (f.ledger.getWorktree(f.lane.id) ?? f.ledger.registerWorktree(f.lane));
-    // The durable state a process leaves when it dies after registry.spawn()
-    // and registration but before onPrepared: the reservation, the spawned
-    // registration, no native target, no producer start, no deferral.
-    expect(f.ledger.claimDirectiveDispatch(f.intent.requestId)).toBe(true);
-    f.ledger.setAgentState('logical-minion', 'spawning');
-    const original = f.ledger.getDirective(f.intent.requestId)!;
-    expect(original).toMatchObject({ state: 'dispatching', nativeTarget: null });
-    f.db.close(); const db = new LedgerDb(f.dir); cleanups.push(() => db.close());
+    let release!: () => void;
+    if (window === 'inside-spawn') f.spawnGate(new Promise<void>((resolve) => { release = resolve; }));
+    let snapshot: string | null = null;
+    let boundaries = 0;
+    const run = executeAcceptedDirective({ ...f.deps, beforeWriterSideEffect: () => {
+      boundaries += 1;
+      // The fresh route's second admission boundary sits after the spawned
+      // registration and immediately before onPrepared.
+      if (window === 'after-registration' && boundaries === 2) snapshot = crashSnapshot(f);
+    } }, f.intent.requestId);
+    if (window === 'inside-spawn') {
+      await vi.waitFor(() => expect(f.spawns).toHaveLength(1));
+      snapshot = crashSnapshot(f);
+      release();
+    }
+    await run;
+    if (snapshot === null) throw new Error(`fixture: no crash snapshot at ${window}`);
+    const db = new LedgerDb(snapshot); cleanups.push(() => db.close());
     const bus = new EventBus({}); const ledger = new LedgerApi(db.handle, { bus });
     for (const lane of ledger.listWorktrees()) rememberManagedLane(lane, ledger);
-    const registry: DirectiveRegistry = { getHandle: () => null, spawn: async (_role, options = {}) => { f.spawns.push(options); throw new Error('the reserved original must never respawn'); },
+    let respawns = 0;
+    const registry: DirectiveRegistry = { getHandle: () => null, spawn: async () => { respawns += 1; throw new Error('the reserved original must never respawn'); },
       disposeHandle: async (handle) => handle.dispose() };
-    const deps = { ...f.deps, ledger, registry, notifications: new NotificationCenter({ ledger, bus }) };
-    const service = new DirectiveProgressService(deps);
-    try { service.reconsider(); await service.settled(); service.reconsider(); await service.settled(); }
-    finally { await service.dispose(); }
-    // Never replayed: no spawn, no prompt, no deferral invented from the missing target.
-    expect(f.spawns).toEqual([]); expect(f.native.prompts).toEqual([]);
-    expect(ledger.getDirective(f.intent.requestId)).toMatchObject({ state: 'dispatching', nativeTarget: null });
+    const service = new DirectiveProgressService({ ...f.deps, ledger, registry, notifications: new NotificationCenter({ ledger, bus }) });
+    try {
+      // Two passes: a second reconsideration must not replay it either.
+      service.reconsider(); await service.settled();
+      service.reconsider(); await service.settled();
+    } finally { await service.dispose(); }
+    const original = ledger.getDirective(f.intent.requestId);
+    // Never replayed, and no deferral invented from the missing target.
+    expect(respawns).toBe(0);
+    expect(original).toMatchObject({ state: 'dispatching', nativeTarget: null });
     expect(ledger.hasDirectiveDispatchDeferral(f.intent.requestId)).toBe(false);
     expect(ledger.claimDirectiveDispatch(f.intent.requestId)).toBe(false);
+    expect(() => ledger.directiveProducerStart(f.identity)).toThrow(/exact directive producer start receipt missing/u);
     const debt = ledger.listObligations({ jobId: f.intent.jobId }).find((item) => item.incidentKey === `directive-recovery:${f.intent.requestId}`);
-    expect(debt?.state).toMatch(/open|waiting/);
+    expect(debt, 'the interrupted request is owed a recovery decision').toBeDefined();
     const authority = ledger.directiveCurrentAuthority(f.intent.jobId);
     const decide = () => recoverInterruptedDirectiveFromRoute({ ledger, worktrees: f.worktrees, pendingProducerBlockers: () => [],
-      requestId: f.intent.requestId, generation: debt!.generation, expectedPayloadHash: original.payloadHash,
+      requestId: f.intent.requestId, generation: debt!.generation, expectedPayloadHash: original!.payloadHash,
       expectedHead: resolveGitCommit(f.lane.path, 'HEAD'), expectedEpoch: ledger.directiveRecoveryEpoch(f.intent.jobId),
       expectedWorkRevision: authority.workRevision, expectedContractSha256: authority.contractSha256,
       reason: 'the reserved original never reached a native target', decision: { kind: 'successor', requestId: 'post-crash-successor', directive: 'approved correction' } });
-    // The spawned registration is still an open turn: the successor waits.
-    const refused = (() => { try { decide(); return null; } catch (error) { return error as { code?: string; blockers?: readonly string[] }; } })();
-    expect(refused?.code).toBe('live_work');
-    expect(refused?.blockers).toEqual([expect.stringMatching(/open worker turn\(s\): logical-minion \(spawning\)/u)]);
-    expect(ledger.getDirective('post-crash-successor')).toBeNull();
-    // Once that turn is terminal, no native effect can exist (no target and no
-    // producer start were ever recorded), so fresh authority may proceed.
-    ledger.setAgentState('logical-minion', 'disposed');
-    expect(decide().successor?.requestId).toBe('post-crash-successor');
-    expect(ledger.getDirective(f.intent.requestId)?.state).toBe('retired');
-    expect(f.native.prompts).toEqual([]);
-  });
+    return { ledger, decide, debt: debt! };
+  }
+
+  /** No prompt can precede onPrepared, so neither crash window left a native
+   * effect: no open turn fences the lane (the registration leaves the agent
+   * idle), and fresh authority may proceed at once — retiring the reserved
+   * original, never replaying it. */
+  async function assertSuccessorMayProceed(window: 'inside-spawn' | 'after-registration') {
+    const { ledger, decide } = await recoverFromCrash(window);
+    expect(ledger.getAgent('logical-minion')?.state, window).toBe('idle');
+    expect(decide().successor?.requestId, window).toBe('post-crash-successor');
+    expect(ledger.getDirective('approved-request')?.state, window).toBe('retired');
+  }
+  it('#362 a crash inside registry.spawn() is never replayed, and a successor may proceed', () => assertSuccessorMayProceed('inside-spawn'));
+  it('#362 a crash after the spawned registration but before onPrepared is never replayed, and a successor may proceed', () => assertSuccessorMayProceed('after-registration'));
 
   it('positive no-effect closes only the attached awaiting phase without completion', async () => {
     const f = await fixture(); f.ledger.failDirective({ requestId: f.intent.requestId, reason: 'fixture replaced before dispatch' });
