@@ -36,7 +36,6 @@ import { RestartCleanupJournal, restartCleanupDiagnostic, type RestartCleanupDeb
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
-/** Default backoff sleep: a real, unref'd timer (tests inject a fake). */
 /** A thrown value's text for a reason or detail: never blank, never a second throw. */
 function failureText(error: unknown): string {
   try {
@@ -47,6 +46,7 @@ function failureText(error: unknown): string {
   }
 }
 
+/** Default backoff sleep: a real, unref'd timer (tests inject a fake). */
 function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     const timer = setTimeout(resolve, ms);

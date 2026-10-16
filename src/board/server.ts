@@ -839,7 +839,7 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
                   rearm = outcome.superseded === true ? 'superseded' : outcome.rearmed === false ? 'not_applicable' : 'accepted';
                 }
               } catch (error) {
-                const message = String(error instanceof Error ? error.message : error);
+                const message = failureText(error instanceof Error ? error.message : error);
                 ledger.appendCustomEvent({
                   kind: 'notification.rearm-failed',
                   payload: { id, error: message },

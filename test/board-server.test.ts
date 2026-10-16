@@ -1871,6 +1871,13 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
         expect(await postJson(harness.port, `/api/notifications/${encodeURIComponent(failing.id)}/disposition`, 'board-test-token', { detail: 'silent failure' }))
           .toMatchObject({ status: 500, body: { error: 'disposition_failed', rearm: 'accepted', detail: 'an error with no text — the supervisor had already acted on it (rearm: accepted) (and that could not be recorded in the ledger); the alert stays open: retriage or resolve it' } });
       } finally { unrecorded.mockRestore(); silentDisposal.mockRestore(); }
+      // Text that is only blanks is no text, on the 500 and in its record.
+      const blank = vi.spyOn(harness.api, 'disposeMachineNotification').mockImplementation(() => { throw Object.assign(new Error(''), { toString: () => ' \t ' }); });
+      try {
+        expect(await postJson(harness.port, `/api/notifications/${encodeURIComponent(failing.id)}/disposition`, 'board-test-token', { detail: 'blank failure' }))
+          .toMatchObject({ status: 500, body: { error: 'disposition_failed', detail: expect.stringMatching(/^an error with no text — the supervisor had already acted on it/u) } });
+      } finally { blank.mockRestore(); }
+      expect(actedEvents()).toContainEqual({ id: failing.id, rearm: 'accepted', outcome: 'failed', reason: 'an error with no text' });
       // One that cannot print is still a typed 500 that names it so.
       const unprintable = vi.spyOn(harness.api, 'disposeMachineNotification').mockImplementation(() => { throw Object.assign(new Error(''), { toString: () => { throw new Error('no'); } }); });
       try {
@@ -2150,6 +2157,20 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
       expect(api.listEvents({ limit: 100 }).filter((event) => event.kind === 'notification.rearm-failed')).toHaveLength(1);
     } finally {
       await close();
+    }
+    // A re-arm failure with no text, or one that cannot print, is still a typed 502 that names it so.
+    for (const [thrown, named] of [
+      [Object.assign(new Error(''), { toString: () => '' }), 'an error with no text'],
+      [{ toString: () => { throw new Error('no'); } }, 'an error that cannot be printed'],
+    ] as const) {
+      const failing = await boot('board-test-token', { onNotificationDisposition: () => { throw thrown; } });
+      try {
+        failing.api.recordNotification({ id: 'machine-silent', kind: 'supervision.breaker', routing: 'action-required', severity: 'error', title: 'Lane stopped', detail: 'breaker open' });
+        expect(await postJson(failing.port, '/api/notifications/machine-silent/disposition', 'board-test-token', { detail: 'try' }), named)
+          .toMatchObject({ status: 502, body: { error: 'rearm_failed', detail: named } });
+      } finally {
+        await failing.close();
+      }
     }
   });
 
