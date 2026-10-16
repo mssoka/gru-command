@@ -35,6 +35,9 @@ export default defineConfig({
   timeout: 30_000,
   reporter: [['list']],
   snapshotPathTemplate: '{snapshotDir}/{testFileName}-snapshots/{arg}-{platform}{ext}',
+  // CI keeps a trace and a screenshot of every failing test so the workflow
+  // can upload them (#402); local runs stay as fast as before.
+  use: process.env.CI ? { trace: 'retain-on-failure', screenshot: 'only-on-failure' } : {},
   webServer: [
     {
       command: 'npm run mock',
