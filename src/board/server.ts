@@ -95,7 +95,7 @@ interface Client {
  * prefix) — read inside the same guard. */
 function failureText(error: unknown, messageOnly = false): string {
   try {
-    const text = messageOnly && error instanceof Error ? error.message : String(error);
+    const text = messageOnly && error instanceof Error ? String(error.message) : String(error);
     return text.trim() === '' ? 'an error with no text' : text;
   } catch {
     return 'an error that cannot be printed';
@@ -841,12 +841,20 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
                   rearm = outcome.superseded === true ? 'superseded' : outcome.rearmed === false ? 'not_applicable' : 'accepted';
                 }
               } catch (error) {
-                const message = failureText(error, true);
-                ledger.appendCustomEvent({
-                  kind: 'notification.rearm-failed',
-                  payload: { id, error: message },
-                });
-                json(res, 502, { error: 'rearm_failed', detail: message });
+                // Bounded on code points, as the disposal reason is; recorded
+                // best effort — a failed append never costs the typed answer.
+                const message = [...failureText(error, true).slice(0, 1001)].slice(0, 500).join('');
+                let recorded = true;
+                try {
+                  ledger.appendCustomEvent({
+                    kind: 'notification.rearm-failed',
+                    payload: { id, error: message },
+                  });
+                } catch (eventError) {
+                  recorded = false;
+                  try { log('error', 'rearm-failed event not recorded', { id, error: failureText(eventError) }); } catch { /* the answer still goes out */ }
+                }
+                json(res, 502, { error: 'rearm_failed', detail: recorded ? message : `${message} (and that could not be recorded in the ledger)` });
                 return;
               }
             }

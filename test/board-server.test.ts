@@ -2152,9 +2152,11 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
         detail: 'breaker open',
       });
       const res = await postJson(port, '/api/notifications/machine-fail/disposition', 'board-test-token', { detail: 'try' });
-      expect(res).toMatchObject({ status: 502, body: { error: 'rearm_failed' } });
+      // An Error is named by its message, with no name prefix — in the answer and its record.
+      expect(res).toMatchObject({ status: 502, body: { error: 'rearm_failed', detail: 'supervisor unavailable' } });
       expect(api.getNotification('machine-fail')?.resolvedAt).toBeNull();
-      expect(api.listEvents({ limit: 100 }).filter((event) => event.kind === 'notification.rearm-failed')).toHaveLength(1);
+      expect(api.listEvents({ limit: 100 }).filter((event) => event.kind === 'notification.rearm-failed').map((event) => event.payload))
+        .toEqual([{ id: 'machine-fail', error: 'supervisor unavailable' }]);
     } finally {
       await close();
     }
@@ -2164,6 +2166,9 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
       [{ toString: () => { throw new Error('no'); } }, 'an error that cannot be printed'],
       // An Error whose message itself cannot be read is named the same way.
       [Object.defineProperty(new Error('x'), 'message', { get: () => { throw new Error('no'); } }), 'an error that cannot be printed'],
+      // A message that is no string is still printed, and a long one is cut on code points.
+      [Object.assign(new Error('x'), { message: 5 }), '5'],
+      [new Error(`${'y'.repeat(499)}\u{1F600}tail`), `${'y'.repeat(499)}\u{1F600}`],
     ] as const) {
       const failing = await boot('board-test-token', { onNotificationDisposition: () => { throw thrown; } });
       try {
@@ -2176,6 +2181,22 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
       } finally {
         await failing.close();
       }
+    }
+    // A record that cannot be written is said, never a lost answer.
+    const unrecorded = await boot('board-test-token', { onNotificationDisposition: () => { throw new Error('supervisor unavailable'); } });
+    try {
+      unrecorded.api.recordNotification({ id: 'machine-unrecorded', kind: 'supervision.breaker', routing: 'action-required', severity: 'error', title: 'Lane stopped', detail: 'breaker open' });
+      const append = unrecorded.api.appendCustomEvent.bind(unrecorded.api);
+      const failingAppend = vi.spyOn(unrecorded.api, 'appendCustomEvent').mockImplementation((input) => {
+        if (input.kind === 'notification.rearm-failed') throw new Error('ledger full');
+        return append(input);
+      });
+      try {
+        expect(await postJson(unrecorded.port, '/api/notifications/machine-unrecorded/disposition', 'board-test-token', { detail: 'try' }))
+          .toMatchObject({ status: 502, body: { error: 'rearm_failed', detail: 'supervisor unavailable (and that could not be recorded in the ledger)' } });
+      } finally { failingAppend.mockRestore(); }
+    } finally {
+      await unrecorded.close();
     }
   });
 
