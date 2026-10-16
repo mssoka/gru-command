@@ -171,7 +171,7 @@ const PINS: Record<string, number> = {
   'property-real-tool-campaign.test.ts': 10,
   'property-repair-ci.test.ts': 21,
   'property-perkins-integration.test.ts': 15,
-  'property-overlay-restore.test.ts': 2,
+  'property-overlay-restore.test.ts': 4,
   'property-owner-actions.test.ts': 16,
   'property-review-regressions.test.ts': 13,
   'property-qualification.test.ts': 33,

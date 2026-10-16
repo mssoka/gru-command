@@ -229,14 +229,14 @@ keeps the original candidate counterexample (not a qualification control's) and
 preserves oracle bytes and adds a closed seed/path regression wrapper plus
 the actual minimized counterexample/replay audit file. Retention changes
 source bytes and invalidates prior review evidence; its files land in the live
-lane all-or-nothing (a mid-way failure removes the files and exactly the
-parent directories it created, and restores what it overwrote, bytes and
-mode, by renaming a re-created copy over it — read-only files included, a
-link swapped in at the target replaced and never written through, the
-target path never without the original bytes; a file the apply never
-touched is left exactly as it was, and a failed restore step removes its
-copy; an incomplete
-rollback fails loud with the original error and every cause, #380).
+lane all-or-nothing (#380). A mid-way failure removes the files and exactly
+the parent directories it created. A file it overwrote is restored, bytes
+and mode, by renaming a re-created copy over it: read-only files included,
+a link swapped in at the target replaced and never written through, and the
+target path never without the original bytes. A file whose mode and bytes
+still match is left exactly as it was. A failed restore step removes its
+copy (and names the copy if even that fails). An incomplete rollback fails
+loud with the original error and every cause.
 
 **Owner-service lifecycle (#380).** The owner HTTP service keeps campaigns
 process-local. At its retention cap (128), once the new proposal has
@@ -247,10 +247,11 @@ decision are never evicted (when only those remain, a new proposal is
 refused until they are decided). An eviction is audited
 (`owner-evicted-*.json` beside the entry's records) FIRST — before the new
 proposal leaves any record and before the entry leaves memory; a failed
-audit write evicts and records nothing and names the directory to fix, and
-a proposal whose own record cannot be written withdraws the eviction record
-— and
-a later read of that id by its own job says it was evicted (the last 1024
+audit write evicts and records nothing and names the directory to fix. A
+proposal whose own record cannot be written withdraws the eviction record
+and anything under its own fresh directory; if that cleanup fails too, the
+refusal names the record to remove by hand. A later read of an evicted id
+by its own job says it was evicted (the last 1024
 evicted ids are remembered; an older one reads as unknown).
 Every campaign view carries
 `nextAction: { kind, detail }` with `kind` one of `decide-execute`,

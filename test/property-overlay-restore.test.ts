@@ -9,7 +9,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
  * can cause — a link swapped in at the target, a failing rename — driven
  * through a mocked `node:fs` whose real calls pass through.
  */
-const { hooks } = vi.hoisted(() => ({ hooks: { beforeRestoreRename: null as ((from: string, to: string) => void) | null } }));
+const { hooks } = vi.hoisted(() => ({ hooks: {
+  beforeRestoreRename: null as ((from: string, to: string) => void) | null,
+  beforeRm: null as ((path: string) => void) | null,
+  beforeReadFile: null as ((path: string) => void) | null,
+} }));
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>();
   return {
@@ -18,6 +22,8 @@ vi.mock('node:fs', async (importOriginal) => {
       if (String(from).includes('.gru-restore-')) hooks.beforeRestoreRename?.(String(from), String(to));
       return actual.renameSync(from, to);
     },
+    rmSync: (...args: Parameters<typeof actual.rmSync>) => { hooks.beforeRm?.(String(args[0])); return actual.rmSync(...args); },
+    readFileSync: ((...args: Parameters<typeof actual.readFileSync>) => { hooks.beforeReadFile?.(String(args[0])); return actual.readFileSync(...args); }) as typeof actual.readFileSync,
   };
 });
 const fs = await import('node:fs');
@@ -25,7 +31,7 @@ const { applyOverlayFilesAllOrNothing } = await import('../src/property/overlay.
 
 const dirs: string[] = [];
 afterEach(() => {
-  hooks.beforeRestoreRename = null;
+  hooks.beforeRestoreRename = null; hooks.beforeRm = null; hooks.beforeReadFile = null;
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 function workspace(): string {
@@ -50,14 +56,17 @@ describe('overlay rollback restore (#380)', () => {
     const outside = join(realpathSync(mkdtempSync(join(tmpdir(), 'property-overlay-outside-'))), 'victim.txt');
     dirs.push(join(outside, '..'));
     writeFileSync(outside, 'outside bytes\n');
+    let swapped = false;
     hooks.beforeRestoreRename = (_from, to) => {
       rmSync(to, { force: true });
       fs.symlinkSync(outside, to);
+      swapped = true;
     };
     expect(() => applyOverlayFilesAllOrNothing({ workspaceRoot: root, files: failingSet })).toThrow(/non-file entry/u);
     expect(fs.lstatSync(join(root, 'test/existing.test.mjs')).isFile()).toBe(true);
     expect(readFileSync(join(root, 'test/existing.test.mjs'), 'utf8')).toBe('original\n');
     expect(readFileSync(outside, 'utf8')).toBe('outside bytes\n');
+    expect(swapped, 'the link was swapped in before the restore').toBe(true);
     expect(leftovers(root)).toEqual([]);
   });
 
@@ -73,5 +82,32 @@ describe('overlay rollback restore (#380)', () => {
     // No stray copy is left in the live tree.
     expect(leftovers(root)).toEqual([]);
     expect(statSync(join(root, 'test/occupied.replay.json')).isDirectory()).toBe(true);
+  });
+
+  it('a copy that cannot be removed after a failed restore step is named, with both causes', () => {
+    const root = workspace();
+    hooks.beforeRestoreRename = () => { throw Object.assign(new Error('rename refused'), { code: 'EPERM' }); };
+    hooks.beforeRm = (path) => { if (path.includes('.gru-restore-')) throw Object.assign(new Error('copy busy'), { code: 'EBUSY' }); };
+    let error: unknown = null;
+    try { applyOverlayFilesAllOrNothing({ workspaceRoot: root, files: failingSet }); } catch (caught) { error = caught; }
+    hooks.beforeRm = null;
+    expect(error).toBeInstanceOf(AggregateError);
+    const restore = (error as AggregateError).errors[1] as AggregateError;
+    const [copy] = leftovers(root);
+    expect(restore.message).toBe(`restoring ${join(root, 'test/existing.test.mjs')} failed and its copy ${join(root, 'test', copy!)} could not be removed`);
+    expect(restore.errors.map((cause) => (cause as NodeJS.ErrnoException).code)).toEqual(['EPERM', 'EBUSY']);
+  });
+
+  it('a target the untouched-check cannot read is restored, never skipped', () => {
+    const root = workspace();
+    const target = join(root, 'test/existing.test.mjs');
+    let reads = 0;
+    // The first read captures the prior bytes; the second is the rollback's untouched-check.
+    hooks.beforeReadFile = (path) => { if (path === target && ++reads === 2) throw Object.assign(new Error('read refused'), { code: 'EACCES' }); };
+    expect(() => applyOverlayFilesAllOrNothing({ workspaceRoot: root, files: failingSet })).toThrow(/non-file entry/u);
+    hooks.beforeReadFile = null;
+    expect(reads).toBe(2);
+    expect(readFileSync(target, 'utf8')).toBe('original\n');
+    expect(leftovers(root)).toEqual([]);
   });
 });

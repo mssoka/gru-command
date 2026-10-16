@@ -72,7 +72,11 @@ const RETENTION = { maxReceipts: 1024, maxRetainedOutputBytes: 256 * 1024 * 1024
  * retry and its close handling are tested against injected `readSync` and
  * `closeSync`. Leaves the trimmed text read in `nonce`. */
 export function nonceReaderSource(budgetMs: number): string {
-  if (!Number.isSafeInteger(budgetMs) || budgetMs < 10) throw new Error('nonce reader budget must be an integer of at least 10 ms');
+  // The reader waits in 10 ms steps: the budget is a whole number of them,
+  // and bounded, so a run's startup never waits without end.
+  if (!Number.isSafeInteger(budgetMs) || budgetMs < 10 || budgetMs > 60_000 || budgetMs % 10 !== 0) {
+    throw new Error(`nonce reader budget must be a multiple of 10 ms from 10 to 60000, got ${String(budgetMs)}`);
+  }
   return [
   // fd 3 may be a non-blocking socket: retry EAGAIN (bounded), and always
   // close it — a close failure never masks the read's own error.

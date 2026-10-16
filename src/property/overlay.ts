@@ -191,8 +191,14 @@ export function applyOverlayFilesAllOrNothing(input: Parameters<typeof applyOver
         if (state === 'file' && content !== null && mode !== null) {
           // A file the failed apply never touched is left exactly as it is
           // (same inode, links and times).
-          const current = lstatSync(target, { throwIfNoEntry: false });
-          if (current?.isFile() === true && (current.mode & 0o7777) === mode && readFileSync(target).equals(content)) continue;
+          // Judged by mode and bytes; a check that cannot read the target
+          // never skips — the target is then restored.
+          let untouched = false;
+          try {
+            const current = lstatSync(target, { throwIfNoEntry: false });
+            untouched = current?.isFile() === true && (current.mode & 0o7777) === mode && readFileSync(target).equals(content);
+          } catch { untouched = false; }
+          if (untouched) continue;
           // Re-created beside the target (a short name, never too long), then
           // renamed over it in one step: the original bytes are never absent
           // from the target path, and a link swapped in meanwhile is
@@ -203,7 +209,9 @@ export function applyOverlayFilesAllOrNothing(input: Parameters<typeof applyOver
             chmodSync(restored, mode); // exact, whatever the umask
             renameSync(restored, target);
           } catch (stepError) {
-            rmSync(restored, { force: true });
+            try { rmSync(restored, { force: true }); } catch (cleanupError) {
+              throw new AggregateError([stepError, cleanupError], `restoring ${target} failed and its copy ${restored} could not be removed`);
+            }
             throw stepError;
           }
         } else {

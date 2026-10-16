@@ -131,8 +131,11 @@ function jsonOf(value: unknown): string {
   try {
     json = JSON.stringify(value) as string | undefined;
   } catch (error) {
-    // A BigInt or a cycle: named, never a raw TypeError.
-    throw new PropertyPipelineError(`a directive value has no JSON form (${String(error)})`, { cause: error });
+    // A BigInt, a cycle or a throwing toJSON: named, never a raw error, and
+    // the detail is bounded (the value is sandbox-controlled).
+    let detail: string;
+    try { detail = String(error); } catch { detail = 'an unprintable error'; }
+    throw new PropertyPipelineError(`a directive value has no JSON form (${detail.length > 256 ? `${detail.slice(0, 256)}…` : detail})`, { cause: error });
   }
   if (json === undefined) throw new PropertyPipelineError('a directive value has no JSON form');
   return json;

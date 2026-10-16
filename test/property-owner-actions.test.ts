@@ -1,7 +1,15 @@
-import { chmodSync, existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
-import { createPropertyCampaignService, evictable, EVICTED_IDS_REMEMBERED, evictionVictim, nextAction, rememberEvicted } from '../src/dispatch/property-campaigns.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+// node:fs passes through; a test may make one removal fail (#380).
+const { fsHooks } = vi.hoisted(() => ({ fsHooks: { beforeRm: null as ((path: string) => void) | null } }));
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return { ...actual, rmSync: (...args: Parameters<typeof actual.rmSync>) => { fsHooks.beforeRm?.(String(args[0])); return actual.rmSync(...args); } };
+});
+afterEach(() => { fsHooks.beforeRm = null; });
+import { createPropertyCampaignService, evictable, PropertyOwnerActionError, EVICTED_IDS_REMEMBERED, evictionVictim, nextAction, rememberEvicted } from '../src/dispatch/property-campaigns.js';
 import { forceCoversBlocker, laneIsBusy, snapshotForceAuthorization } from '../src/dispatch/branch-idle.js';
 import { unitCampaign, commit, UNIT_PATH } from './fixtures/property/executor/campaign.js';
 import { ownerService } from './fixtures/property/owner-service.js';
@@ -222,11 +230,13 @@ describe('ordinary owner HTTP property actions (controlled minion; no JSON issua
       const auditDir = join(h.serviceOptions.artifactsRoot, a.id);
       const evictedAudit = () => readdirSync(auditDir).filter((name) => name.startsWith('owner-evicted-'));
       const campaignsBefore = readdirSync(h.serviceOptions.artifactsRoot).sort();
+      // chmod cannot lock a directory for root: these refusals need a non-root user.
+      expect(process.getuid?.(), 'run as a non-root user').not.toBe(0);
       chmodSync(auditDir, 0o500);
-      try {
-        expect(() => service.propose(h.jobId, { campaign: f.reviewed }))
-          .toThrow(new RegExp(`the cache is full and campaign ${a.id} could not be evicted: its audit could not be written in ${auditDir.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')} \\(.*EACCES.*\\); fix that directory, or decide a pending campaign, then propose again`, 'u'));
-      } finally { chmodSync(auditDir, 0o700); }
+      let evictionRefusal: unknown = null;
+      try { service.propose(h.jobId, { campaign: f.reviewed }); } catch (caught) { evictionRefusal = caught; } finally { chmodSync(auditDir, 0o700); }
+      expect((evictionRefusal as Error).message).toMatch(new RegExp(`^the cache is full and campaign ${a.id} could not be evicted: its audit could not be written in ${auditDir.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')} \\(.*EACCES.*\\); fix that directory, or decide a pending campaign, then propose again$`, 'u'));
+      expect((evictionRefusal as Error).cause).toMatchObject({ code: 'EACCES' });
       expect(evictedAudit()).toEqual([]);
       // ...and the refused proposal left no record of its own.
       expect(readdirSync(h.serviceOptions.artifactsRoot).sort()).toEqual(campaignsBefore);
@@ -238,8 +248,19 @@ describe('ordinary owner HTTP property actions (controlled minion; no JSON issua
       } finally { chmodSync(h.serviceOptions.artifactsRoot, 0o700); }
       expect(evictedAudit()).toEqual([]);
       expect(service.read(h.jobId, a.id).state).toBe('retained');
-      expect(service.read(h.jobId, a.id).state).toBe('retained');
       expect(service.read(h.jobId, b.id).state).toBe('proposed');
+      // A withdrawal that fails itself fails loud: the original error and the
+      // withdrawal's, and the record to remove by hand.
+      fsHooks.beforeRm = (path) => { if (path.includes('owner-evicted-')) throw Object.assign(new Error('record busy'), { code: 'EBUSY' }); };
+      chmodSync(h.serviceOptions.artifactsRoot, 0o500);
+      let cleanupRefusal: unknown = null;
+      try { service.propose(h.jobId, { campaign: f.reviewed }); } catch (caught) { cleanupRefusal = caught; } finally { chmodSync(h.serviceOptions.artifactsRoot, 0o700); fsHooks.beforeRm = null; }
+      expect(cleanupRefusal).toBeInstanceOf(PropertyOwnerActionError);
+      expect((cleanupRefusal as Error).message).toMatch(new RegExp(`^proposal campaign-[0-9a-f-]+ could not be recorded \\(.*EACCES.*\\) and its cleanup failed: Error: record busy — remove .*owner-evicted-[0-9a-f-]+\\.json by hand; campaign ${a.id} was not evicted$`, 'u'));
+      expect(((cleanupRefusal as Error).cause as AggregateError).errors.map((cause) => (cause as NodeJS.ErrnoException).code)).toEqual(['EACCES', 'EBUSY']);
+      expect(evictedAudit()).toHaveLength(1);
+      rmSync(join(auditDir, evictedAudit()[0]!));
+      expect(service.read(h.jobId, a.id).state).toBe('retained');
       // Once the audit can be written, the same proposal evicts A by name.
       const c = service.propose(h.jobId, { campaign: f.reviewed });
       expect(evictedAudit()).toHaveLength(1);

@@ -208,8 +208,17 @@ export function createPropertyCampaignService(options: PropertyCampaignServiceOp
         audit(entry);
       } catch (error) {
         // The new proposal was never admitted: its victim was never evicted,
-        // so the eviction record is withdrawn with it.
-        if (evictionAudit !== null) rmSync(evictionAudit, { force: true });
+        // so the eviction record is withdrawn with it, and whatever the
+        // failed audit left under the proposal's fresh directory goes too. A
+        // cleanup that fails itself fails loud, carrying the original error.
+        const cleanup: unknown[] = [];
+        if (evictionAudit !== null) {
+          try { rmSync(evictionAudit, { force: true }); } catch (withdrawError) { cleanup.push(withdrawError); }
+        }
+        try { rmSync(entry.artifactsDir, { recursive: true, force: true }); } catch (removeError) { cleanup.push(removeError); }
+        if (cleanup.length > 0) {
+          throw new PropertyOwnerActionError(`proposal ${id} could not be recorded (${String(error)}) and its cleanup failed: ${cleanup.map(String).join('; ')}${evictionAudit === null ? '' : ` — remove ${evictionAudit} by hand; campaign ${victim!.id} was not evicted`}`, { cause: new AggregateError([error, ...cleanup], 'proposal record and cleanup failed') });
+        }
         throw error;
       }
       if (victim !== undefined) {

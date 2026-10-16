@@ -7,6 +7,7 @@ import type { PropertyExecutionPlan } from '../../../../src/property/types.js';
 /** Fake runners are OS-mechanism unit controls, never real Vitest proof. */
 export function scenarioRepo(script: string, options: { readonly reportersModule?: boolean | 'directory' | 'symlink' | 'linked-dist' } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'property-unit-')));
+  const extra: string[] = [];
   const git = (args: string[]) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: 'pipe' }).trim();
   mkdirSync(join(root, 'node_modules', 'vitest'), { recursive: true });
   mkdirSync(join(root, 'node_modules', '.bin'), { recursive: true });
@@ -18,6 +19,7 @@ export function scenarioRepo(script: string, options: { readonly reportersModule
     // A regular reporters.js, but reached through a dist directory linked
     // outside the repository.
     const outside = realpathSync(mkdtempSync(join(tmpdir(), 'property-unit-outside-dist-')));
+    extra.push(outside);
     writeFileSync(join(outside, 'reporters.js'), 'export class JsonReporter {}\n');
     symlinkSync(outside, join(root, 'node_modules', 'vitest', 'dist'));
   } else if (options.reportersModule !== false) {
@@ -41,7 +43,7 @@ export function scenarioRepo(script: string, options: { readonly reportersModule
     envAllowlist: ['PATH', 'CI', 'TZ'], executable: true, refusalReason: null,
     budget: { maxIterations: 20, maxShrinkSteps: 100, runTimeoutMs: 10_000, maxOutputBytes: 32_768 },
   };
-  return { root, git, plan, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+  return { root, git, plan, cleanup: () => { for (const dir of [root, ...extra]) rmSync(dir, { recursive: true, force: true }); } };
 }
 /** A fake runner reports through the host's authenticated channel the way
  * the host config's reporter does (#378): the per-run nonce arrives on fd 3

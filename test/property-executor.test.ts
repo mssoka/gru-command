@@ -4,7 +4,7 @@ import fs, { existsSync, linkSync, mkdirSync, readFileSync, symlinkSync, writeFi
 import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createBoundedPropertyCapture, createPropertyExecutor, PreExecutionRejectionError, createReceiptRetention, framedRunnerReport, isSealedExecutionReceipt, noReportReasons, NONCE_READ_BUDGET_MS, nonceReaderSource, ReceiptRetentionError, resolveSandboxBackend, validatePlanAgainstHostApproval } from '../src/property/executor.js';
+import { createBoundedPropertyCapture, createPropertyExecutor, PreExecutionRejectionError, createReceiptRetention, framedRunnerReport, isSealedExecutionReceipt, noReportReasons, NONCE_READ_BUDGET_MS, nonceReaderSource, propertyWorkspaceIdentity, ReceiptRetentionError, resolveSandboxBackend, validatePlanAgainstHostApproval } from '../src/property/executor.js';
 import { VITEST_FAST_CHECK_ADAPTER as adapter } from '../src/property/adapters/vitest-fast-check.js';
 import { applyOverlayFiles, applyOverlayFilesAllOrNothing } from '../src/property/overlay.js';
 import { buildSourceIdentity } from '../src/property/receipts.js';
@@ -122,7 +122,9 @@ describe('host property executor (positive sandbox controls on macOS; other host
     // budget here; the shipped config waits NONCE_READ_BUDGET_MS).
     expect(run(Array.from({ length: 100 }, () => errno('EAGAIN')), null, 50)).toMatchObject({ result: { code: 'EAGAIN' }, closed: [3], reads: 6 });
     expect(NONCE_READ_BUDGET_MS).toBe(5000);
-    expect(() => nonceReaderSource(5)).toThrow(/budget must be an integer of at least 10 ms/u);
+    // A whole number of 10 ms steps, bounded: a startup never waits without end.
+    for (const bad of [5, 15, 60_010, Number.NaN, 2 ** 53]) expect(() => nonceReaderSource(bad), String(bad)).toThrow(/^nonce reader budget must be a multiple of 10 ms from 10 to 60000, got /u);
+    for (const good of [10, 50, 60_000]) expect(() => nonceReaderSource(good), String(good)).not.toThrow();
   });
   it('refuses an invalid host receipt retention bound and reports the bound it enforces (#377)', () => {
     for (const bad of [0, -1, 1.5, 256 * 1024 * 1024 + 1]) expect(() => createPropertyExecutor({ maxRetainedOutputBytes: bad })).toThrow(/receipt retention bound/);
@@ -177,9 +179,18 @@ describe('host property executor (positive sandbox controls on macOS; other host
     const f = scenarioRepo(PASS_RUNNER, { reportersModule: 'linked-dist' }); fixtures.push(f);
     const executor = createPropertyExecutor();
     const input = { plan: f.plan, repoRoot: f.root, packageDir: f.root };
-    const outcome = await Promise.resolve().then(() => executor.executePlan({ ...input, adapter, approval: executor.approvePlan(input) })).then(() => null, (caught: unknown) => caught);
-    if (process.platform !== 'darwin') return;
-    expect(String(outcome)).toMatch(/external\/absolute symlink refused: node_modules\/vitest\/dist/u);
+    // The workspace reading the copy is made from refuses the link on every platform...
+    expect(() => propertyWorkspaceIdentity(f.root)).toThrow(/^external\/absolute symlink refused: node_modules\/vitest\/dist$/u);
+    const outcome = await Promise.resolve().then(() => executor.executePlan({ ...input, adapter, approval: executor.approvePlan(input) }))
+      .then((result) => ({ result, caught: null }), (caught: unknown) => ({ result: null, caught }));
+    if (process.platform === 'darwin') {
+      // ...and a real run refuses before any copy exists.
+      expect(outcome.result).toBeNull();
+      expect(String(outcome.caught)).toMatch(/external\/absolute symlink refused: node_modules\/vitest\/dist/u);
+    } else {
+      // Without the sandbox, nothing runs at all.
+      expect(outcome.result).toMatchObject({ executed: false, refusal: { kind: 'not-run' } });
+    }
   });
   it('refuses a raw receipt without its framed report field, by name; null is no report (#378)', () => {
     const f = fixture(PASS_RUNNER);

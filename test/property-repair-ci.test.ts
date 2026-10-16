@@ -246,7 +246,18 @@ describe('property modes, host approval, repair and CI (fake runner unit control
     expect(() => renderPropertyEvidenceLine(undefined)).toThrow(/no JSON form/u);
     // A value JSON cannot serialize at all is refused by name, never a raw TypeError.
     const cyclic: Record<string, unknown> = {}; cyclic['self'] = cyclic;
-    for (const value of [{ big: 10n }, cyclic]) expect(() => renderPropertyEvidenceLine(value)).toThrow(/^a directive value has no JSON form \(TypeError: /u);
+    const refusal = (value: unknown): Error => { try { renderPropertyEvidenceLine(value); } catch (caught) { return caught as Error; } throw new Error('expected a refusal'); };
+    for (const value of [{ big: 10n }, cyclic]) {
+      const error = refusal(value);
+      expect(error.message).toMatch(/^a directive value has no JSON form \(TypeError: /u);
+      // The original error travels as the cause.
+      expect(error.cause).toBeInstanceOf(TypeError);
+    }
+    // A thrown value that cannot even be printed is still named, and a long detail is bounded.
+    const unprintable = { toString() { throw new Error('no text'); } };
+    expect(refusal({ toJSON() { throw unprintable; } })).toMatchObject({ message: 'a directive value has no JSON form (an unprintable error)', cause: unprintable });
+    const long = refusal({ toJSON() { throw new Error('y'.repeat(1000)); } }).message;
+    expect(long).toBe(`a directive value has no JSON form (${`Error: ${'y'.repeat(1000)}`.slice(0, 256)}…)`);
   });
 
   it('the reviewer prompt\'s evidence wrapper renders exactly the bounded line, names absence, and refuses unissued results (#379)', async () => {
