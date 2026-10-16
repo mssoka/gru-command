@@ -1282,12 +1282,12 @@ test('settleTransitions finishes running transitions and names every culprit it 
     /^a CSS transition could not be finished \(div#stalled\.box\.on color: InvalidStateError: [^;]+\); CSS transitions kept restarting after 3 settle passes: div#settles\.box\.on color$/u,
   );
 
-  // The pass bound itself must be a positive integer.
-  // Both ends of the bound are accepted (on a fresh, settled page).
+  // Both ends of the pass bound are accepted (on a fresh page)...
   await start();
   await settleTransitions(page, 1);
   await settleTransitions(page, 1000);
   expect(await live()).toBe(0);
+  // ...and the bound itself must be an integer from 1 to 1000.
   for (const passes of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 1001]) {
     await expect(settleTransitions(page, passes), String(passes)).rejects.toThrow(/settleTransitions: passes must be an integer from 1 to 1000/u);
   }

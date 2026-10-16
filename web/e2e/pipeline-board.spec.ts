@@ -740,12 +740,19 @@ test.describe('compact owner-first board — synthetic geometry proof', () => {
       // An unusable device pixel ratio fails loud — zero, negative, NaN or
       // infinite (which would silently zero the sliver) — for a missing
       // selector too.
+      const setRatio = (ratio: number) => page.evaluate((value) => { Object.defineProperty(window, 'devicePixelRatio', { value, configurable: true }); }, ratio);
       for (const ratio of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
-        await page.evaluate((value) => { Object.defineProperty(window, 'devicePixelRatio', { value, configurable: true }); }, ratio);
+        await setRatio(ratio);
         for (const id of ['#bottom-in', '#missing']) {
-          await expect(hitTarget(page, id), `${String(ratio)} ${id}`).rejects.toThrow(`hitTarget: unusable devicePixelRatio ${String(ratio)}`);
+          // The exact message (Playwright wraps it in its own prefix and
+          // stack): `0` must never pass for `0.5`.
+          await expect(hitTarget(page, id), `${String(ratio)} ${id}`).rejects.toThrow(new RegExp(`Error: hitTarget: unusable devicePixelRatio ${String(ratio)}$`, 'mu'));
         }
       }
+      // A positive fractional ratio is usable (and restores the page).
+      await setRatio(1.5);
+      expect(await hitTarget(page, '#missing')).toEqual({ found: false, inViewport: false, hit: false });
+      await expect(hitTarget(page, '#bottom-in')).resolves.toMatchObject({ found: true, hit: true });
     } finally {
       await context.close();
     }
