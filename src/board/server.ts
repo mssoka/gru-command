@@ -842,10 +842,11 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             // that is recorded (best effort: an append or log failure never
             // replaces the answer) and then said — never hidden.
             const acted = rearm;
+            // True when nothing is left unrecorded: no action to record, or recorded.
             const recordActed = (outcome: 'refused' | 'removed' | 'failed', reason: string): boolean => {
               if (acted === 'not_applicable') return true;
               try {
-                ledger.appendCustomEvent({ kind: 'notification.disposition-refused-after-rearm', payload: { id, rearm: acted, outcome, reason: reason.slice(0, 500) } });
+                ledger.appendCustomEvent({ kind: 'notification.disposition-refused-after-rearm', payload: { id, rearm: acted, outcome, reason: [...reason.slice(0, 1001)].slice(0, 500).join('') } });
                 return true;
               } catch (eventError) {
                 try { log('error', 'refused-after-rearm event not recorded', { id, rearm: acted, error: String(eventError) }); } catch { /* the answer still goes out */ }
@@ -866,8 +867,12 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
               // the consult), that is said and recorded, never hidden: the
               // alert stays open for a person to retriage or resolve.
               if (!(error instanceof MachineDispositionRefusedError)) {
-                recordActed('failed', String(error));
-                throw error;
+                // The supervisor already acted: the caller is told so, typed —
+                // never a bare failure that hides the re-arm or closure.
+                if (acted === 'not_applicable') throw error;
+                const recorded = recordActed('failed', String(error));
+                json(res, 500, { error: 'disposition_failed', code: 'disposition_failed', rearm, detail: `${String(error)}${actedNote(recorded)}` });
+                return;
               }
               const recorded = recordActed('refused', error.refusal);
               json(res, 409, { error: 'disposition_refused', code: 'disposition_refused', rearm, detail: `${error.refusal}${actedNote(recorded)}` });

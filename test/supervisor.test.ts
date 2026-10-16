@@ -6128,6 +6128,11 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       expect(rig.api.hasSupervisionStopSuperseded('legacy')).toBe(true);
       rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', jobId: 'fenced-job', payload: { notification_id: 'job-only' } });
       expect(rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: 'job-only' } })).toBe(true);
+      rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: '', jobId: 'fenced-job', payload: { notification_id: 'blank-agent' } });
+      expect(rig.api.hasSupervisionStopSuperseded('blank-agent')).toBe(false);
+      // The incomplete row is passed over; the first COMPLETE closure binds.
+      expect(rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: 'blank-agent' } })).toBe(true);
+      expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: 'b', jobId: 'fenced-job', payload: { notification_id: 'blank-agent' } })).toThrow(SupervisionStopClosureConflictError);
       // The FIRST complete closure of an alert is the binding one.
       rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: 'first', jobId: 'fenced-job', payload: { notification_id: 'twice' } });
       rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: 'second', jobId: 'fenced-job', payload: { notification_id: 'twice' } });

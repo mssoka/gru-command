@@ -1843,6 +1843,16 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
         .toMatchObject({ status: 404, body: { error: 'not_found', rearm: 'accepted', detail: expect.stringMatching(/not found — the supervisor had already acted on it \(rearm: accepted\)/u) } });
       expect(actedEvents()).toContainEqual({ id: removed.id, rearm: 'accepted', outcome: 'removed', reason: `notification "${removed.id}" not found` });
       changeDuringConsult = null;
+      // A disposal failing any other way after the supervisor acted is a typed
+      // 500 that says so, and is recorded.
+      const failing = harness.notifications.post({ kind: 'supervision.breaker', routing: 'action-required', severity: 'error', title: 'Lane stopped once more' });
+      consultOutcome = { ok: true };
+      const disposal = vi.spyOn(harness.api, 'disposeMachineNotification').mockImplementation(() => { throw new Error('ledger locked'); });
+      try {
+        expect(await postJson(harness.port, `/api/notifications/${encodeURIComponent(failing.id)}/disposition`, 'board-test-token', { detail: 'disposal fails' }))
+          .toMatchObject({ status: 500, body: { error: 'disposition_failed', code: 'disposition_failed', rearm: 'accepted', detail: expect.stringMatching(/^Error: ledger locked — the supervisor had already acted on it \(rearm: accepted\); the alert stays open/u) } });
+      } finally { disposal.mockRestore(); }
+      expect(actedEvents()).toContainEqual({ id: failing.id, rearm: 'accepted', outcome: 'failed', reason: 'Error: ledger locked' });
       // A resolved action-required row stays an idempotent retry.
       const note = harness.notifications.post({ kind: 'job.note', routing: 'action-required', severity: 'info', title: 'handled' });
       for (const attempt of ['first', 'retry']) {

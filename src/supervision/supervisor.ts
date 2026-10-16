@@ -3553,17 +3553,17 @@ export class Supervisor {
       // matters; a kind that cannot be read is treated as a breaker (fail
       // closed). No alert at all has no stop whose answer could be lost.
       let breaker = true;
-      let kindFailure = '';
+      let kindFailure: string | null = null;
       try {
         breaker = this.ledger.getNotification(notificationId)?.kind === 'supervision.breaker';
       } catch (kindError) {
-        kindFailure = String(kindError);
+        kindFailure = String(kindError) || 'an error with no text';
         this.log('error', 'notification kind lookup failed after a failed closure lookup — treating it as a breaker alert', { notification_id: notificationId, error: kindFailure });
       }
       if (onFailure === 'refuse' && breaker) {
-        return { ok: false, reason: `superseded closure lookup failed — retry the disposition: ${String(error)}${kindFailure === '' ? '' : `; its alert kind could not be read either: ${kindFailure}`}` };
+        return { ok: false, reason: `superseded closure lookup failed — retry the disposition: ${String(error)}${kindFailure === null ? '' : `; its alert kind could not be read either: ${kindFailure}`}` };
       }
-      this.log(breaker ? 'error' : 'warn', 'superseded closure lookup failed — reporting a pure record', { notification_id: notificationId, breaker, error: String(error), ...(kindFailure === '' ? {} : { kind_failure: kindFailure }) });
+      this.log(breaker ? 'error' : 'warn', 'superseded closure lookup failed — reporting a pure record', { notification_id: notificationId, breaker, error: String(error), ...(kindFailure === null ? {} : { kind_failure: kindFailure }) });
       return { ok: true, rearmed: false };
     }
   }

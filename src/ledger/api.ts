@@ -3336,11 +3336,11 @@ export class LedgerApi {
   }
 
   /** The FIRST recorded closure of this alert's stop — the binding one.
-   * Every closure this ledger writes names its agent and job; a row naming
-   * neither (never written here) is no closure, for reads and writes alike. */
+   * Every closure this ledger writes names its agent and job; a row missing
+   * either (never written here) is no closure, for reads and writes alike. */
   private supervisionStopClosure(notificationId: string): { readonly agentId: string; readonly jobId: string } | undefined {
     return this.db.prepare(
-      "SELECT agent_id AS agentId, job_id AS jobId FROM events WHERE kind = 'supervision.stop-superseded' AND json_extract(payload, '$.notification_id') = ? AND agent_id IS NOT NULL AND job_id IS NOT NULL ORDER BY seq ASC LIMIT 1",
+      "SELECT agent_id AS agentId, job_id AS jobId FROM events WHERE kind = 'supervision.stop-superseded' AND json_extract(payload, '$.notification_id') = ? AND agent_id IS NOT NULL AND agent_id <> '' AND job_id IS NOT NULL AND job_id <> '' ORDER BY seq ASC LIMIT 1",
     ).get(notificationId) as { agentId: string; jobId: string } | undefined;
   }
 
