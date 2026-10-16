@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { rebriefFreshMinion, recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
+import { DirectiveRoutingContractError, rebriefFreshMinion, recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { LedgerApi, type ObligationRecord } from '../src/ledger/api.js';
 import { EventBus } from '../src/events/bus.js';
@@ -523,6 +523,23 @@ describe('eviction-safe fix directives (phase 3)', () => {
         db.close();
       }
     }
+  });
+
+  it('refuses a native directive turn without onPrepared before any spawn or prompt (#362)', async () => {
+    const { registry, controller, calls, prompted } = stubRegistry(null);
+    // Every ledger read throws: the refusal precedes any effect at all.
+    const untouched = () => { throw new Error('the ledger must not be touched'); };
+    const ledger = { getAgent: untouched, listAgents: untouched, listImplementerMinions: untouched, registerAgent: untouched, getJob: untouched };
+    const refusal: unknown = await routeFixDirectiveToMinion({
+      registry: registry as never, ledger: ledger as never, worktrees: { listWorktrees: () => [] } as unknown as WorktreePort,
+      jobId: 'job-no-prepare', directive: 'repair', signal: controller.signal,
+      directiveTurn: { identity: {} as never, beforeAdmission: () => {}, onAdmitted: () => {} },
+    }).then(() => null, (error: unknown) => error);
+    expect(refusal, 'the route refused').not.toBeNull();
+    expect(refusal).toBeInstanceOf(DirectiveRoutingContractError);
+    expect((refusal as Error).message).toMatch(/^job "job-no-prepare": a native directive turn needs onPrepared/u);
+    expect(calls).toEqual([]);
+    expect(prompted).toEqual([]);
   });
 
   it('falls through a typed eviction rejection and resumes the FAILING logical session', async () => {

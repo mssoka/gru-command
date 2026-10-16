@@ -237,7 +237,7 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   including those older than the recent feed; it wakes Gru once and
   refuses human Ack. Rows bound to a terminal merged/done/binned lane are
   CLOSED RECEIPTS: they render under FEED, never as live queue entries,
-  and the live unacked chip does not count them), and FEED (FYI rows
+  and the strip's live ALERTS count does not count them), and FEED (FYI rows
   plus closed receipts). Route assignment is enforced server-side: only
   registered owner-reserved kinds can reach FOR YOU; a `needs-owner`
   request from any unregistered or machine kind is routed to Gru
