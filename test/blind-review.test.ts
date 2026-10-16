@@ -180,7 +180,7 @@ describe('real persisted transcripts (#360 R5-V1 round 1)', () => {
   // wrote it.
   const fixtures = join(import.meta.dirname, 'fixtures', 'blind-transcripts');
 
-  it('reads the real record shapes: each read result is paired with the file its call named', () => {
+  it('reads the real record shapes: each read result is paired with the file its call named #contract:blind-transcript-reader:pi #contract:blind-transcript-reader:claude-code', () => {
     expect(readSessionToolResults(join(fixtures, 'claude-code-read.jsonl'))).toEqual([
       { index: 1, toolName: null, text: '1\tplain text with nothing that looks like history', readPath: '/lanes/job-1/docs/issues/9.md' },
     ]);
@@ -189,7 +189,7 @@ describe('real persisted transcripts (#360 R5-V1 round 1)', () => {
     ]);
   });
 
-  it('through the ledger, an absolute read inside the job\'s recorded lane — either spelling of it — invalidates coverage', () => {
+  it('through the ledger, an absolute read inside the job\'s recorded lane — either spelling of it — invalidates coverage #contract:blind-read-invalidates:pi #contract:blind-read-invalidates:claude-code', () => {
     for (const [jobId, file] of [['job-claude-lane', 'claude-code-read.jsonl'], ['job-pi-lane', 'pi-read.jsonl']] as const) {
       const own = blindLedger();
       own.admit(jobId);

@@ -53,6 +53,13 @@ const BLIND_PACKAGE = { baseSha: BASE, targetSha: TARGET, files: [{ path: 'src/f
 const sessionToolResult = (text: string): string =>
   `${JSON.stringify({ type: 'message', message: { role: 'toolResult', toolName: 'bash', content: text } })}\n`;
 
+/** The same tool result as a Claude Code session persists it: the assistant's
+ * Bash tool_use, then the user record carrying its tool_result (#374). */
+const claudeToolResult = (text: string): string => [
+  { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_fixture_resume', name: 'Bash', input: { command: 'grep -rn assessment docs' } }] } },
+  { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_fixture_resume', content: text }] } },
+].map((record) => `${JSON.stringify(record)}\n`).join('');
+
 const cleanupDirs: string[] = [];
 let sharedRepo: FixtureRepo | null = null;
 
@@ -598,10 +605,10 @@ describe('guarded claim — blind coverage scan at the resume settle seam (issue
 
   /** The resumed continuation handle whose turn appends the transcript it
    * "read" — the real ordering (a scan before delivery reads a clean file). */
-  function resumeTurnThatReads(h: ClaimHarness, sessionFile: string, text: string): void {
+  function resumeTurnThatReads(h: ClaimHarness, sessionFile: string, text: string, record: (text: string) => string = sessionToolResult): void {
     h.registry.spawnImpl = (resumeFile) => {
       const handle = new FakeHandle('minion', `agent-blind-${h.registry.handles.size + 1}`, resumeFile);
-      handle.promptEffect = () => appendFileSync(sessionFile, sessionToolResult(text));
+      handle.promptEffect = () => appendFileSync(sessionFile, record(text));
       h.registry.handles.set(handle.id, handle);
       return handle;
     };
@@ -642,7 +649,7 @@ describe('guarded claim — blind coverage scan at the resume settle seam (issue
       .toMatchObject({ stage: 'spawn', error: expect.stringMatching(/its attested blind input package was not kept/u) });
   });
 
-  it('a prohibited read during the resumed TURN invalidates blind coverage instead of leaving it qualifying', async () => {
+  it('a prohibited read during the resumed TURN invalidates blind coverage instead of leaving it qualifying #contract:blind-resumed-turn-scan:pi', async () => {
     const h = new ClaimHarness();
     const sessionDir = mkdtempSync(join(tmpdir(), 'pr-blind-session-prohibited-'));
     cleanupDirs.push(sessionDir);
@@ -659,6 +666,23 @@ describe('guarded claim — blind coverage scan at the resume settle seam (issue
     // The prohibited read happened during THIS resumed turn's session: the
     // resume settle seam must scan it and invalidate the coverage.
     expect(h.ledger.latestJobEvent(jobId, BLIND_ACCESS_EVENT)).not.toBeNull();
+    expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({
+      state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
+    });
+  });
+
+  it('a prohibited read in a resumed Claude Code turn\'s own record shape invalidates blind coverage too #contract:blind-resumed-turn-scan:claude-code', async () => {
+    const h = new ClaimHarness();
+    const sessionDir = mkdtempSync(join(tmpdir(), 'pr-blind-session-claude-'));
+    cleanupDirs.push(sessionDir);
+    const sessionFile = join(sessionDir, 'reviewer.jsonl');
+    const jobId = 'j-blind-claude';
+    const waitId = await h.recoveredMinionWait({ sessionFile, jobId });
+    h.admitBlind(jobId, fixtureRepo().path);
+    resumeTurnThatReads(h, sessionFile, PROHIBITED, claudeToolResult);
+    expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({ state: 'qualifying', qualifying: true, accessObserved: false });
+    const result = await claimProviderRecoveryContinuation(h.deps(), waitId, 'silas');
+    expect(result).toMatchObject({ outcome: 'continued', path: 'resumed' });
     expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({
       state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
     });

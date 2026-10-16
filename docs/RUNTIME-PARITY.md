@@ -54,6 +54,9 @@ that proves it on each adapter.
 | `cessation-unproven-holds-permit` | Without that proof, evidence stays `unknown` and the resident permit is held as debt | `test/runtime-positive-cessation-ownership.test.ts` | `test/runtime-claude-cessation-ownership.test.ts` |
 | `scheduled-verification` | The #315 guard refuses a scheduled-verification producer before it runs | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts` |
 | `spawn-cwd` | A session is rooted at the explicit project cwd, never the workspace root | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts` |
+| `blind-transcript-reader` | The blind-access reader pairs each read result with the file its call named, read from each runtime's real persisted record shape | `test/blind-review.test.ts` | `test/blind-review.test.ts` |
+| `blind-read-invalidates` | Through the ledger, an absolute read inside the job's recorded lane invalidates blind coverage | `test/blind-review.test.ts` | `test/blind-review.test.ts` |
+| `blind-resumed-turn-scan` | A prohibited read during a provider-recovery resumed turn invalidates blind coverage | `test/provider-recovery-resume.test.ts` | `test/provider-recovery-resume.test.ts` |
 | `stale-spawn-quarantine` | A quarantined handle (GH-280) loses lookup eligibility until disposal. This is proven in the registry, for any adapter | `test/runtime-resident-registry.test.ts` | `test/runtime-resident-registry.test.ts` |
 <!-- parity-matrix:end -->
 
@@ -102,8 +105,10 @@ runtimes:
   `runtime-spawn-registration.test.ts`);
 - disposal aggregation (`runtime-disposal-aggregation.test.ts`).
 
-Blind-review observation reads each runtime's own transcript format. Its parity
-rows land with the reader's real-format fixtures (#360, PR #418).
+Blind-review observation reads each runtime's own transcript format. The
+`blind-transcript-reader` and `blind-read-invalidates` rows run on fixtures
+copied from real Claude Code and pi sessions (#360). `blind-resumed-turn-scan`
+writes each runtime's own record shape during a resumed turn.
 
 ## Differences by design
 

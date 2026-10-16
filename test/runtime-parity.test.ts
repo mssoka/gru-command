@@ -32,14 +32,20 @@ const unquote = (cell: string): string => cell.replace(/^`|`$/gu, '');
 
 interface Tag { readonly id: string; readonly runtime: string; readonly file: string; readonly title: string }
 
+/** The title of the test a source line registers, or undefined. A
+ * backslash-escaped quote stays inside the title. (Spelled `(?:it)` so the
+ * static suite pin never counts this line as a test.) */
+function titleOf(line: string): string | undefined {
+  return /^\s*(?:it)(?:\.skipIf\([^)]*\))?\(\s*(['"`])((?:\\.|(?!\1)[^\\])*)\1/u.exec(line)?.[2];
+}
+
 /** Every contract tag in a test title, across the test tree. */
 function tags(): readonly Tag[] {
   const out: Tag[] = [];
   for (const name of readdirSync(join(root, 'test')).filter((entry) => entry.endsWith('.test.ts')).sort()) {
     const file = `test/${name}`;
     for (const line of readFileSync(join(root, file), 'utf8').split('\n')) {
-      // (Spelled `(?:it)` so the static suite pin never counts this line as a test.)
-      const title = /^\s*(?:it)(?:\.skipIf\([^)]*\))?\(\s*(['"`])(.*?)\1/u.exec(line)?.[2];
+      const title = titleOf(line);
       if (title === undefined) continue;
       for (const match of title.matchAll(/#contract:([a-z0-9-]+):([a-z-]+)/gu)) {
         out.push({ id: match[1]!, runtime: match[2]!, file, title });
@@ -106,6 +112,12 @@ describe('runtime parity guard (#374)', () => {
     expect([...placed.keys()].filter((key) => !actual.includes(key)), 'placements of blocks that do not exist').toEqual([]);
     const kinds = [...placed.entries()].filter(([, kind]) => kind !== 'umbrella' && kind !== 'adapter-internal' && !ids.has(kind));
     expect(kinds.map(([key, kind]) => `${key}: ${kind}`), 'placements naming no listed contract').toEqual([]);
+  });
+
+  it('a title holding an escaped quote is read whole, so its tags count', () => {
+    // Built in parts so neither the suite pin nor this guard reads it as a test.
+    const line = `  ${'it'}('the job\\'s lane, read whole #contract:spawn-cwd:pi', () => {`;
+    expect(titleOf(line)).toBe("the job\\'s lane, read whole #contract:spawn-cwd:pi");
   });
 
   it('the check names a contract proven on one runtime only, and a cell that names another file', () => {
