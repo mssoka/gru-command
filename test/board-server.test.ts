@@ -1776,17 +1776,22 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
     }
   });
 
-  it('refuses a disposition the ledger would refuse BEFORE the supervisor acts on it (#385)', async () => {
+  it('refuses a disposition the ledger would refuse BEFORE the supervisor acts on it, with a typed 409 (#385)', async () => {
     let consulted = 0;
     const harness = await boot('board-test-token', { onNotificationDisposition: () => { consulted += 1; return { ok: true }; } });
     try {
-      // A self-closing kind refuses a machine disposition.
-      const alert = harness.notifications.post({ kind: 'lessons.dream-failed', routing: 'action-required', severity: 'error', title: 'dream failed' });
-      expect(harness.api.machineDispositionRefusal(alert.id)).toMatch(/closes itself on a completed dream pass/u);
-      const response = await postJson(harness.port, `/api/notifications/${encodeURIComponent(alert.id)}/disposition`, 'board-test-token', { detail: 'tried anyway' });
-      expect(response.status).toBeGreaterThanOrEqual(400);
+      // An informational row takes no machine disposition: refused before
+      // the supervisor is consulted, so no stop can close beside it.
+      const fyi = harness.notifications.post({ kind: 'job.note', routing: 'fyi', severity: 'info', title: 'for your information' });
+      expect(harness.api.machineDispositionRefusal(fyi.id)).toMatch(/only action-required notifications accept a machine disposition/u);
+      const response = await postJson(harness.port, `/api/notifications/${encodeURIComponent(fyi.id)}/disposition`, 'board-test-token', { detail: 'tried anyway' });
+      expect(response).toMatchObject({ status: 409, body: { error: 'disposition_refused', code: 'disposition_refused', detail: expect.stringMatching(/only action-required notifications/u) } });
       expect(consulted).toBe(0);
-      expect(harness.api.getNotification(alert.id)).toMatchObject({ resolvedAt: null });
+      expect(harness.api.getNotification(fyi.id)).toMatchObject({ resolvedAt: null });
+      // The ledger helper applies the self-closing rule too (the route answers
+      // that case earlier, as producer_resolved).
+      const dream = harness.notifications.post({ kind: 'lessons.dream-failed', routing: 'action-required', severity: 'error', title: 'dream failed' });
+      expect(harness.api.machineDispositionRefusal(dream.id)).toMatch(/closes itself on a completed dream pass/u);
       expect(harness.api.machineDispositionRefusal('no-such-alert')).toBeNull();
     } finally {
       await harness.close();

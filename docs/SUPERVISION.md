@@ -135,13 +135,16 @@ replays, so the disposition **closes the stop** instead of re-arming it:
   once per alert, atomically.
 - The response says `rearm: superseded`; a retried disposition says so again,
   answered from that durable event (restarts and a disabled supervisor
-  included). If that lookup fails, a retry on a breaker alert refuses so it
-  can ask again; any other alert stays a pure record.
+  included). If that lookup fails, a retry on a breaker alert — or on an
+  alert whose kind cannot be read either — refuses so it can ask again; an
+  alert known not to be a breaker stays a pure record, and a disabled
+  supervisor never refuses.
 - The lane no longer reads as stopped: its supervision record is retired
   in-process and durably alike, and the fresh re-brief or directive is
   supervised as a new watching record.
-- A disposition the ledger would refuse (a self-closing alert kind, a
-  non-machine routing) is refused before the supervisor acts on it.
+- A disposition the ledger would refuse is refused before the supervisor
+  acts on it: a self-closing alert kind as `409 producer_resolved`, a
+  non-machine routing as `409 disposition_refused`.
 - Any other fence (an active park, a hold, a live producer, a live handle or
   restart, an unreadable authority) still refuses with the debt retained.
 

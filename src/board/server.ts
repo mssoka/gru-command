@@ -802,7 +802,10 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
               // supervisor acts on it (#385): never a closed stop beside an
               // alert left open.
               const refusal = ledger.machineDispositionRefusal(id);
-              if (refusal !== null) throw new Error(refusal);
+              if (refusal !== null) {
+                json(res, 409, { error: 'disposition_refused', code: 'disposition_refused', detail: refusal });
+                return;
+              }
               try {
                 const outcome = onNotificationDisposition(id, detail);
                 if (outcome !== undefined && outcome.ok === false) {

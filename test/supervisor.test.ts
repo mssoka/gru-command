@@ -6107,7 +6107,13 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: ' ', jobId: 'fenced-job', payload: { notification_id: 'n' } })).toThrow(/needs a non-blank agentId/u);
       expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: '' } })).toThrow(/needs a non-blank notification_id/u);
       expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: 'n', job_id: 'other-job' } })).toThrow(/names job "other-job" in its payload but "fenced-job" as its job/u);
+      expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: 7 as never } })).toThrow(/needs a non-blank notification_id/u);
       expect(closures(rig)).toEqual([]);
+      // One alert closes ONE stop: a replay naming another agent or job conflicts.
+      expect(rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: 'once' } })).toBe(true);
+      expect(rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: 'once' } })).toBe(false);
+      expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: 'b', jobId: 'fenced-job', payload: { notification_id: 'once' } })).toThrow(/alert "once" already closed the stop of agent "a" on job "fenced-job" — not "b" on "fenced-job"/u);
+      expect(closures(rig)).toHaveLength(1);
     } finally {
       rig.close();
     }

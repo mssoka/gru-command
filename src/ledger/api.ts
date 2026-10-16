@@ -457,7 +457,7 @@ const UNPROVEN_NATIVE_CANDIDATE_SQL = `EXISTS (SELECT 1 FROM pending_directives 
       AND json_extract(s.payload, '$.request_id') = p.request_id AND json_extract(s.payload, '$.delivery_seq') = d.seq
     ORDER BY s.seq DESC LIMIT 1), 0) != 1))`;
 
-/** What closes a producer-resolved alert kind, or null for any other kind. */
+/** Why a machine disposition of this notification is refused, or null. */
 function machineDispositionRefusalOf(current: Pick<NotificationRecord, 'kind' | 'routing'>): string | null {
   if (current.routing !== 'action-required') {
     return 'only action-required notifications accept a machine disposition; owner decisions resolve through the recorded-decision follow-through';
@@ -466,6 +466,7 @@ function machineDispositionRefusalOf(current: Pick<NotificationRecord, 'kind' | 
   return closer === null ? null : `${current.kind} closes itself on ${closer} — fix its cause and leave the alert open; a disposition is refused`;
 }
 
+/** What closes a producer-resolved alert kind, or null for any other kind. */
 export function producerResolvedBy(kind: string): string | null {
   return Object.hasOwn(PRODUCER_RESOLVED_KINDS, kind) ? PRODUCER_RESOLVED_KINDS[kind]! : null;
 }
@@ -3326,13 +3327,23 @@ export class LedgerApi {
     readonly payload: Readonly<Record<string, unknown>> & { readonly notification_id: string };
   }): boolean {
     for (const [name, value] of [['agentId', input.agentId], ['jobId', input.jobId], ['notification_id', input.payload.notification_id]] as const) {
-      if (value.trim() === '') throw new Error(`a superseded-stop closure needs a non-blank ${name}`);
+      if (typeof value !== 'string' || value.trim() === '') throw new Error(`a superseded-stop closure needs a non-blank ${name}`);
     }
     if (input.payload['job_id'] !== undefined && input.payload['job_id'] !== input.jobId) {
       throw new Error(`a superseded-stop closure names job "${String(input.payload['job_id'])}" in its payload but "${input.jobId}" as its job`);
     }
     return this.transaction(() => {
-      if (this.hasSupervisionStopSuperseded(input.payload.notification_id)) return false;
+      const prior = this.db.prepare(
+        "SELECT agent_id AS agentId, job_id AS jobId FROM events WHERE kind = 'supervision.stop-superseded' AND json_extract(payload, '$.notification_id') = ? LIMIT 1",
+      ).get(input.payload.notification_id) as { agentId: string | null; jobId: string | null } | undefined;
+      if (prior !== undefined) {
+        // The same alert closes ONE stop: a replay naming another agent or
+        // job is a conflict, never "already recorded".
+        if (prior.agentId !== input.agentId || prior.jobId !== input.jobId) {
+          throw new Error(`alert "${input.payload.notification_id}" already closed the stop of agent "${String(prior.agentId)}" on job "${String(prior.jobId)}" — not "${input.agentId}" on "${input.jobId}"`);
+        }
+        return false;
+      }
       this.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: input.agentId, jobId: input.jobId, payload: { ...input.payload } });
       return true;
     });
@@ -5269,6 +5280,15 @@ export class LedgerApi {
     });
   }
 
+  /** Why a machine disposition of this notification would be refused, or
+   * null — the SAME rule `disposeMachineNotification` enforces, read first
+   * so a route can refuse before any other effect (#385). The disposal
+   * re-checks it in its own transaction and stays the authority. */
+  machineDispositionRefusal(id: string): string | null {
+    const current = this.getNotification(id);
+    return current === null ? null : machineDispositionRefusalOf(current);
+  }
+
   /** Explicit machine disposition, distinct from the owner's Ack.
    * A successful wake prompt by itself never calls this method.
    *
@@ -5276,14 +5296,6 @@ export class LedgerApi {
    * dispose); it is NOT proof of who held the pen. The audit event carries
    * the credential class that authorised the call and any caller-declared
    * actor so the record never claims provenance it cannot prove (#99). */
-  /** Why a machine disposition of this notification would be refused, or
-   * null — the SAME rule `disposeMachineNotification` enforces, read first
-   * so a route can refuse before any other effect (#385). */
-  machineDispositionRefusal(id: string): string | null {
-    const current = this.getNotification(id);
-    return current === null ? null : machineDispositionRefusalOf(current);
-  }
-
   disposeMachineNotification(
     id: string,
     detail: string,
