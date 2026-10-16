@@ -119,10 +119,13 @@ function assertIssued(receipt: Receipt, lane: WorktreeRecord, ledger: LedgerApi)
 }
 
 const GITDIR_PREFIX = 'gitdir: ';
-const errnoOf = (error: unknown): string => (error as NodeJS.ErrnoException | null)?.code ?? String(error);
+const errnoOf = (error: unknown): string =>
+  (error as NodeJS.ErrnoException | null)?.code ?? (error instanceof Error ? error.message : String(error));
 
 /** The gitdir a checkout's `.git` FILE names, resolved against the checkout
- * but not yet followed — so a dangling target can still be refused by name. */
+ * but not yet followed — so a dangling target can still be refused by name.
+ * Like git, the whole remainder after `gitdir: ` (trailing line ends
+ * stripped) is the path, so a second line is no gitdir file git writes. */
 function linkedGitdir(path: string): string {
   const file = join(path, '.git');
   let isFile: boolean;
@@ -132,40 +135,59 @@ function linkedGitdir(path: string): string {
     throw new Error(`checkout ${path} no longer has its linked gitdir file (${errnoOf(error)})`, { cause: error });
   }
   if (!isFile) throw new Error(`checkout ${path} no longer has its linked gitdir file (.git is not a regular file)`);
-  const text = readWorktreeMetadata(file).trim();
+  let text: string;
+  try {
+    text = readWorktreeMetadata(file).replace(/[\r\n]+$/u, '');
+  } catch (error) {
+    throw new Error(`checkout ${path} has an unreadable .git file (${errnoOf(error)})`, { cause: error });
+  }
   if (!text.startsWith(GITDIR_PREFIX)) throw new Error(`checkout ${path} lost its linked gitdir: its .git file has no "${GITDIR_PREFIX}" line`);
-  if (text.includes('\n')) throw new Error(`checkout ${path} has a .git file of more than one line — not a gitdir file git writes`);
+  if (/[\r\n]/u.test(text)) throw new Error(`checkout ${path} has a .git file of more than one line — not a gitdir file git writes`);
   return resolve(path, text.slice(GITDIR_PREFIX.length));
 }
 
 /** A managed checkout's administration directory, followed — or refused by
- * name when the gitdir its `.git` file names cannot be resolved. */
+ * name when the gitdir its `.git` file names cannot be resolved, or is not a
+ * directory. */
 function adminFor(path: string): string {
   const gitdir = linkedGitdir(path);
+  let admin: string;
   try {
-    return realpathSync(gitdir);
+    admin = realpathSync(gitdir);
   } catch (error) {
     throw new Error(`checkout ${path} names gitdir ${gitdir}, which cannot be resolved (${errnoOf(error)})`, { cause: error });
+  }
+  let isDirectory: boolean;
+  try {
+    isDirectory = statSync(admin).isDirectory();
+  } catch (error) {
+    throw new Error(`checkout ${path} names gitdir ${gitdir}, which cannot be inspected (${errnoOf(error)})`, { cause: error });
+  }
+  if (!isDirectory) throw new Error(`checkout ${path} names gitdir ${gitdir}, which is not a directory`);
+  return admin;
+}
+
+type EntryKind = 'file' | 'directory' | 'other' | 'absent' | { readonly unreadable: string };
+/** What `path` is, followed as git follows it — never a raw error. */
+function entryKind(path: string): EntryKind {
+  try {
+    const stat = statSync(path);
+    return stat.isFile() ? 'file' : stat.isDirectory() ? 'directory' : 'other';
+  } catch (error) {
+    return errnoOf(error) === 'ENOENT' ? 'absent' : { unreadable: errnoOf(error) };
   }
 }
 
 /** Why `dir` is not a full git directory (HEAD file, objects and refs
  * directories, each followed as git follows them), or null when it is. */
 function gitDirectoryProblem(dir: string): string | null {
-  const kind = (name: string): 'file' | 'directory' | 'other' | 'absent' => {
-    try {
-      const stat = statSync(join(dir, name));
-      return stat.isFile() ? 'file' : stat.isDirectory() ? 'directory' : 'other';
-    } catch (error) {
-      if (errnoOf(error) === 'ENOENT') return 'absent';
-      throw error;
-    }
-  };
-  const head = kind('HEAD');
+  const head = entryKind(join(dir, 'HEAD'));
   if (head === 'absent') return 'it has no HEAD file';
+  if (typeof head === 'object') return `its HEAD cannot be inspected (${head.unreadable})`;
   if (head !== 'file') return 'its HEAD is not a regular file';
   for (const name of ['objects', 'refs']) {
-    const found = kind(name);
+    const found = entryKind(join(dir, name));
+    if (typeof found === 'object') return `its ${name} cannot be inspected (${found.unreadable})`;
     if (found !== 'directory') return found === 'absent' ? `it has no ${name} directory` : `its ${name} is not a directory`;
   }
   return null;
@@ -175,46 +197,58 @@ function gitDirectoryProblem(dir: string): string | null {
  * linked worktree's administration names it in `commondir`; a
  * `--separate-git-dir` checkout's gitdir IS the full git directory (no
  * `commondir`). Either way the directory reached must be a full git
- * directory. Anything else — missing, dangling, looping, an empty or
- * dangling `commondir` — fails loud by name, with the path as given and,
+ * directory, and a `commondir` never chains to another administration.
+ * Anything else — missing, dangling, looping, unreadable, an empty, unreadable
+ * or foreign `commondir` — fails loud by name, with the path as given and,
  * when they differ, the path it resolved to. */
 export function commonDirectoryOfGitdir(gitdir: string): string {
-  let canonical: string | null = null;
+  let resolved: string | null = null;
   const refuse = (problem: string): never => {
-    const where = canonical !== null && canonical !== gitdir ? `${gitdir} (resolved to ${canonical})` : gitdir;
+    const where = resolved !== null && resolved !== gitdir ? `${gitdir} (resolved to ${resolved})` : gitdir;
     throw new Error(`repository gitdir ${where} is neither a linked worktree administration nor a git directory: ${problem}`);
   };
   try {
-    canonical = realpathSync(gitdir);
+    resolved = realpathSync(gitdir);
   } catch (error) {
-    refuse(errnoOf(error) === 'ENOENT' ? 'it does not exist' : `it cannot be resolved (${errnoOf(error)})`);
+    return refuse(errnoOf(error) === 'ENOENT' ? 'it does not exist' : `it cannot be resolved (${errnoOf(error)})`);
   }
-  const resolved = canonical!;
-  if (!statSync(resolved).isDirectory()) refuse('it is not a directory');
+  const self = entryKind(resolved);
+  if (typeof self === 'object') return refuse(`it cannot be inspected (${self.unreadable})`);
+  if (self !== 'directory') return refuse('it is not a directory');
   const commondir = join(resolved, 'commondir');
-  if (!absent(commondir)) {
-    const target = readWorktreeMetadata(commondir).trim();
-    if (target === '') refuse('its commondir is empty');
-    let common: string;
-    try {
-      common = realpathSync(resolve(resolved, target));
-    } catch (error) {
-      return refuse(`its commondir names ${target}, which cannot be resolved (${errnoOf(error)})`);
-    }
-    const problem = statSync(common).isDirectory() ? gitDirectoryProblem(common) : 'it is not a directory';
-    if (problem !== null) refuse(`its commondir names ${common}, which is not a git directory: ${problem}`);
-    return common;
+  const pointer = entryKind(commondir);
+  if (pointer === 'absent') {
+    const problem = gitDirectoryProblem(resolved);
+    return problem === null ? resolved : refuse(problem);
   }
-  const problem = gitDirectoryProblem(resolved);
-  if (problem !== null) refuse(problem);
-  return resolved;
+  let target: string;
+  try {
+    target = readWorktreeMetadata(commondir).trim();
+  } catch (error) {
+    return refuse(`its commondir cannot be read (${errnoOf(error)})`);
+  }
+  if (target === '') return refuse('its commondir is empty');
+  let common: string;
+  try {
+    common = realpathSync(resolve(resolved, target));
+  } catch (error) {
+    return refuse(`its commondir names ${target}, which cannot be resolved (${errnoOf(error)})`);
+  }
+  const kind = entryKind(common);
+  const problem = typeof kind === 'object' ? `it cannot be inspected (${kind.unreadable})`
+    : kind !== 'directory' ? 'it is not a directory'
+    : entryKind(join(common, 'commondir')) !== 'absent' ? 'it is itself a linked administration'
+    : gitDirectoryProblem(common);
+  return problem === null ? common : refuse(`its commondir names ${common}, which is not a git directory: ${problem}`);
 }
 
 /** The repository's common git directory: its `.git` directory (a symlinked
  * one followed), or what its `.git` file's gitdir resolves to (linked
  * worktree or separate git dir). The ONE layout reading behind the handoff
- * proof, the absence proof and creation custody. A missing `.git`, or a
- * `.git` symlink to a gitdir FILE, is refused by name. */
+ * proof, the absence proof and creation custody. A missing `.git`, a `.git`
+ * directory that is no full git directory, or a `.git` symlink to a gitdir
+ * FILE (whose relative gitdir git and this reading could resolve
+ * differently), is refused by name. */
 export function repositoryCommonDirectory(repoPath: string): string {
   const repoGit = join(repoPath, '.git');
   let canonical: string;
@@ -223,14 +257,20 @@ export function repositoryCommonDirectory(repoPath: string): string {
   } catch (error) {
     throw new Error(`repository ${repoPath} has no usable .git (${errnoOf(error)})`, { cause: error });
   }
-  if (statSync(canonical).isDirectory()) return canonical;
-  if (lstatSync(repoGit).isSymbolicLink()) throw new Error(`repository ${repoPath} has a .git symlink to a gitdir file (${canonical}) — an unsupported layout`);
+  const kind = entryKind(canonical);
+  if (typeof kind === 'object') throw new Error(`repository ${repoPath} has a .git that cannot be inspected (${kind.unreadable})`);
+  if (kind === 'directory') {
+    const problem = gitDirectoryProblem(canonical);
+    if (problem !== null) throw new Error(`repository ${repoPath} has a .git directory that is not a git directory: ${problem}`);
+    return canonical;
+  }
+  if (entryKind(repoGit) !== 'absent' && lstatSync(repoGit).isSymbolicLink()) throw new Error(`repository ${repoPath} has a .git symlink to a gitdir file (${canonical}) — an unsupported layout`);
   return commonDirectoryOfGitdir(linkedGitdir(repoPath));
 }
 
 function validate(receipt: Receipt, lane: WorktreeLane): void {
   const admin = adminFor(lane.path);
-  const common = realpathSync(resolve(admin, readWorktreeMetadata(join(admin, 'commondir')).trim()));
+  const common = commonDirectoryOfGitdir(admin);
   const repoCommon = repositoryCommonDirectory(lane.repoPath);
   if (repoCommon !== common || receipt.id !== lane.id || receipt.kind !== lane.kind || receipt.jobId !== lane.jobId || receipt.roundId !== lane.roundId || receipt.branch !== lane.branch || receipt.sha !== lane.sha ||
     receipt.repo !== realpathSync(lane.repoPath) || receipt.path !== realpathSync(lane.path) || receipt.admin !== admin || receipt.common !== common ||
@@ -261,7 +301,7 @@ function validate(receipt: Receipt, lane: WorktreeLane): void {
 
 export function beginLaneHandoff(lane: Pick<WorktreeLane, 'id' | 'kind' | 'repoPath' | 'path' | 'branch' | 'sha' | 'jobId' | 'roundId'>, admin: string, token: string): void {
   const receipt: Receipt = { state: 'pending', token, id: lane.id, kind: lane.kind, jobId: lane.jobId, roundId: lane.roundId, repo: realpathSync(lane.repoPath),
-    common: realpathSync(resolve(admin, readWorktreeMetadata(join(admin, 'commondir')).trim())), admin,
+    common: commonDirectoryOfGitdir(admin), admin,
     path: realpathSync(lane.path), branch: lane.branch, sha: lane.sha, createdAt: null };
   const file = join(admin, receiptName), temp = `${file}.${token.slice(13)}`;
   writeFileSync(temp, JSON.stringify(receipt), { flag: 'wx' });
