@@ -3,7 +3,7 @@ import { nativeSeams } from './helpers/silas-native-seams.js';
 import { execFileSync } from 'node:child_process';
 import { chmodSync, linkSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
@@ -44,7 +44,9 @@ interface RecordOptions {
 function writeRecord(root: string, opts: RecordOptions): { readonly recordPath: string; readonly recordSha256: string; readonly treePath: string; readonly manifestSha256: string } {
   mkdirSync(root, { recursive: true });
   const treePath = opts.treePath ?? join(root, 'tree');
-  mkdirSync(treePath, { recursive: true });
+  // A relative tree (a refusal case) is never made: it would land in the
+  // runner's working directory, and outlive the test.
+  if (isAbsolute(treePath)) mkdirSync(treePath, { recursive: true });
   writeFileSync(join(root, 'complete-original-report.md'), opts.report);
   writeFileSync(join(root, 'original-source-session.jsonl'), opts.session);
   const record = {
@@ -242,6 +244,8 @@ describe('resolvePreservationReference — fails loud and never follows links (#
     const damages = {
       missing: [undefined, /manifest is missing or unreadable/],
       malformed: [() => '{ not json', /manifest is malformed/],
+      // The parser's own message quotes the text: it is shown line-safe.
+      'malformed-unsafe': [() => '{"a":\u202e1}', /manifest is malformed \("SyntaxError: Unexpected token '\\u202e'/u],
       array: [() => [], /manifest is not an object/],
       'no-entries': [(manifest: Record<string, unknown>) => ({ original_tree: manifest['original_tree'], archive_sha256: '' }), /carries no relative_entries list/],
     } as const;
@@ -367,6 +371,11 @@ describe('resolvePreservationReference — fails loud and never follows links (#
     for (const entry of ['.', 'a/./b', 'a//b']) {
       expect(verdictFor(entry), entry).toMatchObject({ reusable: false, guidance: expect.stringMatching(/escapes the original tree/) });
     }
+    // A record-named entry is always a bounded line-safe literal in guidance.
+    const unsafe = verdictFor('a\u202e\nb/../..').guidance;
+    expect(unsafe).toContain('("a\\u202e\\nb/../..")');
+    expect(unsafe).not.toMatch(/[\u202e\n]/u);
+    expect(verdictFor(`${'x'.repeat(500)}/../..`).guidance).toContain(`(${JSON.stringify('x'.repeat(200))}…)`);
   });
 
   it('refuses a relative original tree and a malformed manifest binding by name', () => {

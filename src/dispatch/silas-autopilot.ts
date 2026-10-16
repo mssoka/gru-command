@@ -778,9 +778,13 @@ export function canonicalJson(value: unknown): string {
     const node = resolved;
     ancestors.add(node);
     try {
-      if (Array.isArray(node)) {
-        let length: number;
-        try { length = node.length; } catch (error) { throw unreadable(key, error); }
+      let isArray: boolean;
+      try { isArray = Array.isArray(node); } catch (error) { throw unreadable(key, error); }
+      if (isArray) {
+        let length: unknown;
+        try { length = (node as unknown[]).length; } catch (error) { throw unreadable(key, error); }
+        // A proxied array can answer any length: only a whole count is one.
+        if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0) throw unreadable(key, new TypeError(`its length is not a whole count (${typeof length})`));
         if (length > MAX_CANONICAL_ITEMS) throw new TypeError(`canonicalJson: an array of ${String(length)} items has no canonical form`);
         const items: string[] = [];
         for (let index = 0; index < length; index += 1) {

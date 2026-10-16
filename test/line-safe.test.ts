@@ -11,5 +11,9 @@ describe('line-safe text for guidance and ledger lines (#367, #369)', () => {
     expect(shownText('/repo/tree‮evil')).toBe('"/repo/tree\\u202eevil"');
     expect(shownText('x'.repeat(201))).toBe(`${JSON.stringify('x'.repeat(200))}…`);
     expect(shownText('😀'.repeat(300), 5)).toBe(`${JSON.stringify('😀'.repeat(5))}…`);
+    // The bound is in code points: safe astral text within it is shown as written.
+    expect(shownText('😀'.repeat(150))).toBe('😀'.repeat(150));
+    expect(shownText('😀'.repeat(200))).toBe('😀'.repeat(200));
+    expect(shownText('😀'.repeat(201))).toBe(`${JSON.stringify('😀'.repeat(200))}…`);
   });
 });

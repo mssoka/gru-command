@@ -502,6 +502,17 @@ describe('autopilot mode resolution (kill switch + per-family modes)', () => {
     expect(() => canonicalJson({ list: throwingIndex })).toThrow(/^canonicalJson: the value at "0" cannot be read$/u);
     const throwingKeys = new Proxy({}, { ownKeys: () => { throw new Error('no'); } });
     expect(() => canonicalJson({ bag: throwingKeys })).toThrow(/^canonicalJson: the value at "bag" cannot be read$/u);
+    const throwingLength = new Proxy([1], { get: (target, key) => { if (key === 'length') throw new Error('no'); return Reflect.get(target, key) as unknown; } });
+    expect(() => canonicalJson({ list: throwingLength })).toThrow(/^canonicalJson: the value at "list" cannot be read$/u);
+    const oddLength = new Proxy([1], { get: (target, key) => (key === 'length' ? { valueOf: () => { throw new Error('no'); } } : Reflect.get(target, key) as unknown) });
+    expect(() => canonicalJson({ list: oddLength })).toThrow(/^canonicalJson: the value at "list" cannot be read$/u);
+    const revocable = Proxy.revocable([1], {});
+    revocable.revoke();
+    expect(() => canonicalJson({ gone: revocable.proxy })).toThrow(/^canonicalJson: the value at "gone" cannot be read$/u);
+    // A boxed boolean serializes by its value, whatever its own valueOf says.
+    const spoofed = { b: Object.assign(new Boolean(false), { valueOf: () => true }) };
+    expect(canonicalJson(spoofed)).toBe('{"b":false}');
+    expect(canonicalJson(spoofed)).toBe(JSON.stringify(spoofed));
     // A repeated (non-circular) member is no cycle.
     const shared = { x: 1 };
     expect(canonicalJson({ a: shared, b: shared })).toBe('{"a":{"x":1},"b":{"x":1}}');

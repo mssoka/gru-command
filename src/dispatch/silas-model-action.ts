@@ -216,6 +216,7 @@ export function spawnSilasWithActionTool(
   // tools read here — not a second read of the array — are the ones spawned.
   let slots: number;
   try { slots = supplied.length; } catch { return Promise.reject(new TypeError('spawn options nativeTools cannot be read')); }
+  if (typeof slots !== 'number' || !Number.isSafeInteger(slots) || slots < 0) return Promise.reject(new TypeError('spawn options nativeTools cannot be read'));
   if (slots > MAX_NATIVE_TOOLS) return Promise.reject(new TypeError(`spawn options nativeTools has ${String(slots)} slots (at most ${String(MAX_NATIVE_TOOLS)})`));
   const callerTools: NativeAgentTool[] = [];
   const names: string[] = [];
@@ -232,6 +233,12 @@ export function spawnSilasWithActionTool(
     callerTools.push(tool as NativeAgentTool);
     names.push(name);
   }
+  // The other options, each read once (nativeTools never again): one that
+  // cannot be read is refused, never a raw synchronous throw.
+  const rest: Record<string, unknown> = {};
+  try {
+    for (const key of Object.keys(spawnOptions ?? {})) if (key !== 'nativeTools') rest[key] = (spawnOptions as Record<string, unknown>)[key];
+  } catch (error) { return Promise.reject(new TypeError('spawn options cannot be read', { cause: error })); }
   if (names.includes(SILAS_MODEL_ACTION_TOOL)) {
     return Promise.reject(new Error(
       `the Silas spawn already carries a ${SILAS_MODEL_ACTION_TOOL} tool — each spawn binds its own; pass spawn options without it`,
@@ -239,7 +246,7 @@ export function spawnSilasWithActionTool(
   }
   return deps.registry
     .spawn('silas', {
-      ...(spawnOptions ?? {}),
+      ...(rest as SpawnOptions),
       nativeTools: [...callerTools, actionTool],
     })
     .then((handle) => {

@@ -200,6 +200,14 @@ describe('preservation reference — faults only a filesystem can cause (#367)',
     hooks.onLstat = (path, stat) => (path === join(tree, 'nested') && bigintStat(stat) && (seen += 1) === 2 ? reborn(stat) : stat);
     expect(resolvePreservationReference({ reference, jobId: 'job-h1' }))
       .toMatchObject({ reusable: false, guidance: `the original tree changed while it was being verified (${join(tree, 'nested')} was replaced by another directory) — the tree is retained` });
+    // A shared parent that vanishes between two entries is refused by name too.
+    seen = 0;
+    hooks.onLstat = (path, stat) => {
+      if (path === join(tree, 'nested') && bigintStat(stat) && (seen += 1) === 2) throw Object.assign(new Error('gone'), { code: 'ENOENT' });
+      return stat;
+    };
+    expect(resolvePreservationReference({ reference, jobId: 'job-h1' }))
+      .toMatchObject({ reusable: false, guidance: `the original tree changed while it was being verified (${join(tree, 'nested')} vanished or cannot be read) — the tree is retained` });
     hooks.onLstat = null;
     // A tree whose name carries a bidi override is shown as a JSON literal.
     const odd = record();

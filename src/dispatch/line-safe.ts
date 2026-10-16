@@ -14,6 +14,8 @@ export const lineSafeLiteral = (text: string): string =>
  * and marked — never anything that can break, reorder or flood the line. */
 export function shownText(text: string, maxPoints = 200): string {
   const points = [...text.slice(0, maxPoints * 2 + 1)];
-  if (!LINE_UNSAFE_ANY.test(text) && text.length <= maxPoints) return text;
+  // Whole when no more than twice the bound in units: then `points` is all of it.
+  const whole = text.length <= maxPoints * 2;
+  if (whole && points.length <= maxPoints && !LINE_UNSAFE_ANY.test(text)) return text;
   return points.length > maxPoints ? `${lineSafeLiteral(points.slice(0, maxPoints).join(''))}…` : lineSafeLiteral(points.join(''));
 }
