@@ -42,6 +42,8 @@ const str = (value: unknown): string | null =>
 /** Bounds on the model's free text (#369): the record is advisory audit
  * material, so an over-long field is refused by name, never truncated.
  * Lengths are in code points — the unit JSON Schema `maxLength` counts. */
+/** A spawn carries a handful of native tools; a slot count past this is no tool list. */
+const MAX_NATIVE_TOOLS = 256;
 export const SILAS_ACTION_LIMITS = { jobId: 200, family: 128, debt: 128, rationale: 2000 } as const;
 const BOUNDED_FIELDS = Object.keys(SILAS_ACTION_LIMITS) as readonly (keyof typeof SILAS_ACTION_LIMITS)[];
 const HEAD_SHA = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u;
@@ -51,25 +53,31 @@ const HEAD_SHA = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u;
  * point. The zero-width joiner and non-joiner are the exception: emoji
  * sequences and Indic or Persian text need them, and they cannot reorder or
  * hide a line. The rationale alone may carry tabs and line feeds; a carriage
- * return could overwrite a rendered line, so it never may. */
-// Unassigned (Cn) is judged by this runtime's Unicode tables: fail-closed —
-// a code point with no defined rendering is refused until the runtime knows it.
+ * return could overwrite a rendered line, so it never may. Unassigned (Cn)
+ * is judged by this runtime's Unicode tables: fail-closed — a code point with
+ * no defined rendering is refused until the runtime knows it. */
 const UNSAFE_TEXT = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Co}\p{Cn}]/gu;
 const JOINERS: ReadonlySet<string> = new Set(['\u200c', '\u200d']);
 const hasUnsafeText = (value: string, allowBreaks: boolean): boolean =>
   [...value.matchAll(UNSAFE_TEXT)].some(([char]) => !JOINERS.has(char) && !(allowBreaks && (char === '\t' || char === '\n')));
 
-const TEXT_RULE = 'non-blank; length in code points; no control, format, separator, private-use or unassigned characters (zero-width joiners allowed)';
+/** What a bounded text field may not carry — stated once, for the schema
+ * the model reads and for the refusal it gets. */
+const UNSAFE_TEXT_RULE = 'control, format, separator, private-use or unassigned characters (zero-width joiners allowed)';
+const TEXT_RULE = `non-blank; length in code points; no ${UNSAFE_TEXT_RULE}`;
+/** Characters that render as nothing: a value made only of these (and
+ * whitespace) is blank. */
+const INVISIBLE_FILLERS = /\u200c|\u200d|[\u115f\u1160\u2800\u3164\uffa0]/gu;
 
 /** Why a present bounded field is unusable, or null when it is fine. */
 function boundedFieldProblem(field: keyof typeof SILAS_ACTION_LIMITS, value: unknown): string | null {
   const limit = SILAS_ACTION_LIMITS[field];
-  // Joiners alone render as nothing: they never make a value non-blank.
-  if (typeof value !== 'string' || value.replace(/[\u200c\u200d]/gu, '').trim() === '') return `${field} must be a non-blank string`;
+  // Joiners and filler characters render as nothing: they never make a value non-blank.
+  if (typeof value !== 'string' || value.replace(INVISIBLE_FILLERS, '').trim() === '') return `${field} must be a non-blank string`;
   // A lone surrogate is no character a reader can see, and no UTF-8 text.
   if (/\p{Surrogate}/u.test(value)) return `${field} must be well-formed Unicode`;
   if ([...value].length > limit) return `${field} must be at most ${String(limit)} characters`;
-  if (hasUnsafeText(value, field === 'rationale')) return `${field} must not contain control, format, separator, private-use or unassigned characters (zero-width joiners allowed)`;
+  if (hasUnsafeText(value, field === 'rationale')) return `${field} must not contain ${UNSAFE_TEXT_RULE}`;
   return null;
 }
 
@@ -199,10 +207,14 @@ export function spawnSilasWithActionTool(
   });
   const callerTools: unknown = spawnOptions?.nativeTools ?? [];
   if (!Array.isArray(callerTools)) return Promise.reject(new TypeError('spawn options nativeTools must be an array of named native tools'));
-  // Every slot, holes included: a hole or a nameless member is named by index.
+  if (callerTools.length > MAX_NATIVE_TOOLS) return Promise.reject(new TypeError(`spawn options nativeTools has ${String(callerTools.length)} slots (at most ${String(MAX_NATIVE_TOOLS)})`));
+  // Every slot, holes included: a hole or a nameless member is named by
+  // index — and a name that cannot even be read refuses the same way.
   for (let index = 0; index < callerTools.length; index += 1) {
     const tool: unknown = callerTools[index];
-    if (tool === null || typeof tool !== 'object' || typeof (tool as { name?: unknown }).name !== 'string' || (tool as { name: string }).name === '') {
+    let name: unknown;
+    try { name = tool === null || typeof tool !== 'object' ? undefined : (tool as { name?: unknown }).name; } catch { name = undefined; }
+    if (typeof name !== 'string' || name === '') {
       return Promise.reject(new TypeError(`spawn options nativeTools[${String(index)}] must be a native tool with a non-empty string name`));
     }
   }

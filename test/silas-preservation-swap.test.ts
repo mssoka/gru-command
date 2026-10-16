@@ -11,7 +11,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
  */
 // Hoisted with the mock factory, which runs before any other top-level code.
 const { hooks, mutableConstants } = vi.hoisted(() => ({
-  hooks: { onOpen: null } as { onOpen: ((path: string) => void) | null },
+  hooks: { onOpen: null, onLstat: null, onRealpath: null } as {
+    onOpen: ((path: string) => void) | null;
+    onLstat: ((path: string, stat: unknown) => unknown) | null;
+    onRealpath: ((path: string, real: string) => string) | null;
+  },
   mutableConstants: {} as Record<string, number | undefined>,
 }));
 vi.mock('node:fs', async (importOriginal) => {
@@ -24,13 +28,21 @@ vi.mock('node:fs', async (importOriginal) => {
       hooks.onOpen?.(String(args[0]));
       return actual.openSync(...args);
     },
+    lstatSync: ((...args: Parameters<typeof actual.lstatSync>) => {
+      const stat = actual.lstatSync(...args);
+      return hooks.onLstat === null ? stat : hooks.onLstat(String(args[0]), stat);
+    }) as typeof actual.lstatSync,
+    realpathSync: Object.assign((...args: Parameters<typeof actual.realpathSync>) => {
+      const real = actual.realpathSync(...args);
+      return hooks.onRealpath === null ? real : hooks.onRealpath(String(args[0]), String(real));
+    }, { native: actual.realpathSync.native }) as typeof actual.realpathSync,
   };
 });
 const { resolvePreservationReference } = await import('../src/dispatch/silas-preservation-reference.js');
 
 const dirs: string[] = [];
 afterEach(() => {
-  hooks.onOpen = null;
+  hooks.onOpen = null; hooks.onLstat = null; hooks.onRealpath = null;
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 const sha256 = (value: string): string => createHash('sha256').update(value).digest('hex');
@@ -85,7 +97,7 @@ describe('preservation reference — faults only a filesystem can cause (#367)',
       dirs.push(`${root}.moved`);
     };
     expect(resolvePreservationReference({ reference, jobId: 'job-h1' }))
-      .toMatchObject({ reusable: false, guidance: `the record directory or the original tree changed while it was being verified (${root} was replaced by another directory) — the tree is retained` });
+      .toMatchObject({ reusable: false, guidance: expect.stringContaining(`verified (${root} was replaced by another directory`) });
   });
 
   it('refuses a tree deleted and re-created at the same path, and one that vanished, by name', () => {
@@ -130,6 +142,27 @@ describe('preservation reference — faults only a filesystem can cause (#367)',
     };
     expect(resolvePreservationReference({ reference, jobId: 'job-h1' }))
       .toMatchObject({ reusable: false, guidance: expect.stringContaining(`(${join(tree, 'nested')} was replaced by another directory)`) });
+  });
+
+  it('refuses a directory whose birth time changed on the same inode, or that is now reached through a symlink, naming every change', () => {
+    const reborn = record();
+    let armed = false;
+    hooks.onOpen = (path) => { if (path.endsWith('.tar.gz')) armed = true; };
+    // Same device and inode, born later: a recycled inode.
+    hooks.onLstat = (path, stat) => {
+      if (!armed || path !== reborn.tree || typeof (stat as { birthtimeNs?: unknown }).birthtimeNs !== 'bigint') return stat;
+      return Object.assign(Object.create(Object.getPrototypeOf(stat) as object) as object, stat, { birthtimeNs: (stat as { birthtimeNs: bigint }).birthtimeNs + 1n });
+    };
+    expect(resolvePreservationReference({ reference: reborn.reference, jobId: 'job-h1' }))
+      .toMatchObject({ reusable: false, guidance: expect.stringContaining(`(${reborn.tree} was replaced by another directory)`) });
+    hooks.onLstat = null;
+    // The same directory, now reached through a symlink — and the record
+    // directory too: both are named.
+    const moved = record();
+    armed = false;
+    hooks.onRealpath = (path, real) => (armed && (path === moved.tree || path === moved.root) ? `${real}-elsewhere` : real);
+    expect(resolvePreservationReference({ reference: moved.reference, jobId: 'job-h1' }))
+      .toMatchObject({ reusable: false, guidance: `the record directory or the original tree changed while it was being verified (${moved.root} is now reached through a symlink; ${moved.tree} is now reached through a symlink) — the tree is retained` });
   });
 
   it('refuses on a platform without no-follow reads, by name', () => {

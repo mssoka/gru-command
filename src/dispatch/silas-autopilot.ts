@@ -731,32 +731,41 @@ export interface SilasAutopilotInput {
   readonly log?: Log;
 }
 
-/** JSON with every object's keys sorted: two equal decisions built in a
- * different key order — or read back from the ledger — hash alike. Values
- * serialize as JSON.stringify would: `toJSON` called once per value;
+/** Nesting past this is no decision; refused by name, never a stack overflow. */
+const MAX_CANONICAL_DEPTH = 256;
+
+/** JSON with every object's keys sorted (by code unit): two equal decisions
+ * built in a different key order — or read back from the ledger — hash
+ * alike. Otherwise values serialize as JSON.stringify would: `toJSON(key)`
+ * called once per value; boxed numbers, strings and booleans unwrapped;
  * `undefined`, function and symbol members dropped (null in an array, holes
- * included); non-finite numbers as null. A cycle or a BigInt is refused by
- * name, never a stack overflow. Exported for its own tests. */
+ * included); non-finite numbers as null. A cycle, a BigInt or nesting past
+ * MAX_CANONICAL_DEPTH is refused by name. Exported for its own tests. */
 export function canonicalJson(value: unknown): string {
-  const ancestors: object[] = [];
-  const serialize = (input: unknown): string | undefined => {
-    const resolved = input !== null && typeof input === 'object' && typeof (input as { toJSON?: unknown }).toJSON === 'function'
-      ? (input as { toJSON(): unknown }).toJSON() : input;
+  const ancestors = new Set<object>();
+  const serialize = (input: unknown, key: string): string | undefined => {
+    let resolved = input !== null && typeof input === 'object' && typeof (input as { toJSON?: unknown }).toJSON === 'function'
+      ? (input as { toJSON(key: string): unknown }).toJSON(key) : input;
+    if (resolved instanceof Number || resolved instanceof String || resolved instanceof Boolean) resolved = resolved.valueOf();
     if (resolved === undefined || typeof resolved === 'function' || typeof resolved === 'symbol') return undefined;
-    if (typeof resolved === 'bigint') throw new TypeError('canonicalJson: a BigInt has no JSON form');
+    if (typeof resolved === 'bigint' || (typeof resolved === 'object' && resolved !== null && Object.prototype.toString.call(resolved) === '[object BigInt]')) {
+      throw new TypeError('canonicalJson: a BigInt has no JSON form');
+    }
     if (resolved === null || typeof resolved !== 'object') return JSON.stringify(resolved);
-    if (ancestors.includes(resolved)) throw new TypeError('canonicalJson: a circular structure has no JSON form');
-    ancestors.push(resolved);
+    if (ancestors.has(resolved)) throw new TypeError('canonicalJson: a circular structure has no JSON form');
+    if (ancestors.size >= MAX_CANONICAL_DEPTH) throw new TypeError(`canonicalJson: nesting deeper than ${String(MAX_CANONICAL_DEPTH)} has no canonical form`);
+    const node = resolved;
+    ancestors.add(node);
     try {
-      if (Array.isArray(resolved)) return `[${Array.from(resolved, (member: unknown) => serialize(member) ?? 'null').join(',')}]`;
-      const members = Object.keys(resolved).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).flatMap((key) => {
-        const text = serialize((resolved as Record<string, unknown>)[key]);
-        return text === undefined ? [] : [`${JSON.stringify(key)}:${text}`];
+      if (Array.isArray(node)) return `[${Array.from(node, (member: unknown, index) => serialize(member, String(index)) ?? 'null').join(',')}]`;
+      const members = Object.keys(node).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).flatMap((member) => {
+        const text = serialize((node as Record<string, unknown>)[member], member);
+        return text === undefined ? [] : [`${JSON.stringify(member)}:${text}`];
       });
       return `{${members.join(',')}}`;
-    } finally { ancestors.pop(); }
+    } finally { ancestors.delete(node); }
   };
-  return serialize(value) ?? 'null';
+  return serialize(value, '') ?? 'null';
 }
 
 /** The identity of one decision: what it would call, and in which mode. */

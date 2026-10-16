@@ -69,17 +69,27 @@ export function promptRefusalUnproven(input: {
   return evidence === 'ceased' ? null : `prepared producer ${input.prepared.id} has not proven cessation (${evidence ?? 'no cessation evidence'})`;
 }
 
-// JSON.stringify leaves these unescaped; each can break or reorder a rendered line.
-const LINE_UNSAFE = /[\u0080-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/gu;
+// JSON.stringify escapes only C0 controls; every other control (DEL, C1),
+// format (bidi marks and overrides, zero-width, BOM, tags) and line or
+// paragraph separator can still break, reorder or hide a rendered line.
+const LINE_UNSAFE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu;
 const lineSafeLiteral = (text: string): string =>
-  JSON.stringify(text).replace(LINE_UNSAFE, (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`);
+  JSON.stringify(text).replace(LINE_UNSAFE, (char) => Array.from({ length: char.length }, (_, unit) => `\\u${char.charCodeAt(unit).toString(16).padStart(4, '0')}`).join(''));
 
 /** An error as ledger-safe text: one JSON literal of at most 200 characters
  * (line breaks, controls and bidi overrides escaped; cut on a code point),
  * even when the error cannot print. */
 function boundedErrorText(error: unknown): string {
   let text: string;
-  try { text = error instanceof Error ? (error.message === '' ? error.name : `${error.name}: ${error.message}`) : String(error); } catch { text = 'an error that cannot be printed'; }
+  try {
+    if (error instanceof Error) {
+      const name = String(error.name) || 'Error';
+      const message = String(error.message);
+      text = message === '' ? name : `${name}: ${message}`;
+    } else {
+      text = String(error);
+    }
+  } catch { text = 'an error that cannot be printed'; }
   const literal = lineSafeLiteral(text);
   if (literal.length <= 200) return literal;
   // Escaping can grow a character six-fold: shrink until the cut fits.

@@ -474,6 +474,16 @@ describe('autopilot mode resolution (kill switch + per-family modes)', () => {
     const cyclic: Record<string, unknown> = {}; cyclic['self'] = cyclic;
     expect(() => canonicalJson(cyclic)).toThrow(/^canonicalJson: a circular structure has no JSON form$/u);
     expect(() => canonicalJson({ n: 1n })).toThrow(/^canonicalJson: a BigInt has no JSON form$/u);
+    // toJSON receives its key, and boxed primitives unwrap, as JSON.stringify does.
+    const keyed = { a: { toJSON: (key: string) => `key ${key}` }, list: [{ toJSON: (key: string) => `index ${key}` }] };
+    expect(canonicalJson(keyed)).toBe(JSON.stringify(keyed));
+    const boxed = { b: new Boolean(false), n: new Number(1), s: new String('x') };
+    expect(canonicalJson(boxed)).toBe(JSON.stringify(boxed));
+    expect(() => canonicalJson({ n: Object(1n) })).toThrow(/^canonicalJson: a BigInt has no JSON form$/u);
+    // Deep nesting is refused by name, never a stack overflow; ordinary depth is fine.
+    const nest = (depth: number): unknown => { let value: unknown = 1; for (let level = 0; level < depth; level += 1) value = { v: value }; return value; };
+    expect(canonicalJson(nest(200))).toBe(JSON.stringify(nest(200)));
+    expect(() => canonicalJson(nest(10_000))).toThrow(/^canonicalJson: nesting deeper than 256 has no canonical form$/u);
     // A repeated (non-circular) member is no cycle.
     const shared = { x: 1 };
     expect(canonicalJson({ a: shared, b: shared })).toBe('{"a":{"x":1},"b":{"x":1}}');

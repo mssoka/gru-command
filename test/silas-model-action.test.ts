@@ -175,8 +175,10 @@ describe('H6 silas_action tool bindings (unit seams)', () => {
         .toMatchObject({ ok: false, reason: 'bad-field', message: `${field} must not contain control, format, separator, private-use or unassigned characters (zero-width joiners allowed)` });
     }
     // Joiners alone render as nothing: never a non-blank value.
-    expect(await outcome({ action: 'hold', jobId: job.id, rationale: ' \u200d\u200c ' }))
-      .toMatchObject({ ok: false, reason: 'bad-field', message: 'rationale must be a non-blank string' });
+    for (const blank of [' \u200d\u200c ', '\u3164\u2800', '\u115f\u1160\uffa0']) {
+      expect(await outcome({ action: 'hold', jobId: job.id, rationale: blank }), JSON.stringify(blank))
+        .toMatchObject({ ok: false, reason: 'bad-field', message: 'rationale must be a non-blank string' });
+    }
     // The schema the model sees states the same rules.
     const schema = (tool.inputSchema as { properties: Record<string, { minLength?: number; description?: string }> }).properties;
     for (const field of ['jobId', 'family', 'debt', 'rationale']) {
@@ -296,11 +298,15 @@ describe('H6 the Silas slot spawn wiring (#368)', () => {
     await expect(spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() }, { nativeTools: 'not tools' as never }))
       .rejects.toThrow(/nativeTools must be an array of named native tools/u);
     // Every slot is checked — holes included — and named by index.
+    const unreadable = { get name(): string { throw new Error('no name'); } };
     // eslint-disable-next-line no-sparse-arrays
-    for (const [tools, index] of [[[null], 0], [[{}], 0], [[{ name: 5 }], 0], [['x'], 0], [[{ name: '' }], 0], [[stale, ,], 1]] as const) {
-      await expect(spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() }, { nativeTools: tools as never }), JSON.stringify(tools))
+    for (const [label, tools, index] of [['null', [null], 0], ['empty', [{}], 0], ['numeric name', [{ name: 5 }], 0], ['string', ['x'], 0], ['blank name', [{ name: '' }], 0], ['hole', [stale, ,], 1], ['unreadable name', [unreadable], 0]] as const) {
+      await expect(spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() }, { nativeTools: tools as never }), label)
         .rejects.toThrow(`spawn options nativeTools[${String(index)}] must be a native tool with a non-empty string name`);
     }
+    // A slot count past any tool list is refused before a slot is read.
+    await expect(spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() }, { nativeTools: new Array(1000) as never }))
+      .rejects.toThrow('spawn options nativeTools has 1000 slots (at most 256)');
     expect(spawns).toBe(1);
   });
 

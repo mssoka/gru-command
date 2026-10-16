@@ -932,8 +932,11 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     }
     // Line and paragraph separators, C1 controls and bidi overrides are escaped too.
     expect(literal('a\u2028b\u2029c\u0085d\u202ee\u2066f')).toBe('"Error: a\\u2028b\\u2029c\\u0085d\\u202ee\\u2066f"');
-    // An empty message still names the error.
+    // DEL, bidi and zero-width marks, the BOM and tag characters are escaped as well.
+    expect(literal('a\u007fb\u200ec\u061cd\u200be\ufefff\u{e0041}g')).toBe('"Error: a\\u007fb\\u200ec\\u061cd\\u200be\\ufefff\\udb40\\udc41g"');
+    // An empty message still names the error; an empty name reads as Error.
     expect(literal('')).toBe('"Error"');
+    expect(unproven({ prepared: prepared(() => { throw Object.assign(new Error(''), { name: '' }); }) })).toBe('prepared producer minion-x has not proven cessation (unreadable: "Error")');
     const hostile = { toString() { throw new Error('no'); } };
     expect(unproven({ prepared: prepared(() => { throw hostile; }) })).toBe('prepared producer minion-x has not proven cessation (unreadable: "an error that cannot be printed")');
   });
