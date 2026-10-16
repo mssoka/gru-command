@@ -49,8 +49,8 @@ export function scenarioRepo(script: string, options: { readonly reportersModule
     };
     return { root, git, plan, cleanup };
   } catch (error) {
-    // The setup error is what surfaces; a cleanup failure never masks it.
-    try { cleanup(); } catch { /* the temp root is reclaimed by the OS */ }
+    // The setup error surfaces first; a cleanup failure travels beside it.
+    try { cleanup(); } catch (cleanupError) { throw new AggregateError([error, cleanupError], 'scenario setup failed and so did its cleanup'); }
     throw error;
   }
 }

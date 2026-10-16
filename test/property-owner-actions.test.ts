@@ -292,6 +292,17 @@ describe('ordinary owner HTTP property actions (controlled minion; no JSON issua
       expect((partialRefusal as Error).message).toMatch(new RegExp(`then propose again \\(${partialPath.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')} could not be removed: Error: record stuck — remove it by hand\\)$`, 'u'));
       expect(((partialRefusal as Error).cause as AggregateError).errors.map((cause) => (cause as NodeJS.ErrnoException).code)).toEqual(['ENOSPC', 'EBUSY']);
       rmSync(partialPath);
+      // A record the exclusive write found already there is never removed.
+      let foreign = '';
+      fsHooks.beforeWrite = (path) => {
+        if (!path.includes('owner-evicted-')) return;
+        fsHooks.beforeWrite = null; foreign = path;
+        writeFileSync(path, 'foreign');
+        throw Object.assign(new Error('exists'), { code: 'EEXIST' });
+      };
+      expect(() => service.propose(h.jobId, { campaign: f.reviewed })).toThrow(/could not be evicted: its audit could not be written in .*\(Error: exists\); fix that directory, or decide a pending campaign, then propose again$/u);
+      expect(readFileSync(foreign, 'utf8')).toBe('foreign');
+      rmSync(foreign);
       // A victim directory the failed audit itself had to create is removed with it.
       rmSync(auditDir, { recursive: true, force: true });
       fsHooks.beforeWrite = (path) => { if (path.includes('owner-evicted-')) throw Object.assign(new Error('disk full'), { code: 'ENOSPC' }); };
@@ -324,7 +335,8 @@ describe('ordinary owner HTTP property actions (controlled minion; no JSON issua
       expect(left).toHaveLength(1);
       expect((refusal as Error).message).toBe(`proposal ${left[0]!} could not be recorded (Error: disk full) and its cleanup failed: Error: directory busy — remove ${join(h.serviceOptions.artifactsRoot, left[0]!)} by hand`);
       expect(((refusal as Error).cause as AggregateError).errors.map((cause) => (cause as NodeJS.ErrnoException).code)).toEqual(['ENOSPC', 'EBUSY']);
-      // Error text is one bounded line, whatever the filesystem said.
+      // The proposal's own error is rethrown as it is; the composed refusal
+      // around a failed cleanup is one bounded line, whatever the filesystem said.
       fsHooks.beforeWrite = (path) => { if (path.includes('owner-proposed-')) throw new Error(`disk\nfull\u202e ${'x'.repeat(400)}`); };
       let noisy: unknown = null;
       try { service.propose(h.jobId, { campaign: f.reviewed }); } catch (caught) { noisy = caught; } finally { fsHooks.beforeWrite = null; }

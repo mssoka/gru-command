@@ -151,6 +151,15 @@ describe('overlay rollback restore (#380)', () => {
     expect(leftovers(root)).toEqual([]);
   });
 
+  it('an overwritten file is restored with its own mode', () => {
+    const root = workspace();
+    const target = join(root, 'test/existing.test.mjs');
+    fs.chmodSync(target, 0o751);
+    expect(() => applyOverlayFilesAllOrNothing({ workspaceRoot: root, files: failingSet })).toThrow(/non-file entry/u);
+    expect(readFileSync(target, 'utf8')).toBe('original\n');
+    expect(statSync(target).mode & 0o7777).toBe(0o751);
+  });
+
   it('a target the untouched-check cannot read is restored, never skipped', () => {
     const root = workspace();
     const target = join(root, 'test/existing.test.mjs');
