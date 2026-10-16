@@ -115,11 +115,13 @@ export const SILAS_RULES: readonly SilasRuleSpec[] = [
     kind: 'action',
     firesOn:
       'currentInspections row (the newest delivery is history — no proven current candidate — while a corrective ' +
-      'verification or a contract revision is still owed, no writer owns the lane and no verification runs)',
+      'verification or a contract revision is still owed, no writer owns the lane, no verification runs, and no ' +
+      'stalledWorking, minionErrors or verificationFailures row is published for the job)',
     receipt: ['silas.directive-sent'],
     summary:
-      'Inspect the lane head read-only, then ONE directive with blocker_fingerprint current-inspection:<job> asking the ' +
-      'minion to deliver its current candidate; the receipt carries rule_id. Review stays fenced throughout.',
+      'Inspect the lane head read-only, then ONE directive with blocker_fingerprint and request_id ' +
+      'current-inspection:<job>:<historicalDeliverySeq> asking the minion to deliver its current candidate; the receipt ' +
+      'carries rule_id. Review stays fenced throughout.',
   },
   {
     id: 'sweep-ack',

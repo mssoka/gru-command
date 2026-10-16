@@ -470,6 +470,54 @@ describe('a historical-only delivery owes a current inspection (#361)', () => {
     expect(result.currentInspections).toEqual([]);
   });
 
+  it('stands aside for a stalled lane and for a minion error that own the job', async () => {
+    for (const owner of ['stall', 'error'] as const) {
+      const ledger = fixture();
+      historicalOnly(ledger);
+      if (owner === 'stall') {
+        ledger.registerAgent({ id: 'min-historical', role: 'minion', jobId: 'historical-job' });
+        ledger.setAgentState('min-historical', 'idle');
+      } else {
+        ledger.appendCustomEvent({ kind: 'job.minion-error', jobId: 'historical-job', payload: { error: 'provider down' } });
+      }
+      const result = await digest(ledger);
+      expect((owner === 'stall' ? result.stalledWorking : result.minionErrors).map((row) => row.jobId), owner).toEqual(['historical-job']);
+      expect(result.currentInspections, owner).toEqual([]);
+    }
+  });
+
+  it('a stalled row retracted at the publish boundary no longer hides the inspection', async () => {
+    const ledger = fixture();
+    historicalOnly(ledger);
+    ledger.registerAgent({ id: 'min-historical', role: 'minion', jobId: 'historical-job' });
+    ledger.setAgentState('min-historical', 'idle');
+    // A later job's blocker history is awaited, which opens the gap.
+    ledger.addJob({ id: 'review-job', repo: 'fixture-app', title: 'review', briefing: 'b' });
+    ledger.setJobStatus('review-job', 'working');
+    ledger.setJobStatus('review-job', 'in-review');
+    const round = ledger.addRound({ jobId: 'review-job', lenses: ['blind'] });
+    ledger.setRoundStatus(round.id, 'live');
+    ledger.setRoundStatus(round.id, 'verdict-posted');
+    ledger.setRoundVerdict(round.id, 'changes-requested');
+    ledger.appendCustomEvent({ kind: 'round.verdict', jobId: 'review-job', roundId: round.id, payload: { verdict: 'changes-requested' } });
+    // Jobs are read newest-updated first: the historical lane is computed
+    // (its stall included) before the review job's await.
+    databases.get(ledger)!.handle.prepare('UPDATE jobs SET updated_at = ? WHERE id = ?').run('2000-01-01T00:00:00.000Z', 'review-job');
+    let awaited = false;
+    const result = await computeSilasDigest({ ledger, config: DEFAULT_SILAS_CONFIG, trigger: 'api', now: () => NOW,
+      blockersForRound: async () => {
+        await Promise.resolve();
+        // The worker shows activity during the gap (no job event): the stall
+        // is retracted, and nothing else owns the job.
+        databases.get(ledger)!.handle.prepare('UPDATE agents SET last_activity = ? WHERE id = ?').run(new Date(NOW).toISOString(), 'min-historical');
+        awaited = true;
+        return { blockers: [], note: null };
+      } });
+    expect(awaited).toBe(true);
+    expect(result.stalledWorking).toEqual([]);
+    expect(result.currentInspections.map((row) => row.jobId)).toEqual(['historical-job']);
+  });
+
   it('retires once a proven current delivery exists, and never duplicates a row that already owns the job', async () => {
     const ledger = fixture();
     historicalOnly(ledger);

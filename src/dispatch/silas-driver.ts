@@ -2165,7 +2165,17 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
   const liveWriterOwns = (jobId: string): boolean =>
     input.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
     input.ledger.listPendingRebriefs({ jobId }).length > 0;
-  const inspectionYields = new Set([...digest.stalledWorking, ...digest.minionErrors, ...verificationFailures].map((row) => row.jobId));
+  const minionErrors = digest.minionErrors.filter(continuationAllowed);
+  const stalledWorking = digest.stalledWorking.filter((row) => {
+    const phaseSeq = phaseSeqByJob.get(row.jobId);
+    const silenceFloor = stallSilenceFloorByJob.get(row.jobId);
+    const jobSeq = jobSeqAtComputeByJob.get(row.jobId);
+    return phaseSeq !== undefined && silenceFloor !== undefined && jobSeq !== undefined &&
+      stallStillEligible(input, row, phaseSeq, silenceFloor, jobSeq);
+  });
+  // The inspection yields only to a row that is itself published: a stall
+  // retracted at this boundary must not leave the job with no action at all.
+  const inspectionYields = new Set([...stalledWorking, ...minionErrors, ...verificationFailures].map((row) => row.jobId));
   return {
     ...digest,
     // Issue #243 original-M2 carry-forward: the publish boundary must not
@@ -2179,7 +2189,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     ),
     verificationFailures,
     verificationWaits: digest.verificationWaits.filter(continuationAllowed),
-    minionErrors: digest.minionErrors.filter(continuationAllowed),
+    minionErrors,
     providerRecoveryPending: digest.providerRecoveryPending.filter((row) => {
       if (row.jobId === null) return true;
       if (!continuationAllowed({ jobId: row.jobId }) ||
@@ -2204,8 +2214,8 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       return input.ledger.correctiveVerificationDebt(row.jobId) !== null;
     }),
     currentInspections: digest.currentInspections.filter((row) => {
-      // A stalled lane, a minion error or a failed verification owns the job
-      // with its own action: no competing inspection directive.
+      // A published stalled lane, minion error or failed verification owns
+      // the job with its own action: no competing inspection directive.
       if (inspectionYields.has(row.jobId)) return false;
       if (!continuationAllowed(row) || !jobSeqUnchanged(row.jobId) || verificationInFlight(input.ledger, row.jobId) ||
           input.ledger.listPendingDirectives({ jobId: row.jobId, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
@@ -2238,13 +2248,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
         (job.status === 'working' || job.status === 'delivered' || job.status === 'in-review') &&
         (job.deliverable === null || job.deliverable === 'pr');
     }),
-    stalledWorking: digest.stalledWorking.filter((row) => {
-      const phaseSeq = phaseSeqByJob.get(row.jobId);
-      const silenceFloor = stallSilenceFloorByJob.get(row.jobId);
-      const jobSeq = jobSeqAtComputeByJob.get(row.jobId);
-      return phaseSeq !== undefined && silenceFloor !== undefined && jobSeq !== undefined &&
-        stallStillEligible(input, row, phaseSeq, silenceFloor, jobSeq);
-    }),
+    stalledWorking,
   };
 }
 
