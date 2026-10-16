@@ -484,6 +484,15 @@ describe('autopilot mode resolution (kill switch + per-family modes)', () => {
     const nest = (depth: number): unknown => { let value: unknown = 1; for (let level = 0; level < depth; level += 1) value = { v: value }; return value; };
     expect(canonicalJson(nest(200))).toBe(JSON.stringify(nest(200)));
     expect(() => canonicalJson(nest(10_000))).toThrow(/^canonicalJson: nesting deeper than 256 has no canonical form$/u);
+    expect(canonicalJson(nest(256))).toBe(JSON.stringify(nest(256)));
+    expect(() => canonicalJson(nest(257))).toThrow(/nesting deeper than 256/u);
+    // Boxed values unwrap through ToString/ToNumber; a spoofed BigInt tag is an ordinary object.
+    const overridden = { s: Object.assign(new String('x'), { toString: () => 'y' }), t: { [Symbol.toStringTag]: 'BigInt', a: 1 } };
+    expect(canonicalJson(overridden)).toBe(JSON.stringify(overridden));
+    // A throwing getter, and a huge (sparse) array, are refused by name.
+    expect(() => canonicalJson({ get a(): unknown { throw new Error('no'); } })).toThrow(/^canonicalJson: the value at "a" cannot be read$/u);
+    expect(() => canonicalJson([1, { toJSON() { throw new Error('no'); } }])).toThrow(/^canonicalJson: the value at "1" cannot be read$/u);
+    expect(() => canonicalJson(new Array(100_001))).toThrow(/^canonicalJson: an array of 100001 items has no canonical form$/u);
     // A repeated (non-circular) member is no cycle.
     const shared = { x: 1 };
     expect(canonicalJson({ a: shared, b: shared })).toBe('{"a":{"x":1},"b":{"x":1}}');

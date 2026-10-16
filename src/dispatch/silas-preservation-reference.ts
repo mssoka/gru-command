@@ -156,9 +156,15 @@ function directoryIdentity(path: string): DirectoryIdentity | null {
 /** Why `path` is no longer the canonical directory it was, or null. */
 function directoryChange(path: string, before: DirectoryIdentity | null): string | null {
   const now = directoryIdentity(path);
-  if (before === null || now === null) return `${path} vanished or cannot be read`;
-  if (now.dev !== before.dev || now.ino !== before.ino || now.birth !== before.birth) return `${path} was replaced by another directory`;
-  return canonicalDirectory(path) ? null : `${path} is now reached through a symlink`;
+  if (before === null || now === null) return `${shownPath(path)} vanished or cannot be read`;
+  if (now.dev !== before.dev || now.ino !== before.ino || now.birth !== before.birth) return `${shownPath(path)} was replaced by another directory`;
+  return canonicalDirectory(path) ? null : `${shownPath(path)} is now reached through a symlink`;
+}
+/** A path as guidance shows it: as written, or — when it carries a control,
+ * format or separator character (a record names it) — as a JSON literal, so
+ * it can never break or reorder the guidance line. */
+function shownPath(path: string): string {
+  return /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(path) ? JSON.stringify(path) : path;
 }
 
 /** A real directory reached by no symlinked component: its realpath is the
@@ -232,8 +238,12 @@ export function resolvePreservationReference(input: {
   // Identity first: the canonical proof then speaks for the directory the
   // final re-check compares against.
   const recordDirIdentity = directoryIdentity(recordDir);
-  if (!canonicalDirectory(recordDir) || directoryChange(recordDir, recordDirIdentity) !== null) {
-    return refuse(`the preservation record directory ${recordDir} must be a real directory reached by no symlink — pass its realpath`);
+  if (recordDirIdentity === null || !canonicalDirectory(recordDir)) {
+    return refuse(`the preservation record directory ${shownPath(recordDir)} must be a real directory reached by no symlink — pass its realpath`);
+  }
+  const recordDirMoved = directoryChange(recordDir, recordDirIdentity);
+  if (recordDirMoved !== null) {
+    return refuse(`the preservation record directory changed while it was being proven (${recordDirMoved}) — the tree is retained`);
   }
   // ONE read: the bytes whose digest is verified are the bytes parsed.
   let recordBytes: Buffer;
@@ -272,8 +282,12 @@ export function resolvePreservationReference(input: {
     return refuse('the preservation record carries no original tree path', [], actualRecordSha);
   }
   const treeIdentity = isAbsolute(treePath) ? directoryIdentity(treePath) : null;
-  if (!isAbsolute(treePath) || !canonicalDirectory(treePath) || directoryChange(treePath, treeIdentity) !== null) {
-    return refuse(`the original tree ${treePath} must be an absolute real directory reached by no symlink — the tree is retained`, [], actualRecordSha);
+  if (treeIdentity === null || !canonicalDirectory(treePath)) {
+    return refuse(`the original tree ${shownPath(treePath)} must be an absolute real directory reached by no symlink — the tree is retained`, [], actualRecordSha);
+  }
+  const treeMoved = directoryChange(treePath, treeIdentity);
+  if (treeMoved !== null) {
+    return refuse(`the original tree changed while it was being proven (${treeMoved}) — the tree is retained`, [], actualRecordSha);
   }
   // The parent of each live link verified below, re-proven with the rest.
   const linkParents = new Map<string, DirectoryIdentity | null>();
@@ -391,7 +405,13 @@ export function resolvePreservationReference(input: {
     if (stat.isSymbolicLink()) {
       // The link IS the deliverable: reading its target would dereference
       // it. Presence is enough — the target is never followed or copied.
-      if (!linkParents.has(dirname(entryPath))) linkParents.set(dirname(entryPath), parentIdentity);
+      // Every entry under one parent must see the SAME parent: the first
+      // identity is kept, and a later one that differs is a swap.
+      const first = linkParents.get(dirname(entryPath));
+      if (first === undefined) linkParents.set(dirname(entryPath), parentIdentity);
+      else if (first === null || parentIdentity === null || first.dev !== parentIdentity.dev || first.ino !== parentIdentity.ino || first.birth !== parentIdentity.birth) {
+        return refuse(`the original tree changed while it was being verified (${shownPath(dirname(entryPath))} was replaced by another directory) — the tree is retained`, verifiedAssets, actualRecordSha);
+      }
       verifiedAssets.push(`link:${entry}`);
     }
   }
@@ -429,7 +449,9 @@ export function resolvePreservationReference(input: {
   const changed = [[recordDir, recordDirIdentity] as const, [treePath, treeIdentity] as const, ...linkParents]
     .map(([path, identity]) => directoryChange(path, identity)).filter((change) => change !== null);
   if (changed.length > 0) {
-    return refuse(`the record directory or the original tree changed while it was being verified (${changed.join('; ')}) — the tree is retained`, verifiedAssets, actualRecordSha);
+    // Every change is named, up to five; the rest are counted.
+    const named = changed.slice(0, 5).join('; ') + (changed.length > 5 ? `; and ${String(changed.length - 5)} more` : '');
+    return refuse(`the record directory or the original tree changed while it was being verified (${named}) — the tree is retained`, verifiedAssets, actualRecordSha);
   }
   return { reusable: true, guidance: null, verifiedAssets, recordSha256: actualRecordSha };
 }

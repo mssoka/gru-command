@@ -339,7 +339,7 @@ const PINS: Record<string, number> = {
   'silas-rules.test.ts': 10,
   'silas-autopilot.test.ts': 110,
   'silas-preservation-reference.test.ts': 31,
-  'silas-preservation-swap.test.ts': 7,
+  'silas-preservation-swap.test.ts': 10,
   'smoke-claude.test.ts': 1,
   'smoke-real-model.test.ts': 1,
   'spawn-backoff.test.ts': 5,

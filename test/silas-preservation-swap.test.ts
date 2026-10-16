@@ -144,25 +144,79 @@ describe('preservation reference — faults only a filesystem can cause (#367)',
       .toMatchObject({ reusable: false, guidance: expect.stringContaining(`(${join(tree, 'nested')} was replaced by another directory)`) });
   });
 
-  it('refuses a directory whose birth time changed on the same inode, or that is now reached through a symlink, naming every change', () => {
-    const reborn = record();
+  /** A stat as if the directory were born later: same device and inode. */
+  const reborn = (stat: unknown): unknown => Object.assign(Object.create(Object.getPrototypeOf(stat) as object) as object, stat, { birthtimeNs: (stat as { birthtimeNs: bigint }).birthtimeNs + 1n });
+  const bigintStat = (stat: unknown): boolean => typeof (stat as { birthtimeNs?: unknown }).birthtimeNs === 'bigint';
+
+  it('refuses a directory whose birth time changed on the same inode (a recycled inode)', () => {
+    const { tree, reference } = record();
+    let armed = false;
+    let fired = 0;
+    hooks.onOpen = (path) => { if (path.endsWith('.tar.gz')) armed = true; };
+    hooks.onLstat = (path, stat) => (armed && path === tree && bigintStat(stat) ? (fired += 1, reborn(stat)) : stat);
+    expect(resolvePreservationReference({ reference, jobId: 'job-h1' }))
+      .toMatchObject({ reusable: false, guidance: expect.stringContaining(`(${tree} was replaced by another directory)`) });
+    expect(fired, 'the recycled inode was seen').toBeGreaterThan(0);
+  });
+
+  it('names every directory now reached through a symlink', () => {
+    const { root, tree, reference } = record();
     let armed = false;
     hooks.onOpen = (path) => { if (path.endsWith('.tar.gz')) armed = true; };
-    // Same device and inode, born later: a recycled inode.
-    hooks.onLstat = (path, stat) => {
-      if (!armed || path !== reborn.tree || typeof (stat as { birthtimeNs?: unknown }).birthtimeNs !== 'bigint') return stat;
-      return Object.assign(Object.create(Object.getPrototypeOf(stat) as object) as object, stat, { birthtimeNs: (stat as { birthtimeNs: bigint }).birthtimeNs + 1n });
-    };
-    expect(resolvePreservationReference({ reference: reborn.reference, jobId: 'job-h1' }))
-      .toMatchObject({ reusable: false, guidance: expect.stringContaining(`(${reborn.tree} was replaced by another directory)`) });
+    hooks.onRealpath = (path, real) => (armed && (path === tree || path === root) ? `${real}-elsewhere` : real);
+    expect(resolvePreservationReference({ reference, jobId: 'job-h1' }))
+      .toMatchObject({ reusable: false, guidance: `the record directory or the original tree changed while it was being verified (${root} is now reached through a symlink; ${tree} is now reached through a symlink) — the tree is retained` });
+  });
+
+  it('refuses a directory swapped between its identity and its proof, before anything is read', () => {
+    // The record directory: its identity, then a later stat shows another directory.
+    const first = record();
+    let seen = 0;
+    hooks.onLstat = (path, stat) => (path === first.root && bigintStat(stat) && (seen += 1) > 1 ? reborn(stat) : stat);
+    expect(resolvePreservationReference({ reference: first.reference, jobId: 'job-h1' }))
+      .toMatchObject({ reusable: false, guidance: `the preservation record directory changed while it was being proven (${first.root} was replaced by another directory) — the tree is retained` });
+    // The original tree, the same way.
+    const second = record();
+    seen = 0;
+    hooks.onLstat = (path, stat) => (path === second.tree && bigintStat(stat) && (seen += 1) > 1 ? reborn(stat) : stat);
+    expect(resolvePreservationReference({ reference: second.reference, jobId: 'job-h1' }))
+      .toMatchObject({ reusable: false, guidance: `the original tree changed while it was being proven (${second.tree} was replaced by another directory) — the tree is retained` });
+  });
+
+  it('refuses a link parent swapped between two of its entries, and shows a record-named path safely', () => {
+    const { root, tree, reference: original } = record();
+    mkdirSync(join(tree, 'nested'));
+    symlinkSync('../one', join(tree, 'nested', 'a'));
+    symlinkSync('../two', join(tree, 'nested', 'b'));
+    const manifest = JSON.stringify({ original_tree: tree, relative_entries: ['nested/a', 'nested/b'], archive_sha256: sha256('archive') });
+    writeFileSync(join(root, 'link-preservation-manifest.json'), manifest);
+    const text = JSON.stringify({
+      job: { id: 'job-h1', repo: 'fixture-repo' }, tree: { job_id: 'job-h1', path: tree },
+      original_report_sha256: sha256('r'), original_session_sha256: sha256('s'), link_manifest_sha256: sha256(manifest),
+    });
+    writeFileSync(original.recordPath, text);
+    const reference = { recordPath: original.recordPath, recordSha256: sha256(text) };
+    let seen = 0;
+    hooks.onLstat = (path, stat) => (path === join(tree, 'nested') && bigintStat(stat) && (seen += 1) === 2 ? reborn(stat) : stat);
+    expect(resolvePreservationReference({ reference, jobId: 'job-h1' }))
+      .toMatchObject({ reusable: false, guidance: `the original tree changed while it was being verified (${join(tree, 'nested')} was replaced by another directory) — the tree is retained` });
     hooks.onLstat = null;
-    // The same directory, now reached through a symlink — and the record
-    // directory too: both are named.
-    const moved = record();
-    armed = false;
-    hooks.onRealpath = (path, real) => (armed && (path === moved.tree || path === moved.root) ? `${real}-elsewhere` : real);
-    expect(resolvePreservationReference({ reference: moved.reference, jobId: 'job-h1' }))
-      .toMatchObject({ reusable: false, guidance: `the record directory or the original tree changed while it was being verified (${moved.root} is now reached through a symlink; ${moved.tree} is now reached through a symlink) — the tree is retained` });
+    // A tree whose name carries a bidi override is shown as a JSON literal.
+    const odd = record();
+    const oddTree = join(odd.root, 'tree\u202eevil');
+    renameSync(odd.tree, oddTree);
+    const oddManifest = JSON.stringify({ original_tree: oddTree, relative_entries: [], archive_sha256: sha256('archive') });
+    writeFileSync(join(odd.root, 'link-preservation-manifest.json'), oddManifest);
+    const oddText = JSON.stringify({
+      job: { id: 'job-h1', repo: 'fixture-repo' }, tree: { job_id: 'job-h1', path: oddTree },
+      original_report_sha256: sha256('r'), original_session_sha256: sha256('s'), link_manifest_sha256: sha256(oddManifest),
+    });
+    writeFileSync(odd.reference.recordPath, oddText);
+    let armed = false;
+    hooks.onOpen = (path) => { if (path.endsWith('.tar.gz')) armed = true; };
+    hooks.onLstat = (path, stat) => (armed && path === oddTree && bigintStat(stat) ? reborn(stat) : stat);
+    expect(resolvePreservationReference({ reference: { recordPath: odd.reference.recordPath, recordSha256: sha256(oddText) }, jobId: 'job-h1' }))
+      .toMatchObject({ reusable: false, guidance: expect.stringContaining(`(${JSON.stringify(oddTree)} was replaced by another directory)`) });
   });
 
   it('refuses on a platform without no-follow reads, by name', () => {

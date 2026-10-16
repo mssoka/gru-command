@@ -70,9 +70,10 @@ export function promptRefusalUnproven(input: {
 }
 
 // JSON.stringify escapes only C0 controls; every other control (DEL, C1),
-// format (bidi marks and overrides, zero-width, BOM, tags) and line or
-// paragraph separator can still break, reorder or hide a rendered line.
-const LINE_UNSAFE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu;
+// format (bidi marks and overrides, zero-width, BOM, tags), line or paragraph
+// separator, private-use or unassigned code point can still break, reorder
+// or hide a rendered line — the same classes silas_action text refuses.
+const LINE_UNSAFE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Co}\p{Cn}]/gu;
 const lineSafeLiteral = (text: string): string =>
   JSON.stringify(text).replace(LINE_UNSAFE, (char) => Array.from({ length: char.length }, (_, unit) => `\\u${char.charCodeAt(unit).toString(16).padStart(4, '0')}`).join(''));
 
@@ -81,18 +82,23 @@ const lineSafeLiteral = (text: string): string =>
  * even when the error cannot print. */
 function boundedErrorText(error: unknown): string {
   let text: string;
-  try {
-    if (error instanceof Error) {
-      const name = String(error.name) || 'Error';
-      const message = String(error.message);
-      text = message === '' ? name : `${name}: ${message}`;
-    } else {
-      text = String(error);
-    }
-  } catch { text = 'an error that cannot be printed'; }
+  // Name and message are read apart: one that cannot print never costs the
+  // other; a missing or non-string name reads as Error.
+  const field = (read: () => unknown): string | null => { try { const value = read(); return typeof value === 'string' ? value : null; } catch { return null; } };
+  let isError = false;
+  try { isError = error instanceof Error; } catch { isError = false; }
+  if (isError) {
+    const name = field(() => (error as Error).name) || 'Error';
+    const message = field(() => (error as Error).message);
+    text = message === null ? `${name} (its message cannot be printed)` : message === '' ? name : `${name}: ${message}`;
+  } else {
+    try { text = String(error); } catch { text = 'an error that cannot be printed'; }
+  }
   const literal = lineSafeLiteral(text);
   if (literal.length <= 200) return literal;
-  // Escaping can grow a character six-fold: shrink until the cut fits.
+  // Escaping grows a character up to twelve-fold (an astral one becomes two
+  // \uXXXX escapes): shrink until the cut fits. The cut is on code points,
+  // before escaping, so an escaped pair is never split.
   const points = [...text];
   let count = Math.min(points.length, 198);
   let cut = lineSafeLiteral(points.slice(0, count).join(''));

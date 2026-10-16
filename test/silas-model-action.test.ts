@@ -175,7 +175,7 @@ describe('H6 silas_action tool bindings (unit seams)', () => {
         .toMatchObject({ ok: false, reason: 'bad-field', message: `${field} must not contain control, format, separator, private-use or unassigned characters (zero-width joiners allowed)` });
     }
     // Joiners alone render as nothing: never a non-blank value.
-    for (const blank of [' \u200d\u200c ', '\u3164\u2800', '\u115f\u1160\uffa0']) {
+    for (const blank of [' \u200d\u200c ', '\u3164\u2800', '\u115f\u1160\uffa0', '\u180e\u17b4\ufe0f\u034f']) {
       expect(await outcome({ action: 'hold', jobId: job.id, rationale: blank }), JSON.stringify(blank))
         .toMatchObject({ ok: false, reason: 'bad-field', message: 'rationale must be a non-blank string' });
     }
@@ -304,9 +304,13 @@ describe('H6 the Silas slot spawn wiring (#368)', () => {
       await expect(spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() }, { nativeTools: tools as never }), label)
         .rejects.toThrow(`spawn options nativeTools[${String(index)}] must be a native tool with a non-empty string name`);
     }
-    // A slot count past any tool list is refused before a slot is read.
-    await expect(spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() }, { nativeTools: new Array(1000) as never }))
-      .rejects.toThrow('spawn options nativeTools has 1000 slots (at most 256)');
+    // A slot count past any tool list is refused before a slot is read;
+    // an array whose length cannot be read is refused by name.
+    await expect(spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() }, { nativeTools: new Array(257) as never }))
+      .rejects.toThrow('spawn options nativeTools has 257 slots (at most 256)');
+    const hostile = new Proxy([], { get: (target, key) => { if (key === 'length') throw new Error('no length'); return Reflect.get(target, key) as unknown; } });
+    await expect(spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() }, { nativeTools: hostile as never }))
+      .rejects.toThrow('spawn options nativeTools cannot be read');
     expect(spawns).toBe(1);
   });
 

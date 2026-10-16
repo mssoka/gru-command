@@ -937,6 +937,13 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     // An empty message still names the error; an empty name reads as Error.
     expect(literal('')).toBe('"Error"');
     expect(unproven({ prepared: prepared(() => { throw Object.assign(new Error(''), { name: '' }); }) })).toBe('prepared producer minion-x has not proven cessation (unreadable: "Error")');
+    // A missing name reads as Error; a message that cannot print keeps the name.
+    expect(literal('m')).toBe('"Error: m"');
+    expect(unproven({ prepared: prepared(() => { throw Object.assign(new Error('m'), { name: undefined }); }) })).toBe('prepared producer minion-x has not proven cessation (unreadable: "Error: m")');
+    const silent = new TypeError('x'); Object.defineProperty(silent, 'message', { get() { throw new Error('no'); } });
+    expect(unproven({ prepared: prepared(() => { throw silent; }) })).toBe('prepared producer minion-x has not proven cessation (unreadable: "TypeError (its message cannot be printed)")');
+    // Private-use and unassigned code points are escaped too.
+    expect(literal('a\ue000b\u0378c')).toBe('"Error: a\\ue000b\\u0378c"');
     const hostile = { toString() { throw new Error('no'); } };
     expect(unproven({ prepared: prepared(() => { throw hostile; }) })).toBe('prepared producer minion-x has not proven cessation (unreadable: "an error that cannot be printed")');
   });

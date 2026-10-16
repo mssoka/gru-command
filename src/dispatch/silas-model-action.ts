@@ -39,11 +39,11 @@ const refusal = (reason: string, message: string): NativeAgentToolResult => ({
 const str = (value: unknown): string | null =>
   typeof value === 'string' && value.length > 0 ? value : null;
 
+/** A spawn carries a handful of native tools; a slot count past this is no tool list. */
+const MAX_NATIVE_TOOLS = 256;
 /** Bounds on the model's free text (#369): the record is advisory audit
  * material, so an over-long field is refused by name, never truncated.
  * Lengths are in code points — the unit JSON Schema `maxLength` counts. */
-/** A spawn carries a handful of native tools; a slot count past this is no tool list. */
-const MAX_NATIVE_TOOLS = 256;
 export const SILAS_ACTION_LIMITS = { jobId: 200, family: 128, debt: 128, rationale: 2000 } as const;
 const BOUNDED_FIELDS = Object.keys(SILAS_ACTION_LIMITS) as readonly (keyof typeof SILAS_ACTION_LIMITS)[];
 const HEAD_SHA = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u;
@@ -65,9 +65,10 @@ const hasUnsafeText = (value: string, allowBreaks: boolean): boolean =>
  * the model reads and for the refusal it gets. */
 const UNSAFE_TEXT_RULE = 'control, format, separator, private-use or unassigned characters (zero-width joiners allowed)';
 const TEXT_RULE = `non-blank; length in code points; no ${UNSAFE_TEXT_RULE}`;
-/** Characters that render as nothing: a value made only of these (and
- * whitespace) is blank. */
-const INVISIBLE_FILLERS = /\u200c|\u200d|[\u115f\u1160\u2800\u3164\uffa0]/gu;
+/** Characters that render as nothing — every default-ignorable code point
+ * (joiners, Hangul fillers, variation selectors…) and the blank Braille
+ * pattern: a value made only of these (and whitespace) is blank. */
+const INVISIBLE_FILLERS = /[\p{Default_Ignorable_Code_Point}\u2800]/gu;
 
 /** Why a present bounded field is unusable, or null when it is fine. */
 function boundedFieldProblem(field: keyof typeof SILAS_ACTION_LIMITS, value: unknown): string | null {
@@ -205,20 +206,30 @@ export function spawnSilasWithActionTool(
     digest: deps.digest,
     ...(deps.log !== undefined ? { log: deps.log } : {}),
   });
-  const callerTools: unknown = spawnOptions?.nativeTools ?? [];
-  if (!Array.isArray(callerTools)) return Promise.reject(new TypeError('spawn options nativeTools must be an array of named native tools'));
-  if (callerTools.length > MAX_NATIVE_TOOLS) return Promise.reject(new TypeError(`spawn options nativeTools has ${String(callerTools.length)} slots (at most ${String(MAX_NATIVE_TOOLS)})`));
-  // Every slot, holes included: a hole or a nameless member is named by
-  // index — and a name that cannot even be read refuses the same way.
-  for (let index = 0; index < callerTools.length; index += 1) {
-    const tool: unknown = callerTools[index];
+  const supplied: unknown = spawnOptions?.nativeTools ?? [];
+  if (!Array.isArray(supplied)) return Promise.reject(new TypeError('spawn options nativeTools must be an array of named native tools'));
+  // Read once, every slot (holes included), each slot and name exactly once:
+  // a hostile array or getter is refused by index, never a raw throw, and
+  // what was checked is what is spawned.
+  let slots: number;
+  try { slots = supplied.length; } catch { return Promise.reject(new TypeError('spawn options nativeTools cannot be read')); }
+  if (slots > MAX_NATIVE_TOOLS) return Promise.reject(new TypeError(`spawn options nativeTools has ${String(slots)} slots (at most ${String(MAX_NATIVE_TOOLS)})`));
+  const callerTools: NativeAgentTool[] = [];
+  const names: string[] = [];
+  for (let index = 0; index < slots; index += 1) {
+    let tool: unknown;
     let name: unknown;
-    try { name = tool === null || typeof tool !== 'object' ? undefined : (tool as { name?: unknown }).name; } catch { name = undefined; }
+    try {
+      tool = supplied[index];
+      name = tool === null || typeof tool !== 'object' ? undefined : (tool as { name?: unknown }).name;
+    } catch { name = undefined; }
     if (typeof name !== 'string' || name === '') {
       return Promise.reject(new TypeError(`spawn options nativeTools[${String(index)}] must be a native tool with a non-empty string name`));
     }
+    callerTools.push(tool as NativeAgentTool);
+    names.push(name);
   }
-  if ((callerTools as readonly NativeAgentTool[]).some((tool) => tool.name === SILAS_MODEL_ACTION_TOOL)) {
+  if (names.includes(SILAS_MODEL_ACTION_TOOL)) {
     return Promise.reject(new Error(
       `the Silas spawn already carries a ${SILAS_MODEL_ACTION_TOOL} tool — each spawn binds its own; pass spawn options without it`,
     ));
@@ -226,7 +237,7 @@ export function spawnSilasWithActionTool(
   return deps.registry
     .spawn('silas', {
       ...(spawnOptions ?? {}),
-      nativeTools: [...(spawnOptions?.nativeTools ?? []), actionTool],
+      nativeTools: [...callerTools, actionTool],
     })
     .then((handle) => {
       bound = handle;
