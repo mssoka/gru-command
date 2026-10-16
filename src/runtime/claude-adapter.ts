@@ -1157,9 +1157,16 @@ export class ClaudeCodeHandle implements AgentHandle {
               live.once('error', () => { exitKind = exitKind ?? 'error'; resolve(); });
             });
       // Late-observation latch: survives the race; fires even after the
-      // deadline already settled bookkeeping (no new kill policy/timer).
+      // deadline or a transport error already settled bookkeeping (no new
+      // kill policy/timer). The ORIGINAL child's own close is the proof —
+      // after an error exactly as after a deadline (owner ruling 2026-10-16,
+      // #359); without it the evidence stays UNKNOWN and the slot held.
+      // A close BEFORE settlement (the same tick as an error) is remembered,
+      // so the settlement below cannot overwrite it.
+      let closedBeforeSettlement = false;
       live.once('close', () => {
-        if (this.cessationKind === 'deadline') {
+        if (this.cessationKind === 'live') closedBeforeSettlement = true;
+        if (this.cessationKind === 'deadline' || this.cessationKind === 'error') {
           this.cessationKind = 'close-observed-late';
           this.emitEvidence();
         }
@@ -1189,6 +1196,13 @@ export class ClaudeCodeHandle implements AgentHandle {
       });
       await Promise.race([childExited, exitDeadline]).then(() => {
         if (exitKind === 'close-observed') this.cessationKind = 'close-observed';
+        // The original child's own close that already came — in the same
+        // tick as the error, before this settlement ran — is still its proof:
+        // never overwritten by 'error' or 'deadline'. An exit reported after
+        // the disposal began is not: past an error or the deadline only the
+        // close is (owner ruling 2026-10-16, #359). An exit already reported
+        // when the disposal began is the initial proof above, unchanged here.
+        else if (closedBeforeSettlement || this.closedVerificationChildren.has(live)) this.cessationKind = 'close-observed-late';
         else if (exitKind === 'error') this.cessationKind = 'error';
         else this.cessationKind = 'deadline';
       });
