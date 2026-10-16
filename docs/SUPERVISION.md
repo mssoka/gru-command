@@ -129,10 +129,13 @@ watching record. The event is written first — a failed write refuses and
 changes nothing — with `notification_id` and `job_id` (strings),
 `captured_epoch` and `current_epoch` (integers), `producer_changed`,
 `had_open_turn` and `prompt_named` (booleans) and `stop_reason` (string);
-once it lands the closure stands, and it is never recorded twice. Any other fence (an active park, a hold, a live producer, a
-live handle or restart, an unreadable authority) still refuses with the
-debt retained. A
-service restart also resets breaker state (in-memory by design) — the
+once it lands the closure stands (every retirement cleanup step runs; a
+failing one is logged as an error), and the ledger records it at most once
+per alert, atomically. When the lookup of a recorded closure fails, a retry
+on a breaker alert refuses so it can ask again. Any other fence (an active
+park, a hold, a live producer, a live handle or restart, an unreadable
+authority) still refuses with the debt retained. A service restart also
+resets breaker state (in-memory by design) — the
 resolution record is durable, an open breaker is not, so a re-arm can
 never strand an agent across a service restart. The owner is never asked
 to ack a breaker.

@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
-import { LedgerApi, NotificationDecisionRefusal } from '../src/ledger/api.js';
+import { BlankProvenanceCredentialError, LedgerApi, NotificationDecisionRefusal } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import {
   parseNotificationDecision,
@@ -387,8 +387,21 @@ describe('decision follow-through and cross-route guards', () => {
     expect(() => rig.api.resolveOwnerDecision(machine.id, 'nope', INTERNAL)).toThrow(/use the disposition route/u);
     // Machine attention never adopts a typed owner decision either (#395).
     expect(() => rig.api.adoptLegacyOwnerDecision(machine.id, decision(), INTERNAL)).toThrow(/only owner decisions adopt a typed decision/u);
-    // Provenance is required and never blank (#396).
+    // Provenance is required and never blank (#396) — on every path, by name,
+    // before anything is written.
     expect(() => rig.api.resolveOwnerDecision(machine.id, 'x', { credential: ' ', declaredActor: null })).toThrow(/credential must be non-empty/u);
+    expect(() => rig.api.disposeMachineNotification(machine.id, 'x', { credential: '  ', declaredActor: null })).toThrow(BlankProvenanceCredentialError);
+    expect(() => rig.api.disposeMachineNotification(machine.id, 'x', { credential: '\t', declaredActor: null })).toThrow('machine disposition credential must be non-empty');
+    expect(rig.api.getNotification(machine.id)?.resolvedAt).toBeNull();
+    expect(() => rig.api.adoptLegacyOwnerDecision(id, decision(), { credential: '', declaredActor: null })).toThrow(BlankProvenanceCredentialError);
+    // Routing is checked FIRST: a machine row refuses adoption as no owner
+    // decision even when its decision column is populated.
+    (rig.api as unknown as { db: { prepare(sql: string): { run(...args: unknown[]): unknown } } }).db
+      .prepare('UPDATE notifications SET decision_json = ? WHERE id = ?').run('{"options":[]}', machine.id);
+    let refusal: unknown = null;
+    try { rig.api.adoptLegacyOwnerDecision(machine.id, decision(), INTERNAL); } catch (error) { refusal = error; }
+    expect(refusal).toBeInstanceOf(NotificationDecisionRefusal);
+    expect((refusal as NotificationDecisionRefusal).code).toBe('not_owner_decision');
   });
 
   it('an ack can never erase a typed owner decision (feed clears stay separate)', () => {

@@ -1398,9 +1398,14 @@ export class Supervisor {
   ): void {
     const incident = agent.rateLimitRetry;
     if (incident === null) return;
-    incident.admissionAbort.abort();
+    // Detach first and settle whatever the abort does: no awaiter of this
+    // incident is ever left hanging.
     agent.rateLimitRetry = null;
-    incident.resolveSettled(disposition);
+    try {
+      incident.admissionAbort.abort();
+    } finally {
+      incident.resolveSettled(disposition);
+    }
   }
 
   /** Supersede a restart-recovery admission wait or in-flight delivery:
@@ -3196,9 +3201,10 @@ export class Supervisor {
 
   /** Records the closure DURABLY first — a failed append throws and leaves
    * the stop exactly as it was — then retires the supervision record
-   * in-process. Once the append has landed the closure stands: retirement
-   * always removes the record (cleanup failures are logged, never rethrown),
-   * and an already-recorded closure is never appended twice. */
+   * in-process. Once the closure is recorded it stands: retirement always
+   * removes the record, each cleanup step runs whatever an earlier one did
+   * (a failure is logged as an error, never rethrown), and the closure is
+   * recorded at most once per alert (atomically, in the ledger). */
   private closeSupersededStop(
     agent: SupervisedAgent,
     notificationId: string,
@@ -3206,8 +3212,7 @@ export class Supervisor {
   ): void {
     const recovery = agent.pendingRecovery;
     const stopReason = `stop closed: its captured turn was superseded on job "${closure.jobId}" — it will never replay; continue the lane with a fresh re-brief or directive`;
-    if (!this.ledger.hasSupervisionStopSuperseded(notificationId)) this.ledger.appendCustomEvent({
-      kind: 'supervision.stop-superseded',
+    this.ledger.recordSupervisionStopSuperseded({
       agentId: agent.agentId,
       jobId: closure.jobId,
       payload: {
@@ -3226,13 +3231,23 @@ export class Supervisor {
     // — so the lane no longer reads as stopped and a fresh re-brief/directive
     // adopts a new watching record instead of being disposed and re-alerted.
     // Only a job minion with no live handle and no restart rung gets here.
+    const cleanup: readonly (readonly [string, () => void])[] = [
+      ['backoff timer', () => {
+        const timer = agent.backoffTimer;
+        agent.backoffTimer = null;
+        if (timer !== null) clearTimeout(timer);
+      }],
+      ['rate-limit retry', () => { this.clearRateLimitRetry(agent, 'superseded'); }],
+      ['recovery admission', () => { this.clearRecoveryAdmission(agent); }],
+    ];
     try {
-      if (agent.backoffTimer !== null) clearTimeout(agent.backoffTimer);
-      agent.backoffTimer = null;
-      this.clearRateLimitRetry(agent, 'superseded');
-      this.clearRecoveryAdmission(agent);
-    } catch (error) {
-      this.log('error', 'superseded stop retirement cleanup failed — the closure stands', { agent_id: agent.agentId, error: String(error) });
+      for (const [step, run] of cleanup) {
+        try {
+          run();
+        } catch (error) {
+          this.log('error', 'superseded stop retirement cleanup step failed — the closure stands', { agent_id: agent.agentId, step, error: String(error) });
+        }
+      }
     } finally {
       this.agents.delete(agent.agentId);
       this.restoredStops.delete(agent.agentId);
@@ -3465,7 +3480,8 @@ export class Supervisor {
   private reArmFromNotification(
     notificationId: string,
   ): { ok: true; rearmed: boolean; superseded?: true } | { ok: false; reason: string } {
-    if (this.disposed || !this.cfg.enabled) return { ok: true, rearmed: false }; // off = acks are pure records
+    // Off = acks are pure records, still labelled with a recorded closure.
+    if (this.disposed || !this.cfg.enabled) return this.recordedClosureOutcome(notificationId, 'pure');
     for (const agent of this.agents.values()) {
       if (agent.breakerNotificationId !== notificationId || !agent.breakerOpen) continue;
       const superseded = this.supersededStopClosure(agent);
@@ -3509,19 +3525,30 @@ export class Supervisor {
         };
       }
     }
-    // A retried disposition of a stop already closed as superseded reports
-    // that same outcome, from the durable record (restarts included).
-    try {
-      if (this.ledger.hasSupervisionStopSuperseded(notificationId)) return { ok: true, rearmed: false, superseded: true };
-    } catch (error) {
-      // No stop is bound to this alert either way: a failed lookup only loses
-      // the "superseded" label of a retry, so it never blocks the record.
-      this.log('warn', 'superseded closure lookup failed — reporting a pure record', { notification_id: notificationId, error: String(error) });
-    }
     // No stopped breaker is bound to this alert: the disposition is a pure
-    // record. Say so — an accepted outcome must never claim a re-arm that
-    // did not happen.
-    return { ok: true, rearmed: false };
+    // record — or the retry of a stop already closed as superseded, which
+    // reports that same outcome from the durable record (restarts included).
+    // An accepted outcome never claims a re-arm that did not happen.
+    return this.recordedClosureOutcome(notificationId, 'refuse');
+  }
+
+  /** The outcome of a disposition no live stop answers: superseded when the
+   * ledger recorded this alert's closure, else a pure record. When the
+   * lookup fails, a breaker alert (whose answer it could change) refuses so
+   * the retry asks again; any other alert — or a supervisor that is off
+   * (`onFailure: 'pure'`) — stays a pure record. */
+  private recordedClosureOutcome(notificationId: string, onFailure: 'refuse' | 'pure'): { ok: true; rearmed: false; superseded?: true } | { ok: false; reason: string } {
+    try {
+      return this.ledger.hasSupervisionStopSuperseded(notificationId) ? { ok: true, rearmed: false, superseded: true } : { ok: true, rearmed: false };
+    } catch (error) {
+      let breaker = true;
+      try { breaker = this.ledger.getNotification(notificationId)?.kind === 'supervision.breaker'; } catch { /* unknown: treat as a breaker */ }
+      if (onFailure === 'refuse' && breaker) {
+        return { ok: false, reason: `superseded closure lookup failed — retry the disposition: ${String(error)}` };
+      }
+      this.log('warn', 'superseded closure lookup failed — reporting a pure record', { notification_id: notificationId, error: String(error) });
+      return { ok: true, rearmed: false };
+    }
   }
 
   /**

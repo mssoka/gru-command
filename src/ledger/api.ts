@@ -478,6 +478,16 @@ export interface NotificationProvenance {
   readonly declaredActor: string | null;
 }
 
+/** A notification decision/disposition/adoption was asked to record a blank
+ * credential class: a programming error at the caller (every route supplies
+ * one), refused before anything is written (#396). */
+export class BlankProvenanceCredentialError extends Error {
+  constructor(operation: string) {
+    super(`${operation} credential must be non-empty`);
+    this.name = 'BlankProvenanceCredentialError';
+  }
+}
+
 /** One durable notification row (EPICS E7 story 2 — the notification log
  * lives in the ledger; ack ids are the proven-ack contract). */
 export interface NotificationRecord {
@@ -3299,6 +3309,21 @@ export class LedgerApi {
     ).get(notificationId) !== undefined;
   }
 
+  /** Records a superseded-stop closure (#385) at most ONCE per alert: the
+   * check and the append share one transaction, so no interleaving can
+   * record it twice. True when this call recorded it. */
+  recordSupervisionStopSuperseded(input: {
+    readonly agentId: string;
+    readonly jobId: string;
+    readonly payload: Readonly<Record<string, unknown>> & { readonly notification_id: string };
+  }): boolean {
+    return this.transaction(() => {
+      if (this.hasSupervisionStopSuperseded(input.payload.notification_id)) return false;
+      this.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: input.agentId, jobId: input.jobId, payload: { ...input.payload } });
+      return true;
+    });
+  }
+
   /**
    * Durable supervision stop truth for restart hydration (code review
    * 2026-10-04): the latest supervision lifecycle event per agent, kept
@@ -5195,7 +5220,7 @@ export class LedgerApi {
     provenance: NotificationProvenance,
   ): NotificationRecord | null {
     if (detail.trim() === '') throw new Error('owner-decision resolution detail must be non-empty');
-    if (provenance.credential.trim() === '') throw new Error('owner-decision resolution credential must be non-empty');
+    if (provenance.credential.trim() === '') throw new BlankProvenanceCredentialError('owner-decision resolution');
     return this.transaction(() => {
       const current = this.getNotification(id);
       if (current === null) return null;
@@ -5243,7 +5268,7 @@ export class LedgerApi {
     provenance: NotificationProvenance = { credential: 'internal', declaredActor: null },
   ): NotificationRecord | null {
     if (detail.trim() === '') throw new Error('machine disposition detail must be non-empty');
-    if (provenance.credential.trim() === '') throw new Error('machine disposition credential must be non-empty');
+    if (provenance.credential.trim() === '') throw new BlankProvenanceCredentialError('machine disposition');
     return this.transaction(() => {
       const current = this.getNotification(id);
       if (current === null) return null;
@@ -5438,7 +5463,7 @@ export class LedgerApi {
     decision: NotificationDecision,
     provenance: NotificationProvenance,
   ): NotificationRecord | null {
-    if (provenance.credential.trim() === '') throw new Error('decision adoption credential must be non-empty');
+    if (provenance.credential.trim() === '') throw new BlankProvenanceCredentialError('decision adoption');
     return this.transaction(() => {
       const current = this.getNotification(id);
       if (current === null) return null;
