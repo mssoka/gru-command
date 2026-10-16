@@ -49,8 +49,9 @@ const review1Names = [
  * missing compiled helper would read IDENTICALLY — the report alone cannot
  * tell them apart. It is excluded upstream instead (#358): each generating
  * scope builds the candidate, which carries src/verify/capture-cli.ts, under
- * `set -e` before any test runs, and the policy names the helper inside that
- * built snapshot (pinned by the exclusion test); the current status test also
+ * `set -e` before any test runs, refuses (exit 2) unless the built helper
+ * exists and loads, and the policy names the helper inside that built
+ * snapshot (pinned by the exclusion tests); the current status test also
  * throws a named `fixture setup:` error when its helper is missing. No other
  * title may pass a wrapped rejection off as behavioral RED. */
 const wrappedRejectionNames = new Set([STATUS_ACTION_NAME]);

@@ -1,7 +1,7 @@
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { exec, execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
 import { classifyReviewedRed, STATUS_ACTION_NAME } from '../tools/classify-scheduled-verification-red.mjs';
@@ -55,7 +55,8 @@ describe('reviewed-candidate behavioral RED custody', () => {
       // Vitest truncates the rejected value: no stderr, nothing that names
       // the missing module — so the report cannot tell setup from behavior,
       // and the generating scopes must exclude it (next test).
-      expect(message).toMatch(/^Error: promise rejected "Error: Command failed: "/u);
+      // The failing command is the node helper invocation itself.
+      expect(message.startsWith(`Error: promise rejected "Error: Command failed: "${process.execPath.slice(0, 8)}`), message).toBe(true);
       expect(message).not.toMatch(/Cannot find module|MODULE_NOT_FOUND/u);
       const titled = (name: string) => { const r = report(message); r.testResults[0]!.assertionResults[0]!.title = `review-2 ${name}`; return r; };
       expect(classifyReviewedRed(titled(STATUS_ACTION_NAME), 2, 'fast')).toEqual([`review-2 ${STATUS_ACTION_NAME}`]);
@@ -64,56 +65,131 @@ describe('reviewed-candidate behavioral RED custody', () => {
   });
 
   const BASELINES = ['tools/scheduled-verification-review-baseline.sh', 'tools/scheduled-verification-review2-baseline.sh'] as const;
+  const BASELINE_LIB = 'tools/scheduled-verification-baseline-lib.sh';
   const repoRoot = join(import.meta.dirname, '..');
+  /** A child shell that cannot be redirected to this repository by an
+   * ambient git environment (a hook's GIT_DIR) and never hangs the suite. */
+  function shell(script: string, args: readonly string[], cwd: string, tmp: string) {
+    const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('GIT_')));
+    const run = spawnSync('sh', [script, ...args], { cwd, encoding: 'utf8', timeout: 60_000, env: { ...env, TMPDIR: tmp } });
+    expect(run.signal, `${script} ran to completion`).toBeNull();
+    return run;
+  }
+  function libCall(call: string, cwd: string, tmp: string) {
+    return shell('-c', [`. "$1" && ${call}`, 'lib', join(repoRoot, BASELINE_LIB)], cwd, tmp);
+  }
+
+  it('only the two baselines and the retained scope invoke the classifier (#358 exclusion scope)', () => {
+    // The review-8 runner names the classifier's TEST file, never the
+    // classifier: it never classifies RED.
+    const invokers = execFileSync('git', ['-C', repoRoot, 'grep', '-l', 'classify-scheduled-verification-red\\.mjs', '--', 'tools', '.gru-command', '.github', 'package.json'], { encoding: 'utf8' })
+      .split('\n').filter((line) => line !== '' && line !== 'tools/classify-scheduled-verification-red.mjs').sort();
+    expect(invokers).toEqual(['.gru-command/worktree.toml', ...BASELINES].sort());
+    const manifest = loadWorktreeManifest(repoRoot)!;
+    expect(Object.entries(manifest.verify).filter(([, command]) => command.includes('classify-scheduled-verification-red.mjs')).map(([scope]) => scope)).toEqual(['gh315-retained-red-classify']);
+  });
 
   it('the generating scopes cannot reach a missing compiled helper: they build it in the snapshot and refuse when it is absent (#358 exclusion evidence)', () => {
-    // These two scripts generate every report the classifier judges (the
-    // review-8 runner never classifies RED; the retained classify scope reads
-    // the review-2 baseline's reports).
     const shallow = execFileSync('git', ['-C', repoRoot, 'rev-parse', '--is-shallow-repository'], { encoding: 'utf8' }).trim();
     if (shallow === 'true') throw new Error('fixture setup: this evidence reads pinned historical commits — fetch full history (git fetch --unshallow)');
     for (const script of BASELINES) {
-      const lines = readFileSync(join(repoRoot, script), 'utf8').split('\n');
+      const lines = readFileSync(join(repoRoot, script), 'utf8').split(/\r?\n/u);
       const at = (line: string): number => {
-        const index = lines.indexOf(line);
-        expect(index, `${script} has the line ${JSON.stringify(line)}`).toBeGreaterThan(0);
-        return index;
+        expect(lines.filter((candidate) => candidate === line), `${script} has the line ${JSON.stringify(line)} exactly once`).toHaveLength(1);
+        return lines.indexOf(line);
       };
       const candidate = /^base=([0-9a-f]{40})$/mu.exec(lines.join('\n'))?.[1];
       expect(candidate, `${script} names its reviewed candidate`).toBeDefined();
-      // Abort-on-error, into the snapshot, build, the helper must exist,
-      // and only then tests.
-      const order = [at('set -e'), at('cd "$d"'), at('npm run build'),
-        lines.findIndex((line) => line.startsWith('test -f dist/verify/capture-cli.js || {') && line.includes('exit 2')), at('set +e'),
+      if (spawnSync('git', ['-C', repoRoot, 'cat-file', '-e', `${candidate!}^{commit}`]).status !== 0) {
+        throw new Error(`fixture setup: reviewed candidate ${candidate!} is not in this clone — fetch it`);
+      }
+      // Abort-on-error, sources checked before the snapshot exists, into the
+      // snapshot, build, the helper must exist and load, and only then tests.
+      const order = [at('set -e'), at(`. "$(dirname "$0")/scheduled-verification-baseline-lib.sh"`),
+        at('require_pinned_sources "$base" "$regressions" "$@"'), lines.findIndex((line) => line.startsWith('d=$(mktemp -d ')),
+        at('cd "$d"'), at('npm run build'), at('require_built_helper'), at('set +e'),
         lines.findIndex((line) => line.startsWith('npx vitest run'))];
       expect(order.every((index) => index > 0), `${script}: ${JSON.stringify(order)}`).toBe(true);
-      expect([...order].sort((a, b) => a - b), `${script}: set -e, cd, build, helper guard, set +e, tests`).toEqual(order);
+      expect([...order].sort((a, b) => a - b), `${script}: set -e, lib, sources, snapshot, cd, build, helper, set +e, tests`).toEqual(order);
       // The candidate carries the helper source the build compiles, and its
       // policy names that helper inside the snapshot the build ran in.
       const show = (path: string) => execFileSync('git', ['-C', repoRoot, 'show', `${candidate!}:${path}`], { encoding: 'utf8' });
       expect(() => show('src/verify/capture-cli.ts'), `${candidate!} carries the capture helper source`).not.toThrow();
       expect(show('src/runtime/worker-verification-policy.ts')).toContain("join(PACKAGE_ROOT, 'dist/verify/capture-cli.js')");
       expect(show('src/bmad/runtime.ts')).toContain("export const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');");
+      // Importing the helper loads it without running it: it runs only when invoked directly.
+      expect(show('src/verify/capture-cli.ts')).toContain('import.meta.url === pathToFileURL(process.argv[1]).href');
     }
   });
 
   it('a clone without the pinned revisions is refused by name before anything is created (#358)', () => {
     const empty = mkdtempSync(join(tmpdir(), 'gru-shallow-baseline-'));
     try {
-      execFileSync('git', ['init', '-q', empty]);
+      execFileSync('git', ['init', '-q', join(empty, 'clone')]);
+      mkdirSync(join(empty, 'tmp'));
       for (const script of BASELINES) {
-        const before = readdirSync(tmpdir()).filter((name) => name.startsWith('gru-gh315-')).length;
-        const run = spawnSync('sh', [join(repoRoot, script)], { cwd: empty, encoding: 'utf8', env: { ...process.env, TMPDIR: tmpdir() } });
+        const run = shell(join(repoRoot, script), [], join(empty, 'clone'), join(empty, 'tmp'));
         expect(run.status, script).toBe(2);
         expect(run.stderr, script).toMatch(/^reviewed candidate [0-9a-f]{40} is not in this clone — fetch full history \(git fetch --unshallow\)$/mu);
-        expect(readdirSync(tmpdir()).filter((name) => name.startsWith('gru-gh315-')).length, `${script} created no snapshot`).toBe(before);
+        expect(readdirSync(join(empty, 'tmp')), `${script} created no snapshot`).toEqual([]);
       }
     } finally { rmSync(empty, { recursive: true, force: true }); }
   });
 
+  it('every pinned source is checked by name: the candidate, the regressions revision, and each regression file (#358)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-pinned-sources-'));
+    try {
+      const repo = join(dir, 'clone'); mkdirSync(join(dir, 'tmp'));
+      execFileSync('git', ['init', '-q', repo]);
+      writeFileSync(join(repo, 'present.ts'), 'export {};\n');
+      execFileSync('git', ['-C', repo, '-c', 'user.name=gru', '-c', 'user.email=gru@example.test', 'add', 'present.ts']);
+      execFileSync('git', ['-C', repo, '-c', 'user.name=gru', '-c', 'user.email=gru@example.test', 'commit', '-q', '-m', 'pinned']);
+      const head = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      const absent = '0123456789abcdef0123456789abcdef01234567';
+      const check = (args: string) => libCall(`require_pinned_sources ${args}`, repo, join(dir, 'tmp'));
+      const regressions = check(`${head} ${absent} present.ts`);
+      expect(regressions.status).toBe(2);
+      expect(regressions.stderr).toBe(`regressions revision ${absent} is not in this clone — fetch full history (git fetch --unshallow)\n`);
+      const file = check(`${head} ${head} present.ts 'missing file.ts'`);
+      expect(file.status).toBe(2);
+      expect(file.stderr).toBe(`pinned regression file missing file.ts is missing at ${head} — fetch full history (git fetch --unshallow)\n`);
+      const present = check(`${head} ${head} present.ts`);
+      expect([present.status, present.stderr]).toEqual([0, '']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('the built helper must exist, be non-empty and load — a broken helper is refused, a loadable one is never run (#358)', () => {
+    // Real path: the shell's $PWD never names a symlinked tmpdir.
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), 'gru-built-helper-')));
+    try {
+      const snapshot = join(dir, 'snapshot'); mkdirSync(join(snapshot, 'dist', 'verify'), { recursive: true }); mkdirSync(join(dir, 'tmp'));
+      writeFileSync(join(snapshot, 'package.json'), '{"type":"module"}\n');
+      const helper = join(snapshot, 'dist', 'verify', 'capture-cli.js');
+      const guard = () => libCall('require_built_helper', snapshot, join(dir, 'tmp'));
+      const missing = guard();
+      expect(missing.status).toBe(2);
+      expect(missing.stderr).toBe(`the build did not emit dist/verify/capture-cli.js — a missing helper would read as behavioral RED; refusing (snapshot kept at ${snapshot})\n`);
+      writeFileSync(helper, '');
+      expect(guard().status, 'an empty helper').toBe(2);
+      writeFileSync(helper, "import './scheduler.js';\n");
+      const broken = guard();
+      expect(broken.status).toBe(2);
+      expect(broken.stderr).toMatch(/ERR_MODULE_NOT_FOUND[\s\S]*the built dist\/verify\/capture-cli\.js does not load — a broken helper would read as behavioral RED; refusing \(snapshot kept at /u);
+      writeFileSync(join(snapshot, 'dist', 'verify', 'scheduler.js'), 'export {};\n');
+      // Loading runs no CLI: the helper acts only when invoked directly.
+      writeFileSync(helper, "import './scheduler.js';\nif (process.argv[1] !== undefined) { console.error('ran'); process.exit(9); }\n");
+      const loaded = guard();
+      expect([loaded.status, loaded.stderr]).toEqual([0, '']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('the status title the classifier allows is the real status regression\'s title', () => {
-    expect(readFileSync(join(repoRoot, 'test/worker-verification-policy.test.ts'), 'utf8')).toContain(`it('review-2 ${STATUS_ACTION_NAME}'`);
-    // A wrapped rejection is accepted only as Vitest renders it: nothing after "resolving" on its line.
+    // Built in parts so the suite-shape counter never mistakes it for a registration.
+    const registration = ['it', `('review-2 ${STATUS_ACTION_NAME}'`].join('');
+    expect(readFileSync(join(repoRoot, 'test/worker-verification-policy.test.ts'), 'utf8')).toContain(registration);
+  });
+
+  it('a wrapped rejection is accepted only as Vitest renders it: nothing after "resolving" on its line', () => {
     const r = report('Error: promise rejected "Error: Command failed: x" instead of resolving (and more)');
     r.testResults[0]!.assertionResults[0]!.title = `review-2 ${STATUS_ACTION_NAME}`;
     expect(() => classifyReviewedRed(r, 2, 'fast')).toThrow(/non-behavioral/u);

@@ -149,7 +149,7 @@ function shellCommandSubstitutionDepthAt(codeLines: readonly string[], lineIndex
  * Adding a test? Bump this pin — that is the point.
  */
 const PINS: Record<string, number> = {
-  'classify-scheduled-verification-red.test.ts': 15,
+  'classify-scheduled-verification-red.test.ts': 18,
   'assert-binned-baseline.test.ts': 3,
   'classify-baseline.test.ts': 32,
   'assert-merge-authority-baseline.test.ts': 8,
