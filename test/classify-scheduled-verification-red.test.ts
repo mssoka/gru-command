@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { exec, execFileSync, spawnSync } from 'node:child_process';
+import { exec, execFileSync, spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
@@ -71,11 +72,20 @@ describe('reviewed-candidate behavioral RED custody', () => {
   const BASELINES = ['tools/scheduled-verification-review-baseline.sh', 'tools/scheduled-verification-review2-baseline.sh'] as const;
   const BASELINE_LIB = 'tools/scheduled-verification-baseline-lib.sh';
   const repoRoot = join(import.meta.dirname, '..');
-  /** A child shell that cannot be redirected to this repository by an
-   * ambient git environment (a hook's GIT_DIR) and never hangs the suite. */
   /** The environment minus every `GIT_*` variable: no hook's GIT_DIR can
    * point a fixture's git at this repository. */
   const gitFree = (): NodeJS.ProcessEnv => Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('GIT_') && !name.startsWith('GRU_HELPER_')));
+  /** Each baseline's pinned reviewed candidate. */
+  const candidateOf = (script: string): string | undefined => /^base=([0-9a-f]{40})$/mu.exec(readFileSync(join(repoRoot, script), 'utf8'))?.[1];
+  /** The reviewed candidates are the owner's pre-merge commits: a clone that
+   * holds them (the one they were reviewed in) can read them; GitHub never
+   * carried them, so CI's full-history clone cannot. */
+  const candidatesHere = BASELINES.every((script) => {
+    const candidate = candidateOf(script);
+    return candidate !== undefined && spawnSync('git', ['-C', repoRoot, 'cat-file', '-e', `${candidate}^{commit}`], { env: gitFree() }).status === 0;
+  });
+  /** A child shell that cannot be redirected to this repository by an
+   * ambient git environment (a hook's GIT_DIR) and never hangs the suite. */
   function shell(argv: readonly string[], cwd: string, tmp: string, env: NodeJS.ProcessEnv = {}) {
     const run = spawnSync('sh', argv, { cwd, encoding: 'utf8', timeout: 60_000, env: { ...gitFree(), TMPDIR: tmp, ...env } });
     expect(run.signal, `sh ${argv[0] ?? ''} finished within its timeout (signal ${String(run.signal)})`).toBeNull();
@@ -100,19 +110,13 @@ describe('reviewed-candidate behavioral RED custody', () => {
   });
 
   it('the generating scopes cannot reach a missing compiled helper: they build it in the snapshot and refuse when it is absent (#358 exclusion evidence)', () => {
-    const shallow = execFileSync('git', ['-C', repoRoot, 'rev-parse', '--is-shallow-repository'], { encoding: 'utf8' }).trim();
-    if (shallow === 'true') throw new Error('fixture setup: this evidence reads pinned historical commits — fetch full history (git fetch --unshallow)');
     for (const script of BASELINES) {
       const lines = readFileSync(join(repoRoot, script), 'utf8').split(/\r?\n/u);
       const at = (line: string): number => {
         expect(lines.filter((candidate) => candidate === line), `${script} has the line ${JSON.stringify(line)} exactly once`).toHaveLength(1);
         return lines.indexOf(line);
       };
-      const candidate = /^base=([0-9a-f]{40})$/mu.exec(lines.join('\n'))?.[1];
-      expect(candidate, `${script} names its reviewed candidate`).toBeDefined();
-      if (spawnSync('git', ['-C', repoRoot, 'cat-file', '-e', `${candidate!}^{commit}`], { env: gitFree() }).status !== 0) {
-        throw new Error(`fixture setup: reviewed candidate ${candidate!} is not in this clone — fetch it`);
-      }
+      expect(candidateOf(script), `${script} names its reviewed candidate`).toBeDefined();
       // Abort-on-error, sources checked before the snapshot exists, into the
       // snapshot, build, the helper must exist and load, and only then tests.
       const order = [at('set -e'), lines.findIndex((line) => line.startsWith('set -- test/')), at('lib="$(dirname "$0")/scheduled-verification-baseline-lib.sh"'), at('. "$lib"'),
@@ -121,6 +125,12 @@ describe('reviewed-candidate behavioral RED custody', () => {
         lines.findIndex((line) => line.startsWith('npx vitest run'))];
       expect(order.every((index) => index > 0), `${script}: ${JSON.stringify(order)}`).toBe(true);
       expect([...order].sort((a, b) => a - b), `${script}: set -e, files, lib, sources, snapshot dir, snapshot, cd, build, helper, set +e, tests`).toEqual(order);
+    }
+  });
+
+  it.skipIf(!candidatesHere)('each reviewed candidate carries the helper source its snapshot build compiles, and a policy naming it there (#358 exclusion evidence; reads the pinned pre-merge candidates, so only in a clone that holds them)', () => {
+    for (const script of BASELINES) {
+      const candidate = candidateOf(script);
       // The candidate carries the helper source the build compiles, and its
       // policy names that helper inside the snapshot the build ran in.
       const show = (path: string) => execFileSync('git', ['-C', repoRoot, 'show', `${candidate!}:${path}`], { encoding: 'utf8' });
@@ -180,7 +190,7 @@ describe('reviewed-candidate behavioral RED custody', () => {
       expect(check(`${head} '' present.ts`).stderr).toBe('require_pinned_sources was given a regressions revision that is empty or not a plain revision: ""\n');
       // A revision git would read as an option is never handed to it.
       expect(check(`--output=/tmp/x ${head} present.ts`).stderr).toBe('require_pinned_sources was given a candidate revision that is empty or not a plain revision: "--output=/tmp/x"\n');
-      for (const odd of ['a b', 'HEAD:secret', 'abc*', 'a..b', 'a...b', '^x']) {
+      for (const odd of ['a b', 'HEAD:secret', 'abc*', 'a..b', 'a...b', '^x', 'abc^-', 'abc^-1', '~1', '/x', 'a//b', 'a/', 'a.']) {
         expect(check(`'${odd}' ${head} present.ts`).stderr, odd).toBe(`require_pinned_sources was given a candidate revision that is empty or not a plain revision: "${odd}"\n`);
       }
       // The snapshot is the candidate's tree, with no archive left behind...
@@ -194,7 +204,7 @@ describe('reviewed-candidate behavioral RED custody', () => {
       expect(libCall(`snapshot_candidate '${join(dir, 'absent')}' ${head}`, repo, join(dir, 'tmp')).stderr).toBe(`snapshot directory ${join(dir, 'absent')} must be an existing, empty, real directory\n`);
       // A linked target is refused: a failure would remove only the link, never the partial tree.
       const target = join(dir, 'link-target'); mkdirSync(target); symlinkSync(target, join(dir, 'linked'));
-      for (const linked of [join(dir, 'linked'), `${join(dir, 'linked')}/`, `${join(dir, 'linked')}//`, `${join(dir, 'linked')}/.`]) {
+      for (const linked of [join(dir, 'linked'), `${join(dir, 'linked')}/`, `${join(dir, 'linked')}//`, `${join(dir, 'linked')}/.`, `${target}/.`, `${target}/..`]) {
         const refused = libCall(`snapshot_candidate '${linked}' ${head}`, repo, join(dir, 'tmp'));
         expect([refused.status, refused.stderr], linked).toEqual([2, `snapshot directory ${linked} must be an existing, empty, real directory\n`]);
       }
@@ -207,6 +217,15 @@ describe('reviewed-candidate behavioral RED custody', () => {
       expect(failed.status).toBe(2);
       expect(failed.stderr).toMatch(new RegExp(`reviewed candidate ${absent} could not be archived into .*fresh — refusing\\n$`, 'u'));
       expect(readdirSync(join(dir, 'tmp'))).toEqual(['snap']);
+      // A dash-named snapshot is removed as a name, never read as rm's options.
+      mkdirSync(join(repo, '-snap'));
+      expect(libCall(`snapshot_candidate -snap ${absent}`, repo, join(dir, 'tmp')).status).toBe(2);
+      expect(existsSync(join(repo, '-snap'))).toBe(false);
+      // A real directory under a linked parent is still a real directory.
+      mkdirSync(join(dir, 'parent-real', 'snap2'), { recursive: true });
+      symlinkSync(join(dir, 'parent-real'), join(dir, 'parent-link'));
+      const underLink = libCall(`snapshot_candidate '${join(dir, 'parent-link', 'snap2')}' ${head}`, repo, join(dir, 'tmp'));
+      expect([underLink.status, underLink.stderr, readdirSync(join(dir, 'parent-real', 'snap2'))]).toEqual([0, '', ['present.ts']]);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
@@ -274,13 +293,48 @@ describe('reviewed-candidate behavioral RED custody', () => {
       writeFileSync(helper, "import './scheduler.js';\nconsole.log('loading capture helper');\nprocess.stdout.write('no newline');\n");
       expect(guard()).toMatchObject({ status: 0, stderr: '' });
       // The bound itself is a whole number from 1 to 3600000 — never one that disables it.
-      for (const bound of ['soon', '0', '00', '0000300', '-5', '1.5', '3600001', '99999999', '99999999999999999999999']) {
+      for (const bound of ['soon', '0', '00', '01', '0300', '0000300', '-5', '1.5', '3600001', '99999999', '99999999999999999999999']) {
         expect(libCall('require_built_helper', snapshot, join(dir, 'tmp'), { GRU_HELPER_LOAD_MS: bound }).stderr, bound)
           .toBe(`GRU_HELPER_LOAD_MS must be a whole number of milliseconds from 1 to 3600000, without leading zeros (got "${bound}")\n`);
       }
+      // ...and both ends of that range are bounds.
+      for (const bound of ['1', '3600000']) {
+        expect(libCall('require_built_helper', snapshot, join(dir, 'tmp'), { GRU_HELPER_LOAD_MS: bound }).stderr, bound).not.toMatch(/GRU_HELPER_LOAD_MS must be/u);
+      }
+      expect(libCall('require_built_helper', snapshot, join(dir, 'tmp'), { GRU_HELPER_LOAD_MS: '3600000' })).toMatchObject({ status: 0, stderr: '' });
       // The real compiled helper (this tree's build) loads without running.
       const real = libCall('require_built_helper', repoRoot, join(dir, 'tmp'));
       expect([real.status, real.stderr]).toEqual([0, '']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('an interrupted helper load takes its group down, leaves no temporary directory, and is said as an interruption (#358)', async () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), 'gru-helper-interrupt-')));
+    try {
+      const snapshot = join(dir, 'snapshot'); mkdirSync(join(snapshot, 'dist', 'verify'), { recursive: true }); mkdirSync(join(dir, 'tmp'));
+      writeFileSync(join(snapshot, 'package.json'), '{"type":"module"}\n');
+      const pidFile = join(dir, 'kid.pid');
+      writeFileSync(join(snapshot, 'dist', 'verify', 'capture-cli.js'), `import { spawn } from 'node:child_process';\nimport { writeFileSync } from 'node:fs';\nconst kid = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' });\nwriteFileSync(${JSON.stringify(pidFile)}, String(kid.pid));\nsetInterval(() => {}, 1000);\nawait new Promise(() => {});\n`);
+      const run = spawn('sh', ['-c', '. "$1" && require_built_helper', 'lib', join(repoRoot, BASELINE_LIB)], { cwd: snapshot, env: { ...gitFree(), TMPDIR: join(dir, 'tmp'), GRU_HELPER_LOAD_MS: '60000' }, stdio: ['ignore', 'ignore', 'pipe'] });
+      let stderr = '';
+      run.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk; });
+      const exited = once(run, 'exit');
+      const deadline = Date.now() + 20_000;
+      const kidPid = (): number => (existsSync(pidFile) ? Number(readFileSync(pidFile, 'utf8')) : 0);
+      while (kidPid() <= 1 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+      const kid = kidPid();
+      expect(kid > 1, 'the load started its descendant').toBe(true);
+      // The load guard is the shell's node child.
+      const guards = execFileSync('pgrep', ['-P', String(run.pid), '-f', 'input-type=module'], { encoding: 'utf8' }).trim().split('\n');
+      expect(guards).toHaveLength(1);
+      process.kill(Number(guards[0]), 'SIGTERM');
+      const [status] = await exited;
+      expect([status, stderr]).toEqual([130, `the helper load was interrupted (status 130) — nothing was judged; refusing (snapshot kept at ${snapshot})\n`]);
+      const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
+      const until = Date.now() + 5000;
+      while (alive(kid) && Date.now() < until) await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(alive(kid), 'the load\'s descendant went with it').toBe(false);
+      expect(readdirSync(join(dir, 'tmp')).filter((name) => name.startsWith('gru-helper-load-'))).toEqual([]);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
