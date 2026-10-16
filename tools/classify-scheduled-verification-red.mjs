@@ -2,6 +2,9 @@ import { readFileSync } from 'node:fs';
 import process from 'node:process';
 import { pathToFileURL } from 'node:url';
 
+/** The status-action regression's name (its title without the review prefix). */
+export const STATUS_ACTION_NAME = 'advertised shell-safe status action authenticates literal dollar/backtick host config paths';
+
 const adapterNames = [
   'npm aliases refuse independently before producer start',
   'conventional option positions refuse independently',
@@ -11,7 +14,7 @@ const adapterNames = [
   'plain unquoted source heredocs and diagnostic reads execute normally',
 ];
 const policyNames = [
-  'advertised shell-safe status action authenticates literal dollar/backtick host config paths',
+  STATUS_ACTION_NAME,
   'conventional aliases/options/control/path forms classify without data-position inference',
   'exact declared npm script words survive normalization',
   'plain unquoted heredoc bodies are data, actual expansions and executable neighbors still refuse',
@@ -42,15 +45,20 @@ const review1Names = [
 /** The one listed test whose behavioral RED is a wrapped subprocess
  * rejection: it awaits the advertised status action with `.resolves`, so the
  * candidate's failing action surfaces as `promise rejected "Error: Command
- * failed…"`. The test throws a named `fixture setup:` error (never an
- * assertion) when its compiled helper is missing, so that wrapper here can
- * only be the advertised action failing (#358). No other title may pass a
- * wrapped rejection off as behavioral RED. */
-const wrappedRejectionNames = new Set(['advertised shell-safe status action authenticates literal dollar/backtick host config paths']);
+ * failed…"`. Vitest truncates that rendering (no stderr survives), so a
+ * missing compiled helper would read IDENTICALLY — the report alone cannot
+ * tell them apart. It is excluded upstream instead (#358): each generating
+ * scope builds the candidate, which carries src/verify/capture-cli.ts, under
+ * `set -e` before any test runs, and the policy names the helper inside that
+ * built snapshot (pinned by the exclusion test); the current status test also
+ * throws a named `fixture setup:` error when its helper is missing. No other
+ * title may pass a wrapped rejection off as behavioral RED. */
+const wrappedRejectionNames = new Set([STATUS_ACTION_NAME]);
+const WRAPPED_COMMAND_FAILURE = /^Error: promise rejected "Error: Command failed\b[\s\S]*" instead of resolving(?:\n|$)/u;
 
 function isBehavioralFailure(name, text) {
   if (/^AssertionError:/su.test(text)) return true;
-  return wrappedRejectionNames.has(name) && /^Error: promise rejected "Error: Command failed\b.* instead of resolving/su.test(text);
+  return wrappedRejectionNames.has(name) && WRAPPED_COMMAND_FAILURE.test(text);
 }
 
 /** RED is a named behavioral assertion, never an arbitrary nonzero runner exit.
