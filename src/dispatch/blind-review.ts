@@ -356,25 +356,32 @@ export function blindSessionIdentity(sessionFile: string): string {
  * nearest ancestor that still resolves, canonical, plus the names below it —
  * the same identity it had while it existed. Any failure other than absence
  * is raised. */
-function canonicalPathOf(path: string): string {
+function canonicalPathOf(path: string, hops = 0): string {
+  // As realpath bounds its own walk: a chain this long is a loop.
+  if (hops > 40) throw Object.assign(new Error(`too many levels of links resolving ${path}`), { code: 'ELOOP' });
   try {
     return realpathSync(path);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     const parent = dirname(path);
     if ((code !== 'ENOENT' && code !== 'ENOTDIR') || parent === path) throw error;
-    // A link whose target is gone names that target, as it did while the
-    // target existed.
-    const target = danglingLinkTarget(path);
-    return target === null ? join(canonicalPathOf(parent), basename(path)) : canonicalPathOf(target);
+    // A link whose target is gone names that target — resolved from the
+    // link's own canonical directory, as realpath did while the target
+    // existed.
+    const canonicalParent = canonicalPathOf(parent, hops);
+    const link = danglingLinkTarget(path);
+    return link === null ? join(canonicalParent, basename(path)) : canonicalPathOf(resolve(canonicalParent, link), hops + 1);
   }
 }
-/** Where a symbolic link at `path` points, or null when there is none. */
+/** What a symbolic link at `path` holds, or null when there is no link;
+ * any failure other than absence is raised. */
 function danglingLinkTarget(path: string): string | null {
   try {
-    return lstatSync(path).isSymbolicLink() ? resolve(dirname(path), readlinkSync(path)) : null;
-  } catch {
-    return null;
+    return lstatSync(path).isSymbolicLink() ? readlinkSync(path) : null;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return null;
+    throw error;
   }
 }
 

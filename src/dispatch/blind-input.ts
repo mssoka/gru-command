@@ -618,15 +618,23 @@ const MAX_PATH_CHARS = 4096;
  * clock time whose words follow the last slash (`/var/log/app.log started
  * at 10`), a lone `/word` (`ratio 3 /4:12:`) or a bare `//host` URL. */
 function fileLikeOutside(candidate: string): boolean {
-  const parts = candidate.split('/');
-  const last = parts[parts.length - 1]!;
+  // Index arithmetic, not a split: a dense line yields thousands of
+  // candidates, and none allocates per component.
+  const lastSlash = candidate.lastIndexOf('/');
+  const last = candidate.slice(lastSlash + 1);
   if (last === '' || /\s/u.test(last)) return false;
   if (candidate.startsWith('../')) return true;
-  // A UNC share (`//host/share/…/file`) names a host, a share and a file.
-  if (candidate.startsWith('//')) return parts.length >= 5 && parts[2] !== '' && parts[3] !== '';
-  // A POSIX or drive-letter absolute path names a directory and a file.
-  if (candidate.startsWith('/')) return parts.length >= 3 && parts[1] !== '';
-  if (/^[A-Za-z]:\//u.test(candidate)) return parts.length >= 3 && parts[1] !== '';
+  if (candidate.startsWith('//')) {
+    // A UNC share (`//host/share/…/file`) names a host — never spaced, so
+    // `//a b/…` prose is not one — a share and a file.
+    const hostEnd = candidate.indexOf('/', 2);
+    const shareEnd = hostEnd < 0 ? -1 : candidate.indexOf('/', hostEnd + 1);
+    return hostEnd > 2 && shareEnd > hostEnd + 1 && !/\s/u.test(candidate.slice(2, hostEnd));
+  }
+  // A POSIX or drive-letter absolute path names a directory and a file (a
+  // file directly under a root, `/x` or `C:/x`, is too like prose to count).
+  if (candidate.startsWith('/')) return candidate.indexOf('/', 1) > 1;
+  if (/^[A-Za-z]:\//u.test(candidate)) return candidate.indexOf('/', 3) > 3;
   return false;
 }
 
@@ -646,7 +654,9 @@ export function grepPathCandidates(line: string): readonly { readonly path: stri
   if (!/\s/u.test(path)) return [{ path, byShape: true }];
   const from = Math.max(0, path.length - MAX_PATH_CHARS);
   const starts = from === 0 ? [0] : [];
-  const start = /(?<=[\s/])\S/gu;
+  // A start is a word after whitespace, or a component after a slash — never
+  // the second slash of `//`, which no path component begins with.
+  const start = /(?<=\s)\S|(?<=\/)[^\s/]/gu;
   start.lastIndex = from;
   for (let match = start.exec(path); match !== null; match = start.exec(path)) starts.push(match.index);
   return starts.map((at) => {

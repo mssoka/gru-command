@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
@@ -218,6 +218,18 @@ describe('observeBlindSessionAccess — repeated scans count distinct reads (iss
       const living = blindSessionIdentity(join(loopDir, 'link.jsonl'));
       rmSync(join(loopDir, 'target.jsonl'));
       expect(blindSessionIdentity(join(loopDir, 'link.jsonl'))).toBe(living);
+      // A relative link, reached through a linked directory, and a two-hop chain: the same.
+      mkdirSync(join(loopDir, 'real'));
+      symlinkSync(join(loopDir, 'real'), join(loopDir, 'alias'));
+      writeFileSync(join(loopDir, 'real', 'deep.jsonl'), '');
+      symlinkSync('deep.jsonl', join(loopDir, 'real', 'hop1.jsonl'));
+      symlinkSync('hop1.jsonl', join(loopDir, 'real', 'hop2.jsonl'));
+      const relative = blindSessionIdentity(join(loopDir, 'alias', 'hop1.jsonl'));
+      const chained = blindSessionIdentity(join(loopDir, 'alias', 'hop2.jsonl'));
+      expect(chained).toBe(relative);
+      rmSync(join(loopDir, 'real', 'deep.jsonl'));
+      expect(blindSessionIdentity(join(loopDir, 'alias', 'hop1.jsonl'))).toBe(relative);
+      expect(blindSessionIdentity(join(loopDir, 'alias', 'hop2.jsonl'))).toBe(chained);
     } finally { rmSync(loopDir, { recursive: true, force: true }); }
     // Gone through a linked directory: the same identity it had while it existed.
     const dir = realpathSync(mkdtempSync(join(tmpdir(), 'blind-gone-')));

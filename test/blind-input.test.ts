@@ -90,6 +90,10 @@ describe('path and content classification', () => {
     // Traversal is never a valid package path.
     expect(classifyBlindPath('../outside/secret.md', rule)).toMatch(/invalid package path/u);
     expect(classifyBlindPath('/abs/path.ts', rule)).toMatch(/invalid package path/u);
+    // So is a Windows drive or UNC share, in either slash direction.
+    for (const path of ['C:\\Users\\x\\f.md', 'C:/x', '\\\\host\\share\\f.md', 'docs\\..\\..\\x']) {
+      expect(classifyBlindPath(path, rule), path).toMatch(/invalid package path/u);
+    }
   });
 
   it('detects history-bearing text by content, so a renamed spec is still caught', () => {
@@ -352,7 +356,7 @@ describe('observed reviewer access — grep paths with spaces (#357)', () => {
       { index: 11, toolName: 'bash', text: '\\\\host\\my share\\f.md:1:x' },
     ], DEFAULT_BLIND_ISOLATION_RULE).map((p) => p.path)).toEqual(['../other repo/docs/issues/a.md', 'C:/Users/a b/notes.md', '//host/my share/f.md']);
     // A lone `/word` or a `//host` URL in prose is no outside path.
-    for (const text of ['ratio 3 /4:12:', 'run /help:5:', 'see //host/x y:1:', 'the dir /tmp/:1:']) {
+    for (const text of ['ratio 3 /4:12:', 'run /help:5:', 'see //host/x y:1:', 'the dir /tmp/:1:', 'see //a b/c/d.md:1:', 'at C:/x then:1:']) {
       expect(scanObservedAccess([{ index: 9, toolName: 'bash', text }], DEFAULT_BLIND_ISOLATION_RULE), text).toEqual([]);
     }
   });
