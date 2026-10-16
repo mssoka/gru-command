@@ -605,7 +605,7 @@ describe('blind review commissioning (issue #316)', () => {
       expect.objectContaining({ code: 'unbound-package', where: 'src/feature.ts', detail: expect.stringMatching(/the hunk at -1 shows lines that are not "src\/feature\.ts" at /u) }),
     ]);
     // ...nor a base the object store lacks, or one that is not the target's ancestor — with or without a diff.
-    const unrelated = h.repo.git(['commit-tree', '-m', 'unrelated', `${target}^{tree}`]).trim();
+    const unrelated = h.repo.git(['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit-tree', '-m', 'unrelated', `${target}^{tree}`]).trim();
     for (const [label, base_sha] of [['fictitious', 'e'.repeat(40)], ['unrelated', unrelated]] as const) {
       const filesOnly = await call(h.port, 'POST', '/api/dispatch', blindReview(`rev-base-${label}`, {
         repo_path: h.repo.path, target_sha: target, input_package: { base_sha, target_sha: target, files: pkg.files },

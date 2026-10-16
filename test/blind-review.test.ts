@@ -154,6 +154,14 @@ describe('an unread session stands until a later scan of that same session reads
     rmSync(sessionA);
     observeBlindSessionAccess(h.ledger, 'job-stands', sessionA);
     expect(blindCoverageOf(h.ledger, 'job-stands')).toMatchObject({ state: 'unobserved', qualifying: false });
+    // A turn with no transcript at all stands for good: no later clean scan
+    // of any session can say what it read, and a repeat adds nothing.
+    h.admit('job-no-transcript');
+    observeBlindSessionAccess(h.ledger, 'job-no-transcript', null);
+    observeBlindSessionAccess(h.ledger, 'job-no-transcript', null);
+    expect(h.ledger.listJobEventsByKinds('job-no-transcript', [BLIND_ACCESS_UNOBSERVABLE_EVENT])).toHaveLength(1);
+    observeBlindSessionAccess(h.ledger, 'job-no-transcript', sessionB);
+    expect(blindCoverageOf(h.ledger, 'job-no-transcript')).toMatchObject({ state: 'unobserved', qualifying: false });
     h.dispose();
   });
 });
@@ -210,27 +218,31 @@ describe('real persisted transcripts (#360 R5-V1 round 1)', () => {
       ['toolu_m', 'MultiEdit', { file_path: '/lanes/job-1/src/a.ts', edits: [] }],
       ['toolu_r', 'NotebookRead', { notebook_path: '/lanes/job-1/src/b.ipynb' }],
       ['toolu_n', 'NotebookEdit', { notebook_path: '/lanes/job-1/src/b.ipynb', new_source: 'x' }],
-      // Searches name a directory, not a file they returned.
+      // A content search names its path: a directory, or one file.
       ['toolu_g', 'Grep', { pattern: 'x', path: '/lanes/job-1/docs/issues' }],
+      ['toolu_f', 'Grep', { pattern: 'state', path: '/lanes/job-1/_bmad-output/state.json' }],
+      // A listing names a directory, never a file it returned.
       ['toolu_d', 'Glob', { pattern: '**/*.md', path: '.' }],
       ['toolu_b', 'Bash', { command: 'ls' }],
     ] as const;
     const transcript = join(dir, 'claude.jsonl');
     writeFileSync(transcript, calls.flatMap(([id, name, input]) => [
       { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id, name, input }] } },
-      { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: name === 'Glob' || name === 'Grep' ? 'No files found' : 'ok' }] } },
+      { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: id === 'toolu_f' ? '"state": "done"' : name === 'Glob' || name === 'Grep' ? 'No files found' : 'ok' }] } },
     ]).map((line) => JSON.stringify(line)).join('\n') + '\n');
     expect(readSessionToolResults(transcript)?.map((result) => result.readPath ?? null)).toEqual([
-      '/lanes/job-1/_bmad-output/a.md', '/lanes/job-1/src/a.ts', '/lanes/job-1/src/b.ipynb', '/lanes/job-1/src/b.ipynb', null, null, null,
+      '/lanes/job-1/_bmad-output/a.md', '/lanes/job-1/src/a.ts', '/lanes/job-1/src/b.ipynb', '/lanes/job-1/src/b.ipynb',
+      '/lanes/job-1/docs/issues', '/lanes/job-1/_bmad-output/state.json', null, null,
     ]);
-    // Through the ledger, only the Edit of the excluded file is access.
+    // Through the ledger: the Edit of an excluded file and the content search
+    // of one are access; the search over a directory and the listing are not.
     const h = blindLedger();
     h.admit('job-edit');
     h.lane('job-edit', '/lanes/job-1');
     observeBlindSessionAccess(h.ledger, 'job-edit', transcript);
-    expect(blindCoverageOf(h.ledger, 'job-edit')).toMatchObject({ state: 'invalidated', prohibitedAccess: 1 });
+    expect(blindCoverageOf(h.ledger, 'job-edit')).toMatchObject({ state: 'invalidated', prohibitedAccess: 2 });
     const record = h.ledger.latestJobEvent('job-edit', BLIND_ACCESS_EVENT)?.payload as { prohibited: { path: string }[] };
-    expect(record.prohibited.map((hit) => hit.path)).toEqual(['_bmad-output/a.md']);
+    expect(record.prohibited.map((hit) => hit.path)).toEqual(['_bmad-output/a.md', '_bmad-output/state.json']);
     h.dispose();
   });
 });

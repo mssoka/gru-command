@@ -695,8 +695,9 @@ export function evaluateBlindPackage(pkg: BlindInputPackage, rule: BlindIsolatio
   const fileRecords: { path: string; sha256: string; blobSha: string }[] = [];
   for (const file of files) {
     // A file's path heads its fenced bytes in the reviewer's briefing: a
-    // control character there would put text outside the data fence.
-    if ([...file.path].some((char) => char.charCodeAt(0) < 0x20 || char.charCodeAt(0) === 0x7f)) {
+    // control or line-separator character there would put text outside the
+    // data fence (C0, DEL, C1, U+2028, U+2029).
+    if ([...file.path].some((char) => { const code = char.charCodeAt(0); return code < 0x20 || (code >= 0x7f && code <= 0x9f) || code === 0x2028 || code === 0x2029; })) {
       violations.push({ code: 'excluded-path', where: JSON.stringify(file.path), detail: `invalid package path ${JSON.stringify(file.path)} (holds a control character)` });
       continue;
     }

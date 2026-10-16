@@ -437,12 +437,13 @@ derived only from the admission, `review.blind-access-observed` and
 `job.blind-access-unobservable` facts. The reviewer's session tool results are
 scanned at turn settle (grep lines landing in excluded paths, paged reads
 returning history-bearing text, and any file-content tool call — pi `read`/`edit`,
-Claude `Read`/`Edit`/`MultiEdit`/`NotebookRead`/`NotebookEdit` — whose result
-returned, even empty or binary, for an excluded file, however its bytes look; an
-absolute path inside the job's lane is judged by its repository path, one outside
-it is outside the package, and the repository root itself is no file. A search
-— `grep`, `Grep`, `Glob`, `find`, `ls` — is judged by the paths and text its
-output shows, never by the directory it named). A settled session whose
+Claude `Read`/`Edit`/`MultiEdit`/`NotebookRead`/`NotebookEdit`, and a content
+search (pi `grep`, Claude `Grep`) pointed at one file — whose result returned,
+even empty or binary, for an excluded file, however its bytes look; an absolute
+path inside the job's lane is judged by its repository path, one outside it is
+outside the package, and the repository root itself is no file. A search over a
+directory, and a listing (`Glob`, `find`, `ls`), is judged by the paths and text
+its output shows, never by the directory it named). A settled session whose
 transcript cannot be read at all (absent, unreadable or over the size bound)
 records `job.blind-access-unobservable` once while it stands — never an empty,
 clean-reading observation — and its coverage is `unobserved`, not qualifying,

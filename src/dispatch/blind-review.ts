@@ -610,17 +610,14 @@ export function recordObservedAccess(
   return blindCoverageOf(ledger, jobId);
 }
 
-const ACCESS_HISTORY_LIMIT = 100_000;
-
 /** The sessions of the job found unreadable that no later scan of that same
  * session has read since. A turn with no transcript at all (session null)
  * has nothing a later scan could read: it stands for good, so its job stays
  * `unobserved` — what that turn read is unknown, whatever came after. */
 function unreadSessions(ledger: LedgerApi, jobId: string): ReadonlySet<string | null> {
-  const events = ledger.listJobEventsByKinds(jobId, [BLIND_ACCESS_EVENT, BLIND_ACCESS_UNOBSERVABLE_EVENT], { limit: ACCESS_HISTORY_LIMIT });
-  if (events.length === ACCESS_HISTORY_LIMIT) {
-    throw new Error(`job "${jobId}" holds ${String(ACCESS_HISTORY_LIMIT)} or more blind access events — too many to judge its unread sessions`);
-  }
+  // The whole history, never a truncated window: an unread session older
+  // than any window must still stand.
+  const events = ledger.listJobEventsByKinds(jobId, [BLIND_ACCESS_EVENT, BLIND_ACCESS_UNOBSERVABLE_EVENT], { limit: Number.MAX_SAFE_INTEGER });
   const unread = new Set<string | null>();
   // The listing is newest first; the history is replayed oldest first.
   for (const event of [...events].reverse()) {
@@ -718,14 +715,17 @@ export function readSessionToolResults(sessionFile: string | null): readonly Obs
   }
   const out: ObservedToolResult[] = [];
   // File-content calls by id, so each result knows the file it returned
-  // (#360 R5-B5): the tools whose result IS the file's bytes — pi `read`,
+  // (#360 R5-B5): the tools whose result is a file's bytes — pi `read`,
   // `edit` {path}; Claude `Read`, `Edit`, `MultiEdit` {file_path},
-  // `NotebookRead`, `NotebookEdit` {notebook_path}. A search (`grep`, `Grep`,
-  // `Glob`, `find`, `ls`) names a directory, not a file it returned: its
-  // output is judged by the paths and text it shows, as before.
+  // `NotebookRead`, `NotebookEdit` {notebook_path} — and a content search
+  // (pi `grep`, Claude `Grep` {path}), whose lines from a single file carry
+  // no path prefix. A path naming a directory matches no file glob, so a
+  // search over a directory (or `Glob`, `find`, `ls`) is judged by the paths
+  // and text its output shows, as before.
   const reads = new Map<string, string>();
   const CONTENT_TOOLS: Readonly<Record<string, 'path' | 'file_path' | 'notebook_path'>> = {
-    read: 'path', edit: 'path', Read: 'file_path', Edit: 'file_path', MultiEdit: 'file_path', NotebookRead: 'notebook_path', NotebookEdit: 'notebook_path',
+    read: 'path', edit: 'path', grep: 'path', Read: 'file_path', Edit: 'file_path', MultiEdit: 'file_path', Grep: 'path',
+    NotebookRead: 'notebook_path', NotebookEdit: 'notebook_path',
   };
   const callPath = (name: unknown, args: unknown): string | null => {
     const key = typeof name === 'string' && Object.hasOwn(CONTENT_TOOLS, name) ? CONTENT_TOOLS[name] : undefined;
