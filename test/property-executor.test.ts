@@ -4,7 +4,7 @@ import fs, { existsSync, linkSync, mkdirSync, readFileSync, symlinkSync, writeFi
 import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createBoundedPropertyCapture, createPropertyExecutor, createReceiptRetention, framedRunnerReport, isSealedExecutionReceipt, noReportReasons, NONCE_READER_SOURCE, ReceiptRetentionError, resolveSandboxBackend, validatePlanAgainstHostApproval } from '../src/property/executor.js';
+import { createBoundedPropertyCapture, createPropertyExecutor, PreExecutionRejectionError, createReceiptRetention, framedRunnerReport, isSealedExecutionReceipt, noReportReasons, NONCE_READER_SOURCE, ReceiptRetentionError, resolveSandboxBackend, validatePlanAgainstHostApproval } from '../src/property/executor.js';
 import { VITEST_FAST_CHECK_ADAPTER as adapter } from '../src/property/adapters/vitest-fast-check.js';
 import { applyOverlayFiles, applyOverlayFilesAllOrNothing } from '../src/property/overlay.js';
 import { buildSourceIdentity } from '../src/property/receipts.js';
@@ -92,15 +92,15 @@ describe('host property executor (positive sandbox controls on macOS; other host
   it('reads the fd-3 nonce through EAGAIN within its budget, and a close failure never masks the read error (#378)', () => {
     type Step = number | string | Error;
     const errno = (code: string): Error => Object.assign(new Error(code), { code });
-    const reader = new Function('readSync', 'closeSync', `${NONCE_READER_SOURCE}\nreturn nonce;`) as (read: (fd: number, buffer: Buffer, offset: number) => number, close: (fd: number) => void) => string;
+    const reader = new Function('readSync', 'closeSync', `${NONCE_READER_SOURCE}\nreturn nonce;`) as (read: (fd: number, buffer: Buffer, offset: number, length: number) => number, close: (fd: number) => void) => string;
     const run = (steps: readonly Step[], closeError: Error | null = null) => {
       const closed: number[] = [];
       const queue = [...steps];
-      const read = (fd: number, buffer: Buffer, offset: number): number => {
+      const read = (fd: number, buffer: Buffer, offset: number, length: number): number => {
         expect(fd).toBe(3);
         const step = queue.shift() ?? 0;
         if (step instanceof Error) throw step;
-        if (typeof step === 'string') return buffer.write(step, offset);
+        if (typeof step === 'string') return buffer.write(step, offset, length);
         return step;
       };
       const close = (fd: number) => { closed.push(fd); if (closeError !== null) throw closeError; };
@@ -115,7 +115,11 @@ describe('host property executor (positive sandbox controls on macOS; other host
     expect(run([errno('EIO')], errno('EBADF'))).toMatchObject({ result: { code: 'EIO' } });
     // ...and is the failure when the read itself succeeded.
     expect(run([`${nonce}\n`, 0], errno('EBADF'))).toMatchObject({ result: { code: 'EBADF' } });
-  });
+    // A channel that never delivers gives up after its bounded wait, and still closes.
+    const started = Date.now();
+    expect(run(Array.from({ length: 2000 }, () => errno('EAGAIN')))).toMatchObject({ result: { code: 'EAGAIN' }, closed: [3] });
+    expect(Date.now() - started).toBeGreaterThanOrEqual(4900);
+  }, 20_000);
   it('refuses an invalid host receipt retention bound and reports the bound it enforces (#377)', () => {
     for (const bad of [0, -1, 1.5, 256 * 1024 * 1024 + 1]) expect(() => createPropertyExecutor({ maxRetainedOutputBytes: bad })).toThrow(/receipt retention bound/);
     expect(createPropertyExecutor({ maxRetainedOutputBytes: 4096 }).retention()).toEqual({ receipts: 0, retainedOutputBytes: 0, maxRetainedOutputBytes: 4096, evicted: 0 });
@@ -151,13 +155,27 @@ describe('host property executor (positive sandbox controls on macOS; other host
     expect(executor.resolveReceiptRef(second.ref)).toBe(second.receipt);
     expect(executor.retention()).toMatchObject({ receipts: 1, maxRetainedOutputBytes: bound, evicted: 1 });
   });
-  it('refuses by name a copied Vitest without the reporters module the framed report needs (#378)', async () => {
-    const f = scenarioRepo(PASS_RUNNER, { reportersModule: false }); fixtures.push(f);
+  async function assertUnsupportedRunner(layout: false | 'directory' | 'symlink'): Promise<void> {
+    const f = scenarioRepo(PASS_RUNNER, { reportersModule: layout }); fixtures.push(f);
     const executor = createPropertyExecutor();
     const input = { plan: f.plan, repoRoot: f.root, packageDir: f.root };
     const pending = executor.executePlan({ ...input, adapter, approval: executor.approvePlan(input) });
     if (process.platform !== 'darwin') { expect((await pending).executed).toBe(false); return; }
-    await expect(pending).rejects.toThrow(/copied Vitest has no node_modules\/vitest\/dist\/reporters\.js; the host-framed report cannot be produced/u);
+    const error = await pending.then(() => null, (caught: unknown) => caught);
+    expect(error).toBeInstanceOf(PreExecutionRejectionError);
+    expect((error as PreExecutionRejectionError).category).toBe('unsupported-runner');
+    expect(String(error)).toMatch(/copied Vitest has no regular file node_modules\/vitest\/dist\/reporters\.js; the host-framed report cannot be produced/u);
+  }
+  it('refuses by name a copied Vitest without the reporters module the framed report needs (#378)', () => assertUnsupportedRunner(false));
+  it('refuses a reporters module that is a directory (#378)', () => assertUnsupportedRunner('directory'));
+  it('refuses a reporters module that is a symbolic link (#378)', () => assertUnsupportedRunner('symlink'));
+  it('refuses a raw receipt without its framed report field, by name; null is no report (#378)', () => {
+    const f = fixture(PASS_RUNNER);
+    const raw = { stdout: '', stderr: '', report: null, exitCode: 1, signal: null, timedOut: false, durationMs: 1 };
+    for (const report of [undefined, 5]) {
+      expect(() => adapter.interpretExecution({ ...raw, report } as never, { ...f.plan, cwd: f.root }), String(report)).toThrow(TypeError);
+    }
+    expect(adapter.interpretExecution(raw, { ...f.plan, cwd: f.root }).kind).not.toBe('pass');
   });
   it('extracts exactly one nonce-framed runner report and nothing else (#378)', () => {
     const nonce = 'a'.repeat(64);

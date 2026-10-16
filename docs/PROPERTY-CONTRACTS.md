@@ -207,8 +207,10 @@ characters on a code-point boundary and carried with its sha256, and the
 reviewed oracle files — at most eight, paths at most 512 characters — are
 each bounded the same way at 8192, under fixed keys (`path`, `sha256`,
 `content`, and `contentKeptCodePoints`/`contentTotalCodePoints` when cut), so
-no value can forge or hide a directive line and the whole directive is
-bounded (#379). The reviewer's evidence line obeys the same rules and is
+no value can forge or hide a directive line and both sandbox-controlled and
+oracle text are bounded (the remaining values are the reviewed proposal's
+own fields, under its schema's limits) (#379). Escaping changes only how a
+value reads: JSON-parsing a literal gives back exactly the value. The reviewer's evidence line obeys the same rules and is
 bounded at 16384 escaped characters; past that it carries an excerpt of the
 evidence's JSON text (`JSON.stringify`) with that text's length and sha256,
 which a holder of the result can recompute.
@@ -225,8 +227,9 @@ preserves oracle bytes and adds a closed seed/path regression wrapper plus
 the actual minimized counterexample/replay audit file. Retention changes
 source bytes and invalidates prior review evidence; its files land in the live
 lane all-or-nothing (a mid-way failure removes the files and exactly the
-parent directories it created, and re-creates what it overwrote, bytes and
-mode — read-only files included, never through a link; an incomplete
+parent directories it created, and restores what it overwrote, bytes and
+mode, by renaming a re-created copy over it — read-only files included, never
+through a link, the original never absent meanwhile; an incomplete
 rollback fails loud with the original error and every cause, #380).
 
 **Owner-service lifecycle (#380).** The owner HTTP service keeps campaigns
@@ -236,9 +239,11 @@ owes no decision (the same job's first; never the entry being decided).
 Pending proposals, unresolved blockers and repairs awaiting their retention
 decision are never evicted (when only those remain, a new proposal is
 refused until they are decided). An eviction is audited
-(`owner-evicted-*.json` beside the entry's records) BEFORE the entry leaves
-memory — a failed audit write evicts nothing — and a later read of that id by
-its own job says it was evicted (the last 1024 evicted ids are remembered).
+(`owner-evicted-*.json` beside the entry's records) FIRST — before the new
+proposal leaves any record and before the entry leaves memory; a failed
+audit write evicts and records nothing and names the directory to fix — and
+a later read of that id by its own job says it was evicted (the last 1024
+evicted ids are remembered; an older one reads as unknown).
 Every campaign view carries
 `nextAction: { kind, detail }` with `kind` one of `decide-execute`,
 `decide-repair`, `decide-retain`, `propose-again` or `none`. A `failed` entry
@@ -265,8 +270,9 @@ digest and the pretty-printed artifact still serialize a whole receipt;
 with every receipt bounded, that cost is bounded too.
 
 **Authenticated runner report (#378).** The host-framed report needs the
-copied Vitest's own `dist/reporters.js` (a regular file); a layout without
-it is refused by name (`unsupported-runner`) before the run. When a run
+copied Vitest's own `dist/reporters.js` (a regular file — a directory or a
+link refuses); a layout without it is refused by name (`unsupported-runner`)
+before the run. When a run
 yields no framed report, its outcome names every cause that applies (output
 cap reached before the frame closed, a failed host report channel) or, when
 neither does, that the run printed no single complete frame; stdout itself is

@@ -212,11 +212,15 @@ describe('ordinary owner HTTP property actions (controlled minion; no JSON issua
       // An eviction whose audit cannot be written evicts nothing: A stays.
       const auditDir = join(h.serviceOptions.artifactsRoot, a.id);
       const evictedAudit = () => readdirSync(auditDir).filter((name) => name.startsWith('owner-evicted-'));
+      const campaignsBefore = readdirSync(h.serviceOptions.artifactsRoot).sort();
       chmodSync(auditDir, 0o500);
       try {
-        expect(() => service.propose(h.jobId, { campaign: f.reviewed })).toThrow(/EACCES|permission denied/iu);
+        expect(() => service.propose(h.jobId, { campaign: f.reviewed }))
+          .toThrow(new RegExp(`the cache is full and campaign ${a.id} could not be evicted: its audit could not be written in ${auditDir.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')} \\(.*EACCES.*\\); fix that directory, or decide a pending campaign, then propose again`, 'u'));
       } finally { chmodSync(auditDir, 0o700); }
       expect(evictedAudit()).toEqual([]);
+      // ...and the refused proposal left no record of its own.
+      expect(readdirSync(h.serviceOptions.artifactsRoot).sort()).toEqual(campaignsBefore);
       expect(service.read(h.jobId, a.id).state).toBe('retained');
       expect(service.read(h.jobId, b.id).state).toBe('proposed');
       // Once the audit can be written, the same proposal evicts A by name.

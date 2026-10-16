@@ -166,7 +166,7 @@ const PINS: Record<string, number> = {
   'property-resolve.test.ts': 22,
   'property-config.test.ts': 19,
   'property-metrics.test.ts': 15,
-  'property-executor.test.ts': 39,
+  'property-executor.test.ts': 42,
   'property-replay.test.ts': 8,
   'property-real-tool-campaign.test.ts': 10,
   'property-repair-ci.test.ts': 21,

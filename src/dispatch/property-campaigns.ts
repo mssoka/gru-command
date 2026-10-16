@@ -69,9 +69,12 @@ export function evictionVictim<T extends Pick<Entry, 'id' | 'jobId' | 'state' | 
   return candidates.find((entry) => entry.jobId === jobId) ?? candidates[0];
 }
 
+/** How many evicted ids a service remembers; an older one reads as unknown. */
+export const EVICTED_IDS_REMEMBERED = 1024;
+
 /** Remembers an evicted id (bounded, oldest forgotten first) so a later read
  * says "evicted" by name rather than "unknown". */
-export function rememberEvicted<V>(evicted: Map<string, V>, id: string, value: V, limit = 1024): void {
+export function rememberEvicted<V>(evicted: Map<string, V>, id: string, value: V, limit = EVICTED_IDS_REMEMBERED): void {
   evicted.delete(id);
   evicted.set(id, value);
   for (const oldest of evicted.keys()) {
@@ -187,12 +190,19 @@ export function createPropertyCampaignService(options: PropertyCampaignServiceOp
       const entry: Entry = { id, jobId, spec, heads: roots(spec).map(head), treeDigests: roots(spec).map((root) => propertyWorkspaceIdentity(root).digest), configHash: propertyConfigIdentity(spec.candidateRoot), artifactsDir: join(options.artifactsRoot, id), state: 'proposed', report: null, retainedPaths: [] };
       const victim = entries.size >= maxRetainedProposals ? evictionVictim(entries.values(), jobId, activeId) : undefined;
       if (entries.size >= maxRetainedProposals && victim === undefined) throw new PropertyOwnerActionError('process-local proposal retention limit reached: every retained campaign is a pending proposal, an unresolved blocker, a repair awaiting retention or the campaign being decided right now; decide those first');
+      if (victim !== undefined) {
+        // The eviction is audited beside the victim's own records FIRST —
+        // before the new proposal leaves any record and before the victim
+        // leaves memory: a failed write evicts and records nothing.
+        try {
+          mkdirSync(victim.artifactsDir, { recursive: true, mode: 0o700 });
+          writeFileSync(join(victim.artifactsDir, `owner-evicted-${randomUUID()}.json`), `${JSON.stringify({ evicted: view(victim), byProposal: id }, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+        } catch (error) {
+          throw new PropertyOwnerActionError(`the cache is full and campaign ${victim.id} could not be evicted: its audit could not be written in ${victim.artifactsDir} (${String(error)}); fix that directory, or decide a pending campaign, then propose again`);
+        }
+      }
       audit(entry);
       if (victim !== undefined) {
-        // The eviction is audited beside the victim's own records BEFORE it
-        // leaves memory: a failed write evicts nothing.
-        mkdirSync(victim.artifactsDir, { recursive: true, mode: 0o700 });
-        writeFileSync(join(victim.artifactsDir, `owner-evicted-${randomUUID()}.json`), `${JSON.stringify({ evicted: view(victim), byProposal: id }, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
         entries.delete(victim.id);
         rememberEvicted(evictedIds, victim.id, { jobId: victim.jobId, artifactsDir: victim.artifactsDir });
       }

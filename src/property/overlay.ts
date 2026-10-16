@@ -1,5 +1,5 @@
-import { createHash } from 'node:crypto';
-import { chmodSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmdirSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { chmodSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import type { OverlayIdentity } from './types.js';
 
@@ -188,10 +188,16 @@ export function applyOverlayFilesAllOrNothing(input: Parameters<typeof applyOver
       // refuses it), so it is never touched here either.
       if (state === 'other') continue;
       try {
-        rmSync(target, { force: true });
         if (state === 'file' && content !== null && mode !== null) {
-          writeFileSync(target, content, { flag: 'wx', mode });
-          chmodSync(target, mode); // exact, whatever the umask
+          // Re-created beside the target, then renamed over it in one step:
+          // the original bytes are never absent from the tree, and a link
+          // swapped in meanwhile is replaced, never written through.
+          const restored = `${target}.gru-restore-${randomUUID()}`;
+          writeFileSync(restored, content, { flag: 'wx', mode });
+          chmodSync(restored, mode); // exact, whatever the umask
+          renameSync(restored, target);
+        } else {
+          rmSync(target, { force: true });
         }
       } catch (restoreError) { failures.push(restoreError); }
     }

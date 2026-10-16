@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { cpSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -371,7 +371,8 @@ export function createPropertyExecutor(options: PropertyExecutorOptions = {}): P
         const reportersModule = join(dirname(runner.path), 'dist', 'reporters.js');
         // The framed report depends on the copied Vitest's own reporters
         // module: a layout without it is refused by name before any run.
-        if (statSync(reportersModule, { throwIfNoEntry: false })?.isFile() !== true) throw new PreExecutionRejectionError('unsupported-runner', `copied Vitest has no ${relative(workspace, reportersModule)}; the host-framed report cannot be produced`);
+        // A regular file, never a link that could resolve outside the copy.
+        if (lstatSync(reportersModule, { throwIfNoEntry: false })?.isFile() !== true) throw new PreExecutionRejectionError('unsupported-runner', `copied Vitest has no regular file ${relative(workspace, reportersModule)}; the host-framed report cannot be produced`);
         env['GRU_PROPERTY_REPORTERS_MODULE'] = pathToFileURL(reportersModule).href;
         env['GRU_PROPERTY_MAX_ITERATIONS'] = String(plan.budget.maxIterations);
         env['GRU_PROPERTY_MAX_SHRINK_STEPS'] = String(plan.budget.maxShrinkSteps);
