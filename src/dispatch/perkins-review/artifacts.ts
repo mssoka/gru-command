@@ -284,10 +284,15 @@ export async function procGroupMembersAsync(
   pgid: number,
   fs: ProcFsAsync = OWNED_GIT_SEAMS.procFsAsync,
   expired: () => boolean = () => false,
+  /** Milliseconds left: each read is raced against it, so one that never
+   * settles is unknown on time (#360 R5-E6), not a wait without bound. */
+  remaining?: () => number,
 ): Promise<GroupMember[] | null> {
   let entries: string[];
   try {
-    entries = await fs.list();
+    const listed = await inTime(fs.list(), remaining);
+    if (listed === 'timeout') return null;
+    entries = listed.value;
   } catch {
     return null;
   }
@@ -297,7 +302,9 @@ export async function procGroupMembersAsync(
     if (expired()) return null;
     let stat: string;
     try {
-      stat = await fs.read(`/proc/${entry}/stat`);
+      const read = await inTime(fs.read(`/proc/${entry}/stat`), remaining);
+      if (read === 'timeout') return null;
+      stat = read.value;
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code === 'ENOENT' || code === 'ESRCH') continue; // ended while listing
@@ -308,6 +315,21 @@ export async function procGroupMembersAsync(
     if (record.group === pgid) members.push({ pid: Number(entry), state: record.state });
   }
   return expired() ? null : members;
+}
+
+/** A read raced against the time left (no bound without `remaining`): one
+ * that does not settle in time is a timeout. Its rejection is its own. */
+async function inTime<T>(read: Promise<T>, remaining: (() => number) | undefined): Promise<{ readonly value: T } | 'timeout'> {
+  if (remaining === undefined) return { value: await read };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      read.then((value) => ({ value })),
+      new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), Math.max(0, remaining())); timer.unref?.(); }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 /** Members of group `pgid` from `ps -A -o pid=,pgid=,stat=` output, or null
@@ -368,7 +390,7 @@ export async function groupHasLiveMemberAsync(pgid: number, budgetMs: number): P
   if (OWNED_GIT_SEAMS.platform === 'linux') {
     // Asynchronous and charged to the remaining settle budget (#264).
     const until = OWNED_GIT_SEAMS.now() + budgetMs;
-    return executingMember(await procGroupMembersAsync(pgid, OWNED_GIT_SEAMS.procFsAsync, () => OWNED_GIT_SEAMS.now() >= until));
+    return executingMember(await procGroupMembersAsync(pgid, OWNED_GIT_SEAMS.procFsAsync, () => OWNED_GIT_SEAMS.now() >= until, () => until - OWNED_GIT_SEAMS.now()));
   }
   try {
     const { stdout } = await execFileAsPromised('/bin/ps', ['-A', '-o', 'pid=,pgid=,stat='], {

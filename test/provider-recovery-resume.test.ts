@@ -47,6 +47,7 @@ const FAKE_CAPABILITIES: AgentCapabilities = {
 
 const TARGET = 'f'.repeat(40);
 const BASE = 'a'.repeat(40);
+const BLIND_PACKAGE = { baseSha: BASE, targetSha: TARGET, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] };
 
 /** A pi-session toolResult line (what the reviewer's session jsonl holds). */
 const sessionToolResult = (text: string): string =>
@@ -198,7 +199,7 @@ class ClaimHarness {
   /** Admit `jobId` as a blind review (issue #316) so the resume settle seam
    * has an isolation rule to judge the resumed session's tool access
    * against. */
-  admitBlind(jobId: string, repoName: string): void {
+  admitBlind(jobId: string, repoName: string, keepPackage = true): void {
     const admission = admitBlindReview({
       ledger: this.ledger,
       jobId,
@@ -207,10 +208,10 @@ class ClaimHarness {
       briefing: 'Review the immutable package read-only.',
       targetSha: TARGET,
       repoName,
-      inputPackage: { baseSha: BASE, targetSha: TARGET, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] },
+      inputPackage: BLIND_PACKAGE,
     });
     if (admission === null) throw new Error(`job "${jobId}" was not admitted as a blind review`);
-    recordBlindAdmission(this.ledger, jobId, admission);
+    recordBlindAdmission(this.ledger, jobId, admission, keepPackage ? BLIND_PACKAGE : undefined);
   }
 
   /** A job with a lane, a minion agent, and a recovered wait on it. Each
@@ -605,6 +606,41 @@ describe('guarded claim — blind coverage scan at the resume settle seam (issue
       return handle;
     };
   }
+
+  it('a FRESH replacement blind reviewer is briefed with the package it was admitted with; a resumed one already holds it (#360 R5-B3)', async () => {
+    const h = new ClaimHarness();
+    const jobId = 'j-blind-fresh';
+    const waitId = await h.recoveredMinionWait({ jobId });
+    h.admitBlind(jobId, fixtureRepo().path);
+    const result = await claimProviderRecoveryContinuation(h.deps(), waitId, 'silas');
+    expect(result).toMatchObject({ outcome: 'continued', path: 'redispatched' });
+    const prompted = [...h.registry.handles.values()].flatMap((handle) => handle.prompts);
+    expect(prompted).toHaveLength(1);
+    expect(prompted[0]).toContain('do the work');
+    expect(prompted[0]!.split('BLIND INPUT PACKAGE')).toHaveLength(2);
+    expect(prompted[0]).toContain(`Base: ${BASE}  Target: ${TARGET}`);
+    expect(prompted[0]).toContain('File src/feature.ts (at the target):\n```\nexport const feature = 1;\n\n```');
+    // A resumed session was briefed at its first spawn: no second copy.
+    const resumed = new ClaimHarness();
+    const sessionDir = mkdtempSync(join(tmpdir(), 'pr-blind-session-resumed-'));
+    cleanupDirs.push(sessionDir);
+    const resumedJob = 'j-blind-resumed';
+    const resumedWait = await resumed.recoveredMinionWait({ sessionFile: join(sessionDir, 'reviewer.jsonl'), jobId: resumedJob });
+    resumed.admitBlind(resumedJob, fixtureRepo().path);
+    expect(await claimProviderRecoveryContinuation(resumed.deps(), resumedWait, 'silas')).toMatchObject({ outcome: 'continued', path: 'resumed' });
+    expect([...resumed.registry.handles.values()].flatMap((handle) => handle.prompts).join('\n')).not.toContain('BLIND INPUT PACKAGE');
+    // An attested package that was never kept fails the fresh continuation by
+    // name: no replacement is briefed without its input.
+    const unkept = new ClaimHarness();
+    const unkeptJob = 'j-blind-unkept';
+    const unkeptWait = await unkept.recoveredMinionWait({ jobId: unkeptJob });
+    unkept.admitBlind(unkeptJob, fixtureRepo().path, false);
+    const failed = await claimProviderRecoveryContinuation(unkept.deps(), unkeptWait, 'silas');
+    expect(failed.outcome).not.toBe('continued');
+    expect([...unkept.registry.handles.values()].flatMap((handle) => handle.prompts)).toEqual([]);
+    expect(unkept.ledger.latestJobEvent(unkeptJob, 'provider.continuation-failed')?.payload)
+      .toMatchObject({ stage: 'spawn', error: expect.stringMatching(/its attested blind input package was not kept/u) });
+  });
 
   it('a prohibited read during the resumed TURN invalidates blind coverage instead of leaving it qualifying', async () => {
     const h = new ClaimHarness();

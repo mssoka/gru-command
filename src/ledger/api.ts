@@ -1206,16 +1206,31 @@ export class LedgerApi {
    * `kinds` narrows to an explicit set (empty/omitted = every kind). */
   listEventsAfter(
     seq: number,
-    opts: { limit?: number; order?: 'asc' | 'desc'; kinds?: readonly string[] } = {},
+    opts: {
+      limit?: number;
+      order?: 'asc' | 'desc';
+      kinds?: readonly string[];
+      /** One top-level payload field that must (or must not) equal a value:
+       * a window of its own, never a share of a mixed one (#360 R5-B11). */
+      payload?: { readonly key: string; readonly equals?: string; readonly notEquals?: string };
+    } = {},
   ): readonly EventRecord[] {
     const limit = opts.limit ?? 100;
     const order = opts.order === 'desc' ? 'DESC' : 'ASC';
     const kinds = opts.kinds;
-    const where =
+    let where =
       kinds === undefined || kinds.length === 0
         ? 'seq > ?'
         : `seq > ? AND kind IN (${kinds.map(() => '?').join(', ')})`;
     const params: (number | string)[] = [seq, ...(kinds ?? [])];
+    if (opts.payload !== undefined) {
+      const { key, equals, notEquals } = opts.payload;
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(key) || (equals === undefined) === (notEquals === undefined)) {
+        throw new Error('listEventsAfter payload filter needs one plain field name and exactly one of equals/notEquals');
+      }
+      where += equals !== undefined ? ` AND json_extract(payload, '$.${key}') = ?` : ` AND json_extract(payload, '$.${key}') IS NOT ?`;
+      params.push((equals ?? notEquals)!);
+    }
     return (
       this.db
         .prepare(`SELECT * FROM events WHERE ${where} ORDER BY seq ${order} LIMIT ?`)
@@ -8875,13 +8890,19 @@ export class LedgerApi {
     readonly decision: { readonly kind: 'successor'; readonly requestId: string; readonly directive: string } |
       { readonly kind: 'owner-decision'; readonly obligationId: string };
   }): { readonly successor: DirectiveRequestRecord | null; readonly idempotent: boolean } {
-    const fingerprint = createHash('sha256').update(JSON.stringify([input.requestId, input.generation, input.expectedPayloadHash, input.expectedHead, input.expectedEpoch, input.expectedWorkRevision, input.expectedContractSha256, input.reason, input.decision])).digest('hex');
+    const facts = [input.requestId, input.generation, input.expectedPayloadHash, input.expectedHead, input.expectedEpoch, input.expectedWorkRevision, input.expectedContractSha256, input.reason, input.decision];
+    // Canonical, like the rebrief decision's (#363 S02-0-02): the same
+    // decision with its properties in another order is the same decision.
+    const fingerprint = createHash('sha256').update(canonicalRebriefEvidence(facts)).digest('hex');
+    // A decision consumed before that recorded the insertion-order spelling;
+    // its exact replay still matches.
+    const legacyFingerprint = createHash('sha256').update(JSON.stringify(facts)).digest('hex');
     return this.transaction(() => {
       const row = this.getDirective(input.requestId);
       if (row === null) throw new RecordNotFound(`directive request "${input.requestId}" not found`);
       const prior = this.recoveryDecisionHistory('directive', row.requestId).find((decision) => decision.generation === input.generation);
       if (prior !== undefined) {
-        if (prior.fingerprint !== fingerprint) throw new DirectiveCheckpointError('recovery decision conflicts with the consumed decision');
+        if (prior.fingerprint !== fingerprint && prior.fingerprint !== legacyFingerprint) throw new DirectiveCheckpointError('recovery decision conflicts with the consumed decision');
         return { successor: prior.successorId === null ? null : this.getDirective(prior.successorId), idempotent: true };
       }
       const currentDebt = this.recoveryObligation(row.jobId, 'directive', row.requestId);

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -38,6 +38,7 @@ const ctl = process.env.GRU_FIXTURE_CTL ?? JSON.parse((await import('node:fs')).
 appendFileSync(join(ctl, 'steps.log'), name + '\\n');
 if (existsSync(join(ctl, 'fail-' + name))) { console.error('fixture failure: ' + name); process.exit(3); }
 if (existsSync(join(ctl, 'slow-' + name))) await new Promise((r) => setTimeout(r, 30000));
+while (existsSync(join(ctl, 'hold-' + name))) await new Promise((r) => setTimeout(r, 20));
 if (name === 'build') {
   mkdirSync('dist/runtime', { recursive: true });
   writeFileSync('dist/build-rev.json', JSON.stringify({ n: Date.now() + Math.random() }));
@@ -59,7 +60,7 @@ function makeLane(): Lane {
   const ctl = mkdtempSync(join(tmpdir(), 'gru-build-reuse-ctl-'));
   cleanups.push(() => rmSync(ctl, { recursive: true, force: true }), () => repo.cleanup());
   writeFileSync(join(ctl, 'steps.log'), '');
-  repo.commitFile('.gitignore', 'dist/\n.npmrc\n');
+  repo.commitFile('.gitignore', 'dist/\n.npmrc\nnode_modules/\n');
   repo.commitFile('tools/step.mjs', STEP_SCRIPT);
   repo.commitFile('tools/ctl.json', JSON.stringify({ dir: ctl }));
   repo.commitFile('tools/patch-vitest-rpc-timeout.mjs', "import './step.mjs';\n");
@@ -231,6 +232,37 @@ describe('verification build reuse (#318)', () => {
     } finally {
       release(); if (running !== null) await running.catch(() => {});
       vi.restoreAllMocks(); vi.useRealTimers(); await scheduler.dispose(); rmSync(storage, { recursive: true, force: true });
+    }
+  });
+
+  it('a first-step reuse starts the run clock itself: reused output paused past runTimeoutMs times the run out with no native start and no later step (#363 S09-2-01)', async () => {
+    const lane = makeLane(); const storage = mkdtempSync(join(tmpdir(), 'gru-first-step-reuse-clock-'));
+    const records: VerificationRecord[] = [];
+    const scheduler = new VerificationScheduler({ storageDir: storage,
+      limits: { maxConcurrent: 1, workerBudget: 4, lockWaitTimeoutMs: 30_000, runTimeoutMs: 30_000 },
+      sweepIntervalMs: 50, killGraceMs: 100, disposeGraceMs: 500,
+      record: (record) => { records.push(record); } });
+    let release!: () => void; const paused = new Promise<void>((resolve) => { release = resolve; });
+    let reached!: () => void; const reused = new Promise<void>((resolve) => { reached = resolve; });
+    let running: Promise<VerificationOutcome> | null = null;
+    try {
+      expect((await run(scheduler, lane, 'warm', DOCS)).ok).toBe(true);
+      records.length = 0;
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      // The build is the FIRST step, so no earlier native step started the clock.
+      running = run(scheduler, lane, 'first-step-reuse', DOCS, async (frame) => {
+        if (frame.type === 'output' && frame.text.includes('[gru-verify] npm run build reused')) { reached(); await paused; }
+      });
+      await reused;
+      vi.advanceTimersByTime(30_000);
+      release(); const result = await running;
+      expect(result.timedOut).toBe(true);
+      expect(records.filter((record) => record.kind === 'verification.started')).toEqual([]);
+      expect(count(lane.steps(), 'build')).toBe(1);
+      expect(count(lane.steps(), 'config-docs')).toBe(1);
+    } finally {
+      release(); if (running !== null) await running.catch(() => {});
+      vi.useRealTimers(); await scheduler.dispose(); rmSync(storage, { recursive: true, force: true });
     }
   });
 
@@ -455,6 +487,13 @@ describe('verification build reuse (#318)', () => {
       await expectRebuild(lane, scheduler, 'config-changed');
     });
 
+    it('changed installed dependencies — npm\'s record of node_modules (#360 R5-B8)', async () => {
+      const { lane, scheduler } = await warm();
+      mkdirSync(join(lane.repo.path, 'node_modules'), { recursive: true });
+      writeFileSync(join(lane.repo.path, 'node_modules', '.package-lock.json'), JSON.stringify({ packages: { 'node_modules/typescript': { version: '9.9.9' } } }));
+      await expectRebuild(lane, scheduler, 'dependencies-changed');
+    });
+
     it('changed environment', async () => {
       const { lane, scheduler } = await warm();
       process.env['GRU_FIXTURE_BUILD_ENV'] = 'different';
@@ -542,6 +581,35 @@ describe('verification build reuse (#318)', () => {
     // The queued second run reports its wait apart from its execution time.
     expect(second.queuedMs).toBeGreaterThanOrEqual(first.durationMs - 5);
   });
+
+  it('a gate admitted while a build is in flight still inherits it once it finished before its own build step — the proof is taken at the step (#360 R5-B9)', async () => {
+    const lane = makeLane();
+    const scheduler = makeScheduler({ maxConcurrent: 2 });
+    const waitFor = async (what: string, check: () => boolean): Promise<void> => {
+      const deadline = Date.now() + 15_000;
+      while (!check()) {
+        if (Date.now() > deadline) throw new Error(`${what} never happened`);
+        await new Promise((r) => setTimeout(r, 20));
+      }
+    };
+    lane.flag('hold-build');
+    lane.flag('hold-typecheck');
+    // A's build is in flight when B arrives; B waits in its typecheck.
+    const a = run(scheduler, lane, 'docs', DOCS);
+    await waitFor('the donor build', () => count(lane.steps(), 'build') === 1);
+    const b = run(scheduler, lane, 'static', STATIC);
+    await waitFor('the second gate\'s typecheck', () => count(lane.steps(), 'typecheck') === 1);
+    // A's build finishes and is recorded before B's build step comes.
+    lane.unflag('hold-build');
+    const first = await a;
+    expect(first.ok).toBe(true);
+    lane.unflag('hold-typecheck');
+    const second = await b;
+    expect(second.ok).toBe(true);
+    expect(second.checks?.[3]).toMatchObject({ status: 'reused', ran: false, reusedFromRunId: first.runId });
+    expect(count(lane.steps(), 'build')).toBe(1);
+    await scheduler.dispose();
+  }, 30_000);
 
   it('never reuses a build that another run is still producing in the same lane', async () => {
     const lane = makeLane();

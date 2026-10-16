@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LedgerDb, MIGRATIONS } from '../src/ledger/db.js';
@@ -43,6 +43,15 @@ describe('GH286 approved integration schema', () => {
     expect(MIGRATIONS[27]).toMatchObject({ id: 28, name: 'directive-native-progress' });
     expect(MIGRATIONS[28]).toMatchObject({ id: 29, name: 'notification-owner-decisions' });
     expect(hash(MIGRATIONS[27]!.sql)).toBe('3fe446722711a74bcb5ae577b7b47ed8f65f243ea5f059fbc3ebff1250ea546e');
+  });
+
+  it('the ledger docs name each migration by its real id: every `Migration N (name)` is MIGRATIONS[N - 1] (#363)', () => {
+    const doc = readFileSync(join(import.meta.dirname, '..', 'docs', 'LEDGER.md'), 'utf8');
+    const named = [...doc.matchAll(/Migration (\d+) \(`([a-z0-9-]+)`\)/gu)].map((match) => ({ id: Number(match[1]), name: match[2]! }));
+    expect(named.length).toBeGreaterThan(0);
+    for (const { id, name } of named) expect(MIGRATIONS.find((migration) => migration.name === name)?.id, name).toBe(id);
+    // The native progress prose names the same ordinal as its heading line.
+    expect(doc).toContain('Migration 28 adds nullable native progress');
   });
 
   it('creates the complete fresh schema and applies native28 exactly once across an ordinary reopen', () => {
