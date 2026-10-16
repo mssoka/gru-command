@@ -83,6 +83,8 @@ import { AgentLessonsDistiller } from './lessons/distiller.js';
 import { createSessionLessonsCapture } from './lessons/capture.js';
 import { createReviewOutcomeCapture } from './lessons/review-capture.js';
 import { createLessonsServer } from './lessons/server.js';
+import { VectorService } from './vector/service.js';
+import { createVectorServer } from './vector/server.js';
 import { DecisionRuntime } from './decisions/runtime.js';
 import { DECISION_SURFACE_EVENT_TRIAGE } from './decisions/questions.js';
 import { isolateDecisionEnvironment } from './decisions/credentials.js';
@@ -575,6 +577,18 @@ async function main(): Promise<number> {
   } catch (error) {
     logger.log('error', 'lesson proposal reconcile failed at startup', { error: String(error) });
   }
+  // Vector's raids, planning half (#351): code builds the candidate list,
+  // Gru picks, FOR YOU holds proposals. Off unless [vector] enabled.
+  const vector = new VectorService({
+    vector: config.vector,
+    workspaceRoot: config.workspaceRoot,
+    managedRepos: config.managedRepos,
+    ledger,
+    bus,
+    notifications,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  const vectorServer = createVectorServer({ token: config.auth.token, service: vector, log: (level, msg, fields) => logger.log(level, msg, fields) });
   const lessonsServer = createLessonsServer({
     config,
     journal,
@@ -1485,6 +1499,7 @@ async function main(): Promise<number> {
       buildInfo: () => buildInfo,
       requestHook: (req, res, path) =>
         lessonsServer.requestHook(req, res, path) ||
+        vectorServer.requestHook(req, res, path) ||
         rollServer.requestHook(req, res, path) ||
         attachmentsServer.requestHook(req, res, path) ||
         worktreeServer.requestHook(req, res, path) ||
@@ -1554,6 +1569,13 @@ async function main(): Promise<number> {
   bob.start();
   if (config.lessons.enabled) dream.start();
   else logger.info('lesson dream disabled by config', {});
+  try {
+    vector.start();
+    state.vector = vector;
+  } catch (error) {
+    // Raid planning is off the heist path: a failure is loud, never fatal.
+    logger.log('error', 'vector raid planning failed to start', { error: String(error) });
+  }
   if (silasSlot !== null) {
     // The driver starts after listen so its wake prompt carries the real
     // bound port (config port 0 = ephemeral); until then no sweeps run and

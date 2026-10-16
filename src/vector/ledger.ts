@@ -1,0 +1,226 @@
+import type { LedgerApi } from '../ledger/api.js';
+
+/**
+ * Vector's raid records (#351), kept as append-only `vector.*` ledger events
+ * and projected in memory. No table: a raid is a short, rare lifecycle, and
+ * every decision in it (pick, proposal, Accept, Decline, withdrawal, launch)
+ * is already an auditable fact the ledger records once.
+ */
+
+export const VECTOR_EVENTS = {
+  /** Code offered Gru a candidate list (one Gru turn per distinct list). */
+  planOffered: 'vector.plan-offered',
+  /** Gru answered an offered list (zero or more picks). */
+  planDecided: 'vector.plan-decided',
+  /** A validated pick: one raid record is born. */
+  picked: 'vector.raid-picked',
+  /** The pick waits for the owner in FOR YOU (raid_mode "proposed"). */
+  proposed: 'vector.raid-proposed',
+  /** The owner declined; the target is not proposed again at this identity. */
+  declined: 'vector.raid-declined',
+  /** The target changed before a decision; the proposal is void. */
+  withdrawn: 'vector.raid-withdrawn',
+  /** The raid is launched: it waits in Silas's raid queue. */
+  queued: 'vector.raid-queued',
+} as const;
+
+export const VECTOR_EVENT_KINDS: readonly string[] = Object.values(VECTOR_EVENTS);
+
+/** One package in one managed repository. */
+export interface RaidTarget {
+  readonly repo: string;
+  readonly packageDir: string;
+}
+
+/** Why code ranked a candidate where it did (shown to Gru and the owner). */
+export interface RaidSignals {
+  /** Commits touching the package since its last raid (all history when never raided). */
+  readonly commitsSinceLastRaid: number;
+  /** Break-ins earlier raids found on this target. */
+  readonly escapedRegressions: number;
+  /** Changes-requested Perkins verdicts on the repository's jobs since the last raid. */
+  readonly perkinsFindings: number;
+  /** Whole days since the target's last raid; null when never raided. */
+  readonly daysSinceLastRaid: number | null;
+}
+
+export type RaidRequester = 'gru' | 'owner-chat';
+export type RaidLaunch = 'owner-accept' | 'autonomous' | 'owner-chat';
+export type RaidState = 'proposed' | 'declined' | 'withdrawn' | 'queued';
+
+export interface RaidRecord {
+  readonly id: string;
+  readonly target: RaidTarget;
+  /** Git tree id of the package at the default-branch head it was picked at. */
+  readonly sourceIdentity: string;
+  readonly headSha: string;
+  readonly reason: string;
+  readonly requestedBy: RaidRequester;
+  readonly signals: RaidSignals;
+  readonly pickedAt: string;
+  readonly state: RaidState;
+  /** The FOR YOU decision row, when the raid was proposed. */
+  readonly notificationId: string | null;
+  readonly launchedBy: RaidLaunch | null;
+  readonly launchedAt: string | null;
+  /** Why a proposal ended without a launch (decline or withdrawal). */
+  readonly closedDetail: string | null;
+}
+
+export interface PlanRecord {
+  readonly digest: string;
+  readonly notificationId: string;
+  readonly offeredAt: string;
+  readonly decidedAt: string | null;
+}
+
+export class VectorRecordError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'VectorRecordError';
+  }
+}
+
+type Payload = Record<string, unknown>;
+
+function text(payload: Payload, key: string): string {
+  const value = payload[key];
+  if (typeof value !== 'string' || value === '') throw new VectorRecordError(`vector event is missing "${key}"`);
+  return value;
+}
+
+function signalsOf(value: unknown): RaidSignals {
+  const raw = (typeof value === 'object' && value !== null ? value : {}) as Payload;
+  const count = (key: string): number => (typeof raw[key] === 'number' ? raw[key] : 0);
+  return {
+    commitsSinceLastRaid: count('commits_since_last_raid'),
+    escapedRegressions: count('escaped_regressions'),
+    perkinsFindings: count('perkins_findings'),
+    daysSinceLastRaid: typeof raw['days_since_last_raid'] === 'number' ? raw['days_since_last_raid'] : null,
+  };
+}
+
+export function signalsPayload(signals: RaidSignals): Payload {
+  return {
+    commits_since_last_raid: signals.commitsSinceLastRaid,
+    escaped_regressions: signals.escapedRegressions,
+    perkins_findings: signals.perkinsFindings,
+    days_since_last_raid: signals.daysSinceLastRaid,
+  };
+}
+
+const PAGE = 500;
+
+/**
+ * The raid projection. It reads only `vector.*` events, after the last seq it
+ * applied, so a long ledger costs one indexed page per refresh.
+ */
+export class VectorLedger {
+  private cursor = 0;
+  private readonly raidsById = new Map<string, RaidRecord>();
+  private readonly plans = new Map<string, PlanRecord>();
+
+  constructor(private readonly ledger: LedgerApi) {}
+
+  /** Apply every `vector.*` event the projection has not seen yet. */
+  refresh(): void {
+    for (;;) {
+      const page = this.ledger.listEventsAfter(this.cursor, { kinds: VECTOR_EVENT_KINDS, limit: PAGE });
+      for (const event of page) {
+        this.apply(event.kind, (typeof event.payload === 'object' && event.payload !== null ? event.payload : {}) as Payload, event.ts);
+        this.cursor = event.seq;
+      }
+      if (page.length < PAGE) return;
+    }
+  }
+
+  /** Append one `vector.*` fact and apply it. */
+  record(kind: string, payload: Payload): void {
+    if (!VECTOR_EVENT_KINDS.includes(kind)) throw new VectorRecordError(`unknown vector event kind "${kind}"`);
+    this.refresh();
+    const event = this.ledger.appendCustomEvent({ kind, payload });
+    this.apply(kind, payload, event.ts);
+    this.cursor = Math.max(this.cursor, event.seq);
+  }
+
+  raids(): readonly RaidRecord[] {
+    this.refresh();
+    return [...this.raidsById.values()];
+  }
+
+  raid(id: string): RaidRecord | null {
+    this.refresh();
+    return this.raidsById.get(id) ?? null;
+  }
+
+  plan(digest: string): PlanRecord | null {
+    this.refresh();
+    return this.plans.get(digest) ?? null;
+  }
+
+  openPlans(): readonly PlanRecord[] {
+    this.refresh();
+    return [...this.plans.values()].filter((plan) => plan.decidedAt === null);
+  }
+
+  private apply(kind: string, payload: Payload, ts: string): void {
+    switch (kind) {
+      case VECTOR_EVENTS.planOffered: {
+        const digest = text(payload, 'digest');
+        this.plans.set(digest, { digest, notificationId: text(payload, 'notification_id'), offeredAt: ts, decidedAt: null });
+        return;
+      }
+      case VECTOR_EVENTS.planDecided: {
+        const digest = text(payload, 'digest');
+        const plan = this.plans.get(digest);
+        if (plan !== undefined) this.plans.set(digest, { ...plan, decidedAt: ts });
+        return;
+      }
+      case VECTOR_EVENTS.picked: {
+        const id = text(payload, 'raid_id');
+        this.raidsById.set(id, {
+          id,
+          target: { repo: text(payload, 'repo'), packageDir: text(payload, 'package_dir') },
+          sourceIdentity: text(payload, 'source_identity'),
+          headSha: text(payload, 'head_sha'),
+          reason: text(payload, 'reason'),
+          requestedBy: payload['requested_by'] === 'owner-chat' ? 'owner-chat' : 'gru',
+          signals: signalsOf(payload['signals']),
+          pickedAt: ts,
+          state: 'proposed',
+          notificationId: null,
+          launchedBy: null,
+          launchedAt: null,
+          closedDetail: null,
+        });
+        return;
+      }
+      default:
+        break;
+    }
+    const id = text(payload, 'raid_id');
+    const raid = this.raidsById.get(id);
+    if (raid === undefined) throw new VectorRecordError(`${kind} names unknown raid "${id}"`);
+    switch (kind) {
+      case VECTOR_EVENTS.proposed:
+        this.raidsById.set(id, { ...raid, state: 'proposed', notificationId: text(payload, 'notification_id') });
+        return;
+      case VECTOR_EVENTS.declined:
+        this.raidsById.set(id, { ...raid, state: 'declined', closedDetail: text(payload, 'detail') });
+        return;
+      case VECTOR_EVENTS.withdrawn:
+        this.raidsById.set(id, { ...raid, state: 'withdrawn', closedDetail: text(payload, 'detail') });
+        return;
+      case VECTOR_EVENTS.queued: {
+        const launchedBy = text(payload, 'launched_by');
+        if (launchedBy !== 'owner-accept' && launchedBy !== 'autonomous' && launchedBy !== 'owner-chat') {
+          throw new VectorRecordError(`raid "${id}" names an unknown launch "${launchedBy}"`);
+        }
+        this.raidsById.set(id, { ...raid, state: 'queued', launchedBy, launchedAt: ts });
+        return;
+      }
+      default:
+        throw new VectorRecordError(`unhandled vector event kind "${kind}"`);
+    }
+  }
+}

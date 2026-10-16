@@ -57,6 +57,7 @@ import {
 import {
   parseDecisionOptions,
   parseStoredNotificationDecision,
+  producerWithdrawable,
   serializeNotificationDecision,
   type NotificationDecision,
   type NotificationDecisionOption,
@@ -601,7 +602,8 @@ export type NotificationDecisionRefusalCode =
   | 'undecided'
   | 'not_discussion'
   | 'decision_present'
-  | 'legacy_closed';
+  | 'legacy_closed'
+  | 'not_withdrawable';
 
 export class NotificationDecisionRefusal extends Error {
   constructor(
@@ -5263,6 +5265,30 @@ export class LedgerApi {
       this.db.prepare('UPDATE notifications SET resolved_at = ?, resolved_by = ? WHERE id = ?')
         .run(nowIso(), by, id);
       this.appendEvent({ kind: 'notification.resolved', agentId: current.agentId, payload: { id, by } });
+      return this.getNotification(id);
+    });
+  }
+
+  /**
+   * Producer withdrawal of a stale owner PROPOSAL (#351): the thing proposed
+   * changed before the owner answered, so the question no longer exists.
+   * Only kinds the attention registry marks producer-withdrawable qualify; a
+   * decided proposal is never withdrawn (its follow-through owns it), and an
+   * already-resolved row is returned as it is. Audited with `withdrawn: true`.
+   */
+  withdrawOwnerProposal(id: string, detail: string): NotificationRecord | null {
+    if (detail.trim() === '') throw new Error('proposal withdrawal detail must be non-empty');
+    return this.transaction(() => {
+      const current = this.getNotification(id);
+      if (current === null || current.resolvedAt !== null) return current;
+      if (current.routing !== 'needs-owner' || !producerWithdrawable(current.kind)) {
+        throw new NotificationDecisionRefusal('not_withdrawable', `notification "${id}" (${current.kind}) is not a producer-withdrawable owner proposal`);
+      }
+      if (current.decidedAt !== null) {
+        throw new NotificationDecisionRefusal('decision_recorded', `notification "${id}" already records decision "${current.decidedOption}"; it is carried out, never withdrawn`);
+      }
+      this.db.prepare('UPDATE notifications SET resolved_at = ?, resolved_by = ? WHERE id = ?').run(nowIso(), 'producer-withdrawn', id);
+      this.appendEvent({ kind: 'notification.resolved', agentId: current.agentId, payload: { id, by: 'producer-withdrawn', detail, withdrawn: true } });
       return this.getNotification(id);
     });
   }

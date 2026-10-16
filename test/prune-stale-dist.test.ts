@@ -58,9 +58,9 @@ describe('prune-stale-dist', () => {
     // (dist/git-env.js); #379/#380 the shared one-line error text
     // (dist/property/error-text.js); #364/#367 the shared line-safe escape
     // (dist/dispatch/line-safe.js).
-    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5190);
+    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5194);
     expect(createHash('sha256').update(`${[...PUBLIC_REVIEW_EXECUTABLE_PATHS].sort().join('\n')}\n`).digest('hex'))
-      .toBe('29065728b6e002b29140e394fb53695801a39cb4a3915a1cdb99a52f15afefac');
+      .toBe('f49027ea0dbaeab72bcc2db5cba64e5000188bcff863445f0f6e166bad6d2c17');
     const root = fixtureRoot();
     touch(root, 'src/worktrees/handoff.ts'); touch(root, 'dist/worktrees/handoff.js');
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', dependencies: {} }));

@@ -420,6 +420,38 @@ probe_timeout_ms = 30000
 # false means GLM checks fail closed (no readiness endpoint exists yet).
 glm_generation_fallback = false
 
+[vector]
+# Vector's raids (#351, docs/VECTOR.md): Gru-directed adversarial property
+# campaigns against code already on the default branch, off the heist path.
+# Raids gate nothing: no merge, review or verification waits on one, and a
+# raid that finds nothing is never a pass. Raids spend quota, so they are
+# off until you opt in: true lets Gru plan raids; false = no candidate list,
+# no Gru turn, no Vector session, and a chat raid request is refused.
+# A repository opts out with `[vector] enabled = false` in its own
+# .gru-command/worktree.toml.
+enabled = false
+# "proposed": each raid Gru picks waits for your Accept in FOR YOU.
+# "autonomous": Gru launches raids without asking (board activity only).
+raid_mode = "proposed"
+# "proposed": each break-in waits for your Accept in FOR YOU before Gru
+# dispatches its fix heist. "autonomous": Gru dispatches it without asking.
+fix_mode = "proposed"
+# How often code rebuilds the raid candidate list (ms); only a changed list
+# costs a Gru turn. 0 = raids only when you ask Gru in chat.
+plan_interval_ms = 86400000
+# Per-raid budgets, never raised after failures or an empty raid. Each
+# attack runs a known-bad and a healthy control before it runs against the
+# target, plus a baseline and a fresh replay when it fails, so one round
+# costs three to five sandboxed runs.
+max_rounds = 4
+max_runs = 16
+max_raid_ms = 1800000
+# Token cap where the runtime reports usage; when it does not, the round,
+# run and time caps still bind and the raid report says so.
+max_raid_tokens = 400000
+# Raids launched per repository in any rolling 24 hours.
+max_raids_per_day = 2
+
 [roll]
 # Graceful self-roll drain policy: how long the service waits for
 # in-flight review rounds and mid-turn agent sessions to settle before it
@@ -534,6 +566,36 @@ real liveness. See
 semantics, and the session-store contract, and
 [SUPERVISION.md](./SUPERVISION.md) for the supervision policy the
 `[supervision]` table drives plus the log-rotation knobs.
+
+### Vector's raids: `proposed` or `autonomous`
+
+`[vector]` is off by default, because raids spend quota. Turn it on with
+`enabled = true`. Two settings then decide how much Gru does without asking
+you. [VECTOR.md](./VECTOR.md) describes the whole flow.
+
+- **`raid_mode`** decides what happens when Gru picks a package to raid.
+  - **`"proposed"` (default).** Say Gru picks `billing-api/src/refunds` because
+    twelve commits landed there since its last raid. You get one FOR YOU card:
+    "Launch Vector's raid on billing-api/src/refunds?", with Gru's reason, the
+    budget and the ranking signals. Accept queues the raid for Silas. Decline
+    is recorded, and that package is not proposed again until its code
+    changes. If the code changes before you answer, the card is withdrawn.
+  - **`"autonomous"`.** The same pick launches straight away. You see it in
+    the board's activity, not in FOR YOU.
+- **`fix_mode`** decides what happens when a raid breaks in: a qualified
+  counterexample that a fresh replay confirmed.
+  - **`"proposed"` (default).** You get a FOR YOU card carrying the frozen
+    contract, the replay data and the receipts. Only Accept makes Gru dispatch
+    the fix heist.
+  - **`"autonomous"`.** Gru dispatches the fix heist directly.
+
+  Either way, the fix runs through normal review, convergence, verification
+  and readiness.
+
+Asking Gru in chat to raid a package counts as your Accept. It is checked
+against the same candidate list, so a package code excluded is refused, with
+the reason. With `enabled = false`, a chat request is refused and says how to
+turn raids on.
 
 ### Mailbox recovery cadence
 

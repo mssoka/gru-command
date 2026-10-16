@@ -58,6 +58,15 @@ export interface NotificationDecision {
   readonly discussion: boolean;
 }
 
+/** Owner proposals whose PRODUCER may withdraw them undecided, because the
+ * thing proposed changed before the owner answered (#351: a raid target's
+ * code moved). Every other undecided owner row stays open until answered. */
+const PRODUCER_WITHDRAWABLE_KINDS: readonly string[] = ['vector.raid-proposal'];
+
+export function producerWithdrawable(kind: string): boolean {
+  return PRODUCER_WITHDRAWABLE_KINDS.includes(kind);
+}
+
 const OPTION_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
 /** Reject C0 controls (except tab/LF) and DEL without a raw control range
