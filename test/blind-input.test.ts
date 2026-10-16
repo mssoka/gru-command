@@ -582,6 +582,13 @@ describe('git\'s diff section grammar (#360 R5-B1 round 1)', () => {
     const quoteRule = { ...DEFAULT_BLIND_ISOLATION_RULE, excludeGlobs: ['"x".md', 'a"x".md'] };
     const recorded = (relative: string): unknown => scanObservedAccess([{ index: 0, toolName: 'read', text: 'x', readPath: `/lanes/job-1/${relative}` }], quoteRule, ['/lanes/job-1'])[0]?.path;
     expect([recorded('"x".md'), recorded('a"x".md')]).toEqual(['"\\"x\\".md"', 'a"x".md']);
+    // ...and so is every other package-file and diff-section `where`: both digests, an excluded file, an excluded section.
+    const digests = evaluateBlindPackage({ baseSha: base, targetSha: target, files: [{ path: '"x".ts', content: 'real\n', sha256: sha('other\n'), blobSha: gitBlobSha('other\n') }] }, DEFAULT_BLIND_ISOLATION_RULE).violations;
+    expect(digests.map((v) => `${v.code} ${v.where}`)).toEqual(['digest-mismatch "\\"x\\".ts"', 'digest-mismatch "\\"x\\".ts"']);
+    const excludedFile = evaluateBlindPackage({ baseSha: base, targetSha: target, files: [{ path: '"x".md', content: 'x\n' }] }, quoteRule).violations;
+    expect(excludedFile.map((v) => `${v.code} ${v.where}`)).toEqual(['excluded-path "\\"x\\".md"']);
+    const excludedSection = evaluateBlindPackage({ baseSha: base, targetSha: target, diff: { text: ['diff --git "a/\\"x\\".md" "b/\\"x\\".md"', '@@ -0,0 +1 @@', '+x', ''].join('\n') } }, quoteRule).violations;
+    expect(excludedSection.map((v) => `${v.code} ${v.where}`)).toEqual(['excluded-path "\\"x\\".md"']);
   });
 
   it('`.` or `./` names the repository, never a package file; a file path holding a control character is refused', () => {
