@@ -56,10 +56,11 @@ describe('prune-stale-dist', () => {
     // helpers. PR312 adds the managed-names and runtime repository helpers;
     // PR289 the publication-evidence module; #382 its shared git-env module
     // (dist/git-env.js); #379/#380 the shared one-line error text
-    // (dist/property/error-text.js).
-    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5189);
+    // (dist/property/error-text.js); #364/#367 the shared line-safe escape
+    // (dist/dispatch/line-safe.js).
+    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5190);
     expect(createHash('sha256').update(`${[...PUBLIC_REVIEW_EXECUTABLE_PATHS].sort().join('\n')}\n`).digest('hex'))
-      .toBe('182b5f939909229ae2986349a506fe378b83b5a077cabb498cd72857b9e64b23');
+      .toBe('29065728b6e002b29140e394fb53695801a39cb4a3915a1cdb99a52f15afefac');
     const root = fixtureRoot();
     touch(root, 'src/worktrees/handoff.ts'); touch(root, 'dist/worktrees/handoff.js');
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', dependencies: {} }));
