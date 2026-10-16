@@ -1,7 +1,7 @@
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { exec, execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
 import { classifyReviewedRed, STATUS_ACTION_NAME } from '../tools/classify-scheduled-verification-red.mjs';
@@ -174,10 +174,13 @@ describe('reviewed-candidate behavioral RED custody', () => {
       const short = check(`${head} ${head}`);
       expect([short.status, short.stderr]).toEqual([2, 'require_pinned_sources needs a candidate, a regressions revision and at least one file (got 2 arguments)\n']);
       expect(check(`${head} ${head} present.ts ''`).stderr).toBe('require_pinned_sources was given an empty file name\n');
-      expect(check(`'' ${head} present.ts`).stderr).toBe('require_pinned_sources was given a candidate revision that is empty or not a plain name: ""\n');
-      expect(check(`${head} '' present.ts`).stderr).toBe('require_pinned_sources was given a regressions revision that is empty or not a plain name: ""\n');
+      expect(check(`'' ${head} present.ts`).stderr).toBe('require_pinned_sources was given a candidate revision that is empty or not a plain revision: ""\n');
+      expect(check(`${head} '' present.ts`).stderr).toBe('require_pinned_sources was given a regressions revision that is empty or not a plain revision: ""\n');
       // A revision git would read as an option is never handed to it.
-      expect(check(`--output=/tmp/x ${head} present.ts`).stderr).toBe('require_pinned_sources was given a candidate revision that is empty or not a plain name: "--output=/tmp/x"\n');
+      expect(check(`--output=/tmp/x ${head} present.ts`).stderr).toBe('require_pinned_sources was given a candidate revision that is empty or not a plain revision: "--output=/tmp/x"\n');
+      for (const odd of ['a b', 'HEAD:secret', 'abc*']) {
+        expect(check(`'${odd}' ${head} present.ts`).stderr, odd).toBe(`require_pinned_sources was given a candidate revision that is empty or not a plain revision: "${odd}"\n`);
+      }
       // The snapshot is the candidate's tree, with no archive left behind...
       const snapshot = join(dir, 'tmp', 'snap'); mkdirSync(snapshot);
       const made = libCall(`snapshot_candidate '${snapshot}' ${head}`, repo, join(dir, 'tmp'));
@@ -189,9 +192,13 @@ describe('reviewed-candidate behavioral RED custody', () => {
       expect(libCall(`snapshot_candidate '${join(dir, 'absent')}' ${head}`, repo, join(dir, 'tmp')).stderr).toBe(`snapshot directory ${join(dir, 'absent')} must be an existing, empty, real directory\n`);
       // A linked target is refused: a failure would remove only the link, never the partial tree.
       const target = join(dir, 'link-target'); mkdirSync(target); symlinkSync(target, join(dir, 'linked'));
-      expect(libCall(`snapshot_candidate '${join(dir, 'linked')}' ${head}`, repo, join(dir, 'tmp')).stderr).toBe(`snapshot directory ${join(dir, 'linked')} must be an existing, empty, real directory\n`);
+      for (const linked of [join(dir, 'linked'), `${join(dir, 'linked')}/`, `${join(dir, 'linked')}//`]) {
+        const refused = libCall(`snapshot_candidate '${linked}' ${head}`, repo, join(dir, 'tmp'));
+        expect([refused.status, refused.stderr], linked).toEqual([2, `snapshot directory ${linked} must be an existing, empty, real directory\n`]);
+      }
+      expect(lstatSync(join(dir, 'linked')).isSymbolicLink() && statSync(target).isDirectory()).toBe(true);
       expect(libCall(`snapshot_candidate '' ${head}`, repo, join(dir, 'tmp')).stderr).toBe('snapshot_candidate needs a snapshot directory and a candidate\n');
-      expect(libCall(`snapshot_candidate '${target}' -x`, repo, join(dir, 'tmp')).stderr).toBe('snapshot_candidate was given a candidate that is empty or not a plain name: "-x"\n');
+      expect(libCall(`snapshot_candidate '${target}' -x`, repo, join(dir, 'tmp')).stderr).toBe('snapshot_candidate was given a candidate that is empty or not a plain revision: "-x"\n');
       // ...and a failed archive removes the partial snapshot and refuses by name.
       const fresh = join(dir, 'tmp', 'fresh'); mkdirSync(fresh);
       const failed = libCall(`snapshot_candidate '${fresh}' ${absent}`, repo, join(dir, 'tmp'));
@@ -234,8 +241,9 @@ describe('reviewed-candidate behavioral RED custody', () => {
         'setInterval(() => {}, 1000);\nawait new Promise(() => {});\n',
         'for (;;) {}\n',
         "process.on('SIGTERM', () => {});\nfor (;;) {}\n",
-        // A descendant keeps the helper's output open for 10 s: the bound still holds.
-        "import { spawn } from 'node:child_process';\nspawn(process.execPath, ['-e', 'setTimeout(() => {}, 10000)'], { stdio: ['ignore', 'inherit', 'ignore'], detached: true }).unref();\nsetInterval(() => {}, 1000);\nawait new Promise(() => {});\n",
+        // A descendant holds the helper's output open: the bound still holds,
+        // and the descendant goes with the helper (checked below).
+        `import { spawn } from 'node:child_process';\nimport { writeFileSync } from 'node:fs';\nconst kid = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: ['ignore', 'inherit', 'ignore'] });\nwriteFileSync(${JSON.stringify(join(dir, 'kid.pid'))}, String(kid.pid));\nsetInterval(() => {}, 1000);\nawait new Promise(() => {});\n`,
       ]) {
         writeFileSync(helper, body);
         const started = Date.now();
@@ -244,11 +252,17 @@ describe('reviewed-candidate behavioral RED custody', () => {
         expect(hung.status, body).toBe(2);
         expect(hung.stderr, body).toMatch(/the helper did not finish loading within 300 ms[\s\S]*does not load cleanly/u);
       }
+      // The descendant did not outlive the refusal.
+      const kid = Number(readFileSync(join(dir, 'kid.pid'), 'utf8'));
+      const alive = (): boolean => { try { process.kill(kid, 0); return true; } catch { return false; } };
+      const deadline = Date.now() + 5000;
+      while (alive() && Date.now() < deadline) execFileSync('sleep', ['0.1']);
+      expect(alive(), 'the load\'s descendant was killed with it').toBe(false);
       // A helper that prints while loading — even a partial line — still loads.
       writeFileSync(helper, "import './scheduler.js';\nconsole.log('loading capture helper');\nprocess.stdout.write('no newline');\n");
       expect(guard()).toMatchObject({ status: 0, stderr: '' });
       // The bound itself is a whole number from 1 to 3600000 — never one that disables it.
-      for (const bound of ['soon', '0', '00', '-5', '1.5', '3600001', '99999999']) {
+      for (const bound of ['soon', '0', '00', '0000300', '-5', '1.5', '3600001', '99999999', '99999999999999999999999']) {
         expect(libCall('require_built_helper', snapshot, join(dir, 'tmp'), { GRU_HELPER_LOAD_MS: bound }).stderr, bound)
           .toBe(`GRU_HELPER_LOAD_MS must be a whole number of milliseconds from 1 to 3600000 (got "${bound}")\n`);
       }
