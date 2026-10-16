@@ -16,6 +16,7 @@ import { inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirective
 import { WorkerDisposalInProgressError } from '../src/runtime/registry.js';
 import { DirectiveProgressService, DirectivePromptRefusedError, executeAcceptedDirective, promptRefusalUnproven, settleNativeDirective, surfaceDirectiveRecovery } from '../src/dispatch/directive-progress.js';
 import { recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute } from '../src/dispatch/directive-recovery.js';
+import { DirectiveRetirementError } from '../src/ledger/directives.js';
 import { reconcilePendingLegacyDirectives, reconcilePendingRebriefs, settleDirectivesFromEvidence } from '../src/dispatch/rebrief-recovery.js';
 import type { AgentHandle, SpawnOptions } from '../src/runtime/types.js';
 import { recordFollowUpDelivery, type DirectiveRegistry } from '../src/dispatch/fix-directive.js';
@@ -2520,6 +2521,46 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(f.spawns).toEqual([]); expect(f.native.prompts).toEqual([]);
     expect(f.ledger.listPendingRebriefs()).toEqual(markers);
     expect(f.ledger.listObligations({ jobId: f.intent.jobId }).filter((row) => row.incidentKey.startsWith('rebrief-recovery:'))).toHaveLength(1);
+  });
+
+  it('/recover refuses a successor while a queued worker for the job or its agent waits: nothing retired, decided or created (#363 S06-2-01)', async () => {
+    const queuedGate = (entryId: string) => ({ view: () => ({ worker: { queued: [{ id: entryId, label: `queued ${entryId}` }] } }) }) as never;
+    // Directive recovery: a queued job-ID entry, then a queued agent-ID entry.
+    for (const entryId of ['job', 'agent'] as const) {
+      const f = await fixture();
+      const debt = f.ledger.openDirectiveRecoveryDebt(f.intent.requestId, 'predecessor handoff requires a decision');
+      const head = resolveGitCommit(f.lane.path, 'HEAD'); const authority = f.ledger.directiveCurrentAuthority(f.intent.jobId);
+      const watermark = f.ledger.latestEventSeq(); const before = f.ledger.getDirective(f.intent.requestId);
+      const queuedId = entryId === 'job' ? f.intent.jobId : FIXTURE_MINION;
+      let refusal: unknown = null;
+      try {
+        recoverInterruptedDirectiveFromRoute({ ...f.deps, workerGate: queuedGate(queuedId), requestId: f.intent.requestId, generation: debt.generation,
+          expectedPayloadHash: f.intent.payloadHash, expectedHead: head, expectedEpoch: f.ledger.directiveRecoveryEpoch(f.intent.jobId),
+          expectedWorkRevision: authority.workRevision, expectedContractSha256: authority.contractSha256, reason: 'fresh approved successor',
+          decision: { kind: 'successor', requestId: `queued-successor-${entryId}`, directive: 'approved correction' } });
+      } catch (error) { refusal = error; }
+      expect(refusal, entryId).toBeInstanceOf(DirectiveRetirementError);
+      expect(String((refusal as Error).message), entryId).toMatch(/recovery successor refused/u);
+      expect(f.ledger.latestEventSeq(), entryId).toBe(watermark);
+      expect(f.ledger.getDirective(f.intent.requestId), entryId).toEqual(before);
+      expect(f.ledger.getDirective(`queued-successor-${entryId}`), entryId).toBeNull();
+      expect(f.ledger.recoveryDecisionHistory('directive', f.intent.requestId), entryId).toEqual([]);
+    }
+    // Historical rebrief recovery: the same fence, markers untouched.
+    const f = await fixture(); f.ledger.failDirective({ requestId: f.intent.requestId, reason: 'fixture no-effect' });
+    f.ledger.beginPendingRebrief({ jobId: f.intent.jobId, note: 'legacy', briefing: 'original contract' });
+    await bindOriginalRebriefSdkOwner(f.ledger, f.ledger.listPendingRebriefs(), { cwd: f.lane.path, dataDir: f.dir, agentId: 'logical-minion', sessionFile: f.file });
+    const markers = f.ledger.listPendingRebriefs(); const marker = markers.find((row) => row.kind === 'silas.rebrief')!;
+    const debt = f.ledger.openRebriefRecoveryDebt(marker.id, 'unknown native effects');
+    const authority = f.ledger.directiveCurrentAuthority(f.intent.jobId);
+    expect(() => recoverInterruptedRebriefFromRoute({ ...f.deps, workerGate: queuedGate(f.intent.jobId), markerId: marker.id, generation: debt.generation,
+      expectedPayloadHash: marker.payloadHash, expectedReceiptEvidenceSha256: f.ledger.rebriefReceiptEvidence(marker.id).sha256,
+      expectedEpoch: f.ledger.directiveRecoveryEpoch(f.intent.jobId), expectedWorkRevision: authority.workRevision, expectedContractSha256: authority.contractSha256,
+      expectedHead: resolveGitCommit(f.lane.path, 'HEAD'), reason: 'finish under fresh authority',
+      decision: { kind: 'successor', requestId: 'queued-marker-successor', directive: 'finish' } })).toThrow(/requires proven producer cessation/u);
+    expect(f.ledger.listPendingRebriefs()).toEqual(markers);
+    expect(f.ledger.getDirective('queued-marker-successor')).toBeNull();
+    expect(f.ledger.getRebriefRecoveryDecision(marker.id, debt.generation)).toBeNull();
   });
 
   it('historical marker successor is exact-generation guarded and hands off actual authority once', async () => {
