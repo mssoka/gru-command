@@ -431,14 +431,29 @@ export function beginLaneHandoff(lane: Pick<WorktreeLane, 'id' | 'kind' | 'repoP
     if (ours) removeTemp(error);
     throw new Error(`lane administration ${admin} cannot take a handoff receipt (${errnoOf(error)})`, { cause: error });
   }
-  removeTemp(null);
-  // The published directory entry is made durable too, where the filesystem can.
+  // The published directory entry is made durable too, where the filesystem
+  // can — before the temporary name is removed, so no cleanup failure skips
+  // it. A failure here comes after publication and is named so; the caller
+  // rolls the unregistered lane back, receipt and all.
+  let undurable: unknown = null;
   try {
     const dirFd = openSync(admin, 'r');
     try { durably(dirFd); } finally { closeSync(dirFd); }
   } catch (error) {
-    throw new Error(`lane administration ${admin} published its handoff receipt but could not make it durable (${errnoOf(error)})`, { cause: error });
+    undurable = error;
   }
+  if (undurable === null) {
+    removeTemp(null);
+    return;
+  }
+  const notDurable = `lane administration ${admin} published its handoff receipt but could not make it durable (${errnoOf(undurable)})`;
+  try { unlinkSync(temp); } catch (cleanupError) {
+    if (errnoOf(cleanupError) !== 'ENOENT') {
+      throw new Error(`${notDurable}, and its temporary receipt ${temp} could not be removed (${errnoOf(cleanupError)})`,
+        { cause: new AggregateError([undurable, cleanupError], 'handoff receipt durability and its cleanup failed') });
+    }
+  }
+  throw new Error(notDurable, { cause: undurable });
 }
 
 export function assertPendingLaneHandoff(lane: WorktreeRecord, admin: string, token: string): Receipt {

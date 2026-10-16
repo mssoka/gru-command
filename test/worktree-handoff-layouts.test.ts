@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { closeSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, relative as relativePath } from 'node:path';
+import { basename, dirname, join, relative as relativePath } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 // node:fs passes through; a test may make one write or removal fail.
@@ -349,7 +349,7 @@ describe('child lane parent custody, called directly (#373)', () => {
         const ref = join(common, 'refs', 'heads', f.parent.branch!);
         rmSync(ref, { force: true }); mkdirSync(dirname(ref), { recursive: true }); symlinkSync(join(directory(), 'missing'), ref);
       }, () => /writer branch ref .* cannot be resolved \(ENOENT\)/u],
-      ['writer branch ref uninspectable', (f) => {
+      ['writer branch ref a looping link', (f) => {
         const ref = join(realpathSync(join(f.repo.path, '.git')), 'refs', 'heads', f.parent.branch!);
         rmSync(ref); symlinkSync(ref, ref);
       }, () => /writer branch ref .* cannot be resolved \(ELOOP\)/u],
@@ -359,6 +359,11 @@ describe('child lane parent custody, called directly (#373)', () => {
         const branchDir = dirname(join(common, 'refs', 'heads', f.parent.branch!));
         rmSync(branchDir, { recursive: true }); writeFileSync(branchDir, 'x');
       }, () => /writer branch ref .* cannot be inspected \(ENOTDIR\)/u],
+      ['writer refs/heads a link', (f) => {
+        const common = realpathSync(join(f.repo.path, '.git'));
+        renameSync(join(common, 'refs', 'heads'), join(common, 'refs', 'heads-real'));
+        symlinkSync(join(common, 'refs', 'heads-real'), join(common, 'refs', 'heads'));
+      }, () => /writer branch is not direct: its ref .* lies under a linked directory .*\/refs\/heads$/u],
       ['writer branch ref under a dangling directory link', (f) => {
         const common = realpathSync(join(f.repo.path, '.git'));
         git(f.repo.path, ['pack-refs', '--all']);
@@ -486,8 +491,39 @@ describe('child lane parent custody, called directly (#373)', () => {
     fsHooks.beforeFsync = null;
     expect(existsSync(temp)).toBe(false);
     expect(existsSync(join(f.admin, 'gru-creation-handoff.json'))).toBe(true);
+    // ...and when its temporary receipt cannot be removed either, both are said.
+    rmSync(join(f.admin, 'gru-creation-handoff.json'));
+    syncs = 0;
+    fsHooks.beforeFsync = () => { syncs += 1; if (syncs === 2) throw Object.assign(new Error('io'), { code: 'EIO' }); };
+    fsHooks.beforeUnlink = (path) => { if (path === temp) throw Object.assign(new Error('busy'), { code: 'EBUSY' }); };
+    expect(() => handoffProof.beginLaneHandoff(f.parent, f.admin, token))
+      .toThrow(`lane administration ${f.admin} published its handoff receipt but could not make it durable (EIO), and its temporary receipt ${temp} could not be removed (EBUSY)`);
+    fsHooks.beforeFsync = null; fsHooks.beforeUnlink = null;
+    rmSync(temp);
+    // A filesystem that cannot fsync a file or a directory (EINVAL, ENOTSUP) publishes all the same.
+    for (const code of ['EINVAL', 'ENOTSUP']) {
+      rmSync(join(f.admin, 'gru-creation-handoff.json'));
+      fsHooks.beforeFsync = () => { throw Object.assign(new Error('unsupported'), { code }); };
+      try {
+        expect(() => handoffProof.beginLaneHandoff(f.parent, f.admin, token), code).not.toThrow();
+      } finally { fsHooks.beforeFsync = null; }
+      expect(existsSync(join(f.admin, 'gru-creation-handoff.json')), code).toBe(true);
+      expect(existsSync(temp), code).toBe(false);
+    }
     writeFileSync(join(f.admin, 'gru-creation-handoff.json'), receipt);
     expect(readdirSync(f.admin).sort()).toEqual(before);
+  });
+
+  it('a child whose published receipt cannot be made durable is rolled back whole, receipt and all', async () => {
+    const f = await parentFixture('custody-undurable');
+    let syncs = 0;
+    fsHooks.beforeFsync = () => { syncs += 1; if (syncs === 2) throw Object.assign(new Error('io'), { code: 'EIO' }); };
+    try {
+      await expect(f.createChild()).rejects.toThrow(/published its handoff receipt but could not make it durable \(EIO\)$/u);
+    } finally { fsHooks.beforeFsync = null; }
+    expect(syncs).toBe(2);
+    f.childLeftNothing();
+    expect(readdirSync(join(realpathSync(join(f.repo.path, '.git')), 'worktrees'))).toEqual([basename(f.admin)]);
   });
 
   it('a receipt gone after capture is refused by name at the next check', async () => {
