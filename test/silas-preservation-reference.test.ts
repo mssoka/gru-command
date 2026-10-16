@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { nativeSeams } from './helpers/silas-native-seams.js';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { linkSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -31,9 +32,14 @@ interface RecordOptions {
   readonly archive?: Buffer;
   readonly actorId?: string;
   readonly treePath?: string;
+  /** Reshapes the manifest before it is written and bound (a string is
+   * written verbatim). */
+  readonly manifest?: (manifest: Record<string, unknown>) => unknown;
+  /** Default true: the record pins the manifest (`link_manifest_sha256`). */
+  readonly bindManifest?: boolean;
 }
 
-function writeRecord(root: string, opts: RecordOptions): { readonly recordPath: string; readonly recordSha256: string; readonly treePath: string } {
+function writeRecord(root: string, opts: RecordOptions): { readonly recordPath: string; readonly recordSha256: string; readonly treePath: string; readonly manifestSha256: string } {
   mkdirSync(root, { recursive: true });
   const treePath = opts.treePath ?? join(root, 'tree');
   mkdirSync(treePath, { recursive: true });
@@ -47,26 +53,29 @@ function writeRecord(root: string, opts: RecordOptions): { readonly recordPath: 
     original_session_sha256: sha256(opts.session),
     retention_ONLY_complete_inputs_context_process_cleanGit_freshmain_releaseproof_notyetfully_qualified: 'unknown',
   };
-  writeFileSync(
-    join(root, 'link-preservation-manifest.json'),
-    JSON.stringify({
-      original_tree: treePath,
-      relative_entries: opts.linkEntries ?? [],
-      archive_sha256: opts.archive === undefined ? '' : sha256(opts.archive),
-      no_external_link_dereference: true,
-    }),
-  );
+  const manifest: Record<string, unknown> = {
+    original_tree: treePath,
+    relative_entries: opts.linkEntries ?? [],
+    archive_sha256: opts.archive === undefined ? '' : sha256(opts.archive),
+    no_external_link_dereference: true,
+  };
+  const shaped = opts.manifest === undefined ? manifest : opts.manifest(manifest);
+  const manifestText = typeof shaped === 'string' ? shaped : JSON.stringify(shaped);
+  writeFileSync(join(root, 'link-preservation-manifest.json'), manifestText);
+  if (opts.bindManifest !== false) Object.assign(record, { link_manifest_sha256: sha256(manifestText) });
   if (opts.archive !== undefined) {
     writeFileSync(join(root, 'current-ignored-untracked-deliverables-links-preserved.tar.gz'), opts.archive);
   }
   const recordPath = join(root, 'original-custody-and-retention-preflight.json');
   const recordText = JSON.stringify(record);
   writeFileSync(recordPath, recordText);
-  return { recordPath, recordSha256: sha256(recordText), treePath };
+  return { recordPath, recordSha256: sha256(recordText), treePath, manifestSha256: sha256(manifestText) };
 }
 
+/** A canonical temporary root: the resolver refuses symlinked directories,
+ * and the platform temp directory may itself sit behind one. */
 function tempRoot(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'silas-preservation-'));
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'silas-preservation-')));
   dirs.push(dir);
   return dir;
 }
@@ -100,6 +109,7 @@ describe('resolvePreservationReference — reusable retained portions', () => {
     expect(verdict.verifiedAssets).toEqual([
       'complete-original-report.md',
       'original-source-session.jsonl',
+      'link-preservation-manifest.json',
       'link:link-1',
       'archive(current-ignored-untracked-deliverables-links-preserved.tar.gz)',
     ]);
@@ -227,17 +237,19 @@ describe('resolvePreservationReference — fails loud and never follows links (#
   });
 
   it('refuses a missing, malformed or non-object link-preservation manifest — never "nothing to verify"', () => {
-    for (const damage of ['missing', 'malformed', 'array', 'no-entries'] as const) {
+    const damages = {
+      missing: [undefined, /manifest is missing or unreadable/],
+      malformed: [() => '{ not json', /manifest is malformed/],
+      array: [() => [], /manifest is not an object/],
+      'no-entries': [(manifest: Record<string, unknown>) => ({ original_tree: manifest['original_tree'], archive_sha256: '' }), /carries no relative_entries list/],
+    } as const;
+    for (const [damage, [shape, guidance]] of Object.entries(damages)) {
       const root = tempRoot();
-      const record = writeRecord(root, { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's' });
-      const manifest = join(root, 'link-preservation-manifest.json');
-      if (damage === 'missing') rmSync(manifest);
-      if (damage === 'malformed') writeFileSync(manifest, '{ not json');
-      if (damage === 'array') writeFileSync(manifest, '[]');
-      if (damage === 'no-entries') writeFileSync(manifest, JSON.stringify({ original_tree: record.treePath, archive_sha256: '' }));
+      const record = writeRecord(root, { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's', ...(shape === undefined ? {} : { manifest: shape }) });
+      if (damage === 'missing') rmSync(join(root, 'link-preservation-manifest.json'));
       const verdict = resolve(record);
       expect(verdict.reusable, damage).toBe(false);
-      expect(verdict.guidance, damage).toMatch(/link-preservation manifest/);
+      expect(verdict.guidance, damage).toMatch(guidance);
     }
   });
 
@@ -247,9 +259,8 @@ describe('resolvePreservationReference — fails loud and never follows links (#
     rmSync(join(absent, 'current-ignored-untracked-deliverables-links-preserved.tar.gz'));
     expect(resolve(record)).toMatchObject({ reusable: false, guidance: expect.stringMatching(/declared opaque archive is missing/) });
     const malformed = tempRoot();
-    const second = writeRecord(malformed, { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's' });
-    writeFileSync(join(malformed, 'link-preservation-manifest.json'), JSON.stringify({ original_tree: second.treePath, relative_entries: [], archive_sha256: 'not-a-digest' }));
-    expect(resolve(second)).toMatchObject({ reusable: false, guidance: expect.stringMatching(/malformed archive digest/) });
+    const second = writeRecord(malformed, { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's', manifest: (manifest) => ({ ...manifest, archive_sha256: 'A'.repeat(64) }) });
+    expect(resolve(second)).toMatchObject({ reusable: false, guidance: expect.stringMatching(/malformed archive digest — archive_sha256 must be "" \(no archive retained\) or 64 lowercase hex/) });
   });
 
   it('never reads a record or asset through a symlink', () => {
@@ -276,6 +287,81 @@ describe('resolvePreservationReference — fails loud and never follows links (#
     const fine = tempRoot();
     const ok = writeRecord(fine, { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's', linkEntries: ['a..b', 'only/in/archive/link'] });
     expect(resolve(ok).reusable).toBe(true);
+  });
+
+  it('refuses a manifest no digest pins, or one that differs from its binding; a caller binding alone suffices', () => {
+    const unbound = tempRoot();
+    const record = writeRecord(unbound, { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's', bindManifest: false });
+    expect(resolve(record)).toMatchObject({ reusable: false, guidance: expect.stringMatching(/not digest-bound — supply expectedAssets\["link-preservation-manifest\.json"\]/) });
+    const withCaller = (manifestSha: string) => resolvePreservationReference({
+      reference: { recordPath: record.recordPath, recordSha256: record.recordSha256, expectedAssets: { 'link-preservation-manifest.json': manifestSha } }, jobId: 'job-h1',
+    });
+    expect(withCaller(record.manifestSha256).reusable).toBe(true);
+    expect(withCaller('c'.repeat(64))).toMatchObject({ reusable: false, guidance: expect.stringMatching(/does not match its bound digest/) });
+    // A record-bound manifest swapped for one that drops its archive.
+    const bound = tempRoot();
+    const pinned = writeRecord(bound, { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's', archive: Buffer.from('bytes') });
+    writeFileSync(join(bound, 'link-preservation-manifest.json'), JSON.stringify({ original_tree: pinned.treePath, relative_entries: [], archive_sha256: '' }));
+    expect(resolve(pinned)).toMatchObject({ reusable: false, guidance: expect.stringMatching(/does not match its bound digest/) });
+  });
+
+  const hardlinkCases = ['original-custody-and-retention-preflight.json', 'complete-original-report.md', 'link-preservation-manifest.json', 'current-ignored-untracked-deliverables-links-preserved.tar.gz'];
+  const hardlinked = (name: string) => () => {
+    const root = tempRoot();
+    const record = writeRecord(root, { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's', archive: Buffer.from('bytes') });
+    linkSync(join(root, name), join(tempRoot(), 'second-name'));
+    expect(resolve(record)).toMatchObject({ reusable: false, guidance: expect.stringMatching(/is not a single-link regular file/) });
+  };
+  it('refuses a hardlinked record', hardlinked(hardlinkCases[0]!));
+  it('refuses a hardlinked asset', hardlinked(hardlinkCases[1]!));
+  it('refuses a hardlinked manifest', hardlinked(hardlinkCases[2]!));
+  it('refuses a hardlinked archive', hardlinked(hardlinkCases[3]!));
+
+  const symlinked = (name: string) => () => {
+    const root = tempRoot();
+    const record = writeRecord(root, { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's', archive: Buffer.from('bytes') });
+    const elsewhere = join(tempRoot(), name);
+    renameSync(join(root, name), elsewhere);
+    symlinkSync(elsewhere, join(root, name));
+    expect(resolve(record)).toMatchObject({ reusable: false, guidance: expect.stringMatching(/is a symbolic link — refused, never read through/) });
+  };
+  it('refuses a symlinked record leaf', symlinked(hardlinkCases[0]!));
+  it('refuses a symlinked manifest', symlinked(hardlinkCases[2]!));
+  it('refuses a symlinked archive', symlinked(hardlinkCases[3]!));
+
+  it('refuses a FIFO asset without blocking on it', () => {
+    const root = tempRoot();
+    const record = writeRecord(root, { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's' });
+    rmSync(join(root, 'original-source-session.jsonl'));
+    execFileSync('mkfifo', [join(root, 'original-source-session.jsonl')]);
+    expect(resolve(record)).toMatchObject({ reusable: false, guidance: expect.stringMatching(/original-source-session\.jsonl is not a single-link regular file/) });
+  });
+
+  it('refuses a record reached through a symlinked directory, and a symlinked original tree', () => {
+    const root = tempRoot();
+    const record = writeRecord(root, { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's' });
+    const alias = join(tempRoot(), 'alias');
+    symlinkSync(root, alias);
+    const viaAlias = resolvePreservationReference({ reference: { recordPath: join(alias, 'original-custody-and-retention-preflight.json'), recordSha256: record.recordSha256 }, jobId: 'job-h1' });
+    expect(viaAlias).toMatchObject({ reusable: false, guidance: expect.stringMatching(/record directory .*alias must be a real directory reached by no symlink/) });
+    const treeRoot = tempRoot();
+    const realTree = join(treeRoot, 'real-tree');
+    mkdirSync(realTree);
+    symlinkSync(realTree, join(treeRoot, 'tree-link'));
+    const linkedTree = writeRecord(tempRoot(), { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's', treePath: join(treeRoot, 'tree-link') });
+    expect(resolve(linkedTree)).toMatchObject({ reusable: false, guidance: expect.stringMatching(/original tree .*tree-link must be an absolute real directory/) });
+  });
+
+  it('refuses an entry under a dangling link, and "." or empty segments', () => {
+    const root = tempRoot();
+    const tree = join(root, 'tree');
+    mkdirSync(tree, { recursive: true });
+    symlinkSync(join(tempRoot(), 'not-yet-there'), join(tree, 'dangling'));
+    for (const entry of ['dangling/node_modules', '.', 'a/./b', 'a//b']) {
+      const at = tempRoot();
+      const record = writeRecord(at, { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's', treePath: tree, linkEntries: [entry] });
+      expect(resolve(record), entry).toMatchObject({ reusable: false, guidance: expect.stringMatching(/escapes the original tree/) });
+    }
   });
 });
 
@@ -358,17 +444,22 @@ describe('the production release ingress consumes the preservation reference (is
     ledger.setJobStatus(job.id, 'working');
     ledger.setJobStatus(job.id, 'done');
     const record = writeRecord(tempRoot(), { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's', archive: Buffer.from('a') });
+    const other = writeRecord(tempRoot(), { jobId: 'job-h1', repo: 'fixture-repo', report: 'other report', session: 's' });
     let attempts = 0;
     const ops = opsFor(ledger, async () => {
       attempts += 1;
-      if (attempts === 1) return { status: 'paused', processes: [], preserved: null, note: 'a process is using the tree' };
+      if (attempts < 3) return { status: 'paused', processes: [], preserved: null, note: 'a process is using the tree' };
       return { status: 'swept', preserved: null, branch: 'none', freshHead: 'a'.repeat(40) };
     });
     const reference = { recordPath: record.recordPath, recordSha256: record.recordSha256 };
     await expect(ops.releaseLane({ jobId: job.id, ruleId: 'sweep-ack', preservationReference: reference })).rejects.toThrow(/paused/);
-    await ops.releaseLane({ jobId: job.id, ruleId: 'sweep-ack', preservationReference: reference });
-    expect(attempts).toBe(2);
+    await expect(ops.releaseLane({ jobId: job.id, ruleId: 'sweep-ack', preservationReference: reference })).rejects.toThrow(/paused/);
     expect(ledger.listJobEventsByKinds(job.id, ['silas.preservation-reuse'])).toHaveLength(1);
+    // A DIFFERENT record is a different selection: it is recorded too.
+    await ops.releaseLane({ jobId: job.id, ruleId: 'sweep-ack', preservationReference: { recordPath: other.recordPath, recordSha256: other.recordSha256 } });
+    expect(attempts).toBe(3);
+    expect(ledger.listJobEventsByKinds(job.id, ['silas.preservation-reuse']).map((event) => (event.payload as { record_sha256: string }).record_sha256))
+      .toEqual([other.recordSha256, record.recordSha256]);
   });
 
   it('refuses a record that names another repository than the release job (#368)', async () => {

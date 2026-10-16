@@ -1523,6 +1523,17 @@ export class LedgerApi {
     return row === undefined ? null : this.eventFromRow(row);
   }
 
+  /** The newest job event of one kind whose top-level payload `field`
+   * equals `value` — answered over the job's COMPLETE record, so unrelated
+   * traffic (even of the same kind) can never push it out of a window. */
+  latestJobEventByPayloadField(jobId: string, kind: string, field: string, value: string): EventRecord | null {
+    if (!/^[a-z][a-z0-9_]*$/u.test(field)) throw new Error(`latestJobEventByPayloadField: "${field}" is not a plain snake_case payload field`);
+    const row = this.db
+      .prepare(`SELECT * FROM events WHERE job_id = ? AND kind = ? AND json_extract(payload, ?) = ? ORDER BY seq DESC LIMIT 1`)
+      .get(jobId, kind, `$.${field}`, value) as Row | undefined;
+    return row === undefined ? null : this.eventFromRow(row);
+  }
+
   /** The newest event per (kind, scope) for a job. The verification
    * follow-through reduction rides this so an unresolved scope can never
    * age out behind newer traffic from other scopes (no newest-N window). */

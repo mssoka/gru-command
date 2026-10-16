@@ -13,7 +13,7 @@ import { SessionStore } from '../src/sessions/store.js';
 import { PiAgentHandle, PI_CAPABILITIES } from '../src/runtime/pi-adapter.js';
 import { ClaudeCodeHandle, CLAUDE_CODE_CAPABILITIES } from '../src/runtime/claude-adapter.js';
 import { inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveCompletion, recordDirectiveProducerCessation, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader } from '../src/runtime/directive-checkpoint.js';
-import { DirectiveProgressService, executeAcceptedDirective, settleNativeDirective, surfaceDirectiveRecovery } from '../src/dispatch/directive-progress.js';
+import { DirectiveProgressService, DirectivePromptRefusedError, executeAcceptedDirective, promptRefusalUnproven, settleNativeDirective, surfaceDirectiveRecovery } from '../src/dispatch/directive-progress.js';
 import { recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute } from '../src/dispatch/directive-recovery.js';
 import { reconcilePendingLegacyDirectives, reconcilePendingRebriefs, settleDirectivesFromEvidence } from '../src/dispatch/rebrief-recovery.js';
 import type { AgentHandle, SpawnOptions } from '../src/runtime/types.js';
@@ -852,6 +852,36 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     try { service.reconsider(); await service.settled(); expect(spawn).toHaveBeenCalledTimes(1); expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('dispatching'); }
     finally { await service.dispose(); }
   });
+
+  it('#364 an admission refusal before any prompt fails the request by name and releases the lane', async () => {
+    const f = await fixture();
+    await executeAcceptedDirective({ ...f.deps, beforeWriterSideEffect: () => { throw new DirectivePromptRefusedError('an owner hold covers this lane'); } }, f.intent.requestId);
+    expect(f.spawns).toEqual([]);
+    expect(f.ledger.getDirective(f.intent.requestId)).toMatchObject({ state: 'failed', failReason: 'refused before any prompt: an owner hold covers this lane' });
+  });
+
+  it('#364 an untyped fault in the admission re-check is no decision: the request stays live for reconciliation', async () => {
+    const f = await fixture();
+    await executeAcceptedDirective({ ...f.deps, beforeWriterSideEffect: () => { throw new Error('ledger read failed'); } }, f.intent.requestId);
+    expect(f.spawns).toEqual([]);
+    expect(f.ledger.getDirective(f.intent.requestId)?.state).not.toBe('failed');
+  });
+
+  const refusal = new DirectivePromptRefusedError('refused');
+  const prepared = (evidence: (() => 'ceased' | 'unknown') | undefined) => ({ id: 'minion-x', ...(evidence === undefined ? {} : { cessationEvidence: evidence }) });
+  const unproven = (input: Partial<Parameters<typeof promptRefusalUnproven>[0]>): string | null =>
+    promptRefusalUnproven({ error: refusal, failures: 1, admitted: false, prepared: undefined, ...input });
+  it('#364 no-effect proof: a lone refusal with no prepared producer is a no-effect', () => expect(unproven({})).toBeNull());
+  it('#364 no-effect proof: a prepared producer that proved cessation is a no-effect', () => expect(unproven({ prepared: prepared(() => 'ceased') })).toBeNull());
+  it('#364 no-effect proof: a prepared producer with unknown cessation is kept, by name', () =>
+    expect(unproven({ prepared: prepared(() => 'unknown') })).toBe('prepared producer minion-x has not proven cessation (unknown)'));
+  it('#364 no-effect proof: a prepared producer with no cessation evidence is kept', () =>
+    expect(unproven({ prepared: prepared(undefined) })).toMatch(/minion-x has not proven cessation \(no cessation evidence\)/u));
+  it('#364 no-effect proof: an unreadable cessation is unproven, never thrown', () =>
+    expect(unproven({ prepared: prepared(() => { throw new Error('lock unreadable'); }) })).toMatch(/\(unreadable\)/u));
+  it('#364 no-effect proof: a bound native admission is never a no-effect', () => expect(unproven({ admitted: true })).toMatch(/admission was already bound/u));
+  it('#364 no-effect proof: a refusal with a failed cleanup is kept', () => expect(unproven({ failures: 2 })).toMatch(/cleanup also failed/u));
+  it('#364 no-effect proof: any other error is not an admission refusal', () => expect(unproven({ error: new Error('x') })).toBe('not an admission refusal'));
 
   it('positive no-effect closes only the attached awaiting phase without completion', async () => {
     const f = await fixture(); f.ledger.failDirective({ requestId: f.intent.requestId, reason: 'fixture replaced before dispatch' });

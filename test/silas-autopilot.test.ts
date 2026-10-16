@@ -146,6 +146,12 @@ class FakeLedger {
     return this.state.directives.get(requestId) ?? null;
   }
 
+  /** The newest event of a kind whose payload field equals the value. */
+  latestJobEventByPayloadField(jobId: string, kind: string, field: string, value: string): FakeEvent | null {
+    return [...this.state.events].reverse().find((event) => event.jobId === jobId && event.kind === kind &&
+      (event.payload as Record<string, unknown> | undefined)?.[field] === value) ?? null;
+  }
+
   /** Newest first and capped, exactly like the real ledger's query. */
   listJobEventsByKinds(jobId: string, kinds: readonly string[], opts: { limit?: number } = {}): FakeEvent[] {
     return this.state.events
@@ -427,6 +433,39 @@ describe('autopilot mode resolution (kill switch + per-family modes)', () => {
       config: enabled(), ledger: ledger.port, ops: ops.ops,
     });
     expect(ledger.decisions().filter((event) => event.jobId === 'job-other')).toHaveLength(1);
+  });
+
+  it('a rule\'s last decision is found past any number of other rules\' decisions on the job (#369)', async () => {
+    const ledger = newRealLedger();
+    const job = ledger.addJob({ id: 'job-release', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
+    ledger.setJobStatus(job.id, 'working');
+    ledger.setJobStatus(job.id, 'done');
+    const ops = fakeOps();
+    const pass = () => runSilasAutopilot({ digest: digest({ releaseEligible: [releaseRow()] }), config: enabled(), ledger, ops: ops.ops });
+    const ruleDecisions = () => ledger.listJobEventsByKinds(job.id, [AUTOPILOT_DECISION_EVENT], { limit: 1000 })
+      .filter((event) => (event.payload as { rule_id?: string }).rule_id === 'sweep-ack');
+    await pass();
+    expect(ruleDecisions()).toHaveLength(1);
+    // More decisions from another rule than any fixed newest-N window holds.
+    for (let index = 0; index < 300; index += 1) {
+      ledger.appendCustomEvent({ kind: AUTOPILOT_DECISION_EVENT, jobId: job.id, payload: { rule_id: 'pr-review-trigger', job: job.id, action: 'noop', would_call: { index }, mode: 'dry-run' } });
+    }
+    await pass();
+    expect(ruleDecisions()).toHaveLength(1);
+    expect(() => ledger.latestJobEventByPayloadField(job.id, AUTOPILOT_DECISION_EVENT, "rule_id') OR 1=1 --", 'x')).toThrow(/not a plain snake_case payload field/u);
+  });
+
+  it('a decision recorded before fingerprints existed is the same decision on upgrade (#369)', async () => {
+    const ledger = new FakeLedger().job('job-release', 'done');
+    const ops = fakeOps();
+    const pass = () => runSilasAutopilot({ digest: digest({ releaseEligible: [releaseRow()] }), config: enabled(), ledger: ledger.port, ops: ops.ops });
+    await pass();
+    const [first] = ledger.decisions();
+    const { fingerprint: _fingerprint, ...legacy } = first!.payload as Record<string, unknown>;
+    // Rewrite history as a pre-#369 deployment left it: no fingerprint.
+    (first as { payload: unknown }).payload = legacy;
+    await pass();
+    expect(ledger.decisions()).toHaveLength(1);
   });
 
   it('enforce performs exactly one call per decision, and reports the failure of one', async () => {
@@ -2968,6 +3007,43 @@ describe('F-H3 verification ownership is re-proved after the pacing wait', () =>
     expect(request?.state).toBe('failed');
     expect(request?.failReason).toMatch(/^refused before any prompt: .*verification/);
     expect(ledger.listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES, limit: 5 })).toEqual([]);
+  });
+});
+
+describe('#364 only a named admission refusal fails the request', () => {
+  it('a ledger fault while re-proving after the pacing wait keeps the request live for reconciliation', async () => {
+    const ledger = newRealLedger();
+    const job = ledger.addJob({ id: 'job-364-fault', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
+    ledger.setJobStatus(job.id, 'working');
+    ledger.registerAgent({ id: 'min-364', role: 'minion', jobId: job.id });
+    ledger.setAgentState('min-364', 'idle');
+    let prompted = 0;
+    const lanes = await nativeLanes(job.id, ledger);
+    const handle = nativeHandle({ ...idleHandle('min-364'), async prompt() { prompted += 1; } }, lanes, job.id);
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'hold the pool' });
+    const ops = createSilasAutopilotOps({
+      ...nativeSeams,
+      ledger,
+      wave: waveStub(),
+      registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
+      worktrees: lanes,
+      dispatch: { recordPr: () => ({ prUrl: null }) },
+      gh: { listPullsForHead: async () => [] },
+      resolveRemote: () => null,
+      workerGate: gate,
+    });
+    await ops.sendDirective({ jobId: job.id, directive: 'x', ruleId: 'verdict-rung-directive', sourceRoundId: 'round-364' });
+    await vi.waitFor(() => expect(gate.view().worker.queued).toHaveLength(1));
+    // The verification-ownership re-read itself fails after the wait.
+    vi.spyOn(ledger, 'hasUnsettledVerificationRun').mockImplementation(() => { throw new Error('ledger read failed'); });
+    holder.release();
+    await vi.waitFor(() => expect(gate.view().worker.queued).toHaveLength(0));
+    await ops.drain();
+    expect(prompted).toBe(0);
+    const [request] = ledger.listPendingDirectives({ jobId: job.id });
+    expect(request?.state).not.toBe('failed');
+    expect(ledger.listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES, limit: 5 })).toHaveLength(1);
   });
 });
 

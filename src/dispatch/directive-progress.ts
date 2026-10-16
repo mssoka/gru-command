@@ -38,18 +38,39 @@ function check(deps: DirectiveProgressDeps, identity: DirectiveTurnIdentity): vo
   if (deps.signal.aborted) throw new DirectiveCheckpointError('service stopping — directive recovery cancelled');
   deps.ledger.assertDirectiveAuthority(identity);
 }
-/** The target minion's runtime cannot host a native directive at all. Raised
- * before any target binding, header read or prompt — positive no-effect. */
 /** A caller's admission re-check (`beforeWriterSideEffect`) refused at a
  * post-wait boundary — after pacing, around spawn/resume or immediately
- * before the prompt, so ALWAYS before any prompt (#364). Once every cleanup
- * settled and any prepared native target has proven cessation, that is a
- * positive no-effect: the request fails by name instead of staying live for
+ * before the prompt, each of which precedes that boundary's prompt (#364).
+ * It is a positive no-effect only when {@link promptRefusalIsNoEffect}
+ * holds; then the request fails by name instead of staying live for
  * reconciliation and fencing the lane. */
 export class DirectivePromptRefusedError extends Error {
-  constructor(message: string) { super(message); this.name = 'DirectivePromptRefusedError'; }
+  constructor(message: string, options?: ErrorOptions) { super(message, options); this.name = 'DirectivePromptRefusedError'; }
 }
 
+/** #364: an admission refusal fails the request by name only when nothing
+ * can have reached the minion — no native admission was bound this turn,
+ * the refusal is the ONLY failure (every cleanup settled), and no prepared
+ * producer outlives it (none was prepared, or it proved cessation; an
+ * unreadable cessation is unproven). Anything else stays live for
+ * reconciliation. Returns the reason it is NOT a no-effect, or null. */
+export function promptRefusalUnproven(input: {
+  readonly error: unknown;
+  readonly failures: number;
+  readonly admitted: boolean;
+  readonly prepared: Pick<AgentHandle, 'id' | 'cessationEvidence'> | undefined;
+}): string | null {
+  if (!(input.error instanceof DirectivePromptRefusedError)) return 'not an admission refusal';
+  if (input.failures !== 1) return 'a cleanup also failed';
+  if (input.admitted) return 'a native admission was already bound';
+  if (input.prepared === undefined) return null;
+  let evidence: string | undefined;
+  try { evidence = input.prepared.cessationEvidence?.(); } catch { evidence = 'unreadable'; }
+  return evidence === 'ceased' ? null : `prepared producer ${input.prepared.id} has not proven cessation (${evidence ?? 'no cessation evidence'})`;
+}
+
+/** The target minion's runtime cannot host a native directive at all. Raised
+ * before any target binding, header read or prompt — positive no-effect. */
 class DirectiveRuntimeUnsupportedError extends DirectiveCheckpointError {
   constructor(message: string) { super(message); this.name = 'DirectiveRuntimeUnsupportedError'; }
 }
@@ -155,6 +176,7 @@ export async function executeAcceptedDirective(deps: DirectiveProgressDeps, requ
   const release = deps.ledger.beginJobAdmission(row.jobId, `directive ${requestId}`);
   let preparedHandle: AgentHandle | undefined;
   let preparedCleanupAttempted = false;
+  let admitted = false;
   let producerStartSeq: number | undefined;
   let dispatchStartSeq: number | undefined;
   let preparedProducer: DirectiveProducer | undefined;
@@ -214,7 +236,7 @@ export async function executeAcceptedDirective(deps: DirectiveProgressDeps, requ
         producerStartSeq = deps.ledger.startDirectiveProducer(identity, preparedProducer);
       },
       directiveTurn: { identity, beforeAdmission: () => checkFreshAdmission(),
-        onAdmitted: (binding) => { deps.ledger.bindDirectiveNativeAdmission(binding); } },
+        onAdmitted: (binding) => { admitted = true; deps.ledger.bindDirectiveNativeAdmission(binding); } },
     });
     // Resident routing does not dispose; the same prepared native owner
     // must prove cleanup too. Fresh routing has already disposed/journaled.
@@ -251,16 +273,18 @@ export async function executeAcceptedDirective(deps: DirectiveProgressDeps, requ
       try { recordCleanup(deps, identity, preparedHandle, producerStartSeq); } catch (journalError) { failures.push(journalError); }
     }
     const failure = failures.length === 1 ? error : new AggregateError(failures, `directive execution/cleanup failed: ${failures.map(String).join('; ')}`);
-    const promptRefused = error instanceof DirectivePromptRefusedError &&
-      (preparedHandle === undefined || preparedHandle.cessationEvidence?.() === 'ceased');
+    const unproven = promptRefusalUnproven({ error, failures: failures.length, admitted, prepared: preparedHandle });
+    const promptRefused = error instanceof DirectivePromptRefusedError && unproven === null;
     if ((error instanceof DirectiveRuntimeUnsupportedError || promptRefused) && failures.length === 1 && !deps.signal.aborted) {
       // Refused before any prompt, every cleanup settled and no prepared
       // producer outlives it: a positive no-effect. A runtime refusal cannot
       // change on retry; an admission refusal is the caller's fresh decision.
       deps.ledger.failDirective({ requestId, reason: promptRefused ? `refused before any prompt: ${error.message}` : error.message });
     } else if (!deps.signal.aborted) {
-      deps.ledger.recordDirectiveReconcile({ requestId, note: String(failure) });
-      surfaceDirectiveRecovery(deps, requestId, String(failure));
+      // An admission refusal that cannot be proven a no-effect says why.
+      const note = error instanceof DirectivePromptRefusedError ? `${String(failure)} — kept for reconciliation: ${unproven ?? 'unknown'}` : String(failure);
+      deps.ledger.recordDirectiveReconcile({ requestId, note });
+      surfaceDirectiveRecovery(deps, requestId, note);
     }
   } finally { release(); }
 }

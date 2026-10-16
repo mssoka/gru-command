@@ -141,6 +141,32 @@ describe('H6 silas_action tool bindings (unit seams)', () => {
     expect(eventKinds().filter((row) => row.kind === 'silas.model-action')).toHaveLength(4);
   });
 
+  it('refuses non-object input, blank fields and control characters, and counts length in code points (#369)', async () => {
+    const { ledger, eventKinds } = makeLedger();
+    const job = ledger.addJob({ id: 'job-shape', repo: 'r', title: 't', baseBranch: 'main', briefing: 'b' });
+    ledger.setJobStatus(job.id, 'working');
+    const handle = { id: 'silas-s', pendingTurn: () => ({ text: 'live', owner: 'silas' }) } as unknown as AgentHandle;
+    const tool = createSilasModelActionTool({ getHandle: () => handle, ledger, digest: async () => emptyDigest() });
+    const outcome = async (input: unknown) => JSON.parse((await tool.execute(input as Record<string, unknown>)).text) as { reason?: string; ok: boolean; message?: string };
+    for (const input of [[], 'hold', 7, true]) {
+      expect(await outcome(input), JSON.stringify(input)).toMatchObject({ ok: false, reason: 'bad-input' });
+    }
+    const refusedFields: readonly (readonly [string, unknown])[] = [
+      ['family', ''], ['debt', '   '], ['family', 7], ['debt', 'a\u0000b'], ['family', 'esc\u001b[31m'], ['jobId', `${job.id}\u0085`], ['rationale', 'bell\u0007'],
+    ];
+    for (const [field, value] of refusedFields) {
+      expect(await outcome({ action: 'hold', jobId: job.id, [field]: value }), `${field}=${JSON.stringify(value)}`).toMatchObject({ ok: false, reason: 'bad-field' });
+    }
+    // The rationale alone may break lines; length is in code points, the
+    // unit JSON Schema maxLength counts.
+    expect(await outcome({ action: 'hold', jobId: job.id, rationale: 'line one\n\tline two\r\n' })).toMatchObject({ ok: true });
+    const astral = '\u{1F600}';
+    expect(await outcome({ action: 'hold', jobId: job.id, rationale: astral.repeat(SILAS_ACTION_LIMITS.rationale) })).toMatchObject({ ok: true });
+    expect(await outcome({ action: 'hold', jobId: job.id, rationale: astral.repeat(SILAS_ACTION_LIMITS.rationale + 1) }))
+      .toMatchObject({ ok: false, reason: 'bad-field', message: `rationale must be at most ${String(SILAS_ACTION_LIMITS.rationale)} characters` });
+    expect(eventKinds().filter((row) => row.kind === 'silas.model-action')).toHaveLength(2);
+  });
+
   it('refuses a missing or unknown action and a missing job, and a failed digest leaves no receipt (#368)', async () => {
     const { ledger, eventKinds } = makeLedger();
     const job = ledger.addJob({ id: 'job-branches', repo: 'r', title: 't', baseBranch: 'main', briefing: 'b' });
@@ -219,6 +245,33 @@ describe('H6 the Silas slot spawn wiring (#368)', () => {
     const receipts = eventKinds().filter((row) => row.kind === 'silas.model-observation')
       .map((row) => (JSON.parse(String(row.payload)) as { handle_id: string }).handle_id);
     expect(receipts).toEqual([first.id, second.id]);
+  });
+
+  it('refuses before its spawn resolves, and a caller tool of the same name is refused before any spawn', async () => {
+    const { ledger, eventKinds } = makeLedger();
+    const job = ledger.addJob({ id: 'job-pending', repo: 'r', title: 't', baseBranch: 'main', briefing: 'b' });
+    ledger.setJobStatus(job.id, 'working');
+    let captured: SpawnOptions | undefined;
+    let finish: (handle: AgentHandle) => void = () => {};
+    let spawns = 0;
+    const registry = {
+      spawn: (_role: string, options?: SpawnOptions): Promise<AgentHandle> => {
+        spawns += 1;
+        captured = options;
+        return new Promise<AgentHandle>((resolve) => { finish = resolve; });
+      },
+    };
+    const spawning = spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() });
+    const tool = captured!.nativeTools![0]!;
+    expect(JSON.parse((await tool.execute({ action: 'hold', jobId: job.id })).text)).toMatchObject({ ok: false, reason: 'unbound' });
+    expect(eventKinds()).toEqual([]);
+    finish({ id: 'silas-late', sessionFile: null, pendingTurn: () => ({ text: 'live', owner: 'silas' }) } as unknown as AgentHandle);
+    await spawning;
+    expect(JSON.parse((await tool.execute({ action: 'hold', jobId: job.id })).text)).toMatchObject({ ok: true });
+    const stale = { name: SILAS_MODEL_ACTION_TOOL } as unknown as NativeAgentTool;
+    await expect(spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() }, { nativeTools: [stale] }))
+      .rejects.toThrow(/already carries a silas_action tool — each spawn binds its own/u);
+    expect(spawns).toBe(1);
   });
 
   it('is the spawn main.ts declares for the Silas slot (wiring alarm)', () => {

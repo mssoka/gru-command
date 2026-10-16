@@ -142,6 +142,12 @@ export function autopilotReceiptFields(ruleId: SilasAutopilotRuleId): {
   return { rule_id: ruleId, source: AUTOPILOT_SOURCE };
 }
 
+/** A machine writer's admission re-check refused the effect: a DECISION
+ * (owner hold or verification ownership), never a fault while re-proving. */
+export class AutopilotAdmissionRefusedError extends Error {
+  constructor(message: string) { super(message); this.name = 'AutopilotAdmissionRefusedError'; }
+}
+
 export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutopilotOpsHandle {
   const log = deps.log ?? ((): void => {});
 
@@ -204,7 +210,7 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
    * re-brief is admitted. */
   const requireNoUnsettledVerification = (jobId: string, label: string): void => {
     if (deps.ledger.hasUnsettledVerificationRun(jobId)) {
-      throw new Error(`a verification is already in flight on this lane — the ${label} is left for LLM Silas`);
+      throw new AutopilotAdmissionRefusedError(`a verification is already in flight on this lane — the ${label} is left for LLM Silas`);
     }
   };
 
@@ -216,7 +222,7 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
   const requireHoldUncovered = (jobId: string, hold: DecisionHoldTriple | undefined, label: string): void => {
     if (hold === undefined) return;
     const covered = decisionHold(deps.ledger, jobId, hold);
-    if (covered !== null) throw new Error(`${covered} — the ${label} is left for LLM Silas`);
+    if (covered !== null) throw new AutopilotAdmissionRefusedError(`${covered} — the ${label} is left for LLM Silas`);
   };
 
   /** A directive-recovery/retirement hold the planner saw can land between
@@ -480,14 +486,17 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
       signal: controller.signal,
       clearLaneForWriter: (input) => deps.wave.clearLaneForWriter(input),
       // F-H2/F-H3: re-proved at every post-wait writer boundary. A refusal
-      // here is always before any prompt (#364): typed so the executor fails
-      // the request by name rather than leaving it live for reconcile.
+      // here precedes that boundary's prompt (#364): typed so the executor
+      // can fail the request by name rather than leave it live for
+      // reconcile. Only the named refusal is typed — a ledger fault while
+      // re-proving is not a decision and propagates unchanged.
       beforeWriterSideEffect: () => {
         try {
           requireHoldUncovered(jobId, hold, label);
           requireNoUnsettledVerification(jobId, label);
         } catch (error) {
-          throw new DirectivePromptRefusedError(String(error instanceof Error ? error.message : error));
+          if (error instanceof AutopilotAdmissionRefusedError) throw new DirectivePromptRefusedError(error.message, { cause: error });
+          throw error;
         }
       },
       ...(deps.workerGate === undefined ? {} : { workerGate: deps.workerGate }),
@@ -649,11 +658,8 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
       if (!verdict.reusable) {
         throw new Error(`preservation reuse refused: ${verdict.guidance ?? 'the supplied reference is not reusable'}`);
       }
-      const already = deps.ledger
-        .listJobEventsByKinds(input.jobId, ['silas.preservation-reuse'])
-        .some((event) => typeof event.payload === 'object' && event.payload !== null &&
-          (event.payload as { record_sha256?: unknown }).record_sha256 === verdict.recordSha256);
-      if (!already) {
+      const already = deps.ledger.latestJobEventByPayloadField(input.jobId, 'silas.preservation-reuse', 'record_sha256', verdict.recordSha256);
+      if (already === null) {
         deps.ledger.appendCustomEvent({
           kind: 'silas.preservation-reuse',
           jobId: input.jobId,

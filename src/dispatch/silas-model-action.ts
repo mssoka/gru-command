@@ -40,9 +40,27 @@ const str = (value: unknown): string | null =>
   typeof value === 'string' && value.length > 0 ? value : null;
 
 /** Bounds on the model's free text (#369): the record is advisory audit
- * material, so an over-long field is refused by name, never truncated. */
+ * material, so an over-long field is refused by name, never truncated.
+ * Lengths are in code points — the unit JSON Schema `maxLength` counts. */
 export const SILAS_ACTION_LIMITS = { jobId: 200, family: 128, debt: 128, rationale: 2000 } as const;
+const BOUNDED_FIELDS = Object.keys(SILAS_ACTION_LIMITS) as readonly (keyof typeof SILAS_ACTION_LIMITS)[];
 const HEAD_SHA = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u;
+/** Control characters never enter the audit record; the rationale alone may
+ * carry tabs and line breaks. */
+const hasControl = (value: string, allowBreaks: boolean): boolean => [...value].some((char) => {
+  const code = char.codePointAt(0)!;
+  if (allowBreaks && (code === 0x09 || code === 0x0a || code === 0x0d)) return false;
+  return code < 0x20 || (code >= 0x7f && code <= 0x9f);
+});
+
+/** Why a present bounded field is unusable, or null when it is fine. */
+function boundedFieldProblem(field: keyof typeof SILAS_ACTION_LIMITS, value: unknown): string | null {
+  const limit = SILAS_ACTION_LIMITS[field];
+  if (typeof value !== 'string' || value.trim() === '') return `${field} must be a non-blank string`;
+  if ([...value].length > limit) return `${field} must be at most ${String(limit)} characters`;
+  if (hasControl(value, field === 'rationale')) return `${field} must not contain control characters`;
+  return null;
+}
 
 export function createSilasModelActionTool(deps: SilasModelActionToolDeps): NativeAgentTool {
   return {
@@ -52,7 +70,7 @@ export function createSilasModelActionTool(deps: SilasModelActionToolDeps): Nati
       'It executes nothing: the host only binds the record to the live model turn, the observed digest ' +
       'and the actual job row, and returns a durable action id. Perform the operation through its own ' +
       'endpoint. Free text is bounded (rationale ' + String(SILAS_ACTION_LIMITS.rationale) + ' chars) and ' +
-      'head must be a full commit SHA.',
+      'head must be a full lowercase commit SHA (40 or 64 hex characters).',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -61,7 +79,7 @@ export function createSilasModelActionTool(deps: SilasModelActionToolDeps): Nati
         jobId: { type: 'string', maxLength: SILAS_ACTION_LIMITS.jobId },
         family: { type: 'string', maxLength: SILAS_ACTION_LIMITS.family },
         debt: { type: 'string', maxLength: SILAS_ACTION_LIMITS.debt },
-        head: { type: 'string', pattern: HEAD_SHA.source },
+        head: { type: 'string', pattern: HEAD_SHA.source, description: 'full lowercase commit SHA (40 or 64 hex characters)' },
         rationale: { type: 'string', maxLength: SILAS_ACTION_LIMITS.rationale },
       },
       required: ['action', 'jobId'],
@@ -75,18 +93,22 @@ export function createSilasModelActionTool(deps: SilasModelActionToolDeps): Nati
       if (turn === null) {
         return refusal('no-live-turn', 'no live model turn currently owns this session');
       }
-      const args = (input ?? {}) as Record<string, unknown>;
+      // No arguments at all reads as an empty object (refused below for its
+      // missing action); any other non-object input is refused by name.
+      const raw: unknown = input ?? {};
+      if (typeof raw !== 'object' || Array.isArray(raw)) {
+        return refusal('bad-input', 'the tool input must be a JSON object');
+      }
+      const args = raw as Record<string, unknown>;
       const action = str(args['action']);
       if (action === null || !ACTIONS.includes(action as SilasModelActionKind)) {
         return refusal('bad-action', `action must be one of ${ACTIONS.join('|')}`);
       }
       const jobId = str(args['jobId']);
       if (jobId === null) return refusal('bad-job', 'jobId is required');
-      for (const field of ['jobId', 'family', 'debt', 'rationale'] as const) {
-        const value = args[field];
-        if (value !== undefined && (typeof value !== 'string' || value.length > SILAS_ACTION_LIMITS[field])) {
-          return refusal('bad-field', `${field} must be a string of at most ${String(SILAS_ACTION_LIMITS[field])} characters`);
-        }
+      for (const field of BOUNDED_FIELDS) {
+        const problem = args[field] === undefined ? null : boundedFieldProblem(field, args[field]);
+        if (problem !== null) return refusal('bad-field', problem);
       }
       const head = str(args['head']);
       if (args['head'] !== undefined && (head === null || !HEAD_SHA.test(head))) {
@@ -164,6 +186,11 @@ export function spawnSilasWithActionTool(
     digest: deps.digest,
     ...(deps.log !== undefined ? { log: deps.log } : {}),
   });
+  if ((spawnOptions?.nativeTools ?? []).some((tool) => tool.name === SILAS_MODEL_ACTION_TOOL)) {
+    return Promise.reject(new Error(
+      `the Silas spawn already carries a ${SILAS_MODEL_ACTION_TOOL} tool — each spawn binds its own; pass spawn options without it`,
+    ));
+  }
   return deps.registry
     .spawn('silas', {
       ...(spawnOptions ?? {}),

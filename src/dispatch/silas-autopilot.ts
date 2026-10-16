@@ -156,6 +156,7 @@ export type AutopilotLedger = Pick<
   | 'latestJobEvent'
   | 'getDirective'
   | 'listJobEventsByKinds'
+  | 'latestJobEventByPayloadField'
   | 'listPendingRebriefs'
   | 'listPendingDirectives'
   | 'hasOpenDirectiveRecoveryHold'
@@ -735,6 +736,23 @@ export interface SilasAutopilotInput {
  * per deterministic observation; a family that refuses or fails leaves its
  * row untouched for LLM Silas.
  */
+/** The identity of one decision: what it would call, and in which mode. */
+function decisionFingerprint(decision: { readonly action: unknown; readonly would_call: unknown; readonly mode: unknown }): string {
+  return createHash('sha256')
+    .update(JSON.stringify({ action: decision.action, would_call: decision.would_call, mode: decision.mode }))
+    .digest('hex');
+}
+
+/** A recorded decision's fingerprint; a decision recorded before #369
+ * carried none, so it is derived from the same fields it would have hashed
+ * (an upgrade never re-records an unchanged decision). */
+function recordedFingerprint(payload: unknown): string | null {
+  if (typeof payload !== 'object' || payload === null) return null;
+  const recorded = payload as { readonly fingerprint?: unknown; readonly action?: unknown; readonly would_call?: unknown; readonly mode?: unknown };
+  if (typeof recorded.fingerprint === 'string') return recorded.fingerprint;
+  return decisionFingerprint({ action: recorded.action, would_call: recorded.would_call, mode: recorded.mode });
+}
+
 export async function runSilasAutopilot(input: SilasAutopilotInput): Promise<SilasAutopilotPassResult> {
   const log = input.log ?? ((): void => {});
   const counts: Record<string, MutableRuleCounts> = {};
@@ -757,21 +775,21 @@ export async function runSilasAutopilot(input: SilasAutopilotInput): Promise<Sil
   };
 
   /** Record one decision and (in enforce mode) perform exactly one call.
-   * The decision EVENT is recorded once per (rule, job, fingerprint) (#369):
-   * a row that persists unchanged across passes is the same decision, so it
-   * never inflates the would-do record; a changed call/mode records anew.
-   * (An enforce-mode call still runs each pass — calls carry their own
-   * idempotent receipts.) */
+   * The decision EVENT is recorded only when it differs from this rule's
+   * LAST recorded decision for the job (#369): a row that persists
+   * unchanged across passes is the same decision and never inflates the
+   * would-do record, while any change (call or mode) records anew — so
+   * A, A, B, A records A, B, A. The pass's `decisions` count still counts
+   * every decision this pass made, recorded or not, and an enforce-mode
+   * call still runs each pass (calls carry their own idempotent receipts). */
   const decide = async (ruleId: SilasAutopilotRuleId, jobId: string, call: AutopilotCall): Promise<void> => {
     const rule = counts[ruleId]!;
     rule.decisions += 1;
-    const fingerprint = createHash('sha256')
-      .update(JSON.stringify({ action: call.action, would_call: call.wouldCall, mode: rule.mode }))
-      .digest('hex');
-    const latest = input.ledger
-      .listJobEventsByKinds(jobId, [AUTOPILOT_DECISION_EVENT], { limit: 64 })
-      .find((event) => (event.payload as { rule_id?: unknown } | null)?.rule_id === ruleId);
-    if ((latest?.payload as { fingerprint?: unknown } | null | undefined)?.fingerprint !== fingerprint) {
+    const fingerprint = decisionFingerprint({ action: call.action, would_call: call.wouldCall, mode: rule.mode });
+    // The rule's newest decision over the job's complete record: other
+    // rules' decisions can never push it out of a window.
+    const latest = input.ledger.latestJobEventByPayloadField(jobId, AUTOPILOT_DECISION_EVENT, 'rule_id', ruleId);
+    if (latest === null || recordedFingerprint(latest.payload) !== fingerprint) {
       input.ledger.appendCustomEvent({
         kind: AUTOPILOT_DECISION_EVENT,
         jobId,
