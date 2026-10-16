@@ -12,7 +12,7 @@ function foldedSegment(part: string): string {
   const bare = folded.replace(/[.\s]+$/u, '');
   // A stream suffix (`a:b`) or a reserved device name (with any extension or
   // trailing blanks) folds to nothing too: refused, never judged as another name.
-  if (bare.includes(':') || /^(?:con|prn|aux|nul|com\d|lpt\d|conin\$|conout\$|clock\$)(?:\.[\s\S]*)?$/iu.test(bare)) return '';
+  if (bare.includes(':') || /^(?:con|prn|aux|nul|com\d|lpt\d|conin\$|conout\$|clock\$)\s*(?:\.[\s\S]*)?$/iu.test(bare)) return '';
   return bare.toLowerCase();
 }
 /** A name a filesystem may map onto `.git`, including the 8.3 short names

@@ -87,17 +87,18 @@ const STACK_LINE = new RegExp(String.raw`^\s+at (?:async )?(?:\S.* \((?:.*:\d+:\
 const FRAME_OPENING = /^\s+at \S/u;
 const MAX_FRAME_LINE = 2048;
 /** An indented `at …` line naming a location: one that ends in
- * `:line:column`, or holds a path-like token — a `/` in it, or a file
- * extension (`.ts`, `.md`) — followed by `:line` anywhere, with or without a
- * column, closed or not. A bare clock time, and prose whose numbers are not
- * attached to a path (`1.5:1`, `v2.0:3`), are not. Linear in the line. */
-const PATH_LIKE = /\/|\.[A-Za-z][A-Za-z0-9]*$/u;
+ * `:line:column`, or holds a path-like token — any `.`, `/` or `\\` in it
+ * (fail closed: `notes.v2-final`, `a.7z`, `test\\h` all count) — followed by
+ * `:line` anywhere, with or without a column, closed or not. A bare clock
+ * time, and a version or decimal number (`1.5:1`, `v2.0:3`), are not. Linear
+ * in the line (a frame-opening line is at most MAX_FRAME_LINE long). */
+const PATH_LIKE = (part) => /[./\\]/u.test(part) && !/^v?\d+(?:\.\d+)+$/u.test(part);
 function namesLocation(line) {
   if (/:\d+:\d+\)?$/u.test(line)) return true;
   for (const token of line.split(/[\s()]+/u)) {
     const parts = token.split(':');
     for (let index = 0; index < parts.length - 1; index += 1) {
-      if (PATH_LIKE.test(parts[index]) && /^\d/u.test(parts[index + 1])) return true;
+      if (PATH_LIKE(parts[index]) && /^\d/u.test(parts[index + 1])) return true;
     }
   }
   return false;
