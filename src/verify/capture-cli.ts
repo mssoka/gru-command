@@ -64,6 +64,32 @@ export type CaptureExitCode = (typeof CAPTURE_EXIT)[keyof typeof CAPTURE_EXIT];
 
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
+/** Connect + response-headers bound for the capture transport (#389). */
+export const CAPTURE_RESPONSE_HEADERS_TIMEOUT_MS = 60_000;
+/** The errno-style code a response-headers timeout carries into the receipt. */
+export const CAPTURE_RESPONSE_TIMEOUT_CODE = 'ERESPONSETIMEOUT';
+
+/** Node's setTimeout ceiling: a larger delay overflows and fires at once. */
+const MAX_TIMER_MS = 2_147_483_647;
+
+/** A headers bound that cannot time correctly is refused by name (#389):
+ * NaN/infinite, below Node's 1 ms timer floor (which coerces it to 1 ms) or
+ * past the timer ceiling (which overflows) would fire at once and fail every
+ * request with a misleading timeout. */
+export function checkResponseHeadersTimeoutMs(ms: number): number {
+  if (!Number.isFinite(ms) || ms < 1 || ms > MAX_TIMER_MS) {
+    throw new RangeError(
+      `responseHeadersTimeoutMs must be a number of milliseconds from 1 to ${String(MAX_TIMER_MS)} (got ${String(ms)})`,
+    );
+  }
+  return ms;
+}
+
+export interface NodeStreamFetchOptions {
+  /** Test seam; production uses CAPTURE_RESPONSE_HEADERS_TIMEOUT_MS. */
+  readonly responseHeadersTimeoutMs?: number;
+}
+
 /**
  * The production streaming transport. Deliberately NOT global fetch:
  * undici's default 5-minute body inactivity timeout can abort a verify
@@ -74,8 +100,22 @@ type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
  * — and real socket errors reach the receipt with their errno/cause.
  * The surface matches the FetchLike seam the tests inject: `ok`,
  * `status`, `body` (a byte stream) and `text()`.
+ *
+ * Connecting and receiving the response HEADERS are bounded (#389): the
+ * verify service writes its 200 before any queue wait, so this bound only
+ * ends a service that never completes the connection (a refused connection
+ * fails at once with ECONNREFUSED) or accepted it and never answered — a
+ * named transport error in an UNKNOWN receipt instead of a hang. The
+ * body stays unbounded: a long quiet run is never cut off.
  */
-export function nodeStreamFetch(input: string, init?: RequestInit): Promise<Response> {
+export function nodeStreamFetch(input: string, init?: RequestInit, options: NodeStreamFetchOptions = {}): Promise<Response> {
+  let responseHeadersTimeoutMs: number;
+  try {
+    responseHeadersTimeoutMs = checkResponseHeadersTimeoutMs(options.responseHeadersTimeoutMs ?? CAPTURE_RESPONSE_HEADERS_TIMEOUT_MS);
+  } catch (error) {
+    // A Promise-returning transport fails by rejection, never a sync throw.
+    return Promise.reject(error as Error);
+  }
   return new Promise((resolve, reject) => {
     const url = new URL(input);
     const requestFn = url.protocol === 'https:' ? httpsRequest : httpRequest;
@@ -105,7 +145,14 @@ export function nodeStreamFetch(input: string, init?: RequestInit): Promise<Resp
       reject(new Error('nodeStreamFetch supports only string or Buffer request bodies'));
       return;
     }
-    const request = requestFn(url, { method: init?.method ?? 'GET', headers }, (response) => {
+    const method = init?.method ?? 'GET';
+    let headersTimer: ReturnType<typeof setTimeout> | null = null;
+    const clearHeadersTimer = (): void => {
+      if (headersTimer !== null) clearTimeout(headersTimer);
+      headersTimer = null;
+    };
+    const request = requestFn(url, { method, headers }, (response) => {
+      clearHeadersTimer();
       let cachedBody: ReadableStream<Uint8Array> | null = null;
       let bodyAccessed = false;
       let consumedByText = false;
@@ -173,7 +220,22 @@ export function nodeStreamFetch(input: string, init?: RequestInit): Promise<Resp
       };
       resolve(result as unknown as Response);
     });
-    request.on('error', (error: Error) => reject(error));
+    request.on('error', (error: Error) => {
+      clearHeadersTimer();
+      reject(error);
+    });
+    headersTimer = setTimeout(() => {
+      headersTimer = null;
+      request.destroy(Object.assign(
+        new Error(
+          `${method} ${url.origin}${url.pathname}: no response within ${String(responseHeadersTimeoutMs)} ms ` +
+            '(connect + response headers) — the service is unreachable or hung. If the request reached it, it may ' +
+            "still have been accepted: the outcome is unknown (run the capture helper's status action with the same " +
+            '--request-id before rerunning)',
+        ),
+        { code: CAPTURE_RESPONSE_TIMEOUT_CODE },
+      ));
+    }, responseHeadersTimeoutMs);
     const signal = init?.signal;
     if (signal !== undefined && signal !== null) {
       if (signal.aborted) {
@@ -185,6 +247,19 @@ export function nodeStreamFetch(input: string, init?: RequestInit): Promise<Resp
     if (bodyText !== null) request.write(bodyText);
     request.end();
   });
+}
+
+/** The transport of every command that talks to the verify service (run,
+ * status). A headers bound that cannot time correctly is a programming error
+ * in the caller's deps: it fails loud here — after the command's flag and
+ * owner usage refusals, before its first side effect (stale-owner removal,
+ * sink, request or receipt) — and never surfaces as an UNKNOWN receipt
+ * mid-run (#389). An injected `fetchImpl` is used as-is: the bound is still
+ * validated, but only the default transport applies it. Commands that make
+ * no request (withdraw) never consult it. */
+function transportFor(deps: CaptureCliDeps): FetchLike {
+  if (deps.responseHeadersTimeoutMs !== undefined) checkResponseHeadersTimeoutMs(deps.responseHeadersTimeoutMs);
+  return deps.fetchImpl ?? ((input, init) => nodeStreamFetch(input, init, { responseHeadersTimeoutMs: deps.responseHeadersTimeoutMs }));
 }
 
 /** Transport errors keep the primary message and add the underlying code
@@ -208,6 +283,8 @@ export function describeTransportError(error: unknown): string {
 
 export interface CaptureCliDeps {
   readonly fetchImpl?: FetchLike;
+  /** Test seam for the default transport's connect + headers bound. */
+  readonly responseHeadersTimeoutMs?: number;
   readonly now?: () => number;
   readonly probe?: (pid: number) => ProcessProbe;
   readonly signal?: (pid: number, signal: NodeJS.Signals) => void;
@@ -388,29 +465,31 @@ async function commandRun(
   const expectedHead = flags.get('expected-head') ?? null;
   const { baseUrl, token } = resolveOps(flags);
   const probe = deps.probe ?? systemProcessProbe;
-  const fetchImpl: FetchLike = deps.fetchImpl ?? nodeStreamFetch;
   const now = deps.now ?? Date.now;
   const ownerPath = captureOwnerPath(sinkPath);
 
   // A live owner means ANOTHER capture already watches this sink: never
-  // start a second watcher; reconcile through `status`/same request id.
+  // start a second watcher; reconcile with the status action and the same
+  // --request-id.
   const ownerRead = readCaptureOwner(ownerPath);
   if (ownerRead.kind === 'malformed') {
     stderr(`capture: ${ownerPath} is malformed (${ownerRead.detail}) — withdraw it explicitly first\n`);
     return CAPTURE_EXIT.usage;
   }
-  if (ownerRead.kind === 'owner') {
-    const live = probe(ownerRead.record.pid);
-    if (live.alive) {
-      stderr(
-        `capture: sink ${sinkPath} is owned by live helper pid ${String(ownerRead.record.pid)} ` +
-          `(request_id ${ownerRead.record.request_id}) — reconnecting is a same-request_id reconcile, ` +
-          'not a second watcher\n',
-      );
-      return CAPTURE_EXIT.usage;
-    }
-    removeCaptureOwner(ownerPath); // stale claim: the owner is gone
+  const ownerAlive = ownerRead.kind === 'owner' && probe(ownerRead.record.pid).alive;
+  if (ownerRead.kind === 'owner' && ownerAlive) {
+    stderr(
+      `capture: sink ${sinkPath} is owned by live helper pid ${String(ownerRead.record.pid)} ` +
+        `(request_id ${ownerRead.record.request_id}) — reconnecting is a same-request_id reconcile, ` +
+        'not a second watcher\n',
+    );
+    return CAPTURE_EXIT.usage;
   }
+  // After every usage refusal above, before this command's first side effect.
+  const fetchImpl = transportFor(deps);
+  // A live owner returned above; restating !ownerAlive keeps the deletion safe
+  // even if that refusal is ever edited. The probe found this claim's owner gone.
+  if (ownerRead.kind === 'owner' && !ownerAlive) removeCaptureOwner(ownerPath);
 
   // Exclusive sink BEFORE the POST (a second capture for the same path is
   // a typed refusal, never a truncating interleave).
@@ -571,7 +650,7 @@ async function commandStatus(
 ): Promise<CaptureExitCode> {
   const requestId = required(flags, 'request-id');
   const { baseUrl, token } = resolveOps(flags);
-  const fetchImpl: FetchLike = deps.fetchImpl ?? nodeStreamFetch;
+  const fetchImpl = transportFor(deps);
   let response: Response;
   try {
     response = await fetchImpl(
