@@ -601,6 +601,30 @@ describe('verification scheduler — global budget', () => {
     } finally { await scheduler.dispose(); }
   });
 
+  it('an indexed no-start still pending publication is evicted like any other, and a retry pass that publishes nothing keeps the bound (#363 S09-1-05)', async () => {
+    const storageDir = join(tempDir(), 'verify'); const missing = join(tempDir(), 'missing'); const cwd = tempDir();
+    const scheduler = new VerificationScheduler({ storageDir, limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 5000, runTimeoutMs: 5000 }, buildReuse: false,
+      record: (record) => {
+        if (record.kind === 'verification.no-start' && (record.payload as { request_ids: string[] }).request_ids.includes('held')) throw new Error('publication unavailable');
+      } });
+    try {
+      // Durably indexed, but its publication keeps failing: it stays pending.
+      await expect(scheduler.submit({ jobId: 'indexed', requestId: 'held', scope: 'full', cwd: missing, head: null, command: 'true' })).rejects.toThrow(/ENOENT/);
+      const history = (scheduler as unknown as { requestHistory: Map<string, unknown> }).requestHistory;
+      for (let index = 0; index < 64; index += 1) {
+        await scheduler.submit({ jobId: 'indexed', requestId: `ordinary-${String(index)}`, scope: 'full', cwd, head: null, command: 'true' });
+      }
+      // The index answers for it, so the bound evicted it.
+      expect(history.size).toBe(64);
+      expect(history.has('held')).toBe(false);
+      expect(scheduler.attemptStatus({ requestId: 'held' })).toMatchObject({ state: 'admission-failed', started: false, error: { code: 'spawn_failed' } });
+      // Its resubmit runs a retry pass that re-derives its entry and publishes nothing; the bound still holds.
+      await expect(scheduler.submit({ jobId: 'indexed', requestId: 'held', scope: 'full', cwd: missing, head: null, command: 'true' })).rejects.toThrow(/ENOENT/);
+      expect(history.has('held')).toBe(true);
+      expect(history.size).toBe(64);
+    } finally { await scheduler.dispose(); }
+  });
+
   it('a no-start whose durable append failed is never evicted into unknown: it answers until a retry indexes it, then the bound holds again (#363 S09-1-05)', async () => {
     const storageDir = join(tempDir(), 'verify'); const missing = join(tempDir(), 'missing'); const cwd = tempDir();
     const scheduler = new VerificationScheduler({ storageDir, limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 5000, runTimeoutMs: 5000 }, buildReuse: false, record: () => undefined });
