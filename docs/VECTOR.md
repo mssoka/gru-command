@@ -158,8 +158,10 @@ How `POST /api/vector/raids` behaves:
      that changes nothing, a control path that passes through a link in the
      clone (a dangling one included), or a path the clone cannot hold (under
      a file, onto a directory, or too long), is an `invalid-attack`: it never
-     runs, and nothing it wrote stays in the clone. Any other write failure
-     is the host's, and ends the raid as a host error. Otherwise the host
+     runs, and the clone goes back to the head (no file it wrote, no
+     directory made for it). Any other failure while preparing the controls,
+     writing or checking a path, is the host's: the raid ends as a host
+     error, and the attack is listed as `not-run`. Otherwise the host
      qualifies the contract (seam C). The known-bad control must fail it and
      the reference must pass it. A rejected, inconclusive or escalated verdict
      never attacks, and counts as an invalid oracle.
@@ -197,7 +199,8 @@ How `POST /api/vector/raids` behaves:
   and the raid ends `refused`.
 - **A round cut short.** An attack Vector submitted that the time cap or a
   stop reaches before it runs is recorded as `not-run`. One that was running
-  and did not finish is recorded as `voided`, with whatever receipts it left.
+  and did not finish is recorded as `voided`, with whatever receipts it left
+  and the runs it spent.
 
 ## Outcomes, reports and metrics
 

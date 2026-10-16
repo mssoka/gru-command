@@ -94,6 +94,8 @@ export interface RaidRunnerOptions {
   readonly sandbox?: () => { readonly backend: string; readonly reason: string | null };
   /** Refresh the cached origin default branch (default: a bounded `git fetch origin` with the user's own git setup). */
   readonly fetchDefault?: (repoPath: string) => void;
+  /** Write one control file into a clone (test seam for host write faults; default: writeFileSync). */
+  readonly writeControlFile?: (path: string, content: string) => void;
   readonly resolvePackages?: (repoPath: string) => readonly PackageResolution[];
   readonly now?: () => Date;
   readonly log?: Log;
@@ -362,13 +364,28 @@ export class VectorRaidRunner {
       this.recordRound(ctx, { outcome: 'duplicate', verdict: 'duplicate', description: attack.description, artifactSha256, detail: 'an exact duplicate of a test already run at this source identity; not executed' });
       return;
     }
-    const knownBad = this.commitControl(roots.knownBad, ctx.headSha, attack.knownBad, 'known-bad control');
-    const reference = knownBad === 'changed' ? this.commitControl(roots.healthy, ctx.headSha, attack.reference, 'reference control') : 'unchanged';
+    let knownBad: ReturnType<VectorRaidRunner['commitControl']>;
+    let reference: ReturnType<VectorRaidRunner['commitControl']>;
+    try {
+      knownBad = this.commitControl(roots.knownBad, ctx.headSha, attack.knownBad, 'known-bad control');
+      reference = knownBad === 'changed' ? this.commitControl(roots.healthy, ctx.headSha, attack.reference, 'reference control') : 'unchanged';
+    } catch (error) {
+      // A host fault while preparing the controls: the attack is still listed, never run.
+      this.recordRound(ctx, { outcome: 'not-run', verdict: 'not-run', description: attack.description, artifactSha256,
+        detail: `not run: the host failed while preparing its controls (${oneLineError(error)})` });
+      throw error;
+    }
     if (knownBad !== 'changed' || reference.startsWith('refused')) {
       ctx.invalidAttacks += 1;
       this.recordRound(ctx, { outcome: 'invalid-attack', verdict: 'invalid-attack', description: attack.description, artifactSha256,
         detail: knownBad === 'unchanged' ? 'the known-bad control changes nothing' : knownBad !== 'changed' ? knownBad : reference });
       return;
+    }
+    // A cap or a stop that came while the controls were prepared: the attack never runs.
+    if (signal.aborted) {
+      this.recordRound(ctx, { outcome: 'not-run', verdict: 'not-run', description: attack.description, artifactSha256,
+        detail: 'not run: the raid was cut short before this attack could run' });
+      throw new Error('the raid was cut short before the attack ran');
     }
     ctx.attacks += 1;
     const spec: ReviewedPropertyCampaign = {
@@ -391,9 +408,13 @@ export class VectorRaidRunner {
       result = await campaign.run(spec, evidenceDir);
     } catch (error) {
       // An attack that did not finish (time cap, stop, host fault) is still
-      // listed, with whatever receipts it left; nothing from it counts.
+      // listed, with whatever receipts it left; nothing from it counts, but
+      // the runs it executed (one `pex-` receipt each) were spent.
+      const receipts = this.receiptsIn(evidenceDir);
+      const executedRuns = receipts.filter((name) => name.startsWith('pex-')).length;
+      ctx.runs += executedRuns;
       this.recordRound(ctx, { outcome: 'voided', verdict: 'not-finished', description: attack.description, artifactSha256,
-        receipts: this.receiptsIn(evidenceDir), detail: `voided: the attack did not finish (${oneLineError(error)})` });
+        receipts, executedRuns, detail: `voided: the attack did not finish (${oneLineError(error)})` });
       throw error;
     }
     ctx.runs += result.metrics.executedRuns;
@@ -502,23 +523,31 @@ export class VectorRaidRunner {
         } catch (error) {
           const code = (error as NodeJS.ErrnoException).code;
           if (code === 'ENOENT' || code === 'ENOTDIR') break;
-          return `refused: ${label} path ${file.path} cannot be checked in the clone (${code ?? 'unknown error'})`;
+          // As for writes: a path fault is the attack's, anything else the host's.
+          if (isAttackPathFault(code)) return `refused: ${label} path ${file.path} cannot be checked in the clone (${String(code)})`;
+          throw error;
         }
         if (link) return `refused: ${label} path ${file.path} passes through a link in the clone`;
       }
     }
-    const written: string[] = [];
+    const attempted: string[] = [];
+    const createdDirs: string[] = [];
     for (const file of files) {
       try {
-        mkdirSync(dirname(join(root, file.path)), { recursive: true });
-        writeFileSync(join(root, file.path), file.content);
-        written.push(join(root, file.path));
+        const made = mkdirSync(dirname(join(root, file.path)), { recursive: true });
+        if (made !== undefined) createdDirs.push(made);
+        attempted.push(join(root, file.path));
+        (this.opts.writeControlFile ?? ((path: string, content: string) => writeFileSync(path, content)))(join(root, file.path), file.content);
       } catch (error) {
         // A path the clone cannot hold is the attack's fault; any other write
-        // failure is the host's. Either way, nothing it wrote stays behind.
-        for (const path of written) rmSync(path, { force: true });
+        // failure is the host's. Either way the clone goes back to the head:
+        // what was written (part-written too) and every directory made for it
+        // are removed, and a tracked file it overwrote is restored.
+        for (const path of attempted) rmSync(path, { force: true });
+        for (const dir of createdDirs.reverse()) rmSync(dir, { recursive: true, force: true });
+        raidGit(root, ['reset', '--quiet', '--hard', headSha]);
         const code = (error as NodeJS.ErrnoException).code;
-        if (isAttackPathFault(code)) return `refused: ${label} path ${file.path} cannot be written in the clone (${code})`;
+        if (isAttackPathFault(code)) return `refused: ${label} path ${file.path} cannot be written in the clone (${String(code)})`;
         throw error;
       }
     }
