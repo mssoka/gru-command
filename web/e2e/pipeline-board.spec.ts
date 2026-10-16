@@ -358,19 +358,47 @@ interface HitTarget {
 
 /** Center hit-target + viewport containment for one selector: the live
  * occlusion check (sticky chrome, drawer or any other element covering
- * the control fails the hit test). */
+ * the control fails the hit test). Containment allows a sliver of at most
+ * half a DEVICE pixel on any edge (0.5 CSS px at 1x, 0.25 at 2x):
+ * browsers scroll in whole pixels while layout positions are fractional, so
+ * a focus/scroll that aligns an edge can leave a sub-pixel sliver outside
+ * (Linux font metrics put the 1440 SETTLED and 768 PIPELINE disclosures
+ * 0.1875px past the bottom edge — #402). A real overhang, an empty box or
+ * any occluder still fails (every edge and the exact boundary are pinned
+ * below). */
 async function hitTarget(page: Page, selector: string): Promise<HitTarget> {
   return page.evaluate((sel) => {
+    if (!Number.isFinite(window.devicePixelRatio) || window.devicePixelRatio <= 0) throw new Error(`hitTarget: unusable devicePixelRatio ${String(window.devicePixelRatio)}`);
     const element = document.querySelector<HTMLElement>(sel);
     if (element === null) return { found: false, inViewport: false, hit: false };
     const rect = element.getBoundingClientRect();
     const topmost = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    const sliver = 0.5 / window.devicePixelRatio;
     return {
       found: true,
-      inViewport:
-        rect.left >= 0 && rect.top >= 0 && rect.right <= window.innerWidth && rect.bottom <= window.innerHeight,
+      inViewport: rect.width > 0 && rect.height > 0 &&
+        rect.left >= -sliver && rect.top >= -sliver &&
+        rect.right <= window.innerWidth + sliver && rect.bottom <= window.innerHeight + sliver,
       hit: topmost !== null && (topmost === element || element.contains(topmost)),
     };
+  }, selector);
+}
+
+/** Scrolls the selector's first match to the viewport centre and waits two
+ * frames. Playwright's scrollIntoViewIfNeeded treats a row whose edge
+ * overflows the viewport by a sub-pixel (fractional chrome heights left the
+ * 1440 COLD row's bottom at 900.19 of 900 — #402) as already visible and
+ * does not scroll, so the strict containment oracle below would measure a
+ * position the scroll never chose. Centring is an explicit, deterministic
+ * position; the hit test still fails on any real occluder. */
+async function scrollFullyIntoView(page: Page, selector: string): Promise<void> {
+  await page.evaluate(async (sel) => {
+    const element = document.querySelector<HTMLElement>(sel);
+    if (element === null) throw new Error(`missing ${sel}`);
+    element.scrollIntoView({ block: 'center', inline: 'nearest' });
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+    });
   }, selector);
 }
 
@@ -554,7 +582,7 @@ async function viewportProof(browser: Browser, viewportCase: ViewportCase, theme
     await expect(page.locator('.board-band--pipeline .board-pipeline')).toHaveCount(6);
     await page.locator('.board-band--cold .board-band__more').click();
     await expect(page.locator('.board-band--cold .board-job')).toHaveCount(4);
-    await page.locator('.board-band--cold .board-job').first().scrollIntoViewIfNeeded();
+    await scrollFullyIntoView(page, '.board-band--cold .board-job');
     await expectReachable(page, '.board-band--cold .board-job');
     await page.locator('.board-band--cold .board-band__more').focus();
     await expect(page.locator('.board-band--cold .board-band__more')).toBeFocused();
@@ -637,6 +665,117 @@ async function largeCountsProof(browser: Browser, viewportCase: ViewportCase): P
 }
 
 test.describe('compact owner-first board — synthetic geometry proof', () => {
+  test('containment tolerates only a sub-pixel sliver: a real overhang or an empty box fails (#402)', async ({ page }) => {
+    await page.setViewportSize({ width: 400, height: 300 });
+    await page.setContent([
+      '<style>html,body{margin:0;padding:0;overflow:hidden}div{position:fixed;box-sizing:border-box;background:#888}</style>',
+      '<div id="sliver" style="left:10px;top:250.1875px;width:20px;height:50px"></div>',
+      '<div id="boundary" style="left:40px;top:250.5px;width:20px;height:50px"></div>',
+      '<div id="overhang" style="left:70px;top:251px;width:20px;height:50px"></div>',
+      '<div id="left-overhang" style="left:-1px;top:10px;width:20px;height:20px"></div>',
+      '<div id="top-overhang" style="left:40px;top:-1px;width:20px;height:20px"></div>',
+      '<div id="right-overhang" style="left:381px;top:40px;width:20px;height:20px"></div>',
+      '<div id="right-boundary" style="left:380.5px;top:80px;width:20px;height:20px"></div>',
+      '<div id="left-boundary" style="left:-0.5px;top:120px;width:20px;height:20px"></div>',
+      '<div id="top-boundary" style="left:200px;top:-0.5px;width:20px;height:20px"></div>',
+      '<div id="past-boundary" style="left:230px;top:250.75px;width:20px;height:50px"></div>',
+      '<div id="empty" style="left:100px;top:10px;width:0;height:0"></div>',
+    ].join(''));
+    expect(await page.evaluate(() => [window.devicePixelRatio, window.innerWidth, window.innerHeight]), 'this proof runs at 1x in 400×300').toEqual([1, 400, 300]);
+    expect(await hitTarget(page, '#sliver')).toEqual({ found: true, inViewport: true, hit: true });
+    // Exactly half a device pixel past each edge is still contained and hittable.
+    for (const id of ['#boundary', '#right-boundary', '#left-boundary', '#top-boundary']) {
+      expect(await hitTarget(page, id), id).toEqual({ found: true, inViewport: true, hit: true });
+    }
+    // Anything beyond it, or an empty box, is not contained.
+    for (const id of ['#past-boundary', '#overhang', '#left-overhang', '#top-overhang', '#right-overhang', '#empty']) {
+      expect((await hitTarget(page, id)).inViewport, id).toBe(false);
+    }
+    expect((await hitTarget(page, '#empty')).hit, 'an empty box is never hit').toBe(false);
+    expect(await hitTarget(page, '#missing')).toEqual({ found: false, inViewport: false, hit: false });
+  });
+
+  test('at 2x device pixels the containment sliver is half a DEVICE pixel on every edge: 0.25 CSS px in, past it out (#402)', async ({ browser }) => {
+    const context = await browser.newContext({ deviceScaleFactor: 2, viewport: { width: 400, height: 300 } });
+    const page = await context.newPage();
+    try {
+      await page.setContent([
+        '<style>html,body{margin:0;padding:0;overflow:hidden}div{position:fixed;box-sizing:border-box;background:#888}</style>',
+        '<div id="bottom-in" style="left:10px;top:250.25px;width:20px;height:50px"></div>',
+        '<div id="bottom-out" style="left:40px;top:250.3125px;width:20px;height:50px"></div>',
+        '<div id="top-in" style="left:70px;top:-0.25px;width:20px;height:20px"></div>',
+        '<div id="top-out" style="left:100px;top:-0.3125px;width:20px;height:20px"></div>',
+        '<div id="left-in" style="left:-0.25px;top:40px;width:20px;height:20px"></div>',
+        '<div id="left-out" style="left:-0.3125px;top:70px;width:20px;height:20px"></div>',
+        '<div id="right-in" style="left:380.25px;top:100px;width:20px;height:20px"></div>',
+        '<div id="right-out" style="left:380.3125px;top:130px;width:20px;height:20px"></div>',
+        // 0.34375 (22/64) px over: past 1/3 (half a device pixel at 1.5x) but
+        // inside 1/2 (at 1x) — it tells a 0.5/ratio sliver from a 1x one.
+        '<div id="bottom-third" style="left:160px;top:250.34375px;width:20px;height:50px"></div>',
+      ].join(''));
+      expect(await page.evaluate(() => [window.devicePixelRatio, window.innerWidth, window.innerHeight]), 'this proof runs at 2x in 400×300').toEqual([2, 400, 300]);
+      // The boxes sit exactly where the CSS puts them (no device-pixel
+      // snapping of the measured rects): the boundary under test is real.
+      // 0.25 is half a device pixel at 2x (exactly on the boundary); 0.3125
+      // is 1/16 px past it — both exact in layout units (1/64 px).
+      expect(await page.evaluate(() => ['bottom-in', 'bottom-out', 'top-in', 'top-out', 'left-in', 'left-out', 'right-in', 'right-out', 'bottom-third'].map((id) => {
+        const rect = document.getElementById(id)!.getBoundingClientRect();
+        return { id, top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right };
+      }))).toEqual([
+        { id: 'bottom-in', top: 250.25, bottom: 300.25, left: 10, right: 30 },
+        { id: 'bottom-out', top: 250.3125, bottom: 300.3125, left: 40, right: 60 },
+        { id: 'top-in', top: -0.25, bottom: 19.75, left: 70, right: 90 },
+        { id: 'top-out', top: -0.3125, bottom: 19.6875, left: 100, right: 120 },
+        { id: 'left-in', top: 40, bottom: 60, left: -0.25, right: 19.75 },
+        { id: 'left-out', top: 70, bottom: 90, left: -0.3125, right: 19.6875 },
+        { id: 'right-in', top: 100, bottom: 120, left: 380.25, right: 400.25 },
+        { id: 'right-out', top: 130, bottom: 150, left: 380.3125, right: 400.3125 },
+        { id: 'bottom-third', top: 250.34375, bottom: 300.34375, left: 160, right: 180 },
+      ]);
+      // Exactly half a DEVICE pixel past each edge is contained and hittable...
+      for (const id of ['#bottom-in', '#top-in', '#left-in', '#right-in']) {
+        expect(await hitTarget(page, id), id).toEqual({ found: true, inViewport: true, hit: true });
+      }
+      // ...and anything past it is not — the 1x half-CSS-pixel allowance
+      // would have wrongly admitted every one of these.
+      for (const id of ['#bottom-out', '#top-out', '#left-out', '#right-out']) {
+        expect(await hitTarget(page, id), id).toEqual({ found: true, inViewport: false, hit: true });
+      }
+      // An unusable device pixel ratio fails loud — zero, negative, NaN or
+      // infinite (which would silently zero the sliver) — for a missing
+      // selector too.
+      const setRatio = (ratio: number) => page.evaluate((value) => { Object.defineProperty(window, 'devicePixelRatio', { value, configurable: true }); }, ratio);
+      // At 2x the 0.34375 overhang is out (a 1/4 sliver)...
+      expect(await hitTarget(page, '#bottom-third')).toEqual({ found: true, inViewport: false, hit: true });
+      for (const ratio of [0, -0, -1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+        await setRatio(ratio);
+        const label = Object.is(ratio, -0) ? '-0' : String(ratio);
+        expect(Object.is(await page.evaluate(() => window.devicePixelRatio), ratio), `${label} reached the page as itself`).toBe(true);
+        for (const id of ['#bottom-in', '#missing']) {
+          // The exact refusal line (whatever prefix Playwright wraps it in):
+          // `0` must never pass for `0.5`.
+          await expect(hitTarget(page, id), `${label} ${id}`).rejects.toThrow(new RegExp(`(?:^|: )Error: hitTarget: unusable devicePixelRatio ${String(ratio)}$`, 'mu'));
+        }
+      }
+      // A positive fractional ratio is usable, and its sliver is 0.5/ratio:
+      // at 1.5x that is 1/3 CSS px, so the 0.3125 overhang OUT at 2x is IN
+      // here, while the 0.34375 one — IN under a 1x half pixel — stays OUT.
+      await setRatio(1.5);
+      expect(await page.evaluate(() => window.devicePixelRatio)).toBe(1.5);
+      expect(await hitTarget(page, '#missing')).toEqual({ found: false, inViewport: false, hit: false });
+      expect(await hitTarget(page, '#bottom-in')).toEqual({ found: true, inViewport: true, hit: true });
+      expect(await hitTarget(page, '#bottom-out')).toEqual({ found: true, inViewport: true, hit: true });
+      expect(await hitTarget(page, '#bottom-third')).toEqual({ found: true, inViewport: false, hit: true });
+      // ...and at 1x (a 1/2 sliver) the same box is IN.
+      await setRatio(1);
+      expect(await page.evaluate(() => window.devicePixelRatio)).toBe(1);
+      expect(await hitTarget(page, '#bottom-third')).toEqual({ found: true, inViewport: true, hit: true });
+      // The page's ratio is left overridden at 1: nothing below this point may use it.
+    } finally {
+      await context.close();
+    }
+  });
+
   test('desktop 1440: exact six-section order, bounded previews, reversible disclosures', async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 900 });
     const seed = await seedBoard(page, proofSnapshot());

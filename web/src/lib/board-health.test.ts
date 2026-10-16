@@ -215,9 +215,10 @@ describe('the remaining health cards render truthfully or n/a', () => {
     // The count is LIVE-only: the card copy says so (A4).
     expect(alertsCard(0).detail).toBe('live machine queue clear');
     expect(alertsCard(2).detail).toBe('live machine attention awaiting Gru');
-    expect(alertsCard(0).titleAttr).toContain('0 live machine-attention notification(s) awaiting Gru');
-    expect(alertsCard(2).titleAttr).toContain('2 live machine-attention notification(s) awaiting Gru');
-    expect(alertsCard(2).titleAttr).toContain('closed receipts and the owner bell stay quiet');
+    expect(alertsCard(0).titleAttr).toContain('0 live machine-attention notifications awaiting a Gru disposition');
+    expect(alertsCard(1).titleAttr).toContain('1 live machine-attention notification awaiting a Gru disposition');
+    expect(alertsCard(2).titleAttr).toContain('2 live machine-attention notifications awaiting a Gru disposition');
+    expect(alertsCard(2).titleAttr).toContain('closed receipts stay in the record and the owner bell is not rung');
   });
 
   it('Verify queue: lock/queue/worker headroom, n/a when the api is absent', () => {
