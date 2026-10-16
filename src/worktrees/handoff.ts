@@ -13,8 +13,11 @@ export function registerHandoffManager(manager: object, ledger: LedgerApi): void
   for (const lane of ledger.listWorktrees()) rememberManagedLane(lane, ledger);
 }
 
+/** The default bound on one git metadata file read. */
+export const WORKTREE_METADATA_LIMIT = 64 * 1024;
+
 /** Internal descriptor-bound metadata proof shared with creation rollback. */
-export function readWorktreeMetadata(file: string, limit = 64 * 1024): string {
+export function readWorktreeMetadata(file: string, limit = WORKTREE_METADATA_LIMIT): string {
   if (!lstatSync(file).isFile()) throw new Error('handoff metadata is not a regular file');
   const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
@@ -299,13 +302,20 @@ function laneCommonDirectory(admin: string): string {
 /** The checkout `.git` file a lane administration's `gitdir` file points
  * back to, followed — or refused by name. */
 function adminBackPointer(admin: string): string {
-  let named: string;
+  // Git trims only the END of this file (strbuf_rtrim); an empty one names
+  // nothing.
+  const named = adminFile(admin, 'gitdir').trimEnd();
+  if (named === '') throw new Error(`lane administration ${admin} has an empty gitdir file`);
+  return resolvedPath(`lane administration ${admin} names the checkout git file`, resolve(admin, named));
+}
+
+/** A lane administration's metadata file, or a refusal naming it. */
+function adminFile(admin: string, name: string): string {
   try {
-    named = readWorktreeMetadata(join(admin, 'gitdir')).trim();
+    return readWorktreeMetadata(join(admin, name));
   } catch (error) {
-    throw new Error(`lane administration ${admin} has an unreadable gitdir file (${errnoOf(error)})`, { cause: error });
+    throw new Error(`lane administration ${admin} has an unreadable ${name} file (${errnoOf(error)})`, { cause: error });
   }
-  return resolvedPath(`lane administration ${admin} names checkout .git`, resolve(admin, named));
 }
 
 function validate(receipt: Receipt, lane: WorktreeLane): void {
@@ -315,11 +325,11 @@ function validate(receipt: Receipt, lane: WorktreeLane): void {
   if (repoCommon !== common || receipt.id !== lane.id || receipt.kind !== lane.kind || receipt.jobId !== lane.jobId || receipt.roundId !== lane.roundId || receipt.branch !== lane.branch || receipt.sha !== lane.sha ||
     receipt.repo !== resolvedPath('repository', lane.repoPath) || receipt.path !== resolvedPath('checkout', lane.path) || receipt.admin !== admin || receipt.common !== common ||
     dirname(admin) !== join(common, 'worktrees') ||
-    adminBackPointer(admin) !== resolvedPath('checkout .git', join(lane.path, '.git'))) throw new Error('handoff binding changed');
+    adminBackPointer(admin) !== resolvedPath("checkout's git file", join(lane.path, '.git'))) throw new Error('handoff binding changed');
   // Job/writer commits may advance. Attachment must not: a detached lane is
   // frozen, and a writer's reserved name must still be a direct branch.
   if (existsSync(join(common, 'reftable'))) throw new Error('unsupported ref storage — handoff identity unverified');
-  const head = readWorktreeMetadata(join(admin, 'HEAD')).trim();
+  const head = adminFile(admin, 'HEAD').trim();
   if (lane.branch === null) {
     if (head !== lane.sha) throw new Error('detached handoff identity changed');
   } else {
@@ -344,8 +354,19 @@ export function beginLaneHandoff(lane: Pick<WorktreeLane, 'id' | 'kind' | 'repoP
     common: laneCommonDirectory(admin), admin,
     path: resolvedPath('checkout', lane.path), branch: lane.branch, sha: lane.sha, createdAt: null };
   const file = join(admin, receiptName), temp = `${file}.${token.slice(13)}`;
-  writeFileSync(temp, JSON.stringify(receipt), { flag: 'wx' });
-  linkSync(temp, file); // atomic publication, never overwrite a foreign receipt
+  let written = false;
+  try {
+    writeFileSync(temp, JSON.stringify(receipt), { flag: 'wx' });
+    written = true;
+    linkSync(temp, file); // atomic publication, never overwrite a foreign receipt
+  } catch (error) {
+    // Never a stray temporary receipt: the one this call wrote is removed,
+    // and one that cannot be is named.
+    const failures: unknown[] = [error];
+    if (written) { try { unlinkSync(temp); } catch (cleanupError) { failures.push(cleanupError); } }
+    throw new Error(`lane administration ${admin} cannot take a handoff receipt (${errnoOf(error)})${failures.length > 1 ? ` and its temporary receipt ${temp} could not be removed` : ''}`,
+      { cause: failures.length > 1 ? new AggregateError(failures, 'handoff receipt and its cleanup failed') : error });
+  }
   unlinkSync(temp);
 }
 
@@ -402,7 +423,7 @@ export function captureLaneHandoff(lane: WorktreeLane): () => void {
       try {
         const current = ledger.getWorktree(expected.id);
         if (current === null || current.status === 'swept' || current.createdAt !== generation) throw new Error('managed lane generation is unavailable or swept');
-        if (readWorktreeMetadata(file) !== original || receipt.state !== 'ready' || typeof receipt.createdAt !== 'string' ||
+        if (adminFile(admin, receiptName) !== original || receipt.state !== 'ready' || typeof receipt.createdAt !== 'string' ||
           receipt.createdAt !== generation) throw new Error('completed handoff proof is missing or changed');
         validate(receipt, current);
         validate(receipt, lane);

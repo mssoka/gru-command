@@ -177,7 +177,7 @@ describe('worktree handoff with a --separate-git-dir repository (#372)', () => {
     // Like git: an empty path is refused, and a file past its bound is unreadable.
     writeFileSync(join(plain.path, '.git'), 'gitdir: \n');
     expect(() => handoffProof.repositoryCommonDirectory(plain.path)).toThrow(`checkout ${plain.path} has a .git file naming an empty gitdir`);
-    writeFileSync(join(plain.path, '.git'), `gitdir: ${'x'.repeat(64 * 1024)}\n`);
+    writeFileSync(join(plain.path, '.git'), `gitdir: ${'x'.repeat(handoffProof.WORKTREE_METADATA_LIMIT)}\n`);
     expect(() => handoffProof.repositoryCommonDirectory(plain.path)).toThrow(`checkout ${plain.path} has an unreadable .git file (handoff metadata exceeds its bound)`);
     // No .git at all is refused by name, with the repository path.
     rmSync(join(plain.path, '.git'), { force: true });
@@ -305,6 +305,16 @@ describe('child lane parent custody, called directly (#373)', () => {
       // The parent's .git pointed at the repository's own git directory: a full git directory, no lane administration.
       ['repository git directory', (f) => { writeFileSync(join(f.parent.path, '.git'), `gitdir: ${realpathSync(join(f.repo.path, '.git'))}\n`); },
         (f) => new RegExp(`lane administration ${escape(realpathSync(join(f.repo.path, '.git')))} has no commondir — it is not a linked worktree administration`, 'u')],
+      ['commondir uninspectable', (f) => { rmSync(join(f.admin, 'commondir')); symlinkSync(join(f.admin, 'commondir'), join(f.admin, 'commondir')); },
+        (f) => new RegExp(`lane administration ${escape(f.admin)} has a commondir that cannot be inspected \\(ELOOP\\)`, 'u')],
+      ['gitdir file removed', (f) => { rmSync(join(f.admin, 'gitdir')); },
+        (f) => new RegExp(`lane administration ${escape(f.admin)} has an unreadable gitdir file \\(ENOENT\\)`, 'u')],
+      ['gitdir file empty', (f) => { writeFileSync(join(f.admin, 'gitdir'), '\n'); },
+        (f) => new RegExp(`lane administration ${escape(f.admin)} has an empty gitdir file`, 'u')],
+      ['gitdir file names a missing checkout', (f) => { writeFileSync(join(f.admin, 'gitdir'), '/nowhere/checkout/.git\n'); },
+        (f) => new RegExp(`lane administration ${escape(f.admin)} names the checkout git file /nowhere/checkout/\\.git cannot be resolved \\(ENOENT\\)`, 'u')],
+      ['HEAD removed', (f) => { rmSync(join(f.admin, 'HEAD')); },
+        (f) => new RegExp(`lane administration ${escape(f.admin)} has an unreadable HEAD file \\(ENOENT\\)`, 'u')],
       ['receipt removed', (f) => { rmSync(join(f.admin, 'gru-creation-handoff.json')); },
         (f) => new RegExp(`lane administration ${escape(f.admin)} has no readable handoff receipt \\(ENOENT\\)`, 'u')],
       ['commondir to a non-repository', (f) => { mkdirSync(join(f.admin, 'plain')); writeFileSync(join(f.admin, 'commondir'), 'plain\n'); },
@@ -334,6 +344,11 @@ describe('child lane parent custody, called directly (#373)', () => {
       .toThrow(`repository ${gone} cannot be resolved (ENOENT)`);
     expect(() => handoffProof.beginLaneHandoff({ ...f.parent, path: gone }, f.admin, 'token-0123456789abcdef'))
       .toThrow(`checkout ${gone} cannot be resolved (ENOENT)`);
+    expect(readdirSync(f.admin).sort()).toEqual(before);
+    // A receipt that cannot be published (one is already there) is refused
+    // by name, and its temporary receipt is removed.
+    expect(() => handoffProof.beginLaneHandoff(f.parent, f.admin, 'token-0123456789abcdef'))
+      .toThrow(`lane administration ${f.admin} cannot take a handoff receipt (EEXIST)`);
     expect(readdirSync(f.admin).sort()).toEqual(before);
   });
 
