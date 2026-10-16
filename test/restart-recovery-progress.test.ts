@@ -92,6 +92,9 @@ class NativeFixture {
   getContextUsage() { return undefined; }
 }
 
+/** The minion the fixture registers and its registry spawns by default. */
+const FIXTURE_MINION = 'logical-minion';
+
 async function fixture(kind: 'directive' | 'rebrief' = 'directive', nativeCwd = true, report = false) {
   const dir = mkdtempSync(join(tmpdir(), 'gru-restart-progress-'));
   const repo = makeFixtureRepo('restart-progress');
@@ -109,8 +112,8 @@ async function fixture(kind: 'directive' | 'rebrief' = 'directive', nativeCwd = 
   mkdirSync(join(store.sessionsDir, 'minion'), { recursive: true });
   writeFileSync(file, '');
   const native = new NativeFixture(file, 'native-session', nativeCwd ? lane.path : undefined);
-  ledger.registerAgent({ id: 'logical-minion', role: 'minion', jobId: 'approved-job', sessionFile: file, parentage: 'top-level' });
-  ledger.setAgentState('logical-minion', 'idle');
+  ledger.registerAgent({ id: FIXTURE_MINION, role: 'minion', jobId: 'approved-job', sessionFile: file, parentage: 'top-level' });
+  ledger.setAgentState(FIXTURE_MINION, 'idle');
   const intent = kind === 'rebrief'
     ? ledger.beginRebriefIntent({ jobId: 'approved-job', requestId: 'approved-request', note: 'approved correction', holder: 'gru' }).record
     : ledger.beginDirectiveIntent({ jobId: 'approved-job', requestId: 'approved-request', directive: 'approved correction', holder: 'gru' }).record;
@@ -124,7 +127,7 @@ async function fixture(kind: 'directive' | 'rebrief' = 'directive', nativeCwd = 
     async spawn(_role, options = {}) {
       spawns.push(options);
       if (spawnGate !== null) await spawnGate;
-      handle = new PiAgentHandle('minion', native, file, PI_CAPABILITIES, false, [], store, () => {}, () => { handle = null; }, 60_000, options.agentId ?? 'logical-minion', () => manifest, () => resolveGitCommit(lane.path, 'HEAD'));
+      handle = new PiAgentHandle('minion', native, file, PI_CAPABILITIES, false, [], store, () => {}, () => { handle = null; }, 60_000, options.agentId ?? FIXTURE_MINION, () => manifest, () => resolveGitCommit(lane.path, 'HEAD'));
       handle.subscribe((event) => { if (event.type === 'state' && ledger.getAgent(handle!.id) !== null) ledger.setAgentState(handle!.id, event.state); });
       return handle;
     },
@@ -893,8 +896,8 @@ describe('restart-recovery-progress — exact native request matrix', () => {
   }
 
   const POST_CRASH_SUCCESSOR = 'post-crash-successor';
-  /** The minion the fixture registers and the fresh route spawns. */
-  const SPAWNED_MINION = 'logical-minion';
+  /** The minion the fresh route spawns: the fixture's own. */
+  const SPAWNED_MINION = FIXTURE_MINION;
 
   /** Runs the REAL executor and snapshots the ledger at a crash window between
    * registry.spawn() and onPrepared, then recovers from that snapshot as a
@@ -913,18 +916,21 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     // Every failure is kept with where it came from (a thrown null included),
     // and none masks another.
     const failures: { readonly where: string; readonly error: unknown }[] = [];
+    let registrations = 0;
     const register = f.ledger.registerAgent.bind(f.ledger);
     const spy = vi.spyOn(f.ledger, 'registerAgent').mockImplementation((input) => {
       const row = register(input);
-      if (input.id === SPAWNED_MINION) registered = true;
+      if (input.id === SPAWNED_MINION) { registered = true; registrations += 1; }
       return row;
     });
     try {
+      // The rejection handler is attached where the run starts: never an
+      // unhandled rejection while the spawn wait runs.
       const run = executeAcceptedDirective({ ...f.deps, beforeWriterSideEffect: () => {
         if (crashPoint !== 'after-registration' || !registered || snapshot !== null || failures.length > 0) return;
         // A failing snapshot is kept, never folded into the executor's own recovery.
         try { takeSnapshot(); } catch (error) { failures.push({ where: 'snapshot', error }); }
-      } }, f.intent.requestId);
+      } }, f.intent.requestId).catch((error: unknown) => { failures.push({ where: 'executor', error }); });
       try {
         if (crashPoint === 'inside-spawn') {
           await vi.waitFor(() => expect(f.spawns).toHaveLength(1));
@@ -932,10 +938,16 @@ describe('restart-recovery-progress — exact native request matrix', () => {
         }
       } catch (error) { failures.push({ where: 'spawn wait', error }); } finally { release(); }
       // The executor is always awaited, so it never runs on into cleanup.
-      await run.catch((error: unknown) => { failures.push({ where: 'executor', error }); });
+      await run;
     } finally { spy.mockRestore(); }
-    if (failures.length === 1) throw failures[0]!.error;
-    if (failures.length > 1) throw new AggregateError(failures.map((failure) => failure.error), `fixture: failures at ${crashPoint} (${failures.map((failure) => failure.where).join(', ')})`);
+    const [only] = failures;
+    if (failures.length === 1 && only !== undefined) throw new Error(`fixture: ${only.where} failed at ${crashPoint}`, { cause: only.error });
+    if (failures.length > 1) {
+      const where = failures.map((failure) => failure.where).join(', ');
+      throw new AggregateError(failures.map((failure) => failure.error), `fixture: failures at ${crashPoint} (${where})`);
+    }
+    // The run went on to completion: the spawned minion registered exactly once.
+    expect(registrations, `${crashPoint}: registrations of ${SPAWNED_MINION}`).toBe(1);
     if (crashPoint === 'after-registration' && !registered) throw new Error(`fixture: the spawned registration of "${SPAWNED_MINION}" was never reached (did the spawn register another id?)`);
     if (snapshot === null) throw new Error(crashPoint === 'after-registration' ? 'fixture: no admission boundary followed the spawned registration' : 'fixture: no snapshot inside the spawn');
     // The windows differ by what the executor had done when the snapshot was
@@ -991,6 +1003,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     // (the durable event itself: the row-state predicate is false for any
     // retired row, so it cannot witness this).
     expect(ledger.latestJobEventByRequestId(jobId, 'silas.directive-dispatch-deferred', requestId), `${crashPoint}: no deferral event`).toBeNull();
+    expect(ledger.latestJobEventByRequestId(jobId, 'silas.directive-dispatch-deferred', POST_CRASH_SUCCESSOR), `${crashPoint}: none for the successor either`).toBeNull();
   }
   it('#362 a crash inside registry.spawn() is never replayed, and a successor may proceed', () => assertSuccessorMayProceed('inside-spawn'));
   it('#362 a crash after the spawned registration but before onPrepared is never replayed, and a successor may proceed', () => assertSuccessorMayProceed('after-registration'));
