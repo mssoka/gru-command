@@ -234,7 +234,7 @@ function cessationEvents(events: readonly RuntimeEvent[], evidence: 'ceased' | '
 }
 
 describe('pi adapter cessation evidence requires a bounded idle proof (#341, Option A)', () => {
-  it('dispose followed by a confirmed idle reports ceased', async () => {
+  it('dispose followed by a confirmed idle reports ceased #contract:cessation-proven:pi', async () => {
     const { handle, session, events } = piHandle({ waitForIdleMode: 'idle' });
     await handle.dispose();
     expect(session.disposed).toBe(true);

@@ -216,7 +216,7 @@ async function waitFor(cond: () => boolean, timeoutMs = 10_000): Promise<void> {
 }
 
 describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
-  it('spawns a session persisted under the store layout, named by the minted session uuid, lock held', async () => {
+  it('spawns a session persisted under the store layout, named by the minted session uuid, lock held #contract:session-roundtrip:claude-code', async () => {
     const fx = fixture();
     const handle = await fx.runtime.spawn('gru');
     try {
@@ -276,7 +276,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     }
   });
 
-  it('runs native /compact in a dedicated resumed process without leaking command text', async () => {
+  it('runs native /compact in a dedicated resumed process without leaking command text #contract:compaction:claude-code', async () => {
     const fx = fixture();
     const handle = await fx.runtime.spawn('gru');
     try {
@@ -426,7 +426,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     }
   });
 
-  it('emits thinking deltas before text when the model reasons', async () => {
+  it('emits thinking deltas before text when the model reasons #contract:thinking-deltas:claude-code', async () => {
     const fx = fixture();
     const handle = await fx.runtime.spawn('gru');
     try {
@@ -532,7 +532,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     }
   });
 
-  it('in-band error: result is_error resolves the prompt, sticky error state, next turn recovers', async () => {
+  it('in-band error: result is_error resolves the prompt, sticky error state, next turn recovers #contract:in-band-error:claude-code', async () => {
     const fx = fixture();
     const handle = await fx.runtime.spawn('gru');
     try {
@@ -633,7 +633,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     }
   });
 
-  it('dispose mid-turn SIGTERMs the process: prompt rejects disposed, lock released', async () => {
+  it('dispose mid-turn SIGTERMs the process: prompt rejects disposed, lock released #contract:dispose-releases-lock:claude-code', async () => {
     const fx = fixture();
     const releaseFile = join(fx.home, 'never-released');
     const handle = await fx.runtime.spawn('gru');
@@ -730,7 +730,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     await handle.dispose();
   });
 
-  it('declares claude-code capabilities honestly (steer queued, no followUp)', () => {
+  it('declares claude-code capabilities honestly (steer queued, no followUp) #contract:capabilities:claude-code', () => {
     expect(CLAUDE_CODE_CAPABILITIES).toEqual({
       streaming: true,
       steer: 'queued',
@@ -762,7 +762,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     }
   });
 
-  it('maps "default" to no flags and "provider/model" + level to --model/--effort', async () => {
+  it('maps "default" to no flags and "provider/model" + level to --model/--effort #contract:model-resolution:claude-code', async () => {
     const fx = fixture();
     // default: neither flag leaves the adapter.
     const plain = await fx.runtime.spawn('gru');
@@ -1149,7 +1149,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     expect(fx.runtime.health().state).toBe('ok');
   });
 
-  it('sends images as base64 content blocks in the stdin frame; plain text stays a string', async () => {
+  it('sends images as base64 content blocks in the stdin frame; plain text stays a string #contract:images:claude-code', async () => {
     const fx = fixture();
     const withImage = await fx.runtime.spawn('gru');
     await withImage.prompt('look at this', {
@@ -1345,7 +1345,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     expect(isolated!.argv[isolated!.argv.indexOf('--system-prompt') + 1]).toBe('isolated policy');
   });
 
-  it('enforces isolated-review tools and disables ambient Claude resources in argv', async () => {
+  it('enforces isolated-review tools and disables ambient Claude resources in argv #contract:isolated-review-tools:claude-code', async () => {
     const fx = fixture();
     const handle = await fx.runtime.spawn('perkins', {
       isolatedReview: { systemPrompt: 'isolated policy', tools: [] },
@@ -1365,7 +1365,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     expect(handle.reviewIsolation).toBe(true);
   });
 
-  it('starts a scoped bridge for an isolated lens child declaring native tools, exposing exactly them', async () => {
+  it('starts a scoped bridge for an isolated lens child declaring native tools, exposing exactly them #contract:review-native-tools:claude-code', async () => {
     const fx = fixture();
     const executed: unknown[] = [];
     const submitFindings = {
@@ -1626,7 +1626,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     }
   });
 
-  it('rejects resume for isolated reviews so ambient history cannot cross the boundary', async () => {
+  it('rejects resume for isolated reviews so ambient history cannot cross the boundary #contract:isolated-review-no-resume:claude-code', async () => {
     const fx = fixture();
     const ordinary = await fx.runtime.spawn('perkins');
     const file = ordinary.sessionFile!;
@@ -2365,7 +2365,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     }
   });
 
-  it('a Claude usage-limit wall is a typed quota wall the supervisor and recovery sensor can act on', async () => {
+  it('a Claude usage-limit wall is a typed quota wall the supervisor and recovery sensor can act on #contract:provider-failure-typed:claude-code', async () => {
     const fx = fixture();
     const handle = await fx.runtime.spawn('minion', { model: 'claude-opus-5-5' });
     const events = collect(handle);
@@ -2423,7 +2423,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     });
   });
 
-  it('resumes a previous session file: --resume pinned, same file appended, history intact', async () => {
+  it('resumes a previous session file: --resume pinned, same file appended, history intact #contract:session-resume:claude-code', async () => {
     const fx = fixture();
     const first = await fx.runtime.spawn('gru');
     await first.prompt('remember this', { owner: 'alice' });
@@ -2457,7 +2457,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     }
   });
 
-  it('refuses a resumeFile outside the session store', async () => {
+  it('refuses a resumeFile outside the session store #contract:resume-outside-store-refused:claude-code', async () => {
     const fx = fixture();
     await expect(
       fx.runtime.spawn('gru', { resumeFile: join(fx.home, 'elsewhere.jsonl') }),
@@ -2476,6 +2476,20 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     expect(existsSync(`${orphan}.lock`)).toBe(false); // released on the way out
     // Caller-facing input error — adapter health stays ok (never latched).
     expect(fx.runtime.health().state).toBe('ok');
+  });
+
+  it('refuses to resume a transcript another runtime wrote (a pi session) by name, releasing its lock #contract:foreign-transcript-refused:claude-code', async () => {
+    const fx = fixture();
+    const dir = fx.store.sessionDirFor('gru', fx.workspace);
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, '2026-09-17T00-00-00-000Z_22222222-2222-2222-2222-222222222222.jsonl');
+    // pi's own first records: its session header, then a user message.
+    writeFileSync(file, `${JSON.stringify({ type: 'session', version: 3, id: '22222222-2222-2222-2222-222222222222', timestamp: '2026-09-17T00:00:00.000Z', cwd: fx.workspace })}\n${JSON.stringify({ type: 'message', id: 'a1b2c3d4', parentId: null, message: { role: 'user', content: [{ type: 'text', text: 'hello' }] } })}\n`, 'utf-8');
+    const before = readFileSync(file, 'utf-8');
+    await expect(fx.runtime.spawn('gru', { resumeFile: file })).rejects.toThrow(/has no session id/);
+    expect(existsSync(`${file}.lock`)).toBe(false);
+    expect(readFileSync(file, 'utf-8')).toBe(before);
+    expect(doubleInvocations(fx)).toEqual([]);
   });
 
   it('resume scan is bounded: a session id beyond the prefix window is not found', async () => {
@@ -2668,7 +2682,7 @@ describe('RuntimeRegistry + claude-code (fallback-wrapped)', () => {
     await registry.dispose();
   });
 
-  it('steer mid-turn queues (steer-unable) and delivers as a SECOND process after idle', async () => {
+  it('steer mid-turn queues (steer-unable) and delivers as a SECOND process after idle #contract:steering:claude-code', async () => {
     const { fx, registry } = await claudeRegistryFixture();
     registry.boot();
     const handle = await registry.spawn('gru');
@@ -2728,7 +2742,7 @@ describe('RuntimeRegistry + claude-code (fallback-wrapped)', () => {
     }
   });
 
-  it('config-driven ruling-16 policy flows through the registry into argv', async () => {
+  it('config-driven ruling-16 policy flows through the registry into argv #contract:registry-policy:claude-code', async () => {
     const fx = fixture();
     writeFileSync(
       configPathFor(fx.home),
@@ -3143,7 +3157,7 @@ describe('ReviewMcpBridge bounded protocol failures', () => {
 });
 
 describe('spawn cwd (SPEC ruling 17 — dispatch roots in the project)', () => {
-  it('runs the CLI with the explicit project cwd, not the workspace root', async () => {
+  it('runs the CLI with the explicit project cwd, not the workspace root #contract:spawn-cwd:claude-code', async () => {
     const fx = fixture();
     const project = join(fx.workspace, 'fixture-project');
     mkdirSync(project, { recursive: true });
@@ -3376,7 +3390,7 @@ describe('scheduled verification ordinary Claude Bash', () => {
     finally { delete process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL']; }
   });
 
-  it('review-1 standalone lint refuses before any producer', async () => refuses('npm run lint'));
+  it('review-1 standalone lint refuses before any producer #contract:scheduled-verification:claude-code', async () => refuses('npm run lint'));
   it('review-1 standalone typecheck refuses before any producer', async () => refuses('npm run typecheck'));
   it('review-1 standalone build refuses before any producer', async () => refuses('npm run build'));
   it('review-1 standalone build:web refuses before any producer', async () => refuses('npm run build:web'));

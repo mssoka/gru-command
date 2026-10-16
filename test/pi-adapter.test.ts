@@ -928,7 +928,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     } finally { await first.dispose(); await registry.dispose(); }
   });
 
-  it('enforces isolated-review tools and strips ambient Pi resources', async () => {
+  it('enforces isolated-review tools and strips ambient Pi resources #contract:isolated-review-tools:pi', async () => {
     const fx = await fixture();
     writeFileSync(join(fx.workspace, 'AGENTS.md'), 'PROJECT-CONTEXT-CANARY', 'utf8');
     mkdirSync(join(fx.agentDir, 'skills', 'canary'), { recursive: true });
@@ -1182,7 +1182,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     }
   });
 
-  it('injects exactly the declared native tools into an isolated lens session, in-process', async () => {
+  it('injects exactly the declared native tools into an isolated lens session, in-process #contract:review-native-tools:pi', async () => {
     const fx = await fixture([
       {
         deltas: [],
@@ -1247,7 +1247,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     }
   });
 
-  it('rejects resume for isolated reviews so ambient history cannot cross the boundary', async () => {
+  it('rejects resume for isolated reviews so ambient history cannot cross the boundary #contract:isolated-review-no-resume:pi', async () => {
     const fx = await fixture();
     const ordinary = await fx.runtime.spawn('perkins');
     const file = ordinary.sessionFile!;
@@ -1258,7 +1258,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     })).rejects.toThrow(/must be fresh/);
   });
 
-  it('round-trips a prompt with ordered deltas, turn lifecycle, and a durable session file', async () => {
+  it('round-trips a prompt with ordered deltas, turn lifecycle, and a durable session file #contract:session-roundtrip:pi', async () => {
     const fx = await fixture([{ deltas: ['Hello', ' ', 'world'] }]);
     const handle = await fx.runtime.spawn('gru');
     try {
@@ -1326,7 +1326,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     }
   });
 
-  it('successfully compacts through the installed Pi SDK without changing session identity', async () => {
+  it('successfully compacts through the installed Pi SDK without changing session identity #contract:compaction:pi', async () => {
     const fx = await fixture([
       { deltas: ['first answer'] },
       { deltas: ['second answer'] },
@@ -1987,7 +1987,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       }
     });
 
-    it('native SDK follow-up: admitted before compaction, pending through the stall, delivered once (signal settles)', async () => {
+    it('native SDK follow-up: admitted before compaction, pending through the stall, delivered once (signal settles) #contract:steering:pi', async () => {
       const observation = await observeNativeFollowUpCancellation('abort-settles');
       expect(observation.pendingAfterAdmission).toBe(1);
       expect(observation.pendingDuringStall).toBe(1);
@@ -2039,7 +2039,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     });
   });
 
-  it('emits thinking deltas before text when the model reasons', async () => {
+  it('emits thinking deltas before text when the model reasons #contract:thinking-deltas:pi', async () => {
     const fx = await fixture([{ thinking: ['pondering'], deltas: ['answer'] }]);
     const handle = await fx.runtime.spawn('gru');
     try {
@@ -2162,7 +2162,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     }
   });
 
-  it('resumes a previous session file with history intact (process restart)', async () => {
+  it('resumes a previous session file with history intact (process restart) #contract:session-resume:pi', async () => {
     const fx = await fixture([{ deltas: ['first'] }]);
     const first = await fx.runtime.spawn('gru');
     await first.prompt('remember this', { owner: 'alice' });
@@ -2190,7 +2190,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     }
   });
 
-  it('fails loud on an unknown model reference', async () => {
+  it('fails loud on an unknown model reference #contract:model-resolution:pi', async () => {
     const fx = await fixture([], ['text'], {
       configExtra: '[runtimes.pi]\nmodel_refresh = false\n',
     });
@@ -2949,7 +2949,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     });
   });
 
-  it('dispose releases the session lock', async () => {
+  it('dispose releases the session lock #contract:dispose-releases-lock:pi', async () => {
     const fx = await fixture();
     const handle = await fx.runtime.spawn('gru');
     const file = handle.sessionFile!;
@@ -2960,7 +2960,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     expect(handle.health().state).toBe('disposed');
   });
 
-  it('declares pi capabilities honestly in the matrix', async () => {
+  it('declares pi capabilities honestly in the matrix #contract:capabilities:pi', async () => {
     const fx = await fixture();
     expect(fx.runtime.capabilities).toEqual({
       streaming: true,
@@ -3048,7 +3048,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
 });
 
 describe('RuntimeRegistry', () => {
-  it('boots with growth detection, resolves roles to the configured runtime, and reports status', async () => {
+  it('boots with growth detection, resolves roles to the configured runtime, and reports status #contract:registry-policy:pi', async () => {
     const fx = await fixture();
     const registry = new RuntimeRegistry({
       config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'),
@@ -3176,7 +3176,7 @@ describe('RuntimeRegistry', () => {
 });
 
 describe('Perkins r1 regressions', () => {
-  it('B3: images round-trip in the EXACT SDK shape (data + mimeType)', async () => {
+  it('B3: images round-trip in the EXACT SDK shape (data + mimeType) #contract:images:pi', async () => {
     const fx = await fixture([{ deltas: ['seen'] }], ['text', 'image']);
     const handle = await fx.runtime.spawn('gru');
     try {
@@ -3283,7 +3283,7 @@ describe('Perkins r1 regressions', () => {
     }
   });
 
-  it('W7: error turn — in-band completion: error event + state error, then recovers', async () => {
+  it('W7: error turn — in-band completion: error event + state error, then recovers #contract:in-band-error:pi', async () => {
     const fx = await fixture([{ deltas: [], error: 'model exploded' }, { deltas: ['recovered'] }]);
     const handle = await fx.runtime.spawn('gru');
     try {
@@ -3424,7 +3424,20 @@ describe('Perkins r1 regressions', () => {
     }
   });
 
-  it('N24: resumeFile outside the session store is refused', async () => {
+  it('refuses to resume a transcript another runtime wrote (a Claude Code session) by name, releasing its lock #contract:foreign-transcript-refused:pi', async () => {
+    const fx = await fixture([{ deltas: ['x'] }]);
+    const dir = fx.store.sessionDirFor('gru', fx.workspace);
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, '2026-09-17T00-00-00-000Z_11111111-1111-1111-1111-111111111111.jsonl');
+    // Claude Code's own first records (an init frame, then a user turn).
+    writeFileSync(file, `${JSON.stringify({ type: 'system', subtype: 'init', session_id: '11111111-1111-1111-1111-111111111111' })}\n${JSON.stringify({ type: 'user', message: { role: 'user', content: 'hello' } })}\n`, 'utf-8');
+    const before = readFileSync(file, 'utf-8');
+    await expect(fx.runtime.spawn('gru', { resumeFile: file })).rejects.toThrow(/is not a valid pi session/);
+    expect(existsSync(`${file}.lock`)).toBe(false);
+    expect(readFileSync(file, 'utf-8')).toBe(before);
+  });
+
+  it('N24: resumeFile outside the session store is refused #contract:resume-outside-store-refused:pi', async () => {
     const fx = await fixture([]);
     await expect(
       fx.runtime.spawn('gru', { resumeFile: join(fx.home, 'elsewhere.jsonl') }),
@@ -3583,7 +3596,7 @@ describe('Perkins r3: gated-twin scenario (winner-ensures-lock leg)', () => {
 });
 
 describe('spawn cwd (SPEC ruling 17 — dispatch roots in the project)', () => {
-  it('hosts the session rooted at an explicit project cwd, not the workspace root', async () => {
+  it('hosts the session rooted at an explicit project cwd, not the workspace root #contract:spawn-cwd:pi', async () => {
     const fx = await fixture();
     const project = join(fx.workspace, 'fixture-project');
     mkdirSync(project, { recursive: true });
@@ -3681,7 +3694,7 @@ describe('typed provider-response provenance (r1 #13) — pure parsers', () => {
   // object with a numeric status, or a provider terminal message whose
   // machine-composed line parses strictly. Arbitrary exceptions stay
   // anonymous, so the recovery sensor can never misread them.
-  it('sdk errors: numeric status/statusCode is the gate; headers carry Retry-After', async () => {
+  it('sdk errors: numeric status/statusCode is the gate; headers carry Retry-After #contract:provider-failure-typed:pi', async () => {
     const { typedFromSdkError } = await import('../src/runtime/pi-adapter.js');
     expect(typedFromSdkError(new Error('arbitrary exception'))).toBeNull();
     expect(typedFromSdkError({ message: 'no numeric status' })).toBeNull();
@@ -5060,7 +5073,7 @@ describe('scheduled verification ordinary Pi Bash', () => {
   it('scheduled verification guard refuses the entire exact build compound before its first producer', async () => refuses(BUILD_INCIDENT));
 
 
-  it('review-1 standalone lint refuses before any producer', async () => refuses('npm run lint'));
+  it('review-1 standalone lint refuses before any producer #contract:scheduled-verification:pi', async () => refuses('npm run lint'));
   it('review-1 standalone typecheck refuses before any producer', async () => refuses('npm run typecheck'));
   it('review-1 standalone build refuses before any producer', async () => refuses('npm run build'));
   it('review-1 standalone build:web refuses before any producer', async () => refuses('npm run build:web'));
