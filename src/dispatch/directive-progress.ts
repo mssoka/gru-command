@@ -107,18 +107,20 @@ function boundedErrorText(error: unknown): string {
 class DirectiveRuntimeUnsupportedError extends DirectiveCheckpointError {
   constructor(message: string) { super(message); this.name = 'DirectiveRuntimeUnsupportedError'; }
 }
-/** A runtime without native admission/producer attestation (claude-code
- * declares this gap) must be refused before the target is bound: a bound
+/** A session without native admission/producer attestation (a claude-code
+ * session with no GC session header, or with ambient MCP tools the host
+ * cannot fence — #424) must be refused before the target is bound: a bound
  * target whose producer journal can never exist leaves cessation UNKNOWN
- * forever, turning a declared runtime gap into an owner-only stop. */
+ * forever, turning a declared gap into an owner-only stop. */
 function assertNativeDirectiveRuntime(handle: AgentHandle): asserts handle is AgentHandle & {
   readonly sessionFile: string;
   readonly prepareDirectiveProducer: NonNullable<AgentHandle['prepareDirectiveProducer']>;
 } {
   if (handle.sessionFile === null || handle.inspectDirective === undefined || handle.prepareDirectiveProducer === undefined) {
     throw new DirectiveRuntimeUnsupportedError(
-      `minion ${handle.id} runs on a runtime that cannot attest native directive admission or producer ownership ` +
-        '(the claude-code runtime declares this gap); Silas directives and re-briefs need a pi-hosted minion',
+      `minion ${handle.id} runs in a session that cannot attest native directive admission or producer ownership ` +
+        '(for claude-code: a session with no GC session header, or one that loads ambient MCP tools the host cannot fence); ' +
+        'Silas directives and re-briefs need a session that can attest them',
     );
   }
 }

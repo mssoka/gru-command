@@ -8195,7 +8195,8 @@ export class LedgerApi {
       validateDirectiveIdentity(binding.identity);
       const row = this.getDirective(binding.identity.requestId);
       if (row === null || isDirectiveTerminal(row.state) || !isDeepStrictEqual(this.directiveTurnIdentity(row.requestId), binding.identity)) throw new DirectiveCheckpointError('native admission does not match a live accepted request');
-      if (binding.runtime !== 'pi' || !binding.sessionId || !binding.userEntryId || !/^[a-f0-9]{64}$/.test(binding.promptHash) ||
+      // Both runtimes attest exact admission (#424: claude-code by its CLI echo).
+      if ((binding.runtime !== 'pi' && binding.runtime !== 'claude-code') || !binding.sessionId || !binding.userEntryId || !/^[a-f0-9]{64}$/.test(binding.promptHash) ||
           row.nativeTarget?.agentId !== binding.agentId || row.nativeTarget?.sessionFile !== binding.sessionFile) throw new DirectiveCheckpointError('actual native admission identity is incomplete/mismatched');
       const actual = inspectDirectiveAdmission(binding.sessionFile, binding.identity);
       if (!isDeepStrictEqual(actual, binding)) throw new DirectiveCheckpointError('native admission does not match actual durable user readback');

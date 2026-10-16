@@ -3,7 +3,7 @@ import * as childProcesses from 'node:child_process';
 import { BUILD_INCIDENT, FULL_INCIDENT, WEB_INCIDENT, authenticatedCaptureStatus, verificationLane } from './helpers/worker-verification.js';
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { closeSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
+import { appendFileSync, closeSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -35,6 +35,7 @@ import {
   type StreamFrame,
 } from '../src/runtime/stream-json.js';
 import { LockBusyError, SessionStore } from '../src/sessions/store.js';
+import { inspectDirectiveProducers, prepareClaudeDirectiveBinding, readDirectiveBinding, readDirectiveCompletion, type DirectiveNativeBinding, type DirectiveTurnIdentity } from '../src/runtime/directive-checkpoint.js';
 import type { AgentHandle, RuntimeEvent } from '../src/runtime/types.js';
 import { ReviewMcpBridge } from '../src/runtime/review-mcp-bridge.js';
 import { PerkinsWholeReview } from '../src/dispatch/perkins-review/whole.js';
@@ -57,6 +58,8 @@ function copiesOf(sessionFile: string): string[] {
 
 const DOUBLE = join(import.meta.dirname, 'helpers', 'claude-double.mjs');
 const DOUBLE_ENV_KEYS = [
+  'CLAUDE_DOUBLE_ECHO',
+  'CLAUDE_DOUBLE_TOOL_INPUT_DRIFT',
   'CLAUDE_DOUBLE_PERMISSION_MALFORMED',
   'CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL',
   'CLAUDE_DOUBLE_COMPACT_VERIFICATION',
@@ -251,12 +254,13 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       expect(st[st.length - 1]).toBe('idle');
       expect(handle.health().lastActivity).not.toBeNull();
 
-      // The transcript holds the RAW frames (init / assistant / result).
+      // The transcript holds GC's session header, then the RAW frames (init / assistant / result).
       const lines = readFileSync(handle.sessionFile!, 'utf-8').trim().split('\n');
       const frames = lines.map((l) => JSON.parse(l) as StreamFrame);
-      expect(frames[0]!['type']).toBe('system');
-      expect(frames[0]!['subtype']).toBe('init');
-      expect(frames[0]!['session_id']).toBe(handle.id);
+      expect(frames[0]).toMatchObject({ type: 'session', id: handle.id, cwd: fx.workspace, runtime: 'claude-code' });
+      expect(frames[1]!['type']).toBe('system');
+      expect(frames[1]!['subtype']).toBe('init');
+      expect(frames[1]!['session_id']).toBe(handle.id);
       expect(frames.some((f) => f['type'] === 'assistant')).toBe(true);
       const last = frames[frames.length - 1]!;
       expect(last['type']).toBe('result');
@@ -2492,16 +2496,347 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     expect(doubleInvocations(fx)).toEqual([]);
   });
 
-  it('declares the native-directive gap: a directive prompt is refused by name before any CLI run, and inspection is UNKNOWN (#424) #contract:native-directive-admission:claude-code', async () => {
-    const fx = fixture();
-    const handle = await fx.runtime.spawn('gru');
-    const identity = { requestId: 'directive-gap', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64), jobId: 'job-gap', workRevision: 0, authorityEpoch: 0 };
-    await expect(handle.prompt('approved correction', { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } }))
-      .rejects.toThrow(/cannot attest actual request admission; directive checkpoint capability unavailable/u);
-    expect(handle.inspectDirective?.(identity)).toMatchObject({ state: 'unknown' });
-    expect(handle.prepareDirectiveProducer).toBeUndefined();
-    expect(doubleInvocations(fx)).toEqual([]);
-    await handle.dispose();
+  describe('native directive admission (#424: exact proof, never resume)', () => {
+    const identityFor = (requestId: string): DirectiveTurnIdentity => ({ requestId, payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64), jobId: `job-${requestId}`, workRevision: 0, authorityEpoch: 0 });
+    const frames = (file: string): StreamFrame[] => readFileSync(file, 'utf-8').trim().split('\n').map((line) => JSON.parse(line) as StreamFrame);
+    const gitRepo = (dir: string): string => {
+      for (const args of [['init', '-q'], ['-c', 'user.name=t', '-c', 'user.email=t@t.invalid', 'commit', '-q', '--allow-empty', '-m', 'seed']]) execFileSync('git', args, { cwd: dir });
+      return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim();
+    };
+
+    it('admits a directive at the CLI\'s own echo, fences every tool after its intent is durable, and records completion with HEAD #contract:native-directive-admission:claude-code', async () => {
+      const fx = fixture();
+      const head = gitRepo(fx.workspace);
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const identity = identityFor('claude-admitted');
+      const admitted: DirectiveNativeBinding[] = [];
+      let checks = 0;
+      const producer = handle.prepareDirectiveProducer!(identity);
+      await handle.prompt('tool:Read follow the approved correction', { directive: { identity, beforeAdmission: () => { checks += 1; }, onAdmitted: (binding) => admitted.push(binding) } });
+      const transcript = frames(handle.sessionFile!);
+      const echo = transcript.find((frame) => frame['type'] === 'user' && frame['isReplay'] === true)!;
+      const result = transcript.find((frame) => frame['type'] === 'result')!;
+      // Admission is the CLI's own receipt, read back from the durable transcript.
+      expect(admitted).toEqual([expect.objectContaining({ runtime: 'claude-code', agentId: handle.id, sessionId: handle.id, userEntryId: echo['uuid'] })]);
+      expect(readDirectiveBinding(handle.sessionFile!, identity.requestId)).toMatchObject({ userEntryId: echo['uuid'] });
+      // The tool asked the host after its tool_use was recorded, and the host allowed it unchanged.
+      const order = transcript.map((frame) => frame['type'] === 'control_request' ? 'ask' : frame['type'] === 'assistant' && JSON.stringify(frame).includes('"tool_use"') ? 'intent' : null).filter(Boolean);
+      expect(order).toEqual(['intent', 'ask']);
+      expect(transcript.some((frame) => frame['type'] === 'control_response' && JSON.stringify(frame).includes('"behavior":"allow"'))).toBe(true);
+      expect(checks).toBeGreaterThanOrEqual(2); // before the binding, and again at the tool
+      // A directive turn's record is the echo, never a GC-written prompt frame.
+      expect(transcript.some((frame) => frame['gc_prompt'] === true)).toBe(false);
+      const argv = doubleInvocations(fx).at(-1)!.argv;
+      expect(argv).toEqual(expect.arrayContaining(['--replay-user-messages', '--permission-prompt-tool', 'stdio', '--settings']));
+      expect(existsSync(argv[argv.indexOf('--settings') + 1]!)).toBe(false); // private, removed after the turn
+      // Terminal at the turn's own result; completion carries the HEAD captured at the result.
+      expect(handle.inspectDirective!(identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: result['uuid'] });
+      expect(readDirectiveCompletion(handle.sessionFile!, identity, result['uuid'] as string)).toMatchObject({ head, producer });
+      // The CLI child is an independent controller until this handle proves cessation.
+      expect(inspectDirectiveProducers(handle.sessionFile!, identity).map((owner) => owner.evidence)).toEqual(['unknown']);
+      await handle.dispose();
+      expect(handle.cessationEvidence?.()).toBe('ceased');
+      expect(inspectDirectiveProducers(handle.sessionFile!, identity).map((owner) => owner.evidence)).toEqual(['ceased']);
+      await expect(handle.resumeDirective!(identity, 'x', () => {})).rejects.toThrow(/never continues an interrupted directive/u);
+    });
+
+    it('an echo that differs from what the host sent is no admission: the turn is refused and no tool is allowed', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const identity = identityFor('claude-mutated');
+      const admitted: DirectiveNativeBinding[] = [];
+      process.env['CLAUDE_DOUBLE_ECHO'] = 'mutate';
+      await expect(handle.prompt('tool:Read follow it', { directive: { identity, beforeAdmission: () => {}, onAdmitted: (binding) => admitted.push(binding) } }))
+        .rejects.toThrow(/directive refused: actual native admission user receipt unavailable\/changed/u);
+      expect(admitted).toEqual([]);
+      expect(handle.inspectDirective!(identity)).toMatchObject({ state: 'unknown' });
+      expect(frames(handle.sessionFile!).some((frame) => frame['type'] === 'control_response' && JSON.stringify(frame).includes('"behavior":"allow"'))).toBe(false);
+      await handle.dispose();
+    });
+
+    it('authority withdrawn before a tool runs, or a permission request naming other input, refuses the tool with a durable guard receipt', async () => {
+      for (const [label, setup] of [['withdrawn', () => {}], ['drifted', () => { process.env['CLAUDE_DOUBLE_TOOL_INPUT_DRIFT'] = '1'; }]] as const) {
+        const fx = fixture();
+        const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+        const identity = identityFor(`claude-guard-${label}`);
+        let checks = 0;
+        setup();
+        try {
+          const beforeAdmission = (): void => { checks += 1; if (label === 'withdrawn' && checks > 1) throw new Error('the job was parked'); };
+          await expect(handle.prompt('tool:Read follow it', { directive: { identity, beforeAdmission, onAdmitted: () => {} } }), label).rejects.toThrow(/directive refused/u);
+          const journal = readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf-8');
+          expect(journal, label).toContain('"state":"guard-refused"');
+          expect(handle.inspectDirective!(identity), label).toMatchObject({ state: 'unknown' });
+          expect(frames(handle.sessionFile!).some((frame) => frame['type'] === 'control_response' && JSON.stringify(frame).includes('"behavior":"allow"')), label).toBe(false);
+        } finally {
+          delete process.env['CLAUDE_DOUBLE_TOOL_INPUT_DRIFT'];
+          await handle.dispose();
+        }
+      }
+    });
+
+    it('a refused tool\'s deny is written before the turn ends, and a CLI that ignores SIGTERM is killed after the grace period', async () => {
+      const fx = fixture({ killGraceMs: 300 });
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const identity = identityFor('claude-stubborn');
+      process.env['CLAUDE_DOUBLE_TOOL_INPUT_DRIFT'] = '1';
+      process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
+      try {
+        // Without the escalation this CLI never exits and the prompt never settles.
+        await expect(handle.prompt('tool:Read follow it', { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } }))
+          .rejects.toThrow(/directive refused: native tool intent is not persisted/u);
+        // The CLI read the deny (it echoes what the host wrote) before it was killed.
+        expect(frames(handle.sessionFile!).some((frame) => frame['type'] === 'control_response' && JSON.stringify(frame).includes('"behavior":"deny"'))).toBe(true);
+      } finally {
+        delete process.env['CLAUDE_DOUBLE_TOOL_INPUT_DRIFT'];
+        delete process.env['CLAUDE_DOUBLE_IGNORE_TERM'];
+        await handle.dispose();
+      }
+    });
+
+    it('a lost transcript write fails the directive: an incomplete record is never a delivery', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      let broken = false;
+      handle.subscribe((event) => {
+        if (event.type !== 'turn_start') return;
+        // The disk fails on the first ordinary (non-gating) frame of the turn.
+        type Chunk = { toString(): string };
+        const stream = (handle as unknown as { liveTranscript: { _writev: unknown; _write: (chunk: Chunk, encoding: unknown, callback: (error?: Error) => void) => void } }).liveTranscript;
+        const write = stream._write.bind(stream);
+        stream._writev = null;
+        stream._write = (chunk, encoding, callback) => {
+          if (!broken && chunk.toString().includes('"type":"stream_event"')) { broken = true; callback(new Error('ENOSPC: no space left on device')); return; }
+          write(chunk, encoding, callback);
+        };
+      });
+      await expect(handle.prompt('answer plainly', { directive: { identity: identityFor('claude-disk'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+        .rejects.toThrow(/directive transcript write failed: ENOSPC/u);
+      expect(broken).toBe(true);
+      await handle.dispose();
+    });
+
+    it('a directive that already failed admits nothing, even when the CLI\'s echo is durable after the failure', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const identity = identityFor('claude-failed-first');
+      const file = handle.sessionFile!;
+      // A genuine binding and a genuine echo: only the earlier failure stops admission.
+      const content = [{ type: 'text', text: 'follow it' }];
+      prepareClaudeDirectiveBinding({ identity, agentId: handle.id, sessionId: handle.id, sessionFile: file, content, authorityManifest: 'manifest' });
+      const echo = { type: 'user', isReplay: true, uuid: 'echo-1', session_id: handle.id, parent_tool_use_id: null, message: { role: 'user', content } };
+      appendFileSync(file, `${JSON.stringify({ type: 'system', subtype: 'init', session_id: handle.id })}\n${JSON.stringify(echo)}\n`);
+      const admitted: unknown[] = [];
+      const turn = { directive: { identity, beforeAdmission: () => {}, onAdmitted: (binding: unknown) => admitted.push(binding) },
+        producer: {}, content, settings: { file: '', dispose: () => {} }, admission: null as Promise<void> | null, admitted: null, failure: new Error('refused earlier') as unknown, completion: null };
+      const follow = (handle as unknown as { followDirectiveFrame(turn: unknown, frame: unknown, durable: Promise<void>, abort: (detail: string) => void): void }).followDirectiveFrame.bind(handle);
+      follow(turn, echo, Promise.resolve(), () => {});
+      await turn.admission;
+      expect(admitted).toEqual([]);
+      expect(turn.admitted).toBeNull();
+      await handle.dispose();
+    });
+
+    it('a throw while handling a lost transcript write still fails the directive and ends its CLI', async () => {
+      const signals: string[] = [];
+      const fx = fixture({ spawnProcess: ((binary: string, args: readonly string[], options: object) => {
+        const child = spawn(binary, args, options);
+        const kill = child.kill.bind(child);
+        child.kill = (signal?: NodeJS.Signals | number) => { signals.push(String(signal)); return kill(signal); };
+        return child;
+      }) as unknown as typeof spawn });
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      vi.spyOn(handle as unknown as { failDirective(): void }, 'failDirective').mockImplementation(() => { throw new Error('handler broke'); });
+      let broken = false;
+      handle.subscribe((event) => {
+        if (event.type !== 'turn_start') return;
+        type Chunk = { toString(): string };
+        const stream = (handle as unknown as { liveTranscript: { _writev: unknown; _write: (chunk: Chunk, encoding: unknown, callback: (error?: Error) => void) => void } }).liveTranscript;
+        const write = stream._write.bind(stream);
+        stream._writev = null;
+        stream._write = (chunk, encoding, callback) => {
+          if (!broken && chunk.toString().includes('"type":"stream_event"')) { broken = true; callback(new Error('ENOSPC: no space left on device')); return; }
+          write(chunk, encoding, callback);
+        };
+      });
+      await expect(handle.prompt('answer plainly', { directive: { identity: identityFor('claude-handler-throws'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+        .rejects.toThrow(/directive failure handling threw: handler broke/u);
+      expect(fx.logs.some((line) => line.level === 'error' && line.msg === 'directive failure handling threw after a lost transcript write')).toBe(true);
+      expect(signals[0]).toBe('SIGTERM'); // the CLI was ended, not left running
+      await handle.dispose();
+    });
+
+    it('a directive turn whose CLI never starts leaves no private settings behind; one that started keeps them until its close', async () => {
+      const settingsOf = (args: readonly string[]): string => args[args.indexOf('--settings') + 1]!;
+      for (const mode of ['throws', 'errors', 'errors-while-live'] as const) {
+        let settings = '';
+        let live: (EventEmitter & { killed: string[] }) | null = null;
+        const spawnProcess = ((_binary: string, args: readonly string[]) => {
+          settings = settingsOf(args);
+          if (mode === 'throws') throw new Error('EAGAIN: cannot fork');
+          const child = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+            pid: mode === 'errors-while-live' ? 4242 : undefined, exitCode: null, signalCode: null, killed: [] as string[],
+            kill: (signal: string) => { child.killed.push(signal); return true; } });
+          live = child;
+          setImmediate(() => {
+            child.emit('error', Object.assign(new Error('spawn claude ENOENT'), { code: 'ENOENT' }));
+            // A live child may report a second error (say, a failed kill): handled once.
+            if (mode === 'errors-while-live') child.emit('error', Object.assign(new Error('kill EPERM'), { code: 'EPERM' }));
+          });
+          return child as unknown as ChildProcess;
+        }) as unknown as typeof spawn;
+        const fx = fixture({ spawnProcess, killGraceMs: 50 });
+        const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+        const prompt = handle.prompt('follow it', { directive: { identity: identityFor(`claude-nospawn-${mode}`), beforeAdmission: () => {}, onAdmitted: () => {} } });
+        if (mode === 'errors-while-live') {
+          // A CLI that did start is ended (SIGTERM, then SIGKILL after the grace)
+          // and keeps its settings; the turn settles only from its close.
+          let settled = false;
+          void prompt.catch(() => {}).finally(() => { settled = true; });
+          await vi.waitFor(() => expect(live!.killed).toEqual(['SIGTERM', 'SIGKILL']));
+          expect(fx.logs.filter((line) => line.msg === 'a further claude child error was ignored: its first error already began ending the child'), mode).toHaveLength(1);
+          expect(existsSync(settings), mode).toBe(true);
+          expect(settled, mode).toBe(false);
+          live!.emit('close', null, 'SIGKILL');
+        }
+        // A CLI that started is not reported as one that failed to spawn.
+        await expect(prompt, mode).rejects.toThrow(mode === 'errors-while-live' ? /^claude process failed: Error: spawn claude ENOENT$/u : /claude process failed to spawn/u);
+        expect(settings, mode).not.toBe('');
+        await vi.waitFor(() => expect(existsSync(settings), mode).toBe(false));
+        await handle.dispose();
+      }
+    });
+
+    it('a turn admitted at the echo that never reaches a result is no delivery', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const identity = identityFor('claude-no-result');
+      const admitted: DirectiveNativeBinding[] = [];
+      await expect(handle.prompt('no-result-ok please', { directive: { identity, beforeAdmission: () => {}, onAdmitted: (binding) => admitted.push(binding) } }))
+        .rejects.toThrow(/without a result frame/u);
+      expect(admitted).toHaveLength(1); // admitted: the CLI acknowledged it
+      expect(handle.inspectDirective!(identity)).toMatchObject({ state: 'unknown', reason: 'native directive turn has no result yet' });
+      await handle.dispose();
+    });
+
+    it('a directive turn on a foreign session is aborted, even by a CLI that ignores SIGTERM', async () => {
+      const fx = fixture({ killGraceMs: 300 });
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      process.env['CLAUDE_DOUBLE_MISMATCH'] = '1';
+      process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
+      const identity = identityFor('claude-foreign');
+      const admitted: DirectiveNativeBinding[] = [];
+      try {
+        // Its stdin stays open for the permission channel: only the abort ends it.
+        await expect(handle.prompt('follow it', { directive: { identity, beforeAdmission: () => {}, onAdmitted: (binding) => admitted.push(binding) } }))
+          .rejects.toThrow(/session id mismatch/u);
+        // The foreign session's echo (sent before it died) admits nothing.
+        expect(admitted).toEqual([]);
+        expect(handle.inspectDirective!(identity)).toMatchObject({ state: 'unknown' });
+      } finally {
+        delete process.env['CLAUDE_DOUBLE_MISMATCH'];
+        delete process.env['CLAUDE_DOUBLE_IGNORE_TERM'];
+        await handle.dispose();
+      }
+    });
+
+    it('a CLI that dies before answering keeps its own diagnosis, not the missing echo', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      await expect(handle.prompt('crash right away', { directive: { identity: identityFor('claude-crash'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+        .rejects.toThrow(/claude ended via exit 2 without a result frame: double crash requested/u);
+      await handle.dispose();
+    });
+
+    it('a changed authority manifest at the tool refuses it with a durable guard receipt', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const identity = identityFor('claude-manifest');
+      const manifest = handle as unknown as { directiveAuthorityManifest(): string };
+      const original = manifest.directiveAuthorityManifest.bind(handle);
+      let calls = 0;
+      vi.spyOn(manifest, 'directiveAuthorityManifest').mockImplementation(() => (calls += 1) === 1 ? original() : 'a different model or tool set');
+      await expect(handle.prompt('tool:Read follow it', { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } }))
+        .rejects.toThrow(/authority changed before effect/u);
+      expect(readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf-8')).toContain('"state":"guard-refused"');
+      expect(handle.inspectDirective!(identity)).toMatchObject({ state: 'unknown' });
+      await handle.dispose();
+    });
+
+    it('a turn the CLI never acknowledged with its echo is no delivery, even when the CLI reports success', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const identity = identityFor('claude-no-echo');
+      const admitted: DirectiveNativeBinding[] = [];
+      process.env['CLAUDE_DOUBLE_ECHO'] = 'skip';
+      await expect(handle.prompt('just answer', { directive: { identity, beforeAdmission: () => {}, onAdmitted: (binding) => admitted.push(binding) } }))
+        .rejects.toThrow(/ended without the CLI's admission echo/u);
+      expect(admitted).toEqual([]);
+      expect(handle.inspectDirective!(identity)).toMatchObject({ state: 'unknown', reason: 'the native turn proceeded without an exact admission receipt' });
+      await handle.dispose();
+    });
+
+    it('a directive is text only: an image, or no text, is refused before anything is bound', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const directive = (requestId: string) => ({ identity: identityFor(requestId), beforeAdmission: () => {}, onAdmitted: () => {} });
+      await expect(handle.prompt('look at this', { images: [{ mediaType: 'image/png', data: 'AAAA' }], directive: directive('claude-image') })).rejects.toThrow(/text only/u);
+      await expect(handle.prompt('', { directive: directive('claude-empty') })).rejects.toThrow(/needs text/u);
+      expect(readDirectiveBinding(handle.sessionFile!, 'claude-image')).toBeNull();
+      expect(doubleInvocations(fx)).toEqual([]);
+      await handle.dispose();
+    });
+
+    it('a resumed session keeps the capability only when GC\'s header names this session and cwd', async () => {
+      const fx = fixture();
+      const first = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const file = first.sessionFile!;
+      await first.dispose();
+      const resumed = await fx.runtime.spawn('minion', { cwd: fx.workspace, resumeFile: file });
+      expect(resumed.prepareDirectiveProducer).toBeDefined();
+      expect(resumed.inspectDirective).toBeDefined();
+      await resumed.dispose();
+      // The same session resumed in another directory cannot attest admission there.
+      const elsewhere = mkdtempSync(join(tmpdir(), 'gru-command-elsewhere-'));
+      cleanupDirs.push(elsewhere);
+      const moved = await fx.runtime.spawn('minion', { cwd: elsewhere, resumeFile: file });
+      expect(moved.prepareDirectiveProducer).toBeUndefined();
+      expect(moved.inspectDirective).toBeUndefined();
+      await moved.dispose();
+    });
+
+    it('a tool error leaves the checkpoint UNKNOWN (a recovery judgment, as on pi) and records no completion', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const identity = identityFor('claude-tool-error');
+      await expect(handle.prompt('tool-error:Read try it', { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } }))
+        .rejects.toThrow(/native tool error requires a recovery judgment/u);
+      expect(handle.inspectDirective!(identity)).toMatchObject({ state: 'unknown', reason: 'native tool error requires a recovery judgment' });
+      await handle.dispose();
+    });
+
+    it('a session that cannot attest admission exposes no directive capability and refuses a directive by name before any CLI run', async () => {
+      const fx = fixture({ configToml: '[runtimes.claude-code]\nmcp = "user"\n' });
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      expect(handle.prepareDirectiveProducer).toBeUndefined();
+      expect(handle.inspectDirective).toBeUndefined();
+      await expect(handle.prompt('follow it', { directive: { identity: identityFor('claude-ambient'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+        .rejects.toThrow(/cannot attest directive admission/u);
+      expect(doubleInvocations(fx)).toEqual([]);
+      await handle.dispose();
+    });
+
+    it('a directive whose authority fails before the binding leaves no association and runs no CLI', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const identity = identityFor('claude-refused-early');
+      await expect(handle.prompt('follow it', { directive: { identity, beforeAdmission: () => { throw new Error('superseded'); }, onAdmitted: () => {} } }))
+        .rejects.toThrow(/superseded/u);
+      expect(readDirectiveBinding(handle.sessionFile!, identity.requestId)).toBeNull();
+      expect(doubleInvocations(fx)).toEqual([]);
+      expect(handle.health().state).toBe('idle');
+      await handle.dispose();
+    });
   });
 
   it('resume scan is bounded: a session id beyond the prefix window is not found', async () => {
@@ -2521,13 +2856,29 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     expect(fx.runtime.health().state).toBe('ok');
   });
 
-  it('a spawned-but-never-prompted transcript resumes by adopting the filename uuid', async () => {
+  it('a legacy empty transcript resumes by adopting the filename uuid', async () => {
+    const fx = fixture();
+    const dir = fx.store.sessionDirFor('gru', fx.workspace);
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, '2026-09-17T00-00-00-000Z_33333333-3333-3333-3333-333333333333.jsonl');
+    writeFileSync(file, '', 'utf-8');
+    const resumed = await fx.runtime.spawn('gru', { resumeFile: file });
+    try {
+      expect(resumed.id).toBe('33333333-3333-3333-3333-333333333333');
+      // No GC header: this session cannot attest directive admission.
+      expect(resumed.prepareDirectiveProducer).toBeUndefined();
+    } finally {
+      await resumed.dispose();
+    }
+  });
+
+  it('a spawned-but-never-prompted transcript (GC\'s header only) resumes by adopting the header\'s session id', async () => {
     const fx = fixture();
     const first = await fx.runtime.spawn('gru');
     const file = first.sessionFile!;
     const sessionId = first.id;
-    await first.dispose(); // never prompted: empty transcript on disk
-    expect(readFileSync(file, 'utf-8')).toBe('');
+    await first.dispose(); // never prompted: only the session header on disk
+    expect(JSON.parse(readFileSync(file, 'utf-8'))).toMatchObject({ type: 'session', id: sessionId, runtime: 'claude-code' });
 
     const secondRuntime = new ClaudeCodeRuntime({
       config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'),
@@ -2537,7 +2888,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     });
     const resumed = await secondRuntime.spawn('gru', { resumeFile: file });
     try {
-      expect(resumed.id).toBe(sessionId); // adopted from the filename
+      expect(resumed.id).toBe(sessionId); // adopted from the header
       await resumed.prompt('first words', { owner: 'alice' });
       const invocations = doubleInvocations(fx);
       const last = invocations[invocations.length - 1]!;
@@ -2549,7 +2900,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         .trim()
         .split('\n')
         .map((l) => JSON.parse(l) as StreamFrame);
-      expect(frames[0]!['session_id']).toBe(sessionId);
+      expect(frames[1]!['session_id']).toBe(sessionId);
     } finally {
       await resumed.dispose();
     }

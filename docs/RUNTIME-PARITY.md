@@ -76,7 +76,7 @@ that proves it on each adapter.
 | `blind-transcript-reader` | The blind-access reader pairs each read result with the file its call named, read from each runtime's real persisted record shape | `test/blind-review.test.ts` | `test/blind-review.test.ts` |
 | `blind-read-invalidates` | Through the ledger, an absolute read inside the job's recorded lane invalidates blind coverage | `test/blind-review.test.ts` | `test/blind-review.test.ts` |
 | `blind-resumed-turn-scan` | A prohibited read during a provider-recovery resumed turn invalidates blind coverage | `test/provider-recovery-resume.test.ts` | `test/provider-recovery-resume.test.ts` |
-| `native-directive-admission` | **Declared gap (#424).** pi attests a Silas directive's native admission and producer ownership: an accepted directive runs as its exact SDK producer and settles with its delivery. Claude Code refuses a directive prompt by name, and directive progress refuses its minion before binding anything | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts`, `test/restart-recovery-progress.test.ts` |
+| `native-directive-admission` | A Silas directive's native admission and producer ownership are attested before any effect, and the directive settles with its delivery. pi: an accepted directive runs as its exact SDK producer. Claude Code (#424): the binding is durable before the CLI starts, admission is the CLI's own echo of the prompt (`--replay-user-messages`), every tool asks the host through the stdio permission prompt and is allowed only once its intent is durable and the directive's authority still holds, and completion is the turn's own result | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts`, `test/restart-recovery-progress.test.ts` |
 | `rate-limit-retry` | An in-band 429 keeps the delivery pending until the supervisor's automatic retry recovers; driven through `AgentHandle` | `test/supervisor.test.ts` | `test/supervisor.test.ts` |
 | `supervisor-restart-ladder` | A hung agent climbs the restart ladder and is restored by resume; driven through `AgentHandle` | `test/supervisor.test.ts` | `test/supervisor.test.ts` |
 | `provider-recovery-continuation` | A provider-recovery claim resumes the interrupted session and re-delivers its continuation prompt; driven through `AgentHandle` | `test/provider-recovery-resume.test.ts` | `test/provider-recovery-resume.test.ts` |
@@ -126,17 +126,22 @@ runtimes. Each has a `:neutral` row in the matrix:
 - provider-recovery continuation (`provider-recovery-continuation`);
 - resident registry custody (`stale-spawn-quarantine`).
 
-Directive restart recovery (#286) is NOT runtime-neutral. It continues an
-interrupted directive from the runtime's own native checkpoint, which only pi
-attests: see the `native-directive-admission` gap.
+Directive restart recovery (#286) is NOT runtime-neutral. pi continues an
+interrupted directive from its own native checkpoint; Claude Code never
+continues one (see Differences by design).
 
 ## Declared gaps
 
 <!-- declared-gaps:start -->
 | Contract | Gap | Issue |
 |---|---|---|
-| `native-directive-admission` | Silas directives and re-briefs need native admission and producer attestation. Claude Code cannot provide them, so a directive to a Claude-hosted minion is refused by name before anything is bound or prompted (a positive no-effect). Directive restart recovery (#286) rests on the same checkpoint and is pi-only too. The minion-owned review/fix cycle is unaffected | #424 |
 <!-- declared-gaps:end -->
+
+None today. #424 closed the last one: Claude Code minions take Silas
+directives and re-briefs with exact admission proof, as pi does. The
+intentional differences (an interrupted directive is never resumed, a
+directive is text only, and a session that cannot attest admission refuses)
+are listed under Differences by design.
 
 Blind-review observation reads each runtime's own transcript format. The
 `blind-transcript-reader` and `blind-read-invalidates` rows run on fixtures
@@ -157,6 +162,29 @@ writes each runtime's own record shape during a resumed turn.
 - **MCP servers.** Claude Code loads none by default (`[runtimes.claude-code]
   mcp`). pi sessions get their product-native tools in-process, with no MCP
   bridge (see the `review-native-tools` row).
+- **An interrupted directive.** pi continues it from its native checkpoint
+  when that checkpoint is safely resumable. Claude Code never continues or
+  replays one (owner ruling 2026-10-16): the CLI cannot continue a turn
+  without a new prompt, so an interrupted Claude directive is Gru's recovery
+  decision (`test/restart-recovery-progress.test.ts`, "an interrupted Claude
+  directive is never resumed or replayed …" and "a service that died
+  mid-directive …").
+- **Directive sessions.** A Claude Code transcript starts with a GC session
+  header (session id and cwd), which directive admission binds. A directive
+  and a re-brief both run in the minion's recorded session, so two kinds of
+  Claude session refuse them by name before anything is bound:
+  - one started before GC wrote session headers (#424): it has none, while
+    every session GC starts now begins with one;
+  - one that loads ambient MCP tools (`[runtimes.claude-code] mcp`). This is
+    intentional: the host fences every tool it lists, and it cannot list tools
+    it does not know.
+
+  A directive to either kind fails by name before anything is bound or sent
+  ("cannot attest native directive admission or producer ownership"), and is
+  never re-sent.
+- **Directive content.** A Claude directive is text only (an image is refused
+  by name): the CLI may transform an image, which would break the byte-exact
+  echo admission binds.
 
 ## Rollout of the default change
 
@@ -169,10 +197,9 @@ writes each runtime's own record shape during a resumed turn.
   Regenerating with `--force` keeps the existing runtime unless another is
   chosen explicitly (`test/config-generate.test.ts`, "an existing pi config …
   is untouched by --force regeneration").
-- **Before switching an install to Claude Code**, note the
-  `native-directive-admission` gap (#424). Silas cannot send directives or
-  re-briefs to Claude-hosted minions, and an interrupted directive cannot be
-  recovered from a Claude checkpoint.
+- **Before switching an install to Claude Code**, note that an interrupted
+  directive is never resumed on Claude Code; Gru decides its recovery (see
+  Differences by design).
 - **Live sessions when an install switches by hand.** A transcript belongs to
   the runtime that wrote it. The other adapter refuses to resume it by name and
   releases its lock (`foreign-transcript-refused`), so a switched install never

@@ -18,13 +18,14 @@ const ADAPTER_FILES = ['test/pi-adapter.test.ts', 'test/claude-adapter.test.ts']
 interface Row { readonly cells: readonly string[] }
 
 /** The rows of the markdown table between `<!-- name:start -->` and `<!-- name:end -->`;
- * a row whose cell count differs from the header's is refused by name. */
-function table(doc: string, name: string): readonly Row[] {
+ * a row whose cell count differs from the header's is refused by name. Only a
+ * table whose empty state is meaningful (no declared gaps) may have no rows. */
+function table(doc: string, name: string, opts: { readonly allowEmpty?: boolean } = {}): readonly Row[] {
   const start = doc.indexOf(`<!-- ${name}:start -->`);
   const end = doc.indexOf(`<!-- ${name}:end -->`);
   if (start < 0 || end < start) throw new Error(`docs/RUNTIME-PARITY.md has no ${name} table between its markers`);
   const lines = doc.slice(start, end).split('\n').filter((line) => line.startsWith('|'));
-  if (lines.length < 3) throw new Error(`docs/RUNTIME-PARITY.md ${name} table has no header, separator or rows`);
+  if (lines.length < (opts.allowEmpty === true ? 2 : 3)) throw new Error(`docs/RUNTIME-PARITY.md ${name} table has no header, separator or rows`);
   const cellsOf = (line: string): readonly string[] => line.split('|').slice(1, -1).map((cell) => cell.trim());
   const width = cellsOf(lines[0] ?? '').length;
   return lines.slice(2).map((line) => { // header and separator
@@ -156,7 +157,7 @@ describe('runtime parity guard (#374)', () => {
   const doc = readFileSync(join(root, 'docs', 'RUNTIME-PARITY.md'), 'utf8');
   const matrix = table(doc, 'parity-matrix');
   const blocks = table(doc, 'adapter-blocks');
-  const gaps = table(doc, 'declared-gaps');
+  const gaps = table(doc, 'declared-gaps', { allowEmpty: true });
   const { found, malformed } = tags();
 
   it('every contract in the matrix is proven on both runtimes, and every cell names its tagged test file', () => {
@@ -225,6 +226,9 @@ describe('runtime parity guard (#374)', () => {
     expect(cellFileProblems([{ cells: ['`x`', 'b', '`test/runtime-parity.test.ts`', '-'] }], [{ id: 'x', runtime: 'claude-code', file: 'test/runtime-parity.test.ts', title: 't' }]))
       .toEqual(['x: test/runtime-parity.test.ts holds no test tagged for it on pi']);
     expect(() => table('<!-- t:start -->\n| a | b |\n|---|---|\n<!-- t:end -->', 't')).toThrow(/t table has no header, separator or rows/u);
+    // No declared gaps is a real state; a gaps table still needs its header.
+    expect(table('<!-- t:start -->\n| a | b |\n|---|---|\n<!-- t:end -->', 't', { allowEmpty: true })).toEqual([]);
+    expect(() => table('<!-- t:start -->\n| a | b |\n<!-- t:end -->', 't', { allowEmpty: true })).toThrow(/t table has no header, separator or rows/u);
     expect(TAG.test('#contract:spawn-cwd:windows')).toBe(false);
   });
 
