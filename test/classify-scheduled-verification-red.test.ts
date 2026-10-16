@@ -4,6 +4,7 @@ import { exec, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { classifyReviewedRed, STATUS_ACTION_NAME } from '../tools/classify-scheduled-verification-red.mjs';
 import { loadWorktreeManifest } from '../src/worktrees/manifest.js';
@@ -305,8 +306,25 @@ describe('reviewed-candidate behavioral RED custody', () => {
       // A load guard that cannot make its temporary directory says why — it never ran the helper.
       const noTmp = libCall('require_built_helper', snapshot, join(dir, 'no-such-tmp'));
       expect(noTmp.status).toBe(2);
-      expect(noTmp.stderr).toMatch(new RegExp(`^the helper load could not run: ENOENT[^\\n]*\\nthe helper load could not run — nothing was judged about the helper; refusing \\(snapshot kept at ${snapshot.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}\\)\\n$`, 'u'));
+      expect(noTmp.stderr).toMatch(new RegExp(`^the helper load could not run: ENOENT[^\\n]*\\nthe helper load could not run or be read — nothing was judged about the helper; refusing \\(snapshot kept at ${snapshot.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}\\)\\n$`, 'u'));
       expect(noTmp.stderr).not.toMatch(/does not load cleanly/u);
+      // ...nor one whose load process cannot be started after its directory exists,
+      // nor a guard that cannot start at all: nothing was judged about the helper.
+      const preload = (name: string, body: string): string => { const file = join(dir, name); writeFileSync(file, body); return `--import=${pathToFileURL(file).href}`; };
+      const noSpawn = libCall('require_built_helper', snapshot, join(dir, 'tmp'), { NODE_OPTIONS: preload('no-spawn.mjs', "import cp from 'node:child_process';\nimport { syncBuiltinESMExports } from 'node:module';\ncp.spawn = () => { throw Object.assign(new Error('spawn refused'), { code: 'EAGAIN' }); };\nsyncBuiltinESMExports();\n") });
+      expect(noSpawn.status).toBe(2);
+      expect(noSpawn.stderr).toMatch(/^the helper load could not run: spawn refused\nthe helper load could not run or be read — nothing was judged about the helper/u);
+      const shOnly = join(dir, 'sh-only'); mkdirSync(shOnly); symlinkSync('/bin/sh', join(shOnly, 'sh'));
+      const noNode = libCall('require_built_helper', snapshot, join(dir, 'tmp'), { PATH: shOnly });
+      expect(noNode.status).toBe(2);
+      expect(noNode.stderr).toMatch(/the helper load guard failed \(status 127\) — nothing was judged about the helper; refusing/u);
+      expect(noNode.stderr).not.toMatch(/does not load cleanly/u);
+      // A temporary directory the guard cannot remove never replaces its verdict.
+      const keptDirs = readdirSync(join(dir, 'tmp')).filter((name) => name.startsWith('gru-helper-load-')).length;
+      const stuck = libCall('require_built_helper', snapshot, join(dir, 'tmp'), { NODE_OPTIONS: preload('no-rm.mjs', "import fs from 'node:fs';\nimport { syncBuiltinESMExports } from 'node:module';\nfs.rmSync = () => { throw Object.assign(new Error('busy'), { code: 'EBUSY' }); };\nsyncBuiltinESMExports();\n") });
+      expect([stuck.status, stuck.stderr]).toEqual([0, '']);
+      expect(readdirSync(join(dir, 'tmp')).filter((name) => name.startsWith('gru-helper-load-'))).toHaveLength(keptDirs + 1);
+      for (const name of readdirSync(join(dir, 'tmp')).filter((entry) => entry.startsWith('gru-helper-load-'))) rmSync(join(dir, 'tmp', name), { recursive: true, force: true });
       // The real compiled helper (this tree's build) loads without running.
       const real = libCall('require_built_helper', repoRoot, join(dir, 'tmp'));
       expect([real.status, real.stderr]).toEqual([0, '']);
@@ -326,12 +344,14 @@ describe('reviewed-candidate behavioral RED custody', () => {
     /** pgrep's matches — a pgrep that cannot run is a named fixture failure. */
     const pgrep = (args: readonly string[]): string[] => {
       const out = spawnSync('pgrep', args, { encoding: 'utf8' });
-      if (out.error !== undefined) throw new Error(`fixture setup: pgrep could not run (${out.error.message})`);
+      // pgrep exits 1 for no match; anything above that is its own failure.
+      if (out.error !== undefined || (out.status ?? 2) > 1) throw new Error(`fixture setup: pgrep could not run (${out.error?.message ?? `status ${String(out.status)}: ${out.stderr}`})`);
       return (out.stdout ?? '').trim().split('\n').filter((line) => line !== '');
     };
     /** Every load group a guard started, and the guard: down, whatever failed. */
     const killGuard = (guard: number): void => {
-      const children = pgrep(['-P', String(guard)]);
+      let children: string[] = [];
+      try { children = pgrep(['-P', String(guard)]); } catch { /* still kill the guard below */ }
       for (const child of children) { try { process.kill(-Number(child), 'SIGKILL'); } catch { /* gone */ } }
       try { process.kill(guard, 'SIGKILL'); } catch { /* gone */ }
     };
@@ -405,7 +425,7 @@ describe('reviewed-candidate behavioral RED custody', () => {
       for (const leader of groups) { try { process.kill(-leader, 'SIGKILL'); } catch { /* gone */ } }
       rmSync(dir, { recursive: true, force: true });
     }
-  }, 240_000);
+  }, 300_000);
 
   it('the status title the classifier allows is the real status regression\'s title', () => {
     // Built in parts so the suite-shape counter never mistakes it for a registration.
