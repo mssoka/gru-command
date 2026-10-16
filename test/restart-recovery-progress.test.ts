@@ -1,7 +1,7 @@
 import { bindOriginalRebriefSdkOwner, markHistoricalDirectiveFixture } from './helpers/directive-native-fixture.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
-import { appendFileSync, closeSync, constants, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, truncateSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, constants, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, truncateSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { tmpdir } from 'node:os';
@@ -13,10 +13,11 @@ import { NotificationCenter } from '../src/notifications/center.js';
 import { SessionStore } from '../src/sessions/store.js';
 import { PiAgentHandle, PI_CAPABILITIES } from '../src/runtime/pi-adapter.js';
 import { ClaudeCodeHandle, CLAUDE_CODE_CAPABILITIES } from '../src/runtime/claude-adapter.js';
-import { inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveCompletion, recordDirectiveProducerCessation, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader } from '../src/runtime/directive-checkpoint.js';
+import { DirectiveCheckpointError, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveCompletion, recordDirectiveProducerCessation, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader } from '../src/runtime/directive-checkpoint.js';
 import { WorkerDisposalInProgressError } from '../src/runtime/registry.js';
 import { DirectiveProgressService, DirectivePromptRefusedError, executeAcceptedDirective, promptRefusalUnproven, settleNativeDirective, surfaceDirectiveRecovery } from '../src/dispatch/directive-progress.js';
 import { recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute } from '../src/dispatch/directive-recovery.js';
+import { DirectiveRetirementError } from '../src/ledger/directives.js';
 import { reconcilePendingLegacyDirectives, reconcilePendingRebriefs, settleDirectivesFromEvidence } from '../src/dispatch/rebrief-recovery.js';
 import type { AgentHandle, SpawnOptions } from '../src/runtime/types.js';
 import { recordFollowUpDelivery, type DirectiveRegistry } from '../src/dispatch/fix-directive.js';
@@ -1440,6 +1441,32 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     })();
   });
 
+  it('an exact successful completion whose producer probe is EPERM stays UNKNOWN: no delivery, no settlement, nothing disposed (#363 S04-2-01)', async () => {
+    const f = await fixture(); void (f.ledger.getWorktree(f.lane.id) ?? f.ledger.registerWorktree(f.lane));
+    f.ledger.prepareDirectiveTarget(f.intent.requestId, { agentId: 'logical-minion', sessionFile: f.file });
+    prepareDirectiveBinding({ identity: f.identity, runtime: 'pi', agentId: 'logical-minion', sessionId: f.native.sessionId, sessionFile: f.file, text: 'original user', authorityManifest: 'original authority' });
+    const producer = prepareDirectiveProducer({ identity: f.identity, agentId: 'logical-minion', sessionId: f.native.sessionId, sessionFile: f.file });
+    f.ledger.startDirectiveProducer(f.identity, producer);
+    f.native.append({ role: 'user', content: [{ type: 'text', text: 'original user' }] }); f.native.finish();
+    const proof = inspectDirectiveCheckpoint(f.file, f.identity);
+    if (proof.state !== 'terminal' || !proof.ok) throw new Error('original successful terminal required');
+    recordDirectiveCompletion(producer, proof.checkpointId, resolveGitCommit(f.lane.path, 'HEAD'));
+    // No lock file is left to refuse on its own: the probe alone decides, and EPERM proves nothing.
+    expect(existsSync(`${f.file}.lock`)).toBe(false);
+    const probe = vi.spyOn(process, 'kill').mockImplementation(() => { throw Object.assign(new Error('fixture ambiguous permission'), { code: 'EPERM' }); });
+    const disposals = vi.spyOn(f.registry, 'disposeHandle');
+    try {
+      expect(inspectDirectiveProducers(f.file, f.identity)).toEqual([expect.objectContaining({ evidence: 'unknown' })]);
+      const outcome = (() => { try { return settleNativeDirective(f.deps, f.identity); } catch (error) { return error; } })();
+      expect(outcome).toBeInstanceOf(DirectiveCheckpointError);
+      expect((outcome as Error).message).toMatch(/^exact original physical native producer cessation unproven; start \d+$/u);
+      expect(f.ledger.latestJobEventByRequestId(f.intent.jobId, 'job.delivered', f.intent.requestId)).toBeNull();
+      expect(f.ledger.getDirective(f.intent.requestId)?.state).not.toBe('settled');
+      expect(disposals).not.toHaveBeenCalled();
+      expect(f.native.prompts).toEqual([]); expect(f.spawns).toEqual([]);
+    } finally { disposals.mockRestore(); probe.mockRestore(); recordDirectiveProducerCessation(producer); }
+  });
+
   async function assertHistoricalMissingHead(mode: 'amended' | 'parked' | 'unknown') {
     const f = await fixture(); f.seed(); f.native.finish();
     f.ledger.bindDirectiveNativeAdmission(inspectDirectiveAdmission(f.file, f.identity));
@@ -2554,6 +2581,56 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(f.ledger.listObligations({ jobId: f.intent.jobId }).filter((row) => row.incidentKey.startsWith('rebrief-recovery:'))).toHaveLength(1);
   });
 
+  it('/recover refuses a successor while a queued worker for the job or its agent waits: nothing retired, decided or created (#363 S06-2-01)', async () => {
+    const queuedGate = (entryId: string) => ({ view: () => ({ worker: { queued: [{ id: entryId, label: `queued ${entryId}` }] } }) }) as never;
+    // Directive recovery: a queued job-ID entry, then a queued agent-ID entry.
+    for (const entryId of ['job', 'agent'] as const) {
+      const f = await fixture();
+      const debt = f.ledger.openDirectiveRecoveryDebt(f.intent.requestId, 'predecessor handoff requires a decision');
+      const head = resolveGitCommit(f.lane.path, 'HEAD'); const authority = f.ledger.directiveCurrentAuthority(f.intent.jobId);
+      const watermark = f.ledger.latestEventSeq(); const before = f.ledger.getDirective(f.intent.requestId);
+      const queuedId = entryId === 'job' ? f.intent.jobId : FIXTURE_MINION;
+      let refusal: unknown = null;
+      try {
+        recoverInterruptedDirectiveFromRoute({ ...f.deps, workerGate: queuedGate(queuedId), requestId: f.intent.requestId, generation: debt.generation,
+          expectedPayloadHash: f.intent.payloadHash, expectedHead: head, expectedEpoch: f.ledger.directiveRecoveryEpoch(f.intent.jobId),
+          expectedWorkRevision: authority.workRevision, expectedContractSha256: authority.contractSha256, reason: 'fresh approved successor',
+          decision: { kind: 'successor', requestId: `queued-successor-${entryId}`, directive: 'approved correction' } });
+      } catch (error) { refusal = error; }
+      expect(refusal, entryId).toBeInstanceOf(DirectiveRetirementError);
+      expect(String((refusal as Error).message), entryId).toMatch(/recovery successor refused/u);
+      expect(f.ledger.latestEventSeq(), entryId).toBe(watermark);
+      expect(f.ledger.getDirective(f.intent.requestId), entryId).toEqual(before);
+      expect(f.ledger.getDirective(`queued-successor-${entryId}`), entryId).toBeNull();
+      expect(f.ledger.recoveryDecisionHistory('directive', f.intent.requestId), entryId).toEqual([]);
+    }
+    // Historical rebrief recovery: the same fence for a queued job-ID and agent-ID entry, markers untouched.
+    for (const entryId of ['job', 'agent'] as const) {
+    const f = await fixture(); f.ledger.failDirective({ requestId: f.intent.requestId, reason: 'fixture no-effect' });
+    f.ledger.beginPendingRebrief({ jobId: f.intent.jobId, note: 'legacy', briefing: 'original contract' });
+    await bindOriginalRebriefSdkOwner(f.ledger, f.ledger.listPendingRebriefs(), { cwd: f.lane.path, dataDir: f.dir, agentId: 'logical-minion', sessionFile: f.file });
+    const markers = f.ledger.listPendingRebriefs(); const marker = markers.find((row) => row.kind === 'silas.rebrief')!;
+    const debt = f.ledger.openRebriefRecoveryDebt(marker.id, 'unknown native effects');
+    const authority = f.ledger.directiveCurrentAuthority(f.intent.jobId);
+    const queuedId = entryId === 'job' ? f.intent.jobId : FIXTURE_MINION;
+    let refusal: unknown = null;
+    try {
+      recoverInterruptedRebriefFromRoute({ ...f.deps, workerGate: queuedGate(queuedId), markerId: marker.id, generation: debt.generation,
+        expectedPayloadHash: marker.payloadHash, expectedReceiptEvidenceSha256: f.ledger.rebriefReceiptEvidence(marker.id).sha256,
+        expectedEpoch: f.ledger.directiveRecoveryEpoch(f.intent.jobId), expectedWorkRevision: authority.workRevision, expectedContractSha256: authority.contractSha256,
+        expectedHead: resolveGitCommit(f.lane.path, 'HEAD'), reason: 'finish under fresh authority',
+        decision: { kind: 'successor', requestId: `queued-marker-successor-${entryId}`, directive: 'finish' } });
+    } catch (error) { refusal = error; }
+    // Refused by the queued entry itself: it is the one blocker named.
+    expect(refusal, entryId).toBeInstanceOf(DirectiveRetirementError);
+    expect(String((refusal as Error).message), entryId).toMatch(/requires proven producer cessation/u);
+    expect((refusal as DirectiveRetirementError).blockers, entryId).toEqual([`queued ${queuedId}`]);
+    expect(f.ledger.listPendingRebriefs(), entryId).toEqual(markers);
+    expect(f.ledger.getDirective(`queued-marker-successor-${entryId}`), entryId).toBeNull();
+    expect(f.ledger.getRebriefRecoveryDecision(marker.id, debt.generation), entryId).toBeNull();
+    }
+  });
+
   it('historical marker successor is exact-generation guarded and hands off actual authority once', async () => {
     const f = await fixture(); f.ledger.failDirective({ requestId: f.intent.requestId, reason: 'fixture no-effect' });
     f.ledger.beginPendingRebrief({ jobId: f.intent.jobId, note: 'legacy', briefing: 'original contract' });
@@ -2841,6 +2918,21 @@ it('P35 positively pre-native parent tool preparation failure later continues th
   expect(f.spawns).toEqual([]); expect(f.native.continuations).toBe(0); available = true;
   service.reconsider(); await service.settled(); service.reconsider(); await service.settled();
   expect(f.native.continuations).toBe(1); expect(f.native.prompts).toEqual([]); expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('settled'); await service.dispose();
+});
+
+it('P35 a checkpoint continuation restores the original agent\'s nonempty parent tools, same capability and same identity (#363 S04-2-02)', async () => {
+  const f = await fixture(); f.seed();
+  const capability = { name: 'request_child_worker', description: 'request a child worker for the original parent', inputSchema: { type: 'object' },
+    authorityManifest: 'original-parent:logical-minion', execute: async () => ({ text: 'ok' }) };
+  const asked: string[] = [];
+  const service = new DirectiveProgressService({ ...f.deps, parentTools: (agentId) => { asked.push(agentId); return [capability]; } });
+  service.reconsider(); await service.settled(); service.reconsider(); await service.settled();
+  expect(f.native.continuations).toBe(1);
+  expect(asked).toEqual(['logical-minion']);
+  expect(f.spawns).toHaveLength(1);
+  expect(f.spawns[0]).toMatchObject({ agentId: 'logical-minion', resumeFile: f.file, nativeTools: [capability] });
+  expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('settled');
+  await service.dispose();
 });
 
 async function assertLateTerminalRecoveryHold(mode: 'suspended' | 'claimed'): Promise<void> {

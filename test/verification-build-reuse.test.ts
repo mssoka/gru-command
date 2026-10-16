@@ -235,6 +235,37 @@ describe('verification build reuse (#318)', () => {
     }
   });
 
+  it('a first-step reuse starts the run clock itself: reused output paused past runTimeoutMs times the run out with no native start and no later step (#363 S09-2-01)', async () => {
+    const lane = makeLane(); const storage = mkdtempSync(join(tmpdir(), 'gru-first-step-reuse-clock-'));
+    const records: VerificationRecord[] = [];
+    const scheduler = new VerificationScheduler({ storageDir: storage,
+      limits: { maxConcurrent: 1, workerBudget: 4, lockWaitTimeoutMs: 30_000, runTimeoutMs: 30_000 },
+      sweepIntervalMs: 50, killGraceMs: 100, disposeGraceMs: 500,
+      record: (record) => { records.push(record); } });
+    let release!: () => void; const paused = new Promise<void>((resolve) => { release = resolve; });
+    let reached!: () => void; const reused = new Promise<void>((resolve) => { reached = resolve; });
+    let running: Promise<VerificationOutcome> | null = null;
+    try {
+      expect((await run(scheduler, lane, 'warm', DOCS)).ok).toBe(true);
+      records.length = 0;
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      // The build is the FIRST step, so no earlier native step started the clock.
+      running = run(scheduler, lane, 'first-step-reuse', DOCS, async (frame) => {
+        if (frame.type === 'output' && frame.text.includes('[gru-verify] npm run build reused')) { reached(); await paused; }
+      });
+      await reused;
+      vi.advanceTimersByTime(30_000);
+      release(); const result = await running;
+      expect(result.timedOut).toBe(true);
+      expect(records.filter((record) => record.kind === 'verification.started')).toEqual([]);
+      expect(count(lane.steps(), 'build')).toBe(1);
+      expect(count(lane.steps(), 'config-docs')).toBe(1);
+    } finally {
+      release(); if (running !== null) await running.catch(() => {});
+      vi.useRealTimers(); await scheduler.dispose(); rmSync(storage, { recursive: true, force: true });
+    }
+  });
+
   it('R16 received childless shutdown during reuse preserves original no-start through persistent readback', async () => {
     const lane = makeLane(); const storage = mkdtempSync(join(tmpdir(), 'gru-r16-reuse-no-start-'));
     const records: VerificationRecord[] = []; const frames: VerificationProgress[] = [];

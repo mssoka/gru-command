@@ -574,7 +574,7 @@ describe('verification single-flight + reconcile (issue #159)', () => {
   it('R15 post-source coverage retains complete overflowing native-step event history and UNKNOWN ownership', () => assertOriginalStepReadback('decomposed', 'event-overflow'));
   it('R15 post-source coverage retains an oversized original native-step receipt and UNKNOWN ownership', () => assertOriginalStepReadback('decomposed', 'byte-overflow'));
 
-  async function assertProcessIdentityRefusal(fault: 'unbound' | 'conflicting-start' | 'unbound-reused-pid' | 'reused-pid' | 'foreign-command' | 'foreign-terminal' | 'EPERM' | 'live-original') {
+  async function assertProcessIdentityRefusal(fault: 'unbound' | 'conflicting-start' | 'unbound-reused-pid' | 'reused-pid' | 'foreign-command' | 'foreign-terminal' | 'EPERM' | 'live-original' | 'live-group' | 'EPERM-group') {
     const h = await boot(); const requestId = `process-negative-${fault}`;
     const result = await call(h.port, { job_id: h.jobId, scope: 'full', request_id: requestId });
     const outcome = outcomeOf(completedFrame(result.frames)); const runId = String(outcome['runId']);
@@ -594,6 +594,14 @@ describe('verification single-flight + reconcile (issue #159)', () => {
         if (fault === 'live-original') return true;
         throw Object.assign(new Error('ambiguous permission'), { code: 'EPERM' });
       }
+      // An absent leader whose original process group still answers (#363 S01-2-01).
+      if (signal === 0 && (fault === 'live-group' || fault === 'EPERM-group')) {
+        if (pid === facts.pid) throw Object.assign(new Error('no such process'), { code: 'ESRCH' });
+        if (pid === -facts.pid) {
+          if (fault === 'live-group') return true;
+          throw Object.assign(new Error('ambiguous permission'), { code: 'EPERM' });
+        }
+      }
       return kill(pid, signal);
     });
     try {
@@ -609,6 +617,8 @@ describe('verification single-flight + reconcile (issue #159)', () => {
   it('process reconciliation refuses foreign-terminal original identity evidence', () => assertProcessIdentityRefusal('foreign-terminal'));
   it('process reconciliation refuses EPERM original identity evidence', () => assertProcessIdentityRefusal('EPERM'));
   it('process reconciliation refuses live-original original identity evidence', () => assertProcessIdentityRefusal('live-original'));
+  it('process reconciliation keeps an absent leader live while its original process group still answers (#363 S01-2-01)', () => assertProcessIdentityRefusal('live-group'));
+  it('process reconciliation keeps an absent leader live while its original process group probe is EPERM (#363 S01-2-01)', () => assertProcessIdentityRefusal('EPERM-group'));
 
   it('original no-start deduplication survives more than 1000 newer receipts and a real server restart', async () => {
     let h = await boot();

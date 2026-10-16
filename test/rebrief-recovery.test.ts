@@ -420,6 +420,20 @@ describe('re-brief restart safety (durable markers)', () => {
       expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(2);
       expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')?.seq).toBe(receipt.seq);
       expect(h.registry.workers).toHaveLength(0); expect(h.registry.disposed).toHaveLength(0);
+      // The real observation over the malformed receipt (#363 S07-0-04): it
+      // settles nothing, rewrites no receipt, keeps both markers, and owes an
+      // actionable refusal instead.
+      const markersBefore = h.ledger.listPendingRebriefs({ jobId });
+      const receiptsBefore = h.ledger.listJobEventsByKinds(jobId, ['silas.rebrief', 'job.delivered']);
+      const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { limit: 100 });
+      expect(report, fault).toMatchObject({ completed: 0, retired: 0 });
+      expect(h.ledger.listPendingRebriefs({ jobId }), fault).toEqual(markersBefore);
+      expect(h.ledger.listJobEventsByKinds(jobId, ['silas.rebrief', 'job.delivered']), fault).toEqual(receiptsBefore);
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-settled'), fault).toBeNull();
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-recovered'), fault).toBeNull();
+      const card = h.ledger.findNotificationByKind(`silas.rebrief-unreconciled.${jobId}`, 'active');
+      expect(card?.detail, fault).toMatch(/POST its \/recover/u);
+      expect(h.registry.workers, fault).toHaveLength(0); expect(h.registry.disposed, fault).toHaveLength(0);
   }
 
   it('strict original receipt correlation refuses missing-binding without rewriting immutable history', async () => {
