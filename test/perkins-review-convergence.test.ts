@@ -556,7 +556,7 @@ describe('integration unit fail-loud guards (#393)', () => {
     const head = repo.head();
     const status = () => repo.git(['status', '--porcelain', '--ignored']);
     const before = status();
-    for (const [count, directory] of [[0, 'many'], [100_001, 'many'], [1, '../out'], [1, '/abs'], [1, 'C:foo'], [1, '.git/objects2'], [1, '.GIT/objects2'], [1, 'a/.Git'], [1, '.git./x'], [1, '.git /x'], [1, 'GIT~1/x'], [1, 'git~2/x'], [1, '.g\u200bit/x'], [1, '.\uff47it/x'], [1, '.git::$INDEX_ALLOCATION/x'], [1, '.. /x'], [1, '.../x'], [1, '..../x'], [1, '. ./x'], [1, 'a:b/x'], [1, '.git:x/y'], [1, '.git\t/x'], [1, 'nul/x'], [1, 'nul /x'], [1, 'nul./x'], [1, 'nul .txt/x'], [1, 'CONOUT$/x'], [1, 'CONIN$/x'], [1, 'clock$/x'], [1, 'COM1.txt/x'], [1, 'a/./b'], [1, 'a\0b']] as const) {
+    for (const [count, directory] of [[0, 'many'], [100_001, 'many'], [1, '../out'], [1, '/abs'], [1, 'C:foo'], [1, '.git/objects2'], [1, '.GIT/objects2'], [1, 'a/.Git'], [1, '.git./x'], [1, '.git /x'], [1, 'GIT~1/x'], [1, 'git~2/x'], [1, '.g\u200bit/x'], [1, '.\uff47it/x'], [1, '.git::$INDEX_ALLOCATION/x'], [1, '.. /x'], [1, '.../x'], [1, '..../x'], [1, '. ./x'], [1, 'a:b/x'], [1, '.git:x/y'], [1, '.git\t/x'], [1, 'nul/x'], [1, 'nul /x'], [1, 'nul./x'], [1, 'nul .txt/x'], [1, 'CONOUT$/x'], [1, 'CONIN$/x'], [1, 'clock$/x'], [1, 'COM1.txt/x'], [1, 'COM1 .txt/x'], [1, 'lpt9 .log/x'], [1, 'a/./b'], [1, 'a\0b']] as const) {
       expect(() => commitManyPaths(repo, count, directory), `${String(count)} ${directory}`).toThrow(/^commitManyPaths (?:needs a path count|directory must be a relative path)/u);
     }
     // Nothing was written or committed by any refusal.

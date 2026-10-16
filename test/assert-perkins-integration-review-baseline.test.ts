@@ -324,7 +324,7 @@ describe('perkins integration R4 fail-before classifier', () => {
     // ...but one BEFORE the deciding frame still refuses, as too long to judge.
     expect(behavioralRefusal(`AssertionError: x\n    at ${'a'.repeat(3000)}:1:2\n    at /repo/test/a.test.ts:1:2`)).toMatch(/^a frame-opening line is longer than 2048 characters: /u);
     // Any dotted, slashed or backslashed token before a :line is a location (fail closed).
-    for (const frame of ['    at helper.ts:12 extra', '    at notes.v2-final:3 x', '    at a.7z:3 x', '    at test\\helpers\\h:12 x']) {
+    for (const frame of ['    at helper.ts:12 extra', '    at notes.v2-final:3 x', '    at a.7z:3 x', '    at test\\helpers\\h:12 x', '    at test/helpers/h:12 x']) {
       expect(behavioralRefusal(`AssertionError: x\n${frame}\n    at /repo/test/a.test.ts:1:2`), frame).toMatch(/^a frame names a location that cannot be judged/u);
     }
     // Prose whose numbers are not attached to a path is no location.
