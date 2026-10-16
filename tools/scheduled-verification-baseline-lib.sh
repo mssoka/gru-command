@@ -111,8 +111,18 @@ let child;
 const killGroup = () => { if (child?.pid === undefined) return; try { process.kill(-child.pid, 0); process.kill(-child.pid, 'SIGKILL'); } catch { /* the group is gone */ } };
 // Taken before anything is made (the temporary directory, the load), so a
 // signal the guard can handle never orphans either.
-for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT']) process.once(signal, () => { killGroup(); if (dir !== undefined) rmSync(dir, { recursive: true, force: true }); process.exit(130); });
-dir = mkdtempSync(join(tmpdir(), 'gru-helper-load-'));
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT']) {
+  process.once(signal, () => {
+    killGroup();
+    // The stop is said whatever the cleanup meets: a stray directory is the lesser loss.
+    try { if (dir !== undefined) rmSync(dir, { recursive: true, force: true }); } catch { /* still stopped */ }
+    process.exit(130);
+  });
+}
+try { dir = mkdtempSync(join(tmpdir(), 'gru-helper-load-')); } catch (error) {
+  console.error(`the helper load could not run: ${error instanceof Error ? error.message : String(error)}`);
+  process.exit(3);
+}
 try {
   const out = openSync(join(dir, 'stdout'), 'w');
   try {

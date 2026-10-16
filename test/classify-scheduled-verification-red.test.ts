@@ -302,21 +302,39 @@ describe('reviewed-candidate behavioral RED custody', () => {
         expect(libCall('require_built_helper', snapshot, join(dir, 'tmp'), { GRU_HELPER_LOAD_MS: bound }).stderr, bound).not.toMatch(/GRU_HELPER_LOAD_MS must be/u);
       }
       expect(libCall('require_built_helper', snapshot, join(dir, 'tmp'), { GRU_HELPER_LOAD_MS: '3600000' })).toMatchObject({ status: 0, stderr: '' });
+      // A load guard that cannot make its temporary directory says why — it never ran the helper.
+      const noTmp = libCall('require_built_helper', snapshot, join(dir, 'no-such-tmp'));
+      expect(noTmp.status).toBe(2);
+      expect(noTmp.stderr).toMatch(/^the helper load could not run: ENOENT[^\n]*\nthe built dist\/verify\/capture-cli\.js does not load cleanly/u);
       // The real compiled helper (this tree's build) loads without running.
       const real = libCall('require_built_helper', repoRoot, join(dir, 'tmp'));
       expect([real.status, real.stderr]).toEqual([0, '']);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it('a helper load stopped by any signal the guard handles takes its group down, leaves no temporary directory, and is said so (#358)', async () => {
+  it('a helper load stopped by a signal is said so: one the guard handles takes its group and temporary directory down, one it cannot (SIGKILL) leaves them, as documented (#358)', async () => {
     const dir = realpathSync(mkdtempSync(join(tmpdir(), 'gru-helper-interrupt-')));
     const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
     const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    /** Whether `promise` settles within `ms` — its timer never outlives the answer. */
+    const settlesWithin = async (promise: Promise<unknown>, ms: number): Promise<boolean> => {
+      let timer: NodeJS.Timeout | undefined;
+      try { return await Promise.race([promise.then(() => true), new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), ms); })]); }
+      finally { clearTimeout(timer); }
+    };
+    /** Every load group a guard started, and the guard: down, whatever failed. */
+    const killGuard = (guard: number): void => {
+      const children = spawnSync('pgrep', ['-P', String(guard)], { encoding: 'utf8' }).stdout.trim().split('\n').filter((line) => line !== '');
+      for (const child of children) { try { process.kill(-Number(child), 'SIGKILL'); } catch { /* gone */ } }
+      try { process.kill(guard, 'SIGKILL'); } catch { /* gone */ }
+    };
     const groups: number[] = [];
     try {
       const snapshot = join(dir, 'snapshot'); mkdirSync(join(snapshot, 'dist', 'verify'), { recursive: true }); mkdirSync(join(dir, 'tmp'));
       writeFileSync(join(snapshot, 'package.json'), '{"type":"module"}\n');
-      for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT'] as const) {
+      // SIGKILL last: it leaves a temporary directory behind.
+      for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT', 'SIGKILL'] as const) {
+        const handled = signal !== 'SIGKILL';
         const pidFile = join(dir, `${signal}.pid`);
         // The load (its group's leader) and its descendant, written whole by rename: never read half-written.
         writeFileSync(join(snapshot, 'dist', 'verify', 'capture-cli.js'), `import { spawn } from 'node:child_process';\nimport { renameSync, writeFileSync } from 'node:fs';\nconst kid = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' });\nwriteFileSync(${JSON.stringify(`${pidFile}.part`)}, \`\${process.pid} \${kid.pid}\`);\nrenameSync(${JSON.stringify(`${pidFile}.part`)}, ${JSON.stringify(pidFile)});\nsetInterval(() => {}, 1000);\nawait new Promise(() => {});\n`);
@@ -325,30 +343,43 @@ describe('reviewed-candidate behavioral RED custody', () => {
         run.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk; });
         const exited = once(run, 'exit');
         const closed = once(run, 'close');
+        let guard: number | null = null;
         try {
+          // The guard is the shell's node child.
           const deadline = Date.now() + 20_000;
-          while (!existsSync(pidFile) && Date.now() < deadline) await pause(50);
+          while (guard === null && run.exitCode === null && Date.now() < deadline) {
+            const found = spawnSync('pgrep', ['-P', String(run.pid), '-f', 'input-type=module'], { encoding: 'utf8' }).stdout.trim().split('\n').filter((line) => line !== '');
+            if (found.length === 1) guard = Number(found[0]); else await pause(50);
+          }
+          expect(guard, `${signal}: the load guard is found`).not.toBeNull();
+          while (!existsSync(pidFile) && run.exitCode === null && Date.now() < deadline) await pause(50);
           expect(existsSync(pidFile), `${signal}: the load started its descendant`).toBe(true);
           const [leader, kid] = readFileSync(pidFile, 'utf8').split(' ').map(Number) as [number, number];
           expect([leader, kid].every((pid) => Number.isSafeInteger(pid) && pid > 1), `${signal}: ${pidFile} holds real pids`).toBe(true);
           groups.push(leader);
-          // The load guard is the shell's node child.
-          const found = spawnSync('pgrep', ['-P', String(run.pid), '-f', 'input-type=module'], { encoding: 'utf8' });
-          expect(found.status, `${signal}: the load guard is found (${found.stderr})`).toBe(0);
-          const guards = found.stdout.trim().split('\n');
-          expect(guards, signal).toHaveLength(1);
-          process.kill(Number(guards[0]), signal);
+          process.kill(guard!, signal);
           const [status] = await exited;
+          if (!handled) {
+            // No handler runs: the load's group outlives the guard, holding its stderr open.
+            expect(alive(kid), `${signal}: the load outlives a guard no handler could stop`).toBe(true);
+            process.kill(-leader, 'SIGKILL');
+          }
           // Closed, not just exited: every byte of stderr is read — and a
-          // load group that outlived the guard would hold it open.
-          const drained = await Promise.race([closed.then(() => true), pause(10_000).then(() => false)]);
-          expect(drained, `${signal}: nothing the load started still holds the guard's stderr`).toBe(true);
-          expect([status, stderr], signal).toEqual([130, `the helper load was stopped by a signal (status 130) — nothing was judged; refusing (snapshot kept at ${snapshot})\n`]);
+          // load group that outlived a handled stop would hold it open.
+          expect(await settlesWithin(closed, 10_000), `${signal}: nothing the load started still holds the guard's stderr`).toBe(true);
+          const expected = handled ? 130 : 137;
+          const said = `the helper load was stopped by a signal (status ${String(expected)}) — nothing was judged; refusing (snapshot kept at ${snapshot})\n`;
+          expect(status, signal).toBe(expected);
+          // A shell may print its own notice of a child it saw killed (bash does; dash does not) before ours.
+          if (handled) expect(stderr, signal).toBe(said);
+          else expect(stderr.endsWith(said), `${signal}: ${stderr}`).toBe(true);
           const until = Date.now() + 5000;
           while (alive(kid) && Date.now() < until) await pause(100);
-          expect(alive(kid), `${signal}: the load's descendant went with it`).toBe(false);
-          expect(readdirSync(join(dir, 'tmp')).filter((name) => name.startsWith('gru-helper-load-')), signal).toEqual([]);
+          expect(alive(kid), `${signal}: the load's descendant is gone`).toBe(false);
+          groups.pop(); // confirmed gone: never signalled again
+          expect(readdirSync(join(dir, 'tmp')).filter((name) => name.startsWith('gru-helper-load-')), signal).toHaveLength(handled ? 0 : 1);
         } finally {
+          if (guard !== null) killGuard(guard);
           if (run.exitCode === null && run.signalCode === null) { run.kill('SIGKILL'); await exited; }
         }
       }
@@ -357,7 +388,7 @@ describe('reviewed-candidate behavioral RED custody', () => {
       for (const leader of groups) { try { process.kill(-leader, 'SIGKILL'); } catch { /* gone */ } }
       rmSync(dir, { recursive: true, force: true });
     }
-  }, 120_000);
+  }, 150_000);
 
   it('the status title the classifier allows is the real status regression\'s title', () => {
     // Built in parts so the suite-shape counter never mistakes it for a registration.
