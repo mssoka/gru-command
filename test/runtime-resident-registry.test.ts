@@ -128,7 +128,7 @@ describe('registry resident boundary across adapters', () => {
     } finally { h.cleanup(); }
   });
 
-  it('revokes lookup eligibility for a quarantined handle until disposal (GH-280)', async () => {
+  it('revokes lookup eligibility for a quarantined handle until disposal (GH-280) #contract:stale-spawn-quarantine:neutral', async () => {
     const h = harness(2);
     try {
       const minion = await h.registry.spawn('minion');

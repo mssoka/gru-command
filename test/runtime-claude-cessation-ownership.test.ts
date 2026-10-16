@@ -85,7 +85,7 @@ describe('Claude Code cessation through the registry (runtime-neutral contract)'
     expect(registry.getHandle(resident.id)).toBeNull();
   });
 
-  it('an observed close is ceased and releases ownership', async () => {
+  it('an observed close is ceased and releases ownership #contract:cessation-proven:claude-code', async () => {
     const child = fakeChild();
     const fx = claudeRegistry(child);
     const { registry } = fx;
@@ -98,7 +98,7 @@ describe('Claude Code cessation through the registry (runtime-neutral contract)'
     expect(registry.getHandle(resident.id)).toBeNull();
   });
 
-  it('a deadline without close stays unknown and holds the permit until a late close releases it once', async () => {
+  it('a deadline without close stays unknown and holds the permit until a late close releases it once #contract:cessation-unproven-holds-permit:claude-code', async () => {
     const child = fakeChild();
     const fx = claudeRegistry(child);
     const { registry } = fx;

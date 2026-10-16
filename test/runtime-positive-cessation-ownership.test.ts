@@ -196,7 +196,7 @@ describe('registry resident ownership is adapter-evidence gated (F60-P1/P4)', ()
     await registry.dispose();
   });
 
-  it('a real Pi timeout keeps disposed health + UNKNOWN evidence AND the permit as debt (negative control)', async () => {
+  it('a real Pi timeout keeps disposed health + UNKNOWN evidence AND the permit as debt (negative control) #contract:cessation-unproven-holds-permit:pi', async () => {
     vi.useFakeTimers();
     try {
       const { handle } = piHandle({ waitForIdleMode: 'never' });

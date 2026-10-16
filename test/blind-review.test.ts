@@ -180,24 +180,34 @@ describe('real persisted transcripts (#360 R5-V1 round 1)', () => {
   // wrote it.
   const fixtures = join(import.meta.dirname, 'fixtures', 'blind-transcripts');
 
-  it('reads the real record shapes: each read result is paired with the file its call named', () => {
+  it('reads Claude Code\'s real record shape: each read result is paired with the file its call named #contract:blind-transcript-reader:claude-code', () => {
     expect(readSessionToolResults(join(fixtures, 'claude-code-read.jsonl'))).toEqual([
       { index: 1, toolName: null, text: '1\tplain text with nothing that looks like history', readPath: '/lanes/job-1/docs/issues/9.md' },
     ]);
+  });
+
+  it('reads pi\'s real record shape: each read result is paired with the file its call named #contract:blind-transcript-reader:pi', () => {
     expect(readSessionToolResults(join(fixtures, 'pi-read.jsonl'))).toEqual([
       { index: 2, toolName: 'read', text: '{"state":"done"}', readPath: '/lanes/job-1/_bmad-output/state.json' },
     ]);
   });
 
-  it('through the ledger, an absolute read inside the job\'s recorded lane — either spelling of it — invalidates coverage', () => {
-    for (const [jobId, file] of [['job-claude-lane', 'claude-code-read.jsonl'], ['job-pi-lane', 'pi-read.jsonl']] as const) {
-      const own = blindLedger();
-      own.admit(jobId);
-      own.lane(jobId, '/lanes/job-1');
-      observeBlindSessionAccess(own.ledger, jobId, join(fixtures, file));
-      expect(blindCoverageOf(own.ledger, jobId), jobId).toMatchObject({ state: 'invalidated', qualifying: false, prohibitedAccess: 1 });
-      own.dispose();
-    }
+  /** One real transcript's absolute read, judged through the ledger against the job's recorded lane. */
+  function laneReadInvalidates(jobId: string, file: string): void {
+    const own = blindLedger();
+    own.admit(jobId);
+    own.lane(jobId, '/lanes/job-1');
+    observeBlindSessionAccess(own.ledger, jobId, join(fixtures, file));
+    expect(blindCoverageOf(own.ledger, jobId), jobId).toMatchObject({ state: 'invalidated', qualifying: false, prohibitedAccess: 1 });
+    own.dispose();
+  }
+
+  it('through the ledger, a pi session\'s absolute read inside the job\'s recorded lane invalidates coverage #contract:blind-read-invalidates:pi', () => {
+    laneReadInvalidates('job-pi-lane', 'pi-read.jsonl');
+  });
+
+  it('through the ledger, an absolute read inside the job\'s recorded lane — either spelling of it — invalidates coverage #contract:blind-read-invalidates:claude-code', () => {
+    laneReadInvalidates('job-claude-lane', 'claude-code-read.jsonl');
     const h = blindLedger();
     // The lane recorded through a link: a read naming its canonical path is still inside it.
     const dir = realpathSync(mkdtempSync(join(tmpdir(), 'gru-command-blind-lane-')));
