@@ -1,4 +1,6 @@
-import { readFileSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { lstatSync, readFileSync, readlinkSync, realpathSync, statSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import type { LedgerApi } from '../ledger/api.js';
 import {
   BlindInputRefusal,
@@ -271,7 +273,25 @@ export function admitBlindReview(input: {
     if (!sameTarget(sibling.targetSha, targetSha) || sibling.targetRef !== (input.targetRef?.trim() ?? null)) continue;
     if ((sibling.parentJobId ?? null) !== parentJobId) continue;
     if (sibling.status === 'blocked' || sibling.status === 'parked' || sibling.status === 'binned') continue;
-    const coverage = blindCoverageOf(ledger, sibling.id);
+    let coverage: BlindCoverage;
+    try {
+      coverage = blindCoverageOf(ledger, sibling.id);
+    } catch (error) {
+      // A sibling whose coverage cannot be read is never silently replaced.
+      refuse(
+        ledger,
+        { jobId: input.jobId, parentJobId },
+        new BlindInputRefusal({
+          code: 'blind_coverage_unreadable',
+          status: 409,
+          message: `blind coverage of sibling review "${sibling.id}" cannot be read: ${error instanceof Error ? error.message : String(error)}`,
+          violations: [],
+          correction: `Inspect and repair "${sibling.id}"'s ${BLIND_ACCESS_EVENT} events in the ledger (its coverage cannot be computed until they are readable), then commission again.`,
+          details: { coverage_job_id: sibling.id },
+        }),
+        rule.sha256,
+      );
+    }
     if (coverage.qualifying) {
       refuse(
         ledger,
@@ -315,6 +335,98 @@ function admittedOf(ledger: LedgerApi, jobId: string): AdmittedPayload | null {
   return event === null ? null : (event.payload as AdmittedPayload);
 }
 
+/** What makes two recorded prohibited reads the same read (#355). Events
+ * recorded before #355 carry no `session` and count as one unknown session. */
+const BLIND_READ_IDENTITY = {
+  event: ['source', 'session'],
+  entry: ['index', 'toolName', 'code', 'path', 'excerptSha256'],
+} as const;
+
+/** A transcript's identity for distinct-read counting: the sha256 of its
+ * canonical path, so a symlinked spelling of the same file is the same
+ * session, and the ledger never stores the local path itself. The path must
+ * be absolute; a transcript gone since it was read keeps its absolute
+ * spelling, and any other resolution failure is thrown. */
+export function blindSessionIdentity(sessionFile: string): string {
+  if (!isAbsolute(sessionFile)) throw new Error(`blind session file must be an absolute path (got ${JSON.stringify(sessionFile)})`);
+  return createHash('sha256').update(canonicalPathOf(sessionFile)).digest('hex');
+}
+
+/** A path's canonical form, even once it (or its directories) is gone: the
+ * nearest ancestor that still resolves, canonical, plus the names below it —
+ * and a link whose target is gone names that target, joined to the link's
+ * canonical directory WITHOUT lexical `..` collapse, so the OS's realpath
+ * walks it physically, as it did while the target existed. The links this
+ * walk follows itself are one count, capped; plain depth is bounded by the
+ * path itself. A `..` under a missing directory or a non-directory is refused
+ * by name, and any failure other than absence is raised. */
+function canonicalPathOf(path: string): string {
+  // One count of the links this walk follows itself — parents and targets
+  // alike — capped as the OS caps its own (MAXSYMLINKS is 32 to 40). A backstop:
+  // the OS's realpath of the whole path already followed each of them, and
+  // refuses a longer chain first wherever it counts them.
+  let hops = 0;
+  const walk = (current: string): string => {
+    try {
+      // The OS's own realpath: `..` after a link is walked physically (the
+      // default JavaScript realpath collapses it lexically).
+      return realpathSync.native(current);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      const parent = dirname(current);
+      if ((code !== 'ENOENT' && code !== 'ENOTDIR') || parent === current) throw error;
+      // `..` past a missing directory has no physical answer: never guessed lexically.
+      if (basename(current) === '..') {
+        // Named where it is met: a link's target may carry the `..`.
+        const where = current === path ? path : `${current} (resolving ${path})`;
+        throw new Error(`${where} climbs (..) out of ${code === 'ENOTDIR' ? 'something that is not a directory' : 'a directory that does not exist'} — it has no physical identity`, { cause: error });
+      }
+      const canonicalParent = walk(parent);
+      const link = danglingLinkTarget(current);
+      if (link === null) return join(canonicalParent, basename(current));
+      if ((hops += 1) > 40) throw Object.assign(new Error(`too many levels of links resolving ${path}`), { code: 'ELOOP' });
+      return walk(isAbsolute(link) ? link : `${canonicalParent === '/' ? '' : canonicalParent}/${link}`);
+    }
+  };
+  return walk(path);
+}
+
+/** What a symbolic link at `path` holds, or null when there is none (absent,
+ * or — only readlink can say so — replaced by a non-link meanwhile); any other
+ * failure is raised. */
+function danglingLinkTarget(path: string): string | null {
+  let isLink: boolean;
+  try {
+    isLink = lstatSync(path).isSymbolicLink();
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return null;
+    throw error;
+  }
+  if (!isLink) return null;
+  try {
+    return readlinkSync(path);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'EINVAL') return null;
+    throw error;
+  }
+}
+
+/** The identity a scan records: the canonical one, or — when the transcript
+ * path cannot be resolved — an explicit unresolved one, so a read that was
+ * scanned is never dropped for want of an identity (#356). */
+function scanSessionIdentity(sessionFile: string): string {
+  // Deliberately broad: the observer never throws and never drops a scanned
+  // read (#356). The fallback hashes the resolved path, so repeated scans of
+  // one unresolvable transcript count once.
+  try {
+    return blindSessionIdentity(sessionFile);
+  } catch {
+    return `unresolved:${createHash('sha256').update(resolve(sessionFile)).digest('hex')}`;
+  }
+}
+
 /**
  * Validity of one review job as blind coverage. Derived ONLY from the
  * admission and the observed-access facts; job status and report
@@ -329,8 +441,13 @@ export function blindCoverageOf(ledger: LedgerApi, jobId: string): BlindCoverage
       reasons: ['no blind-input admission was recorded for this job (historical or unclassified review)'],
     };
   }
-  const access = ledger.countJobEventsAndArrayFieldLength(jobId, BLIND_ACCESS_EVENT, 'prohibited');
-  const prohibited = access.total;
+  // Distinct reads (#355): a re-scan of the same transcript (a settle scan
+  // plus a late physical-completion scan) re-reports a read without growing
+  // the count; a read in another session, or a new one, still counts. An
+  // operator re-posting the same observation is the same read; events from
+  // before #355 carry no session and count as one unknown session.
+  const access = ledger.countJobEventsAndDistinctArrayEntries(jobId, BLIND_ACCESS_EVENT, 'prohibited', BLIND_READ_IDENTITY);
+  const prohibited = access.distinct;
   const base = {
     jobId,
     role: admitted.role,
@@ -376,6 +493,10 @@ export function recordObservedAccess(
   jobId: string,
   results: readonly ObservedToolResult[],
   source: 'session' | 'operator',
+  /** The identity of the transcript the results were read from (session
+   * scans, {@link blindSessionIdentity}): the same index in another session
+   * is another read. Operator posts carry none. */
+  session: string | null = null,
 ): BlindCoverage {
   const admitted = admittedOf(ledger, jobId);
   if (admitted === null || admitted.role !== 'blind' || admitted.rule === null) {
@@ -386,7 +507,7 @@ export function recordObservedAccess(
   ledger.appendCustomEvent({
     kind: BLIND_ACCESS_EVENT,
     jobId,
-    payload: { source, scanned: results.length, rule_sha256: rule.sha256, prohibited },
+    payload: { source, session, scanned: results.length, rule_sha256: rule.sha256, prohibited },
   });
   return blindCoverageOf(ledger, jobId);
 }
@@ -406,15 +527,15 @@ export function isAdmittedBlind(ledger: LedgerApi, jobId: string): boolean {
  * records nothing rather than inventing a clean pass.
  *
  * A resumed session's jsonl is cumulative, so a settle scan re-reads results
- * an earlier scan already saw. The derived verdict is idempotent (a nonzero
- * prohibited count invalidates either way), but `blindCoverageOf` SUMS the
- * prohibited arrays across every observation event, so the informational
- * `prohibitedAccess` count is cumulative, not distinct reads (issue #339,
- * accepted tradeoff: a delta scan would need persisted per-job offset state).
- * The same session can therefore be observed MORE THAN ONCE (a settle scan plus
- * a chained or independent physical-completion scan): scan scheduling is NOT
- * exactly-once. The single owner of the scan/classification logic is this
- * helper; the summoning schedule is not deduplicated.
+ * an earlier scan already saw, and the same session can be observed MORE THAN
+ * ONCE (a settle scan plus a chained or independent physical-completion
+ * scan): scan scheduling is deliberately NOT exactly-once, so a late retry or
+ * cancellation observation is never lost. Every scan appends its fact; the
+ * derived verdict is idempotent, and `blindCoverageOf` counts DISTINCT reads
+ * (session + tool-result index + classification + excerpt digest), so a
+ * re-scan never inflates the informational `prohibitedAccess` count
+ * (issue #355). The single owner of the scan/classification logic is this
+ * helper.
  */
 export function observeBlindSessionAccess(
   ledger: LedgerApi,
@@ -425,7 +546,7 @@ export function observeBlindSessionAccess(
   if (!isAdmittedBlind(ledger, jobId)) return;
   const results = readResults(sessionFile);
   if (results === null) return;
-  recordObservedAccess(ledger, jobId, results, 'session');
+  recordObservedAccess(ledger, jobId, results, 'session', sessionFile === null ? null : scanSessionIdentity(sessionFile));
 }
 
 const MAX_SESSION_BYTES = 64 * 1024 * 1024;
