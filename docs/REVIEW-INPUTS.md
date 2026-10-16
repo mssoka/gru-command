@@ -411,8 +411,10 @@ lifecycle fact — so a settled report read as independent coverage.
   carries a `BLIND INPUT PACKAGE` block with the exact diff and files, fenced and
   framed as data (a package file path holding a control, format — bidi,
   zero-width — separator, private-use or unassigned character is refused, so
-  nothing can escape a fence or disguise its heading; every blind refusal names a
-  path holding one as a line-safe JSON literal). The package bytes are kept
+  nothing can escape a fence or disguise its heading). A refusal's text names
+  every path as a JSON literal with each line-unsafe character escaped; a
+  violation's `where` (and a recorded read's `path`) holds a line-safe path as
+  written and any other as that literal, quotes included. The package bytes are kept
   (`review.blind-input-package`, written before the admission), so a fresh
   replacement reviewer spawned by provider recovery gets the same block; a resumed
   session already holds it. An attested reviewer whose package was not kept (one

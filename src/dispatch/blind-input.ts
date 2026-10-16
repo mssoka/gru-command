@@ -292,16 +292,18 @@ export function normalizeRepoPath(path: string): string {
   return path.replace(/\\/gu, '/').split('/').filter((segment) => segment !== '.' && segment !== '').join('/');
 }
 
-/** A path as a refusal names it: quoted as written when it is line-safe;
- * otherwise as one JSON literal with every line-unsafe character escaped
- * (the classes silas_action text refuses — control, format, separator,
- * private-use, unassigned — astral ones too), so no refusal can break,
- * reorder or hide a line. */
+/** A path as a refusal names it: always one JSON literal (a quote or a
+ * backslash in it stays unambiguous), with every line-unsafe character
+ * escaped too (the classes silas_action text refuses — control, format,
+ * separator, private-use, unassigned — astral ones too), so no refusal can
+ * break, reorder or hide a line. */
 export function shownPath(path: string): string {
-  return hasLineUnsafe(path) ? lineSafeLiteral(path) : `"${path}"`;
+  return lineSafeLiteral(path);
 }
 
-/** A path as a violation's `where` holds it: as written when line-safe. */
+/** A path as a violation's `where` (or a recorded read's `path`) holds it:
+ * as written when line-safe; otherwise its line-safe JSON literal, quotes
+ * included, which marks it as escaped. */
 export function shownWhere(path: string): string {
   return hasLineUnsafe(path) ? lineSafeLiteral(path) : path;
 }
@@ -581,7 +583,7 @@ function splitDiff(text: string): { readonly sections: readonly DiffSection[]; r
       path = group.header.path;
     }
     if (group.named.old.some((name) => name !== oldPath) || group.named.new.some((name) => name !== path)) {
-      return fail(group, group.at, `names "${oldPath}" → "${path}", but its rename, copy or ---/+++ lines name another path`);
+      return fail(group, group.at, `names ${shownPath(oldPath)} → ${shownPath(path)}, but its rename, copy or ---/+++ lines name another path`);
     }
     sections.push({ path, oldPath, text: group.lines.join('\n'), body: group.body.join('\n'), hunks: group.hunks });
   };
@@ -1011,5 +1013,5 @@ function readPathViolation(rawPath: string, rule: BlindIsolationRule, laneRoots:
     }
   }
   const detail = classifyBlindPath(path, rule);
-  return detail === null ? null : { path, detail };
+  return detail === null ? null : { path: shownWhere(path), detail };
 }

@@ -550,6 +550,19 @@ describe('git\'s diff section grammar (#360 R5-B1 round 1)', () => {
     // ...and a grep hit naming such a path, as recorded access.
     const [hit] = scanObservedAccess([{ index: 0, toolName: 'bash', text: 'docs/issues/a\u202eb.md:1:x' }], DEFAULT_BLIND_ISOLATION_RULE);
     expect(hit).toMatchObject({ code: 'excluded-path-read', path: '"docs/issues/a\\u202eb.md"' });
+    // ...and a direct read of one inside the checkout, path and detail alike.
+    const [direct] = scanObservedAccess([{ index: 0, toolName: 'read', text: 'x', readPath: '/lanes/job-1/docs/issues/a\u202eb.md' }], DEFAULT_BLIND_ISOLATION_RULE, ['/lanes/job-1']);
+    expect(direct).toMatchObject({ path: '"docs/issues/a\\u202eb.md"' });
+    expect(direct!.detail).not.toMatch(/\u202e/u);
+    // Every classifyBlindPath branch names it line-safe: excluded, invalid, a header disagreeing with its path lines.
+    const excluded = evaluate(['diff --git "a/docs/issues/x\\342\\200\\256.md" "b/docs/issues/x\\342\\200\\256.md"', '@@ -0,0 +1 @@', '+x', ''].join('\n')).violations;
+    expect(excluded.map((v) => v.detail)).toEqual([expect.stringMatching(/^"docs\/issues\/x\\u202e\.md" is (?:private job material|excluded by the parent isolation rule)/u)]);
+    expect(classifyBlindPath('../x\u202e.ts', DEFAULT_BLIND_ISOLATION_RULE)).toBe('invalid package path "../x\\u202e.ts" (must be a relative path inside the repository)');
+    expect(classifyBlindPath('vendor/x\u202e.ts', { ...DEFAULT_BLIND_ISOLATION_RULE, excludeGlobs: ['vendor/**'] })).toBe('"vendor/x\\u202e.ts" is excluded by the parent isolation rule');
+    const disagreeing = evaluate(['diff --git "a/src/x\\342\\200\\256.ts" "b/src/x\\342\\200\\256.ts"', '--- "a/src/y.ts"', '+++ "b/src/x\\342\\200\\256.ts"', '@@ -0,0 +1 @@', '+x', ''].join('\n')).violations;
+    expect(disagreeing.map((v) => v.detail)).toEqual([expect.stringContaining('names "src/x\\u202e.ts" → "src/x\\u202e.ts", but its rename')]);
+    // A quote in an otherwise line-safe path stays unambiguous too.
+    expect(classifyBlindPath('_bmad-output/a" is fine "b.md', DEFAULT_BLIND_ISOLATION_RULE)).toBe('"_bmad-output/a\\" is fine \\"b.md" is private job material (planning, spec, review or triage artifacts)');
   });
 
   it('`.` or `./` names the repository, never a package file; a file path holding a control character is refused', () => {

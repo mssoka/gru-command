@@ -622,6 +622,17 @@ describe('blind review commissioning (issue #316)', () => {
     expect((hidden.json['violations'] as { code: string; where: string; detail: string }[])).toEqual([
       expect.objectContaining({ code: 'unbound-package', where: '"src/x\\u200b.ts"', detail: expect.stringMatching(/^the diff names "src\/x\\u200b\.ts", which /u) }),
     ]);
+    // A forged hunk on a really changed path holding one is named line-safe too.
+    const zw = h.repo.commitFile('src/x\u200b.ts', 'export const zw = 1;\n', 'zero-width path');
+    const zwDiff = h.repo.git(['diff', '--no-color', next, zw]);
+    const zwForged = await call(h.port, 'POST', '/api/dispatch', blindReview('rev-zw-hunk', {
+      repo_path: h.repo.path, target_sha: zw,
+      input_package: { base_sha: next, target_sha: zw, diff: { text: zwDiff.replace('+export const zw = 1;', '+export const zw = 2;') } },
+    }));
+    expect(zwForged.status).toBe(422);
+    expect((zwForged.json['violations'] as { code: string; where: string; detail: string }[])).toEqual([
+      expect.objectContaining({ code: 'unbound-package', where: '"src/x\\u200b.ts"', detail: expect.stringMatching(/^the hunk at \+1 shows lines that are not "src\/x\\u200b\.ts" at /u) }),
+    ]);
     // Neither does a file the target tree does not hold, nor a diff path the range never changes.
     const strays = await call(h.port, 'POST', '/api/dispatch', blindReview('rev-strays', {
       repo_path: h.repo.path, target_sha: target,
