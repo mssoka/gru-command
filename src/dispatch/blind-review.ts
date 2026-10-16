@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { readFileSync, realpathSync, statSync } from 'node:fs';
-import { isAbsolute, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import type { LedgerApi } from '../ledger/api.js';
 import {
   BlindInputRefusal,
@@ -286,7 +286,7 @@ export function admitBlindReview(input: {
           status: 409,
           message: `blind coverage of sibling review "${sibling.id}" cannot be read: ${error instanceof Error ? error.message : String(error)}`,
           violations: [],
-          correction: `Inspect and repair "${sibling.id}"'s blind-access events (GET /api/dispatch/jobs/${sibling.id}/blind-coverage), then commission again.`,
+          correction: `Inspect and repair "${sibling.id}"'s ${BLIND_ACCESS_EVENT} events in the ledger (its coverage cannot be computed until they are readable), then commission again.`,
           details: { coverage_job_id: sibling.id },
         }),
         rule.sha256,
@@ -354,9 +354,22 @@ export function blindSessionIdentity(sessionFile: string): string {
     canonical = realpathSync(sessionFile);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    canonical = resolve(sessionFile);
+    // Gone since it was read: its directory, canonical, plus its own name —
+    // the same identity it had while it existed.
+    try { canonical = join(realpathSync(dirname(sessionFile)), basename(sessionFile)); } catch { canonical = resolve(sessionFile); }
   }
   return createHash('sha256').update(canonical).digest('hex');
+}
+
+/** The identity a scan records: the canonical one, or — when the transcript
+ * path cannot be resolved — an explicit unresolved one, so a read that was
+ * scanned is never dropped for want of an identity (#356). */
+function scanSessionIdentity(sessionFile: string): string {
+  try {
+    return blindSessionIdentity(sessionFile);
+  } catch {
+    return `unresolved:${createHash('sha256').update(sessionFile).digest('hex')}`;
+  }
 }
 
 /**
@@ -478,7 +491,7 @@ export function observeBlindSessionAccess(
   if (!isAdmittedBlind(ledger, jobId)) return;
   const results = readResults(sessionFile);
   if (results === null) return;
-  recordObservedAccess(ledger, jobId, results, 'session', sessionFile === null ? null : blindSessionIdentity(sessionFile));
+  recordObservedAccess(ledger, jobId, results, 'session', sessionFile === null ? null : scanSessionIdentity(sessionFile));
 }
 
 const MAX_SESSION_BYTES = 64 * 1024 * 1024;

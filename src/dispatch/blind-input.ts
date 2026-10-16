@@ -269,14 +269,14 @@ function extensionOf(path: string): string {
   return dot <= 0 ? '' : base.slice(dot).toLowerCase();
 }
 
-/** Why a package path is not admissible, or null when it is. */
 /** A path whose SHAPE alone puts it outside the package: empty, absolute,
- * a `..` segment or a NUL. */
-function outsidePackageShape(rawPath: string): boolean {
-  const path = rawPath.replace(/\\/gu, '/');
-  return path === '' || path.startsWith('/') || /(^|\/)\.\.(\/|$)/u.test(path) || path.includes('\0');
+ * a `..` segment or a NUL (either slash direction). */
+function outsidePackageShape(path: string): boolean {
+  const slashed = path.replace(/\\/gu, '/');
+  return slashed === '' || slashed.startsWith('/') || /(^|\/)\.\.(\/|$)/u.test(slashed) || slashed.includes('\0');
 }
 
+/** Why a package path is not admissible, or null when it is. */
 export function classifyBlindPath(rawPath: string, rule: BlindIsolationRule): string | null {
   const path = rawPath.replace(/\\/gu, '/');
   if (outsidePackageShape(path)) {
@@ -602,14 +602,16 @@ export interface ProhibitedAccess {
  * starts with whitespace (an indented stack frame is not a grep result). */
 const GREP_LINE = /^((?:\.\/)?[^\s:][^:\n]*):\d+[:-]/u;
 
-/** Candidate paths judged per spaced grep line: enough for any real path
- * (every word and every path component), bounded for a pathological line. */
+/** Candidate paths judged per spaced grep line: the whole capture plus its
+ * LAST starts (the path is a suffix, so padding before it can never push it
+ * out), bounded for a pathological line. */
 const MAX_GREP_CANDIDATES = 64;
 /** A spaced candidate whose SHAPE may still classify it: it starts like an
- * absolute or parent path AND ends in a file name with an extension — a real
- * spaced path (`/Users/a b/notes.md`), never a clock time or prose
+ * absolute or parent path AND its last path component has no whitespace — a
+ * real spaced path (`/Users/a b/notes.md`, `/Users/a b/Makefile`), never a
+ * clock time or prose, whose words follow the last slash
  * (`/var/log/app.log started at 10`). */
-const FILE_LIKE_OUTSIDE = /^(?:\/|\.\.\/)[\s\S]*\/[^/\s]*[^/\s.]\.[A-Za-z0-9]{1,10}$/u;
+const FILE_LIKE_OUTSIDE = /^(?:\/|\.\.\/)[\s\S]*\/[^/\s]+$/u;
 
 /** The paths a tool-result line may name as a grep hit, each with whether
  * its SHAPE alone (absolute, `..`) may classify it. A space-free capture is
@@ -624,12 +626,12 @@ function grepPathCandidates(line: string): readonly { readonly path: string; rea
   if (captured === undefined) return [];
   const path = captured.trimEnd();
   if (!/\s/u.test(path)) return [{ path, byShape: true }];
-  const starts = [0];
+  const later: number[] = [];
   for (const match of path.matchAll(/(?<=[\s/])\S/gu)) {
-    if (starts.length >= MAX_GREP_CANDIDATES) break;
-    starts.push(match.index);
+    later.push(match.index);
+    if (later.length > MAX_GREP_CANDIDATES - 1) later.shift();
   }
-  return starts.map((at) => {
+  return [0, ...later].map((at) => {
     const candidate = path.slice(at);
     return { path: candidate, byShape: FILE_LIKE_OUTSIDE.test(candidate) };
   });

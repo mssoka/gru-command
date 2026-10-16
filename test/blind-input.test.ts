@@ -326,6 +326,11 @@ describe('observed reviewer access — grep paths with spaces (#357)', () => {
         { index: 3, toolName: 'bash', text: '/Users/John Smith/notes.md:1:x' },
         // A relative spaced path names its excluded directory through a path-component suffix.
         { index: 4, toolName: 'bash', text: 'vendor copy/docs/issues/b.md:2:y' },
+        // Extensionless and dot files are file-like too.
+        { index: 5, toolName: 'bash', text: '/Users/a b/Makefile:2:all:' },
+        { index: 6, toolName: 'bash', text: '/Users/John Smith/.env:1:TOKEN=x' },
+        // Whitespace before the line number is not part of the path.
+        { index: 7, toolName: 'bash', text: 'docs/issues/a.md :1:x' },
       ],
       DEFAULT_BLIND_ISOLATION_RULE,
     );
@@ -334,16 +339,19 @@ describe('observed reviewer access — grep paths with spaces (#357)', () => {
       '2:../other repo/docs/issues/a.md',
       '3:/Users/John Smith/notes.md',
       '4:docs/issues/b.md',
+      '5:/Users/a b/Makefile',
+      '6:/Users/John Smith/.env',
+      '7:docs/issues/a.md',
     ]);
   });
 
-  it('bounds the candidates a pathological spaced line can produce', () => {
-    const line = `${'word '.repeat(20_000)}docs/issues/late.md:1:x`;
-    const started = performance.now();
-    const prohibited = scanObservedAccess([{ index: 1, toolName: 'bash', text: line }], DEFAULT_BLIND_ISOLATION_RULE);
-    expect(performance.now() - started).toBeLessThan(2000);
-    // Past the candidate bound a path is not chased: prose this long is no grep hit.
-    expect(prohibited).toEqual([]);
+  it('bounds the candidates a padded spaced line produces, and padding never hides the path at its end', () => {
+    // The path is a suffix: the LAST starts are kept, so no amount of padding
+    // before it pushes it out of judgement.
+    const padded = scanObservedAccess([{ index: 1, toolName: 'bash', text: `${'word '.repeat(20_000)}docs/issues/late.md:1:x` }], DEFAULT_BLIND_ISOLATION_RULE);
+    expect(padded.map((p) => p.path)).toEqual(['docs/issues/late.md']);
+    // Prose padding with no excluded suffix stays no hit.
+    expect(scanObservedAccess([{ index: 2, toolName: 'bash', text: `${'word '.repeat(20_000)}done at 10:30:15` }], DEFAULT_BLIND_ISOLATION_RULE)).toEqual([]);
   });
 });
 

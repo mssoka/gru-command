@@ -409,6 +409,8 @@ records a LATER read. Any prohibited observation makes the coverage
 `invalidated`; the report, its findings, its status and its disposition are left
 exactly as recorded (no replay, no debt revival). A blind commission for a target
 whose blind coverage is already `qualifying` under the same parent answers
-`409 blind_coverage_owned` naming the job to reuse; invalidated coverage may be
+`409 blind_coverage_owned` naming the job to reuse (or `409
+blind_coverage_unreadable` naming a sibling whose recorded blind-access facts
+cannot be counted — repair them in the ledger first); invalidated coverage may be
 replaced and the new admission lists what it replaces.
 

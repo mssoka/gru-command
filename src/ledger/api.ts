@@ -1510,7 +1510,10 @@ export class LedgerApi {
       )
       .get(jobId, kind, jobId, kind, jobId, kind, jobId, kind) as { events: number; malformedEvents: number; malformedEntries: number; distinctEntries: number };
     } catch (error) {
-      throw new Error(`job "${jobId}" has a ${kind} event whose payload cannot be read as JSON (${String(error)}) — refusing to count; inspect the ledger`, { cause: error });
+      // Only a corrupt payload is named as one; any other database failure
+      // (busy, closed) stays what it is.
+      if (!/malformed JSON/iu.test(String(error))) throw error;
+      throw new Error(`job "${jobId}" has a ${kind} event whose payload cannot be read as JSON — refusing to count; inspect the ledger`, { cause: error });
     }
     if (row.malformedEvents > 0 || row.malformedEntries > 0) {
       throw new Error(

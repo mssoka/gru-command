@@ -199,6 +199,24 @@ describe('observeBlindSessionAccess — repeated scans count distinct reads (iss
     expect(() => blindSessionIdentity('relative/session.jsonl')).toThrow(/must be an absolute path/u);
     const gone = join(tmpdir(), `gru-gone-${String(process.pid)}`, 'session.jsonl');
     expect(blindSessionIdentity(gone)).toMatch(/^[0-9a-f]{64}$/u);
+    // Gone through a linked directory: the same identity it had while it existed.
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), 'blind-gone-')));
+    try {
+      writeFileSync(join(dir, 'a.jsonl'), '');
+      symlinkSync(dir, `${dir}-alias`);
+      const living = blindSessionIdentity(join(`${dir}-alias`, 'a.jsonl'));
+      rmSync(join(dir, 'a.jsonl'));
+      expect(blindSessionIdentity(join(`${dir}-alias`, 'a.jsonl'))).toBe(living);
+    } finally { rmSync(`${dir}-alias`, { force: true }); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('a scanned read is recorded even when its transcript path cannot be resolved (#356)', () => {
+    const h = blindLedger();
+    h.admit('job-cumulative');
+    observeBlindSessionAccess(h.ledger, 'job-cumulative', 'relative/session.jsonl', () => [result(0, PROHIBITED)]);
+    expect(blindCoverageOf(h.ledger, 'job-cumulative')).toMatchObject({ state: 'invalidated', prohibitedAccess: 1 });
+    expect((h.ledger.latestJobEvent('job-cumulative', BLIND_ACCESS_EVENT)?.payload as { session: string }).session).toMatch(/^unresolved:[0-9a-f]{64}$/u);
+    h.dispose();
   });
 
   it('refuses a malformed identity key by name instead of interpolating it', () => {
