@@ -709,6 +709,9 @@ test.describe('compact owner-first board — synthetic geometry proof', () => {
         '<div id="left-out" style="left:-0.3125px;top:70px;width:20px;height:20px"></div>',
         '<div id="right-in" style="left:380.25px;top:100px;width:20px;height:20px"></div>',
         '<div id="right-out" style="left:380.3125px;top:130px;width:20px;height:20px"></div>',
+        // 0.34375 (22/64) px over: past 1/3 (half a device pixel at 1.5x) but
+        // inside 1/2 (at 1x) — it tells a 0.5/ratio sliver from a 1x one.
+        '<div id="bottom-third" style="left:160px;top:250.34375px;width:20px;height:50px"></div>',
       ].join(''));
       expect(await page.evaluate(() => [window.devicePixelRatio, window.innerWidth, window.innerHeight]), 'this proof runs at 2x in 400×300').toEqual([2, 400, 300]);
       // The boxes sit exactly where the CSS puts them (no device-pixel
@@ -741,21 +744,25 @@ test.describe('compact owner-first board — synthetic geometry proof', () => {
       // infinite (which would silently zero the sliver) — for a missing
       // selector too.
       const setRatio = (ratio: number) => page.evaluate((value) => { Object.defineProperty(window, 'devicePixelRatio', { value, configurable: true }); }, ratio);
-      for (const ratio of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      // At 2x the 0.34375 overhang is out (a 1/4 sliver)...
+      expect(await hitTarget(page, '#bottom-third')).toEqual({ found: true, inViewport: false, hit: true });
+      for (const ratio of [0, -0, -1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
         await setRatio(ratio);
         for (const id of ['#bottom-in', '#missing']) {
-          // The exact first line Playwright reports: `0` must never pass for `0.5`.
-          const exact = `page.evaluate: Error: hitTarget: unusable devicePixelRatio ${String(ratio)}`.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
-          await expect(hitTarget(page, id), `${String(ratio)} ${id}`).rejects.toThrow(new RegExp(`^${exact}$`, 'mu'));
+          // The exact refusal line (whatever prefix Playwright wraps it in):
+          // `0` must never pass for `0.5`.
+          const label = Object.is(ratio, -0) ? '-0' : String(ratio);
+          await expect(hitTarget(page, id), `${label} ${id}`).rejects.toThrow(new RegExp(`(?:^|: )Error: hitTarget: unusable devicePixelRatio ${String(ratio)}$`, 'mu'));
         }
       }
-      // A positive fractional ratio is usable, and its sliver is its own:
-      // at 1.5x half a device pixel is 1/3 CSS px, so the 0.3125 overhang
-      // that is OUT at 2x is IN here.
+      // A positive fractional ratio is usable, and its sliver is 0.5/ratio:
+      // at 1.5x that is 1/3 CSS px, so the 0.3125 overhang OUT at 2x is IN
+      // here, while the 0.34375 one — IN under a 1x half pixel — stays OUT.
       await setRatio(1.5);
       expect(await hitTarget(page, '#missing')).toEqual({ found: false, inViewport: false, hit: false });
       expect(await hitTarget(page, '#bottom-in')).toEqual({ found: true, inViewport: true, hit: true });
       expect(await hitTarget(page, '#bottom-out')).toEqual({ found: true, inViewport: true, hit: true });
+      expect(await hitTarget(page, '#bottom-third')).toEqual({ found: true, inViewport: false, hit: true });
       // The page's ratio is left overridden: nothing below this point may use it.
     } finally {
       await context.close();
