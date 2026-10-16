@@ -117,7 +117,7 @@ describe('Claude Code cessation through the registry (runtime-neutral contract)'
   });
 
   it('a child transport error is unknown and holds the permit until the same child\'s late close releases it once (#359)', async () => {
-    for (const wrapped of [false, true]) {
+    for (const wrapped of [false, true]) try {
       vi.useRealTimers();
       const child = fakeChild();
       const fx = claudeRegistry(child, { wrapped });
@@ -147,7 +147,29 @@ describe('Claude Code cessation through the registry (runtime-neutral contract)'
       expect(released).toBe(1);
       child.emit('close', null, 'SIGTERM');
       expect(released).toBe(1);
-    }
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('an error and a close in the same tick — before the disposal settles — are ceased, never stuck on the error (#359)', async () => {
+    for (const wrapped of [false, true]) try {
+      vi.useRealTimers();
+      const child = fakeChild();
+      const fx = claudeRegistry(child, { wrapped });
+      const { registry } = fx;
+      let released = 0;
+      registry.onResidentReleased(() => { released += 1; });
+      const resident = await spawnBusy(fx);
+      vi.useFakeTimers();
+      const disposing = resident.dispose();
+      for (let tick = 0; tick < 20 && vi.mocked(child.kill).mock.calls.length === 0; tick += 1) await Promise.resolve();
+      expect(child.kill).toHaveBeenCalled();
+      child.emit('error', new Error('spawn transport failed'));
+      closeChild(child, null, 'SIGTERM');
+      await vi.advanceTimersByTimeAsync(60);
+      await disposing;
+      expect(adapterCessationEvidence(resident), `wrapped ${String(wrapped)}`).toBe('ceased');
+      expect([registry.residents.occupied, released], `wrapped ${String(wrapped)}`).toEqual([0, 1]);
+    } finally { vi.useRealTimers(); }
   });
 
   it('through the production fallback wrapper, a deadline without close holds the permit until the same child\'s late close releases it once (#359)', async () => {

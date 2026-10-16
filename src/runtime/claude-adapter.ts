@@ -1192,6 +1192,10 @@ export class ClaudeCodeHandle implements AgentHandle {
       });
       await Promise.race([childExited, exitDeadline]).then(() => {
         if (exitKind === 'close-observed') this.cessationKind = 'close-observed';
+        // A close that already came — in the same tick as the error, before
+        // this settlement ran, so the late latch saw 'live' — is still the
+        // original child's proof: never overwritten by 'error' or 'deadline'.
+        else if (live.exitCode !== null || live.signalCode !== null || this.closedVerificationChildren.has(live)) this.cessationKind = 'close-observed-late';
         else if (exitKind === 'error') this.cessationKind = 'error';
         else this.cessationKind = 'deadline';
       });
