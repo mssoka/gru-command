@@ -258,6 +258,8 @@ describe('property modes, host approval, repair and CI (fake runner unit control
     expect(refusal({ toJSON() { throw unprintable; } })).toMatchObject({ message: 'a directive value has no JSON form (an unprintable error)', cause: unprintable });
     const long = refusal({ toJSON() { throw new Error('y'.repeat(1000)); } }).message;
     expect(long).toBe(`a directive value has no JSON form (${`Error: ${'y'.repeat(1000)}`.slice(0, 256)}…)`);
+    // One line: line breaks, controls and bidi overrides become spaces.
+    expect(refusal({ toJSON() { throw new Error('line\none\u2028two\u202e\u0007'); } }).message).toBe('a directive value has no JSON form (Error: line one two )');
   });
 
   it('the reviewer prompt\'s evidence wrapper renders exactly the bounded line, names absence, and refuses unissued results (#379)', async () => {

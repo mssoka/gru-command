@@ -233,10 +233,11 @@ lane all-or-nothing (#380). A mid-way failure removes the files and exactly
 the parent directories it created. A file it overwrote is restored, bytes
 and mode, by renaming a re-created copy over it: read-only files included,
 a link swapped in at the target replaced and never written through, and the
-target path never without the original bytes. A file whose mode and bytes
-still match is left exactly as it was. A failed restore step removes its
-copy (and names the copy if even that fails). An incomplete rollback fails
-loud with the original error and every cause.
+target path never without the original bytes. A file still on its own
+inode with its mode and bytes is left exactly as it was; one that cannot be
+checked is restored. A failed restore step removes its copy (and names the
+copy if even that fails), and every other file is still restored. An
+incomplete rollback fails loud with the original error and every cause.
 
 **Owner-service lifecycle (#380).** The owner HTTP service keeps campaigns
 process-local. At its retention cap (128), once the new proposal has
@@ -250,7 +251,8 @@ proposal leaves any record and before the entry leaves memory; a failed
 audit write evicts and records nothing and names the directory to fix. A
 proposal whose own record cannot be written withdraws the eviction record
 and anything under its own fresh directory; if that cleanup fails too, the
-refusal names the record to remove by hand. A later read of an evicted id
+refusal names exactly what is left to remove by hand. A failed eviction
+audit removes its own partial record. A later read of an evicted id
 by its own job says it was evicted (the last 1024
 evicted ids are remembered; an older one reads as unknown).
 Every campaign view carries

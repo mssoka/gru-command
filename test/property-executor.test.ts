@@ -124,7 +124,7 @@ describe('host property executor (positive sandbox controls on macOS; other host
     expect(NONCE_READ_BUDGET_MS).toBe(5000);
     // A whole number of 10 ms steps, bounded: a startup never waits without end.
     for (const bad of [5, 15, 60_010, Number.NaN, 2 ** 53]) expect(() => nonceReaderSource(bad), String(bad)).toThrow(/^nonce reader budget must be a multiple of 10 ms from 10 to 60000, got /u);
-    for (const good of [10, 50, 60_000]) expect(() => nonceReaderSource(good), String(good)).not.toThrow();
+    for (const good of [10, 50, 60_000, NONCE_READ_BUDGET_MS]) expect(() => nonceReaderSource(good), String(good)).not.toThrow();
   });
   it('refuses an invalid host receipt retention bound and reports the bound it enforces (#377)', () => {
     for (const bad of [0, -1, 1.5, 256 * 1024 * 1024 + 1]) expect(() => createPropertyExecutor({ maxRetainedOutputBytes: bad })).toThrow(/receipt retention bound/);
@@ -183,12 +183,12 @@ describe('host property executor (positive sandbox controls on macOS; other host
     expect(() => propertyWorkspaceIdentity(f.root)).toThrow(/^external\/absolute symlink refused: node_modules\/vitest\/dist$/u);
     const outcome = await Promise.resolve().then(() => executor.executePlan({ ...input, adapter, approval: executor.approvePlan(input) }))
       .then((result) => ({ result, caught: null }), (caught: unknown) => ({ result: null, caught }));
-    if (process.platform === 'darwin') {
+    if (resolveSandboxBackend().executable !== null) {
       // ...and a real run refuses before any copy exists.
       expect(outcome.result).toBeNull();
       expect(String(outcome.caught)).toMatch(/external\/absolute symlink refused: node_modules\/vitest\/dist/u);
     } else {
-      // Without the sandbox, nothing runs at all.
+      // Without a sandbox backend, nothing runs at all.
       expect(outcome.result).toMatchObject({ executed: false, refusal: { kind: 'not-run' } });
     }
   });

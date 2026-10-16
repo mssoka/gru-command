@@ -8,42 +8,46 @@ import type { PropertyExecutionPlan } from '../../../../src/property/types.js';
 export function scenarioRepo(script: string, options: { readonly reportersModule?: boolean | 'directory' | 'symlink' | 'linked-dist' } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'property-unit-')));
   const extra: string[] = [];
-  const git = (args: string[]) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: 'pipe' }).trim();
-  mkdirSync(join(root, 'node_modules', 'vitest'), { recursive: true });
-  mkdirSync(join(root, 'node_modules', '.bin'), { recursive: true });
-  mkdirSync(join(root, 'test'), { recursive: true });
-  writeFileSync(join(root, 'node_modules', 'vitest', 'vitest.mjs'), script);
-  // The real layout's reporters module beside the runner (the host config
-  // imports it; fake runners frame their own report and never load it).
-  if (options.reportersModule === 'linked-dist') {
-    // A regular reporters.js, but reached through a dist directory linked
-    // outside the repository.
-    const outside = realpathSync(mkdtempSync(join(tmpdir(), 'property-unit-outside-dist-')));
-    extra.push(outside);
-    writeFileSync(join(outside, 'reporters.js'), 'export class JsonReporter {}\n');
-    symlinkSync(outside, join(root, 'node_modules', 'vitest', 'dist'));
-  } else if (options.reportersModule !== false) {
-    const dist = join(root, 'node_modules', 'vitest', 'dist');
-    mkdirSync(dist, { recursive: true });
-    if (options.reportersModule === 'directory') mkdirSync(join(dist, 'reporters.js', 'inner'), { recursive: true });
-    else if (options.reportersModule === 'symlink') {
-      writeFileSync(join(dist, 'real-reporters.js'), 'export class JsonReporter {}\n');
-      symlinkSync('real-reporters.js', join(dist, 'reporters.js'));
-    } else writeFileSync(join(dist, 'reporters.js'), 'export class JsonReporter {}\n');
-  }
-  symlinkSync('../vitest/vitest.mjs', join(root, 'node_modules', '.bin', 'vitest'));
-  writeFileSync(join(root, 'package.json'), '{"type":"module"}\n');
-  writeFileSync(join(root, '.gitignore'), 'node_modules/\n');
-  writeFileSync(join(root, 'test', 'placeholder'), 'tracked\n');
-  git(['init', '-b', 'main']); git(['add', '.']);
-  git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'unit control']);
-  const plan: PropertyExecutionPlan = {
-    adapterId: 'vitest-fast-check', command: join(root, 'node_modules', 'vitest', 'vitest.mjs'),
-    args: ['run', '--reporter=json', 'test/contract.test.ts'], cwd: root,
-    envAllowlist: ['PATH', 'CI', 'TZ'], executable: true, refusalReason: null,
-    budget: { maxIterations: 20, maxShrinkSteps: 100, runTimeoutMs: 10_000, maxOutputBytes: 32_768 },
-  };
-  return { root, git, plan, cleanup: () => { for (const dir of [root, ...extra]) rmSync(dir, { recursive: true, force: true }); } };
+  const cleanup = (): void => { for (const dir of [root, ...extra]) rmSync(dir, { recursive: true, force: true }); };
+  // A setup step that fails removes what was already made.
+  try {
+    const git = (args: string[]) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: 'pipe' }).trim();
+    mkdirSync(join(root, 'node_modules', 'vitest'), { recursive: true });
+    mkdirSync(join(root, 'node_modules', '.bin'), { recursive: true });
+    mkdirSync(join(root, 'test'), { recursive: true });
+    writeFileSync(join(root, 'node_modules', 'vitest', 'vitest.mjs'), script);
+    // The real layout's reporters module beside the runner (the host config
+    // imports it; fake runners frame their own report and never load it).
+    if (options.reportersModule === 'linked-dist') {
+      // A regular reporters.js, but reached through a dist directory linked
+      // outside the repository.
+      const outside = realpathSync(mkdtempSync(join(tmpdir(), 'property-unit-outside-dist-')));
+      extra.push(outside);
+      writeFileSync(join(outside, 'reporters.js'), 'export class JsonReporter {}\n');
+      symlinkSync(outside, join(root, 'node_modules', 'vitest', 'dist'));
+    } else if (options.reportersModule !== false) {
+      const dist = join(root, 'node_modules', 'vitest', 'dist');
+      mkdirSync(dist, { recursive: true });
+      if (options.reportersModule === 'directory') mkdirSync(join(dist, 'reporters.js', 'inner'), { recursive: true });
+      else if (options.reportersModule === 'symlink') {
+        writeFileSync(join(dist, 'real-reporters.js'), 'export class JsonReporter {}\n');
+        symlinkSync('real-reporters.js', join(dist, 'reporters.js'));
+      } else writeFileSync(join(dist, 'reporters.js'), 'export class JsonReporter {}\n');
+    }
+    symlinkSync('../vitest/vitest.mjs', join(root, 'node_modules', '.bin', 'vitest'));
+    writeFileSync(join(root, 'package.json'), '{"type":"module"}\n');
+    writeFileSync(join(root, '.gitignore'), 'node_modules/\n');
+    writeFileSync(join(root, 'test', 'placeholder'), 'tracked\n');
+    git(['init', '-b', 'main']); git(['add', '.']);
+    git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'unit control']);
+    const plan: PropertyExecutionPlan = {
+      adapterId: 'vitest-fast-check', command: join(root, 'node_modules', 'vitest', 'vitest.mjs'),
+      args: ['run', '--reporter=json', 'test/contract.test.ts'], cwd: root,
+      envAllowlist: ['PATH', 'CI', 'TZ'], executable: true, refusalReason: null,
+      budget: { maxIterations: 20, maxShrinkSteps: 100, runTimeoutMs: 10_000, maxOutputBytes: 32_768 },
+    };
+    return { root, git, plan, cleanup };
+  } catch (error) { cleanup(); throw error; }
 }
 /** A fake runner reports through the host's authenticated channel the way
  * the host config's reporter does (#378): the per-run nonce arrives on fd 3

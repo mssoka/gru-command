@@ -13,6 +13,7 @@ const { hooks } = vi.hoisted(() => ({ hooks: {
   beforeRestoreRename: null as ((from: string, to: string) => void) | null,
   beforeRm: null as ((path: string) => void) | null,
   beforeReadFile: null as ((path: string) => void) | null,
+  beforeLstat: null as ((path: string) => void) | null,
 } }));
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>();
@@ -24,6 +25,7 @@ vi.mock('node:fs', async (importOriginal) => {
     },
     rmSync: (...args: Parameters<typeof actual.rmSync>) => { hooks.beforeRm?.(String(args[0])); return actual.rmSync(...args); },
     readFileSync: ((...args: Parameters<typeof actual.readFileSync>) => { hooks.beforeReadFile?.(String(args[0])); return actual.readFileSync(...args); }) as typeof actual.readFileSync,
+    lstatSync: ((...args: Parameters<typeof actual.lstatSync>) => { hooks.beforeLstat?.(String(args[0])); return actual.lstatSync(...args); }) as typeof actual.lstatSync,
   };
 });
 const fs = await import('node:fs');
@@ -31,7 +33,7 @@ const { applyOverlayFilesAllOrNothing } = await import('../src/property/overlay.
 
 const dirs: string[] = [];
 afterEach(() => {
-  hooks.beforeRestoreRename = null; hooks.beforeRm = null; hooks.beforeReadFile = null;
+  hooks.beforeRestoreRename = null; hooks.beforeRm = null; hooks.beforeReadFile = null; hooks.beforeLstat = null;
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 function workspace(): string {
@@ -96,6 +98,57 @@ describe('overlay rollback restore (#380)', () => {
     const [copy] = leftovers(root);
     expect(restore.message).toBe(`restoring ${join(root, 'test/existing.test.mjs')} failed and its copy ${join(root, 'test', copy!)} could not be removed`);
     expect(restore.errors.map((cause) => (cause as NodeJS.ErrnoException).code)).toEqual(['EPERM', 'EBUSY']);
+  });
+
+  it('one failed restore never stops the rest: every other overwritten file is restored', () => {
+    const root = workspace();
+    writeFileSync(join(root, 'test/second.test.mjs'), 'second original\n');
+    let renames = 0;
+    hooks.beforeRestoreRename = () => { renames += 1; if (renames === 1) throw Object.assign(new Error('rename refused'), { code: 'EPERM' }); };
+    const files = [
+      { path: 'test/existing.test.mjs', content: 'overlay\n' },
+      { path: 'test/second.test.mjs', content: 'overlay two\n' },
+      { path: 'test/occupied.replay.json', content: '{}\n' },
+    ];
+    let error: unknown = null;
+    try { applyOverlayFilesAllOrNothing({ workspaceRoot: root, files }); } catch (caught) { error = caught; }
+    expect(renames).toBe(2);
+    expect((error as AggregateError).errors.slice(1).map((cause) => (cause as NodeJS.ErrnoException).code)).toEqual(['EPERM']);
+    // The first file's restore failed; the second was still restored.
+    expect(readFileSync(join(root, 'test/existing.test.mjs'), 'utf8')).toBe('overlay\n');
+    expect(readFileSync(join(root, 'test/second.test.mjs'), 'utf8')).toBe('second original\n');
+    expect(leftovers(root)).toEqual([]);
+  });
+
+  it('a file the apply never reached is skipped only on its own inode: a same-bytes replacement is restored', () => {
+    const root = workspace();
+    const later = join(root, 'test/later.test.mjs');
+    writeFileSync(later, 'later original\n');
+    const files = [
+      { path: 'test/existing.test.mjs', content: 'overlay\n' },
+      { path: 'test/occupied.replay.json', content: '{}\n' },
+      { path: 'test/later.test.mjs', content: 'never written\n' },
+    ];
+    // Untouched and on its own inode: skipped (the inode is unchanged).
+    const before = statSync(later).ino;
+    expect(() => applyOverlayFilesAllOrNothing({ workspaceRoot: root, files })).toThrow(/non-file entry/u);
+    expect(statSync(later).ino).toBe(before);
+    // Swapped for a same-bytes copy once the rollback has begun (the first
+    // restore is under way): restored.
+    let swapped: number | null = null;
+    let rollingBack = false;
+    hooks.beforeRestoreRename = () => { rollingBack = true; };
+    hooks.beforeLstat = (path) => {
+      if (path !== later || swapped !== null || !rollingBack) return;
+      writeFileSync(`${later}.copy`, 'later original\n');
+      fs.renameSync(`${later}.copy`, later);
+      swapped = statSync(later).ino;
+    };
+    expect(() => applyOverlayFilesAllOrNothing({ workspaceRoot: root, files })).toThrow(/non-file entry/u);
+    expect(swapped).not.toBeNull();
+    expect(statSync(later).ino).not.toBe(swapped);
+    expect(readFileSync(later, 'utf8')).toBe('later original\n');
+    expect(leftovers(root)).toEqual([]);
   });
 
   it('a target the untouched-check cannot read is restored, never skipped', () => {

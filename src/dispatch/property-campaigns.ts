@@ -13,6 +13,15 @@ import type { DirectiveRoutingDeps } from './fix-directive.js';
 import type { RecoveryNotifications } from './rebrief-recovery.js';
 import type { WaveRunner } from './perkins.js';
 
+/** An error as one bounded line of text, even when it cannot print. */
+function printable(error: unknown): string {
+  let text: string;
+  try { text = String(error); } catch { text = 'an unprintable error'; }
+  const line = text.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, ' ');
+  const points = [...line];
+  return points.length > 300 ? `${points.slice(0, 300).join('')}…` : line;
+}
+
 export class PropertyOwnerActionError extends Error {
   constructor(message: string, options?: ErrorOptions) { super(message, options); this.name = 'PropertyOwnerActionError'; }
 }
@@ -190,7 +199,7 @@ export function createPropertyCampaignService(options: PropertyCampaignServiceOp
       const entry: Entry = { id, jobId, spec, heads: roots(spec).map(head), treeDigests: roots(spec).map((root) => propertyWorkspaceIdentity(root).digest), configHash: propertyConfigIdentity(spec.candidateRoot), artifactsDir: join(options.artifactsRoot, id), state: 'proposed', report: null, retainedPaths: [] };
       const victim = entries.size >= maxRetainedProposals ? evictionVictim(entries.values(), jobId, activeId) : undefined;
       if (entries.size >= maxRetainedProposals && victim === undefined) throw new PropertyOwnerActionError('process-local proposal retention limit reached: every retained campaign is a pending proposal, an unresolved blocker, a repair awaiting retention or the campaign being decided right now; decide those first');
-      let evictionAudit: string | null = null;
+      let evictionAudit: { readonly path: string; readonly victimId: string } | null = null;
       if (victim !== undefined) {
         // The eviction is audited beside the victim's own records FIRST —
         // before the new proposal leaves any record and before the victim
@@ -200,9 +209,12 @@ export function createPropertyCampaignService(options: PropertyCampaignServiceOp
           mkdirSync(victim.artifactsDir, { recursive: true, mode: 0o700 });
           writeFileSync(path, `${JSON.stringify({ evicted: view(victim), byProposal: id }, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
         } catch (error) {
-          throw new PropertyOwnerActionError(`the cache is full and campaign ${victim.id} could not be evicted: its audit could not be written in ${victim.artifactsDir} (${String(error)}); fix that directory, or decide a pending campaign, then propose again`, { cause: error });
+          // A partial record is removed: nothing is left that claims an eviction.
+          let partial = '';
+          try { rmSync(path, { force: true }); } catch (removeError) { partial = ` (its partial record ${path} could not be removed: ${printable(removeError)} — remove it by hand)`; }
+          throw new PropertyOwnerActionError(`the cache is full and campaign ${victim.id} could not be evicted: its audit could not be written in ${victim.artifactsDir} (${printable(error)}); fix that directory, or decide a pending campaign, then propose again${partial}`, { cause: error });
         }
-        evictionAudit = path;
+        evictionAudit = { path, victimId: victim.id };
       }
       try {
         audit(entry);
@@ -211,13 +223,15 @@ export function createPropertyCampaignService(options: PropertyCampaignServiceOp
         // so the eviction record is withdrawn with it, and whatever the
         // failed audit left under the proposal's fresh directory goes too. A
         // cleanup that fails itself fails loud, carrying the original error.
+        // Only what is still on disk is named for removal by hand.
         const cleanup: unknown[] = [];
+        const leftovers: string[] = [];
         if (evictionAudit !== null) {
-          try { rmSync(evictionAudit, { force: true }); } catch (withdrawError) { cleanup.push(withdrawError); }
+          try { rmSync(evictionAudit.path, { force: true }); } catch (withdrawError) { cleanup.push(withdrawError); leftovers.push(`${evictionAudit.path} (campaign ${evictionAudit.victimId} was not evicted)`); }
         }
-        try { rmSync(entry.artifactsDir, { recursive: true, force: true }); } catch (removeError) { cleanup.push(removeError); }
+        try { rmSync(entry.artifactsDir, { recursive: true, force: true }); } catch (removeError) { cleanup.push(removeError); leftovers.push(entry.artifactsDir); }
         if (cleanup.length > 0) {
-          throw new PropertyOwnerActionError(`proposal ${id} could not be recorded (${String(error)}) and its cleanup failed: ${cleanup.map(String).join('; ')}${evictionAudit === null ? '' : ` — remove ${evictionAudit} by hand; campaign ${victim!.id} was not evicted`}`, { cause: new AggregateError([error, ...cleanup], 'proposal record and cleanup failed') });
+          throw new PropertyOwnerActionError(`proposal ${id} could not be recorded (${printable(error)}) and its cleanup failed: ${cleanup.map(printable).join('; ')} — remove ${leftovers.join(' and ')} by hand`, { cause: new AggregateError([error, ...cleanup], 'proposal record and cleanup failed') });
         }
         throw error;
       }

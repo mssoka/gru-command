@@ -133,9 +133,12 @@ function jsonOf(value: unknown): string {
   } catch (error) {
     // A BigInt, a cycle or a throwing toJSON: named, never a raw error, and
     // the detail is bounded (the value is sandbox-controlled).
+    // One line: controls, format and separator characters become spaces;
+    // the cut never splits a surrogate pair.
     let detail: string;
     try { detail = String(error); } catch { detail = 'an unprintable error'; }
-    throw new PropertyPipelineError(`a directive value has no JSON form (${detail.length > 256 ? `${detail.slice(0, 256)}…` : detail})`, { cause: error });
+    const points = [...detail.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, ' ')];
+    throw new PropertyPipelineError(`a directive value has no JSON form (${points.length > 256 ? `${points.slice(0, 256).join('')}…` : points.join('')})`, { cause: error });
   }
   if (json === undefined) throw new PropertyPipelineError('a directive value has no JSON form');
   return json;

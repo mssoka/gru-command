@@ -180,23 +180,23 @@ export function applyOverlayFiles(input: {
  * rollback itself fails — an AggregateError carrying it and every cause. */
 export function applyOverlayFilesAllOrNothing(input: Parameters<typeof applyOverlayFiles>[0]): OverlayIdentity {
   const createdDirs = new Set<string>();
-  const prior: { readonly target: string; readonly state: 'absent' | 'file' | 'other'; readonly content: Buffer | null; readonly mode: number | null }[] = [];
+  const prior: { readonly target: string; readonly state: 'absent' | 'file' | 'other'; readonly content: Buffer | null; readonly mode: number | null; readonly inode: string | null }[] = [];
   const rollback = (error: unknown): never => {
     const failures: unknown[] = [];
-    for (const { target, state, content, mode } of prior) {
+    for (const { target, state, content, mode, inode } of prior) {
       // A pre-existing non-file entry is never written (applyOverlayFiles
       // refuses it), so it is never touched here either.
       if (state === 'other') continue;
       try {
         if (state === 'file' && content !== null && mode !== null) {
           // A file the failed apply never touched is left exactly as it is
-          // (same inode, links and times).
-          // Judged by mode and bytes; a check that cannot read the target
-          // never skips — the target is then restored.
+          // (same inode, links and times): judged by its device and inode,
+          // mode and bytes. The check is only a shortcut — one that cannot
+          // read the target never skips, and the target is restored.
           let untouched = false;
           try {
             const current = lstatSync(target, { throwIfNoEntry: false });
-            untouched = current?.isFile() === true && (current.mode & 0o7777) === mode && readFileSync(target).equals(content);
+            untouched = current?.isFile() === true && `${String(current.dev)}:${String(current.ino)}` === inode && (current.mode & 0o7777) === mode && readFileSync(target).equals(content);
           } catch { untouched = false; }
           if (untouched) continue;
           // Re-created beside the target (a short name, never too long), then
@@ -229,9 +229,10 @@ export function applyOverlayFilesAllOrNothing(input: Parameters<typeof applyOver
     for (const file of input.files) {
       const target = resolveOverlayTarget(input.workspaceRoot, file.path, (dir) => { createdDirs.add(dir); });
       const current = lstatSync(target, { throwIfNoEntry: false });
-      prior.push({ target, state: current === undefined ? 'absent' : current.isFile() ? 'file' : 'other',
-        content: current !== undefined && current.isFile() ? readFileSync(target) : null,
-        mode: current !== undefined && current.isFile() ? current.mode & 0o7777 : null });
+      const regular = current !== undefined && current.isFile();
+      prior.push({ target, state: current === undefined ? 'absent' : regular ? 'file' : 'other',
+        content: regular ? readFileSync(target) : null, mode: regular ? current.mode & 0o7777 : null,
+        inode: regular ? `${String(current.dev)}:${String(current.ino)}` : null });
     }
     return applyOverlayFiles(input);
   } catch (error) {

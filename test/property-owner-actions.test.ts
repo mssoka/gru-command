@@ -2,13 +2,20 @@ import { chmodSync, existsSync, readdirSync, readFileSync, rmSync, writeFileSync
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-// node:fs passes through; a test may make one removal fail (#380).
-const { fsHooks } = vi.hoisted(() => ({ fsHooks: { beforeRm: null as ((path: string) => void) | null } }));
+// node:fs passes through; a test may make one removal or write fail (#380).
+const { fsHooks } = vi.hoisted(() => ({ fsHooks: {
+  beforeRm: null as ((path: string) => void) | null,
+  beforeWrite: null as ((path: string) => void) | null,
+} }));
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>();
-  return { ...actual, rmSync: (...args: Parameters<typeof actual.rmSync>) => { fsHooks.beforeRm?.(String(args[0])); return actual.rmSync(...args); } };
+  return {
+    ...actual,
+    rmSync: (...args: Parameters<typeof actual.rmSync>) => { fsHooks.beforeRm?.(String(args[0])); return actual.rmSync(...args); },
+    writeFileSync: ((...args: Parameters<typeof actual.writeFileSync>) => { fsHooks.beforeWrite?.(String(args[0])); return actual.writeFileSync(...args); }) as typeof actual.writeFileSync,
+  };
 });
-afterEach(() => { fsHooks.beforeRm = null; });
+afterEach(() => { fsHooks.beforeRm = null; fsHooks.beforeWrite = null; });
 import { createPropertyCampaignService, evictable, PropertyOwnerActionError, EVICTED_IDS_REMEMBERED, evictionVictim, nextAction, rememberEvicted } from '../src/dispatch/property-campaigns.js';
 import { forceCoversBlocker, laneIsBusy, snapshotForceAuthorization } from '../src/dispatch/branch-idle.js';
 import { unitCampaign, commit, UNIT_PATH } from './fixtures/property/executor/campaign.js';
@@ -256,16 +263,47 @@ describe('ordinary owner HTTP property actions (controlled minion; no JSON issua
       let cleanupRefusal: unknown = null;
       try { service.propose(h.jobId, { campaign: f.reviewed }); } catch (caught) { cleanupRefusal = caught; } finally { chmodSync(h.serviceOptions.artifactsRoot, 0o700); fsHooks.beforeRm = null; }
       expect(cleanupRefusal).toBeInstanceOf(PropertyOwnerActionError);
-      expect((cleanupRefusal as Error).message).toMatch(new RegExp(`^proposal campaign-[0-9a-f-]+ could not be recorded \\(.*EACCES.*\\) and its cleanup failed: Error: record busy — remove .*owner-evicted-[0-9a-f-]+\\.json by hand; campaign ${a.id} was not evicted$`, 'u'));
+      expect((cleanupRefusal as Error).message).toMatch(new RegExp(`^proposal campaign-[0-9a-f-]+ could not be recorded \\(.*EACCES.*\\) and its cleanup failed: Error: record busy — remove .*owner-evicted-[0-9a-f-]+\\.json \\(campaign ${a.id} was not evicted\\) by hand$`, 'u'));
       expect(((cleanupRefusal as Error).cause as AggregateError).errors.map((cause) => (cause as NodeJS.ErrnoException).code)).toEqual(['EACCES', 'EBUSY']);
       expect(evictedAudit()).toHaveLength(1);
       rmSync(join(auditDir, evictedAudit()[0]!));
+      expect(service.read(h.jobId, a.id).state).toBe('retained');
+      // A failed eviction audit removes its own partial record.
+      fsHooks.beforeWrite = (path) => {
+        if (!path.includes('owner-evicted-')) return;
+        fsHooks.beforeWrite = null;
+        writeFileSync(path, '{"partial');
+        throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+      };
+      expect(() => service.propose(h.jobId, { campaign: f.reviewed })).toThrow(/could not be evicted: its audit could not be written in .*\(Error: disk full\); fix that directory/u);
+      expect(evictedAudit()).toEqual([]);
       expect(service.read(h.jobId, a.id).state).toBe('retained');
       // Once the audit can be written, the same proposal evicts A by name.
       const c = service.propose(h.jobId, { campaign: f.reviewed });
       expect(evictedAudit()).toHaveLength(1);
       expect(() => service.read(h.jobId, a.id)).toThrow(/was evicted to make room/u);
       expect(service.read(h.jobId, c.id).state).toBe('proposed');
+    } finally { await service.dispose(); }
+  });
+
+  it('a proposal whose own record fails after its directory exists leaves nothing, and names exactly what it could not remove (#380)', async () => {
+    const { f, h } = await setup();
+    const service = createPropertyCampaignService(h.serviceOptions);
+    try {
+      const before = readdirSync(h.serviceOptions.artifactsRoot).sort();
+      // The directory is made, then the record write fails: the directory goes too.
+      fsHooks.beforeWrite = (path) => { if (path.includes('owner-proposed-')) throw Object.assign(new Error('disk full'), { code: 'ENOSPC' }); };
+      expect(() => service.propose(h.jobId, { campaign: f.reviewed })).toThrow(/^disk full$/u);
+      expect(readdirSync(h.serviceOptions.artifactsRoot).sort()).toEqual(before);
+      // When that removal fails too, the directory is named for removal by hand.
+      fsHooks.beforeRm = (path) => { if (/campaign-[0-9a-f-]+$/u.test(path)) throw Object.assign(new Error('directory busy'), { code: 'EBUSY' }); };
+      let refusal: unknown = null;
+      try { service.propose(h.jobId, { campaign: f.reviewed }); } catch (caught) { refusal = caught; } finally { fsHooks.beforeRm = null; fsHooks.beforeWrite = null; }
+      expect(refusal).toBeInstanceOf(PropertyOwnerActionError);
+      const left = readdirSync(h.serviceOptions.artifactsRoot).filter((name) => !before.includes(name));
+      expect(left).toHaveLength(1);
+      expect((refusal as Error).message).toBe(`proposal ${left[0]!} could not be recorded (Error: disk full) and its cleanup failed: Error: directory busy — remove ${join(h.serviceOptions.artifactsRoot, left[0]!)} by hand`);
+      expect(((refusal as Error).cause as AggregateError).errors.map((cause) => (cause as NodeJS.ErrnoException).code)).toEqual(['ENOSPC', 'EBUSY']);
     } finally { await service.dispose(); }
   });
 
