@@ -1,7 +1,7 @@
-import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { createPropertyCampaignService, evictable, nextAction } from '../src/dispatch/property-campaigns.js';
+import { createPropertyCampaignService, evictable, evictionVictim, nextAction, rememberEvicted } from '../src/dispatch/property-campaigns.js';
 import { forceCoversBlocker, laneIsBusy, snapshotForceAuthorization } from '../src/dispatch/branch-idle.js';
 import { unitCampaign, commit, UNIT_PATH } from './fixtures/property/executor/campaign.js';
 import { ownerService } from './fixtures/property/owner-service.js';
@@ -142,7 +142,7 @@ describe('ordinary owner HTTP property actions (controlled minion; no JSON issua
       const a = service.propose(h.jobId, { campaign: f.reviewed });
       const b = service.propose(h.jobId, { campaign: f.reviewed });
       // Both are pending proposals: nothing may be evicted.
-      expect(() => service.propose(h.jobId, { campaign: f.reviewed })).toThrow(/every retained campaign is a pending proposal, an unresolved blocker or a repair awaiting retention/);
+      expect(() => service.propose(h.jobId, { campaign: f.reviewed })).toThrow(/every retained campaign is a pending proposal, an unresolved blocker, a repair awaiting retention or the campaign being decided right now/);
       // A executes in disabled mode: settled and non-blocking, so evictable.
       const executed = await service.decide(h.jobId, a.id, 'execute', { decision: 'approve', expectedHead });
       expect(executed).toMatchObject({ state: 'executed', report: { blocking: false }, nextAction: { kind: 'none' } });
@@ -158,7 +158,72 @@ describe('ordinary owner HTTP property actions (controlled minion; no JSON issua
       expect(JSON.parse(readFileSync(join(h.serviceOptions.artifactsRoot, a.id, audit[0]!), 'utf8'))).toMatchObject({ evicted: { id: a.id, state: 'executed' }, byProposal: c.id });
       expect(service.read(h.jobId, b.id).state).toBe('proposed');
       expect(service.read(h.jobId, c.id).state).toBe('proposed');
+      // Another job asking for the evicted id learns nothing about it.
+      expect(() => service.read('another-job', a.id)).toThrow(/^no process-local campaign for this job\/id/u);
       expect(() => createPropertyCampaignService({ ...h.serviceOptions, maxRetainedProposals: 0 })).toThrow(/1\.\.128/);
+    } finally { await service.dispose(); }
+  });
+
+  it('picks the eviction victim: oldest evictable, the proposing job\'s own first, never the one being decided (#380)', () => {
+    const entry = (id: string, jobId: string, state: 'proposed' | 'executed' | 'retained' | 'failed', blocking = false) => ({ id, jobId, state, report: state === 'proposed' ? null : ({ blocking }) as never });
+    const entries = [entry('p1', 'job-a', 'proposed'), entry('x1', 'job-b', 'executed'), entry('b1', 'job-a', 'executed', true), entry('r1', 'job-a', 'retained'), entry('f1', 'job-a', 'failed')];
+    expect(evictionVictim(entries, 'job-a', null)?.id).toBe('r1');
+    expect(evictionVictim(entries, 'job-c', null)?.id).toBe('x1');
+    expect(evictionVictim(entries, 'job-a', 'r1')?.id).toBe('f1');
+    expect(evictionVictim(entries, 'job-b', 'x1')?.id).toBe('r1');
+    expect(evictionVictim([entry('p1', 'job-a', 'proposed'), entry('b1', 'job-a', 'executed', true)], 'job-a', null)).toBeUndefined();
+    expect(evictionVictim([entry('x1', 'job-a', 'executed')], 'job-a', 'x1')).toBeUndefined();
+  });
+
+  it('remembers evicted ids within a bound, forgetting the oldest first (#380)', () => {
+    const evicted = new Map<string, number>();
+    for (let index = 0; index < 5; index += 1) rememberEvicted(evicted, `id-${String(index)}`, index, 3);
+    expect([...evicted.keys()]).toEqual(['id-2', 'id-3', 'id-4']);
+    rememberEvicted(evicted, 'id-2', 22, 3); // re-remembered: now the newest
+    rememberEvicted(evicted, 'id-5', 5, 3);
+    expect([...evicted.entries()]).toEqual([['id-4', 4], ['id-2', 22], ['id-5', 5]]);
+  });
+
+  it('never evicts the campaign being decided, and a failed eviction audit evicts nothing (#380)', async () => {
+    const { f, h, expectedHead } = await setup();
+    let releaseClear!: () => void;
+    const clearing = new Promise<void>((resolve) => { releaseClear = resolve; });
+    const host = {
+      approveReviewedCampaign: () => ({}),
+      execute: async () => ({ blocking: false, candidateSha: expectedHead }),
+      repair: async (report: unknown) => report,
+      retainReviewedRegression: () => [],
+    };
+    const wave = {
+      assertWriterAdmissible: (jobId: string) => h.wave.assertWriterAdmissible(jobId),
+      clearLaneForWriter: async (input: { readonly jobId: string; readonly writer: string }) => { await clearing; return h.wave.clearLaneForWriter(input); },
+    };
+    const service = createPropertyCampaignService({ ...h.serviceOptions, wave: wave as never, maxRetainedProposals: 2 }, host as never);
+    try {
+      const a = service.propose(h.jobId, { campaign: f.reviewed });
+      await service.decide(h.jobId, a.id, 'execute', { decision: 'approve', expectedHead });
+      const b = service.propose(h.jobId, { campaign: f.reviewed });
+      // A is settled and evictable — but it is being decided right now.
+      const retaining = service.decide(h.jobId, a.id, 'retain', { decision: 'approve', expectedHead });
+      expect(() => service.propose(h.jobId, { campaign: f.reviewed })).toThrow(/or the campaign being decided right now; decide those first/u);
+      expect(service.read(h.jobId, a.id).state).toBe('executed');
+      releaseClear();
+      expect(await retaining).toMatchObject({ id: a.id, state: 'retained' });
+      // An eviction whose audit cannot be written evicts nothing: A stays.
+      const auditDir = join(h.serviceOptions.artifactsRoot, a.id);
+      const evictedAudit = () => readdirSync(auditDir).filter((name) => name.startsWith('owner-evicted-'));
+      chmodSync(auditDir, 0o500);
+      try {
+        expect(() => service.propose(h.jobId, { campaign: f.reviewed })).toThrow(/EACCES|permission denied/iu);
+      } finally { chmodSync(auditDir, 0o700); }
+      expect(evictedAudit()).toEqual([]);
+      expect(service.read(h.jobId, a.id).state).toBe('retained');
+      expect(service.read(h.jobId, b.id).state).toBe('proposed');
+      // Once the audit can be written, the same proposal evicts A by name.
+      const c = service.propose(h.jobId, { campaign: f.reviewed });
+      expect(evictedAudit()).toHaveLength(1);
+      expect(() => service.read(h.jobId, a.id)).toThrow(/was evicted to make room/u);
+      expect(service.read(h.jobId, c.id).state).toBe('proposed');
     } finally { await service.dispose(); }
   });
 

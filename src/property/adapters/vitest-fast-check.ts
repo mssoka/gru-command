@@ -458,6 +458,8 @@ export function interpretVitestJsonReceipt(raw: RawExecutionReceipt, plan: Prope
   // Every receipt carries the nonce-authenticated report (#378): only it is
   // parsed — stdout, which the code under test can write, never is. A
   // missing/ambiguous frame is no report at all.
+  // A receipt without the field is a caller bug, never "no report".
+  if (raw.report !== null && typeof raw.report !== 'string') throw new TypeError('a raw execution receipt must carry its host-framed report as a string, or null when there is none');
   const report = raw.report === null ? null : parseVitestReport(raw.report);
   if (report === null) {
     const diagnostic = raw.exitCode !== 0 ? recognizedDiagnostic(raw.stderr) : null;

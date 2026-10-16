@@ -4,7 +4,7 @@ import fs, { existsSync, linkSync, mkdirSync, readFileSync, symlinkSync, writeFi
 import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createBoundedPropertyCapture, createPropertyExecutor, createReceiptRetention, framedRunnerReport, isSealedExecutionReceipt, resolveSandboxBackend, validatePlanAgainstHostApproval } from '../src/property/executor.js';
+import { createBoundedPropertyCapture, createPropertyExecutor, createReceiptRetention, framedRunnerReport, isSealedExecutionReceipt, noReportReasons, NONCE_READER_SOURCE, ReceiptRetentionError, resolveSandboxBackend, validatePlanAgainstHostApproval } from '../src/property/executor.js';
 import { VITEST_FAST_CHECK_ADAPTER as adapter } from '../src/property/adapters/vitest-fast-check.js';
 import { applyOverlayFiles, applyOverlayFilesAllOrNothing } from '../src/property/overlay.js';
 import { buildSourceIdentity } from '../src/property/receipts.js';
@@ -39,7 +39,7 @@ describe('host property executor (positive sandbox controls on macOS; other host
   it('allocates capture storage only for bytes actually kept, never 2 × the cap up front (#377)', () => {
     const source = `const POLICY={maxMaxOutputBytes:8388608};global.gc();const before=process.memoryUsage().arrayBuffers;const capture=(${createBoundedPropertyCapture.toString()})(8388608);capture.push('stdout',Buffer.from('small output'));global.gc();console.log(JSON.stringify({allocated:process.memoryUsage().arrayBuffers-before,capacity:capture.capacityBytes,stdout:capture.finish().stdout}));`;
     const result = JSON.parse(execFileSync(process.execPath, ['--expose-gc', '--input-type=module', '-e', source], { encoding: 'utf8', timeout: 15_000, env: { PATH: '/usr/bin:/bin', LANG: 'C' } }));
-    expect(result.capacity).toBe(4096); // grows with output, from one 4 KiB step
+    expect(result.capacity).toBeLessThanOrEqual(64 * 1024); // grows with output; nothing near the 8 MiB cap up front
     expect(result.allocated).toBeLessThan(1024 * 1024); // a 16 MiB preallocation would show here
     expect(result.stdout).toBe('small output');
   });
@@ -58,7 +58,8 @@ describe('host property executor (positive sandbox controls on macOS; other host
     retention.add('d', 'D', 10); retention.add('e', 'E', 10); // 4 receipts > 3: the oldest goes
     expect([retention.get('b'), retention.get('c'), retention.get('d'), retention.get('e'), retention.size]).toEqual([undefined, 'C', 'D', 'E', 3]);
     // A receipt that alone exceeds the byte bound is refused by name; nothing changes.
-    expect(() => retention.add('huge', 'H', 500)).toThrow(/a 500-byte receipt exceeds the 100-byte retention bound/u);
+    expect(() => retention.add('huge', 'H', 500)).toThrow(ReceiptRetentionError);
+    expect(() => retention.add('huge', 'H', 500)).toThrow(/^a 500-byte receipt exceeds the 100-byte retention bound$/u);
     expect([retention.size, retention.retainedBytes, retention.evicted]).toEqual([3, 60, 2]);
     // Re-adding an id replaces its bytes instead of double-counting them.
     retention.add('c', 'C2', 30);
@@ -67,6 +68,53 @@ describe('host property executor (positive sandbox controls on macOS; other host
     retention.get('d'); retention.add('f', 'F', 10);
     expect([retention.get('e'), retention.get('d'), retention.get('f'), retention.evicted]).toEqual([undefined, 'D', 'F', 3]);
     expect(retention.get(undefined)).toBeUndefined();
+  });
+  it('a completed run whose receipt exceeds the retention bound is reported by name, never issued (#377)', async () => {
+    const f = fixture(`process.stdout.write('y'.repeat(6000))`);
+    const executor = createPropertyExecutor({ maxRetainedOutputBytes: 1024 });
+    const input = { plan: f.plan, repoRoot: f.root, packageDir: f.root };
+    const pending = executor.executePlan({ ...input, adapter, approval: executor.approvePlan(input) });
+    if (process.platform !== 'darwin') { expect((await pending).executed).toBe(false); return; }
+    const error = await pending.then(() => null, (caught: unknown) => caught);
+    expect(error).toBeInstanceOf(ReceiptRetentionError);
+    expect(String(error)).toMatch(/^ReceiptRetentionError: the run completed \([a-z-]+\) but its receipt was not issued: a \d+-byte receipt exceeds the 1024-byte retention bound; raise the host retention bound or lower max_output_bytes$/u);
+    expect(executor.retention()).toMatchObject({ receipts: 0, retainedOutputBytes: 0 });
+  });
+  it('names every reason a run has no authenticated report (#378)', () => {
+    expect(noReportReasons({ stdoutTruncated: false, nonceChannelError: null })).toEqual(['no host-framed report: the run printed no single complete nonce frame']);
+    expect(noReportReasons({ stdoutTruncated: true, nonceChannelError: null })).toEqual(['no host-framed report: stdout reached the output cap before the frame closed']);
+    expect(noReportReasons({ stdoutTruncated: false, nonceChannelError: 'Error: EPIPE' })).toEqual(['no host-framed report: host report channel failed: Error: EPIPE']);
+    expect(noReportReasons({ stdoutTruncated: true, nonceChannelError: 'Error: EPIPE' })).toEqual([
+      'no host-framed report: stdout reached the output cap before the frame closed',
+      'no host-framed report: host report channel failed: Error: EPIPE',
+    ]);
+  });
+  it('reads the fd-3 nonce through EAGAIN within its budget, and a close failure never masks the read error (#378)', () => {
+    type Step = number | string | Error;
+    const errno = (code: string): Error => Object.assign(new Error(code), { code });
+    const reader = new Function('readSync', 'closeSync', `${NONCE_READER_SOURCE}\nreturn nonce;`) as (read: (fd: number, buffer: Buffer, offset: number) => number, close: (fd: number) => void) => string;
+    const run = (steps: readonly Step[], closeError: Error | null = null) => {
+      const closed: number[] = [];
+      const queue = [...steps];
+      const read = (fd: number, buffer: Buffer, offset: number): number => {
+        expect(fd).toBe(3);
+        const step = queue.shift() ?? 0;
+        if (step instanceof Error) throw step;
+        if (typeof step === 'string') return buffer.write(step, offset);
+        return step;
+      };
+      const close = (fd: number) => { closed.push(fd); if (closeError !== null) throw closeError; };
+      return { result: (() => { try { return reader(read, close); } catch (error) { return error; } })(), closed };
+    };
+    const nonce = 'c'.repeat(64);
+    // A not-yet-written non-blocking channel is retried, then read whole, then closed.
+    expect(run([errno('EAGAIN'), errno('EAGAIN'), `${nonce}\n`, 0])).toEqual({ result: nonce, closed: [3] });
+    // Any other read error is the channel's failure — and still closes fd 3.
+    expect(run([errno('EBADF')])).toMatchObject({ result: { code: 'EBADF' }, closed: [3] });
+    // A close failure never masks the read's own error...
+    expect(run([errno('EIO')], errno('EBADF'))).toMatchObject({ result: { code: 'EIO' } });
+    // ...and is the failure when the read itself succeeded.
+    expect(run([`${nonce}\n`, 0], errno('EBADF'))).toMatchObject({ result: { code: 'EBADF' } });
   });
   it('refuses an invalid host receipt retention bound and reports the bound it enforces (#377)', () => {
     for (const bad of [0, -1, 1.5, 256 * 1024 * 1024 + 1]) expect(() => createPropertyExecutor({ maxRetainedOutputBytes: bad })).toThrow(/receipt retention bound/);
@@ -84,6 +132,7 @@ describe('host property executor (positive sandbox controls on macOS; other host
     if (!measured.executed) throw new Error(measured.refusal.reason);
     const bound = Math.floor(probe.retention().retainedOutputBytes * 1.5);
     expect(probe.retention().retainedOutputBytes).toBe(Buffer.byteLength(JSON.stringify(measured.receipt))); // the WHOLE receipt counts
+    const size = (receipt: unknown) => Buffer.byteLength(JSON.stringify(receipt));
     const executor = createPropertyExecutor({ maxRetainedOutputBytes: bound });
     const execute = async () => {
       const input = { plan: f.plan, repoRoot: f.root, packageDir: f.root };
@@ -94,6 +143,10 @@ describe('host property executor (positive sandbox controls on macOS; other host
     expect(executor.resolveReceiptRef(first.ref)).toBe(first.receipt);
     const second = await execute();
     if (!second.executed) throw new Error(second.refusal.reason);
+    // The premise, measured rather than assumed: each fits, both do not.
+    expect(size(first.receipt)).toBeLessThanOrEqual(bound);
+    expect(size(second.receipt)).toBeLessThanOrEqual(bound);
+    expect(size(first.receipt) + size(second.receipt)).toBeGreaterThan(bound);
     expect(executor.resolveReceiptRef(first.ref)).toBeNull(); // evicted: consumers fail closed
     expect(executor.resolveReceiptRef(second.ref)).toBe(second.receipt);
     expect(executor.retention()).toMatchObject({ receipts: 1, maxRetainedOutputBytes: bound, evicted: 1 });
@@ -267,6 +320,49 @@ describe('host property executor (positive sandbox controls on macOS; other host
     applyOverlayFilesAllOrNothing({ workspaceRoot: f.root, files: files.slice(0, 2) });
     expect(readFileSync(join(f.root, 'test/existing.test.mjs'), 'utf8')).toBe('overlay bytes\n');
     expect(readFileSync(join(f.root, 'test/new.regression.test.mjs'), 'utf8')).toBe('wrapper\n');
+  });
+  it('rolls back only the directories it made: a later refused path leaves no debris and no false rollback failure (#380)', () => {
+    const f = fixture();
+    const files = [
+      { path: 'test/made/here/a.test.mjs', content: 'a\n' },
+      // Refused by path: its missing parent `test/never` is never created.
+      { path: 'test/never/../../../escape.test.mjs', content: 'x\n' },
+    ];
+    const error = (() => { try { applyOverlayFilesAllOrNothing({ workspaceRoot: f.root, files }); return null; } catch (caught) { return caught; } })();
+    expect(error).not.toBeInstanceOf(AggregateError);
+    expect(String(error)).toMatch(/overlay path must be a safe relative path/u);
+    expect(existsSync(join(f.root, 'test/made'))).toBe(false);
+    expect(existsSync(join(f.root, 'test/never'))).toBe(false);
+  });
+  // Permission bits do not bind root, so these two need an ordinary user.
+  const asUser = process.getuid?.() !== 0;
+  it.runIf(asUser)('restores a read-only original exactly, bytes and mode (#380)', () => {
+    const f = fixture();
+    const target = join(f.root, 'test/readonly.test.mjs');
+    writeFileSync(target, 'original\n'); fs.chmodSync(target, 0o444);
+    const files = [{ path: 'test/readonly.test.mjs', content: 'overlay\n' }, { path: 'test/../../escape.test.mjs', content: 'x\n' }];
+    let error: unknown = null;
+    try { applyOverlayFilesAllOrNothing({ workspaceRoot: f.root, files }); } catch (caught) { error = caught; }
+    // The restore itself succeeds: the original error, never a rollback failure.
+    expect(error).not.toBeInstanceOf(AggregateError);
+    expect(String(error)).toMatch(/overlay path must be a safe relative path/u);
+    expect(readFileSync(target, 'utf8')).toBe('original\n');
+    expect(fs.statSync(target).mode & 0o777).toBe(0o444);
+  });
+  it.runIf(asUser)('an incomplete rollback fails loud with the original error and every rollback cause (#380)', () => {
+    const f = fixture();
+    const locked = join(f.root, 'test/locked');
+    mkdirSync(locked); writeFileSync(join(locked, 'kept.test.mjs'), 'original\n');
+    const files = [{ path: 'test/locked/kept.test.mjs', content: 'overlay\n' }, { path: 'test/../../escape.test.mjs', content: 'x\n' }];
+    // The target can be written but its directory cannot change: the restore's unlink fails.
+    fs.chmodSync(locked, 0o555);
+    let error: unknown = null;
+    try { applyOverlayFilesAllOrNothing({ workspaceRoot: f.root, files }); } catch (caught) { error = caught; } finally { fs.chmodSync(locked, 0o755); }
+    expect(error).toBeInstanceOf(AggregateError);
+    const aggregate = error as AggregateError;
+    expect(aggregate.message).toMatch(/^overlay write failed and its rollback was incomplete: OverlayPathError: overlay path must be a safe relative path/u);
+    expect(String(aggregate.errors[0])).toMatch(/overlay path must be a safe relative path/u);
+    expect(aggregate.errors.slice(1).map((cause) => (cause as NodeJS.ErrnoException).code)).toEqual(['EACCES']);
   });
   it('binds host approval to exact overlay bytes and replay controls', async () => {
     const f = fixture(); const executor = createPropertyExecutor();

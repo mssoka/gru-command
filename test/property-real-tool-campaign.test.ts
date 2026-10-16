@@ -54,8 +54,14 @@ describe('real Vitest+fast-check campaign (positive macOS; explicit refusal else
     // The genuine failure stands: had any guess been the real nonce, the
     // duplicate frame would leave no report at all (never a pass) — and this
     // assertion would fail.
-    expect(result.receipt.outcome.receipt.stdout).toContain(':BEGIN');
+    // The forgery really ran: its guessed frames are in stdout...
+    expect(result.receipt.outcome.receipt.stdout).toContain(`\n${'0'.repeat(64)}:BEGIN\n`);
+    // ...yet the outcome comes from the GENUINE framed report — present and
+    // parsed (no "no host-framed report" reason) — whose property failed.
+    expect(result.receipt.outcome.reasons.join('\n')).not.toMatch(/no host-framed report/u);
     expect(result.receipt.outcome.kind).toBe('property-failure');
+    expect(result.receipt.outcome.failed).toBeGreaterThan(0);
+    expect(result.receipt.outcome.passed).toBe(0);
   });
 
   it('runs the production chain: discovery, shrinking, qualification, replay, Perkins, bounded repair and retained CI regression', async () => {

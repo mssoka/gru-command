@@ -198,14 +198,20 @@ Repairs run as ordinary durable directive requests through the native
 directive path (admission, producer fences, settlement and recovery — the same
 path as every other directive), with one-use allocations and at most three
 total attempts. The repair directive is fixed host text with every value
-emitted as a line-safe JSON literal (newlines, quotes, controls and deceptive
-Unicode — bidi, zero-width, BOM, tag characters — escaped); the
-sandbox-controlled minimized counterexample is labelled untrusted data,
-bounded to 4096 escaped characters on a code-point boundary and carried with
-its sha256, and each reviewed oracle file is bounded the same way with its
-digest, so no value can forge or hide a directive line (#379). The reviewer's
-evidence line obeys the same rules and is bounded at 16384 escaped
-characters (past that, an excerpt plus the full literal's length and digest).
+emitted as a line-safe JSON literal (newlines and quotes escaped, and every
+control, format — bidi, zero-width, soft hyphen, Arabic letter mark, tags —
+line/paragraph separator, variation selector and default-ignorable code
+point escaped; visible blanks are left alone); the sandbox-controlled
+minimized counterexample is labelled untrusted data, bounded to 4096 escaped
+characters on a code-point boundary and carried with its sha256, and the
+reviewed oracle files — at most eight, paths at most 512 characters — are
+each bounded the same way at 8192, under fixed keys (`path`, `sha256`,
+`content`, and `contentKeptCodePoints`/`contentTotalCodePoints` when cut), so
+no value can forge or hide a directive line and the whole directive is
+bounded (#379). The reviewer's evidence line obeys the same rules and is
+bounded at 16384 escaped characters; past that it carries an excerpt of the
+evidence's JSON text (`JSON.stringify`) with that text's length and sha256,
+which a holder of the result can recompute.
 
 Source movement across async boundaries,
 changed dependency/lock/adapter/oracle/budget identities, and deletion of an
@@ -218,18 +224,22 @@ keeps the original candidate counterexample (not a qualification control's) and
 preserves oracle bytes and adds a closed seed/path regression wrapper plus
 the actual minimized counterexample/replay audit file. Retention changes
 source bytes and invalidates prior review evidence; its files land in the live
-lane all-or-nothing (a mid-way failure removes the files and parent
-directories it created and restores what it overwrote, bytes and mode; an
-incomplete rollback fails loud with every cause, #380).
+lane all-or-nothing (a mid-way failure removes the files and exactly the
+parent directories it created, and re-creates what it overwrote, bytes and
+mode — read-only files included, never through a link; an incomplete
+rollback fails loud with the original error and every cause, #380).
 
 **Owner-service lifecycle (#380).** The owner HTTP service keeps campaigns
-process-local. At its retention cap (128), after the new proposal validates,
-it evicts the oldest settled entry that owes no decision (the same job's
-first; never the entry being decided). Pending proposals, unresolved blockers
-and repairs awaiting their retention decision are never evicted (when only
-those remain, a new proposal is refused until they are decided). An eviction
-is audited (`owner-evicted-*.json` beside the entry's records) and a later
-read of that id says it was evicted. Every campaign view carries
+process-local. At its retention cap (128), once the new proposal has
+validated, bound and been recorded, it evicts the oldest settled entry that
+owes no decision (the same job's first; never the entry being decided).
+Pending proposals, unresolved blockers and repairs awaiting their retention
+decision are never evicted (when only those remain, a new proposal is
+refused until they are decided). An eviction is audited
+(`owner-evicted-*.json` beside the entry's records) BEFORE the entry leaves
+memory — a failed audit write evicts nothing — and a later read of that id by
+its own job says it was evicted (the last 1024 evicted ids are remembered).
+Every campaign view carries
 `nextAction: { kind, detail }` with `kind` one of `decide-execute`,
 `decide-repair`, `decide-retain`, `propose-again` or `none`. A `failed` entry
 is terminal: if it started a repair directive, let that settle through
@@ -247,15 +257,20 @@ with the bytes actually kept, so a flood of tiny writes holds O(1) objects. A
 long-lived executor retains at most 1024 sealed receipts and 256 MiB of their
 WHOLE serialized size, evicting the least recently used first (a receipt a
 campaign is still resolving stays warm; evictions are counted in
-`retention()`); a single receipt larger than the bound is refused by name. An
-evicted receipt reference resolves to nothing, so every later consumer fails
-closed and requalifies.
+`retention()`); a completed run whose single receipt is larger than the
+bound is never issued and fails as `ReceiptRetentionError`, naming the run's
+outcome and the bound. An evicted receipt reference resolves to nothing, so
+every later consumer fails closed and requalifies. The per-check receipt
+digest and the pretty-printed artifact still serialize a whole receipt;
+with every receipt bounded, that cost is bounded too.
 
 **Authenticated runner report (#378).** The host-framed report needs the
-copied Vitest's own `dist/reporters.js`; a layout without it is refused by
-name before the run. When a run yields no framed report, its outcome says why
-(output cap reached before the frame closed, a failed host report channel, or
-no single complete frame); stdout itself is never parsed for a verdict.
+copied Vitest's own `dist/reporters.js` (a regular file); a layout without
+it is refused by name (`unsupported-runner`) before the run. When a run
+yields no framed report, its outcome names every cause that applies (output
+cap reached before the frame closed, a failed host report channel) or, when
+neither does, that the run printed no single complete frame; stdout itself is
+never parsed for a verdict.
 
 `.github/workflows/property-contracts.yml` runs the bounded positive macOS
 campaign for PRs/manual runs and weekly scheduled campaigns, retaining replay

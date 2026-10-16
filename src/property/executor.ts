@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -26,6 +26,11 @@ export class WorkspaceCopyError extends Error {
 }
 export class SandboxSpawnError extends Error {
   constructor(message: string) { super(message); this.name = 'SandboxSpawnError'; }
+}
+/** A sealed receipt too large for the host's retention bound (#377): raised
+ * AFTER a run, so it is never a pre-execution rejection. */
+export class ReceiptRetentionError extends Error {
+  constructor(message: string) { super(message); this.name = 'ReceiptRetentionError'; }
 }
 export interface TypedExecutionRefusal { readonly kind: PropertyOutcomeKind; readonly reason: string; readonly backend: SandboxBackend }
 export interface CleanupOutcome { readonly proven: boolean; readonly workspaceRetained: boolean; readonly detail: string }
@@ -63,6 +68,26 @@ const POLICY = { maxRunTimeoutMs: 900_000, maxMaxOutputBytes: 8 * 1024 * 1024 };
  * resolves to null and every consumer fails closed (requalify), instead of
  * the executor holding unbounded output or refusing all later runs. */
 const RETENTION = { maxReceipts: 1024, maxRetainedOutputBytes: 256 * 1024 * 1024 };
+/** The config's fd-3 nonce read (#378), exported so its bounded EAGAIN
+ * retry and its close handling are tested against injected `readSync` and
+ * `closeSync`. Leaves the trimmed text read in `nonce`. */
+export const NONCE_READER_SOURCE = [
+  // fd 3 may be a non-blocking socket: retry EAGAIN (bounded), and always
+  // close it — a close failure never masks the read's own error.
+  'let nonce = \'\'; let channelError = null;',
+  'try {',
+  '  const buffer = Buffer.alloc(128); let length = 0; let waited = 0;',
+  '  for (;;) {',
+  '    let read;',
+  '    try { read = readSync(3, buffer, length, buffer.length - length, null); }',
+  "    catch (error) { if (error.code !== 'EAGAIN' || waited >= 5000) throw error; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); waited += 10; continue; }",
+  '    if (read === 0 || (length += read) >= buffer.length) break;',
+  '  }',
+  "  nonce = buffer.subarray(0, length).toString('utf8').trim();",
+  '} catch (error) { channelError = error; }',
+  'try { closeSync(3); } catch (error) { channelError ??= error; }',
+  'if (channelError !== null) throw channelError;',
+].join('\n');
 /** The host-owned runner config (#378). Under pool=threads the code under
  * test shares the process with Vitest's reporter, so stdout (and any file the
  * sandbox lets the run write) is writable by that code. The report is
@@ -73,18 +98,7 @@ const RETENTION = { maxReceipts: 1024, maxRetainedOutputBytes: 256 * 1024 * 1024
  * only that one framed block. The nonce never appears in argv, env or files. */
 const CONFIG = [
   "import { closeSync, readSync } from 'node:fs';",
-  // fd 3 may be a non-blocking socket: retry EAGAIN (bounded), and always close it.
-  'let nonce = \'\';',
-  'try {',
-  '  const buffer = Buffer.alloc(128); let length = 0; let waited = 0;',
-  '  for (;;) {',
-  '    let read;',
-  '    try { read = readSync(3, buffer, length, buffer.length - length, null); }',
-  "    catch (error) { if (error.code !== 'EAGAIN' || waited >= 5000) throw error; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); waited += 10; continue; }",
-  '    if (read === 0 || (length += read) >= buffer.length) break;',
-  '  }',
-  "  nonce = buffer.subarray(0, length).toString('utf8').trim();",
-  '} finally { closeSync(3); }',
+  NONCE_READER_SOURCE,
   "if (!/^[0-9a-f]{64}$/.test(nonce)) throw new Error('host report nonce unavailable');",
   'const { JsonReporter } = await import(process.env.GRU_PROPERTY_REPORTERS_MODULE);',
   'class HostFramedJsonReporter extends JsonReporter {',
@@ -94,6 +108,16 @@ const CONFIG = [
   '',
 ].join('\n');
 
+/** Every reason a run has no authenticated report (#378): the output cap,
+ * a failed host report channel, or — when neither explains it — a run that
+ * printed no single complete nonce frame. */
+export function noReportReasons(input: { readonly stdoutTruncated: boolean; readonly nonceChannelError: string | null }): readonly string[] {
+  const reasons = [
+    ...(input.stdoutTruncated ? ['no host-framed report: stdout reached the output cap before the frame closed'] : []),
+    ...(input.nonceChannelError !== null ? [`no host-framed report: host report channel failed: ${input.nonceChannelError}`] : []),
+  ];
+  return reasons.length > 0 ? reasons : ['no host-framed report: the run printed no single complete nonce frame'];
+}
 /** The single nonce-framed report in `stdout`, or null when it is absent,
  * duplicated or unterminated (#378). Nothing outside the frame is parsed. */
 export function framedRunnerReport(stdout: string, nonce: string): string | null {
@@ -214,7 +238,7 @@ export function createReceiptRetention<T>(bounds: { readonly maxReceipts: number
   let total = 0; let evicted = 0;
   return {
     add(id: string, value: T, bytes: number): void {
-      if (bytes > bounds.maxBytes) throw new PreExecutionRejectionError('budget-exceeds-policy', `a ${String(bytes)}-byte receipt exceeds the ${String(bounds.maxBytes)}-byte retention bound`);
+      if (bytes > bounds.maxBytes) throw new ReceiptRetentionError(`a ${String(bytes)}-byte receipt exceeds the ${String(bounds.maxBytes)}-byte retention bound`);
       const prior = entries.get(id);
       if (prior !== undefined) { entries.delete(id); total -= prior.bytes; }
       entries.set(id, { value, bytes }); total += bytes;
@@ -347,7 +371,7 @@ export function createPropertyExecutor(options: PropertyExecutorOptions = {}): P
         const reportersModule = join(dirname(runner.path), 'dist', 'reporters.js');
         // The framed report depends on the copied Vitest's own reporters
         // module: a layout without it is refused by name before any run.
-        if (!existsSync(reportersModule)) throw new PreExecutionRejectionError('unapproved-command', `copied Vitest has no ${relative(workspace, reportersModule)}; the host-framed report cannot be produced`);
+        if (statSync(reportersModule, { throwIfNoEntry: false })?.isFile() !== true) throw new PreExecutionRejectionError('unsupported-runner', `copied Vitest has no ${relative(workspace, reportersModule)}; the host-framed report cannot be produced`);
         env['GRU_PROPERTY_REPORTERS_MODULE'] = pathToFileURL(reportersModule).href;
         env['GRU_PROPERTY_MAX_ITERATIONS'] = String(plan.budget.maxIterations);
         env['GRU_PROPERTY_MAX_SHRINK_STEPS'] = String(plan.budget.maxShrinkSteps);
@@ -399,13 +423,9 @@ export function createPropertyExecutor(options: PropertyExecutorOptions = {}): P
         const raw = { stdout, stderr, report: framedRunnerReport(stdout, reportNonce), exitCode: child.exitCode, signal: child.signalCode, timedOut, durationMs: Date.now() - start };
         let outcome = VITEST_FAST_CHECK_ADAPTER.interpretExecution(raw, { ...plan, cwd: wsPkg });
         if ((capture.stdoutTruncated || capture.stderrTruncated) && outcome.kind === 'pass') outcome = { ...outcome, kind: 'inconclusive', reasons: [...outcome.reasons, 'output capture was truncated'] };
-        // Why there is no authenticated report, by name (#378).
-        if (raw.report === null) {
-          const why = capture.stdoutTruncated ? 'no host-framed report: stdout reached the output cap before the frame closed'
-            : nonceChannelError !== null ? `no host-framed report: host report channel failed: ${nonceChannelError}`
-            : 'no host-framed report: the run printed no single complete nonce frame';
-          outcome = { ...outcome, reasons: [...outcome.reasons, why] };
-        }
+        // Why there is no authenticated report, by name — every cause that
+        // applies (#378).
+        if (raw.report === null) outcome = { ...outcome, reasons: [...outcome.reasons, ...noReportReasons({ stdoutTruncated: capture.stdoutTruncated, nonceChannelError })] };
         const environmentProfile = environmentProfileString(env);
         const counterexample = retainedCounterexample({ outcome, environmentProfile });
         const body = assemblePropertyExecutionReceipt({
@@ -416,11 +436,17 @@ export function createPropertyExecutor(options: PropertyExecutorOptions = {}): P
         });
         const sealed = body as SealedExecutionReceipt;
         const serialized = JSON.stringify(sealed);
-        issued.set(sealed, sha256Hex(serialized));
         const ref = { receiptId: `pex-${randomUUID()}` };
         // Retention counts the WHOLE receipt (outcome, excerpts, overlay,
-        // counterexample), not just its two output streams.
-        receipts.add(ref.receiptId, sealed, Buffer.byteLength(serialized));
+        // counterexample), not just its two output streams. A receipt over
+        // the bound is never issued: the completed run is reported by name.
+        try {
+          receipts.add(ref.receiptId, sealed, Buffer.byteLength(serialized));
+        } catch (error) {
+          if (!(error instanceof ReceiptRetentionError)) throw error;
+          throw new ReceiptRetentionError(`the run completed (${outcome.kind}) but its receipt was not issued: ${error.message}; raise the host retention bound or lower max_output_bytes`);
+        }
+        issued.set(sealed, sha256Hex(serialized));
         rmSync(workspace, { recursive: true, force: true });
         return { executed: true, receipt: sealed, ref, cleanup: { proven: true, workspaceRetained: false, detail: 'actual close observed, fork denied, process group empty; workspace released' } };
       } catch (error) {

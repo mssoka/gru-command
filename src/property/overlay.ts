@@ -92,7 +92,7 @@ export function sha256Hex(data: string): string {
  * any path whose parent chain resolves (through copied symlinks) outside
  * the workspace root.
  */
-function resolveOverlayTarget(workspaceRoot: string, relPath: string): string {
+function resolveOverlayTarget(workspaceRoot: string, relPath: string, onCreatedDirectory?: (dir: string) => void): string {
   const segments = relPath.split('/');
   if (!relPath || isAbsolute(relPath) || /[\\:]/u.test(relPath) || [...relPath].some((char) => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127) || relPath.startsWith('-') || segments.some((part) => !part || part === '.' || part === '..')) {
     throw new OverlayPathError(`overlay path must be a safe relative path: ${JSON.stringify(relPath)}`);
@@ -104,7 +104,7 @@ function resolveOverlayTarget(workspaceRoot: string, relPath: string): string {
     parent = join(parent, segment);
     const info = lstatSync(parent, { throwIfNoEntry: false });
     if (info !== undefined && (!info.isDirectory() || info.isSymbolicLink())) throw new OverlayPathError(`overlay parent is not an ordinary directory: ${parent}`);
-    if (info === undefined) mkdirSync(parent);
+    if (info === undefined) { mkdirSync(parent); onCreatedDirectory?.(parent); }
   }
   return join(parent, segments.at(-1)!);
 }
@@ -171,22 +171,27 @@ export function applyOverlayFiles(input: {
 
 /** All-or-nothing overlay into a LIVE tree (#380): applyOverlayFiles writes
  * file by file, so a later refusal or write error would leave a partial set.
- * Every target's prior state is captured first; on any failure each file the
- * call created is removed and each file it overwrote is restored byte-for-byte,
- * then the original error is rethrown. */
+ * Every target's prior state is captured first — creating only the parent
+ * directories a VALIDATED path needs, each recorded as it is made; on any
+ * failure each file the call created is removed, each file it overwrote is
+ * re-created byte-for-byte with its mode (never written through a link
+ * swapped in meanwhile), and each directory it made is removed deepest
+ * first; then the original error is rethrown, or — when part of the
+ * rollback itself fails — an AggregateError carrying it and every cause. */
 export function applyOverlayFilesAllOrNothing(input: Parameters<typeof applyOverlayFiles>[0]): OverlayIdentity {
-  // Parent directories this call creates, in creation order, so a rollback
-  // removes them (deepest first) and leaves no empty directory behind.
-  const createdDirs: string[] = [];
+  const createdDirs = new Set<string>();
   const prior: { readonly target: string; readonly state: 'absent' | 'file' | 'other'; readonly content: Buffer | null; readonly mode: number | null }[] = [];
   const rollback = (error: unknown): never => {
     const failures: unknown[] = [];
     for (const { target, state, content, mode } of prior) {
+      // A pre-existing non-file entry is never written (applyOverlayFiles
+      // refuses it), so it is never touched here either.
+      if (state === 'other') continue;
       try {
-        if (state === 'absent') rmSync(target, { force: true });
-        else if (state === 'file' && content !== null) {
-          writeFileSync(target, content);
-          if (mode !== null) chmodSync(target, mode);
+        rmSync(target, { force: true });
+        if (state === 'file' && content !== null && mode !== null) {
+          writeFileSync(target, content, { flag: 'wx', mode });
+          chmodSync(target, mode); // exact, whatever the umask
         }
       } catch (restoreError) { failures.push(restoreError); }
     }
@@ -197,18 +202,9 @@ export function applyOverlayFilesAllOrNothing(input: Parameters<typeof applyOver
     throw error;
   };
   try {
-    const root = realpathSync(input.workspaceRoot);
     for (const file of input.files) {
-      // Record which parents are missing before resolveOverlayTarget makes them.
-      let parent = root;
-      for (const segment of file.path.split('/').slice(0, -1)) {
-        parent = join(parent, segment);
-        if (lstatSync(parent, { throwIfNoEntry: false }) === undefined && !createdDirs.includes(parent)) createdDirs.push(parent);
-      }
-      const target = resolveOverlayTarget(input.workspaceRoot, file.path);
+      const target = resolveOverlayTarget(input.workspaceRoot, file.path, (dir) => { createdDirs.add(dir); });
       const current = lstatSync(target, { throwIfNoEntry: false });
-      // A pre-existing non-file entry is never written (applyOverlayFiles
-      // refuses it), so it is never touched on rollback either.
       prior.push({ target, state: current === undefined ? 'absent' : current.isFile() ? 'file' : 'other',
         content: current !== undefined && current.isFile() ? readFileSync(target) : null,
         mode: current !== undefined && current.isFile() ? current.mode & 0o7777 : null });

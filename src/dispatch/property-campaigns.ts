@@ -61,6 +61,24 @@ export function nextAction(entry: Pick<Entry, 'state' | 'report'>): { readonly k
 export function evictable(entry: Pick<Entry, 'state' | 'report'>): boolean {
   return entry.state === 'failed' || entry.state === 'retained' || (entry.state === 'executed' && entry.report?.blocking !== true);
 }
+/** The entry a full cache gives up for a new proposal (#380): the OLDEST
+ * evictable one, the proposing job's own first, never the one being decided
+ * right now; undefined when none may go. `entries` is in insertion order. */
+export function evictionVictim<T extends Pick<Entry, 'id' | 'jobId' | 'state' | 'report'>>(entries: Iterable<T>, jobId: string, activeId: string | null): T | undefined {
+  const candidates = [...entries].filter((entry) => evictable(entry) && entry.id !== activeId);
+  return candidates.find((entry) => entry.jobId === jobId) ?? candidates[0];
+}
+
+/** Remembers an evicted id (bounded, oldest forgotten first) so a later read
+ * says "evicted" by name rather than "unknown". */
+export function rememberEvicted<V>(evicted: Map<string, V>, id: string, value: V, limit = 1024): void {
+  evicted.delete(id);
+  evicted.set(id, value);
+  for (const oldest of evicted.keys()) {
+    if (evicted.size <= limit) break;
+    evicted.delete(oldest);
+  }
+}
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 function head(root: string): string {
   const source = buildSourceIdentity(root);
@@ -83,7 +101,7 @@ export function createPropertyCampaignService(options: PropertyCampaignServiceOp
   const host = suppliedHost ?? createPropertyCampaignHost(createPropertyExecutor({ signal: hostController.signal }));
   const entries = new Map<string, Entry>();
   const controllers = new Set<AbortController>();
-  let active = false;
+  // The ONE campaign being decided right now (decide is single-flight), or null.
   let activeId: string | null = null;
   let settled: Promise<void> | null = null;
   let disposed = false;
@@ -160,26 +178,25 @@ export function createPropertyCampaignService(options: PropertyCampaignServiceOp
     propose(jobId: string, body: Record<string, unknown>) {
       if (disposed) throw new PropertyOwnerActionError('property campaign service disposed');
       keys(body, ['campaign']);
-      // Validate and bind the NEW proposal first: a malformed or unbound
-      // proposal never costs a retained campaign its slot.
+      // Validate, bind and BUILD the new proposal first — and audit it —
+      // so a malformed, unbound or unreadable proposal never costs a
+      // retained campaign its slot.
       const spec = clone(parseReviewedCampaign(body.campaign));
       bind(jobId, spec.candidateRoot);
       const id = `campaign-${randomUUID()}`;
-      if (entries.size >= maxRetainedProposals) {
-        // Make room by dropping the OLDEST settled entry that owes no decision,
-        // this job's first; never the entry being decided right now.
-        const candidates = [...entries.values()].filter((entry) => evictable(entry) && entry.id !== activeId);
-        const oldest = candidates.find((entry) => entry.jobId === jobId) ?? candidates[0];
-        if (oldest === undefined) throw new PropertyOwnerActionError('process-local proposal retention limit reached: every retained campaign is a pending proposal, an unresolved blocker or a repair awaiting retention; decide those first');
-        entries.delete(oldest.id);
-        evictedIds.set(oldest.id, { jobId: oldest.jobId, artifactsDir: oldest.artifactsDir });
-        if (evictedIds.size > 1024) evictedIds.delete(evictedIds.keys().next().value!);
-        // The eviction itself is audited beside the entry's own records.
-        mkdirSync(oldest.artifactsDir, { recursive: true, mode: 0o700 });
-        writeFileSync(join(oldest.artifactsDir, `owner-evicted-${randomUUID()}.json`), `${JSON.stringify({ evicted: view(oldest), byProposal: id }, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
-      }
       const entry: Entry = { id, jobId, spec, heads: roots(spec).map(head), treeDigests: roots(spec).map((root) => propertyWorkspaceIdentity(root).digest), configHash: propertyConfigIdentity(spec.candidateRoot), artifactsDir: join(options.artifactsRoot, id), state: 'proposed', report: null, retainedPaths: [] };
-      entries.set(id, entry); audit(entry); return view(entry);
+      const victim = entries.size >= maxRetainedProposals ? evictionVictim(entries.values(), jobId, activeId) : undefined;
+      if (entries.size >= maxRetainedProposals && victim === undefined) throw new PropertyOwnerActionError('process-local proposal retention limit reached: every retained campaign is a pending proposal, an unresolved blocker, a repair awaiting retention or the campaign being decided right now; decide those first');
+      audit(entry);
+      if (victim !== undefined) {
+        // The eviction is audited beside the victim's own records BEFORE it
+        // leaves memory: a failed write evicts nothing.
+        mkdirSync(victim.artifactsDir, { recursive: true, mode: 0o700 });
+        writeFileSync(join(victim.artifactsDir, `owner-evicted-${randomUUID()}.json`), `${JSON.stringify({ evicted: view(victim), byProposal: id }, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+        entries.delete(victim.id);
+        rememberEvicted(evictedIds, victim.id, { jobId: victim.jobId, artifactsDir: victim.artifactsDir });
+      }
+      entries.set(id, entry); return view(entry);
     },
     read(jobId: string, id: string) { return view(get(jobId, id)); },
     async decide(jobId: string, id: string, action: 'execute' | 'repair' | 'retain', body: Record<string, unknown>) {
@@ -189,9 +206,9 @@ export function createPropertyCampaignService(options: PropertyCampaignServiceOp
       if (body.decision !== 'approve') throw new PropertyOwnerActionError('decision must be propose or approve');
       const expected = entry.report?.candidateSha ?? entry.heads[2];
       if (typeof body.expectedHead !== 'string' || !/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u.test(body.expectedHead) || body.expectedHead !== expected || head(entry.spec.candidateRoot) !== expected) throw new PropertyOwnerActionError('approval must name this exact current candidate head');
-      if (active || disposed) throw new PropertyOwnerActionError('property host busy/disposed; no concurrent allocation');
+      if (activeId !== null || disposed) throw new PropertyOwnerActionError('property host busy/disposed; no concurrent allocation');
       idle(jobId, entry.spec.candidateRoot);
-      active = true; activeId = entry.id;
+      activeId = entry.id;
       let resolveSettlement!: () => void;
       settled = new Promise<void>((resolve) => { resolveSettlement = resolve; });
       let release: (() => void) | null = null;
@@ -222,7 +239,7 @@ export function createPropertyCampaignService(options: PropertyCampaignServiceOp
         }
         audit(entry); return view(entry);
       } catch (error) { entry.state = 'failed'; audit(entry); throw error; }
-      finally { release?.(); active = false; activeId = null; settled = null; resolveSettlement(); }
+      finally { release?.(); activeId = null; settled = null; resolveSettlement(); }
     },
     async dispose() { disposed = true; hostController.abort(); for (const controller of controllers) controller.abort(); await settled; },
   };
