@@ -306,7 +306,17 @@ function adminBackPointer(admin: string): string {
   // nothing.
   const named = adminFile(admin, 'gitdir').trimEnd();
   if (named === '') throw new Error(`lane administration ${admin} has an empty gitdir file`);
-  return resolvedPath(`lane administration ${admin} names the checkout git file`, resolve(admin, named));
+  if (/[\0\r\n]/u.test(named)) throw new Error(`lane administration ${admin} has a gitdir file of more than one line — not one git writes`);
+  return resolvedPath(`lane administration ${admin}'s checkout git file`, resolve(admin, named));
+}
+
+/** A git metadata file's text, or a refusal naming it. */
+function namedMetadata(file: string, what: string, limit?: number): string {
+  try {
+    return readWorktreeMetadata(file, limit);
+  } catch (error) {
+    throw new Error(`${what} ${file} is unreadable (${errnoOf(error)})`, { cause: error });
+  }
 }
 
 /** A lane administration's metadata file, or a refusal naming it. */
@@ -336,9 +346,10 @@ function validate(receipt: Receipt, lane: WorktreeLane): void {
     if (head !== `ref: refs/heads/${lane.branch}`) throw new Error('writer handoff attachment changed');
     const ref = join(common, 'refs', 'heads', lane.branch);
     if (existsSync(ref)) {
-      if (realpathSync(ref) !== ref || !lstatSync(ref).isFile() || !/^[0-9a-f]{40,64}$/u.test(readWorktreeMetadata(ref).trim()) || readWorktreeMetadata(ref).trim().length !== lane.sha.length) throw new Error('writer branch is not direct');
+      const text = namedMetadata(ref, 'writer branch ref', undefined).trim();
+      if (resolvedPath('writer branch ref', ref) !== ref || !/^[0-9a-f]{40,64}$/u.test(text) || text.length !== lane.sha.length) throw new Error('writer branch is not direct');
     } else {
-      const packed = readWorktreeMetadata(join(common, 'packed-refs'), 16 * 1024 * 1024);
+      const packed = namedMetadata(join(common, 'packed-refs'), 'packed refs', 16 * 1024 * 1024);
       if (packed.split('\n').some((line) => line.startsWith('^') && !/^\^[0-9a-f]{40,64}$/u.test(line))) throw new Error('malformed peeled ref metadata');
       const lines = packed.split('\n').filter((line) => line !== '' && !line.startsWith('#') && !line.startsWith('^'));
       if (lines.some((line) => !/^[0-9a-f]{40,64} refs\//u.test(line))) throw new Error('malformed packed ref metadata');
@@ -354,20 +365,32 @@ export function beginLaneHandoff(lane: Pick<WorktreeLane, 'id' | 'kind' | 'repoP
     common: laneCommonDirectory(admin), admin,
     path: resolvedPath('checkout', lane.path), branch: lane.branch, sha: lane.sha, createdAt: null };
   const file = join(admin, receiptName), temp = `${file}.${token.slice(13)}`;
-  let written = false;
+  // Never a stray temporary receipt: whatever this call created — even a
+  // write that failed partway — is removed, and one that cannot be is named
+  // with its own reason. Only a temporary name that already existed (the
+  // `wx` open refused it) is not this call's to remove.
+  const removeTemp = (failure: unknown): void => {
+    try { unlinkSync(temp); } catch (cleanupError) {
+      if (errnoOf(cleanupError) === 'ENOENT') return;
+      throw new Error(`lane administration ${admin} ${failure === null ? 'published its handoff receipt' : `cannot take a handoff receipt (${errnoOf(failure)})`} and its temporary receipt ${temp} could not be removed (${errnoOf(cleanupError)})`,
+        { cause: failure === null ? cleanupError : new AggregateError([failure, cleanupError], 'handoff receipt and its cleanup failed') });
+    }
+  };
+  let ours = false;
   try {
-    writeFileSync(temp, JSON.stringify(receipt), { flag: 'wx' });
-    written = true;
+    try {
+      writeFileSync(temp, JSON.stringify(receipt), { flag: 'wx' });
+      ours = true;
+    } catch (writeError) {
+      ours = errnoOf(writeError) !== 'EEXIST';
+      throw writeError;
+    }
     linkSync(temp, file); // atomic publication, never overwrite a foreign receipt
   } catch (error) {
-    // Never a stray temporary receipt: the one this call wrote is removed,
-    // and one that cannot be is named.
-    const failures: unknown[] = [error];
-    if (written) { try { unlinkSync(temp); } catch (cleanupError) { failures.push(cleanupError); } }
-    throw new Error(`lane administration ${admin} cannot take a handoff receipt (${errnoOf(error)})${failures.length > 1 ? ` and its temporary receipt ${temp} could not be removed` : ''}`,
-      { cause: failures.length > 1 ? new AggregateError(failures, 'handoff receipt and its cleanup failed') : error });
+    if (ours) removeTemp(error);
+    throw new Error(`lane administration ${admin} cannot take a handoff receipt (${errnoOf(error)})`, { cause: error });
   }
-  unlinkSync(temp);
+  removeTemp(null);
 }
 
 export function assertPendingLaneHandoff(lane: WorktreeRecord, admin: string, token: string): Receipt {

@@ -2,7 +2,22 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative as relativePath } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+// node:fs passes through; a test may make one write or removal fail.
+const { fsHooks } = vi.hoisted(() => ({ fsHooks: {
+  beforeWrite: null as ((path: string) => void) | null,
+  beforeUnlink: null as ((path: string) => void) | null,
+} }));
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return {
+    ...actual,
+    writeFileSync: ((...args: Parameters<typeof actual.writeFileSync>) => { fsHooks.beforeWrite?.(String(args[0])); return actual.writeFileSync(...args); }) as typeof actual.writeFileSync,
+    unlinkSync: ((...args: Parameters<typeof actual.unlinkSync>) => { fsHooks.beforeUnlink?.(String(args[0])); return actual.unlinkSync(...args); }) as typeof actual.unlinkSync,
+  };
+});
+afterEach(() => { fsHooks.beforeWrite = null; fsHooks.beforeUnlink = null; });
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
@@ -312,7 +327,13 @@ describe('child lane parent custody, called directly (#373)', () => {
       ['gitdir file empty', (f) => { writeFileSync(join(f.admin, 'gitdir'), '\n'); },
         (f) => new RegExp(`lane administration ${escape(f.admin)} has an empty gitdir file`, 'u')],
       ['gitdir file names a missing checkout', (f) => { writeFileSync(join(f.admin, 'gitdir'), '/nowhere/checkout/.git\n'); },
-        (f) => new RegExp(`lane administration ${escape(f.admin)} names the checkout git file /nowhere/checkout/\\.git cannot be resolved \\(ENOENT\\)`, 'u')],
+        (f) => new RegExp(`lane administration ${escape(f.admin)}'s checkout git file /nowhere/checkout/\\.git cannot be resolved \\(ENOENT\\)`, 'u')],
+      ['gitdir file of two lines', (f) => { writeFileSync(join(f.admin, 'gitdir'), `${join(f.parent.path, '.git')}\nsecond\n`); },
+        (f) => new RegExp(`lane administration ${escape(f.admin)} has a gitdir file of more than one line`, 'u')],
+      ['writer branch ref unreadable', (f) => {
+        const ref = join(realpathSync(join(f.repo.path, '.git')), 'refs', 'heads', f.parent.branch!);
+        rmSync(ref); mkdirSync(ref);
+      }, () => /writer branch ref .* is unreadable \(handoff metadata is not a regular file\)/u],
       ['HEAD removed', (f) => { rmSync(join(f.admin, 'HEAD')); },
         (f) => new RegExp(`lane administration ${escape(f.admin)} has an unreadable HEAD file \\(ENOENT\\)`, 'u')],
       ['receipt removed', (f) => { rmSync(join(f.admin, 'gru-creation-handoff.json')); },
@@ -347,9 +368,50 @@ describe('child lane parent custody, called directly (#373)', () => {
     expect(readdirSync(f.admin).sort()).toEqual(before);
     // A receipt that cannot be published (one is already there) is refused
     // by name, and its temporary receipt is removed.
-    expect(() => handoffProof.beginLaneHandoff(f.parent, f.admin, 'token-0123456789abcdef'))
-      .toThrow(`lane administration ${f.admin} cannot take a handoff receipt (EEXIST)`);
+    const token = 'token-0123456789abcdef';
+    expect(() => handoffProof.beginLaneHandoff(f.parent, f.admin, token))
+      .toThrow(new RegExp(`^lane administration ${f.admin.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')} cannot take a handoff receipt \\(EEXIST\\)$`, 'u'));
     expect(readdirSync(f.admin).sort()).toEqual(before);
+    const temp = `${join(f.admin, 'gru-creation-handoff.json')}.${token.slice(13)}`;
+    // ...and when its temporary receipt cannot be removed either, that is named with its reason.
+    fsHooks.beforeUnlink = (path) => { if (path === temp) throw Object.assign(new Error('busy'), { code: 'EBUSY' }); };
+    expect(() => handoffProof.beginLaneHandoff(f.parent, f.admin, token))
+      .toThrow(`lane administration ${f.admin} cannot take a handoff receipt (EEXIST) and its temporary receipt ${temp} could not be removed (EBUSY)`);
+    fsHooks.beforeUnlink = null;
+    rmSync(temp);
+    // A write that fails partway still removes what it created.
+    fsHooks.beforeWrite = (path) => {
+      if (path !== temp) return;
+      fsHooks.beforeWrite = null;
+      writeFileSync(temp, '{"partial');
+      throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+    };
+    expect(() => handoffProof.beginLaneHandoff(f.parent, f.admin, token)).toThrow(`lane administration ${f.admin} cannot take a handoff receipt (ENOSPC)`);
+    expect(readdirSync(f.admin).sort()).toEqual(before);
+    // A temporary name that already existed is not this call's to remove.
+    writeFileSync(temp, 'foreign');
+    expect(() => handoffProof.beginLaneHandoff(f.parent, f.admin, token)).toThrow(`lane administration ${f.admin} cannot take a handoff receipt (EEXIST)`);
+    expect(readFileSync(temp, 'utf8')).toBe('foreign');
+    rmSync(temp);
+    // A published receipt whose temporary file cannot be removed says so.
+    const receipt = readFileSync(join(f.admin, 'gru-creation-handoff.json'), 'utf8');
+    rmSync(join(f.admin, 'gru-creation-handoff.json'));
+    fsHooks.beforeUnlink = (path) => { if (path === temp) throw Object.assign(new Error('busy'), { code: 'EBUSY' }); };
+    expect(() => handoffProof.beginLaneHandoff(f.parent, f.admin, token))
+      .toThrow(`lane administration ${f.admin} published its handoff receipt and its temporary receipt ${temp} could not be removed (EBUSY)`);
+    fsHooks.beforeUnlink = null;
+    rmSync(temp);
+    writeFileSync(join(f.admin, 'gru-creation-handoff.json'), receipt);
+    expect(readdirSync(f.admin).sort()).toEqual(before);
+  });
+
+  it('a receipt gone after capture is refused by name at the next check', async () => {
+    const f = await parentFixture('custody-receipt-gone');
+    const check = handoffProof.capturePortLaneHandoff(f.h.worktrees, f.parent);
+    rmSync(join(f.admin, 'gru-creation-handoff.json'));
+    const error = (() => { try { check(); return null; } catch (caught) { return caught; } })();
+    expect(error).toBeInstanceOf(handoffProof.WorktreeHandoffUnresolvedError);
+    expect(reasonsOf(error)).toContain(`lane administration ${f.admin} has an unreadable gru-creation-handoff.json file (ENOENT)`);
   });
 
   it('refuses a parent whose git administration was removed, by name', async () => {
