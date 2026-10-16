@@ -215,8 +215,9 @@ describe('preservation reference — faults only a filesystem can cause (#367)',
     let armed = false;
     hooks.onOpen = (path) => { if (path.endsWith('.tar.gz')) armed = true; };
     hooks.onLstat = (path, stat) => (armed && path === oddTree && bigintStat(stat) ? reborn(stat) : stat);
-    expect(resolvePreservationReference({ reference: { recordPath: odd.reference.recordPath, recordSha256: sha256(oddText) }, jobId: 'job-h1' }))
-      .toMatchObject({ reusable: false, guidance: expect.stringContaining(`(${JSON.stringify(oddTree)} was replaced by another directory)`) });
+    const oddVerdict = resolvePreservationReference({ reference: { recordPath: odd.reference.recordPath, recordSha256: sha256(oddText) }, jobId: 'job-h1' });
+    expect(oddVerdict).toMatchObject({ reusable: false, guidance: expect.stringContaining(`(${JSON.stringify(oddTree).replace('\u202e', '\\u202e')} was replaced by another directory)`) });
+    expect(oddVerdict.guidance).not.toContain('\u202e');
   });
 
   it('refuses on a platform without no-follow reads, by name', () => {

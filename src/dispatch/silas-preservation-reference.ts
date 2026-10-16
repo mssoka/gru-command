@@ -47,6 +47,7 @@
  * proves the retained report/session/link/archive portions, it does not grant
  * release.
  */
+import { lineSafeLiteral, shownText } from './line-safe.js';
 import { createHash } from 'node:crypto';
 import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
@@ -160,12 +161,14 @@ function directoryChange(path: string, before: DirectoryIdentity | null): string
   if (now.dev !== before.dev || now.ino !== before.ino || now.birth !== before.birth) return `${shownPath(path)} was replaced by another directory`;
   return canonicalDirectory(path) ? null : `${shownPath(path)} is now reached through a symlink`;
 }
-/** A path as guidance shows it: as written, or — when it carries a control,
- * format or separator character (a record names it) — as a JSON literal, so
- * it can never break or reorder the guidance line. */
-function shownPath(path: string): string {
-  return /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(path) ? JSON.stringify(path) : path;
-}
+/** A record-named path as guidance shows it (see shownText). */
+const shownPath = (path: string): string => shownText(path);
+/** A record-named link entry, always quoted: a line-safe literal of at most
+ * 200 code points, marked when cut. */
+const shownEntry = (entry: string): string => {
+  const points = [...entry.slice(0, 401)];
+  return points.length > 200 ? `${lineSafeLiteral(points.slice(0, 200).join(''))}…` : lineSafeLiteral(entry);
+};
 
 /** A real directory reached by no symlinked component: its realpath is the
  * path itself (#367), so every later read names what the checks saw. */
@@ -250,7 +253,7 @@ export function resolvePreservationReference(input: {
   try {
     recordBytes = regularFileBytes(reference.recordPath);
   } catch (error) {
-    return refuse(`the supplied preservation record is unreadable (${String(error)}) — the tree is retained`);
+    return refuse(`the supplied preservation record is unreadable (${shownText(String(error))}) — the tree is retained`);
   }
   const actualRecordSha = digestOf(recordBytes);
   if (actualRecordSha !== reference.recordSha256) {
@@ -262,7 +265,7 @@ export function resolvePreservationReference(input: {
   try {
     record = JSON.parse(recordBytes.toString('utf-8')) as Record<string, unknown>;
   } catch (error) {
-    return refuse(`the supplied preservation record is not valid JSON (${String(error)})`, [], actualRecordSha);
+    return refuse(`the supplied preservation record is not valid JSON (${shownText(String(error))})`, [], actualRecordSha);
   }
   if (!isRecord(record)) return refuse('the preservation record is not an object', [], actualRecordSha);
   const job = isRecord(record['job']) ? record['job'] : null;
@@ -318,7 +321,7 @@ export function resolvePreservationReference(input: {
     try {
       actual = sha256(assetPath);
     } catch (error) {
-      return refuse(`retained asset ${asset.name} is unreadable (${String(error)}) — the tree is retained`, verifiedAssets, actualRecordSha);
+      return refuse(`retained asset ${asset.name} is unreadable (${shownText(String(error))}) — the tree is retained`, verifiedAssets, actualRecordSha);
     }
     if (actual !== asset.sha) {
       return refuse(`retained asset ${asset.name} does not match its recorded digest — the tree is retained`, verifiedAssets, actualRecordSha);
@@ -337,7 +340,7 @@ export function resolvePreservationReference(input: {
   try {
     manifestBytes = regularFileBytes(manifestPath);
   } catch (error) {
-    return refuse(`the link-preservation manifest is missing or unreadable (${String(error)}) — the tree is retained`, verifiedAssets, actualRecordSha);
+    return refuse(`the link-preservation manifest is missing or unreadable (${shownText(String(error))}) — the tree is retained`, verifiedAssets, actualRecordSha);
   }
   const manifestSha = digestOf(manifestBytes);
   const recordBinding = record['link_manifest_sha256'];
@@ -367,7 +370,7 @@ export function resolvePreservationReference(input: {
     }
     manifest = parsed;
   } catch (error) {
-    return refuse(`the link-preservation manifest is malformed (${String(error)}) — the tree is retained`, verifiedAssets, actualRecordSha);
+    return refuse(`the link-preservation manifest is malformed (${shownText(String(error))}) — the tree is retained`, verifiedAssets, actualRecordSha);
   }
   verifiedAssets.push(LINK_MANIFEST_ASSET);
   if (manifest['original_tree'] !== treePath) {
@@ -379,7 +382,7 @@ export function resolvePreservationReference(input: {
   const entries: readonly unknown[] = manifest['relative_entries'];
   for (const entry of entries) {
     if (typeof entry !== 'string' || !plainRelative(entry)) {
-      return refuse(`a link-preservation entry escapes the original tree ("${String(entry)}") — the tree is retained`, verifiedAssets, actualRecordSha);
+      return refuse(`a link-preservation entry escapes the original tree (${typeof entry === 'string' ? shownEntry(entry) : shownText(String(entry))}) — the tree is retained`, verifiedAssets, actualRecordSha);
     }
     const entryPath = join(treePath, entry);
     // The parent's identity is taken before the containment proof, so the
@@ -387,10 +390,10 @@ export function resolvePreservationReference(input: {
     const parentIdentity = directoryIdentity(dirname(entryPath));
     const placement = contained(treePath, entryPath);
     if (placement === 'outside') {
-      return refuse(`a link-preservation entry escapes the original tree ("${entry}") — the tree is retained`, verifiedAssets, actualRecordSha);
+      return refuse(`a link-preservation entry escapes the original tree (${shownEntry(entry)}) — the tree is retained`, verifiedAssets, actualRecordSha);
     }
     if (placement === 'unresolvable') {
-      return refuse(`a link-preservation entry cannot be resolved inside the original tree ("${entry}": a dangling link, a loop, a non-directory or an unreadable component) — the tree is retained`, verifiedAssets, actualRecordSha);
+      return refuse(`a link-preservation entry cannot be resolved inside the original tree (${shownEntry(entry)}: a dangling link, a loop, a non-directory or an unreadable component) — the tree is retained`, verifiedAssets, actualRecordSha);
     }
     let stat;
     try {
@@ -400,7 +403,7 @@ export function resolvePreservationReference(input: {
       // hash below is the integrity witness; a live entry is verified as a
       // link without dereferencing it. Only true absence means that.
       if (errorCode(error) === 'ENOENT') continue;
-      return refuse(`a link-preservation entry is unreadable ("${entry}": ${String(error)}) — the tree is retained`, verifiedAssets, actualRecordSha);
+      return refuse(`a link-preservation entry is unreadable (${shownEntry(entry)}: ${shownText(String(error))}) — the tree is retained`, verifiedAssets, actualRecordSha);
     }
     if (stat.isSymbolicLink()) {
       // The link IS the deliverable: reading its target would dereference
@@ -409,7 +412,9 @@ export function resolvePreservationReference(input: {
       // identity is kept, and a later one that differs is a swap.
       const first = linkParents.get(dirname(entryPath));
       if (first === undefined) linkParents.set(dirname(entryPath), parentIdentity);
-      else if (first === null || parentIdentity === null || first.dev !== parentIdentity.dev || first.ino !== parentIdentity.ino || first.birth !== parentIdentity.birth) {
+      else if (first === null || parentIdentity === null) {
+        return refuse(`the original tree changed while it was being verified (${shownPath(dirname(entryPath))} vanished or cannot be read) — the tree is retained`, verifiedAssets, actualRecordSha);
+      } else if (first.dev !== parentIdentity.dev || first.ino !== parentIdentity.ino || first.birth !== parentIdentity.birth) {
         return refuse(`the original tree changed while it was being verified (${shownPath(dirname(entryPath))} was replaced by another directory) — the tree is retained`, verifiedAssets, actualRecordSha);
       }
       verifiedAssets.push(`link:${entry}`);
@@ -432,7 +437,7 @@ export function resolvePreservationReference(input: {
     try {
       actualArchive = sha256(archivePath);
     } catch (error) {
-      return refuse(`the declared opaque archive is missing or unreadable (${String(error)}) — the tree is retained`, verifiedAssets, actualRecordSha);
+      return refuse(`the declared opaque archive is missing or unreadable (${shownText(String(error))}) — the tree is retained`, verifiedAssets, actualRecordSha);
     }
     if (actualArchive !== archiveSha) {
       return refuse('the preserved opaque archive does not match its recorded digest — the tree is retained', verifiedAssets, actualRecordSha);

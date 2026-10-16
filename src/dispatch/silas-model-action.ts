@@ -206,11 +206,14 @@ export function spawnSilasWithActionTool(
     digest: deps.digest,
     ...(deps.log !== undefined ? { log: deps.log } : {}),
   });
-  const supplied: unknown = spawnOptions?.nativeTools ?? [];
-  if (!Array.isArray(supplied)) return Promise.reject(new TypeError('spawn options nativeTools must be an array of named native tools'));
+  let supplied: unknown;
+  try {
+    supplied = spawnOptions?.nativeTools ?? [];
+    if (!Array.isArray(supplied)) return Promise.reject(new TypeError('spawn options nativeTools must be an array of named native tools'));
+  } catch { return Promise.reject(new TypeError('spawn options nativeTools cannot be read')); }
   // Read once, every slot (holes included), each slot and name exactly once:
-  // a hostile array or getter is refused by index, never a raw throw, and
-  // what was checked is what is spawned.
+  // a hostile array or getter is refused by index, never a raw throw, and the
+  // tools read here — not a second read of the array — are the ones spawned.
   let slots: number;
   try { slots = supplied.length; } catch { return Promise.reject(new TypeError('spawn options nativeTools cannot be read')); }
   if (slots > MAX_NATIVE_TOOLS) return Promise.reject(new TypeError(`spawn options nativeTools has ${String(slots)} slots (at most ${String(MAX_NATIVE_TOOLS)})`));

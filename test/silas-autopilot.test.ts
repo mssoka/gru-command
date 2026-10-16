@@ -493,6 +493,15 @@ describe('autopilot mode resolution (kill switch + per-family modes)', () => {
     expect(() => canonicalJson({ get a(): unknown { throw new Error('no'); } })).toThrow(/^canonicalJson: the value at "a" cannot be read$/u);
     expect(() => canonicalJson([1, { toJSON() { throw new Error('no'); } }])).toThrow(/^canonicalJson: the value at "1" cannot be read$/u);
     expect(() => canonicalJson(new Array(100_001))).toThrow(/^canonicalJson: an array of 100001 items has no canonical form$/u);
+    expect(() => canonicalJson(new Array(100_000))).not.toThrow();
+    // Shared sub-arrays count every time they are walked: the whole walk is bounded.
+    const leaf = new Array<number>(1000).fill(0);
+    expect(() => canonicalJson(new Array<number[]>(1000).fill(leaf))).toThrow(/^canonicalJson: more than 1000000 values have no canonical form$/u);
+    // A hostile array or object is refused by name, wherever its read throws.
+    const throwingIndex = new Proxy([1], { get: (target, key) => { if (key === '0') throw new Error('no'); return Reflect.get(target, key) as unknown; } });
+    expect(() => canonicalJson({ list: throwingIndex })).toThrow(/^canonicalJson: the value at "0" cannot be read$/u);
+    const throwingKeys = new Proxy({}, { ownKeys: () => { throw new Error('no'); } });
+    expect(() => canonicalJson({ bag: throwingKeys })).toThrow(/^canonicalJson: the value at "bag" cannot be read$/u);
     // A repeated (non-circular) member is no cycle.
     const shared = { x: 1 };
     expect(canonicalJson({ a: shared, b: shared })).toBe('{"a":{"x":1},"b":{"x":1}}');

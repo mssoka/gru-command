@@ -7,6 +7,7 @@ import { isJobTerminal } from '../ledger/states.js';
 import { DirectiveCheckpointError, directiveProducerLockBlocker, directiveSessionLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader, type DirectiveCheckpoint, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
 import type { AgentHandle, NativeAgentTool } from '../runtime/types.js';
 import type { PacingGate, PacingLease, RetrySettlement } from '../runtime/pacing.js';
+import { lineSafeLiteral } from './line-safe.js';
 import { DirectiveDispatchDeferredError, flipJobToWorking, recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion, type DirectiveRegistry } from './fix-directive.js';
 import { observePendingRebriefs, type RecoveryNotifications } from './rebrief-recovery.js';
 import type { WorktreeLane, WorktreePort } from './worktree-port.js';
@@ -68,14 +69,6 @@ export function promptRefusalUnproven(input: {
   try { evidence = input.prepared.cessationEvidence?.(); } catch (error) { evidence = `unreadable: ${boundedErrorText(error)}`; }
   return evidence === 'ceased' ? null : `prepared producer ${input.prepared.id} has not proven cessation (${evidence ?? 'no cessation evidence'})`;
 }
-
-// JSON.stringify escapes only C0 controls; every other control (DEL, C1),
-// format (bidi marks and overrides, zero-width, BOM, tags), line or paragraph
-// separator, private-use or unassigned code point can still break, reorder
-// or hide a rendered line — the same classes silas_action text refuses.
-const LINE_UNSAFE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Co}\p{Cn}]/gu;
-const lineSafeLiteral = (text: string): string =>
-  JSON.stringify(text).replace(LINE_UNSAFE, (char) => Array.from({ length: char.length }, (_, unit) => `\\u${char.charCodeAt(unit).toString(16).padStart(4, '0')}`).join(''));
 
 /** An error as ledger-safe text: one JSON literal of at most 200 characters
  * (line breaks, controls and bidi overrides escaped; cut on a code point),

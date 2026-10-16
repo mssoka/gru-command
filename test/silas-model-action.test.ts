@@ -262,6 +262,14 @@ describe('H6 the Silas slot spawn wiring (#368)', () => {
     expect(spawned[0]?.options?.cwd).toBe('/w');
     expect(spawned[0]?.options?.nativeTools?.map((tool) => tool.name)).toEqual(['existing_tool', SILAS_MODEL_ACTION_TOOL]);
     expect(spawned[1]?.options?.nativeTools?.map((tool) => tool.name)).toEqual([SILAS_MODEL_ACTION_TOOL]);
+    // The tools read and checked are the ones spawned — never a second read of the array.
+    const clean = { name: 'clean_tool' } as unknown as NativeAgentTool;
+    const smuggled = { name: SILAS_MODEL_ACTION_TOOL } as unknown as NativeAgentTool;
+    let reads = 0;
+    const shifty = new Proxy([clean], { get: (target, key) => (key === '0' ? ((reads += 1) === 1 ? clean : smuggled) : Reflect.get(target, key) as unknown) });
+    await spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() }, { nativeTools: shifty as never });
+    expect(spawned[2]?.options?.nativeTools?.map((tool) => tool.name)).toEqual(['clean_tool', SILAS_MODEL_ACTION_TOOL]);
+    spawned.splice(2);
     const firstTool = spawned[0]!.options!.nativeTools![1]!;
     const secondTool = spawned[1]!.options!.nativeTools![0]!;
     await firstTool.execute({ action: 'hold', jobId: job.id });
@@ -308,6 +316,11 @@ describe('H6 the Silas slot spawn wiring (#368)', () => {
     // an array whose length cannot be read is refused by name.
     await expect(spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() }, { nativeTools: new Array(257) as never }))
       .rejects.toThrow('spawn options nativeTools has 257 slots (at most 256)');
+    const throwingSlot = new Proxy([{ name: 'x' }], { get: (target, key) => { if (key === '0') throw new Error('no slot'); return Reflect.get(target, key) as unknown; } });
+    await expect(spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() }, { nativeTools: throwingSlot as never }))
+      .rejects.toThrow('spawn options nativeTools[0] must be a native tool with a non-empty string name');
+    await expect(spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() }, { get nativeTools(): never { throw new Error('no tools'); } }))
+      .rejects.toThrow('spawn options nativeTools cannot be read');
     const hostile = new Proxy([], { get: (target, key) => { if (key === 'length') throw new Error('no length'); return Reflect.get(target, key) as unknown; } });
     await expect(spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() }, { nativeTools: hostile as never }))
       .rejects.toThrow('spawn options nativeTools cannot be read');

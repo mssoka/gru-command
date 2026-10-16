@@ -246,6 +246,7 @@ const PINS: Record<string, number> = {
   'ledger-db.test.ts': 10,
   'ledger-job-parent.test.ts': 5,
   'lessons-bible.test.ts': 109,
+  'line-safe.test.ts': 2,
   'lessons-bible-lock.test.ts': 5,
   'lessons-capture.test.ts': 14,
   'lessons-dream.test.ts': 65,
