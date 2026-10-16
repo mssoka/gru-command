@@ -17,10 +17,12 @@ that proves it on each adapter.
   - `#contract:<id>:neutral` marks a contract proven above the adapter layer,
     through the runtime-neutral `AgentHandle` interface.
 - `test/runtime-parity.test.ts` reads the two tables below and every test
-  title. Only a test registered with a plain `it(`, outside any
-  `describe.skip`/`skipIf`/`runIf`/`todo` block, counts as proof. A test
-  that skips itself from inside its own body cannot be seen by the guard;
-  review catches that. The guard fails when:
+  title. Only a test registered with a plain `it(` on its own line, outside
+  any block whose `describe` carries `skip`, `skipIf`, `runIf` or `todo`
+  (chained modifiers included), counts as proof. The scan follows blocks by
+  indentation. A test that skips itself from inside its own body, or a block
+  formatted unusually, cannot be seen by the guard; review catches that. The
+  guard fails when:
   - a contract lacks a test on either runtime (a neutral test covers both);
   - a tag is malformed or names a contract the matrix does not list;
   - a runtime's tag sits in the other runtime's adapter test file, or a
@@ -28,7 +30,8 @@ that proves it on each adapter.
   - a matrix cell does not name the file of a test tagged for it, or names a
     file that does not exist or holds no tag for that contract on that
     cell's runtime;
-  - a declared gap is not a matrix row marked as a gap, or has no issue.
+  - a declared gap is not a matrix row marked as a gap, has no issue, or a
+    row marked as a gap is not declared;
   - an adapter test file (`test/pi-adapter.test.ts`,
     `test/claude-adapter.test.ts`) grows a top-level `describe` block that the
     block map below does not place.

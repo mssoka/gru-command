@@ -55,11 +55,11 @@ function registeredLines(source: string): readonly { readonly line: string; read
   const open: { readonly indent: number; readonly conditional: boolean }[] = [];
   return source.split('\n').map((line) => {
     const indent = line.length - line.trimStart().length;
-    const block = /^\s*describe(\.[a-zA-Z]+)?/u.exec(line);
+    const block = /^\s*describe((?:\.[a-zA-Z]+)*)/u.exec(line);
     const closes = /^\s*\}\)/u.test(line);
     while (open.length > 0 && (indent < open.at(-1)!.indent || ((block !== null || closes) && indent === open.at(-1)!.indent))) open.pop();
     const conditional = open.some((entry) => entry.conditional);
-    if (block !== null) open.push({ indent, conditional: conditional || /^\.(skip|skipIf|runIf|todo)$/u.test(block[1] ?? '') });
+    if (block !== null) open.push({ indent, conditional: conditional || (block[1] ?? '').split('.').some((modifier) => ['skip', 'skipIf', 'runIf', 'todo'].includes(modifier)) });
     return { line, conditional };
   });
 }
@@ -200,9 +200,10 @@ describe('runtime parity guard (#374)', () => {
 
   it('a test inside a skipped or conditional describe block is no proof, however deep', () => {
     const source = [`${'describe'}('kept', () => {`, `  ${'it'}('a #contract:x:pi', () => {});`, '});', `${'describe'}.skipIf(true)('gated', () => {`,
-      `  ${'describe'}('inner', () => {`, `    ${'it'}('b #contract:x:pi', () => {});`, '  });', '});', `${'it'}('c #contract:x:pi', () => {});`].join('\n');
+      `  ${'describe'}('inner', () => {`, `    ${'it'}('b #contract:x:pi', () => {});`, '  });', '});', `${'it'}('c #contract:x:pi', () => {});`,
+      `${'describe'}.concurrent.skip('chained', () => {`, `  ${'it'}('d #contract:x:pi', () => {});`, '});'].join('\n');
     expect(registeredLines(source).filter((entry) => titleOf(entry.line) !== undefined).map((entry) => [titleOf(entry.line), entry.conditional]))
-      .toEqual([['a #contract:x:pi', false], ['b #contract:x:pi', true], ['c #contract:x:pi', false]]);
+      .toEqual([['a #contract:x:pi', false], ['b #contract:x:pi', true], ['c #contract:x:pi', false], ['d #contract:x:pi', true]]);
     expect(tagsIn('test/x.test.ts', source).found.map((found) => found.title)).toEqual(['a #contract:x:pi', 'c #contract:x:pi']);
   });
 
