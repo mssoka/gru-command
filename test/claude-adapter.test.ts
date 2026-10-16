@@ -2638,7 +2638,13 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     });
 
     it('a throw while handling a lost transcript write still fails the directive and ends its CLI', async () => {
-      const fx = fixture();
+      const signals: string[] = [];
+      const fx = fixture({ spawnProcess: ((binary: string, args: readonly string[], options: object) => {
+        const child = spawn(binary, args, options);
+        const kill = child.kill.bind(child);
+        child.kill = (signal?: NodeJS.Signals | number) => { signals.push(String(signal)); return kill(signal); };
+        return child;
+      }) as unknown as typeof spawn });
       const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
       vi.spyOn(handle as unknown as { failDirective(): void }, 'failDirective').mockImplementation(() => { throw new Error('handler broke'); });
       let broken = false;
@@ -2656,6 +2662,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       await expect(handle.prompt('answer plainly', { directive: { identity: identityFor('claude-handler-throws'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
         .rejects.toThrow(/directive failure handling threw: handler broke/u);
       expect(fx.logs.some((line) => line.level === 'error' && line.msg === 'directive failure handling threw after a lost transcript write')).toBe(true);
+      expect(signals[0]).toBe('SIGTERM'); // the CLI was ended, not left running
       await handle.dispose();
     });
 
@@ -2671,7 +2678,11 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
             pid: mode === 'errors-while-live' ? 4242 : undefined, exitCode: null, signalCode: null, killed: [] as string[],
             kill: (signal: string) => { child.killed.push(signal); return true; } });
           live = child;
-          setImmediate(() => child.emit('error', Object.assign(new Error('spawn claude ENOENT'), { code: 'ENOENT' })));
+          setImmediate(() => {
+            child.emit('error', Object.assign(new Error('spawn claude ENOENT'), { code: 'ENOENT' }));
+            // A live child may report a second error (say, a failed kill): handled once.
+            if (mode === 'errors-while-live') child.emit('error', Object.assign(new Error('kill EPERM'), { code: 'EPERM' }));
+          });
           return child as unknown as ChildProcess;
         }) as unknown as typeof spawn;
         const fx = fixture({ spawnProcess, killGraceMs: 50 });
@@ -2683,6 +2694,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
           let settled = false;
           void prompt.catch(() => {}).finally(() => { settled = true; });
           await vi.waitFor(() => expect(live!.killed).toEqual(['SIGTERM', 'SIGKILL']));
+          expect(fx.logs.filter((line) => line.msg === 'a further claude child error was ignored: its first error already ended the child'), mode).toHaveLength(1);
           expect(existsSync(settings), mode).toBe(true);
           expect(settled, mode).toBe(false);
           live!.emit('close', null, 'SIGKILL');

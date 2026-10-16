@@ -2057,7 +2057,10 @@ export class ClaudeCodeHandle implements AgentHandle {
                   turn.failure ??= failure;
                   this.log('error', 'directive failure handling threw after a lost transcript write', { error: failure instanceof Error ? failure.stack ?? failure.message : String(failure) });
                   try { abortTurn(`directive failure handling threw: ${failure instanceof Error ? failure.message : String(failure)}`); }
-                  catch { try { child.kill('SIGKILL'); } catch { /* already gone */ } }
+                  catch {
+                    try { child.stdin?.end(); } catch { /* already closed */ }
+                    try { child.kill('SIGKILL'); } catch { /* already gone */ }
+                  }
                 } finally {
                   resolveWritten();
                 }
@@ -2169,7 +2172,10 @@ export class ClaudeCodeHandle implements AgentHandle {
           // A live directive CLI (#424): its turn settles only from its close
           // (one writer per session), so it is ended — once — to make that
           // close come; its settings stay until then.
-          if (liveError) return;
+          if (liveError) {
+            this.log('warn', 'a further claude child error was ignored: its first error already ended the child', { error: String(error) });
+            return;
+          }
           liveError = true;
           this.onInfraError(error);
           abortTurn(`claude process failed: ${String(error)}`);
