@@ -356,13 +356,15 @@ export function blindSessionIdentity(sessionFile: string): string {
  * nearest ancestor that still resolves, canonical, plus the names below it —
  * and a link whose target is gone names that target, joined to the link's
  * canonical directory WITHOUT lexical `..` collapse, so the OS's realpath
- * walks it physically, as it did while the target existed. The links followed
- * across the whole walk are capped (as realpath caps its own); plain depth is
- * bounded by the path itself. A `..` under a missing directory is refused by
- * name, and any failure other than absence is raised. */
+ * walks it physically, as it did while the target existed. The links this
+ * walk follows itself are one count, capped; plain depth is bounded by the
+ * path itself. A `..` under a missing directory or a non-directory is refused
+ * by name, and any failure other than absence is raised. */
 function canonicalPathOf(path: string): string {
-  // One count of links followed across the whole walk — parents and targets
-  // alike — capped as the OS caps its own (MAXSYMLINKS is 32 to 40).
+  // One count of the links this walk follows itself — parents and targets
+  // alike — capped as the OS caps its own (MAXSYMLINKS is 32 to 40). A backstop:
+  // the OS's realpath of the whole path already followed each of them, and
+  // refuses a longer chain first wherever it counts them.
   let hops = 0;
   const walk = (current: string): string => {
     try {
@@ -374,7 +376,11 @@ function canonicalPathOf(path: string): string {
       const parent = dirname(current);
       if ((code !== 'ENOENT' && code !== 'ENOTDIR') || parent === current) throw error;
       // `..` past a missing directory has no physical answer: never guessed lexically.
-      if (basename(current) === '..') throw new Error(`${path} climbs (..) out of a directory that does not exist — it has no physical identity`, { cause: error });
+      if (basename(current) === '..') {
+        // Named where it is met: a link's target may carry the `..`.
+        const where = current === path ? path : `${current} (resolving ${path})`;
+        throw new Error(`${where} climbs (..) out of ${code === 'ENOTDIR' ? 'something that is not a directory' : 'a directory that does not exist'} — it has no physical identity`, { cause: error });
+      }
       const canonicalParent = walk(parent);
       const link = danglingLinkTarget(current);
       if (link === null) return join(canonicalParent, basename(current));

@@ -326,35 +326,35 @@ describe('observed reviewer access — grep paths with spaces (#357)', () => {
   it('a file-like spaced path outside the package still classifies — by shape, or by the directory it names', () => {
     const prohibited = scanObservedAccess(
       [
-        { index: 1, toolName: 'bash', text: '/Users/John Smith/repo/docs/issues/a.md:3:text' },
+        { index: 1, toolName: 'bash', text: '/srv/John Smith/repo/docs/issues/a.md:3:text' },
         { index: 2, toolName: 'bash', text: '../other repo/docs/issues/a.md:1:x' },
-        { index: 3, toolName: 'bash', text: '/Users/John Smith/notes.md:1:x' },
+        { index: 3, toolName: 'bash', text: '/srv/John Smith/notes.md:1:x' },
         // A relative spaced path names its excluded directory through a path-component suffix.
         { index: 4, toolName: 'bash', text: 'vendor copy/docs/issues/b.md:2:y' },
         // Extensionless and dot files are file-like too.
-        { index: 5, toolName: 'bash', text: '/Users/a b/Makefile:2:all:' },
-        { index: 6, toolName: 'bash', text: '/Users/John Smith/.env:1:TOKEN=x' },
+        { index: 5, toolName: 'bash', text: '/srv/a b/Makefile:2:all:' },
+        { index: 6, toolName: 'bash', text: '/srv/John Smith/.env:1:TOKEN=x' },
         // Whitespace before the line number is not part of the path.
         { index: 7, toolName: 'bash', text: 'docs/issues/a.md :1:x' },
       ],
       DEFAULT_BLIND_ISOLATION_RULE,
     );
     expect(prohibited.map((p) => `${p.index}:${p.path ?? ''}`)).toEqual([
-      '1:/Users/John Smith/repo/docs/issues/a.md',
+      '1:/srv/John Smith/repo/docs/issues/a.md',
       '2:../other repo/docs/issues/a.md',
-      '3:/Users/John Smith/notes.md',
+      '3:/srv/John Smith/notes.md',
       '4:docs/issues/b.md',
-      '5:/Users/a b/Makefile',
-      '6:/Users/John Smith/.env',
+      '5:/srv/a b/Makefile',
+      '6:/srv/John Smith/.env',
       '7:docs/issues/a.md',
     ]);
     // A Windows-style spaced hit is judged as the same path — a drive and a
     // UNC share are outside by shape too.
     expect(scanObservedAccess([
       { index: 8, toolName: 'bash', text: '..\\other repo\\docs\\issues\\a.md:1:x' },
-      { index: 10, toolName: 'bash', text: 'C:\\Users\\a b\\notes.md:1:x' },
+      { index: 10, toolName: 'bash', text: 'C:\\Data\\a b\\notes.md:1:x' },
       { index: 11, toolName: 'bash', text: '\\\\host\\my share\\f.md:1:x' },
-    ], DEFAULT_BLIND_ISOLATION_RULE).map((p) => p.path)).toEqual(['../other repo/docs/issues/a.md', 'C:/Users/a b/notes.md', '//host/my share/f.md']);
+    ], DEFAULT_BLIND_ISOLATION_RULE).map((p) => p.path)).toEqual(['../other repo/docs/issues/a.md', 'C:/Data/a b/notes.md', '//host/my share/f.md']);
     // A lone `/word` or a `//host` URL in prose is no outside path.
     for (const text of ['ratio 3 /4:12:', 'run /help:5:', 'see //host/x y:1:', 'the dir /tmp/:1:', 'see //a b/c/d.md:1:', 'at C:/x then:1:']) {
       expect(scanObservedAccess([{ index: 9, toolName: 'bash', text }], DEFAULT_BLIND_ISOLATION_RULE), text).toEqual([]);

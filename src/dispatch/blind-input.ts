@@ -615,7 +615,7 @@ const MAX_PATH_CHARS = 4096;
  * component is non-empty with no whitespace, and it is a parent path
  * (`../x`), an absolute one naming at least a directory and a file (POSIX or
  * a Windows drive), or a UNC share naming an unspaced host, a share and a
- * file — a real spaced path (`/Users/a b/notes.md`, `C:/Users/a b/Makefile`),
+ * file — a real spaced path (`/srv/a b/notes.md`, `C:/Data/a b/Makefile`),
  * never prose or a clock time whose words follow the last slash
  * (`/var/log/app.log started at 10`), a lone `/word` (`ratio 3 /4:12:`), a
  * spaced `//a b/…` or a bare `//host` URL. */
@@ -645,7 +645,7 @@ function fileLikeOutside(candidate: string): boolean {
  * the path itself. A spaced capture (#357) is ambiguous — prose or a clock
  * time reaches a `:digits:` too — so it, and every suffix of it that starts a
  * word or a path component (`Matches in docs/issues/a b.md:1:` names
- * `docs/issues/a b.md`; `/Users/a b/repo/docs/issues/x.md:1:` names
+ * `docs/issues/a b.md`; `/srv/a b/repo/docs/issues/x.md:1:` names
  * `docs/issues/x.md`), is judged by the isolation globs; by shape only when
  * it is file-like (see fileLikeOutside). */
 export function grepPathCandidates(line: string): readonly { readonly path: string; readonly byShape: boolean }[] {

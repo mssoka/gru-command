@@ -3,6 +3,21 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
+
+// The OS's realpath counts its own links and refuses a long chain first; a
+// test stands in a realpath that fails for chosen paths, so the walk's own
+// count of links is what decides.
+const { fsHooks } = vi.hoisted(() => ({ fsHooks: { nativeRealpathFails: null as ((path: string) => string | null) | null } }));
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  const native = ((path: Parameters<typeof actual.realpathSync.native>[0], options?: Parameters<typeof actual.realpathSync.native>[1]) => {
+    const code = fsHooks.nativeRealpathFails?.(String(path)) ?? null;
+    if (code !== null) throw Object.assign(new Error(`${code}: realpath '${String(path)}'`), { code });
+    return actual.realpathSync.native(path, options);
+  }) as typeof actual.realpathSync.native;
+  const realpathSync = Object.assign(((...args: Parameters<typeof actual.realpathSync>) => actual.realpathSync(...args)) as typeof actual.realpathSync, { native });
+  return { ...actual, realpathSync };
+});
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
@@ -251,7 +266,35 @@ describe('observeBlindSessionAccess — repeated scans count distinct reads (iss
       rmSync(join(loopDir, 'elsewhere', 'up2.jsonl'));
       expect(blindSessionIdentity(join(loopDir, 'subalias', 'l2.jsonl'))).toBe(physical);
       // A `..` under a directory that does not exist has no physical identity.
-      expect(() => blindSessionIdentity(`${loopDir}/missing/../a.jsonl`)).toThrow(`${loopDir}/missing/../a.jsonl climbs (..) out of a directory that does not exist — it has no physical identity`);
+      expect(() => blindSessionIdentity(`${loopDir}/missing/../a.jsonl`))
+        .toThrow(`${loopDir}/missing/.. (resolving ${loopDir}/missing/../a.jsonl) climbs (..) out of a directory that does not exist — it has no physical identity`);
+      // ...nor one under a file, named as such (Linux's realpath answers
+      // ENOTDIR there; macOS's resolves it, so that answer is stood in).
+      writeFileSync(join(loopDir, 'plain.txt'), '');
+      fsHooks.nativeRealpathFails = (path) => (path.includes('/plain.txt/..') ? 'ENOTDIR' : null);
+      try {
+        expect(() => blindSessionIdentity(`${loopDir}/plain.txt/../a.jsonl`))
+          .toThrow(`${loopDir}/plain.txt/.. (resolving ${loopDir}/plain.txt/../a.jsonl) climbs (..) out of something that is not a directory — it has no physical identity`);
+      } finally { fsHooks.nativeRealpathFails = null; }
+      // A gone link's target carrying the `..` is named where it is met.
+      symlinkSync('missing2/../x.jsonl', join(loopDir, 'dl.jsonl'));
+      expect(() => blindSessionIdentity(join(loopDir, 'dl.jsonl')))
+        .toThrow(`${realpathSync(loopDir)}/missing2/.. (resolving ${join(loopDir, 'dl.jsonl')}) climbs (..) out of a directory that does not exist`);
+      // The walk's own count spans parents and targets: 20 + 20 links pass, 21 + 20 do not.
+      for (const [label, parents] of [['under', 20], ['over', 21]] as const) {
+        const capDir = join(loopDir, `cap-${label}`);
+        const real = realpathSync(loopDir);
+        mkdirSync(join(capDir, `p${String(parents)}`), { recursive: true });
+        for (let index = 0; index < parents; index += 1) symlinkSync(`p${String(index + 1)}`, join(capDir, `p${String(index)}`));
+        const end = join(capDir, `p${String(parents)}`);
+        for (let index = 0; index < 20; index += 1) symlinkSync(index === 19 ? 'end.jsonl' : `t${String(index + 1)}`, join(end, `t${String(index)}`));
+        fsHooks.nativeRealpathFails = (path) => (path.startsWith(`${capDir}/`) || path.startsWith(`${real}/cap-${label}/`) ? 'ENOENT' : null);
+        try {
+          const target = join(capDir, 'p0', 't0');
+          if (label === 'under') expect(blindSessionIdentity(target)).toBe(sha256(join(real, `cap-${label}`, `p${String(parents)}`, 'end.jsonl')));
+          else expect(() => blindSessionIdentity(target)).toThrow(`too many levels of links resolving ${target}`);
+        } finally { fsHooks.nativeRealpathFails = null; }
+      }
       // A gone path many directories deep is no loop: it keeps its identity.
       const deepGone = join(loopDir, ...Array.from({ length: 80 }, (_, index) => `d${String(index)}`), 'gone.jsonl');
       expect(blindSessionIdentity(deepGone)).toBe(sha256(deepGone));
