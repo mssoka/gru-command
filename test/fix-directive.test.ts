@@ -535,6 +535,7 @@ describe('eviction-safe fix directives (phase 3)', () => {
       jobId: 'job-no-prepare', directive: 'repair', signal: controller.signal,
       directiveTurn: { identity: {} as never, beforeAdmission: () => {}, onAdmitted: () => {} },
     }).then(() => null, (error: unknown) => error);
+    expect(refusal, 'the route refused').not.toBeNull();
     expect(refusal).toBeInstanceOf(DirectiveRoutingContractError);
     expect((refusal as Error).message).toMatch(/^job "job-no-prepare": a native directive turn needs onPrepared/u);
     expect(calls).toEqual([]);

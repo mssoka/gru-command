@@ -136,8 +136,9 @@ export class DirectiveDispatchDeferredError extends Error {
 }
 
 /** A caller broke the routing contract (a programming error), refused
- * before any effect. It is never a deferral: the executor surfaces it as a
- * recovery decision, and the fix is in the calling code, not a retry. */
+ * before any effect. It is no DirectiveDispatchDeferredError, so an executor
+ * never records it as a deferral; the fix is in the calling code, not a
+ * retry. */
 export class DirectiveRoutingContractError extends Error {
   constructor(message: string) { super(message); this.name = 'DirectiveRoutingContractError'; }
 }
