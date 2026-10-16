@@ -129,9 +129,6 @@ describe('worktree handoff with a --separate-git-dir repository (#372)', () => {
   });
 
   it('refuses each malformed gitdir layout by name, with the path and the missing piece', () => {
-    const fullGitDir = (dir: string): void => {
-      mkdirSync(join(dir, 'objects'), { recursive: true }); mkdirSync(join(dir, 'refs')); writeFileSync(join(dir, 'HEAD'), 'ref: refs/heads/main\n');
-    };
     const cases: readonly (readonly [string, (gitdir: string) => void, RegExp])[] = [
       ['missing', () => {}, /: it does not exist$/u],
       ['dangling link', (gitdir) => { symlinkSync(join(directory(), 'nowhere'), gitdir); }, /: it does not exist$/u],
