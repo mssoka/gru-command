@@ -11,7 +11,7 @@ import { NotificationCenter } from '../src/notifications/center.js';
 import { propertyCampaignRunningForReview, propertyEvidenceForReview, type PropertyCampaignResult } from '../src/property/pipeline.js';
 import type { PackageResolution, RetainedCounterexample } from '../src/property/types.js';
 import type { AgentHandle, IsolatedReviewPolicy } from '../src/runtime/types.js';
-import { RAID_OUTCOMES, VECTOR_EVENTS } from '../src/vector/ledger.js';
+import { RAID_OUTCOMES, repositoryRollups, VECTOR_EVENTS, ZERO_BREAK_IN_FLAG_RAIDS, type RaidRecord } from '../src/vector/ledger.js';
 import { raidOutcomeLabel, VectorRaidRunner, type RaidCampaign } from '../src/vector/runner.js';
 import { FIX_DISPATCHED_KIND, FIX_PROPOSAL_KIND, VectorService } from '../src/vector/service.js';
 
@@ -280,11 +280,59 @@ describe('Silas\'s raid queue (#351 §3)', () => {
     expect(h.service.candidates().candidates).toHaveLength(1);
   });
 
+  it('with [vector] enabled = false the queue never runs: no Vector session, no raid', async () => {
+    const h = harness({ vector: { enabled: false }, scripts: [{ attack: attackInput(1) }] });
+    h.ledger.appendCustomEvent({ kind: VECTOR_EVENTS.picked, payload: { raid_id: 'raid-queued-before', repo: 'billing', package_dir: 'src/refunds', source_identity: 'x', head_sha: 'h', reason: 'r', requested_by: 'gru' } });
+    h.ledger.appendCustomEvent({ kind: VECTOR_EVENTS.queued, payload: { raid_id: 'raid-queued-before', launched_by: 'autonomous' } });
+    h.runner.start();
+    expect(await h.runner.tick()).toBeNull();
+    expect(h.spawned).toBe(0);
+    expect(raid(h, 'raid-queued-before').state).toBe('queued');
+  });
+
   it('no label renders an empty raid as a pass, verified or free of defects', () => {
     for (const outcome of RAID_OUTCOMES) {
       expect(raidOutcomeLabel(outcome, 'detail', 3), outcome).not.toMatch(/\bpass(ed)?\b|verified|no defects|\bclean\b/iu);
     }
     expect(raidOutcomeLabel('budget-exhausted', '', 1)).toBe('Raid over: no break-in found in 1 attack — not proof the code is safe');
+  });
+});
+
+describe('repository rollup (#351 §5)', () => {
+  const finished = (n: number, outcome: RaidRecord['outcome'], breakIns: number, tokens: number | null): RaidRecord => ({
+    id: `raid-${String(n)}`, target: { repo: 'billing', packageDir: 'src/refunds' }, sourceIdentity: `t${String(n)}`, headSha: 'h', reason: 'r', requestedBy: 'gru',
+    signals: { commitsSinceLastRaid: 0, escapedRegressions: 0, perkinsFindings: 0, daysSinceLastRaid: null }, pickedAt: '2026-10-01T00:00:00Z',
+    state: 'finished', notificationId: null, launchedBy: 'autonomous', launchedAt: '2026-10-01T00:00:00Z', closedDetail: null, startedAt: null, runHeadSha: 'h', rounds: [],
+    outcome, outcomeLabel: 'x', finishedAt: new Date(Date.parse('2026-10-01T00:00:00Z') + n * 60_000).toISOString(), reportFile: null,
+    metrics: { proposals: 2, qualified: 1, invalidOracles: 1, executedRuns: 6, breakIns, wallClockMs: 1000, tokens },
+  });
+
+  it('reports cost per break-in and the invalid-oracle rate, and flags spend once enough raids in a row found nothing', () => {
+    const found = finished(0, 'found', 1, 3000);
+    const empties = Array.from({ length: ZERO_BREAK_IN_FLAG_RAIDS - 1 }, (_, index) => finished(index + 1, 'budget-exhausted', 0, 1000));
+    // Refused and unsupported raids ran nothing, so they spend nothing and never count.
+    const refused = { ...finished(50, 'refused', 0, null), metrics: null };
+    const [before] = repositoryRollups([found, ...empties, refused]);
+    expect(before).toMatchObject({ repo: 'billing', raids: ZERO_BREAK_IN_FLAG_RAIDS, breakIns: 1, tokens: 3000 + 1000 * (ZERO_BREAK_IN_FLAG_RAIDS - 1),
+      costPerBreakIn: 3000 + 1000 * (ZERO_BREAK_IN_FLAG_RAIDS - 1), invalidOracleRate: 0.5, raidsSinceLastBreakIn: ZERO_BREAK_IN_FLAG_RAIDS - 1, flag: null });
+    const [after] = repositoryRollups([found, ...empties, finished(99, 'no-qualified-proposals', 0, null)]);
+    expect(after).toMatchObject({ raidsSinceLastBreakIn: ZERO_BREAK_IN_FLAG_RAIDS, raidsWithoutTokenUsage: 1,
+      flag: expect.stringMatching(new RegExp(`^${String(ZERO_BREAK_IN_FLAG_RAIDS)} raids in a row found no break-in .*turning raids off for billing is your call$`, 'u')) });
+  });
+
+  it('the raid that reaches the streak says so on its FYI, and the rollup is on the API surface', async () => {
+    const h = harness({ vector: { maxRounds: 1, maxRaidsPerDay: 10 }, scripts: [{ attack: attackInput(1) }] });
+    for (let n = 0; n < ZERO_BREAK_IN_FLAG_RAIDS - 1; n += 1) {
+      const id = `raid-earlier-${String(n)}`;
+      h.ledger.appendCustomEvent({ kind: VECTOR_EVENTS.picked, payload: { raid_id: id, repo: 'billing', package_dir: 'src/refunds', source_identity: `old-${String(n)}`, head_sha: 'h', reason: 'r', requested_by: 'gru' } });
+      h.ledger.appendCustomEvent({ kind: VECTOR_EVENTS.queued, payload: { raid_id: id, launched_by: 'autonomous' } });
+      h.ledger.appendCustomEvent({ kind: VECTOR_EVENTS.finished, payload: { raid_id: id, outcome: 'budget-exhausted', label: 'x', detail: 'd', metrics: { proposals: 1, executed_runs: 3, break_ins: 0, tokens: 10 } } });
+    }
+    const id = h.launch();
+    await h.runner.tick();
+    expect(raid(h, id).outcome).toBe('budget-exhausted');
+    expect(h.rows('vector.raid-finished').find((row) => row.id === `vector-finished:${id}`)!.detail).toMatch(new RegExp(`${String(ZERO_BREAK_IN_FLAG_RAIDS)} raids in a row found no break-in`, 'u'));
+    expect(h.service.rollup()).toEqual([expect.objectContaining({ repo: 'billing', raids: ZERO_BREAK_IN_FLAG_RAIDS, flag: expect.any(String) })]);
   });
 });
 

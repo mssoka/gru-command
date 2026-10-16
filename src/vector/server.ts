@@ -15,6 +15,7 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  *   GET  /api/vector/candidates   the ranked list, its digest and exclusions
  *   POST /api/vector/raids        { digest?, picks: [{ repo, package_dir, reason }], requested_by? }
  *   GET  /api/vector/raids        every raid record
+ *   GET  /api/vector/rollup       spend and yield per repository (cost per break-in, zero-break-in flag)
  */
 
 export interface VectorServerOptions {
@@ -157,6 +158,11 @@ export function createVectorServer(options: VectorServerOptions): VectorServer {
     if (path === '/api/vector/raids' && req.method === 'GET') {
       if (!authed(req, res)) return true;
       json(res, 200, { enabled: options.service.enabled, raids: options.service.raids().map(raidView) });
+      return true;
+    }
+    if (path === '/api/vector/rollup' && req.method === 'GET') {
+      if (!authed(req, res)) return true;
+      json(res, 200, { rollup: options.service.rollup() });
       return true;
     }
     if (path === '/api/vector/raids' && req.method === 'POST') {

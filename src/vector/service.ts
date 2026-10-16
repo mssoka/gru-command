@@ -8,7 +8,7 @@ import type { NotificationCenter } from '../notifications/center.js';
 import type { PackageResolution } from '../property/types.js';
 import { buildRaidCandidates, type RaidCandidate, type RaidCandidateList } from './candidates.js';
 import { breakInContract, fixHeistJobId, fixHeistTitle, renderFixBriefing } from './fix.js';
-import { signalsPayload, VECTOR_EVENTS, VectorLedger, type BreakInRecord, type RaidRecord, type RaidRequester, type RaidTarget } from './ledger.js';
+import { repositoryRollups, signalsPayload, VECTOR_EVENTS, VectorLedger, type BreakInRecord, type RaidRecord, type RaidRequester, type RaidTarget, type RepositoryRollup } from './ledger.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -358,6 +358,11 @@ export class VectorService {
 
   breakIns(): readonly BreakInRecord[] {
     return this.store.breakIns();
+  }
+
+  /** Spend and yield per repository across every finished raid (#351 §5). */
+  rollup(): readonly RepositoryRollup[] {
+    return repositoryRollups(this.store.raids());
   }
 
   /**

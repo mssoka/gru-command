@@ -68,6 +68,7 @@ Gru answers through the API:
 | `GET /api/vector/candidates` | — | the ranked list, its `digest`, every exclusion with its reason |
 | `POST /api/vector/raids` | `{ "digest"?, "picks": [{ "repo", "package_dir", "reason" }], "requested_by"?: "gru" \| "owner-chat" }` | `201 { raids }`; `422 not_a_candidate`/`invalid_pick`; `409 vector_disabled` |
 | `GET /api/vector/raids` | — | every raid record |
+| `GET /api/vector/rollup` | — | spend and yield per repository (see below) |
 
 How `POST /api/vector/raids` behaves:
 
@@ -179,6 +180,14 @@ Its metrics extend #350's: proposals, qualified, rejections by verdict,
 invalid-oracle rate, executed runs, break-ins, replay reliability, wall clock,
 token usage, and the headline **cost per break-in**. Generated case counts are
 context, never a success measure.
+
+The **repository rollup** (`GET /api/vector/rollup`) sums every finished raid
+that spent anything; refused and unsupported raids ran nothing and are left
+out. Per repository it shows raids, proposals, the invalid-oracle rate,
+executed runs, break-ins, tokens, cost per break-in, and the raids since the
+last break-in. After five raids in a row with no break-in, it flags the spend.
+The raid that reaches the streak repeats the flag on its FYI. It is surfaced
+as a number: turning raids off is your call.
 
 ## Break-ins
 

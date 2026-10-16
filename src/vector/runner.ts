@@ -14,7 +14,7 @@ import type { PackageResolution, RetainedCounterexample } from '../property/type
 import type { PacingLease } from '../runtime/pacing.js';
 import type { AgentHandle, IsolatedReviewPolicy } from '../runtime/types.js';
 import { renderRoundPrompt, VECTOR_SYSTEM_PROMPT, vectorAttackTool, type Attack, type AttackFile } from './attack.js';
-import { VECTOR_EVENTS, VectorLedger, type BreakInRecord, type RaidOutcome, type RaidRecord } from './ledger.js';
+import { repositoryRollups, VECTOR_EVENTS, VectorLedger, type BreakInRecord, type RaidOutcome, type RaidRecord } from './ledger.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -470,6 +470,7 @@ export class VectorRaidRunner {
       this.log('error', 'vector raid report write failed; the ledger keeps the outcome', { raid: raid.id, error: oneLineError(error) });
     }
     this.store.record(VECTOR_EVENTS.finished, { raid_id: raid.id, outcome, label, detail, report_file: reportFile, metrics });
+    const flag = repositoryRollups(this.store.raids()).find((rollup) => rollup.repo === raid.target.repo)?.flag ?? null;
     const name = raid.target.packageDir === '.' ? raid.target.repo : `${raid.target.repo}/${raid.target.packageDir}`;
     this.opts.notifications.post({
       id: `vector-finished:${raid.id}`,
@@ -477,7 +478,7 @@ export class VectorRaidRunner {
       routing: 'fyi',
       severity: outcome === 'infrastructure-error' ? 'error' : 'info',
       title: `Vector raid on ${name.length > 120 ? `${name.slice(0, 119)}…` : name}: ${label.length > 160 ? `${label.slice(0, 159)}…` : label}`,
-      detail: `${detail}\n${String(attacks)} attack(s), ${String(metrics.executed_runs)} sandboxed run(s), ${String(metrics.break_ins)} break-in(s).${reportFile === null ? '' : ` Report: ${reportFile}`}`,
+      detail: `${detail}\n${String(attacks)} attack(s), ${String(metrics.executed_runs)} sandboxed run(s), ${String(metrics.break_ins)} break-in(s).${reportFile === null ? '' : ` Report: ${reportFile}`}${flag === null ? '' : `\n${flag}`}`,
     });
   }
 

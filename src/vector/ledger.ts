@@ -133,6 +133,78 @@ export interface RaidRecord {
   readonly outcomeLabel: string | null;
   readonly finishedAt: string | null;
   readonly reportFile: string | null;
+  /** The raid's metrics as its report recorded them. */
+  readonly metrics: RaidMetrics | null;
+}
+
+/** Per-raid metrics (#351 §5): they extend #350's snapshot, and never count generated cases. */
+export interface RaidMetrics {
+  readonly proposals: number;
+  readonly qualified: number;
+  readonly invalidOracles: number;
+  readonly executedRuns: number;
+  readonly breakIns: number;
+  readonly wallClockMs: number;
+  /** null when the runtime reported no usage. */
+  readonly tokens: number | null;
+}
+
+/** Finished raids in a row with no break-in before a repository's spend is flagged. */
+export const ZERO_BREAK_IN_FLAG_RAIDS = 5;
+
+/** One repository's raid spend and yield across every finished raid. */
+export interface RepositoryRollup {
+  readonly repo: string;
+  readonly raids: number;
+  readonly proposals: number;
+  readonly invalidOracles: number;
+  readonly invalidOracleRate: number | null;
+  readonly executedRuns: number;
+  readonly breakIns: number;
+  /** Tokens across raids that reported usage, and how many did not. */
+  readonly tokens: number;
+  readonly raidsWithoutTokenUsage: number;
+  /** The headline metric: tokens per break-in (null with no break-in or no reported usage). */
+  readonly costPerBreakIn: number | null;
+  /** Finished raids since the last one that broke in (all of them when none did). */
+  readonly raidsSinceLastBreakIn: number;
+  /** Set once that streak reaches ZERO_BREAK_IN_FLAG_RAIDS. Turning raids off is the owner's call. */
+  readonly flag: string | null;
+}
+
+/** Raids that actually spent: refused and unsupported raids ran nothing. */
+const SPENT = (raid: RaidRecord): boolean => raid.state === 'finished' && raid.outcome !== 'refused' && raid.outcome !== 'unsupported';
+
+export function repositoryRollups(raids: readonly RaidRecord[]): readonly RepositoryRollup[] {
+  const byRepo = new Map<string, RaidRecord[]>();
+  for (const raid of raids.filter(SPENT)) byRepo.set(raid.target.repo, [...(byRepo.get(raid.target.repo) ?? []), raid]);
+  return [...byRepo.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([repo, list]) => {
+    const ordered = [...list].sort((left, right) => Date.parse(left.finishedAt!) - Date.parse(right.finishedAt!));
+    const sum = (pick: (metrics: RaidMetrics) => number): number => ordered.reduce((total, raid) => total + (raid.metrics === null ? 0 : pick(raid.metrics)), 0);
+    const breakIns = sum((metrics) => metrics.breakIns);
+    const proposals = sum((metrics) => metrics.proposals);
+    const invalidOracles = sum((metrics) => metrics.invalidOracles);
+    const tokens = sum((metrics) => metrics.tokens ?? 0);
+    const raidsWithoutTokenUsage = ordered.filter((raid) => raid.metrics?.tokens === null || raid.metrics === null).length;
+    const lastFound = ordered.map((raid) => raid.outcome === 'found').lastIndexOf(true);
+    const raidsSinceLastBreakIn = ordered.length - 1 - lastFound;
+    return {
+      repo,
+      raids: ordered.length,
+      proposals,
+      invalidOracles,
+      invalidOracleRate: proposals === 0 ? null : invalidOracles / proposals,
+      executedRuns: sum((metrics) => metrics.executedRuns),
+      breakIns,
+      tokens,
+      raidsWithoutTokenUsage,
+      costPerBreakIn: breakIns === 0 || raidsWithoutTokenUsage === ordered.length ? null : tokens / breakIns,
+      raidsSinceLastBreakIn,
+      flag: raidsSinceLastBreakIn >= ZERO_BREAK_IN_FLAG_RAIDS
+        ? `${String(raidsSinceLastBreakIn)} raids in a row found no break-in (${String(sum((metrics) => metrics.executedRuns))} sandboxed runs${tokens > 0 ? `, ${String(tokens)} tokens` : ''} spent in total); turning raids off for ${repo} is your call`
+        : null,
+    };
+  });
 }
 
 export interface PlanRecord {
@@ -278,6 +350,7 @@ export class VectorLedger {
           outcomeLabel: null,
           finishedAt: null,
           reportFile: null,
+          metrics: null,
         });
         return;
       }
@@ -366,8 +439,12 @@ export class VectorLedger {
       case VECTOR_EVENTS.finished: {
         const outcome = text(payload, 'outcome');
         if (!(RAID_OUTCOMES as readonly string[]).includes(outcome)) throw new VectorRecordError(`raid "${id}" names an unknown outcome "${outcome}"`);
+        const m = (typeof payload['metrics'] === 'object' && payload['metrics'] !== null ? payload['metrics'] : {}) as Payload;
+        const count = (key: string): number => (typeof m[key] === 'number' ? m[key] : 0);
         this.raidsById.set(id, { ...raid, state: 'finished', outcome: outcome as RaidOutcome, outcomeLabel: text(payload, 'label'), finishedAt: ts,
-          reportFile: typeof payload['report_file'] === 'string' ? payload['report_file'] : null });
+          reportFile: typeof payload['report_file'] === 'string' ? payload['report_file'] : null,
+          metrics: { proposals: count('proposals'), qualified: count('qualified'), invalidOracles: count('invalid_oracles'), executedRuns: count('executed_runs'),
+            breakIns: count('break_ins'), wallClockMs: count('wall_clock_ms'), tokens: typeof m['tokens'] === 'number' ? m['tokens'] : null } });
         return;
       }
       default:
