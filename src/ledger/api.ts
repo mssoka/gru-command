@@ -8055,6 +8055,8 @@ export class LedgerApi {
     }
   }
 
+  /** Reserves the dispatch (once). A reservation alone is no cleanup
+   * blocker — see directiveCleanupBlockers (#362). */
   claimDirectiveDispatch(requestId: string): boolean {
     return this.transaction(() => {
       const identity = this.directiveTurnIdentity(requestId);
@@ -8185,6 +8187,14 @@ export class LedgerApi {
     }
   }
 
+  /** A dispatch reservation alone is deliberately NOT a cleanup blocker
+   * (#362): every route prompts only after onPrepared has committed the
+   * native target and the producer start (each of which IS fenced here), so
+   * a crash between registry.spawn() and onPrepared left no native effect —
+   * the spawned registration leaves the agent idle, with no open turn. The
+   * reserved request is never replayed (its claim is spent) and owes a
+   * recovery decision; a successor may proceed at once. Pinned by the
+   * crash-window tests in restart-recovery-progress.test.ts. */
   private directiveCleanupBlockers(jobId: string, ownProducerStartSeq?: number): readonly string[] {
     const rows = this.db.prepare(`SELECT seq, kind, payload FROM events e WHERE e.job_id = ?
       AND e.kind IN ('silas.directive-producer-unknown', 'silas.directive-producer-ceased')
