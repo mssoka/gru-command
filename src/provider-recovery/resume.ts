@@ -79,7 +79,8 @@ function freshBriefing(
 
 /** A FRESH blind reviewer is briefed with the package it was admitted
  * with (#360 R5-B3), exactly as at its first spawn; a resumed session
- * already holds it. */
+ * already holds it. An attested package that was not kept throws by name
+ * (admittedBlindPackage), failing the continuation loudly. */
 function withBlindPackage(briefing: string | null, pkg: ReturnType<typeof admittedBlindPackage>): string | null {
   if (pkg === null) return briefing;
   return [...(briefing === null ? [] : [briefing]), renderBlindPackageBlock(pkg).join('\n')].join('\n\n');

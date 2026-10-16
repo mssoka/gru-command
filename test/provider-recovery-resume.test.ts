@@ -199,7 +199,7 @@ class ClaimHarness {
   /** Admit `jobId` as a blind review (issue #316) so the resume settle seam
    * has an isolation rule to judge the resumed session's tool access
    * against. */
-  admitBlind(jobId: string, repoName: string): void {
+  admitBlind(jobId: string, repoName: string, keepPackage = true): void {
     const admission = admitBlindReview({
       ledger: this.ledger,
       jobId,
@@ -211,7 +211,7 @@ class ClaimHarness {
       inputPackage: BLIND_PACKAGE,
     });
     if (admission === null) throw new Error(`job "${jobId}" was not admitted as a blind review`);
-    recordBlindAdmission(this.ledger, jobId, admission, BLIND_PACKAGE);
+    recordBlindAdmission(this.ledger, jobId, admission, keepPackage ? BLIND_PACKAGE : undefined);
   }
 
   /** A job with a lane, a minion agent, and a recovered wait on it. Each
@@ -629,6 +629,17 @@ describe('guarded claim — blind coverage scan at the resume settle seam (issue
     resumed.admitBlind(resumedJob, fixtureRepo().path);
     expect(await claimProviderRecoveryContinuation(resumed.deps(), resumedWait, 'silas')).toMatchObject({ outcome: 'continued', path: 'resumed' });
     expect([...resumed.registry.handles.values()].flatMap((handle) => handle.prompts).join('\n')).not.toContain('BLIND INPUT PACKAGE');
+    // An attested package that was never kept fails the fresh continuation by
+    // name: no replacement is briefed without its input.
+    const unkept = new ClaimHarness();
+    const unkeptJob = 'j-blind-unkept';
+    const unkeptWait = await unkept.recoveredMinionWait({ jobId: unkeptJob });
+    unkept.admitBlind(unkeptJob, fixtureRepo().path, false);
+    const failed = await claimProviderRecoveryContinuation(unkept.deps(), unkeptWait, 'silas');
+    expect(failed.outcome).not.toBe('continued');
+    expect([...unkept.registry.handles.values()].flatMap((handle) => handle.prompts)).toEqual([]);
+    expect(unkept.ledger.latestJobEvent(unkeptJob, 'provider.continuation-failed')?.payload)
+      .toMatchObject({ stage: 'spawn', error: expect.stringMatching(/its attested blind input package was not kept/u) });
   });
 
   it('a prohibited read during the resumed TURN invalidates blind coverage instead of leaving it qualifying', async () => {

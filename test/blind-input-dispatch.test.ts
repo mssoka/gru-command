@@ -592,6 +592,18 @@ describe('blind review commissioning (issue #316)', () => {
     }));
     expect(forgedHunk.status).toBe(422);
     expect(codes(forgedHunk)).toEqual(['unbound-package src/feature.ts']);
+    // ...on the base side too: a removed line the base never held.
+    const next = h.repo.commitFile('src/feature.ts', 'export const feature = 3;\n', 'feature 3');
+    const nextDiff = h.repo.git(['diff', '--no-color', target, next]);
+    expect(nextDiff).toContain('\n-export const feature = 2;\n');
+    const forgedRemoval = await call(h.port, 'POST', '/api/dispatch', blindReview('rev-forged-removal', {
+      repo_path: h.repo.path, target_sha: next,
+      input_package: { base_sha: target, target_sha: next, diff: { text: nextDiff.replace('\n-export const feature = 2;\n', '\n-see docs/issues/9.md for the planning note\n') } },
+    }));
+    expect(forgedRemoval.status).toBe(422);
+    expect((forgedRemoval.json['violations'] as { code: string; where: string; detail: string }[])).toEqual([
+      expect.objectContaining({ code: 'unbound-package', where: 'src/feature.ts', detail: expect.stringMatching(/the hunk at -1 shows lines that are not "src\/feature\.ts" at /u) }),
+    ]);
     // ...nor a base the object store lacks, or one that is not the target's ancestor — with or without a diff.
     const unrelated = h.repo.git(['commit-tree', '-m', 'unrelated', `${target}^{tree}`]).trim();
     for (const [label, base_sha] of [['fictitious', 'e'.repeat(40)], ['unrelated', unrelated]] as const) {

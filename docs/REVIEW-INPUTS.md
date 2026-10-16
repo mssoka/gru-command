@@ -409,9 +409,13 @@ lifecycle fact — so a settled report read as independent coverage.
   RESOLVED target, so an abbreviated `target_sha` never splits already-owned coverage.
 - **Delivered (#360).** The admitted package is the reviewer's input: its briefing
   carries a `BLIND INPUT PACKAGE` block with the exact diff and files, fenced and
-  framed as data. The package bytes are kept (`review.blind-input-package`), so a
-  fresh replacement reviewer spawned by provider recovery gets the same block; a
-  resumed session already holds it.
+  framed as data (a package file path holding a control character is refused, so
+  nothing can escape a fence). The package bytes are kept
+  (`review.blind-input-package`, written before the admission), so a fresh
+  replacement reviewer spawned by provider recovery gets the same block; a resumed
+  session already holds it. An attested reviewer whose package was not kept (one
+  admitted before packages were kept) fails that fresh continuation by name —
+  never a replacement briefed without its input.
 - **No claims (#360).** `required_inputs` (claims inputs) on a blind reviewer are
   refused as `claims-input`; a reviewer that needs them is `review_role: "claims"`.
 - `parent_contract_sha256`: the parent contract hash the package was built
@@ -432,16 +436,20 @@ answers `qualifying | invalidated | unattested | unobserved | not-blind | unclas
 derived only from the admission, `review.blind-access-observed` and
 `job.blind-access-unobservable` facts. The reviewer's session tool results are
 scanned at turn settle (grep lines landing in excluded paths, paged reads
-returning history-bearing text, and any path-naming tool call — pi `read`/`edit`/
-`grep`, Claude `Read`/`Edit`/`Write`/`NotebookEdit`/`Grep`/`Glob` — whose result
-returned, even empty or binary, for an excluded path, however its bytes look; an
+returning history-bearing text, and any file-content tool call — pi `read`/`edit`,
+Claude `Read`/`Edit`/`MultiEdit`/`NotebookRead`/`NotebookEdit` — whose result
+returned, even empty or binary, for an excluded file, however its bytes look; an
 absolute path inside the job's lane is judged by its repository path, one outside
-it is outside the package). A settled session whose transcript cannot be read at
-all (absent, unreadable or over the size bound) records
-`job.blind-access-unobservable` once while it stands — never an empty,
+it is outside the package, and the repository root itself is no file. A search
+— `grep`, `Grep`, `Glob`, `find`, `ls` — is judged by the paths and text its
+output shows, never by the directory it named). A settled session whose
+transcript cannot be read at all (absent, unreadable or over the size bound)
+records `job.blind-access-unobservable` once while it stands — never an empty,
 clean-reading observation — and its coverage is `unobserved`, not qualifying,
 until a LATER scan of that same session reads it; another session's read, an
-earlier read or an operator post never supersede it (#360). And
+earlier read or an operator post never supersede it. A turn with no transcript
+at all has nothing a later scan could read, so its job stays `unobserved`: what
+that turn read is unknown, whatever came after (#360). And
 `POST /api/dispatch/blind-access {job_id, tool_results:[{tool_name?, text}]}`
 records a LATER read. Any prohibited observation makes the coverage
 `invalidated`; the report, its findings, its status and its disposition are left

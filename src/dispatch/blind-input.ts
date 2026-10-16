@@ -694,6 +694,12 @@ export function evaluateBlindPackage(pkg: BlindInputPackage, rule: BlindIsolatio
   }
   const fileRecords: { path: string; sha256: string; blobSha: string }[] = [];
   for (const file of files) {
+    // A file's path heads its fenced bytes in the reviewer's briefing: a
+    // control character there would put text outside the data fence.
+    if ([...file.path].some((char) => char.charCodeAt(0) < 0x20 || char.charCodeAt(0) === 0x7f)) {
+      violations.push({ code: 'excluded-path', where: JSON.stringify(file.path), detail: `invalid package path ${JSON.stringify(file.path)} (holds a control character)` });
+      continue;
+    }
     const reason = classifyBlindPath(file.path, rule);
     if (reason !== null) {
       violations.push({ code: 'excluded-path', where: file.path, detail: reason });
@@ -920,6 +926,8 @@ export function scanObservedAccess(
     // A file-read call that RETURNED content read that file — observed, not
     // intent: an excluded path read directly, whatever its bytes look like.
     // An empty or binary result (an image, a PDF) still returned the file.
+    // Only file-content calls carry a readPath; a search is judged below by
+    // what its output lines name, as before.
     const read = result.readPath === undefined || result.isError === true
       ? null : readPathViolation(result.readPath, rule, laneRoots);
     if (read !== null) {
@@ -972,6 +980,8 @@ export function scanObservedAccess(
 function readPathViolation(rawPath: string, rule: BlindIsolationRule, laneRoots: readonly string[]): { readonly path: string; readonly detail: string } | null {
   const slashed = rawPath.replace(/\\/gu, '/');
   let path = slashed;
+  // The repository root (`.`, `./`) is no file, relative or absolute.
+  if (!outsidePackageShape(slashed) && normalizeRepoPath(slashed) === '') return null;
   if (outsidePackageShape(slashed) && !slashed.includes('\0')) {
     const root = laneRoots.map((lane) => lane.replace(/\\/gu, '/').replace(/\/+$/u, '')).find((lane) => slashed === lane || slashed.startsWith(`${lane}/`));
     if (root !== undefined) {

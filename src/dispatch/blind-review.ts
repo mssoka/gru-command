@@ -351,7 +351,8 @@ export function admitBlindReview(input: {
  * commissioning) and, for an attested blind reviewer, the admitted package
  * itself — its input on every later spawn. */
 export function recordBlindAdmission(ledger: LedgerApi, jobId: string, admission: BlindAdmission, pkg?: BlindInputPackage): void {
-  ledger.appendCustomEvent({ kind: BLIND_ADMITTED_EVENT, jobId, payload: admission.payload });
+  // The package first: a crash between the two leaves a kept package with
+  // no admission (inert), never an attested admission without its package.
   if (admission.payload.role === 'blind' && admission.payload.attested && pkg !== undefined) {
     ledger.appendCustomEvent({
       kind: BLIND_PACKAGE_EVENT,
@@ -364,13 +365,20 @@ export function recordBlindAdmission(ledger: LedgerApi, jobId: string, admission
       },
     });
   }
+  ledger.appendCustomEvent({ kind: BLIND_ADMITTED_EVENT, jobId, payload: admission.payload });
 }
 
-/** The package a blind reviewer was admitted with, or null (not blind, not
- * attested, or admitted before packages were kept). */
+/** The package a blind reviewer was admitted with, or null when the job is
+ * no attested blind review. An attested blind review whose package was not
+ * kept (admitted before packages were kept) throws by name: a replacement
+ * briefed without its input would review nothing it was given. */
 export function admittedBlindPackage(ledger: LedgerApi, jobId: string): BlindInputPackage | null {
+  const admitted = admittedOf(ledger, jobId);
+  if (admitted === null || admitted.role !== 'blind' || !admitted.attested) return null;
   const event = ledger.latestJobEvent(jobId, BLIND_PACKAGE_EVENT);
-  if (event === null) return null;
+  if (event === null) {
+    throw new Error(`job "${jobId}": its attested blind input package was not kept (admitted before packages were kept), so a fresh reviewer cannot be briefed with it — commission the blind review again`);
+  }
   const payload = event.payload as { base_sha?: unknown; target_sha?: unknown; diff?: unknown; files?: unknown };
   if (typeof payload.base_sha !== 'string' || typeof payload.target_sha !== 'string' || (payload.diff !== null && typeof payload.diff !== 'string') || !Array.isArray(payload.files)) {
     throw new Error(`job "${jobId}": its recorded blind input package (event ${String(event.seq)}) is malformed — the reviewer's input cannot be re-delivered`);
@@ -561,7 +569,7 @@ export function blindCoverageOf(ledger: LedgerApi, jobId: string): BlindCoverage
   // A settled session nobody could read is unproven, not clean (#360 R5-B6),
   // until a LATER scan of that same session reads it — never an earlier
   // scan, another session's, or an operator's post.
-  if (unreadSessionStands(ledger, jobId)) {
+  if (unreadSessions(ledger, jobId).size > 0) {
     return {
       ...base,
       state: 'unobserved',
@@ -602,18 +610,26 @@ export function recordObservedAccess(
   return blindCoverageOf(ledger, jobId);
 }
 
-/** Whether some session of the job was found unreadable and no later scan
- * of that same session has read it since. */
-function unreadSessionStands(ledger: LedgerApi, jobId: string): boolean {
-  const events = ledger.listJobEventsByKinds(jobId, [BLIND_ACCESS_EVENT, BLIND_ACCESS_UNOBSERVABLE_EVENT], { limit: 100_000 });
+const ACCESS_HISTORY_LIMIT = 100_000;
+
+/** The sessions of the job found unreadable that no later scan of that same
+ * session has read since. A turn with no transcript at all (session null)
+ * has nothing a later scan could read: it stands for good, so its job stays
+ * `unobserved` — what that turn read is unknown, whatever came after. */
+function unreadSessions(ledger: LedgerApi, jobId: string): ReadonlySet<string | null> {
+  const events = ledger.listJobEventsByKinds(jobId, [BLIND_ACCESS_EVENT, BLIND_ACCESS_UNOBSERVABLE_EVENT], { limit: ACCESS_HISTORY_LIMIT });
+  if (events.length === ACCESS_HISTORY_LIMIT) {
+    throw new Error(`job "${jobId}" holds ${String(ACCESS_HISTORY_LIMIT)} or more blind access events — too many to judge its unread sessions`);
+  }
   const unread = new Set<string | null>();
-  for (const event of [...events].sort((left, right) => left.seq - right.seq)) {
+  // The listing is newest first; the history is replayed oldest first.
+  for (const event of [...events].reverse()) {
     const payload = event.payload as { source?: unknown; session?: unknown };
     const session = typeof payload.session === 'string' ? payload.session : null;
     if (event.kind === BLIND_ACCESS_UNOBSERVABLE_EVENT) unread.add(session);
     else if (payload.source === 'session' && session !== null) unread.delete(session);
   }
-  return unread.size > 0;
+  return unread;
 }
 
 /** The reviewer's checkout, as its tools name it: the job lane's recorded
@@ -664,8 +680,7 @@ export function observeBlindSessionAccess(
     // could not be read, so its isolation is unproven — said by name, once
     // while it stands (a repeated failing settle adds nothing).
     const session = sessionFile === null ? null : scanSessionIdentity(sessionFile);
-    const latest = ledger.listJobEventsByKinds(jobId, [BLIND_ACCESS_EVENT, BLIND_ACCESS_UNOBSERVABLE_EVENT], { limit: 1 })[0];
-    if (latest?.kind === BLIND_ACCESS_UNOBSERVABLE_EVENT && (latest.payload as { session?: unknown }).session === session) return;
+    if (unreadSessions(ledger, jobId).has(session)) return;
     ledger.appendCustomEvent({
       kind: BLIND_ACCESS_UNOBSERVABLE_EVENT,
       jobId,
@@ -702,16 +717,21 @@ export function readSessionToolResults(sessionFile: string | null): readonly Obs
     return null;
   }
   const out: ObservedToolResult[] = [];
-  // Path-naming tool calls by id, so each result knows the file it returned
-  // (#360 R5-B5): any tool that names a file or directory — pi `read`,
-  // `edit`, `grep` {path}; Claude `Read`, `Edit`, `Write` {file_path},
-  // `NotebookEdit` {notebook_path}, `Grep`, `Glob` {path}.
+  // File-content calls by id, so each result knows the file it returned
+  // (#360 R5-B5): the tools whose result IS the file's bytes — pi `read`,
+  // `edit` {path}; Claude `Read`, `Edit`, `MultiEdit` {file_path},
+  // `NotebookRead`, `NotebookEdit` {notebook_path}. A search (`grep`, `Grep`,
+  // `Glob`, `find`, `ls`) names a directory, not a file it returned: its
+  // output is judged by the paths and text it shows, as before.
   const reads = new Map<string, string>();
-  const callPath = (_name: unknown, args: unknown): string | null => {
-    if (typeof args !== 'object' || args === null) return null;
-    const named = args as { file_path?: unknown; notebook_path?: unknown; path?: unknown };
-    const value = [named.file_path, named.notebook_path, named.path].find((candidate) => typeof candidate === 'string' && candidate !== '');
-    return typeof value === 'string' ? value : null;
+  const CONTENT_TOOLS: Readonly<Record<string, 'path' | 'file_path' | 'notebook_path'>> = {
+    read: 'path', edit: 'path', Read: 'file_path', Edit: 'file_path', MultiEdit: 'file_path', NotebookRead: 'notebook_path', NotebookEdit: 'notebook_path',
+  };
+  const callPath = (name: unknown, args: unknown): string | null => {
+    const key = typeof name === 'string' && Object.hasOwn(CONTENT_TOOLS, name) ? CONTENT_TOOLS[name] : undefined;
+    if (key === undefined || typeof args !== 'object' || args === null) return null;
+    const value = (args as Record<string, unknown>)[key];
+    return typeof value === 'string' && value !== '' ? value : null;
   };
   const withRead = (result: ObservedToolResult, id: unknown, isError: unknown): ObservedToolResult => {
     const readPath = typeof id === 'string' ? reads.get(id) : undefined;
