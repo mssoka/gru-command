@@ -368,11 +368,11 @@ interface HitTarget {
  * below). */
 async function hitTarget(page: Page, selector: string): Promise<HitTarget> {
   return page.evaluate((sel) => {
+    if (!(window.devicePixelRatio > 0)) throw new Error(`hitTarget: unusable devicePixelRatio ${String(window.devicePixelRatio)}`);
     const element = document.querySelector<HTMLElement>(sel);
     if (element === null) return { found: false, inViewport: false, hit: false };
     const rect = element.getBoundingClientRect();
     const topmost = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
-    if (!(window.devicePixelRatio > 0)) throw new Error(`hitTarget: unusable devicePixelRatio ${String(window.devicePixelRatio)}`);
     const sliver = 0.5 / window.devicePixelRatio;
     return {
       found: true,
@@ -713,14 +713,17 @@ test.describe('compact owner-first board — synthetic geometry proof', () => {
       expect(await page.evaluate(() => [window.devicePixelRatio, window.innerWidth, window.innerHeight]), 'this proof runs at 2x in 400×300').toEqual([2, 400, 300]);
       // The boxes sit exactly where the CSS puts them (no device-pixel
       // snapping of the measured rects): the boundary under test is real.
-      expect(await page.evaluate(() => ['bottom-in', 'bottom-out', 'top-out', 'left-out', 'right-out'].map((id) => {
+      expect(await page.evaluate(() => ['bottom-in', 'bottom-out', 'top-in', 'top-out', 'left-in', 'left-out', 'right-in', 'right-out'].map((id) => {
         const rect = document.getElementById(id)!.getBoundingClientRect();
         return { id, top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right };
       }))).toEqual([
         { id: 'bottom-in', top: 250.25, bottom: 300.25, left: 10, right: 30 },
         { id: 'bottom-out', top: 250.3125, bottom: 300.3125, left: 40, right: 60 },
+        { id: 'top-in', top: -0.25, bottom: 19.75, left: 70, right: 90 },
         { id: 'top-out', top: -0.3125, bottom: 19.6875, left: 100, right: 120 },
+        { id: 'left-in', top: 40, bottom: 60, left: -0.25, right: 19.75 },
         { id: 'left-out', top: 70, bottom: 90, left: -0.3125, right: 19.6875 },
+        { id: 'right-in', top: 100, bottom: 120, left: 380.25, right: 400.25 },
         { id: 'right-out', top: 130, bottom: 150, left: 380.3125, right: 400.3125 },
       ]);
       // Exactly half a DEVICE pixel past each edge is contained and hittable...
@@ -731,6 +734,11 @@ test.describe('compact owner-first board — synthetic geometry proof', () => {
       // would have wrongly admitted every one of these.
       for (const id of ['#bottom-out', '#top-out', '#left-out', '#right-out']) {
         expect(await hitTarget(page, id), id).toEqual({ found: true, inViewport: false, hit: true });
+      }
+      // An unusable device pixel ratio fails loud — for a missing selector too.
+      await page.evaluate(() => { Object.defineProperty(window, 'devicePixelRatio', { value: 0, configurable: true }); });
+      for (const id of ['#bottom-in', '#missing']) {
+        await expect(hitTarget(page, id), id).rejects.toThrow(/hitTarget: unusable devicePixelRatio 0/u);
       }
     } finally {
       await context.close();

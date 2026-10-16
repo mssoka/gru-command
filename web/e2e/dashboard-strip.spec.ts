@@ -1247,6 +1247,12 @@ test('settleTransitions finishes running transitions and names every culprit it 
   const failureOf = () => settleTransitions(page, 3).then(() => null, (error: unknown) =>
     (error instanceof Error ? error.message : String(error)).split('\n')[0]!.replace(/^page\.evaluate: Error: /u, ''));
 
+  // Settled straight after the class change — nothing else touched the
+  // animations first — every transition reaches its END state.
+  await start();
+  await settleTransitions(page);
+  expect([await colorOf('settles'), await colorOf('stalled'), await live()]).toEqual(['rgb(255, 0, 0)', 'rgb(255, 0, 0)', 0]);
+
   await start();
   await sabotage('stalled', 'stall');
   const stalled = await failureOf();
@@ -1277,7 +1283,7 @@ test('settleTransitions finishes running transitions and names every culprit it 
   );
 
   // The pass bound itself must be a positive integer.
-  for (const passes of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
-    await expect(settleTransitions(page, passes), String(passes)).rejects.toThrow(/settleTransitions: passes must be a positive integer/u);
+  for (const passes of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 1001]) {
+    await expect(settleTransitions(page, passes), String(passes)).rejects.toThrow(/settleTransitions: passes must be an integer from 1 to 1000/u);
   }
 });

@@ -2,6 +2,8 @@ import type { Page } from '@playwright/test';
 
 /** Settle passes before an unsettled page is reported as restarting. */
 export const SETTLE_PASSES = 60;
+/** The most passes a caller may ask for: a restarting page fails in bounded time. */
+export const MAX_SETTLE_PASSES = 1000;
 
 /**
  * Jump every unsettled CSS transition on the page to its END state
@@ -15,7 +17,9 @@ export const SETTLE_PASSES = 60;
  * culprit named (element, id, classes, pseudo-element and property).
  */
 export async function settleTransitions(page: Page, passes = SETTLE_PASSES): Promise<void> {
-  if (!Number.isSafeInteger(passes) || passes < 1) throw new Error(`settleTransitions: passes must be a positive integer, got ${String(passes)}`);
+  if (!Number.isSafeInteger(passes) || passes < 1 || passes > MAX_SETTLE_PASSES) {
+    throw new Error(`settleTransitions: passes must be an integer from 1 to ${String(MAX_SETTLE_PASSES)}, got ${String(passes)}`);
+  }
   await page.evaluate((limit) => {
     // Running (pending play included) or paused transitions are unsettled;
     // finished and idle ones are done.
