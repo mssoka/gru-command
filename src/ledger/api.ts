@@ -457,6 +457,15 @@ const UNPROVEN_NATIVE_CANDIDATE_SQL = `EXISTS (SELECT 1 FROM pending_directives 
       AND json_extract(s.payload, '$.request_id') = p.request_id AND json_extract(s.payload, '$.delivery_seq') = d.seq
     ORDER BY s.seq DESC LIMIT 1), 0) != 1))`;
 
+/** Why a machine disposition of this notification is refused, or null. */
+function machineDispositionRefusalOf(current: Pick<NotificationRecord, 'kind' | 'routing'>): string | null {
+  if (current.routing !== 'action-required') {
+    return 'only action-required notifications accept a machine disposition; owner decisions resolve through the recorded-decision follow-through';
+  }
+  const closer = producerResolvedBy(current.kind);
+  return closer === null ? null : `${current.kind} closes itself on ${closer} — fix its cause and leave the alert open; a disposition is refused`;
+}
+
 /** What closes a producer-resolved alert kind, or null for any other kind. */
 export function producerResolvedBy(kind: string): string | null {
   return Object.hasOwn(PRODUCER_RESOLVED_KINDS, kind) ? PRODUCER_RESOLVED_KINDS[kind]! : null;
@@ -468,6 +477,43 @@ export function isNotificationRouting(value: string): value is NotificationRouti
 
 export function isNotificationSeverity(value: string): value is NotificationSeverity {
   return (NOTIFICATION_SEVERITIES as readonly string[]).includes(value);
+}
+
+/** Who authenticated a notification decision/disposition and which actor
+ * (if any) it declared (decision #99: a shared bearer proves only a paired
+ * caller, never an actor). */
+export interface NotificationProvenance {
+  readonly credential: string;
+  readonly declaredActor: string | null;
+}
+
+/** A machine disposition the row cannot take (not action-required, or a
+ * kind that closes itself): the board route answers it as a typed
+ * `409 disposition_refused` (#385). */
+export class MachineDispositionRefusedError extends Error {
+  constructor(readonly notificationId: string, readonly refusal: string) {
+    super(refusal);
+    this.name = 'MachineDispositionRefusedError';
+  }
+}
+
+/** One alert closes ONE stop (#385): a replay of a recorded closure naming
+ * another agent or job. */
+export class SupervisionStopClosureConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SupervisionStopClosureConflictError';
+  }
+}
+
+/** A notification decision/disposition/adoption was asked to record a blank
+ * credential class: a programming error at the caller (every route supplies
+ * one), refused before anything is written (#396). */
+export class BlankProvenanceCredentialError extends Error {
+  constructor(operation: string) {
+    super(`${operation} credential must be non-empty`);
+    this.name = 'BlankProvenanceCredentialError';
+  }
 }
 
 /** One durable notification row (EPICS E7 story 2 — the notification log
@@ -553,7 +599,9 @@ export type NotificationDecisionRefusalCode =
   | 'decision_recorded'
   | 'not_open'
   | 'undecided'
-  | 'not_discussion';
+  | 'not_discussion'
+  | 'decision_present'
+  | 'legacy_closed';
 
 export class NotificationDecisionRefusal extends Error {
   constructor(
@@ -1550,6 +1598,17 @@ export class LedgerApi {
          AND json_extract(payload, '$.request_id') = ? ORDER BY seq DESC LIMIT 1`,
       )
       .get(jobId, kind, opts.sinceSeq ?? -1, requestId) as Row | undefined;
+    return row === undefined ? null : this.eventFromRow(row);
+  }
+
+  /** The newest job event of one kind whose top-level payload `field`
+   * equals `value` — answered over the job's COMPLETE record, so unrelated
+   * traffic (even of the same kind) can never push it out of a window. */
+  latestJobEventByPayloadField(jobId: string, kind: string, field: string, value: string): EventRecord | null {
+    if (!/^[a-z][a-z0-9_]*$/u.test(field)) throw new Error(`latestJobEventByPayloadField: "${field}" is not a plain snake_case payload field`);
+    const row = this.db
+      .prepare(`SELECT * FROM events WHERE job_id = ? AND kind = ? AND json_extract(payload, ?) = ? ORDER BY seq DESC LIMIT 1`)
+      .get(jobId, kind, `$.${field}`, value) as Row | undefined;
     return row === undefined ? null : this.eventFromRow(row);
   }
 
@@ -3286,7 +3345,7 @@ export class LedgerApi {
 
   latestSupervisionEvent(agentId: string): EventRecord | null {
     const row = this.db.prepare(`SELECT * FROM events WHERE agent_id = ?
-      AND kind IN ('supervision.escalated', 'supervision.breaker', 'supervision.rearmed', 'supervision.rearm-fenced') ORDER BY seq DESC LIMIT 1`).get(agentId) as Row | undefined;
+      AND kind IN ('supervision.escalated', 'supervision.breaker', 'supervision.rearmed', 'supervision.rearm-fenced', 'supervision.stop-superseded') ORDER BY seq DESC LIMIT 1`).get(agentId) as Row | undefined;
     return row === undefined ? null : this.eventFromRow(row);
   }
 
@@ -3308,6 +3367,56 @@ export class LedgerApi {
         });
       }
       return this.getAgent(id) as AgentRecord;
+    });
+  }
+
+  /** Whether a breaker alert's stop was closed as superseded (#385): the
+   * durable record a retried disposition is answered from, across restarts. */
+  hasSupervisionStopSuperseded(notificationId: string): boolean {
+    return this.supervisionStopClosure(notificationId) !== undefined;
+  }
+
+  /** The FIRST recorded closure of this alert's stop — the binding one.
+   * Every closure this ledger writes names a non-blank agent and job (the
+   * writer's own rule, applied here the same way); a row missing either
+   * (never written here) closes no alert's stop: neither this lookup nor a
+   * replayed write binds to it. Restart hydration is separate — it reads an
+   * agent's own latest lifecycle row by agent id. */
+  private supervisionStopClosure(notificationId: string): { readonly agentId: string; readonly jobId: string } | undefined {
+    const rows = this.db.prepare(
+      "SELECT agent_id AS agentId, job_id AS jobId FROM events WHERE kind = 'supervision.stop-superseded' AND json_extract(payload, '$.notification_id') = ? ORDER BY seq ASC",
+    ).all(notificationId) as Array<{ agentId: unknown; jobId: unknown }>;
+    const complete = (value: unknown): value is string => typeof value === 'string' && value.trim() !== '';
+    const first = rows.find((row) => complete(row.agentId) && complete(row.jobId));
+    return first === undefined ? undefined : { agentId: first.agentId as string, jobId: first.jobId as string };
+  }
+
+  /** Records a superseded-stop closure (#385) at most ONCE per alert: the
+   * check and the append share one transaction, so no interleaving can
+   * record it twice. True when this call recorded it. */
+  recordSupervisionStopSuperseded(input: {
+    readonly agentId: string;
+    readonly jobId: string;
+    readonly payload: Readonly<Record<string, unknown>> & { readonly notification_id: string };
+  }): boolean {
+    for (const [name, value] of [['agentId', input.agentId], ['jobId', input.jobId], ['notification_id', input.payload.notification_id]] as const) {
+      if (typeof value !== 'string' || value.trim() === '') throw new Error(`a superseded-stop closure needs a non-blank ${name}`);
+    }
+    if (input.payload['job_id'] !== undefined && input.payload['job_id'] !== input.jobId) {
+      throw new Error(`a superseded-stop closure names job "${String(input.payload['job_id'])}" in its payload but "${input.jobId}" as its job`);
+    }
+    return this.transaction(() => {
+      const prior = this.supervisionStopClosure(input.payload.notification_id);
+      if (prior !== undefined) {
+        // The same alert closes ONE stop: a replay naming another agent or
+        // job is a conflict, never "already recorded".
+        if (prior.agentId !== input.agentId || prior.jobId !== input.jobId) {
+          throw new SupervisionStopClosureConflictError(`alert "${input.payload.notification_id}" already closed the stop of agent "${prior.agentId}" on job "${prior.jobId}" — not agent "${input.agentId}" on job "${input.jobId}"`);
+        }
+        return false;
+      }
+      this.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: input.agentId, jobId: input.jobId, payload: { ...input.payload } });
+      return true;
     });
   }
 
@@ -3336,7 +3445,7 @@ export class LedgerApi {
              SELECT agent_id, MAX(seq) AS seq
                FROM events
               WHERE agent_id IS NOT NULL
-                AND kind IN ('supervision.escalated', 'supervision.breaker', 'supervision.rearmed', 'supervision.rearm-fenced')
+                AND kind IN ('supervision.escalated', 'supervision.breaker', 'supervision.rearmed', 'supervision.rearm-fenced', 'supervision.stop-superseded')
               GROUP BY agent_id
            ) latest ON latest.agent_id = e.agent_id AND latest.seq = e.seq
            JOIN agents a ON a.id = e.agent_id
@@ -5193,9 +5302,21 @@ export class LedgerApi {
    * UNDECIDED owner row is refused — resolution may never silence a
    * question the owner has not answered, and no display receipt or age
    * ever closes one. Distinct from `disposeMachineNotification` (machine
-   * attention) and from `ackNotification` (feed/notice only). */
-  resolveOwnerDecision(id: string, detail: string): NotificationRecord | null {
+   * attention) and from `ackNotification` (feed/notice only).
+   *
+   * `by: 'gru'` names the follow-through ROLE, exactly as a machine
+   * disposition does: the audit event carries the authorising credential
+   * class and any caller-declared actor, never a claimed identity (#99,
+   * #396). */
+  resolveOwnerDecision(
+    id: string,
+    detail: string,
+    // Required, never defaulted (#396): every caller states the credential
+    // that authenticated it and any actor it declared.
+    provenance: NotificationProvenance,
+  ): NotificationRecord | null {
     if (detail.trim() === '') throw new Error('owner-decision resolution detail must be non-empty');
+    if (provenance.credential.trim() === '') throw new BlankProvenanceCredentialError('owner-decision resolution');
     return this.transaction(() => {
       const current = this.getNotification(id);
       if (current === null) return null;
@@ -5217,10 +5338,26 @@ export class LedgerApi {
       this.appendEvent({
         kind: 'notification.resolved',
         agentId: current.agentId,
-        payload: { id, by: 'gru', detail, owner_decision: current.decidedOption },
+        payload: {
+          id,
+          by: 'gru',
+          detail,
+          owner_decision: current.decidedOption,
+          credential: provenance.credential,
+          declaredActor: provenance.declaredActor,
+        },
       });
       return this.getNotification(id) as NotificationRecord;
     });
+  }
+
+  /** Why a machine disposition of this notification would be refused, or
+   * null — the SAME rule `disposeMachineNotification` enforces, read first
+   * so a route can refuse before any other effect (#385). The disposal
+   * re-checks it in its own transaction and stays the authority. */
+  machineDispositionRefusal(id: string): string | null {
+    const current = this.getNotification(id);
+    return current === null ? null : machineDispositionRefusalOf(current);
   }
 
   /** Explicit machine disposition, distinct from the owner's Ack.
@@ -5233,19 +5370,15 @@ export class LedgerApi {
   disposeMachineNotification(
     id: string,
     detail: string,
-    provenance: { readonly credential: string; readonly declaredActor: string | null } = { credential: 'internal', declaredActor: null },
+    provenance: NotificationProvenance = { credential: 'internal', declaredActor: null },
   ): NotificationRecord | null {
     if (detail.trim() === '') throw new Error('machine disposition detail must be non-empty');
+    if (provenance.credential.trim() === '') throw new BlankProvenanceCredentialError('machine disposition');
     return this.transaction(() => {
       const current = this.getNotification(id);
       if (current === null) return null;
-      if (current.routing !== 'action-required') {
-        throw new Error('only action-required notifications accept a machine disposition; owner decisions resolve through the recorded-decision follow-through');
-      }
-      const closer = producerResolvedBy(current.kind);
-      if (closer !== null) {
-        throw new Error(`${current.kind} closes itself on ${closer} — fix its cause and leave the alert open; a disposition is refused`);
-      }
+      const refusal = machineDispositionRefusalOf(current);
+      if (refusal !== null) throw new MachineDispositionRefusedError(id, refusal);
       if (current.resolvedAt !== null || current.ackedAt !== null) return current;
       this.db.prepare('UPDATE notifications SET resolved_at = ?, resolved_by = ? WHERE id = ?')
         .run(nowIso(), 'gru', id);
@@ -5414,6 +5547,57 @@ export class LedgerApi {
         kind: 'notification.decision-options',
         agentId: current.agentId,
         payload: { id, by, option_ids: validated.map((option) => option.id) },
+      });
+      return this.getNotification(id) as NotificationRecord;
+    });
+  }
+
+  /** Upgrade-in-place for an idempotent owner-escalation replay (#395): a
+   * row written before typed decisions were required (decision null) and
+   * still OPEN adopts the replayed typed decision, so the owner gets the
+   * typed options on the ONE existing FOR YOU item instead of a 409 forever
+   * (or a second item). A closed (acked/resolved) legacy row is refused —
+   * a decision can never be attached to an already-closed question. */
+  adoptLegacyOwnerDecision(
+    id: string,
+    decision: NotificationDecision,
+    provenance: NotificationProvenance,
+  ): NotificationRecord | null {
+    if (provenance.credential.trim() === '') throw new BlankProvenanceCredentialError('decision adoption');
+    return this.transaction(() => {
+      const current = this.getNotification(id);
+      if (current === null) return null;
+      if (current.routing !== 'needs-owner') {
+        throw new NotificationDecisionRefusal(
+          'not_owner_decision',
+          `notification "${id}" is ${current.routing}; only owner decisions adopt a typed decision`,
+        );
+      }
+      const stored = this.db.prepare('SELECT decision_json FROM notifications WHERE id = ?').get(id) as { decision_json: string | null } | undefined;
+      if (stored === undefined) return null;
+      // Legacy means the STORED column is empty — never a stored decision
+      // that merely failed to parse — and nothing was ever decided on it.
+      const storedDecision = stored.decision_json !== null;
+      const alreadyDecided = current.decidedOption !== null;
+      if (current.decision !== null || storedDecision || alreadyDecided) {
+        throw new NotificationDecisionRefusal(
+          'decision_present',
+          `notification "${id}" already carries a typed decision — it is never replaced`,
+        );
+      }
+      if (current.resolvedAt !== null || current.ackedAt !== null) {
+        throw new NotificationDecisionRefusal(
+          'legacy_closed',
+          `notification "${id}" was closed before it carried a typed decision — use a new key for a new decision`,
+        );
+      }
+      this.db
+        .prepare('UPDATE notifications SET decision_json = ? WHERE id = ?')
+        .run(serializeNotificationDecision(decision), id);
+      this.appendEvent({
+        kind: 'notification.decision-adopted',
+        agentId: current.agentId,
+        payload: { id, credential: provenance.credential, declaredActor: provenance.declaredActor, option_ids: decision.options.map((option) => option.id) },
       });
       return this.getNotification(id) as NotificationRecord;
     });

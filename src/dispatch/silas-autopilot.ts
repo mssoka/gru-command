@@ -36,6 +36,7 @@
  *    on every blocker: a templated bullet never invents one.
  *  - `verdict-rung-escalate` is not an autopilot family at all.
  */
+import { createHash } from 'node:crypto';
 import type { SilasAutopilotConfig, SilasAutopilotRuleMode } from '../config.js';
 import type { LedgerApi } from '../ledger/api.js';
 import { LIVE_DIRECTIVE_STATES } from '../ledger/directives.js';
@@ -155,6 +156,7 @@ export type AutopilotLedger = Pick<
   | 'latestJobEvent'
   | 'getDirective'
   | 'listJobEventsByKinds'
+  | 'latestJobEventByPayloadField'
   | 'listPendingRebriefs'
   | 'listPendingDirectives'
   | 'hasOpenDirectiveRecoveryHold'
@@ -729,6 +731,102 @@ export interface SilasAutopilotInput {
   readonly log?: Log;
 }
 
+/** Nesting or an array past these is no decision: refused by name, never a
+ * stack overflow or a walk over a huge sparse array. */
+const MAX_CANONICAL_DEPTH = 256;
+const MAX_CANONICAL_ITEMS = 100_000;
+/** Values visited in one serialization, shared or not: the whole walk is bounded. */
+const MAX_CANONICAL_NODES = 1_000_000;
+/** A BigInt, boxed or not, by its internal slot — never by a spoofable tag. */
+const isBigIntValue = (value: unknown): boolean => {
+  if (typeof value === 'bigint') return true;
+  if (typeof value !== 'object' || value === null) return false;
+  try { BigInt.prototype.valueOf.call(value); return true; } catch { return false; }
+};
+
+/** JSON with every object's keys sorted (by code unit): two equal decisions
+ * built in a different key order — or read back from the ledger — hash
+ * alike. Otherwise values serialize as JSON.stringify would: `toJSON(key)`
+ * called once per value; boxed numbers and strings unwrapped through
+ * ToNumber/ToString, boxed booleans by their value; `undefined`, function and
+ * symbol members dropped (null in an array, holes included); non-finite
+ * numbers as null. A cycle, a BigInt, nesting past MAX_CANONICAL_DEPTH, an
+ * array past MAX_CANONICAL_ITEMS, or a throwing toJSON or getter is refused
+ * by name (unlike JSON.stringify, which has no bounds). Exported for its own
+ * tests. */
+export function canonicalJson(value: unknown): string {
+  const ancestors = new Set<object>();
+  let visited = 0;
+  const unreadable = (where: string, error: unknown): TypeError => new TypeError(`canonicalJson: the value at ${JSON.stringify(where)} cannot be read`, { cause: error });
+  const serialize = (input: unknown, key: string): string | undefined => {
+    if ((visited += 1) > MAX_CANONICAL_NODES) throw new TypeError(`canonicalJson: more than ${String(MAX_CANONICAL_NODES)} values have no canonical form`);
+    let resolved: unknown;
+    try {
+      resolved = input !== null && typeof input === 'object' && typeof (input as { toJSON?: unknown }).toJSON === 'function'
+        ? (input as { toJSON(key: string): unknown }).toJSON(key) : input;
+      if (resolved instanceof Number) resolved = Number(resolved);
+      else if (resolved instanceof String) resolved = String(resolved);
+      else if (resolved instanceof Boolean) resolved = Boolean.prototype.valueOf.call(resolved);
+    } catch (error) {
+      throw unreadable(key, error);
+    }
+    if (resolved === undefined || typeof resolved === 'function' || typeof resolved === 'symbol') return undefined;
+    if (isBigIntValue(resolved)) throw new TypeError('canonicalJson: a BigInt has no JSON form');
+    if (resolved === null || typeof resolved !== 'object') return JSON.stringify(resolved);
+    if (ancestors.has(resolved)) throw new TypeError('canonicalJson: a circular structure has no JSON form');
+    if (ancestors.size >= MAX_CANONICAL_DEPTH) throw new TypeError(`canonicalJson: nesting deeper than ${String(MAX_CANONICAL_DEPTH)} has no canonical form`);
+    const node = resolved;
+    ancestors.add(node);
+    try {
+      // A proxy can revoke itself as late as its last prototype read above,
+      // so even this check is refused by name.
+      let isArray: boolean;
+      try { isArray = Array.isArray(node); } catch (error) { throw unreadable(key, error); }
+      if (isArray) {
+        let length: unknown;
+        try { length = (node as unknown[]).length; } catch (error) { throw unreadable(key, error); }
+        // A proxied array can answer any length: only a whole count is one.
+        if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0) throw unreadable(key, new TypeError(`its length is not a whole count (${typeof length})`));
+        if (length > MAX_CANONICAL_ITEMS) throw new TypeError(`canonicalJson: an array of ${String(length)} items has no canonical form`);
+        const items: string[] = [];
+        for (let index = 0; index < length; index += 1) {
+          let member: unknown;
+          try { member = (node as unknown[])[index]; } catch (error) { throw unreadable(String(index), error); }
+          items.push(serialize(member, String(index)) ?? 'null');
+        }
+        return `[${items.join(',')}]`;
+      }
+      let keys: string[];
+      try { keys = Object.keys(node); } catch (error) { throw unreadable(key, error); }
+      const members = keys.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).flatMap((member) => {
+        let value: unknown;
+        try { value = (node as Record<string, unknown>)[member]; } catch (error) { throw unreadable(member, error); }
+        const text = serialize(value, member);
+        return text === undefined ? [] : [`${JSON.stringify(member)}:${text}`];
+      });
+      return `{${members.join(',')}}`;
+    } finally { ancestors.delete(node); }
+  };
+  return serialize(value, '') ?? 'null';
+}
+
+/** The identity of one decision: what it would call, and in which mode. */
+function decisionFingerprint(decision: { readonly action: unknown; readonly would_call: unknown; readonly mode: unknown }): string {
+  return createHash('sha256')
+    .update(canonicalJson({ action: decision.action, would_call: decision.would_call, mode: decision.mode }))
+    .digest('hex');
+}
+
+/** A recorded decision's fingerprint; a decision recorded before #369
+ * carried none, so it is derived from the same fields it would have hashed
+ * (an upgrade never re-records an unchanged decision). */
+function recordedFingerprint(payload: unknown): string | null {
+  if (typeof payload !== 'object' || payload === null) return null;
+  const recorded = payload as { readonly fingerprint?: unknown; readonly action?: unknown; readonly would_call?: unknown; readonly mode?: unknown };
+  if (typeof recorded.fingerprint === 'string') return recorded.fingerprint;
+  return decisionFingerprint({ action: recorded.action, would_call: recorded.would_call, mode: recorded.mode });
+}
+
 /**
  * Run every enabled family against the freshly computed digest. One pass
  * per deterministic observation; a family that refuses or fails leaves its
@@ -755,21 +853,35 @@ export async function runSilasAutopilot(input: SilasAutopilotInput): Promise<Sil
     log('info', 'silas autopilot refused — leaving the row to LLM Silas', { rule: ruleId, job: jobId, reason });
   };
 
-  /** Record one decision and (in enforce mode) perform exactly one call. */
+  /** Record one decision and (in enforce mode) perform exactly one call.
+   * The decision EVENT is recorded only when it differs from this rule's
+   * LAST recorded decision for the job (#369): a row that persists
+   * unchanged across passes is the same decision and never inflates the
+   * would-do record, while any change (call or mode) records anew — so
+   * A, A, B, A records A, B, A. The pass's `decisions` count still counts
+   * every decision this pass made, recorded or not, and an enforce-mode
+   * call still runs each pass (calls carry their own idempotent receipts). */
   const decide = async (ruleId: SilasAutopilotRuleId, jobId: string, call: AutopilotCall): Promise<void> => {
     const rule = counts[ruleId]!;
     rule.decisions += 1;
-    input.ledger.appendCustomEvent({
-      kind: AUTOPILOT_DECISION_EVENT,
-      jobId,
-      payload: {
-        rule_id: ruleId,
-        job: jobId,
-        action: call.action,
-        would_call: call.wouldCall,
-        mode: rule.mode,
-      },
-    });
+    const fingerprint = decisionFingerprint({ action: call.action, would_call: call.wouldCall, mode: rule.mode });
+    // The rule's newest decision over the job's complete record: other
+    // rules' decisions can never push it out of a window.
+    const latest = input.ledger.latestJobEventByPayloadField(jobId, AUTOPILOT_DECISION_EVENT, 'rule_id', ruleId);
+    if (latest === null || recordedFingerprint(latest.payload) !== fingerprint) {
+      input.ledger.appendCustomEvent({
+        kind: AUTOPILOT_DECISION_EVENT,
+        jobId,
+        payload: {
+          rule_id: ruleId,
+          job: jobId,
+          action: call.action,
+          would_call: call.wouldCall,
+          mode: rule.mode,
+          fingerprint,
+        },
+      });
+    }
     if (rule.mode !== 'enforce') return;
     try {
       await performCall(ruleId, jobId, call, input.ops);
