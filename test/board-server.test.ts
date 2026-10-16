@@ -1778,7 +1778,8 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
 
   it('refuses a disposition the ledger would refuse BEFORE the supervisor acts on it, with a typed 409 (#385)', async () => {
     let consulted = 0;
-    const harness = await boot('board-test-token', { onNotificationDisposition: () => { consulted += 1; return { ok: true }; } });
+    let changeDuringConsult: (() => void) | null = null;
+    const harness = await boot('board-test-token', { onNotificationDisposition: () => { consulted += 1; changeDuringConsult?.(); return { ok: true }; } });
     try {
       // An informational row takes no machine disposition: refused before
       // the supervisor is consulted, so no stop can close beside it.
@@ -1788,6 +1789,22 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
       expect(response).toMatchObject({ status: 409, body: { error: 'disposition_refused', code: 'disposition_refused', detail: expect.stringMatching(/only action-required notifications/u) } });
       expect(consulted).toBe(0);
       expect(harness.api.getNotification(fyi.id)).toMatchObject({ resolvedAt: null });
+      // An informational row already resolved is refused the same typed way.
+      harness.api.resolveNotificationById(fyi.id, 'producer');
+      expect(harness.api.getNotification(fyi.id)?.resolvedAt).not.toBeNull();
+      expect(await postJson(harness.port, `/api/notifications/${encodeURIComponent(fyi.id)}/disposition`, 'board-test-token', { detail: 'again' }))
+        .toMatchObject({ status: 409, body: { error: 'disposition_refused', code: 'disposition_refused' } });
+      expect(consulted).toBe(0);
+      // A row that changes between the check and its disposal is refused by
+      // the disposal's own re-check, the same typed way.
+      const breaker = harness.notifications.post({ kind: 'supervision.breaker', routing: 'action-required', severity: 'error', title: 'Lane stopped' });
+      const db = (harness.api as unknown as { db: { prepare(sql: string): { run(...args: unknown[]): unknown } } }).db;
+      consulted = 0;
+      changeDuringConsult = () => { db.prepare("UPDATE notifications SET routing = 'fyi' WHERE id = ?").run(breaker.id); };
+      expect(await postJson(harness.port, `/api/notifications/${encodeURIComponent(breaker.id)}/disposition`, 'board-test-token', { detail: 'raced' }))
+        .toMatchObject({ status: 409, body: { error: 'disposition_refused', code: 'disposition_refused', detail: expect.stringMatching(/only action-required notifications/u) } });
+      expect(consulted).toBe(1);
+      expect(harness.api.getNotification(breaker.id)).toMatchObject({ resolvedAt: null });
       // The ledger helper applies the self-closing rule too (the route answers
       // that case earlier, as producer_resolved).
       const dream = harness.notifications.post({ kind: 'lessons.dream-failed', routing: 'action-required', severity: 'error', title: 'dream failed' });

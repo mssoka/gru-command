@@ -6,7 +6,7 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import { ROLES, type GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { EventBus } from '../events/bus.js';
-import { LedgerApi, RecordNotFound, AdminCloseoutRefusal, NotificationDecisionRefusal, producerResolvedBy, type DecisionActor, type DecisionKind, type NotificationRecord } from '../ledger/api.js';
+import { LedgerApi, RecordNotFound, AdminCloseoutRefusal, MachineDispositionRefusedError, NotificationDecisionRefusal, producerResolvedBy, type DecisionActor, type DecisionKind, type NotificationRecord } from '../ledger/api.js';
 import { isDecisionActor, isDecisionKind } from '../ledger/decision-memory.js';
 import { parseDecisionOptions, parseNotificationDecision, serializeNotificationDecision } from '../ledger/notification-decision.js';
 import { isJobStatus, isRoundStatus, isRoundVerdict } from '../ledger/states.js';
@@ -797,15 +797,15 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             // outcome and keeps the alert open with its retryable debt —
             // settlement is never reported before the control accepts it.
             let rearm: 'accepted' | 'not_applicable' | 'superseded' = 'not_applicable';
+            // A disposition the ledger would refuse is refused BEFORE the
+            // supervisor acts on it (#385), open or already resolved: never a
+            // closed stop beside an alert left open.
+            const refusal = !ownerFollowThrough && target !== null ? ledger.machineDispositionRefusal(id) : null;
+            if (refusal !== null) {
+              json(res, 409, { error: 'disposition_refused', code: 'disposition_refused', detail: refusal });
+              return;
+            }
             if (!ownerFollowThrough && target !== null && target.resolvedAt === null) {
-              // A disposition the ledger would refuse is refused BEFORE the
-              // supervisor acts on it (#385): never a closed stop beside an
-              // alert left open.
-              const refusal = ledger.machineDispositionRefusal(id);
-              if (refusal !== null) {
-                json(res, 409, { error: 'disposition_refused', code: 'disposition_refused', detail: refusal });
-                return;
-              }
               try {
                 const outcome = onNotificationDisposition(id, detail);
                 if (outcome !== undefined && outcome.ok === false) {
@@ -838,9 +838,18 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
                 return;
               }
             }
-            const row = ownerFollowThrough
-              ? ledger.resolveOwnerDecision(id, detail, { credential: 'shared-bearer', declaredActor })
-              : ledger.disposeMachineNotification(id, detail, { credential: 'shared-bearer', declaredActor });
+            let row: NotificationRecord | null;
+            try {
+              row = ownerFollowThrough
+                ? ledger.resolveOwnerDecision(id, detail, { credential: 'shared-bearer', declaredActor })
+                : ledger.disposeMachineNotification(id, detail, { credential: 'shared-bearer', declaredActor });
+            } catch (error) {
+              // The disposal re-checks in its own transaction: a row that
+              // changed since the check above is refused the same typed way.
+              if (!(error instanceof MachineDispositionRefusedError)) throw error;
+              json(res, 409, { error: 'disposition_refused', code: 'disposition_refused', detail: error.refusal });
+              return;
+            }
             if (row === null) {
               json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });
               return;

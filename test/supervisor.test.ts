@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { BoardEngine } from '../src/board/engine.js';
-import { LedgerApi, type NotificationRecord } from '../src/ledger/api.js';
+import { LedgerApi, SupervisionStopClosureConflictError, type NotificationRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import {
@@ -6112,8 +6112,23 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       // One alert closes ONE stop: a replay naming another agent or job conflicts.
       expect(rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: 'once' } })).toBe(true);
       expect(rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: 'once' } })).toBe(false);
-      expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: 'b', jobId: 'fenced-job', payload: { notification_id: 'once' } })).toThrow(/alert "once" already closed the stop of agent "a" on job "fenced-job" — not "b" on "fenced-job"/u);
+      expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: 'b', jobId: 'fenced-job', payload: { notification_id: 'once' } }))
+        .toThrow(new SupervisionStopClosureConflictError('alert "once" already closed the stop of agent "a" on job "fenced-job" — not agent "b" on job "fenced-job"'));
+      expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'other-job', payload: { notification_id: 'once' } }))
+        .toThrow(/already closed the stop of agent "a" on job "fenced-job" — not agent "a" on job "other-job"$/u);
+      for (const [agentId, jobId, name] of [[7, 'fenced-job', 'agentId'], ['a', null, 'jobId']] as const) {
+        expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: agentId as never, jobId: jobId as never, payload: { notification_id: 'typed' } })).toThrow(`a superseded-stop closure needs a non-blank ${name}`);
+      }
       expect(closures(rig)).toHaveLength(1);
+      // A legacy closure with no agent or job conflicts by name, and the
+      // FIRST recorded closure of an alert is the binding one.
+      rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', payload: { notification_id: 'legacy' } });
+      expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: 'legacy' } }))
+        .toThrow(/already closed the stop of no agent on no job — not agent "a" on job "fenced-job"$/u);
+      rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: 'first', jobId: 'fenced-job', payload: { notification_id: 'twice' } });
+      rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: 'second', jobId: 'fenced-job', payload: { notification_id: 'twice' } });
+      expect(rig.api.recordSupervisionStopSuperseded({ agentId: 'first', jobId: 'fenced-job', payload: { notification_id: 'twice' } })).toBe(false);
+      expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: 'second', jobId: 'fenced-job', payload: { notification_id: 'twice' } })).toThrow(SupervisionStopClosureConflictError);
     } finally {
       rig.close();
     }
@@ -6151,6 +6166,16 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       const spy = vi.spyOn(rig.api, 'hasSupervisionStopSuperseded').mockImplementation(() => { throw new Error('events unreadable'); });
       try {
         expect(rig.supervisor.onNotificationDisposed(stopId)).toEqual({ ok: false, reason: 'superseded closure lookup failed — retry the disposition: Error: events unreadable' });
+        // An alert known not to be a breaker stays a pure record...
+        const note = rig.center.post({ kind: 'job.note', routing: 'action-required', severity: 'info', title: 'not a breaker' });
+        expect(rig.supervisor.onNotificationDisposed(note.id)).toEqual({ ok: true, rearmed: false });
+        // ...and one whose kind cannot be read is treated as a breaker: refused.
+        const kind = vi.spyOn(rig.api, 'getNotification').mockImplementation(() => { throw new Error('notifications unreadable'); });
+        try {
+          expect(rig.supervisor.onNotificationDisposed(note.id)).toEqual({ ok: false, reason: 'superseded closure lookup failed — retry the disposition: Error: events unreadable' });
+        } finally {
+          kind.mockRestore();
+        }
       } finally {
         spy.mockRestore();
       }

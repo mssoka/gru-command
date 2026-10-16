@@ -487,6 +487,25 @@ export interface NotificationProvenance {
   readonly declaredActor: string | null;
 }
 
+/** A machine disposition the row cannot take (not action-required, or a
+ * kind that closes itself): the board route answers it as a typed
+ * `409 disposition_refused` (#385). */
+export class MachineDispositionRefusedError extends Error {
+  constructor(readonly notificationId: string, readonly refusal: string) {
+    super(refusal);
+    this.name = 'MachineDispositionRefusedError';
+  }
+}
+
+/** One alert closes ONE stop (#385): a replay of a recorded closure naming
+ * another agent or job. */
+export class SupervisionStopClosureConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SupervisionStopClosureConflictError';
+  }
+}
+
 /** A notification decision/disposition/adoption was asked to record a blank
  * credential class: a programming error at the caller (every route supplies
  * one), refused before anything is written (#396). */
@@ -3313,9 +3332,14 @@ export class LedgerApi {
   /** Whether a breaker alert's stop was closed as superseded (#385): the
    * durable record a retried disposition is answered from, across restarts. */
   hasSupervisionStopSuperseded(notificationId: string): boolean {
+    return this.supervisionStopClosure(notificationId) !== undefined;
+  }
+
+  /** The FIRST recorded closure of this alert's stop — the binding one. */
+  private supervisionStopClosure(notificationId: string): { readonly agentId: string | null; readonly jobId: string | null } | undefined {
     return this.db.prepare(
-      "SELECT 1 FROM events WHERE kind = 'supervision.stop-superseded' AND json_extract(payload, '$.notification_id') = ? LIMIT 1",
-    ).get(notificationId) !== undefined;
+      "SELECT agent_id AS agentId, job_id AS jobId FROM events WHERE kind = 'supervision.stop-superseded' AND json_extract(payload, '$.notification_id') = ? ORDER BY seq ASC LIMIT 1",
+    ).get(notificationId) as { agentId: string | null; jobId: string | null } | undefined;
   }
 
   /** Records a superseded-stop closure (#385) at most ONCE per alert: the
@@ -3333,14 +3357,13 @@ export class LedgerApi {
       throw new Error(`a superseded-stop closure names job "${String(input.payload['job_id'])}" in its payload but "${input.jobId}" as its job`);
     }
     return this.transaction(() => {
-      const prior = this.db.prepare(
-        "SELECT agent_id AS agentId, job_id AS jobId FROM events WHERE kind = 'supervision.stop-superseded' AND json_extract(payload, '$.notification_id') = ? LIMIT 1",
-      ).get(input.payload.notification_id) as { agentId: string | null; jobId: string | null } | undefined;
+      const prior = this.supervisionStopClosure(input.payload.notification_id);
       if (prior !== undefined) {
         // The same alert closes ONE stop: a replay naming another agent or
         // job is a conflict, never "already recorded".
         if (prior.agentId !== input.agentId || prior.jobId !== input.jobId) {
-          throw new Error(`alert "${input.payload.notification_id}" already closed the stop of agent "${String(prior.agentId)}" on job "${String(prior.jobId)}" — not "${input.agentId}" on "${input.jobId}"`);
+          const named = (what: string, value: string | null): string => (value === null ? `no ${what}` : `${what} "${value}"`);
+          throw new SupervisionStopClosureConflictError(`alert "${input.payload.notification_id}" already closed the stop of ${named('agent', prior.agentId)} on ${named('job', prior.jobId)} — not agent "${input.agentId}" on job "${input.jobId}"`);
         }
         return false;
       }
@@ -5307,7 +5330,7 @@ export class LedgerApi {
       const current = this.getNotification(id);
       if (current === null) return null;
       const refusal = machineDispositionRefusalOf(current);
-      if (refusal !== null) throw new Error(refusal);
+      if (refusal !== null) throw new MachineDispositionRefusedError(id, refusal);
       if (current.resolvedAt !== null || current.ackedAt !== null) return current;
       this.db.prepare('UPDATE notifications SET resolved_at = ?, resolved_by = ? WHERE id = ?')
         .run(nowIso(), 'gru', id);
