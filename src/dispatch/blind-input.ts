@@ -302,10 +302,11 @@ export function shownPath(path: string): string {
 }
 
 /** A path as a violation's `where` (or a recorded read's `path`) holds it:
- * as written when line-safe; otherwise its line-safe JSON literal, quotes
- * included, which marks it as escaped. */
+ * as written when line-safe and not opening with a quote; otherwise its
+ * line-safe JSON literal. A leading quote therefore always marks the escaped
+ * form: a real path opening with `"` is shown as its literal, never bare. */
 export function shownWhere(path: string): string {
-  return hasLineUnsafe(path) ? lineSafeLiteral(path) : path;
+  return hasLineUnsafe(path) || path.startsWith('"') ? lineSafeLiteral(path) : path;
 }
 
 /** Why a package path is not admissible, or null when it is. */
@@ -721,22 +722,22 @@ export function evaluateBlindPackage(pkg: BlindInputPackage, rule: BlindIsolatio
     }
     const reason = classifyBlindPath(file.path, rule);
     if (reason !== null) {
-      violations.push({ code: 'excluded-path', where: file.path, detail: reason });
+      violations.push({ code: 'excluded-path', where: shownWhere(file.path), detail: reason });
       continue;
     }
     const computed = sha256(file.content);
     const blob = gitBlobSha(file.content);
     if (file.sha256 !== undefined && file.sha256 !== computed) {
-      violations.push({ code: 'digest-mismatch', where: file.path, detail: `declared sha256 does not match the bytes supplied for "${file.path}"` });
+      violations.push({ code: 'digest-mismatch', where: shownWhere(file.path), detail: `declared sha256 does not match the bytes supplied for ${shownPath(file.path)}` });
     }
     if (file.blobSha !== undefined && file.blobSha !== blob) {
-      violations.push({ code: 'digest-mismatch', where: file.path, detail: `declared git blob id does not match the bytes supplied for "${file.path}"` });
+      violations.push({ code: 'digest-mismatch', where: shownWhere(file.path), detail: `declared git blob id does not match the bytes supplied for ${shownPath(file.path)}` });
     }
     if (DOC_EXTENSIONS.has(extensionOf(file.path)) && classifyHistoryContent(file.content).excluded) {
       violations.push({
         code: 'history-content',
-        where: file.path,
-        detail: `"${file.path}" carries task-spec, prior-assessment, deferred-work or triage text`,
+        where: shownWhere(file.path),
+        detail: `${shownPath(file.path)} carries task-spec, prior-assessment, deferred-work or triage text`,
       });
     }
     fileRecords.push({ path: normalizeRepoPath(file.path), sha256: computed, blobSha: blob });

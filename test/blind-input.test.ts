@@ -563,6 +563,25 @@ describe('git\'s diff section grammar (#360 R5-B1 round 1)', () => {
     expect(disagreeing.map((v) => v.detail)).toEqual([expect.stringContaining('names "src/x\\u202e.ts" → "src/x\\u202e.ts", but its rename')]);
     // A quote in an otherwise line-safe path stays unambiguous too.
     expect(classifyBlindPath('_bmad-output/a" is fine "b.md', DEFAULT_BLIND_ISOLATION_RULE)).toBe('"_bmad-output/a\\" is fine \\"b.md" is private job material (planning, spec, review or triage artifacts)');
+    // ...and so do the package-file digest and history refusals.
+    const quoted = 'notes/a" is fine "b.md';
+    const files = evaluateBlindPackage({
+      baseSha: base, targetSha: target,
+      files: [{ path: quoted, content: HISTORY_NOTE, sha256: sha('other\n'), blobSha: gitBlobSha('other\n') }],
+    }, DEFAULT_BLIND_ISOLATION_RULE).violations;
+    const literal = '"notes/a\\" is fine \\"b.md"';
+    expect(files.map((v) => `${v.code} ${v.where} ${v.detail}`)).toEqual([
+      `digest-mismatch ${quoted} declared sha256 does not match the bytes supplied for ${literal}`,
+      `digest-mismatch ${quoted} declared git blob id does not match the bytes supplied for ${literal}`,
+      `history-content ${quoted} ${literal} carries task-spec, prior-assessment, deferred-work or triage text`,
+    ]);
+    // A `where` opening with a quote is always the escaped form: a real path
+    // that opens with one is shown as its literal, never bare.
+    const opening = evaluateBlindPackage({ baseSha: base, targetSha: target, files: [{ path: '"x".md', content: HISTORY_NOTE }] }, DEFAULT_BLIND_ISOLATION_RULE).violations;
+    expect(opening.map((v) => [v.where, v.detail])).toEqual([['"\\"x\\".md"', '"\\"x\\".md" carries task-spec, prior-assessment, deferred-work or triage text']]);
+    const quoteRule = { ...DEFAULT_BLIND_ISOLATION_RULE, excludeGlobs: ['"x".md', 'a"x".md'] };
+    const recorded = (relative: string): unknown => scanObservedAccess([{ index: 0, toolName: 'read', text: 'x', readPath: `/lanes/job-1/${relative}` }], quoteRule, ['/lanes/job-1'])[0]?.path;
+    expect([recorded('"x".md'), recorded('a"x".md')]).toEqual(['"\\"x\\".md"', 'a"x".md']);
   });
 
   it('`.` or `./` names the repository, never a package file; a file path holding a control character is refused', () => {

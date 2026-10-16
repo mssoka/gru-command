@@ -412,10 +412,12 @@ lifecycle fact — so a settled report read as independent coverage.
   framed as data (a package file path holding a control, format — bidi,
   zero-width — separator, private-use or unassigned character is refused, so
   nothing can escape a fence or disguise its heading). A refusal's text names
-  every path as a JSON literal with each line-unsafe character escaped; a
+  every path as a JSON literal with each line-unsafe character escaped. A
   violation's `where` (and a recorded read's `path`) holds a line-safe path as
-  written and any other as that literal, quotes included. The package bytes are kept
-  (`review.blind-input-package`, written before the admission), so a fresh
+  written, and any other path as that literal. A path that itself opens with
+  `"` counts as "any other", so a leading quote always marks the escaped form.
+  The package bytes are kept (`review.blind-input-package`, written before the
+  admission), so a fresh
   replacement reviewer spawned by provider recovery gets the same block; a resumed
   session already holds it. An attested reviewer whose package was not kept (one
   admitted before packages were kept) fails that fresh continuation by name —
