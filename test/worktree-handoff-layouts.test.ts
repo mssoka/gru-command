@@ -502,6 +502,23 @@ describe('child lane parent custody, called directly (#373)', () => {
       .toThrow(`lane administration ${f.admin} published its handoff receipt but could not make it durable (EIO), and its temporary receipt ${temp} could not be removed (EBUSY)`);
     fsHooks.beforeFsync = null; fsHooks.beforeUnlink = null;
     rmSync(temp);
+    // ...and with the directory's close failing too, every failure is in the cause.
+    rmSync(join(f.admin, 'gru-creation-handoff.json'));
+    fsHooks.beforeFsync = failDirectorySync('EIO');
+    fsHooks.beforeClose = (fd) => {
+      if (!fstatSync(fd).isDirectory()) return;
+      fsHooks.beforeClose = null;
+      closeSync(fd);
+      throw Object.assign(new Error('close'), { code: 'EBADF' });
+    };
+    fsHooks.beforeUnlink = (path) => { if (path === temp) throw Object.assign(new Error('busy'), { code: 'EBUSY' }); };
+    const all = (() => { try { handoffProof.beginLaneHandoff(f.parent, f.admin, token); return null; } catch (error) { return error as Error; } })();
+    fsHooks.beforeFsync = null; fsHooks.beforeClose = null; fsHooks.beforeUnlink = null;
+    expect(all).not.toBeNull();
+    expect(all!.message).toBe(`lane administration ${f.admin} published its handoff receipt but could not make it durable (EIO), and its temporary receipt ${temp} could not be removed (EBUSY)`);
+    const [durability, cleanup] = (all!.cause as AggregateError).errors as [AggregateError, { code: string }];
+    expect([(durability.errors as { code: string }[]).map((error) => error.code), cleanup.code]).toEqual([['EIO', 'EBADF'], 'EBUSY']);
+    rmSync(temp);
     // ...nor does the directory's close failure replace its sync failure.
     rmSync(join(f.admin, 'gru-creation-handoff.json'));
     let directoryFd = -1;
@@ -517,10 +534,18 @@ describe('child lane parent custody, called directly (#373)', () => {
     fsHooks.beforeClose = failDirectoryClose;
     const both = (() => { try { handoffProof.beginLaneHandoff(f.parent, f.admin, token); return null; } catch (error) { return error as Error; } })();
     fsHooks.beforeFsync = null; fsHooks.beforeClose = null;
+    expect(both).not.toBeNull();
     expect(both?.message).toBe(`lane administration ${f.admin} published its handoff receipt but could not make it durable (EIO)`);
     expect([directoryFd > -1, closeFired]).toEqual([true, true]);
     // ...the close failure travels with it.
     expect(((both?.cause as AggregateError).errors as { code: string }[]).map((error) => error.code)).toEqual(['EIO', 'EBADF']);
+    expect(existsSync(temp)).toBe(false);
+    // Even a sync that throws no error object at all is a failure, never success.
+    rmSync(join(f.admin, 'gru-creation-handoff.json'));
+    fsHooks.beforeFsync = (fd) => { if (fstatSync(fd).isDirectory()) throw undefined as unknown as Error; };
+    expect(() => handoffProof.beginLaneHandoff(f.parent, f.admin, token))
+      .toThrow(`lane administration ${f.admin} published its handoff receipt but could not make it durable (undefined)`);
+    fsHooks.beforeFsync = null;
     expect(existsSync(temp)).toBe(false);
     // A directory close failure alone, after a sync that succeeded, is a failure to make it durable too.
     rmSync(join(f.admin, 'gru-creation-handoff.json'));
@@ -559,7 +584,10 @@ describe('child lane parent custody, called directly (#373)', () => {
       return existsSync(dir) ? readdirSync(dir).sort() : [];
     };
     /** Every lane checkout under a manager's root, as `<repo>/<lane>`. */
-    const checkouts = (root: string): string[] => (existsSync(root) ? readdirSync(root).flatMap((repoName) => readdirSync(join(root, repoName)).map((lane) => `${repoName}/${lane}`)).sort() : []);
+    const checkouts = (root: string): string[] => (existsSync(root)
+      ? readdirSync(root, { withFileTypes: true }).filter((entry) => entry.isDirectory())
+        .flatMap((repo) => readdirSync(join(root, repo.name)).map((lane) => `${repo.name}/${lane}`)).sort()
+      : []);
     // A job lane, and a review lane.
     for (const kind of ['job', 'review'] as const) {
       const repo = fixture(`undurable-${kind}`);

@@ -435,23 +435,25 @@ export function beginLaneHandoff(lane: Pick<WorktreeLane, 'id' | 'kind' | 'repoP
   // can — before the temporary name is removed, so no cleanup failure skips
   // it. A failure here comes after publication and is named so; the caller
   // rolls the unregistered lane back, receipt and all.
-  let unsynced: unknown = null;
-  let unclosed: unknown = null;
+  // Boxed, so even a thrown `undefined` or `null` is a failure.
+  let unsynced: { readonly error: unknown } | null = null;
+  let unclosed: { readonly error: unknown } | null = null;
   try {
     const dirFd = openSync(admin, 'r');
-    try { durably(dirFd); } catch (error) { unsynced = error; }
-    try { closeSync(dirFd); } catch (error) { unclosed = error; }
+    try { durably(dirFd); } catch (error) { unsynced = { error }; }
+    try { closeSync(dirFd); } catch (error) { unclosed = { error }; }
   } catch (error) {
-    unsynced = error;
+    unsynced = { error };
   }
   // A close failure alone is a failure to make it durable; after a sync
   // failure it never replaces that reason, but travels with it.
-  const undurable = unsynced ?? unclosed;
-  if (undurable === null) {
+  const failed = unsynced ?? unclosed;
+  if (failed === null) {
     removeTemp(null);
     return;
   }
-  const cause = unsynced !== null && unclosed !== null ? new AggregateError([unsynced, unclosed], 'the directory sync and its close both failed') : undurable;
+  const undurable = failed.error;
+  const cause = unsynced !== null && unclosed !== null ? new AggregateError([unsynced.error, unclosed.error], 'the directory sync and its close both failed') : undurable;
   const notDurable = `lane administration ${admin} published its handoff receipt but could not make it durable (${errnoOf(undurable)})`;
   try { unlinkSync(temp); } catch (cleanupError) {
     if (errnoOf(cleanupError) !== 'ENOENT') {
