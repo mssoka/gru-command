@@ -135,14 +135,17 @@ export class DirectiveDispatchDeferredError extends Error {
   constructor(readonly original: unknown) { super(`pre-native directive deferred: ${String(original)}`); this.name = 'DirectiveDispatchDeferredError'; }
 }
 
-/** Route a directive to the implementing minion: the live job minion
- * first; otherwise a fresh minion on the job lane. */
 /** A caller broke the routing contract (a programming error), refused
- * before any effect. */
+ * before any effect. It is never a deferral: the executor surfaces it as a
+ * recovery decision, and the fix is in the calling code, not a retry. */
 export class DirectiveRoutingContractError extends Error {
   constructor(message: string) { super(message); this.name = 'DirectiveRoutingContractError'; }
 }
 
+/** Route a directive to the implementing minion: the live job minion
+ * first; otherwise a fresh minion on the job lane. Throws
+ * DirectiveRoutingContractError when a native directive turn arrives
+ * without onPrepared. */
 export async function routeFixDirectiveToMinion(
   input: DirectiveRoutingDeps & {
     jobId: string;

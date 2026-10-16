@@ -892,6 +892,8 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     return dir;
   }
 
+  const POST_CRASH_SUCCESSOR = 'post-crash-successor';
+
   /** Runs the REAL executor and snapshots the ledger at a crash window between
    * registry.spawn() and onPrepared, then recovers from that snapshot as a
    * restarted service would (#362). */
@@ -904,24 +906,35 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     // the first admission boundary after the spawned registration is the one
     // immediately before onPrepared.
     let registered = false;
+    let registeredAtCrash: boolean | null = null;
     const register = f.ledger.registerAgent.bind(f.ledger);
-    vi.spyOn(f.ledger, 'registerAgent').mockImplementation((input) => { const row = register(input); registered = true; return row; });
+    const spy = vi.spyOn(f.ledger, 'registerAgent').mockImplementation((input) => { const row = register(input); registered = true; return row; });
     const run = executeAcceptedDirective({ ...f.deps, beforeWriterSideEffect: () => {
-      if (crashPoint === 'after-registration' && registered && snapshot === null) snapshot = crashSnapshot(f);
+      if (crashPoint === 'after-registration' && registered && snapshot === null) { snapshot = crashSnapshot(f); registeredAtCrash = registered; }
     } }, f.intent.requestId);
+    let failure: unknown = null;
     try {
       if (crashPoint === 'inside-spawn') {
         await vi.waitFor(() => expect(f.spawns).toHaveLength(1));
-        snapshot = crashSnapshot(f);
+        snapshot = crashSnapshot(f); registeredAtCrash = registered;
       }
-    } finally { release(); }
-    await run;
+    } catch (error) { failure = error; } finally { release(); }
+    // The executor is always awaited, so it never runs on into cleanup.
+    const runFailure = await run.then(() => null, (error: unknown) => error);
+    spy.mockRestore();
+    if (failure !== null) throw failure;
+    if (runFailure !== null) throw runFailure;
+    if (crashPoint === 'after-registration' && !registered) throw new Error('fixture: the spawned registration was never reached');
     if (snapshot === null) throw new Error(`fixture: no crash snapshot at ${crashPoint}`);
+    // The two windows differ: only the second crashed after the spawned registration.
+    expect(registeredAtCrash, crashPoint).toBe(crashPoint === 'after-registration');
     const db = new LedgerDb(snapshot); cleanups.push(() => db.close());
     const bus = new EventBus({}); const ledger = new LedgerApi(db.handle, { bus });
-    // The crashed state itself: reserved, no native target, no producer start.
+    // The crashed state itself: reserved, no native target, no producer start,
+    // and no open turn on the agent row that could fence the lane.
     expect(ledger.getDirective(f.intent.requestId), crashPoint).toMatchObject({ state: 'dispatching', nativeTarget: null });
     expect(ledger.latestJobEventByRequestId(f.intent.jobId, 'silas.directive-producer-started', f.intent.requestId), crashPoint).toBeNull();
+    expect(ledger.getAgent('logical-minion')?.state, crashPoint).toBe('idle');
     for (const lane of ledger.listWorktrees()) rememberManagedLane(lane, ledger);
     let respawns = 0;
     const registry: DirectiveRegistry = { getHandle: () => null, spawn: async () => { respawns += 1; throw new Error('the reserved original must never respawn'); },
@@ -946,7 +959,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       requestId: f.intent.requestId, generation: debt!.generation, expectedPayloadHash: original!.payloadHash,
       expectedHead: resolveGitCommit(f.lane.path, 'HEAD'), expectedEpoch: ledger.directiveRecoveryEpoch(f.intent.jobId),
       expectedWorkRevision: authority.workRevision, expectedContractSha256: authority.contractSha256,
-      reason: 'the reserved original never reached a native target', decision: { kind: 'successor', requestId: 'post-crash-successor', directive: 'approved correction' } });
+      reason: 'the reserved original never reached a native target', decision: { kind: 'successor', requestId: POST_CRASH_SUCCESSOR, directive: 'approved correction' } });
     return { ledger, decide, debt: debt!, requestId: f.intent.requestId };
   }
 
@@ -958,8 +971,10 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     const { ledger, decide, requestId } = await recoverFromCrash(crashPoint);
     // The (re-)registered row is idle — no open turn can fence the lane.
     expect(ledger.getAgent('logical-minion')?.state, crashPoint).toBe('idle');
-    expect(decide().successor?.requestId, crashPoint).toBe('post-crash-successor');
+    expect(decide().successor?.requestId, crashPoint).toBe(POST_CRASH_SUCCESSOR);
     expect(ledger.getDirective(requestId)?.state, crashPoint).toBe('retired');
+    // Retired by the decision, never by an invented no-native-effect deferral.
+    expect(ledger.latestJobEventByRequestId(ledger.getDirective(requestId)!.jobId, 'silas.directive-dispatch-deferred', requestId), crashPoint).toBeNull();
   }
   it('#362 a crash inside registry.spawn() is never replayed, and a successor may proceed', () => assertSuccessorMayProceed('inside-spawn'));
   it('#362 a crash after the spawned registration but before onPrepared is never replayed, and a successor may proceed', () => assertSuccessorMayProceed('after-registration'));

@@ -530,16 +530,13 @@ describe('eviction-safe fix directives (phase 3)', () => {
     // Every ledger read throws: the refusal precedes any effect at all.
     const untouched = () => { throw new Error('the ledger must not be touched'); };
     const ledger = { getAgent: untouched, listAgents: untouched, listImplementerMinions: untouched, registerAgent: untouched, getJob: untouched };
-    await expect(routeFixDirectiveToMinion({
+    const refusal: unknown = await routeFixDirectiveToMinion({
       registry: registry as never, ledger: ledger as never, worktrees: { listWorktrees: () => [] } as unknown as WorktreePort,
       jobId: 'job-no-prepare', directive: 'repair', signal: controller.signal,
       directiveTurn: { identity: {} as never, beforeAdmission: () => {}, onAdmitted: () => {} },
-    })).rejects.toThrow(DirectiveRoutingContractError);
-    await expect(routeFixDirectiveToMinion({
-      registry: registry as never, ledger: ledger as never, worktrees: { listWorktrees: () => [] } as unknown as WorktreePort,
-      jobId: 'job-no-prepare', directive: 'repair', signal: controller.signal,
-      directiveTurn: { identity: {} as never, beforeAdmission: () => {}, onAdmitted: () => {} },
-    })).rejects.toThrow(/^job "job-no-prepare": a native directive turn needs onPrepared/u);
+    }).then(() => null, (error: unknown) => error);
+    expect(refusal).toBeInstanceOf(DirectiveRoutingContractError);
+    expect((refusal as Error).message).toMatch(/^job "job-no-prepare": a native directive turn needs onPrepared/u);
     expect(calls).toEqual([]);
     expect(prompted).toEqual([]);
   });
