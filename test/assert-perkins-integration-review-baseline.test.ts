@@ -185,8 +185,8 @@ describe('perkins integration R4 fail-before classifier', () => {
     }
     // A frame-opening line too long to judge is never matched — and refuses.
     expect(isBehavioralAssertion(`AssertionError: x\n    at ${'a ('.repeat(5000)}/repo/test/helpers/h.ts:1:2)\n    at /repo/test/a.test.ts:1:2`)).toBe(false);
-    // The bound is 2048 characters: a real frame just under it is judged, one
-    // just over it (and under the old 4096) refuses by name.
+    // The bound is 2048 characters: a real frame at it is judged, one just
+    // over it refuses by name.
     const frameOf = (length: number): string => { const head = '    at /repo/test/'; const tail = '.test.ts:1:2'; return `${head}${'d'.repeat(length - head.length - tail.length)}${tail}`; };
     expect(frameOf(2048)).toHaveLength(2048);
     expect(behavioralRefusal(`AssertionError: x\n${frameOf(2048)}`)).toBeNull();
@@ -309,6 +309,18 @@ describe('perkins integration R4 fail-before classifier', () => {
     expect(behavioralRefusal('AssertionError: x\n    at test/my helpers/h.ts:1:2\n    at /repo/test/a.test.ts:1:2'))
       .toBe('a frame names a location that cannot be judged (rephrase prose shaped like a frame): "at test/my helpers/h.ts:1:2"');
     expect(behavioralRefusal('AssertionError: x\n    at 12:30:15\n    at /repo/test/a.test.ts:1:2')).toBeNull();
+    // Layout never hides a frame: trailing blanks, or a tab after `at`.
+    for (const helper of ['    at /repo/test/helpers/h.ts:1:2 ', '    at\t/repo/test/helpers/h.ts:1:2', '    at  fn (/repo/test/helpers/h.ts:1:2)']) {
+      expect(behavioralRefusal(`AssertionError: x\n${helper}\n    at /repo/test/a.test.ts:1:2`), JSON.stringify(helper)).toBe('the assertion was raised outside a test file, in "/repo/test/helpers/h.ts"');
+    }
+    // A location without a column, or with text after it, is located and unreadable: refused.
+    for (const frame of ['    at fn (test/x.ts:12)', '    at fn (/repo/test/helpers/h.ts:1:2) extra']) {
+      expect(behavioralRefusal(`AssertionError: x\n${frame}\n    at /repo/test/a.test.ts:1:2`), frame).toMatch(/^a frame names a location that cannot be judged/u);
+    }
+    // Frames after the deciding test-file frame are its callers: not judged.
+    expect(behavioralRefusal('AssertionError: x\n    at /repo/test/a.test.ts:1:2\n    at stage:1:2')).toBeNull();
+    // A huge line is quoted from a bounded prefix, cut and marked.
+    expect(behavioralRefusal(`TypeError: ${'z'.repeat(5_000_000)}`)).toBe(`its first line is no assertion or rejects/resolves report: ${JSON.stringify(`TypeError: ${'z'.repeat(149)}`)}…`);
     // A quoted line is cut on a code point, never inside a surrogate pair.
     const emoji = behavioralRefusal(`TypeError: ${'😀'.repeat(200)}`)!;
     expect(emoji).toBe(`its first line is no assertion or rejects/resolves report: ${JSON.stringify(`TypeError: ${'😀'.repeat(149)}`)}…`);

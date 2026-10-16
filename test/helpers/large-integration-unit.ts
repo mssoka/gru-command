@@ -7,11 +7,12 @@ import type { FixtureRepo } from './fixture-repo.js';
  * or spaces (Windows), any case. */
 function foldedSegment(part: string): string {
   const folded = part.normalize('NFKC').replace(/\p{Default_Ignorable_Code_Point}/gu, '');
-  // A stream suffix (`a:b`) or a run of three or more dots (Windows strips
-  // trailing dots) folds to nothing: refused, never judged as another name.
-  if (folded.includes(':') || /^\.{3,}$/u.test(folded)) return '';
-  if (folded === '.' || folded === '..') return folded;
-  return folded.replace(/[. ]+$/u, '').toLowerCase();
+  // A stream suffix (`a:b`) or a reserved device name folds to nothing:
+  // refused, never judged as another name.
+  if (folded.includes(':') || /^(?:con|prn|aux|nul|com\d|lpt\d)(?:\..*)?$/iu.test(folded)) return '';
+  // Windows drops trailing dots and blanks: a segment of only those (`.`,
+  // `..`, `...`, `. .`) folds to nothing too.
+  return folded.replace(/[.\s]+$/u, '').toLowerCase();
 }
 /** A name a filesystem may map onto `.git`, including the 8.3 short names
  * `git~N`. */

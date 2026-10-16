@@ -86,15 +86,26 @@ const STACK_LINE = new RegExp(String.raw`^\s+at (?:async )?(?:\S.* \((?:.*:\d+:\
  * shorter. */
 const FRAME_OPENING = /^\s+at \S/u;
 const MAX_FRAME_LINE = 2048;
-/** An indented `at …` line ending in a location, and a bare clock time. */
-const LOCATED_TAIL = /:\d+:\d+\)?$/u;
+/** An indented `at …` line naming a location: one that ends in
+ * `:line:column`, or holds a path-like token (a `.` or `/` in it) followed
+ * by `:line` anywhere — with or without a column, closed or not. A bare clock
+ * time, and prose whose numbers are not attached to a path, are not. */
+const LOCATED = /:\d+:\d+\)?$|[^\s:()]*[./][^\s:()]*:\d+/u;
 const CLOCK_PROSE = /^\s+at \d+(?::\d+)+$/u;
+/** A line as the grammar judges it: trailing whitespace dropped, and any run
+ * of blanks after `at` read as one — layout never hides a frame. */
+const frameText = (line) => line.trimEnd().replace(/^(\s+at)\s+/u, '$1 ');
 /** Lines end at any line terminator a rendered message can carry —
  * vertical tab, form feed and NEL included. */
 const LINE_BREAK = /\r\n|[\n\v\f\r\u0085\u2028\u2029]/u;
-/** Report text quoted in a refusal: a JSON literal of at most 160 code
- * points (never a split surrogate pair), marked when cut. */
-const quoted = (text) => { const points = [...text]; return `${JSON.stringify(points.slice(0, 160).join(''))}${points.length > 160 ? '…' : ''}`; };
+/** Report text quoted in a refusal: a JSON literal of at most QUOTE_POINTS
+ * code points (never a split surrogate pair), marked when cut — read from a
+ * bounded prefix, so a huge line costs no more than a short one. */
+const QUOTE_POINTS = 160;
+const quoted = (text) => {
+  const points = [...text.slice(0, QUOTE_POINTS * 2 + 1)];
+  return `${JSON.stringify(points.slice(0, QUOTE_POINTS).join(''))}${points.length > QUOTE_POINTS ? '…' : ''}`;
+};
 const LOCATION = /^([A-Za-z][A-Za-z0-9+.-]*:\/\/)?(.+):\d+:\d+$/u;
 /** A V8 token frame names no source location by design. */
 const TOKEN_FRAME = /^(?:<anonymous>|index \d+|native)$/u;
@@ -151,7 +162,7 @@ export function frameLocation(line) {
   // An eval frame by the frame grammar — `eval at <origin>`, or `<fn> (eval
   // at <origin>…)` with `<fn>` one name, optionally `new `/`async `-prefixed
   // or `[as …]`-aliased — never a path that merely contains the text.
-  const innermostEval = /^(?:eval at |(?:new |async )?[^\s(]+(?: \[as [^\]]+\])? \(eval at )/u.test(body) ? body.lastIndexOf('eval at ') : -1;
+  const innermostEval = /^(?:eval at |(?:new )?[^\s(]+(?: \[as [^\]]+\])? \(eval at )/u.test(body) ? body.lastIndexOf('eval at ') : -1;
   if (innermostEval !== -1) {
     const origin = body.slice(innermostEval + 'eval at '.length);
     for (let index = origin.indexOf(' ('); index !== -1; index = origin.indexOf(' (', index + 1)) {
@@ -193,22 +204,25 @@ export function behavioralRefusal(message) {
   if (typeof message !== 'string') return 'the failure message is not text';
   const [head = '', ...rest] = message.split(LINE_BREAK);
   if (!ASSERTION_HEAD.test(head) && !PROMISE_REPORT_HEAD.test(head)) return `its first line is no assertion or rejects/resolves report: ${quoted(head)}`;
+  const lines = rest.map(frameText);
   // A frame-opening line too long to judge refuses (fail closed).
-  const overlong = rest.find((line) => line.length > MAX_FRAME_LINE && FRAME_OPENING.test(line));
+  const overlong = lines.find((line) => line.length > MAX_FRAME_LINE && FRAME_OPENING.test(line));
   if (overlong !== undefined) return `a frame-opening line is longer than ${String(MAX_FRAME_LINE)} characters: ${quoted(overlong)}`;
-  // Every frame, and every located `at …` line the grammar cannot read (it
-  // refuses where it stands, below).
-  const stack = rest.filter((line) => line.length <= MAX_FRAME_LINE &&
-    (STACK_LINE.test(line) || (FRAME_OPENING.test(line) && LOCATED_TAIL.test(line) && !CLOCK_PROSE.test(line))));
+  // Every frame, and every located `at …` line the grammar cannot read —
+  // classified once; an unreadable one refuses where it stands, below.
+  const stack = lines.filter((line) => line.length <= MAX_FRAME_LINE && FRAME_OPENING.test(line))
+    .map((line) => ({ line, readable: STACK_LINE.test(line) }))
+    .filter(({ line, readable }) => readable || (LOCATED.test(line) && !CLOCK_PROSE.test(line)));
   // A report without any stack frames is judged by its head alone.
   if (stack.length === 0) return null;
   // The first frame outside the runtime and assertion machinery decides.
   // Token frames name nothing and are passed over; a frame whose location
   // cannot be judged — before the deciding one — refuses, as does a stack
   // that is all tokens or all machinery: never an open door for a
-  // helper-raised assertion (#394).
-  for (const line of stack) {
-    const file = STACK_LINE.test(line) ? frameLocation(line) : undefined;
+  // helper-raised assertion (#394). Frames after the deciding one are its
+  // callers, never the raiser: they are not judged.
+  for (const { line, readable } of stack) {
+    const file = readable ? frameLocation(line) : undefined;
     if (file === null) continue;
     if (file === undefined) return `a frame names a location that cannot be judged (rephrase prose shaped like a frame): ${quoted(line.trim())}`;
     if (MACHINERY_FRAME.test(file)) continue;
