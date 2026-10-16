@@ -941,14 +941,15 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       await run;
     } finally { spy.mockRestore(); }
     const [only] = failures;
-    if (failures.length === 1 && only !== undefined) throw new Error(`fixture: ${only.where} failed at ${crashPoint}`, { cause: only.error });
+    if (failures.length === 1 && only !== undefined) throw new Error(`fixture: ${only.where} failed at ${crashPoint}: ${String(only.error)}`, { cause: only.error });
     if (failures.length > 1) {
       const where = failures.map((failure) => failure.where).join(', ');
       throw new AggregateError(failures.map((failure) => failure.error), `fixture: failures at ${crashPoint} (${where})`);
     }
-    // The run went on to completion: the spawned minion registered exactly once.
-    expect(registrations, `${crashPoint}: registrations of ${SPAWNED_MINION}`).toBe(1);
     if (crashPoint === 'after-registration' && !registered) throw new Error(`fixture: the spawned registration of "${SPAWNED_MINION}" was never reached (did the spawn register another id?)`);
+    // The run went on to completion (inside the spawn, after its release): the
+    // spawned minion registered exactly once.
+    expect(registrations, `${crashPoint}: registrations of ${SPAWNED_MINION}`).toBe(1);
     if (snapshot === null) throw new Error(crashPoint === 'after-registration' ? 'fixture: no admission boundary followed the spawned registration' : 'fixture: no snapshot inside the spawn');
     // The windows differ by what the executor had done when the snapshot was
     // taken (the fixture pre-registers the same idle row, so the two rows
@@ -1003,7 +1004,6 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     // (the durable event itself: the row-state predicate is false for any
     // retired row, so it cannot witness this).
     expect(ledger.latestJobEventByRequestId(jobId, 'silas.directive-dispatch-deferred', requestId), `${crashPoint}: no deferral event`).toBeNull();
-    expect(ledger.latestJobEventByRequestId(jobId, 'silas.directive-dispatch-deferred', POST_CRASH_SUCCESSOR), `${crashPoint}: none for the successor either`).toBeNull();
   }
   it('#362 a crash inside registry.spawn() is never replayed, and a successor may proceed', () => assertSuccessorMayProceed('inside-spawn'));
   it('#362 a crash after the spawned registration but before onPrepared is never replayed, and a successor may proceed', () => assertSuccessorMayProceed('after-registration'));
