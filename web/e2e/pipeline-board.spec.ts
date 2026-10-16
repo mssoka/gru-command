@@ -718,7 +718,7 @@ test.describe('compact owner-first board — synthetic geometry proof', () => {
       // snapping of the measured rects): the boundary under test is real.
       // 0.25 is half a device pixel at 2x (exactly on the boundary); 0.3125
       // is 1/16 px past it — both exact in layout units (1/64 px).
-      expect(await page.evaluate(() => ['bottom-in', 'bottom-out', 'top-in', 'top-out', 'left-in', 'left-out', 'right-in', 'right-out'].map((id) => {
+      expect(await page.evaluate(() => ['bottom-in', 'bottom-out', 'top-in', 'top-out', 'left-in', 'left-out', 'right-in', 'right-out', 'bottom-third'].map((id) => {
         const rect = document.getElementById(id)!.getBoundingClientRect();
         return { id, top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right };
       }))).toEqual([
@@ -730,6 +730,7 @@ test.describe('compact owner-first board — synthetic geometry proof', () => {
         { id: 'left-out', top: 70, bottom: 90, left: -0.3125, right: 19.6875 },
         { id: 'right-in', top: 100, bottom: 120, left: 380.25, right: 400.25 },
         { id: 'right-out', top: 130, bottom: 150, left: 380.3125, right: 400.3125 },
+        { id: 'bottom-third', top: 250.34375, bottom: 300.34375, left: 160, right: 180 },
       ]);
       // Exactly half a DEVICE pixel past each edge is contained and hittable...
       for (const id of ['#bottom-in', '#top-in', '#left-in', '#right-in']) {
@@ -748,6 +749,7 @@ test.describe('compact owner-first board — synthetic geometry proof', () => {
       expect(await hitTarget(page, '#bottom-third')).toEqual({ found: true, inViewport: false, hit: true });
       for (const ratio of [0, -0, -1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
         await setRatio(ratio);
+        expect(Object.is(await page.evaluate(() => window.devicePixelRatio), ratio), `${String(ratio)} reached the page as itself`).toBe(true);
         for (const id of ['#bottom-in', '#missing']) {
           // The exact refusal line (whatever prefix Playwright wraps it in):
           // `0` must never pass for `0.5`.
@@ -763,6 +765,9 @@ test.describe('compact owner-first board — synthetic geometry proof', () => {
       expect(await hitTarget(page, '#bottom-in')).toEqual({ found: true, inViewport: true, hit: true });
       expect(await hitTarget(page, '#bottom-out')).toEqual({ found: true, inViewport: true, hit: true });
       expect(await hitTarget(page, '#bottom-third')).toEqual({ found: true, inViewport: false, hit: true });
+      // ...and at 1x (a 1/2 sliver) the same box is IN.
+      await setRatio(1);
+      expect(await hitTarget(page, '#bottom-third')).toEqual({ found: true, inViewport: true, hit: true });
       // The page's ratio is left overridden: nothing below this point may use it.
     } finally {
       await context.close();
