@@ -183,14 +183,10 @@ describe('host property executor (positive sandbox controls on macOS; other host
     expect(() => propertyWorkspaceIdentity(f.root)).toThrow(/^external\/absolute symlink refused: node_modules\/vitest\/dist$/u);
     const outcome = await Promise.resolve().then(() => executor.executePlan({ ...input, adapter, approval: executor.approvePlan(input) }))
       .then((result) => ({ result, caught: null }), (caught: unknown) => ({ result: null, caught }));
-    if (resolveSandboxBackend().executable !== null) {
-      // ...and a real run refuses before any copy exists.
-      expect(outcome.result).toBeNull();
-      expect(String(outcome.caught)).toMatch(/external\/absolute symlink refused: node_modules\/vitest\/dist/u);
-    } else {
-      // Without a sandbox backend, nothing runs at all.
-      expect(outcome.result).toMatchObject({ executed: false, refusal: { kind: 'not-run' } });
-    }
+    // ...and so does the plan's approval, before any copy exists — on every
+    // platform, with or without a sandbox backend.
+    expect(outcome.result).toBeNull();
+    expect(String(outcome.caught)).toMatch(/external\/absolute symlink refused: node_modules\/vitest\/dist/u);
   });
   it('refuses a raw receipt without its framed report field, by name; null is no report (#378)', () => {
     const f = fixture(PASS_RUNNER);
