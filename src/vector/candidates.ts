@@ -62,10 +62,9 @@ const DAY_MS = 86_400_000;
 
 const sameTarget = (left: RaidTarget, right: RaidTarget): boolean => left.repo === right.repo && left.packageDir === right.packageDir;
 
-/** Outcomes that leave a target worth raiding again at the same code: the
- * raid stopped for heist work, main moved under it, the host failed, or the
- * host could not run it (a sandbox can be installed later). */
-/** Outcomes that leave a target eligible again at the same source identity. */
+/** Outcomes that leave a target eligible again at the same source identity:
+ * the raid stopped for heist work, main moved under it, the host failed, or
+ * the host could not run it (a sandbox can be installed later). */
 export const RETRYABLE_OUTCOMES: ReadonlySet<string> = new Set(['yielded', 'invalidated', 'infrastructure-error', 'refused']);
 
 /** The one adapter the raid runner executes (#350's shipped pilot). */

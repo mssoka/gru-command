@@ -358,7 +358,7 @@ const PINS: Record<string, number> = {
   'transcripts.test.ts': 16,
   'uploads-dir.test.ts': 3,
   'vector-attack.test.ts': 7,
-  'vector-raid-runner.test.ts': 29,
+  'vector-raid-runner.test.ts': 34,
   'vector-raids.test.ts': 31,
   'verification-evidence.test.ts': 13,
   'verification-build-reuse.test.ts': 32,

@@ -11,8 +11,8 @@ import { NotificationCenter } from '../src/notifications/center.js';
 import { propertyCampaignRunningForReview, propertyEvidenceForReview, type PropertyCampaignResult } from '../src/property/pipeline.js';
 import type { PackageResolution, RetainedCounterexample } from '../src/property/types.js';
 import type { AgentHandle, IsolatedReviewPolicy } from '../src/runtime/types.js';
-import { metricsOf, RAID_OUTCOMES, repositoryRollups, VECTOR_EVENTS, ZERO_BREAK_IN_FLAG_RAIDS, type RaidRecord } from '../src/vector/ledger.js';
-import { raidOutcomeLabel, VectorRaidRunner, type RaidCampaign } from '../src/vector/runner.js';
+import { metricsOf, RAID_OUTCOMES, raidsTowardCap, repositoryRollups, VECTOR_EVENTS, ZERO_BREAK_IN_FLAG_RAIDS, type RaidRecord } from '../src/vector/ledger.js';
+import { isAttackPathFault, raidOutcomeLabel, VectorRaidRunner, type RaidCampaign } from '../src/vector/runner.js';
 import { FIX_DISPATCH_FAILED_KIND, FIX_DISPATCHED_KIND, FIX_PROPOSAL_KIND, VectorService } from '../src/vector/service.js';
 
 /**
@@ -60,6 +60,8 @@ type Script = {
   readonly onRun?: () => void | Promise<void>;
   /** Runs inside Vector's session, before it submits. */
   readonly onPrompt?: () => void;
+  /** Extra files the campaign leaves in the round's evidence directory. */
+  readonly evidence?: readonly string[];
 };
 
 function campaignResult(script: Script): PropertyCampaignResult {
@@ -114,6 +116,8 @@ interface RunnerHarness {
   now: number;
   /** Fire the raid's wall-clock deadline now (the injected timer). */
   fireDeadline(): void;
+  /** The campaign spec of the round in flight (its control roots). */
+  lastSpec: { readonly knownBadRoot: string } | null;
   /** Launch one raid on billing/src/refunds (autonomous mode). */
   launch(): string;
   rows(kind: string): ReturnType<LedgerApi['listNotifications']>;
@@ -157,13 +161,14 @@ function harness(opts: { readonly scripts: Script[]; readonly vector?: Partial<V
   cleanups.push(() => service.stop());
   const queue = [...opts.scripts];
   const h = {
-    ledger, repo, service, runs: [] as Script[], dispatched, spawned: 0, heistWaiting: false, now: Date.parse('2026-10-16T09:00:00Z'),
+    ledger, repo, service, runs: [] as Script[], dispatched, spawned: 0, heistWaiting: false, now: Date.parse('2026-10-16T09:00:00Z'), lastSpec: null,
   } as unknown as RunnerHarness;
   let deadline: (() => void) | null = null;
   let current: Script = {};
   const spawnVector = fakeVector(() => { current = queue.shift() ?? { attack: null }; return current; }, opts.tokens === undefined ? 1000 : opts.tokens);
   const campaign: RaidCampaign = {
-    run: async (_spec, artifactsDir) => {
+    run: async (spec, artifactsDir) => {
+      h.lastSpec = spec;
       h.runs.push(current);
       await current.onRun?.();
       const result = campaignResult(current);
@@ -171,6 +176,7 @@ function harness(opts: { readonly scripts: Script[]; readonly vector?: Partial<V
       mkdirSync(artifactsDir, { recursive: true });
       for (let run = 0; run < result.metrics.executedRuns; run += 1) writeFileSync(join(artifactsDir, `pex-${String(h.runs.length)}-${String(run)}.json`), '{}');
       writeFileSync(join(artifactsDir, 'property-fixture.json'), '{}');
+      for (const name of current.evidence ?? []) writeFileSync(join(artifactsDir, name), '{}');
       return result;
     },
     counterexample: (): RetainedCounterexample => ({ minimizedInput: '[-1]', replay: { seed: '42', shrinkPath: ['0:1'], schedule: null, environmentProfile: 'fixture', replaySupported: true, replayDisclosure: null } }),
@@ -386,6 +392,42 @@ describe('Silas\'s raid queue (#351 §3)', () => {
     expect(raid(unwritable, u).outcome).not.toBe('infrastructure-error');
   });
 
+  it('a control that fails part-way leaves nothing in the clone, a path that cannot be checked is refused, and only path faults are the attack\'s', async () => {
+    const partial = { known_bad: [{ path: 'src/refunds/new.js', content: 'export const extra = 1;\n' }, { path: 'src/refunds/refund.js/inner.js', content: 'x\n' }] };
+    const h = harness({ vector: { maxRounds: 2 }, scripts: [{ attack: attackInput(1, partial) }, { attack: attackInput(2), onRun: () => {
+      expect(existsSync(join(h.lastSpec!.knownBadRoot, 'src', 'refunds', 'new.js'))).toBe(false);
+    } }] });
+    const id = h.launch();
+    await h.runner.tick();
+    expect(raid(h, id).rounds.map((round) => round.outcome)).toEqual(['invalid-attack', 'pass']);
+    const long = harness({ vector: { maxRounds: 1 }, scripts: [{ attack: attackInput(1, { known_bad: [{ path: `src/refunds/${'a'.repeat(300)}.js`, content: 'x\n' }] }) }] });
+    const l = long.launch();
+    await long.runner.tick();
+    expect(raid(long, l).rounds.map((round) => [round.outcome, round.detail]))
+      .toEqual([['invalid-attack', `refused: known-bad control path src/refunds/${'a'.repeat(300)}.js cannot be checked in the clone (ENAMETOOLONG)`]]);
+    // A full disk or a permission fault is the host's: the raid fails as a host error.
+    expect(['ENOTDIR', 'EEXIST', 'EISDIR', 'ENAMETOOLONG'].map(isAttackPathFault)).toEqual([true, true, true, true]);
+    expect(['ENOSPC', 'EACCES', 'EROFS', 'EIO', undefined].map(isAttackPathFault)).toEqual([false, false, false, false, false]);
+  });
+
+  it('a raid that ended without starting counts toward the daily cap for 24 hours after it ended', () => {
+    const now = new Date('2026-10-16T12:00:00Z');
+    const ended = (outcome: RaidRecord['outcome'], launchedHoursAgo: number, finishedHoursAgo: number, started: boolean): RaidRecord => ({
+      id: `raid-${String(outcome)}-${String(launchedHoursAgo)}`, target: { repo: 'billing', packageDir: 'src/refunds' }, sourceIdentity: 't', headSha: 'h', reason: 'r', requestedBy: 'gru',
+      signals: { commitsSinceLastRaid: 0, escapedRegressions: 0, perkinsFindings: 0, daysSinceLastRaid: null }, pickedAt: now.toISOString(), state: 'finished', notificationId: null,
+      launchedBy: 'autonomous', launchedAt: new Date(now.getTime() - launchedHoursAgo * 3_600_000).toISOString(), closedDetail: null,
+      startedAt: started ? new Date(now.getTime() - launchedHoursAgo * 3_600_000).toISOString() : null, runHeadSha: null, rounds: [], outcome, outcomeLabel: 'x',
+      finishedAt: new Date(now.getTime() - finishedHoursAgo * 3_600_000).toISOString(), reportFile: null, metrics: null,
+    });
+    // Launched 30 hours ago, waited, and ended without starting 2 hours ago: it still counts.
+    expect(raidsTowardCap([ended('refused', 30, 2, false)], 'billing', now)).toBe(1);
+    expect(raidsTowardCap([ended('infrastructure-error', 3, 3, false)], 'billing', now)).toBe(1);
+    expect(raidsTowardCap([ended('invalidated', 3, 3, false)], 'billing', now)).toBe(1);
+    expect(raidsTowardCap([ended('refused', 30, 25, false)], 'billing', now)).toBe(0);
+    // A raid that started counts from its start, as before.
+    expect(raidsTowardCap([ended('budget-exhausted', 30, 2, true)], 'billing', now)).toBe(0);
+  });
+
   it('a repository that opted out, or turned property execution off, after the pick is refused at start: no Vector session', async () => {
     const opted = harness({ scripts: [{ attack: attackInput(1) }] });
     const o = opted.launch();
@@ -410,6 +452,37 @@ describe('Silas\'s raid queue (#351 §3)', () => {
     expect(raid(h, id)).toMatchObject({ outcome: 'budget-exhausted' });
     const report = JSON.parse(readFileSync(raid(h, id).reportFile!, 'utf8')) as { detail: string };
     expect(report.detail).toMatch(/raid time cap ran out \(the round in flight ended with: the sandbox run was aborted\)$/u);
+    // The attack that did not finish is still listed; nothing from it counts.
+    expect(raid(h, id).rounds.map((round) => [round.outcome, round.detail])).toEqual([['voided', 'voided: the attack did not finish (the sandbox run was aborted)']]);
+  });
+
+  it('an attack Vector already submitted when the time cap ran out is listed as never run', async () => {
+    const h = harness({ scripts: [{ attack: attackInput(1), onPrompt: () => h.fireDeadline() }] });
+    const id = h.launch();
+    await h.runner.tick();
+    expect(raid(h, id)).toMatchObject({ outcome: 'budget-exhausted' });
+    expect(raid(h, id).rounds.map((round) => [round.outcome, round.description, round.detail]))
+      .toEqual([['not-run', 'vector 1: negative refunds', 'not run: the raid was cut short before this attack could run']]);
+    expect(h.runs).toEqual([]);
+  });
+
+  it('a round\'s receipts are exactly the host\'s execution and replay receipts', async () => {
+    const h = harness({ vector: { maxRounds: 1 }, scripts: [{ attack: attackInput(1), evidence: ['replay-0f1e.json', 'break-in.json', 'notes.json'] }] });
+    const id = h.launch();
+    await h.runner.tick();
+    expect(raid(h, id).rounds[0]!.receipts).toEqual(['pex-1-0.json', 'pex-1-1.json', 'pex-1-2.json', 'replay-0f1e.json']);
+  });
+
+  it('a test whose run was voided is no duplicate: a later raid at the same identity runs it', async () => {
+    const h = harness({ scripts: [{ attack: attackInput(1), onRun: () => h.moveMain() }, { attack: attackInput(1) }], vector: { maxRounds: 1 } });
+    const first = h.launch();
+    await h.runner.tick();
+    expect(raid(h, first)).toMatchObject({ outcome: 'invalidated' });
+    // Main moved outside the package: same source identity, the target is retryable.
+    const second = h.launch();
+    await h.runner.tick();
+    expect(raid(h, second).rounds.map((round) => [round.outcome, round.verdict])).toEqual([['pass', 'qualified']]);
+    expect(h.runs).toHaveLength(2);
   });
 
   it('a Vector session cut short by the time cap is no "no submission": the raid ends budget-exhausted, not no-qualified-proposals', async () => {

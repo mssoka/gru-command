@@ -337,17 +337,15 @@ export class VectorService {
     // request (the owner's Accept).
     const launches = (entry: (typeof chosen)[number]): boolean =>
       request.requestedBy === 'owner-chat' || (entry.candidate !== null && this.opts.vector.raidMode === 'autonomous');
-    {
-      const perRepo = new Map<string, number>();
-      for (const entry of chosen.filter(launches)) {
-        const repo = (entry.candidate?.target ?? entry.reuse!.target).repo;
-        perRepo.set(repo, (perRepo.get(repo) ?? 0) + 1);
-      }
-      for (const [repo, count] of perRepo) {
-        const already = raidsTowardCap(raidsNow, repo, this.now());
-        if (already + count > this.opts.vector.maxRaidsPerDay) {
-          throw new VectorRefusal('not_a_candidate', `${repo}: ${String(count)} more raid(s) would pass the daily raid cap (${String(already)} of ${String(this.opts.vector.maxRaidsPerDay)} in the last 24 hours)`);
-        }
+    const perRepo = new Map<string, number>();
+    for (const entry of chosen.filter(launches)) {
+      const repo = (entry.candidate?.target ?? entry.reuse!.target).repo;
+      perRepo.set(repo, (perRepo.get(repo) ?? 0) + 1);
+    }
+    for (const [repo, count] of perRepo) {
+      const already = raidsTowardCap(raidsNow, repo, this.now());
+      if (already + count > this.opts.vector.maxRaidsPerDay) {
+        throw new VectorRefusal('not_a_candidate', `${repo}: ${String(count)} more raid(s) would pass the daily raid cap (${String(already)} of ${String(this.opts.vector.maxRaidsPerDay)} in the last 24 hours)`);
       }
     }
     const raids: RaidRecord[] = [];

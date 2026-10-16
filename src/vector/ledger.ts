@@ -70,9 +70,10 @@ export type RaidOutcome = (typeof RAID_OUTCOMES)[number];
 
 /**
  * How a round ended, typed (#351 §3): never a pass of the code. `not-run`:
- * the host refused to execute the attack (no sandbox, or property execution
- * off at this head). `voided`: main moved during the round, so nothing from
- * it counts.
+ * the attack never executed (the host refused it: no sandbox, or property
+ * execution off at this head; or the time cap or a stop came first).
+ * `voided`: the attack ran, but main moved during it or it did not finish,
+ * so nothing from it counts.
  */
 export const ROUND_OUTCOMES = ['no-submission', 'invalid-attack', 'duplicate', 'rejected', 'pass', 'inconclusive', 'break-in', 'not-run', 'voided'] as const;
 export type RoundOutcome = (typeof ROUND_OUTCOMES)[number];
@@ -251,14 +252,15 @@ const DAY_MS = 86_400_000;
 
 /**
  * Raids counting toward a repository's daily cap: started in the last 24
- * hours, launched and not yet run, or launched in the last 24 hours and
- * refused before starting (so a target that keeps being refused is retried
- * at most the cap's number of times a day).
+ * hours, launched and not yet run, or ended without starting (refused, or
+ * failed before it started) in the last 24 hours. A target whose raids keep
+ * ending before they start is retried at most the cap's number of times a day.
  */
 export function raidsTowardCap(raids: readonly RaidRecord[], repo: string, now: Date): number {
   const within = (at: string | null): boolean => at !== null && now.getTime() - Date.parse(at) < DAY_MS;
   return raids.filter((raid) => raid.target.repo === repo &&
-    (within(raid.startedAt) || raid.state === 'queued' || raid.state === 'running' || (raid.outcome === 'refused' && within(raid.launchedAt)))).length;
+    (within(raid.startedAt) || raid.state === 'queued' || raid.state === 'running' ||
+      (raid.state === 'finished' && raid.startedAt === null && raid.launchedAt !== null && within(raid.finishedAt)))).length;
 }
 
 /** A key naming one target at one source identity. */

@@ -451,7 +451,7 @@ max_raid_ms = 1800000
 # run and time caps still bind and the raid report says so.
 max_raid_tokens = 400000
 # Raids per repository in any rolling 24 hours: started, waiting to run,
-# or refused before starting.
+# or ended before starting (refused, or failed before they started).
 max_raids_per_day = 2
 
 [roll]

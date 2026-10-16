@@ -135,6 +135,12 @@ function packageTree(repoPath: string, headSha: string, packageDir: string): str
 }
 
 const sha256 = (text: string): string => createHash('sha256').update(text).digest('hex');
+
+/** A control write failed because of the path the attack chose (under a file, onto a directory, too long), not the host. */
+export function isAttackPathFault(code: string | undefined): boolean {
+  // mkdir onto an existing file reports EEXIST (macOS) or ENOTDIR (Linux).
+  return code === 'ENOTDIR' || code === 'EEXIST' || code === 'EISDIR' || code === 'ENAMETOOLONG';
+}
 const oneLineError = (error: unknown): string => (error instanceof Error ? error.message : String(error)).split('\n')[0]!.slice(0, 300);
 
 class RaidStop extends Error {
@@ -328,8 +334,16 @@ export class VectorRaidRunner {
       repo: raid.target.repo, packageDir: raid.target.packageDir, headSha: ctx.headSha, round: ctx.rounds, maxRounds: this.opts.vector.maxRounds, testPath, tried, retained: known,
     }), signal);
     // A session cut short by the time cap or a stop is no Vector decision:
-    // the catch in run() classifies it (time cap: budget-exhausted).
-    if (signal.aborted) throw new Error('the Vector session was cut short mid-round');
+    // the catch in run() classifies it (time cap: budget-exhausted). An attack
+    // it already submitted is recorded as never run.
+    if (signal.aborted) {
+      if (attack !== null) {
+        const submitted: Attack = attack;
+        this.recordRound(ctx, { outcome: 'not-run', verdict: 'not-run', description: submitted.description, artifactSha256: sha256(submitted.testContent),
+          detail: 'not run: the raid was cut short before this attack could run' });
+      }
+      throw new Error('the Vector session was cut short mid-round');
+    }
     if (attack === null) {
       this.recordRound(ctx, { outcome: 'no-submission', verdict: 'no-submission', detail: 'Vector submitted no valid attack this round' });
       // Vector stopped without one attack ever surviving qualification.
@@ -337,10 +351,12 @@ export class VectorRaidRunner {
       return;
     }
     const artifactSha256 = sha256(attack.testContent);
-    // Only a test that actually ran at this identity is a duplicate.
+    // Only a test that actually ran at this identity, and whose run counted, is
+    // a duplicate: a voided or not-run round settled nothing.
     const seenBefore = this.store.raids()
       .filter((entry) => entry.target.repo === raid.target.repo && entry.target.packageDir === raid.target.packageDir && entry.sourceIdentity === raid.sourceIdentity)
-      .some((entry) => entry.rounds.some((previous) => previous.artifactSha256 === artifactSha256 && previous.executedRuns > 0));
+      .some((entry) => entry.rounds.some((previous) => previous.artifactSha256 === artifactSha256 && previous.executedRuns > 0 &&
+        previous.outcome !== 'voided' && previous.outcome !== 'not-run'));
     if (seenBefore) {
       ctx.duplicates += 1;
       this.recordRound(ctx, { outcome: 'duplicate', verdict: 'duplicate', description: attack.description, artifactSha256, detail: 'an exact duplicate of a test already run at this source identity; not executed' });
@@ -370,7 +386,16 @@ export class VectorRaidRunner {
       baselineRoot: roots.target,
     };
     const evidenceDir = join(ctx.raidDir, 'evidence', `round-${String(ctx.rounds)}`);
-    const result = await campaign.run(spec, evidenceDir);
+    let result: PropertyCampaignResult;
+    try {
+      result = await campaign.run(spec, evidenceDir);
+    } catch (error) {
+      // An attack that did not finish (time cap, stop, host fault) is still
+      // listed, with whatever receipts it left; nothing from it counts.
+      this.recordRound(ctx, { outcome: 'voided', verdict: 'not-finished', description: attack.description, artifactSha256,
+        receipts: this.receiptsIn(evidenceDir), detail: `voided: the attack did not finish (${oneLineError(error)})` });
+      throw error;
+    }
     ctx.runs += result.metrics.executedRuns;
     ctx.executionMs += result.metrics.totalExecutionMs;
     const receipts = this.receiptsIn(evidenceDir);
@@ -469,22 +494,32 @@ export class VectorRaidRunner {
     for (const file of files) {
       const parts = file.path.split('/');
       for (let depth = 1; depth <= parts.length; depth += 1) {
-        // lstat, not exists: a dangling link is still a link.
+        // lstat, not exists: a dangling link is still a link. Only a path that
+        // does not exist (yet) ends the walk; any other failure refuses.
         let link: boolean;
         try {
           link = lstatSync(join(root, ...parts.slice(0, depth))).isSymbolicLink();
-        } catch {
-          break;
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code === 'ENOENT' || code === 'ENOTDIR') break;
+          return `refused: ${label} path ${file.path} cannot be checked in the clone (${code ?? 'unknown error'})`;
         }
         if (link) return `refused: ${label} path ${file.path} passes through a link in the clone`;
       }
     }
+    const written: string[] = [];
     for (const file of files) {
       try {
         mkdirSync(dirname(join(root, file.path)), { recursive: true });
         writeFileSync(join(root, file.path), file.content);
+        written.push(join(root, file.path));
       } catch (error) {
-        return `refused: ${label} path ${file.path} cannot be written in the clone (${oneLineError(error)})`;
+        // A path the clone cannot hold is the attack's fault; any other write
+        // failure is the host's. Either way, nothing it wrote stays behind.
+        for (const path of written) rmSync(path, { force: true });
+        const code = (error as NodeJS.ErrnoException).code;
+        if (isAttackPathFault(code)) return `refused: ${label} path ${file.path} cannot be written in the clone (${code})`;
+        throw error;
       }
     }
     // Forced: a control may touch a path the repository ignores.

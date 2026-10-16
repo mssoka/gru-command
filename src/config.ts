@@ -287,7 +287,7 @@ export interface VectorConfig {
   readonly maxRaidMs: number;
   /** Token cap per raid where the runtime reports usage. */
   readonly maxRaidTokens: number;
-  /** Raids per repository in any rolling 24 hours: started, waiting to run, or refused before starting. */
+  /** Raids per repository in any rolling 24 hours: started, waiting to run, or ended before starting. */
   readonly maxRaidsPerDay: number;
 }
 

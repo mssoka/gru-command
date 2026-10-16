@@ -53,9 +53,10 @@ state only.
   - opted-out repositories;
   - repositories at their daily cap (`max_raids_per_day`). The cap counts
     raids started in the last 24 hours, raids queued or running now, and
-    raids refused in the last 24 hours (so a target that keeps being refused
-    is retried at most the cap's number of times a day). A proposal waiting
-    for your Accept does not count until it is accepted;
+    raids that ended without starting (refused, or failed before they
+    started) in the last 24 hours, so a target whose raids keep ending before
+    they start is retried at most the cap's number of times a day. A proposal
+    waiting for your Accept does not count until it is accepted;
   - a package with a pending proposal, or with a raid queued or running;
   - a package already raided or declined at the same source identity.
 
@@ -151,12 +152,14 @@ How `POST /api/vector/raids` behaves:
      ends by the cap (or the stop) instead.
   2. An exact duplicate of a test that already ran (same package and test
      bytes at the same source identity) is rejected without execution. A test
-     that was submitted but never ran is not a duplicate. Semantic
+     that never ran, or whose run was voided, is not a duplicate. Semantic
      near-duplicates cannot be detected deterministically, and are not.
   3. The host commits the controls into their clones. A known-bad control
      that changes nothing, a control path that passes through a link in the
-     clone (a dangling one included), or a path the clone cannot hold, is an
-     `invalid-attack`: it never runs. Otherwise the host
+     clone (a dangling one included), or a path the clone cannot hold (under
+     a file, onto a directory, or too long), is an `invalid-attack`: it never
+     runs, and nothing it wrote stays in the clone. Any other write failure
+     is the host's, and ends the raid as a host error. Otherwise the host
      qualifies the contract (seam C). The known-bad control must fail it and
      the reference must pass it. A rejected, inconclusive or escalated verdict
      never attacks, and counts as an invalid oracle.
@@ -185,13 +188,16 @@ How `POST /api/vector/raids` behaves:
 - **Main moving.** If the default-branch head moves during a raid, the raid
   ends `invalidated`, and nothing from the moved round counts, not even a
   break-in. The report still lists that round as `voided`, with the receipts
-  it spent.
-- **The host refusing mid-raid.** When the sandbox refuses an attack, or
-  property execution is off at the head, the round is recorded as `not-run`
-  and the raid ends `refused`. The head is fetched from origin at every boundary; when a fetch
+  it spent. The head is fetched from origin at every boundary; when a fetch
   fails, the cached default branch decides and the report says the head's
   freshness is unverified. A raid left running by a stopped service is closed
   out at the next boot as a host error.
+- **The host refusing mid-raid.** When the sandbox refuses an attack, or
+  property execution is off at the head, the round is recorded as `not-run`
+  and the raid ends `refused`.
+- **A round cut short.** An attack Vector submitted that the time cap or a
+  stop reaches before it runs is recorded as `not-run`. One that was running
+  and did not finish is recorded as `voided`, with whatever receipts it left.
 
 ## Outcomes, reports and metrics
 
@@ -230,8 +236,9 @@ Generated case counts are context, never a success measure.
 
 The **repository rollup** (`GET /api/vector/rollup`) sums every finished raid
 that spent anything: at least one Vector round or one sandboxed run. A raid
-that ran nothing (refused, unsupported, or stopped before its first round) is
-left out. Per repository it
+that ran nothing (refused before any Vector session, unsupported, or stopped
+before its first round) is left out. A raid refused mid-raid ran Vector
+sessions, so it counts. Per repository it
 shows raids, proposals, qualified attacks, rejections by verdict, the
 invalid-oracle rate, executed runs, break-ins, replay reliability, wall clock,
 tokens, cost per break-in, and the raids since the last break-in. Cost per

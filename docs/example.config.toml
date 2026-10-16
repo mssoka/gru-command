@@ -199,10 +199,10 @@ fix_mode = "proposed"             # "proposed": each break-in waits for your Acc
                                   # "autonomous": Gru dispatches the fix heist without asking
 plan_interval_ms = 86400000       # how often Gru reviews raid candidates; 0 = raids only on request
 max_rounds = 4                    # attacks Vector may propose per raid
-max_runs = 16                     # sandboxed executions per raid (3–5 per attack)
+max_runs = 16                     # sandboxed executions per raid (3–5 per attack; at least 5)
 max_raid_ms = 1800000             # wall-clock cap per raid
 max_raid_tokens = 400000          # token cap per raid, where the runtime reports usage
-max_raids_per_day = 2             # per repository, rolling 24 hours
+max_raids_per_day = 2             # per repository, rolling 24 hours (started, waiting, or ended before starting)
 
 [review]
 max_concurrent_children = 2     # lead-selected lens-children ceiling in the pool (<= 32); a round still caps at 16 runs / 2 attempts per lens

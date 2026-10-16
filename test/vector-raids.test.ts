@@ -527,7 +527,12 @@ describe('planning and picks (#351 §2)', () => {
     expect(service.planTick().offered).toBe(false);
     // The raid is refused (no sandbox on this host): the target is eligible, and offered again.
     h.ledger.appendCustomEvent({ kind: VECTOR_EVENTS.finished, payload: { raid_id: raid!.id, outcome: 'refused', label: 'Raid not run: x', detail: 'not-run: no sandbox backend' } });
-    expect(service.planTick().offered).toBe(true);
+    const retry = service.planTick();
+    expect(retry.offered).toBe(true);
+    expect(h.rows(RAID_CANDIDATES_KIND)).toHaveLength(3);
+    // Gru answers that list too, picking nothing: the newer answer stands, and the target is not offered again.
+    service.pick({ picks: [], digest: retry.digest!, requestedBy: 'gru' });
+    expect(service.planTick().offered).toBe(false);
     expect(h.rows(RAID_CANDIDATES_KIND)).toHaveLength(3);
   });
 });
