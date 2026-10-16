@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { BoardEngine } from '../src/board/engine.js';
-import { LedgerApi, type NotificationRecord } from '../src/ledger/api.js';
+import { LedgerApi, SupervisionStopClosureConflictError, type NotificationRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import {
@@ -2936,7 +2936,7 @@ describe('supervisor — idle restart after retirement handoff (GH-279)', () => 
     } finally { rig.dispose(); vi.useRealTimers(); }
   });
 
-  it('a captured obsolete turn stays fenced after a later handoff releases the hold (GH-279)', async () => {
+  it('a captured obsolete turn never replays after a later handoff releases the hold; the stop closes as superseded (GH-279, #385)', async () => {
     vi.useFakeTimers();
     const rig = boot(undefined, { maxRestarts: 1 });
     try {
@@ -2971,7 +2971,12 @@ describe('supervisor — idle restart after retirement handoff (GH-279)', () => 
       await flushMicrotasks();
       expect(rig.registry.spawnCalls).toHaveLength(before);
       expect(rig.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.rearmed')).toEqual([]);
-      expect(rig.supervisor.viewFor(idle.id)?.breakerOpen).toBe(true);
+      // Owner decision (#385, 2026-10-15): the fresh authority supersedes the
+      // obsolete captured turn, so Gru's disposition closes the stop — the
+      // stale turn never replays and the lane continues with the fresh work.
+      expect(rig.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.stop-superseded')).toHaveLength(1);
+      expect(rig.supervisor.viewFor(idle.id)).toBeNull();
+      expect(idle.promptCalls).toHaveLength(0);
     } finally { rig.dispose(); vi.useRealTimers(); }
   });
 });
@@ -5882,6 +5887,35 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
     return { rig, handle, stop };
   }
 
+  /** The parts of a supervision record a superseded closure must cancel. */
+  interface RetirableRecord {
+    backoffTimer: ReturnType<typeof setTimeout> | null;
+    rateLimitRetry: { readonly admissionAbort: AbortController; resolveSettled(disposition: string): void } | null;
+    recoveryAdmission: AbortController | null;
+  }
+  /** Arms a pending backoff timer, rate-limit retry and recovery admission
+   * on the record, and returns probes that they were all cancelled. */
+  function armRetirable(record: RetirableRecord) {
+    let fired = false;
+    const settled: string[] = [];
+    const retryAbort = new AbortController();
+    const admission = new AbortController();
+    record.backoffTimer = setTimeout(() => { fired = true; }, 10);
+    record.rateLimitRetry = { admissionAbort: retryAbort, resolveSettled: (disposition) => { settled.push(disposition); } };
+    record.recoveryAdmission = admission;
+    return {
+      admission,
+      settled: () => settled,
+      timerFired: () => fired,
+      expectCancelled: () => {
+        expect(record).toMatchObject({ backoffTimer: null, rateLimitRetry: null, recoveryAdmission: null });
+        expect(retryAbort.signal.aborted).toBe(true);
+        expect(settled).toEqual(['superseded']);
+        expect(admission.signal.aborted).toBe(true);
+      },
+    };
+  }
+  const TRIP_CONFIG = { enabled: true, turnSilenceMs: 30, restartWindowMs: 600_000, maxRestarts: 1, restartBackoffMs: 1 } as const;
   function tripBreaker(): {
     api: LedgerApi;
     center: NotificationCenter;
@@ -5898,7 +5932,7 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
     const registry = new FakeRegistry();
     let nowMs = 2_000_000;
     const supervisor = new Supervisor({
-      config: { enabled: true, turnSilenceMs: 30, restartWindowMs: 600_000, maxRestarts: 1, restartBackoffMs: 1 },
+      config: TRIP_CONFIG,
       registry,
       ledger: api,
       notifications: center,
@@ -5948,14 +5982,345 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       const fenced = rig.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.rearm-fenced');
       expect(fenced.length).toBeGreaterThanOrEqual(1);
       expect((fenced[0]!.payload as { reason?: string }).reason).toContain('parked');
-      // The hold lifts, but parking is a native control event: the captured
-      // interrupted prompt is superseded (issue #279/#280) and never replays,
-      // so the same control stays refused with its debt retained.
+      // Supersession is never waived while another fence owns the stop: the
+      // captured turn is retained, nothing is closed (#385).
+      const pending = () => (rig.supervisor as unknown as { agents: Map<string, { pendingRecovery: unknown }> })
+        .agents.get(rig.handle.id)?.pendingRecovery;
+      expect(pending()).not.toBeNull();
+      // The hold lifts. Parking is a native control event: the captured
+      // interrupted prompt is superseded (issue #279/#280) and never replays.
+      // Owner decision (#385, 2026-10-15): Gru's disposition CLOSES the stop
+      // as superseded — no restart of the stale worker, the prompt is
+      // dropped, and the lane continues through a fresh re-brief/directive.
       rig.api.setJobStatus('fenced-job', 'working');
-      rig.registry.spawnImpl = async (role) => new FakeHandle(role, 'fenced-agent-resumed', null);
-      const stillFenced = rig.supervisor.onNotificationDisposed(stop!.id);
-      expect(stillFenced.ok).toBe(false);
-      if (!stillFenced.ok) expect(stillFenced.reason).toContain('no longer current');
+      const spawnsBefore = rig.registry.spawnCalls.length;
+      rig.registry.spawnImpl = async (role) => new FakeHandle(role, 'must-not-spawn', null);
+      // Arm everything the stopped record could still own, so retirement
+      // provably cancels it (not merely finds it already empty).
+      const retired = (rig.supervisor as unknown as { agents: Map<string, RetirableRecord> }).agents.get(rig.handle.id)!;
+      const armed = armRetirable(retired);
+      expect(rig.supervisor.onNotificationDisposed(stop!.id)).toEqual({ ok: true, rearmed: false, superseded: true });
+      armed.expectCancelled();
+      await flushMicrotasks();
+      expect(rig.registry.spawnCalls).toHaveLength(spawnsBefore);
+      expect(pending()).toBeUndefined();
+      // CLOSED, not held: the supervision record is retired in-process exactly
+      // as durably, so the lane no longer reads as stopped.
+      expect(rig.supervisor.viewFor(rig.handle.id)).toBeNull();
+      const closed = rig.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.stop-superseded');
+      expect(closed).toHaveLength(1);
+      expect(closed[0]!.payload).toMatchObject({ notification_id: stop!.id, job_id: 'fenced-job', had_open_turn: true,
+        producer_changed: false, stop_reason: expect.stringContaining('captured turn was superseded') });
+      const payload = closed[0]!.payload as { current_epoch: number; captured_epoch: number };
+      expect(payload.current_epoch).toBeGreaterThan(payload.captured_epoch);
+      expect(rig.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.rearmed')).toEqual([]);
+      // The closed stop is no longer a durable stop: a restart never raises a
+      // fresh control for it.
+      expect(rig.api.durableSupervisionStops().has(rig.handle.id)).toBe(false);
+      // A retried disposition reports the same closure, never a bare record —
+      // answered from the durable record, so a restarted service agrees.
+      expect(rig.supervisor.onNotificationDisposed(stop!.id)).toEqual({ ok: true, rearmed: false, superseded: true });
+      const restarted = new Supervisor({ config: TRIP_CONFIG, registry: rig.registry, ledger: rig.api, notifications: rig.center, tickMs: 5, now: () => 9_000_000 });
+      try {
+        expect(restarted.onNotificationDisposed(stop!.id)).toEqual({ ok: true, rearmed: false, superseded: true });
+      } finally {
+        restarted.dispose();
+      }
+      // Nothing the closed record owned fires later.
+      await new Promise((resolveWait) => setTimeout(resolveWait, 40));
+      expect(armed.timerFired()).toBe(false);
+      expect(rig.registry.spawnCalls).toHaveLength(spawnsBefore);
+      // A fresh re-brief/directive adopts the same logical id as a NEW watching
+      // record: never disposed as a restored stop, never re-alerted.
+      const alertsBefore = rig.api.listNotifications({ limit: 100 }).length;
+      const fresh = new FakeHandle('minion', 'fenced-agent', null);
+      rig.registry.adopt(fresh);
+      await flushMicrotasks();
+      expect(rig.supervisor.viewFor(rig.handle.id)).toMatchObject({ state: 'watching', breakerOpen: false });
+      expect(fresh.disposed).toBe(false);
+      expect(rig.api.listNotifications({ limit: 100 })).toHaveLength(alertsBefore);
+      // A later breaker on the same agent makes it a durable stop again.
+      rig.api.appendCustomEvent({ kind: 'supervision.breaker', agentId: rig.handle.id, payload: { reason: 'later stop' } });
+      expect(rig.api.durableSupervisionStops().has(rig.handle.id)).toBe(true);
+    } finally {
+      rig.close();
+    }
+  });
+
+  /** Reaches the superseded-closure branch: a stopped breaker whose captured
+   * turn a park→resume superseded. Returns the stop alert's id. */
+  async function supersededStop(rig: ReturnType<typeof tripBreaker>): Promise<string> {
+    await vi.waitFor(() => expect(rig.supervisor.viewFor(rig.handle.id)?.state).toBe('stopped'));
+    const stop = rig.api.listNotifications({ limit: 30 }).find((n) => n.kind === 'supervision.breaker');
+    rig.api.setJobStatus('fenced-job', 'parked');
+    rig.api.setJobStatus('fenced-job', 'working');
+    return stop!.id;
+  }
+  const closures = (rig: ReturnType<typeof tripBreaker>) => rig.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.stop-superseded');
+
+  it('a closure already recorded while the record is still live is never appended twice, and the record still retires (#385)', async () => {
+    const rig = tripBreaker();
+    try {
+      const stopId = await supersededStop(rig);
+      rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: rig.handle.id, jobId: 'fenced-job', payload: { notification_id: stopId, job_id: 'fenced-job' } });
+      expect(rig.supervisor.viewFor(rig.handle.id)).not.toBeNull();
+      expect(rig.supervisor.onNotificationDisposed(stopId)).toEqual({ ok: true, rearmed: false, superseded: true });
+      expect(closures(rig)).toHaveLength(1);
+      expect(rig.supervisor.viewFor(rig.handle.id)).toBeNull();
+      // The ledger's once-only record is atomic on its own.
+      expect(rig.api.recordSupervisionStopSuperseded({ agentId: rig.handle.id, jobId: 'fenced-job', payload: { notification_id: stopId } })).toBe(false);
+      expect(rig.api.recordSupervisionStopSuperseded({ agentId: rig.handle.id, jobId: 'fenced-job', payload: { notification_id: 'another-alert' } })).toBe(true);
+      expect(closures(rig)).toHaveLength(2);
+    } finally {
+      rig.close();
+    }
+  });
+
+  it('a throwing retry abort still settles and detaches the incident, and never escapes the closure (#385)', async () => {
+    const rig = tripBreaker();
+    try {
+      const stopId = await supersededStop(rig);
+      const record = (rig.supervisor as unknown as { agents: Map<string, RetirableRecord> }).agents.get(rig.handle.id)!;
+      const armed = armRetirable(record);
+      const abort = record.rateLimitRetry!.admissionAbort;
+      abort.abort = () => { throw new Error('abort listener threw'); };
+      expect(rig.supervisor.onNotificationDisposed(stopId)).toEqual({ ok: true, rearmed: false, superseded: true });
+      expect(record.rateLimitRetry).toBeNull();
+      expect(armed.settled()).toEqual(['superseded']);
+      expect(armed.admission.signal.aborted).toBe(true);
+      expect(rig.supervisor.viewFor(rig.handle.id)).toBeNull();
+      // Called directly, as its many other callers do: it never throws.
+      const settled: string[] = [];
+      const loose = { agentId: 'loose', rateLimitRetry: { admissionAbort: { abort: () => { throw new Error('abort listener threw'); } }, resolveSettled: (disposition: string) => { settled.push(disposition); } } };
+      const clear = (rig.supervisor as unknown as { clearRateLimitRetry(agent: unknown, disposition: string): void }).clearRateLimitRetry.bind(rig.supervisor);
+      expect(() => clear(loose, 'exhausted')).not.toThrow();
+      expect(loose.rateLimitRetry).toBeNull();
+      expect(settled).toEqual(['exhausted']);
+    } finally {
+      rig.close();
+    }
+  });
+
+  it('a superseded-stop closure needs real ids and one job (#385)', () => {
+    const rig = tripBreaker();
+    try {
+      expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: ' ', jobId: 'fenced-job', payload: { notification_id: 'n' } })).toThrow(/needs a non-blank agentId/u);
+      expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: '' } })).toThrow(/needs a non-blank notification_id/u);
+      expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: 'n', job_id: 'other-job' } })).toThrow(/names job "other-job" in its payload but "fenced-job" as its job/u);
+      expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: 7 as never } })).toThrow(/needs a non-blank notification_id/u);
+      expect(closures(rig)).toEqual([]);
+      // One alert closes ONE stop: a replay naming another agent or job conflicts.
+      expect(rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: 'once' } })).toBe(true);
+      expect(rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: 'once' } })).toBe(false);
+      expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: 'b', jobId: 'fenced-job', payload: { notification_id: 'once' } }))
+        .toThrow(new SupervisionStopClosureConflictError('alert "once" already closed the stop of agent "a" on job "fenced-job" — not agent "b" on job "fenced-job"'));
+      expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'other-job', payload: { notification_id: 'once' } }))
+        .toThrow(/already closed the stop of agent "a" on job "fenced-job" — not agent "a" on job "other-job"$/u);
+      for (const [agentId, jobId, name] of [[7, 'fenced-job', 'agentId'], ['a', null, 'jobId']] as const) {
+        expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: agentId as never, jobId: jobId as never, payload: { notification_id: 'typed' } })).toThrow(`a superseded-stop closure needs a non-blank ${name}`);
+      }
+      expect(closures(rig)).toHaveLength(1);
+      // A row naming no agent or job (never written by this ledger) is no
+      // closure — for reads and writes alike: never a dead end, never a binding.
+      rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', payload: { notification_id: 'legacy' } });
+      expect(rig.api.hasSupervisionStopSuperseded('legacy')).toBe(false);
+      expect(rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: 'legacy' } })).toBe(true);
+      expect(rig.api.hasSupervisionStopSuperseded('legacy')).toBe(true);
+      rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', jobId: 'fenced-job', payload: { notification_id: 'job-only' } });
+      expect(rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: 'job-only' } })).toBe(true);
+      rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: '', jobId: 'fenced-job', payload: { notification_id: 'blank-agent' } });
+      expect(rig.api.hasSupervisionStopSuperseded('blank-agent')).toBe(false);
+      // The incomplete row is passed over; the first COMPLETE closure binds.
+      expect(rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: 'blank-agent' } })).toBe(true);
+      expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: 'b', jobId: 'fenced-job', payload: { notification_id: 'blank-agent' } })).toThrow(SupervisionStopClosureConflictError);
+      // A blank job, or ids that are only whitespace (which the writer refuses), alike.
+      rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: 'b', jobId: '', payload: { notification_id: 'blank-job' } });
+      rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: ' ', jobId: '\t', payload: { notification_id: 'blank-job' } });
+      rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: 'b', jobId: ' ', payload: { notification_id: 'blank-job' } });
+      rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: ' ', jobId: 'fenced-job', payload: { notification_id: 'blank-job' } });
+      expect(rig.api.hasSupervisionStopSuperseded('blank-job')).toBe(false);
+      expect(rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: 'blank-job' } })).toBe(true);
+      expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: 'b', jobId: 'fenced-job', payload: { notification_id: 'blank-job' } })).toThrow(SupervisionStopClosureConflictError);
+      // The FIRST complete closure of an alert is the binding one.
+      rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: 'first', jobId: 'fenced-job', payload: { notification_id: 'twice' } });
+      rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: 'second', jobId: 'fenced-job', payload: { notification_id: 'twice' } });
+      expect(rig.api.recordSupervisionStopSuperseded({ agentId: 'first', jobId: 'fenced-job', payload: { notification_id: 'twice' } })).toBe(false);
+      expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: 'second', jobId: 'fenced-job', payload: { notification_id: 'twice' } })).toThrow(SupervisionStopClosureConflictError);
+    } finally {
+      rig.close();
+    }
+  });
+
+  it('a failing retirement cleanup step never skips the others: the closure stands and the record retires (#385)', async () => {
+    const rig = tripBreaker();
+    try {
+      const stopId = await supersededStop(rig);
+      const record = (rig.supervisor as unknown as { agents: Map<string, RetirableRecord> }).agents.get(rig.handle.id)!;
+      const armed = armRetirable(record);
+      const spy = vi.spyOn(rig.supervisor as unknown as { clearRateLimitRetry(): void }, 'clearRateLimitRetry').mockImplementation(() => { throw new Error('retry abort failed'); });
+      try {
+        expect(rig.supervisor.onNotificationDisposed(stopId)).toEqual({ ok: true, rearmed: false, superseded: true });
+      } finally {
+        spy.mockRestore();
+      }
+      // The steps after the failing one still ran.
+      expect(armed.admission.signal.aborted).toBe(true);
+      expect(record.recoveryAdmission).toBeNull();
+      expect(record.backoffTimer).toBeNull();
+      expect(rig.supervisor.viewFor(rig.handle.id)).toBeNull();
+      expect(closures(rig)).toHaveLength(1);
+      expect(rig.api.durableSupervisionStops().has(rig.handle.id)).toBe(false);
+    } finally {
+      rig.close();
+    }
+  });
+
+  it('a failed closure lookup on a breaker alert refuses so the retry asks again; a supervisor that is off still labels a recorded closure (#385)', async () => {
+    const rig = tripBreaker();
+    try {
+      const stopId = await supersededStop(rig);
+      expect(rig.supervisor.onNotificationDisposed(stopId)).toEqual({ ok: true, rearmed: false, superseded: true });
+      const spy = vi.spyOn(rig.api, 'hasSupervisionStopSuperseded').mockImplementation(() => { throw new Error('events unreadable'); });
+      try {
+        expect(rig.supervisor.onNotificationDisposed(stopId)).toEqual({ ok: false, reason: 'superseded closure lookup failed — retry the disposition: Error: events unreadable' });
+        // An alert known not to be a breaker stays a pure record...
+        const note = rig.center.post({ kind: 'job.note', routing: 'action-required', severity: 'info', title: 'not a breaker' });
+        expect(rig.supervisor.onNotificationDisposed(note.id)).toEqual({ ok: true, rearmed: false });
+        // ...and one whose kind cannot be read is treated as a breaker:
+        // refused, naming both failures.
+        const kind = vi.spyOn(rig.api, 'getNotification').mockImplementation(() => { throw new Error('notifications unreadable'); });
+        try {
+          expect(rig.supervisor.onNotificationDisposed(note.id)).toEqual({ ok: false, reason: 'superseded closure lookup failed — retry the disposition: Error: events unreadable; its alert kind could not be read either: Error: notifications unreadable' });
+        } finally {
+          kind.mockRestore();
+        }
+        // Errors with no text are still named: never an empty reason.
+        const textless = (): Error => Object.assign(new Error(''), { toString: () => '' });
+        spy.mockImplementation(() => { throw textless(); });
+        const silent = vi.spyOn(rig.api, 'getNotification').mockImplementation(() => { throw textless(); });
+        try {
+          expect(rig.supervisor.onNotificationDisposed(note.id)).toEqual({ ok: false, reason: 'superseded closure lookup failed — retry the disposition: an error with no text; its alert kind could not be read either: an error with no text' });
+          // Text that is only blanks is no text; one that cannot print is named so.
+          spy.mockImplementation(() => { throw Object.assign(new Error(''), { toString: () => ' \t ' }); });
+          silent.mockImplementation(() => { throw Object.assign(new Error(''), { toString: () => { throw new Error('no'); } }); });
+          expect(rig.supervisor.onNotificationDisposed(note.id)).toEqual({ ok: false, reason: 'superseded closure lookup failed — retry the disposition: an error with no text; its alert kind could not be read either: an error that cannot be printed' });
+        } finally {
+          silent.mockRestore();
+        }
+      } finally {
+        spy.mockRestore();
+      }
+      const off = new Supervisor({ config: { ...TRIP_CONFIG, enabled: false }, registry: rig.registry, ledger: rig.api, notifications: rig.center, tickMs: 5, now: () => 9_000_000 });
+      try {
+        expect(off.onNotificationDisposed(stopId)).toEqual({ ok: true, rearmed: false, superseded: true });
+        expect(off.onNotificationDisposed('notification-with-no-stop')).toEqual({ ok: true, rearmed: false });
+        // An OFF supervisor never refuses: a failed lookup only loses the label.
+        const failing = vi.spyOn(rig.api, 'hasSupervisionStopSuperseded').mockImplementation(() => { throw new Error('events unreadable'); });
+        try {
+          expect(off.onNotificationDisposed(stopId)).toEqual({ ok: true, rearmed: false });
+        } finally {
+          failing.mockRestore();
+        }
+      } finally {
+        off.dispose();
+      }
+    } finally {
+      rig.close();
+    }
+  });
+
+  const NOT_CURRENT = /^recovery authority for job "fenced-job" is no longer current \(superseded, held or unreadable\)$/u;
+  async function assertNeverClosed(variant: 'live-handle' | 'in-restart' | 'append-fails' | 'producer-unreadable', reason: RegExp): Promise<void> {
+    const rig = tripBreaker();
+    const spies: { mockRestore(): void }[] = [];
+    try {
+      await vi.waitFor(() => expect(rig.supervisor.viewFor(rig.handle.id)?.state).toBe('stopped'));
+      const stop = rig.api.listNotifications({ limit: 30 }).find((n) => n.kind === 'supervision.breaker');
+      rig.api.setJobStatus('fenced-job', 'parked');
+      rig.api.setJobStatus('fenced-job', 'working');
+      const agents = (rig.supervisor as unknown as { agents: Map<string, { handle: unknown; inRestart: boolean; pendingRecovery: unknown }> }).agents;
+      if (variant === 'live-handle') agents.get(rig.handle.id)!.handle = new FakeHandle('minion', rig.handle.id, null);
+      if (variant === 'in-restart') agents.get(rig.handle.id)!.inRestart = true;
+      if (variant === 'append-fails') {
+        const append = rig.api.appendCustomEvent.bind(rig.api);
+        spies.push(vi.spyOn(rig.api, 'appendCustomEvent').mockImplementation((event) => {
+          if (event.kind === 'supervision.stop-superseded') throw new Error('ledger write failed');
+          return append(event);
+        }));
+      }
+      if (variant === 'producer-unreadable') spies.push(vi.spyOn(rig.api, 'listPendingRebriefs').mockImplementation(() => { throw new Error('rebrief audit unreadable'); }));
+      const outcome = rig.supervisor.onNotificationDisposed(stop!.id);
+      for (const spy of spies.splice(0)) spy.mockRestore();
+      expect(outcome).toMatchObject({ ok: false, reason: expect.stringMatching(reason) });
+      expect(rig.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.stop-superseded')).toEqual([]);
+      expect(agents.get(rig.handle.id)?.pendingRecovery).not.toBeNull();
+      expect(rig.supervisor.viewFor(rig.handle.id)).not.toBeNull();
+      expect(rig.api.durableSupervisionStops().has(rig.handle.id)).toBe(true);
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+      rig.close();
+    }
+  }
+  it('never closes a superseded stop whose agent holds a live handle: refused, debt kept (#385)', () => assertNeverClosed('live-handle', NOT_CURRENT));
+  it('never closes a superseded stop whose agent is mid-restart: refused, debt kept (#385)', () => assertNeverClosed('in-restart', NOT_CURRENT));
+  it('never closes a superseded stop whose closure cannot be recorded: refused, nothing changed (#385)', () =>
+    assertNeverClosed('append-fails', /^superseded stop closure could not be recorded: Error: ledger write failed$/u));
+  it('never closes a superseded stop whose producer authority is unreadable: refused, debt kept (#385)', () => assertNeverClosed('producer-unreadable', NOT_CURRENT));
+
+  it('a failed closure lookup on an unbound alert only loses the label: the disposition is still a pure record (#385)', async () => {
+    const rig = tripBreaker();
+    try {
+      const spy = vi.spyOn(rig.api, 'hasSupervisionStopSuperseded').mockImplementation(() => { throw new Error('events unreadable'); });
+      try {
+        expect(rig.supervisor.onNotificationDisposed('notification-with-no-stop')).toEqual({ ok: true, rearmed: false });
+      } finally {
+        spy.mockRestore();
+      }
+    } finally {
+      rig.close();
+    }
+  });
+
+  it('a fresh producer alone (unchanged epoch) supersedes the captured turn and closes the stop (#385)', async () => {
+    const rig = tripBreaker();
+    try {
+      await vi.waitFor(() => expect(rig.supervisor.viewFor(rig.handle.id)?.state).toBe('stopped'));
+      const stop = rig.api.listNotifications({ limit: 30 }).find((n) => n.kind === 'supervision.breaker');
+      const epoch = rig.api.directiveRecoveryEpoch('fenced-job');
+      // A settled re-brief moves the native producer history, not the epoch.
+      rig.api.appendCustomEvent({ kind: 'silas.rebrief-retired', jobId: 'fenced-job', payload: { reason: 'fixture: superseding producer' } });
+      expect(rig.api.directiveRecoveryEpoch('fenced-job')).toBe(epoch);
+      const spawnsBefore = rig.registry.spawnCalls.length;
+      expect(rig.supervisor.onNotificationDisposed(stop!.id)).toEqual({ ok: true, rearmed: false, superseded: true });
+      await flushMicrotasks();
+      expect(rig.registry.spawnCalls).toHaveLength(spawnsBefore);
+      const closed = rig.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.stop-superseded');
+      expect(closed).toHaveLength(1);
+      expect(closed[0]!.payload).toMatchObject({ producer_changed: true, captured_epoch: epoch, current_epoch: epoch });
+    } finally {
+      rig.close();
+    }
+  });
+
+  it('an unreadable current authority never closes a captured turn as superseded: the stop stays fenced (#385)', async () => {
+    const rig = tripBreaker();
+    try {
+      await vi.waitFor(() => expect(rig.supervisor.viewFor(rig.handle.id)?.state).toBe('stopped'));
+      const stop = rig.api.listNotifications({ limit: 30 }).find((n) => n.kind === 'supervision.breaker');
+      rig.api.setJobStatus('fenced-job', 'parked');
+      rig.api.setJobStatus('fenced-job', 'working');
+      const realEpoch = rig.api.directiveRecoveryEpoch.bind(rig.api);
+      rig.api.directiveRecoveryEpoch = () => {
+        throw new Error('directive audit unreadable');
+      };
+      try {
+        expect(rig.supervisor.onNotificationDisposed(stop!.id).ok).toBe(false);
+      } finally {
+        rig.api.directiveRecoveryEpoch = realEpoch;
+      }
+      const agent = (rig.supervisor as unknown as { agents: Map<string, { pendingRecovery: unknown }> }).agents.get(rig.handle.id);
+      expect(agent?.pendingRecovery).not.toBeNull();
+      expect(rig.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.stop-superseded')).toEqual([]);
       expect(rig.supervisor.viewFor(rig.handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true });
       expect(rig.api.getNotification(stop!.id)?.resolvedAt).toBeNull();
     } finally {
@@ -6153,12 +6518,16 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       const fresh = rig.api.listNotifications({ limit: 50 }).find((row) => row.kind === 'supervision.rearm-fenced');
       expect(fresh).toMatchObject({ routing: 'action-required', resolvedAt: null });
 
-      // Parking superseded the captured prompt (native control epoch): the
-      // fence control stays refused after the job resumes; nothing replays.
+      // Parking superseded the captured prompt (native control epoch): after
+      // the job resumes the fence control closes the stop as superseded
+      // (#385) — nothing replays and nothing respawns.
       rig.api.setJobStatus('replay-park-job', 'working');
-      const stillFenced = rig.supervisor.onNotificationDisposed(fresh!.id);
-      expect(stillFenced.ok).toBe(false);
+      const spawnsBefore = rig.registry.spawnCalls.length;
+      expect(rig.supervisor.onNotificationDisposed(fresh!.id)).toEqual({ ok: true, rearmed: false, superseded: true });
+      await flushMicrotasks();
+      expect(rig.registry.spawnCalls).toHaveLength(spawnsBefore);
       expect(first.promptCalls).toHaveLength(0);
+      expect(rig.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.stop-superseded')).toHaveLength(1);
     } finally {
       releaseHolder();
       rig.dispose();

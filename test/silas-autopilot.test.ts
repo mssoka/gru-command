@@ -7,12 +7,14 @@ import { LIVE_DIRECTIVE_STATES } from '../src/ledger/directives.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import {
   AUTOPILOT_DECISION_EVENT,
+  canonicalJson,
   AUTOPILOT_SOURCE,
   autopilotRuleMode,
   runSilasAutopilot,
   type AutopilotLedger,
   type SilasAutopilotOps,
 } from '../src/dispatch/silas-autopilot.js';
+import { BranchBusyError } from '../src/dispatch/branch-idle.js';
 import { createSilasAutopilotOps, type SilasAutopilotOpsDeps } from '../src/dispatch/silas-autopilot-ops.js';
 import { composeDeterministicPass, createSilasAutopilotHook } from '../src/dispatch/silas-autopilot-pass.js';
 import { ReviewInProgressError, WaveRunner } from '../src/dispatch/perkins.js';
@@ -145,8 +147,18 @@ class FakeLedger {
     return this.state.directives.get(requestId) ?? null;
   }
 
-  listJobEventsByKinds(jobId: string, kinds: readonly string[]): FakeEvent[] {
-    return this.state.events.filter((event) => event.jobId === jobId && kinds.includes(event.kind));
+  /** The newest event of a kind whose payload field equals the value. */
+  latestJobEventByPayloadField(jobId: string, kind: string, field: string, value: string): FakeEvent | null {
+    return [...this.state.events].reverse().find((event) => event.jobId === jobId && event.kind === kind &&
+      (event.payload as Record<string, unknown> | undefined)?.[field] === value) ?? null;
+  }
+
+  /** Newest first and capped, exactly like the real ledger's query. */
+  listJobEventsByKinds(jobId: string, kinds: readonly string[], opts: { limit?: number } = {}): FakeEvent[] {
+    return this.state.events
+      .filter((event) => event.jobId === jobId && kinds.includes(event.kind))
+      .reverse()
+      .slice(0, opts.limit ?? 200);
   }
 
   listPendingRebriefs(opts: { jobId?: string } = {}): readonly unknown[] {
@@ -396,7 +408,141 @@ describe('autopilot mode resolution (kill switch + per-family modes)', () => {
         hold_basis: 'status:done',
       },
       mode: 'dry-run',
+      fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/u),
     });
+  });
+
+  it('records a persisting row decision ONCE per (rule, job, fingerprint); a changed decision records anew (#369)', async () => {
+    const ledger = new FakeLedger().job('job-release', 'done');
+    const ops = fakeOps();
+    const pass = (mode?: 'enforce') => runSilasAutopilot({
+      digest: digest({ releaseEligible: [releaseRow()] }),
+      config: mode === undefined ? enabled() : enabled({ 'sweep-ack': mode }),
+      ledger: ledger.port,
+      ops: ops.ops,
+    });
+    // The same unchanged row across three passes is ONE decision event...
+    for (let index = 0; index < 3; index += 1) expect((await pass()).decisions).toBe(1);
+    expect(ledger.decisions()).toHaveLength(1);
+    // ...while a changed decision (here the family's mode) records anew.
+    await pass('enforce');
+    expect(ledger.decisions()).toHaveLength(2);
+    expect(ledger.decisions().map((event) => (event.payload as { mode: string }).mode)).toEqual(['dry-run', 'enforce']);
+    // Another job's decision for the same rule never masks this one.
+    ledger.job('job-other', 'done');
+    await runSilasAutopilot({
+      digest: digest({ releaseEligible: [releaseRow({ jobId: 'job-other' })] }),
+      config: enabled(), ledger: ledger.port, ops: ops.ops,
+    });
+    expect(ledger.decisions().filter((event) => event.jobId === 'job-other')).toHaveLength(1);
+  });
+
+  it('a rule\'s last decision is found past any number of other rules\' decisions on the job (#369)', async () => {
+    const ledger = newRealLedger();
+    const job = ledger.addJob({ id: 'job-release', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
+    ledger.setJobStatus(job.id, 'working');
+    ledger.setJobStatus(job.id, 'done');
+    const ops = fakeOps();
+    const pass = () => runSilasAutopilot({ digest: digest({ releaseEligible: [releaseRow()] }), config: enabled(), ledger, ops: ops.ops });
+    const ruleDecisions = () => ledger.listJobEventsByKinds(job.id, [AUTOPILOT_DECISION_EVENT], { limit: 1000 })
+      .filter((event) => (event.payload as { rule_id?: string }).rule_id === 'sweep-ack');
+    await pass();
+    expect(ruleDecisions()).toHaveLength(1);
+    // More decisions from another rule than any fixed newest-N window holds.
+    for (let index = 0; index < 300; index += 1) {
+      ledger.appendCustomEvent({ kind: AUTOPILOT_DECISION_EVENT, jobId: job.id, payload: { rule_id: 'pr-review-trigger', job: job.id, action: 'noop', would_call: { index }, mode: 'dry-run' } });
+    }
+    await pass();
+    expect(ruleDecisions()).toHaveLength(1);
+    expect(() => ledger.latestJobEventByPayloadField(job.id, AUTOPILOT_DECISION_EVENT, "rule_id') OR 1=1 --", 'x')).toThrow(/not a plain snake_case payload field/u);
+  });
+
+  it('canonical JSON sorts keys at every depth and serializes values as JSON.stringify does (#369)', () => {
+    expect(canonicalJson({ b: 1, a: { d: [3, { y: 1, x: 2 }], c: 'é' } })).toBe('{"a":{"c":"é","d":[3,{"x":2,"y":1}]},"b":1}');
+    expect(canonicalJson({ b: 1, a: 2 })).toBe(canonicalJson({ a: 2, b: 1 }));
+    const when = new Date('2026-10-16T00:00:00.000Z');
+    expect(canonicalJson({ when })).toBe(JSON.stringify({ when }));
+    expect(canonicalJson({ gone: undefined, fn: () => 1, kept: null })).toBe('{"kept":null}');
+    expect(canonicalJson([undefined, () => 1, 'x'])).toBe(JSON.stringify([undefined, () => 1, 'x']));
+    // Exactly as JSON.stringify: symbol members, a toJSON returning undefined,
+    // holes, non-finite numbers, and a toJSON called once (never again on its result).
+    const self = { a: 1, toJSON() { return this; } };
+    // eslint-disable-next-line no-sparse-arrays
+    for (const value of [{ a: Symbol('s'), b: 1 }, { a: { toJSON: () => undefined }, b: 1 }, [, 1], [Symbol('s')], { a: Number.NaN, b: Infinity }, self]) {
+      expect(canonicalJson(value)).toBe(JSON.stringify(value));
+    }
+    // A cycle or a BigInt is refused by name, never a stack overflow.
+    const cyclic: Record<string, unknown> = {}; cyclic['self'] = cyclic;
+    expect(() => canonicalJson(cyclic)).toThrow(/^canonicalJson: a circular structure has no JSON form$/u);
+    expect(() => canonicalJson({ n: 1n })).toThrow(/^canonicalJson: a BigInt has no JSON form$/u);
+    // toJSON receives its key, and boxed primitives unwrap, as JSON.stringify does.
+    const keyed = { a: { toJSON: (key: string) => `key ${key}` }, list: [{ toJSON: (key: string) => `index ${key}` }] };
+    expect(canonicalJson(keyed)).toBe(JSON.stringify(keyed));
+    const boxed = { b: new Boolean(false), n: new Number(1), s: new String('x') };
+    expect(canonicalJson(boxed)).toBe(JSON.stringify(boxed));
+    expect(() => canonicalJson({ n: Object(1n) })).toThrow(/^canonicalJson: a BigInt has no JSON form$/u);
+    // Deep nesting is refused by name, never a stack overflow; ordinary depth is fine.
+    const nest = (depth: number): unknown => { let value: unknown = 1; for (let level = 0; level < depth; level += 1) value = { v: value }; return value; };
+    expect(canonicalJson(nest(200))).toBe(JSON.stringify(nest(200)));
+    expect(() => canonicalJson(nest(10_000))).toThrow(/^canonicalJson: nesting deeper than 256 has no canonical form$/u);
+    expect(canonicalJson(nest(256))).toBe(JSON.stringify(nest(256)));
+    expect(() => canonicalJson(nest(257))).toThrow(/nesting deeper than 256/u);
+    // Boxed values unwrap through ToString/ToNumber; a spoofed BigInt tag is an ordinary object.
+    const overridden = { s: Object.assign(new String('x'), { toString: () => 'y' }), t: { [Symbol.toStringTag]: 'BigInt', a: 1 } };
+    expect(canonicalJson(overridden)).toBe(JSON.stringify(overridden));
+    // A throwing getter, and a huge (sparse) array, are refused by name.
+    expect(() => canonicalJson({ get a(): unknown { throw new Error('no'); } })).toThrow(/^canonicalJson: the value at "a" cannot be read$/u);
+    expect(() => canonicalJson([1, { toJSON() { throw new Error('no'); } }])).toThrow(/^canonicalJson: the value at "1" cannot be read$/u);
+    expect(() => canonicalJson(new Array(100_001))).toThrow(/^canonicalJson: an array of 100001 items has no canonical form$/u);
+    expect(() => canonicalJson(new Array(100_000))).not.toThrow();
+    // Shared sub-arrays count every time they are walked: the whole walk is bounded.
+    const leaf = new Array<number>(1000).fill(0);
+    expect(() => canonicalJson(new Array<number[]>(1000).fill(leaf))).toThrow(/^canonicalJson: more than 1000000 values have no canonical form$/u);
+    // A hostile array or object is refused by name, wherever its read throws.
+    const throwingIndex = new Proxy([1], { get: (target, key) => { if (key === '0') throw new Error('no'); return Reflect.get(target, key) as unknown; } });
+    expect(() => canonicalJson({ list: throwingIndex })).toThrow(/^canonicalJson: the value at "0" cannot be read$/u);
+    const throwingKeys = new Proxy({}, { ownKeys: () => { throw new Error('no'); } });
+    expect(() => canonicalJson({ bag: throwingKeys })).toThrow(/^canonicalJson: the value at "bag" cannot be read$/u);
+    const throwingLength = new Proxy([1], { get: (target, key) => { if (key === 'length') throw new Error('no'); return Reflect.get(target, key) as unknown; } });
+    expect(() => canonicalJson({ list: throwingLength })).toThrow(/^canonicalJson: the value at "list" cannot be read$/u);
+    const oddLength = new Proxy([1], { get: (target, key) => (key === 'length' ? { valueOf: () => { throw new Error('no'); } } : Reflect.get(target, key) as unknown) });
+    expect(() => canonicalJson({ list: oddLength })).toThrow(/^canonicalJson: the value at "list" cannot be read$/u);
+    for (const length of [Number.NaN, -1, 1.5, 2 ** 53]) {
+      const counted = new Proxy([1], { get: (target, key) => (key === 'length' ? length : Reflect.get(target, key) as unknown) });
+      expect(() => canonicalJson({ list: counted }), String(length)).toThrow(/^canonicalJson: the value at "list" cannot be read$/u);
+    }
+    const revocable = Proxy.revocable([1], {});
+    revocable.revoke();
+    expect(() => canonicalJson({ gone: revocable.proxy })).toThrow(/^canonicalJson: the value at "gone" cannot be read$/u);
+    // ...and so is one that revokes itself on its last prototype read, just before the array check.
+    let prototypeReads = 0;
+    const lateRevoked = Proxy.revocable([1], { getPrototypeOf: (target) => { if ((prototypeReads += 1) === 3) lateRevoked.revoke(); return Reflect.getPrototypeOf(target); } });
+    expect(() => canonicalJson({ late: lateRevoked.proxy })).toThrow(/^canonicalJson: the value at "late" cannot be read$/u);
+    expect(prototypeReads).toBe(3);
+    // A boxed boolean serializes by its value, whatever its own valueOf says.
+    const spoofed = { b: Object.assign(new Boolean(false), { valueOf: () => true }) };
+    expect(canonicalJson(spoofed)).toBe('{"b":false}');
+    expect(canonicalJson(spoofed)).toBe(JSON.stringify(spoofed));
+    // A repeated (non-circular) member is no cycle.
+    const shared = { x: 1 };
+    expect(canonicalJson({ a: shared, b: shared })).toBe('{"a":{"x":1},"b":{"x":1}}');
+  });
+
+  it('a decision recorded before fingerprints existed is the same decision on upgrade (#369)', async () => {
+    const ledger = new FakeLedger().job('job-release', 'done');
+    const ops = fakeOps();
+    const pass = () => runSilasAutopilot({ digest: digest({ releaseEligible: [releaseRow()] }), config: enabled(), ledger: ledger.port, ops: ops.ops });
+    await pass();
+    const [first] = ledger.decisions();
+    const { fingerprint: _fingerprint, ...legacy } = first!.payload as Record<string, unknown>;
+    // Rewrite history as a pre-#369 deployment left it: no fingerprint, and
+    // its would-call object read back with its keys in another order.
+    const reversed = (value: unknown): unknown => value !== null && typeof value === 'object' && !Array.isArray(value)
+      ? Object.fromEntries(Object.entries(value).reverse().map(([key, member]) => [key, reversed(member)])) : value;
+    (first as { payload: unknown }).payload = { ...legacy, would_call: reversed(legacy['would_call']) };
+    expect(JSON.stringify((first!.payload as { would_call?: unknown }).would_call)).not.toBe(JSON.stringify(legacy['would_call']));
+    await pass();
+    expect(ledger.decisions()).toHaveLength(1);
   });
 
   it('enforce performs exactly one call per decision, and reports the failure of one', async () => {
@@ -2835,6 +2981,62 @@ describe('F-H2 the admission boundary re-proves a hold that lands after planning
   });
 });
 
+describe('#368 review admission receipts and the final pull-request binding', () => {
+  const A = 'f'.repeat(40);
+  const base = (requestReview: SilasAutopilotOpsDeps['wave']['requestReview'], prUrl: string | null = null) => {
+    const ledger = newRealLedger();
+    const job = ledger.addJob({ id: 'job-368', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
+    ledger.setJobStatus(job.id, 'working');
+    ledger.setJobStatus(job.id, 'delivered');
+    if (prUrl !== null) ledger.setJobPr(job.id, prUrl);
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: job.id, payload: { sha: A } });
+    const ops = createSilasAutopilotOps({
+      ...nativeSeams,
+      ledger,
+      wave: waveStub({ requestReview }),
+      registry: {} as never,
+      worktrees: { listWorktrees: () => [] } as never,
+      dispatch: { recordPr: () => ({ prUrl: null }) },
+      gh: { listPullsForHead: async () => [] },
+      resolveRemote: () => null,
+    });
+    return { ledger, job, ops };
+  };
+
+  it('a busy branch defers the review with a durable receipt instead of failing the pass', async () => {
+    const { ledger, job, ops } = base(async () => {
+      throw new BranchBusyError('gru/job-368', [{ jobId: 'job-other', status: 'working', branch: 'gru/job-368' } as never], 'arm');
+    });
+    await ops.triggerReview({ jobId: job.id, ruleId: 'pr-review-trigger', targetRef: A, boundDeliveredSha: A });
+    const deferred = ledger.latestJobEvent(job.id, 'silas.review-deferred');
+    expect(deferred?.payload).toMatchObject({ phase: 'arm', blockers: [expect.objectContaining({ job_id: 'job-other', status: 'working' })] });
+    expect(ledger.latestJobEvent(job.id, 'silas.review-triggered')).toBeNull();
+  });
+
+  it('a non-Perkins route is recorded as deferred, never as an armed review', async () => {
+    const { ledger, job, ops } = base(async () => ({ route: 'bmad-review-fallback', failedLegs: [], skillInstalled: false, clearToMerge: false, run: Promise.resolve() }) as never);
+    await ops.triggerReview({ jobId: job.id, ruleId: 'pr-review-trigger', targetRef: A, boundDeliveredSha: A });
+    expect(ledger.latestJobEvent(job.id, 'silas.review-deferred')?.payload).toMatchObject({ route: 'bmad-review-fallback' });
+    expect(ledger.latestJobEvent(job.id, 'silas.review-triggered')).toBeNull();
+  });
+
+  it('the final admission guard binds the CI observation to the job pull request: none or another PR refuses', async () => {
+    let guard: (() => void) | undefined;
+    const { ledger, job, ops } = base(async (input) => {
+      guard = input.finalAdmissionGuard;
+      throw new Error('captured');
+    }, 'https://github.com/mssoka/gru-command/pull/42');
+    await expect(ops.triggerReview({ jobId: job.id, ruleId: 'pr-review-trigger', targetRef: A, boundDeliveredSha: A })).rejects.toThrow('captured');
+    expect(guard).toBeDefined();
+    ledger.appendCustomEvent({ kind: 'github.ci-green', jobId: job.id, payload: { sha: A } });
+    expect(() => guard!()).toThrow(/carries no pull-request binding/);
+    ledger.appendCustomEvent({ kind: 'github.ci-green', jobId: job.id, payload: { sha: A, pr: 7 } });
+    expect(() => guard!()).toThrow(/belongs to a different pull request/);
+    ledger.appendCustomEvent({ kind: 'github.ci-green', jobId: job.id, payload: { sha: A, pr: 42 } });
+    expect(() => guard!()).not.toThrow();
+  });
+});
+
 describe('F-H3 verification ownership is re-proved after the pacing wait', () => {
   it('a directive queued behind pacing never prompts after a verification takes the lane', async () => {
     const ledger = newRealLedger();
@@ -2876,7 +3078,49 @@ describe('F-H3 verification ownership is re-proved after the pacing wait', () =>
     await ops.drain();
     expect(prompted).toBe(0);
     expect(ledger.latestJobEvent(job.id, 'silas.directive-sent')).toBeNull();
-    expect(ledger.listPendingDirectives({ jobId: job.id })[0]?.state).not.toBe('settled');
+    // #364: the post-wait refusal is before any prompt — a positive no-effect,
+    // so the request FAILS by name and never stays live fencing the lane.
+    const [request] = ledger.listPendingDirectives({ jobId: job.id });
+    expect(request?.state).toBe('failed');
+    expect(request?.failReason).toMatch(/^refused before any prompt: .*verification/);
+    expect(ledger.listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES, limit: 5 })).toEqual([]);
+  });
+});
+
+describe('#364 only a named admission refusal fails the request', () => {
+  it('a ledger fault while re-proving after the pacing wait keeps the request live for reconciliation', async () => {
+    const ledger = newRealLedger();
+    const job = ledger.addJob({ id: 'job-364-fault', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
+    ledger.setJobStatus(job.id, 'working');
+    ledger.registerAgent({ id: 'min-364', role: 'minion', jobId: job.id });
+    ledger.setAgentState('min-364', 'idle');
+    let prompted = 0;
+    const lanes = await nativeLanes(job.id, ledger);
+    const handle = nativeHandle({ ...idleHandle('min-364'), async prompt() { prompted += 1; } }, lanes, job.id);
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'hold the pool' });
+    const ops = createSilasAutopilotOps({
+      ...nativeSeams,
+      ledger,
+      wave: waveStub(),
+      registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
+      worktrees: lanes,
+      dispatch: { recordPr: () => ({ prUrl: null }) },
+      gh: { listPullsForHead: async () => [] },
+      resolveRemote: () => null,
+      workerGate: gate,
+    });
+    await ops.sendDirective({ jobId: job.id, directive: 'x', ruleId: 'verdict-rung-directive', sourceRoundId: 'round-364' });
+    await vi.waitFor(() => expect(gate.view().worker.queued).toHaveLength(1));
+    // The verification-ownership re-read itself fails after the wait.
+    vi.spyOn(ledger, 'hasUnsettledVerificationRun').mockImplementation(() => { throw new Error('ledger read failed'); });
+    holder.release();
+    await vi.waitFor(() => expect(gate.view().worker.queued).toHaveLength(0));
+    await ops.drain();
+    expect(prompted).toBe(0);
+    const [request] = ledger.listPendingDirectives({ jobId: job.id });
+    expect(request?.state).not.toBe('failed');
+    expect(ledger.listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES, limit: 5 })).toHaveLength(1);
   });
 });
 

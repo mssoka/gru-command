@@ -222,9 +222,72 @@ describe('service shutdown orchestration (issue #341, R3-2 executable)', () => {
     }
   });
 
+  it('checkpoints pending autopilot producers before the first await and drains them only after registry disposal (#368)', async () => {
+    const order: string[] = [];
+    const warnings: string[] = [];
+    let releaseChat!: () => void;
+    const chatGate = new Promise<void>((resolve) => { releaseChat = resolve; });
+    const pending = [{ operation: 'directive', jobId: 'job-1', ruleId: 'verdict-rung-fix', requestRefs: ['req-1'], agentId: null }];
+    const state: ServiceShutdownState = {
+      chat: { dispose: async () => { order.push('chat.dispose'); await chatGate; } } as unknown as NonNullable<ServiceShutdownState['chat']>,
+      autopilot: {
+        pendingSnapshot: () => { order.push('autopilot.snapshot'); return pending; },
+        drain: async () => { order.push('autopilot.drain'); return { settled: false, pending: 1 }; },
+      } as unknown as NonNullable<ServiceShutdownState['autopilot']>,
+      ledger: { appendCustomEvent: (event: { kind: string; payload: unknown }) => { order.push(`ledger.${event.kind}`); return event; } } as unknown as NonNullable<ServiceShutdownState['ledger']>,
+      registry: { dispose: async () => { order.push('registry.dispose'); } } as unknown as RuntimeRegistry,
+      store: {
+        writeShutdownCheckpoint: (input: { pending: readonly unknown[] }) => { order.push(`store.checkpoint:${String(input.pending.length)}`); },
+        dispose: (): void => { order.push('store.dispose'); },
+        persistSnapshot: (): void => { order.push('store.snapshot'); },
+      } as unknown as SessionStore,
+      handle: fakeHandle(order),
+    };
+    const logger = recordingLogger();
+    const exits: number[] = [];
+    let resolveExit!: (code: number) => void;
+    const exited = new Promise<number>((resolve) => { resolveExit = resolve; });
+    startServiceShutdown({
+      signal: 'SIGTERM',
+      exitCode: 0,
+      logger: { ...logger, warn: (msg) => { warnings.push(msg); } },
+      state,
+      serviceStop: new AbortController(),
+      exit: (code) => { exits.push(code); resolveExit(code); },
+    });
+    // Synchronously, before any stage awaited: the durable checkpoint landed.
+    expect(order).toEqual(['autopilot.snapshot', 'store.checkpoint:1', 'ledger.silas.shutdown-checkpoint']);
+    await delay(0);
+    expect(order.at(-1)).toBe('chat.dispose');
+    releaseChat();
+    await exited;
+    expect(exits).toEqual([0]);
+    expect(order.slice(3)).toEqual(['chat.dispose', 'registry.dispose', 'autopilot.drain', 'store.dispose', 'store.snapshot', 'handle.stop']);
+    expect(warnings).toEqual(['silas autopilot producers unsettled after disposal — ownership retained for boot reconciliation']);
+  });
+
+  it('a failed checkpoint is logged and never blocks the shutdown (#368)', async () => {
+    const order: string[] = [];
+    const state: ServiceShutdownState = {
+      autopilot: {
+        pendingSnapshot: () => { throw new Error('snapshot unavailable'); },
+        drain: async () => { order.push('autopilot.drain'); return { settled: true, pending: 0 }; },
+      } as unknown as NonNullable<ServiceShutdownState['autopilot']>,
+      handle: fakeHandle(order),
+    };
+    const run = runShutdown(state);
+    await run.exited;
+    expect(run.exits).toEqual([0]);
+    expect(order).toEqual(['autopilot.drain', 'handle.stop']);
+    expect(run.lines.some((line) => line.msg === 'shutdown checkpoint failed — pending ownership retained')).toBe(true);
+  });
+
   it('is the orchestration main.ts actually invokes (wiring alarm)', () => {
     const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
     expect(mainSource).toContain("from './service-shutdown.js'");
     expect(mainSource).toMatch(/startServiceShutdown\(\{\s*signal,\s*exitCode/);
+    // #368: the autopilot handle and the checkpoint ledger reach the state bag.
+    expect(mainSource).toMatch(/\bstate\.autopilot = autopilotOps;/);
+    expect(mainSource).toMatch(/\bstate\.ledger = ledger;/);
   });
 });

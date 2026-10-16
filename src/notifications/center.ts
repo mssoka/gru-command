@@ -15,6 +15,7 @@ import {
   type NotificationRecord,
   type NotificationRouting,
   type NotificationSeverity,
+  type NotificationProvenance,
 } from '../ledger/api.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -289,6 +290,16 @@ export class NotificationCenter {
    * LedgerApi.updateNotificationDecisionOptions). */
   attachDecisionOptions(id: string, options: readonly NotificationDecisionOption[], by: string): NotificationRecord | null {
     return this.ledger.updateNotificationDecisionOptions(id, options, by);
+  }
+
+  /** A pre-upgrade owner row adopts a replayed typed decision (see
+   * LedgerApi.adoptLegacyOwnerDecision, #395). */
+  adoptLegacyDecision(
+    id: string,
+    decision: NotificationDecision,
+    provenance: NotificationProvenance,
+  ): NotificationRecord | null {
+    return this.ledger.adoptLegacyOwnerDecision(id, decision, provenance);
   }
 
   /** Refresh an open incident's detail (same id, same ack state). */
