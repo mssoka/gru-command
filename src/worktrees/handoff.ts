@@ -1,4 +1,4 @@
-import { closeSync, constants, existsSync, fstatSync, linkSync, lstatSync, openSync, readSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, existsSync, fstatSync, fsyncSync, linkSync, lstatSync, openSync, readSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import type { WorktreePort, WorktreeLane } from '../dispatch/worktree-port.js';
 import type { LedgerApi, WorktreeRecord } from '../ledger/api.js';
@@ -185,9 +185,17 @@ function entryKind(path: string): EntryKind {
   }
 }
 
-/** Whether `path` is a symbolic link (dangling or not) — never a raw error. */
-function isLink(path: string): boolean {
-  try { return lstatSync(path).isSymbolicLink(); } catch { return false; }
+/** Whether anything at all — a dangling link included — is at `path`
+ * (lstat, never following), or a refusal naming why that cannot be told. */
+function present(path: string, what: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (error) {
+    const code = errnoOf(error);
+    if (code === 'ENOENT' || code === 'ENOTDIR') return false;
+    throw new Error(`${what} ${path} cannot be inspected (${code})`, { cause: error });
+  }
 }
 
 /** Why `dir` is not a full git directory (HEAD file, objects and refs
@@ -353,15 +361,14 @@ function validate(receipt: Receipt, lane: WorktreeLane): void {
     const ref = join(common, 'refs', 'heads', lane.branch);
     // Present as anything at all (a dangling link included) is a loose ref,
     // judged as one; only true absence falls back to packed refs.
-    const loose = entryKind(ref) !== 'absent' || isLink(ref);
-    if (loose) {
+    if (present(ref, 'writer branch ref')) {
       // Direct first — a ref reached through a link is never read.
-      if (resolvedPath('writer branch ref', ref) !== ref) throw new Error('writer branch is not direct');
+      if (resolvedPath('writer branch ref', ref) !== ref) throw new Error(`writer branch is not direct: its ref ${ref} is reached through a link`);
       const text = namedMetadata(ref, 'writer branch ref').trim();
-      if (!/^[0-9a-f]{40,64}$/u.test(text) || text.length !== lane.sha.length) throw new Error('writer branch is not direct');
+      if (!/^[0-9a-f]{40,64}$/u.test(text) || text.length !== lane.sha.length) throw new Error(`writer branch is not direct: its ref ${ref} does not hold a commit id of the lane's length`);
     } else {
       const packedFile = join(common, 'packed-refs');
-      if (entryKind(packedFile) === 'absent') throw new Error(`writer branch ${lane.branch} has neither a loose ref nor a packed-refs file`);
+      if (!present(packedFile, 'packed refs')) throw new Error(`writer branch ${lane.branch} has neither a loose ref nor a packed-refs file`);
       const packed = namedMetadata(packedFile, 'packed refs', 16 * 1024 * 1024);
       if (packed.split('\n').some((line) => line.startsWith('^') && !/^\^[0-9a-f]{40,64}$/u.test(line))) throw new Error('malformed peeled ref metadata');
       const lines = packed.split('\n').filter((line) => line !== '' && !line.startsWith('#') && !line.startsWith('^'));
@@ -394,7 +401,15 @@ export function beginLaneHandoff(lane: Pick<WorktreeLane, 'id' | 'kind' | 'repoP
   try {
     const fd = openSync(temp, 'wx');
     ours = true;
-    try { writeFileSync(fd, JSON.stringify(receipt)); } finally { closeSync(fd); }
+    // Durable before it is published; a write error stays the one reported.
+    try {
+      writeFileSync(fd, JSON.stringify(receipt));
+      fsyncSync(fd);
+    } catch (writeError) {
+      try { closeSync(fd); } catch { /* the write error is the one to report */ }
+      throw writeError;
+    }
+    closeSync(fd);
     linkSync(temp, file); // atomic publication, never overwrite a foreign receipt
   } catch (error) {
     if (ours) removeTemp(error);

@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, relative as relativePath } from 'node:path';
+import { dirname, join, relative as relativePath } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 // node:fs passes through; a test may make one write or removal fail.
@@ -337,10 +337,17 @@ describe('child lane parent custody, called directly (#373)', () => {
       ['writer branch ref through a link', (f) => {
         const ref = join(realpathSync(join(f.repo.path, '.git')), 'refs', 'heads', f.parent.branch!);
         const elsewhere = join(directory(), 'ref'); writeFileSync(elsewhere, readFileSync(ref)); rmSync(ref); symlinkSync(elsewhere, ref);
-      }, () => /writer branch is not direct/u],
+      }, () => /writer branch is not direct: its ref .* is reached through a link/u],
+      ['writer branch ref dangling link', (f) => {
+        // packed-refs lists the branch: a fall-through to it would pass.
+        const common = realpathSync(join(f.repo.path, '.git'));
+        git(f.repo.path, ['pack-refs', '--all']);
+        const ref = join(common, 'refs', 'heads', f.parent.branch!);
+        rmSync(ref, { force: true }); mkdirSync(dirname(ref), { recursive: true }); symlinkSync(join(directory(), 'missing'), ref);
+      }, () => /writer branch ref .* cannot be resolved \(ENOENT\)/u],
       ['writer branch ref junk', (f) => {
         writeFileSync(join(realpathSync(join(f.repo.path, '.git')), 'refs', 'heads', f.parent.branch!), 'junk\n');
-      }, () => /writer branch is not direct/u],
+      }, () => /writer branch is not direct: its ref .* does not hold a commit id of the lane's length/u],
       ['packed refs unreadable', (f) => {
         const common = realpathSync(join(f.repo.path, '.git'));
         rmSync(join(common, 'refs', 'heads', f.parent.branch!)); rmSync(join(common, 'packed-refs'), { force: true }); mkdirSync(join(common, 'packed-refs'));
@@ -366,11 +373,15 @@ describe('child lane parent custody, called directly (#373)', () => {
     for (const [label, corrupt, reason] of corruptions) {
       const f = await parentFixture(`custody-admin-${label.replace(/\W+/gu, '-')}`);
       corrupt(f);
-      const error = await f.createChild().then(() => null, (cause: unknown) => cause);
-      expect(error, label).toBeInstanceOf(handoffProof.WorktreeHandoffUnresolvedError);
-      expect(reasonsOf(error), label).toMatch(reason(f));
-      // Git itself cannot list branches past a packed-refs directory: restore it first.
-      if (label === 'packed refs unreadable') rmSync(join(realpathSync(join(f.repo.path, '.git')), 'packed-refs'), { recursive: true });
+      try {
+        const error = await f.createChild().then(() => null, (cause: unknown) => cause);
+        expect(error, label).toBeInstanceOf(handoffProof.WorktreeHandoffUnresolvedError);
+        expect(reasonsOf(error), label).toMatch(reason(f));
+      } finally {
+        // Git itself cannot list branches past a packed-refs directory: undo
+        // that case's corruption whatever the assertions above found.
+        if (label === 'packed refs unreadable') rmSync(join(realpathSync(join(f.repo.path, '.git')), 'packed-refs'), { recursive: true, force: true });
+      }
       f.childLeftNothing();
       expect(f.h.ledger.getWorktree(f.parent.id)?.status, label).toBe('active');
     }
