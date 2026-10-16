@@ -18,7 +18,7 @@ import type { ExecutionBudget, ExecutionReceiptRef, PropertyMetricsSnapshot, Pro
  * approval binds exact test bytes and target commits. Repo configuration can
  * reduce/disable execution, but can NEVER mint this capability. */
 export class PropertyPipelineError extends Error {
-  constructor(message: string) { super(message); this.name = 'PropertyPipelineError'; }
+  constructor(message: string, options?: ErrorOptions) { super(message, options); this.name = 'PropertyPipelineError'; }
 }
 export interface ReviewedPropertyCampaign {
   readonly proposal: PropertyProposal;
@@ -127,7 +127,13 @@ function directiveLiteral(value: unknown): string {
 }
 /** A value's JSON text, refused by name when it has none. */
 function jsonOf(value: unknown): string {
-  const json = JSON.stringify(value) as string | undefined;
+  let json: string | undefined;
+  try {
+    json = JSON.stringify(value) as string | undefined;
+  } catch (error) {
+    // A BigInt or a cycle: named, never a raw TypeError.
+    throw new PropertyPipelineError(`a directive value has no JSON form (${String(error)})`, { cause: error });
+  }
   if (json === undefined) throw new PropertyPipelineError('a directive value has no JSON form');
   return json;
 }

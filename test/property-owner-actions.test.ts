@@ -1,7 +1,7 @@
 import { chmodSync, existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { createPropertyCampaignService, evictable, evictionVictim, nextAction, rememberEvicted } from '../src/dispatch/property-campaigns.js';
+import { createPropertyCampaignService, evictable, EVICTED_IDS_REMEMBERED, evictionVictim, nextAction, rememberEvicted } from '../src/dispatch/property-campaigns.js';
 import { forceCoversBlocker, laneIsBusy, snapshotForceAuthorization } from '../src/dispatch/branch-idle.js';
 import { unitCampaign, commit, UNIT_PATH } from './fixtures/property/executor/campaign.js';
 import { ownerService } from './fixtures/property/owner-service.js';
@@ -175,6 +175,15 @@ describe('ordinary owner HTTP property actions (controlled minion; no JSON issua
     expect(evictionVictim([entry('x1', 'job-a', 'executed')], 'job-a', 'x1')).toBeUndefined();
   });
 
+  it('remembers the last EVICTED_IDS_REMEMBERED evicted ids by default; an older one is forgotten (#380)', () => {
+    const evicted = new Map<string, number>();
+    for (let index = 0; index <= EVICTED_IDS_REMEMBERED; index += 1) rememberEvicted(evicted, `id-${String(index)}`, index);
+    expect(EVICTED_IDS_REMEMBERED).toBe(1024);
+    expect(evicted.size).toBe(EVICTED_IDS_REMEMBERED);
+    expect(evicted.has('id-0')).toBe(false);
+    expect(evicted.has(`id-${String(EVICTED_IDS_REMEMBERED)}`)).toBe(true);
+  });
+
   it('remembers evicted ids within a bound, forgetting the oldest first (#380)', () => {
     const evicted = new Map<string, number>();
     for (let index = 0; index < 5; index += 1) rememberEvicted(evicted, `id-${String(index)}`, index, 3);
@@ -221,6 +230,14 @@ describe('ordinary owner HTTP property actions (controlled minion; no JSON issua
       expect(evictedAudit()).toEqual([]);
       // ...and the refused proposal left no record of its own.
       expect(readdirSync(h.serviceOptions.artifactsRoot).sort()).toEqual(campaignsBefore);
+      // A proposal whose OWN record cannot be written evicts nothing either:
+      // the victim's eviction record is withdrawn with it.
+      chmodSync(h.serviceOptions.artifactsRoot, 0o500);
+      try {
+        expect(() => service.propose(h.jobId, { campaign: f.reviewed })).toThrow(/EACCES|permission denied/iu);
+      } finally { chmodSync(h.serviceOptions.artifactsRoot, 0o700); }
+      expect(evictedAudit()).toEqual([]);
+      expect(service.read(h.jobId, a.id).state).toBe('retained');
       expect(service.read(h.jobId, a.id).state).toBe('retained');
       expect(service.read(h.jobId, b.id).state).toBe('proposed');
       // Once the audit can be written, the same proposal evicts A by name.

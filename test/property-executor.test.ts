@@ -4,7 +4,7 @@ import fs, { existsSync, linkSync, mkdirSync, readFileSync, symlinkSync, writeFi
 import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createBoundedPropertyCapture, createPropertyExecutor, PreExecutionRejectionError, createReceiptRetention, framedRunnerReport, isSealedExecutionReceipt, noReportReasons, NONCE_READER_SOURCE, ReceiptRetentionError, resolveSandboxBackend, validatePlanAgainstHostApproval } from '../src/property/executor.js';
+import { createBoundedPropertyCapture, createPropertyExecutor, PreExecutionRejectionError, createReceiptRetention, framedRunnerReport, isSealedExecutionReceipt, noReportReasons, NONCE_READ_BUDGET_MS, nonceReaderSource, ReceiptRetentionError, resolveSandboxBackend, validatePlanAgainstHostApproval } from '../src/property/executor.js';
 import { VITEST_FAST_CHECK_ADAPTER as adapter } from '../src/property/adapters/vitest-fast-check.js';
 import { applyOverlayFiles, applyOverlayFilesAllOrNothing } from '../src/property/overlay.js';
 import { buildSourceIdentity } from '../src/property/receipts.js';
@@ -92,34 +92,38 @@ describe('host property executor (positive sandbox controls on macOS; other host
   it('reads the fd-3 nonce through EAGAIN within its budget, and a close failure never masks the read error (#378)', () => {
     type Step = number | string | Error;
     const errno = (code: string): Error => Object.assign(new Error(code), { code });
-    const reader = new Function('readSync', 'closeSync', `${NONCE_READER_SOURCE}\nreturn nonce;`) as (read: (fd: number, buffer: Buffer, offset: number, length: number) => number, close: (fd: number) => void) => string;
-    const run = (steps: readonly Step[], closeError: Error | null = null) => {
+    const reader = (budgetMs = NONCE_READ_BUDGET_MS) => new Function('readSync', 'closeSync', `${nonceReaderSource(budgetMs)}\nreturn nonce;`) as (read: (fd: number, buffer: Buffer, offset: number, length: number) => number, close: (fd: number) => void) => string;
+    const run = (steps: readonly Step[], closeError: Error | null = null, budgetMs = NONCE_READ_BUDGET_MS) => {
       const closed: number[] = [];
       const queue = [...steps];
+      let reads = 0;
       const read = (fd: number, buffer: Buffer, offset: number, length: number): number => {
         expect(fd).toBe(3);
+        reads += 1;
         const step = queue.shift() ?? 0;
         if (step instanceof Error) throw step;
         if (typeof step === 'string') return buffer.write(step, offset, length);
         return step;
       };
       const close = (fd: number) => { closed.push(fd); if (closeError !== null) throw closeError; };
-      return { result: (() => { try { return reader(read, close); } catch (error) { return error; } })(), closed };
+      return { result: (() => { try { return reader(budgetMs)(read, close); } catch (error) { return error; } })(), closed, reads };
     };
     const nonce = 'c'.repeat(64);
     // A not-yet-written non-blocking channel is retried, then read whole, then closed.
-    expect(run([errno('EAGAIN'), errno('EAGAIN'), `${nonce}\n`, 0])).toEqual({ result: nonce, closed: [3] });
+    expect(run([errno('EAGAIN'), errno('EAGAIN'), `${nonce}\n`, 0])).toEqual({ result: nonce, closed: [3], reads: 4 });
     // Any other read error is the channel's failure — and still closes fd 3.
     expect(run([errno('EBADF')])).toMatchObject({ result: { code: 'EBADF' }, closed: [3] });
     // A close failure never masks the read's own error...
     expect(run([errno('EIO')], errno('EBADF'))).toMatchObject({ result: { code: 'EIO' } });
     // ...and is the failure when the read itself succeeded.
     expect(run([`${nonce}\n`, 0], errno('EBADF'))).toMatchObject({ result: { code: 'EBADF' } });
-    // A channel that never delivers gives up after its bounded wait, and still closes.
-    const started = Date.now();
-    expect(run(Array.from({ length: 2000 }, () => errno('EAGAIN')))).toMatchObject({ result: { code: 'EAGAIN' }, closed: [3] });
-    expect(Date.now() - started).toBeGreaterThanOrEqual(4900);
-  }, 20_000);
+    // A channel that never delivers gives up after its bounded wait — one
+    // read per 10 ms waited, then the last — and still closes (a 50 ms
+    // budget here; the shipped config waits NONCE_READ_BUDGET_MS).
+    expect(run(Array.from({ length: 100 }, () => errno('EAGAIN')), null, 50)).toMatchObject({ result: { code: 'EAGAIN' }, closed: [3], reads: 6 });
+    expect(NONCE_READ_BUDGET_MS).toBe(5000);
+    expect(() => nonceReaderSource(5)).toThrow(/budget must be an integer of at least 10 ms/u);
+  });
   it('refuses an invalid host receipt retention bound and reports the bound it enforces (#377)', () => {
     for (const bad of [0, -1, 1.5, 256 * 1024 * 1024 + 1]) expect(() => createPropertyExecutor({ maxRetainedOutputBytes: bad })).toThrow(/receipt retention bound/);
     expect(createPropertyExecutor({ maxRetainedOutputBytes: 4096 }).retention()).toEqual({ receipts: 0, retainedOutputBytes: 0, maxRetainedOutputBytes: 4096, evicted: 0 });
@@ -169,6 +173,14 @@ describe('host property executor (positive sandbox controls on macOS; other host
   it('refuses by name a copied Vitest without the reporters module the framed report needs (#378)', () => assertUnsupportedRunner(false));
   it('refuses a reporters module that is a directory (#378)', () => assertUnsupportedRunner('directory'));
   it('refuses a reporters module that is a symbolic link (#378)', () => assertUnsupportedRunner('symlink'));
+  it('never copies a reporters module reached through a directory linked outside the repository (#378)', async () => {
+    const f = scenarioRepo(PASS_RUNNER, { reportersModule: 'linked-dist' }); fixtures.push(f);
+    const executor = createPropertyExecutor();
+    const input = { plan: f.plan, repoRoot: f.root, packageDir: f.root };
+    const outcome = await Promise.resolve().then(() => executor.executePlan({ ...input, adapter, approval: executor.approvePlan(input) })).then(() => null, (caught: unknown) => caught);
+    if (process.platform !== 'darwin') return;
+    expect(String(outcome)).toMatch(/external\/absolute symlink refused: node_modules\/vitest\/dist/u);
+  });
   it('refuses a raw receipt without its framed report field, by name; null is no report (#378)', () => {
     const f = fixture(PASS_RUNNER);
     const raw = { stdout: '', stderr: '', report: null, exitCode: 1, signal: null, timedOut: false, durationMs: 1 };
@@ -367,20 +379,21 @@ describe('host property executor (positive sandbox controls on macOS; other host
     expect(readFileSync(target, 'utf8')).toBe('original\n');
     expect(fs.statSync(target).mode & 0o777).toBe(0o444);
   });
-  it.runIf(asUser)('an incomplete rollback fails loud with the original error and every rollback cause (#380)', () => {
+  it.runIf(asUser)('a rollback leaves a file the failed apply never touched exactly as it was, even in a locked directory (#380)', () => {
     const f = fixture();
     const locked = join(f.root, 'test/locked');
     mkdirSync(locked); writeFileSync(join(locked, 'kept.test.mjs'), 'original\n');
+    const before = fs.statSync(join(locked, 'kept.test.mjs'));
     const files = [{ path: 'test/locked/kept.test.mjs', content: 'overlay\n' }, { path: 'test/../../escape.test.mjs', content: 'x\n' }];
-    // The target can be written but its directory cannot change: the restore's unlink fails.
+    // The refusal lands before any write: the untouched file needs no restore,
+    // so the locked directory cannot fail the rollback.
     fs.chmodSync(locked, 0o555);
     let error: unknown = null;
     try { applyOverlayFilesAllOrNothing({ workspaceRoot: f.root, files }); } catch (caught) { error = caught; } finally { fs.chmodSync(locked, 0o755); }
-    expect(error).toBeInstanceOf(AggregateError);
-    const aggregate = error as AggregateError;
-    expect(aggregate.message).toMatch(/^overlay write failed and its rollback was incomplete: OverlayPathError: overlay path must be a safe relative path/u);
-    expect(String(aggregate.errors[0])).toMatch(/overlay path must be a safe relative path/u);
-    expect(aggregate.errors.slice(1).map((cause) => (cause as NodeJS.ErrnoException).code)).toEqual(['EACCES']);
+    expect(error).not.toBeInstanceOf(AggregateError);
+    expect(String(error)).toMatch(/overlay path must be a safe relative path/u);
+    const after = fs.statSync(join(locked, 'kept.test.mjs'));
+    expect([after.ino, after.mtimeMs]).toEqual([before.ino, before.mtimeMs]);
   });
   it('binds host approval to exact overlay bytes and replay controls', async () => {
     const f = fixture(); const executor = createPropertyExecutor();

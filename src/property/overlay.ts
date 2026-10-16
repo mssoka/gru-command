@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, writeFileSync } from 'node:fs';
-import { isAbsolute, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import type { OverlayIdentity } from './types.js';
 
 /**
@@ -189,13 +189,23 @@ export function applyOverlayFilesAllOrNothing(input: Parameters<typeof applyOver
       if (state === 'other') continue;
       try {
         if (state === 'file' && content !== null && mode !== null) {
-          // Re-created beside the target, then renamed over it in one step:
-          // the original bytes are never absent from the tree, and a link
-          // swapped in meanwhile is replaced, never written through.
-          const restored = `${target}.gru-restore-${randomUUID()}`;
-          writeFileSync(restored, content, { flag: 'wx', mode });
-          chmodSync(restored, mode); // exact, whatever the umask
-          renameSync(restored, target);
+          // A file the failed apply never touched is left exactly as it is
+          // (same inode, links and times).
+          const current = lstatSync(target, { throwIfNoEntry: false });
+          if (current?.isFile() === true && (current.mode & 0o7777) === mode && readFileSync(target).equals(content)) continue;
+          // Re-created beside the target (a short name, never too long), then
+          // renamed over it in one step: the original bytes are never absent
+          // from the target path, and a link swapped in meanwhile is
+          // replaced, never written through. A failed step removes its copy.
+          const restored = join(dirname(target), `.gru-restore-${randomUUID()}`);
+          try {
+            writeFileSync(restored, content, { flag: 'wx', mode });
+            chmodSync(restored, mode); // exact, whatever the umask
+            renameSync(restored, target);
+          } catch (stepError) {
+            rmSync(restored, { force: true });
+            throw stepError;
+          }
         } else {
           rmSync(target, { force: true });
         }

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, realpathSync, writeFileSync } from 'node:fs';
+import { mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parseReviewedCampaign } from '../cli/property-check.js';
 import { isJobTerminal } from '../ledger/states.js';
@@ -14,7 +14,7 @@ import type { RecoveryNotifications } from './rebrief-recovery.js';
 import type { WaveRunner } from './perkins.js';
 
 export class PropertyOwnerActionError extends Error {
-  constructor(message: string) { super(message); this.name = 'PropertyOwnerActionError'; }
+  constructor(message: string, options?: ErrorOptions) { super(message, options); this.name = 'PropertyOwnerActionError'; }
 }
 interface Entry {
   readonly id: string;
@@ -190,18 +190,28 @@ export function createPropertyCampaignService(options: PropertyCampaignServiceOp
       const entry: Entry = { id, jobId, spec, heads: roots(spec).map(head), treeDigests: roots(spec).map((root) => propertyWorkspaceIdentity(root).digest), configHash: propertyConfigIdentity(spec.candidateRoot), artifactsDir: join(options.artifactsRoot, id), state: 'proposed', report: null, retainedPaths: [] };
       const victim = entries.size >= maxRetainedProposals ? evictionVictim(entries.values(), jobId, activeId) : undefined;
       if (entries.size >= maxRetainedProposals && victim === undefined) throw new PropertyOwnerActionError('process-local proposal retention limit reached: every retained campaign is a pending proposal, an unresolved blocker, a repair awaiting retention or the campaign being decided right now; decide those first');
+      let evictionAudit: string | null = null;
       if (victim !== undefined) {
         // The eviction is audited beside the victim's own records FIRST —
         // before the new proposal leaves any record and before the victim
         // leaves memory: a failed write evicts and records nothing.
+        const path = join(victim.artifactsDir, `owner-evicted-${randomUUID()}.json`);
         try {
           mkdirSync(victim.artifactsDir, { recursive: true, mode: 0o700 });
-          writeFileSync(join(victim.artifactsDir, `owner-evicted-${randomUUID()}.json`), `${JSON.stringify({ evicted: view(victim), byProposal: id }, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+          writeFileSync(path, `${JSON.stringify({ evicted: view(victim), byProposal: id }, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
         } catch (error) {
-          throw new PropertyOwnerActionError(`the cache is full and campaign ${victim.id} could not be evicted: its audit could not be written in ${victim.artifactsDir} (${String(error)}); fix that directory, or decide a pending campaign, then propose again`);
+          throw new PropertyOwnerActionError(`the cache is full and campaign ${victim.id} could not be evicted: its audit could not be written in ${victim.artifactsDir} (${String(error)}); fix that directory, or decide a pending campaign, then propose again`, { cause: error });
         }
+        evictionAudit = path;
       }
-      audit(entry);
+      try {
+        audit(entry);
+      } catch (error) {
+        // The new proposal was never admitted: its victim was never evicted,
+        // so the eviction record is withdrawn with it.
+        if (evictionAudit !== null) rmSync(evictionAudit, { force: true });
+        throw error;
+      }
       if (victim !== undefined) {
         entries.delete(victim.id);
         rememberEvicted(evictedIds, victim.id, { jobId: victim.jobId, artifactsDir: victim.artifactsDir });

@@ -71,7 +71,9 @@ const RETENTION = { maxReceipts: 1024, maxRetainedOutputBytes: 256 * 1024 * 1024
 /** The config's fd-3 nonce read (#378), exported so its bounded EAGAIN
  * retry and its close handling are tested against injected `readSync` and
  * `closeSync`. Leaves the trimmed text read in `nonce`. */
-export const NONCE_READER_SOURCE = [
+export function nonceReaderSource(budgetMs: number): string {
+  if (!Number.isSafeInteger(budgetMs) || budgetMs < 10) throw new Error('nonce reader budget must be an integer of at least 10 ms');
+  return [
   // fd 3 may be a non-blocking socket: retry EAGAIN (bounded), and always
   // close it — a close failure never masks the read's own error.
   'let nonce = \'\'; let channelError = null;',
@@ -80,7 +82,7 @@ export const NONCE_READER_SOURCE = [
   '  for (;;) {',
   '    let read;',
   '    try { read = readSync(3, buffer, length, buffer.length - length, null); }',
-  "    catch (error) { if (error.code !== 'EAGAIN' || waited >= 5000) throw error; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); waited += 10; continue; }",
+  `    catch (error) { if (error.code !== 'EAGAIN' || waited >= ${String(budgetMs)}) throw error; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); waited += 10; continue; }`,
   '    if (read === 0 || (length += read) >= buffer.length) break;',
   '  }',
   "  nonce = buffer.subarray(0, length).toString('utf8').trim();",
@@ -88,6 +90,10 @@ export const NONCE_READER_SOURCE = [
   'try { closeSync(3); } catch (error) { channelError ??= error; }',
   'if (channelError !== null) throw channelError;',
 ].join('\n');
+}
+/** The wait budget for a not-yet-written fd 3. */
+export const NONCE_READ_BUDGET_MS = 5000;
+const NONCE_READER_SOURCE = nonceReaderSource(NONCE_READ_BUDGET_MS);
 /** The host-owned runner config (#378). Under pool=threads the code under
  * test shares the process with Vitest's reporter, so stdout (and any file the
  * sandbox lets the run write) is writable by that code. The report is
@@ -371,8 +377,11 @@ export function createPropertyExecutor(options: PropertyExecutorOptions = {}): P
         const reportersModule = join(dirname(runner.path), 'dist', 'reporters.js');
         // The framed report depends on the copied Vitest's own reporters
         // module: a layout without it is refused by name before any run.
-        // A regular file, never a link that could resolve outside the copy.
-        if (lstatSync(reportersModule, { throwIfNoEntry: false })?.isFile() !== true) throw new PreExecutionRejectionError('unsupported-runner', `copied Vitest has no regular file ${relative(workspace, reportersModule)}; the host-framed report cannot be produced`);
+        // A regular file, never a link. (A directory linked outside the
+        // repository never reaches here: the copy refuses external links.)
+        if (lstatSync(reportersModule, { throwIfNoEntry: false })?.isFile() !== true) {
+          throw new PreExecutionRejectionError('unsupported-runner', `copied Vitest has no regular file ${relative(workspace, reportersModule)}; the host-framed report cannot be produced`);
+        }
         env['GRU_PROPERTY_REPORTERS_MODULE'] = pathToFileURL(reportersModule).href;
         env['GRU_PROPERTY_MAX_ITERATIONS'] = String(plan.budget.maxIterations);
         env['GRU_PROPERTY_MAX_SHRINK_STEPS'] = String(plan.budget.maxShrinkSteps);
