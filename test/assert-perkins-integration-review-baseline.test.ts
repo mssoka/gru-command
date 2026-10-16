@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   BASELINE_TITLES,
   assertPerkinsIntegrationBaseline,
+  behavioralRefusal,
   frameLocation,
   isBehavioralAssertion,
 } from '../tools/assert-perkins-integration-review-baseline.mjs';
@@ -34,7 +35,7 @@ const RESOLVED_INSTEAD = 'Error: promise resolved "{ …(11) }" instead of rejec
  * argument after the script path (the tool takes no flags), quotes removed,
  * a plain word — a shell expansion or operator is no leg. */
 const legOf = (command: string): string | undefined =>
-  /assert-perkins-integration-review-baseline\.mjs["']?\s+["']?([A-Za-z0-9._-]+)["']?(?=[\s;&|()<>`]|$)/u.exec(command)?.[1];
+  /assert-perkins-integration-review-baseline\.mjs["']?\s+(["']?)([A-Za-z0-9._-]+)\1(?=[\s;&|()<>`]|$)/u.exec(command)?.[2];
 
 describe('perkins integration R4 fail-before classifier', () => {
   it('accepts the named fast mutation refusal and all three named heavy assertions', () => {
@@ -186,6 +187,21 @@ describe('perkins integration R4 fail-before classifier', () => {
     for (const frame of ['    at fn (test/my helpers/h.ts:1:2)', '    at FILE:///repo/test/helpers/h.ts:1:2', '    at fn (FILE:///repo/test/helpers/h.ts:1:2)']) {
       expect(isBehavioralAssertion(`AssertionError: x\n${frame}\n    at /repo/test/a.test.ts:1:2`), frame).toBe(false);
     }
+    // ...and so is a bare relative helper location; a bare clock time stays prose.
+    expect(isBehavioralAssertion('AssertionError: x\n    at test/helpers/h.ts:1:2\n    at /repo/test/a.test.ts:1:2')).toBe(false);
+    expect(isBehavioralAssertion('AssertionError: x\n    at 12:30:15\n    at /repo/test/a.test.ts:1:2')).toBe(true);
+    // An upper-case file scheme is decoded like a lower-case one.
+    for (const frame of ['    at FILE:///repo/test/a.test.ts:1:2', '    at fn (FILE:///repo/test/a.test.ts:1:2)']) {
+      expect(isBehavioralAssertion(`AssertionError: x\n${frame}`), frame).toBe(true);
+    }
+    // Any line terminator separates frames: a helper frame cannot hide behind one.
+    for (const separator of ['\r', '\u2028', '\u2029']) {
+      expect(isBehavioralAssertion(`AssertionError: x${separator}    at /repo/test/helpers/h.ts:1:2${separator}    at /repo/test/a.test.ts:1:2`), JSON.stringify(separator)).toBe(false);
+    }
+    // A stack of only generated frames, bare or parenthesised, decides nothing: refused.
+    expect(isBehavioralAssertion('AssertionError: x\n    at <anonymous>:1:1\n    at evalmachine.<anonymous>:2:3')).toBe(false);
+    // A path holding "(eval at …)" is no eval frame.
+    expect(isBehavioralAssertion('AssertionError: x\n    at /repo/test/(eval at x)/a.test.ts:1:2')).toBe(true);
     // Generated code (new Function, vm scripts) names no file: passed over.
     expect(isBehavioralAssertion('AssertionError: x\n    at fn (<anonymous>:1:1)\n    at run (evalmachine.<anonymous>:2:3)\n    at /repo/test/a.test.ts:1:2')).toBe(true);
     // A path that merely contains "eval at " is not an eval frame.
@@ -268,10 +284,22 @@ describe('perkins integration R4 fail-before classifier', () => {
     for (const [name, command] of scopes) expect(Object.keys(BASELINE_TITLES), name).toContain(legOf(command));
   });
 
+  it('names why a failure is no behavioral RED, line and all', () => {
+    expect(behavioralRefusal('AssertionError: expected list\n    at least 3 items (see notes.md:1:2)'))
+      .toBe('a frame names a location that cannot be judged (rephrase prose shaped like a frame): "at least 3 items (see notes.md:1:2)"');
+    expect(behavioralRefusal('AssertionError: x\n    at stage (/repo/test/helpers/h.ts:1:2)')).toBe('the assertion was raised outside a test file, in "/repo/test/helpers/h.ts"');
+    expect(behavioralRefusal('TypeError: nope')).toBe('its first line is no assertion or rejects/resolves report: "TypeError: nope"');
+    expect(behavioralRefusal('AssertionError: x\n    at <anonymous>')).toBe('its stack names only runtime, machinery or generated frames');
+    expect(behavioralRefusal('AssertionError: x\n    at /repo/test/a.test.ts:1:2')).toBeNull();
+    expect(() => assertPerkinsIntegrationBaseline('fast', report(red(FAST_TITLE, ['AssertionError: x\n    at stage (/repo/test/helpers/h.ts:1:2)']))))
+      .toThrow(/failed before its assertion; setup\/import failure is not RED evidence \(the assertion was raised outside a test file, in "\/repo\/test\/helpers\/h\.ts"\)/u);
+  });
+
   it('reads a scope\'s classifier leg as the tool does: its first argument, a plain word', () => {
     expect(['x.mjs fast r.json', 'assert-perkins-integration-review-baseline.mjs "r8" "$d/r.json"', "assert-perkins-integration-review-baseline.mjs' heavy;",
-      'assert-perkins-integration-review-baseline.mjs r9&&true', 'assert-perkins-integration-review-baseline.mjs r10)', 'assert-perkins-integration-review-baseline.mjs $LEG r.json']
-      .map(legOf)).toEqual([undefined, 'r8', 'heavy', 'r9', 'r10', undefined]);
+      'assert-perkins-integration-review-baseline.mjs r9&&true', 'assert-perkins-integration-review-baseline.mjs r10)', 'assert-perkins-integration-review-baseline.mjs $LEG r.json',
+      'assert-perkins-integration-review-baseline.mjs "r8\' r.json']
+      .map(legOf)).toEqual([undefined, 'r8', 'heavy', 'r9', 'r10', undefined, undefined]);
   });
 
   it('refuses an unparseable report, a missing named regression and an unknown leg', () => {

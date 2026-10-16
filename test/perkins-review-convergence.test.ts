@@ -556,7 +556,7 @@ describe('integration unit fail-loud guards (#393)', () => {
     const head = repo.head();
     const status = () => repo.git(['status', '--porcelain', '--ignored']);
     const before = status();
-    for (const [count, directory] of [[0, 'many'], [100_001, 'many'], [1, '../out'], [1, '/abs'], [1, 'C:foo'], [1, '.git/objects2'], [1, '.GIT/objects2'], [1, 'a/.Git'], [1, '.git./x'], [1, '.git /x'], [1, 'GIT~1/x'], [1, '.g\u200bit/x'], [1, 'a/./b'], [1, 'a\0b']] as const) {
+    for (const [count, directory] of [[0, 'many'], [100_001, 'many'], [1, '../out'], [1, '/abs'], [1, 'C:foo'], [1, '.git/objects2'], [1, '.GIT/objects2'], [1, 'a/.Git'], [1, '.git./x'], [1, '.git /x'], [1, 'GIT~1/x'], [1, 'git~2/x'], [1, '.g\u200bit/x'], [1, '.\uff47it/x'], [1, '.git::$INDEX_ALLOCATION/x'], [1, '.. /x'], [1, 'a/./b'], [1, 'a\0b']] as const) {
       expect(() => commitManyPaths(repo, count, directory), `${String(count)} ${directory}`).toThrow(/^commitManyPaths (?:needs a path count|directory must be a relative path)/u);
     }
     // Nothing was written or committed by any refusal.
@@ -591,6 +591,8 @@ describe('integration unit fail-loud guards (#393)', () => {
     expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} short M\0src/a.ts\0`))).toThrow(/unparseable record/u);
     expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${sha} M\0`))).toThrow(/record with no path/u);
     expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${sha} M`))).toThrow(/record with no path/u);
+    // A record without its path refuses as such, before its status is judged.
+    expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${sha} U\0`))).toThrow(/^git diff --raw produced a record with no path$/u);
     expect(() => parseRawChanges(Buffer.from([0x3a, 0xff, 0x00]))).toThrow(/not valid UTF-8/u);
     // Only the trailing NUL's empty field is skipped: stray output and a
     // repeated path fail closed instead of shrinking the reviewed unit.
@@ -619,8 +621,6 @@ describe('integration unit fail-loud guards (#393)', () => {
     // A malformed header is unparseable, whatever letter it ends in.
     expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} short R\0a.ts\0`))).toThrow(/unparseable record \(it looks like a rename\/copy record/u);
     // Only A/D/M/T statuses are expected from a no-renames commit diff.
-    // A record without its path refuses as such, before its status is judged.
-    expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${sha} U\0`))).toThrow(/^git diff --raw produced a record with no path$/u);
     for (const status of ['U', 'X', 'B']) {
       expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${sha} ${status}\0a.ts\0`)), status).toThrow(`unexpected status "${status}" for "a.ts"`);
     }

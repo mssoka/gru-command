@@ -8,4 +8,6 @@ export declare const BASELINE_TITLES: {
 };
 export declare function frameLocation(line: string): string | undefined;
 export declare function isBehavioralAssertion(message: string): boolean;
+/** Why a failure message is no behavioral RED, or null when it is one. */
+export declare function behavioralRefusal(message: unknown): string | null;
 export declare function assertPerkinsIntegrationBaseline(leg: string, report: unknown): readonly string[];
