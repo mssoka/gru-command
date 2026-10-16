@@ -3287,6 +3287,30 @@ describe('ReviewMcpBridge fail-closed guards', () => {
       await settingsLifetime('error');
     });
 
+    it('a child whose error and close land in the same tick, before the disposal settles, is ceased and releases its files (#359)', async () => {
+      const fx = fixture({ killGraceMs: 5 });
+      const handle = await fx.runtime.spawn('gru', { workerVerification: policy });
+      const owned = handle as unknown as { params: { verificationSettingsFile?: string }; live: ChildProcess | null };
+      const file = owned.params.verificationSettingsFile as string;
+      const policyFile = join(dirname(file), 'policy.json');
+      // The close alone is the proof: this fake never records an exit code or signal.
+      const original = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null, kill: vi.fn(() => true) }) as unknown as ChildProcess;
+      owned.live = original;
+      vi.useFakeTimers();
+      try {
+        const disposing = handle.dispose();
+        original.emit('error', new Error('owned fixture transport error'));
+        original.emit('close', null, 'SIGTERM');
+        await vi.advanceTimersByTimeAsync(40);
+        await disposing;
+        expect(handle.cessationEvidence!()).toBe('ceased');
+        expect([existsSync(file), existsSync(policyFile)]).toEqual([false, false]);
+      } finally {
+        vi.useRealTimers();
+        await fx.runtime.dispose();
+      }
+    });
+
     /** A controllable policy child: the spawn seam returns it for the turn so
      * an owned error can clear the live slot without a real close. */
     function policyChild(): ChildProcess & { kill: ReturnType<typeof vi.fn> } {
