@@ -87,10 +87,21 @@ const STACK_LINE = new RegExp(String.raw`^\s+at (?:async )?(?:\S.* \((?:.*:\d+:\
 const FRAME_OPENING = /^\s+at \S/u;
 const MAX_FRAME_LINE = 2048;
 /** An indented `at …` line naming a location: one that ends in
- * `:line:column`, or holds a path-like token (a `.` or `/` in it) followed
- * by `:line` anywhere — with or without a column, closed or not. A bare clock
- * time, and prose whose numbers are not attached to a path, are not. */
-const LOCATED = /:\d+:\d+\)?$|[^\s:()]*[./][^\s:()]*:\d+/u;
+ * `:line:column`, or holds a path-like token — a `/` in it, or a file
+ * extension (`.ts`, `.md`) — followed by `:line` anywhere, with or without a
+ * column, closed or not. A bare clock time, and prose whose numbers are not
+ * attached to a path (`1.5:1`, `v2.0:3`), are not. Linear in the line. */
+const PATH_LIKE = /\/|\.[A-Za-z][A-Za-z0-9]*$/u;
+function namesLocation(line) {
+  if (/:\d+:\d+\)?$/u.test(line)) return true;
+  for (const token of line.split(/[\s()]+/u)) {
+    const parts = token.split(':');
+    for (let index = 0; index < parts.length - 1; index += 1) {
+      if (PATH_LIKE.test(parts[index]) && /^\d/u.test(parts[index + 1])) return true;
+    }
+  }
+  return false;
+}
 const CLOCK_PROSE = /^\s+at \d+(?::\d+)+$/u;
 /** A line as the grammar judges it: trailing whitespace dropped, and any run
  * of blanks after `at` read as one — layout never hides a frame. */
@@ -160,8 +171,9 @@ export function frameLocation(line) {
   const body = line.replace(/^\s+at /u, '').replace(/^async /u, '');
   if (TOKEN_FRAME.test(body) || GENERATED_LOCATION.test(body)) return null;
   // An eval frame by the frame grammar — `eval at <origin>`, or `<fn> (eval
-  // at <origin>…)` with `<fn>` one name, optionally `new `/`async `-prefixed
-  // or `[as …]`-aliased — never a path that merely contains the text.
+  // at <origin>…)` with `<fn>` one name, optionally `new `-prefixed (an
+  // `async ` prefix is already stripped above) or `[as …]`-aliased — never a
+  // path that merely contains the text.
   const innermostEval = /^(?:eval at |(?:new )?[^\s(]+(?: \[as [^\]]+\])? \(eval at )/u.test(body) ? body.lastIndexOf('eval at ') : -1;
   if (innermostEval !== -1) {
     const origin = body.slice(innermostEval + 'eval at '.length);
@@ -204,24 +216,22 @@ export function behavioralRefusal(message) {
   if (typeof message !== 'string') return 'the failure message is not text';
   const [head = '', ...rest] = message.split(LINE_BREAK);
   if (!ASSERTION_HEAD.test(head) && !PROMISE_REPORT_HEAD.test(head)) return `its first line is no assertion or rejects/resolves report: ${quoted(head)}`;
-  const lines = rest.map(frameText);
-  // A frame-opening line too long to judge refuses (fail closed).
-  const overlong = lines.find((line) => line.length > MAX_FRAME_LINE && FRAME_OPENING.test(line));
-  if (overlong !== undefined) return `a frame-opening line is longer than ${String(MAX_FRAME_LINE)} characters: ${quoted(overlong)}`;
-  // Every frame, and every located `at …` line the grammar cannot read —
-  // classified once; an unreadable one refuses where it stands, below.
-  const stack = lines.filter((line) => line.length <= MAX_FRAME_LINE && FRAME_OPENING.test(line))
-    .map((line) => ({ line, readable: STACK_LINE.test(line) }))
-    .filter(({ line, readable }) => readable || (LOCATED.test(line) && !CLOCK_PROSE.test(line)));
-  // A report without any stack frames is judged by its head alone.
-  if (stack.length === 0) return null;
-  // The first frame outside the runtime and assertion machinery decides.
-  // Token frames name nothing and are passed over; a frame whose location
-  // cannot be judged — before the deciding one — refuses, as does a stack
-  // that is all tokens or all machinery: never an open door for a
-  // helper-raised assertion (#394). Frames after the deciding one are its
-  // callers, never the raiser: they are not judged.
-  for (const { line, readable } of stack) {
+  // Lines are judged in order, up to the deciding frame: the first frame
+  // outside the runtime and assertion machinery decides. Token frames name
+  // nothing and are passed over; before the deciding frame, a frame-opening
+  // line too long to judge, or a frame (or located `at …` line) whose
+  // location cannot be judged, refuses — as does a stack that is all tokens
+  // or all machinery: never an open door for a helper-raised assertion
+  // (#394). Lines after the deciding frame are its callers, never the
+  // raiser: they are not judged at all.
+  let sawFrame = false;
+  for (const raw of rest) {
+    const line = frameText(raw);
+    if (!FRAME_OPENING.test(line)) continue;
+    if (line.length > MAX_FRAME_LINE) return `a frame-opening line is longer than ${String(MAX_FRAME_LINE)} characters: ${quoted(line)}`;
+    const readable = STACK_LINE.test(line);
+    if (!readable && (!namesLocation(line) || CLOCK_PROSE.test(line))) continue;
+    sawFrame = true;
     const file = readable ? frameLocation(line) : undefined;
     if (file === null) continue;
     if (file === undefined) return `a frame names a location that cannot be judged (rephrase prose shaped like a frame): ${quoted(line.trim())}`;
@@ -229,7 +239,8 @@ export function behavioralRefusal(message) {
     const testFile = /\.test\.[cm]?[jt]s$/u.test(file) && !file.includes('/node_modules/') && !file.includes('/test/helpers/');
     return testFile ? null : `the assertion was raised outside a test file, in ${JSON.stringify(file)}`;
   }
-  return 'its stack names only runtime, machinery or generated frames';
+  // A report without any stack frames is judged by its head alone.
+  return sawFrame ? 'its stack names only runtime, machinery or generated frames' : null;
 }
 
 /**

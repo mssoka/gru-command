@@ -7,12 +7,13 @@ import type { FixtureRepo } from './fixture-repo.js';
  * or spaces (Windows), any case. */
 function foldedSegment(part: string): string {
   const folded = part.normalize('NFKC').replace(/\p{Default_Ignorable_Code_Point}/gu, '');
-  // A stream suffix (`a:b`) or a reserved device name folds to nothing:
-  // refused, never judged as another name.
-  if (folded.includes(':') || /^(?:con|prn|aux|nul|com\d|lpt\d)(?:\..*)?$/iu.test(folded)) return '';
   // Windows drops trailing dots and blanks: a segment of only those (`.`,
-  // `..`, `...`, `. .`) folds to nothing too.
-  return folded.replace(/[.\s]+$/u, '').toLowerCase();
+  // `..`, `...`, `. .`) folds to nothing.
+  const bare = folded.replace(/[.\s]+$/u, '');
+  // A stream suffix (`a:b`) or a reserved device name (with any extension or
+  // trailing blanks) folds to nothing too: refused, never judged as another name.
+  if (bare.includes(':') || /^(?:con|prn|aux|nul|com\d|lpt\d|conin\$|conout\$|clock\$)(?:\.[\s\S]*)?$/iu.test(bare)) return '';
+  return bare.toLowerCase();
 }
 /** A name a filesystem may map onto `.git`, including the 8.3 short names
  * `git~N`. */
@@ -31,7 +32,7 @@ export function commitManyPaths(repo: FixtureRepo, count: number, directory = 'm
     throw new Error(`commitManyPaths needs a path count from 1 to 100000 (got ${String(count)})`);
   }
   if (directory === '' || isAbsolute(directory) || /^[A-Za-z]:/u.test(directory) || directory.includes('\0') ||
-      directory.split(/[\\/]/u).some((part) => { const folded = foldedSegment(part); return folded === '..' || folded === '.' || folded === '' || isGitAlias(part); })) {
+      directory.split(/[\\/]/u).some((part) => part === '.' || part === '..' || foldedSegment(part) === '' || isGitAlias(part))) {
     throw new Error(`commitManyPaths directory must be a relative path inside the fixture's work tree (got ${JSON.stringify(directory)})`);
   }
   if (existsSync(join(repo.path, directory))) throw new Error(`commitManyPaths directory already exists: ${directory}`);

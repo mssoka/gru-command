@@ -317,9 +317,19 @@ describe('perkins integration R4 fail-before classifier', () => {
     for (const frame of ['    at fn (test/x.ts:12)', '    at fn (/repo/test/helpers/h.ts:1:2) extra']) {
       expect(behavioralRefusal(`AssertionError: x\n${frame}\n    at /repo/test/a.test.ts:1:2`), frame).toMatch(/^a frame names a location that cannot be judged/u);
     }
-    // Frames after the deciding test-file frame are its callers: not judged.
+    // Frames after the deciding test-file frame are its callers: not judged —
+    // an unreadable one, or one too long to judge.
     expect(behavioralRefusal('AssertionError: x\n    at /repo/test/a.test.ts:1:2\n    at stage:1:2')).toBeNull();
-    // A huge line is quoted from a bounded prefix, cut and marked.
+    expect(behavioralRefusal(`AssertionError: x\n    at /repo/test/a.test.ts:1:2\n    at ${'a'.repeat(3000)}:1:2`)).toBeNull();
+    // Prose whose numbers are not attached to a path is no location.
+    for (const prose of ['    at version 1.2:3 failed', '    at least 1.5:1 ratio', '    at v2.0:3 sites']) {
+      expect(behavioralRefusal(`AssertionError: x\n${prose}\n    at /repo/test/a.test.ts:1:2`), prose).toBeNull();
+    }
+    // A long dotted line is judged in linear time (no backtracking blow-up).
+    const started = performance.now();
+    expect(behavioralRefusal(`AssertionError: x\n    at ${'a.'.repeat(1000)}\n    at /repo/test/a.test.ts:1:2`)).toBeNull();
+    expect(performance.now() - started).toBeLessThan(500);
+    // A huge line is quoted cut and marked (the prefix bound itself is not observable here).
     expect(behavioralRefusal(`TypeError: ${'z'.repeat(5_000_000)}`)).toBe(`its first line is no assertion or rejects/resolves report: ${JSON.stringify(`TypeError: ${'z'.repeat(149)}`)}…`);
     // A quoted line is cut on a code point, never inside a surrogate pair.
     const emoji = behavioralRefusal(`TypeError: ${'😀'.repeat(200)}`)!;
