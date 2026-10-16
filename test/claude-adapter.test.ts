@@ -2616,22 +2616,33 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       await handle.dispose();
     });
 
-    it('a directive turn whose CLI never starts leaves no private settings behind', async () => {
+    it('a directive turn whose CLI never starts leaves no private settings behind; one that started keeps them until its close', async () => {
       const settingsOf = (args: readonly string[]): string => args[args.indexOf('--settings') + 1]!;
-      for (const mode of ['throws', 'errors'] as const) {
+      for (const mode of ['throws', 'errors', 'errors-while-live'] as const) {
         let settings = '';
+        let live: (EventEmitter & { killed: string[] }) | null = null;
         const spawnProcess = ((_binary: string, args: readonly string[]) => {
           settings = settingsOf(args);
           if (mode === 'throws') throw new Error('EAGAIN: cannot fork');
-          const child = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), pid: undefined, exitCode: null, signalCode: null, kill: () => true });
+          const child = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+            pid: mode === 'errors-while-live' ? 4242 : undefined, exitCode: null, signalCode: null, killed: [] as string[],
+            kill: (signal: string) => { child.killed.push(signal); return true; } });
+          live = child;
           setImmediate(() => child.emit('error', Object.assign(new Error('spawn claude ENOENT'), { code: 'ENOENT' })));
           return child as unknown as ChildProcess;
         }) as unknown as typeof spawn;
-        const fx = fixture({ spawnProcess });
+        const fx = fixture({ spawnProcess, killGraceMs: 50 });
         const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
         await expect(handle.prompt('follow it', { directive: { identity: identityFor(`claude-nospawn-${mode}`), beforeAdmission: () => {}, onAdmitted: () => {} } }), mode)
           .rejects.toThrow(/claude process failed to spawn/u);
         expect(settings, mode).not.toBe('');
+        if (mode === 'errors-while-live') {
+          // A CLI that did start keeps its settings until its close, and is ended so that close comes.
+          expect(existsSync(settings), mode).toBe(true);
+          expect(live!.killed[0], mode).toBe('SIGTERM');
+          live!.emit('close', null, 'SIGTERM');
+          await new Promise((resolve) => setImmediate(resolve));
+        }
         expect(existsSync(settings), mode).toBe(false);
         await handle.dispose();
       }

@@ -2048,6 +2048,8 @@ export class ClaudeCodeHandle implements AgentHandle {
                 // A lost frame leaves the directive's record incomplete: no delivery.
                 try {
                   if (error != null) this.failDirective(turn, new DirectiveCheckpointError(`directive transcript write failed: ${error.message}`), abortTurn);
+                } catch (failure) {
+                  this.log('error', 'directive failure handling threw after a lost transcript write', { error: String(failure) });
                 } finally {
                   resolveWritten();
                 }
@@ -2081,8 +2083,10 @@ export class ClaudeCodeHandle implements AgentHandle {
           turnStarted = true;
           const init = translator.init;
           if (init !== null && init.sessionId !== params.sessionId) {
-            // Ends stdin too (a directive turn keeps it open) and escalates
-            // to SIGKILL for a CLI that ignores SIGTERM.
+            // A directive refuses everything after this (admission, tools,
+            // completion). Ends stdin too (a directive turn keeps it open)
+            // and escalates to SIGKILL for a CLI that ignores SIGTERM.
+            if (turn !== null) turn.failure ??= new DirectiveCheckpointError('the CLI reported a foreign session');
             abortTurn(
               `session id mismatch: requested ${params.sessionId}, claude reported ` +
                 `${init.sessionId || '(empty)'} — refusing to continue a foreign session`,
@@ -2156,9 +2160,10 @@ export class ClaudeCodeHandle implements AgentHandle {
         this.onInfraError(error);
         failTurn(`claude process failed to spawn: ${String(error)}`);
         parser.end();
-        // A child that never started can never read its settings; a live one
-        // keeps them until its close.
+        // A child that never started can never read its settings. A live one
+        // keeps them until its close, and is ended so that close comes.
         if (child.pid === undefined) turn?.settings.dispose();
+        else if (turn !== null) abortTurn(`claude process failed: ${String(error)}`);
         transcript.end(() => settle(new Error(failure)));
       });
       child.on('close', (code: number | null, signal: NodeJS.Signals | null) => {

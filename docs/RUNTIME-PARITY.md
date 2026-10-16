@@ -173,8 +173,8 @@ writes each runtime's own record shape during a resumed turn.
   header (session id and cwd), which directive admission binds. A directive
   and a re-brief both run in the minion's recorded session, so two kinds of
   Claude session refuse them by name before anything is bound:
-  - one started before the header existed (GC writes it at the start of
-    every Claude session it creates since #424);
+  - one started before GC wrote session headers (#424): it has none, while
+    every session GC starts now begins with one;
   - one that loads ambient MCP tools (`[runtimes.claude-code] mcp`). This is
     intentional: the host fences every tool it lists, and it cannot list tools
     it does not know.
