@@ -409,8 +409,9 @@ lifecycle fact — so a settled report read as independent coverage.
   RESOLVED target, so an abbreviated `target_sha` never splits already-owned coverage.
 - **Delivered (#360).** The admitted package is the reviewer's input: its briefing
   carries a `BLIND INPUT PACKAGE` block with the exact diff and files, fenced and
-  framed as data (a package file path holding a control character is refused, so
-  nothing can escape a fence). The package bytes are kept
+  framed as data (a package file path holding a control, format — bidi,
+  zero-width — or line-separator character is refused, so nothing can escape a
+  fence or disguise its heading). The package bytes are kept
   (`review.blind-input-package`, written before the admission), so a fresh
   replacement reviewer spawned by provider recovery gets the same block; a resumed
   session already holds it. An attested reviewer whose package was not kept (one
@@ -438,12 +439,13 @@ derived only from the admission, `review.blind-access-observed` and
 scanned at turn settle (grep lines landing in excluded paths, paged reads
 returning history-bearing text, and any file-content tool call — pi `read`/`edit`,
 Claude `Read`/`Edit`/`MultiEdit`/`NotebookRead`/`NotebookEdit`, and a content
-search (pi `grep`, Claude `Grep`) pointed at one file — whose result returned,
-even empty or binary, for an excluded file, however its bytes look; an absolute
-path inside the job's lane is judged by its repository path, one outside it is
-outside the package, and the repository root itself is no file. A search over a
-directory, and a listing (`Glob`, `find`, `ls`), is judged by the paths and text
-its output shows, never by the directory it named). A settled session whose
+search (pi `grep`, Claude `Grep`) — whose result returned, even empty or binary,
+for a path that is excluded, however its bytes look. A call is judged by the path
+it names: an absolute path inside the job's lane by its repository path, one
+outside the checkout as outside the package, and the repository root itself as no
+file. A directory inside the checkout seldom matches a file glob, so a search over
+one is judged by the paths and text its output shows; a listing (`Glob`, `find`,
+`ls`) always is). A settled session whose
 transcript cannot be read at all (absent, unreadable or over the size bound)
 records `job.blind-access-unobservable` once while it stands — never an empty,
 clean-reading observation — and its coverage is `unobserved`, not qualifying,

@@ -162,6 +162,13 @@ describe('an unread session stands until a later scan of that same session reads
     expect(h.ledger.listJobEventsByKinds('job-no-transcript', [BLIND_ACCESS_UNOBSERVABLE_EVENT])).toHaveLength(1);
     observeBlindSessionAccess(h.ledger, 'job-no-transcript', sessionB);
     expect(blindCoverageOf(h.ledger, 'job-no-transcript')).toMatchObject({ state: 'unobserved', qualifying: false });
+    // Judged over the whole history: more later scans than any listing window
+    // (other sessions, which never clear it) still leave it standing.
+    h.admit('job-long-history');
+    observeBlindSessionAccess(h.ledger, 'job-long-history', null);
+    for (let scan = 0; scan < 250; scan += 1) recordObservedAccess(h.ledger, 'job-long-history', [], 'session', `other-session-${String(scan)}`);
+    expect(h.ledger.listJobEventsByKinds('job-long-history', [BLIND_ACCESS_EVENT], { limit: 1_000 })).toHaveLength(250);
+    expect(blindCoverageOf(h.ledger, 'job-long-history')).toMatchObject({ state: 'unobserved', qualifying: false });
     h.dispose();
   });
 });
@@ -243,6 +250,23 @@ describe('real persisted transcripts (#360 R5-V1 round 1)', () => {
     expect(blindCoverageOf(h.ledger, 'job-edit')).toMatchObject({ state: 'invalidated', prohibitedAccess: 2 });
     const record = h.ledger.latestJobEvent('job-edit', BLIND_ACCESS_EVENT)?.payload as { prohibited: { path: string }[] };
     expect(record.prohibited.map((hit) => hit.path)).toEqual(['_bmad-output/a.md', '_bmad-output/state.json']);
+    // pi's `grep` names its path the same way.
+    const pi = join(dir, 'pi.jsonl');
+    writeFileSync(pi, [
+      { type: 'session', version: 3, id: 'fixture-session', cwd: '/lanes/job-1' },
+      { type: 'message', id: 'm1', message: { role: 'assistant', content: [
+        { type: 'toolCall', id: 'call-grep-file', name: 'grep', arguments: { pattern: 'state', path: '/lanes/job-1/_bmad-output/state.json' } },
+        { type: 'toolCall', id: 'call-grep-dir', name: 'grep', arguments: { pattern: 'x', path: '/lanes/job-1/src' } },
+      ] } },
+      { type: 'message', id: 'm2', message: { role: 'toolResult', toolCallId: 'call-grep-file', toolName: 'grep', content: [{ type: 'text', text: '"state": "done"' }], isError: false } },
+      { type: 'message', id: 'm3', message: { role: 'toolResult', toolCallId: 'call-grep-dir', toolName: 'grep', content: [{ type: 'text', text: 'No matches found' }], isError: false } },
+    ].map((line) => JSON.stringify(line)).join('\n') + '\n');
+    expect(readSessionToolResults(pi)?.map((result) => result.readPath ?? null)).toEqual(['/lanes/job-1/_bmad-output/state.json', '/lanes/job-1/src']);
+    h.admit('job-pi-grep');
+    h.lane('job-pi-grep', '/lanes/job-2');
+    writeFileSync(pi, readFileSync(pi, 'utf8').replaceAll('/lanes/job-1', '/lanes/job-2'));
+    observeBlindSessionAccess(h.ledger, 'job-pi-grep', pi);
+    expect(blindCoverageOf(h.ledger, 'job-pi-grep')).toMatchObject({ state: 'invalidated', prohibitedAccess: 1 });
     h.dispose();
   });
 });

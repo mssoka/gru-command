@@ -291,6 +291,16 @@ export function normalizeRepoPath(path: string): string {
   return path.replace(/\\/gu, '/').split('/').filter((segment) => segment !== '.' && segment !== '').join('/');
 }
 
+/** Control (C0, DEL, C1), format (bidi, zero-width, BOM) and line/paragraph
+ * separator characters: none belongs in a path a briefing shows. */
+const UNSAFE_PATH_CHARACTER = /[\p{Cc}\p{Cf}\u2028\u2029]/u;
+
+/** A path with each unsafe character spelled as its `\uXXXX` escape, so a
+ * refusal that names it cannot itself break a line. */
+function escapeUnsafePathCharacters(path: string): string {
+  return path.replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`);
+}
+
 /** Why a package path is not admissible, or null when it is. */
 export function classifyBlindPath(rawPath: string, rule: BlindIsolationRule): string | null {
   const path = rawPath.replace(/\\/gu, '/');
@@ -695,10 +705,11 @@ export function evaluateBlindPackage(pkg: BlindInputPackage, rule: BlindIsolatio
   const fileRecords: { path: string; sha256: string; blobSha: string }[] = [];
   for (const file of files) {
     // A file's path heads its fenced bytes in the reviewer's briefing: a
-    // control or line-separator character there would put text outside the
-    // data fence (C0, DEL, C1, U+2028, U+2029).
-    if ([...file.path].some((char) => { const code = char.charCodeAt(0); return code < 0x20 || (code >= 0x7f && code <= 0x9f) || code === 0x2028 || code === 0x2029; })) {
-      violations.push({ code: 'excluded-path', where: JSON.stringify(file.path), detail: `invalid package path ${JSON.stringify(file.path)} (holds a control character)` });
+    // control, format (bidi, zero-width) or line-separator character there
+    // could put text outside the data fence or disguise the heading.
+    if (UNSAFE_PATH_CHARACTER.test(file.path)) {
+      const shown = escapeUnsafePathCharacters(file.path);
+      violations.push({ code: 'excluded-path', where: shown, detail: `invalid package path "${shown}" (holds a control, format or line-separator character)` });
       continue;
     }
     const reason = classifyBlindPath(file.path, rule);
