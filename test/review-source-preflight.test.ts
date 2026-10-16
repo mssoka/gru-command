@@ -225,13 +225,18 @@ describe('review source preflight (service)', () => {
     }
   });
 
-  it('fails loud when review-source fields are supplied but no preflight is wired, and rejects them on non-review jobs', async () => {
+  it('fails loud when review-source fields or a blind package are supplied but no preflight is wired, and rejects them on non-review jobs', async () => {
     const f = sharedOriginFixture();
     const bare = rig({ wired: false });
     try {
       await expect(bare.service.dispatch(review(f.full.path, f.target, { targetBase: f.base }))).rejects.toThrow(/review source preflight is not wired/u);
       await expect(bare.service.dispatch({ ...review(f.full.path, f.target), deliverable: 'investigation', targetBase: f.base }))
         .rejects.toThrow(/only apply to review jobs/u);
+      // A blind input package is bound by the preflight too: unwired, it is refused by name (#360 R5-B2).
+      await expect(bare.service.dispatch(review(f.full.path, f.target, {
+        reviewRole: 'blind', inputPackage: { baseSha: f.base, targetSha: f.target, files: [{ path: 'src/a.ts', content: 'x\n' }] },
+      }))).rejects.toThrow(/refusing to admit a blind input package whose bytes cannot be bound/u);
+      expect(bare.ledger.getJob('rev-1')).toBeNull();
       expect(bare.spawns.count).toBe(0);
     } finally {
       bare.close();
