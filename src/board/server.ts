@@ -90,10 +90,12 @@ interface Client {
   pongMisses: number;
 }
 
-/** A thrown value's text for a reason or detail: never blank, never a second throw. */
-function failureText(error: unknown): string {
+/** A thrown value's text for a reason or detail: never blank, never a second
+ * throw. With `messageOnly`, an Error is named by its message (no name
+ * prefix) — read inside the same guard. */
+function failureText(error: unknown, messageOnly = false): string {
   try {
-    const text = String(error);
+    const text = messageOnly && error instanceof Error ? error.message : String(error);
     return text.trim() === '' ? 'an error with no text' : text;
   } catch {
     return 'an error that cannot be printed';
@@ -839,7 +841,7 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
                   rearm = outcome.superseded === true ? 'superseded' : outcome.rearmed === false ? 'not_applicable' : 'accepted';
                 }
               } catch (error) {
-                const message = failureText(error instanceof Error ? error.message : error);
+                const message = failureText(error, true);
                 ledger.appendCustomEvent({
                   kind: 'notification.rearm-failed',
                   payload: { id, error: message },

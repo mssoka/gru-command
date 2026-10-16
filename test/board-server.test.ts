@@ -2162,12 +2162,17 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
     for (const [thrown, named] of [
       [Object.assign(new Error(''), { toString: () => '' }), 'an error with no text'],
       [{ toString: () => { throw new Error('no'); } }, 'an error that cannot be printed'],
+      // An Error whose message itself cannot be read is named the same way.
+      [Object.defineProperty(new Error('x'), 'message', { get: () => { throw new Error('no'); } }), 'an error that cannot be printed'],
     ] as const) {
       const failing = await boot('board-test-token', { onNotificationDisposition: () => { throw thrown; } });
       try {
         failing.api.recordNotification({ id: 'machine-silent', kind: 'supervision.breaker', routing: 'action-required', severity: 'error', title: 'Lane stopped', detail: 'breaker open' });
         expect(await postJson(failing.port, '/api/notifications/machine-silent/disposition', 'board-test-token', { detail: 'try' }), named)
           .toMatchObject({ status: 502, body: { error: 'rearm_failed', detail: named } });
+        // The ledger records the same text the answer gives.
+        expect(failing.api.listEvents({ limit: 100 }).filter((event) => event.kind === 'notification.rearm-failed').map((event) => event.payload), named)
+          .toEqual([{ id: 'machine-silent', error: named }]);
       } finally {
         await failing.close();
       }
