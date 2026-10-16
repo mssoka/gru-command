@@ -1899,6 +1899,8 @@ export class ClaudeCodeHandle implements AgentHandle {
         return;
       }
       turn.admission = durable.then(() => {
+        // A directive that already failed admits nothing more.
+        if (turn.failure !== null) return;
         const binding = inspectDirectiveAdmission(this.sessionFile, directive.identity);
         directive.onAdmitted(binding);
         turn.admitted = binding;
@@ -2049,7 +2051,10 @@ export class ClaudeCodeHandle implements AgentHandle {
                 try {
                   if (error != null) this.failDirective(turn, new DirectiveCheckpointError(`directive transcript write failed: ${error.message}`), abortTurn);
                 } catch (failure) {
-                  this.log('error', 'directive failure handling threw after a lost transcript write', { error: String(failure) });
+                  // The directive still fails, and its CLI is still ended.
+                  turn.failure ??= failure;
+                  this.log('error', 'directive failure handling threw after a lost transcript write', { error: failure instanceof Error ? failure.stack ?? failure.message : String(failure) });
+                  try { child.kill('SIGTERM'); } catch { /* already gone */ }
                 } finally {
                   resolveWritten();
                 }
@@ -2086,7 +2091,7 @@ export class ClaudeCodeHandle implements AgentHandle {
             // A directive refuses everything after this (admission, tools,
             // completion). Ends stdin too (a directive turn keeps it open)
             // and escalates to SIGKILL for a CLI that ignores SIGTERM.
-            if (turn !== null) turn.failure ??= new DirectiveCheckpointError('the CLI reported a foreign session');
+            if (turn !== null) turn.failure ??= new DirectiveCheckpointError(`the CLI reported a foreign session (${init.sessionId || '(empty)'}, not ${params.sessionId})`);
             abortTurn(
               `session id mismatch: requested ${params.sessionId}, claude reported ` +
                 `${init.sessionId || '(empty)'} — refusing to continue a foreign session`,
@@ -2159,11 +2164,16 @@ export class ClaudeCodeHandle implements AgentHandle {
         // 'close' may never follow — settle here too (guarded).
         this.onInfraError(error);
         failTurn(`claude process failed to spawn: ${String(error)}`);
+        if (child.pid !== undefined) {
+          // A live CLI: the turn settles only from its close (one writer per
+          // session), so it is ended to make that close come; its settings
+          // stay until then.
+          abortTurn(`claude process failed: ${String(error)}`);
+          return;
+        }
+        // A child that never started can never read its settings.
         parser.end();
-        // A child that never started can never read its settings. A live one
-        // keeps them until its close, and is ended so that close comes.
-        if (child.pid === undefined) turn?.settings.dispose();
-        else if (turn !== null) abortTurn(`claude process failed: ${String(error)}`);
+        turn?.settings.dispose();
         transcript.end(() => settle(new Error(failure)));
       });
       child.on('close', (code: number | null, signal: NodeJS.Signals | null) => {

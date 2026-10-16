@@ -178,6 +178,9 @@ writes each runtime's own record shape during a resumed turn.
   - one that loads ambient MCP tools (`[runtimes.claude-code] mcp`). This is
     intentional: the host fences every tool it lists, and it cannot list tools
     it does not know.
+
+  Such a directive fails by name before anything is bound (a positive
+  no-effect), and Gru decides the next step.
 - **Directive content.** A Claude directive is text only (an image is refused
   by name): the CLI may transform an image, which would break the byte-exact
   echo admission binds.

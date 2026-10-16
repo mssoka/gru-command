@@ -2633,17 +2633,20 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         }) as unknown as typeof spawn;
         const fx = fixture({ spawnProcess, killGraceMs: 50 });
         const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
-        await expect(handle.prompt('follow it', { directive: { identity: identityFor(`claude-nospawn-${mode}`), beforeAdmission: () => {}, onAdmitted: () => {} } }), mode)
-          .rejects.toThrow(/claude process failed to spawn/u);
-        expect(settings, mode).not.toBe('');
+        const prompt = handle.prompt('follow it', { directive: { identity: identityFor(`claude-nospawn-${mode}`), beforeAdmission: () => {}, onAdmitted: () => {} } });
         if (mode === 'errors-while-live') {
-          // A CLI that did start keeps its settings until its close, and is ended so that close comes.
+          // A CLI that did start is ended (SIGTERM, then SIGKILL after the grace)
+          // and keeps its settings; the turn settles only from its close.
+          let settled = false;
+          void prompt.catch(() => {}).finally(() => { settled = true; });
+          await vi.waitFor(() => expect(live!.killed).toEqual(['SIGTERM', 'SIGKILL']));
           expect(existsSync(settings), mode).toBe(true);
-          expect(live!.killed[0], mode).toBe('SIGTERM');
-          live!.emit('close', null, 'SIGTERM');
-          await new Promise((resolve) => setImmediate(resolve));
+          expect(settled, mode).toBe(false);
+          live!.emit('close', null, 'SIGKILL');
         }
-        expect(existsSync(settings), mode).toBe(false);
+        await expect(prompt, mode).rejects.toThrow(/claude process failed to spawn/u);
+        expect(settings, mode).not.toBe('');
+        await vi.waitFor(() => expect(existsSync(settings), mode).toBe(false));
         await handle.dispose();
       }
     });
@@ -2665,10 +2668,15 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
       process.env['CLAUDE_DOUBLE_MISMATCH'] = '1';
       process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
+      const identity = identityFor('claude-foreign');
+      const admitted: DirectiveNativeBinding[] = [];
       try {
         // Its stdin stays open for the permission channel: only the abort ends it.
-        await expect(handle.prompt('follow it', { directive: { identity: identityFor('claude-foreign'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+        await expect(handle.prompt('follow it', { directive: { identity, beforeAdmission: () => {}, onAdmitted: (binding) => admitted.push(binding) } }))
           .rejects.toThrow(/session id mismatch/u);
+        // The foreign session's echo (sent before it died) admits nothing.
+        expect(admitted).toEqual([]);
+        expect(handle.inspectDirective!(identity)).toMatchObject({ state: 'unknown' });
       } finally {
         delete process.env['CLAUDE_DOUBLE_MISMATCH'];
         delete process.env['CLAUDE_DOUBLE_IGNORE_TERM'];
