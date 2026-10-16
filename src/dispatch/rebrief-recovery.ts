@@ -111,22 +111,19 @@ export interface ReconcileReport {
   readonly examined: number;
   /** Jobs whose guarded events were already landed and whose markers cleared. */
   readonly completed: number;
-  /** Jobs QUEUED for a background re-dispatch (resume or fresh worker)
-   * during this scan. The turn settles after boot; a retirement it reaches
-   * mid-turn is logged per job and audited, not counted here. */
+  /** Always 0: historical observation never re-dispatches a turn (no
+   * replay, no fresh-session fallback). Kept for the report's shape. */
   readonly redispatched: number;
   /** Jobs retired synchronously during this scan because the job is
    * terminal (one per job group with at least one marker retired in THIS
    * scan; a group partially retired now and completed by a later scan is
-   * counted by each scan that retired part of it). A retirement reached
-   * mid-turn is logged per job and audited, not counted here. */
+   * counted by each scan that retired part of it). */
   readonly retired: number;
   /** Failed historical groups retained with exact-generation recovery action
    * and a durable bounded retry; never reported as completed or replayed. */
   readonly failed: number;
-  /** Settles when every background re-dispatch has settled — resumed,
-   * escalated, or abandoned because the process is stopping. Boot does not
-   * await it (a re-brief turn is long); tests do. */
+  /** Already resolved: observation is synchronous and starts no background
+   * work. Kept so callers that await it need no change. */
   readonly settled: Promise<void>;
 }
 
@@ -328,10 +325,6 @@ export function checkRebriefTurn(ledger: Pick<LedgerApi, 'getJob' | 'listPending
   if (isJobTerminal(job.status)) throw new RebriefTurnCancelled('terminal');
 }
 
-/** Markers this process is actively recovering — a second reconcile pass
- * (same boot, or a boot racing an open recovery) never double-dispatches. */
-
-
 /** Boot wrapper reports scoped historical failures without aborting independent initialization. */
 export async function reconcilePendingRebriefs(
   deps: ReconcileRebriefDeps,
@@ -377,6 +370,10 @@ export function observePendingRebriefs(
     let expected: readonly PendingRebriefRecord[] | null = null;
     try {
       const group = deps.ledger.listPendingRebriefs({ jobId });
+      // A generation settled since the page was listed (a subscriber of an
+      // earlier group's settlement, or another pass) is gone, not broken:
+      // nothing is left to observe or escalate.
+      if (group.length === 0) continue;
       expected = group;
       examined += group.length;
       if (deps.observeBlindTurn !== undefined) {
@@ -470,13 +467,21 @@ export function observePendingRebriefs(
           deps.log?.('warn', 're-brief delivery recorded but request was superseded before clearing', { job: jobId });
           continue;
         }
-        deps.ledger.appendCustomEvent({
-          kind: 'silas.rebrief-recovered',
-          jobId,
-          payload: { path: 'delivery-only', delivered_sha: (followUp.payload as { sha: string }).sha, original_provenance: (followUp.payload as { provenance: unknown }).provenance },
-        });
-        deps.log?.('info', 're-brief delivery recorded from a crash window', { job: jobId });
+        // The settlement committed with the clear: the generation is complete
+        // whatever the audit append below meets. A lost audit is said loudly,
+        // never retained as a failed generation the next pass cannot find.
         completed += 1;
+        try {
+          deps.ledger.appendCustomEvent({
+            kind: 'silas.rebrief-recovered',
+            jobId,
+            payload: { path: 'delivery-only', delivered_sha: (followUp.payload as { sha: string }).sha, original_provenance: (followUp.payload as { provenance: unknown }).provenance },
+          });
+        } catch (error) {
+          deps.log?.('error', 're-brief recovered but its recovery audit could not be recorded', { job: jobId, error: String(error) });
+          continue;
+        }
+        deps.log?.('info', 're-brief delivery recorded from a crash window', { job: jobId });
         continue;
       }
       if (job === null) {

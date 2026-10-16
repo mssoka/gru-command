@@ -960,6 +960,51 @@ describe('re-brief restart safety (durable markers)', () => {
     expect(busSettlements).toBe(1);
   });
 
+  it('a generation settled by a subscriber while an earlier group is observed is skipped, never escalated as an incomplete pair (#363 S07-0-02)', async () => {
+    const h = makeHarness();
+    await seedPendingRebrief({ h, jobId: 'first-job' });
+    seedHistoricalCompletion(h, 'first-job');
+    await seedPendingRebrief({ h, jobId: 'second-job' });
+    seedHistoricalCompletion(h, 'second-job');
+    const second = h.ledger.listPendingRebriefs({ jobId: 'second-job' });
+    let settledBySubscriber = false;
+    h.bus.subscribe((event) => {
+      if (event.kind !== 'silas.rebrief-settled' || event.jobId !== 'first-job' || settledBySubscriber) return;
+      settledBySubscriber = h.ledger.clearPendingRebriefsIfCurrentAndSettle(second);
+    });
+    const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { limit: 100 });
+    expect(settledBySubscriber).toBe(true);
+    expect(report).toMatchObject({ completed: 1, failed: 0 });
+    expect(h.ledger.listPendingRebriefs({ jobId: 'second-job' })).toEqual([]);
+    expect(h.ledger.findNotificationByKind('silas.rebrief-unreconciled.second-job', 'active')).toBeNull();
+  });
+
+  it('a delivery-only recovery whose audit append fails is still counted completed, never retained as a failed generation (#363 S07-0-03)', async () => {
+    const h = makeHarness();
+    const jobId = 'audit-fault-job';
+    await seedPendingRebrief({ h, jobId });
+    await bindOriginalRebriefSdkOwner(h.ledger, h.ledger.listPendingRebriefs({ jobId }), { cwd: h.lanePath!, dataDir: h.dir, agentId: 'worker-1' });
+    seedCorrelatedReceipt(h, jobId, 'silas.rebrief');
+    const seam = h.ledger as unknown as { appendEvent: (fields: { kind: string }) => unknown };
+    const original = seam.appendEvent;
+    const spy = vi.spyOn(seam, 'appendEvent').mockImplementation(function (this: unknown, fields: { kind: string }) {
+      if (fields.kind === 'silas.rebrief-recovered') throw new Error('audit append failed');
+      return original.apply(this, [fields]);
+    });
+    const logged: { level: string; msg: string; fields?: Record<string, unknown> }[] = [];
+    try {
+      const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications,
+        log: (level, msg, fields) => { logged.push({ level, msg, ...(fields === undefined ? {} : { fields }) }); } }, { limit: 100 });
+      // The settlement committed: the generation is complete, not a failure to retry.
+      expect(report).toMatchObject({ completed: 1, failed: 0 });
+    } finally { spy.mockRestore(); }
+    expect(h.ledger.listPendingRebriefs({ jobId })).toEqual([]);
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-settled')).not.toBeNull();
+    expect(h.ledger.findNotificationByKind(`silas.rebrief-unreconciled.${jobId}`, 'active')).toBeNull();
+    // ...and the lost audit is said loudly, by name.
+    expect(logged).toContainEqual(expect.objectContaining({ level: 'error', msg: 're-brief recovered but its recovery audit could not be recorded', fields: expect.objectContaining({ job: jobId }) }));
+  });
+
   it('reconstructed report delivery opens its handback obligation atomically', async () => {
     const h = makeHarness(); const jobId = 'reconstructed-report-handback';
     try {
