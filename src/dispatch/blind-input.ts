@@ -58,7 +58,14 @@ export type BlindViolationCode =
   | 'digest-mismatch'
   | 'target-mismatch'
   | 'empty-package'
-  | 'package-required';
+  | 'package-required'
+  /** A diff the gate cannot read as `diff --git` sections (prose, an empty
+   * text, a preamble, an unreadable header): judged nothing, admits nothing. */
+  | 'unparsed-diff'
+  /** A package file or diff path the target's own git objects do not bear out. */
+  | 'unbound-package'
+  /** Claims inputs (required_inputs) named for a blind reviewer. */
+  | 'claims-input';
 
 export interface BlindViolation {
   readonly code: BlindViolationCode;
@@ -277,13 +284,20 @@ function outsidePackageShape(path: string): boolean {
   return slashed === '' || slashed.startsWith('/') || /^[A-Za-z]:\//u.test(slashed) || /(^|\/)\.\.(\/|$)/u.test(slashed) || slashed.includes('\0');
 }
 
+/** A repository-relative spelling with every `.` segment and empty segment
+ * dropped (`././a//b` is `a/b`): one spelling per path, so no prefix of dots
+ * can step around a glob. */
+export function normalizeRepoPath(path: string): string {
+  return path.replace(/\\/gu, '/').split('/').filter((segment) => segment !== '.' && segment !== '').join('/');
+}
+
 /** Why a package path is not admissible, or null when it is. */
 export function classifyBlindPath(rawPath: string, rule: BlindIsolationRule): string | null {
   const path = rawPath.replace(/\\/gu, '/');
   if (outsidePackageShape(path)) {
     return `invalid package path "${rawPath}" (must be a relative path inside the repository)`;
   }
-  const normalized = path.replace(/^\.\//u, '');
+  const normalized = normalizeRepoPath(path);
   if (rule.privateGlobs.some((glob) => globToRegExp(glob).test(normalized))) {
     return `"${normalized}" is private job material (planning, spec, review or triage artifacts)`;
   }
@@ -421,15 +435,82 @@ interface DiffSection {
   readonly body: string;
 }
 
-function splitDiff(text: string): readonly DiffSection[] {
-  const header = /^diff --git a\/(.+?) b\/(.+)$/u;
-  const groups: { oldPath: string; path: string; lines: string[] }[] = [];
-  for (const line of text.split('\n')) {
-    const match = header.exec(line);
-    if (match !== null) groups.push({ oldPath: match[1]!, path: match[2]!, lines: [line] });
-    else groups.at(-1)?.lines.push(line);
+/** One C-quoted git path (`"a/sp\\303\\251c\\"ial"`): the text after the
+ * quote, or null when the quoting is malformed. */
+function unquoteGitPath(quoted: string): { readonly path: string; readonly rest: string } | null {
+  const bytes: number[] = [];
+  const escapes: Record<string, number> = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, '\\': 92 };
+  for (let at = 1; at < quoted.length; at += 1) {
+    const char = quoted[at]!;
+    if (char === '"') {
+      try {
+        return { path: new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array(bytes)), rest: quoted.slice(at + 1) };
+      } catch { return null; }
+    }
+    if (char !== '\\') { bytes.push(...Buffer.from(char, 'utf8')); continue; }
+    const next = quoted[at + 1];
+    if (next === undefined) return null;
+    if (/[0-7]/u.test(next)) {
+      const octal = /^[0-7]{3}/u.exec(quoted.slice(at + 1))?.[0];
+      if (octal === undefined) return null;
+      bytes.push(Number.parseInt(octal, 8));
+      at += 3;
+      continue;
+    }
+    const code = escapes[next];
+    if (code === undefined) return null;
+    bytes.push(code);
+    at += 1;
   }
-  return groups.map((group) => ({
+  return null;
+}
+
+/** The two paths of a `diff --git` header, quoted (`"a/…" "b/…"`) or not,
+ * or null when the header cannot be read. */
+function diffHeaderPaths(line: string): { readonly oldPath: string; readonly path: string } | null {
+  const rest = line.slice('diff --git '.length);
+  if (rest.startsWith('"')) {
+    const first = unquoteGitPath(rest);
+    if (first === null || !first.path.startsWith('a/') || !first.rest.startsWith(' ')) return null;
+    const second = first.rest.slice(1);
+    if (second.startsWith('"')) {
+      const quoted = unquoteGitPath(second);
+      return quoted !== null && quoted.rest === '' && quoted.path.startsWith('b/') ? { oldPath: first.path.slice(2), path: quoted.path.slice(2) } : null;
+    }
+    return second.startsWith('b/') ? { oldPath: first.path.slice(2), path: second.slice(2) } : null;
+  }
+  const plain = /^a\/(.+?) (?:b\/(.+)|"(b\/.*)")$/u.exec(rest);
+  if (plain === null) return null;
+  if (plain[2] !== undefined) return { oldPath: plain[1]!, path: plain[2] };
+  const quoted = unquoteGitPath(`"${plain[3]!}"`);
+  return quoted !== null && quoted.rest === '' ? { oldPath: plain[1]!, path: quoted.path.slice(2) } : null;
+}
+
+/** The diff's sections, and what about the text could not be read: an empty
+ * text, prose before the first header, or a header that is no readable
+ * `diff --git` line. A diff the gate cannot read admits nothing. */
+function splitDiff(text: string): { readonly sections: readonly DiffSection[]; readonly unreadable: readonly string[] } {
+  const groups: { oldPath: string; path: string; lines: string[] }[] = [];
+  const unreadable: string[] = [];
+  // The lines after an unreadable header are its own (already refused),
+  // never the previous section's, and never reported again.
+  let current: { lines: string[] } | null = null;
+  for (const [index, line] of text.split('\n').entries()) {
+    if (line.startsWith('diff --git ')) {
+      const paths = diffHeaderPaths(line);
+      if (paths === null) {
+        unreadable.push(`line ${String(index + 1)} is a diff header the gate cannot read`);
+        current = { lines: [] };
+        continue;
+      }
+      const group = { ...paths, lines: [line] };
+      groups.push(group);
+      current = group;
+    } else if (current !== null) current.lines.push(line);
+    else if (line.trim() !== '') unreadable.push(`line ${String(index + 1)} comes before any diff header`);
+  }
+  if (groups.length === 0 && unreadable.length === 0) unreadable.push(text.trim() === '' ? 'the diff text is empty' : 'the diff carries no diff header');
+  const sections = groups.map((group) => ({
     path: group.path,
     oldPath: group.oldPath,
     text: group.lines.join('\n'),
@@ -439,6 +520,7 @@ function splitDiff(text: string): readonly DiffSection[] {
       .map((line) => line.slice(1))
       .join('\n'),
   }));
+  return { sections, unreadable };
 }
 
 function sectionViolations(section: DiffSection, rule: BlindIsolationRule): readonly BlindViolation[] {
@@ -447,7 +529,9 @@ function sectionViolations(section: DiffSection, rule: BlindIsolationRule): read
     const reason = classifyBlindPath(path, rule);
     if (reason !== null) out.push({ code: 'excluded-path', where: path, detail: reason });
   }
-  if (out.length === 0 && DOC_EXTENSIONS.has(extensionOf(section.path)) && classifyHistoryContent(section.body).excluded) {
+  // A document renamed to a source extension still carries its history text.
+  if (out.length === 0 && [section.path, section.oldPath].some((path) => DOC_EXTENSIONS.has(extensionOf(path))) &&
+      classifyHistoryContent(section.body).excluded) {
     out.push({
       code: 'history-content',
       where: section.path,
@@ -455,6 +539,16 @@ function sectionViolations(section: DiffSection, rule: BlindIsolationRule): read
     });
   }
   return out;
+}
+
+/** Every repository path a package diff names, old and new, normalized. */
+export function blindDiffPaths(text: string): readonly string[] {
+  const paths = new Set<string>();
+  for (const section of splitDiff(text).sections) {
+    paths.add(normalizeRepoPath(section.oldPath));
+    paths.add(normalizeRepoPath(section.path));
+  }
+  return [...paths];
 }
 
 export function evaluateBlindPackage(pkg: BlindInputPackage, rule: BlindIsolationRule): BlindPackageEvaluation {
@@ -489,7 +583,7 @@ export function evaluateBlindPackage(pkg: BlindInputPackage, rule: BlindIsolatio
         detail: `"${file.path}" carries task-spec, prior-assessment, deferred-work or triage text`,
       });
     }
-    fileRecords.push({ path: file.path.replace(/^\.\//u, ''), sha256: computed, blobSha: blob });
+    fileRecords.push({ path: normalizeRepoPath(file.path), sha256: computed, blobSha: blob });
   }
   let diffSha: string | null = null;
   const diffPaths: string[] = [];
@@ -498,8 +592,10 @@ export function evaluateBlindPackage(pkg: BlindInputPackage, rule: BlindIsolatio
     if (pkg.diff.sha256 !== undefined && pkg.diff.sha256 !== diffSha) {
       violations.push({ code: 'digest-mismatch', where: 'diff', detail: 'declared diff sha256 does not match the diff bytes supplied' });
     }
-    for (const section of splitDiff(pkg.diff.text)) {
-      diffPaths.push(section.path);
+    const parsed = splitDiff(pkg.diff.text);
+    for (const problem of parsed.unreadable) violations.push({ code: 'unparsed-diff', where: 'diff', detail: problem });
+    for (const section of parsed.sections) {
+      diffPaths.push(normalizeRepoPath(section.path));
       violations.push(...sectionViolations(section, rule));
     }
   }
@@ -586,6 +682,11 @@ export interface ObservedToolResult {
   readonly index: number;
   readonly toolName: string | null;
   readonly text: string;
+  /** The file a file-read tool call (Claude `Read`, pi `read`) asked for,
+   * paired with this, its result; absent for every other result. */
+  readonly readPath?: string;
+  /** The result reported an error (nothing was read). */
+  readonly isError?: boolean;
 }
 
 export interface ProhibitedAccess {
@@ -677,9 +778,29 @@ function excludedGrepPath(candidate: { readonly path: string; readonly byShape: 
  * excluded path or whose body is history-bearing text. This is observed
  * access, not inferred intent from a file name or a search command.
  */
-export function scanObservedAccess(results: readonly ObservedToolResult[], rule: BlindIsolationRule): readonly ProhibitedAccess[] {
+export function scanObservedAccess(
+  results: readonly ObservedToolResult[],
+  rule: BlindIsolationRule,
+  /** The reviewer's checkout: a read tool names absolute paths inside it. */
+  laneRoots: readonly string[] = [],
+): readonly ProhibitedAccess[] {
   const out: ProhibitedAccess[] = [];
   for (const result of results) {
+    // A file-read call that RETURNED content read that file — observed, not
+    // intent: an excluded path read directly, whatever its bytes look like.
+    const read = result.readPath === undefined || result.isError === true || result.text.trim() === ''
+      ? null : readPathViolation(result.readPath, rule, laneRoots);
+    if (read !== null) {
+      out.push({
+        index: result.index,
+        toolName: result.toolName,
+        code: 'excluded-path-read',
+        path: read.path,
+        detail: read.detail,
+        excerptSha256: sha256(result.text),
+      });
+      continue;
+    }
     const excluded = result.text
       .split('\n')
       .flatMap((line) => grepPathCandidates(line))
@@ -709,4 +830,20 @@ export function scanObservedAccess(results: readonly ObservedToolResult[], rule:
     }
   }
   return out;
+}
+
+/** Why a file a read tool returned is excluded, or null. Absolute paths
+ * inside the reviewer's checkout are judged by their repository path;
+ * absolute paths outside it are outside the package; with no known
+ * checkout an absolute path is not judged (no false read). */
+function readPathViolation(rawPath: string, rule: BlindIsolationRule, laneRoots: readonly string[]): { readonly path: string; readonly detail: string } | null {
+  const slashed = rawPath.replace(/\\/gu, '/');
+  let path = slashed;
+  if (outsidePackageShape(slashed) && !slashed.includes('\0')) {
+    const root = laneRoots.map((lane) => lane.replace(/\\/gu, '/').replace(/\/+$/u, '')).find((lane) => slashed === lane || slashed.startsWith(`${lane}/`));
+    if (root !== undefined) path = slashed.slice(root.length + 1);
+    else if (laneRoots.length === 0) return null;
+  }
+  const detail = classifyBlindPath(path, rule);
+  return detail === null ? null : { path, detail };
 }

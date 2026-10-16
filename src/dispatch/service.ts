@@ -20,7 +20,10 @@ import { settleRetries, RetrySettlementUnavailableError, type PacingGate, type P
 import { WORKER_RULE_BLOCKS } from './worker-rules.js';
 import {
   assertLaneUsesBoundStore,
+  changedPaths,
   renderReviewSourceBlock,
+  storeCommit,
+  targetBlob,
   type ReviewRequiredInput,
   type ReviewSourceBinding,
   type ReviewSourcePackage,
@@ -38,7 +41,57 @@ import {
   recordObservedAccess,
   type BlindCoverage,
 } from './blind-review.js';
-import type { BlindInputPackage, ObservedToolResult } from './blind-input.js';
+import { blindDiffPaths, gitBlobSha, normalizeRepoPath, type BlindInputPackage, type BlindViolation, type ObservedToolResult } from './blind-input.js';
+
+/** The selected object store's reading of a blind package (#360 R5-B2): it
+ * names the preflight-verified target, every file is that target's own
+ * blob, and every path its diff names is one `base..target` really changes.
+ * Self-consistent digests alone bind nothing. */
+function bindBlindPackage(binding: ReviewSourceBinding): (pkg: BlindInputPackage) => readonly BlindViolation[] {
+  return (pkg) => {
+    const store = binding.objectStore;
+    const unbound = (where: string, detail: string): BlindViolation => ({ code: 'unbound-package', where, detail });
+    const target = storeCommit(store, pkg.targetSha);
+    if (target !== binding.targetSha) return [unbound('input_package.target_sha', `package target ${pkg.targetSha} is not the verified review target ${binding.targetSha}`)];
+    const violations: BlindViolation[] = [];
+    for (const file of pkg.files ?? []) {
+      const path = normalizeRepoPath(file.path);
+      const blob = targetBlob(store, target, path);
+      if (blob === null) violations.push(unbound(path, `"${path}" is not a file in the target tree`));
+      else if (blob !== gitBlobSha(file.content)) violations.push(unbound(path, `the bytes supplied for "${path}" are not the target's blob ${blob}`));
+    }
+    if (pkg.diff !== undefined) {
+      const base = storeCommit(store, pkg.baseSha);
+      const changed = base === null ? null : changedPaths(store, base, target);
+      if (base === null) violations.push(unbound('input_package.base_sha', `package base ${pkg.baseSha} is not in the object store`));
+      else if (changed === null) violations.push(unbound('diff', `the range ${pkg.baseSha}..${pkg.targetSha} cannot be read`));
+      else {
+        for (const path of blindDiffPaths(pkg.diff.text)) {
+          if (!changed.has(path)) violations.push(unbound(path, `the diff names "${path}", which ${pkg.baseSha}..${pkg.targetSha} does not change`));
+        }
+      }
+    }
+    return violations;
+  };
+}
+
+/** The admitted blind package, as the reviewer's input (#360 R5-B3): the
+ * exact bytes the commissioner sent and the gate admitted, each fenced
+ * longer than any backtick run it holds. */
+function renderBlindPackageBlock(pkg: BlindInputPackage): readonly string[] {
+  const fenced = (lang: string, text: string): readonly string[] => {
+    const longest = Math.max(0, ...[...text.matchAll(/`+/gu)].map((run) => run[0].length));
+    const fence = '`'.repeat(Math.max(3, longest + 1));
+    return [`${fence}${lang}`, text, fence];
+  };
+  return [
+    'BLIND INPUT PACKAGE (your review input — validated against the parent isolation rule and bound to the target\'s git objects):',
+    `Base: ${pkg.baseSha}  Target: ${pkg.targetSha}`,
+    'Review this input. Do not read task specs, prior assessments, deferred work or triage material from the tree; reading them voids your blind coverage.',
+    ...(pkg.diff === undefined ? [] : ['', 'Diff (base to target):', ...fenced('diff', pkg.diff.text)]),
+    ...(pkg.files ?? []).flatMap((file) => ['', `File ${normalizeRepoPath(file.path)} (at the target):`, ...fenced('', file.content)]),
+  ];
+}
 
 /**
  * Dispatch flow (EPICS E8 story 2; SPEC rulings 2/17/18): the Gru-authored
@@ -123,6 +176,8 @@ export function renderMinionBriefing(input: {
   deliverable?: JobDeliverable;
   /** Issue #317: the preflight-verified review source, bound verbatim. */
   reviewSource?: ReviewSourceBinding;
+  /** #360 R5-B3: an admitted blind reviewer's package — its input. */
+  blindPackage?: BlindInputPackage;
 }): string {
   const lessonsSection = renderLessonsSection(input.lessons ?? []);
   return [
@@ -135,6 +190,7 @@ export function renderMinionBriefing(input: {
     'BRIEFING:',
     input.briefing,
     ...(input.reviewSource === undefined ? [] : ['', ...renderReviewSourceBlock(input.reviewSource)]),
+    ...(input.blindPackage === undefined ? [] : ['', ...renderBlindPackageBlock(input.blindPackage)]),
     ...(lessonsSection === '' ? [] : ['', lessonsSection]),
     ...WORKER_RULE_BLOCKS.flatMap((block) => ['', block]),
     '',
@@ -315,11 +371,16 @@ export class DispatchService {
       reviewRole: input.reviewRole,
       briefing: input.briefing,
       targetRef: input.targetRef,
-      targetSha: input.targetSha,
+      // The resolved target (#360 R5-E3): already-owned coverage is recorded
+      // under it, so an abbreviated spelling can never split it.
+      targetSha: recordedTargetSha,
+      requestedTargetSha: input.targetSha,
       parentJobId: input.parentJobId,
       repoName,
       inputPackage: input.inputPackage,
       parentContractSha256: input.parentContractSha256,
+      requiredInputs: input.requiredInputs,
+      ...(reviewSource !== null ? { bindPackage: bindBlindPackage(reviewSource) } : {}),
     });
 
     // (1) The job row: the briefing IS the contract (recorded verbatim).
@@ -669,6 +730,7 @@ export class DispatchService {
         briefing: input.briefing,
         ...(input.deliverable !== undefined ? { deliverable: input.deliverable } : {}),
         ...(reviewSource !== null ? { reviewSource } : {}),
+        ...(blindAdmission?.payload.role === 'blind' && input.inputPackage !== undefined ? { blindPackage: input.inputPackage } : {}),
         agentId: handle.id,
         ...(this.opts.parentTools !== undefined && this.opts.parentTools(handle.id).length > 0
           ? { childWorkerTools: true }

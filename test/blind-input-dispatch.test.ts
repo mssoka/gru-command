@@ -19,6 +19,7 @@ import { BLIND_ACCESS_EVENT } from '../src/dispatch/blind-review.js';
 import type { Role } from '../src/config.js';
 import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { gitReviewSourcePreflight } from '../src/dispatch/review-source.js';
 
 /**
  * Issue #316 at the dispatch boundary: a blind review commission is
@@ -53,6 +54,8 @@ interface Harness {
 }
 
 async function boot(opts: {
+  /** Wire the real git review-source preflight (the production wiring). */
+  reviewSource?: boolean;
   sessionToolResults?: (file: string | null) => readonly ObservedToolResult[] | null;
   /** The briefing prompt of this job rejects after its tools ran (#356). */
   rejectPromptOf?: string;
@@ -76,8 +79,12 @@ async function boot(opts: {
   const spawner = async (role: Role, _options?: SpawnOptions): Promise<AgentHandle> => {
     spawns += 1;
     const id = `agent-${spawns}`;
+    // A real (empty) transcript, as every production session has: a settle
+    // scan reads it, so absence never stands in for an observation.
+    const sessionFile = join(dir, `${id}.jsonl`);
+    writeFileSync(sessionFile, '');
     return {
-      role, id, sessionFile: null, capabilities: CAPS,
+      role, id, sessionFile, capabilities: CAPS,
       async prompt(text: string) {
         if (role !== 'minion') return;
         prompts.push(text);
@@ -85,7 +92,7 @@ async function boot(opts: {
       },
       async steer() {}, async followUp() {},
       subscribe() { return () => {}; },
-      health() { return { state: 'idle' as const, lastActivity: null, sessionFile: null }; },
+      health() { return { state: 'idle' as const, lastActivity: null, sessionFile }; },
       async dispose() {},
     };
   };
@@ -97,6 +104,7 @@ async function boot(opts: {
     ...(opts.log !== undefined ? { log: opts.log } : {}),
     ...(opts.retrySettlement !== undefined ? { retrySettlement: opts.retrySettlement } : {}),
     ...(opts.stopSignal !== undefined ? { stopSignal: opts.stopSignal } : {}),
+    ...(opts.reviewSource === true ? { reviewSource: gitReviewSourcePreflight } : {}),
   });
   const wave = new WaveRunner({ ledger, worktrees, spawner, bus });
   const server = createDispatchServer({ pendingProducerBlockers: () => [], config: cfg, dispatch, wave, ledger });
@@ -560,6 +568,69 @@ describe('blind review commissioning (issue #316)', () => {
     const replacement = await call(h.port, 'POST', '/api/dispatch', blindReview('rev-replacement', { repo_path: h.repo.path, input_package: validPackage() }));
     expect(replacement.status).toBe(202);
     expect(h.ledger.latestJobEvent('rev-replacement', 'review.blind-input-admitted')?.payload).toMatchObject({ replaces: ['rev-first'] });
+  });
+
+  it('binds the package to the target\'s own git objects, admits it under the resolved target, and hands it to the reviewer (#360 R5-B2, R5-B3, R5-E3)', async () => {
+    const h = await boot({ reviewSource: true });
+    await dispatchParent(h);
+    const base = h.repo.head();
+    const target = h.repo.commitFile('src/feature.ts', 'export const feature = 2;\n', 'feature');
+    const diff = h.repo.git(['diff', '--no-color', base, target]);
+    const pkg = { base_sha: base, target_sha: target, diff: { text: diff }, files: [{ path: 'src/feature.ts', content: 'export const feature = 2;\n' }] };
+    const codes = (res: { json: Record<string, unknown> }) => (res.json['violations'] as { code: string; where: string }[]).map((v) => `${v.code} ${v.where}`);
+    // Self-consistent bytes that are not the target's blob bind nothing.
+    const forged = await call(h.port, 'POST', '/api/dispatch', blindReview('rev-forged', {
+      repo_path: h.repo.path, target_sha: target, input_package: { ...pkg, files: [{ path: 'src/feature.ts', content: 'export const feature = 3;\n' }] },
+    }));
+    expect(forged.status).toBe(422);
+    expect(codes(forged)).toEqual(['unbound-package src/feature.ts']);
+    // Neither does a file the target tree does not hold, nor a diff path the range never changes.
+    const strays = await call(h.port, 'POST', '/api/dispatch', blindReview('rev-strays', {
+      repo_path: h.repo.path, target_sha: target,
+      input_package: { ...pkg, diff: { text: `${diff}\ndiff --git a/src/other.ts b/src/other.ts\n--- a/src/other.ts\n+++ b/src/other.ts\n@@ -1 +1 @@\n-a\n+b\n` },
+        files: [...pkg.files, { path: 'src/missing.ts', content: 'x\n' }] },
+    }));
+    expect(strays.status).toBe(422);
+    expect(codes(strays)).toEqual(['unbound-package src/missing.ts', 'unbound-package src/other.ts']);
+    expect(h.spawnCount()).toBe(1);
+    // A bound package, commissioned with an abbreviated target, is admitted under the resolved one...
+    const short = target.slice(0, 12);
+    const ok = await call(h.port, 'POST', '/api/dispatch', blindReview('rev-bound', { repo_path: h.repo.path, target_sha: short, input_package: { ...pkg, target_sha: short } }));
+    expect(ok.status).toBe(202);
+    expect(h.ledger.getJob('rev-bound')?.targetSha).toBe(target);
+    expect(h.ledger.latestJobEvent('rev-bound', 'review.blind-input-admitted')?.payload).toMatchObject({ target_sha: target });
+    // ...and its reviewer is handed exactly that package as its input.
+    await waitFor(() => h.prompts.some((prompt) => prompt.includes('BLIND INPUT PACKAGE')));
+    const prompt = h.prompts.find((candidate) => candidate.includes('BLIND INPUT PACKAGE'))!;
+    expect(prompt).toContain(`Base: ${base}  Target: ${short}`);
+    expect(prompt).toContain('diff --git a/src/feature.ts b/src/feature.ts');
+    expect(prompt).toContain('File src/feature.ts (at the target):');
+    expect(prompt).toContain('export const feature = 2;');
+    // Its owned coverage is found whichever spelling a second commission uses.
+    const again = await call(h.port, 'POST', '/api/dispatch', blindReview('rev-again', { repo_path: h.repo.path, target_sha: target, input_package: pkg }));
+    expect(again.status).toBe(409);
+    expect(again.json).toMatchObject({ error: 'blind_coverage_owned', coverage_job_id: 'rev-bound' });
+  });
+
+  it('refuses claims inputs (required_inputs) for a blind reviewer, before any reviewer spawns (#360 R5-B4)', async () => {
+    const h = await boot({ reviewSource: true });
+    await dispatchParent(h);
+    const base = h.repo.head();
+    const target = h.repo.commitFile('src/feature.ts', 'export const feature = 2;\n', 'feature');
+    const pkg = { base_sha: base, target_sha: target, files: [{ path: 'src/feature.ts', content: 'export const feature = 2;\n' }] };
+    const spawnsBefore = h.spawnCount();
+    const res = await call(h.port, 'POST', '/api/dispatch', blindReview('rev-claims', {
+      repo_path: h.repo.path, target_sha: target, input_package: pkg, required_inputs: [{ path: 'src/feature.ts', lens: 'claims' }],
+    }));
+    expect(res.status).toBe(422);
+    expect((res.json['violations'] as { code: string; where: string }[])).toEqual([expect.objectContaining({ code: 'claims-input', where: 'required_inputs.src/feature.ts' })]);
+    expect(h.ledger.getJob('rev-claims')).toBeNull();
+    expect(h.spawnCount()).toBe(spawnsBefore);
+    // The claims reviewer may name them: it is a separate contract.
+    const claims = await call(h.port, 'POST', '/api/dispatch', blindReview('rev-claims-ok', {
+      repo_path: h.repo.path, target_sha: target, review_role: 'claims', title: 'review (claims)', required_inputs: [{ path: 'src/feature.ts', lens: 'claims' }],
+    }));
+    expect(claims.status).toBe(202);
   });
 
   it('refuses blind access recording for a job that was never admitted as blind', async () => {

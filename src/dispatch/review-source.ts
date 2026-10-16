@@ -164,6 +164,27 @@ function inspect(storeDir: string, request: ReviewSourceRequest): Inspection {
   return { problems, targetSha: target, targetBase: base, rangeCommits, inputs };
 }
 
+/** The blob a commit's tree holds at a path, or null (absent, not a file). */
+export function targetBlob(storeDir: string, commit: string, path: string): string | null {
+  const blob = git(storeDir, ['rev-parse', '--verify', '--quiet', `${commit}:${path}`]);
+  if (!blob.ok || blob.out === '') return null;
+  const kind = git(storeDir, ['cat-file', '-t', blob.out]);
+  return kind.ok && kind.out === 'blob' ? blob.out : null;
+}
+
+/** The full commit a revision names in the store, or null. */
+export function storeCommit(storeDir: string, rev: string): string | null {
+  return resolveCommit(storeDir, rev);
+}
+
+/** Every path `base..target` changes (renames as a deletion plus an
+ * addition), or null when the range cannot be read. */
+export function changedPaths(storeDir: string, base: string, target: string): ReadonlySet<string> | null {
+  const result = spawnSync('git', ['diff', '--name-only', '--no-renames', '-z', base, target], { cwd: storeDir, encoding: 'utf-8', env: cleanGitEnv(), maxBuffer: 64 * 1024 * 1024 });
+  if (result.error !== undefined || result.status !== 0) return null;
+  return new Set((result.stdout ?? '').split('\0').filter((path) => path !== ''));
+}
+
 /** Verify the pinned bundle and fetch it into the selected repository. */
 function repairFromPackage(request: ReviewSourceRequest, pkg: ReviewSourcePackage, repoDir: string): string[] {
   if (!SHA256_HEX.test(pkg.sha256)) return [`source package sha256 must be 64 hex characters`];

@@ -385,7 +385,22 @@ lifecycle fact — so a settled report read as independent coverage.
   (structure-anchored). Other file types are not content-scanned: they are
   judged by path only, and a source line merely mentioning a planning path is
   not exposure. It is also refused when it mismatches its declared digests or git
-  blob ids, or targets another sha. An unfiltered diff is judged per file section.
+  blob ids, or targets another sha. An unfiltered diff is judged per file section
+  (git's C-quoted `diff --git "a/…" "b/…"` headers included, every `./` and empty
+  segment normalized, and a document renamed to a source extension still judged by
+  its text). A diff the gate cannot read — an empty text, prose, lines before the
+  first header, or an unreadable header — is refused as `unparsed-diff`: a diff
+  that judged nothing admits nothing (#360).
+- **Bound to the target (#360).** With the review-source preflight wired (the
+  production default), the package must name the verified target, every file must
+  be the target tree's own blob at that path, and every path its diff names must be
+  one `base..target` really changes; anything else is `unbound-package`.
+  Self-consistent digests alone bind nothing. Coverage is admitted under the
+  RESOLVED target, so an abbreviated `target_sha` never splits already-owned coverage.
+- **Delivered (#360).** The admitted package is the reviewer's input: its briefing
+  carries a `BLIND INPUT PACKAGE` block with the exact diff and files.
+- **No claims (#360).** `required_inputs` (claims inputs) on a blind reviewer are
+  refused as `claims-input`; a reviewer that needs them is `review_role: "claims"`.
 - `parent_contract_sha256`: the parent contract hash the package was built
   against. A stale hash answers `409 stale_parent_contract` with the current hash.
 
@@ -400,10 +415,16 @@ sha256 and git blob id, diff digest and paths). A refusal records
 `review.blind-input-refused`.
 
 **Validity is not settlement.** `GET /api/dispatch/jobs/<id>/blind-coverage`
-answers `qualifying | invalidated | unattested | not-blind | unclassified`,
-derived only from the admission and `review.blind-access-observed` facts. The
-reviewer's session tool results are scanned at turn settle (grep lines landing
-in excluded paths, paged reads returning history-bearing text), and
+answers `qualifying | invalidated | unattested | unobserved | not-blind | unclassified`,
+derived only from the admission, `review.blind-access-observed` and
+`job.blind-access-unobservable` facts. The reviewer's session tool results are
+scanned at turn settle (grep lines landing in excluded paths, paged reads
+returning history-bearing text, and a file-read call — pi `read`, Claude `Read` —
+whose result returned an excluded file, however its bytes look). A settled
+session whose transcript cannot be read at all (absent, unreadable or over the
+size bound) records `job.blind-access-unobservable` — never an empty, clean-reading
+observation — and its coverage is `unobserved`, not qualifying, until a later scan
+reads it (#360). And
 `POST /api/dispatch/blind-access {job_id, tool_results:[{tool_name?, text}]}`
 records a LATER read. Any prohibited observation makes the coverage
 `invalidated`; the report, its findings, its status and its disposition are left

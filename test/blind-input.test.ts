@@ -392,6 +392,69 @@ describe('observed reviewer access — grep paths with spaces (#357)', () => {
   });
 });
 
+describe('retained blind-input roots (#360)', () => {
+  const base = 'b'.repeat(40);
+  const target = 'c'.repeat(40);
+  const evaluate = (text: string) => evaluateBlindPackage({ baseSha: base, targetSha: target, diff: { text } }, DEFAULT_BLIND_ISOLATION_RULE);
+  const section = (header: string, added: string) => [header, '--- a/x', '+++ b/x', '@@ -0,0 +1 @@', `+${added}`, ''].join('\n');
+
+  it('refuses a diff the gate cannot read — prose, an empty text, a preamble or an unreadable header (R5-B1)', () => {
+    const prose = evaluate(HISTORY_NOTE);
+    expect(prose.ok).toBe(false);
+    expect(new Set(prose.violations.map((v) => v.code))).toEqual(new Set(['unparsed-diff']));
+    expect(evaluate('').violations).toEqual([expect.objectContaining({ code: 'unparsed-diff', detail: 'the diff text is empty' })]);
+    expect(evaluate('Here is the change:\n' + section('diff --git a/src/a.ts b/src/a.ts', 'x')).violations)
+      .toEqual([expect.objectContaining({ code: 'unparsed-diff', detail: 'line 1 comes before any diff header' })]);
+    expect(evaluate(section('diff --git a b', 'x')).violations)
+      .toEqual([expect.objectContaining({ code: 'unparsed-diff', detail: 'line 1 is a diff header the gate cannot read' })]);
+    // A readable diff stays admissible.
+    expect(evaluate(section('diff --git a/src/a.ts b/src/a.ts', 'x')).ok).toBe(true);
+  });
+
+  it('reads git\'s quoted headers, so a quoted excluded path is still refused — alone or after an ordinary section (R5-B1)', () => {
+    const quoted = section('diff --git "a/_bmad-output/sp\\303\\251c.md" "b/_bmad-output/sp\\303\\251c.md"', 'x');
+    expect(evaluate(quoted).violations).toEqual([expect.objectContaining({ code: 'excluded-path', where: '_bmad-output/spéc.md' })]);
+    const tabbed = section('diff --git "a/docs/issues/a\\tb.md" "b/docs/issues/a\\tb.md"', 'x');
+    expect(evaluate(tabbed).violations).toEqual([expect.objectContaining({ code: 'excluded-path', where: 'docs/issues/a\tb.md' })]);
+    // After an ordinary section, it is its own section — never hidden in the one before.
+    const mixed = section('diff --git a/src/a.ts b/src/a.ts', 'x') + quoted;
+    expect(evaluate(mixed).violations).toEqual([expect.objectContaining({ code: 'excluded-path', where: '_bmad-output/spéc.md' })]);
+    // One side quoted, one not.
+    expect(evaluate(section('diff --git a/src/a.ts "b/_bmad-output/sp\\303\\251c.md"', 'x')).violations)
+      .toEqual([expect.objectContaining({ code: 'excluded-path', where: '_bmad-output/spéc.md' })]);
+    // Malformed quoting is unreadable, never guessed.
+    expect(evaluate(section('diff --git "a/src/a.ts "b/src/a.ts"', 'x')).violations.map((v) => v.code)).toEqual(['unparsed-diff']);
+  });
+
+  it('normalizes every ./ and empty segment, so dots cannot step around a glob (R4-E4)', () => {
+    expect(classifyBlindPath('././_bmad-output/spec.md', DEFAULT_BLIND_ISOLATION_RULE)).toMatch(/private job material/u);
+    expect(classifyBlindPath('docs//./issues/x.md', DEFAULT_BLIND_ISOLATION_RULE)).toMatch(/private job material/u);
+    const files = evaluateBlindPackage({ baseSha: base, targetSha: target, files: [{ path: 'src//./feature.ts', content: 'x\n' }] }, DEFAULT_BLIND_ISOLATION_RULE);
+    expect(files.provenance?.files.map((file) => file.path)).toEqual(['src/feature.ts']);
+  });
+
+  it('a document renamed to a source extension is still judged by its history text (R4-E5)', () => {
+    const renamed = ['diff --git a/notes.md b/notes.ts', 'similarity index 10%', 'rename from notes.md', 'rename to notes.ts', '--- a/notes.md', '+++ b/notes.ts', '@@ -1 +1,7 @@',
+      ...HISTORY_NOTE.split('\n').map((line) => `+${line}`), ''].join('\n');
+    expect(evaluate(renamed).violations).toEqual([expect.objectContaining({ code: 'history-content', where: 'notes.ts' })]);
+  });
+
+  it('a file-read call that returned an excluded file is observed access, whatever its bytes say (R5-B5)', () => {
+    const rule = DEFAULT_BLIND_ISOLATION_RULE;
+    const read = (readPath: string, text = '{"state":"done"}', isError?: boolean) => ({ index: 0, toolName: 'read', text, readPath, ...(isError === undefined ? {} : { isError }) });
+    expect(scanObservedAccess([read('_bmad-output/state.json')], rule)).toEqual([expect.objectContaining({ code: 'excluded-path-read', path: '_bmad-output/state.json' })]);
+    // An absolute path inside the reviewer's checkout is judged by its repository path...
+    expect(scanObservedAccess([read('/lanes/job-1/docs/issues/9.json')], rule, ['/lanes/job-1']))
+      .toEqual([expect.objectContaining({ code: 'excluded-path-read', path: 'docs/issues/9.json' })]);
+    expect(scanObservedAccess([read('/lanes/job-1/src/a.ts')], rule, ['/lanes/job-1'])).toEqual([]);
+    // ...one outside it is outside the package; with no known checkout it is not judged.
+    expect(scanObservedAccess([read('/elsewhere/repo/x.json')], rule, ['/lanes/job-1'])).toEqual([expect.objectContaining({ code: 'excluded-path-read' })]);
+    expect(scanObservedAccess([read('/elsewhere/repo/x.json')], rule)).toEqual([]);
+    // A read that failed, or returned nothing, read nothing.
+    expect(scanObservedAccess([read('_bmad-output/state.json', 'ENOENT', true), read('_bmad-output/state.json', '  ')], rule)).toEqual([]);
+  });
+});
+
 describe('package request parsing', () => {
   it('rejects malformed packages loudly', () => {
     expect(() => parseBlindInputPackage('nope')).toThrow(BlindInputRefusal);

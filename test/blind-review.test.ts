@@ -26,9 +26,11 @@ import {
   blindCoverageOf,
   blindSessionIdentity,
   observeBlindSessionAccess,
+  readSessionToolResults,
   recordBlindAdmission,
   recordObservedAccess,
   BLIND_ACCESS_EVENT,
+  BLIND_ACCESS_UNOBSERVABLE_EVENT,
 } from '../src/dispatch/blind-review.js';
 import { BlindInputRefusal, type ObservedToolResult } from '../src/dispatch/blind-input.js';
 
@@ -94,7 +96,7 @@ describe('observeBlindSessionAccess — no-op contracts (issue #339 N9)', () => 
     h.dispose();
   });
 
-  it('records no fabricated clean pass when the resumed session is unreadable', () => {
+  it('records no fabricated clean pass when the resumed session is unreadable — it is unobserved, by name (#360 R5-B6)', () => {
     const h = blindLedger();
     h.admit('job-unreadable');
     // A path this test OWNS that cannot exist (a unique empty directory), so a
@@ -105,7 +107,55 @@ describe('observeBlindSessionAccess — no-op contracts (issue #339 N9)', () => 
     cleanupDirs.push(missingDir);
     observeBlindSessionAccess(h.ledger, 'job-unreadable', join(missingDir, 'no-such-session.jsonl'));
     expect(h.ledger.latestJobEvent('job-unreadable', BLIND_ACCESS_EVENT)).toBeNull();
-    expect(blindCoverageOf(h.ledger, 'job-unreadable')).toMatchObject({ state: 'qualifying', accessObserved: false });
+    // Absence is never a clean pass, and never qualifying coverage either.
+    expect(h.ledger.latestJobEvent('job-unreadable', BLIND_ACCESS_UNOBSERVABLE_EVENT)).not.toBeNull();
+    expect(blindCoverageOf(h.ledger, 'job-unreadable')).toMatchObject({ state: 'unobserved', qualifying: false, accessObserved: false });
+    // A later successful read of the session supersedes it.
+    const readable = join(missingDir, 'session.jsonl');
+    writeFileSync(readable, '');
+    observeBlindSessionAccess(h.ledger, 'job-unreadable', readable);
+    expect(blindCoverageOf(h.ledger, 'job-unreadable')).toMatchObject({ state: 'qualifying', qualifying: true, accessObserved: true });
+    // Before any settle scan (a running reviewer), coverage is unchanged.
+    h.admit('job-running');
+    expect(blindCoverageOf(h.ledger, 'job-running')).toMatchObject({ state: 'qualifying', accessObserved: false });
+    h.dispose();
+  });
+});
+
+describe('the default session reader on transcripts as pi and Claude persist them (#360 R5-V1, R5-B5)', () => {
+  it('pairs each file-read call with its result, and a direct read of an excluded file invalidates coverage', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-blind-transcripts-'));
+    cleanupDirs.push(dir);
+    // pi: an assistant `toolCall` (read {path}), then its `toolResult` by toolCallId.
+    const pi = join(dir, 'pi.jsonl');
+    writeFileSync(pi, [
+      { type: 'session', id: 's1' },
+      { type: 'message', id: 'm1', message: { role: 'assistant', stopReason: 'toolUse', content: [{ type: 'toolCall', id: 'call-1', name: 'read', arguments: { path: '_bmad-output/state.json' } }] } },
+      { type: 'message', id: 'm2', message: { role: 'toolResult', toolCallId: 'call-1', toolName: 'read', content: [{ type: 'text', text: '{"state":"done"}' }], isError: false } },
+      { type: 'message', id: 'm3', message: { role: 'assistant', stopReason: 'toolUse', content: [{ type: 'toolCall', id: 'call-2', name: 'bash', arguments: { command: 'ls' } }] } },
+      { type: 'message', id: 'm4', message: { role: 'toolResult', toolCallId: 'call-2', toolName: 'bash', content: [{ type: 'text', text: 'src' }], isError: false } },
+    ].map((line) => JSON.stringify(line)).join('\n') + '\n');
+    // Claude: an assistant `tool_use` (Read {file_path}), then a user `tool_result` by tool_use_id.
+    const claude = join(dir, 'claude.jsonl');
+    writeFileSync(claude, [
+      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Read', input: { file_path: '/lanes/job-1/docs/issues/9.md' } }] } },
+      { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: [{ type: 'text', text: '1\tplain text' }] }] } },
+      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_2', name: 'Read', input: { file_path: '/lanes/job-1/missing.md' } }] } },
+      { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_2', is_error: true, content: 'File does not exist.' }] } },
+    ].map((line) => JSON.stringify(line)).join('\n') + '\n');
+    expect(readSessionToolResults(pi)).toEqual([
+      { index: 2, toolName: 'read', text: '{"state":"done"}', readPath: '_bmad-output/state.json' },
+      { index: 4, toolName: 'bash', text: 'src' },
+    ]);
+    expect(readSessionToolResults(claude)).toEqual([
+      { index: 1, toolName: null, text: '1\tplain text', readPath: '/lanes/job-1/docs/issues/9.md' },
+      { index: 3, toolName: null, text: 'File does not exist.', readPath: '/lanes/job-1/missing.md', isError: true },
+    ]);
+    // Through the default reader, the pi read of an excluded file invalidates coverage.
+    const h = blindLedger();
+    h.admit('job-pi-read');
+    observeBlindSessionAccess(h.ledger, 'job-pi-read', pi);
+    expect(blindCoverageOf(h.ledger, 'job-pi-read')).toMatchObject({ state: 'invalidated', qualifying: false, prohibitedAccess: 1 });
     h.dispose();
   });
 });
