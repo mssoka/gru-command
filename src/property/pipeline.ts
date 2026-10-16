@@ -3,6 +3,7 @@ import { existsSync, lstatSync, readFileSync, realpathSync, writeFileSync, mkdir
 import { join, relative, resolve } from 'node:path';
 import { VITEST_FAST_CHECK_ADAPTER as adapter } from './adapters/vitest-fast-check.js';
 import { loadPropertyConfig } from './config.js';
+import { oneLineErrorText } from './error-text.js';
 import { createPropertyExecutor, isSealedExecutionReceipt, propertyProtectedIdentity, propertyWorkspaceIdentity, type PropertyExecutor } from './executor.js';
 import { canonicalJson, freeze, verifyFrozen, type QualifiedFrozenContract } from './freeze.js';
 import { aggregatePropertyMetrics, type PropertyRunMetricRecord } from './metrics.js';
@@ -133,12 +134,7 @@ function jsonOf(value: unknown): string {
   } catch (error) {
     // A BigInt, a cycle or a throwing toJSON: named, never a raw error, and
     // the detail is bounded (the value is sandbox-controlled).
-    // One line: controls, format and separator characters become spaces;
-    // the cut never splits a surrogate pair.
-    let detail: string;
-    try { detail = String(error); } catch { detail = 'an unprintable error'; }
-    const points = [...detail.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, ' ')];
-    throw new PropertyPipelineError(`a directive value has no JSON form (${points.length > 256 ? `${points.slice(0, 256).join('')}…` : points.join('')})`, { cause: error });
+    throw new PropertyPipelineError(`a directive value has no JSON form (${oneLineErrorText(error, 256)})`, { cause: error });
   }
   if (json === undefined) throw new PropertyPipelineError('a directive value has no JSON form');
   return json;

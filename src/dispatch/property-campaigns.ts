@@ -3,6 +3,7 @@ import { mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parseReviewedCampaign } from '../cli/property-check.js';
 import { isJobTerminal } from '../ledger/states.js';
+import { oneLineErrorText } from '../property/error-text.js';
 import type { LedgerApi } from '../ledger/api.js';
 import { loadPropertyConfig } from '../property/config.js';
 import { createPropertyExecutor, propertyWorkspaceIdentity } from '../property/executor.js';
@@ -14,13 +15,7 @@ import type { RecoveryNotifications } from './rebrief-recovery.js';
 import type { WaveRunner } from './perkins.js';
 
 /** An error as one bounded line of text, even when it cannot print. */
-function printable(error: unknown): string {
-  let text: string;
-  try { text = String(error); } catch { text = 'an unprintable error'; }
-  const line = text.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, ' ');
-  const points = [...line];
-  return points.length > 300 ? `${points.slice(0, 300).join('')}…` : line;
-}
+const printable = (error: unknown): string => oneLineErrorText(error, 300);
 
 export class PropertyOwnerActionError extends Error {
   constructor(message: string, options?: ErrorOptions) { super(message, options); this.name = 'PropertyOwnerActionError'; }
@@ -205,14 +200,25 @@ export function createPropertyCampaignService(options: PropertyCampaignServiceOp
         // before the new proposal leaves any record and before the victim
         // leaves memory: a failed write evicts and records nothing.
         const path = join(victim.artifactsDir, `owner-evicted-${randomUUID()}.json`);
+        let madeDir: string | undefined;
         try {
-          mkdirSync(victim.artifactsDir, { recursive: true, mode: 0o700 });
+          madeDir = mkdirSync(victim.artifactsDir, { recursive: true, mode: 0o700 });
           writeFileSync(path, `${JSON.stringify({ evicted: view(victim), byProposal: id }, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
         } catch (error) {
-          // A partial record is removed: nothing is left that claims an eviction.
+          // Only what this call made is removed — a directory it created
+          // (with its partial record), else its partial record; a record a
+          // `wx` write found already there is never touched. Nothing is left
+          // that claims an eviction, or what is left is named.
+          const made = madeDir ?? ((error as NodeJS.ErrnoException).code === 'EEXIST' ? undefined : path);
           let partial = '';
-          try { rmSync(path, { force: true }); } catch (removeError) { partial = ` (its partial record ${path} could not be removed: ${printable(removeError)} — remove it by hand)`; }
-          throw new PropertyOwnerActionError(`the cache is full and campaign ${victim.id} could not be evicted: its audit could not be written in ${victim.artifactsDir} (${printable(error)}); fix that directory, or decide a pending campaign, then propose again${partial}`, { cause: error });
+          let cause: unknown = error;
+          if (made !== undefined) {
+            try { rmSync(made, { recursive: true, force: true }); } catch (removeError) {
+              partial = ` (${made} could not be removed: ${printable(removeError)} — remove it by hand)`;
+              cause = new AggregateError([error, removeError], 'eviction audit and its cleanup failed');
+            }
+          }
+          throw new PropertyOwnerActionError(`the cache is full and campaign ${victim.id} could not be evicted: its audit could not be written in ${victim.artifactsDir} (${printable(error)}); fix that directory, or decide a pending campaign, then propose again${partial}`, { cause });
         }
         evictionAudit = { path, victimId: victim.id };
       }

@@ -278,6 +278,26 @@ describe('ordinary owner HTTP property actions (controlled minion; no JSON issua
       expect(() => service.propose(h.jobId, { campaign: f.reviewed })).toThrow(/could not be evicted: its audit could not be written in .*\(Error: disk full\); fix that directory/u);
       expect(evictedAudit()).toEqual([]);
       expect(service.read(h.jobId, a.id).state).toBe('retained');
+      // A partial record that cannot be removed is named, and travels as a cause.
+      let partialPath = '';
+      fsHooks.beforeWrite = (path) => {
+        if (!path.includes('owner-evicted-')) return;
+        fsHooks.beforeWrite = null; partialPath = path;
+        writeFileSync(path, '{"partial');
+        throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+      };
+      fsHooks.beforeRm = (path) => { if (path.includes('owner-evicted-')) throw Object.assign(new Error('record stuck'), { code: 'EBUSY' }); };
+      let partialRefusal: unknown = null;
+      try { service.propose(h.jobId, { campaign: f.reviewed }); } catch (caught) { partialRefusal = caught; } finally { fsHooks.beforeRm = null; fsHooks.beforeWrite = null; }
+      expect((partialRefusal as Error).message).toMatch(new RegExp(`then propose again \\(${partialPath.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')} could not be removed: Error: record stuck — remove it by hand\\)$`, 'u'));
+      expect(((partialRefusal as Error).cause as AggregateError).errors.map((cause) => (cause as NodeJS.ErrnoException).code)).toEqual(['ENOSPC', 'EBUSY']);
+      rmSync(partialPath);
+      // A victim directory the failed audit itself had to create is removed with it.
+      rmSync(auditDir, { recursive: true, force: true });
+      fsHooks.beforeWrite = (path) => { if (path.includes('owner-evicted-')) throw Object.assign(new Error('disk full'), { code: 'ENOSPC' }); };
+      try { expect(() => service.propose(h.jobId, { campaign: f.reviewed })).toThrow(/could not be evicted/u); } finally { fsHooks.beforeWrite = null; }
+      expect(existsSync(auditDir)).toBe(false);
+      expect(service.read(h.jobId, a.id).state).toBe('retained');
       // Once the audit can be written, the same proposal evicts A by name.
       const c = service.propose(h.jobId, { campaign: f.reviewed });
       expect(evictedAudit()).toHaveLength(1);
@@ -304,6 +324,16 @@ describe('ordinary owner HTTP property actions (controlled minion; no JSON issua
       expect(left).toHaveLength(1);
       expect((refusal as Error).message).toBe(`proposal ${left[0]!} could not be recorded (Error: disk full) and its cleanup failed: Error: directory busy — remove ${join(h.serviceOptions.artifactsRoot, left[0]!)} by hand`);
       expect(((refusal as Error).cause as AggregateError).errors.map((cause) => (cause as NodeJS.ErrnoException).code)).toEqual(['ENOSPC', 'EBUSY']);
+      // Error text is one bounded line, whatever the filesystem said.
+      fsHooks.beforeWrite = (path) => { if (path.includes('owner-proposed-')) throw new Error(`disk\nfull\u202e ${'x'.repeat(400)}`); };
+      let noisy: unknown = null;
+      try { service.propose(h.jobId, { campaign: f.reviewed }); } catch (caught) { noisy = caught; } finally { fsHooks.beforeWrite = null; }
+      expect((noisy as Error).message).toBe(`disk\nfull\u202e ${'x'.repeat(400)}`);
+      fsHooks.beforeWrite = (path) => { if (path.includes('owner-proposed-')) throw new Error(`disk\nfull\u202e ${'x'.repeat(400)}`); };
+      fsHooks.beforeRm = (path) => { if (/campaign-[0-9a-f-]+$/u.test(path)) throw { toString() { throw new Error('unprintable'); } }; };
+      try { service.propose(h.jobId, { campaign: f.reviewed }); } catch (caught) { noisy = caught; } finally { fsHooks.beforeRm = null; fsHooks.beforeWrite = null; }
+      expect((noisy as Error).message).toMatch(new RegExp(`^proposal campaign-[0-9a-f-]+ could not be recorded \\(Error: disk full ${'x'.repeat(300 - 'Error: disk full '.length)}…\\) and its cleanup failed: an unprintable error — remove .* by hand$`, 'u'));
+      expect((noisy as Error).message).not.toMatch(/[\n\u202e]/u);
     } finally { await service.dispose(); }
   });
 

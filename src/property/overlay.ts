@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
+import { oneLineErrorText } from './error-text.js';
 import type { OverlayIdentity } from './types.js';
 
 /**
@@ -195,8 +196,8 @@ export function applyOverlayFilesAllOrNothing(input: Parameters<typeof applyOver
           // read the target never skips, and the target is restored.
           let untouched = false;
           try {
-            const current = lstatSync(target, { throwIfNoEntry: false });
-            untouched = current?.isFile() === true && `${String(current.dev)}:${String(current.ino)}` === inode && (current.mode & 0o7777) === mode && readFileSync(target).equals(content);
+            const current = lstatSync(target, { throwIfNoEntry: false, bigint: true });
+            untouched = current?.isFile() === true && `${String(current.dev)}:${String(current.ino)}` === inode && Number(current.mode & 0o7777n) === mode && readFileSync(target).equals(content);
           } catch { untouched = false; }
           if (untouched) continue;
           // Re-created beside the target (a short name, never too long), then
@@ -222,16 +223,17 @@ export function applyOverlayFilesAllOrNothing(input: Parameters<typeof applyOver
     for (const dir of [...createdDirs].reverse()) {
       try { rmdirSync(dir); } catch (removeError) { failures.push(removeError); }
     }
-    if (failures.length > 0) throw new AggregateError([error, ...failures], `overlay write failed and its rollback was incomplete: ${String(error)}`);
+    if (failures.length > 0) throw new AggregateError([error, ...failures], `overlay write failed and its rollback was incomplete: ${oneLineErrorText(error, 300)}`);
     throw error;
   };
   try {
     for (const file of input.files) {
       const target = resolveOverlayTarget(input.workspaceRoot, file.path, (dir) => { createdDirs.add(dir); });
-      const current = lstatSync(target, { throwIfNoEntry: false });
+      // Device and inode as bigints: exact, whatever the filesystem's numbers.
+      const current = lstatSync(target, { throwIfNoEntry: false, bigint: true });
       const regular = current !== undefined && current.isFile();
       prior.push({ target, state: current === undefined ? 'absent' : regular ? 'file' : 'other',
-        content: regular ? readFileSync(target) : null, mode: regular ? current.mode & 0o7777 : null,
+        content: regular ? readFileSync(target) : null, mode: regular ? Number(current.mode & 0o7777n) : null,
         inode: regular ? `${String(current.dev)}:${String(current.ino)}` : null });
     }
     return applyOverlayFiles(input);

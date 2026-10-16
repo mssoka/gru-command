@@ -21,8 +21,9 @@ export function scenarioRepo(script: string, options: { readonly reportersModule
     if (options.reportersModule === 'linked-dist') {
       // A regular reporters.js, but reached through a dist directory linked
       // outside the repository.
-      const outside = realpathSync(mkdtempSync(join(tmpdir(), 'property-unit-outside-dist-')));
-      extra.push(outside);
+      const made = mkdtempSync(join(tmpdir(), 'property-unit-outside-dist-'));
+      extra.push(made);
+      const outside = realpathSync(made);
       writeFileSync(join(outside, 'reporters.js'), 'export class JsonReporter {}\n');
       symlinkSync(outside, join(root, 'node_modules', 'vitest', 'dist'));
     } else if (options.reportersModule !== false) {
@@ -47,7 +48,11 @@ export function scenarioRepo(script: string, options: { readonly reportersModule
       budget: { maxIterations: 20, maxShrinkSteps: 100, runTimeoutMs: 10_000, maxOutputBytes: 32_768 },
     };
     return { root, git, plan, cleanup };
-  } catch (error) { cleanup(); throw error; }
+  } catch (error) {
+    // The setup error is what surfaces; a cleanup failure never masks it.
+    try { cleanup(); } catch { /* the temp root is reclaimed by the OS */ }
+    throw error;
+  }
 }
 /** A fake runner reports through the host's authenticated channel the way
  * the host config's reporter does (#378): the per-run nonce arrives on fd 3
