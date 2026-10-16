@@ -392,7 +392,45 @@ lifecycle fact — so a settled report read as independent coverage.
   (structure-anchored). Other file types are not content-scanned: they are
   judged by path only, and a source line merely mentioning a planning path is
   not exposure. It is also refused when it mismatches its declared digests or git
-  blob ids, or targets another sha. An unfiltered diff is judged per file section.
+  blob ids, or targets another sha. An unfiltered diff is judged per file section
+  (git's C-quoted `diff --git "a/…" "b/…"` headers included, every `./` and empty
+  segment normalized, and a document renamed to a source extension still judged by
+  its text). A diff the gate cannot read — an empty text, prose, lines before the
+  first header, an unreadable header, or any line inside a section outside git's
+  own grammar (extended headers, then hunks holding exactly the lines their headers
+  count: prose, a `diff --cc` line, a hunk overrun or cut short, a binary patch, a
+  rename/copy/`---`/`+++` line naming another path than the header) — is refused
+  as `unparsed-diff`: a diff that judged nothing admits nothing (#360). An
+  unquoted header naming one path twice is split at its middle, so a path holding
+  ` b/` is read whole; a rename header is split only by its own rename lines.
+- **Bound to the target (#360).** The review-source preflight (always wired by the
+  service) binds the package: it must name the verified target and a base that is
+  in the object store and an ancestor of the target; every file must be the target
+  tree's own blob at that path; every path its diff names must be one
+  `base..target` really changes; and every line a hunk shows must be that file's
+  own line where the hunk header says (removals and context at the base, additions
+  and context at the target). Anything else is `unbound-package`. Self-consistent
+  digests alone bind nothing. With no preflight wired, a blind package is refused
+  by name (an embedding may opt out with `allowUnboundBlindPackages`, which only
+  test harnesses set). Coverage is admitted under the
+  RESOLVED target, so an abbreviated `target_sha` never splits already-owned coverage.
+- **Delivered (#360).** The admitted package is the reviewer's input: its briefing
+  carries a `BLIND INPUT PACKAGE` block with the exact diff and files, fenced and
+  framed as data (a package file path holding a control, format — bidi,
+  zero-width — separator, private-use or unassigned character is refused, so
+  nothing can escape a fence or disguise its heading). A refusal's text names
+  every path as a JSON literal with each line-unsafe character escaped. A
+  violation's `where` (and a recorded read's `path`) holds a line-safe path as
+  written, and any other path as that literal. A path that itself opens with
+  `"` counts as "any other", so a leading quote always marks the escaped form.
+  The package bytes are kept (`review.blind-input-package`, written before the
+  admission), so a fresh
+  replacement reviewer spawned by provider recovery gets the same block; a resumed
+  session already holds it. An attested reviewer whose package was not kept (one
+  admitted before packages were kept) fails that fresh continuation by name —
+  never a replacement briefed without its input.
+- **No claims (#360).** `required_inputs` (claims inputs) on a blind reviewer are
+  refused as `claims-input`; a reviewer that needs them is `review_role: "claims"`.
 - `parent_contract_sha256`: the parent contract hash the package was built
   against. A stale hash answers `409 stale_parent_contract` with the current hash.
 
@@ -407,10 +445,27 @@ sha256 and git blob id, diff digest and paths). A refusal records
 `review.blind-input-refused`.
 
 **Validity is not settlement.** `GET /api/dispatch/jobs/<id>/blind-coverage`
-answers `qualifying | invalidated | unattested | not-blind | unclassified`,
-derived only from the admission and `review.blind-access-observed` facts. The
-reviewer's session tool results are scanned at turn settle (grep lines landing
-in excluded paths, paged reads returning history-bearing text), and
+answers `qualifying | invalidated | unattested | unobserved | not-blind | unclassified`,
+derived only from the admission, `review.blind-access-observed` and
+`job.blind-access-unobservable` facts. The reviewer's session tool results are
+scanned at turn settle (grep lines landing in excluded paths, paged reads
+returning history-bearing text, and any file-content tool call — pi `read`/`edit`,
+Claude `Read`/`Edit`/`MultiEdit`/`NotebookRead`/`NotebookEdit`, and a content
+search (pi `grep`, Claude `Grep`) — whose result returned, even empty or binary,
+for a path that is excluded, however its bytes look. A call is judged by the path
+it names: an absolute path inside the job's lane by its repository path, one
+outside the checkout as outside the package, and the repository root itself as no
+file. A path inside the checkout is access exactly when it matches an excluded
+glob; a directory that matches none (the usual case — `docs/issues` does not match
+`docs/issues/**`) leaves the search judged by the paths and text its output shows,
+as every listing (`Glob`, `find`, `ls`) is). A settled session whose
+transcript cannot be read at all (absent, unreadable or over the size bound)
+records `job.blind-access-unobservable` once while it stands — never an empty,
+clean-reading observation — and its coverage is `unobserved`, not qualifying,
+until a LATER scan of that same session reads it; another session's read, an
+earlier read or an operator post never supersede it. A turn with no transcript
+at all has nothing a later scan could read, so its job stays `unobserved`: what
+that turn read is unknown, whatever came after (#360). And
 `POST /api/dispatch/blind-access {job_id, tool_results:[{tool_name?, text}]}`
 records a LATER read. Any prohibited observation makes the coverage
 `invalidated`; the report, its findings, its status and its disposition are left

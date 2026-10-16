@@ -4664,6 +4664,35 @@ describe('supervisor — automatic rate-limit retries (owner heist 2026-09-29, s
     h.dispose();
   });
 
+  it('a rate-limited turn carrying a native directive is never replayed: no prompt, the retry is superseded, and checkpoint recovery is owed (#363 native-rate-limit-no-replay)', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0 });
+    try {
+      const jobId = 'job-native-429';
+      h.api.addJob({ id: jobId, repo: 'fixture', title: jobId }); h.api.setJobStatus(jobId, 'working');
+      const handle = new FakeHandle('minion', 'minion-native-429', null);
+      h.api.registerAgent({ id: handle.id, role: 'minion', jobId });
+      const request = h.api.beginDirectiveIntent({ jobId, requestId: 'native-429-request', directive: 'repair the lane', holder: 'gru' }).record;
+      handle.pendingTurnSnapshot = { text: 'repair the lane', owner: `silas-directive:${request.requestId}`, directive: {
+        identity: h.api.directiveTurnIdentity(request.requestId), beforeAdmission: () => {}, onAdmitted: () => {},
+      } };
+      h.registry.adopt(handle);
+      emitFailure(handle, '429 too many requests');
+      expect(sleeper.delays).toEqual([100]);
+      await sleeper.release();
+      // No replay: the captured native directive is never prompted again...
+      await vi.waitFor(() => expect(h.notificationsOfKind(`silas.directive-unreconciled.${request.requestId}`)).toHaveLength(1));
+      expect(handle.promptCalls).toHaveLength(0);
+      expect(sleeper.delays).toEqual([100]);
+      // ...the retry incident is gone (superseded, not delivered)...
+      expect(h.supervisor.pendingProducerBlockers(jobId).join(' ')).not.toContain('pending recovery/retry');
+      // ...and actionable checkpoint recovery is owed, with no fabricated delivery.
+      expect(h.notificationsOfKind(`silas.directive-unreconciled.${request.requestId}`)[0]!.detail).toContain('provider retry cannot replay a consumed native directive');
+      expect(h.api.recoveryObligation(jobId, 'directive', request.requestId)?.state).toBe('open');
+      expect(h.api.latestJobEvent(jobId, 'job.delivered')).toBeNull();
+    } finally { h.dispose(); }
+  });
+
   it('retries with exponential backoff, records every attempt, and exhausts into the ladder', async () => {
     const sleeper = new ManualSleeper();
     const h = boot(undefined, {

@@ -654,7 +654,7 @@ this stream; nothing avoids a wake silently.
 
 ### Exact directive/rebrief restart progress
 
-Migration 26 (`directive-native-progress`) is additive/nullable. Historical
+Migration 28 (`directive-native-progress`) is additive/nullable. Historical
 request rows retain NULL request kind/contract SHA/native target/native admission/
 checkpoint/authority epoch: NULL is unprovable, not safe-to-replay. New
 requests bind kind, immutable contract snapshot, revision and native
@@ -689,7 +689,7 @@ cannot release that ownership or mint readiness.
 
 ### Restart-recovery historical evidence and reserved-owner lineage
 
-Migration 26 adds nullable native progress and latest recovery pointers without inferring old facts. Immutable `silas.{directive,rebrief}-recovery-decided` events are uniquely indexed by exact subject + debt generation; pointers are compatibility/latest views, never mutable history. Audits retain canonical decision fingerprint, full exact marker/native subject snapshot, versioned legacy accepted/unproven receipt evidence and any concrete reserved-owner target binding.
+Migration 28 adds nullable native progress and latest recovery pointers without inferring old facts. Immutable `silas.{directive,rebrief}-recovery-decided` events are uniquely indexed by exact subject + debt generation; pointers are compatibility/latest views, never mutable history. Audits retain canonical decision fingerprint, full exact marker/native subject snapshot, versioned legacy accepted/unproven receipt evidence and any concrete reserved-owner target binding.
 
 Legacy receipt SHA is server-computed and compared inside judgment transactions; clocks/watermarks alone are not correlation. Missing historical HEAD/revision are never supplied from current state. `silas.rebrief-control-closed` is non-executing administrative closure of proven-completed control with absent delivery facts: full immutable evidence remains; a concrete current-inspection obligation owns the next fresh directive/verification action. No historical delivery/current revision/verification/READY is emitted by closure.
 

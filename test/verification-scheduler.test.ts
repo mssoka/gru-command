@@ -557,6 +557,103 @@ describe('verification scheduler — global budget', () => {
     } finally { release(); await scheduler.dispose(); await shutdown; }
   });
 
+  it('childless failures keep the request history within its bound, in memory and persisted; the durable index still answers every one (#363 S09-1-05)', async () => {
+    const storageDir = join(tempDir(), 'verify'); const cwd = join(tempDir(), 'missing');
+    const scheduler = new VerificationScheduler({ storageDir, limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 5000, runTimeoutMs: 5000 } });
+    try {
+      for (let index = 0; index < 70; index += 1) {
+        await expect(scheduler.submit({ jobId: 'bounded-history', requestId: `no-start-${String(index)}`, scope: 'full', cwd, head: null, command: 'true' })).rejects.toThrow(/ENOENT/);
+      }
+      expect((scheduler as unknown as { requestHistory: Map<string, unknown> }).requestHistory.size).toBeLessThanOrEqual(64);
+      const persisted = JSON.parse(readFileSync(join(storageDir, 'scheduler.json'), 'utf8')) as { attempts?: readonly unknown[] };
+      expect(persisted.attempts?.length ?? 0).toBeLessThanOrEqual(64);
+      // The newest is still in memory; the oldest, evicted, answers from the durable index.
+      for (const requestId of ['no-start-69', 'no-start-0']) {
+        expect(scheduler.attemptStatus({ requestId }), requestId).toMatchObject({ state: 'admission-failed', started: false });
+      }
+    } finally { await scheduler.dispose(); }
+  });
+
+  it('a no-start whose publication is still pending keeps answering and still publishes once it can, while the history stays bounded (#363 S09-1-05)', async () => {
+    const storageDir = join(tempDir(), 'verify'); const cwd = join(tempDir(), 'missing');
+    let holdHeld = true;
+    const published: string[] = [];
+    const scheduler = new VerificationScheduler({ storageDir, limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 5000, runTimeoutMs: 5000 },
+      record: (record) => {
+        const ids = record.kind === 'verification.no-start' ? (record.payload as { request_ids: string[] }).request_ids : [];
+        if (holdHeld && ids.includes('held')) throw new Error('publication unavailable');
+        published.push(...ids);
+      } });
+    try {
+      await expect(scheduler.submit({ jobId: 'bounded-history', requestId: 'held', scope: 'full', cwd, head: null, command: 'true' })).rejects.toThrow(/ENOENT/);
+      const history = (scheduler as unknown as { requestHistory: Map<string, unknown> }).requestHistory;
+      for (let index = 0; index < 70; index += 1) {
+        await expect(scheduler.submit({ jobId: 'bounded-history', requestId: `later-${String(index)}`, scope: 'full', cwd, head: null, command: 'true' })).rejects.toThrow(/ENOENT/);
+        expect(history.size).toBeLessThanOrEqual(64);
+        // Still answered while unpublished (memory or the durable index): never unknown, so never replayed.
+        expect(scheduler.attemptStatus({ requestId: 'held' }), String(index)).toMatchObject({ state: 'admission-failed', started: false });
+      }
+      expect(published).not.toContain('held');
+      holdHeld = false;
+      await expect(scheduler.submit({ jobId: 'bounded-history', requestId: 'final', scope: 'full', cwd, head: null, command: 'true' })).rejects.toThrow(/ENOENT/);
+      expect(published).toContain('held');
+      expect(history.size).toBeLessThanOrEqual(64);
+    } finally { await scheduler.dispose(); }
+  });
+
+  it('an indexed no-start still pending publication is evicted like any other, and a retry pass that publishes nothing keeps the bound (#363 S09-1-05)', async () => {
+    const storageDir = join(tempDir(), 'verify'); const missing = join(tempDir(), 'missing'); const cwd = tempDir();
+    const scheduler = new VerificationScheduler({ storageDir, limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 5000, runTimeoutMs: 5000 }, buildReuse: false,
+      record: (record) => {
+        if (record.kind === 'verification.no-start' && (record.payload as { request_ids: string[] }).request_ids.includes('held')) throw new Error('publication unavailable');
+      } });
+    try {
+      // Durably indexed, but its publication keeps failing: it stays pending.
+      await expect(scheduler.submit({ jobId: 'indexed', requestId: 'held', scope: 'full', cwd: missing, head: null, command: 'true' })).rejects.toThrow(/ENOENT/);
+      const history = (scheduler as unknown as { requestHistory: Map<string, unknown> }).requestHistory;
+      for (let index = 0; index < 64; index += 1) {
+        await scheduler.submit({ jobId: 'indexed', requestId: `ordinary-${String(index)}`, scope: 'full', cwd, head: null, command: 'true' });
+      }
+      // The index answers for it, so the bound evicted it.
+      expect(history.size).toBe(64);
+      expect(history.has('held')).toBe(false);
+      expect(scheduler.attemptStatus({ requestId: 'held' })).toMatchObject({ state: 'admission-failed', started: false, error: { code: 'spawn_failed' } });
+      // Its resubmit runs a retry pass that re-derives its entry and publishes nothing; the bound still holds.
+      await expect(scheduler.submit({ jobId: 'indexed', requestId: 'held', scope: 'full', cwd: missing, head: null, command: 'true' })).rejects.toThrow(/ENOENT/);
+      expect(history.has('held')).toBe(true);
+      expect(history.size).toBe(64);
+    } finally { await scheduler.dispose(); }
+  });
+
+  it('a no-start whose durable append failed is never evicted into unknown: it answers until a retry indexes it, then the bound holds again (#363 S09-1-05)', async () => {
+    const storageDir = join(tempDir(), 'verify'); const missing = join(tempDir(), 'missing'); const cwd = tempDir();
+    const scheduler = new VerificationScheduler({ storageDir, limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 5000, runTimeoutMs: 5000 }, buildReuse: false, record: () => undefined });
+    const requestLog = join(storageDir, 'requests.ndjson');
+    try {
+      scheduler.start();
+      // The durable identity log cannot be written: the no-start stays pending, unindexed.
+      mkdirSync(requestLog);
+      await expect(scheduler.submit({ jobId: 'unindexed', requestId: 'held', scope: 'full', cwd: missing, head: null, command: 'true' })).rejects.toThrow(/ENOENT/);
+      const history = (scheduler as unknown as { requestHistory: Map<string, unknown> }).requestHistory;
+      // More ordinary settles than the bound holds; each bounds the history.
+      for (let index = 0; index < 70; index += 1) {
+        const outcome = await scheduler.submit({ jobId: 'unindexed', requestId: `ordinary-${String(index)}`, scope: 'full', cwd, head: null, command: 'true' });
+        expect(outcome.exitCode).toBe(0);
+        expect(scheduler.attemptStatus({ requestId: 'held' }), String(index)).toMatchObject({ state: 'admission-failed', started: false, error: { code: 'spawn_failed' } });
+      }
+      expect(history.size).toBe(64);
+      expect(history.has('held')).toBe(true);
+      // Once the log is writable again, the next retry indexes it and the bound evicts it like any other.
+      rmSync(requestLog, { recursive: true });
+      await expect(scheduler.submit({ jobId: 'unindexed', requestId: 'held', scope: 'full', cwd: missing, head: null, command: 'true' })).rejects.toThrow(/ENOENT/);
+      expect(history.size).toBe(64);
+      await scheduler.submit({ jobId: 'unindexed', requestId: 'ordinary-last', scope: 'full', cwd, head: null, command: 'true' });
+      expect(history.size).toBe(64);
+      expect(history.has('held')).toBe(false);
+      expect(scheduler.attemptStatus({ requestId: 'held' })).toMatchObject({ state: 'admission-failed', started: false, error: { code: 'spawn_failed' } });
+    } finally { await scheduler.dispose(); }
+  });
+
   it('rejects a queued request parked on its queued frame when dispose runs', async () => {
     const { scheduler } = makeScheduler({ maxConcurrent: 1 });
     scheduler.start();
