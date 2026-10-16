@@ -88,15 +88,16 @@ async function driveBaseline(mode: 'none' | 'head' | 'dirty'): Promise<DriverRun
     appendFileSync(join(clone, '.git', 'info', 'exclude'), '/node_modules\n');
     const preload = join(dir, 'probe-preload.mjs');
     writeFileSync(preload, PROBE_PRELOAD);
-    const exitCode = await new Promise<number | null>((resolve) => {
+    const { exitCode, output } = await new Promise<{ readonly exitCode: number | null; readonly output: string }>((resolve) => {
       const child = execFile(process.execPath, [join(root, 'tools', 'verify-restart-recovery-baseline.mjs')], {
-        cwd: clone, timeout: 120_000, maxBuffer: 64 * 1024 * 1024,
+        cwd: clone, timeout: 25_000, maxBuffer: 64 * 1024 * 1024,
         env: { ...process.env, NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`, GRU_BASELINE_FIXTURE_MODE: mode, GRU_BASELINE_FIXTURE_REPO: clone },
-      }, () => resolve(child.exitCode));
+      }, (error, stdout, stderr) => resolve({ exitCode: child.exitCode, output: `${error === null ? '' : `${String(error)}\n`}${stdout}${stderr}` }));
     });
     const attempts = join(clone, '_bmad-output', 'verification', 'gh-286-baseline', head);
-    const [attempt] = existsSync(attempts) ? readdirSync(attempts) : [];
-    if (attempt === undefined) throw new Error(`the driver (${mode}) left no attempt, exit ${String(exitCode)}`);
+    const made = existsSync(attempts) ? readdirSync(attempts) : [];
+    if (made.length !== 1) throw new Error(`the driver (${mode}) left ${String(made.length)} attempts, exit ${String(exitCode)}:\n${output}`);
+    const attempt = made[0]!;
     return { exitCode, manifest: JSON.parse(readFileSync(join(attempts, attempt, 'manifest.json'), 'utf8')) as DriverRun['manifest'] };
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }

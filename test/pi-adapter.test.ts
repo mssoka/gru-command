@@ -3733,9 +3733,9 @@ it('a directive-bearing steer or follow-up from the live turn\'s own owner waits
     let admissions = 0;
     try {
       const live = handle.prompt('go', { owner: 'alice' });
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      await vi.waitFor(() => expect(f.script.calls.map((call) => call.prompt)).toEqual(['go']));
       const directed = handle[channel]('exact accepted directive', { owner: 'alice', directive: { identity, beforeAdmission: () => { admissions += 1; }, onAdmitted: () => {} } });
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      await vi.waitFor(() => expect(events.some((event) => event.type === 'queued')).toBe(true));
       // Not delivered into the live turn: it waits in the single-writer queue, unadmitted.
       expect(events.some((event) => event.type === 'queued'), channel).toBe(true);
       expect(admissions, channel).toBe(0);

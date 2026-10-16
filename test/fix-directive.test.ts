@@ -334,10 +334,10 @@ it('P40 marks original native HEAD as a candidate only on one matching clean uns
   expect(appendCustomEvent).toHaveBeenLastCalledWith(expect.objectContaining({ payload: expect.objectContaining({ sha: head, candidate_delivery_proven: true }) }));
   // An untracked input alone — HEAD unchanged, tracked tree clean — is no proven candidate either (#363 S08-0-02).
   writeFileSync(join(lane.path, 'untracked-input.ts'), 'export const extra = 1;\n');
-  const untracked = deliver();
+  let untracked: ReturnType<typeof deliver>;
+  try { untracked = deliver(); } finally { rmSync(join(lane.path, 'untracked-input.ts')); }
   expect(untracked.sha).toBe(head); expect(untracked.note).toMatch(/untracked inputs are present/u);
   expect(appendCustomEvent).toHaveBeenLastCalledWith(expect.objectContaining({ payload: expect.objectContaining({ sha: head, candidate_delivery_proven: false }) }));
-  rmSync(join(lane.path, 'untracked-input.ts'));
   writeFileSync(join(lane.path, 'src/main.ts'), 'export function answer(): number { return 43; }\n');
   const dirty = deliver();
   expect(dirty.sha).toBe(head); expect(dirty.note).toMatch(/tracked tree is dirty/u);

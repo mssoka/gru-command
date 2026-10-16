@@ -330,9 +330,11 @@ describe('explicit phase-completion handoff (fresh dispatch and same-head rebrie
     expect(observePhaseCompletion(deps, deliver('req-other'))).toBeNull();
     expect(h.ledger.getPhaseHandoff(phase!.phaseId)?.state).toBe('awaiting');
     // ...its own completes the phase and posts the Gru hand-back, once.
-    expect(observePhaseCompletion(deps, deliver('req-ph-rbq'))).not.toBeNull();
+    const first = observePhaseCompletion(deps, deliver('req-ph-rbq'));
+    expect(first).toMatchObject({ phaseId: phase!.phaseId, created: true, closed: false });
     expect(h.ledger.getPhaseHandoff(phase!.phaseId)?.state).toBe('completed');
-    observePhaseCompletion(deps, deliver('req-ph-rbq'));
+    // A replayed delivery finishes the already-completed phase: no new debt, the same card.
+    expect(observePhaseCompletion(deps, deliver('req-ph-rbq'))).toMatchObject({ phaseId: phase!.phaseId, created: false, notificationId: first!.notificationId });
     const cards = h.ledger.listNotifications({ limit: 50 }).filter((row) => row.kind === `silas.phase-handback.${phase!.phaseId}`);
     expect(cards.map((row) => row.routing)).toEqual(['action-required']);
   });
