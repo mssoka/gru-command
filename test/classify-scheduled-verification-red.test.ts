@@ -356,6 +356,36 @@ describe('reviewed-candidate behavioral RED custody', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it('a load that exited cleanly is judged by its output even when the bound fires before its exit is seen (#358)', () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), 'gru-helper-late-exit-')));
+    try {
+      const snapshot = join(dir, 'snapshot'); mkdirSync(join(snapshot, 'dist', 'verify'), { recursive: true }); mkdirSync(join(dir, 'tmp'));
+      writeFileSync(join(snapshot, 'package.json'), '{"type":"module"}\n');
+      const helper = join(snapshot, 'dist', 'verify', 'capture-cli.js');
+      // The guard is shown the load's exit only after its bound has fired,
+      // while the load itself exits long before: the race is forced, not timed.
+      const lateExit = join(dir, 'late-exit.mjs');
+      writeFileSync(lateExit, "import { ChildProcess } from 'node:child_process';\nconst emit = ChildProcess.prototype.emit;\nChildProcess.prototype.emit = function (event, ...args) {\n  if (event !== 'exit') return emit.call(this, event, ...args);\n  setTimeout(() => emit.call(this, event, ...args), Number(process.env.GRU_HELPER_LOAD_MS) + 500);\n  return true;\n};\n");
+      const env = { GRU_HELPER_LOAD_MS: '4000', NODE_OPTIONS: `--import=${pathToFileURL(lateExit).href}` };
+      const lateGuard = () => {
+        const started = Date.now();
+        const result = libCall('require_built_helper', snapshot, join(dir, 'tmp'), env);
+        // The verdict came after the bound fired.
+        expect(Date.now() - started).toBeGreaterThanOrEqual(4000);
+        return result;
+      };
+      // A clean load is still a clean load...
+      writeFileSync(helper, 'export {};\n');
+      expect(lateGuard()).toMatchObject({ status: 0, stderr: '' });
+      // ...and a clean exit before the end of loading is said as that, not as a hang.
+      writeFileSync(helper, 'process.exit(0);\n');
+      const early = lateGuard();
+      expect(early.status).toBe(2);
+      expect(early.stderr).toMatch(/^the helper stopped before it finished loading\nthe built dist\/verify\/capture-cli\.js does not load cleanly/u);
+      expect(early.stderr).not.toMatch(/did not finish loading within/u);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 60_000);
+
   it('a helper load stopped by a signal is said so: one the guard handles takes its group and temporary directory down, one it cannot (SIGKILL) leaves them, as documented (#358)', async () => {
     const dir = realpathSync(mkdtempSync(join(tmpdir(), 'gru-helper-interrupt-')));
     const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
