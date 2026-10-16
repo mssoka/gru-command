@@ -258,6 +258,54 @@ export const DEFAULT_LESSONS_CONFIG: LessonsConfig = {
   maxReferences: 3,
 };
 
+/** How a Vector raid decision is made (#351): `proposed` waits for the
+ * owner's Accept in FOR YOU; `autonomous` lets Gru act without asking. */
+export const VECTOR_MODES = ['proposed', 'autonomous'] as const;
+export type VectorMode = (typeof VECTOR_MODES)[number];
+
+/** Vector's raids (#351): Gru-directed adversarial property campaigns off
+ * the heist path. Raids spend quota, so every user opts in (`enabled`
+ * defaults to false). Budgets never rise after failures or empty raids. */
+export interface VectorConfig {
+  /** true lets Gru plan raids; false = no candidate list, no Gru turn, no
+   * Vector session, and a chat raid request is refused with the reason. */
+  readonly enabled: boolean;
+  /** Starting a raid Gru picked: wait for the owner, or launch. */
+  readonly raidMode: VectorMode;
+  /** Turning a break-in into a fix heist: wait for the owner, or dispatch. */
+  readonly fixMode: VectorMode;
+  /** How often code rebuilds the candidate list and, when it changed, gives
+   * Gru one turn to pick; 0 = raids only on request. */
+  readonly planIntervalMs: number;
+  /** Attacks (Vector proposals) per raid. */
+  readonly maxRounds: number;
+  /** Sandboxed executions per raid (qualification controls, the attack,
+   * the baseline and the replay each count). At least
+   * VECTOR_MAX_RUNS_PER_ATTACK, or no attack could ever start. */
+  readonly maxRuns: number;
+  /** Wall-clock cap per raid. */
+  readonly maxRaidMs: number;
+  /** Token cap per raid where the runtime reports usage. */
+  readonly maxRaidTokens: number;
+  /** Raids per repository in any rolling 24 hours: started, waiting to run, or ended before starting. */
+  readonly maxRaidsPerDay: number;
+}
+
+/** The most one raid attack can cost: both controls, the attack, then the baseline and the replay when it fails. */
+export const VECTOR_MAX_RUNS_PER_ATTACK = 5;
+
+export const DEFAULT_VECTOR_CONFIG: VectorConfig = {
+  enabled: false,
+  raidMode: 'proposed',
+  fixMode: 'proposed',
+  planIntervalMs: 86_400_000,
+  maxRounds: 4,
+  maxRuns: 16,
+  maxRaidMs: 1_800_000,
+  maxRaidTokens: 400_000,
+  maxRaidsPerDay: 2,
+};
+
 /** Graceful self-roll policy (issue #34 graduation heist). */
 export interface RollConfig {
   /** Bounded drain wait before a swap (ms); 0 snapshots and swaps now. */
@@ -637,6 +685,7 @@ export interface GruCommandConfig {
   readonly lessons: LessonsConfig;
   readonly silas: SilasConfig;
   readonly providerRecovery: ProviderRecoveryConfig;
+  readonly vector: VectorConfig;
   readonly roll: RollConfig;
   readonly concurrency: ConcurrencyConfig;
   readonly review: ReviewConfig;
@@ -816,6 +865,7 @@ const TOP_LEVEL_KEYS = [
   'lessons',
   'silas',
   'provider_recovery',
+  'vector',
   'roll',
   'concurrency',
   'review',
@@ -897,6 +947,14 @@ function validateRuntimeId(value: unknown, file: string, field: string): Runtime
     );
   }
   return id as RuntimeId;
+}
+
+/** A Vector decision mode; anything else names the valid set (#351). */
+function requireVectorMode(value: unknown, file: string, field: string): VectorMode {
+  if (typeof value !== 'string' || !(VECTOR_MODES as readonly string[]).includes(value)) {
+    throw new ConfigError(`${field} must be one of ${VECTOR_MODES.map((mode) => `"${mode}"`).join(', ')}, got: ${JSON.stringify(value)}`, file, field);
+  }
+  return value as VectorMode;
 }
 
 function requireBool(value: unknown, file: string, field: string): boolean {
@@ -1083,6 +1141,7 @@ export function loadConfig(
   let lessons: LessonsConfig = DEFAULT_LESSONS_CONFIG;
   let silas: SilasConfig = DEFAULT_SILAS_CONFIG;
   let providerRecovery: ProviderRecoveryConfig = DEFAULT_PROVIDER_RECOVERY_CONFIG;
+  let vector: VectorConfig = DEFAULT_VECTOR_CONFIG;
   let roll: RollConfig = DEFAULT_ROLL_CONFIG;
   let concurrency: ConcurrencyConfig = DEFAULT_CONCURRENCY_CONFIG;
   let review: ReviewConfig = { enabled: true, maxConcurrentChildren: DEFAULT_REVIEW_CHILDREN };
@@ -1573,6 +1632,30 @@ export function loadConfig(
             : providerRecovery.claudeNative,
       };
     }
+    if (raw['vector'] !== undefined) {
+      const table = requireTable(raw['vector'], file, 'vector');
+      const VALID = ['enabled', 'raid_mode', 'fix_mode', 'plan_interval_ms', 'max_rounds', 'max_runs', 'max_raid_ms', 'max_raid_tokens', 'max_raids_per_day'];
+      for (const key of Object.keys(table)) {
+        if (!VALID.includes(key)) {
+          throw new ConfigError(`unknown key \`${key}\` in [vector] (valid keys: ${VALID.join(', ')})`, file, `vector.${key}`);
+        }
+      }
+      vector = {
+        enabled: table['enabled'] !== undefined ? requireBool(table['enabled'], file, 'vector.enabled') : vector.enabled,
+        raidMode: table['raid_mode'] !== undefined ? requireVectorMode(table['raid_mode'], file, 'vector.raid_mode') : vector.raidMode,
+        fixMode: table['fix_mode'] !== undefined ? requireVectorMode(table['fix_mode'], file, 'vector.fix_mode') : vector.fixMode,
+        planIntervalMs: table['plan_interval_ms'] !== undefined ? requireTimerInterval(table['plan_interval_ms'], file, 'vector.plan_interval_ms') : vector.planIntervalMs,
+        maxRounds: table['max_rounds'] !== undefined ? requirePositiveInt(table['max_rounds'], file, 'vector.max_rounds') : vector.maxRounds,
+        maxRuns: table['max_runs'] !== undefined ? requirePositiveInt(table['max_runs'], file, 'vector.max_runs') : vector.maxRuns,
+        maxRaidMs: table['max_raid_ms'] !== undefined ? requireTimerInterval(table['max_raid_ms'], file, 'vector.max_raid_ms') : vector.maxRaidMs,
+        maxRaidTokens: table['max_raid_tokens'] !== undefined ? requirePositiveInt(table['max_raid_tokens'], file, 'vector.max_raid_tokens') : vector.maxRaidTokens,
+        maxRaidsPerDay: table['max_raids_per_day'] !== undefined ? requirePositiveInt(table['max_raids_per_day'], file, 'vector.max_raids_per_day') : vector.maxRaidsPerDay,
+      };
+      if (vector.maxRaidMs === 0) throw new ConfigError('vector.max_raid_ms must be positive (a raid always has a wall-clock cap)', file, 'vector.max_raid_ms');
+      if (vector.maxRuns < VECTOR_MAX_RUNS_PER_ATTACK) {
+        throw new ConfigError(`vector.max_runs must be at least ${String(VECTOR_MAX_RUNS_PER_ATTACK)}: one attack can need that many sandboxed runs (both controls, the attack, the baseline and the replay), so a smaller cap never attacks`, file, 'vector.max_runs');
+      }
+    }
     if (raw['roll'] !== undefined) {
       const table = requireTable(raw['roll'], file, 'roll');
       for (const key of Object.keys(table)) {
@@ -1732,6 +1815,7 @@ export function loadConfig(
     lessons,
     silas,
     providerRecovery,
+    vector,
     roll,
     concurrency,
     review,

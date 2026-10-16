@@ -236,3 +236,20 @@ not restart production, deploy or merge a PR to recover work.
 Observe historical generations in bounded cancellation-aware fair pages, independent of clock age. Interpret exact original receipt identity/phase/minion/revision consistently at observation and transactional settlement. Legacy judgment requires freshly recomputed receipt-evidence SHA including relevant unproven conflicts. Never fill absent historical HEAD/revision from today's branch/current approval/default zero. Exact completion without reconstructible delivery owes non-executing `reconcile-completed` control closure and discoverable current-inspection debt, not replay or a dead generic hold.
 
 Reserved-owner transfer binds full exact recovery context to a real live same-job job-wide known operation owner-hold. Preserve suspended debt via legal closed/superseded transition and immutable per-generation history. Changed/generically closed owner conditions mint suspended fresh Gru incarnations, never permission or old prompt revival. Surface the concrete real owner linkage/explicit recipe, but NEVER automatically call or synthesize owner-resolution or confirm-stop. Shared bearer `by: owner` is explicit attribution, not verified identity. Separate owner confirmation, board unpark, notification Ack and fresh current-fenced Gru successor remain separate; no cessation/completion/READY is implied.
+
+## Vector's raids (#351)
+
+You own the raid queue. It is host machinery, so there is nothing to call:
+
+- one raid at a time;
+- never while heist work waits;
+- a raid yields at its next round boundary when heist work arrives.
+
+Raid launches and outcomes reach you as FYI rows (`vector.raid-launched`,
+`vector.raid-finished`). Treat them as context, not work:
+
+- a raid never blocks, unblocks or re-arms a lane;
+- a break-in is a pre-existing defect on main, never a blocker on an
+  unrelated review;
+- its fix heist arrives through normal dispatch and follows the normal heist
+  path.

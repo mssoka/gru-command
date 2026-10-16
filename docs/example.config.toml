@@ -187,6 +187,23 @@ retry_after_max_ms = 3600000      # cap honored for trustworthy Retry-After hint
 probe_timeout_ms = 30000          # finite timeout for one probe I/O / reservation expiry
 glm_generation_fallback = false   # GLM bounded generation fallback; overlay: disabled in production
 
+[vector]                          # Vector's raids (docs/VECTOR.md) — off until you opt in
+# Gru-directed adversarial property campaigns against code already on the
+# default branch, off the heist path. Raids gate nothing, and a raid that
+# finds nothing is never a pass. A repository opts out with
+# `[vector] enabled = false` in its .gru-command/worktree.toml.
+enabled = false                   # true lets Gru plan raids; false = no raids, no Vector sessions
+raid_mode = "proposed"            # "proposed": each raid Gru picks waits for your Accept in FOR YOU
+                                  # "autonomous": Gru launches raids without asking
+fix_mode = "proposed"             # "proposed": each break-in waits for your Accept in FOR YOU
+                                  # "autonomous": Gru dispatches the fix heist without asking
+plan_interval_ms = 86400000       # how often Gru reviews raid candidates; 0 = raids only on request
+max_rounds = 4                    # attacks Vector may propose per raid
+max_runs = 16                     # sandboxed executions per raid (3–5 per attack; at least 5)
+max_raid_ms = 1800000             # wall-clock cap per raid
+max_raid_tokens = 400000          # token cap per raid, where the runtime reports usage
+max_raids_per_day = 2             # per repository, rolling 24 hours (started, waiting, or ended before starting)
+
 [review]
 max_concurrent_children = 2     # lead-selected lens-children ceiling in the pool (<= 32); a round still caps at 16 runs / 2 attempts per lens
 # Review gate policy (user amendment 2026-09-20). Optional; enabled by default.

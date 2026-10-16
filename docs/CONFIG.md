@@ -420,6 +420,40 @@ probe_timeout_ms = 30000
 # false means GLM checks fail closed (no readiness endpoint exists yet).
 glm_generation_fallback = false
 
+[vector]
+# Vector's raids (#351, docs/VECTOR.md): Gru-directed adversarial property
+# campaigns against code already on the default branch, off the heist path.
+# Raids gate nothing: no merge, review or verification waits on one, and a
+# raid that finds nothing is never a pass. Raids spend quota, so they are
+# off until you opt in: true lets Gru plan raids; false = no candidate list,
+# no Gru turn, no Vector session, and a chat raid request is refused.
+# A repository opts out with `[vector] enabled = false` in its own
+# .gru-command/worktree.toml.
+enabled = false
+# "proposed": each raid Gru picks waits for your Accept in FOR YOU.
+# "autonomous": Gru launches raids without asking (board activity only).
+raid_mode = "proposed"
+# "proposed": each break-in waits for your Accept in FOR YOU before Gru
+# dispatches its fix heist. "autonomous": Gru dispatches it without asking.
+fix_mode = "proposed"
+# How often code rebuilds the raid candidate list (ms); only a changed list
+# costs a Gru turn. 0 = raids only when you ask Gru in chat.
+plan_interval_ms = 86400000
+# Per-raid budgets, never raised after failures or an empty raid. Each
+# attack runs a known-bad and a healthy control before it runs against the
+# target, plus a baseline and a fresh replay when it fails, so one round
+# costs three to five sandboxed runs. A round starts only while five runs
+# are left, so max_runs is at least 5.
+max_rounds = 4
+max_runs = 16
+max_raid_ms = 1800000
+# Token cap where the runtime reports usage; when it does not, the round,
+# run and time caps still bind and the raid report says so.
+max_raid_tokens = 400000
+# Raids per repository in any rolling 24 hours: started, waiting to run,
+# or ended before starting (refused, or failed before they started).
+max_raids_per_day = 2
+
 [roll]
 # Graceful self-roll drain policy: how long the service waits for
 # in-flight review rounds and mid-turn agent sessions to settle before it
@@ -534,6 +568,48 @@ real liveness. See
 semantics, and the session-store contract, and
 [SUPERVISION.md](./SUPERVISION.md) for the supervision policy the
 `[supervision]` table drives plus the log-rotation knobs.
+
+### Vector's raids: `proposed` or `autonomous`
+
+`[vector]` is off by default, because raids spend quota. Turn it on with
+`enabled = true`. Two settings then decide how much Gru does without asking
+you. [VECTOR.md](./VECTOR.md) describes the whole flow.
+
+- **`raid_mode`** decides what happens when Gru picks a package to raid.
+  - **`"proposed"` (default).** Say Gru picks `billing-api/src/refunds` because
+    twelve commits landed there since its last raid. You get one FOR YOU card:
+    "Launch Vector's raid on billing-api/src/refunds?", with Gru's reason, the
+    budget and the ranking signals. Accept queues the raid for Silas. Decline
+    is recorded, and that package is not proposed again until its code
+    changes. If the code changes before you answer, the card is withdrawn.
+  - **`"autonomous"`.** Say Gru makes the same pick overnight. The raid
+    launches straight away and waits in Silas's queue until no heist work is
+    waiting. You see "Vector raid launched: billing-api/src/refunds" in the
+    board's activity, not in FOR YOU. The daily cap still binds: with
+    `max_raids_per_day = 2`, a third raid on billing-api within 24 hours is
+    refused, and the refusal names the cap.
+- **`fix_mode`** decides what happens when a raid breaks in: a qualified
+  counterexample that a fresh replay confirmed.
+  - **`"proposed"` (default).** Say the raid finds that a refund of `-1`
+    cents comes back negative, and a fresh replay reproduces it. You get one
+    FOR YOU card: "Dispatch a fix heist for Vector's break-in on
+    billing-api/src/refunds?". It shows the invariant, the counterexample and
+    the replay seed, and its Details hold the frozen contract, the shrink path
+    and the receipts. Only Accept makes Gru dispatch the fix heist. Decline is
+    recorded, and the same requirement and invariant is not proposed again
+    until that package's code changes.
+  - **`"autonomous"`.** The same break-in dispatches the fix heist at once,
+    and you see "Vector fix heist dispatched" in the board's activity. If the
+    dispatch fails, Gru gets an action-required row, and the dispatch is
+    retried every five minutes.
+
+  Either way, the fix runs through normal review, convergence, verification
+  and readiness.
+
+Asking Gru in chat to raid a package counts as your Accept. It is checked
+against the same candidate list, so a package code excluded is refused, with
+the reason. With `enabled = false`, a chat request is refused and says how to
+turn raids on.
 
 ### Mailbox recovery cadence
 

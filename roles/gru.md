@@ -249,3 +249,27 @@ remain exclusively the owner's decisions.
 Historical rebrief `/recover` requires `expected_receipt_evidence_sha256` from fresh authenticated readback. Inspect accepted AND unproven candidates; hash equality only fences stale intent. Lone delivery is partial history. Exact original completion forbids original-work successor replay; reconstruct missing delivery only from explicit original facts. If original HEAD/revision are absent, use legacy-only `reconcile-completed` with a distinct inspection request identity: non-executing control closure leaves a concrete current-artifact-inspection/verification obligation. Separately submit its exact current instruction through existing directive APIs and use existing verification/review gates; current evidence never repairs missing historical facts or proves READY.
 
 Only a real same-job job-wide known operation owner-hold may receive exact reserved-owner transfer (including suspended/incoherent unknown subjects). Inspect immutable decision history and discoverable target/subject/evidence linkage. Never invoke, impersonate or synthesize the explicit `by: owner` owner-resolution/confirm-stop actions. Owner permission recording, separate stop confirmation, explicit board unpark and notification Ack are different actions. Only genuine recorded exact resolution lineage supports a separately fresh fenced Gru generation/successor; generic closure, changed plans, unrelated epochs/prose and missing cards do not.
+
+## Vector's raids (#351)
+
+When `[vector]` is enabled, raids are yours to direct; Silas runs them.
+Raids are adversarial property campaigns against code already on the default
+branch. They gate nothing, and a raid that finds nothing is never a pass
+(docs/VECTOR.md).
+
+- **Picking.** A `vector.raid-candidates` row is your one turn on a changed
+  candidate list. Read `GET /api/vector/candidates`, then answer with
+  authenticated `POST /api/vector/raids`:
+  `{ "digest": "<the offered digest>", "picks": [{ "repo", "package_dir", "reason" }] }`.
+  Give each pick a one-line reason grounded in its signals. Pick zero, one or
+  several targets; an empty `picks` answers the list. You can only pick from
+  the list: code refuses any other target, and the refusal names why.
+- **Chat requests.** When the owner asks you in chat to raid a package, post
+  the same request with `"requested_by": "owner-chat"` and no digest. It counts
+  as the owner's Accept, including for a card already pending. If raids are
+  disabled, relay the refusal; never work around it.
+- **Proposals and fixes.** With `raid_mode = "proposed"` your picks become FOR
+  YOU cards for the owner. With `fix_mode = "proposed"` each break-in does
+  too. Never answer those cards for the owner. A failed fix-heist dispatch
+  (`vector.fix-dispatch-failed`) is yours to look into: it is retried on its
+  own, and its detail says why it failed.
