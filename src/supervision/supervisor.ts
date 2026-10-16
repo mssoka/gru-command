@@ -37,6 +37,16 @@ import { RestartCleanupJournal, restartCleanupDiagnostic, type RestartCleanupDeb
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
 /** Default backoff sleep: a real, unref'd timer (tests inject a fake). */
+/** A thrown value's text for a reason or detail: never blank, never a second throw. */
+function failureText(error: unknown): string {
+  try {
+    const text = String(error);
+    return text.trim() === '' ? 'an error with no text' : text;
+  } catch {
+    return 'an error that cannot be printed';
+  }
+}
+
 function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     const timer = setTimeout(resolve, ms);
@@ -3549,7 +3559,7 @@ export class Supervisor {
     try {
       return this.ledger.hasSupervisionStopSuperseded(notificationId) ? { ok: true, rearmed: false, superseded: true } : { ok: true, rearmed: false };
     } catch (error) {
-      const failure = String(error) || 'an error with no text';
+      const failure = failureText(error);
       // Whether the alert is a breaker decides whether the lost answer
       // matters; a kind that cannot be read is treated as a breaker (fail
       // closed). No alert at all has no stop whose answer could be lost.
@@ -3558,7 +3568,7 @@ export class Supervisor {
       try {
         breaker = this.ledger.getNotification(notificationId)?.kind === 'supervision.breaker';
       } catch (kindError) {
-        kindFailure = String(kindError) || 'an error with no text';
+        kindFailure = failureText(kindError);
         this.log('error', 'notification kind lookup failed after a failed closure lookup — treating it as a breaker alert', { notification_id: notificationId, error: kindFailure });
       }
       if (onFailure === 'refuse' && breaker) {

@@ -90,6 +90,16 @@ interface Client {
   pongMisses: number;
 }
 
+/** A thrown value's text for a reason or detail: never blank, never a second throw. */
+function failureText(error: unknown): string {
+  try {
+    const text = String(error);
+    return text.trim() === '' ? 'an error with no text' : text;
+  } catch {
+    return 'an error that cannot be printed';
+  }
+}
+
 function json(res: import('node:http').ServerResponse, status: number, body: unknown): void {
   const payload = `${JSON.stringify(body)}\n`;
   res.writeHead(status, {
@@ -870,7 +880,7 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
                 // The supervisor already acted: the caller is told so, typed —
                 // never a bare failure that hides the re-arm or closure.
                 if (acted === 'not_applicable') throw error;
-                const failure = String(error) || 'an error with no text';
+                const failure = failureText(error);
                 const recorded = recordActed('failed', failure);
                 json(res, 500, { error: 'disposition_failed', code: 'disposition_failed', rearm, detail: `${failure}${actedNote(recorded)}` });
                 return;

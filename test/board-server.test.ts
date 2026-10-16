@@ -1871,6 +1871,12 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
         expect(await postJson(harness.port, `/api/notifications/${encodeURIComponent(failing.id)}/disposition`, 'board-test-token', { detail: 'silent failure' }))
           .toMatchObject({ status: 500, body: { error: 'disposition_failed', rearm: 'accepted', detail: 'an error with no text — the supervisor had already acted on it (rearm: accepted) (and that could not be recorded in the ledger); the alert stays open: retriage or resolve it' } });
       } finally { unrecorded.mockRestore(); silentDisposal.mockRestore(); }
+      // One that cannot print is still a typed 500 that names it so.
+      const unprintable = vi.spyOn(harness.api, 'disposeMachineNotification').mockImplementation(() => { throw Object.assign(new Error(''), { toString: () => { throw new Error('no'); } }); });
+      try {
+        expect(await postJson(harness.port, `/api/notifications/${encodeURIComponent(failing.id)}/disposition`, 'board-test-token', { detail: 'unprintable failure' }))
+          .toMatchObject({ status: 500, body: { error: 'disposition_failed', rearm: 'accepted', detail: expect.stringMatching(/^an error that cannot be printed — the supervisor had already acted on it/u) } });
+      } finally { unprintable.mockRestore(); }
       // A resolved action-required row stays an idempotent retry.
       const note = harness.notifications.post({ kind: 'job.note', routing: 'action-required', severity: 'info', title: 'handled' });
       for (const attempt of ['first', 'retry']) {

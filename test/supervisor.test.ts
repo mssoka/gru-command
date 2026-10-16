@@ -6137,6 +6137,7 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: 'b', jobId: '', payload: { notification_id: 'blank-job' } });
       rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: ' ', jobId: '\t', payload: { notification_id: 'blank-job' } });
       rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: 'b', jobId: ' ', payload: { notification_id: 'blank-job' } });
+      rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: ' ', jobId: 'fenced-job', payload: { notification_id: 'blank-job' } });
       expect(rig.api.hasSupervisionStopSuperseded('blank-job')).toBe(false);
       expect(rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: 'blank-job' } })).toBe(true);
       expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: 'b', jobId: 'fenced-job', payload: { notification_id: 'blank-job' } })).toThrow(SupervisionStopClosureConflictError);
@@ -6199,6 +6200,10 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
         const silent = vi.spyOn(rig.api, 'getNotification').mockImplementation(() => { throw textless(); });
         try {
           expect(rig.supervisor.onNotificationDisposed(note.id)).toEqual({ ok: false, reason: 'superseded closure lookup failed — retry the disposition: an error with no text; its alert kind could not be read either: an error with no text' });
+          // Text that is only blanks is no text; one that cannot print is named so.
+          spy.mockImplementation(() => { throw Object.assign(new Error(''), { toString: () => ' \t ' }); });
+          silent.mockImplementation(() => { throw Object.assign(new Error(''), { toString: () => { throw new Error('no'); } }); });
+          expect(rig.supervisor.onNotificationDisposed(note.id)).toEqual({ ok: false, reason: 'superseded closure lookup failed — retry the disposition: an error with no text; its alert kind could not be read either: an error that cannot be printed' });
         } finally {
           silent.mockRestore();
         }
