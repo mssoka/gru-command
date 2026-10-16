@@ -580,14 +580,26 @@ you. [VECTOR.md](./VECTOR.md) describes the whole flow.
     budget and the ranking signals. Accept queues the raid for Silas. Decline
     is recorded, and that package is not proposed again until its code
     changes. If the code changes before you answer, the card is withdrawn.
-  - **`"autonomous"`.** The same pick launches straight away. You see it in
-    the board's activity, not in FOR YOU.
+  - **`"autonomous"`.** Say Gru makes the same pick overnight. The raid
+    launches straight away and waits in Silas's queue until no heist work is
+    waiting. You see "Vector raid launched: billing-api/src/refunds" in the
+    board's activity, not in FOR YOU. The daily cap still binds: with
+    `max_raids_per_day = 2`, a third raid on billing-api within 24 hours is
+    refused, and the refusal names the cap.
 - **`fix_mode`** decides what happens when a raid breaks in: a qualified
   counterexample that a fresh replay confirmed.
-  - **`"proposed"` (default).** You get a FOR YOU card carrying the frozen
-    contract, the replay data and the receipts. Only Accept makes Gru dispatch
-    the fix heist.
-  - **`"autonomous"`.** Gru dispatches the fix heist directly.
+  - **`"proposed"` (default).** Say the raid finds that a refund of `-1`
+    cents comes back negative, and a fresh replay reproduces it. You get one
+    FOR YOU card: "Dispatch a fix heist for Vector's break-in on
+    billing-api/src/refunds?". It shows the invariant, the counterexample and
+    the replay seed, and its Details hold the frozen contract, the shrink path
+    and the receipts. Only Accept makes Gru dispatch the fix heist. Decline is
+    recorded, and the same requirement and invariant is not proposed again
+    until that package's code changes.
+  - **`"autonomous"`.** The same break-in dispatches the fix heist at once,
+    and you see "Vector fix heist dispatched" in the board's activity. If the
+    dispatch fails, Gru gets an action-required row, and the dispatch is
+    retried every five minutes.
 
   Either way, the fix runs through normal review, convergence, verification
   and readiness.

@@ -1,23 +1,37 @@
 import { randomUUID } from 'node:crypto';
+import { join } from 'node:path';
 import type { VectorConfig } from '../config.js';
 import type { EventBus } from '../events/bus.js';
-import type { LedgerApi } from '../ledger/api.js';
+import { NotificationDecisionRefusal, type LedgerApi } from '../ledger/api.js';
 import { parseNotificationDecision, type NotificationDecision } from '../ledger/notification-decision.js';
 import type { LogLevel } from '../logger.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { PackageResolution } from '../property/types.js';
 import { buildRaidCandidates, type RaidCandidate, type RaidCandidateList } from './candidates.js';
 import { breakInContract, fixHeistJobId, fixHeistTitle, renderFixBriefing } from './fix.js';
-import { repositoryRollups, signalsPayload, VECTOR_EVENTS, VectorLedger, type BreakInRecord, type RaidRecord, type RaidRequester, type RaidTarget, type RepositoryRollup } from './ledger.js';
+import {
+  offerKey,
+  raidsTowardCap,
+  repositoryRollups,
+  signalsPayload,
+  VECTOR_EVENTS,
+  VectorLedger,
+  type BreakInRecord,
+  type RaidRecord,
+  type RaidRequester,
+  type RaidTarget,
+  type RepositoryRollup,
+} from './ledger.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
 /**
- * Vector's raids, planning half (#351 §1–2): code builds the candidate list,
- * Gru picks from it, and a pick either waits for the owner in FOR YOU
+ * Vector's raids, planning half (#351 §1–2, §4): code builds the candidate
+ * list, Gru picks from it, and a pick either waits for the owner in FOR YOU
  * (`raid_mode = "proposed"`) or launches (`"autonomous"`, or a chat request,
  * which counts as the owner's Accept). A launched raid waits in Silas's raid
- * queue. Raids gate nothing: no heist path reads any of this.
+ * queue. A confirmed break-in becomes a fix proposal or a fix heist. Raids
+ * gate nothing: no heist path reads any of this.
  */
 
 /** Gru's turn: an action-required row carrying the changed candidate list. */
@@ -95,11 +109,15 @@ const targetName = (target: RaidTarget): string => {
   return name.length <= 160 ? name : `${name.slice(0, 159)}…`;
 };
 
+const sameTarget = (left: RaidTarget, right: RaidTarget): boolean => left.repo === right.repo && left.packageDir === right.packageDir;
+
+/** Two contracts are the same when they name the same requirement and invariant (whitespace aside). */
+const contractKey = (breakIn: BreakInRecord): string => `${breakIn.requirementRef.trim()}\u0000${breakIn.invariant.replace(/\s+/gu, ' ').trim()}`;
+
 function oneLine(value: unknown, what: string, max: number): string {
   if (typeof value !== 'string') throw new VectorRefusal('invalid_pick', `${what} must be a string`);
   const trimmed = value.trim();
-  // Control, format, separator, private-use and unassigned characters are
-  // refused: the value is shown on owner-facing cards.
+  // The value is shown on owner-facing cards: nothing that can break, reorder or hide a line.
   if (trimmed === '' || LINE_UNSAFE.test(trimmed)) throw new VectorRefusal('invalid_pick', `${what} must be one non-blank line of visible text`);
   if (trimmed.length > max) throw new VectorRefusal('invalid_pick', `${what} must be at most ${String(max)} characters`);
   return trimmed;
@@ -113,10 +131,12 @@ export class VectorService {
   private firstTick: ReturnType<typeof setTimeout> | null = null;
   private reconcileTimer: ReturnType<typeof setInterval> | null = null;
   private unsubscribe: (() => void) | null = null;
+  /** Break-ins whose fix follow-through is in flight (one dispatch at a time each). */
+  private readonly fixInFlight = new Set<string>();
 
   constructor(private readonly opts: VectorServiceOptions) {
-    this.store = new VectorLedger(opts.ledger);
     this.log = opts.log ?? (() => {});
+    this.store = new VectorLedger(opts.ledger, this.log);
     this.now = opts.now ?? (() => new Date());
   }
 
@@ -124,7 +144,7 @@ export class VectorService {
     return this.opts.vector.enabled;
   }
 
-  /** Boot: reconcile proposals, follow owner decisions, start the plan cadence. */
+  /** Boot: follow owner decisions, reconcile, start the plan cadence. */
   start(): void {
     if (!this.enabled) {
       this.log('info', 'vector raids disabled ([vector] enabled = false): no candidate list, no Gru turn, no Vector session', {});
@@ -136,16 +156,14 @@ export class VectorService {
       const id = (event.payload as { id?: unknown } | null)?.id;
       if (typeof id !== 'string') return;
       try { this.followDecision(id); } catch (error) {
-        this.log('error', 'vector raid decision follow-through failed; the next reconcile retries it', { notification: id, error: String(error) });
+        this.log('error', 'vector decision follow-through failed; the next reconcile retries it', { notification: id, error: String(error) });
       }
     });
-    this.reconcile();
     // Decisions and fix dispatches a failure left undone are retried even
     // when planning is off (plan_interval_ms = 0).
-    this.reconcileTimer = (this.opts.setInterval ?? setInterval)(() => {
-      try { this.reconcile(); } catch (error) { this.log('error', 'vector reconcile failed; the next interval retries it', { error: String(error) }); }
-    }, RECONCILE_INTERVAL_MS);
+    this.reconcileTimer = (this.opts.setInterval ?? setInterval)(() => this.safeReconcile(), RECONCILE_INTERVAL_MS);
     this.reconcileTimer.unref?.();
+    this.safeReconcile();
     if (this.opts.vector.planIntervalMs > 0) {
       const tick = (): void => {
         try { this.planTick(); } catch (error) { this.log('error', 'vector raid planning failed; the next interval retries it', { error: String(error) }); }
@@ -172,6 +190,10 @@ export class VectorService {
     this.reconcileTimer = null;
   }
 
+  private safeReconcile(): void {
+    try { this.reconcile(); } catch (error) { this.log('error', 'vector reconcile failed; the next interval retries it', { error: String(error) }); }
+  }
+
   private requireEnabled(): void {
     if (!this.enabled) {
       throw new VectorRefusal('vector_disabled', 'Vector raids are disabled: set [vector] enabled = true in config.toml to let Gru plan raids');
@@ -181,14 +203,17 @@ export class VectorService {
   /** The code-built, ranked candidate list (fresh on every call). */
   candidates(): RaidCandidateList {
     this.requireEnabled();
-    const raids = this.store.raids();
+    return this.buildList(this.store.raids(), this.opts.vector.maxRaidsPerDay, true);
+  }
+
+  private buildList(raids: readonly RaidRecord[], maxRaidsPerDay: number, signals: boolean): RaidCandidateList {
     return buildRaidCandidates({
       workspaceRoot: this.opts.workspaceRoot,
       managedRepos: this.opts.managedRepos,
-      maxRaidsPerDay: this.opts.vector.maxRaidsPerDay,
+      maxRaidsPerDay,
       raids,
-      perkinsFindings: (repo, since) => this.perkinsFindings(repo, since),
-      escapedRegressions: (target) => this.store.breakIns().filter((entry) => entry.target.repo === target.repo && entry.target.packageDir === target.packageDir).length,
+      perkinsFindings: (repo, since) => (signals ? this.perkinsFindings(repo, since) : 0),
+      escapedRegressions: (target) => (signals ? this.store.breakIns().filter((entry) => sameTarget(entry.target, target)).length : 0),
       ...(this.opts.resolvePackages === undefined ? {} : { resolvePackages: this.opts.resolvePackages }),
       now: this.now(),
     });
@@ -198,22 +223,45 @@ export class VectorService {
     return this.store.raids();
   }
 
+  breakIns(): readonly BreakInRecord[] {
+    return this.store.breakIns();
+  }
+
+  /** Spend and yield per repository across every raid that ran anything (#351 §5). */
+  rollup(): readonly RepositoryRollup[] {
+    return repositoryRollups(this.store.raids());
+  }
+
   /**
-   * One planning tick: no eligible candidate means no Gru turn; a list Gru
-   * already answered (or is still answering) is never offered again.
+   * One planning tick. No eligible candidate means no Gru turn. A candidate
+   * Gru already saw in an answered list, at the same source identity, is
+   * never offered again (picking one target from a list does not re-offer
+   * the rest); a newer list supersedes an unanswered one.
    */
   planTick(): { readonly offered: boolean; readonly digest: string | null } {
     this.requireEnabled();
     this.reconcile();
     const list = this.candidates();
-    if (list.candidates.length === 0) return { offered: false, digest: null };
-    if (this.store.plan(list.digest) !== null) return { offered: false, digest: list.digest };
-    // A newer list supersedes any offer Gru has not answered yet.
-    for (const open of this.store.openPlans()) {
-      this.opts.ledger.resolveNotificationById(open.notificationId, 'vector-plan-superseded');
-      this.store.record(VECTOR_EVENTS.planDecided, { digest: open.digest, picks: 0, superseded_by: list.digest });
+    const supersede = (by: string | null): void => {
+      for (const open of this.store.openPlans()) {
+        this.opts.ledger.resolveNotificationById(open.notificationId, 'vector-plan-superseded');
+        this.store.record(VECTOR_EVENTS.planDecided, { digest: open.digest, picks: 0, superseded_by: by });
+      }
+    };
+    if (list.candidates.length === 0) {
+      supersede(null);
+      return { offered: false, digest: null };
     }
-    const notificationId = `vector-plan:${list.digest.slice(0, 24)}`;
+    const open = this.store.openPlans();
+    if (open.some((plan) => plan.digest === list.digest)) return { offered: false, digest: list.digest };
+    const seen = new Set(this.store.decidedOffers());
+    const keys = list.candidates.map((candidate) => offerKey(candidate.target.repo, candidate.target.packageDir, candidate.sourceIdentity));
+    if (keys.every((key) => seen.has(key))) {
+      supersede(null);
+      return { offered: false, digest: list.digest };
+    }
+    supersede(list.digest);
+    const notificationId = `vector-plan:${list.digest.slice(0, 24)}:${String(this.store.planCount())}`;
     this.opts.notifications.post({
       id: notificationId,
       kind: RAID_CANDIDATES_KIND,
@@ -222,7 +270,7 @@ export class VectorService {
       title: `Vector raid candidates changed (${String(list.candidates.length)})`,
       detail: this.planDetail(list),
     });
-    this.store.record(VECTOR_EVENTS.planOffered, { digest: list.digest, notification_id: notificationId, candidates: list.candidates.length });
+    this.store.record(VECTOR_EVENTS.planOffered, { digest: list.digest, notification_id: notificationId, candidates: list.candidates.length, offered: keys });
     return { offered: true, digest: list.digest };
   }
 
@@ -242,14 +290,20 @@ export class VectorService {
     ].join('\n');
   }
 
-  /** Validate and record Gru's picks (or the owner's chat request). Atomic: one invalid pick refuses them all. */
+  /**
+   * Validate and record Gru's picks (or the owner's chat request). Every pick
+   * is validated, and the daily cap checked, before anything is recorded; one
+   * invalid pick refuses them all. A failure while recording leaves what was
+   * recorded for the next reconcile to finish (a pick with no card gets one).
+   */
   pick(request: PickRequest): PickResult {
     this.requireEnabled();
     // Withdraw stale proposals first: a pending proposal that survives is
     // current, and a retried pick of its target reuses it.
     this.reconcile();
     const list = this.candidates();
-    const pending = this.store.raids().filter((raid) => raid.state === 'proposed');
+    const raidsNow = this.store.raids();
+    const pending = raidsNow.filter((raid) => raid.state === 'proposed');
     const chosen: { readonly candidate: RaidCandidate | null; readonly reuse: RaidRecord | null; readonly reason: string }[] = [];
     const seen = new Set<string>();
     for (const [index, raw] of request.picks.entries()) {
@@ -259,23 +313,36 @@ export class VectorService {
       const key = `${repo}\u0000${packageDir}`;
       if (seen.has(key)) throw new VectorRefusal('invalid_pick', `picks[${String(index)}] repeats ${repo}/${packageDir}`);
       seen.add(key);
-      const reuse = pending.find((raid) => raid.target.repo === repo && raid.target.packageDir === packageDir);
+      const reuse = pending.find((raid) => sameTarget(raid.target, { repo, packageDir }));
       if (reuse !== undefined) { chosen.push({ candidate: null, reuse, reason }); continue; }
-      const candidate = list.candidates.find((entry) => entry.target.repo === repo && entry.target.packageDir === packageDir);
+      const candidate = list.candidates.find((entry) => sameTarget(entry.target, { repo, packageDir }));
       if (candidate === undefined) {
         const excluded = list.exclusions.find((entry) => entry.repo === repo && (entry.packageDir === null || entry.packageDir === packageDir));
         throw new VectorRefusal('not_a_candidate', `${repo}/${packageDir} is not a raid candidate: ${excluded?.reason ?? 'code found no runnable package there'}`);
       }
       chosen.push({ candidate, reuse: null, reason });
     }
+    // The daily cap holds across the whole request: picks that launch now
+    // (autonomous, or a chat request) count with what already counts.
+    const launchesNow = request.requestedBy === 'owner-chat' || this.opts.vector.raidMode === 'autonomous';
+    if (launchesNow) {
+      const perRepo = new Map<string, number>();
+      for (const entry of chosen) {
+        const repo = (entry.candidate?.target ?? entry.reuse!.target).repo;
+        perRepo.set(repo, (perRepo.get(repo) ?? 0) + 1);
+      }
+      for (const [repo, count] of perRepo) {
+        const already = raidsTowardCap(raidsNow, repo, this.now());
+        if (already + count > this.opts.vector.maxRaidsPerDay) {
+          throw new VectorRefusal('not_a_candidate', `${repo}: ${String(count)} more raid(s) would pass the daily raid cap (${String(already)} of ${String(this.opts.vector.maxRaidsPerDay)} in the last 24 hours)`);
+        }
+      }
+    }
     const raids: RaidRecord[] = [];
     for (const { candidate, reuse, reason } of chosen) {
       if (reuse !== null) {
         // The owner asking in chat is the owner's Accept of the pending card.
-        if (request.requestedBy === 'owner-chat' && reuse.notificationId !== null) {
-          this.opts.ledger.recordNotificationDecision(reuse.notificationId, 'accept', 'owner-chat');
-          this.followDecision(reuse.notificationId);
-        }
+        if (request.requestedBy === 'owner-chat' && reuse.notificationId !== null) this.acceptOnChat(reuse.notificationId);
         raids.push(this.store.raid(reuse.id)!);
         continue;
       }
@@ -297,13 +364,22 @@ export class VectorService {
       raids.push(this.store.raid(raidId)!);
     }
     if (request.digest !== null) {
-      const plan = this.store.plan(request.digest);
-      if (plan !== null && plan.decidedAt === null) {
+      for (const plan of this.store.openPlans().filter((entry) => entry.digest === request.digest)) {
         this.store.record(VECTOR_EVENTS.planDecided, { digest: plan.digest, picks: chosen.length });
         this.opts.ledger.resolveNotificationById(plan.notificationId, 'gru');
       }
     }
     return { raids };
+  }
+
+  /** Record the owner's chat Accept on a pending card; a choice already recorded is carried out instead. */
+  private acceptOnChat(notificationId: string): void {
+    try {
+      this.opts.ledger.recordNotificationDecision(notificationId, 'accept', 'owner-chat');
+    } catch (error) {
+      if (!(error instanceof NotificationDecisionRefusal) || error.code !== 'decision_recorded') throw error;
+    }
+    this.followDecision(notificationId);
   }
 
   private decision(raid: RaidRecord): NotificationDecision {
@@ -346,45 +422,97 @@ export class VectorService {
   private launch(raidId: string, launchedBy: 'owner-accept' | 'autonomous' | 'owner-chat'): void {
     const raid = this.store.raid(raidId)!;
     this.store.record(VECTOR_EVENTS.queued, { raid_id: raidId, launched_by: launchedBy });
+    const how = launchedBy === 'autonomous'
+      ? 'Launched by Gru (raid_mode = "autonomous")'
+      : launchedBy === 'owner-chat'
+        // The pairing bearer is shared: this is Gru's declaration, shown as one.
+        ? 'Requested by the owner in chat, as Gru declared it'
+        : 'Accepted by the owner';
     this.opts.notifications.post({
       id: `vector-launched:${raidId}`,
       kind: RAID_LAUNCHED_KIND,
       routing: 'fyi',
       severity: 'info',
       title: `Vector raid launched: ${targetName(raid.target)}`,
-      detail: `${launchedBy === 'autonomous' ? 'Launched by Gru (raid_mode = "autonomous")' : launchedBy === 'owner-chat' ? 'Requested by the owner in chat' : 'Accepted by the owner'}; queued for Silas. Reason: ${raid.reason}`,
+      detail: `${how}; queued for Silas. Reason: ${raid.reason}`,
     });
   }
 
-  breakIns(): readonly BreakInRecord[] {
-    return this.store.breakIns();
+  /** The package's tree at the current default-branch head, as the candidate list sees it (null when it is no longer a candidate). */
+  private currentIdentity(target: RaidTarget): string | null {
+    const raids = this.store.raids().filter((raid) => !(sameTarget(raid.target, target) && (raid.state === 'proposed' || raid.state === 'queued' || raid.state === 'running')));
+    // The daily cap and signals do not decide whether a proposal is stale.
+    return this.buildList(raids, Number.MAX_SAFE_INTEGER, false).candidates.find((entry) => sameTarget(entry.target, target))?.sourceIdentity ?? null;
   }
 
-  /** Spend and yield per repository across every finished raid (#351 §5). */
-  rollup(): readonly RepositoryRollup[] {
-    return repositoryRollups(this.store.raids());
+  private staleDetail(raid: RaidRecord, current: string | null): string | null {
+    if (current === raid.sourceIdentity) return null;
+    return current === null
+      ? `withdrawn: ${targetName(raid.target)} is no longer a raid candidate`
+      : `withdrawn: ${targetName(raid.target)} changed (${raid.sourceIdentity.slice(0, 12)} → ${current.slice(0, 12)}) before a decision`;
+  }
+
+  private withdraw(raid: RaidRecord, detail: string): void {
+    this.store.record(VECTOR_EVENTS.withdrawn, { raid_id: raid.id, detail });
+    this.opts.notifications.post({ id: `vector-withdrawn:${raid.id}`, kind: RAID_WITHDRAWN_KIND, routing: 'fyi', severity: 'info', title: `Vector raid proposal withdrawn: ${targetName(raid.target)}`, detail });
+  }
+
+  /** Carry out the owner's recorded choice on a raid or fix proposal. Idempotent. */
+  followDecision(notificationId: string): void {
+    const row = this.opts.ledger.getNotification(notificationId);
+    if (row?.kind === FIX_PROPOSAL_KIND) {
+      void this.followFixDecision(notificationId).catch((error: unknown) => {
+        this.log('error', 'vector fix decision follow-through failed; the next reconcile retries it', { notification: notificationId, error: String(error) });
+      });
+      return;
+    }
+    if (row === null || row.kind !== RAID_PROPOSAL_KIND || row.decidedOption === null) return;
+    const raid = this.store.raids().find((entry) => entry.notificationId === notificationId);
+    if (raid === undefined) return;
+    let detail: string | null = null;
+    if (raid.state === 'proposed') {
+      if (row.decidedOption === 'accept') {
+        // An Accept on a target that changed since the card launches nothing.
+        const stale = this.staleDetail(raid, this.currentIdentity(raid.target));
+        if (stale === null) this.launch(raid.id, 'owner-accept');
+        else { this.withdraw(raid, stale); detail = `${stale}; the Accept launched nothing`; }
+      } else {
+        this.store.record(VECTOR_EVENTS.declined, { raid_id: raid.id, detail: `declined by ${row.decidedBy ?? 'the owner'}` });
+      }
+    }
+    if (row.resolvedAt === null) {
+      const done = this.store.raid(raid.id)!;
+      this.opts.ledger.resolveOwnerDecision(notificationId, detail ?? (done.state === 'queued' ? 'raid queued for Silas' : done.state === 'withdrawn' ? done.closedDetail ?? 'withdrawn' : 'decline recorded'), OWNER_PROVENANCE);
+    }
   }
 
   /**
    * A confirmed break-in (#351 §4): one FOR YOU fix proposal (fix_mode
-   * "proposed"), or the fix heist itself ("autonomous"). Idempotent, and a
-   * contract the owner declined at this source identity is not proposed again.
+   * "proposed"), or the fix heist itself ("autonomous"). Idempotent; one
+   * follow-through at a time per break-in. A contract the owner declined at
+   * this source identity (same requirement and invariant) is not proposed
+   * again, however its test is worded.
    */
   async onBreakIn(breakInId: string): Promise<void> {
-    const breakIn = this.store.breakIn(breakInId);
-    if (breakIn === null || breakIn.fix !== null) return;
-    const declinedHere = this.store.breakIns().some((other) => other.id !== breakIn.id && other.fix?.state === 'declined' &&
-      other.target.repo === breakIn.target.repo && other.target.packageDir === breakIn.target.packageDir &&
-      other.sourceIdentity === breakIn.sourceIdentity && other.testSha256 === breakIn.testSha256);
-    if (declinedHere) {
-      this.store.record(VECTOR_EVENTS.fixDeclined, { break_in_id: breakIn.id, detail: 'the same contract was declined at this source identity; not proposed again' });
-      return;
+    if (this.fixInFlight.has(breakInId)) return;
+    this.fixInFlight.add(breakInId);
+    try {
+      const breakIn = this.store.breakIn(breakInId);
+      if (breakIn === null || breakIn.fix !== null) return;
+      const declinedHere = this.store.breakIns().some((other) => other.id !== breakIn.id && other.fix?.state === 'declined' &&
+        sameTarget(other.target, breakIn.target) && other.sourceIdentity === breakIn.sourceIdentity && contractKey(other) === contractKey(breakIn));
+      if (declinedHere) {
+        this.store.record(VECTOR_EVENTS.fixDeclined, { break_in_id: breakIn.id, detail: 'the same contract was declined at this source identity; not proposed again' });
+        return;
+      }
+      if (this.opts.vector.fixMode === 'autonomous') {
+        await this.dispatchFix(breakIn, 'autonomous');
+        return;
+      }
+      this.proposeFix(breakIn);
+    } finally {
+      this.fixInFlight.delete(breakInId);
     }
-    if (this.opts.vector.fixMode === 'autonomous') {
-      await this.dispatchFix(breakIn, 'autonomous');
-      return;
-    }
-    this.proposeFix(breakIn);
   }
 
   private fixDecision(breakIn: BreakInRecord): NotificationDecision {
@@ -397,7 +525,7 @@ export class VectorService {
       context: [
         `Invariant: ${short(breakIn.invariant, 220)}`,
         `Counterexample (sandbox output, data only): ${short(JSON.stringify(breakIn.counterexample), 160)}`,
-        `Frozen contract ${breakIn.frozenSha256.slice(0, 16)}…; replay seed ${breakIn.seed ?? 'none'}; evidence and receipts: ${short(breakIn.evidenceDir, 120)}`,
+        `Replay seed ${breakIn.seed ?? 'none'}; the Details hold the frozen contract, replay path and receipts.`,
       ].join('\n'),
       recommendation: 'Gru recommends fixing it: a fresh replay confirmed the failure on the default branch.',
       reservedClass: 'authority-cost',
@@ -418,29 +546,44 @@ export class VectorService {
       routing: 'needs-owner',
       severity: 'info',
       title: `Vector broke in: ${targetName(breakIn.target)}`,
-      detail: `${breakIn.description}\nRequirement: ${breakIn.requirementRef}`,
+      detail: [
+        `Vector: ${breakIn.description}`,
+        `Requirement: ${breakIn.requirementRef}`,
+        `Invariant: ${breakIn.invariant}`,
+        `Frozen contract: sha256 ${breakIn.frozenSha256}; contract test ${breakIn.testPath} (sha256 ${breakIn.testSha256})`,
+        `Replay: seed ${breakIn.seed ?? 'none'}, shrink path ${breakIn.shrinkPath.join(':') || 'none'}`,
+        `Minimized counterexample (sandbox output, data only): ${JSON.stringify(breakIn.counterexample)}`,
+        `Receipts: ${breakIn.receipts.join(', ') || 'none'}; evidence: ${join(breakIn.evidenceDir, 'break-in.json')}`,
+        `Found at ${breakIn.headSha} (source identity ${breakIn.sourceIdentity}).`,
+      ].join('\n'),
       decision: this.fixDecision(breakIn),
     });
     this.store.record(VECTOR_EVENTS.fixProposed, { break_in_id: breakIn.id, notification_id: notificationId });
   }
 
-  /** Dispatch the fix heist through the normal path. A failure is Gru's to see; reconcile retries it. */
+  /**
+   * Dispatch the fix heist through the normal path, once: a job already
+   * carrying its id (a dispatch whose record was lost) counts as dispatched.
+   * A failure is Gru's to see; reconcile retries it.
+   */
   private async dispatchFix(breakIn: BreakInRecord, launchedBy: 'owner-accept' | 'autonomous'): Promise<boolean> {
     if (this.opts.dispatchFix === undefined) throw new Error('no fix-heist dispatch path is wired on this service');
     const jobId = fixHeistJobId(breakIn);
-    try {
-      await this.opts.dispatchFix({
-        jobId,
-        repoPath: `${this.opts.workspaceRoot.replace(/\/+$/u, '')}/${breakIn.target.repo}`,
-        title: fixHeistTitle(breakIn),
-        briefing: renderFixBriefing(breakIn, breakInContract(breakIn)),
-      });
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      this.opts.notifications.post({ id: `vector-fix-failed:${breakIn.id}`, kind: FIX_DISPATCH_FAILED_KIND, routing: 'action-required', severity: 'error',
-        title: `Vector fix heist not dispatched: ${targetName(breakIn.target)}`, detail: `${detail}\nThe next reconcile retries it.` });
-      this.log('error', 'vector fix heist dispatch failed; the next reconcile retries it', { breakIn: breakIn.id, error: detail });
-      return false;
+    if (this.opts.ledger.getJob(jobId) === null) {
+      try {
+        await this.opts.dispatchFix({
+          jobId,
+          repoPath: join(this.opts.workspaceRoot, breakIn.target.repo),
+          title: fixHeistTitle(breakIn),
+          briefing: renderFixBriefing(breakIn, breakInContract(breakIn)),
+        });
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        this.opts.notifications.post({ id: `vector-fix-failed:${breakIn.id}`, kind: FIX_DISPATCH_FAILED_KIND, routing: 'action-required', severity: 'error',
+          title: `Vector fix heist not dispatched: ${targetName(breakIn.target)}`, detail: `${detail}\nThe next reconcile retries it.` });
+        this.log('error', 'vector fix heist dispatch failed; the next reconcile retries it', { breakIn: breakIn.id, error: detail });
+        return false;
+      }
     }
     this.store.record(VECTOR_EVENTS.fixDispatched, { break_in_id: breakIn.id, job_id: jobId, launched_by: launchedBy });
     const failed = this.opts.ledger.getNotification(`vector-fix-failed:${breakIn.id}`);
@@ -450,57 +593,40 @@ export class VectorService {
     return true;
   }
 
-  /** Carry out the owner's recorded choice on a fix proposal. Idempotent. */
+  /** Carry out the owner's recorded choice on a fix proposal. Idempotent; one at a time per break-in. */
   async followFixDecision(notificationId: string): Promise<void> {
     const row = this.opts.ledger.getNotification(notificationId);
     if (row === null || row.kind !== FIX_PROPOSAL_KIND || row.decidedOption === null) return;
     const breakIn = this.store.breakIns().find((entry) => entry.fix?.notificationId === notificationId);
-    if (breakIn === undefined) return;
-    if (breakIn.fix?.state === 'proposed') {
-      if (row.decidedOption === 'accept') {
-        if (!(await this.dispatchFix(breakIn, 'owner-accept'))) return;
-      } else {
-        this.store.record(VECTOR_EVENTS.fixDeclined, { break_in_id: breakIn.id, detail: `declined by ${row.decidedBy ?? 'the owner'}` });
+    if (breakIn === undefined || this.fixInFlight.has(breakIn.id)) return;
+    this.fixInFlight.add(breakIn.id);
+    try {
+      if (breakIn.fix?.state === 'proposed') {
+        if (row.decidedOption === 'accept') {
+          if (!(await this.dispatchFix(breakIn, 'owner-accept'))) return;
+        } else {
+          this.store.record(VECTOR_EVENTS.fixDeclined, { break_in_id: breakIn.id, detail: `declined by ${row.decidedBy ?? 'the owner'}` });
+        }
       }
-    }
-    const done = this.store.breakIn(breakIn.id)!;
-    if (row.resolvedAt === null && done.fix?.state !== 'proposed') {
-      this.opts.ledger.resolveOwnerDecision(notificationId, done.fix?.state === 'dispatched' ? `fix heist ${done.fix.jobId ?? ''} dispatched` : 'decline recorded', OWNER_PROVENANCE);
-    }
-  }
-
-  /** Carry out the owner's recorded choice on a raid proposal. Idempotent. */
-  followDecision(notificationId: string): void {
-    const row = this.opts.ledger.getNotification(notificationId);
-    if (row?.kind === FIX_PROPOSAL_KIND) {
-      void this.followFixDecision(notificationId).catch((error: unknown) => {
-        this.log('error', 'vector fix decision follow-through failed; the next reconcile retries it', { notification: notificationId, error: String(error) });
-      });
-      return;
-    }
-    if (row === null || row.kind !== RAID_PROPOSAL_KIND || row.decidedOption === null) return;
-    const raid = this.store.raids().find((entry) => entry.notificationId === notificationId);
-    if (raid === undefined) return;
-    if (raid.state === 'proposed') {
-      if (row.decidedOption === 'accept') this.launch(raid.id, 'owner-accept');
-      else this.store.record(VECTOR_EVENTS.declined, { raid_id: raid.id, detail: `declined by ${row.decidedBy ?? 'the owner'}` });
-    }
-    if (row.resolvedAt === null) {
-      const done = this.store.raid(raid.id)!;
-      this.opts.ledger.resolveOwnerDecision(notificationId, done.state === 'queued' ? 'raid queued for Silas' : 'decline recorded', OWNER_PROVENANCE);
+      const done = this.store.breakIn(breakIn.id)!;
+      if (row.resolvedAt === null && done.fix?.state !== 'proposed') {
+        this.opts.ledger.resolveOwnerDecision(notificationId, done.fix?.state === 'dispatched' ? `fix heist ${done.fix.jobId ?? ''} dispatched` : 'decline recorded', OWNER_PROVENANCE);
+      }
+    } finally {
+      this.fixInFlight.delete(breakIn.id);
     }
   }
 
   /**
-   * Boot and every tick: carry out decisions recorded while the service was
-   * down, withdraw proposals whose target changed, and re-ensure every
-   * pending proposal's FOR YOU row.
+   * Boot and every five minutes: carry out decisions recorded while the
+   * service was down, give a pick with no card its card, close a raid whose
+   * card was closed without an answer, withdraw proposals whose target
+   * changed, and finish every break-in's fix follow-through.
    */
   reconcile(): void {
     if (!this.enabled) return;
     for (const breakIn of this.store.breakIns()) {
       if (breakIn.fix === null) {
-        // Found while the follow-through was down (or it failed): carry it out now.
         void this.onBreakIn(breakIn.id).catch((error: unknown) => this.log('error', 'vector break-in follow-through failed', { breakIn: breakIn.id, error: String(error) }));
       } else if (breakIn.fix.state === 'proposed' && breakIn.fix.notificationId !== null) {
         const row = this.opts.ledger.getNotification(breakIn.fix.notificationId);
@@ -508,43 +634,31 @@ export class VectorService {
         else if (row.decidedOption !== null) this.followDecision(row.id);
       }
     }
-    const pending = this.store.raids().filter((raid) => raid.state === 'proposed' && raid.notificationId !== null);
-    if (pending.length === 0) return;
-    let list: RaidCandidateList | null = null;
-    for (const raid of pending) {
-      const row = this.opts.ledger.getNotification(raid.notificationId!);
-      if (row !== null && row.decidedOption !== null) { this.followDecision(raid.notificationId!); continue; }
-      // Proposals exclude their own target, so compare against the code
-      // directly: the package's tree at the current default-branch head.
-      list ??= this.candidatesIgnoringPending();
-      const current = list.candidates.find((entry) => entry.target.repo === raid.target.repo && entry.target.packageDir === raid.target.packageDir);
-      if (current === undefined || current.sourceIdentity !== raid.sourceIdentity) {
-        const detail = current === undefined
-          ? `withdrawn: ${targetName(raid.target)} is no longer a raid candidate`
-          : `withdrawn: ${targetName(raid.target)} changed (${raid.sourceIdentity.slice(0, 12)} → ${current.sourceIdentity.slice(0, 12)}) before a decision`;
-        if (row !== null) this.opts.ledger.withdrawOwnerProposal(row.id, detail);
-        this.store.record(VECTOR_EVENTS.withdrawn, { raid_id: raid.id, detail });
-        this.opts.notifications.post({ id: `vector-withdrawn:${raid.id}`, kind: RAID_WITHDRAWN_KIND, routing: 'fyi', severity: 'info', title: `Vector raid proposal withdrawn: ${targetName(raid.target)}`, detail });
+    for (const raid of this.store.raids().filter((entry) => entry.state === 'proposed')) {
+      if (raid.notificationId === null) {
+        // Picked, but the card was never recorded (a failure mid-pick).
+        this.propose(raid.id);
+        continue;
+      }
+      const row = this.opts.ledger.getNotification(raid.notificationId);
+      if (row !== null && row.decidedOption !== null) { this.followDecision(raid.notificationId); continue; }
+      if (row !== null && row.resolvedAt !== null) { this.withdraw(raid, 'withdrawn: its card was closed without an answer'); continue; }
+      const stale = this.staleDetail(raid, this.currentIdentity(raid.target));
+      if (stale !== null) {
+        if (row !== null) {
+          try {
+            this.opts.ledger.withdrawOwnerProposal(row.id, stale);
+          } catch (error) {
+            // The owner answered in between: carry the answer out instead.
+            if (error instanceof NotificationDecisionRefusal && error.code === 'decision_recorded') { this.followDecision(row.id); continue; }
+            throw error;
+          }
+        }
+        this.withdraw(raid, stale);
         continue;
       }
       if (row === null) this.propose(raid.id);
     }
-  }
-
-  /** The candidate list as if no proposal were pending (the withdrawal check). */
-  private candidatesIgnoringPending(): RaidCandidateList {
-    const raids = this.store.raids().filter((raid) => raid.state !== 'proposed');
-    return buildRaidCandidates({
-      workspaceRoot: this.opts.workspaceRoot,
-      managedRepos: this.opts.managedRepos,
-      // The daily cap does not decide whether a pending proposal is stale.
-      maxRaidsPerDay: Number.MAX_SAFE_INTEGER,
-      raids,
-      perkinsFindings: () => 0,
-      escapedRegressions: () => 0,
-      ...(this.opts.resolvePackages === undefined ? {} : { resolvePackages: this.opts.resolvePackages }),
-      now: this.now(),
-    });
   }
 
   /** Changes-requested Perkins verdicts on the repository's jobs since an instant. */

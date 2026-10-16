@@ -1,20 +1,23 @@
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { VectorConfig } from '../config.js';
 import type { LedgerApi } from '../ledger/api.js';
 import type { LogLevel } from '../logger.js';
 import type { NotificationCenter } from '../notifications/center.js';
+import { loadPropertyConfig } from '../property/config.js';
 import { createPropertyExecutor, resolveSandboxBackend } from '../property/executor.js';
 import { createPropertyCampaignHost, type PropertyCampaignResult, type ReviewedPropertyCampaign } from '../property/pipeline.js';
 import { parsePropertyProposal } from '../property/proposal.js';
 import { resolvePropertyCapabilities } from '../property/resolve.js';
 import type { PackageResolution, RetainedCounterexample } from '../property/types.js';
-import type { PacingLease } from '../runtime/pacing.js';
+import type { PacingGateView, PacingLease } from '../runtime/pacing.js';
 import type { AgentHandle, IsolatedReviewPolicy } from '../runtime/types.js';
+import { loadWorktreeManifest } from '../worktrees/manifest.js';
 import { renderRoundPrompt, VECTOR_SYSTEM_PROMPT, vectorAttackTool, type Attack, type AttackFile } from './attack.js';
-import { repositoryRollups, VECTOR_EVENTS, VectorLedger, type BreakInRecord, type RaidOutcome, type RaidRecord } from './ledger.js';
+import { RAID_ADAPTER } from './candidates.js';
+import { repositoryRollups, VECTOR_EVENTS, VectorLedger, type BreakInRecord, type RaidMetrics, type RaidOutcome, type RaidRecord, type RoundOutcome } from './ledger.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -32,8 +35,8 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
 /** Board activity: a raid ended (its label says how). */
 export const RAID_FINISHED_KIND = 'vector.raid-finished';
 
-/** The least one attack costs: its known-bad control, its healthy control and the attack. */
-export const RUNS_PER_ATTACK = 3;
+/** The most one attack can cost: both controls, the attack, then the baseline and the replay when it fails. */
+export const MAX_RUNS_PER_ATTACK = 5;
 
 /** One reviewed attack campaign, host evidence only (seam B/C). */
 export interface RaidCampaign {
@@ -50,6 +53,11 @@ export function defaultRaidCampaign(signal: AbortSignal): RaidCampaign {
     run: (spec, artifactsDir) => host.execute(host.approveReviewedCampaign(spec), { artifactsDir, trigger: 'scheduled' }),
     counterexample: (result) => (result.candidateRef === null ? null : executor.resolveReceiptRef(result.candidateRef)?.counterexample ?? null),
   };
+}
+
+/** Heist work is waiting: a queued worker turn, or a queued review turn that is not Vector's own. */
+export function heistWorkWaiting(view: PacingGateView): boolean {
+  return view.worker.queued.length > 0 || view.review.queued.some((entry) => !entry.id.startsWith('vector:'));
 }
 
 export function raidOutcomeLabel(outcome: RaidOutcome, detail: string, attacks: number): string {
@@ -83,7 +91,7 @@ export interface RaidRunnerOptions {
   readonly onBreakIn?: (breakIn: BreakInRecord) => void;
   readonly campaign?: (signal: AbortSignal) => RaidCampaign;
   readonly sandbox?: () => { readonly backend: string; readonly reason: string | null };
-  /** Refresh the cached origin default branch (default: a bounded `git fetch origin`). */
+  /** Refresh the cached origin default branch (default: a bounded `git fetch origin` with the user's own git setup). */
   readonly fetchDefault?: (repoPath: string) => void;
   readonly resolvePackages?: (repoPath: string) => readonly PackageResolution[];
   readonly now?: () => Date;
@@ -93,13 +101,17 @@ export interface RaidRunnerOptions {
   readonly clearInterval?: typeof clearInterval;
 }
 
-const GIT_ENV = { PATH: '/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin', LC_ALL: 'C', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0' };
-
-/** Git for raid roots: no hooks, no fsmonitor, a fixed identity for control commits. */
+/** Git for raid roots: no hooks, no fsmonitor, no user config, a fixed identity for control commits; the host's own PATH. */
 function raidGit(cwd: string, args: readonly string[], timeoutMs = 120_000): string {
   return execFileSync('git', ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'user.name=Vector', '-c', 'user.email=vector@gru-command.invalid', ...args], {
-    cwd, encoding: 'utf8', timeout: timeoutMs, env: GIT_ENV, stdio: ['ignore', 'pipe', 'pipe'],
+    cwd, encoding: 'utf8', timeout: timeoutMs, stdio: ['ignore', 'pipe', 'pipe'],
+    env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin', LC_ALL: 'C', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0' },
   });
+}
+
+/** A fetch needs the user's own credential helpers and ssh setup; hooks stay off. */
+function fetchOrigin(repoPath: string): void {
+  execFileSync('git', ['-c', 'core.hooksPath=/dev/null', 'fetch', '--quiet', 'origin'], { cwd: repoPath, encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
 }
 
 function cachedDefaultHead(repoPath: string): string | null {
@@ -135,15 +147,23 @@ interface RaidContext {
   readonly headSha: string;
   readonly startedMs: number;
   rounds: number;
+  /** Attacks that reached qualification. */
   attacks: number;
   qualified: number;
+  inconclusive: number;
+  invalidAttacks: number;
+  duplicates: number;
   runs: number;
+  executionMs: number;
   tokens: number;
-  tokensKnown: boolean;
+  roundsWithoutTokenUsage: number;
   breakIns: number;
   readonly verdicts: Record<string, number>;
   replayed: number;
   reproduced: number;
+  /** A fetch failed at some boundary: the head's freshness is unverified. */
+  fetchFailed: boolean;
+  timedOut: boolean;
 }
 
 export class VectorRaidRunner {
@@ -155,8 +175,8 @@ export class VectorRaidRunner {
   private readonly stopController = new AbortController();
 
   constructor(private readonly opts: RaidRunnerOptions) {
-    this.store = new VectorLedger(opts.ledger);
     this.log = opts.log ?? (() => {});
+    this.store = new VectorLedger(opts.ledger, this.log);
     this.now = opts.now ?? (() => new Date());
   }
 
@@ -178,11 +198,18 @@ export class VectorRaidRunner {
     }
   }
 
-  /** Run the oldest queued raid when the host is free. Resolves with its id, or null. */
+  /**
+   * Run the oldest queued raid whose repository is under its daily cap, when
+   * the host is free. Resolves with its id, or null.
+   */
   tick(): Promise<string | null> {
     if (this.running !== null || !this.opts.vector.enabled || this.stopController.signal.aborted) return Promise.resolve(null);
     if (this.opts.heistWorkWaiting()) return Promise.resolve(null);
-    const next = this.store.raids().filter((raid) => raid.state === 'queued')
+    const raids = this.store.raids();
+    const now = this.now();
+    // Started raids count toward the cap; a queued raid only waits for room.
+    const startedToday = (repo: string): number => raids.filter((raid) => raid.target.repo === repo && raid.startedAt !== null && now.getTime() - Date.parse(raid.startedAt) < 86_400_000).length;
+    const next = raids.filter((raid) => raid.state === 'queued' && startedToday(raid.target.repo) < this.opts.vector.maxRaidsPerDay)
       .sort((left, right) => Date.parse(left.launchedAt ?? left.pickedAt) - Date.parse(right.launchedAt ?? right.pickedAt))[0];
     if (next === undefined) return Promise.resolve(null);
     this.running = this.run(next).then(() => next.id, (error: unknown) => {
@@ -196,10 +223,23 @@ export class VectorRaidRunner {
     const repoPath = join(this.opts.workspaceRoot, raid.target.repo);
     const sandbox = (this.opts.sandbox ?? resolveSandboxBackend)();
     if (sandbox.backend === 'none-found') {
-      this.finishWith(raid, 'refused', `no sandbox backend on this host (${sandbox.reason ?? 'none found'}); a worktree is not a sandbox`, null);
+      // The executor's own word for this is `not-run`: nothing executes.
+      this.finishWith(raid, 'refused', `not-run: no sandbox backend on this host (${sandbox.reason ?? 'none found'}); a worktree is not a sandbox`, null);
       return;
     }
-    this.fetch(repoPath);
+    // The repository may have opted out, or turned property execution off, since the pick.
+    let optedOut: string | null = null;
+    try {
+      if (loadWorktreeManifest(repoPath)?.vector?.enabled === false) optedOut = 'the repository opted out ([vector] enabled = false in .gru-command/worktree.toml)';
+      else if ((loadPropertyConfig(repoPath)?.mode ?? 'disabled') === 'disabled') optedOut = 'property execution is disabled in the repository (.gru-command/property.toml)';
+    } catch (error) {
+      optedOut = `the repository configuration does not load: ${oneLineError(error)}`;
+    }
+    if (optedOut !== null) {
+      this.finishWith(raid, 'refused', optedOut, null);
+      return;
+    }
+    const fetchFailed = !this.fetch(repoPath);
     const headSha = cachedDefaultHead(repoPath);
     if (headSha === null) {
       this.finishWith(raid, 'infrastructure-error', 'the default branch cannot be resolved (refs/remotes/origin/HEAD)', null);
@@ -211,20 +251,22 @@ export class VectorRaidRunner {
       return;
     }
     const raidDir = join(this.opts.raidsDir, raid.id);
-    mkdirSync(raidDir, { recursive: true });
-    this.store.record(VECTOR_EVENTS.started, { raid_id: raid.id, head_sha: headSha });
-    const ctx: RaidContext = { raid, repoPath, raidDir, headSha, startedMs: this.now().getTime(), rounds: 0, attacks: 0, qualified: 0, runs: 0, tokens: 0, tokensKnown: true, breakIns: 0, verdicts: {}, replayed: 0, reproduced: 0 };
+    const ctx: RaidContext = { raid, repoPath, raidDir, headSha, startedMs: this.now().getTime(), rounds: 0, attacks: 0, qualified: 0, inconclusive: 0, invalidAttacks: 0, duplicates: 0,
+      runs: 0, executionMs: 0, tokens: 0, roundsWithoutTokenUsage: 0, breakIns: 0, verdicts: {}, replayed: 0, reproduced: 0, fetchFailed, timedOut: false };
     const abort = new AbortController();
     const onStop = (): void => abort.abort();
     this.stopController.signal.addEventListener('abort', onStop, { once: true });
-    const deadline = setTimeout(() => abort.abort(), Math.max(1, this.opts.vector.maxRaidMs));
+    if (this.stopController.signal.aborted) abort.abort();
+    const deadline = setTimeout(() => { ctx.timedOut = true; abort.abort(); }, Math.max(1, this.opts.vector.maxRaidMs));
     deadline.unref?.();
     const roots = { target: join(raidDir, 'target'), knownBad: join(raidDir, 'known-bad'), healthy: join(raidDir, 'healthy') };
     try {
+      mkdirSync(raidDir, { recursive: true });
+      this.store.record(VECTOR_EVENTS.started, { raid_id: raid.id, head_sha: headSha });
       for (const root of Object.values(roots)) this.makeRoot(repoPath, root, headSha, raid.target.packageDir);
       const row = (this.opts.resolvePackages ?? ((root: string) => resolvePropertyCapabilities({ repoRoot: root }).packages))(roots.target)
         .find((entry) => entry.packageDir === raid.target.packageDir);
-      if (row === undefined || row.status !== 'resolved' || row.adapterId !== 'vitest-fast-check' || row.tooling?.executable !== true) {
+      if (row === undefined || row.status !== 'resolved' || row.adapterId !== RAID_ADAPTER || row.tooling?.executable !== true) {
         throw new RaidStop('unsupported', row === undefined ? 'the package is not discovered at this head' : `${row.adapterId ?? 'no adapter'}: ${[row.status, ...row.reasons].join('; ')}`);
       }
       const campaign = (this.opts.campaign ?? defaultRaidCampaign)(abort.signal);
@@ -236,7 +278,8 @@ export class VectorRaidRunner {
       }
     } catch (error) {
       if (error instanceof RaidStop) this.finishWith(raid, error.outcome, error.detail, ctx);
-      else this.finishWith(raid, abort.signal.aborted && !this.stopController.signal.aborted ? (ctx.qualified > 0 ? 'budget-exhausted' : 'no-qualified-proposals') : 'infrastructure-error', abort.signal.aborted && !this.stopController.signal.aborted ? `the ${String(Math.round(this.opts.vector.maxRaidMs / 60_000))}-minute raid time cap ran out` : oneLineError(error), ctx);
+      else if (ctx.timedOut) this.finishWith(raid, 'budget-exhausted', `the ${String(Math.round(this.opts.vector.maxRaidMs / 60_000))}-minute raid time cap ran out (the round in flight ended with: ${oneLineError(error)})`, ctx);
+      else this.finishWith(raid, 'infrastructure-error', this.stopController.signal.aborted ? `the service is stopping (${oneLineError(error)})` : oneLineError(error), ctx);
     } finally {
       clearTimeout(deadline);
       this.stopController.signal.removeEventListener('abort', onStop);
@@ -247,15 +290,28 @@ export class VectorRaidRunner {
   /** Round-boundary checks: every budget dimension, heist priority, and main. */
   private boundary(ctx: RaidContext, signal: AbortSignal): void {
     const v = this.opts.vector;
-    const exhausted = (why: string): RaidStop => new RaidStop(ctx.qualified > 0 ? 'budget-exhausted' : 'no-qualified-proposals', why);
+    // Every budget dimension ends the raid as budget-exhausted (#351).
+    const exhausted = (why: string): RaidStop => new RaidStop('budget-exhausted', why);
     if (this.stopController.signal.aborted) throw new RaidStop('infrastructure-error', 'the service is stopping');
-    if (signal.aborted || this.now().getTime() - ctx.startedMs >= v.maxRaidMs) throw exhausted(`the ${String(Math.round(v.maxRaidMs / 60_000))}-minute raid time cap ran out`);
+    if (ctx.timedOut || this.now().getTime() - ctx.startedMs >= v.maxRaidMs) throw exhausted(`the ${String(Math.round(v.maxRaidMs / 60_000))}-minute raid time cap ran out`);
+    if (signal.aborted) throw new RaidStop('infrastructure-error', 'the raid was aborted');
     if (ctx.rounds >= v.maxRounds) throw exhausted(`all ${String(v.maxRounds)} attacks were spent`);
-    if (ctx.runs + RUNS_PER_ATTACK > v.maxRuns) throw exhausted(`${String(v.maxRuns - ctx.runs)} of ${String(v.maxRuns)} sandboxed runs left, fewer than one attack needs`);
-    if (ctx.tokensKnown && ctx.tokens >= v.maxRaidTokens) throw exhausted(`the ${String(v.maxRaidTokens)}-token cap was reached`);
+    if (ctx.runs + MAX_RUNS_PER_ATTACK > v.maxRuns) throw exhausted(`${String(v.maxRuns - ctx.runs)} of ${String(v.maxRuns)} sandboxed runs left, fewer than one attack may need (${String(MAX_RUNS_PER_ATTACK)})`);
+    if (ctx.tokens >= v.maxRaidTokens) throw exhausted(`the ${String(v.maxRaidTokens)}-token cap was reached`);
     if (this.opts.heistWorkWaiting()) throw new RaidStop('yielded', 'heist work arrived; Gru may pick this target again later');
-    this.fetch(ctx.repoPath);
+    if (!this.fetch(ctx.repoPath)) ctx.fetchFailed = true;
     if (cachedDefaultHead(ctx.repoPath) !== ctx.headSha) throw new RaidStop('invalidated', 'main moved during the raid; no evidence crosses heads');
+  }
+
+  private recordRound(ctx: RaidContext, fields: { readonly outcome: RoundOutcome; readonly verdict: string; readonly description?: string | null; readonly detail: string;
+    readonly artifactSha256?: string | null; readonly candidateOutcome?: string | null; readonly replay?: string | null; readonly executedRuns?: number; readonly receipts?: readonly string[] }): void {
+    const receipts = fields.receipts ?? [];
+    this.store.record(VECTOR_EVENTS.round, {
+      raid_id: ctx.raid.id, round: ctx.rounds, outcome: fields.outcome, verdict: fields.verdict, description: fields.description ?? null, detail: fields.detail,
+      artifact_sha256: fields.artifactSha256 ?? null, candidate_outcome: fields.candidateOutcome ?? null, replay: fields.replay ?? null,
+      executed_runs: fields.executedRuns ?? 0, receipts,
+      ...(receipts.length > 0 ? {} : { no_receipt_reason: fields.executedRuns === undefined || fields.executedRuns === 0 ? `not executed: the round ended ${fields.outcome}` : 'executed, but the host kept no receipt file for it' }),
+    });
   }
 
   private async round(ctx: RaidContext, roots: { readonly target: string; readonly knownBad: string; readonly healthy: string }, campaign: RaidCampaign, signal: AbortSignal): Promise<void> {
@@ -263,33 +319,39 @@ export class VectorRaidRunner {
     const prefix = raid.target.packageDir === '.' ? '' : `${raid.target.packageDir}/`;
     const testPath = `${prefix}test/vector/r${String(ctx.rounds)}-${raid.id.slice(-8)}.test.mjs`;
     const tried = this.store.raid(raid.id)!.rounds.map((entry) => entry.description).filter((entry): entry is string => entry !== null);
-    const retained = this.store.breakIns().filter((entry) => entry.target.repo === raid.target.repo && entry.target.packageDir === raid.target.packageDir).map((entry) => entry.invariant);
+    const known = this.store.breakIns().filter((entry) => entry.target.repo === raid.target.repo && entry.target.packageDir === raid.target.packageDir).map((entry) => entry.invariant);
     const attack = await this.askVector(ctx, roots.target, renderRoundPrompt({
-      repo: raid.target.repo, packageDir: raid.target.packageDir, headSha: ctx.headSha, round: ctx.rounds, maxRounds: this.opts.vector.maxRounds, testPath, tried, retained,
+      repo: raid.target.repo, packageDir: raid.target.packageDir, headSha: ctx.headSha, round: ctx.rounds, maxRounds: this.opts.vector.maxRounds, testPath, tried, retained: known,
     }), signal);
-    const roundBase = { raid_id: raid.id, round: ctx.rounds };
     if (attack === null) {
-      this.store.record(VECTOR_EVENTS.round, { ...roundBase, verdict: 'no-submission', detail: 'Vector submitted no valid attack this round' });
+      this.recordRound(ctx, { outcome: 'no-submission', verdict: 'no-submission', detail: 'Vector submitted no valid attack this round' });
+      // Vector stopped without one attack ever surviving qualification.
+      if (ctx.qualified === 0) throw new RaidStop('no-qualified-proposals', `round ${String(ctx.rounds)} brought no attack, and none before it survived qualification`);
+      return;
+    }
+    const artifactSha256 = sha256(attack.testContent);
+    // Only a test that actually ran at this identity is a duplicate.
+    const seenBefore = this.store.raids()
+      .filter((entry) => entry.target.repo === raid.target.repo && entry.target.packageDir === raid.target.packageDir && entry.sourceIdentity === raid.sourceIdentity)
+      .some((entry) => entry.rounds.some((previous) => previous.artifactSha256 === artifactSha256 && previous.executedRuns > 0));
+    if (seenBefore) {
+      ctx.duplicates += 1;
+      this.recordRound(ctx, { outcome: 'duplicate', verdict: 'duplicate', description: attack.description, artifactSha256, detail: 'an exact duplicate of a test already run at this source identity; not executed' });
+      return;
+    }
+    const knownBad = this.commitControl(roots.knownBad, ctx.headSha, attack.knownBad, 'known-bad control');
+    const reference = knownBad === 'changed' ? this.commitControl(roots.healthy, ctx.headSha, attack.reference, 'reference control') : 'unchanged';
+    if (knownBad !== 'changed' || reference.startsWith('refused')) {
+      ctx.invalidAttacks += 1;
+      this.recordRound(ctx, { outcome: 'invalid-attack', verdict: 'invalid-attack', description: attack.description, artifactSha256,
+        detail: knownBad === 'unchanged' ? 'the known-bad control changes nothing' : knownBad !== 'changed' ? knownBad : reference });
       return;
     }
     ctx.attacks += 1;
-    const artifactSha256 = sha256(attack.testContent);
-    const seenBefore = this.store.raids()
-      .filter((entry) => entry.target.repo === raid.target.repo && entry.target.packageDir === raid.target.packageDir && entry.sourceIdentity === raid.sourceIdentity)
-      .some((entry) => entry.rounds.some((previous) => previous.artifactSha256 === artifactSha256));
-    if (seenBefore) {
-      this.store.record(VECTOR_EVENTS.round, { ...roundBase, description: attack.description, verdict: 'duplicate', artifact_sha256: artifactSha256, detail: 'an exact duplicate of a test already run at this source identity; not executed' });
-      return;
-    }
-    if (!this.commitControl(roots.knownBad, ctx.headSha, attack.knownBad, 'known-bad control')) {
-      this.store.record(VECTOR_EVENTS.round, { ...roundBase, description: attack.description, verdict: 'invalid-attack', artifact_sha256: artifactSha256, detail: 'the known-bad control changes nothing' });
-      return;
-    }
-    this.commitControl(roots.healthy, ctx.headSha, attack.reference, 'reference control');
     const spec: ReviewedPropertyCampaign = {
       proposal: parsePropertyProposal({
         requirementRef: attack.requirementRef, invariant: attack.invariant, inputDomain: attack.inputDomain, invalidInputBehavior: attack.invalidInputBehavior,
-        targetPackageDir: raid.target.packageDir, adapterId: 'vitest-fast-check', testArtifactRefs: [{ path: testPath, sha256: artifactSha256 }],
+        targetPackageDir: raid.target.packageDir, adapterId: RAID_ADAPTER, testArtifactRefs: [{ path: testPath, sha256: artifactSha256 }],
         establishes: attack.establishes, doesNotEstablish: attack.doesNotEstablish,
       }),
       overlayFiles: [{ path: testPath, content: attack.testContent }],
@@ -303,31 +365,45 @@ export class VectorRaidRunner {
     const evidenceDir = join(ctx.raidDir, 'evidence', `round-${String(ctx.rounds)}`);
     const result = await campaign.run(spec, evidenceDir);
     ctx.runs += result.metrics.executedRuns;
+    ctx.executionMs += result.metrics.totalExecutionMs;
+    const receipts = this.receiptsIn(evidenceDir);
+    const verdict = result.qualification?.verdict ?? 'not-run';
+    if (result.mode === 'disabled') throw new RaidStop('refused', 'not-run: property execution is disabled (.gru-command/property.toml) at this head');
+    if (verdict === 'escalated' && result.disclosure.startsWith('sandbox execution refused')) throw new RaidStop('refused', `not-run: ${result.disclosure}`);
     // Evidence binds the head it ran at: when main moved during the attack,
     // nothing from it counts (not even a break-in).
-    this.fetch(ctx.repoPath);
+    if (!this.fetch(ctx.repoPath)) ctx.fetchFailed = true;
     if (cachedDefaultHead(ctx.repoPath) !== ctx.headSha) throw new RaidStop('invalidated', 'main moved during the raid; no evidence crosses heads');
-    const verdict = result.qualification?.verdict ?? 'not-run';
-    ctx.verdicts[verdict] = (ctx.verdicts[verdict] ?? 0) + 1;
-    if (result.mode === 'disabled') throw new RaidStop('refused', 'property execution is disabled (.gru-command/property.toml) at this head');
-    if (verdict === 'escalated' && result.disclosure.startsWith('sandbox execution refused')) throw new RaidStop('refused', result.disclosure);
     if (verdict === 'qualified') ctx.qualified += 1;
+    else ctx.verdicts[verdict] = (ctx.verdicts[verdict] ?? 0) + 1;
     const replay = result.replay;
-    if (verdict === 'qualified' && result.candidateOutcome === 'property-failure' && replay !== 'not-run') {
+    const failed = verdict === 'qualified' && result.candidateOutcome === 'property-failure';
+    if (failed && replay !== 'not-run') {
       ctx.replayed += 1;
       if (replay === 'reproduced') ctx.reproduced += 1;
     }
-    this.store.record(VECTOR_EVENTS.round, {
-      ...roundBase, description: attack.description, verdict, candidate_outcome: result.candidateOutcome, replay, artifact_sha256: artifactSha256,
-      executed_runs: result.metrics.executedRuns,
-      detail: verdict !== 'qualified'
+    const brokeIn = failed && replay === 'reproduced' && result.frozen !== null;
+    const outcome: RoundOutcome = verdict !== 'qualified' ? 'rejected' : brokeIn ? 'break-in' : result.candidateOutcome === 'pass' ? 'pass' : 'inconclusive';
+    if (outcome === 'inconclusive') ctx.inconclusive += 1;
+    this.recordRound(ctx, {
+      outcome, verdict, description: attack.description, artifactSha256, candidateOutcome: result.candidateOutcome, replay, executedRuns: result.metrics.executedRuns, receipts,
+      detail: outcome === 'rejected'
         ? `rejected before attacking: ${(result.qualification?.reasons ?? [result.disclosure]).join('; ').slice(0, 600)}`
-        : result.candidateOutcome === 'property-failure' && replay !== 'reproduced'
-          ? `inconclusive: the failure did not reproduce on a fresh replay (${replay}); nondeterminism disclosed: ${result.disclosure.slice(0, 400)}`
+        : outcome === 'inconclusive'
+          ? (failed
+            ? `inconclusive: the failure did not reproduce on a fresh replay (${replay}); nondeterminism disclosed: ${result.disclosure.slice(0, 400)}`
+            : `inconclusive: the attack run settled nothing (${result.candidateOutcome ?? 'no outcome'}): ${result.disclosure.slice(0, 400)}`)
           : result.disclosure.slice(0, 600),
     });
-    if (verdict === 'qualified' && result.candidateOutcome === 'property-failure' && replay === 'reproduced' && result.frozen !== null) {
-      this.recordBreakIn(ctx, attack, testPath, artifactSha256, result, campaign.counterexample(result), evidenceDir);
+    if (brokeIn) this.recordBreakIn(ctx, attack, testPath, artifactSha256, result, campaign.counterexample(result), evidenceDir, receipts);
+  }
+
+  /** The host's receipt files the campaign wrote for a round (its report and the break-in record are not receipts). */
+  private receiptsIn(evidenceDir: string): readonly string[] {
+    try {
+      return readdirSync(evidenceDir).filter((name) => name.endsWith('.json') && !name.startsWith('property-') && name !== 'break-in.json').sort();
+    } catch {
+      return [];
     }
   }
 
@@ -344,8 +420,9 @@ export class VectorRaidRunner {
     try {
       handle = await this.opts.spawnVector({ raidId: ctx.raid.id, policy, cwd, signal });
       await handle.prompt(prompt, { owner: 'vector' });
+      // Token usage is the session's context size as the runtime reports it.
       const usage = handle.getContextUsage?.() ?? null;
-      if (usage === null) ctx.tokensKnown = false;
+      if (usage === null) ctx.roundsWithoutTokenUsage += 1;
       else ctx.tokens += usage.tokens;
     } finally {
       if (handle !== null) await this.opts.disposeVector(handle);
@@ -367,25 +444,37 @@ export class VectorRaidRunner {
     }
   }
 
-  /** Reset a control root to the head, write the control's files, commit. False when it changes nothing. */
-  private commitControl(root: string, headSha: string, files: readonly AttackFile[], label: string): boolean {
+  /**
+   * Reset a control root to the head, write the control's files, commit.
+   * `unchanged` when it changes nothing; `refused: …` when a path would pass
+   * through a link in the clone (a control writes only inside its clone).
+   */
+  private commitControl(root: string, headSha: string, files: readonly AttackFile[], label: string): 'changed' | 'unchanged' | `refused: ${string}` {
     raidGit(root, ['reset', '--quiet', '--hard', headSha]);
-    if (files.length === 0) return false;
+    if (files.length === 0) return 'unchanged';
+    for (const file of files) {
+      const parts = file.path.split('/');
+      for (let depth = 1; depth <= parts.length; depth += 1) {
+        const at = join(root, ...parts.slice(0, depth));
+        if (existsSync(at) && lstatSync(at).isSymbolicLink()) return `refused: ${label} path ${file.path} passes through a link in the clone`;
+      }
+    }
     for (const file of files) {
       mkdirSync(dirname(join(root, file.path)), { recursive: true });
       writeFileSync(join(root, file.path), file.content);
     }
-    raidGit(root, ['add', '--', ...files.map((file) => file.path)]);
+    // Forced: a control may touch a path the repository ignores.
+    raidGit(root, ['add', '--force', '--', ...files.map((file) => file.path)]);
     try {
       raidGit(root, ['diff', '--cached', '--quiet']);
-      return false;
+      return 'unchanged';
     } catch {
       raidGit(root, ['commit', '--quiet', '-m', label]);
-      return true;
+      return 'changed';
     }
   }
 
-  private recordBreakIn(ctx: RaidContext, attack: Attack, testPath: string, testSha256: string, result: PropertyCampaignResult, example: RetainedCounterexample | null, evidenceDir: string): void {
+  private recordBreakIn(ctx: RaidContext, attack: Attack, testPath: string, testSha256: string, result: PropertyCampaignResult, example: RetainedCounterexample | null, evidenceDir: string, receipts: readonly string[]): void {
     const breakInId = `breakin-${ctx.raid.id.slice('raid-'.length)}-r${String(ctx.rounds)}`;
     mkdirSync(evidenceDir, { recursive: true });
     writeFileSync(join(evidenceDir, 'break-in.json'), `${JSON.stringify({ breakInId, frozen: result.frozen, test: { path: testPath, content: attack.testContent }, counterexample: example, attack: { ...attack, testContent: undefined } }, null, 2)}\n`, { mode: 0o600 });
@@ -406,7 +495,7 @@ export class VectorRaidRunner {
       evidence_dir: evidenceDir,
       test_path: testPath,
       test_sha256: testSha256,
-      receipts: result.candidateRef === null ? [] : [result.candidateRef.receiptId],
+      receipts: receipts.length > 0 ? receipts : result.candidateRef === null ? [] : [`${result.candidateRef.receiptId}.json`],
     });
     ctx.breakIns += 1;
     const recorded = this.store.breakIn(breakInId)!;
@@ -415,11 +504,14 @@ export class VectorRaidRunner {
     }
   }
 
-  private fetch(repoPath: string): void {
+  /** Refresh the cached default branch. False (logged) when the fetch failed: the cached head then decides. */
+  private fetch(repoPath: string): boolean {
     try {
-      (this.opts.fetchDefault ?? ((path: string) => { raidGit(path, ['fetch', '--quiet', 'origin'], 60_000); }))(repoPath);
+      (this.opts.fetchDefault ?? fetchOrigin)(repoPath);
+      return true;
     } catch (error) {
       this.log('warn', 'vector raid fetch failed; the cached default branch decides', { repo: repoPath, error: oneLineError(error) });
+      return false;
     }
   }
 
@@ -427,22 +519,30 @@ export class VectorRaidRunner {
     const attacks = ctx?.attacks ?? 0;
     const label = raidOutcomeLabel(outcome, detail, attacks);
     const current = this.store.raid(raid.id) ?? raid;
-    const invalidOracles = ctx === null ? 0 : Object.entries(ctx.verdicts).filter(([verdict]) => verdict !== 'qualified').reduce((sum, [, count]) => sum + count, 0);
+    const invalidOracles = ctx === null ? 0 : Object.values(ctx.verdicts).reduce((sum, count) => sum + count, 0);
     const wallClockMs = ctx === null ? 0 : this.now().getTime() - ctx.startedMs;
-    const tokens = ctx === null ? null : ctx.tokensKnown ? ctx.tokens : null;
-    const metrics = {
+    const metrics: RaidMetrics = {
+      // #350's snapshot, as a raid fills it.
+      actionableDefects: ctx?.breakIns ?? 0,
+      invalidOracles,
+      unknownValidity: ctx?.inconclusive ?? 0,
+      totalQualificationAttempts: attacks,
+      replayReliability: { replayed: ctx?.replayed ?? 0, reproduced: ctx?.reproduced ?? 0 },
+      escapedRegressions: 0,
+      executedRuns: ctx?.runs ?? 0,
+      totalExecutionMs: ctx?.executionMs ?? 0,
+      totalTokenCost: ctx === null ? null : ctx.tokens,
+      // The raid's own.
       proposals: attacks,
       qualified: ctx?.qualified ?? 0,
-      rejected_by_verdict: Object.fromEntries(Object.entries(ctx?.verdicts ?? {}).filter(([verdict]) => verdict !== 'qualified')),
-      invalid_oracles: invalidOracles,
-      invalid_oracle_rate: attacks === 0 ? null : invalidOracles / attacks,
-      executed_runs: ctx?.runs ?? 0,
-      break_ins: ctx?.breakIns ?? 0,
-      replay_reliability: { replayed: ctx?.replayed ?? 0, reproduced: ctx?.reproduced ?? 0 },
-      wall_clock_ms: wallClockMs,
-      tokens,
-      token_usage: tokens === null ? 'unavailable: the runtime did not report usage, so only the round, run and time caps bound this raid' : 'the Vector sessions\' context size at the end of each round, as the runtime reported it',
-      cost_per_break_in: tokens === null || (ctx?.breakIns ?? 0) === 0 ? null : tokens / ctx!.breakIns,
+      rejectedByVerdict: { ...(ctx?.verdicts ?? {}) },
+      inconclusive: ctx?.inconclusive ?? 0,
+      invalidAttacks: ctx?.invalidAttacks ?? 0,
+      duplicates: ctx?.duplicates ?? 0,
+      breakIns: ctx?.breakIns ?? 0,
+      wallClockMs,
+      tokens: ctx?.tokens ?? 0,
+      roundsWithoutTokenUsage: ctx?.roundsWithoutTokenUsage ?? 0,
     };
     const report = {
       raid: raid.id,
@@ -451,12 +551,18 @@ export class VectorRaidRunner {
       requested_by: raid.requestedBy,
       launched_by: raid.launchedBy,
       head_sha: ctx?.headSha ?? null,
+      head_freshness: ctx === null ? 'not reached' : ctx.fetchFailed ? 'unverified: a fetch of origin failed, so the cached default branch decided' : 'fetched at every boundary',
       source_identity: raid.sourceIdentity,
       proposals: current.rounds,
       outcome,
       label,
       detail,
       metrics,
+      invalid_oracle_rate: attacks === 0 ? null : invalidOracles / attacks,
+      cost_per_break_in: metrics.breakIns === 0 || metrics.roundsWithoutTokenUsage > 0 ? null : metrics.tokens / metrics.breakIns,
+      token_usage: metrics.roundsWithoutTokenUsage === 0
+        ? 'the Vector sessions\' context size at the end of each round, as the runtime reported it'
+        : `${String(metrics.roundsWithoutTokenUsage)} round(s) reported no usage; the token cap counted the rounds that did, and the round, run and time caps bound the rest`,
       merge_authority: 'none',
     };
     let reportFile: string | null = null;
@@ -478,7 +584,7 @@ export class VectorRaidRunner {
       routing: 'fyi',
       severity: outcome === 'infrastructure-error' ? 'error' : 'info',
       title: `Vector raid on ${name.length > 120 ? `${name.slice(0, 119)}…` : name}: ${label.length > 160 ? `${label.slice(0, 159)}…` : label}`,
-      detail: `${detail}\n${String(attacks)} attack(s), ${String(metrics.executed_runs)} sandboxed run(s), ${String(metrics.break_ins)} break-in(s).${reportFile === null ? '' : ` Report: ${reportFile}`}${flag === null ? '' : `\n${flag}`}`,
+      detail: `${detail}\n${String(attacks)} attack(s), ${String(metrics.executedRuns)} sandboxed run(s), ${String(metrics.breakIns)} break-in(s).${reportFile === null ? '' : ` Report: ${reportFile}`}${flag === null ? '' : `\n${flag}`}`,
     });
   }
 

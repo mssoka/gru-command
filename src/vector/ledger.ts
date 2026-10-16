@@ -1,4 +1,6 @@
 import type { LedgerApi } from '../ledger/api.js';
+import type { LogLevel } from '../logger.js';
+import type { PropertyMetricsSnapshot } from '../property/types.js';
 
 /**
  * Vector's raid records (#351), kept as append-only `vector.*` ledger events
@@ -66,16 +68,26 @@ export type RaidState = 'proposed' | 'declined' | 'withdrawn' | 'queued' | 'runn
 export const RAID_OUTCOMES = ['found', 'budget-exhausted', 'no-qualified-proposals', 'refused', 'unsupported', 'infrastructure-error', 'yielded', 'invalidated'] as const;
 export type RaidOutcome = (typeof RAID_OUTCOMES)[number];
 
+/** How a round ended, typed (#351 §3): never a pass of the code. */
+export const ROUND_OUTCOMES = ['no-submission', 'invalid-attack', 'duplicate', 'rejected', 'pass', 'inconclusive', 'break-in'] as const;
+export type RoundOutcome = (typeof ROUND_OUTCOMES)[number];
+
 /** One attack as the ledger keeps it. */
 export interface RaidRoundRecord {
   readonly round: number;
   readonly description: string | null;
-  /** The qualification verdict, or why there was none (no-submission, invalid-attack, duplicate, error). */
+  /** The typed round outcome: `inconclusive` is a failure a fresh replay did not reproduce (or a run that settled nothing). */
+  readonly outcome: RoundOutcome;
+  /** The qualification verdict, or the outcome when qualification never ran. */
   readonly verdict: string;
   readonly candidateOutcome: string | null;
   readonly replay: string | null;
   readonly artifactSha256: string | null;
   readonly executedRuns: number;
+  /** Every host-issued receipt of the round (controls, attack, baseline, replay). */
+  readonly receipts: readonly string[];
+  /** When there are none: why (typed, never inferred). */
+  readonly noReceiptReason: string | null;
   readonly detail: string;
 }
 
@@ -137,81 +149,116 @@ export interface RaidRecord {
   readonly metrics: RaidMetrics | null;
 }
 
-/** Per-raid metrics (#351 §5): they extend #350's snapshot, and never count generated cases. */
-export interface RaidMetrics {
+/**
+ * Per-raid metrics (#351 §5). They extend #350's PropertyMetricsSnapshot:
+ * actionable defects are break-ins, invalid oracles are qualification
+ * rejections, unknown validity counts inconclusive rounds. Generated case
+ * counts are never a measure.
+ */
+export interface RaidMetrics extends PropertyMetricsSnapshot {
+  /** Attacks that reached qualification. */
   readonly proposals: number;
   readonly qualified: number;
-  readonly invalidOracles: number;
-  readonly executedRuns: number;
+  readonly rejectedByVerdict: Readonly<Record<string, number>>;
+  readonly inconclusive: number;
+  /** Submissions refused before qualification (an invalid attack, or an exact duplicate). */
+  readonly invalidAttacks: number;
+  readonly duplicates: number;
   readonly breakIns: number;
   readonly wallClockMs: number;
-  /** null when the runtime reported no usage. */
-  readonly tokens: number | null;
+  /** Token usage the runtime reported (rounds that reported none are counted apart). */
+  readonly tokens: number;
+  readonly roundsWithoutTokenUsage: number;
 }
 
 /** Finished raids in a row with no break-in before a repository's spend is flagged. */
 export const ZERO_BREAK_IN_FLAG_RAIDS = 5;
 
-/** One repository's raid spend and yield across every finished raid. */
+/** One repository's raid spend and yield across every raid that ran anything. */
 export interface RepositoryRollup {
   readonly repo: string;
   readonly raids: number;
   readonly proposals: number;
+  readonly qualified: number;
+  readonly rejectedByVerdict: Readonly<Record<string, number>>;
   readonly invalidOracles: number;
   readonly invalidOracleRate: number | null;
   readonly executedRuns: number;
   readonly breakIns: number;
-  /** Tokens across raids that reported usage, and how many did not. */
+  readonly replayReliability: { readonly replayed: number; readonly reproduced: number };
+  readonly wallClockMs: number;
+  /** Tokens the runtime reported, and how many rounds reported none. */
   readonly tokens: number;
-  readonly raidsWithoutTokenUsage: number;
-  /** The headline metric: tokens per break-in (null with no break-in or no reported usage). */
+  readonly roundsWithoutTokenUsage: number;
+  /** The headline metric: tokens per break-in, over raids whose every round reported usage (null when that leaves no break-in). */
   readonly costPerBreakIn: number | null;
-  /** Finished raids since the last one that broke in (all of them when none did). */
+  /** Raids since the last one that broke in (all of them when none did). */
   readonly raidsSinceLastBreakIn: number;
   /** Set once that streak reaches ZERO_BREAK_IN_FLAG_RAIDS. Turning raids off is the owner's call. */
   readonly flag: string | null;
 }
 
-/** Raids that actually spent: refused and unsupported raids ran nothing. */
-const SPENT = (raid: RaidRecord): boolean => raid.state === 'finished' && raid.outcome !== 'refused' && raid.outcome !== 'unsupported';
+/** A raid that actually spent: at least one sandboxed run. */
+const SPENT = (raid: RaidRecord): boolean => raid.state === 'finished' && (raid.metrics?.executedRuns ?? 0) > 0;
 
 export function repositoryRollups(raids: readonly RaidRecord[]): readonly RepositoryRollup[] {
   const byRepo = new Map<string, RaidRecord[]>();
   for (const raid of raids.filter(SPENT)) byRepo.set(raid.target.repo, [...(byRepo.get(raid.target.repo) ?? []), raid]);
   return [...byRepo.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([repo, list]) => {
     const ordered = [...list].sort((left, right) => Date.parse(left.finishedAt!) - Date.parse(right.finishedAt!));
-    const sum = (pick: (metrics: RaidMetrics) => number): number => ordered.reduce((total, raid) => total + (raid.metrics === null ? 0 : pick(raid.metrics)), 0);
-    const breakIns = sum((metrics) => metrics.breakIns);
-    const proposals = sum((metrics) => metrics.proposals);
-    const invalidOracles = sum((metrics) => metrics.invalidOracles);
-    const tokens = sum((metrics) => metrics.tokens ?? 0);
-    const raidsWithoutTokenUsage = ordered.filter((raid) => raid.metrics?.tokens === null || raid.metrics === null).length;
+    const metrics = ordered.map((raid) => raid.metrics!);
+    const sum = (pick: (entry: RaidMetrics) => number): number => metrics.reduce((total, entry) => total + pick(entry), 0);
+    const rejectedByVerdict: Record<string, number> = {};
+    for (const entry of metrics) for (const [verdict, count] of Object.entries(entry.rejectedByVerdict)) rejectedByVerdict[verdict] = (rejectedByVerdict[verdict] ?? 0) + count;
+    const breakIns = sum((entry) => entry.breakIns);
+    const proposals = sum((entry) => entry.proposals);
+    const invalidOracles = sum((entry) => entry.invalidOracles);
+    const tokens = sum((entry) => entry.tokens);
+    const fullyReported = metrics.filter((entry) => entry.roundsWithoutTokenUsage === 0);
+    const reportedBreakIns = fullyReported.reduce((total, entry) => total + entry.breakIns, 0);
     const lastFound = ordered.map((raid) => raid.outcome === 'found').lastIndexOf(true);
     const raidsSinceLastBreakIn = ordered.length - 1 - lastFound;
+    const executedRuns = sum((entry) => entry.executedRuns);
     return {
       repo,
       raids: ordered.length,
       proposals,
+      qualified: sum((entry) => entry.qualified),
+      rejectedByVerdict,
       invalidOracles,
       invalidOracleRate: proposals === 0 ? null : invalidOracles / proposals,
-      executedRuns: sum((metrics) => metrics.executedRuns),
+      executedRuns,
       breakIns,
+      replayReliability: { replayed: sum((entry) => entry.replayReliability.replayed), reproduced: sum((entry) => entry.replayReliability.reproduced) },
+      wallClockMs: sum((entry) => entry.wallClockMs),
       tokens,
-      raidsWithoutTokenUsage,
-      costPerBreakIn: breakIns === 0 || raidsWithoutTokenUsage === ordered.length ? null : tokens / breakIns,
+      roundsWithoutTokenUsage: sum((entry) => entry.roundsWithoutTokenUsage),
+      costPerBreakIn: reportedBreakIns === 0 ? null : fullyReported.reduce((total, entry) => total + entry.tokens, 0) / reportedBreakIns,
       raidsSinceLastBreakIn,
       flag: raidsSinceLastBreakIn >= ZERO_BREAK_IN_FLAG_RAIDS
-        ? `${String(raidsSinceLastBreakIn)} raids in a row found no break-in (${String(sum((metrics) => metrics.executedRuns))} sandboxed runs${tokens > 0 ? `, ${String(tokens)} tokens` : ''} spent in total); turning raids off for ${repo} is your call`
+        ? `${String(raidsSinceLastBreakIn)} raids in a row found no break-in (${String(executedRuns)} sandboxed runs${tokens > 0 ? `, ${String(tokens)} tokens` : ''} spent in total); turning raids off for ${repo} is your call`
         : null,
     };
   });
 }
+
+/** Raids counting toward a repository's daily cap: started in the last 24 hours, or launched and not yet run. */
+export function raidsTowardCap(raids: readonly RaidRecord[], repo: string, now: Date): number {
+  const DAY_MS = 86_400_000;
+  return raids.filter((raid) => raid.target.repo === repo &&
+    ((raid.startedAt !== null && now.getTime() - Date.parse(raid.startedAt) < DAY_MS) || raid.state === 'queued' || raid.state === 'running')).length;
+}
+
+/** A key naming one target at one source identity. */
+export const offerKey = (repo: string, packageDir: string, sourceIdentity: string): string => `${repo}\u0000${packageDir}\u0000${sourceIdentity}`;
 
 export interface PlanRecord {
   readonly digest: string;
   readonly notificationId: string;
   readonly offeredAt: string;
   readonly decidedAt: string | null;
+  /** offerKey of every candidate the list offered: once decided, Gru has seen them. */
+  readonly offered: readonly string[];
 }
 
 export class VectorRecordError extends Error {
@@ -240,6 +287,35 @@ function signalsOf(value: unknown): RaidSignals {
   };
 }
 
+/** Read a stored metrics object; anything absent counts as zero. */
+export function metricsOf(value: unknown): RaidMetrics {
+  const m = (typeof value === 'object' && value !== null ? value : {}) as Payload;
+  const count = (key: string): number => (typeof m[key] === 'number' ? m[key] : 0);
+  const replay = (typeof m['replayReliability'] === 'object' && m['replayReliability'] !== null ? m['replayReliability'] : {}) as Payload;
+  const rejected = (typeof m['rejectedByVerdict'] === 'object' && m['rejectedByVerdict'] !== null ? m['rejectedByVerdict'] : {}) as Payload;
+  return {
+    actionableDefects: count('actionableDefects'),
+    invalidOracles: count('invalidOracles'),
+    unknownValidity: count('unknownValidity'),
+    totalQualificationAttempts: count('totalQualificationAttempts'),
+    replayReliability: { replayed: typeof replay['replayed'] === 'number' ? replay['replayed'] : 0, reproduced: typeof replay['reproduced'] === 'number' ? replay['reproduced'] : 0 },
+    escapedRegressions: count('escapedRegressions'),
+    executedRuns: count('executedRuns'),
+    totalExecutionMs: count('totalExecutionMs'),
+    totalTokenCost: typeof m['totalTokenCost'] === 'number' ? m['totalTokenCost'] : null,
+    proposals: count('proposals'),
+    qualified: count('qualified'),
+    rejectedByVerdict: Object.fromEntries(Object.entries(rejected).filter((entry): entry is [string, number] => typeof entry[1] === 'number')),
+    inconclusive: count('inconclusive'),
+    invalidAttacks: count('invalidAttacks'),
+    duplicates: count('duplicates'),
+    breakIns: count('breakIns'),
+    wallClockMs: count('wallClockMs'),
+    tokens: count('tokens'),
+    roundsWithoutTokenUsage: count('roundsWithoutTokenUsage'),
+  };
+}
+
 export function signalsPayload(signals: RaidSignals): Payload {
   return {
     commits_since_last_raid: signals.commitsSinceLastRaid,
@@ -260,19 +336,35 @@ export class VectorLedger {
   private readonly raidsById = new Map<string, RaidRecord>();
   private readonly plans = new Map<string, PlanRecord>();
   private readonly breakInsById = new Map<string, BreakInRecord>();
+  private skippedEvents = 0;
 
-  constructor(private readonly ledger: LedgerApi) {}
+  constructor(private readonly ledger: LedgerApi, private readonly log: (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void = () => {}) {}
 
-  /** Apply every `vector.*` event the projection has not seen yet. */
+  /** Apply every `vector.*` event the projection has not seen yet. An event
+   * that cannot apply (a record naming an unknown raid, a missing field) is
+   * logged at error with its seq and skipped, never a wedge: the projection
+   * keeps every other raid working. */
   refresh(): void {
     for (;;) {
       const page = this.ledger.listEventsAfter(this.cursor, { kinds: VECTOR_EVENT_KINDS, limit: PAGE });
       for (const event of page) {
-        this.apply(event.kind, (typeof event.payload === 'object' && event.payload !== null ? event.payload : {}) as Payload, event.ts);
-        this.cursor = event.seq;
+        try {
+          this.apply(event.kind, (typeof event.payload === 'object' && event.payload !== null ? event.payload : {}) as Payload, event.ts);
+        } catch (error) {
+          this.skippedEvents += 1;
+          this.log('error', 'vector event skipped: it does not apply to the raid projection', { seq: event.seq, kind: event.kind, error: error instanceof Error ? error.message : String(error) });
+        } finally {
+          this.cursor = event.seq;
+        }
       }
       if (page.length < PAGE) return;
     }
+  }
+
+  /** How many stored `vector.*` events could not apply (each logged). */
+  skipped(): number {
+    this.refresh();
+    return this.skippedEvents;
   }
 
   /** Append one `vector.*` fact and apply it. */
@@ -309,6 +401,17 @@ export class VectorLedger {
     return this.plans.get(digest) ?? null;
   }
 
+  /** offerKey of every candidate an answered (or superseded) list showed Gru. */
+  decidedOffers(): readonly string[] {
+    this.refresh();
+    return [...this.plans.values()].filter((plan) => plan.decidedAt !== null).flatMap((plan) => plan.offered);
+  }
+
+  planCount(): number {
+    this.refresh();
+    return this.plans.size;
+  }
+
   openPlans(): readonly PlanRecord[] {
     this.refresh();
     return [...this.plans.values()].filter((plan) => plan.decidedAt === null);
@@ -318,7 +421,8 @@ export class VectorLedger {
     switch (kind) {
       case VECTOR_EVENTS.planOffered: {
         const digest = text(payload, 'digest');
-        this.plans.set(digest, { digest, notificationId: text(payload, 'notification_id'), offeredAt: ts, decidedAt: null });
+        const offered = Array.isArray(payload['offered']) ? (payload['offered'] as unknown[]).filter((entry): entry is string => typeof entry === 'string') : [];
+        this.plans.set(digest, { digest, notificationId: text(payload, 'notification_id'), offeredAt: ts, decidedAt: null, offered });
         return;
       }
       case VECTOR_EVENTS.planDecided: {
@@ -423,14 +527,20 @@ export class VectorLedger {
         this.raidsById.set(id, { ...raid, state: 'running', startedAt: ts, runHeadSha: text(payload, 'head_sha') });
         return;
       case VECTOR_EVENTS.round: {
+        const outcome = text(payload, 'outcome');
+        if (!(ROUND_OUTCOMES as readonly string[]).includes(outcome)) throw new VectorRecordError(`raid "${id}" names an unknown round outcome "${outcome}"`);
+        const receipts = Array.isArray(payload['receipts']) ? (payload['receipts'] as unknown[]).filter((entry): entry is string => typeof entry === 'string') : [];
         const round: RaidRoundRecord = {
           round: typeof payload['round'] === 'number' ? payload['round'] : raid.rounds.length + 1,
           description: typeof payload['description'] === 'string' ? payload['description'] : null,
+          outcome: outcome as RoundOutcome,
           verdict: text(payload, 'verdict'),
           candidateOutcome: typeof payload['candidate_outcome'] === 'string' ? payload['candidate_outcome'] : null,
           replay: typeof payload['replay'] === 'string' ? payload['replay'] : null,
           artifactSha256: typeof payload['artifact_sha256'] === 'string' ? payload['artifact_sha256'] : null,
           executedRuns: typeof payload['executed_runs'] === 'number' ? payload['executed_runs'] : 0,
+          receipts,
+          noReceiptReason: receipts.length > 0 ? null : (typeof payload['no_receipt_reason'] === 'string' ? payload['no_receipt_reason'] : `no receipt: the round ended ${outcome}`),
           detail: typeof payload['detail'] === 'string' ? payload['detail'] : '',
         };
         this.raidsById.set(id, { ...raid, rounds: [...raid.rounds, round] });
@@ -439,12 +549,9 @@ export class VectorLedger {
       case VECTOR_EVENTS.finished: {
         const outcome = text(payload, 'outcome');
         if (!(RAID_OUTCOMES as readonly string[]).includes(outcome)) throw new VectorRecordError(`raid "${id}" names an unknown outcome "${outcome}"`);
-        const m = (typeof payload['metrics'] === 'object' && payload['metrics'] !== null ? payload['metrics'] : {}) as Payload;
-        const count = (key: string): number => (typeof m[key] === 'number' ? m[key] : 0);
         this.raidsById.set(id, { ...raid, state: 'finished', outcome: outcome as RaidOutcome, outcomeLabel: text(payload, 'label'), finishedAt: ts,
           reportFile: typeof payload['report_file'] === 'string' ? payload['report_file'] : null,
-          metrics: { proposals: count('proposals'), qualified: count('qualified'), invalidOracles: count('invalid_oracles'), executedRuns: count('executed_runs'),
-            breakIns: count('break_ins'), wallClockMs: count('wall_clock_ms'), tokens: typeof m['tokens'] === 'number' ? m['tokens'] : null } });
+          metrics: metricsOf(payload['metrics']) });
         return;
       }
       default:

@@ -6,7 +6,7 @@ import { propertyGit } from '../property/receipts.js';
 import { resolvePropertyCapabilities } from '../property/resolve.js';
 import type { PackageResolution } from '../property/types.js';
 import { loadWorktreeManifest } from '../worktrees/manifest.js';
-import type { RaidRecord, RaidSignals, RaidTarget } from './ledger.js';
+import { raidsTowardCap, type RaidRecord, type RaidSignals, type RaidTarget } from './ledger.js';
 
 /**
  * Raid candidates (#351 §2): code builds and ranks the list from structured
@@ -63,8 +63,12 @@ const DAY_MS = 86_400_000;
 const sameTarget = (left: RaidTarget, right: RaidTarget): boolean => left.repo === right.repo && left.packageDir === right.packageDir;
 
 /** Outcomes that leave a target worth raiding again at the same code: the
- * raid stopped for heist work, main moved under it, or the host failed. */
-const RETRYABLE_OUTCOMES: ReadonlySet<string> = new Set(['yielded', 'invalidated', 'infrastructure-error']);
+ * raid stopped for heist work, main moved under it, the host failed, or the
+ * host could not run it (a sandbox can be installed later). */
+const RETRYABLE_OUTCOMES: ReadonlySet<string> = new Set(['yielded', 'invalidated', 'infrastructure-error', 'refused']);
+
+/** The one adapter the raid runner executes (#350's shipped pilot). */
+export const RAID_ADAPTER = 'vitest-fast-check';
 
 /** A launched raid that settled this target at this identity. */
 const raidedHere = (raid: RaidRecord): boolean =>
@@ -97,7 +101,7 @@ function packageTree(repoPath: string, headSha: string, packageDir: string): str
 function commitsSince(repoPath: string, headSha: string, packageDir: string, sinceSha: string | null): number {
   const range = sinceSha === null ? headSha : `${sinceSha}..${headSha}`;
   try {
-    const out = propertyGit(repoPath, ['rev-list', '--count', range, '--', packageDir === '.' ? '.' : packageDir]).trim();
+    const out = propertyGit(repoPath, ['rev-list', '--count', range, '--', `:(literal)${packageDir}`]).trim();
     const count = Number.parseInt(out, 10);
     return Number.isSafeInteger(count) ? count : 0;
   } catch {
@@ -106,10 +110,6 @@ function commitsSince(repoPath: string, headSha: string, packageDir: string, sin
   }
 }
 
-/** Launched raids count toward the cap whatever their outcome. */
-function launchedWithin(raids: readonly RaidRecord[], repo: string, now: Date): number {
-  return raids.filter((raid) => raid.target.repo === repo && raid.launchedAt !== null && now.getTime() - Date.parse(raid.launchedAt) < DAY_MS).length;
-}
 
 export function buildRaidCandidates(inputs: CandidateInputs): RaidCandidateList {
   const candidates: RaidCandidate[] = [];
@@ -136,7 +136,7 @@ export function buildRaidCandidates(inputs: CandidateInputs): RaidCandidateList 
     if (mode === 'disabled') { exclude('property execution is disabled (.gru-command/property.toml mode is missing or "disabled")'); continue; }
     const headSha = defaultHead(repoPath);
     if (headSha === null) { exclude('no cached origin default branch (refs/remotes/origin/HEAD); fetch the repository'); continue; }
-    if (launchedWithin(inputs.raids, repo, inputs.now) >= inputs.maxRaidsPerDay) {
+    if (raidsTowardCap(inputs.raids, repo, inputs.now) >= inputs.maxRaidsPerDay) {
       exclude(`daily raid cap reached (${String(inputs.maxRaidsPerDay)} in the last 24 hours)`);
       continue;
     }
@@ -153,12 +153,14 @@ export function buildRaidCandidates(inputs: CandidateInputs): RaidCandidateList 
         exclude(`no runnable property adapter (${row.status}${row.reasons.length > 0 ? `: ${row.reasons.join('; ')}` : ''})`, packageDir);
         continue;
       }
+      if (row.adapterId !== RAID_ADAPTER) { exclude(`raids run only the ${RAID_ADAPTER} adapter today (this package resolves to ${row.adapterId})`, packageDir); continue; }
       const sourceIdentity = packageTree(repoPath, headSha, packageDir);
       if (sourceIdentity === null) { exclude('the package is not in the default-branch head', packageDir); continue; }
       const target: RaidTarget = { repo, packageDir };
       const history = inputs.raids.filter((raid) => sameTarget(raid.target, target));
       const atIdentity = history.filter((raid) => raid.sourceIdentity === sourceIdentity);
       if (history.some((raid) => raid.state === 'proposed')) { exclude('a raid proposal for it is pending', packageDir); continue; }
+      if (history.some((raid) => raid.state === 'queued' || raid.state === 'running')) { exclude('a raid on it is queued or running', packageDir); continue; }
       if (atIdentity.some(raidedHere)) { exclude('already raided at this source identity', packageDir); continue; }
       if (atIdentity.some((raid) => raid.state === 'declined')) { exclude('declined at this source identity', packageDir); continue; }
       const last = history.filter((raid) => raid.launchedAt !== null).sort((left, right) => Date.parse(right.launchedAt!) - Date.parse(left.launchedAt!))[0];

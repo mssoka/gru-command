@@ -282,6 +282,20 @@ describe('service shutdown orchestration (issue #341, R3-2 executable)', () => {
     expect(run.lines.some((line) => line.msg === 'shutdown checkpoint failed — pending ownership retained')).toBe(true);
   });
 
+  it('stops Vector\'s raid planning and raid queue; one failing to stop never skips the other (#351)', async () => {
+    const order: string[] = [];
+    const state: ServiceShutdownState = {
+      vector: { stop: () => { order.push('vector.stop'); throw new Error('planning timer gone'); } },
+      vectorRaids: { stop: () => { order.push('vectorRaids.stop'); } },
+      handle: fakeHandle(order),
+    };
+    const run = runShutdown(state);
+    await run.exited;
+    expect(run.exits).toEqual([0]);
+    expect(order).toEqual(['vector.stop', 'vectorRaids.stop', 'handle.stop']);
+    expect(run.lines.filter((line) => line.level === 'error').map((line) => line.msg)).toEqual(['vector raid planning stop failed']);
+  });
+
   it('is the orchestration main.ts actually invokes (wiring alarm)', () => {
     const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
     expect(mainSource).toContain("from './service-shutdown.js'");
@@ -289,5 +303,11 @@ describe('service shutdown orchestration (issue #341, R3-2 executable)', () => {
     // #368: the autopilot handle and the checkpoint ledger reach the state bag.
     expect(mainSource).toMatch(/\bstate\.autopilot = autopilotOps;/);
     expect(mainSource).toMatch(/\bstate\.ledger = ledger;/);
+    // #351: both raid halves reach the state bag before either starts, so a failed start still stops.
+    const registered = Math.max(mainSource.indexOf('state.vector = vector;'), mainSource.indexOf('state.vectorRaids = vectorRaids;'));
+    expect(mainSource.indexOf('state.vector = vector;')).toBeGreaterThan(-1);
+    expect(mainSource.indexOf('state.vectorRaids = vectorRaids;')).toBeGreaterThan(-1);
+    expect(registered).toBeLessThan(mainSource.indexOf('vector.start();'));
+    expect(registered).toBeLessThan(mainSource.indexOf('vectorRaids.start();'));
   });
 });

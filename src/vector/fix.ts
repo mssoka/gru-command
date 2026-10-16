@@ -36,6 +36,7 @@ export function breakInContract(breakIn: BreakInRecord): { readonly path: string
   } catch (error) {
     throw new FixBriefingError(`break-in ${breakIn.id} evidence is unreadable at ${breakIn.evidenceDir}: ${error instanceof Error ? error.message : String(error)}`);
   }
+  if (typeof record !== 'object' || record === null) throw new FixBriefingError(`break-in ${breakIn.id} evidence at ${breakIn.evidenceDir} is not a record`);
   const test = (record as { test?: { path?: unknown; content?: unknown } }).test;
   if (typeof test?.path !== 'string' || typeof test.content !== 'string') throw new FixBriefingError(`break-in ${breakIn.id} evidence holds no contract test`);
   return { path: test.path, content: test.content };
@@ -46,8 +47,8 @@ export function fixHeistJobId(breakIn: BreakInRecord): string {
 }
 
 export function fixHeistTitle(breakIn: BreakInRecord): string {
-  const invariant = [...breakIn.invariant.replace(/\s+/gu, ' ')].slice(0, 80).join('');
-  return `Fix Vector break-in: ${invariant}${breakIn.invariant.length > 80 ? '…' : ''}`;
+  const points = [...breakIn.invariant.replace(/\s+/gu, ' ').trim()];
+  return `Fix Vector break-in: ${points.slice(0, 80).join('')}${points.length > 80 ? '…' : ''}`;
 }
 
 export function renderFixBriefing(breakIn: BreakInRecord, contract: { readonly path: string; readonly content: string }): string {

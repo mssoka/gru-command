@@ -72,6 +72,8 @@ const REFUSAL_STATUS: Readonly<Record<VectorRefusal['code'], number>> = {
   not_a_candidate: 422,
 };
 
+class BodyTooLarge extends Error {}
+
 function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
   return new Promise((resolveBody, rejectBody) => {
     let seen = 0;
@@ -82,8 +84,9 @@ function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
       seen += chunk.length;
       if (seen > 64 * 1024) {
         rejected = true;
-        rejectBody(new Error('request body exceeds 64 KiB'));
-        req.destroy();
+        rejectBody(new BodyTooLarge('request body exceeds 64 KiB'));
+        // The caller answers 413 first; the rest of the body is drained, not read.
+        req.resume();
         return;
       }
       chunks.push(chunk);
@@ -169,7 +172,7 @@ export function createVectorServer(options: VectorServerOptions): VectorServer {
       if (!authed(req, res)) return true;
       let body: Record<string, unknown>;
       try { body = await readBody(req); } catch (error) {
-        json(res, 400, { error: 'bad_request', detail: error instanceof Error ? error.message : String(error) });
+        json(res, error instanceof BodyTooLarge ? 413 : 400, { error: error instanceof BodyTooLarge ? 'payload_too_large' : 'bad_request', detail: error instanceof Error ? error.message : String(error) });
         return true;
       }
       const result = options.service.pick(parsePicks(body));

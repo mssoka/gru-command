@@ -85,7 +85,7 @@ import { createReviewOutcomeCapture } from './lessons/review-capture.js';
 import { createLessonsServer } from './lessons/server.js';
 import { VectorService } from './vector/service.js';
 import { createVectorServer } from './vector/server.js';
-import { VectorRaidRunner } from './vector/runner.js';
+import { heistWorkWaiting as raidHeistWorkWaiting, VectorRaidRunner } from './vector/runner.js';
 import { DecisionRuntime } from './decisions/runtime.js';
 import { DECISION_SURFACE_EVENT_TRIAGE } from './decisions/questions.js';
 import { isolateDecisionEnvironment } from './decisions/credentials.js';
@@ -609,10 +609,7 @@ async function main(): Promise<number> {
     },
     disposeVector: (handle) => registry.disposeHandle(handle),
     acquireTurn: (input) => pacing.gate.acquireReviewTurn(input),
-    heistWorkWaiting: () => {
-      const view = pacing.gate.view();
-      return view.worker.queued.length > 0 || view.review.queued.some((entry) => !entry.id.startsWith('vector:'));
-    },
+    heistWorkWaiting: () => raidHeistWorkWaiting(pacing.gate.view()),
     notifications,
     onBreakIn: (breakIn) => {
       void vector.onBreakIn(breakIn.id).catch((error: unknown) => logger.log('error', 'vector break-in follow-through failed', { breakIn: breakIn.id, error: String(error) }));
@@ -1602,14 +1599,20 @@ async function main(): Promise<number> {
   bob.start();
   if (config.lessons.enabled) dream.start();
   else logger.info('lesson dream disabled by config', {});
+  // Registered for shutdown before starting, so a failed start still stops.
+  // Raids are off the heist path: a failure is loud, never fatal, and one
+  // half failing never keeps the other from starting.
+  state.vector = vector;
+  state.vectorRaids = vectorRaids;
   try {
     vector.start();
-    state.vector = vector;
-    vectorRaids.start();
-    state.vectorRaids = vectorRaids;
   } catch (error) {
-    // Raid planning is off the heist path: a failure is loud, never fatal.
     logger.log('error', 'vector raid planning failed to start', { error: String(error) });
+  }
+  try {
+    vectorRaids.start();
+  } catch (error) {
+    logger.log('error', 'vector raid runner failed to start', { error: String(error) });
   }
   if (silasSlot !== null) {
     // The driver starts after listen so its wake prompt carries the real
