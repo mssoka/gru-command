@@ -4,15 +4,15 @@ import fs, { existsSync, linkSync, mkdirSync, readFileSync, symlinkSync, writeFi
 import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createBoundedPropertyCapture, createPropertyExecutor, isSealedExecutionReceipt, resolveSandboxBackend, validatePlanAgainstHostApproval } from '../src/property/executor.js';
+import { createBoundedPropertyCapture, createPropertyExecutor, PreExecutionRejectionError, createReceiptRetention, framedRunnerReport, isSealedExecutionReceipt, noReportReasons, NONCE_READ_BUDGET_MS, nonceReaderSource, propertyWorkspaceIdentity, ReceiptRetentionError, resolveSandboxBackend, validatePlanAgainstHostApproval } from '../src/property/executor.js';
 import { VITEST_FAST_CHECK_ADAPTER as adapter } from '../src/property/adapters/vitest-fast-check.js';
-import { applyOverlayFiles } from '../src/property/overlay.js';
+import { applyOverlayFiles, applyOverlayFilesAllOrNothing } from '../src/property/overlay.js';
 import { buildSourceIdentity } from '../src/property/receipts.js';
 import { PASS_RUNNER, scenarioRepo } from './fixtures/property/executor/helpers.js';
 const fixtures: ReturnType<typeof scenarioRepo>[] = [];
 afterEach(() => { for (const f of fixtures.splice(0)) f.cleanup(); });
 function fixture(script = PASS_RUNNER) { const f = scenarioRepo(script); fixtures.push(f); return f; }
-function ceilings() { return { maxRunTimeoutMs: 900_000, maxMaxOutputBytes: 64 * 1024 * 1024 }; }
+function ceilings() { return { maxRunTimeoutMs: 900_000, maxMaxOutputBytes: 8 * 1024 * 1024 }; }
 async function run(script: string, opts: { readonly timeout?: number; readonly output?: number; readonly env?: Record<string, string> } = {}) {
   const f = fixture(script); const executor = createPropertyExecutor({ envSource: opts.env });
   const plan = { ...f.plan, budget: { ...f.plan.budget, runTimeoutMs: opts.timeout ?? 10_000, maxOutputBytes: opts.output ?? 32_768 } };
@@ -35,6 +35,188 @@ describe('host property executor (positive sandbox controls on macOS; other host
     const source = `const POLICY={maxMaxOutputBytes:67108864};const capture=(${createBoundedPropertyCapture.toString()})(1024);global.gc();const before=process.memoryUsage().arrayBuffers;const first=Buffer.from('abc');capture.push('stdout',first);first.fill(122);for(let i=0;i<2000;i++){capture.push('stdout',Buffer.alloc(131072,120));capture.push('stderr',Buffer.alloc(131072,121));}global.gc();global.gc();console.log(JSON.stringify({retained:process.memoryUsage().arrayBuffers-before,capacity:capture.capacityBytes,...capture.finish()}));`;
     const result = JSON.parse(execFileSync(process.execPath, ['--expose-gc', '--input-type=module', '-e', source], { encoding: 'utf8', timeout: 15_000, env: { PATH: '/usr/bin:/bin', LANG: 'C' } }));
     expect(result.retained).toBeLessThan(2 * 1024 * 1024); expect(result.capacity).toBe(2048); expect(result.stdout).toHaveLength(1024); expect(result.stderr).toHaveLength(1024); expect(result.stdout.startsWith('abc')).toBe(true); expect(result.complete).toBe(false);
+  });
+  it('allocates capture storage only for bytes actually kept, never 2 × the cap up front (#377)', () => {
+    const source = `const POLICY={maxMaxOutputBytes:8388608};global.gc();const before=process.memoryUsage().arrayBuffers;const capture=(${createBoundedPropertyCapture.toString()})(8388608);capture.push('stdout',Buffer.from('small output'));global.gc();console.log(JSON.stringify({allocated:process.memoryUsage().arrayBuffers-before,capacity:capture.capacityBytes,stdout:capture.finish().stdout}));`;
+    const result = JSON.parse(execFileSync(process.execPath, ['--expose-gc', '--input-type=module', '-e', source], { encoding: 'utf8', timeout: 15_000, env: { PATH: '/usr/bin:/bin', LANG: 'C' } }));
+    expect(result.capacity).toBeLessThanOrEqual(64 * 1024); // grows with output; nothing near the 8 MiB cap up front
+    expect(result.allocated).toBeLessThan(1024 * 1024); // a 16 MiB preallocation would show here
+    expect(result.stdout).toBe('small output');
+  });
+  it('keeps one growing buffer per stream under a flood of tiny writes, never one object per chunk (#377)', () => {
+    const source = `const POLICY={maxMaxOutputBytes:8388608};const capture=(${createBoundedPropertyCapture.toString()})(65536);global.gc();const before=process.memoryUsage().arrayBuffers;for(let i=0;i<200000;i++)capture.push('stdout',Buffer.from([97+(i%26)]));global.gc();const out=capture.finish();console.log(JSON.stringify({retained:process.memoryUsage().arrayBuffers-before,capacity:capture.capacityBytes,length:out.stdout.length,head:out.stdout.slice(0,3),truncated:out.stdoutTruncated}));`;
+    const result = JSON.parse(execFileSync(process.execPath, ['--expose-gc', '--input-type=module', '-e', source], { encoding: 'utf8', timeout: 15_000, env: { PATH: '/usr/bin:/bin', LANG: 'C' } }));
+    expect(result).toMatchObject({ capacity: 65536, length: 65536, head: 'abc', truncated: true });
+    expect(result.retained).toBeLessThan(1024 * 1024);
+  });
+  it('bounds retained receipts by count and summed output bytes, evicting the oldest first (#377)', () => {
+    const retention = createReceiptRetention<string>({ maxReceipts: 3, maxBytes: 100 });
+    retention.add('a', 'A', 40); retention.add('b', 'B', 40);
+    expect([retention.get('a'), retention.get('b'), retention.retainedBytes]).toEqual(['A', 'B', 80]);
+    retention.add('c', 'C', 40); // 120 bytes > 100: the oldest goes
+    expect([retention.get('a'), retention.get('b'), retention.get('c'), retention.retainedBytes]).toEqual([undefined, 'B', 'C', 80]);
+    retention.add('d', 'D', 10); retention.add('e', 'E', 10); // 4 receipts > 3: the oldest goes
+    expect([retention.get('b'), retention.get('c'), retention.get('d'), retention.get('e'), retention.size]).toEqual([undefined, 'C', 'D', 'E', 3]);
+    // A receipt that alone exceeds the byte bound is refused by name; nothing changes.
+    expect(() => retention.add('huge', 'H', 500)).toThrow(ReceiptRetentionError);
+    expect(() => retention.add('huge', 'H', 500)).toThrow(/^a 500-byte receipt exceeds the 100-byte retention bound$/u);
+    expect([retention.size, retention.retainedBytes, retention.evicted]).toEqual([3, 60, 2]);
+    // Re-adding an id replaces its bytes instead of double-counting them.
+    retention.add('c', 'C2', 30);
+    expect([retention.get('c'), retention.retainedBytes]).toEqual(['C2', 50]);
+    // A read keeps a receipt warm: the least recently USED one goes first.
+    retention.get('d'); retention.add('f', 'F', 10);
+    expect([retention.get('e'), retention.get('d'), retention.get('f'), retention.evicted]).toEqual([undefined, 'D', 'F', 3]);
+    expect(retention.get(undefined)).toBeUndefined();
+  });
+  it('a completed run whose receipt exceeds the retention bound is reported by name, never issued (#377)', async () => {
+    const f = fixture(`process.stdout.write('y'.repeat(6000))`);
+    const executor = createPropertyExecutor({ maxRetainedOutputBytes: 1024 });
+    const input = { plan: f.plan, repoRoot: f.root, packageDir: f.root };
+    const pending = executor.executePlan({ ...input, adapter, approval: executor.approvePlan(input) });
+    if (process.platform !== 'darwin') { expect((await pending).executed).toBe(false); return; }
+    const error = await pending.then(() => null, (caught: unknown) => caught);
+    expect(error).toBeInstanceOf(ReceiptRetentionError);
+    expect(String(error)).toMatch(/^ReceiptRetentionError: the run completed \([a-z-]+\) but its receipt was not issued: a \d+-byte receipt exceeds the 1024-byte retention bound; raise the host retention bound or lower max_output_bytes$/u);
+    expect(executor.retention()).toMatchObject({ receipts: 0, retainedOutputBytes: 0 });
+  });
+  it('names every reason a run has no authenticated report (#378)', () => {
+    expect(noReportReasons({ stdoutTruncated: false, nonceChannelError: null })).toEqual(['no host-framed report: the run printed no single complete nonce frame']);
+    expect(noReportReasons({ stdoutTruncated: true, nonceChannelError: null })).toEqual(['no host-framed report: stdout reached the output cap before the frame closed']);
+    expect(noReportReasons({ stdoutTruncated: false, nonceChannelError: 'Error: EPIPE' })).toEqual(['no host-framed report: host report channel failed: Error: EPIPE']);
+    expect(noReportReasons({ stdoutTruncated: true, nonceChannelError: 'Error: EPIPE' })).toEqual([
+      'no host-framed report: stdout reached the output cap before the frame closed',
+      'no host-framed report: host report channel failed: Error: EPIPE',
+    ]);
+  });
+  it('reads the fd-3 nonce through EAGAIN within its budget, and a close failure never masks the read error (#378)', () => {
+    type Step = number | string | Error;
+    const errno = (code: string): Error => Object.assign(new Error(code), { code });
+    const reader = (budgetMs = NONCE_READ_BUDGET_MS) => new Function('readSync', 'closeSync', `${nonceReaderSource(budgetMs)}\nreturn nonce;`) as (read: (fd: number, buffer: Buffer, offset: number, length: number) => number, close: (fd: number) => void) => string;
+    const run = (steps: readonly Step[], closeError: Error | null = null, budgetMs = NONCE_READ_BUDGET_MS) => {
+      const closed: number[] = [];
+      const queue = [...steps];
+      let reads = 0;
+      const read = (fd: number, buffer: Buffer, offset: number, length: number): number => {
+        expect(fd).toBe(3);
+        reads += 1;
+        const step = queue.shift() ?? 0;
+        if (step instanceof Error) throw step;
+        if (typeof step === 'string') return buffer.write(step, offset, length);
+        return step;
+      };
+      const close = (fd: number) => { closed.push(fd); if (closeError !== null) throw closeError; };
+      return { result: (() => { try { return reader(budgetMs)(read, close); } catch (error) { return error; } })(), closed, reads };
+    };
+    const nonce = 'c'.repeat(64);
+    // A not-yet-written non-blocking channel is retried, then read whole, then closed.
+    expect(run([errno('EAGAIN'), errno('EAGAIN'), `${nonce}\n`, 0])).toEqual({ result: nonce, closed: [3], reads: 4 });
+    // Any other read error is the channel's failure — and still closes fd 3.
+    expect(run([errno('EBADF')])).toMatchObject({ result: { code: 'EBADF' }, closed: [3] });
+    // A close failure never masks the read's own error...
+    expect(run([errno('EIO')], errno('EBADF'))).toMatchObject({ result: { code: 'EIO' } });
+    // ...and is the failure when the read itself succeeded.
+    expect(run([`${nonce}\n`, 0], errno('EBADF'))).toMatchObject({ result: { code: 'EBADF' } });
+    // A channel that never delivers gives up after its bounded wait — one
+    // read per 10 ms waited, then the last — and still closes (a 50 ms
+    // budget here; the shipped config waits NONCE_READ_BUDGET_MS).
+    expect(run(Array.from({ length: 100 }, () => errno('EAGAIN')), null, 50)).toMatchObject({ result: { code: 'EAGAIN' }, closed: [3], reads: 6 });
+    expect(NONCE_READ_BUDGET_MS).toBe(5000);
+    // A whole number of 10 ms steps, bounded: a startup never waits without end.
+    for (const bad of [5, 15, 60_010, Number.NaN, 2 ** 53]) expect(() => nonceReaderSource(bad), String(bad)).toThrow(/^nonce reader budget must be a multiple of 10 ms from 10 to 60000, got /u);
+    for (const good of [10, 50, 60_000, NONCE_READ_BUDGET_MS]) expect(() => nonceReaderSource(good), String(good)).not.toThrow();
+  });
+  it('refuses an invalid host receipt retention bound and reports the bound it enforces (#377)', () => {
+    for (const bad of [0, -1, 1.5, 256 * 1024 * 1024 + 1]) expect(() => createPropertyExecutor({ maxRetainedOutputBytes: bad })).toThrow(/receipt retention bound/);
+    expect(createPropertyExecutor({ maxRetainedOutputBytes: 4096 }).retention()).toEqual({ receipts: 0, retainedOutputBytes: 0, maxRetainedOutputBytes: 4096, evicted: 0 });
+    expect(createPropertyExecutor().retention().maxRetainedOutputBytes).toBe(256 * 1024 * 1024);
+    expect(() => createPropertyExecutor({ maxMaxOutputBytes: 8 * 1024 * 1024 + 1 })).toThrow(/invalid host ceiling/);
+  });
+  it('evicts the oldest sealed receipt past the retained-output bound; its ref then resolves to null (#377)', async () => {
+    const f = fixture(`process.stdout.write('y'.repeat(6000))`);
+    // Measure one whole sealed receipt, then bound retention below two of them.
+    const probe = createPropertyExecutor();
+    const probeInput = { plan: f.plan, repoRoot: f.root, packageDir: f.root };
+    const measured = await probe.executePlan({ ...probeInput, adapter, approval: probe.approvePlan(probeInput) });
+    if (process.platform !== 'darwin') { expect(measured.executed).toBe(false); return; }
+    if (!measured.executed) throw new Error(measured.refusal.reason);
+    const bound = Math.floor(probe.retention().retainedOutputBytes * 1.5);
+    expect(probe.retention().retainedOutputBytes).toBe(Buffer.byteLength(JSON.stringify(measured.receipt))); // the WHOLE receipt counts
+    const size = (receipt: unknown) => Buffer.byteLength(JSON.stringify(receipt));
+    const executor = createPropertyExecutor({ maxRetainedOutputBytes: bound });
+    const execute = async () => {
+      const input = { plan: f.plan, repoRoot: f.root, packageDir: f.root };
+      return executor.executePlan({ ...input, adapter, approval: executor.approvePlan(input) });
+    };
+    const first = await execute();
+    if (!first.executed) throw new Error(first.refusal.reason);
+    expect(executor.resolveReceiptRef(first.ref)).toBe(first.receipt);
+    const second = await execute();
+    if (!second.executed) throw new Error(second.refusal.reason);
+    // The premise, measured rather than assumed: each fits, both do not.
+    expect(size(first.receipt)).toBeLessThanOrEqual(bound);
+    expect(size(second.receipt)).toBeLessThanOrEqual(bound);
+    expect(size(first.receipt) + size(second.receipt)).toBeGreaterThan(bound);
+    expect(executor.resolveReceiptRef(first.ref)).toBeNull(); // evicted: consumers fail closed
+    expect(executor.resolveReceiptRef(second.ref)).toBe(second.receipt);
+    expect(executor.retention()).toMatchObject({ receipts: 1, maxRetainedOutputBytes: bound, evicted: 1 });
+  });
+  async function assertUnsupportedRunner(layout: false | 'directory' | 'symlink'): Promise<void> {
+    const f = scenarioRepo(PASS_RUNNER, { reportersModule: layout }); fixtures.push(f);
+    const executor = createPropertyExecutor();
+    const input = { plan: f.plan, repoRoot: f.root, packageDir: f.root };
+    const pending = executor.executePlan({ ...input, adapter, approval: executor.approvePlan(input) });
+    if (process.platform !== 'darwin') { expect((await pending).executed).toBe(false); return; }
+    const error = await pending.then(() => null, (caught: unknown) => caught);
+    expect(error).toBeInstanceOf(PreExecutionRejectionError);
+    expect((error as PreExecutionRejectionError).category).toBe('unsupported-runner');
+    expect(String(error)).toMatch(/copied Vitest has no regular file node_modules\/vitest\/dist\/reporters\.js; the host-framed report cannot be produced/u);
+  }
+  it('refuses by name a copied Vitest without the reporters module the framed report needs (#378)', () => assertUnsupportedRunner(false));
+  it('refuses a reporters module that is a directory (#378)', () => assertUnsupportedRunner('directory'));
+  it('refuses a reporters module that is a symbolic link (#378)', () => assertUnsupportedRunner('symlink'));
+  it('never copies a reporters module reached through a directory linked outside the repository (#378)', async () => {
+    const f = scenarioRepo(PASS_RUNNER, { reportersModule: 'linked-dist' }); fixtures.push(f);
+    const executor = createPropertyExecutor();
+    const input = { plan: f.plan, repoRoot: f.root, packageDir: f.root };
+    // The workspace reading the copy is made from refuses the link on every platform...
+    expect(() => propertyWorkspaceIdentity(f.root)).toThrow(/^external\/absolute symlink refused: node_modules\/vitest\/dist$/u);
+    const outcome = await Promise.resolve().then(() => executor.executePlan({ ...input, adapter, approval: executor.approvePlan(input) }))
+      .then((result) => ({ result, caught: null }), (caught: unknown) => ({ result: null, caught }));
+    // ...and so does the plan's approval, before any copy exists — on every
+    // platform, with or without a sandbox backend.
+    expect(outcome.result).toBeNull();
+    expect(String(outcome.caught)).toMatch(/external\/absolute symlink refused: node_modules\/vitest\/dist/u);
+  });
+  it('refuses a raw receipt without its framed report field, by name; null is no report (#378)', () => {
+    const f = fixture(PASS_RUNNER);
+    const raw = { stdout: '', stderr: '', report: null, exitCode: 1, signal: null, timedOut: false, durationMs: 1 };
+    for (const report of [undefined, 5]) {
+      expect(() => adapter.interpretExecution({ ...raw, report } as never, { ...f.plan, cwd: f.root }), String(report)).toThrow(TypeError);
+    }
+    expect(adapter.interpretExecution(raw, { ...f.plan, cwd: f.root }).kind).not.toBe('pass');
+  });
+  it('extracts exactly one nonce-framed runner report and nothing else (#378)', () => {
+    const nonce = 'a'.repeat(64);
+    const frame = (body: string) => `\n${nonce}:BEGIN\n${body}\n${nonce}:END\n`;
+    expect(framedRunnerReport(`noise${frame('{"report":1}')}tail`, nonce)).toBe('{"report":1}');
+    expect(framedRunnerReport('{"numTotalTests":1}', nonce)).toBeNull(); // unframed
+    expect(framedRunnerReport(frame('{}') + frame('{}'), nonce)).toBeNull(); // duplicated
+    expect(framedRunnerReport(`\n${nonce}:BEGIN\n{}`, nonce)).toBeNull(); // unterminated
+    expect(framedRunnerReport(frame('{}').replaceAll(nonce, 'b'.repeat(64)), nonce)).toBeNull(); // guessed nonce
+  });
+  it('never credits a report the code under test prints without the host nonce (#378)', async () => {
+    // The runner prints a perfectly valid PASS report straight to stdout (as
+    // repository code under test could), never reading the fd-3 nonce.
+    const forged = `console.log(JSON.stringify({numTotalTests:1,numPassedTests:1,numFailedTests:0,numPendingTests:0,numTodoTests:0,success:true,testResults:[{name:process.cwd()+'/test/contract.test.ts',status:'passed',message:'',assertionResults:[{status:'passed',fullName:'contract',failureMessages:[]}]}]}));`;
+    const r = await run(forged); if (r === null) return;
+    expect(r.receipt.outcome.kind).not.toBe('pass');
+    expect(r.receipt.outcome.receipt.report).toBeNull();
+    // The same report through the authenticated channel is credited.
+    const framed = await run(PASS_RUNNER); if (framed === null) return;
+    expect(framed.receipt.outcome.kind).toBe('pass');
+    expect(framed.receipt.identity.adapterProfile).toContain('nonce-framed-report');
+    expect(framed.receipt.identity.argv).not.toContain('--reporter=json'); // the framed host reporter fulfils it
   });
   it('aborts an owned process and proves close/group cessation before disposal releases its workspace', async () => {
     const f = fixture('setInterval(()=>{},1000);'); const controller = new AbortController(); const executor = createPropertyExecutor({ signal: controller.signal });
@@ -135,6 +317,8 @@ describe('host property executor (positive sandbox controls on macOS; other host
   it('bounds output capture and never turns truncated output into PASS', async () => {
     const r = await run(`process.stdout.write('x'.repeat(100000))`, { output: 100 }); if (r === null) return;
     expect(r.receipt.capture).toMatchObject({ stdoutTruncated: true, complete: false }); expect(r.receipt.outputs[0]!.bytes).toBeLessThanOrEqual(100); expect(r.receipt.outcome.kind).not.toBe('pass');
+    // Why there is no authenticated report is named, never silent (#378).
+    expect(r.receipt.outcome.reasons).toContain('no host-framed report: stdout reached the output cap before the frame closed');
   });
   it('kills an expired run and proves actual process cessation before cleanup', async () => {
     const r = await run(`setInterval(()=>{},1000)`, { timeout: 300 }); if (r === null) return;
@@ -150,6 +334,73 @@ describe('host property executor (positive sandbox controls on macOS; other host
     expect(overlay.files[0]!.bytes).toBe(1); expect(readFileSync(join(f.root, 'test/a.ts'), 'utf8')).toBe('a');
     expect(() => applyOverlayFiles({ workspaceRoot: f.root, files: [{ path: 'a', content: '1' }, { path: 'a', content: '2' }] })).toThrow(/duplicate/);
     mkdirSync(join(f.root, 'normal')); writeFileSync(join(f.root, 'normal/a'), 'a');
+  });
+  it('writes a live overlay all-or-nothing: a mid-way refusal leaves no partial set and restores overwritten files (#380)', () => {
+    const f = fixture();
+    writeFileSync(join(f.root, 'test/existing.test.mjs'), 'original bytes\n');
+    fs.chmodSync(join(f.root, 'test/existing.test.mjs'), 0o640);
+    mkdirSync(join(f.root, 'test/occupied.replay.json'));
+    const files = [
+      { path: 'test/existing.test.mjs', content: 'overlay bytes\n' },
+      { path: 'test/new.regression.test.mjs', content: 'wrapper\n' },
+      { path: 'test/fresh/deeper/wrapper.test.mjs', content: 'nested\n' }, // creates two parents
+      { path: 'test/occupied.replay.json', content: '{}\n' }, // a directory: refused mid-way
+    ];
+    expect(() => applyOverlayFilesAllOrNothing({ workspaceRoot: f.root, files })).toThrow(/non-file entry/);
+    expect(readFileSync(join(f.root, 'test/existing.test.mjs'), 'utf8')).toBe('original bytes\n');
+    expect(fs.statSync(join(f.root, 'test/existing.test.mjs')).mode & 0o777).toBe(0o640);
+    expect(existsSync(join(f.root, 'test/new.regression.test.mjs'))).toBe(false);
+    // The parent directories it created are gone too: no empty debris.
+    expect(existsSync(join(f.root, 'test/fresh'))).toBe(false);
+    expect(fs.statSync(join(f.root, 'test/occupied.replay.json')).isDirectory()).toBe(true);
+    // Without the refusal the same set lands whole.
+    applyOverlayFilesAllOrNothing({ workspaceRoot: f.root, files: files.slice(0, 2) });
+    expect(readFileSync(join(f.root, 'test/existing.test.mjs'), 'utf8')).toBe('overlay bytes\n');
+    expect(readFileSync(join(f.root, 'test/new.regression.test.mjs'), 'utf8')).toBe('wrapper\n');
+  });
+  it('rolls back only the directories it made: a later refused path leaves no debris and no false rollback failure (#380)', () => {
+    const f = fixture();
+    const files = [
+      { path: 'test/made/here/a.test.mjs', content: 'a\n' },
+      // Refused by path: its missing parent `test/never` is never created.
+      { path: 'test/never/../../../escape.test.mjs', content: 'x\n' },
+    ];
+    const error = (() => { try { applyOverlayFilesAllOrNothing({ workspaceRoot: f.root, files }); return null; } catch (caught) { return caught; } })();
+    expect(error).not.toBeInstanceOf(AggregateError);
+    expect(String(error)).toMatch(/overlay path must be a safe relative path/u);
+    expect(existsSync(join(f.root, 'test/made'))).toBe(false);
+    expect(existsSync(join(f.root, 'test/never'))).toBe(false);
+  });
+  // Permission bits do not bind root, so these two need an ordinary user.
+  const asUser = process.getuid?.() !== 0;
+  it.runIf(asUser)('restores a read-only original exactly, bytes and mode (#380)', () => {
+    const f = fixture();
+    const target = join(f.root, 'test/readonly.test.mjs');
+    writeFileSync(target, 'original\n'); fs.chmodSync(target, 0o444);
+    const files = [{ path: 'test/readonly.test.mjs', content: 'overlay\n' }, { path: 'test/../../escape.test.mjs', content: 'x\n' }];
+    let error: unknown = null;
+    try { applyOverlayFilesAllOrNothing({ workspaceRoot: f.root, files }); } catch (caught) { error = caught; }
+    // The restore itself succeeds: the original error, never a rollback failure.
+    expect(error).not.toBeInstanceOf(AggregateError);
+    expect(String(error)).toMatch(/overlay path must be a safe relative path/u);
+    expect(readFileSync(target, 'utf8')).toBe('original\n');
+    expect(fs.statSync(target).mode & 0o777).toBe(0o444);
+  });
+  it.runIf(asUser)('a rollback leaves a file the failed apply never touched exactly as it was, even in a locked directory (#380)', () => {
+    const f = fixture();
+    const locked = join(f.root, 'test/locked');
+    mkdirSync(locked); writeFileSync(join(locked, 'kept.test.mjs'), 'original\n');
+    const before = fs.statSync(join(locked, 'kept.test.mjs'));
+    const files = [{ path: 'test/locked/kept.test.mjs', content: 'overlay\n' }, { path: 'test/../../escape.test.mjs', content: 'x\n' }];
+    // The refusal lands before any write: the untouched file needs no restore,
+    // so the locked directory cannot fail the rollback.
+    fs.chmodSync(locked, 0o555);
+    let error: unknown = null;
+    try { applyOverlayFilesAllOrNothing({ workspaceRoot: f.root, files }); } catch (caught) { error = caught; } finally { fs.chmodSync(locked, 0o755); }
+    expect(error).not.toBeInstanceOf(AggregateError);
+    expect(String(error)).toMatch(/overlay path must be a safe relative path/u);
+    const after = fs.statSync(join(locked, 'kept.test.mjs'));
+    expect([after.ino, after.mtimeMs]).toEqual([before.ino, before.mtimeMs]);
   });
   it('binds host approval to exact overlay bytes and replay controls', async () => {
     const f = fixture(); const executor = createPropertyExecutor();

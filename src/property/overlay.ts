@@ -1,6 +1,7 @@
-import { createHash } from 'node:crypto';
-import { lstatSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
-import { isAbsolute, join } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { chmodSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, isAbsolute, join } from 'node:path';
+import { oneLineErrorText } from './error-text.js';
 import type { OverlayIdentity } from './types.js';
 
 /**
@@ -92,7 +93,7 @@ export function sha256Hex(data: string): string {
  * any path whose parent chain resolves (through copied symlinks) outside
  * the workspace root.
  */
-function resolveOverlayTarget(workspaceRoot: string, relPath: string): string {
+function resolveOverlayTarget(workspaceRoot: string, relPath: string, onCreatedDirectory?: (dir: string) => void): string {
   const segments = relPath.split('/');
   if (!relPath || isAbsolute(relPath) || /[\\:]/u.test(relPath) || [...relPath].some((char) => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127) || relPath.startsWith('-') || segments.some((part) => !part || part === '.' || part === '..')) {
     throw new OverlayPathError(`overlay path must be a safe relative path: ${JSON.stringify(relPath)}`);
@@ -104,7 +105,7 @@ function resolveOverlayTarget(workspaceRoot: string, relPath: string): string {
     parent = join(parent, segment);
     const info = lstatSync(parent, { throwIfNoEntry: false });
     if (info !== undefined && (!info.isDirectory() || info.isSymbolicLink())) throw new OverlayPathError(`overlay parent is not an ordinary directory: ${parent}`);
-    if (info === undefined) mkdirSync(parent);
+    if (info === undefined) { mkdirSync(parent); onCreatedDirectory?.(parent); }
   }
   return join(parent, segments.at(-1)!);
 }
@@ -167,4 +168,76 @@ export function applyOverlayFiles(input: {
     );
   }
   return { files: identities, overlaySha256 };
+}
+
+/** All-or-nothing overlay into a LIVE tree (#380): applyOverlayFiles writes
+ * file by file, so a later refusal or write error would leave a partial set.
+ * Every target's prior state is captured first — creating only the parent
+ * directories a VALIDATED path needs, each recorded as it is made; on any
+ * failure each file the call created is removed, each file it overwrote is
+ * re-created byte-for-byte with its mode (never written through a link
+ * swapped in meanwhile), and each directory it made is removed deepest
+ * first; then the original error is rethrown, or — when part of the
+ * rollback itself fails — an AggregateError carrying it and every cause. */
+export function applyOverlayFilesAllOrNothing(input: Parameters<typeof applyOverlayFiles>[0]): OverlayIdentity {
+  const createdDirs = new Set<string>();
+  const prior: { readonly target: string; readonly state: 'absent' | 'file' | 'other'; readonly content: Buffer | null; readonly mode: number | null; readonly inode: string | null }[] = [];
+  const rollback = (error: unknown): never => {
+    const failures: unknown[] = [];
+    for (const { target, state, content, mode, inode } of prior) {
+      // A pre-existing non-file entry is never written (applyOverlayFiles
+      // refuses it), so it is never touched here either.
+      if (state === 'other') continue;
+      try {
+        if (state === 'file' && content !== null && mode !== null) {
+          // A file the failed apply never touched is left exactly as it is
+          // (same inode, links and times): judged by its device and inode,
+          // mode and bytes. The check is only a shortcut — one that cannot
+          // read the target never skips, and the target is restored.
+          let untouched = false;
+          try {
+            const current = lstatSync(target, { throwIfNoEntry: false, bigint: true });
+            untouched = current?.isFile() === true && `${String(current.dev)}:${String(current.ino)}` === inode && Number(current.mode & 0o7777n) === mode && readFileSync(target).equals(content);
+          } catch { untouched = false; }
+          if (untouched) continue;
+          // Re-created beside the target (a short name, never too long), then
+          // renamed over it in one step: the original bytes are never absent
+          // from the target path, and a link swapped in meanwhile is
+          // replaced, never written through. A failed step removes its copy.
+          const restored = join(dirname(target), `.gru-restore-${randomUUID()}`);
+          try {
+            writeFileSync(restored, content, { flag: 'wx', mode });
+            chmodSync(restored, mode); // exact, whatever the umask
+            renameSync(restored, target);
+          } catch (stepError) {
+            try { rmSync(restored, { force: true }); } catch (cleanupError) {
+              throw new AggregateError([stepError, cleanupError], `restoring ${target} failed and its copy ${restored} could not be removed`);
+            }
+            throw stepError;
+          }
+        } else {
+          rmSync(target, { force: true });
+        }
+      } catch (restoreError) { failures.push(restoreError); }
+    }
+    for (const dir of [...createdDirs].reverse()) {
+      try { rmdirSync(dir); } catch (removeError) { failures.push(removeError); }
+    }
+    if (failures.length > 0) throw new AggregateError([error, ...failures], `overlay write failed and its rollback was incomplete: ${oneLineErrorText(error, 300)}`);
+    throw error;
+  };
+  try {
+    for (const file of input.files) {
+      const target = resolveOverlayTarget(input.workspaceRoot, file.path, (dir) => { createdDirs.add(dir); });
+      // Device and inode as bigints: exact, whatever the filesystem's numbers.
+      const current = lstatSync(target, { throwIfNoEntry: false, bigint: true });
+      const regular = current !== undefined && current.isFile();
+      prior.push({ target, state: current === undefined ? 'absent' : regular ? 'file' : 'other',
+        content: regular ? readFileSync(target) : null, mode: regular ? Number(current.mode & 0o7777n) : null,
+        inode: regular ? `${String(current.dev)}:${String(current.ino)}` : null });
+    }
+    return applyOverlayFiles(input);
+  } catch (error) {
+    return rollback(error);
+  }
 }
