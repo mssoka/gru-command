@@ -8864,13 +8864,19 @@ export class LedgerApi {
     readonly decision: { readonly kind: 'successor'; readonly requestId: string; readonly directive: string } |
       { readonly kind: 'owner-decision'; readonly obligationId: string };
   }): { readonly successor: DirectiveRequestRecord | null; readonly idempotent: boolean } {
-    const fingerprint = createHash('sha256').update(JSON.stringify([input.requestId, input.generation, input.expectedPayloadHash, input.expectedHead, input.expectedEpoch, input.expectedWorkRevision, input.expectedContractSha256, input.reason, input.decision])).digest('hex');
+    const facts = [input.requestId, input.generation, input.expectedPayloadHash, input.expectedHead, input.expectedEpoch, input.expectedWorkRevision, input.expectedContractSha256, input.reason, input.decision];
+    // Canonical, like the rebrief decision's (#363 S02-0-02): the same
+    // decision with its properties in another order is the same decision.
+    const fingerprint = createHash('sha256').update(canonicalRebriefEvidence(facts)).digest('hex');
+    // A decision consumed before that recorded the insertion-order spelling;
+    // its exact replay still matches.
+    const legacyFingerprint = createHash('sha256').update(JSON.stringify(facts)).digest('hex');
     return this.transaction(() => {
       const row = this.getDirective(input.requestId);
       if (row === null) throw new RecordNotFound(`directive request "${input.requestId}" not found`);
       const prior = this.recoveryDecisionHistory('directive', row.requestId).find((decision) => decision.generation === input.generation);
       if (prior !== undefined) {
-        if (prior.fingerprint !== fingerprint) throw new DirectiveCheckpointError('recovery decision conflicts with the consumed decision');
+        if (prior.fingerprint !== fingerprint && prior.fingerprint !== legacyFingerprint) throw new DirectiveCheckpointError('recovery decision conflicts with the consumed decision');
         return { successor: prior.successorId === null ? null : this.getDirective(prior.successorId), idempotent: true };
       }
       const currentDebt = this.recoveryObligation(row.jobId, 'directive', row.requestId);

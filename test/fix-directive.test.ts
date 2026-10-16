@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DirectiveRoutingContractError, rebriefFreshMinion, recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
+import { DirectiveDispatchDeferredError, DirectiveRoutingContractError, rebriefFreshMinion, recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { LedgerApi, type ObligationRecord } from '../src/ledger/api.js';
 import { EventBus } from '../src/events/bus.js';
@@ -540,6 +540,46 @@ describe('eviction-safe fix directives (phase 3)', () => {
     expect((refusal as Error).message).toMatch(/^job "job-no-prepare": a native directive turn needs onPrepared/u);
     expect(calls).toEqual([]);
     expect(prompted).toEqual([]);
+  });
+
+  it('a guard stop after a positively ceased prior cleanup is a deferral; an uncertain cleanup never is (#363 S08-0-01)', async () => {
+    for (const evidence of ['ceased', 'unknown', 'no-evidence', 'disposal-failed'] as const) {
+      const disposed: string[] = [];
+      const prior = {
+        id: 'minion-prior', role: 'minion' as const, sessionFile: '/sessions/prior.jsonl', capabilities: CAPS,
+        health: () => ({ state: 'idle', lastActivity: null, sessionFile: '/sessions/prior.jsonl' }),
+        prompt: async () => {}, steer: async () => {}, followUp: async () => {}, subscribe: () => () => {}, dispose: async () => {},
+        ...(evidence === 'no-evidence' ? {} : { cessationEvidence: () => (evidence === 'disposal-failed' ? 'unknown' : evidence) }),
+      };
+      const spawned: string[] = [];
+      const registry = {
+        getHandle: () => prior,
+        disposeHandle: async (handle: { id: string }) => { disposed.push(handle.id); if (evidence === 'disposal-failed') throw new Error('disposal failed'); },
+        spawn: async (role: string) => { spawned.push(role); throw new Error('no spawn is expected'); },
+      };
+      const ledger = {
+        getAgent: () => null, listAgents: () => [], registerAgent: () => {}, getJob: () => ({ briefing: 'original contract' }),
+        listImplementerMinions: () => [{ id: 'minion-prior', role: 'minion', jobId: 'job-deferral', sessionFile: '/sessions/prior.jsonl' }],
+      };
+      let guards = 0;
+      const outcome: unknown = await routeFixDirectiveToMinion({
+        registry: registry as never, ledger: ledger as never, worktrees: { listWorktrees: () => [] } as unknown as WorktreePort,
+        jobId: 'job-deferral', directive: 'repair', freshSession: true, signal: new AbortController().signal,
+        directiveTurn: { identity: {} as never, beforeAdmission: () => {}, onAdmitted: () => {} }, onPrepared: () => {},
+        // The first guard admits the cleanup; the one after it stops the route.
+        beforeTurnSideEffect: () => { guards += 1; if (guards === 2) throw new Error('authority moved'); },
+      }).then(() => null, (error: unknown) => error);
+      expect(disposed, evidence).toEqual(['minion-prior']);
+      expect(spawned, evidence).toEqual([]);
+      if (evidence === 'ceased') {
+        // The prior session is proven gone: nothing of this request ran, so the stop defers.
+        expect(outcome).toBeInstanceOf(DirectiveDispatchDeferredError);
+      } else {
+        // Unknown, absent or failed cleanup is never a deferral.
+        expect(outcome, evidence).not.toBeInstanceOf(DirectiveDispatchDeferredError);
+        expect(String(outcome), evidence).toMatch(evidence === 'disposal-failed' ? /disposal failed/u : /retains unproven producer ownership/u);
+      }
+    }
   });
 
   it('falls through a typed eviction rejection and resumes the FAILING logical session', async () => {

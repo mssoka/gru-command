@@ -55,7 +55,14 @@ function readBoundedUtf8(path: string, limit: number, label: string): string {
       chunks.push(chunk.subarray(0, count));
     }
     if (fstatSync(fd).size !== total) throw new DirectiveCheckpointError(`${label} changed during bounded inspection`);
-    return Buffer.concat(chunks, total).toString('utf8');
+    // Fatal decoding (#363 S04-1-02): a lenient decode turns invalid bytes
+    // into U+FFFD, so corrupted evidence could hash like a genuine prompt.
+    try {
+      // ignoreBOM keeps a leading U+FEFF, exactly as the lenient decode did.
+      return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(Buffer.concat(chunks, total));
+    } catch {
+      throw new DirectiveCheckpointError(`${label} is not valid UTF-8; corrupted bytes are never evidence`);
+    }
   } finally { closeSync(fd); }
 }
 function assertEntryLimit(text: string, limit: number, label: string): void {
@@ -370,9 +377,14 @@ export function inspectDirectiveProducers(file: string, identity?: DirectiveTurn
   readonly producer: DirectiveProducer; readonly evidence: 'ceased' | 'host-absent' | 'unknown';
 }[] {
   const rows = producerReceipts(file).filter((row) => identity === undefined || isDeepStrictEqual(row.producer.identity, identity));
+  // One pass, not one scan per start (#363 S04-0-03): producerReceipts has
+  // already proven every receipt of an incarnation equals its start, so
+  // the incarnation names the exact physical producer.
+  const ceased = new Set(rows.filter((row) => row.state === 'ceased').map((row) => row.producer.incarnation));
+  const independent = new Set(rows.filter((row) => row.state === 'independent').map((row) => row.producer.incarnation));
   return rows.filter((row) => row.state === 'started').map(({ producer }) => {
-    if (rows.some((row) => row.state === 'ceased' && isDeepStrictEqual(row.producer, producer))) return { producer, evidence: 'ceased' as const };
-    if (rows.some((row) => row.state === 'independent' && isDeepStrictEqual(row.producer, producer))) return { producer, evidence: 'unknown' as const };
+    if (ceased.has(producer.incarnation)) return { producer, evidence: 'ceased' as const };
+    if (independent.has(producer.incarnation)) return { producer, evidence: 'unknown' as const };
     let absent = false;
     if (producer.host === hostname()) {
       try { process.kill(producer.pid, 0); }
