@@ -1471,27 +1471,57 @@ export class LedgerApi {
   }
 
   /** A job's lifetime counters for one event kind: how many such events
-   * exist, and the summed length of a JSON-array payload field across them.
-   * Both are SQL aggregates over the COMPLETE record, so a value can never
-   * age out of a fixed newest-N window — `total > 0` stays true however many
-   * later events of the same kind follow. `field` is a fixed payload key
-   * supplied by the caller (never request data). */
-  countJobEventsAndArrayFieldLength(
+   * exist, and how many DISTINCT entries their JSON-array payload `field`
+   * holds, an entry's identity being the named event payload keys plus the
+   * named entry keys (issue #355: a re-scan of the same transcript re-reports
+   * a read; the distinct count does not grow with it). One statement over
+   * the COMPLETE record — one consistent snapshot, nothing ages out of a
+   * window. A malformed event (no array `field`, or a non-object entry) is
+   * refused by name, never counted as zero. Every key is a fixed
+   * caller-supplied name (never request data). */
+  countJobEventsAndDistinctArrayEntries(
     jobId: string,
     kind: string,
     field: string,
-  ): { readonly events: number; readonly total: number } {
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(field)) {
-      throw new Error(`payload field must be a simple JSON key (got ${JSON.stringify(field)})`);
+    identity: { readonly event: readonly string[]; readonly entry: readonly string[] },
+  ): { readonly events: number; readonly distinct: number } {
+    for (const key of [field, ...identity.event, ...identity.entry]) {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(key)) {
+        throw new Error(`payload key must be a simple JSON key (got ${JSON.stringify(key)})`);
+      }
     }
-    const row = this.db
+    if (identity.event.length + identity.entry.length === 0) {
+      throw new Error('a distinct count needs at least one identity key');
+    }
+    const parts = [
+      ...identity.event.map((key) => `json_extract(e.payload, '$.${key}')`),
+      ...identity.entry.map((key) => `json_extract(p.value, '$.${key}')`),
+    ].join(', ');
+    const scope = `e.job_id = ? AND e.kind = ? AND json_type(e.payload, '$.${field}') = 'array'`;
+    let row: { events: number; malformedEvents: number; malformedEntries: number; distinctEntries: number };
+    try {
+      row = this.db
       .prepare(
-        `SELECT COUNT(*) AS events,
-                COALESCE(SUM(COALESCE(json_array_length(json_extract(payload, '$.${field}')), 0)), 0) AS total
-           FROM events WHERE job_id = ? AND kind = ?`,
+        `SELECT
+           (SELECT COUNT(*) FROM events WHERE job_id = ? AND kind = ?) AS events,
+           (SELECT COUNT(*) FROM events WHERE job_id = ? AND kind = ? AND json_type(payload, '$.${field}') IS NOT 'array') AS malformedEvents,
+           (SELECT COUNT(*) FROM events e, json_each(e.payload, '$.${field}') p WHERE ${scope} AND p.type <> 'object') AS malformedEntries,
+           (SELECT COUNT(DISTINCT json_array(${parts})) FROM events e, json_each(e.payload, '$.${field}') p WHERE ${scope} AND p.type = 'object') AS distinctEntries`,
       )
-      .get(jobId, kind) as { events: number; total: number };
-    return { events: Number(row.events), total: Number(row.total) };
+      .get(jobId, kind, jobId, kind, jobId, kind, jobId, kind) as { events: number; malformedEvents: number; malformedEntries: number; distinctEntries: number };
+    } catch (error) {
+      // Only a corrupt payload is named as one (SQLite's malformed-JSON
+      // error); any other failure — busy, closed, or a bad path, which is a
+      // query bug — stays what it is.
+      if (!/malformed JSON/iu.test(String(error))) throw error;
+      throw new Error(`job "${jobId}" has a ${kind} event whose payload cannot be read as JSON (${String(error)}) — refusing to count; inspect the ledger`, { cause: error });
+    }
+    if (row.malformedEvents > 0 || row.malformedEntries > 0) {
+      throw new Error(
+        `job "${jobId}" has ${String(row.malformedEvents)} ${kind} event(s) without a "${field}" array and ${String(row.malformedEntries)} non-object "${field}" entr(ies) — refusing to count them; inspect the ledger`,
+      );
+    }
+    return { events: Number(row.events), distinct: Number(row.distinctEntries) };
   }
 
   /** A marked request's guarded event, however many newer unrelated job

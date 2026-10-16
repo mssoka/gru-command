@@ -10,6 +10,7 @@ import {
   evaluateBlindBriefing,
   evaluateBlindPackage,
   gitBlobSha,
+  grepPathCandidates,
   parseBlindInputPackage,
   reviewRoleFor,
   scanObservedAccess,
@@ -89,6 +90,10 @@ describe('path and content classification', () => {
     // Traversal is never a valid package path.
     expect(classifyBlindPath('../outside/secret.md', rule)).toMatch(/invalid package path/u);
     expect(classifyBlindPath('/abs/path.ts', rule)).toMatch(/invalid package path/u);
+    // So is a Windows drive or UNC share, in either slash direction.
+    for (const path of ['C:\\Users\\x\\f.md', 'C:/x', '\\\\host\\share\\f.md', 'docs\\..\\..\\x']) {
+      expect(classifyBlindPath(path, rule), path).toMatch(/invalid package path/u);
+    }
   });
 
   it('detects history-bearing text by content, so a renamed spec is still caught', () => {
@@ -274,6 +279,116 @@ describe('observed reviewer access', () => {
     expect(prohibited[0]?.excerptSha256).toMatch(/^[0-9a-f]{64}$/u);
     // Private text never rides the record.
     expect(JSON.stringify(prohibited)).not.toContain('Prior replacement');
+  });
+});
+
+describe('observed reviewer access — grep paths with spaces (#357)', () => {
+  it('flags an excluded grep path containing spaces, keeps ordinary paths, and leaves permitted paths alone', () => {
+    const prohibited = scanObservedAccess(
+      [
+        { index: 1, toolName: 'bash', text: 'docs/issues/prior review.md:1:plain text' },
+        { index: 2, toolName: 'bash', text: './docs/issues/prior review.md:4-context line' },
+        { index: 3, toolName: 'bash', text: 'docs/issues/305-review.md:1:plain text' },
+        { index: 4, toolName: 'bash', text: 'src/my feature.ts:10:const x = 1;' },
+        { index: 5, toolName: 'bash', text: '    at docs/issues/prior review.md:1:2' },
+        { index: 6, toolName: 'bash', text: 'src/feature.ts:2:const y = 2;' },
+      ],
+      DEFAULT_BLIND_ISOLATION_RULE,
+    );
+    expect(prohibited.map((p) => `${p.index}:${p.code}:${p.path ?? ''}`)).toEqual([
+      '1:excluded-path-read:docs/issues/prior review.md',
+      '2:excluded-path-read:./docs/issues/prior review.md',
+      '3:excluded-path-read:docs/issues/305-review.md',
+    ]);
+    // Private text never rides the record: digest only.
+    expect(JSON.stringify(prohibited)).not.toContain('plain text');
+  });
+
+  it('judges a spaced capture by the isolation globs only: prose and clock times are no grep hit, a prose-prefixed excluded path still is', () => {
+    const prohibited = scanObservedAccess(
+      [
+        { index: 1, toolName: 'bash', text: '/var/log/app.log started at 10:30:15 ok' },
+        { index: 2, toolName: 'bash', text: '../x y.log at 10:30:15' },
+        { index: 3, toolName: 'bash', text: 'Started at 10:30:15' },
+        { index: 4, toolName: 'bash', text: 'time 12:30:45 elapsed' },
+        { index: 5, toolName: 'bash', text: 'Matches in docs/issues/prior review.md:1:x' },
+        // A space-free capture keeps its shape rule: an absolute grep hit is outside the package.
+        { index: 6, toolName: 'bash', text: '/etc/hosts:1:127.0.0.1 localhost' },
+      ],
+      DEFAULT_BLIND_ISOLATION_RULE,
+    );
+    expect(prohibited.map((p) => `${p.index}:${p.path ?? ''}`)).toEqual([
+      '5:docs/issues/prior review.md',
+      '6:/etc/hosts',
+    ]);
+  });
+
+  it('a file-like spaced path outside the package still classifies — by shape, or by the directory it names', () => {
+    const prohibited = scanObservedAccess(
+      [
+        { index: 1, toolName: 'bash', text: '/srv/John Smith/repo/docs/issues/a.md:3:text' },
+        { index: 2, toolName: 'bash', text: '../other repo/docs/issues/a.md:1:x' },
+        { index: 3, toolName: 'bash', text: '/srv/John Smith/notes.md:1:x' },
+        // A relative spaced path names its excluded directory through a path-component suffix.
+        { index: 4, toolName: 'bash', text: 'vendor copy/docs/issues/b.md:2:y' },
+        // Extensionless and dot files are file-like too.
+        { index: 5, toolName: 'bash', text: '/srv/a b/Makefile:2:all:' },
+        { index: 6, toolName: 'bash', text: '/srv/John Smith/.env:1:TOKEN=x' },
+        // Whitespace before the line number is not part of the path.
+        { index: 7, toolName: 'bash', text: 'docs/issues/a.md :1:x' },
+      ],
+      DEFAULT_BLIND_ISOLATION_RULE,
+    );
+    expect(prohibited.map((p) => `${p.index}:${p.path ?? ''}`)).toEqual([
+      '1:/srv/John Smith/repo/docs/issues/a.md',
+      '2:../other repo/docs/issues/a.md',
+      '3:/srv/John Smith/notes.md',
+      '4:docs/issues/b.md',
+      '5:/srv/a b/Makefile',
+      '6:/srv/John Smith/.env',
+      '7:docs/issues/a.md',
+    ]);
+    // A Windows-style spaced hit is judged as the same path — a drive and a
+    // UNC share are outside by shape too.
+    expect(scanObservedAccess([
+      { index: 8, toolName: 'bash', text: '..\\other repo\\docs\\issues\\a.md:1:x' },
+      { index: 10, toolName: 'bash', text: 'C:\\Data\\a b\\notes.md:1:x' },
+      { index: 11, toolName: 'bash', text: '\\\\host\\my share\\f.md:1:x' },
+    ], DEFAULT_BLIND_ISOLATION_RULE).map((p) => p.path)).toEqual(['../other repo/docs/issues/a.md', 'C:/Data/a b/notes.md', '//host/my share/f.md']);
+    // A lone `/word` or a `//host` URL in prose is no outside path.
+    for (const text of ['ratio 3 /4:12:', 'run /help:5:', 'see //host/x y:1:', 'the dir /tmp/:1:', 'see //a b/c/d.md:1:', 'at C:/x then:1:']) {
+      expect(scanObservedAccess([{ index: 9, toolName: 'bash', text }], DEFAULT_BLIND_ISOLATION_RULE), text).toEqual([]);
+    }
+  });
+
+  it('bounds the candidates a padded spaced line produces, and padding never hides the path at its end', () => {
+    // The path is a suffix: the LAST starts are kept, so no amount of padding
+    // before it pushes it out of judgement.
+    const padded = scanObservedAccess([{ index: 1, toolName: 'bash', text: `${'word '.repeat(20_000)}docs/issues/late.md:1:x` }], DEFAULT_BLIND_ISOLATION_RULE);
+    expect(padded.map((p) => p.path)).toEqual(['docs/issues/late.md']);
+    // ...however deep the path below its excluded directory.
+    const deep = `docs/issues/${'c/'.repeat(70)}x.md`;
+    expect(scanObservedAccess([{ index: 3, toolName: 'bash', text: `${'word '.repeat(20_000)}${deep}:1:x` }], DEFAULT_BLIND_ISOLATION_RULE).map((p) => p.path)).toEqual([deep]);
+    // The work is bounded: candidates start within the last PATH_MAX (4096) characters.
+    const candidates = grepPathCandidates(`${'word '.repeat(20_000)}${deep}:1:x`);
+    expect(candidates.every((candidate) => candidate.path.length <= 4096)).toBe(true);
+    expect(candidates.length).toBeLessThanOrEqual(2048);
+    expect(candidates.map((candidate) => candidate.path)).toContain(deep);
+    // The window is exactly PATH_MAX: a 4096-character path is judged whole,
+    // a 4097-character one only by its suffixes.
+    const pathOf = (length: number): string => `docs/issues/${'d'.repeat(length - 'docs/issues/'.length - '.md'.length)}.md`;
+    for (const [length, whole] of [[4096, true], [4097, false]] as const) {
+      const paths = grepPathCandidates(`${'word '.repeat(2000)}${pathOf(length)}:1:x`).map((candidate) => candidate.path);
+      expect(paths.includes(pathOf(length)), String(length)).toBe(whole);
+    }
+    // The densest line still yields at most one candidate per two characters of the window.
+    expect(grepPathCandidates(`${'a '.repeat(5000)}x.md:1:x`).length).toBeLessThanOrEqual(2049);
+    expect(grepPathCandidates(`a b${'/a'.repeat(5000)}:1:x`).length).toBeLessThanOrEqual(2049);
+    // The second slash of `//` starts nothing: no `/host/…` candidate.
+    expect(grepPathCandidates('foo //host/share/f.md:1:x').map((candidate) => candidate.path))
+      .toEqual(['foo //host/share/f.md', '//host/share/f.md', 'host/share/f.md', 'share/f.md', 'f.md']);
+    // Prose padding with no excluded suffix stays no hit.
+    expect(scanObservedAccess([{ index: 2, toolName: 'bash', text: `${'word '.repeat(20_000)}done at 10:30:15` }], DEFAULT_BLIND_ISOLATION_RULE)).toEqual([]);
   });
 });
 
