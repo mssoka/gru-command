@@ -226,6 +226,13 @@ latest revision → verify → fresh review. The service enforces it centrally.
   When no unresolved same-head repair remains, the full Silas digest still offers
   `verificationsOwed`. Dismissal never rewrites FAILED receipts or grants review:
   the unchanged corrective-verification gate remains until eligible proof exists.
+- **A historical-only delivery owes a current inspection (owner decision 2026-10-16, #361).**
+  When a job's newest delivery is history (a completion recorded without proving a current
+  candidate) while a corrective verification or a contract revision is still owed, no
+  verification, continuation or review row can name its candidate. The Silas digest offers a
+  `currentInspections` row instead: Silas inspects the lane head and asks the minion, with one
+  `current-inspection` directive, for a proven current delivery. The row never restores
+  review eligibility; the lane stays busy until that delivery owes and pays its own gates.
 - **Supersession.** Accepting a material amendment supersedes any review that owns the lane.
   A queued round is withdrawn, or a running round and its specialists are cancelled.
   `round.superseded` is recorded first, with the settled specialist checkpoints. Partial

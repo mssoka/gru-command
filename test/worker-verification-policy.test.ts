@@ -560,6 +560,10 @@ describe('worker verification policy', () => {
       const command = reason.split('reconcile that existing request identity: ')[1]!.split('. A timeout')[0]!
         .replace('<existing-id>', 'existing').replace('<ops-url>', status.url);
       expect(f.policy.configFile).toContain('$literal-`literal`');
+      // Setup, never behavior (#358): a missing compiled helper fails as a
+      // named setup error the reviewed-RED classifier refuses — it can never
+      // masquerade as the advertised action's own rejection below.
+      if (!existsSync(f.policy.helper)) throw new Error(`fixture setup: compiled capture helper is missing at ${f.policy.helper}`);
       const execution = promisify(exec)(command, { cwd: f.policy.cwd });
       await expect(execution).resolves.toMatchObject({ stdout: expect.stringContaining('existing') });
       expect(status.requests).toEqual(['GET /api/verify/status?request_id=existing']);

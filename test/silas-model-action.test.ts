@@ -47,7 +47,7 @@ const emptyDigest = (): SilasOpsDigest => ({
   conflictingPrs: [],
   releaseEligible: [],
   revisionContinuations: [],
-  verificationsOwed: [],
+  verificationsOwed: [], currentInspections: [],
 });
 
 function makeLedger(): { ledger: LedgerApi; eventKinds: () => { kind: string; payload: unknown }[] } {
