@@ -480,9 +480,17 @@ describe('board server — HTTP API', () => {
     const undecidedId = (undecided.body as { id: string }).id;
     const refusedResolve = await postJson(port, `/api/notifications/${undecidedId}/disposition`, 'board-test-token', { detail: 'premature' });
     expect(refusedResolve).toMatchObject({ status: 409, body: { error: 'decision_refused', code: 'undecided' } });
-    const resolved = await postJson(port, `/api/notifications/${row.id}/disposition`, 'board-test-token', { detail: 'Executed the approved prep' });
+    const resolved = await postJson(port, `/api/notifications/${row.id}/disposition`, 'board-test-token', { detail: 'Executed the approved prep', actor: 'gru' });
     expect(resolved).toMatchObject({ status: 200, body: { resolvedBy: 'gru', decidedOption: 'approve', ackedAt: null } });
     expect(api.getNotification(row.id)).toMatchObject({ resolvedBy: 'gru' });
+    // #396: owner follow-through records the same bearer provenance as a
+    // machine disposition (#99) — the role, the credential class and the
+    // caller-declared actor, never a claimed identity.
+    const followThrough = api.listEventsAfter(0, { kinds: ['notification.resolved'] })
+      .filter((event) => (event.payload as { id?: string }).id === row.id);
+    expect(followThrough).toMatchObject([
+      { payload: { by: 'gru', owner_decision: 'approve', credential: 'shared-bearer', declaredActor: 'gru' } },
+    ]);
   });
 
   it('needs-owner escalation retries with the same idempotency key yield one row; distinct escalations stay distinct (#100)', async () => {
@@ -529,6 +537,83 @@ describe('board server — HTTP API', () => {
       expect((await postJson(port, path, 'board-test-token', { title: 't', detail: 'd', decision, idempotencyKey: key })).status).toBe(400);
     }
     expect(count()).toBe(start + 4);
+  });
+
+  it('an identical replay onto a pre-upgrade bare owner row upgrades it in place; a closed legacy row is a typed conflict (#395)', async () => {
+    const { api, port } = harness;
+    const path = '/api/notifications/needs-owner';
+    const decision = {
+      question: 'Approve the external merge?',
+      context: 'The merge needs an owner-controlled integration route.',
+      recommendation: 'Approve it.',
+      reservedClass: 'merge',
+      whyNotDelegable: 'All merges remain owner-performed.',
+      options: [{ id: 'approve', label: 'Approve', consequence: 'Gru prepares the merge.' }],
+      discussion: false,
+    };
+    // A row written before typed decisions were required: decision null.
+    const legacy = (key: string) => api.recordNotification({
+      id: `owner-escalation:${key}`, kind: 'gru.owner-escalation', routing: 'needs-owner', severity: 'error',
+      title: 'Legacy call', detail: 'Approve merge',
+    });
+    const count = () => api.listNotifications({ limit: 500 }).filter((n) => n.kind === 'gru.owner-escalation').length;
+    expect(legacy('legacy-open').decision).toBeNull();
+    const start = count();
+    const body = { title: 'Legacy call', detail: 'Approve merge', idempotencyKey: 'legacy-open', decision };
+    const adopted = await postJson(port, path, 'board-test-token', body);
+    expect(adopted).toMatchObject({ status: 200, body: { id: 'owner-escalation:legacy-open', decision: { question: 'Approve the external merge?' } } });
+    expect(api.getNotification('owner-escalation:legacy-open')?.decision?.options.map((option) => option.id)).toEqual(['approve']);
+    expect(count()).toBe(start); // the ONE existing item, never a second
+    expect(api.listEventsAfter(0, { kinds: ['notification.decision-adopted'] })).toMatchObject([
+      { payload: { id: 'owner-escalation:legacy-open', credential: 'shared-bearer', declaredActor: null, option_ids: ['approve'] } },
+    ]);
+    // The adopted row now replays like any typed escalation.
+    expect((await postJson(port, path, 'board-test-token', body)).status).toBe(200);
+    expect((await postJson(port, path, 'board-test-token', { ...body, decision: { ...decision, recommendation: 'Do not.' } })).status).toBe(409);
+    expect(api.listEventsAfter(0, { kinds: ['notification.decision-adopted'] })).toHaveLength(1);
+    // Changed text onto a legacy row is still a different escalation.
+    legacy('legacy-changed');
+    expect((await postJson(port, path, 'board-test-token', { ...body, idempotencyKey: 'legacy-changed', detail: 'Other' })).status).toBe(409);
+    expect(api.getNotification('owner-escalation:legacy-changed')?.decision).toBeNull();
+    // A legacy row the owner already closed cannot have a decision attached.
+    legacy('legacy-acked');
+    api.ackNotification('owner-escalation:legacy-acked', 'web');
+    expect(await postJson(port, path, 'board-test-token', { ...body, idempotencyKey: 'legacy-acked' })).toMatchObject({
+      status: 409,
+      body: { error: 'idempotency_conflict', code: 'legacy_closed' },
+    });
+    expect(api.getNotification('owner-escalation:legacy-acked')?.decision).toBeNull();
+    // A STORED decision that merely fails to parse is never legacy: it is
+    // refused, and its bytes are kept.
+    legacy('legacy-corrupt');
+    const db = (api as unknown as { db: { prepare(sql: string): { run(...args: unknown[]): unknown; get(...args: unknown[]): unknown } } }).db;
+    db.prepare('UPDATE notifications SET decision_json = ? WHERE id = ?').run('{corrupt', 'owner-escalation:legacy-corrupt');
+    expect(await postJson(port, path, 'board-test-token', { ...body, idempotencyKey: 'legacy-corrupt' })).toMatchObject({
+      status: 409,
+      body: { error: 'idempotency_conflict', code: 'decision_present' },
+    });
+    expect(db.prepare('SELECT decision_json FROM notifications WHERE id = ?').get('owner-escalation:legacy-corrupt')).toEqual({ decision_json: '{corrupt' });
+    // A legacy row with a recorded choice is never re-decided by adoption.
+    legacy('legacy-decided');
+    db.prepare('UPDATE notifications SET decided_option = ? WHERE id = ?').run('approve', 'owner-escalation:legacy-decided');
+    expect(await postJson(port, path, 'board-test-token', { ...body, idempotencyKey: 'legacy-decided' })).toMatchObject({
+      status: 409, body: { code: 'decision_present' },
+    });
+    expect(api.getNotification('owner-escalation:legacy-decided')?.decision).toBeNull();
+    // A RESOLVED (not just acked) legacy row is closed too.
+    legacy('legacy-resolved');
+    api.resolveNotificationById('owner-escalation:legacy-resolved', 'fixture: closed before the upgrade');
+    expect(await postJson(port, path, 'board-test-token', { ...body, idempotencyKey: 'legacy-resolved' })).toMatchObject({
+      status: 409, body: { code: 'legacy_closed' },
+    });
+    // A row that vanished before adoption is a 404, never a 200 with no body.
+    legacy('legacy-vanished');
+    const adopt = vi.spyOn(NotificationCenter.prototype, 'adoptLegacyDecision').mockReturnValueOnce(null);
+    try {
+      expect(await postJson(port, path, 'board-test-token', { ...body, idempotencyKey: 'legacy-vanished' })).toMatchObject({ status: 404, body: { error: 'not_found' } });
+    } finally {
+      adopt.mockRestore();
+    }
   });
 
   it('decision status and recheck are authenticated and return the durable disabled state', async () => {
@@ -1627,7 +1712,7 @@ describe('board server — decision memory (issue #218)', () => {
 });
 describe('board server — guarded machine re-arm and the discussion bridge (R1 fixes)', () => {
   it('a refused re-arm is a typed 409 that consumes nothing; the same control retries once the fence clears', async () => {
-    let refusal: { ok: boolean; reason?: string } | null = {
+    let refusal: { ok: boolean; reason?: string; rearmed?: boolean; superseded?: boolean } | null = {
       ok: false,
       reason: 'job "parked-lane" is parked (owner/ops hold)',
     };
@@ -1674,8 +1759,144 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
       });
       expect(repeat).toMatchObject({ status: 200, body: { rearm: 'not_applicable' } });
       expect(hookCalls).toEqual(['machine-rearm', 'machine-rearm']);
+      // #385: a stop closed as superseded (its captured turn will never
+      // replay) records the disposition WITHOUT a restart, and says so.
+      api.recordNotification({
+        id: 'machine-superseded', kind: 'supervision.breaker', routing: 'action-required', severity: 'error',
+        title: 'Lane stopped: restart ladder tripped', detail: 'breaker open',
+      });
+      refusal = { ok: true, rearmed: false, superseded: true };
+      const superseded = await postJson(port, '/api/notifications/machine-superseded/disposition', 'board-test-token', {
+        detail: 'parked then resumed; re-briefing the lane',
+      });
+      expect(superseded).toMatchObject({ status: 200, body: { rearm: 'superseded' } });
+      expect(api.getNotification('machine-superseded')?.resolvedBy).toBe('gru');
     } finally {
       await close();
+    }
+  });
+
+  it('refuses a disposition the ledger would refuse BEFORE the supervisor acts on it, with a typed 409 (#385)', async () => {
+    let consulted = 0;
+    let changeDuringConsult: (() => void) | null = null;
+    let consultOutcome: { readonly ok: boolean; readonly rearmed?: boolean; readonly superseded?: boolean } = { ok: true };
+    const harness = await boot('board-test-token', { onNotificationDisposition: () => { consulted += 1; changeDuringConsult?.(); return consultOutcome; } });
+    try {
+      // An informational row takes no machine disposition: refused before
+      // the supervisor is consulted, so no stop can close beside it.
+      const fyi = harness.notifications.post({ kind: 'job.note', routing: 'fyi', severity: 'info', title: 'for your information' });
+      expect(harness.api.machineDispositionRefusal(fyi.id)).toMatch(/only action-required notifications accept a machine disposition/u);
+      const response = await postJson(harness.port, `/api/notifications/${encodeURIComponent(fyi.id)}/disposition`, 'board-test-token', { detail: 'tried anyway' });
+      expect(response).toMatchObject({ status: 409, body: { error: 'disposition_refused', code: 'disposition_refused', rearm: 'not_applicable', detail: expect.stringMatching(/only action-required notifications[^—]*$/u) } });
+      expect(consulted).toBe(0);
+      expect(harness.api.getNotification(fyi.id)).toMatchObject({ resolvedAt: null });
+      // An informational row already resolved is refused the same typed way.
+      harness.api.resolveNotificationById(fyi.id, 'producer');
+      expect(harness.api.getNotification(fyi.id)?.resolvedAt).not.toBeNull();
+      expect(await postJson(harness.port, `/api/notifications/${encodeURIComponent(fyi.id)}/disposition`, 'board-test-token', { detail: 'again' }))
+        .toMatchObject({ status: 409, body: { error: 'disposition_refused', code: 'disposition_refused', rearm: 'not_applicable' } });
+      expect(consulted).toBe(0);
+      // A row that changes between the check and its disposal is refused by
+      // the disposal's own re-check, the same typed way.
+      const breaker = harness.notifications.post({ kind: 'supervision.breaker', routing: 'action-required', severity: 'error', title: 'Lane stopped' });
+      consulted = 0;
+      changeDuringConsult = () => { harness.api.updateNotificationTriage(breaker.id, 'fyi', null); };
+      const actedEvents = () => harness.api.listEvents({ limit: 5000 }).filter((event) => event.kind === 'notification.disposition-refused-after-rearm').map((event) => event.payload);
+      // The supervisor had already acted: the refusal says so and records it —
+      // for a re-arm and a superseded close alike; a pure record says nothing.
+      for (const [outcome, rearm] of [[{ ok: true }, 'accepted'], [{ ok: true, rearmed: false, superseded: true }, 'superseded'], [{ ok: true, rearmed: false }, 'not_applicable']] as const) {
+        harness.api.updateNotificationTriage(breaker.id, 'action-required', null);
+        consulted = 0; consultOutcome = outcome;
+        const before = actedEvents().length;
+        const raced = await postJson(harness.port, `/api/notifications/${encodeURIComponent(breaker.id)}/disposition`, 'board-test-token', { detail: `raced ${rearm}` });
+        expect(raced, rearm).toMatchObject({ status: 409, body: { error: 'disposition_refused', code: 'disposition_refused', rearm } });
+        const detail = (raced.body as { detail: string }).detail;
+        if (rearm === 'not_applicable') {
+          expect(detail, rearm).not.toMatch(/supervisor had already acted/u);
+          expect(actedEvents(), rearm).toHaveLength(before);
+        } else {
+          expect(detail, rearm).toMatch(new RegExp(`^only action-required notifications .* — the supervisor had already acted on it \\(rearm: ${rearm}\\); the alert stays open: retriage or resolve it$`, 'u'));
+          const after = actedEvents();
+          expect(after, rearm).toHaveLength(before + 1);
+          expect(after, rearm).toContainEqual({ id: breaker.id, rearm, outcome: 'refused', reason: expect.stringMatching(/only action-required notifications/u) });
+        }
+        expect(consulted, rearm).toBe(1);
+        expect(harness.api.getNotification(breaker.id), rearm).toMatchObject({ resolvedAt: null });
+      }
+      // An event that cannot be written is said, never a 500 in place of the refusal.
+      harness.api.updateNotificationTriage(breaker.id, 'action-required', null);
+      consultOutcome = { ok: true };
+      const append = harness.api.appendCustomEvent.bind(harness.api);
+      const failingEvent = vi.spyOn(harness.api, 'appendCustomEvent').mockImplementation((input) => {
+        if (input.kind === 'notification.disposition-refused-after-rearm') throw new Error('ledger full');
+        return append(input);
+      });
+      try {
+        expect(await postJson(harness.port, `/api/notifications/${encodeURIComponent(breaker.id)}/disposition`, 'board-test-token', { detail: 'raced, unrecorded' }))
+          .toMatchObject({ status: 409, body: { rearm: 'accepted', detail: expect.stringMatching(/\(rearm: accepted\) \(and that could not be recorded in the ledger\); the alert stays open/u) } });
+        expect(failingEvent.mock.calls.some(([input]) => input.kind === 'notification.disposition-refused-after-rearm')).toBe(true);
+      } finally { failingEvent.mockRestore(); }
+      // A row removed while the supervisor acted answers 404 — and says the supervisor acted.
+      const removed = harness.notifications.post({ kind: 'supervision.breaker', routing: 'action-required', severity: 'error', title: 'Lane stopped again' });
+      changeDuringConsult = () => { (harness.api as unknown as { db: { prepare(sql: string): { run(...args: unknown[]): unknown } } }).db.prepare('DELETE FROM notifications WHERE id = ?').run(removed.id); };
+      expect(await postJson(harness.port, `/api/notifications/${encodeURIComponent(removed.id)}/disposition`, 'board-test-token', { detail: 'raced away' }))
+        .toMatchObject({ status: 404, body: { error: 'not_found', rearm: 'accepted', detail: expect.stringMatching(/not found — the supervisor had already acted on it \(rearm: accepted\)/u) } });
+      expect(actedEvents()).toContainEqual({ id: removed.id, rearm: 'accepted', outcome: 'removed', reason: `notification "${removed.id}" not found` });
+      changeDuringConsult = null;
+      // A disposal failing any other way after the supervisor acted is a typed
+      // 500 that says so, and is recorded.
+      const failing = harness.notifications.post({ kind: 'supervision.breaker', routing: 'action-required', severity: 'error', title: 'Lane stopped once more' });
+      consultOutcome = { ok: true };
+      const disposal = vi.spyOn(harness.api, 'disposeMachineNotification').mockImplementation(() => { throw new Error('ledger locked'); });
+      try {
+        expect(await postJson(harness.port, `/api/notifications/${encodeURIComponent(failing.id)}/disposition`, 'board-test-token', { detail: 'disposal fails' }))
+          .toMatchObject({ status: 500, body: { error: 'disposition_failed', code: 'disposition_failed', rearm: 'accepted', detail: expect.stringMatching(/^Error: ledger locked — the supervisor had already acted on it \(rearm: accepted\); the alert stays open/u) } });
+      } finally { disposal.mockRestore(); }
+      expect(actedEvents()).toContainEqual({ id: failing.id, rearm: 'accepted', outcome: 'failed', reason: 'Error: ledger locked' });
+      // Its recorded reason is cut on code points — never half an emoji.
+      const long = vi.spyOn(harness.api, 'disposeMachineNotification').mockImplementation(() => { throw new Error(`${'x'.repeat(492)}\u{1F600}tail`); });
+      try {
+        expect(await postJson(harness.port, `/api/notifications/${encodeURIComponent(failing.id)}/disposition`, 'board-test-token', { detail: 'long failure' }))
+          .toMatchObject({ status: 500, body: { error: 'disposition_failed' } });
+      } finally { long.mockRestore(); }
+      expect(actedEvents()).toContainEqual({ id: failing.id, rearm: 'accepted', outcome: 'failed', reason: `Error: ${'x'.repeat(492)}\u{1F600}` });
+      // An error with no text is named, and an event that cannot be written is said on the 500 too.
+      const silentDisposal = vi.spyOn(harness.api, 'disposeMachineNotification').mockImplementation(() => { throw Object.assign(new Error(''), { toString: () => '' }); });
+      const appendFailing = harness.api.appendCustomEvent.bind(harness.api);
+      const unrecorded = vi.spyOn(harness.api, 'appendCustomEvent').mockImplementation((input) => {
+        if (input.kind === 'notification.disposition-refused-after-rearm') throw new Error('ledger full');
+        return appendFailing(input);
+      });
+      try {
+        expect(await postJson(harness.port, `/api/notifications/${encodeURIComponent(failing.id)}/disposition`, 'board-test-token', { detail: 'silent failure' }))
+          .toMatchObject({ status: 500, body: { error: 'disposition_failed', rearm: 'accepted', detail: 'an error with no text — the supervisor had already acted on it (rearm: accepted) (and that could not be recorded in the ledger); the alert stays open: retriage or resolve it' } });
+      } finally { unrecorded.mockRestore(); silentDisposal.mockRestore(); }
+      // Text that is only blanks is no text, on the 500 and in its record.
+      const blank = vi.spyOn(harness.api, 'disposeMachineNotification').mockImplementation(() => { throw Object.assign(new Error(''), { toString: () => ' \t ' }); });
+      try {
+        expect(await postJson(harness.port, `/api/notifications/${encodeURIComponent(failing.id)}/disposition`, 'board-test-token', { detail: 'blank failure' }))
+          .toMatchObject({ status: 500, body: { error: 'disposition_failed', detail: expect.stringMatching(/^an error with no text — the supervisor had already acted on it/u) } });
+      } finally { blank.mockRestore(); }
+      expect(actedEvents()).toContainEqual({ id: failing.id, rearm: 'accepted', outcome: 'failed', reason: 'an error with no text' });
+      // One that cannot print is still a typed 500 that names it so.
+      const unprintable = vi.spyOn(harness.api, 'disposeMachineNotification').mockImplementation(() => { throw Object.assign(new Error(''), { toString: () => { throw new Error('no'); } }); });
+      try {
+        expect(await postJson(harness.port, `/api/notifications/${encodeURIComponent(failing.id)}/disposition`, 'board-test-token', { detail: 'unprintable failure' }))
+          .toMatchObject({ status: 500, body: { error: 'disposition_failed', rearm: 'accepted', detail: expect.stringMatching(/^an error that cannot be printed — the supervisor had already acted on it/u) } });
+      } finally { unprintable.mockRestore(); }
+      // A resolved action-required row stays an idempotent retry.
+      const note = harness.notifications.post({ kind: 'job.note', routing: 'action-required', severity: 'info', title: 'handled' });
+      for (const attempt of ['first', 'retry']) {
+        expect(await postJson(harness.port, `/api/notifications/${encodeURIComponent(note.id)}/disposition`, 'board-test-token', { detail: attempt }), attempt)
+          .toMatchObject({ status: 200, body: { id: note.id, resolvedBy: 'gru' } });
+      }
+      // The ledger helper applies the self-closing rule too (the route answers
+      // that case earlier, as producer_resolved).
+      const dream = harness.notifications.post({ kind: 'lessons.dream-failed', routing: 'action-required', severity: 'error', title: 'dream failed' });
+      expect(harness.api.machineDispositionRefusal(dream.id)).toMatch(/closes itself on a completed dream pass/u);
+      expect(harness.api.machineDispositionRefusal('no-such-alert')).toBeNull();
+    } finally {
+      await harness.close();
     }
   });
 
@@ -1931,11 +2152,51 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
         detail: 'breaker open',
       });
       const res = await postJson(port, '/api/notifications/machine-fail/disposition', 'board-test-token', { detail: 'try' });
-      expect(res).toMatchObject({ status: 502, body: { error: 'rearm_failed' } });
+      // An Error is named by its message, with no name prefix — in the answer and its record.
+      expect(res).toMatchObject({ status: 502, body: { error: 'rearm_failed', detail: 'supervisor unavailable' } });
       expect(api.getNotification('machine-fail')?.resolvedAt).toBeNull();
-      expect(api.listEvents({ limit: 100 }).filter((event) => event.kind === 'notification.rearm-failed')).toHaveLength(1);
+      expect(api.listEvents({ limit: 100 }).filter((event) => event.kind === 'notification.rearm-failed').map((event) => event.payload))
+        .toEqual([{ id: 'machine-fail', error: 'supervisor unavailable' }]);
     } finally {
       await close();
+    }
+    // A re-arm failure with no text, or one that cannot print, is still a typed 502 that names it so.
+    for (const [thrown, named] of [
+      [Object.assign(new Error(''), { toString: () => '' }), 'an error with no text'],
+      [{ toString: () => { throw new Error('no'); } }, 'an error that cannot be printed'],
+      // An Error whose message itself cannot be read is named the same way.
+      [Object.defineProperty(new Error('x'), 'message', { get: () => { throw new Error('no'); } }), 'an error that cannot be printed'],
+      // A message that is no string is still printed, and a long one is cut on code points.
+      [Object.assign(new Error('x'), { message: 5 }), '5'],
+      [new Error(`${'y'.repeat(499)}\u{1F600}tail`), `${'y'.repeat(499)}\u{1F600}`],
+    ] as const) {
+      const failing = await boot('board-test-token', { onNotificationDisposition: () => { throw thrown; } });
+      try {
+        failing.api.recordNotification({ id: 'machine-silent', kind: 'supervision.breaker', routing: 'action-required', severity: 'error', title: 'Lane stopped', detail: 'breaker open' });
+        expect(await postJson(failing.port, '/api/notifications/machine-silent/disposition', 'board-test-token', { detail: 'try' }), named)
+          .toMatchObject({ status: 502, body: { error: 'rearm_failed', detail: named } });
+        // The ledger records the same text the answer gives.
+        expect(failing.api.listEvents({ limit: 100 }).filter((event) => event.kind === 'notification.rearm-failed').map((event) => event.payload), named)
+          .toEqual([{ id: 'machine-silent', error: named }]);
+      } finally {
+        await failing.close();
+      }
+    }
+    // A record that cannot be written is said, never a lost answer.
+    const unrecorded = await boot('board-test-token', { onNotificationDisposition: () => { throw new Error('supervisor unavailable'); } });
+    try {
+      unrecorded.api.recordNotification({ id: 'machine-unrecorded', kind: 'supervision.breaker', routing: 'action-required', severity: 'error', title: 'Lane stopped', detail: 'breaker open' });
+      const append = unrecorded.api.appendCustomEvent.bind(unrecorded.api);
+      const failingAppend = vi.spyOn(unrecorded.api, 'appendCustomEvent').mockImplementation((input) => {
+        if (input.kind === 'notification.rearm-failed') throw new Error('ledger full');
+        return append(input);
+      });
+      try {
+        expect(await postJson(unrecorded.port, '/api/notifications/machine-unrecorded/disposition', 'board-test-token', { detail: 'try' }))
+          .toMatchObject({ status: 502, body: { error: 'rearm_failed', detail: 'supervisor unavailable (and that could not be recorded in the ledger)' } });
+      } finally { failingAppend.mockRestore(); }
+    } finally {
+      await unrecorded.close();
     }
   });
 

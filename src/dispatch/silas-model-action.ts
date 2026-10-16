@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
 import type { LedgerApi } from '../ledger/api.js';
 import type { SilasOpsDigest } from './silas-driver.js';
-import type { AgentHandle, NativeAgentTool, NativeAgentToolResult } from '../runtime/types.js';
+import type { Role } from '../config.js';
+import type { AgentHandle, NativeAgentTool, NativeAgentToolResult, SpawnOptions } from '../runtime/types.js';
 
 /**
  * Issue #243 H6 — the product-owned native tool a SILAS model turn may call.
@@ -38,23 +39,68 @@ const refusal = (reason: string, message: string): NativeAgentToolResult => ({
 const str = (value: unknown): string | null =>
   typeof value === 'string' && value.length > 0 ? value : null;
 
+/** A spawn carries a handful of native tools; a slot count past this is no tool list. */
+const MAX_NATIVE_TOOLS = 256;
+/** Bounds on the model's free text (#369): the record is advisory audit
+ * material, so an over-long field is refused by name, never truncated.
+ * Lengths are in code points — the unit JSON Schema `maxLength` counts. */
+export const SILAS_ACTION_LIMITS = { jobId: 200, family: 128, debt: 128, rationale: 2000 } as const;
+const BOUNDED_FIELDS = Object.keys(SILAS_ACTION_LIMITS) as readonly (keyof typeof SILAS_ACTION_LIMITS)[];
+const HEAD_SHA = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u;
+/** Characters that never enter the audit record: every control (Cc),
+ * format (Cf — bidi overrides and isolates, zero-width spaces, tags), line or
+ * paragraph separator (Zl/Zp), private-use (Co) and unassigned (Cn) code
+ * point. The zero-width joiner and non-joiner are the exception: emoji
+ * sequences and Indic or Persian text need them, and they cannot reorder or
+ * hide a line. The rationale alone may carry tabs and line feeds; a carriage
+ * return could overwrite a rendered line, so it never may. Unassigned (Cn)
+ * is judged by this runtime's Unicode tables: fail-closed — a code point with
+ * no defined rendering is refused until the runtime knows it. */
+const UNSAFE_TEXT = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Co}\p{Cn}]/gu;
+const JOINERS: ReadonlySet<string> = new Set(['\u200c', '\u200d']);
+const hasUnsafeText = (value: string, allowBreaks: boolean): boolean =>
+  [...value.matchAll(UNSAFE_TEXT)].some(([char]) => !JOINERS.has(char) && !(allowBreaks && (char === '\t' || char === '\n')));
+
+/** What a bounded text field may not carry — stated once, for the schema
+ * the model reads and for the refusal it gets. */
+const UNSAFE_TEXT_RULE = 'control, format, separator, private-use or unassigned characters (zero-width joiners allowed)';
+const TEXT_RULE = `non-blank; length in code points; no ${UNSAFE_TEXT_RULE}`;
+/** Characters that render as nothing — every default-ignorable code point
+ * (joiners, Hangul fillers, variation selectors…) and the blank Braille
+ * pattern: a value made only of these (and whitespace) is blank. */
+const INVISIBLE_FILLERS = /[\p{Default_Ignorable_Code_Point}\u2800]/gu;
+
+/** Why a present bounded field is unusable, or null when it is fine. */
+function boundedFieldProblem(field: keyof typeof SILAS_ACTION_LIMITS, value: unknown): string | null {
+  const limit = SILAS_ACTION_LIMITS[field];
+  // Joiners and filler characters render as nothing: they never make a value non-blank.
+  if (typeof value !== 'string' || value.replace(INVISIBLE_FILLERS, '').trim() === '') return `${field} must be a non-blank string`;
+  // A lone surrogate is no character a reader can see, and no UTF-8 text.
+  if (/\p{Surrogate}/u.test(value)) return `${field} must be well-formed Unicode`;
+  if ([...value].length > limit) return `${field} must be at most ${String(limit)} characters`;
+  if (hasUnsafeText(value, field === 'rationale')) return `${field} must not contain ${UNSAFE_TEXT_RULE}`;
+  return null;
+}
+
 export function createSilasModelActionTool(deps: SilasModelActionToolDeps): NativeAgentTool {
   return {
     name: SILAS_MODEL_ACTION_TOOL,
     description:
-      'Record ONE Silas arbitration action (dispatch | escalate | hold) for a canonical job. ' +
-      'The host binds it to the live model turn, the observed digest and the actual job row, ' +
-      'and returns a durable action id.',
+      'Record ONE ADVISORY Silas arbitration action (dispatch | escalate | hold) for a canonical job. ' +
+      'It executes nothing: the host only binds the record to the live model turn, the observed digest ' +
+      'and the actual job row, and returns a durable action id. Perform the operation through its own ' +
+      'endpoint. Free text is bounded (rationale ' + String(SILAS_ACTION_LIMITS.rationale) + ' chars) and ' +
+      'head must be a full lowercase commit SHA (40 or 64 hex characters).',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
       properties: {
         action: { type: 'string', enum: [...ACTIONS] },
-        jobId: { type: 'string' },
-        family: { type: 'string' },
-        debt: { type: 'string' },
-        head: { type: 'string' },
-        rationale: { type: 'string' },
+        jobId: { type: 'string', minLength: 1, maxLength: SILAS_ACTION_LIMITS.jobId, description: TEXT_RULE },
+        family: { type: 'string', minLength: 1, maxLength: SILAS_ACTION_LIMITS.family, description: TEXT_RULE },
+        debt: { type: 'string', minLength: 1, maxLength: SILAS_ACTION_LIMITS.debt, description: TEXT_RULE },
+        head: { type: 'string', pattern: HEAD_SHA.source, description: 'full lowercase commit SHA (40 or 64 hex characters)' },
+        rationale: { type: 'string', minLength: 1, maxLength: SILAS_ACTION_LIMITS.rationale, description: `${TEXT_RULE}; tabs and line feeds allowed` },
       },
       required: ['action', 'jobId'],
     },
@@ -67,13 +113,27 @@ export function createSilasModelActionTool(deps: SilasModelActionToolDeps): Nati
       if (turn === null) {
         return refusal('no-live-turn', 'no live model turn currently owns this session');
       }
-      const args = (input ?? {}) as Record<string, unknown>;
+      // No arguments at all reads as an empty object (refused below for its
+      // missing action); any other non-object input is refused by name.
+      const raw: unknown = input ?? {};
+      if (typeof raw !== 'object' || Array.isArray(raw)) {
+        return refusal('bad-input', 'the tool input must be a JSON object');
+      }
+      const args = raw as Record<string, unknown>;
       const action = str(args['action']);
       if (action === null || !ACTIONS.includes(action as SilasModelActionKind)) {
         return refusal('bad-action', `action must be one of ${ACTIONS.join('|')}`);
       }
       const jobId = str(args['jobId']);
       if (jobId === null) return refusal('bad-job', 'jobId is required');
+      for (const field of BOUNDED_FIELDS) {
+        const problem = args[field] === undefined ? null : boundedFieldProblem(field, args[field]);
+        if (problem !== null) return refusal('bad-field', problem);
+      }
+      const head = str(args['head']);
+      if (args['head'] !== undefined && (head === null || !HEAD_SHA.test(head))) {
+        return refusal('bad-field', 'head must be a full lowercase commit SHA (40 or 64 hex characters)');
+      }
       const job = deps.ledger.getJob(jobId);
       if (job === null) return refusal('unknown-job', `no canonical job row for ${jobId}`);
       const digest = await deps.digest();
@@ -103,7 +163,7 @@ export function createSilasModelActionTool(deps: SilasModelActionToolDeps): Nati
           job_id: jobId,
           family: str(args['family']),
           debt: str(args['debt']),
-          head: str(args['head']),
+          head,
           rationale: str(args['rationale']),
           digest_sha256: digestSha256,
         },
@@ -125,4 +185,84 @@ export function createSilasModelActionTool(deps: SilasModelActionToolDeps): Nati
       };
     },
   };
+}
+
+/**
+ * The Silas slot's spawn (issue #243 H6, pinned by #368): appends a model-action
+ * tool to the caller's native tools and binds it to THIS spawn's handle once
+ * the spawn resolves — a re-spawn gets its own tool, never a late lookup of
+ * whichever incarnation is current.
+ */
+export function spawnSilasWithActionTool(
+  deps: Omit<SilasModelActionToolDeps, 'getHandle'> & {
+    readonly registry: { spawn(role: Role, options?: SpawnOptions): Promise<AgentHandle> };
+  },
+  spawnOptions?: SpawnOptions,
+): Promise<AgentHandle> {
+  let bound: AgentHandle | null = null;
+  const actionTool = createSilasModelActionTool({
+    getHandle: () => bound,
+    ledger: deps.ledger,
+    digest: deps.digest,
+    ...(deps.log !== undefined ? { log: deps.log } : {}),
+  });
+  let supplied: unknown;
+  try {
+    supplied = spawnOptions?.nativeTools ?? [];
+    if (!Array.isArray(supplied)) return Promise.reject(new TypeError('spawn options nativeTools must be an array of named native tools'));
+  } catch { return Promise.reject(new TypeError('spawn options nativeTools cannot be read')); }
+  // Read once, every slot (holes included), each slot and name exactly once:
+  // a hostile array or getter is refused by index, never a raw throw, and the
+  // tools read here — not a second read of the array — are the ones spawned.
+  let slots: number;
+  try { slots = supplied.length; } catch { return Promise.reject(new TypeError('spawn options nativeTools cannot be read')); }
+  if (typeof slots !== 'number' || !Number.isSafeInteger(slots) || slots < 0) return Promise.reject(new TypeError('spawn options nativeTools cannot be read'));
+  if (slots > MAX_NATIVE_TOOLS) return Promise.reject(new TypeError(`spawn options nativeTools has ${String(slots)} slots (at most ${String(MAX_NATIVE_TOOLS)})`));
+  const callerTools: NativeAgentTool[] = [];
+  const names: string[] = [];
+  for (let index = 0; index < slots; index += 1) {
+    let tool: unknown;
+    let name: unknown;
+    try {
+      tool = supplied[index];
+      name = tool === null || typeof tool !== 'object' ? undefined : (tool as { name?: unknown }).name;
+    } catch { name = undefined; }
+    if (typeof name !== 'string' || name === '') {
+      return Promise.reject(new TypeError(`spawn options nativeTools[${String(index)}] must be a native tool with a non-empty string name`));
+    }
+    callerTools.push(tool as NativeAgentTool);
+    names.push(name);
+  }
+  // The other options: an options object's own enumerable keys, copied as a
+  // spread copies them (symbols and an own `__proto__` included), each read
+  // once and nativeTools never again. Unlike a spread, anything but an object
+  // (null, a primitive, a function) is refused, and an option that cannot be
+  // read is refused by name — never a raw synchronous throw.
+  if (spawnOptions !== undefined && (typeof spawnOptions !== 'object' || spawnOptions === null)) {
+    return Promise.reject(new TypeError(`spawn options must be an object (got ${spawnOptions === null ? 'null' : typeof spawnOptions})`));
+  }
+  const rest: Record<PropertyKey, unknown> = {};
+  const source = (spawnOptions ?? {}) as Record<PropertyKey, unknown>;
+  let keys: readonly PropertyKey[];
+  try { keys = Reflect.ownKeys(source); } catch (error) { return Promise.reject(new TypeError('spawn options cannot be listed', { cause: error })); }
+  for (const key of keys) {
+    try {
+      if (key === 'nativeTools' || Object.getOwnPropertyDescriptor(source, key)?.enumerable !== true) continue;
+      Object.defineProperty(rest, key, { value: source[key], enumerable: true, writable: true, configurable: true });
+    } catch (error) { return Promise.reject(new TypeError(`spawn option ${String(key)} cannot be read`, { cause: error })); }
+  }
+  if (names.includes(SILAS_MODEL_ACTION_TOOL)) {
+    return Promise.reject(new Error(
+      `the Silas spawn already carries a ${SILAS_MODEL_ACTION_TOOL} tool — each spawn binds its own; pass spawn options without it`,
+    ));
+  }
+  return deps.registry
+    .spawn('silas', {
+      ...(rest as SpawnOptions),
+      nativeTools: [...callerTools, actionTool],
+    })
+    .then((handle) => {
+      bound = handle;
+      return handle;
+    });
 }

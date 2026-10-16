@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
-import { LedgerApi, NotificationDecisionRefusal } from '../src/ledger/api.js';
+import { BlankProvenanceCredentialError, LedgerApi, NotificationDecisionRefusal } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import {
   parseNotificationDecision,
@@ -14,6 +14,9 @@ import {
 import { ownerAttentionFor, requiresTypedDecision, resolveNotificationRouting } from '../src/notifications/attention.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import { reconcileLegacyOwnerAttention } from '../src/notifications/legacy-owner.js';
+
+/** Test callers run in-process, with no paired credential. */
+const INTERNAL = { credential: 'internal', declaredActor: null } as const;
 
 /**
  * Owner release 2026-10-11: the responsibility chain
@@ -355,27 +358,50 @@ describe('decision follow-through and cross-route guards', () => {
       decision: decision(),
     }).id;
     // Undecided: resolution must never silence the question.
-    expect(() => rig.api.resolveOwnerDecision(id, 'done')).toThrow(NotificationDecisionRefusal);
+    expect(() => rig.api.resolveOwnerDecision(id, 'done', INTERNAL)).toThrow(NotificationDecisionRefusal);
     try {
-      rig.api.resolveOwnerDecision(id, 'done');
+      rig.api.resolveOwnerDecision(id, 'done', INTERNAL);
       expect.unreachable();
     } catch (error) {
       expect((error as NotificationDecisionRefusal).code).toBe('undecided');
     }
     expect(rig.api.getNotification(id)).toMatchObject({ resolvedAt: null, decidedAt: null });
     rig.center.decide(id, 'approve', 'web');
-    const resolved = rig.api.resolveOwnerDecision(id, 'Executed the approved plan');
+    const resolved = rig.api.resolveOwnerDecision(id, 'Executed the approved plan', INTERNAL);
     expect(resolved).toMatchObject({ resolvedBy: 'gru', decidedOption: 'approve', ackedAt: null });
     // Idempotent replay; the decision record survives.
-    expect(rig.api.resolveOwnerDecision(id, 'repeat')).toMatchObject({ decidedOption: 'approve' });
+    expect(rig.api.resolveOwnerDecision(id, 'repeat', INTERNAL)).toMatchObject({ decidedOption: 'approve' });
     const events = rig.api
       .listEvents({ limit: 100 })
       .filter((event) => event.kind === 'notification.resolved' && (event.payload as { id?: string }).id === id);
     expect(events).toHaveLength(1);
-    expect(events[0]?.payload).toMatchObject({ detail: 'Executed the approved plan', owner_decision: 'approve' });
+    expect(events[0]?.payload).toMatchObject({
+      detail: 'Executed the approved plan',
+      owner_decision: 'approve',
+      // An in-process caller is labelled `internal`, never a bearer (#396).
+      credential: 'internal',
+      declaredActor: null,
+    });
     // Machine attention keeps its own path.
     const machine = rig.center.post({ kind: 'supervision.breaker', routing: 'needs-owner', severity: 'error', title: 'Breaker' });
-    expect(() => rig.api.resolveOwnerDecision(machine.id, 'nope')).toThrow(/use the disposition route/u);
+    expect(() => rig.api.resolveOwnerDecision(machine.id, 'nope', INTERNAL)).toThrow(/use the disposition route/u);
+    // Machine attention never adopts a typed owner decision either (#395).
+    expect(() => rig.api.adoptLegacyOwnerDecision(machine.id, decision(), INTERNAL)).toThrow(/only owner decisions adopt a typed decision/u);
+    // Provenance is required and never blank (#396) — on every path, by name,
+    // before anything is written.
+    expect(() => rig.api.resolveOwnerDecision(machine.id, 'x', { credential: ' ', declaredActor: null })).toThrow(/credential must be non-empty/u);
+    expect(() => rig.api.disposeMachineNotification(machine.id, 'x', { credential: '  ', declaredActor: null })).toThrow(BlankProvenanceCredentialError);
+    expect(() => rig.api.disposeMachineNotification(machine.id, 'x', { credential: '\t', declaredActor: null })).toThrow('machine disposition credential must be non-empty');
+    expect(rig.api.getNotification(machine.id)?.resolvedAt).toBeNull();
+    expect(() => rig.api.adoptLegacyOwnerDecision(id, decision(), { credential: '', declaredActor: null })).toThrow(BlankProvenanceCredentialError);
+    // Routing is checked FIRST: a machine row refuses adoption as no owner
+    // decision even when its decision column is populated.
+    (rig.api as unknown as { db: { prepare(sql: string): { run(...args: unknown[]): unknown } } }).db
+      .prepare('UPDATE notifications SET decision_json = ? WHERE id = ?').run('{"options":[]}', machine.id);
+    let refusal: unknown = null;
+    try { rig.api.adoptLegacyOwnerDecision(machine.id, decision(), INTERNAL); } catch (error) { refusal = error; }
+    expect(refusal).toBeInstanceOf(NotificationDecisionRefusal);
+    expect((refusal as NotificationDecisionRefusal).code).toBe('not_owner_decision');
   });
 
   it('an ack can never erase a typed owner decision (feed clears stay separate)', () => {
@@ -450,7 +476,7 @@ describe('updateNotificationDecisionOptions — the supported discussion bridge'
     // follow-through remains refused until the owner records a choice.
     expect(attached?.decidedAt).toBeNull();
     expect(attached?.resolvedAt).toBeNull();
-    expect(() => rig.api.resolveOwnerDecision(id, 'premature')).toThrow(NotificationDecisionRefusal);
+    expect(() => rig.api.resolveOwnerDecision(id, 'premature', INTERNAL)).toThrow(NotificationDecisionRefusal);
     const events = rig.api
       .listEvents({ limit: 100 })
       .filter((event) => event.kind === 'notification.decision-options' && (event.payload as { id?: string }).id === id);
@@ -459,7 +485,7 @@ describe('updateNotificationDecisionOptions — the supported discussion bridge'
     // The owner's recorded choice is the only thing that records a decision.
     const decided = rig.center.decide(id, 'go', 'owner');
     expect(decided?.decidedOption).toBe('go');
-    expect(rig.api.resolveOwnerDecision(id, 'executed')?.resolvedAt).not.toBeNull();
+    expect(rig.api.resolveOwnerDecision(id, 'executed', INTERNAL)?.resolvedAt).not.toBeNull();
   });
 
   it('refuses every other row shape with typed codes and an empty option list', () => {
@@ -515,7 +541,7 @@ describe('updateNotificationDecisionOptions — the supported discussion bridge'
     const resolvedId = seedDiscussion(rig);
     rig.api.updateNotificationDecisionOptions(resolvedId, options, 'gru');
     rig.center.decide(resolvedId, 'go', 'owner');
-    rig.api.resolveOwnerDecision(resolvedId, 'discussion follow-through completed');
+    rig.api.resolveOwnerDecision(resolvedId, 'discussion follow-through completed', INTERNAL);
     expect(codeOf(() => rig.api.updateNotificationDecisionOptions(resolvedId, options, 'gru'))).toBe('not_open');
     expect(rig.api.updateNotificationDecisionOptions('missing', options, 'gru')).toBeNull();
   });
