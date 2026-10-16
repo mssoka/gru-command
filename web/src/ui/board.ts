@@ -6,7 +6,8 @@
  * The surface stack:
  *   - the status chip rail (v4 health row relocated; `board-rail.ts`)
  *     under the command bar carries whole-system state incl. the labeled
- *     heist/PR/minion counts and the Jev/unacked trackers;
+ *     heist/PR/minion counts, the live machine (ALERTS) count and the
+ *     Jev/wake trackers;
  *   - attention-bucketed job rows (NEEDS GRU / IN FLIGHT / SETTLED /
  *     COLD) with sticky headers and counts;
  *   - the crew rail (CREW/TRANSCRIPTS tabs, dense rows, disposed overflow);
@@ -193,7 +194,6 @@ export class BoardView {
   private readonly notificationBadge: HTMLElement;
   private readonly notificationPanel: HTMLElement;
   private readonly decisionsChip: HTMLElement;
-  private readonly unackedChip: HTMLElement;
   private readonly wakesChip: HTMLElement;
   private readonly onOpenTranscript: (request: TranscriptOpenRequest) => void;
   /** v3: collapsed-by-default job rows. The expanded set loads once from
@@ -320,7 +320,6 @@ export class BoardView {
     this.notificationBadge = mustGet('notification-badge');
     this.notificationPanel = mustGet('notification-panel');
     this.decisionsChip = mustGet('board-decisions');
-    this.unackedChip = mustGet('board-unacked');
     this.wakesChip = mustGet('board-wakes');
     this.onOpenTranscript = onOpenTranscript;
     this.boardClient = boardClient;
@@ -1104,7 +1103,7 @@ export class BoardView {
     for (const chip of chips) {
       if (chip.id !== 'trackers') row.append(this.statusPairNode(chip));
     }
-    row.append(this.decisionsChip, this.unackedChip, this.wakesChip);
+    row.append(this.decisionsChip, this.wakesChip);
     this.chipRail.append(
       row,
       this.stripGroupsNode(chips.find((chip) => chip.id === 'trackers') ?? null),
@@ -1161,11 +1160,15 @@ export class BoardView {
     // title text): hover/AT users keep the Heists/PRs/minions + Jev fact.
     groups.title = trackers.titleAttr;
     for (const group of trackers.kpis ?? []) {
-      const groupNode = el('section', `strip-group strip-group--${STRIP_GROUP_TONE[group.label] ?? 'park'}`);
-      // The visible group heading is also its accessible name; the full
-      // status enumeration remains available through the tooltip below.
+      // A labelled group, not a heading or region landmark (#401): the
+      // sticky strip renders on every page, and three h2s/regions ahead of
+      // FOR YOU would pad screen-reader heading/landmark navigation. The
+      // visible label is also its accessible name; the full status
+      // enumeration remains available through the tooltip below.
+      const groupNode = el('div', `strip-group strip-group--${STRIP_GROUP_TONE[group.label] ?? 'park'}`);
+      groupNode.setAttribute('role', 'group');
       groupNode.setAttribute('aria-label', group.label);
-      const head = el('h2', 'strip-group__head');
+      const head = el('div', 'strip-group__head');
       const mark = el('span', 'strip-group__mark');
       mark.setAttribute('aria-hidden', 'true');
       head.append(mark, el('span', 'strip-group__name', group.label));
@@ -1199,7 +1202,7 @@ export class BoardView {
   }
 
   // ------------------------------------------------------------------
-  // Tracker chips: decisions + NEEDS GRU queue + wake count (the tracker
+  // Tracker chips: decisions + wake count (the tracker
   // GROUPS themselves render in stripGroupsNode from the same derivation).
   // ------------------------------------------------------------------
 
@@ -1214,16 +1217,9 @@ export class BoardView {
         : decisions.reason === null
           ? `Decision routing: ${decisions.status}.`
           : `Decision routing: ${decisions.status} (${decisions.reason}).`;
-    // NEEDS GRU is the LIVE machine queue: action-required rows awaiting a
-    // machine disposition (terminal-bound rows are closed receipts below).
-    // It never rings the owner bell — the FOR YOU band (bell + toasts) is
-    // the only human-facing surface. The slim strip renders this fact ONCE
-    // (the ALERTS pair); this chip keeps its id/text/title logic but stays
-    // hidden, so the number is not duplicated.
-    const needsGru = snapshot.unackedActionRequired;
-    this.unackedChip.hidden = true;
-    this.unackedChip.textContent = `🛠 ${needsGru} notifications · needs Gru`;
-    this.unackedChip.title = `${needsGru} live machine-attention notification${needsGru === 1 ? '' : 's'} awaiting a Gru disposition — the live queue clears itself; closed receipts stay in the record and the owner bell is not rung.`;
+    // NEEDS GRU (the LIVE machine queue) renders once, as the strip's ALERTS
+    // pair, whose title carries the full explanation (alertsCard). It never
+    // rings the owner bell — the FOR YOU band is the human-facing surface.
     // Wake tracker: every autonomous wake is a durable `gru.wake` event.
     // Count and last-wake time are INDEPENDENT facts derived ONLY from
     // snapshot.wakes (never from Silas): only 0 + no/invalid stamp is the

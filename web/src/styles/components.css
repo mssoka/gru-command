@@ -458,7 +458,7 @@ body {
   font-weight: 800;
 }
 
-/* Jev / needs-Gru / GRU-wake chips keep their pp-chip faces inside the
+/* Jev / GRU-wake chips keep their pp-chip faces inside the
    status row — but NOT its nowrap: chip facts wrap honestly like every
    other label (no clipping, no overflow masking). */
 .strip-status .pp-chip {
@@ -466,7 +466,6 @@ body {
 }
 
 .strip-status .board-decisions,
-.strip-status .board-unacked,
 .strip-status .board-wakes {
   font-size: 10.5px;
   padding: 3px 10px;
@@ -2492,7 +2491,6 @@ body {
 /* Tracker chips (inside the rail's TRACKERS chip) */
 
 .board-decisions,
-.board-unacked,
 .board-wakes {
   font-size: 10px;
   padding: 3px 10px;

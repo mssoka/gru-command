@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { expect, test, type FileChooser, type Page } from '@playwright/test';
 import { pickFreePort, startRealService, type RealServiceHandle } from '../../test/helpers/real-service.mjs';
+import { GruSessionPointer } from '../../src/chat/session-state.js';
 
 /**
  * Real-server smoke (E5c): the REAL service (repo dist/main.js, real
@@ -35,17 +36,72 @@ const JEV_MODE_FILE = join(tmpdir(), `gru-e2e-jev-mode-${Date.now()}`);
 const JEV_PRELOAD = join(import.meta.dirname, '..', '..', 'test', 'helpers', 'jev-fetch-double.mjs');
 process.env.CLAUDE_DOUBLE_LOG = DOUBLE_LOG;
 
-/** Last {prompt, images} the agent-side double received. */
-function lastAgentPrompt(): { prompt: string; images: number; argv: string[] } | null {
+type AgentInvocation = { prompt: string; images: number; argv: string[] };
+
+/** The newest invocation the agent-side double logged whose prompt carries
+ * `text` — the one this test sent. Never just the log's last line: a
+ * background service turn (a wake, an awareness pass) that ends after the
+ * reply would be "last" and make the receipt depend on test order (#402).
+ * Only the final line can be one a concurrent turn is still appending (not
+ * a record yet); any earlier unparseable line is a corrupt log and throws. */
+function newestInvocationContaining(text: string): AgentInvocation | null {
+  let content: string;
   try {
-    const lines = readFileSync(DOUBLE_LOG, 'utf-8').trim().split('\n');
-    const last = lines.at(-1);
-    return last === undefined || last === ''
-      ? null
-      : (JSON.parse(last) as { prompt: string; images: number; argv: string[] });
-  } catch {
-    return null;
+    content = readFileSync(DOUBLE_LOG, 'utf-8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; // no turn has ended yet
+    throw error;
   }
+  const lines = content.split('\n');
+  const last = lines.length - 1;
+  for (let index = last; index >= 0; index -= 1) {
+    const line = lines[index]!;
+    if (line === '') continue;
+    let record: AgentInvocation;
+    try {
+      record = JSON.parse(line) as AgentInvocation;
+    } catch (error) {
+      if (index === last) continue; // torn: still being appended
+      throw error;
+    }
+    if (record === null || typeof record !== 'object') {
+      throw new SyntaxError(`double log line ${String(index + 1)} is not a record: ${line.slice(0, 80)}`);
+    }
+    if (typeof record.prompt === 'string' && record.prompt.includes(text)) return record;
+  }
+  return null;
+}
+
+/** Waits (bounded) for the double to log the invocation carrying `text` —
+ * it appends at turn end, which can trail the rendered reply — and returns
+ * exactly the record the poll observed. Every probe text in this file is
+ * unique to its test. */
+async function agentPromptContaining(text: string): Promise<AgentInvocation> {
+  // Assigned inside the poll callback, so typed explicitly (no narrowing).
+  let found = null as AgentInvocation | null;
+  // An unreadable or corrupt log ends the poll at once and is rethrown —
+  // expect.poll would otherwise retry a throwing callback for the whole
+  // timeout and report only its generic message.
+  let fatal = null as Error | null;
+  await expect
+    .poll(() => {
+      try {
+        found = newestInvocationContaining(text);
+      } catch (error) {
+        const what = error instanceof SyntaxError ? 'has a corrupt record' : 'is unreadable';
+        fatal = new Error(`claude double log ${DOUBLE_LOG} ${what}: ${String(error)}`, { cause: error });
+        return true;
+      }
+      return found !== null;
+    }, {
+      message: `double logged a prompt carrying ${JSON.stringify(text)}`,
+      timeout: 15_000,
+    })
+    .toBe(true);
+  if (fatal !== null) throw fatal;
+  // Invariant: the poll only passes with a record or a fatal error.
+  if (found === null) throw new Error(`no double log record carries ${JSON.stringify(text)}`);
+  return found;
 }
 
 let service: RealServiceHandle | null = null;
@@ -145,41 +201,68 @@ test('multi-line prompt rides the real socket intact (agent receives the newline
   await expect(input).toHaveValue('');
   // AGENT-SIDE receipt: the double's prompt log carries the EXACT
   // composer text — the wire never flattened the newline.
-  expect(lastAgentPrompt()?.prompt).toContain(`${line1}\n${line2}`);
+  expect((await agentPromptContaining(`${line1}\n${line2}`)).prompt).toContain(`${line1}\n${line2}`);
 });
 
 test('real native compact preserves history and New chat starts unresumed behind a durable epoch', async ({ page }) => {
   await pair(page);
   await sendAndWaitReply(page, 'real context control old words');
-  const pointerFile = join(durableHome, 'chat', 'gru-session.json');
+  // The product's OWN pointer loader reads it: no copy of its shape rules
+  // to drift (a corrupt pointer throws, naming the file).
+  const pointer = new GruSessionPointer(join(durableHome, 'chat'));
+  const readPointer = (): { readonly sessionFile: string; readonly epoch: number } => {
+    const state = pointer.current();
+    if (state === null) throw new Error(`no chat session pointer at ${pointer.file}`);
+    return { sessionFile: state.sessionFile, epoch: state.epoch };
+  };
 
   await expect(page.locator('#chat-compact')).toBeEnabled();
   await page.locator('#chat-compact').click();
   await expect(page.locator('.notice-line', { hasText: 'context compacted' })).toBeVisible();
   await expect(page.locator('.msg--user', { hasText: 'real context control old words' })).toHaveCount(1);
-  const oldPointer = JSON.parse(readFileSync(pointerFile, 'utf-8')) as {
-    sessionFile: string;
-    epoch: number;
-  };
+  const oldPointer = readPointer();
   const oldBytes = readFileSync(oldPointer.sessionFile);
 
   page.once('dialog', (dialog) => dialog.accept());
   await page.locator('#chat-new').click();
   await expect(page.locator('.msg--user', { hasText: 'real context control old words' })).toHaveCount(0);
-  const freshPointer = JSON.parse(readFileSync(pointerFile, 'utf-8')) as {
-    sessionFile: string;
-    epoch: number;
+  // The UI clears before the service has necessarily persisted the new
+  // epoch pointer (the write is asynchronous): wait for the durable advance
+  // rather than reading once — reading once made this test order/timing
+  // sensitive (#402).
+  // A transient read failure is retried. If the poll gives up, the failure
+  // reports what the LAST poll saw — the epoch it read, or the read
+  // failure it hit — and how many polls ran; the poll's own error stays
+  // attached as the cause.
+  let polls = 0;
+  let lastPoll = 'no poll ran';
+  const polledEpoch = (): number | null => {
+    polls += 1;
+    try {
+      const { epoch } = readPointer();
+      lastPoll = `read epoch ${String(epoch)}`;
+      return epoch;
+    } catch (error) {
+      lastPoll = `read failed: ${String(error)}`;
+      return null;
+    }
   };
-  expect(freshPointer.epoch).toBe(oldPointer.epoch + 1);
+  const advanced = 'New chat never durably advanced the chat session epoch pointer';
+  try {
+    await expect.poll(polledEpoch, { message: advanced, timeout: 10_000 }).toBe(oldPointer.epoch + 1);
+  } catch (error) {
+    throw new Error(`${advanced} to ${String(oldPointer.epoch + 1)} within ${String(polls)} polls; the last poll ${lastPoll}`, { cause: error });
+  }
+  const freshPointer = readPointer();
   expect(freshPointer.sessionFile).not.toBe(oldPointer.sessionFile);
   expect(readFileSync(oldPointer.sessionFile)).toEqual(oldBytes);
 
   await page.reload();
   await expect(page.locator('.msg--user', { hasText: 'real context control old words' })).toHaveCount(0);
   await sendAndWaitReply(page, 'first real words in fresh epoch');
-  const invocation = lastAgentPrompt();
-  expect(invocation?.argv).toContain('--session-id');
-  expect(invocation?.argv).not.toContain('--resume');
+  const invocation = await agentPromptContaining('first real words in fresh epoch');
+  expect(invocation.argv).toContain('--session-id');
+  expect(invocation.argv).not.toContain('--resume');
 });
 
 test('reload keeps history from the real frame log (no duplicates)', async ({ page }) => {
@@ -655,11 +738,11 @@ test.describe('attach flow (SPEC ruling 19) — full gesture', () => {
 
     // AGENT-SIDE receipt (not just UI): the double's prompt log carries
     // the manifest with the absolute workspace path…
-    const agentPrompt = lastAgentPrompt();
-    expect(agentPrompt?.prompt).toContain('[attached files — read them yourself at these paths]');
-    expect(agentPrompt?.prompt).toContain(realWsFile);
+    const agentPrompt = await agentPromptContaining('read the plan');
+    expect(agentPrompt.prompt).toContain('[attached files — read them yourself at these paths]');
+    expect(agentPrompt.prompt).toContain(realWsFile);
     // …and NO image bytes were ever attached through the runtime.
-    expect(agentPrompt?.images ?? -1).toBe(0);
+    expect(agentPrompt.images).toBe(0);
 
     // FAILS-PRE-FIX DISCRIMINATOR (no byte copy): an implementation that
     // copied bytes would materialize the pick into uploads/ — it must
@@ -726,10 +809,10 @@ test.describe('attach flow (SPEC ruling 19) — full gesture', () => {
 
     // The sent path points AT it — the agent received THAT path.
     await expect(page.locator('.msg--gru', { hasText: storedPath })).toBeVisible();
-    const agentPrompt = lastAgentPrompt();
-    expect(agentPrompt?.prompt).toContain(storedPath);
-    expect(agentPrompt?.prompt).toContain('(image)');
-    expect(agentPrompt?.images ?? -1).toBe(0); // paths only, never bytes
+    const agentPrompt = await agentPromptContaining('what did I just shoot');
+    expect(agentPrompt.prompt).toContain(storedPath);
+    expect(agentPrompt.prompt).toContain('(image)');
+    expect(agentPrompt.images).toBe(0); // paths only, never bytes
     // Vision-capable runtime (claude declares images): no decline notice.
     await expect(page.locator('.notice-line', { hasText: 'Vision is unavailable' })).toHaveCount(0);
   });

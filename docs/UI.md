@@ -318,7 +318,7 @@ Two section-truth rules keep the bands honest (2026-09-29):
   escalation rows keep living in the notification record as closed
   receipts (they clear through a Gru disposition, never a human Ack),
   but they no longer promote the lane, alert its row, or count into the
-  unacked tracker chip (the service counts live rows only); in the bell
+  strip's live ALERTS count (the service counts live rows only); in the bell
   they render under FEED, not in the live NEEDS GRU queue. A merged lane
   renders in SETTLED/COLD as a receipt.
 - **Stopped lanes wait with their reason.** A working lane whose minion

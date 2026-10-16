@@ -9,6 +9,7 @@ import { PerkinsWholeReview, type PerkinsWholeResult } from '../src/dispatch/per
 import { planPerkinsReviewScope, readPriorConvergenceMeta } from '../src/dispatch/perkins-review/convergence.js';
 import { fakeWholeSpawner, groundedFinding, type WholeLeadOptions } from './helpers/perkins-whole-double.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { commitManyPaths, LARGE_UNIT_TIMEOUT_MS } from './helpers/large-integration-unit.js';
 
 /**
  * Native integration review with retained prior coverage — exercised through
@@ -437,6 +438,69 @@ describe('native integration review retains prior coverage', () => {
     expect(b0).toMatch(/^[0-9a-f]{40}$/u);
     expect(b1).toMatch(/^[0-9a-f]{40}$/u);
   });
+
+  it('re-proves the integration lineage in the engine: a non-descendant candidate falls back to whole (#392)', async () => {
+    const harness = makeEngine({ childAnswer: () => '[]', specialists: [] });
+    const { b0, h0 } = featureHead(harness.repo, 'src/feature.ts', 'export const feature = 1;\n');
+    const frozen1 = freeze(harness, 'lineage-round-1', h0);
+    const round1 = await runRound(harness, { roundId: 'lineage-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
+    expect(round1.convergence?.coverageComplete).toBe(true);
+    const consolidated1 = join(reviewArtifactDirectory(harness.root, 'lineage-round-1'), 'consolidated.json');
+    // Main advances, and the feature is REWRITTEN from the old base: its new
+    // head merges main but does not descend from the reviewed H0. A direct
+    // engine caller still asks for an integration round.
+    const { b1 } = integrateClean(harness.repo);
+    // symbolic-ref throws on a detached HEAD (repo.git throws on any non-zero exit).
+    const featureBranch = harness.repo.git(['symbolic-ref', '--short', 'HEAD']);
+    harness.repo.git(['checkout', '-B', featureBranch, b0]);
+    harness.repo.commitFile('src/feature.ts', 'export const feature = 2;\n');
+    harness.repo.git(['merge', '--no-ff', '-m', 'merge main', 'main']);
+    const h1 = harness.repo.head();
+    expect(() => harness.repo.git(['merge-base', '--is-ancestor', h0, h1])).toThrow();
+    const frozen2 = freeze(harness, 'lineage-round-2', h1);
+    const round2 = await runRound(harness, {
+      roundId: 'lineage-round-2', roundNumber: 2, frozen: frozen2,
+      reviewScope: 'integration', priorConsolidatedFile: consolidated1,
+    });
+    const lead = harness.leadCalls.at(-1);
+    expect(lead, 'round 2 prompted its lead').toBeDefined();
+    const prompt = lead?.prompt ?? '';
+    expect(round2.convergence?.reviewScope).toBe('whole');
+    expect(round2.convergence?.deltaUnavailable).toContain('integration lineage could not be re-proven');
+    expect(round2.convergence?.scopeReason).toContain('whole-change re-verification');
+    expect(round2.convergence?.integrationFromSha).toBeUndefined();
+    expect(prompt).toContain('REVIEW SCOPE: WHOLE CHANGE');
+    expect(prompt).not.toContain('--- INTEGRATION UNIT');
+    // The rewritten candidate did integrate the advanced base: only the
+    // reviewed head's lineage is broken, which is exactly what is re-proven.
+    expect(() => harness.repo.git(['merge-base', '--is-ancestor', b1, h1])).not.toThrow();
+  });
+
+  it('an integration unit over its path bound falls back to a disclosed whole round, never a truncated unit (#393)', async () => {
+    // (The unit's byte cap and strict-UTF-8 guards are defence in depth: the
+    // frozen diff carries the same cap, and a non-UTF-8 path cannot even be
+    // checked out pristine for the freeze, so both refuse before the engine.
+    // Every guard shares the same integrationSince throw → disclosed whole
+    // fallback, so the path bound is the reachable engine-level proof.)
+    const harness = makeEngine({ childAnswer: () => '[]', specialists: [] });
+    const { h0 } = featureHead(harness.repo, 'src/feature.ts', 'export const feature = 1;\n');
+    const frozen1 = freeze(harness, 'bound-round-1', h0);
+    await runRound(harness, { roundId: 'bound-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
+    const consolidated1 = join(reviewArtifactDirectory(harness.root, 'bound-round-1'), 'consolidated.json');
+    integrateClean(harness.repo);
+    commitManyPaths(harness.repo, 4001);
+    const frozen2 = freeze(harness, 'bound-round-2', harness.repo.head());
+    const round2 = await runRound(harness, {
+      roundId: 'bound-round-2', roundNumber: 2, frozen: frozen2,
+      reviewScope: 'integration', priorConsolidatedFile: consolidated1,
+    });
+    expect(round2.convergence?.reviewScope).toBe('whole');
+    expect(round2.convergence?.deltaUnavailable).toContain('over the 4000-path bound');
+    expect(round2.convergence?.scopeReason).toContain('whole-change re-verification');
+    const lead = harness.leadCalls.at(-1);
+    expect(lead, 'round 2 prompted its lead').toBeDefined();
+    expect(lead?.prompt ?? '').not.toContain('--- INTEGRATION UNIT');
+  }, LARGE_UNIT_TIMEOUT_MS);
 
   it('records whole-candidate coverage even when the whole round requests changes', async () => {
     const harness = makeEngine({
