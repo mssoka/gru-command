@@ -870,8 +870,9 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
                 // The supervisor already acted: the caller is told so, typed —
                 // never a bare failure that hides the re-arm or closure.
                 if (acted === 'not_applicable') throw error;
-                const recorded = recordActed('failed', String(error));
-                json(res, 500, { error: 'disposition_failed', code: 'disposition_failed', rearm, detail: `${String(error)}${actedNote(recorded)}` });
+                const failure = String(error) || 'an error with no text';
+                const recorded = recordActed('failed', failure);
+                json(res, 500, { error: 'disposition_failed', code: 'disposition_failed', rearm, detail: `${failure}${actedNote(recorded)}` });
                 return;
               }
               const recorded = recordActed('refused', error.refusal);

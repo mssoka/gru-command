@@ -1853,6 +1853,24 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
           .toMatchObject({ status: 500, body: { error: 'disposition_failed', code: 'disposition_failed', rearm: 'accepted', detail: expect.stringMatching(/^Error: ledger locked — the supervisor had already acted on it \(rearm: accepted\); the alert stays open/u) } });
       } finally { disposal.mockRestore(); }
       expect(actedEvents()).toContainEqual({ id: failing.id, rearm: 'accepted', outcome: 'failed', reason: 'Error: ledger locked' });
+      // Its recorded reason is cut on code points — never half an emoji.
+      const long = vi.spyOn(harness.api, 'disposeMachineNotification').mockImplementation(() => { throw new Error(`${'x'.repeat(492)}\u{1F600}tail`); });
+      try {
+        expect(await postJson(harness.port, `/api/notifications/${encodeURIComponent(failing.id)}/disposition`, 'board-test-token', { detail: 'long failure' }))
+          .toMatchObject({ status: 500, body: { error: 'disposition_failed' } });
+      } finally { long.mockRestore(); }
+      expect(actedEvents()).toContainEqual({ id: failing.id, rearm: 'accepted', outcome: 'failed', reason: `Error: ${'x'.repeat(492)}\u{1F600}` });
+      // An error with no text is named, and an event that cannot be written is said on the 500 too.
+      const silentDisposal = vi.spyOn(harness.api, 'disposeMachineNotification').mockImplementation(() => { throw Object.assign(new Error(''), { toString: () => '' }); });
+      const appendFailing = harness.api.appendCustomEvent.bind(harness.api);
+      const unrecorded = vi.spyOn(harness.api, 'appendCustomEvent').mockImplementation((input) => {
+        if (input.kind === 'notification.disposition-refused-after-rearm') throw new Error('ledger full');
+        return appendFailing(input);
+      });
+      try {
+        expect(await postJson(harness.port, `/api/notifications/${encodeURIComponent(failing.id)}/disposition`, 'board-test-token', { detail: 'silent failure' }))
+          .toMatchObject({ status: 500, body: { error: 'disposition_failed', rearm: 'accepted', detail: 'an error with no text — the supervisor had already acted on it (rearm: accepted) (and that could not be recorded in the ledger); the alert stays open: retriage or resolve it' } });
+      } finally { unrecorded.mockRestore(); silentDisposal.mockRestore(); }
       // A resolved action-required row stays an idempotent retry.
       const note = harness.notifications.post({ kind: 'job.note', routing: 'action-required', severity: 'info', title: 'handled' });
       for (const attempt of ['first', 'retry']) {

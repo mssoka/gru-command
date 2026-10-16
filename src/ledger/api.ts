@@ -3336,12 +3336,18 @@ export class LedgerApi {
   }
 
   /** The FIRST recorded closure of this alert's stop — the binding one.
-   * Every closure this ledger writes names its agent and job; a row missing
-   * either (never written here) is no closure, for reads and writes alike. */
+   * Every closure this ledger writes names a non-blank agent and job (the
+   * writer's own rule, applied here the same way); a row missing either
+   * (never written here) closes no alert's stop: neither this lookup nor a
+   * replayed write binds to it. Restart hydration is separate — it reads an
+   * agent's own latest lifecycle row by agent id. */
   private supervisionStopClosure(notificationId: string): { readonly agentId: string; readonly jobId: string } | undefined {
-    return this.db.prepare(
-      "SELECT agent_id AS agentId, job_id AS jobId FROM events WHERE kind = 'supervision.stop-superseded' AND json_extract(payload, '$.notification_id') = ? AND agent_id IS NOT NULL AND agent_id <> '' AND job_id IS NOT NULL AND job_id <> '' ORDER BY seq ASC LIMIT 1",
-    ).get(notificationId) as { agentId: string; jobId: string } | undefined;
+    const rows = this.db.prepare(
+      "SELECT agent_id AS agentId, job_id AS jobId FROM events WHERE kind = 'supervision.stop-superseded' AND json_extract(payload, '$.notification_id') = ? ORDER BY seq ASC",
+    ).all(notificationId) as Array<{ agentId: unknown; jobId: unknown }>;
+    const complete = (value: unknown): value is string => typeof value === 'string' && value.trim() !== '';
+    const first = rows.find((row) => complete(row.agentId) && complete(row.jobId));
+    return first === undefined ? undefined : { agentId: first.agentId as string, jobId: first.jobId as string };
   }
 
   /** Records a superseded-stop closure (#385) at most ONCE per alert: the

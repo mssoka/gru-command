@@ -6133,6 +6133,13 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       // The incomplete row is passed over; the first COMPLETE closure binds.
       expect(rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: 'blank-agent' } })).toBe(true);
       expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: 'b', jobId: 'fenced-job', payload: { notification_id: 'blank-agent' } })).toThrow(SupervisionStopClosureConflictError);
+      // A blank job, or ids that are only whitespace (which the writer refuses), alike.
+      rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: 'b', jobId: '', payload: { notification_id: 'blank-job' } });
+      rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: ' ', jobId: '\t', payload: { notification_id: 'blank-job' } });
+      rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: 'b', jobId: ' ', payload: { notification_id: 'blank-job' } });
+      expect(rig.api.hasSupervisionStopSuperseded('blank-job')).toBe(false);
+      expect(rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: 'blank-job' } })).toBe(true);
+      expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: 'b', jobId: 'fenced-job', payload: { notification_id: 'blank-job' } })).toThrow(SupervisionStopClosureConflictError);
       // The FIRST complete closure of an alert is the binding one.
       rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: 'first', jobId: 'fenced-job', payload: { notification_id: 'twice' } });
       rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: 'second', jobId: 'fenced-job', payload: { notification_id: 'twice' } });
@@ -6185,6 +6192,15 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
           expect(rig.supervisor.onNotificationDisposed(note.id)).toEqual({ ok: false, reason: 'superseded closure lookup failed — retry the disposition: Error: events unreadable; its alert kind could not be read either: Error: notifications unreadable' });
         } finally {
           kind.mockRestore();
+        }
+        // Errors with no text are still named: never an empty reason.
+        const textless = (): Error => Object.assign(new Error(''), { toString: () => '' });
+        spy.mockImplementation(() => { throw textless(); });
+        const silent = vi.spyOn(rig.api, 'getNotification').mockImplementation(() => { throw textless(); });
+        try {
+          expect(rig.supervisor.onNotificationDisposed(note.id)).toEqual({ ok: false, reason: 'superseded closure lookup failed — retry the disposition: an error with no text; its alert kind could not be read either: an error with no text' });
+        } finally {
+          silent.mockRestore();
         }
       } finally {
         spy.mockRestore();
