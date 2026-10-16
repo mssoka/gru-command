@@ -3742,7 +3742,7 @@ describe('typed provider-response provenance (r1 #13) — pure parsers', () => {
   });
 });
 
-it('a directive-bearing steer or follow-up from the live turn\'s own owner waits as its own queued turn with its own admission, never native steering (#363 S05-2-02) #contract:native-directive-admission:pi', async () => {
+it('a directive-bearing steer or follow-up from the live turn\'s own owner waits as its own queued turn with its own admission, never native steering (#363 S05-2-02)', async () => {
   for (const channel of ['steer', 'followUp'] as const) {
     let release!: () => void;
     const hold = new Promise<void>((resolve) => { release = resolve; });
@@ -4418,7 +4418,7 @@ async function assertGuardedSdkDelivery(resume: boolean) {
     expect(f.scene.worktrees.listWorktrees({ jobId: row.jobId })).toEqual([f.scene.lane]);
   } finally { await service?.dispose(); await f.cleanup(); }
 }
-it('production shared executor permits only its exact streaming SDK producer to run two native tools and deliver', () => assertGuardedSdkDelivery(false));
+it('production shared executor permits only its exact streaming SDK producer to run two native tools and deliver #contract:native-directive-admission:pi', () => assertGuardedSdkDelivery(false));
 it('production checkpoint callback permits its exact streaming SDK producer to run two native tools without prompt replay', () => assertGuardedSdkDelivery(true));
 
 async function assertProductionSdkFence(resume: boolean, fault: 'model-await' | 'prior-hook-await' | 'branch-model-await' | 'branch-hook' | 'foreign-streaming' | 'manifest-model' | 'manifest-role' | 'manifest-hook' | 'manifest-tools' | 'manifest-role-hook' | 'manifest-model-hook' | 'manifest-execution-mode') {

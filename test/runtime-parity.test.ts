@@ -24,6 +24,7 @@ function table(doc: string, name: string): readonly Row[] {
   const end = doc.indexOf(`<!-- ${name}:end -->`);
   if (start < 0 || end < start) throw new Error(`docs/RUNTIME-PARITY.md has no ${name} table between its markers`);
   const lines = doc.slice(start, end).split('\n').filter((line) => line.startsWith('|'));
+  if (lines.length < 3) throw new Error(`docs/RUNTIME-PARITY.md ${name} table has no header, separator or rows`);
   const cellsOf = (line: string): readonly string[] => line.split('|').slice(1, -1).map((cell) => cell.trim());
   const width = cellsOf(lines[0] ?? '').length;
   return lines.slice(2).map((line) => { // header and separator
@@ -47,6 +48,22 @@ function titleOf(line: string): string | undefined {
 
 const TAG = /^#contract:([a-z0-9-]+):(pi|claude-code|neutral)$/u;
 
+/** Each line with whether it sits inside a `describe.skip`/`skipIf`/`runIf`/
+ * `todo` block (by indentation): a test there is conditional, never proof. A
+ * test that skips itself from its own body cannot be seen from here. */
+function registeredLines(source: string): readonly { readonly line: string; readonly conditional: boolean }[] {
+  const open: { readonly indent: number; readonly conditional: boolean }[] = [];
+  return source.split('\n').map((line) => {
+    const indent = line.length - line.trimStart().length;
+    const block = /^\s*describe(\.[a-zA-Z]+)?/u.exec(line);
+    const closes = /^\s*\}\)/u.test(line);
+    while (open.length > 0 && (indent < open.at(-1)!.indent || ((block !== null || closes) && indent === open.at(-1)!.indent))) open.pop();
+    const conditional = open.some((entry) => entry.conditional);
+    if (block !== null) open.push({ indent, conditional: conditional || /^\.(skip|skipIf|runIf|todo)$/u.test(block[1] ?? '') });
+    return { line, conditional };
+  });
+}
+
 /** Every contract tag in a test title, across the test tree; a token that
  * starts like a tag but is not one is returned as malformed, never dropped. */
 function tags(): { readonly found: readonly Tag[]; readonly malformed: readonly string[] } {
@@ -54,14 +71,24 @@ function tags(): { readonly found: readonly Tag[]; readonly malformed: readonly 
   const malformed: string[] = [];
   for (const name of readdirSync(join(root, 'test')).filter((entry) => entry.endsWith('.test.ts')).sort()) {
     const file = `test/${name}`;
-    for (const line of readFileSync(join(root, file), 'utf8').split('\n')) {
-      const title = titleOf(line);
-      if (title === undefined) continue;
-      for (const token of title.match(/#contract:\S*/gu) ?? []) {
-        const match = TAG.exec(token);
-        if (match === null) malformed.push(`${file}: ${token}`);
-        else found.push({ id: match[1]!, runtime: match[2]!, file, title });
-      }
+    const one = tagsIn(file, readFileSync(join(root, file), 'utf8'));
+    found.push(...one.found);
+    malformed.push(...one.malformed);
+  }
+  return { found, malformed };
+}
+
+/** The tags one test file's unconditional tests carry. */
+function tagsIn(file: string, source: string): { readonly found: readonly Tag[]; readonly malformed: readonly string[] } {
+  const found: Tag[] = [];
+  const malformed: string[] = [];
+  for (const { line, conditional } of registeredLines(source)) {
+    const title = titleOf(line);
+    if (title === undefined || conditional) continue;
+    for (const token of title.match(/#contract:\S*/gu) ?? []) {
+      const match = TAG.exec(token);
+      if (match === null) malformed.push(`${file}: ${token}`);
+      else found.push({ id: match[1]!, runtime: match[2]!, file, title });
     }
   }
   return { found, malformed };
@@ -70,7 +97,10 @@ function tags(): { readonly found: readonly Tag[]; readonly malformed: readonly 
 /** A runtime's tag never sits in the other runtime's adapter test file. */
 function misplacedTags(found: readonly Tag[]): readonly string[] {
   const other: Readonly<Record<string, string>> = { pi: 'test/claude-adapter.test.ts', 'claude-code': 'test/pi-adapter.test.ts' };
-  return found.filter((tag) => other[tag.runtime] === tag.file).map((tag) => `${tag.file}: #contract:${tag.id}:${tag.runtime}`);
+  // A neutral test drives `AgentHandle`, so it never lives in an adapter's own file.
+  const adapterFiles: readonly string[] = ADAPTER_FILES;
+  return found.filter((tag) => other[tag.runtime] === tag.file || (tag.runtime === 'neutral' && adapterFiles.includes(tag.file)))
+    .map((tag) => `${tag.file}: #contract:${tag.id}:${tag.runtime}`);
 }
 
 /** Every file a matrix cell names exists and holds a tag for that row's contract. */
@@ -78,12 +108,12 @@ function cellFileProblems(rows: readonly Row[], found: readonly Tag[]): readonly
   const problems: string[] = [];
   for (const row of rows) {
     const id = unquote(row.cells[0]!);
-    for (const cell of row.cells.slice(2)) {
-      for (const [, file] of cell.matchAll(/`(test\/[^`]+)`/gu)) {
+    RUNTIMES.forEach((runtime, column) => {
+      for (const [, file] of (row.cells[2 + column] ?? '').matchAll(/`(test\/[^`]+)`/gu)) {
         if (!existsSync(join(root, file!))) problems.push(`${id}: ${file!} does not exist`);
-        else if (!found.some((tag) => tag.id === id && tag.file === file)) problems.push(`${id}: ${file!} holds no test tagged for it`);
+        else if (!found.some((tag) => tag.id === id && tag.file === file && (tag.runtime === runtime || tag.runtime === 'neutral'))) problems.push(`${id}: ${file!} holds no test tagged for it on ${runtime}`);
       }
-    }
+    });
   }
   return problems;
 }
@@ -126,6 +156,7 @@ describe('runtime parity guard (#374)', () => {
   const doc = readFileSync(join(root, 'docs', 'RUNTIME-PARITY.md'), 'utf8');
   const matrix = table(doc, 'parity-matrix');
   const blocks = table(doc, 'adapter-blocks');
+  const gaps = table(doc, 'declared-gaps');
   const { found, malformed } = tags();
 
   it('every contract in the matrix is proven on both runtimes, and every cell names its tagged test file', () => {
@@ -139,6 +170,15 @@ describe('runtime parity guard (#374)', () => {
     expect(malformed, 'malformed tags').toEqual([]);
     expect(misplacedTags(found), 'tags in the other runtime\'s adapter file').toEqual([]);
     expect(cellFileProblems(matrix, found)).toEqual([]);
+  });
+
+  it('every declared gap is a matrix row marked as one, with its issue, and every row marked as a gap is declared', () => {
+    const ids = new Set(matrix.map((row) => unquote(row.cells[0]!)));
+    const declared = gaps.map((row) => unquote(row.cells[0]!));
+    expect(declared.filter((id) => !ids.has(id)), 'gaps naming no matrix row').toEqual([]);
+    expect(gaps.filter((row) => !/^#\d+$/u.test(row.cells[2]!)).map((row) => row.cells[0]), 'gaps without an issue').toEqual([]);
+    const marked = matrix.filter((row) => row.cells[1]!.startsWith('**Declared gap')).map((row) => unquote(row.cells[0]!));
+    expect(marked.sort()).toEqual([...declared].sort());
   });
 
   it('every tag names a listed contract and a known runtime', () => {
@@ -158,6 +198,14 @@ describe('runtime parity guard (#374)', () => {
     expect(kinds.map(([key, kind]) => `${key}: ${kind}`), 'placements naming no listed contract').toEqual([]);
   });
 
+  it('a test inside a skipped or conditional describe block is no proof, however deep', () => {
+    const source = [`${'describe'}('kept', () => {`, `  ${'it'}('a #contract:x:pi', () => {});`, '});', `${'describe'}.skipIf(true)('gated', () => {`,
+      `  ${'describe'}('inner', () => {`, `    ${'it'}('b #contract:x:pi', () => {});`, '  });', '});', `${'it'}('c #contract:x:pi', () => {});`].join('\n');
+    expect(registeredLines(source).filter((entry) => titleOf(entry.line) !== undefined).map((entry) => [titleOf(entry.line), entry.conditional]))
+      .toEqual([['a #contract:x:pi', false], ['b #contract:x:pi', true], ['c #contract:x:pi', false]]);
+    expect(tagsIn('test/x.test.ts', source).found.map((found) => found.title)).toEqual(['a #contract:x:pi', 'c #contract:x:pi']);
+  });
+
   it('a conditionally skipped test is no proof; a describe with a modifier or an escaped quote is still a block', () => {
     // Built in parts so neither the suite pin nor this guard reads them as tests.
     expect(titleOf(`  ${'it'}.skipIf(process.platform === 'linux')('x #contract:spawn-cwd:pi', () => {`)).toBeUndefined();
@@ -169,9 +217,13 @@ describe('runtime parity guard (#374)', () => {
     const tag = (runtime: string, file: string): Tag => ({ id: 'x', runtime, file, title: 't' });
     expect(misplacedTags([tag('pi', 'test/claude-adapter.test.ts'), tag('claude-code', 'test/claude-adapter.test.ts')])).toEqual(['test/claude-adapter.test.ts: #contract:x:pi']);
     expect(cellFileProblems([{ cells: ['`x`', 'b', '`test/nope.test.ts`', '`test/runtime-parity.test.ts`'] }], []))
-      .toEqual(['x: test/nope.test.ts does not exist', 'x: test/runtime-parity.test.ts holds no test tagged for it']);
+      .toEqual(['x: test/nope.test.ts does not exist', 'x: test/runtime-parity.test.ts holds no test tagged for it on claude-code']);
     expect(() => table('<!-- t:start -->\n| a | b |\n|---|---|\n| only |\n<!-- t:end -->', 't')).toThrow(/t row has 1 cells, not 2/u);
     expect(TAG.test('#contract:Foo_Bar:pi')).toBe(false);
+    expect(misplacedTags([tag('neutral', 'test/pi-adapter.test.ts')])).toEqual(['test/pi-adapter.test.ts: #contract:x:neutral']);
+    expect(cellFileProblems([{ cells: ['`x`', 'b', '`test/runtime-parity.test.ts`', '-'] }], [{ id: 'x', runtime: 'claude-code', file: 'test/runtime-parity.test.ts', title: 't' }]))
+      .toEqual(['x: test/runtime-parity.test.ts holds no test tagged for it on pi']);
+    expect(() => table('<!-- t:start -->\n| a | b |\n|---|---|\n<!-- t:end -->', 't')).toThrow(/t table has no header, separator or rows/u);
     expect(TAG.test('#contract:spawn-cwd:windows')).toBe(false);
   });
 

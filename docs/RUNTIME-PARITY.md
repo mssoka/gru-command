@@ -17,13 +17,18 @@ that proves it on each adapter.
   - `#contract:<id>:neutral` marks a contract proven above the adapter layer,
     through the runtime-neutral `AgentHandle` interface.
 - `test/runtime-parity.test.ts` reads the two tables below and every test
-  title. Only an unconditional test counts as proof; a skipped or
-  conditionally skipped test does not. The guard fails when:
+  title. Only a test registered with a plain `it(`, outside any
+  `describe.skip`/`skipIf`/`runIf`/`todo` block, counts as proof. A test
+  that skips itself from inside its own body cannot be seen by the guard;
+  review catches that. The guard fails when:
   - a contract lacks a test on either runtime (a neutral test covers both);
-  - a tag is malformed, names a contract the matrix does not list, or sits in
-    the other runtime's adapter test file;
+  - a tag is malformed or names a contract the matrix does not list;
+  - a runtime's tag sits in the other runtime's adapter test file, or a
+    `:neutral` tag sits in either adapter test file;
   - a matrix cell does not name the file of a test tagged for it, or names a
-    file that does not exist or holds no tag for that contract;
+    file that does not exist or holds no tag for that contract on that
+    cell's runtime;
+  - a declared gap is not a matrix row marked as a gap, or has no issue.
   - an adapter test file (`test/pi-adapter.test.ts`,
     `test/claude-adapter.test.ts`) grows a top-level `describe` block that the
     block map below does not place.
@@ -68,7 +73,7 @@ that proves it on each adapter.
 | `blind-transcript-reader` | The blind-access reader pairs each read result with the file its call named, read from each runtime's real persisted record shape | `test/blind-review.test.ts` | `test/blind-review.test.ts` |
 | `blind-read-invalidates` | Through the ledger, an absolute read inside the job's recorded lane invalidates blind coverage | `test/blind-review.test.ts` | `test/blind-review.test.ts` |
 | `blind-resumed-turn-scan` | A prohibited read during a provider-recovery resumed turn invalidates blind coverage | `test/provider-recovery-resume.test.ts` | `test/provider-recovery-resume.test.ts` |
-| `native-directive-admission` | **Declared gap (#424).** pi attests a Silas directive's native admission and producer ownership. Claude Code refuses a directive prompt by name, and directive progress refuses its minion before binding anything | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts`, `test/restart-recovery-progress.test.ts` |
+| `native-directive-admission` | **Declared gap (#424).** pi attests a Silas directive's native admission and producer ownership: an accepted directive runs as its exact SDK producer and settles with its delivery. Claude Code refuses a directive prompt by name, and directive progress refuses its minion before binding anything | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts`, `test/restart-recovery-progress.test.ts` |
 | `rate-limit-retry` | An in-band 429 keeps the delivery pending until the supervisor's automatic retry recovers; driven through `AgentHandle` | `test/supervisor.test.ts` | `test/supervisor.test.ts` |
 | `supervisor-restart-ladder` | A hung agent climbs the restart ladder and is restored by resume; driven through `AgentHandle` | `test/supervisor.test.ts` | `test/supervisor.test.ts` |
 | `provider-recovery-continuation` | A provider-recovery claim resumes the interrupted session and re-delivers its continuation prompt; driven through `AgentHandle` | `test/provider-recovery-resume.test.ts` | `test/provider-recovery-resume.test.ts` |
@@ -124,9 +129,11 @@ attests: see the `native-directive-admission` gap.
 
 ## Declared gaps
 
+<!-- declared-gaps:start -->
 | Contract | Gap | Issue |
 |---|---|---|
-| `native-directive-admission` | Silas directives and re-briefs need native admission and producer attestation. Claude Code cannot provide them, so a directive to a Claude-hosted minion is refused by name before anything is bound or prompted (a positive no-effect). The minion-owned review/fix cycle is unaffected | #424 |
+| `native-directive-admission` | Silas directives and re-briefs need native admission and producer attestation. Claude Code cannot provide them, so a directive to a Claude-hosted minion is refused by name before anything is bound or prompted (a positive no-effect). Directive restart recovery (#286) rests on the same checkpoint and is pi-only too. The minion-owned review/fix cycle is unaffected | #424 |
+<!-- declared-gaps:end -->
 
 Blind-review observation reads each runtime's own transcript format. The
 `blind-transcript-reader` and `blind-read-invalidates` rows run on fixtures
@@ -161,7 +168,8 @@ writes each runtime's own record shape during a resumed turn.
   is untouched by --force regeneration").
 - **Before switching an install to Claude Code**, note the
   `native-directive-admission` gap (#424). Silas cannot send directives or
-  re-briefs to Claude-hosted minions.
+  re-briefs to Claude-hosted minions, and an interrupted directive cannot be
+  recovered from a Claude checkpoint.
 - **Live sessions when an install switches by hand.** A transcript belongs to
   the runtime that wrote it. The other adapter refuses to resume it by name and
   releases its lock (`foreign-transcript-refused`), so a switched install never
