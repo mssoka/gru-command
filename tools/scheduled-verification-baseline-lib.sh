@@ -9,7 +9,7 @@
 # name, optionally with ^/~ suffixes — never something git would read as an
 # option or a range.
 plain_revision() {
-  case "$1" in ''|-*|*[!0-9A-Za-z_./^~-]*) return 1;; esac
+  case "$1" in ''|-*|^*|*..*|*[!0-9A-Za-z_./^~-]*) return 1;; esac
 }
 
 # require_pinned_sources <candidate> <regressions> <file>...: every pinned
@@ -41,10 +41,16 @@ require_pinned_sources() {
 snapshot_candidate() {
   [ "$#" -eq 2 ] && [ -n "$1" ] || { echo "snapshot_candidate needs a snapshot directory and a candidate" >&2; exit 2; }
   plain_revision "$2" || { echo "snapshot_candidate was given a candidate that is empty or not a plain revision: \"$2\"" >&2; exit 2; }
-  # Trailing slashes dropped: `link/` is judged as the link it names.
+  # Trailing slashes dropped (`link/` is judged as the link it names); a last
+  # component of `.` or `..`, or one that is not physically itself
+  # (`link/.`), is no real directory.
   _snapshot_dir=$1
   while [ "${_snapshot_dir%/}" != "$_snapshot_dir" ] && [ "$_snapshot_dir" != / ]; do _snapshot_dir=${_snapshot_dir%/}; done
-  if [ -L "$_snapshot_dir" ] || [ ! -d "$_snapshot_dir" ] || ! _snapshot_entries=$(ls -A -- "$_snapshot_dir") || [ -n "$_snapshot_entries" ]; then
+  case "$(basename -- "$_snapshot_dir")" in .|..|/) _snapshot_real=false;; *) _snapshot_real=true;; esac
+  if [ "$_snapshot_real" = true ] && [ -d "$_snapshot_dir" ] && [ ! -L "$_snapshot_dir" ]; then
+    [ "$(cd -P -- "$_snapshot_dir" && pwd -P)" = "$(cd -P -- "$(dirname -- "$_snapshot_dir")" && pwd -P)/$(basename -- "$_snapshot_dir")" ] || _snapshot_real=false
+  fi
+  if [ "$_snapshot_real" != true ] || [ -L "$_snapshot_dir" ] || [ ! -d "$_snapshot_dir" ] || ! _snapshot_entries=$(ls -A -- "$_snapshot_dir") || [ -n "$_snapshot_entries" ]; then
     echo "snapshot directory $1 must be an existing, empty, real directory" >&2
     exit 2
   fi
@@ -52,7 +58,7 @@ snapshot_candidate() {
   if git archive -o "$_snapshot_archive" "$2" && tar -x -C "$_snapshot_dir" -f "$_snapshot_archive"; then
     rm -f "$_snapshot_archive"
   else
-    rm -rf "$_snapshot_dir" "$_snapshot_archive"
+    rm -rf -- "$_snapshot_dir" "$_snapshot_archive"
     echo "reviewed candidate $2 could not be archived into $1 — refusing" >&2
     exit 2
   fi
@@ -65,17 +71,21 @@ snapshot_candidate() {
 # killed (SIGKILL, with every descendant: it leads its own process group) at
 # the bound — GRU_HELPER_LOAD_MS, a whole number from 1 to 3600000 written
 # without leading zeros, default 60000 — writing to a file rather than a pipe,
-# so neither a spinning helper, one that ignores SIGTERM, nor a descendant
-# holding its output open can stall the baseline or outlive it. A per-run
+# so neither a spinning helper, one that ignores SIGTERM, nor a descendant in
+# its group holding its output open can stall the baseline or outlive it (a
+# descendant that leaves the group with setsid is beyond this reach). An
+# interrupted baseline takes the load down with it. A per-run
 # sentinel, on its own line, proves the load finished (against accidental
 # output; the helper under test can read its own command line). Importing never runs the CLI (it runs only when
 # invoked directly). A refused snapshot is kept for inspection.
 require_built_helper() {
   test -s dist/verify/capture-cli.js || { echo "the build did not emit dist/verify/capture-cli.js — a missing helper would read as behavioral RED; refusing (check the build output; snapshot kept at $PWD)" >&2; exit 2; }
   _helper_load_ms=${GRU_HELPER_LOAD_MS:-60000}
+  # The length check keeps an all-digit value too long for the shell to
+  # compare (which it would treat as false, passing it) out.
   case "$_helper_load_ms" in ''|0*|*[!0-9]*) _helper_bound_ok=false;; *) _helper_bound_ok=true;; esac
   if [ "$_helper_bound_ok" != true ] || [ "${#_helper_load_ms}" -gt 7 ] || [ "$_helper_load_ms" -lt 1 ] || [ "$_helper_load_ms" -gt 3600000 ]; then
-    echo "GRU_HELPER_LOAD_MS must be a whole number of milliseconds from 1 to 3600000 (got \"$_helper_load_ms\")" >&2
+    echo "GRU_HELPER_LOAD_MS must be a whole number of milliseconds from 1 to 3600000, without leading zeros (got \"$_helper_load_ms\")" >&2
     exit 2
   fi
   if ! GRU_HELPER_LOAD_MS="$_helper_load_ms" node --input-type=module - <<'JS'
@@ -96,7 +106,10 @@ try {
     const load = `await import('./dist/verify/capture-cli.js'); process.stdout.write(${JSON.stringify(`\n${sentinel}\n`)}, () => process.exit(0));`;
     child = spawn(process.execPath, ['--input-type=module', '-e', load], { detached: true, stdio: ['ignore', out, 'inherit'] });
   } finally { closeSync(out); }
-  const killGroup = () => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ } };
+  // The group is signalled only while it has members (a reaped leader's
+  // pid is never signalled as some other group).
+  const killGroup = () => { try { process.kill(-child.pid, 0); process.kill(-child.pid, 'SIGKILL'); } catch { /* the group is gone */ } };
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.once(signal, () => { killGroup(); rmSync(dir, { recursive: true, force: true }); process.exit(130); });
   let timedOut = false;
   const timer = setTimeout(() => { timedOut = true; killGroup(); }, ms);
   const [[code, signal]] = await Promise.race([once(child, 'exit').then((args) => [args]), once(child, 'error').then(([error]) => { throw error; })]);

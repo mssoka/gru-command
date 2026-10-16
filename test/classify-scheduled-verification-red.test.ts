@@ -170,6 +170,8 @@ describe('reviewed-candidate behavioral RED custody', () => {
       expect(file.stderr).toBe(`pinned regression file missing file.ts is missing at ${head} — fetch full history (git fetch --unshallow)\n`);
       const present = check(`${head} ${head} present.ts`);
       expect([present.status, present.stderr]).toEqual([0, '']);
+      // A suffixed plain revision is still one.
+      expect(check(`${head}~0 ${head}^0 present.ts`)).toMatchObject({ status: 0, stderr: '' });
       // Its own arguments are checked by name too.
       const short = check(`${head} ${head}`);
       expect([short.status, short.stderr]).toEqual([2, 'require_pinned_sources needs a candidate, a regressions revision and at least one file (got 2 arguments)\n']);
@@ -178,7 +180,7 @@ describe('reviewed-candidate behavioral RED custody', () => {
       expect(check(`${head} '' present.ts`).stderr).toBe('require_pinned_sources was given a regressions revision that is empty or not a plain revision: ""\n');
       // A revision git would read as an option is never handed to it.
       expect(check(`--output=/tmp/x ${head} present.ts`).stderr).toBe('require_pinned_sources was given a candidate revision that is empty or not a plain revision: "--output=/tmp/x"\n');
-      for (const odd of ['a b', 'HEAD:secret', 'abc*']) {
+      for (const odd of ['a b', 'HEAD:secret', 'abc*', 'a..b', 'a...b', '^x']) {
         expect(check(`'${odd}' ${head} present.ts`).stderr, odd).toBe(`require_pinned_sources was given a candidate revision that is empty or not a plain revision: "${odd}"\n`);
       }
       // The snapshot is the candidate's tree, with no archive left behind...
@@ -192,7 +194,7 @@ describe('reviewed-candidate behavioral RED custody', () => {
       expect(libCall(`snapshot_candidate '${join(dir, 'absent')}' ${head}`, repo, join(dir, 'tmp')).stderr).toBe(`snapshot directory ${join(dir, 'absent')} must be an existing, empty, real directory\n`);
       // A linked target is refused: a failure would remove only the link, never the partial tree.
       const target = join(dir, 'link-target'); mkdirSync(target); symlinkSync(target, join(dir, 'linked'));
-      for (const linked of [join(dir, 'linked'), `${join(dir, 'linked')}/`, `${join(dir, 'linked')}//`]) {
+      for (const linked of [join(dir, 'linked'), `${join(dir, 'linked')}/`, `${join(dir, 'linked')}//`, `${join(dir, 'linked')}/.`]) {
         const refused = libCall(`snapshot_candidate '${linked}' ${head}`, repo, join(dir, 'tmp'));
         expect([refused.status, refused.stderr], linked).toEqual([2, `snapshot directory ${linked} must be an existing, empty, real directory\n`]);
       }
@@ -253,18 +255,28 @@ describe('reviewed-candidate behavioral RED custody', () => {
         expect(hung.stderr, body).toMatch(/the helper did not finish loading within 300 ms[\s\S]*does not load cleanly/u);
       }
       // The descendant did not outlive the refusal.
-      const kid = Number(readFileSync(join(dir, 'kid.pid'), 'utf8'));
-      const alive = (): boolean => { try { process.kill(kid, 0); return true; } catch { return false; } };
-      const deadline = Date.now() + 5000;
-      while (alive() && Date.now() < deadline) execFileSync('sleep', ['0.1']);
-      expect(alive(), 'the load\'s descendant was killed with it').toBe(false);
+      const pidOf = (file: string): number => {
+        const pid = Number(readFileSync(file, 'utf8'));
+        expect(Number.isSafeInteger(pid) && pid > 1, `${file} holds a real pid`).toBe(true);
+        return pid;
+      };
+      const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
+      const gone = (pid: number): boolean => { const deadline = Date.now() + 5000; while (alive(pid) && Date.now() < deadline) execFileSync('sleep', ['0.1']); return !alive(pid); };
+      expect(gone(pidOf(join(dir, 'kid.pid'))), 'the load\'s descendant was killed with it').toBe(true);
+      // ...and neither does one left behind by a load that finished cleanly.
+      writeFileSync(join(snapshot, 'dist', 'verify', 'scheduler.js'), 'export {};\n');
+      writeFileSync(helper, `import { spawn } from 'node:child_process';\nimport { writeFileSync } from 'node:fs';\nconst kid = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' });\nwriteFileSync(${JSON.stringify(join(dir, 'left.pid'))}, String(kid.pid));\n`);
+      expect(guard()).toMatchObject({ status: 0, stderr: '' });
+      expect(gone(pidOf(join(dir, 'left.pid'))), 'a cleanly loaded helper leaves nothing running').toBe(true);
+      // No load leaves its temporary directory behind.
+      expect(readdirSync(join(dir, 'tmp')).filter((name) => name.startsWith('gru-helper-load-'))).toEqual([]);
       // A helper that prints while loading — even a partial line — still loads.
       writeFileSync(helper, "import './scheduler.js';\nconsole.log('loading capture helper');\nprocess.stdout.write('no newline');\n");
       expect(guard()).toMatchObject({ status: 0, stderr: '' });
       // The bound itself is a whole number from 1 to 3600000 — never one that disables it.
       for (const bound of ['soon', '0', '00', '0000300', '-5', '1.5', '3600001', '99999999', '99999999999999999999999']) {
         expect(libCall('require_built_helper', snapshot, join(dir, 'tmp'), { GRU_HELPER_LOAD_MS: bound }).stderr, bound)
-          .toBe(`GRU_HELPER_LOAD_MS must be a whole number of milliseconds from 1 to 3600000 (got "${bound}")\n`);
+          .toBe(`GRU_HELPER_LOAD_MS must be a whole number of milliseconds from 1 to 3600000, without leading zeros (got "${bound}")\n`);
       }
       // The real compiled helper (this tree's build) loads without running.
       const real = libCall('require_built_helper', repoRoot, join(dir, 'tmp'));
