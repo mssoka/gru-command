@@ -7,13 +7,15 @@ export const SETTLE_PASSES = 60;
  * Jump every unsettled CSS transition on the page to its END state
  * (finish()) instead of awaiting it — headless Chromium on Linux can stall a
  * transition's `finished` promise past the test timeout (#402) — repeating,
- * bounded, until nothing is left unsettled. A finish() that throws, or
- * transitions that keep restarting, fail loud with EVERY culprit named
- * (element, id, classes, pseudo-element and property).
+ * bounded, until nothing is left unsettled. `document.getAnimations()`
+ * flushes pending style changes first (Web Animations), so a transition a
+ * just-committed class change starts is already listed: no frame wait is
+ * needed, and none can hang a throttled page. A finish() that throws and
+ * transitions that keep restarting each fail loud, together, with EVERY
+ * culprit named (element, id, classes, pseudo-element and property).
  */
 export async function settleTransitions(page: Page, passes = SETTLE_PASSES): Promise<void> {
-  // Let transitions a just-committed style change starts on the next frame begin first.
-  await page.evaluate(() => new Promise<void>((resolve) => { requestAnimationFrame(() => { requestAnimationFrame(() => { resolve(); }); }); }));
+  if (!Number.isSafeInteger(passes) || passes < 1) throw new Error(`settleTransitions: passes must be a positive integer, got ${String(passes)}`);
   await page.evaluate((limit) => {
     // Running (pending play included) or paused transitions are unsettled;
     // finished and idle ones are done.
@@ -38,10 +40,12 @@ export async function settleTransitions(page: Page, passes = SETTLE_PASSES): Pro
         try { transition.finish(); } catch (error) { failed.set(transition, `${nameOf(transition)}: ${String(error)}`); }
       }
     }
-    const stuck = [...new Set(unsettled().filter((t) => !failed.has(t)).map(nameOf))];
-    if (failed.size > 0) {
-      throw new Error(`a CSS transition could not be finished (${[...failed.values()].join('; ')}); other transitions still unsettled: ${stuck.join(', ') || 'none'}`);
-    }
-    if (stuck.length > 0) throw new Error(`CSS transitions kept restarting after ${String(limit)} settle passes: ${stuck.join(', ')}`);
+    // What is still live after every pass was finished each pass: it restarts.
+    const restarting = [...new Set(unsettled().filter((t) => !failed.has(t)).map(nameOf))];
+    const problems = [
+      ...(failed.size > 0 ? [`a CSS transition could not be finished (${[...failed.values()].join('; ')})`] : []),
+      ...(restarting.length > 0 ? [`CSS transitions kept restarting after ${String(limit)} settle passes: ${restarting.join(', ')}`] : []),
+    ];
+    if (problems.length > 0) throw new Error(problems.join('; '));
   }, passes);
 }

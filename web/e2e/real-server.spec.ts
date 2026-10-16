@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { expect, test, type FileChooser, type Page } from '@playwright/test';
 import { pickFreePort, startRealService, type RealServiceHandle } from '../../test/helpers/real-service.mjs';
+import { GruSessionPointer } from '../../src/chat/session-state.js';
 
 /**
  * Real-server smoke (E5c): the REAL service (repo dist/main.js, real
@@ -206,22 +207,13 @@ test('multi-line prompt rides the real socket intact (agent receives the newline
 test('real native compact preserves history and New chat starts unresumed behind a durable epoch', async ({ page }) => {
   await pair(page);
   await sendAndWaitReply(page, 'real context control old words');
-  const pointerFile = join(durableHome, 'chat', 'gru-session.json');
-  const readPointer = (): { sessionFile: string; epoch: number } => {
-    const raw = ((): string => {
-      try { return readFileSync(pointerFile, 'utf-8'); } catch (error) { throw new Error(`unreadable chat session pointer ${pointerFile}: ${String(error)}`); }
-    })();
-    const value = ((): unknown => {
-      try { return JSON.parse(raw); } catch (error) { throw new Error(`chat session pointer ${pointerFile} is not JSON: ${String(error)}`); }
-    })();
-    const record = typeof value === 'object' && value !== null ? value as { sessionFile?: unknown; epoch?: unknown } : null;
-    const epoch = record?.epoch;
-    // The same shape the product's own loader accepts (src/chat/session-state.ts).
-    if (record === null || typeof record.sessionFile !== 'string' || record.sessionFile === '' ||
-        typeof epoch !== 'number' || !Number.isSafeInteger(epoch) || epoch < 0) {
-      throw new Error(`malformed chat session pointer ${pointerFile}: ${raw}`);
-    }
-    return { sessionFile: record.sessionFile, epoch };
+  // The product's OWN pointer loader reads it: no copy of its shape rules
+  // to drift (a corrupt pointer throws, naming the file).
+  const pointer = new GruSessionPointer(join(durableHome, 'chat'));
+  const readPointer = (): { readonly sessionFile: string; readonly epoch: number } => {
+    const state = pointer.current();
+    if (state === null) throw new Error(`no chat session pointer at ${pointer.file}`);
+    return { sessionFile: state.sessionFile, epoch: state.epoch };
   };
 
   await expect(page.locator('#chat-compact')).toBeEnabled();
@@ -239,18 +231,27 @@ test('real native compact preserves history and New chat starts unresumed behind
   // rather than reading once — reading once made this test order/timing
   // sensitive (#402).
   // A transient read failure is retried. If the poll gives up, the failure
-  // reports the last epoch actually read AND the last read failure seen
-  // (a later successful read does not erase it).
-  let lastEpoch: number | null = null;
-  let lastReadError: string | null = null;
+  // reports what the LAST poll saw — the epoch it read, or the read
+  // failure it hit — and how many polls ran; the poll's own error stays
+  // attached as the cause.
+  let polls = 0;
+  let lastPoll = 'no poll ran';
   const polledEpoch = (): number | null => {
-    try { lastEpoch = readPointer().epoch; return lastEpoch; } catch (error) { lastReadError = String(error); return null; }
+    polls += 1;
+    try {
+      const { epoch } = readPointer();
+      lastPoll = `read epoch ${String(epoch)}`;
+      return epoch;
+    } catch (error) {
+      lastPoll = `read failed: ${String(error)}`;
+      return null;
+    }
   };
   const advanced = 'New chat never durably advanced the chat session epoch pointer';
   try {
     await expect.poll(polledEpoch, { message: advanced, timeout: 10_000 }).toBe(oldPointer.epoch + 1);
   } catch (error) {
-    throw new Error(`${advanced}: last epoch read ${String(lastEpoch)}, expected ${String(oldPointer.epoch + 1)}; last read failure: ${lastReadError ?? 'none'}`, { cause: error });
+    throw new Error(`${advanced} to ${String(oldPointer.epoch + 1)} within ${String(polls)} polls; the last poll ${lastPoll}`, { cause: error });
   }
   const freshPointer = readPointer();
   expect(freshPointer.sessionFile).not.toBe(oldPointer.sessionFile);

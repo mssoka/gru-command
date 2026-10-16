@@ -372,7 +372,8 @@ async function hitTarget(page: Page, selector: string): Promise<HitTarget> {
     if (element === null) return { found: false, inViewport: false, hit: false };
     const rect = element.getBoundingClientRect();
     const topmost = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
-    const sliver = 0.5 / (window.devicePixelRatio > 0 ? window.devicePixelRatio : 1);
+    if (!(window.devicePixelRatio > 0)) throw new Error(`hitTarget: unusable devicePixelRatio ${String(window.devicePixelRatio)}`);
+    const sliver = 0.5 / window.devicePixelRatio;
     return {
       found: true,
       inViewport: rect.width > 0 && rect.height > 0 &&
@@ -694,18 +695,43 @@ test.describe('compact owner-first board — synthetic geometry proof', () => {
     expect(await hitTarget(page, '#missing')).toEqual({ found: false, inViewport: false, hit: false });
   });
 
-  test('at 2x device pixels the containment sliver is half a DEVICE pixel: 0.25 CSS px in, 0.3 out (#402)', async ({ browser }) => {
+  test('at 2x device pixels the containment sliver is half a DEVICE pixel on every edge: 0.25 CSS px in, past it out (#402)', async ({ browser }) => {
     const context = await browser.newContext({ deviceScaleFactor: 2, viewport: { width: 400, height: 300 } });
     const page = await context.newPage();
     try {
       await page.setContent([
         '<style>html,body{margin:0;padding:0;overflow:hidden}div{position:fixed;box-sizing:border-box;background:#888}</style>',
-        '<div id="in" style="left:10px;top:250.25px;width:20px;height:50px"></div>',
-        '<div id="out" style="left:40px;top:250.3px;width:20px;height:50px"></div>',
+        '<div id="bottom-in" style="left:10px;top:250.25px;width:20px;height:50px"></div>',
+        '<div id="bottom-out" style="left:40px;top:250.3125px;width:20px;height:50px"></div>',
+        '<div id="top-in" style="left:70px;top:-0.25px;width:20px;height:20px"></div>',
+        '<div id="top-out" style="left:100px;top:-0.3125px;width:20px;height:20px"></div>',
+        '<div id="left-in" style="left:-0.25px;top:40px;width:20px;height:20px"></div>',
+        '<div id="left-out" style="left:-0.3125px;top:70px;width:20px;height:20px"></div>',
+        '<div id="right-in" style="left:380.25px;top:100px;width:20px;height:20px"></div>',
+        '<div id="right-out" style="left:380.3125px;top:130px;width:20px;height:20px"></div>',
       ].join(''));
-      expect(await page.evaluate(() => window.devicePixelRatio)).toBe(2);
-      expect((await hitTarget(page, '#in')).inViewport, 'a quarter CSS pixel past the bottom at 2x').toBe(true);
-      expect((await hitTarget(page, '#out')).inViewport, 'past half a device pixel at 2x').toBe(false);
+      expect(await page.evaluate(() => [window.devicePixelRatio, window.innerWidth, window.innerHeight]), 'this proof runs at 2x in 400×300').toEqual([2, 400, 300]);
+      // The boxes sit exactly where the CSS puts them (no device-pixel
+      // snapping of the measured rects): the boundary under test is real.
+      expect(await page.evaluate(() => ['bottom-in', 'bottom-out', 'top-out', 'left-out', 'right-out'].map((id) => {
+        const rect = document.getElementById(id)!.getBoundingClientRect();
+        return { id, top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right };
+      }))).toEqual([
+        { id: 'bottom-in', top: 250.25, bottom: 300.25, left: 10, right: 30 },
+        { id: 'bottom-out', top: 250.3125, bottom: 300.3125, left: 40, right: 60 },
+        { id: 'top-out', top: -0.3125, bottom: 19.6875, left: 100, right: 120 },
+        { id: 'left-out', top: 70, bottom: 90, left: -0.3125, right: 19.6875 },
+        { id: 'right-out', top: 130, bottom: 150, left: 380.3125, right: 400.3125 },
+      ]);
+      // Exactly half a DEVICE pixel past each edge is contained and hittable...
+      for (const id of ['#bottom-in', '#top-in', '#left-in', '#right-in']) {
+        expect(await hitTarget(page, id), id).toEqual({ found: true, inViewport: true, hit: true });
+      }
+      // ...and anything past it is not — the 1x half-CSS-pixel allowance
+      // would have wrongly admitted every one of these.
+      for (const id of ['#bottom-out', '#top-out', '#left-out', '#right-out']) {
+        expect(await hitTarget(page, id), id).toEqual({ found: true, inViewport: false, hit: true });
+      }
     } finally {
       await context.close();
     }
