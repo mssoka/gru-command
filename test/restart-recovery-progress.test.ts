@@ -1767,8 +1767,10 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     f.db.close();
     const db = new LedgerDb(f.dir); cleanups.push(() => db.close());
     const aged = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
-    expect(db.handle.prepare('UPDATE pending_directives SET created_at = ?, updated_at = ?, dispatch_started_at = coalesce(dispatch_started_at, ?) WHERE request_id = ?')
+    // The claim is the row's recovery_checkpoint plus its continuation-claimed event; both age with the job's events.
+    expect(db.handle.prepare('UPDATE pending_directives SET created_at = ?, updated_at = ?, dispatch_started_at = ? WHERE request_id = ?')
       .run(aged, aged, aged, f.intent.requestId).changes).toBe(1);
+    expect(db.handle.prepare('UPDATE events SET ts = ? WHERE job_id = ?').run(aged, f.intent.jobId).changes).toBeGreaterThan(0);
     const bus = new EventBus({}); const ledger = new LedgerApi(db.handle, { bus });
     const restarted = new DirectiveProgressService({ ...f.deps, ledger, notifications: new NotificationCenter({ ledger, bus }) });
     try {
@@ -2182,7 +2184,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     try {
       // An execution that ends before agent_start fails here by name, never
       // as an admission timeout (#363 S10-0-03).
-      await Promise.race([started.promise, original.then((outcome) => { throw new Error(`the accepted dispatch ended before native admission: ${String(outcome)}`); })]);
+      await Promise.race([started.promise, original.then((outcome) => { throw new Error(`the accepted dispatch ended before native admission: ${outcome instanceof Error ? `it threw ${outcome.name}: ${outcome.message}` : 'it returned without admitting'}`); })]);
       // The actual protocol, not seed(), has consumed this accepted prompt.
       expect(f.native.prompts).toHaveLength(1); expect(f.native.isIdle).toBe(false);
       const native = inspectDirectiveCheckpoint(f.file, f.identity);
