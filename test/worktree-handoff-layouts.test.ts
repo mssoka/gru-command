@@ -505,17 +505,32 @@ describe('child lane parent custody, called directly (#373)', () => {
     // ...nor does the directory's close failure replace its sync failure.
     rmSync(join(f.admin, 'gru-creation-handoff.json'));
     let directoryFd = -1;
+    let closeFired = false;
     fsHooks.beforeFsync = (fd) => { if (fstatSync(fd).isDirectory()) { directoryFd = fd; throw Object.assign(new Error('io'), { code: 'EIO' }); } };
-    fsHooks.beforeClose = (fd) => {
-      if (fd !== directoryFd) return;
+    const failDirectoryClose = (fd: number): void => {
+      if (!fstatSync(fd).isDirectory()) return;
       fsHooks.beforeClose = null;
+      closeFired = true;
       closeSync(fd);
       throw Object.assign(new Error('close'), { code: 'EBADF' });
     };
-    expect(() => handoffProof.beginLaneHandoff(f.parent, f.admin, token))
-      .toThrow(new RegExp(`^lane administration ${f.admin.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')} published its handoff receipt but could not make it durable \\(EIO\\)$`, 'u'));
+    fsHooks.beforeClose = failDirectoryClose;
+    const both = (() => { try { handoffProof.beginLaneHandoff(f.parent, f.admin, token); return null; } catch (error) { return error as Error; } })();
     fsHooks.beforeFsync = null; fsHooks.beforeClose = null;
-    expect(directoryFd).toBeGreaterThan(-1);
+    expect(both?.message).toBe(`lane administration ${f.admin} published its handoff receipt but could not make it durable (EIO)`);
+    expect([directoryFd > -1, closeFired]).toEqual([true, true]);
+    // ...the close failure travels with it.
+    expect(((both?.cause as AggregateError).errors as { code: string }[]).map((error) => error.code)).toEqual(['EIO', 'EBADF']);
+    expect(existsSync(temp)).toBe(false);
+    // A directory close failure alone, after a sync that succeeded, is a failure to make it durable too.
+    rmSync(join(f.admin, 'gru-creation-handoff.json'));
+    closeFired = false;
+    fsHooks.beforeClose = failDirectoryClose;
+    expect(() => handoffProof.beginLaneHandoff(f.parent, f.admin, token))
+      .toThrow(`lane administration ${f.admin} published its handoff receipt but could not make it durable (EBADF)`);
+    fsHooks.beforeClose = null;
+    expect(closeFired).toBe(true);
+    expect(existsSync(temp)).toBe(false);
     // A filesystem that cannot fsync a file, or a directory (EINVAL, ENOTSUP), publishes all the same.
     for (const code of ['EINVAL', 'ENOTSUP']) {
       for (const kind of ['file', 'directory'] as const) {
@@ -543,12 +558,15 @@ describe('child lane parent custody, called directly (#373)', () => {
       const dir = join(realpathSync(join(repoPath, '.git')), 'worktrees');
       return existsSync(dir) ? readdirSync(dir).sort() : [];
     };
+    /** Every lane checkout under a manager's root, as `<repo>/<lane>`. */
+    const checkouts = (root: string): string[] => (existsSync(root) ? readdirSync(root).flatMap((repoName) => readdirSync(join(root, repoName)).map((lane) => `${repoName}/${lane}`)).sort() : []);
     // A job lane, and a review lane.
     for (const kind of ['job', 'review'] as const) {
       const repo = fixture(`undurable-${kind}`);
       const h = manager();
       const job = h.ledger.addJob({ id: `undurable-${kind}`, repo: 'assigned', title: kind });
       const before = admins(repo.path);
+      const lanesBefore = checkouts(h.root);
       fsHooks.beforeFsync = failDirectorySync('EIO');
       try {
         const creating = kind === 'job'
@@ -558,7 +576,9 @@ describe('child lane parent custody, called directly (#373)', () => {
       } finally { fsHooks.beforeFsync = null; }
       expect(h.ledger.getWorktree(kind === 'job' ? job.id : `round-${kind}`), kind).toBeNull();
       expect(admins(repo.path), kind).toEqual(before);
-      expect(git(repo.path, ['branch', '--list', `gru/${job.id}`]), kind).toBe('');
+      // No checkout is left behind (a review lane is detached: it never had a branch).
+      expect(checkouts(h.root), kind).toEqual(lanesBefore);
+      if (kind === 'job') expect(git(repo.path, ['branch', '--list', `gru/${job.id}`])).toBe('');
     }
     // A child lane.
     const f = await parentFixture('custody-undurable');

@@ -435,27 +435,31 @@ export function beginLaneHandoff(lane: Pick<WorktreeLane, 'id' | 'kind' | 'repoP
   // can — before the temporary name is removed, so no cleanup failure skips
   // it. A failure here comes after publication and is named so; the caller
   // rolls the unregistered lane back, receipt and all.
-  let undurable: unknown = null;
+  let unsynced: unknown = null;
+  let unclosed: unknown = null;
   try {
     const dirFd = openSync(admin, 'r');
-    // A close failure never replaces the sync failure it follows.
-    try { durably(dirFd); } catch (error) { undurable = error; }
-    try { closeSync(dirFd); } catch (error) { undurable ??= error; }
+    try { durably(dirFd); } catch (error) { unsynced = error; }
+    try { closeSync(dirFd); } catch (error) { unclosed = error; }
   } catch (error) {
-    undurable = error;
+    unsynced = error;
   }
+  // A close failure alone is a failure to make it durable; after a sync
+  // failure it never replaces that reason, but travels with it.
+  const undurable = unsynced ?? unclosed;
   if (undurable === null) {
     removeTemp(null);
     return;
   }
+  const cause = unsynced !== null && unclosed !== null ? new AggregateError([unsynced, unclosed], 'the directory sync and its close both failed') : undurable;
   const notDurable = `lane administration ${admin} published its handoff receipt but could not make it durable (${errnoOf(undurable)})`;
   try { unlinkSync(temp); } catch (cleanupError) {
     if (errnoOf(cleanupError) !== 'ENOENT') {
       throw new Error(`${notDurable}, and its temporary receipt ${temp} could not be removed (${errnoOf(cleanupError)})`,
-        { cause: new AggregateError([undurable, cleanupError], 'handoff receipt durability and its cleanup failed') });
+        { cause: new AggregateError([cause, cleanupError], 'handoff receipt durability and its cleanup failed') });
     }
   }
-  throw new Error(notDurable, { cause: undurable });
+  throw new Error(notDurable, { cause });
 }
 
 export function assertPendingLaneHandoff(lane: WorktreeRecord, admin: string, token: string): Receipt {
