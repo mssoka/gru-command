@@ -1,3 +1,8 @@
+import { execFile, execFileSync } from 'node:child_process';
+import { appendFileSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { assertRestartRecoveryBaseline, BaselineRecoveryGateError } from '../tools/assert-restart-recovery-baseline.mjs';
 
@@ -42,5 +47,68 @@ describe('restart recovery baseline assertion classifier', () => {
     expect(() => assertRestartRecoveryBaseline({ ...report(), numFailedTests: 0, numPassedTests: 1 }, input)).toThrow(BaselineRecoveryGateError);
     expect(() => assertRestartRecoveryBaseline(null, input)).toThrow(BaselineRecoveryGateError);
     expect(() => assertRestartRecoveryBaseline({ ...report(), testResults: [] }, input)).toThrow(BaselineRecoveryGateError);
+  });
+});
+
+// Stands in for the driver's two children (#363 S09-2-02): the RPC
+// prerequisite passes; the Vitest probe moves the final authority as the mode
+// says, then fails at the exact admission assertion the driver extracted.
+const PROBE_PRELOAD = `
+import { execFileSync } from 'node:child_process';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+const entry = process.argv[1] ?? '';
+if (entry.endsWith('patch-vitest-rpc-timeout.mjs')) process.exit(0);
+if (entry.endsWith('vitest.mjs')) {
+  const repo = process.env.GRU_BASELINE_FIXTURE_REPO;
+  const mode = process.env.GRU_BASELINE_FIXTURE_MODE;
+  if (mode === 'head') execFileSync('git', ['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-q', '--allow-empty', '-m', 'moved'], { cwd: repo });
+  if (mode === 'dirty') writeFileSync(join(repo, 'stray.txt'), 'x\\n');
+  const { testName, assertionLine } = JSON.parse(readFileSync(join(process.cwd(), '..', 'manifest.json'), 'utf8'));
+  const message = 'AssertionError: expected [] to have a length of 1 but got +0\\n at ' + process.cwd() + '/test/pi-adapter.test.ts:' + assertionLine + ':24';
+  const out = process.argv.find((arg) => arg.startsWith('--outputFile.json=')).slice('--outputFile.json='.length);
+  writeFileSync(out, JSON.stringify({ numFailedTests: 1, numPassedTests: 0, testResults: [{ message: '', assertionResults: [{ title: testName, status: 'failed', failureMessages: [message] }] }] }));
+  process.stdout.write('FAIL ' + testName + '\\n' + message + '\\n');
+  process.exit(1);
+}
+`;
+
+interface DriverRun { readonly exitCode: number | null; readonly manifest: { readonly classification: string; readonly error?: string } }
+
+/** The real driver, run as its scope runs it, in a disposable clone of this checkout's HEAD. */
+async function driveBaseline(mode: 'none' | 'head' | 'dirty'): Promise<DriverRun> {
+  const root = join(import.meta.dirname, '..');
+  const dir = mkdtempSync(join(tmpdir(), `gru-baseline-authority-${mode}-`));
+  try {
+    const clone = join(dir, 'repo');
+    const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
+    execFileSync('git', ['clone', '-q', '--shared', '--no-checkout', root, clone]);
+    execFileSync('git', ['checkout', '-q', '--detach', head], { cwd: clone });
+    symlinkSync(join(root, 'node_modules'), join(clone, 'node_modules'), 'dir');
+    appendFileSync(join(clone, '.git', 'info', 'exclude'), '/node_modules\n');
+    const preload = join(dir, 'probe-preload.mjs');
+    writeFileSync(preload, PROBE_PRELOAD);
+    const exitCode = await new Promise<number | null>((resolve) => {
+      const child = execFile(process.execPath, [join(root, 'tools', 'verify-restart-recovery-baseline.mjs')], {
+        cwd: clone, timeout: 120_000, maxBuffer: 64 * 1024 * 1024,
+        env: { ...process.env, NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`, GRU_BASELINE_FIXTURE_MODE: mode, GRU_BASELINE_FIXTURE_REPO: clone },
+      }, () => resolve(child.exitCode));
+    });
+    const attempts = join(clone, '_bmad-output', 'verification', 'gh-286-baseline', head);
+    const [attempt] = existsSync(attempts) ? readdirSync(attempts) : [];
+    if (attempt === undefined) throw new Error(`the driver (${mode}) left no attempt, exit ${String(exitCode)}`);
+    return { exitCode, manifest: JSON.parse(readFileSync(join(attempts, attempt, 'manifest.json'), 'utf8')) as DriverRun['manifest'] };
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+describe('restart recovery baseline driver final authority (#363 S09-2-02)', () => {
+  it('a valid probe is attested only while HEAD and a clean tree hold; either changing under the child refuses it (exit 2)', async () => {
+    const [held, moved, dirtied] = await Promise.all([driveBaseline('none'), driveBaseline('head'), driveBaseline('dirty')]);
+    expect(held).toMatchObject({ exitCode: 1, manifest: { classification: 'baseline-assertion-red' } });
+    for (const refused of [moved, dirtied]) {
+      expect(refused.exitCode).toBe(2);
+      expect(refused.manifest.classification).toBe('invalid-baseline-proof');
+      expect(refused.manifest.error).toContain('final authority changed during baseline probe');
+    }
   });
 });

@@ -390,7 +390,7 @@ describe('SessionStore', () => {
     store.acquireLock(other);
     const release = store.releaseLock.bind(store);
     const spy = vi.spyOn(store, 'releaseLock').mockImplementation((file: string) => {
-      if (file === contested) throw new SessionLockCoordinationError(`coordination contention on ${file}`);
+      if (file === contested) throw new SessionLockCoordinationError(file, new Error('coordination contention'));
       release(file);
     });
     let thrown: unknown = null;
