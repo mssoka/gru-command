@@ -941,14 +941,19 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       await run;
     } finally { spy.mockRestore(); }
     const [only] = failures;
-    if (failures.length === 1 && only !== undefined) throw new Error(`fixture: ${only.where} failed at ${crashPoint}: ${String(only.error)}`, { cause: only.error });
+    // The failure's own text, whatever it is — never a second throw while reporting it.
+    const textOf = (error: unknown): string => {
+      if (error instanceof Error) return error.message;
+      try { return JSON.stringify(error) ?? String(error); } catch { return Object.prototype.toString.call(error); }
+    };
+    if (failures.length === 1 && only !== undefined) throw new Error(`fixture: ${only.where} failed at ${crashPoint}: ${textOf(only.error)}`, { cause: only.error });
     if (failures.length > 1) {
       const where = failures.map((failure) => failure.where).join(', ');
       throw new AggregateError(failures.map((failure) => failure.error), `fixture: failures at ${crashPoint} (${where})`);
     }
     if (crashPoint === 'after-registration' && !registered) throw new Error(`fixture: the spawned registration of "${SPAWNED_MINION}" was never reached (did the spawn register another id?)`);
-    // The run went on to completion (inside the spawn, after its release): the
-    // spawned minion registered exactly once.
+    // Either way the run went on to completion (the inside-spawn run once its
+    // gate was released): the spawned minion registered exactly once.
     expect(registrations, `${crashPoint}: registrations of ${SPAWNED_MINION}`).toBe(1);
     if (snapshot === null) throw new Error(crashPoint === 'after-registration' ? 'fixture: no admission boundary followed the spawned registration' : 'fixture: no snapshot inside the spawn');
     // The windows differ by what the executor had done when the snapshot was
