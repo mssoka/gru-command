@@ -334,6 +334,23 @@ describe('child lane parent custody, called directly (#373)', () => {
         const ref = join(realpathSync(join(f.repo.path, '.git')), 'refs', 'heads', f.parent.branch!);
         rmSync(ref); mkdirSync(ref);
       }, () => /writer branch ref .* is unreadable \(handoff metadata is not a regular file\)/u],
+      ['writer branch ref through a link', (f) => {
+        const ref = join(realpathSync(join(f.repo.path, '.git')), 'refs', 'heads', f.parent.branch!);
+        const elsewhere = join(directory(), 'ref'); writeFileSync(elsewhere, readFileSync(ref)); rmSync(ref); symlinkSync(elsewhere, ref);
+      }, () => /writer branch is not direct/u],
+      ['writer branch ref junk', (f) => {
+        writeFileSync(join(realpathSync(join(f.repo.path, '.git')), 'refs', 'heads', f.parent.branch!), 'junk\n');
+      }, () => /writer branch is not direct/u],
+      ['packed refs unreadable', (f) => {
+        const common = realpathSync(join(f.repo.path, '.git'));
+        rmSync(join(common, 'refs', 'heads', f.parent.branch!)); rmSync(join(common, 'packed-refs'), { force: true }); mkdirSync(join(common, 'packed-refs'));
+      }, () => /packed refs .*packed-refs is unreadable \(handoff metadata is not a regular file\)/u],
+      ['no writer ref at all', (f) => {
+        const common = realpathSync(join(f.repo.path, '.git'));
+        rmSync(join(common, 'refs', 'heads', f.parent.branch!)); rmSync(join(common, 'packed-refs'), { force: true });
+      }, (f) => new RegExp(`writer branch ${escape(f.parent.branch!)} has neither a loose ref nor a packed-refs file`, 'u')],
+      ['gitdir file holding a NUL', (f) => { writeFileSync(join(f.admin, 'gitdir'), `${join(f.parent.path, '.git')}\0\n`); },
+        (f) => new RegExp(`lane administration ${escape(f.admin)} has a gitdir file holding a NUL byte`, 'u')],
       ['HEAD removed', (f) => { rmSync(join(f.admin, 'HEAD')); },
         (f) => new RegExp(`lane administration ${escape(f.admin)} has an unreadable HEAD file \\(ENOENT\\)`, 'u')],
       ['receipt removed', (f) => { rmSync(join(f.admin, 'gru-creation-handoff.json')); },
@@ -352,6 +369,8 @@ describe('child lane parent custody, called directly (#373)', () => {
       const error = await f.createChild().then(() => null, (cause: unknown) => cause);
       expect(error, label).toBeInstanceOf(handoffProof.WorktreeHandoffUnresolvedError);
       expect(reasonsOf(error), label).toMatch(reason(f));
+      // Git itself cannot list branches past a packed-refs directory: restore it first.
+      if (label === 'packed refs unreadable') rmSync(join(realpathSync(join(f.repo.path, '.git')), 'packed-refs'), { recursive: true });
       f.childLeftNothing();
       expect(f.h.ledger.getWorktree(f.parent.id)?.status, label).toBe('active');
     }
@@ -379,11 +398,10 @@ describe('child lane parent custody, called directly (#373)', () => {
       .toThrow(`lane administration ${f.admin} cannot take a handoff receipt (EEXIST) and its temporary receipt ${temp} could not be removed (EBUSY)`);
     fsHooks.beforeUnlink = null;
     rmSync(temp);
-    // A write that fails partway still removes what it created.
+    // A write that fails partway (the exclusive open made the file) still removes it.
     fsHooks.beforeWrite = (path) => {
-      if (path !== temp) return;
+      if (!/^\d+$/u.test(path)) return;
       fsHooks.beforeWrite = null;
-      writeFileSync(temp, '{"partial');
       throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
     };
     expect(() => handoffProof.beginLaneHandoff(f.parent, f.admin, token)).toThrow(`lane administration ${f.admin} cannot take a handoff receipt (ENOSPC)`);

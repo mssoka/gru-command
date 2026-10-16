@@ -185,6 +185,11 @@ function entryKind(path: string): EntryKind {
   }
 }
 
+/** Whether `path` is a symbolic link (dangling or not) — never a raw error. */
+function isLink(path: string): boolean {
+  try { return lstatSync(path).isSymbolicLink(); } catch { return false; }
+}
+
 /** Why `dir` is not a full git directory (HEAD file, objects and refs
  * directories, each followed as git follows them), or null when it is. */
 function gitDirectoryProblem(dir: string): string | null {
@@ -306,7 +311,8 @@ function adminBackPointer(admin: string): string {
   // nothing.
   const named = adminFile(admin, 'gitdir').trimEnd();
   if (named === '') throw new Error(`lane administration ${admin} has an empty gitdir file`);
-  if (/[\0\r\n]/u.test(named)) throw new Error(`lane administration ${admin} has a gitdir file of more than one line — not one git writes`);
+  if (named.includes('\0')) throw new Error(`lane administration ${admin} has a gitdir file holding a NUL byte — not one git writes`);
+  if (/[\r\n]/u.test(named)) throw new Error(`lane administration ${admin} has a gitdir file of more than one line — not one git writes`);
   return resolvedPath(`lane administration ${admin}'s checkout git file`, resolve(admin, named));
 }
 
@@ -345,11 +351,18 @@ function validate(receipt: Receipt, lane: WorktreeLane): void {
   } else {
     if (head !== `ref: refs/heads/${lane.branch}`) throw new Error('writer handoff attachment changed');
     const ref = join(common, 'refs', 'heads', lane.branch);
-    if (existsSync(ref)) {
-      const text = namedMetadata(ref, 'writer branch ref', undefined).trim();
-      if (resolvedPath('writer branch ref', ref) !== ref || !/^[0-9a-f]{40,64}$/u.test(text) || text.length !== lane.sha.length) throw new Error('writer branch is not direct');
+    // Present as anything at all (a dangling link included) is a loose ref,
+    // judged as one; only true absence falls back to packed refs.
+    const loose = entryKind(ref) !== 'absent' || isLink(ref);
+    if (loose) {
+      // Direct first — a ref reached through a link is never read.
+      if (resolvedPath('writer branch ref', ref) !== ref) throw new Error('writer branch is not direct');
+      const text = namedMetadata(ref, 'writer branch ref').trim();
+      if (!/^[0-9a-f]{40,64}$/u.test(text) || text.length !== lane.sha.length) throw new Error('writer branch is not direct');
     } else {
-      const packed = namedMetadata(join(common, 'packed-refs'), 'packed refs', 16 * 1024 * 1024);
+      const packedFile = join(common, 'packed-refs');
+      if (entryKind(packedFile) === 'absent') throw new Error(`writer branch ${lane.branch} has neither a loose ref nor a packed-refs file`);
+      const packed = namedMetadata(packedFile, 'packed refs', 16 * 1024 * 1024);
       if (packed.split('\n').some((line) => line.startsWith('^') && !/^\^[0-9a-f]{40,64}$/u.test(line))) throw new Error('malformed peeled ref metadata');
       const lines = packed.split('\n').filter((line) => line !== '' && !line.startsWith('#') && !line.startsWith('^'));
       if (lines.some((line) => !/^[0-9a-f]{40,64} refs\//u.test(line))) throw new Error('malformed packed ref metadata');
@@ -376,15 +389,12 @@ export function beginLaneHandoff(lane: Pick<WorktreeLane, 'id' | 'kind' | 'repoP
         { cause: failure === null ? cleanupError : new AggregateError([failure, cleanupError], 'handoff receipt and its cleanup failed') });
     }
   };
+  // Ours exactly when the exclusive open succeeded: nothing else is ever removed.
   let ours = false;
   try {
-    try {
-      writeFileSync(temp, JSON.stringify(receipt), { flag: 'wx' });
-      ours = true;
-    } catch (writeError) {
-      ours = errnoOf(writeError) !== 'EEXIST';
-      throw writeError;
-    }
+    const fd = openSync(temp, 'wx');
+    ours = true;
+    try { writeFileSync(fd, JSON.stringify(receipt)); } finally { closeSync(fd); }
     linkSync(temp, file); // atomic publication, never overwrite a foreign receipt
   } catch (error) {
     if (ours) removeTemp(error);
