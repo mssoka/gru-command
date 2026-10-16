@@ -120,8 +120,18 @@ export class DirectiveDispatchDeferredError extends Error {
   constructor(readonly original: unknown) { super(`pre-native directive deferred: ${String(original)}`); this.name = 'DirectiveDispatchDeferredError'; }
 }
 
+/** A caller broke the routing contract (a programming error), refused
+ * before any effect. It does not extend DirectiveDispatchDeferredError, so
+ * an executor never records it as a deferral; the fix is in the calling
+ * code, not a retry. */
+export class DirectiveRoutingContractError extends Error {
+  constructor(message: string) { super(message); this.name = 'DirectiveRoutingContractError'; }
+}
+
 /** Route a directive to the implementing minion: the live job minion
- * first; otherwise a fresh minion on the job lane. */
+ * first; otherwise a fresh minion on the job lane. Throws
+ * DirectiveRoutingContractError when a native directive turn arrives
+ * without onPrepared. */
 export async function routeFixDirectiveToMinion(
   input: DirectiveRoutingDeps & {
     jobId: string;
@@ -165,6 +175,12 @@ export async function routeFixDirectiveToMinion(
    * single-writer guard on this evidence alone. */
   admission?: 'none' | 'unknown';
 }> {
+  // A native directive turn is admitted only with its target and producer
+  // start committed first (#362): without onPrepared nothing would commit
+  // them before the prompt, so the route refuses before any effect.
+  if (input.directiveTurn !== undefined && input.onPrepared === undefined) {
+    throw new DirectiveRoutingContractError(`job "${input.jobId}": a native directive turn needs onPrepared — its target and producer start must commit before the prompt`);
+  }
   const disposeAndRecord = async (handle: AgentHandle, viaRegistry = false): Promise<void> => {
     const failures: unknown[] = [];
     try { await (viaRegistry ? input.registry.disposeHandle(handle) : handle.dispose()); } catch (error) { failures.push(error); }
