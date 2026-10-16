@@ -2,7 +2,9 @@
  * unassigned code point: the characters that can break, reorder or hide a
  * rendered line — the same classes silas_action text refuses. */
 const LINE_UNSAFE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Co}\p{Cn}]/gu;
-const LINE_UNSAFE_ANY = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Co}\p{Cn}]/u;
+/** ...and a lone surrogate, which is no text at all (JSON.stringify
+ * escapes it in the literal). */
+const LINE_UNSAFE_ANY = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Co}\p{Cn}\p{Cs}]/u;
 
 /** Text as one JSON literal with every line-unsafe character `\uXXXX`-escaped
  * (JSON.stringify alone escapes only C0 controls and lone surrogates). */

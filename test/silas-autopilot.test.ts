@@ -506,6 +506,10 @@ describe('autopilot mode resolution (kill switch + per-family modes)', () => {
     expect(() => canonicalJson({ list: throwingLength })).toThrow(/^canonicalJson: the value at "list" cannot be read$/u);
     const oddLength = new Proxy([1], { get: (target, key) => (key === 'length' ? { valueOf: () => { throw new Error('no'); } } : Reflect.get(target, key) as unknown) });
     expect(() => canonicalJson({ list: oddLength })).toThrow(/^canonicalJson: the value at "list" cannot be read$/u);
+    for (const length of [Number.NaN, -1, 1.5, 2 ** 53]) {
+      const counted = new Proxy([1], { get: (target, key) => (key === 'length' ? length : Reflect.get(target, key) as unknown) });
+      expect(() => canonicalJson({ list: counted }), String(length)).toThrow(/^canonicalJson: the value at "list" cannot be read$/u);
+    }
     const revocable = Proxy.revocable([1], {});
     revocable.revoke();
     expect(() => canonicalJson({ gone: revocable.proxy })).toThrow(/^canonicalJson: the value at "gone" cannot be read$/u);

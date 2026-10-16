@@ -778,9 +778,8 @@ export function canonicalJson(value: unknown): string {
     const node = resolved;
     ancestors.add(node);
     try {
-      let isArray: boolean;
-      try { isArray = Array.isArray(node); } catch (error) { throw unreadable(key, error); }
-      if (isArray) {
+      // A revoked proxy never gets here: its toJSON read above is refused.
+      if (Array.isArray(node)) {
         let length: unknown;
         try { length = (node as unknown[]).length; } catch (error) { throw unreadable(key, error); }
         // A proxied array can answer any length: only a whole count is one.

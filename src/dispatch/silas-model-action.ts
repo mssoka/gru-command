@@ -233,12 +233,20 @@ export function spawnSilasWithActionTool(
     callerTools.push(tool as NativeAgentTool);
     names.push(name);
   }
-  // The other options, each read once (nativeTools never again): one that
-  // cannot be read is refused, never a raw synchronous throw.
-  const rest: Record<string, unknown> = {};
+  // The other options, copied as a spread copies them (every own enumerable
+  // key, symbols and an own `__proto__` included), each read once and
+  // nativeTools never again: one that cannot be read is refused by name,
+  // never a raw synchronous throw.
+  const rest: Record<PropertyKey, unknown> = {};
+  let reading: PropertyKey = '';
   try {
-    for (const key of Object.keys(spawnOptions ?? {})) if (key !== 'nativeTools') rest[key] = (spawnOptions as Record<string, unknown>)[key];
-  } catch (error) { return Promise.reject(new TypeError('spawn options cannot be read', { cause: error })); }
+    const source = (spawnOptions ?? {}) as Record<PropertyKey, unknown>;
+    for (const key of Reflect.ownKeys(source)) {
+      reading = key;
+      if (key === 'nativeTools' || Object.getOwnPropertyDescriptor(source, key)?.enumerable !== true) continue;
+      Object.defineProperty(rest, key, { value: source[key], enumerable: true, writable: true, configurable: true });
+    }
+  } catch (error) { return Promise.reject(new TypeError(`spawn option ${String(reading)} cannot be read`, { cause: error })); }
   if (names.includes(SILAS_MODEL_ACTION_TOOL)) {
     return Promise.reject(new Error(
       `the Silas spawn already carries a ${SILAS_MODEL_ACTION_TOOL} tool — each spawn binds its own; pass spawn options without it`,
