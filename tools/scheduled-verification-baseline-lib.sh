@@ -140,21 +140,27 @@ try {
   clearTimeout(timer);
   // Whatever the load left running goes with it.
   killGroup();
-  let stdout = null;
-  try { stdout = readFileSync(join(dir, 'stdout'), 'utf8'); } catch (error) {
-    couldNotRun = true;
-    failure = `the helper's load output could not be read: ${error instanceof Error ? error.message : String(error)}`;
-  }
-  if (stdout === null) { /* nothing judged */ }
-  else if (timedOut) failure = `the helper did not finish loading within ${String(ms)} ms`;
+  // A hang or a non-zero exit is the verdict whatever the output says; only
+  // the finished-load proof needs the output read.
+  if (timedOut) failure = `the helper did not finish loading within ${String(ms)} ms`;
   else if (code !== 0) failure = `the helper exited ${String(code ?? signal)} while loading`;
-  else if (!stdout.split('\n').includes(sentinel)) failure = 'the helper stopped before it finished loading';
+  else {
+    let stdout = null;
+    try { stdout = readFileSync(join(dir, 'stdout'), 'utf8'); } catch (error) {
+      couldNotRun = true;
+      failure = `the helper's load output could not be read: ${error instanceof Error ? error.message : String(error)}`;
+    }
+    if (stdout !== null && !stdout.split('\n').includes(sentinel)) failure = 'the helper stopped before it finished loading';
+  }
 } catch (error) {
   couldNotRun = true;
   failure = `the helper load could not run: ${error instanceof Error ? error.message : String(error)}`;
 } finally {
-  // A cleanup error never replaces the verdict: a stray directory is the lesser loss.
-  try { rmSync(dir, { recursive: true, force: true }); } catch { /* the verdict stands */ }
+  // A cleanup error never replaces the verdict — a stray directory is the
+  // lesser loss — but it is said.
+  try { rmSync(dir, { recursive: true, force: true }); } catch (error) {
+    console.error(`the helper load directory ${dir} could not be removed: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 // Exit codes of the guard's own (76: the helper is broken; 77: nothing was
 // judged), clear of node's reserved 1–14 and of signal statuses.
