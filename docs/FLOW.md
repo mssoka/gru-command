@@ -488,6 +488,37 @@ verification budget.
   evidence for its captured exact head, not paid-model behavior or native
   Perkins READY. Final integrated/FULL/remote CI acceptance remains separate.
 
+- **Integration rounds retain coverage only under proof, and never stall the
+  final pass (#392, #393, #397).** When the merge base moves under a
+  reviewed candidate, an integration round may retain the prior coverage
+  and review only the integration unit — but only after the engine itself
+  re-proves the lineage (the reviewed head descends into the candidate, the
+  prior base into the new one) and the unit is bounded (at most 4000
+  changed paths, 8 MiB of diff, strict UTF-8 paths; every `git diff --raw`
+  record parsed exactly, with rename detection disabled so a rename/copy,
+  stray, duplicate, unparseable record, or any status other than `A`, `D`,
+  `M` or `T` (such as `U`, `X` or `B`, named with its path), fails closed).
+  Any failed proof reviews the whole change instead, with the reason
+  disclosed as `deltaUnavailable`; an offending path is quoted as a JSON
+  literal of at most 200 UTF-16 code units — quotes, escapes and the `…`
+  marking a cut included. A partial integration READY still owes
+  the final whole-change pass; if the base moves again before that pass
+  runs, the next round reviews whole (whatever the candidate, policy or
+  lineage), so a moving base can never defer approval forever.
+
+- **Fail-before baselines are declared scopes, not hand runs (#394).** A
+  repair's fail-before claim is proved by a declared `[verify]` scope (for
+  this repository, the `perkins-int*-baseline*` scopes in
+  `.gru-command/worktree.toml`) that checks out the uncorrected base, runs
+  only the named regressions with `--reporter=json`, and hands the report to
+  a classifier (`tools/assert-perkins-integration-review-baseline.mjs`).
+  The classifier accepts a RED only when every named regression failed by
+  its OWN assertion — the failure's first line is the matcher failure or
+  rejects/resolves report, raised in a test file — and anything else
+  (setup/import/collection errors, a helper-raised assertion, an unlisted
+  failure, a green baseline) exits 2 as `FAILS-BEFORE CLAIM BROKEN`. A test
+  pins that every classifier leg is wired to such a scope.
+
 Managed repos still own their CI: this endpoint coordinates LOCAL
 verification runs inside lane worktrees — the orchestrator never hosts a
 tenant's CI.

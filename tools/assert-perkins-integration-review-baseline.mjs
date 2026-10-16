@@ -32,7 +32,7 @@
  *           and owner-readiness assertions fail.
  */
 import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { posix, resolve } from 'node:path';
 import process from 'node:process';
 import { pathToFileURL } from 'node:url';
 
@@ -61,12 +61,187 @@ export const BASELINE_TITLES = {
   ],
 };
 
-/** A behavioral RED: a Vitest matcher failure or a rejects/resolves report —
- * never a timeout, import, collection or setup error text. */
+const ASSERTION_HEAD = /^AssertionError: /u;
+const PROMISE_REPORT_HEAD = /^(?:AssertionError|Error): promise (?:resolved|rejected) .* instead of (?:rejecting|resolving)$/u;
+/** A V8 stack frame line (optionally `async`): `at <fn> (<anything>:L:C)`
+ * or `at <fn> (<eval origin, V8 token>)`; a bare `at <absolute path or
+ * URL>:L:C`, a bare `at <relative/path.ext>:L:C`, a bare generated
+ * `at <anonymous>:L:C`; or `at <anonymous>`. ANY parenthesised `…:L:C`
+ * location counts as a frame — relative, spaced or a non-file URL included —
+ * and one the classifier cannot judge refuses: fail closed. Indented prose
+ * that merely looks like one (`at least 3 (see notes.md:1:2)`) therefore
+ * refuses too, and the refusal names that line; the remedy is to rephrase
+ * that assertion message, never to let a helper frame slip by. A bare
+ * `at 12:30:15` (no parentheses, no path) is prose; any other indented
+ * `at …` line ending in a `:line:column` location that the grammar cannot
+ * read (`at stage:1:2`, a spaced relative path) refuses by name. */
+const PATH_START = String.raw`(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/|node:|[A-Za-z]:[\\/]|[\\/])`;
+const BARE_RELATIVE = String.raw`[^\s()]*[/.][^\s()]*:\d+:\d+`;
+/** Runtime-generated code (`new Function`, `vm` scripts) names no file. */
+const GENERATED = String.raw`(?:evalmachine\.)?<anonymous>:\d+:\d+`;
+const STACK_LINE = new RegExp(String.raw`^\s+at (?:async )?(?:\S.* \((?:.*:\d+:\d+|eval at .*|<anonymous>|index \d+|native)\)|${PATH_START}.*:\d+:\d+|${GENERATED}|${BARE_RELATIVE}|<anonymous>)$`, 'u');
+/** An indented line that opens like a frame. Past MAX_FRAME_LINE no line is
+ * matched (bounded work: the frame grammar is quadratic in a line's length)
+ * — and a frame-opening line that long refuses. Real V8 frames are far
+ * shorter. */
+const FRAME_OPENING = /^\s+at \S/u;
+const MAX_FRAME_LINE = 2048;
+/** An indented `at …` line naming a location: one that ends in
+ * `:line:column`, or holds a path-like token — any `.`, `/` or `\\` in it
+ * (fail closed: `notes.v2-final`, `a.7z`, `test\\h` all count) — followed by
+ * `:line` anywhere, with or without a column, closed or not. A bare clock
+ * time, and a version or decimal number (`1.5:1`, `v2.0:3`), are not. Linear
+ * in the line (a frame-opening line is at most MAX_FRAME_LINE long). */
+const PATH_LIKE = (part) => /[./\\]/u.test(part) && !/^v?\d+(?:\.\d+)+$/u.test(part);
+function namesLocation(line) {
+  if (/:\d+:\d+\)?$/u.test(line)) return true;
+  for (const token of line.split(/[\s()]+/u)) {
+    const parts = token.split(':');
+    for (let index = 0; index < parts.length - 1; index += 1) {
+      if (PATH_LIKE(parts[index]) && /^\d/u.test(parts[index + 1])) return true;
+    }
+  }
+  return false;
+}
+const CLOCK_PROSE = /^\s+at \d+(?::\d+)+$/u;
+/** A line as the grammar judges it: trailing whitespace dropped, and any run
+ * of blanks after `at` read as one — layout never hides a frame. */
+const frameText = (line) => line.trimEnd().replace(/^(\s+at)\s+/u, '$1 ');
+/** Lines end at any line terminator a rendered message can carry —
+ * vertical tab, form feed and NEL included. */
+const LINE_BREAK = /\r\n|[\n\v\f\r\u0085\u2028\u2029]/u;
+/** Report text quoted in a refusal: a JSON literal of at most QUOTE_POINTS
+ * code points (never a split surrogate pair), marked when cut — read from a
+ * bounded prefix, so a huge line costs no more than a short one. */
+const QUOTE_POINTS = 160;
+const quoted = (text) => {
+  const points = [...text.slice(0, QUOTE_POINTS * 2 + 1)];
+  return `${JSON.stringify(points.slice(0, QUOTE_POINTS).join(''))}${points.length > QUOTE_POINTS ? '…' : ''}`;
+};
+const LOCATION = /^([A-Za-z][A-Za-z0-9+.-]*:\/\/)?(.+):\d+:\d+$/u;
+/** A V8 token frame names no source location by design. */
+const TOKEN_FRAME = /^(?:<anonymous>|index \d+|native)$/u;
+const GENERATED_LOCATION = new RegExp(`^${GENERATED}$`, 'u');
+/** A location as the absolute path it names, or undefined when it names
+ * none it can be judged by. A file:// URL is decoded (an encoded
+ * `test%2Fhelpers` is judged as the path it names) after its query or
+ * fragment is stripped (a vite `?t=` stamp; a literal `?` or `#` in a file
+ * name is percent-encoded in a URL), and given back its drive letter. A
+ * plain path keeps every character (`?` and `#` are legal in file names).
+ * Both are normalised with `/` separators and `..` resolved. Any other
+ * scheme, a relative path or an undecodable URL is undefined. */
+function located(match) {
+  if (match === null) return undefined;
+  // Runtime-internal frames keep their scheme: they are machinery.
+  if (match[1] === undefined && match[2].startsWith('node:')) return match[2];
+  let path;
+  if (match[1] === undefined) {
+    path = match[2];
+  } else if (match[1].toLowerCase() === 'file://') {
+    try { path = decodeURIComponent(match[2].replace(/[?#].*$/u, '')); } catch { return undefined; }
+    if (/^\/[A-Za-z]:\//u.test(path)) path = path.slice(1);
+  } else {
+    return undefined;
+  }
+  path = path.replaceAll('\\', '/');
+  if (!path.startsWith('/') && !/^[A-Za-z]:\//u.test(path)) return undefined;
+  return posix.normalize(path);
+}
+/** The parenthesised text after `start` up to its BALANCED close, or null. */
+function balancedFrom(text, start) {
+  let depth = 0;
+  for (let index = start; index < text.length; index += 1) {
+    if (text[index] === '(') depth += 1;
+    else if (text[index] === ')') {
+      depth -= 1;
+      if (depth === 0) return text.slice(start + 1, index);
+    }
+  }
+  return null;
+}
+/** The source location a frame names: the absolute path, `null` for a V8
+ * token frame that names none (`<anonymous>`, `index 0`, `native`), or
+ * undefined when the frame names a location that cannot be judged — the
+ * caller refuses on that, never skips it. Paths may contain spaces,
+ * parentheses and colons: a framed location is the first balanced ` (…)`
+ * group that yields one, so `fn (/repo/a (copy)/x.ts:1:2)` and
+ * `/repo/a (copy).test.ts:1:2` both resolve to their full path. An `eval`
+ * frame names the location of the code that called eval — the innermost
+ * origin when evals nest, whatever the origin function is called. */
+export function frameLocation(line) {
+  const body = line.replace(/^\s+at /u, '').replace(/^async /u, '');
+  if (TOKEN_FRAME.test(body) || GENERATED_LOCATION.test(body)) return null;
+  // An eval frame by the frame grammar — `eval at <origin>`, or `<fn> (eval
+  // at <origin>…)` with `<fn>` one name, optionally `new `-prefixed (an
+  // `async ` prefix is already stripped above) or `[as …]`-aliased — never a
+  // path that merely contains the text.
+  const innermostEval = /^(?:eval at |(?:new )?[^\s(]+(?: \[as [^\]]+\])? \(eval at )/u.test(body) ? body.lastIndexOf('eval at ') : -1;
+  if (innermostEval !== -1) {
+    const origin = body.slice(innermostEval + 'eval at '.length);
+    for (let index = origin.indexOf(' ('); index !== -1; index = origin.indexOf(' (', index + 1)) {
+      const inner = balancedFrom(origin, index + 1);
+      const location = inner === null ? undefined : located(LOCATION.exec(inner));
+      if (location !== undefined) return location;
+    }
+    return undefined;
+  }
+  if (body.endsWith(')')) {
+    for (let index = body.indexOf(' ('); index !== -1; index = body.indexOf(' (', index + 1)) {
+      const inner = body.slice(index + 2, -1);
+      if (TOKEN_FRAME.test(inner) || GENERATED_LOCATION.test(inner)) return null;
+      const location = located(LOCATION.exec(inner));
+      if (location !== undefined) return location;
+    }
+    return undefined;
+  }
+  return located(LOCATION.exec(body));
+}
+/** Runtime and assertion-machinery frames sit between a matcher and its
+ * caller; they never decide who raised the assertion. */
+const MACHINERY_FRAME = /^node:|\/node_modules\/(?:@vitest\/|vitest\/|chai\/|tinyspy\/|@jest\/expect)/u;
+
+/** A behavioral RED: the failure's OWN first line is a Vitest matcher
+ * failure or a rejects/resolves report — never a timeout, import,
+ * collection or setup error that merely embeds that text (#394). When the
+ * message carries a stack, its first non-machinery frame must be a test
+ * file: an assertion inside a shared helper module (test/helpers/…) or a
+ * dependency is setup, not the named regression's claim, and a stack nothing
+ * in which can be located is refused. */
 export function isBehavioralAssertion(message) {
-  return message.includes('AssertionError:') ||
-    message.includes('instead of rejecting') ||
-    message.includes('instead of resolving');
+  return behavioralRefusal(message) === null;
+}
+
+/** Why a failure message is no behavioral RED, or null when it is one (the
+ * reason names the line that decided, so a refusal is actionable). */
+export function behavioralRefusal(message) {
+  if (typeof message !== 'string') return 'the failure message is not text';
+  const [head = '', ...rest] = message.split(LINE_BREAK);
+  if (!ASSERTION_HEAD.test(head) && !PROMISE_REPORT_HEAD.test(head)) return `its first line is no assertion or rejects/resolves report: ${quoted(head)}`;
+  // Lines are judged in order, up to the deciding frame: the first frame
+  // outside the runtime and assertion machinery decides. Token frames name
+  // nothing and are passed over; before the deciding frame, a frame-opening
+  // line too long to judge, or a frame (or located `at …` line) whose
+  // location cannot be judged, refuses — as does a stack that is all tokens
+  // or all machinery: never an open door for a helper-raised assertion
+  // (#394). Lines after the deciding frame are its callers, never the
+  // raiser: they are not judged at all.
+  let sawFrame = false;
+  for (const raw of rest) {
+    const line = frameText(raw);
+    if (!FRAME_OPENING.test(line)) continue;
+    if (line.length > MAX_FRAME_LINE) return `a frame-opening line is longer than ${String(MAX_FRAME_LINE)} characters: ${quoted(line)}`;
+    const readable = STACK_LINE.test(line);
+    if (!readable && (!namesLocation(line) || CLOCK_PROSE.test(line))) continue;
+    sawFrame = true;
+    const file = readable ? frameLocation(line) : undefined;
+    if (file === null) continue;
+    if (file === undefined) return `a frame names a location that cannot be judged (rephrase prose shaped like a frame): ${quoted(line.trim())}`;
+    if (MACHINERY_FRAME.test(file)) continue;
+    const testFile = /\.test\.[cm]?[jt]s$/u.test(file) && !file.includes('/node_modules/') && !file.includes('/test/helpers/');
+    return testFile ? null : `the assertion was raised outside a test file, in ${JSON.stringify(file)}`;
+  }
+  // A report without any stack frames is judged by its head alone.
+  return sawFrame ? 'its stack names only runtime, machinery or generated frames' : null;
 }
 
 /**
@@ -129,9 +304,9 @@ export function assertPerkinsIntegrationBaseline(leg, report) {
         `"${title}" carries ${String(messages.length)} failure message(s); exactly one assertion failure is before-proof evidence`,
       );
     }
-    const message = messages[0];
-    if (typeof message !== 'string' || !isBehavioralAssertion(message)) {
-      throw new Error(`"${title}" failed before its assertion; setup/import failure is not RED evidence`);
+    const refusal = behavioralRefusal(messages[0]);
+    if (refusal !== null) {
+      throw new Error(`"${title}" failed before its assertion; setup/import failure is not RED evidence (${refusal})`);
     }
   }
   return expected;

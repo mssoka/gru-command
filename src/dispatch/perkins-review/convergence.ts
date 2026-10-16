@@ -373,7 +373,7 @@ export interface IntegrationDelta extends DeltaSince {
   readonly droppedFeaturePaths: readonly string[];
 }
 
-interface RawChange {
+export interface RawChange {
   readonly oldMode: string;
   readonly newMode: string;
   readonly oldSha: string;
@@ -383,8 +383,9 @@ interface RawChange {
 /** Per-path blob pair and modes of a `git diff --raw -z --no-renames
  * --abbrev=40` change set. The NUL-delimited form needs no C-unquote
  * decoding; a path that does not decode as UTF-8 refuses (the caller falls
- * back to a whole review). Modes are kept so a mode-only change is not lost. */
-function rawChanges(repoPath: string, fromSha: string, toSha: string): Map<string, RawChange> {
+ * back to a whole review). Modes are kept so a mode-only change is not lost.
+ * Exported for the real-git `--no-renames` pin in the guard tests. */
+export function rawChanges(repoPath: string, fromSha: string, toSha: string): Map<string, RawChange> {
   let bytes: Buffer;
   try {
     bytes = execFileSync('git', ['-C', repoPath, 'diff', '--raw', '-z', '--no-ext-diff', '--no-renames', '--abbrev=40', fromSha, toSha, '--'], {
@@ -393,6 +394,38 @@ function rawChanges(repoPath: string, fromSha: string, toSha: string): Map<strin
   } catch (error) {
     throw new Error(`change set ${fromSha.slice(0, 12)}..${toSha.slice(0, 12)} could not be read: ${String(error)}`);
   }
+  return parseRawChanges(bytes);
+}
+
+/** The longest JSON literal of repository text a disclosed reason quotes. */
+export const REASON_EXCERPT_MAX_CHARS = 200;
+/** Repository text quoted into a disclosed fallback reason: a JSON literal of
+ * at most REASON_EXCERPT_MAX_CHARS characters (UTF-16 units, as `.length`
+ * counts them) — quotes, escape expansion and the … that marks a cut all
+ * included — cut on a code-point boundary, so no surrogate pair is split
+ * (exported for the bound tests). */
+export function boundedForReason(text: string): string {
+  const whole = JSON.stringify(text);
+  if (whole.length <= REASON_EXCERPT_MAX_CHARS) return whole;
+  let kept = '';
+  let length = 3; // the quotes and the …
+  for (const point of text) {
+    const piece = JSON.stringify(point).length - 2;
+    if (length + piece > REASON_EXCERPT_MAX_CHARS) break;
+    kept += point; length += piece;
+  }
+  return `${JSON.stringify(kept).slice(0, -1)}…"`;
+}
+
+/** The statuses a commit-to-commit, no-renames diff can carry. */
+const RAW_STATUSES: ReadonlySet<string> = new Set(['A', 'D', 'M', 'T']);
+/** A record header whose status field is a rename or copy, however the rest
+ * of it is malformed: it earns the --no-renames hint. */
+const RENAME_HEADER = /^:\S+ \S+ \S+ \S+ [RC]\d*(?:\s|$)/u;
+
+/** Parse `git diff --raw -z --abbrev=40` bytes (exported for the guard
+ * tests, #393). Every malformed shape refuses so the caller reviews whole. */
+export function parseRawChanges(bytes: Buffer): Map<string, RawChange> {
   // Paths are raw bytes: decode strictly so an invalid UTF-8 path fails
   // closed instead of being silently mangled into a path that matches
   // nothing. A legitimate U+FFFD is valid UTF-8 and is preserved.
@@ -406,17 +439,37 @@ function rawChanges(repoPath: string, fromSha: string, toSha: string): Map<strin
   const fields = output.split('\0');
   for (let index = 0; index < fields.length; index += 1) {
     const header = fields[index]!;
-    if (!header.startsWith(':')) continue;
-    const match = /^:([0-7]{6}) ([0-7]{6}) ([0-9a-f]{40}) ([0-9a-f]{40}) [A-Z]\d*$/u.exec(header);
+    // `-z` output ends with a NUL: only that final empty field is skipped;
+    // any other stray field is unexpected output and fails closed.
+    if (header === '' && index === fields.length - 1) continue;
+    if (!header.startsWith(':')) {
+      throw new Error(`git diff --raw produced an unexpected field outside a record: ${boundedForReason(header)}`);
+    }
+    const match = /^:([0-7]{6}) ([0-7]{6}) ([0-9a-f]{40}) ([0-9a-f]{40}) ([A-Z])\d*$/u.exec(header);
     // A header that starts a raw record but does not parse is unexpected
     // output: fail closed (the caller reviews whole) rather than silently
     // shrink the reviewed unit and the carry scope.
-    if (match === null) throw new Error('git diff --raw produced an unparseable record');
+    if (match === null) {
+      throw new Error(`git diff --raw produced an unparseable record${RENAME_HEADER.test(header) ? ' (it looks like a rename/copy record: rename detection must stay disabled, --no-renames)' : ''}`);
+    }
+    const [, oldMode, newMode, oldSha, newSha, status] = match;
+    if (oldMode === undefined || newMode === undefined || oldSha === undefined || newSha === undefined || status === undefined) {
+      throw new Error('git diff --raw record parser lost a capture group — the header pattern changed');
+    }
+    // Rename/copy records carry TWO paths: the caller disables rename
+    // detection, so one here is unexpected output and fails closed by name.
+    if (status === 'R' || status === 'C') {
+      throw new Error('git diff --raw produced a rename/copy record — rename detection must stay disabled (--no-renames)');
+    }
     const path = fields[index + 1];
     // A missing/empty path field is the same fail-open class: refuse it.
     if (path === undefined || path === '') throw new Error('git diff --raw produced a record with no path');
     index += 1;
-    changes.set(path, { oldMode: match[1]!, newMode: match[2]!, oldSha: match[3]!, newSha: match[4]! });
+    if (!RAW_STATUSES.has(status)) throw new Error(`git diff --raw produced an unexpected status ${JSON.stringify(status)} for ${boundedForReason(path)}`);
+    // One record per path: a repeated path would silently drop a record from
+    // the carry-scope comparison, so it fails closed too.
+    if (changes.has(path)) throw new Error(`git diff --raw produced a duplicate path: ${boundedForReason(path)}`);
+    changes.set(path, { oldMode, newMode, oldSha, newSha });
   }
   return changes;
 }
@@ -712,6 +765,28 @@ export function planReviewScope(input: {
     return { scope: 'whole', reason: 're-review at an unchanged candidate (target and merge base unchanged)', priorCoverageComplete: prior.coverageComplete };
   }
   if (prior.diffBaseSha !== input.currentDiffBaseSha) {
+    // Liveness (#397): a partial-coverage INTEGRATION round that posted READY
+    // owes the final whole-change pass, normally chained at the same
+    // candidate. When the merge base moved again before that pass ran —
+    // whether or not the candidate moved too (an unchanged head adopting the
+    // new base included) — another integration round would retain the same
+    // partial coverage and owe the pass again: a base that keeps moving could
+    // defer it forever and the PR would stall (approval is never credited
+    // without it). So the chain is bounded at one integration round, whatever
+    // the policy or lineage: this round reviews whole, and a whole round
+    // records complete coverage whatever its verdict (pinned in
+    // test/perkins-integration-review.test.ts, "records whole-candidate
+    // coverage even when the whole round requests changes"), so later base
+    // moves retain COMPLETE coverage again.
+    if (input.finalWholePassAtReady && prior.reviewScope === 'integration' && !prior.coverageComplete &&
+      prior.canonicalVerdict === 'READY TO MERGE') {
+      return {
+        scope: 'whole',
+        reason: `merge base moved again while the partial integration READY at ${prior.targetSha.slice(0, 12)} still owes the final ` +
+          'whole-change pass — whole-change re-verification instead of another partial integration round',
+        priorCoverageComplete: false,
+      };
+    }
     const lineage = input.integrationLineage ?? null;
     const integratedForward = prior.targetSha !== input.currentTargetSha &&
       lineage !== null && lineage.baseAdvanced && lineage.featureIntegrated && lineage.commonBasePinned;
