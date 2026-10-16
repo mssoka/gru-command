@@ -388,7 +388,7 @@ describe('Silas corrective verification after exact failure dismissals (GH-302)'
 describe('a historical-only delivery owes a current inspection (#361)', () => {
   /** Approved material corrections, then the job's only delivery: a
    * completion recorded WITHOUT a proven current candidate. */
-  function historicalOnly(ledger: LedgerApi, jobId = 'historical-job', provenFirst = false): void {
+  function historicalOnly(ledger: LedgerApi, jobId = 'historical-job', provenFirst = false): number {
     ledger.addJob({ id: jobId, repo: 'fixture-app', title: 'historical delivery', briefing: 'Ship it.' });
     ledger.setJobStatus(jobId, 'working');
     if (provenFirst) ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: HEAD, work_revision: 0 } });
@@ -397,16 +397,16 @@ describe('a historical-only delivery owes a current inspection (#361)', () => {
         approval: { by: 'owner', reference: `fixture-approval-${revision}` },
         expectedContractSha256: ledger.effectiveContract(jobId)!.contractSha256 }).status).toBe('accepted');
     }
-    ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: null, work_revision: 2, candidate_delivery_proven: false } });
+    return ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: null, work_revision: 2, candidate_delivery_proven: false } }).seq;
   }
 
   it('offers one current-inspection row, and no verification, continuation, PR or review row — review stays fenced', async () => {
     const ledger = fixture();
-    historicalOnly(ledger);
+    const seq = historicalOnly(ledger);
     expect(ledger.latestCandidateDelivery('historical-job')).toBeNull();
     expect(ledger.correctiveVerificationDebt('historical-job')).toEqual({ revision: 2, head: null });
     const result = await digest(ledger);
-    expect(result.currentInspections).toEqual([{ jobId: 'historical-job', repo: 'fixture-app', verificationRevision: 2, requiredRevision: 2 }]);
+    expect(result.currentInspections).toEqual([{ jobId: 'historical-job', repo: 'fixture-app', verificationRevision: 2, requiredRevision: 2, historicalDeliverySeq: seq }]);
     expect([result.verificationsOwed, result.revisionContinuations, result.deliveredWithoutPr, result.prWithoutReview]).toEqual([[], [], [], []]);
     expect(digestActionCount(result)).toBe(1);
     expect(laneIsBusy(ledger, ledger.getJob('historical-job')!)).toBe(true);
@@ -430,6 +430,44 @@ describe('a historical-only delivery owes a current inspection (#361)', () => {
       else ledger.appendCustomEvent({ kind: 'verification.requested', jobId: 'historical-job', payload: { scope: 'full', run_id: 'pending-run', head: HEAD } });
       expect((await digest(ledger)).currentInspections, fence).toEqual([]);
     }
+  });
+
+  it('names each obligation on its own: a plain historical completion owes only the candidate\'s verification', async () => {
+    const ledger = fixture();
+    ledger.addJob({ id: 'plain-job', repo: 'fixture-app', title: 'plain', briefing: 'Ship it.' });
+    ledger.setJobStatus('plain-job', 'working');
+    const seq = ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'plain-job', payload: { sha: null, work_revision: 0, candidate_delivery_proven: false } }).seq;
+    expect((await digest(ledger)).currentInspections).toEqual([{ jobId: 'plain-job', repo: 'fixture-app', verificationRevision: 0, requiredRevision: null, historicalDeliverySeq: seq }]);
+    // A later historical delivery is a new inspection (a new seq, so a new request id).
+    const later = ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'plain-job', payload: { sha: null, work_revision: 0, candidate_delivery_proven: false } }).seq;
+    expect((await digest(ledger)).currentInspections.map((row) => row.historicalDeliverySeq)).toEqual([later]);
+  });
+
+  it('stands aside for a failed verification that owns the job, and is rechecked before the digest is published', async () => {
+    const ledger = fixture();
+    historicalOnly(ledger);
+    completed(ledger, 'historical-job', 'full', 'failed-run');
+    const failing = await digest(ledger);
+    expect(failing.verificationFailures.map((row) => row.jobId)).toEqual(['historical-job']);
+    expect(failing.currentInspections).toEqual([]);
+    // A writer that takes the lane while the digest is being computed retracts the row.
+    const racing = fixture();
+    historicalOnly(racing);
+    racing.addJob({ id: 'review-job', repo: 'fixture-app', title: 'review', briefing: 'b' });
+    racing.setJobStatus('review-job', 'working');
+    racing.setJobStatus('review-job', 'in-review');
+    const round = racing.addRound({ jobId: 'review-job', lenses: ['blind'] });
+    racing.setRoundStatus(round.id, 'live');
+    racing.setRoundStatus(round.id, 'verdict-posted');
+    racing.setRoundVerdict(round.id, 'changes-requested');
+    racing.appendCustomEvent({ kind: 'round.verdict', jobId: 'review-job', roundId: round.id, payload: { verdict: 'changes-requested' } });
+    const result = await computeSilasDigest({ ledger: racing, config: DEFAULT_SILAS_CONFIG, trigger: 'api', now: () => NOW,
+      blockersForRound: async () => {
+        await Promise.resolve();
+        racing.beginDirectiveIntent({ jobId: 'historical-job', directive: 'Deliver the current candidate.', holder: 'fixture' });
+        return { blockers: [], note: null };
+      } });
+    expect(result.currentInspections).toEqual([]);
   });
 
   it('retires once a proven current delivery exists, and never duplicates a row that already owns the job', async () => {

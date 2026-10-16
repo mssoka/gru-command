@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   parseSilasActionRuleId,
+  parseSilasRouteRuleId,
   SILAS_ACTION_RULE_IDS,
   SILAS_RULES,
   SILAS_RULE_IDS,
@@ -99,6 +100,15 @@ describe('the named Silas rule registry (issue #117/g21)', () => {
       .map((match) => match[1] ?? '')
       .filter((id) => !SILAS_RULE_IDS.has(id));
     expect(invented, `skill promises unregistered rules: ${invented.join(', ')}`).toEqual([]);
+  });
+});
+
+describe('the routes the skill sends each rule on (#361)', () => {
+  it('accepts current-inspection on the directive route, and nowhere else', () => {
+    expect(parseSilasRouteRuleId('directive', 'current-inspection')).toBe('current-inspection');
+    for (const route of ['rebrief', 'escalate', 'pr', 'review'] as const) {
+      expect(() => parseSilasRouteRuleId(route, 'current-inspection'), route).toThrow(/does not fire on the/u);
+    }
   });
 });
 

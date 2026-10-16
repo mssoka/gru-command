@@ -596,6 +596,9 @@ export interface CurrentInspectionRow {
   readonly verificationRevision: number | null;
   /** The pending contract revision, or null when none is pending. */
   readonly requiredRevision: number | null;
+  /** The newest (historical) delivery's ledger seq: a later historical
+   * delivery is a new inspection, with its own request id. */
+  readonly historicalDeliverySeq: number;
 }
 
 export interface SilasOpsDigest {
@@ -774,7 +777,7 @@ export function digestRowProjection(category: DigestRowCategory, row: DigestRow)
     }
     case 'currentInspections': {
       const r = row as CurrentInspectionRow;
-      return { jobId: r.jobId, repo: r.repo, verificationRevision: r.verificationRevision, requiredRevision: r.requiredRevision };
+      return { jobId: r.jobId, repo: r.repo, verificationRevision: r.verificationRevision, requiredRevision: r.requiredRevision, historicalDeliverySeq: r.historicalDeliverySeq };
     }
   }
 }
@@ -1282,7 +1285,7 @@ function verificationInFlight(ledger: DigestLedger, jobId: string): boolean {
 function currentInspectionOwed(
   ledger: DigestLedger,
   job: Parameters<typeof pendingWorkRevision>[1],
-): Pick<CurrentInspectionRow, 'verificationRevision' | 'requiredRevision'> | null {
+): Pick<CurrentInspectionRow, 'verificationRevision' | 'requiredRevision' | 'historicalDeliverySeq'> | null {
   const newest = ledger.latestJobEvent(job.id, 'job.delivered');
   if (newest === null) return null;
   const candidate = ledger.latestCandidateDelivery(job.id);
@@ -1290,7 +1293,7 @@ function currentInspectionOwed(
   const debt = ledger.correctiveVerificationDebt(job.id);
   const revision = pendingWorkRevision(ledger, job);
   if (debt === null && revision === null) return null;
-  return { verificationRevision: debt?.revision ?? null, requiredRevision: revision?.required ?? null };
+  return { verificationRevision: debt?.revision ?? null, requiredRevision: revision?.required ?? null, historicalDeliverySeq: newest.seq };
 }
 
 /** The one review-eligible status predicate, shared by candidate intake and
@@ -2162,6 +2165,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
   const liveWriterOwns = (jobId: string): boolean =>
     input.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
     input.ledger.listPendingRebriefs({ jobId }).length > 0;
+  const inspectionYields = new Set([...digest.stalledWorking, ...digest.minionErrors, ...verificationFailures].map((row) => row.jobId));
   return {
     ...digest,
     // Issue #243 original-M2 carry-forward: the publish boundary must not
@@ -2200,6 +2204,9 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       return input.ledger.correctiveVerificationDebt(row.jobId) !== null;
     }),
     currentInspections: digest.currentInspections.filter((row) => {
+      // A stalled lane, a minion error or a failed verification owns the job
+      // with its own action: no competing inspection directive.
+      if (inspectionYields.has(row.jobId)) return false;
       if (!continuationAllowed(row) || !jobSeqUnchanged(row.jobId) || verificationInFlight(input.ledger, row.jobId) ||
           input.ledger.listPendingDirectives({ jobId: row.jobId, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
           input.ledger.listPendingRebriefs({ jobId: row.jobId }).length > 0) return false;

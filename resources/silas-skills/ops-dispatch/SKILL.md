@@ -409,12 +409,16 @@ service enforces the rest — you never decide it from a status:
   `verification_required_head`.
 - **`current-inspection` (owner decision 2026-10-16).** A
   `currentInspections` row (job, the owed verification revision and/or the
-  pending contract revision) means the job's NEWEST delivery is history — a
+  pending contract revision, and the historical delivery's seq) means the
+  job's NEWEST delivery is history — a
   completion recorded without proving a current candidate — while that
   obligation remains. No verification, continuation or review row can name
   its candidate. Inspect the lane's current head read-only, then send ONE
   directive asking the minion to deliver its current candidate:
-  `POST /api/silas/directive {"job_id":"<job>","directive":"Deliver your current candidate ...","blocker_fingerprint":"current-inspection:<job>","rule_id":"current-inspection","request_id":"<stable-id>"}`.
+  `POST /api/silas/directive {"job_id":"<job>","directive":"Deliver your current candidate ...","blocker_fingerprint":"current-inspection:<job>:<seq>","rule_id":"current-inspection","request_id":"current-inspection:<job>:<seq>"}`
+  (one request per historical delivery; a later one is a new inspection). A
+  stalled lane, a minion error or a failed verification on the job takes
+  precedence: no inspection row is offered while one stands.
   The proven delivery then owes the ordinary verification (and any revision
   continuation). If the lane has nothing to deliver, escalate to the chief.
   The row never makes the job review-eligible: review arms stay busy.
