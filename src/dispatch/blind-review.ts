@@ -1,4 +1,6 @@
-import { readFileSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { readFileSync, realpathSync, statSync } from 'node:fs';
+import { resolve } from 'node:path';
 import type { LedgerApi } from '../ledger/api.js';
 import {
   BlindInputRefusal,
@@ -320,6 +322,21 @@ function admittedOf(ledger: LedgerApi, jobId: string): AdmittedPayload | null {
  * admission and the observed-access facts; job status and report
  * disposition are not inputs (settlement is not validity).
  */
+/** What makes two recorded prohibited reads the same read (#355). */
+const BLIND_READ_IDENTITY = {
+  event: ['source', 'session'],
+  entry: ['index', 'toolName', 'code', 'path', 'excerptSha256'],
+} as const;
+
+/** A transcript's identity for distinct-read counting: the sha256 of its
+ * canonical path, so a symlinked or relative spelling of the same file is
+ * the same session, and the ledger never stores the local path itself. */
+export function blindSessionIdentity(sessionFile: string): string {
+  let canonical: string;
+  try { canonical = realpathSync(sessionFile); } catch { canonical = resolve(sessionFile); }
+  return createHash('sha256').update(canonical).digest('hex');
+}
+
 export function blindCoverageOf(ledger: LedgerApi, jobId: string): BlindCoverage {
   const admitted = admittedOf(ledger, jobId);
   if (admitted === null) {
@@ -331,11 +348,10 @@ export function blindCoverageOf(ledger: LedgerApi, jobId: string): BlindCoverage
   }
   // Distinct reads (#355): a re-scan of the same transcript (a settle scan
   // plus a late physical-completion scan) re-reports a read without growing
-  // the count; a read in another session, or a new one, still counts.
-  const access = ledger.countJobEventsAndDistinctArrayEntries(jobId, BLIND_ACCESS_EVENT, 'prohibited', {
-    event: ['source', 'session'],
-    entry: ['index', 'toolName', 'code', 'path', 'excerptSha256'],
-  });
+  // the count; a read in another session, or a new one, still counts. An
+  // operator re-posting the same observation is the same read; events from
+  // before #355 carry no session and count as one unknown session.
+  const access = ledger.countJobEventsAndDistinctArrayEntries(jobId, BLIND_ACCESS_EVENT, 'prohibited', BLIND_READ_IDENTITY);
   const prohibited = access.distinct;
   const base = {
     jobId,
@@ -382,8 +398,9 @@ export function recordObservedAccess(
   jobId: string,
   results: readonly ObservedToolResult[],
   source: 'session' | 'operator',
-  /** The transcript the results were read from (session scans): the same
-   * index in another session is another read. */
+  /** The identity of the transcript the results were read from (session
+   * scans, {@link blindSessionIdentity}): the same index in another session
+   * is another read. Operator posts carry none. */
   session: string | null = null,
 ): BlindCoverage {
   const admitted = admittedOf(ledger, jobId);
@@ -434,7 +451,7 @@ export function observeBlindSessionAccess(
   if (!isAdmittedBlind(ledger, jobId)) return;
   const results = readResults(sessionFile);
   if (results === null) return;
-  recordObservedAccess(ledger, jobId, results, 'session', sessionFile);
+  recordObservedAccess(ledger, jobId, results, 'session', sessionFile === null ? null : blindSessionIdentity(sessionFile));
 }
 
 const MAX_SESSION_BYTES = 64 * 1024 * 1024;

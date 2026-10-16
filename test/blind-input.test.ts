@@ -298,6 +298,25 @@ describe('observed reviewer access — grep paths with spaces (#357)', () => {
     // Private text never rides the record: digest only.
     expect(JSON.stringify(prohibited)).not.toContain('plain text');
   });
+
+  it('judges a spaced capture by the isolation globs only: prose and clock times are no grep hit, a prose-prefixed excluded path still is', () => {
+    const prohibited = scanObservedAccess(
+      [
+        { index: 1, toolName: 'bash', text: '/var/log/app.log started at 10:30:15 ok' },
+        { index: 2, toolName: 'bash', text: '../x y.log at 10:30:15' },
+        { index: 3, toolName: 'bash', text: 'Started at 10:30:15' },
+        { index: 4, toolName: 'bash', text: 'time 12:30:45 elapsed' },
+        { index: 5, toolName: 'bash', text: 'Matches in docs/issues/prior review.md:1:x' },
+        // A space-free capture keeps its shape rule: an absolute grep hit is outside the package.
+        { index: 6, toolName: 'bash', text: '/etc/hosts:1:127.0.0.1 localhost' },
+      ],
+      DEFAULT_BLIND_ISOLATION_RULE,
+    );
+    expect(prohibited.map((p) => `${p.index}:${p.path ?? ''}`)).toEqual([
+      '5:docs/issues/prior review.md',
+      '6:/etc/hosts',
+    ]);
+  });
 });
 
 describe('package request parsing', () => {

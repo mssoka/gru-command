@@ -1474,10 +1474,11 @@ export class LedgerApi {
    * exist, and how many DISTINCT entries their JSON-array payload `field`
    * holds, an entry's identity being the named event payload keys plus the
    * named entry keys (issue #355: a re-scan of the same transcript re-reports
-   * a read; the distinct count does not grow with it). Both are SQL
-   * aggregates over the COMPLETE record, so a value can never age out of a
-   * fixed newest-N window. Every key is a fixed caller-supplied name (never
-   * request data). */
+   * a read; the distinct count does not grow with it). One statement over
+   * the COMPLETE record — one consistent snapshot, nothing ages out of a
+   * window. A malformed event (no array `field`, or a non-object entry) is
+   * refused by name, never counted as zero. Every key is a fixed
+   * caller-supplied name (never request data). */
   countJobEventsAndDistinctArrayEntries(
     jobId: string,
     kind: string,
@@ -1496,17 +1497,22 @@ export class LedgerApi {
       ...identity.event.map((key) => `json_extract(e.payload, '$.${key}')`),
       ...identity.entry.map((key) => `json_extract(p.value, '$.${key}')`),
     ].join(', ');
-    const events = this.db
-      .prepare('SELECT COUNT(*) AS n FROM events WHERE job_id = ? AND kind = ?')
-      .get(jobId, kind) as { n: number };
-    const distinct = this.db
+    const scope = `e.job_id = ? AND e.kind = ? AND json_type(e.payload, '$.${field}') = 'array'`;
+    const row = this.db
       .prepare(
-        `SELECT COUNT(DISTINCT json_array(${parts})) AS n
-           FROM events e, json_each(e.payload, '$.${field}') p
-          WHERE e.job_id = ? AND e.kind = ? AND json_type(e.payload, '$.${field}') = 'array'`,
+        `SELECT
+           (SELECT COUNT(*) FROM events WHERE job_id = ? AND kind = ?) AS events,
+           (SELECT COUNT(*) FROM events WHERE job_id = ? AND kind = ? AND json_type(payload, '$.${field}') IS NOT 'array') AS malformedEvents,
+           (SELECT COUNT(*) FROM events e, json_each(e.payload, '$.${field}') p WHERE ${scope} AND p.type <> 'object') AS malformedEntries,
+           (SELECT COUNT(DISTINCT json_array(${parts})) FROM events e, json_each(e.payload, '$.${field}') p WHERE ${scope} AND p.type = 'object') AS distinctEntries`,
       )
-      .get(jobId, kind) as { n: number };
-    return { events: Number(events.n), distinct: Number(distinct.n) };
+      .get(jobId, kind, jobId, kind, jobId, kind, jobId, kind) as { events: number; malformedEvents: number; malformedEntries: number; distinctEntries: number };
+    if (row.malformedEvents > 0 || row.malformedEntries > 0) {
+      throw new Error(
+        `job "${jobId}" has ${String(row.malformedEvents)} ${kind} event(s) without a "${field}" array and ${String(row.malformedEntries)} non-object "${field}" entr(ies) — refusing to count them; inspect the ledger`,
+      );
+    }
+    return { events: Number(row.events), distinct: Number(row.distinctEntries) };
   }
 
   /** A marked request's guarded event, however many newer unrelated job

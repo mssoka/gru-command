@@ -230,7 +230,18 @@ export function reviveBlindIsolationRule(parts: {
   return rule;
 }
 
+/** Compiled glob patterns: a large tool output classifies many candidate
+ * paths against the same few globs. */
+const compiledGlobs = new Map<string, RegExp>();
 function globToRegExp(glob: string): RegExp {
+  const cached = compiledGlobs.get(glob);
+  if (cached !== undefined) return cached;
+  const compiled = compileGlob(glob);
+  if (compiledGlobs.size >= 1024) compiledGlobs.clear();
+  compiledGlobs.set(glob, compiled);
+  return compiled;
+}
+function compileGlob(glob: string): RegExp {
   let out = '';
   for (let index = 0; index < glob.length; index += 1) {
     const char = glob[index]!;
@@ -577,6 +588,35 @@ export interface ProhibitedAccess {
  * starts with whitespace (an indented stack frame is not a grep result). */
 const GREP_LINE = /^((?:\.\/)?[^\s:][^:\n]*):\d+[:-]/u;
 
+/** The paths a tool-result line may name as a grep hit, each with whether
+ * its SHAPE alone (absolute, `..`) may classify it. A space-free capture is
+ * the path itself. A spaced capture (#357) is ambiguous — prose or a clock
+ * time (`/var/log/app.log started at 10:30:15`) reaches a `:digits:` too —
+ * so it, and every word-suffix of it (`Matches in docs/issues/a b.md:1:`
+ * names `docs/issues/a b.md`), counts only when the isolation globs
+ * themselves exclude it, never by shape. */
+function grepPathCandidates(line: string): readonly { readonly path: string; readonly byShape: boolean }[] {
+  const path = GREP_LINE.exec(line)?.[1];
+  if (path === undefined) return [];
+  if (!/\s/u.test(path)) return [{ path, byShape: true }];
+  const candidates = [{ path, byShape: false }];
+  for (let at = path.search(/\s\S/u); at !== -1; at = nextWordStart(path, at + 1)) {
+    candidates.push({ path: path.slice(at + 1), byShape: false });
+  }
+  return candidates;
+}
+function nextWordStart(text: string, from: number): number {
+  const rest = text.slice(from).search(/\s\S/u);
+  return rest === -1 ? -1 : from + rest;
+}
+/** Why a grep-hit candidate is excluded, or null. */
+function excludedGrepPath(candidate: { readonly path: string; readonly byShape: boolean }, rule: BlindIsolationRule): string | null {
+  const path = candidate.path.replace(/\\/gu, '/');
+  const shapeOnly = path === '' || path.startsWith('/') || /(^|\/)\.\.(\/|$)/u.test(path) || path.includes('\0');
+  if (shapeOnly && !candidate.byShape) return null;
+  return classifyBlindPath(candidate.path, rule);
+}
+
 /**
  * What the reviewer actually SAW: tool results whose grep lines land in an
  * excluded path or whose body is history-bearing text. This is observed
@@ -585,17 +625,18 @@ const GREP_LINE = /^((?:\.\/)?[^\s:][^:\n]*):\d+[:-]/u;
 export function scanObservedAccess(results: readonly ObservedToolResult[], rule: BlindIsolationRule): readonly ProhibitedAccess[] {
   const out: ProhibitedAccess[] = [];
   for (const result of results) {
-    const excludedPath = result.text
+    const excluded = result.text
       .split('\n')
-      .map((line) => GREP_LINE.exec(line)?.[1])
-      .find((path) => path !== undefined && classifyBlindPath(path, rule) !== null);
-    if (excludedPath !== undefined) {
+      .flatMap((line) => grepPathCandidates(line))
+      .map((candidate) => ({ path: candidate.path, detail: excludedGrepPath(candidate, rule) }))
+      .find((hit) => hit.detail !== null);
+    if (excluded !== undefined) {
       out.push({
         index: result.index,
         toolName: result.toolName,
         code: 'excluded-path-read',
-        path: excludedPath,
-        detail: classifyBlindPath(excludedPath, rule) ?? 'excluded path',
+        path: excluded.path,
+        detail: excluded.detail ?? 'excluded path',
         excerptSha256: sha256(result.text),
       });
       continue;

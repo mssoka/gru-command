@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -8,8 +8,10 @@ import { LedgerDb } from '../src/ledger/db.js';
 import {
   admitBlindReview,
   blindCoverageOf,
+  blindSessionIdentity,
   observeBlindSessionAccess,
   recordBlindAdmission,
+  recordObservedAccess,
   BLIND_ACCESS_EVENT,
 } from '../src/dispatch/blind-review.js';
 import type { ObservedToolResult } from '../src/dispatch/blind-input.js';
@@ -123,6 +125,45 @@ describe('observeBlindSessionAccess — repeated scans count distinct reads (iss
     // ...and the same index in ANOTHER session is another physical read.
     observeBlindSessionAccess(h.ledger, 'job-cumulative', '/s/b.jsonl', () => dirty);
     expect(blindCoverageOf(h.ledger, 'job-cumulative').prohibitedAccess).toBe(3);
+    h.dispose();
+  });
+
+  it('identifies a session by its canonical path: two spellings of one transcript are one session (#355)', () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), 'blind-session-')));
+    try {
+      writeFileSync(join(dir, 'a.jsonl'), '');
+      symlinkSync(join(dir, 'a.jsonl'), join(dir, 'alias.jsonl'));
+      const identity = blindSessionIdentity(join(dir, 'a.jsonl'));
+      expect(identity).toMatch(/^[0-9a-f]{64}$/u);
+      expect(blindSessionIdentity(join(dir, 'alias.jsonl'))).toBe(identity);
+      expect(blindSessionIdentity(join(dir, '.', 'a.jsonl'))).toBe(identity);
+      const h = blindLedger();
+      h.admit('job-cumulative');
+      observeBlindSessionAccess(h.ledger, 'job-cumulative', join(dir, 'a.jsonl'), () => [result(0, PROHIBITED)]);
+      observeBlindSessionAccess(h.ledger, 'job-cumulative', join(dir, 'alias.jsonl'), () => [result(0, PROHIBITED)]);
+      expect(blindCoverageOf(h.ledger, 'job-cumulative').prohibitedAccess).toBe(1);
+      // The local path itself never rides the ledger.
+      expect(JSON.stringify(h.ledger.listJobEvents('job-cumulative'))).not.toContain(dir);
+      h.dispose();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('counts an identical operator re-post once, a legacy session-less event as one unknown session, and refuses a malformed event (#355)', () => {
+    const h = blindLedger();
+    h.admit('job-cumulative');
+    recordObservedAccess(h.ledger, 'job-cumulative', [result(0, PROHIBITED)], 'operator');
+    recordObservedAccess(h.ledger, 'job-cumulative', [result(0, PROHIBITED)], 'operator');
+    expect(blindCoverageOf(h.ledger, 'job-cumulative').prohibitedAccess).toBe(1);
+    recordObservedAccess(h.ledger, 'job-cumulative', [result(1, PROHIBITED)], 'operator');
+    expect(blindCoverageOf(h.ledger, 'job-cumulative').prohibitedAccess).toBe(2);
+    // A pre-#355 session scan carried no `session`: it is one unknown session.
+    const [entry] = (h.ledger.latestJobEvent('job-cumulative', BLIND_ACCESS_EVENT)!.payload as { prohibited: unknown[] }).prohibited;
+    h.ledger.appendCustomEvent({ kind: BLIND_ACCESS_EVENT, jobId: 'job-cumulative', payload: { source: 'session', scanned: 1, rule_sha256: 'r', prohibited: [entry] } });
+    h.ledger.appendCustomEvent({ kind: BLIND_ACCESS_EVENT, jobId: 'job-cumulative', payload: { source: 'session', scanned: 1, rule_sha256: 'r', prohibited: [entry] } });
+    expect(blindCoverageOf(h.ledger, 'job-cumulative').prohibitedAccess).toBe(3);
+    // A corrupt event is refused by name, never counted as nothing.
+    h.ledger.appendCustomEvent({ kind: BLIND_ACCESS_EVENT, jobId: 'job-cumulative', payload: { source: 'session', prohibited: ['not an object'] } });
+    expect(() => blindCoverageOf(h.ledger, 'job-cumulative')).toThrow(/1 non-object "prohibited" entr\(ies\) — refusing to count them/u);
     h.dispose();
   });
 

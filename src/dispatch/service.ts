@@ -517,16 +517,22 @@ export class DispatchService {
         failure: unknown | null,
         verdict: PromptTurnVerdict | null,
       ): Promise<{ readonly ok: boolean; readonly error?: string }> => {
+        // Issue #316/#356: whatever the reviewer's tools actually returned is
+        // judged against the rule it was admitted under the moment the
+        // initial prompt physically settled — before anything else, before
+        // any retry wait and before every disposition-specific exit — so a
+        // read-then-reject turn invalidates coverage even when its retries
+        // never conclude. The observer never throws.
+        this.observeBlindSession(job.id, handle.sessionFile);
         // Release the slot first: the retry reacquires admission per attempt.
         releaseWorker();
         const settlement = await settleRetries(this.opts.retrySettlement, handle.id, this.opts.stopSignal).then(
           (value) => ({ ok: true as const, value }),
           (error: unknown) => ({ ok: false as const, error }),
         );
-        // Issue #316/#356: whatever the reviewer's tools actually returned is
-        // judged against the rule it was admitted under — observed here,
-        // before every disposition-specific exit, so a read-then-reject turn
-        // still invalidates coverage. The observer never throws.
+        // Judged again once the retries concluded: a retry turn's own reads
+        // count too, and a re-scan of reads already seen never inflates the
+        // distinct count (#355).
         this.observeBlindSession(job.id, handle.sessionFile);
         if (!settlement.ok) {
           if (!(settlement.error instanceof RetrySettlementUnavailableError)) throw settlement.error;

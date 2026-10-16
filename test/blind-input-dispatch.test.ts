@@ -14,6 +14,7 @@ import type { LogLevel } from '../src/logger.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
 import type { ObservedToolResult } from '../src/dispatch/blind-input.js';
+import type { RetrySettlement } from '../src/runtime/pacing.js';
 import { BLIND_ACCESS_EVENT } from '../src/dispatch/blind-review.js';
 import type { Role } from '../src/config.js';
 import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
@@ -55,6 +56,9 @@ async function boot(opts: {
   sessionToolResults?: (file: string | null) => readonly ObservedToolResult[] | null;
   /** The briefing prompt of this job rejects after its tools ran (#356). */
   rejectPromptOf?: string;
+  /** The automatic-retry settlement every briefing turn waits on (#356). */
+  retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
+  stopSignal?: AbortSignal;
   log?: (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 } = {}): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-blind-'));
@@ -91,6 +95,8 @@ async function boot(opts: {
     spawner,
     ...(opts.sessionToolResults !== undefined ? { sessionToolResults: opts.sessionToolResults } : {}),
     ...(opts.log !== undefined ? { log: opts.log } : {}),
+    ...(opts.retrySettlement !== undefined ? { retrySettlement: opts.retrySettlement } : {}),
+    ...(opts.stopSignal !== undefined ? { stopSignal: opts.stopSignal } : {}),
   });
   const wave = new WaveRunner({ ledger, worktrees, spawner, bus });
   const server = createDispatchServer({ pendingProducerBlockers: () => [], config: cfg, dispatch, wave, ledger });
@@ -418,6 +424,56 @@ describe('blind review commissioning (issue #316)', () => {
     expect((await call(h.port, 'GET', '/api/dispatch/jobs/rev-reject/blind-coverage')).json).toMatchObject({
       state: 'invalidated', qualifying: false, accessObserved: true,
     });
+  });
+
+  /** A reviewer reads prohibited material, then its turn ends through one
+   * disposition-specific exit: the read still invalidates coverage (#356). */
+  async function assertReadInvalidatesOn(exit: 'exhausted' | 'superseded' | 'unavailable' | 'cancelled'): Promise<void> {
+    const stop = new AbortController();
+    // Armed after the parent delivered: only the reviewer's turn takes the exit.
+    let armed = false;
+    const h = await boot({
+      sessionToolResults: () => [{ index: 0, toolName: 'bash', text: '_bmad-output/implementation-artifacts/deferred-work.md:3:- old finding' }],
+      retrySettlement: async () => {
+        if (!armed) return 'none';
+        // The settlement machinery names any hook fault RetrySettlementUnavailableError.
+        if (exit === 'unavailable') throw new Error('settlement hook fault');
+        if (exit === 'cancelled') { stop.abort(); return new Promise<RetrySettlement>(() => {}); }
+        return exit;
+      },
+      stopSignal: stop.signal,
+    });
+    await dispatchParent(h);
+    armed = true;
+    const id = `rev-${exit}`;
+    expect((await call(h.port, 'POST', '/api/dispatch', blindReview(id, { repo_path: h.repo.path, input_package: validPackage() }))).status).toBe(202);
+    await waitFor(() => h.ledger.latestJobEvent(id, 'job.minion-error') !== null);
+    expect(h.ledger.getJob(id)?.status).toBe('blocked');
+    expect(h.ledger.latestJobEvent(id, 'job.delivered')).toBeNull();
+    expect((await call(h.port, 'GET', `/api/dispatch/jobs/${id}/blind-coverage`)).json).toMatchObject({ state: 'invalidated', qualifying: false, prohibitedAccess: 1 });
+  }
+  it('a read before an exhausted automatic retry still invalidates coverage (#356)', () => assertReadInvalidatesOn('exhausted'));
+  it('a read before a superseded automatic retry still invalidates coverage (#356)', () => assertReadInvalidatesOn('superseded'));
+  it('a read before an unavailable retry settlement still invalidates coverage (#356)', () => assertReadInvalidatesOn('unavailable'));
+  it('a read before a shutdown-cancelled retry wait still invalidates coverage (#356)', () => assertReadInvalidatesOn('cancelled'));
+
+  it('observes the initial prompt the moment it settles, before its retries conclude (#356)', async () => {
+    let settled!: (value: RetrySettlement) => void;
+    let armed = false;
+    const h = await boot({
+      sessionToolResults: () => [{ index: 0, toolName: 'bash', text: '_bmad-output/implementation-artifacts/deferred-work.md:3:- old finding' }],
+      retrySettlement: async () => armed ? new Promise<RetrySettlement>((resolve) => { settled = resolve; }) : 'none',
+    });
+    await dispatchParent(h);
+    armed = true;
+    expect((await call(h.port, 'POST', '/api/dispatch', blindReview('rev-pending', { repo_path: h.repo.path, input_package: validPackage() }))).status).toBe(202);
+    await waitFor(() => h.ledger.latestJobEvent('rev-pending', BLIND_ACCESS_EVENT) !== null);
+    expect(h.ledger.latestJobEvent('rev-pending', 'job.delivered')).toBeNull(); // still waiting on its retries
+    expect((await call(h.port, 'GET', '/api/dispatch/jobs/rev-pending/blind-coverage')).json).toMatchObject({ state: 'invalidated', prohibitedAccess: 1 });
+    settled('none');
+    // The post-retry re-scan re-reports the same read: still one distinct read.
+    await waitFor(() => h.ledger.listJobEventsByKinds('rev-pending', [BLIND_ACCESS_EVENT]).length >= 2);
+    expect((await call(h.port, 'GET', '/api/dispatch/jobs/rev-pending/blind-coverage')).json).toMatchObject({ state: 'invalidated', prohibitedAccess: 1 });
   });
 
   it('observes session grep results whose excluded path contains spaces, and keeps a spaced permitted path qualifying (#357)', async () => {
