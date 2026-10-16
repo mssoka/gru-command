@@ -60,8 +60,12 @@ describe('perkins-stage1-baseline verdict tool (#175)', () => {
     if (report !== undefined) writeFileSync(file, JSON.stringify(report));
     return spawnSync(process.execPath, [verdictTool, file, ...fragments], { encoding: 'utf8' });
   }
-  const report = (...tests: Array<[string, 'passed' | 'failed' | 'pending']>) => ({
-    testResults: [{ assertionResults: tests.map(([fullName, status]) => ({ fullName, status })) }],
+  /** A matcher failure raised in the test file itself. */
+  const ASSERTION = 'AssertionError: expected 1 to be 2\n    at /snapshot/test/review-mcp-transport.test.ts:10:5';
+  const report = (...tests: Array<[string, 'passed' | 'failed' | 'pending', string?]>) => ({
+    testResults: [{ assertionResults: tests.map(([fullName, status, message]) => ({
+      fullName, status, failureMessages: status === 'failed' ? [message ?? ASSERTION] : [],
+    })) }],
   });
 
   it('accepts a genuine assertion RED covering every fragment and names the failures', () => {
@@ -77,6 +81,20 @@ describe('perkins-stage1-baseline verdict tool (#175)', () => {
     expect(result.stderr).toContain('SELECTION INCOMPLETE');
     expect(result.stderr).toContain('joins an identical');
     expect(verdict(report(), 'anything').status).toBe(6);
+  });
+
+  it('refuses a run whose failed test failed some other way than an assertion — a beforeAll setup error — with exit 5 (#360 R4-V3)', () => {
+    const hook = 'Error: setup broke\n    at /snapshot/test/helpers/fixture.ts:3:9';
+    const setup = verdict(report(['suite joins an identical x', 'failed', hook], ['suite joins an identical y', 'failed']), 'joins an identical');
+    expect(setup.status).toBe(5);
+    expect(setup.stderr).toContain('RUN BROKEN');
+    expect(setup.stderr).toContain('NOT RED: suite joins an identical x');
+    // An assertion raised inside a shared helper is setup too.
+    const helper = verdict(report(['suite joins an identical x', 'failed', 'AssertionError: x\n    at /snapshot/test/helpers/fixture.ts:3:9']), 'joins an identical');
+    expect(helper.status).toBe(5);
+    // A failure with no message at all is no evidence either.
+    const silent = verdict({ testResults: [{ assertionResults: [{ fullName: 'suite joins an identical x', status: 'failed', failureMessages: [] }] }] }, 'joins an identical');
+    expect(silent.status).toBe(5);
   });
 
   it('refuses a failed run without any failing selected test, or without a report, with exit 5', () => {
@@ -164,9 +182,9 @@ describe('perkins-stage1-baseline scope exit contract (#175)', () => {
     const report = JSON.stringify({
       testResults: [{
         assertionResults: [
-          { fullName: 'suite joins an identical in-flight request', status: 'failed' },
-          { fullName: 'suite wait-expired tools/call', status: 'failed' },
-          { fullName: 'suite fails loud on a malformed wait override', status: 'failed' },
+          { fullName: 'suite joins an identical in-flight request', status: 'failed', failureMessages: ['AssertionError: expected 1 to be 2\n    at /snapshot/test/review-mcp-transport.test.ts:10:5'] },
+          { fullName: 'suite wait-expired tools/call', status: 'failed', failureMessages: ['AssertionError: expected 1 to be 2\n    at /snapshot/test/review-mcp-transport.test.ts:20:5'] },
+          { fullName: 'suite fails loud on a malformed wait override', status: 'failed', failureMessages: ['AssertionError: expected 1 to be 2\n    at /snapshot/test/review-mcp-transport.test.ts:30:5'] },
         ],
       }],
     });

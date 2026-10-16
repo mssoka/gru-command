@@ -768,6 +768,75 @@ test.describe('notification readability — fixed long-content fixtures', () => 
     }
   });
 
+  test('a long notification panel at a short viewport keeps its last control reachable (#360 V2)', async ({ browser }) => {
+    // The panel is position: fixed, so page scrolling never moves it: if
+    // its box ran past the viewport bottom, the controls down there could
+    // not be reached at all. Many expanded rows at a short height prove
+    // the panel stays inside the viewport and scrolls its own content.
+    for (const viewport of [{ width: 1280, height: 420 }, { width: 390, height: 520 }]) {
+      const page = await browser.newPage({ viewport });
+      try {
+        const extra: NotificationView[] = Array.from({ length: 12 }, (_, index) => ({
+          ...machineNotification(),
+          id: `machine-extra-${index}`,
+          title: `Extra long machine notice ${index}: reconcile the interrupted lane before any re-arm`,
+        }));
+        const base = fixtureSnapshot();
+        const seed = await seedBoard(page, fixtureSnapshot({ notifications: [...base.notifications, ...extra] }));
+        await pairAndOpenBoard(page);
+        await clickBell(page);
+        await settled(page);
+        expect(seed.pageErrors).toEqual([]);
+        const panel = page.locator('#notification-panel');
+        const summaries = panel.locator('.board-notification__details summary');
+        expect(await summaries.count()).toBeGreaterThan(10);
+        for (let index = 0; index < (await summaries.count()); index += 1) {
+          const summary = summaries.nth(index);
+          await summary.scrollIntoViewIfNeeded();
+          await summary.click();
+        }
+        await settled(page);
+        const geometry = await panel.evaluate((element) => {
+          const list = element.querySelector<HTMLElement>('#notification-list');
+          if (list === null) throw new Error('notification list not found inside the panel');
+          return {
+            top: element.getBoundingClientRect().top,
+            bottom: element.getBoundingClientRect().bottom,
+            viewportHeight: window.innerHeight,
+            panelOverflow: element.scrollHeight - element.clientHeight,
+            listOverflow: list.scrollHeight - list.clientHeight,
+          };
+        });
+        const label = `${viewport.width}x${viewport.height}`;
+        console.log(`[#360 V2] ${label} ${JSON.stringify(geometry)}`);
+        // The content is genuinely longer than the room it has...
+        expect(geometry.panelOverflow + geometry.listOverflow, `${label}: fixture is longer than the panel`).toBeGreaterThan(0);
+        // ...yet the fixed box itself never runs past the viewport bottom.
+        expect(geometry.bottom, `${label}: panel bottom inside the viewport`).toBeLessThanOrEqual(geometry.viewportHeight);
+        const last = panel.locator('button, summary, a[href], input, select, textarea').last();
+        await last.scrollIntoViewIfNeeded();
+        await settled(page);
+        const reach = await last.evaluate((element) => {
+          const rect = element.getBoundingClientRect();
+          const topmost = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+          return {
+            top: rect.top,
+            bottom: rect.bottom,
+            viewportHeight: window.innerHeight,
+            hit: topmost !== null && (topmost === element || element.contains(topmost)),
+          };
+        });
+        expect(reach.top, `${label}: last control top on screen`).toBeGreaterThanOrEqual(0);
+        expect(reach.bottom, `${label}: last control bottom on screen`).toBeLessThanOrEqual(reach.viewportHeight);
+        expect(reach.hit, `${label}: last control is the topmost hit target`).toBe(true);
+        await last.click({ trial: true });
+        await captureViewport(page, `short-viewport-${label}`, `long panel at ${label}: last control scrolled into reach`);
+      } finally {
+        await page.close();
+      }
+    }
+  });
+
   test('200% PAGE zoom (CSS zoom scales text AND layout together): the board and the proposal review reflow', async ({ browser }) => {
     // This case is page zoom, NOT text-only zoom: `zoom: 2` on the root
     // scales text and layout together and halves the effective layout width

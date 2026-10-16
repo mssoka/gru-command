@@ -1407,6 +1407,30 @@ describe('Perkins admission preflight (gh-169)', () => {
     }
   });
 
+  it('a /proc listing or read that never settles is bounded by the remaining budget — unknown, so live (#360 R5-E6)', async () => {
+    const child = spawn('/bin/sleep', ['30'], { detached: true, stdio: 'ignore' });
+    const pgid = child.pid!;
+    const realPlatform = OWNED_GIT_SEAMS.platform;
+    const realProcAsync = OWNED_GIT_SEAMS.procFsAsync;
+    const never = <T>(): Promise<T> => new Promise<T>(() => {});
+    try {
+      OWNED_GIT_SEAMS.platform = 'linux';
+      for (const [label, fs] of [
+        ['listing', { list: () => never<string[]>(), read: async () => '' }],
+        ['stat read', { list: async () => ['100'], read: () => never<string>() }],
+      ] as const) {
+        OWNED_GIT_SEAMS.procFsAsync = fs;
+        const started = performance.now();
+        expect(await groupHasLiveMemberAsync(pgid, 100), label).toBe(true);
+        expect(performance.now() - started, label).toBeLessThan(500);
+      }
+    } finally {
+      OWNED_GIT_SEAMS.platform = realPlatform;
+      OWNED_GIT_SEAMS.procFsAsync = realProcAsync;
+      process.kill(-pgid, 'SIGKILL');
+    }
+  });
+
   it('the Linux /proc scan is asynchronous, charged to the remaining budget, and an expired or incomplete scan is unknown — live (#264)', async () => {
     const stat = (state: string, group: number) => `1 (git) ${state} 1 ${group} 1 0 -1`;
     const entries = (count: number): string[] => Array.from({ length: count }, (_, index) => String(100 + index));
