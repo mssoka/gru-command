@@ -1779,35 +1779,63 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
   it('refuses a disposition the ledger would refuse BEFORE the supervisor acts on it, with a typed 409 (#385)', async () => {
     let consulted = 0;
     let changeDuringConsult: (() => void) | null = null;
-    const harness = await boot('board-test-token', { onNotificationDisposition: () => { consulted += 1; changeDuringConsult?.(); return { ok: true }; } });
+    let consultOutcome: { readonly ok: boolean; readonly rearmed?: boolean; readonly superseded?: boolean } = { ok: true };
+    const harness = await boot('board-test-token', { onNotificationDisposition: () => { consulted += 1; changeDuringConsult?.(); return consultOutcome; } });
     try {
       // An informational row takes no machine disposition: refused before
       // the supervisor is consulted, so no stop can close beside it.
       const fyi = harness.notifications.post({ kind: 'job.note', routing: 'fyi', severity: 'info', title: 'for your information' });
       expect(harness.api.machineDispositionRefusal(fyi.id)).toMatch(/only action-required notifications accept a machine disposition/u);
       const response = await postJson(harness.port, `/api/notifications/${encodeURIComponent(fyi.id)}/disposition`, 'board-test-token', { detail: 'tried anyway' });
-      expect(response).toMatchObject({ status: 409, body: { error: 'disposition_refused', code: 'disposition_refused', detail: expect.stringMatching(/only action-required notifications/u) } });
+      expect(response).toMatchObject({ status: 409, body: { error: 'disposition_refused', code: 'disposition_refused', rearm: 'not_applicable', detail: expect.stringMatching(/only action-required notifications[^—]*$/u) } });
       expect(consulted).toBe(0);
       expect(harness.api.getNotification(fyi.id)).toMatchObject({ resolvedAt: null });
       // An informational row already resolved is refused the same typed way.
       harness.api.resolveNotificationById(fyi.id, 'producer');
       expect(harness.api.getNotification(fyi.id)?.resolvedAt).not.toBeNull();
       expect(await postJson(harness.port, `/api/notifications/${encodeURIComponent(fyi.id)}/disposition`, 'board-test-token', { detail: 'again' }))
-        .toMatchObject({ status: 409, body: { error: 'disposition_refused', code: 'disposition_refused' } });
+        .toMatchObject({ status: 409, body: { error: 'disposition_refused', code: 'disposition_refused', rearm: 'not_applicable' } });
       expect(consulted).toBe(0);
       // A row that changes between the check and its disposal is refused by
       // the disposal's own re-check, the same typed way.
       const breaker = harness.notifications.post({ kind: 'supervision.breaker', routing: 'action-required', severity: 'error', title: 'Lane stopped' });
       consulted = 0;
       changeDuringConsult = () => { harness.api.updateNotificationTriage(breaker.id, 'fyi', null); };
-      // The supervisor had already acted: the refusal says so and records it.
-      expect(await postJson(harness.port, `/api/notifications/${encodeURIComponent(breaker.id)}/disposition`, 'board-test-token', { detail: 'raced' }))
-        .toMatchObject({ status: 409, body: { error: 'disposition_refused', code: 'disposition_refused', rearm: 'accepted',
-          detail: expect.stringMatching(/only action-required notifications .* — the supervisor had already acted on it \(rearm: accepted\); the alert stays open: retriage or resolve it$/u) } });
-      expect(consulted).toBe(1);
-      expect(harness.api.getNotification(breaker.id)).toMatchObject({ resolvedAt: null });
-      expect(harness.api.listEvents({ limit: 50 }).filter((event) => event.kind === 'notification.disposition-refused-after-rearm').map((event) => event.payload))
-        .toEqual([{ id: breaker.id, rearm: 'accepted', refusal: expect.stringMatching(/only action-required notifications/u) }]);
+      const actedEvents = () => harness.api.listEvents({ limit: 100 }).filter((event) => event.kind === 'notification.disposition-refused-after-rearm').map((event) => event.payload);
+      // The supervisor had already acted: the refusal says so and records it —
+      // for a re-arm and a superseded close alike; a pure record says nothing.
+      for (const [outcome, rearm] of [[{ ok: true }, 'accepted'], [{ ok: true, rearmed: false, superseded: true }, 'superseded'], [{ ok: true, rearmed: false }, 'not_applicable']] as const) {
+        harness.api.updateNotificationTriage(breaker.id, 'action-required', null);
+        consulted = 0; consultOutcome = outcome;
+        const before = actedEvents().length;
+        const raced = await postJson(harness.port, `/api/notifications/${encodeURIComponent(breaker.id)}/disposition`, 'board-test-token', { detail: `raced ${rearm}` });
+        expect(raced, rearm).toMatchObject({ status: 409, body: { error: 'disposition_refused', code: 'disposition_refused', rearm } });
+        const detail = (raced.body as { detail: string }).detail;
+        if (rearm === 'not_applicable') {
+          expect(detail, rearm).not.toMatch(/supervisor had already acted/u);
+          expect(actedEvents(), rearm).toHaveLength(before);
+        } else {
+          expect(detail, rearm).toMatch(new RegExp(`^only action-required notifications .* — the supervisor had already acted on it \\(rearm: ${rearm}\\); the alert stays open: retriage or resolve it$`, 'u'));
+          const after = actedEvents();
+          expect(after, rearm).toHaveLength(before + 1);
+          expect(after, rearm).toContainEqual({ id: breaker.id, rearm });
+        }
+        expect(consulted, rearm).toBe(1);
+        expect(harness.api.getNotification(breaker.id), rearm).toMatchObject({ resolvedAt: null });
+      }
+      // An event that cannot be written is said, never a 500 in place of the refusal.
+      harness.api.updateNotificationTriage(breaker.id, 'action-required', null);
+      consultOutcome = { ok: true };
+      const failingEvent = vi.spyOn(harness.api, 'appendCustomEvent').mockImplementation(() => { throw new Error('ledger full'); });
+      try {
+        expect(await postJson(harness.port, `/api/notifications/${encodeURIComponent(breaker.id)}/disposition`, 'board-test-token', { detail: 'raced, unrecorded' }))
+          .toMatchObject({ status: 409, body: { rearm: 'accepted', detail: expect.stringMatching(/\(rearm: accepted\) \(and that could not be recorded in the ledger\); the alert stays open/u) } });
+      } finally { failingEvent.mockRestore(); }
+      // A row removed while the supervisor acted answers 404 — and says the supervisor acted.
+      const removed = harness.notifications.post({ kind: 'supervision.breaker', routing: 'action-required', severity: 'error', title: 'Lane stopped again' });
+      changeDuringConsult = () => { (harness.api as unknown as { db: { prepare(sql: string): { run(...args: unknown[]): unknown } } }).db.prepare('DELETE FROM notifications WHERE id = ?').run(removed.id); };
+      expect(await postJson(harness.port, `/api/notifications/${encodeURIComponent(removed.id)}/disposition`, 'board-test-token', { detail: 'raced away' }))
+        .toMatchObject({ status: 404, body: { error: 'not_found', rearm: 'accepted', detail: expect.stringMatching(/not found — the supervisor had already acted on it \(rearm: accepted\)/u) } });
       changeDuringConsult = null;
       // A resolved action-required row stays an idempotent retry.
       const note = harness.notifications.post({ kind: 'job.note', routing: 'action-required', severity: 'info', title: 'handled' });

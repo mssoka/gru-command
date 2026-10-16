@@ -3563,7 +3563,7 @@ export class Supervisor {
       if (onFailure === 'refuse' && breaker) {
         return { ok: false, reason: `superseded closure lookup failed — retry the disposition: ${String(error)}${kindFailure}` };
       }
-      this.log(breaker ? 'error' : 'warn', 'superseded closure lookup failed — reporting a pure record', { notification_id: notificationId, breaker, error: String(error) });
+      this.log(breaker ? 'error' : 'warn', 'superseded closure lookup failed — reporting a pure record', { notification_id: notificationId, breaker, error: String(error), ...(kindFailure === '' ? {} : { kind_failure: kindFailure }) });
       return { ok: true, rearmed: false };
     }
   }

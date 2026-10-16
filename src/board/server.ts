@@ -838,6 +838,19 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
                 return;
               }
             }
+            // When the supervisor acted but nothing is resolved after all,
+            // that is recorded and said — never hidden behind a refusal.
+            const actedNote = (): string => {
+              if (rearm === 'not_applicable') return '';
+              let unrecorded = '';
+              try {
+                ledger.appendCustomEvent({ kind: 'notification.disposition-refused-after-rearm', payload: { id, rearm } });
+              } catch (eventError) {
+                log('error', 'refused-after-rearm event not recorded', { id, rearm, error: String(eventError) });
+                unrecorded = ' (and that could not be recorded in the ledger)';
+              }
+              return ` — the supervisor had already acted on it (rearm: ${rearm})${unrecorded}; the alert stays open: retriage or resolve it`;
+            };
             let row: NotificationRecord | null;
             try {
               row = ownerFollowThrough
@@ -850,17 +863,11 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
               // the consult), that is said and recorded, never hidden: the
               // alert stays open for a person to retriage or resolve.
               if (!(error instanceof MachineDispositionRefusedError)) throw error;
-              if (rearm !== 'not_applicable') {
-                ledger.appendCustomEvent({ kind: 'notification.disposition-refused-after-rearm', payload: { id, rearm, refusal: error.refusal } });
-              }
-              json(res, 409, {
-                error: 'disposition_refused', code: 'disposition_refused', rearm,
-                detail: rearm === 'not_applicable' ? error.refusal : `${error.refusal} — the supervisor had already acted on it (rearm: ${rearm}); the alert stays open: retriage or resolve it`,
-              });
+              json(res, 409, { error: 'disposition_refused', code: 'disposition_refused', rearm, detail: `${error.refusal}${actedNote()}` });
               return;
             }
             if (row === null) {
-              json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });
+              json(res, 404, { error: 'not_found', rearm, detail: `notification "${id}" not found${actedNote()}` });
               return;
             }
             json(res, 200, { ...row, rearm });
