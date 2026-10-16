@@ -463,6 +463,20 @@ describe('autopilot mode resolution (kill switch + per-family modes)', () => {
     expect(canonicalJson({ when })).toBe(JSON.stringify({ when }));
     expect(canonicalJson({ gone: undefined, fn: () => 1, kept: null })).toBe('{"kept":null}');
     expect(canonicalJson([undefined, () => 1, 'x'])).toBe(JSON.stringify([undefined, () => 1, 'x']));
+    // Exactly as JSON.stringify: symbol members, a toJSON returning undefined,
+    // holes, non-finite numbers, and a toJSON called once (never again on its result).
+    const self = { a: 1, toJSON() { return this; } };
+    // eslint-disable-next-line no-sparse-arrays
+    for (const value of [{ a: Symbol('s'), b: 1 }, { a: { toJSON: () => undefined }, b: 1 }, [, 1], [Symbol('s')], { a: Number.NaN, b: Infinity }, self]) {
+      expect(canonicalJson(value)).toBe(JSON.stringify(value));
+    }
+    // A cycle or a BigInt is refused by name, never a stack overflow.
+    const cyclic: Record<string, unknown> = {}; cyclic['self'] = cyclic;
+    expect(() => canonicalJson(cyclic)).toThrow(/^canonicalJson: a circular structure has no JSON form$/u);
+    expect(() => canonicalJson({ n: 1n })).toThrow(/^canonicalJson: a BigInt has no JSON form$/u);
+    // A repeated (non-circular) member is no cycle.
+    const shared = { x: 1 };
+    expect(canonicalJson({ a: shared, b: shared })).toBe('{"a":{"x":1},"b":{"x":1}}');
   });
 
   it('a decision recorded before fingerprints existed is the same decision on upgrade (#369)', async () => {

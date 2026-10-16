@@ -733,18 +733,30 @@ export interface SilasAutopilotInput {
 
 /** JSON with every object's keys sorted: two equal decisions built in a
  * different key order — or read back from the ledger — hash alike. Values
- * serialize as JSON.stringify would (`toJSON` honoured, `undefined` members
- * dropped, `undefined` array slots as null); exported for its own tests. */
+ * serialize as JSON.stringify would: `toJSON` called once per value;
+ * `undefined`, function and symbol members dropped (null in an array, holes
+ * included); non-finite numbers as null. A cycle or a BigInt is refused by
+ * name, never a stack overflow. Exported for its own tests. */
 export function canonicalJson(value: unknown): string {
-  if (value !== null && typeof value === 'object' && typeof (value as { toJSON?: unknown }).toJSON === 'function') {
-    return canonicalJson((value as { toJSON(): unknown }).toJSON());
-  }
-  if (Array.isArray(value)) return `[${value.map((member) => (member === undefined || typeof member === 'function' ? 'null' : canonicalJson(member))).join(',')}]`;
-  if (value !== null && typeof value === 'object') {
-    const entries = Object.entries(value).filter(([, member]) => member !== undefined && typeof member !== 'function').sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-    return `{${entries.map(([key, member]) => `${JSON.stringify(key)}:${canonicalJson(member)}`).join(',')}}`;
-  }
-  return JSON.stringify(value) ?? 'null';
+  const ancestors: object[] = [];
+  const serialize = (input: unknown): string | undefined => {
+    const resolved = input !== null && typeof input === 'object' && typeof (input as { toJSON?: unknown }).toJSON === 'function'
+      ? (input as { toJSON(): unknown }).toJSON() : input;
+    if (resolved === undefined || typeof resolved === 'function' || typeof resolved === 'symbol') return undefined;
+    if (typeof resolved === 'bigint') throw new TypeError('canonicalJson: a BigInt has no JSON form');
+    if (resolved === null || typeof resolved !== 'object') return JSON.stringify(resolved);
+    if (ancestors.includes(resolved)) throw new TypeError('canonicalJson: a circular structure has no JSON form');
+    ancestors.push(resolved);
+    try {
+      if (Array.isArray(resolved)) return `[${Array.from(resolved, (member: unknown) => serialize(member) ?? 'null').join(',')}]`;
+      const members = Object.keys(resolved).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).flatMap((key) => {
+        const text = serialize((resolved as Record<string, unknown>)[key]);
+        return text === undefined ? [] : [`${JSON.stringify(key)}:${text}`];
+      });
+      return `{${members.join(',')}}`;
+    } finally { ancestors.pop(); }
+  };
+  return serialize(value) ?? 'null';
 }
 
 /** The identity of one decision: what it would call, and in which mode. */

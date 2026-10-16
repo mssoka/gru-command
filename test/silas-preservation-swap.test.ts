@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -52,7 +52,7 @@ function record() {
   });
   const recordPath = join(root, 'original-custody-and-retention-preflight.json');
   writeFileSync(recordPath, text);
-  return { tree, reference: { recordPath, recordSha256: sha256(text) } };
+  return { root, tree, reference: { recordPath, recordSha256: sha256(text) } };
 }
 
 describe('preservation reference — faults only a filesystem can cause (#367)', () => {
@@ -70,7 +70,66 @@ describe('preservation reference — faults only a filesystem can cause (#367)',
       mkdirSync(tree);
     };
     expect(resolvePreservationReference({ reference, jobId: 'job-h1' }))
-      .toMatchObject({ reusable: false, guidance: expect.stringMatching(/the record directory or the original tree changed while it was being verified/u) });
+      .toMatchObject({ reusable: false, guidance: `the record directory or the original tree changed while it was being verified (${tree} was replaced by another directory) — the tree is retained` });
+  });
+
+  it('refuses when the record directory is swapped for another directory while the reads run', () => {
+    const { root, reference } = record();
+    hooks.onOpen = (path) => {
+      if (!path.endsWith('.tar.gz')) return;
+      hooks.onOpen = null;
+      // The same files at the same path, in a different directory.
+      cpSync(root, `${root}.copy`, { recursive: true });
+      renameSync(root, `${root}.moved`);
+      renameSync(`${root}.copy`, root);
+      dirs.push(`${root}.moved`);
+    };
+    expect(resolvePreservationReference({ reference, jobId: 'job-h1' }))
+      .toMatchObject({ reusable: false, guidance: `the record directory or the original tree changed while it was being verified (${root} was replaced by another directory) — the tree is retained` });
+  });
+
+  it('refuses a tree deleted and re-created at the same path, and one that vanished, by name', () => {
+    const recreated = record();
+    hooks.onOpen = (path) => {
+      if (!path.endsWith('.tar.gz')) return;
+      hooks.onOpen = null;
+      rmSync(recreated.tree, { recursive: true });
+      mkdirSync(recreated.tree);
+    };
+    expect(resolvePreservationReference({ reference: recreated.reference, jobId: 'job-h1' }))
+      .toMatchObject({ reusable: false, guidance: expect.stringContaining(`(${recreated.tree} was replaced by another directory)`) });
+    const vanished = record();
+    hooks.onOpen = (path) => {
+      if (!path.endsWith('.tar.gz')) return;
+      hooks.onOpen = null;
+      rmSync(vanished.tree, { recursive: true });
+    };
+    expect(resolvePreservationReference({ reference: vanished.reference, jobId: 'job-h1' }))
+      .toMatchObject({ reusable: false, guidance: expect.stringContaining(`(${vanished.tree} vanished or cannot be read)`) });
+  });
+
+  it('refuses when a verified link\'s directory is swapped while the reads run', () => {
+    const { root, tree, reference: original } = record();
+    mkdirSync(join(tree, 'nested'));
+    symlinkSync('../outside-target', join(tree, 'nested', 'link'));
+    // Re-bind the record to a manifest that names the nested link.
+    const manifest = JSON.stringify({ original_tree: tree, relative_entries: ['nested/link'], archive_sha256: sha256('archive') });
+    writeFileSync(join(root, 'link-preservation-manifest.json'), manifest);
+    const text = JSON.stringify({
+      job: { id: 'job-h1', repo: 'fixture-repo' }, tree: { job_id: 'job-h1', path: tree },
+      original_report_sha256: sha256('r'), original_session_sha256: sha256('s'), link_manifest_sha256: sha256(manifest),
+    });
+    writeFileSync(original.recordPath, text);
+    const reference = { recordPath: original.recordPath, recordSha256: sha256(text) };
+    expect(resolvePreservationReference({ reference, jobId: 'job-h1' })).toMatchObject({ reusable: true, verifiedAssets: expect.arrayContaining(['link:nested/link']) });
+    hooks.onOpen = (path) => {
+      if (!path.endsWith('.tar.gz')) return;
+      hooks.onOpen = null;
+      renameSync(join(tree, 'nested'), join(tree, 'nested.moved'));
+      mkdirSync(join(tree, 'nested'));
+    };
+    expect(resolvePreservationReference({ reference, jobId: 'job-h1' }))
+      .toMatchObject({ reusable: false, guidance: expect.stringContaining(`(${join(tree, 'nested')} was replaced by another directory)`) });
   });
 
   it('refuses on a platform without no-follow reads, by name', () => {
@@ -80,6 +139,8 @@ describe('preservation reference — faults only a filesystem can cause (#367)',
     try {
       expect(resolvePreservationReference({ reference, jobId: 'job-h1' }))
         .toMatchObject({ reusable: false, guidance: expect.stringMatching(/no-follow file reads are unsupported on this platform/u) });
-    } finally { mutableConstants['O_NOFOLLOW'] = noFollow; }
+    } finally {
+      if (noFollow === undefined) delete mutableConstants['O_NOFOLLOW']; else mutableConstants['O_NOFOLLOW'] = noFollow;
+    }
   });
 });

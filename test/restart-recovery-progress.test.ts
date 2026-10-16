@@ -920,6 +920,20 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(long).not.toContain('\n');
     expect(long).toMatch(/\(unreadable: "Error: line one\\nline two x+…"\)$/u);
     expect(long.length).toBeLessThan(300);
+    const literal = (message: string): string => /\(unreadable: (".*")\)$/u.exec(unproven({ prepared: prepared(() => { throw new Error(message); }) })!)![1]!;
+    // Escaping can grow a character six-fold; the literal still stays within 200.
+    for (const message of ['\n'.repeat(500), '\u0001'.repeat(500), `${'x'.repeat(170)}${'😀'.repeat(40)}`]) {
+      const quoted = literal(message);
+      expect(quoted.length, JSON.stringify(message.slice(0, 4))).toBeLessThanOrEqual(200);
+      expect(quoted.endsWith('…"')).toBe(true);
+      // Cut on a code point: no lone surrogate escape.
+      expect(quoted).not.toMatch(/\\ud[89ab]/u);
+      expect(() => JSON.parse(quoted)).not.toThrow();
+    }
+    // Line and paragraph separators, C1 controls and bidi overrides are escaped too.
+    expect(literal('a\u2028b\u2029c\u0085d\u202ee\u2066f')).toBe('"Error: a\\u2028b\\u2029c\\u0085d\\u202ee\\u2066f"');
+    // An empty message still names the error.
+    expect(literal('')).toBe('"Error"');
     const hostile = { toString() { throw new Error('no'); } };
     expect(unproven({ prepared: prepared(() => { throw hostile; }) })).toBe('prepared producer minion-x has not proven cessation (unreadable: "an error that cannot be printed")');
   });

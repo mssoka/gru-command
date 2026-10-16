@@ -69,13 +69,28 @@ export function promptRefusalUnproven(input: {
   return evidence === 'ceased' ? null : `prepared producer ${input.prepared.id} has not proven cessation (${evidence ?? 'no cessation evidence'})`;
 }
 
+// JSON.stringify leaves these unescaped; each can break or reorder a rendered line.
+const LINE_UNSAFE = /[\u0080-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/gu;
+const lineSafeLiteral = (text: string): string =>
+  JSON.stringify(text).replace(LINE_UNSAFE, (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`);
+
 /** An error as ledger-safe text: one JSON literal of at most 200 characters
- * (line breaks and controls escaped), even when the error cannot print. */
+ * (line breaks, controls and bidi overrides escaped; cut on a code point),
+ * even when the error cannot print. */
 function boundedErrorText(error: unknown): string {
   let text: string;
-  try { text = error instanceof Error ? `${error.name}: ${error.message}` : String(error); } catch { text = 'an error that cannot be printed'; }
-  const literal = JSON.stringify(text);
-  return literal.length <= 200 ? literal : `${JSON.stringify(text.slice(0, 180)).slice(0, -1)}…"`;
+  try { text = error instanceof Error ? (error.message === '' ? error.name : `${error.name}: ${error.message}`) : String(error); } catch { text = 'an error that cannot be printed'; }
+  const literal = lineSafeLiteral(text);
+  if (literal.length <= 200) return literal;
+  // Escaping can grow a character six-fold: shrink until the cut fits.
+  const points = [...text];
+  let count = Math.min(points.length, 198);
+  let cut = lineSafeLiteral(points.slice(0, count).join(''));
+  while (cut.length > 199) {
+    count = Math.max(0, Math.min(count - 1, Math.floor((count * 199) / cut.length)));
+    cut = lineSafeLiteral(points.slice(0, count).join(''));
+  }
+  return `${cut.slice(0, -1)}…"`;
 }
 
 /** The target minion's runtime cannot host a native directive at all. Raised

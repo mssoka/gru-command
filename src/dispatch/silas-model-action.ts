@@ -52,6 +52,8 @@ const HEAD_SHA = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u;
  * sequences and Indic or Persian text need them, and they cannot reorder or
  * hide a line. The rationale alone may carry tabs and line feeds; a carriage
  * return could overwrite a rendered line, so it never may. */
+// Unassigned (Cn) is judged by this runtime's Unicode tables: fail-closed —
+// a code point with no defined rendering is refused until the runtime knows it.
 const UNSAFE_TEXT = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Co}\p{Cn}]/gu;
 const JOINERS: ReadonlySet<string> = new Set(['\u200c', '\u200d']);
 const hasUnsafeText = (value: string, allowBreaks: boolean): boolean =>
@@ -62,11 +64,12 @@ const TEXT_RULE = 'non-blank; length in code points; no control, format, separat
 /** Why a present bounded field is unusable, or null when it is fine. */
 function boundedFieldProblem(field: keyof typeof SILAS_ACTION_LIMITS, value: unknown): string | null {
   const limit = SILAS_ACTION_LIMITS[field];
-  if (typeof value !== 'string' || value.trim() === '') return `${field} must be a non-blank string`;
+  // Joiners alone render as nothing: they never make a value non-blank.
+  if (typeof value !== 'string' || value.replace(/[\u200c\u200d]/gu, '').trim() === '') return `${field} must be a non-blank string`;
   // A lone surrogate is no character a reader can see, and no UTF-8 text.
   if (/\p{Surrogate}/u.test(value)) return `${field} must be well-formed Unicode`;
   if ([...value].length > limit) return `${field} must be at most ${String(limit)} characters`;
-  if (hasUnsafeText(value, field === 'rationale')) return `${field} must not contain control, format or separator characters`;
+  if (hasUnsafeText(value, field === 'rationale')) return `${field} must not contain control, format, separator, private-use or unassigned characters (zero-width joiners allowed)`;
   return null;
 }
 
@@ -195,8 +198,13 @@ export function spawnSilasWithActionTool(
     ...(deps.log !== undefined ? { log: deps.log } : {}),
   });
   const callerTools: unknown = spawnOptions?.nativeTools ?? [];
-  if (!Array.isArray(callerTools) || callerTools.some((tool) => tool === null || typeof tool !== 'object' || typeof (tool as { name?: unknown }).name !== 'string')) {
-    return Promise.reject(new TypeError('spawn options nativeTools must be an array of named native tools'));
+  if (!Array.isArray(callerTools)) return Promise.reject(new TypeError('spawn options nativeTools must be an array of named native tools'));
+  // Every slot, holes included: a hole or a nameless member is named by index.
+  for (let index = 0; index < callerTools.length; index += 1) {
+    const tool: unknown = callerTools[index];
+    if (tool === null || typeof tool !== 'object' || typeof (tool as { name?: unknown }).name !== 'string' || (tool as { name: string }).name === '') {
+      return Promise.reject(new TypeError(`spawn options nativeTools[${String(index)}] must be a native tool with a non-empty string name`));
+    }
   }
   if ((callerTools as readonly NativeAgentTool[]).some((tool) => tool.name === SILAS_MODEL_ACTION_TOOL)) {
     return Promise.reject(new Error(

@@ -170,8 +170,13 @@ describe('H6 silas_action tool bindings (unit seams)', () => {
     // private-use and unassigned code points are not.
     expect(await outcome({ action: 'hold', jobId: job.id, rationale: '👩\u200d💻 می\u200cخواهم', family: 'joined\u200dtext' })).toMatchObject({ ok: true });
     for (const [field, value] of [['rationale', 'private\ue000use'], ['debt', 'unassigned\u0378']] as const) {
-      expect(await outcome({ action: 'hold', jobId: job.id, [field]: value }), field).toMatchObject({ ok: false, reason: 'bad-field' });
+      // The refusal names the rule the schema states.
+      expect(await outcome({ action: 'hold', jobId: job.id, [field]: value }), field)
+        .toMatchObject({ ok: false, reason: 'bad-field', message: `${field} must not contain control, format, separator, private-use or unassigned characters (zero-width joiners allowed)` });
     }
+    // Joiners alone render as nothing: never a non-blank value.
+    expect(await outcome({ action: 'hold', jobId: job.id, rationale: ' \u200d\u200c ' }))
+      .toMatchObject({ ok: false, reason: 'bad-field', message: 'rationale must be a non-blank string' });
     // The schema the model sees states the same rules.
     const schema = (tool.inputSchema as { properties: Record<string, { minLength?: number; description?: string }> }).properties;
     for (const field of ['jobId', 'family', 'debt', 'rationale']) {
@@ -290,8 +295,12 @@ describe('H6 the Silas slot spawn wiring (#368)', () => {
       .rejects.toThrow(/already carries a silas_action tool — each spawn binds its own/u);
     await expect(spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() }, { nativeTools: 'not tools' as never }))
       .rejects.toThrow(/nativeTools must be an array of named native tools/u);
-    await expect(spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() }, { nativeTools: [null] as never }))
-      .rejects.toThrow(/nativeTools must be an array of named native tools/u);
+    // Every slot is checked — holes included — and named by index.
+    // eslint-disable-next-line no-sparse-arrays
+    for (const [tools, index] of [[[null], 0], [[{}], 0], [[{ name: 5 }], 0], [['x'], 0], [[{ name: '' }], 0], [[stale, ,], 1]] as const) {
+      await expect(spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() }, { nativeTools: tools as never }), JSON.stringify(tools))
+        .rejects.toThrow(`spawn options nativeTools[${String(index)}] must be a native tool with a non-empty string name`);
+    }
     expect(spawns).toBe(1);
   });
 

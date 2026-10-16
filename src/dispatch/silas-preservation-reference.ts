@@ -139,19 +139,24 @@ const plainRelative = (entry: string): boolean =>
 
 const errorCode = (error: unknown): string | undefined => (error as NodeJS.ErrnoException | null)?.code;
 
-/** A directory's device and inode, read without following a link. */
-function directoryIdentity(path: string): { readonly dev: number; readonly ino: number } | null {
+interface DirectoryIdentity { readonly dev: bigint; readonly ino: bigint; readonly birth: bigint }
+/** A directory's device, inode and birth time (nanoseconds — a directory
+ * deleted and re-created on a recycled inode is born later), read without
+ * following a link; null when it is no directory or cannot be read. */
+function directoryIdentity(path: string): DirectoryIdentity | null {
   try {
-    const stat = lstatSync(path);
-    return stat.isDirectory() ? { dev: stat.dev, ino: stat.ino } : null;
+    const stat = lstatSync(path, { bigint: true });
+    return stat.isDirectory() ? { dev: stat.dev, ino: stat.ino, birth: stat.birthtimeNs } : null;
   } catch {
     return null;
   }
 }
-/** Still the same canonical directory it was. */
-function sameDirectory(path: string, before: { readonly dev: number; readonly ino: number } | null): boolean {
+/** Why `path` is no longer the canonical directory it was, or null. */
+function directoryChange(path: string, before: DirectoryIdentity | null): string | null {
   const now = directoryIdentity(path);
-  return before !== null && now !== null && now.dev === before.dev && now.ino === before.ino && canonicalDirectory(path);
+  if (before === null || now === null) return `${path} vanished or cannot be read`;
+  if (now.dev !== before.dev || now.ino !== before.ino || now.birth !== before.birth) return `${path} was replaced by another directory`;
+  return canonicalDirectory(path) ? null : `${path} is now reached through a symlink`;
 }
 
 /** A real directory reached by no symlinked component: its realpath is the
@@ -222,10 +227,12 @@ export function resolvePreservationReference(input: {
     return refuse('the preservation reference must carry a lowercase sha256 of the record');
   }
   const recordDir = dirname(resolve(reference.recordPath));
+  // Identity first: the canonical proof then speaks for the directory the
+  // final re-check compares against.
+  const recordDirIdentity = directoryIdentity(recordDir);
   if (!canonicalDirectory(recordDir)) {
     return refuse(`the preservation record directory ${recordDir} must be a real directory reached by no symlink — pass its realpath`);
   }
-  const recordDirIdentity = directoryIdentity(recordDir);
   // ONE read: the bytes whose digest is verified are the bytes parsed.
   let recordBytes: Buffer;
   try {
@@ -262,10 +269,12 @@ export function resolvePreservationReference(input: {
   if (treePath === null || treePath === '') {
     return refuse('the preservation record carries no original tree path', [], actualRecordSha);
   }
+  const treeIdentity = isAbsolute(treePath) ? directoryIdentity(treePath) : null;
   if (!isAbsolute(treePath) || !canonicalDirectory(treePath)) {
     return refuse(`the original tree ${treePath} must be an absolute real directory reached by no symlink — the tree is retained`, [], actualRecordSha);
   }
-  const treeIdentity = directoryIdentity(treePath);
+  // The parent of each live link verified below, re-proven with the rest.
+  const linkParents = new Map<string, DirectoryIdentity | null>();
   // The reusable original portions the legacy record declares.
   const declared: { readonly name: string; readonly sha: unknown }[] = [
     { name: REPORT_ASSET, sha: record['original_report_sha256'] },
@@ -377,6 +386,7 @@ export function resolvePreservationReference(input: {
     if (stat.isSymbolicLink()) {
       // The link IS the deliverable: reading its target would dereference
       // it. Presence is enough — the target is never followed or copied.
+      if (!linkParents.has(dirname(entryPath))) linkParents.set(dirname(entryPath), directoryIdentity(dirname(entryPath)));
       verifiedAssets.push(`link:${entry}`);
     }
   }
@@ -404,14 +414,16 @@ export function resolvePreservationReference(input: {
     }
     verifiedAssets.push('archive(current-ignored-untracked-deliverables-links-preserved.tar.gz)');
   }
-  // Leaves are read no-follow; their parent directories were proven
-  // canonical before the reads and are proven to be the SAME directories
-  // (same device and inode, still canonical) after the last one, so a
-  // directory left swapped is refused. A swap that is undone again before
-  // this check is not observable from paths alone — this narrows the window,
-  // it does not close it.
-  if (!sameDirectory(recordDir, recordDirIdentity) || !sameDirectory(treePath, treeIdentity)) {
-    return refuse('the record directory or the original tree changed while it was being verified — the tree is retained', verifiedAssets, actualRecordSha);
+  // Leaves are read no-follow; their parent directories (and each verified
+  // link's) were proven canonical and are proven to be the SAME directories
+  // (same device, inode and birth time, still canonical) after the last
+  // read, so a directory left swapped is refused. A swap that is undone again
+  // before this check is not observable from paths alone — this narrows the
+  // window, it does not close it.
+  const changed = [[recordDir, recordDirIdentity] as const, [treePath, treeIdentity] as const, ...linkParents]
+    .map(([path, identity]) => directoryChange(path, identity)).find((change) => change !== null);
+  if (changed !== undefined) {
+    return refuse(`the record directory or the original tree changed while it was being verified (${changed}) — the tree is retained`, verifiedAssets, actualRecordSha);
   }
   return { reusable: true, guidance: null, verifiedAssets, recordSha256: actualRecordSha };
 }
