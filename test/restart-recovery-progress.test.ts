@@ -92,6 +92,9 @@ class NativeFixture {
   getContextUsage() { return undefined; }
 }
 
+/** The minion the fixture registers and its registry spawns by default. */
+const FIXTURE_MINION = 'logical-minion';
+
 async function fixture(kind: 'directive' | 'rebrief' = 'directive', nativeCwd = true, report = false) {
   const dir = mkdtempSync(join(tmpdir(), 'gru-restart-progress-'));
   const repo = makeFixtureRepo('restart-progress');
@@ -109,8 +112,8 @@ async function fixture(kind: 'directive' | 'rebrief' = 'directive', nativeCwd = 
   mkdirSync(join(store.sessionsDir, 'minion'), { recursive: true });
   writeFileSync(file, '');
   const native = new NativeFixture(file, 'native-session', nativeCwd ? lane.path : undefined);
-  ledger.registerAgent({ id: 'logical-minion', role: 'minion', jobId: 'approved-job', sessionFile: file, parentage: 'top-level' });
-  ledger.setAgentState('logical-minion', 'idle');
+  ledger.registerAgent({ id: FIXTURE_MINION, role: 'minion', jobId: 'approved-job', sessionFile: file, parentage: 'top-level' });
+  ledger.setAgentState(FIXTURE_MINION, 'idle');
   const intent = kind === 'rebrief'
     ? ledger.beginRebriefIntent({ jobId: 'approved-job', requestId: 'approved-request', note: 'approved correction', holder: 'gru' }).record
     : ledger.beginDirectiveIntent({ jobId: 'approved-job', requestId: 'approved-request', directive: 'approved correction', holder: 'gru' }).record;
@@ -124,7 +127,7 @@ async function fixture(kind: 'directive' | 'rebrief' = 'directive', nativeCwd = 
     async spawn(_role, options = {}) {
       spawns.push(options);
       if (spawnGate !== null) await spawnGate;
-      handle = new PiAgentHandle('minion', native, file, PI_CAPABILITIES, false, [], store, () => {}, () => { handle = null; }, 60_000, options.agentId ?? 'logical-minion', () => manifest, () => resolveGitCommit(lane.path, 'HEAD'));
+      handle = new PiAgentHandle('minion', native, file, PI_CAPABILITIES, false, [], store, () => {}, () => { handle = null; }, 60_000, options.agentId ?? FIXTURE_MINION, () => manifest, () => resolveGitCommit(lane.path, 'HEAD'));
       handle.subscribe((event) => { if (event.type === 'state' && ledger.getAgent(handle!.id) !== null) ledger.setAgentState(handle!.id, event.state); });
       return handle;
     },
@@ -852,6 +855,163 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     try { service.reconsider(); await service.settled(); expect(spawn).toHaveBeenCalledTimes(1); expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('dispatching'); }
     finally { await service.dispose(); }
   });
+
+  /** Before the physical prompt starts, the native target and the producer
+   * start are COMMITTED: read back from a fresh connection to a consistent
+   * copy of the ledger, not from the writer's own state (#362). */
+  async function assertPreparedBeforePrompt(route: 'fresh' | 'resident') {
+    const f = await fixture();
+    if (route === 'resident') await f.registry.spawn('minion', { agentId: 'logical-minion' });
+    const seen: { readonly target: unknown; readonly started: boolean }[] = [];
+    const prompt = f.native.prompt.bind(f.native);
+    f.native.prompt = async (text: string, options?: unknown) => {
+      const db = new LedgerDb(crashSnapshot(f));
+      try {
+        const durable = new LedgerApi(db.handle, { bus: new EventBus({}) });
+        seen.push({
+          target: durable.getDirective(f.intent.requestId)?.nativeTarget ?? null,
+          started: durable.latestJobEventByRequestId(f.intent.jobId, 'silas.directive-producer-started', f.intent.requestId) !== null,
+        });
+      } finally { db.close(); }
+      return prompt(text, options);
+    };
+    await executeAcceptedDirective(f.deps, f.intent.requestId);
+    // One spawn either way: the resident route's own setup spawn, or the
+    // fresh route's spawn — never a second.
+    expect(f.spawns, route).toHaveLength(1);
+    expect(seen, route).toEqual([{ target: { agentId: 'logical-minion', sessionFile: f.file }, started: true }]);
+  }
+  it('#362 the fresh route prompts only after the durable native target and producer start commit', () => assertPreparedBeforePrompt('fresh'));
+  it('#362 the resident route prompts only after the durable native target and producer start commit', () => assertPreparedBeforePrompt('resident'));
+
+  /** The durable ledger exactly as it stands NOW — what a process killed at
+   * this instant leaves behind (a consistent online copy, never a guess). */
+  function crashSnapshot(f: Awaited<ReturnType<typeof fixture>>): string {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-crash-snapshot-'));
+    // Cleanups run last-in first-out: a db opened on this copy closes first.
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    mkdirSync(join(dir, 'ledger'));
+    f.db.handle.prepare('VACUUM INTO ?').run(join(dir, 'ledger', 'ledger.db'));
+    return dir;
+  }
+
+  const POST_CRASH_SUCCESSOR = 'post-crash-successor';
+  /** The minion the fresh route spawns: the fixture's own. */
+  const SPAWNED_MINION = FIXTURE_MINION;
+
+  /** Runs the REAL executor and snapshots the ledger at a crash window between
+   * registry.spawn() and onPrepared, then recovers from that snapshot as a
+   * restarted service would (#362). */
+  async function recoverFromCrash(crashPoint: 'inside-spawn' | 'after-registration') {
+    const f = await fixture(); void (f.ledger.getWorktree(f.lane.id) ?? f.ledger.registerWorktree(f.lane));
+    let release: () => void = () => {};
+    if (crashPoint === 'inside-spawn') f.spawnGate(new Promise<void>((resolve) => { release = resolve; }));
+    let snapshot = null as string | null;
+    // The crash point is found by what happened, not by counting boundaries:
+    // the first admission boundary after the spawned minion's registration is
+    // the one immediately before onPrepared.
+    let registered = false;
+    let registeredAtCrash = false;
+    const takeSnapshot = (): void => { snapshot = crashSnapshot(f); registeredAtCrash = registered; };
+    // Every failure is kept with where it came from (a thrown null included),
+    // and none masks another.
+    const failures: { readonly where: string; readonly error: unknown }[] = [];
+    let registrations = 0;
+    const register = f.ledger.registerAgent.bind(f.ledger);
+    const spy = vi.spyOn(f.ledger, 'registerAgent').mockImplementation((input) => {
+      const row = register(input);
+      if (input.id === SPAWNED_MINION) { registered = true; registrations += 1; }
+      return row;
+    });
+    try {
+      // The rejection handler is attached where the run starts: never an
+      // unhandled rejection while the spawn wait runs.
+      const run = executeAcceptedDirective({ ...f.deps, beforeWriterSideEffect: () => {
+        if (crashPoint !== 'after-registration' || !registered || snapshot !== null || failures.length > 0) return;
+        // A failing snapshot is kept, never folded into the executor's own recovery.
+        try { takeSnapshot(); } catch (error) { failures.push({ where: 'snapshot', error }); }
+      } }, f.intent.requestId).catch((error: unknown) => { failures.push({ where: 'executor', error }); });
+      try {
+        if (crashPoint === 'inside-spawn') {
+          await vi.waitFor(() => expect(f.spawns).toHaveLength(1));
+          takeSnapshot();
+        }
+      } catch (error) { failures.push({ where: 'spawn wait', error }); } finally { release(); }
+      // The executor is always awaited, so it never runs on into cleanup.
+      await run;
+    } finally { spy.mockRestore(); }
+    const [only] = failures;
+    // The failure's own text, whatever it is — never a second throw while reporting it.
+    const textOf = (error: unknown): string => {
+      if (error instanceof Error) return error.message;
+      try { return JSON.stringify(error) ?? String(error); } catch { return Object.prototype.toString.call(error); }
+    };
+    if (failures.length === 1 && only !== undefined) throw new Error(`fixture: ${only.where} failed at ${crashPoint}: ${textOf(only.error)}`, { cause: only.error });
+    if (failures.length > 1) {
+      const where = failures.map((failure) => failure.where).join(', ');
+      throw new AggregateError(failures.map((failure) => failure.error), `fixture: failures at ${crashPoint} (${where})`);
+    }
+    if (crashPoint === 'after-registration' && !registered) throw new Error(`fixture: the spawned registration of "${SPAWNED_MINION}" was never reached (did the spawn register another id?)`);
+    // Either way the run went on to completion (the inside-spawn run once its
+    // gate was released): the spawned minion registered exactly once.
+    expect(registrations, `${crashPoint}: registrations of ${SPAWNED_MINION}`).toBe(1);
+    if (snapshot === null) throw new Error(crashPoint === 'after-registration' ? 'fixture: no admission boundary followed the spawned registration' : 'fixture: no snapshot inside the spawn');
+    // The windows differ by what the executor had done when the snapshot was
+    // taken (the fixture pre-registers the same idle row, so the two rows
+    // look alike): inside the spawn the registration had NOT run.
+    expect(registeredAtCrash, `${crashPoint}: the spawned registration had run`).toBe(crashPoint === 'after-registration');
+    const db = new LedgerDb(snapshot); cleanups.push(() => db.close());
+    const bus = new EventBus({}); const ledger = new LedgerApi(db.handle, { bus });
+    // The crashed state itself: reserved, no native target, no producer start,
+    // and no open turn on the agent row that could fence the lane.
+    expect(ledger.getDirective(f.intent.requestId), crashPoint).toMatchObject({ state: 'dispatching', nativeTarget: null });
+    expect(ledger.latestJobEventByRequestId(f.intent.jobId, 'silas.directive-producer-started', f.intent.requestId), crashPoint).toBeNull();
+    expect(ledger.getAgent(SPAWNED_MINION)?.state, `${crashPoint}: the crashed row`).toBe('idle');
+    for (const lane of ledger.listWorktrees()) rememberManagedLane(lane, ledger);
+    let respawns = 0;
+    const registry: DirectiveRegistry = { getHandle: () => null, spawn: async () => { respawns += 1; throw new Error('the reserved original must never respawn'); },
+      disposeHandle: async (handle) => handle.dispose() };
+    const service = new DirectiveProgressService({ ...f.deps, ledger, registry, notifications: new NotificationCenter({ ledger, bus }) });
+    try {
+      // Two passes: a second reconsideration must not replay it either.
+      service.reconsider(); await service.settled();
+      service.reconsider(); await service.settled();
+    } finally { await service.dispose(); }
+    const original = ledger.getDirective(f.intent.requestId);
+    // Never replayed, and no deferral invented from the missing target.
+    expect(respawns).toBe(0);
+    expect(original).toMatchObject({ state: 'dispatching', nativeTarget: null });
+    expect(ledger.hasDirectiveDispatchDeferral(f.intent.requestId)).toBe(false);
+    expect(ledger.claimDirectiveDispatch(f.intent.requestId)).toBe(false);
+    expect(() => ledger.directiveProducerStart(f.identity)).toThrow(/exact directive producer start receipt missing/u);
+    const debt = ledger.listObligations({ jobId: f.intent.jobId }).find((item) => item.incidentKey === `directive-recovery:${f.intent.requestId}`);
+    expect(debt, 'the interrupted request is owed a recovery decision').toBeDefined();
+    const authority = ledger.directiveCurrentAuthority(f.intent.jobId);
+    const decide = () => recoverInterruptedDirectiveFromRoute({ ledger, worktrees: f.worktrees, pendingProducerBlockers: () => [],
+      requestId: f.intent.requestId, generation: debt!.generation, expectedPayloadHash: original!.payloadHash,
+      expectedHead: resolveGitCommit(f.lane.path, 'HEAD'), expectedEpoch: ledger.directiveRecoveryEpoch(f.intent.jobId),
+      expectedWorkRevision: authority.workRevision, expectedContractSha256: authority.contractSha256,
+      reason: 'the reserved original never reached a native target', decision: { kind: 'successor', requestId: POST_CRASH_SUCCESSOR, directive: 'approved correction' } });
+    return { ledger, decide, debt: debt!, requestId: f.intent.requestId, jobId: f.intent.jobId };
+  }
+
+  /** No prompt can precede onPrepared, so neither crash window left a native
+   * effect: no open turn fences the lane (the registration leaves the agent
+   * idle), and fresh authority may proceed at once — retiring the reserved
+   * original, never replaying it. */
+  async function assertSuccessorMayProceed(crashPoint: 'inside-spawn' | 'after-registration') {
+    const { ledger, decide, requestId, jobId } = await recoverFromCrash(crashPoint);
+    // After recovery the row is still idle — no open turn can fence the lane.
+    expect(ledger.getAgent(SPAWNED_MINION)?.state, `${crashPoint}: the recovered row`).toBe('idle');
+    expect(decide().successor?.requestId, crashPoint).toBe(POST_CRASH_SUCCESSOR);
+    expect(ledger.getDirective(requestId)?.state, crashPoint).toBe('retired');
+    // Retired by the decision, never by an invented no-native-effect deferral
+    // (the durable event itself: the row-state predicate is false for any
+    // retired row, so it cannot witness this).
+    expect(ledger.latestJobEventByRequestId(jobId, 'silas.directive-dispatch-deferred', requestId), `${crashPoint}: no deferral event`).toBeNull();
+  }
+  it('#362 a crash inside registry.spawn() is never replayed, and a successor may proceed', () => assertSuccessorMayProceed('inside-spawn'));
+  it('#362 a crash after the spawned registration but before onPrepared is never replayed, and a successor may proceed', () => assertSuccessorMayProceed('after-registration'));
 
   it('positive no-effect closes only the attached awaiting phase without completion', async () => {
     const f = await fixture(); f.ledger.failDirective({ requestId: f.intent.requestId, reason: 'fixture replaced before dispatch' });
