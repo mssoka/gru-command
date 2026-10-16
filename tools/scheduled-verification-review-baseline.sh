@@ -10,14 +10,12 @@ base=2823cf75e4a736bd9548973294e1f569fceab718
 # rerun into a setup failure the classifier rightly refuses (#358).
 regressions=6883628e6ba4f58efb993fb2f042260b84b6a6d1
 set -- test/worker-verification-policy.test.ts test/workflow-session.test.ts test/pi-adapter.test.ts test/claude-adapter.test.ts test/helpers/worker-verification.ts test/helpers/claude-double.mjs test/helpers/verification-native-corpus.mjs test/helpers/verification-native-corpus.d.mts
-. "$(dirname "$0")/scheduled-verification-baseline-lib.sh"
+lib="$(dirname "$0")/scheduled-verification-baseline-lib.sh"
+[ -r "$lib" ] || { echo "cannot read $lib — run this baseline as: sh tools/$(basename "$0")" >&2; exit 2; }
+. "$lib"
 require_pinned_sources "$base" "$regressions" "$@"
 d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gh315-review-baseline.XXXXXX")
-# Archive to a file first: a failing archive aborts under set -e (a pipe
-# would report only tar's status).
-git archive -o "$d.tar" "$base"
-tar -x -C "$d" -f "$d.tar"
-rm -f "$d.tar"
+snapshot_candidate "$d" "$base"
 for f in "$@"; do
   git show "${regressions}:$f" > "$d/$f"
 done
