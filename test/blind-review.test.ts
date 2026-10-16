@@ -1,7 +1,8 @@
+import { createHash } from 'node:crypto';
 import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { afterAll, describe, expect, it } from 'vitest';
+import { join, resolve } from 'node:path';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
@@ -192,13 +193,22 @@ describe('observeBlindSessionAccess — repeated scans count distinct reads (iss
     expect(refusal).toBeInstanceOf(BlindInputRefusal);
     expect(refusal).toMatchObject({ code: 'blind_coverage_unreadable', status: 409, details: { coverage_job_id: 'sibling-review' } });
     expect(String(refusal)).toMatch(/blind coverage of sibling review "sibling-review" cannot be read: .*non-object "prohibited" entr/u);
+    expect((refusal as BlindInputRefusal).correction).toBe(`Inspect and repair "sibling-review"'s ${BLIND_ACCESS_EVENT} events in the ledger (its coverage cannot be computed until they are readable), then commission again.`);
     h.dispose();
   });
 
   it('a session identity needs an absolute path, and survives a transcript gone since it was read (#355)', () => {
     expect(() => blindSessionIdentity('relative/session.jsonl')).toThrow(/must be an absolute path/u);
+    // Gone with its directory: the nearest ancestor that resolves, canonical, plus the names below it.
     const gone = join(tmpdir(), `gru-gone-${String(process.pid)}`, 'session.jsonl');
-    expect(blindSessionIdentity(gone)).toMatch(/^[0-9a-f]{64}$/u);
+    const sha256 = (text: string): string => createHash('sha256').update(text).digest('hex');
+    expect(blindSessionIdentity(gone)).toBe(sha256(join(realpathSync(tmpdir()), `gru-gone-${String(process.pid)}`, 'session.jsonl')));
+    // Any failure other than absence is raised, never papered over.
+    const loop = join(realpathSync(mkdtempSync(join(tmpdir(), 'blind-loop-'))), 'loop');
+    try {
+      symlinkSync(loop, loop);
+      expect(() => blindSessionIdentity(join(loop, 'a.jsonl'))).toThrow(/ELOOP/u);
+    } finally { rmSync(join(loop, '..'), { recursive: true, force: true }); }
     // Gone through a linked directory: the same identity it had while it existed.
     const dir = realpathSync(mkdtempSync(join(tmpdir(), 'blind-gone-')));
     try {
@@ -215,7 +225,30 @@ describe('observeBlindSessionAccess — repeated scans count distinct reads (iss
     h.admit('job-cumulative');
     observeBlindSessionAccess(h.ledger, 'job-cumulative', 'relative/session.jsonl', () => [result(0, PROHIBITED)]);
     expect(blindCoverageOf(h.ledger, 'job-cumulative')).toMatchObject({ state: 'invalidated', prohibitedAccess: 1 });
-    expect((h.ledger.latestJobEvent('job-cumulative', BLIND_ACCESS_EVENT)?.payload as { session: string }).session).toMatch(/^unresolved:[0-9a-f]{64}$/u);
+    const unresolved = `unresolved:${createHash('sha256').update(resolve('relative/session.jsonl')).digest('hex')}`;
+    expect((h.ledger.latestJobEvent('job-cumulative', BLIND_ACCESS_EVENT)?.payload as { session: string }).session).toBe(unresolved);
+    // A re-scan of the same unresolvable transcript is the same read.
+    observeBlindSessionAccess(h.ledger, 'job-cumulative', 'relative/session.jsonl', () => [result(0, PROHIBITED)]);
+    expect(blindCoverageOf(h.ledger, 'job-cumulative')).toMatchObject({ state: 'invalidated', prohibitedAccess: 1 });
+    h.dispose();
+  });
+
+  it('names a corrupt blind-access payload, and leaves any other database failure as it is (#355)', () => {
+    const h = blindLedger();
+    h.admit('job-corrupt');
+    observeBlindSessionAccess(h.ledger, 'job-corrupt', '/sessions/a.jsonl', () => [result(0, PROHIBITED)]);
+    const db = (h.ledger as unknown as { db: { prepare(sql: string): { run(...args: unknown[]): unknown } } }).db;
+    db.prepare('UPDATE events SET payload = ? WHERE job_id = ? AND kind = ?').run('{bad', 'job-corrupt', BLIND_ACCESS_EVENT);
+    const keys = { event: ['session'], entry: ['index'] };
+    let corrupt: unknown = null;
+    try { h.ledger.countJobEventsAndDistinctArrayEntries('job-corrupt', BLIND_ACCESS_EVENT, 'prohibited', keys); } catch (error) { corrupt = error; }
+    expect((corrupt as Error).message).toMatch(new RegExp(`^job "job-corrupt" has a ${BLIND_ACCESS_EVENT.replace(/\./gu, '\\.')} event whose payload cannot be read as JSON \\(.*malformed JSON.*\\) — refusing to count; inspect the ledger$`, 'u'));
+    expect((corrupt as Error).cause).toBeInstanceOf(Error);
+    const busy = Object.assign(new Error('database is locked'), { code: 'SQLITE_BUSY' });
+    const spy = vi.spyOn(db, 'prepare').mockImplementation(() => { throw busy; });
+    try {
+      expect(() => h.ledger.countJobEventsAndDistinctArrayEntries('job-corrupt', BLIND_ACCESS_EVENT, 'prohibited', keys)).toThrow(busy);
+    } finally { spy.mockRestore(); }
     h.dispose();
   });
 

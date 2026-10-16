@@ -349,26 +349,35 @@ const BLIND_READ_IDENTITY = {
  * spelling, and any other resolution failure is thrown. */
 export function blindSessionIdentity(sessionFile: string): string {
   if (!isAbsolute(sessionFile)) throw new Error(`blind session file must be an absolute path (got ${JSON.stringify(sessionFile)})`);
-  let canonical: string;
+  return createHash('sha256').update(canonicalPathOf(sessionFile)).digest('hex');
+}
+
+/** A path's canonical form, even once it (or its directories) is gone: the
+ * nearest ancestor that still resolves, canonical, plus the names below it —
+ * the same identity it had while it existed. Any failure other than absence
+ * is raised. */
+function canonicalPathOf(path: string): string {
   try {
-    canonical = realpathSync(sessionFile);
+    return realpathSync(path);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    // Gone since it was read: its directory, canonical, plus its own name —
-    // the same identity it had while it existed.
-    try { canonical = join(realpathSync(dirname(sessionFile)), basename(sessionFile)); } catch { canonical = resolve(sessionFile); }
+    const code = (error as NodeJS.ErrnoException).code;
+    const parent = dirname(path);
+    if ((code !== 'ENOENT' && code !== 'ENOTDIR') || parent === path) throw error;
+    return join(canonicalPathOf(parent), basename(path));
   }
-  return createHash('sha256').update(canonical).digest('hex');
 }
 
 /** The identity a scan records: the canonical one, or — when the transcript
  * path cannot be resolved — an explicit unresolved one, so a read that was
  * scanned is never dropped for want of an identity (#356). */
 function scanSessionIdentity(sessionFile: string): string {
+  // Deliberately broad: the observer never throws and never drops a scanned
+  // read (#356). The fallback hashes the resolved path, so repeated scans of
+  // one unresolvable transcript count once.
   try {
     return blindSessionIdentity(sessionFile);
   } catch {
-    return `unresolved:${createHash('sha256').update(sessionFile).digest('hex')}`;
+    return `unresolved:${createHash('sha256').update(resolve(sessionFile)).digest('hex')}`;
   }
 }
 

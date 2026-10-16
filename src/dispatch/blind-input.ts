@@ -270,9 +270,8 @@ function extensionOf(path: string): string {
 }
 
 /** A path whose SHAPE alone puts it outside the package: empty, absolute,
- * a `..` segment or a NUL (either slash direction). */
-function outsidePackageShape(path: string): boolean {
-  const slashed = path.replace(/\\/gu, '/');
+ * a `..` segment or a NUL. Callers pass `/`-separated paths. */
+function outsidePackageShape(slashed: string): boolean {
   return slashed === '' || slashed.startsWith('/') || /(^|\/)\.\.(\/|$)/u.test(slashed) || slashed.includes('\0');
 }
 
@@ -602,16 +601,25 @@ export interface ProhibitedAccess {
  * starts with whitespace (an indented stack frame is not a grep result). */
 const GREP_LINE = /^((?:\.\/)?[^\s:][^:\n]*):\d+[:-]/u;
 
-/** Candidate paths judged per spaced grep line: the whole capture plus its
- * LAST starts (the path is a suffix, so padding before it can never push it
- * out), bounded for a pathological line. */
-const MAX_GREP_CANDIDATES = 64;
-/** A spaced candidate whose SHAPE may still classify it: it starts like an
- * absolute or parent path AND its last path component has no whitespace — a
- * real spaced path (`/Users/a b/notes.md`, `/Users/a b/Makefile`), never a
- * clock time or prose, whose words follow the last slash
- * (`/var/log/app.log started at 10`). */
-const FILE_LIKE_OUTSIDE = /^(?:\/|\.\.\/)[\s\S]*\/[^/\s]+$/u;
+/** No path is longer than PATH_MAX: a spaced grep line's candidates are the
+ * word and component starts within its last this-many characters. The path
+ * is a suffix of the capture, so every start of a real one — however deep,
+ * however much padding precedes it — is judged, and the work per line stays
+ * bounded. */
+const MAX_PATH_CHARS = 4096;
+/** A spaced candidate whose SHAPE may still classify it: its last path
+ * component has no whitespace, and it is a parent path (`../x`) or an
+ * absolute one naming at least a directory and a file — a real spaced path
+ * (`/Users/a b/notes.md`, `/Users/a b/Makefile`), never prose or a clock
+ * time whose words follow the last slash (`/var/log/app.log started at
+ * 10`), a lone `/word` (`ratio 3 /4:12:`) or a `//host` URL. */
+function fileLikeOutside(candidate: string): boolean {
+  const lastSlash = candidate.lastIndexOf('/');
+  const last = candidate.slice(lastSlash + 1);
+  if (last === '' || /\s/u.test(last)) return false;
+  if (candidate.startsWith('../')) return true;
+  return candidate.startsWith('/') && candidate.indexOf('/', 1) > 1 && lastSlash > 0;
+}
 
 /** The paths a tool-result line may name as a grep hit, each with whether
  * its SHAPE alone (absolute, `..`) may classify it. A space-free capture is
@@ -620,20 +628,21 @@ const FILE_LIKE_OUTSIDE = /^(?:\/|\.\.\/)[\s\S]*\/[^/\s]+$/u;
  * word or a path component (`Matches in docs/issues/a b.md:1:` names
  * `docs/issues/a b.md`; `/Users/a b/repo/docs/issues/x.md:1:` names
  * `docs/issues/x.md`), is judged by the isolation globs; by shape only when
- * it is file-like (see FILE_LIKE_OUTSIDE). */
-function grepPathCandidates(line: string): readonly { readonly path: string; readonly byShape: boolean }[] {
+ * it is file-like (see fileLikeOutside). */
+export function grepPathCandidates(line: string): readonly { readonly path: string; readonly byShape: boolean }[] {
   const captured = GREP_LINE.exec(line)?.[1];
   if (captured === undefined) return [];
-  const path = captured.trimEnd();
+  // One separator: a Windows-style hit is judged as the same path.
+  const path = captured.trimEnd().replace(/\\/gu, '/');
   if (!/\s/u.test(path)) return [{ path, byShape: true }];
-  const later: number[] = [];
-  for (const match of path.matchAll(/(?<=[\s/])\S/gu)) {
-    later.push(match.index);
-    if (later.length > MAX_GREP_CANDIDATES - 1) later.shift();
-  }
-  return [0, ...later].map((at) => {
+  const from = Math.max(0, path.length - MAX_PATH_CHARS);
+  const starts = from === 0 ? [0] : [];
+  const start = /(?<=[\s/])\S/gu;
+  start.lastIndex = from;
+  for (let match = start.exec(path); match !== null; match = start.exec(path)) starts.push(match.index);
+  return starts.map((at) => {
     const candidate = path.slice(at);
-    return { path: candidate, byShape: FILE_LIKE_OUTSIDE.test(candidate) };
+    return { path: candidate, byShape: fileLikeOutside(candidate) };
   });
 }
 /** Why a grep-hit candidate is excluded, or null. */
