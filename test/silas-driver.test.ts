@@ -895,6 +895,40 @@ describe('silas digest (the four actionable states)', () => {
     }
   });
 
+  it('a newer historical-only delivery never hides a stalled lane: only a proven candidate delivery ends its phase (#363 S07-2-01)', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-historical-stall', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-historical-stall', 'working');
+      h.ledger.registerAgent({ id: 'min-historical-stall', role: 'minion', jobId: 'job-historical-stall' });
+      h.ledger.setAgentState('min-historical-stall', 'idle');
+      // A completion recorded without a proven current candidate, newer than the phase start.
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-historical-stall', payload: { sha: null, work_revision: 0, candidate_delivery_proven: false } });
+      const now = Date.now();
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+        now: () => now + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1_000,
+      });
+      // Computed and rechecked at the publish boundary alike: still stalled.
+      expect(digest.stalledWorking.map((row) => row.jobId)).toEqual(['job-historical-stall']);
+      // A proven candidate delivery does end the phase.
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-historical-stall', payload: { sha: 'a'.repeat(40), work_revision: 0 } });
+      const delivered = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+        now: () => now + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1_000,
+      });
+      expect(delivered.stalledWorking).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('the stalled-lane pick never lands on a review-only session (Gru ruling 2026-09-29)', async () => {
     const h = makeLedger();
     try {

@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -1015,5 +1015,14 @@ describe('pipeline service — r3 blocker repairs', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('pipeline delivery eligibility gate (#363 S06-0-07)', () => {
+  it('the restart-recovery gate runs this file: its historical-only prerequisite regression is part of that focused gate', () => {
+    const toml = readFileSync(join(import.meta.dirname, '..', '.gru-command', 'worktree.toml'), 'utf8');
+    const gate = /^restart-recovery-progress = "([^"]*)"$/mu.exec(toml)?.[1];
+    expect(gate, 'the restart-recovery-progress scope exists').toBeDefined();
+    expect(gate!.split(' ')).toContain('test/pipeline-service.test.ts');
   });
 });
