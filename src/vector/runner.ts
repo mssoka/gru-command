@@ -110,10 +110,15 @@ export interface RaidRunnerOptions {
 /** The file operations commitControl uses on a clone. */
 export interface ControlFs {
   readonly lstat: (path: string) => { isSymbolicLink(): boolean; isDirectory(): boolean };
+  readonly mkdir: (path: string) => void;
   readonly writeFile: (path: string, content: string) => void;
 }
 
-const NODE_CONTROL_FS: ControlFs = { lstat: (path) => lstatSync(path), writeFile: (path, content) => writeFileSync(path, content) };
+export const NODE_CONTROL_FS: ControlFs = {
+  lstat: (path) => lstatSync(path),
+  mkdir: (path) => { mkdirSync(path, { recursive: true }); },
+  writeFile: (path, content) => writeFileSync(path, content),
+};
 
 /** Git for raid roots: no hooks, no fsmonitor, no user config, a fixed identity for control commits; the host's own PATH. */
 function raidGit(cwd: string, args: readonly string[], timeoutMs = 120_000): string {
@@ -546,12 +551,13 @@ export class VectorRaidRunner {
     for (const file of files) {
       const target = join(root, file.path);
       try {
-        // The first directory this write would create, recorded before mkdir:
-        // a recursive mkdir that fails part-way returns nothing.
+        // The first directory this write would create, recorded before mkdir
+        // (a recursive mkdir that fails part-way returns nothing). Only one
+        // whose parent is a directory can be made at all.
         let missing = dirname(target);
         while (dirname(missing) !== missing && !existsSync(dirname(missing))) missing = dirname(missing);
-        if (!existsSync(missing)) createdDirs.push(missing);
-        mkdirSync(dirname(target), { recursive: true });
+        if (!existsSync(missing) && fs.lstat(dirname(missing)).isDirectory()) createdDirs.push(missing);
+        fs.mkdir(dirname(target));
         attempted.push(target);
         fs.writeFile(target, file.content);
       } catch (error) {
@@ -560,15 +566,20 @@ export class VectorRaidRunner {
         // every file it wrote (part-written too) and every directory made for
         // it are removed, and a tracked file it overwrote is restored. A
         // cleanup that fails leaves the clone unknown: that is the host's.
+        const absent = (cause: unknown): boolean => ['ENOENT', 'ENOTDIR'].includes((cause as NodeJS.ErrnoException).code ?? '');
         try {
           for (const path of attempted) {
             // Never a directory: writing onto an existing one is the attack's EISDIR.
-            if (existsSync(path) && !fs.lstat(path).isDirectory()) rmSync(path, { force: true });
+            try {
+              if (!fs.lstat(path).isDirectory()) rmSync(path, { force: true });
+            } catch (cause) {
+              if (!absent(cause)) throw cause;
+            }
           }
           for (const dir of [...createdDirs].reverse()) rmSync(dir, { recursive: true, force: true });
           raidGit(root, ['reset', '--quiet', '--hard', headSha]);
         } catch (cleanup) {
-          throw new AggregateError([error, cleanup], `${label} could not be written, and the clone could not be put back: ${oneLineError(cleanup)}`);
+          throw new AggregateError([error, cleanup], `${label} could not be written (${oneLineError(error)}), and the clone could not be put back: ${oneLineError(cleanup)}`);
         }
         const code = (error as NodeJS.ErrnoException).code;
         if (isAttackPathFault(code)) return `refused: ${label} path ${file.path} cannot be written in the clone (${String(code)})`;

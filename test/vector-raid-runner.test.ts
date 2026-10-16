@@ -12,7 +12,7 @@ import { propertyCampaignRunningForReview, propertyEvidenceForReview, type Prope
 import type { PackageResolution, RetainedCounterexample } from '../src/property/types.js';
 import type { AgentHandle, IsolatedReviewPolicy } from '../src/runtime/types.js';
 import { metricsOf, RAID_OUTCOMES, raidsTowardCap, repositoryRollups, VECTOR_EVENTS, ZERO_BREAK_IN_FLAG_RAIDS, type RaidRecord } from '../src/vector/ledger.js';
-import { isAttackPathFault, raidOutcomeLabel, VectorRaidRunner, type ControlFs, type RaidCampaign } from '../src/vector/runner.js';
+import { isAttackPathFault, NODE_CONTROL_FS, raidOutcomeLabel, VectorRaidRunner, type ControlFs, type RaidCampaign } from '../src/vector/runner.js';
 import { FIX_DISPATCH_FAILED_KIND, FIX_DISPATCHED_KIND, FIX_PROPOSAL_KIND, VectorService } from '../src/vector/service.js';
 
 /**
@@ -203,7 +203,7 @@ function harness(opts: { readonly scripts: Script[]; readonly vector?: Partial<V
     campaign: () => campaign,
     sandbox: () => ({ backend: opts.sandbox ?? 'macos-sandbox-exec', reason: opts.sandbox === 'none-found' ? 'no sandbox-exec on linux' : null }),
     fetchDefault: () => { if (opts.fetchFails === true) throw new Error('could not read from remote repository'); },
-    ...(opts.controlFs === undefined ? {} : { controlFs: { lstat: (path: string) => lstatSync(path), writeFile: (path: string, content: string) => writeFileSync(path, content), ...opts.controlFs } }),
+    ...(opts.controlFs === undefined ? {} : { controlFs: { ...NODE_CONTROL_FS, ...opts.controlFs } }),
     resolvePackages: runnable,
     now: () => new Date(h.now),
     // The wall-clock deadline fires only when a test fires it.
@@ -423,18 +423,42 @@ describe('Silas\'s raid queue (#351 §3)', () => {
       ['invalid-attack', `refused: known-bad control path src/refunds/newtop/${'b'.repeat(300)}/x.js cannot be written in the clone (ENAMETOOLONG)`], ['pass', expect.any(String)]]);
     expect(checked).toBe(true);
     // Writing onto a directory the package holds is the attack's EISDIR, and the directory stays.
-    const dirTarget = harness({ vector: { maxRounds: 1 }, seed: (repo) => { mkdirSync(join(repo, 'src', 'refunds', 'lib')); writeFileSync(join(repo, 'src', 'refunds', 'lib', 'x.js'), 'x\n'); },
-      scripts: [{ attack: attackInput(1, { known_bad: [{ path: 'src/refunds/lib', content: 'x\n' }] }) }] });
+    let dirChecked = false;
+    const dirTarget = harness({ vector: { maxRounds: 2 }, seed: (repo) => { mkdirSync(join(repo, 'src', 'refunds', 'lib')); writeFileSync(join(repo, 'src', 'refunds', 'lib', 'x.js'), 'x\n'); },
+      scripts: [{ attack: attackInput(1, { known_bad: [{ path: 'src/refunds/lib', content: 'x\n' }] }) }, { attack: null, onPrompt: () => {
+        expect(readFileSync(join(dirTarget.raidsDir, d, 'known-bad', 'src', 'refunds', 'lib', 'x.js'), 'utf8')).toBe('x\n');
+        dirChecked = true;
+      } }] });
     const d = dirTarget.launch();
     await dirTarget.runner.tick();
-    expect(raid(dirTarget, d).rounds.map((round) => [round.outcome, round.detail]))
-      .toEqual([['invalid-attack', 'refused: known-bad control path src/refunds/lib cannot be written in the clone (EISDIR)']]);
+    expect(raid(dirTarget, d).rounds.map((round) => [round.outcome, round.detail])[0])
+      .toEqual(['invalid-attack', 'refused: known-bad control path src/refunds/lib cannot be written in the clone (EISDIR)']);
+    expect(dirChecked).toBe(true);
+    // A path that runs through a tracked file into a missing directory is the attack's too.
+    const throughFile = harness({ vector: { maxRounds: 1 }, scripts: [{ attack: attackInput(1, { known_bad: [{ path: 'src/refunds/refund.js/deep/inner.js', content: 'x\n' }] }) }] });
+    const t = throughFile.launch();
+    await throughFile.runner.tick();
+    expect(raid(throughFile, t).rounds.map((round) => [round.outcome, round.detail]))
+      .toEqual([['invalid-attack', expect.stringMatching(/^refused: known-bad control path src\/refunds\/refund\.js\/deep\/inner\.js cannot be written in the clone \((ENOTDIR|EEXIST)\)$/u)]]);
+    // A cleanup that fails leaves the clone unknown: the host's, whatever the first fault was, and both are named.
+    const tooLong = Object.assign(new Error('ENAMETOOLONG: name too long'), { code: 'ENAMETOOLONG' });
+    const eio = Object.assign(new Error('EIO: i/o error'), { code: 'EIO' });
+    let partWritten = false;
+    const stuck = harness({ scripts: [{ attack: attackInput(1, { known_bad: [{ path: 'src/refunds/half.js', content: 'h\n' }] }) }], controlFs: {
+      writeFile: (path, content) => { writeFileSync(path, content); partWritten = true; throw tooLong; },
+      lstat: (path) => { if (partWritten && path.endsWith('half.js')) throw eio; return lstatSync(path); } } });
+    const k = stuck.launch();
+    await stuck.runner.tick();
+    expect(raid(stuck, k)).toMatchObject({ outcome: 'infrastructure-error' });
+    expect(raid(stuck, k).rounds.map((round) => [round.outcome, round.detail])).toEqual([['not-run',
+      'not run: the host failed while preparing its controls (known-bad control could not be written (ENAMETOOLONG: name too long), and the clone could not be put back: EIO: i/o error)']]);
     const long = harness({ vector: { maxRounds: 1 }, scripts: [{ attack: attackInput(1, { known_bad: [{ path: `src/refunds/${'a'.repeat(300)}.js`, content: 'x\n' }] }) }] });
     const l = long.launch();
     await long.runner.tick();
     expect(raid(long, l).rounds.map((round) => [round.outcome, round.detail]))
       .toEqual([['invalid-attack', `refused: known-bad control path src/refunds/${'a'.repeat(300)}.js cannot be checked in the clone (ENAMETOOLONG)`]]);
     // A full disk or a permission fault is the host's: the raid fails as a host error, and the attack is still listed.
+    // (The ENAMETOOLONG cases rely on a 255-byte name limit, as on APFS and ext4.)
     const denied = Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
     const host = harness({ scripts: [{ attack: attackInput(1, { known_bad: [{ path: 'src/refunds/a.js', content: 'a\n' }, { path: 'src/refunds/b.js', content: 'b\n' }] }) }],
       controlFs: { writeFile: (path, content) => { if (path.endsWith('b.js')) throw denied; writeFileSync(path, content); } } });
@@ -451,6 +475,12 @@ describe('Silas\'s raid queue (#351 §3)', () => {
     await unreadable.runner.tick();
     expect(raid(unreadable, r)).toMatchObject({ outcome: 'infrastructure-error' });
     expect(raid(unreadable, r).rounds.map((round) => round.outcome)).toEqual(['not-run']);
+    // And when making a directory fails for a host reason.
+    const noDir = harness({ scripts: [{ attack: attackInput(1, { known_bad: [{ path: 'src/refunds/sub/x.js', content: 'x\n' }] }) }],
+      controlFs: { mkdir: () => { throw denied; } } });
+    const m = noDir.launch();
+    await noDir.runner.tick();
+    expect(raid(noDir, m)).toMatchObject({ outcome: 'infrastructure-error', outcomeLabel: 'Raid failed: EACCES: permission denied' });
     expect(['ENOTDIR', 'EEXIST', 'EISDIR', 'ENAMETOOLONG'].map(isAttackPathFault)).toEqual([true, true, true, true]);
     expect(['ENOSPC', 'EACCES', 'EROFS', 'EIO', undefined].map(isAttackPathFault)).toEqual([false, false, false, false, false]);
   });
