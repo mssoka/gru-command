@@ -141,16 +141,16 @@ token = "a-random-pairing-token"
 [runtimes]
 # Session host runtime: "claude-code" (default for new installs) or "pi".
 # Existing installs keep whatever is set here; switch by editing this line.
-default = "pi"
+default = "claude-code"
 
 [runtimes.roles]
 # Optional per-role runtime overrides (valid roles: gru, silas, minion, perkins, bob);
 # omitted roles inherit runtimes.default.
-# gru = "pi"
-# silas = "pi"
-# minion = "pi"
-# perkins = "pi"
-# bob = "pi"
+# gru = "claude-code"
+# silas = "claude-code"
+# minion = "claude-code"
+# perkins = "claude-code"
+# bob = "claude-code"
 
 [models]
 # Default model reference. pi takes an explicit "provider/model" reference as-is. claude-code is always Anthropic and needs no provider: use the CLI's own names ("opus", "claude-opus-5-5"); a provider segment, if present, is stripped for its --model flag (bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"); a shared [models] entry naming another provider is a pi reference that claude-code passes over, unless its id has an Anthropic cloud shape (Bedrock "[region.]anthropic.…", Vertex "claude-…@YYYYMMDD"); resellers serving Claude under their own ids ("github-copilot/claude-…") are passed over too, as is a pi-only shared [thinking] level ("minimal"). The literal "default" means the runtime's own configuration (SPEC ruling 16).

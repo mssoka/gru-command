@@ -514,6 +514,11 @@ describe('config-generate: Claude Code is the default for new installs (#374)', 
     expect(runtimeOf(instance)).toBe('pi');
   });
 
+  it('the generated docs/CONFIG.md reference shows Claude Code as the default too', () => {
+    expect(renderConfigDocBlock()).toMatch(/^\[runtimes\]\n(?:#[^\n]*\n)*default = "claude-code"$/mu);
+    expect(renderConfigDocBlock()).not.toMatch(/^default = "pi"$/mu);
+  });
+
   it('missing claude CLI fails loud with the fix and the pi alternative, writing nothing', () => {
     const instance = join(tempDir('gru-command-cg-missing-'), 'instance');
     const result = run(instance, [], { PATH: '/usr/bin:/bin' });

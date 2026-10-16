@@ -735,7 +735,7 @@ const DOC_EXAMPLE_VALUES: CompleteConfigValues = {
   host: '127.0.0.1',
   port: 7665,
   token: 'a-random-pairing-token',
-  runtime: 'pi',
+  runtime: 'claude-code',
   model: MODEL_DEFAULT_SENTINEL,
   thinkingLevel: MODEL_DEFAULT_SENTINEL,
   roles: {},

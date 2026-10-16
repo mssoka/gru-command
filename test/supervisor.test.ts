@@ -490,7 +490,7 @@ describe('supervisor — watchdog + restart ladder', () => {
     expect(view?.slotId).toBeNull();
   });
 
-  it('a hung agent climbs the ladder and is restored with resume', async () => {
+  it('a hung agent climbs the ladder and is restored with resume #contract:supervisor-restart-ladder:neutral', async () => {
     const sessionFile = join(tmpDir(), 'gru', 'session.jsonl');
     mkdirSync(join(sessionFile, '..'), { recursive: true });
     writeFileSync(sessionFile, '{}\n', 'utf-8');
@@ -5437,7 +5437,7 @@ describe('supervisor pacing admission and workflow boundary', () => {
 });
 
 describe('worker delivery settlement under automatic rate-limit retry', () => {
-  it('an initial dispatch keeps its delivery pending until an in-band 429 retry recovers', async () => {
+  it('an initial dispatch keeps its delivery pending until an in-band 429 retry recovers #contract:rate-limit-retry:neutral', async () => {
     const sleeper = new ManualSleeper();
     const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
     const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0, workerGate: gate });
