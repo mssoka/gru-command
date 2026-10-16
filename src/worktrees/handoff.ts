@@ -124,8 +124,10 @@ const errnoOf = (error: unknown): string =>
 
 /** The gitdir a checkout's `.git` FILE names, resolved against the checkout
  * but not yet followed — so a dangling target can still be refused by name.
- * Like git, the whole remainder after `gitdir: ` (trailing line ends
- * stripped) is the path, so a second line is no gitdir file git writes. */
+ * Like git's read_gitfile: trailing line ends (any number) are stripped and
+ * nothing else, so trailing spaces stay part of the path and an empty path
+ * is refused. A line end left inside is a second line, which no gitdir file
+ * git writes has — refused by name. */
 function linkedGitdir(path: string): string {
   const file = join(path, '.git');
   let isFile: boolean;
@@ -143,7 +145,9 @@ function linkedGitdir(path: string): string {
   }
   if (!text.startsWith(GITDIR_PREFIX)) throw new Error(`checkout ${path} lost its linked gitdir: its .git file has no "${GITDIR_PREFIX}" line`);
   if (/[\r\n]/u.test(text)) throw new Error(`checkout ${path} has a .git file of more than one line — not a gitdir file git writes`);
-  return resolve(path, text.slice(GITDIR_PREFIX.length));
+  const named = text.slice(GITDIR_PREFIX.length);
+  if (named === '') throw new Error(`checkout ${path} has a .git file naming an empty gitdir`);
+  return resolve(path, named);
 }
 
 /** A managed checkout's administration directory, followed — or refused by
@@ -235,9 +239,11 @@ export function commonDirectoryOfGitdir(gitdir: string): string {
     return refuse(`its commondir names ${target}, which cannot be resolved (${errnoOf(error)})`);
   }
   const kind = entryKind(common);
+  const chain = kind === 'directory' ? entryKind(join(common, 'commondir')) : 'absent';
   const problem = typeof kind === 'object' ? `it cannot be inspected (${kind.unreadable})`
     : kind !== 'directory' ? 'it is not a directory'
-    : entryKind(join(common, 'commondir')) !== 'absent' ? 'it is itself a linked administration'
+    : typeof chain === 'object' ? `its commondir cannot be inspected (${chain.unreadable})`
+    : chain !== 'absent' ? 'it is itself a linked administration'
     : gitDirectoryProblem(common);
   return problem === null ? common : refuse(`its commondir names ${common}, which is not a git directory: ${problem}`);
 }
@@ -251,8 +257,10 @@ export function commonDirectoryOfGitdir(gitdir: string): string {
  * differently), is refused by name. */
 export function repositoryCommonDirectory(repoPath: string): string {
   const repoGit = join(repoPath, '.git');
+  let link: boolean;
   let canonical: string;
   try {
+    link = lstatSync(repoGit).isSymbolicLink();
     canonical = realpathSync(repoGit);
   } catch (error) {
     throw new Error(`repository ${repoPath} has no usable .git (${errnoOf(error)})`, { cause: error });
@@ -264,18 +272,50 @@ export function repositoryCommonDirectory(repoPath: string): string {
     if (problem !== null) throw new Error(`repository ${repoPath} has a .git directory that is not a git directory: ${problem}`);
     return canonical;
   }
-  if (entryKind(repoGit) !== 'absent' && lstatSync(repoGit).isSymbolicLink()) throw new Error(`repository ${repoPath} has a .git symlink to a gitdir file (${canonical}) — an unsupported layout`);
+  if (link) throw new Error(`repository ${repoPath} has a .git symlink to a gitdir file (${canonical}) — an unsupported layout`);
   return commonDirectoryOfGitdir(linkedGitdir(repoPath));
+}
+
+/** `path` followed, or refused by name — never a raw error. */
+function resolvedPath(what: string, path: string): string {
+  try {
+    return realpathSync(path);
+  } catch (error) {
+    throw new Error(`${what} ${path} cannot be resolved (${errnoOf(error)})`, { cause: error });
+  }
+}
+
+/** A managed lane's administration is always a linked worktree
+ * administration: it names its common directory in `commondir`. A full git
+ * directory (a `.git` file pointed at the repository's own git directory) is
+ * refused by name, never taken for its own common directory. */
+function laneCommonDirectory(admin: string): string {
+  const pointer = entryKind(join(admin, 'commondir'));
+  if (pointer === 'absent') throw new Error(`lane administration ${admin} has no commondir — it is not a linked worktree administration`);
+  if (typeof pointer === 'object') throw new Error(`lane administration ${admin} has a commondir that cannot be inspected (${pointer.unreadable})`);
+  return commonDirectoryOfGitdir(admin);
+}
+
+/** The checkout `.git` file a lane administration's `gitdir` file points
+ * back to, followed — or refused by name. */
+function adminBackPointer(admin: string): string {
+  let named: string;
+  try {
+    named = readWorktreeMetadata(join(admin, 'gitdir')).trim();
+  } catch (error) {
+    throw new Error(`lane administration ${admin} has an unreadable gitdir file (${errnoOf(error)})`, { cause: error });
+  }
+  return resolvedPath(`lane administration ${admin} names checkout .git`, resolve(admin, named));
 }
 
 function validate(receipt: Receipt, lane: WorktreeLane): void {
   const admin = adminFor(lane.path);
-  const common = commonDirectoryOfGitdir(admin);
+  const common = laneCommonDirectory(admin);
   const repoCommon = repositoryCommonDirectory(lane.repoPath);
   if (repoCommon !== common || receipt.id !== lane.id || receipt.kind !== lane.kind || receipt.jobId !== lane.jobId || receipt.roundId !== lane.roundId || receipt.branch !== lane.branch || receipt.sha !== lane.sha ||
-    receipt.repo !== realpathSync(lane.repoPath) || receipt.path !== realpathSync(lane.path) || receipt.admin !== admin || receipt.common !== common ||
+    receipt.repo !== resolvedPath('repository', lane.repoPath) || receipt.path !== resolvedPath('checkout', lane.path) || receipt.admin !== admin || receipt.common !== common ||
     dirname(admin) !== join(common, 'worktrees') ||
-    realpathSync(resolve(admin, readWorktreeMetadata(join(admin, 'gitdir')).trim())) !== realpathSync(join(lane.path, '.git'))) throw new Error('handoff binding changed');
+    adminBackPointer(admin) !== resolvedPath('checkout .git', join(lane.path, '.git'))) throw new Error('handoff binding changed');
   // Job/writer commits may advance. Attachment must not: a detached lane is
   // frozen, and a writer's reserved name must still be a direct branch.
   if (existsSync(join(common, 'reftable'))) throw new Error('unsupported ref storage — handoff identity unverified');
@@ -300,9 +340,9 @@ function validate(receipt: Receipt, lane: WorktreeLane): void {
 }
 
 export function beginLaneHandoff(lane: Pick<WorktreeLane, 'id' | 'kind' | 'repoPath' | 'path' | 'branch' | 'sha' | 'jobId' | 'roundId'>, admin: string, token: string): void {
-  const receipt: Receipt = { state: 'pending', token, id: lane.id, kind: lane.kind, jobId: lane.jobId, roundId: lane.roundId, repo: realpathSync(lane.repoPath),
-    common: commonDirectoryOfGitdir(admin), admin,
-    path: realpathSync(lane.path), branch: lane.branch, sha: lane.sha, createdAt: null };
+  const receipt: Receipt = { state: 'pending', token, id: lane.id, kind: lane.kind, jobId: lane.jobId, roundId: lane.roundId, repo: resolvedPath('repository', lane.repoPath),
+    common: laneCommonDirectory(admin), admin,
+    path: resolvedPath('checkout', lane.path), branch: lane.branch, sha: lane.sha, createdAt: null };
   const file = join(admin, receiptName), temp = `${file}.${token.slice(13)}`;
   writeFileSync(temp, JSON.stringify(receipt), { flag: 'wx' });
   linkSync(temp, file); // atomic publication, never overwrite a foreign receipt
@@ -349,7 +389,14 @@ export function captureLaneHandoff(lane: WorktreeLane): () => void {
     if (expected === null || expected.createdAt !== association.lane.createdAt) throw new Error('original registered generation is unavailable');
     const generation = expected.createdAt;
     const admin = adminFor(lane.path), file = join(admin, receiptName);
-    const original = readWorktreeMetadata(file);
+    // A non-lane administration is refused by name before its receipt is read.
+    laneCommonDirectory(admin);
+    let original: string;
+    try {
+      original = readWorktreeMetadata(file);
+    } catch (error) {
+      throw new Error(`lane administration ${admin} has no readable handoff receipt (${errnoOf(error)})`, { cause: error });
+    }
     const receipt = parseReceipt(original);
     const check = (): void => {
       try {

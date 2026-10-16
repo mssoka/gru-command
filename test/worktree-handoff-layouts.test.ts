@@ -141,14 +141,20 @@ describe('worktree handoff with a --separate-git-dir repository (#372)', () => {
       ['empty', (gitdir) => { mkdirSync(gitdir); }, /: it has no HEAD file$/u],
       ['empty commondir', (gitdir) => { mkdirSync(gitdir); writeFileSync(join(gitdir, 'commondir'), '\n'); }, /: its commondir is empty$/u],
       ['dangling commondir', (gitdir) => { mkdirSync(gitdir); writeFileSync(join(gitdir, 'commondir'), '../gone\n'); }, /: its commondir names \.\.\/gone, which cannot be resolved \(ENOENT\)$/u],
-      ['commondir to a non-repository', (gitdir) => { mkdirSync(join(gitdir, 'plain'), { recursive: true }); writeFileSync(join(gitdir, 'commondir'), 'plain\n'); }, /: its commondir names \S+\/bogus\.git\/plain, which is not a git directory: it has no HEAD file$/u],
-      ['commondir to a file', (gitdir) => { mkdirSync(gitdir); writeFileSync(join(gitdir, 'file'), 'x'); writeFileSync(join(gitdir, 'commondir'), 'file\n'); }, /: its commondir names \S+\/bogus\.git\/file, which is not a git directory: it is not a directory$/u],
+      ['commondir to a non-repository', (gitdir) => { mkdirSync(join(gitdir, 'plain'), { recursive: true }); writeFileSync(join(gitdir, 'commondir'), 'plain\n'); }, /: its commondir names .+\/bogus\.git\/plain, which is not a git directory: it has no HEAD file$/u],
+      ['commondir to a file', (gitdir) => { mkdirSync(gitdir); writeFileSync(join(gitdir, 'file'), 'x'); writeFileSync(join(gitdir, 'commondir'), 'file\n'); }, /: its commondir names .+\/bogus\.git\/file, which is not a git directory: it is not a directory$/u],
       ['chained commondir', (gitdir) => {
         mkdirSync(join(gitdir, 'next', 'objects'), { recursive: true }); mkdirSync(join(gitdir, 'next', 'refs'));
         writeFileSync(join(gitdir, 'next', 'HEAD'), 'ref: refs/heads/main\n'); writeFileSync(join(gitdir, 'next', 'commondir'), '..\n'); writeFileSync(join(gitdir, 'commondir'), 'next\n');
-      }, /: its commondir names \S+\/next, which is not a git directory: it is itself a linked administration$/u],
+      }, /: its commondir names .+\/bogus\.git\/next, which is not a git directory: it is itself a linked administration$/u],
+      ['uninspectable chained commondir', (gitdir) => {
+        mkdirSync(join(gitdir, 'next', 'objects'), { recursive: true }); mkdirSync(join(gitdir, 'next', 'refs'));
+        writeFileSync(join(gitdir, 'next', 'HEAD'), 'ref: refs/heads/main\n'); symlinkSync(join(gitdir, 'next', 'commondir'), join(gitdir, 'next', 'commondir')); writeFileSync(join(gitdir, 'commondir'), 'next\n');
+      }, /: its commondir names .+\/bogus\.git\/next, which is not a git directory: its commondir cannot be inspected \(ELOOP\)$/u],
       ['unreadable commondir', (gitdir) => { mkdirSync(join(gitdir, 'commondir'), { recursive: true }); }, /: its commondir cannot be read \(handoff metadata is not a regular file\)$/u],
       ['looping HEAD', (gitdir) => { mkdirSync(gitdir); symlinkSync(join(gitdir, 'HEAD'), join(gitdir, 'HEAD')); }, /: its HEAD cannot be inspected \(ELOOP\)$/u],
+      ['looping objects', (gitdir) => { mkdirSync(gitdir); writeFileSync(join(gitdir, 'HEAD'), 'x'); symlinkSync(join(gitdir, 'objects'), join(gitdir, 'objects')); }, /: its objects cannot be inspected \(ELOOP\)$/u],
+      ['looping refs', (gitdir) => { mkdirSync(join(gitdir, 'objects'), { recursive: true }); writeFileSync(join(gitdir, 'HEAD'), 'x'); symlinkSync(join(gitdir, 'refs'), join(gitdir, 'refs')); }, /: its refs cannot be inspected \(ELOOP\)$/u],
     ];
     for (const [label, make, problem] of cases) {
       const repo = fixture(`separate-bogus-${label.replace(/\W+/gu, '-')}`);
@@ -166,6 +172,13 @@ describe('worktree handoff with a --separate-git-dir repository (#372)', () => {
     expect(() => handoffProof.repositoryCommonDirectory(plain.path)).toThrow(/lost its linked gitdir/u);
     writeFileSync(join(plain.path, '.git'), `gitdir: ${directory()}\nsecond line\n`);
     expect(() => handoffProof.repositoryCommonDirectory(plain.path)).toThrow(/has a \.git file of more than one line/u);
+    writeFileSync(join(plain.path, '.git'), `gitdir: ${directory()}\r\nsecond line`);
+    expect(() => handoffProof.repositoryCommonDirectory(plain.path)).toThrow(/has a \.git file of more than one line/u);
+    // Like git: an empty path is refused, and a file past its bound is unreadable.
+    writeFileSync(join(plain.path, '.git'), 'gitdir: \n');
+    expect(() => handoffProof.repositoryCommonDirectory(plain.path)).toThrow(`checkout ${plain.path} has a .git file naming an empty gitdir`);
+    writeFileSync(join(plain.path, '.git'), `gitdir: ${'x'.repeat(64 * 1024)}\n`);
+    expect(() => handoffProof.repositoryCommonDirectory(plain.path)).toThrow(`checkout ${plain.path} has an unreadable .git file (handoff metadata exceeds its bound)`);
     // No .git at all is refused by name, with the repository path.
     rmSync(join(plain.path, '.git'), { force: true });
     expect(() => handoffProof.repositoryCommonDirectory(plain.path)).toThrow(`repository ${plain.path} has no usable .git (ENOENT)`);
@@ -173,6 +186,18 @@ describe('worktree handoff with a --separate-git-dir repository (#372)', () => {
     const hollow = fixture('separate-hollow-dotgit');
     rmSync(join(hollow.path, '.git', 'objects'), { recursive: true, force: true });
     expect(() => handoffProof.repositoryCommonDirectory(hollow.path)).toThrow(`repository ${hollow.path} has a .git directory that is not a git directory: it has no objects directory`);
+  });
+
+  it('strips only trailing line ends from a .git file, as git does', () => {
+    const repo = fixture('separate-line-ends');
+    const gitdir = separateGitDir(repo);
+    // Any number of trailing CR/LF line ends are no part of the path.
+    writeFileSync(join(repo.path, '.git'), `gitdir: ${gitdir}\r\n\n`);
+    expect(handoffProof.repositoryCommonDirectory(repo.path)).toBe(gitdir);
+    // A trailing space is: git would look for that path, and so does this reading.
+    writeFileSync(join(repo.path, '.git'), `gitdir: ${gitdir} \n`);
+    expect(() => handoffProof.repositoryCommonDirectory(repo.path))
+      .toThrow(`repository gitdir ${gitdir}  is neither a linked worktree administration nor a git directory: it does not exist`);
   });
 
   it('names the path it resolved to when a gitdir is reached through a link', () => {
@@ -257,6 +282,59 @@ describe('child lane parent custody, called directly (#373)', () => {
     expect(error).toBeInstanceOf(handoffProof.WorktreeHandoffUnresolvedError);
     expect(reasonsOf(error)).toMatch(/<- checkout .*job-custody-parent no longer has its linked gitdir file \(\.git is not a regular file\)/u);
     f.childLeftNothing();
+    expect(f.h.ledger.getWorktree(f.parent.id)?.status).toBe('active');
+  });
+
+  it('refuses a parent whose .git file names a gitdir that is not a directory, by name', async () => {
+    const f = await parentFixture('custody-gitdir-file');
+    const file = join(directory(), 'not-a-gitdir');
+    writeFileSync(file, 'x');
+    writeFileSync(join(f.parent.path, '.git'), `gitdir: ${file}\n`);
+    const error = await f.createChild().then(() => null, (cause: unknown) => cause);
+    expect(error).toBeInstanceOf(handoffProof.WorktreeHandoffUnresolvedError);
+    expect(reasonsOf(error)).toContain(`checkout ${f.parent.path} names gitdir ${file}, which is not a directory`);
+    f.childLeftNothing();
+    expect(f.h.ledger.getWorktree(f.parent.id)?.status).toBe('active');
+  });
+
+  it('refuses a parent whose administration is not a linked worktree administration, by name', async () => {
+    const escape = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+    const corruptions: readonly (readonly [string, (f: Awaited<ReturnType<typeof parentFixture>>) => void, (f: Awaited<ReturnType<typeof parentFixture>>) => RegExp])[] = [
+      ['commondir removed', (f) => { rmSync(join(f.admin, 'commondir')); },
+        (f) => new RegExp(`lane administration ${escape(f.admin)} has no commondir — it is not a linked worktree administration`, 'u')],
+      // The parent's .git pointed at the repository's own git directory: a full git directory, no lane administration.
+      ['repository git directory', (f) => { writeFileSync(join(f.parent.path, '.git'), `gitdir: ${realpathSync(join(f.repo.path, '.git'))}\n`); },
+        (f) => new RegExp(`lane administration ${escape(realpathSync(join(f.repo.path, '.git')))} has no commondir — it is not a linked worktree administration`, 'u')],
+      ['receipt removed', (f) => { rmSync(join(f.admin, 'gru-creation-handoff.json')); },
+        (f) => new RegExp(`lane administration ${escape(f.admin)} has no readable handoff receipt \\(ENOENT\\)`, 'u')],
+      ['commondir to a non-repository', (f) => { mkdirSync(join(f.admin, 'plain')); writeFileSync(join(f.admin, 'commondir'), 'plain\n'); },
+        (f) => new RegExp(`its commondir names ${escape(join(f.admin, 'plain'))}, which is not a git directory: it has no HEAD file`, 'u')],
+      ['chained commondir', (f) => {
+        const next = join(f.admin, 'next');
+        mkdirSync(join(next, 'objects'), { recursive: true }); mkdirSync(join(next, 'refs'));
+        writeFileSync(join(next, 'HEAD'), 'ref: refs/heads/main\n'); writeFileSync(join(next, 'commondir'), '..\n'); writeFileSync(join(f.admin, 'commondir'), 'next\n');
+      }, (f) => new RegExp(`its commondir names ${escape(join(f.admin, 'next'))}, which is not a git directory: it is itself a linked administration`, 'u')],
+    ];
+    for (const [label, corrupt, reason] of corruptions) {
+      const f = await parentFixture(`custody-admin-${label.replace(/\W+/gu, '-')}`);
+      corrupt(f);
+      const error = await f.createChild().then(() => null, (cause: unknown) => cause);
+      expect(error, label).toBeInstanceOf(handoffProof.WorktreeHandoffUnresolvedError);
+      expect(reasonsOf(error), label).toMatch(reason(f));
+      f.childLeftNothing();
+      expect(f.h.ledger.getWorktree(f.parent.id)?.status, label).toBe('active');
+    }
+  });
+
+  it('a handoff begun for a path that cannot be resolved is refused by name, before any receipt', async () => {
+    const f = await parentFixture('custody-begin-unresolved');
+    const gone = join(directory(), 'gone');
+    const before = readdirSync(f.admin).sort();
+    expect(() => handoffProof.beginLaneHandoff({ ...f.parent, repoPath: gone }, f.admin, 'token-0123456789abcdef'))
+      .toThrow(`repository ${gone} cannot be resolved (ENOENT)`);
+    expect(() => handoffProof.beginLaneHandoff({ ...f.parent, path: gone }, f.admin, 'token-0123456789abcdef'))
+      .toThrow(`checkout ${gone} cannot be resolved (ENOENT)`);
+    expect(readdirSync(f.admin).sort()).toEqual(before);
   });
 
   it('refuses a parent whose git administration was removed, by name', async () => {
