@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { readFileSync, realpathSync, statSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
 import type { LedgerApi } from '../ledger/api.js';
 import {
   BlindInputRefusal,
@@ -273,7 +273,25 @@ export function admitBlindReview(input: {
     if (!sameTarget(sibling.targetSha, targetSha) || sibling.targetRef !== (input.targetRef?.trim() ?? null)) continue;
     if ((sibling.parentJobId ?? null) !== parentJobId) continue;
     if (sibling.status === 'blocked' || sibling.status === 'parked' || sibling.status === 'binned') continue;
-    const coverage = blindCoverageOf(ledger, sibling.id);
+    let coverage: BlindCoverage;
+    try {
+      coverage = blindCoverageOf(ledger, sibling.id);
+    } catch (error) {
+      // A sibling whose coverage cannot be read is never silently replaced.
+      refuse(
+        ledger,
+        { jobId: input.jobId, parentJobId },
+        new BlindInputRefusal({
+          code: 'blind_coverage_unreadable',
+          status: 409,
+          message: `blind coverage of sibling review "${sibling.id}" cannot be read: ${error instanceof Error ? error.message : String(error)}`,
+          violations: [],
+          correction: `Inspect and repair "${sibling.id}"'s blind-access events (GET /api/dispatch/jobs/${sibling.id}/blind-coverage), then commission again.`,
+          details: { coverage_job_id: sibling.id },
+        }),
+        rule.sha256,
+      );
+    }
     if (coverage.qualifying) {
       refuse(
         ledger,
@@ -317,26 +335,35 @@ function admittedOf(ledger: LedgerApi, jobId: string): AdmittedPayload | null {
   return event === null ? null : (event.payload as AdmittedPayload);
 }
 
-/**
- * Validity of one review job as blind coverage. Derived ONLY from the
- * admission and the observed-access facts; job status and report
- * disposition are not inputs (settlement is not validity).
- */
-/** What makes two recorded prohibited reads the same read (#355). */
+/** What makes two recorded prohibited reads the same read (#355). Events
+ * recorded before #355 carry no `session` and count as one unknown session. */
 const BLIND_READ_IDENTITY = {
   event: ['source', 'session'],
   entry: ['index', 'toolName', 'code', 'path', 'excerptSha256'],
 } as const;
 
 /** A transcript's identity for distinct-read counting: the sha256 of its
- * canonical path, so a symlinked or relative spelling of the same file is
- * the same session, and the ledger never stores the local path itself. */
+ * canonical path, so a symlinked spelling of the same file is the same
+ * session, and the ledger never stores the local path itself. The path must
+ * be absolute; a transcript gone since it was read keeps its absolute
+ * spelling, and any other resolution failure is thrown. */
 export function blindSessionIdentity(sessionFile: string): string {
+  if (!isAbsolute(sessionFile)) throw new Error(`blind session file must be an absolute path (got ${JSON.stringify(sessionFile)})`);
   let canonical: string;
-  try { canonical = realpathSync(sessionFile); } catch { canonical = resolve(sessionFile); }
+  try {
+    canonical = realpathSync(sessionFile);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    canonical = resolve(sessionFile);
+  }
   return createHash('sha256').update(canonical).digest('hex');
 }
 
+/**
+ * Validity of one review job as blind coverage. Derived ONLY from the
+ * admission and the observed-access facts; job status and report
+ * disposition are not inputs (settlement is not validity).
+ */
 export function blindCoverageOf(ledger: LedgerApi, jobId: string): BlindCoverage {
   const admitted = admittedOf(ledger, jobId);
   if (admitted === null) {

@@ -317,6 +317,34 @@ describe('observed reviewer access — grep paths with spaces (#357)', () => {
       '6:/etc/hosts',
     ]);
   });
+
+  it('a file-like spaced path outside the package still classifies — by shape, or by the directory it names', () => {
+    const prohibited = scanObservedAccess(
+      [
+        { index: 1, toolName: 'bash', text: '/Users/John Smith/repo/docs/issues/a.md:3:text' },
+        { index: 2, toolName: 'bash', text: '../other repo/docs/issues/a.md:1:x' },
+        { index: 3, toolName: 'bash', text: '/Users/John Smith/notes.md:1:x' },
+        // A relative spaced path names its excluded directory through a path-component suffix.
+        { index: 4, toolName: 'bash', text: 'vendor copy/docs/issues/b.md:2:y' },
+      ],
+      DEFAULT_BLIND_ISOLATION_RULE,
+    );
+    expect(prohibited.map((p) => `${p.index}:${p.path ?? ''}`)).toEqual([
+      '1:/Users/John Smith/repo/docs/issues/a.md',
+      '2:../other repo/docs/issues/a.md',
+      '3:/Users/John Smith/notes.md',
+      '4:docs/issues/b.md',
+    ]);
+  });
+
+  it('bounds the candidates a pathological spaced line can produce', () => {
+    const line = `${'word '.repeat(20_000)}docs/issues/late.md:1:x`;
+    const started = performance.now();
+    const prohibited = scanObservedAccess([{ index: 1, toolName: 'bash', text: line }], DEFAULT_BLIND_ISOLATION_RULE);
+    expect(performance.now() - started).toBeLessThan(2000);
+    // Past the candidate bound a path is not chased: prose this long is no grep hit.
+    expect(prohibited).toEqual([]);
+  });
 });
 
 describe('package request parsing', () => {

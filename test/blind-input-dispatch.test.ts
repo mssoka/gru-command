@@ -476,6 +476,29 @@ describe('blind review commissioning (issue #316)', () => {
     expect((await call(h.port, 'GET', '/api/dispatch/jobs/rev-pending/blind-coverage')).json).toMatchObject({ state: 'invalidated', prohibitedAccess: 1 });
   });
 
+  it('an initial prompt that read and then rejected invalidates coverage before its retries settle, with its failure bookkeeping unchanged (#356)', async () => {
+    let settled!: (value: RetrySettlement) => void;
+    let armed = false;
+    const h = await boot({
+      rejectPromptOf: 'rev-early-reject',
+      sessionToolResults: () => [{ index: 0, toolName: 'bash', text: '_bmad-output/implementation-artifacts/deferred-work.md:3:- old finding' }],
+      retrySettlement: async () => armed ? new Promise<RetrySettlement>((resolve) => { settled = resolve; }) : 'none',
+    });
+    await dispatchParent(h);
+    armed = true;
+    expect((await call(h.port, 'POST', '/api/dispatch', blindReview('rev-early-reject', { repo_path: h.repo.path, input_package: validPackage() }))).status).toBe(202);
+    // Observed the moment the rejected prompt settled — its retries still pending.
+    await waitFor(() => h.ledger.latestJobEvent('rev-early-reject', BLIND_ACCESS_EVENT) !== null);
+    expect(h.ledger.latestJobEvent('rev-early-reject', 'job.minion-error')).toBeNull();
+    expect((await call(h.port, 'GET', '/api/dispatch/jobs/rev-early-reject/blind-coverage')).json).toMatchObject({ state: 'invalidated', qualifying: false, prohibitedAccess: 1 });
+    settled('exhausted');
+    await waitFor(() => h.ledger.latestJobEvent('rev-early-reject', 'job.minion-error') !== null);
+    expect(h.ledger.latestJobEvent('rev-early-reject', 'job.minion-error')?.payload).toMatchObject({ error: expect.stringContaining('provider closed the stream mid-turn') });
+    expect(h.ledger.getJob('rev-early-reject')?.status).toBe('blocked');
+    expect(h.ledger.latestJobEvent('rev-early-reject', 'job.delivered')).toBeNull();
+    expect((await call(h.port, 'GET', '/api/dispatch/jobs/rev-early-reject/blind-coverage')).json).toMatchObject({ state: 'invalidated', prohibitedAccess: 1 });
+  });
+
   it('observes session grep results whose excluded path contains spaces, and keeps a spaced permitted path qualifying (#357)', async () => {
     const seen = await boot({
       sessionToolResults: () => [{ index: 0, toolName: 'bash', text: 'docs/issues/prior review.md:1:plain text' }],

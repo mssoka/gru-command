@@ -1498,7 +1498,9 @@ export class LedgerApi {
       ...identity.entry.map((key) => `json_extract(p.value, '$.${key}')`),
     ].join(', ');
     const scope = `e.job_id = ? AND e.kind = ? AND json_type(e.payload, '$.${field}') = 'array'`;
-    const row = this.db
+    let row: { events: number; malformedEvents: number; malformedEntries: number; distinctEntries: number };
+    try {
+      row = this.db
       .prepare(
         `SELECT
            (SELECT COUNT(*) FROM events WHERE job_id = ? AND kind = ?) AS events,
@@ -1507,6 +1509,9 @@ export class LedgerApi {
            (SELECT COUNT(DISTINCT json_array(${parts})) FROM events e, json_each(e.payload, '$.${field}') p WHERE ${scope} AND p.type = 'object') AS distinctEntries`,
       )
       .get(jobId, kind, jobId, kind, jobId, kind, jobId, kind) as { events: number; malformedEvents: number; malformedEntries: number; distinctEntries: number };
+    } catch (error) {
+      throw new Error(`job "${jobId}" has a ${kind} event whose payload cannot be read as JSON (${String(error)}) — refusing to count; inspect the ledger`, { cause: error });
+    }
     if (row.malformedEvents > 0 || row.malformedEntries > 0) {
       throw new Error(
         `job "${jobId}" has ${String(row.malformedEvents)} ${kind} event(s) without a "${field}" array and ${String(row.malformedEntries)} non-object "${field}" entr(ies) — refusing to count them; inspect the ledger`,

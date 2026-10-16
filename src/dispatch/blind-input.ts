@@ -71,7 +71,8 @@ export type BlindRefusalCode =
   | 'invalid_input_package'
   | 'blind_input_refused'
   | 'stale_parent_contract'
-  | 'blind_coverage_owned';
+  | 'blind_coverage_owned'
+  | 'blind_coverage_unreadable';
 
 /** A named refusal at the commissioning boundary. `correction` is the path a
  * stranger can act on; `violations` never carry the private text itself. */
@@ -233,11 +234,17 @@ export function reviveBlindIsolationRule(parts: {
 /** Compiled glob patterns: a large tool output classifies many candidate
  * paths against the same few globs. */
 const compiledGlobs = new Map<string, RegExp>();
+const MAX_COMPILED_GLOBS = 1024;
 function globToRegExp(glob: string): RegExp {
   const cached = compiledGlobs.get(glob);
-  if (cached !== undefined) return cached;
+  if (cached !== undefined) {
+    // Least recently used goes first: a hit moves to the newest end.
+    compiledGlobs.delete(glob);
+    compiledGlobs.set(glob, cached);
+    return cached;
+  }
   const compiled = compileGlob(glob);
-  if (compiledGlobs.size >= 1024) compiledGlobs.clear();
+  if (compiledGlobs.size >= MAX_COMPILED_GLOBS) compiledGlobs.delete(compiledGlobs.keys().next().value as string);
   compiledGlobs.set(glob, compiled);
   return compiled;
 }
@@ -263,9 +270,16 @@ function extensionOf(path: string): string {
 }
 
 /** Why a package path is not admissible, or null when it is. */
+/** A path whose SHAPE alone puts it outside the package: empty, absolute,
+ * a `..` segment or a NUL. */
+function outsidePackageShape(rawPath: string): boolean {
+  const path = rawPath.replace(/\\/gu, '/');
+  return path === '' || path.startsWith('/') || /(^|\/)\.\.(\/|$)/u.test(path) || path.includes('\0');
+}
+
 export function classifyBlindPath(rawPath: string, rule: BlindIsolationRule): string | null {
   const path = rawPath.replace(/\\/gu, '/');
-  if (path === '' || path.startsWith('/') || /(^|\/)\.\.(\/|$)/u.test(path) || path.includes('\0')) {
+  if (outsidePackageShape(path)) {
     return `invalid package path "${rawPath}" (must be a relative path inside the repository)`;
   }
   const normalized = path.replace(/^\.\//u, '');
@@ -588,32 +602,41 @@ export interface ProhibitedAccess {
  * starts with whitespace (an indented stack frame is not a grep result). */
 const GREP_LINE = /^((?:\.\/)?[^\s:][^:\n]*):\d+[:-]/u;
 
+/** Candidate paths judged per spaced grep line: enough for any real path
+ * (every word and every path component), bounded for a pathological line. */
+const MAX_GREP_CANDIDATES = 64;
+/** A spaced candidate whose SHAPE may still classify it: it starts like an
+ * absolute or parent path AND ends in a file name with an extension — a real
+ * spaced path (`/Users/a b/notes.md`), never a clock time or prose
+ * (`/var/log/app.log started at 10`). */
+const FILE_LIKE_OUTSIDE = /^(?:\/|\.\.\/)[\s\S]*\/[^/\s]*[^/\s.]\.[A-Za-z0-9]{1,10}$/u;
+
 /** The paths a tool-result line may name as a grep hit, each with whether
  * its SHAPE alone (absolute, `..`) may classify it. A space-free capture is
  * the path itself. A spaced capture (#357) is ambiguous — prose or a clock
- * time (`/var/log/app.log started at 10:30:15`) reaches a `:digits:` too —
- * so it, and every word-suffix of it (`Matches in docs/issues/a b.md:1:`
- * names `docs/issues/a b.md`), counts only when the isolation globs
- * themselves exclude it, never by shape. */
+ * time reaches a `:digits:` too — so it, and every suffix of it that starts a
+ * word or a path component (`Matches in docs/issues/a b.md:1:` names
+ * `docs/issues/a b.md`; `/Users/a b/repo/docs/issues/x.md:1:` names
+ * `docs/issues/x.md`), is judged by the isolation globs; by shape only when
+ * it is file-like (see FILE_LIKE_OUTSIDE). */
 function grepPathCandidates(line: string): readonly { readonly path: string; readonly byShape: boolean }[] {
-  const path = GREP_LINE.exec(line)?.[1];
-  if (path === undefined) return [];
+  const captured = GREP_LINE.exec(line)?.[1];
+  if (captured === undefined) return [];
+  const path = captured.trimEnd();
   if (!/\s/u.test(path)) return [{ path, byShape: true }];
-  const candidates = [{ path, byShape: false }];
-  for (let at = path.search(/\s\S/u); at !== -1; at = nextWordStart(path, at + 1)) {
-    candidates.push({ path: path.slice(at + 1), byShape: false });
+  const starts = [0];
+  for (const match of path.matchAll(/(?<=[\s/])\S/gu)) {
+    if (starts.length >= MAX_GREP_CANDIDATES) break;
+    starts.push(match.index);
   }
-  return candidates;
-}
-function nextWordStart(text: string, from: number): number {
-  const rest = text.slice(from).search(/\s\S/u);
-  return rest === -1 ? -1 : from + rest;
+  return starts.map((at) => {
+    const candidate = path.slice(at);
+    return { path: candidate, byShape: FILE_LIKE_OUTSIDE.test(candidate) };
+  });
 }
 /** Why a grep-hit candidate is excluded, or null. */
 function excludedGrepPath(candidate: { readonly path: string; readonly byShape: boolean }, rule: BlindIsolationRule): string | null {
-  const path = candidate.path.replace(/\\/gu, '/');
-  const shapeOnly = path === '' || path.startsWith('/') || /(^|\/)\.\.(\/|$)/u.test(path) || path.includes('\0');
-  if (shapeOnly && !candidate.byShape) return null;
+  if (outsidePackageShape(candidate.path) && !candidate.byShape) return null;
   return classifyBlindPath(candidate.path, rule);
 }
 

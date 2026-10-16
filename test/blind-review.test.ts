@@ -14,7 +14,7 @@ import {
   recordObservedAccess,
   BLIND_ACCESS_EVENT,
 } from '../src/dispatch/blind-review.js';
-import type { ObservedToolResult } from '../src/dispatch/blind-input.js';
+import { BlindInputRefusal, type ObservedToolResult } from '../src/dispatch/blind-input.js';
 
 /**
  * The shared blind-access observer (`observeBlindSessionAccess`) is the one
@@ -161,10 +161,44 @@ describe('observeBlindSessionAccess — repeated scans count distinct reads (iss
     h.ledger.appendCustomEvent({ kind: BLIND_ACCESS_EVENT, jobId: 'job-cumulative', payload: { source: 'session', scanned: 1, rule_sha256: 'r', prohibited: [entry] } });
     h.ledger.appendCustomEvent({ kind: BLIND_ACCESS_EVENT, jobId: 'job-cumulative', payload: { source: 'session', scanned: 1, rule_sha256: 'r', prohibited: [entry] } });
     expect(blindCoverageOf(h.ledger, 'job-cumulative').prohibitedAccess).toBe(3);
-    // A corrupt event is refused by name, never counted as nothing.
+    // A corrupt event is refused by name, never counted as nothing: an event
+    // without the array, and an entry that is no object.
+    h.ledger.appendCustomEvent({ kind: BLIND_ACCESS_EVENT, jobId: 'job-cumulative', payload: { source: 'session', scanned: 1 } });
+    expect(() => blindCoverageOf(h.ledger, 'job-cumulative')).toThrow(/has 1 review\.blind-access-observed event\(s\) without a "prohibited" array and 0 non-object "prohibited" entr\(ies\)/u);
     h.ledger.appendCustomEvent({ kind: BLIND_ACCESS_EVENT, jobId: 'job-cumulative', payload: { source: 'session', prohibited: ['not an object'] } });
-    expect(() => blindCoverageOf(h.ledger, 'job-cumulative')).toThrow(/1 non-object "prohibited" entr\(ies\) — refusing to count them/u);
+    expect(() => blindCoverageOf(h.ledger, 'job-cumulative')).toThrow(/1 review\.blind-access-observed event\(s\) without a "prohibited" array and 1 non-object "prohibited" entr\(ies\) — refusing to count them/u);
     h.dispose();
+  });
+
+  it('a sibling review whose coverage cannot be read refuses a new admission by name, never replacing it blindly (#355)', () => {
+    const h = blindLedger();
+    h.ledger.addJob({ id: 'sibling-review', repo: 'fixture', title: 'blind review', deliverable: 'review', targetSha: TARGET });
+    const admission = admitBlindReview({
+      ledger: h.ledger, jobId: 'sibling-review', title: 'review (blind)', deliverable: 'review',
+      briefing: 'Review the immutable package read-only.', targetSha: TARGET, repoName: 'fixture',
+      inputPackage: { baseSha: 'a'.repeat(40), targetSha: TARGET, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] },
+    });
+    recordBlindAdmission(h.ledger, 'sibling-review', admission!);
+    h.ledger.appendCustomEvent({ kind: BLIND_ACCESS_EVENT, jobId: 'sibling-review', payload: { source: 'session', prohibited: [7] } });
+    h.ledger.addJob({ id: 'new-review', repo: 'fixture', title: 'blind review', deliverable: 'review', targetSha: TARGET });
+    let refusal: unknown = null;
+    try {
+      admitBlindReview({
+        ledger: h.ledger, jobId: 'new-review', title: 'review (blind)', deliverable: 'review',
+        briefing: 'Review the immutable package read-only.', targetSha: TARGET, repoName: 'fixture',
+        inputPackage: { baseSha: 'a'.repeat(40), targetSha: TARGET, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] },
+      });
+    } catch (error) { refusal = error; }
+    expect(refusal).toBeInstanceOf(BlindInputRefusal);
+    expect(refusal).toMatchObject({ code: 'blind_coverage_unreadable', status: 409, details: { coverage_job_id: 'sibling-review' } });
+    expect(String(refusal)).toMatch(/blind coverage of sibling review "sibling-review" cannot be read: .*non-object "prohibited" entr/u);
+    h.dispose();
+  });
+
+  it('a session identity needs an absolute path, and survives a transcript gone since it was read (#355)', () => {
+    expect(() => blindSessionIdentity('relative/session.jsonl')).toThrow(/must be an absolute path/u);
+    const gone = join(tmpdir(), `gru-gone-${String(process.pid)}`, 'session.jsonl');
+    expect(blindSessionIdentity(gone)).toMatch(/^[0-9a-f]{64}$/u);
   });
 
   it('refuses a malformed identity key by name instead of interpolating it', () => {
