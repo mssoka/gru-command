@@ -7882,6 +7882,8 @@ export class LedgerApi {
     }
   }
 
+  /** Reserves the dispatch (once). A reservation alone is no cleanup
+   * blocker — see directiveCleanupBlockers (#362). */
   claimDirectiveDispatch(requestId: string): boolean {
     return this.transaction(() => {
       const identity = this.directiveTurnIdentity(requestId);

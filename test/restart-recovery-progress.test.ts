@@ -873,7 +873,9 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       return prompt(text, options);
     };
     await executeAcceptedDirective(f.deps, f.intent.requestId);
-    expect(f.spawns, route).toHaveLength(route === 'resident' ? 1 : 1);
+    // One spawn either way: the resident route's own setup spawn, or the
+    // fresh route's spawn — never a second.
+    expect(f.spawns, route).toHaveLength(1);
     expect(seen, route).toEqual([{ target: { agentId: 'logical-minion', sessionFile: f.file }, started: true }]);
   }
   it('#362 the fresh route prompts only after the durable native target and producer start commit', () => assertPreparedBeforePrompt('fresh'));
@@ -883,36 +885,43 @@ describe('restart-recovery-progress — exact native request matrix', () => {
    * this instant leaves behind (a consistent online copy, never a guess). */
   function crashSnapshot(f: Awaited<ReturnType<typeof fixture>>): string {
     const dir = mkdtempSync(join(tmpdir(), 'gru-crash-snapshot-'));
+    // Cleanups run last-in first-out: a db opened on this copy closes first.
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
     mkdirSync(join(dir, 'ledger'));
-    f.db.handle.exec(`VACUUM INTO '${join(dir, 'ledger', 'ledger.db').replaceAll("'", "''")}'`);
+    f.db.handle.prepare('VACUUM INTO ?').run(join(dir, 'ledger', 'ledger.db'));
     return dir;
   }
 
   /** Runs the REAL executor and snapshots the ledger at a crash window between
    * registry.spawn() and onPrepared, then recovers from that snapshot as a
    * restarted service would (#362). */
-  async function recoverFromCrash(window: 'inside-spawn' | 'after-registration') {
+  async function recoverFromCrash(crashPoint: 'inside-spawn' | 'after-registration') {
     const f = await fixture(); void (f.ledger.getWorktree(f.lane.id) ?? f.ledger.registerWorktree(f.lane));
-    let release!: () => void;
-    if (window === 'inside-spawn') f.spawnGate(new Promise<void>((resolve) => { release = resolve; }));
+    let release: () => void = () => {};
+    if (crashPoint === 'inside-spawn') f.spawnGate(new Promise<void>((resolve) => { release = resolve; }));
     let snapshot: string | null = null;
-    let boundaries = 0;
+    // The crash point is found by what happened, not by counting boundaries:
+    // the first admission boundary after the spawned registration is the one
+    // immediately before onPrepared.
+    let registered = false;
+    const register = f.ledger.registerAgent.bind(f.ledger);
+    vi.spyOn(f.ledger, 'registerAgent').mockImplementation((input) => { const row = register(input); registered = true; return row; });
     const run = executeAcceptedDirective({ ...f.deps, beforeWriterSideEffect: () => {
-      boundaries += 1;
-      // The fresh route's second admission boundary sits after the spawned
-      // registration and immediately before onPrepared.
-      if (window === 'after-registration' && boundaries === 2) snapshot = crashSnapshot(f);
+      if (crashPoint === 'after-registration' && registered && snapshot === null) snapshot = crashSnapshot(f);
     } }, f.intent.requestId);
-    if (window === 'inside-spawn') {
-      await vi.waitFor(() => expect(f.spawns).toHaveLength(1));
-      snapshot = crashSnapshot(f);
-      release();
-    }
+    try {
+      if (crashPoint === 'inside-spawn') {
+        await vi.waitFor(() => expect(f.spawns).toHaveLength(1));
+        snapshot = crashSnapshot(f);
+      }
+    } finally { release(); }
     await run;
-    if (snapshot === null) throw new Error(`fixture: no crash snapshot at ${window}`);
+    if (snapshot === null) throw new Error(`fixture: no crash snapshot at ${crashPoint}`);
     const db = new LedgerDb(snapshot); cleanups.push(() => db.close());
     const bus = new EventBus({}); const ledger = new LedgerApi(db.handle, { bus });
+    // The crashed state itself: reserved, no native target, no producer start.
+    expect(ledger.getDirective(f.intent.requestId), crashPoint).toMatchObject({ state: 'dispatching', nativeTarget: null });
+    expect(ledger.latestJobEventByRequestId(f.intent.jobId, 'silas.directive-producer-started', f.intent.requestId), crashPoint).toBeNull();
     for (const lane of ledger.listWorktrees()) rememberManagedLane(lane, ledger);
     let respawns = 0;
     const registry: DirectiveRegistry = { getHandle: () => null, spawn: async () => { respawns += 1; throw new Error('the reserved original must never respawn'); },
@@ -938,18 +947,19 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       expectedHead: resolveGitCommit(f.lane.path, 'HEAD'), expectedEpoch: ledger.directiveRecoveryEpoch(f.intent.jobId),
       expectedWorkRevision: authority.workRevision, expectedContractSha256: authority.contractSha256,
       reason: 'the reserved original never reached a native target', decision: { kind: 'successor', requestId: 'post-crash-successor', directive: 'approved correction' } });
-    return { ledger, decide, debt: debt! };
+    return { ledger, decide, debt: debt!, requestId: f.intent.requestId };
   }
 
   /** No prompt can precede onPrepared, so neither crash window left a native
    * effect: no open turn fences the lane (the registration leaves the agent
    * idle), and fresh authority may proceed at once — retiring the reserved
    * original, never replaying it. */
-  async function assertSuccessorMayProceed(window: 'inside-spawn' | 'after-registration') {
-    const { ledger, decide } = await recoverFromCrash(window);
-    expect(ledger.getAgent('logical-minion')?.state, window).toBe('idle');
-    expect(decide().successor?.requestId, window).toBe('post-crash-successor');
-    expect(ledger.getDirective('approved-request')?.state, window).toBe('retired');
+  async function assertSuccessorMayProceed(crashPoint: 'inside-spawn' | 'after-registration') {
+    const { ledger, decide, requestId } = await recoverFromCrash(crashPoint);
+    // The (re-)registered row is idle — no open turn can fence the lane.
+    expect(ledger.getAgent('logical-minion')?.state, crashPoint).toBe('idle');
+    expect(decide().successor?.requestId, crashPoint).toBe('post-crash-successor');
+    expect(ledger.getDirective(requestId)?.state, crashPoint).toBe('retired');
   }
   it('#362 a crash inside registry.spawn() is never replayed, and a successor may proceed', () => assertSuccessorMayProceed('inside-spawn'));
   it('#362 a crash after the spawned registration but before onPrepared is never replayed, and a successor may proceed', () => assertSuccessorMayProceed('after-registration'));

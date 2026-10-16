@@ -137,6 +137,12 @@ export class DirectiveDispatchDeferredError extends Error {
 
 /** Route a directive to the implementing minion: the live job minion
  * first; otherwise a fresh minion on the job lane. */
+/** A caller broke the routing contract (a programming error), refused
+ * before any effect. */
+export class DirectiveRoutingContractError extends Error {
+  constructor(message: string) { super(message); this.name = 'DirectiveRoutingContractError'; }
+}
+
 export async function routeFixDirectiveToMinion(
   input: DirectiveRoutingDeps & {
     jobId: string;
@@ -184,7 +190,7 @@ export async function routeFixDirectiveToMinion(
   // start committed first (#362): without onPrepared nothing would commit
   // them before the prompt, so the route refuses before any effect.
   if (input.directiveTurn !== undefined && input.onPrepared === undefined) {
-    throw new Error('a native directive turn needs onPrepared: its target and producer start must commit before the prompt');
+    throw new DirectiveRoutingContractError(`job "${input.jobId}": a native directive turn needs onPrepared — its target and producer start must commit before the prompt`);
   }
   const disposeAndRecord = async (handle: AgentHandle, viaRegistry = false): Promise<void> => {
     const failures: unknown[] = [];
