@@ -2694,7 +2694,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
           let settled = false;
           void prompt.catch(() => {}).finally(() => { settled = true; });
           await vi.waitFor(() => expect(live!.killed).toEqual(['SIGTERM', 'SIGKILL']));
-          expect(fx.logs.filter((line) => line.msg === 'a further claude child error was ignored: its first error already ended the child'), mode).toHaveLength(1);
+          expect(fx.logs.filter((line) => line.msg === 'a further claude child error was ignored: its first error already began ending the child'), mode).toHaveLength(1);
           expect(existsSync(settings), mode).toBe(true);
           expect(settled, mode).toBe(false);
           live!.emit('close', null, 'SIGKILL');
