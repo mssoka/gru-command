@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, relative as relativePath } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -22,6 +22,10 @@ vi.mock('node:fs', async (importOriginal) => {
   };
 });
 afterEach(() => { fsHooks.beforeWrite = null; fsHooks.beforeUnlink = null; fsHooks.beforeFsync = null; fsHooks.beforeClose = null; });
+/** An fsync hook failing only a directory's sync — by what the fd is, never by counting syncs. */
+const failDirectorySync = (code: string) => (fd: number): void => {
+  if (fstatSync(fd).isDirectory()) throw Object.assign(new Error('sync failed'), { code });
+};
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
@@ -484,8 +488,7 @@ describe('child lane parent custody, called directly (#373)', () => {
     rmSync(temp);
     // A receipt published but not made durable is named as published, never as untaken.
     rmSync(join(f.admin, 'gru-creation-handoff.json'));
-    let syncs = 0;
-    fsHooks.beforeFsync = () => { syncs += 1; if (syncs === 2) throw Object.assign(new Error('io'), { code: 'EIO' }); };
+    fsHooks.beforeFsync = failDirectorySync('EIO');
     expect(() => handoffProof.beginLaneHandoff(f.parent, f.admin, token))
       .toThrow(`lane administration ${f.admin} published its handoff receipt but could not make it durable (EIO)`);
     fsHooks.beforeFsync = null;
@@ -493,37 +496,78 @@ describe('child lane parent custody, called directly (#373)', () => {
     expect(existsSync(join(f.admin, 'gru-creation-handoff.json'))).toBe(true);
     // ...and when its temporary receipt cannot be removed either, both are said.
     rmSync(join(f.admin, 'gru-creation-handoff.json'));
-    syncs = 0;
-    fsHooks.beforeFsync = () => { syncs += 1; if (syncs === 2) throw Object.assign(new Error('io'), { code: 'EIO' }); };
+    fsHooks.beforeFsync = failDirectorySync('EIO');
     fsHooks.beforeUnlink = (path) => { if (path === temp) throw Object.assign(new Error('busy'), { code: 'EBUSY' }); };
     expect(() => handoffProof.beginLaneHandoff(f.parent, f.admin, token))
       .toThrow(`lane administration ${f.admin} published its handoff receipt but could not make it durable (EIO), and its temporary receipt ${temp} could not be removed (EBUSY)`);
     fsHooks.beforeFsync = null; fsHooks.beforeUnlink = null;
     rmSync(temp);
-    // A filesystem that cannot fsync a file or a directory (EINVAL, ENOTSUP) publishes all the same.
+    // ...nor does the directory's close failure replace its sync failure.
+    rmSync(join(f.admin, 'gru-creation-handoff.json'));
+    let directoryFd = -1;
+    fsHooks.beforeFsync = (fd) => { if (fstatSync(fd).isDirectory()) { directoryFd = fd; throw Object.assign(new Error('io'), { code: 'EIO' }); } };
+    fsHooks.beforeClose = (fd) => {
+      if (fd !== directoryFd) return;
+      fsHooks.beforeClose = null;
+      closeSync(fd);
+      throw Object.assign(new Error('close'), { code: 'EBADF' });
+    };
+    expect(() => handoffProof.beginLaneHandoff(f.parent, f.admin, token))
+      .toThrow(new RegExp(`^lane administration ${f.admin.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')} published its handoff receipt but could not make it durable \\(EIO\\)$`, 'u'));
+    fsHooks.beforeFsync = null; fsHooks.beforeClose = null;
+    expect(directoryFd).toBeGreaterThan(-1);
+    // A filesystem that cannot fsync a file, or a directory (EINVAL, ENOTSUP), publishes all the same.
     for (const code of ['EINVAL', 'ENOTSUP']) {
-      rmSync(join(f.admin, 'gru-creation-handoff.json'));
-      fsHooks.beforeFsync = () => { throw Object.assign(new Error('unsupported'), { code }); };
-      try {
-        expect(() => handoffProof.beginLaneHandoff(f.parent, f.admin, token), code).not.toThrow();
-      } finally { fsHooks.beforeFsync = null; }
-      expect(existsSync(join(f.admin, 'gru-creation-handoff.json')), code).toBe(true);
-      expect(existsSync(temp), code).toBe(false);
+      for (const kind of ['file', 'directory'] as const) {
+        rmSync(join(f.admin, 'gru-creation-handoff.json'));
+        let refused = 0;
+        fsHooks.beforeFsync = (fd) => {
+          if (fstatSync(fd).isDirectory() !== (kind === 'directory')) return;
+          refused += 1;
+          throw Object.assign(new Error('unsupported'), { code });
+        };
+        try {
+          expect(() => handoffProof.beginLaneHandoff(f.parent, f.admin, token), `${code} ${kind}`).not.toThrow();
+        } finally { fsHooks.beforeFsync = null; }
+        expect(refused, `${code} ${kind}`).toBe(1);
+        expect(existsSync(join(f.admin, 'gru-creation-handoff.json')), `${code} ${kind}`).toBe(true);
+        expect(existsSync(temp), `${code} ${kind}`).toBe(false);
+      }
     }
     writeFileSync(join(f.admin, 'gru-creation-handoff.json'), receipt);
     expect(readdirSync(f.admin).sort()).toEqual(before);
   });
 
-  it('a child whose published receipt cannot be made durable is rolled back whole, receipt and all', async () => {
+  it('a lane whose published receipt cannot be made durable is rolled back whole, receipt and all — job, review and child alike', async () => {
+    const admins = (repoPath: string): string[] => {
+      const dir = join(realpathSync(join(repoPath, '.git')), 'worktrees');
+      return existsSync(dir) ? readdirSync(dir).sort() : [];
+    };
+    // A job lane, and a review lane.
+    for (const kind of ['job', 'review'] as const) {
+      const repo = fixture(`undurable-${kind}`);
+      const h = manager();
+      const job = h.ledger.addJob({ id: `undurable-${kind}`, repo: 'assigned', title: kind });
+      const before = admins(repo.path);
+      fsHooks.beforeFsync = failDirectorySync('EIO');
+      try {
+        const creating = kind === 'job'
+          ? h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id })
+          : h.worktrees.createReviewWorktree({ repoPath: repo.path, roundId: `round-${kind}`, ref: git(repo.path, ['rev-parse', 'HEAD']), jobId: job.id });
+        await expect(creating, kind).rejects.toThrow(/published its handoff receipt but could not make it durable \(EIO\)$/u);
+      } finally { fsHooks.beforeFsync = null; }
+      expect(h.ledger.getWorktree(kind === 'job' ? job.id : `round-${kind}`), kind).toBeNull();
+      expect(admins(repo.path), kind).toEqual(before);
+      expect(git(repo.path, ['branch', '--list', `gru/${job.id}`]), kind).toBe('');
+    }
+    // A child lane.
     const f = await parentFixture('custody-undurable');
-    let syncs = 0;
-    fsHooks.beforeFsync = () => { syncs += 1; if (syncs === 2) throw Object.assign(new Error('io'), { code: 'EIO' }); };
+    fsHooks.beforeFsync = failDirectorySync('EIO');
     try {
       await expect(f.createChild()).rejects.toThrow(/published its handoff receipt but could not make it durable \(EIO\)$/u);
     } finally { fsHooks.beforeFsync = null; }
-    expect(syncs).toBe(2);
     f.childLeftNothing();
-    expect(readdirSync(join(realpathSync(join(f.repo.path, '.git')), 'worktrees'))).toEqual([basename(f.admin)]);
+    expect(admins(f.repo.path)).toEqual([basename(f.admin)]);
   });
 
   it('a receipt gone after capture is refused by name at the next check', async () => {

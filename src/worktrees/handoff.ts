@@ -438,7 +438,9 @@ export function beginLaneHandoff(lane: Pick<WorktreeLane, 'id' | 'kind' | 'repoP
   let undurable: unknown = null;
   try {
     const dirFd = openSync(admin, 'r');
-    try { durably(dirFd); } finally { closeSync(dirFd); }
+    // A close failure never replaces the sync failure it follows.
+    try { durably(dirFd); } catch (error) { undurable = error; }
+    try { closeSync(dirFd); } catch (error) { undurable ??= error; }
   } catch (error) {
     undurable = error;
   }
