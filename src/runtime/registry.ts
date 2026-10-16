@@ -865,16 +865,22 @@ export class RuntimeRegistry {
         this.publications.delete(resident);
         this.emitAgentEvent({ handle: resident, agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'spawned' });
         assertHandoff();
-        publishing = false;
         // Never forward any pending event until the post-listener custody
         // proof succeeds; then in the order they happened (#353): every frame
         // held before publication, then any frame a `spawned` listener made
-        // on this handle — a reentrant frame never overtakes a held one.
-        for (const envelope of [...buffered.splice(0), ...duringPublication.splice(0)]) this.emitAgentEvent(envelope);
+        // on this handle, then any frame a listener makes during this drain —
+        // still queued, so a reentrant frame never overtakes a held one.
+        const queue = [...buffered.splice(0), ...duringPublication.splice(0)];
+        while (queue.length > 0) {
+          this.emitAgentEvent(queue.shift()!);
+          queue.push(...duringPublication.splice(0));
+        }
+        publishing = false;
       } catch (error) {
         publicationFailure = { error };
         published = false;
         if (this.handles.has(resident)) this.unpublished.add(resident);
+        this.publications.delete(resident); // terminal: nothing is held any more
         buffered.length = 0;
         duringPublication.length = 0;
         throw error; // delayed Supervisor retries see the same terminal refusal
@@ -884,7 +890,8 @@ export class RuntimeRegistry {
     // its held frames are released, and later ones are never held (#352).
     // Only the tap copy goes — the handle's own subscribers (the release
     // listener below, cleanup traversal, an owner's disposal and cessation
-    // observers) keep receiving every frame.
+    // observers) keep receiving every frame. Once publication has begun, or
+    // has failed, a quarantine changes nothing here.
     this.publications.set(resident, {
       held: () => buffered.length + duringPublication.length,
       refuse: () => {

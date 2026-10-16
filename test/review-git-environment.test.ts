@@ -1362,6 +1362,9 @@ describe('review Git repository environment isolation (GH-270)', () => {
         expect(prompt).not.toHaveBeenCalled();
         expect(registry.getHandle(handle.id)).toBeNull();
         expect(publish).toThrow(/handoff unresolved/); // Supervisor retries must remain terminal.
+        // A quarantine after a failed publication keeps the original refusal (#352).
+        registry.quarantineHandle(handle);
+        expect(publish).toThrow(/handoff unresolved/);
         expect(readFileSync(join(admin, 'locked'), 'utf8')).toMatch(/foreign/);
         rmSync(join(admin, 'locked')); // fixture actor restores bytes, not publication authority
         expect(publish).toThrow(/handoff unresolved/);

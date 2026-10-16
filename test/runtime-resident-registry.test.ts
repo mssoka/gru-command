@@ -9,6 +9,8 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import { Supervisor } from '../src/supervision/supervisor.js';
 import { RuntimeRegistry } from '../src/runtime/registry.js';
+import { observeDisposalSettlement } from '../src/runtime/disposal-observation.js';
+import { withFallbacks } from '../src/runtime/fallbacks.js';
 import { stageSpawnRegistration } from '../src/runtime/spawn-registration.js';
 import { QuarantinedPublicationError, WorkerDisposalInProgressError } from '../src/runtime/worker-errors.js';
 import type { AgentHandle, AgentRuntime, RuntimeEvent, RuntimeEventListener, SpawnOptions } from '../src/runtime/types.js';
@@ -763,7 +765,8 @@ describe('registry resident release notifications (Perkins r3 blocker 4)', () =>
 
 describe('registry publication taps (#352, #353)', () => {
   /** Native generations whose frames the test emits, whose disposal may
-   * reject, and whose adapter attests cessation only when the test says so. */
+   * reject, and whose adapter attests cessation only when the test says so —
+   * behind the fallback wrapper the registry puts on every production native. */
   function generations(options: { readonly rejectDispose?: boolean } = {}) {
     const dir = mkdtempSync(join(tmpdir(), 'gru-publication-'));
     const emitters = new Map<string, (event: RuntimeEvent) => void>();
@@ -786,9 +789,10 @@ describe('registry publication taps (#352, #353)', () => {
         };
       },
     };
+    const wrapped = withFallbacks(adapter);
     class Registry extends RuntimeRegistry {
       override runtimeIdFor(): RuntimeId { return 'pi'; }
-      override runtimeFor(): AgentRuntime { return adapter; }
+      override runtimeFor(): AgentRuntime { return wrapped; }
     }
     const registry = new Registry({ config: { ...loadConfig({ GRU_COMMAND_HOME: dir }), concurrency: { maxWorkers: 4 } }, store: {} as SessionStore });
     /** What tap consumers saw, per agent: phases, and frames by their text or type. */
@@ -813,7 +817,7 @@ describe('registry publication taps (#352, #353)', () => {
     return { registry, tapped, emit, held, staged, cease, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
   }
 
-  it('#353 publication shows spawned first, then held frames in order, then a frame a spawned listener made — never ahead of a held one', async () => {
+  it('#353 publication shows spawned first, then held frames in order, then frames listeners made while it published — never ahead of a held one', async () => {
     const g = generations();
     try {
       // An ordinary spawn publishes at once: spawned is its first frame, nothing is held.
@@ -824,8 +828,12 @@ describe('registry publication taps (#352, #353)', () => {
       // A held publication: a `spawned` listener that makes a frame on the same handle.
       const { handle, publish } = await g.staged();
       let reentered = false;
+      let drained = false;
       g.registry.onAgentEvent((envelope) => {
-        if (envelope.phase === 'spawned' && envelope.agentId === handle.id && !reentered) { reentered = true; g.emit(handle, { type: 'text_delta', delta: 'reentrant' }); }
+        if (envelope.agentId !== handle.id) return;
+        // A `spawned` listener, and a listener of the first drained frame, both make a frame on the same handle.
+        if (envelope.phase === 'spawned' && !reentered) { reentered = true; g.emit(handle, { type: 'text_delta', delta: 'reentrant' }); }
+        if (envelope.phase === 'event' && envelope.event?.type === 'text_delta' && envelope.event.delta === 'held-1' && !drained) { drained = true; g.emit(handle, { type: 'text_delta', delta: 'during drain' }); }
       });
       g.emit(handle, { type: 'text_delta', delta: 'held-1' });
       g.emit(handle, { type: 'state', state: 'idle' });
@@ -834,7 +842,7 @@ describe('registry publication taps (#352, #353)', () => {
       expect(g.held(handle)).toBe(3);
       publish();
       g.emit(handle, { type: 'text_delta', delta: 'live' });
-      expect(g.tapped.get(handle.id)).toEqual(['spawned', 'held-1', 'state', 'held-2', 'reentrant', 'live']);
+      expect(g.tapped.get(handle.id)).toEqual(['spawned', 'held-1', 'state', 'held-2', 'reentrant', 'during drain', 'live']);
       expect(g.held(handle)).toBe(0);
     } finally {
       g.cleanup();
@@ -850,6 +858,11 @@ describe('registry publication taps (#352, #353)', () => {
         g.emit(handle, { type: 'state', state: 'idle' });
         expect(g.held(handle), String(rejectDispose)).toBe(2);
         g.registry.quarantineHandle(handle);
+        // The handle's own subscribers — as an owner's cessation and disposal observers — still hear everything.
+        const heard: string[] = [];
+        handle.subscribe((event) => { heard.push(event.type === 'text_delta' ? event.delta : event.type); });
+        const acknowledgements: boolean[] = [];
+        observeDisposalSettlement(handle, (acknowledged) => { acknowledgements.push(acknowledged); });
         // The held frames are released; a previously started turn's late frames are never held.
         expect(g.held(handle)).toBe(0);
         g.emit(handle, { type: 'text_delta', delta: 'late turn' });
@@ -863,10 +876,13 @@ describe('registry publication taps (#352, #353)', () => {
         // Disposal, acknowledged or rejected, is not cessation: its capacity is retained.
         if (rejectDispose) await expect(handle.dispose()).rejects.toThrow('native disposal rejected');
         else await handle.dispose();
+        expect(acknowledgements).toEqual([!rejectDispose]);
         expect(g.registry.residencySnapshot().occupied).toBe(1);
         // Late adapter-owned cessation still reaches the release listener: released once.
         g.cease(handle);
         expect(g.registry.residencySnapshot()).toMatchObject({ occupied: 0, handles: [] });
+        expect(heard).toEqual(expect.arrayContaining(['late turn', 'turn_end', 'state', 'cessation_evidence']));
+        expect(heard.indexOf('late turn')).toBeLessThan(heard.indexOf('cessation_evidence'));
         expect(g.tapped.get(handle.id)).toBeUndefined();
       } finally {
         g.cleanup();
@@ -874,18 +890,28 @@ describe('registry publication taps (#352, #353)', () => {
     }
   });
 
-  it('#352 a quarantine after publication changes no tap delivery, and a quarantine of a published handle never refuses it', async () => {
+  it('#352 a quarantine once publication has begun changes no tap delivery and never refuses it — after it, or from a spawned listener', async () => {
     const g = generations();
     try {
-      const { handle, publish } = await g.staged();
-      g.emit(handle, { type: 'text_delta', delta: 'held' });
-      publish();
-      g.registry.quarantineHandle(handle);
-      g.emit(handle, { type: 'text_delta', delta: 'after quarantine' });
-      expect(g.tapped.get(handle.id)).toEqual(['spawned', 'held', 'after quarantine']);
-      expect(() => publish()).not.toThrow();
-      expect(g.registry.getHandle(handle.id)).toBeNull();
-      g.cease(handle);
+      // After publication.
+      const after = await g.staged();
+      g.emit(after.handle, { type: 'text_delta', delta: 'held' });
+      after.publish();
+      g.registry.quarantineHandle(after.handle);
+      g.emit(after.handle, { type: 'text_delta', delta: 'after quarantine' });
+      expect(g.tapped.get(after.handle.id)).toEqual(['spawned', 'held', 'after quarantine']);
+      expect(() => after.publish()).not.toThrow();
+      expect(g.registry.getHandle(after.handle.id)).toBeNull();
+      // From a `spawned` listener, mid-publication: the publication completes, held frames included.
+      const during = await g.staged();
+      g.registry.onAgentEvent((envelope) => { if (envelope.phase === 'spawned' && envelope.agentId === during.handle.id) g.registry.quarantineHandle(during.handle); });
+      g.emit(during.handle, { type: 'text_delta', delta: 'held' });
+      during.publish();
+      g.emit(during.handle, { type: 'text_delta', delta: 'after quarantine' });
+      expect(g.tapped.get(during.handle.id)).toEqual(['spawned', 'held', 'after quarantine']);
+      expect(() => during.publish()).not.toThrow();
+      expect(g.registry.getHandle(during.handle.id)).toBeNull();
+      for (const handle of [after.handle, during.handle]) { await handle.dispose(); g.cease(handle); }
       expect(g.registry.residencySnapshot().occupied).toBe(0);
     } finally {
       g.cleanup();
