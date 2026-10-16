@@ -41,8 +41,11 @@ function plan(overrides: Partial<PropertyExecutionPlan> = {}): PropertyExecution
   };
 }
 
+/** A synthetic receipt whose authenticated report is, unless overridden,
+ * the JSON the runner printed (what the host's framed reporter carries). */
 function receipt(overrides: Partial<RawExecutionReceipt> = {}): RawExecutionReceipt {
-  return { exitCode: 0, signal: null, timedOut: false, stdout: '', stderr: '', durationMs: 1_000, ...overrides };
+  const stdout = overrides.stdout ?? '';
+  return { exitCode: 0, signal: null, timedOut: false, stdout, stderr: '', report: stdout === '' ? null : stdout, durationMs: 1_000, ...overrides };
 }
 
 function vitestJson(payload: unknown): string {
@@ -88,6 +91,21 @@ const collectionFailure = vitestJson({
 });
 
 describe('GH350 vitest adapter interpretation precedence', () => {
+  it('parses ONLY the host-authenticated report when a host receipt carries one, never stdout (#378)', () => {
+    // Code under test forged a passing report on stdout; the host found no
+    // nonce-framed report: missing evidence, never a pass.
+    const forged = interpretVitestJsonReceipt({ ...receipt({ stdout: selectedPass }), report: null }, plan());
+    expect(forged.kind).not.toBe('pass');
+    expect(forged.kind).toBe('inconclusive');
+    // The authenticated report decides even when stdout says otherwise.
+    const authenticated = interpretVitestJsonReceipt({ ...receipt({ exitCode: 1, stdout: selectedPass }), report: selectedFailure }, plan());
+    expect(authenticated.kind).toBe('property-failure');
+    // The report is never read from stdout: only an explicit authenticated
+    // report can pass, even when stdout carries the same JSON.
+    expect(interpretVitestJsonReceipt({ ...receipt({ stdout: selectedPass }), report: selectedPass }, plan()).kind).toBe('pass');
+    expect(interpretVitestJsonReceipt({ ...receipt({ stdout: selectedPass }), report: null }, plan()).kind).not.toBe('pass');
+  });
+
   it('classifies a fully consistent selected passing run as pass', () => {
     const outcome = interpretVitestJsonReceipt(receipt({ stdout: selectedPass }), plan());
     expect(outcome.kind).toBe('pass');

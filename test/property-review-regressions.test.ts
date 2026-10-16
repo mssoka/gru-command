@@ -7,7 +7,7 @@ import { createPropertyCampaignHost, propertyEvidenceForReview } from '../src/pr
 import { runPropertyCheck } from '../src/cli/property-check.js';
 import { sha256Hex } from '../src/property/overlay.js';
 import { unitCampaign, commit, UNIT_CONTENT, UNIT_PATH, UNIT_RUNNER } from './fixtures/property/executor/campaign.js';
-import { PASS_RUNNER } from './fixtures/property/executor/helpers.js';
+import { PASS_RUNNER, REPORT_FRAME } from './fixtures/property/executor/helpers.js';
 
 const fixtures: ReturnType<typeof unitCampaign>[] = [];
 const dirs: string[] = [];
@@ -69,7 +69,7 @@ describe('independent-review regression controls (fake runners; never real-tool 
   });
 
   it('does not suppress a new candidate assertion because a different baseline assertion fails', async () => {
-    const unrelated = `console.log(JSON.stringify({numTotalTests:2,numPassedTests:1,numFailedTests:1,numPendingTests:0,numTodoTests:0,success:false,testResults:[{name:process.cwd()+'/${UNIT_PATH}',status:'failed',message:'',assertionResults:[{status:'passed',fullName:'contract',failureMessages:[]},{status:'failed',fullName:'unrelated baseline assertion',failureMessages:['Property failed\\nseed: 42\\nCounterexample: [2]']}]}]}));process.exitCode=1;`;
+    const unrelated = `${REPORT_FRAME}__report(({numTotalTests:2,numPassedTests:1,numFailedTests:1,numPendingTests:0,numTodoTests:0,success:false,testResults:[{name:process.cwd()+'/${UNIT_PATH}',status:'failed',message:'',assertionResults:[{status:'passed',fullName:'contract',failureMessages:[]},{status:'failed',fullName:'unrelated baseline assertion',failureMessages:['Property failed\\nseed: 42\\nCounterexample: [2]']}]}]}));process.exitCode=1;`;
     const script = `import fs from 'node:fs';if(fs.readFileSync('test/placeholder','utf8').startsWith('baseline')){${unrelated}}else{${UNIT_RUNNER.replace("import fs from 'node:fs';", '')}}`;
     const setup = runnerSetup(script); const f = fixture('enforced', setup); const base = fixture('enforced', setup);
     writeFileSync(join(base.healthy.root, 'test/placeholder'), 'baseline unrelated defect\n'); commit(base.healthy, 'unrelated baseline assertion fails');
@@ -95,7 +95,7 @@ describe('independent-review regression controls (fake runners; never real-tool 
   });
 
   it('refuses an original assertion becoming skipped while a different selected assertion passes', async () => {
-    const skipped = `console.log(JSON.stringify({numTotalTests:2,numPassedTests:1,numFailedTests:0,numPendingTests:1,numTodoTests:0,success:true,testResults:[{name:process.cwd()+'/${UNIT_PATH}',status:'passed',message:'',assertionResults:[{status:'skipped',fullName:'contract',failureMessages:[]},{status:'passed',fullName:'replacement assertion',failureMessages:[]}]}]}));`;
+    const skipped = `${REPORT_FRAME}__report(({numTotalTests:2,numPassedTests:1,numFailedTests:0,numPendingTests:1,numTodoTests:0,success:true,testResults:[{name:process.cwd()+'/${UNIT_PATH}',status:'passed',message:'',assertionResults:[{status:'skipped',fullName:'contract',failureMessages:[]},{status:'passed',fullName:'replacement assertion',failureMessages:[]}]}]}));`;
     const script = `import fs from 'node:fs';if(fs.readFileSync('test/placeholder','utf8')==='skip\\n'){${skipped}}else{${UNIT_RUNNER.replace("import fs from 'node:fs';", '')}}`;
     const f = fixture('enforced', runnerSetup(script)); const { host, report, artifactsDir } = await execute(f); if (process.platform !== 'darwin') return;
     await expect(host.repair(report, async () => { writeFileSync(join(f.candidate.root, 'test/placeholder'), 'skip\n'); commit(f.candidate, 'skip original assertion via implementation state'); }, { artifactsDir, maxAttempts: 1 })).rejects.toThrow(/original frozen assertion/);

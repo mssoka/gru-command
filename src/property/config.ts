@@ -23,7 +23,10 @@ export const PROPERTY_CONFIG_CEILINGS = {
   maxIterations: 1_000_000,
   maxShrinkSteps: 100_000,
   runTimeoutMs: 3_600_000,
-  maxOutputBytes: 64 * 1_024 * 1_024,
+  // Per stream, per run. A sealed receipt retains its full capture, so this
+  // ceiling bounds every retained receipt (#377); a property-test runner
+  // report is kilobytes, far under it.
+  maxOutputBytes: 8 * 1_024 * 1_024,
 } as const;
 
 const MODES: readonly PropertyMode[] = ['disabled', 'observation', 'enforced'];
