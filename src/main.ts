@@ -83,6 +83,9 @@ import { AgentLessonsDistiller } from './lessons/distiller.js';
 import { createSessionLessonsCapture } from './lessons/capture.js';
 import { createReviewOutcomeCapture } from './lessons/review-capture.js';
 import { createLessonsServer } from './lessons/server.js';
+import { startVectorHalves, VectorService } from './vector/service.js';
+import { createVectorServer } from './vector/server.js';
+import { heistWorkWaiting as raidHeistWorkWaiting, VectorRaidRunner } from './vector/runner.js';
 import { DecisionRuntime } from './decisions/runtime.js';
 import { DECISION_SURFACE_EVENT_TRIAGE } from './decisions/questions.js';
 import { isolateDecisionEnvironment } from './decisions/credentials.js';
@@ -575,6 +578,45 @@ async function main(): Promise<number> {
   } catch (error) {
     logger.log('error', 'lesson proposal reconcile failed at startup', { error: String(error) });
   }
+  // Vector's raids, planning half (#351): code builds the candidate list,
+  // Gru picks, FOR YOU holds proposals. Off unless [vector] enabled.
+  // The dispatcher is built further down; a fix heist reaches it late-bound.
+  let dispatchFixHeist: ((input: { readonly jobId: string; readonly repoPath: string; readonly title: string; readonly briefing: string }) => Promise<unknown>) | null = null;
+  const vector = new VectorService({
+    vector: config.vector,
+    workspaceRoot: config.workspaceRoot,
+    managedRepos: config.managedRepos,
+    ledger,
+    bus,
+    notifications,
+    dispatchFix: async (input) => {
+      if (dispatchFixHeist === null) throw new Error('the dispatch service is not up yet');
+      return await dispatchFixHeist(input);
+    },
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  // Silas's raid queue (#351): Vector runs on Perkins's read-only role with
+  // his own prompt, through the same resident pool and pacing as every role.
+  const vectorRaids = new VectorRaidRunner({
+    vector: config.vector,
+    workspaceRoot: config.workspaceRoot,
+    ledger,
+    raidsDir: join(config.dataDir, 'vector', 'raids'),
+    spawnVector: async ({ policy, cwd, signal }) => {
+      const handle = await registry.spawn('perkins', { cwd, signal, isolatedReview: policy });
+      ledger.registerAgent({ id: handle.id, role: 'perkins', label: 'vector', sessionFile: handle.sessionFile, parentage: 'top-level' });
+      return handle;
+    },
+    disposeVector: (handle) => registry.disposeHandle(handle),
+    acquireTurn: (input) => pacing.gate.acquireReviewTurn(input),
+    heistWorkWaiting: () => raidHeistWorkWaiting(pacing.gate.view()),
+    notifications,
+    onBreakIn: (breakIn) => {
+      void vector.onBreakIn(breakIn.id).catch((error: unknown) => logger.log('error', 'vector break-in follow-through failed', { breakIn: breakIn.id, error: String(error) }));
+    },
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  const vectorServer = createVectorServer({ token: config.auth.token, service: vector, log: (level, msg, fields) => logger.log(level, msg, fields) });
   const lessonsServer = createLessonsServer({
     config,
     journal,
@@ -1058,6 +1100,8 @@ async function main(): Promise<number> {
     ...(config.lessons.enabled ? { lessons: lessonReferences, lessonsCapture } : {}),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+  // A Vector break-in's fix heist goes through the same dispatch path as POST /api/dispatch (#351).
+  dispatchFixHeist = (input) => dispatcher.dispatch({ jobId: input.jobId, repoPath: input.repoPath, title: input.title, briefing: input.briefing });
   // Issue #339: a prohibited read during a resume/re-brief invalidates blind
   // coverage — the same observation the dispatch settle seam runs. One wiring
   // for every resume/re-brief path (boot re-brief, silas re-brief, provider
@@ -1485,6 +1529,7 @@ async function main(): Promise<number> {
       buildInfo: () => buildInfo,
       requestHook: (req, res, path) =>
         lessonsServer.requestHook(req, res, path) ||
+        vectorServer.requestHook(req, res, path) ||
         rollServer.requestHook(req, res, path) ||
         attachmentsServer.requestHook(req, res, path) ||
         worktreeServer.requestHook(req, res, path) ||
@@ -1554,6 +1599,12 @@ async function main(): Promise<number> {
   bob.start();
   if (config.lessons.enabled) dream.start();
   else logger.info('lesson dream disabled by config', {});
+  // Registered for shutdown before starting, so a failed start still stops.
+  // Raids are off the heist path: a failure is loud, never fatal, and one
+  // half failing never keeps the other from starting.
+  state.vector = vector;
+  state.vectorRaids = vectorRaids;
+  startVectorHalves({ planning: vector, runner: vectorRaids }, (level, msg, fields) => logger.log(level, msg, fields));
   if (silasSlot !== null) {
     // The driver starts after listen so its wake prompt carries the real
     // bound port (config port 0 = ephemeral); until then no sweeps run and

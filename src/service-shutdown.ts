@@ -1,3 +1,5 @@
+import type { VectorService } from './vector/service.js';
+import type { VectorRaidRunner } from './vector/runner.js';
 import type { ServiceHandle } from './server.js';
 import type { RuntimeRegistry } from './runtime/registry.js';
 import type { SessionStore } from './sessions/store.js';
@@ -43,6 +45,10 @@ export interface ServiceShutdownState {
   decisions?: DecisionRuntime;
   bob?: BobScheduler;
   dream?: DreamScheduler;
+  /** Vector's raid planning (#351): its plan cadence and decision follow-through stop. */
+  vector?: Pick<VectorService, 'stop'>;
+  /** Silas's raid queue (#351): a raid in flight stops at its next boundary. */
+  vectorRaids?: Pick<VectorRaidRunner, 'stop'>;
   silas?: SilasDriver;
   /** Issue #243: the autopilot ops the shutdown checkpoints and drains. */
   autopilot?: SilasAutopilotOpsHandle;
@@ -181,6 +187,20 @@ export function startServiceShutdown(options: ServiceShutdownOptions): void {
           state.dream.stop();
         } catch (error) {
           logger.error('lesson dream scheduler stop failed', { error: String(error) });
+        }
+      }
+      if (state.vector !== undefined) {
+        try {
+          state.vector.stop();
+        } catch (error) {
+          logger.error('vector raid planning stop failed', { error: String(error) });
+        }
+      }
+      if (state.vectorRaids !== undefined) {
+        try {
+          state.vectorRaids.stop();
+        } catch (error) {
+          logger.error('vector raid runner stop failed', { error: String(error) });
         }
       }
       if (state.silas !== undefined) {

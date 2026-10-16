@@ -30,6 +30,9 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  *   [verify]                 # the project's verification commands, by scope;
  *   full = "npm test"        #   POST /api/verify runs these under the global
  *   quick = "npm run lint"   #   test budget (see docs/FLOW.md)
+ *
+ *   [vector]                 # Vector's raids (#351, docs/VECTOR.md)
+ *   enabled = false          #   false removes this repository from raid candidates
  */
 
 export const MANIFEST_DIR = '.gru-command';
@@ -63,6 +66,8 @@ export interface WorktreeManifest {
   readonly copies: readonly ManifestCopy[];
   readonly setup: readonly ManifestSetup[];
   readonly verify: ManifestVerify;
+  /** Per-repository raid opt-out (#351); absent means the instance setting decides. */
+  readonly vector?: { readonly enabled: boolean };
   /** Historical manifests remain readable for already-running jobs; creation refuses this obsolete GC bootstrap. */
   readonly retiredGcBmadBootstrap?: true;
 }
@@ -98,8 +103,8 @@ export function parseWorktreeManifest(text: string, source = MANIFEST_PATH): Wor
     throw new Error(`worktree manifest ${source} is not valid TOML: ${String(error)}`);
   }
   for (const key of Object.keys(raw)) {
-    if (!['link', 'copy', 'setup', 'verify'].includes(key)) {
-      throw new Error(`worktree manifest ${source} has unknown key "${key}" (valid: link, copy, setup, verify)`);
+    if (!['link', 'copy', 'setup', 'verify', 'vector'].includes(key)) {
+      throw new Error(`worktree manifest ${source} has unknown key "${key}" (valid: link, copy, setup, verify, vector)`);
     }
   }
 
@@ -156,13 +161,27 @@ export function parseWorktreeManifest(text: string, source = MANIFEST_PATH): Wor
     }
   }
 
+  let vector: { readonly enabled: boolean } | undefined;
+  const rawVector = raw['vector'];
+  if (rawVector !== undefined) {
+    if (typeof rawVector !== 'object' || rawVector === null || Array.isArray(rawVector)) {
+      throw new Error(`worktree manifest ${source}: [vector] must be a table`);
+    }
+    for (const key of Object.keys(rawVector)) {
+      if (key !== 'enabled') throw new Error(`worktree manifest ${source} [vector] has unknown key "${key}" (valid: enabled)`);
+    }
+    const enabled = (rawVector as Record<string, unknown>)['enabled'];
+    if (typeof enabled !== 'boolean') throw new Error(`worktree manifest ${source} [vector].enabled must be a boolean, got: ${String(enabled)}`);
+    vector = { enabled };
+  }
+
   // Distinguish actual comment markers from the same text inside a user's
   // multiline setup string. Removing a comment cannot alter parsed TOML.
   const retired = [...text.matchAll(/^[\t ]*#[\t ]*(?:BEGIN|END)[\t ]+GRU[\t ]+COMMAND[\t ]+BMAD[\t ]+BOOTSTRAP\b[^\r\n]*/gmu)].some((match) => {
     const withoutLine = text.slice(0, match.index) + text.slice(match.index + match[0].length);
     try { return JSON.stringify(parse(withoutLine)) === JSON.stringify(raw); } catch { return false; }
   });
-  return { links, copies, setup, verify: verifyEntries, ...(retired ? { retiredGcBmadBootstrap: true as const } : {}) };
+  return { links, copies, setup, verify: verifyEntries, ...(vector === undefined ? {} : { vector }), ...(retired ? { retiredGcBmadBootstrap: true as const } : {}) };
 }
 
 /** Creation-only guard: historical jobs can still resolve their original verification commands. */

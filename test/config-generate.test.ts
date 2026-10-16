@@ -94,6 +94,7 @@ describe('config-generate CLI', () => {
       'lessons',
       'silas',
       'provider_recovery',
+      'vector',
       'roll',
       'concurrency',
       'review',

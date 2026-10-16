@@ -40,6 +40,11 @@ const OWNER_REQUIRED_KINDS: readonly string[] = [
   // Unconfirmed native cleanup after a refused replacement can need a human
   // when the original owner is lost (issue #280): main's owner-facing notice.
   'supervision.restart-cleanup-unconfirmed',
+  // Vector's raids (#351): raid_mode = "proposed" puts each raid Gru picks
+  // in FOR YOU for the owner's Accept or Decline; fix_mode = "proposed"
+  // does the same for each break-in's fix heist.
+  'vector.raid-proposal',
+  'vector.fix-proposal',
 ];
 
 /** Kinds that are always owner-facing, prefix match (dynamic suffixes,
@@ -59,7 +64,7 @@ const OWNER_ALLOWED_PREFIXES: readonly string[] = ['decisions.degraded.'];
 
 /** Kinds that only ever route `needs-owner` with a typed reserved
  * decision attached (validated at the write boundary). */
-const DECISION_REQUIRED_KINDS: readonly string[] = ['gru.owner-escalation'];
+const DECISION_REQUIRED_KINDS: readonly string[] = ['gru.owner-escalation', 'vector.raid-proposal', 'vector.fix-proposal'];
 
 export function ownerAttentionFor(kind: string): OwnerAttention {
   if (OWNER_REQUIRED_KINDS.includes(kind)) return 'owner-required';
