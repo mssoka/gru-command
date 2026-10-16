@@ -190,7 +190,7 @@ describe('reviewed-candidate behavioral RED custody', () => {
       expect(check(`${head} '' present.ts`).stderr).toBe('require_pinned_sources was given a regressions revision that is empty or not a plain revision: ""\n');
       // A revision git would read as an option is never handed to it.
       expect(check(`--output=/tmp/x ${head} present.ts`).stderr).toBe('require_pinned_sources was given a candidate revision that is empty or not a plain revision: "--output=/tmp/x"\n');
-      for (const odd of ['a b', 'HEAD:secret', 'abc*', 'a..b', 'a...b', '^x', 'abc^-', 'abc^-1', '~1', '/x', 'a//b', 'a/', 'a.']) {
+      for (const odd of ['a b', 'HEAD:secret', 'abc*', 'a..b', 'a...b', '^x', 'abc^-', 'abc^-1', '~1', '/x', 'a//b', 'a/', 'a.', '.x', 'a/.b', 'x.lock', 'a.lock/b']) {
         expect(check(`'${odd}' ${head} present.ts`).stderr, odd).toBe(`require_pinned_sources was given a candidate revision that is empty or not a plain revision: "${odd}"\n`);
       }
       // The snapshot is the candidate's tree, with no archive left behind...
@@ -308,35 +308,56 @@ describe('reviewed-candidate behavioral RED custody', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it('an interrupted helper load takes its group down, leaves no temporary directory, and is said as an interruption (#358)', async () => {
+  it('a helper load stopped by any signal the guard handles takes its group down, leaves no temporary directory, and is said so (#358)', async () => {
     const dir = realpathSync(mkdtempSync(join(tmpdir(), 'gru-helper-interrupt-')));
+    const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    const groups: number[] = [];
     try {
       const snapshot = join(dir, 'snapshot'); mkdirSync(join(snapshot, 'dist', 'verify'), { recursive: true }); mkdirSync(join(dir, 'tmp'));
       writeFileSync(join(snapshot, 'package.json'), '{"type":"module"}\n');
-      const pidFile = join(dir, 'kid.pid');
-      writeFileSync(join(snapshot, 'dist', 'verify', 'capture-cli.js'), `import { spawn } from 'node:child_process';\nimport { writeFileSync } from 'node:fs';\nconst kid = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' });\nwriteFileSync(${JSON.stringify(pidFile)}, String(kid.pid));\nsetInterval(() => {}, 1000);\nawait new Promise(() => {});\n`);
-      const run = spawn('sh', ['-c', '. "$1" && require_built_helper', 'lib', join(repoRoot, BASELINE_LIB)], { cwd: snapshot, env: { ...gitFree(), TMPDIR: join(dir, 'tmp'), GRU_HELPER_LOAD_MS: '60000' }, stdio: ['ignore', 'ignore', 'pipe'] });
-      let stderr = '';
-      run.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk; });
-      const exited = once(run, 'exit');
-      const deadline = Date.now() + 20_000;
-      const kidPid = (): number => (existsSync(pidFile) ? Number(readFileSync(pidFile, 'utf8')) : 0);
-      while (kidPid() <= 1 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
-      const kid = kidPid();
-      expect(kid > 1, 'the load started its descendant').toBe(true);
-      // The load guard is the shell's node child.
-      const guards = execFileSync('pgrep', ['-P', String(run.pid), '-f', 'input-type=module'], { encoding: 'utf8' }).trim().split('\n');
-      expect(guards).toHaveLength(1);
-      process.kill(Number(guards[0]), 'SIGTERM');
-      const [status] = await exited;
-      expect([status, stderr]).toEqual([130, `the helper load was interrupted (status 130) — nothing was judged; refusing (snapshot kept at ${snapshot})\n`]);
-      const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
-      const until = Date.now() + 5000;
-      while (alive(kid) && Date.now() < until) await new Promise((resolve) => setTimeout(resolve, 100));
-      expect(alive(kid), 'the load\'s descendant went with it').toBe(false);
-      expect(readdirSync(join(dir, 'tmp')).filter((name) => name.startsWith('gru-helper-load-'))).toEqual([]);
-    } finally { rmSync(dir, { recursive: true, force: true }); }
-  });
+      for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT'] as const) {
+        const pidFile = join(dir, `${signal}.pid`);
+        // The load (its group's leader) and its descendant, written whole by rename: never read half-written.
+        writeFileSync(join(snapshot, 'dist', 'verify', 'capture-cli.js'), `import { spawn } from 'node:child_process';\nimport { renameSync, writeFileSync } from 'node:fs';\nconst kid = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' });\nwriteFileSync(${JSON.stringify(`${pidFile}.part`)}, \`\${process.pid} \${kid.pid}\`);\nrenameSync(${JSON.stringify(`${pidFile}.part`)}, ${JSON.stringify(pidFile)});\nsetInterval(() => {}, 1000);\nawait new Promise(() => {});\n`);
+        const run = spawn('sh', ['-c', '. "$1" && require_built_helper', 'lib', join(repoRoot, BASELINE_LIB)], { cwd: snapshot, env: { ...gitFree(), TMPDIR: join(dir, 'tmp'), GRU_HELPER_LOAD_MS: '60000' }, stdio: ['ignore', 'ignore', 'pipe'] });
+        let stderr = '';
+        run.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk; });
+        const exited = once(run, 'exit');
+        const closed = once(run, 'close');
+        try {
+          const deadline = Date.now() + 20_000;
+          while (!existsSync(pidFile) && Date.now() < deadline) await pause(50);
+          expect(existsSync(pidFile), `${signal}: the load started its descendant`).toBe(true);
+          const [leader, kid] = readFileSync(pidFile, 'utf8').split(' ').map(Number) as [number, number];
+          expect([leader, kid].every((pid) => Number.isSafeInteger(pid) && pid > 1), `${signal}: ${pidFile} holds real pids`).toBe(true);
+          groups.push(leader);
+          // The load guard is the shell's node child.
+          const found = spawnSync('pgrep', ['-P', String(run.pid), '-f', 'input-type=module'], { encoding: 'utf8' });
+          expect(found.status, `${signal}: the load guard is found (${found.stderr})`).toBe(0);
+          const guards = found.stdout.trim().split('\n');
+          expect(guards, signal).toHaveLength(1);
+          process.kill(Number(guards[0]), signal);
+          const [status] = await exited;
+          // Closed, not just exited: every byte of stderr is read — and a
+          // load group that outlived the guard would hold it open.
+          const drained = await Promise.race([closed.then(() => true), pause(10_000).then(() => false)]);
+          expect(drained, `${signal}: nothing the load started still holds the guard's stderr`).toBe(true);
+          expect([status, stderr], signal).toEqual([130, `the helper load was stopped by a signal (status 130) — nothing was judged; refusing (snapshot kept at ${snapshot})\n`]);
+          const until = Date.now() + 5000;
+          while (alive(kid) && Date.now() < until) await pause(100);
+          expect(alive(kid), `${signal}: the load's descendant went with it`).toBe(false);
+          expect(readdirSync(join(dir, 'tmp')).filter((name) => name.startsWith('gru-helper-load-')), signal).toEqual([]);
+        } finally {
+          if (run.exitCode === null && run.signalCode === null) { run.kill('SIGKILL'); await exited; }
+        }
+      }
+    } finally {
+      // Nothing this test started outlives it, whatever failed above.
+      for (const leader of groups) { try { process.kill(-leader, 'SIGKILL'); } catch { /* gone */ } }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120_000);
 
   it('the status title the classifier allows is the real status regression\'s title', () => {
     // Built in parts so the suite-shape counter never mistakes it for a registration.

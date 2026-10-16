@@ -7,10 +7,12 @@
 
 # A revision handed to git must be a plain revision — a hash or a simple ref
 # name, optionally with ^/~ suffixes — never something git would read as an
-# option or a range (`a..b`, `^a`, `a^-n`), nor a spelling no ref can have
-# (a leading `~` or `/`, `//`, a trailing `/` or `.`).
+# option or a range (`a..b`, `^a`, `a^-n`), nor one of these spellings no
+# ref can have: a leading `~`, `/` or `.`, a component starting with `.`,
+# `//`, a trailing `/` or `.`, or a component ending in `.lock`. (The ^/~
+# suffix grammar itself is left to git, which refuses by its own message.)
 plain_revision() {
-  case "$1" in ''|-*|^*|~*|/*|*..*|*^-*|*//*|*/|*.|*[!0-9A-Za-z_./^~-]*) return 1;; esac
+  case "$1" in ''|-*|^*|~*|/*|.*|*/.*|*..*|*^-*|*//*|*/|*.|*.lock|*.lock/*|*[!0-9A-Za-z_./^~-]*) return 1;; esac
 }
 
 # require_pinned_sources <candidate> <regressions> <file>...: every pinned
@@ -74,9 +76,11 @@ snapshot_candidate() {
 # without leading zeros, default 60000 — writing to a file rather than a pipe,
 # so neither a spinning helper, one that ignores SIGTERM, nor a descendant in
 # its group holding its output open can stall the baseline or outlive it (a
-# descendant that leaves the group with setsid is beyond this reach). An
-# interrupted load (SIGINT, SIGTERM, SIGHUP or SIGQUIT) takes its group down
-# with it and is said as an interruption, never as a broken helper. A per-run
+# descendant that leaves the group with setsid is beyond this reach). A load
+# stopped by a signal is said so, with its status, never as a broken helper;
+# the four signals the guard handles (SIGINT, SIGTERM, SIGHUP, SIGQUIT) take
+# its group and temporary directory down first — SIGKILL, or a signal sent to
+# the shell alone, reaches no handler. A per-run
 # sentinel, on its own line, proves the load finished (against accidental
 # output; the helper under test can read its own command line). Importing never runs the CLI (it runs only when
 # invoked directly). A refused snapshot is kept for inspection.
@@ -99,14 +103,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 const ms = Number(process.env.GRU_HELPER_LOAD_MS);
 const sentinel = `gru-helper-loaded-${randomUUID()}`;
-const dir = mkdtempSync(join(tmpdir(), 'gru-helper-load-'));
+let dir;
 let failure = null;
 let child;
 // The group is probed before it is signalled: that narrows, but cannot
 // close, the window in which a reaped leader's id names some other group.
 const killGroup = () => { if (child?.pid === undefined) return; try { process.kill(-child.pid, 0); process.kill(-child.pid, 'SIGKILL'); } catch { /* the group is gone */ } };
-// Taken before the load starts, so no interruption can orphan it.
-for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT']) process.once(signal, () => { killGroup(); rmSync(dir, { recursive: true, force: true }); process.exit(130); });
+// Taken before anything is made (the temporary directory, the load), so a
+// signal the guard can handle never orphans either.
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT']) process.once(signal, () => { killGroup(); if (dir !== undefined) rmSync(dir, { recursive: true, force: true }); process.exit(130); });
+dir = mkdtempSync(join(tmpdir(), 'gru-helper-load-'));
 try {
   const out = openSync(join(dir, 'stdout'), 'w');
   try {
@@ -134,9 +140,9 @@ JS
     :
   else
     _helper_status=$?
-    # A load stopped by a signal judged nothing about the helper.
+    # A load stopped by a signal (handled: 130; or not) judged nothing about the helper.
     if [ "$_helper_status" -ge 128 ]; then
-      echo "the helper load was interrupted (status $_helper_status) — nothing was judged; refusing (snapshot kept at $PWD)" >&2
+      echo "the helper load was stopped by a signal (status $_helper_status) — nothing was judged; refusing (snapshot kept at $PWD)" >&2
       exit "$_helper_status"
     fi
     echo "the built dist/verify/capture-cli.js does not load cleanly — a broken helper would read as behavioral RED; refusing (snapshot kept at $PWD)" >&2
