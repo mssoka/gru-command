@@ -2046,8 +2046,11 @@ export class ClaudeCodeHandle implements AgentHandle {
             ? new Promise<void>((resolveWritten) => {
               transcript.write(`${JSON.stringify(frame)}\n`, (error?: Error | null) => {
                 // A lost frame leaves the directive's record incomplete: no delivery.
-                if (error != null) this.failDirective(turn, new DirectiveCheckpointError(`directive transcript write failed: ${error.message}`), abortTurn);
-                resolveWritten();
+                try {
+                  if (error != null) this.failDirective(turn, new DirectiveCheckpointError(`directive transcript write failed: ${error.message}`), abortTurn);
+                } finally {
+                  resolveWritten();
+                }
               });
             })
             : new Promise<void>((resolveDurable, rejectDurable) => {
@@ -2078,15 +2081,12 @@ export class ClaudeCodeHandle implements AgentHandle {
           turnStarted = true;
           const init = translator.init;
           if (init !== null && init.sessionId !== params.sessionId) {
-            failTurn(
+            // Ends stdin too (a directive turn keeps it open) and escalates
+            // to SIGKILL for a CLI that ignores SIGTERM.
+            abortTurn(
               `session id mismatch: requested ${params.sessionId}, claude reported ` +
                 `${init.sessionId || '(empty)'} — refusing to continue a foreign session`,
             );
-            try {
-              child.kill('SIGTERM');
-            } catch {
-              /* already gone */
-            }
             return;
           }
           // Servers the CLI skipped (mcp_server_errors, --mcp-config only),
@@ -2156,7 +2156,9 @@ export class ClaudeCodeHandle implements AgentHandle {
         this.onInfraError(error);
         failTurn(`claude process failed to spawn: ${String(error)}`);
         parser.end();
-        turn?.settings.dispose();
+        // A child that never started can never read its settings; a live one
+        // keeps them until its close.
+        if (child.pid === undefined) turn?.settings.dispose();
         transcript.end(() => settle(new Error(failure)));
       });
       child.on('close', (code: number | null, signal: NodeJS.Signals | null) => {

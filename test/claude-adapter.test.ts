@@ -2594,6 +2594,77 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       }
     });
 
+    it('a lost transcript write fails the directive: an incomplete record is never a delivery', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      let broken = false;
+      handle.subscribe((event) => {
+        if (event.type !== 'turn_start') return;
+        // The disk fails on the first ordinary (non-gating) frame of the turn.
+        type Chunk = { toString(): string };
+        const stream = (handle as unknown as { liveTranscript: { _writev: unknown; _write: (chunk: Chunk, encoding: unknown, callback: (error?: Error) => void) => void } }).liveTranscript;
+        const write = stream._write.bind(stream);
+        stream._writev = null;
+        stream._write = (chunk, encoding, callback) => {
+          if (!broken && chunk.toString().includes('"type":"stream_event"')) { broken = true; callback(new Error('ENOSPC: no space left on device')); return; }
+          write(chunk, encoding, callback);
+        };
+      });
+      await expect(handle.prompt('answer plainly', { directive: { identity: identityFor('claude-disk'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+        .rejects.toThrow(/directive transcript write failed: ENOSPC/u);
+      expect(broken).toBe(true);
+      await handle.dispose();
+    });
+
+    it('a directive turn whose CLI never starts leaves no private settings behind', async () => {
+      const settingsOf = (args: readonly string[]): string => args[args.indexOf('--settings') + 1]!;
+      for (const mode of ['throws', 'errors'] as const) {
+        let settings = '';
+        const spawnProcess = ((_binary: string, args: readonly string[]) => {
+          settings = settingsOf(args);
+          if (mode === 'throws') throw new Error('EAGAIN: cannot fork');
+          const child = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), pid: undefined, exitCode: null, signalCode: null, kill: () => true });
+          setImmediate(() => child.emit('error', Object.assign(new Error('spawn claude ENOENT'), { code: 'ENOENT' })));
+          return child as unknown as ChildProcess;
+        }) as unknown as typeof spawn;
+        const fx = fixture({ spawnProcess });
+        const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+        await expect(handle.prompt('follow it', { directive: { identity: identityFor(`claude-nospawn-${mode}`), beforeAdmission: () => {}, onAdmitted: () => {} } }), mode)
+          .rejects.toThrow(/claude process failed to spawn/u);
+        expect(settings, mode).not.toBe('');
+        expect(existsSync(settings), mode).toBe(false);
+        await handle.dispose();
+      }
+    });
+
+    it('a turn admitted at the echo that never reaches a result is no delivery', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const identity = identityFor('claude-no-result');
+      const admitted: DirectiveNativeBinding[] = [];
+      await expect(handle.prompt('no-result-ok please', { directive: { identity, beforeAdmission: () => {}, onAdmitted: (binding) => admitted.push(binding) } }))
+        .rejects.toThrow(/without a result frame/u);
+      expect(admitted).toHaveLength(1); // admitted: the CLI acknowledged it
+      expect(handle.inspectDirective!(identity)).toMatchObject({ state: 'unknown', reason: 'native directive turn has no result yet' });
+      await handle.dispose();
+    });
+
+    it('a directive turn on a foreign session is aborted, even by a CLI that ignores SIGTERM', async () => {
+      const fx = fixture({ killGraceMs: 300 });
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      process.env['CLAUDE_DOUBLE_MISMATCH'] = '1';
+      process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
+      try {
+        // Its stdin stays open for the permission channel: only the abort ends it.
+        await expect(handle.prompt('follow it', { directive: { identity: identityFor('claude-foreign'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+          .rejects.toThrow(/session id mismatch/u);
+      } finally {
+        delete process.env['CLAUDE_DOUBLE_MISMATCH'];
+        delete process.env['CLAUDE_DOUBLE_IGNORE_TERM'];
+        await handle.dispose();
+      }
+    });
+
     it('a CLI that dies before answering keeps its own diagnosis, not the missing echo', async () => {
       const fx = fixture();
       const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });

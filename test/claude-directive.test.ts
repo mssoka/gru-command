@@ -160,12 +160,11 @@ describe('the Claude directive checkpoint (#424)', () => {
     expect(() => assertClaudeDirectiveToolIntent(turn([init, echo, use('t1'), use('t1')]), identity, 't1', 'Read', { file_path: '/x' })).toThrow(/ambiguous/u);
   });
 
-  it('a header that no longer names the session makes the checkpoint unknown, never a throw', () => {
+  it('a transcript whose bound prefix changed (its header included) makes the checkpoint unknown, never a throw', () => {
     const file = turn([init, echo, done]);
     const [, ...rest] = readFileSync(file, 'utf8').split('\n');
     writeFileSync(file, [JSON.stringify({ type: 'session', version: 1, id: 'another-session', cwd: '/elsewhere', runtime: 'claude-code' }), ...rest].join('\n'));
-    // The prefix it was bound to changed too; either way: unknown, by name.
-    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'unknown' });
+    expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: 'the native transcript before the directive changed' });
   });
 
   it('a transcript with no GC session header binds nothing', () => {
