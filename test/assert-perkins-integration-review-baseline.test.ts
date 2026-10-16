@@ -169,6 +169,9 @@ describe('perkins integration R4 fail-before classifier', () => {
       // An eval origin is found whatever its function is called.
       ['    at eval (eval at Object.load [as x] (file:///repo/test/helpers/h.ts:4:5), <anonymous>:1:1)', '/repo/test/helpers/h.ts'],
       ['    at eval (eval at new Loader (/repo/test/helpers/h.ts:4:5), <anonymous>:1:1)', '/repo/test/helpers/h.ts'],
+      // A spaced function name (`new X`, `async x`) on the eval frame itself.
+      ['    at new Foo (eval at x (file:///repo/test/a.test.ts:1:2), <anonymous>:1:1)', '/repo/test/a.test.ts'],
+      ['    at async run (eval at load (/repo/test/helpers/h.ts:4:5), <anonymous>:1:1)', '/repo/test/helpers/h.ts'],
       // A frame that names a location which cannot be judged is undefined.
       ['    at file:///repo/test/%E0%A4%A.ts:1:2', undefined],
       ['    at fn (test/helpers/h.ts:1:2)', undefined],
@@ -182,6 +185,13 @@ describe('perkins integration R4 fail-before classifier', () => {
     }
     // A frame-opening line too long to judge is never matched — and refuses.
     expect(isBehavioralAssertion(`AssertionError: x\n    at ${'a ('.repeat(5000)}/repo/test/helpers/h.ts:1:2)\n    at /repo/test/a.test.ts:1:2`)).toBe(false);
+    // The bound is 2048 characters: a real frame just under it is judged, one
+    // just over it (and under the old 4096) refuses by name.
+    const frameOf = (length: number): string => { const head = '    at /repo/test/'; const tail = '.test.ts:1:2'; return `${head}${'d'.repeat(length - head.length - tail.length)}${tail}`; };
+    expect(frameOf(2048)).toHaveLength(2048);
+    expect(behavioralRefusal(`AssertionError: x\n${frameOf(2048)}`)).toBeNull();
+    expect(behavioralRefusal(`AssertionError: x\n${frameOf(2049)}`)).toMatch(/^a frame-opening line is longer than 2048 characters: " {4}at \/repo\/test\/d+"…$/u);
+    expect(behavioralRefusal(`AssertionError: x\n${frameOf(3000)}`)).toMatch(/^a frame-opening line is longer than 2048 characters: /u);
     // A spaced relative or upper-case-scheme helper location is a frame that
     // cannot be judged: it refuses rather than slipping by as prose.
     for (const frame of ['    at fn (test/my helpers/h.ts:1:2)', '    at FILE:///repo/test/helpers/h.ts:1:2', '    at fn (FILE:///repo/test/helpers/h.ts:1:2)']) {
@@ -195,7 +205,7 @@ describe('perkins integration R4 fail-before classifier', () => {
       expect(isBehavioralAssertion(`AssertionError: x\n${frame}`), frame).toBe(true);
     }
     // Any line terminator separates frames: a helper frame cannot hide behind one.
-    for (const separator of ['\r', '\u2028', '\u2029']) {
+    for (const separator of ['\r', '\u2028', '\u2029', '\v', '\f', '\u0085']) {
       expect(isBehavioralAssertion(`AssertionError: x${separator}    at /repo/test/helpers/h.ts:1:2${separator}    at /repo/test/a.test.ts:1:2`), JSON.stringify(separator)).toBe(false);
     }
     // A stack of only generated frames, bare or parenthesised, decides nothing: refused.
@@ -291,6 +301,17 @@ describe('perkins integration R4 fail-before classifier', () => {
     expect(behavioralRefusal('TypeError: nope')).toBe('its first line is no assertion or rejects/resolves report: "TypeError: nope"');
     expect(behavioralRefusal('AssertionError: x\n    at <anonymous>')).toBe('its stack names only runtime, machinery or generated frames');
     expect(behavioralRefusal('AssertionError: x\n    at /repo/test/a.test.ts:1:2')).toBeNull();
+    expect(behavioralRefusal(undefined)).toBe('the failure message is not text');
+    expect(isBehavioralAssertion(42)).toBe(false);
+    // A located `at …` line the grammar cannot read refuses by name; a bare clock time is prose.
+    expect(behavioralRefusal('AssertionError: x\n    at stage:1:2\n    at /repo/test/a.test.ts:1:2'))
+      .toBe('a frame names a location that cannot be judged (rephrase prose shaped like a frame): "at stage:1:2"');
+    expect(behavioralRefusal('AssertionError: x\n    at test/my helpers/h.ts:1:2\n    at /repo/test/a.test.ts:1:2'))
+      .toBe('a frame names a location that cannot be judged (rephrase prose shaped like a frame): "at test/my helpers/h.ts:1:2"');
+    expect(behavioralRefusal('AssertionError: x\n    at 12:30:15\n    at /repo/test/a.test.ts:1:2')).toBeNull();
+    // A quoted line is cut on a code point, never inside a surrogate pair.
+    const emoji = behavioralRefusal(`TypeError: ${'😀'.repeat(200)}`)!;
+    expect(emoji).toBe(`its first line is no assertion or rejects/resolves report: ${JSON.stringify(`TypeError: ${'😀'.repeat(149)}`)}…`);
     expect(() => assertPerkinsIntegrationBaseline('fast', report(red(FAST_TITLE, ['AssertionError: x\n    at stage (/repo/test/helpers/h.ts:1:2)']))))
       .toThrow(/failed before its assertion; setup\/import failure is not RED evidence \(the assertion was raised outside a test file, in "\/repo\/test\/helpers\/h\.ts"\)/u);
   });
@@ -298,8 +319,8 @@ describe('perkins integration R4 fail-before classifier', () => {
   it('reads a scope\'s classifier leg as the tool does: its first argument, a plain word', () => {
     expect(['x.mjs fast r.json', 'assert-perkins-integration-review-baseline.mjs "r8" "$d/r.json"', "assert-perkins-integration-review-baseline.mjs' heavy;",
       'assert-perkins-integration-review-baseline.mjs r9&&true', 'assert-perkins-integration-review-baseline.mjs r10)', 'assert-perkins-integration-review-baseline.mjs $LEG r.json',
-      'assert-perkins-integration-review-baseline.mjs "r8\' r.json']
-      .map(legOf)).toEqual([undefined, 'r8', 'heavy', 'r9', 'r10', undefined, undefined]);
+      'assert-perkins-integration-review-baseline.mjs "r8\' r.json', "assert-perkins-integration-review-baseline.mjs 'r8' r.json"]
+      .map(legOf)).toEqual([undefined, 'r8', 'heavy', 'r9', 'r10', undefined, undefined, 'r8']);
   });
 
   it('refuses an unparseable report, a missing named regression and an unknown leg', () => {

@@ -72,24 +72,33 @@ const PROMISE_REPORT_HEAD = /^(?:AssertionError|Error): promise (?:resolved|reje
  * that merely looks like one (`at least 3 (see notes.md:1:2)`) therefore
  * refuses too, and the refusal names that line; the remedy is to rephrase
  * that assertion message, never to let a helper frame slip by. A bare
- * `at 12:30:15` (no parentheses, no path) is prose. */
+ * `at 12:30:15` (no parentheses, no path) is prose; any other indented
+ * `at …` line ending in a `:line:column` location that the grammar cannot
+ * read (`at stage:1:2`, a spaced relative path) refuses by name. */
 const PATH_START = String.raw`(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/|node:|[A-Za-z]:[\\/]|[\\/])`;
 const BARE_RELATIVE = String.raw`[^\s()]*[/.][^\s()]*:\d+:\d+`;
-const BARE_GENERATED = String.raw`(?:evalmachine\.)?<anonymous>:\d+:\d+`;
-const STACK_LINE = new RegExp(String.raw`^\s+at (?:async )?(?:\S.* \((?:.*:\d+:\d+|eval at .*|<anonymous>|index \d+|native)\)|${PATH_START}.*:\d+:\d+|${BARE_GENERATED}|${BARE_RELATIVE}|<anonymous>)$`, 'u');
+/** Runtime-generated code (`new Function`, `vm` scripts) names no file. */
+const GENERATED = String.raw`(?:evalmachine\.)?<anonymous>:\d+:\d+`;
+const STACK_LINE = new RegExp(String.raw`^\s+at (?:async )?(?:\S.* \((?:.*:\d+:\d+|eval at .*|<anonymous>|index \d+|native)\)|${PATH_START}.*:\d+:\d+|${GENERATED}|${BARE_RELATIVE}|<anonymous>)$`, 'u');
 /** An indented line that opens like a frame. Past MAX_FRAME_LINE no line is
  * matched (bounded work: the frame grammar is quadratic in a line's length)
  * — and a frame-opening line that long refuses. Real V8 frames are far
  * shorter. */
 const FRAME_OPENING = /^\s+at \S/u;
 const MAX_FRAME_LINE = 2048;
-/** Lines end at any line terminator a rendered message can carry. */
-const LINE_BREAK = /\r\n|[\n\r\u2028\u2029]/u;
+/** An indented `at …` line ending in a location, and a bare clock time. */
+const LOCATED_TAIL = /:\d+:\d+\)?$/u;
+const CLOCK_PROSE = /^\s+at \d+(?::\d+)+$/u;
+/** Lines end at any line terminator a rendered message can carry —
+ * vertical tab, form feed and NEL included. */
+const LINE_BREAK = /\r\n|[\n\v\f\r\u0085\u2028\u2029]/u;
+/** Report text quoted in a refusal: a JSON literal of at most 160 code
+ * points (never a split surrogate pair), marked when cut. */
+const quoted = (text) => { const points = [...text]; return `${JSON.stringify(points.slice(0, 160).join(''))}${points.length > 160 ? '…' : ''}`; };
 const LOCATION = /^([A-Za-z][A-Za-z0-9+.-]*:\/\/)?(.+):\d+:\d+$/u;
 /** A V8 token frame names no source location by design. */
 const TOKEN_FRAME = /^(?:<anonymous>|index \d+|native)$/u;
-/** Runtime-generated code (`new Function`, `vm` scripts) names no file. */
-const GENERATED_LOCATION = /^(?:<anonymous>|evalmachine\.<anonymous>):\d+:\d+$/u;
+const GENERATED_LOCATION = new RegExp(`^${GENERATED}$`, 'u');
 /** A location as the absolute path it names, or undefined when it names
  * none it can be judged by. A file:// URL is decoded (an encoded
  * `test%2Fhelpers` is judged as the path it names) after its query or
@@ -139,11 +148,10 @@ function balancedFrom(text, start) {
 export function frameLocation(line) {
   const body = line.replace(/^\s+at /u, '').replace(/^async /u, '');
   if (TOKEN_FRAME.test(body) || GENERATED_LOCATION.test(body)) return null;
-  // Only a real eval frame (`eval (eval at …)`, or an `eval at …` origin) is
-  // read as one — never a path that merely contains the text.
   // An eval frame by the frame grammar — `eval at <origin>`, or `<fn> (eval
-  // at <origin>…)` — never a path that merely contains the text.
-  const innermostEval = /^(?:eval at |[^\s(]+(?: \[as [^\]]+\])? \(eval at )/u.test(body) ? body.lastIndexOf('eval at ') : -1;
+  // at <origin>…)` with `<fn>` one name, optionally `new `/`async `-prefixed
+  // or `[as …]`-aliased — never a path that merely contains the text.
+  const innermostEval = /^(?:eval at |(?:new |async )?[^\s(]+(?: \[as [^\]]+\])? \(eval at )/u.test(body) ? body.lastIndexOf('eval at ') : -1;
   if (innermostEval !== -1) {
     const origin = body.slice(innermostEval + 'eval at '.length);
     for (let index = origin.indexOf(' ('); index !== -1; index = origin.indexOf(' (', index + 1)) {
@@ -184,11 +192,14 @@ export function isBehavioralAssertion(message) {
 export function behavioralRefusal(message) {
   if (typeof message !== 'string') return 'the failure message is not text';
   const [head = '', ...rest] = message.split(LINE_BREAK);
-  if (!ASSERTION_HEAD.test(head) && !PROMISE_REPORT_HEAD.test(head)) return `its first line is no assertion or rejects/resolves report: ${JSON.stringify(head.slice(0, 120))}`;
+  if (!ASSERTION_HEAD.test(head) && !PROMISE_REPORT_HEAD.test(head)) return `its first line is no assertion or rejects/resolves report: ${quoted(head)}`;
   // A frame-opening line too long to judge refuses (fail closed).
   const overlong = rest.find((line) => line.length > MAX_FRAME_LINE && FRAME_OPENING.test(line));
-  if (overlong !== undefined) return `a frame-opening line is longer than ${String(MAX_FRAME_LINE)} characters: ${JSON.stringify(overlong.slice(0, 120))}…`;
-  const stack = rest.filter((line) => line.length <= MAX_FRAME_LINE && STACK_LINE.test(line));
+  if (overlong !== undefined) return `a frame-opening line is longer than ${String(MAX_FRAME_LINE)} characters: ${quoted(overlong)}`;
+  // Every frame, and every located `at …` line the grammar cannot read (it
+  // refuses where it stands, below).
+  const stack = rest.filter((line) => line.length <= MAX_FRAME_LINE &&
+    (STACK_LINE.test(line) || (FRAME_OPENING.test(line) && LOCATED_TAIL.test(line) && !CLOCK_PROSE.test(line))));
   // A report without any stack frames is judged by its head alone.
   if (stack.length === 0) return null;
   // The first frame outside the runtime and assertion machinery decides.
@@ -197,9 +208,9 @@ export function behavioralRefusal(message) {
   // that is all tokens or all machinery: never an open door for a
   // helper-raised assertion (#394).
   for (const line of stack) {
-    const file = frameLocation(line);
+    const file = STACK_LINE.test(line) ? frameLocation(line) : undefined;
     if (file === null) continue;
-    if (file === undefined) return `a frame names a location that cannot be judged (rephrase prose shaped like a frame): ${JSON.stringify(line.trim().slice(0, 160))}`;
+    if (file === undefined) return `a frame names a location that cannot be judged (rephrase prose shaped like a frame): ${quoted(line.trim())}`;
     if (MACHINERY_FRAME.test(file)) continue;
     const testFile = /\.test\.[cm]?[jt]s$/u.test(file) && !file.includes('/node_modules/') && !file.includes('/test/helpers/');
     return testFile ? null : `the assertion was raised outside a test file, in ${JSON.stringify(file)}`;

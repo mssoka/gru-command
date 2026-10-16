@@ -6,7 +6,12 @@ import type { FixtureRepo } from './fixture-repo.js';
  * ignorable code points (HFS+), an NTFS stream suffix (`:…`), trailing dots
  * or spaces (Windows), any case. */
 function foldedSegment(part: string): string {
-  return part.normalize('NFKC').replace(/\p{Default_Ignorable_Code_Point}/gu, '').replace(/:.*$/u, '').replace(/[. ]+$/u, (tail) => (/^\.+$/u.test(part) ? tail : '')).toLowerCase();
+  const folded = part.normalize('NFKC').replace(/\p{Default_Ignorable_Code_Point}/gu, '');
+  // A stream suffix (`a:b`) or a run of three or more dots (Windows strips
+  // trailing dots) folds to nothing: refused, never judged as another name.
+  if (folded.includes(':') || /^\.{3,}$/u.test(folded)) return '';
+  if (folded === '.' || folded === '..') return folded;
+  return folded.replace(/[. ]+$/u, '').toLowerCase();
 }
 /** A name a filesystem may map onto `.git`, including the 8.3 short names
  * `git~N`. */
