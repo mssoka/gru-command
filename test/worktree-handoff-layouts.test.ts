@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative as relativePath } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -8,6 +8,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 const { fsHooks } = vi.hoisted(() => ({ fsHooks: {
   beforeWrite: null as ((path: string) => void) | null,
   beforeUnlink: null as ((path: string) => void) | null,
+  beforeFsync: null as ((fd: number) => void) | null,
+  beforeClose: null as ((fd: number) => void) | null,
 } }));
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>();
@@ -15,9 +17,11 @@ vi.mock('node:fs', async (importOriginal) => {
     ...actual,
     writeFileSync: ((...args: Parameters<typeof actual.writeFileSync>) => { fsHooks.beforeWrite?.(String(args[0])); return actual.writeFileSync(...args); }) as typeof actual.writeFileSync,
     unlinkSync: ((...args: Parameters<typeof actual.unlinkSync>) => { fsHooks.beforeUnlink?.(String(args[0])); return actual.unlinkSync(...args); }) as typeof actual.unlinkSync,
+    fsyncSync: ((fd: number) => { fsHooks.beforeFsync?.(fd); return actual.fsyncSync(fd); }) as typeof actual.fsyncSync,
+    closeSync: ((fd: number) => { fsHooks.beforeClose?.(fd); return actual.closeSync(fd); }) as typeof actual.closeSync,
   };
 });
-afterEach(() => { fsHooks.beforeWrite = null; fsHooks.beforeUnlink = null; });
+afterEach(() => { fsHooks.beforeWrite = null; fsHooks.beforeUnlink = null; fsHooks.beforeFsync = null; fsHooks.beforeClose = null; });
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
@@ -345,6 +349,27 @@ describe('child lane parent custody, called directly (#373)', () => {
         const ref = join(common, 'refs', 'heads', f.parent.branch!);
         rmSync(ref, { force: true }); mkdirSync(dirname(ref), { recursive: true }); symlinkSync(join(directory(), 'missing'), ref);
       }, () => /writer branch ref .* cannot be resolved \(ENOENT\)/u],
+      ['writer branch ref uninspectable', (f) => {
+        const ref = join(realpathSync(join(f.repo.path, '.git')), 'refs', 'heads', f.parent.branch!);
+        rmSync(ref); symlinkSync(ref, ref);
+      }, () => /writer branch ref .* cannot be resolved \(ELOOP\)/u],
+      ['writer branch ref under a file', (f) => {
+        // The branch directory replaced by a file: corruption, never absence.
+        const common = realpathSync(join(f.repo.path, '.git'));
+        const branchDir = dirname(join(common, 'refs', 'heads', f.parent.branch!));
+        rmSync(branchDir, { recursive: true }); writeFileSync(branchDir, 'x');
+      }, () => /writer branch ref .* cannot be inspected \(ENOTDIR\)/u],
+      ['writer branch ref under a dangling directory link', (f) => {
+        const common = realpathSync(join(f.repo.path, '.git'));
+        git(f.repo.path, ['pack-refs', '--all']);
+        const branchDir = dirname(join(common, 'refs', 'heads', f.parent.branch!));
+        rmSync(branchDir, { recursive: true, force: true }); symlinkSync(join(directory(), 'gone'), branchDir);
+      }, () => /writer branch is not direct: its ref .* lies under a linked directory/u],
+      ['packed refs a looping link', (f) => {
+        const common = realpathSync(join(f.repo.path, '.git'));
+        rmSync(join(common, 'refs', 'heads', f.parent.branch!)); rmSync(join(common, 'packed-refs'), { force: true });
+        symlinkSync(join(common, 'packed-refs'), join(common, 'packed-refs'));
+      }, () => /packed refs .*packed-refs is unreadable \(handoff metadata is not a regular file\)/u],
       ['writer branch ref junk', (f) => {
         writeFileSync(join(realpathSync(join(f.repo.path, '.git')), 'refs', 'heads', f.parent.branch!), 'junk\n');
       }, () => /writer branch is not direct: its ref .* does not hold a commit id of the lane's length/u],
@@ -372,15 +397,20 @@ describe('child lane parent custody, called directly (#373)', () => {
     ];
     for (const [label, corrupt, reason] of corruptions) {
       const f = await parentFixture(`custody-admin-${label.replace(/\W+/gu, '-')}`);
-      corrupt(f);
       try {
+        corrupt(f);
         const error = await f.createChild().then(() => null, (cause: unknown) => cause);
         expect(error, label).toBeInstanceOf(handoffProof.WorktreeHandoffUnresolvedError);
         expect(reasonsOf(error), label).toMatch(reason(f));
       } finally {
         // Git itself cannot list branches past a packed-refs directory: undo
         // that case's corruption whatever the assertions above found.
-        if (label === 'packed refs unreadable') rmSync(join(realpathSync(join(f.repo.path, '.git')), 'packed-refs'), { recursive: true, force: true });
+        if (label.startsWith('packed refs')) rmSync(join(realpathSync(join(f.repo.path, '.git')), 'packed-refs'), { recursive: true, force: true });
+        // Git cannot list branches past a branch directory turned file or link either.
+        if (label.startsWith('writer branch ref under')) {
+          const branchDir = dirname(join(realpathSync(join(f.repo.path, '.git')), 'refs', 'heads', f.parent.branch!));
+          rmSync(branchDir, { recursive: true, force: true });
+        }
       }
       f.childLeftNothing();
       expect(f.h.ledger.getWorktree(f.parent.id)?.status, label).toBe('active');
@@ -417,6 +447,23 @@ describe('child lane parent custody, called directly (#373)', () => {
     };
     expect(() => handoffProof.beginLaneHandoff(f.parent, f.admin, token)).toThrow(`lane administration ${f.admin} cannot take a handoff receipt (ENOSPC)`);
     expect(readdirSync(f.admin).sort()).toEqual(before);
+    // An fsync failure is the write's failure: the temp is removed, and a
+    // close failure after it never replaces the reported reason.
+    let failed = -1;
+    fsHooks.beforeFsync = (fd) => { fsHooks.beforeFsync = null; failed = fd; throw Object.assign(new Error('io'), { code: 'EIO' }); };
+    fsHooks.beforeClose = (fd) => {
+      if (fd !== failed) return;
+      fsHooks.beforeClose = null;
+      closeSync(fd);
+      throw Object.assign(new Error('close'), { code: 'EBADF' });
+    };
+    expect(() => handoffProof.beginLaneHandoff(f.parent, f.admin, token)).toThrow(`lane administration ${f.admin} cannot take a handoff receipt (EIO)`);
+    fsHooks.beforeClose = null;
+    expect(readdirSync(f.admin).sort()).toEqual(before);
+    // A filesystem that cannot fsync is no reason to refuse.
+    expect(() => { fsHooks.beforeFsync = () => { throw Object.assign(new Error('unsupported'), { code: 'EINVAL' }); }; try { handoffProof.beginLaneHandoff(f.parent, f.admin, token); } finally { fsHooks.beforeFsync = null; } })
+      .toThrow(`lane administration ${f.admin} cannot take a handoff receipt (EEXIST)`);
+    expect(readdirSync(f.admin).sort()).toEqual(before);
     // A temporary name that already existed is not this call's to remove.
     writeFileSync(temp, 'foreign');
     expect(() => handoffProof.beginLaneHandoff(f.parent, f.admin, token)).toThrow(`lane administration ${f.admin} cannot take a handoff receipt (EEXIST)`);
@@ -430,6 +477,15 @@ describe('child lane parent custody, called directly (#373)', () => {
       .toThrow(`lane administration ${f.admin} published its handoff receipt and its temporary receipt ${temp} could not be removed (EBUSY)`);
     fsHooks.beforeUnlink = null;
     rmSync(temp);
+    // A receipt published but not made durable is named as published, never as untaken.
+    rmSync(join(f.admin, 'gru-creation-handoff.json'));
+    let syncs = 0;
+    fsHooks.beforeFsync = () => { syncs += 1; if (syncs === 2) throw Object.assign(new Error('io'), { code: 'EIO' }); };
+    expect(() => handoffProof.beginLaneHandoff(f.parent, f.admin, token))
+      .toThrow(`lane administration ${f.admin} published its handoff receipt but could not make it durable (EIO)`);
+    fsHooks.beforeFsync = null;
+    expect(existsSync(temp)).toBe(false);
+    expect(existsSync(join(f.admin, 'gru-creation-handoff.json'))).toBe(true);
     writeFileSync(join(f.admin, 'gru-creation-handoff.json'), receipt);
     expect(readdirSync(f.admin).sort()).toEqual(before);
   });

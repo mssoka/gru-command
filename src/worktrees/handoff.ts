@@ -186,15 +186,25 @@ function entryKind(path: string): EntryKind {
 }
 
 /** Whether anything at all — a dangling link included — is at `path`
- * (lstat, never following), or a refusal naming why that cannot be told. */
+ * (lstat, never following), or a refusal naming why that cannot be told.
+ * Only true absence is absence: a file standing where a directory of the
+ * path should be (ENOTDIR) is corruption, refused by name. */
 function present(path: string, what: string): boolean {
   try {
     lstatSync(path);
     return true;
   } catch (error) {
     const code = errnoOf(error);
-    if (code === 'ENOENT' || code === 'ENOTDIR') return false;
+    if (code === 'ENOENT') return false;
     throw new Error(`${what} ${path} cannot be inspected (${code})`, { cause: error });
+  }
+}
+
+/** fsync, where the filesystem can: one that cannot (EINVAL, ENOTSUP) is no
+ * reason to refuse a handoff; any other failure is raised. */
+function durably(fd: number): void {
+  try { fsyncSync(fd); } catch (error) {
+    if (errnoOf(error) !== 'EINVAL' && errnoOf(error) !== 'ENOTSUP') throw error;
   }
 }
 
@@ -360,7 +370,13 @@ function validate(receipt: Receipt, lane: WorktreeLane): void {
     if (head !== `ref: refs/heads/${lane.branch}`) throw new Error('writer handoff attachment changed');
     const ref = join(common, 'refs', 'heads', lane.branch);
     // Present as anything at all (a dangling link included) is a loose ref,
-    // judged as one; only true absence falls back to packed refs.
+    // judged as one; only true absence — under real directories — falls back
+    // to packed refs.
+    for (let dir = dirname(ref); dir.startsWith(join(common, 'refs')) && dir !== common; dir = dirname(dir)) {
+      let link = false;
+      try { link = lstatSync(dir).isSymbolicLink(); } catch (error) { if (errnoOf(error) !== 'ENOENT') throw new Error(`writer branch ref directory ${dir} cannot be inspected (${errnoOf(error)})`, { cause: error }); }
+      if (link) throw new Error(`writer branch is not direct: its ref ${ref} lies under a linked directory ${dir}`);
+    }
     if (present(ref, 'writer branch ref')) {
       // Direct first — a ref reached through a link is never read.
       if (resolvedPath('writer branch ref', ref) !== ref) throw new Error(`writer branch is not direct: its ref ${ref} is reached through a link`);
@@ -404,7 +420,7 @@ export function beginLaneHandoff(lane: Pick<WorktreeLane, 'id' | 'kind' | 'repoP
     // Durable before it is published; a write error stays the one reported.
     try {
       writeFileSync(fd, JSON.stringify(receipt));
-      fsyncSync(fd);
+      durably(fd);
     } catch (writeError) {
       try { closeSync(fd); } catch { /* the write error is the one to report */ }
       throw writeError;
@@ -416,6 +432,13 @@ export function beginLaneHandoff(lane: Pick<WorktreeLane, 'id' | 'kind' | 'repoP
     throw new Error(`lane administration ${admin} cannot take a handoff receipt (${errnoOf(error)})`, { cause: error });
   }
   removeTemp(null);
+  // The published directory entry is made durable too, where the filesystem can.
+  try {
+    const dirFd = openSync(admin, 'r');
+    try { durably(dirFd); } finally { closeSync(dirFd); }
+  } catch (error) {
+    throw new Error(`lane administration ${admin} published its handoff receipt but could not make it durable (${errnoOf(error)})`, { cause: error });
+  }
 }
 
 export function assertPendingLaneHandoff(lane: WorktreeRecord, admin: string, token: string): Receipt {
