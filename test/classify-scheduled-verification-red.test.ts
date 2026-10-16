@@ -1,7 +1,7 @@
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { exec, execFileSync, spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
 import { classifyReviewedRed, STATUS_ACTION_NAME } from '../tools/classify-scheduled-verification-red.mjs';
@@ -75,7 +75,7 @@ describe('reviewed-candidate behavioral RED custody', () => {
    * ambient git environment (a hook's GIT_DIR) and never hangs the suite. */
   /** The environment minus every `GIT_*` variable: no hook's GIT_DIR can
    * point a fixture's git at this repository. */
-  const gitFree = (): NodeJS.ProcessEnv => Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('GIT_')));
+  const gitFree = (): NodeJS.ProcessEnv => Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('GIT_') && !name.startsWith('GRU_HELPER_')));
   function shell(argv: readonly string[], cwd: string, tmp: string, env: NodeJS.ProcessEnv = {}) {
     const run = spawnSync('sh', argv, { cwd, encoding: 'utf8', timeout: 60_000, env: { ...gitFree(), TMPDIR: tmp, ...env } });
     expect(run.signal, `sh ${argv[0] ?? ''} finished within its timeout (signal ${String(run.signal)})`).toBeNull();
@@ -88,8 +88,9 @@ describe('reviewed-candidate behavioral RED custody', () => {
   it('only the two baselines and the retained scope invoke the classifier (#358 exclusion scope)', () => {
     // The review-8 runner names the classifier's TEST file, never the
     // classifier: it never classifies RED.
-    // Every tracked or untracked file in the tree (git grep exits 1 on no match).
-    const grep = spawnSync('git', ['-C', repoRoot, 'grep', '--untracked', '-l', 'classify-scheduled-verification-red\\.mjs', '--', '.', ':!test/classify-scheduled-verification-red.test.ts'], { encoding: 'utf8', env: gitFree() });
+    // Every tracked file in the tree — what CI runs — so a local scratch file
+    // never changes the answer (git grep exits 1 on no match).
+    const grep = spawnSync('git', ['-C', repoRoot, 'grep', '-l', 'classify-scheduled-verification-red\\.mjs', '--', '.', ':!test/classify-scheduled-verification-red.test.ts'], { encoding: 'utf8', env: gitFree() });
     expect(grep.status, grep.stderr).toBe(0);
     const invokers = grep.stdout.split('\n').filter((line) => line !== '' && line !== 'tools/classify-scheduled-verification-red.mjs').sort();
     expect(invokers).toEqual(['.gru-command/worktree.toml', ...BASELINES].sort());
@@ -169,17 +170,26 @@ describe('reviewed-candidate behavioral RED custody', () => {
       const present = check(`${head} ${head} present.ts`);
       expect([present.status, present.stderr]).toEqual([0, '']);
       // Its own arguments are checked by name too.
-      expect([check(`${head} ${head}`).status, check(`${head} ${head}`).stderr]).toEqual([2, 'require_pinned_sources needs a candidate, a regressions revision and at least one file (got 2 arguments)\n']);
+      const short = check(`${head} ${head}`);
+      expect([short.status, short.stderr]).toEqual([2, 'require_pinned_sources needs a candidate, a regressions revision and at least one file (got 2 arguments)\n']);
       expect(check(`${head} ${head} present.ts ''`).stderr).toBe('require_pinned_sources was given an empty file name\n');
+      expect(check(`'' ${head} present.ts`).stderr).toBe('require_pinned_sources was given an empty revision\n');
       // The snapshot is the candidate's tree, with no archive left behind...
       const snapshot = join(dir, 'tmp', 'snap'); mkdirSync(snapshot);
       const made = libCall(`snapshot_candidate '${snapshot}' ${head}`, repo, join(dir, 'tmp'));
       expect([made.status, made.stderr, readdirSync(snapshot), readdirSync(join(dir, 'tmp'))]).toEqual([0, '', ['present.ts'], ['snap']]);
+      // Its target must be an existing, empty directory — never one it would wrongly remove.
+      const occupied = join(dir, 'occupied'); mkdirSync(occupied); writeFileSync(join(occupied, 'keep'), 'x');
+      expect(libCall(`snapshot_candidate '${occupied}' ${head}`, repo, join(dir, 'tmp')).stderr).toBe(`snapshot directory ${occupied} must exist and be empty\n`);
+      expect(readdirSync(occupied)).toEqual(['keep']);
+      expect(libCall(`snapshot_candidate '${join(dir, 'absent')}' ${head}`, repo, join(dir, 'tmp')).stderr).toBe(`snapshot directory ${join(dir, 'absent')} must exist and be empty\n`);
+      expect(libCall(`snapshot_candidate '' ${head}`, repo, join(dir, 'tmp')).stderr).toBe('snapshot_candidate needs a snapshot directory and a candidate\n');
       // ...and a failed archive removes the partial snapshot and refuses by name.
-      const failed = libCall(`snapshot_candidate '${snapshot}' ${absent}`, repo, join(dir, 'tmp'));
+      const fresh = join(dir, 'tmp', 'fresh'); mkdirSync(fresh);
+      const failed = libCall(`snapshot_candidate '${fresh}' ${absent}`, repo, join(dir, 'tmp'));
       expect(failed.status).toBe(2);
-      expect(failed.stderr).toMatch(new RegExp(`reviewed candidate ${absent} could not be archived into .*snap — refusing\\n$`, 'u'));
-      expect(readdirSync(join(dir, 'tmp'))).toEqual([]);
+      expect(failed.stderr).toMatch(new RegExp(`reviewed candidate ${absent} could not be archived into .*fresh — refusing\\n$`, 'u'));
+      expect(readdirSync(join(dir, 'tmp'))).toEqual(['snap']);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
@@ -208,13 +218,22 @@ describe('reviewed-candidate behavioral RED custody', () => {
       // A helper that exits while loading, or never finishes loading, is refused.
       writeFileSync(helper, 'process.exit(0);\n');
       expect(guard().stderr).toMatch(/does not load cleanly/u);
-      writeFileSync(helper, 'setInterval(() => {}, 1000);\nawait new Promise(() => {});\n');
-      const hung = libCall('require_built_helper', snapshot, join(dir, 'tmp'), { GRU_HELPER_LOAD_MS: '300' });
-      expect(hung.status).toBe(2);
-      expect(hung.stderr).toMatch(/the helper did not finish loading within 300 ms[\s\S]*does not load cleanly/u);
+      // A hang is bounded whether it waits or spins synchronously.
+      for (const body of ['setInterval(() => {}, 1000);\nawait new Promise(() => {});\n', 'for (;;) {}\n']) {
+        writeFileSync(helper, body);
+        const hung = libCall('require_built_helper', snapshot, join(dir, 'tmp'), { GRU_HELPER_LOAD_MS: '300' });
+        expect(hung.status, body).toBe(2);
+        expect(hung.stderr, body).toMatch(/the helper did not finish loading within 300 ms[\s\S]*does not load cleanly/u);
+      }
+      // A helper that prints while loading still loads.
+      writeFileSync(helper, "import './scheduler.js';\nconsole.log('loading capture helper');\n");
+      expect(guard()).toMatchObject({ status: 0, stderr: '' });
+      // The bound itself must be a positive whole number.
+      expect(libCall('require_built_helper', snapshot, join(dir, 'tmp'), { GRU_HELPER_LOAD_MS: 'soon' }).stderr).toBe('GRU_HELPER_LOAD_MS must be a positive whole number of milliseconds (got "soon")\n');
       // The real compiled helper (this tree's build) loads without running.
+      if (!existsSync(join(repoRoot, 'dist', 'verify', 'capture-cli.js'))) throw new Error('fixture setup: this tree has no build — run npm run build first');
       const real = libCall('require_built_helper', repoRoot, join(dir, 'tmp'));
-      expect([real.status, real.stderr], 'run npm run build first').toEqual([0, '']);
+      expect([real.status, real.stderr]).toEqual([0, '']);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
