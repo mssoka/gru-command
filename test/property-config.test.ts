@@ -160,6 +160,13 @@ describe('GH350 property config strict parse', () => {
     );
   });
 
+  it('bounds max_output_bytes at 8 MiB per stream, so every retained receipt is bounded (#377)', () => {
+    expect(PROPERTY_CONFIG_CEILINGS.maxOutputBytes).toBe(8 * 1024 * 1024);
+    const toml = (bytes: number) => `mode = "disabled"\n[budgets]\nmax_iterations = 10\nmax_shrink_steps = 10\nrun_timeout_ms = 10\nmax_output_bytes = ${bytes}\n`;
+    expect(parsePropertyConfig(toml(8 * 1024 * 1024))?.budgets?.maxOutputBytes).toBe(8 * 1024 * 1024);
+    expect(() => parsePropertyConfig(toml(8 * 1024 * 1024 + 1))).toThrowError(/exceeds the approved ceiling of 8388608/);
+  });
+
   it('rejects non-string adapter override values', () => {
     const toml = 'mode = "observation"\n[adapters]\nvitest-fast-check = 3\n';
     expect(() => parsePropertyConfig(toml)).toThrowError(/adapters."vitest-fast-check" must be a non-empty string/);

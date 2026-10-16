@@ -5,29 +5,61 @@ import { join } from 'node:path';
 import type { PropertyExecutionPlan } from '../../../../src/property/types.js';
 
 /** Fake runners are OS-mechanism unit controls, never real Vitest proof. */
-export function scenarioRepo(script: string) {
+export function scenarioRepo(script: string, options: { readonly reportersModule?: boolean | 'directory' | 'symlink' | 'linked-dist' } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'property-unit-')));
-  const git = (args: string[]) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: 'pipe' }).trim();
-  mkdirSync(join(root, 'node_modules', 'vitest'), { recursive: true });
-  mkdirSync(join(root, 'node_modules', '.bin'), { recursive: true });
-  mkdirSync(join(root, 'test'), { recursive: true });
-  writeFileSync(join(root, 'node_modules', 'vitest', 'vitest.mjs'), script);
-  symlinkSync('../vitest/vitest.mjs', join(root, 'node_modules', '.bin', 'vitest'));
-  writeFileSync(join(root, 'package.json'), '{"type":"module"}\n');
-  writeFileSync(join(root, '.gitignore'), 'node_modules/\n');
-  writeFileSync(join(root, 'test', 'placeholder'), 'tracked\n');
-  git(['init', '-b', 'main']); git(['add', '.']);
-  git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'unit control']);
-  const plan: PropertyExecutionPlan = {
-    adapterId: 'vitest-fast-check', command: join(root, 'node_modules', 'vitest', 'vitest.mjs'),
-    args: ['run', '--reporter=json', 'test/contract.test.ts'], cwd: root,
-    envAllowlist: ['PATH', 'CI', 'TZ'], executable: true, refusalReason: null,
-    budget: { maxIterations: 20, maxShrinkSteps: 100, runTimeoutMs: 10_000, maxOutputBytes: 32_768 },
-  };
-  return { root, git, plan, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+  const extra: string[] = [];
+  const cleanup = (): void => { for (const dir of [root, ...extra]) rmSync(dir, { recursive: true, force: true }); };
+  // A setup step that fails removes what was already made.
+  try {
+    const git = (args: string[]) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: 'pipe' }).trim();
+    mkdirSync(join(root, 'node_modules', 'vitest'), { recursive: true });
+    mkdirSync(join(root, 'node_modules', '.bin'), { recursive: true });
+    mkdirSync(join(root, 'test'), { recursive: true });
+    writeFileSync(join(root, 'node_modules', 'vitest', 'vitest.mjs'), script);
+    // The real layout's reporters module beside the runner (the host config
+    // imports it; fake runners frame their own report and never load it).
+    if (options.reportersModule === 'linked-dist') {
+      // A regular reporters.js, but reached through a dist directory linked
+      // outside the repository.
+      const made = mkdtempSync(join(tmpdir(), 'property-unit-outside-dist-'));
+      extra.push(made);
+      const outside = realpathSync(made);
+      writeFileSync(join(outside, 'reporters.js'), 'export class JsonReporter {}\n');
+      symlinkSync(outside, join(root, 'node_modules', 'vitest', 'dist'));
+    } else if (options.reportersModule !== false) {
+      const dist = join(root, 'node_modules', 'vitest', 'dist');
+      mkdirSync(dist, { recursive: true });
+      if (options.reportersModule === 'directory') mkdirSync(join(dist, 'reporters.js', 'inner'), { recursive: true });
+      else if (options.reportersModule === 'symlink') {
+        writeFileSync(join(dist, 'real-reporters.js'), 'export class JsonReporter {}\n');
+        symlinkSync('real-reporters.js', join(dist, 'reporters.js'));
+      } else writeFileSync(join(dist, 'reporters.js'), 'export class JsonReporter {}\n');
+    }
+    symlinkSync('../vitest/vitest.mjs', join(root, 'node_modules', '.bin', 'vitest'));
+    writeFileSync(join(root, 'package.json'), '{"type":"module"}\n');
+    writeFileSync(join(root, '.gitignore'), 'node_modules/\n');
+    writeFileSync(join(root, 'test', 'placeholder'), 'tracked\n');
+    git(['init', '-b', 'main']); git(['add', '.']);
+    git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'unit control']);
+    const plan: PropertyExecutionPlan = {
+      adapterId: 'vitest-fast-check', command: join(root, 'node_modules', 'vitest', 'vitest.mjs'),
+      args: ['run', '--reporter=json', 'test/contract.test.ts'], cwd: root,
+      envAllowlist: ['PATH', 'CI', 'TZ'], executable: true, refusalReason: null,
+      budget: { maxIterations: 20, maxShrinkSteps: 100, runTimeoutMs: 10_000, maxOutputBytes: 32_768 },
+    };
+    return { root, git, plan, cleanup };
+  } catch (error) {
+    // The setup error surfaces first; a cleanup failure travels beside it.
+    try { cleanup(); } catch (cleanupError) { throw new AggregateError([error, cleanupError], 'scenario setup failed and so did its cleanup'); }
+    throw error;
+  }
 }
-export const PASS_RUNNER = `const name=process.cwd()+'/test/contract.test.ts';
-console.log(JSON.stringify({numTotalTests:1,numPassedTests:1,numFailedTests:0,numPendingTests:0,numTodoTests:0,success:true,testResults:[{name,status:'passed',message:'',assertionResults:[{status:'passed',fullName:'contract',failureMessages:[]}]}]}));`;
-export const FAILURE_RUNNER = `const seed=process.env.GRU_PROPERTY_SEED ?? '42';
+/** A fake runner reports through the host's authenticated channel the way
+ * the host config's reporter does (#378): the per-run nonce arrives on fd 3
+ * and the report is printed between nonce frames. Block-safe (no import). */
+export const REPORT_FRAME = `const __fs=process.getBuiltinModule('node:fs');let __nonce='';try{__nonce=__fs.readFileSync(3,'utf8').trim();__fs.closeSync(3);}catch{}const __report=(r)=>process.stdout.write('\\n'+__nonce+':BEGIN\\n'+JSON.stringify(r)+'\\n'+__nonce+':END\\n');`;
+export const PASS_RUNNER = `${REPORT_FRAME}const name=process.cwd()+'/test/contract.test.ts';
+__report(({numTotalTests:1,numPassedTests:1,numFailedTests:0,numPendingTests:0,numTodoTests:0,success:true,testResults:[{name,status:'passed',message:'',assertionResults:[{status:'passed',fullName:'contract',failureMessages:[]}]}]}));`;
+export const FAILURE_RUNNER = `${REPORT_FRAME}const seed=process.env.GRU_PROPERTY_SEED ?? '42';
 const failure='Property failed after 1 tests\\n{ seed: '+seed+', path: "0:1", endOnFailure: true }\\nCounterexample: [1]\\nShrunk 1 time(s)';
-console.log(JSON.stringify({numTotalTests:1,numPassedTests:0,numFailedTests:1,numPendingTests:0,numTodoTests:0,success:false,testResults:[{name:process.cwd()+'/test/contract.test.ts',status:'failed',message:'',assertionResults:[{status:'failed',fullName:'contract',failureMessages:[failure]}]}]}));process.exitCode=1;`;
+__report(({numTotalTests:1,numPassedTests:0,numFailedTests:1,numPendingTests:0,numTodoTests:0,success:false,testResults:[{name:process.cwd()+'/test/contract.test.ts',status:'failed',message:'',assertionResults:[{status:'failed',fullName:'contract',failureMessages:[failure]}]}]}));process.exitCode=1;`;
