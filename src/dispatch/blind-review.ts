@@ -356,13 +356,15 @@ export function blindSessionIdentity(sessionFile: string): string {
  * nearest ancestor that still resolves, canonical, plus the names below it —
  * and a link whose target is gone names that target, joined to the link's
  * canonical directory WITHOUT lexical `..` collapse, so the OS's realpath
- * walks it physically, as it did while the target existed. Links followed are bounded
- * (as realpath bounds its own); plain depth is bounded by the path itself. A
- * `..` under a missing directory, and any failure other than absence, is
- * raised. */
+ * walks it physically, as it did while the target existed. The links followed
+ * across the whole walk are capped (as realpath caps its own); plain depth is
+ * bounded by the path itself. A `..` under a missing directory is refused by
+ * name, and any failure other than absence is raised. */
 function canonicalPathOf(path: string): string {
-  const walk = (current: string, hops: number): string => {
-    if (hops > 40) throw Object.assign(new Error(`too many levels of links resolving ${path}`), { code: 'ELOOP' });
+  // One count of links followed across the whole walk — parents and targets
+  // alike — capped as the OS caps its own (MAXSYMLINKS is 32 to 40).
+  let hops = 0;
+  const walk = (current: string): string => {
     try {
       // The OS's own realpath: `..` after a link is walked physically (the
       // default JavaScript realpath collapses it lexically).
@@ -370,16 +372,19 @@ function canonicalPathOf(path: string): string {
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       const parent = dirname(current);
+      if ((code !== 'ENOENT' && code !== 'ENOTDIR') || parent === current) throw error;
       // `..` past a missing directory has no physical answer: never guessed lexically.
-      if ((code !== 'ENOENT' && code !== 'ENOTDIR') || parent === current || basename(current) === '..') throw error;
-      const canonicalParent = walk(parent, hops);
+      if (basename(current) === '..') throw new Error(`${path} climbs (..) out of a directory that does not exist — it has no physical identity`, { cause: error });
+      const canonicalParent = walk(parent);
       const link = danglingLinkTarget(current);
       if (link === null) return join(canonicalParent, basename(current));
-      return walk(isAbsolute(link) ? link : `${canonicalParent === '/' ? '' : canonicalParent}/${link}`, hops + 1);
+      if ((hops += 1) > 40) throw Object.assign(new Error(`too many levels of links resolving ${path}`), { code: 'ELOOP' });
+      return walk(isAbsolute(link) ? link : `${canonicalParent === '/' ? '' : canonicalParent}/${link}`);
     }
   };
-  return walk(path, 0);
+  return walk(path);
 }
+
 /** What a symbolic link at `path` holds, or null when there is none (absent,
  * or — only readlink can say so — replaced by a non-link meanwhile); any other
  * failure is raised. */

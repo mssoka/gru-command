@@ -250,6 +250,8 @@ describe('observeBlindSessionAccess — repeated scans count distinct reads (iss
       expect(physical).toBe(sha256(join(loopDir, 'elsewhere', 'up2.jsonl')));
       rmSync(join(loopDir, 'elsewhere', 'up2.jsonl'));
       expect(blindSessionIdentity(join(loopDir, 'subalias', 'l2.jsonl'))).toBe(physical);
+      // A `..` under a directory that does not exist has no physical identity.
+      expect(() => blindSessionIdentity(`${loopDir}/missing/../a.jsonl`)).toThrow(`${loopDir}/missing/../a.jsonl climbs (..) out of a directory that does not exist — it has no physical identity`);
       // A gone path many directories deep is no loop: it keeps its identity.
       const deepGone = join(loopDir, ...Array.from({ length: 80 }, (_, index) => `d${String(index)}`), 'gone.jsonl');
       expect(blindSessionIdentity(deepGone)).toBe(sha256(deepGone));
