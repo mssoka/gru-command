@@ -1517,25 +1517,33 @@ describe('restart-recovery-progress — exact native request matrix', () => {
         notifications: { postIncident: () => {} }, signal: new AbortController().signal, pendingProducerBlockers: () => [] }, 'approved-request');
     `;
     const child = spawn(process.execPath, ['--input-type=module', '-e', code], { cwd: root, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
-    let stderr = ''; child.stderr!.on('data', (chunk) => { stderr += String(chunk); });
-    const ready = await Promise.race([once(child, 'message'), once(child, 'exit').then(() => { throw new Error(`native fixture exited before admission: ${stderr}`); })]);
-    expect(ready[0]).toMatchObject({ admitted: 'admitted' });
-    const original = f.ledger.getDirective(f.intent.requestId)!;
-    const start = f.ledger.latestJobEvent(f.intent.jobId, 'silas.directive-producer-started')!;
-    const nativePrefix = readFileSync(f.file, 'utf8');
-    let resumedHandle: AgentHandle | null = null;
-    const registry: DirectiveRegistry = {
-      getHandle: () => resumedHandle,
-      spawn: vi.fn(async (_role, options = {}) => {
-        if (options.directiveRecoveryProducer !== undefined) f.store.acquireLockAfterHostExit(f.file, options.directiveRecoveryProducer.pid, options.directiveRecoveryProducer.lockOwner);
-        resumedHandle = new PiAgentHandle('minion', f.native, f.file, PI_CAPABILITIES, false, [], f.store, () => {}, () => { resumedHandle = null; },
-          60_000, options.agentId, () => JSON.stringify({ role: 'minion', cwd: f.lane.path, tools: ['read', 'bash'], model: 'fixture/model' }));
-        return resumedHandle;
-      }),
-      disposeHandle: async (handle) => handle.dispose(),
-    };
-    let service = new DirectiveProgressService({ ...f.deps, registry });
+    let service: DirectiveProgressService | null = null;
+    // Every step after the spawn, readiness included, is inside the child's
+    // cleanup boundary (#363 S10-0-02, S10-1-01).
     try {
+      let stderr = ''; child.stderr!.on('data', (chunk) => { stderr += String(chunk); });
+      let deadline: NodeJS.Timeout | undefined;
+      const ready = await Promise.race([
+        once(child, 'message'),
+        once(child, 'exit').then(() => { throw new Error(`native fixture exited before admission: ${stderr}`); }),
+        new Promise<never>((_resolve, reject) => { deadline = setTimeout(() => reject(new Error(`native fixture reported no admission within 20s: ${stderr}`)), 20_000); }),
+      ]).finally(() => clearTimeout(deadline));
+      expect(ready[0]).toMatchObject({ admitted: 'admitted' });
+      const original = f.ledger.getDirective(f.intent.requestId)!;
+      const start = f.ledger.latestJobEvent(f.intent.jobId, 'silas.directive-producer-started')!;
+      const nativePrefix = readFileSync(f.file, 'utf8');
+      let resumedHandle: AgentHandle | null = null;
+      const registry: DirectiveRegistry = {
+        getHandle: () => resumedHandle,
+        spawn: vi.fn(async (_role, options = {}) => {
+          if (options.directiveRecoveryProducer !== undefined) f.store.acquireLockAfterHostExit(f.file, options.directiveRecoveryProducer.pid, options.directiveRecoveryProducer.lockOwner);
+          resumedHandle = new PiAgentHandle('minion', f.native, f.file, PI_CAPABILITIES, false, [], f.store, () => {}, () => { resumedHandle = null; },
+            60_000, options.agentId, () => JSON.stringify({ role: 'minion', cwd: f.lane.path, tools: ['read', 'bash'], model: 'fixture/model' }));
+          return resumedHandle;
+        }),
+        disposeHandle: async (handle) => handle.dispose(),
+      };
+      service = new DirectiveProgressService({ ...f.deps, registry });
       service.reconsider(); await service.settled();
       expect(registry.spawn).not.toHaveBeenCalled(); expect(f.native.continuations).toBe(0);
       child.kill('SIGSTOP'); // frozen-but-live is never dead by heartbeat age
@@ -1562,7 +1570,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       expect(f.native.continuations).toBe(1); expect(registry.spawn).toHaveBeenCalledTimes(1);
     } finally {
       if (child.exitCode === null && child.signalCode === null) { const exit = once(child, 'exit'); child.kill('SIGKILL'); await exit; }
-      await service.dispose();
+      await service?.dispose();
     }
   });
 
@@ -1752,9 +1760,22 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     if (proof.state !== 'resumable') throw new Error('fixture checkpoint expected');
     f.ledger.bindDirectiveNativeAdmission(proof.binding);
     f.ledger.claimDirectiveCheckpoint(f.identity, proof.checkpointId);
-    const service = new DirectiveProgressService(f.deps); service.reconsider(); await service.settled();
+    const service = new DirectiveProgressService(f.deps); service.reconsider(); await service.settled(); await service.dispose();
     expect(f.spawns).toEqual([]); expect(f.native.continuations).toBe(0);
     expect(f.ledger.getDirective(f.intent.requestId)?.recoveryCheckpoint).toBe(proof.checkpointId);
+    // A second restart reopens the persisted claim from disk, aged far past any lease (#363 S10-0-04).
+    f.db.close();
+    const db = new LedgerDb(f.dir); cleanups.push(() => db.close());
+    const aged = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+    expect(db.handle.prepare('UPDATE pending_directives SET created_at = ?, updated_at = ?, dispatch_started_at = coalesce(dispatch_started_at, ?) WHERE request_id = ?')
+      .run(aged, aged, aged, f.intent.requestId).changes).toBe(1);
+    const bus = new EventBus({}); const ledger = new LedgerApi(db.handle, { bus });
+    const restarted = new DirectiveProgressService({ ...f.deps, ledger, notifications: new NotificationCenter({ ledger, bus }) });
+    try {
+      restarted.reconsider(); await restarted.settled();
+      expect(f.spawns).toEqual([]); expect(f.native.continuations).toBe(0);
+      expect(ledger.getDirective(f.intent.requestId)?.recoveryCheckpoint).toBe(proof.checkpointId);
+    } finally { await restarted.dispose(); }
   });
 
   it('live/queued producer ownership blocks recovery and reconsiders after actual settlement', async () => {
@@ -1767,10 +1788,18 @@ describe('restart-recovery-progress — exact native request matrix', () => {
 
   it('rechecks permission after deferred spawn and disposes without executing a superseded checkpoint', async () => {
     const f = await fixture(); f.seed(); const gate = deferred<void>(); f.spawnGate(gate.promise);
+    const disposed: AgentHandle[] = [];
+    const dispose = f.registry.disposeHandle.bind(f.registry);
+    f.registry.disposeHandle = async (handle) => { disposed.push(handle); await dispose(handle); };
     const service = new DirectiveProgressService(f.deps); service.reconsider();
     await Promise.resolve(); expect(f.spawns).toHaveLength(1);
     f.ledger.setJobStatus(f.intent.jobId, 'parked'); gate.resolve(); await service.settled();
     expect(f.native.continuations).toBe(0); expect(f.ledger.latestJobEvent(f.intent.jobId, 'job.delivered')).toBeNull();
+    // The handle spawned for the superseded checkpoint is disposed, exactly once (#363 S10-0-06).
+    expect(disposed).toHaveLength(1);
+    expect(disposed[0]!.id).toBe('logical-minion');
+    expect(f.registry.getHandle('logical-minion')).toBeNull();
+    await service.dispose();
   });
 
   it('terminal jobs never revive or infer completion from bookkeeping', async () => {
@@ -2137,7 +2166,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
   it('dispatch start fence committed publication failure retains uncertainty without starting native work', async () => {
     await assertProducerFenceWriteFailure('dispatch', true);
   });
-  it('checkpoint start fence storage failure rolls back before spawn or continuation', async () => {
+  it('checkpoint start fence storage failure rolls back before native continuation (the owner handle spawns once, never continues)', async () => {
     await assertProducerFenceWriteFailure('checkpoint', false);
   });
   it('checkpoint start fence committed publication failure retains uncertainty without continuing native work', async () => {
@@ -2151,7 +2180,9 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     const original = executeAcceptedDirective(f.deps, f.intent.requestId).catch((error: unknown) => error);
     let resumed: DirectiveProgressService | null = null;
     try {
-      await started.promise;
+      // An execution that ends before agent_start fails here by name, never
+      // as an admission timeout (#363 S10-0-03).
+      await Promise.race([started.promise, original.then((outcome) => { throw new Error(`the accepted dispatch ended before native admission: ${String(outcome)}`); })]);
       // The actual protocol, not seed(), has consumed this accepted prompt.
       expect(f.native.prompts).toHaveLength(1); expect(f.native.isIdle).toBe(false);
       const native = inspectDirectiveCheckpoint(f.file, f.identity);
