@@ -458,6 +458,14 @@ const UNPROVEN_NATIVE_CANDIDATE_SQL = `EXISTS (SELECT 1 FROM pending_directives 
     ORDER BY s.seq DESC LIMIT 1), 0) != 1))`;
 
 /** What closes a producer-resolved alert kind, or null for any other kind. */
+function machineDispositionRefusalOf(current: Pick<NotificationRecord, 'kind' | 'routing'>): string | null {
+  if (current.routing !== 'action-required') {
+    return 'only action-required notifications accept a machine disposition; owner decisions resolve through the recorded-decision follow-through';
+  }
+  const closer = producerResolvedBy(current.kind);
+  return closer === null ? null : `${current.kind} closes itself on ${closer} — fix its cause and leave the alert open; a disposition is refused`;
+}
+
 export function producerResolvedBy(kind: string): string | null {
   return Object.hasOwn(PRODUCER_RESOLVED_KINDS, kind) ? PRODUCER_RESOLVED_KINDS[kind]! : null;
 }
@@ -3317,6 +3325,12 @@ export class LedgerApi {
     readonly jobId: string;
     readonly payload: Readonly<Record<string, unknown>> & { readonly notification_id: string };
   }): boolean {
+    for (const [name, value] of [['agentId', input.agentId], ['jobId', input.jobId], ['notification_id', input.payload.notification_id]] as const) {
+      if (value.trim() === '') throw new Error(`a superseded-stop closure needs a non-blank ${name}`);
+    }
+    if (input.payload['job_id'] !== undefined && input.payload['job_id'] !== input.jobId) {
+      throw new Error(`a superseded-stop closure names job "${String(input.payload['job_id'])}" in its payload but "${input.jobId}" as its job`);
+    }
     return this.transaction(() => {
       if (this.hasSupervisionStopSuperseded(input.payload.notification_id)) return false;
       this.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: input.agentId, jobId: input.jobId, payload: { ...input.payload } });
@@ -5262,6 +5276,14 @@ export class LedgerApi {
    * dispose); it is NOT proof of who held the pen. The audit event carries
    * the credential class that authorised the call and any caller-declared
    * actor so the record never claims provenance it cannot prove (#99). */
+  /** Why a machine disposition of this notification would be refused, or
+   * null — the SAME rule `disposeMachineNotification` enforces, read first
+   * so a route can refuse before any other effect (#385). */
+  machineDispositionRefusal(id: string): string | null {
+    const current = this.getNotification(id);
+    return current === null ? null : machineDispositionRefusalOf(current);
+  }
+
   disposeMachineNotification(
     id: string,
     detail: string,
@@ -5272,13 +5294,8 @@ export class LedgerApi {
     return this.transaction(() => {
       const current = this.getNotification(id);
       if (current === null) return null;
-      if (current.routing !== 'action-required') {
-        throw new Error('only action-required notifications accept a machine disposition; owner decisions resolve through the recorded-decision follow-through');
-      }
-      const closer = producerResolvedBy(current.kind);
-      if (closer !== null) {
-        throw new Error(`${current.kind} closes itself on ${closer} — fix its cause and leave the alert open; a disposition is refused`);
-      }
+      const refusal = machineDispositionRefusalOf(current);
+      if (refusal !== null) throw new Error(refusal);
       if (current.resolvedAt !== null || current.ackedAt !== null) return current;
       this.db.prepare('UPDATE notifications SET resolved_at = ?, resolved_by = ? WHERE id = ?')
         .run(nowIso(), 'gru', id);

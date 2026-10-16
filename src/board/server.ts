@@ -798,6 +798,11 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             // settlement is never reported before the control accepts it.
             let rearm: 'accepted' | 'not_applicable' | 'superseded' = 'not_applicable';
             if (!ownerFollowThrough && target !== null && target.resolvedAt === null) {
+              // A disposition the ledger would refuse is refused BEFORE the
+              // supervisor acts on it (#385): never a closed stop beside an
+              // alert left open.
+              const refusal = ledger.machineDispositionRefusal(id);
+              if (refusal !== null) throw new Error(refusal);
               try {
                 const outcome = onNotificationDisposition(id, detail);
                 if (outcome !== undefined && outcome.ok === false) {

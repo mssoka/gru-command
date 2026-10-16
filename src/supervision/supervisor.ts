@@ -1398,13 +1398,19 @@ export class Supervisor {
   ): void {
     const incident = agent.rateLimitRetry;
     if (incident === null) return;
-    // Detach first and settle whatever the abort does: no awaiter of this
-    // incident is ever left hanging.
+    // Detach first, then abort and settle independently: a throwing abort
+    // listener never leaves an awaiter of this incident hanging, and never
+    // escapes into the many callers that clear a retry on their way out.
     agent.rateLimitRetry = null;
     try {
       incident.admissionAbort.abort();
-    } finally {
+    } catch (error) {
+      this.log('error', 'rate-limit retry abort failed — the incident is settled anyway', { agent_id: agent.agentId, error: String(error) });
+    }
+    try {
       incident.resolveSettled(disposition);
+    } catch (error) {
+      this.log('error', 'rate-limit retry settlement failed', { agent_id: agent.agentId, disposition, error: String(error) });
     }
   }
 
@@ -3212,7 +3218,7 @@ export class Supervisor {
   ): void {
     const recovery = agent.pendingRecovery;
     const stopReason = `stop closed: its captured turn was superseded on job "${closure.jobId}" — it will never replay; continue the lane with a fresh re-brief or directive`;
-    this.ledger.recordSupervisionStopSuperseded({
+    const recorded = this.ledger.recordSupervisionStopSuperseded({
       agentId: agent.agentId,
       jobId: closure.jobId,
       payload: {
@@ -3253,7 +3259,9 @@ export class Supervisor {
       this.restoredStops.delete(agent.agentId);
       this.restoredRearmControls.delete(agent.agentId);
     }
-    this.log('info', 'breaker stop closed as superseded — the stale captured turn never replays', {
+    this.log('info', recorded
+      ? 'breaker stop closed as superseded — the stale captured turn never replays'
+      : 'breaker stop already closed as superseded — its live record is retired', {
       agent_id: agent.agentId,
       job_id: closure.jobId,
       notification_id: notificationId,
@@ -3541,12 +3549,18 @@ export class Supervisor {
     try {
       return this.ledger.hasSupervisionStopSuperseded(notificationId) ? { ok: true, rearmed: false, superseded: true } : { ok: true, rearmed: false };
     } catch (error) {
+      // Whether the alert is a breaker decides whether the lost answer
+      // matters; an unknown kind is treated as a breaker (fail closed).
       let breaker = true;
-      try { breaker = this.ledger.getNotification(notificationId)?.kind === 'supervision.breaker'; } catch { /* unknown: treat as a breaker */ }
+      try {
+        breaker = this.ledger.getNotification(notificationId)?.kind === 'supervision.breaker';
+      } catch (kindError) {
+        this.log('error', 'notification kind lookup failed after a failed closure lookup — treating it as a breaker alert', { notification_id: notificationId, error: String(kindError) });
+      }
       if (onFailure === 'refuse' && breaker) {
         return { ok: false, reason: `superseded closure lookup failed — retry the disposition: ${String(error)}` };
       }
-      this.log('warn', 'superseded closure lookup failed — reporting a pure record', { notification_id: notificationId, error: String(error) });
+      this.log(breaker ? 'error' : 'warn', 'superseded closure lookup failed — reporting a pure record', { notification_id: notificationId, breaker, error: String(error) });
       return { ok: true, rearmed: false };
     }
   }

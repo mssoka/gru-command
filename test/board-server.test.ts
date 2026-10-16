@@ -1776,6 +1776,23 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
     }
   });
 
+  it('refuses a disposition the ledger would refuse BEFORE the supervisor acts on it (#385)', async () => {
+    let consulted = 0;
+    const harness = await boot('board-test-token', { onNotificationDisposition: () => { consulted += 1; return { ok: true }; } });
+    try {
+      // A self-closing kind refuses a machine disposition.
+      const alert = harness.notifications.post({ kind: 'lessons.dream-failed', routing: 'action-required', severity: 'error', title: 'dream failed' });
+      expect(harness.api.machineDispositionRefusal(alert.id)).toMatch(/closes itself on a completed dream pass/u);
+      const response = await postJson(harness.port, `/api/notifications/${encodeURIComponent(alert.id)}/disposition`, 'board-test-token', { detail: 'tried anyway' });
+      expect(response.status).toBeGreaterThanOrEqual(400);
+      expect(consulted).toBe(0);
+      expect(harness.api.getNotification(alert.id)).toMatchObject({ resolvedAt: null });
+      expect(harness.api.machineDispositionRefusal('no-such-alert')).toBeNull();
+    } finally {
+      await harness.close();
+    }
+  });
+
   it('the production supervisor binding preserves a real refusal through the authenticated disposition route', async () => {
     let disposition: ((id: string) => ReturnType<Supervisor['onNotificationDisposed']>) | null = null;
     const harness = await boot('board-test-token', {

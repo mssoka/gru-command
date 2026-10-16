@@ -5905,6 +5905,7 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
     record.recoveryAdmission = admission;
     return {
       admission,
+      settled: () => settled,
       timerFired: () => fired,
       expectCancelled: () => {
         expect(record).toMatchObject({ backoffTimer: null, rateLimitRetry: null, recoveryAdmission: null });
@@ -6075,6 +6076,43 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
     }
   });
 
+  it('a throwing retry abort still settles and detaches the incident, and never escapes the closure (#385)', async () => {
+    const rig = tripBreaker();
+    try {
+      const stopId = await supersededStop(rig);
+      const record = (rig.supervisor as unknown as { agents: Map<string, RetirableRecord> }).agents.get(rig.handle.id)!;
+      const armed = armRetirable(record);
+      const abort = record.rateLimitRetry!.admissionAbort;
+      abort.abort = () => { throw new Error('abort listener threw'); };
+      expect(rig.supervisor.onNotificationDisposed(stopId)).toEqual({ ok: true, rearmed: false, superseded: true });
+      expect(record.rateLimitRetry).toBeNull();
+      expect(armed.settled()).toEqual(['superseded']);
+      expect(armed.admission.signal.aborted).toBe(true);
+      expect(rig.supervisor.viewFor(rig.handle.id)).toBeNull();
+      // Called directly, as its many other callers do: it never throws.
+      const settled: string[] = [];
+      const loose = { agentId: 'loose', rateLimitRetry: { admissionAbort: { abort: () => { throw new Error('abort listener threw'); } }, resolveSettled: (disposition: string) => { settled.push(disposition); } } };
+      const clear = (rig.supervisor as unknown as { clearRateLimitRetry(agent: unknown, disposition: string): void }).clearRateLimitRetry.bind(rig.supervisor);
+      expect(() => clear(loose, 'exhausted')).not.toThrow();
+      expect(loose.rateLimitRetry).toBeNull();
+      expect(settled).toEqual(['exhausted']);
+    } finally {
+      rig.close();
+    }
+  });
+
+  it('a superseded-stop closure needs real ids and one job (#385)', () => {
+    const rig = tripBreaker();
+    try {
+      expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: ' ', jobId: 'fenced-job', payload: { notification_id: 'n' } })).toThrow(/needs a non-blank agentId/u);
+      expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: '' } })).toThrow(/needs a non-blank notification_id/u);
+      expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: 'n', job_id: 'other-job' } })).toThrow(/names job "other-job" in its payload but "fenced-job" as its job/u);
+      expect(closures(rig)).toEqual([]);
+    } finally {
+      rig.close();
+    }
+  });
+
   it('a failing retirement cleanup step never skips the others: the closure stands and the record retires (#385)', async () => {
     const rig = tripBreaker();
     try {
@@ -6114,6 +6152,13 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       try {
         expect(off.onNotificationDisposed(stopId)).toEqual({ ok: true, rearmed: false, superseded: true });
         expect(off.onNotificationDisposed('notification-with-no-stop')).toEqual({ ok: true, rearmed: false });
+        // An OFF supervisor never refuses: a failed lookup only loses the label.
+        const failing = vi.spyOn(rig.api, 'hasSupervisionStopSuperseded').mockImplementation(() => { throw new Error('events unreadable'); });
+        try {
+          expect(off.onNotificationDisposed(stopId)).toEqual({ ok: true, rearmed: false });
+        } finally {
+          failing.mockRestore();
+        }
       } finally {
         off.dispose();
       }
