@@ -9,7 +9,10 @@ describe('one bounded line of error text (#379, #380)', () => {
     // A cut prefix that collapses below the bound never ends in half a pair.
     const blankThenEmoji = `${' '.repeat(39)}${'😀'.repeat(20)}`;
     expect(oneLineErrorText(blankThenEmoji, 10)).toBe(`${'😀'.repeat(10)}…`);
-    expect(oneLineErrorText(`${' '.repeat(639)}${'😀'.repeat(20)}`, 10)).not.toMatch(/(?:^|[^\ud800-\udbff])[\udc00-\udfff]|[\ud800-\udbff](?![\udc00-\udfff])/u);
+    // ...and a scanned prefix cut inside a pair drops the half: `x`, then the cut mark.
+    expect(oneLineErrorText(`x${' '.repeat(638)}${'😀'.repeat(20)}`, 10)).toBe('x…');
+    // A value that is all blanks past the scanned prefix was cut, not empty.
+    expect(oneLineErrorText(' '.repeat(1000), 10)).toBe('…');
     expect(oneLineErrorText({ toString() { throw new Error('no'); } }, 10)).toBe('an unprintable error');
     expect(oneLineErrorText('  \n\t ', 10)).toBe('an error with no text');
     expect(oneLineErrorText('x'.repeat(10), 10)).toBe('x'.repeat(10));

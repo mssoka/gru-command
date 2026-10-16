@@ -154,10 +154,11 @@ describe('overlay rollback restore (#380)', () => {
   it('an overwritten file is restored with its own mode', () => {
     const root = workspace();
     const target = join(root, 'test/existing.test.mjs');
-    fs.chmodSync(target, 0o751);
+    // Every write bit set: any umask would strip some, so only an exact chmod keeps them.
+    fs.chmodSync(target, 0o777);
     expect(() => applyOverlayFilesAllOrNothing({ workspaceRoot: root, files: failingSet })).toThrow(/non-file entry/u);
     expect(readFileSync(target, 'utf8')).toBe('original\n');
-    expect(statSync(target).mode & 0o7777).toBe(0o751);
+    expect(statSync(target).mode & 0o7777).toBe(0o777);
   });
 
   it('a target the untouched-check cannot read is restored, never skipped', () => {
