@@ -21,6 +21,9 @@ export interface ResidentHandleObservation {
   readonly sessionFile: string | null;
   /** Adapter-reported state ('idle' here is a display label, not quiescence). */
   readonly state: string;
+  /** Frames held for tap consumers until the handle's publication: zero once
+   * it is published, or once a quarantine refuses its publication (#352). */
+  readonly heldEvents: number;
 }
 
 /** Aggregated pool state at observation time. */

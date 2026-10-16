@@ -1362,6 +1362,9 @@ describe('review Git repository environment isolation (GH-270)', () => {
         expect(prompt).not.toHaveBeenCalled();
         expect(registry.getHandle(handle.id)).toBeNull();
         expect(publish).toThrow(/handoff unresolved/); // Supervisor retries must remain terminal.
+        // A quarantine after a failed publication keeps the original refusal (#352).
+        registry.quarantineHandle(handle);
+        expect(publish).toThrow(/handoff unresolved/);
         expect(readFileSync(join(admin, 'locked'), 'utf8')).toMatch(/foreign/);
         rmSync(join(admin, 'locked')); // fixture actor restores bytes, not publication authority
         expect(publish).toThrow(/handoff unresolved/);
@@ -1369,7 +1372,8 @@ describe('review Git repository environment isolation (GH-270)', () => {
         expect(registry.getHandle(handle.id)).toBeNull();
       }
       for (const listener of listeners) listener({ type: 'text_delta', delta: 'after publication attempt' });
-      expect(forwarded).toEqual(seam === 'healthy' ? ['inside publication', 'buffered before publication', 'after publication attempt'] : []);
+      // In the order they happened (#353): the held frame, then the one a `spawned` listener made.
+      expect(forwarded).toEqual(seam === 'healthy' ? ['buffered before publication', 'inside publication', 'after publication attempt'] : []);
       expect(published).toEqual(seam === 'before-publication' ? [] : [handle.id]);
       const acknowledgements: boolean[] = [];
       const stopSettlement = observeDisposalSettlement(handle, (acknowledged) => { acknowledgements.push(acknowledged); });
