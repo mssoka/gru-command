@@ -3722,6 +3722,35 @@ describe('typed provider-response provenance (r1 #13) — pure parsers', () => {
   });
 });
 
+it('a directive-bearing steer or follow-up from the live turn\'s own owner waits as its own queued turn with its own admission, never native steering (#363 S05-2-02)', async () => {
+  for (const channel of ['steer', 'followUp'] as const) {
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    const f = await fixture([{ deltas: ['base'], hold }, { deltas: ['directive turn done'] }]);
+    const handle = await f.runtime.spawn('minion', { cwd: f.workspace, agentId: `directive-${channel}-minion` });
+    const identity = { requestId: `directive-${channel}`, payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64), jobId: `directive-${channel}-job`, workRevision: 0, authorityEpoch: 0 };
+    const events = collect(handle);
+    let admissions = 0;
+    try {
+      const live = handle.prompt('go', { owner: 'alice' });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      const directed = handle[channel]('exact accepted directive', { owner: 'alice', directive: { identity, beforeAdmission: () => { admissions += 1; }, onAdmitted: () => {} } });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      // Not delivered into the live turn: it waits in the single-writer queue, unadmitted.
+      expect(events.some((event) => event.type === 'queued'), channel).toBe(true);
+      expect(admissions, channel).toBe(0);
+      expect(f.script.calls.map((call) => call.prompt), channel).toEqual(['go']);
+      release();
+      await live; await directed;
+      // Then its own turn: admitted for itself, delivered after the live one, checkpointed exactly.
+      expect(admissions, channel).toBeGreaterThan(0);
+      expect(f.script.calls.map((call) => call.prompt), channel).toEqual(['go', 'exact accepted directive']);
+      const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+      expect(inspectDirectiveCheckpoint(handle.sessionFile!, identity), channel).toMatchObject({ state: 'terminal', ok: true });
+    } finally { release(); await handle.dispose(); await f.runtime.dispose(); f.store.dispose(); }
+  }
+});
+
 it('directive native multi-tool invocation persists each sequential result and rejects unpersisted, foreign or completed calls', async () => {
   const f = await fixture([
     { deltas: [], toolCalls: [

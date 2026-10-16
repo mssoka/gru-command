@@ -1,6 +1,6 @@
 import { bindOriginalRebriefSdkOwner, markHistoricalDirectiveFixture } from './helpers/directive-native-fixture.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { appendFileSync, closeSync, constants, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, truncateSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, constants, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, truncateSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { tmpdir } from 'node:os';
@@ -1381,6 +1381,31 @@ describe('restart-recovery-progress — exact native request matrix', () => {
         expect(f.native.prompts).toEqual([]); expect(f.spawns).toEqual([]);
       } finally { record.mockRestore(); probe.mockRestore(); recordDirectiveProducerCessation(producer); }
     })();
+  });
+
+  it('an exact successful completion whose producer probe is EPERM stays UNKNOWN: no delivery, no settlement, nothing disposed (#363 S04-2-01)', async () => {
+    const f = await fixture(); void (f.ledger.getWorktree(f.lane.id) ?? f.ledger.registerWorktree(f.lane));
+    f.ledger.prepareDirectiveTarget(f.intent.requestId, { agentId: 'logical-minion', sessionFile: f.file });
+    prepareDirectiveBinding({ identity: f.identity, runtime: 'pi', agentId: 'logical-minion', sessionId: f.native.sessionId, sessionFile: f.file, text: 'original user', authorityManifest: 'original authority' });
+    const producer = prepareDirectiveProducer({ identity: f.identity, agentId: 'logical-minion', sessionId: f.native.sessionId, sessionFile: f.file });
+    f.ledger.startDirectiveProducer(f.identity, producer);
+    f.native.append({ role: 'user', content: [{ type: 'text', text: 'original user' }] }); f.native.finish();
+    const proof = inspectDirectiveCheckpoint(f.file, f.identity);
+    if (proof.state !== 'terminal' || !proof.ok) throw new Error('original successful terminal required');
+    recordDirectiveCompletion(producer, proof.checkpointId, resolveGitCommit(f.lane.path, 'HEAD'));
+    // No lock file is left to refuse on its own: the probe alone decides, and EPERM proves nothing.
+    expect(existsSync(`${f.file}.lock`)).toBe(false);
+    const probe = vi.spyOn(process, 'kill').mockImplementation(() => { throw Object.assign(new Error('fixture ambiguous permission'), { code: 'EPERM' }); });
+    const disposals = vi.spyOn(f.registry, 'disposeHandle');
+    try {
+      expect(inspectDirectiveProducers(f.file, f.identity)).toEqual([expect.objectContaining({ evidence: 'unknown' })]);
+      const outcome = (() => { try { return settleNativeDirective(f.deps, f.identity); } catch (error) { return error; } })();
+      expect(outcome).not.toBe(true);
+      expect(f.ledger.latestJobEventByRequestId(f.intent.jobId, 'job.delivered', f.intent.requestId)).toBeNull();
+      expect(f.ledger.getDirective(f.intent.requestId)?.state).not.toBe('settled');
+      expect(disposals).not.toHaveBeenCalled();
+      expect(f.native.prompts).toEqual([]); expect(f.spawns).toEqual([]);
+    } finally { disposals.mockRestore(); probe.mockRestore(); recordDirectiveProducerCessation(producer); }
   });
 
   async function assertHistoricalMissingHead(mode: 'amended' | 'parked' | 'unknown') {
@@ -2784,6 +2809,21 @@ it('P35 positively pre-native parent tool preparation failure later continues th
   expect(f.spawns).toEqual([]); expect(f.native.continuations).toBe(0); available = true;
   service.reconsider(); await service.settled(); service.reconsider(); await service.settled();
   expect(f.native.continuations).toBe(1); expect(f.native.prompts).toEqual([]); expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('settled'); await service.dispose();
+});
+
+it('P35 a checkpoint continuation restores the original agent\'s nonempty parent tools, same capability and same identity (#363 S04-2-02)', async () => {
+  const f = await fixture(); f.seed();
+  const capability = { name: 'request_child_worker', description: 'request a child worker for the original parent', inputSchema: { type: 'object' },
+    authorityManifest: 'original-parent:logical-minion', execute: async () => ({ text: 'ok' }) };
+  const asked: string[] = [];
+  const service = new DirectiveProgressService({ ...f.deps, parentTools: (agentId) => { asked.push(agentId); return [capability]; } });
+  service.reconsider(); await service.settled(); service.reconsider(); await service.settled();
+  expect(f.native.continuations).toBe(1);
+  expect(asked).toEqual(['logical-minion']);
+  expect(f.spawns).toHaveLength(1);
+  expect(f.spawns[0]).toMatchObject({ agentId: 'logical-minion', resumeFile: f.file, nativeTools: [capability] });
+  expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('settled');
+  await service.dispose();
 });
 
 async function assertLateTerminalRecoveryHold(mode: 'suspended' | 'claimed'): Promise<void> {
