@@ -14,6 +14,7 @@ import type { LogLevel } from '../src/logger.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
 import type { ObservedToolResult } from '../src/dispatch/blind-input.js';
+import type { RetrySettlement } from '../src/runtime/pacing.js';
 import { BLIND_ACCESS_EVENT } from '../src/dispatch/blind-review.js';
 import type { Role } from '../src/config.js';
 import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
@@ -53,6 +54,11 @@ interface Harness {
 
 async function boot(opts: {
   sessionToolResults?: (file: string | null) => readonly ObservedToolResult[] | null;
+  /** The briefing prompt of this job rejects after its tools ran (#356). */
+  rejectPromptOf?: string;
+  /** The automatic-retry settlement every briefing turn waits on (#356). */
+  retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
+  stopSignal?: AbortSignal;
   log?: (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 } = {}): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-blind-'));
@@ -72,7 +78,11 @@ async function boot(opts: {
     const id = `agent-${spawns}`;
     return {
       role, id, sessionFile: null, capabilities: CAPS,
-      async prompt(text: string) { if (role === 'minion') prompts.push(text); },
+      async prompt(text: string) {
+        if (role !== 'minion') return;
+        prompts.push(text);
+        if (opts.rejectPromptOf !== undefined && text.includes(opts.rejectPromptOf)) throw new Error('provider closed the stream mid-turn');
+      },
       async steer() {}, async followUp() {},
       subscribe() { return () => {}; },
       health() { return { state: 'idle' as const, lastActivity: null, sessionFile: null }; },
@@ -85,6 +95,8 @@ async function boot(opts: {
     spawner,
     ...(opts.sessionToolResults !== undefined ? { sessionToolResults: opts.sessionToolResults } : {}),
     ...(opts.log !== undefined ? { log: opts.log } : {}),
+    ...(opts.retrySettlement !== undefined ? { retrySettlement: opts.retrySettlement } : {}),
+    ...(opts.stopSignal !== undefined ? { stopSignal: opts.stopSignal } : {}),
   });
   const wave = new WaveRunner({ ledger, worktrees, spawner, bus });
   const server = createDispatchServer({ pendingProducerBlockers: () => [], config: cfg, dispatch, wave, ledger });
@@ -389,6 +401,123 @@ describe('blind review commissioning (issue #316)', () => {
     await waitFor(() => h.ledger.latestJobEvent('rev-seen', 'review.blind-access-observed') !== null);
     expect((await call(h.port, 'GET', '/api/dispatch/jobs/rev-seen/blind-coverage')).json).toMatchObject({
       state: 'invalidated', qualifying: false, accessObserved: true,
+    });
+  });
+
+  it('observes a reviewer whose initial prompt read prohibited material and then rejected (#356)', async () => {
+    const h = await boot({
+      rejectPromptOf: 'rev-reject',
+      sessionToolResults: () => [
+        { index: 0, toolName: 'bash', text: '_bmad-output/implementation-artifacts/deferred-work.md:3:- old finding' },
+      ],
+    });
+    await dispatchParent(h);
+    const created = await call(h.port, 'POST', '/api/dispatch', blindReview('rev-reject', { repo_path: h.repo.path, input_package: validPackage() }));
+    expect(created.status).toBe(202);
+    await waitFor(() => h.ledger.latestJobEvent('rev-reject', 'job.minion-error') !== null);
+    // The failure bookkeeping is unchanged: blocked, the original error, no delivery.
+    expect(h.ledger.latestJobEvent('rev-reject', 'job.minion-error')?.payload).toMatchObject({ error: expect.stringContaining('provider closed the stream mid-turn') });
+    expect(h.ledger.getJob('rev-reject')?.status).toBe('blocked');
+    expect(h.ledger.latestJobEvent('rev-reject', 'job.delivered')).toBeNull();
+    // ...and the read it made before rejecting still invalidates coverage.
+    expect(h.ledger.latestJobEvent('rev-reject', BLIND_ACCESS_EVENT)).not.toBeNull();
+    expect((await call(h.port, 'GET', '/api/dispatch/jobs/rev-reject/blind-coverage')).json).toMatchObject({
+      state: 'invalidated', qualifying: false, accessObserved: true,
+    });
+  });
+
+  /** A reviewer reads prohibited material, then its turn ends through one
+   * disposition-specific exit: the read still invalidates coverage (#356). */
+  async function assertReadInvalidatesOn(exit: 'exhausted' | 'superseded' | 'unavailable' | 'cancelled'): Promise<void> {
+    const stop = new AbortController();
+    // Armed after the parent delivered: only the reviewer's turn takes the exit.
+    let armed = false;
+    const h = await boot({
+      sessionToolResults: () => [{ index: 0, toolName: 'bash', text: '_bmad-output/implementation-artifacts/deferred-work.md:3:- old finding' }],
+      retrySettlement: async () => {
+        if (!armed) return 'none';
+        // The settlement machinery names any hook fault RetrySettlementUnavailableError.
+        if (exit === 'unavailable') throw new Error('settlement hook fault');
+        if (exit === 'cancelled') { stop.abort(); return new Promise<RetrySettlement>(() => {}); }
+        return exit;
+      },
+      stopSignal: stop.signal,
+    });
+    await dispatchParent(h);
+    armed = true;
+    const id = `rev-${exit}`;
+    expect((await call(h.port, 'POST', '/api/dispatch', blindReview(id, { repo_path: h.repo.path, input_package: validPackage() }))).status).toBe(202);
+    await waitFor(() => h.ledger.latestJobEvent(id, 'job.minion-error') !== null);
+    expect(h.ledger.getJob(id)?.status).toBe('blocked');
+    expect(h.ledger.latestJobEvent(id, 'job.delivered')).toBeNull();
+    expect((await call(h.port, 'GET', `/api/dispatch/jobs/${id}/blind-coverage`)).json).toMatchObject({ state: 'invalidated', qualifying: false, prohibitedAccess: 1 });
+  }
+  it('a read before an exhausted automatic retry still invalidates coverage (#356)', () => assertReadInvalidatesOn('exhausted'));
+  it('a read before a superseded automatic retry still invalidates coverage (#356)', () => assertReadInvalidatesOn('superseded'));
+  it('a read before an unavailable retry settlement still invalidates coverage (#356)', () => assertReadInvalidatesOn('unavailable'));
+  it('a read before a shutdown-cancelled retry wait still invalidates coverage (#356)', () => assertReadInvalidatesOn('cancelled'));
+
+  it('observes the initial prompt the moment it settles, before its retries conclude (#356)', async () => {
+    let settled!: (value: RetrySettlement) => void;
+    let armed = false;
+    const h = await boot({
+      sessionToolResults: () => [{ index: 0, toolName: 'bash', text: '_bmad-output/implementation-artifacts/deferred-work.md:3:- old finding' }],
+      retrySettlement: async () => armed ? new Promise<RetrySettlement>((resolve) => { settled = resolve; }) : 'none',
+    });
+    await dispatchParent(h);
+    armed = true;
+    expect((await call(h.port, 'POST', '/api/dispatch', blindReview('rev-pending', { repo_path: h.repo.path, input_package: validPackage() }))).status).toBe(202);
+    await waitFor(() => h.ledger.latestJobEvent('rev-pending', BLIND_ACCESS_EVENT) !== null);
+    expect(h.ledger.latestJobEvent('rev-pending', 'job.delivered')).toBeNull(); // still waiting on its retries
+    expect((await call(h.port, 'GET', '/api/dispatch/jobs/rev-pending/blind-coverage')).json).toMatchObject({ state: 'invalidated', prohibitedAccess: 1 });
+    settled('none');
+    // The post-retry re-scan re-reports the same read: still one distinct read.
+    await waitFor(() => h.ledger.listJobEventsByKinds('rev-pending', [BLIND_ACCESS_EVENT]).length >= 2);
+    expect((await call(h.port, 'GET', '/api/dispatch/jobs/rev-pending/blind-coverage')).json).toMatchObject({ state: 'invalidated', prohibitedAccess: 1 });
+  });
+
+  it('an initial prompt that read and then rejected invalidates coverage before its retries settle, with its failure bookkeeping unchanged (#356)', async () => {
+    let settled!: (value: RetrySettlement) => void;
+    let armed = false;
+    const h = await boot({
+      rejectPromptOf: 'rev-early-reject',
+      sessionToolResults: () => [{ index: 0, toolName: 'bash', text: '_bmad-output/implementation-artifacts/deferred-work.md:3:- old finding' }],
+      retrySettlement: async () => armed ? new Promise<RetrySettlement>((resolve) => { settled = resolve; }) : 'none',
+    });
+    await dispatchParent(h);
+    armed = true;
+    expect((await call(h.port, 'POST', '/api/dispatch', blindReview('rev-early-reject', { repo_path: h.repo.path, input_package: validPackage() }))).status).toBe(202);
+    // Observed the moment the rejected prompt settled — its retries still pending.
+    await waitFor(() => h.ledger.latestJobEvent('rev-early-reject', BLIND_ACCESS_EVENT) !== null);
+    expect(h.ledger.latestJobEvent('rev-early-reject', 'job.minion-error')).toBeNull();
+    expect((await call(h.port, 'GET', '/api/dispatch/jobs/rev-early-reject/blind-coverage')).json).toMatchObject({ state: 'invalidated', qualifying: false, prohibitedAccess: 1 });
+    settled('exhausted');
+    await waitFor(() => h.ledger.latestJobEvent('rev-early-reject', 'job.minion-error') !== null);
+    expect(h.ledger.latestJobEvent('rev-early-reject', 'job.minion-error')?.payload).toMatchObject({ error: expect.stringContaining('provider closed the stream mid-turn') });
+    expect(h.ledger.getJob('rev-early-reject')?.status).toBe('blocked');
+    expect(h.ledger.latestJobEvent('rev-early-reject', 'job.delivered')).toBeNull();
+    expect((await call(h.port, 'GET', '/api/dispatch/jobs/rev-early-reject/blind-coverage')).json).toMatchObject({ state: 'invalidated', prohibitedAccess: 1 });
+  });
+
+  it('observes session grep results whose excluded path contains spaces, and keeps a spaced permitted path qualifying (#357)', async () => {
+    const seen = await boot({
+      sessionToolResults: () => [{ index: 0, toolName: 'bash', text: 'docs/issues/prior review.md:1:plain text' }],
+    });
+    await dispatchParent(seen);
+    expect((await call(seen.port, 'POST', '/api/dispatch', blindReview('rev-spaced', { repo_path: seen.repo.path, input_package: validPackage() }))).status).toBe(202);
+    await waitFor(() => seen.ledger.latestJobEvent('rev-spaced', BLIND_ACCESS_EVENT) !== null);
+    expect((await call(seen.port, 'GET', '/api/dispatch/jobs/rev-spaced/blind-coverage')).json).toMatchObject({
+      state: 'invalidated', qualifying: false, prohibitedAccess: 1,
+    });
+
+    const control = await boot({
+      sessionToolResults: () => [{ index: 0, toolName: 'bash', text: 'src/my feature.ts:1:export const feature = 1;' }],
+    });
+    await dispatchParent(control);
+    expect((await call(control.port, 'POST', '/api/dispatch', blindReview('rev-permitted', { repo_path: control.repo.path, input_package: validPackage() }))).status).toBe(202);
+    await waitFor(() => control.ledger.latestJobEvent('rev-permitted', BLIND_ACCESS_EVENT) !== null);
+    expect((await call(control.port, 'GET', '/api/dispatch/jobs/rev-permitted/blind-coverage')).json).toMatchObject({
+      qualifying: true, prohibitedAccess: 0,
     });
   });
 
