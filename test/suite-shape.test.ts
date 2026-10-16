@@ -379,11 +379,11 @@ const PINS: Record<string, number> = {
   'harness-routing.test.ts': 3,
   'ledger-obligations.test.ts': 30,
   'obligations-handback.test.ts': 9,
-  'perkins-github-app.test.ts': 175,
+  'perkins-github-app.test.ts': 177,
   'prompt-verdict.test.ts': 6,
   'test-budgets.test.ts': 10,
   'tool-call-policy.test.ts': 12,
-  'verification-capture.test.ts': 36,
+  'verification-capture.test.ts': 45,
 
 };
 
