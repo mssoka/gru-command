@@ -2174,7 +2174,9 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       stallStillEligible(input, row, phaseSeq, silenceFloor, jobSeq);
   });
   // The inspection yields only to a row that is itself published: a stall
-  // retracted at this boundary must not leave the job with no action at all.
+  // retracted here while the inspection's own fences still hold (the worker
+  // showed activity, no job event) must not hide it too. A job event during
+  // the await retracts both — the next sweep re-derives the job.
   const inspectionYields = new Set([...stalledWorking, ...minionErrors, ...verificationFailures].map((row) => row.jobId));
   return {
     ...digest,
