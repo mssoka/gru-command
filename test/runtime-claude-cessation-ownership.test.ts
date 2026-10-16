@@ -172,6 +172,36 @@ describe('Claude Code cessation through the registry (runtime-neutral contract)'
     } finally { vi.useRealTimers(); }
   });
 
+  it('an error whose child reports an exit but no close stays unknown and holds the permit: only the close is the proof (#359)', async () => {
+    for (const exit of [{ code: 143, signal: null }, { code: null, signal: 'SIGTERM' as NodeJS.Signals }]) try {
+      vi.useRealTimers();
+      const child = fakeChild();
+      const fx = claudeRegistry(child);
+      const { registry } = fx;
+      let released = 0;
+      registry.onResidentReleased(() => { released += 1; });
+      const resident = await spawnBusy(fx);
+      vi.useFakeTimers();
+      const disposing = resident.dispose();
+      for (let tick = 0; tick < 20 && vi.mocked(child.kill).mock.calls.length === 0; tick += 1) await Promise.resolve();
+      expect(child.kill).toHaveBeenCalled();
+      // The exit is recorded (as a real ChildProcess does at 'exit'), the
+      // transport errors, and the close never comes before the settlement.
+      Object.assign(child, { exitCode: exit.code, signalCode: exit.signal });
+      child.emit('error', new Error('transport error'));
+      await vi.advanceTimersByTimeAsync(60);
+      await disposing;
+      const label = `exit ${String(exit.code ?? exit.signal)}`;
+      expect(adapterCessationEvidence(resident), label).toBe('unknown');
+      expect([registry.residents.occupied, released], label).toEqual([1, 0]);
+      // ...until the same child's own close.
+      child.emit('close', exit.code, exit.signal);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(adapterCessationEvidence(resident), label).toBe('ceased');
+      expect([registry.residents.occupied, released], label).toEqual([0, 1]);
+    } finally { vi.useRealTimers(); }
+  });
+
   it('through the production fallback wrapper, a deadline without close holds the permit until the same child\'s late close releases it once (#359)', async () => {
     const child = fakeChild();
     const fx = claudeRegistry(child, { wrapped: true });

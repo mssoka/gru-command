@@ -326,7 +326,7 @@ const PINS: Record<string, number> = {
   'runtime-cessation-evidence.test.ts': 14,
   'runtime-probe.test.ts': 8,
   'runtime-resident-registry.test.ts': 25,
-  'runtime-claude-cessation-ownership.test.ts': 8,
+  'runtime-claude-cessation-ownership.test.ts': 9,
   'runtime-positive-cessation-ownership.test.ts': 6,
   'runtime-spawn-registration.test.ts': 17,
   'service-port-guard.test.ts': 14,

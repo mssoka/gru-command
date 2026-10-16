@@ -1198,7 +1198,10 @@ export class ClaudeCodeHandle implements AgentHandle {
         if (exitKind === 'close-observed') this.cessationKind = 'close-observed';
         // The original child's own close that already came — in the same
         // tick as the error, before this settlement ran — is still its proof:
-        // never overwritten by 'error' or 'deadline'. An exit alone is not.
+        // never overwritten by 'error' or 'deadline'. An exit reported after
+        // the disposal began is not: past an error or the deadline only the
+        // close is (owner ruling 2026-10-16, #359). An exit already reported
+        // when the disposal began is the initial proof above, unchanged here.
         else if (closedBeforeSettlement || this.closedVerificationChildren.has(live)) this.cessationKind = 'close-observed-late';
         else if (exitKind === 'error') this.cessationKind = 'error';
         else this.cessationKind = 'deadline';

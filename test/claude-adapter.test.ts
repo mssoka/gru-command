@@ -3294,6 +3294,9 @@ describe('ReviewMcpBridge fail-closed guards', () => {
       const file = owned.params.verificationSettingsFile as string;
       const policyFile = join(dirname(file), 'policy.json');
       // The close alone is the proof: this fake never records an exit code or signal.
+      // (A policy child's close is also recorded by its custody tracker; the
+      // adapter's own same-tick latch is pinned without a policy in
+      // runtime-claude-cessation-ownership.test.ts.)
       const original = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null, kill: vi.fn(() => true) }) as unknown as ChildProcess;
       owned.live = original;
       vi.useFakeTimers();
