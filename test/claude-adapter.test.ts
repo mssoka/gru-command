@@ -2492,6 +2492,18 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     expect(doubleInvocations(fx)).toEqual([]);
   });
 
+  it('declares the native-directive gap: a directive prompt is refused by name before any CLI run, and inspection is UNKNOWN (#424) #contract:native-directive-admission:claude-code', async () => {
+    const fx = fixture();
+    const handle = await fx.runtime.spawn('gru');
+    const identity = { requestId: 'directive-gap', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64), jobId: 'job-gap', workRevision: 0, authorityEpoch: 0 };
+    await expect(handle.prompt('approved correction', { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } }))
+      .rejects.toThrow(/cannot attest actual request admission; directive checkpoint capability unavailable/u);
+    expect(handle.inspectDirective?.(identity)).toMatchObject({ state: 'unknown' });
+    expect(handle.prepareDirectiveProducer).toBeUndefined();
+    expect(doubleInvocations(fx)).toEqual([]);
+    await handle.dispose();
+  });
+
   it('resume scan is bounded: a session id beyond the prefix window is not found', async () => {
     const fx = fixture();
     const dir = fx.store.sessionDirFor('gru', fx.workspace);

@@ -3742,7 +3742,7 @@ describe('typed provider-response provenance (r1 #13) — pure parsers', () => {
   });
 });
 
-it('a directive-bearing steer or follow-up from the live turn\'s own owner waits as its own queued turn with its own admission, never native steering (#363 S05-2-02)', async () => {
+it('a directive-bearing steer or follow-up from the live turn\'s own owner waits as its own queued turn with its own admission, never native steering (#363 S05-2-02) #contract:native-directive-admission:pi', async () => {
   for (const channel of ['steer', 'followUp'] as const) {
     let release!: () => void;
     const hold = new Promise<void>((resolve) => { release = resolve; });

@@ -12,8 +12,12 @@ New installs and generated configs (`config-generate`, the setup wizard) write
 `config.toml` files keep whatever they say (including a config with no
 `[runtimes]` table, which still resolves to `pi`); regenerating with `--force`
 adopts the existing runtime unless one is chosen explicitly. Switch an existing
-install by editing `[runtimes] default`. [RUNTIME-PARITY.md](./RUNTIME-PARITY.md) is the parity matrix between the two
-runtimes, its guard, and the rollout notes for changing the default.
+install by editing `[runtimes] default`.
+
+[RUNTIME-PARITY.md](./RUNTIME-PARITY.md) holds the parity matrix between the
+two runtimes, its guard, the declared gaps and the rollout notes for changing
+the default. Read its gaps before switching an install: Silas directives and
+re-briefs need a pi-hosted minion (#424).
 
 ## Capability matrix
 

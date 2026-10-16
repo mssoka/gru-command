@@ -318,7 +318,7 @@ describe('guarded claim — happy path', () => {
     expect(prompted[0]).not.toContain('records the delivery of this turn');
   });
 
-  it('resumes the interrupted session and re-delivers the continuation prompt', async () => {
+  it('resumes the interrupted session and re-delivers the continuation prompt #contract:provider-recovery-continuation:neutral', async () => {
     const h = new ClaimHarness();
     const sessionDir = mkdtempSync(join(tmpdir(), 'pr-session-'));
     cleanupDirs.push(sessionDir);

@@ -17,16 +17,27 @@ that proves it on each adapter.
   - `#contract:<id>:neutral` marks a contract proven above the adapter layer,
     through the runtime-neutral `AgentHandle` interface.
 - `test/runtime-parity.test.ts` reads the two tables below and every test
-  title. It fails when:
+  title. Only an unconditional test counts as proof; a skipped or
+  conditionally skipped test does not. The guard fails when:
   - a contract lacks a test on either runtime (a neutral test covers both);
-  - a tag names a contract the matrix does not list;
-  - a matrix cell does not name the file of a test tagged for it;
+  - a tag is malformed, names a contract the matrix does not list, or sits in
+    the other runtime's adapter test file;
+  - a matrix cell does not name the file of a test tagged for it, or names a
+    file that does not exist or holds no tag for that contract;
   - an adapter test file (`test/pi-adapter.test.ts`,
     `test/claude-adapter.test.ts`) grows a top-level `describe` block that the
     block map below does not place.
-- A new runtime-dependent feature therefore lands with a tagged test on both
-  adapters, or with an explicit row saying why it is neutral. A pi test alone,
-  or a Claude test alone, fails the guard.
+- **What the guard cannot do.** It holds every DECLARED contract on both
+  runtimes, but it cannot detect a runtime-dependent behaviour nobody
+  declared. A new test inside an `umbrella` block is not checked either. So
+  a change that adds runtime-dependent behaviour adds its row here and tags a
+  test on each runtime, or a `:neutral` test that drives it through
+  `AgentHandle`. Review asks for that row; a pi test alone or a Claude test
+  alone then fails the guard.
+- **A gap is a row too.** A capability one runtime cannot provide is listed
+  under [Declared gaps](#declared-gaps). Its row is "proven" on the gap side
+  by a test that pins the named refusal, never by pretending the capability
+  exists.
 
 ## Parity matrix
 
@@ -44,7 +55,7 @@ that proves it on each adapter.
 | `registry-policy` | The registry resolves each role to its configured runtime and model/thinking policy | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts` |
 | `session-resume` | A previous session file resumes with its history intact after a process restart | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts` |
 | `resume-outside-store-refused` | A resume file outside the session store is refused | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts` |
-| `foreign-transcript-refused` | A transcript the other runtime wrote is refused by name, with its lock released and its bytes untouched. It is never resumed as a fresh session | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts` |
+| `foreign-transcript-refused` | A transcript the other runtime wrote is refused by name, with no lock left behind and its bytes untouched. It is never resumed as a fresh session | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts` |
 | `isolated-review-no-resume` | An isolated review never resumes, so ambient history cannot cross the boundary | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts` |
 | `isolated-review-tools` | An isolated review gets exactly its review tools; ambient runtime resources are stripped | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts` |
 | `review-native-tools` | A lens session gets exactly its declared product-native tools: in-process for pi, a scoped MCP bridge for Claude | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts` |
@@ -57,6 +68,10 @@ that proves it on each adapter.
 | `blind-transcript-reader` | The blind-access reader pairs each read result with the file its call named, read from each runtime's real persisted record shape | `test/blind-review.test.ts` | `test/blind-review.test.ts` |
 | `blind-read-invalidates` | Through the ledger, an absolute read inside the job's recorded lane invalidates blind coverage | `test/blind-review.test.ts` | `test/blind-review.test.ts` |
 | `blind-resumed-turn-scan` | A prohibited read during a provider-recovery resumed turn invalidates blind coverage | `test/provider-recovery-resume.test.ts` | `test/provider-recovery-resume.test.ts` |
+| `native-directive-admission` | **Declared gap (#424).** pi attests a Silas directive's native admission and producer ownership. Claude Code refuses a directive prompt by name, and directive progress refuses its minion before binding anything | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts`, `test/restart-recovery-progress.test.ts` |
+| `rate-limit-retry` | An in-band 429 keeps the delivery pending until the supervisor's automatic retry recovers; driven through `AgentHandle` | `test/supervisor.test.ts` | `test/supervisor.test.ts` |
+| `supervisor-restart-ladder` | A hung agent climbs the restart ladder and is restored by resume; driven through `AgentHandle` | `test/supervisor.test.ts` | `test/supervisor.test.ts` |
+| `provider-recovery-continuation` | A provider-recovery claim resumes the interrupted session and re-delivers its continuation prompt; driven through `AgentHandle` | `test/provider-recovery-resume.test.ts` | `test/provider-recovery-resume.test.ts` |
 | `stale-spawn-quarantine` | A quarantined handle (GH-280) loses lookup eligibility until disposal. This is proven in the registry, for any adapter | `test/runtime-resident-registry.test.ts` | `test/runtime-resident-registry.test.ts` |
 <!-- parity-matrix:end -->
 
@@ -96,14 +111,22 @@ no counterpart on the other runtime.
 
 These paths see a runtime only through the `AgentHandle` interface and its
 events. Their suites drive them with fake handles, so one test covers both
-runtimes:
+runtimes. Each has a `:neutral` row in the matrix:
 
-- the supervisor restart ladder and breaker (`supervisor.test.ts`);
-- restart recovery (`restart-recovery-progress.test.ts`);
-- provider-recovery waits and the sensor (`provider-recovery-*.test.ts`);
-- resident registry custody (`runtime-resident-registry.test.ts`,
-  `runtime-spawn-registration.test.ts`);
-- disposal aggregation (`runtime-disposal-aggregation.test.ts`).
+- the supervisor restart ladder (`supervisor-restart-ladder`) and its
+  rate-limit retry (`rate-limit-retry`);
+- provider-recovery continuation (`provider-recovery-continuation`);
+- resident registry custody (`stale-spawn-quarantine`).
+
+Directive restart recovery (#286) is NOT runtime-neutral. It continues an
+interrupted directive from the runtime's own native checkpoint, which only pi
+attests: see the `native-directive-admission` gap.
+
+## Declared gaps
+
+| Contract | Gap | Issue |
+|---|---|---|
+| `native-directive-admission` | Silas directives and re-briefs need native admission and producer attestation. Claude Code cannot provide them, so a directive to a Claude-hosted minion is refused by name before anything is bound or prompted (a positive no-effect). The minion-owned review/fix cycle is unaffected | #424 |
 
 Blind-review observation reads each runtime's own transcript format. The
 `blind-transcript-reader` and `blind-read-invalidates` rows run on fixtures
@@ -129,11 +152,16 @@ writes each runtime's own record shape during a resumed turn.
 
 - **New installs.** The setup wizard and `config-generate` write
   `[runtimes] default = "claude-code"`. Setup fails loud when the `claude` CLI
-  is missing, naming how to choose `pi` instead.
+  is missing, naming how to choose `pi` instead (`test/config-generate.test.ts`,
+  "missing claude CLI fails loud …").
 - **Existing installs.** Nothing changes. A `config.toml` keeps the runtime it
   names, and one with no `[runtimes]` table still resolves to `pi`.
   Regenerating with `--force` keeps the existing runtime unless another is
-  chosen explicitly.
+  chosen explicitly (`test/config-generate.test.ts`, "an existing pi config …
+  is untouched by --force regeneration").
+- **Before switching an install to Claude Code**, note the
+  `native-directive-admission` gap (#424). Silas cannot send directives or
+  re-briefs to Claude-hosted minions.
 - **Live sessions when an install switches by hand.** A transcript belongs to
   the runtime that wrote it. The other adapter refuses to resume it by name and
   releases its lock (`foreign-transcript-refused`), so a switched install never
@@ -141,4 +169,5 @@ writes each runtime's own record shape during a resumed turn.
   dispose them, before editing `[runtimes] default`.
 - **Recorded runtime ids.** A review-owner marker records the runtime that
   wrote it and is judged by that runtime's rules, never by the current default.
-  A Claude marker is never released by PID death alone.
+  A Claude marker is never released by PID death alone
+  (`test/perkins-builtin-wave.test.ts`, `reviewOwnerCeased` for `claude-code`).

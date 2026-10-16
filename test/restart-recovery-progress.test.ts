@@ -1038,6 +1038,24 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(seen, route).toEqual([{ target: { agentId: 'logical-minion', sessionFile: f.file }, started: true }]);
   }
   it('#362 the fresh route prompts only after the durable native target and producer start commit', () => assertPreparedBeforePrompt('fresh'));
+  it('a minion on a runtime that cannot attest native admission is refused by name before any target binding or prompt (#424) #contract:native-directive-admission:claude-code', async () => {
+    const f = await fixture();
+    const prompts: string[] = [];
+    // The claude-code handle's directive surface: no producer attestation.
+    f.registry.spawn = async (_role, options = {}) => {
+      f.spawns.push(options);
+      return { role: 'minion', id: options.agentId ?? FIXTURE_MINION, sessionFile: f.file, capabilities: PI_CAPABILITIES,
+        async prompt(text: string) { prompts.push(text); }, async steer() {}, async followUp() {}, subscribe: () => () => {},
+        health: () => ({ state: 'idle' as const, lastActivity: null, sessionFile: f.file }),
+        inspectDirective: () => ({ state: 'unknown' as const, reason: 'claude-code CLI exposes no exact request acceptance/safe checkpoint continuation proof' }),
+        async dispose() {} } as AgentHandle;
+    };
+    await executeAcceptedDirective(f.deps, f.intent.requestId);
+    // A positive no-effect: failed by name, nothing bound, nothing prompted.
+    expect(f.ledger.getDirective(f.intent.requestId)).toMatchObject({ state: 'failed', nativeTarget: null, nativeBinding: null,
+      failReason: expect.stringMatching(/cannot attest native directive admission or producer ownership .*need a pi-hosted minion/su) });
+    expect(prompts).toEqual([]);
+  });
   it('#362 the resident route prompts only after the durable native target and producer start commit', () => assertPreparedBeforePrompt('resident'));
 
   /** The durable ledger exactly as it stands NOW — what a process killed at
