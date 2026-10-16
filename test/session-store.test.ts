@@ -381,6 +381,28 @@ describe('SessionStore', () => {
     expect(() => fresh.acquireLock(file)).not.toThrow();
     fresh.releaseLock(file);
   });
+
+  it('dispose keeps releasing every other lock past one whose release meets coordination contention, then reports that failure (#363 S03-2-02)', () => {
+    const store = new SessionStore(tmpDataDir());
+    const contested = seedSession(store, 'gru');
+    const other = seedSession(store, 'minion');
+    store.acquireLock(contested);
+    store.acquireLock(other);
+    const release = store.releaseLock.bind(store);
+    const spy = vi.spyOn(store, 'releaseLock').mockImplementation((file: string) => {
+      if (file === contested) throw new SessionLockCoordinationError(`coordination contention on ${file}`);
+      release(file);
+    });
+    let thrown: unknown = null;
+    try { store.dispose(); } catch (error) { thrown = error; } finally { spy.mockRestore(); }
+    expect(thrown).toBeInstanceOf(AggregateError);
+    expect((thrown as AggregateError).errors).toEqual([expect.any(SessionLockCoordinationError)]);
+    // The contested ownership is preserved; the other lock was still released.
+    const fresh = new SessionStore(store.dataDir);
+    expect(() => fresh.acquireLock(other)).not.toThrow();
+    expect(() => fresh.acquireLock(contested)).toThrow();
+    fresh.releaseLock(other);
+  });
 });
 
 describe('Perkins r1 regressions', () => {
