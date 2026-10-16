@@ -14,7 +14,8 @@ import { SessionStore } from '../src/sessions/store.js';
 import { PiAgentHandle, PI_CAPABILITIES } from '../src/runtime/pi-adapter.js';
 import { ClaudeCodeHandle, CLAUDE_CODE_CAPABILITIES } from '../src/runtime/claude-adapter.js';
 import { DirectiveCheckpointError, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveCompletion, recordDirectiveProducerCessation, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader } from '../src/runtime/directive-checkpoint.js';
-import { WorkerDisposalInProgressError } from '../src/runtime/registry.js';
+import { RuntimeRegistry, WorkerDisposalInProgressError } from '../src/runtime/registry.js';
+import { configPathFor, loadConfig } from '../src/config.js';
 import { DirectiveProgressService, DirectivePromptRefusedError, executeAcceptedDirective, promptRefusalUnproven, settleNativeDirective, surfaceDirectiveRecovery } from '../src/dispatch/directive-progress.js';
 import { recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute } from '../src/dispatch/directive-recovery.js';
 import { DirectiveRetirementError } from '../src/ledger/directives.js';
@@ -28,6 +29,8 @@ import { resolveGitCommit } from '../src/dispatch/perkins-review/artifacts.js';
 import { PacingGate } from '../src/runtime/pacing.js';
 
 const cleanups: (() => void)[] = [];
+/** The stubbed claude CLI (test/helpers/claude-double.mjs). */
+const DOUBLE = join(import.meta.dirname, 'helpers', 'claude-double.mjs');
 afterEach(() => { while (cleanups.length > 0) cleanups.pop()!(); });
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -1038,23 +1041,148 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(seen, route).toEqual([{ target: { agentId: 'logical-minion', sessionFile: f.file }, started: true }]);
   }
   it('#362 the fresh route prompts only after the durable native target and producer start commit', () => assertPreparedBeforePrompt('fresh'));
-  it('a minion on a runtime that cannot attest native admission is refused by name before any target binding or prompt (#424) #contract:native-directive-admission:claude-code', async () => {
+  it('a minion whose session cannot attest native admission is refused by name before any target binding or prompt (#424)', async () => {
     const f = await fixture();
     const prompts: string[] = [];
-    // The claude-code handle's directive surface: no producer attestation.
+    // A directive surface with no producer attestation (a legacy claude-code session).
     f.registry.spawn = async (_role, options = {}) => {
       f.spawns.push(options);
       return { role: 'minion', id: options.agentId ?? FIXTURE_MINION, sessionFile: f.file, capabilities: PI_CAPABILITIES,
         async prompt(text: string) { prompts.push(text); }, async steer() {}, async followUp() {}, subscribe: () => () => {},
         health: () => ({ state: 'idle' as const, lastActivity: null, sessionFile: f.file }),
-        inspectDirective: () => ({ state: 'unknown' as const, reason: 'claude-code CLI exposes no exact request acceptance/safe checkpoint continuation proof' }),
+        inspectDirective: () => ({ state: 'unknown' as const, reason: 'no attestation' }),
         async dispose() {} } as AgentHandle;
     };
     await executeAcceptedDirective(f.deps, f.intent.requestId);
     // A positive no-effect: failed by name, nothing bound, nothing prompted.
     expect(f.ledger.getDirective(f.intent.requestId)).toMatchObject({ state: 'failed', nativeTarget: null, nativeBinding: null,
-      failReason: expect.stringMatching(/cannot attest native directive admission or producer ownership .*need a pi-hosted minion/su) });
+      failReason: expect.stringMatching(/cannot attest native directive admission or producer ownership .*need a fresh session of the minion/su) });
     expect(prompts).toEqual([]);
+  });
+
+  /** A Claude Code minion's job (#424): the real adapter over the CLI
+   * double, through the real registry and the production executor. */
+  async function claudeDirectiveScene(kind: 'directive' | 'rebrief', text: string) {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-claude-directive-'));
+    const repo = makeFixtureRepo('claude-directive');
+    const home = mkdtempSync(join(tmpdir(), 'gru-claude-directive-home-'));
+    const db = new LedgerDb(dir);
+    const bus = new EventBus({});
+    const ledger = new LedgerApi(db.handle, { bus });
+    const notifications = new NotificationCenter({ ledger, bus });
+    const worktrees = new InMemoryWorktreePort(join(dir, 'lanes'), ledger);
+    ledger.addJob({ id: 'claude-job', repo: 'fixture', title: 'claude directive', briefing: 'approved original contract' });
+    ledger.setJobStatus('claude-job', 'working');
+    ledger.setJobPr('claude-job', 'https://example.test/pull/424');
+    const lane = await worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'claude-job' });
+    if (ledger.getWorktree(lane.id) === null) ledger.registerWorktree(lane);
+    writeFileSync(configPathFor(home), `workspace_root = "${dir}"\n[runtimes]\ndefault = "claude-code"\n`);
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    const store = new SessionStore(config.dataDir);
+    const log = join(home, 'double-log.jsonl');
+    process.env['CLAUDE_DOUBLE_LOG'] = log;
+    const registry = new RuntimeRegistry({ config, store, claude: { binary: DOUBLE, reviewSettingsFile: join(home, 'absent-review-settings.json') } });
+    registry.onAgentEvent((envelope) => {
+      if (envelope.phase === 'event' && envelope.event?.type === 'state' && ledger.getAgent(envelope.agentId) !== null) ledger.setAgentState(envelope.agentId, envelope.event.state);
+    });
+    // The job's minion: a Claude session on the lane, now at rest.
+    const first = await registry.spawn('minion', { cwd: lane.path, agentId: 'claude-minion' });
+    ledger.registerAgent({ id: first.id, role: 'minion', jobId: 'claude-job', sessionFile: first.sessionFile, parentage: 'top-level' });
+    await registry.disposeHandle(first);
+    ledger.setAgentState(first.id, 'disposed');
+    const intent = kind === 'rebrief'
+      ? ledger.beginRebriefIntent({ jobId: 'claude-job', requestId: 'claude-request', note: text, holder: 'gru' }).record
+      : ledger.beginDirectiveIntent({ jobId: 'claude-job', requestId: 'claude-request', directive: text, holder: 'gru' }).record;
+    const deps = { ledger, registry, worktrees, notifications, signal: new AbortController().signal, pendingProducerBlockers: () => [] };
+    const turns = (): readonly { readonly argv: readonly string[] }[] => existsSync(log)
+      ? readFileSync(log, 'utf8').trim().split('\n').filter((line) => line !== '').map((line) => JSON.parse(line) as { argv: string[] }) : [];
+    const cleanup = async (): Promise<void> => {
+      delete process.env['CLAUDE_DOUBLE_LOG'];
+      await registry.dispose(); store.dispose(); db.close(); repo.cleanup();
+      rmSync(dir, { recursive: true, force: true }); rmSync(home, { recursive: true, force: true });
+    };
+    return { db, ledger, lane, store, registry, intent, deps, sessionFile: first.sessionFile!, turns, cleanup };
+  }
+
+  async function assertClaudeDirectiveDelivery(kind: 'directive' | 'rebrief') {
+    const scene = await claudeDirectiveScene(kind, 'tool:Read finish the approved scope');
+    const { ledger, intent, lane } = scene;
+    try {
+      await executeAcceptedDirective(scene.deps, intent.requestId);
+      const row = ledger.getDirective(intent.requestId)!;
+      expect(row.failReason, kind).toBeNull();
+      expect(row.state, kind).toBe('settled');
+      // Admitted at the CLI's own echo, completed at its own result, with the lane HEAD.
+      expect(row.nativeBinding, kind).toMatchObject({ runtime: 'claude-code', agentId: 'claude-minion', userEntryId: expect.any(String) });
+      const proof = inspectDirectiveCheckpoint(row.nativeTarget!.sessionFile, ledger.directiveTurnIdentity(intent.requestId));
+      expect(proof, kind).toMatchObject({ state: 'terminal', ok: true });
+      const delivered = ledger.latestJobEventByRequestId('claude-job', 'job.delivered', intent.requestId)!;
+      expect(delivered.payload, kind).toMatchObject({ request_id: intent.requestId, agentId: 'claude-minion', sha: resolveGitCommit(lane.path, 'HEAD'),
+        native_completion: { binding: { runtime: 'claude-code' }, checkpoint_id: (proof as { checkpointId: string }).checkpointId } });
+      // The CLI child proved cessation: every physical producer ceased.
+      expect(inspectDirectiveProducers(row.nativeTarget!.sessionFile).map((owner) => owner.evidence), kind).toEqual(['ceased']);
+      // One CLI turn, with the echo and the permission ask: never a replay.
+      expect(scene.turns().map((turn) => turn.argv.includes('--replay-user-messages')), kind).toEqual([true]);
+    } finally { await scene.cleanup(); }
+  }
+  it('a Claude Code minion takes a Silas directive end to end: admitted at the CLI echo, fenced, settled with its native completion (#424) #contract:native-directive-admission:claude-code', () =>
+    assertClaudeDirectiveDelivery('directive'));
+  it('a Claude Code minion takes a re-brief end to end through a fresh session (#424)', () =>
+    assertClaudeDirectiveDelivery('rebrief'));
+
+  it('an interrupted Claude directive is never resumed or replayed: it stays admitted and Gru gets the recovery card (#424)', async () => {
+    const scene = await claudeDirectiveScene('directive', 'die-after-echo finish the approved scope');
+    const { ledger, intent } = scene;
+    try {
+      await executeAcceptedDirective(scene.deps, intent.requestId);
+      const service = new DirectiveProgressService(scene.deps);
+      try { service.reconsider(); await service.settled(); service.reconsider(); await service.settled(); }
+      finally { await service.dispose(); }
+      const row = ledger.getDirective(intent.requestId)!;
+      // Admitted by the CLI's echo; never delivered, never failed as a no-effect.
+      expect(row.nativeBinding).toMatchObject({ runtime: 'claude-code', userEntryId: expect.any(String) });
+      expect(row.state).not.toBe('settled');
+      expect(row.state).not.toBe('failed');
+      expect(ledger.latestJobEventByRequestId('claude-job', 'job.delivered', intent.requestId)).toBeNull();
+      expect(ledger.findNotificationByKind(`silas.directive-unreconciled.${intent.requestId}`, 'active')).not.toBeNull();
+      // One CLI turn: the interrupted directive was never sent again.
+      expect(scene.turns()).toHaveLength(1);
+    } finally { await scene.cleanup(); }
+  });
+
+  it('a service that died mid-directive leaves the CLI child an independent controller: a restarted service never replays it (#424)', async () => {
+    const releaseDir = mkdtempSync(join(tmpdir(), 'gru-claude-release-'));
+    const release = join(releaseDir, 'go');
+    const scene = await claudeDirectiveScene('directive', `held:${release} finish the approved scope`);
+    const { ledger } = scene;
+    const held = scene.intent;
+    const running = executeAcceptedDirective(scene.deps, held.requestId);
+    try {
+      // Wait until the CLI's echo is admitted: the turn is live, the child running.
+      for (let tries = 0; tries < 2000 && ledger.getDirective(held.requestId)?.nativeBinding?.userEntryId == null; tries += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(ledger.getDirective(held.requestId)?.nativeBinding).toMatchObject({ runtime: 'claude-code' });
+      // The service "dies" here: what it leaves is the durable ledger and the session's journals.
+      const snapshot = mkdtempSync(join(tmpdir(), 'gru-claude-crash-'));
+      mkdirSync(join(snapshot, 'ledger'));
+      scene.db.handle.prepare('VACUUM INTO ?').run(join(snapshot, 'ledger', 'ledger.db'));
+      const restartedDb = new LedgerDb(snapshot);
+      try {
+        const restarted = new LedgerApi(restartedDb.handle, { bus: new EventBus({}) });
+        const before = scene.turns().length;
+        const service = new DirectiveProgressService({ ...scene.deps, ledger: restarted, notifications: new NotificationCenter({ ledger: restarted, bus: new EventBus({}) }) });
+        try { service.reconsider(); await service.settled(); } finally { await service.dispose(); }
+        // The producer's CLI child has no proven cessation: UNKNOWN, never a replay.
+        expect(inspectDirectiveProducers(scene.sessionFile, ledger.directiveTurnIdentity(held.requestId)).map((owner) => owner.evidence)).toEqual(['unknown']);
+        expect(restarted.getDirective(held.requestId)?.state).not.toBe('settled');
+        expect(restarted.findNotificationByKind(`silas.directive-unreconciled.${held.requestId}`, 'active')).not.toBeNull();
+        expect(scene.turns()).toHaveLength(before);
+      } finally { restartedDb.close(); rmSync(snapshot, { recursive: true, force: true }); }
+    } finally {
+      writeFileSync(release, '');
+      await running.catch(() => {});
+      await scene.cleanup();
+      rmSync(releaseDir, { recursive: true, force: true });
+    }
   });
   it('#362 the resident route prompts only after the durable native target and producer start commit', () => assertPreparedBeforePrompt('resident'));
 
@@ -3036,7 +3164,7 @@ it('P28 production job incident from a different rebrief generation remains acti
   expect(f.ledger.getNotification(card.id)).toEqual(card);
 });
 
-describe('directive routing to a runtime without native directive checkpoints (claude-code)', () => {
+describe('directive routing to a claude-code minion whose session cannot attest admission (no GC session header, #424)', () => {
   async function assertClaudeMinionRefusal(route: 'resident' | 'respawned', kind: 'directive' | 'rebrief' = 'directive') {
     const f = await fixture(kind);
     // Real claude-code transcripts are raw stream-json frames, never a pi

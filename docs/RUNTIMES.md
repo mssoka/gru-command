@@ -16,8 +16,8 @@ install by editing `[runtimes] default`.
 
 [RUNTIME-PARITY.md](./RUNTIME-PARITY.md) holds the parity matrix between the
 two runtimes, its guard, the declared gaps and the rollout notes for changing
-the default. Read its gaps before switching an install: Silas directives and
-re-briefs need a pi-hosted minion (#424).
+the default. Both runtimes take Silas directives and re-briefs with exact
+admission (#424); an interrupted directive is never resumed on Claude Code.
 
 ## Capability matrix
 

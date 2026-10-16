@@ -6,6 +6,7 @@ import {
   closeSync,
   constants as fsConstants,
   createWriteStream,
+  fsyncSync,
   mkdirSync,
   openSync,
   readSync,
@@ -62,7 +63,26 @@ import type {
 import { ToolHeartbeat, toolHeartbeatIntervalMs } from './tool-heartbeat.js';
 import { disposeAll } from './disposal.js';
 import { CLAUDE_CODE_CAPABILITIES } from './capabilities.js';
-import { DirectiveCheckpointError, type DirectiveCheckpoint, type DirectiveTurnIdentity } from './directive-checkpoint.js';
+import {
+  assertClaudeDirectiveToolIntent,
+  DirectiveCheckpointError,
+  inspectDirectiveAdmission,
+  inspectDirectiveCheckpoint,
+  prepareClaudeDirectiveBinding,
+  prepareDirectiveProducer as prepareNativeDirectiveProducer,
+  readDirectiveBinding,
+  recordDirectiveAuthorityRefusal,
+  recordDirectiveCompletion,
+  recordDirectiveIndependentController,
+  recordDirectiveProducerCessation,
+  recordDirectiveToolRefusal,
+  type DirectiveCheckpoint,
+  type DirectiveNativeBinding,
+  type DirectiveProducer,
+  type DirectiveTurnIdentity,
+} from './directive-checkpoint.js';
+import { ClaudeDirectivePermissionChannel, privateClaudeDirectiveSettings, type ClaudeToolDecision, type ClaudeToolRequest } from './claude-directive.js';
+import { resolveGitCommit } from '../dispatch/perkins-review/artifacts.js';
 import { CLAUDE_NATIVE_PROVIDER } from '../provider-recovery/classify.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -454,6 +474,8 @@ export class ClaudeCodeRuntime implements AgentRuntime {
       // FILENAME and re-mints it on the first turn (the session never
       // registered CLI-side, so --resume would have nothing to resume).
       let established = false;
+      /** GC's header on a resumed transcript (#424), read from its bounded head. */
+      let resumedHeader: { readonly id: string; readonly cwd: string | null } | null = null;
       if (resumeFile !== undefined) {
         let head: string;
         try {
@@ -464,9 +486,13 @@ export class ClaudeCodeRuntime implements AgentRuntime {
           );
         }
         const extracted = extractSessionId(head);
+        resumedHeader = claudeHeaderOf(head);
         if (extracted !== null) {
           sessionId = extracted;
           established = true;
+        } else if (resumedHeader !== null) {
+          // Only GC's header so far: the CLI never registered the session.
+          sessionId = resumedHeader.id;
         } else if (statSync(resumeFile).size === 0) {
           const fromName =
             /_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/.exec(
@@ -497,13 +523,20 @@ export class ClaudeCodeRuntime implements AgentRuntime {
         // pi-standard naming: <ISO-ts-with-dashes>_<uuid>.jsonl
         const stamp = new Date().toISOString().replace(/[:.]/g, '-');
         sessionFile = join(dir, `${stamp}_${sessionId}.jsonl`);
-        writeFileSync(sessionFile, '', { encoding: 'utf-8', flag: 'wx' });
+        // A GC session header (#424): the exact session id and cwd a
+        // directive's admission and lane checks bind (pi's header shape).
+        writeFileSync(sessionFile, claudeSessionHeader(sessionId, cwd), { encoding: 'utf-8', flag: 'wx' });
         createdNewFile = sessionFile;
         if (!this.store.isHeld(sessionFile)) {
           this.store.acquireLock(sessionFile);
         }
       }
       this.activeFiles.add(sessionFile);
+      // Directive admission (#424) needs the GC session header (written above
+      // for a fresh session; read from the bounded head on resume) and a tool
+      // set the host can fence: ambient MCP tools would bypass the ask.
+      const nativeDirectives = reviewMode === undefined && ambientMcp.mode === 'none' &&
+        (resumeFile === undefined || (resumedHeader !== null && resumedHeader.id === sessionId && resumedHeader.cwd === cwd));
       const handle = new ClaudeCodeHandle(
         role,
         {
@@ -535,6 +568,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
             } : {}),
           killGraceMs: this.killGraceMs,
           resume: established,
+          nativeDirectives,
           ...(model !== undefined ? { model } : {}),
           ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
         },
@@ -606,6 +640,19 @@ export class ClaudeCodeRuntime implements AgentRuntime {
   }
 }
 
+/** One directive turn in flight (#424). */
+interface DirectiveTurn {
+  readonly directive: NonNullable<PromptOptions['directive']>;
+  readonly producer: DirectiveProducer;
+  readonly content: readonly StreamFrame[];
+  readonly settings: { readonly file: string; dispose(): void };
+  /** Settles once the CLI's echo was read back and published (or refused). */
+  admission: Promise<void> | null;
+  admitted: DirectiveNativeBinding | null;
+  failure: unknown;
+  completion: Promise<void> | null;
+}
+
 interface HandleParams {
   readonly sessionId: string;
   readonly sessionFile: string;
@@ -636,6 +683,8 @@ interface HandleParams {
   readonly reviewBridge?: ReviewMcpBridge;
   readonly killGraceMs: number;
   readonly resume: boolean;
+  /** The session can host native directives (#424): GC header, no ambient MCP. */
+  readonly nativeDirectives?: boolean;
   readonly model?: string;
   readonly thinkingLevel?: string;
   /** Issue #283: the bound GC-managed BMAD runtime, loaded as a plugin dir. */
@@ -918,6 +967,30 @@ export function isProjectMcpCopyName(sessionBase: string, name: string): boolean
 }
 
 /** The stdin user frame for one prompt (image blocks first, then text). */
+/** The GC session header a claude-code transcript starts with (#424). */
+export function claudeSessionHeader(sessionId: string, cwd: string): string {
+  return `${JSON.stringify({ type: 'session', version: 1, id: sessionId, timestamp: new Date().toISOString(), cwd, runtime: 'claude-code' })}\n`;
+}
+
+/** The session id and cwd of a transcript whose first line is GC's claude-code header. */
+function claudeHeaderOf(head: string): { readonly id: string; readonly cwd: string | null } | null {
+  const end = head.indexOf('\n');
+  if (end < 0) return null;
+  try {
+    const header = JSON.parse(head.slice(0, end)) as Record<string, unknown>;
+    if (header['type'] !== 'session' || header['runtime'] !== 'claude-code' || typeof header['id'] !== 'string' || header['id'] === '') return null;
+    return { id: header['id'], cwd: typeof header['cwd'] === 'string' ? header['cwd'] : null };
+  } catch {
+    return null;
+  }
+}
+
+/** A directive's exact user content (#424): always an array, text only, so
+ * the CLI's echo binds it byte for byte. */
+export function claudeDirectiveContent(text: string): readonly StreamFrame[] {
+  return [{ type: 'text', text }];
+}
+
 export function claudePromptFrame(text: string, images?: PromptOptions['images']): StreamFrame {
   let content: string | StreamFrame[] = text;
   if (images !== undefined && images.length > 0) {
@@ -989,6 +1062,15 @@ export class ClaudeCodeHandle implements AgentHandle {
   /** A turn is resolving its params (the project-MCP git check): the
    * operation slot is held exactly as by a live child. */
   private preparingTurn = false;
+  /** Directive producers this handle prepared, by request (#424). */
+  private readonly directiveProducers = new Map<string, DirectiveProducer>();
+  /** Guard refusals whose receipt could not be written yet (retried at cessation). */
+  private readonly pendingGuardRefusals = new Map<string, { readonly producer: DirectiveProducer; readonly toolUseId?: string; readonly reason: string }>();
+  /** Every producer's cessation receipt is written (#424). */
+  private producersCeased = false;
+  /** Native directive capability (#424): absent when the session cannot attest admission. */
+  readonly prepareDirectiveProducer?: (identity: DirectiveTurnIdentity) => DirectiveProducer;
+  readonly inspectDirective?: (identity: DirectiveTurnIdentity) => DirectiveCheckpoint;
 
   constructor(
     role: Role,
@@ -1019,6 +1101,44 @@ export class ClaudeCodeHandle implements AgentHandle {
     this.onDispose = onDispose;
     this.onInfraError = onInfraError;
     this.toolHeartbeat = new ToolHeartbeat((event) => this.emit(event), toolHeartbeatMs);
+    if (params.nativeDirectives === true && params.isolatedReview !== true) {
+      this.prepareDirectiveProducer = (identity) => this.prepareProducer(identity);
+      this.inspectDirective = (identity) => inspectDirectiveCheckpoint(this.sessionFile, identity);
+    }
+  }
+
+  /** Everything that decides what a directive turn may do (#424). */
+  private directiveAuthorityManifest(): string {
+    const p = this.params;
+    return createHash('sha256').update(JSON.stringify({
+      runtime: 'claude-code', role: this.role, cwd: p.cwd, binary: p.binary, systemPrompt: p.systemPrompt, tools: [...p.tools],
+      fileTools: p.fileTools === undefined ? null : [...p.fileTools], model: p.model ?? null, thinkingLevel: p.thinkingLevel ?? null,
+      ambientMcp: p.ambientMcp ?? { mode: 'none' }, managedPluginDir: p.managedPluginDir ?? null, workerVerification: p.workerVerification ?? null,
+    })).digest('hex');
+  }
+
+  private prepareProducer(identity: DirectiveTurnIdentity): DirectiveProducer {
+    this.assertLive();
+    const prior = this.directiveProducers.get(identity.requestId);
+    if (prior !== undefined) return prior;
+    if (this.live !== null || this.preparingTurn || this.compacting) {
+      throw new DirectiveCheckpointError('native producer preparation requires a genuinely idle claude-code session');
+    }
+    const producer = prepareNativeDirectiveProducer({ identity, agentId: this.id, sessionId: this.params.sessionId, sessionFile: this.sessionFile,
+      ...(this.store.isHeld(this.sessionFile) ? { lockOwner: this.store.ownedLockIdentity(this.sessionFile) } : {}) });
+    this.directiveProducers.set(identity.requestId, producer);
+    return producer;
+  }
+
+  /** A refused tool or authority boundary: durable receipt (or retried at cessation). */
+  private recordGuardRefusal(producer: DirectiveProducer, toolUseId: string | undefined, reason: string): void {
+    try {
+      if (toolUseId === undefined) recordDirectiveAuthorityRefusal(producer, reason);
+      else recordDirectiveToolRefusal(producer, toolUseId, reason);
+    } catch (error) {
+      this.pendingGuardRefusals.set(`${producer.incarnation}:${toolUseId ?? 'authority'}`, { producer, ...(toolUseId === undefined ? {} : { toolUseId }), reason });
+      this.log('error', 'directive guard refusal receipt failed; retried at cessation', { error: String(error) });
+    }
   }
 
   /**
@@ -1047,16 +1167,20 @@ export class ClaudeCodeHandle implements AgentHandle {
     };
   }
 
-  inspectDirective = (_identity: DirectiveTurnIdentity): DirectiveCheckpoint => ({ state: 'unknown', reason: 'claude-code CLI exposes no exact request acceptance/safe checkpoint continuation proof' });
-
+  /** Owner ruling 2026-10-16 (#424): a Claude directive is never resumed or
+   * replayed; an interrupted one is Gru's recovery decision. */
   async resumeDirective(): Promise<never> {
-    throw new DirectiveCheckpointError('claude-code cannot safely continue an interrupted directive without replay — Gru recovery decision required');
+    throw new DirectiveCheckpointError('claude-code never continues an interrupted directive (no native resume; no replay) — Gru recovery decision required');
   }
 
   async prompt(text: string, options: PromptOptions = {}): Promise<void> {
     this.assertLive();
     if (options.directive !== undefined) {
-      throw new DirectiveCheckpointError('claude-code cannot attest actual request admission; directive checkpoint capability unavailable');
+      if (this.prepareDirectiveProducer === undefined) {
+        throw new DirectiveCheckpointError('this claude-code session cannot attest directive admission (no GC session header, or ambient MCP tools the host cannot fence)');
+      }
+      if (options.images !== undefined && options.images.length > 0) throw new DirectiveCheckpointError('a claude-code directive carries text only');
+      if (text === '') throw new DirectiveCheckpointError('a claude-code directive needs text');
     }
     if (text === '' && (options.images === undefined || options.images.length === 0)) {
       throw new Error('empty prompt: nothing to send (no text, no images)');
@@ -1067,7 +1191,7 @@ export class ClaudeCodeHandle implements AgentHandle {
           '(the interface fallback serializes product callers; direct callers must wait)',
       );
     }
-    return this.runTurn(text, options.owner ?? null, options.images);
+    return this.runTurn(text, options.owner ?? null, options.images, options.directive);
   }
 
   /** Raw-handle alias: an idle steer is just a prompt (no mid-turn channel exists). */
@@ -1386,9 +1510,29 @@ export class ClaudeCodeHandle implements AgentHandle {
     // cleared the live turn slot. Non-policy evidence semantics are unchanged.
     if (this.verificationChildren.size !== 0) return 'unknown';
     if (this.cessationKind === 'close-observed' || this.cessationKind === 'close-observed-late' || this.cessationKind === 'no-child') {
-      return 'ceased';
+      return this.recordProducerCessation() ? 'ceased' : 'unknown';
     }
     return 'unknown'; // 'live' mid-disposal, 'error', or 'deadline' without a late close
+  }
+
+  /** The directive producers' physical receipts (#424): guard refusals still
+   * owed, then cessation, once the original child's close is observed. A
+   * receipt that cannot be written keeps the evidence UNKNOWN (retried). */
+  private recordProducerCessation(): boolean {
+    if (this.producersCeased) return true;
+    try {
+      for (const [key, refusal] of this.pendingGuardRefusals) {
+        if (refusal.toolUseId === undefined) recordDirectiveAuthorityRefusal(refusal.producer, refusal.reason);
+        else recordDirectiveToolRefusal(refusal.producer, refusal.toolUseId, refusal.reason);
+        this.pendingGuardRefusals.delete(key);
+      }
+      for (const producer of this.directiveProducers.values()) recordDirectiveProducerCessation(producer);
+    } catch (error) {
+      this.log('error', 'directive producer cessation receipt failed; ownership stays UNKNOWN until it is written', { error: String(error) });
+      return false;
+    }
+    this.producersCeased = true;
+    return true;
   }
 
   private assertLive(): void {
@@ -1685,7 +1829,11 @@ export class ClaudeCodeHandle implements AgentHandle {
     });
   }
 
-  private runTurn(text: string, owner: string | null, images?: PromptOptions['images']): Promise<void> {
+  private runTurn(text: string, owner: string | null, images?: PromptOptions['images'], directive?: PromptOptions['directive']): Promise<void> {
+    // A directive is prepared before any native I/O and before the turn takes
+    // the slot (#424): its authority holds, its producer is prepared, and its
+    // exact association is durable. A refusal here leaves no effect.
+    const turn = directive === undefined ? null : this.prepareDirectiveTurn(text, directive);
     this.setState('spawning');
     // The accepted prompt is the pending turn from this moment — through a
     // project-mode check too — so a supervisor capture never misses it.
@@ -1693,9 +1841,11 @@ export class ClaudeCodeHandle implements AgentHandle {
       text,
       owner,
       ...(images !== undefined && images.length > 0 ? { images } : {}),
+      ...(directive !== undefined ? { directive } : {}),
     };
     const accepted = this.livePrompt;
-    return this.withTurnParams((params) => this.spawnTurn(params), (failure) => {
+    return this.withTurnParams((params) => this.spawnTurn(params, turn), (failure) => {
+      turn?.settings.dispose();
       // Error first, exactly as a failed spawn reports: an error-time capture
       // (the supervisor's restart snapshot) still sees the accepted prompt.
       if (failure !== null) {
@@ -1711,7 +1861,87 @@ export class ClaudeCodeHandle implements AgentHandle {
     });
   }
 
-  private spawnTurn(params: HandleParams): Promise<void> {
+  private prepareDirectiveTurn(text: string, directive: NonNullable<PromptOptions['directive']>): DirectiveTurn {
+    directive.beforeAdmission();
+    const producer = this.prepareProducer(directive.identity);
+    const content = claudeDirectiveContent(text);
+    prepareClaudeDirectiveBinding({ identity: directive.identity, agentId: this.id, sessionId: this.params.sessionId, sessionFile: this.sessionFile,
+      content, authorityManifest: this.directiveAuthorityManifest() });
+    const settings = privateClaudeDirectiveSettings(this.params.tools, this.params.workerVerification);
+    return { directive, producer, content, settings, admission: null, admitted: null, failure: null, completion: null };
+  }
+
+  private failDirective(turn: DirectiveTurn, error: unknown, abortTurn: (detail: string) => void): void {
+    turn.failure ??= error;
+    abortTurn(`directive refused: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  /** Admission at the CLI's own echo; completion at the turn's own result. Each
+   * reads back the frame only once it is durable in the transcript. */
+  private followDirectiveFrame(turn: DirectiveTurn, frame: StreamFrame, durable: Promise<void>, abortTurn: (detail: string) => void): void {
+    const { directive, producer } = turn;
+    if (frame['type'] === 'user' && frame['isReplay'] === true) {
+      if (turn.admission !== null) {
+        this.failDirective(turn, new DirectiveCheckpointError('a second prompt entered the directive turn'), abortTurn);
+        return;
+      }
+      turn.admission = durable.then(() => {
+        const binding = inspectDirectiveAdmission(this.sessionFile, directive.identity);
+        directive.onAdmitted(binding);
+        turn.admitted = binding;
+      }).catch((error: unknown) => this.failDirective(turn, error, abortTurn));
+      return;
+    }
+    if (frame['type'] === 'result' && frame['subtype'] === 'success' && frame['is_error'] === false) {
+      // HEAD now, before anything can move the lane; only its durable
+      // terminal checkpoint is associated afterwards.
+      let head: string | null = null;
+      try { head = resolveGitCommit(this.params.cwd, 'HEAD'); }
+      catch (error) { this.log('warn', 'native completion HEAD unavailable; current candidate gates remain owed', { error: String(error) }); }
+      turn.completion = durable.then(async () => {
+        await turn.admission;
+        if (turn.failure !== null || turn.admitted === null) return;
+        // Completed original work may be historical: verify native authority, not today's candidacy.
+        if (readDirectiveBinding(this.sessionFile, directive.identity.requestId)?.authorityManifest !== this.directiveAuthorityManifest()) {
+          this.recordGuardRefusal(producer, undefined, 'live native directive role/tools/model authority changed before completion');
+          throw new DirectiveCheckpointError('live native directive role/tools/model authority changed before completion');
+        }
+        const proof = inspectDirectiveCheckpoint(this.sessionFile, directive.identity);
+        if (proof.state !== 'terminal' || !proof.ok) {
+          throw new DirectiveCheckpointError(`native completion checkpoint unavailable: ${proof.state === 'unknown' ? proof.reason : proof.state === 'terminal' ? proof.error ?? 'failed' : 'not terminal'}`);
+        }
+        recordDirectiveCompletion(producer, proof.checkpointId, head);
+      }).catch((error: unknown) => {
+        turn.failure ??= error;
+        this.log('error', 'claude directive completion was not recorded', { request: directive.identity.requestId, error: String(error) });
+      });
+    }
+  }
+
+  /** The tool fence (#424): admission published, authority current, the exact
+   * intent durable in the admitted turn. Anything else refuses the tool and
+   * ends the turn, with a durable guard receipt. */
+  private decideDirectiveTool(turn: DirectiveTurn, request: ClaudeToolRequest, durable: Promise<void>, abortTurn: (detail: string) => void): Promise<ClaudeToolDecision> {
+    return durable.then(async (): Promise<ClaudeToolDecision> => {
+      await turn.admission;
+      if (turn.failure !== null || turn.admitted === null) {
+        throw new DirectiveCheckpointError('native directive actual admission has not been published; tool effects refused');
+      }
+      turn.directive.beforeAdmission();
+      if (readDirectiveBinding(this.sessionFile, turn.directive.identity.requestId)?.authorityManifest !== this.directiveAuthorityManifest()) {
+        throw new DirectiveCheckpointError('live native directive role/tools/model authority changed before effect');
+      }
+      assertClaudeDirectiveToolIntent(this.sessionFile, turn.directive.identity, request.toolUseId, request.toolName, request.input);
+      return { allow: true };
+    }).catch((error: unknown): ClaudeToolDecision => {
+      const reason = error instanceof Error ? error.message : String(error);
+      this.recordGuardRefusal(turn.producer, request.toolUseId, reason);
+      this.failDirective(turn, error, abortTurn);
+      return { allow: false, message: `Refused by the directive's authority fence: ${reason}` };
+    });
+  }
+
+  private spawnTurn(params: HandleParams, turn: DirectiveTurn | null = null): Promise<void> {
     const translator = new ClaudeTurnTranslator();
     let turnStarted = false;
     const livePrompt = this.livePrompt;
@@ -1774,10 +2004,32 @@ export class ClaudeCodeHandle implements AgentHandle {
       });
 
       let permissions: ClaudeVerificationPermissionChannel | undefined;
+      let directivePermissions: ClaudeDirectivePermissionChannel | undefined;
+      // A directive refusal ends the turn: no further effect is allowed.
+      const abortTurn = (detail: string): void => {
+        failTurn(detail);
+        try { child?.stdin?.end(); } catch { /* already closed */ }
+        try { child?.kill('SIGTERM'); } catch { /* already gone */ }
+      };
       const handleFrame = (frame: StreamFrame): void => {
-        permissions?.ingest(frame);
-        if (permissions !== undefined && frame['type'] === 'result') child?.stdin?.end();
-        transcript.write(`${JSON.stringify(frame)}\n`);
+        if (turn !== null) {
+          // Durable before acted on (#424): each frame is written and synced
+          // before its admission, tool fence or completion step reads it back.
+          const durable = new Promise<void>((resolveDurable, rejectDurable) => {
+            transcript.write(`${JSON.stringify(frame)}\n`, (error?: Error | null) => {
+              if (error != null) { rejectDurable(error); return; }
+              try { fsyncSync((transcript as unknown as { readonly fd: number }).fd); resolveDurable(); } catch (syncError) { rejectDurable(syncError); }
+            });
+          });
+          durable.catch(() => { /* each consumer observes it */ });
+          directivePermissions?.ingest(frame, durable);
+          if (frame['type'] === 'result') child?.stdin?.end();
+          this.followDirectiveFrame(turn, frame, durable, abortTurn);
+        } else {
+          permissions?.ingest(frame);
+          if (permissions !== undefined && frame['type'] === 'result') child?.stdin?.end();
+          transcript.write(`${JSON.stringify(frame)}\n`);
+        }
         for (const event of translator.ingest(frame)) {
           if (event.type === 'tool_start') this.toolHeartbeat.started(event.callId, event.tool);
           else if (event.type === 'tool_end') this.toolHeartbeat.ended(event.callId);
@@ -1813,12 +2065,15 @@ export class ClaudeCodeHandle implements AgentHandle {
           // the CLI's --replay-user-messages: it also echoes the permission
           // control_responses the worker-verification channel writes, which
           // that channel rightly fails closed on as foreign frames.
-          transcript.write(`${JSON.stringify({
-            ...claudePromptFrame(text, images),
-            session_id: params.sessionId,
-            timestamp: new Date().toISOString(),
-            gc_prompt: true,
-          })}\n`);
+          // A directive turn's record is the CLI's own echo (#424).
+          if (turn === null) {
+            transcript.write(`${JSON.stringify({
+              ...claudePromptFrame(text, images),
+              session_id: params.sessionId,
+              timestamp: new Date().toISOString(),
+              gc_prompt: true,
+            })}\n`);
+          }
           this.setState('streaming');
           this.emit({ type: 'turn_start' });
           this.sessionEstablished = true;
@@ -1834,7 +2089,13 @@ export class ClaudeCodeHandle implements AgentHandle {
       });
 
       try {
-        child = (params.spawnProcess ?? spawn)(params.binary, claudeTurnArgs(params, this.sessionEstablished), {
+        const args = turn === null
+          ? claudeTurnArgs(params, this.sessionEstablished)
+          : [...claudeTurnArgs({ ...params, verificationSettingsFile: turn.settings.file }, this.sessionEstablished), '--replay-user-messages'];
+        // The CLI child is an independent physical controller of the turn:
+        // only its observed close (at this handle's cessation) proves it gone.
+        if (turn !== null) recordDirectiveIndependentController(turn.producer);
+        child = (params.spawnProcess ?? spawn)(params.binary, args, {
           cwd: params.cwd,
           stdio: ['pipe', 'pipe', 'pipe'],
           ...(params.reviewAuthEnv !== undefined ? { env: params.reviewAuthEnv } : {}),
@@ -1863,10 +2124,23 @@ export class ClaudeCodeHandle implements AgentHandle {
       });
       child.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
         parser.end();
+        turn?.settings.dispose();
         transcript.end(() => {
+          // A directive's admission and completion steps finish before the turn settles.
+          const steps = turn === null ? Promise.resolve() : Promise.allSettled([turn.admission, turn.completion]).then(() => undefined);
+          void steps.then(() => finishTurn(code, signal));
+        });
+      });
+      const finishTurn = (code: number | null, signal: NodeJS.Signals | null): void => {
+        {
           if (this.disposed) {
             settle(new Error('agent session disposed'));
             return;
+          }
+          // A directive whose admission, fence or completion failed is no
+          // success, whatever the CLI reported.
+          if (turn !== null && turn.failure !== null && !failed) {
+            failTurn(`directive turn refused: ${turn.failure instanceof Error ? turn.failure.message : String(turn.failure)}`);
           }
           const result = translator.result;
           if (!failed && result !== null && !turnStarted) {
@@ -1896,19 +2170,28 @@ export class ClaudeCodeHandle implements AgentHandle {
             );
           }
           settle(new Error(failure));
-        });
-      });
+        }
+      };
 
-      // Policy children keep stdin open for native permission responses; other
-      // turns retain the existing single-frame/EOF transport.
+      // Policy and directive children keep stdin open for native permission
+      // responses; other turns retain the existing single-frame/EOF transport.
       const send = (): void => {
-        const frame = `${JSON.stringify(claudePromptFrame(text, images))}\n`;
-        child.stdin?.write(frame, (error?: Error | null) => {
+        const prompt = turn === null ? claudePromptFrame(text, images) : { type: 'user', message: { role: 'user', content: turn.content } };
+        child.stdin?.write(`${JSON.stringify(prompt)}\n`, (error?: Error | null) => {
           if (error != null) this.log('error', 'failed to write prompt frame to claude stdin', { error: String(error) });
-          if (permissions === undefined) child.stdin?.end();
+          if (permissions === undefined && directivePermissions === undefined) child.stdin?.end();
         });
       };
-      if (params.workerVerification !== undefined && !params.isolatedReview) {
+      if (turn !== null) {
+        // Every tool asks the host (#424); the lane's verification policy rides along.
+        directivePermissions = new ClaudeDirectivePermissionChannel(child, {
+          fail: (message) => abortTurn(message),
+          decide: (request, durable) => this.decideDirectiveTool(turn, request, durable, abortTurn),
+          ...(params.workerVerification !== undefined ? { verification: params.workerVerification } : {}),
+        });
+        directivePermissions.start();
+        if (!failed) send();
+      } else if (params.workerVerification !== undefined && !params.isolatedReview) {
         permissions = new ClaudeVerificationPermissionChannel(child, params.workerVerification, (message) => {
           failTurn(message); child.stdin?.end();
         }, () => undefined);

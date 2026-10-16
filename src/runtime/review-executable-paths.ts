@@ -2700,6 +2700,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/roll/server.js",
   "dist/roll/state.js",
   "dist/runtime/claude-adapter.js",
+  "dist/runtime/claude-directive.js",
   "dist/runtime/claude-model.js",
   "dist/runtime/claude-review-settings.js",
   "dist/runtime/claude-verification-settings.js",

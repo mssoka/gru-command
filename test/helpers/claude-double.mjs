@@ -8,8 +8,12 @@
  *
  * Sentinels (in the prompt text):
  *   "hold:<abs path>"  — emit init, then wait for that file to appear
+ *   "held:<abs path>"  — anywhere in the prompt: the same wait (after the
+ *                        echo of a directive turn), then an ordinary answer
  *                        before completing the turn (25s safety exit 4)
  *   "crash"            — stderr + exit 2, no result frame
+ *   "die-after-echo"   — init, the prompt echo and a tool_use, then exit 2
+ *                        with no result (an interrupted directive turn)
  *   "no-result-ok"     — exit 0 with no result frame (protocol violation)
  *   "api-error"        — the real CLI's synthetic API-error assistant
  *                        message (is_api_error_message) + is_error result
@@ -23,6 +27,13 @@
  *                        (session identity never announced)
  *   "think"            — thinking deltas + thinking block before text
  *   "tool:<name>"      — a tool_use/tool_result loop before the answer
+ *   "tool-error:<name>" — the same loop whose tool_result is an error
+ *
+ * With --replay-user-messages (a directive turn, #424) the double echoes the
+ * prompt after init (`isReplay: true`, a uuid) and echoes every
+ * control_response the host writes; with --permission-prompt-tool stdio and a
+ * --settings `permissions.ask` naming the tool, every tool_use asks the host
+ * (can_use_tool) after its assistant frame and honours the decision.
  *   otherwise          — echo turn: "echo: <prompt>"
  *
  * Env knobs:
@@ -48,11 +59,14 @@
  *   CLAUDE_DOUBLE_WORKFLOW_CANDIDATE=1 emit one security finding plus verifier response
  *   CLAUDE_DOUBLE_GRU_ACT={baseUrl,token,detail} on a wake prompt, POST the
  *                               notification disposition itself (Gru-authored action)
+ *   CLAUDE_DOUBLE_ECHO=mutate|skip  the prompt echo carries other text, or never comes
+ *   CLAUDE_DOUBLE_TOOL_INPUT_DRIFT=1 the permission request names other input than the tool_use
  */
 import process from 'node:process';
 import { Buffer } from 'node:buffer';
 import { appendFileSync, existsSync, readFileSync, statSync } from 'node:fs';
 import { spawnSync, spawn as childSpawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
 import { clearTimeout as clearTimer, setTimeout as setTimer } from 'node:timers';
@@ -89,6 +103,7 @@ process.stdin.setEncoding('utf8');
 let pendingInput = ''; let running = false;
 const responses = new Map();
 const headlessHost = flagValue('--permission-prompt-tool') === 'stdio';
+const replay = argv.includes('--replay-user-messages');
 const launch = () => {
   if (running) return;
   running = true;
@@ -106,6 +121,7 @@ process.stdin.on('data', (chunk) => {
     if (frame.type === 'control_request' && frame.request?.subtype === 'initialize') {
       out({ type: 'control_response', response: { subtype: 'success', request_id: frame.request_id, response: {} } });
     } else if (frame.type === 'control_response') {
+      if (replay) out(frame);
       responses.get(frame.response.request_id)?.(frame.response.response);
       responses.delete(frame.response.request_id);
     } else if (frame.type === 'user') launch();
@@ -168,6 +184,7 @@ function initFrame() {
 function resultFrame(text, isError) {
   return {
     type: 'result',
+    uuid: randomUUID(),
     subtype: isError ? 'error_during_execution' : 'success',
     is_error: isError,
     duration_ms: 1,
@@ -183,6 +200,7 @@ function resultFrame(text, isError) {
 function assistantFrame(blocks) {
   return {
     type: 'assistant',
+    uuid: randomUUID(),
     session_id: sessionId,
     message: {
       id: 'msg_double',
@@ -231,7 +249,20 @@ async function emitThinkingTurn(text) {
   await emitTextTurn(text);
 }
 
-async function emitToolTurn(toolName) {
+/** The host's decision on one tool, when the settings ask it (stdio prompt). */
+async function askHost(toolName, callId, input) {
+  const settingsFile = flagValue('--settings');
+  const settings = settingsFile ? JSON.parse(readFileSync(settingsFile, 'utf8')) : {};
+  if (!headlessHost || !settings.permissions?.ask?.includes(toolName)) return { behavior: 'allow' };
+  const requestId = `perm-${randomUUID()}`;
+  const asked = process.env.CLAUDE_DOUBLE_TOOL_INPUT_DRIFT === '1' ? { ...input, drifted: true } : input;
+  return await new Promise((resolve) => {
+    responses.set(requestId, resolve);
+    out({ type: 'control_request', request_id: requestId, request: { subtype: 'can_use_tool', tool_name: toolName, tool_use_id: callId, input: asked } });
+  });
+}
+
+async function emitToolTurn(toolName, toolError = false) {
   const callId = 'toolu_double_1';
   if (partials) {
     streamEvent({
@@ -258,17 +289,31 @@ async function emitToolTurn(toolName) {
       { type: 'tool_use', id: callId, name: toolName, input: { command: 'ls' } },
     ]),
   );
+  const decision = await askHost(toolName, callId, { command: 'ls' });
   const holdMs = Number(process.env['CLAUDE_DOUBLE_TOOL_HOLD_MS'] ?? '0');
   if (Number.isFinite(holdMs) && holdMs > 0) await delay(holdMs);
+  const denied = decision?.behavior !== 'allow';
   out({
     type: 'user',
+    uuid: randomUUID(),
     session_id: sessionId,
     message: {
       role: 'user',
-      content: [{ type: 'tool_result', tool_use_id: callId, content: 'ok', is_error: false }],
+      content: [{ type: 'tool_result', tool_use_id: callId, content: denied ? (decision?.message ?? 'denied') : toolError ? 'tool failed' : 'ok', is_error: denied || toolError }],
     },
   });
-  await emitTextTurn('tool done');
+  await emitTextTurn(denied ? 'tool refused' : 'tool done');
+}
+
+/** The CLI's own echo of the prompt it accepted (--replay-user-messages). */
+function echoPrompt() {
+  if (!replay || process.env.CLAUDE_DOUBLE_ECHO === 'skip') return;
+  const frame = stdinText.split('\n').filter((line) => line.trim() !== '').map((line) => JSON.parse(line)).find((entry) => entry.type === 'user');
+  if (frame === undefined) return;
+  const message = process.env.CLAUDE_DOUBLE_ECHO === 'mutate'
+    ? { ...frame.message, content: [{ type: 'text', text: 'not what the host sent' }] }
+    : frame.message;
+  out({ type: 'user', message, session_id: sessionId, parent_tool_use_id: null, uuid: randomUUID(), timestamp: new Date().toISOString(), isReplay: true });
 }
 
 /** Minimal MCP stdio client: newline-delimited JSON-RPC to the bridge
@@ -391,6 +436,13 @@ async function run() {
     out(init);
   } else {
     out(initFrame());
+    echoPrompt();
+  }
+
+  if (prompt.includes('die-after-echo')) {
+    out(assistantFrame([{ type: 'tool_use', id: 'toolu_interrupted', name: 'Bash', input: { command: 'make' } }]));
+    process.stderr.write('double died mid-turn\n');
+    process.exit(2);
   }
 
   const gruAct = process.env['CLAUDE_DOUBLE_GRU_ACT'];
@@ -422,6 +474,8 @@ async function run() {
     const settingsFile = flagValue('--settings');
     const settings = settingsFile ? JSON.parse(readFileSync(settingsFile, 'utf8')) : {};
     let reason = '';
+    // The real CLI announces the tool_use before its hook and permission ask.
+    out(assistantFrame([{ type: 'tool_use', id: 'verification-call', name: 'Bash', input: { command } }]));
     const hook = settings.hooks?.PreToolUse?.[0]?.hooks?.[0]?.command;
     if (hook && process.env.CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL !== '1') {
       const result = spawnSync('/bin/sh', ['-c', hook], { input: JSON.stringify({ tool_name: 'Bash', tool_input: { command } }), encoding: 'utf8' });
@@ -448,8 +502,7 @@ async function run() {
       answer = execution.stdout + execution.stderr;
       if (execution.status !== 0) reason = answer;
     }
-    out(assistantFrame([{ type: 'tool_use', id: 'verification-call', name: 'Bash', input: { command } }]));
-    out({ type: 'user', session_id: sessionId, message: { role: 'user', content: [
+    out({ type: 'user', uuid: randomUUID(), session_id: sessionId, message: { role: 'user', content: [
       { type: 'tool_result', tool_use_id: 'verification-call', content: answer, is_error: !!reason },
     ] } });
     if (prompt !== '/compact') { await emitTextTurn('verification attempt settled'); out(resultFrame('verification attempt settled', false)); return; }
@@ -584,8 +637,8 @@ async function run() {
     return;
   }
 
-  if (prompt.startsWith('hold:')) {
-    const releaseFile = prompt.slice('hold:'.length).trim();
+  if (prompt.startsWith('hold:') || prompt.includes('held:')) {
+    const releaseFile = prompt.startsWith('hold:') ? prompt.slice('hold:'.length).trim() : prompt.split('held:')[1].split(/\s/)[0];
     const deadline = Date.now() + 25_000;
     while (!existsSync(releaseFile)) {
       if (Date.now() > deadline) {
@@ -663,6 +716,11 @@ async function run() {
   if (prompt.includes('think')) {
     await emitThinkingTurn('thought about it');
     out(resultFrame('thought about it', false));
+    return;
+  }
+  if (prompt.includes('tool-error:')) {
+    await emitToolTurn(prompt.split('tool-error:')[1].split(/\s/)[0] || 'Bash', true);
+    out(resultFrame('tool failed', false));
     return;
   }
   if (prompt.includes('tool:')) {
