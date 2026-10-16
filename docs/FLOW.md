@@ -398,11 +398,18 @@ verification budget.
   other runners.
 - **Compatible gates reuse one build.** A declared `npm run build` step
   may be satisfied by the immediately preceding successful build in the
-  same lane when head, clean tree, configuration, environment and the
-  whole `dist/` tree digest are all unchanged — every other step still
-  runs and is reported. A second gate that arrives while that lane's
-  build is in flight never inherits it (`build-in-flight`) and runs its
-  own build.
+  same lane when head, clean tree, configuration, installed dependencies
+  (npm's `node_modules/.package-lock.json`), environment and the whole
+  `dist/` tree are all unchanged — every other step still runs and is
+  reported. Reuse is ON by default: a deliberate policy (#318; owner
+  decision 2026-10-16, #360 A1), switched off only in code. The proof is
+  taken when a gate's BUILD STEP comes, not when the gate was admitted: a
+  build step that comes while that lane's build is in flight never inherits
+  it (`build-in-flight`) and runs its own build, while a gate admitted
+  during that build whose own build step comes after it finished may
+  inherit it — its inputs are proven identical at that moment (#360 R5-B9).
+  A dist tree holding a link or any non-regular entry is no output proof
+  (`outputs-missing`).
 - **Project harness budgets compose with the run budget.** A repo may
   classify process-heavy integration files with their own finite ceilings
   and a smaller worker cap (gru-command: 120s and two workers, see

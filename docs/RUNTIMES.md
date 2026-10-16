@@ -303,6 +303,16 @@ runs at wizard/boot time, never on a hot path.
   policy; resolution ends at `"default"` — Claude Code's own model/effort —
   when nothing else applies. Explicit `[runtimes.claude-code]` tiers and
   spawn options are never filtered.
+- **Deliberate policy — pi's own default model precedence (owner ruling
+  2026-10-16, #360 A3).** When the resolved reference is `"default"`, pi's
+  own precedence decides, unchanged by GC. A resumed session's persisted
+  model comes first. Then comes the settings default, read through pi's
+  SettingsManager exactly as pi merges it: the project's `.pi/settings.json`
+  over the global agent `settings.json`. Last is pi's own first available
+  model. An explicit `"provider/model"` at any tier always wins over all
+  three. This mirrors the harness rather than a GC choice, so a project
+  setting or a resumed session may select a different model than a fresh
+  global spawn would.
 - **Known limit — resumed sessions (issue #24).** A resumed session's
   persisted model outranks the settings default, so a saved model whose
   provider has no credentials fails at prompt time instead of falling back

@@ -184,7 +184,7 @@ const PINS: Record<string, number> = {
   'artifact-context.test.ts': 34,
   'attachments.test.ts': 28,
 
-  'awareness.test.ts': 134,
+  'awareness.test.ts': 137,
   'awareness-adversarial.test.ts': 2,
 
 
@@ -268,7 +268,7 @@ const PINS: Record<string, number> = {
   'pacing-admission.test.ts': 14,
   'pacing.test.ts': 33,
   'patch-vitest-rpc-timeout.test.ts': 11,
-  'perkins-admission-preflight.test.ts': 83,
+  'perkins-admission-preflight.test.ts': 84,
   'perkins-admission-sysctl.test.ts': 1,
   'perkins-builtin-wave.test.ts': 268,
   'perkins-checkpoint-enumeration.test.ts': 1,
@@ -311,7 +311,7 @@ const PINS: Record<string, number> = {
   'review-inputs-handoff.test.ts': 10,
   'review-inputs-wave.test.ts': 1,
   'review-mcp-transport.test.ts': 11,
-  'stage1-baseline-scope.test.ts': 10,
+  'stage1-baseline-scope.test.ts': 11,
   'review-runtime-swap.test.ts': 22,
   'review-source-preflight.test.ts': 13,
   'review-supersession.test.ts': 65,
@@ -357,7 +357,7 @@ const PINS: Record<string, number> = {
   'transcripts.test.ts': 16,
   'uploads-dir.test.ts': 3,
   'verification-evidence.test.ts': 13,
-  'verification-build-reuse.test.ts': 30,
+  'verification-build-reuse.test.ts': 32,
   'verification-scheduler.test.ts': 58,
   'verification-server.test.ts': 47,
   'verify-perkins-resource.test.ts': 3,

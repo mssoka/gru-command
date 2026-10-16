@@ -394,6 +394,15 @@ function promptSafe(value: string): string {
   return redactedText(value, 2_000);
 }
 
+/** promptSafe over every string inside a value (mailbox metadata is external
+ * data too: #360 R5-B10). */
+function promptSafeDeep(value: unknown): unknown {
+  if (typeof value === 'string') return promptSafe(value);
+  if (Array.isArray(value)) return value.map(promptSafeDeep);
+  if (typeof value === 'object' && value !== null) return Object.fromEntries(Object.entries(value).map(([key, inner]) => [key, promptSafeDeep(inner)]));
+  return value;
+}
+
 function clampLine(line: string, max: number): string {
   // Ledger titles, details and check names are external data, not prompt
   // structure. No metadata may create another service-context line.
@@ -1020,7 +1029,7 @@ export class GruAwareness {
       renderedRows.set(id, row);
       if (this.mailbox?.captureRow(row) != null) {
         const item = JSON.parse(row.detail!) as MailboxItem;
-        notes.push({ id, displayId: row.id, mailbox: true, line: `- [${row.id}] ${JSON.stringify({ id: item.id, subject: item.subject, title: item.title, notificationIds: item.notificationIds, basis: item.basis, reasons: item.reasons.map((reason) => reason.label), state: item.state, owner: item.owner, dependency: item.disposition?.dependency ?? null, recheckAt: item.disposition?.recheckAt ?? null, receipt: item.receipt, references: item.references, restrictions: item.restrictions.length === 0 ? 'none recorded' : `${item.restrictions.length} recorded restrictions; inspect GET /api/mailbox before acting` })}` });
+        notes.push({ id, displayId: row.id, mailbox: true, line: `- [${row.id}] ${JSON.stringify(promptSafeDeep({ id: item.id, subject: item.subject, title: item.title, notificationIds: item.notificationIds, basis: item.basis, reasons: item.reasons.map((reason) => reason.label), state: item.state, owner: item.owner, dependency: item.disposition?.dependency ?? null, recheckAt: item.disposition?.recheckAt ?? null, receipt: item.receipt, references: item.references, restrictions: item.restrictions.length === 0 ? 'none recorded' : `${item.restrictions.length} recorded restrictions; inspect GET /api/mailbox before acting` }))}` });
         return;
       }
       notes.push({ id, displayId: row.id, mailbox: false, line: `- ${icon} [${row.id}] title=${JSON.stringify(promptSafe(row.title))}${detail} (routing: ${row.routing})` });
@@ -1841,26 +1850,33 @@ export class GruAwareness {
     const wakes = this.ledger.listEventsAfter(this.lastOwnerSeq, { kinds: ['gru.wake'], limit: 101 });
     capped('fires', wakes.length, 'wake delivered');
     const boardActions = this.ledger.listEventsAfter(this.lastOwnerSeq, { kinds: [...MORNING_ACTION_KINDS], limit: 101 });
-    const resolutions = this.ledger.listEventsAfter(this.lastOwnerSeq, { kinds: ['notification.resolved'], limit: 101, order: 'desc' });
     // Decision (GH-104, docs/decisions/awareness-digest-semantics.md): only
     // durable `notification.resolved` rows attributed `by: 'gru'` are Gru
     // ACTIONS. Deliveries, status changes, verdicts and non-Gru resolutions
-    // are passive board ACTIVITY and are labeled separately.
-    const gruResolutions = resolutions.filter((event) => payloadOf(event)['by'] === 'gru');
-    const activityCount = boardActions.length + (resolutions.length - gruResolutions.length);
+    // are passive board ACTIVITY and are labeled separately. Each category
+    // counts in its own 101-row window, never a share of a mixed one (#360
+    // R5-B11): one Gru action among 100 others is 1, and an older one is
+    // still found.
+    const resolved = (payload: { key: string; equals?: string; notEquals?: string }) =>
+      this.ledger.listEventsAfter(this.lastOwnerSeq, { kinds: ['notification.resolved'], limit: 101, order: 'desc', payload });
+    const gruResolutions = resolved({ key: 'by', equals: 'gru' });
+    const otherResolutions = resolved({ key: 'by', notEquals: 'gru' });
+    const activityCount = boardActions.length + otherResolutions.length;
     const bound = (count: number, capped: boolean): string => (capped ? '100+' : String(count));
-    const anyCapped = boardActions.length >= 101 || resolutions.length >= 101;
+    const anyCapped = boardActions.length >= 101 || otherResolutions.length >= 101;
     if (activityCount > 0) push(`- activity: ${bound(activityCount, anyCapped)} board event${activityCount === 1 ? '' : 's'}`);
-    if (gruResolutions.length > 0) push(`- Gru actions: ${bound(gruResolutions.length, resolutions.length >= 101)} disposition${gruResolutions.length === 1 ? '' : 's'}`);
-    const latestDisposition = resolutions.find((event) => payloadOf(event)['by'] === 'gru');
+    if (gruResolutions.length > 0) push(`- Gru actions: ${bound(gruResolutions.length, gruResolutions.length >= 101)} disposition${gruResolutions.length === 1 ? '' : 's'}`);
+    const latestDisposition = gruResolutions[0];
     if (latestDisposition !== undefined) {
       const disposition = payloadOf(latestDisposition);
       // #99: `by: 'gru'` names the disposition ROLE, not a proven actor — the
       // board's shared bearer can speak for owner or agent alike. Surface the
       // role and any caller-declared actor rather than over-claiming "Gru".
       const declared = textOf(disposition['declaredActor']);
-      const actor = declared !== null ? ` (declared actor: ${declared})` : '';
-      push(clampLine(`- Machine disposition [${textOf(disposition['id']) ?? '?'}]: ${textOf(disposition['detail']) ?? 'no detail recorded'}${actor}`, this.limits.maxLineChars));
+      const actor = declared !== null ? ` (declared actor: ${promptSafe(declared)})` : '';
+      // The recorded detail is external data: redacted like every other (#360 R5-B10).
+      const detail = textOf(disposition['detail']);
+      push(clampLine(`- Machine disposition [${textOf(disposition['id']) ?? '?'}]: ${detail === null ? 'no detail recorded' : promptSafe(detail)}${actor}`, this.limits.maxLineChars));
     }
     const jobs = this.ledger.listJobs();
     const list = (ids: readonly string[]): string =>

@@ -2409,6 +2409,20 @@ describe('GH-305 mailbox reconciliation through existing awareness gates', () =>
     } finally { rig.close(); vi.useRealTimers(); }
   });
 
+  it('a credential in mailbox metadata never reaches the prompt (#360 R5-B10)', () => {
+    vi.useFakeTimers();
+    const rig = mailboxRig();
+    try {
+      rig.api.addJob({ id: 'leaky', repo: 'r', title: 'deploy with token=ghp_0123456789abcdefghijklmnopqrstuvwxyzAB' });
+      rig.api.setJobStatus('leaky', 'blocked');
+      vi.advanceTimersByTime(1000);
+      const injection = rig.awareness.prepare('wake')!;
+      expect(injection.text).toContain('job:leaky');
+      expect(injection.text).toContain('token=[redacted]');
+      expect(injection.text).not.toContain('ghp_0123456789');
+    } finally { rig.close(); vi.useRealTimers(); }
+  });
+
   it('empty mailbox costs no turns; passive-only mode durably explains admission deferral', () => {
     vi.useFakeTimers();
     const rig = mailboxRig('never');
@@ -3040,6 +3054,52 @@ describe('GH-104 (g7): Gru actions are labeled apart from passive board activity
       expect(text.split('\n')).toContain(`- Machine disposition [${alert.id}]: Repaired the lane (declared actor: gru)`);
       expect(text).toContain('(declared actor: gru)');
       expect(text).not.toContain('Gru disposition');
+      rig.awareness.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+});
+
+describe('#360: the away digest counts each category in its own window and redacts dispositions', () => {
+  function away(): Rig {
+    vi.setSystemTime(new Date('2026-09-22T21:00:00Z'));
+    const rig = boot({ now: () => Date.now() });
+    rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'a', to: 'b' } });
+    rig.awareness.commit(rig.awareness.prepare()!);
+    vi.setSystemTime(new Date('2026-09-23T07:00:00Z'));
+    return rig;
+  }
+
+  it('one Gru action among 100 other resolutions is 1, and one older than 101 others is still found (R5-B11)', () => {
+    vi.useFakeTimers();
+    try {
+      const rig = away();
+      const alert = rig.notifications.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Fix' });
+      rig.api.disposeMachineNotification(alert.id, 'Repaired the lane', { credential: 'shared-bearer', declaredActor: 'gru' });
+      for (let index = 0; index < 101; index += 1) rig.api.appendCustomEvent({ kind: 'notification.resolved', payload: { id: `n-${String(index)}`, by: 'owner' } });
+      const lines = rig.awareness.prepare()!.text.split('\n');
+      expect(lines).toContain('- Gru actions: 1 disposition');
+      expect(lines).toContain('- activity: 100+ board events');
+      expect(lines).toContain(`- Machine disposition [${alert.id}]: Repaired the lane (declared actor: gru)`);
+      rig.awareness.dispose();
+      // A resolution recorded with no `by` at all is still board activity.
+      const unattributed = away();
+      unattributed.api.appendCustomEvent({ kind: 'notification.resolved', payload: { id: 'n-unattributed' } });
+      const unattributedLines = unattributed.awareness.prepare()!.text.split('\n');
+      expect(unattributedLines).toContain('- activity: 1 board event');
+      expect(unattributedLines.some((line) => line.startsWith('- Gru actions'))).toBe(false);
+      unattributed.awareness.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('a credential in a machine disposition detail never reaches the prompt (R5-B10)', () => {
+    vi.useFakeTimers();
+    try {
+      const rig = away();
+      const alert = rig.notifications.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Fix' });
+      rig.api.disposeMachineNotification(alert.id, 'Rotated it: token=ghp_0123456789abcdefghijklmnopqrstuvwxyzAB', { credential: 'shared-bearer', declaredActor: 'gru' });
+      const text = rig.awareness.prepare()!.text;
+      expect(text).toContain(`- Machine disposition [${alert.id}]: Rotated it: token=[redacted]`);
+      expect(text).not.toContain('ghp_0123456789');
       rig.awareness.dispose();
     } finally { vi.useRealTimers(); }
   });

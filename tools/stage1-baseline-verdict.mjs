@@ -9,14 +9,18 @@
  *
  * Exit codes:
  *   0  EXPECTED RED: every fragment selected at least one executed test and
- *      at least one executed test failed an assertion.
- *   5  the baseline run produced no usable report (collection/infra failure)
- *      or failed without any failing test.
+ *      at least one executed test failed an assertion — and every failed
+ *      test failed one (#360 R4-V3: a `beforeAll` setup error Vitest stamps
+ *      onto each test of its suite is no assertion RED).
+ *   5  the baseline run produced no usable report (collection/infra failure),
+ *      failed without any failing test, or failed a test some other way
+ *      than a behavioral assertion (setup, hook, import or helper failure).
  *   6  the selection is incomplete: a fragment matched no executed test (a
  *      vacuous baseline), or nothing ran.
  */
 import { readFileSync } from 'node:fs';
 import process from 'node:process';
+import { behavioralRefusal } from './assert-perkins-integration-review-baseline.mjs';
 
 const out = (message) => process.stdout.write(`${message}\n`);
 const err = (message) => process.stderr.write(`${message}\n`);
@@ -47,6 +51,22 @@ if (executed.length === 0 || missing.length > 0) {
       `no executed test matched: ${missing.length > 0 ? missing.join(' | ') : '(nothing ran)'}`,
   );
   process.exit(6);
+}
+// Every failed test must have failed a behavioral assertion: its first
+// failure message is a matcher failure or a rejects/resolves report raised in
+// a test file. One that failed any other way makes the run no fail-before
+// evidence at all.
+const notAssertions = failed.flatMap((test) => {
+  const reason = behavioralRefusal((test.failureMessages ?? [])[0]);
+  return reason === null ? [] : [`${test.fullName}: ${reason}`];
+});
+if (notAssertions.length > 0) {
+  err(
+    `BASELINE RUN BROKEN (exit 5): ${notAssertions.length} failed test${notAssertions.length === 1 ? '' : 's'} failed some other way than an assertion ` +
+      `(setup, hook, import or helper failure); not accepted as fail-before evidence`,
+  );
+  for (const line of notAssertions) err(`  NOT RED: ${line}`);
+  process.exit(5);
 }
 if (failed.length === 0) {
   err(
