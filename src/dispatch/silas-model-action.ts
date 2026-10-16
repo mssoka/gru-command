@@ -233,10 +233,11 @@ export function spawnSilasWithActionTool(
     callerTools.push(tool as NativeAgentTool);
     names.push(name);
   }
-  // The other options, copied as a spread copies them (every own enumerable
-  // key, symbols and an own `__proto__` included), each read once and
-  // nativeTools never again: one that cannot be read is refused by name,
-  // never a raw synchronous throw.
+  // The other options: an options object's own enumerable keys, copied as a
+  // spread copies them (symbols and an own `__proto__` included), each read
+  // once and nativeTools never again. Unlike a spread, anything but an object
+  // (null, a primitive, a function) is refused, and an option that cannot be
+  // read is refused by name — never a raw synchronous throw.
   if (spawnOptions !== undefined && (typeof spawnOptions !== 'object' || spawnOptions === null)) {
     return Promise.reject(new TypeError(`spawn options must be an object (got ${spawnOptions === null ? 'null' : typeof spawnOptions})`));
   }
