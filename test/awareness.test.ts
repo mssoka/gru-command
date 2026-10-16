@@ -3081,6 +3081,13 @@ describe('#360: the away digest counts each category in its own window and redac
       expect(lines).toContain('- activity: 100+ board events');
       expect(lines).toContain(`- Machine disposition [${alert.id}]: Repaired the lane (declared actor: gru)`);
       rig.awareness.dispose();
+      // A resolution recorded with no `by` at all is still board activity.
+      const unattributed = away();
+      unattributed.api.appendCustomEvent({ kind: 'notification.resolved', payload: { id: 'n-unattributed' } });
+      const unattributedLines = unattributed.awareness.prepare()!.text.split('\n');
+      expect(unattributedLines).toContain('- activity: 1 board event');
+      expect(unattributedLines.some((line) => line.startsWith('- Gru actions'))).toBe(false);
+      unattributed.awareness.dispose();
     } finally { vi.useRealTimers(); }
   });
 
