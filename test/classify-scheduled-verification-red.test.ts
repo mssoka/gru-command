@@ -1,7 +1,7 @@
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { exec, execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
 import { classifyReviewedRed, STATUS_ACTION_NAME } from '../tools/classify-scheduled-verification-red.mjs';
@@ -88,7 +88,8 @@ describe('reviewed-candidate behavioral RED custody', () => {
   it('only the two baselines and the retained scope invoke the classifier (#358 exclusion scope)', () => {
     // The review-8 runner names the classifier's TEST file, never the
     // classifier: it never classifies RED.
-    // Every tracked file in the tree — what CI runs — so a local scratch file
+    // Every tracked file in the tree (its working-tree content) — what a
+    // commit can carry to CI — so a local untracked scratch file
     // never changes the answer (git grep exits 1 on no match).
     const grep = spawnSync('git', ['-C', repoRoot, 'grep', '-l', 'classify-scheduled-verification-red\\.mjs', '--', '.', ':!test/classify-scheduled-verification-red.test.ts'], { encoding: 'utf8', env: gitFree() });
     expect(grep.status, grep.stderr).toBe(0);
@@ -173,17 +174,24 @@ describe('reviewed-candidate behavioral RED custody', () => {
       const short = check(`${head} ${head}`);
       expect([short.status, short.stderr]).toEqual([2, 'require_pinned_sources needs a candidate, a regressions revision and at least one file (got 2 arguments)\n']);
       expect(check(`${head} ${head} present.ts ''`).stderr).toBe('require_pinned_sources was given an empty file name\n');
-      expect(check(`'' ${head} present.ts`).stderr).toBe('require_pinned_sources was given an empty revision\n');
+      expect(check(`'' ${head} present.ts`).stderr).toBe('require_pinned_sources was given a candidate revision that is empty or not a plain name: ""\n');
+      expect(check(`${head} '' present.ts`).stderr).toBe('require_pinned_sources was given a regressions revision that is empty or not a plain name: ""\n');
+      // A revision git would read as an option is never handed to it.
+      expect(check(`--output=/tmp/x ${head} present.ts`).stderr).toBe('require_pinned_sources was given a candidate revision that is empty or not a plain name: "--output=/tmp/x"\n');
       // The snapshot is the candidate's tree, with no archive left behind...
       const snapshot = join(dir, 'tmp', 'snap'); mkdirSync(snapshot);
       const made = libCall(`snapshot_candidate '${snapshot}' ${head}`, repo, join(dir, 'tmp'));
       expect([made.status, made.stderr, readdirSync(snapshot), readdirSync(join(dir, 'tmp'))]).toEqual([0, '', ['present.ts'], ['snap']]);
       // Its target must be an existing, empty directory — never one it would wrongly remove.
       const occupied = join(dir, 'occupied'); mkdirSync(occupied); writeFileSync(join(occupied, 'keep'), 'x');
-      expect(libCall(`snapshot_candidate '${occupied}' ${head}`, repo, join(dir, 'tmp')).stderr).toBe(`snapshot directory ${occupied} must exist and be empty\n`);
+      expect(libCall(`snapshot_candidate '${occupied}' ${head}`, repo, join(dir, 'tmp')).stderr).toBe(`snapshot directory ${occupied} must be an existing, empty, real directory\n`);
       expect(readdirSync(occupied)).toEqual(['keep']);
-      expect(libCall(`snapshot_candidate '${join(dir, 'absent')}' ${head}`, repo, join(dir, 'tmp')).stderr).toBe(`snapshot directory ${join(dir, 'absent')} must exist and be empty\n`);
+      expect(libCall(`snapshot_candidate '${join(dir, 'absent')}' ${head}`, repo, join(dir, 'tmp')).stderr).toBe(`snapshot directory ${join(dir, 'absent')} must be an existing, empty, real directory\n`);
+      // A linked target is refused: a failure would remove only the link, never the partial tree.
+      const target = join(dir, 'link-target'); mkdirSync(target); symlinkSync(target, join(dir, 'linked'));
+      expect(libCall(`snapshot_candidate '${join(dir, 'linked')}' ${head}`, repo, join(dir, 'tmp')).stderr).toBe(`snapshot directory ${join(dir, 'linked')} must be an existing, empty, real directory\n`);
       expect(libCall(`snapshot_candidate '' ${head}`, repo, join(dir, 'tmp')).stderr).toBe('snapshot_candidate needs a snapshot directory and a candidate\n');
+      expect(libCall(`snapshot_candidate '${target}' -x`, repo, join(dir, 'tmp')).stderr).toBe('snapshot_candidate was given a candidate that is empty or not a plain name: "-x"\n');
       // ...and a failed archive removes the partial snapshot and refuses by name.
       const fresh = join(dir, 'tmp', 'fresh'); mkdirSync(fresh);
       const failed = libCall(`snapshot_candidate '${fresh}' ${absent}`, repo, join(dir, 'tmp'));
@@ -200,6 +208,8 @@ describe('reviewed-candidate behavioral RED custody', () => {
       const snapshot = join(dir, 'snapshot'); mkdirSync(join(snapshot, 'dist', 'verify'), { recursive: true }); mkdirSync(join(dir, 'tmp'));
       writeFileSync(join(snapshot, 'package.json'), '{"type":"module"}\n');
       const helper = join(snapshot, 'dist', 'verify', 'capture-cli.js');
+      // The real-build case below needs this tree's build; say so before anything else.
+      if (!existsSync(join(repoRoot, 'dist', 'verify', 'capture-cli.js'))) throw new Error('fixture setup: this tree has no build — run npm run build first');
       const guard = () => libCall('require_built_helper', snapshot, join(dir, 'tmp'));
       const missing = guard();
       expect(missing.status).toBe(2);
@@ -218,20 +228,31 @@ describe('reviewed-candidate behavioral RED custody', () => {
       // A helper that exits while loading, or never finishes loading, is refused.
       writeFileSync(helper, 'process.exit(0);\n');
       expect(guard().stderr).toMatch(/does not load cleanly/u);
-      // A hang is bounded whether it waits or spins synchronously.
-      for (const body of ['setInterval(() => {}, 1000);\nawait new Promise(() => {});\n', 'for (;;) {}\n']) {
+      // A hang is bounded whether it waits, spins synchronously, ignores
+      // SIGTERM, or leaves a descendant holding its output open.
+      for (const body of [
+        'setInterval(() => {}, 1000);\nawait new Promise(() => {});\n',
+        'for (;;) {}\n',
+        "process.on('SIGTERM', () => {});\nfor (;;) {}\n",
+        // A descendant keeps the helper's output open for 10 s: the bound still holds.
+        "import { spawn } from 'node:child_process';\nspawn(process.execPath, ['-e', 'setTimeout(() => {}, 10000)'], { stdio: ['ignore', 'inherit', 'ignore'], detached: true }).unref();\nsetInterval(() => {}, 1000);\nawait new Promise(() => {});\n",
+      ]) {
         writeFileSync(helper, body);
+        const started = Date.now();
         const hung = libCall('require_built_helper', snapshot, join(dir, 'tmp'), { GRU_HELPER_LOAD_MS: '300' });
+        expect(Date.now() - started, body).toBeLessThan(8000);
         expect(hung.status, body).toBe(2);
         expect(hung.stderr, body).toMatch(/the helper did not finish loading within 300 ms[\s\S]*does not load cleanly/u);
       }
-      // A helper that prints while loading still loads.
-      writeFileSync(helper, "import './scheduler.js';\nconsole.log('loading capture helper');\n");
+      // A helper that prints while loading — even a partial line — still loads.
+      writeFileSync(helper, "import './scheduler.js';\nconsole.log('loading capture helper');\nprocess.stdout.write('no newline');\n");
       expect(guard()).toMatchObject({ status: 0, stderr: '' });
-      // The bound itself must be a positive whole number.
-      expect(libCall('require_built_helper', snapshot, join(dir, 'tmp'), { GRU_HELPER_LOAD_MS: 'soon' }).stderr).toBe('GRU_HELPER_LOAD_MS must be a positive whole number of milliseconds (got "soon")\n');
+      // The bound itself is a whole number from 1 to 3600000 — never one that disables it.
+      for (const bound of ['soon', '0', '00', '-5', '1.5', '3600001', '99999999']) {
+        expect(libCall('require_built_helper', snapshot, join(dir, 'tmp'), { GRU_HELPER_LOAD_MS: bound }).stderr, bound)
+          .toBe(`GRU_HELPER_LOAD_MS must be a whole number of milliseconds from 1 to 3600000 (got "${bound}")\n`);
+      }
       // The real compiled helper (this tree's build) loads without running.
-      if (!existsSync(join(repoRoot, 'dist', 'verify', 'capture-cli.js'))) throw new Error('fixture setup: this tree has no build — run npm run build first');
       const real = libCall('require_built_helper', repoRoot, join(dir, 'tmp'));
       expect([real.status, real.stderr]).toEqual([0, '']);
     } finally { rmSync(dir, { recursive: true, force: true }); }
