@@ -749,11 +749,11 @@ test.describe('compact owner-first board — synthetic geometry proof', () => {
       expect(await hitTarget(page, '#bottom-third')).toEqual({ found: true, inViewport: false, hit: true });
       for (const ratio of [0, -0, -1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
         await setRatio(ratio);
-        expect(Object.is(await page.evaluate(() => window.devicePixelRatio), ratio), `${String(ratio)} reached the page as itself`).toBe(true);
+        const label = Object.is(ratio, -0) ? '-0' : String(ratio);
+        expect(Object.is(await page.evaluate(() => window.devicePixelRatio), ratio), `${label} reached the page as itself`).toBe(true);
         for (const id of ['#bottom-in', '#missing']) {
           // The exact refusal line (whatever prefix Playwright wraps it in):
           // `0` must never pass for `0.5`.
-          const label = Object.is(ratio, -0) ? '-0' : String(ratio);
           await expect(hitTarget(page, id), `${label} ${id}`).rejects.toThrow(new RegExp(`(?:^|: )Error: hitTarget: unusable devicePixelRatio ${String(ratio)}$`, 'mu'));
         }
       }
@@ -761,14 +761,16 @@ test.describe('compact owner-first board — synthetic geometry proof', () => {
       // at 1.5x that is 1/3 CSS px, so the 0.3125 overhang OUT at 2x is IN
       // here, while the 0.34375 one — IN under a 1x half pixel — stays OUT.
       await setRatio(1.5);
+      expect(await page.evaluate(() => window.devicePixelRatio)).toBe(1.5);
       expect(await hitTarget(page, '#missing')).toEqual({ found: false, inViewport: false, hit: false });
       expect(await hitTarget(page, '#bottom-in')).toEqual({ found: true, inViewport: true, hit: true });
       expect(await hitTarget(page, '#bottom-out')).toEqual({ found: true, inViewport: true, hit: true });
       expect(await hitTarget(page, '#bottom-third')).toEqual({ found: true, inViewport: false, hit: true });
       // ...and at 1x (a 1/2 sliver) the same box is IN.
       await setRatio(1);
+      expect(await page.evaluate(() => window.devicePixelRatio)).toBe(1);
       expect(await hitTarget(page, '#bottom-third')).toEqual({ found: true, inViewport: true, hit: true });
-      // The page's ratio is left overridden: nothing below this point may use it.
+      // The page's ratio is left overridden at 1: nothing below this point may use it.
     } finally {
       await context.close();
     }
