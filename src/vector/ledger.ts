@@ -12,7 +12,7 @@ import type { PropertyMetricsSnapshot } from '../property/types.js';
 export const VECTOR_EVENTS = {
   /** Code offered Gru a candidate list (one Gru turn per distinct list). */
   planOffered: 'vector.plan-offered',
-  /** Gru answered an offered list (zero or more picks). */
+  /** An offered list closed: Gru answered it (zero or more picks), or code superseded or closed it unanswered. */
   planDecided: 'vector.plan-decided',
   /** A validated pick: one raid record is born. */
   picked: 'vector.raid-picked',
@@ -68,8 +68,13 @@ export type RaidState = 'proposed' | 'declined' | 'withdrawn' | 'queued' | 'runn
 export const RAID_OUTCOMES = ['found', 'budget-exhausted', 'no-qualified-proposals', 'refused', 'unsupported', 'infrastructure-error', 'yielded', 'invalidated'] as const;
 export type RaidOutcome = (typeof RAID_OUTCOMES)[number];
 
-/** How a round ended, typed (#351 §3): never a pass of the code. */
-export const ROUND_OUTCOMES = ['no-submission', 'invalid-attack', 'duplicate', 'rejected', 'pass', 'inconclusive', 'break-in'] as const;
+/**
+ * How a round ended, typed (#351 §3): never a pass of the code. `not-run`:
+ * the host refused to execute the attack (no sandbox, or property execution
+ * off at this head). `voided`: main moved during the round, so nothing from
+ * it counts.
+ */
+export const ROUND_OUTCOMES = ['no-submission', 'invalid-attack', 'duplicate', 'rejected', 'pass', 'inconclusive', 'break-in', 'not-run', 'voided'] as const;
 export type RoundOutcome = (typeof ROUND_OUTCOMES)[number];
 
 /** One attack as the ledger keeps it. */
@@ -198,8 +203,8 @@ export interface RepositoryRollup {
   readonly flag: string | null;
 }
 
-/** A raid that actually spent: at least one sandboxed run. */
-const SPENT = (raid: RaidRecord): boolean => raid.state === 'finished' && (raid.metrics?.executedRuns ?? 0) > 0;
+/** A raid that actually spent: at least one Vector round (a session ran) or one sandboxed run. */
+const SPENT = (raid: RaidRecord): boolean => raid.state === 'finished' && (raid.rounds.length > 0 || (raid.metrics?.executedRuns ?? 0) > 0);
 
 export function repositoryRollups(raids: readonly RaidRecord[]): readonly RepositoryRollup[] {
   const byRepo = new Map<string, RaidRecord[]>();
@@ -242,11 +247,18 @@ export function repositoryRollups(raids: readonly RaidRecord[]): readonly Reposi
   });
 }
 
-/** Raids counting toward a repository's daily cap: started in the last 24 hours, or launched and not yet run. */
+const DAY_MS = 86_400_000;
+
+/**
+ * Raids counting toward a repository's daily cap: started in the last 24
+ * hours, launched and not yet run, or launched in the last 24 hours and
+ * refused before starting (so a target that keeps being refused is retried
+ * at most the cap's number of times a day).
+ */
 export function raidsTowardCap(raids: readonly RaidRecord[], repo: string, now: Date): number {
-  const DAY_MS = 86_400_000;
+  const within = (at: string | null): boolean => at !== null && now.getTime() - Date.parse(at) < DAY_MS;
   return raids.filter((raid) => raid.target.repo === repo &&
-    ((raid.startedAt !== null && now.getTime() - Date.parse(raid.startedAt) < DAY_MS) || raid.state === 'queued' || raid.state === 'running')).length;
+    (within(raid.startedAt) || raid.state === 'queued' || raid.state === 'running' || (raid.outcome === 'refused' && within(raid.launchedAt)))).length;
 }
 
 /** A key naming one target at one source identity. */
@@ -257,7 +269,9 @@ export interface PlanRecord {
   readonly notificationId: string;
   readonly offeredAt: string;
   readonly decidedAt: string | null;
-  /** offerKey of every candidate the list offered: once decided, Gru has seen them. */
+  /** True only when Gru answered the list; a list code superseded or closed unanswered was never decided. */
+  readonly answered: boolean;
+  /** offerKey of every candidate the list offered: once answered, Gru has seen them. */
   readonly offered: readonly string[];
 }
 
@@ -337,6 +351,8 @@ export class VectorLedger {
   private readonly plans = new Map<string, PlanRecord>();
   private readonly breakInsById = new Map<string, BreakInRecord>();
   private skippedEvents = 0;
+  /** Every list ever offered, a re-offer of the same digest included. */
+  private offers = 0;
 
   constructor(private readonly ledger: LedgerApi, private readonly log: (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void = () => {}) {}
 
@@ -401,15 +417,17 @@ export class VectorLedger {
     return this.plans.get(digest) ?? null;
   }
 
-  /** offerKey of every candidate an answered (or superseded) list showed Gru. */
-  decidedOffers(): readonly string[] {
+  /** Every candidate an answered list showed Gru: its offerKey and when Gru answered. */
+  answeredOffers(): readonly { readonly key: string; readonly answeredAt: string }[] {
     this.refresh();
-    return [...this.plans.values()].filter((plan) => plan.decidedAt !== null).flatMap((plan) => plan.offered);
+    return [...this.plans.values()].filter((plan) => plan.answered && plan.decidedAt !== null)
+      .flatMap((plan) => plan.offered.map((key) => ({ key, answeredAt: plan.decidedAt! })));
   }
 
+  /** How many lists were ever offered (each offer gets its own Gru turn row). */
   planCount(): number {
     this.refresh();
-    return this.plans.size;
+    return this.offers;
   }
 
   openPlans(): readonly PlanRecord[] {
@@ -422,13 +440,14 @@ export class VectorLedger {
       case VECTOR_EVENTS.planOffered: {
         const digest = text(payload, 'digest');
         const offered = Array.isArray(payload['offered']) ? (payload['offered'] as unknown[]).filter((entry): entry is string => typeof entry === 'string') : [];
-        this.plans.set(digest, { digest, notificationId: text(payload, 'notification_id'), offeredAt: ts, decidedAt: null, offered });
+        this.plans.set(digest, { digest, notificationId: text(payload, 'notification_id'), offeredAt: ts, decidedAt: null, answered: false, offered });
+        this.offers += 1;
         return;
       }
       case VECTOR_EVENTS.planDecided: {
         const digest = text(payload, 'digest');
         const plan = this.plans.get(digest);
-        if (plan !== undefined) this.plans.set(digest, { ...plan, decidedAt: ts });
+        if (plan !== undefined) this.plans.set(digest, { ...plan, decidedAt: ts, answered: payload['answered'] === true });
         return;
       }
       case VECTOR_EVENTS.picked: {

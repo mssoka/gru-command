@@ -83,7 +83,7 @@ import { AgentLessonsDistiller } from './lessons/distiller.js';
 import { createSessionLessonsCapture } from './lessons/capture.js';
 import { createReviewOutcomeCapture } from './lessons/review-capture.js';
 import { createLessonsServer } from './lessons/server.js';
-import { VectorService } from './vector/service.js';
+import { startVectorHalves, VectorService } from './vector/service.js';
 import { createVectorServer } from './vector/server.js';
 import { heistWorkWaiting as raidHeistWorkWaiting, VectorRaidRunner } from './vector/runner.js';
 import { DecisionRuntime } from './decisions/runtime.js';
@@ -1604,16 +1604,7 @@ async function main(): Promise<number> {
   // half failing never keeps the other from starting.
   state.vector = vector;
   state.vectorRaids = vectorRaids;
-  try {
-    vector.start();
-  } catch (error) {
-    logger.log('error', 'vector raid planning failed to start', { error: String(error) });
-  }
-  try {
-    vectorRaids.start();
-  } catch (error) {
-    logger.log('error', 'vector raid runner failed to start', { error: String(error) });
-  }
+  startVectorHalves({ planning: vector, runner: vectorRaids }, (level, msg, fields) => logger.log(level, msg, fields));
   if (silasSlot !== null) {
     // The driver starts after listen so its wake prompt carries the real
     // bound port (config port 0 = ephemeral); until then no sweeps run and

@@ -52,8 +52,10 @@ state only.
 - **Excluded, each with its reason:**
   - opted-out repositories;
   - repositories at their daily cap (`max_raids_per_day`). The cap counts
-    raids started in the last 24 hours plus raids queued or running now; a
-    proposal waiting for your Accept does not count until it is accepted;
+    raids started in the last 24 hours, raids queued or running now, and
+    raids refused in the last 24 hours (so a target that keeps being refused
+    is retried at most the cap's number of times a day). A proposal waiting
+    for your Accept does not count until it is accepted;
   - a package with a pending proposal, or with a raid queued or running;
   - a package already raided or declined at the same source identity.
 
@@ -64,8 +66,11 @@ No eligible candidate means no Gru turn, so an idle repository costs nothing.
 Otherwise Gru gets one turn: an action-required `vector.raid-candidates` row
 carrying the list. A target Gru has seen in an answered list, at the same
 source identity, is not offered again: picking one target from a list does
-not re-offer the others. A newer list supersedes an unanswered one, and when
-no candidate is left, an unanswered list is closed.
+not re-offer the others. The exception is a target whose raid ended
+retryable (refused, yielded, invalidated or a host error) after that answer:
+it is offered again. A newer list supersedes an unanswered one, and when no
+candidate is left, an unanswered list is closed. A list closed or superseded
+unanswered marks nothing as seen.
 
 Gru answers through the API:
 
@@ -141,14 +146,17 @@ How `POST /api/vector/raids` behaves:
      - an optional reference that satisfies it.
      A round with no valid submission is recorded as `no-submission`. When
      no attack has qualified yet, it ends the raid as
-     `no-qualified-proposals`; after one has, the raid goes on.
+     `no-qualified-proposals`; after one has, the raid goes on. A session
+     cut short by the time cap or a stop is not a `no-submission`: the raid
+     ends by the cap (or the stop) instead.
   2. An exact duplicate of a test that already ran (same package and test
      bytes at the same source identity) is rejected without execution. A test
      that was submitted but never ran is not a duplicate. Semantic
      near-duplicates cannot be detected deterministically, and are not.
   3. The host commits the controls into their clones. A known-bad control
-     that changes nothing, or a control path that passes through a link in
-     the clone, is an `invalid-attack`: it never runs. Otherwise the host
+     that changes nothing, a control path that passes through a link in the
+     clone (a dangling one included), or a path the clone cannot hold, is an
+     `invalid-attack`: it never runs. Otherwise the host
      qualifies the contract (seam C). The known-bad control must fail it and
      the reference must pass it. A rejected, inconclusive or escalated verdict
      never attacks, and counts as an invalid oracle.
@@ -168,14 +176,19 @@ How `POST /api/vector/raids` behaves:
     did not, and the round, run and time caps bound the rest.
   - One attack costs at least three runs: both controls and the attack. A
     failure adds the baseline and the replay. A round starts only while at
-    least five runs (the most one attack can need) are left.
+    least five runs (the most one attack can need) are left, so `max_runs`
+    must be at least 5; a smaller value fails at boot.
   - Budgets never rise after failures or empty raids.
   - Every cap ends the raid as `budget-exhausted`. The round, run and token
     caps are checked at the next round boundary. The time cap also stops the
     round in flight, and the outcome keeps what that round ended with.
 - **Main moving.** If the default-branch head moves during a raid, the raid
   ends `invalidated`, and nothing from the moved round counts, not even a
-  break-in. The head is fetched from origin at every boundary; when a fetch
+  break-in. The report still lists that round as `voided`, with the receipts
+  it spent.
+- **The host refusing mid-raid.** When the sandbox refuses an attack, or
+  property execution is off at the head, the round is recorded as `not-run`
+  and the raid ends `refused`. The head is fetched from origin at every boundary; when a fetch
   fails, the cached default branch decides and the report says the head's
   freshness is unverified. A raid left running by a stopped service is closed
   out at the next boot as a host error.
@@ -202,21 +215,23 @@ label. The report holds:
 - the target and why it was picked, and who launched it;
 - the head it ran at, and whether that head's freshness was verified;
 - every round with its typed outcome (`break-in`, `pass`, `inconclusive`,
-  `rejected`, `invalid-attack`, `duplicate` or `no-submission`) and its
-  qualification verdict;
-- each round's receipts, or the typed reason it has none;
+  `rejected`, `invalid-attack`, `duplicate`, `no-submission`, `not-run` or
+  `voided`) and its qualification verdict;
+- each round's receipts (the host's `pex-<id>.json` execution and
+  `replay-<id>.json` replay receipts), or the typed reason it has none;
 - the outcome.
 
 Its metrics extend #350's: proposals, qualified, rejections by verdict,
 invalid-oracle rate, inconclusive rounds, invalid attacks, duplicates,
 executed runs, break-ins, replay reliability, wall clock, token usage, and the
-headline **cost per break-in**. Cost per break-in is left out when any round
-reported no token usage. Generated case counts are context, never a success
-measure.
+headline **cost per break-in**. When any round reported no token usage, the
+token cost is unknown (`null`, never zero) and cost per break-in is left out.
+Generated case counts are context, never a success measure.
 
 The **repository rollup** (`GET /api/vector/rollup`) sums every finished raid
-that executed at least one sandboxed run. A raid that ran nothing (refused,
-unsupported, or stopped before its first run) is left out. Per repository it
+that spent anything: at least one Vector round or one sandboxed run. A raid
+that ran nothing (refused, unsupported, or stopped before its first round) is
+left out. Per repository it
 shows raids, proposals, qualified attacks, rejections by verdict, the
 invalid-oracle rate, executed runs, break-ins, replay reliability, wall clock,
 tokens, cost per break-in, and the raids since the last break-in. Cost per

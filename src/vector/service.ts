@@ -7,7 +7,7 @@ import { parseNotificationDecision, type NotificationDecision } from '../ledger/
 import type { LogLevel } from '../logger.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { PackageResolution } from '../property/types.js';
-import { buildRaidCandidates, type RaidCandidate, type RaidCandidateList } from './candidates.js';
+import { buildRaidCandidates, RETRYABLE_OUTCOMES, type RaidCandidate, type RaidCandidateList } from './candidates.js';
 import { breakInContract, fixHeistJobId, fixHeistTitle, renderFixBriefing } from './fix.js';
 import {
   offerKey,
@@ -234,9 +234,12 @@ export class VectorService {
 
   /**
    * One planning tick. No eligible candidate means no Gru turn. A candidate
-   * Gru already saw in an answered list, at the same source identity, is
-   * never offered again (picking one target from a list does not re-offer
-   * the rest); a newer list supersedes an unanswered one.
+   * Gru already saw in an answered list, at the same source identity, is not
+   * offered again (picking one target from a list does not re-offer the
+   * rest), unless a raid on it ended retryable (refused, yielded,
+   * invalidated, host error) after that answer. A newer list supersedes an
+   * unanswered one; a superseded or closed list was never answered, so it
+   * marks nothing seen.
    */
   planTick(): { readonly offered: boolean; readonly digest: string | null } {
     this.requireEnabled();
@@ -245,7 +248,7 @@ export class VectorService {
     const supersede = (by: string | null): void => {
       for (const open of this.store.openPlans()) {
         this.opts.ledger.resolveNotificationById(open.notificationId, 'vector-plan-superseded');
-        this.store.record(VECTOR_EVENTS.planDecided, { digest: open.digest, picks: 0, superseded_by: by });
+        this.store.record(VECTOR_EVENTS.planDecided, { digest: open.digest, picks: 0, answered: false, superseded_by: by });
       }
     };
     if (list.candidates.length === 0) {
@@ -254,7 +257,13 @@ export class VectorService {
     }
     const open = this.store.openPlans();
     if (open.some((plan) => plan.digest === list.digest)) return { offered: false, digest: list.digest };
-    const seen = new Set(this.store.decidedOffers());
+    const raids = this.store.raids();
+    const retriedAfter = (key: string, answeredAt: string): boolean => raids.some((raid) => raid.state === 'finished' && raid.outcome !== null &&
+      RETRYABLE_OUTCOMES.has(raid.outcome) && raid.finishedAt !== null && Date.parse(raid.finishedAt) >= Date.parse(answeredAt) &&
+      offerKey(raid.target.repo, raid.target.packageDir, raid.sourceIdentity) === key);
+    const answered = this.store.answeredOffers();
+    const seen = new Set(answered.filter((offer) => !answered.some((other) => other.key === offer.key && Date.parse(other.answeredAt) > Date.parse(offer.answeredAt)) &&
+      !retriedAfter(offer.key, offer.answeredAt)).map((offer) => offer.key));
     const keys = list.candidates.map((candidate) => offerKey(candidate.target.repo, candidate.target.packageDir, candidate.sourceIdentity));
     if (keys.every((key) => seen.has(key))) {
       supersede(null);
@@ -323,11 +332,14 @@ export class VectorService {
       chosen.push({ candidate, reuse: null, reason });
     }
     // The daily cap holds across the whole request: picks that launch now
-    // (autonomous, or a chat request) count with what already counts.
-    const launchesNow = request.requestedBy === 'owner-chat' || this.opts.vector.raidMode === 'autonomous';
-    if (launchesNow) {
+    // count with what already counts. A new pick launches in autonomous mode
+    // or on a chat request; a reused pending card launches only on a chat
+    // request (the owner's Accept).
+    const launches = (entry: (typeof chosen)[number]): boolean =>
+      request.requestedBy === 'owner-chat' || (entry.candidate !== null && this.opts.vector.raidMode === 'autonomous');
+    {
       const perRepo = new Map<string, number>();
-      for (const entry of chosen) {
+      for (const entry of chosen.filter(launches)) {
         const repo = (entry.candidate?.target ?? entry.reuse!.target).repo;
         perRepo.set(repo, (perRepo.get(repo) ?? 0) + 1);
       }
@@ -365,7 +377,7 @@ export class VectorService {
     }
     if (request.digest !== null) {
       for (const plan of this.store.openPlans().filter((entry) => entry.digest === request.digest)) {
-        this.store.record(VECTOR_EVENTS.planDecided, { digest: plan.digest, picks: chosen.length });
+        this.store.record(VECTOR_EVENTS.planDecided, { digest: plan.digest, picks: chosen.length, answered: true });
         this.opts.ledger.resolveNotificationById(plan.notificationId, 'gru');
       }
     }
@@ -671,5 +683,23 @@ export class VectorService {
       }
     }
     return count;
+  }
+}
+
+/**
+ * Start both raid halves (#351). Raids are off the heist path: a failure is
+ * loud, never fatal, and one half failing never keeps the other from
+ * starting.
+ */
+export function startVectorHalves(halves: { readonly planning: Pick<VectorService, 'start'>; readonly runner: { start(): void } }, log: Log): void {
+  try {
+    halves.planning.start();
+  } catch (error) {
+    log('error', 'vector raid planning failed to start', { error: String(error) });
+  }
+  try {
+    halves.runner.start();
+  } catch (error) {
+    log('error', 'vector raid runner failed to start', { error: String(error) });
   }
 }

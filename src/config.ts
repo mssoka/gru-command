@@ -280,15 +280,19 @@ export interface VectorConfig {
   /** Attacks (Vector proposals) per raid. */
   readonly maxRounds: number;
   /** Sandboxed executions per raid (qualification controls, the attack,
-   * the baseline and the replay each count). */
+   * the baseline and the replay each count). At least
+   * VECTOR_MAX_RUNS_PER_ATTACK, or no attack could ever start. */
   readonly maxRuns: number;
   /** Wall-clock cap per raid. */
   readonly maxRaidMs: number;
   /** Token cap per raid where the runtime reports usage. */
   readonly maxRaidTokens: number;
-  /** Raids launched per repository in any rolling 24 hours. */
+  /** Raids per repository in any rolling 24 hours: started, waiting to run, or refused before starting. */
   readonly maxRaidsPerDay: number;
 }
+
+/** The most one raid attack can cost: both controls, the attack, then the baseline and the replay when it fails. */
+export const VECTOR_MAX_RUNS_PER_ATTACK = 5;
 
 export const DEFAULT_VECTOR_CONFIG: VectorConfig = {
   enabled: false,
@@ -1648,6 +1652,9 @@ export function loadConfig(
         maxRaidsPerDay: table['max_raids_per_day'] !== undefined ? requirePositiveInt(table['max_raids_per_day'], file, 'vector.max_raids_per_day') : vector.maxRaidsPerDay,
       };
       if (vector.maxRaidMs === 0) throw new ConfigError('vector.max_raid_ms must be positive (a raid always has a wall-clock cap)', file, 'vector.max_raid_ms');
+      if (vector.maxRuns < VECTOR_MAX_RUNS_PER_ATTACK) {
+        throw new ConfigError(`vector.max_runs must be at least ${String(VECTOR_MAX_RUNS_PER_ATTACK)}: one attack can need that many sandboxed runs (both controls, the attack, the baseline and the replay), so a smaller cap never attacks`, file, 'vector.max_runs');
+      }
     }
     if (raw['roll'] !== undefined) {
       const table = requireTable(raw['roll'], file, 'roll');

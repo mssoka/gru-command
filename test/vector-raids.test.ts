@@ -18,7 +18,7 @@ import { parseWorktreeManifest } from '../src/worktrees/manifest.js';
 import { buildRaidCandidates, rankScore } from '../src/vector/candidates.js';
 import { VECTOR_EVENTS, VectorLedger } from '../src/vector/ledger.js';
 import { createVectorServer } from '../src/vector/server.js';
-import { RAID_CANDIDATES_KIND, RAID_LAUNCHED_KIND, RAID_PROPOSAL_KIND, VectorRefusal, VectorService } from '../src/vector/service.js';
+import { RAID_CANDIDATES_KIND, RAID_LAUNCHED_KIND, RAID_PROPOSAL_KIND, startVectorHalves, VectorRefusal, VectorService } from '../src/vector/service.js';
 
 /**
  * Vector's raids, planning half (#351 §1–2): config, the code-built
@@ -148,11 +148,14 @@ describe('[vector] config (#351 §1)', () => {
     expect(load('[vector]\nenabled = true\nraid_mode = "autonomous"\nfix_mode = "autonomous"\nmax_runs = 9\n').vector).toMatchObject({ enabled: true, raidMode: 'autonomous', fixMode: 'autonomous', maxRuns: 9 });
   });
 
-  it('fails at boot on an invalid mode, naming the valid set, and on unknown keys or a zero time cap', () => {
+  it('fails at boot on an invalid mode, naming the valid set, and on unknown keys, a zero time cap or a run cap below one attack', () => {
     expect(() => load('[vector]\nraid_mode = "sometimes"\n')).toThrow(/vector\.raid_mode must be one of "proposed", "autonomous", got: "sometimes"/u);
     expect(() => load('[vector]\nfix_mode = true\n')).toThrow(/vector\.fix_mode must be one of "proposed", "autonomous", got: true/u);
     expect(() => load('[vector]\nraids = 3\n')).toThrow(/unknown key `raids` in \[vector\]/u);
     expect(() => load('[vector]\nmax_raid_ms = 0\n')).toThrow(/vector\.max_raid_ms must be positive/u);
+    // One attack can need five sandboxed runs; a smaller cap would never attack.
+    expect(() => load('[vector]\nmax_runs = 4\n')).toThrow(/vector\.max_runs must be at least 5: one attack can need that many sandboxed runs/u);
+    expect(load('[vector]\nmax_runs = 5\n').vector.maxRuns).toBe(5);
   });
 
   it('regenerating the config keeps every [vector] value; zero and wrong-typed values fail by name, and plan_interval_ms = 0 means raids only on request', () => {
@@ -227,6 +230,20 @@ describe('raid candidates: code ranks, Gru decides (#351 §2)', () => {
     expect(rankScore({ ...base, escapedRegressions: 1 })).toBeGreaterThan(rankScore({ ...base, commitsSinceLastRaid: 1 }));
     expect(rankScore({ ...base, commitsSinceLastRaid: 1 })).toBeGreaterThan(rankScore({ ...base, perkinsFindings: 1 }));
     expect(rankScore({ ...base, daysSinceLastRaid: null })).toBeGreaterThan(rankScore({ ...base, commitsSinceLastRaid: 100 }));
+  });
+
+  it('raids run only the vitest-fast-check adapter, and a package path is matched literally, never as a glob', () => {
+    const ws = workspace();
+    ws.repo('billing');
+    // A directory literally named "a*", and a sibling a glob would also match.
+    ws.commit('billing', 'src/a*/x.js', 'x\n');
+    ws.commit('billing', 'src/ab/y.js', 'y\n');
+    ws.commit('billing', 'src/ab/y.js', 'y2\n');
+    const row = (packageDir: string, adapterId: string): PackageResolution => ({ ...runnable()[0]!, packageDir, adapterId });
+    const list = buildRaidCandidates({ workspaceRoot: ws.root, managedRepos: ['billing'], maxRaidsPerDay: 2, raids: [], perkinsFindings: () => 0, escapedRegressions: () => 0,
+      resolvePackages: () => [row('src/a*', 'vitest-fast-check'), row('src/ab', 'pytest-hypothesis')], now: new Date() });
+    expect(list.exclusions).toEqual([{ repo: 'billing', packageDir: 'src/ab', reason: 'raids run only the vitest-fast-check adapter today (this package resolves to pytest-hypothesis)' }]);
+    expect(list.candidates.map((candidate) => [candidate.target.packageDir, candidate.signals.commitsSinceLastRaid])).toEqual([['src/a*', 1]]);
   });
 
   it('its digest changes with the code, not with time', () => {
@@ -438,11 +455,10 @@ describe('planning and picks (#351 §2)', () => {
     expect(other.ledger.getNotification(proposed!.notificationId!)).toMatchObject({ decidedOption: 'accept', decidedBy: 'owner-chat' });
   });
 
-  it('the daily cap counts launched and started raids, holds across one request, and frees up 24 hours after a start', () => {
+  it('the daily cap counts launched and started raids and frees up 24 hours after a start; one request may not name a target twice', () => {
     const h = harness(['billing', 'ledger-svc']);
     let now = new Date();
     const service = h.service({ raidMode: 'autonomous', maxRaidsPerDay: 1 }, () => now);
-    // One request may not launch past the cap for a repository.
     expect(() => service.pick({ picks: [pickRefunds(), { repo: 'billing', packageDir: 'src/refunds', reason: 'twice' }], digest: null, requestedBy: 'gru' })).toThrow(/repeats/u);
     const [raid] = service.pick({ picks: [pickRefunds()], digest: null, requestedBy: 'gru' }).raids;
     h.ws.commit('billing', 'src/refunds/refund.js', 'export const refund = (amount) => amount - 0;\n');
@@ -457,14 +473,75 @@ describe('planning and picks (#351 §2)', () => {
 
   it('several picks in one request for one repository cannot pass its cap together', () => {
     const h = harness();
-    const service = h.service({ raidMode: 'autonomous', maxRaidsPerDay: 1 });
     const runnableTwice = (): readonly PackageResolution[] => [...runnable(), { ...runnable()[0]!, packageDir: 'src' }];
     const two = new VectorService({ vector: { ...DEFAULT_VECTOR_CONFIG, enabled: true, raidMode: 'autonomous', planIntervalMs: 0, maxRaidsPerDay: 1 }, workspaceRoot: h.ws.root,
       managedRepos: ['billing'], ledger: h.ledger, bus: h.bus, notifications: h.notifications, resolvePackages: runnableTwice });
-    void service;
     expect(() => two.pick({ picks: [pickRefunds(), { repo: 'billing', packageDir: 'src', reason: 'the rest of src' }], digest: null, requestedBy: 'gru' }))
       .toThrow(/billing: 2 more raid\(s\) would pass the daily raid cap \(0 of 1 in the last 24 hours\)/u);
     expect(two.raids()).toEqual([]);
+  });
+
+  it('a refused raid counts toward the daily cap, so a target that keeps being refused is retried at most the cap a day', () => {
+    const h = harness();
+    let now = new Date();
+    const service = h.service({ raidMode: 'autonomous', maxRaidsPerDay: 1 }, () => now);
+    const [raid] = service.pick({ picks: [pickRefunds()], digest: null, requestedBy: 'gru' }).raids;
+    h.ledger.appendCustomEvent({ kind: VECTOR_EVENTS.finished, payload: { raid_id: raid!.id, outcome: 'refused', label: 'Raid not run: x', detail: 'not-run: no sandbox backend' } });
+    expect(service.candidates().exclusions).toContainEqual({ repo: 'billing', packageDir: null, reason: 'daily raid cap reached (1 in the last 24 hours)' });
+    now = new Date(Date.now() + 25 * 3_600_000);
+    expect(service.candidates().candidates).toHaveLength(1);
+  });
+
+  it('a pick that reuses a pending card launches nothing, so it never counts toward the cap', () => {
+    const h = harness();
+    const [card] = h.service().pick({ picks: [pickRefunds()], digest: null, requestedBy: 'gru' }).raids;
+    expect(card!.state).toBe('proposed');
+    // raid_mode is now autonomous, and another raid on billing already fills its cap.
+    h.ledger.appendCustomEvent({ kind: VECTOR_EVENTS.picked, payload: { raid_id: 'raid-other', repo: 'billing', package_dir: 'src/other', source_identity: 'x', head_sha: 'h', reason: 'r', requested_by: 'gru' } });
+    h.ledger.appendCustomEvent({ kind: VECTOR_EVENTS.queued, payload: { raid_id: 'raid-other', launched_by: 'autonomous' } });
+    const autonomous = h.service({ raidMode: 'autonomous', maxRaidsPerDay: 1 });
+    expect(autonomous.pick({ picks: [pickRefunds('again')], digest: null, requestedBy: 'gru' }).raids).toEqual([expect.objectContaining({ id: card!.id, state: 'proposed' })]);
+  });
+
+  it('a chat request for a target the owner declined is refused, naming the decline', () => {
+    const h = harness();
+    const service = h.service();
+    const [raid] = service.pick({ picks: [pickRefunds()], digest: null, requestedBy: 'gru' }).raids;
+    h.ledger.recordNotificationDecision(raid!.notificationId!, 'decline', 'web');
+    expect(() => service.pick({ picks: [pickRefunds('the owner asked in chat')], digest: null, requestedBy: 'owner-chat' })).toThrow(/declined at this source identity/u);
+    expect(service.raids().find((entry) => entry.id === raid!.id)!.state).toBe('declined');
+  });
+
+  it('a list closed or superseded unanswered marks nothing seen, and a target whose raid ended retryable is offered again', () => {
+    const h = harness(['alpha']);
+    const service = h.service({ raidMode: 'autonomous' });
+    expect(service.planTick().offered).toBe(true);
+    // The list empties before Gru answers it: the turn closes unanswered.
+    h.ws.commit('alpha', '.gru-command/property.toml', 'mode = "disabled"\n');
+    expect(service.planTick().offered).toBe(false);
+    // Back at the same source identity: Gru never answered, so it is offered again.
+    h.ws.commit('alpha', '.gru-command/property.toml', 'mode = "observation"\n');
+    const again = service.planTick();
+    expect(again.offered).toBe(true);
+    const [raid] = service.pick({ picks: [{ repo: 'alpha', packageDir: 'src/refunds', reason: 'never raided' }], digest: again.digest!, requestedBy: 'gru' }).raids;
+    expect(service.planTick().offered).toBe(false);
+    // The raid is refused (no sandbox on this host): the target is eligible, and offered again.
+    h.ledger.appendCustomEvent({ kind: VECTOR_EVENTS.finished, payload: { raid_id: raid!.id, outcome: 'refused', label: 'Raid not run: x', detail: 'not-run: no sandbox backend' } });
+    expect(service.planTick().offered).toBe(true);
+    expect(h.rows(RAID_CANDIDATES_KIND)).toHaveLength(3);
+  });
+});
+
+describe('raid service wiring (#351)', () => {
+  it('starting the two raid halves: one failing never keeps the other from starting, and the failure is logged', () => {
+    for (const failing of ['planning', 'runner'] as const) {
+      const started: string[] = [];
+      const logged: string[] = [];
+      const half = (name: 'planning' | 'runner') => ({ start: () => { started.push(name); if (name === failing) throw new Error(`${name} broke`); } });
+      startVectorHalves({ planning: half('planning'), runner: half('runner') }, (level, msg) => logged.push(`${level}: ${msg}`));
+      expect(started, failing).toEqual(['planning', 'runner']);
+      expect(logged, failing).toEqual([`error: vector raid ${failing} failed to start`]);
+    }
   });
 });
 

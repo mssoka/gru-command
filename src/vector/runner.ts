@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import type { VectorConfig } from '../config.js';
+import { VECTOR_MAX_RUNS_PER_ATTACK, type VectorConfig } from '../config.js';
 import type { LedgerApi } from '../ledger/api.js';
 import type { LogLevel } from '../logger.js';
 import type { NotificationCenter } from '../notifications/center.js';
@@ -36,7 +36,7 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
 export const RAID_FINISHED_KIND = 'vector.raid-finished';
 
 /** The most one attack can cost: both controls, the attack, then the baseline and the replay when it fails. */
-export const MAX_RUNS_PER_ATTACK = 5;
+export const MAX_RUNS_PER_ATTACK = VECTOR_MAX_RUNS_PER_ATTACK;
 
 /** One reviewed attack campaign, host evidence only (seam B/C). */
 export interface RaidCampaign {
@@ -65,7 +65,8 @@ export function raidOutcomeLabel(outcome: RaidOutcome, detail: string, attacks: 
     case 'found': return 'Vector broke in';
     case 'budget-exhausted': return `Raid over: no break-in found in ${String(attacks)} attack${attacks === 1 ? '' : 's'} — not proof the code is safe`;
     case 'no-qualified-proposals': return 'Raid over: no attack survived qualification';
-    case 'refused': return `Raid not run: ${detail}`;
+    // The detail keeps the executor's own `not-run:` word; the label says it once.
+    case 'refused': return `Raid not run: ${detail.replace(/^not-run: /u, '')}`;
     case 'unsupported': return `Raid not run: target unsupported (${detail})`;
     case 'infrastructure-error': return `Raid failed: ${detail}`;
     case 'yielded': return 'Raid stopped for heist work';
@@ -99,6 +100,9 @@ export interface RaidRunnerOptions {
   readonly tickIntervalMs?: number;
   readonly setInterval?: typeof setInterval;
   readonly clearInterval?: typeof clearInterval;
+  /** The raid's wall-clock deadline timer (test seam). */
+  readonly setTimeout?: typeof setTimeout;
+  readonly clearTimeout?: typeof clearTimeout;
 }
 
 /** Git for raid roots: no hooks, no fsmonitor, no user config, a fixed identity for control commits; the host's own PATH. */
@@ -111,7 +115,7 @@ function raidGit(cwd: string, args: readonly string[], timeoutMs = 120_000): str
 
 /** A fetch needs the user's own credential helpers and ssh setup; hooks stay off. */
 function fetchOrigin(repoPath: string): void {
-  execFileSync('git', ['-c', 'core.hooksPath=/dev/null', 'fetch', '--quiet', 'origin'], { cwd: repoPath, encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
+  execFileSync('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', 'fetch', '--quiet', 'origin'], { cwd: repoPath, encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
 }
 
 function cachedDefaultHead(repoPath: string): string | null {
@@ -257,7 +261,7 @@ export class VectorRaidRunner {
     const onStop = (): void => abort.abort();
     this.stopController.signal.addEventListener('abort', onStop, { once: true });
     if (this.stopController.signal.aborted) abort.abort();
-    const deadline = setTimeout(() => { ctx.timedOut = true; abort.abort(); }, Math.max(1, this.opts.vector.maxRaidMs));
+    const deadline = (this.opts.setTimeout ?? setTimeout)(() => { ctx.timedOut = true; abort.abort(); }, Math.max(1, this.opts.vector.maxRaidMs));
     deadline.unref?.();
     const roots = { target: join(raidDir, 'target'), knownBad: join(raidDir, 'known-bad'), healthy: join(raidDir, 'healthy') };
     try {
@@ -281,7 +285,7 @@ export class VectorRaidRunner {
       else if (ctx.timedOut) this.finishWith(raid, 'budget-exhausted', `the ${String(Math.round(this.opts.vector.maxRaidMs / 60_000))}-minute raid time cap ran out (the round in flight ended with: ${oneLineError(error)})`, ctx);
       else this.finishWith(raid, 'infrastructure-error', this.stopController.signal.aborted ? `the service is stopping (${oneLineError(error)})` : oneLineError(error), ctx);
     } finally {
-      clearTimeout(deadline);
+      (this.opts.clearTimeout ?? clearTimeout)(deadline);
       this.stopController.signal.removeEventListener('abort', onStop);
       for (const root of Object.values(roots)) rmSync(root, { recursive: true, force: true });
     }
@@ -323,6 +327,9 @@ export class VectorRaidRunner {
     const attack = await this.askVector(ctx, roots.target, renderRoundPrompt({
       repo: raid.target.repo, packageDir: raid.target.packageDir, headSha: ctx.headSha, round: ctx.rounds, maxRounds: this.opts.vector.maxRounds, testPath, tried, retained: known,
     }), signal);
+    // A session cut short by the time cap or a stop is no Vector decision:
+    // the catch in run() classifies it (time cap: budget-exhausted).
+    if (signal.aborted) throw new Error('the Vector session was cut short mid-round');
     if (attack === null) {
       this.recordRound(ctx, { outcome: 'no-submission', verdict: 'no-submission', detail: 'Vector submitted no valid attack this round' });
       // Vector stopped without one attack ever surviving qualification.
@@ -368,12 +375,19 @@ export class VectorRaidRunner {
     ctx.executionMs += result.metrics.totalExecutionMs;
     const receipts = this.receiptsIn(evidenceDir);
     const verdict = result.qualification?.verdict ?? 'not-run';
-    if (result.mode === 'disabled') throw new RaidStop('refused', 'not-run: property execution is disabled (.gru-command/property.toml) at this head');
-    if (verdict === 'escalated' && result.disclosure.startsWith('sandbox execution refused')) throw new RaidStop('refused', `not-run: ${result.disclosure}`);
+    // A round that ends the raid is still recorded, with its receipts, so the
+    // report lists every proposal (#351 §5).
+    const endRound = (outcome: 'not-run' | 'voided', stop: RaidStop): never => {
+      this.recordRound(ctx, { outcome, verdict, description: attack.description, artifactSha256, candidateOutcome: result.candidateOutcome, replay: result.replay,
+        executedRuns: result.metrics.executedRuns, receipts, detail: stop.detail });
+      throw stop;
+    };
+    if (result.mode === 'disabled') endRound('not-run', new RaidStop('refused', 'not-run: property execution is disabled (.gru-command/property.toml) at this head'));
+    if (verdict === 'escalated' && result.disclosure.startsWith('sandbox execution refused')) endRound('not-run', new RaidStop('refused', `not-run: ${result.disclosure}`));
     // Evidence binds the head it ran at: when main moved during the attack,
     // nothing from it counts (not even a break-in).
     if (!this.fetch(ctx.repoPath)) ctx.fetchFailed = true;
-    if (cachedDefaultHead(ctx.repoPath) !== ctx.headSha) throw new RaidStop('invalidated', 'main moved during the raid; no evidence crosses heads');
+    if (cachedDefaultHead(ctx.repoPath) !== ctx.headSha) endRound('voided', new RaidStop('invalidated', 'main moved during the raid; no evidence crosses heads'));
     if (verdict === 'qualified') ctx.qualified += 1;
     else ctx.verdicts[verdict] = (ctx.verdicts[verdict] ?? 0) + 1;
     const replay = result.replay;
@@ -398,10 +412,10 @@ export class VectorRaidRunner {
     if (brokeIn) this.recordBreakIn(ctx, attack, testPath, artifactSha256, result, campaign.counterexample(result), evidenceDir, receipts);
   }
 
-  /** The host's receipt files the campaign wrote for a round (its report and the break-in record are not receipts). */
+  /** The host's receipt files the campaign wrote for a round: one `pex-<id>.json` per execution and `replay-<id>.json` per replay (#350's names; its result and the break-in record are not receipts). */
   private receiptsIn(evidenceDir: string): readonly string[] {
     try {
-      return readdirSync(evidenceDir).filter((name) => name.endsWith('.json') && !name.startsWith('property-') && name !== 'break-in.json').sort();
+      return readdirSync(evidenceDir).filter((name) => /^(?:pex|replay)-[A-Za-z0-9-]+\.json$/u.test(name)).sort();
     } catch {
       return [];
     }
@@ -455,13 +469,23 @@ export class VectorRaidRunner {
     for (const file of files) {
       const parts = file.path.split('/');
       for (let depth = 1; depth <= parts.length; depth += 1) {
-        const at = join(root, ...parts.slice(0, depth));
-        if (existsSync(at) && lstatSync(at).isSymbolicLink()) return `refused: ${label} path ${file.path} passes through a link in the clone`;
+        // lstat, not exists: a dangling link is still a link.
+        let link: boolean;
+        try {
+          link = lstatSync(join(root, ...parts.slice(0, depth))).isSymbolicLink();
+        } catch {
+          break;
+        }
+        if (link) return `refused: ${label} path ${file.path} passes through a link in the clone`;
       }
     }
     for (const file of files) {
-      mkdirSync(dirname(join(root, file.path)), { recursive: true });
-      writeFileSync(join(root, file.path), file.content);
+      try {
+        mkdirSync(dirname(join(root, file.path)), { recursive: true });
+        writeFileSync(join(root, file.path), file.content);
+      } catch (error) {
+        return `refused: ${label} path ${file.path} cannot be written in the clone (${oneLineError(error)})`;
+      }
     }
     // Forced: a control may touch a path the repository ignores.
     raidGit(root, ['add', '--force', '--', ...files.map((file) => file.path)]);
@@ -531,7 +555,8 @@ export class VectorRaidRunner {
       escapedRegressions: 0,
       executedRuns: ctx?.runs ?? 0,
       totalExecutionMs: ctx?.executionMs ?? 0,
-      totalTokenCost: ctx === null ? null : ctx.tokens,
+      // Unknown, not zero, when a round reported no usage.
+      totalTokenCost: ctx === null || ctx.roundsWithoutTokenUsage > 0 ? null : ctx.tokens,
       // The raid's own.
       proposals: attacks,
       qualified: ctx?.qualified ?? 0,

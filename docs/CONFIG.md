@@ -442,14 +442,16 @@ plan_interval_ms = 86400000
 # Per-raid budgets, never raised after failures or an empty raid. Each
 # attack runs a known-bad and a healthy control before it runs against the
 # target, plus a baseline and a fresh replay when it fails, so one round
-# costs three to five sandboxed runs.
+# costs three to five sandboxed runs. A round starts only while five runs
+# are left, so max_runs is at least 5.
 max_rounds = 4
 max_runs = 16
 max_raid_ms = 1800000
 # Token cap where the runtime reports usage; when it does not, the round,
 # run and time caps still bind and the raid report says so.
 max_raid_tokens = 400000
-# Raids launched per repository in any rolling 24 hours.
+# Raids per repository in any rolling 24 hours: started, waiting to run,
+# or refused before starting.
 max_raids_per_day = 2
 
 [roll]

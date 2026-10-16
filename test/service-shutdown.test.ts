@@ -307,7 +307,6 @@ describe('service shutdown orchestration (issue #341, R3-2 executable)', () => {
     const registered = Math.max(mainSource.indexOf('state.vector = vector;'), mainSource.indexOf('state.vectorRaids = vectorRaids;'));
     expect(mainSource.indexOf('state.vector = vector;')).toBeGreaterThan(-1);
     expect(mainSource.indexOf('state.vectorRaids = vectorRaids;')).toBeGreaterThan(-1);
-    expect(registered).toBeLessThan(mainSource.indexOf('vector.start();'));
-    expect(registered).toBeLessThan(mainSource.indexOf('vectorRaids.start();'));
+    expect(mainSource.indexOf('startVectorHalves({ planning: vector, runner: vectorRaids }')).toBeGreaterThan(registered);
   });
 });

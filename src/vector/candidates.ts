@@ -65,7 +65,8 @@ const sameTarget = (left: RaidTarget, right: RaidTarget): boolean => left.repo =
 /** Outcomes that leave a target worth raiding again at the same code: the
  * raid stopped for heist work, main moved under it, the host failed, or the
  * host could not run it (a sandbox can be installed later). */
-const RETRYABLE_OUTCOMES: ReadonlySet<string> = new Set(['yielded', 'invalidated', 'infrastructure-error', 'refused']);
+/** Outcomes that leave a target eligible again at the same source identity. */
+export const RETRYABLE_OUTCOMES: ReadonlySet<string> = new Set(['yielded', 'invalidated', 'infrastructure-error', 'refused']);
 
 /** The one adapter the raid runner executes (#350's shipped pilot). */
 export const RAID_ADAPTER = 'vitest-fast-check';
