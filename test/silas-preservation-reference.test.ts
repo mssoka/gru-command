@@ -376,6 +376,12 @@ describe('resolvePreservationReference — fails loud and never follows links (#
       const record = writeRecord(tempRoot(), { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's', manifestBindingValue: value });
       expect(resolve(record), String(value)).toMatchObject({ reusable: false, guidance: expect.stringMatching(/link_manifest_sha256 is malformed \(must be 64 lowercase hex characters\)/u) });
     }
+    // The caller's binding is held to the same form, by name.
+    const unbound = writeRecord(tempRoot(), { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's', bindManifest: false });
+    for (const value of ['F'.repeat(64), 'short']) {
+      expect(resolvePreservationReference({ reference: { recordPath: unbound.recordPath, recordSha256: unbound.recordSha256, expectedAssets: { 'link-preservation-manifest.json': value } }, jobId: 'job-h1' }), value)
+        .toMatchObject({ reusable: false, guidance: expect.stringMatching(/caller's expectedAssets\["link-preservation-manifest\.json"\] is malformed/u) });
+    }
   });
 
   it.runIf(process.getuid?.() !== 0)('refuses an entry an unreadable directory hides, never treating it as archive-only', () => {

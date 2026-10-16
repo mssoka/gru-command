@@ -731,17 +731,17 @@ export interface SilasAutopilotInput {
   readonly log?: Log;
 }
 
-/**
- * Run every enabled family against the freshly computed digest. One pass
- * per deterministic observation; a family that refuses or fails leaves its
- * row untouched for LLM Silas.
- */
 /** JSON with every object's keys sorted: two equal decisions built in a
- * different key order — or read back from the ledger — hash alike. */
-function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+ * different key order — or read back from the ledger — hash alike. Values
+ * serialize as JSON.stringify would (`toJSON` honoured, `undefined` members
+ * dropped, `undefined` array slots as null); exported for its own tests. */
+export function canonicalJson(value: unknown): string {
+  if (value !== null && typeof value === 'object' && typeof (value as { toJSON?: unknown }).toJSON === 'function') {
+    return canonicalJson((value as { toJSON(): unknown }).toJSON());
+  }
+  if (Array.isArray(value)) return `[${value.map((member) => (member === undefined || typeof member === 'function' ? 'null' : canonicalJson(member))).join(',')}]`;
   if (value !== null && typeof value === 'object') {
-    const entries = Object.entries(value).filter(([, member]) => member !== undefined).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    const entries = Object.entries(value).filter(([, member]) => member !== undefined && typeof member !== 'function').sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
     return `{${entries.map(([key, member]) => `${JSON.stringify(key)}:${canonicalJson(member)}`).join(',')}}`;
   }
   return JSON.stringify(value) ?? 'null';
@@ -764,6 +764,11 @@ function recordedFingerprint(payload: unknown): string | null {
   return decisionFingerprint({ action: recorded.action, would_call: recorded.would_call, mode: recorded.mode });
 }
 
+/**
+ * Run every enabled family against the freshly computed digest. One pass
+ * per deterministic observation; a family that refuses or fails leaves its
+ * row untouched for LLM Silas.
+ */
 export async function runSilasAutopilot(input: SilasAutopilotInput): Promise<SilasAutopilotPassResult> {
   const log = input.log ?? ((): void => {});
   const counts: Record<string, MutableRuleCounts> = {};

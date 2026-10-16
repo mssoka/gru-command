@@ -65,8 +65,17 @@ export function promptRefusalUnproven(input: {
   if (input.admitted) return 'a native admission was already bound';
   if (input.prepared === undefined) return null;
   let evidence: string | undefined;
-  try { evidence = input.prepared.cessationEvidence?.(); } catch (error) { evidence = `unreadable: ${String(error)}`; }
+  try { evidence = input.prepared.cessationEvidence?.(); } catch (error) { evidence = `unreadable: ${boundedErrorText(error)}`; }
   return evidence === 'ceased' ? null : `prepared producer ${input.prepared.id} has not proven cessation (${evidence ?? 'no cessation evidence'})`;
+}
+
+/** An error as ledger-safe text: one JSON literal of at most 200 characters
+ * (line breaks and controls escaped), even when the error cannot print. */
+function boundedErrorText(error: unknown): string {
+  let text: string;
+  try { text = error instanceof Error ? `${error.name}: ${error.message}` : String(error); } catch { text = 'an error that cannot be printed'; }
+  const literal = JSON.stringify(text);
+  return literal.length <= 200 ? literal : `${JSON.stringify(text.slice(0, 180)).slice(0, -1)}…"`;
 }
 
 /** The target minion's runtime cannot host a native directive at all. Raised

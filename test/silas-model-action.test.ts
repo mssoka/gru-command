@@ -166,16 +166,22 @@ describe('H6 silas_action tool bindings (unit seams)', () => {
     // The rationale alone may break lines; length is in code points, the
     // unit JSON Schema maxLength counts.
     expect(await outcome({ action: 'hold', jobId: job.id, rationale: 'line one\n\tline two\n' })).toMatchObject({ ok: true });
+    // Joiners carry real text — an emoji sequence, Persian — and are allowed;
+    // private-use and unassigned code points are not.
+    expect(await outcome({ action: 'hold', jobId: job.id, rationale: '👩\u200d💻 می\u200cخواهم', family: 'joined\u200dtext' })).toMatchObject({ ok: true });
+    for (const [field, value] of [['rationale', 'private\ue000use'], ['debt', 'unassigned\u0378']] as const) {
+      expect(await outcome({ action: 'hold', jobId: job.id, [field]: value }), field).toMatchObject({ ok: false, reason: 'bad-field' });
+    }
     // The schema the model sees states the same rules.
     const schema = (tool.inputSchema as { properties: Record<string, { minLength?: number; description?: string }> }).properties;
     for (const field of ['jobId', 'family', 'debt', 'rationale']) {
-      expect(schema[field], field).toMatchObject({ minLength: 1, description: expect.stringContaining('no control, format or separator characters') });
+      expect(schema[field], field).toMatchObject({ minLength: 1, description: expect.stringContaining('no control, format, separator, private-use or unassigned characters') });
     }
     const astral = '\u{1F600}';
     expect(await outcome({ action: 'hold', jobId: job.id, rationale: astral.repeat(SILAS_ACTION_LIMITS.rationale) })).toMatchObject({ ok: true });
     expect(await outcome({ action: 'hold', jobId: job.id, rationale: astral.repeat(SILAS_ACTION_LIMITS.rationale + 1) }))
       .toMatchObject({ ok: false, reason: 'bad-field', message: `rationale must be at most ${String(SILAS_ACTION_LIMITS.rationale)} characters` });
-    expect(eventKinds().filter((row) => row.kind === 'silas.model-action')).toHaveLength(2);
+    expect(eventKinds().filter((row) => row.kind === 'silas.model-action')).toHaveLength(3);
   });
 
   it('refuses a missing or unknown action and a missing job, and a failed digest leaves no receipt (#368)', async () => {
@@ -283,7 +289,9 @@ describe('H6 the Silas slot spawn wiring (#368)', () => {
     await expect(spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() }, { nativeTools: [stale] }))
       .rejects.toThrow(/already carries a silas_action tool — each spawn binds its own/u);
     await expect(spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() }, { nativeTools: 'not tools' as never }))
-      .rejects.toThrow(/nativeTools must be an array/u);
+      .rejects.toThrow(/nativeTools must be an array of named native tools/u);
+    await expect(spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() }, { nativeTools: [null] as never }))
+      .rejects.toThrow(/nativeTools must be an array of named native tools/u);
     expect(spawns).toBe(1);
   });
 

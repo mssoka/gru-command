@@ -46,21 +46,24 @@ export const SILAS_ACTION_LIMITS = { jobId: 200, family: 128, debt: 128, rationa
 const BOUNDED_FIELDS = Object.keys(SILAS_ACTION_LIMITS) as readonly (keyof typeof SILAS_ACTION_LIMITS)[];
 const HEAD_SHA = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u;
 /** Characters that never enter the audit record: every control (Cc),
- * format (Cf — bidi overrides and isolates, zero-width, tags) and line or
- * paragraph separator (Zl/Zp). The rationale alone may carry tabs and line
- * feeds; a carriage return could overwrite a rendered line, so it never
- * may. */
-const UNSAFE_TEXT = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu;
+ * format (Cf — bidi overrides and isolates, zero-width spaces, tags), line or
+ * paragraph separator (Zl/Zp), private-use (Co) and unassigned (Cn) code
+ * point. The zero-width joiner and non-joiner are the exception: emoji
+ * sequences and Indic or Persian text need them, and they cannot reorder or
+ * hide a line. The rationale alone may carry tabs and line feeds; a carriage
+ * return could overwrite a rendered line, so it never may. */
+const UNSAFE_TEXT = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Co}\p{Cn}]/gu;
+const JOINERS: ReadonlySet<string> = new Set(['\u200c', '\u200d']);
 const hasUnsafeText = (value: string, allowBreaks: boolean): boolean =>
-  [...value.matchAll(UNSAFE_TEXT)].some(([char]) => !(allowBreaks && (char === '\t' || char === '\n')));
+  [...value.matchAll(UNSAFE_TEXT)].some(([char]) => !JOINERS.has(char) && !(allowBreaks && (char === '\t' || char === '\n')));
 
-const TEXT_RULE = 'non-blank; length in code points; no control, format or separator characters';
+const TEXT_RULE = 'non-blank; length in code points; no control, format, separator, private-use or unassigned characters (zero-width joiners allowed)';
 
 /** Why a present bounded field is unusable, or null when it is fine. */
 function boundedFieldProblem(field: keyof typeof SILAS_ACTION_LIMITS, value: unknown): string | null {
   const limit = SILAS_ACTION_LIMITS[field];
   if (typeof value !== 'string' || value.trim() === '') return `${field} must be a non-blank string`;
-  // A lone surrogate would be rewritten on its JSON round trip.
+  // A lone surrogate is no character a reader can see, and no UTF-8 text.
   if (/\p{Surrogate}/u.test(value)) return `${field} must be well-formed Unicode`;
   if ([...value].length > limit) return `${field} must be at most ${String(limit)} characters`;
   if (hasUnsafeText(value, field === 'rationale')) return `${field} must not contain control, format or separator characters`;
@@ -192,7 +195,9 @@ export function spawnSilasWithActionTool(
     ...(deps.log !== undefined ? { log: deps.log } : {}),
   });
   const callerTools: unknown = spawnOptions?.nativeTools ?? [];
-  if (!Array.isArray(callerTools)) return Promise.reject(new TypeError('spawn options nativeTools must be an array of native tools'));
+  if (!Array.isArray(callerTools) || callerTools.some((tool) => tool === null || typeof tool !== 'object' || typeof (tool as { name?: unknown }).name !== 'string')) {
+    return Promise.reject(new TypeError('spawn options nativeTools must be an array of named native tools'));
+  }
   if ((callerTools as readonly NativeAgentTool[]).some((tool) => tool.name === SILAS_MODEL_ACTION_TOOL)) {
     return Promise.reject(new Error(
       `the Silas spawn already carries a ${SILAS_MODEL_ACTION_TOOL} tool — each spawn binds its own; pass spawn options without it`,

@@ -914,7 +914,15 @@ describe('restart-recovery-progress — exact native request matrix', () => {
   it('#364 no-effect proof: a prepared producer with no cessation evidence is kept', () =>
     expect(unproven({ prepared: prepared(undefined) })).toMatch(/minion-x has not proven cessation \(no cessation evidence\)/u));
   it('#364 no-effect proof: an unreadable cessation is unproven, never thrown', () =>
-    expect(unproven({ prepared: prepared(() => { throw new Error('lock unreadable'); }) })).toBe('prepared producer minion-x has not proven cessation (unreadable: Error: lock unreadable)'));
+    expect(unproven({ prepared: prepared(() => { throw new Error('lock unreadable'); }) })).toBe('prepared producer minion-x has not proven cessation (unreadable: "Error: lock unreadable")'));
+  it('#364 no-effect proof: an unreadable cessation is quoted bounded and line-safe, even when it cannot print', () => {
+    const long = unproven({ prepared: prepared(() => { throw new Error(`line one\nline two ${'x'.repeat(500)}`); }) })!;
+    expect(long).not.toContain('\n');
+    expect(long).toMatch(/\(unreadable: "Error: line one\\nline two x+…"\)$/u);
+    expect(long.length).toBeLessThan(300);
+    const hostile = { toString() { throw new Error('no'); } };
+    expect(unproven({ prepared: prepared(() => { throw hostile; }) })).toBe('prepared producer minion-x has not proven cessation (unreadable: "an error that cannot be printed")');
+  });
   it('#364 no-effect proof: a bound native admission is never a no-effect', () => expect(unproven({ admitted: true })).toMatch(/admission was already bound/u));
   it('#364 no-effect proof: a refusal with a failed cleanup is kept', () => expect(unproven({ failures: 2 })).toMatch(/cleanup also failed/u));
   it('#364 no-effect proof: any other error is not an admission refusal', () => expect(unproven({ error: new Error('x') })).toBe('not an admission refusal'));

@@ -7,6 +7,7 @@ import { LIVE_DIRECTIVE_STATES } from '../src/ledger/directives.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import {
   AUTOPILOT_DECISION_EVENT,
+  canonicalJson,
   AUTOPILOT_SOURCE,
   autopilotRuleMode,
   runSilasAutopilot,
@@ -455,6 +456,15 @@ describe('autopilot mode resolution (kill switch + per-family modes)', () => {
     expect(() => ledger.latestJobEventByPayloadField(job.id, AUTOPILOT_DECISION_EVENT, "rule_id') OR 1=1 --", 'x')).toThrow(/not a plain snake_case payload field/u);
   });
 
+  it('canonical JSON sorts keys at every depth and serializes values as JSON.stringify does (#369)', () => {
+    expect(canonicalJson({ b: 1, a: { d: [3, { y: 1, x: 2 }], c: 'é' } })).toBe('{"a":{"c":"é","d":[3,{"x":2,"y":1}]},"b":1}');
+    expect(canonicalJson({ b: 1, a: 2 })).toBe(canonicalJson({ a: 2, b: 1 }));
+    const when = new Date('2026-10-16T00:00:00.000Z');
+    expect(canonicalJson({ when })).toBe(JSON.stringify({ when }));
+    expect(canonicalJson({ gone: undefined, fn: () => 1, kept: null })).toBe('{"kept":null}');
+    expect(canonicalJson([undefined, () => 1, 'x'])).toBe(JSON.stringify([undefined, () => 1, 'x']));
+  });
+
   it('a decision recorded before fingerprints existed is the same decision on upgrade (#369)', async () => {
     const ledger = new FakeLedger().job('job-release', 'done');
     const ops = fakeOps();
@@ -467,7 +477,7 @@ describe('autopilot mode resolution (kill switch + per-family modes)', () => {
     const reversed = (value: unknown): unknown => value !== null && typeof value === 'object' && !Array.isArray(value)
       ? Object.fromEntries(Object.entries(value).reverse().map(([key, member]) => [key, reversed(member)])) : value;
     (first as { payload: unknown }).payload = { ...legacy, would_call: reversed(legacy['would_call']) };
-    expect(JSON.stringify((first!.payload as { would_call?: unknown }).would_call)).not.toBe(JSON.stringify(legacy["would_call"]));
+    expect(JSON.stringify((first!.payload as { would_call?: unknown }).would_call)).not.toBe(JSON.stringify(legacy['would_call']));
     await pass();
     expect(ledger.decisions()).toHaveLength(1);
   });
