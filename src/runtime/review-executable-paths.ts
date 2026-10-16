@@ -2663,6 +2663,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/property/adapters/matrix.js",
   "dist/property/adapters/vitest-fast-check.js",
   "dist/property/config.js",
+  "dist/property/error-text.js",
   "dist/property/executor.js",
   "dist/property/freeze.js",
   "dist/property/metrics.js",
