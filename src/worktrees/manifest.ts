@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, symlinkSync, copyFileSync, mkdirSync, statSync } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, win32 } from 'node:path';
 import { parse } from 'smol-toml';
 import type { LogLevel } from '../logger.js';
 import { repositoryGitEnv } from '../dispatch/perkins-review/artifacts.js';
@@ -33,6 +33,11 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  *
  *   [vector]                 # Vector's raids (#351, docs/VECTOR.md)
  *   enabled = false          #   false removes this repository from raid candidates
+ *
+ *   reclaim = ["build"]      # top-level, before any table (#427): repo-relative
+ *                            #   folders setup or builds create and git ignores,
+ *                            #   which GC may delete and recreate; never .., an
+ *                            #   absolute path, ".", .git or .gru-command
  */
 
 export const MANIFEST_DIR = '.gru-command';
@@ -68,6 +73,8 @@ export interface WorktreeManifest {
   readonly verify: ManifestVerify;
   /** Per-repository raid opt-out (#351); absent means the instance setting decides. */
   readonly vector?: { readonly enabled: boolean };
+  /** Regenerable folders (#427): repo-relative, normalized ("a/b"), unique. Nothing consumes them yet. */
+  readonly reclaim?: readonly string[];
   /** Historical manifests remain readable for already-running jobs; creation refuses this obsolete GC bootstrap. */
   readonly retiredGcBmadBootstrap?: true;
 }
@@ -103,8 +110,8 @@ export function parseWorktreeManifest(text: string, source = MANIFEST_PATH): Wor
     throw new Error(`worktree manifest ${source} is not valid TOML: ${String(error)}`);
   }
   for (const key of Object.keys(raw)) {
-    if (!['link', 'copy', 'setup', 'verify', 'vector'].includes(key)) {
-      throw new Error(`worktree manifest ${source} has unknown key "${key}" (valid: link, copy, setup, verify, vector)`);
+    if (!['link', 'copy', 'setup', 'verify', 'vector', 'reclaim'].includes(key)) {
+      throw new Error(`worktree manifest ${source} has unknown key "${key}" (valid: link, copy, setup, verify, vector, reclaim)`);
     }
   }
 
@@ -175,13 +182,44 @@ export function parseWorktreeManifest(text: string, source = MANIFEST_PATH): Wor
     vector = { enabled };
   }
 
+  let reclaim: string[] | undefined;
+  const rawReclaim = raw['reclaim'];
+  if (rawReclaim !== undefined) {
+    if (!Array.isArray(rawReclaim)) throw new Error(`worktree manifest ${source}: reclaim must be an array of repo-relative folder paths`);
+    reclaim = [];
+    for (const [index, entry] of rawReclaim.entries()) {
+      const at = `worktree manifest ${source} reclaim[${index}]`;
+      if (typeof entry !== 'string' || entry.trim() === '') throw new Error(`${at} must be a non-empty folder path, got: ${JSON.stringify(entry)}`);
+      if (entry.includes('\u0000')) throw new Error(`${at} must not contain NUL: ${JSON.stringify(entry)}`);
+      const value = entry.trim();
+      if (isAbsolute(value) || win32.isAbsolute(value)) throw new Error(`${at} must be relative to the repository root: ${JSON.stringify(entry)}`);
+      if (escapesTree(value)) throw new Error(`${at} must stay inside the repository (no ..): ${JSON.stringify(entry)}`);
+      const segments = value.split(/[\\/]/).filter((segment) => segment !== '' && segment !== '.');
+      if (segments.length === 0) throw new Error(`${at} must name a folder below the repository root, not the root itself: ${JSON.stringify(entry)}`);
+      const reserved = segments.find((segment) => segment === '.git' || segment === MANIFEST_DIR);
+      if (reserved !== undefined) throw new Error(`${at} must not be or be inside ${reserved}: ${JSON.stringify(entry)}`);
+      const normalized = segments.join('/');
+      const earlier = reclaim.indexOf(normalized);
+      if (earlier !== -1) throw new Error(`${at} ${JSON.stringify(entry)} duplicates reclaim[${earlier}] (both name "${normalized}")`);
+      reclaim.push(normalized);
+    }
+  }
+
   // Distinguish actual comment markers from the same text inside a user's
   // multiline setup string. Removing a comment cannot alter parsed TOML.
   const retired = [...text.matchAll(/^[\t ]*#[\t ]*(?:BEGIN|END)[\t ]+GRU[\t ]+COMMAND[\t ]+BMAD[\t ]+BOOTSTRAP\b[^\r\n]*/gmu)].some((match) => {
     const withoutLine = text.slice(0, match.index) + text.slice(match.index + match[0].length);
     try { return JSON.stringify(parse(withoutLine)) === JSON.stringify(raw); } catch { return false; }
   });
-  return { links, copies, setup, verify: verifyEntries, ...(vector === undefined ? {} : { vector }), ...(retired ? { retiredGcBmadBootstrap: true as const } : {}) };
+  return {
+    links,
+    copies,
+    setup,
+    verify: verifyEntries,
+    ...(vector === undefined ? {} : { vector }),
+    ...(reclaim === undefined ? {} : { reclaim }),
+    ...(retired ? { retiredGcBmadBootstrap: true as const } : {}),
+  };
 }
 
 /** Creation-only guard: historical jobs can still resolve their original verification commands. */

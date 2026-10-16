@@ -296,6 +296,20 @@ describe('service shutdown orchestration (issue #341, R3-2 executable)', () => {
     expect(run.lines.filter((line) => line.level === 'error').map((line) => line.msg)).toEqual(['vector raid planning stop failed']);
   });
 
+  it('stops onboarding after the raid halves, so a stop mid-scan aborts its origin probes; a failing stop never skips what follows (#427)', async () => {
+    const order: string[] = [];
+    const state: ServiceShutdownState = {
+      vectorRaids: { stop: () => { order.push('vectorRaids.stop'); } },
+      onboarding: { stop: () => { order.push('onboarding.stop'); throw new Error('probe already gone'); } },
+      handle: fakeHandle(order),
+    };
+    const run = runShutdown(state);
+    await run.exited;
+    expect(run.exits).toEqual([0]);
+    expect(order).toEqual(['vectorRaids.stop', 'onboarding.stop', 'handle.stop']);
+    expect(run.lines.filter((line) => line.level === 'error').map((line) => line.msg)).toEqual(['onboarding stop failed']);
+  });
+
   it('is the orchestration main.ts actually invokes (wiring alarm)', () => {
     const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
     expect(mainSource).toContain("from './service-shutdown.js'");
@@ -308,5 +322,8 @@ describe('service shutdown orchestration (issue #341, R3-2 executable)', () => {
     expect(mainSource.indexOf('state.vector = vector;')).toBeGreaterThan(-1);
     expect(mainSource.indexOf('state.vectorRaids = vectorRaids;')).toBeGreaterThan(-1);
     expect(mainSource.indexOf('startVectorHalves({ planning: vector, runner: vectorRaids }')).toBeGreaterThan(registered);
+    // #427: onboarding reaches the state bag before it starts scanning.
+    expect(mainSource.indexOf('state.onboarding = onboarding;')).toBeGreaterThan(-1);
+    expect(mainSource.indexOf('startOnboarding(onboarding,')).toBeGreaterThan(mainSource.indexOf('state.onboarding = onboarding;'));
   });
 });

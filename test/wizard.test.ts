@@ -523,6 +523,35 @@ describe('wizard CLI surface', () => {
     }
   });
 
+  it('non-interactive setup reports the onboarding check but never writes onboarding consent (#427)', () => {
+    const repoRoot = join(import.meta.dirname, '..');
+    const workspace = tempDir('gru-command-wizard-onboard-ws-');
+    const origins = tempDir('gru-command-wizard-onboard-origins-');
+    const git = (cwd: string, ...args: string[]): void => {
+      execFileSync('git', ['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', ...args], { cwd, stdio: 'ignore' });
+    };
+    const dir = join(workspace, 'swift-app');
+    mkdirSync(dir);
+    git(dir, 'init', '-q', '-b', 'main');
+    writeFileSync(join(dir, 'README.md'), '# swift-app\n');
+    git(dir, 'add', '-A');
+    git(dir, 'commit', '-qm', 'seed');
+    git(origins, 'init', '-q', '--bare', '-b', 'main', join(origins, 'swift-app.git'));
+    git(dir, 'remote', 'add', 'origin', join(origins, 'swift-app.git'));
+    git(dir, 'push', '-q', 'origin', 'main');
+    const home = tempDir('gru-command-wizard-onboard-home-');
+    const result = spawnSync(process.execPath, [join(repoRoot, 'dist/wizard/main.js'), '--no-interact', '--answers',
+      JSON.stringify({ workspace_root: workspace, repos: ['swift-app'], port: 0, smoke: false })], {
+      env: { ...process.env, GRU_COMMAND_HOME: home },
+      encoding: 'utf-8',
+      timeout: 30_000,
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain('swift-app: NO manifest on origin/main');
+    expect(result.stdout).toContain('Not onboarding from non-interactive setup');
+    expect(existsSync(join(home, 'onboarding-consent.json'))).toBe(false);
+  });
+
   it('unattended repeats preserve and deliberately replace the configured selection', () => {
     const repoRoot = join(import.meta.dirname, '..');
     const workspace = tempDir('gru-command-wizard-headless-managed-ws-');

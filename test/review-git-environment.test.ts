@@ -77,6 +77,17 @@ function foreignState(repo: FixtureRepo): unknown {
   };
 }
 
+/** Lanes apply their own committed manifest (#427): commit it in the parent
+ * lane and fast-forward main to it, so job lanes (main) and writer children
+ * (the parent's HEAD) both carry it, at the same commit. */
+function commitLaneManifest(repo: FixtureRepo, parentPath: string, manifest: string): void {
+  mkdirSync(join(parentPath, '.gru-command'), { recursive: true });
+  writeFileSync(join(parentPath, '.gru-command', 'worktree.toml'), manifest);
+  git(parentPath, ['add', '.gru-command/worktree.toml']);
+  git(parentPath, ['commit', '-qm', 'lane manifest']);
+  git(repo.path, ['merge', '--quiet', '--ff-only', git(parentPath, ['rev-parse', 'HEAD'])]);
+}
+
 function origin(repo: FixtureRepo): string {
   const path = attachBareOrigin(repo);
   repo.git(['push', '--quiet', 'origin', 'main']);
@@ -171,7 +182,7 @@ describe('review Git repository environment isolation (GH-270)', () => {
     const ref = authority === 'job' ? `refs/heads/gru/${id}` : `refs/heads/gru/${parentJob.id}-child-${id}`;
     const create = () => authority === 'job' ? h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: id })
       : h.worktrees.createChildWorktree({ repoPath: repo.path, jobId: parentJob.id, childId: id, parentPath: parent.path, authority });
-    return { repo, ...h, id, ref, create };
+    return { repo, ...h, parent, id, ref, create };
   }
 
   it('keeps original parent custody through queued bootstrap and registration child boundaries (final review)', async () => {
@@ -181,18 +192,24 @@ describe('review Git repository environment isolation (GH-270)', () => {
       const job = h.ledger.addJob({ id: 'parent', repo: 'assigned', title: 'original parent' });
       const parent = await h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id });
       const admin = git(parent.path, ['rev-parse', '--absolute-git-dir']);
+      const ready = join(directory(), 'ready'), release = `${ready}.release`, script = `${ready}.cjs`;
+      const blocking = seam === 'queue' || seam === 'bootstrap';
       writeFileSync(join(parent.path, 'advance'), 'healthy parent advance');
+      if (blocking) {
+        writeFileSync(script, `const fs=require('node:fs');fs.writeFileSync(${JSON.stringify(ready)},process.cwd());let n=0;const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(release)})){clearInterval(timer);}else if(++n===1000){clearInterval(timer);process.exitCode=7;}},10);`);
+        const manifest = `[[setup]]\ncommand = ${JSON.stringify(`"${process.execPath}" "${script}"`)}\n`;
+        // Lanes apply their own committed manifest (#427): the writer child
+        // carries it from the parent's advance, the queue's blocker from main.
+        mkdirSync(join(parent.path, '.gru-command'), { recursive: true });
+        writeFileSync(join(parent.path, '.gru-command/worktree.toml'), manifest);
+        git(parent.path, ['add', '.gru-command/worktree.toml']);
+        repo.commitFile('.gru-command/worktree.toml', manifest);
+      }
       git(parent.path, ['add', 'advance']); git(parent.path, ['commit', '-qm', 'advance original writer']);
       const advanced = git(parent.path, ['rev-parse', 'HEAD']);
       git(repo.path, ['branch', 'foreign-parent', advanced]);
       const mutate = () => { writeFileSync(join(admin, 'HEAD'), 'ref: refs/heads/foreign-parent\n'); writeFileSync(join(parent.path, 'foreign-data'), 'retain parent'); };
-      const ready = join(directory(), 'ready'), release = `${ready}.release`, script = `${ready}.cjs`;
       const blocker = h.ledger.addJob({ id: 'locker', repo: 'assigned', title: 'holds repo lock' });
-      if (seam === 'queue' || seam === 'bootstrap') {
-        writeFileSync(script, `const fs=require('node:fs');fs.writeFileSync(${JSON.stringify(ready)},process.cwd());let n=0;const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(release)})){clearInterval(timer);}else if(++n===1000){clearInterval(timer);process.exitCode=7;}},10);`);
-        mkdirSync(join(repo.path, '.gru-command'), { recursive: true });
-        writeFileSync(join(repo.path, '.gru-command/worktree.toml'), `[[setup]]\ncommand = ${JSON.stringify(`"${process.execPath}" "${script}"`)}\n`);
-      }
       const stop = h.bus.subscribe((event) => { if (seam === 'registration' && event.kind === 'worktree.created' && h.ledger.getWorktree('child') !== null) mutate(); });
       const operations: Promise<unknown>[] = [];
       try {
@@ -268,8 +285,7 @@ describe('review Git repository environment isolation (GH-270)', () => {
       const h = await rollbackRaceFixture(`final-success-fifo-${authority}-${fifo}`, authority);
       const root = directory(), ready = join(root, 'ready.json'), finished = join(root, 'finished'), unblocked = join(root, 'unblocked'), script = join(root, 'setup.cjs');
       writeFileSync(script, `const fs=require('node:fs'),cp=require('node:child_process'),p=require('node:path');const admin=cp.execFileSync('git',['rev-parse','--absolute-git-dir'],{encoding:'utf8'}).trim(),common=fs.realpathSync(p.resolve(admin,fs.readFileSync(p.join(admin,'commondir'),'utf8').trim())),file=${metadata === 'HEAD' ? "p.join(admin,'HEAD')" : "p.join(common,cp.execFileSync('git',['symbolic-ref','HEAD'],{encoding:'utf8'}).trim())"},head=fs.readFileSync(file,'utf8');fs.writeFileSync(p.join(process.cwd(),'retained-data'),'owned successful setup');${fifo ? "fs.unlinkSync(file);cp.execFileSync('mkfifo',[file]);" : ''}fs.writeFileSync(${JSON.stringify(ready)},JSON.stringify({file,head,tree:process.cwd(),admin}));`);
-      mkdirSync(join(h.repo.path, '.gru-command'), { recursive: true });
-      writeFileSync(join(h.repo.path, '.gru-command/worktree.toml'), `[[setup]]\ncommand = ${JSON.stringify(`"${process.execPath}" "${script}"`)}\n`);
+      commitLaneManifest(h.repo, h.parent.path, `[[setup]]\ncommand = ${JSON.stringify(`"${process.execPath}" "${script}"`)}\n`);
       const child = spawn(process.execPath, ['-e', `const fs=require('node:fs');let n=0;const poll=setInterval(()=>{if(fs.existsSync(${JSON.stringify(finished)})){clearInterval(poll);}else if(fs.existsSync(${JSON.stringify(ready)})){clearInterval(poll);setTimeout(()=>{if(fs.existsSync(${JSON.stringify(finished)}))return;const r=JSON.parse(fs.readFileSync(${JSON.stringify(ready)},'utf8'));if(!fs.lstatSync(r.file).isFIFO())return;const fd=fs.openSync(r.file,fs.constants.O_RDWR|fs.constants.O_NONBLOCK);fs.writeSync(fd,r.head);fs.closeSync(fd);fs.unlinkSync(r.file);fs.writeFileSync(r.file,r.head);fs.writeFileSync(${JSON.stringify(unblocked)},'owned unblock');},800);}else if(++n===1000){clearInterval(poll);process.exitCode=9;}},10);`], { stdio: 'pipe' });
       console.error(`[final-bootstrap-fifo] owned child pid=${child.pid}`);
       const settled = new Promise<number | null>((done, reject) => { child.once('error', reject); child.once('close', (code) => { console.error(`[final-bootstrap-fifo] child closed pid=${child.pid} code=${code}`); done(code); }); });
@@ -2450,9 +2466,7 @@ if (argv.includes('POST')) {
     const { ledger, worktrees, root } = manager();
     const job = ledger.addJob({ id: 'bootstrap-retarget', repo: 'assigned', title: 'retarget', baseBranch: 'main' });
     const parent = await worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id });
-    mkdirSync(join(repo.path, '.gru-command'), { recursive: true });
-    writeFileSync(join(repo.path, '.gru-command', 'worktree.toml'),
-      `[[setup]]\ncommand = 'git symbolic-ref HEAD refs/heads/main; printf retain > .setup-data'\n`);
+    commitLaneManifest(repo, parent.path, `[[setup]]\ncommand = 'git symbolic-ref HEAD refs/heads/main; printf retain > .setup-data'\n`);
     const before = git(repo.path, ['rev-parse', 'refs/heads/main']);
     const other = ledger.addJob({ id: 'bootstrap-new-job', repo: 'assigned', title: 'new', baseBranch: 'main' });
     for (const authority of ['job', 'writer'] as const) {

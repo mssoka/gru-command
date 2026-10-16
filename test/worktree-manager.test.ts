@@ -34,6 +34,7 @@ interface Harness {
   escalations: { title: string; detail: string }[];
   swept: string[];
   baseFallbacks: BaseFallbackNotice[];
+  logs: { level: string; msg: string; fields: Record<string, unknown> }[];
   enumerator: ReturnType<typeof vi.fn>;
   make: (name?: string) => FixtureRepo;
   dispose: () => Promise<void>;
@@ -44,6 +45,7 @@ function makeHarness(useDefaultEnumerator = false): Harness {
   const escalations: { title: string; detail: string }[] = [];
   const swept: string[] = [];
   const baseFallbacks: BaseFallbackNotice[] = [];
+  const logs: Harness['logs'] = [];
   const ledgerDb = new LedgerDb(mkdtempSync(join(tmpdir(), 'gru-command-wtdata-')));
   const ledger = new LedgerApi(ledgerDb.handle, { bus: new EventBus({}) });
   const enumerator = vi.fn<(treePath: string) => readonly TreeProcess[]>(() => []);
@@ -63,6 +65,7 @@ function makeHarness(useDefaultEnumerator = false): Harness {
       swept.push(worktree.id);
     },
     onBaseFallback: (input) => baseFallbacks.push({ ...input }),
+    log: (level, msg, fields) => logs.push({ level, msg, fields: fields ?? {} }),
     ...(useDefaultEnumerator ? {} : { enumerateProcesses: (treePath: string) => enumerator(treePath) }),
   });
   return {
@@ -72,6 +75,7 @@ function makeHarness(useDefaultEnumerator = false): Harness {
     escalations,
     swept,
     baseFallbacks,
+    logs,
     enumerator,
     make(name?: string): FixtureRepo {
       const repo = makeFixtureRepo(name ?? 'fixture-wt');
@@ -136,14 +140,84 @@ describe('worktree manager: creation (ruling 18a/b/d/e)', () => {
   it('applies the bootstrap manifest automatically at creation', async () => {
     const h = harness();
     const repo = h.make('fixture-boot');
-    mkdirSync(join(repo.path, '.gru-command'), { recursive: true });
-    writeFileSync(
-      join(repo.path, '.gru-command', 'worktree.toml'),
-      '[[setup]]\ncommand = "echo ok > .boot-marker"',
-    );
+    // Lanes apply their own committed manifest (#427), so the fixture commits it.
+    repo.commitFile('.gru-command/worktree.toml', '[[setup]]\ncommand = "echo ok > .boot-marker"');
     ledgerJob(h, 'job-boot', repo);
     const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-boot' });
     expect(existsSync(join(row.path, '.boot-marker'))).toBe(true);
+  });
+
+  it('applies the lane\'s own committed manifest, never an uncommitted local edit; the warn names both files (#427)', async () => {
+    const h = harness();
+    const repo = h.make('fixture-lane-manifest');
+    repo.commitFile('.gru-command/worktree.toml', '[[setup]]\ncommand = "echo committed > .committed-marker"\n');
+    writeFileSync(join(repo.path, '.gru-command', 'worktree.toml'), '[[setup]]\ncommand = "echo local > .local-marker"\n');
+    ledgerJob(h, 'job-lane-manifest', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-lane-manifest' });
+    expect(existsSync(join(row.path, '.committed-marker'))).toBe(true);
+    expect(existsSync(join(row.path, '.local-marker'))).toBe(false);
+    const warn = h.logs.find((line) => line.level === 'warn' && line.msg.includes('manifest differs'));
+    expect(warn?.fields).toMatchObject({
+      source_manifest: join(realpathSync(repo.path), '.gru-command', 'worktree.toml'),
+      lane_manifest: join(row.path, '.gru-command', 'worktree.toml'),
+      lane_has_manifest: true,
+    });
+  });
+
+  it('an uncommitted manifest in the source checkout only runs no setup, and the warn says the lane has none (#427)', async () => {
+    const h = harness();
+    const repo = h.make('fixture-local-only');
+    mkdirSync(join(repo.path, '.gru-command'), { recursive: true });
+    writeFileSync(join(repo.path, '.gru-command', 'worktree.toml'), '[[setup]]\ncommand = "echo local > .local-marker"\n');
+    ledgerJob(h, 'job-local-only', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-local-only' });
+    expect(row.status).toBe('active');
+    expect(existsSync(join(row.path, '.local-marker'))).toBe(false);
+    expect(existsSync(join(row.path, '.gru-command', 'worktree.toml'))).toBe(false);
+    const warn = h.logs.find((line) => line.level === 'warn' && line.msg.includes('manifest differs'));
+    expect(warn?.fields).toMatchObject({
+      source_manifest: join(realpathSync(repo.path), '.gru-command', 'worktree.toml'),
+      lane_manifest: join(row.path, '.gru-command', 'worktree.toml'),
+      lane_has_manifest: false,
+    });
+  });
+
+  it('an unreadable source manifest beside a lane with none still warns, naming both files and the error (#427)', async () => {
+    const h = harness();
+    const repo = h.make('fixture-unreadable-source');
+    // A directory where the manifest file belongs: it exists, and reading it fails.
+    mkdirSync(join(repo.path, '.gru-command', 'worktree.toml'), { recursive: true });
+    ledgerJob(h, 'job-unreadable-source', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-unreadable-source' });
+    expect(row.status).toBe('active');
+    const warn = h.logs.find((line) => line.level === 'warn' && line.msg.includes('manifest differs'));
+    expect(warn?.fields).toMatchObject({
+      source_manifest: join(realpathSync(repo.path), '.gru-command', 'worktree.toml'),
+      lane_manifest: join(row.path, '.gru-command', 'worktree.toml'),
+      lane_has_manifest: false,
+    });
+    expect(String(warn?.fields['source_error'])).toMatch(/EISDIR/u);
+  });
+
+  it('a manifest merged on origin runs its setup in the next lane before the checkout pulls it; copies still come from the checkout (#427)', async () => {
+    const h = harness();
+    const repo = h.make('fixture-merged-unpulled');
+    const origin = attachBareOrigin(repo);
+    const localHead = repo.head();
+    repo.commitFile('.gru-command/worktree.toml', '[[copy]]\nfrom = ".env.local"\nto = ".env.local"\n[[setup]]\ncommand = "echo merged > .merged-marker"\n');
+    repo.git(['push', '--quiet', 'origin', 'main']);
+    repo.git(['symbolic-ref', 'HEAD', 'refs/heads/main'], origin);
+    // The owner's checkout never pulled the merge.
+    repo.git(['reset', '--quiet', '--hard', localHead]);
+    repo.git(['update-ref', '-d', 'refs/remotes/origin/main']);
+    expect(existsSync(join(repo.path, '.gru-command', 'worktree.toml'))).toBe(false);
+    writeFileSync(join(repo.path, '.env.local'), 'TOKEN=from-the-checkout\n');
+    ledgerJob(h, 'job-merged-unpulled', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-merged-unpulled' });
+    expect(row.baseSource).toBe('origin');
+    expect(readFileSync(join(row.path, '.merged-marker'), 'utf-8')).toBe('merged\n');
+    expect(readFileSync(join(row.path, '.env.local'), 'utf-8')).toBe('TOKEN=from-the-checkout\n');
+    expect(h.logs.some((line) => line.level === 'warn' && line.msg.includes('manifest differs'))).toBe(false);
   });
 
   it('provisions full verification in a fresh job lane without local BMAD onboarding', async () => {
@@ -243,8 +317,7 @@ describe('worktree manager: creation (ruling 18a/b/d/e)', () => {
   it('rolls the worktree back when the bootstrap manifest fails', async () => {
     const h = harness();
     const repo = h.make('fixture-bootfail');
-    mkdirSync(join(repo.path, '.gru-command'), { recursive: true });
-    writeFileSync(join(repo.path, '.gru-command', 'worktree.toml'), '[[setup]]\ncommand = "exit 9"');
+    repo.commitFile('.gru-command/worktree.toml', '[[setup]]\ncommand = "exit 9"');
     ledgerJob(h, 'job-bootfail', repo);
     await expect(
       h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-bootfail' }),
@@ -282,11 +355,7 @@ describe('worktree manager: creation (ruling 18a/b/d/e)', () => {
   it('creates review worktrees DETACHED — no branch, ever (ruling 18d)', async () => {
     const h = harness();
     const repo = h.make();
-    mkdirSync(join(repo.path, '.gru-command'), { recursive: true });
-    writeFileSync(
-      join(repo.path, '.gru-command', 'worktree.toml'),
-      '[[setup]]\ncommand = "echo bootstrap-output > .boot-marker"',
-    );
+    repo.commitFile('.gru-command/worktree.toml', '[[setup]]\ncommand = "echo bootstrap-output > .boot-marker"');
     ledgerJob(h, 'job-reviewable', repo);
     const jobRow = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-reviewable' });
     expect(existsSync(join(jobRow.path, '.boot-marker'))).toBe(true);
@@ -1297,9 +1366,7 @@ describe('Perkins r2 B1: failed bootstrap rollback un-wedges the job id', () => 
   it('a failed setup deletes the branch it created — the SAME job id retries cleanly', async () => {
     const h = harness();
     const repo = h.make('fixture-unwedge');
-    const { mkdirSync: mk, writeFileSync: wf } = await import('node:fs');
-    mk(join(repo.path, '.gru-command'), { recursive: true });
-    wf(join(repo.path, '.gru-command', 'worktree.toml'), '[[setup]]\ncommand = "exit 5"');
+    repo.commitFile('.gru-command/worktree.toml', '[[setup]]\ncommand = "exit 5"');
     ledgerJob(h, 'job-wedge', repo);
     await expect(
       h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-wedge' }),
@@ -1307,7 +1374,7 @@ describe('Perkins r2 B1: failed bootstrap rollback un-wedges the job id', () => 
     // No leftover branch wedging the id…
     expect(repo.git(['branch', '--list', 'gru/job-wedge'])).toBe('');
     // …so the retry (with the manifest fixed) succeeds on the SAME id.
-    wf(join(repo.path, '.gru-command', 'worktree.toml'), '[[setup]]\ncommand = "true"');
+    repo.commitFile('.gru-command/worktree.toml', '[[setup]]\ncommand = "true"');
     const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-wedge' });
     expect(row.branch).toBe('gru/job-wedge');
     expect(existsSync(row.path)).toBe(true);
@@ -1563,8 +1630,7 @@ describe('Perkins r4 B1: manifest [[link]] lanes are releasable (the link is a d
     // the exact shape the bootstrap manifest exists for.
     mkdirSync(join(repo.path, '_shared'), { recursive: true });
     writeFileSync(join(repo.path, '_shared', 'knowledge.txt'), 'shared knowledge');
-    mkdirSync(join(repo.path, '.gru-command'), { recursive: true });
-    writeFileSync(join(repo.path, '.gru-command', 'worktree.toml'), '[[link]]\nat = "_shared"\nto = "_shared"');
+    repo.commitFile('.gru-command/worktree.toml', '[[link]]\nat = "_shared"\nto = "_shared"');
     ledgerJob(h, 'job-link', repo);
     const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-link' });
     // Lane reality: an untracked symlink + an untracked regular deliverable.

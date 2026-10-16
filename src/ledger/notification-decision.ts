@@ -60,8 +60,9 @@ export interface NotificationDecision {
 
 /** Owner proposals whose PRODUCER may withdraw them undecided, because the
  * thing proposed changed before the owner answered (#351: a raid target's
- * code moved). Every other undecided owner row stays open until answered. */
-const PRODUCER_WITHDRAWABLE_KINDS: readonly string[] = ['vector.raid-proposal'];
+ * code moved; #427: the repository left managed_repos, or onboarding was
+ * turned off). Every other undecided owner row stays open until answered. */
+const PRODUCER_WITHDRAWABLE_KINDS: readonly string[] = ['vector.raid-proposal', 'onboarding.proposal'];
 
 export function producerWithdrawable(kind: string): boolean {
   return PRODUCER_WITHDRAWABLE_KINDS.includes(kind);

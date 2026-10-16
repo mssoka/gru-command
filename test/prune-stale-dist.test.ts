@@ -58,10 +58,11 @@ describe('prune-stale-dist', () => {
     // (dist/git-env.js); #379/#380 the shared one-line error text
     // (dist/property/error-text.js); #364/#367 the shared line-safe escape
     // (dist/dispatch/line-safe.js); #424 the Claude directive permission
-    // channel (dist/runtime/claude-directive.js).
-    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5198);
+    // channel (dist/runtime/claude-directive.js); #427 the six onboarding
+    // modules (dist/onboarding/*.js).
+    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5204);
     expect(createHash('sha256').update(`${[...PUBLIC_REVIEW_EXECUTABLE_PATHS].sort().join('\n')}\n`).digest('hex'))
-      .toBe('5812e11834a9ff9a634172cc348be4f944cad4753a504cb6c88caca86bdd2715');
+      .toBe('db9dc5e9d624006fac1d1a2fb86ba0ae35c9d861ad811885a4aa53482cfc4fea');
     const root = fixtureRoot();
     touch(root, 'src/worktrees/handoff.ts'); touch(root, 'dist/worktrees/handoff.js');
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', dependencies: {} }));

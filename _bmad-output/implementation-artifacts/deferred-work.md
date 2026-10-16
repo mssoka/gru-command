@@ -334,3 +334,16 @@ warrants. They are recorded, not dropped:
 ## Deferred from: post-integration tracked review of PR #289 (2026-10-12)
 
 - [Review][Defer] `captureFallbackInput` (`src/dispatch/perkins.ts`) runs `git reset -q --` after `git add -N .`; this can reset the caller's whole index (including staged-only content), and a partial `git add -N` failure may leave temporary intent-to-add entries. The exact code is already present at main `79c032e5` and unchanged by the task's PR-base diff, so it is outside this integration correction and remains an explicit follow-up, not fixed or dismissed as harmless. A separately authorized change should preserve/restore the caller's index and test staged-only content plus partial preparation failure.
+
+
+## Deferred from: #427 disk-use program (2026-10-16)
+
+- source_spec: none
+  summary: #427 follow-up "GC-folder manifest" — a manifest kept in GC's own folder for managed repos GC cannot push an onboarding PR to, shown as a degraded state, never silent.
+  evidence: Split from #427 PR 1 by owner choice (2026-10-16). After PR 1a, lane bootstrap applies the lane's committed manifest (`src/worktrees/manager.ts` `bootstrap()`), and verify reads the lane (`src/verify/server.ts:349`, `src/runtime/worker-verification-policy.ts:483`); a GC-folder manifest needs an explicit, recorded precedence over both.
+- source_spec: none
+  summary: #427 follow-up "re-onboarding" — propose re-onboarding when lanes of a managed repo keep failing bootstrap setup.
+  evidence: Split from #427 PR 1 by owner choice (2026-10-16). Needs a lane-setup-failure signal from `applyWorktreeManifest` failures; it reuses the onboarding proposal path PR 1a adds.
+- source_spec: `_bmad-output/implementation-artifacts/spec-gh-427-onboarding-heist.md`
+  summary: #427 PR 1b — code-run proof of an onboarding manifest in a throwaway lane at the PR head (setup, `verify.full` via the scheduler under scope `onboarding-proof`, measured git-ignored folders vs `reclaim`), an unforceable review fence until it passes, and the evidence comment on the PR plus a Perkins packet block.
+  evidence: Split from PR 1 by owner choice (2026-10-16) for spec size; it touches review gating (`branch-idle.ts:350`, `perkins.ts:3989,4051`, `silas-driver.ts:1590-1639`), the verification server, and a new `GhApiPort.commentOnPull`, worth reviewing on its own.

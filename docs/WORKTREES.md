@@ -11,6 +11,9 @@ Each project repo declares its fresh-worktree needs in-repo at
 `<repo>/.gru-command/worktree.toml`; applied automatically at creation:
 
 ```toml
+reclaim = ["build"]      # top-level, before any table: folders setup or builds
+                         #   create and git ignores, which GC may regenerate
+
 [[link]]                 # symlink created in the fresh worktree
 at = "fixtures/large"    #   worktree-relative (no ..)
 to = "fixtures/large"    #   target: repo-root-relative (.. allowed) or absolute
@@ -30,6 +33,26 @@ quick = "npm run lint"
 A missing manifest is a no-op; a malformed one fails loud and rolls the
 worktree back **all the way** (worktree AND the branch the failed call
 created — a leftover `gru/<job>` would wedge the job id forever).
+
+**Which manifest applies (#427).** Bootstrap applies the manifest committed
+in the **lane** itself. A job lane is created at the fetched origin head, so a
+manifest merged on origin takes effect in the next lane even when the source
+checkout has not pulled it. An uncommitted manifest that exists only in the
+source checkout runs no setup. A writer child lane starts at its parent lane's
+HEAD, so it applies the manifest committed there, including the minion's own
+commits. That is no new authority: the minion can already run any command in
+its lane with its shell. `[[link]]` and `[[copy]]` entries still resolve from
+the source checkout. When the source checkout's manifest differs from the
+lane's, or the lane has none, or it cannot be read, the manager logs a `warn`
+naming both files.
+
+**`reclaim` (#427)** lists repo-relative folders that setup or builds create
+and that git ignores, so GC may delete and recreate them. Each entry is
+normalized (`./build/` → `build`). An entry fails loud, naming it, when it is
+empty or `.`, absolute, contains `..` or NUL, has a `.git` or `.gru-command`
+segment (it is, or sits inside, one), or repeats an earlier entry. Nothing
+consumes `reclaim` yet. Onboarding heists write it
+([ONBOARDING.md](./ONBOARDING.md)).
 
 GC-owned workflows need no BMAD manifest entry or project/global installation.
 New lanes bind the owned workflow and explicit artifact context when the minion

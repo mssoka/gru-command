@@ -428,6 +428,8 @@ export type NotificationSeverity = (typeof NOTIFICATION_SEVERITIES)[number];
  * failure streak at pass 1 on the next failing beat. Value: what closes it. */
 const PRODUCER_RESOLVED_KINDS: Readonly<Record<string, string>> = {
   'lessons.dream-failed': 'a completed dream pass',
+  // #427: the row drives onboarding's retry; a disposition would stop it.
+  'onboarding.dispatch-failed': 'a dispatched onboarding heist, or a scan that finds none is needed',
 };
 
 // The alias d is an immutable delivery. A protected root must cite its

@@ -95,6 +95,7 @@ describe('config-generate CLI', () => {
       'silas',
       'provider_recovery',
       'vector',
+      'onboarding',
       'roll',
       'concurrency',
       'review',
@@ -137,6 +138,9 @@ describe('config-generate CLI', () => {
     expect(loaded.dispatch.bobIntervalMs).toBe(0);
     expect(raw.concurrency).toMatchObject({ max_workers: 4 });
     expect(raw.review).toMatchObject({ max_concurrent_children: 2 });
+    // #427: onboarding is proposed (FOR YOU cards) on a fresh install.
+    expect(raw.onboarding).toEqual({ mode: 'proposed' });
+    expect(loaded.onboarding.mode).toBe('proposed');
     expect(loaded.concurrency.maxWorkers).toBe(4);
     expect(loaded.review.maxConcurrentChildren).toBe(2);
     expect(loaded.supervision).toMatchObject({
@@ -294,6 +298,8 @@ describe('config-generate CLI', () => {
       `root = ${JSON.stringify(join(root, 'lanes'))}`,
       '[provider_recovery]',
       'claude_native = false',
+      '[onboarding]',
+      'mode = "off"',
     ].join('\n');
     writeFileSync(join(instance, 'config.toml'), `${prior}\n`);
 
@@ -319,6 +325,8 @@ describe('config-generate CLI', () => {
     expect(claudePolicy).toMatchObject({ model: 'anthropic/claude-x', thinking_level: 'high', mcp: 'project' });
     // An owner opt-out of Claude auto-recovery must survive regeneration.
     expect(raw.provider_recovery).toMatchObject({ claude_native: false });
+    // So must a turned-off onboarding (#427).
+    expect(raw.onboarding).toEqual({ mode: 'off' });
     expect(claudePolicy.roles).toMatchObject({ minion: { thinking_level: 'low' } });
     expect((raw.supervision as Record<string, number>).turn_silence_ms).toBe(600000);
     expect((raw.dispatch as Record<string, number>).bob_interval_ms).toBe(120000);
@@ -338,6 +346,7 @@ describe('config-generate CLI', () => {
     expect(loaded.worktrees.root).toBe(join(root, 'lanes'));
     expect(loaded.runtimes.policies['claude-code']?.mcp).toBe('project');
     expect(loaded.providerRecovery.claudeNative).toBe(false);
+    expect(loaded.onboarding.mode).toBe('off');
   });
 
   it('round trip preserves an active [pacing] section (caps + backoff, never silently dropped)', () => {

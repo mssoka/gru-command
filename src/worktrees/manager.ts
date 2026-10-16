@@ -9,6 +9,7 @@ import {
   mkdirSync,
   readlinkSync,
   readdirSync,
+  readFileSync,
   realpathSync,
   symlinkSync,
   type Stats,
@@ -16,7 +17,7 @@ import {
 import { basename, dirname, join, resolve } from 'node:path';
 import type { LogLevel } from '../logger.js';
 import type { LedgerApi, WorktreeBaseSource, WorktreeRecord } from '../ledger/api.js';
-import { applyWorktreeManifest, assertWorktreeBootstrapSupported, loadWorktreeManifest } from './manifest.js';
+import { applyWorktreeManifest, loadWorktreeManifest, MANIFEST_PATH } from './manifest.js';
 import { redactedText } from '../decisions/questions.js';
 import { repositoryGitEnv } from '../dispatch/perkins-review/artifacts.js';
 
@@ -922,18 +923,43 @@ export class WorktreeManager {
    * Async: setup commands run off the event loop, so a slow bootstrap
    * (npm ci) never freezes chat/supervision while dispatch awaits the lane. */
   private async bootstrap(sourceRoot: string, worktreePath: string): Promise<void> {
-    // Fetched job heads and writer children can differ from the source
-    // checkout. Refuse retired references in those actual lane bytes too;
-    // read-only/existing lanes retain their historical manifests untouched.
-    const laneManifest = loadWorktreeManifest(worktreePath, this.log);
-    if (laneManifest !== null) assertWorktreeBootstrapSupported(laneManifest);
-    const manifest = loadWorktreeManifest(sourceRoot, this.log);
+    // The lane's own committed manifest is applied (#427): a job lane is
+    // fresh from origin, so a merged manifest takes effect before the user's
+    // checkout pulls it, and an uncommitted local one never does. Its
+    // [[link]]/[[copy]] entries still resolve from the source checkout.
+    const manifest = loadWorktreeManifest(worktreePath, this.log);
+    this.warnOnSourceManifestDrift(sourceRoot, worktreePath);
     if (manifest === null) return;
     await applyWorktreeManifest(manifest, {
       sourceRoot,
       worktreePath,
       setupTimeoutMs: this.opts.setupTimeoutMs,
       log: this.log,
+    });
+  }
+
+  /** A source checkout whose manifest differs from the lane's (or a lane
+   * with none) is stale or carries local edits: say which file GC used. */
+  private warnOnSourceManifestDrift(sourceRoot: string, worktreePath: string): void {
+    const read = (root: string): { readonly path: string; readonly text: string | null; readonly error: string | null } => {
+      const path = join(root, MANIFEST_PATH);
+      if (!existsSync(path)) return { path, text: null, error: null };
+      try {
+        return { path, text: readFileSync(path, 'utf-8'), error: null };
+      } catch (error) {
+        return { path, text: null, error: String(error) };
+      }
+    };
+    const source = read(sourceRoot);
+    const lane = read(worktreePath);
+    if (source.text === null && source.error === null) return;
+    // An unreadable source manifest always warns, even beside a lane with none.
+    if (source.error === null && source.text === lane.text) return;
+    this.log('warn', 'worktree manifest: the source checkout\'s manifest differs from the lane\'s; bootstrap used the lane\'s (none means no setup)', {
+      source_manifest: source.path,
+      lane_manifest: lane.path,
+      lane_has_manifest: lane.text !== null,
+      ...(source.error !== null ? { source_error: source.error } : {}),
     });
   }
 
