@@ -736,10 +736,21 @@ export interface SilasAutopilotInput {
  * per deterministic observation; a family that refuses or fails leaves its
  * row untouched for LLM Silas.
  */
+/** JSON with every object's keys sorted: two equal decisions built in a
+ * different key order — or read back from the ledger — hash alike. */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    const entries = Object.entries(value).filter(([, member]) => member !== undefined).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([key, member]) => `${JSON.stringify(key)}:${canonicalJson(member)}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
 /** The identity of one decision: what it would call, and in which mode. */
 function decisionFingerprint(decision: { readonly action: unknown; readonly would_call: unknown; readonly mode: unknown }): string {
   return createHash('sha256')
-    .update(JSON.stringify({ action: decision.action, would_call: decision.would_call, mode: decision.mode }))
+    .update(canonicalJson({ action: decision.action, would_call: decision.would_call, mode: decision.mode }))
     .digest('hex');
 }
 

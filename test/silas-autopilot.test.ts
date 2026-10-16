@@ -462,8 +462,12 @@ describe('autopilot mode resolution (kill switch + per-family modes)', () => {
     await pass();
     const [first] = ledger.decisions();
     const { fingerprint: _fingerprint, ...legacy } = first!.payload as Record<string, unknown>;
-    // Rewrite history as a pre-#369 deployment left it: no fingerprint.
-    (first as { payload: unknown }).payload = legacy;
+    // Rewrite history as a pre-#369 deployment left it: no fingerprint, and
+    // its would-call object read back with its keys in another order.
+    const reversed = (value: unknown): unknown => value !== null && typeof value === 'object' && !Array.isArray(value)
+      ? Object.fromEntries(Object.entries(value).reverse().map(([key, member]) => [key, reversed(member)])) : value;
+    (first as { payload: unknown }).payload = { ...legacy, would_call: reversed(legacy['would_call']) };
+    expect(JSON.stringify((first!.payload as { would_call?: unknown }).would_call)).not.toBe(JSON.stringify(legacy["would_call"]));
     await pass();
     expect(ledger.decisions()).toHaveLength(1);
   });

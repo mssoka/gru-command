@@ -65,7 +65,7 @@ export function promptRefusalUnproven(input: {
   if (input.admitted) return 'a native admission was already bound';
   if (input.prepared === undefined) return null;
   let evidence: string | undefined;
-  try { evidence = input.prepared.cessationEvidence?.(); } catch { evidence = 'unreadable'; }
+  try { evidence = input.prepared.cessationEvidence?.(); } catch (error) { evidence = `unreadable: ${String(error)}`; }
   return evidence === 'ceased' ? null : `prepared producer ${input.prepared.id} has not proven cessation (${evidence ?? 'no cessation evidence'})`;
 }
 

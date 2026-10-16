@@ -23,13 +23,16 @@
  *    link-preservation manifest included: a missing, malformed or unbound
  *    manifest (its digest pinned by neither the record nor the caller), or
  *    a declared archive that is absent, never verifies as reusable (#367);
- *  - every read is no-follow: the record, the manifest, its assets and the
- *    archive are each read through ONE `O_NOFOLLOW` descriptor whose fstat
- *    must show a single-link regular file (a symlink, hardlink or FIFO is
- *    refused, never read through), and each is hashed and parsed from the
- *    SAME bytes;
+ *  - every file read is no-follow at its leaf: the record, the manifest, its
+ *    assets and the archive are each read through ONE `O_NOFOLLOW`
+ *    descriptor whose fstat must show a single-link regular file (a symlink,
+ *    hardlink or FIFO is refused, never read through); the record and
+ *    manifest are hashed and parsed from the SAME bytes, and the archive is
+ *    hashed in streamed chunks;
  *  - the record directory and the original tree must be canonical real
- *    directories (no symlinked component), and entry containment is decided
+ *    directories (no symlinked component) before the reads AND after the
+ *    last one (a directory swapped in meanwhile refuses), and entry
+ *    containment is decided
  *    on realpaths with exact segments, climbing only past truly absent
  *    ancestors — a dangling link, a loop or an unreadable component refuses
  *    (#367).
@@ -45,7 +48,7 @@
  * release.
  */
 import { createHash } from 'node:crypto';
-import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, realpathSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 
 /** The explicit caller-supplied selector. */
@@ -88,7 +91,11 @@ const refuse = (guidance: string, verifiedAssets: readonly string[] = [], record
  * descriptor (#367): `O_NOFOLLOW` refuses a symlink leaf, `O_NONBLOCK` keeps
  * a FIFO from blocking the open, and the type and link count are checked on
  * the descriptor actually read — never on a path swapped after the check. */
-function regularFileBytes(path: string): Buffer {
+function withRegularFile<T>(path: string, use: (fd: number) => T): T {
+  // No platform without these flags can keep the no-follow promise.
+  if (constants.O_NOFOLLOW === undefined || constants.O_NONBLOCK === undefined) {
+    throw new Error('no-follow file reads are unsupported on this platform — preservation references cannot be verified here');
+  }
   let fd: number;
   try {
     fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
@@ -99,14 +106,29 @@ function regularFileBytes(path: string): Buffer {
   try {
     const stat = fstatSync(fd);
     if (!stat.isFile() || stat.nlink !== 1) throw new Error(`${path} is not a single-link regular file`);
-    return readFileSync(fd);
+    return use(fd);
   } finally {
     closeSync(fd);
   }
 }
+function regularFileBytes(path: string): Buffer {
+  return withRegularFile(path, (fd) => readFileSync(fd));
+}
 
 const digestOf = (bytes: Buffer): string => createHash('sha256').update(bytes).digest('hex');
-const sha256 = (path: string): string => digestOf(regularFileBytes(path));
+/** The sha256 of a single-link regular file, streamed in chunks from its
+ * no-follow descriptor: a large preserved archive is hashed, never loaded
+ * whole. */
+function sha256(path: string): string {
+  return withRegularFile(path, (fd) => {
+    const hash = createHash('sha256');
+    const chunk = Buffer.alloc(1024 * 1024);
+    for (let read = readSync(fd, chunk, 0, chunk.length, null); read > 0; read = readSync(fd, chunk, 0, chunk.length, null)) {
+      hash.update(chunk.subarray(0, read));
+    }
+    return hash.digest('hex');
+  });
+}
 
 /** A path carrying an exact `..` segment (never a lexical substring match). */
 const hasParentSegment = (path: string): boolean => path.split(/[\\/]/u).includes('..');
@@ -132,12 +154,12 @@ function canonicalDirectory(path: string): boolean {
  * directory cannot carry an entry outside the tree) and the remaining,
  * not-yet-existing segments — already free of exact `..` — are appended.
  * The candidate itself is never followed (it may BE a preserved link). */
-function contained(root: string, candidate: string): boolean {
+function contained(root: string, candidate: string): 'inside' | 'outside' | 'unresolvable' {
   let realRoot: string;
   try {
     realRoot = realpathSync(root);
   } catch {
-    return false;
+    return 'unresolvable';
   }
   const rest: string[] = [basename(candidate)];
   let ancestor = dirname(candidate);
@@ -149,22 +171,22 @@ function contained(root: string, candidate: string): boolean {
       // Climb ONLY past a truly absent ancestor. A dangling link (it exists
       // to lstat), a loop or an unreadable component could hide an escape,
       // so it refuses rather than being skipped.
-      if (errorCode(error) !== 'ENOENT') return false;
+      if (errorCode(error) !== 'ENOENT') return 'unresolvable';
       try {
         lstatSync(ancestor);
-        return false;
+        return 'unresolvable';
       } catch (absence) {
-        if (errorCode(absence) !== 'ENOENT') return false;
+        if (errorCode(absence) !== 'ENOENT') return 'unresolvable';
       }
       const parent = dirname(ancestor);
-      if (parent === ancestor) return false;
+      if (parent === ancestor) return 'unresolvable';
       rest.unshift(basename(ancestor));
       ancestor = parent;
       continue;
     }
     // Strictly inside: the root itself is not an entry.
     const rel = relative(realRoot, join(realAncestor, ...rest));
-    return rel !== '' && !hasParentSegment(rel) && !isAbsolute(rel);
+    return rel !== '' && !hasParentSegment(rel) && !isAbsolute(rel) ? 'inside' : 'outside';
   }
 }
 
@@ -247,7 +269,7 @@ export function resolvePreservationReference(input: {
       );
     }
     const assetPath = join(recordDir, asset.name);
-    if (!contained(recordDir, assetPath)) {
+    if (contained(recordDir, assetPath) !== 'inside') {
       return refuse(`the preservation record references ${asset.name} outside its own directory — retained`, verifiedAssets, actualRecordSha);
     }
     let actual: string;
@@ -276,7 +298,11 @@ export function resolvePreservationReference(input: {
     return refuse(`the link-preservation manifest is missing or unreadable (${String(error)}) — the tree is retained`, verifiedAssets, actualRecordSha);
   }
   const manifestSha = digestOf(manifestBytes);
-  const manifestBindings = [record['link_manifest_sha256'], reference.expectedAssets?.[LINK_MANIFEST_ASSET]].filter((sha) => sha !== undefined);
+  const recordBinding = record['link_manifest_sha256'];
+  if (recordBinding !== undefined && (typeof recordBinding !== 'string' || !/^[a-f0-9]{64}$/u.test(recordBinding))) {
+    return refuse('the preservation record\'s link_manifest_sha256 is malformed (must be 64 lowercase hex characters) — the tree is retained', verifiedAssets, actualRecordSha);
+  }
+  const manifestBindings = [recordBinding, reference.expectedAssets?.[LINK_MANIFEST_ASSET]].filter((sha) => sha !== undefined);
   if (manifestBindings.length === 0) {
     return refuse(
       `the link-preservation manifest is not digest-bound — supply expectedAssets["${LINK_MANIFEST_ASSET}"] (the record carries no link_manifest_sha256); the tree is retained`,
@@ -310,8 +336,12 @@ export function resolvePreservationReference(input: {
       return refuse(`a link-preservation entry escapes the original tree ("${String(entry)}") — the tree is retained`, verifiedAssets, actualRecordSha);
     }
     const entryPath = join(treePath, entry);
-    if (!contained(treePath, entryPath)) {
+    const placement = contained(treePath, entryPath);
+    if (placement === 'outside') {
       return refuse(`a link-preservation entry escapes the original tree ("${entry}") — the tree is retained`, verifiedAssets, actualRecordSha);
+    }
+    if (placement === 'unresolvable') {
+      return refuse(`a link-preservation entry cannot be resolved inside the original tree ("${entry}": a dangling link, a loop, a non-directory or an unreadable component) — the tree is retained`, verifiedAssets, actualRecordSha);
     }
     let stat;
     try {
@@ -352,6 +382,12 @@ export function resolvePreservationReference(input: {
       return refuse('the preserved opaque archive does not match its recorded digest — the tree is retained', verifiedAssets, actualRecordSha);
     }
     verifiedAssets.push('archive(current-ignored-untracked-deliverables-links-preserved.tar.gz)');
+  }
+  // Leaves are read no-follow; their parents were proven canonical before
+  // the reads and are proven so again after the last one, so a directory
+  // swapped in meanwhile is refused rather than trusted.
+  if (!canonicalDirectory(recordDir) || !canonicalDirectory(treePath)) {
+    return refuse('the record directory or the original tree changed while it was being verified — the tree is retained', verifiedAssets, actualRecordSha);
   }
   return { reusable: true, guidance: null, verifiedAssets, recordSha256: actualRecordSha };
 }

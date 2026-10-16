@@ -13,6 +13,7 @@ import { SessionStore } from '../src/sessions/store.js';
 import { PiAgentHandle, PI_CAPABILITIES } from '../src/runtime/pi-adapter.js';
 import { ClaudeCodeHandle, CLAUDE_CODE_CAPABILITIES } from '../src/runtime/claude-adapter.js';
 import { inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveCompletion, recordDirectiveProducerCessation, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader } from '../src/runtime/directive-checkpoint.js';
+import { WorkerDisposalInProgressError } from '../src/runtime/registry.js';
 import { DirectiveProgressService, DirectivePromptRefusedError, executeAcceptedDirective, promptRefusalUnproven, settleNativeDirective, surfaceDirectiveRecovery } from '../src/dispatch/directive-progress.js';
 import { recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute } from '../src/dispatch/directive-recovery.js';
 import { reconcilePendingLegacyDirectives, reconcilePendingRebriefs, settleDirectivesFromEvidence } from '../src/dispatch/rebrief-recovery.js';
@@ -867,6 +868,41 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(f.ledger.getDirective(f.intent.requestId)?.state).not.toBe('failed');
   });
 
+  /** A resident turn prepared its producer, then its prompt was refused by a
+   * disposal in progress; the FRESH boundary that follows is refused by the
+   * caller. Whether that is a no-effect depends on the prepared producer. */
+  async function refuseAfterPreparedResident(cessation: 'ceased' | 'unknown', admitted = false) {
+    const f = await fixture();
+    const resident = await f.registry.spawn('minion', { agentId: 'logical-minion' });
+    const disposing = async (_text: string, options?: { readonly directive?: { onAdmitted?(binding: never): void } }): Promise<never> => {
+      // The runtime reported the prompt ADMITTED before the disposal refused
+      // it (the fixture binding itself need not be valid: the report is the fact).
+      if (admitted) { try { options?.directive?.onAdmitted?.({} as never); } catch { /* fixture binding */ } }
+      throw new WorkerDisposalInProgressError();
+    };
+    Object.assign(resident, { prompt: disposing, promptWithVerdict: disposing, cessationEvidence: () => cessation });
+    let boundaries = 0;
+    await executeAcceptedDirective({ ...f.deps, beforeWriterSideEffect: () => {
+      boundaries += 1;
+      if (boundaries > 1) throw new DirectivePromptRefusedError('an owner hold landed');
+    } }, f.intent.requestId);
+    expect(boundaries, 'refused at the fresh boundary, after the resident one passed').toBe(2);
+    return f.ledger.getDirective(f.intent.requestId);
+  }
+  it('#364 a refusal beside a prepared producer that proved cessation fails the request by name', async () => {
+    expect(await refuseAfterPreparedResident('ceased')).toMatchObject({ state: 'failed', failReason: 'refused before any prompt: an owner hold landed' });
+  });
+  it('#364 a refusal after a native admission was bound stays live, saying why', async () => {
+    const row = await refuseAfterPreparedResident('ceased', true);
+    expect(row?.state).not.toBe('failed');
+    expect(row?.failReason).toContain('kept for reconciliation: a native admission was already bound');
+  });
+  it('#364 a refusal beside a prepared producer with unproven cessation stays live, saying why', async () => {
+    const row = await refuseAfterPreparedResident('unknown');
+    expect(row?.state).not.toBe('failed');
+    expect(row?.failReason).toContain('kept for reconciliation: prepared producer logical-minion has not proven cessation (unknown)');
+  });
+
   const refusal = new DirectivePromptRefusedError('refused');
   const prepared = (evidence: (() => 'ceased' | 'unknown') | undefined) => ({ id: 'minion-x', ...(evidence === undefined ? {} : { cessationEvidence: evidence }) });
   const unproven = (input: Partial<Parameters<typeof promptRefusalUnproven>[0]>): string | null =>
@@ -878,7 +914,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
   it('#364 no-effect proof: a prepared producer with no cessation evidence is kept', () =>
     expect(unproven({ prepared: prepared(undefined) })).toMatch(/minion-x has not proven cessation \(no cessation evidence\)/u));
   it('#364 no-effect proof: an unreadable cessation is unproven, never thrown', () =>
-    expect(unproven({ prepared: prepared(() => { throw new Error('lock unreadable'); }) })).toMatch(/\(unreadable\)/u));
+    expect(unproven({ prepared: prepared(() => { throw new Error('lock unreadable'); }) })).toBe('prepared producer minion-x has not proven cessation (unreadable: Error: lock unreadable)'));
   it('#364 no-effect proof: a bound native admission is never a no-effect', () => expect(unproven({ admitted: true })).toMatch(/admission was already bound/u));
   it('#364 no-effect proof: a refusal with a failed cleanup is kept', () => expect(unproven({ failures: 2 })).toMatch(/cleanup also failed/u));
   it('#364 no-effect proof: any other error is not an admission refusal', () => expect(unproven({ error: new Error('x') })).toBe('not an admission refusal'));

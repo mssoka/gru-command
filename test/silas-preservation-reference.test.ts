@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { nativeSeams } from './helpers/silas-native-seams.js';
 import { execFileSync } from 'node:child_process';
-import { linkSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, linkSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -37,6 +37,8 @@ interface RecordOptions {
   readonly manifest?: (manifest: Record<string, unknown>) => unknown;
   /** Default true: the record pins the manifest (`link_manifest_sha256`). */
   readonly bindManifest?: boolean;
+  /** A raw `link_manifest_sha256` value written instead of the real digest. */
+  readonly manifestBindingValue?: unknown;
 }
 
 function writeRecord(root: string, opts: RecordOptions): { readonly recordPath: string; readonly recordSha256: string; readonly treePath: string; readonly manifestSha256: string } {
@@ -62,7 +64,7 @@ function writeRecord(root: string, opts: RecordOptions): { readonly recordPath: 
   const shaped = opts.manifest === undefined ? manifest : opts.manifest(manifest);
   const manifestText = typeof shaped === 'string' ? shaped : JSON.stringify(shaped);
   writeFileSync(join(root, 'link-preservation-manifest.json'), manifestText);
-  if (opts.bindManifest !== false) Object.assign(record, { link_manifest_sha256: sha256(manifestText) });
+  if (opts.bindManifest !== false) Object.assign(record, { link_manifest_sha256: 'manifestBindingValue' in opts ? opts.manifestBindingValue : sha256(manifestText) });
   if (opts.archive !== undefined) {
     writeFileSync(join(root, 'current-ignored-untracked-deliverables-links-preserved.tar.gz'), opts.archive);
   }
@@ -352,16 +354,45 @@ describe('resolvePreservationReference — fails loud and never follows links (#
     expect(resolve(linkedTree)).toMatchObject({ reusable: false, guidance: expect.stringMatching(/original tree .*tree-link must be an absolute real directory/) });
   });
 
-  it('refuses an entry under a dangling link, and "." or empty segments', () => {
+  it('refuses an entry under a dangling link or a loop as unresolvable, and "." or empty segments as escaping', () => {
     const root = tempRoot();
     const tree = join(root, 'tree');
     mkdirSync(tree, { recursive: true });
     symlinkSync(join(tempRoot(), 'not-yet-there'), join(tree, 'dangling'));
-    for (const entry of ['dangling/node_modules', '.', 'a/./b', 'a//b']) {
-      const at = tempRoot();
-      const record = writeRecord(at, { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's', treePath: tree, linkEntries: [entry] });
-      expect(resolve(record), entry).toMatchObject({ reusable: false, guidance: expect.stringMatching(/escapes the original tree/) });
+    symlinkSync(join(tree, 'loop'), join(tree, 'loop'));
+    const verdictFor = (entry: string) => resolve(writeRecord(tempRoot(), { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's', treePath: tree, linkEntries: [entry] }));
+    for (const entry of ['dangling/node_modules', 'loop/x']) {
+      expect(verdictFor(entry), entry).toMatchObject({ reusable: false, guidance: expect.stringMatching(/cannot be resolved inside the original tree .*a dangling link, a loop/u) });
     }
+    for (const entry of ['.', 'a/./b', 'a//b']) {
+      expect(verdictFor(entry), entry).toMatchObject({ reusable: false, guidance: expect.stringMatching(/escapes the original tree/) });
+    }
+  });
+
+  it('refuses a relative original tree and a malformed manifest binding by name', () => {
+    const relativeTree = writeRecord(tempRoot(), { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's', treePath: 'relative/tree' });
+    expect(resolve(relativeTree)).toMatchObject({ reusable: false, guidance: expect.stringMatching(/original tree relative\/tree must be an absolute real directory/u) });
+    for (const value of [null, 'F'.repeat(64), 7]) {
+      const record = writeRecord(tempRoot(), { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's', manifestBindingValue: value });
+      expect(resolve(record), String(value)).toMatchObject({ reusable: false, guidance: expect.stringMatching(/link_manifest_sha256 is malformed \(must be 64 lowercase hex characters\)/u) });
+    }
+  });
+
+  it.runIf(process.getuid?.() !== 0)('refuses an entry an unreadable directory hides, never treating it as archive-only', () => {
+    const root = tempRoot();
+    const tree = join(root, 'tree');
+    mkdirSync(join(tree, 'locked'), { recursive: true });
+    const record = writeRecord(root, { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's', treePath: tree, linkEntries: ['locked/link'] });
+    chmodSync(join(tree, 'locked'), 0o000);
+    try {
+      expect(resolve(record)).toMatchObject({ reusable: false, guidance: expect.stringMatching(/a link-preservation entry is unreadable \("locked\/link": .*EACCES/u) });
+    } finally { chmodSync(join(tree, 'locked'), 0o700); }
+  });
+
+  it('hashes a preserved archive larger than one read chunk', () => {
+    const archive = Buffer.alloc(3 * 1024 * 1024 + 17, 7);
+    const record = writeRecord(tempRoot(), { jobId: 'job-h1', repo: 'fixture-repo', report: 'r', session: 's', archive });
+    expect(resolve(record)).toMatchObject({ reusable: true, verifiedAssets: expect.arrayContaining(['archive(current-ignored-untracked-deliverables-links-preserved.tar.gz)']) });
   });
 });
 

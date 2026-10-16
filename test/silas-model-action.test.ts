@@ -153,13 +153,24 @@ describe('H6 silas_action tool bindings (unit seams)', () => {
     }
     const refusedFields: readonly (readonly [string, unknown])[] = [
       ['family', ''], ['debt', '   '], ['family', 7], ['debt', 'a\u0000b'], ['family', 'esc\u001b[31m'], ['jobId', `${job.id}\u0085`], ['rationale', 'bell\u0007'],
+      // Format and separator characters spoof or break a rendered audit line.
+      ['rationale', 'safe\u202eevil'], ['family', 'zero\u200bwidth'], ['debt', 'line\u2028break'], ['rationale', 'para\u2029graph'], ['family', 'tag\u{e0041}'],
+      // A carriage return could overwrite a rendered line, even in the rationale.
+      ['rationale', 'overwritten\rforged'],
+      // A lone surrogate would not survive its JSON round trip.
+      ['debt', 'half\ud800'],
     ];
     for (const [field, value] of refusedFields) {
       expect(await outcome({ action: 'hold', jobId: job.id, [field]: value }), `${field}=${JSON.stringify(value)}`).toMatchObject({ ok: false, reason: 'bad-field' });
     }
     // The rationale alone may break lines; length is in code points, the
     // unit JSON Schema maxLength counts.
-    expect(await outcome({ action: 'hold', jobId: job.id, rationale: 'line one\n\tline two\r\n' })).toMatchObject({ ok: true });
+    expect(await outcome({ action: 'hold', jobId: job.id, rationale: 'line one\n\tline two\n' })).toMatchObject({ ok: true });
+    // The schema the model sees states the same rules.
+    const schema = (tool.inputSchema as { properties: Record<string, { minLength?: number; description?: string }> }).properties;
+    for (const field of ['jobId', 'family', 'debt', 'rationale']) {
+      expect(schema[field], field).toMatchObject({ minLength: 1, description: expect.stringContaining('no control, format or separator characters') });
+    }
     const astral = '\u{1F600}';
     expect(await outcome({ action: 'hold', jobId: job.id, rationale: astral.repeat(SILAS_ACTION_LIMITS.rationale) })).toMatchObject({ ok: true });
     expect(await outcome({ action: 'hold', jobId: job.id, rationale: astral.repeat(SILAS_ACTION_LIMITS.rationale + 1) }))
@@ -271,6 +282,8 @@ describe('H6 the Silas slot spawn wiring (#368)', () => {
     const stale = { name: SILAS_MODEL_ACTION_TOOL } as unknown as NativeAgentTool;
     await expect(spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() }, { nativeTools: [stale] }))
       .rejects.toThrow(/already carries a silas_action tool — each spawn binds its own/u);
+    await expect(spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() }, { nativeTools: 'not tools' as never }))
+      .rejects.toThrow(/nativeTools must be an array/u);
     expect(spawns).toBe(1);
   });
 
