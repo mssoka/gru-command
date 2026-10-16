@@ -1157,9 +1157,12 @@ export class ClaudeCodeHandle implements AgentHandle {
               live.once('error', () => { exitKind = exitKind ?? 'error'; resolve(); });
             });
       // Late-observation latch: survives the race; fires even after the
-      // deadline already settled bookkeeping (no new kill policy/timer).
+      // deadline or a transport error already settled bookkeeping (no new
+      // kill policy/timer). The ORIGINAL child's own close is the proof —
+      // after an error exactly as after a deadline (owner ruling 2026-10-16,
+      // #359); without it the evidence stays UNKNOWN and the slot held.
       live.once('close', () => {
-        if (this.cessationKind === 'deadline') {
+        if (this.cessationKind === 'deadline' || this.cessationKind === 'error') {
           this.cessationKind = 'close-observed-late';
           this.emitEvidence();
         }
