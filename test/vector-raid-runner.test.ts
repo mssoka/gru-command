@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -12,7 +12,7 @@ import { propertyCampaignRunningForReview, propertyEvidenceForReview, type Prope
 import type { PackageResolution, RetainedCounterexample } from '../src/property/types.js';
 import type { AgentHandle, IsolatedReviewPolicy } from '../src/runtime/types.js';
 import { metricsOf, RAID_OUTCOMES, raidsTowardCap, repositoryRollups, VECTOR_EVENTS, ZERO_BREAK_IN_FLAG_RAIDS, type RaidRecord } from '../src/vector/ledger.js';
-import { isAttackPathFault, raidOutcomeLabel, VectorRaidRunner, type RaidCampaign } from '../src/vector/runner.js';
+import { isAttackPathFault, raidOutcomeLabel, VectorRaidRunner, type ControlFs, type RaidCampaign } from '../src/vector/runner.js';
 import { FIX_DISPATCH_FAILED_KIND, FIX_DISPATCHED_KIND, FIX_PROPOSAL_KIND, VectorService } from '../src/vector/service.js';
 
 /**
@@ -120,6 +120,8 @@ interface RunnerHarness {
   fireDeadline(): void;
   /** The campaign spec of the round in flight (its control roots). */
   lastSpec: { readonly knownBadRoot: string } | null;
+  /** Where raid roots live (<raidsDir>/<raid>/known-bad, …). */
+  readonly raidsDir: string;
   /** Launch one raid on billing/src/refunds (autonomous mode). */
   launch(): string;
   rows(kind: string): ReturnType<LedgerApi['listNotifications']>;
@@ -135,8 +137,8 @@ function harness(opts: { readonly scripts: Script[]; readonly vector?: Partial<V
   readonly dispatchFix?: DispatchFix;
   /** Every fetch of origin fails (the cached default branch decides). */
   readonly fetchFails?: boolean;
-  /** The control-file writer (default: the runner's own). */
-  readonly writeControlFile?: (path: string, content: string) => void; } ): RunnerHarness {
+  /** Control file operations to override (the rest are node:fs). */
+  readonly controlFs?: Partial<ControlFs>; } ): RunnerHarness {
   const root = tempDir('gru-vector-runner-');
   const repo = join(root, 'billing');
   mkdirSync(join(repo, 'src', 'refunds'), { recursive: true });
@@ -166,6 +168,7 @@ function harness(opts: { readonly scripts: Script[]; readonly vector?: Partial<V
   const queue = [...opts.scripts];
   const h = {
     ledger, repo, service, runs: [] as Script[], dispatched, spawned: 0, heistWaiting: false, now: Date.parse('2026-10-16T09:00:00Z'), lastSpec: null,
+    raidsDir: join(dataDir, 'vector', 'raids'),
   } as unknown as RunnerHarness;
   let deadline: (() => void) | null = null;
   let current: Script = {};
@@ -200,7 +203,7 @@ function harness(opts: { readonly scripts: Script[]; readonly vector?: Partial<V
     campaign: () => campaign,
     sandbox: () => ({ backend: opts.sandbox ?? 'macos-sandbox-exec', reason: opts.sandbox === 'none-found' ? 'no sandbox-exec on linux' : null }),
     fetchDefault: () => { if (opts.fetchFails === true) throw new Error('could not read from remote repository'); },
-    ...(opts.writeControlFile === undefined ? {} : { writeControlFile: opts.writeControlFile }),
+    ...(opts.controlFs === undefined ? {} : { controlFs: { lstat: (path: string) => lstatSync(path), writeFile: (path: string, content: string) => writeFileSync(path, content), ...opts.controlFs } }),
     resolvePackages: runnable,
     now: () => new Date(h.now),
     // The wall-clock deadline fires only when a test fires it.
@@ -403,19 +406,29 @@ describe('Silas\'s raid queue (#351 §3)', () => {
   });
 
   it('a control that fails part-way leaves nothing in the clone, a path that cannot be checked is refused, and only path faults are the attack\'s', async () => {
-    const partial = { known_bad: [{ path: 'src/refunds/new.js', content: 'export const extra = 1;\n' }, { path: 'src/refunds/newdir/deep/x.js', content: 'x\n' },
-      { path: 'src/refunds/refund.js/inner.js', content: 'x\n' }] };
+    // It overwrites a tracked file, writes two new ones, then fails part-way through a mkdir (a name too long).
+    const partial = { known_bad: [{ path: 'src/refunds/refund.js', content: 'POLLUTED\n' }, { path: 'src/refunds/new.js', content: 'export const extra = 1;\n' },
+      { path: 'src/refunds/newdir/deep/x.js', content: 'x\n' }, { path: `src/refunds/newtop/${'b'.repeat(300)}/x.js`, content: 'x\n' }] };
     let checked = false;
-    const h = harness({ vector: { maxRounds: 2 }, scripts: [{ attack: attackInput(1, partial) }, { attack: attackInput(2), onRun: () => {
-      // The next round's clone holds nothing from the failed control: no file, no directory.
-      expect(existsSync(join(h.lastSpec!.knownBadRoot, 'src', 'refunds', 'new.js'))).toBe(false);
-      expect(existsSync(join(h.lastSpec!.knownBadRoot, 'src', 'refunds', 'newdir'))).toBe(false);
+    const h = harness({ vector: { maxRounds: 2 }, scripts: [{ attack: attackInput(1, partial) }, { attack: attackInput(2), onPrompt: () => {
+      // Before the next round touches it, the clone is back at the head: the tracked file restored, nothing new left.
+      const clone = join(h.raidsDir, id, 'known-bad', 'src', 'refunds');
+      expect(readFileSync(join(clone, 'refund.js'), 'utf8')).toBe('export const refund = (amount) => amount;\n');
+      for (const leftover of ['new.js', 'newdir', 'newtop']) expect(existsSync(join(clone, leftover)), leftover).toBe(false);
       checked = true;
     } }] });
     const id = h.launch();
     await h.runner.tick();
-    expect(raid(h, id).rounds.map((round) => round.outcome)).toEqual(['invalid-attack', 'pass']);
+    expect(raid(h, id).rounds.map((round) => [round.outcome, round.detail])).toEqual([
+      ['invalid-attack', `refused: known-bad control path src/refunds/newtop/${'b'.repeat(300)}/x.js cannot be written in the clone (ENAMETOOLONG)`], ['pass', expect.any(String)]]);
     expect(checked).toBe(true);
+    // Writing onto a directory the package holds is the attack's EISDIR, and the directory stays.
+    const dirTarget = harness({ vector: { maxRounds: 1 }, seed: (repo) => { mkdirSync(join(repo, 'src', 'refunds', 'lib')); writeFileSync(join(repo, 'src', 'refunds', 'lib', 'x.js'), 'x\n'); },
+      scripts: [{ attack: attackInput(1, { known_bad: [{ path: 'src/refunds/lib', content: 'x\n' }] }) }] });
+    const d = dirTarget.launch();
+    await dirTarget.runner.tick();
+    expect(raid(dirTarget, d).rounds.map((round) => [round.outcome, round.detail]))
+      .toEqual([['invalid-attack', 'refused: known-bad control path src/refunds/lib cannot be written in the clone (EISDIR)']]);
     const long = harness({ vector: { maxRounds: 1 }, scripts: [{ attack: attackInput(1, { known_bad: [{ path: `src/refunds/${'a'.repeat(300)}.js`, content: 'x\n' }] }) }] });
     const l = long.launch();
     await long.runner.tick();
@@ -424,13 +437,20 @@ describe('Silas\'s raid queue (#351 §3)', () => {
     // A full disk or a permission fault is the host's: the raid fails as a host error, and the attack is still listed.
     const denied = Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
     const host = harness({ scripts: [{ attack: attackInput(1, { known_bad: [{ path: 'src/refunds/a.js', content: 'a\n' }, { path: 'src/refunds/b.js', content: 'b\n' }] }) }],
-      writeControlFile: (path, content) => { if (path.endsWith('b.js')) throw denied; writeFileSync(path, content); } });
+      controlFs: { writeFile: (path, content) => { if (path.endsWith('b.js')) throw denied; writeFileSync(path, content); } } });
     const f = host.launch();
     await host.runner.tick();
     expect(raid(host, f)).toMatchObject({ outcome: 'infrastructure-error', outcomeLabel: 'Raid failed: EACCES: permission denied' });
     expect(raid(host, f).rounds.map((round) => [round.outcome, round.detail]))
       .toEqual([['not-run', 'not run: the host failed while preparing its controls (EACCES: permission denied)']]);
     expect(host.runs).toEqual([]);
+    // The same holds when checking a path fails for a host reason.
+    const unreadable = harness({ scripts: [{ attack: attackInput(1) }],
+      controlFs: { lstat: (path) => { if (path.endsWith(join('src', 'refunds', 'refund.js'))) throw denied; return lstatSync(path); } } });
+    const r = unreadable.launch();
+    await unreadable.runner.tick();
+    expect(raid(unreadable, r)).toMatchObject({ outcome: 'infrastructure-error' });
+    expect(raid(unreadable, r).rounds.map((round) => round.outcome)).toEqual(['not-run']);
     expect(['ENOTDIR', 'EEXIST', 'EISDIR', 'ENAMETOOLONG'].map(isAttackPathFault)).toEqual([true, true, true, true]);
     expect(['ENOSPC', 'EACCES', 'EROFS', 'EIO', undefined].map(isAttackPathFault)).toEqual([false, false, false, false, false]);
   });
@@ -488,6 +508,16 @@ describe('Silas\'s raid queue (#351 §3)', () => {
     expect(raid(h, id)).toMatchObject({ outcome: 'infrastructure-error', outcomeLabel: 'Raid failed: the sandbox backend crashed' });
     expect(raid(h, id).rounds.map((round) => [round.outcome, round.executedRuns, round.receipts])).toEqual([['voided', 2, ['pex-1-0.json', 'pex-1-1.json']]]);
     expect(raid(h, id).metrics).toMatchObject({ executedRuns: 2, proposals: 1 });
+  });
+
+  it('a time cap that runs out while the controls are prepared lists the attack as never run, and it never runs', async () => {
+    const h = harness({ scripts: [{ attack: attackInput(1) }], controlFs: { writeFile: (path, content) => { h.fireDeadline(); writeFileSync(path, content); } } });
+    const id = h.launch();
+    await h.runner.tick();
+    expect(raid(h, id)).toMatchObject({ outcome: 'budget-exhausted' });
+    expect(raid(h, id).rounds.map((round) => [round.outcome, round.detail])).toEqual([['not-run', 'not run: the raid was cut short before this attack could run']]);
+    expect(h.runs).toEqual([]);
+    expect(raid(h, id).metrics).toMatchObject({ proposals: 0, executedRuns: 0 });
   });
 
   it('an attack Vector already submitted when the time cap ran out is listed as never run', async () => {
@@ -619,7 +649,8 @@ describe('repository rollup (#351 §5)', () => {
     expect(sessionsOnly).toMatchObject({ raids: 1, executedRuns: 0, tokens: 500, raidsSinceLastBreakIn: 1 });
     // A raid the host refused mid-raid ran Vector sessions: it counts too.
     const refusedMidRaid = { ...noSubmission, outcome: 'not-run' as const, verdict: 'escalated', detail: 'not-run: sandbox execution refused' };
-    expect(repositoryRollups([{ ...finished(61, 'refused', 0, 300), rounds: [refusedMidRaid], metrics: metricsOf({ tokens: 300 }) }])).toEqual([expect.objectContaining({ raids: 1, tokens: 300 })]);
+    expect(repositoryRollups([{ ...finished(61, 'refused', 0, 300), rounds: [refusedMidRaid], metrics: metricsOf({ tokens: 300 }) }]))
+      .toEqual([expect.objectContaining({ raids: 1, tokens: 300, raidsSinceLastBreakIn: 1 })]);
     const [after] = repositoryRollups([found, ...empties, finished(99, 'no-qualified-proposals', 0, null)]);
     expect(after).toMatchObject({ raidsSinceLastBreakIn: ZERO_BREAK_IN_FLAG_RAIDS, roundsWithoutTokenUsage: 1,
       flag: expect.stringMatching(new RegExp(`^${String(ZERO_BREAK_IN_FLAG_RAIDS)} raids in a row found no break-in .*turning raids off for billing is your call$`, 'u')) });

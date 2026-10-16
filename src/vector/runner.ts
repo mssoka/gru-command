@@ -94,8 +94,8 @@ export interface RaidRunnerOptions {
   readonly sandbox?: () => { readonly backend: string; readonly reason: string | null };
   /** Refresh the cached origin default branch (default: a bounded `git fetch origin` with the user's own git setup). */
   readonly fetchDefault?: (repoPath: string) => void;
-  /** Write one control file into a clone (test seam for host write faults; default: writeFileSync). */
-  readonly writeControlFile?: (path: string, content: string) => void;
+  /** The file operations that write controls into a clone (test seam for host faults; default: node:fs). */
+  readonly controlFs?: ControlFs;
   readonly resolvePackages?: (repoPath: string) => readonly PackageResolution[];
   readonly now?: () => Date;
   readonly log?: Log;
@@ -106,6 +106,14 @@ export interface RaidRunnerOptions {
   readonly setTimeout?: typeof setTimeout;
   readonly clearTimeout?: typeof clearTimeout;
 }
+
+/** The file operations commitControl uses on a clone. */
+export interface ControlFs {
+  readonly lstat: (path: string) => { isSymbolicLink(): boolean; isDirectory(): boolean };
+  readonly writeFile: (path: string, content: string) => void;
+}
+
+const NODE_CONTROL_FS: ControlFs = { lstat: (path) => lstatSync(path), writeFile: (path, content) => writeFileSync(path, content) };
 
 /** Git for raid roots: no hooks, no fsmonitor, no user config, a fixed identity for control commits; the host's own PATH. */
 function raidGit(cwd: string, args: readonly string[], timeoutMs = 120_000): string {
@@ -381,7 +389,8 @@ export class VectorRaidRunner {
         detail: knownBad === 'unchanged' ? 'the known-bad control changes nothing' : knownBad !== 'changed' ? knownBad : reference });
       return;
     }
-    // A cap or a stop that came while the controls were prepared: the attack never runs.
+    // A cap or a stop that came while the controls were prepared: the attack
+    // never runs (the catch in run() classifies it, as for a cut-short session).
     if (signal.aborted) {
       this.recordRound(ctx, { outcome: 'not-run', verdict: 'not-run', description: attack.description, artifactSha256,
         detail: 'not run: the raid was cut short before this attack could run' });
@@ -408,8 +417,9 @@ export class VectorRaidRunner {
       result = await campaign.run(spec, evidenceDir);
     } catch (error) {
       // An attack that did not finish (time cap, stop, host fault) is still
-      // listed, with whatever receipts it left; nothing from it counts, but
-      // the runs it executed (one `pex-` receipt each) were spent.
+      // listed, with whatever receipts it left. No evidence from it counts;
+      // the runs it spent, one `pex-` receipt each, do count toward the budget
+      // (a run cut off before its receipt was written is not seen).
       const receipts = this.receiptsIn(evidenceDir);
       const executedRuns = receipts.filter((name) => name.startsWith('pex-')).length;
       ctx.runs += executedRuns;
@@ -512,6 +522,7 @@ export class VectorRaidRunner {
   private commitControl(root: string, headSha: string, files: readonly AttackFile[], label: string): 'changed' | 'unchanged' | `refused: ${string}` {
     raidGit(root, ['reset', '--quiet', '--hard', headSha]);
     if (files.length === 0) return 'unchanged';
+    const fs = this.opts.controlFs ?? NODE_CONTROL_FS;
     for (const file of files) {
       const parts = file.path.split('/');
       for (let depth = 1; depth <= parts.length; depth += 1) {
@@ -519,7 +530,7 @@ export class VectorRaidRunner {
         // does not exist (yet) ends the walk; any other failure refuses.
         let link: boolean;
         try {
-          link = lstatSync(join(root, ...parts.slice(0, depth))).isSymbolicLink();
+          link = fs.lstat(join(root, ...parts.slice(0, depth))).isSymbolicLink();
         } catch (error) {
           const code = (error as NodeJS.ErrnoException).code;
           if (code === 'ENOENT' || code === 'ENOTDIR') break;
@@ -533,19 +544,32 @@ export class VectorRaidRunner {
     const attempted: string[] = [];
     const createdDirs: string[] = [];
     for (const file of files) {
+      const target = join(root, file.path);
       try {
-        const made = mkdirSync(dirname(join(root, file.path)), { recursive: true });
-        if (made !== undefined) createdDirs.push(made);
-        attempted.push(join(root, file.path));
-        (this.opts.writeControlFile ?? ((path: string, content: string) => writeFileSync(path, content)))(join(root, file.path), file.content);
+        // The first directory this write would create, recorded before mkdir:
+        // a recursive mkdir that fails part-way returns nothing.
+        let missing = dirname(target);
+        while (dirname(missing) !== missing && !existsSync(dirname(missing))) missing = dirname(missing);
+        if (!existsSync(missing)) createdDirs.push(missing);
+        mkdirSync(dirname(target), { recursive: true });
+        attempted.push(target);
+        fs.writeFile(target, file.content);
       } catch (error) {
         // A path the clone cannot hold is the attack's fault; any other write
         // failure is the host's. Either way the clone goes back to the head:
-        // what was written (part-written too) and every directory made for it
-        // are removed, and a tracked file it overwrote is restored.
-        for (const path of attempted) rmSync(path, { force: true });
-        for (const dir of createdDirs.reverse()) rmSync(dir, { recursive: true, force: true });
-        raidGit(root, ['reset', '--quiet', '--hard', headSha]);
+        // every file it wrote (part-written too) and every directory made for
+        // it are removed, and a tracked file it overwrote is restored. A
+        // cleanup that fails leaves the clone unknown: that is the host's.
+        try {
+          for (const path of attempted) {
+            // Never a directory: writing onto an existing one is the attack's EISDIR.
+            if (existsSync(path) && !fs.lstat(path).isDirectory()) rmSync(path, { force: true });
+          }
+          for (const dir of [...createdDirs].reverse()) rmSync(dir, { recursive: true, force: true });
+          raidGit(root, ['reset', '--quiet', '--hard', headSha]);
+        } catch (cleanup) {
+          throw new AggregateError([error, cleanup], `${label} could not be written, and the clone could not be put back: ${oneLineError(cleanup)}`);
+        }
         const code = (error as NodeJS.ErrnoException).code;
         if (isAttackPathFault(code)) return `refused: ${label} path ${file.path} cannot be written in the clone (${String(code)})`;
         throw error;
