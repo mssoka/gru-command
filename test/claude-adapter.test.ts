@@ -3,7 +3,7 @@ import * as childProcesses from 'node:child_process';
 import { BUILD_INCIDENT, FULL_INCIDENT, WEB_INCIDENT, authenticatedCaptureStatus, verificationLane } from './helpers/worker-verification.js';
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { closeSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
+import { appendFileSync, closeSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -35,7 +35,7 @@ import {
   type StreamFrame,
 } from '../src/runtime/stream-json.js';
 import { LockBusyError, SessionStore } from '../src/sessions/store.js';
-import { inspectDirectiveProducers, readDirectiveBinding, readDirectiveCompletion, type DirectiveNativeBinding, type DirectiveTurnIdentity } from '../src/runtime/directive-checkpoint.js';
+import { inspectDirectiveProducers, prepareClaudeDirectiveBinding, readDirectiveBinding, readDirectiveCompletion, type DirectiveNativeBinding, type DirectiveTurnIdentity } from '../src/runtime/directive-checkpoint.js';
 import type { AgentHandle, RuntimeEvent } from '../src/runtime/types.js';
 import { ReviewMcpBridge } from '../src/runtime/review-mcp-bridge.js';
 import { PerkinsWholeReview } from '../src/dispatch/perkins-review/whole.js';
@@ -2616,6 +2616,49 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       await handle.dispose();
     });
 
+    it('a directive that already failed admits nothing, even when the CLI\'s echo is durable after the failure', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const identity = identityFor('claude-failed-first');
+      const file = handle.sessionFile!;
+      // A genuine binding and a genuine echo: only the earlier failure stops admission.
+      const content = [{ type: 'text', text: 'follow it' }];
+      prepareClaudeDirectiveBinding({ identity, agentId: handle.id, sessionId: handle.id, sessionFile: file, content, authorityManifest: 'manifest' });
+      const echo = { type: 'user', isReplay: true, uuid: 'echo-1', session_id: handle.id, parent_tool_use_id: null, message: { role: 'user', content } };
+      appendFileSync(file, `${JSON.stringify({ type: 'system', subtype: 'init', session_id: handle.id })}\n${JSON.stringify(echo)}\n`);
+      const admitted: unknown[] = [];
+      const turn = { directive: { identity, beforeAdmission: () => {}, onAdmitted: (binding: unknown) => admitted.push(binding) },
+        producer: {}, content, settings: { file: '', dispose: () => {} }, admission: null as Promise<void> | null, admitted: null, failure: new Error('refused earlier') as unknown, completion: null };
+      const follow = (handle as unknown as { followDirectiveFrame(turn: unknown, frame: unknown, durable: Promise<void>, abort: (detail: string) => void): void }).followDirectiveFrame.bind(handle);
+      follow(turn, echo, Promise.resolve(), () => {});
+      await turn.admission;
+      expect(admitted).toEqual([]);
+      expect(turn.admitted).toBeNull();
+      await handle.dispose();
+    });
+
+    it('a throw while handling a lost transcript write still fails the directive and ends its CLI', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      vi.spyOn(handle as unknown as { failDirective(): void }, 'failDirective').mockImplementation(() => { throw new Error('handler broke'); });
+      let broken = false;
+      handle.subscribe((event) => {
+        if (event.type !== 'turn_start') return;
+        type Chunk = { toString(): string };
+        const stream = (handle as unknown as { liveTranscript: { _writev: unknown; _write: (chunk: Chunk, encoding: unknown, callback: (error?: Error) => void) => void } }).liveTranscript;
+        const write = stream._write.bind(stream);
+        stream._writev = null;
+        stream._write = (chunk, encoding, callback) => {
+          if (!broken && chunk.toString().includes('"type":"stream_event"')) { broken = true; callback(new Error('ENOSPC: no space left on device')); return; }
+          write(chunk, encoding, callback);
+        };
+      });
+      await expect(handle.prompt('answer plainly', { directive: { identity: identityFor('claude-handler-throws'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+        .rejects.toThrow(/directive failure handling threw: handler broke/u);
+      expect(fx.logs.some((line) => line.level === 'error' && line.msg === 'directive failure handling threw after a lost transcript write')).toBe(true);
+      await handle.dispose();
+    });
+
     it('a directive turn whose CLI never starts leaves no private settings behind; one that started keeps them until its close', async () => {
       const settingsOf = (args: readonly string[]): string => args[args.indexOf('--settings') + 1]!;
       for (const mode of ['throws', 'errors', 'errors-while-live'] as const) {
@@ -2644,7 +2687,8 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
           expect(settled, mode).toBe(false);
           live!.emit('close', null, 'SIGKILL');
         }
-        await expect(prompt, mode).rejects.toThrow(/claude process failed to spawn/u);
+        // A CLI that started is not reported as one that failed to spawn.
+        await expect(prompt, mode).rejects.toThrow(mode === 'errors-while-live' ? /^claude process failed: Error: spawn claude ENOENT$/u : /claude process failed to spawn/u);
         expect(settings, mode).not.toBe('');
         await vi.waitFor(() => expect(existsSync(settings), mode).toBe(false));
         await handle.dispose();

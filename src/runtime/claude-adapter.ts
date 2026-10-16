@@ -2025,6 +2025,8 @@ export class ClaudeCodeHandle implements AgentHandle {
       let directivePermissions: ClaudeDirectivePermissionChannel | undefined;
       // A directive refusal ends the turn: no further effect is allowed.
       let escalation: ReturnType<typeof setTimeout> | null = null;
+      /** A live directive child already reported an error (handled once). */
+      let liveError = false;
       const abortTurn = (detail: string): void => {
         failTurn(detail);
         if (child === undefined || child.exitCode !== null || child.signalCode !== null) return;
@@ -2054,7 +2056,8 @@ export class ClaudeCodeHandle implements AgentHandle {
                   // The directive still fails, and its CLI is still ended.
                   turn.failure ??= failure;
                   this.log('error', 'directive failure handling threw after a lost transcript write', { error: failure instanceof Error ? failure.stack ?? failure.message : String(failure) });
-                  try { child.kill('SIGTERM'); } catch { /* already gone */ }
+                  try { abortTurn(`directive failure handling threw: ${failure instanceof Error ? failure.message : String(failure)}`); }
+                  catch { try { child.kill('SIGKILL'); } catch { /* already gone */ } }
                 } finally {
                   resolveWritten();
                 }
@@ -2162,17 +2165,20 @@ export class ClaudeCodeHandle implements AgentHandle {
       child.on('error', (error: Error) => {
         // Async spawn failure (ENOENT when the binary is missing, ...).
         // 'close' may never follow — settle here too (guarded).
-        this.onInfraError(error);
-        failTurn(`claude process failed to spawn: ${String(error)}`);
-        if (child.pid !== undefined) {
-          // A live CLI: the turn settles only from its close (one writer per
-          // session), so it is ended to make that close come; its settings
-          // stay until then.
+        if (turn !== null && child.pid !== undefined) {
+          // A live directive CLI (#424): its turn settles only from its close
+          // (one writer per session), so it is ended — once — to make that
+          // close come; its settings stay until then.
+          if (liveError) return;
+          liveError = true;
+          this.onInfraError(error);
           abortTurn(`claude process failed: ${String(error)}`);
           return;
         }
-        // A child that never started can never read its settings.
+        this.onInfraError(error);
+        failTurn(`claude process failed to spawn: ${String(error)}`);
         parser.end();
+        // A child that never started can never read its settings.
         turn?.settings.dispose();
         transcript.end(() => settle(new Error(failure)));
       });
