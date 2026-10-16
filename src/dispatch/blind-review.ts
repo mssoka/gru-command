@@ -355,36 +355,49 @@ export function blindSessionIdentity(sessionFile: string): string {
 /** A path's canonical form, even once it (or its directories) is gone: the
  * nearest ancestor that still resolves, canonical, plus the names below it —
  * and a link whose target is gone names that target, joined to the link's
- * canonical directory WITHOUT lexical `..` collapse, so realpath walks it
- * physically, as it did while the target existed. The whole walk shares one
- * budget (as realpath bounds its own), and any failure other than absence is
+ * canonical directory WITHOUT lexical `..` collapse, so the OS's realpath
+ * walks it physically, as it did while the target existed. Links followed are bounded
+ * (as realpath bounds its own); plain depth is bounded by the path itself. A
+ * `..` under a missing directory, and any failure other than absence, is
  * raised. */
 function canonicalPathOf(path: string): string {
-  let budget = 64;
-  const walk = (current: string): string => {
-    if ((budget -= 1) < 0) throw Object.assign(new Error(`too many levels of links resolving ${path}`), { code: 'ELOOP' });
+  const walk = (current: string, hops: number): string => {
+    if (hops > 40) throw Object.assign(new Error(`too many levels of links resolving ${path}`), { code: 'ELOOP' });
     try {
-      return realpathSync(current);
+      // The OS's own realpath: `..` after a link is walked physically (the
+      // default JavaScript realpath collapses it lexically).
+      return realpathSync.native(current);
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       const parent = dirname(current);
-      if ((code !== 'ENOENT' && code !== 'ENOTDIR') || parent === current) throw error;
-      const canonicalParent = walk(parent);
+      // `..` past a missing directory has no physical answer: never guessed lexically.
+      if ((code !== 'ENOENT' && code !== 'ENOTDIR') || parent === current || basename(current) === '..') throw error;
+      const canonicalParent = walk(parent, hops);
       const link = danglingLinkTarget(current);
       if (link === null) return join(canonicalParent, basename(current));
-      return walk(isAbsolute(link) ? link : `${canonicalParent}/${link}`);
+      return walk(isAbsolute(link) ? link : `${canonicalParent === '/' ? '' : canonicalParent}/${link}`, hops + 1);
     }
   };
-  return walk(path);
+  return walk(path, 0);
 }
 /** What a symbolic link at `path` holds, or null when there is none (absent,
- * or replaced by a non-link meanwhile); any other failure is raised. */
+ * or — only readlink can say so — replaced by a non-link meanwhile); any other
+ * failure is raised. */
 function danglingLinkTarget(path: string): string | null {
+  let isLink: boolean;
   try {
-    return lstatSync(path).isSymbolicLink() ? readlinkSync(path) : null;
+    isLink = lstatSync(path).isSymbolicLink();
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (code === 'ENOENT' || code === 'ENOTDIR' || code === 'EINVAL') return null;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return null;
+    throw error;
+  }
+  if (!isLink) return null;
+  try {
+    return readlinkSync(path);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'EINVAL') return null;
     throw error;
   }
 }

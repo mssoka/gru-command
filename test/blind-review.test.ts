@@ -240,6 +240,19 @@ describe('observeBlindSessionAccess — repeated scans count distinct reads (iss
       expect(upward).toBe(sha256(join(loopDir, 'real', 'up.jsonl')));
       rmSync(join(loopDir, 'real', 'up.jsonl'));
       expect(blindSessionIdentity(join(loopDir, 'subalias', 'l.jsonl'))).toBe(upward);
+      // A `..` after a LINKED directory in the target lands where realpath
+      // lands (the link's parent elsewhere), not where a lexical collapse would.
+      mkdirSync(join(loopDir, 'elsewhere', 'deep'), { recursive: true });
+      symlinkSync(join(loopDir, 'elsewhere', 'deep'), join(loopDir, 'real', 'sub', 'linkdir'));
+      writeFileSync(join(loopDir, 'elsewhere', 'up2.jsonl'), '');
+      symlinkSync('linkdir/../up2.jsonl', join(loopDir, 'real', 'sub', 'l2.jsonl'));
+      const physical = blindSessionIdentity(join(loopDir, 'subalias', 'l2.jsonl'));
+      expect(physical).toBe(sha256(join(loopDir, 'elsewhere', 'up2.jsonl')));
+      rmSync(join(loopDir, 'elsewhere', 'up2.jsonl'));
+      expect(blindSessionIdentity(join(loopDir, 'subalias', 'l2.jsonl'))).toBe(physical);
+      // A gone path many directories deep is no loop: it keeps its identity.
+      const deepGone = join(loopDir, ...Array.from({ length: 80 }, (_, index) => `d${String(index)}`), 'gone.jsonl');
+      expect(blindSessionIdentity(deepGone)).toBe(sha256(deepGone));
       // A long chain of links is refused by name, never walked without end.
       for (let index = 0; index < 70; index += 1) symlinkSync(`c${String(index + 1)}.jsonl`, join(loopDir, `c${String(index)}.jsonl`));
       expect(() => blindSessionIdentity(join(loopDir, 'c0.jsonl'))).toThrow(/ELOOP|too many levels/u);
