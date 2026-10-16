@@ -64,44 +64,89 @@ export const BASELINE_TITLES = {
 const ASSERTION_HEAD = /^AssertionError: /u;
 const PROMISE_REPORT_HEAD = /^(?:AssertionError|Error): promise (?:resolved|rejected) .* instead of (?:rejecting|resolving)$/u;
 /** A V8 stack frame line (optionally `async`): `at <fn> (<location>)` whose
- * parenthesised location is an absolute path, a file:// or node: URL, an
- * `eval at …` origin or a V8 token (`<anonymous>`, `index N`, `native`); a
- * bare `at <absolute path or URL>:line:col`; or `at <anonymous>`. Indented
- * prose in an assertion message — `at least 3 (see notes.md:1:2)`,
- * `at 12:30:15` — is not a frame. */
-const PATH_START = String.raw`(?:file:\/\/|node:|[A-Za-z]:[\\/]|[\\/])`;
-const STACK_LINE = new RegExp(String.raw`^\s+at (?:async )?(?:\S.* \((?:${PATH_START}.*:\d+:\d+|eval at .*|<anonymous>|index \d+|native)\)|${PATH_START}.*:\d+:\d+|<anonymous>)$`, 'u');
-const LOCATION = /^(file:\/\/)?(.+):\d+:\d+$/u;
-/** A location as the path it names. A file:// URL is decoded (an encoded
- * `test%2Fhelpers` is judged as the path it names), stripped of any query or
- * fragment (a vite `?t=` stamp), given back its drive letter, and normalised
- * (`..` resolved); an undecodable URL is unlocatable. */
+ * parenthesised location is a path or URL, an `eval at …` origin or a V8
+ * token (`<anonymous>`, `index N`, `native`); a bare `at <absolute path or
+ * URL>:line:col`; or `at <anonymous>`. A parenthesised location without
+ * spaces counts as a frame even when it is relative or a non-file URL
+ * (`test/helpers/h.ts:1:2`, `webpack-internal:///x.js:1:2`) — the runtime
+ * never prints one here, so such a frame is judged UNLOCATABLE and refused
+ * rather than dropped as prose. Indented prose in an assertion message —
+ * `at least 3 (see notes.md:1:2)`, `at 12:30:15` — is not a frame. Lines are
+ * bounded before matching, so a pathological line cannot backtrack. */
+const PATH_START = String.raw`(?:[a-z][a-z0-9+.-]*:\/\/|node:|[A-Za-z]:[\\/]|[\\/])`;
+const STACK_LINE = new RegExp(String.raw`^\s+at (?:async )?(?:\S.* \((?:${PATH_START}.*:\d+:\d+|[^()\s]+:\d+:\d+|eval at .*|<anonymous>|index \d+|native)\)|${PATH_START}.*:\d+:\d+|<anonymous>)$`, 'u');
+/** Longer lines are no V8 frame; they are never matched (bounded work). */
+const MAX_FRAME_LINE = 4096;
+const LOCATION = /^([a-z][a-z0-9+.-]*:\/\/)?(.+):\d+:\d+$/u;
+/** A V8 token frame names no source location by design. */
+const TOKEN_FRAME = /^(?:<anonymous>|index \d+|native)$/u;
+/** A location as the absolute path it names, or undefined when it names
+ * none it can be judged by. A file:// URL is decoded (an encoded
+ * `test%2Fhelpers` is judged as the path it names) after its query or
+ * fragment is stripped (a vite `?t=` stamp; a literal `?` or `#` in a file
+ * name is percent-encoded in a URL), and given back its drive letter. A
+ * plain path keeps every character (`?` and `#` are legal in file names).
+ * Both are normalised with `/` separators and `..` resolved. Any other
+ * scheme, a relative path or an undecodable URL is undefined. */
 function located(match) {
   if (match === null) return undefined;
-  if (match[1] === undefined) return match[2];
+  // Runtime-internal frames keep their scheme: they are machinery.
+  if (match[1] === undefined && match[2].startsWith('node:')) return match[2];
   let path;
-  try { path = decodeURIComponent(match[2].replace(/[?#].*$/u, '')); } catch { return undefined; }
-  if (/^\/[A-Za-z]:\//u.test(path)) path = path.slice(1);
+  if (match[1] === undefined) {
+    path = match[2];
+  } else if (match[1] === 'file://') {
+    try { path = decodeURIComponent(match[2].replace(/[?#].*$/u, '')); } catch { return undefined; }
+    if (/^\/[A-Za-z]:\//u.test(path)) path = path.slice(1);
+  } else {
+    return undefined;
+  }
+  path = path.replaceAll('\\', '/');
+  if (!path.startsWith('/') && !/^[A-Za-z]:\//u.test(path)) return undefined;
   return posix.normalize(path);
 }
-/** The source location a frame names, or undefined (`<anonymous>`, `index 0`,
- * `native`). Paths may contain spaces, parentheses and colons: a framed
- * location is the remainder after the FIRST " (" that yields one, so
- * `fn (/repo/a (copy)/x.ts:1:2)` and `/repo/a (copy).test.ts:1:2` both
- * resolve to their full path. An `eval` frame names the location of the code
- * that called eval — the innermost origin when evals nest. */
+/** The parenthesised text after `start` up to its BALANCED close, or null. */
+function balancedFrom(text, start) {
+  let depth = 0;
+  for (let index = start; index < text.length; index += 1) {
+    if (text[index] === '(') depth += 1;
+    else if (text[index] === ')') {
+      depth -= 1;
+      if (depth === 0) return text.slice(start + 1, index);
+    }
+  }
+  return null;
+}
+/** The source location a frame names: the absolute path, `null` for a V8
+ * token frame that names none (`<anonymous>`, `index 0`, `native`), or
+ * undefined when the frame names a location that cannot be judged — the
+ * caller refuses on that, never skips it. Paths may contain spaces,
+ * parentheses and colons: a framed location is the first balanced ` (…)`
+ * group that yields one, so `fn (/repo/a (copy)/x.ts:1:2)` and
+ * `/repo/a (copy).test.ts:1:2` both resolve to their full path. An `eval`
+ * frame names the location of the code that called eval — the innermost
+ * origin when evals nest, whatever the origin function is called. */
 export function frameLocation(line) {
   const body = line.replace(/^\s+at /u, '').replace(/^async /u, '');
+  if (TOKEN_FRAME.test(body)) return null;
   const innermostEval = body.lastIndexOf('eval at ');
   if (innermostEval !== -1) {
-    const origin = /^\S+ \(((?:file:\/\/)?.+?:\d+:\d+)\)(?:, |\)$)/u.exec(body.slice(innermostEval + 'eval at '.length));
-    return origin === null ? undefined : located(LOCATION.exec(origin[1]));
+    const origin = body.slice(innermostEval + 'eval at '.length);
+    for (let index = origin.indexOf(' ('); index !== -1; index = origin.indexOf(' (', index + 1)) {
+      const inner = balancedFrom(origin, index + 1);
+      const location = inner === null ? undefined : located(LOCATION.exec(inner));
+      if (location !== undefined) return location;
+    }
+    return undefined;
   }
   if (body.endsWith(')')) {
     for (let index = body.indexOf(' ('); index !== -1; index = body.indexOf(' (', index + 1)) {
-      const location = located(LOCATION.exec(body.slice(index + 2, -1)));
+      const inner = body.slice(index + 2, -1);
+      if (TOKEN_FRAME.test(inner)) return null;
+      const location = located(LOCATION.exec(inner));
       if (location !== undefined) return location;
     }
+    return undefined;
   }
   return located(LOCATION.exec(body));
 }
@@ -120,17 +165,22 @@ export function isBehavioralAssertion(message) {
   if (typeof message !== 'string') return false;
   const [head = '', ...rest] = message.split(/\r?\n/u);
   if (!ASSERTION_HEAD.test(head) && !PROMISE_REPORT_HEAD.test(head)) return false;
-  const stack = rest.filter((line) => STACK_LINE.test(line));
+  const stack = rest.filter((line) => line.length <= MAX_FRAME_LINE && STACK_LINE.test(line));
   // A report without any stack frames is judged by its head alone.
   if (stack.length === 0) return true;
-  // The first frame outside the runtime and assertion machinery decides. A
-  // stack whose frames are all unlocatable or all machinery is refused —
-  // never an open door for a helper-raised assertion (#394).
-  const file = stack
-    .map((line) => frameLocation(line)?.replaceAll('\\', '/'))
-    .find((location) => location !== undefined && !MACHINERY_FRAME.test(location));
-  if (file === undefined) return false;
-  return /\.test\.[cm]?[jt]s$/u.test(file) && !file.includes('/node_modules/') && !file.includes('/test/helpers/');
+  // The first frame outside the runtime and assertion machinery decides.
+  // Token frames name nothing and are passed over; a frame whose location
+  // cannot be judged — before the deciding one — refuses, as does a stack
+  // that is all tokens or all machinery: never an open door for a
+  // helper-raised assertion (#394).
+  for (const line of stack) {
+    const file = frameLocation(line);
+    if (file === null) continue;
+    if (file === undefined) return false;
+    if (MACHINERY_FRAME.test(file)) continue;
+    return /\.test\.[cm]?[jt]s$/u.test(file) && !file.includes('/node_modules/') && !file.includes('/test/helpers/');
+  }
+  return false;
 }
 
 /**

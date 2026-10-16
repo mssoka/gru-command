@@ -141,10 +141,14 @@ describe('perkins integration R4 fail-before classifier', () => {
       ['    at fn (/repo/test/a.test.ts:3:4)', '/repo/test/a.test.ts'],
       ['    at /repo/test/helpers/a (copy).test.ts:3:4', '/repo/test/helpers/a (copy).test.ts'],
       ['    at fn (/repo/a (copy)/x.ts:1:2)', '/repo/a (copy)/x.ts'],
-      ['    at C:\\repo\\test\\a (copy).test.ts:3:4', 'C:\\repo\\test\\a (copy).test.ts'],
+      ['    at C:\\repo\\test\\..\\test\\a (copy).test.ts:3:4', 'C:/repo/test/a (copy).test.ts'],
       ['    at Object.<anonymous> (file:///repo/test/a.test.ts:9:1)', '/repo/test/a.test.ts'],
-      ['    at async Promise.all (index 0)', undefined],
-      ['    at <anonymous>', undefined],
+      // V8 token frames name no location (null): passed over, never refused.
+      ['    at async Promise.all (index 0)', null],
+      ['    at <anonymous>', null],
+      ['    at Reflect.get (<anonymous>)', null],
+      ['    at Array.map (native)', null],
+      ['    at Module._compile (node:internal/modules/cjs/loader:1554:14)', 'node:internal/modules/cjs/loader'],
       ['    at eval (eval at load (file:///repo/test/helpers/h.ts:4:5), <anonymous>:1:1)', '/repo/test/helpers/h.ts'],
       ['    at eval (eval at load (file:///repo/test/helpers/a (copy).ts:4:5), <anonymous>:1:1)', '/repo/test/helpers/a (copy).ts'],
       ['    at eval (eval at a (eval at b (file:///x/test/helpers/n.ts:1:1), <anonymous>:2:2), <anonymous>:3:3)', '/x/test/helpers/n.ts'],
@@ -152,10 +156,25 @@ describe('perkins integration R4 fail-before classifier', () => {
       ['    at file:///repo/test/%2e%2e/helpers/x.ts:1:2', '/repo/helpers/x.ts'],
       ['    at file:///repo/test/a.test.ts?t=1700000000:1:2', '/repo/test/a.test.ts'],
       ['    at file:///C:/repo/test/a.test.ts:1:2', 'C:/repo/test/a.test.ts'],
-      ['    at file:///repo/test/%E0%A4%A.ts:1:2', undefined],
       ['    at async /repo/test/helpers/h.ts:4:5', '/repo/test/helpers/h.ts'],
-      ['    at async Promise.all (index 0)', undefined],
+      // A plain path keeps `?` and `#` (legal file-name characters) and is normalised.
+      ['    at fn (/repo/test/../test/helpers/h?#.ts:1:2)', '/repo/test/helpers/h?#.ts'],
+      // An eval origin is found whatever its function is called.
+      ['    at eval (eval at Object.load [as x] (file:///repo/test/helpers/h.ts:4:5), <anonymous>:1:1)', '/repo/test/helpers/h.ts'],
+      ['    at eval (eval at new Loader (/repo/test/helpers/h.ts:4:5), <anonymous>:1:1)', '/repo/test/helpers/h.ts'],
+      // A frame that names a location which cannot be judged is undefined.
+      ['    at file:///repo/test/%E0%A4%A.ts:1:2', undefined],
+      ['    at fn (test/helpers/h.ts:1:2)', undefined],
+      ['    at fn (webpack-internal:///./test/helpers/h.ts:1:2)', undefined],
+      ['    at eval (eval at load (somewhere), <anonymous>:1:1)', undefined],
     ] as const) expect(frameLocation(line), line).toBe(location);
+    // An unlocatable frame BEFORE the deciding test frame refuses: it could
+    // be the helper that raised the assertion.
+    for (const frame of ['    at fn (test/helpers/h.ts:1:2)', '    at fn (webpack-internal:///./test/helpers/h.ts:1:2)', '    at file:///repo/test/%E0%A4%A.ts:1:2']) {
+      expect(isBehavioralAssertion(`AssertionError: x\n${frame}\n    at /repo/test/a.test.ts:1:2`), frame).toBe(false);
+    }
+    // A pathological frame-like line is bounded, never matched.
+    expect(isBehavioralAssertion(`AssertionError: x\n    at ${'a ('.repeat(5000)}/repo/test/helpers/h.ts:1:2)\n    at /repo/test/a.test.ts:1:2`)).toBe(true);
     // An async helper frame is still a helper; a vite-stamped test URL is a test.
     expect(isBehavioralAssertion('AssertionError: x\n    at async /repo/test/helpers/h.ts:4:5')).toBe(false);
     expect(isBehavioralAssertion('AssertionError: x\n    at file:///repo/test/a.test.ts?t=1:1:2')).toBe(true);
@@ -213,7 +232,11 @@ describe('perkins integration R4 fail-before classifier', () => {
     const manifest = loadWorktreeManifest(join(import.meta.dirname, '..'));
     if (manifest === null) throw new Error('the repository has no .gru-command/worktree.toml manifest');
     const scopes = Object.entries(manifest.verify).filter(([, command]) => command.includes('assert-perkins-integration-review-baseline.mjs'));
-    const legOf = (command: string): string | undefined => /assert-perkins-integration-review-baseline\.mjs["']?(?:\s+--?[\w-]+(?:=\S+)?)*\s+["']?([A-Za-z0-9]+)["']?(?:\s|$)/u.exec(command)?.[1];
+    // The leg is the tool's FIRST argument (it takes no flags): the first
+    // shell word after the script path, quotes removed.
+    const legOf = (command: string): string | undefined => /assert-perkins-integration-review-baseline\.mjs["']?\s+["']?([^\s"';&|]+)["']?(?=[\s;&|]|$)/u.exec(command)?.[1];
+    expect(['x.mjs fast r.json', 'assert-perkins-integration-review-baseline.mjs "r8" "$d/r.json"', "assert-perkins-integration-review-baseline.mjs' heavy;", 'assert-perkins-integration-review-baseline.mjs r9&&true']
+      .map(legOf)).toEqual([undefined, 'r8', 'heavy', 'r9']);
     for (const [name, command] of scopes) expect(legOf(command), `${name} names its classifier leg`).toBeDefined();
     for (const [leg, titles] of Object.entries(BASELINE_TITLES)) {
       const own = scopes.filter(([, command]) => legOf(command) === leg);

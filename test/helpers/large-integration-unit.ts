@@ -12,7 +12,8 @@ export function commitManyPaths(repo: FixtureRepo, count: number, directory = 'm
     throw new Error(`commitManyPaths needs a path count from 1 to 100000 (got ${String(count)})`);
   }
   if (directory === '' || isAbsolute(directory) || /^[A-Za-z]:/u.test(directory) || directory.includes('\0') ||
-      directory.split(/[\\/]/u).some((part) => part === '..' || part === '.' || part === '' || part === '.git')) {
+      // `.git` in any case: a case-insensitive volume (default macOS) maps `.GIT` onto it.
+      directory.split(/[\\/]/u).some((part) => part === '..' || part === '.' || part === '' || part.toLowerCase() === '.git')) {
     throw new Error(`commitManyPaths directory must be a relative path inside the fixture's work tree (got ${JSON.stringify(directory)})`);
   }
   if (existsSync(join(repo.path, directory))) throw new Error(`commitManyPaths directory already exists: ${directory}`);

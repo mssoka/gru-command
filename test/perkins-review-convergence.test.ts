@@ -11,7 +11,9 @@ import {
   deltaSince,
   findingIntersectsDelta,
   integrationSince,
+  boundedForReason,
   parseRawChanges,
+  REASON_EXCERPT_MAX_CHARS,
   rawChanges,
   planReviewScope,
   planPerkinsReviewScope,
@@ -539,6 +541,9 @@ describe('integration unit fail-loud guards (#393)', () => {
       if (edit) writeFileSync(join(repo.path, 'src/renamed.ts'), `${'export const moved = 1;\n'.repeat(19)}export const edited = 2;\n`);
       repo.git(['add', '-A']);
       repo.git(['commit', '-m', `rename (${setting}, edited ${String(edit)})`]);
+      // Positive control: with detection on, git DOES score this commit as a rename.
+      const detected = execFileSync('git', ['-C', repo.path, 'diff', '--raw', '-z', '-M', '--abbrev=40', before, repo.head(), '--']).toString();
+      expect(detected, setting).toMatch(/ R\d+\0src\/moved\.ts\0src\/renamed\.ts\0/u);
       const changes = rawChanges(repo.path, before, repo.head());
       expect([...changes.keys()].sort(), setting).toEqual(['src/moved.ts', 'src/renamed.ts']);
       expect(changes.get('src/moved.ts'), setting).toMatchObject({ newSha: '0'.repeat(40), newMode: '000000' });
@@ -548,11 +553,35 @@ describe('integration unit fail-loud guards (#393)', () => {
 
   it('refuses unsafe commitManyPaths fixtures by name before writing anything', () => {
     const { repo } = integratedFeature('perkins-guard-helper');
-    for (const [count, directory] of [[0, 'many'], [100_001, 'many'], [1, '../out'], [1, '/abs'], [1, 'C:foo'], [1, '.git/objects2'], [1, 'a/./b'], [1, 'a\0b']] as const) {
-      expect(() => commitManyPaths(repo, count, directory), `${String(count)} ${directory}`).toThrow(/commitManyPaths/u);
+    const head = repo.head();
+    const status = () => repo.git(['status', '--porcelain', '--ignored']);
+    const before = status();
+    for (const [count, directory] of [[0, 'many'], [100_001, 'many'], [1, '../out'], [1, '/abs'], [1, 'C:foo'], [1, '.git/objects2'], [1, '.GIT/objects2'], [1, 'a/.Git'], [1, 'a/./b'], [1, 'a\0b']] as const) {
+      expect(() => commitManyPaths(repo, count, directory), `${String(count)} ${directory}`).toThrow(/^commitManyPaths (?:needs a path count|directory must be a relative path)/u);
     }
+    // Nothing was written or committed by any refusal.
+    expect(repo.head()).toBe(head);
+    expect(status()).toBe(before);
     commitManyPaths(repo, 2, 'twice');
     expect(() => commitManyPaths(repo, 2, 'twice')).toThrow(/directory already exists: twice/u);
+  });
+
+  it('bounds a quoted reason literal exactly: whole when it fits, cut on a code point with … when not (#393)', () => {
+    const fits = 'x'.repeat(REASON_EXCERPT_MAX_CHARS - 2);
+    expect(boundedForReason(fits)).toBe(JSON.stringify(fits));
+    expect(boundedForReason(`${fits}y`)).toBe(`"${'x'.repeat(REASON_EXCERPT_MAX_CHARS - 3)}…"`);
+    expect(boundedForReason(`${fits}y`)).toHaveLength(REASON_EXCERPT_MAX_CHARS);
+    // Escapes count at their escaped width and are never split.
+    const escaped = boundedForReason('\u0001'.repeat(100));
+    expect(escaped.length).toBeLessThanOrEqual(REASON_EXCERPT_MAX_CHARS);
+    expect(escaped).toBe(`"${'\\u0001'.repeat(32)}…"`);
+    // An astral character is two units and is never cut in half.
+    for (const lead of ['', 'a']) {
+      const cut = boundedForReason(`${lead}${'\u{1F600}'.repeat(150)}`);
+      expect(cut.length, lead).toBeLessThanOrEqual(REASON_EXCERPT_MAX_CHARS);
+      expect(cut.endsWith('…"'), lead).toBe(true);
+      expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]|\\ud[89a-f]/iu.test(cut), lead).toBe(false);
+    }
   });
 
   it('refuses an unparseable or path-less git diff --raw record', () => {
@@ -573,21 +602,30 @@ describe('integration unit fail-loud guards (#393)', () => {
     const long = `src/${'x'.repeat(400)}.ts`;
     const longRecord = `:100644 100644 ${sha} ${'b'.repeat(40)} M\0${long}\0`;
     const thrown = (bytes: Buffer): string => { try { parseRawChanges(bytes); return ''; } catch (error) { return String(error); } };
-    // Both quoting sites bound the excerpt, counting escape expansion.
+    // Every quoting site bounds the literal, counting escape expansion.
+    // The quoted repository text is the message's LAST JSON literal.
+    const quoted = (message: string): string => [...message.matchAll(/"(?:[^"\\]|\\.)*"/gu)].at(-1)?.[0] ?? '';
     for (const message of [
       thrown(Buffer.from(longRecord + longRecord)),
       thrown(Buffer.from(`${'x'.repeat(400)}\0${longRecord}`)),
       thrown(Buffer.from(`${'\u0001'.repeat(400)}\0${longRecord}`)),
+      thrown(Buffer.from(`:100644 100644 ${sha} ${sha} U\0${long}\0`)),
     ]) {
-      expect(message.length, message.slice(0, 80)).toBeLessThan(320);
-      expect(message).toContain('…');
+      // Full to the bound, short of it only by less than one escape's width.
+      expect(quoted(message).length, message.slice(0, 80)).toBeLessThanOrEqual(REASON_EXCERPT_MAX_CHARS);
+      expect(quoted(message).length, message.slice(0, 80)).toBeGreaterThan(REASON_EXCERPT_MAX_CHARS - 6);
+      expect(quoted(message).endsWith('…"'), message.slice(0, 80)).toBe(true);
     }
     // A malformed header is unparseable, whatever letter it ends in.
     expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} short R\0a.ts\0`))).toThrow(/unparseable record \(it looks like a rename\/copy record/u);
     // Only A/D/M/T statuses are expected from a no-renames commit diff.
     for (const status of ['U', 'X', 'B']) {
-      expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${sha} ${status}\0a.ts\0`)), status).toThrow(/unexpected status/u);
+      expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${sha} ${status}\0a.ts\0`)), status).toThrow(`unexpected status "${status}" for "a.ts"`);
     }
+    // The hint reads the status FIELD: trailing junk keeps it, a stray field
+    // that merely ends in " R" does not earn it.
+    expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${sha} R100 junk\0a.ts\0b.ts\0`))).toThrow(/unparseable record \(it looks like a rename\/copy record/u);
+    expect(() => parseRawChanges(Buffer.from(`:100644 R\0a.ts\0`))).toThrow(/^git diff --raw produced an unparseable record$/u);
     expect([...parseRawChanges(Buffer.from(`:100644 120000 ${sha} ${'b'.repeat(40)} T\0link\0`)).keys()]).toEqual(['link']);
     // Rename/copy records (two paths) are refused by name, never misparsed.
     expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${sha} R100\0old.ts\0new.ts\0`))).toThrow(/rename\/copy record/u);
