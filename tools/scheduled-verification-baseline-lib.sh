@@ -119,8 +119,11 @@ const killGroup = () => { if (child?.pid === undefined) return; try { process.ki
 for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT']) {
   process.once(signal, () => {
     killGroup();
-    // The stop is said whatever the cleanup meets: a stray directory is the lesser loss.
-    try { if (dir !== undefined) rmSync(dir, { recursive: true, force: true }); } catch { /* still stopped */ }
+    // The stop is said whatever the cleanup meets — a stray directory is the
+    // lesser loss — and so is the cleanup's failure.
+    try { if (dir !== undefined) rmSync(dir, { recursive: true, force: true }); } catch (error) {
+      console.error(`the helper load directory ${dir} could not be removed: ${error instanceof Error ? error.message : String(error)}`);
+    }
     process.exit(130);
   });
 }
@@ -140,9 +143,10 @@ try {
   clearTimeout(timer);
   // Whatever the load left running goes with it.
   killGroup();
-  // A hang or a non-zero exit is the verdict whatever the output says; only
-  // the finished-load proof needs the output read.
-  if (timedOut) failure = `the helper did not finish loading within ${String(ms)} ms`;
+  // A load that exited cleanly is judged by its output, even when the bound
+  // fired between its exit and this verdict; a hang or a non-zero exit is the
+  // verdict whatever the output says.
+  if (code !== 0 && timedOut) failure = `the helper did not finish loading within ${String(ms)} ms`;
   else if (code !== 0) failure = `the helper exited ${String(code ?? signal)} while loading`;
   else {
     let stdout = null;

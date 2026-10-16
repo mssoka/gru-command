@@ -323,18 +323,28 @@ describe('reviewed-candidate behavioral RED custody', () => {
       const keptDirs = readdirSync(join(dir, 'tmp')).filter((name) => name.startsWith('gru-helper-load-')).length;
       const stuck = libCall('require_built_helper', snapshot, join(dir, 'tmp'), { NODE_OPTIONS: preload('no-rm.mjs', "import fs from 'node:fs';\nimport { syncBuiltinESMExports } from 'node:module';\nfs.rmSync = () => { throw Object.assign(new Error('busy'), { code: 'EBUSY' }); };\nsyncBuiltinESMExports();\n") });
       expect(stuck.status).toBe(0);
-      expect(stuck.stderr).toMatch(/^the helper load directory \S*gru-helper-load-\S+ could not be removed: busy\n$/u);
+      expect(stuck.stderr).toMatch(/^the helper load directory .*gru-helper-load-[^/\n]+ could not be removed: busy\n$/u);
       expect(readdirSync(join(dir, 'tmp')).filter((name) => name.startsWith('gru-helper-load-'))).toHaveLength(keptDirs + 1);
       for (const name of readdirSync(join(dir, 'tmp')).filter((entry) => entry.startsWith('gru-helper-load-'))) rmSync(join(dir, 'tmp', name), { recursive: true, force: true });
       // A load that finished but whose output cannot be read judged nothing about the helper...
       const unread = libCall('require_built_helper', snapshot, join(dir, 'tmp'), { NODE_OPTIONS: preload('no-read.mjs', "import fs from 'node:fs';\nimport { syncBuiltinESMExports } from 'node:module';\nconst read = fs.readFileSync;\nfs.readFileSync = (path, ...rest) => { if (String(path).endsWith('/stdout')) throw Object.assign(new Error('unreadable'), { code: 'EIO' }); return read(path, ...rest); };\nsyncBuiltinESMExports();\n") });
       expect(unread.status).toBe(2);
       expect(unread.stderr).toMatch(/^the helper's load output could not be read: unreadable\nthe helper load could not run or be read — nothing was judged about the helper/u);
-      // ...while a hang stays a broken-helper verdict whatever the output read meets.
-      writeFileSync(helper, 'for (;;) {}\n');
-      const hungUnread = libCall('require_built_helper', snapshot, join(dir, 'tmp'), { GRU_HELPER_LOAD_MS: '300', NODE_OPTIONS: preload('no-read.mjs', "import fs from 'node:fs';\nimport { syncBuiltinESMExports } from 'node:module';\nconst read = fs.readFileSync;\nfs.readFileSync = (path, ...rest) => { if (String(path).endsWith('/stdout')) throw Object.assign(new Error('unreadable'), { code: 'EIO' }); return read(path, ...rest); };\nsyncBuiltinESMExports();\n") });
-      expect(hungUnread.stderr).toMatch(/^the helper did not finish loading within 300 ms\nthe built dist\/verify\/capture-cli\.js does not load cleanly/u);
-      writeFileSync(helper, "import './scheduler.js';\nconsole.log('loading capture helper');\nprocess.stdout.write('no newline');\n");
+      // ...while a hang or a non-zero exit stays a broken-helper verdict whatever the output read meets.
+      const noRead = preload('no-read.mjs', "import fs from 'node:fs';\nimport { syncBuiltinESMExports } from 'node:module';\nconst read = fs.readFileSync;\nfs.readFileSync = (path, ...rest) => { if (String(path).endsWith('/stdout')) throw Object.assign(new Error('unreadable'), { code: 'EIO' }); return read(path, ...rest); };\nsyncBuiltinESMExports();\n");
+      try {
+        writeFileSync(helper, 'for (;;) {}\n');
+        const hungUnread = libCall('require_built_helper', snapshot, join(dir, 'tmp'), { GRU_HELPER_LOAD_MS: '300', NODE_OPTIONS: noRead });
+        expect(hungUnread.status).toBe(2);
+        expect(hungUnread.stderr).toMatch(/^the helper did not finish loading within 300 ms\nthe built dist\/verify\/capture-cli\.js does not load cleanly/u);
+        writeFileSync(helper, 'process.exit(3);\n');
+        const exitedUnread = libCall('require_built_helper', snapshot, join(dir, 'tmp'), { NODE_OPTIONS: noRead });
+        expect(exitedUnread.status).toBe(2);
+        expect(exitedUnread.stderr).toMatch(/^the helper exited 3 while loading\nthe built dist\/verify\/capture-cli\.js does not load cleanly/u);
+        expect(exitedUnread.stderr).not.toMatch(/could not be read/u);
+      } finally {
+        writeFileSync(helper, "import './scheduler.js';\nconsole.log('loading capture helper');\nprocess.stdout.write('no newline');\n");
+      }
       // A guard that crashes before judging (a failing preload: node exits 1) is no verdict either.
       const crashed = libCall('require_built_helper', snapshot, join(dir, 'tmp'), { NODE_OPTIONS: preload('crash.mjs', "throw new Error('guard crashed');\n") });
       expect(crashed.status).toBe(2);
@@ -421,7 +431,8 @@ describe('reviewed-candidate behavioral RED custody', () => {
           const said = `the helper load was stopped by a signal (status ${String(expected)}) — nothing was judged; refusing (snapshot kept at ${snapshot})\n`;
           expect(status, signal).toBe(expected);
           // A shell may print its own notice of a child it saw killed (bash does; dash does not) before ours.
-          if (handled) expect(stderr, signal).toBe(said);
+          if (handled && !lockTmp) expect(stderr, signal).toBe(said);
+          else if (lockTmp) expect(stderr, label).toMatch(new RegExp(`^the helper load directory .*gru-helper-load-[^/\\n]+ could not be removed: [^\\n]+\\n${said.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}$`, 'u'));
           else expect(stderr.endsWith(said), `${signal}: ${stderr}`).toBe(true);
           const until = Date.now() + 5000;
           while (alive(kid) && Date.now() < until) await pause(100);
