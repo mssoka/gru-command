@@ -1369,7 +1369,8 @@ describe('review Git repository environment isolation (GH-270)', () => {
         expect(registry.getHandle(handle.id)).toBeNull();
       }
       for (const listener of listeners) listener({ type: 'text_delta', delta: 'after publication attempt' });
-      expect(forwarded).toEqual(seam === 'healthy' ? ['inside publication', 'buffered before publication', 'after publication attempt'] : []);
+      // In the order they happened (#353): the held frame, then the one a `spawned` listener made.
+      expect(forwarded).toEqual(seam === 'healthy' ? ['buffered before publication', 'inside publication', 'after publication attempt'] : []);
       expect(published).toEqual(seam === 'before-publication' ? [] : [handle.id]);
       const acknowledgements: boolean[] = [];
       const stopSettlement = observeDisposalSettlement(handle, (acknowledged) => { acknowledgements.push(acknowledged); });

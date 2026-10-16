@@ -14,7 +14,7 @@ import { createWorkflowSessionBinder } from '../workflows/session.js';
 import type { WorktreeLane } from '../dispatch/worktree-port.js';
 import { ResidentBudget } from './resident-budget.js';
 import type { ResidencySnapshot } from './residency-observations.js';
-import { WorkerDisposalInProgressError } from './worker-errors.js';
+import { QuarantinedPublicationError, WorkerDisposalInProgressError } from './worker-errors.js';
 import { disposePhases, type DisposableTarget } from './disposal.js';
 import { publishSpawnRegistration } from './spawn-registration.js';
 import { notifyDisposalSettlement } from './disposal-observation.js';
@@ -188,6 +188,9 @@ export class RuntimeRegistry {
   private readonly handles = new Set<AgentHandle>();
   private readonly unpublished = new Set<AgentHandle>();
   private readonly quarantined = new Set<AgentHandle>();
+  /** Per unpublished handle: its held-frame count, and the refusal a
+   * quarantine applies to its publication (#352). */
+  private readonly publications = new Map<AgentHandle, { readonly held: () => number; readonly refuse: () => void }>();
   private readonly ceasedReviewOwners = new Map<string, string>();
 
   /** Pi isolated review tools and host-native callbacks run inside this
@@ -247,6 +250,7 @@ export class RuntimeRegistry {
         return {
           agentId: handle.id, role: handle.role,
           sessionFile: handle.sessionFile ?? null, state,
+          heldEvents: this.publications.get(handle)?.held() ?? 0,
         };
       }),
     };
@@ -730,6 +734,7 @@ export class RuntimeRegistry {
       this.handles.delete(resident);
       this.unpublished.delete(resident);
       this.quarantined.delete(resident);
+      this.publications.delete(resident);
       this.residents.unwatch(resident);
       release?.();
       // AFTER the permit is actually released: notify capacity consumers
@@ -857,12 +862,15 @@ export class RuntimeRegistry {
         publishing = true;
         published = true;
         this.unpublished.delete(resident);
+        this.publications.delete(resident);
         this.emitAgentEvent({ handle: resident, agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'spawned' });
         assertHandoff();
         publishing = false;
-        // Preserve healthy observer-event ordering, but never forward any
-        // pending event until the post-listener custody proof succeeds.
-        for (const envelope of [...duringPublication.splice(0), ...buffered.splice(0)]) this.emitAgentEvent(envelope);
+        // Never forward any pending event until the post-listener custody
+        // proof succeeds; then in the order they happened (#353): every frame
+        // held before publication, then any frame a `spawned` listener made
+        // on this handle — a reentrant frame never overtakes a held one.
+        for (const envelope of [...buffered.splice(0), ...duringPublication.splice(0)]) this.emitAgentEvent(envelope);
       } catch (error) {
         publicationFailure = { error };
         published = false;
@@ -872,6 +880,20 @@ export class RuntimeRegistry {
         throw error; // delayed Supervisor retries see the same terminal refusal
       } finally { publishing = false; }
     };
+    // A generation its owner rejects before publishing it never publishes:
+    // its held frames are released, and later ones are never held (#352).
+    // Only the tap copy goes — the handle's own subscribers (the release
+    // listener below, cleanup traversal, an owner's disposal and cessation
+    // observers) keep receiving every frame.
+    this.publications.set(resident, {
+      held: () => buffered.length + duringPublication.length,
+      refuse: () => {
+        if (published || publishing || publicationFailure !== null) return;
+        publicationFailure = { error: new QuarantinedPublicationError(handle.id) };
+        buffered.length = 0;
+        duringPublication.length = 0;
+      },
+    });
     // Self-healing membership: a handle disposed by ANY caller leaves the
     // registry set — the status surface must never contradict itself.
     // Registered FIRST (before the emit tap below) so the disposed event
@@ -945,9 +967,13 @@ export class RuntimeRegistry {
    * handle is no longer returned by getHandle, so no dispatch/consumer path
    * can hand a supervisor-refused producer new work while its cleanup is
    * outstanding (issue #280 AC1). The quarantine is monotonic — disposal, or
-   * registry shutdown, drops the record (and the quarantined handle with it). */
+   * registry shutdown, drops the record (and the quarantined handle with it).
+   * A handle quarantined before its publication is never published, and holds
+   * no frames for tap consumers (#352). */
   quarantineHandle(handle: AgentHandle): void {
-    if (this.handles.has(handle)) this.quarantined.add(handle);
+    if (!this.handles.has(handle)) return;
+    this.quarantined.add(handle);
+    this.publications.get(handle)?.refuse();
   }
 
   /** The shared offline pi ModelRuntime for read-only consumers (the

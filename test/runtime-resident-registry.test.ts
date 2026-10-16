@@ -9,7 +9,8 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import { Supervisor } from '../src/supervision/supervisor.js';
 import { RuntimeRegistry } from '../src/runtime/registry.js';
-import { WorkerDisposalInProgressError } from '../src/runtime/worker-errors.js';
+import { stageSpawnRegistration } from '../src/runtime/spawn-registration.js';
+import { QuarantinedPublicationError, WorkerDisposalInProgressError } from '../src/runtime/worker-errors.js';
 import type { AgentHandle, AgentRuntime, RuntimeEvent, RuntimeEventListener, SpawnOptions } from '../src/runtime/types.js';
 import type { SessionStore } from '../src/sessions/store.js';
 
@@ -756,6 +757,138 @@ describe('registry resident release notifications (Perkins r3 blocker 4)', () =>
       h.cleanup();
     } finally {
       h.cleanup();
+    }
+  });
+});
+
+describe('registry publication taps (#352, #353)', () => {
+  /** Native generations whose frames the test emits, whose disposal may
+   * reject, and whose adapter attests cessation only when the test says so. */
+  function generations(options: { readonly rejectDispose?: boolean } = {}) {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-publication-'));
+    const emitters = new Map<string, (event: RuntimeEvent) => void>();
+    const ceased = new Set<string>();
+    let next = 0;
+    const adapter: AgentRuntime = {
+      id: 'pi', capabilities: caps, health: () => ({ state: 'ok' }), dispose: async () => {},
+      spawn: async (role: Role): Promise<AgentHandle> => {
+        const id = `generation-${String(++next)}`;
+        const listeners = new Set<RuntimeEventListener>();
+        emitters.set(id, (event) => { for (const listener of [...listeners]) listener(event); });
+        return {
+          id, role, sessionFile: null, capabilities: caps,
+          health: () => ({ state: ceased.has(id) ? 'disposed' : 'idle', lastActivity: null, sessionFile: null }),
+          cessationEvidence: () => (ceased.has(id) ? 'ceased' : 'unknown'),
+          subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
+          prompt: async () => {}, steer: async () => {}, followUp: async () => {},
+          hasLiveProcess: () => !ceased.has(id), isCompacting: () => false,
+          dispose: async () => { if (options.rejectDispose === true) throw new Error('native disposal rejected'); },
+        };
+      },
+    };
+    class Registry extends RuntimeRegistry {
+      override runtimeIdFor(): RuntimeId { return 'pi'; }
+      override runtimeFor(): AgentRuntime { return adapter; }
+    }
+    const registry = new Registry({ config: { ...loadConfig({ GRU_COMMAND_HOME: dir }), concurrency: { maxWorkers: 4 } }, store: {} as SessionStore });
+    /** What tap consumers saw, per agent: phases, and frames by their text or type. */
+    const tapped = new Map<string, string[]>();
+    registry.onAgentEvent((envelope) => {
+      const label = envelope.phase !== 'event' ? envelope.phase : envelope.event?.type === 'text_delta' ? envelope.event.delta : envelope.event?.type ?? 'unknown';
+      tapped.set(envelope.agentId, [...(tapped.get(envelope.agentId) ?? []), label]);
+    });
+    const emit = (handle: AgentHandle, event: RuntimeEvent): void => { emitters.get(handle.id)?.(event); };
+    const held = (handle: AgentHandle): number | undefined => registry.residencySnapshot().handles.find((row) => row.agentId === handle.id)?.heldEvents;
+    const staged = async (): Promise<{ readonly handle: AgentHandle; readonly publish: () => void }> => {
+      let publish: (() => void) | undefined;
+      const handle = await registry.spawn('minion', stageSpawnRegistration({}, (_handle, stage) => { publish = stage; }));
+      if (publish === undefined) throw new Error('fixture owner never received its publication stage');
+      return { handle, publish };
+    };
+    const cease = (handle: AgentHandle): void => {
+      ceased.add(handle.id);
+      emit(handle, { type: 'state', state: 'disposed' });
+      emit(handle, { type: 'cessation_evidence', evidence: 'ceased' });
+    };
+    return { registry, tapped, emit, held, staged, cease, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  }
+
+  it('#353 publication shows spawned first, then held frames in order, then a frame a spawned listener made — never ahead of a held one', async () => {
+    const g = generations();
+    try {
+      // An ordinary spawn publishes at once: spawned is its first frame, nothing is held.
+      const ordinary = await g.registry.spawn('minion');
+      g.emit(ordinary, { type: 'text_delta', delta: 'live' });
+      expect(g.tapped.get(ordinary.id)).toEqual(['spawned', 'live']);
+      expect(g.held(ordinary)).toBe(0);
+      // A held publication: a `spawned` listener that makes a frame on the same handle.
+      const { handle, publish } = await g.staged();
+      let reentered = false;
+      g.registry.onAgentEvent((envelope) => {
+        if (envelope.phase === 'spawned' && envelope.agentId === handle.id && !reentered) { reentered = true; g.emit(handle, { type: 'text_delta', delta: 'reentrant' }); }
+      });
+      g.emit(handle, { type: 'text_delta', delta: 'held-1' });
+      g.emit(handle, { type: 'state', state: 'idle' });
+      g.emit(handle, { type: 'text_delta', delta: 'held-2' });
+      expect(g.tapped.get(handle.id)).toBeUndefined();
+      expect(g.held(handle)).toBe(3);
+      publish();
+      g.emit(handle, { type: 'text_delta', delta: 'live' });
+      expect(g.tapped.get(handle.id)).toEqual(['spawned', 'held-1', 'state', 'held-2', 'reentrant', 'live']);
+      expect(g.held(handle)).toBe(0);
+    } finally {
+      g.cleanup();
+    }
+  });
+
+  it('#352 a generation quarantined before publication holds no frames and is never published, while its disposal and cessation custody stand — rejected disposal included', async () => {
+    for (const rejectDispose of [false, true]) {
+      const g = generations({ rejectDispose });
+      try {
+        const { handle, publish } = await g.staged();
+        g.emit(handle, { type: 'text_delta', delta: 'startup' });
+        g.emit(handle, { type: 'state', state: 'idle' });
+        expect(g.held(handle), String(rejectDispose)).toBe(2);
+        g.registry.quarantineHandle(handle);
+        // The held frames are released; a previously started turn's late frames are never held.
+        expect(g.held(handle)).toBe(0);
+        g.emit(handle, { type: 'text_delta', delta: 'late turn' });
+        g.emit(handle, { type: 'turn_end' });
+        expect(g.held(handle)).toBe(0);
+        // Never published, never prompted, never found — and every retry is refused alike.
+        expect(publish).toThrow(new QuarantinedPublicationError(handle.id));
+        expect(publish).toThrow(QuarantinedPublicationError);
+        await expect(handle.prompt('never')).rejects.toBeInstanceOf(QuarantinedPublicationError);
+        expect(g.registry.getHandle(handle.id)).toBeNull();
+        // Disposal, acknowledged or rejected, is not cessation: its capacity is retained.
+        if (rejectDispose) await expect(handle.dispose()).rejects.toThrow('native disposal rejected');
+        else await handle.dispose();
+        expect(g.registry.residencySnapshot().occupied).toBe(1);
+        // Late adapter-owned cessation still reaches the release listener: released once.
+        g.cease(handle);
+        expect(g.registry.residencySnapshot()).toMatchObject({ occupied: 0, handles: [] });
+        expect(g.tapped.get(handle.id)).toBeUndefined();
+      } finally {
+        g.cleanup();
+      }
+    }
+  });
+
+  it('#352 a quarantine after publication changes no tap delivery, and a quarantine of a published handle never refuses it', async () => {
+    const g = generations();
+    try {
+      const { handle, publish } = await g.staged();
+      g.emit(handle, { type: 'text_delta', delta: 'held' });
+      publish();
+      g.registry.quarantineHandle(handle);
+      g.emit(handle, { type: 'text_delta', delta: 'after quarantine' });
+      expect(g.tapped.get(handle.id)).toEqual(['spawned', 'held', 'after quarantine']);
+      expect(() => publish()).not.toThrow();
+      expect(g.registry.getHandle(handle.id)).toBeNull();
+      g.cease(handle);
+      expect(g.registry.residencySnapshot().occupied).toBe(0);
+    } finally {
+      g.cleanup();
     }
   });
 });
