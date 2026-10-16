@@ -4,14 +4,26 @@
 set -e
 root="$PWD"
 base=2823cf75e4a736bd9548973294e1f569fceab718
+# The regressions are pinned to the revision that authored them (the GH315
+# merge), never the evolving working tree: later test files import helpers
+# and modules the preserved candidate does not have, which turned every
+# rerun into a setup failure the classifier rightly refuses (#358).
+regressions=6883628e6ba4f58efb993fb2f042260b84b6a6d1
+set -- test/worker-verification-policy.test.ts test/workflow-session.test.ts test/pi-adapter.test.ts test/claude-adapter.test.ts test/helpers/worker-verification.ts test/helpers/claude-double.mjs test/helpers/verification-native-corpus.mjs test/helpers/verification-native-corpus.d.mts
+lib="$(dirname "$0")/scheduled-verification-baseline-lib.sh"
+[ -r "$lib" ] || { echo "cannot read $lib — run this baseline as: sh tools/$(basename "$0")" >&2; exit 2; }
+. "$lib"
+require_pinned_sources "$base" "$regressions" "$@"
 d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gh315-review-baseline.XXXXXX")
-git archive "$base" | tar -x -C "$d"
-cp test/worker-verification-policy.test.ts test/workflow-session.test.ts test/pi-adapter.test.ts test/claude-adapter.test.ts "$d/test/"
-cp test/helpers/worker-verification.ts test/helpers/claude-double.mjs test/helpers/verification-native-corpus.mjs test/helpers/verification-native-corpus.d.mts "$d/test/helpers/"
+snapshot_candidate "$d" "$base"
+for f in "$@"; do
+  git show "${regressions}:$f" > "$d/$f"
+done
 ln -s "$root/node_modules" "$d/node_modules"
-printf 'GH315 reviewed-candidate source=%s head=%s snapshot=%s\n' "$base" "$(git rev-parse HEAD)" "$d"
+printf 'GH315 reviewed-candidate source=%s regressions=%s head=%s snapshot=%s\n' "$base" "$regressions" "$(git rev-parse HEAD)" "$d"
 cd "$d"
 npm run build
+require_built_helper
 node tools/patch-vitest-rpc-timeout.mjs
 set +e
 npx vitest run --reporter=json --outputFile="$d/fast-results.json" test/worker-verification-policy.test.ts test/workflow-session.test.ts test/pi-adapter.test.ts -t 'review-1'
