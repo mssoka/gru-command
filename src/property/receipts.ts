@@ -230,7 +230,9 @@ export function captureState(stdoutTruncated: boolean, stderrTruncated: boolean)
  * environment POLICY inputs, not the throwaway workspace path.
  */
 export function environmentProfileString(env: Readonly<Record<string, string>>): string {
-  const volatile = new Set(['HOME', 'TMPDIR', 'CFFIXED_USER_HOME', 'GRU_PROPERTY_SEED', 'GRU_PROPERTY_PATH']);
+  // Per-run workspace paths (HOME, TMPDIR, the copied runner's reporters
+  // module for the host-framed report, #378) and replay controls vary by run.
+  const volatile = new Set(['HOME', 'TMPDIR', 'CFFIXED_USER_HOME', 'GRU_PROPERTY_SEED', 'GRU_PROPERTY_PATH', 'GRU_PROPERTY_REPORTERS_MODULE']);
   const canonical = Object.keys(env)
     .filter((key) => !volatile.has(key))
     .sort()
