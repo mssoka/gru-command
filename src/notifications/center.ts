@@ -302,9 +302,9 @@ export class NotificationCenter {
     return this.ledger.adoptLegacyOwnerDecision(id, decision, provenance);
   }
 
-  /** Refresh an open incident's detail (same id, same ack state). */
-  updateDetail(id: string, detail: string): NotificationRecord | null {
-    return this.ledger.updateNotificationDetail(id, detail);
+  /** Refresh an open incident's detail (and title, when given) — same id, same ack state. */
+  updateDetail(id: string, detail: string, title?: string): NotificationRecord | null {
+    return this.ledger.updateNotificationDetail(id, detail, title);
   }
 
   resolveIncidents(kindPrefix: string, by: string): readonly NotificationRecord[] {

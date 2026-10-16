@@ -9,7 +9,7 @@ import type { AgentHandle, NativeAgentTool } from '../runtime/types.js';
 import type { PacingGate, PacingLease, RetrySettlement } from '../runtime/pacing.js';
 import { lineSafeLiteral } from './line-safe.js';
 import { DirectiveDispatchDeferredError, flipJobToWorking, recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion, type DirectiveRegistry } from './fix-directive.js';
-import { observePendingRebriefs, type RecoveryNotifications } from './rebrief-recovery.js';
+import { observePendingRebriefs, postRecoveryIncident, type RecoveryNotifications } from './rebrief-recovery.js';
 import type { WorktreeLane, WorktreePort } from './worktree-port.js';
 import type { LessonsReferencePort } from '../lessons/types.js';
 import { resolveGitCommit } from './perkins-review/artifacts.js';
@@ -467,7 +467,7 @@ export function surfaceDirectiveRecovery(deps: Pick<DirectiveProgressDeps, 'ledg
   }
   const debt = deps.ledger.openDirectiveRecoveryDebt(requestId, reason);
   const current = deps.ledger.directiveCurrentAuthority(row.jobId);
-  deps.notifications.postIncident({ kind: `silas.directive-unreconciled.${requestId}`, routing: 'action-required', severity: 'error',
+  postRecoveryIncident(deps.notifications, { kind: `silas.directive-unreconciled.${requestId}`, routing: 'action-required', severity: 'error',
     title: `Directive ${requestId}: concrete Gru recovery decision owed (job ${row.jobId})`,
     detail: `Request ${requestId}; payload_hash ${row.payloadHash}; generation ${debt.generation}; authority_epoch ${deps.ledger.directiveRecoveryEpoch(row.jobId)}; ` +
       `current approved work_revision ${current.workRevision}, contract_sha256 ${current.contractSha256}; native target ${JSON.stringify(row.nativeTarget)}; blocker/evidence: ${reason}. Inspect GET /api/silas/directives/${requestId}, ` +
