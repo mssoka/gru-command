@@ -56,14 +56,9 @@ function plan(): PropertyExecutionPlan {
 }
 
 function rawFromFixture(name: string, exitCode: number): RawExecutionReceipt {
-  return {
-    exitCode,
-    signal: null,
-    timedOut: false,
-    stdout: readFileSync(`${FIXTURES}/${name}`, 'utf-8'),
-    stderr: '',
-    durationMs: 900,
-  };
+  const json = readFileSync(`${FIXTURES}/${name}`, 'utf-8');
+  // The fixture JSON is what the host's framed reporter authenticated.
+  return { exitCode, signal: null, timedOut: false, stdout: json, stderr: '', report: json, durationMs: 900 };
 }
 
 function outcomeFromFixture(name: string, exitCode: number): PropertyRunOutcome {
@@ -89,7 +84,7 @@ function bareOutcome(overrides: Partial<PropertyRunOutcome> & Pick<PropertyRunOu
     unselectedFailures: [],
     reasons: [],
     matchedDiagnostic: null,
-    receipt: { exitCode: 0, signal: null, timedOut: false, stdout: '', stderr: '', durationMs: 100 },
+    receipt: { exitCode: 0, signal: null, timedOut: false, stdout: '', stderr: '', report: null, durationMs: 100 },
     ...overrides,
   };
 }
@@ -221,7 +216,7 @@ describe('GH350 qualification verdicts (injected unit controls)', () => {
 
   it('rejects as inconclusive with validity UNKNOWN when the known-bad control only hit an infrastructure error', () => {
     const knownBad = interpretVitestJsonReceipt(
-      { exitCode: null, signal: 'SIGKILL', timedOut: false, stdout: '', stderr: '', durationMs: 300 },
+      { exitCode: null, signal: 'SIGKILL', timedOut: false, stdout: '', stderr: '', report: null, durationMs: 300 },
       plan(),
     );
     const healthy = outcomeFromFixture('healthy-passes.report.json', 0);
@@ -233,7 +228,7 @@ describe('GH350 qualification verdicts (injected unit controls)', () => {
 
   it('rejects as inconclusive with validity UNKNOWN when the known-bad control timed out', () => {
     const knownBad = interpretVitestJsonReceipt(
-      { exitCode: null, signal: null, timedOut: true, stdout: '', stderr: '', durationMs: 120_000 },
+      { exitCode: null, signal: null, timedOut: true, stdout: '', stderr: '', report: null, durationMs: 120_000 },
       plan(),
     );
     const healthy = outcomeFromFixture('healthy-passes.report.json', 0);
@@ -248,7 +243,7 @@ describe('GH350 qualification verdicts (injected unit controls)', () => {
       failed: 1,
       passed: 1,
       failures: [],
-      receipt: { exitCode: 1, signal: null, timedOut: false, stdout: '', stderr: '', durationMs: 100 },
+      receipt: { exitCode: 1, signal: null, timedOut: false, stdout: '', stderr: '', report: null, durationMs: 100 },
     });
     const healthy = outcomeFromFixture('healthy-passes.report.json', 0);
     const record = qualifyContract(proposal, controls(knownBad, healthy));
@@ -270,7 +265,7 @@ describe('GH350 qualification verdicts (injected unit controls)', () => {
   it('escalates when the healthy control hit a harness-level refusal (infrastructure-error), never blaming the oracle', () => {
     const knownBad = outcomeFromFixture('known-bad-fails.report.json', 1);
     const healthy = interpretVitestJsonReceipt(
-      { exitCode: null, signal: 'SIGKILL', timedOut: false, stdout: '', stderr: '', durationMs: 300 },
+      { exitCode: null, signal: 'SIGKILL', timedOut: false, stdout: '', stderr: '', report: null, durationMs: 300 },
       plan(),
     );
     expect(healthy.kind).toBe('infrastructure-error');
@@ -310,7 +305,7 @@ describe('GH350 baseline attribution', () => {
     const candidate = outcomeFromFixture('known-bad-fails.report.json', 1);
     expect(attributeCounterexample(candidate, null)).toBe('unattributed');
     const timedOut = interpretVitestJsonReceipt(
-      { exitCode: null, signal: null, timedOut: true, stdout: '', stderr: '', durationMs: 120_000 },
+      { exitCode: null, signal: null, timedOut: true, stdout: '', stderr: '', report: null, durationMs: 120_000 },
       plan(),
     );
     expect(attributeCounterexample(candidate, timedOut)).toBe('unattributed');
