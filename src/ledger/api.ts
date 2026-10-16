@@ -1204,16 +1204,31 @@ export class LedgerApi {
    * `kinds` narrows to an explicit set (empty/omitted = every kind). */
   listEventsAfter(
     seq: number,
-    opts: { limit?: number; order?: 'asc' | 'desc'; kinds?: readonly string[] } = {},
+    opts: {
+      limit?: number;
+      order?: 'asc' | 'desc';
+      kinds?: readonly string[];
+      /** One top-level payload field that must (or must not) equal a value:
+       * a window of its own, never a share of a mixed one (#360 R5-B11). */
+      payload?: { readonly key: string; readonly equals?: string; readonly notEquals?: string };
+    } = {},
   ): readonly EventRecord[] {
     const limit = opts.limit ?? 100;
     const order = opts.order === 'desc' ? 'DESC' : 'ASC';
     const kinds = opts.kinds;
-    const where =
+    let where =
       kinds === undefined || kinds.length === 0
         ? 'seq > ?'
         : `seq > ? AND kind IN (${kinds.map(() => '?').join(', ')})`;
     const params: (number | string)[] = [seq, ...(kinds ?? [])];
+    if (opts.payload !== undefined) {
+      const { key, equals, notEquals } = opts.payload;
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(key) || (equals === undefined) === (notEquals === undefined)) {
+        throw new Error('listEventsAfter payload filter needs one plain field name and exactly one of equals/notEquals');
+      }
+      where += equals !== undefined ? ` AND json_extract(payload, '$.${key}') = ?` : ` AND json_extract(payload, '$.${key}') IS NOT ?`;
+      params.push((equals ?? notEquals)!);
+    }
     return (
       this.db
         .prepare(`SELECT * FROM events WHERE ${where} ORDER BY seq ${order} LIMIT ?`)

@@ -121,6 +121,9 @@ export interface BuildInputs {
   readonly head: string | null;
   readonly clean: boolean;
   readonly config: string;
+  /** The installed dependency tree as npm records it (#360 R5-B8): ignored
+   * `node_modules` changes the head, the tree and the lockfile never see. */
+  readonly dependencies: string;
   readonly env: string;
   readonly outputs: OutputFingerprint | null;
 }
@@ -166,6 +169,14 @@ function configFingerprint(cwd: string): string {
   }
   const files = ['package.json', 'package-lock.json', '.npmrc', ...names].sort();
   return sha(files.map((file) => `${file}=${fileDigest(join(cwd, file))}`));
+}
+
+/** npm's own record of what is installed (`node_modules/.package-lock.json`,
+ * rewritten by every npm install/ci/update): a different installed tree is
+ * a different build input even when package.json and the lockfile agree.
+ * Hand edits inside node_modules are not seen by it. */
+function dependencyFingerprint(cwd: string): string {
+  return fileDigest(join(cwd, 'node_modules', '.package-lock.json'));
 }
 
 function envFingerprint(env: NodeJS.ProcessEnv): string {
@@ -234,6 +245,7 @@ export function observeBuildInputs(
     head: head === null || head === '' ? null : head,
     clean: status === '',
     config: configFingerprint(cwd),
+    dependencies: dependencyFingerprint(cwd),
     env: envFingerprint(env),
     outputs: outputsFingerprint(cwd, roots),
   };
@@ -254,6 +266,7 @@ export function inspectReuse(
   if (now.head !== leaseHead || now.head !== record.head) return 'head-changed';
   if (!now.clean) return 'dirty-input';
   if (now.config !== record.config) return 'config-changed';
+  if (now.dependencies !== record.dependencies) return 'dependencies-changed';
   if (now.env !== record.env) return 'env-changed';
   if (now.outputs === null) return 'outputs-missing';
   if (record.outputs === null) return 'outputs-changed';
