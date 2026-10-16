@@ -78,7 +78,8 @@ describe('restart recovery baseline driver capture (#363 S09-0-02)', () => {
       const result = await run(process.execPath, ['-e', "process.stdout.write('to stdout'); process.stderr.write('to stderr'); process.exitCode = 3;"], dir, log, [sink(0), sink(1)]);
       expect(result).toEqual({ exitCode: 3, signal: null });
       expect(seen.map((chunks) => chunks.join(''))).toEqual(['to stdout', 'to stderr']);
-      expect(readFileSync(log, 'utf8').split('').sort().join('')).toBe('to stdoutto stderr'.split('').sort().join(''));
+      // Each stream's bytes land whole; only the order between the two streams may vary.
+      expect(['to stdoutto stderr', 'to stderrto stdout']).toContain(readFileSync(log, 'utf8'));
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 

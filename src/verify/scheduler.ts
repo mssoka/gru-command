@@ -1573,11 +1573,10 @@ export class VerificationScheduler {
         this.log('error', 'verification no-start persistence/publication failed; original identity retained for retry', { run: runId, error: String(error) });
       } finally { this.publishingNoStart.delete(runId); }
     }
-    // A publication settled: keep the memory history within its bound
-    // (#363 S09-1-05) and persist it.
-    if (!published) return;
+    // Keep the memory history within its bound after every pass, published
+    // or not (#363 S09-1-05), and persist it once something published.
     this.boundRequestHistory();
-    this.persistBestEffort();
+    if (published) this.persistBestEffort();
   }
 
   /** Record (or forget) every bound request identity for reconciliation. */
@@ -1624,12 +1623,16 @@ export class VerificationScheduler {
   }
 
   /** Keep at most MAX_REQUEST_HISTORY terminal entries in memory, oldest out
-   * first. Nothing is lost: an evicted terminal identity answers from the
-   * durable index, and a no-start still pending publication keeps its whole
-   * record in pendingNoStart, which re-derives its entry on every retry. */
+   * first, once each is durably indexed (#363 S09-1-05): an evicted identity
+   * answers from the durable index. A pending no-start whose durable append
+   * failed has no index entry, so its history entry is the only copy that
+   * answers for it (and the only one persisted for a restart). That
+   * unpublished refusal is kept until a retry indexes it, never evicted into
+   * an `unknown` that a resubmit would replay. */
   private boundRequestHistory(): void {
-    for (const requestId of this.requestHistory.keys()) {
+    for (const [requestId, entry] of this.requestHistory) {
       if (this.requestHistory.size <= MAX_REQUEST_HISTORY) break;
+      if (this.pendingNoStart.has(entry.runId) && !this.requestIndex.has(requestId)) continue;
       this.requestHistory.delete(requestId);
     }
   }

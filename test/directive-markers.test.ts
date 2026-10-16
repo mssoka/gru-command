@@ -333,7 +333,7 @@ describe('directive requests — boot reconciliation (crash windows, bounded, no
     reconcilePendingDirectives({ ledger, notifications });
     const card = ledger.findNotificationByKind('silas.directive-unreconciled.req-stale-card', 'unacked')!;
     expect(card.id).toBe(stale.id);
-    expect(card.ackedAt).toBe(stale.ackedAt);
+    expect(card.ackedAt).toBeNull();
     expect(card.title).toBe('Directive request req-stale-card unreconciled after restart (job job-stale-card)');
     expect(card.detail).toContain('Do NOT re-dispatch');
     expect(card.detail).not.toContain('removed marker');

@@ -358,7 +358,7 @@ const PINS: Record<string, number> = {
   'uploads-dir.test.ts': 3,
   'verification-evidence.test.ts': 13,
   'verification-build-reuse.test.ts': 29,
-  'verification-scheduler.test.ts': 56,
+  'verification-scheduler.test.ts': 57,
   'verification-server.test.ts': 45,
   'verify-perkins-resource.test.ts': 3,
   'wake-e2e.test.ts': 4,

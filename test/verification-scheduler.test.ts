@@ -601,6 +601,35 @@ describe('verification scheduler — global budget', () => {
     } finally { await scheduler.dispose(); }
   });
 
+  it('a no-start whose durable append failed is never evicted into unknown: it answers until a retry indexes it, then the bound holds again (#363 S09-1-05)', async () => {
+    const storageDir = join(tempDir(), 'verify'); const missing = join(tempDir(), 'missing'); const cwd = tempDir();
+    const scheduler = new VerificationScheduler({ storageDir, limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 5000, runTimeoutMs: 5000 }, buildReuse: false, record: () => undefined });
+    const requestLog = join(storageDir, 'requests.ndjson');
+    try {
+      scheduler.start();
+      // The durable identity log cannot be written: the no-start stays pending, unindexed.
+      mkdirSync(requestLog);
+      await expect(scheduler.submit({ jobId: 'unindexed', requestId: 'held', scope: 'full', cwd: missing, head: null, command: 'true' })).rejects.toThrow(/ENOENT/);
+      const history = (scheduler as unknown as { requestHistory: Map<string, unknown> }).requestHistory;
+      // More ordinary settles than the bound holds; each bounds the history.
+      for (let index = 0; index < 70; index += 1) {
+        const outcome = await scheduler.submit({ jobId: 'unindexed', requestId: `ordinary-${String(index)}`, scope: 'full', cwd, head: null, command: 'true' });
+        expect(outcome.exitCode).toBe(0);
+        expect(scheduler.attemptStatus({ requestId: 'held' }), String(index)).toMatchObject({ state: 'admission-failed', started: false, error: { code: 'spawn_failed' } });
+      }
+      expect(history.size).toBe(64);
+      expect(history.has('held')).toBe(true);
+      // Once the log is writable again, the next retry indexes it and the bound evicts it like any other.
+      rmSync(requestLog, { recursive: true });
+      await expect(scheduler.submit({ jobId: 'unindexed', requestId: 'held', scope: 'full', cwd: missing, head: null, command: 'true' })).rejects.toThrow(/ENOENT/);
+      expect(history.size).toBe(64);
+      await scheduler.submit({ jobId: 'unindexed', requestId: 'ordinary-last', scope: 'full', cwd, head: null, command: 'true' });
+      expect(history.size).toBe(64);
+      expect(history.has('held')).toBe(false);
+      expect(scheduler.attemptStatus({ requestId: 'held' })).toMatchObject({ state: 'admission-failed', started: false, error: { code: 'spawn_failed' } });
+    } finally { await scheduler.dispose(); }
+  });
+
   it('rejects a queued request parked on its queued frame when dispose runs', async () => {
     const { scheduler } = makeScheduler({ maxConcurrent: 1 });
     scheduler.start();
