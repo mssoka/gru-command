@@ -87,6 +87,38 @@ describe('worktree bootstrap manifest (E8, ruling 18a)', () => {
     expect(() => parseWorktreeManifest('unknown_key = 1')).toThrowError(/unknown key/);
   });
 
+  it('parses reclaim as normalized repo-relative folders; absent means no reclaim key (#427)', () => {
+    const manifest = parseWorktreeManifest('reclaim = ["build", "./target/", "web\\\\dist", "out//cache"]\n[[setup]]\ncommand = "x"');
+    expect(manifest.reclaim).toEqual(['build', 'target', 'web/dist', 'out/cache']);
+    expect(manifest.setup).toHaveLength(1);
+    expect(parseWorktreeManifest('reclaim = []').reclaim).toEqual([]);
+    expect('reclaim' in parseWorktreeManifest('[[setup]]\ncommand = "x"')).toBe(false);
+  });
+
+  it('rejects every unsafe or repeated reclaim entry with an error naming it (#427)', () => {
+    const rejected: readonly (readonly [string, RegExp])[] = [
+      ['["../x"]', /reclaim\[0\] must stay inside the repository \(no \.\.\): "\.\.\/x"/],
+      ['["a/../../x"]', /reclaim\[0\] must stay inside the repository \(no \.\.\): "a\/\.\.\/\.\.\/x"/],
+      ['["/abs/build"]', /reclaim\[0\] must be relative to the repository root: "\/abs\/build"/],
+      ['["C:\\\\build"]', /reclaim\[0\] must be relative to the repository root: "C:\\\\build"/],
+      ['[""]', /reclaim\[0\] must be a non-empty folder path, got: ""/],
+      ['["."]', /reclaim\[0\] must name a folder below the repository root, not the root itself: "\."/],
+      ['["./"]', /reclaim\[0\] must name a folder below the repository root, not the root itself: "\.\/"/],
+      ['["a\\u0000b"]', /reclaim\[0\] must not contain NUL: "a\\u0000b"/],
+      ['[".git"]', /reclaim\[0\] must not be or be inside \.git: "\.git"/],
+      ['[".git/hooks"]', /reclaim\[0\] must not be or be inside \.git: "\.git\/hooks"/],
+      ['["vendor/.git"]', /reclaim\[0\] must not be or be inside \.git: "vendor\/\.git"/],
+      ['[".gru-command"]', /reclaim\[0\] must not be or be inside \.gru-command: "\.gru-command"/],
+      ['[".gru-command/cache"]', /reclaim\[0\] must not be or be inside \.gru-command: "\.gru-command\/cache"/],
+      ['["build", "./build/"]', /reclaim\[1\] "\.\/build\/" duplicates reclaim\[0\] \(both name "build"\)/],
+      ['[3]', /reclaim\[0\] must be a non-empty folder path, got: 3/],
+      ['"build"', /reclaim must be an array of repo-relative folder paths/],
+    ];
+    for (const [value, error] of rejected) {
+      expect(() => parseWorktreeManifest(`reclaim = ${value}`), value).toThrowError(error);
+    }
+  });
+
   it('parses [verify] scopes and resolves them fail-loud', () => {
     const manifest = parseWorktreeManifest(
       ['[verify]', 'full = "npm test"', 'quick = "npm run lint"'].join('\n'),

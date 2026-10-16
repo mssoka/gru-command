@@ -23,6 +23,9 @@ and GC worktree setup without provisioning or inspecting independent BMAD
 ([BMAD-RUNTIME.md](./BMAD-RUNTIME.md)), and writes the same **complete
 teaching config** as the generator below. The exact selection is persisted
 as root-level `managed_repos`; discovery does not enroll unselected siblings.
+It then checks each selected repository's origin for a GC manifest and asks
+once whether to onboard the ones without
+([ONBOARDING.md](./ONBOARDING.md#installer-consent)).
 Every concrete default is active; optional role/runtime overrides are shown
 commented because activating a placeholder would change precedence. Interactive
 setup excludes linked repo entries from choices; explicit headless selection
@@ -454,6 +457,20 @@ max_raid_tokens = 400000
 # or ended before starting (refused, or failed before they started).
 max_raids_per_day = 2
 
+[onboarding]
+# Onboarding heists (#427, docs/ONBOARDING.md): a managed repository whose
+# origin default branch has no .gru-command/worktree.toml gets no lane
+# setup and no verify command. GC finds those repositories at start (only
+# when origin answers; an unreachable origin is never taken as missing) and
+# a minion opens a PR adding the manifest, derived from the repository's
+# own CI, build files and README.
+# "proposed": one FOR YOU card per repository; Accept dispatches the heist,
+# Decline is remembered until you ask Gru to propose it again.
+# "autonomous": GC dispatches the heist and posts a board FYI row.
+# "off": nothing is checked, proposed or dispatched, and the installer's
+# consent is not read.
+mode = "proposed"
+
 [roll]
 # Graceful self-roll drain policy: how long the service waits for
 # in-flight review rounds and mid-turn agent sessions to settle before it
@@ -610,6 +627,30 @@ Asking Gru in chat to raid a package counts as your Accept. It is checked
 against the same candidate list, so a package code excluded is refused, with
 the reason. With `enabled = false`, a chat request is refused and says how to
 turn raids on.
+
+### Onboarding: `proposed`, `autonomous` or `off`
+
+`[onboarding] mode` decides what GC does about a managed repository whose
+origin default branch has no `.gru-command/worktree.toml`. Such a repository's
+lanes get no setup and no verify command. [ONBOARDING.md](./ONBOARDING.md)
+describes the whole flow.
+
+- **`"proposed"` (default).** Say `swift-app`'s origin `main` has no manifest.
+  At start you get one FOR YOU card, "Onboard swift-app". Accept dispatches a
+  heist whose minion reads the repository's CI, build files and README and opens
+  "Onboard swift-app to GC". Decline is remembered: swift-app is not proposed
+  again until you ask Gru to propose it. A restart while the card waits posts
+  no second card.
+- **`"autonomous"`.** The same scan dispatches the heist straight away. You see
+  "Onboarding heist dispatched: swift-app" in the board's activity, not in FOR
+  YOU. Only a repository's first onboarding heist starts this way. If it ends
+  without the manifest reaching origin, the next scan asks you with a card.
+- **`"off"`.** Nothing is checked, proposed or dispatched, and the installer's
+  consent file is not read.
+
+If origin cannot be reached, nothing happens: GC logs why and checks again at
+the next start. Answering yes to the wizard's "Onboard them now?" skips the
+cards for those repositories in any mode except `"off"`.
 
 ### Mailbox recovery cadence
 

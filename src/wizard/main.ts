@@ -7,12 +7,14 @@
  * `'{}'` completes headlessly). Pipeline: runtime probe (warn-and-proceed
  * when no runtime CLI is found) → workspace root → managed-repo pick →
  * runtime/model/thinking picks ("default" sentinel, ruling 16) → bind
- * host → token → config write (timestamped backup first) → first-boot
- * smoke (spawn dist/main.js, poll /health for the 3 liveness signals +
- * identity fingerprint, clean shutdown) → terminal pairing QR
+ * host → token → onboarding check (#427: each repo's origin manifest,
+ * one consent question) → config write (timestamped backup first) →
+ * first-boot smoke (spawn dist/main.js, poll /health for the 3 liveness
+ * signals + identity fingerprint, clean shutdown) → terminal pairing QR
  * (byte-identical payload shape to the web pairing screen; the smoke's
- * discovered port when ephemeral) → optional OS-service registration
- * (install.sh --service — one mechanism, only after a green smoke).
+ * discovered port when ephemeral) → onboarding consent file → optional
+ * OS-service registration (install.sh --service — one mechanism, only
+ * after a green smoke).
  */
 
 import { spawn, spawnSync } from 'node:child_process';
@@ -58,6 +60,9 @@ import {
   managedRepoNameError,
   resolveManagedRepoPathSync,
 } from '../repos/managed-names.js';
+import { removeOnboardingConsent, writeOnboardingConsent } from '../onboarding/consent.js';
+import { probeOriginManifest, type OriginManifestProbe } from '../onboarding/origin-manifest.js';
+import { MANIFEST_PATH } from '../worktrees/manifest.js';
 
 const WIZARD_USAGE =
   'usage: node dist/wizard/main.js [--no-interact] [--answers <json>] [--force]';
@@ -150,6 +155,59 @@ function portInUseGuidance(host: string, port: number, holder: string): string {
 
 function yn(value: string): boolean {
   return value.toLowerCase() === 'y' || value.toLowerCase() === 'yes';
+}
+
+/**
+ * Onboarding check (#427): the service is down while the wizard runs, so the
+ * installer reads each selected repository's origin itself and asks once
+ * whether to onboard the ones without a manifest. Only a verified absence
+ * counts; an unreachable origin is checked again by the service. Returns the
+ * repositories the owner consented to (none without a terminal).
+ */
+async function onboardingConsentStep(
+  workspaceAbs: string,
+  repos: readonly string[],
+  terminal: WizardTerminal | null,
+): Promise<readonly string[]> {
+  if (repos.length === 0) return [];
+  const checked = await Promise.all(repos.map(async (repo) => {
+    const located = resolveManagedRepoPathSync(workspaceAbs, repo);
+    const result: OriginManifestProbe = located.kind === 'available'
+      ? await probeOriginManifest(located.path)
+      : { state: 'unverified', reason: located.kind === 'unavailable' ? located.reason : located.error };
+    return { repo, result };
+  }));
+  stdout.write(`\nOnboarding check (does origin's default branch have ${MANIFEST_PATH}?):\n`);
+  for (const { repo, result } of checked) {
+    const line = result.state === 'present'
+      ? `has it (origin/${result.defaultBranch})`
+      : result.state === 'missing'
+        ? `NO manifest on origin/${result.defaultBranch}`
+        : `not checked: ${result.reason} (the service checks again at start)`;
+    stdout.write(`  ${displayRepositoryName(repo)}: ${line}\n`);
+  }
+  const missing = checked.filter(({ result }) => result.state === 'missing').map(({ repo }) => repo);
+  if (missing.length === 0) return [];
+  if (terminal === null) {
+    stdout.write('Not onboarding from non-interactive setup: each repository without a manifest gets a FOR YOU card at first start.\n');
+    return [];
+  }
+  const rl = createInterface({ input: terminal.input, output: terminal.output });
+  try {
+    terminal.output.write(
+      `\nWithout a manifest, GC lanes in ${missing.map(displayRepositoryName).join(', ')} get no setup and no verify command.\n` +
+        '  Onboarding dispatches one heist per repository: a minion reads its CI, build files and README\n' +
+        `  and opens a PR adding ${MANIFEST_PATH}. Answering n leaves a FOR YOU card for each instead.\n`,
+    );
+    for (;;) {
+      const answer = (await ask(rl, 'Onboard them now? [Y/n]: ')).toLowerCase();
+      if (answer === '' || answer === 'y' || answer === 'yes') return missing;
+      if (answer === 'n' || answer === 'no') return [];
+      terminal.output.write('  ✗ answer y or n (Enter means yes)\n');
+    }
+  } finally {
+    rl.close();
+  }
 }
 
 interface CollectedAnswers {
@@ -794,6 +852,10 @@ async function main(argv: readonly string[]): Promise<number> {
     stdout.write(`Repository ready in ${displayRepositoryName(repo)}: GC setup validated; project files unchanged.\n`);
   }
 
+  // An instance whose onboarding is off is not asked: consent would fire
+  // whenever the mode is later turned back on.
+  const onboardNow = prior?.onboarding.mode === 'off' ? [] : await onboardingConsentStep(workspaceAbs, answers.repos, terminal);
+
   // Recheck the fixed port immediately
   // before writing config so a late listener cannot turn a completed
   // setup into a knowingly unbootable instance.
@@ -806,6 +868,9 @@ async function main(argv: readonly string[]): Promise<number> {
 
   const write = writeConfigText(instanceDir, configText, { force });
   clearWizardDraft(instanceDir);
+  // This run's answer replaces any earlier run's consent, and the smoke boot
+  // below must not act on one: consent is written only after the smoke.
+  removeOnboardingConsent(instanceDir);
   stdout.write(`\nWrote ${write.configPath}\n`);
   if (write.backupPath !== null) stdout.write(`Previous config backed up: ${write.backupPath}\n`);
 
@@ -854,6 +919,14 @@ async function main(argv: readonly string[]): Promise<number> {
   }
   if (answers.host === '127.0.0.1') {
     stdout.write('Loopback-bound: to pair a phone, re-run and bind your LAN address.\n');
+  }
+
+  if (onboardNow.length > 0) {
+    const consentPath = writeOnboardingConsent(instanceDir, onboardNow);
+    stdout.write(
+      `\nOnboarding consent saved (${consentPath}): at its next start the service dispatches an onboarding heist for ` +
+        `${onboardNow.map(displayRepositoryName).join(', ')} (no FOR YOU card), unless origin has a manifest by then.\n`,
+    );
   }
 
   if (answers.registerService) {

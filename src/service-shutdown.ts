@@ -1,5 +1,6 @@
 import type { VectorService } from './vector/service.js';
 import type { VectorRaidRunner } from './vector/runner.js';
+import type { OnboardingService } from './onboarding/service.js';
 import type { ServiceHandle } from './server.js';
 import type { RuntimeRegistry } from './runtime/registry.js';
 import type { SessionStore } from './sessions/store.js';
@@ -49,6 +50,8 @@ export interface ServiceShutdownState {
   vector?: Pick<VectorService, 'stop'>;
   /** Silas's raid queue (#351): a raid in flight stops at its next boundary. */
   vectorRaids?: Pick<VectorRaidRunner, 'stop'>;
+  /** Onboarding (#427): its event follow-through and reconcile stop, and in-flight origin probes abort. */
+  onboarding?: Pick<OnboardingService, 'stop'>;
   silas?: SilasDriver;
   /** Issue #243: the autopilot ops the shutdown checkpoints and drains. */
   autopilot?: SilasAutopilotOpsHandle;
@@ -201,6 +204,13 @@ export function startServiceShutdown(options: ServiceShutdownOptions): void {
           state.vectorRaids.stop();
         } catch (error) {
           logger.error('vector raid runner stop failed', { error: String(error) });
+        }
+      }
+      if (state.onboarding !== undefined) {
+        try {
+          state.onboarding.stop();
+        } catch (error) {
+          logger.error('onboarding stop failed', { error: String(error) });
         }
       }
       if (state.silas !== undefined) {

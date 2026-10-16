@@ -45,6 +45,9 @@ const OWNER_REQUIRED_KINDS: readonly string[] = [
   // does the same for each break-in's fix heist.
   'vector.raid-proposal',
   'vector.fix-proposal',
+  // Onboarding heists (#427): onboarding mode = "proposed" puts each managed
+  // repository whose origin has no manifest in FOR YOU for Accept or Decline.
+  'onboarding.proposal',
 ];
 
 /** Kinds that are always owner-facing, prefix match (dynamic suffixes,
@@ -64,7 +67,7 @@ const OWNER_ALLOWED_PREFIXES: readonly string[] = ['decisions.degraded.'];
 
 /** Kinds that only ever route `needs-owner` with a typed reserved
  * decision attached (validated at the write boundary). */
-const DECISION_REQUIRED_KINDS: readonly string[] = ['gru.owner-escalation', 'vector.raid-proposal', 'vector.fix-proposal'];
+const DECISION_REQUIRED_KINDS: readonly string[] = ['gru.owner-escalation', 'vector.raid-proposal', 'vector.fix-proposal', 'onboarding.proposal'];
 
 export function ownerAttentionFor(kind: string): OwnerAttention {
   if (OWNER_REQUIRED_KINDS.includes(kind)) return 'owner-required';

@@ -273,3 +273,16 @@ branch. They gate nothing, and a raid that finds nothing is never a pass
   too. Never answer those cards for the owner. A failed fix-heist dispatch
   (`vector.fix-dispatch-failed`) is yours to look into: it is retried on its
   own, and its detail says why it failed.
+
+## Onboarding heists (#427)
+
+Code finds managed repositories whose origin has no `.gru-command/worktree.toml`
+and posts one FOR YOU card per repository ("Onboard <repo>"), or dispatches the
+heist in autonomous mode. You get no turn for it, and you never answer those
+cards for the owner. Call authenticated `POST /api/onboarding/propose`
+`{ "repo": "<name>" }` only when the owner asks you to onboard a repository. It
+clears an earlier decline and scans that repository, and its `action` says what
+happened. Relay a refusal as it is. A failed dispatch
+(`onboarding.dispatch-failed`) is retried on its own and closes itself, so a
+disposition of it is refused; its detail says why it failed
+(docs/ONBOARDING.md).

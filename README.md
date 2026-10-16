@@ -350,6 +350,7 @@ Full reference (provider profiles including TypeSafe direct and a local `/v1/sys
 | [LEDGER.md](docs/LEDGER.md) | the SQLite ledger of record |
 | [FLOW.md](docs/FLOW.md) | the dispatch flow: briefing → lanes → review waves |
 | [WORKTREES.md](docs/WORKTREES.md) | the worktree manager (preserve-first sweeps) |
+| [ONBOARDING.md](docs/ONBOARDING.md) | onboarding heists: a manifest PR for each managed repo that has none |
 | [RUNTIMES.md](docs/RUNTIMES.md) | runtime adapters, capabilities, session store |
 | [jev-production-integration.md](docs/jev-production-integration.md) | optional Jev decision provider: OpenRouter key, shadow mode, backtests, troubleshooting |
 | [SUPERVISION.md](docs/SUPERVISION.md) | supervision, notifications, OS service install |

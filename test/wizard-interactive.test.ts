@@ -7,6 +7,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { loadConfig } from '../src/config.js';
 import { parseAnswers } from '../src/wizard/answers.js';
 import { writeInstanceConfig } from '../src/wizard/steps.js';
+import { writeOnboardingConsent } from '../src/onboarding/consent.js';
 
 /** Real PTY front-door coverage. BMAD provisioning/retry prompts are retired (#295). */
 const repoRoot = join(import.meta.dirname, '..');
@@ -66,6 +67,31 @@ const PORT_PROMPT = 'Bind port';
 const TOKEN_PROMPT = 'Pairing token';
 const REGISTER_PROMPT = 'Register the OS service';
 const SMOKE_PROMPT = 'first-boot smoke test now';
+const ONBOARD_PROMPT = 'Onboard them now? [Y/n]';
+/** swift-app's origin has no manifest; web's has one (#427). */
+function onboardingWorkspace(): string {
+  const workspace = tempDir('gru-command-pty-onboard-ws-');
+  const origins = tempDir('gru-command-pty-onboard-origins-');
+  const git = (cwd: string, ...args: string[]): void => {
+    execFileSync('git', ['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', ...args], { cwd, stdio: 'ignore' });
+  };
+  for (const [name, manifest] of [['swift-app', false], ['web', true]] as const) {
+    const dir = join(workspace, name);
+    mkdirSync(dir);
+    git(dir, 'init', '-q', '-b', 'main');
+    writeFileSync(join(dir, 'README.md'), `# ${name}\n`);
+    if (manifest) {
+      mkdirSync(join(dir, '.gru-command'));
+      writeFileSync(join(dir, '.gru-command', 'worktree.toml'), '[verify]\nfull = "./check"\n');
+    }
+    git(dir, 'add', '-A');
+    git(dir, 'commit', '-qm', 'seed');
+    git(origins, 'init', '-q', '--bare', '-b', 'main', join(origins, `${name}.git`));
+    git(dir, 'remote', 'add', 'origin', join(origins, `${name}.git`));
+    git(dir, 'push', '-q', 'origin', 'main');
+  }
+  return workspace;
+}
 const finishSteps = (smoke = 'n'): readonly Step[] => [
   { expect: RUNTIME_PROMPT, send: '' },
   { expect: MODEL_PROMPT, send: '' },
@@ -276,6 +302,68 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     expect(rejectedRepoLine).toBe(
       '  ✗ not an available Git repository candidate: not-a-repo\\u{202e}hidden',
     );
+  }, 90_000);
+
+  it('asks once to onboard the repositories whose origin has no manifest and leaves a one-shot consent file (#427)', () => {
+    const workspace = onboardingWorkspace();
+    const instance = tempDir('gru-command-pty-onboard-home-');
+    const { output, status } = ptyWizard([
+      { expect: WS_PROMPT, send: workspace }, { expect: REPOS_PROMPT, send: '' }, ...finishSteps(),
+      { expect: ONBOARD_PROMPT, send: '' },
+    ], { GRU_COMMAND_HOME: instance });
+    expect(status, output).toBe(0);
+    expect(output).toContain('swift-app: NO manifest on origin/main');
+    expect(output).toContain('web: has it (origin/main)');
+    const consentFile = join(instance, 'onboarding-consent.json');
+    expect(JSON.parse(readFileSync(consentFile, 'utf-8'))).toMatchObject({ version: 1, source: 'installer', repos: ['swift-app'] });
+    expect(statSync(consentFile).mode & 0o777).toBe(0o600);
+    expect(output).toContain('Onboarding consent saved');
+  }, 90_000);
+
+  it('re-asks anything but y or n; answering n removes an earlier consent file and writes none (#427)', () => {
+    const workspace = onboardingWorkspace();
+    const instance = tempDir('gru-command-pty-onboard-no-');
+    writeOnboardingConsent(instance, ['web']);
+    const { output, status } = ptyWizard([
+      { expect: WS_PROMPT, send: workspace }, { expect: REPOS_PROMPT, send: '' }, ...finishSteps(),
+      { expect: ONBOARD_PROMPT, send: 'maybe' }, { expect: ONBOARD_PROMPT, send: 'n' },
+    ], { GRU_COMMAND_HOME: instance });
+    expect(status, output).toBe(0);
+    expect(output).toContain('answer y or n (Enter means yes)');
+    expect(existsSync(join(instance, 'onboarding-consent.json'))).toBe(false);
+    expect(output).not.toContain('Onboarding consent saved');
+  }, 90_000);
+
+  it('with the first-boot smoke on, the consent file is written after the smoke and is still there afterwards (#427)', () => {
+    const workspace = onboardingWorkspace();
+    const instance = tempDir('gru-command-pty-onboard-smoke-');
+    const { output, status } = ptyWizard([
+      { expect: WS_PROMPT, send: workspace }, { expect: REPOS_PROMPT, send: '' }, ...finishSteps(''),
+      { expect: ONBOARD_PROMPT, send: '' },
+    ], { GRU_COMMAND_HOME: instance });
+    expect(status, output).toBe(0);
+    expect(output.indexOf('Onboarding consent saved')).toBeGreaterThan(output.indexOf('Smoke green'));
+    expect(output.indexOf('Smoke green')).toBeGreaterThan(-1);
+    expect(JSON.parse(readFileSync(join(instance, 'onboarding-consent.json'), 'utf-8'))).toMatchObject({ repos: ['swift-app'] });
+  }, 90_000);
+
+  it('an instance whose [onboarding] mode is "off" is not checked or asked, and gets no consent file (#427)', () => {
+    const workspace = onboardingWorkspace();
+    const instance = tempDir('gru-command-pty-onboard-off-');
+    writeInstanceConfig({ instanceDir: instance, answers: parseAnswers(JSON.stringify({ workspace_root: workspace, repos: ['swift-app', 'web'], port: 0 })) });
+    const config = join(instance, 'config.toml');
+    writeFileSync(config, readFileSync(config, 'utf-8').replace(/(\[onboarding\][\s\S]*?)mode = "proposed"/u, '$1mode = "off"'));
+    expect(loadConfig({ GRU_COMMAND_HOME: instance }).onboarding.mode).toBe('off');
+    const { output, status } = ptyWizard(
+      [{ expect: WS_PROMPT, send: '' }, { expect: REPOS_PROMPT, send: '' }, ...finishSteps('n')],
+      { GRU_COMMAND_HOME: instance },
+      ['--force'],
+    );
+    expect(status, output).toBe(0);
+    expect(output).not.toContain('Onboarding check');
+    expect(output).not.toContain('Onboard them now');
+    expect(existsSync(join(instance, 'onboarding-consent.json'))).toBe(false);
+    expect(loadConfig({ GRU_COMMAND_HOME: instance }).onboarding.mode).toBe('off');
   }, 90_000);
 
   it('managed-repo multi-pick by INDEX selects exactly that repo', () => {

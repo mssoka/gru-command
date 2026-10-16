@@ -683,6 +683,25 @@ describe('[provider_recovery] claude_native', () => {
   });
 });
 
+describe('[onboarding] mode (#427)', () => {
+  it('defaults to "proposed", parses every mode, and rejects anything else naming the valid set', () => {
+    const fresh = tmpHome();
+    writeConfig(fresh, '');
+    expect(loadConfig({ GRU_COMMAND_HOME: fresh }, '/home/tester').onboarding).toEqual({ mode: 'proposed' });
+    for (const mode of ['proposed', 'autonomous', 'off']) {
+      const home = tmpHome();
+      writeConfig(home, `[onboarding]\nmode = "${mode}"\n`);
+      expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').onboarding.mode).toBe(mode);
+    }
+    const bad = tmpHome();
+    writeConfig(bad, '[onboarding]\nmode = "always"\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: bad }, '/home/tester')).toThrow(/onboarding\.mode must be one of "proposed", "autonomous", "off"/);
+    const unknown = tmpHome();
+    writeConfig(unknown, '[onboarding]\nenabled = true\n');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: unknown }, '/home/tester')).toThrow(/unknown key `enabled` in \[onboarding\] \(valid keys: mode\)/);
+  });
+});
+
 describe('docs/example.config.toml', () => {
   it('parses and validates through the loader (docs drift guard)', () => {
     const example = readFileSync(join(import.meta.dirname, '..', 'docs', 'example.config.toml'), 'utf-8');
@@ -693,6 +712,7 @@ describe('docs/example.config.toml', () => {
     expect(config.models.default).toBe('default');
     expect(config.thinking.default).toBe('default');
     expect(config.runtimes.policies['pi']?.roles).toEqual({});
+    expect(config.onboarding.mode).toBe('proposed');
   });
 });
 

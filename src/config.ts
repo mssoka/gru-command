@@ -306,6 +306,20 @@ export const DEFAULT_VECTOR_CONFIG: VectorConfig = {
   maxRaidsPerDay: 2,
 };
 
+/** What GC does about a managed repository whose origin default branch has
+ * no `.gru-command/worktree.toml` (#427, docs/ONBOARDING.md): `proposed`
+ * posts one FOR YOU card per repository; `autonomous` dispatches the
+ * onboarding heist and posts an FYI row; `off` does nothing and ignores the
+ * installer's consent. */
+export const ONBOARDING_MODES = ['proposed', 'autonomous', 'off'] as const;
+export type OnboardingMode = (typeof ONBOARDING_MODES)[number];
+
+export interface OnboardingConfig {
+  readonly mode: OnboardingMode;
+}
+
+export const DEFAULT_ONBOARDING_CONFIG: OnboardingConfig = { mode: 'proposed' };
+
 /** Graceful self-roll policy (issue #34 graduation heist). */
 export interface RollConfig {
   /** Bounded drain wait before a swap (ms); 0 snapshots and swaps now. */
@@ -686,6 +700,7 @@ export interface GruCommandConfig {
   readonly silas: SilasConfig;
   readonly providerRecovery: ProviderRecoveryConfig;
   readonly vector: VectorConfig;
+  readonly onboarding: OnboardingConfig;
   readonly roll: RollConfig;
   readonly concurrency: ConcurrencyConfig;
   readonly review: ReviewConfig;
@@ -866,6 +881,7 @@ const TOP_LEVEL_KEYS = [
   'silas',
   'provider_recovery',
   'vector',
+  'onboarding',
   'roll',
   'concurrency',
   'review',
@@ -1142,6 +1158,7 @@ export function loadConfig(
   let silas: SilasConfig = DEFAULT_SILAS_CONFIG;
   let providerRecovery: ProviderRecoveryConfig = DEFAULT_PROVIDER_RECOVERY_CONFIG;
   let vector: VectorConfig = DEFAULT_VECTOR_CONFIG;
+  let onboarding: OnboardingConfig = DEFAULT_ONBOARDING_CONFIG;
   let roll: RollConfig = DEFAULT_ROLL_CONFIG;
   let concurrency: ConcurrencyConfig = DEFAULT_CONCURRENCY_CONFIG;
   let review: ReviewConfig = { enabled: true, maxConcurrentChildren: DEFAULT_REVIEW_CHILDREN };
@@ -1656,6 +1673,17 @@ export function loadConfig(
         throw new ConfigError(`vector.max_runs must be at least ${String(VECTOR_MAX_RUNS_PER_ATTACK)}: one attack can need that many sandboxed runs (both controls, the attack, the baseline and the replay), so a smaller cap never attacks`, file, 'vector.max_runs');
       }
     }
+    if (raw['onboarding'] !== undefined) {
+      const table = requireTable(raw['onboarding'], file, 'onboarding');
+      for (const key of Object.keys(table)) {
+        if (key !== 'mode') throw new ConfigError(`unknown key \`${key}\` in [onboarding] (valid keys: mode)`, file, `onboarding.${key}`);
+      }
+      const mode = table['mode'];
+      if (mode !== undefined && (typeof mode !== 'string' || !(ONBOARDING_MODES as readonly string[]).includes(mode))) {
+        throw new ConfigError(`onboarding.mode must be one of ${ONBOARDING_MODES.map((entry) => `"${entry}"`).join(', ')}, got: ${JSON.stringify(mode)}`, file, 'onboarding.mode');
+      }
+      onboarding = { mode: (mode as OnboardingMode | undefined) ?? onboarding.mode };
+    }
     if (raw['roll'] !== undefined) {
       const table = requireTable(raw['roll'], file, 'roll');
       for (const key of Object.keys(table)) {
@@ -1816,6 +1844,7 @@ export function loadConfig(
     silas,
     providerRecovery,
     vector,
+    onboarding,
     roll,
     concurrency,
     review,

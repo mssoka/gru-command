@@ -85,6 +85,8 @@ import { createReviewOutcomeCapture } from './lessons/review-capture.js';
 import { createLessonsServer } from './lessons/server.js';
 import { startVectorHalves, VectorService } from './vector/service.js';
 import { createVectorServer } from './vector/server.js';
+import { OnboardingService, startOnboarding, type OnboardingDispatchInput } from './onboarding/service.js';
+import { createOnboardingServer } from './onboarding/server.js';
 import { heistWorkWaiting as raidHeistWorkWaiting, VectorRaidRunner } from './vector/runner.js';
 import { DecisionRuntime } from './decisions/runtime.js';
 import { DECISION_SURFACE_EVENT_TRIAGE } from './decisions/questions.js';
@@ -617,6 +619,25 @@ async function main(): Promise<number> {
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   const vectorServer = createVectorServer({ token: config.auth.token, service: vector, log: (level, msg, fields) => logger.log(level, msg, fields) });
+  // Onboarding heists (#427): code finds managed repositories whose origin
+  // has no manifest and proposes (or dispatches) a manifest PR for each. The
+  // dispatcher is built further down; a heist reaches it late-bound.
+  let dispatchOnboardingHeist: ((input: OnboardingDispatchInput) => Promise<unknown>) | null = null;
+  const onboarding = new OnboardingService({
+    onboarding: config.onboarding,
+    workspaceRoot: config.workspaceRoot,
+    managedRepos: config.managedRepos,
+    instanceDir: config.instanceDir,
+    ledger,
+    bus,
+    notifications,
+    dispatch: async (input) => {
+      if (dispatchOnboardingHeist === null) throw new Error('the dispatch service is not up yet');
+      return await dispatchOnboardingHeist(input);
+    },
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  const onboardingServer = createOnboardingServer({ token: config.auth.token, service: onboarding, log: (level, msg, fields) => logger.log(level, msg, fields) });
   const lessonsServer = createLessonsServer({
     config,
     journal,
@@ -1102,6 +1123,8 @@ async function main(): Promise<number> {
   });
   // A Vector break-in's fix heist goes through the same dispatch path as POST /api/dispatch (#351).
   dispatchFixHeist = (input) => dispatcher.dispatch({ jobId: input.jobId, repoPath: input.repoPath, title: input.title, briefing: input.briefing });
+  // So does an onboarding heist (#427).
+  dispatchOnboardingHeist = (input) => dispatcher.dispatch({ jobId: input.jobId, repoPath: input.repoPath, title: input.title, briefing: input.briefing });
   // Issue #339: a prohibited read during a resume/re-brief invalidates blind
   // coverage — the same observation the dispatch settle seam runs. One wiring
   // for every resume/re-brief path (boot re-brief, silas re-brief, provider
@@ -1530,6 +1553,7 @@ async function main(): Promise<number> {
       requestHook: (req, res, path) =>
         lessonsServer.requestHook(req, res, path) ||
         vectorServer.requestHook(req, res, path) ||
+        onboardingServer.requestHook(req, res, path) ||
         rollServer.requestHook(req, res, path) ||
         attachmentsServer.requestHook(req, res, path) ||
         worktreeServer.requestHook(req, res, path) ||
@@ -1605,6 +1629,10 @@ async function main(): Promise<number> {
   state.vector = vector;
   state.vectorRaids = vectorRaids;
   startVectorHalves({ planning: vector, runner: vectorRaids }, (level, msg, fields) => logger.log(level, msg, fields));
+  // Onboarding (#427) scans off the boot path and is never fatal; registered
+  // for shutdown first, so a stop during a scan aborts its origin probes.
+  state.onboarding = onboarding;
+  startOnboarding(onboarding, (level, msg, fields) => logger.log(level, msg, fields));
   if (silasSlot !== null) {
     // The driver starts after listen so its wake prompt carries the real
     // bound port (config port 0 = ephemeral); until then no sweeps run and
