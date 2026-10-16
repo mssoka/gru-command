@@ -6,6 +6,10 @@ const LINE_UNSAFE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Co}\p{Cn}]/gu;
  * escapes it in the literal). */
 const LINE_UNSAFE_ANY = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Co}\p{Cn}\p{Cs}]/u;
 
+/** Whether text holds any character that can break, reorder or hide a
+ * rendered line (or a lone surrogate). */
+export const hasLineUnsafe = (text: string): boolean => LINE_UNSAFE_ANY.test(text);
+
 /** Text as one JSON literal with every line-unsafe character `\uXXXX`-escaped
  * (JSON.stringify alone escapes only C0 controls and lone surrogates). */
 export const lineSafeLiteral = (text: string): string =>

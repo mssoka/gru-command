@@ -410,8 +410,9 @@ lifecycle fact — so a settled report read as independent coverage.
 - **Delivered (#360).** The admitted package is the reviewer's input: its briefing
   carries a `BLIND INPUT PACKAGE` block with the exact diff and files, fenced and
   framed as data (a package file path holding a control, format — bidi,
-  zero-width — or line-separator character is refused, so nothing can escape a
-  fence or disguise its heading). The package bytes are kept
+  zero-width — separator, private-use or unassigned character is refused, so
+  nothing can escape a fence or disguise its heading; every blind refusal names a
+  path holding one as a line-safe JSON literal). The package bytes are kept
   (`review.blind-input-package`, written before the admission), so a fresh
   replacement reviewer spawned by provider recovery gets the same block; a resumed
   session already holds it. An attested reviewer whose package was not kept (one
@@ -443,9 +444,10 @@ search (pi `grep`, Claude `Grep`) — whose result returned, even empty or binar
 for a path that is excluded, however its bytes look. A call is judged by the path
 it names: an absolute path inside the job's lane by its repository path, one
 outside the checkout as outside the package, and the repository root itself as no
-file. A directory inside the checkout seldom matches a file glob, so a search over
-one is judged by the paths and text its output shows; a listing (`Glob`, `find`,
-`ls`) always is). A settled session whose
+file. A path inside the checkout is access exactly when it matches an excluded
+glob; a directory that matches none (the usual case — `docs/issues` does not match
+`docs/issues/**`) leaves the search judged by the paths and text its output shows,
+as every listing (`Glob`, `find`, `ls`) is). A settled session whose
 transcript cannot be read at all (absent, unreadable or over the size bound)
 records `job.blind-access-unobservable` once while it stands — never an empty,
 clean-reading observation — and its coverage is `unobserved`, not qualifying,

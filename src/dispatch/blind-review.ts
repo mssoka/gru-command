@@ -720,10 +720,9 @@ export function readSessionToolResults(sessionFile: string | null): readonly Obs
   // `NotebookRead`, `NotebookEdit` {notebook_path} — and a content search
   // (pi `grep`, Claude `Grep` {path}), whose lines from a single file carry
   // no path prefix. A search's path is judged exactly like a read's: an
-  // excluded path, or one outside the checkout, is access. A directory inside
-  // the checkout seldom matches a file glob, so a search over one is judged
-  // by the paths and text its output shows; a listing (`Glob`, `find`, `ls`)
-  // always is.
+  // excluded path, or one outside the checkout, is access (docs/REVIEW-INPUTS.md
+  // §7 states when a directory is). A listing (`Glob`, `find`, `ls`) is judged
+  // by the paths and text its output shows.
   const reads = new Map<string, string>();
   const CONTENT_TOOLS: Readonly<Record<string, 'path' | 'file_path' | 'notebook_path'>> = {
     read: 'path', edit: 'path', grep: 'path', Read: 'file_path', Edit: 'file_path', MultiEdit: 'file_path', Grep: 'path',

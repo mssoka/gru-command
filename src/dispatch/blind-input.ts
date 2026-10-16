@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { JobAmendmentRecord } from '../review-inputs/amendments.js';
 import { amendmentSupersessions } from '../review-inputs/amendments.js';
+import { hasLineUnsafe, lineSafeLiteral } from './line-safe.js';
 
 /**
  * Blind-review input isolation (issue #316).
@@ -291,32 +292,36 @@ export function normalizeRepoPath(path: string): string {
   return path.replace(/\\/gu, '/').split('/').filter((segment) => segment !== '.' && segment !== '').join('/');
 }
 
-/** Control (C0, DEL, C1), format (bidi, zero-width, BOM) and line/paragraph
- * separator characters: none belongs in a path a briefing shows. */
-const UNSAFE_PATH_CHARACTER = /[\p{Cc}\p{Cf}\u2028\u2029]/u;
+/** A path as a refusal names it: quoted as written when it is line-safe;
+ * otherwise as one JSON literal with every line-unsafe character escaped
+ * (the classes silas_action text refuses — control, format, separator,
+ * private-use, unassigned — astral ones too), so no refusal can break,
+ * reorder or hide a line. */
+function shownPath(path: string): string {
+  return hasLineUnsafe(path) ? lineSafeLiteral(path) : `"${path}"`;
+}
 
-/** A path with each unsafe character spelled as its `\uXXXX` escape, so a
- * refusal that names it cannot itself break a line. */
-function escapeUnsafePathCharacters(path: string): string {
-  return path.replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`);
+/** A path as a violation's `where` holds it: as written when line-safe. */
+function shownWhere(path: string): string {
+  return hasLineUnsafe(path) ? lineSafeLiteral(path) : path;
 }
 
 /** Why a package path is not admissible, or null when it is. */
 export function classifyBlindPath(rawPath: string, rule: BlindIsolationRule): string | null {
   const path = rawPath.replace(/\\/gu, '/');
   if (outsidePackageShape(path)) {
-    return `invalid package path "${rawPath}" (must be a relative path inside the repository)`;
+    return `invalid package path ${shownPath(rawPath)} (must be a relative path inside the repository)`;
   }
   const normalized = normalizeRepoPath(path);
   // `.` or `./` names the repository itself, never a file in it.
-  if (normalized === '') return `invalid package path "${rawPath}" (names the repository root, not a file)`;
+  if (normalized === '') return `invalid package path ${shownPath(rawPath)} (names the repository root, not a file)`;
   if (rule.privateGlobs.some((glob) => globToRegExp(glob).test(normalized))) {
-    return `"${normalized}" is private job material (planning, spec, review or triage artifacts)`;
+    return `${shownPath(normalized)} is private job material (planning, spec, review or triage artifacts)`;
   }
   const permitted =
     rule.permitPaths.includes(normalized) && CONFIG_EXTENSIONS.has(extensionOf(normalized));
   if (!permitted && rule.excludeGlobs.some((glob) => globToRegExp(glob).test(normalized))) {
-    return `"${normalized}" is excluded by the parent isolation rule`;
+    return `${shownPath(normalized)} is excluded by the parent isolation rule`;
   }
   return null;
 }
@@ -662,7 +667,7 @@ function sectionViolations(section: DiffSection, rule: BlindIsolationRule): read
   const out: BlindViolation[] = [];
   for (const path of new Set([section.path, section.oldPath])) {
     const reason = classifyBlindPath(path, rule);
-    if (reason !== null) out.push({ code: 'excluded-path', where: path, detail: reason });
+    if (reason !== null) out.push({ code: 'excluded-path', where: shownWhere(path), detail: reason });
   }
   // A document renamed to a source extension still carries its history text.
   if (out.length === 0 && [section.path, section.oldPath].some((path) => DOC_EXTENSIONS.has(extensionOf(path))) &&
@@ -705,11 +710,11 @@ export function evaluateBlindPackage(pkg: BlindInputPackage, rule: BlindIsolatio
   const fileRecords: { path: string; sha256: string; blobSha: string }[] = [];
   for (const file of files) {
     // A file's path heads its fenced bytes in the reviewer's briefing: a
-    // control, format (bidi, zero-width) or line-separator character there
-    // could put text outside the data fence or disguise the heading.
-    if (UNSAFE_PATH_CHARACTER.test(file.path)) {
-      const shown = escapeUnsafePathCharacters(file.path);
-      violations.push({ code: 'excluded-path', where: shown, detail: `invalid package path "${shown}" (holds a control, format or line-separator character)` });
+    // line-unsafe character there could put text outside the data fence or
+    // disguise the heading.
+    if (hasLineUnsafe(file.path)) {
+      const shown = lineSafeLiteral(file.path);
+      violations.push({ code: 'excluded-path', where: shown, detail: `invalid package path ${shown} (holds a control, format, separator, private-use or unassigned character)` });
       continue;
     }
     const reason = classifyBlindPath(file.path, rule);
@@ -1002,7 +1007,7 @@ function readPathViolation(rawPath: string, rule: BlindIsolationRule, laneRoots:
     } else if (laneRoots.length === 0) {
       return null;
     } else if (slashed.startsWith('/') || /^[A-Za-z]:\//u.test(slashed)) {
-      return { path: slashed, detail: `"${slashed}" is outside the reviewer's checkout, so outside its package` };
+      return { path: shownWhere(slashed), detail: `${shownPath(slashed)} is outside the reviewer's checkout, so outside its package` };
     }
   }
   const detail = classifyBlindPath(path, rule);
