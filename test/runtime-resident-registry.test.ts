@@ -834,6 +834,8 @@ describe('registry publication taps (#352, #353)', () => {
         // A `spawned` listener, and a listener of the first drained frame, both make a frame on the same handle.
         if (envelope.phase === 'spawned' && !reentered) { reentered = true; g.emit(handle, { type: 'text_delta', delta: 'reentrant' }); }
         if (envelope.phase === 'event' && envelope.event?.type === 'text_delta' && envelope.event.delta === 'held-1' && !drained) { drained = true; g.emit(handle, { type: 'text_delta', delta: 'during drain' }); }
+        // ...and a listener of the LAST held frame too: still after every held one.
+        if (envelope.phase === 'event' && envelope.event?.type === 'text_delta' && envelope.event.delta === 'held-2') g.emit(handle, { type: 'text_delta', delta: 'after held-2' });
       });
       g.emit(handle, { type: 'text_delta', delta: 'held-1' });
       g.emit(handle, { type: 'state', state: 'idle' });
@@ -842,7 +844,7 @@ describe('registry publication taps (#352, #353)', () => {
       expect(g.held(handle)).toBe(3);
       publish();
       g.emit(handle, { type: 'text_delta', delta: 'live' });
-      expect(g.tapped.get(handle.id)).toEqual(['spawned', 'held-1', 'state', 'held-2', 'reentrant', 'during drain', 'live']);
+      expect(g.tapped.get(handle.id)).toEqual(['spawned', 'held-1', 'state', 'held-2', 'reentrant', 'during drain', 'after held-2', 'live']);
       expect(g.held(handle)).toBe(0);
     } finally {
       g.cleanup();
@@ -911,7 +913,17 @@ describe('registry publication taps (#352, #353)', () => {
       expect(g.tapped.get(during.handle.id)).toEqual(['spawned', 'held', 'after quarantine']);
       expect(() => during.publish()).not.toThrow();
       expect(g.registry.getHandle(during.handle.id)).toBeNull();
-      for (const handle of [after.handle, during.handle]) { await handle.dispose(); g.cease(handle); }
+      // From a listener of a drained held frame: the drain completes, every held frame included.
+      const draining = await g.staged();
+      g.registry.onAgentEvent((envelope) => {
+        if (envelope.agentId === draining.handle.id && envelope.phase === 'event' && envelope.event?.type === 'text_delta' && envelope.event.delta === 'held-a') g.registry.quarantineHandle(draining.handle);
+      });
+      g.emit(draining.handle, { type: 'text_delta', delta: 'held-a' });
+      g.emit(draining.handle, { type: 'text_delta', delta: 'held-b' });
+      draining.publish();
+      expect(g.tapped.get(draining.handle.id)).toEqual(['spawned', 'held-a', 'held-b']);
+      expect(g.registry.getHandle(draining.handle.id)).toBeNull();
+      for (const handle of [after.handle, during.handle, draining.handle]) { await handle.dispose(); g.cease(handle); }
       expect(g.registry.residencySnapshot().occupied).toBe(0);
     } finally {
       g.cleanup();
