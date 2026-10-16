@@ -265,7 +265,7 @@ export function alertsCard(unacked: number): HealthCardView {
     unacked === 0 ? 'live machine queue clear' : 'live machine attention awaiting Gru',
     unacked > 0 ? 'alert' : 'ok',
     unacked > 0 ? 'NEEDS GRU' : null,
-    `${unacked} live machine-attention notification(s) awaiting Gru; closed receipts and the owner bell stay quiet`,
+    `${unacked} live machine-attention notification${unacked === 1 ? '' : 's'} awaiting a Gru disposition — the live queue clears itself; closed receipts stay in the record and the owner bell is not rung.`,
     { lead: '', num: unacked, unit: '' },
   );
 }

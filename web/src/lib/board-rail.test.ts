@@ -245,7 +245,7 @@ describe('board rail — chips (v6)', () => {
     expect(crew?.values[0]?.title).toBe('1 live minion');
   });
 
-  it('marks the loud states: an unacked tracker chip flags the count', () => {
+  it('marks the loud states: the TRACKERS chip flags a live machine (needs Gru) count', () => {
     const snap = snapshot([job('i1', 'in-review', { prUrl: 'https://x/2', prState: 'conflicting' })]);
     const trackers = railChips({ ...snap, unackedActionRequired: 2 }, NOW).find((chip) => chip.id === 'trackers');
     expect(trackers?.tone).toBe('alert');
