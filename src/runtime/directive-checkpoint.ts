@@ -58,7 +58,8 @@ function readBoundedUtf8(path: string, limit: number, label: string): string {
     // Fatal decoding (#363 S04-1-02): a lenient decode turns invalid bytes
     // into U+FFFD, so corrupted evidence could hash like a genuine prompt.
     try {
-      return new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks, total));
+      // ignoreBOM keeps a leading U+FEFF, exactly as the lenient decode did.
+      return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(Buffer.concat(chunks, total));
     } catch {
       throw new DirectiveCheckpointError(`${label} is not valid UTF-8; corrupted bytes are never evidence`);
     }

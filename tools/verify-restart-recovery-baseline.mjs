@@ -1,8 +1,8 @@
 import process from 'node:process';
 import console from 'node:console';
-import { URL, pathToFileURL } from 'node:url';
+import { URL, fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import ts from 'typescript';
@@ -155,4 +155,10 @@ try {
 }
 }
 
-if (process.argv[1] !== undefined && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) await main();
+// Run as the CLI however it was invoked (a relative or symlinked path too);
+// an import (the test's) never runs the probe.
+const invokedAsCli = (() => {
+  if (process.argv[1] === undefined) return false;
+  try { return realpathSync(resolve(process.argv[1])) === realpathSync(fileURLToPath(import.meta.url)); } catch { return false; }
+})();
+if (invokedAsCli) await main();

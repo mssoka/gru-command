@@ -632,6 +632,11 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(() => inspectDirectiveCheckpoint(f.file, f.identity)).toThrow(/native transcript is not valid UTF-8/);
     expect(() => inspectDirectiveAdmission(f.file, f.identity)).toThrow(/native transcript is not valid UTF-8/);
     expect(() => readDirectiveSessionHeader(f.file)).toThrow(/native transcript is not valid UTF-8/);
+    // A leading BOM is decoded exactly as before (kept, never stripped): the
+    // header it precedes is still no JSON.
+    const bom = await fixture(); bom.seed();
+    writeFileSync(bom.file, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), readFileSync(bom.file)]));
+    expect(() => readDirectiveSessionHeader(bom.file)).toThrow(SyntaxError);
   });
 
   it('refuses oversized native association and producer journals before parsing', async () => {

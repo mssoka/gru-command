@@ -574,6 +574,33 @@ describe('verification scheduler — global budget', () => {
     } finally { await scheduler.dispose(); }
   });
 
+  it('a no-start whose publication is still pending keeps answering and still publishes once it can, while the history stays bounded (#363 S09-1-05)', async () => {
+    const storageDir = join(tempDir(), 'verify'); const cwd = join(tempDir(), 'missing');
+    let holdHeld = true;
+    const published: string[] = [];
+    const scheduler = new VerificationScheduler({ storageDir, limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 5000, runTimeoutMs: 5000 },
+      record: (record) => {
+        const ids = record.kind === 'verification.no-start' ? (record.payload as { request_ids: string[] }).request_ids : [];
+        if (holdHeld && ids.includes('held')) throw new Error('publication unavailable');
+        published.push(...ids);
+      } });
+    try {
+      await expect(scheduler.submit({ jobId: 'bounded-history', requestId: 'held', scope: 'full', cwd, head: null, command: 'true' })).rejects.toThrow(/ENOENT/);
+      const history = (scheduler as unknown as { requestHistory: Map<string, unknown> }).requestHistory;
+      for (let index = 0; index < 70; index += 1) {
+        await expect(scheduler.submit({ jobId: 'bounded-history', requestId: `later-${String(index)}`, scope: 'full', cwd, head: null, command: 'true' })).rejects.toThrow(/ENOENT/);
+        expect(history.size).toBeLessThanOrEqual(64);
+        // Still answered while unpublished (memory or the durable index): never unknown, so never replayed.
+        expect(scheduler.attemptStatus({ requestId: 'held' }), String(index)).toMatchObject({ state: 'admission-failed', started: false });
+      }
+      expect(published).not.toContain('held');
+      holdHeld = false;
+      await expect(scheduler.submit({ jobId: 'bounded-history', requestId: 'final', scope: 'full', cwd, head: null, command: 'true' })).rejects.toThrow(/ENOENT/);
+      expect(published).toContain('held');
+      expect(history.size).toBeLessThanOrEqual(64);
+    } finally { await scheduler.dispose(); }
+  });
+
   it('rejects a queued request parked on its queued frame when dispose runs', async () => {
     const { scheduler } = makeScheduler({ maxConcurrent: 1 });
     scheduler.start();

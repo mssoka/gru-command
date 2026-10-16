@@ -1539,6 +1539,7 @@ export class VerificationScheduler {
   }
 
   private retryNoStart(): void {
+    let published = false;
     for (const [runId, record] of this.pendingNoStart) {
       if (this.publishingNoStart.has(runId)) continue;
       this.publishingNoStart.add(runId);
@@ -1567,14 +1568,16 @@ export class VerificationScheduler {
         this.recordEvent(record);
         this.noStartSettled.add(runId);
         this.pendingNoStart.delete(runId);
-        // Published: the durable index answers it from here on, so the
-        // memory history keeps its bound (#363 S09-1-05).
-        this.boundRequestHistory();
-        this.persistBestEffort();
+        published = true;
       } catch (error) {
         this.log('error', 'verification no-start persistence/publication failed; original identity retained for retry', { run: runId, error: String(error) });
       } finally { this.publishingNoStart.delete(runId); }
     }
+    // A publication settled: keep the memory history within its bound
+    // (#363 S09-1-05) and persist it.
+    if (!published) return;
+    this.boundRequestHistory();
+    this.persistBestEffort();
   }
 
   /** Record (or forget) every bound request identity for reconciliation. */
@@ -1621,13 +1624,12 @@ export class VerificationScheduler {
   }
 
   /** Keep at most MAX_REQUEST_HISTORY terminal entries in memory, oldest out
-   * first. An entry of a no-start whose publication is still pending stays:
-   * it is the only copy that retry can publish from. */
+   * first. Nothing is lost: an evicted terminal identity answers from the
+   * durable index, and a no-start still pending publication keeps its whole
+   * record in pendingNoStart, which re-derives its entry on every retry. */
   private boundRequestHistory(): void {
-    const pending = new Set([...this.pendingNoStart.values()].flatMap((record) => record.payload['request_ids'] as string[]));
     for (const requestId of this.requestHistory.keys()) {
       if (this.requestHistory.size <= MAX_REQUEST_HISTORY) break;
-      if (pending.has(requestId)) continue;
       this.requestHistory.delete(requestId);
     }
   }

@@ -43,4 +43,24 @@ describe('producer inspection cost (#363 S04-0-03)', () => {
     // receipts. A scan per start would be on the order of pairs².
     expect(inspectionCompares).toBeLessThan(4 * 2 * pairs);
   });
+
+  it('an independent receipt keeps its start unknown, even on this host, and a ceased one still wins for its own incarnation', async () => {
+    const { hostname } = await import('node:os');
+    const dir = mkdtempSync(join(tmpdir(), 'gru-producer-independent-'));
+    dirs.push(dir);
+    const file = join(dir, 'session.jsonl');
+    const producer = (incarnation: string, pid: number) => ({ incarnation, pid, host: hostname(), identity, agentId: 'minion-1', sessionId: 'session-1', sessionFile: file });
+    // A same-host pid that is surely gone: absent, unless an independent controller owns it.
+    const gone = 2_147_483_000;
+    const independent = producer('independent-incarnation', gone);
+    const absent = producer('absent-incarnation', gone - 1);
+    const both = producer('both-incarnation', gone - 2);
+    writeFileSync(`${file}.producers.jsonl`, [
+      { state: 'started', producer: independent }, { state: 'independent', producer: independent },
+      { state: 'started', producer: absent },
+      { state: 'started', producer: both }, { state: 'independent', producer: both }, { state: 'ceased', producer: both },
+    ].map((row) => JSON.stringify(row)).join('\n') + '\n');
+    const evidence = Object.fromEntries(inspectDirectiveProducers(file, identity).map((owner) => [owner.producer.incarnation, owner.evidence]));
+    expect(evidence).toEqual({ 'independent-incarnation': 'unknown', 'absent-incarnation': 'host-absent', 'both-incarnation': 'ceased' });
+  });
 });

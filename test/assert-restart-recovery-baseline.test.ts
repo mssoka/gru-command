@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Writable } from 'node:stream';
@@ -65,6 +66,32 @@ describe('restart recovery baseline driver capture (#363 S09-0-02)', () => {
       expect(outcome).toMatchObject({ error: expect.any(BaselineRecoveryGateError) });
       expect(String((outcome as { error: unknown }).error)).toMatch(/complete output capture failed \(Error: ENOTDIR[^)]*\); the child was stopped — not behavioral RED/u);
       expect(Date.now() - started).toBeLessThan(30_000);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('a run that captures cleanly resolves its exit status, with each stream teed to its own sink and both in the log', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-baseline-capture-ok-'));
+    try {
+      const log = join(dir, 'complete-output.txt');
+      const seen: string[][] = [[], []];
+      const sink = (index: number): Writable => new Writable({ write(chunk, _encoding, done) { seen[index]!.push(String(chunk)); done(); } });
+      const result = await run(process.execPath, ['-e', "process.stdout.write('to stdout'); process.stderr.write('to stderr'); process.exitCode = 3;"], dir, log, [sink(0), sink(1)]);
+      expect(result).toEqual({ exitCode: 3, signal: null });
+      expect(seen.map((chunks) => chunks.join(''))).toEqual(['to stdout', 'to stderr']);
+      expect(readFileSync(log, 'utf8').split('').sort().join('')).toBe('to stdoutto stderr'.split('').sort().join(''));
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('run as a command — directly or through a symlink — the driver enters its probe and refuses outside a git checkout (exit 2)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-baseline-cli-'));
+    try {
+      const script = join(import.meta.dirname, '..', 'tools', 'verify-restart-recovery-baseline.mjs');
+      const linked = join(dir, 'linked-driver.mjs');
+      symlinkSync(script, linked);
+      for (const entry of [script, linked]) {
+        const result = spawnSync(process.execPath, [entry], { cwd: dir, encoding: 'utf8', env: { ...process.env, GIT_DIR: join(dir, 'no-such-git'), GIT_CEILING_DIRECTORIES: dir } });
+        expect([result.status, result.stderr], entry).toEqual([2, expect.stringMatching(/^baseline proof refused: /mu)]);
+      }
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

@@ -543,18 +543,18 @@ describe('eviction-safe fix directives (phase 3)', () => {
   });
 
   it('a guard stop after a positively ceased prior cleanup is a deferral; an uncertain cleanup never is (#363 S08-0-01)', async () => {
-    for (const evidence of ['ceased', 'unknown'] as const) {
+    for (const evidence of ['ceased', 'unknown', 'no-evidence', 'disposal-failed'] as const) {
       const disposed: string[] = [];
       const prior = {
         id: 'minion-prior', role: 'minion' as const, sessionFile: '/sessions/prior.jsonl', capabilities: CAPS,
         health: () => ({ state: 'idle', lastActivity: null, sessionFile: '/sessions/prior.jsonl' }),
         prompt: async () => {}, steer: async () => {}, followUp: async () => {}, subscribe: () => () => {}, dispose: async () => {},
-        cessationEvidence: () => evidence,
+        ...(evidence === 'no-evidence' ? {} : { cessationEvidence: () => (evidence === 'disposal-failed' ? 'unknown' : evidence) }),
       };
       const spawned: string[] = [];
       const registry = {
         getHandle: () => prior,
-        disposeHandle: async (handle: { id: string }) => { disposed.push(handle.id); },
+        disposeHandle: async (handle: { id: string }) => { disposed.push(handle.id); if (evidence === 'disposal-failed') throw new Error('disposal failed'); },
         spawn: async (role: string) => { spawned.push(role); throw new Error('no spawn is expected'); },
       };
       const ledger = {
@@ -575,8 +575,9 @@ describe('eviction-safe fix directives (phase 3)', () => {
         // The prior session is proven gone: nothing of this request ran, so the stop defers.
         expect(outcome).toBeInstanceOf(DirectiveDispatchDeferredError);
       } else {
-        expect(outcome).not.toBeInstanceOf(DirectiveDispatchDeferredError);
-        expect(String(outcome)).toMatch(/retains unproven producer ownership/u);
+        // Unknown, absent or failed cleanup is never a deferral.
+        expect(outcome, evidence).not.toBeInstanceOf(DirectiveDispatchDeferredError);
+        expect(String(outcome), evidence).toMatch(evidence === 'disposal-failed' ? /disposal failed/u : /retains unproven producer ownership/u);
       }
     }
   });

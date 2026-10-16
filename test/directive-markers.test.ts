@@ -318,6 +318,27 @@ describe('directive requests — boot reconciliation (crash windows, bounded, no
     expect(cards).toHaveLength(1);
   });
 
+  it('a boot reconcile card reused from an older pass is refreshed in place with the current detail (#363 S07-3-01)', () => {
+    const dir = tmpDir();
+    {
+      const { ledger } = boot(dir);
+      ledger.addJob({ id: 'job-stale-card', repo: 'r', title: 'Job stale card' });
+      ledger.setJobStatus('job-stale-card', 'working');
+      ledger.beginDirectiveIntent({ jobId: 'job-stale-card', directive: 'run', holder: 'silas-ops', requestId: 'req-stale-card' });
+    }
+    const { ledger, notifications } = boot(dir);
+    // An open card from an earlier pass, written before this detail existed.
+    const stale = notifications.postIncident({ kind: 'silas.directive-unreconciled.req-stale-card', routing: 'action-required', severity: 'error',
+      title: 'an older title', detail: 'an older generation: inspect a removed marker', dedupe: 'unacked' });
+    reconcilePendingDirectives({ ledger, notifications });
+    const card = ledger.findNotificationByKind('silas.directive-unreconciled.req-stale-card', 'unacked')!;
+    expect(card.id).toBe(stale.id);
+    expect(card.ackedAt).toBe(stale.ackedAt);
+    expect(card.title).toBe('Directive request req-stale-card unreconciled after restart (job job-stale-card)');
+    expect(card.detail).toContain('Do NOT re-dispatch');
+    expect(card.detail).not.toContain('removed marker');
+  });
+
   it('escalates an ADMITTED request without a terminal receipt — no fabricated job.delivered', () => {
     const dir = tmpDir();
     {
