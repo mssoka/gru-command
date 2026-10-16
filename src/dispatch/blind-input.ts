@@ -610,13 +610,15 @@ const GREP_LINE = /^((?:\.\/|[A-Za-z]:[\\/])?[^\s:][^:\n]*):\d+[:-]/u;
  * however much padding precedes it — is judged, and the work per line stays
  * bounded. */
 const MAX_PATH_CHARS = 4096;
-/** A spaced candidate whose SHAPE may still classify it: its last path
- * component has no whitespace, and it is a parent path (`../x`), an
- * absolute one naming at least a directory and a file (POSIX or a Windows
- * drive), or a UNC share naming a host, a share and a file — a real spaced
- * path (`/Users/a b/notes.md`, `C:/Users/a b/Makefile`), never prose or a
- * clock time whose words follow the last slash (`/var/log/app.log started
- * at 10`), a lone `/word` (`ratio 3 /4:12:`) or a bare `//host` URL. */
+/** A spaced candidate whose SHAPE may still classify it (candidates arrive
+ * with `/` separators — grepPathCandidates normalises them): its last path
+ * component is non-empty with no whitespace, and it is a parent path
+ * (`../x`), an absolute one naming at least a directory and a file (POSIX or
+ * a Windows drive), or a UNC share naming an unspaced host, a share and a
+ * file — a real spaced path (`/Users/a b/notes.md`, `C:/Users/a b/Makefile`),
+ * never prose or a clock time whose words follow the last slash
+ * (`/var/log/app.log started at 10`), a lone `/word` (`ratio 3 /4:12:`), a
+ * spaced `//a b/…` or a bare `//host` URL. */
 function fileLikeOutside(candidate: string): boolean {
   // Index arithmetic, not a split: a dense line yields thousands of
   // candidates, and none allocates per component.

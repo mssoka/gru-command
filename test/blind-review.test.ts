@@ -230,6 +230,19 @@ describe('observeBlindSessionAccess — repeated scans count distinct reads (iss
       rmSync(join(loopDir, 'real', 'deep.jsonl'));
       expect(blindSessionIdentity(join(loopDir, 'alias', 'hop1.jsonl'))).toBe(relative);
       expect(blindSessionIdentity(join(loopDir, 'alias', 'hop2.jsonl'))).toBe(chained);
+      // A `..` target reached through a linked directory is walked physically,
+      // as realpath walked it — never collapsed lexically against the alias.
+      mkdirSync(join(loopDir, 'real', 'sub'));
+      symlinkSync(join(loopDir, 'real', 'sub'), join(loopDir, 'subalias'));
+      writeFileSync(join(loopDir, 'real', 'up.jsonl'), '');
+      symlinkSync('../up.jsonl', join(loopDir, 'real', 'sub', 'l.jsonl'));
+      const upward = blindSessionIdentity(join(loopDir, 'subalias', 'l.jsonl'));
+      expect(upward).toBe(sha256(join(loopDir, 'real', 'up.jsonl')));
+      rmSync(join(loopDir, 'real', 'up.jsonl'));
+      expect(blindSessionIdentity(join(loopDir, 'subalias', 'l.jsonl'))).toBe(upward);
+      // A long chain of links is refused by name, never walked without end.
+      for (let index = 0; index < 70; index += 1) symlinkSync(`c${String(index + 1)}.jsonl`, join(loopDir, `c${String(index)}.jsonl`));
+      expect(() => blindSessionIdentity(join(loopDir, 'c0.jsonl'))).toThrow(/ELOOP|too many levels/u);
     } finally { rmSync(loopDir, { recursive: true, force: true }); }
     // Gone through a linked directory: the same identity it had while it existed.
     const dir = realpathSync(mkdtempSync(join(tmpdir(), 'blind-gone-')));

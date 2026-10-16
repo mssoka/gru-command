@@ -384,6 +384,9 @@ describe('observed reviewer access — grep paths with spaces (#357)', () => {
     // The densest line still yields at most one candidate per two characters of the window.
     expect(grepPathCandidates(`${'a '.repeat(5000)}x.md:1:x`).length).toBeLessThanOrEqual(2049);
     expect(grepPathCandidates(`a b${'/a'.repeat(5000)}:1:x`).length).toBeLessThanOrEqual(2049);
+    // The second slash of `//` starts nothing: no `/host/…` candidate.
+    expect(grepPathCandidates('foo //host/share/f.md:1:x').map((candidate) => candidate.path))
+      .toEqual(['foo //host/share/f.md', '//host/share/f.md', 'host/share/f.md', 'share/f.md', 'f.md']);
     // Prose padding with no excluded suffix stays no hit.
     expect(scanObservedAccess([{ index: 2, toolName: 'bash', text: `${'word '.repeat(20_000)}done at 10:30:15` }], DEFAULT_BLIND_ISOLATION_RULE)).toEqual([]);
   });
