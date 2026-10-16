@@ -6,7 +6,7 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import { ROLES, type GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { EventBus } from '../events/bus.js';
-import { LedgerApi, RecordNotFound, AdminCloseoutRefusal, NotificationDecisionRefusal, producerResolvedBy, type DecisionActor, type DecisionKind, type NotificationRecord } from '../ledger/api.js';
+import { LedgerApi, RecordNotFound, AdminCloseoutRefusal, MachineDispositionRefusedError, NotificationDecisionRefusal, producerResolvedBy, type DecisionActor, type DecisionKind, type NotificationRecord } from '../ledger/api.js';
 import { isDecisionActor, isDecisionKind } from '../ledger/decision-memory.js';
 import { parseDecisionOptions, parseNotificationDecision, serializeNotificationDecision } from '../ledger/notification-decision.js';
 import { isJobStatus, isRoundStatus, isRoundVerdict } from '../ledger/states.js';
@@ -58,7 +58,7 @@ export interface BoardServerOptions {
   readonly onNotificationDisposition?: (
     id: string,
     detail: string,
-  ) => { readonly ok: boolean; readonly rearmed?: boolean; readonly reason?: string } | void;
+  ) => { readonly ok: boolean; readonly rearmed?: boolean; readonly superseded?: boolean; readonly reason?: string } | void;
   readonly decisionsStatus?: () => DecisionRuntimeStatus;
   readonly onDecisionsRecheck?: () => Promise<DecisionRuntimeStatus>;
   readonly log?: Log;
@@ -88,6 +88,18 @@ interface Client {
   authed: boolean;
   authDeadline: ReturnType<typeof setTimeout> | null;
   pongMisses: number;
+}
+
+/** A thrown value's text for a reason or detail: never blank, never a second
+ * throw. With `messageOnly`, an Error is named by its message (no name
+ * prefix) — read inside the same guard. */
+function failureText(error: unknown, messageOnly = false): string {
+  try {
+    const text = messageOnly && error instanceof Error ? String(error.message) : String(error);
+    return text.trim() === '' ? 'an error with no text' : text;
+  } catch {
+    return 'an error that cannot be printed';
+  }
 }
 
 function json(res: import('node:http').ServerResponse, status: number, body: unknown): void {
@@ -626,6 +638,29 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             const id = `owner-escalation:${rawKey}`;
             const existing = ledger.getNotification(id);
             if (existing !== null) {
+              if (existing.title === title && existing.detail === detail && existing.decision === null) {
+                // A row written before typed decisions were required (#395):
+                // an identical replay upgrades it in place when it is still
+                // open; a closed legacy row is a typed conflict.
+                try {
+                  // The shared bearer proves a paired caller, never an actor
+                  // (decision #99): record exactly that.
+                  const adopted = notifications.adoptLegacyDecision(id, decision, { credential: 'shared-bearer', declaredActor: null });
+                  if (adopted === null) {
+                    json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });
+                    return;
+                  }
+                  json(res, 200, adopted);
+                } catch (error) {
+                  if (!(error instanceof NotificationDecisionRefusal)) throw error;
+                  json(res, 409, {
+                    error: 'idempotency_conflict',
+                    code: error.code,
+                    detail: `idempotencyKey "${rawKey}": ${error.message}`,
+                  });
+                }
+                return;
+              }
               if (
                 existing.title !== title ||
                 existing.detail !== detail ||
@@ -773,7 +808,15 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             // recorded. A refused or failed re-arm returns an honest
             // outcome and keeps the alert open with its retryable debt —
             // settlement is never reported before the control accepts it.
-            let rearm: 'accepted' | 'not_applicable' = 'not_applicable';
+            let rearm: 'accepted' | 'not_applicable' | 'superseded' = 'not_applicable';
+            // A disposition the ledger would refuse is refused BEFORE the
+            // supervisor acts on it (#385), open or already resolved: never a
+            // closed stop beside an alert left open.
+            const refusal = !ownerFollowThrough && target !== null ? ledger.machineDispositionRefusal(id) : null;
+            if (refusal !== null) {
+              json(res, 409, { error: 'disposition_refused', code: 'disposition_refused', rearm, detail: refusal });
+              return;
+            }
             if (!ownerFollowThrough && target !== null && target.resolvedAt === null) {
               try {
                 const outcome = onNotificationDisposition(id, detail);
@@ -790,23 +833,75 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
                   return;
                 }
                 // Truthful typed outcome: `rearmed: false` means no
-                // stopped breaker matched this alert (pure record).
-                if (outcome !== undefined) rearm = outcome.rearmed === false ? 'not_applicable' : 'accepted';
+                // stopped breaker matched this alert (pure record);
+                // `superseded` means the stop closed WITHOUT a restart because
+                // its captured turn was superseded (#385) — the lane needs a
+                // fresh re-brief or directive to continue.
+                if (outcome !== undefined) {
+                  rearm = outcome.superseded === true ? 'superseded' : outcome.rearmed === false ? 'not_applicable' : 'accepted';
+                }
               } catch (error) {
-                const message = String(error instanceof Error ? error.message : error);
-                ledger.appendCustomEvent({
-                  kind: 'notification.rearm-failed',
-                  payload: { id, error: message },
-                });
-                json(res, 502, { error: 'rearm_failed', detail: message });
+                // Bounded on code points, as the disposal reason is; recorded
+                // best effort — a failed append never costs the typed answer.
+                const message = [...failureText(error, true).slice(0, 1001)].slice(0, 500).join('');
+                let recorded = true;
+                try {
+                  ledger.appendCustomEvent({
+                    kind: 'notification.rearm-failed',
+                    payload: { id, error: message },
+                  });
+                } catch (eventError) {
+                  recorded = false;
+                  try { log('error', 'rearm-failed event not recorded', { id, error: failureText(eventError) }); } catch { /* the answer still goes out */ }
+                }
+                json(res, 502, { error: 'rearm_failed', detail: recorded ? message : `${message} (and that could not be recorded in the ledger)` });
                 return;
               }
             }
-            const row = ownerFollowThrough
-              ? ledger.resolveOwnerDecision(id, detail)
-              : ledger.disposeMachineNotification(id, detail, { credential: 'shared-bearer', declaredActor });
+            // When the supervisor acted but nothing is resolved after all,
+            // that is recorded (best effort: an append or log failure never
+            // replaces the answer) and then said — never hidden.
+            const acted = rearm;
+            // True when nothing is left unrecorded: no action to record, or recorded.
+            const recordActed = (outcome: 'refused' | 'removed' | 'failed', reason: string): boolean => {
+              if (acted === 'not_applicable') return true;
+              try {
+                ledger.appendCustomEvent({ kind: 'notification.disposition-refused-after-rearm', payload: { id, rearm: acted, outcome, reason: [...reason.slice(0, 1001)].slice(0, 500).join('') } });
+                return true;
+              } catch (eventError) {
+                try { log('error', 'refused-after-rearm event not recorded', { id, rearm: acted, error: String(eventError) }); } catch { /* the answer still goes out */ }
+                return false;
+              }
+            };
+            const actedNote = (recorded: boolean): string => (acted === 'not_applicable' ? ''
+              : ` — the supervisor had already acted on it (rearm: ${acted})${recorded ? '' : ' (and that could not be recorded in the ledger)'}; the alert stays open: retriage or resolve it`);
+            let row: NotificationRecord | null;
+            try {
+              row = ownerFollowThrough
+                ? ledger.resolveOwnerDecision(id, detail, { credential: 'shared-bearer', declaredActor })
+                : ledger.disposeMachineNotification(id, detail, { credential: 'shared-bearer', declaredActor });
+            } catch (error) {
+              // The disposal re-checks in its own transaction: a row that
+              // changed since the check above is refused the same typed way.
+              // If the supervisor had already acted on it (a retriage raced
+              // the consult), that is said and recorded, never hidden: the
+              // alert stays open for a person to retriage or resolve.
+              if (!(error instanceof MachineDispositionRefusedError)) {
+                // The supervisor already acted: the caller is told so, typed —
+                // never a bare failure that hides the re-arm or closure.
+                if (acted === 'not_applicable') throw error;
+                const failure = failureText(error);
+                const recorded = recordActed('failed', failure);
+                json(res, 500, { error: 'disposition_failed', code: 'disposition_failed', rearm, detail: `${failure}${actedNote(recorded)}` });
+                return;
+              }
+              const recorded = recordActed('refused', error.refusal);
+              json(res, 409, { error: 'disposition_refused', code: 'disposition_refused', rearm, detail: `${error.refusal}${actedNote(recorded)}` });
+              return;
+            }
             if (row === null) {
-              json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });
+              const recorded = recordActed('removed', `notification "${id}" not found`);
+              json(res, 404, { error: 'not_found', rearm, detail: `notification "${id}" not found${actedNote(recorded)}` });
               return;
             }
             json(res, 200, { ...row, rearm });

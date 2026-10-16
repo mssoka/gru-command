@@ -116,10 +116,37 @@ wakes Gru, and the board marks the agent (`⛔ stopped` on the rail + the
 alert). Gru **re-arms** supervision through the guarded disposition on
 that alert (or an operator resumes the lane by using its slot): the ring
 clears, a fresh window opens, one restart attempt resumes the agent. A
-service restart also resets breaker state (in-memory by design) — the
-resolution record is durable, an open breaker is not, so a re-arm can
-never strand an agent across a service restart. The owner is never asked
-to ack a breaker.
+service restart resets breaker state (in-memory by design) — the resolution
+record is durable, an open breaker is not, so a re-arm can never strand an
+agent across a service restart. The owner is never asked to ack a breaker.
+
+**Superseded stops close (owner decision 2026-10-15, #385).** When the
+stopped turn's captured prompt was SUPERSEDED — the job was parked and
+resumed, or a fresh directive/re-brief took over — that prompt never
+replays, so the disposition **closes the stop** instead of re-arming it:
+
+- No restart of the stale worker. A `supervision.stop-superseded` event
+  records the dropped turn: `notification_id` and `job_id` (strings),
+  `captured_epoch` and `current_epoch` (integers), `producer_changed`,
+  `had_open_turn` and `prompt_named` (booleans) and `stop_reason` (string).
+- The event is written FIRST: a failed write refuses and changes nothing.
+  Once it lands the closure stands — every retirement cleanup step runs (a
+  failing one is logged as an error) — and the ledger records it at most
+  once per alert, atomically.
+- The response says `rearm: superseded`; a retried disposition says so again,
+  answered from that durable event (restarts and a disabled supervisor
+  included). If that lookup fails, a retry on a breaker alert — or on an
+  alert whose kind cannot be read either — refuses so it can ask again; an
+  alert known not to be a breaker stays a pure record, and a disabled
+  supervisor never refuses.
+- The lane no longer reads as stopped: its supervision record is retired
+  in-process and durably alike, and the fresh re-brief or directive is
+  supervised as a new watching record.
+- A disposition the ledger would refuse is refused before the supervisor
+  acts on it: a self-closing alert kind as `409 producer_resolved`, a
+  non-machine routing as `409 disposition_refused`.
+- Any other fence (an active park, a hold, a live producer, a live handle or
+  restart, an unreadable authority) still refuses with the debt retained.
 
 **Watchdog config** (`[supervision]` in `config.toml`):
 
