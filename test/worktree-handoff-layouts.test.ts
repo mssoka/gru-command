@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative as relativePath } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -38,9 +38,11 @@ function fixture(name: string): FixtureRepo {
   return repo;
 }
 
-/** Fixture git: the inherited environment minus any repository routing. */
+/** Fixture git: the inherited environment minus EVERY `GIT_*` variable (no
+ * hook or outer-repository routing can redirect a fixture), plus a fixed
+ * identity. */
 function git(cwd: string, args: readonly string[]): string {
-  const { GIT_DIR: _dir, GIT_WORK_TREE: _tree, GIT_INDEX_FILE: _index, ...inherited } = process.env;
+  const inherited = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('GIT_')));
   return execFileSync('git', ['-C', cwd, ...args], {
     encoding: 'utf8',
     env: { ...inherited, GIT_AUTHOR_NAME: 'Fixture', GIT_AUTHOR_EMAIL: 'fixture@example.invalid', GIT_COMMITTER_NAME: 'Fixture', GIT_COMMITTER_EMAIL: 'fixture@example.invalid' },
@@ -117,21 +119,32 @@ describe('worktree handoff with a --separate-git-dir repository (#372)', () => {
     const job = h.ledger.addJob({ id: 'sep-rollback', repo: 'assigned', title: 'failing setup' });
     const error = await h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id }).then(() => null, (cause: unknown) => cause);
     expect(error, 'creation fails in its setup').not.toBeNull();
+    // The ORIGINAL setup failure is what surfaces — no layout error masks it.
     const reasons = reasonsOf(error);
-    expect(reasons).not.toMatch(/missing repository gitdir|commondir|neither a linked worktree administration/u);
+    expect(reasons).toMatch(/^worktree setup command exited 7: exit 7\n/u);
+    expect(reasons).not.toMatch(/neither a linked worktree administration|has no usable \.git|cannot be resolved/u);
     // Nothing partial survives: no lane administration and no branch.
     expect(existsSync(join(gitdir, 'worktrees')) ? readdirSync(join(gitdir, 'worktrees')) : []).toEqual([]);
     expect(git(repo.path, ['branch', '--list', `gru/${job.id}`])).toBe('');
   });
 
   it('refuses each malformed gitdir layout by name, with the path and the missing piece', () => {
+    const fullGitDir = (dir: string): void => {
+      mkdirSync(join(dir, 'objects'), { recursive: true }); mkdirSync(join(dir, 'refs')); writeFileSync(join(dir, 'HEAD'), 'ref: refs/heads/main\n');
+    };
     const cases: readonly (readonly [string, (gitdir: string) => void, RegExp])[] = [
-      ['missing', () => {}, /does not exist/u],
-      ['a file', (gitdir) => { writeFileSync(gitdir, 'not a directory'); }, /is not a directory/u],
-      ['HEAD only', (gitdir) => { mkdirSync(gitdir); writeFileSync(join(gitdir, 'HEAD'), 'ref: refs/heads/main\n'); }, /has no objects directory/u],
-      ['no refs', (gitdir) => { mkdirSync(join(gitdir, 'objects'), { recursive: true }); writeFileSync(join(gitdir, 'HEAD'), 'ref: refs/heads/main\n'); }, /has no refs directory/u],
-      ['objects is a file', (gitdir) => { mkdirSync(join(gitdir, 'refs'), { recursive: true }); writeFileSync(join(gitdir, 'HEAD'), 'x'); writeFileSync(join(gitdir, 'objects'), 'x'); }, /has no objects directory/u],
-      ['empty', (gitdir) => { mkdirSync(gitdir); }, /has no HEAD file/u],
+      ['missing', () => {}, /: it does not exist$/u],
+      ['dangling link', (gitdir) => { symlinkSync(join(directory(), 'nowhere'), gitdir); }, /: it does not exist$/u],
+      ['looping link', (gitdir) => { symlinkSync(gitdir, gitdir); }, /: it cannot be resolved \(ELOOP\)$/u],
+      ['a file', (gitdir) => { writeFileSync(gitdir, 'not a directory'); }, /: it is not a directory$/u],
+      ['HEAD only', (gitdir) => { mkdirSync(gitdir); writeFileSync(join(gitdir, 'HEAD'), 'ref: refs/heads/main\n'); }, /: it has no objects directory$/u],
+      ['no refs', (gitdir) => { mkdirSync(join(gitdir, 'objects'), { recursive: true }); writeFileSync(join(gitdir, 'HEAD'), 'ref: refs/heads/main\n'); }, /: it has no refs directory$/u],
+      ['objects is a file', (gitdir) => { mkdirSync(join(gitdir, 'refs'), { recursive: true }); writeFileSync(join(gitdir, 'HEAD'), 'x'); writeFileSync(join(gitdir, 'objects'), 'x'); }, /: its objects is not a directory$/u],
+      ['HEAD is a directory', (gitdir) => { mkdirSync(join(gitdir, 'HEAD'), { recursive: true }); }, /: its HEAD is not a regular file$/u],
+      ['empty', (gitdir) => { mkdirSync(gitdir); }, /: it has no HEAD file$/u],
+      ['empty commondir', (gitdir) => { mkdirSync(gitdir); writeFileSync(join(gitdir, 'commondir'), '\n'); }, /: its commondir is empty$/u],
+      ['dangling commondir', (gitdir) => { mkdirSync(gitdir); writeFileSync(join(gitdir, 'commondir'), '../gone\n'); }, /: its commondir names \.\.\/gone, which cannot be resolved \(ENOENT\)$/u],
+      ['commondir to a non-repository', (gitdir) => { mkdirSync(join(gitdir, 'plain'), { recursive: true }); writeFileSync(join(gitdir, 'commondir'), 'plain\n'); }, /: its commondir names .*plain, which is not a git directory: it has no HEAD file$/u],
     ];
     for (const [label, make, problem] of cases) {
       const repo = fixture(`separate-bogus-${label.replace(/\W+/gu, '-')}`);
@@ -142,11 +155,31 @@ describe('worktree handoff with a --separate-git-dir repository (#372)', () => {
       expect(() => handoffProof.repositoryCommonDirectory(repo.path), label).toThrow(problem);
       expect(() => handoffProof.repositoryCommonDirectory(repo.path), label).toThrow(bogus);
     }
-    // A .git file without the gitdir prefix is no layout at all.
+    // A .git file without the gitdir prefix, or with more than one line, is no layout at all.
     const plain = fixture('separate-no-prefix');
     rmSync(join(plain.path, '.git'), { recursive: true, force: true });
     writeFileSync(join(plain.path, '.git'), 'not a gitdir line\n');
     expect(() => handoffProof.repositoryCommonDirectory(plain.path)).toThrow(/lost its linked gitdir/u);
+    writeFileSync(join(plain.path, '.git'), `gitdir: ${directory()}\nsecond line\n`);
+    expect(() => handoffProof.repositoryCommonDirectory(plain.path)).toThrow(/has a \.git file of more than one line/u);
+    // No .git at all is refused by name, with the repository path.
+    rmSync(join(plain.path, '.git'), { force: true });
+    expect(() => handoffProof.repositoryCommonDirectory(plain.path)).toThrow(`repository ${plain.path} has no usable .git (ENOENT)`);
+  });
+
+  it('follows a symlinked .git directory, and refuses a .git symlink to a gitdir file by name', () => {
+    const repo = fixture('symlinked-dotgit');
+    const real = join(directory(), 'real.git');
+    renameSync(join(repo.path, '.git'), real);
+    symlinkSync(real, join(repo.path, '.git'));
+    expect(handoffProof.repositoryCommonDirectory(repo.path)).toBe(realpathSync(real));
+    const gitfileRepo = fixture('symlinked-gitfile');
+    const gitdir = separateGitDir(gitfileRepo);
+    const gitfile = join(directory(), 'gitfile');
+    writeFileSync(gitfile, `gitdir: ${gitdir}\n`);
+    rmSync(join(gitfileRepo.path, '.git'));
+    symlinkSync(gitfile, join(gitfileRepo.path, '.git'));
+    expect(() => handoffProof.repositoryCommonDirectory(gitfileRepo.path)).toThrow(/has a \.git symlink to a gitdir file .* — an unsupported layout/u);
   });
 });
 
@@ -192,19 +225,32 @@ describe('child lane parent custody, called directly (#373)', () => {
     rmSync(f.parent.path, { recursive: true, force: true });
     const error = await f.createChild().then(() => null, (cause: unknown) => cause);
     expect(error).toBeInstanceOf(handoffProof.WorktreeHandoffUnresolvedError);
+    expect(reasonsOf(error)).toMatch(/handoff unresolved .* <- checkout .*job-custody-parent no longer has its linked gitdir file \(ENOENT\)(?: <- |$)/u);
+    f.childLeftNothing();
+    expect(f.h.ledger.getWorktree(f.parent.id)?.status).toBe('active');
+  });
+
+  it('refuses a parent whose git administration was removed, by name', async () => {
+    const f = await parentFixture('custody-admin-removed');
+    rmSync(f.admin, { recursive: true, force: true });
+    const error = await f.createChild().then(() => null, (cause: unknown) => cause);
+    expect(error).toBeInstanceOf(handoffProof.WorktreeHandoffUnresolvedError);
+    expect(reasonsOf(error)).toMatch(new RegExp(`names gitdir ${f.admin.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}, which cannot be resolved \\(ENOENT\\)`, 'u'));
     f.childLeftNothing();
   });
 
   it('refuses a parent whose completed handoff receipt changed, before any child Git effect', async () => {
     const f = await parentFixture('custody-receipt');
     const receipt = join(f.admin, 'gru-creation-handoff.json');
-    const original = JSON.parse(readFileSync(receipt, 'utf8')) as { state: string; createdAt: string | null };
+    const bytes = readFileSync(receipt, 'utf8');
+    const original = JSON.parse(bytes) as { state: string; createdAt: string | null };
     expect(original.state).toBe('ready');
+    // The issuer writes compact JSON in this key order, so the rewrite below
+    // is a receipt it could have written.
+    expect(JSON.stringify(original)).toBe(bytes);
     // A well-formed receipt rolled back to its pending phase: it parses, but
     // the completed proof the parent was registered with is gone.
-    const pending = JSON.stringify({ ...original, state: 'pending', createdAt: null });
-    writeFileSync(receipt, pending);
-    expect(readFileSync(receipt, 'utf8')).toBe(pending);
+    writeFileSync(receipt, JSON.stringify({ ...original, state: 'pending', createdAt: null }));
     const error = await f.createChild().then(() => null, (cause: unknown) => cause);
     expect(reasonsOf(error)).toMatch(/handoff unresolved .*completed handoff proof is missing or changed/u);
     f.childLeftNothing();
