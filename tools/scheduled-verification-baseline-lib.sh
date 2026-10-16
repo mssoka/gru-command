@@ -80,7 +80,9 @@ snapshot_candidate() {
 # stopped by a signal is said so, with its status, never as a broken helper;
 # the four signals the guard handles (SIGINT, SIGTERM, SIGHUP, SIGQUIT) take
 # its group and temporary directory down first — SIGKILL, or a signal sent to
-# the shell alone, reaches no handler. A per-run
+# the shell alone, reaches no handler and leaves both behind. A load that
+# could not run at all (no temporary directory, no process) is said so, never
+# as a broken helper either. A per-run
 # sentinel, on its own line, proves the load finished (against accidental
 # output; the helper under test can read its own command line). Importing never runs the CLI (it runs only when
 # invoked directly). A refused snapshot is kept for inspection.
@@ -105,6 +107,8 @@ const ms = Number(process.env.GRU_HELPER_LOAD_MS);
 const sentinel = `gru-helper-loaded-${randomUUID()}`;
 let dir;
 let failure = null;
+// Set when the load never ran far enough to judge the helper.
+let couldNotRun = false;
 let child;
 // The group is probed before it is signalled: that narrows, but cannot
 // close, the window in which a reaped leader's id names some other group.
@@ -121,7 +125,7 @@ for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT']) {
 }
 try { dir = mkdtempSync(join(tmpdir(), 'gru-helper-load-')); } catch (error) {
   console.error(`the helper load could not run: ${error instanceof Error ? error.message : String(error)}`);
-  process.exit(3);
+  process.exit(4);
 }
 try {
   const out = openSync(join(dir, 'stdout'), 'w');
@@ -140,11 +144,13 @@ try {
   else if (code !== 0) failure = `the helper exited ${String(code ?? signal)} while loading`;
   else if (!stdout.split('\n').includes(sentinel)) failure = 'the helper stopped before it finished loading';
 } catch (error) {
+  couldNotRun = true;
   failure = `the helper load could not run: ${error instanceof Error ? error.message : String(error)}`;
 } finally {
-  rmSync(dir, { recursive: true, force: true });
+  // A cleanup error never replaces the verdict: a stray directory is the lesser loss.
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* the verdict stands */ }
 }
-if (failure !== null) { console.error(failure); process.exit(3); }
+if (failure !== null) { console.error(failure); process.exit(couldNotRun ? 4 : 3); }
 JS
   then
     :
@@ -154,6 +160,10 @@ JS
     if [ "$_helper_status" -ge 128 ]; then
       echo "the helper load was stopped by a signal (status $_helper_status) — nothing was judged; refusing (snapshot kept at $PWD)" >&2
       exit "$_helper_status"
+    fi
+    if [ "$_helper_status" -eq 4 ]; then
+      echo "the helper load could not run — nothing was judged about the helper; refusing (snapshot kept at $PWD)" >&2
+      exit 2
     fi
     echo "the built dist/verify/capture-cli.js does not load cleanly — a broken helper would read as behavioral RED; refusing (snapshot kept at $PWD)" >&2
     exit 2

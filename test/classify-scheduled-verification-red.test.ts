@@ -2,7 +2,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { exec, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
 import { classifyReviewedRed, STATUS_ACTION_NAME } from '../tools/classify-scheduled-verification-red.mjs';
@@ -305,7 +305,8 @@ describe('reviewed-candidate behavioral RED custody', () => {
       // A load guard that cannot make its temporary directory says why — it never ran the helper.
       const noTmp = libCall('require_built_helper', snapshot, join(dir, 'no-such-tmp'));
       expect(noTmp.status).toBe(2);
-      expect(noTmp.stderr).toMatch(/^the helper load could not run: ENOENT[^\n]*\nthe built dist\/verify\/capture-cli\.js does not load cleanly/u);
+      expect(noTmp.stderr).toMatch(new RegExp(`^the helper load could not run: ENOENT[^\\n]*\\nthe helper load could not run — nothing was judged about the helper; refusing \\(snapshot kept at ${snapshot.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}\\)\\n$`, 'u'));
+      expect(noTmp.stderr).not.toMatch(/does not load cleanly/u);
       // The real compiled helper (this tree's build) loads without running.
       const real = libCall('require_built_helper', repoRoot, join(dir, 'tmp'));
       expect([real.status, real.stderr]).toEqual([0, '']);
@@ -322,20 +323,33 @@ describe('reviewed-candidate behavioral RED custody', () => {
       try { return await Promise.race([promise.then(() => true), new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), ms); })]); }
       finally { clearTimeout(timer); }
     };
+    /** pgrep's matches — a pgrep that cannot run is a named fixture failure. */
+    const pgrep = (args: readonly string[]): string[] => {
+      const out = spawnSync('pgrep', args, { encoding: 'utf8' });
+      if (out.error !== undefined) throw new Error(`fixture setup: pgrep could not run (${out.error.message})`);
+      return (out.stdout ?? '').trim().split('\n').filter((line) => line !== '');
+    };
     /** Every load group a guard started, and the guard: down, whatever failed. */
     const killGuard = (guard: number): void => {
-      const children = spawnSync('pgrep', ['-P', String(guard)], { encoding: 'utf8' }).stdout.trim().split('\n').filter((line) => line !== '');
+      const children = pgrep(['-P', String(guard)]);
       for (const child of children) { try { process.kill(-Number(child), 'SIGKILL'); } catch { /* gone */ } }
       try { process.kill(guard, 'SIGKILL'); } catch { /* gone */ }
     };
     const groups: number[] = [];
+    const loadDirs = (): number => readdirSync(join(dir, 'tmp')).filter((name) => name.startsWith('gru-helper-load-')).length;
     try {
       const snapshot = join(dir, 'snapshot'); mkdirSync(join(snapshot, 'dist', 'verify'), { recursive: true }); mkdirSync(join(dir, 'tmp'));
       writeFileSync(join(snapshot, 'package.json'), '{"type":"module"}\n');
       // SIGKILL last: it leaves a temporary directory behind.
-      for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT', 'SIGKILL'] as const) {
+      // A handled stop whose cleanup meets an error (an unwritable temporary
+      // parent) still exits 130 and is said so; SIGKILL reaches no handler.
+      const cases = [...(['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT'] as const).map((signal) => ({ signal, lockTmp: false })),
+        ...(process.getuid?.() === 0 ? [] : [{ signal: 'SIGTERM' as const, lockTmp: true }]), { signal: 'SIGKILL' as const, lockTmp: false }];
+      for (const { signal, lockTmp } of cases) {
         const handled = signal !== 'SIGKILL';
-        const pidFile = join(dir, `${signal}.pid`);
+        const label = lockTmp ? `${signal} (cleanup refused)` : signal;
+        const pidFile = join(dir, `${label.replace(/\W+/gu, '-')}.pid`);
+        const dirsBefore = loadDirs();
         // The load (its group's leader) and its descendant, written whole by rename: never read half-written.
         writeFileSync(join(snapshot, 'dist', 'verify', 'capture-cli.js'), `import { spawn } from 'node:child_process';\nimport { renameSync, writeFileSync } from 'node:fs';\nconst kid = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' });\nwriteFileSync(${JSON.stringify(`${pidFile}.part`)}, \`\${process.pid} \${kid.pid}\`);\nrenameSync(${JSON.stringify(`${pidFile}.part`)}, ${JSON.stringify(pidFile)});\nsetInterval(() => {}, 1000);\nawait new Promise(() => {});\n`);
         const run = spawn('sh', ['-c', '. "$1" && require_built_helper', 'lib', join(repoRoot, BASELINE_LIB)], { cwd: snapshot, env: { ...gitFree(), TMPDIR: join(dir, 'tmp'), GRU_HELPER_LOAD_MS: '60000' }, stdio: ['ignore', 'ignore', 'pipe'] });
@@ -348,7 +362,7 @@ describe('reviewed-candidate behavioral RED custody', () => {
           // The guard is the shell's node child.
           const deadline = Date.now() + 20_000;
           while (guard === null && run.exitCode === null && Date.now() < deadline) {
-            const found = spawnSync('pgrep', ['-P', String(run.pid), '-f', 'input-type=module'], { encoding: 'utf8' }).stdout.trim().split('\n').filter((line) => line !== '');
+            const found = pgrep(['-P', String(run.pid), '-f', 'input-type=module']);
             if (found.length === 1) guard = Number(found[0]); else await pause(50);
           }
           expect(guard, `${signal}: the load guard is found`).not.toBeNull();
@@ -357,12 +371,13 @@ describe('reviewed-candidate behavioral RED custody', () => {
           const [leader, kid] = readFileSync(pidFile, 'utf8').split(' ').map(Number) as [number, number];
           expect([leader, kid].every((pid) => Number.isSafeInteger(pid) && pid > 1), `${signal}: ${pidFile} holds real pids`).toBe(true);
           groups.push(leader);
+          if (lockTmp) chmodSync(join(dir, 'tmp'), 0o555);
           process.kill(guard!, signal);
           const [status] = await exited;
           if (!handled) {
             // No handler runs: the load's group outlives the guard, holding its stderr open.
             expect(alive(kid), `${signal}: the load outlives a guard no handler could stop`).toBe(true);
-            process.kill(-leader, 'SIGKILL');
+            try { process.kill(-leader, 'SIGKILL'); } catch { /* gone: the close below says whether anything still holds stderr */ }
           }
           // Closed, not just exited: every byte of stderr is read — and a
           // load group that outlived a handled stop would hold it open.
@@ -377,8 +392,10 @@ describe('reviewed-candidate behavioral RED custody', () => {
           while (alive(kid) && Date.now() < until) await pause(100);
           expect(alive(kid), `${signal}: the load's descendant is gone`).toBe(false);
           groups.pop(); // confirmed gone: never signalled again
-          expect(readdirSync(join(dir, 'tmp')).filter((name) => name.startsWith('gru-helper-load-')), signal).toHaveLength(handled ? 0 : 1);
+          // A clean handled stop removes its directory; a refused cleanup or SIGKILL leaves one.
+          expect(loadDirs() - dirsBefore, label).toBe(handled && !lockTmp ? 0 : 1);
         } finally {
+          if (lockTmp) chmodSync(join(dir, 'tmp'), 0o755);
           if (guard !== null) killGuard(guard);
           if (run.exitCode === null && run.signalCode === null) { run.kill('SIGKILL'); await exited; }
         }
@@ -388,7 +405,7 @@ describe('reviewed-candidate behavioral RED custody', () => {
       for (const leader of groups) { try { process.kill(-leader, 'SIGKILL'); } catch { /* gone */ } }
       rmSync(dir, { recursive: true, force: true });
     }
-  }, 150_000);
+  }, 240_000);
 
   it('the status title the classifier allows is the real status regression\'s title', () => {
     // Built in parts so the suite-shape counter never mistakes it for a registration.
