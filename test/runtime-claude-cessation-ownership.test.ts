@@ -172,11 +172,13 @@ describe('Claude Code cessation through the registry (runtime-neutral contract)'
     } finally { vi.useRealTimers(); }
   });
 
-  it('an error whose child reports an exit but no close stays unknown and holds the permit: only the close is the proof (#359)', async () => {
-    for (const exit of [{ code: 143, signal: null }, { code: null, signal: 'SIGTERM' as NodeJS.Signals }]) try {
+  it('an exit recorded with no close — past an error or the deadline, wrapped or not — stays unknown and holds the permit: only the close is the proof (#359)', async () => {
+    for (const exit of [{ code: 143, signal: null }, { code: null, signal: 'SIGTERM' as NodeJS.Signals }])
+    for (const settlement of ['error', 'deadline'] as const)
+    for (const wrapped of [false, true]) try {
       vi.useRealTimers();
       const child = fakeChild();
-      const fx = claudeRegistry(child);
+      const fx = claudeRegistry(child, { wrapped });
       const { registry } = fx;
       let released = 0;
       registry.onResidentReleased(() => { released += 1; });
@@ -188,10 +190,10 @@ describe('Claude Code cessation through the registry (runtime-neutral contract)'
       // The exit is recorded (as a real ChildProcess does at 'exit'), the
       // transport errors, and the close never comes before the settlement.
       Object.assign(child, { exitCode: exit.code, signalCode: exit.signal });
-      child.emit('error', new Error('transport error'));
+      if (settlement === 'error') child.emit('error', new Error('transport error'));
       await vi.advanceTimersByTimeAsync(60);
       await disposing;
-      const label = `exit ${String(exit.code ?? exit.signal)}`;
+      const label = `exit ${String(exit.code ?? exit.signal)}, ${settlement}, wrapped ${String(wrapped)}`;
       expect(adapterCessationEvidence(resident), label).toBe('unknown');
       expect([registry.residents.occupied, released], label).toEqual([1, 0]);
       // ...until the same child's own close.
@@ -199,6 +201,9 @@ describe('Claude Code cessation through the registry (runtime-neutral contract)'
       await vi.advanceTimersByTimeAsync(0);
       expect(adapterCessationEvidence(resident), label).toBe('ceased');
       expect([registry.residents.occupied, released], label).toEqual([0, 1]);
+      // Released once: a repeated close changes nothing.
+      child.emit('close', exit.code, exit.signal);
+      expect(released, label).toBe(1);
     } finally { vi.useRealTimers(); }
   });
 

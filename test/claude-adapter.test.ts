@@ -3243,7 +3243,7 @@ describe('ReviewMcpBridge fail-closed guards', () => {
       producerPrefixes: [['npm', 'test']], helper: '/pkg/dist/verify/capture-cli.js', configFile: '/instance/config.toml',
     };
 
-    async function settingsLifetime(outcome: 'deadline' | 'error'): Promise<void> {
+    async function settingsLifetime(outcome: 'deadline' | 'error', recordedExit = false): Promise<void> {
       const fx = fixture({ killGraceMs: 5 });
       const handle = await fx.runtime.spawn('gru', { workerVerification: policy });
       const owned = handle as unknown as {
@@ -3261,6 +3261,9 @@ describe('ReviewMcpBridge fail-closed guards', () => {
       try {
         const disposing = handle.dispose();
         const settled = disposing.then(() => 'fulfilled', () => 'rejected');
+        // A real ChildProcess records its exit before its close: an exit seen
+        // after the disposal began is no proof past an error or the deadline (#359).
+        if (recordedExit) Object.assign(original, { exitCode: 143 });
         if (outcome === 'error') original.emit('error', new Error('owned fixture transport error'));
         await vi.advanceTimersByTimeAsync(40);
         expect(await settled).toBe('fulfilled');
@@ -3285,6 +3288,11 @@ describe('ReviewMcpBridge fail-closed guards', () => {
 
     it('retains private verification files through a child error until actual close', async () => {
       await settingsLifetime('error');
+    });
+
+    it('retains private verification files through an exit recorded with no close — past an error or the deadline — until the close (#359)', async () => {
+      await settingsLifetime('error', true);
+      await settingsLifetime('deadline', true);
     });
 
     it('a child whose error and close land in the same tick, before the disposal settles, is ceased and releases its files (#359)', async () => {
