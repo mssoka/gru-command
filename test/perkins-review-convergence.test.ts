@@ -11,6 +11,10 @@ import {
   deltaSince,
   findingIntersectsDelta,
   integrationSince,
+  boundedForReason,
+  parseRawChanges,
+  REASON_EXCERPT_MAX_CHARS,
+  rawChanges,
   planReviewScope,
   planPerkinsReviewScope,
   probeIntegrationLineage,
@@ -27,6 +31,7 @@ import { PerkinsWholeReview, type PerkinsWholeResult } from '../src/dispatch/per
 import type { VerifiedFinding } from '../src/dispatch/perkins-review/types.js';
 import { fakeWholeSpawner, groundedFinding, type WholeLeadOptions } from './helpers/perkins-whole-double.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { commitManyPaths, LARGE_UNIT_TIMEOUT_MS } from './helpers/large-integration-unit.js';
 
 const repos: FixtureRepo[] = [];
 const temporaryDirectories: string[] = [];
@@ -483,6 +488,153 @@ describe('integration unit (retained coverage across an advanced base)', () => {
   });
 });
 
+describe('integration unit fail-loud guards (#393)', () => {
+  /** H0 on B0, main advances to B1, and the feature merges it cleanly; the
+   * caller then commits the integration work that makes H1. */
+  function integratedFeature(name: string): { repo: FixtureRepo; b0: string; h0: string; b1: string } {
+    const repo = makeFixtureRepo(name);
+    repos.push(repo);
+    repo.git(['config', 'user.name', 'Fixture Tests']);
+    repo.git(['config', 'user.email', 'tests@example.invalid']);
+    const b0 = repo.head();
+    repo.git(['checkout', '-b', 'feature/guards']);
+    const h0 = repo.commitFile('src/feature.ts', 'export const feature = 1;\n');
+    repo.git(['checkout', 'main']);
+    const b1 = repo.commitFile('src/mainonly.ts', 'export const mainonly = 1;\n');
+    repo.git(['checkout', 'feature/guards']);
+    repo.git(['merge', '--no-ff', '-m', 'merge main', 'main']);
+    return { repo, b0, h0, b1 };
+  }
+
+  it('refuses an integration unit over the path bound instead of truncating it', () => {
+    const { repo, b0, h0, b1 } = integratedFeature('perkins-guard-paths');
+    commitManyPaths(repo, 4001);
+    expect(() => integrationSince(repo.path, h0, b0, b1, repo.head())).toThrow(/integration unit touches 4001 paths, over the 4000-path bound/u);
+  }, LARGE_UNIT_TIMEOUT_MS);
+
+  it('refuses an integration unit whose diff exceeds the byte cap', () => {
+    const { repo, b0, h0, b1 } = integratedFeature('perkins-guard-bytes');
+    repo.commitFile('src/huge.ts', `${'x'.repeat(1023)}\n`.repeat(9 * 1024));
+    // The unit's own diff cap (diffForPaths), not another guard's message.
+    expect(() => integrationSince(repo.path, h0, b0, b1, repo.head())).toThrow(/^integration unit for [0-9a-f]{12} exceeds 8388608 UTF-8 bytes$/u);
+  });
+
+  it('refuses a changed path that is not valid UTF-8 rather than mangling it', () => {
+    const { repo, b0, h0, b1 } = integratedFeature('perkins-guard-utf8');
+    const realBlob = execFileSync('git', ['-C', repo.path, 'hash-object', '-w', '--stdin'], { input: 'export const odd = 1;\n' }).toString().trim();
+    // A raw non-UTF-8 byte path, staged through the index (no filesystem
+    // name involved, so this works on UTF-8-only volumes too).
+    execFileSync('git', ['-C', repo.path, 'update-index', '--add', '--index-info'], {
+      input: Buffer.concat([Buffer.from(`100644 blob ${realBlob}\tsrc/`), Buffer.from([0xff, 0xfe]), Buffer.from('.ts\n')]),
+    });
+    execFileSync('git', ['-C', repo.path, 'commit', '-m', 'non-utf8 path'], { stdio: 'ignore' });
+    expect(() => integrationSince(repo.path, h0, b0, b1, repo.head())).toThrow(/a changed path is not valid UTF-8/u);
+  });
+
+  it('reads a real rename as a deletion and an addition: rename detection stays disabled, whatever the repository config (#393)', () => {
+    for (const [setting, edit] of [['copies', false], ['true', true]] as const) {
+      const { repo } = integratedFeature(`perkins-guard-renames-${setting}`);
+      repo.git(['config', 'diff.renames', setting]);
+      const before = repo.commitFile('src/moved.ts', 'export const moved = 1;\n'.repeat(20));
+      repo.git(['mv', 'src/moved.ts', 'src/renamed.ts']);
+      // A small edit makes git score the similarity (an R<score> record if detection ran).
+      if (edit) writeFileSync(join(repo.path, 'src/renamed.ts'), `${'export const moved = 1;\n'.repeat(19)}export const edited = 2;\n`);
+      repo.git(['add', '-A']);
+      repo.git(['commit', '-m', `rename (${setting}, edited ${String(edit)})`]);
+      // Positive control: with detection on, git DOES score this commit as a rename.
+      const detected = execFileSync('git', ['-C', repo.path, 'diff', '--raw', '-z', '-M', '--abbrev=40', before, repo.head(), '--']).toString();
+      expect(detected, setting).toMatch(/ R\d+\0src\/moved\.ts\0src\/renamed\.ts\0/u);
+      const changes = rawChanges(repo.path, before, repo.head());
+      expect([...changes.keys()].sort(), setting).toEqual(['src/moved.ts', 'src/renamed.ts']);
+      expect(changes.get('src/moved.ts'), setting).toMatchObject({ newSha: '0'.repeat(40), newMode: '000000' });
+      expect(changes.get('src/renamed.ts'), setting).toMatchObject({ oldSha: '0'.repeat(40), oldMode: '000000' });
+    }
+  });
+
+  it('refuses unsafe commitManyPaths fixtures by name before writing anything', () => {
+    const { repo } = integratedFeature('perkins-guard-helper');
+    const head = repo.head();
+    const status = () => repo.git(['status', '--porcelain', '--ignored']);
+    const before = status();
+    for (const [count, directory] of [[0, 'many'], [100_001, 'many'], [1, '../out'], [1, '/abs'], [1, 'C:foo'], [1, '.git/objects2'], [1, '.GIT/objects2'], [1, 'a/.Git'], [1, '.git./x'], [1, '.git /x'], [1, 'GIT~1/x'], [1, 'git~2/x'], [1, '.g\u200bit/x'], [1, '.\uff47it/x'], [1, '.git::$INDEX_ALLOCATION/x'], [1, '.. /x'], [1, '.../x'], [1, '..../x'], [1, '. ./x'], [1, 'a:b/x'], [1, '.git:x/y'], [1, '.git\t/x'], [1, 'nul/x'], [1, 'nul /x'], [1, 'nul./x'], [1, 'nul .txt/x'], [1, 'CONOUT$/x'], [1, 'CONIN$/x'], [1, 'clock$/x'], [1, 'COM1.txt/x'], [1, 'COM1 .txt/x'], [1, 'lpt9 .log/x'], [1, 'a/./b'], [1, 'a\0b']] as const) {
+      expect(() => commitManyPaths(repo, count, directory), `${String(count)} ${directory}`).toThrow(/^commitManyPaths (?:needs a path count|directory must be a relative path)/u);
+    }
+    // Nothing was written or committed by any refusal.
+    expect(repo.head()).toBe(head);
+    expect(status()).toBe(before);
+    commitManyPaths(repo, 2, 'twice');
+    expect(() => commitManyPaths(repo, 2, 'twice')).toThrow(/directory already exists: twice/u);
+  });
+
+  it('bounds a quoted reason literal exactly: whole when it fits, cut on a code point with … when not (#393)', () => {
+    const fits = 'x'.repeat(REASON_EXCERPT_MAX_CHARS - 2);
+    expect(boundedForReason(fits)).toBe(JSON.stringify(fits));
+    expect(boundedForReason(`${fits}y`)).toBe(`"${'x'.repeat(REASON_EXCERPT_MAX_CHARS - 3)}…"`);
+    expect(boundedForReason(`${fits}y`)).toHaveLength(REASON_EXCERPT_MAX_CHARS);
+    // Escapes count at their escaped width and are never split.
+    const escaped = boundedForReason('\u0001'.repeat(100));
+    expect(escaped.length).toBeLessThanOrEqual(REASON_EXCERPT_MAX_CHARS);
+    expect(escaped).toBe(`"${'\\u0001'.repeat(32)}…"`);
+    // An astral character is two units and is never cut in half.
+    for (const lead of ['', 'a']) {
+      const cut = boundedForReason(`${lead}${'\u{1F600}'.repeat(150)}`);
+      expect(cut.length, lead).toBeLessThanOrEqual(REASON_EXCERPT_MAX_CHARS);
+      expect(cut.endsWith('…"'), lead).toBe(true);
+      expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]|\\ud[89a-f]/iu.test(cut), lead).toBe(false);
+    }
+  });
+
+  it('refuses an unparseable or path-less git diff --raw record', () => {
+    const sha = 'a'.repeat(40);
+    const ok = parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${'b'.repeat(40)} M\0src/a.ts\0`));
+    expect([...ok.keys()]).toEqual(['src/a.ts']);
+    expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} short M\0src/a.ts\0`))).toThrow(/unparseable record/u);
+    expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${sha} M\0`))).toThrow(/record with no path/u);
+    expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${sha} M`))).toThrow(/record with no path/u);
+    // A record without its path refuses as such, before its status is judged.
+    expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${sha} U\0`))).toThrow(/^git diff --raw produced a record with no path$/u);
+    expect(() => parseRawChanges(Buffer.from([0x3a, 0xff, 0x00]))).toThrow(/not valid UTF-8/u);
+    // Only the trailing NUL's empty field is skipped: stray output and a
+    // repeated path fail closed instead of shrinking the reviewed unit.
+    expect(() => parseRawChanges(Buffer.from(`garbage\0:100644 100644 ${sha} ${'b'.repeat(40)} M\0src/a.ts\0`))).toThrow(/unexpected field outside a record/u);
+    expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${'b'.repeat(40)} M\0src/a.ts\0\0`))).toThrow(/unexpected field outside a record/u);
+    const record = `:100644 100644 ${sha} ${'b'.repeat(40)} M\0src/a.ts\0`;
+    expect(() => parseRawChanges(Buffer.from(record + record))).toThrow(/duplicate path: "src\/a\.ts"/u);
+    // Quoted repository text is bounded in the disclosed reason.
+    const long = `src/${'x'.repeat(400)}.ts`;
+    const longRecord = `:100644 100644 ${sha} ${'b'.repeat(40)} M\0${long}\0`;
+    const thrown = (bytes: Buffer): string => { try { parseRawChanges(bytes); return ''; } catch (error) { return String(error); } };
+    // Every quoting site bounds the literal, counting escape expansion.
+    // The quoted repository text is the message's LAST JSON literal.
+    const quoted = (message: string): string => [...message.matchAll(/"(?:[^"\\]|\\.)*"/gu)].at(-1)?.[0] ?? '';
+    for (const message of [
+      thrown(Buffer.from(longRecord + longRecord)),
+      thrown(Buffer.from(`${'x'.repeat(400)}\0${longRecord}`)),
+      thrown(Buffer.from(`${'\u0001'.repeat(400)}\0${longRecord}`)),
+      thrown(Buffer.from(`:100644 100644 ${sha} ${sha} U\0${long}\0`)),
+    ]) {
+      // Full to the bound, short of it only by less than one escape's width.
+      expect(quoted(message).length, message.slice(0, 80)).toBeLessThanOrEqual(REASON_EXCERPT_MAX_CHARS);
+      expect(quoted(message).length, message.slice(0, 80)).toBeGreaterThan(REASON_EXCERPT_MAX_CHARS - 6);
+      expect(quoted(message).endsWith('…"'), message.slice(0, 80)).toBe(true);
+    }
+    // A malformed header is unparseable, whatever letter it ends in.
+    expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} short R\0a.ts\0`))).toThrow(/unparseable record \(it looks like a rename\/copy record/u);
+    // Only A/D/M/T statuses are expected from a no-renames commit diff.
+    for (const status of ['U', 'X', 'B']) {
+      expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${sha} ${status}\0a.ts\0`)), status).toThrow(`unexpected status "${status}" for "a.ts"`);
+    }
+    // The hint reads the status FIELD: trailing junk keeps it, a stray field
+    // that merely ends in " R" does not earn it.
+    expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${sha} R100 junk\0a.ts\0b.ts\0`))).toThrow(/unparseable record \(it looks like a rename\/copy record/u);
+    expect(() => parseRawChanges(Buffer.from(`:100644 R\0a.ts\0`))).toThrow(/^git diff --raw produced an unparseable record$/u);
+    expect([...parseRawChanges(Buffer.from(`:100644 120000 ${sha} ${'b'.repeat(40)} T\0link\0`)).keys()]).toEqual(['link']);
+    // Rename/copy records (two paths) are refused by name, never misparsed.
+    expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${sha} R100\0old.ts\0new.ts\0`))).toThrow(/rename\/copy record/u);
+    expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${sha} C75\0a.ts\0b.ts\0`))).toThrow(/rename\/copy record/u);
+  });
+});
+
 describe('integration scope: same-head adopted base and identical base adoption', () => {
   it('retains coverage (no whole reset) when an unchanged candidate adopts a descendant base', () => {
     const repo = makeFixtureRepo('perkins-same-head-adopted');
@@ -928,6 +1080,46 @@ describe('review scope planning (final whole pass at a READY candidate)', () => 
     });
     expect(integrated.scope).toBe('integration');
     expect(integrated.reason).toContain('prior coverage retained');
+  });
+
+  it('bounds the partial-coverage chain: a moved base after a partial integration READY reviews whole (#397)', () => {
+    const integratedForward = {
+      currentTargetSha: 'c'.repeat(40), currentDiffBaseSha: 'e'.repeat(40), integrationCoverage: true,
+      integrationLineage: { baseAdvanced: true, featureIntegrated: true, commonBasePinned: true, sameHeadAdoptedBase: false },
+    } as const;
+    // The designed first step: a partial (delta) READY whose base then moves
+    // runs ONE integration round (its READY chains the final whole pass).
+    expect(scope(meta({ reviewScope: 'delta', canonicalVerdict: 'READY TO MERGE' }), integratedForward).scope).toBe('integration');
+    // That integration READY was still partial and the candidate moved on
+    // before the pass ran: the next base move reviews whole, never another
+    // partial integration round that would owe the pass again.
+    const bounded = scope(meta({ reviewScope: 'integration', canonicalVerdict: 'READY TO MERGE' }), integratedForward);
+    expect(bounded.scope).toBe('whole');
+    expect(bounded.reason).toContain('still owes the final whole-change pass');
+    // Complete coverage, or an integration round that has not reached READY,
+    // keeps retaining coverage as before.
+    expect(scope({ ...meta({ reviewScope: 'integration', canonicalVerdict: 'READY TO MERGE' }), coverageComplete: true }, integratedForward).scope).toBe('integration');
+    expect(scope(meta({ reviewScope: 'integration', canonicalVerdict: 'NEEDS CHANGES' }), integratedForward).scope).toBe('integration');
+    // With the final whole pass disabled by policy there is no owed pass.
+    expect(scope(meta({ reviewScope: 'integration', canonicalVerdict: 'READY TO MERGE' }), { ...integratedForward, finalWholePassAtReady: false }).scope).toBe('integration');
+    // An UNCHANGED candidate adopting the new base would defer the owed pass
+    // just the same: the bound covers it too.
+    const sameHead = { ...integratedForward, currentTargetSha: meta({}).targetSha,
+      integrationLineage: { baseAdvanced: true, featureIntegrated: true, commonBasePinned: false, sameHeadAdoptedBase: true } };
+    expect(scope(meta({ reviewScope: 'delta', canonicalVerdict: 'READY TO MERGE' }), sameHead).scope).toBe('integration');
+    const sameHeadBounded = scope(meta({ reviewScope: 'integration', canonicalVerdict: 'READY TO MERGE' }), sameHead);
+    expect(sameHeadBounded.scope).toBe('whole');
+    expect(sameHeadBounded.reason).toContain('still owes the final whole-change pass');
+    // The bound wins whatever the policy or lineage would otherwise say.
+    for (const variant of [{ integrationCoverage: false }, { integrationLineage: null }, { acceptanceCompatible: false }]) {
+      const bounded2 = scope(meta({ reviewScope: 'integration', canonicalVerdict: 'READY TO MERGE' }), { ...integratedForward, ...variant });
+      expect(bounded2.reason, JSON.stringify(variant)).toContain('still owes the final whole-change pass');
+    }
+    // Liveness: the bounded whole round records COMPLETE coverage whatever its
+    // verdict (the engine test "records whole-candidate coverage even when the
+    // whole round requests changes" pins that), so the next base move retains
+    // coverage instead of looping.
+    expect(scope({ ...meta({ reviewScope: 'whole', canonicalVerdict: 'NEEDS CHANGES' }), coverageComplete: true }, integratedForward).scope).toBe('integration');
   });
 
   it('falls back to whole when integration coverage is unsafe', () => {

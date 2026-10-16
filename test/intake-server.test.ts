@@ -393,9 +393,13 @@ it('refuses concrete unreviewed B with reviewed A current token and leaves zero 
   expect(h.ledger.listPipelineEntries()).toEqual([]); expect(h.dispatch).not.toHaveBeenCalled();
 });
 
-it('declares existing scoped paired-shell intake acceptance in CI', () => {
+it('declares the paired-shell intake acceptance in CI — inside the all-projects browser e2e run (#402)', () => {
   const ci = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
   expect(ci).toContain('run: npm run build:web');
   expect(ci).toContain('run: npx playwright install --with-deps chromium');
-  expect(ci).toMatch(/working-directory: web\s+run: npx playwright test --project=intake/u);
+  // An unfiltered run: every project, intake included, gates CI.
+  expect(ci).toMatch(/working-directory: web\s+run: npx playwright test --ignore-snapshots\n/u);
+  expect(ci).not.toMatch(/npx playwright test[^\n]*--project/u);
+  const playwright = readFileSync(new URL('../web/playwright.config.ts', import.meta.url), 'utf8');
+  expect(playwright).toMatch(/name: 'intake',\s+testMatch: 'intake\.spec\.ts'/u);
 });
