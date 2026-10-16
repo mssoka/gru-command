@@ -1798,13 +1798,23 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
       // A row that changes between the check and its disposal is refused by
       // the disposal's own re-check, the same typed way.
       const breaker = harness.notifications.post({ kind: 'supervision.breaker', routing: 'action-required', severity: 'error', title: 'Lane stopped' });
-      const db = (harness.api as unknown as { db: { prepare(sql: string): { run(...args: unknown[]): unknown } } }).db;
       consulted = 0;
-      changeDuringConsult = () => { db.prepare("UPDATE notifications SET routing = 'fyi' WHERE id = ?").run(breaker.id); };
+      changeDuringConsult = () => { harness.api.updateNotificationTriage(breaker.id, 'fyi', null); };
+      // The supervisor had already acted: the refusal says so and records it.
       expect(await postJson(harness.port, `/api/notifications/${encodeURIComponent(breaker.id)}/disposition`, 'board-test-token', { detail: 'raced' }))
-        .toMatchObject({ status: 409, body: { error: 'disposition_refused', code: 'disposition_refused', detail: expect.stringMatching(/only action-required notifications/u) } });
+        .toMatchObject({ status: 409, body: { error: 'disposition_refused', code: 'disposition_refused', rearm: 'accepted',
+          detail: expect.stringMatching(/only action-required notifications .* — the supervisor had already acted on it \(rearm: accepted\); the alert stays open: retriage or resolve it$/u) } });
       expect(consulted).toBe(1);
       expect(harness.api.getNotification(breaker.id)).toMatchObject({ resolvedAt: null });
+      expect(harness.api.listEvents({ limit: 50 }).filter((event) => event.kind === 'notification.disposition-refused-after-rearm').map((event) => event.payload))
+        .toEqual([{ id: breaker.id, rearm: 'accepted', refusal: expect.stringMatching(/only action-required notifications/u) }]);
+      changeDuringConsult = null;
+      // A resolved action-required row stays an idempotent retry.
+      const note = harness.notifications.post({ kind: 'job.note', routing: 'action-required', severity: 'info', title: 'handled' });
+      for (const attempt of ['first', 'retry']) {
+        expect(await postJson(harness.port, `/api/notifications/${encodeURIComponent(note.id)}/disposition`, 'board-test-token', { detail: attempt }), attempt)
+          .toMatchObject({ status: 200, body: { id: note.id, resolvedBy: 'gru' } });
+      }
       // The ledger helper applies the self-closing rule too (the route answers
       // that case earlier, as producer_resolved).
       const dream = harness.notifications.post({ kind: 'lessons.dream-failed', routing: 'action-required', severity: 'error', title: 'dream failed' });

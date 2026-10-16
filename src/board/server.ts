@@ -802,7 +802,7 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             // closed stop beside an alert left open.
             const refusal = !ownerFollowThrough && target !== null ? ledger.machineDispositionRefusal(id) : null;
             if (refusal !== null) {
-              json(res, 409, { error: 'disposition_refused', code: 'disposition_refused', detail: refusal });
+              json(res, 409, { error: 'disposition_refused', code: 'disposition_refused', rearm, detail: refusal });
               return;
             }
             if (!ownerFollowThrough && target !== null && target.resolvedAt === null) {
@@ -846,8 +846,17 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             } catch (error) {
               // The disposal re-checks in its own transaction: a row that
               // changed since the check above is refused the same typed way.
+              // If the supervisor had already acted on it (a retriage raced
+              // the consult), that is said and recorded, never hidden: the
+              // alert stays open for a person to retriage or resolve.
               if (!(error instanceof MachineDispositionRefusedError)) throw error;
-              json(res, 409, { error: 'disposition_refused', code: 'disposition_refused', detail: error.refusal });
+              if (rearm !== 'not_applicable') {
+                ledger.appendCustomEvent({ kind: 'notification.disposition-refused-after-rearm', payload: { id, rearm, refusal: error.refusal } });
+              }
+              json(res, 409, {
+                error: 'disposition_refused', code: 'disposition_refused', rearm,
+                detail: rearm === 'not_applicable' ? error.refusal : `${error.refusal} — the supervisor had already acted on it (rearm: ${rearm}); the alert stays open: retriage or resolve it`,
+              });
               return;
             }
             if (row === null) {

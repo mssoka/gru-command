@@ -3550,15 +3550,18 @@ export class Supervisor {
       return this.ledger.hasSupervisionStopSuperseded(notificationId) ? { ok: true, rearmed: false, superseded: true } : { ok: true, rearmed: false };
     } catch (error) {
       // Whether the alert is a breaker decides whether the lost answer
-      // matters; an unknown kind is treated as a breaker (fail closed).
+      // matters; a kind that cannot be read is treated as a breaker (fail
+      // closed). No alert at all has no stop whose answer could be lost.
       let breaker = true;
+      let kindFailure = '';
       try {
         breaker = this.ledger.getNotification(notificationId)?.kind === 'supervision.breaker';
       } catch (kindError) {
+        kindFailure = `; its alert kind could not be read either: ${String(kindError)}`;
         this.log('error', 'notification kind lookup failed after a failed closure lookup — treating it as a breaker alert', { notification_id: notificationId, error: String(kindError) });
       }
       if (onFailure === 'refuse' && breaker) {
-        return { ok: false, reason: `superseded closure lookup failed — retry the disposition: ${String(error)}` };
+        return { ok: false, reason: `superseded closure lookup failed — retry the disposition: ${String(error)}${kindFailure}` };
       }
       this.log(breaker ? 'error' : 'warn', 'superseded closure lookup failed — reporting a pure record', { notification_id: notificationId, breaker, error: String(error) });
       return { ok: true, rearmed: false };

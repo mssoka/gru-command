@@ -6122,9 +6122,14 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       expect(closures(rig)).toHaveLength(1);
       // A legacy closure with no agent or job conflicts by name, and the
       // FIRST recorded closure of an alert is the binding one.
+      // A closure naming no agent or job binds the alert with nothing to
+      // compare; one naming only its job still conflicts on that job.
       rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', payload: { notification_id: 'legacy' } });
-      expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: 'legacy' } }))
-        .toThrow(/already closed the stop of no agent on no job — not agent "a" on job "fenced-job"$/u);
+      expect(rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: 'legacy' } })).toBe(false);
+      rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', jobId: 'fenced-job', payload: { notification_id: 'job-only' } });
+      expect(rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: 'job-only' } })).toBe(false);
+      expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'other-job', payload: { notification_id: 'job-only' } }))
+        .toThrow(/already closed the stop of agent "null" on job "fenced-job" — not agent "a" on job "other-job"$/u);
       rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: 'first', jobId: 'fenced-job', payload: { notification_id: 'twice' } });
       rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: 'second', jobId: 'fenced-job', payload: { notification_id: 'twice' } });
       expect(rig.api.recordSupervisionStopSuperseded({ agentId: 'first', jobId: 'fenced-job', payload: { notification_id: 'twice' } })).toBe(false);
@@ -6169,10 +6174,11 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
         // An alert known not to be a breaker stays a pure record...
         const note = rig.center.post({ kind: 'job.note', routing: 'action-required', severity: 'info', title: 'not a breaker' });
         expect(rig.supervisor.onNotificationDisposed(note.id)).toEqual({ ok: true, rearmed: false });
-        // ...and one whose kind cannot be read is treated as a breaker: refused.
+        // ...and one whose kind cannot be read is treated as a breaker:
+        // refused, naming both failures.
         const kind = vi.spyOn(rig.api, 'getNotification').mockImplementation(() => { throw new Error('notifications unreadable'); });
         try {
-          expect(rig.supervisor.onNotificationDisposed(note.id)).toEqual({ ok: false, reason: 'superseded closure lookup failed — retry the disposition: Error: events unreadable' });
+          expect(rig.supervisor.onNotificationDisposed(note.id)).toEqual({ ok: false, reason: 'superseded closure lookup failed — retry the disposition: Error: events unreadable; its alert kind could not be read either: Error: notifications unreadable' });
         } finally {
           kind.mockRestore();
         }
