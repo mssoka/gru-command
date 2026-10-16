@@ -1,7 +1,7 @@
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { exec, execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { exec, execFileSync, spawnSync } from 'node:child_process';
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
 import { classifyReviewedRed, STATUS_ACTION_NAME } from '../tools/classify-scheduled-verification-red.mjs';
@@ -48,14 +48,14 @@ describe('reviewed-candidate behavioral RED custody', () => {
     const dir = mkdtempSync(join(tmpdir(), 'gru-missing-helper-'));
     try {
       // Exactly what the status test awaits, against a helper that is not there.
-      const rejection = await expect(promisify(exec)(`node "${join(dir, 'dist', 'verify', 'capture-cli.js')}" status --request-id existing`, { cwd: dir }))
+      const rejection = await expect(promisify(exec)(`"${process.execPath}" "${join(dir, 'dist', 'verify', 'capture-cli.js')}" status --request-id existing`, { cwd: dir }))
         .resolves.toMatchObject({ stdout: expect.stringContaining('existing') }).then(() => null, (error: unknown) => error as Error);
       expect(rejection).not.toBeNull();
       const message = rejection!.stack ?? String(rejection);
       // Vitest truncates the rejected value: no stderr, nothing that names
       // the missing module — so the report cannot tell setup from behavior,
       // and the generating scopes must exclude it (next test).
-      expect(message).toMatch(/^Error: promise rejected "Error: Command failed: node "/u);
+      expect(message).toMatch(/^Error: promise rejected "Error: Command failed: "/u);
       expect(message).not.toMatch(/Cannot find module|MODULE_NOT_FOUND/u);
       const titled = (name: string) => { const r = report(message); r.testResults[0]!.assertionResults[0]!.title = `review-2 ${name}`; return r; };
       expect(classifyReviewedRed(titled(STATUS_ACTION_NAME), 2, 'fast')).toEqual([`review-2 ${STATUS_ACTION_NAME}`]);
@@ -63,25 +63,60 @@ describe('reviewed-candidate behavioral RED custody', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it('the generating scopes cannot reach a missing compiled helper: they build it before any test runs (#358 exclusion evidence)', () => {
-    const root = join(import.meta.dirname, '..');
-    for (const script of ['tools/scheduled-verification-review-baseline.sh', 'tools/scheduled-verification-review2-baseline.sh']) {
-      const text = readFileSync(join(root, script), 'utf8');
-      const candidate = /^base=([0-9a-f]{40})$/mu.exec(text)?.[1];
+  const BASELINES = ['tools/scheduled-verification-review-baseline.sh', 'tools/scheduled-verification-review2-baseline.sh'] as const;
+  const repoRoot = join(import.meta.dirname, '..');
+
+  it('the generating scopes cannot reach a missing compiled helper: they build it in the snapshot and refuse when it is absent (#358 exclusion evidence)', () => {
+    // These two scripts generate every report the classifier judges (the
+    // review-8 runner never classifies RED; the retained classify scope reads
+    // the review-2 baseline's reports).
+    const shallow = execFileSync('git', ['-C', repoRoot, 'rev-parse', '--is-shallow-repository'], { encoding: 'utf8' }).trim();
+    if (shallow === 'true') throw new Error('fixture setup: this evidence reads pinned historical commits — fetch full history (git fetch --unshallow)');
+    for (const script of BASELINES) {
+      const lines = readFileSync(join(repoRoot, script), 'utf8').split('\n');
+      const at = (line: string): number => {
+        const index = lines.indexOf(line);
+        expect(index, `${script} has the line ${JSON.stringify(line)}`).toBeGreaterThan(0);
+        return index;
+      };
+      const candidate = /^base=([0-9a-f]{40})$/mu.exec(lines.join('\n'))?.[1];
       expect(candidate, `${script} names its reviewed candidate`).toBeDefined();
-      // The build runs under `set -e` (a failed build aborts the scope) and
-      // strictly before the first test run.
-      const strict = text.indexOf('\nset -e\n'); const build = text.indexOf('\nnpm run build\n');
-      const lenient = text.indexOf('\nset +e\n'); const firstRun = text.indexOf('\nnpx vitest run');
-      expect([strict, build, lenient, firstRun].every((at) => at > 0), script).toBe(true);
-      expect(strict < build && build < lenient && lenient < firstRun, `${script}: set -e, build, set +e, then tests`).toBe(true);
-      // The candidate carries the helper source the build compiles...
-      const show = (path: string) => execFileSync('git', ['-C', root, 'show', `${candidate!}:${path}`], { encoding: 'utf8' });
+      // Abort-on-error, into the snapshot, build, the helper must exist,
+      // and only then tests.
+      const order = [at('set -e'), at('cd "$d"'), at('npm run build'),
+        lines.findIndex((line) => line.startsWith('test -f dist/verify/capture-cli.js || {') && line.includes('exit 2')), at('set +e'),
+        lines.findIndex((line) => line.startsWith('npx vitest run'))];
+      expect(order.every((index) => index > 0), `${script}: ${JSON.stringify(order)}`).toBe(true);
+      expect([...order].sort((a, b) => a - b), `${script}: set -e, cd, build, helper guard, set +e, tests`).toEqual(order);
+      // The candidate carries the helper source the build compiles, and its
+      // policy names that helper inside the snapshot the build ran in.
+      const show = (path: string) => execFileSync('git', ['-C', repoRoot, 'show', `${candidate!}:${path}`], { encoding: 'utf8' });
       expect(() => show('src/verify/capture-cli.ts'), `${candidate!} carries the capture helper source`).not.toThrow();
-      // ...and its policy names that helper inside the snapshot the build ran in.
       expect(show('src/runtime/worker-verification-policy.ts')).toContain("join(PACKAGE_ROOT, 'dist/verify/capture-cli.js')");
       expect(show('src/bmad/runtime.ts')).toContain("export const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');");
     }
+  });
+
+  it('a clone without the pinned revisions is refused by name before anything is created (#358)', () => {
+    const empty = mkdtempSync(join(tmpdir(), 'gru-shallow-baseline-'));
+    try {
+      execFileSync('git', ['init', '-q', empty]);
+      for (const script of BASELINES) {
+        const before = readdirSync(tmpdir()).filter((name) => name.startsWith('gru-gh315-')).length;
+        const run = spawnSync('sh', [join(repoRoot, script)], { cwd: empty, encoding: 'utf8', env: { ...process.env, TMPDIR: tmpdir() } });
+        expect(run.status, script).toBe(2);
+        expect(run.stderr, script).toMatch(/^reviewed candidate [0-9a-f]{40} is not in this clone — fetch full history \(git fetch --unshallow\)$/mu);
+        expect(readdirSync(tmpdir()).filter((name) => name.startsWith('gru-gh315-')).length, `${script} created no snapshot`).toBe(before);
+      }
+    } finally { rmSync(empty, { recursive: true, force: true }); }
+  });
+
+  it('the status title the classifier allows is the real status regression\'s title', () => {
+    expect(readFileSync(join(repoRoot, 'test/worker-verification-policy.test.ts'), 'utf8')).toContain(`it('review-2 ${STATUS_ACTION_NAME}'`);
+    // A wrapped rejection is accepted only as Vitest renders it: nothing after "resolving" on its line.
+    const r = report('Error: promise rejected "Error: Command failed: x" instead of resolving (and more)');
+    r.testResults[0]!.assertionResults[0]!.title = `review-2 ${STATUS_ACTION_NAME}`;
+    expect(() => classifyReviewedRed(r, 2, 'fast')).toThrow(/non-behavioral/u);
   });
 
   it('rejects missing reports and missing collected suites', () => {
