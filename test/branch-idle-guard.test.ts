@@ -1550,6 +1550,41 @@ describe('branch-idle guard', () => {
     expect(findBusyLanes({ ledger, lanes, targetBranch: 'gru/marker-owner' })).toEqual([]);
   });
 
+  it('the fallback route runs the caller\'s final admission guard and re-proves the bound delivered head before any fallback work (#366)', async () => {
+    const repo = makeFixtureRepo('branch-idle-fallback-final-guard');
+    cleanupRepos.push(repo);
+    const h = await boot({ preflightFails: true });
+    try {
+      const lane = await createLaneJob(h, repo, { jobId: 'fallback-guard', status: 'delivered' });
+      const head = execFileSync('git', ['-C', lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'fallback-guard', payload: { sha: head } });
+      const fallbackEvents = () => h.ledger.listJobEvents('fallback-guard').filter((event) => event.kind === 'job.fallback-review');
+      // A hold/CI change that lands during the preflight await: the caller's
+      // last guard refuses on the fallback route exactly as on the native one.
+      let guarded = 0;
+      await expect(h.wave.requestReview({
+        jobId: 'fallback-guard',
+        finalAdmissionGuard: () => { guarded += 1; throw new Error('owner hold landed during the preflight'); },
+      })).rejects.toThrow(/owner hold landed during the preflight/);
+      expect(guarded).toBe(1);
+      expect(h.fallbackRuns).toHaveLength(0);
+      expect(fallbackEvents()).toEqual([]);
+      // A clean-abort head move during the preflight: the bound delivered
+      // head is re-proved before the fallback gate admits anything.
+      await expect(h.wave.requestReview({ jobId: 'fallback-guard', boundDeliveredSha: 'b'.repeat(40) }))
+        .rejects.toThrow(/bound delivered head moved during the fallback preflight/);
+      expect(h.fallbackRuns).toHaveLength(0);
+      expect(fallbackEvents()).toEqual([]);
+      // With the guard passing and the head still bound, the fallback gate admits.
+      const passed = joinJobEvent(h, 'fallback-guard', 'job.fallback-review', (event) => (event.payload as { phase?: string }).phase === 'pass');
+      await h.wave.requestReview({ jobId: 'fallback-guard', boundDeliveredSha: head, finalAdmissionGuard: () => {} });
+      await passed;
+      expect(h.fallbackRuns).toHaveLength(1);
+    } finally {
+      await h.close();
+    }
+  });
+
   it('force=true still admits the fallback gate on a failing pre-flight with a pending-marker fence', async () => {
     const repo = makeFixtureRepo('branch-idle-fallback-force');
     cleanupRepos.push(repo);

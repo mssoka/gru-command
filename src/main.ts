@@ -30,7 +30,7 @@ import { createReviewEscalationNotifier } from './dispatch/escalation-identity.j
 import { createStartupVerdictPoster } from './dispatch/perkins-github-app.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { SilasDriver, computeSilasDigest, consolidatedBlockersFor, supervisionLookup } from './dispatch/silas-driver.js';
-import { createSilasModelActionTool } from './dispatch/silas-model-action.js';
+import { spawnSilasWithActionTool } from './dispatch/silas-model-action.js';
 import { composeDeterministicPass, createSilasAutopilotHook } from './dispatch/silas-autopilot-pass.js';
 import { createSilasAutopilotOps } from './dispatch/silas-autopilot-ops.js';
 import { createProductionDeterministicPass } from './dispatch/durable-reconcile.js';
@@ -104,7 +104,7 @@ import {
   runRuntimeReviewPreflight,
 } from './dispatch/review-path.js';
 import { loadPerkinsPolicy } from './dispatch/perkins-review/policy.js';
-import type { AgentHandle, NativeAgentTool, SpawnOptions } from './runtime/types.js';
+import type { NativeAgentTool, SpawnOptions } from './runtime/types.js';
 import { serviceWorkflowAuthority } from './workflows/session.js';
 
 /** The process LISTENING on the configured instance port when it is not us
@@ -1327,28 +1327,14 @@ async function main(): Promise<number> {
     ? supervisorLive.declareSlot({
         id: 'silas-ops',
         role: 'silas',
-        spawn: (spawnOptions) => {
-          // Bind the model-action tool to THIS spawn's exact handle: `bound` is
-          // assigned when the spawn resolves, so a re-spawn gets its own tool
-          // bound to its own incarnation (never a late lookup of the current
-          // slot). The tool runs only during a live model turn.
-          let bound: AgentHandle | null = null;
-          const actionTool = createSilasModelActionTool({
-            getHandle: () => bound,
-            ledger,
-            digest: () => silasActionDigest(),
-            log: (level, msg, fields) => logger.log(level, msg, fields),
-          });
-          return registry
-            .spawn('silas', {
-              ...(spawnOptions ?? {}),
-              nativeTools: [...(spawnOptions?.nativeTools ?? []), actionTool],
-            })
-            .then((handle) => {
-              bound = handle;
-              return handle;
-            });
-        },
+        // Bound to THIS spawn's exact handle; the tool runs only during a
+        // live model turn (issue #243 H6).
+        spawn: (spawnOptions) => spawnSilasWithActionTool({
+          registry,
+          ledger,
+          digest: () => silasActionDigest(),
+          log: (level, msg, fields) => logger.log(level, msg, fields),
+        }, spawnOptions),
       })
     : null;
   const resolveIntakeRepos = createManagedRepoIntakeResolver(config.workspaceRoot, config.managedRepos);

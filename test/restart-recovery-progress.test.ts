@@ -13,7 +13,8 @@ import { SessionStore } from '../src/sessions/store.js';
 import { PiAgentHandle, PI_CAPABILITIES } from '../src/runtime/pi-adapter.js';
 import { ClaudeCodeHandle, CLAUDE_CODE_CAPABILITIES } from '../src/runtime/claude-adapter.js';
 import { inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveCompletion, recordDirectiveProducerCessation, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader } from '../src/runtime/directive-checkpoint.js';
-import { DirectiveProgressService, executeAcceptedDirective, settleNativeDirective, surfaceDirectiveRecovery } from '../src/dispatch/directive-progress.js';
+import { WorkerDisposalInProgressError } from '../src/runtime/registry.js';
+import { DirectiveProgressService, DirectivePromptRefusedError, executeAcceptedDirective, promptRefusalUnproven, settleNativeDirective, surfaceDirectiveRecovery } from '../src/dispatch/directive-progress.js';
 import { recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute } from '../src/dispatch/directive-recovery.js';
 import { reconcilePendingLegacyDirectives, reconcilePendingRebriefs, settleDirectivesFromEvidence } from '../src/dispatch/rebrief-recovery.js';
 import type { AgentHandle, SpawnOptions } from '../src/runtime/types.js';
@@ -855,6 +856,103 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     try { service.reconsider(); await service.settled(); expect(spawn).toHaveBeenCalledTimes(1); expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('dispatching'); }
     finally { await service.dispose(); }
   });
+
+  it('#364 an admission refusal before any prompt fails the request by name and releases the lane', async () => {
+    const f = await fixture();
+    await executeAcceptedDirective({ ...f.deps, beforeWriterSideEffect: () => { throw new DirectivePromptRefusedError('an owner hold covers this lane'); } }, f.intent.requestId);
+    expect(f.spawns).toEqual([]);
+    expect(f.ledger.getDirective(f.intent.requestId)).toMatchObject({ state: 'failed', failReason: 'refused before any prompt: an owner hold covers this lane' });
+  });
+
+  it('#364 an untyped fault in the admission re-check is no decision: the request stays live for reconciliation', async () => {
+    const f = await fixture();
+    await executeAcceptedDirective({ ...f.deps, beforeWriterSideEffect: () => { throw new Error('ledger read failed'); } }, f.intent.requestId);
+    expect(f.spawns).toEqual([]);
+    expect(f.ledger.getDirective(f.intent.requestId)?.state).not.toBe('failed');
+  });
+
+  /** A resident turn prepared its producer, then its prompt was refused by a
+   * disposal in progress; the FRESH boundary that follows is refused by the
+   * caller. Whether that is a no-effect depends on the prepared producer. */
+  async function refuseAfterPreparedResident(cessation: 'ceased' | 'unknown', admitted = false) {
+    const f = await fixture();
+    const resident = await f.registry.spawn('minion', { agentId: 'logical-minion' });
+    const disposing = async (_text: string, options?: { readonly directive?: { onAdmitted?(binding: never): void } }): Promise<never> => {
+      // The runtime reported the prompt ADMITTED before the disposal refused
+      // it (the fixture binding itself need not be valid: the report is the fact).
+      if (admitted) { try { options?.directive?.onAdmitted?.({} as never); } catch { /* fixture binding */ } }
+      throw new WorkerDisposalInProgressError();
+    };
+    Object.assign(resident, { prompt: disposing, promptWithVerdict: disposing, cessationEvidence: () => cessation });
+    let boundaries = 0;
+    await executeAcceptedDirective({ ...f.deps, beforeWriterSideEffect: () => {
+      boundaries += 1;
+      if (boundaries > 1) throw new DirectivePromptRefusedError('an owner hold landed');
+    } }, f.intent.requestId);
+    expect(boundaries, 'refused at the fresh boundary, after the resident one passed').toBe(2);
+    return f.ledger.getDirective(f.intent.requestId);
+  }
+  it('#364 a refusal beside a prepared producer that proved cessation fails the request by name', async () => {
+    expect(await refuseAfterPreparedResident('ceased')).toMatchObject({ state: 'failed', failReason: 'refused before any prompt: an owner hold landed' });
+  });
+  it('#364 a refusal after a native admission was bound stays live, saying why', async () => {
+    const row = await refuseAfterPreparedResident('ceased', true);
+    expect(row?.state).not.toBe('failed');
+    expect(row?.failReason).toContain('kept for reconciliation: a native admission was already bound');
+  });
+  it('#364 a refusal beside a prepared producer with unproven cessation stays live, saying why', async () => {
+    const row = await refuseAfterPreparedResident('unknown');
+    expect(row?.state).not.toBe('failed');
+    expect(row?.failReason).toContain('kept for reconciliation: prepared producer logical-minion has not proven cessation (unknown)');
+  });
+
+  const refusal = new DirectivePromptRefusedError('refused');
+  const prepared = (evidence: (() => 'ceased' | 'unknown') | undefined) => ({ id: 'minion-x', ...(evidence === undefined ? {} : { cessationEvidence: evidence }) });
+  const unproven = (input: Partial<Parameters<typeof promptRefusalUnproven>[0]>): string | null =>
+    promptRefusalUnproven({ error: refusal, failures: 1, admitted: false, prepared: undefined, ...input });
+  it('#364 no-effect proof: a lone refusal with no prepared producer is a no-effect', () => expect(unproven({})).toBeNull());
+  it('#364 no-effect proof: a prepared producer that proved cessation is a no-effect', () => expect(unproven({ prepared: prepared(() => 'ceased') })).toBeNull());
+  it('#364 no-effect proof: a prepared producer with unknown cessation is kept, by name', () =>
+    expect(unproven({ prepared: prepared(() => 'unknown') })).toBe('prepared producer minion-x has not proven cessation (unknown)'));
+  it('#364 no-effect proof: a prepared producer with no cessation evidence is kept', () =>
+    expect(unproven({ prepared: prepared(undefined) })).toMatch(/minion-x has not proven cessation \(no cessation evidence\)/u));
+  it('#364 no-effect proof: an unreadable cessation is unproven, never thrown', () =>
+    expect(unproven({ prepared: prepared(() => { throw new Error('lock unreadable'); }) })).toBe('prepared producer minion-x has not proven cessation (unreadable: "Error: lock unreadable")'));
+  it('#364 no-effect proof: an unreadable cessation is quoted bounded and line-safe, even when it cannot print', () => {
+    const long = unproven({ prepared: prepared(() => { throw new Error(`line one\nline two ${'x'.repeat(500)}`); }) })!;
+    expect(long).not.toContain('\n');
+    expect(long).toMatch(/\(unreadable: "Error: line one\\nline two x+…"\)$/u);
+    expect(long.length).toBeLessThan(300);
+    const literal = (message: string): string => /\(unreadable: (".*")\)$/u.exec(unproven({ prepared: prepared(() => { throw new Error(message); }) })!)![1]!;
+    // Escaping can grow a character six-fold; the literal still stays within 200.
+    for (const message of ['\n'.repeat(500), '\u0001'.repeat(500), `${'x'.repeat(170)}${'😀'.repeat(40)}`]) {
+      const quoted = literal(message);
+      expect(quoted.length, JSON.stringify(message.slice(0, 4))).toBeLessThanOrEqual(200);
+      expect(quoted.endsWith('…"')).toBe(true);
+      // Cut on a code point: no lone surrogate escape.
+      expect(quoted).not.toMatch(/\\ud[89ab]/u);
+      expect(() => JSON.parse(quoted)).not.toThrow();
+    }
+    // Line and paragraph separators, C1 controls and bidi overrides are escaped too.
+    expect(literal('a\u2028b\u2029c\u0085d\u202ee\u2066f')).toBe('"Error: a\\u2028b\\u2029c\\u0085d\\u202ee\\u2066f"');
+    // DEL, bidi and zero-width marks, the BOM and tag characters are escaped as well.
+    expect(literal('a\u007fb\u200ec\u061cd\u200be\ufefff\u{e0041}g')).toBe('"Error: a\\u007fb\\u200ec\\u061cd\\u200be\\ufefff\\udb40\\udc41g"');
+    // An empty message still names the error; an empty name reads as Error.
+    expect(literal('')).toBe('"Error"');
+    expect(unproven({ prepared: prepared(() => { throw Object.assign(new Error(''), { name: '' }); }) })).toBe('prepared producer minion-x has not proven cessation (unreadable: "Error")');
+    // A missing name reads as Error; a message that cannot print keeps the name.
+    expect(literal('m')).toBe('"Error: m"');
+    expect(unproven({ prepared: prepared(() => { throw Object.assign(new Error('m'), { name: undefined }); }) })).toBe('prepared producer minion-x has not proven cessation (unreadable: "Error: m")');
+    const silent = new TypeError('x'); Object.defineProperty(silent, 'message', { get() { throw new Error('no'); } });
+    expect(unproven({ prepared: prepared(() => { throw silent; }) })).toBe('prepared producer minion-x has not proven cessation (unreadable: "TypeError (its message cannot be printed)")');
+    // Private-use and unassigned code points are escaped too.
+    expect(literal('a\ue000b\u0378c')).toBe('"Error: a\\ue000b\\u0378c"');
+    const hostile = { toString() { throw new Error('no'); } };
+    expect(unproven({ prepared: prepared(() => { throw hostile; }) })).toBe('prepared producer minion-x has not proven cessation (unreadable: "an error that cannot be printed")');
+  });
+  it('#364 no-effect proof: a bound native admission is never a no-effect', () => expect(unproven({ admitted: true })).toMatch(/admission was already bound/u));
+  it('#364 no-effect proof: a refusal with a failed cleanup is kept', () => expect(unproven({ failures: 2 })).toMatch(/cleanup also failed/u));
+  it('#364 no-effect proof: any other error is not an admission refusal', () => expect(unproven({ error: new Error('x') })).toBe('not an admission refusal'));
 
   /** Before the physical prompt starts, the native target and the producer
    * start are COMMITTED: read back from a fresh connection to a consistent
