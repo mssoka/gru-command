@@ -63,23 +63,25 @@ export const BASELINE_TITLES = {
 
 const ASSERTION_HEAD = /^AssertionError: /u;
 const PROMISE_REPORT_HEAD = /^(?:AssertionError|Error): promise (?:resolved|rejected) .* instead of (?:rejecting|resolving)$/u;
-/** A V8 stack frame line (optionally `async`): `at <fn> (<location>)` whose
- * parenthesised location is a path or URL, an `eval at …` origin or a V8
- * token (`<anonymous>`, `index N`, `native`); a bare `at <absolute path or
- * URL>:line:col`; or `at <anonymous>`. A parenthesised location without
- * spaces counts as a frame even when it is relative or a non-file URL
- * (`test/helpers/h.ts:1:2`, `webpack-internal:///x.js:1:2`) — the runtime
- * never prints one here, so such a frame is judged UNLOCATABLE and refused
- * rather than dropped as prose. Indented prose in an assertion message —
- * `at least 3 (see notes.md:1:2)`, `at 12:30:15` — is not a frame. Lines are
- * bounded before matching, so a pathological line cannot backtrack. */
-const PATH_START = String.raw`(?:[a-z][a-z0-9+.-]*:\/\/|node:|[A-Za-z]:[\\/]|[\\/])`;
-const STACK_LINE = new RegExp(String.raw`^\s+at (?:async )?(?:\S.* \((?:${PATH_START}.*:\d+:\d+|[^()\s]+:\d+:\d+|eval at .*|<anonymous>|index \d+|native)\)|${PATH_START}.*:\d+:\d+|<anonymous>)$`, 'u');
-/** Longer lines are no V8 frame; they are never matched (bounded work). */
+/** A V8 stack frame line (optionally `async`): `at <fn> (<anything>:L:C)`
+ * or `at <fn> (<eval origin, V8 token>)`; a bare `at <absolute path or
+ * URL>:L:C`; or `at <anonymous>`. ANY parenthesised `…:L:C` location counts
+ * as a frame — relative, spaced or a non-file URL included — and one the
+ * classifier cannot judge refuses: fail closed. Indented prose that merely
+ * looks like one (`at least 3 (see notes.md:1:2)`) therefore refuses too;
+ * the remedy is to rephrase that assertion message, never to let a helper
+ * frame slip by. A bare `at 12:30:15` (no parentheses, no path) is prose. */
+const PATH_START = String.raw`(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/|node:|[A-Za-z]:[\\/]|[\\/])`;
+const STACK_LINE = new RegExp(String.raw`^\s+at (?:async )?(?:\S.* \((?:.*:\d+:\d+|eval at .*|<anonymous>|index \d+|native)\)|${PATH_START}.*:\d+:\d+|<anonymous>)$`, 'u');
+/** An indented line that opens like a frame. Past MAX_FRAME_LINE no line is
+ * matched (bounded work) — and a frame-opening line that long refuses. */
+const FRAME_OPENING = /^\s+at \S/u;
 const MAX_FRAME_LINE = 4096;
-const LOCATION = /^([a-z][a-z0-9+.-]*:\/\/)?(.+):\d+:\d+$/u;
+const LOCATION = /^([A-Za-z][A-Za-z0-9+.-]*:\/\/)?(.+):\d+:\d+$/u;
 /** A V8 token frame names no source location by design. */
 const TOKEN_FRAME = /^(?:<anonymous>|index \d+|native)$/u;
+/** Runtime-generated code (`new Function`, `vm` scripts) names no file. */
+const GENERATED_LOCATION = /^(?:<anonymous>|evalmachine\.<anonymous>):\d+:\d+$/u;
 /** A location as the absolute path it names, or undefined when it names
  * none it can be judged by. A file:// URL is decoded (an encoded
  * `test%2Fhelpers` is judged as the path it names) after its query or
@@ -95,7 +97,7 @@ function located(match) {
   let path;
   if (match[1] === undefined) {
     path = match[2];
-  } else if (match[1] === 'file://') {
+  } else if (match[1].toLowerCase() === 'file://') {
     try { path = decodeURIComponent(match[2].replace(/[?#].*$/u, '')); } catch { return undefined; }
     if (/^\/[A-Za-z]:\//u.test(path)) path = path.slice(1);
   } else {
@@ -129,7 +131,9 @@ function balancedFrom(text, start) {
 export function frameLocation(line) {
   const body = line.replace(/^\s+at /u, '').replace(/^async /u, '');
   if (TOKEN_FRAME.test(body)) return null;
-  const innermostEval = body.lastIndexOf('eval at ');
+  // Only a real eval frame (`eval (eval at …)`, or an `eval at …` origin) is
+  // read as one — never a path that merely contains the text.
+  const innermostEval = body.startsWith('eval at ') || body.includes('(eval at ') ? body.lastIndexOf('eval at ') : -1;
   if (innermostEval !== -1) {
     const origin = body.slice(innermostEval + 'eval at '.length);
     for (let index = origin.indexOf(' ('); index !== -1; index = origin.indexOf(' (', index + 1)) {
@@ -142,7 +146,7 @@ export function frameLocation(line) {
   if (body.endsWith(')')) {
     for (let index = body.indexOf(' ('); index !== -1; index = body.indexOf(' (', index + 1)) {
       const inner = body.slice(index + 2, -1);
-      if (TOKEN_FRAME.test(inner)) return null;
+      if (TOKEN_FRAME.test(inner) || GENERATED_LOCATION.test(inner)) return null;
       const location = located(LOCATION.exec(inner));
       if (location !== undefined) return location;
     }
@@ -165,6 +169,8 @@ export function isBehavioralAssertion(message) {
   if (typeof message !== 'string') return false;
   const [head = '', ...rest] = message.split(/\r?\n/u);
   if (!ASSERTION_HEAD.test(head) && !PROMISE_REPORT_HEAD.test(head)) return false;
+  // A frame-opening line too long to judge refuses (fail closed).
+  if (rest.some((line) => line.length > MAX_FRAME_LINE && FRAME_OPENING.test(line))) return false;
   const stack = rest.filter((line) => line.length <= MAX_FRAME_LINE && STACK_LINE.test(line));
   // A report without any stack frames is judged by its head alone.
   if (stack.length === 0) return true;

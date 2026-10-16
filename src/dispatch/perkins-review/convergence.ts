@@ -452,7 +452,10 @@ export function parseRawChanges(bytes: Buffer): Map<string, RawChange> {
     if (match === null) {
       throw new Error(`git diff --raw produced an unparseable record${RENAME_HEADER.test(header) ? ' (it looks like a rename/copy record: rename detection must stay disabled, --no-renames)' : ''}`);
     }
-    const [, oldMode, newMode, oldSha, newSha, status] = match as unknown as readonly [string, string, string, string, string, string];
+    const [, oldMode, newMode, oldSha, newSha, status] = match;
+    if (oldMode === undefined || newMode === undefined || oldSha === undefined || newSha === undefined || status === undefined) {
+      throw new Error('git diff --raw record parser lost a capture group — the header pattern changed');
+    }
     // Rename/copy records carry TWO paths: the caller disables rename
     // detection, so one here is unexpected output and fails closed by name.
     if (status === 'R' || status === 'C') {
