@@ -116,6 +116,19 @@ The host supplies iteration/shrink bounds to the reviewed property through
 that ignores those values is still bounded by the OS restrictions and wall
 clock, not by a claimed universal assertion-count monitor.
 
+**Authenticated runner report (#378).** Under `pool=threads` the code under
+test shares the process with Vitest's reporter, so stdout — and any file the
+sandbox let the run write — is writable by that code. The verdict therefore
+never comes from free stdout: the host passes a per-run 256-bit nonce on
+fd 3 only (never argv, environment or files), the host-owned config reads and
+closes fd 3 in the main thread before any test worker exists, and a framing
+reporter (Vitest's own JSON reporter) prints the report between
+`<nonce>:BEGIN` and `<nonce>:END`. The host parses exactly one such framed
+block; an unframed, duplicated or unterminated report is no report at all
+(`inconclusive`, never a pass). The approved plan's `--reporter=json` is
+fulfilled by that host reporter rather than passed as a CLI flag (a CLI
+reporter would replace it and print an unframed report).
+
 **Owner-defined trust boundary:** Seatbelt denials may return catchable
 `EPERM`/`EACCES`. A hostile runner that catches a denial and prints PASS can
 produce only an unqualified `runner-report-classification`, not product
@@ -181,8 +194,31 @@ installation permissions. Persisted JSON is audit material: it cannot recreate
 in-process execution, report, repair-directive or artifact-review authority.
 A new process must execute and qualify again.
 
-Repairs use the existing minion fix-directive router, with one-use allocations
-and at most three total attempts. Source movement across async boundaries,
+Repairs run as ordinary durable directive requests through the native
+directive path (admission, producer fences, settlement and recovery — the same
+path as every other directive), with one-use allocations and at most three
+total attempts. The repair directive is fixed host text with every value
+emitted as a line-safe JSON literal (newlines and quotes escaped, and every
+control, format — bidi, zero-width, soft hyphen, Arabic letter mark, tags —
+line/paragraph separator, variation selector and default-ignorable code
+point escaped; visible blanks are left alone); the sandbox-controlled
+minimized counterexample is labelled untrusted data, bounded to 4096 escaped
+characters on a code-point boundary and carried with its sha256, and the
+reviewed oracle files — at most eight, paths at most 512 characters — are
+each bounded the same way at 8192, under fixed keys (`path`, `sha256`,
+`content`, and `contentKeptCodePoints`/`contentTotalCodePoints` when cut), so
+no value can forge or hide a directive line and both sandbox-controlled and
+oracle text are bounded (the remaining values are the reviewed proposal's
+own fields, under its schema's limits) (#379).
+
+Escaping changes only how a value reads: JSON-parsing a literal gives back
+exactly the value. A value JSON cannot serialize (a BigInt, a cycle) is
+refused by name. The reviewer's evidence line obeys the same rules and is
+bounded at 16384 escaped characters; past that it carries an excerpt of the
+evidence's JSON text (`JSON.stringify`) with that text's length and sha256,
+which a holder of the result can recompute.
+
+Source movement across async boundaries,
 changed dependency/lock/adapter/oracle/budget identities, and deletion of an
 already-present frozen contract require requalification. Each repair validation
 uses both the retained seed and native shrink path, so passing only the random
@@ -192,7 +228,66 @@ recognized package/root lockfiles with a 2MiB per-file ceiling. Reviewed retenti
 keeps the original candidate counterexample (not a qualification control's) and
 preserves oracle bytes and adds a closed seed/path regression wrapper plus
 the actual minimized counterexample/replay audit file. Retention changes
-source bytes and invalidates prior review evidence.
+source bytes and invalidates prior review evidence; its files land in the live
+lane all-or-nothing (#380). A mid-way failure removes the files and exactly
+the parent directories it created. A file it overwrote is restored, bytes
+and mode, by renaming a re-created copy over it: read-only files included,
+a link swapped in at the target replaced and never written through, and the
+target path never without the original bytes. A file still on its own
+inode with its mode and bytes is left exactly as it was; one that cannot be
+checked is restored. A failed restore step removes its copy (and names the
+copy if even that fails), and every other file is still restored. An
+incomplete rollback fails loud with the original error and every cause.
+
+**Owner-service lifecycle (#380).** The owner HTTP service keeps campaigns
+process-local. At its retention cap (128), once the new proposal has
+validated, bound and been recorded, it evicts the oldest settled entry that
+owes no decision (the same job's first; never the entry being decided).
+Pending proposals, unresolved blockers and repairs awaiting their retention
+decision are never evicted (when only those remain, a new proposal is
+refused until they are decided). An eviction is audited
+(`owner-evicted-*.json` beside the entry's records) FIRST — before the new
+proposal leaves any record and before the entry leaves memory; a failed
+audit write evicts and records nothing and names the directory to fix. A
+proposal whose own record cannot be written withdraws the eviction record
+and anything under its own fresh directory; if that cleanup fails too, the
+refusal names exactly what is left to remove by hand. A failed eviction
+audit removes its own partial record. A later read of an evicted id
+by its own job says it was evicted (the last 1024
+evicted ids are remembered; an older one reads as unknown).
+Every campaign view carries
+`nextAction: { kind, detail }` with `kind` one of `decide-execute`,
+`decide-repair`, `decide-retain`, `propose-again` or `none`. A `failed` entry
+is terminal: if it started a repair directive, let that settle through
+ordinary reconciliation, then propose the reviewed campaign again for the
+current head. The candidate root
+is bound to the job's active managed lane; the qualification control roots
+(`knownBadRoot`, `healthyRoot`, `baselineRoot`) are owner-supplied paths
+accepted on the authenticated owner's word — they are read-only inputs,
+copied and executed only inside the sandbox, never written.
+
+**Bounded evidence (#377).** `max_output_bytes` is capped at 8 MiB per stream
+per run (lowered from 64 MiB: an existing config above it now fails to load
+with the named ceiling). Capture keeps one buffer per stream that grows only
+with the bytes actually kept, so a flood of tiny writes holds O(1) objects. A
+long-lived executor retains at most 1024 sealed receipts and 256 MiB of their
+WHOLE serialized size, evicting the least recently used first (a receipt a
+campaign is still resolving stays warm; evictions are counted in
+`retention()`); a completed run whose single receipt is larger than the
+bound is never issued and fails as `ReceiptRetentionError`, naming the run's
+outcome and the bound. An evicted receipt reference resolves to nothing, so
+every later consumer fails closed and requalifies. The per-check receipt
+digest and the pretty-printed artifact still serialize a whole receipt;
+with every receipt bounded, that cost is bounded too.
+
+**Authenticated runner report (#378).** The host-framed report needs the
+copied Vitest's own `dist/reporters.js`, a regular file (a directory or a
+link refuses, and the copy itself refuses any link out of the repository); a
+layout without it is refused by name (`unsupported-runner`) before the run. When a run
+yields no framed report, its outcome names every cause that applies (output
+cap reached before the frame closed, a failed host report channel) or, when
+neither does, that the run printed no single complete frame; stdout itself is
+never parsed for a verdict.
 
 `.github/workflows/property-contracts.yml` runs the bounded positive macOS
 campaign for PRs/manual runs and weekly scheduled campaigns, retaining replay

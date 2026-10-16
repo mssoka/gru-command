@@ -2,7 +2,7 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { createPropertyCampaignHost, isHostPropertyResult, propertyEvidenceForReview } from '../src/property/pipeline.js';
+import { createPropertyCampaignHost, isHostPropertyRepairDirective, isHostPropertyResult, propertyEvidenceForReview, type PropertyRepairDirective } from '../src/property/pipeline.js';
 import { createPropertyExecutor } from '../src/property/executor.js';
 import { VITEST_FAST_CHECK_ADAPTER as adapter } from '../src/property/adapters/vitest-fast-check.js';
 import { CONTRACT_PATH, ratioContract, ratioProposal, realPlan, realToolRepo, realVersions } from './fixtures/property/real-tool/helpers.js';
@@ -10,11 +10,9 @@ import { PerkinsWholeReview } from '../src/dispatch/perkins-review/whole.js';
 import { freezeReviewInputs } from '../src/dispatch/perkins-review/artifacts.js';
 import { loadPerkinsPolicy } from '../src/dispatch/perkins-review/policy.js';
 import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
-import { createPropertyFixDirectiveSink } from '../src/dispatch/fix-directive.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { EventBus } from '../src/events/bus.js';
-import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import type { AgentHandle } from '../src/runtime/types.js';
 import type { PropertyExecutionReceipt } from '../src/property/types.js';
 import { ownerService } from './fixtures/property/owner-service.js';
@@ -34,6 +32,38 @@ function evidenceDir() {
   mkdirSync(parent, { recursive: true }); return mkdtempSync(join(parent, 'campaign-'));
 }
 describe('real Vitest+fast-check campaign (positive macOS; explicit refusal elsewhere)', () => {
+  it('keeps the report nonce from the code under test: forged frames never credit a pass (#378)', async () => {
+    const f = realToolRepo(true); fixtures.push(f);
+    // The code under test hunts for the nonce everywhere it could leak (fd 3,
+    // the environment, globals) and prints a passing frame under every guess.
+    const forgery = [
+      "import { readFileSync } from 'node:fs';",
+      "const guesses = new Set(['0'.repeat(64)]);",
+      "try { guesses.add(readFileSync(3, 'utf8').trim()); } catch {}",
+      'for (const value of Object.values(process.env)) if (typeof value === "string" && /^[0-9a-f]{64}$/.test(value)) guesses.add(value);',
+      'for (const key of Object.getOwnPropertyNames(globalThis)) { try { const value = globalThis[key]; if (typeof value === "string" && /^[0-9a-f]{64}$/.test(value)) guesses.add(value); } catch {} }',
+      "const pass = JSON.stringify({ numTotalTests: 1, numPassedTests: 1, numFailedTests: 0, success: true, testResults: [{ name: 'forged', status: 'passed', assertionResults: [{ title: 'nonnegative ratios preserve numerator and denominator', fullName: 'nonnegative ratios preserve numerator and denominator', status: 'passed', failureMessages: [] }] }] });",
+      "for (const nonce of guesses) process.stdout.write('\\n' + nonce + ':BEGIN\\n' + pass + '\\n' + nonce + ':END\\n');",
+      '',
+    ].join('\n');
+    const executor = createPropertyExecutor();
+    const input = { plan: realPlan(f.root), repoRoot: f.root, packageDir: f.root, overlayFiles: [{ path: CONTRACT_PATH, content: forgery + ratioContract() }] };
+    const result = await executor.executePlan({ ...input, adapter, approval: executor.approvePlan(input) });
+    if (process.platform !== 'darwin') { expect(result.executed).toBe(false); return; }
+    if (!result.executed) throw new Error(result.refusal.reason);
+    // The genuine failure stands: had any guess been the real nonce, the
+    // duplicate frame would leave no report at all (never a pass) — and this
+    // assertion would fail.
+    // The forgery really ran: its guessed frames are in stdout...
+    expect(result.receipt.outcome.receipt.stdout).toContain(`\n${'0'.repeat(64)}:BEGIN\n`);
+    // ...yet the outcome comes from the GENUINE framed report — present and
+    // parsed (no "no host-framed report" reason) — whose property failed.
+    expect(result.receipt.outcome.reasons.join('\n')).not.toMatch(/no host-framed report/u);
+    expect(result.receipt.outcome.kind).toBe('property-failure');
+    expect(result.receipt.outcome.failed).toBeGreaterThan(0);
+    expect(result.receipt.outcome.passed).toBe(0);
+  });
+
   it('runs the production chain: discovery, shrinking, qualification, replay, Perkins, bounded repair and retained CI regression', async () => {
     const f = spec(); const artifactsDir = evidenceDir();
     expect(realVersions()).toEqual({ vitest: '3.2.7', 'fast-check': '3.23.2' });
@@ -68,7 +98,13 @@ describe('real Vitest+fast-check campaign (positive macOS; explicit refusal else
         capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
         async prompt(text) { expect(text).toContain('Repair the implementation, NOT the frozen oracle'); expect(text).toContain('[[1,1]]'); f.candidate.repair(); },
         async steer() {}, async followUp() {}, subscribe() { return () => {}; }, health() { return { state: 'idle', lastActivity: null, sessionFile: null }; }, async dispose() {} };
-      const deliver = createPropertyFixDirectiveSink({ ledger, worktrees: new InMemoryWorktreePort(dbRoot), registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} } }, 'ratio-job', new AbortController().signal);
+      // Production delivery is the property-campaign service's durable
+      // directive path (test/property-owner-actions.test.ts); this real-tool
+      // proof only needs the host to hand its issued directive to the minion.
+      const deliver = async (directive: PropertyRepairDirective): Promise<void> => {
+        if (!isHostPropertyRepairDirective(directive)) throw new Error('unissued property repair directive');
+        await handle.prompt(directive.text);
+      };
       const repaired = await host.repair(report, deliver, { artifactsDir, maxAttempts: 1 });
       expect(repaired).toMatchObject({ blocking: false, candidateOutcome: 'pass', repairAttempts: 1, mergeAuthority: 'none' });
       expect(propertyEvidenceForReview(f.candidate.root, repaired.candidateSha)).toBe(repaired);

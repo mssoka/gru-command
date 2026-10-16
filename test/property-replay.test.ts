@@ -5,7 +5,7 @@ import { createPropertyExecutor } from '../src/property/executor.js';
 import { VITEST_FAST_CHECK_ADAPTER as adapter } from '../src/property/adapters/vitest-fast-check.js';
 import { replayRetainedCounterexample } from '../src/property/replay.js';
 import { extractShrinkPath, retainedCounterexample } from '../src/property/receipts.js';
-import { FAILURE_RUNNER, scenarioRepo } from './fixtures/property/executor/helpers.js';
+import { FAILURE_RUNNER, scenarioRepo, REPORT_FRAME } from './fixtures/property/executor/helpers.js';
 const fixtures: ReturnType<typeof scenarioRepo>[] = [];
 afterEach(() => { for (const f of fixtures.splice(0)) f.cleanup(); });
 async function capture(script = FAILURE_RUNNER) {
@@ -34,7 +34,7 @@ describe('retained counterexample replay (fake unit controls, not real-tool proo
   it('retains complete bounded native replay data independently of the 400-byte display excerpt', async () => {
     const input = JSON.stringify(Array.from({ length: 1500 }, () => 1));
     const message = `${'display padding '.repeat(70)}\nProperty failed\n{ seed: 42, path: "0:1", endOnFailure: true }\nCounterexample: ${input}\nShrunk 1 time(s)`;
-    const script = `console.log(JSON.stringify({numTotalTests:1,numPassedTests:0,numFailedTests:1,numPendingTests:0,numTodoTests:0,success:false,testResults:[{name:process.cwd()+'/test/contract.test.ts',status:'failed',message:'',assertionResults:[{status:'failed',fullName:'contract',failureMessages:[${JSON.stringify(message)}]}]}]}));process.exitCode=1;`;
+    const script = `${REPORT_FRAME}__report(({numTotalTests:1,numPassedTests:0,numFailedTests:1,numPendingTests:0,numTodoTests:0,success:false,testResults:[{name:process.cwd()+'/test/contract.test.ts',status:'failed',message:'',assertionResults:[{status:'failed',fullName:'contract',failureMessages:[${JSON.stringify(message)}]}]}]}));process.exitCode=1;`;
     const r = await capture(script); if (r === null) return;
     expect(r.result.receipt.outcome.failures[0]!.messageExcerpt.length).toBeLessThanOrEqual(401);
     expect(r.result.receipt.counterexample).toMatchObject({ testIdentity: 'contract', minimizedInput: input, replay: { seed: '42', shrinkPath: ['0:1'], replaySupported: true } });
