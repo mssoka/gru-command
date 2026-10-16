@@ -2575,6 +2575,33 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       }
     });
 
+    it('a refused tool\'s deny is written before the turn ends, and a CLI that ignores SIGTERM is killed after the grace period', async () => {
+      const fx = fixture({ killGraceMs: 300 });
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const identity = identityFor('claude-stubborn');
+      process.env['CLAUDE_DOUBLE_TOOL_INPUT_DRIFT'] = '1';
+      process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
+      try {
+        // Without the escalation this CLI never exits and the prompt never settles.
+        await expect(handle.prompt('tool:Read follow it', { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } }))
+          .rejects.toThrow(/directive refused: native tool intent is not persisted/u);
+        // The CLI read the deny (it echoes what the host wrote) before it was killed.
+        expect(frames(handle.sessionFile!).some((frame) => frame['type'] === 'control_response' && JSON.stringify(frame).includes('"behavior":"deny"'))).toBe(true);
+      } finally {
+        delete process.env['CLAUDE_DOUBLE_TOOL_INPUT_DRIFT'];
+        delete process.env['CLAUDE_DOUBLE_IGNORE_TERM'];
+        await handle.dispose();
+      }
+    });
+
+    it('a CLI that dies before answering keeps its own diagnosis, not the missing echo', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      await expect(handle.prompt('crash right away', { directive: { identity: identityFor('claude-crash'), beforeAdmission: () => {}, onAdmitted: () => {} } }))
+        .rejects.toThrow(/claude ended via exit 2 without a result frame: double crash requested/u);
+      await handle.dispose();
+    });
+
     it('a changed authority manifest at the tool refuses it with a durable guard receipt', async () => {
       const fx = fixture();
       const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });

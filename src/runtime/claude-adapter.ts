@@ -2022,14 +2022,19 @@ export class ClaudeCodeHandle implements AgentHandle {
       let permissions: ClaudeVerificationPermissionChannel | undefined;
       let directivePermissions: ClaudeDirectivePermissionChannel | undefined;
       // A directive refusal ends the turn: no further effect is allowed.
+      let escalation: ReturnType<typeof setTimeout> | null = null;
       const abortTurn = (detail: string): void => {
         failTurn(detail);
-        try { child?.stdin?.end(); } catch { /* already closed */ }
-        try { child?.kill('SIGTERM'); } catch { /* already gone */ }
-        // A child that ignores SIGTERM is killed after the grace period.
-        const escalate = setTimeout(() => { try { child?.kill('SIGKILL'); } catch { /* already gone */ } }, params.killGraceMs);
-        escalate.unref();
-        child?.once('close', () => clearTimeout(escalate));
+        if (child === undefined || child.exitCode !== null || child.signalCode !== null) return;
+        try { child.stdin?.end(); } catch { /* already closed */ }
+        try { child.kill('SIGTERM'); } catch { /* already gone */ }
+        // A child that ignores SIGTERM is killed after the grace period (armed once).
+        if (escalation === null) {
+          const target = child;
+          escalation = setTimeout(() => { try { target.kill('SIGKILL'); } catch { /* already gone */ } }, params.killGraceMs);
+          escalation.unref();
+          target.once('close', () => { if (escalation !== null) clearTimeout(escalation); });
+        }
       };
       const handleFrame = (frame: StreamFrame): void => {
         if (turn !== null) {
@@ -2038,7 +2043,13 @@ export class ClaudeCodeHandle implements AgentHandle {
           // — with every frame before it — before that step reads it back.
           const gates = (frame['type'] === 'user' && frame['isReplay'] === true) || frame['type'] === 'control_request' || frame['type'] === 'result';
           const durable = !gates
-            ? new Promise<void>((resolveWritten) => { transcript.write(`${JSON.stringify(frame)}\n`, () => resolveWritten()); })
+            ? new Promise<void>((resolveWritten) => {
+              transcript.write(`${JSON.stringify(frame)}\n`, (error?: Error | null) => {
+                // A lost frame leaves the directive's record incomplete: no delivery.
+                if (error != null) this.failDirective(turn, new DirectiveCheckpointError(`directive transcript write failed: ${error.message}`), abortTurn);
+                resolveWritten();
+              });
+            })
             : new Promise<void>((resolveDurable, rejectDurable) => {
               transcript.write(`${JSON.stringify(frame)}\n`, (error?: Error | null) => {
                 if (error != null) { rejectDurable(error); return; }
@@ -2128,6 +2139,7 @@ export class ClaudeCodeHandle implements AgentHandle {
         // Synchronous spawn faults (async ENOENT arrives via 'error').
         this.onInfraError(error);
         failTurn(`claude process failed to spawn: ${String(error)}`);
+        turn?.settings.dispose();
         transcript.end(() => settle(new Error(failure)));
         return;
       }
@@ -2144,6 +2156,7 @@ export class ClaudeCodeHandle implements AgentHandle {
         this.onInfraError(error);
         failTurn(`claude process failed to spawn: ${String(error)}`);
         parser.end();
+        turn?.settings.dispose();
         transcript.end(() => settle(new Error(failure)));
       });
       child.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
@@ -2166,7 +2179,7 @@ export class ClaudeCodeHandle implements AgentHandle {
         if (turn !== null && turn.failure !== null && !failed) {
           failTurn(`directive turn refused: ${turn.failure instanceof Error ? turn.failure.message : String(turn.failure)}`);
         }
-        if (turn !== null && turn.admitted === null && !failed) {
+        if (turn !== null && turn.admitted === null && !failed && translator.result !== null) {
           failTurn('directive turn ended without the CLI\'s admission echo; nothing it did counts as delivered');
         }
         const result = translator.result;

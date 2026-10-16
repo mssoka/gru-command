@@ -170,11 +170,11 @@ writes each runtime's own record shape during a resumed turn.
   directive is never resumed or replayed …" and "a service that died
   mid-directive …").
 - **Directive sessions.** A Claude Code transcript starts with a GC session
-  header (session id and cwd), which directive admission binds. Two kinds of
-  Claude session refuse a directive or a re-brief by name before anything is
-  bound (both resume the minion's own session):
-  - one started before the header existed: the minion's next new session has
-    it;
+  header (session id and cwd), which directive admission binds. A directive
+  and a re-brief both run in the minion's recorded session, so two kinds of
+  Claude session refuse them by name before anything is bound:
+  - one started before the header existed (every session GC starts from now
+    on has it);
   - one that loads ambient MCP tools (`[runtimes.claude-code] mcp`). This is
     intentional: the host fences every tool it lists, and it cannot list tools
     it does not know.

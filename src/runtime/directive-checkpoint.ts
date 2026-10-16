@@ -381,7 +381,10 @@ function claudeTurn(file: string, binding: DirectiveNativeBinding): { readonly f
     return { refused: 'the native transcript before the directive changed' };
   }
   try { claudeHeader(text, binding.sessionId); }
-  catch (error) { return { refused: error instanceof Error ? error.message : String(error) }; }
+  catch (error) {
+    if (!(error instanceof DirectiveCheckpointError)) throw error;
+    return { refused: error.message };
+  }
   const lines = bytes.subarray(length).toString('utf8').split('\n');
   lines.pop(); // a partial tail cannot undo an accepted prefix
   const frames: ClaudeFrame[] = [];

@@ -1,11 +1,11 @@
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import type { ChildProcess } from 'node:child_process';
-import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { ClaudeDirectivePermissionChannel, type ClaudeToolDecision, type ClaudeToolRequest } from '../src/runtime/claude-directive.js';
+import { ClaudeDirectivePermissionChannel, privateClaudeDirectiveSettings, type ClaudeToolDecision, type ClaudeToolRequest } from '../src/runtime/claude-directive.js';
 import { assertClaudeDirectiveToolIntent, inspectDirectiveCheckpoint, prepareClaudeDirectiveBinding, type DirectiveTurnIdentity } from '../src/runtime/directive-checkpoint.js';
 import { workerVerificationRefusal, type WorkerVerificationPolicy } from '../src/runtime/worker-verification-policy.js';
 
@@ -160,9 +160,34 @@ describe('the Claude directive checkpoint (#424)', () => {
     expect(() => assertClaudeDirectiveToolIntent(turn([init, echo, use('t1'), use('t1')]), identity, 't1', 'Read', { file_path: '/x' })).toThrow(/ambiguous/u);
   });
 
+  it('a header that no longer names the session makes the checkpoint unknown, never a throw', () => {
+    const file = turn([init, echo, done]);
+    const [, ...rest] = readFileSync(file, 'utf8').split('\n');
+    writeFileSync(file, [JSON.stringify({ type: 'session', version: 1, id: 'another-session', cwd: '/elsewhere', runtime: 'claude-code' }), ...rest].join('\n'));
+    // The prefix it was bound to changed too; either way: unknown, by name.
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'unknown' });
+  });
+
   it('a transcript with no GC session header binds nothing', () => {
     const legacy = turn([], false);
     expect(() => prepareClaudeDirectiveBinding({ identity, agentId: 'minion', sessionId: 'cli-session', sessionFile: legacy, content, authorityManifest: 'manifest' }))
       .toThrow(/no exact GC session header/u);
+  });
+});
+
+describe('directive turn settings (#424)', () => {
+  it('ask the host for every listed tool; a verification lane adds its Bash hook; the file is private', () => {
+    const plain = privateClaudeDirectiveSettings(['Read', 'Bash', 'Edit']);
+    try {
+      expect(JSON.parse(readFileSync(plain.file, 'utf8'))).toEqual({ permissions: { ask: ['Read', 'Bash', 'Edit'] } });
+      expect(statSync(plain.file).mode & 0o077).toBe(0);
+    } finally { plain.dispose(); }
+    const policy: WorkerVerificationPolicy = { jobId: 'job', laneId: 'lane', cwd: '/lane', scopes: ['full'], producerPrefixes: [['npm', 'test']], helper: 'gc-verify', configFile: '/config.toml' };
+    const lane = privateClaudeDirectiveSettings(['Read', 'Bash'], policy);
+    try {
+      const settings = JSON.parse(readFileSync(lane.file, 'utf8')) as { permissions: { ask: string[] }; hooks: { PreToolUse: { matcher: string }[] } };
+      expect(settings.permissions.ask).toEqual(['Read', 'Bash']);
+      expect(settings.hooks.PreToolUse.map((hook) => hook.matcher)).toEqual(['Bash']);
+    } finally { lane.dispose(); }
   });
 });
