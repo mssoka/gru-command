@@ -204,11 +204,21 @@ describe('observeBlindSessionAccess — repeated scans count distinct reads (iss
     const sha256 = (text: string): string => createHash('sha256').update(text).digest('hex');
     expect(blindSessionIdentity(gone)).toBe(sha256(join(realpathSync(tmpdir()), `gru-gone-${String(process.pid)}`, 'session.jsonl')));
     // Any failure other than absence is raised, never papered over.
-    const loop = join(realpathSync(mkdtempSync(join(tmpdir(), 'blind-loop-'))), 'loop');
+    const loopDir = realpathSync(mkdtempSync(join(tmpdir(), 'blind-loop-')));
     try {
+      const loop = join(loopDir, 'loop');
       symlinkSync(loop, loop);
       expect(() => blindSessionIdentity(join(loop, 'a.jsonl'))).toThrow(/ELOOP/u);
-    } finally { rmSync(join(loop, '..'), { recursive: true, force: true }); }
+      // Under a regular file (ENOTDIR) the path is the file's canonical path plus the name.
+      writeFileSync(join(loopDir, 'plain'), '');
+      expect(blindSessionIdentity(join(loopDir, 'plain', 'a.jsonl'))).toBe(sha256(join(loopDir, 'plain', 'a.jsonl')));
+      // A transcript reached through a link keeps the target's identity once the target is gone.
+      writeFileSync(join(loopDir, 'target.jsonl'), '');
+      symlinkSync(join(loopDir, 'target.jsonl'), join(loopDir, 'link.jsonl'));
+      const living = blindSessionIdentity(join(loopDir, 'link.jsonl'));
+      rmSync(join(loopDir, 'target.jsonl'));
+      expect(blindSessionIdentity(join(loopDir, 'link.jsonl'))).toBe(living);
+    } finally { rmSync(loopDir, { recursive: true, force: true }); }
     // Gone through a linked directory: the same identity it had while it existed.
     const dir = realpathSync(mkdtempSync(join(tmpdir(), 'blind-gone-')));
     try {
@@ -248,6 +258,7 @@ describe('observeBlindSessionAccess — repeated scans count distinct reads (iss
     const spy = vi.spyOn(db, 'prepare').mockImplementation(() => { throw busy; });
     try {
       expect(() => h.ledger.countJobEventsAndDistinctArrayEntries('job-corrupt', BLIND_ACCESS_EVENT, 'prohibited', keys)).toThrow(busy);
+      expect(spy).toHaveBeenCalled();
     } finally { spy.mockRestore(); }
     h.dispose();
   });

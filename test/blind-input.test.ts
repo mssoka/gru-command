@@ -344,9 +344,13 @@ describe('observed reviewer access — grep paths with spaces (#357)', () => {
       '6:/Users/John Smith/.env',
       '7:docs/issues/a.md',
     ]);
-    // A Windows-style spaced hit is judged as the same path.
-    expect(scanObservedAccess([{ index: 8, toolName: 'bash', text: '..\\other repo\\docs\\issues\\a.md:1:x' }], DEFAULT_BLIND_ISOLATION_RULE).map((p) => p.path))
-      .toEqual(['../other repo/docs/issues/a.md']);
+    // A Windows-style spaced hit is judged as the same path — a drive and a
+    // UNC share are outside by shape too.
+    expect(scanObservedAccess([
+      { index: 8, toolName: 'bash', text: '..\\other repo\\docs\\issues\\a.md:1:x' },
+      { index: 10, toolName: 'bash', text: 'C:\\Users\\a b\\notes.md:1:x' },
+      { index: 11, toolName: 'bash', text: '\\\\host\\my share\\f.md:1:x' },
+    ], DEFAULT_BLIND_ISOLATION_RULE).map((p) => p.path)).toEqual(['../other repo/docs/issues/a.md', 'C:/Users/a b/notes.md', '//host/my share/f.md']);
     // A lone `/word` or a `//host` URL in prose is no outside path.
     for (const text of ['ratio 3 /4:12:', 'run /help:5:', 'see //host/x y:1:', 'the dir /tmp/:1:']) {
       expect(scanObservedAccess([{ index: 9, toolName: 'bash', text }], DEFAULT_BLIND_ISOLATION_RULE), text).toEqual([]);
@@ -366,6 +370,16 @@ describe('observed reviewer access — grep paths with spaces (#357)', () => {
     expect(candidates.every((candidate) => candidate.path.length <= 4096)).toBe(true);
     expect(candidates.length).toBeLessThanOrEqual(2048);
     expect(candidates.map((candidate) => candidate.path)).toContain(deep);
+    // The window is exactly PATH_MAX: a 4096-character path is judged whole,
+    // a 4097-character one only by its suffixes.
+    const pathOf = (length: number): string => `docs/issues/${'d'.repeat(length - 'docs/issues/'.length - '.md'.length)}.md`;
+    for (const [length, whole] of [[4096, true], [4097, false]] as const) {
+      const paths = grepPathCandidates(`${'word '.repeat(2000)}${pathOf(length)}:1:x`).map((candidate) => candidate.path);
+      expect(paths.includes(pathOf(length)), String(length)).toBe(whole);
+    }
+    // The densest line still yields at most one candidate per two characters of the window.
+    expect(grepPathCandidates(`${'a '.repeat(5000)}x.md:1:x`).length).toBeLessThanOrEqual(2049);
+    expect(grepPathCandidates(`a b${'/a'.repeat(5000)}:1:x`).length).toBeLessThanOrEqual(2049);
     // Prose padding with no excluded suffix stays no hit.
     expect(scanObservedAccess([{ index: 2, toolName: 'bash', text: `${'word '.repeat(20_000)}done at 10:30:15` }], DEFAULT_BLIND_ISOLATION_RULE)).toEqual([]);
   });

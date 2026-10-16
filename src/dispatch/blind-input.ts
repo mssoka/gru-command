@@ -269,10 +269,12 @@ function extensionOf(path: string): string {
   return dot <= 0 ? '' : base.slice(dot).toLowerCase();
 }
 
-/** A path whose SHAPE alone puts it outside the package: empty, absolute,
- * a `..` segment or a NUL. Callers pass `/`-separated paths. */
-function outsidePackageShape(slashed: string): boolean {
-  return slashed === '' || slashed.startsWith('/') || /(^|\/)\.\.(\/|$)/u.test(slashed) || slashed.includes('\0');
+/** A path whose SHAPE alone puts it outside the package: empty, absolute
+ * (POSIX, a Windows drive or a UNC share), a `..` segment or a NUL — in
+ * either slash direction. */
+function outsidePackageShape(path: string): boolean {
+  const slashed = path.replace(/\\/gu, '/');
+  return slashed === '' || slashed.startsWith('/') || /^[A-Za-z]:\//u.test(slashed) || /(^|\/)\.\.(\/|$)/u.test(slashed) || slashed.includes('\0');
 }
 
 /** Why a package path is not admissible, or null when it is. */
@@ -597,9 +599,10 @@ export interface ProhibitedAccess {
 }
 
 /** A grep result line: `path:LINE:` (or `path:LINE-` context). The path may
- * contain spaces (#357) — it ends at the numeric line delimiter — but never
- * starts with whitespace (an indented stack frame is not a grep result). */
-const GREP_LINE = /^((?:\.\/)?[^\s:][^:\n]*):\d+[:-]/u;
+ * contain spaces (#357) — it ends at the numeric line delimiter — and may
+ * open with a Windows drive (`C:\`), but never starts with whitespace (an
+ * indented stack frame is not a grep result). */
+const GREP_LINE = /^((?:\.\/|[A-Za-z]:[\\/])?[^\s:][^:\n]*):\d+[:-]/u;
 
 /** No path is longer than PATH_MAX: a spaced grep line's candidates are the
  * word and component starts within its last this-many characters. The path
@@ -608,17 +611,23 @@ const GREP_LINE = /^((?:\.\/)?[^\s:][^:\n]*):\d+[:-]/u;
  * bounded. */
 const MAX_PATH_CHARS = 4096;
 /** A spaced candidate whose SHAPE may still classify it: its last path
- * component has no whitespace, and it is a parent path (`../x`) or an
- * absolute one naming at least a directory and a file — a real spaced path
- * (`/Users/a b/notes.md`, `/Users/a b/Makefile`), never prose or a clock
- * time whose words follow the last slash (`/var/log/app.log started at
- * 10`), a lone `/word` (`ratio 3 /4:12:`) or a `//host` URL. */
+ * component has no whitespace, and it is a parent path (`../x`), an
+ * absolute one naming at least a directory and a file (POSIX or a Windows
+ * drive), or a UNC share naming a host, a share and a file — a real spaced
+ * path (`/Users/a b/notes.md`, `C:/Users/a b/Makefile`), never prose or a
+ * clock time whose words follow the last slash (`/var/log/app.log started
+ * at 10`), a lone `/word` (`ratio 3 /4:12:`) or a bare `//host` URL. */
 function fileLikeOutside(candidate: string): boolean {
-  const lastSlash = candidate.lastIndexOf('/');
-  const last = candidate.slice(lastSlash + 1);
+  const parts = candidate.split('/');
+  const last = parts[parts.length - 1]!;
   if (last === '' || /\s/u.test(last)) return false;
   if (candidate.startsWith('../')) return true;
-  return candidate.startsWith('/') && candidate.indexOf('/', 1) > 1 && lastSlash > 0;
+  // A UNC share (`//host/share/…/file`) names a host, a share and a file.
+  if (candidate.startsWith('//')) return parts.length >= 5 && parts[2] !== '' && parts[3] !== '';
+  // A POSIX or drive-letter absolute path names a directory and a file.
+  if (candidate.startsWith('/')) return parts.length >= 3 && parts[1] !== '';
+  if (/^[A-Za-z]:\//u.test(candidate)) return parts.length >= 3 && parts[1] !== '';
+  return false;
 }
 
 /** The paths a tool-result line may name as a grep hit, each with whether

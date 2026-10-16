@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { readFileSync, realpathSync, statSync } from 'node:fs';
+import { lstatSync, readFileSync, readlinkSync, realpathSync, statSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import type { LedgerApi } from '../ledger/api.js';
 import {
@@ -363,7 +363,18 @@ function canonicalPathOf(path: string): string {
     const code = (error as NodeJS.ErrnoException).code;
     const parent = dirname(path);
     if ((code !== 'ENOENT' && code !== 'ENOTDIR') || parent === path) throw error;
-    return join(canonicalPathOf(parent), basename(path));
+    // A link whose target is gone names that target, as it did while the
+    // target existed.
+    const target = danglingLinkTarget(path);
+    return target === null ? join(canonicalPathOf(parent), basename(path)) : canonicalPathOf(target);
+  }
+}
+/** Where a symbolic link at `path` points, or null when there is none. */
+function danglingLinkTarget(path: string): string | null {
+  try {
+    return lstatSync(path).isSymbolicLink() ? resolve(dirname(path), readlinkSync(path)) : null;
+  } catch {
+    return null;
   }
 }
 

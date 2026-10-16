@@ -1510,9 +1510,10 @@ export class LedgerApi {
       )
       .get(jobId, kind, jobId, kind, jobId, kind, jobId, kind) as { events: number; malformedEvents: number; malformedEntries: number; distinctEntries: number };
     } catch (error) {
-      // Only a corrupt payload is named as one (SQLite's JSON errors); any
-      // other database failure (busy, closed) stays what it is.
-      if (!/malformed JSON|JSON cannot hold BLOB values|bad JSON path/iu.test(String(error))) throw error;
+      // Only a corrupt payload is named as one (SQLite's malformed-JSON
+      // error); any other failure — busy, closed, or a bad path, which is a
+      // query bug — stays what it is.
+      if (!/malformed JSON/iu.test(String(error))) throw error;
       throw new Error(`job "${jobId}" has a ${kind} event whose payload cannot be read as JSON (${String(error)}) — refusing to count; inspect the ledger`, { cause: error });
     }
     if (row.malformedEvents > 0 || row.malformedEntries > 0) {
