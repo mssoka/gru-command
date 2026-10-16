@@ -159,6 +159,12 @@ function lastUserPrompt(context: Context): {
 
 export type StubResponder = (prompt: string, callIndex: number) => StubTurn;
 
+/** A turn's fields that exclude each other, checked synchronously. */
+function assertStubTurn(turn: StubTurn): StubTurn {
+  if (turn.toolCall !== undefined && turn.toolCalls !== undefined) throw new Error('stub turn must not supply both toolCall and toolCalls');
+  return turn;
+}
+
 export class StubScript {
   private turns: StubTurn[];
   private readonly responder: StubResponder | null;
@@ -167,11 +173,14 @@ export class StubScript {
   constructor(turns: readonly StubTurn[] | StubResponder) {
     this.turns = typeof turns === 'function' ? [] : [...turns];
     this.responder = typeof turns === 'function' ? turns : null;
+    // A dishonest fixture fails where it is written (#363), never inside a
+    // detached producer whose rejection nothing observes.
+    for (const turn of this.turns) assertStubTurn(turn);
   }
 
   next(prompt: string, images: StubImage[] = []): StubTurn {
     this.calls.push({ prompt, imageCount: images.length, images, aborted: false });
-    return this.responder?.(prompt, this.calls.length - 1) ?? this.turns.shift() ?? { deltas: ['stub: ', 'ok'] };
+    return assertStubTurn(this.responder?.(prompt, this.calls.length - 1) ?? this.turns.shift() ?? { deltas: ['stub: ', 'ok'] });
   }
 }
 
@@ -219,7 +228,6 @@ export async function makeStubModelRuntime(
     const stream = new AssistantMessageEventStream();
     const text = turn.deltas.join('');
     void (async () => {
-      if (turn.toolCall !== undefined && turn.toolCalls !== undefined) throw new Error('stub turn must not supply both toolCall and toolCalls');
       const toolCalls = turn.toolCalls ?? (turn.toolCall === undefined ? [] : [turn.toolCall]);
       const isTool = toolCalls.length > 0;
       const final = makeMessage(

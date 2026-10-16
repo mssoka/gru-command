@@ -115,7 +115,11 @@ function assertDirectiveJobActive(ledger: DirectiveAdmissionLedger, jobId: strin
 }
 
 /** Positive routing proof: this invocation stopped at a guard before any
- * native spawn, preparation, prompt or cleanup operation was attempted. */
+ * native spawn, preparation, prompt, or cleanup with an unproven outcome
+ * was attempted. A fresh-session route may already have disposed a prior
+ * session whose cessation it positively proved (#363 S08-0-01): that prior
+ * is gone, and nothing of this request ran. A cleanup without that proof
+ * never ends in a deferral. */
 export class DirectiveDispatchDeferredError extends Error {
   constructor(readonly original: unknown) { super(`pre-native directive deferred: ${String(original)}`); this.name = 'DirectiveDispatchDeferredError'; }
 }

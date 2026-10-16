@@ -20,7 +20,12 @@ import { settleRetries, RetrySettlementUnavailableError, type PacingGate, type P
 import { WORKER_RULE_BLOCKS } from './worker-rules.js';
 import {
   assertLaneUsesBoundStore,
+  blobText,
+  changedPaths,
+  isAncestorCommit,
   renderReviewSourceBlock,
+  storeCommit,
+  targetBlob,
   type ReviewRequiredInput,
   type ReviewSourceBinding,
   type ReviewSourcePackage,
@@ -36,9 +41,75 @@ import {
   readSessionToolResults,
   recordBlindAdmission,
   recordObservedAccess,
+  renderBlindPackageBlock,
   type BlindCoverage,
 } from './blind-review.js';
-import type { BlindInputPackage, ObservedToolResult } from './blind-input.js';
+import { blindDiffSections, gitBlobSha, normalizeRepoPath, shownPath, shownWhere, type BlindInputPackage, type BlindViolation, type DiffHunk, type ObservedToolResult } from './blind-input.js';
+
+/** A file's lines as a diff counts them (a final newline ends the last). */
+function fileLines(text: string): readonly string[] {
+  const lines = text.split('\n');
+  if (lines.at(-1) === '') lines.pop();
+  return lines;
+}
+
+/** Whether a hunk side's lines are the file's own lines from `start`. */
+function hunkSideHolds(text: string | null, start: number, lines: readonly string[]): boolean {
+  if (lines.length === 0) return true;
+  if (text === null || start < 1) return false;
+  const file = fileLines(text);
+  return start - 1 + lines.length <= file.length && lines.every((line, at) => file[start - 1 + at] === line);
+}
+
+/** The selected object store's reading of a blind package (#360 R5-B2): it
+ * names the preflight-verified target and a base that is the target's own
+ * ancestor; every file is that target's own blob; every path its diff names
+ * is one `base..target` really changes; and every line a hunk shows is that
+ * file's own line where the hunk header says — removals and context at the
+ * base, additions and context at the target. Self-consistent digests alone
+ * bind nothing. */
+function bindBlindPackage(binding: ReviewSourceBinding): (pkg: BlindInputPackage) => readonly BlindViolation[] {
+  return (pkg) => {
+    const store = binding.objectStore;
+    const unbound = (where: string, detail: string): BlindViolation => ({ code: 'unbound-package', where, detail });
+    const target = storeCommit(store, pkg.targetSha);
+    if (target !== binding.targetSha) return [unbound('input_package.target_sha', `package target ${pkg.targetSha} is not the verified review target ${binding.targetSha}`)];
+    const violations: BlindViolation[] = [];
+    const base = storeCommit(store, pkg.baseSha);
+    const baseHolds = base !== null && isAncestorCommit(store, base, target);
+    if (base === null) violations.push(unbound('input_package.base_sha', `package base ${pkg.baseSha} is not in the object store`));
+    else if (!baseHolds) violations.push(unbound('input_package.base_sha', `package base ${pkg.baseSha} is not an ancestor of the review target ${target}`));
+    for (const file of pkg.files ?? []) {
+      const path = normalizeRepoPath(file.path);
+      const blob = targetBlob(store, target, path);
+      if (blob === null) violations.push(unbound(shownWhere(path), `${shownPath(path)} is not a file in the target tree`));
+      else if (blob !== gitBlobSha(file.content)) violations.push(unbound(shownWhere(path), `the bytes supplied for ${shownPath(path)} are not the target's blob ${blob}`));
+    }
+    if (pkg.diff !== undefined && base !== null && baseHolds) {
+      const changed = changedPaths(store, base, target);
+      if (changed === null) violations.push(unbound('diff', `the range ${pkg.baseSha}..${pkg.targetSha} cannot be read`));
+      else {
+        for (const section of blindDiffSections(pkg.diff.text)) {
+          const named = [...new Set([section.oldPath, section.path])].filter((path) => !changed.has(path));
+          for (const path of named) violations.push(unbound(shownWhere(path), `the diff names ${shownPath(path)}, which ${pkg.baseSha}..${pkg.targetSha} does not change`));
+          if (named.length > 0 || section.hunks.length === 0) continue;
+          const before = blobText(store, base, section.oldPath);
+          const after = blobText(store, target, section.path);
+          const side = (hunk: DiffHunk, old: boolean): string => old ? `-${String(hunk.oldStart)}` : `+${String(hunk.newStart)}`;
+          for (const hunk of section.hunks) {
+            if (!hunkSideHolds(before, hunk.oldStart, hunk.oldLines)) {
+              violations.push(unbound(shownWhere(section.oldPath), `the hunk at ${side(hunk, true)} shows lines that are not ${shownPath(section.oldPath)} at ${pkg.baseSha}`));
+            }
+            if (!hunkSideHolds(after, hunk.newStart, hunk.newLines)) {
+              violations.push(unbound(shownWhere(section.path), `the hunk at ${side(hunk, false)} shows lines that are not ${shownPath(section.path)} at ${pkg.targetSha}`));
+            }
+          }
+        }
+      }
+    }
+    return violations;
+  };
+}
 
 /**
  * Dispatch flow (EPICS E8 story 2; SPEC rulings 2/17/18): the Gru-authored
@@ -94,6 +165,9 @@ export interface DispatchServiceOptions {
    * selected object store). Absent = report reviews carry no source proof
    * and may not name a base, required inputs or a source package. */
   readonly reviewSource?: ReviewSourcePreflight;
+  /** #360 R5-B2: admit a blind input package with no preflight to bind it
+   * against. Test harnesses only; production always wires the preflight. */
+  readonly allowUnboundBlindPackages?: boolean;
   /** Issue #316: reads a finished blind reviewer's tool results from its
    * session file (default: the session jsonl on disk). null = unobservable. */
   readonly sessionToolResults?: (sessionFile: string | null) => readonly ObservedToolResult[] | null;
@@ -123,6 +197,8 @@ export function renderMinionBriefing(input: {
   deliverable?: JobDeliverable;
   /** Issue #317: the preflight-verified review source, bound verbatim. */
   reviewSource?: ReviewSourceBinding;
+  /** #360 R5-B3: an admitted blind reviewer's package — its input. */
+  blindPackage?: BlindInputPackage;
 }): string {
   const lessonsSection = renderLessonsSection(input.lessons ?? []);
   return [
@@ -135,6 +211,7 @@ export function renderMinionBriefing(input: {
     'BRIEFING:',
     input.briefing,
     ...(input.reviewSource === undefined ? [] : ['', ...renderReviewSourceBlock(input.reviewSource)]),
+    ...(input.blindPackage === undefined ? [] : ['', ...renderBlindPackageBlock(input.blindPackage)]),
     ...(lessonsSection === '' ? [] : ['', lessonsSection]),
     ...WORKER_RULE_BLOCKS.flatMap((block) => ['', block]),
     '',
@@ -285,6 +362,13 @@ export class DispatchService {
     if (namesSourceFields && this.opts.reviewSource === undefined) {
       throw new Error(`job "${input.jobId}": review source preflight is not wired — refusing to admit a review whose source cannot be proven`);
     }
+    // #360 R5-B2: a blind package is bound to the target's git objects by
+    // the preflight; without it the package is refused by name, unless the
+    // embedding explicitly admits unbound packages (test harnesses only).
+    if (input.deliverable === 'review' && input.inputPackage !== undefined && this.opts.reviewSource === undefined &&
+        this.opts.allowUnboundBlindPackages !== true) {
+      throw new Error(`job "${input.jobId}": review source preflight is not wired — refusing to admit a blind input package whose bytes cannot be bound to the target's git objects`);
+    }
     const reviewSource: ReviewSourceBinding | null =
       input.deliverable === 'review' && targetSha !== undefined && this.opts.reviewSource !== undefined
         ? this.opts.reviewSource({
@@ -315,11 +399,16 @@ export class DispatchService {
       reviewRole: input.reviewRole,
       briefing: input.briefing,
       targetRef: input.targetRef,
-      targetSha: input.targetSha,
+      // The resolved target (#360 R5-E3): already-owned coverage is recorded
+      // under it, so an abbreviated spelling can never split it.
+      targetSha: recordedTargetSha,
+      requestedTargetSha: input.targetSha,
       parentJobId: input.parentJobId,
       repoName,
       inputPackage: input.inputPackage,
       parentContractSha256: input.parentContractSha256,
+      requiredInputs: input.requiredInputs,
+      ...(reviewSource !== null ? { bindPackage: bindBlindPackage(reviewSource) } : {}),
     });
 
     // (1) The job row: the briefing IS the contract (recorded verbatim).
@@ -352,7 +441,7 @@ export class DispatchService {
       });
     }
 
-    if (blindAdmission !== null) recordBlindAdmission(this.opts.ledger, job.id, blindAdmission);
+    if (blindAdmission !== null) recordBlindAdmission(this.opts.ledger, job.id, blindAdmission, input.inputPackage);
 
     // (2) Ops handoff: dispatched → working, on the record.
     this.opts.ledger.appendCustomEvent({
@@ -669,6 +758,7 @@ export class DispatchService {
         briefing: input.briefing,
         ...(input.deliverable !== undefined ? { deliverable: input.deliverable } : {}),
         ...(reviewSource !== null ? { reviewSource } : {}),
+        ...(blindAdmission?.payload.role === 'blind' && input.inputPackage !== undefined ? { blindPackage: input.inputPackage } : {}),
         agentId: handle.id,
         ...(this.opts.parentTools !== undefined && this.opts.parentTools(handle.id).length > 0
           ? { childWorkerTools: true }
