@@ -4725,6 +4725,41 @@ it('actual Pi native resume refuses a reused native boot incarnation without rep
 it('actual Pi native resume refuses even a stale live original PID lock', () => assertStrictOriginalSdkLock('live'));
 it('actual Pi native resume refuses EPERM original PID evidence and preserves every ownership row', () => assertStrictOriginalSdkLock('eperm'));
 
+it('actual Pi native resume through the production registry reclaims the exact host-absent predecessor\'s surviving lock, without replaying anything (#363 S05-0-05, S05-2-01, S10-2-01)', async () => {
+  const f = await sdkDirectiveExecutionFixture([{ deltas: ['must never execute'] }]);
+  const seeded = await seedSdkUserCheckpoint(f); const file = seeded.original.sessionFile!;
+  const native = JSON.parse(readFileSync(`${file}.producers.jsonl`, 'utf8').trim().split('\n')[0]!) as { producer: import('../src/runtime/directive-checkpoint.js').DirectiveProducer };
+  const owner = { ...seeded.lockOwner, host: seeded.lockOwner.host ?? native.producer.host };
+  // A host that died wrote no cessation receipt: only its start remains in the journal.
+  const rows = readFileSync(`${file}.producers.jsonl`, 'utf8').trimEnd().split('\n');
+  writeFileSync(`${file}.producers.jsonl`, `${rows.filter((line) => (JSON.parse(line) as { state: string }).state !== 'ceased').join('\n')}\n`);
+  // The exact original owner's lock survives its host's exit.
+  const lock = { host: owner.host, pid: owner.pid, bootId: owner.bootId, acquiredAt: '2000-01-01T00:00:00.000Z', heartbeatAt: '2000-01-01T00:00:00.000Z' };
+  writeFileSync(`${file}.lock`, JSON.stringify(lock));
+  const bytes = readFileSync(file, 'utf8'); const journal = readFileSync(`${file}.producers.jsonl`, 'utf8');
+  const realKill = process.kill.bind(process);
+  // The original producer's PID is probed as gone (ESRCH): host-absent, not merely ceased.
+  const kill = vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+    if (signal === 0 && (pid === native.producer.pid || pid === owner.pid)) throw Object.assign(new Error('original host exited'), { code: 'ESRCH' });
+    return realKill(pid, signal);
+  });
+  try {
+    const { inspectDirectiveProducers } = await import('../src/runtime/directive-checkpoint.js');
+    expect(inspectDirectiveProducers(file, native.producer.identity).at(-1)).toMatchObject({ evidence: 'host-absent' });
+    // The exact journaled predecessor, its recorded lock owner included.
+    const handle = await f.registry.spawn('minion', { cwd: f.scene.lane.path, agentId: seeded.original.id, resumeFile: file,
+      directiveRecoveryProducer: native.producer });
+    try {
+      // Reclaimed: the store now holds the original session, and nothing was replayed.
+      expect(handle.sessionFile).toBe(file);
+      expect(f.fx.store.isHeld(file)).toBe(true);
+      expect(readFileSync(`${file}.lock`, 'utf8')).not.toBe(JSON.stringify(lock));
+      expect(readFileSync(file, 'utf8')).toBe(bytes); expect(readFileSync(`${file}.producers.jsonl`, 'utf8')).toBe(journal);
+      expect(f.fx.script.calls).toHaveLength(0);
+    } finally { await f.registry.disposeHandle(handle).catch(() => {}); }
+  } finally { kill.mockRestore(); rmSync(`${file}.lock`, { force: true }); await f.cleanup(); }
+});
+
 async function assertSdkRefusalJournalRetry(postCommit: boolean) {
   const checkpoint = await import('../src/runtime/directive-checkpoint.js');
   const { executeAcceptedDirective, DirectiveProgressService } = await import('../src/dispatch/directive-progress.js');
