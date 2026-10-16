@@ -257,6 +257,7 @@ function digest(partial: Partial<SilasOpsDigest> = {}): SilasOpsDigest {
     releaseEligible: [],
     revisionContinuations: [],
     verificationsOwed: [],
+    currentInspections: [],
     ...partial,
   };
 }

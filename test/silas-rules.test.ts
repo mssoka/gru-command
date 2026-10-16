@@ -25,6 +25,7 @@ const EXPECTED_RULE_IDS = [
   'verification-repair',
   'pr-conflict-rebase',
   'revision-continuation',
+  'current-inspection',
   'delivered-pr-register',
   'pr-review-trigger',
   'sweep-ack',

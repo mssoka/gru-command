@@ -407,6 +407,17 @@ service enforces the rest — you never decide it from a status:
   its own pass. While a verification is owed, the job gets no PR or review
   row, and review arms answer `409 branch_busy` with
   `verification_required_head`.
+- **`current-inspection` (owner decision 2026-10-16).** A
+  `currentInspections` row (job, the owed verification revision and/or the
+  pending contract revision) means the job's NEWEST delivery is history — a
+  completion recorded without proving a current candidate — while that
+  obligation remains. No verification, continuation or review row can name
+  its candidate. Inspect the lane's current head read-only, then send ONE
+  directive asking the minion to deliver its current candidate:
+  `POST /api/silas/directive {"job_id":"<job>","directive":"Deliver your current candidate ...","blocker_fingerprint":"current-inspection:<job>","rule_id":"current-inspection","request_id":"<stable-id>"}`.
+  The proven delivery then owes the ordinary verification (and any revision
+  continuation). If the lane has nothing to deliver, escalate to the chief.
+  The row never makes the job review-eligible: review arms stay busy.
 - **Approved changes supersede a running review.** Accepting a material
   amendment withdraws a queued round or cancels a running one and its
   specialists (settled checkpoints stay in the round artifacts; the round

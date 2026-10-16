@@ -582,6 +582,22 @@ export interface VerificationOwedRow {
   readonly head: string | null;
 }
 
+/** A job whose NEWEST delivery is history — a completion recorded without
+ * proving a current candidate — while an obligation remains: an unpaid
+ * corrective verification, or a pending contract revision (#361). No other
+ * row can name a candidate for it (review stays fenced, and the verification
+ * and continuation rows need a current delivery), so this is its follow-up
+ * surface: inspect the lane's current head and get a proven current
+ * delivery. It never restores review eligibility (owner decision 2026-10-16). */
+export interface CurrentInspectionRow {
+  readonly jobId: string;
+  readonly repo: string;
+  /** The unpaid corrective verification's revision, or null when none is owed. */
+  readonly verificationRevision: number | null;
+  /** The pending contract revision, or null when none is pending. */
+  readonly requiredRevision: number | null;
+}
+
 export interface SilasOpsDigest {
   readonly computedAt: string;
   readonly trigger: string;
@@ -597,6 +613,7 @@ export interface SilasOpsDigest {
   readonly releaseEligible: readonly ReleaseEligibleRow[];
   readonly revisionContinuations: readonly RevisionContinuationRow[];
   readonly verificationsOwed: readonly VerificationOwedRow[];
+  readonly currentInspections: readonly CurrentInspectionRow[];
 }
 
 /** Count of actionable rows (an empty digest never wakes, issue #243). */
@@ -613,7 +630,8 @@ export function digestActionCount(digest: SilasOpsDigest): number {
     digest.conflictingPrs.length +
     digest.releaseEligible.length +
     digest.revisionContinuations.length +
-    digest.verificationsOwed.length
+    digest.verificationsOwed.length +
+    digest.currentInspections.length
   );
 }
 
@@ -635,6 +653,7 @@ const DIGEST_ROW_CATEGORIES = [
   'releaseEligible',
   'revisionContinuations',
   'verificationsOwed',
+  'currentInspections',
 ] as const;
 
 export type DigestRowCategory = (typeof DIGEST_ROW_CATEGORIES)[number];
@@ -652,7 +671,8 @@ export type DigestRow =
   | ConflictingPrRow
   | ReleaseEligibleRow
   | RevisionContinuationRow
-  | VerificationOwedRow;
+  | VerificationOwedRow
+  | CurrentInspectionRow;
 
 /**
  * Decision-relevant projection of a digest row (issue #217): identity and
@@ -752,6 +772,10 @@ export function digestRowProjection(category: DigestRowCategory, row: DigestRow)
       const r = row as VerificationOwedRow;
       return { jobId: r.jobId, repo: r.repo, revision: r.revision, head: r.head };
     }
+    case 'currentInspections': {
+      const r = row as CurrentInspectionRow;
+      return { jobId: r.jobId, repo: r.repo, verificationRevision: r.verificationRevision, requiredRevision: r.requiredRevision };
+    }
   }
 }
 
@@ -784,6 +808,8 @@ export function digestRowKey(category: DigestRowCategory, row: DigestRow): strin
       return (row as RevisionContinuationRow).jobId;
     case 'verificationsOwed':
       return `${(row as VerificationOwedRow).jobId} ${(row as VerificationOwedRow).head ?? ''}`;
+    case 'currentInspections':
+      return (row as CurrentInspectionRow).jobId;
   }
 }
 
@@ -1250,6 +1276,23 @@ function verificationInFlight(ledger: DigestLedger, jobId: string): boolean {
   return ledger.hasUnsettledVerificationRun(jobId);
 }
 
+/** What a job whose newest delivery is history still owes (#361), or null:
+ * null when it has no delivery, when its newest delivery is a proven
+ * candidate (the ordinary rows own it), or when nothing remains owed. */
+function currentInspectionOwed(
+  ledger: DigestLedger,
+  job: Parameters<typeof pendingWorkRevision>[1],
+): Pick<CurrentInspectionRow, 'verificationRevision' | 'requiredRevision'> | null {
+  const newest = ledger.latestJobEvent(job.id, 'job.delivered');
+  if (newest === null) return null;
+  const candidate = ledger.latestCandidateDelivery(job.id);
+  if (candidate !== null && candidate.seq >= newest.seq) return null;
+  const debt = ledger.correctiveVerificationDebt(job.id);
+  const revision = pendingWorkRevision(ledger, job);
+  if (debt === null && revision === null) return null;
+  return { verificationRevision: debt?.revision ?? null, requiredRevision: revision?.required ?? null };
+}
+
 /** The one review-eligible status predicate, shared by candidate intake and
  * the publish-boundary recheck: only a live lane (`working`, `delivered`,
  * `in-review`) owes a review offer. A lane that slid to `blocked`/`parked`
@@ -1405,6 +1448,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     releaseEligible: ReleaseEligibleRow[];
     revisionContinuations: RevisionContinuationRow[];
     verificationsOwed: VerificationOwedRow[];
+    currentInspections: CurrentInspectionRow[];
   } = {
     computedAt: new Date(now()).toISOString(),
     trigger: input.trigger,
@@ -1420,6 +1464,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     releaseEligible: [],
     revisionContinuations: [],
     verificationsOwed: [],
+    currentInspections: [],
   };
   // One unresolved re-brief request fences the target: a marker exists while
   // a re-brief worker runs (or a restart-recovered request waits for boot
@@ -1544,6 +1589,15 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
         currentPhaseDelivered && !verificationInFlight(input.ledger, job.id)) {
       digest.verificationsOwed.push({ jobId: job.id, repo: job.repo, revision: verificationDebt.revision, head: verificationDebt.head });
     }
+    // (#361) A live lane whose newest delivery is history, with no delivery
+    // in its current phase, owes a CURRENT inspection: the continuation and
+    // verification rows above need a current delivery, so none can name its
+    // candidate (with one, they own the job and this row stays away). Review
+    // stays fenced; offered only while no writer owns the lane and no
+    // verification runs.
+    const inspection = reviewPending && !currentPhaseDelivered && !rebriefPending && !liveDirectiveOwns &&
+      !verificationInFlight(input.ledger, job.id) ? currentInspectionOwed(input.ledger, job) : null;
+    if (inspection !== null) digest.currentInspections.push({ jobId: job.id, repo: job.repo, ...inspection });
 
     // (1) Delivered, no PR yet. Only PR-owing lanes (deliverable
     // null/'pr', E19) belong here: a delivered review/artifact/
@@ -2144,6 +2198,13 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
           input.ledger.listPendingDirectives({ jobId: row.jobId, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
           input.ledger.listPendingRebriefs({ jobId: row.jobId }).length > 0) return false;
       return input.ledger.correctiveVerificationDebt(row.jobId) !== null;
+    }),
+    currentInspections: digest.currentInspections.filter((row) => {
+      if (!continuationAllowed(row) || !jobSeqUnchanged(row.jobId) || verificationInFlight(input.ledger, row.jobId) ||
+          input.ledger.listPendingDirectives({ jobId: row.jobId, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
+          input.ledger.listPendingRebriefs({ jobId: row.jobId }).length > 0) return false;
+      const job = input.ledger.getJob(row.jobId);
+      return job !== null && currentInspectionOwed(input.ledger, job) !== null;
     }),
     revisionContinuations: digest.revisionContinuations.filter((row) => {
       if (!continuationAllowed(row) || !jobSeqUnchanged(row.jobId) ||

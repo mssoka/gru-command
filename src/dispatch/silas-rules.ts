@@ -22,6 +22,7 @@ export type SilasActionRuleId =
   | 'verification-repair'
   | 'pr-conflict-rebase'
   | 'revision-continuation'
+  | 'current-inspection'
   | 'sweep-ack'
   | 'delivered-pr-register'
   | 'pr-review-trigger';
@@ -108,6 +109,17 @@ export const SILAS_RULES: readonly SilasRuleSpec[] = [
     summary:
       'ONE continuation directive with blocker_fingerprint contract-revision:<required>; the service attaches every pending ' +
       'amendment and stamps the revision, and the receipt carries rule_id.',
+  },
+  {
+    id: 'current-inspection',
+    kind: 'action',
+    firesOn:
+      'currentInspections row (the newest delivery is history — no proven current candidate — while a corrective ' +
+      'verification or a contract revision is still owed, no writer owns the lane and no verification runs)',
+    receipt: ['silas.directive-sent'],
+    summary:
+      'Inspect the lane head read-only, then ONE directive with blocker_fingerprint current-inspection:<job> asking the ' +
+      'minion to deliver its current candidate; the receipt carries rule_id. Review stays fenced throughout.',
   },
   {
     id: 'sweep-ack',
@@ -204,7 +216,7 @@ export const SILAS_RULE_ROUTES: Readonly<{
   pr: ReadonlySet<string>;
   review: ReadonlySet<string>;
 }> = {
-  directive: new Set(['verdict-rung-directive', 'verification-repair', 'pr-conflict-rebase', 'revision-continuation']),
+  directive: new Set(['verdict-rung-directive', 'verification-repair', 'pr-conflict-rebase', 'revision-continuation', 'current-inspection']),
   rebrief: new Set(['verdict-rung-rebrief']),
   escalate: new Set(['verdict-rung-escalate']),
   pr: new Set(['delivered-pr-register']),
