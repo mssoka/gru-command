@@ -1283,6 +1283,11 @@ test('settleTransitions finishes running transitions and names every culprit it 
   );
 
   // The pass bound itself must be a positive integer.
+  // Both ends of the bound are accepted (on a fresh, settled page).
+  await start();
+  await settleTransitions(page, 1);
+  await settleTransitions(page, 1000);
+  expect(await live()).toBe(0);
   for (const passes of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 1001]) {
     await expect(settleTransitions(page, passes), String(passes)).rejects.toThrow(/settleTransitions: passes must be an integer from 1 to 1000/u);
   }

@@ -368,7 +368,7 @@ interface HitTarget {
  * below). */
 async function hitTarget(page: Page, selector: string): Promise<HitTarget> {
   return page.evaluate((sel) => {
-    if (!(window.devicePixelRatio > 0)) throw new Error(`hitTarget: unusable devicePixelRatio ${String(window.devicePixelRatio)}`);
+    if (!Number.isFinite(window.devicePixelRatio) || window.devicePixelRatio <= 0) throw new Error(`hitTarget: unusable devicePixelRatio ${String(window.devicePixelRatio)}`);
     const element = document.querySelector<HTMLElement>(sel);
     if (element === null) return { found: false, inViewport: false, hit: false };
     const rect = element.getBoundingClientRect();
@@ -713,6 +713,8 @@ test.describe('compact owner-first board — synthetic geometry proof', () => {
       expect(await page.evaluate(() => [window.devicePixelRatio, window.innerWidth, window.innerHeight]), 'this proof runs at 2x in 400×300').toEqual([2, 400, 300]);
       // The boxes sit exactly where the CSS puts them (no device-pixel
       // snapping of the measured rects): the boundary under test is real.
+      // 0.25 is half a device pixel at 2x (exactly on the boundary); 0.3125
+      // is 1/16 px past it — both exact in layout units (1/64 px).
       expect(await page.evaluate(() => ['bottom-in', 'bottom-out', 'top-in', 'top-out', 'left-in', 'left-out', 'right-in', 'right-out'].map((id) => {
         const rect = document.getElementById(id)!.getBoundingClientRect();
         return { id, top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right };
@@ -735,10 +737,14 @@ test.describe('compact owner-first board — synthetic geometry proof', () => {
       for (const id of ['#bottom-out', '#top-out', '#left-out', '#right-out']) {
         expect(await hitTarget(page, id), id).toEqual({ found: true, inViewport: false, hit: true });
       }
-      // An unusable device pixel ratio fails loud — for a missing selector too.
-      await page.evaluate(() => { Object.defineProperty(window, 'devicePixelRatio', { value: 0, configurable: true }); });
-      for (const id of ['#bottom-in', '#missing']) {
-        await expect(hitTarget(page, id), id).rejects.toThrow(/hitTarget: unusable devicePixelRatio 0/u);
+      // An unusable device pixel ratio fails loud — zero, negative, NaN or
+      // infinite (which would silently zero the sliver) — for a missing
+      // selector too.
+      for (const ratio of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+        await page.evaluate((value) => { Object.defineProperty(window, 'devicePixelRatio', { value, configurable: true }); }, ratio);
+        for (const id of ['#bottom-in', '#missing']) {
+          await expect(hitTarget(page, id), `${String(ratio)} ${id}`).rejects.toThrow(`hitTarget: unusable devicePixelRatio ${String(ratio)}`);
+        }
       }
     } finally {
       await context.close();
