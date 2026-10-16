@@ -33,7 +33,7 @@ done
 ln -s "$root/node_modules" "$d/node_modules"
 printf '%s base=%s head=%s\n' "$d" "$base" "$headrev" > "$prep/formal-verdicts-rev3-baseline.last-snapshot.txt"
 cd "$d"
-for pair in "silas-driver.test.ts:174" "dispatch-server.test.ts:70"; do
+for pair in "silas-driver.test.ts:175" "dispatch-server.test.ts:70"; do
   file=${pair%%:*}
   expected=${pair##*:}
   registered=$(grep -oE '\bit\(|\bit\.skipIf\(' "test/$file" | wc -l | tr -d ' ')

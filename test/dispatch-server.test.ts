@@ -1222,6 +1222,16 @@ describe('dispatch server (E8)', () => {
         detail: expect.stringMatching(/no trusted no-spawn proof or owner marker; ownership is unknown/) } });
       expect(h.ledger.latestJobEvent('clean-abort', 'silas.review-triggered')).toBeNull();
       expect(h.ledger.listRounds('clean-abort')).toHaveLength(1);
+      // A later historical-only delivery naming another head is no candidate: the
+      // re-arm is still judged against the reviewed candidate's head (#363 S06-2-02).
+      // It passes that check and meets the lane's own fence — the historical
+      // delivery owes a current inspection, so review stays busy — never a
+      // changed-head refusal.
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'clean-abort', payload: { sha: 'b'.repeat(40), work_revision: 0, candidate_delivery_proven: false } });
+      const fenced = await call(h.port, 'POST', '/api/dispatch/review', body, TOKEN);
+      expect(fenced.status).toBe(409);
+      expect(fenced.json).toMatchObject({ error: 'branch_busy' });
+      expect(JSON.stringify(fenced.json)).not.toMatch(/unchanged delivered head/u);
     } finally { await h.close(); }
   }, 90_000);
 
