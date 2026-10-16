@@ -3424,6 +3424,13 @@ describe('Perkins r1 regressions', () => {
     }
   });
 
+  it('a stub turn supplying both toolCall and toolCalls is refused where it is written, never inside a detached stream (#363)', () => {
+    const call = { id: 'c1', name: 'bash', args: { command: 'ls' } };
+    expect(() => new StubScript([{ deltas: [], toolCall: call, toolCalls: [call] }])).toThrow(/must not supply both toolCall and toolCalls/);
+    const responder = new StubScript(() => ({ deltas: [], toolCall: call, toolCalls: [call] }));
+    expect(() => responder.next('prompt')).toThrow(/must not supply both toolCall and toolCalls/);
+  });
+
   it('N24: resumeFile outside the session store is refused', async () => {
     const fx = await fixture([]);
     await expect(

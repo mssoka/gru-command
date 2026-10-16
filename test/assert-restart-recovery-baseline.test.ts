@@ -1,5 +1,10 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Writable } from 'node:stream';
 import { describe, expect, it } from 'vitest';
 import { assertRestartRecoveryBaseline, BaselineRecoveryGateError } from '../tools/assert-restart-recovery-baseline.mjs';
+import { run } from '../tools/verify-restart-recovery-baseline.mjs';
 
 const testName = 'restart recovery records actual admission while the native prompt remains pending';
 const message = 'AssertionError: expected [] to have a length of 1 but got +0\n at /fixture/test/pi-adapter.test.ts:3287:24';
@@ -42,5 +47,24 @@ describe('restart recovery baseline assertion classifier', () => {
     expect(() => assertRestartRecoveryBaseline({ ...report(), numFailedTests: 0, numPassedTests: 1 }, input)).toThrow(BaselineRecoveryGateError);
     expect(() => assertRestartRecoveryBaseline(null, input)).toThrow(BaselineRecoveryGateError);
     expect(() => assertRestartRecoveryBaseline({ ...report(), testResults: [] }, input)).toThrow(BaselineRecoveryGateError);
+  });
+});
+
+describe('restart recovery baseline driver capture (#363 S09-0-02)', () => {
+  it('a capture write that fails stops the child and rejects the run by name — never an escaped throw', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-baseline-capture-'));
+    try {
+      // The log's parent is a file: every append fails with ENOTDIR.
+      writeFileSync(join(dir, 'not-a-directory'), '');
+      const log = join(dir, 'not-a-directory', 'complete-output.txt');
+      const quiet = (): Writable => new Writable({ write(_chunk, _encoding, done) { done(); } });
+      const started = Date.now();
+      // The child would run for a minute after its first output.
+      const outcome = await run(process.execPath, ['-e', "process.stdout.write('baseline output\\n'); setTimeout(() => {}, 60000);"], dir, log, [quiet(), quiet()])
+        .then((result: unknown) => ({ result }), (error: unknown) => ({ error }));
+      expect(outcome).toMatchObject({ error: expect.any(BaselineRecoveryGateError) });
+      expect(String((outcome as { error: unknown }).error)).toMatch(/complete output capture failed \(Error: ENOTDIR[^)]*\); the child was stopped — not behavioral RED/u);
+      expect(Date.now() - started).toBeLessThan(30_000);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

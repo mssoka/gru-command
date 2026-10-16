@@ -1005,6 +1005,27 @@ describe('re-brief restart safety (durable markers)', () => {
     expect(logged).toContainEqual(expect.objectContaining({ level: 'error', msg: 're-brief recovered but its recovery audit could not be recorded', fields: expect.objectContaining({ job: jobId }) }));
   });
 
+  it('a recovery card reused for a newer marker generation is refreshed in place: its id stays, its detail names the current marker (#363 S07-1-02)', async () => {
+    const h = makeHarness();
+    const jobId = 'card-refresh-job';
+    await seedPendingRebrief({ h, jobId });
+    const deps = { registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications };
+    await reconcilePendingRebriefs(deps, { limit: 100 });
+    const firstMarker = h.ledger.listPendingRebriefs({ jobId }).find((marker) => marker.kind === 'silas.rebrief')!;
+    const first = h.ledger.findNotificationByKind(`silas.rebrief-unreconciled.${jobId}`, 'active')!;
+    expect(first.detail).toContain(`/api/silas/rebriefs/${firstMarker.id}`);
+    // A newer request replaces the generation's marker ids.
+    h.ledger.beginPendingRebrief({ jobId, note: 'a newer correction', briefing: 'the original contract' });
+    const newerMarker = h.ledger.listPendingRebriefs({ jobId }).find((marker) => marker.kind === 'silas.rebrief')!;
+    expect(newerMarker.id).not.toBe(firstMarker.id);
+    await reconcilePendingRebriefs(deps, { limit: 100 });
+    const refreshed = h.ledger.findNotificationByKind(`silas.rebrief-unreconciled.${jobId}`, 'active')!;
+    expect(refreshed.id).toBe(first.id);
+    expect(refreshed.ackedAt).toBe(first.ackedAt);
+    expect(refreshed.detail).toContain(`/api/silas/rebriefs/${newerMarker.id}`);
+    expect(refreshed.detail).not.toContain(firstMarker.id);
+  });
+
   it('reconstructed report delivery opens its handback obligation atomically', async () => {
     const h = makeHarness(); const jobId = 'reconstructed-report-handback';
     try {

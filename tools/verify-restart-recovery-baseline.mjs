@@ -1,6 +1,6 @@
 import process from 'node:process';
 import console from 'node:console';
-import { URL } from 'node:url';
+import { URL, pathToFileURL } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -45,17 +45,36 @@ function admissionAssertionLine(file, test) {
   requireEvidence(matches.length === 1, 'selected regression must have one exact admission-length assertion');
   return file.getLineAndCharacterOfPosition(matches[0].getStart(file)).line + 1;
 }
-function run(command, args, cwd, log) {
+/** Run a child, teeing its complete output into `log`. A capture write that
+ * fails (ENOSPC, EIO) is no evidence: the child is stopped, its streams are
+ * released, and the run rejects once it has closed — never an escaped throw
+ * that skips the attempt's refusal manifest (#363 S09-0-02). */
+export function run(command, args, cwd, log, sinks = [process.stdout, process.stderr]) {
   return new Promise((resolveRun, reject) => {
     const child = spawn(command, args, { cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] });
-    for (const [stream, sink] of [[child.stdout, process.stdout], [child.stderr, process.stderr]]) {
-      stream.on('data', (bytes) => { appendFileSync(log, bytes); sink.write(bytes); });
+    let captureFailure = null;
+    for (const [stream, sink] of [[child.stdout, sinks[0]], [child.stderr, sinks[1]]]) {
+      stream.on('data', (bytes) => {
+        if (captureFailure !== null) return;
+        try { appendFileSync(log, bytes); } catch (error) {
+          captureFailure = error;
+          try { child.kill('SIGKILL'); } catch { /* already gone */ }
+          child.stdout.destroy();
+          child.stderr.destroy();
+          return;
+        }
+        sink.write(bytes);
+      });
     }
     child.once('error', reject);
-    child.once('close', (exitCode, signal) => resolveRun({ exitCode, signal }));
+    child.once('close', (exitCode, signal) => {
+      if (captureFailure !== null) reject(new BaselineRecoveryGateError(`complete output capture failed (${String(captureFailure)}); the child was stopped — not behavioral RED`));
+      else resolveRun({ exitCode, signal });
+    });
   });
 }
 
+async function main() {
 let attempt;
 let manifest = { version: 1, baselineSourceSha: BASELINE, testFile: TEST_FILE, testName: TEST_NAME, classification: 'unproven', startedAt: new Date().toISOString() };
 function save() {
@@ -134,3 +153,6 @@ try {
   console.error(`baseline proof refused: ${String(error)}; retained ${attempt ?? 'no attempt created'}`);
   process.exitCode = 2;
 }
+}
+
+if (process.argv[1] !== undefined && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) await main();

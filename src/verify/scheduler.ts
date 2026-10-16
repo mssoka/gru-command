@@ -1567,6 +1567,10 @@ export class VerificationScheduler {
         this.recordEvent(record);
         this.noStartSettled.add(runId);
         this.pendingNoStart.delete(runId);
+        // Published: the durable index answers it from here on, so the
+        // memory history keeps its bound (#363 S09-1-05).
+        this.boundRequestHistory();
+        this.persistBestEffort();
       } catch (error) {
         this.log('error', 'verification no-start persistence/publication failed; original identity retained for retry', { run: runId, error: String(error) });
       } finally { this.publishingNoStart.delete(runId); }
@@ -1612,12 +1616,20 @@ export class VerificationScheduler {
         completed_at: completedAt,
       });
     }
-    while (this.requestHistory.size > MAX_REQUEST_HISTORY) {
-      const oldest = this.requestHistory.keys().next().value;
-      if (oldest === undefined) break;
-      this.requestHistory.delete(oldest);
-    }
+    this.boundRequestHistory();
     this.persistBestEffort();
+  }
+
+  /** Keep at most MAX_REQUEST_HISTORY terminal entries in memory, oldest out
+   * first. An entry of a no-start whose publication is still pending stays:
+   * it is the only copy that retry can publish from. */
+  private boundRequestHistory(): void {
+    const pending = new Set([...this.pendingNoStart.values()].flatMap((record) => record.payload['request_ids'] as string[]));
+    for (const requestId of this.requestHistory.keys()) {
+      if (this.requestHistory.size <= MAX_REQUEST_HISTORY) break;
+      if (pending.has(requestId)) continue;
+      this.requestHistory.delete(requestId);
+    }
   }
 
   /** Load the append-only terminal identity index (torn tails skipped loud). */

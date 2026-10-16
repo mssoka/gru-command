@@ -217,6 +217,22 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       .toMatchObject({ idempotent: true });
   });
 
+  it('a directive recovery card reused for a later cause is refreshed in place, never left naming the older one (#363 S07-3-01)', async () => {
+    const f = await fixture();
+    surfaceDirectiveRecovery(f.deps, f.intent.requestId, 'first blocker: native admission unproven');
+    const first = f.ledger.findNotificationByKind(`silas.directive-unreconciled.${f.intent.requestId}`, 'active')!;
+    expect(first.detail).toContain('first blocker');
+    surfaceDirectiveRecovery(f.deps, f.intent.requestId, 'second blocker: producer ownership unknown');
+    const refreshed = f.ledger.findNotificationByKind(`silas.directive-unreconciled.${f.intent.requestId}`, 'active')!;
+    expect(refreshed.id).toBe(first.id);
+    expect(refreshed.ackedAt).toBe(first.ackedAt);
+    expect(refreshed.detail).toContain('second blocker');
+    expect(refreshed.detail).not.toContain('first blocker');
+    // A surface that cannot refresh a stale card says so by name.
+    expect(() => surfaceDirectiveRecovery({ ledger: f.ledger, notifications: { postIncident: (input) => f.notifications.postIncident(input) } }, f.intent.requestId, 'third blocker'))
+      .toThrow(/was reused with an older generation's detail, and this notifications surface cannot refresh it/);
+  });
+
   it('PR334 completion successful native truth prevents retirement before its ledger delivery', async () => {
     const f = await pr334CompletedOriginalWithRecoveryDebt();
     const original = f.ledger.getDirective(f.intent.requestId); const watermark = f.ledger.latestEventSeq();
@@ -502,7 +518,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     f.seed(); f.native.finish();
     const completed = inspectDirectiveCheckpoint(f.file, f.identity);
     if (completed.state !== 'terminal' || !completed.ok) throw new Error('original fixture must really reach its terminal before owner control');
-    const owners = inspectDirectiveProducers(f.file, f.identity); console.log(`S04-0-03 inspect ms ${String(Date.now() - started)} bytes ${String(readFileSync(`${f.file}.producers.jsonl`).length)}`);
+    const owners = inspectDirectiveProducers(f.file, f.identity);
     if (owners.length !== 1 || owners[0]?.evidence !== 'ceased') throw new Error('original completion must carry its exact original ceased producer');
     recordDirectiveCompletion(owners[0].producer, completed.checkpointId, resolveGitCommit(f.lane.path, 'HEAD')); // original completion, not recovery backfill
     f.ledger.bindDirectiveNativeAdmission(inspectDirectiveAdmission(f.file, f.identity));

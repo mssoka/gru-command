@@ -42,6 +42,24 @@ export interface RecoveryNotifications {
     agentId?: string | null;
     dedupe: 'unacked' | 'active' | 'all';
   }): unknown;
+  /** Refresh an open incident's detail and title in place (same id, same
+   * ack state). NotificationCenter has it; a surface without it cannot
+   * refresh a reused card and says so when one needs it. */
+  updateDetail?(id: string, detail: string, title?: string): unknown;
+}
+
+/** Post a recovery card, and refresh a reused one in place (#363 S07-1-02,
+ * S07-3-01): a card deduped onto an older open row would otherwise keep the
+ * older generation's marker, hash and instructions. Its id and Ack state stay. */
+export function postRecoveryIncident(notifications: RecoveryNotifications, input: Parameters<RecoveryNotifications['postIncident']>[0] & { readonly detail: string }): void {
+  const record = notifications.postIncident(input) as { readonly id?: unknown; readonly detail?: unknown; readonly title?: unknown; readonly resolvedAt?: unknown } | null | undefined;
+  // Only an open notification record can be stale (a structural surface may return nothing).
+  if (record === null || record === undefined || typeof record.id !== 'string' || typeof record.title !== 'string' || record.resolvedAt !== null) return;
+  if (record.detail === input.detail && record.title === input.title) return;
+  if (notifications.updateDetail === undefined) {
+    throw new Error(`recovery card ${record.id} (${input.kind}) was reused with an older generation's detail, and this notifications surface cannot refresh it`);
+  }
+  notifications.updateDetail(record.id, input.detail, input.title);
 }
 
 export interface ReconcileRebriefDeps {
@@ -565,7 +583,7 @@ function escalateRecoveryFailure(
     group.find((marker) => marker.agentId !== null)?.agentId ??
     null;
   try {
-    deps.notifications.postIncident({
+    postRecoveryIncident(deps.notifications, {
       kind: `silas.rebrief-unreconciled.${jobId}`,
       routing: 'action-required',
       severity: 'error',
@@ -664,7 +682,7 @@ function reconcilePendingDirectivesForRows(
       note: admissionUnknown ? 'admission-unknown at boot' : 'admitted without terminal receipt at boot',
     });
     try {
-      deps.notifications.postIncident({
+      postRecoveryIncident(deps.notifications, {
         kind: `silas.directive-unreconciled.${current.requestId}`,
         routing: 'action-required',
         severity: 'error',

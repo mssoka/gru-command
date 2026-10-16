@@ -557,6 +557,23 @@ describe('verification scheduler — global budget', () => {
     } finally { release(); await scheduler.dispose(); await shutdown; }
   });
 
+  it('childless failures keep the request history within its bound, in memory and persisted; the durable index still answers every one (#363 S09-1-05)', async () => {
+    const storageDir = join(tempDir(), 'verify'); const cwd = join(tempDir(), 'missing');
+    const scheduler = new VerificationScheduler({ storageDir, limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 5000, runTimeoutMs: 5000 } });
+    try {
+      for (let index = 0; index < 70; index += 1) {
+        await expect(scheduler.submit({ jobId: 'bounded-history', requestId: `no-start-${String(index)}`, scope: 'full', cwd, head: null, command: 'true' })).rejects.toThrow(/ENOENT/);
+      }
+      expect((scheduler as unknown as { requestHistory: Map<string, unknown> }).requestHistory.size).toBeLessThanOrEqual(64);
+      const persisted = JSON.parse(readFileSync(join(storageDir, 'scheduler.json'), 'utf8')) as { attempts?: readonly unknown[] };
+      expect(persisted.attempts?.length ?? 0).toBeLessThanOrEqual(64);
+      // The newest is still in memory; the oldest, evicted, answers from the durable index.
+      for (const requestId of ['no-start-69', 'no-start-0']) {
+        expect(scheduler.attemptStatus({ requestId }), requestId).toMatchObject({ state: 'admission-failed', started: false });
+      }
+    } finally { await scheduler.dispose(); }
+  });
+
   it('rejects a queued request parked on its queued frame when dispose runs', async () => {
     const { scheduler } = makeScheduler({ maxConcurrent: 1 });
     scheduler.start();
