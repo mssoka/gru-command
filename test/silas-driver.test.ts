@@ -895,6 +895,40 @@ describe('silas digest (the four actionable states)', () => {
     }
   });
 
+  it('a newer historical-only delivery never hides a stalled lane: only a proven candidate delivery ends its phase (#363 S07-2-01)', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-historical-stall', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-historical-stall', 'working');
+      h.ledger.registerAgent({ id: 'min-historical-stall', role: 'minion', jobId: 'job-historical-stall' });
+      h.ledger.setAgentState('min-historical-stall', 'idle');
+      // A completion recorded without a proven current candidate, newer than the phase start.
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-historical-stall', payload: { sha: null, work_revision: 0, candidate_delivery_proven: false } });
+      const now = Date.now();
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+        now: () => now + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1_000,
+      });
+      // Computed and rechecked at the publish boundary alike: still stalled.
+      expect(digest.stalledWorking.map((row) => row.jobId)).toEqual(['job-historical-stall']);
+      // A proven candidate delivery does end the phase.
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-historical-stall', payload: { sha: 'a'.repeat(40), work_revision: 0 } });
+      const delivered = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+        now: () => now + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1_000,
+      });
+      expect(delivered.stalledWorking).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('the stalled-lane pick never lands on a review-only session (Gru ruling 2026-09-29)', async () => {
     const h = makeLedger();
     try {
@@ -3238,7 +3272,7 @@ describe('silas skills and wake prompt', () => {
       deliveredWithoutPr: [], prWithoutReview: [{ jobId: 'clean', repo: 'gru-command', prUrl: 'https://example.invalid/1',
         priorRounds: 1, cleanAbort: { roundId: 'clean-r1', ruleId: 'clean-abort-service-restart' } }],
       verdictsAwaitingDirective: [], stalledWorking: [], minionErrors: [],
-      verificationFailures: [], verificationWaits: [], providerRecoveryPending: [], conflictingPrs: [], releaseEligible: [], revisionContinuations: [], verificationsOwed: [] },
+      verificationFailures: [], verificationWaits: [], providerRecoveryPending: [], conflictingPrs: [], releaseEligible: [], revisionContinuations: [], verificationsOwed: [], currentInspections: [] },
       trigger: { kind: 'sweep' }, skills: loadSilasSkills(), ops: { baseUrl: 'http://127.0.0.1:1', configPath: '/tmp/test-config' } });
     expect(prompt).toContain('You NEVER merge a pull request');
     expect(prompt).toContain('every final PR merge');
@@ -3282,7 +3316,7 @@ describe('silas skills and wake prompt', () => {
         verificationWaits: [],
         providerRecoveryPending: [],
         conflictingPrs: [],
-        releaseEligible: [], revisionContinuations: [], verificationsOwed: [],
+        releaseEligible: [], revisionContinuations: [], verificationsOwed: [], currentInspections: [],
       },
       trigger: { kind: 'job.delivered', jobId: 'job-a' },
       skills,
@@ -3665,7 +3699,7 @@ describe('silas digest fingerprint (issue #217)', () => {
     providerRecoveryPending: [],
     conflictingPrs: [],
     releaseEligible: [],
-    revisionContinuations: [], verificationsOwed: [],
+    revisionContinuations: [], verificationsOwed: [], currentInspections: [],
     ...over,
   });
 
@@ -3800,7 +3834,7 @@ describe('silas digest delta (issue #217)', () => {
       verificationWaits: [],
       providerRecoveryPending: [],
       conflictingPrs: [],
-      releaseEligible: [], revisionContinuations: [], verificationsOwed: [],
+      releaseEligible: [], revisionContinuations: [], verificationsOwed: [], currentInspections: [],
     };
     const current: import('../src/dispatch/silas-driver.js').SilasOpsDigest = {
       ...previous,

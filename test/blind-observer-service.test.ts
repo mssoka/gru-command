@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -78,7 +78,10 @@ describe('compiled service: the production blind observer is installed at startu
     try {
       // The test does NOT install the observer: the preload captured the
       // production main.ts installation and drives the recovered turn.
-      writeFileSync(trigger, JSON.stringify({ jobId, agentId, sessionFile }), 'utf-8');
+      // Written whole, then renamed into place: the preload polls for the file
+      // and must never read it half-written (an empty read is no trigger).
+      writeFileSync(`${trigger}.tmp`, JSON.stringify({ jobId, agentId, sessionFile }), 'utf-8');
+      renameSync(`${trigger}.tmp`, trigger);
       await vi.waitFor(() => {
         expect(JSON.parse(readFileSync(result, 'utf-8'))).toMatchObject({ installed: true, observed: true });
       }, { timeout: 15_000, interval: 100 });

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { JobAmendmentRecord } from '../review-inputs/amendments.js';
 import { amendmentSupersessions } from '../review-inputs/amendments.js';
+import { hasLineUnsafe, lineSafeLiteral } from './line-safe.js';
 
 /**
  * Blind-review input isolation (issue #316).
@@ -58,7 +59,14 @@ export type BlindViolationCode =
   | 'digest-mismatch'
   | 'target-mismatch'
   | 'empty-package'
-  | 'package-required';
+  | 'package-required'
+  /** A diff the gate cannot read as `diff --git` sections (prose, an empty
+   * text, a preamble, an unreadable header): judged nothing, admits nothing. */
+  | 'unparsed-diff'
+  /** A package file or diff path the target's own git objects do not bear out. */
+  | 'unbound-package'
+  /** Claims inputs (required_inputs) named for a blind reviewer. */
+  | 'claims-input';
 
 export interface BlindViolation {
   readonly code: BlindViolationCode;
@@ -277,20 +285,46 @@ function outsidePackageShape(path: string): boolean {
   return slashed === '' || slashed.startsWith('/') || /^[A-Za-z]:\//u.test(slashed) || /(^|\/)\.\.(\/|$)/u.test(slashed) || slashed.includes('\0');
 }
 
+/** A repository-relative spelling with every `.` segment and empty segment
+ * dropped (`././a//b` is `a/b`): one spelling per path, so no prefix of dots
+ * can step around a glob. */
+export function normalizeRepoPath(path: string): string {
+  return path.replace(/\\/gu, '/').split('/').filter((segment) => segment !== '.' && segment !== '').join('/');
+}
+
+/** A path as a refusal names it: always one JSON literal (a quote or a
+ * backslash in it stays unambiguous), with every line-unsafe character
+ * escaped too (the classes silas_action text refuses — control, format,
+ * separator, private-use, unassigned — astral ones too), so no refusal can
+ * break, reorder or hide a line. */
+export function shownPath(path: string): string {
+  return lineSafeLiteral(path);
+}
+
+/** A path as a violation's `where` (or a recorded read's `path`) holds it:
+ * as written when line-safe and not opening with a quote; otherwise its
+ * line-safe JSON literal. A leading quote therefore always marks the escaped
+ * form: a real path opening with `"` is shown as its literal, never bare. */
+export function shownWhere(path: string): string {
+  return hasLineUnsafe(path) || path.startsWith('"') ? lineSafeLiteral(path) : path;
+}
+
 /** Why a package path is not admissible, or null when it is. */
 export function classifyBlindPath(rawPath: string, rule: BlindIsolationRule): string | null {
   const path = rawPath.replace(/\\/gu, '/');
   if (outsidePackageShape(path)) {
-    return `invalid package path "${rawPath}" (must be a relative path inside the repository)`;
+    return `invalid package path ${shownPath(rawPath)} (must be a relative path inside the repository)`;
   }
-  const normalized = path.replace(/^\.\//u, '');
+  const normalized = normalizeRepoPath(path);
+  // `.` or `./` names the repository itself, never a file in it.
+  if (normalized === '') return `invalid package path ${shownPath(rawPath)} (names the repository root, not a file)`;
   if (rule.privateGlobs.some((glob) => globToRegExp(glob).test(normalized))) {
-    return `"${normalized}" is private job material (planning, spec, review or triage artifacts)`;
+    return `${shownPath(normalized)} is private job material (planning, spec, review or triage artifacts)`;
   }
   const permitted =
     rule.permitPaths.includes(normalized) && CONFIG_EXTENSIONS.has(extensionOf(normalized));
   if (!permitted && rule.excludeGlobs.some((glob) => globToRegExp(glob).test(normalized))) {
-    return `"${normalized}" is excluded by the parent isolation rule`;
+    return `${shownPath(normalized)} is excluded by the parent isolation rule`;
   }
   return null;
 }
@@ -414,47 +448,256 @@ export function gitBlobSha(content: string): string {
   return createHash('sha1').update(`blob ${body.length}\0`).update(body).digest('hex');
 }
 
+/** One hunk of a diff section: the old- and new-side lines it shows (its
+ * context with its removals, its context with its additions), each from the
+ * line its header names. */
+export interface DiffHunk {
+  readonly oldStart: number;
+  readonly oldLines: readonly string[];
+  readonly newStart: number;
+  readonly newLines: readonly string[];
+}
+
 interface DiffSection {
   readonly path: string;
   readonly oldPath: string;
   readonly text: string;
   readonly body: string;
+  readonly hunks: readonly DiffHunk[];
 }
 
-function splitDiff(text: string): readonly DiffSection[] {
-  const header = /^diff --git a\/(.+?) b\/(.+)$/u;
-  const groups: { oldPath: string; path: string; lines: string[] }[] = [];
-  for (const line of text.split('\n')) {
-    const match = header.exec(line);
-    if (match !== null) groups.push({ oldPath: match[1]!, path: match[2]!, lines: [line] });
-    else groups.at(-1)?.lines.push(line);
+/** One C-quoted git path (`"a/sp\\303\\251c\\"ial"`): the text after the
+ * quote, or null when the quoting is malformed. */
+function unquoteGitPath(quoted: string): { readonly path: string; readonly rest: string } | null {
+  const bytes: number[] = [];
+  const escapes: Record<string, number> = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, '\\': 92 };
+  for (let at = 1; at < quoted.length; at += 1) {
+    // A whole code point, never half a surrogate pair: an unescaped astral
+    // character (core.quotePath=false) keeps its bytes.
+    const char = String.fromCodePoint(quoted.codePointAt(at)!);
+    if (char === '"') {
+      try {
+        return { path: new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array(bytes)), rest: quoted.slice(at + 1) };
+      } catch { return null; }
+    }
+    if (char !== '\\') { bytes.push(...Buffer.from(char, 'utf8')); at += char.length - 1; continue; }
+    const next = quoted[at + 1];
+    if (next === undefined) return null;
+    if (/[0-7]/u.test(next)) {
+      const octal = /^[0-7]{3}/u.exec(quoted.slice(at + 1))?.[0];
+      if (octal === undefined) return null;
+      bytes.push(Number.parseInt(octal, 8));
+      at += 3;
+      continue;
+    }
+    const code = escapes[next];
+    if (code === undefined) return null;
+    bytes.push(code);
+    at += 1;
   }
-  return groups.map((group) => ({
-    path: group.path,
-    oldPath: group.oldPath,
-    text: group.lines.join('\n'),
-    body: group.lines
-      .slice(1)
-      .filter((line) => !/^(?:index |--- |\+\+\+ |@@ )/u.test(line))
-      .map((line) => line.slice(1))
-      .join('\n'),
-  }));
+  return null;
+}
+
+/** A whole path token of a diff line, C-quoted or not, or null when its
+ * quoting is malformed. */
+function gitPathToken(token: string): string | null {
+  if (!token.startsWith('"')) return token;
+  const quoted = unquoteGitPath(token);
+  return quoted !== null && quoted.rest === '' ? quoted.path : null;
+}
+
+/** The two paths of a `diff --git` header, quoted (`"a/…" "b/…"`) or not;
+ * `ambiguous` when an unquoted header names two different paths, which only
+ * the section's own rename/copy/---/+++ lines can split; null when the header
+ * cannot be read. */
+type HeaderPaths = { readonly oldPath: string; readonly path: string } | { readonly ambiguous: string };
+function diffHeaderPaths(line: string): HeaderPaths | null {
+  const rest = line.slice('diff --git '.length);
+  if (rest.startsWith('"')) {
+    const first = unquoteGitPath(rest);
+    if (first === null || !first.path.startsWith('a/') || !first.rest.startsWith(' ')) return null;
+    const second = gitPathToken(first.rest.slice(1));
+    return second !== null && second.startsWith('b/') ? { oldPath: first.path.slice(2), path: second.slice(2) } : null;
+  }
+  // `a/P b/P` names one path twice: split at the middle, so a path that
+  // itself holds " b/" (`a/p b/q.ts b/p b/q.ts`) is read whole.
+  if (rest.startsWith('a/') && (rest.length - 5) % 2 === 0) {
+    const half = (rest.length - 5) / 2;
+    const oldPath = rest.slice(2, 2 + half);
+    if (half > 0 && rest.slice(2 + half, 5 + half) === ' b/' && rest.slice(5 + half) === oldPath) return { oldPath, path: oldPath };
+  }
+  const quotedNew = /^a\/(.+) ("b\/.*")$/u.exec(rest);
+  if (quotedNew !== null) {
+    const path = gitPathToken(quotedNew[2]!);
+    return path === null ? null : { oldPath: quotedNew[1]!, path: path.slice(2) };
+  }
+  return /^a\/.+ b\/.+$/u.test(rest) ? { ambiguous: rest } : null;
+}
+
+const HUNK_HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/u;
+/** The extended header lines git writes between `diff --git` and the first
+ * hunk, other than the path-naming ones. */
+const EXTENDED_HEADER = /^(?:(?:old|new) mode [0-7]{6}|(?:deleted|new) file mode [0-7]{6}|(?:dis)?similarity index \d{1,3}%|index [0-9a-f]+\.\.[0-9a-f]+(?: [0-7]{6})?|Binary files .+ and .+ differ)$/u;
+
+/** The diff's sections, and what about the text could not be read: an empty
+ * text, prose before the first header, a header that is no readable
+ * `diff --git` line, or any line inside a section that is not git's own
+ * section grammar (extended headers, then hunks holding exactly the lines
+ * their headers count) — prose, a combined `diff --cc` line, a hunk cut
+ * short, or a rename/copy/---/+++ line naming another path than the header.
+ * A diff the gate cannot read admits nothing. */
+function splitDiff(text: string): { readonly sections: readonly DiffSection[]; readonly unreadable: readonly string[] } {
+  interface Group {
+    readonly header: HeaderPaths;
+    readonly at: number;
+    readonly lines: string[];
+    readonly body: string[];
+    readonly hunks: { oldStart: number; oldLines: string[]; newStart: number; newLines: string[] }[];
+    readonly named: { old: string[]; new: string[] };
+    oldLeft: number;
+    newLeft: number;
+    broken: boolean;
+  }
+  const sections: DiffSection[] = [];
+  const unreadable: string[] = [];
+  let current: Group | { readonly broken: true } | null = null;
+  const fail = (group: Group, index: number, problem: string): void => {
+    if (!group.broken) unreadable.push(`line ${String(index + 1)} ${problem}`);
+    group.broken = true;
+  };
+  const close = (group: Group, index: number): void => {
+    if (group.broken) return;
+    if (group.oldLeft > 0 || group.newLeft > 0) return fail(group, index, 'ends a hunk before the lines its header counts');
+    let oldPath: string;
+    let path: string;
+    if ('ambiguous' in group.header) {
+      // Only the section's own path lines can split `a/X b/Y`; they must
+      // spell the header back exactly.
+      const named = { old: group.named.old[0], new: group.named.new[0] };
+      if (named.old === undefined || named.new === undefined || group.header.ambiguous !== `a/${named.old} b/${named.new}`) {
+        return fail(group, group.at, 'is a diff header the gate cannot read');
+      }
+      oldPath = named.old;
+      path = named.new;
+    } else {
+      oldPath = group.header.oldPath;
+      path = group.header.path;
+    }
+    if (group.named.old.some((name) => name !== oldPath) || group.named.new.some((name) => name !== path)) {
+      return fail(group, group.at, `names ${shownPath(oldPath)} → ${shownPath(path)}, but its rename, copy or ---/+++ lines name another path`);
+    }
+    sections.push({ path, oldPath, text: group.lines.join('\n'), body: group.body.join('\n'), hunks: group.hunks });
+  };
+  // A text ending in a newline holds no empty last line.
+  const lines = text.split('\n');
+  if (lines.length > 1 && lines.at(-1) === '') lines.pop();
+  for (const [index, line] of lines.entries()) {
+    if (line.startsWith('diff --git ')) {
+      if (current !== null && !current.broken) close(current as Group, index);
+      const header = diffHeaderPaths(line);
+      if (header === null) {
+        // The lines after an unreadable header are its own (already
+        // refused), never the previous section's, and never reported again.
+        unreadable.push(`line ${String(index + 1)} is a diff header the gate cannot read`);
+        current = { broken: true };
+        continue;
+      }
+      current = { header, at: index, lines: [line], body: [], hunks: [], named: { old: [], new: [] }, oldLeft: 0, newLeft: 0, broken: false };
+      continue;
+    }
+    if (current === null) {
+      if (line.trim() !== '') unreadable.push(`line ${String(index + 1)} comes before any diff header`);
+      continue;
+    }
+    if (current.broken) continue;
+    const group = current as Group;
+    group.lines.push(line);
+    const hunk = group.hunks.at(-1);
+    if (hunk !== undefined && (group.oldLeft > 0 || group.newLeft > 0)) {
+      // Inside a hunk: exactly the lines its header counts (an empty line
+      // is a context line whose leading space was stripped).
+      const kind = line === '' ? ' ' : line[0];
+      const content = line.slice(1);
+      if (kind === '\\') continue;
+      if ((kind === ' ' && group.oldLeft > 0 && group.newLeft > 0) || (kind === '-' && group.oldLeft > 0) || (kind === '+' && group.newLeft > 0)) {
+        if (kind !== '+') { hunk.oldLines.push(content); group.oldLeft -= 1; }
+        if (kind !== '-') { hunk.newLines.push(content); group.newLeft -= 1; }
+        group.body.push(content);
+        continue;
+      }
+      fail(group, index, 'is not a line of the hunk its header counts');
+      continue;
+    }
+    const counted = HUNK_HEADER.exec(line);
+    if (counted !== null) {
+      const oldCount = counted[2] === undefined ? 1 : Number(counted[2]);
+      const newCount = counted[4] === undefined ? 1 : Number(counted[4]);
+      group.hunks.push({ oldStart: Number(counted[1]), oldLines: [], newStart: Number(counted[3]), newLines: [] });
+      group.oldLeft = oldCount;
+      group.newLeft = newCount;
+      continue;
+    }
+    // A finished hunk may carry git's no-newline marker; blank separators
+    // carry nothing.
+    if (line === '' || (hunk !== undefined && line.startsWith('\\'))) continue;
+    if (hunk === undefined) {
+      if (EXTENDED_HEADER.test(line)) continue;
+      const pathLine = /^(rename|copy) (from|to) (.+)$/u.exec(line);
+      if (pathLine !== null) {
+        const name = gitPathToken(pathLine[3]!);
+        if (name === null) { fail(group, index, 'names a path the gate cannot read'); continue; }
+        (pathLine[2] === 'from' ? group.named.old : group.named.new).push(name);
+        continue;
+      }
+      const sideLine = /^(---|\+\+\+) (.+?)\t?$/u.exec(line);
+      if (sideLine !== null) {
+        const name = gitPathToken(sideLine[2]!);
+        const prefix = sideLine[1] === '---' ? 'a/' : 'b/';
+        if (name === '/dev/null') continue;
+        if (name === null || !name.startsWith(prefix)) { fail(group, index, 'names a path the gate cannot read'); continue; }
+        (sideLine[1] === '---' ? group.named.old : group.named.new).push(name.slice(2));
+        continue;
+      }
+    }
+    fail(group, index, 'is not part of any diff section the gate can read');
+  }
+  if (current !== null && !current.broken) close(current as Group, lines.length);
+  if (sections.length === 0 && unreadable.length === 0) unreadable.push(text.trim() === '' ? 'the diff text is empty' : 'the diff carries no diff header');
+  return { sections, unreadable };
 }
 
 function sectionViolations(section: DiffSection, rule: BlindIsolationRule): readonly BlindViolation[] {
   const out: BlindViolation[] = [];
   for (const path of new Set([section.path, section.oldPath])) {
     const reason = classifyBlindPath(path, rule);
-    if (reason !== null) out.push({ code: 'excluded-path', where: path, detail: reason });
+    if (reason !== null) out.push({ code: 'excluded-path', where: shownWhere(path), detail: reason });
   }
-  if (out.length === 0 && DOC_EXTENSIONS.has(extensionOf(section.path)) && classifyHistoryContent(section.body).excluded) {
+  // A document renamed to a source extension still carries its history text.
+  if (out.length === 0 && [section.path, section.oldPath].some((path) => DOC_EXTENSIONS.has(extensionOf(path))) &&
+      classifyHistoryContent(section.body).excluded) {
     out.push({
       code: 'history-content',
-      where: section.path,
-      detail: `"${section.path}" carries task-spec, prior-assessment, deferred-work or triage text in its diff body`,
+      where: shownWhere(section.path),
+      detail: `${shownPath(section.path)} carries task-spec, prior-assessment, deferred-work or triage text in its diff body`,
     });
   }
   return out;
+}
+
+/** A package diff's sections as git objects name them: each section's old
+ * and new repository paths, normalized, and its hunks. Only for a diff the
+ * gate could read — an unreadable one is a caller error, said loud. */
+export function blindDiffSections(text: string): readonly { readonly oldPath: string; readonly path: string; readonly hunks: readonly DiffHunk[] }[] {
+  const parsed = splitDiff(text);
+  if (parsed.unreadable.length > 0) {
+    throw new Error(`blind package diff cannot be bound: ${parsed.unreadable.join('; ')} — evaluate the package before binding it`);
+  }
+  return parsed.sections.map((section) => ({ oldPath: normalizeRepoPath(section.oldPath), path: normalizeRepoPath(section.path), hunks: section.hunks }));
+}
+
+/** Every repository path a package diff names, old and new, normalized. */
+export function blindDiffPaths(text: string): readonly string[] {
+  return [...new Set(blindDiffSections(text).flatMap((section) => [section.oldPath, section.path]))];
 }
 
 export function evaluateBlindPackage(pkg: BlindInputPackage, rule: BlindIsolationRule): BlindPackageEvaluation {
@@ -469,27 +712,35 @@ export function evaluateBlindPackage(pkg: BlindInputPackage, rule: BlindIsolatio
   }
   const fileRecords: { path: string; sha256: string; blobSha: string }[] = [];
   for (const file of files) {
+    // A file's path heads its fenced bytes in the reviewer's briefing: a
+    // line-unsafe character there could put text outside the data fence or
+    // disguise the heading.
+    if (hasLineUnsafe(file.path)) {
+      const shown = lineSafeLiteral(file.path);
+      violations.push({ code: 'excluded-path', where: shown, detail: `invalid package path ${shown} (holds a control, format, separator, private-use or unassigned character)` });
+      continue;
+    }
     const reason = classifyBlindPath(file.path, rule);
     if (reason !== null) {
-      violations.push({ code: 'excluded-path', where: file.path, detail: reason });
+      violations.push({ code: 'excluded-path', where: shownWhere(file.path), detail: reason });
       continue;
     }
     const computed = sha256(file.content);
     const blob = gitBlobSha(file.content);
     if (file.sha256 !== undefined && file.sha256 !== computed) {
-      violations.push({ code: 'digest-mismatch', where: file.path, detail: `declared sha256 does not match the bytes supplied for "${file.path}"` });
+      violations.push({ code: 'digest-mismatch', where: shownWhere(file.path), detail: `declared sha256 does not match the bytes supplied for ${shownPath(file.path)}` });
     }
     if (file.blobSha !== undefined && file.blobSha !== blob) {
-      violations.push({ code: 'digest-mismatch', where: file.path, detail: `declared git blob id does not match the bytes supplied for "${file.path}"` });
+      violations.push({ code: 'digest-mismatch', where: shownWhere(file.path), detail: `declared git blob id does not match the bytes supplied for ${shownPath(file.path)}` });
     }
     if (DOC_EXTENSIONS.has(extensionOf(file.path)) && classifyHistoryContent(file.content).excluded) {
       violations.push({
         code: 'history-content',
-        where: file.path,
-        detail: `"${file.path}" carries task-spec, prior-assessment, deferred-work or triage text`,
+        where: shownWhere(file.path),
+        detail: `${shownPath(file.path)} carries task-spec, prior-assessment, deferred-work or triage text`,
       });
     }
-    fileRecords.push({ path: file.path.replace(/^\.\//u, ''), sha256: computed, blobSha: blob });
+    fileRecords.push({ path: normalizeRepoPath(file.path), sha256: computed, blobSha: blob });
   }
   let diffSha: string | null = null;
   const diffPaths: string[] = [];
@@ -498,8 +749,10 @@ export function evaluateBlindPackage(pkg: BlindInputPackage, rule: BlindIsolatio
     if (pkg.diff.sha256 !== undefined && pkg.diff.sha256 !== diffSha) {
       violations.push({ code: 'digest-mismatch', where: 'diff', detail: 'declared diff sha256 does not match the diff bytes supplied' });
     }
-    for (const section of splitDiff(pkg.diff.text)) {
-      diffPaths.push(section.path);
+    const parsed = splitDiff(pkg.diff.text);
+    for (const problem of parsed.unreadable) violations.push({ code: 'unparsed-diff', where: 'diff', detail: problem });
+    for (const section of parsed.sections) {
+      diffPaths.push(normalizeRepoPath(section.path));
       violations.push(...sectionViolations(section, rule));
     }
   }
@@ -586,6 +839,11 @@ export interface ObservedToolResult {
   readonly index: number;
   readonly toolName: string | null;
   readonly text: string;
+  /** The file a file-read tool call (Claude `Read`, pi `read`) asked for,
+   * paired with this, its result; absent for every other result. */
+  readonly readPath?: string;
+  /** The result reported an error (nothing was read). */
+  readonly isError?: boolean;
 }
 
 export interface ProhibitedAccess {
@@ -677,9 +935,32 @@ function excludedGrepPath(candidate: { readonly path: string; readonly byShape: 
  * excluded path or whose body is history-bearing text. This is observed
  * access, not inferred intent from a file name or a search command.
  */
-export function scanObservedAccess(results: readonly ObservedToolResult[], rule: BlindIsolationRule): readonly ProhibitedAccess[] {
+export function scanObservedAccess(
+  results: readonly ObservedToolResult[],
+  rule: BlindIsolationRule,
+  /** The reviewer's checkout: a read tool names absolute paths inside it. */
+  laneRoots: readonly string[] = [],
+): readonly ProhibitedAccess[] {
   const out: ProhibitedAccess[] = [];
   for (const result of results) {
+    // A file-read call that RETURNED content read that file — observed, not
+    // intent: an excluded path read directly, whatever its bytes look like.
+    // An empty or binary result (an image, a PDF) still returned the file.
+    // Only file-content calls carry a readPath; a search is judged below by
+    // what its output lines name, as before.
+    const read = result.readPath === undefined || result.isError === true
+      ? null : readPathViolation(result.readPath, rule, laneRoots);
+    if (read !== null) {
+      out.push({
+        index: result.index,
+        toolName: result.toolName,
+        code: 'excluded-path-read',
+        path: read.path,
+        detail: read.detail,
+        excerptSha256: sha256(result.text),
+      });
+      continue;
+    }
     const excluded = result.text
       .split('\n')
       .flatMap((line) => grepPathCandidates(line))
@@ -690,7 +971,7 @@ export function scanObservedAccess(results: readonly ObservedToolResult[], rule:
         index: result.index,
         toolName: result.toolName,
         code: 'excluded-path-read',
-        path: excluded.path,
+        path: shownWhere(excluded.path),
         detail: excluded.detail ?? 'excluded path',
         excerptSha256: sha256(result.text),
       });
@@ -709,4 +990,29 @@ export function scanObservedAccess(results: readonly ObservedToolResult[], rule:
     }
   }
   return out;
+}
+
+/** Why a file a tool call named is excluded, or null. Absolute paths
+ * inside the reviewer's checkout are judged by their repository path (the
+ * checkout itself is no file); absolute paths outside it are outside the
+ * package, like an absolute grep hit; with no known checkout an absolute
+ * path is not judged (no false read). */
+function readPathViolation(rawPath: string, rule: BlindIsolationRule, laneRoots: readonly string[]): { readonly path: string; readonly detail: string } | null {
+  const slashed = rawPath.replace(/\\/gu, '/');
+  let path = slashed;
+  // The repository root (`.`, `./`) is no file, relative or absolute.
+  if (!outsidePackageShape(slashed) && normalizeRepoPath(slashed) === '') return null;
+  if (outsidePackageShape(slashed) && !slashed.includes('\0')) {
+    const root = laneRoots.map((lane) => lane.replace(/\\/gu, '/').replace(/\/+$/u, '')).find((lane) => slashed === lane || slashed.startsWith(`${lane}/`));
+    if (root !== undefined) {
+      path = normalizeRepoPath(slashed.slice(root.length + 1));
+      if (path === '') return null;
+    } else if (laneRoots.length === 0) {
+      return null;
+    } else if (slashed.startsWith('/') || /^[A-Za-z]:\//u.test(slashed)) {
+      return { path: shownWhere(slashed), detail: `${shownPath(slashed)} is outside the reviewer's checkout, so outside its package` };
+    }
+  }
+  const detail = classifyBlindPath(path, rule);
+  return detail === null ? null : { path: shownWhere(path), detail };
 }

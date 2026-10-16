@@ -3257,7 +3257,7 @@ describe('ReviewMcpBridge fail-closed guards', () => {
       producerPrefixes: [['npm', 'test']], helper: '/pkg/dist/verify/capture-cli.js', configFile: '/instance/config.toml',
     };
 
-    async function settingsLifetime(outcome: 'deadline' | 'error'): Promise<void> {
+    async function settingsLifetime(outcome: 'deadline' | 'error', recordedExit = false): Promise<void> {
       const fx = fixture({ killGraceMs: 5 });
       const handle = await fx.runtime.spawn('gru', { workerVerification: policy });
       const owned = handle as unknown as {
@@ -3275,6 +3275,9 @@ describe('ReviewMcpBridge fail-closed guards', () => {
       try {
         const disposing = handle.dispose();
         const settled = disposing.then(() => 'fulfilled', () => 'rejected');
+        // A real ChildProcess records its exit before its close: an exit seen
+        // after the disposal began is no proof past an error or the deadline (#359).
+        if (recordedExit) Object.assign(original, { exitCode: 143 });
         if (outcome === 'error') original.emit('error', new Error('owned fixture transport error'));
         await vi.advanceTimersByTimeAsync(40);
         expect(await settled).toBe('fulfilled');
@@ -3299,6 +3302,38 @@ describe('ReviewMcpBridge fail-closed guards', () => {
 
     it('retains private verification files through a child error until actual close', async () => {
       await settingsLifetime('error');
+    });
+
+    it('retains private verification files through an exit recorded with no close — past an error or the deadline — until the close (#359)', async () => {
+      await settingsLifetime('error', true);
+      await settingsLifetime('deadline', true);
+    });
+
+    it('a child whose error and close land in the same tick, before the disposal settles, is ceased and releases its files (#359)', async () => {
+      const fx = fixture({ killGraceMs: 5 });
+      const handle = await fx.runtime.spawn('gru', { workerVerification: policy });
+      const owned = handle as unknown as { params: { verificationSettingsFile?: string }; live: ChildProcess | null };
+      const file = owned.params.verificationSettingsFile as string;
+      const policyFile = join(dirname(file), 'policy.json');
+      // The close alone is the proof: this fake never records an exit code or signal.
+      // (A policy child's close is also recorded by its custody tracker; the
+      // adapter's own same-tick latch is pinned without a policy in
+      // runtime-claude-cessation-ownership.test.ts.)
+      const original = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null, kill: vi.fn(() => true) }) as unknown as ChildProcess;
+      owned.live = original;
+      vi.useFakeTimers();
+      try {
+        const disposing = handle.dispose();
+        original.emit('error', new Error('owned fixture transport error'));
+        original.emit('close', null, 'SIGTERM');
+        await vi.advanceTimersByTimeAsync(40);
+        await disposing;
+        expect(handle.cessationEvidence!()).toBe('ceased');
+        expect([existsSync(file), existsSync(policyFile)]).toEqual([false, false]);
+      } finally {
+        vi.useRealTimers();
+        await fx.runtime.dispose();
+      }
     });
 
     /** A controllable policy child: the spawn seam returns it for the turn so

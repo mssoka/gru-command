@@ -304,6 +304,41 @@ describe('explicit phase-completion handoff (fresh dispatch and same-head rebrie
     ).toBe('action-required');
   });
 
+  it('a request-backed re-brief completes only after its own request is admitted, and hands back to Gru exactly once (#363 S08-2-01)', () => {
+    const h = makeHarness();
+    seedJob(h.ledger, 'job-ph-rbq', 'blocked');
+    h.ledger.beginRebriefIntent({
+      jobId: 'job-ph-rbq',
+      note: 'address the review finding',
+      holder: 'silas-ops',
+      requestId: 'req-ph-rbq',
+      handoff: { kind: 'gru-decision', decision: 'rule on the re-brief result' },
+    });
+    const phase = h.ledger.getPhaseHandoff('phase-handoff:job-ph-rbq:silas-rebrief:1');
+    expect(phase).toMatchObject({ state: 'awaiting', source: 'silas-rebrief', requestId: 'req-ph-rbq' });
+    const deliver = (requestId: string) => h.ledger.appendCustomEvent({
+      kind: 'job.delivered',
+      jobId: 'job-ph-rbq',
+      payload: { source: 'silas-rebrief', request_id: requestId, phase_id: phase!.phaseId, agentId: 'minion-rbq', sha: 'head' },
+    });
+    const deps = { ledger: h.ledger, notifications: h.notifications };
+    // Not admitted yet: its delivery completes nothing.
+    expect(observePhaseCompletion(deps, deliver('req-ph-rbq'))).toBeNull();
+    expect(h.ledger.getPhaseHandoff(phase!.phaseId)?.state).toBe('awaiting');
+    admitNativeDirectiveFixture(h.ledger, 'req-ph-rbq', 'minion-rbq', join(tmpDir(), 'minion-rbq.jsonl'));
+    // Admitted: a delivery naming another request still completes nothing...
+    expect(observePhaseCompletion(deps, deliver('req-other'))).toBeNull();
+    expect(h.ledger.getPhaseHandoff(phase!.phaseId)?.state).toBe('awaiting');
+    // ...its own completes the phase and posts the Gru hand-back, once.
+    const first = observePhaseCompletion(deps, deliver('req-ph-rbq'));
+    expect(first).toMatchObject({ phaseId: phase!.phaseId, created: true, closed: false });
+    expect(h.ledger.getPhaseHandoff(phase!.phaseId)?.state).toBe('completed');
+    // A replayed delivery finishes the already-completed phase: no new debt, the same card.
+    expect(observePhaseCompletion(deps, deliver('req-ph-rbq'))).toMatchObject({ phaseId: phase!.phaseId, created: false, notificationId: first!.notificationId });
+    const cards = h.ledger.listNotifications({ limit: 50 }).filter((row) => row.kind === `silas.phase-handback.${phase!.phaseId}`);
+    expect(cards.map((row) => row.routing)).toEqual(['action-required']);
+  });
+
   it('failed attempts never masquerade as completion: the dispatch failure closes the phase; a failed directive stays closed', async () => {
     const h = makeHarness();
     const worktrees = new InMemoryWorktreePort(join(tmpDir(), 'wt'));
