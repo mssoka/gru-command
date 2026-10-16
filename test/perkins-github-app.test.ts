@@ -3,8 +3,8 @@ import { createHash, createVerify, generateKeyPairSync } from 'node:crypto';
 import { chmodSync, chownSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { AssertionError as ChaiAssertionError } from 'chai';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, chai, describe, expect, it, vi } from 'vitest';
+
 import {
   createGithubVerdictPoster,
   createStartupVerdictPoster,
@@ -20,6 +20,9 @@ import {
 } from '../src/dispatch/perkins-github-app.js';
 import { AutoVerdictPoster, DefiniteNonDeliveryError, GhPrPoster, GitLabMrPoster, type VerdictPoster, type VerdictPosterInput } from '../src/dispatch/perkins.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+
+/** Vitest's bundled chai: no separate chai devDependency (#391). */
+const ChaiAssertionError = chai.AssertionError;
 
 async function assertFormalEventAssertion(tag: string, assertion: () => unknown): Promise<void> {
   try {
@@ -1628,6 +1631,69 @@ describe('bounded ambiguous-POST reconciliation', () => {
         await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }), omitted).rejects.toThrow(PerkinsAppError);
       }
       expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews')), omitted).toHaveLength(1);
+    }
+  });
+
+  it('certifies absence past an unrelated review whose predicate field is an explicit provider null (#390)', async () => {
+    // GitHub nulls commit_id once a review's commit is garbage-collected: a
+    // human's review on an old, force-pushed head must not hold every later
+    // walk unresolved. A typed null can never match a delivery predicate.
+    // Our bot's login with a non-Bot type fails the predicates' author check too.
+    const sameLoginUser = { login: MATCHING_REVIEW.user.login, type: 'User' };
+    for (const author of [{ login: 'other-user', type: 'User' }, sameLoginUser, null] as const) {
+      for (const nulled of ['state', 'commit_id', 'body'] as const) {
+        const label = `${author === null ? 'ghost' : `${author.login}/${author.type}`}:${nulled}`;
+        const foreign = {
+          id: 3133,
+          user: author,
+          commit_id: HEAD,
+          state: 'COMMENTED',
+          body: 'someone else\n',
+          submitted_at: new Date(NOW + 60_000).toISOString(),
+          [nulled]: null,
+        };
+        const fixture = bundleFixture();
+        const { poster, calls } = posterWith(fixture, [
+          { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+          { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [foreign] }) },
+        ]);
+        await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }), label).rejects.toThrow(/did not land/u);
+        await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }), label).resolves.toBeNull();
+        expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews')), label).toHaveLength(1);
+      }
+    }
+  });
+
+  it('keeps an explicit null on a review by our own App bot login undecidable — never absence, no second POST (#390)', async () => {
+    for (const nulled of ['state', 'commit_id', 'body'] as const) {
+      // It may be this round's publication with a nulled field.
+      const ours = { ...MATCHING_REVIEW, id: 3134, [nulled]: null };
+      const fixture = bundleFixture();
+      const { poster, calls } = posterWith(fixture, [
+        { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+        { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [ours] }) },
+      ]);
+      const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
+      expect(error?.message ?? '', nulled).toMatch(/delivery stays unproven/u);
+      expect(error?.message ?? '', nulled).not.toMatch(/did not land/u);
+      await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }), nulled).rejects.toThrow(/malformed list body/u);
+      expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews')), nulled).toHaveLength(1);
+    }
+    // Regression guard: our login with a missing or non-string type is
+    // malformed author evidence (refused before the author check), so even
+    // with a nulled field it never becomes a decidable non-match.
+    for (const type of [undefined, null, 42] as const) {
+      const { type: _dropped, ...withoutType } = MATCHING_REVIEW.user;
+      const user = type === undefined ? withoutType : { ...withoutType, type };
+      const malformed = { ...MATCHING_REVIEW, id: 3135, user, commit_id: null };
+      const fixture = bundleFixture();
+      const { poster, calls } = posterWith(fixture, [
+        { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+        { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [malformed] }) },
+      ]);
+      const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
+      expect(error?.message ?? '', String(type)).toMatch(/delivery stays unproven/u);
+      expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews')), String(type)).toHaveLength(1);
     }
   });
 
