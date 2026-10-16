@@ -513,6 +513,11 @@ describe('autopilot mode resolution (kill switch + per-family modes)', () => {
     const revocable = Proxy.revocable([1], {});
     revocable.revoke();
     expect(() => canonicalJson({ gone: revocable.proxy })).toThrow(/^canonicalJson: the value at "gone" cannot be read$/u);
+    // ...and so is one that revokes itself on its last prototype read, just before the array check.
+    let prototypeReads = 0;
+    const lateRevoked = Proxy.revocable([1], { getPrototypeOf: (target) => { if ((prototypeReads += 1) === 3) lateRevoked.revoke(); return Reflect.getPrototypeOf(target); } });
+    expect(() => canonicalJson({ late: lateRevoked.proxy })).toThrow(/^canonicalJson: the value at "late" cannot be read$/u);
+    expect(prototypeReads).toBe(3);
     // A boxed boolean serializes by its value, whatever its own valueOf says.
     const spoofed = { b: Object.assign(new Boolean(false), { valueOf: () => true }) };
     expect(canonicalJson(spoofed)).toBe('{"b":false}');

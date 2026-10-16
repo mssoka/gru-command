@@ -263,9 +263,13 @@ describe('H6 the Silas slot spawn wiring (#368)', () => {
     // The other options pass as a spread passes them: symbol keys and an own `__proto__` too.
     const marker = Symbol('marker');
     const odd = Object.assign(JSON.parse('{"__proto__": "own"}') as Record<string, unknown>, { [marker]: 'kept', cwd: '/odd' });
+    // ...and, as a spread, drop a non-enumerable one without ever reading it.
+    Object.defineProperty(odd, 'hidden', { value: 1, enumerable: false });
+    Object.defineProperty(odd, 'unread', { get: () => { throw new Error('never read'); }, enumerable: false });
     await spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() }, odd as SpawnOptions);
     const passed = spawned.pop()!.options as unknown as Record<PropertyKey, unknown>;
     expect([passed[marker], Object.getOwnPropertyDescriptor(passed, '__proto__')?.value, passed['cwd']]).toEqual(['kept', 'own', '/odd']);
+    expect(Object.hasOwn(passed, 'hidden') || Object.hasOwn(passed, 'unread')).toBe(false);
     expect(spawned[0]?.options?.nativeTools?.map((tool) => tool.name)).toEqual(['existing_tool', SILAS_MODEL_ACTION_TOOL]);
     expect(spawned[1]?.options?.nativeTools?.map((tool) => tool.name)).toEqual([SILAS_MODEL_ACTION_TOOL]);
     // The tools read and checked are the ones spawned — never a second read of the array.
@@ -330,6 +334,12 @@ describe('H6 the Silas slot spawn wiring (#368)', () => {
     // Any other option that cannot be read is a rejection too, never a synchronous throw.
     const unreadableOption = spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() }, { get cwd(): never { throw new Error('no cwd'); } });
     await expect(unreadableOption).rejects.toThrow('spawn option cwd cannot be read');
+    // Options that cannot be listed, or are no object at all, are refused by name too.
+    await expect(spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() }, new Proxy({}, { ownKeys: () => { throw new Error('no keys'); } })))
+      .rejects.toThrow('spawn options cannot be listed');
+    for (const [options, got] of [['cwd', 'string'], [7, 'number'], [null, 'null']] as const) {
+      await expect(spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() }, options as never), got).rejects.toThrow(`spawn options must be an object (got ${got})`);
+    }
     // A length a proxy invents is no slot count — a word, or a number that counts nothing.
     for (const length of ['many', Number.NaN, -1, 1.5, 2 ** 53]) {
       await expect(spawnSilasWithActionTool({ registry, ledger, digest: async () => emptyDigest() }, { nativeTools: new Proxy([], { get: (target, key) => (key === 'length' ? length : Reflect.get(target, key) as unknown) }) as never }), String(length))

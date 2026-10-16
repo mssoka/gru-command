@@ -237,16 +237,19 @@ export function spawnSilasWithActionTool(
   // key, symbols and an own `__proto__` included), each read once and
   // nativeTools never again: one that cannot be read is refused by name,
   // never a raw synchronous throw.
+  if (spawnOptions !== undefined && (typeof spawnOptions !== 'object' || spawnOptions === null)) {
+    return Promise.reject(new TypeError(`spawn options must be an object (got ${spawnOptions === null ? 'null' : typeof spawnOptions})`));
+  }
   const rest: Record<PropertyKey, unknown> = {};
-  let reading: PropertyKey = '';
-  try {
-    const source = (spawnOptions ?? {}) as Record<PropertyKey, unknown>;
-    for (const key of Reflect.ownKeys(source)) {
-      reading = key;
+  const source = (spawnOptions ?? {}) as Record<PropertyKey, unknown>;
+  let keys: readonly PropertyKey[];
+  try { keys = Reflect.ownKeys(source); } catch (error) { return Promise.reject(new TypeError('spawn options cannot be listed', { cause: error })); }
+  for (const key of keys) {
+    try {
       if (key === 'nativeTools' || Object.getOwnPropertyDescriptor(source, key)?.enumerable !== true) continue;
       Object.defineProperty(rest, key, { value: source[key], enumerable: true, writable: true, configurable: true });
-    }
-  } catch (error) { return Promise.reject(new TypeError(`spawn option ${String(reading)} cannot be read`, { cause: error })); }
+    } catch (error) { return Promise.reject(new TypeError(`spawn option ${String(key)} cannot be read`, { cause: error })); }
+  }
   if (names.includes(SILAS_MODEL_ACTION_TOOL)) {
     return Promise.reject(new Error(
       `the Silas spawn already carries a ${SILAS_MODEL_ACTION_TOOL} tool — each spawn binds its own; pass spawn options without it`,

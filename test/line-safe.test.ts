@@ -17,5 +17,7 @@ describe('line-safe text for guidance and ledger lines (#367, #369)', () => {
     expect(shownText('😀'.repeat(201))).toBe(`${JSON.stringify('😀'.repeat(200))}…`);
     // A lone surrogate is no text: shown escaped, never raw.
     expect(shownText('a\ud800b')).toBe('"a\\ud800b"');
+    // ...at the cut too.
+    expect(shownText(`${'x'.repeat(199)}\ud800${'y'.repeat(5)}`)).toBe(`"${'x'.repeat(199)}\\ud800"…`);
   });
 });
