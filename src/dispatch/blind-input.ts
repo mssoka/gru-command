@@ -71,7 +71,8 @@ export type BlindRefusalCode =
   | 'invalid_input_package'
   | 'blind_input_refused'
   | 'stale_parent_contract'
-  | 'blind_coverage_owned';
+  | 'blind_coverage_owned'
+  | 'blind_coverage_unreadable';
 
 /** A named refusal at the commissioning boundary. `correction` is the path a
  * stranger can act on; `violations` never carry the private text itself. */
@@ -230,7 +231,24 @@ export function reviveBlindIsolationRule(parts: {
   return rule;
 }
 
+/** Compiled glob patterns: a large tool output classifies many candidate
+ * paths against the same few globs. */
+const compiledGlobs = new Map<string, RegExp>();
+const MAX_COMPILED_GLOBS = 1024;
 function globToRegExp(glob: string): RegExp {
+  const cached = compiledGlobs.get(glob);
+  if (cached !== undefined) {
+    // Least recently used goes first: a hit moves to the newest end.
+    compiledGlobs.delete(glob);
+    compiledGlobs.set(glob, cached);
+    return cached;
+  }
+  const compiled = compileGlob(glob);
+  if (compiledGlobs.size >= MAX_COMPILED_GLOBS) compiledGlobs.delete(compiledGlobs.keys().next().value as string);
+  compiledGlobs.set(glob, compiled);
+  return compiled;
+}
+function compileGlob(glob: string): RegExp {
   let out = '';
   for (let index = 0; index < glob.length; index += 1) {
     const char = glob[index]!;
@@ -251,10 +269,18 @@ function extensionOf(path: string): string {
   return dot <= 0 ? '' : base.slice(dot).toLowerCase();
 }
 
+/** A path whose SHAPE alone puts it outside the package: empty, absolute
+ * (POSIX, a Windows drive or a UNC share), a `..` segment or a NUL — in
+ * either slash direction. */
+function outsidePackageShape(path: string): boolean {
+  const slashed = path.replace(/\\/gu, '/');
+  return slashed === '' || slashed.startsWith('/') || /^[A-Za-z]:\//u.test(slashed) || /(^|\/)\.\.(\/|$)/u.test(slashed) || slashed.includes('\0');
+}
+
 /** Why a package path is not admissible, or null when it is. */
 export function classifyBlindPath(rawPath: string, rule: BlindIsolationRule): string | null {
   const path = rawPath.replace(/\\/gu, '/');
-  if (path === '' || path.startsWith('/') || /(^|\/)\.\.(\/|$)/u.test(path) || path.includes('\0')) {
+  if (outsidePackageShape(path)) {
     return `invalid package path "${rawPath}" (must be a relative path inside the repository)`;
   }
   const normalized = path.replace(/^\.\//u, '');
@@ -572,7 +598,79 @@ export interface ProhibitedAccess {
   readonly excerptSha256: string;
 }
 
-const GREP_LINE = /^((?:\.\/)?[^\s:]+):\d+[:-]/u;
+/** A grep result line: `path:LINE:` (or `path:LINE-` context). The path may
+ * contain spaces (#357) — it ends at the numeric line delimiter — and may
+ * open with a Windows drive (`C:\`), but never starts with whitespace (an
+ * indented stack frame is not a grep result). */
+const GREP_LINE = /^((?:\.\/|[A-Za-z]:[\\/])?[^\s:][^:\n]*):\d+[:-]/u;
+
+/** No path is longer than PATH_MAX: a spaced grep line's candidates are the
+ * word and component starts within its last this-many characters. The path
+ * is a suffix of the capture, so every start of a real one — however deep,
+ * however much padding precedes it — is judged, and the work per line stays
+ * bounded. */
+const MAX_PATH_CHARS = 4096;
+/** A spaced candidate whose SHAPE may still classify it (candidates arrive
+ * with `/` separators — grepPathCandidates normalises them): its last path
+ * component is non-empty with no whitespace, and it is a parent path
+ * (`../x`), an absolute one naming at least a directory and a file (POSIX or
+ * a Windows drive), or a UNC share naming an unspaced host, a share and a
+ * file — a real spaced path (`/srv/a b/notes.md`, `C:/Data/a b/Makefile`),
+ * never prose or a clock time whose words follow the last slash
+ * (`/var/log/app.log started at 10`), a lone `/word` (`ratio 3 /4:12:`), a
+ * spaced `//a b/…` or a bare `//host` URL. */
+function fileLikeOutside(candidate: string): boolean {
+  // Index arithmetic, not a split: a dense line yields thousands of
+  // candidates, and none allocates per component.
+  const lastSlash = candidate.lastIndexOf('/');
+  const last = candidate.slice(lastSlash + 1);
+  if (last === '' || /\s/u.test(last)) return false;
+  if (candidate.startsWith('../')) return true;
+  if (candidate.startsWith('//')) {
+    // A UNC share (`//host/share/…/file`) names a host — never spaced, so
+    // `//a b/…` prose is not one — a share and a file.
+    const hostEnd = candidate.indexOf('/', 2);
+    const shareEnd = hostEnd < 0 ? -1 : candidate.indexOf('/', hostEnd + 1);
+    return hostEnd > 2 && shareEnd > hostEnd + 1 && !/\s/u.test(candidate.slice(2, hostEnd));
+  }
+  // A POSIX or drive-letter absolute path names a directory and a file (a
+  // file directly under a root, `/x` or `C:/x`, is too like prose to count).
+  if (candidate.startsWith('/')) return candidate.indexOf('/', 1) > 1;
+  if (/^[A-Za-z]:\//u.test(candidate)) return candidate.indexOf('/', 3) > 3;
+  return false;
+}
+
+/** The paths a tool-result line may name as a grep hit, each with whether
+ * its SHAPE alone (absolute, `..`) may classify it. A space-free capture is
+ * the path itself. A spaced capture (#357) is ambiguous — prose or a clock
+ * time reaches a `:digits:` too — so it, and every suffix of it that starts a
+ * word or a path component (`Matches in docs/issues/a b.md:1:` names
+ * `docs/issues/a b.md`; `/srv/a b/repo/docs/issues/x.md:1:` names
+ * `docs/issues/x.md`), is judged by the isolation globs; by shape only when
+ * it is file-like (see fileLikeOutside). */
+export function grepPathCandidates(line: string): readonly { readonly path: string; readonly byShape: boolean }[] {
+  const captured = GREP_LINE.exec(line)?.[1];
+  if (captured === undefined) return [];
+  // One separator: a Windows-style hit is judged as the same path.
+  const path = captured.trimEnd().replace(/\\/gu, '/');
+  if (!/\s/u.test(path)) return [{ path, byShape: true }];
+  const from = Math.max(0, path.length - MAX_PATH_CHARS);
+  const starts = from === 0 ? [0] : [];
+  // A start is a word after whitespace, or a component after a slash — never
+  // the second slash of `//`, which no path component begins with.
+  const start = /(?<=\s)\S|(?<=\/)[^\s/]/gu;
+  start.lastIndex = from;
+  for (let match = start.exec(path); match !== null; match = start.exec(path)) starts.push(match.index);
+  return starts.map((at) => {
+    const candidate = path.slice(at);
+    return { path: candidate, byShape: fileLikeOutside(candidate) };
+  });
+}
+/** Why a grep-hit candidate is excluded, or null. */
+function excludedGrepPath(candidate: { readonly path: string; readonly byShape: boolean }, rule: BlindIsolationRule): string | null {
+  if (outsidePackageShape(candidate.path) && !candidate.byShape) return null;
+  return classifyBlindPath(candidate.path, rule);
+}
 
 /**
  * What the reviewer actually SAW: tool results whose grep lines land in an
@@ -582,17 +680,18 @@ const GREP_LINE = /^((?:\.\/)?[^\s:]+):\d+[:-]/u;
 export function scanObservedAccess(results: readonly ObservedToolResult[], rule: BlindIsolationRule): readonly ProhibitedAccess[] {
   const out: ProhibitedAccess[] = [];
   for (const result of results) {
-    const excludedPath = result.text
+    const excluded = result.text
       .split('\n')
-      .map((line) => GREP_LINE.exec(line)?.[1])
-      .find((path) => path !== undefined && classifyBlindPath(path, rule) !== null);
-    if (excludedPath !== undefined) {
+      .flatMap((line) => grepPathCandidates(line))
+      .map((candidate) => ({ path: candidate.path, detail: excludedGrepPath(candidate, rule) }))
+      .find((hit) => hit.detail !== null);
+    if (excluded !== undefined) {
       out.push({
         index: result.index,
         toolName: result.toolName,
         code: 'excluded-path-read',
-        path: excludedPath,
-        detail: classifyBlindPath(excludedPath, rule) ?? 'excluded path',
+        path: excluded.path,
+        detail: excluded.detail ?? 'excluded path',
         excerptSha256: sha256(result.text),
       });
       continue;
