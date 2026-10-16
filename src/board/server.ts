@@ -839,18 +839,21 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
               }
             }
             // When the supervisor acted but nothing is resolved after all,
-            // that is recorded and said — never hidden behind a refusal.
-            const actedNote = (): string => {
-              if (rearm === 'not_applicable') return '';
-              let unrecorded = '';
+            // that is recorded (best effort: an append or log failure never
+            // replaces the answer) and then said — never hidden.
+            const acted = rearm;
+            const recordActed = (outcome: 'refused' | 'removed' | 'failed', reason: string): boolean => {
+              if (acted === 'not_applicable') return true;
               try {
-                ledger.appendCustomEvent({ kind: 'notification.disposition-refused-after-rearm', payload: { id, rearm } });
+                ledger.appendCustomEvent({ kind: 'notification.disposition-refused-after-rearm', payload: { id, rearm: acted, outcome, reason: reason.slice(0, 500) } });
+                return true;
               } catch (eventError) {
-                log('error', 'refused-after-rearm event not recorded', { id, rearm, error: String(eventError) });
-                unrecorded = ' (and that could not be recorded in the ledger)';
+                try { log('error', 'refused-after-rearm event not recorded', { id, rearm: acted, error: String(eventError) }); } catch { /* the answer still goes out */ }
+                return false;
               }
-              return ` — the supervisor had already acted on it (rearm: ${rearm})${unrecorded}; the alert stays open: retriage or resolve it`;
             };
+            const actedNote = (recorded: boolean): string => (acted === 'not_applicable' ? ''
+              : ` — the supervisor had already acted on it (rearm: ${acted})${recorded ? '' : ' (and that could not be recorded in the ledger)'}; the alert stays open: retriage or resolve it`);
             let row: NotificationRecord | null;
             try {
               row = ownerFollowThrough
@@ -862,12 +865,17 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
               // If the supervisor had already acted on it (a retriage raced
               // the consult), that is said and recorded, never hidden: the
               // alert stays open for a person to retriage or resolve.
-              if (!(error instanceof MachineDispositionRefusedError)) throw error;
-              json(res, 409, { error: 'disposition_refused', code: 'disposition_refused', rearm, detail: `${error.refusal}${actedNote()}` });
+              if (!(error instanceof MachineDispositionRefusedError)) {
+                recordActed('failed', String(error));
+                throw error;
+              }
+              const recorded = recordActed('refused', error.refusal);
+              json(res, 409, { error: 'disposition_refused', code: 'disposition_refused', rearm, detail: `${error.refusal}${actedNote(recorded)}` });
               return;
             }
             if (row === null) {
-              json(res, 404, { error: 'not_found', rearm, detail: `notification "${id}" not found${actedNote()}` });
+              const recorded = recordActed('removed', `notification "${id}" not found`);
+              json(res, 404, { error: 'not_found', rearm, detail: `notification "${id}" not found${actedNote(recorded)}` });
               return;
             }
             json(res, 200, { ...row, rearm });

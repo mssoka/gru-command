@@ -3335,11 +3335,13 @@ export class LedgerApi {
     return this.supervisionStopClosure(notificationId) !== undefined;
   }
 
-  /** The FIRST recorded closure of this alert's stop — the binding one. */
-  private supervisionStopClosure(notificationId: string): { readonly agentId: string | null; readonly jobId: string | null } | undefined {
+  /** The FIRST recorded closure of this alert's stop — the binding one.
+   * Every closure this ledger writes names its agent and job; a row naming
+   * neither (never written here) is no closure, for reads and writes alike. */
+  private supervisionStopClosure(notificationId: string): { readonly agentId: string; readonly jobId: string } | undefined {
     return this.db.prepare(
-      "SELECT agent_id AS agentId, job_id AS jobId FROM events WHERE kind = 'supervision.stop-superseded' AND json_extract(payload, '$.notification_id') = ? ORDER BY seq ASC LIMIT 1",
-    ).get(notificationId) as { agentId: string | null; jobId: string | null } | undefined;
+      "SELECT agent_id AS agentId, job_id AS jobId FROM events WHERE kind = 'supervision.stop-superseded' AND json_extract(payload, '$.notification_id') = ? AND agent_id IS NOT NULL AND job_id IS NOT NULL ORDER BY seq ASC LIMIT 1",
+    ).get(notificationId) as { agentId: string; jobId: string } | undefined;
   }
 
   /** Records a superseded-stop closure (#385) at most ONCE per alert: the
@@ -3360,12 +3362,7 @@ export class LedgerApi {
       const prior = this.supervisionStopClosure(input.payload.notification_id);
       if (prior !== undefined) {
         // The same alert closes ONE stop: a replay naming another agent or
-        // job is a conflict, never "already recorded". Every closure this
-        // ledger writes names both; one that does not cannot be compared and
-        // is refused by name.
-        if (prior.agentId === null || prior.jobId === null) {
-          throw new SupervisionStopClosureConflictError(`alert "${input.payload.notification_id}" has a recorded closure that names ${prior.agentId === null ? 'no agent' : `agent "${prior.agentId}"`} on ${prior.jobId === null ? 'no job' : `job "${prior.jobId}"`} — it cannot be compared; inspect the ledger`);
-        }
+        // job is a conflict, never "already recorded".
         if (prior.agentId !== input.agentId || prior.jobId !== input.jobId) {
           throw new SupervisionStopClosureConflictError(`alert "${input.payload.notification_id}" already closed the stop of agent "${prior.agentId}" on job "${prior.jobId}" — not agent "${input.agentId}" on job "${input.jobId}"`);
         }

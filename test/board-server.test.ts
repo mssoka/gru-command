@@ -1801,7 +1801,7 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
       const breaker = harness.notifications.post({ kind: 'supervision.breaker', routing: 'action-required', severity: 'error', title: 'Lane stopped' });
       consulted = 0;
       changeDuringConsult = () => { harness.api.updateNotificationTriage(breaker.id, 'fyi', null); };
-      const actedEvents = () => harness.api.listEvents({ limit: 100 }).filter((event) => event.kind === 'notification.disposition-refused-after-rearm').map((event) => event.payload);
+      const actedEvents = () => harness.api.listEvents({ limit: 5000 }).filter((event) => event.kind === 'notification.disposition-refused-after-rearm').map((event) => event.payload);
       // The supervisor had already acted: the refusal says so and records it —
       // for a re-arm and a superseded close alike; a pure record says nothing.
       for (const [outcome, rearm] of [[{ ok: true }, 'accepted'], [{ ok: true, rearmed: false, superseded: true }, 'superseded'], [{ ok: true, rearmed: false }, 'not_applicable']] as const) {
@@ -1818,7 +1818,7 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
           expect(detail, rearm).toMatch(new RegExp(`^only action-required notifications .* — the supervisor had already acted on it \\(rearm: ${rearm}\\); the alert stays open: retriage or resolve it$`, 'u'));
           const after = actedEvents();
           expect(after, rearm).toHaveLength(before + 1);
-          expect(after, rearm).toContainEqual({ id: breaker.id, rearm });
+          expect(after, rearm).toContainEqual({ id: breaker.id, rearm, outcome: 'refused', reason: expect.stringMatching(/only action-required notifications/u) });
         }
         expect(consulted, rearm).toBe(1);
         expect(harness.api.getNotification(breaker.id), rearm).toMatchObject({ resolvedAt: null });
@@ -1826,16 +1826,22 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
       // An event that cannot be written is said, never a 500 in place of the refusal.
       harness.api.updateNotificationTriage(breaker.id, 'action-required', null);
       consultOutcome = { ok: true };
-      const failingEvent = vi.spyOn(harness.api, 'appendCustomEvent').mockImplementation(() => { throw new Error('ledger full'); });
+      const append = harness.api.appendCustomEvent.bind(harness.api);
+      const failingEvent = vi.spyOn(harness.api, 'appendCustomEvent').mockImplementation((input) => {
+        if (input.kind === 'notification.disposition-refused-after-rearm') throw new Error('ledger full');
+        return append(input);
+      });
       try {
         expect(await postJson(harness.port, `/api/notifications/${encodeURIComponent(breaker.id)}/disposition`, 'board-test-token', { detail: 'raced, unrecorded' }))
           .toMatchObject({ status: 409, body: { rearm: 'accepted', detail: expect.stringMatching(/\(rearm: accepted\) \(and that could not be recorded in the ledger\); the alert stays open/u) } });
+        expect(failingEvent.mock.calls.some(([input]) => input.kind === 'notification.disposition-refused-after-rearm')).toBe(true);
       } finally { failingEvent.mockRestore(); }
       // A row removed while the supervisor acted answers 404 — and says the supervisor acted.
       const removed = harness.notifications.post({ kind: 'supervision.breaker', routing: 'action-required', severity: 'error', title: 'Lane stopped again' });
       changeDuringConsult = () => { (harness.api as unknown as { db: { prepare(sql: string): { run(...args: unknown[]): unknown } } }).db.prepare('DELETE FROM notifications WHERE id = ?').run(removed.id); };
       expect(await postJson(harness.port, `/api/notifications/${encodeURIComponent(removed.id)}/disposition`, 'board-test-token', { detail: 'raced away' }))
         .toMatchObject({ status: 404, body: { error: 'not_found', rearm: 'accepted', detail: expect.stringMatching(/not found — the supervisor had already acted on it \(rearm: accepted\)/u) } });
+      expect(actedEvents()).toContainEqual({ id: removed.id, rearm: 'accepted', outcome: 'removed', reason: `notification "${removed.id}" not found` });
       changeDuringConsult = null;
       // A resolved action-required row stays an idempotent retry.
       const note = harness.notifications.post({ kind: 'job.note', routing: 'action-required', severity: 'info', title: 'handled' });

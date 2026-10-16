@@ -6120,15 +6120,15 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
         expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: agentId as never, jobId: jobId as never, payload: { notification_id: 'typed' } })).toThrow(`a superseded-stop closure needs a non-blank ${name}`);
       }
       expect(closures(rig)).toHaveLength(1);
-      // A legacy closure with no agent or job conflicts by name, and the
-      // FIRST recorded closure of an alert is the binding one.
-      // A recorded closure that names no agent or job cannot be compared: refused by name.
+      // A row naming no agent or job (never written by this ledger) is no
+      // closure — for reads and writes alike: never a dead end, never a binding.
       rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', payload: { notification_id: 'legacy' } });
-      expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: 'legacy' } }))
-        .toThrow(new SupervisionStopClosureConflictError('alert "legacy" has a recorded closure that names no agent on no job — it cannot be compared; inspect the ledger'));
+      expect(rig.api.hasSupervisionStopSuperseded('legacy')).toBe(false);
+      expect(rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: 'legacy' } })).toBe(true);
+      expect(rig.api.hasSupervisionStopSuperseded('legacy')).toBe(true);
       rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', jobId: 'fenced-job', payload: { notification_id: 'job-only' } });
-      expect(() => rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: 'job-only' } }))
-        .toThrow(/has a recorded closure that names no agent on job "fenced-job" — it cannot be compared; inspect the ledger$/u);
+      expect(rig.api.recordSupervisionStopSuperseded({ agentId: 'a', jobId: 'fenced-job', payload: { notification_id: 'job-only' } })).toBe(true);
+      // The FIRST complete closure of an alert is the binding one.
       rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: 'first', jobId: 'fenced-job', payload: { notification_id: 'twice' } });
       rig.api.appendCustomEvent({ kind: 'supervision.stop-superseded', agentId: 'second', jobId: 'fenced-job', payload: { notification_id: 'twice' } });
       expect(rig.api.recordSupervisionStopSuperseded({ agentId: 'first', jobId: 'fenced-job', payload: { notification_id: 'twice' } })).toBe(false);
