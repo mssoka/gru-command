@@ -14,6 +14,12 @@ fail-loud at boot); this page is the map.
 | Perkins | `roles/perkins.md` | **spawn-provided** (frozen detached review tree) | review artifacts only | one whole-PR lead reviews the complete change, may run tracked whole-change specialists, verifies, revisits priors, and reports through narrow host tools |
 | Bob | `roles/bob.md` | workspace root | memory files | periodic consolidation with provenance |
 
+**Vector** ([VECTOR.md](./VECTOR.md), #351) is a persona, not a sixth role.
+He runs on Perkins's read-only role definition: the same tool confinement
+(read, grep, find, ls), no write tools, a host-supplied prompt
+(`src/vector/attack.ts`), and one host-bound submission tool. He is rooted in
+a throwaway raid clone of the default-branch head.
+
 ## Cwd policy (SPEC ruling 17)
 
 - The chat Gru, ops (Silas), and memory (Bob) host at the **workspace

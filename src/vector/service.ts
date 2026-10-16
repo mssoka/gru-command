@@ -7,7 +7,8 @@ import type { LogLevel } from '../logger.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { PackageResolution } from '../property/types.js';
 import { buildRaidCandidates, type RaidCandidate, type RaidCandidateList } from './candidates.js';
-import { signalsPayload, VECTOR_EVENTS, VectorLedger, type RaidRecord, type RaidRequester, type RaidTarget } from './ledger.js';
+import { breakInContract, fixHeistJobId, fixHeistTitle, renderFixBriefing } from './fix.js';
+import { signalsPayload, VECTOR_EVENTS, VectorLedger, type BreakInRecord, type RaidRecord, type RaidRequester, type RaidTarget } from './ledger.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -27,8 +28,17 @@ export const RAID_PROPOSAL_KIND = 'vector.raid-proposal';
 export const RAID_LAUNCHED_KIND = 'vector.raid-launched';
 /** Board activity: a proposal withdrawn because its target changed. */
 export const RAID_WITHDRAWN_KIND = 'vector.raid-proposal-withdrawn';
+/** The owner's Accept/Decline on turning one break-in into a fix heist. */
+export const FIX_PROPOSAL_KIND = 'vector.fix-proposal';
+/** Board activity: a fix heist was dispatched for a break-in. */
+export const FIX_DISPATCHED_KIND = 'vector.fix-dispatched';
+/** Gru's attention: a fix heist could not be dispatched (retried at the next reconcile). */
+export const FIX_DISPATCH_FAILED_KIND = 'vector.fix-dispatch-failed';
 
 export const RAID_REASON_MAX_CHARS = 200;
+
+/** How often undone follow-through (decisions, fix dispatches) is retried. */
+export const RECONCILE_INTERVAL_MS = 300_000;
 
 /** A refusal Gru (or the owner, through chat) can act on, by name. */
 export class VectorRefusal extends Error {
@@ -69,6 +79,8 @@ export interface VectorServiceOptions {
   readonly setTimeout?: typeof setTimeout;
   /** Seam A capability resolution (default: the real resolver). */
   readonly resolvePackages?: (repoPath: string) => readonly PackageResolution[];
+  /** The normal dispatch path a fix heist goes through (POST /api/dispatch's service). */
+  readonly dispatchFix?: (input: { readonly jobId: string; readonly repoPath: string; readonly title: string; readonly briefing: string }) => Promise<unknown>;
 }
 
 const OWNER_PROVENANCE = { credential: 'internal', declaredActor: null } as const;
@@ -99,6 +111,7 @@ export class VectorService {
   private readonly now: () => Date;
   private timer: ReturnType<typeof setInterval> | null = null;
   private firstTick: ReturnType<typeof setTimeout> | null = null;
+  private reconcileTimer: ReturnType<typeof setInterval> | null = null;
   private unsubscribe: (() => void) | null = null;
 
   constructor(private readonly opts: VectorServiceOptions) {
@@ -127,6 +140,12 @@ export class VectorService {
       }
     });
     this.reconcile();
+    // Decisions and fix dispatches a failure left undone are retried even
+    // when planning is off (plan_interval_ms = 0).
+    this.reconcileTimer = (this.opts.setInterval ?? setInterval)(() => {
+      try { this.reconcile(); } catch (error) { this.log('error', 'vector reconcile failed; the next interval retries it', { error: String(error) }); }
+    }, RECONCILE_INTERVAL_MS);
+    this.reconcileTimer.unref?.();
     if (this.opts.vector.planIntervalMs > 0) {
       const tick = (): void => {
         try { this.planTick(); } catch (error) { this.log('error', 'vector raid planning failed; the next interval retries it', { error: String(error) }); }
@@ -148,10 +167,9 @@ export class VectorService {
       clearTimeout(this.firstTick);
       this.firstTick = null;
     }
-    if (this.timer !== null) {
-      (this.opts.clearInterval ?? clearInterval)(this.timer);
-      this.timer = null;
-    }
+    for (const timer of [this.timer, this.reconcileTimer]) if (timer !== null) (this.opts.clearInterval ?? clearInterval)(timer);
+    this.timer = null;
+    this.reconcileTimer = null;
   }
 
   private requireEnabled(): void {
@@ -170,7 +188,7 @@ export class VectorService {
       maxRaidsPerDay: this.opts.vector.maxRaidsPerDay,
       raids,
       perkinsFindings: (repo, since) => this.perkinsFindings(repo, since),
-      escapedRegressions: () => 0,
+      escapedRegressions: (target) => this.store.breakIns().filter((entry) => entry.target.repo === target.repo && entry.target.packageDir === target.packageDir).length,
       ...(this.opts.resolvePackages === undefined ? {} : { resolvePackages: this.opts.resolvePackages }),
       now: this.now(),
     });
@@ -338,9 +356,123 @@ export class VectorService {
     });
   }
 
+  breakIns(): readonly BreakInRecord[] {
+    return this.store.breakIns();
+  }
+
+  /**
+   * A confirmed break-in (#351 §4): one FOR YOU fix proposal (fix_mode
+   * "proposed"), or the fix heist itself ("autonomous"). Idempotent, and a
+   * contract the owner declined at this source identity is not proposed again.
+   */
+  async onBreakIn(breakInId: string): Promise<void> {
+    const breakIn = this.store.breakIn(breakInId);
+    if (breakIn === null || breakIn.fix !== null) return;
+    const declinedHere = this.store.breakIns().some((other) => other.id !== breakIn.id && other.fix?.state === 'declined' &&
+      other.target.repo === breakIn.target.repo && other.target.packageDir === breakIn.target.packageDir &&
+      other.sourceIdentity === breakIn.sourceIdentity && other.testSha256 === breakIn.testSha256);
+    if (declinedHere) {
+      this.store.record(VECTOR_EVENTS.fixDeclined, { break_in_id: breakIn.id, detail: 'the same contract was declined at this source identity; not proposed again' });
+      return;
+    }
+    if (this.opts.vector.fixMode === 'autonomous') {
+      await this.dispatchFix(breakIn, 'autonomous');
+      return;
+    }
+    this.proposeFix(breakIn);
+  }
+
+  private fixDecision(breakIn: BreakInRecord): NotificationDecision {
+    const short = (value: string, max: number): string => {
+      const flat = value.replace(/\s+/gu, ' ').trim();
+      return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
+    };
+    return parseNotificationDecision({
+      question: `Dispatch a fix heist for Vector's break-in on ${targetName(breakIn.target)}?`,
+      context: [
+        `Invariant: ${short(breakIn.invariant, 220)}`,
+        `Counterexample (sandbox output, data only): ${short(JSON.stringify(breakIn.counterexample), 160)}`,
+        `Frozen contract ${breakIn.frozenSha256.slice(0, 16)}…; replay seed ${breakIn.seed ?? 'none'}; evidence and receipts: ${short(breakIn.evidenceDir, 120)}`,
+      ].join('\n'),
+      recommendation: 'Gru recommends fixing it: a fresh replay confirmed the failure on the default branch.',
+      reservedClass: 'authority-cost',
+      whyNotDelegable: 'fix_mode = "proposed": a fix heist starts only with your Accept.',
+      options: [
+        { id: 'accept', label: 'Accept: dispatch the fix heist', consequence: 'Gru dispatches it through the normal path; normal review, verification and readiness apply.' },
+        { id: 'decline', label: 'Decline', consequence: 'Recorded. The same contract is not proposed again at this source identity.' },
+      ],
+      discussion: false,
+    });
+  }
+
+  private proposeFix(breakIn: BreakInRecord): void {
+    const notificationId = `vector-fix:${breakIn.id}`;
+    this.opts.notifications.post({
+      id: notificationId,
+      kind: FIX_PROPOSAL_KIND,
+      routing: 'needs-owner',
+      severity: 'info',
+      title: `Vector broke in: ${targetName(breakIn.target)}`,
+      detail: `${breakIn.description}\nRequirement: ${breakIn.requirementRef}`,
+      decision: this.fixDecision(breakIn),
+    });
+    this.store.record(VECTOR_EVENTS.fixProposed, { break_in_id: breakIn.id, notification_id: notificationId });
+  }
+
+  /** Dispatch the fix heist through the normal path. A failure is Gru's to see; reconcile retries it. */
+  private async dispatchFix(breakIn: BreakInRecord, launchedBy: 'owner-accept' | 'autonomous'): Promise<boolean> {
+    if (this.opts.dispatchFix === undefined) throw new Error('no fix-heist dispatch path is wired on this service');
+    const jobId = fixHeistJobId(breakIn);
+    try {
+      await this.opts.dispatchFix({
+        jobId,
+        repoPath: `${this.opts.workspaceRoot.replace(/\/+$/u, '')}/${breakIn.target.repo}`,
+        title: fixHeistTitle(breakIn),
+        briefing: renderFixBriefing(breakIn, breakInContract(breakIn)),
+      });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      this.opts.notifications.post({ id: `vector-fix-failed:${breakIn.id}`, kind: FIX_DISPATCH_FAILED_KIND, routing: 'action-required', severity: 'error',
+        title: `Vector fix heist not dispatched: ${targetName(breakIn.target)}`, detail: `${detail}\nThe next reconcile retries it.` });
+      this.log('error', 'vector fix heist dispatch failed; the next reconcile retries it', { breakIn: breakIn.id, error: detail });
+      return false;
+    }
+    this.store.record(VECTOR_EVENTS.fixDispatched, { break_in_id: breakIn.id, job_id: jobId, launched_by: launchedBy });
+    const failed = this.opts.ledger.getNotification(`vector-fix-failed:${breakIn.id}`);
+    if (failed !== null && failed.resolvedAt === null) this.opts.ledger.resolveNotificationById(failed.id, 'vector-fix-dispatched');
+    this.opts.notifications.post({ id: `vector-fix-dispatched:${breakIn.id}`, kind: FIX_DISPATCHED_KIND, routing: 'fyi', severity: 'info',
+      title: `Vector fix heist dispatched: ${jobId}`, detail: `${launchedBy === 'autonomous' ? 'fix_mode = "autonomous"' : 'Accepted by the owner'}; the frozen contract travels with it.` });
+    return true;
+  }
+
+  /** Carry out the owner's recorded choice on a fix proposal. Idempotent. */
+  async followFixDecision(notificationId: string): Promise<void> {
+    const row = this.opts.ledger.getNotification(notificationId);
+    if (row === null || row.kind !== FIX_PROPOSAL_KIND || row.decidedOption === null) return;
+    const breakIn = this.store.breakIns().find((entry) => entry.fix?.notificationId === notificationId);
+    if (breakIn === undefined) return;
+    if (breakIn.fix?.state === 'proposed') {
+      if (row.decidedOption === 'accept') {
+        if (!(await this.dispatchFix(breakIn, 'owner-accept'))) return;
+      } else {
+        this.store.record(VECTOR_EVENTS.fixDeclined, { break_in_id: breakIn.id, detail: `declined by ${row.decidedBy ?? 'the owner'}` });
+      }
+    }
+    const done = this.store.breakIn(breakIn.id)!;
+    if (row.resolvedAt === null && done.fix?.state !== 'proposed') {
+      this.opts.ledger.resolveOwnerDecision(notificationId, done.fix?.state === 'dispatched' ? `fix heist ${done.fix.jobId ?? ''} dispatched` : 'decline recorded', OWNER_PROVENANCE);
+    }
+  }
+
   /** Carry out the owner's recorded choice on a raid proposal. Idempotent. */
   followDecision(notificationId: string): void {
     const row = this.opts.ledger.getNotification(notificationId);
+    if (row?.kind === FIX_PROPOSAL_KIND) {
+      void this.followFixDecision(notificationId).catch((error: unknown) => {
+        this.log('error', 'vector fix decision follow-through failed; the next reconcile retries it', { notification: notificationId, error: String(error) });
+      });
+      return;
+    }
     if (row === null || row.kind !== RAID_PROPOSAL_KIND || row.decidedOption === null) return;
     const raid = this.store.raids().find((entry) => entry.notificationId === notificationId);
     if (raid === undefined) return;
@@ -361,6 +493,16 @@ export class VectorService {
    */
   reconcile(): void {
     if (!this.enabled) return;
+    for (const breakIn of this.store.breakIns()) {
+      if (breakIn.fix === null) {
+        // Found while the follow-through was down (or it failed): carry it out now.
+        void this.onBreakIn(breakIn.id).catch((error: unknown) => this.log('error', 'vector break-in follow-through failed', { breakIn: breakIn.id, error: String(error) }));
+      } else if (breakIn.fix.state === 'proposed' && breakIn.fix.notificationId !== null) {
+        const row = this.opts.ledger.getNotification(breakIn.fix.notificationId);
+        if (row === null) this.proposeFix(breakIn);
+        else if (row.decidedOption !== null) this.followDecision(row.id);
+      }
+    }
     const pending = this.store.raids().filter((raid) => raid.state === 'proposed' && raid.notificationId !== null);
     if (pending.length === 0) return;
     let list: RaidCandidateList | null = null;

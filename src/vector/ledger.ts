@@ -22,6 +22,20 @@ export const VECTOR_EVENTS = {
   withdrawn: 'vector.raid-withdrawn',
   /** The raid is launched: it waits in Silas's raid queue. */
   queued: 'vector.raid-queued',
+  /** Silas started the raid at a default-branch head. */
+  started: 'vector.raid-started',
+  /** One attack's verdict and receipts. */
+  round: 'vector.raid-round',
+  /** A qualified counterexample a fresh replay confirmed. */
+  breakIn: 'vector.break-in',
+  /** The raid's terminal outcome and its report. */
+  finished: 'vector.raid-finished',
+  /** A break-in waits for the owner in FOR YOU (fix_mode "proposed"). */
+  fixProposed: 'vector.fix-proposed',
+  /** The owner declined the fix; the same contract is not proposed again at this identity. */
+  fixDeclined: 'vector.fix-declined',
+  /** The fix heist was dispatched through the normal dispatch path. */
+  fixDispatched: 'vector.fix-dispatched',
 } as const;
 
 export const VECTOR_EVENT_KINDS: readonly string[] = Object.values(VECTOR_EVENTS);
@@ -46,7 +60,52 @@ export interface RaidSignals {
 
 export type RaidRequester = 'gru' | 'owner-chat';
 export type RaidLaunch = 'owner-accept' | 'autonomous' | 'owner-chat';
-export type RaidState = 'proposed' | 'declined' | 'withdrawn' | 'queued';
+export type RaidState = 'proposed' | 'declined' | 'withdrawn' | 'queued' | 'running' | 'finished';
+
+/** The terminal outcome vocabulary (#351 §5). None of them is a pass. */
+export const RAID_OUTCOMES = ['found', 'budget-exhausted', 'no-qualified-proposals', 'refused', 'unsupported', 'infrastructure-error', 'yielded', 'invalidated'] as const;
+export type RaidOutcome = (typeof RAID_OUTCOMES)[number];
+
+/** One attack as the ledger keeps it. */
+export interface RaidRoundRecord {
+  readonly round: number;
+  readonly description: string | null;
+  /** The qualification verdict, or why there was none (no-submission, invalid-attack, duplicate, error). */
+  readonly verdict: string;
+  readonly candidateOutcome: string | null;
+  readonly replay: string | null;
+  readonly artifactSha256: string | null;
+  readonly executedRuns: number;
+  readonly detail: string;
+}
+
+export interface BreakInRecord {
+  readonly id: string;
+  readonly raidId: string;
+  readonly target: RaidTarget;
+  readonly headSha: string;
+  readonly sourceIdentity: string;
+  readonly description: string;
+  readonly requirementRef: string;
+  readonly invariant: string;
+  readonly frozenSha256: string;
+  readonly counterexample: string;
+  readonly seed: string | null;
+  readonly shrinkPath: readonly string[];
+  /** Where the frozen contract, the test bytes and the receipts are kept. */
+  readonly evidenceDir: string;
+  readonly testPath: string;
+  readonly testSha256: string;
+  readonly receipts: readonly string[];
+  readonly foundAt: string;
+  readonly fix: {
+    readonly state: 'proposed' | 'declined' | 'dispatched';
+    readonly notificationId: string | null;
+    readonly jobId: string | null;
+    readonly launchedBy: RaidLaunch | null;
+    readonly detail: string | null;
+  } | null;
+}
 
 export interface RaidRecord {
   readonly id: string;
@@ -65,6 +124,15 @@ export interface RaidRecord {
   readonly launchedAt: string | null;
   /** Why a proposal ended without a launch (decline or withdrawal). */
   readonly closedDetail: string | null;
+  readonly startedAt: string | null;
+  /** The default-branch head the raid actually ran at. */
+  readonly runHeadSha: string | null;
+  readonly rounds: readonly RaidRoundRecord[];
+  readonly outcome: RaidOutcome | null;
+  /** The user-facing label (never "pass"). */
+  readonly outcomeLabel: string | null;
+  readonly finishedAt: string | null;
+  readonly reportFile: string | null;
 }
 
 export interface PlanRecord {
@@ -119,6 +187,7 @@ export class VectorLedger {
   private cursor = 0;
   private readonly raidsById = new Map<string, RaidRecord>();
   private readonly plans = new Map<string, PlanRecord>();
+  private readonly breakInsById = new Map<string, BreakInRecord>();
 
   constructor(private readonly ledger: LedgerApi) {}
 
@@ -151,6 +220,16 @@ export class VectorLedger {
   raid(id: string): RaidRecord | null {
     this.refresh();
     return this.raidsById.get(id) ?? null;
+  }
+
+  breakIns(): readonly BreakInRecord[] {
+    this.refresh();
+    return [...this.breakInsById.values()];
+  }
+
+  breakIn(id: string): BreakInRecord | null {
+    this.refresh();
+    return this.breakInsById.get(id) ?? null;
   }
 
   plan(digest: string): PlanRecord | null {
@@ -192,7 +271,55 @@ export class VectorLedger {
           launchedBy: null,
           launchedAt: null,
           closedDetail: null,
+          startedAt: null,
+          runHeadSha: null,
+          rounds: [],
+          outcome: null,
+          outcomeLabel: null,
+          finishedAt: null,
+          reportFile: null,
         });
+        return;
+      }
+      case VECTOR_EVENTS.breakIn: {
+        const id = text(payload, 'break_in_id');
+        const strings = (key: string): readonly string[] => (Array.isArray(payload[key]) ? (payload[key] as unknown[]).filter((entry): entry is string => typeof entry === 'string') : []);
+        this.breakInsById.set(id, {
+          id,
+          raidId: text(payload, 'raid_id'),
+          target: { repo: text(payload, 'repo'), packageDir: text(payload, 'package_dir') },
+          headSha: text(payload, 'head_sha'),
+          sourceIdentity: text(payload, 'source_identity'),
+          description: text(payload, 'description'),
+          requirementRef: text(payload, 'requirement_ref'),
+          invariant: text(payload, 'invariant'),
+          frozenSha256: text(payload, 'frozen_sha256'),
+          counterexample: typeof payload['counterexample'] === 'string' ? payload['counterexample'] : '',
+          seed: typeof payload['seed'] === 'string' ? payload['seed'] : null,
+          shrinkPath: strings('shrink_path'),
+          evidenceDir: text(payload, 'evidence_dir'),
+          testPath: text(payload, 'test_path'),
+          testSha256: text(payload, 'test_sha256'),
+          receipts: strings('receipts'),
+          foundAt: ts,
+          fix: null,
+        });
+        return;
+      }
+      case VECTOR_EVENTS.fixProposed:
+      case VECTOR_EVENTS.fixDeclined:
+      case VECTOR_EVENTS.fixDispatched: {
+        const id = text(payload, 'break_in_id');
+        const breakIn = this.breakInsById.get(id);
+        if (breakIn === undefined) throw new VectorRecordError(`${kind} names unknown break-in "${id}"`);
+        const previous = breakIn.fix;
+        const fix = kind === VECTOR_EVENTS.fixProposed
+          ? { state: 'proposed' as const, notificationId: text(payload, 'notification_id'), jobId: null, launchedBy: null, detail: null }
+          : kind === VECTOR_EVENTS.fixDeclined
+            ? { state: 'declined' as const, notificationId: previous?.notificationId ?? null, jobId: null, launchedBy: null, detail: text(payload, 'detail') }
+            : { state: 'dispatched' as const, notificationId: previous?.notificationId ?? null, jobId: text(payload, 'job_id'),
+              launchedBy: (payload['launched_by'] === 'autonomous' ? 'autonomous' : 'owner-accept') as RaidLaunch, detail: null };
+        this.breakInsById.set(id, { ...breakIn, fix });
         return;
       }
       default:
@@ -217,6 +344,30 @@ export class VectorLedger {
           throw new VectorRecordError(`raid "${id}" names an unknown launch "${launchedBy}"`);
         }
         this.raidsById.set(id, { ...raid, state: 'queued', launchedBy, launchedAt: ts });
+        return;
+      }
+      case VECTOR_EVENTS.started:
+        this.raidsById.set(id, { ...raid, state: 'running', startedAt: ts, runHeadSha: text(payload, 'head_sha') });
+        return;
+      case VECTOR_EVENTS.round: {
+        const round: RaidRoundRecord = {
+          round: typeof payload['round'] === 'number' ? payload['round'] : raid.rounds.length + 1,
+          description: typeof payload['description'] === 'string' ? payload['description'] : null,
+          verdict: text(payload, 'verdict'),
+          candidateOutcome: typeof payload['candidate_outcome'] === 'string' ? payload['candidate_outcome'] : null,
+          replay: typeof payload['replay'] === 'string' ? payload['replay'] : null,
+          artifactSha256: typeof payload['artifact_sha256'] === 'string' ? payload['artifact_sha256'] : null,
+          executedRuns: typeof payload['executed_runs'] === 'number' ? payload['executed_runs'] : 0,
+          detail: typeof payload['detail'] === 'string' ? payload['detail'] : '',
+        };
+        this.raidsById.set(id, { ...raid, rounds: [...raid.rounds, round] });
+        return;
+      }
+      case VECTOR_EVENTS.finished: {
+        const outcome = text(payload, 'outcome');
+        if (!(RAID_OUTCOMES as readonly string[]).includes(outcome)) throw new VectorRecordError(`raid "${id}" names an unknown outcome "${outcome}"`);
+        this.raidsById.set(id, { ...raid, state: 'finished', outcome: outcome as RaidOutcome, outcomeLabel: text(payload, 'label'), finishedAt: ts,
+          reportFile: typeof payload['report_file'] === 'string' ? payload['report_file'] : null });
         return;
       }
       default:

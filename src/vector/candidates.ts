@@ -62,6 +62,14 @@ const DAY_MS = 86_400_000;
 
 const sameTarget = (left: RaidTarget, right: RaidTarget): boolean => left.repo === right.repo && left.packageDir === right.packageDir;
 
+/** Outcomes that leave a target worth raiding again at the same code: the
+ * raid stopped for heist work, main moved under it, or the host failed. */
+const RETRYABLE_OUTCOMES: ReadonlySet<string> = new Set(['yielded', 'invalidated', 'infrastructure-error']);
+
+/** A launched raid that settled this target at this identity. */
+const raidedHere = (raid: RaidRecord): boolean =>
+  raid.launchedAt !== null && !(raid.state === 'finished' && raid.outcome !== null && RETRYABLE_OUTCOMES.has(raid.outcome));
+
 /** Never-raided targets first; then weighted signals. Deterministic. */
 export function rankScore(signals: RaidSignals): number {
   const age = signals.daysSinceLastRaid === null ? 1_000 : signals.daysSinceLastRaid;
@@ -151,7 +159,7 @@ export function buildRaidCandidates(inputs: CandidateInputs): RaidCandidateList 
       const history = inputs.raids.filter((raid) => sameTarget(raid.target, target));
       const atIdentity = history.filter((raid) => raid.sourceIdentity === sourceIdentity);
       if (history.some((raid) => raid.state === 'proposed')) { exclude('a raid proposal for it is pending', packageDir); continue; }
-      if (atIdentity.some((raid) => raid.state === 'queued')) { exclude('already raided at this source identity', packageDir); continue; }
+      if (atIdentity.some(raidedHere)) { exclude('already raided at this source identity', packageDir); continue; }
       if (atIdentity.some((raid) => raid.state === 'declined')) { exclude('declined at this source identity', packageDir); continue; }
       const last = history.filter((raid) => raid.launchedAt !== null).sort((left, right) => Date.parse(right.launchedAt!) - Date.parse(left.launchedAt!))[0];
       const signals: RaidSignals = {
