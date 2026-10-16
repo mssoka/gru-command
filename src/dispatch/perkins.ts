@@ -3637,6 +3637,22 @@ export class WaveRunner {
       if (input.evidence !== undefined && input.evidence.length > 0) {
         throw new Error('private review evidence cannot be delivered through the bmad-review fallback route; re-arm without evidence or repair the Perkins pre-flight');
       }
+      // #366: the fallback route crosses the SAME last admission boundary as
+      // the native route (F-H7 / F-H2/M2): after every awaited preflight step
+      // and before any fallback admission effect, the bound delivered head is
+      // re-proved and the caller's final admission guard runs — a clean-abort
+      // head move or a hold/CI change during the preflight never arms a
+      // fallback review on stale grounds.
+      if (input.boundDeliveredSha !== undefined) {
+        const deliveredNow = this.opts.ledger.latestJobEvent(input.jobId, 'job.delivered');
+        const shaNow = deliveredNow === null ? null : deliveredTargetSha(deliveredNow);
+        if (shaNow !== input.boundDeliveredSha) {
+          throw new Error(
+            `the bound delivered head moved during the fallback preflight (${input.boundDeliveredSha} -> ${shaNow ?? 'none'}) — request the review again`,
+          );
+        }
+      }
+      input.finalAdmissionGuard?.();
       return this.beginFallbackGate(input, result.failures, lanePath, () => this.assertFallbackIterationCurrent(input, admission));
     }
     // Post-await recheck (handoff replays only): permission is re-proven

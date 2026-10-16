@@ -12,7 +12,7 @@ import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
 import type { Role } from '../src/config.js';
-import { finalizeRebriefRequest, reconcilePendingRebriefs } from '../src/dispatch/rebrief-recovery.js';
+import { RebriefTurnCancelled, checkRebriefTurn, finalizeRebriefRequest, reconcilePendingRebriefs } from '../src/dispatch/rebrief-recovery.js';
 import type { DirectiveRegistry } from '../src/dispatch/fix-directive.js';
 import {
   admitBlindReview,
@@ -283,6 +283,30 @@ function seedCorrelatedReceipt(h: Harness, jobId: string, kind: 'silas.rebrief' 
     ...(kind === 'silas.rebrief' ? { minion_id: minionId, note: 'n', sha: h.lanePath === null ? undefined : resolveGitCommit(h.lanePath, 'HEAD') } : { agentId: minionId, source: 'silas-rebrief', sha: 'settled-head' }),
     work_revision: marker.workRevision,
     ...(marker.phaseId === null ? { marker_id: marker.id, payload_hash: marker.payloadHash } : { phase_id: marker.phaseId }), ...extra } });
+}
+
+/** Fires `change` at the first re-brief receipt read AFTER finalize has
+ * read the job live (the read just before its turn check), so the change
+ * is visible only to `checkRebriefTurn`, never to the earlier job read. */
+function afterLiveJobRead(h: Harness, change: () => void): { readonly fired: () => boolean } {
+  const getJob = h.ledger.getJob.bind(h.ledger);
+  const receipt = h.ledger.pendingRebriefReceipt.bind(h.ledger);
+  let inReceipt = 0;
+  let jobRead = false;
+  let fired = false;
+  vi.spyOn(h.ledger, 'getJob').mockImplementation((id) => {
+    if (inReceipt === 0) jobRead = true;
+    return getJob(id);
+  });
+  vi.spyOn(h.ledger, 'pendingRebriefReceipt').mockImplementation((marker) => {
+    inReceipt += 1;
+    try {
+      const found = receipt(marker);
+      if (jobRead && !fired) { fired = true; change(); }
+      return found;
+    } finally { inReceipt -= 1; }
+  });
+  return { fired: () => fired };
 }
 
 function seedHistoricalCompletion(h: Harness, jobId: string): void {
@@ -784,6 +808,67 @@ describe('re-brief restart safety (durable markers)', () => {
     expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
     expect(h.ledger.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-settled')).toHaveLength(1);
     expect(busSettlements).toBe(1);
+  });
+
+  it('the turn check cancels by name: a replaced generation is superseded, a terminal job is terminal, a missing job is no cancellation (#368)', async () => {
+    const h = makeHarness();
+    const jobId = 'turn-check-job';
+    try {
+      await seedPendingRebrief({ h, jobId });
+      const markers = h.ledger.listPendingRebriefs({ jobId });
+      expect(() => checkRebriefTurn(h.ledger, jobId, markers)).not.toThrow();
+      const cancelled = (expected: readonly typeof markers[number][], reader: Pick<LedgerApi, 'getJob' | 'listPendingRebriefs'> = h.ledger): unknown => {
+        try { checkRebriefTurn(reader, jobId, expected); return null; } catch (error) { return error; }
+      };
+      const replaced = cancelled(markers.map((marker) => ({ ...marker, payloadHash: 'another-generation' })));
+      expect(replaced).toBeInstanceOf(RebriefTurnCancelled);
+      expect((replaced as RebriefTurnCancelled).reason).toBe('superseded');
+      const missingJob = cancelled(markers, { listPendingRebriefs: (opts) => h.ledger.listPendingRebriefs(opts), getJob: () => null });
+      expect(missingJob).not.toBeInstanceOf(RebriefTurnCancelled);
+      expect(String(missingJob)).toMatch(/no longer exists/u);
+      merge(h, jobId);
+      const terminal = cancelled(markers);
+      expect(terminal).toBeInstanceOf(RebriefTurnCancelled);
+      expect((terminal as RebriefTurnCancelled).reason).toBe('terminal');
+    } finally { h.close(); }
+  });
+
+  it('a job that goes terminal at the turn check retires the exact generation instead of recording a late delivery (#368)', async () => {
+    const h = makeHarness();
+    const jobId = 'turn-cancel-terminal';
+    try {
+      await seedPendingRebrief({ h, jobId });
+      seedCorrelatedReceipt(h, jobId, 'silas.rebrief');
+      const markers = h.ledger.listPendingRebriefs({ jobId });
+      // The job goes terminal AFTER finalize read it live, at the receipt
+      // read just before the turn check — only the cancelled turn can see it.
+      const trigger = afterLiveJobRead(h, () => merge(h, jobId));
+      const result = finalizeRebriefRequest({ ledger: h.ledger, worktrees: h.worktrees, jobId, minionId: 'worker-1', lanePath: h.lanePath, note: 'n', expectedMarkers: markers });
+      expect(trigger.fired()).toBe(true);
+      expect(result).toMatchObject({ retired: true, superseded: false, deliveryRecorded: false, deliveredSha: null });
+      expect(h.ledger.listPendingRebriefs({ jobId })).toEqual([]);
+      expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
+      expect(h.ledger.getJob(jobId)?.status).toBe('merged');
+    } finally { h.close(); }
+  });
+
+  it('a generation replaced at the turn check leaves the newer request pending and reports the old turn superseded (#368)', async () => {
+    const h = makeHarness();
+    const jobId = 'turn-cancel-superseded';
+    try {
+      await seedPendingRebrief({ h, jobId });
+      seedCorrelatedReceipt(h, jobId, 'silas.rebrief');
+      const markers = h.ledger.listPendingRebriefs({ jobId });
+      let newer: readonly { readonly id: string }[] = [];
+      const trigger = afterLiveJobRead(h, () => { newer = h.ledger.beginPendingRebrief({ jobId, note: 'new request', briefing: 'new contract' }); });
+      const result = finalizeRebriefRequest({ ledger: h.ledger, worktrees: h.worktrees, jobId, minionId: 'worker-1', lanePath: h.lanePath, note: 'n', expectedMarkers: markers });
+      expect(trigger.fired()).toBe(true);
+      expect(newer).toHaveLength(2);
+      expect(result).toMatchObject({ superseded: true, retired: false, deliveryRecorded: false });
+      expect(h.ledger.listPendingRebriefs({ jobId }).map((marker) => marker.id)).toEqual(newer.map((marker) => marker.id));
+      expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
+      expect(h.ledger.getJob(jobId)?.status).toBe('working');
+    } finally { h.close(); }
   });
 
   it('a newer request admitted after a settlement failure is never settled by the old turn (issue #189)', async () => {
