@@ -44,7 +44,7 @@ import {
   renderBlindPackageBlock,
   type BlindCoverage,
 } from './blind-review.js';
-import { blindDiffSections, gitBlobSha, normalizeRepoPath, type BlindInputPackage, type BlindViolation, type DiffHunk, type ObservedToolResult } from './blind-input.js';
+import { blindDiffSections, gitBlobSha, normalizeRepoPath, shownPath, shownWhere, type BlindInputPackage, type BlindViolation, type DiffHunk, type ObservedToolResult } from './blind-input.js';
 
 /** A file's lines as a diff counts them (a final newline ends the last). */
 function fileLines(text: string): readonly string[] {
@@ -82,8 +82,8 @@ function bindBlindPackage(binding: ReviewSourceBinding): (pkg: BlindInputPackage
     for (const file of pkg.files ?? []) {
       const path = normalizeRepoPath(file.path);
       const blob = targetBlob(store, target, path);
-      if (blob === null) violations.push(unbound(path, `"${path}" is not a file in the target tree`));
-      else if (blob !== gitBlobSha(file.content)) violations.push(unbound(path, `the bytes supplied for "${path}" are not the target's blob ${blob}`));
+      if (blob === null) violations.push(unbound(shownWhere(path), `${shownPath(path)} is not a file in the target tree`));
+      else if (blob !== gitBlobSha(file.content)) violations.push(unbound(shownWhere(path), `the bytes supplied for ${shownPath(path)} are not the target's blob ${blob}`));
     }
     if (pkg.diff !== undefined && base !== null && baseHolds) {
       const changed = changedPaths(store, base, target);
@@ -91,17 +91,17 @@ function bindBlindPackage(binding: ReviewSourceBinding): (pkg: BlindInputPackage
       else {
         for (const section of blindDiffSections(pkg.diff.text)) {
           const named = [...new Set([section.oldPath, section.path])].filter((path) => !changed.has(path));
-          for (const path of named) violations.push(unbound(path, `the diff names "${path}", which ${pkg.baseSha}..${pkg.targetSha} does not change`));
+          for (const path of named) violations.push(unbound(shownWhere(path), `the diff names ${shownPath(path)}, which ${pkg.baseSha}..${pkg.targetSha} does not change`));
           if (named.length > 0 || section.hunks.length === 0) continue;
           const before = blobText(store, base, section.oldPath);
           const after = blobText(store, target, section.path);
           const side = (hunk: DiffHunk, old: boolean): string => old ? `-${String(hunk.oldStart)}` : `+${String(hunk.newStart)}`;
           for (const hunk of section.hunks) {
             if (!hunkSideHolds(before, hunk.oldStart, hunk.oldLines)) {
-              violations.push(unbound(section.oldPath, `the hunk at ${side(hunk, true)} shows lines that are not "${section.oldPath}" at ${pkg.baseSha}`));
+              violations.push(unbound(shownWhere(section.oldPath), `the hunk at ${side(hunk, true)} shows lines that are not ${shownPath(section.oldPath)} at ${pkg.baseSha}`));
             }
             if (!hunkSideHolds(after, hunk.newStart, hunk.newLines)) {
-              violations.push(unbound(section.path, `the hunk at ${side(hunk, false)} shows lines that are not "${section.path}" at ${pkg.targetSha}`));
+              violations.push(unbound(shownWhere(section.path), `the hunk at ${side(hunk, false)} shows lines that are not ${shownPath(section.path)} at ${pkg.targetSha}`));
             }
           }
         }

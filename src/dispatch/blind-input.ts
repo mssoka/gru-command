@@ -297,12 +297,12 @@ export function normalizeRepoPath(path: string): string {
  * (the classes silas_action text refuses — control, format, separator,
  * private-use, unassigned — astral ones too), so no refusal can break,
  * reorder or hide a line. */
-function shownPath(path: string): string {
+export function shownPath(path: string): string {
   return hasLineUnsafe(path) ? lineSafeLiteral(path) : `"${path}"`;
 }
 
 /** A path as a violation's `where` holds it: as written when line-safe. */
-function shownWhere(path: string): string {
+export function shownWhere(path: string): string {
   return hasLineUnsafe(path) ? lineSafeLiteral(path) : path;
 }
 
@@ -674,8 +674,8 @@ function sectionViolations(section: DiffSection, rule: BlindIsolationRule): read
       classifyHistoryContent(section.body).excluded) {
     out.push({
       code: 'history-content',
-      where: section.path,
-      detail: `"${section.path}" carries task-spec, prior-assessment, deferred-work or triage text in its diff body`,
+      where: shownWhere(section.path),
+      detail: `${shownPath(section.path)} carries task-spec, prior-assessment, deferred-work or triage text in its diff body`,
     });
   }
   return out;
@@ -968,7 +968,7 @@ export function scanObservedAccess(
         index: result.index,
         toolName: result.toolName,
         code: 'excluded-path-read',
-        path: excluded.path,
+        path: shownWhere(excluded.path),
         detail: excluded.detail ?? 'excluded path',
         excerptSha256: sha256(result.text),
       });

@@ -542,6 +542,14 @@ describe('git\'s diff section grammar (#360 R5-B1 round 1)', () => {
     expect(violations).toEqual([expect.objectContaining({ code: 'excluded-path', where: '"_bmad-output/x\\u202e.md"' })]);
     expect(violations[0]!.detail).not.toMatch(/\u202e/u);
     expect(violations[0]!.detail).toContain('"_bmad-output/x\\u202e.md" is private job material');
+    // ...and a document section judged by its history text, likewise.
+    const note = HISTORY_NOTE.split('\n');
+    const historyHeader = 'diff --git "a/notes\\342\\200\\256.md" "b/notes\\342\\200\\256.md"';
+    const history = evaluate([historyHeader, `@@ -0,0 +1,${String(note.length)} @@`, ...note.map((line) => `+${line}`), ''].join('\n')).violations;
+    expect(history).toEqual([expect.objectContaining({ code: 'history-content', where: '"notes\\u202e.md"', detail: expect.stringMatching(/^"notes\\u202e\.md" carries/u) })]);
+    // ...and a grep hit naming such a path, as recorded access.
+    const [hit] = scanObservedAccess([{ index: 0, toolName: 'bash', text: 'docs/issues/a\u202eb.md:1:x' }], DEFAULT_BLIND_ISOLATION_RULE);
+    expect(hit).toMatchObject({ code: 'excluded-path-read', path: '"docs/issues/a\\u202eb.md"' });
   });
 
   it('`.` or `./` names the repository, never a package file; a file path holding a control character is refused', () => {

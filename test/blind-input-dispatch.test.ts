@@ -613,6 +613,15 @@ describe('blind review commissioning (issue #316)', () => {
       expect(filesOnly.status, label).toBe(422);
       expect(codes(filesOnly), label).toEqual(['unbound-package input_package.base_sha']);
     }
+    // A diff path holding a line-unsafe character is named line-safe in its refusal.
+    const hidden = await call(h.port, 'POST', '/api/dispatch', blindReview('rev-hidden-path', {
+      repo_path: h.repo.path, target_sha: target,
+      input_package: { ...pkg, diff: { text: `${diff}\ndiff --git "a/src/x\\342\\200\\213.ts" "b/src/x\\342\\200\\213.ts"\n@@ -0,0 +1 @@\n+x\n` } },
+    }));
+    expect(hidden.status).toBe(422);
+    expect((hidden.json['violations'] as { code: string; where: string; detail: string }[])).toEqual([
+      expect.objectContaining({ code: 'unbound-package', where: '"src/x\\u200b.ts"', detail: expect.stringMatching(/^the diff names "src\/x\\u200b\.ts", which /u) }),
+    ]);
     // Neither does a file the target tree does not hold, nor a diff path the range never changes.
     const strays = await call(h.port, 'POST', '/api/dispatch', blindReview('rev-strays', {
       repo_path: h.repo.path, target_sha: target,
