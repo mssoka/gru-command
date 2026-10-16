@@ -4,6 +4,8 @@ import { describe, expect, it } from 'vitest';
 import {
   BlindInputRefusal,
   DEFAULT_BLIND_ISOLATION_RULE,
+  blindDiffPaths,
+  blindDiffSections,
   classifyBlindPath,
   classifyHistoryContent,
   deriveBlindIsolationRule,
@@ -396,7 +398,7 @@ describe('retained blind-input roots (#360)', () => {
   const base = 'b'.repeat(40);
   const target = 'c'.repeat(40);
   const evaluate = (text: string) => evaluateBlindPackage({ baseSha: base, targetSha: target, diff: { text } }, DEFAULT_BLIND_ISOLATION_RULE);
-  const section = (header: string, added: string) => [header, '--- a/x', '+++ b/x', '@@ -0,0 +1 @@', `+${added}`, ''].join('\n');
+  const section = (header: string, added: string) => [header, '@@ -0,0 +1 @@', `+${added}`, ''].join('\n');
 
   it('refuses a diff the gate cannot read — prose, an empty text, a preamble or an unreadable header (R5-B1)', () => {
     const prose = evaluate(HISTORY_NOTE);
@@ -434,8 +436,9 @@ describe('retained blind-input roots (#360)', () => {
   });
 
   it('a document renamed to a source extension is still judged by its history text (R4-E5)', () => {
-    const renamed = ['diff --git a/notes.md b/notes.ts', 'similarity index 10%', 'rename from notes.md', 'rename to notes.ts', '--- a/notes.md', '+++ b/notes.ts', '@@ -1 +1,7 @@',
-      ...HISTORY_NOTE.split('\n').map((line) => `+${line}`), ''].join('\n');
+    const note = HISTORY_NOTE.split('\n');
+    const renamed = ['diff --git a/notes.md b/notes.ts', 'similarity index 10%', 'rename from notes.md', 'rename to notes.ts', '--- a/notes.md', '+++ b/notes.ts',
+      `@@ -1 +1,${String(note.length)} @@`, '-old note', ...note.map((line) => `+${line}`), ''].join('\n');
     expect(evaluate(renamed).violations).toEqual([expect.objectContaining({ code: 'history-content', where: 'notes.ts' })]);
   });
 
@@ -447,11 +450,86 @@ describe('retained blind-input roots (#360)', () => {
     expect(scanObservedAccess([read('/lanes/job-1/docs/issues/9.json')], rule, ['/lanes/job-1']))
       .toEqual([expect.objectContaining({ code: 'excluded-path-read', path: 'docs/issues/9.json' })]);
     expect(scanObservedAccess([read('/lanes/job-1/src/a.ts')], rule, ['/lanes/job-1'])).toEqual([]);
-    // ...one outside it is outside the package; with no known checkout it is not judged.
-    expect(scanObservedAccess([read('/elsewhere/repo/x.json')], rule, ['/lanes/job-1'])).toEqual([expect.objectContaining({ code: 'excluded-path-read' })]);
+    // ...one outside it is outside the package, said as that; with no known checkout it is not judged.
+    expect(scanObservedAccess([read('/elsewhere/repo/x.json')], rule, ['/lanes/job-1']))
+      .toEqual([expect.objectContaining({ code: 'excluded-path-read', path: '/elsewhere/repo/x.json', detail: '"/elsewhere/repo/x.json" is outside the reviewer\'s checkout, so outside its package' })]);
     expect(scanObservedAccess([read('/elsewhere/repo/x.json')], rule)).toEqual([]);
-    // A read that failed, or returned nothing, read nothing.
-    expect(scanObservedAccess([read('_bmad-output/state.json', 'ENOENT', true), read('_bmad-output/state.json', '  ')], rule)).toEqual([]);
+    // The checkout itself is no file.
+    expect(scanObservedAccess([read('/lanes/job-1'), read('/lanes/job-1/')], rule, ['/lanes/job-1'])).toEqual([]);
+    // A read that failed read nothing...
+    expect(scanObservedAccess([read('_bmad-output/state.json', 'ENOENT', true)], rule)).toEqual([]);
+    // ...but an empty or binary result (an image, a PDF: no text) still returned the file.
+    expect(scanObservedAccess([read('_bmad-output/state.json', '  '), read('docs/issues/scan.png', '')], rule).map((hit) => hit.path))
+      .toEqual(['_bmad-output/state.json', 'docs/issues/scan.png']);
+  });
+});
+
+describe('git\'s diff section grammar (#360 R5-B1 round 1)', () => {
+  const base = 'b'.repeat(40);
+  const target = 'c'.repeat(40);
+  const evaluate = (text: string) => evaluateBlindPackage({ baseSha: base, targetSha: target, diff: { text } }, DEFAULT_BLIND_ISOLATION_RULE);
+  const changed = (path: string, quoted = false) => {
+    const a = quoted ? `"a/${path}"` : `a/${path}`;
+    const b = quoted ? `"b/${path}"` : `b/${path}`;
+    // git ends a ---/+++ name holding a space with a tab.
+    const tab = path.includes(' ') ? '\t' : '';
+    return [`diff --git ${a} ${b}`, 'index 422c2b7..0f7bc76 100644', `--- ${a}${tab}`, `+++ ${b}${tab}`, '@@ -1,2 +1,2 @@', ' a', '-b', '+c', ''].join('\n');
+  };
+
+  it('reads a path that itself holds " b/" whole, as git writes it', () => {
+    expect(evaluate(changed('p b/q.ts')).ok).toBe(true);
+    expect(blindDiffPaths(changed('p b/q.ts'))).toEqual(['p b/q.ts']);
+    expect(evaluate(changed('docs/issues/x b/y.md')).violations).toEqual([expect.objectContaining({ code: 'excluded-path', where: 'docs/issues/x b/y.md' })]);
+    // With no ---/+++ lines to lean on (a mode-only change), the header alone names it.
+    expect(blindDiffPaths(['diff --git a/p b/run.sh b/p b/run.sh', 'old mode 100644', 'new mode 100755', ''].join('\n'))).toEqual(['p b/run.sh']);
+  });
+
+  it('splits a rename header only by its own rename lines, which must spell it back', () => {
+    const rename = (from: string, to: string, header = `diff --git a/${from} b/${to}`) =>
+      [header, 'similarity index 100%', `rename from ${from}`, `rename to ${to}`, ''].join('\n');
+    expect(blindDiffSections(rename('p b/q.ts', 'p b/r.ts'))).toEqual([{ oldPath: 'p b/q.ts', path: 'p b/r.ts', hunks: [] }]);
+    expect(evaluate(rename('p b/q.ts', 'p b/r.ts', 'diff --git a/p b/q.ts b/p b/s.ts')).violations.map((v) => v.code)).toEqual(['unparsed-diff']);
+    // An ambiguous header with nothing to split it is unreadable, never guessed.
+    expect(evaluate('diff --git a/x.ts b/y.ts\n').violations.map((v) => v.code)).toEqual(['unparsed-diff']);
+  });
+
+  it('a ---/+++ or rename line naming another path than the header is refused', () => {
+    const lying = changed('src/a.ts').replace('+++ b/src/a.ts', '+++ b/_bmad-output/spec.md');
+    expect(evaluate(lying).violations).toEqual([expect.objectContaining({ code: 'unparsed-diff', detail: expect.stringMatching(/rename, copy or ---\/\+\+\+ lines name another path/u) })]);
+    const renamed = ['diff --git a/src/a.ts b/src/a.ts', 'rename from docs/issues/9.md', 'rename to src/a.ts', ''].join('\n');
+    expect(evaluate(renamed).violations.map((v) => v.code)).toEqual(['unparsed-diff']);
+  });
+
+  it('reads an unescaped astral character in a quoted path as itself', () => {
+    expect(blindDiffPaths(changed('src/\u{1F600}.ts', true))).toEqual(['src/\u{1F600}.ts']);
+  });
+
+  it('refuses every line outside a section\'s grammar: prose, a combined diff, a hunk overrun or cut short, a binary patch', () => {
+    const ok = changed('src/a.ts');
+    expect(evaluate(ok).ok).toBe(true);
+    const cases: readonly [string, string][] = [
+      ['prose after a hunk', `${ok}${HISTORY_NOTE}\n`],
+      ['a combined diff line', `${ok}diff --cc docs/issues/9.md\n`],
+      ['a hunk overrun', ok.replace('+c\n', '+c\n+one more\n')],
+      ['a hunk cut short', ok.replace(' a\n-b\n+c\n', ' a\n-b\n')],
+      ['prose among the extended headers', ok.replace('index 422c2b7..0f7bc76 100644', 'Here is the planning note:')],
+      ['a binary patch', ['diff --git a/x.bin b/x.bin', 'GIT binary patch', 'literal 3', 'abc', ''].join('\n')],
+    ];
+    for (const [label, text] of cases) expect(evaluate(text).violations.map((v) => v.code), label).toEqual(['unparsed-diff']);
+    // Git's own no-newline marker, a blank separator and a mode-only section stay readable.
+    expect(evaluate(`${ok.replace('+c\n', '+c\n\\ No newline at end of file\n')}\n${['diff --git a/run.sh b/run.sh', 'old mode 100644', 'new mode 100755', ''].join('\n')}`).ok).toBe(true);
+  });
+
+  it('records each hunk\'s old and new lines from the lines its header names', () => {
+    expect(blindDiffSections(changed('src/a.ts'))).toEqual([{ oldPath: 'src/a.ts', path: 'src/a.ts', hunks: [{ oldStart: 1, oldLines: ['a', 'b'], newStart: 1, newLines: ['a', 'c'] }] }]);
+  });
+
+  it('binding an unreadable diff is a caller error, said loud', () => {
+    expect(() => blindDiffSections('Here is the change.')).toThrow(/cannot be bound: line 1 comes before any diff header/u);
+  });
+
+  it('`.` or `./` names the repository, never a package file', () => {
+    for (const path of ['.', './', './/']) expect(classifyBlindPath(path, DEFAULT_BLIND_ISOLATION_RULE), path).toMatch(/names the repository root/u);
   });
 });
 

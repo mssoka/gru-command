@@ -56,6 +56,8 @@ interface Harness {
 async function boot(opts: {
   /** Wire the real git review-source preflight (the production wiring). */
   reviewSource?: boolean;
+  /** Spawned sessions carry no transcript at all (#360 R5-B6). */
+  noTranscript?: boolean;
   sessionToolResults?: (file: string | null) => readonly ObservedToolResult[] | null;
   /** The briefing prompt of this job rejects after its tools ran (#356). */
   rejectPromptOf?: string;
@@ -81,8 +83,8 @@ async function boot(opts: {
     const id = `agent-${spawns}`;
     // A real (empty) transcript, as every production session has: a settle
     // scan reads it, so absence never stands in for an observation.
-    const sessionFile = join(dir, `${id}.jsonl`);
-    writeFileSync(sessionFile, '');
+    const sessionFile = opts.noTranscript === true ? null : join(dir, `${id}.jsonl`);
+    if (sessionFile !== null) writeFileSync(sessionFile, '');
     return {
       role, id, sessionFile, capabilities: CAPS,
       async prompt(text: string) {
@@ -104,7 +106,7 @@ async function boot(opts: {
     ...(opts.log !== undefined ? { log: opts.log } : {}),
     ...(opts.retrySettlement !== undefined ? { retrySettlement: opts.retrySettlement } : {}),
     ...(opts.stopSignal !== undefined ? { stopSignal: opts.stopSignal } : {}),
-    ...(opts.reviewSource === true ? { reviewSource: gitReviewSourcePreflight } : {}),
+    ...(opts.reviewSource === true ? { reviewSource: gitReviewSourcePreflight } : { allowUnboundBlindPackages: true }),
   });
   const wave = new WaveRunner({ ledger, worktrees, spawner, bus });
   const server = createDispatchServer({ pendingProducerBlockers: () => [], config: cfg, dispatch, wave, ledger });
@@ -584,6 +586,21 @@ describe('blind review commissioning (issue #316)', () => {
     }));
     expect(forged.status).toBe(422);
     expect(codes(forged)).toEqual(['unbound-package src/feature.ts']);
+    // Nor does a diff whose hunk shows lines the files never held at that place...
+    const forgedHunk = await call(h.port, 'POST', '/api/dispatch', blindReview('rev-forged-hunk', {
+      repo_path: h.repo.path, target_sha: target, input_package: { ...pkg, diff: { text: diff.replace('+export const feature = 2;', '+export const feature = 2; // see docs/issues/9.md') } },
+    }));
+    expect(forgedHunk.status).toBe(422);
+    expect(codes(forgedHunk)).toEqual(['unbound-package src/feature.ts']);
+    // ...nor a base the object store lacks, or one that is not the target's ancestor — with or without a diff.
+    const unrelated = h.repo.git(['commit-tree', '-m', 'unrelated', `${target}^{tree}`]).trim();
+    for (const [label, base_sha] of [['fictitious', 'e'.repeat(40)], ['unrelated', unrelated]] as const) {
+      const filesOnly = await call(h.port, 'POST', '/api/dispatch', blindReview(`rev-base-${label}`, {
+        repo_path: h.repo.path, target_sha: target, input_package: { base_sha, target_sha: target, files: pkg.files },
+      }));
+      expect(filesOnly.status, label).toBe(422);
+      expect(codes(filesOnly), label).toEqual(['unbound-package input_package.base_sha']);
+    }
     // Neither does a file the target tree does not hold, nor a diff path the range never changes.
     const strays = await call(h.port, 'POST', '/api/dispatch', blindReview('rev-strays', {
       repo_path: h.repo.path, target_sha: target,
@@ -610,6 +627,16 @@ describe('blind review commissioning (issue #316)', () => {
     const again = await call(h.port, 'POST', '/api/dispatch', blindReview('rev-again', { repo_path: h.repo.path, target_sha: target, input_package: pkg }));
     expect(again.status).toBe(409);
     expect(again.json).toMatchObject({ error: 'blind_coverage_owned', coverage_job_id: 'rev-bound' });
+  });
+
+  it('a settled reviewer whose transcript cannot be read is unobserved through the API, never qualifying (#360 R5-B6)', async () => {
+    const h = await boot({ noTranscript: true });
+    await dispatchParent(h);
+    const created = await call(h.port, 'POST', '/api/dispatch', blindReview('rev-unread', { repo_path: h.repo.path, input_package: validPackage() }));
+    expect(created.status).toBe(202);
+    await waitFor(() => h.ledger.latestJobEvent('rev-unread', 'job.blind-access-unobservable') !== null);
+    const coverage = await call(h.port, 'GET', '/api/dispatch/jobs/rev-unread/blind-coverage');
+    expect(coverage.json).toMatchObject({ state: 'unobserved', qualifying: false, accessObserved: false });
   });
 
   it('refuses claims inputs (required_inputs) for a blind reviewer, before any reviewer spawns (#360 R5-B4)', async () => {

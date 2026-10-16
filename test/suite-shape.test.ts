@@ -188,10 +188,10 @@ const PINS: Record<string, number> = {
   'awareness-adversarial.test.ts': 2,
 
 
-  'blind-input-dispatch.test.ts': 23,
-  'blind-input.test.ts': 25,
+  'blind-input-dispatch.test.ts': 24,
+  'blind-input.test.ts': 33,
   'blind-observer-service.test.ts': 2,
-  'blind-review.test.ts': 11,
+  'blind-review.test.ts': 16,
   'bmad-legacy-retirement.test.ts': 5,
   'bmad-onboarding.test.ts': 13,
   'gc-bootstrap-retirement.test.ts': 6,
@@ -290,7 +290,7 @@ const PINS: Record<string, number> = {
   'provider-recovery-composition.test.ts': 9,
   'provider-recovery-ledger.test.ts': 18,
   'provider-recovery-metadata.test.ts': 24,
-  'provider-recovery-resume.test.ts': 26,
+  'provider-recovery-resume.test.ts': 27,
   'provider-recovery-seam.test.ts': 17,
   'provider-recovery-sensor.test.ts': 92,
   'restart-recovery-progress.test.ts': 183,

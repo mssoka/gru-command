@@ -298,6 +298,8 @@ export function classifyBlindPath(rawPath: string, rule: BlindIsolationRule): st
     return `invalid package path "${rawPath}" (must be a relative path inside the repository)`;
   }
   const normalized = normalizeRepoPath(path);
+  // `.` or `./` names the repository itself, never a file in it.
+  if (normalized === '') return `invalid package path "${rawPath}" (names the repository root, not a file)`;
   if (rule.privateGlobs.some((glob) => globToRegExp(glob).test(normalized))) {
     return `"${normalized}" is private job material (planning, spec, review or triage artifacts)`;
   }
@@ -428,11 +430,22 @@ export function gitBlobSha(content: string): string {
   return createHash('sha1').update(`blob ${body.length}\0`).update(body).digest('hex');
 }
 
+/** One hunk of a diff section: the old- and new-side lines it shows (its
+ * context with its removals, its context with its additions), each from the
+ * line its header names. */
+export interface DiffHunk {
+  readonly oldStart: number;
+  readonly oldLines: readonly string[];
+  readonly newStart: number;
+  readonly newLines: readonly string[];
+}
+
 interface DiffSection {
   readonly path: string;
   readonly oldPath: string;
   readonly text: string;
   readonly body: string;
+  readonly hunks: readonly DiffHunk[];
 }
 
 /** One C-quoted git path (`"a/sp\\303\\251c\\"ial"`): the text after the
@@ -441,13 +454,15 @@ function unquoteGitPath(quoted: string): { readonly path: string; readonly rest:
   const bytes: number[] = [];
   const escapes: Record<string, number> = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, '\\': 92 };
   for (let at = 1; at < quoted.length; at += 1) {
-    const char = quoted[at]!;
+    // A whole code point, never half a surrogate pair: an unescaped astral
+    // character (core.quotePath=false) keeps its bytes.
+    const char = String.fromCodePoint(quoted.codePointAt(at)!);
     if (char === '"') {
       try {
         return { path: new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array(bytes)), rest: quoted.slice(at + 1) };
       } catch { return null; }
     }
-    if (char !== '\\') { bytes.push(...Buffer.from(char, 'utf8')); continue; }
+    if (char !== '\\') { bytes.push(...Buffer.from(char, 'utf8')); at += char.length - 1; continue; }
     const next = quoted[at + 1];
     if (next === undefined) return null;
     if (/[0-7]/u.test(next)) {
@@ -465,61 +480,171 @@ function unquoteGitPath(quoted: string): { readonly path: string; readonly rest:
   return null;
 }
 
-/** The two paths of a `diff --git` header, quoted (`"a/…" "b/…"`) or not,
- * or null when the header cannot be read. */
-function diffHeaderPaths(line: string): { readonly oldPath: string; readonly path: string } | null {
+/** A whole path token of a diff line, C-quoted or not, or null when its
+ * quoting is malformed. */
+function gitPathToken(token: string): string | null {
+  if (!token.startsWith('"')) return token;
+  const quoted = unquoteGitPath(token);
+  return quoted !== null && quoted.rest === '' ? quoted.path : null;
+}
+
+/** The two paths of a `diff --git` header, quoted (`"a/…" "b/…"`) or not;
+ * `ambiguous` when an unquoted header names two different paths, which only
+ * the section's own rename/copy/---/+++ lines can split; null when the header
+ * cannot be read. */
+type HeaderPaths = { readonly oldPath: string; readonly path: string } | { readonly ambiguous: string };
+function diffHeaderPaths(line: string): HeaderPaths | null {
   const rest = line.slice('diff --git '.length);
   if (rest.startsWith('"')) {
     const first = unquoteGitPath(rest);
     if (first === null || !first.path.startsWith('a/') || !first.rest.startsWith(' ')) return null;
-    const second = first.rest.slice(1);
-    if (second.startsWith('"')) {
-      const quoted = unquoteGitPath(second);
-      return quoted !== null && quoted.rest === '' && quoted.path.startsWith('b/') ? { oldPath: first.path.slice(2), path: quoted.path.slice(2) } : null;
-    }
-    return second.startsWith('b/') ? { oldPath: first.path.slice(2), path: second.slice(2) } : null;
+    const second = gitPathToken(first.rest.slice(1));
+    return second !== null && second.startsWith('b/') ? { oldPath: first.path.slice(2), path: second.slice(2) } : null;
   }
-  const plain = /^a\/(.+?) (?:b\/(.+)|"(b\/.*)")$/u.exec(rest);
-  if (plain === null) return null;
-  if (plain[2] !== undefined) return { oldPath: plain[1]!, path: plain[2] };
-  const quoted = unquoteGitPath(`"${plain[3]!}"`);
-  return quoted !== null && quoted.rest === '' ? { oldPath: plain[1]!, path: quoted.path.slice(2) } : null;
+  // `a/P b/P` names one path twice: split at the middle, so a path that
+  // itself holds " b/" (`a/p b/q.ts b/p b/q.ts`) is read whole.
+  if (rest.startsWith('a/') && (rest.length - 5) % 2 === 0) {
+    const half = (rest.length - 5) / 2;
+    const oldPath = rest.slice(2, 2 + half);
+    if (half > 0 && rest.slice(2 + half, 5 + half) === ' b/' && rest.slice(5 + half) === oldPath) return { oldPath, path: oldPath };
+  }
+  const quotedNew = /^a\/(.+) ("b\/.*")$/u.exec(rest);
+  if (quotedNew !== null) {
+    const path = gitPathToken(quotedNew[2]!);
+    return path === null ? null : { oldPath: quotedNew[1]!, path: path.slice(2) };
+  }
+  return /^a\/.+ b\/.+$/u.test(rest) ? { ambiguous: rest } : null;
 }
 
+const HUNK_HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/u;
+/** The extended header lines git writes between `diff --git` and the first
+ * hunk, other than the path-naming ones. */
+const EXTENDED_HEADER = /^(?:(?:old|new) mode [0-7]{6}|(?:deleted|new) file mode [0-7]{6}|(?:dis)?similarity index \d{1,3}%|index [0-9a-f]+\.\.[0-9a-f]+(?: [0-7]{6})?|Binary files .+ and .+ differ)$/u;
+
 /** The diff's sections, and what about the text could not be read: an empty
- * text, prose before the first header, or a header that is no readable
- * `diff --git` line. A diff the gate cannot read admits nothing. */
+ * text, prose before the first header, a header that is no readable
+ * `diff --git` line, or any line inside a section that is not git's own
+ * section grammar (extended headers, then hunks holding exactly the lines
+ * their headers count) — prose, a combined `diff --cc` line, a hunk cut
+ * short, or a rename/copy/---/+++ line naming another path than the header.
+ * A diff the gate cannot read admits nothing. */
 function splitDiff(text: string): { readonly sections: readonly DiffSection[]; readonly unreadable: readonly string[] } {
-  const groups: { oldPath: string; path: string; lines: string[] }[] = [];
+  interface Group {
+    readonly header: HeaderPaths;
+    readonly at: number;
+    readonly lines: string[];
+    readonly body: string[];
+    readonly hunks: { oldStart: number; oldLines: string[]; newStart: number; newLines: string[] }[];
+    readonly named: { old: string[]; new: string[] };
+    oldLeft: number;
+    newLeft: number;
+    broken: boolean;
+  }
+  const sections: DiffSection[] = [];
   const unreadable: string[] = [];
-  // The lines after an unreadable header are its own (already refused),
-  // never the previous section's, and never reported again.
-  let current: { lines: string[] } | null = null;
-  for (const [index, line] of text.split('\n').entries()) {
+  let current: Group | { readonly broken: true } | null = null;
+  const fail = (group: Group, index: number, problem: string): void => {
+    if (!group.broken) unreadable.push(`line ${String(index + 1)} ${problem}`);
+    group.broken = true;
+  };
+  const close = (group: Group, index: number): void => {
+    if (group.broken) return;
+    if (group.oldLeft > 0 || group.newLeft > 0) return fail(group, index, 'ends a hunk before the lines its header counts');
+    let oldPath: string;
+    let path: string;
+    if ('ambiguous' in group.header) {
+      // Only the section's own path lines can split `a/X b/Y`; they must
+      // spell the header back exactly.
+      const named = { old: group.named.old[0], new: group.named.new[0] };
+      if (named.old === undefined || named.new === undefined || group.header.ambiguous !== `a/${named.old} b/${named.new}`) {
+        return fail(group, group.at, 'is a diff header the gate cannot read');
+      }
+      oldPath = named.old;
+      path = named.new;
+    } else {
+      oldPath = group.header.oldPath;
+      path = group.header.path;
+    }
+    if (group.named.old.some((name) => name !== oldPath) || group.named.new.some((name) => name !== path)) {
+      return fail(group, group.at, `names "${oldPath}" → "${path}", but its rename, copy or ---/+++ lines name another path`);
+    }
+    sections.push({ path, oldPath, text: group.lines.join('\n'), body: group.body.join('\n'), hunks: group.hunks });
+  };
+  // A text ending in a newline holds no empty last line.
+  const lines = text.split('\n');
+  if (lines.length > 1 && lines.at(-1) === '') lines.pop();
+  for (const [index, line] of lines.entries()) {
     if (line.startsWith('diff --git ')) {
-      const paths = diffHeaderPaths(line);
-      if (paths === null) {
+      if (current !== null && !current.broken) close(current as Group, index);
+      const header = diffHeaderPaths(line);
+      if (header === null) {
+        // The lines after an unreadable header are its own (already
+        // refused), never the previous section's, and never reported again.
         unreadable.push(`line ${String(index + 1)} is a diff header the gate cannot read`);
-        current = { lines: [] };
+        current = { broken: true };
         continue;
       }
-      const group = { ...paths, lines: [line] };
-      groups.push(group);
-      current = group;
-    } else if (current !== null) current.lines.push(line);
-    else if (line.trim() !== '') unreadable.push(`line ${String(index + 1)} comes before any diff header`);
+      current = { header, at: index, lines: [line], body: [], hunks: [], named: { old: [], new: [] }, oldLeft: 0, newLeft: 0, broken: false };
+      continue;
+    }
+    if (current === null) {
+      if (line.trim() !== '') unreadable.push(`line ${String(index + 1)} comes before any diff header`);
+      continue;
+    }
+    if (current.broken) continue;
+    const group = current as Group;
+    group.lines.push(line);
+    const hunk = group.hunks.at(-1);
+    if (hunk !== undefined && (group.oldLeft > 0 || group.newLeft > 0)) {
+      // Inside a hunk: exactly the lines its header counts (an empty line
+      // is a context line whose leading space was stripped).
+      const kind = line === '' ? ' ' : line[0];
+      const content = line.slice(1);
+      if (kind === '\\') continue;
+      if ((kind === ' ' && group.oldLeft > 0 && group.newLeft > 0) || (kind === '-' && group.oldLeft > 0) || (kind === '+' && group.newLeft > 0)) {
+        if (kind !== '+') { hunk.oldLines.push(content); group.oldLeft -= 1; }
+        if (kind !== '-') { hunk.newLines.push(content); group.newLeft -= 1; }
+        group.body.push(content);
+        continue;
+      }
+      fail(group, index, 'is not a line of the hunk its header counts');
+      continue;
+    }
+    const counted = HUNK_HEADER.exec(line);
+    if (counted !== null) {
+      const oldCount = counted[2] === undefined ? 1 : Number(counted[2]);
+      const newCount = counted[4] === undefined ? 1 : Number(counted[4]);
+      group.hunks.push({ oldStart: Number(counted[1]), oldLines: [], newStart: Number(counted[3]), newLines: [] });
+      group.oldLeft = oldCount;
+      group.newLeft = newCount;
+      continue;
+    }
+    // A finished hunk may carry git's no-newline marker; blank separators
+    // carry nothing.
+    if (line === '' || (hunk !== undefined && line.startsWith('\\'))) continue;
+    if (hunk === undefined) {
+      if (EXTENDED_HEADER.test(line)) continue;
+      const pathLine = /^(rename|copy) (from|to) (.+)$/u.exec(line);
+      if (pathLine !== null) {
+        const name = gitPathToken(pathLine[3]!);
+        if (name === null) { fail(group, index, 'names a path the gate cannot read'); continue; }
+        (pathLine[2] === 'from' ? group.named.old : group.named.new).push(name);
+        continue;
+      }
+      const sideLine = /^(---|\+\+\+) (.+?)\t?$/u.exec(line);
+      if (sideLine !== null) {
+        const name = gitPathToken(sideLine[2]!);
+        const prefix = sideLine[1] === '---' ? 'a/' : 'b/';
+        if (name === '/dev/null') continue;
+        if (name === null || !name.startsWith(prefix)) { fail(group, index, 'names a path the gate cannot read'); continue; }
+        (sideLine[1] === '---' ? group.named.old : group.named.new).push(name.slice(2));
+        continue;
+      }
+    }
+    fail(group, index, 'is not part of any diff section the gate can read');
   }
-  if (groups.length === 0 && unreadable.length === 0) unreadable.push(text.trim() === '' ? 'the diff text is empty' : 'the diff carries no diff header');
-  const sections = groups.map((group) => ({
-    path: group.path,
-    oldPath: group.oldPath,
-    text: group.lines.join('\n'),
-    body: group.lines
-      .slice(1)
-      .filter((line) => !/^(?:index |--- |\+\+\+ |@@ )/u.test(line))
-      .map((line) => line.slice(1))
-      .join('\n'),
-  }));
+  if (current !== null && !current.broken) close(current as Group, lines.length);
+  if (sections.length === 0 && unreadable.length === 0) unreadable.push(text.trim() === '' ? 'the diff text is empty' : 'the diff carries no diff header');
   return { sections, unreadable };
 }
 
@@ -541,14 +666,20 @@ function sectionViolations(section: DiffSection, rule: BlindIsolationRule): read
   return out;
 }
 
+/** A package diff's sections as git objects name them: each section's old
+ * and new repository paths, normalized, and its hunks. Only for a diff the
+ * gate could read — an unreadable one is a caller error, said loud. */
+export function blindDiffSections(text: string): readonly { readonly oldPath: string; readonly path: string; readonly hunks: readonly DiffHunk[] }[] {
+  const parsed = splitDiff(text);
+  if (parsed.unreadable.length > 0) {
+    throw new Error(`blind package diff cannot be bound: ${parsed.unreadable.join('; ')} — evaluate the package before binding it`);
+  }
+  return parsed.sections.map((section) => ({ oldPath: normalizeRepoPath(section.oldPath), path: normalizeRepoPath(section.path), hunks: section.hunks }));
+}
+
 /** Every repository path a package diff names, old and new, normalized. */
 export function blindDiffPaths(text: string): readonly string[] {
-  const paths = new Set<string>();
-  for (const section of splitDiff(text).sections) {
-    paths.add(normalizeRepoPath(section.oldPath));
-    paths.add(normalizeRepoPath(section.path));
-  }
-  return [...paths];
+  return [...new Set(blindDiffSections(text).flatMap((section) => [section.oldPath, section.path]))];
 }
 
 export function evaluateBlindPackage(pkg: BlindInputPackage, rule: BlindIsolationRule): BlindPackageEvaluation {
@@ -788,7 +919,8 @@ export function scanObservedAccess(
   for (const result of results) {
     // A file-read call that RETURNED content read that file — observed, not
     // intent: an excluded path read directly, whatever its bytes look like.
-    const read = result.readPath === undefined || result.isError === true || result.text.trim() === ''
+    // An empty or binary result (an image, a PDF) still returned the file.
+    const read = result.readPath === undefined || result.isError === true
       ? null : readPathViolation(result.readPath, rule, laneRoots);
     if (read !== null) {
       out.push({
@@ -832,17 +964,24 @@ export function scanObservedAccess(
   return out;
 }
 
-/** Why a file a read tool returned is excluded, or null. Absolute paths
- * inside the reviewer's checkout are judged by their repository path;
- * absolute paths outside it are outside the package; with no known
- * checkout an absolute path is not judged (no false read). */
+/** Why a file a tool call named is excluded, or null. Absolute paths
+ * inside the reviewer's checkout are judged by their repository path (the
+ * checkout itself is no file); absolute paths outside it are outside the
+ * package, like an absolute grep hit; with no known checkout an absolute
+ * path is not judged (no false read). */
 function readPathViolation(rawPath: string, rule: BlindIsolationRule, laneRoots: readonly string[]): { readonly path: string; readonly detail: string } | null {
   const slashed = rawPath.replace(/\\/gu, '/');
   let path = slashed;
   if (outsidePackageShape(slashed) && !slashed.includes('\0')) {
     const root = laneRoots.map((lane) => lane.replace(/\\/gu, '/').replace(/\/+$/u, '')).find((lane) => slashed === lane || slashed.startsWith(`${lane}/`));
-    if (root !== undefined) path = slashed.slice(root.length + 1);
-    else if (laneRoots.length === 0) return null;
+    if (root !== undefined) {
+      path = normalizeRepoPath(slashed.slice(root.length + 1));
+      if (path === '') return null;
+    } else if (laneRoots.length === 0) {
+      return null;
+    } else if (slashed.startsWith('/') || /^[A-Za-z]:\//u.test(slashed)) {
+      return { path: slashed, detail: `"${slashed}" is outside the reviewer's checkout, so outside its package` };
+    }
   }
   const detail = classifyBlindPath(path, rule);
   return detail === null ? null : { path, detail };

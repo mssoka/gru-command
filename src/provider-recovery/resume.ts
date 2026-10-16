@@ -12,6 +12,7 @@ import type { DirectiveRegistry } from '../dispatch/fix-directive.js';
 import type { WorktreePort } from '../dispatch/worktree-port.js';
 import { blockedByOwnWallSettle } from './settle-attribution.js';
 import { isJobTerminal } from '../ledger/states.js';
+import { admittedBlindPackage, renderBlindPackageBlock } from '../dispatch/blind-review.js';
 import type { SlotReArmPort } from './sensor.js';
 import type { RetrySettlement } from '../runtime/pacing.js';
 
@@ -74,6 +75,14 @@ function freshBriefing(
       : []),
   ];
   return parts.length === 0 ? null : parts.join('\n\n');
+}
+
+/** A FRESH blind reviewer is briefed with the package it was admitted
+ * with (#360 R5-B3), exactly as at its first spawn; a resumed session
+ * already holds it. */
+function withBlindPackage(briefing: string | null, pkg: ReturnType<typeof admittedBlindPackage>): string | null {
+  if (pkg === null) return briefing;
+  return [...(briefing === null ? [] : [briefing]), renderBlindPackageBlock(pkg).join('\n')].join('\n\n');
 }
 
 /** A continuation failure leaves the lane honestly non-working: when this
@@ -318,7 +327,7 @@ async function claimJobMinion(
       // interrupted prompt it continues.
       briefing: resumeFile !== null
         ? withRevisionContinuation(continuationPrompt ?? job.briefing ?? '', pendingCorrection) || null
-        : freshBriefing(deps.ledger.effectiveContract(job.id)?.text ?? job.briefing, continuationPrompt, revisionState),
+        : withBlindPackage(freshBriefing(deps.ledger.effectiveContract(job.id)?.text ?? job.briefing, continuationPrompt, revisionState), admittedBlindPackage(deps.ledger, job.id)),
       ...(resumeFile !== null ? { resumeFile } : {}),
       ...(deps.retrySettlement !== undefined ? { retrySettlement: deps.retrySettlement } : {}),
       ...(deps.observeBlindTurn !== undefined ? { observeBlindTurn: deps.observeBlindTurn } : {}),

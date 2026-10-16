@@ -177,6 +177,19 @@ export function storeCommit(storeDir: string, rev: string): string | null {
   return resolveCommit(storeDir, rev);
 }
 
+/** A blob's exact text at a commit's path, or null (absent, not a file,
+ * unreadable). */
+export function blobText(storeDir: string, commit: string, path: string): string | null {
+  const result = spawnSync('git', ['cat-file', 'blob', `${commit}:${path}`], { cwd: storeDir, encoding: 'utf-8', env: cleanGitEnv(), maxBuffer: 64 * 1024 * 1024 });
+  return result.error !== undefined || result.status !== 0 ? null : result.stdout;
+}
+
+/** Whether `base` is `target` or one of its ancestors in the store. */
+export function isAncestorCommit(storeDir: string, base: string, target: string): boolean {
+  const result = spawnSync('git', ['merge-base', '--is-ancestor', base, target], { cwd: storeDir, encoding: 'utf-8', env: cleanGitEnv() });
+  return result.error === undefined && result.status === 0;
+}
+
 /** Every path `base..target` changes (renames as a deletion plus an
  * addition), or null when the range cannot be read. */
 export function changedPaths(storeDir: string, base: string, target: string): ReadonlySet<string> | null {
