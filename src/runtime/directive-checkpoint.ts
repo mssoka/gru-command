@@ -380,7 +380,8 @@ function claudeTurn(file: string, binding: DirectiveNativeBinding): { readonly f
   if (bytes.length < length || createHash('sha256').update(bytes.subarray(0, length)).digest('hex') !== prefix[2]) {
     return { refused: 'the native transcript before the directive changed' };
   }
-  claudeHeader(text, binding.sessionId);
+  try { claudeHeader(text, binding.sessionId); }
+  catch (error) { return { refused: error instanceof Error ? error.message : String(error) }; }
   const lines = bytes.subarray(length).toString('utf8').split('\n');
   lines.pop(); // a partial tail cannot undo an accepted prefix
   const frames: ClaudeFrame[] = [];
@@ -486,7 +487,13 @@ export function assertClaudeDirectiveToolIntent(file: string, identity: Directiv
   for (const frame of turn.frames.slice(turn.echo + 1)) {
     const blocks = Array.isArray((frame['message'] as { content?: unknown } | undefined)?.content)
       ? (frame['message'] as { content: Record<string, unknown>[] }).content : [];
-    if (frame['type'] === 'assistant') for (const block of blocks) { if (block['type'] === 'tool_use' && block['id'] === toolUseId) intent = block; }
+    if (frame['type'] === 'assistant') {
+      for (const block of blocks) {
+        if (block['type'] !== 'tool_use' || block['id'] !== toolUseId) continue;
+        if (intent !== null) throw new DirectiveCheckpointError('native tool intent is ambiguous: its tool_use id repeats in the turn');
+        intent = block;
+      }
+    }
     if (frame['type'] === 'user') for (const block of blocks) { if (block['type'] === 'tool_result' && typeof block['tool_use_id'] === 'string') resolved.add(block['tool_use_id']); }
     if (frame['type'] === 'result') throw new DirectiveCheckpointError('the directive turn already reached its result');
   }

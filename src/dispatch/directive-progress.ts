@@ -119,8 +119,8 @@ function assertNativeDirectiveRuntime(handle: AgentHandle): asserts handle is Ag
   if (handle.sessionFile === null || handle.inspectDirective === undefined || handle.prepareDirectiveProducer === undefined) {
     throw new DirectiveRuntimeUnsupportedError(
       `minion ${handle.id} runs in a session that cannot attest native directive admission or producer ownership ` +
-        '(a claude-code session started before GC wrote session headers, or one with ambient MCP tools the host cannot fence); ' +
-        'Silas directives and re-briefs need a fresh session of the minion',
+        '(for claude-code: a session with no GC session header, or one that loads ambient MCP tools the host cannot fence); ' +
+        'Silas directives and re-briefs need a session that can attest them',
     );
   }
 }

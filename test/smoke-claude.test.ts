@@ -74,4 +74,50 @@ describe.skipIf(process.env[SMOKE_FLAG] !== '1')('claude-code smoke (live CLI)',
       rmSync(workspace, { recursive: true, force: true });
     }
   }, 180_000);
+
+  // #424: the real CLI's echo, every-tool ask under bypassPermissions and the
+  // tool_use-before-ask order are what directive admission and the fence bind.
+  it('admits a Silas directive at the real CLI\'s echo, fences its tool, and records completion with HEAD', async () => {
+    const { loadConfig, configPathFor } = await import('../src/config.js');
+    const { ClaudeCodeRuntime } = await import('../src/runtime/claude-adapter.js');
+    const { SessionStore } = await import('../src/sessions/store.js');
+    const { inspectDirectiveProducers, readDirectiveCompletion } = await import('../src/runtime/directive-checkpoint.js');
+    const { mkdtempSync, rmSync, writeFileSync } = await import('node:fs');
+    const { execFileSync } = await import('node:child_process');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const home = mkdtempSync(join(tmpdir(), 'gru-command-smoke-claude-'));
+    const workspace = mkdtempSync(join(tmpdir(), 'gru-command-smoke-ws-'));
+    try {
+      execFileSync('git', ['init', '-q'], { cwd: workspace });
+      writeFileSync(join(workspace, 'note.txt'), 'the answer is 42\n');
+      execFileSync('git', ['-c', 'user.name=smoke', '-c', 'user.email=smoke@example.invalid', 'add', '-A'], { cwd: workspace });
+      execFileSync('git', ['-c', 'user.name=smoke', '-c', 'user.email=smoke@example.invalid', 'commit', '-q', '-m', 'seed'], { cwd: workspace });
+      writeFileSync(configPathFor(home), `workspace_root = "${workspace}"\n`, 'utf-8');
+      const config = loadConfig({ GRU_COMMAND_HOME: home });
+      const store = new SessionStore(config.dataDir);
+      const runtime = new ClaudeCodeRuntime({ config, store });
+      const handle = await runtime.spawn('minion', { cwd: workspace });
+      try {
+        const identity = { requestId: 'smoke-directive', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64), jobId: 'smoke-job', workRevision: 0, authorityEpoch: 0 };
+        const admitted: unknown[] = [];
+        handle.prepareDirectiveProducer!(identity);
+        await handle.prompt('Use the Read tool to read note.txt in the current directory, then reply with its content only.',
+          { directive: { identity, beforeAdmission: () => {}, onAdmitted: (binding) => admitted.push(binding) } });
+        expect(admitted).toEqual([expect.objectContaining({ runtime: 'claude-code', userEntryId: expect.any(String) })]);
+        const proof = handle.inspectDirective!(identity);
+        expect(proof).toMatchObject({ state: 'terminal', ok: true });
+        const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workspace, encoding: 'utf8' }).trim();
+        expect(readDirectiveCompletion(handle.sessionFile!, identity, (proof as { checkpointId: string }).checkpointId)).toMatchObject({ head });
+        await handle.dispose();
+        expect(inspectDirectiveProducers(handle.sessionFile!, identity).map((owner) => owner.evidence)).toEqual(['ceased']);
+      } finally {
+        await runtime.dispose();
+        store.dispose();
+      }
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  }, 180_000);
 });

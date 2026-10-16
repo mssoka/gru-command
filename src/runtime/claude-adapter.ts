@@ -640,6 +640,12 @@ export class ClaudeCodeRuntime implements AgentRuntime {
   }
 }
 
+/** Flush a transcript's written bytes to disk (any descriptor of the file will do). */
+function syncTranscript(path: string): void {
+  const fd = openSync(path, 'r');
+  try { fsyncSync(fd); } finally { closeSync(fd); }
+}
+
 /** One directive turn in flight (#424). */
 interface DirectiveTurn {
   readonly directive: NonNullable<PromptOptions['directive']>;
@@ -966,7 +972,6 @@ export function isProjectMcpCopyName(sessionBase: string, name: string): boolean
   return name.startsWith(`${sessionBase}.`) && /^[0-9a-f]{8}\.project-mcp\.json$/u.test(name.slice(sessionBase.length + 1));
 }
 
-/** The stdin user frame for one prompt (image blocks first, then text). */
 /** The GC session header a claude-code transcript starts with (#424). */
 export function claudeSessionHeader(sessionId: string, cwd: string): string {
   return `${JSON.stringify({ type: 'session', version: 1, id: sessionId, timestamp: new Date().toISOString(), cwd, runtime: 'claude-code' })}\n`;
@@ -991,6 +996,7 @@ export function claudeDirectiveContent(text: string): readonly StreamFrame[] {
   return [{ type: 'text', text }];
 }
 
+/** The stdin user frame for one prompt (image blocks first, then text). */
 export function claudePromptFrame(text: string, images?: PromptOptions['images']): StreamFrame {
   let content: string | StreamFrame[] = text;
   if (images !== undefined && images.length > 0) {
@@ -1865,9 +1871,16 @@ export class ClaudeCodeHandle implements AgentHandle {
     directive.beforeAdmission();
     const producer = this.prepareProducer(directive.identity);
     const content = claudeDirectiveContent(text);
-    prepareClaudeDirectiveBinding({ identity: directive.identity, agentId: this.id, sessionId: this.params.sessionId, sessionFile: this.sessionFile,
-      content, authorityManifest: this.directiveAuthorityManifest() });
+    // Everything that can still fail comes before the durable association:
+    // once it is written, the request is never sent again.
     const settings = privateClaudeDirectiveSettings(this.params.tools, this.params.workerVerification);
+    try {
+      prepareClaudeDirectiveBinding({ identity: directive.identity, agentId: this.id, sessionId: this.params.sessionId, sessionFile: this.sessionFile,
+        content, authorityManifest: this.directiveAuthorityManifest() });
+    } catch (error) {
+      settings.dispose();
+      throw error;
+    }
     return { directive, producer, content, settings, admission: null, admitted: null, failure: null, completion: null };
   }
 
@@ -1936,7 +1949,10 @@ export class ClaudeCodeHandle implements AgentHandle {
     }).catch((error: unknown): ClaudeToolDecision => {
       const reason = error instanceof Error ? error.message : String(error);
       this.recordGuardRefusal(turn.producer, request.toolUseId, reason);
-      this.failDirective(turn, error, abortTurn);
+      turn.failure ??= error;
+      // The deny is written first (this decision's own continuation); the
+      // turn ends right after it.
+      setImmediate(() => this.failDirective(turn, error, abortTurn));
       return { allow: false, message: `Refused by the directive's authority fence: ${reason}` };
     });
   }
@@ -2010,17 +2026,25 @@ export class ClaudeCodeHandle implements AgentHandle {
         failTurn(detail);
         try { child?.stdin?.end(); } catch { /* already closed */ }
         try { child?.kill('SIGTERM'); } catch { /* already gone */ }
+        // A child that ignores SIGTERM is killed after the grace period.
+        const escalate = setTimeout(() => { try { child?.kill('SIGKILL'); } catch { /* already gone */ } }, params.killGraceMs);
+        escalate.unref();
+        child?.once('close', () => clearTimeout(escalate));
       };
       const handleFrame = (frame: StreamFrame): void => {
         if (turn !== null) {
-          // Durable before acted on (#424): each frame is written and synced
-          // before its admission, tool fence or completion step reads it back.
-          const durable = new Promise<void>((resolveDurable, rejectDurable) => {
-            transcript.write(`${JSON.stringify(frame)}\n`, (error?: Error | null) => {
-              if (error != null) { rejectDurable(error); return; }
-              try { fsyncSync((transcript as unknown as { readonly fd: number }).fd); resolveDurable(); } catch (syncError) { rejectDurable(syncError); }
+          // Durable before acted on (#424): a frame that gates a step (the
+          // echo, a tool permission request, the result) is written and synced
+          // — with every frame before it — before that step reads it back.
+          const gates = (frame['type'] === 'user' && frame['isReplay'] === true) || frame['type'] === 'control_request' || frame['type'] === 'result';
+          const durable = !gates
+            ? new Promise<void>((resolveWritten) => { transcript.write(`${JSON.stringify(frame)}\n`, () => resolveWritten()); })
+            : new Promise<void>((resolveDurable, rejectDurable) => {
+              transcript.write(`${JSON.stringify(frame)}\n`, (error?: Error | null) => {
+                if (error != null) { rejectDurable(error); return; }
+                try { syncTranscript(params.sessionFile); resolveDurable(); } catch (syncError) { rejectDurable(syncError); }
+              });
             });
-          });
           durable.catch(() => { /* each consumer observes it */ });
           directivePermissions?.ingest(frame, durable);
           if (frame['type'] === 'result') child?.stdin?.end();
@@ -2132,45 +2156,47 @@ export class ClaudeCodeHandle implements AgentHandle {
         });
       });
       const finishTurn = (code: number | null, signal: NodeJS.Signals | null): void => {
-        {
-          if (this.disposed) {
-            settle(new Error('agent session disposed'));
-            return;
-          }
-          // A directive whose admission, fence or completion failed is no
-          // success, whatever the CLI reported.
-          if (turn !== null && turn.failure !== null && !failed) {
-            failTurn(`directive turn refused: ${turn.failure instanceof Error ? turn.failure.message : String(turn.failure)}`);
-          }
-          const result = translator.result;
-          if (!failed && result !== null && !turnStarted) {
-            // Frames flowed but no init ever arrived: the session identity
-            // was never verified — a protocol violation, not a success.
-            failTurn('claude completed without an init frame — session identity never verified');
-          }
-          if (!failed && result !== null) {
-            this.emit({ type: 'turn_end' });
-            if (result.isError) {
-              // In-band error (pi W7 parity): the turn COMPLETED with an
-              // error — resolve, sticky error state, next turn recovers.
-              const event = claudeInBandError(result, translator.apiError, translator.init?.model ?? params.model ?? null);
-              this.emit(event);
-              this.setState('error', event.error);
-            } else {
-              this.setState('idle');
-            }
-            settle(null);
-            return;
-          }
-          if (!failed) {
-            const via = signal !== null ? `signal ${signal}` : `exit ${code}`;
-            failTurn(
-              `claude ended via ${via} without a result frame` +
-                (stderrTail.trim() !== '' ? `: ${stderrTail.trim()}` : ''),
-            );
-          }
-          settle(new Error(failure));
+        if (this.disposed) {
+          settle(new Error('agent session disposed'));
+          return;
         }
+        // A directive whose admission, fence or completion failed — or whose
+        // admission was never published at all — is no success, whatever the
+        // CLI reported.
+        if (turn !== null && turn.failure !== null && !failed) {
+          failTurn(`directive turn refused: ${turn.failure instanceof Error ? turn.failure.message : String(turn.failure)}`);
+        }
+        if (turn !== null && turn.admitted === null && !failed) {
+          failTurn('directive turn ended without the CLI\'s admission echo; nothing it did counts as delivered');
+        }
+        const result = translator.result;
+        if (!failed && result !== null && !turnStarted) {
+          // Frames flowed but no init ever arrived: the session identity
+          // was never verified — a protocol violation, not a success.
+          failTurn('claude completed without an init frame — session identity never verified');
+        }
+        if (!failed && result !== null) {
+          this.emit({ type: 'turn_end' });
+          if (result.isError) {
+            // In-band error (pi W7 parity): the turn COMPLETED with an
+            // error — resolve, sticky error state, next turn recovers.
+            const event = claudeInBandError(result, translator.apiError, translator.init?.model ?? params.model ?? null);
+            this.emit(event);
+            this.setState('error', event.error);
+          } else {
+            this.setState('idle');
+          }
+          settle(null);
+          return;
+        }
+        if (!failed) {
+          const via = signal !== null ? `signal ${signal}` : `exit ${code}`;
+          failTurn(
+            `claude ended via ${via} without a result frame` +
+              (stderrTail.trim() !== '' ? `: ${stderrTail.trim()}` : ''),
+          );
+        }
+        settle(new Error(failure));
       };
 
       // Policy and directive children keep stdin open for native permission

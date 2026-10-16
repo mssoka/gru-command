@@ -138,7 +138,10 @@ continues one (see Differences by design).
 <!-- declared-gaps:end -->
 
 None today. #424 closed the last one: Claude Code minions take Silas
-directives and re-briefs with the same admission guarantees as pi.
+directives and re-briefs with exact admission proof, as pi does. The
+intentional differences (an interrupted directive is never resumed, a
+directive is text only, and a session that cannot attest admission refuses)
+are listed under Differences by design.
 
 Blind-review observation reads each runtime's own transcript format. The
 `blind-transcript-reader` and `blind-read-invalidates` rows run on fixtures
@@ -167,10 +170,17 @@ writes each runtime's own record shape during a resumed turn.
   directive is never resumed or replayed …" and "a service that died
   mid-directive …").
 - **Directive sessions.** A Claude Code transcript starts with a GC session
-  header (session id and cwd), which directive admission binds. A Claude
-  session started before that header existed, or one that loads ambient MCP
-  tools the host cannot fence, refuses a directive by name before anything is
-  bound; a re-brief to a fresh session works.
+  header (session id and cwd), which directive admission binds. Two kinds of
+  Claude session refuse a directive or a re-brief by name before anything is
+  bound (both resume the minion's own session):
+  - one started before the header existed: the minion's next new session has
+    it;
+  - one that loads ambient MCP tools (`[runtimes.claude-code] mcp`). This is
+    intentional: the host fences every tool it lists, and it cannot list tools
+    it does not know.
+- **Directive content.** A Claude directive is text only (an image is refused
+  by name): the CLI may transform an image, which would break the byte-exact
+  echo admission binds.
 
 ## Rollout of the default change
 

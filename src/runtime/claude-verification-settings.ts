@@ -14,17 +14,29 @@ export function privateClaudeVerificationSettings(policy: WorkerVerificationPoli
   readonly file: string;
   dispose(): void;
 } {
-  const dir = mkdtempSync(join(tmpdir(), 'gru-worker-verification-'));
+  return privateClaudeAskSettings(['Bash'], policy, 'gru-worker-verification-');
+}
+
+/** Private settings whose native `ask` rule routes each listed tool to the
+ * stdio host, even under bypassPermissions. A worker-verification policy
+ * adds its Bash hook (the explanation). Shared by verification lanes and
+ * directive turns (#424). */
+export function privateClaudeAskSettings(ask: readonly string[], policy: WorkerVerificationPolicy | undefined, prefix: string): {
+  readonly file: string;
+  dispose(): void;
+} {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
   try {
-    const policyFile = join(dir, 'policy.json');
     const file = join(dir, 'settings.json');
-    writeFileSync(policyFile, JSON.stringify(policy), { mode: 0o600, flag: 'wx' });
-    const hook = join(PACKAGE_ROOT, 'dist/runtime/worker-verification-hook.js');
-    const command = [process.execPath, hook, policyFile].map(verificationShellQuote).join(' ');
-    writeFileSync(file, JSON.stringify({
-      permissions: { ask: ['Bash'] },
-      hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command }] }] },
-    }), { mode: 0o600, flag: 'wx' });
+    let hooks: Record<string, unknown> | undefined;
+    if (policy !== undefined) {
+      const policyFile = join(dir, 'policy.json');
+      writeFileSync(policyFile, JSON.stringify(policy), { mode: 0o600, flag: 'wx' });
+      const hook = join(PACKAGE_ROOT, 'dist/runtime/worker-verification-hook.js');
+      const command = [process.execPath, hook, policyFile].map(verificationShellQuote).join(' ');
+      hooks = { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command }] }] };
+    }
+    writeFileSync(file, JSON.stringify({ permissions: { ask: [...ask] }, ...(hooks === undefined ? {} : { hooks }) }), { mode: 0o600, flag: 'wx' });
     return { file, dispose: () => rmSync(dir, { recursive: true, force: true }) };
   } catch (error) {
     rmSync(dir, { recursive: true, force: true });

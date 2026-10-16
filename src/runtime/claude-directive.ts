@@ -1,12 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import type { ChildProcess } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
-import { PACKAGE_ROOT } from '../bmad/runtime.js';
+import { privateClaudeAskSettings } from './claude-verification-settings.js';
 import type { StreamFrame } from './stream-json.js';
-import { isVerificationProducer, verificationShellQuote, workerVerificationRefusal, type WorkerVerificationPolicy } from './worker-verification-policy.js';
+import { isVerificationProducer, workerVerificationRefusal, type WorkerVerificationPolicy } from './worker-verification-policy.js';
 
 /**
  * Claude Code directive turns (#424, owner ruling 2026-10-16: exact proof,
@@ -22,23 +19,7 @@ export function privateClaudeDirectiveSettings(tools: readonly string[], verific
   readonly file: string;
   dispose(): void;
 } {
-  const dir = mkdtempSync(join(tmpdir(), 'gru-directive-'));
-  try {
-    const file = join(dir, 'settings.json');
-    let hooks: Record<string, unknown> | undefined;
-    if (verification !== undefined) {
-      const policyFile = join(dir, 'policy.json');
-      writeFileSync(policyFile, JSON.stringify(verification), { mode: 0o600, flag: 'wx' });
-      const hook = join(PACKAGE_ROOT, 'dist/runtime/worker-verification-hook.js');
-      const command = [process.execPath, hook, policyFile].map(verificationShellQuote).join(' ');
-      hooks = { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command }] }] };
-    }
-    writeFileSync(file, JSON.stringify({ permissions: { ask: [...tools] }, ...(hooks === undefined ? {} : { hooks }) }), { mode: 0o600, flag: 'wx' });
-    return { file, dispose: () => rmSync(dir, { recursive: true, force: true }) };
-  } catch (error) {
-    rmSync(dir, { recursive: true, force: true });
-    throw error;
-  }
+  return privateClaudeAskSettings(tools, verification, 'gru-directive-');
 }
 
 export interface ClaudeToolRequest {

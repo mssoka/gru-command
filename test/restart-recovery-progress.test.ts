@@ -1056,8 +1056,26 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     await executeAcceptedDirective(f.deps, f.intent.requestId);
     // A positive no-effect: failed by name, nothing bound, nothing prompted.
     expect(f.ledger.getDirective(f.intent.requestId)).toMatchObject({ state: 'failed', nativeTarget: null, nativeBinding: null,
-      failReason: expect.stringMatching(/cannot attest native directive admission or producer ownership .*need a fresh session of the minion/su) });
+      failReason: expect.stringMatching(/cannot attest native directive admission or producer ownership .*need a session that can attest them/su) });
     expect(prompts).toEqual([]);
+  });
+
+  it('the ledger binds a claude-code admission only when it is complete, names the prepared target and reads back from the session; any other runtime is refused (#424)', async () => {
+    const f = await fixture();
+    f.ledger.prepareDirectiveTarget(f.intent.requestId, { agentId: FIXTURE_MINION, sessionFile: f.file });
+    const binding = { identity: f.identity, runtime: 'claude-code' as const, agentId: FIXTURE_MINION, sessionId: 'cli-session', sessionFile: f.file,
+      baseline: `prefix:0:${'0'.repeat(64)}`, promptHash: 'b'.repeat(64), userEntryId: 'echo-uuid', authorityManifest: 'manifest' };
+    for (const [label, forged] of [
+      ['another agent', { ...binding, agentId: 'someone-else' }],
+      ['another session file', { ...binding, sessionFile: `${f.file}.other` }],
+      ['no admission receipt', { ...binding, userEntryId: null }],
+      ['an unknown runtime', { ...binding, runtime: 'other-cli' }],
+    ] as const) {
+      expect(() => f.ledger.bindDirectiveNativeAdmission(forged as never), label).toThrow(/actual native admission identity is incomplete\/mismatched/u);
+    }
+    // A complete binding is still read back from the session's own durable
+    // association: one the session never prepared is refused.
+    expect(() => f.ledger.bindDirectiveNativeAdmission(binding)).toThrow(/exact native admission association unavailable/u);
   });
 
   /** A Claude Code minion's job (#424): the real adapter over the CLI
