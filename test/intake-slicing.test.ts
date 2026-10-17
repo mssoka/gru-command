@@ -6,6 +6,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { IntakeService } from '../src/intake/service.js';
 import { IntakeSlicingService, INTAKE_SLICING_RESULT_KIND, SLICING_HELPER, slicingIdentity, type IntakeSlicingDispatchInput } from '../src/intake/slicing.js';
 import { validatePlan } from '../src/intake/planner.js';
+import { slicingPlan } from '../src/intake/breakdown.js';
+import { INTAKE_MAX_OUTPUT_BYTES } from '../src/intake/service.js';
 import { IntakeApprovalService } from '../src/intake/approval.js';
 import { PipelineService } from '../src/dispatch/pipeline.js';
 import { LedgerApi } from '../src/ledger/api.js';
@@ -18,7 +20,7 @@ import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { makeFixtureRepo } from './helpers/fixture-repo.js';
 import { ownerAttentionFor } from '../src/notifications/attention.js';
 import { loadBundledWorkflowRuntime } from '../src/workflows/runtime.js';
-import type { Proposal } from '../src/intake/types.js';
+import { canonical, type Proposal } from '../src/intake/types.js';
 import { ARCHITECTURE, EPIC } from './helpers/bmad-epic.js';
 
 const roots: string[] = [];
@@ -283,6 +285,39 @@ describe('intake slicing by a commissioned planning minion (#429)', () => {
     const preview = await h.intake.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source });
     h.dispatch.mockImplementationOnce(async () => ({ settled: Promise.resolve() }));
     await expect(h.slicing.commission({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', revisionId: preview.revisionId })).rejects.toMatchObject({ code: 'intake_slicing_dispatch_failed', status: 503, message: expect.stringContaining('without recording planning job') });
+  });
+  it('an identical breakdown retried after approval still converges on the landed revision', async () => {
+    const h = fixture();
+    const preview = await h.intake.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source });
+    const heist = preview.plan.heists[0]!;
+    const concrete = { ...heist, unresolvedQuestions: [], goal: { text: 'Shoppers manage their cart.', traces: [], clarification: true }, scope: [{ text: 'The cart UI.', traces: [], clarification: true }], exclusions: [{ text: 'Pricing and tax.', traces: [], clarification: true }], acceptance: heist.acceptance.map((item) => ({ ...item, text: `Delivered: ${item.traces[0]!.quote}` })), verification: [{ text: 'The cart end-to-end suite passes.', traces: [], clarification: true }], splitMergeRationale: { text: 'One cohesive cart change.', traces: [], clarification: true } };
+    const refined = await h.intake.revise({ repoPath: h.repo, intakeId: 'cart', requestId: 'r2', previousRequestId: 'r1', revisionId: preview.revisionId, plan: { ...preview.plan, questions: [], heists: [concrete] } });
+    const request = { repoPath: h.repo, intakeId: 'cart', requestId: 'r2', revisionId: refined.revisionId };
+    await h.slicing.commission(request);
+    const breakdown = minionBreakdown(h.intake.read(h.repo, 'cart', 'r2'));
+    const landed = await h.slicing.submit({ ...request, breakdown });
+    const decision = { ...request, expectedToken: null };
+    h.approval.approve({ ...decision, expectedToken: h.approval.review(decision).review!.token, selected: [heist.id] });
+    expect(await h.slicing.submit({ ...request, breakdown })).toEqual(landed);
+  });
+
+  it('bounds the exact proposal it would publish, unmapped questions included, before writing the result request', async () => {
+    const h = fixture();
+    // Many uncovered lines: their questions appear in plan.unmapped and again in plan.questions.
+    const lines = Array.from({ length: 3000 }, (_, index) => `- Note ${String(index).padStart(4, '0')}: a captured epic line that no slice covers, long enough to weigh.`).join('\n');
+    h.write('epic-cart/epic-cart.md', `${EPIC}\n## Appendix\n\n${lines}\n`);
+    const preview = await h.intake.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source });
+    const request = { repoPath: h.repo, intakeId: 'cart', requestId: 'r1', revisionId: preview.revisionId };
+    const { resultRequestId } = await h.slicing.commission(request);
+    const base = minionBreakdown(preview);
+    const appendix = new Set(preview.requirements.filter(({ trace }) => trace.quote.startsWith('- Note ')).map(({ id }) => id));
+    const loose = { ...base, context: base.context.filter((id) => !appendix.has(id)) };
+    const plan = slicingPlan(loose, preview);
+    // The plan alone fits; only the published proposal, with its merged questions, overflows.
+    expect(Buffer.byteLength(canonical({ snapshots: preview.snapshots, gaps: preview.gaps, requirements: preview.requirements, plan }))).toBeLessThan(INTAKE_MAX_OUTPUT_BYTES - 64 * 1024);
+    await expect(h.slicing.submit({ ...request, breakdown: loose })).rejects.toMatchObject({ code: 'intake_output_bounds' });
+    expect(() => h.intake.read(h.repo, 'cart', resultRequestId)).toThrow(expect.objectContaining({ code: 'intake_not_found' }));
+    expect((await h.slicing.submit({ ...request, breakdown: base })).requestId).toBe(resultRequestId);
   });
 });
 

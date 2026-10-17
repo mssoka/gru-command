@@ -40,14 +40,17 @@ function parse(value: unknown, approval: boolean): Decision {
  * and enqueued, by heist id with their frozen content (the latest wins). Only
  * the same content satisfies a later revision's prerequisite. */
 type Accepted = ReadonlyMap<string, { readonly entryId: string; readonly heist: string }>;
-function acceptedHeists(ledger: Pick<LedgerApi, 'listApprovedIntakeReviews'>, pipeline: Pick<PipelineService, 'entry'>, input: Pick<Decision, 'repoPath' | 'intakeId' | 'revisionId'>): Accepted {
+function acceptedHeists(ledger: Pick<LedgerApi, 'listApprovedIntakeReviews' | 'getJob'>, pipeline: Pick<PipelineService, 'entry'>, input: Pick<Decision, 'repoPath' | 'intakeId' | 'revisionId'>): Accepted {
   const accepted = new Map<string, { readonly entryId: string; readonly heist: string }>();
   for (const review of ledger.listApprovedIntakeReviews(input.repoPath, input.intakeId)) {
     // This revision's own approval is the immutable-selection rule's to judge.
     if (review.revisionId === input.revisionId) continue;
     review.selected.forEach((heistId, index) => {
       const entry = review.entries[index]!;
-      if (pipeline.entry(entry.id) === null) return;
+      // A failed, cancelled or binned prerequisite releases nothing: it can be
+      // selected again, and its dependents must wait on the new entry.
+      const row = pipeline.entry(entry.id);
+      if (row === null || row.state === 'failed' || row.state === 'cancelled' || ledger.getJob(entry.id)?.status === 'binned') return;
       let heist: unknown;
       try { heist = (JSON.parse(entry.briefing) as { heist?: unknown }).heist; } catch { return; }
       if (heist !== undefined) accepted.set(heistId, { entryId: entry.id, heist: canonical(heist) });

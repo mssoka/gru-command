@@ -214,7 +214,7 @@ export class IntakeView {
     } catch (error) {
       if (current() && error instanceof IntakeClientError) {
         if (error.readback) this.rememberApproval(request, error.readback);
-        else if (['intake_dependency_selection', 'intake_incomplete_plan', 'intake_invalid_request', 'intake_invalid_plan', 'intake_output_bounds', 'intake_stale_review', 'intake_stale_revision'].includes(error.code)) {
+        else if (['intake_dependency_selection', 'intake_already_accepted', 'intake_incomplete_plan', 'intake_invalid_request', 'intake_invalid_plan', 'intake_output_bounds', 'intake_stale_review', 'intake_stale_revision'].includes(error.code)) {
           // These named refusals precede acceptance; a corrected selection is safe.
           this.commitRecovery(this.identity, this.pendingRevision, this.approvals.filter((item) => item.request !== request || item.token !== undefined));
         }

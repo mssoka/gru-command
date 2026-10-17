@@ -218,6 +218,21 @@ describe('BMAD v7 epic folder intake (#429)', () => {
     expect(architectureSnapshots(proposal)).toEqual([]);
   });
 
+  it('finds an architecture named anywhere in a BMAD document, sentence-final or emphasised', async () => {
+    const notes = EPIC.replace('- constraint — architecture-checkout/architecture-checkout.md, AD-1\n', '').replace('- Decision: codes', '- Totals follow **architecture-checkout.md**.\n- See also architecture-payments.md.\n- Decision: codes');
+    const h = epicFolder({ 'epic-cart/epic-cart.md': notes, 'epic-cart/tickets.toml': TICKETS.replace('references = ["architecture-checkout/architecture-checkout.md#ad-1"]\n', '') });
+    const proposal = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source(['epic-cart/tickets.toml']) });
+    expect(proposal.gaps.map(({ code, locator }) => [code, locator])).toEqual([['intake_missing_architecture', 'architecture-checkout.md'], ['intake_missing_architecture', 'architecture-payments.md']]);
+  });
+
+  it('a conflict naming a sub-id or a range stays open on every entry whose covers it reaches', async () => {
+    const h = epicFolder({ 'epic-cart/epic-cart.md': EPIC.replace('- Decision: codes', '- Source conflict: R1.1 — undo is out of scope in the PRD.\n- Source conflict: R1-R3 — totals rounding differs from AD-1.\n- Decision: codes') });
+    const proposal = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source() });
+    const conflicts = proposal.plan.heists.map(({ unresolvedQuestions }) => unresolvedQuestions.filter((question) => question.includes('Source conflict')).map((question) => question.slice(question.indexOf('Source conflict: ') + 17, question.indexOf(' —'))));
+    expect(conflicts).toEqual([['R1.1', 'R1-R3'], ['R1-R3'], ['R1-R3']]);
+    expect(proposal.plan.questions).toEqual([]);
+  });
+
   it('refuses a second breakdown, other TOML and a misnamed breakdown by name', async () => {
     const h = epicFolder({ 'epic-cart/other.toml': TICKETS, 'other/tickets.toml': TICKETS });
     const two = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source(['epic-cart/tickets.toml', 'other/tickets.toml', 'architecture-checkout/architecture-checkout.md']) });
@@ -381,6 +396,21 @@ describe('approval of a v7 breakdown (#429)', () => {
     const decision = { repoPath: h.repo, intakeId: 'cart', requestId: 'r2', revisionId: cleared.revisionId, expectedToken: null };
     const token = h.approval.review(decision).review!.token;
     expect(() => h.approval.approve({ ...decision, expectedToken: token, selected: ['entry-1'] })).toThrow(expect.objectContaining({ code: 'intake_incomplete_plan' }));
+  });
+
+  it('a cancelled accepted prerequisite satisfies nothing and can be selected again', async () => {
+    const h = approvalFixture(TICKETS.replace('hitl = true\n', ''));
+    const first = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source() });
+    const one = { repoPath: h.repo, intakeId: 'cart', requestId: 'r1', revisionId: first.revisionId, expectedToken: null };
+    const accepted = h.approval.approve({ ...one, expectedToken: h.approval.review(one).review!.token, selected: ['entry-1'] }).review!;
+    h.db.handle.prepare("UPDATE pipeline_entries SET state = 'cancelled' WHERE id = ?").run(accepted.entries[0]!.id);
+    const plan = { ...first.plan, heists: first.plan.heists.map((heist) => heist.id === 'entry-2' ? { ...heist, unresolvedQuestions: [] } : heist) };
+    const second = await h.service.revise({ repoPath: h.repo, intakeId: 'cart', requestId: 'r2', previousRequestId: 'r1', revisionId: first.revisionId, plan });
+    const two = { repoPath: h.repo, intakeId: 'cart', requestId: 'r2', revisionId: second.revisionId, expectedToken: accepted.token };
+    const token = h.approval.review(two).review!.token;
+    expect(() => h.approval.approve({ ...two, expectedToken: token, selected: ['entry-2'] })).toThrow(expect.objectContaining({ code: 'intake_dependency_selection' }));
+    const readback = h.approval.approve({ ...two, expectedToken: token, selected: ['entry-1', 'entry-2'] });
+    expect(readback.accepted.map(({ heistId }) => heistId)).toEqual(['entry-1', 'entry-2']);
   });
 
   it('an approval retry enqueues the frozen recorded entries, even when this build renders briefings differently', async () => {

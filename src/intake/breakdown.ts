@@ -147,7 +147,7 @@ function sectionRanges(text: string, heading: RegExp): readonly { readonly start
  * `inputDocuments`, Notes, a breakdown's `references`), by lowercase file
  * name: a mention the capture lacks must never be silently forgotten. */
 export function referencedArchitecture(snapshot: Snapshot): readonly string[] {
-  const names = [...snapshot.text.matchAll(/(?:^|[\s"'`([<,=])((?:[\w.-]+\/)*architecture[\w.-]*\.md)(?=[\s"'`)\]>,#:;]|$)/giu)].map((match) => match[1]!);
+  const names = [...snapshot.text.matchAll(/(?<![\w./-])((?:[\w.-]+\/)*architecture[\w.-]*\.md)(?![\w-]|\.\w)/giu)].map((match) => match[1]!);
   return [...new Set(names.map((name) => name.slice(name.lastIndexOf('/') + 1).toLowerCase()))];
 }
 
@@ -328,7 +328,16 @@ function toPlan(entries: readonly BreakdownEntry[], context: ReadonlySet<string>
   const markdown = new Set([...documents, ...architecture].map(({ id }) => id));
   const conflicts = capture.requirements.filter(({ trace }) => markdown.has(trace.snapshotId) && SOURCE_CONFLICT.test(trace.quote));
   const conflictQuestion = (quote: string): string => `Settle the recorded source conflict before admitting it: ${quote.trim()}`;
-  const names = (quote: string, entry: BreakdownEntry): boolean => entry.coverIds.some((id) => new RegExp(`(?<![0-9A-Za-z])${idPattern(id)}`, 'u').test(quote));
+  // A conflict names an entry through any covers id it mentions, sub-ids
+  // (`R1.1` names R1) and same-prefix ranges (`R1-R3` names R2) included:
+  // over-blocking an entry is the safe side. `AD-1` names no id `1`.
+  const names = (quote: string, entry: BreakdownEntry): boolean => {
+    const ranged = new Set([...quote.matchAll(/(?<![0-9A-Za-z])([A-Za-z]+)(\d+)[ \t]*[-–—][ \t]*\1(\d+)(?![0-9A-Za-z])/gu)].flatMap(([, prefix, from, to]) => {
+      const [low, high] = [Number(from), Number(to)];
+      return high >= low && high - low <= 200 ? Array.from({ length: high - low + 1 }, (_, step) => `${prefix!}${low + step}`) : [];
+    }));
+    return entry.coverIds.some((id) => ranged.has(id) || new RegExp(`(?<![0-9A-Za-z])(?<![0-9A-Za-z][.-])${id.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}(?![0-9A-Za-z])`, 'u').test(quote));
+  };
   const unowned = conflicts.filter(({ trace }) => !entries.some((entry) => names(trace.quote, entry)));
   const heists = entries.map((entry, position): Heist => {
     const covered = unique(entry.covered, ({ id }) => id);

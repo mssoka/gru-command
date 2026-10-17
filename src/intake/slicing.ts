@@ -140,7 +140,10 @@ export class IntakeSlicingService {
       }
     }
     try { await pending; } catch (error) {
-      if (this.options.ledger.getJob(jobId) !== null) return status(true);
+      if (this.options.ledger.getJob(jobId) !== null) {
+        this.options.log?.('error', 'intake planning minion dispatch failed after its job was recorded', { job: jobId, error: error instanceof Error ? error.message : String(error) });
+        return status(true);
+      }
       throw new IntakeError('intake_slicing_dispatch_failed', `The planning minion was not dispatched: ${error instanceof Error ? error.message : String(error)}. Retry the identical request.`, 503);
     }
     return status(true);
@@ -153,7 +156,14 @@ export class IntakeSlicingService {
     const raw = fields(value, ['repoPath', 'intakeId', 'requestId', 'revisionId', 'breakdown']);
     const proposal = this.exact(raw);
     const { jobId, resultRequestId } = slicingIdentity(proposal);
-    if (this.options.ledger.getApprovedIntakeReview(proposal.repoPath, proposal.intakeId, proposal.revisionId) !== null) throw new IntakeError('intake_slicing_approved', 'The sliced revision gained accepted work after its planning minion was commissioned; a sliced plan of it would plan that work twice', 409);
+    // An identical retry of a landed breakdown converges below even after
+    // approval; only a new sliced plan of approved work is refused.
+    let landed = true;
+    try { this.options.intake.read(proposal.repoPath, proposal.intakeId, resultRequestId); } catch (error) {
+      if (!(error instanceof IntakeError) || error.code !== 'intake_not_found') throw error;
+      landed = false;
+    }
+    if (!landed && this.options.ledger.getApprovedIntakeReview(proposal.repoPath, proposal.intakeId, proposal.revisionId) !== null) throw new IntakeError('intake_slicing_approved', 'The sliced revision gained accepted work after its planning minion was commissioned; a sliced plan of it would plan that work twice', 409);
     if (this.options.ledger.getJob(jobId) === null) throw new IntakeError('intake_slicing_not_commissioned', `No planning minion was commissioned for revision ${proposal.revisionId}; commission one with POST /api/intake/slice`, 409);
     const plan = slicingPlan(raw['breakdown'], proposal);
     validatePlan(plan, proposal);

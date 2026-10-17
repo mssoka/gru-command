@@ -251,7 +251,8 @@ work (`409 intake_slicing_approved`, also returned to a breakdown submitted
 after the revision gained accepted work). A dispatch that fails before the job is
 recorded is `503 intake_slicing_dispatch_failed`; retry the identical request.
 If the planning minion ends without a sliced revision (its job blocked or
-closed), preview the sources again and slice the new revision. Any captured
+closed), preview the sources again and slice the new revision. A dispatch failure
+after the job is recorded is logged and shows in `jobStatus`. Any captured
 source can be sliced; the method is written for epics.
 
 The job's briefing binds that revision and embeds the verified GC slicing
@@ -416,9 +417,12 @@ another revision of the same intake accepted, still in the pipeline and with
 identical heist content, needs no second selection: the new entry waits on that
 accepted entry. Selecting such a heist again is refused
 `409 intake_already_accepted`. So an epic can be approved a few slices at a
-time, each batch from a new revision, without enqueueing a slice twice. A heist
-whose content changed under the same id is new work, and its dependents must
-select it. A retry of the
+time, each batch from a new revision, without re-selecting its accepted
+prerequisites. A heist whose content changed under the same id is new work, and
+its dependents must select it. A failed, cancelled or binned accepted entry
+satisfies nothing and can be selected again; only the latest accepted content of
+a heist id is remembered, and an accepted entry whose enqueue was interrupted
+counts once its identical approval retry lands. A retry of the
 identical approval enqueues the recorded entries, even when a newer GC renders
 briefings differently. It does not create
 another queue. If enqueue is interrupted, `503 intake_partial_failure` includes

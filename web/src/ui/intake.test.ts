@@ -411,6 +411,15 @@ it('allows corrected selection only after a definite pre-acceptance refusal', as
   await h.click('Approve selected work'); expect(h.client.approve).toHaveBeenCalledTimes(2);
 });
 
+it('allows a corrected selection after the server refuses re-selecting an accepted heist (#429)', async () => {
+  const h = fixture(); await h.preview(); await h.click('Review this revision');
+  const checkbox = h.root.querySelector<HTMLInputElement>('input[type="checkbox"]')!; checkbox.checked = true; checkbox.dispatchEvent(new Event('change'));
+  h.client.approve.mockRejectedValueOnce(new IntakeClientError('intake_already_accepted', 'Heist one was already accepted'));
+  await h.click('Approve selected work');
+  expect(JSON.parse(sessionStorage.getItem('gru-intake-recovery')!).approvals).toEqual([]);
+  await h.click('Approve selected work'); expect(h.client.approve).toHaveBeenCalledTimes(2);
+});
+
 it('reports one failed historical receipt but continues healthy receipts and current draft without approval', async () => {
   const h = fixture();
   const request = { repoPath: proposal.repoPath, intakeId: proposal.intakeId, requestId: 'r1', revisionId: proposal.revisionId, expectedToken: reviewed.review!.token, selected: ['one'] };
