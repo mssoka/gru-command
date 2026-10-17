@@ -71,6 +71,20 @@ export interface VerificationRunSpec {
   readonly head?: string | null;
 }
 
+/** What a submission asks of the run it starts (#427). An attached
+ * duplicate joins the run already in flight and asks nothing. */
+export interface VerificationRunHooks {
+  /** Awaited after the run is admitted to a slot and before its command
+   * spawns (a slim lane's restore): it runs inside the run's budget, and
+   * the slot covers it, so the job shows a run the whole time. Its signal
+   * is the run's: aborted when the run is cancelled (the scheduler is
+   * disposed; a client that disconnects does not cancel a run, which other
+   * streams may share), so the step ends, the run never spawns and the slot
+   * is released. It should not reject; a rejection is logged and the run
+   * still spawns. */
+  readonly beforeSpawn?: (signal: AbortSignal) => Promise<void>;
+}
+
 export interface VerificationLease {
   readonly runId: string;
   readonly jobId: string;
@@ -386,6 +400,10 @@ interface Attempt {
   started: boolean;
   outcome: VerificationOutcome | null;
   lease: VerificationLease | null;
+  /** The submission's {@link VerificationRunHooks.beforeSpawn}. */
+  readonly beforeSpawn: ((signal: AbortSignal) => Promise<void>) | null;
+  /** The run's cancellation, aborted by {@link VerificationScheduler.dispose}. */
+  readonly cancel: AbortController;
 }
 
 /** Terminal request_id evidence kept (bounded) for reconnect reconciliation. */
@@ -790,6 +808,15 @@ export class VerificationScheduler {
     return this.waiters.length;
   }
 
+  /** True while the job has a run holding a slot (an earlier process's
+   * holder included), waiting for one, or accepted and not yet settled
+   * (#427: a lane is idle for slimming only when this is false). */
+  hasRunFor(jobId: string): boolean {
+    return [...this.slots.values()].some((slot) => slot.lease.jobId === jobId) ||
+      this.waiters.some((waiter) => waiter.spec.jobId === jobId) ||
+      [...this.attempts.values()].some((attempt) => attempt.spec.jobId === jobId);
+  }
+
   /** Load persisted holders, release stale ones, start the sweep. Idempotent. */
   start(): void {
     if (this.started) return;
@@ -1093,6 +1120,7 @@ export class VerificationScheduler {
   async submit(
     spec: VerificationRunSpec,
     sink: VerificationProgressSink = () => {},
+    hooks: VerificationRunHooks = {},
   ): Promise<VerificationOutcome> {
     if (this.disposed) throw new VerificationDisposedError();
     if (!this.started) this.start();
@@ -1201,7 +1229,7 @@ export class VerificationScheduler {
       }
     }
 
-    const attempt = this.createAttempt(key, resolvedSpec, head, requestId, sink);
+    const attempt = this.createAttempt(key, resolvedSpec, head, requestId, sink, hooks);
     this.attempts.set(key, attempt);
     for (const id of attempt.requestIds) this.attemptsByRequest.set(id, attempt);
     this.safeRecord({
@@ -1225,8 +1253,9 @@ export class VerificationScheduler {
   async run(
     spec: VerificationRunSpec,
     sink: VerificationProgressSink = () => {},
+    hooks: VerificationRunHooks = {},
   ): Promise<VerificationOutcome> {
-    return this.submit(spec, sink);
+    return this.submit(spec, sink, hooks);
   }
 
   /**
@@ -1367,6 +1396,8 @@ export class VerificationScheduler {
       this.sweepTimer = null;
     }
     for (const attempt of this.attempts.values()) {
+      // A run still readying its lane (#427) stops readying it.
+      attempt.cancel.abort();
       // An already-produced childless terminal outcome is not a no-start.
       if (!attempt.started && attempt.outcome === null) this.settleNoStart(attempt);
     }
@@ -1414,6 +1445,7 @@ export class VerificationScheduler {
     head: string | null,
     requestId: string | null,
     sink: VerificationProgressSink,
+    hooks: VerificationRunHooks,
   ): Attempt {
     let resolveAttempt!: (outcome: VerificationOutcome) => void;
     let rejectAttempt!: (error: Error) => void;
@@ -1435,6 +1467,8 @@ export class VerificationScheduler {
       started: false,
       outcome: null,
       lease: null,
+      beforeSpawn: hooks.beforeSpawn ?? null,
+      cancel: new AbortController(),
     };
   }
 
@@ -1562,6 +1596,16 @@ export class VerificationScheduler {
       const slot = this.slots.get(lease.runId);
       if (slot !== undefined) slot.requestIds = [...attempt.requestIds];
       this.persistBestEffort();
+      if (attempt.beforeSpawn !== null) {
+        try {
+          await attempt.beforeSpawn(attempt.cancel.signal);
+        } catch (error) {
+          this.log('error', 'verification pre-spawn step failed; the run goes ahead', { run: lease.runId, job: lease.jobId, error: String(error) });
+        }
+      }
+      // A run cancelled or disposed while it readied its lane never spawns
+      // (#427): it settles as a no-start.
+      if (attempt.cancel.signal.aborted || this.disposed) throw new VerificationDisposedError();
       const outcome = await this.execute(lease, (frame) => {
         if (frame.type === 'started') attempt.started = true;
         return this.broadcast(attempt, frame);

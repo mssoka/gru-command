@@ -687,9 +687,11 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
     if (lane === undefined) throw new Error(`job "${input.jobId}" has no active job lane`);
     const result: WorktreeSweepResult = await deps.worktrees.release({
       worktreeId: lane.id,
-      // Issue #243 F-H1: the unattended autopilot release owes pre-removal
-      // proofs (tracked cleanliness, fresh required containment) BEFORE any
-      // forced removal; the operator path keeps its own authority.
+      // Issue #243 F-H1: the unattended autopilot release owes its
+      // pre-removal proof (fresh required containment) BEFORE any forced
+      // removal; the operator path keeps its own authority. Uncommitted
+      // work is snapshotted by every release (#427), never refused; the
+      // autopilot never discards submodule work.
       requireReleaseProofs: true,
     });
     if (result.status !== 'swept') {

@@ -457,6 +457,12 @@ const PRODUCER_RESOLVED_KINDS: Readonly<Record<string, string>> = {
   'onboarding.proof-attention': 'a passing proof, a newer delivered head, or the onboarding job ending',
   // #427 PR 1b: a crashed proof's verify slot the boot judge kept; onboarding closes it.
   'onboarding.proof-slot-held': 'the slot being released',
+  // #427 PR 2a: one row per lane and digest; the lane's sweep (any path) closes it.
+  'worktree.submodule-work': 'the lane being swept or gone, or a refusal of it with a newer digest',
+  // #427 PR 2a: one row per lane whose setup did not recreate what it made.
+  'worktree.restore-incomplete': 'the lane being swept or gone',
+  // #427 PR 2a: one row per lane whose release a sparse checkout refuses.
+  'worktree.sparse-checkout': 'the lane being swept or gone',
 };
 
 // The alias d is an immutable delivery. A protected root must cite its
@@ -1293,6 +1299,18 @@ export class LedgerApi {
     const row = this.db
       .prepare('SELECT * FROM events WHERE kind = ? ORDER BY seq DESC LIMIT 1')
       .get(kind) as Row | undefined;
+    return row === undefined ? null : this.eventFromRow(row);
+  }
+
+  /** The newest event of one kind whose top-level payload `field` equals
+   * `value`, whatever its job (#427: a lane's own records, which a lane
+   * with no job carries too). Meant for rare kinds: it reads every event of
+   * the kind. */
+  latestEventByPayloadField(kind: string, field: string, value: string): EventRecord | null {
+    if (!/^[a-z][a-z0-9_]*$/u.test(field)) throw new Error(`latestEventByPayloadField: "${field}" is not a plain snake_case payload field`);
+    const row = this.db
+      .prepare('SELECT * FROM events WHERE kind = ? AND json_extract(payload, ?) = ? ORDER BY seq DESC LIMIT 1')
+      .get(kind, `$.${field}`, value) as Row | undefined;
     return row === undefined ? null : this.eventFromRow(row);
   }
 
@@ -4724,6 +4742,19 @@ export class LedgerApi {
     return row === undefined ? null : this.providerWaitFromRow(row);
   }
 
+  /** The open (waiting/recovered-pending) provider wait of one job, or
+   * null — lane slimming (#427) treats a job whose minion may still be
+   * continued as busy. */
+  openProviderWaitForJob(jobId: string): ProviderWaitRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM provider_waits WHERE job_id = ? AND status IN ('waiting','recovered-pending')
+         ORDER BY created_at DESC, id LIMIT 1`,
+      )
+      .get(jobId) as Row | undefined;
+    return row === undefined ? null : this.providerWaitFromRow(row);
+  }
+
   listProviderWaits(opts: { status?: ProviderWaitStatus; routeKey?: string } = {}): readonly ProviderWaitRecord[] {
     const clauses: string[] = [];
     const params: string[] = [];
@@ -4796,6 +4827,27 @@ export class LedgerApi {
           this.resolveNotificationById(incident.id, 'provider-recovery-sensor');
         }
       }
+      return true;
+    });
+  }
+
+  /** Hand a claimed wait back (#427): compare-and-set claimed →
+   * recovered-pending, only for a claim whose continuation never spawned
+   * (the service stopped while it restored the job's lanes), so the next
+   * claimant replays it. Returns true when THIS call released it. */
+  releaseProviderWaitClaim(id: string, payload?: Record<string, unknown>): boolean {
+    return this.transaction(() => {
+      const result = this.db
+        .prepare("UPDATE provider_waits SET status = 'recovered-pending', updated_at = ? WHERE id = ? AND status = 'claimed'")
+        .run(nowIso(), id);
+      if (result.changes !== 1) return false;
+      const wait = this.getProviderWait(id);
+      this.appendEvent({
+        kind: 'provider.wait-status',
+        jobId: wait?.jobId ?? null,
+        agentId: wait?.agentId ?? null,
+        payload: { id, from: 'claimed', to: 'recovered-pending', ...(payload ?? {}) },
+      });
       return true;
     });
   }
@@ -5312,6 +5364,37 @@ export class LedgerApi {
       }
       return resolved;
     });
+  }
+
+  /** Resolve every open row whose id starts with `prefix` (#427: the rows
+   * about one lane, `worktree-submodule-work:<lane>:` for each digest).
+   * Unanswered typed owner decisions remain open, as for kind prefixes. */
+  resolveNotificationsByIdPrefix(prefix: string, by: string): readonly NotificationRecord[] {
+    if (prefix === '' || by === '') throw new Error('resolution prefix/by must be non-empty');
+    return this.transaction(() => {
+      const escaped = prefix.replace(/[\\%_]/g, '\\$&');
+      const rows = this.db
+        .prepare(
+          "SELECT id FROM notifications WHERE id LIKE ? ESCAPE '\\' AND resolved_at IS NULL AND NOT (routing = 'needs-owner' AND decision_json IS NOT NULL AND decided_at IS NULL) ORDER BY ts, id",
+        )
+        .all(`${escaped}%`) as Row[];
+      const resolved: NotificationRecord[] = [];
+      for (const raw of rows) {
+        const record = this.resolveNotificationById(str(raw.id), by);
+        if (record !== null) resolved.push(record);
+      }
+      return resolved;
+    });
+  }
+
+  /** The open (unresolved) rows of some kinds (#427: the lane rows a
+   * reconcile settles once their lane is gone). */
+  listOpenNotificationsByKinds(kinds: readonly string[]): readonly NotificationRecord[] {
+    if (kinds.length === 0) return [];
+    const rows = this.db
+      .prepare(`SELECT id FROM notifications WHERE kind IN (${kinds.map(() => '?').join(', ')}) AND resolved_at IS NULL ORDER BY ts, id`)
+      .all(...kinds) as Row[];
+    return rows.map((raw) => this.getNotification(str(raw.id))).filter((record): record is NotificationRecord => record !== null);
   }
 
   /** Resolve every open row of an EXACT kind (no LIKE wildcard semantics):

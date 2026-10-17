@@ -335,8 +335,10 @@ onboarding, never the gate on an open heist.
    any such process is an orphan of a crashed run.
 5. Measuring, against a snapshot taken after the links and copies (so only
    what setup and verify made counts): the git-ignored paths that appeared,
-   each sized with an `lstat` walk that never follows a link, and the
-   checkout's total size without `.git`. Each `reclaim` entry is checked by
+   each sized with an `lstat` walk that never follows a link and counts
+   every inode once (a file also hard-linked from outside the path, as a
+   package store's are, included: the size is what the path holds), and the
+   checkout's total size without `.git`, the same way. Each `reclaim` entry is checked by
    an `lstat` of every part of its path, so a link on the way is reported,
    never walked through.
 
@@ -595,6 +597,26 @@ landed while the service was down. A new delivery is a new head: an earlier
 head's pass no longer counts. The Silas digest still offers registering the
 PR, since the proof needs it.
 
+## What `reclaim` is for
+
+GC deletes a lane's `reclaim` folders when the lane waits, and the
+manifest's `[[setup]]` recreates them before the next minion turn or
+verification in it. Both read the manifest the lane was built from, never
+one a minion committed later. Today that happens to report jobs (review,
+artifact, investigation) once they have delivered and have been idle for
+30 minutes. Only an entry that exists, is not and does not lie under a
+link, holds no `[[link]]` or `[[copy]]` destination, holds no tracked file
+and is git-ignored is deleted, and only from a manifest with `[[setup]]`.
+The proof checks the same things, and accepts an entry that appears after
+setup or after `verify.full`; so does a restore: GC records which entries
+setup made when the lane was built, a restore must bring those back, and
+an entry only a build or verify makes (Rust's `target/`, a `dist/`) comes
+back with the next one (the restore names it as `not_recreated`). A setup
+that skips its work because a stamp file outside `reclaim` says it is done
+does not bring them back: list the stamp under `reclaim` too, or make setup
+check what it makes. A proven manifest is one GC can slim. See
+[WORKTREES.md](./WORKTREES.md#6-lane-slimming-427).
+
 ## Records
 
 Onboarding writes only `onboarding.*` ledger events (no table and no migration),
@@ -625,5 +647,5 @@ failed proof sends:
 
 - Manifests kept in GC's own folder, for repositories GC cannot open a PR on.
 - Proposing re-onboarding when a repository's lanes keep failing setup.
-- Anything that deletes `reclaim` folders. Today they are validated, and an
-  onboarding proof checks them, nothing more.
+- Slimming lanes other than delivered report lanes, driven by a disk
+  budget, and a per-repository opt-out.

@@ -1,3 +1,8 @@
+# Lane slimming (#427) deletes these from an idle lane; [[setup]] (npm ci)
+# restores them. dist and web/dist stay: tests in a lane use the built output
+# and setup does not rebuild it.
+reclaim = ["node_modules", "web/node_modules"]
+
 # The scheduler runs inside each fresh job lane, never in the source checkout.
 [[setup]]
 command = "npm ci"

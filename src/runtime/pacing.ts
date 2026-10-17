@@ -327,6 +327,21 @@ export interface PacingLease {
   readonly waitedMs: number;
 }
 
+/** Readies a job's lanes for a minion turn (#427: restores a slim lane).
+ * The gate awaits it after granting a worker slot and before handing the
+ * lease over, so the turn waits for it while holding its own slot. The
+ * signal is the turn's own (its stop or cancel): it ends what the hook
+ * runs. It must not reject; if it does, the rejection is recorded and the
+ * turn proceeds. */
+export type PrepareWorkerTurn = (jobId: string, signal: AbortSignal | undefined) => Promise<void>;
+
+/** A job's minion turns at the gate right now (#427 slimming's idle proof). */
+export interface JobWorkerTurns {
+  /** Granted worker slots not yet released (a turn being readied included). */
+  readonly held: number;
+  readonly queued: number;
+}
+
 export interface PacingGateOptions {
   readonly enabled: boolean;
   readonly maxConcurrentMinions: number;
@@ -334,6 +349,8 @@ export interface PacingGateOptions {
   readonly record?: PacingEventRecorder;
   /** Clock seam (default Date.now). */
   readonly now?: () => number;
+  /** Awaited between a worker slot's grant and its lease (#427). */
+  readonly prepareWorkerTurn?: PrepareWorkerTurn;
 }
 
 interface PacingWaiter {
@@ -373,6 +390,9 @@ export class PacingGate {
   private readonly running: Record<PacingPool, number> = { worker: 0, review: 0 };
   private readonly queues: Record<PacingPool, PacingWaiter[]> = { worker: [], review: [] };
   private readonly released = new WeakSet<object>();
+  private readonly prepareWorkerTurn: PrepareWorkerTurn | null;
+  /** Granted worker slots per job, released or not (#427). */
+  private readonly heldByJob = new Map<string, number>();
 
   constructor(opts: PacingGateOptions) {
     this.enabled = opts.enabled;
@@ -392,6 +412,7 @@ export class PacingGate {
     };
     this.record = opts.record ?? null;
     this.now = opts.now ?? Date.now;
+    this.prepareWorkerTurn = opts.prepareWorkerTurn ?? null;
   }
 
   /** Acquire a worker (minion turn) slot; queues FIFO while at the limit. */
@@ -402,6 +423,15 @@ export class PacingGate {
   /** Acquire a review turn slot (Perkins lead or lens); queues FIFO. */
   acquireReviewTurn(input: PacingAcquireInput): Promise<PacingLease> {
     return this.acquire('review', input);
+  }
+
+  /** The job's minion turns holding or waiting for a worker slot (#427):
+   * a lane is idle for slimming only when both are zero. */
+  workerTurnsFor(jobId: string): JobWorkerTurns {
+    return {
+      held: this.heldByJob.get(jobId) ?? 0,
+      queued: this.queues.worker.filter((waiter) => waiter.jobId === jobId).length,
+    };
   }
 
   /** Honest snapshot for the board: limits, running counts, and every
@@ -455,7 +485,7 @@ export class PacingGate {
           return Promise.reject(error instanceof Error ? error : new Error(String(error)));
         }
       }
-      return Promise.resolve(this.mintLease(kind, 0));
+      return this.prepared(kind, input.jobId ?? null, input, input.signal, this.mintLease(kind, 0, input.jobId ?? null));
     }
     return new Promise<PacingLease>((resolve, reject) => {
       const waiter: PacingWaiter = {
@@ -531,7 +561,40 @@ export class PacingGate {
     });
   }
 
-  private mintLease(kind: PacingPool, waitedMs: number): PacingLease {
+  /** Hand a granted lease over: a worker turn of a job first awaits the
+   * prepare hook (#427), holding its slot meanwhile. Without a hook, or
+   * for any other turn, the lease is handed over as before. */
+  private prepared(
+    kind: PacingPool,
+    jobId: string | null,
+    waiter: { readonly id: string; readonly label: string; readonly jobId?: string | null; readonly agentId?: string | null },
+    signal: AbortSignal | undefined,
+    lease: PacingLease,
+  ): Promise<PacingLease> {
+    const prepare = this.prepareWorkerTurn;
+    if (kind !== 'worker' || jobId === null || prepare === null) return Promise.resolve(lease);
+    let ready: Promise<void>;
+    try {
+      ready = prepare(jobId, signal);
+    } catch (error) {
+      ready = Promise.reject(error instanceof Error ? error : new Error(String(error)));
+    }
+    return ready.then(
+      () => lease,
+      (error: unknown) => {
+        // Never blocks the turn: the failure is on the record and it proceeds.
+        try {
+          this.recordEvent('pacing.prepare-failed', waiter, { pool: kind, error: String(error) });
+        } catch {
+          // best-effort: the turn still proceeds
+        }
+        return lease;
+      },
+    );
+  }
+
+  private mintLease(kind: PacingPool, waitedMs: number, jobId: string | null): PacingLease {
+    if (kind === 'worker' && jobId !== null) this.heldByJob.set(jobId, (this.heldByJob.get(jobId) ?? 0) + 1);
     const lease: PacingLease = {
       waitedMs,
       release: () => {
@@ -540,6 +603,11 @@ export class PacingGate {
         }
         this.released.add(lease);
         this.running[kind] = Math.max(0, this.running[kind] - 1);
+        if (kind === 'worker' && jobId !== null) {
+          const held = (this.heldByJob.get(jobId) ?? 0) - 1;
+          if (held > 0) this.heldByJob.set(jobId, held);
+          else this.heldByJob.delete(jobId);
+        }
         // A recorder failure rejects THAT waiter loudly, not an orphaned
         // lease. Continue draining so healthy queued callers cannot starve.
         for (;;) {
@@ -553,7 +621,12 @@ export class PacingGate {
             continue;
           }
           this.running[kind] += 1;
-          next.resolve(this.mintLease(kind, waited));
+          const granted = this.mintLease(kind, waited, next.jobId);
+          if (kind === 'worker' && next.jobId !== null && this.prepareWorkerTurn !== null) {
+            void this.prepared(kind, next.jobId, next, next.signal, granted).then((lease) => next.resolve(lease));
+          } else {
+            next.resolve(granted);
+          }
           return;
         }
       },
@@ -585,7 +658,7 @@ export interface ResolvedPacingPolicy {
 
 export function resolvePacingPolicy(
   config: PacingConfig,
-  opts: { readonly record?: PacingEventRecorder; readonly now?: () => number } = {},
+  opts: { readonly record?: PacingEventRecorder; readonly now?: () => number; readonly prepareWorkerTurn?: PrepareWorkerTurn } = {},
 ): ResolvedPacingPolicy {
   return {
     backoff: resolveRateLimitBackoff(config),
@@ -595,6 +668,7 @@ export function resolvePacingPolicy(
       maxConcurrentReviewTurns: config.maxConcurrentReviewTurns,
       ...(opts.record !== undefined ? { record: opts.record } : {}),
       ...(opts.now !== undefined ? { now: opts.now } : {}),
+      ...(opts.prepareWorkerTurn !== undefined ? { prepareWorkerTurn: opts.prepareWorkerTurn } : {}),
     }),
   };
 }

@@ -55,6 +55,16 @@ export interface RecoveryClaimDeps {
    * prohibited read during a resume invalidates blind coverage. Wired by the
    * service to `DispatchService.observeBlindSession`; absent = no observation. */
   readonly observeBlindTurn?: (jobId: string, sessionFile: string | null) => void;
+  /** #427: restores the job's slim lanes before the continuation's prompt
+   * (the restore every other minion turn gets from the worker gate). This
+   * path takes no worker slot by design (no second capacity counter, see
+   * above), so it calls the restore directly; wired by the service to
+   * `laneLifecycleHooks().beforeContinuation`, whose `WorktreeManager.
+   * ensureReady` never rejects and whose stop (the service's) ends a running
+   * setup. `'stopped'`: the service is stopping, so the continuation
+   * neither spawns nor prompts, and its claim is released (the wait is
+   * recovered-pending again) for the next start to replay. */
+  readonly ensureReady?: (jobId: string) => Promise<'ready' | 'stopped'>;
 }
 
 /** The fresh provider-recovery worker's contract half: the effective
@@ -315,7 +325,31 @@ async function claimJobMinion(
   const admitted = { recorded: false };
   let releaseAllowed = true;
   let result: Awaited<ReturnType<typeof rebriefFreshMinion>>;
+  let stopped = false;
   try {
+    // A slim lane gets its setup back before the continuation runs in it
+    // (#427). The claim above already makes the lane busy, so no slim can
+    // run again before the prompt; a failed restore is recorded by the
+    // restore itself and the continuation proceeds. A service stop ends
+    // the restore and the continuation with it: nothing spawns or prompts
+    // during shutdown.
+    if (deps.ensureReady !== undefined) {
+      try {
+        stopped = (await deps.ensureReady(job.id)) === 'stopped';
+      } catch (error) {
+        deps.log?.('error', 'lane restore before a provider continuation failed; the continuation proceeds', { wait_id: wait.id, job: job.id, error: String(error) });
+      }
+    }
+    if (stopped) {
+      // Nothing spawned or prompted: the claim is handed back, so the next
+      // start replays the continuation (#427).
+      const released = deps.ledger.releaseProviderWaitClaim(wait.id, { by, why: 'the service stopped before the continuation spawned' });
+      deps.ledger.appendCustomEvent({ kind: 'provider.continuation-released', jobId: wait.jobId, agentId: wait.agentId, payload: { wait_id: wait.id, by, released } });
+      deps.log?.('info', 'provider continuation not started — the service is stopping; the claim is released for the next start to replay', { wait_id: wait.id, job: wait.jobId, released });
+      return { outcome: 'skipped', waitId: wait.id, why: released
+        ? 'the service stopped before the continuation spawned (claim released; the next start replays it)'
+        : 'the service stopped before the continuation spawned (the claim could not be released)' };
+    }
     result = await rebriefFreshMinion({
       registry: deps.registry,
       ledger: deps.ledger,

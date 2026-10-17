@@ -21,3 +21,9 @@ const SHUTDOWN_FORCE_EXIT_SLACK_MS = 5_000;
  */
 export const SHUTDOWN_FORCE_EXIT_MS =
   CESSATION_IDLE_TIMEOUT_MS + BRIDGE_CLOSE_TIMEOUT_MS + SHUTDOWN_FORCE_EXIT_SLACK_MS;
+
+/** How long shutdown waits for a running lane-slimming pass (#427), well
+ * inside {@link SHUTDOWN_FORCE_EXIT_MS}: the pass stops between reclaim
+ * entries once told to, and one cut short after its record is safe (the
+ * lane is slim, and its next turn restores it). */
+export const LANE_SLIMMER_STOP_WAIT_MS = 5_000;

@@ -85,7 +85,8 @@ export interface WorktreeManifest {
   readonly verify: ManifestVerify;
   /** Per-repository raid opt-out (#351); absent means the instance setting decides. */
   readonly vector?: { readonly enabled: boolean };
-  /** Regenerable folders (#427): repo-relative, normalized ("a/b"), unique. Nothing consumes them yet. */
+  /** Regenerable folders (#427): repo-relative, normalized ("a/b"), unique.
+   * Lane slimming deletes them from an idle lane; the lane's setup restores them. */
   readonly reclaim?: readonly string[];
   /** Historical manifests remain readable for already-running jobs; creation refuses this obsolete GC bootstrap. */
   readonly retiredGcBmadBootstrap?: true;
