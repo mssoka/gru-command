@@ -57,15 +57,19 @@ this is routing compatibility, not an external BMAD dependency.
 ## Supported delivery paths
 
 - `gc-build`: normal route — investigate/plan, implement, independent tracked
-  three-lens review via commissioned service review jobs, reasoned fixes,
+  four-lens review via commissioned service review jobs (blind adversarial,
+  edge-case path tracing, verification gaps, intent alignment), reasoned fixes,
   verification and ordinary PR handoff. Generic child workers/untracked terminals
   do not replace a GC job's commissioned review handback/disposition.
 - Small-change route — reduced planning plus at least one fresh independent
-  adversarial reviewer, reasoned fixes, verification and ordinary PR handoff.
+  adversarial reviewer, widened by the risk re-scored against the candidate diff
+  (`medium` adds the verification and edge-case lenses, `high` or unrecorded uses
+  all four; a risk raised during review adds its lenses on the same head),
+  reasoned fixes, verification and ordinary PR handoff.
 - Planning and review helper entrypoints are also independently resolvable.
 - Intake helpers, read by intake rather than rendered into a lane:
   `skills/gc-build/intake.md` (the planning contract) and, since
-  `gru-command-workflows@2`, `skills/gc-build/slice.md` (#429). The slicing
+  `gru-command-workflows@3`, `skills/gc-build/slice.md` (#429). The slicing
   helper ports the "Epic into stories" method of BMad's `bmad-ticket`: one
   minion-session slice per step toward the epic's Done when, a tracer bullet
   first, lanes that never touch the same code, one runnable check per slice,
@@ -81,6 +85,26 @@ global skill or unshipped checkout file is required for these new resources.
 No minimum finding quota or total/per-phase tool-call ceiling applies; a clean
 review may return `No actionable findings.` Review needs actual independent
 tracked runs/sessions, not author self-review or merely sending a prompt.
+
+Triage verifies every finding at its cited location and gives exactly one verdict:
+`high`, `medium`, `low`, `false` or `maybe-false`. Reviewer-assigned severity is
+ignored. `false` findings are rejected on their refutation. A `low` finding is
+rejected when users or developers are unlikely to meet it in everyday use and its
+fix adds complexity beyond a direct correction or deletion (owner ruling
+2026-10-17). On a re-review, a matching row is carried forward without
+re-verification while nothing changed its cited code, evidence code, the callers
+of or paths into the cited code, or the approved intent since its logged head; a
+row marked fixed or corrected is never carried, because the same finding means the
+fix missed.
+The edge-case lens
+receives no claims (owner ruling 2026-10-17) and no knowledge-root files, so no
+claims are handed to its path tracing; the verification lens falsifies the spec's
+claims against the code and the approved intent. Expected behavior (acceptance
+scenarios, matrix rows) changes only by quoting the approved intent it
+contradicts, then the code follows it, or by owner decision — never to match the
+code. Every finding keeps a
+row and reason in the private triage log; pre-existing defects and unsettled
+`maybe-false` findings are named in the handoff, not opened as new backlog.
 Development/fallback PASS is never native exact-final-head Perkins READY.
 
 ## Explicit invocation context
@@ -139,14 +163,15 @@ same package-relative helper launcher using a supplied absolute context file;
 
 ## Identity, integrity and lane continuity
 
-`runtime.json` uses schema 2, a GC name/version (`gru-command-workflows@2`),
+`runtime.json` uses schema 2, a GC name/version (`gru-command-workflows@<version>`),
 supported entrypoints/skill names and per-resource sha256. There are no upstream
 archive/identity sections. Missing/corrupt/undeclared/symlinked files fail with
 `WorkflowResourceError`; no ambient workflow fallback is permitted. Required
 helpers and reference closure must remain complete even during manifest refresh.
-The current package must ship the intake and slicing helpers. Neither is in the
-manifest's required list, so a lane bound to `@1`, which predates the slicing
-helper, keeps validating and keeps its package.
+A manifest refresh requires the intake and slicing helpers, and commissioning a
+planning minion refuses a package without the slicing helper. Neither helper is
+in the manifest's required list, so a lane bound to `@1` or `@2`, which predate
+the slicing helper, keeps validating and keeps its package.
 
 `loadBundledWorkflowRuntime`, `materializeBmadRuntime` and
 `bindWorkflowRuntime` reuse #283's content-addressed immutable store and atomic
@@ -176,14 +201,17 @@ Edit GC templates/helpers directly, then refresh **local GC integrity**:
 
 ```sh
 npx tsc
-node dist/cli/workflow-runtime.js manifest . --version 3
+node dist/cli/workflow-runtime.js manifest .   # current version still unreleased: keep it
+# or, once per release after the current version shipped:
+# node dist/cli/workflow-runtime.js manifest . --version N   # N: the next unused version
 npm test
 npm pack
 ```
 
-Use a positive integer GC resource version for intentional instruction releases;
-content hashes independently distinguish every set of bytes. There is no BMAD
-fetch/re-vendoring step or byte-for-byte upstream comparison on GC resources.
+Bump the version once per instruction release: while the current version is still
+unreleased (not yet merged), refresh without `--version`; after it ships, pass the
+next unused integer. Content hashes independently distinguish every set of
+bytes. There is no BMAD fetch/re-vendoring step or byte-for-byte upstream comparison on GC resources.
 `npm run build` verifies the owned manifest; `npm pack` rebuilds backend/web and
 ships the complete resource directory plus this document. The old bundle is
 still separately verified for retained historical lanes and transitional setup.

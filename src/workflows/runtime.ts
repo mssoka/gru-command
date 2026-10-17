@@ -74,9 +74,6 @@ export function loadBundledWorkflowRuntime(packageRoot = PACKAGE_ROOT): BundledW
   if (!bundle.files.has(REQUIRED_INTAKE_WORKFLOW_FILE)) {
     throw new WorkflowResourceError(`current GC workflow package lacks required intake helper ${REQUIRED_INTAKE_WORKFLOW_FILE}; rebuild or reinstall GC`);
   }
-  if (!bundle.files.has(REQUIRED_SLICING_WORKFLOW_FILE)) {
-    throw new WorkflowResourceError(`current GC workflow package lacks required slicing helper ${REQUIRED_SLICING_WORKFLOW_FILE}; rebuild or reinstall GC`);
-  }
   return bundle;
 }
 

@@ -42,7 +42,7 @@ function textAt(snapshot: string, name: string): string { return readFileSync(jo
 describe('GC-owned workflow resources', () => {
   it('has a GC identity, ordinary local integrity, license/attribution and its own build verifier', () => {
     const bundle = loadBundledWorkflowRuntime(repoRoot);
-    expect(bundle.id).toBe('gru-command-workflows@2');
+    expect(bundle.id).toBe('gru-command-workflows@3');
     expect(bundle.manifest).not.toHaveProperty('upstream');
     expect(bundle.manifest).not.toHaveProperty('customization');
     expect(bundle.files.get('LICENSE')!.toString()).toContain('MIT License');
@@ -63,9 +63,9 @@ describe('GC-owned workflow resources', () => {
     appendFileSync(join(root, WORKFLOW_RESOURCE_DIR, 'scripts/render.mjs'), '\n// GC-maintained helper change.\n');
     expect(() => loadBundledWorkflowRuntime(root)).toThrow(/does not match its sha256/u);
     const lines: string[] = [];
-    runWorkflowRuntimeCli(['manifest', root, '--version', '3'], (line) => lines.push(line));
+    runWorkflowRuntimeCli(['manifest', root, '--version', '4'], (line) => lines.push(line));
     const after = loadBundledWorkflowRuntime(root);
-    expect(after.id).toBe('gru-command-workflows@3');
+    expect(after.id).toBe('gru-command-workflows@4');
     expect(after.contentSha256).not.toBe(before.contentSha256);
     expect(lines[0]).toContain('owned local resources');
     const invocation = renderWorkflow(materializeBmadRuntime(after, temp()), fixture());
@@ -161,6 +161,161 @@ describe('GC-owned workflow resources', () => {
     expect(textAt(invocation.snapshotDir, 'workflow.md')).toContain('small-change.md');
   });
 
+  it('review commissions four lenses with fixed roles, sizes small-change review by risk and triages with one verdict per finding', () => {
+    const context = fixture();
+    const invocation = renderWorkflow(runtime(), context);
+    const review = textAt(invocation.snapshotDir, 'review.md');
+    const intent = textAt(invocation.snapshotDir, 'review-prompts/intent-alignment.md');
+    const bullet = (lens: string): string => {
+      const start = review.indexOf(join(invocation.snapshotDir, `skills/gc-build/review-prompts/${lens}.md`));
+      expect(start, lens).toBeGreaterThan(-1);
+      const rest = review.slice(start);
+      return rest.slice(0, rest.search(/\n(?:- |\n)/u));
+    };
+    expect(review).toContain('The normal route uses all four lenses');
+    // Each lens is tied to its dispatch role: only the adversarial lens is blind.
+    expect(bullet('adversarial')).toContain('"review_role": "blind"');
+    for (const lens of ['edge-cases', 'verification', 'intent-alignment']) {
+      expect(bullet(lens), lens).toContain('"review_role": "claims"');
+      expect(bullet(lens), lens).not.toContain('"review_role": "blind"');
+    }
+    expect(bullet('adversarial')).not.toContain('"review_role": "claims"');
+    // The path tracer gets no claims; the verification lens falsifies them.
+    expect(bullet('edge-cases')).toMatch(/only: never the spec, intent, task list or author's explanation\. Commission it\s+with `"review_role": "claims"` and no `required_inputs`/u);
+    expect(bullet('verification')).toMatch(/with the approved intent \(the ground truth\) and\s+the claims it falsifies \(the working spec's acceptance and tasks, or on the\s+small-change route the note's settled acceptance\) quoted in its brief/u);
+    expect(review).toMatch(/Hand the edge-case lens the diff without knowledge-root paths/u);
+    expect(review).toContain(`(\`${context.knowledgeRoot}\`), so a committed spec is not part of what it traces;`);
+    expect(review).toMatch(/the other lenses, intent alignment included, review those files as part of the\s+change/u);
+    expect(review).toMatch(/A change that\s+touches\s+only\s+knowledge-root\s+files\s+gives\s+the\s+edge-case\s+lens\s+no\s+code\s+to\s+trace:\s+record\s+it\s+as\s+not\s+applicable/u);
+    expect(bullet('intent-alignment')).toMatch(/plus the verbatim owner-approved intent quoted into the brief; the brief never\s+adds the author's explanation, task list or self-review/u);
+    expect(intent).toMatch(/surface at\s+which\s+the intent's\s+expectations\s+live/u);
+    expect(intent).toMatch(/internal proxy/u);
+    expect(intent).toMatch(/enumerated from the intent text alone\s+before you read the diff/u);
+    expect(intent).toMatch(/Documents in the diff —\s+specs, decisions, notes — are part of the change: judge them against the intent\s+like code; they never settle what the intent means/u);
+    // Risk sizes small-change review, is re-scored against the diff and raised lenses run on the same head.
+    expect(review).toMatch(/`medium` adds the verification and\s+edge-case lenses, `high` uses all four, and an unrecorded risk counts as `high`/u);
+    expect(review).toMatch(/A risk raised during review commissions the lenses it now requires on the same\s+head before review concludes/u);
+    const small = textAt(invocation.snapshotDir, 'small-change.md');
+    expect(small).toMatch(/the change's risk \(`low`, `medium`\s+or `high`: the business impact if it is wrong/u);
+    expect(small).toMatch(/never lowered once a reviewer has run/u);
+    expect(small).toMatch(/re-score the risk against that diff, raising it when the change reaches more\s+than step 1 expected/u);
+    expect(small).toMatch(/`medium` adds the verification and edge-case\s+lenses, `high` uses all four/u);
+    // Triage waits for every lens or records its failure; a failed blind report is never coverage.
+    expect(review).toMatch(/Triage only after every launched reviewer has reported or ended without a report\./u);
+    expect(review).toMatch(/A failed lens is a reviewer job that ended without a report \(crashed, cancelled,\s+refused or stopped\), reported its content missing or unreadable, or delivered a\s+blind report that `blind-coverage` does not rate `qualifying`/u);
+    expect(review).toMatch(/treat that\s+lens's coverage as missing until a replacement reports/u);
+    expect(review).toMatch(/A replacement or later\s+re-review of that lens covers from the last head where it had counted coverage \(or\s+the base\), never a narrower focused delta/u);
+    expect(review).toMatch(/A failed blind report never counts as coverage, whatever `blind-coverage` says\. If\s+its replacement is refused `409 blind_coverage_owned`, do not retry in a loop/u);
+    expect(review).toMatch(/service accepts a same-head replacement only once the failed job is parked or\s+binned\. Decide after triaging the other lenses: when fixes follow, commission the\s+blind lens again on the new head; otherwise escalate to the owner with the failed\s+job's id, and once that job is parked or binned commission the replacement on the\s+then-current head/u);
+    expect(review).toMatch(/Review stays incomplete until every required lens is covered;\s+only the edge-case lens on a knowledge-root-only change may instead be recorded\s+not applicable/u);
+    // Exactly one defined verdict per finding.
+    expect(review).toMatch(/Disregard any\s+severity a reviewer assigned/u);
+    expect(review).toMatch(/Render exactly one verdict:/u);
+    expect(review).toMatch(/- `high` \(intolerable\), `medium` \(tolerable\) or `low` \(cosmetic or negligible\) —\s+the bad outcome is real/u);
+    expect(review).toMatch(/- `false` — you checked and the outcome does not occur/u);
+    expect(review).toMatch(/- `maybe-false` — the diff and surrounding code cannot decide it/u);
+    expect(review).toMatch(/Code that fails loudly on a state you have not shown the program can reach is\s+correct behavior, not a defect/u);
+    // Carried rows: unchanged code, evidence, callers and intent since the logged head; never a row marked fixed.
+    expect(review).toMatch(/Carry a row forward when the finding has the same location and claim and,\s+since the head the row was logged at, nothing changed the cited code, the code its\s+evidence relied on, any caller of or path into the cited code, or the approved\s+intent/u);
+    expect(review).toMatch(/Log it again as `carried` with the head range compared, keeping its\s+original verdict and disposition, without re-verifying or re-fixing it/u);
+    expect(review).toMatch(/A row marked fixed or\s+corrected is never carried: the same finding at unchanged code means the fix\s+missed/u);
+    expect(review).toMatch(/a carried\s+pending owner decision stays pending until the owner rules/u);
+    // Owner ruling 2026-10-17: unlikely low findings whose fix adds complexity are rejected.
+    expect(review).toMatch(/Reject a `low` finding when users or\s+developers are unlikely to meet the defect in everyday use/u);
+    expect(review).toMatch(/new\s+guards, branches, parameters or other complexity/u);
+    expect(review).toMatch(/only when the approved intent itself\s+excludes it/u);
+    // Routing replaces BMAD's defer list; only owner-approved acceptance needs the owner.
+    expect(review).toMatch(/Group the survivors by shared root cause — the same defect produced both, not\s+merely the same location or the same fix — and give each group its highest\s+verdict/u);
+    expect(review).toMatch(/One that cannot be settled is logged as unsettled and named in the\s+handoff with what would settle it/u);
+    expect(review).toMatch(/log it as pre-existing with\s+its evidence and name it in the handoff; do not open new backlog for it/u);
+    expect(review).toMatch(/Findings that expose wrong expected behavior — an acceptance scenario or\s+matrix row — are corrected only by quoting the approved-intent text it\s+contradicts, never to match the code; then fix the code and its tests to the\s+corrected expectation with a regression\. Any other doubt about expected behavior\s+needs an explicit owner decision/u);
+    expect(review).toMatch(/A wrong implementation-plan detail \(a task, a code-map entry\)\s+is corrected with its reason, never to drop work the approved intent or\s+acceptance still requires\. Log each correction as `corrected` \(with the commit\s+of any code fix\) and name it in the handoff/u);
+    expect(review).not.toMatch(/proves it unworkable/u);
+    expect(review).toContain('Do not offload known required work into new backlog.');
+    expect(review).not.toMatch(/deferred-work|defer list/iu);
+    expect(textAt(invocation.snapshotDir, 'present.md')).toMatch(/the recorded\s+risk and review outcome — naming every finding not fixed in this change\s+\(rejected, owner ruling, owner decision pending, pre-existing or unsettled\) and\s+every corrected spec detail with its evidence/u);
+  });
+
+  it('lenses carry the verification-gap and path-tracing methods, and planning carries risk and the I/O matrix audit', () => {
+    const invocation = renderWorkflow(runtime(), fixture());
+    const verification = textAt(invocation.snapshotDir, 'review-prompts/verification.md');
+    for (const shape of ['Regression gap', 'Missing-adoption gap', 'Broken-verification gap', 'Acceptance-evidence gap']) expect(verification).toContain(shape);
+    expect(verification).toMatch(/name the Demonstration: the smallest realistic regression/u);
+    expect(verification).toMatch(/search the whole repository by the symbol under\s+test and by import references/u);
+    expect(verification).toMatch(/source-text assertions that match a file's wording/u);
+    expect(verification).toContain('`expect(x ?? DEFAULT).toBe(DEFAULT)` passes when `x` is missing');
+    expect(verification).toMatch(/## Claims\s+After tracing verification, take the claims your brief quotes — the working\s+spec's acceptance and tasks, or the small-change note's settled acceptance/u);
+    expect(verification).toMatch(/The approved intent is not a claim; it is\s+what the claims are checked against/u);
+    expect(verification).toMatch(/and against the approved intent\. Verified claims produce\s+nothing/u);
+    expect(verification).toMatch(/what contradicts it — the code\s+\(`file:line`, with what it actually does\) or the approved intent \(quoted\)/u);
+    expect(verification).toMatch(/the approved intent and the claims are quoted in the\s+brief/u);
+    expect(verification).toMatch(/testimony, not evidence/u);
+    expect(verification).toMatch(/Outside the claims step\s+below, do not hunt for correctness bugs/u);
+    expect(verification).toMatch(/If the diff your brief\s+names, or the approved intent or claims it quotes, are missing, empty or\s+unreadable, say exactly that and stop/u);
+    expect(verification).toMatch(/inspected scope\s+and the claims you checked/u);
+    const edges = textAt(invocation.snapshotDir, 'review-prompts/edge-cases.md');
+    expect(edges).toMatch(/report only what the change leaves\s+unhandled: reachable paths and boundaries, and removed contracts/u);
+    expect(edges).toMatch(/Your brief\s+carries no claims about the change; do not seek the author's spec, intent or task\s+list, so nothing steers the trace/u);
+    expect(edges).toMatch(/Implicit branches:/u);
+    expect(edges).toMatch(/Handle lifetime:/u);
+    expect(edges).toMatch(/read the callee's declaration/u);
+    expect(edges).toMatch(/where\s+removed code was referenced, and where other writers or readers share the state/u);
+    expect(edges).toMatch(/assign severity or confidence/u);
+    expect(edges).not.toMatch(/high\/medium\/low\s+confidence|claims input|reach you anyway/u);
+    expect(edges).not.toMatch(/carries claims about the change\s+anyway/u);
+    for (const lens of [verification, edges, textAt(invocation.snapshotDir, 'review-prompts/intent-alignment.md')]) {
+      expect(lens).toContain('No actionable findings.');
+      expect(lens).toMatch(/Do not rank or\s+assign severity|no severity, confidence or\s+ranking/u);
+      expect(lens).not.toMatch(/find at least|finding floor|do not stop with an empty/iu);
+    }
+    const spec = textAt(invocation.snapshotDir, 'spec-template.md');
+    expect(spec).toMatch(/## Risk\s+`low`, `medium` or `high` — the business impact if this change is wrong/u);
+    expect(spec).toMatch(/This route reviews with all four lenses whatever the\s+risk; the small-change route records the same field in its note, where it sizes\s+review breadth/u);
+    expect(spec).toContain('| Scenario | Input / state | Expected output / behavior | Error handling |');
+    expect(spec).toMatch(/outermost surface the intent names/u);
+    expect(spec).toMatch(/## Review triage log\s+Append one row per reviewer finding on every review pass, carried rows included:\s+reviewed head/u);
+    expect(spec).toMatch(/corrected \(a spec detail, with its evidence\), rejected with its reason, owner\s+ruling with the ruling, owner decision pending, pre-existing, or unsettled with\s+what would settle it/u);
+    expect(spec).toMatch(/A carried row is marked\s+`carried`, records the head range it was compared over and keeps its original\s+verdict and disposition/u);
+    expect(textAt(invocation.snapshotDir, 'plan.md')).toMatch(/Score its risk from the investigation/u);
+    const implement = textAt(invocation.snapshotDir, 'implement.md');
+    expect(implement).toMatch(/\(unregistered, filtered out,\s+skipped or disabled\) counts as missing/u);
+    expect(implement).toMatch(/never\s+edit the expectation to match the code/u);
+    expect(implement).toMatch(/An acceptance scenario or\s+row is corrected only by quoting the approved-intent text it contradicts, and the\s+code and tests then follow the corrected expectation; any other doubt about one\s+needs an owner decision/u);
+    expect(implement).toMatch(/Tasks and code-map entries are implementation plan,\s+corrected with their reason but never to drop required work/u);
+    expect(implement).toMatch(/Name every\s+correction in the handoff/u);
+    expect(implement).not.toMatch(/proves it unworkable/u);
+  });
+
+  it('a lane bound to the shipped @1 package keeps its retained copy after @2 replaces the package in place, while a new lane binds @2', () => {
+    // Exact bytes of gru-command-workflows@1 as shipped at 408250ac; live lanes are bound to these.
+    const shippedRoot = join(repoRoot, 'test/fixtures/gc-workflows-v1');
+    const shipped = loadBundledWorkflowRuntime(shippedRoot);
+    expect(shipped.id).toBe('gru-command-workflows@1');
+    expect(shipped.contentSha256).toBe('d0bd8c82f608ab1d70fbc468509a6c6f8d1c731fad4964aec6d431b4e6700bc5');
+    // The installed package root is upgraded in place, as an install update does.
+    const installed = temp();
+    cpSync(join(shippedRoot, WORKFLOW_RESOURCE_DIR), join(installed, WORKFLOW_RESOURCE_DIR), { recursive: true });
+    const context = fixture();
+    const old = join(dirname(context.projectRoot), 'bound-v1');
+    const fresh = join(dirname(context.projectRoot), 'fresh-v2');
+    git(context.projectRoot, ['worktree', 'add', '-qb', 'bound-v1', old]);
+    git(context.projectRoot, ['worktree', 'add', '-qb', 'fresh-v2', fresh]);
+    const store = temp();
+    const a = createWorkflowRuntimeBinder(store, installed)(old);
+    expect(a.runtimeId).toBe('gru-command-workflows@1');
+    expect(a.root.startsWith(`${store}/`)).toBe(true);
+    rmSync(join(installed, WORKFLOW_RESOURCE_DIR), { recursive: true });
+    cpSync(join(repoRoot, WORKFLOW_RESOURCE_DIR), join(installed, WORKFLOW_RESOURCE_DIR), { recursive: true });
+    const current = createWorkflowRuntimeBinder(store, installed);
+    expect(current(old)).toEqual(a);
+    expect(current(fresh).runtimeId).toBe('gru-command-workflows@3');
+    const rendered = renderWorkflow({ id: a.runtimeId, dir: a.root, contentSha256: a.contentSha256, skillsDir: a.skillsDir, skills: a.skills },
+      { ...context, worktreeRoot: old, knowledgeRoot: join(old, 'gru-output') }, 'review');
+    const review = readFileSync(rendered.entrypoint, 'utf-8');
+    expect(review).toContain('The normal route uses all three lenses');
+    expect(review).not.toContain('intent-alignment');
+  });
+
   it('ignores absent, broken or symlinked ambient BMAD and does not modify its files', () => {
     const context = fixture();
     const elsewhere = temp();
@@ -241,13 +396,13 @@ describe('GC-owned workflow resources', () => {
     git(context.projectRoot, ['worktree', 'add', '-qb', 'two', two]);
     const store = temp();
     const rootB = packageCopy();
-    writeWorkflowManifest(rootB, 3);
+    writeWorkflowManifest(rootB, 4);
     const bindA = createWorkflowRuntimeBinder(store, repoRoot);
     const bindB = createWorkflowRuntimeBinder(store, rootB);
     const a = bindA(one);
     expect(bindB(one)).toEqual(a);
-    expect(bindB(two).runtimeId).toBe('gru-command-workflows@3');
-    expect(a).toMatchObject({ source: WORKFLOW_SOURCE, runtimeId: 'gru-command-workflows@2', laneBound: true });
+    expect(bindB(two).runtimeId).toBe('gru-command-workflows@4');
+    expect(a).toMatchObject({ source: WORKFLOW_SOURCE, runtimeId: 'gru-command-workflows@3', laneBound: true });
     const originalRecord = readFileSync(join(git(one, ['rev-parse', '--path-format=absolute', '--git-dir']), 'gru-command/bmad-runtime.json'), 'utf-8');
     rmSync(a.root, { recursive: true });
     expect(() => bindB(one)).toThrow(/never switches runtimes/u);
@@ -274,7 +429,7 @@ describe('GC-owned workflow resources', () => {
     const store = temp();
     const a = loadBundledWorkflowRuntime(repoRoot);
     const rootB = packageCopy();
-    writeWorkflowManifest(rootB, 3);
+    writeWorkflowManifest(rootB, 4);
     const b = loadBundledWorkflowRuntime(rootB);
     const result = bindWorkflowRuntime(lane, { storeRoot: store, bundled: () => b,
       beforePublish: () => { bindWorkflowRuntime(lane, { storeRoot: store, bundled: () => a }); } });
@@ -321,12 +476,12 @@ describe('GC-owned workflow resources', () => {
       expect(existsSync(valid.artifactRoot)).toBe(false);
     }
     const packageB = packageCopy();
-    writeWorkflowManifest(packageB, 3);
+    writeWorkflowManifest(packageB, 4);
     writeFileSync(file, JSON.stringify(valid));
     const output: string[] = [];
     runWorkflowRuntimeCli(['render', '--context', file, '--store', store, '--package-root', packageB], (line) => output.push(line));
-    expect(JSON.parse(output[0]!)).toMatchObject({ runtimeId: 'gru-command-workflows@3' });
-    expect(JSON.parse(readFileSync(bindingFile, 'utf-8'))).toMatchObject({ runtime_id: 'gru-command-workflows@3' });
+    expect(JSON.parse(output[0]!)).toMatchObject({ runtimeId: 'gru-command-workflows@4' });
+    expect(JSON.parse(readFileSync(bindingFile, 'utf-8'))).toMatchObject({ runtime_id: 'gru-command-workflows@4' });
   });
 
   it('CLI invocation validates a bound lane under retained A, not the installed B validator', () => {
@@ -344,18 +499,18 @@ describe('GC-owned workflow resources', () => {
       runWorkflowRuntimeCli(['render', '--context', file, '--store', store, '--package-root', packageRoot], (line) => output.push(line));
       return JSON.parse(output[0]!) as { runtimeId: string };
     };
-    expect(invoke(repoRoot).runtimeId).toBe('gru-command-workflows@2');
+    expect(invoke(repoRoot).runtimeId).toBe('gru-command-workflows@3');
     const bindingFile = join(git(lane, ['rev-parse', '--path-format=absolute', '--git-dir']), 'gru-command/bmad-runtime.json');
     const original = readFileSync(bindingFile, 'utf-8');
     rmSync((JSON.parse(original) as { runtime_dir: string }).runtime_dir, { recursive: true });
-    expect(invoke(repoRoot).runtimeId).toBe('gru-command-workflows@2'); // identical-byte restoration after validation
+    expect(invoke(repoRoot).runtimeId).toBe('gru-command-workflows@3'); // identical-byte restoration after validation
     expect(readFileSync(bindingFile, 'utf-8')).toBe(original);
     const packageB = packageCopy();
     const validator = join(packageB, WORKFLOW_RESOURCE_DIR, 'scripts/context.mjs');
     writeFileSync(validator, readFileSync(validator, 'utf-8').replace('export function validateContext(raw, protectedRoots = []) {',
       'export function validateContext(raw, protectedRoots = []) {\n  if (raw?.projectId === "legacy") throw new Error("B rejects legacy");'));
-    writeWorkflowManifest(packageB, 3);
-    expect(invoke(packageB).runtimeId).toBe('gru-command-workflows@2');
+    writeWorkflowManifest(packageB, 4);
+    expect(invoke(packageB).runtimeId).toBe('gru-command-workflows@3');
     expect(readFileSync(bindingFile, 'utf-8')).toBe(original);
     const next = { ...valid, worktreeRoot: fresh, knowledgeRoot: join(fresh, 'gru-output'), artifactRoot: join(temp(), 'new-job') };
     writeFileSync(file, JSON.stringify(next));
@@ -364,7 +519,7 @@ describe('GC-owned workflow resources', () => {
     expect(existsSync(next.artifactRoot)).toBe(false);
     rmSync(join(packageB, WORKFLOW_RESOURCE_DIR), { recursive: true });
     writeFileSync(file, JSON.stringify(valid));
-    expect(invoke(packageB).runtimeId).toBe('gru-command-workflows@2'); // no current bundle available
+    expect(invoke(packageB).runtimeId).toBe('gru-command-workflows@3'); // no current bundle available
   });
 
   it('the explicit render CLI records the bound workflow and rejects incomplete/unknown arguments', () => {
@@ -373,7 +528,7 @@ describe('GC-owned workflow resources', () => {
     writeFileSync(file, JSON.stringify(context));
     const lines: string[] = [];
     runWorkflowRuntimeCli(['render', '--context', file, '--store', temp(), '--package-root', repoRoot, '--route', 'small-change'], (line) => lines.push(line));
-    expect(JSON.parse(lines[0]!)).toMatchObject({ runtimeId: 'gru-command-workflows@2' });
+    expect(JSON.parse(lines[0]!)).toMatchObject({ runtimeId: 'gru-command-workflows@3' });
     for (const args of [[], ['verify', '--bogus'], ['manifest', repoRoot, '--version', '0'], ['render', '--context', file], ['render', '--unknown', 'x']]) {
       expect(() => runWorkflowRuntimeCli(args, () => {})).toThrow(/usage:/u);
     }

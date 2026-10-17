@@ -23,8 +23,9 @@ export const REQUIRED_WORKFLOW_FILES: readonly string[] = [
 
 /** Current intake needs this helper; historical lane manifests remain valid. */
 export const REQUIRED_INTAKE_WORKFLOW_FILE = 'skills/gc-build/intake.md';
-/** Intake slicing (#429) needs this helper. Like the intake helper, only the
- * current package must ship it; lanes bound to older packages remain valid. */
+/** Intake slicing (#429) needs this helper: a manifest refresh refuses a
+ * package without it, and commissioning refuses a loaded package lacking it.
+ * Older packages still load and bind, so their lanes remain valid. */
 export const REQUIRED_SLICING_WORKFLOW_FILE = 'skills/gc-build/slice.md';
 
 export class WorkflowResourceError extends Error {

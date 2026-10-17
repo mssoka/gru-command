@@ -3,6 +3,9 @@
 The build/planning/review templates are adapted from the useful BMad Method
 6.12.0 delivery templates initially bundled by GC in #283, from
 https://github.com/bmad-code-org/BMAD-METHOD (© BMad Code, LLC, MIT).
+The verification-gap, edge-case and intent-alignment review methods, the
+finding-verdict triage and the risk/I-O-matrix planning fields were later
+adapted from the BMad Method 6.13.0-next delivery skills from the same source.
 The epic slicing helper (`skills/gc-build/slice.md`) adapts the "Epic into
 stories" method of the BMad Method 6.13.0-next `bmad-ticket` skill from the same
 source, without its ticket store, refactor sweep or deferred-work list.

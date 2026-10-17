@@ -693,7 +693,7 @@ describe('owned packaged intake workflow', () => {
     expect(() => loadBundledWorkflowRuntime(pkg)).toThrow('required intake helper');
     expect(() => writeWorkflowManifest(pkg)).toThrow('required intake helper');
   });
-  it('requires the slicing helper (#429) for current packages while an earlier package without it still verifies', () => {
+  it('requires the slicing helper (#429) to refresh a manifest while an earlier package without it still loads and verifies', () => {
     const h = fixture();
     const root = join(h.root, 'previous', 'resources', 'gc-workflows');
     mkdirSync(dirname(root), { recursive: true });
@@ -711,7 +711,7 @@ describe('owned packaged intake workflow', () => {
     const files = new Map(Object.keys(manifest.files).map((path) => [path, readFileSync(join(root, path))]));
     expect(() => verifyWorkflowFiles(parsed, files)).not.toThrow();
     expect(parsed.id).toBe('gru-command-workflows@1');
-    expect(() => loadBundledWorkflowRuntime(join(h.root, 'previous'))).toThrow('required slicing helper');
+    expect(loadBundledWorkflowRuntime(join(h.root, 'previous')).id).toBe('gru-command-workflows@1');
     expect(() => writeWorkflowManifest(join(h.root, 'previous'))).toThrow('required slicing helper');
   });
 });
