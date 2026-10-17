@@ -161,43 +161,67 @@ describe('GC-owned workflow resources', () => {
     expect(textAt(invocation.snapshotDir, 'workflow.md')).toContain('small-change.md');
   });
 
-  it('review commissions four lenses, sizes small-change review by risk and triages with one verdict per finding', () => {
+  it('review commissions four lenses with fixed roles, sizes small-change review by risk and triages with one verdict per finding', () => {
     const invocation = renderWorkflow(runtime(), fixture());
     const review = textAt(invocation.snapshotDir, 'review.md');
     const intent = textAt(invocation.snapshotDir, 'review-prompts/intent-alignment.md');
+    const bullet = (lens: string): string => {
+      const start = review.indexOf(join(invocation.snapshotDir, `skills/gc-build/review-prompts/${lens}.md`));
+      expect(start, lens).toBeGreaterThan(-1);
+      const rest = review.slice(start);
+      return rest.slice(0, rest.search(/\n(?:- |\n)/u));
+    };
     expect(review).toContain('The normal route uses all four lenses');
-    expect(review).toContain(join(invocation.snapshotDir, 'skills/gc-build/review-prompts/intent-alignment.md'));
+    // Each lens is tied to its dispatch role: only the adversarial lens is blind.
+    expect(bullet('adversarial')).toContain('"review_role": "blind"');
+    for (const lens of ['edge-cases', 'verification', 'intent-alignment']) {
+      expect(bullet(lens), lens).toContain('"review_role": "claims"');
+      expect(bullet(lens), lens).not.toContain('"review_role": "blind"');
+    }
+    expect(bullet('adversarial')).not.toContain('"review_role": "claims"');
+    // The path tracer gets no claims; the verification lens falsifies them.
+    expect(bullet('edge-cases')).toMatch(/only: never the spec, intent, task list or author's explanation, so nothing steers\s+its path tracing\. Commission it with `"review_role": "claims"` and no\s+`required_inputs`/u);
+    expect(bullet('verification')).toMatch(/the working spec's acceptance and tasks as the claims it falsifies/u);
+    expect(bullet('intent-alignment')).toMatch(/plus the verbatim owner-approved intent quoted into the brief; never the author's\s+explanation, task list or self-review/u);
     expect(intent).toMatch(/surface at\s+which\s+the intent's\s+expectations\s+live/u);
     expect(intent).toMatch(/internal proxy/u);
-    expect(review).toMatch(/intent-alignment\.md\]?\]? — diff and its tests\s+plus the verbatim owner-approved intent quoted into the brief; never the author's\s+explanation, task list or self-review\. Claims-needed lens: `"review_role": "claims"`/u);
-    expect(review).toMatch(/Pass the claims as a `required_inputs` path \(`"lens": "claims"`\) when\s+the approved spec is committed under the knowledge root; otherwise quote them only in\s+a final brief section marked for its claims step/u);
-    expect(review).toMatch(/`medium` adds the verification and edge-case lenses,\s+`high` uses all four, and an unrecorded risk counts as `high`/u);
+    // Risk sizes small-change review, is re-scored against the diff and raised lenses run on the same head.
+    expect(review).toMatch(/`medium` adds the verification and\s+edge-case lenses, `high` uses all four, and an unrecorded risk counts as `high`/u);
+    expect(review).toMatch(/A risk raised during review commissions the lenses it now requires on the same\s+head before review concludes/u);
     const small = textAt(invocation.snapshotDir, 'small-change.md');
     expect(small).toMatch(/the change's risk \(`low`, `medium`\s+or `high`: the business impact if it is wrong/u);
-    expect(small).toMatch(/scored before review and never lowered once a\s+reviewer has run/u);
+    expect(small).toMatch(/never lowered once a reviewer has run/u);
+    expect(small).toMatch(/re-score the risk against that diff, raising it when the change reaches more\s+than step 1 expected/u);
     expect(small).toMatch(/`medium` adds the verification and edge-case\s+lenses, `high` uses all four/u);
-    // Triage: wait for (or record the failure of) every lens, then exactly one defined verdict per finding.
+    // Triage waits for every lens or records its failure; a failed blind report is never coverage.
     expect(review).toMatch(/Triage only after every launched reviewer has reported or ended without a report\./u);
     expect(review).toMatch(/is a failed lens: record it,\s+re-commission it or report the infrastructure failure as above, and treat that\s+lens's coverage as missing until a replacement reports/u);
+    expect(review).toMatch(/A failed blind report never counts as coverage,\s+whatever `blind-coverage` says; if its replacement is refused\s+`409 blind_coverage_owned`, do not retry in a loop/u);
+    // Exactly one defined verdict per finding.
     expect(review).toMatch(/Disregard any severity a reviewer assigned/u);
     expect(review).toMatch(/Render exactly one verdict:/u);
     expect(review).toMatch(/- `high` \(intolerable\), `medium` \(tolerable\) or `low` \(cosmetic or negligible\) —\s+the bad outcome is real/u);
     expect(review).toMatch(/- `false` — you checked and the outcome does not occur/u);
     expect(review).toMatch(/- `maybe-false` — the diff and surrounding code cannot decide it/u);
     expect(review).toMatch(/Code that fails loudly on a state you have not shown the program can reach is\s+correct behavior, not a defect/u);
-    // Carried rows: only rejected/pre-existing rows with unchanged code and evidence; fixed or owner-pending rows are re-verified.
-    expect(review).toMatch(/Carry a row forward only when its disposition was a rejection \(`false`, a\s+rejected `low`, out of scope\) or pre-existing/u);
-    expect(review).toMatch(/both the cited code and the code its evidence relied on are\s+unchanged since the row was logged: log it again as `carried`, keeping its original\s+verdict and disposition/u);
-    expect(review).toMatch(/A finding that matches a row marked fixed or\s+awaiting an owner decision is verified again/u);
+    // Carried rows: only rejected/owner-ruled/pre-existing rows whose code, evidence, intent and paths are unchanged.
+    expect(review).toMatch(/Carry a row forward only when all of these hold: its disposition is\s+rejected, owner ruling or pre-existing/u);
+    expect(review).toMatch(/the cited code, the code its\s+evidence relied on and the approved intent are unchanged and no change adds a new\s+caller of or path into the cited code/u);
+    expect(review).toMatch(/keeping its\s+original verdict and disposition, without re-verifying it/u);
+    expect(review).toMatch(/A finding that matches\s+a row that is fixed, awaiting an owner decision or unsettled is verified again/u);
     // Owner ruling 2026-10-17: unlikely low findings whose fix adds complexity are rejected.
     expect(review).toMatch(/Reject a `low` finding when users or\s+developers are unlikely to meet the defect in everyday use/u);
     expect(review).toMatch(/new\s+guards, branches, parameters or other complexity/u);
     expect(review).toMatch(/only when the approved intent itself\s+excludes it/u);
-    // Routing replaces BMAD's defer list: nothing becomes new backlog.
+    // Routing replaces BMAD's defer list; only owner-approved acceptance needs the owner.
     expect(review).toMatch(/Group the survivors by shared root cause — the same defect produced both, not\s+merely the same location or the same fix — and give each group its highest\s+verdict/u);
-    expect(review).toMatch(/One that cannot be settled is named in the handoff with what would\s+settle it/u);
+    expect(review).toMatch(/One that cannot be settled is logged as unsettled and named in the\s+handoff with what would settle it/u);
     expect(review).toMatch(/log it as pre-existing with\s+its evidence and name it in the handoff; do not open new backlog for it/u);
+    expect(review).toMatch(/Findings that expose wrong owner-approved acceptance need an explicit owner\s+decision/u);
+    expect(review).toMatch(/A wrong\s+planning detail that is not owner-approved acceptance \(an I\/O matrix row, a task\)\s+is corrected in the spec with the approved-intent text it contradicts quoted,\s+and the correction is named in the handoff/u);
+    expect(review).toContain('Do not offload known required work into new backlog.');
     expect(review).not.toMatch(/deferred-work|defer list/iu);
+    expect(textAt(invocation.snapshotDir, 'present.md')).toMatch(/the recorded\s+risk and review outcome — naming every finding not fixed in this change/u);
   });
 
   it('lenses carry the verification-gap and path-tracing methods, and planning carries risk and the I/O matrix audit', () => {
@@ -208,48 +232,60 @@ describe('GC-owned workflow resources', () => {
     expect(verification).toMatch(/search the whole repository by the symbol under\s+test and by import references/u);
     expect(verification).toMatch(/source-text assertions that match a file's wording/u);
     expect(verification).toContain('`expect(x ?? DEFAULT).toBe(DEFAULT)` passes when `x` is missing');
+    expect(verification).toMatch(/## Claims\s+After tracing verification, take the working spec's intent, acceptance and tasks/u);
+    expect(verification).toMatch(/testimony, not evidence/u);
+    expect(verification).toMatch(/If the diff, approved\s+intent or claims your brief names are missing, empty or unreadable, say exactly\s+that and stop/u);
     const edges = textAt(invocation.snapshotDir, 'review-prompts/edge-cases.md');
+    expect(edges).toMatch(/report only what the change leaves\s+unhandled: reachable paths and boundaries, and removed contracts/u);
+    expect(edges).toMatch(/Your brief\s+carries no claims about the change; do not seek the author's spec, intent or task\s+list, so nothing steers the trace/u);
     expect(edges).toMatch(/Implicit branches:/u);
     expect(edges).toMatch(/Handle lifetime:/u);
     expect(edges).toMatch(/read the callee's declaration/u);
-    expect(edges).toMatch(/Leave the claims input \(a file path, or the brief's final\s+claims section\) unread until step 5/u);
     expect(edges).toMatch(/where\s+removed code was referenced, and where other writers or readers share the state/u);
-    expect(edges).not.toMatch(/with a high\/medium\/low confidence/u);
-    expect(edges).toMatch(/Claims, read only now so they cannot steer the trace/u);
+    expect(edges).toMatch(/assign severity or confidence/u);
+    expect(edges).not.toMatch(/high\/medium\/low\s+confidence|claims input/u);
     for (const lens of [verification, edges, textAt(invocation.snapshotDir, 'review-prompts/intent-alignment.md')]) {
       expect(lens).toContain('No actionable findings.');
       expect(lens).toMatch(/Do not rank or\s+assign severity|no severity, confidence or\s+ranking/u);
       expect(lens).not.toMatch(/find at least|finding floor|do not stop with an empty/iu);
     }
     const spec = textAt(invocation.snapshotDir, 'spec-template.md');
-    expect(spec).toContain('## Risk');
+    expect(spec).toMatch(/## Risk\s+`low`, `medium` or `high` — the business impact if this change is wrong/u);
+    expect(spec).toMatch(/This route always reviews with all four lenses; the\s+small-change route records the same field in its note, where it sizes review\s+breadth/u);
     expect(spec).toContain('| Scenario | Input / state | Expected output / behavior | Error handling |');
     expect(spec).toMatch(/outermost surface the intent names/u);
-    expect(spec).toContain('## Review triage log');
+    expect(spec).toMatch(/## Review triage log\s+Append one row per reviewer finding on every review pass, carried rows included:\s+reviewed head/u);
+    expect(spec).toMatch(/owner ruling with the ruling, owner decision pending,\s+pre-existing, or unsettled with what would settle it/u);
+    expect(spec).toMatch(/A carried row is marked\s+`carried` and keeps its original verdict and disposition/u);
     expect(textAt(invocation.snapshotDir, 'plan.md')).toMatch(/Score its risk from the investigation/u);
     const implement = textAt(invocation.snapshotDir, 'implement.md');
     expect(implement).toMatch(/\(unregistered, filtered out,\s+skipped or disabled\) counts as missing/u);
     expect(implement).toMatch(/never\s+edit the expectation to match the code/u);
-    expect(implement).toMatch(/A row that is itself wrong\s+against the approved intent is corrected in the spec with the evidence recorded;\s+a row that encodes owner-approved acceptance changes only on an owner decision/u);
-    expect(spec).toMatch(/A carried row is marked `carried`\s+and keeps its original verdict and disposition/u);
+    expect(implement).toMatch(/A row that is itself wrong\s+against the approved intent is corrected in the spec with the approved-intent text\s+it contradicts quoted, and the correction is named in the handoff; a row that\s+encodes owner-approved acceptance changes only on an owner decision/u);
   });
 
-  it('a lane bound to the shipped @1 package keeps it after @2 ships, while a new lane binds @2', () => {
+  it('a lane bound to the shipped @1 package keeps its retained copy after @2 replaces the package in place, while a new lane binds @2', () => {
     // Exact bytes of gru-command-workflows@1 as shipped at 408250ac; live lanes are bound to these.
-    const v1 = join(repoRoot, 'test/fixtures/gc-workflows-v1');
-    const shipped = loadBundledWorkflowRuntime(v1);
+    const shippedRoot = join(repoRoot, 'test/fixtures/gc-workflows-v1');
+    const shipped = loadBundledWorkflowRuntime(shippedRoot);
     expect(shipped.id).toBe('gru-command-workflows@1');
     expect(shipped.contentSha256).toBe('d0bd8c82f608ab1d70fbc468509a6c6f8d1c731fad4964aec6d431b4e6700bc5');
+    // The installed package root is upgraded in place, as an install update does.
+    const installed = temp();
+    cpSync(join(shippedRoot, WORKFLOW_RESOURCE_DIR), join(installed, WORKFLOW_RESOURCE_DIR), { recursive: true });
     const context = fixture();
     const old = join(dirname(context.projectRoot), 'bound-v1');
     const fresh = join(dirname(context.projectRoot), 'fresh-v2');
     git(context.projectRoot, ['worktree', 'add', '-qb', 'bound-v1', old]);
     git(context.projectRoot, ['worktree', 'add', '-qb', 'fresh-v2', fresh]);
     const store = temp();
-    const a = createWorkflowRuntimeBinder(store, v1)(old);
-    const current = createWorkflowRuntimeBinder(store, repoRoot);
-    expect(current(old)).toEqual(a);
+    const a = createWorkflowRuntimeBinder(store, installed)(old);
     expect(a.runtimeId).toBe('gru-command-workflows@1');
+    expect(a.root.startsWith(`${store}/`)).toBe(true);
+    rmSync(join(installed, WORKFLOW_RESOURCE_DIR), { recursive: true });
+    cpSync(join(repoRoot, WORKFLOW_RESOURCE_DIR), join(installed, WORKFLOW_RESOURCE_DIR), { recursive: true });
+    const current = createWorkflowRuntimeBinder(store, installed);
+    expect(current(old)).toEqual(a);
     expect(current(fresh).runtimeId).toBe('gru-command-workflows@2');
     const rendered = renderWorkflow({ id: a.runtimeId, dir: a.root, contentSha256: a.contentSha256, skillsDir: a.skillsDir, skills: a.skills },
       { ...context, worktreeRoot: old, knowledgeRoot: join(old, 'gru-output') }, 'review');

@@ -45,23 +45,23 @@ parallel when the runtime supports it:
   blind reviewer an unfiltered historical diff, and never count a blind report as
   independent coverage unless `GET /api/dispatch/jobs/<review job>/blind-coverage` says
   `qualifying`; settling a report is not validity.
-- [[gc-resource:skills/gc-build/review-prompts/edge-cases.md]] — diff and relevant code,
-  with the working spec's intent and acceptance as the claims input it reads only after
-  tracing paths. Pass the claims as a `required_inputs` path (`"lens": "claims"`) when
-  the approved spec is committed under the knowledge root; otherwise quote them only in
-  a final brief section marked for its claims step. Claims-needed lens:
-  `"review_role": "claims"`.
+- [[gc-resource:skills/gc-build/review-prompts/edge-cases.md]] — diff and relevant code
+  only: never the spec, intent, task list or author's explanation, so nothing steers
+  its path tracing. Commission it with `"review_role": "claims"` and no
+  `required_inputs`.
 - [[gc-resource:skills/gc-build/review-prompts/verification.md]] — diff, approved intent,
-  tests and exact executed verification evidence. Claims-needed lens: `"review_role": "claims"`.
+  the working spec's acceptance and tasks as the claims it falsifies, tests and exact
+  executed verification evidence. Claims-needed lens: `"review_role": "claims"`.
 - [[gc-resource:skills/gc-build/review-prompts/intent-alignment.md]] — diff and its tests
   plus the verbatim owner-approved intent quoted into the brief; never the author's
   explanation, task list or self-review. Claims-needed lens: `"review_role": "claims"`.
 
 The small-change route requires the fresh adversarial reviewer and widens with the
-risk recorded before review: `medium` adds the verification and edge-case lenses,
-`high` uses all four, and an unrecorded risk counts as `high`. Never substitute
-author self-review for a reviewer. If
-independent execution is unavailable or fails, report the infrastructure failure;
+risk re-scored against the candidate diff: `medium` adds the verification and
+edge-case lenses, `high` uses all four, and an unrecorded risk counts as `high`.
+A risk raised during review commissions the lenses it now requires on the same
+head before review concludes. Never substitute author self-review for a reviewer.
+If independent execution is unavailable or fails, report the infrastructure failure;
 review remains incomplete, not a fabricated pass. Do not silently change the
 owner-selected review model or launch protocol.
 
@@ -82,19 +82,24 @@ A reviewer job that ended without a report (crashed, cancelled, refused or stopp
 or that reported its content missing or unreadable is a failed lens: record it,
 re-commission it or report the infrastructure failure as above, and treat that
 lens's coverage as missing until a replacement reports; triage the replacement's
-findings when they arrive. Disregard any severity a reviewer assigned. Record one row per finding in the review triage log of the
-working spec (or small-change note) under the private artifact root — verdict,
+findings when they arrive. A failed blind report never counts as coverage,
+whatever `blind-coverage` says; if its replacement is refused
+`409 blind_coverage_owned`, do not retry in a loop: report the blind lens as missing
+coverage, and review stays incomplete. Disregard any severity a reviewer assigned.
+Record one row per finding in the review triage log of the working spec (or
+small-change note) under the private artifact root — reviewed head, verdict,
 evidence and a reasoned disposition for every finding; never drop, merge or
 silently skip one.
 
 On a re-review of a changed head, match each finding against the logged rows
-first. Carry a row forward only when its disposition was a rejection (`false`, a
-rejected `low`, out of scope) or pre-existing, the finding has the same location
-and claim, and both the cited code and the code its evidence relied on are
-unchanged since the row was logged: log it again as `carried`, keeping its original
-verdict and disposition, without re-verifying it. A finding that matches a row marked fixed or
-awaiting an owner decision is verified again; a fix that missed or a decision not
-yet made is never carried. Verify everything else.
+first. Carry a row forward only when all of these hold: its disposition is
+rejected, owner ruling or pre-existing; the finding has the same location and
+claim; and since the head the row was logged at, the cited code, the code its
+evidence relied on and the approved intent are unchanged and no change adds a new
+caller of or path into the cited code. Log it again as `carried`, keeping its
+original verdict and disposition, without re-verifying it. A finding that matches
+a row that is fixed, awaiting an owner decision or unsettled is verified again; a
+fix that missed or a decision not yet made is never carried. Verify everything else.
 
 Verify each remaining claim: at the cited file and line, does the bad outcome
 actually occur? Read past the changed lines — callers, upstream guards — until you
@@ -126,12 +131,16 @@ verdict. Then:
 
 - A group of only `maybe-false` members that would be `medium` or `high` if true:
   run the check that decides it (read the deciding code, run the test) and grade
-  it again. One that cannot be settled is named in the handoff with what would
-  settle it; one that would only be `low` is rejected with that note.
+  it again. One that cannot be settled is logged as unsettled and named in the
+  handoff with what would settle it; one that would only be `low` is rejected
+  with that note.
 - A defect this change neither caused nor exposed: log it as pre-existing with
   its evidence and name it in the handoff; do not open new backlog for it.
-- Findings that expose wrong acceptance need an explicit owner decision; do not
-  silently rewrite intent or create a completion claim.
+- Findings that expose wrong owner-approved acceptance need an explicit owner
+  decision; do not silently rewrite intent or create a completion claim. A wrong
+  planning detail that is not owner-approved acceptance (an I/O matrix row, a task)
+  is corrected in the spec with the approved-intent text it contradicts quoted,
+  and the correction is named in the handoff.
 - Fix all actionable in-scope defects — every other surviving group — and
   add/run regressions.
 

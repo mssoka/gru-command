@@ -79,9 +79,12 @@ Triage verifies every finding at its cited location and gives exactly one verdic
 ignored. `false` findings are rejected on their refutation. A `low` finding is
 rejected when users or developers are unlikely to meet it in everyday use and its
 fix adds complexity beyond a direct correction or deletion (owner ruling
-2026-10-17). On a re-review, a rejected or pre-existing row whose cited code and
-evidence are unchanged is carried forward without re-verification; a finding that
-matches a fixed or owner-pending row is verified again. Every finding keeps a
+2026-10-17). On a re-review, a rejected, owner-ruled or pre-existing row is carried
+forward without re-verification only while its cited code, evidence, the approved
+intent and the paths into the cited code are unchanged since its logged head;
+fixed, owner-pending and unsettled rows are verified again. The edge-case lens
+receives no claims, so nothing steers its path tracing; the verification lens
+falsifies the spec's claims. Every finding keeps a
 row and reason in the private triage log; pre-existing defects and unsettled
 `maybe-false` findings are named in the handoff, not opened as new backlog.
 Development/fallback PASS is never native exact-final-head Perkins READY.
@@ -142,7 +145,7 @@ same package-relative helper launcher using a supplied absolute context file;
 
 ## Identity, integrity and lane continuity
 
-`runtime.json` uses schema 2, a GC name/version (currently `gru-command-workflows@2`),
+`runtime.json` uses schema 2, a GC name/version (`gru-command-workflows@<version>`),
 supported entrypoints/skill names and per-resource sha256. There are no upstream
 archive/identity sections. Missing/corrupt/undeclared/symlinked files fail with
 `WorkflowResourceError`; no ambient workflow fallback is permitted. Required
@@ -176,14 +179,16 @@ Edit GC templates/helpers directly, then refresh **local GC integrity**:
 
 ```sh
 npx tsc
-node dist/cli/workflow-runtime.js manifest . --version <next>   # one above the version in runtime.json
+node dist/cli/workflow-runtime.js manifest .              # keeps the version in runtime.json
+node dist/cli/workflow-runtime.js manifest . --version N  # N: the next unused version
 npm test
 npm pack
 ```
 
-Use a positive integer GC resource version for intentional instruction releases;
-content hashes independently distinguish every set of bytes. There is no BMAD
-fetch/re-vendoring step or byte-for-byte upstream comparison on GC resources.
+Bump the version once per instruction release: while the current version is still
+unreleased (not yet merged), refresh without `--version`; after it ships, pass the
+next unused integer. Content hashes independently distinguish every set of
+bytes. There is no BMAD fetch/re-vendoring step or byte-for-byte upstream comparison on GC resources.
 `npm run build` verifies the owned manifest; `npm pack` rebuilds backend/web and
 ships the complete resource directory plus this document. The old bundle is
 still separately verified for retained historical lanes and transitional setup.

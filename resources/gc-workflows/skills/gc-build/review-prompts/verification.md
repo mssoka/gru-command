@@ -59,6 +59,18 @@ Gap shapes:
 5. Re-open the tests or search results each finding relies on before writing it,
    and explain from what the test sets up and checks why it misses the regression.
 
+## Claims
+
+After tracing verification, take the working spec's intent, acceptance and tasks
+from your brief: the change's own account of itself — testimony, not evidence; a
+claim repeated in a code comment is still the same claim. Extract each checkable
+claim — what the change does, what it preserves, ordering, arithmetic, parity with
+existing code ("exactly as X does") — and try to falsify it against the code,
+reading the code that decides it: the compared-to function, the actual callee, the
+state the claim assumes. Verified claims produce nothing.
+
+## What counts as a test
+
 A test counts only if it runs in the normal verification path and an assertion
 observes the changed output, branch or contract. These do not count: no execution;
 source-text assertions that match a file's wording instead of running it;
@@ -88,10 +100,13 @@ ranking — the commissioner's triage grades findings:
   undetected, and why the tests you checked would not fail.
 - Fix: the test to add, fitted to the repository's own way of verifying.
 
-Append genuine non-gap defects you reached while tracing under `Other findings`,
-description only; this permits reporting what you met, not extra hunting.
+For each falsified claim give the claim (quoted), where the code contradicts it
+(`file:line`), what the code actually does and the consequence for someone who
+believed it. Append genuine non-gap defects you reached while tracing under
+`Other findings`, description only; this permits reporting what you met, not extra
+hunting.
 
-There is no minimum finding quota and no tool-call ceiling. If the content your
-brief names is missing, empty or unreadable, say exactly that and stop; never
-report a clean review of content you could not read. A clean review returns
-`No actionable findings.` with reviewed base/head and inspected scope.
+There is no minimum finding quota and no tool-call ceiling. If the diff, approved
+intent or claims your brief names are missing, empty or unreadable, say exactly
+that and stop; never report a clean review of content you could not read. A clean
+review returns `No actionable findings.` with reviewed base/head and inspected scope.
