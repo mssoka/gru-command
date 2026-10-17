@@ -692,6 +692,8 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
     const lines = [...document.querySelectorAll<HTMLElement>('.board-owner__gru')];
     expect(lines).toHaveLength(1);
     expect(lines[0]?.textContent).toBe('Gru is handling 2 live alerts');
+    // Gru's queue is Gru's work: a muted sub-line, never the owner's alert ink.
+    expect(lines[0]?.className).toBe('lbl board-band__clear-hint board-owner__gru');
     // The count is the LIVE machine queue: the line's title says so (A4).
     expect(lines[0]?.title).toContain('2 live machine-attention notifications awaiting a Gru disposition');
     expect(lines[0]?.title).toContain('closed receipts stay in the record');
@@ -700,6 +702,33 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
     // A last-known board says so rather than claiming calm.
     view.markUnavailable('board socket lost');
     expect(document.querySelector('.board-owner__gru')?.textContent).toBe('last-known · nothing needs Gru either · the crew is on it');
+  });
+
+  it('a lost board socket stays last-known through an HTTP catch-up, until the socket reopens', () => {
+    const view = new BoardView(() => {});
+    const verify = { lockInUse: false, activeRuns: 0, queuedRuns: 0, workerBudget: 8, workersPerRun: 4 };
+    const calm = { ...snapshot({ verify }), mailbox: { items: [], counts: { threads: 0, incidents: 0, notifications: 0, needsGru: 0 } } };
+    view.setSocketState('open');
+    view.render(calm);
+    const summary = () => document.getElementById('command-health-summary')?.textContent;
+    const forGru = () => document.querySelector('#board-section-for-gru .board-folded__reason')?.textContent;
+    expect(summary()).toBe('All healthy');
+    view.setSocketState('reconnecting');
+    view.markSnapshotStale();
+    expect(summary()).toBe('last-known · All healthy');
+    // The reconnect timer fetches over HTTP before the socket reopens: the
+    // fresh snapshot is still not a live board.
+    view.render(calm, 'http');
+    expect(summary()).toBe('last-known · All healthy');
+    expect(document.querySelector('.board-owner__gru')?.textContent).toBe('last-known · nothing needs Gru either · the crew is on it');
+    // FOR GRU's folded pill says the same about Gru's queue.
+    expect(forGru()).toBe('last-known · nothing needs Gru · the crew is on it');
+    // Connecting and authenticating do not end the outage; open does.
+    view.setSocketState('authenticating');
+    expect(summary()).toBe('last-known · All healthy');
+    view.setSocketState('open');
+    expect(summary()).toBe('All healthy');
+    expect(forGru()).toBe('nothing needs Gru · the crew is on it');
   });
 
   it('a stale or down board socket marks the health pill and the Gru line last-known until a fresh snapshot', () => {
@@ -737,6 +766,7 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
     expect(summary.previousElementSibling).toBe(head);
     expect(summary.querySelector('.board-owner__headline')?.textContent).toBe('2 things need you');
     expect(summary.querySelector('.board-owner__gru')?.textContent).toBe('nothing needs Gru either · the crew is on it');
+    expect(summary.querySelector('.board-owner__gru')?.className).toBe('lbl board-owner__gru');
     expect(band.dataset.empty).toBe('false');
     view.render(snapshot({ ownerPrs: [pr('a')] }));
     expect(band.querySelector('.board-owner__headline')?.textContent).toBe('1 thing needs you');
@@ -880,11 +910,11 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
     );
     const crew = document.querySelector<HTMLElement>('.cockpit-card--crew')!;
     expect(crew.querySelector('[data-kpi="children.active"]')?.textContent).toBe('2');
-    expect(crew.querySelector('[data-kpi="children.active"]')?.nextElementSibling?.textContent).toBe('sub-minions');
+    expect(crew.querySelector('[data-kpi="children.active"]')?.nextElementSibling?.textContent).toBe('sub-minions active');
     expect(crew.querySelector('[data-kpi="children.active"]')?.getAttribute('title')).toContain('6 created');
     // Queued sub-minions are a count with its own identity, not loose text.
     expect(crew.querySelector('[data-kpi="children.queued"]')?.textContent).toBe('1');
-    expect(crew.querySelector('[data-kpi="children.queued"]')?.nextElementSibling?.textContent).toBe('sub-minion queued');
+    expect(crew.querySelector('[data-kpi="children.queued"]')?.nextElementSibling?.textContent).toBe('queued');
     expect(crew.querySelector('.cockpit-fact--note')).toBeNull();
   });
 
@@ -2025,6 +2055,11 @@ describe('board agent rail — dense rows, tabs count, disposed collapse', () =>
       }),
     );
     const rows = [...document.querySelectorAll<HTMLElement>('#board-agents .board-agent')];
+    // The sub-minion sits indented right under the minion that created it
+    // (owner pick); a top-level or legacy row is never indented.
+    expect(rows.map((row) => row.dataset.agentId)).toEqual(['parent-minion', 'child-agent', 'legacy-minion']);
+    expect(rows.map((row) => row.classList.contains('board-agent--sub'))).toEqual([false, true, false]);
+    expect(rows[1]?.style.getPropertyValue('--sub-depth')).toBe('1');
     // Crew-heist-labels: a minion's primary name is its heist, not its
     // label — locate rows by the #171-stable dataset.agentId identity.
     const byAgentId = new Map(rows.map((row) => [row.dataset.agentId, row]));
@@ -2037,10 +2072,11 @@ describe('board agent rail — dense rows, tabs count, disposed collapse', () =>
     const child = byAgentId.get('child-agent')!;
     expect(child.dataset.parentage).toBe('child');
     // The marker says sub-minion — the word CREW counts — once; the role
-    // line keeps the worker's role, and the accessible name says both.
+    // line keeps the worker's role, and the accessible name says both, in
+    // the row's order.
     expect(child.querySelector('.board-agent__role')?.textContent).toMatch(/^minion · /u);
     expect(child.querySelector('.board-agent__parentage')?.textContent).toBe('🧬 sub-minion');
-    expect(child.getAttribute('aria-label')).toContain('— sub-minion ·');
+    expect(child.getAttribute('aria-label')).toMatch(/ — minion · \S+ · sub-minion$/u);
     expect(child.querySelector('.board-agent__parent-link')?.textContent).toContain('Payment lane');
     // A legacy row (no parentage field) is never claimed either way.
     const legacy = byAgentId.get('legacy-minion')!;

@@ -902,8 +902,8 @@ export class BoardEngine {
     }
   }
 
-  /** The raids card (#351); a failing read is logged and shows no card,
-   * never a broken snapshot. */
+  /** The raids card (#351); a failing read is logged and sent as `null`
+   * (the board shows the card as unavailable), never a broken snapshot. */
   private vectorView(): VectorBoardView | null {
     try {
       return this.vector();

@@ -15,7 +15,7 @@
  *     attention and running work outrank nesting.
  */
 
-import type { JobView } from './board-protocol.js';
+import type { AgentView, JobView } from './board-protocol.js';
 
 export interface JobFamilies {
   /** Every top-level row — heists plus surfaced megaminions — in
@@ -71,6 +71,41 @@ export function jobFamilies(
  * binned) folds into the heist's expanded body. */
 export function isLiveMegaminion(job: JobView): boolean {
   return !(job.status === 'delivered' || job.status === 'done' || job.status === 'merged' || job.status === 'binned');
+}
+
+/**
+ * Sub-minions under their creator (cockpit rework, owner pick: "indented
+ * rows in the rail"): each #161 child worker moves to just after the
+ * minion that created it — and its own children after it — when that
+ * creator is in the same list; everything else keeps the server's order.
+ * A child whose creator is elsewhere (another band, or gone) stays where
+ * it was, flat, with its parent link. `depth` is the indent: 0 for a row
+ * in its own place, 1 under its creator, 2 under a sub-minion. A parent
+ * cycle still renders every row once (never vanishing).
+ */
+export function subMinionTree(agents: readonly AgentView[]): readonly { readonly agent: AgentView; readonly depth: number }[] {
+  const ids = new Set(agents.map((agent) => agent.id));
+  const parentOf = (agent: AgentView): string | null =>
+    agent.parentage === 'child' && agent.parentAgentId !== undefined && agent.parentAgentId !== null && agent.parentAgentId !== agent.id && ids.has(agent.parentAgentId)
+      ? agent.parentAgentId
+      : null;
+  const children = new Map<string, AgentView[]>();
+  for (const agent of agents) {
+    const parent = parentOf(agent);
+    if (parent !== null) children.set(parent, [...(children.get(parent) ?? []), agent]);
+  }
+  const out: { agent: AgentView; depth: number }[] = [];
+  const placed = new Set<string>();
+  const place = (agent: AgentView, depth: number): void => {
+    if (placed.has(agent.id)) return;
+    placed.add(agent.id);
+    out.push({ agent, depth });
+    for (const child of children.get(agent.id) ?? []) place(child, depth + 1);
+  };
+  for (const agent of agents) if (parentOf(agent) === null) place(agent, 0);
+  // Rows only reachable through a cycle: flat, in their own order.
+  for (const agent of agents) place(agent, 0);
+  return out;
 }
 
 /** `↳ 3 megaminions · 2 working · 1 delivered` — the family chip's status

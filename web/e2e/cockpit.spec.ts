@@ -350,12 +350,16 @@ async function harness(page: Page, initial: BoardSnapshot): Promise<Send> {
   assertValid(initial, 'initial HTTP state');
   sockets.length = 0;
   let current: BoardSnapshot = initial;
+  let authed = false;
   await page.context().routeWebSocket(/\/board\/ws/, (ws) => {
     sockets.push(ws);
     // The client sends {type:'auth',token} on open and proceeds only after
     // the real {type:'auth_ok'} — script that actual contract.
     ws.onMessage((data) => {
-      if (String(data).includes('"type":"auth"')) ws.send(JSON.stringify({ type: 'auth_ok' }));
+      if (String(data).includes('"type":"auth"')) {
+        ws.send(JSON.stringify({ type: 'auth_ok' }));
+        authed = true;
+      }
     });
   });
   await page.route(/\/api\/board/, (route) =>
@@ -395,6 +399,11 @@ async function harness(page: Page, initial: BoardSnapshot): Promise<Send> {
     expect(socket, 'a scripted ws socket exists').toBeTruthy();
     await socket!.send(JSON.stringify({ type: 'board', snapshot }));
   };
+  // The board socket goes live with the initial state, so RADAR reads LIVE
+  // before any test measures (on a phone RADAR steps aside only then).
+  await expect.poll(() => authed, { message: 'the board socket authenticated' }).toBe(true);
+  await sendFn(initial);
+  await expect(page.locator('#command-radar-label')).toHaveText('RADAR LIVE');
   return Object.assign(sendFn, {
     stage: (s: BoardSnapshot): void => {
       assertValid(s, 'staged HTTP state');
@@ -402,6 +411,14 @@ async function harness(page: Page, initial: BoardSnapshot): Promise<Send> {
     },
     socketCount: (): number => sockets.length,
   });
+}
+
+/** Drop the board socket for good: reconnects are refused and the HTTP
+ * catch-up never answers, so nothing can make the board current again. */
+async function dropBoardSocket(page: Page): Promise<void> {
+  await page.route(/\/api\/board/, () => { /* never answers */ });
+  await page.context().routeWebSocket(/\/board\/ws/, (ws) => { void ws.close(); });
+  for (const socket of sockets) await socket.close();
 }
 
 interface Geometry {
@@ -779,7 +796,8 @@ test('CREW folds in sub-minions only when the server reported counters (absent i
   await send(makeSnapshot(slotSpec({ gruWakeAgeMs: 300_000, children: { active: 2, queued: 3, finished: 5, lifetimeCreations: 10 } })));
   await expect(crew.locator('[data-kpi="children.active"]')).toHaveText('2');
   await expect(crew.locator('[data-kpi="children.queued"]')).toHaveText('3');
-  await expect(crew.locator('[data-kpi="children.queued"] + .cockpit-fact__label')).toHaveText('sub-minions queued');
+  await expect(crew.locator('[data-kpi="children.active"] + .cockpit-fact__label')).toHaveText('sub-minions active');
+  await expect(crew.locator('[data-kpi="children.queued"] + .cockpit-fact__label')).toHaveText('queued');
   await expect(crew.locator('[data-kpi="children.active"]')).toHaveAttribute('title', /10 created/u);
   // The extra facts wrap honestly: no body overflow and nothing clipped at
   // phone width, measured after the resize settles.
@@ -861,9 +879,11 @@ test('the health pill is a named group; on a phone it keeps the checks that need
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
 
-test('on a phone the bar stays one sticky row of brand and buttons above the health pill; the pills step aside', async ({ page }) => {
+test('on a phone the bar stays one sticky row of brand and buttons above the health pill; the pills step aside while the board is live', async ({ page }) => {
   await page.setViewportSize({ width: 360, height: 740 });
-  await harness(page, makeSnapshot({ ...familyA(4), pending: 30, vector: RAIDS_ON }));
+  const send = await harness(page, makeSnapshot({ ...familyA(4), pending: 30, vector: RAIDS_ON }));
+  await send(makeSnapshot({ ...familyA(4), pending: 30, vector: RAIDS_ON }));
+  await expect(page.locator('#command-radar-label')).toHaveText('RADAR LIVE');
   const read = () => page.evaluate(() => {
     const box = (id: string) => document.getElementById(id)!.getBoundingClientRect();
     const brand = document.querySelector('.command-bar__brand')!.getBoundingClientRect();
@@ -881,13 +901,27 @@ test('on a phone the bar stays one sticky row of brand and buttons above the hea
   });
   const top = await read();
   expect(top).toMatchObject({ position: 'sticky', ticker: 0, buttonsOnRow1: true, kpis: 'static' });
-  expect(top.chromeH).toBe(`${top.barHeight}px`);
+  // The re-measure runs on the bar's resize frame, so poll for it.
+  await expect.poll(async () => { const now = await read(); return now.chromeH === `${now.barHeight}px`; }).toBe(true);
   // Three checks need a look, each with its flag, plus the Jev and wake
   // chips: the sticky bar still leaves most of the screen for the board.
   expect(top.barHeight).toBeLessThanOrEqual(740 * 0.25);
+  // The card asides wrap under their label rather than vanish into "1…".
+  const asides = await page.evaluate(() => [...document.querySelectorAll<HTMLElement>('#board-kpis .cockpit-card__aside')]
+    .map((aside) => ({ text: aside.textContent, whole: aside.scrollWidth <= aside.clientWidth + 1 })));
+  expect(asides).toEqual([{ text: 'round 4 live', whole: true }, { text: '1/2 in 24h', whole: true }]);
   await page.evaluate(() => window.scrollBy(0, 1400));
   const scrolled = await read();
   expect(scrolled.barTop, 'the bar stays at the top').toBeCloseTo(0, 0);
+  // The board socket drops (reconnects refused): RADAR returns on the phone
+  // in its warning colour — nothing else there would say so. ROUND stays
+  // aside.
+  await dropBoardSocket(page);
+  await expect(page.locator('#command-radar')).toBeVisible();
+  await expect(page.locator('#command-radar')).toHaveClass(/command-pill--(warn|alert)/u);
+  await expect(page.locator('#command-round')).toBeHidden();
+  await expect(page.locator('#command-health-summary')).toHaveText(/^last-known · /u);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
 
 test('the health pill dot and ink say the state: muted when nothing reads ok or the board is last-known, ▲ only when something needs a look', async ({ page }) => {
@@ -926,14 +960,38 @@ test('the health pill dot and ink say the state: muted when nothing reads ok or 
   await send({ ...quiet, silas: null } as BoardSnapshot);
   await expect(page.locator('#command-health-summary')).toHaveText('Checks not wired');
   expect(await read()).toEqual({ summary: 'Checks not wired', dot: 'muted', mark: 'none' });
-  // The socket dropped (and every reconnect is refused): the last frame on
-  // screen never reads as current calm.
+  // A problem on screen, then the socket drops (every reconnect refused):
+  // the alert dot and ▲ stay — last-known never hides what needs a look.
+  await send(makeSnapshot(familyA(2)));
+  await expect(page.locator('#command-health-summary')).toHaveText('3 need a look');
+  await dropBoardSocket(page);
+  await expect.poll(read).toEqual({ summary: 'last-known · 3 need a look', dot: 'alert', mark: '"▲ "' });
+});
+
+test('a dropped board socket on a calm board reads last-known with a muted dot, even after the HTTP catch-up', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const send = await harness(page, makeSnapshot(familyA(0)));
   await send(makeSnapshot(familyA(0)));
   await expect(page.locator('#command-health-summary')).toHaveText('All healthy');
+  // Reconnects are refused but the HTTP catch-up still answers: the board
+  // stays last-known until the socket itself reopens.
   await page.context().routeWebSocket(/\/board\/ws/, (ws) => { void ws.close(); });
   for (const socket of sockets) await socket.close();
-  await expect(page.locator('#command-health-summary')).toHaveText('last-known · All healthy');
-  expect((await read()).dot).toBe('muted');
+  await expect(page.locator('#command-health')).toHaveAttribute('data-last-known', 'true');
+  // Two reconnect cycles (each fetches the snapshot over HTTP first).
+  for (const ms of [1_000, 2_000]) {
+    await page.clock.runFor(ms);
+    await expect(page.locator('#command-health-summary')).toHaveText('last-known · All healthy');
+  }
+  const dot = await page.evaluate(() => {
+    const probe = document.createElement('div');
+    probe.style.background = 'var(--park)';
+    document.body.append(probe);
+    const muted = getComputedStyle(probe).backgroundColor;
+    probe.remove();
+    return getComputedStyle(document.querySelector('.command-health__dot')!).backgroundColor === muted;
+  });
+  expect(dot, 'the dot is muted while last-known').toBe(true);
 });
 
 test('RADAR follows the board socket only: the chat socket dropping leaves its dot and word alone', async ({ page }) => {
@@ -981,9 +1039,25 @@ test('the RADAR and ROUND pills keep one width through every word and round 9→
   });
   expect(new Set(widths.radarWidths).size, `RADAR widths ${widths.radarWidths.join(', ')}`).toBe(1);
   expect(new Set(widths.roundWidths).size, `ROUND widths ${widths.roundWidths.join(', ')}`).toBe(1);
+  // On any font the widest reading sits inside its slot with room to spare
+  // (the slot, not the text, sets the width).
+  const slack = await page.evaluate(() => {
+    const room = (box: HTMLElement): number => {
+      const range = document.createRange();
+      range.selectNodeContents(box);
+      return box.getBoundingClientRect().width - range.getBoundingClientRect().width;
+    };
+    const label = document.getElementById('command-radar-label')!;
+    label.textContent = 'RADAR SYNCING';
+    const roundLabel = document.getElementById('command-round-label')!;
+    roundLabel.innerHTML = 'ROUND <span class="command-pill__num">10</span> LIVE';
+    return { radar: room(label), num: room(roundLabel.querySelector<HTMLElement>('.command-pill__num')!) };
+  });
+  expect(slack.radar, 'RADAR SYNCING inside its slot').toBeGreaterThanOrEqual(0.5);
+  expect(slack.num, 'a two-digit round inside its slot').toBeGreaterThanOrEqual(0.5);
 });
 
-test('the command bar keeps the brand, the pills and the buttons on one row from tablet up, buttons at the edge before the first snapshot', async ({ page }) => {
+test('the command bar keeps the brand, the pills and the buttons on one row from tablet up, two rows on a small tablet, buttons at the edge before the first snapshot', async ({ page }) => {
   // Before pairing the health pill is hidden: the buttons still sit at the
   // bar's right edge.
   await page.setViewportSize({ width: 1440, height: 900 });
@@ -1007,6 +1081,21 @@ test('the command bar keeps the brand, the pills and the buttons on one row from
     });
     expect(rows, `${width}px`).toEqual([true, true, true]);
   }
+  // A small tablet: the buttons keep the brand's row and the pills join the
+  // health pill's — two rows, never a row of stray buttons.
+  await page.setViewportSize({ width: 700, height: 900 });
+  await settleTransitions(page);
+  const small = await page.evaluate(() => {
+    const mid = (el: Element): number => { const b = el.getBoundingClientRect(); return b.top + b.height / 2; };
+    const brand = mid(document.querySelector('.command-bar__brand')!);
+    const pill = document.getElementById('command-health')!.getBoundingClientRect();
+    const ticker = mid(document.getElementById('command-ticker')!);
+    return {
+      buttons: ['sound-toggle', 'notification-bell', 'theme-toggle', 'settings-toggle'].every((id) => Math.abs(mid(document.getElementById(id)!) - brand) <= 2),
+      tickerOnPillRow: ticker >= pill.top && ticker <= pill.bottom,
+    };
+  });
+  expect(small).toEqual({ buttons: true, tickerOnPillRow: true });
 });
 
 /** Visual evidence: real captures of the synthetic fixture at all four

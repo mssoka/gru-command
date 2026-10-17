@@ -402,13 +402,25 @@ body {
   .command-health { order: 2; margin-left: 0; flex: 1 1 100%; max-width: none; }
 }
 
+/* Small tablets (641–744px): brand, pills and buttons need 713px of row,
+   so the pills move after the buttons and wrap onto the health pill's row
+   — two rows, never the buttons on a row of their own. From 745px all
+   three share row 1 in their own order. */
+@media (min-width: 641px) and (max-width: 744px) {
+  .command-bar__ticker { order: 1; }
+  .command-health { flex: 1 1 260px; }
+}
+
 /* Phone (the approved mock's rule): the bar stays one sticky row of brand
-   and buttons above the health pill. The RADAR and ROUND pills step aside
-   (a lost connection still shows as the banner); the calm checks give way
-   to the summary, the checks that need a look keep a wrapping line of
-   their own, and the Jev and wake chips wrap inside the pill. */
+   and buttons above the health pill. ROUND steps aside, and RADAR too
+   while the board socket is live — it returns, in its warning colour,
+   whenever the board is syncing, stale or down (nothing else on a phone
+   says so). The calm checks give way to the summary, the checks that need
+   a look keep a wrapping line of their own, and the Jev and wake chips
+   wrap inside the pill. */
 @media (max-width: 640px) {
-  .command-bar__ticker { display: none; }
+  .command-bar__ticker #command-round { display: none; }
+  .command-bar__ticker:not(:has(.command-pill--warn, .command-pill--alert)) { display: none; }
   .command-health { flex: 1 1 auto; flex-wrap: wrap; row-gap: 4px; border-radius: var(--radius-md); }
   .command-health__parts { order: 1; flex: 1 1 100%; white-space: normal; }
   .command-health:not([data-state='attention']) .command-health__parts,
@@ -493,8 +505,9 @@ body {
 
 .cockpit-card__head {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 7px;
+  gap: 2px 7px;
   min-width: 0;
 }
 
@@ -523,9 +536,12 @@ body {
   white-space: nowrap;
 }
 
+/* The aside sits at the head's end, and wraps under the label on a card
+   too narrow for both (a phone's two columns) — never cut to "1…". */
 .cockpit-card__aside {
   margin-left: auto;
   min-width: 0;
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2907,6 +2923,13 @@ body {
   padding-right: 2px;
 }
 
+/* A sub-minion sits indented under the minion that created it (owner pick,
+   cockpit rework); its ↳ link still names the parent. */
+.board-agent.board-agent--sub {
+  margin-left: calc(var(--sub-depth, 1) * 16px);
+  width: calc(100% - var(--sub-depth, 1) * 16px);
+}
+
 .board-agent {
   display: flex;
   align-items: center;
@@ -4139,17 +4162,14 @@ a.repo-row__name:hover {
 /* ------------------------------------------------------------------ */
 /* Phone chrome (≤560px + ≤640px icon compaction)                     */
 /*                                                                     */
-/* The single-row header (logo + title + status + speaker/bell/        */
-/* theme/settings) tightens on a phone: the decorative tagline and     */
-/* drops, the title block shrinks, the pills and health pill wrap,    */
-/* narrows — the header fits a 390px viewport with zero horizontal     */
-/* overflow. Below 640px the command-bar icon controls compact         */
-/* further so the owner-chime speaker keeps row 1 inside the phone    */
-/* budget. flex-wrap is insurance: the header grows rows instead of    */
-/* pushing sideways. It is layout, not a CSS overflow guarantee —     */
-/* the e2e is the guarantee (scrollWidth <= clientWidth asserted on    */
-/* chat + board at 390px and 561px). Desktop (≥768px) is untouched;   */
-/* 561–768px keeps the full single row, e2e-pinned.                    */
+/* On a phone the sticky bar is the brand and the four buttons on row  */
+/* 1 with the health pill under it: the decorative tagline drops, the  */
+/* title shrinks and the icon controls compact (≤640px) so all four    */
+/* buttons share the brand's row down to 360px. flex-wrap is           */
+/* insurance: the bar grows rows instead of pushing sideways. It is    */
+/* layout, not a CSS overflow guarantee — the e2e is the guarantee     */
+/* (scrollWidth <= clientWidth on chat + board at 390px and 561px, and */
+/* the cockpit phone-row test at 360px).                               */
 /* ------------------------------------------------------------------ */
 @media (max-width: 560px) {
   .command-bar {
@@ -4172,8 +4192,6 @@ a.repo-row__name:hover {
     display: none;
   }
 
-  /* The RADAR/ROUND pills stay on a phone (no strip carries the radar
-     any more); they wrap to the second row with the health pill. */
 }
 
 /* ≤640px: command-bar icon controls compact so the brand and all four

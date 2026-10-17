@@ -352,6 +352,7 @@ function startBoard(token: string): void {
         // as "open" while the board was frozen. Last-known actions and
         // visibility receipts stay read-only until a fresh snapshot arrives.
         renderConnectionDot(state);
+        boardView?.setSocketState(state);
         if (state === 'stale' || state === 'reconnecting' || state === 'offline') {
           boardView?.markSnapshotStale();
         }

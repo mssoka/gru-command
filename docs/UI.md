@@ -250,10 +250,12 @@ owns the numbers; CSS mirrors them):
   a dimmed board (scrim).
 - **< 900px — single column:** board-first (SPEC ruling 11) with the
   rail stacked below; the FAB opens the bottom-sheet chat. The command bar
-  wraps: the health pill sits on its own row. On a phone (≤ 640px) the
-  RADAR and ROUND pills step aside (a lost connection still shows as the
-  banner) and the compact buttons share the brand's row, so the bar stays
-  sticky at two rows plus any checks that need a look.
+  wraps: the health pill sits on its own row. On a phone (≤ 640px) ROUND
+  steps aside, and RADAR too while the board socket is live (it returns in
+  its warning colour while the board syncs, goes stale or drops); the
+  compact buttons share the brand's row, so the bar stays sticky: the
+  brand row, then the health pill with its chips and any checks that need
+  a look.
 
 The **global command bar** (cockpit rework, owner-approved 2026-10-17) is
 the only sticky chrome above the board column, at every width (inside the
@@ -268,7 +270,9 @@ badge. No Chat/Board lens toggle (v6.1): chat is always docked on desktop
 and the FAB owns mobile chat. The bar wraps by fit rather than at a fixed
 width (so page zoom and a narrow pane wrap it too, never overflow it), and
 its measured height feeds the sticky offsets whenever it changes. Below
-1100px the health pill takes its own row.
+1100px the health pill takes its own row; from 641 to 744px, where the
+brand, the pills and the buttons cannot share a row, the pills join the
+health pill's row instead (two rows, never the buttons alone).
 
 The **health pill** (a group named “System health”) carries the system
 checks (deploy, Silas, verify, disk, cure) in one line, the ones that need
@@ -278,9 +282,11 @@ a look first — a warning, an alert, or any check carrying a flag such as
 chip. Its summary reads `2 need a look` (pink, ▲), `All healthy` (some
 check reads ok and none needs a look), `No problems reported` (wired checks
 report only neutral facts such as no wakes yet; muted dot), or `Checks not
-wired` (muted dot) — unknown never reads healthy; while the board socket
-is stale or down, or the board is unavailable, the summary is prefixed
-`last-known ·` and the dot is muted unless something needs a look. A check whose source is
+wired` (muted dot) — unknown never reads healthy. From the moment the
+board socket is lost (stale, reconnecting, offline) until it reopens — an
+HTTP catch-up meanwhile is still last-known — or while the board is
+unavailable, the summary is prefixed `last-known ·` and the dot is muted
+unless something needs a look. A check whose source is
 not wired (`n/a`) stays out of the text and in the tooltip. On a phone the
 calm checks fold away and the ones that need a look keep a line of their
 own inside the pill.
@@ -291,7 +297,8 @@ status count), **MEGAMINIONS** (every job a minion commissioned — nested,
 surfaced, or top-level because its parent left the board — live,
 finished, across how many heists on the board, and how many whose heist
 left it), **CREW** (minions, mid-turn, disposed,
-and sub-minions — #161 child workers, active and `sub-minions queued` —
+and sub-minions — #161 child workers, `2 sub-minions`, or `2 sub-minions
+active · 1 queued` once some wait —
 only when the server reported counters), **PRS**, **REVIEWS** (rounds active, the top
 round, verdicts and failures today) and **VECTOR RAIDS** (dashed `off`
 until `[vector] enabled = true`; when on, the running raid and its attack,
@@ -335,7 +342,8 @@ readiness rule. It reads as the attention card (cockpit rework): under
 its `FOR YOU · N pending` heading, `2 things need you`, then one line about
 Gru's own queue — the live NEEDS GRU count, a muted sub-line because it
 is Gru's work, never yours (`Gru is handling 2 live alerts`, or `nothing
-needs Gru either · the crew is on it`; prefixed `last-known ·` while the
+needs Gru either · the crew is on it`; FOR GRU's folded pill says the
+same; prefixed `last-known ·` while the
 board socket is stale or down, or the board is unavailable). Its empty state is the calm clear state (an empty owner
 list is healthy); its rows are keyboard-focusable and a snapshot
 re-render preserves focus (stable action ids) and never toasts or rings

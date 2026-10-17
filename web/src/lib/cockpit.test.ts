@@ -205,7 +205,7 @@ describe('cockpit cards', () => {
       { vector: vector(1) },
     ), NOW));
     expect(one).toEqual(expect.arrayContaining([
-      'crew:minion', 'children.active:sub-minion', 'children.queued:sub-minion queued', 'reviews:round active', 'reviews.verdictsToday:verdict today',
+      'crew:minion', 'children.active:sub-minion active', 'children.queued:queued', 'reviews:round active', 'reviews.verdictsToday:verdict today',
       'vector.fixesAwaitingOwner:fix awaiting you', 'vector.breakIns:break-in',
     ]));
     const two = labels(cockpitCards(snapshot(
@@ -215,7 +215,7 @@ describe('cockpit cards', () => {
       { vector: vector(2) },
     ), NOW));
     expect(two).toEqual(expect.arrayContaining([
-      'crew:minions', 'children.active:sub-minions', 'children.queued:sub-minions queued', 'reviews:rounds active', 'reviews.verdictsToday:verdicts today',
+      'crew:minions', 'children.active:sub-minions active', 'children.queued:queued', 'reviews:rounds active', 'reviews.verdictsToday:verdicts today',
       'vector.fixesAwaitingOwner:fixes awaiting you', 'vector.breakIns:break-ins',
     ]));
   });
@@ -230,10 +230,16 @@ describe('cockpit cards', () => {
     expect(queued.facts.map((fact) => [fact.kpi, fact.value, fact.label])).toEqual([
       ['lanes.midTurn', 0, 'mid-turn'],
       ['lanes.disposed', 0, 'disposed'],
-      ['children.active', 3, 'sub-minions'],
-      ['children.queued', 2, 'sub-minions queued'],
+      ['children.active', 3, 'sub-minions active'],
+      ['children.queued', 2, 'queued'],
     ]);
     expect(queued.notes).toEqual([]);
+    // None active but some queued: never "0 sub-minions" beside the queue.
+    const waiting = card(cockpitCards(snapshot([], [], { queued: 3, active: 0, finished: 0, lifetimeCreations: 3 }), NOW), 'crew');
+    expect(waiting.facts.slice(2).map((fact) => `${fact.value} ${fact.label}`)).toEqual(['0 sub-minions active', '3 queued']);
+    // Nothing queued: the mock's plain "2 sub-minions".
+    const plain = card(cockpitCards(snapshot([], [], { queued: 0, active: 2, finished: 0, lifetimeCreations: 2 }), NOW), 'crew');
+    expect(plain.facts.slice(2).map((fact) => `${fact.value} ${fact.label}`)).toEqual(['2 sub-minions']);
   });
 
   it('flags only non-zero alert counts: a conflicting PR and a failed round', () => {
@@ -269,6 +275,9 @@ describe('cockpit cards', () => {
     expect(mega.notes).toEqual(['across 2 heists', '1 whose heist left the board']);
     const orphansOnly = card(cockpitCards(snapshot([job('o1', 'working', { parentJobId: 'gone' }), job('o2', 'done', { parentJobId: 'lost' })]), NOW), 'megaminions');
     expect(orphansOnly.notes).toEqual(['2 whose heists left the board']);
+    // The plural follows the heists that left, not the megaminions.
+    const oneHeistGone = card(cockpitCards(snapshot([job('a', 'working', { parentJobId: 'gone' }), job('b', 'working', { parentJobId: 'gone' }), job('c', 'done', { parentJobId: 'gone' })]), NOW), 'megaminions');
+    expect(oneHeistGone.notes).toEqual(['3 whose heist left the board']);
     expect(card(cockpitCards(snapshot([job('solo', 'working')]), NOW), 'megaminions').notes).toEqual(['none commissioned']);
   });
 

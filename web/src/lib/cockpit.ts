@@ -148,7 +148,9 @@ export function cockpitCards(snapshot: BoardSnapshot, now = Date.now(), sections
   // megaminion whose heist left the board says so instead.
   const onBoard = new Set(all.map((job) => job.id));
   const parents = new Set(family.map((job) => job.parentJobId).filter((id) => onBoard.has(id ?? ''))).size;
-  const orphans = family.filter((job) => !onBoard.has(job.parentJobId ?? '')).length;
+  const orphaned = family.filter((job) => !onBoard.has(job.parentJobId ?? ''));
+  const orphans = orphaned.length;
+  const departed = new Set(orphaned.map((job) => job.parentJobId)).size;
   const children = kpis.children;
   const cards: CockpitCard[] = [
     {
@@ -183,7 +185,7 @@ export function cockpitCards(snapshot: BoardSnapshot, now = Date.now(), sections
         ? ['none commissioned']
         : [
             ...(parents > 0 ? [`across ${heistCount(parents)}`] : []),
-            ...(orphans > 0 ? [`${orphans} whose ${orphans === 1 ? BOARD_WORDS.heist : BOARD_WORDS.heists} left the board`] : []),
+            ...(orphans > 0 ? [`${orphans} whose ${departed === 1 ? BOARD_WORDS.heist : BOARD_WORDS.heists} left the board`] : []),
           ],
       flow: null,
       off: false,
@@ -200,11 +202,14 @@ export function cockpitCards(snapshot: BoardSnapshot, now = Date.now(), sections
         // an absent block is unknown, never a verified zero.
         ...(children === null
           ? []
+          // With some queued, the pair reads "2 sub-minions active · 1
+          // queued" — never "0 sub-minions" beside a queue of them.
           : [
-              fact('children.active', children.active, children.active === 1 ? 'sub-minion' : 'sub-minions',
+              fact('children.active', children.active,
+                `${children.active === 1 ? 'sub-minion' : 'sub-minions'}${children.queued > 0 ? ' active' : ''}`,
                 `${pluralCount(children.active, 'sub-minion')} active · ${children.queued} queued · ${children.finished} finished · ${children.lifetimeCreations} created (lifetime logical creations)`),
               ...(children.queued > 0
-                ? [fact('children.queued', children.queued, `${children.queued === 1 ? 'sub-minion' : 'sub-minions'} queued`, `${pluralCount(children.queued, 'sub-minion')} queued`)]
+                ? [fact('children.queued', children.queued, 'queued', `${pluralCount(children.queued, 'sub-minion')} queued`)]
                 : []),
             ]),
       ],

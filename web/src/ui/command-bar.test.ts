@@ -141,13 +141,18 @@ describe('command bar (cockpit rework)', () => {
     bar.setSnapshot(snapshot([job([round(2, 'pending'), round(1, 'live')])]));
     expect(roundPill().className).toBe('command-pill command-pill--round-live');
     expect(roundPill().textContent).toBe('ROUND 1 LIVE');
-    // The pills sit in a polite live region: a push that changes no reading
-    // writes nothing, so nothing is re-announced.
+    // The pills sit in a polite live region: each is written only when its
+    // own reading changes, so the other is never re-announced.
     const num = roundPill().querySelector('.command-pill__num');
     bar.setSnapshot(snapshot([job([round(2, 'pending'), round(1, 'live')])]));
-    bar.setBoardState(null);
-    bar.setBoardState(null);
     expect(roundPill().querySelector('.command-pill__num')).toBe(num);
+    bar.setBoardState('open');
+    expect(document.getElementById('command-radar-label')?.textContent).toBe('RADAR LIVE');
+    expect(roundPill().querySelector('.command-pill__num')).toBe(num);
+    const radarText = document.getElementById('command-radar-label')?.firstChild;
+    bar.setSnapshot(snapshot([job([round(3, 'live')])]));
+    expect(roundPill().textContent).toBe('ROUND 3 LIVE');
+    expect(document.getElementById('command-radar-label')?.firstChild).toBe(radarText);
     bar.setSnapshot(snapshot([]));
     expect(roundPill().textContent).toBe('NO ROUND');
     expect(roundPill().querySelector('.command-pill__num')).toBeNull();

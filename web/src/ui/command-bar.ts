@@ -7,8 +7,8 @@
  * the state `renderConnectionDot` gave it — and survives every snapshot
  * push. RADAR is the board socket's: its dot and its word follow the
  * board client only (the chat socket's state is the chat pane's ONLINE
- * badge). The pills sit in a polite live region, so they are written only
- * when a reading changes, and the dot is decoration (aria-hidden): the
+ * badge). The pills sit in a polite live region, so each is written only
+ * when its own reading changes, and the dot is decoration (aria-hidden): the
  * word beside it says the state. There is no lens toggle: chat is always
  * docked on desktop and the FAB owns mobile chat.
  */
@@ -25,7 +25,8 @@ export class CommandBar {
   private readonly roundLabel: HTMLElement;
   private boardState: BoardConnectionState | null = null;
   private snapshot: BoardSnapshot | null = null;
-  private written: string | null = null;
+  private writtenRadar: string | null = null;
+  private writtenRound: string | null = null;
 
   constructor() {
     this.radar = mustGet('command-radar');
@@ -48,20 +49,25 @@ export class CommandBar {
 
   private render(): void {
     const [radar, round] = tickerSegments({ boardState: this.boardState, snapshot: this.snapshot });
-    const reading = `${radar.tone}|${radar.label}|${round.tone}|${round.label}`;
-    if (reading === this.written) return;
-    this.written = reading;
-    this.radar.className = `command-pill command-pill--${radar.tone}`;
-    this.radarLabel.textContent = radar.label;
-    this.round.className = `command-pill command-pill--round-${round.tone}`;
-    if (round.round === null) {
-      this.roundLabel.textContent = round.label;
-    } else {
-      // The number rides a two-digit slot: round 10 never moves the pill.
-      const num = document.createElement('span');
-      num.className = 'command-pill__num';
-      num.textContent = String(round.round.seq);
-      this.roundLabel.replaceChildren('ROUND ', num, ` ${round.round.word}`);
+    const radarReading = `${radar.tone}|${radar.label}`;
+    if (radarReading !== this.writtenRadar) {
+      this.writtenRadar = radarReading;
+      this.radar.className = `command-pill command-pill--${radar.tone}`;
+      this.radarLabel.textContent = radar.label;
+    }
+    const roundReading = `${round.tone}|${round.label}`;
+    if (roundReading !== this.writtenRound) {
+      this.writtenRound = roundReading;
+      this.round.className = `command-pill command-pill--round-${round.tone}`;
+      if (round.round === null) {
+        this.roundLabel.textContent = round.label;
+      } else {
+        // The number rides a two-digit slot: round 10 never moves the pill.
+        const num = document.createElement('span');
+        num.className = 'command-pill__num';
+        num.textContent = String(round.round.seq);
+        this.roundLabel.replaceChildren('ROUND ', num, ` ${round.round.word}`);
+      }
     }
   }
 }

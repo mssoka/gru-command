@@ -71,7 +71,7 @@ import {
 } from '../lib/board-sections.js';
 import { cockpitCards, gruQueueLine, healthPill, type CockpitCard } from '../lib/cockpit.js';
 import { BOARD_WORDS, heistCount, megaminionCount } from '../lib/board-vocabulary.js';
-import { familyStatusBreakdown, isLiveMegaminion } from '../lib/board-family.js';
+import { familyStatusBreakdown, isLiveMegaminion, subMinionTree } from '../lib/board-family.js';
 import { formatAge } from '../lib/board-time.js';
 import { prLinkLabel } from '../lib/pr-link.js';
 import {
@@ -121,7 +121,7 @@ function lensProgressLabel(summary: RoundSummary): string {
   }
   return parts.join(' · ');
 }
-import { BoardApiError, type BoardClient, type BoardSnapshotSource } from '../lib/board-client.js';
+import { BoardApiError, type BoardClient, type BoardConnectionState, type BoardSnapshotSource } from '../lib/board-client.js';
 import type { StorageLike } from '../theme.js';
 import { DECISION_LABELS, decisionChipTone } from './decisions-status.js';
 import { el, mustGet } from './dom.js';
@@ -234,6 +234,9 @@ export class BoardView {
   private snapshot: BoardSnapshot | null = null;
   /** Actions and receipts are live only for a snapshot from the currently bound client. */
   private snapshotIsCurrent = false;
+  /** The board socket was lost (stale, reconnecting, offline) and has not
+   * reopened: an HTTP catch-up during the outage is still last-known. */
+  private socketLost = false;
   /** Invalidates work started before a same-client disconnect, even if the
    * reconnect snapshot arrives before that work's HTTP reply. */
   private snapshotFreshnessGeneration = 0;
@@ -351,6 +354,7 @@ export class BoardView {
   bindClient(client: BoardClient): void {
     this.boardClient = client;
     this.clientGeneration += 1;
+    this.socketLost = false;
     for (const [id, state] of this.proposalStates) {
       if (state.pendingDecision === null) {
         this.invalidateProposalState(state);
@@ -387,11 +391,22 @@ export class BoardView {
     if (this.snapshot !== null) this.renderSnapshot(this.snapshot);
   }
 
-  /** The snapshot on screen is last-known: the board is unavailable, or its
-   * socket went stale or down since the last fresh snapshot. Surfaces that
-   * would otherwise claim calm (the health pill, the Gru line) say so. */
+  /** The board socket's state (the board client's connection events). Lost
+   * on stale, reconnecting or offline; found again only when it reopens —
+   * an HTTP snapshot fetched while it is down never makes the board live. */
+  setSocketState(state: BoardConnectionState): void {
+    const lost = state === 'open' ? false : state === 'stale' || state === 'reconnecting' || state === 'offline' ? true : this.socketLost;
+    if (lost === this.socketLost) return;
+    this.socketLost = lost;
+    if (this.snapshot !== null) this.renderSnapshot(this.snapshot);
+  }
+
+  /** The snapshot on screen is last-known: the board is unavailable, its
+   * socket is lost, or no fresh snapshot arrived since a re-pair. Surfaces
+   * that would otherwise claim calm (the health pill, the Gru queue lines)
+   * say so. */
   private lastKnown(): boolean {
-    return this.unavailableReason !== null || !this.snapshotIsCurrent;
+    return this.unavailableReason !== null || this.socketLost || !this.snapshotIsCurrent;
   }
 
   /** A disconnected board cannot authorize actions from its last-known snapshot. */
@@ -1599,7 +1614,7 @@ export class BoardView {
       }
       const open = snapshot.mailbox.items.some((item) => item.kind === 'incident' && item.state !== 'resolved');
       if (jobs.length === 0 && !open && snapshot.mailbox.counts.threads + snapshot.mailbox.counts.incidents === 0) {
-        return this.emptySection('for-gru', BAND_LABELS['needs-you'], '0', 'nothing needs Gru · the crew is on it');
+        return this.emptySection('for-gru', BAND_LABELS['needs-you'], '0', `${this.lastKnown() ? 'last-known · ' : ''}nothing needs Gru · the crew is on it`);
       }
     }
     const { section, head, body, bodyId } = this.sectionShell(
@@ -2171,7 +2186,9 @@ export class BoardView {
     // row cannot change the suffix of a visible worker (crew-heist-labels).
     const jobs = new Map(this.snapshot?.repos.flatMap((repo) => repo.jobs.map((job) => [job.id, job] as const)) ?? []);
     const suffixes = minionSuffixes(agents, jobs);
-    for (const agent of live) {
+    // Sub-minions sit indented under the minion that created them (owner
+    // pick, cockpit rework), within each band.
+    for (const { agent, depth } of subMinionTree(live)) {
       rail.append(
         this.agentRow(
           agent,
@@ -2181,6 +2198,7 @@ export class BoardView {
           labelById,
           jobs,
           suffixes,
+          depth,
         ),
       );
     }
@@ -2206,8 +2224,8 @@ export class BoardView {
       });
       rail.append(toggle);
       if (this.historyExpanded) {
-        for (const agent of historical) {
-          rail.append(this.agentRow(agent, 'historical', false, false, labelById, jobs, suffixes));
+        for (const { agent, depth } of subMinionTree(historical)) {
+          rail.append(this.agentRow(agent, 'historical', false, false, labelById, jobs, suffixes, depth));
         }
       }
     }
@@ -2231,7 +2249,7 @@ export class BoardView {
       });
       rail.append(toggle);
       if (this.disposedExpanded) {
-        for (const agent of disposed) rail.append(this.agentRow(agent, 'disposed', false, false, labelById, jobs, suffixes));
+        for (const { agent, depth } of subMinionTree(disposed)) rail.append(this.agentRow(agent, 'disposed', false, false, labelById, jobs, suffixes, depth));
       }
     }
   }
@@ -2250,6 +2268,8 @@ export class BoardView {
     labelById: ReadonlyMap<string, string>,
     jobs: ReadonlyMap<string, JobView>,
     suffixes: ReadonlyMap<string, string>,
+    /** Sub-minion indent: rows under the minion that created them. */
+    depth = 0,
   ): HTMLElement {
     // Crew-heist-labels: resolve the minion's job once — the heist name
     // drives the primary line, the tooltip keeps the FULL job title, and
@@ -2273,6 +2293,10 @@ export class BoardView {
     // never inferred as top-level).
     row.dataset.agentId = agent.id;
     row.dataset.parentage = agent.parentage ?? 'unknown';
+    if (depth > 0) {
+      row.classList.add('board-agent--sub');
+      row.style.setProperty('--sub-depth', String(depth));
+    }
     if (status === 'error') row.classList.add('board-agent--error');
     row.title =
       agent.sessionFile !== null
@@ -2297,11 +2321,11 @@ export class BoardView {
         : agent.role;
     // G7: every rail row carries an accessible name; minions keep their
     // full-identity shape, other roles announce label · id — role · state,
-    // with the words the row shows.
-    const spoken = isChild ? 'sub-minion' : roleWord;
+    // with the words the row shows (a sub-minion's marker last).
+    const marker = isChild ? ' · sub-minion' : '';
     row.setAttribute('aria-label', agent.role === 'minion'
-      ? `${name} · ${agent.id}${job !== undefined ? ` — ${job.title}` : ''} — ${spoken} · ${status}`
-      : `${name} · ${agent.id} — ${spoken} · ${status}`);
+      ? `${name} · ${agent.id}${job !== undefined ? ` — ${job.title}` : ''} — ${roleWord} · ${status}${marker}`
+      : `${name} · ${agent.id} — ${roleWord} · ${status}${marker}`);
     if (section === 'historical') {
       row.title += ' · historical: no current runtime owner — record retained';
     }
