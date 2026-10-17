@@ -15,7 +15,7 @@ import {
   backtestRecordPath,
   EnforceGateError,
 } from '../src/decisions/enforce.js';
-import { eventDecisionRequest, supervisionDecisionRequest } from '../src/decisions/questions.js';
+import { DECISION_SURFACES, eventDecisionRequest, supervisionDecisionRequest } from '../src/decisions/questions.js';
 import { DecisionRuntime, SHADOW_MISS_DEGRADE_THRESHOLD } from '../src/decisions/runtime.js';
 import { backtestRecordFromReport, saveBacktestRecord, type BacktestReport } from '../src/decisions/backtest.js';
 import { EventBus, type BusEvent } from '../src/events/bus.js';
@@ -194,14 +194,14 @@ describe('surface mode config parsing (issue #223)', () => {
     expect(template).toContain('Give every surface an explicit mode unless you mean that.');
     expect(template).toContain('escalation_triage and same_blocker are never asked.');
     expect(template).toContain('# Surfaces (the complete list; any other name fails to load):');
+    expect(template).toContain('Setting it anywhere still makes an outage of the default');
+    for (const surface of DECISION_SURFACES) expect(template).toContain(`#   ${surface} `);
     for (const surface of ['event_triage', 'supervision_guidance']) {
       expect(template).toMatch(new RegExp(`#   ${surface} [^\\n]*\\n#\\s+off or shadow today: it has no registered backtest\\n`));
     }
     for (const surface of ['escalation_triage', 'same_blocker']) {
       expect(template).toMatch(
-        new RegExp(
-          `#   ${surface} [^\\n]*\\n#\\s+off or shadow today: it asks Jev only in shadow\\. enforce never asks,\\n#\\s+but still makes a Jev outage page you as if the surface acted\\n`,
-        ),
+        new RegExp(`#   ${surface} [^\\n]*\\n#\\s+off or shadow today: it asks Jev only in shadow, so enforce never asks\\n`),
       );
     }
   });
@@ -521,6 +521,22 @@ describe('shadow misses are evidence, not incidents (2026-10-06 owner page)', ()
     expect(runtime.status()).toMatchObject({ status: 'degraded', reason: 'timeout' });
     expect(postIncident).toHaveBeenCalledTimes(1);
     expect(postIncident.mock.calls[0]![0]).toMatchObject({ kind: 'decisions.degraded.timeout', routing: 'fyi' });
+    runtime.dispose();
+  });
+
+  it('a surface in enforce pages the owner on a transient degrade even though its host never asks', async () => {
+    const { center, postIncident } = notificationStub();
+    const runtime = await shadowRuntime(
+      { ...ALL_SHADOW, escalation_triage: surfaceEntry('openrouter-jev', 'enforce') },
+      ['ok', 'timeout', 'timeout', 'timeout'],
+      { notifications: center, records: [] },
+    );
+    postIncident.mockClear();
+    for (let i = 0; i < SHADOW_MISS_DEGRADE_THRESHOLD; i += 1) {
+      await runtime.decide(eventRequest(), { surface: 'event_triage' });
+    }
+    expect(runtime.status()).toMatchObject({ status: 'degraded', reason: 'timeout' });
+    expect(postIncident.mock.calls[0]![0]).toMatchObject({ kind: 'decisions.degraded.timeout', routing: 'needs-owner' });
     runtime.dispose();
   });
 

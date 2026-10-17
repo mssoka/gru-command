@@ -226,7 +226,7 @@ const PINS: Record<string, number> = {
   'decisions-cli.test.ts': 8,
   'decisions-deadline.test.ts': 28,
   'decisions-service-integration.test.ts': 2,
-  'decisions-shadow.test.ts': 23,
+  'decisions-shadow.test.ts': 24,
   'decisions.test.ts': 91,
   'deploy-drift.test.ts': 10,
   'dispatch-e2e.test.ts': 6,

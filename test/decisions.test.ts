@@ -1667,7 +1667,9 @@ describe('decision profile review fixes', () => {
       ['event_triag', '[decisions.surfaces.event_triag]\nmode = "shadow"\n'],
       ['event_triag', '[decisions.surfaces]\nevent_triag = "local"\n'],
       ['event-triage', '[decisions.surfaces.event-triage]\nmode = "shadow"\n'],
-    ]) {
+      ['event-triage', '[decisions.surfaces]\n"event-triage" = "local"\n'],
+      ['Event_Triage', '[decisions.surfaces.Event_Triage]\nmode = "shadow"\n'],
+    ] as const) {
       const instance = writeInstanceConfig(temp('gru-decisions-surface-typo-'), body);
       expect(() => loadConfig({ GRU_COMMAND_HOME: instance }, temp('gru-decisions-home-'))).toThrow(
         `unknown decision surface \`${name}\` in [decisions.surfaces] (valid surfaces: event_triage, supervision_guidance, escalation_triage, same_blocker, report_conclusion)`,

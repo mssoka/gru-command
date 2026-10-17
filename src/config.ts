@@ -2261,8 +2261,7 @@ function readDecisionsConfig(
     for (const surface of Object.keys(surfacesTable)) {
       if (!Object.prototype.hasOwnProperty.call(surfacesTable, surface)) continue;
       // A misspelled surface would load clean and leave the real one
-      // mode-less, which acts on Jev's answer ungated. The allowlist also
-      // covers what the old [a-z0-9_]+ name pattern guarded.
+      // mode-less, which acts on Jev's answer ungated.
       if (!(DECISION_SURFACES as readonly string[]).includes(surface)) {
         throw new ConfigError(
           `unknown decision surface \`${surface}\` in [decisions.surfaces] (valid surfaces: ${DECISION_SURFACES.join(', ')})`,

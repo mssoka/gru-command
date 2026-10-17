@@ -275,7 +275,7 @@ It is **off by default**. While it is off, deterministic code makes every decisi
 - **Enforcement is gated.** Moving a surface from shadow to `enforce` requires a recorded backtest that meets its threshold, and your explicit decision. It is not usable on any surface yet. See the [Jev guide](docs/jev-production-integration.md).
 - **Authority stays with you.** Jev never decides merges, review verdicts, restarts or owner-only rulings. If OpenRouter is unreachable, Gru Command falls back to deterministic behaviour.
 
-Every command below (`npm run config:generate` and each `dist/decisions/cli.js` call) reads the instance from `GRU_COMMAND_HOME` (default `~/.gru-command`). If your service uses another value, run them with it: `install.sh` writes it into `~/Library/LaunchAgents/com.gru-command.service.plist` (macOS) or `${XDG_CONFIG_HOME:-~/.config}/systemd/user/gru-command.service` (Linux).
+Every command below (`npm run config:generate` and each `dist/decisions/cli.js` call) reads the instance from `GRU_COMMAND_HOME` (default `~/.gru-command`). If your service uses another value, export it first. `install.sh` wrote it into the service file; read it with `plutil -extract EnvironmentVariables.GRU_COMMAND_HOME raw -o - ~/Library/LaunchAgents/com.gru-command.service.plist` (macOS) or `grep '^Environment=GRU_COMMAND_HOME=' "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/gru-command.service"` (Linux).
 
 **1. Store the key.** Use stdin only: never pass the key on the command line or put it in `config.toml`.
 
@@ -303,14 +303,14 @@ This writes `~/.gru-command/credentials/openrouter.key` (or under `$GRU_COMMAND_
 |---|---|
 | `off` | Deterministic only; Jev is never asked |
 | `shadow` | Asks Jev and records its answer, but always uses the deterministic answer. **Start here.** |
-| `enforce` | Uses Jev's answer, with deterministic fallback. It refuses to run until a recorded backtest meets its threshold. Not usable on any surface yet. |
+| `enforce` | Uses Jev's answer, with deterministic fallback. It refuses to run until a recorded backtest meets its threshold. Not usable on any surface yet, and setting it still makes a default-profile outage page you. |
 | *(no mode key)* | Legacy behaviour. `event_triage` and `supervision_guidance` use Jev's answer with **no** backtest gate; `escalation_triage` and `same_blocker` never ask Jev. Avoid it by giving every surface an explicit mode. |
 
 **2. Enable Jev in shadow mode.** The service hot-reloads this section, so no restart is needed. Give every surface an explicit `mode = "shadow"`: an unlisted or mode-less `event_triage` or `supervision_guidance` would act on Jev's answer instead of only recording it.
 
-- **Fresh install:** `~/.gru-command/config.toml` already contains the Jev block, switched off, with every surface in shadow. Set `enabled = true` in its `[decisions.jev]` table. Edit in place; a pasted second copy of a table fails to load.
+- **Fresh install:** your `config.toml` already contains the Jev block, switched off, with every surface in shadow. Set `enabled = true` in its `[decisions.jev]` table. Edit in place; a pasted second copy of a table fails to load.
 - **Older config, Jev off, no surface listed:** run `npm run config:generate -- --force` from the install directory first, then set `enabled = true`. It backs the old file up and keeps your values, but drops hand-written comments; the [Jev guide](docs/jev-production-integration.md#configuration) has the details.
-- **Older config with any surface listed (Jev on or off):** a regenerate keeps exactly those entries, so edit by hand: set `mode = "shadow"` in each existing surface table (turn a shorthand `event_triage = "…"` key into a table), then add only the missing tables. Do it before turning Jev on, or right away if it is already on.
+- **Older config with Jev on, or with any surface listed:** a regenerate keeps exactly those surface entries (none, if none are listed), so edit by hand: set `mode = "shadow"` in each existing surface table, turn a shorthand `event_triage = "<profile>"` key into a table that keeps `provider = "<profile>"`, then add only the missing tables. Do it before turning Jev on, or right away if it is already on.
 
 The Jev and surface tables should read as follows (any provider and threshold tables after them stay as they are):
 
