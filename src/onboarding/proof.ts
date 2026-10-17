@@ -8,7 +8,7 @@ import type { EventRecord } from '../ledger/api.js';
 import type { LogLevel } from '../logger.js';
 import { repositoryGitEnv } from '../git-env.js';
 import { oneLineErrorText } from '../property/error-text.js';
-import { REDACTION_PLACEHOLDER, redactCredentials, redactCredentialWindow } from '../redaction.js';
+import { redactCredentials, redactCredentialWindow } from '../redaction.js';
 import { CI_EVIDENCE_OMITTED_NOTICE } from '../review-inputs/ci-evidence.js';
 import { VerificationDisposedError, VerificationLockTimeoutError, verificationEnvironment, type VerificationLease } from '../verify/scheduler.js';
 import { ONBOARDING_PROOF_SCOPE, type VerificationBudget } from '../verify/server.js';
@@ -94,9 +94,12 @@ export const SUSPICIOUSLY_FAST_MS = 1_000;
 const VERIFY_KILL_GRACE_MS = 5_000;
 /** Bytes of output kept for the record and the minion, after redaction. */
 const OUTPUT_TAIL_BYTES = 4 * 1024;
-/** Bytes of a stream's latest output redacted whole before the tail is cut
- * from it: a credential the tail's cut would split lies inside it. */
+/** Bytes of one stream's output the tail is cut from, after redaction. */
 const OUTPUT_WINDOW_BYTES = 16 * 1024;
+/** Bytes of verify's latest output kept whole: redacted before anything is
+ * cut, so a one-line report up to this size (`jest --json`) keeps its last
+ * bytes. Setup keeps 64 KiB per stream (worktrees/manifest.ts). */
+const OUTPUT_CAPTURE_BYTES = 1024 * 1024;
 /** Appeared paths listed in the record (the count is always kept). */
 const APPEARED_LISTED = 50;
 /** The environment variable a verify shell evaluates its command from. */
@@ -157,16 +160,6 @@ function utf8Tail(text: string, max: number): string {
   return bytes.subarray(start).toString('utf8');
 }
 
-/** A text that starts mid-stream, from its first whole line (in one line
- * with no break, its first whole word): what a cut split is left out,
- * never half shown. */
-function fromBoundary(text: string): string {
-  const line = text.indexOf('\n');
-  if (line !== -1) return text.slice(line + 1);
-  const word = text.search(/\s/u);
-  return word === -1 ? '' : text.slice(word + 1);
-}
-
 /** The first line of a tail that starts inside a line longer than the
  * tail: its words are kept rather than nothing, and it says so. */
 const MID_LINE = '(output tail starts mid-line)\n';
@@ -174,6 +167,10 @@ const MID_LINE = '(output tail starts mid-line)\n';
 /** What stands for a last line with no word boundary to start at: none of
  * it is shown, since its first bytes could be the back half of a token. */
 const longLine = (bytes: number): string => `(last line longer than ${String(Math.max(1, Math.floor(bytes / 1024)))} KiB, not shown)\n`;
+
+/** What stands for kept output whose first line the stream's earlier,
+ * dropped output began: none of it is shown, and no size is claimed. */
+const CUT_MID_LINE = '(output before this was cut mid-line; not shown)\n';
 
 /** The mid-line fallback, for kept bytes whose cut has no line boundary
  * after it: everything up to and including their first whitespace is
@@ -185,15 +182,17 @@ function fromWord(kept: string): string | null {
   return rest.trim() === '' ? null : rest;
 }
 
-/** The last `max` UTF-8 bytes of a text, starting at a boundary. With no
- * line boundary to start at (one line longer than the tail), its last
- * bytes from their first word boundary after {@link MID_LINE}, or, with
- * none, {@link longLine}: a command that printed something never records an
- * empty tail. `midLine`: the text already starts mid-line. */
-function boundedTail(text: string, max: number, midLine: boolean): string {
-  const marked = midLine ? `${MID_LINE}${text}` : text;
-  if (Buffer.byteLength(marked, 'utf8') <= max) return marked;
-  const whole = fromBoundary(utf8Tail(text, max));
+/** The last `max` UTF-8 bytes of a redacted text, starting at a whole
+ * line. When its last line alone is longer than that, that line's last
+ * bytes from their first word, after {@link MID_LINE}; with no word
+ * boundary, {@link longLine}: a command that printed something never
+ * records an empty tail. Only ever cut after redaction, so the cut never
+ * parts a key from its value. */
+function boundedTail(text: string, max: number): string {
+  if (Buffer.byteLength(text, 'utf8') <= max) return text;
+  const tail = utf8Tail(text, max);
+  const line = tail.indexOf('\n');
+  const whole = line === -1 ? '' : tail.slice(line + 1);
   if (whole.trim() !== '' || text.trim() === '') return whole;
   const rest = fromWord(utf8Tail(text, max - Buffer.byteLength(MID_LINE, 'utf8')));
   return rest === null ? longLine(max) : `${MID_LINE}${rest}`;
@@ -203,35 +202,29 @@ function boundedTail(text: string, max: number, midLine: boolean): string {
 type OutputWindow = SetupStreamTail;
 
 /**
- * The recorded output tail: each stream's latest {@link OUTPUT_WINDOW_BYTES}
- * redacted whole (a key whose BEGIN line fell before the window is
- * redacted from the window's start), then the last {@link OUTPUT_TAIL_BYTES}
- * cut at a line. The bound holds after redaction, and a cut never shows
- * half a credential: a window that starts mid-stream (cut here, or a setup
- * stream whose earlier chunks were dropped, however short what is left) is
- * redacted whole first, so dropping its first line or word never parts a
- * key from its value; it then starts at its first whole line, or, when one
- * line fills it, at its first word, and the tail is marked as starting
- * mid-line; one with no word boundary at all shows none of that line
- * ({@link longLine}). A window whose start the redaction replaced (a key
- * whose BEGIN line fell before it) has no partial first line, and keeps
- * that placeholder. Exported for its tests.
+ * The recorded output tail. Each stream's kept output is redacted whole
+ * first (a key whose BEGIN line fell before it is redacted from its
+ * start), and only then cut, so no cut GC makes parts a key from its value:
+ * - output GC kept whole (none dropped, however long) keeps its last
+ *   {@link OUTPUT_WINDOW_BYTES} ({@link boundedTail});
+ * - output whose start was dropped before GC saw it keeps what follows
+ *   the drop when the dropped part ended at a line break; when it did not,
+ *   the first line is dropped after redaction (the earlier cut may have
+ *   split a key's name, which no pattern then recognises), and with no
+ *   line break at all only {@link CUT_MID_LINE} is recorded: a fragment
+ *   the earlier cut made is never shown, not even from a word.
+ * The streams together are then cut to the last {@link OUTPUT_TAIL_BYTES}
+ * the same way. Exported for its tests.
  */
 export function recordedTail(windows: readonly OutputWindow[]): string {
-  const redacted = windows.map((window) => {
-    const cut = Buffer.byteLength(window.text, 'utf8') > OUTPUT_WINDOW_BYTES;
-    const text = cut ? utf8Tail(window.text, OUTPUT_WINDOW_BYTES) : window.text;
-    const whole = redactCredentialWindow(text);
-    if (!cut && !window.truncated) return whole;
-    if (whole.startsWith(REDACTION_PLACEHOLDER) && !text.startsWith(REDACTION_PLACEHOLDER)) return whole;
-    const fromLine = fromBoundary(whole);
-    if (fromLine.trim() !== '' || whole.trim() === '') return fromLine;
-    // One line longer than the window, cut before it was redacted: the cut
-    // may fall inside a key's name (`sword": "…"`), which no pattern then
-    // recognises, so none of that line is shown.
-    return longLine(Buffer.byteLength(text, 'utf8'));
+  const kept = windows.map((window) => {
+    const whole = redactCredentialWindow(window.text);
+    if (!window.truncated || window.startsAtLine) return boundedTail(whole, OUTPUT_WINDOW_BYTES);
+    const line = whole.indexOf('\n');
+    const rest = line === -1 ? '' : whole.slice(line + 1);
+    return rest.trim() === '' ? CUT_MID_LINE : boundedTail(rest, OUTPUT_WINDOW_BYTES);
   }).filter((text) => text !== '');
-  return boundedTail(redacted.join('\n'), OUTPUT_TAIL_BYTES, false);
+  return boundedTail(kept.join('\n'), OUTPUT_TAIL_BYTES);
 }
 
 class ProofStopping extends Error {
@@ -516,10 +509,14 @@ const pause = (ms: number): Promise<void> => new Promise((wake) => { setTimeout(
 
 /** How long a listing of processes may run before it counts as failed. */
 const LISTING_TIMEOUT_MS = 30_000;
-/** How long, past the grace, {@link endProcesses} waits for what it ended to be gone. */
+/** How long, after SIGKILL is sent, {@link endProcesses} waits for what it ended to be gone. */
 const KILL_SETTLE_MS = 5_000;
 /** How often {@link endProcesses} lists the process table while it waits. */
 const KILL_POLL_MS = 100;
+/** How long one poll of {@link endProcesses} waits for its listing: past
+ * it, the poll goes by what `kill(…, 0)` answers and the listing goes on,
+ * for a later poll to use. */
+const KILL_POLL_LISTING_MS = 1_000;
 
 /** One process as the process table shows it. */
 export interface ProcessRow {
@@ -598,43 +595,73 @@ async function gone(target: number): Promise<boolean> {
 const goneFrom = (rows: readonly ProcessRow[], target: number): boolean =>
   rows.every((row) => (target < 0 ? row.pgid !== -target : row.pid !== target) || row.zombie);
 
-/** The targets still not gone, by one listing of the process table for all
- * of them, cut short at `deadline`: a target no process by that id answers
- * is gone without it, and a table that cannot be read (or not in time)
- * leaves the rest living. */
-async function living(targets: readonly number[], table: () => Promise<readonly ProcessRow[]>, deadline: number): Promise<readonly number[]> {
-  const present = targets.filter((target) => signalProcess(target, 0));
-  if (present.length === 0) return present;
+/** A value, or null once `ms` passed first. */
+async function within<T>(work: Promise<T>, ms: number): Promise<T | null> {
   let timer: NodeJS.Timeout | undefined;
   try {
-    const rows = await Promise.race([table(), new Promise<null>((resolveLate) => { timer = setTimeout(() => resolveLate(null), Math.max(0, deadline - Date.now())); })]);
-    return rows === null ? present : present.filter((target) => !goneFrom(rows, target));
-  } catch {
-    return present;
+    return await Promise.race([work, new Promise<null>((resolveLate) => { timer = setTimeout(() => resolveLate(null), ms); })]);
   } finally {
     clearTimeout(timer);
   }
 }
 
+/** What {@link endProcesses} reads, and how long it waits (its tests'
+ * seams; the defaults are the real ones). */
+export interface EndProcessesOptions {
+  /** The one listing of the process table each poll uses. */
+  readonly table?: () => Promise<readonly ProcessRow[]>;
+  /** Whether one target is gone, a zombie counting as gone, judged on its
+   * own (`ps -o stat=` of it): for a poll whose table could not be read. */
+  readonly judge?: (target: number) => Promise<boolean>;
+  readonly settleMs?: number;
+  readonly pollListingMs?: number;
+}
+
 /** End processes or groups (a negated pgid): SIGTERM, then SIGKILL to what
  * still lives after the grace, then wait until every target is gone, a
  * zombie counting as gone, so a caller that judges them next sees them
- * gone. Each poll lists the process table once for every target, and the
- * whole wait, a slow listing included, ends at the grace plus
- * {@link KILL_SETTLE_MS} of wall clock. Returns what is still there at that
- * deadline, which the caller logs. Exported for its tests (`table`: the
- * one listing each poll makes). */
-export async function endProcesses(targets: readonly number[], graceMs: number, table: () => Promise<readonly ProcessRow[]> = processTable): Promise<readonly number[]> {
+ * gone. Each poll waits at most {@link KILL_POLL_LISTING_MS} for one listing
+ * of the process table for every target; one still running is never
+ * started again, and a later poll takes its answer. A table that cannot be
+ * read has each target judged on its own, within the same bound. A poll
+ * with no answer goes by `kill(…, 0)`. After SIGKILL the wait always lasts
+ * up to {@link KILL_SETTLE_MS} of wall clock, however long the polls before
+ * it took, then returns what is still there, which the caller logs.
+ * Exported for its tests. */
+export async function endProcesses(targets: readonly number[], graceMs: number, opts: EndProcessesOptions = {}): Promise<readonly number[]> {
+  const table = opts.table ?? processTable;
+  const judge = opts.judge ?? gone;
+  const settleMs = opts.settleMs ?? KILL_SETTLE_MS;
+  const pollMs = opts.pollListingMs ?? KILL_POLL_LISTING_MS;
+  let pending: Promise<readonly ProcessRow[] | 'unreadable'> | null = null;
+  const listing = (): Promise<readonly ProcessRow[] | 'unreadable'> => {
+    if (pending === null) {
+      const started = table().catch(() => 'unreadable' as const);
+      pending = started;
+      void started.then(() => { if (pending === started) pending = null; });
+    }
+    return pending;
+  };
+  const living = async (left: readonly number[]): Promise<readonly number[]> => {
+    const present = left.filter((target) => signalProcess(target, 0));
+    if (present.length === 0) return present;
+    const rows = await within(listing(), pollMs);
+    if (rows === null) return present;
+    if (rows !== 'unreadable') return present.filter((target) => !goneFrom(rows, target));
+    const judged = await within(Promise.all(present.map((target) => judge(target).catch(() => false))), pollMs);
+    return judged === null ? present : present.filter((_target, index) => !judged[index]);
+  };
   const killAt = Date.now() + graceMs;
-  const deadline = killAt + KILL_SETTLE_MS;
+  let deadline: number | null = null;
   let left: readonly number[] = targets.filter((target) => signalProcess(target, 'SIGTERM'));
-  let killed = false;
   while (left.length > 0) {
-    left = await living(left, table, deadline);
+    left = await living(left);
     if (left.length === 0) break;
-    if (!killed && Date.now() >= killAt) {
-      for (const target of left) signalProcess(target, 'SIGKILL');
-      killed = true;
+    if (deadline === null) {
+      if (Date.now() >= killAt) {
+        for (const target of left) signalProcess(target, 'SIGKILL');
+        deadline = Date.now() + settleMs;
+      }
     } else if (Date.now() >= deadline) {
       break;
     }
@@ -654,26 +681,39 @@ function markedEnvironment(entries: readonly string[], matches: (marker: string)
   return entries.some((entry) => entry.startsWith(prefix) && matches(entry.slice(prefix.length)));
 }
 
+/** Pids whose environment read hung past its pass's bound (a process stuck
+ * in the kernel, on a hung NFS mount, say), for this process's lifetime:
+ * no later pass reads them again, so each pins at most the one threadpool
+ * thread its first read holds, and a later listing completes without it. */
+const hungEnvironReads = new Set<number>();
+
 /**
  * Linux: which of `pids` carry a probe marker `matches` accepts, read from
  * each one's environment. A process of this user whose environment cannot
  * be read (non-dumpable, as ssh-agent and gpg-agent are) is logged at
  * debug only: any of the user's processes may be one, so it is no lead.
- * The whole pass is bounded by `timeoutMs`: a read that hangs (a process
- * stuck in the kernel, on a hung NFS mount, say) is abandoned, never
- * awaited, and the listing fails. Exported for its tests (`read`).
+ * The whole pass is bounded by `timeoutMs`: a read that hangs is abandoned,
+ * never awaited, and the listing fails; its pid is named once at warn and
+ * skipped by every later pass (`hung`), so no second read ever starts on a
+ * pid whose first has not settled. Exported for its tests (`read`, `hung`).
  */
 export async function environMarkedPids(pids: readonly number[], matches: (marker: string) => boolean, log: Log, opts: {
   readonly timeoutMs?: number;
   readonly read?: EnvironReader;
+  readonly hung?: Set<number>;
 } = {}): Promise<readonly number[]> {
   const timeoutMs = opts.timeoutMs ?? LISTING_TIMEOUT_MS;
   const read = opts.read ?? readEnviron;
+  const hung = opts.hung ?? hungEnvironReads;
   let abandoned = false;
+  /** The pid the pass is reading now: the one a timeout abandons. */
+  let reading: number | null = null;
   const pass = async (): Promise<readonly number[]> => {
     const found: number[] = [];
     for (const pid of pids) {
       if (abandoned) break;
+      if (hung.has(pid)) continue;
+      reading = pid;
       let environ: string;
       try {
         environ = await read(pid);
@@ -682,6 +722,8 @@ export async function environMarkedPids(pids: readonly number[], matches: (marke
           log('debug', 'onboarding proof: a process of this user hides its environment (non-dumpable), so its marker cannot be read', { pid });
         }
         continue; // ended meanwhile, or another user's
+      } finally {
+        if (!abandoned) reading = null;
       }
       if (markedEnvironment(environ.split('\0'), matches)) found.push(pid);
     }
@@ -692,6 +734,10 @@ export async function environMarkedPids(pids: readonly number[], matches: (marke
     return await Promise.race([pass(), new Promise<never>((_found, reject) => {
       timer = setTimeout(() => {
         abandoned = true;
+        if (reading !== null && !hung.has(reading)) {
+          hung.add(reading);
+          log('warn', 'onboarding proof: reading a process\'s environment hung, so its marker cannot be read; it is not read again while the service runs', { pid: reading });
+        }
         reject(new Error(`the process environments could not be read within ${String(timeoutMs)} ms`));
       }, timeoutMs);
     })]);
@@ -905,7 +951,7 @@ export async function runOnboardingProof(input: OnboardingProofInput): Promise<O
 async function prove(input: OnboardingProofInput, dir: string, log: Log, processes: ProofProcesses): Promise<OnboardingProofOutcome> {
   // What leaves the proof reaches the ledger, the minion and a PR comment
   // that may be public: anything that looks like a credential is masked.
-  // The output tail was redacted as it was cut (recordedTail).
+  // The output tail was redacted before it was cut (recordedTail).
   const proven = (fields: Partial<OnboardingProofResult> & Pick<OnboardingProofResult, 'failures'>): OnboardingProofOutcome => ({
     kind: 'proven',
     result: {
@@ -1113,8 +1159,9 @@ interface CommandRun {
  * with a lone command) and its argv, bound to the budget slot with its pid,
  * names this run: after a crash the next start can tell the orphan is its
  * own. Each stream is decoded on its own, so a character split across
- * chunks stays whole; the latest {@link OUTPUT_WINDOW_BYTES} are kept and
- * the recorded tail is cut from them (recordedTail). */
+ * chunks stays whole; the latest {@link OUTPUT_CAPTURE_BYTES} are kept, with
+ * whether what was dropped ended at a line break, and the recorded tail is
+ * cut from them (recordedTail). */
 async function runCommand(command: string, cwd: string, env: NodeJS.ProcessEnv, opts: {
   readonly timeoutMs: number;
   readonly graceMs: number;
@@ -1136,12 +1183,24 @@ async function runCommand(command: string, cwd: string, env: NodeJS.ProcessEnv, 
   let outputBytes = 0;
   let hasOutput = false;
   let window = '';
+  let windowBytes = 0;
   let truncated = false;
+  let startsAtLine = true;
+  /** Keep the latest `max` bytes, noting whether what is dropped ended at a line break. */
+  const keep = (max: number): void => {
+    if (windowBytes <= max) return;
+    const kept = utf8Tail(window, max);
+    startsAtLine = window[window.length - kept.length - 1] === '\n';
+    window = kept;
+    windowBytes = Buffer.byteLength(kept, 'utf8');
+    truncated = true;
+  };
   const take = (text: string): void => {
     if (!hasOutput && text.trim() !== '') hasOutput = true;
-    const joined = window + text;
-    window = utf8Tail(joined, OUTPUT_WINDOW_BYTES);
-    if (window.length < joined.length) truncated = true;
+    window += text;
+    windowBytes += Buffer.byteLength(text, 'utf8');
+    // Cut at twice the bound: a chatty command costs one cut per bound's worth of output.
+    keep(2 * OUTPUT_CAPTURE_BYTES);
   };
   const decoders = [new StringDecoder('utf8'), new StringDecoder('utf8')] as const;
   child.stdout?.on('data', (chunk: Buffer) => { outputBytes += chunk.length; take(decoders[0].write(chunk)); });
@@ -1181,7 +1240,8 @@ async function runCommand(command: string, cwd: string, env: NodeJS.ProcessEnv, 
   child.stdout?.destroy();
   child.stderr?.destroy();
   for (const decoder of decoders) take(decoder.end());
-  return { exitCode: exit.code, signal: exit.signal, timedOut, stopped, spawnError: exit.error, ms, outputBytes, hasOutput, tail: recordedTail([{ text: window, truncated }]) };
+  keep(OUTPUT_CAPTURE_BYTES);
+  return { exitCode: exit.code, signal: exit.signal, timedOut, stopped, spawnError: exit.error, ms, outputBytes, hasOutput, tail: recordedTail([{ text: window, truncated, startsAtLine }]) };
 }
 
 /** What `ps` says of one live pid: its process group and command line.
@@ -1236,18 +1296,20 @@ function instanceProcesses(probesDir: string, log: Log, what: string): Promise<r
  * proof's (it carries this instance's marker or is rooted under its probes
  * folder), and the slot is released once it is gone; a group none of whose
  * members is confirmed is never signalled (its pgid may have been reused)
- * and keeps the slot. A live pid that is not that verify (a recycled pid)
- * is never signalled, and a pid `ps` cannot read is an error; each such
- * slot is left to the scheduler's age limit.
+ * and keeps the slot; each such slot is returned, for Gru to be told. A
+ * live pid that is not that verify (a recycled pid) is never signalled,
+ * and a pid `ps` cannot read is an error; each such slot is left to the
+ * scheduler's age limit.
  */
-export async function endOrphanedProofVerifies(budget: () => VerificationBudget, probesDir: string, log: Log = () => {}, graceMs = VERIFY_KILL_GRACE_MS): Promise<void> {
+export async function endOrphanedProofVerifies(budget: () => VerificationBudget, probesDir: string, log: Log = () => {}, graceMs = VERIFY_KILL_GRACE_MS): Promise<readonly UnconfirmedProofSlot[]> {
   let slots: VerificationBudget;
   try {
     slots = budget();
   } catch (error) {
     log('warn', 'onboarding proof: the verification budget is unavailable, so a verify an earlier run left is not ended now', { error: oneLine(error) });
-    return;
+    return [];
   }
+  const kept: UnconfirmedProofSlot[] = [];
   let confirmed: ReadonlySet<number> | null = null;
   for (const holder of slots.restored(ONBOARDING_PROOF_SCOPE)) {
     const fields = { run: holder.lease.runId, job: holder.lease.jobId, pid: holder.pid };
@@ -1284,6 +1346,7 @@ export async function endOrphanedProofVerifies(budget: () => VerificationBudget,
         confirmed ??= new Set(await instanceProcesses(probesDir, log, 'a verify group an earlier run left cannot be confirmed as its own'));
         if (!members.some((member) => !member.zombie && confirmed!.has(member.pid))) {
           log('warn', 'onboarding proof: a budget slot an earlier run left names a verify whose leader is gone while members of its process group live, none of them confirmed the proof\'s (its marker, or rooted under its probes folder); the group is not signalled and the slot waits for the scheduler\'s age limit', fields);
+          kept.push({ lease: holder.lease, pgid: holder.pid, ageLimitMs: slots.ageLimitMs });
           continue;
         }
         if ((await endProcesses([-holder.pid], graceMs)).length > 0) {
@@ -1300,6 +1363,17 @@ export async function endOrphanedProofVerifies(budget: () => VerificationBudget,
       log('error', 'onboarding proof: a verify an earlier run left could not be judged or ended; its slot waits for the scheduler\'s age limit', { ...fields, error: oneLine(error) });
     }
   }
+  return kept;
+}
+
+/** A budget slot the boot judge keeps because a member of its crashed
+ * verify's process group lives that nothing confirms is the proof's. */
+export interface UnconfirmedProofSlot {
+  readonly lease: VerificationLease;
+  /** The group (its lost leader's pid). */
+  readonly pgid: number;
+  /** The scheduler's age limit, from the slot's grant. */
+  readonly ageLimitMs: number;
 }
 
 // ------------------------------------------------------------------

@@ -3,7 +3,7 @@ import type { AgentHandle, PromptTurnVerdict } from '../runtime/types.js';
 import { promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync, writeFileSync, type Stats } from 'node:fs';
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { LogLevel } from '../logger.js';
 import { DEFAULT_REVIEW_CHILDREN } from '../config.js';
@@ -1922,11 +1922,12 @@ export const FALLBACK_ONBOARDING_PROOF_REQUIRED = 'onboarding-proof-required';
 
 /** The way forward that abort records: the gate cannot wait for a proof,
  * so the fix goes through delivery, the proof, then review again. Nothing
- * replays the aborted gate itself; a self-review request made while the
- * new head's proof is owed is queued and replayed on that proof's event. */
+ * replays the aborted gate itself; a self-review request made once the fix
+ * is delivered, while its proof is owed, is queued and replayed on that
+ * proof's pass. */
 export const FALLBACK_ONBOARDING_PROOF_HINT =
   'the minion must commit the fix, push it to the PR branch and deliver; GC proves the new head itself, and once that proof ' +
-  'passes the Silas digest offers the review again; a self-review request the minion makes before then is queued and replayed on the pass';
+  'passes the Silas digest offers the review again (a self-review request the minion makes after it delivered the fix is queued and replayed on that pass)';
 
 /** A reviewed job's ledger row is gone at the freeze. Job rows are never
  * deleted, so nothing the freeze would record about it can be stated. */
@@ -1964,14 +1965,106 @@ function captureFallbackInput(lanePath: string, baseRef: string): Pick<FallbackR
   return { headRef, diff, diffSha256: createHash('sha256').update(diff).digest('hex') };
 }
 
+/** #427 PR 1b: a `[[copy]]` source or a `[[link]]` target in the
+ * repository checkout that cannot be read, so the lane check cannot tell
+ * whether what the lane's bootstrap placed from it is still that. */
+export class BootstrapSourceUnreadableError extends Error {
+  constructor(what: '[[copy]] source' | '[[link]] target', source: string, cause: unknown) {
+    super(`the ${what} ${JSON.stringify(source)} in the repository checkout cannot be read: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = 'BootstrapSourceUnreadableError';
+  }
+}
+
+const missing = (error: unknown): boolean => ['ENOENT', 'ENOTDIR'].includes(String((error as NodeJS.ErrnoException).code));
+
+/** Whether two files of `size` bytes hold the same bytes, read 64 KiB at a
+ * time (never a whole file at once). `source` is the checkout's: a read of
+ * it that fails is a {@link BootstrapSourceUnreadableError}. */
+function sameBytes(source: string, placed: string, size: number, from: string): boolean {
+  let sourceFd: number;
+  try {
+    sourceFd = openSync(source, 'r');
+  } catch (error) {
+    throw new BootstrapSourceUnreadableError('[[copy]] source', from, error);
+  }
+  try {
+    const placedFd = openSync(placed, 'r');
+    try {
+      const want = Buffer.alloc(64 * 1024);
+      const got = Buffer.alloc(64 * 1024);
+      for (let at = 0; at < size;) {
+        let read: number;
+        try {
+          read = readSync(sourceFd, want, 0, want.length, at);
+        } catch (error) {
+          throw new BootstrapSourceUnreadableError('[[copy]] source', from, error);
+        }
+        if (read === 0) return false;
+        if (readSync(placedFd, got, 0, read, at) !== read || !want.subarray(0, read).equals(got.subarray(0, read))) return false;
+        at += read;
+      }
+      return true;
+    } finally {
+      closeSync(placedFd);
+    }
+  } finally {
+    closeSync(sourceFd);
+  }
+}
+
+/** Whether a lane path still holds what a copy of `source` placed: the
+ * same bytes for a file, the same names and contents, recursively, for a
+ * folder. A source that cannot be read throws, naming `from`. */
+function copyIntact(source: string, placed: string, from: string): boolean {
+  let want: Stats;
+  try {
+    want = statSync(source);
+  } catch (error) {
+    throw new BootstrapSourceUnreadableError('[[copy]] source', from, error);
+  }
+  let got: Stats;
+  try {
+    got = lstatSync(placed);
+  } catch (error) {
+    if (missing(error)) return false;
+    throw error;
+  }
+  if (want.isFile()) return got.isFile() && got.size === want.size && sameBytes(source, placed, want.size, from);
+  if (!want.isDirectory() || !got.isDirectory()) return false;
+  let names: string[];
+  try {
+    names = readdirSync(source).sort();
+  } catch (error) {
+    throw new BootstrapSourceUnreadableError('[[copy]] source', from, error);
+  }
+  const placedNames = readdirSync(placed).sort();
+  return names.length === placedNames.length && names.every((name, index) => name === placedNames[index]) &&
+    names.every((name) => copyIntact(join(source, name), join(placed, name), from));
+}
+
+/** One path the lane's bootstrap placed. */
+interface PlacedPath {
+  /** Lane-relative, `/`-separated. */
+  readonly path: string;
+  /** Whether it is still exactly what the bootstrap placed (judged once per check). */
+  readonly intact: () => boolean;
+  /** What a refusal says when it is not. */
+  readonly changed: string;
+}
+
 /** #427 PR 1b: what the lane's bootstrap placed (its manifest's
  * `[[link]]` `at` and `[[copy]]` `to`, lane-relative), each with whether it
- * is still exactly that: a copy whose bytes equal its source's in the
- * repository checkout, a link that still points at the manifest's target.
+ * is still exactly that, compared as git and the filesystem see it: a link
+ * whose real path is its target's (`realpath` of both, however either is
+ * spelled), a copy whose bytes (a folder's, recursively) equal its
+ * source's in the repository checkout now. A source or target there that
+ * cannot be read throws, named ({@link BootstrapSourceUnreadableError}).
  * The proof's own bootstrap places them the same way from the same
  * checkout. A manifest that cannot be read places nothing here, so every
- * path counts. */
-function bootstrapPlaced(lanePath: string, sourceRoot: string): readonly { readonly path: string; readonly intact: () => boolean }[] {
+ * path counts. A limit: a copy is compared with its source as it is now,
+ * so a source that changed since the lane was made makes an untouched copy
+ * read as changed; the refusal says so. */
+function bootstrapPlaced(lanePath: string, sourceRoot: string): readonly PlacedPath[] {
   let manifest;
   try {
     manifest = loadWorktreeManifest(lanePath);
@@ -1980,63 +2073,73 @@ function bootstrapPlaced(lanePath: string, sourceRoot: string): readonly { reado
   }
   if (manifest === null) return [];
   const laneRelative = (path: string): string => relative(lanePath, resolve(lanePath, path)).split(sep).join('/');
-  const holds = (check: () => boolean): (() => boolean) => () => {
-    try {
-      return check();
-    } catch {
-      return false; // gone, or no longer a link or a file
-    }
+  const once = (judge: () => boolean): (() => boolean) => {
+    let judged: boolean | null = null;
+    return () => (judged ??= judge());
   };
   return [
     ...manifest.links.map((link) => ({
       path: laneRelative(link.at),
-      intact: holds(() => readlinkSync(resolve(lanePath, link.at)) === (isAbsolute(link.to) ? resolve(link.to) : resolve(sourceRoot, link.to))),
+      intact: once(() => {
+        let target: string;
+        try {
+          target = realpathSync(isAbsolute(link.to) ? resolve(link.to) : resolve(sourceRoot, link.to));
+        } catch (error) {
+          throw new BootstrapSourceUnreadableError('[[link]] target', link.to, error);
+        }
+        try {
+          const at = resolve(lanePath, link.at);
+          return lstatSync(at).isSymbolicLink() && realpathSync(at) === target;
+        } catch (error) {
+          if (missing(error)) return false; // gone, or pointing at nothing now
+          throw error;
+        }
+      }),
+      changed: `the [[link]] ${JSON.stringify(link.at)} no longer points at ${JSON.stringify(link.to)} in the repository checkout`,
     })),
     ...manifest.copies.map((copy) => ({
       path: laneRelative(copy.to),
-      intact: holds(() => lstatSync(resolve(lanePath, copy.to)).isFile() &&
-        readFileSync(resolve(lanePath, copy.to)).equals(readFileSync(resolve(sourceRoot, copy.from)))),
+      intact: once(() => copyIntact(resolve(sourceRoot, copy.from), resolve(lanePath, copy.to), copy.from)),
+      changed: `the [[copy]] ${JSON.stringify(copy.to)} no longer matches its source ${JSON.stringify(copy.from)} in the repository checkout: ` +
+        'the minion edited it, or the source changed since the lane was made (copying the source again makes it match)',
     })),
   ].filter((entry) => entry.path !== '' && !entry.path.startsWith('..'));
 }
 
-/** #427 PR 1b: whether a lane holds uncommitted changes the fallback would
- * review (tracked edits, untracked files git does not ignore: what
- * `git status --porcelain` lists, an untracked folder collapsed to one
- * entry), leaving out what the lane's bootstrap placed while it is still
- * what it placed (a `node_modules` link a `node_modules/` ignore rule
- * misses, since a link is no folder; a `[[copy]]` the minion has not
- * edited). A collapsed folder that holds a placed path is read file by
- * file, that folder alone. Fails loud when git cannot say (a timeout or an
- * output past its buffer included). */
-function laneHasUncommittedChanges(lanePath: string, sourceRoot: string): boolean {
-  const status = (args: readonly string[]): readonly string[] => {
-    const run = spawnSync('git', ['--literal-pathspecs', '-C', lanePath, '-c', 'core.fsmonitor=false', 'status', '--porcelain', '-z', ...args],
-      { encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 64 * 1024 * 1024, timeout: 30_000 });
-    if (run.error !== undefined || run.status !== 0) {
-      throw new Error(`cannot read the lane's uncommitted changes (git status): ${run.error?.message ?? run.stderr.trim().slice(0, 200)}`);
-    }
-    return run.stdout.split('\0');
-  };
+/** #427 PR 1b: what makes a lane hold uncommitted changes the fallback
+ * would review (tracked edits, untracked files git does not ignore: what
+ * `git status --porcelain` lists), leaving out what the lane's bootstrap
+ * placed while it is still what it placed (a `node_modules` link a
+ * `node_modules/` ignore rule misses, since a link is no folder; a
+ * `[[copy]]` the minion has not edited). Null when the lane is clean; else
+ * `detail` names a placed path that is no longer what was placed (null for
+ * any other change). One `git status` per check: untracked folders
+ * collapsed to one entry each, unless a placed path lies inside a folder,
+ * when every untracked file is listed. File contents are read only for a
+ * placed copy. Fails loud when git cannot say (a timeout or an output past
+ * its buffer included). */
+function laneUncommittedChange(lanePath: string, sourceRoot: string): { readonly detail: string | null } | null {
   const placed = bootstrapPlaced(lanePath, sourceRoot);
-  const isPlaced = (path: string): boolean => placed.some((entry) => (path === entry.path || path.startsWith(`${entry.path}/`)) && entry.intact());
-  const uncommitted = (fields: readonly string[], expand: boolean): boolean => {
-    for (let index = 0; index < fields.length; index += 1) {
-      const field = fields[index]!;
-      if (field === '') continue;
-      // A rename or copy names its source in the next field.
-      const paths = /^(?:[RC].|.[RC]) /u.test(field) ? [field.slice(3), fields[(index += 1)] ?? ''] : [field.slice(3)];
-      const folder = field.startsWith('?? ') && paths[0]!.endsWith('/') ? paths[0]!.slice(0, -1) : null;
-      if (folder !== null && !isPlaced(folder)) {
-        if (!expand || !placed.some((entry) => entry.path.startsWith(`${folder}/`))) return true;
-        if (uncommitted(status(['--untracked-files=all', '--', folder]), false)) return true;
-        continue;
-      }
-      if (!paths.every(isPlaced)) return true;
+  const untracked = placed.some((entry) => entry.path.includes('/')) ? 'all' : 'normal';
+  const run = spawnSync('git', ['--literal-pathspecs', '-C', lanePath, '-c', 'core.fsmonitor=false', 'status', '--porcelain', '-z', `--untracked-files=${untracked}`],
+    { encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 64 * 1024 * 1024, timeout: 30_000 });
+  if (run.error !== undefined || run.status !== 0) {
+    throw new Error(`cannot read the lane's uncommitted changes (git status): ${run.error?.message ?? run.stderr.trim().slice(0, 200)}`);
+  }
+  const fields = run.stdout.split('\0');
+  for (let index = 0; index < fields.length; index += 1) {
+    const field = fields[index]!;
+    if (field === '') continue;
+    // A rename or copy names its source in the next field; a collapsed
+    // untracked folder ends in `/`.
+    const paths = /^(?:[RC].|.[RC]) /u.test(field) ? [field.slice(3), fields[(index += 1)] ?? ''] : [field.slice(3)];
+    for (const path of paths.map((entry) => entry.replace(/\/$/u, ''))) {
+      const entry = placed.find((candidate) => path === candidate.path || path.startsWith(`${candidate.path}/`));
+      if (entry === undefined) return { detail: null };
+      if (!entry.intact()) return { detail: entry.changed };
     }
-    return false;
-  };
-  return uncommitted(status(['--untracked-files=normal']), true);
+  }
+  return null;
 }
 
 /** A late delivered STATUS after an already-recorded delivery is harmless.
@@ -4193,8 +4296,10 @@ export class WaveRunner {
    * onboarding heist's lane must be clean. The debt names the lane HEAD;
    * null when the job is no onboarding heist or its lane is clean. */
   private onboardingLaneDirtyDebt(jobId: string, lane: Pick<WorktreeLane, 'path' | 'repoPath'>): OnboardingProofDebt | null {
-    if (!this.opts.ledger.isOnboardingJob(jobId) || !laneHasUncommittedChanges(lane.path, lane.repoPath)) return null;
-    return { head: resolveGitCommit(lane.path, 'HEAD'), reason: 'uncommitted' };
+    if (!this.opts.ledger.isOnboardingJob(jobId)) return null;
+    const change = laneUncommittedChange(lane.path, lane.repoPath);
+    if (change === null) return null;
+    return { head: resolveGitCommit(lane.path, 'HEAD'), reason: 'uncommitted', ...(change.detail === null ? {} : { detail: change.detail }) };
   }
 
   private enforceBranchIdle(input: {
@@ -4646,9 +4751,10 @@ export class WaveRunner {
         FALLBACK_ONBOARDING_PROOF_REQUIRED,
       );
     }
-    if (this.onboardingLaneDirtyDebt(input.jobId, lane) !== null) {
+    const dirty = this.onboardingLaneDirtyDebt(input.jobId, lane);
+    if (dirty !== null) {
       throw new FallbackSafetyRefusal(
-        `onboarding job "${input.jobId}"'s lane holds uncommitted changes the proof never ran, and the fallback reviews the working tree — the gate stops before the next review round`,
+        `onboarding job "${input.jobId}"'s lane holds uncommitted changes the proof never ran, and the fallback reviews the working tree — the gate stops before the next review round${dirty.detail === undefined ? '' : ` (${dirty.detail})`}`,
         FALLBACK_ONBOARDING_PROOF_REQUIRED,
       );
     }

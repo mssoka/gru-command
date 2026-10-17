@@ -244,13 +244,16 @@ latest revision → verify → fresh review. The service enforces it centrally.
   bmad-review fallback, which reviews the lane's working tree, needs a passing proof of the
   lane HEAD and a lane with no uncommitted changes the proof never ran (tracked edits or
   untracked files git does not ignore, leaving out the `[[link]]` and `[[copy]]` paths the
-  lane's bootstrap placed while each is still what it placed: a link to the manifest's target,
-  a copy whose bytes equal its source's), at admission and at each iteration. A gate that
-  stops at an iteration for this (its fix left an unproven lane HEAD, a new unproven delivery,
-  or uncommitted changes) aborts with `code: "onboarding-proof-required"` and a hint: the
-  minion commits, pushes and delivers the fix, GC proves the new head, and once that proof
-  passes the Silas digest offers the review again; a self-review request made before then is
-  queued and replayed on the pass (nothing replays the aborted gate itself). Like a pending
+  lane's bootstrap placed while each is still what it placed: a link whose real path is the
+  manifest target's, a copy whose bytes, a folder's recursively, equal its source's in the
+  repository checkout now; a source that cannot be read is a named error, and a copy whose
+  source changed since the lane was made is refused, naming it), at admission and at each
+  iteration. A gate that stops at an iteration for this (its fix left an unproven lane HEAD, a
+  new unproven delivery, or uncommitted changes) aborts with `code:
+  "onboarding-proof-required"` and a hint: the minion commits, pushes and delivers the fix, GC
+  proves the new head, and once that proof passes the Silas digest offers the review again; a
+  self-review request made after the fix was delivered is queued and replayed on that pass
+  (nothing replays the aborted gate itself). Like a pending
   correction, `force` never waives it, and the `409 branch_busy` hint says so (or says the
   minion must deliver again, has not delivered yet, or must commit or discard its lane's
   changes). Every `branch-idle.refused` audit records `forced` (force was

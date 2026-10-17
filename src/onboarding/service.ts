@@ -10,7 +10,7 @@ import type { NotificationCenter } from '../notifications/center.js';
 import { oneLineErrorText } from '../property/error-text.js';
 import { redactCredentials } from '../redaction.js';
 import { displayManagedRepoName, resolveManagedRepoPath, type ManagedRepoPath } from '../repos/managed-names.js';
-import type { VerificationBudget } from '../verify/server.js';
+import { ONBOARDING_PROOF_SCOPE, type VerificationBudget } from '../verify/server.js';
 import { MANIFEST_PATH } from '../worktrees/manifest.js';
 import type { OnboardingProofResult } from './proof-record.js';
 import { onboardingJobId, onboardingKeyOfJob, onboardingRepoKey, onboardingTitle, renderOnboardingBriefing } from './briefing.js';
@@ -30,6 +30,7 @@ import {
   sweepOnboardingProbes,
   type OnboardingProofInput,
   type OnboardingProofOutcome,
+  type UnconfirmedProofSlot,
 } from './proof.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -55,7 +56,9 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * unreadable record, no head to prove, repeated deferrals, a directive that
  * cannot be sent, was retired or went unanswered) gets one action-required
  * row for Gru per episode, naming the current reason, which onboarding
- * closes. Review waits for a pass (LedgerApi.onboardingProofDebt). Proofs
+ * closes; so does a crashed proof's verify slot kept at boot for a process
+ * group nothing confirms is the proof's. Review waits for a pass
+ * (LedgerApi.onboardingProofDebt). Proofs
  * run in every mode: "off" stops new onboarding, never the gate on an open
  * heist.
  */
@@ -69,6 +72,12 @@ export const ONBOARDING_DISPATCH_FAILED_KIND = 'onboarding.dispatch-failed';
 
 /** Gru's attention: one row per stuck (job, head) of an onboarding proof; onboarding closes it. */
 export const ONBOARDING_PROOF_ATTENTION_KIND = 'onboarding.proof-attention';
+/** Gru's attention: a crashed proof's verify slot the boot judge kept, since
+ * a member of its process group lives that nothing confirms is the
+ * proof's; onboarding closes it once the slot is released. */
+export const ONBOARDING_PROOF_SLOT_KIND = 'onboarding.proof-slot-held';
+/** That row's id: one per slot. */
+export const onboardingProofSlotRowId = (runId: string): string => `onboarding-proof-slot:${runId}`;
 /** Failed proofs on one job before a failed head gets a row. */
 export const ONBOARDING_PROOF_FAILURES_FOR_GRU = 3;
 /** Consecutive deferrals of one (job, head) in this process, counted at
@@ -85,12 +94,12 @@ export const ONBOARDING_PROOF_COMMENT_ATTEMPTS = 3;
  * unprocessable): recorded as one that cannot be posted at once, never
  * retried. Throttling never is, whatever its status (a secondary limit or
  * the abuse detection answers 403, content created too fast 422): it is
- * retried once per reconcile and never counts as a failed attempt. */
+ * retried at a later reconcile and never counts as a failed attempt. */
 export const ONBOARDING_PROOF_COMMENT_REFUSED_STATUSES: readonly number[] = [403, 404, 410, 422];
-/** Reconciles (about an hour) in which GitHub throttled a head's comment
- * (counted once per reconcile, apart from failed attempts) before it is
+/** Wall-clock time since GitHub first throttled a head's comment in this
+ * run of the service (a restart starts the clock again) after which it is
  * recorded as one that cannot be posted. */
-export const ONBOARDING_PROOF_COMMENT_THROTTLED_RECONCILES = 12;
+export const ONBOARDING_PROOF_COMMENT_THROTTLE_LIMIT_MS = 2 * 60 * 60_000;
 /** A legacy attempt's comment (an older build recorded the attempt with no
  * nonce) is taken by that build's marker only when GitHub created it
  * within this long after the attempt was recorded. */
@@ -201,12 +210,48 @@ export interface OnboardingServiceOptions {
   readonly log?: Log;
   readonly setInterval?: typeof setInterval;
   readonly clearInterval?: typeof clearInterval;
+  /** The wall clock (default: Date.now); its tests' seam. */
+  readonly now?: () => number;
 }
 
 /** A count toward a limit and the reconcile its last counted event fell in. */
 interface Spaced {
   readonly count: number;
   readonly countedAt: number;
+}
+
+/** GitHub throttling one head's comment in this process: since when, the
+ * reconcile of the last throttle, and the time GitHub named before which
+ * no retry is made (0: none named). */
+interface Throttled {
+  readonly since: number;
+  readonly countedAt: number;
+  readonly notBefore: number;
+}
+
+/** The time a throttled call names for its retry, from its error text: a
+ * `Retry-After` in seconds, or an `X-RateLimit-Reset` epoch; 0 when it
+ * names neither. */
+function retryNotBefore(error: unknown, now: number): number {
+  const text = [error instanceof Error ? error.message : String(error), (error as { readonly causeText?: unknown } | null)?.causeText]
+    .filter((part): part is string => typeof part === 'string').join('\n');
+  const after = /retry-after["']?\s*[:=]?\s*(\d+)/iu.exec(text);
+  const reset = /x-ratelimit-reset["']?\s*[:=]?\s*(\d+)/iu.exec(text);
+  return Math.max(0, after === null ? 0 : now + Number(after[1]) * 1000, reset === null ? 0 : Number(reset[1]) * 1000);
+}
+
+/** A span of wall clock, for a record a person reads. */
+function duration(ms: number): string {
+  const minutes = Math.floor(ms / 60_000);
+  return minutes < 60 ? `${String(minutes)} min` : `${String(Math.floor(minutes / 60))} h ${String(minutes % 60)} min`;
+}
+
+/** A ledger event's time as the ledger writes it (`Date#toISOString`, so
+ * UTC with a `Z`); null for anything else, never a guess. */
+function ledgerTime(ts: string): number | null {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/u.test(ts)) return null;
+  const ms = Date.parse(ts);
+  return Number.isFinite(ms) ? ms : null;
 }
 
 const shown = (repo: string): string => displayManagedRepoName(repo);
@@ -242,8 +287,8 @@ export class OnboardingService {
   private readonly deferrals = new Map<string, Spaced & { readonly head: string; readonly reason: string }>();
   /** Failed comment attempts per `job\nhead`. */
   private readonly commentAttempts = new Map<string, Spaced>();
-  /** Reconciles in which GitHub throttled the comment, per `job\nhead`. */
-  private readonly commentThrottles = new Map<string, Spaced>();
+  /** GitHub throttling the comment, per `job\nhead`. */
+  private readonly commentThrottles = new Map<string, Throttled>();
   /** Directive attempts the lane refused before any row, per `job\nhead`. */
   private readonly directRefusals = new Map<string, Spaced & { readonly reason: string }>();
   /** The reconcile in which a failed head's settled directive was first seen still standing, per `job\nhead`. */
@@ -253,9 +298,12 @@ export class OnboardingService {
   /** Ended jobs with nothing left to follow (rows closed, comments settled): the reconcile skips them. */
   private readonly settledJobs = new Set<string>();
 
+  private readonly now: () => number;
+
   constructor(private readonly opts: OnboardingServiceOptions) {
     this.log = opts.log ?? (() => {});
     this.store = new OnboardingLedger(opts.ledger, this.log);
+    this.now = opts.now ?? Date.now;
   }
 
   get mode(): OnboardingConfig['mode'] {
@@ -704,13 +752,62 @@ export class OnboardingService {
 
   /** Boot, before any proof: end every process a crashed run left carrying
    * this instance's marker, then the verifies it left (their budget slots
-   * are released), then remove its leftover checkouts. */
+   * are released; one kept for a group nothing confirms is the proof's
+   * gets Gru a row), then remove its leftover checkouts. */
   private sweepProbes(proof: OnboardingProofOptions): void {
     this.queueProof(async () => {
       await endOrphanedProbeProcesses(proof.probesDir, this.log);
-      await endOrphanedProofVerifies(proof.budget, proof.probesDir, this.log);
+      for (const slot of await endOrphanedProofVerifies(proof.budget, proof.probesDir, this.log)) this.slotHeld(slot);
       await sweepOnboardingProbes(proof.probesDir, this.log);
     });
+  }
+
+  /** One action-required row for a verify slot the boot judge kept: it
+   * names the process group, the slot and the age limit that releases it.
+   * Recorded before it is posted; onboarding closes it once the slot is
+   * released ({@link closeReleasedSlotRows}). */
+  private slotHeld(slot: UnconfirmedProofSlot): void {
+    const { lease, pgid, ageLimitMs } = slot;
+    const id = onboardingProofSlotRowId(lease.runId);
+    if (this.opts.ledger.getNotification(id) !== null) return;
+    const repo = this.store.jobRepo(lease.jobId);
+    if (!this.store.slotRows().some((row) => row.notificationId === id)) {
+      this.store.record(ONBOARDING_EVENTS.proofSlotHeldPosted, { ...(repo === null ? {} : { repo }), job_id: lease.jobId, run_id: lease.runId, pgid, notification_id: id });
+    }
+    const releasedAt = new Date(lease.grantedAt + ageLimitMs).toISOString();
+    this.opts.notifications.post({
+      id,
+      kind: ONBOARDING_PROOF_SLOT_KIND,
+      routing: 'action-required',
+      severity: 'error',
+      title: `A crashed onboarding proof's verify holds a verification slot${repo === null ? '' : `: ${shown(repo)}`}`,
+      detail: [
+        `Verification budget slot ${lease.runId} (job ${lease.jobId}) still holds the verify of a proof a crash interrupted. Its leader, pid ${String(pgid)}, is gone, but process group ${String(pgid)} still has live members, and none is confirmed the proof's (its marker, or a working directory or command line under the probes folder), so GC does not signal the group: its id may belong to someone else's processes now.`,
+        `The slot stays held until that group is gone or the scheduler's age limit releases it (${duration(ageLimitMs)} after the slot was granted, at ${releasedAt}); until then other verifies may wait for it.`,
+        `If those processes are strays, end them (kill -TERM -- -${String(pgid)}); the next verify's stale check then releases the slot. Onboarding closes this row once the slot is released.`,
+      ].join('\n'),
+    });
+    this.log('error', 'onboarding proof: a crashed proof\'s verify slot is kept for a process group nothing confirms is the proof\'s; Gru has a row', {
+      job: lease.jobId, run: lease.runId, pgid, notification: id, released_at: releasedAt,
+    });
+  }
+
+  /** Close the row of each kept verify slot the budget no longer holds. */
+  private closeReleasedSlotRows(proof: OnboardingProofOptions): void {
+    const open = this.store.slotRows().filter((row) => this.opts.ledger.getNotification(row.notificationId)?.resolvedAt === null);
+    if (open.length === 0) return;
+    let held: ReadonlySet<string>;
+    try {
+      held = new Set(proof.budget().restored(ONBOARDING_PROOF_SCOPE).map((holder) => holder.lease.runId));
+    } catch (error) {
+      this.log('debug', 'onboarding proof: the verification budget is unavailable, so a kept slot\'s row is checked at the next reconcile', { error: oneLineErrorText(error, 400) });
+      return;
+    }
+    for (const row of open) {
+      if (held.has(row.runId)) continue;
+      this.opts.ledger.resolveNotificationById(row.notificationId, 'onboarding-proof');
+      this.log('info', 'onboarding proof: a kept verify slot was released; its row is closed', { run: row.runId, notification: row.notificationId });
+    }
   }
 
   /** Run one step on the service's single proof queue. */
@@ -727,6 +824,7 @@ export class OnboardingService {
    * settled is not read again. */
   private proveAll(): void {
     if (this.opts.proof === undefined) return;
+    this.closeReleasedSlotRows(this.opts.proof);
     for (const jobId of this.store.onboardingJobs()) if (!this.settledJobs.has(jobId)) this.proveSoon(jobId);
   }
 
@@ -911,7 +1009,7 @@ export class OnboardingService {
       // A row of this head closes only once its reason is known to have
       // cleared; with no reason and no known clear it stays as it is.
       const newestSeq = this.opts.ledger.newestDeliveredHead(jobId)?.seq ?? 0;
-      this.closeRows(jobId, (row) => row.head === head && this.reasonCleared(jobId, row, directive, newestSeq), 'the head is no longer stuck');
+      this.closeRows(jobId, (row) => row.head === head && this.reasonCleared(row, directive, newestSeq), 'the head is no longer stuck');
       return;
     }
     this.closeRows(jobId, (row) => row.reason !== first.reason, `the head is stuck for another reason now (${first.reason})`);
@@ -958,33 +1056,23 @@ export class OnboardingService {
    * rows before this). A reason whose evidence lives only in this
    * process's memory never clears because a restart emptied it: a deferral
    * clears only on a proof of its head; an unadmitted directive once the
-   * lane admitted it (live or settled); an unanswered failure on a newer
-   * delivery, or a turn of this proof's own directive taken after the row
-   * (an unrelated directive on the job, Silas's or an ops one, is none).
-   * The other reasons rest on the ledger, so holding no more is their clear.
+   * lane admitted it (live or settled); an unanswered failure only on a
+   * newer delivery (no further directive of a head follows a settled one,
+   * so none can answer the row; an unrelated directive on the job,
+   * Silas's or an ops one, never does). The other reasons rest on the
+   * ledger, so holding no more is their clear.
    */
-  private reasonCleared(jobId: string, row: ProofAttentionRow, directive: DirectiveStanding | null, newestSeq: number): boolean {
+  private reasonCleared(row: ProofAttentionRow, directive: DirectiveStanding | null, newestSeq: number): boolean {
     switch (row.reason) {
       case 'deferred':
         return false;
       case 'unadmitted':
         return directive === 'live' || directive === 'settled';
       case 'unanswered':
-        return newestSeq > row.deliverySeq || (row.head !== null && this.proofDirectiveSince(jobId, row.head, row.postedSeq));
+        return newestSeq > row.deliverySeq;
       default:
         return true;
     }
-  }
-
-  /** Whether the lane took a directive of this head's proof (holder
-   * `onboarding-proof`, one of its request ids), live or settled, accepted
-   * at or after the event seq `seq`. */
-  private proofDirectiveSince(jobId: string, head: string, seq: number): boolean {
-    for (let attempt = 1; attempt <= ONBOARDING_PROOF_DIRECTIVE_ATTEMPTS; attempt += 1) {
-      const row = this.opts.ledger.getDirective(onboardingProofDirectiveId(jobId, head, attempt));
-      if (row !== null && row.claim?.holder === 'onboarding-proof' && row.state !== 'failed' && row.state !== 'retired' && row.baselineSeq >= seq) return true;
-    }
-    return false;
   }
 
   /** A failed head's directive settled while the newest delivery still
@@ -1020,10 +1108,12 @@ export class OnboardingService {
    * that cannot be posted; so, at once, is an unreadable record or one
    * GitHub refuses for good ({@link ONBOARDING_PROOF_COMMENT_REFUSED_STATUSES}).
    * Throttling (a rate limit, the abuse detection, content created too
-   * fast) spends no attempt: it is retried once per reconcile, never on a
-   * trigger between two, logged at warn the first time, and after
-   * {@link ONBOARDING_PROOF_COMMENT_THROTTLED_RECONCILES} throttled
-   * reconciles recorded as one that cannot be posted. An attempt recorded
+   * fast) spends no attempt: it is retried at a later reconcile, never on a
+   * trigger between two and never before a time GitHub named (a
+   * `Retry-After` or `X-RateLimit-Reset` in the error), logged at warn the
+   * first time, and once {@link ONBOARDING_PROOF_COMMENT_THROTTLE_LIMIT_MS}
+   * of wall clock passed since its first throttle in this process,
+   * recorded as one that cannot be posted. An attempt recorded
    * before markers carried a nonce is looked up by the marker that build
    * posted ({@link onboardingProofLegacyMarker}), on a comment created soon
    * after it. */
@@ -1044,12 +1134,28 @@ export class OnboardingService {
     }
     const target = { repo: { host: pr.host, owner: pr.owner, repo: pr.repo }, number: pr.number };
     const key = `${jobId}\n${head}`;
-    // Throttled in this reconcile already: the next one retries it.
-    if (this.commentThrottles.get(key)?.countedAt === this.reconciles) return;
     const settle = (): void => {
       this.commentAttempts.delete(key);
       this.commentThrottles.delete(key);
     };
+    const throttledFor = (throttle: Throttled, reason: string): void => {
+      const span = duration(this.now() - throttle.since);
+      settle();
+      this.store.record(ONBOARDING_EVENTS.proofCommented, { repo, job_id: jobId, head, comment_id: null, comment_url: null,
+        detail: `cannot be posted: GitHub kept throttling the comment for ${span}` }, jobId);
+      this.log('error', `onboarding proof comment cannot be posted: GitHub kept throttling it for ${span}; the proof stands in the ledger and is not posted`, {
+        repo, job: jobId, head, error: reason,
+      });
+    };
+    const throttle = this.commentThrottles.get(key);
+    // Throttled in this reconcile already, or before the time GitHub
+    // named: a later reconcile retries it, within the bound.
+    if (throttle !== undefined && (throttle.countedAt === this.reconciles || this.now() < throttle.notBefore)) {
+      if (throttle.countedAt !== this.reconciles && this.now() - throttle.since >= ONBOARDING_PROOF_COMMENT_THROTTLE_LIMIT_MS) {
+        throttledFor(throttle, 'GitHub named a retry time past the bound');
+      }
+      return;
+    }
     try {
       if (record.attemptNonces.length > 0 || record.legacyAttempts.length > 0) {
         const found = await this.markedComment(target, record, proof);
@@ -1068,21 +1174,19 @@ export class OnboardingService {
     } catch (error) {
       const reason = redactCredentials(oneLineErrorText(error instanceof Error ? error.message : error, 400));
       if (ghRateLimited(error)) {
-        // Throttling spends no attempt and backs off to the next reconcile,
-        // within its own bound.
-        const throttled = this.spaced(this.commentThrottles.get(key));
-        if (throttled.count < ONBOARDING_PROOF_COMMENT_THROTTLED_RECONCILES) {
-          this.commentThrottles.set(key, throttled);
-          this.log(throttled.count === 1 ? 'warn' : 'debug', 'onboarding proof comment not posted: GitHub is throttling GC; the next reconcile retries it (no attempt spent)', {
-            repo, job: jobId, head, throttled_reconciles: throttled.count, error: reason,
-          });
+        // Throttling spends no attempt and backs off to a later reconcile,
+        // within its own wall-clock bound.
+        const now = this.now();
+        const previous = this.commentThrottles.get(key);
+        const throttled: Throttled = { since: previous?.since ?? now, countedAt: this.reconciles, notBefore: retryNotBefore(error, now) };
+        if (now - throttled.since >= ONBOARDING_PROOF_COMMENT_THROTTLE_LIMIT_MS) {
+          throttledFor(throttled, reason);
           return;
         }
-        settle();
-        this.store.record(ONBOARDING_EVENTS.proofCommented, { repo, job_id: jobId, head, comment_id: null, comment_url: null,
-          detail: 'cannot be posted: GitHub kept throttling the comment' }, jobId);
-        this.log('error', `onboarding proof comment cannot be posted: GitHub throttled it in ${String(throttled.count)} reconciles; the proof stands in the ledger and is not posted`, {
-          repo, job: jobId, head, error: reason,
+        this.commentThrottles.set(key, throttled);
+        this.log(previous === undefined ? 'warn' : 'debug', 'onboarding proof comment not posted: GitHub is throttling GC; a later reconcile retries it (no attempt spent)', {
+          repo, job: jobId, head, throttled_for: duration(now - throttled.since),
+          ...(throttled.notBefore > now ? { retry_at: new Date(throttled.notBefore).toISOString() } : {}), error: reason,
         });
         return;
       }
@@ -1117,7 +1221,17 @@ export class OnboardingService {
   private async markedComment(target: { readonly repo: RepoRef; readonly number: number }, record: ProofRecord, proof: OnboardingProofOptions): Promise<GhIssueComment | null> {
     const markers = record.attemptNonces.map((nonce) => onboardingProofMarker(record.jobId, record.head, nonce));
     const legacy = onboardingProofLegacyMarker(record.jobId, record.head);
-    const legacyAt = record.legacyAttempts.map((at) => Date.parse(at));
+    // An attempt time the ledger did not write as it writes one is never
+    // guessed at: its comment is not looked up by the legacy marker.
+    const legacyAt = record.legacyAttempts.flatMap((at) => {
+      const ms = ledgerTime(at);
+      if (ms === null) {
+        this.log('warn', 'onboarding proof: an older build\'s comment attempt has a time GC cannot read, so its comment is not looked up by that build\'s marker', {
+          job: record.jobId, head: record.head, ts: at,
+        });
+      }
+      return ms === null ? [] : [ms];
+    });
     const soonAfterLegacy = (createdAt: string | null): boolean => {
       const created = createdAt === null ? Number.NaN : Date.parse(createdAt);
       return legacyAt.some((at) => created >= at - LEGACY_COMMENT_SKEW_MS && created <= at + ONBOARDING_PROOF_LEGACY_COMMENT_WINDOW_MS);

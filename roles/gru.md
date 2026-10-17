@@ -290,4 +290,8 @@ disposition of it is refused; its detail says why it failed
 episode): its detail says why the head is stuck (a retired turn means a
 continuation hold may need you), and it closes when the head's proof passes, a
 newer head is delivered, the job ends, the head is stuck for another reason
-(a new row names it), or its reason clears.
+(a new row names it), or its reason clears. So does a crashed proof's verify
+slot (`onboarding.proof-slot-held`): GC keeps the slot because a process group
+it cannot confirm as the proof's still lives, and the row names that group, the
+slot and when the age limit frees it. If those processes are strays, ending them
+frees the slot; the row closes once the slot is released.

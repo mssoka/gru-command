@@ -110,7 +110,7 @@ describe('redactCredentials', () => {
     }
   });
 
-  it('masks a key that ends its identifier in secretkey, apikey, privatekey, accesstoken, authtoken, passwd, pwd, password, token or secret, in any case and with or without _ or -; AccessKeyId and keys that only start with one stay (#427)', () => {
+  it('masks a key that ends its identifier in secretkey, apikey, privatekey, passwd, pwd, password, token or secret (so accesstoken and authtoken too), in any case and with or without _ or -; AccessKeyId and keys that only start with one stay (#427)', () => {
     for (const [text, secret] of [
       ['stripeSecretKey: "sk_live_51Habcdef"', 'sk_live_51Habcdef'],
       ['STRIPE_SECRET_KEY=sk_live_51Habcdef', 'sk_live_51Habcdef'],
@@ -132,6 +132,22 @@ describe('redactCredentials', () => {
     }
     for (const kept of ['AccessKeyId=ASIAIOSFODNN7EXAMPLE', 'apiKeyId=abcdef123456', 'publicKey=abcdef123456', 'pwdHash: sha256', 'secretKeys: rotated']) {
       expect(redactCredentials(kept), kept).toBe(kept);
+    }
+  });
+
+  it('leaves the shell\'s own PWD and OLDPWD, a ...PWD assigned a path, and a key a / precedes (a path\'s segment) whole; MYSQL_PWD and the token keys stay masked (#427)', () => {
+    for (const kept of ['PWD=/home/runner/app', 'OLDPWD=/tmp', '+ export PWD=/srv/app/build', 'pwd: /home/runner', 'BUILD_PWD=~/work', 'cat: /etc/passwd: Permission denied']) {
+      expect(redactCredentials(kept), kept).toBe(kept);
+    }
+    for (const [text, secret] of [
+      ['MYSQL_PWD=s3cretpw', 's3cretpw'],
+      ['{"MYSQL_PWD": "hunter22x"}', 'hunter22x'],
+      ['ACCESS_TOKEN=abcdef123456', 'abcdef123456'],
+      ['access_token: "abcdef123456"', 'abcdef123456'],
+      ['x-auth-token: abcdef123456', 'abcdef123456'],
+    ] as const) {
+      expect(redactCredentials(text), text).not.toContain(secret);
+      expect(redactCredentials(text), text).toContain(REDACTION_PLACEHOLDER);
     }
   });
 

@@ -429,6 +429,9 @@ export type OnboardingProofDebtReason = 'no-delivery' | 'no-commit' | 'unproven'
 export interface OnboardingProofDebt {
   readonly head: string | null;
   readonly reason: OnboardingProofDebtReason;
+  /** For `uncommitted`: a path the lane's bootstrap placed that is no
+   * longer what it placed, named with what may have changed it. */
+  readonly detail?: string;
 }
 
 /** Notification routing (SPEC ruling 13; owner routing split 2026-09-23):
@@ -452,6 +455,8 @@ const PRODUCER_RESOLVED_KINDS: Readonly<Record<string, string>> = {
   'onboarding.dispatch-failed': 'a dispatched onboarding heist, or a scan that finds none is needed',
   // #427 PR 1b: one row per stuck (job, head); onboarding closes it.
   'onboarding.proof-attention': 'a passing proof, a newer delivered head, or the onboarding job ending',
+  // #427 PR 1b: a crashed proof's verify slot the boot judge kept; onboarding closes it.
+  'onboarding.proof-slot-held': 'the slot being released',
 };
 
 // The alias d is an immutable delivery. A protected root must cite its

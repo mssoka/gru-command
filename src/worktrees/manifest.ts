@@ -379,12 +379,14 @@ const SETUP_OUTPUT_TAIL_BYTES = 64 * 1024;
 const SETUP_KILL_GRACE_MS = 1_000;
 
 /** Bounded tail buffer for captured setup output (a chatty command must
- * never grow the service's memory unboundedly). */
-class OutputTail {
+ * never grow the service's memory unboundedly). Exported for its tests. */
+export class OutputTail {
   private readonly chunks: Buffer[] = [];
   private bytes = 0;
   /** Earlier output was dropped: the text starts mid-stream. */
   private dropped = false;
+  /** The last chunk dropped ended at a line break (or none was). */
+  private startsAtLine = true;
 
   push(chunk: Buffer): void {
     this.chunks.push(chunk);
@@ -394,6 +396,7 @@ class OutputTail {
       if (dropped === undefined) return;
       this.bytes -= dropped.length;
       this.dropped = true;
+      this.startsAtLine = dropped.at(-1) === 0x0a;
     }
   }
 
@@ -402,7 +405,7 @@ class OutputTail {
   }
 
   stream(): SetupStreamTail {
-    return { text: this.text(), truncated: this.dropped };
+    return { text: this.text(), truncated: this.dropped, startsAtLine: this.startsAtLine };
   }
 }
 
@@ -411,6 +414,9 @@ export interface SetupStreamTail {
   readonly text: string;
   /** Earlier output was dropped: the text starts mid-stream. */
   readonly truncated: boolean;
+  /** The text starts at a whole line: nothing was dropped, or what was
+   * dropped ended at a line break. */
+  readonly startsAtLine: boolean;
 }
 
 /** A setup command failed, timed out or was stopped. The message names it

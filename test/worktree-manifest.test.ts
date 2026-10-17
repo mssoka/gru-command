@@ -5,6 +5,7 @@ import {
   applyWorktreeManifest,
   loadWorktreeManifest,
   MANIFEST_PATH,
+  OutputTail,
   parseWorktreeManifest,
   resolveVerifyCommand,
 } from '../src/worktrees/manifest.js';
@@ -302,5 +303,19 @@ describe('worktree bootstrap manifest (E8, ruling 18a)', () => {
     } finally {
       repo.cleanup();
     }
+  });
+
+  it('the setup output keeper records whether the output it dropped ended at a line break, so a kept short line counts as whole only then (#427)', () => {
+    const fresh = new OutputTail();
+    expect(fresh.stream()).toEqual({ text: '', truncated: false, startsAtLine: true });
+    const tail = new OutputTail();
+    tail.push(Buffer.from(`${'a'.repeat(40 * 1024)}\n`));
+    tail.push(Buffer.from('b'.repeat(30 * 1024)));
+    // Past 64 KiB: the first chunk, which ended at a line break, is dropped.
+    expect(tail.stream()).toMatchObject({ truncated: true, startsAtLine: true });
+    expect(tail.stream().text).toBe('b'.repeat(30 * 1024));
+    tail.push(Buffer.from(`${'c'.repeat(40 * 1024)}\n`));
+    // Now the dropped chunk ended mid-line: the kept text's first line is not whole.
+    expect(tail.stream()).toMatchObject({ truncated: true, startsAtLine: false });
   });
 });

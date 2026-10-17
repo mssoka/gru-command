@@ -33,6 +33,8 @@ export const ONBOARDING_EVENTS = {
   proofCommented: 'onboarding.proof-commented',
   /** Gru's attention row for one stuck (job, head) episode was posted, with its reason; a job event. */
   proofAttentionPosted: 'onboarding.proof-attention-posted',
+  /** Gru's row for a crashed proof's verify slot the boot judge kept was posted (its repository when known). */
+  proofSlotHeldPosted: 'onboarding.proof-slot-held-posted',
 } as const;
 
 export const ONBOARDING_EVENT_KINDS: readonly string[] = Object.values(ONBOARDING_EVENTS);
@@ -89,6 +91,13 @@ export interface ProofAttentionRow {
   readonly postedSeq: number;
 }
 
+/** One row onboarding posted for Gru about a verify slot the boot judge kept. */
+export interface ProofSlotRow {
+  readonly notificationId: string;
+  /** The budget slot's run id. */
+  readonly runId: string;
+}
+
 export class OnboardingRecordError extends Error {
   constructor(message: string) {
     super(message);
@@ -121,6 +130,8 @@ export class OnboardingLedger {
   private readonly proofs = new Map<string, ProofRecord[]>();
   /** Per job, the attention rows posted for it, oldest first. */
   private readonly attention = new Map<string, ProofAttentionRow[]>();
+  /** The kept verify slots' rows, oldest first. */
+  private readonly slots: ProofSlotRow[] = [];
 
   constructor(private readonly ledger: LedgerApi, private readonly log: (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void = () => {}) {}
 
@@ -179,6 +190,12 @@ export class OnboardingLedger {
     return this.attention.get(jobId) ?? [];
   }
 
+  /** The rows posted for kept verify slots, oldest first. */
+  slotRows(): readonly ProofSlotRow[] {
+    this.refresh();
+    return this.slots;
+  }
+
   private updateProof(payload: Payload, change: (proof: ProofRecord) => ProofRecord): void {
     const jobId = text(payload, 'job_id');
     const head = text(payload, 'head');
@@ -207,6 +224,12 @@ export class OnboardingLedger {
   }
 
   private apply(kind: string, payload: Payload, ts: string, seq: number): void {
+    if (kind === ONBOARDING_EVENTS.proofSlotHeldPosted) {
+      // A slot's job may not be one an `onboarding.dispatched` event names.
+      const row = { notificationId: text(payload, 'notification_id'), runId: text(payload, 'run_id') };
+      if (!this.slots.some((entry) => entry.notificationId === row.notificationId)) this.slots.push(row);
+      return;
+    }
     const repo = text(payload, 'repo');
     const current = this.repos.get(repo) ?? empty(repo);
     switch (kind) {

@@ -766,6 +766,11 @@ export class VerificationScheduler {
     return Math.max(1, Math.floor(this.workerBudget / this.concurrencyLimit));
   }
 
+  /** How long after its grant a held slot is released as stale (`max-age`). */
+  get staleMaxAge(): number {
+    return this.staleMaxAgeMs;
+  }
+
   activeCount(): number {
     return this.slots.size;
   }

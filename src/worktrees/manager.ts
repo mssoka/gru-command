@@ -216,9 +216,10 @@ function execFileBounded(bin: string, args: readonly string[], timeoutMs: number
 }
 
 /** {@link processCwds} off the event loop: Linux `/proc`, macOS `lsof`
- * (bounded); null on any other platform. A failed or timed-out `lsof`
- * rejects: an async caller logs it rather than lose the cwd evidence
- * silently ({@link psEnumeratorAsync}). */
+ * (bounded); null on any other platform. Rejects when the listing fails
+ * (`/proc` cannot be read, `lsof` failed or timed out), so its caller is
+ * told ({@link psEnumeratorAsync}'s `onCwdError`) rather than lose the cwd
+ * evidence silently. */
 async function processCwdsAsync(timeoutMs: number): Promise<Map<number, string> | null> {
   if (process.platform === 'linux') {
     const cwds = new Map<number, string>();
@@ -249,22 +250,25 @@ async function processCwdsAsync(timeoutMs: number): Promise<Map<number, string> 
 
 /** {@link psEnumerator} off the event loop, each listing bounded by
  * `timeoutMs` (#427 onboarding proof: a slow `lsof` on a loaded host must
- * not stall the service). Rejects when `ps` fails or times out; when only
- * the working directories cannot be listed (`lsof` failed or timed out),
- * `onCwdError` is told and the argv matches still count, as the
- * synchronous enumerator's null cwds do. That enumerator, which the sweep
- * uses, is unchanged. */
+ * not stall the service). Rejects when `ps` fails or times out, whatever
+ * the working directories did. When `ps` answered and only the working
+ * directories cannot be listed (`/proc` unreadable, `lsof` failed or timed
+ * out), `onCwdError` is told and the argv matches still count, as the
+ * synchronous enumerator's null cwds do: never silently. That enumerator,
+ * which the sweep uses, is unchanged. `listCwds`: its tests' seam. */
 export async function psEnumeratorAsync(treePath: string, opts: {
   readonly timeoutMs?: number;
-  readonly onCwdError?: (error: unknown) => void;
-} = {}): Promise<readonly TreeProcess[]> {
+  readonly onCwdError: (error: unknown) => void;
+  readonly listCwds?: (timeoutMs: number) => Promise<Map<number, string> | null>;
+}): Promise<readonly TreeProcess[]> {
   const timeoutMs = opts.timeoutMs ?? 30_000;
-  const cwds = processCwdsAsync(timeoutMs).catch((error: unknown) => {
-    opts.onCwdError?.(error);
-    return null;
-  });
-  const [out, resolved] = await Promise.all([execFileBounded('ps', ['-axo', 'pid=,command='], timeoutMs), cwds]);
-  return treeProcesses(treePath, out, resolved);
+  const [listed, cwds] = await Promise.allSettled([
+    execFileBounded('ps', ['-axo', 'pid=,command='], timeoutMs),
+    (opts.listCwds ?? processCwdsAsync)(timeoutMs),
+  ]);
+  if (listed.status === 'rejected') throw listed.reason instanceof Error ? listed.reason : new Error(String(listed.reason));
+  if (cwds.status === 'rejected') opts.onCwdError(cwds.reason);
+  return treeProcesses(treePath, listed.value, cwds.status === 'fulfilled' ? cwds.value : null);
 }
 
 export interface SweepPreservation {

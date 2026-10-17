@@ -95,6 +95,9 @@ export interface VerificationBudget {
   restored(scope: string): readonly { readonly lease: VerificationLease; readonly pid: number; readonly processCommand: string | null }[];
   release(lease: VerificationLease): void;
   readonly workersPerRun: number;
+  /** The scheduler's age limit: a slot held this long after its grant is
+   * released as stale at the next stale check. */
+  readonly ageLimitMs: number;
 }
 
 /**
@@ -601,6 +604,9 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
         release: (lease) => scheduler.release(lease),
         get workersPerRun() {
           return scheduler.workersPerRun;
+        },
+        get ageLimitMs() {
+          return scheduler.staleMaxAge;
         },
       };
     },

@@ -3,7 +3,7 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, 
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_SILAS_CONFIG, loadConfig, type Role } from '../src/config.js';
 import {
@@ -51,10 +51,13 @@ import {
 } from '../src/onboarding/proof.js';
 import {
   ONBOARDING_PROOF_ATTENTION_KIND,
+  ONBOARDING_PROOF_COMMENT_THROTTLE_LIMIT_MS,
+  ONBOARDING_PROOF_SLOT_KIND,
   ONBOARDING_PROPOSAL_KIND,
   OnboardingService,
   onboardingProofAttentionId,
   onboardingProofDirectiveId,
+  onboardingProofSlotRowId,
   type OnboardingProofDirective,
 } from '../src/onboarding/service.js';
 import { VerificationLockTimeoutError, VerificationScheduler, type VerificationRecord } from '../src/verify/scheduler.js';
@@ -62,10 +65,11 @@ import { createVerificationServer, ONBOARDING_PROOF_SCOPE, type VerificationBudg
 import { FROZEN_SPEC_MAX_BYTES } from '../src/dispatch/perkins-review/artifacts.js';
 import { appendCiEvidence, CI_EVIDENCE_OMITTED_NOTICE } from '../src/review-inputs/ci-evidence.js';
 import type { ManagedRepoPath } from '../src/repos/managed-names.js';
-import { loadWorktreeManifest, ReservedVerifyScopeError, WorktreeSetupError } from '../src/worktrees/manifest.js';
+import { applyWorktreeManifest, loadWorktreeManifest, ReservedVerifyScopeError, WorktreeSetupError, type SetupStreamTail } from '../src/worktrees/manifest.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { GitReviewPort } from './helpers/git-review-port.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
+import { psEnumeratorAsync } from '../src/worktrees/manager.js';
 import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 
 /**
@@ -560,7 +564,7 @@ describe('the proof (real checkout, setup and leased verify)', () => {
     expect(straddling.outputTail).not.toContain(BODY);
     expect(straddling.outputTail).toContain('[REDACTED]');
     expect(straddling.outputTail.endsWith('after the key\n')).toBe(true);
-    // The BEGIN line lies before the window: the dangling END redacts from the window's start.
+    // The BEGIN line lies more than 16 KiB before the end: the output, kept whole, is redacted before the window is cut.
     const dangling = proven(await (await proofLane(`[verify]\nfull = '''${keyLines(340)}; echo after the key; exit 1'''\n`)).prove());
     expect(dangling.outputTail).not.toContain(BODY);
     expect(dangling.outputTail).toBe('[REDACTED]\nafter the key\n');
@@ -575,7 +579,7 @@ describe('the proof (real checkout, setup and leased verify)', () => {
     expect(short.outputTail.endsWith('token=x\n')).toBe(true);
   });
 
-  it('PKCS#8 keys (a bare PRIVATE KEY header) are redacted when they straddle the 4 KiB cut and when their BEGIN line fell before the window', async () => {
+  it('PKCS#8 keys (a bare PRIVATE KEY header) are redacted when they straddle the 4 KiB cut and when their BEGIN line lies more than the 16 KiB window before the end', async () => {
     const BODY = 'MIIEvQIBADANBgkqhkiG9w0BAQ';
     const keyLines = (count: number): string =>
       `echo "-----BEGIN PRIVATE KEY-----"; i=0; while [ $i -lt ${String(count)} ]; do echo "${BODY}$i abcdefghijklmnopqrstuvwxyz0123456789"; i=$((i+1)); done; echo "-----END PRIVATE KEY-----"`;
@@ -597,44 +601,65 @@ describe('the proof (real checkout, setup and leased verify)', () => {
     expect(renderOnboardingProofDirective(readOnboardingProof(payload)!)).toContain('registry auth failed for [REDACTED]');
   });
 
-  it('A final output line longer than the tail never shows a fragment a mid-line cut split, on the verify path and the setup path: none of that line is shown, only a note that it is not, since the cut may fall inside a key\'s name', async () => {
+  it('A final output line longer than the window, kept whole, is redacted before it is cut and keeps its last bytes from a word after a mid-line note, on the verify path and the setup path; a line with no word boundary shows only a note', async () => {
     // 64 hex characters no redaction knows: the 4 KiB cut falls 20 characters before its end.
     const SECRET = 'deadbeef'.repeat(8);
     const words = `head -c 16000 /dev/zero | tr '\\000' x; printf ' %s ' ${SECRET}; head -c 4044 /dev/zero | tr '\\000' z; echo; exit 1`;
     const bare = 'head -c 20480 /dev/zero | tr \'\\000\' x; echo; exit 1';
-    const tails: string[] = [];
     for (const manifest of [`[verify]\nfull = '''${words}'''\n`, `[[setup]]\ncommand = '''${words}'''\n[verify]\nfull = "echo never"\n`]) {
       const result = proven(await (await proofLane(manifest)).prove());
       expect(result.passed).toBe(false);
       expect(result.outputTail).not.toContain(SECRET.slice(-20));
-      expect(result.outputTail).toBe('(last line longer than 16 KiB, not shown)\n');
-      tails.push(result.outputTail);
+      expect(result.outputTail).toBe(`(output tail starts mid-line)\n${'z'.repeat(4044)}\n`);
     }
     for (const manifest of [`[verify]\nfull = '''${bare}'''\n`, `[[setup]]\ncommand = '''${bare}'''\n[verify]\nfull = "echo never"\n`]) {
       const result = proven(await (await proofLane(manifest)).prove());
       expect(result.passed).toBe(false);
       expect(result.outputTail).toBe('(last line longer than 16 KiB, not shown)\n');
     }
-    expect(tails).toHaveLength(2);
   });
 
-  it('A window that starts mid-stream is redacted whole before its first line or word is dropped, so a key never parts from its value: a truncated stream whose kept text is one JSON line records no password, on the verify path and the setup path', () => {
-    const json = '{"password": "hunter22x", "host": "db"}';
-    for (const text of [`${json}\n`, json]) {
-      // The verify path: its one stream's latest output.
-      expect(recordedTail([{ text, truncated: true }]), text).not.toContain('hunter22x');
-      // The setup path: the failure keeps each stream's raw tail, earlier chunks dropped.
-      const setup = splitFailure(new WorktreeSetupError('worktree setup command exited 1\noutput tail:\n(not recorded)', {
-        stdout: { text, truncated: true }, stderr: { text: '', truncated: false },
-      }));
-      expect(setup.reason).toBe('worktree setup command exited 1');
-      expect(setup.tail, text).not.toContain('hunter22x');
+  it('A jest --json-style report (one line, 30 KiB, no newline) keeps its evidence on the verify path and the setup path: its last bytes from a word, its password redacted', async () => {
+    const report = `printf '{"numFailedTests":1,"testResults":[{"message":"'; yes 'ok test passed' | head -c 30000 | tr '\\n' ' '; printf '","password":"hunter22x","failureMessages":["expected 200 received 401 at api.test.ts:12"]}],"success":false}'; exit 1`;
+    for (const manifest of [`[verify]\nfull = '''${report}'''\n`, `[[setup]]\ncommand = '''${report}'''\n[verify]\nfull = "echo never"\n`]) {
+      const result = proven(await (await proofLane(manifest)).prove());
+      expect(result.passed).toBe(false);
+      expect(result.outputTail).toMatch(/^\(output tail starts mid-line\)\n(?:(?:ok )?test )?passed /u);
+      expect(result.outputTail).not.toContain('hunter22x');
+      expect(result.outputTail.endsWith('","[REDACTED],"failureMessages":["expected 200 received 401 at api.test.ts:12"]}],"success":false}')).toBe(true);
+      expect(Buffer.byteLength(result.outputTail, 'utf8')).toBeLessThanOrEqual(4 * 1024);
     }
-    // A line the cut split shows none of itself: the cut may fall inside a
-    // key's name (`sword": "…"`), which no redaction pattern recognises.
-    expect(recordedTail([{ text: `${json}\n`, truncated: true }])).toBe('(last line longer than 1 KiB, not shown)\n');
-    expect(recordedTail([{ text: 'sword": "hunter22x", "host": "db"}\n', truncated: true }])).not.toContain('hunter22x');
-    expect(recordedTail([{ text: 'ken_backhalf and the rest\nnext line\n', truncated: true }])).toBe('next line\n');
+  });
+
+  it('A stream kept whole is redacted before any cut: an untruncated 20 KiB one-line JSON keeps its last bytes from a word, its password redacted', () => {
+    const json = `{"results": "${'test passed '.repeat(1750)}", "password": "hunter22x", "message": "expected 200 received 401"}`;
+    expect(Buffer.byteLength(json, 'utf8')).toBeGreaterThan(20 * 1024);
+    const tail = recordedTail([{ text: json, truncated: false, startsAtLine: true }]);
+    expect(tail).toMatch(/^\(output tail starts mid-line\)\n(?:test )?passed /u);
+    expect(tail).not.toContain('hunter22x');
+    expect(tail.endsWith('", "[REDACTED], "message": "expected 200 received 401"}')).toBe(true);
+    expect(Buffer.byteLength(tail, 'utf8')).toBeLessThanOrEqual(4 * 1024);
+  });
+
+  it('A window whose start was dropped upstream never shows a fragment that cut made: mid-line, its first line goes after redaction, and with no line break only a note is left; at a line, its whole short line stays with no size note', () => {
+    const setupTail = (stdout: SetupStreamTail): string => splitFailure(new WorktreeSetupError('worktree setup command exited 1\noutput tail:\n(not recorded)', {
+      stdout, stderr: { text: '', truncated: false, startsAtLine: true },
+    })).tail;
+    // The upstream cut fell inside a key's name (`sword": …`) and no line break follows: nothing of it is shown.
+    for (const text of ['sword": "hunter22x", "host": "db"}', '{"password": "hunter22x", "host": "db"}']) {
+      const stream = { text, truncated: true, startsAtLine: false };
+      expect(recordedTail([stream]), text).toBe('(output before this was cut mid-line; not shown)\n');
+      expect(setupTail(stream), text).toBe('(output before this was cut mid-line; not shown)\n');
+    }
+    // With a line break, only the split first line goes.
+    expect(recordedTail([{ text: 'sword": "hunter22x", "host": "db"}\nnext line\n', truncated: true, startsAtLine: false }])).toBe('next line\n');
+    expect(recordedTail([{ text: 'sword": "hunter22x"\n', truncated: true, startsAtLine: false }])).toBe('(output before this was cut mid-line; not shown)\n');
+    // The dropped output ended at a line break: the short line left is whole and kept.
+    const e401 = { text: 'npm ERR! code E401\n', truncated: true, startsAtLine: true };
+    expect(recordedTail([e401])).toBe('npm ERR! code E401\n');
+    expect(setupTail(e401)).toBe('npm ERR! code E401\n');
+    // A whole line that holds a key is redacted, not dropped.
+    expect(recordedTail([{ text: '{"password": "hunter22x", "host": "db"}\n', truncated: true, startsAtLine: true }])).toBe('{"[REDACTED], "host": "db"}\n');
   });
 
   it('A service a [[setup]] command starts lives through verify.full, which uses it; once verify ran its group is ended, before anything is measured, and nothing is left', async () => {
@@ -843,30 +868,47 @@ describe('the proof (real checkout, setup and leased verify)', () => {
     expect(logs.filter((entry) => entry.msg.includes('could not be listed;'))).toEqual([]);
   });
 
-  it('The Linux marker listing is bounded as a whole: a pid whose environment read hangs is abandoned, never awaited, and the listing fails naming its bound', async () => {
+  it('The Linux marker listing is bounded as a whole: a pid whose environment read hangs is abandoned, named once at warn, and never read again, so the next pass skips it and completes', async () => {
     const reads: number[] = [];
     const read = (pid: number): Promise<string> => {
       reads.push(pid);
       return pid === 22 ? new Promise<string>(() => {}) : Promise.resolve(`PATH=/bin\0${ONBOARDING_PROBE_ENV}=abc.def\0`);
     };
     const ours = (marker: string): boolean => marker === 'abc.def';
-    await expect(environMarkedPids([11, 22, 33], ours, () => {}, { timeoutMs: 50, read })).rejects.toThrow(/could not be read within 50 ms/u);
+    const hung = new Set<number>();
+    const logs: { readonly level: string; readonly msg: string; readonly pid: unknown }[] = [];
+    const log = (level: string, msg: string, fields?: Record<string, unknown>): void => { logs.push({ level, msg, pid: fields?.['pid'] }); };
+    await expect(environMarkedPids([11, 22, 33], ours, log, { timeoutMs: 50, read, hung })).rejects.toThrow(/could not be read within 50 ms/u);
     expect(reads).toEqual([11, 22]);
-    // With no read hanging, the same pass names every marked pid.
-    expect(await environMarkedPids([11, 33], ours, () => {}, { timeoutMs: 50, read })).toEqual([11, 33]);
+    expect([...hung]).toEqual([22]);
+    // The next passes skip the hung pid, start no second read on it, and complete.
+    expect(await environMarkedPids([11, 22, 33], ours, log, { timeoutMs: 50, read, hung })).toEqual([11, 33]);
+    expect(await environMarkedPids([22, 33], ours, log, { timeoutMs: 50, read, hung })).toEqual([33]);
+    expect(reads.filter((pid) => pid === 22)).toHaveLength(1);
+    expect(logs.filter((entry) => entry.level === 'warn')).toEqual([{ level: 'warn', msg: expect.stringContaining('reading a process\'s environment hung'), pid: 22 }]);
   });
+
+  /** Stub process.kill for fake targets: a signal-0 probe answers whether
+   * one lives, and every other signal is recorded. */
+  const fakeKill = (targets: readonly number[], lives: (target: number) => boolean, signals: (readonly [number, string | number, number])[]): { mockRestore(): void } => {
+    const kill = process.kill.bind(process);
+    return vi.spyOn(process, 'kill').mockImplementation((target: number, signal?: string | number) => {
+      if (!targets.includes(target)) return kill(target, signal);
+      if (signal === 0) {
+        if (!lives(target)) throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
+        return true;
+      }
+      signals.push([target, signal ?? 'SIGTERM', Date.now()]);
+      return true;
+    });
+  };
 
   it('Waiting for a kill lists the process table once per poll for every target: forty targets that live through two listings take three listings in all', async () => {
     const pids = Array.from({ length: 20 }, (_, index) => 4_000_000 + index);
     // Twenty processes and twenty process groups (a negated pgid).
     const targets = [...pids, ...pids.map((pid) => -(pid + 100))];
-    const signals: (readonly [number, string | number])[] = [];
-    const kill = process.kill.bind(process);
-    const spy = vi.spyOn(process, 'kill').mockImplementation((target: number, signal?: string | number) => {
-      if (!targets.includes(target)) return kill(target, signal);
-      if (signal !== 0) signals.push([target, signal ?? 'SIGTERM']);
-      return true;
-    });
+    const signals: (readonly [number, string | number, number])[] = [];
+    const spy = fakeKill(targets, () => true, signals);
     let listings = 0;
     const table = async (): Promise<readonly { readonly pid: number; readonly pgid: number; readonly zombie: boolean }[]> => {
       listings += 1;
@@ -874,13 +916,101 @@ describe('the proof (real checkout, setup and leased verify)', () => {
       return [...pids.map((pid) => ({ pid, pgid: pid, zombie: false })), ...pids.map((pid) => ({ pid: pid + 200, pgid: pid + 100, zombie: false }))];
     };
     try {
-      expect(await endProcesses(targets, 0, table)).toEqual([]);
+      expect(await endProcesses(targets, 0, { table })).toEqual([]);
     } finally {
       spy.mockRestore();
     }
     expect(listings).toBe(3);
     expect(signals.filter(([, signal]) => signal === 'SIGTERM')).toHaveLength(40);
     expect(signals.filter(([, signal]) => signal === 'SIGKILL')).toHaveLength(40);
+  });
+
+  it('A first listing slower than the grace and the settle wait together still leaves the settle wait after SIGKILL: a target that dies soon after it is found gone, never reported as outliving SIGKILL', async () => {
+    const target = 4_100_000;
+    const signals: (readonly [number, string | number, number])[] = [];
+    let killedAt: number | null = null;
+    // It dies 150 ms after SIGKILL; until then every listing and judge sees it.
+    const dead = (): boolean => killedAt !== null && Date.now() - killedAt >= 150;
+    const spy = fakeKill([target], () => !dead(), signals);
+    let listings = 0;
+    const table = async (): Promise<readonly { readonly pid: number; readonly pgid: number; readonly zombie: boolean }[]> => {
+      listings += 1;
+      // The first listing answers only after grace plus settle have passed.
+      if (listings === 1) await pause(600);
+      return dead() ? [] : [{ pid: target, pgid: target, zombie: false }];
+    };
+    let judged = 0;
+    try {
+      const left = endProcesses([target], 50, { table, settleMs: 400, pollListingMs: 100, judge: async () => { judged += 1; return false; } });
+      await until(() => signals.some(([, signal]) => signal === 'SIGKILL'), 'the SIGKILL');
+      killedAt = signals.find(([, signal]) => signal === 'SIGKILL')![2];
+      expect(await left).toEqual([]);
+    } finally {
+      spy.mockRestore();
+    }
+    // The slow listing was never started again: the polls after it waited on it, then went by kill(…, 0).
+    expect(listings).toBe(1);
+    expect(judged).toBe(0);
+    expect(signals.map(([, signal]) => signal)).toEqual(['SIGTERM', 'SIGKILL']);
+  });
+
+  it('The settle deadline ends the wait for a target that never dies, bounded, whether the table lists it alive, never answers, or cannot be read (each then judged on its own)', async () => {
+    const target = 4_200_000;
+    const signals: (readonly [number, string | number, number])[] = [];
+    const spy = fakeKill([target], () => true, signals);
+    try {
+      let listings = 0;
+      const listsAlive = async (): Promise<readonly { readonly pid: number; readonly pgid: number; readonly zombie: boolean }[]> => {
+        listings += 1;
+        return [{ pid: target, pgid: target, zombie: false }];
+      };
+      const started = Date.now();
+      expect(await endProcesses([target], 0, { table: listsAlive, settleMs: 300, pollListingMs: 100 })).toEqual([target]);
+      expect(Date.now() - started).toBeLessThan(2_000);
+      expect(listings).toBeLessThanOrEqual(300 / 100 + 2);
+      // A table that never answers: one listing in all, the polls go by kill(…, 0), and the deadline ends it.
+      let hung = 0;
+      const never = (): Promise<readonly { readonly pid: number; readonly pgid: number; readonly zombie: boolean }[]> => {
+        hung += 1;
+        return new Promise(() => {});
+      };
+      const again = Date.now();
+      expect(await endProcesses([target], 0, { table: never, settleMs: 300, pollListingMs: 100 })).toEqual([target]);
+      expect(Date.now() - again).toBeLessThan(2_000);
+      expect(hung).toBe(1);
+      // A table that cannot be read: each target is judged on its own (as `ps -o stat=` would), and a zombie counts as gone.
+      const unreadable = async (): Promise<never> => { throw new Error('ps could not list -A'); };
+      const judged: number[] = [];
+      expect(await endProcesses([target], 0, { table: unreadable, settleMs: 300, pollListingMs: 100, judge: async (t) => { judged.push(t); return judged.length > 1; } })).toEqual([]);
+      expect(judged).toEqual([target, target]);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(signals.filter(([, signal]) => signal === 'SIGKILL')).toHaveLength(3);
+  });
+
+  it('The rooted listing never degrades silently: a ps failure rejects (the working directories are not blamed), and a working-directory listing that fails (as /proc can on Linux) is told and the command-line matches still count', async () => {
+    const tree = temp('gru-onboarding-proof-rooted-');
+    const orphan = spawn('/bin/sh', ['-c', 'sleep 30; true', join(tree, 'service')], { cwd: tmpdir(), detached: true, stdio: 'ignore' });
+    closers.push(() => { try { process.kill(-orphan.pid!, 'SIGKILL'); } catch { /* already ended */ } });
+    await until(() => alive(orphan.pid!), 'the process');
+    const told: unknown[] = [];
+    const failingCwds = async (): Promise<never> => { throw new Error('/proc could not be read'); };
+    const matched = await psEnumeratorAsync(tree, { timeoutMs: 10_000, onCwdError: (error) => { told.push(error); }, listCwds: failingCwds });
+    expect(matched.map((entry) => entry.pid)).toContain(orphan.pid);
+    expect(told).toEqual([expect.objectContaining({ message: '/proc could not be read' })]);
+    // ps itself fails: the listing rejects, and nothing says the command lines alone matched.
+    const fakeBin = temp('gru-onboarding-proof-ps-');
+    writeFileSync(join(fakeBin, 'ps'), '#!/bin/sh\necho "ps: cannot list" >&2\nexit 1\n', { mode: 0o755 });
+    const path = process.env['PATH'];
+    process.env['PATH'] = `${fakeBin}:${path ?? ''}`;
+    const toldAgain: unknown[] = [];
+    try {
+      await expect(psEnumeratorAsync(tree, { timeoutMs: 10_000, onCwdError: (error) => { toldAgain.push(error); }, listCwds: failingCwds })).rejects.toThrow(/^ps failed/u);
+    } finally {
+      process.env['PATH'] = path;
+    }
+    expect(toldAgain).toEqual([]);
   });
 
   it('LFS parity with the repository\'s own config: its local lfs.storage, URL rewrites, http and credential entries reach the probe, and its origin replaces the clone\'s, with no copied value logged', async () => {
@@ -1246,6 +1376,44 @@ describe('the proof\'s budget slot across a restart', () => {
     expect(brokenLogs).toContainEqual({ level: 'error', msg: expect.stringContaining('could not be judged or ended') });
   });
 
+  it('a slot the boot judge keeps for a group nothing confirms is the proof\'s gets Gru one action-required row naming the group, the slot and the age limit; a restart posts no second one, and onboarding closes it once the slot is released', async () => {
+    const config = verifyConfig();
+    const h = serviceHarness();
+    onboardingJob(h.ledger);
+    const crashed = new VerificationScheduler({ storageDir: join(config.dataDir, 'verify'), limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 1_000, runTimeoutMs: 60_000 } });
+    closers.push(() => crashed.dispose());
+    const lease = await crashed.acquire({ jobId: JOB, scope: ONBOARDING_PROOF_SCOPE, command: 'make test', cwd: config.dataDir, head: H1 });
+    // The member runs outside the probes folder with no marker: nothing confirms it is the proof's.
+    const { leader, member, argv } = await groupWithLostLeader(temp('gru-onboarding-proof-elsewhere-'));
+    crashed.bindPid(lease, leader, argv, { leadsGroup: true });
+    const server = createVerificationServer({ config, ledger: h.ledger, worktrees: new InMemoryWorktreePort(temp('gru-onboarding-proof-wt-'), h.ledger) });
+    closers.push(() => server.dispose());
+    h.budget = () => server.budget();
+    const service = await started(h.service());
+    expect(server.view()).toMatchObject({ lockInUse: true });
+    const id = onboardingProofSlotRowId(lease.runId);
+    const row = h.ledger.getNotification(id);
+    expect(row).toMatchObject({ kind: ONBOARDING_PROOF_SLOT_KIND, routing: 'action-required', severity: 'error', resolvedAt: null });
+    expect(row!.title).toContain('fixture-app');
+    expect(row!.detail).toContain(`slot ${lease.runId} (job ${JOB})`);
+    expect(row!.detail).toContain(`process group ${String(leader)} still has live members`);
+    expect(row!.detail).toContain(`at ${new Date(lease.grantedAt + server.budget().ageLimitMs).toISOString()})`);
+    expect(row!.detail).toContain(`kill -TERM -- -${String(leader)}`);
+    // Gru cannot dispose of it: only the slot's release closes it.
+    expect(() => h.ledger.disposeMachineNotification(id, 'looked at it')).toThrow(MachineDispositionRefusedError);
+    // A restart judges the slot again and keeps it: still one row, still open.
+    service.stop();
+    const restarted = await started(h.service());
+    expect(h.ledger.listNotifications({ limit: 500 }).filter((entry) => entry.kind === ONBOARDING_PROOF_SLOT_KIND)).toHaveLength(1);
+    expect(h.ledger.getNotification(id)?.resolvedAt).toBeNull();
+    // The strays end; the next verify's stale check releases the slot, and the next reconcile closes the row.
+    process.kill(-leader, 'SIGKILL');
+    await until(() => !alive(member), 'the group to be gone');
+    server.budget().release(await server.budget().acquire({ jobId: 'heist-later', scope: 'full', command: 'npm test', cwd: config.dataDir }));
+    await tick(h, restarted);
+    expect(h.ledger.getNotification(id)?.resolvedBy).toBe('onboarding-proof');
+  });
+
   // As root, CAP_SYS_PTRACE reads any environment: nothing is hidden.
   it.skipIf(process.platform !== 'linux' || !python3 || process.getuid?.() === 0)('a process of this user whose environment cannot be read (non-dumpable, as ssh-agent is) is logged at debug only, at each listing, never at warn, and is left alone', async () => {
     const child = spawn('python3', ['-c', 'import ctypes, time; ctypes.CDLL(None).prctl(4, 0, 0, 0, 0); print("ready", flush=True); time.sleep(30)'], { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
@@ -1403,6 +1571,8 @@ interface ServiceHarness {
   repoPath: ManagedRepoPath;
   /** The global verification budget the service reads (default: not up). */
   budget: () => VerificationBudget;
+  /** The wall clock the service reads (default: Date.now). */
+  now: () => number;
   service(opts?: { readonly mode?: 'proposed' | 'autonomous' | 'off' }): OnboardingService;
   /** Gru's onboarding proof rows. */
   attention(): readonly { readonly id: string; readonly title: string; readonly detail: string | null; readonly open: boolean }[];
@@ -1429,6 +1599,7 @@ function serviceHarness(): ServiceHarness {
     admitThenFail: null,
     repoPath: AVAILABLE,
     budget: () => { throw new Error('the stand-in proof needs no budget'); },
+    now: () => Date.now(),
     service(opts = {}) {
       const service = new OnboardingService({
         onboarding: { mode: opts.mode ?? 'proposed' },
@@ -1479,6 +1650,7 @@ function serviceHarness(): ServiceHarness {
         },
         setInterval: ((run: () => void) => { h.intervals.push(run); return { unref() {} }; }) as unknown as typeof setInterval,
         log: (level, msg) => { h.logs.push({ level, msg }); },
+        now: () => h.now(),
       });
       services.push(service);
       return service;
@@ -1749,8 +1921,11 @@ describe('the service: once per (job, head), after the PR, with its comment', ()
     }
   });
 
-  it('Throttling backs off and ends: a throttled comment is retried once per reconcile, never on a trigger between two, warned once, and the twelfth throttled reconcile records it as one that cannot be posted', async () => {
+  it('Throttling backs off and ends by the wall clock: a throttled comment is retried at a later reconcile, never on a trigger between two, warned once, and only once two hours have passed since its first throttle, however many reconciles ran, is it recorded as one that cannot be posted', async () => {
     const h = serviceHarness();
+    const start = Date.parse('2026-10-17T12:00:00.000Z');
+    let clock = start;
+    h.now = () => clock;
     onboardingJob(h.ledger);
     h.ledger.setJobPr(JOB, PR_URL);
     h.refusePost = 'gh: You have exceeded a secondary rate limit. Please wait a few minutes before you try again. (HTTP 403)';
@@ -1764,18 +1939,60 @@ describe('the service: once per (job, head), after the PR, with its comment', ()
     deliver(h.ledger, H1);
     await service.idle();
     expect(h.postAttempts).toBe(1);
-    for (let reconcile = 1; reconcile <= 10; reconcile += 1) await tick(h, service);
-    expect(h.postAttempts).toBe(11);
+    // Thirty reconciles a minute apart, all inside the bound: each retries, none gives up.
+    for (let reconcile = 1; reconcile <= 30; reconcile += 1) {
+      clock += 60_000;
+      await tick(h, service);
+    }
+    expect(h.postAttempts).toBe(31);
     expect(commentReceipts(h.ledger)).toEqual([]);
+    clock = start + ONBOARDING_PROOF_COMMENT_THROTTLE_LIMIT_MS;
     await tick(h, service);
-    expect(h.postAttempts).toBe(12);
+    expect(h.postAttempts).toBe(32);
     expect(commentReceipts(h.ledger)).toEqual([{
-      repo: 'fixture-app', job_id: JOB, head: H1, comment_id: null, comment_url: null, detail: 'cannot be posted: GitHub kept throttling the comment',
+      repo: 'fixture-app', job_id: JOB, head: H1, comment_id: null, comment_url: null, detail: 'cannot be posted: GitHub kept throttling the comment for 2 h 0 min',
     }]);
-    expect(h.logs).toContainEqual({ level: 'error', msg: expect.stringContaining('GitHub throttled it in 12 reconciles') });
+    expect(h.logs).toContainEqual({ level: 'error', msg: expect.stringContaining('GitHub kept throttling it for 2 h 0 min') });
     expect(h.logs.filter((entry) => entry.level === 'warn' && entry.msg.includes('GitHub is throttling GC'))).toHaveLength(1);
     await tick(h, service);
-    expect(h.postAttempts).toBe(12);
+    expect(h.postAttempts).toBe(32);
+  });
+
+  it('A throttle that names its retry time is not retried before it: a Retry-After is waited out, and an X-RateLimit-Reset past the bound records the comment at the bound with no further post', async () => {
+    const start = Date.parse('2026-10-17T12:00:00.000Z');
+    let clock = start;
+    const throttled = async (refusal: string): Promise<{ readonly h: ServiceHarness; readonly service: OnboardingService }> => {
+      const h = serviceHarness();
+      h.now = () => clock;
+      onboardingJob(h.ledger);
+      h.ledger.setJobPr(JOB, PR_URL);
+      h.refusePost = refusal;
+      const service = await started(h.service());
+      deliver(h.ledger, H1);
+      await service.idle();
+      expect(h.postAttempts).toBe(1);
+      return { h, service };
+    };
+    const after = await throttled('gh: API rate limit exceeded for installation (HTTP 403)\nRetry-After: 1800');
+    for (const [minutes, attempts] of [[10, 1], [29, 1], [31, 2], [45, 2], [62, 3]] as const) {
+      clock = start + minutes * 60_000;
+      await tick(after.h, after.service);
+      expect(after.h.postAttempts, `${String(minutes)} min`).toBe(attempts);
+    }
+    expect(commentReceipts(after.h.ledger)).toEqual([]);
+
+    clock = start;
+    const reset = await throttled(`gh: API rate limit exceeded (HTTP 403)\nX-RateLimit-Reset: ${String(Math.floor(start / 1000) + 3 * 3600)}`);
+    for (const minutes of [30, 90]) {
+      clock = start + minutes * 60_000;
+      await tick(reset.h, reset.service);
+    }
+    expect(reset.h.postAttempts).toBe(1);
+    expect(commentReceipts(reset.h.ledger)).toEqual([]);
+    clock = start + ONBOARDING_PROOF_COMMENT_THROTTLE_LIMIT_MS;
+    await tick(reset.h, reset.service);
+    expect(reset.h.postAttempts).toBe(1);
+    expect(commentReceipts(reset.h.ledger)).toEqual([expect.objectContaining({ comment_id: null, detail: 'cannot be posted: GitHub kept throttling the comment for 2 h 0 min' })]);
   });
 
   it('An attempt recorded by a build before the nonce still finds its comment by that build\'s marker after an upgrade, and posts no second one', async () => {
@@ -1793,7 +2010,7 @@ describe('the service: once per (job, head), after the PR, with its comment', ()
     expect(commentReceipts(h.ledger)).toEqual([expect.objectContaining({ head: H1, comment_id: 70, detail: 'found by its marker after an interrupted post' })]);
   });
 
-  it('The pre-nonce marker matches only an old post: a comment that carries it but was created an hour after the legacy attempt, or says no creation time, is not GC\'s, and GC posts its own', async () => {
+  it('The pre-nonce marker matches only an old post: a comment that carries it but was created an hour after the legacy attempt, more than a minute before it, or says no creation time, is not GC\'s, and GC posts its own', async () => {
     const h = serviceHarness();
     onboardingJob(h.ledger);
     h.ledger.setJobPr(JOB, PR_URL);
@@ -1804,10 +2021,29 @@ describe('the service: once per (job, head), after the PR, with its comment', ()
     const legacy = `<!-- gru:onboarding-proof job=${JOB} head=${H1} -->\n### GC onboarding proof: passed`;
     h.comments.push({ id: 71, body: legacy, url: `${PR_URL}#issuecomment-71`, createdAt: new Date(Date.now() + 3_600_000).toISOString(), pr: 'acme/fixture-app#7' });
     h.comments.push({ id: 72, body: legacy, url: `${PR_URL}#issuecomment-72`, createdAt: null, pr: 'acme/fixture-app#7' });
+    // Created two minutes, and an hour, before the attempt was recorded: past the minute of clock skew allowed.
+    h.comments.push({ id: 73, body: legacy, url: `${PR_URL}#issuecomment-73`, createdAt: new Date(Date.now() - 120_000).toISOString(), pr: 'acme/fixture-app#7' });
+    h.comments.push({ id: 74, body: legacy, url: `${PR_URL}#issuecomment-74`, createdAt: new Date(Date.now() - 3_600_000).toISOString(), pr: 'acme/fixture-app#7' });
     await started(h.service());
     expect(h.lookups).toEqual([7]);
     expect(h.posts).toHaveLength(1);
-    expect(commentReceipts(h.ledger)).toEqual([expect.objectContaining({ head: H1, comment_id: 102, detail: 'posted' })]);
+    expect(commentReceipts(h.ledger)).toEqual([expect.objectContaining({ head: H1, comment_id: 104, detail: 'posted' })]);
+  });
+
+  it('A legacy attempt whose recorded time is not the ledger\'s own UTC form is never guessed at: it is logged at warn, its comment is not looked up by the legacy marker, and GC posts its own', async () => {
+    const h = serviceHarness();
+    onboardingJob(h.ledger);
+    h.ledger.setJobPr(JOB, PR_URL);
+    deliver(h.ledger, H1);
+    proofEvent(h.ledger, H1, true);
+    const attempt = h.ledger.appendCustomEvent({ kind: ONBOARDING_EVENTS.proofCommentAttempt, jobId: JOB, payload: { repo: 'fixture-app', job_id: JOB, head: H1, pr_url: PR_URL } });
+    // A time with no zone (local time, read as the host's): not what the ledger writes.
+    h.db.handle.prepare('UPDATE events SET ts = ? WHERE seq = ?').run(new Date().toISOString().slice(0, 19).replace('T', ' '), attempt.seq);
+    h.comments.push({ id: 70, body: `<!-- gru:onboarding-proof job=${JOB} head=${H1} -->\n### GC onboarding proof: passed`, url: `${PR_URL}#issuecomment-70`, createdAt: new Date().toISOString(), pr: 'acme/fixture-app#7' });
+    await started(h.service());
+    expect(h.logs).toContainEqual({ level: 'warn', msg: expect.stringContaining('an older build\'s comment attempt has a time GC cannot read') });
+    expect(h.posts).toHaveLength(1);
+    expect(commentReceipts(h.ledger)).toEqual([expect.objectContaining({ head: H1, comment_id: 101, detail: 'posted' })]);
   });
 
   it('A comment with GC\'s job and head but no nonce, or another nonce, is not GC\'s: after an interrupted post GC ignores it and posts its own', async () => {
@@ -2387,7 +2623,7 @@ describe('the service: one row for Gru per stuck episode', () => {
     }
   });
 
-  it('An unanswered row clears only on its own proof\'s directive: a restart while an unrelated Silas directive is live on the job keeps it open, and no :2 is posted', async () => {
+  it('An unanswered row is not cleared by an unrelated directive: a restart while a Silas directive is live on the job keeps it open, and no :2 is posted', async () => {
     const h = serviceHarness();
     onboardingJob(h.ledger);
     h.ledger.setJobPr(JOB, PR_URL);
@@ -2409,6 +2645,30 @@ describe('the service: one row for Gru per stuck episode', () => {
     for (let reconcile = 0; reconcile < 4; reconcile += 1) await tick(h, restarted);
     expect(h.attention()).toEqual([expect.objectContaining({ id, open: true })]);
     expect(h.ledger.getNotification(`${id}:2`)).toBeNull();
+  });
+
+  it('An unanswered row clears on a newer delivery: a re-delivery of the failed head while the service was down closes it at the next start, and the reason holding again opens that delivery\'s own row', async () => {
+    const h = serviceHarness();
+    onboardingJob(h.ledger);
+    h.ledger.setJobPr(JOB, PR_URL);
+    h.outcome = (input) => failing(input);
+    const service = await started(h.service());
+    deliver(h.ledger, H1);
+    await service.idle();
+    h.db.handle.prepare("UPDATE pending_directives SET state = 'settled' WHERE request_id = ?").run(onboardingProofDirectiveId(JOB, H1, 1));
+    const again = deliver(h.ledger, H1);
+    await service.idle();
+    await tick(h, service);
+    const id = rowId(H1, again, 'unanswered');
+    expect(h.attention()).toEqual([expect.objectContaining({ id, open: true })]);
+    service.stop();
+    // The minion delivers the same failed head again while GC is down.
+    const newer = deliver(h.ledger, H1);
+    const restarted = await started(h.service());
+    expect(h.attention()).toEqual([expect.objectContaining({ id, open: false })]);
+    expect(h.ledger.getNotification(id)?.resolvedBy).toBe('onboarding-proof');
+    await tick(h, restarted);
+    expect(h.attention().filter((row) => row.open)).toEqual([expect.objectContaining({ id: rowId(H1, newer, 'unanswered') })]);
   });
 
   it('Admission resets the refusal count: after the lane admitted the directive, one and then two new refusals post no :2, and the third, in a third reconcile, does', async () => {
@@ -2585,6 +2845,8 @@ interface FencedLane {
   readonly ledger: LedgerApi;
   readonly wave: WaveRunner;
   readonly repo: FixtureRepo;
+  /** The job lane: the fixture repository itself, or a worktree of it. */
+  readonly path: string;
   /** The lane's head, delivered (unless the lane was built undelivered). */
   readonly target: string;
   /** A fresh runner on the same ledger and lane (a restart). */
@@ -2593,18 +2855,26 @@ interface FencedLane {
 
 /** A laned onboarding heist with a real wave and no spawner: the fence's
  * arm/queue paths (the review-supersession plain-lane harness). The lane
- * is the fixture repository itself. */
-async function fencedLane(options: Partial<WaveRunnerOptions> = {}, lane: { readonly delivered?: boolean } = {}): Promise<FencedLane> {
+ * is the fixture repository itself, or (`worktree`) a git worktree of it,
+ * as a real job lane is. */
+async function fencedLane(options: Partial<WaveRunnerOptions> = {}, lane: { readonly delivered?: boolean; readonly worktree?: boolean } = {}): Promise<FencedLane> {
   const repo = makeFixtureRepo('onboarding-proof-fence');
   repos.push(repo);
   repo.git(['checkout', '-b', 'feature/review']);
   const target = repo.commitFile('.gru-command/worktree.toml', '[verify]\nfull = "npm test"\n');
+  let path = repo.path;
+  if (lane.worktree === true) {
+    // The checkout leaves the branch to the lane, as a managed repository does.
+    repo.git(['checkout', '--quiet', '--detach']);
+    path = join(temp('gru-onboarding-proof-fence-lane-'), 'lane');
+    repo.git(['worktree', 'add', '--quiet', path, 'feature/review']);
+  }
   const bus = new EventBus();
   const db = new LedgerDb(temp('gru-onboarding-proof-fence-db-'));
   closers.push(() => db.close());
   const ledger = new LedgerApi(db.handle, { bus });
   const port = new GitReviewPort(temp('gru-onboarding-proof-fence-port-'), 'feature/review', target, ledger);
-  await port.createJobWorktree({ repoPath: repo.path, jobId: JOB });
+  await port.createJobWorktree({ repoPath: repo.path, jobId: JOB, path });
   onboardingJob(ledger);
   ledger.registerWorktree(port.listWorktrees({ jobId: JOB })[0]!);
   if (lane.delivered !== false) deliver(ledger, target);
@@ -2618,7 +2888,16 @@ async function fencedLane(options: Partial<WaveRunnerOptions> = {}, lane: { read
     closers.push(() => wave.shutdown());
     return wave;
   };
-  return { ledger, wave: newWave(), repo, target, newWave };
+  return { ledger, wave: newWave(), repo, path, target, newWave };
+}
+
+/** Commit a file in the lane (a worktree lane commits on its own branch). */
+function commitInLane(lane: FencedLane, rel: string, content: string): string {
+  mkdirSync(dirname(join(lane.path, rel)), { recursive: true });
+  writeFileSync(join(lane.path, rel), content);
+  lane.repo.git(['add', '--', rel], lane.path);
+  lane.repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '--quiet', '-m', `add ${rel}`], lane.path);
+  return lane.repo.git(['rev-parse', 'HEAD'], lane.path);
 }
 
 /** The Perkins gate unavailable: the request takes the bmad-review fallback. */
@@ -2898,6 +3177,57 @@ describe('the review fence', () => {
     await expect(lane.wave.requestReview({ jobId: JOB, force: true })).rejects.toThrow(/uncommitted changes the proof never ran/);
   });
 
+  it('On a real worktree lane, what its bootstrap placed from the repository checkout is placed, compared by real path and content: a relative [[link]] node_modules (however its link is spelled), a [[copy]] file and a folder [[copy]]; a source gone from the checkout is a named error, and a source changed since is refused naming the copy', async () => {
+    const lane: FencedLane = await fencedLane({ ...PERKINS_DOWN, ...fallbackGate(async () => []) }, { worktree: true });
+    expect(lane.path).not.toBe(lane.repo.path);
+    // What the bootstrap links and copies from: untracked in the repository checkout.
+    mkdirSync(join(lane.repo.path, 'node_modules', 'left-pad'), { recursive: true });
+    writeFileSync(join(lane.repo.path, '.env.local'), 'KEY=local\n');
+    mkdirSync(join(lane.repo.path, 'fixtures', 'certs', 'ca'), { recursive: true });
+    writeFileSync(join(lane.repo.path, 'fixtures', 'certs', 'dev.pem'), 'not a real cert\n');
+    writeFileSync(join(lane.repo.path, 'fixtures', 'certs', 'ca', 'root.pem'), 'not a real root\n');
+    const head = commitInLane(lane, '.gru-command/worktree.toml', [
+      '[[link]]', 'at = "node_modules"', 'to = "node_modules"',
+      '[[copy]]', 'from = ".env.local"', 'to = ".env.local"',
+      '[[copy]]', 'from = "fixtures/certs"', 'to = "certs"',
+      '[verify]', 'full = "npm test"', '',
+    ].join('\n'));
+    deliver(lane.ledger, head);
+    proofEvent(lane.ledger, head, true);
+    lane.ledger.setJobStatus(JOB, 'delivered');
+    // The lane's bootstrap places the link and the file copy; it copies no folder, so that one is placed by hand.
+    const manifest = loadWorktreeManifest(lane.path)!;
+    await applyWorktreeManifest({ ...manifest, copies: manifest.copies.filter((copy) => copy.to !== 'certs'), setup: [] }, { sourceRoot: lane.repo.path, worktreePath: lane.path, setupTimeoutMs: 1_000 });
+    cpSync(join(lane.repo.path, 'fixtures', 'certs'), join(lane.path, 'certs'), { recursive: true });
+    expect(lane.repo.git(['status', '--porcelain'], lane.path).split('\n').sort()).toEqual(['?? .env.local', '?? certs/', '?? node_modules']);
+    const passes = (): number => lane.ledger.listJobEvents(JOB).filter((event) => event.kind === 'job.fallback-review' && (event.payload as { phase?: unknown }).phase === 'pass').length;
+    const admitted = async (): Promise<void> => {
+      const outcome = await lane.wave.requestReview({ jobId: JOB, force: true });
+      expect(outcome.route).toBe('bmad-review-fallback');
+      await (outcome as { readonly run: Promise<unknown> }).run;
+    };
+    await admitted();
+    expect(passes()).toBe(1);
+    // The same link spelled relative to the lane points at the same place: still placed.
+    rmSync(join(lane.path, 'node_modules'));
+    symlinkSync(relative(lane.path, join(lane.repo.path, 'node_modules')), join(lane.path, 'node_modules'));
+    await admitted();
+    expect(passes()).toBe(2);
+    // A file added to the copied folder is a change.
+    writeFileSync(join(lane.path, 'certs', 'extra.pem'), 'added\n');
+    await expect(lane.wave.requestReview({ jobId: JOB, force: true })).rejects.toThrow(/uncommitted changes the proof never ran/u);
+    rmSync(join(lane.path, 'certs', 'extra.pem'));
+    // The source is gone from the checkout: a named error, never "edited".
+    rmSync(join(lane.repo.path, '.env.local'));
+    await expect(lane.wave.requestReview({ jobId: JOB, force: true })).rejects.toThrow(/the \[\[copy\]\] source "\.env\.local" in the repository checkout cannot be read: /u);
+    // The source changed since the lane was made: refused, naming the copy and that cause.
+    writeFileSync(join(lane.repo.path, '.env.local'), 'KEY=rotated\n');
+    const refused = await lane.wave.requestReview({ jobId: JOB, force: true }).then(() => null, (error: unknown) => error);
+    expect(refused).toBeInstanceOf(BranchBusyError);
+    expect((refused as BranchBusyError).refusal().hint).toBe(`${BRANCH_BUSY_ONBOARDING_UNCOMMITTED_HINT} (the [[copy]] ".env.local" no longer matches its source ".env.local" in the repository checkout: the minion edited it, or the source changed since the lane was made (copying the source again makes it match))`);
+    expect(passes()).toBe(2);
+  });
+
   it('The lane check reads untracked folders as git collapses them: an un-ignored build/ with many files is one entry, and refuses the fallback as uncommitted', async () => {
     const lane: FencedLane = await fencedLane({ ...PERKINS_DOWN, ...fallbackGate(async () => []) });
     proofEvent(lane.ledger, lane.target, true);
@@ -2926,7 +3256,7 @@ describe('the review fence', () => {
     await (run as { readonly run: Promise<unknown> }).run;
     const aborted = lane.ledger.listJobEvents(JOB).find((event) => event.kind === 'job.fallback-review' && (event.payload as { phase?: unknown }).phase === 'aborted');
     expect(aborted?.payload).toMatchObject({ clearToMerge: false, code: FALLBACK_ONBOARDING_PROOF_REQUIRED, hint: FALLBACK_ONBOARDING_PROOF_HINT });
-    expect(FALLBACK_ONBOARDING_PROOF_HINT).toBe('the minion must commit the fix, push it to the PR branch and deliver; GC proves the new head itself, and once that proof passes the Silas digest offers the review again; a self-review request the minion makes before then is queued and replayed on the pass');
+    expect(FALLBACK_ONBOARDING_PROOF_HINT).toBe('the minion must commit the fix, push it to the PR branch and deliver; GC proves the new head itself, and once that proof passes the Silas digest offers the review again (a self-review request the minion makes after it delivered the fix is queued and replayed on that pass)');
     const digest = async (): Promise<readonly string[]> => (await computeSilasDigest({
       ledger: lane.ledger, blockersForRound: async () => ({ blockers: [], note: null }), config: DEFAULT_SILAS_CONFIG, trigger: 'sweep',
     })).prWithoutReview.map((row) => row.jobId);

@@ -92,12 +92,16 @@ export const BRANCH_BUSY_ONBOARDING_UNCOMMITTED_HINT =
   'the working tree — the minion must commit, push and deliver them (GC then proves that head) or discard them; ' +
   'force cannot skip the proof';
 
-/** The refusal hint for a blocker set: the unforceable reasons first. */
+/** The refusal hint for a blocker set: the unforceable reasons first. An
+ * uncommitted lane's hint names a placed path that changed, when one did. */
 export function branchBusyHint(blockers: readonly BranchIdleBlocker[]): string {
   if (blockers.some((blocker) => blocker.revision !== undefined)) return BRANCH_BUSY_REVISION_HINT;
   const reasons = new Set(blockers.flatMap((blocker) => (blocker.onboardingProof === undefined ? [] : [blocker.onboardingProof.reason])));
   if (reasons.has('unproven') || reasons.has('failed')) return BRANCH_BUSY_ONBOARDING_HINT;
-  if (reasons.has('uncommitted')) return BRANCH_BUSY_ONBOARDING_UNCOMMITTED_HINT;
+  if (reasons.has('uncommitted')) {
+    const details = blockers.flatMap((blocker) => (blocker.onboardingProof?.detail === undefined ? [] : [blocker.onboardingProof.detail]));
+    return details.length === 0 ? BRANCH_BUSY_ONBOARDING_UNCOMMITTED_HINT : `${BRANCH_BUSY_ONBOARDING_UNCOMMITTED_HINT} (${details.join('; ')})`;
+  }
   if (reasons.has('no-commit')) return BRANCH_BUSY_ONBOARDING_NO_HEAD_HINT;
   if (reasons.has('no-delivery')) return BRANCH_BUSY_ONBOARDING_NO_DELIVERY_HINT;
   return BRANCH_BUSY_HINT;

@@ -26,22 +26,28 @@ const KEYWORD_VALUE = '(?:"(?=[^"]*[A-Za-z0-9])[^"]{6,}"|\'(?=[^\']*[A-Za-z0-9])
 /** The keys whose assigned value is a credential, longest first (`_`, `-`
  * or nothing between words, any case, so camelCase too): AWS's secret
  * access key, a private key in JSON (a service-account file), kubeconfig's
- * client key data. Each starts its identifier. */
+ * client key data. Each starts its identifier. (`access_token` and
+ * `auth_token` need no entry: `token` matches after the `_`.) */
 const KEYWORD_KEYS = [
   'aws[_-]?secret[_-]?access[_-]?key', 'secret[_-]?access[_-]?key', 'private[_-]?key', 'client[_-]?key[_-]?data',
-  'api[_-]?key', 'access[_-]?token', 'auth[_-]?token', 'client[_-]?secret', 'refresh[_-]?token', 'secret[_-]?key', 'api[_-]?secret',
+  'api[_-]?key', 'client[_-]?secret', 'refresh[_-]?token', 'secret[_-]?key', 'api[_-]?secret',
   'password', 'secret', 'token',
 ].join('|');
 
 /** The keys that are a credential's however the identifier begins, as long
  * as they end it (`PGPASSWORD`, `dbPassword`, `githubToken`, AWS STS's
  * `SessionToken` and `SecretAccessKey`, `stripeSecretKey`,
- * `googleMapsApiKey`, `signingPrivateKey`, `MYSQL_PWD`, `db_passwd`). A key
- * that only starts with one of them (`tokens`, `AccessKeyId`) is not one. */
+ * `googleMapsApiKey`, `signingPrivateKey`, `db_passwd`). A key that only
+ * starts with one of them (`tokens`, `AccessKeyId`) is not one. */
 const KEYWORD_ENDINGS = [
-  'secret[_-]?access[_-]?key', 'secret[_-]?key', 'api[_-]?key', 'private[_-]?key', 'access[_-]?token', 'auth[_-]?token',
-  'password', 'passwd', 'pwd', 'token', 'secret',
+  'secret[_-]?access[_-]?key', 'secret[_-]?key', 'api[_-]?key', 'private[_-]?key',
+  'password', 'passwd', 'token', 'secret',
 ].join('|');
+
+/** A key that ends its identifier in `pwd` (`MYSQL_PWD`), except the
+ * shell's own `PWD` and `OLDPWD` (the whole identifier) and one assigned a
+ * path (`/…` or `~…`): a working directory is no secret. */
+const PWD_KEY = '(?!(?<![_-])(?:old)?pwd["\']?\\s*[:=])[A-Za-z0-9]*?pwd(?!["\']?\\s*[:=]\\s*["\']?[/~])';
 
 /** A PEM private key header or footer word run: `PRIVATE KEY` alone
  * (PKCS#8), or after algorithm and format words (`RSA`, `EC`, `OPENSSH`,
@@ -62,8 +68,9 @@ const PATTERNS: readonly (readonly [RegExp, (match: string, ...groups: string[])
   [/(\bAuthorization\s*:\s*(?:Bearer|Basic)\s+)[^\s'"`]+/giu, keepPrefix],
   // An `.npmrc` registry credential: `//registry.example/:_authToken=…`.
   [/(\/\/\S*:_(?:authToken|auth|password)\s*=\s*)\S+/gu, keepPrefix],
-  // A key, then an optional closing quote (JSON's `"password": "…"`), then `:` or `=`.
-  [new RegExp(`(?<![A-Za-z0-9])(?:${KEYWORD_KEYS}|[A-Za-z0-9]*?(?:${KEYWORD_ENDINGS}))["']?\\s*[:=]\\s*${KEYWORD_VALUE}`, 'giu'), redaction],
+  // A key, then an optional closing quote (JSON's `"password": "…"`), then
+  // `:` or `=`. One a `/` precedes is a path's segment (`/etc/passwd:`).
+  [new RegExp(`(?<![A-Za-z0-9/])(?:${KEYWORD_KEYS}|[A-Za-z0-9]*?(?:${KEYWORD_ENDINGS})|${PWD_KEY})["']?\\s*[:=]\\s*${KEYWORD_VALUE}`, 'giu'), redaction],
   [/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/gu, redaction],
 ];
 
