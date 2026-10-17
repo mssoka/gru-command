@@ -482,30 +482,35 @@ describe('gh CLI adapter', () => {
     expect(asked[0]).toContain('state=open');
   });
 
-  it('commentOnPull POSTs the body as one raw field; listIssueComments pages to a short page and never reads a truncated history as complete (#427)', async () => {
+  it('commentOnPull POSTs the body as one raw field; listIssueComments pages to a short page, names each author, and never reads a truncated history as complete; viewerLogin names the authenticated user (#427)', async () => {
     const calls: string[][] = [];
     const page = (count: number, from: number): unknown[] =>
-      Array.from({ length: count }, (_, index) => ({ id: from + index, body: `comment ${String(from + index)}`, html_url: `https://github.com/acme/app/pull/7#issuecomment-${String(from + index)}` }));
+      Array.from({ length: count }, (_, index) => ({ id: from + index, body: `comment ${String(from + index)}`, html_url: `https://github.com/acme/app/pull/7#issuecomment-${String(from + index)}`, user: { login: 'gru-bot' } }));
     const body = '@not-a-file <!-- gru:onboarding-proof job=onboard-app head=abc -->\nline two';
     const runner: GhCommandRunner = async (args) => {
       calls.push([...args]);
       if (args.includes('POST')) {
-        return { status: 0, stdout: JSON.stringify({ id: 99, body, html_url: 'https://github.com/acme/app/pull/7#issuecomment-99' }), stderr: '' };
+        return { status: 0, stdout: JSON.stringify({ id: 99, body, html_url: 'https://github.com/acme/app/pull/7#issuecomment-99', user: { login: 'gru-bot' } }), stderr: '' };
       }
+      if (args.at(-1) === 'user') return { status: 0, stdout: JSON.stringify({ login: 'gru-bot', id: 5 }), stderr: '' };
       const pageNumber = Number(/[?&]page=(\d+)/u.exec(args.at(-1) ?? '')?.[1]);
       return { status: 0, stdout: JSON.stringify(pageNumber === 1 ? page(100, 1) : page(3, 101)), stderr: '' };
     };
     const api = new GhCliApi(runner);
-    expect(await api.commentOnPull({ repo: REPO, number: 7, body })).toEqual({ id: 99, body, url: 'https://github.com/acme/app/pull/7#issuecomment-99' });
+    expect(await api.commentOnPull({ repo: REPO, number: 7, body })).toEqual({ id: 99, body, url: 'https://github.com/acme/app/pull/7#issuecomment-99', author: 'gru-bot' });
     // `-f` is a raw string: a leading @ is never read as a file.
     expect(calls[0]).toEqual(['api', '--hostname', 'github.com', '--method', 'POST', 'repos/acme/app/issues/7/comments', '-f', `body=${body}`]);
     const comments = await api.listIssueComments({ repo: REPO, number: 7 });
     expect(comments).toHaveLength(103);
-    expect(comments[102]).toEqual({ id: 103, body: 'comment 103', url: 'https://github.com/acme/app/pull/7#issuecomment-103' });
+    expect(comments[102]).toEqual({ id: 103, body: 'comment 103', url: 'https://github.com/acme/app/pull/7#issuecomment-103', author: 'gru-bot' });
     expect(calls.slice(1).map((call) => call.at(-1))).toEqual([
       'repos/acme/app/issues/7/comments?per_page=100&page=1',
       'repos/acme/app/issues/7/comments?per_page=100&page=2',
     ]);
+    expect(await api.viewerLogin({ host: 'github.com' })).toBe('gru-bot');
+    expect(calls.at(-1)).toEqual(['api', '--hostname', 'github.com', 'user']);
+    const anonymous = new GhCliApi(async () => ({ status: 0, stdout: JSON.stringify({ id: 5 }), stderr: '' }));
+    await expect(anonymous.viewerLogin({ host: 'github.com' })).rejects.toThrow(/names no login/);
     const endless = new GhCliApi(async () => ({ status: 0, stdout: JSON.stringify(page(100, 1)), stderr: '' }));
     await expect(endless.listIssueComments({ repo: REPO, number: 7 })).rejects.toThrow(/more than 1000 comments; the rest were not read/);
     const refused = new GhCliApi(async () => ({ status: 1, stdout: '', stderr: 'HTTP 403: Resource not accessible by integration' }));
@@ -538,7 +543,7 @@ describe('gh CLI adapter', () => {
 // ------------------------------------------------------------------
 
 interface FakeCall {
-  readonly kind: 'listPulls' | 'listPullsForHead' | 'getPull' | 'listCheckRuns' | 'commentOnPull' | 'listIssueComments';
+  readonly kind: 'listPulls' | 'listPullsForHead' | 'getPull' | 'listCheckRuns' | 'commentOnPull' | 'listIssueComments' | 'viewerLogin';
   readonly repo: string;
   readonly arg: number | string | null;
 }
@@ -594,6 +599,11 @@ class FakeGhApi implements GhApiPort {
   async listIssueComments(input: { repo: RepoRef; number: number }): Promise<readonly GhIssueComment[]> {
     this.calls.push({ kind: 'listIssueComments', repo: repoFullName(input.repo), arg: input.number });
     return [];
+  }
+
+  async viewerLogin(input: { host: string }): Promise<string> {
+    this.calls.push({ kind: 'viewerLogin', repo: input.host, arg: 0 });
+    throw new Error('the signal poll never asks who it is');
   }
 
   count(kind: FakeCall['kind']): number {

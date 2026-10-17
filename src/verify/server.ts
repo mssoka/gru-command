@@ -85,6 +85,10 @@ export interface VerificationServer {
 /** One slot of the global verification budget, held by its caller. */
 export interface VerificationBudget {
   acquire(spec: VerificationRunSpec): Promise<VerificationLease>;
+  /** Bind the pid of the command the holder spawned to its slot, persisted
+   * as a scheduler run's child is: a restart then judges an orphaned slot
+   * by that pid's liveness instead of releasing it as runner-less. */
+  bindPid(lease: VerificationLease, pid: number): void;
   release(lease: VerificationLease): void;
   readonly workersPerRun: number;
 }
@@ -337,6 +341,15 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
     const body = await readBody(req);
     const jobId = strField(body, 'job_id');
     const scope = optStrField(body, 'scope') ?? DEFAULT_VERIFY_SCOPE;
+    if (scope === ONBOARDING_PROOF_SCOPE) {
+      // Every event of this scope is dropped (an onboarding proof is never
+      // verification evidence): a run under it would leave no record.
+      json(res, 400, {
+        error: 'reserved_scope',
+        detail: `verify scope "${ONBOARDING_PROOF_SCOPE}" is reserved for GC's onboarding proof and cannot be requested; name the manifest's scope differently`,
+      });
+      return;
+    }
     const requestId = optStrField(body, 'request_id');
     if (requestId !== undefined && !isValidVerificationRequestId(requestId)) {
       json(res, 400, {
@@ -573,6 +586,7 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
     budget(): VerificationBudget {
       return {
         acquire: (spec) => scheduler.acquire(spec),
+        bindPid: (lease, pid) => scheduler.bindPid(lease, pid),
         release: (lease) => scheduler.release(lease),
         get workersPerRun() {
           return scheduler.workersPerRun;

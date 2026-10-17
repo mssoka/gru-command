@@ -285,4 +285,7 @@ clears an earlier decline and scans that repository, and its `action` says what
 happened. Relay a refusal as it is. A failed dispatch
 (`onboarding.dispatch-failed`) is retried on its own and closes itself, so a
 disposition of it is refused; its detail says why it failed
-(docs/ONBOARDING.md).
+(docs/ONBOARDING.md). So does a stuck onboarding proof
+(`onboarding.proof-attention`, one row per job and head): its detail says why
+the head is stuck, and it closes when the head's proof passes, a newer head is
+delivered, or the job ends.

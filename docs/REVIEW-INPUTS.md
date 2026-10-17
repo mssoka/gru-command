@@ -230,14 +230,23 @@ latest revision → verify → fresh review. The service enforces it centrally.
   `onboarding.dispatched` event names owes a passing `onboarding.proof` on its newest
   delivered head: GC clones that head, applies its manifest, runs `verify.full` under the
   verification budget, and measures it ([ONBOARDING.md](./ONBOARDING.md#proof-before-review)).
-  Until the proof passes, the lane is busy on every route the corrective verification fences
-  (arm, freeze, queued handoff, fallback admission and iteration, the Silas review offer); the
-  blocker carries `onboarding_proof_required_head`. Like a pending correction, `force` never
-  waives it, and the `409 branch_busy` hint says so. A worker's own review request is queued
-  and replayed on the `onboarding.proof` event. The proof is never verification evidence (no
-  `verification.*` event exists for it). When the proof's head is the reviewed sha, the frozen
-  packet carries an `ONBOARDING PROOF` block between the recorded verification and the CI
-  evidence; a block that would crowd out the CI section freezes as an omission notice.
+  The head is read as the corrective-verification gate reads the newest delivery: one that is
+  not a proven current candidate, or names no commit, identifies no head, and review waits for
+  the minion's next delivery. The first proof of a head stands. Until it passes, the lane is
+  busy on every route the corrective verification fences (arm, freeze, queued handoff, fallback
+  admission and iteration, the Silas review offer); the blocker carries
+  `onboarding_proof_required_head` (null when there is no head). The freeze also checks the
+  exact sha it reviews: a pass of the delivered head does not cover an explicit target or a
+  commit pushed after the delivery. Like a pending correction, `force` never waives it, the
+  `409 branch_busy` hint says so (or says the minion must deliver again), and a refusal's audit
+  records whether force was asked for. A worker's own review request is queued and replayed
+  on the `onboarding.proof` event, also after a restart. The proof is never verification
+  evidence (no `verification.*` event exists for it, and `POST /api/verify` refuses the
+  reserved `onboarding-proof` scope with `400 reserved_scope`). When the proof's head is the
+  reviewed sha, the frozen packet carries an `ONBOARDING PROOF` block between the recorded
+  verification and the CI evidence. The block must leave room for the actual CI block that
+  follows it; when it does not, it freezes as an omission notice, and when not even the
+  notice fits, the freeze is refused, as for the CI section.
 - **A historical-only delivery owes a current inspection (owner decision 2026-10-16, #361).**
   When a job's newest delivery is history (a completion recorded without proving a current
   candidate) while a corrective verification or a contract revision is still owed, no

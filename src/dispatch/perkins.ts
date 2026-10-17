@@ -83,6 +83,7 @@ import { admissionPreflight, ADMISSION_REMOTE_PROBE_TIMEOUT_MS, ReviewAdmissionE
 import { evidenceRequestFingerprint, type ReviewEvidenceRequest } from '../review-inputs/evidence.js';
 import { parseGitHubPrUrl } from './github-poll.js';
 import { appendOnboardingProof, renderOnboardingProofEvidence } from '../onboarding/proof.js';
+import { REDACTION_PLACEHOLDER, redactReviewForPublication } from '../redaction.js';
 import {
   boundedDiff,
   fallbackReviewPolicy,
@@ -124,31 +125,9 @@ export function lensAgentLabel(lens: string, attempt: number): string {
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
-const REDACTION_PLACEHOLDER = '[REDACTED]';
-
-function redaction(_value: string): string {
-  // A fixed placeholder: any digest of the redacted bytes would publish an
-  // offline brute-force oracle for low-entropy secrets. The scope-disclosure
-  // decoder uses the same literal to distinguish evidence erased by a
-  // redaction span from an authentic pre-disclosure absence.
-  return REDACTION_PLACEHOLDER;
-}
-
-/** Keep verification evidence private when it resembles a credential. The
- * durable local report remains unchanged; only the PR-facing copy is masked. */
-export function redactReviewForPublication(body: string): string {
-  const patterns = [
-    /-----BEGIN [^-\r\n]+ PRIVATE KEY-----[\s\S]*?-----END [^-\r\n]+ PRIVATE KEY-----/gu,
-    /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/gu,
-    /\bgithub_pat_[A-Za-z0-9_]{20,}\b/gu,
-    /\bglpat-[A-Za-z0-9_-]{20,}\b/gu,
-    /\bsk-(?:proj-)?[A-Za-z0-9_-]{16,}\b/gu,
-    /\bAKIA[0-9A-Z]{16}\b/gu,
-    /(?<![A-Za-z0-9])(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|refresh[_-]?token|secret[_-]?key|api[_-]?secret|password|secret|token)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s`'"]+)/giu,
-    /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/gu,
-  ];
-  return patterns.reduce((text, pattern) => text.replace(pattern, redaction), body);
-}
+// Moved to src/redaction.ts (#427 PR 1b: the onboarding proof redacts with it
+// too); re-exported here for its existing importers.
+export { redactReviewForPublication };
 
 /** Publication kinds the appendix can describe truthfully. The wording
  * follows the PR/MR URL FORM (pull/N vs merge_requests/N), which is the
@@ -4038,6 +4017,29 @@ export class WaveRunner {
     throw new BranchBusyError(idle.targetBranch, unaudited, 'freeze');
   }
 
+  /** #427 PR 1b: refuse to freeze an onboarding heist's sha unless the
+   * first proof of exactly that sha passed. Unforceable and audited like
+   * the arm-time onboarding refusal (the audit says whether force was
+   * asked for). */
+  private refuseUnprovenOnboardingTarget(input: {
+    readonly jobId: string;
+    readonly roundId: string;
+    readonly targetBranch: string;
+    readonly targetSha: string;
+    readonly force: boolean;
+  }): void {
+    const onboardingProof = this.opts.ledger.onboardingProofDebtAt(input.jobId, input.targetSha);
+    if (onboardingProof === null) return;
+    const blockers: readonly BranchIdleBlocker[] = [{
+      jobId: input.jobId, status: this.opts.ledger.getJob(input.jobId)?.status ?? 'working', branch: input.targetBranch, onboardingProof,
+    }];
+    this.opts.ledger.appendCustomEvent({
+      kind: 'branch-idle.refused', jobId: input.jobId, roundId: input.roundId,
+      payload: { phase: 'freeze', forced: input.force, targetBranch: input.targetBranch, blockers },
+    });
+    throw new BranchBusyError(input.targetBranch, blockers, 'freeze');
+  }
+
   private enforceBranchIdle(input: {
     job: { readonly id: string };
     jobLane: WorktreeLane | null;
@@ -4388,10 +4390,11 @@ export class WaveRunner {
         laneBranch: lane.branch,
       });
       const blockers: readonly BranchIdleBlocker[] = [{ jobId: input.jobId, status: jobRow.status, branch: targetBranch, onboardingProof }];
+      // The audit says whether force was asked for: it was refused all the same.
       this.opts.ledger.appendCustomEvent({
         kind: 'branch-idle.refused',
         jobId: input.jobId,
-        payload: { phase: 'arm', forced: false, targetBranch, blockers },
+        payload: { phase: 'arm', forced: input.force === true, targetBranch, blockers },
       });
       throw new BranchBusyError(targetBranch, blockers, 'arm');
     }
@@ -5115,12 +5118,12 @@ export class WaveRunner {
           evidence,
           log: (level, msg, fields) => this.log(level, msg, { job: job.id, ...fields }),
         });
-        // #427 PR 1b: an onboarding heist's proof of exactly this head.
-        const proof = this.opts.ledger.listJobEventsByKinds(job.id, ['onboarding.proof'], { limit: 50 })
-          .find((event) => renderOnboardingProofEvidence(event, targetSha) !== null) ?? null;
+        // #427 PR 1b: an onboarding heist's proof of exactly this head (the
+        // first proof of a head stands, as the freeze check reads it).
         spec = appendOnboardingProof({
           spec,
-          block: renderOnboardingProofEvidence(proof, targetSha),
+          block: renderOnboardingProofEvidence(this.opts.ledger.firstOnboardingProof(job.id, targetSha), targetSha),
+          ciBlock: ci.block,
           maxBytes: FROZEN_SPEC_MAX_BYTES,
           log: (level, msg, fields) => this.log(level, msg, { job: job.id, ...fields }),
         });
@@ -5246,6 +5249,10 @@ export class WaveRunner {
         ...(flippedFrom !== null ? { reviewedStatus: { jobId: job.id, status: flippedFrom } } : {}),
       };
       const idle = this.enforceBranchIdle(idleInput);
+      // #427 PR 1b: an onboarding heist freezes only a sha whose own proof
+      // passed. The fence above follows the delivered head; an explicit
+      // target, or a commit pushed after the delivery, can freeze another.
+      this.refuseUnprovenOnboardingTarget({ jobId: job.id, roundId: round.id, targetBranch: idle.targetBranch, targetSha, force: input.force === true });
       // A clean-abort re-arm proved ONE delivered head at request time; the
       // awaited pre-flight/capacity/setup window can admit a newer delivery.
       // Re-prove the unchanged-head precondition here, at the last boundary

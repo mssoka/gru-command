@@ -1,12 +1,14 @@
 import type { OnboardingConfig } from '../config.js';
-import { parseGitHubPrUrl, type GhApiPort } from '../dispatch/github-poll.js';
+import { parseGitHubPrUrl, type GhApiPort, type GhIssueComment, type RepoRef } from '../dispatch/github-poll.js';
 import type { EventBus } from '../events/bus.js';
-import { NotificationDecisionRefusal, type LedgerApi, type NotificationRecord } from '../ledger/api.js';
+import { NotificationDecisionRefusal, type LedgerApi, type NotificationRecord, type OnboardingProofDebt } from '../ledger/api.js';
+import { LIVE_DIRECTIVE_STATES } from '../ledger/directives.js';
 import { parseNotificationDecision, type NotificationDecision } from '../ledger/notification-decision.js';
 import { isJobStatus, isJobTerminal } from '../ledger/states.js';
 import type { LogLevel } from '../logger.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import { oneLineErrorText } from '../property/error-text.js';
+import { redactReviewForPublication } from '../redaction.js';
 import { displayManagedRepoName, resolveManagedRepoPath, type ManagedRepoPath } from '../repos/managed-names.js';
 import type { VerificationBudget } from '../verify/server.js';
 import { MANIFEST_PATH } from '../worktrees/manifest.js';
@@ -45,9 +47,12 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * newest delivered head (src/onboarding/proof.ts), once per head and one
  * proof at a time, on a delivery or PR link, at start, and at each
  * reconcile. Each proven head gets one PR comment; a failed one goes to the
- * minion as a directive, and a third failure on a job reaches Gru. Review
- * waits for a pass (LedgerApi.onboardingProofDebt). Proofs run in every
- * mode: "off" stops new onboarding, never the gate on an open heist.
+ * minion as a directive. A head that stays stuck (a third failed proof,
+ * no head to prove, repeated deferrals, a directive that cannot be sent or
+ * went unanswered) gets one action-required row for Gru, which onboarding
+ * closes. Review waits for a pass (LedgerApi.onboardingProofDebt). Proofs
+ * run in every mode: "off" stops new onboarding, never the gate on an open
+ * heist.
  */
 
 /** The owner's Accept/Decline on onboarding one repository. */
@@ -57,12 +62,20 @@ export const ONBOARDING_DISPATCHED_KIND = 'onboarding.dispatched';
 /** Gru's attention: an onboarding heist could not be dispatched (retried at the next reconcile). */
 export const ONBOARDING_DISPATCH_FAILED_KIND = 'onboarding.dispatch-failed';
 
-/** Gru's attention: an onboarding job's manifest failed its proof this many times. */
-export const ONBOARDING_PROOF_FAILING_KIND = 'onboarding.proof-failing';
-/** Failed proofs on one job before Gru gets a row. */
+/** Gru's attention: one row per stuck (job, head) of an onboarding proof; onboarding closes it. */
+export const ONBOARDING_PROOF_ATTENTION_KIND = 'onboarding.proof-attention';
+/** Failed proofs on one job before a failed head gets a row. */
 export const ONBOARDING_PROOF_FAILURES_FOR_GRU = 3;
+/** Consecutive deferrals of one (job, head) in this process before it gets a row. */
+export const ONBOARDING_PROOF_DEFERRALS_FOR_GRU = 3;
 /** Directive requests per failed proof whose admission was refused before the minion is no longer asked. */
 export const ONBOARDING_PROOF_DIRECTIVE_ATTEMPTS = 3;
+/** Failed attempts at a head's PR comment in this process before it is recorded as one that cannot be posted. */
+export const ONBOARDING_PROOF_COMMENT_ATTEMPTS = 3;
+
+/** The attention row of one (job, head): `nohead` when the newest delivery identifies none. */
+export const onboardingProofAttentionId = (jobId: string, head: string | null): string =>
+  `onboarding-proof-attention:${jobId}:${head === null ? 'nohead' : head.slice(0, 12)}`;
 
 /** How often undone follow-through (an accepted card, a failed dispatch, a proof) is retried. */
 export const ONBOARDING_RECONCILE_INTERVAL_MS = 300_000;
@@ -127,7 +140,7 @@ export interface OnboardingProofOptions {
   readonly runTimeoutMs: number;
   /** The global verification budget (late-bound: the verify server starts later). */
   readonly budget: () => VerificationBudget;
-  readonly github: Pick<GhApiPort, 'commentOnPull' | 'listIssueComments'>;
+  readonly github: Pick<GhApiPort, 'commentOnPull' | 'listIssueComments' | 'viewerLogin'>;
   /** Begin and execute the directive (the property-campaign path). Throws
    * when the lane cannot take it now; the next reconcile retries. */
   readonly direct: (input: OnboardingProofDirective) => Promise<void>;
@@ -181,6 +194,17 @@ export class OnboardingService {
   private readonly proofQueued = new Set<string>();
   /** Jobs whose failed-proof directive is being admitted or run right now. */
   private readonly directing = new Set<string>();
+  // In memory, as the admission retries are (owner, #255): a restart counts
+  // again. Deferrals: the job's newest run of deferrals of one head.
+  private readonly deferrals = new Map<string, { readonly head: string; readonly count: number; readonly reason: string }>();
+  /** Failed comment attempts per `job\nhead`. */
+  private readonly commentAttempts = new Map<string, number>();
+  /** The reconcile in which a failed head's settled directive was first seen still standing, per `job\nhead`. */
+  private readonly settledSeen = new Map<string, number>();
+  /** Reconciles run so far (the start counts as 0). */
+  private reconciles = 0;
+  /** The login gh is authenticated as, per host (asked once). */
+  private readonly viewerLogins = new Map<string, string>();
 
   constructor(private readonly opts: OnboardingServiceOptions) {
     this.log = opts.log ?? (() => {});
@@ -275,6 +299,7 @@ export class OnboardingService {
    * dispatch failed, are scanned again; nothing else is (no periodic probe).
    */
   reconcile(): void {
+    this.reconciles += 1;
     if (this.mode !== 'off') {
       for (const repo of this.opts.managedRepos) {
         const failedRow = this.store.repo(repo).failedRow;
@@ -661,11 +686,16 @@ export class OnboardingService {
   }
 
   /** Prove the job's newest delivered head once it has a PR, unless that
-   * head was proven before; then carry each proof's follow-through. */
+   * head was proven before; then carry each proof's follow-through. A job
+   * that ended only has its attention rows closed. */
   private async proveJob(jobId: string, proof: OnboardingProofOptions): Promise<void> {
     const repo = this.store.jobRepo(jobId);
     const job = this.opts.ledger.getJob(jobId);
-    if (repo === null || job === null || isJobTerminal(job.status) || this.abort.signal.aborted) return;
+    if (repo === null || job === null || this.abort.signal.aborted) return;
+    if (isJobTerminal(job.status)) {
+      this.settleAttention(jobId, undefined, `job ${jobId} is ${job.status}`);
+      return;
+    }
     const debt = this.opts.ledger.onboardingProofDebt(jobId);
     if (job.prUrl !== null && debt !== null && debt.head !== null && this.store.proof(jobId, debt.head) === null) {
       await this.runProof(repo, jobId, debt.head, proof);
@@ -676,9 +706,9 @@ export class OnboardingService {
   private async runProof(repo: string, jobId: string, head: string, proof: OnboardingProofOptions): Promise<void> {
     const resolved = await (this.opts.resolveRepoPath ?? resolveManagedRepoPath)(this.opts.workspaceRoot, repo);
     if (resolved.kind !== 'available') {
-      this.log('warn', 'onboarding proof deferred: the repository is unavailable; the next reconcile retries it', {
-        repo, job: jobId, head, detail: resolved.kind === 'unavailable' ? resolved.reason : resolved.error,
-      });
+      const reason = `the repository is unavailable: ${resolved.kind === 'unavailable' ? resolved.reason : resolved.error}`;
+      this.log('warn', 'onboarding proof deferred: the repository is unavailable; the next reconcile retries it', { repo, job: jobId, head, reason });
+      this.noteDeferral(jobId, head, reason);
       return;
     }
     const outcome = await (proof.run ?? runOnboardingProof)({
@@ -687,45 +717,140 @@ export class OnboardingService {
     });
     if (outcome.kind === 'deferred') {
       this.log('warn', 'onboarding proof deferred; the next reconcile retries it (nothing posted, nothing sent)', { repo, job: jobId, head, reason: outcome.reason });
+      this.noteDeferral(jobId, head, outcome.reason);
       return;
     }
     this.store.record(ONBOARDING_EVENTS.proof, onboardingProofPayload(repo, jobId, outcome.result), jobId);
+    this.deferrals.delete(jobId);
     this.log(outcome.result.passed ? 'info' : 'warn', `onboarding proof ${outcome.result.passed ? 'passed' : 'failed'}`, {
       repo, job: jobId, head, failures: outcome.result.failures,
     });
   }
 
+  /** A deferral of the job's head: consecutive ones of the same head count up. */
+  private noteDeferral(jobId: string, head: string, reason: string): void {
+    const last = this.deferrals.get(jobId);
+    this.deferrals.set(jobId, { head, count: last?.head === head ? last.count + 1 : 1, reason });
+  }
+
   private async followProofs(repo: string, jobId: string, proof: OnboardingProofOptions): Promise<void> {
-    const proofs = this.store.jobProofs(jobId);
-    for (const record of proofs) await this.commentProof(record, proof);
-    const last = proofs.at(-1);
-    const delivered = this.opts.ledger.latestJobEvent(jobId, 'job.delivered');
-    const head = (delivered?.payload as { sha?: unknown } | null)?.sha;
-    // Only the head the minion stands on is worth a directive: a newer
-    // delivery already answers an older failure.
-    if (last !== undefined && !last.passed && last.head === head) this.directSoon(last, proof);
-    const failed = proofs.filter((entry) => !entry.passed);
-    if (failed.length >= ONBOARDING_PROOF_FAILURES_FOR_GRU) {
-      const newest = failed.at(-1)!;
-      const result = readOnboardingProof(newest.payload);
-      this.opts.notifications.post({
-        id: `onboarding-proof-failing:${jobId}`,
-        kind: ONBOARDING_PROOF_FAILING_KIND,
-        routing: 'action-required',
-        severity: 'error',
-        title: `Onboarding proof failed ${String(failed.length)} times: ${shown(repo)}`,
-        detail: [
-          `Job ${jobId}'s ${MANIFEST_PATH} failed GC's onboarding proof ${String(failed.length)} times. The last, at ${newest.head.slice(0, 12)}:`,
-          ...(result?.failures ?? ['(the proof record is unreadable)']).map((failure) => `- ${failure}`),
-          'Each failure went back to the minion; review stays fenced until a proof passes.',
-        ].join('\n'),
-      });
+    for (const record of this.store.jobProofs(jobId)) {
+      // One record that cannot be followed never holds up the rest.
+      try {
+        await this.commentProof(record, proof);
+      } catch (error) {
+        this.log('error', 'onboarding proof record skipped: its PR comment could not be handled; the rest of the job\'s follow-through goes on', {
+          repo, job: jobId, head: record.head, error: oneLineErrorText(error, 400),
+        });
+      }
+    }
+    // The head the fence waits on (LedgerApi.newestDeliveredHead). Only that
+    // head is worth a directive: a newer delivery already answers an older
+    // failure.
+    const debt = this.opts.ledger.onboardingProofDebt(jobId);
+    const current = debt === null || debt.head === null ? null : this.store.proof(jobId, debt.head);
+    const directive = current !== null && !current.passed ? this.directSoon(current, proof) : null;
+    this.attend(repo, jobId, debt, current, directive);
+  }
+
+  /** One action-required row for Gru per stuck (job, head), posted once
+   * (an existing id, open or resolved, is never posted again) and closed by
+   * onboarding when the head passes, is replaced, or the job ends. */
+  private attend(repo: string, jobId: string, debt: OnboardingProofDebt | null, current: ProofRecord | null, directive: DirectiveStanding | null): void {
+    const job = this.opts.ledger.getJob(jobId);
+    if (debt === null) {
+      this.settleAttention(jobId, undefined, 'the newest delivered head\'s proof passed');
+      return;
+    }
+    this.settleAttention(jobId, debt.head, 'a newer head was delivered');
+    if (job === null || job.prUrl === null) return;
+    const head = debt.head;
+    const reasons: string[] = [];
+    let title: string | null = null;
+    if (head === null) {
+      // A PR with no delivery yet is work in progress, not a stuck proof.
+      if (this.opts.ledger.newestDeliveredHead(jobId) === null) return;
+      title = `Onboarding proof has no head to prove: ${shown(repo)}`;
+      reasons.push(`Job ${jobId}'s newest delivery identifies no commit (it names none, or it is not a proven current candidate), so GC has nothing to prove: the minion must deliver again.`);
+    } else {
+      const failed = this.store.jobProofs(jobId).filter((entry) => !entry.passed).length;
+      const failures = current === null || current.passed ? [] : (readOnboardingProof(current.payload)?.failures ?? ['(the proof record is unreadable)']);
+      let detailed = false;
+      // Each reason about a failed head carries that failure, once.
+      const failedReason = (line: string): void => {
+        reasons.push(line);
+        if (detailed) return;
+        detailed = true;
+        reasons.push(`The proof of ${head.slice(0, 12)} failed:`, ...failures.map((failure) => `- ${failure}`));
+      };
+      if (debt.failed && failed >= ONBOARDING_PROOF_FAILURES_FOR_GRU) {
+        title ??= `Onboarding proof failed ${String(failed)} times: ${shown(repo)}`;
+        failedReason(`Job ${jobId}'s ${MANIFEST_PATH} failed GC's onboarding proof ${String(failed)} times.`);
+      }
+      if (debt.failed && directive === 'exhausted') {
+        title ??= `Onboarding proof failure could not reach the minion: ${shown(repo)}`;
+        failedReason(`${String(ONBOARDING_PROOF_DIRECTIVE_ATTEMPTS)} directives telling job ${jobId}'s minion about its failed proof were refused before any prompt; no more are sent for this head.`);
+      }
+      if (debt.failed && directive === 'settled' && this.settledAgain(jobId, head)) {
+        title ??= `Onboarding proof failure unanswered: ${shown(repo)}`;
+        failedReason(`Job ${jobId}'s minion was told its proof failed and finished that turn, but its newest delivery still names the failed head ${head.slice(0, 12)}.`);
+      }
+      const deferred = this.deferrals.get(jobId);
+      if (deferred !== undefined && deferred.head === head && deferred.count >= ONBOARDING_PROOF_DEFERRALS_FOR_GRU) {
+        title ??= `Onboarding proof deferred ${String(deferred.count)} times: ${shown(repo)}`;
+        reasons.push(`GC deferred the proof of job ${jobId}'s head ${head.slice(0, 12)} ${String(deferred.count)} times in a row. The last reason: ${deferred.reason}`);
+      }
+    }
+    if (title === null) return;
+    const id = onboardingProofAttentionId(jobId, head);
+    if (this.opts.ledger.getNotification(id) !== null) return;
+    this.opts.notifications.post({
+      id,
+      kind: ONBOARDING_PROOF_ATTENTION_KIND,
+      routing: 'action-required',
+      severity: 'error',
+      title,
+      detail: [...reasons, 'Review stays fenced until a proof of the newest delivered head passes. Onboarding closes this row when one does, when a newer head is delivered, or when the job ends.'].join('\n'),
+    });
+    this.log('error', 'onboarding proof is stuck; Gru has a row', { repo, job: jobId, head, notification: id, title });
+  }
+
+  /** A failed head's directive settled while the newest delivery still
+   * names that head: true from the reconcile after the one that first saw it. */
+  private settledAgain(jobId: string, head: string): boolean {
+    const key = `${jobId}\n${head}`;
+    const first = this.settledSeen.get(key);
+    if (first === undefined) {
+      this.settledSeen.set(key, this.reconciles);
+      return false;
+    }
+    return this.reconciles > first;
+  }
+
+  /** Close the job's open attention rows, except the one of `keep` (a head,
+   * or null for the no-head row); `undefined` closes them all. A row's head
+   * is always one the job delivered (or none). */
+  private settleAttention(jobId: string, keep: string | null | undefined, why: string): void {
+    const heads = new Set<string | null>([null]);
+    for (const event of this.opts.ledger.listJobEventsByKinds(jobId, ['job.delivered'], { limit: 500 })) {
+      const sha = (event.payload as { sha?: unknown } | null)?.sha;
+      if (typeof sha === 'string' && sha !== '') heads.add(sha);
+    }
+    for (const head of heads) {
+      if (keep !== undefined && head === keep) continue;
+      const row = this.opts.ledger.getNotification(onboardingProofAttentionId(jobId, head));
+      if (row === null || row.resolvedAt !== null) continue;
+      this.opts.ledger.resolveNotificationById(row.id, 'onboarding-proof');
+      this.log('info', 'onboarding proof attention row closed', { job: jobId, notification: row.id, why });
     }
   }
 
   /** One PR comment per proven head. The attempt is recorded before the
-   * post and the receipt after; once an attempt stands, the marker is looked
-   * for first, so a crash between the two never posts twice. */
+   * post and the receipt after; once an attempt stands, GC first looks for
+   * its marker in a comment of its own, so a crash between the two never
+   * posts twice. A head whose comment fails {@link ONBOARDING_PROOF_COMMENT_ATTEMPTS}
+   * times in this process (a failed lookup counts, and never leads to a
+   * blind post) is recorded as one that cannot be posted. */
   private async commentProof(record: ProofRecord, proof: OnboardingProofOptions): Promise<void> {
     if (record.comment !== null) return;
     const { repo, jobId, head } = record;
@@ -740,30 +865,56 @@ export class OnboardingService {
     if (result === null) throw new Error(`the onboarding proof of ${head} on job ${jobId} is unreadable`);
     const target = { repo: { host: pr.host, owner: pr.owner, repo: pr.repo }, number: pr.number };
     const marker = onboardingProofMarker(jobId, head);
+    const key = `${jobId}\n${head}`;
     try {
       if (record.commentAttempted) {
-        const found = (await proof.github.listIssueComments(target)).find((comment) => comment.body.includes(marker));
-        if (found !== undefined) {
+        const found = await this.ownMarkedComment(target, marker, proof);
+        if (found !== null) {
           this.store.record(ONBOARDING_EVENTS.proofCommented, { repo, job_id: jobId, head, comment_id: found.id, comment_url: found.url,
             detail: 'found by its marker after an interrupted post' }, jobId);
+          this.commentAttempts.delete(key);
           return;
         }
       }
       this.store.record(ONBOARDING_EVENTS.proofCommentAttempt, { repo, job_id: jobId, head, pr_url: prUrl }, jobId);
       const posted = await proof.github.commentOnPull({ ...target, body: renderOnboardingProofComment(jobId, result) });
       this.store.record(ONBOARDING_EVENTS.proofCommented, { repo, job_id: jobId, head, comment_id: posted.id, comment_url: posted.url, detail: 'posted' }, jobId);
+      this.commentAttempts.delete(key);
     } catch (error) {
-      this.log('warn', 'onboarding proof comment not posted; the next reconcile looks for its marker, then retries', { repo, job: jobId, head, error: oneLineErrorText(error, 400) });
+      const reason = redactReviewForPublication(oneLineErrorText(error instanceof Error ? error.message : error, 400));
+      const attempts = (this.commentAttempts.get(key) ?? 0) + 1;
+      if (attempts < ONBOARDING_PROOF_COMMENT_ATTEMPTS) {
+        this.commentAttempts.set(key, attempts);
+        this.log('warn', 'onboarding proof comment not posted; the next reconcile looks for its marker, then retries', { repo, job: jobId, head, attempt: attempts, error: reason });
+        return;
+      }
+      this.commentAttempts.delete(key);
+      this.store.record(ONBOARDING_EVENTS.proofCommented, { repo, job_id: jobId, head, comment_id: null, comment_url: null, detail: `cannot be posted: ${reason}` }, jobId);
+      this.log('error', `onboarding proof comment cannot be posted after ${String(attempts)} attempts; the proof stands in the ledger and is not posted`, {
+        repo, job: jobId, head, error: reason,
+      });
     }
+  }
+
+  /** The comment carrying the marker that the authenticated gh user wrote:
+   * a marker quoted in anyone else's comment is not GC's comment. */
+  private async ownMarkedComment(target: { readonly repo: RepoRef; readonly number: number }, marker: string, proof: OnboardingProofOptions): Promise<GhIssueComment | null> {
+    let login = this.viewerLogins.get(target.repo.host);
+    if (login === undefined) {
+      login = await proof.github.viewerLogin({ host: target.repo.host });
+      this.viewerLogins.set(target.repo.host, login);
+    }
+    const author = login;
+    return (await proof.github.listIssueComments(target)).find((comment) => comment.author === author && comment.body.includes(marker)) ?? null;
   }
 
   /** A failed proof goes to the minion as one durable directive. A request
    * refused before any prompt (state `failed`) is asked again under the next
    * id, a bounded number of times; a request the lane could not take at all
-   * leaves no row, and the next reconcile asks again. */
-  private directSoon(record: ProofRecord, proof: OnboardingProofOptions): void {
+   * leaves no row, and the next reconcile asks again. Returns where the
+   * minion's telling stands. */
+  private directSoon(record: ProofRecord, proof: OnboardingProofOptions): DirectiveStanding {
     const { jobId, head } = record;
-    if (this.directing.has(jobId) || this.abort.signal.aborted) return;
     let requestId: string | null = null;
     for (let attempt = 1; attempt <= ONBOARDING_PROOF_DIRECTIVE_ATTEMPTS; attempt += 1) {
       const id = onboardingProofDirectiveId(jobId, head, attempt);
@@ -774,14 +925,12 @@ export class OnboardingService {
       }
       // Settled, live, or closed by its own recovery: told, being told, or
       // not for this service to resume.
-      if (row.state !== 'failed') return;
+      if (row.state !== 'failed') return (LIVE_DIRECTIVE_STATES as readonly string[]).includes(row.state) ? 'live' : 'settled';
     }
-    if (requestId === null) {
-      this.log('error', `onboarding proof: ${String(ONBOARDING_PROOF_DIRECTIVE_ATTEMPTS)} directives about this failed proof were refused before any prompt; no more are sent for this head`, { job: jobId, head });
-      return;
-    }
+    if (requestId === null) return 'exhausted';
+    if (this.directing.has(jobId) || this.abort.signal.aborted) return 'asking';
     const result = readOnboardingProof(record.payload);
-    if (result === null) return;
+    if (result === null) return 'asking';
     this.directing.add(jobId);
     const sent = requestId;
     this.track(proof.direct({ jobId, requestId: sent, directive: renderOnboardingProofDirective(result), signal: this.abort.signal })
@@ -790,6 +939,7 @@ export class OnboardingService {
         job: jobId, head, request: sent, error: oneLineErrorText(error, 400),
       }))
       .finally(() => this.directing.delete(jobId)));
+    return 'asking';
   }
 
   private isOnboardingJob(repo: string, jobId: string): boolean {
@@ -800,6 +950,10 @@ export class OnboardingService {
     }
   }
 }
+
+/** Where telling the minion about a failed head stands: a request is being
+ * made (or will be), one is live, one settled, or every attempt was refused. */
+type DirectiveStanding = 'asking' | 'live' | 'settled' | 'exhausted';
 
 /** Start onboarding after the service listens. Onboarding is off the heist
  * path: a failure to start is loud, never fatal. */

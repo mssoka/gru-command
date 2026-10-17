@@ -438,6 +438,8 @@ const PRODUCER_RESOLVED_KINDS: Readonly<Record<string, string>> = {
   'lessons.dream-failed': 'a completed dream pass',
   // #427: the row drives onboarding's retry; a disposition would stop it.
   'onboarding.dispatch-failed': 'a dispatched onboarding heist, or a scan that finds none is needed',
+  // #427 PR 1b: one row per stuck (job, head); onboarding closes it.
+  'onboarding.proof-attention': 'a passing proof, a newer delivered head, or the onboarding job ending',
 };
 
 // The alias d is an immutable delivery. A protected root must cite its
@@ -2690,26 +2692,65 @@ export class LedgerApi {
     return latest?.ok === 1 ? null : { revision, head };
   }
 
+  /** The job's newest `job.delivered`, read as correctiveVerificationDebt
+   * reads it (`latestDeliveryForGates(jobId, false)`), and the head it
+   * identifies for review: its sha, or null when that delivery is not a
+   * proven current candidate (historical bookkeeping, an unproven native
+   * candidate, original native gate debt) or names no commit. Null when the
+   * job has no delivery. The onboarding fence and the onboarding service's
+   * follow-through both read the head here (#427 PR 1b). */
+  newestDeliveredHead(jobId: string): { readonly seq: number; readonly head: string | null } | null {
+    const newest = this.latestDeliveryForGates(jobId, false);
+    if (newest === null) return null;
+    const payload = (typeof newest.payload === 'object' && newest.payload !== null ? newest.payload : {}) as { candidate_delivery_proven?: unknown; sha?: unknown };
+    if (payload.candidate_delivery_proven === false || this.db.prepare(`SELECT 1 FROM events d WHERE d.seq = ? AND (${ORIGINAL_NATIVE_GATE_DEBT_SQL} OR ${UNPROVEN_NATIVE_CANDIDATE_SQL})`).get(newest.seq) !== undefined) {
+      // A current candidate delivery must identify the head.
+      return { seq: newest.seq, head: null };
+    }
+    return { seq: newest.seq, head: typeof payload.sha === 'string' && payload.sha !== '' ? payload.sha : null };
+  }
+
   /** #427 PR 1b: an onboarding heist (a job an `onboarding.dispatched`
    * event names; that event carries the job only in its payload) is
-   * reviewed only on a head code has proven. The head is the newest
-   * `job.delivered` sha; the debt stands until an `onboarding.proof` of that
-   * exact head passed. Null = no debt; otherwise the head that must pass
-   * (null when the delivery named none) and whether its proof failed. */
+   * reviewed only on a head code has proven. The head is the one
+   * {@link newestDeliveredHead} identifies; the debt stands until the
+   * FIRST `onboarding.proof` of that exact head passed (the first proof of
+   * a head stands, as the onboarding service reads it). Null = no debt;
+   * otherwise the head that must pass (null when the newest delivery
+   * identifies none) and whether its proof failed. */
   onboardingProofDebt(jobId: string): OnboardingProofDebt | null {
-    const onboarding = this.db.prepare(
+    if (!this.isOnboardingJob(jobId)) return null;
+    const head = this.newestDeliveredHead(jobId)?.head ?? null;
+    return head === null ? { head: null, failed: false } : this.onboardingProofOf(jobId, head);
+  }
+
+  /** The proof debt of one exact head (#427 PR 1b): what a freeze of that
+   * sha owes. Null when the job is no onboarding heist or the first proof
+   * of that head passed. */
+  onboardingProofDebtAt(jobId: string, head: string): OnboardingProofDebt | null {
+    return this.isOnboardingJob(jobId) ? this.onboardingProofOf(jobId, head) : null;
+  }
+
+  private isOnboardingJob(jobId: string): boolean {
+    return this.db.prepare(
       `SELECT 1 FROM events WHERE kind = 'onboarding.dispatched' AND json_extract(payload, '$.job_id') = ? LIMIT 1`,
-    ).get(jobId);
-    if (onboarding === undefined) return null;
-    const delivered = this.latestJobEvent(jobId, 'job.delivered');
-    const sha = (delivered?.payload as { sha?: unknown } | null | undefined)?.sha;
-    if (typeof sha !== 'string' || sha === '') return { head: null, failed: false };
-    const proof = this.db.prepare(
-      `SELECT json_extract(payload, '$.outcome') AS outcome FROM events WHERE job_id = ? AND kind = 'onboarding.proof'
-         AND json_extract(payload, '$.head') = ? ORDER BY seq DESC LIMIT 1`,
-    ).get(jobId, sha) as { outcome: unknown } | undefined;
-    if (proof?.outcome === 'passed') return null;
-    return { head: sha, failed: proof?.outcome === 'failed' };
+    ).get(jobId) !== undefined;
+  }
+
+  /** The FIRST `onboarding.proof` of one head of a job: the proof that
+   * stands for that head (#427 PR 1b), or null when it has none. */
+  firstOnboardingProof(jobId: string, head: string): EventRecord | null {
+    const row = this.db.prepare(
+      `SELECT * FROM events WHERE job_id = ? AND kind = 'onboarding.proof'
+         AND json_extract(payload, '$.head') = ? ORDER BY seq ASC LIMIT 1`,
+    ).get(jobId, head) as Row | undefined;
+    return row === undefined ? null : this.eventFromRow(row);
+  }
+
+  private onboardingProofOf(jobId: string, head: string): OnboardingProofDebt | null {
+    const outcome = (this.firstOnboardingProof(jobId, head)?.payload as { outcome?: unknown } | null | undefined)?.outcome;
+    if (outcome === 'passed') return null;
+    return { head, failed: outcome === 'failed' };
   }
 
   private amendmentFromRow(row: Row): JobAmendmentRecord {

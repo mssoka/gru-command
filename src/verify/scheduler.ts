@@ -1004,6 +1004,22 @@ export class VerificationScheduler {
     return promise;
   }
 
+  /**
+   * Bind the pid of a command a lease holder spawned itself (the holder
+   * runs its own command under {@link acquire}, #427 onboarding proof) to
+   * the lease's slot, persisted as {@link run} records its child: a restart
+   * then judges the loaded slot by that pid's liveness (holder-dead, or
+   * max-age) instead of releasing it as `no-runner` while the command may
+   * still run. A slot already released holds nothing to bind.
+   */
+  bindPid(lease: VerificationLease, pid: number): void {
+    if (!Number.isInteger(pid) || pid <= 0) throw new Error(`a verification slot binds a positive integer pid, got ${String(pid)}`);
+    const slot = this.slots.get(lease.runId);
+    if (slot === undefined) return;
+    slot.pid = pid;
+    this.persistBestEffort();
+  }
+
   /** Release a lease (idempotent) and grant the next FIFO waiter. */
   release(lease: VerificationLease): void {
     if (!this.slots.delete(lease.runId)) return;

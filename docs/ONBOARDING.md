@@ -160,68 +160,122 @@ commands; GC knows no ecosystem.
 
 **Which heads.** A job is an onboarding job only when an
 `onboarding.dispatched` event names it. Once the job has a PR, GC proves
-its newest delivered head (the `sha` of its newest `job.delivered`), once
-per head and one proof at a time across the service. A proof starts on a
-delivery or PR link, at service start, and at the five-minute reconcile.
-Proofs run in every mode: `off` stops new onboarding, never the gate on an
-open heist.
+its newest delivered head, once per head and one proof at a time across the
+service. The head is read as the corrective-verification gate reads the
+newest `job.delivered`: its `sha`, unless that delivery is not a proven
+current candidate or names no commit, in which case there is no head to
+prove until the minion delivers again. Only a full commit id (40 or 64
+lowercase hex characters) is ever cloned. A proof starts on a delivery or
+PR link, at service start, and at the five-minute reconcile. Proofs run in
+every mode: `off` stops new onboarding, never the gate on an open heist.
 
 **What runs:**
 
 1. `git clone --shared --no-checkout` of the managed repository into
    `<data_dir>/onboarding-probes/<job>-<sha12>`, then a detached checkout of
-   the head. Your repository gains no worktree, branch, ref or index entry.
+   the head. Both run with your git configuration, as a lane's
+   `worktree add` does (hooks and fsmonitor off, no prompts), so Git LFS and
+   other filters give the content a lane gets. Your repository gains no
+   worktree, branch, ref or index entry.
 2. That head's own manifest, applied as a lane's bootstrap applies it:
    `[[link]]` and `[[copy]]` from your checkout, then each `[[setup]]`
-   command, timed, under `[worktrees] setup_timeout_ms`.
+   command, timed, under `[worktrees] setup_timeout_ms`. A service stop
+   ends a running setup command's whole process group.
 3. `verify.full`, while holding one slot of the global verification budget
    (the same FIFO and lock-wait timeout as `POST /api/verify`). GC spawns it
    itself with the budget's environment and worker share, bounded by
-   `[verify] run_timeout_ms`, and ends its whole process group. It is not a
-   verification of the job: no `verification.*` event is recorded for the
-   `onboarding-proof` scope, and no verification fence sees it. A manifest
-   without `verify.full` passes this step as "no verify command declared".
-4. Measuring: the git-ignored paths that appeared, each sized with an
-   `lstat` walk that never follows a link, and the checkout's total size
-   without `.git`.
+   `[verify] run_timeout_ms`, and ends its whole process group. Its pid is
+   bound to the slot, so after a crash the restarted scheduler keeps the
+   slot while that pid lives. It is not a verification of the job: no
+   `verification.*` event is recorded for the `onboarding-proof` scope, no
+   verification fence sees it, and `POST /api/verify` refuses that scope
+   (`400 reserved_scope`). A manifest without `verify.full` passes this step
+   as "no verify command declared".
+4. Measuring, against a snapshot taken after the links and copies (so only
+   what setup and verify made counts): the git-ignored paths that appeared,
+   each sized with an `lstat` walk that never follows a link, and the
+   checkout's total size without `.git`. Each `reclaim` entry is checked by
+   an `lstat` of every part of its path, so a link on the way is reported,
+   never walked through.
 
 The checkout is removed whatever the outcome, and a start removes any a
-crash left behind.
+crash left behind. The output tail (the last 4 KiB of the failing
+command's output, cut at a character boundary) and the failures are
+redacted for anything shaped like a credential before they are recorded.
 
 **A proof fails** when a setup command fails or times out; when verify
 exits non-zero or times out; when verify exits 0 in under a second with no
 output ("suspiciously empty": it may test nothing); or when a `reclaim`
-entry did not appear, is not git-ignored, or holds tracked files.
+entry is or lies under a link (GC would delete outside the lane), holds
+tracked files, was already there before setup ran (a `[[copy]]` made it),
+did not appear, or is not git-ignored.
 
 **A proof is deferred, never failed,** when the cause is infrastructure:
 the budget wait timed out, the repository is unavailable, the clone failed,
-or the service is stopping. Nothing is recorded, posted or sent; the next
-reconcile proves the head again.
+the head is not a commit id, or the service is stopping. Nothing is
+recorded, posted or sent; the next reconcile proves the head again.
+
+A proof runs once per commit, so a failure with a transient cause (network,
+registry, load) stands for that head. The directive tells the minion to
+push a new commit (an empty one is fine) and deliver, which gets a fresh
+proof.
 
 **What follows a proof:**
 
-- One `onboarding.proof` event, passed or failed, on the job.
+- One `onboarding.proof` event, passed or failed, on the job. The first
+  proof of a head stands for that head.
 - One PR comment per proven head, with the timings, sizes and lane size,
   carrying a hidden marker `<!-- gru:onboarding-proof job=<id> head=<sha> -->`.
-  GC records the attempt before posting and the receipt after; after a
-  crash it looks for a comment with the marker first and never posts blind.
+  Each failure is rendered as code, so a mention, an issue reference or
+  HTML in it stays inert. The output tail is never posted (the PR may be
+  public): the comment says it went to the minion and is kept in GC's
+  ledger. GC records the attempt before posting and the receipt after;
+  after a crash it first looks for a comment with the marker that the
+  authenticated `gh` user wrote, and never posts blind. After three failed
+  attempts for a head in one run of the service (a failed lookup counts),
+  GC records `onboarding.proof-commented` with no comment and
+  `cannot be posted: <reason>`, logs an error, and stops trying.
 - On a pass, review may arm, and the Perkins packet carries an
   `ONBOARDING PROOF` block when the proof's head is the reviewed sha.
 - On a failure, while that head is still the newest, the minion gets one
   directive with the failure and the output tail (the property-repair
   path). A lane that cannot take it now is asked again at the next
-  reconcile. A job's third failed proof also posts an action-required row
-  for Gru, `onboarding.proof-failing`, naming the job and the last failure.
+  reconcile; a request refused before any prompt is asked again under the
+  next id, up to three times.
+
+**When a head is stuck, Gru gets one row.** An action-required row,
+`onboarding.proof-attention`, id
+`onboarding-proof-attention:<job>:<sha12>` (or `:nohead`), is posted once
+for the job's current head when any of these hold, each named in its
+detail:
+
+- it is the job's third or later failed proof (the title gives the count);
+- the newest delivery identifies no commit, so the minion must deliver
+  again;
+- its proof was deferred three times in a row in this run of the service
+  (the detail gives the last reason; a recorded proof starts the count
+  again, and so does a restart);
+- all three directives about its failure were refused before any prompt;
+- the minion finished the directive about its failure, and at a later
+  reconcile its newest delivery still names that head.
+
+Only onboarding closes the row, and a Gru disposition of it is refused: it
+closes when the head's proof passes, when a newer head is delivered (that
+head gets its own row if it gets stuck), or when the job ends. A row's id
+is never posted again.
 
 **The fence.** Until a passing proof exists for the newest delivered head,
 the lane is busy on every path a corrective verification fences: arm,
 freeze, queued handoff, fallback admission and iteration, and the Silas
-review offer. `force` cannot waive it (the `409 branch_busy` blocker
-carries `onboarding_proof_required_head`). A minion's own review request is
-queued, not refused, and is replayed when the `onboarding.proof` event
-lands. A new delivery is a new head: an earlier head's pass no longer
-counts. The Silas digest still offers registering the PR, since the proof
-needs it.
+review offer. The freeze also checks the exact sha it reviews: a pass of
+the delivered head does not cover an explicit target or a commit pushed
+after the delivery. `force` cannot waive any of it (the `409 branch_busy`
+blocker carries `onboarding_proof_required_head`, and the audit records
+whether force was asked for). A minion's own review request is queued, not
+refused, and is replayed when the `onboarding.proof` event lands, or at the
+next start if it landed while the service was down. A new delivery is a new
+head: an earlier head's pass no longer counts. The Silas digest still
+offers registering the PR, since the proof needs it.
 
 ## Records
 
@@ -241,7 +295,8 @@ failed proof sends:
   failures, setup timings, the verify result, what appeared, each `reclaim`
   entry and the lane size
 - `onboarding.proof-comment-attempt` and `onboarding.proof-commented`, the
-  PR comment's attempt and receipt
+  PR comment's attempt and receipt (posted, found by its marker, or
+  `cannot be posted`)
 
 ## Not yet
 

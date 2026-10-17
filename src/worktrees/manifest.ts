@@ -288,6 +288,9 @@ export interface ApplyManifestOptions {
   readonly worktreePath: string;
   readonly setupTimeoutMs: number;
   readonly log?: Log;
+  /** Stops a running setup command (its whole process group: SIGTERM,
+   * then SIGKILL after the grace) and rejects. Lanes pass none. */
+  readonly signal?: AbortSignal;
 }
 
 /**
@@ -337,7 +340,7 @@ export async function applyWorktreeManifest(
 
   for (const [index, entry] of manifest.setup.entries()) {
     const started = Date.now();
-    await execSetupCommand(entry.command, opts.worktreePath, opts.setupTimeoutMs);
+    await execSetupCommand(entry.command, opts.worktreePath, opts.setupTimeoutMs, opts.signal);
     log('info', 'worktree manifest: setup command ran', {
       command: entry.command,
       index,
@@ -374,11 +377,12 @@ class OutputTail {
 }
 
 /** Run one setup command in the worktree (shell, captured, bounded);
- * non-zero exit or timeout fails loud with the output tail. The command
- * runs as its own process group so a timeout kill reaches the children a
- * shell command spawns (npm ci), and awaiting it never blocks the event
- * loop. */
-async function execSetupCommand(command: string, cwd: string, timeoutMs: number): Promise<void> {
+ * non-zero exit, timeout or an abort fails loud with the output tail. The
+ * command runs as its own process group so a timeout or abort kill reaches
+ * the children a shell command spawns (npm ci), and awaiting it never
+ * blocks the event loop. */
+async function execSetupCommand(command: string, cwd: string, timeoutMs: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted === true) throw new Error(`worktree setup command was stopped before it started: ${command}`);
   let child: ChildProcess;
   try {
     child = spawn('/bin/sh', ['-c', command], {
@@ -414,13 +418,22 @@ async function execSetupCommand(command: string, cwd: string, timeoutMs: number)
     }
   };
   let timedOut = false;
+  let stopped = false;
   let forceKillTimer: NodeJS.Timeout | undefined;
-  const killTimer = setTimeout(() => {
-    timedOut = true;
+  const end = (): void => {
     signalTree('SIGTERM');
     // A command that ignores SIGTERM must not hold the dispatch forever.
-    forceKillTimer = setTimeout(() => signalTree('SIGKILL'), SETUP_KILL_GRACE_MS);
+    forceKillTimer ??= setTimeout(() => signalTree('SIGKILL'), SETUP_KILL_GRACE_MS);
+  };
+  const killTimer = setTimeout(() => {
+    timedOut = true;
+    end();
   }, timeoutMs);
+  const onAbort = (): void => {
+    stopped = true;
+    end();
+  };
+  signal?.addEventListener('abort', onAbort, { once: true });
 
   let outcome: { code: number | null; signal: NodeJS.Signals | null };
   try {
@@ -430,9 +443,15 @@ async function execSetupCommand(command: string, cwd: string, timeoutMs: number)
   } finally {
     clearTimeout(killTimer);
     if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
+    signal?.removeEventListener('abort', onAbort);
   }
 
   const outputTail = tail(stdout.text()) + tail(stderr.text());
+  if (stopped) {
+    throw new Error(
+      `worktree setup command was stopped (its caller aborted): ${command}\noutput tail:\n${outputTail}`,
+    );
+  }
   if (timedOut) {
     throw new Error(
       `worktree setup command timed out after ${timeoutMs}ms: ${command}\noutput tail:\n${outputTail}`,

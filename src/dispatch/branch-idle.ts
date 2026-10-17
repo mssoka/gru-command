@@ -70,13 +70,21 @@ export const BRANCH_BUSY_REVISION_HINT =
 /** The hint when a blocker is an unproven onboarding head (#427 PR 1b):
  * force is not offered, because it cannot stand in for the proof. */
 export const BRANCH_BUSY_ONBOARDING_HINT =
-  'this onboarding heist\'s manifest has no passing onboarding proof on its delivered head — GC proves each new ' +
-  'head itself and sends a failure back to the minion; force cannot skip the proof';
+  'this onboarding heist\'s manifest has no passing onboarding proof of the head under review — GC proves each ' +
+  'delivered head itself and sends a failure back to the minion; force cannot skip the proof';
+
+/** The hint when an onboarding heist's newest delivery names no commit:
+ * there is no head to prove until the minion delivers again. */
+export const BRANCH_BUSY_ONBOARDING_NO_HEAD_HINT =
+  'this onboarding heist\'s newest delivery names no commit, so GC has no head to prove — the minion must deliver ' +
+  'again; force cannot skip the proof';
 
 /** The refusal hint for a blocker set: the unforceable reasons first. */
 export function branchBusyHint(blockers: readonly BranchIdleBlocker[]): string {
   if (blockers.some((blocker) => blocker.revision !== undefined)) return BRANCH_BUSY_REVISION_HINT;
-  if (blockers.some((blocker) => blocker.onboardingProof !== undefined)) return BRANCH_BUSY_ONBOARDING_HINT;
+  const onboarding = blockers.filter((blocker) => blocker.onboardingProof !== undefined);
+  if (onboarding.some((blocker) => blocker.onboardingProof!.head !== null)) return BRANCH_BUSY_ONBOARDING_HINT;
+  if (onboarding.length > 0) return BRANCH_BUSY_ONBOARDING_NO_HEAD_HINT;
   return BRANCH_BUSY_HINT;
 }
 

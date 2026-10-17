@@ -1,22 +1,32 @@
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { DEFAULT_SILAS_CONFIG, loadConfig, type Role } from '../src/config.js';
-import { BranchBusyError, BRANCH_BUSY_ONBOARDING_HINT, laneIsBusy } from '../src/dispatch/branch-idle.js';
+import { BranchBusyError, BRANCH_BUSY_ONBOARDING_HINT, BRANCH_BUSY_ONBOARDING_NO_HEAD_HINT, laneIsBusy } from '../src/dispatch/branch-idle.js';
 import type { GhIssueComment, RepoRef } from '../src/dispatch/github-poll.js';
-import { WaveRunner } from '../src/dispatch/perkins.js';
+import { WaveRunner, type WaveRunnerOptions } from '../src/dispatch/perkins.js';
 import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
 import { EventBus } from '../src/events/bus.js';
-import { LedgerApi } from '../src/ledger/api.js';
+import { LedgerApi, type EventRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import { onboardingJobId } from '../src/onboarding/briefing.js';
-import { ONBOARDING_EVENTS } from '../src/onboarding/ledger.js';
+import { writeOnboardingConsent, onboardingConsentPath } from '../src/onboarding/consent.js';
+import { ONBOARDING_EVENTS, OnboardingLedger } from '../src/onboarding/ledger.js';
 import {
   appendOnboardingProof,
+  ONBOARDING_PROOF_EVIDENCE_MAX_BYTES,
+  OnboardingProofHeadError,
+  onboardingProbePath,
   onboardingProofMarker,
   onboardingProofPayload,
+  readOnboardingProof,
+  renderOnboardingProofComment,
+  renderOnboardingProofDirective,
   renderOnboardingProofEvidence,
   runOnboardingProof,
   type OnboardingProofInput,
@@ -24,11 +34,14 @@ import {
   type OnboardingProofResult,
 } from '../src/onboarding/proof.js';
 import {
-  ONBOARDING_PROOF_FAILING_KIND,
+  ONBOARDING_PROOF_ATTENTION_KIND,
+  ONBOARDING_PROPOSAL_KIND,
   OnboardingService,
+  onboardingProofAttentionId,
   onboardingProofDirectiveId,
   type OnboardingProofDirective,
 } from '../src/onboarding/service.js';
+import { VerificationScheduler, type VerificationRecord } from '../src/verify/scheduler.js';
 import { createVerificationServer, ONBOARDING_PROOF_SCOPE, type VerificationServer } from '../src/verify/server.js';
 import { FROZEN_SPEC_MAX_BYTES } from '../src/dispatch/perkins-review/artifacts.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
@@ -61,32 +74,63 @@ function temp(prefix: string): string {
   return dir;
 }
 
+const pause = (ms: number): Promise<void> => new Promise((resolve) => { setTimeout(resolve, ms); });
+
+async function until(condition: () => boolean, what: string): Promise<void> {
+  for (let spins = 0; spins < 400 && !condition(); spins += 1) await pause(5);
+  if (!condition()) throw new Error(`timed out waiting for ${what}`);
+}
+
+const alive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/** A process the proof ended is gone (an orphan is reaped by init). */
+async function expectGone(pid: number): Promise<void> {
+  expect(Number.isInteger(pid) && pid > 0).toBe(true);
+  for (let spins = 0; spins < 300 && alive(pid); spins += 1) await pause(10);
+  expect(alive(pid)).toBe(false);
+}
+
+/** The pid a command wrote, once it is there. */
+async function pidFrom(file: string): Promise<number> {
+  await until(() => existsSync(file) && readFileSync(file, 'utf8').trim() !== '', `a pid in ${file}`);
+  return Number(readFileSync(file, 'utf8').trim());
+}
+
 const IDENTITY = ['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid'];
 const JOB = onboardingJobId('fixture-app', 1);
 const PR_URL = 'https://github.com/acme/fixture-app/pull/7';
 const H1 = '1'.repeat(40);
 const H2 = '2'.repeat(40);
 const H3 = '3'.repeat(40);
+const H4 = '4'.repeat(40);
+const H5 = '5'.repeat(40);
+/** 36 characters after `ghp_`: a GitHub token shape the redaction knows. */
+const TOKEN = `ghp_${'A1b2C3d4E5'.repeat(3)}abcdef`;
 
-function bootLedger(): { readonly ledger: LedgerApi; readonly bus: EventBus; readonly dir: string } {
-  const dir = temp('gru-onboarding-proof-db-');
-  const db = new LedgerDb(dir);
+function bootLedger(): { readonly ledger: LedgerApi; readonly bus: EventBus; readonly db: LedgerDb } {
+  const db = new LedgerDb(temp('gru-onboarding-proof-db-'));
   closers.push(() => db.close());
   const bus = new EventBus({});
-  return { ledger: new LedgerApi(db.handle, { bus }), bus, dir };
+  return { ledger: new LedgerApi(db.handle, { bus }), bus, db };
 }
 
 /** An onboarding heist as the service records it: its job, then the
  * `onboarding.dispatched` event that alone makes the job an onboarding job. */
-function onboardingJob(ledger: LedgerApi, jobId = JOB): void {
-  ledger.addJob({ id: jobId, repo: 'fixture-app', title: 'Onboard fixture-app to GC', briefing: 'Write the manifest.' });
+function onboardingJob(ledger: LedgerApi, jobId = JOB, repo = 'fixture-app'): void {
+  ledger.addJob({ id: jobId, repo, title: `Onboard ${repo} to GC`, briefing: 'Write the manifest.' });
   ledger.setJobStatus(jobId, 'working');
-  ledger.appendCustomEvent({ kind: ONBOARDING_EVENTS.dispatched, payload: { repo: 'fixture-app', job_id: jobId, launched_by: 'autonomous' } });
+  ledger.appendCustomEvent({ kind: ONBOARDING_EVENTS.dispatched, payload: { repo, job_id: jobId, launched_by: 'autonomous' } });
 }
 
-const deliver = (ledger: LedgerApi, head: string, jobId = JOB): void => {
+const deliver = (ledger: LedgerApi, head: string | null, jobId = JOB): EventRecord =>
   ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: head } });
-};
 
 // ------------------------------------------------------------------
 // The real proof: throwaway checkout, setup, leased verify, measure
@@ -152,6 +196,8 @@ function proven(outcome: OnboardingProofOutcome): OnboardingProofResult {
 const verificationEvents = (ledger: LedgerApi): readonly unknown[] =>
   ledger.listEvents({ limit: 1000 }).filter((event) => event.kind.startsWith('verification.'));
 
+const gitLfs = spawnSync('git', ['lfs', 'version'], { encoding: 'utf8' }).status === 0;
+
 describe('the proof (real checkout, setup and leased verify)', () => {
   it('Pass: setup and verify succeed, reclaim build appears ignored; timings, sizes and lane size are measured; nothing is left and nothing is verification evidence', async () => {
     const lane = await proofLane([
@@ -169,7 +215,7 @@ describe('the proof (real checkout, setup and leased verify)', () => {
     expect(result.setup).toEqual([{ command: 'mkdir -p build && printf 12345 > build/out', ms: expect.any(Number), ok: true }]);
     expect(result.verify).toMatchObject({ command: 'test -f build/out && echo tests passed', exitCode: 0, timedOut: false, workers: 2, outputBytes: 13 });
     expect(result.appeared).toEqual([{ path: 'build/', bytes: 5 }]);
-    expect(result.reclaim).toEqual([{ path: 'build', appeared: true, ignored: true, trackedFiles: 0, bytes: 5 }]);
+    expect(result.reclaim).toEqual([{ path: 'build', appeared: true, ignored: true, trackedFiles: 0, bytes: 5, link: false }]);
     expect(result.laneBytes).toBeGreaterThan(5);
     // The proof leaves nothing behind and touches nothing of the user's.
     expect(readdirSync(lane.probes)).toEqual([]);
@@ -202,6 +248,26 @@ describe('the proof (real checkout, setup and leased verify)', () => {
     expect(readdirSync(lane.probes)).toEqual([]);
   });
 
+  it('Verify fails: verify.full prints and exits 1 — failed as "verify.full exited 1", its output tail kept', async () => {
+    const lane = await proofLane('[verify]\nfull = "echo 1 failing; exit 1"\n');
+    const result = proven(await lane.prove());
+    expect(result).toMatchObject({ passed: false, failures: ['verify.full exited 1'], verify: { exitCode: 1, timedOut: false } });
+    expect(result.outputTail).toContain('1 failing');
+    expect(readdirSync(lane.probes)).toEqual([]);
+  });
+
+  it('Verify hangs: past run_timeout_ms its whole process group is ended — timed out, the background child gone, the budget slot back', async () => {
+    const pidFile = join(temp('gru-onboarding-proof-pid-'), 'child.pid');
+    const lane = await proofLane(`[verify]\nfull = "sleep 30 & echo $! > ${pidFile}; sleep 30"\n`);
+    const started = Date.now();
+    const result = proven(await lane.prove({ runTimeoutMs: 300, killGraceMs: 100 }));
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(result).toMatchObject({ passed: false, failures: ['verify.full timed out after 300 ms'], verify: { timedOut: true } });
+    await expectGone(await pidFrom(pidFile));
+    expect(lane.server.view()).toMatchObject({ activeRuns: 0, queuedRuns: 0 });
+    expect(readdirSync(lane.probes)).toEqual([]);
+  });
+
   it('Bad reclaim: a tracked folder, a folder nothing creates and a folder git does not ignore each fail by name; an empty ignored folder is sound', async () => {
     const lane = await proofLane([
       'reclaim = ["src", "missing", "cache", "build"]',
@@ -218,7 +284,40 @@ describe('the proof (real checkout, setup and leased verify)', () => {
       'reclaim "missing" did not appear after setup and verify.full',
       'reclaim "cache" is not git-ignored',
     ]);
-    expect(result.reclaim.find((entry) => entry.path === 'build')).toEqual({ path: 'build', appeared: true, ignored: true, trackedFiles: 0, bytes: 0 });
+    expect(result.reclaim.find((entry) => entry.path === 'build')).toEqual({ path: 'build', appeared: true, ignored: true, trackedFiles: 0, bytes: 0, link: false });
+    expect(readdirSync(lane.probes)).toEqual([]);
+  });
+
+  it('Links and copies are applied as a lane applies them, never counted as output: a reclaim under a link fails by name without being walked, and a folder a [[copy]] made does not satisfy a reclaim', async () => {
+    const lane = await proofLane([
+      'reclaim = ["node_modules/.cache", "seeded"]',
+      '[[link]]',
+      'at = "node_modules"',
+      'to = "shared-modules"',
+      '[[copy]]',
+      'from = ".env.local"',
+      'to = "seeded/.env.local"',
+      '[verify]',
+      'full = "test -L node_modules && test -f node_modules/.cache/keep && test -f seeded/.env.local && echo linked and copied"',
+      '',
+    ].join('\n'), { files: { '.gitignore': 'build/\nnode_modules\nseeded/\n' } });
+    // The link target and the copied file live in the user's checkout.
+    mkdirSync(join(lane.repo.path, 'shared-modules', '.cache'), { recursive: true });
+    writeFileSync(join(lane.repo.path, 'shared-modules', '.cache', 'keep'), 'the owner\'s own cache\n');
+    writeFileSync(join(lane.repo.path, '.env.local'), 'SEED=1\n');
+    const result = proven(await lane.prove());
+    expect(result.verify).toMatchObject({ exitCode: 0 });
+    expect(result.failures).toEqual([
+      'reclaim "node_modules/.cache" is or lies under a link: GC would delete outside the lane',
+      'reclaim "seeded" was already there before setup ran (a [[copy]] made it): only what setup or verify.full create can be reclaimed',
+    ]);
+    expect(result.reclaim).toEqual([
+      { path: 'node_modules/.cache', appeared: false, ignored: false, trackedFiles: 0, bytes: null, link: true },
+      { path: 'seeded', appeared: false, ignored: true, trackedFiles: 0, bytes: 7, link: false },
+    ]);
+    // Neither the link nor the copy appeared: setup and verify made nothing.
+    expect(result).toMatchObject({ appeared: [], appearedCount: 0 });
+    expect(readFileSync(join(lane.repo.path, 'shared-modules', '.cache', 'keep'), 'utf8')).toBe('the owner\'s own cache\n');
     expect(readdirSync(lane.probes)).toEqual([]);
   });
 
@@ -226,6 +325,79 @@ describe('the proof (real checkout, setup and leased verify)', () => {
     const lane = await proofLane('[[setup]]\ncommand = "true"\n');
     const result = proven(await lane.prove());
     expect(result).toMatchObject({ passed: true, verify: { command: null } });
+  });
+
+  it.skipIf(!gitLfs)('Git LFS: the checkout is built as a lane is, with the user\'s git config, so setup sees an LFS file\'s content, not its pointer', async () => {
+    // The user's global config with git-lfs installed, as `git lfs install` writes it.
+    const gitconfig = join(temp('gru-onboarding-proof-gitconfig-'), 'gitconfig');
+    writeFileSync(gitconfig, '[filter "lfs"]\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n\tprocess = git-lfs filter-process\n\trequired = true\n');
+    const previous = process.env['GIT_CONFIG_GLOBAL'];
+    process.env['GIT_CONFIG_GLOBAL'] = gitconfig;
+    try {
+      const lane = await proofLane('[[setup]]\ncommand = "grep -q real-content big.bin"\n', {
+        files: { '.gitattributes': 'big.bin filter=lfs diff=lfs merge=lfs -text\n', 'big.bin': 'real-content\n' },
+      });
+      expect(lane.repo.git(['cat-file', '-p', `${lane.head}:big.bin`])).toContain('git-lfs.github.com/spec');
+      const result = proven(await lane.prove());
+      expect(result).toMatchObject({ passed: true, setup: [{ command: 'grep -q real-content big.bin', ok: true }] });
+    } finally {
+      if (previous === undefined) delete process.env['GIT_CONFIG_GLOBAL'];
+      else process.env['GIT_CONFIG_GLOBAL'] = previous;
+    }
+  });
+
+  it('A head that is not a commit id is refused before anything touches the disk; a probe path refuses one loudly', async () => {
+    const lane = await proofLane('[verify]\nfull = "echo tests passed"\n');
+    const parent = dirname(lane.probes);
+    writeFileSync(join(parent, 'keep'), 'outside the probes folder\n');
+    for (const head of ['../x', '-x', `../${'a'.repeat(40)}`, 'A'.repeat(40)]) {
+      expect(await lane.prove({ head })).toEqual({ kind: 'deferred', reason: expect.stringContaining('is not a full commit id; nothing was cloned') });
+    }
+    expect(existsSync(lane.probes)).toBe(false);
+    expect(readdirSync(parent)).toEqual(['keep']);
+    expect(() => onboardingProbePath(lane.probes, JOB, '../x')).toThrow(OnboardingProofHeadError);
+    expect(onboardingProbePath(lane.probes, JOB, H1)).toBe(join(lane.probes, `${JOB}-${H1.slice(0, 12)}`));
+  });
+
+  it('A head the repository does not have: the clone cannot check it out — deferred, nothing left', async () => {
+    const lane = await proofLane('[verify]\nfull = "echo tests passed"\n');
+    expect(await lane.prove({ head: 'f'.repeat(40) })).toEqual({ kind: 'deferred', reason: expect.stringContaining(`the throwaway clone of ${'f'.repeat(12)} failed`) });
+    expect(readdirSync(lane.probes)).toEqual([]);
+  });
+
+  it('Output is bounded in bytes: a character split across chunks stays whole, and a multibyte tail keeps at most 4 KiB', async () => {
+    const lane = await proofLane([
+      '[verify]',
+      // 5000 bytes of two-byte characters, then a euro sign written in two pieces.
+      'full = \'\'\'i=0; while [ $i -lt 2500 ]; do printf \'\\303\\251\'; i=$((i+1)); done; printf \'\\342\\202\'; sleep 0.3; printf \'\\254 end\\n\'; exit 1\'\'\'',
+      '',
+    ].join('\n'));
+    const result = proven(await lane.prove());
+    expect(result.failures).toEqual(['verify.full exited 1']);
+    expect(result.verify?.outputBytes).toBe(5000 + 3 + 5);
+    expect(result.outputTail.endsWith('é€ end\n')).toBe(true);
+    expect(result.outputTail).not.toContain('�');
+    expect(Buffer.byteLength(result.outputTail, 'utf8')).toBeLessThanOrEqual(4 * 1024);
+    expect(Buffer.byteLength(result.outputTail, 'utf8')).toBeGreaterThan(4 * 1024 - 2);
+  });
+
+  it('A credential in the output or a failure is redacted before it is recorded or sent to the minion; the PR comment carries no output tail', async () => {
+    const lane = await proofLane(`[verify]\nfull = "printf '%s-%s %s' tail line ${TOKEN}; exit 1"\n`);
+    const result = proven(await lane.prove());
+    expect(result.outputTail).toBe('tail-line [REDACTED]');
+    const payload = onboardingProofPayload('fixture-app', JOB, result);
+    expect(JSON.stringify(payload)).not.toContain(TOKEN);
+    const read = readOnboardingProof(payload)!;
+    expect(renderOnboardingProofDirective(read)).toContain('tail-line [REDACTED]');
+    const comment = renderOnboardingProofComment(JOB, read);
+    expect(comment).not.toContain('tail-line');
+    expect(comment).not.toContain(TOKEN);
+    expect(comment).toContain('output tail went to the minion with this failure and is kept in GC\'s ledger; it is not posted here');
+    // A failure quoting a setup command is redacted too.
+    const setup = await proofLane(`[[setup]]\ncommand = "export GITHUB_TOKEN=${TOKEN}; exit 3"\n`);
+    const failed = proven(await setup.prove());
+    expect(failed.failures).toEqual([expect.stringContaining('[REDACTED]')]);
+    expect(JSON.stringify(onboardingProofPayload('fixture-app', JOB, failed))).not.toContain(TOKEN);
   });
 
   it('Budget busy: the slot wait times out — deferred, and no verification.* event is recorded for the proof scope', async () => {
@@ -250,14 +422,76 @@ describe('the proof (real checkout, setup and leased verify)', () => {
     const held = await budget.acquire({ jobId: 'other-job', scope: 'full', command: 'npm test', cwd: lane.repo.path });
     const stop = new AbortController();
     const proving = lane.prove({ signal: stop.signal });
-    for (let spins = 0; spins < 400 && lane.server.view().queuedRuns === 0; spins += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    for (let spins = 0; spins < 400 && lane.server.view().queuedRuns === 0; spins += 1) await pause(5);
     expect(lane.server.view().queuedRuns).toBe(1);
     stop.abort();
     expect(await proving).toEqual({ kind: 'deferred', reason: 'the service is stopping' });
     budget.release(held);
-    for (let spins = 0; spins < 400 && lane.server.view().activeRuns > 0; spins += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    for (let spins = 0; spins < 400 && lane.server.view().activeRuns > 0; spins += 1) await pause(5);
     expect(lane.server.view()).toMatchObject({ activeRuns: 0, queuedRuns: 0 });
     expect(readdirSync(lane.probes)).toEqual([]);
+  });
+
+  it('A stop during setup ends the setup command\'s process group: deferred at once, the command gone, the checkout removed', async () => {
+    const pidFile = join(temp('gru-onboarding-proof-pid-'), 'setup.pid');
+    const lane = await proofLane(`[[setup]]\ncommand = "sleep 30 & echo $! > ${pidFile}; wait"\n[verify]\nfull = "echo never"\n`);
+    const stop = new AbortController();
+    const proving = lane.prove({ signal: stop.signal });
+    const pid = await pidFrom(pidFile);
+    const stopped = Date.now();
+    stop.abort();
+    expect(await proving).toEqual({ kind: 'deferred', reason: 'the service is stopping' });
+    expect(Date.now() - stopped).toBeLessThan(5_000);
+    await expectGone(pid);
+    expect(readdirSync(lane.probes)).toEqual([]);
+  });
+
+  it('POST /api/verify refuses the reserved onboarding-proof scope by name, so a manifest scope of that name never runs unrecorded', async () => {
+    const lane = await proofLane('[verify]\nfull = "echo tests passed"\nonboarding-proof = "echo hidden"\n');
+    const http = createServer((req, res) => {
+      if (lane.server.requestHook(req, res, new URL(req.url ?? '/', 'http://localhost').pathname)) return;
+      res.writeHead(404);
+      res.end();
+    });
+    await new Promise<void>((resolve) => { http.listen(0, '127.0.0.1', resolve); });
+    closers.push(() => new Promise<void>((resolve) => { http.close(() => resolve()); }));
+    const response = await fetch(`http://127.0.0.1:${String((http.address() as AddressInfo).port)}/api/verify`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer onboarding-proof-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ job_id: JOB, scope: 'onboarding-proof' }),
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: 'reserved_scope', detail: expect.stringContaining('"onboarding-proof" is reserved') });
+    expect(verificationEvents(lane.ledger)).toEqual([]);
+  });
+});
+
+describe('the proof\'s budget slot across a restart', () => {
+  it('a verify pid bound to the slot keeps it held on reload while that pid lives, and releases it once the pid is dead', async () => {
+    const limits = { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 1_000, runTimeoutMs: 60_000 };
+    const reload = async (pid: number): Promise<{ readonly scheduler: VerificationScheduler; readonly records: VerificationRecord[] }> => {
+      const storageDir = temp('gru-onboarding-proof-sched-');
+      const crashed = new VerificationScheduler({ storageDir, limits });
+      closers.push(() => crashed.dispose());
+      const lease = await crashed.acquire({ jobId: JOB, scope: ONBOARDING_PROOF_SCOPE, command: 'make test', cwd: storageDir, head: H1 });
+      crashed.bindPid(lease, pid);
+      // A new process loads the state the crashed one left.
+      const records: VerificationRecord[] = [];
+      const scheduler = new VerificationScheduler({ storageDir, limits, record: (event) => { records.push(event); } });
+      closers.push(() => scheduler.dispose());
+      scheduler.start();
+      return { scheduler, records };
+    };
+    // This test's own pid stands in for an orphaned verify that still runs.
+    const live = await reload(process.pid);
+    expect(live.scheduler.view()).toMatchObject({ lockInUse: true });
+    expect(live.records.filter((event) => event.kind === 'verification.stale-released')).toEqual([]);
+    const ended = spawnSync('true');
+    const dead = await reload(ended.pid!);
+    expect(dead.scheduler.view()).toMatchObject({ lockInUse: false });
+    expect(dead.records.filter((event) => event.kind === 'verification.stale-released').map((event) => event.payload)).toEqual([
+      expect.objectContaining({ pid: ended.pid, scope: ONBOARDING_PROOF_SCOPE, reason: 'holder-dead' }),
+    ]);
   });
 });
 
@@ -272,51 +506,89 @@ function result(head: string, failures: readonly string[] = [], outputTail = '')
     verify: failures.length > 0 && failures[0]!.startsWith('setup') ? null
       : { command: 'make test', exitCode: failures.length === 0 ? 0 : 1, signal: null, timedOut: false, ms: 4200, queuedMs: 0, workers: 2, outputBytes: 900 },
     appeared: [{ path: 'build/', bytes: 2048 }], appearedCount: 1,
-    reclaim: [{ path: 'build', appeared: true, ignored: true, trackedFiles: 0, bytes: 2048 }],
+    reclaim: [{ path: 'build', appeared: true, ignored: true, trackedFiles: 0, bytes: 2048, link: false }],
     laneBytes: 4096,
   };
 }
 
+/** A proof event of `head` on the job, as the service records one. */
+const proofEvent = (ledger: LedgerApi, head: string, passed: boolean, jobId = JOB): void => {
+  ledger.appendCustomEvent({ kind: ONBOARDING_EVENTS.proof, jobId,
+    payload: onboardingProofPayload('fixture-app', jobId, result(head, passed ? [] : ['verify.full exited 1'])) });
+};
+
+type HarnessComment = GhIssueComment & { readonly pr: string };
+
 interface ServiceHarness {
   readonly ledger: LedgerApi;
+  readonly db: LedgerDb;
   readonly notifications: NotificationCenter;
   readonly probes: string;
+  readonly instanceDir: string;
   readonly runs: OnboardingProofInput[];
-  readonly comments: (GhIssueComment & { readonly pr: string })[];
+  readonly comments: HarnessComment[];
   readonly posts: string[];
   readonly lookups: number[];
   readonly directives: OnboardingProofDirective[];
   readonly intervals: (() => void)[];
+  readonly logs: { readonly level: string; readonly msg: string }[];
+  /** Origin probes and dispatches (onboarding's scan side). */
+  readonly scans: { probes: number; dispatches: number };
+  /** Comment posts tried (landed or not). */
+  postAttempts: number;
   /** What the next proof ends in (default: passed). */
   outcome: (input: OnboardingProofInput) => OnboardingProofOutcome;
   /** Throw this from the next comment post after it lands (a crash before the receipt). */
   crashAfterPost: boolean;
+  /** Throw from the next comment post before it lands (a crash between the attempt and the post). */
+  crashBeforePost: boolean;
+  /** Every comment post is refused with this while set. */
+  refusePost: string | null;
+  /** Every comment lookup fails with this while set. */
+  refuseLookup: string | null;
   /** The directive path refuses with this while set. */
   refuseDirective: string | null;
   service(opts?: { readonly mode?: 'proposed' | 'autonomous' | 'off' }): OnboardingService;
+  /** Gru's onboarding proof rows. */
+  attention(): readonly { readonly id: string; readonly title: string; readonly detail: string | null; readonly open: boolean }[];
 }
 
+/** The authenticated gh user in the harness: GC's own comments carry it. */
+const VIEWER = 'gru-bot';
+
 function serviceHarness(): ServiceHarness {
-  const { ledger, bus } = bootLedger();
+  const { ledger, bus, db } = bootLedger();
   const notifications = new NotificationCenter({ ledger, bus });
   const probes = join(temp('gru-onboarding-proof-svc-'), 'onboarding-probes');
+  const instanceDir = temp('gru-onboarding-proof-instance-');
   const services: OnboardingService[] = [];
   closers.push(() => { for (const service of services) service.stop(); });
   const h: ServiceHarness = {
-    ledger, notifications, probes,
-    runs: [], comments: [], posts: [], lookups: [], directives: [], intervals: [],
+    ledger, db, notifications, probes, instanceDir,
+    runs: [], comments: [], posts: [], lookups: [], directives: [], intervals: [], logs: [],
+    scans: { probes: 0, dispatches: 0 },
+    postAttempts: 0,
     outcome: (input) => ({ kind: 'proven', result: result(input.head) }),
     crashAfterPost: false,
+    crashBeforePost: false,
+    refusePost: null,
+    refuseLookup: null,
     refuseDirective: null,
     service(opts = {}) {
       const service = new OnboardingService({
         onboarding: { mode: opts.mode ?? 'proposed' },
         workspaceRoot: '/fixture/workspace',
         managedRepos: ['fixture-app'],
-        instanceDir: temp('gru-onboarding-proof-instance-'),
+        instanceDir,
         ledger, bus, notifications,
-        dispatch: async () => { throw new Error('no dispatch in the proof harness'); },
-        probe: async () => ({ state: 'unverified', reason: 'not probed in the proof harness' }),
+        dispatch: async () => {
+          h.scans.dispatches += 1;
+          throw new Error('no dispatch in the proof harness');
+        },
+        probe: async () => {
+          h.scans.probes += 1;
+          return { state: 'unverified', reason: 'not probed in the proof harness' };
+        },
         resolveRepoPath: async () => ({ kind: 'available', path: '/fixture/workspace/fixture-app' }),
         proof: {
           probesDir: probes, setupTimeoutMs: 1_000, runTimeoutMs: 1_000,
@@ -327,7 +599,11 @@ function serviceHarness(): ServiceHarness {
           },
           github: {
             commentOnPull: async (input: { readonly repo: RepoRef; readonly number: number; readonly body: string }) => {
-              const comment = { id: 100 + h.comments.length, body: input.body, url: `${PR_URL}#issuecomment-${String(100 + h.comments.length)}`, pr: `${input.repo.owner}/${input.repo.repo}#${String(input.number)}` };
+              h.postAttempts += 1;
+              if (h.refusePost !== null) throw new Error(h.refusePost);
+              if (h.crashBeforePost) throw new Error('the service died before the post landed');
+              const id = 100 + h.comments.length;
+              const comment = { id, body: input.body, url: `${PR_URL}#issuecomment-${String(id)}`, author: VIEWER, pr: `${input.repo.owner}/${input.repo.repo}#${String(input.number)}` };
               h.comments.push(comment);
               h.posts.push(input.body);
               if (h.crashAfterPost) throw new Error('the service died before the receipt');
@@ -335,8 +611,10 @@ function serviceHarness(): ServiceHarness {
             },
             listIssueComments: async (input: { readonly repo: RepoRef; readonly number: number }) => {
               h.lookups.push(input.number);
+              if (h.refuseLookup !== null) throw new Error(h.refuseLookup);
               return h.comments;
             },
+            viewerLogin: async () => VIEWER,
           },
           direct: async (input) => {
             if (h.refuseDirective !== null) throw new Error(h.refuseDirective);
@@ -345,11 +623,13 @@ function serviceHarness(): ServiceHarness {
           },
         },
         setInterval: ((run: () => void) => { h.intervals.push(run); return { unref() {} }; }) as unknown as typeof setInterval,
-        log: () => {},
+        log: (level, msg) => { h.logs.push({ level, msg }); },
       });
       services.push(service);
       return service;
     },
+    attention: () => ledger.listNotifications({ limit: 500 }).filter((row) => row.kind === ONBOARDING_PROOF_ATTENTION_KIND)
+      .map((row) => ({ id: row.id, title: row.title, detail: row.detail, open: row.resolvedAt === null })),
   };
   return h;
 }
@@ -360,8 +640,20 @@ async function started(service: OnboardingService): Promise<OnboardingService> {
   return service;
 }
 
+/** One reconcile interval of the newest service, then everything it started. */
+async function tick(h: ServiceHarness, service: OnboardingService): Promise<void> {
+  h.intervals.at(-1)!();
+  await service.idle();
+}
+
 const proofEvents = (ledger: LedgerApi, jobId = JOB): readonly Record<string, unknown>[] =>
   ledger.listJobEventsByKinds(jobId, [ONBOARDING_EVENTS.proof], { limit: 100 }).map((event) => event.payload as Record<string, unknown>).reverse();
+
+const commentReceipts = (ledger: LedgerApi): readonly Record<string, unknown>[] =>
+  ledger.listJobEventsByKinds(JOB, [ONBOARDING_EVENTS.proofCommented], { limit: 100 }).map((event) => event.payload as Record<string, unknown>).reverse();
+
+const failing = (input: OnboardingProofInput, failure = 'verify.full exited 1'): OnboardingProofOutcome =>
+  ({ kind: 'proven', result: result(input.head, [failure], 'FAIL test/app.test.ts') });
 
 describe('the service: once per (job, head), after the PR, with its comment', () => {
   it('Pass: the PR link triggers one proof of the delivered head; the fence lifts and one marked comment carries the evidence', async () => {
@@ -390,6 +682,7 @@ describe('the service: once per (job, head), after the PR, with its comment', ()
     expect(h.comments[0]!.body).toContain('reclaim `build`: 2.0 KiB, git-ignored');
     expect(h.comments[0]!.body).toContain('lane size without `.git`: 4.0 KiB');
     expect(h.directives).toEqual([]);
+    expect(h.attention()).toEqual([]);
     // Every later trigger finds the head proven and posted: nothing repeats.
     h.intervals[0]!();
     deliver(h.ledger, H1);
@@ -398,7 +691,7 @@ describe('the service: once per (job, head), after the PR, with its comment', ()
     expect(h.comments).toHaveLength(1);
   });
 
-  it('Setup fails: a failed proof; the directive carries the failure and output tail, the comment says failed, and the fence stays', async () => {
+  it('Setup fails: a failed proof; the directive carries the failure and output tail and says a proof runs once per commit; the comment says failed without the tail; the fence stays', async () => {
     const h = serviceHarness();
     onboardingJob(h.ledger);
     h.ledger.setJobPr(JOB, PR_URL);
@@ -410,18 +703,20 @@ describe('the service: once per (job, head), after the PR, with its comment', ()
     expect(h.ledger.onboardingProofDebt(JOB)).toEqual({ head: H1, failed: true });
     expect(laneIsBusy(h.ledger, h.ledger.getJob(JOB)!)).toBe(true);
     expect(h.comments.map((comment) => comment.body)).toEqual([expect.stringContaining('GC onboarding proof: failed')]);
-    expect(h.comments[0]!.body).toContain('npm ERR! missing token');
+    expect(h.comments[0]!.body).not.toContain('npm ERR! missing token');
+    expect(h.comments[0]!.body).toContain('output tail went to the minion');
     expect(h.directives).toHaveLength(1);
     expect(h.directives[0]).toMatchObject({ jobId: JOB, requestId: onboardingProofDirectiveId(JOB, H1, 1) });
     expect(h.directives[0]!.directive).toContain(`onboarding proof of your manifest FAILED at ${H1}`);
     expect(h.directives[0]!.directive).toContain('setup command 1 failed');
     expect(h.directives[0]!.directive).toContain('npm ERR! missing token');
+    expect(h.directives[0]!.directive).toContain('A proof runs once per commit. If the output shows a transient cause (network, registry, load), push a new commit (an empty commit is fine) and deliver to get a fresh proof.');
     expect(h.ledger.getDirective(onboardingProofDirectiveId(JOB, H1, 1))?.state).toBe('dispatching');
     // The failed head is never proven again, and the minion is told once.
-    h.intervals[0]!();
-    await service.idle();
+    await tick(h, service);
     expect(h.runs).toHaveLength(1);
     expect(h.directives).toHaveLength(1);
+    expect(h.attention()).toEqual([]);
   });
 
   it('New head: a re-delivery is proven on its own; the earlier head\'s pass no longer lifts the fence', async () => {
@@ -432,7 +727,7 @@ describe('the service: once per (job, head), after the PR, with its comment', ()
     deliver(h.ledger, H1);
     await service.idle();
     expect(h.ledger.onboardingProofDebt(JOB)).toBeNull();
-    h.outcome = (input) => ({ kind: 'proven', result: result(input.head, ['verify.full exited 1'], 'FAIL test/app.test.ts') });
+    h.outcome = (input) => failing(input);
     deliver(h.ledger, H2);
     expect(h.ledger.onboardingProofDebt(JOB)).toEqual({ head: H2, failed: false });
     await service.idle();
@@ -455,8 +750,7 @@ describe('the service: once per (job, head), after the PR, with its comment', ()
     expect(h.directives).toEqual([]);
     expect(h.ledger.onboardingProofDebt(JOB)).toEqual({ head: H1, failed: false });
     h.outcome = (input) => ({ kind: 'proven', result: result(input.head) });
-    h.intervals[0]!();
-    await service.idle();
+    await tick(h, service);
     expect(h.runs).toHaveLength(2);
     expect(proofEvents(h.ledger)).toEqual([expect.objectContaining({ head: H1, outcome: 'passed' })]);
     expect(h.ledger.onboardingProofDebt(JOB)).toBeNull();
@@ -483,6 +777,71 @@ describe('the service: once per (job, head), after the PR, with its comment', ()
     });
   });
 
+  it('Crash before post: the attempt stands but nothing landed; the restart looks, finds no comment of GC\'s own (a quoted marker is not one), and posts once', async () => {
+    const h = serviceHarness();
+    onboardingJob(h.ledger);
+    h.ledger.setJobPr(JOB, PR_URL);
+    h.crashBeforePost = true;
+    const first = await started(h.service());
+    deliver(h.ledger, H1);
+    await first.idle();
+    first.stop();
+    expect(h.posts).toEqual([]);
+    expect(h.ledger.listJobEventsByKinds(JOB, [ONBOARDING_EVENTS.proofCommentAttempt])).toHaveLength(1);
+    // Someone else quoted GC's marker on the PR.
+    h.comments.push({ id: 50, body: `quoting ${onboardingProofMarker(JOB, H1)}`, url: `${PR_URL}#issuecomment-50`, author: 'someone-else', pr: 'acme/fixture-app#7' });
+    h.crashBeforePost = false;
+    await started(h.service());
+    expect(h.lookups).toEqual([7]);
+    expect(h.posts).toHaveLength(1);
+    expect(h.posts[0]!.split('\n')[0]).toBe(onboardingProofMarker(JOB, H1));
+    expect(commentReceipts(h.ledger)).toEqual([expect.objectContaining({ head: H1, comment_id: 101, detail: 'posted' })]);
+  });
+
+  it('A comment GitHub keeps refusing ends: after three failed attempts it is recorded as one that cannot be posted, and is never tried again', async () => {
+    const h = serviceHarness();
+    onboardingJob(h.ledger);
+    h.ledger.setJobPr(JOB, PR_URL);
+    h.refusePost = `gh: Resource not accessible by integration (HTTP 403) with ${TOKEN}`;
+    const service = await started(h.service());
+    deliver(h.ledger, H1);
+    await service.idle();
+    await tick(h, service);
+    expect(commentReceipts(h.ledger)).toEqual([]);
+    await tick(h, service);
+    expect(h.postAttempts).toBe(3);
+    expect(commentReceipts(h.ledger)).toEqual([{
+      repo: 'fixture-app', job_id: JOB, head: H1, comment_id: null, comment_url: null,
+      detail: expect.stringMatching(/^cannot be posted: .*HTTP 403.*\[REDACTED\]/u),
+    }]);
+    await tick(h, service);
+    await tick(h, service);
+    expect(h.postAttempts).toBe(3);
+    expect(h.lookups).toEqual([7, 7]);
+    expect(commentReceipts(h.ledger)).toHaveLength(1);
+  });
+
+  it('A failed comment lookup counts as an attempt and never leads to a blind post', async () => {
+    const h = serviceHarness();
+    onboardingJob(h.ledger);
+    h.ledger.setJobPr(JOB, PR_URL);
+    h.crashBeforePost = true;
+    const first = await started(h.service());
+    deliver(h.ledger, H1);
+    await first.idle();
+    first.stop();
+    h.crashBeforePost = false;
+    h.refuseLookup = 'list comments acme/fixture-app#7: more than 1000 comments; the rest were not read';
+    const service = await started(h.service());
+    await tick(h, service);
+    await tick(h, service);
+    expect(h.lookups).toEqual([7, 7, 7]);
+    expect(h.postAttempts).toBe(1);
+    expect(commentReceipts(h.ledger)).toEqual([expect.objectContaining({ comment_id: null, detail: expect.stringContaining('cannot be posted: list comments') })]);
+    await tick(h, service);
+    expect(h.lookups).toHaveLength(3);
+  });
+
   it('Non-onboarding job: a normal heist with a PR and a delivery gets no proof and no fence', async () => {
     const h = serviceHarness();
     h.ledger.addJob({ id: 'heist-1', repo: 'fixture-app', title: 'Ordinary heist', briefing: 'Ship it.' });
@@ -497,34 +856,29 @@ describe('the service: once per (job, head), after the PR, with its comment', ()
     expect(laneIsBusy(h.ledger, h.ledger.getJob('heist-1')!)).toBe(false);
   });
 
-  it('Third failure: the third failed proof on a job also reaches Gru as one action-required row naming the job and the last failure', async () => {
+  it('One unreadable proof record is logged and skipped; the job\'s other comments, its directive and its Gru row still go out', async () => {
     const h = serviceHarness();
     onboardingJob(h.ledger);
     h.ledger.setJobPr(JOB, PR_URL);
-    let n = 0;
-    h.outcome = (input) => ({ kind: 'proven', result: result(input.head, [`verify.full exited ${String(++n)}`]) });
-    const service = await started(h.service());
-    for (const head of [H1, H2]) {
-      deliver(h.ledger, head);
-      await service.idle();
-      // The minion answered the directive with a new head.
-      h.ledger.failDirective({ requestId: onboardingProofDirectiveId(JOB, head, 1), reason: 'answered by a new delivery in this fixture' });
-    }
-    expect(h.ledger.listNotifications({ limit: 50 }).filter((row) => row.kind === ONBOARDING_PROOF_FAILING_KIND)).toEqual([]);
+    deliver(h.ledger, H1);
+    h.ledger.appendCustomEvent({ kind: ONBOARDING_EVENTS.proof, jobId: JOB, payload: { repo: 'fixture-app', job_id: JOB, head: H1, outcome: 'failed', failures: 'not a list' } });
+    deliver(h.ledger, H2);
+    proofEvent(h.ledger, H2, false);
     deliver(h.ledger, H3);
-    await service.idle();
-    const rows = h.ledger.listNotifications({ limit: 50 }).filter((row) => row.kind === ONBOARDING_PROOF_FAILING_KIND);
-    expect(rows).toEqual([expect.objectContaining({ routing: 'action-required', severity: 'error', title: 'Onboarding proof failed 3 times: fixture-app' })]);
-    expect(rows[0]!.detail).toContain(JOB);
-    expect(rows[0]!.detail).toContain('verify.full exited 3');
-    expect(h.directives.map((input) => input.requestId)).toEqual([H1, H2, H3].map((head) => onboardingProofDirectiveId(JOB, head, 1)));
+    h.outcome = (input) => failing(input, 'verify.full exited 3');
+    await started(h.service());
+    expect(h.runs.map((input) => input.head)).toEqual([H3]);
+    expect(h.logs).toContainEqual({ level: 'error', msg: expect.stringContaining('onboarding proof record skipped') });
+    expect(h.comments.map((comment) => comment.body.split('\n')[0])).toEqual([onboardingProofMarker(JOB, H2), onboardingProofMarker(JOB, H3)]);
+    expect(h.directives.map((input) => input.requestId)).toEqual([onboardingProofDirectiveId(JOB, H3, 1)]);
+    expect(h.attention()).toEqual([expect.objectContaining({ id: onboardingProofAttentionId(JOB, H3), title: 'Onboarding proof failed 3 times: fixture-app', open: true })]);
   });
 
   it('A directive the lane cannot take now is retried by the reconcile under the same request id', async () => {
     const h = serviceHarness();
     onboardingJob(h.ledger);
     h.ledger.setJobPr(JOB, PR_URL);
-    h.outcome = (input) => ({ kind: 'proven', result: result(input.head, ['verify.full exited 1']) });
+    h.outcome = (input) => failing(input);
     h.refuseDirective = 'a review owns this lane';
     const service = await started(h.service());
     deliver(h.ledger, H1);
@@ -532,8 +886,7 @@ describe('the service: once per (job, head), after the PR, with its comment', ()
     expect(h.directives).toEqual([]);
     expect(h.ledger.getDirective(onboardingProofDirectiveId(JOB, H1, 1))).toBeNull();
     h.refuseDirective = null;
-    h.intervals[0]!();
-    await service.idle();
+    await tick(h, service);
     expect(h.directives.map((input) => input.requestId)).toEqual([onboardingProofDirectiveId(JOB, H1, 1)]);
     expect(h.runs).toHaveLength(1);
   });
@@ -550,15 +903,224 @@ describe('the service: once per (job, head), after the PR, with its comment', ()
     expect(h.runs.map((input) => input.head)).toEqual([H1]);
     expect(h.ledger.onboardingProofDebt(JOB)).toBeNull();
   });
+
+  it('Off with proofs configured stays off: consent is not read, no origin is probed, an Accept decided after start dispatches nothing, and the interval scans nothing; proofs still run', async () => {
+    const h = serviceHarness();
+    // The open heist being proven belongs to another repository.
+    const other = onboardingJobId('proof-app', 1);
+    onboardingJob(h.ledger, other, 'proof-app');
+    h.ledger.setJobPr(other, PR_URL);
+    deliver(h.ledger, H1, other);
+    writeOnboardingConsent(h.instanceDir, ['fixture-app']);
+    const service = await started(h.service({ mode: 'off' }));
+    expect(h.runs.map((input) => [input.jobId, input.head])).toEqual([[other, H1]]);
+    // A card for fixture-app is answered after the start.
+    const card = h.notifications.post({
+      id: 'onboarding:fixture-app:1', kind: ONBOARDING_PROPOSAL_KIND, routing: 'needs-owner', severity: 'info', title: 'Onboard fixture-app',
+      decision: {
+        question: 'Dispatch an onboarding heist for fixture-app?', context: 'A minion writes the manifest.', recommendation: 'Recommended.',
+        reservedClass: 'authority-cost', whyNotDelegable: 'It spends quota.',
+        options: [{ id: 'accept', label: 'Accept', consequence: 'Dispatched.' }, { id: 'decline', label: 'Decline', consequence: 'Recorded.' }],
+        discussion: false,
+      },
+    });
+    h.ledger.appendCustomEvent({ kind: ONBOARDING_EVENTS.proposed, payload: { repo: 'fixture-app', notification_id: card.id, default_branch: 'main', head_sha: H2 } });
+    h.notifications.decide(card.id, 'accept', 'owner');
+    await service.idle();
+    await tick(h, service);
+    expect(h.scans).toEqual({ probes: 0, dispatches: 0 });
+    expect(h.ledger.getNotification(card.id)).toMatchObject({ decidedOption: 'accept', resolvedAt: null });
+    expect(h.ledger.listNotifications({ limit: 50 }).filter((row) => row.kind === ONBOARDING_PROPOSAL_KIND)).toHaveLength(1);
+    expect(existsSync(onboardingConsentPath(h.instanceDir))).toBe(true);
+    expect(h.ledger.listEventsAfter(0, { kinds: [ONBOARDING_EVENTS.consented], limit: 10 })).toEqual([]);
+  });
+});
+
+describe('the service: one row for Gru per stuck head', () => {
+  it('Third failure: one row naming the job, the real count and the failure, never posted twice; a fourth failure on a new head moves it to a new row, and a pass closes that one', async () => {
+    const h = serviceHarness();
+    onboardingJob(h.ledger);
+    h.ledger.setJobPr(JOB, PR_URL);
+    let n = 0;
+    h.outcome = (input) => (input.head === H5 ? { kind: 'proven', result: result(input.head) } : failing(input, `verify.full exited ${String(++n)}`));
+    const service = await started(h.service());
+    const proveFailing = async (head: string): Promise<void> => {
+      deliver(h.ledger, head);
+      await service.idle();
+    };
+    // The minion answers each directive with a new head.
+    const answered = (head: string): void => {
+      h.ledger.failDirective({ requestId: onboardingProofDirectiveId(JOB, head, 1), reason: 'answered by a new delivery in this fixture' });
+    };
+    await proveFailing(H1);
+    answered(H1);
+    await proveFailing(H2);
+    answered(H2);
+    expect(h.attention()).toEqual([]);
+    await proveFailing(H3);
+    expect(h.attention()).toEqual([{ id: onboardingProofAttentionId(JOB, H3), title: 'Onboarding proof failed 3 times: fixture-app', detail: expect.any(String), open: true }]);
+    expect(h.attention()[0]!.detail).toContain(JOB);
+    expect(h.attention()[0]!.detail).toContain('- verify.full exited 3');
+    const routing = h.ledger.getNotification(onboardingProofAttentionId(JOB, H3));
+    expect(routing).toMatchObject({ routing: 'action-required', severity: 'error' });
+    // Reconciles never post it again.
+    await tick(h, service);
+    await tick(h, service);
+    expect(h.attention()).toHaveLength(1);
+    answered(H3);
+    await proveFailing(H4);
+    expect(h.attention()).toHaveLength(2);
+    expect(h.attention().find((row) => row.id === onboardingProofAttentionId(JOB, H3))).toMatchObject({ open: false });
+    expect(h.attention().find((row) => row.id === onboardingProofAttentionId(JOB, H4))).toMatchObject({ title: 'Onboarding proof failed 4 times: fixture-app', open: true });
+    answered(H4);
+    deliver(h.ledger, H5);
+    await service.idle();
+    expect(h.ledger.onboardingProofDebt(JOB)).toBeNull();
+    expect(h.attention().filter((row) => row.open)).toEqual([]);
+    expect(h.ledger.getNotification(onboardingProofAttentionId(JOB, H4))?.resolvedBy).toBe('onboarding-proof');
+    expect(h.directives.map((input) => input.requestId)).toEqual([H1, H2, H3, H4].map((head) => onboardingProofDirectiveId(JOB, head, 1)));
+  });
+
+  it('A delivery that names no commit: no proof and one row saying the minion must deliver again; review is refused with that hint; the next head closes the row and is proven', async () => {
+    const h = serviceHarness();
+    onboardingJob(h.ledger);
+    h.ledger.setJobPr(JOB, PR_URL);
+    const service = await started(h.service());
+    deliver(h.ledger, null);
+    await service.idle();
+    expect(h.runs).toEqual([]);
+    expect(h.ledger.onboardingProofDebt(JOB)).toEqual({ head: null, failed: false });
+    expect(h.attention()).toEqual([{ id: onboardingProofAttentionId(JOB, null), title: 'Onboarding proof has no head to prove: fixture-app', detail: expect.stringContaining('the minion must deliver again'), open: true }]);
+    await tick(h, service);
+    expect(h.attention()).toHaveLength(1);
+    deliver(h.ledger, H1);
+    await service.idle();
+    expect(h.runs.map((input) => input.head)).toEqual([H1]);
+    expect(h.attention()).toEqual([expect.objectContaining({ id: onboardingProofAttentionId(JOB, null), open: false })]);
+  });
+
+  it('Deferred three times in a row: one row with the last reason; a recorded proof starts the count again, and the job ending closes the row', async () => {
+    const h = serviceHarness();
+    onboardingJob(h.ledger);
+    h.ledger.setJobPr(JOB, PR_URL);
+    deliver(h.ledger, H1);
+    let n = 0;
+    h.outcome = () => ({ kind: 'deferred', reason: `the verification budget wait timed out (#${String(++n)})` });
+    const service = await started(h.service());
+    await tick(h, service);
+    expect(h.attention()).toEqual([]);
+    await tick(h, service);
+    expect(h.attention()).toEqual([{ id: onboardingProofAttentionId(JOB, H1), title: 'Onboarding proof deferred 3 times: fixture-app', detail: expect.stringContaining('The last reason: the verification budget wait timed out (#3)'), open: true }]);
+    await tick(h, service);
+    expect(h.attention()).toHaveLength(1);
+    // A failed proof of H2 resets the count: two deferrals of H3 post nothing.
+    h.outcome = (input) => (input.head === H2 ? failing(input) : { kind: 'deferred', reason: 'the service is stopping' });
+    deliver(h.ledger, H2);
+    await service.idle();
+    deliver(h.ledger, H3);
+    await service.idle();
+    await tick(h, service);
+    expect(h.attention().filter((row) => row.open)).toEqual([]);
+    await tick(h, service);
+    expect(h.attention().filter((row) => row.open)).toEqual([expect.objectContaining({ id: onboardingProofAttentionId(JOB, H3) })]);
+    h.ledger.setJobStatus(JOB, 'done');
+    await tick(h, service);
+    expect(h.attention().filter((row) => row.open)).toEqual([]);
+  });
+
+  it('A directive refused before any prompt is asked again under the next id; after three refused requests no fourth is sent and Gru gets the row', async () => {
+    const h = serviceHarness();
+    onboardingJob(h.ledger);
+    h.ledger.setJobPr(JOB, PR_URL);
+    h.outcome = (input) => failing(input);
+    const service = await started(h.service());
+    deliver(h.ledger, H1);
+    await service.idle();
+    for (const attempt of [1, 2]) {
+      h.ledger.failDirective({ requestId: onboardingProofDirectiveId(JOB, H1, attempt), reason: 'the lane refused it before any prompt' });
+      await tick(h, service);
+    }
+    expect(h.directives.map((input) => input.requestId)).toEqual([1, 2, 3].map((attempt) => onboardingProofDirectiveId(JOB, H1, attempt)));
+    expect(h.attention()).toEqual([]);
+    h.ledger.failDirective({ requestId: onboardingProofDirectiveId(JOB, H1, 3), reason: 'the lane refused it before any prompt' });
+    await tick(h, service);
+    await tick(h, service);
+    expect(h.directives).toHaveLength(3);
+    expect(h.attention()).toEqual([{ id: onboardingProofAttentionId(JOB, H1), title: 'Onboarding proof failure could not reach the minion: fixture-app', detail: expect.stringContaining('were refused before any prompt'), open: true }]);
+    expect(h.attention()[0]!.detail).toContain('- verify.full exited 1');
+  });
+
+  it('A failed head whose directive settled while the newest delivery still names it gets one row at a later reconcile', async () => {
+    const h = serviceHarness();
+    onboardingJob(h.ledger);
+    h.ledger.setJobPr(JOB, PR_URL);
+    h.outcome = (input) => failing(input);
+    const service = await started(h.service());
+    deliver(h.ledger, H1);
+    await service.idle();
+    const requestId = onboardingProofDirectiveId(JOB, H1, 1);
+    // The minion took the directive and finished its turn (the row settled:
+    // its admission and delivery bookkeeping are the directive path's own),
+    // then delivered the same head again.
+    h.db.handle.prepare("UPDATE pending_directives SET state = 'settled' WHERE request_id = ?").run(requestId);
+    expect(h.ledger.getDirective(requestId)?.state).toBe('settled');
+    deliver(h.ledger, H1);
+    await service.idle();
+    expect(h.attention()).toEqual([]);
+    await tick(h, service);
+    expect(h.attention()).toEqual([{ id: onboardingProofAttentionId(JOB, H1), title: 'Onboarding proof failure unanswered: fixture-app', detail: expect.stringContaining('still names the failed head'), open: true }]);
+    await tick(h, service);
+    expect(h.attention()).toHaveLength(1);
+    expect(h.directives).toHaveLength(1);
+  });
+});
+
+describe('the fence reads the head the gates read, and one proof per head', () => {
+  it('a newest delivery that is not a proven current candidate identifies no head, as the corrective-verification gate reads it', () => {
+    const { ledger } = bootLedger();
+    onboardingJob(ledger);
+    deliver(ledger, H1);
+    proofEvent(ledger, H1, true);
+    expect(ledger.onboardingProofDebt(JOB)).toBeNull();
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: JOB, payload: { sha: H1, candidate_delivery_proven: false, historical_bookkeeping_only: true } });
+    expect(ledger.newestDeliveredHead(JOB)).toEqual({ seq: expect.any(Number), head: null });
+    expect(ledger.onboardingProofDebt(JOB)).toEqual({ head: null, failed: false });
+  });
+
+  it('a second, contradicting proof of a head changes neither the fence nor the service\'s record: the first proof stands', () => {
+    const { ledger } = bootLedger();
+    onboardingJob(ledger);
+    const store = new OnboardingLedger(ledger);
+    deliver(ledger, H1);
+    proofEvent(ledger, H1, false);
+    proofEvent(ledger, H1, true);
+    expect(ledger.onboardingProofDebt(JOB)).toEqual({ head: H1, failed: true });
+    expect(store.proof(JOB, H1)?.passed).toBe(false);
+    deliver(ledger, H2);
+    proofEvent(ledger, H2, true);
+    proofEvent(ledger, H2, false);
+    expect(ledger.onboardingProofDebt(JOB)).toBeNull();
+    expect(store.proof(JOB, H2)?.passed).toBe(true);
+    expect(ledger.onboardingProofDebtAt(JOB, H1)).toEqual({ head: H1, failed: true });
+    expect(ledger.onboardingProofDebtAt(JOB, H3)).toEqual({ head: H3, failed: false });
+    expect(ledger.onboardingProofDebtAt('not-onboarding', H3)).toBeNull();
+  });
 });
 
 // ------------------------------------------------------------------
 // The review fence: unforceable, queued self-review replayed, digest
 // ------------------------------------------------------------------
 
+interface FencedLane {
+  readonly ledger: LedgerApi;
+  readonly wave: WaveRunner;
+  /** A fresh runner on the same ledger and lane (a restart). */
+  newWave(): WaveRunner;
+}
+
 /** A laned onboarding heist with a real wave and no spawner: the fence's
  * arm/queue paths (the review-supersession plain-lane harness). */
-async function fencedLane(): Promise<{ readonly ledger: LedgerApi; readonly wave: WaveRunner }> {
+async function fencedLane(options: Partial<WaveRunnerOptions> = {}): Promise<FencedLane> {
   const repo = makeFixtureRepo('onboarding-proof-fence');
   repos.push(repo);
   repo.git(['checkout', '-b', 'feature/review']);
@@ -572,19 +1134,33 @@ async function fencedLane(): Promise<{ readonly ledger: LedgerApi; readonly wave
   onboardingJob(ledger);
   ledger.registerWorktree(port.listWorktrees({ jobId: JOB })[0]!);
   deliver(ledger, 'fixture-settled');
-  const wave = new WaveRunner({
-    ledger, worktrees: port, bus,
-    spawner: async (role: Role) => { throw new Error(`no ${role} spawn in the fence harness`); },
-    reviewArtifactRoot: temp('gru-onboarding-proof-fence-artifacts-'),
-  });
-  closers.push(() => wave.shutdown());
-  return { ledger, wave };
+  const newWave = (): WaveRunner => {
+    const wave = new WaveRunner({
+      ledger, worktrees: port, bus,
+      spawner: async (role: Role) => { throw new Error(`no ${role} spawn in the fence harness`); },
+      reviewArtifactRoot: temp('gru-onboarding-proof-fence-artifacts-'),
+      ...options,
+    });
+    closers.push(() => wave.shutdown());
+    return wave;
+  };
+  return { ledger, wave: newWave(), newWave };
 }
 
-const proofEvent = (ledger: LedgerApi, head: string, passed: boolean): void => {
-  ledger.appendCustomEvent({ kind: ONBOARDING_EVENTS.proof, jobId: JOB,
-    payload: onboardingProofPayload('fixture-app', JOB, result(head, passed ? [] : ['verify.full exited 1'])) });
+/** The Perkins gate unavailable: the request takes the bmad-review fallback. */
+const PERKINS_DOWN: Pick<WaveRunnerOptions, 'reviewPreflight'> = {
+  reviewPreflight: async () => ({
+    ok: false as const,
+    failures: [{ leg: 'review-policy' as const, detail: 'the Perkins review gate is disabled in config', remediation: 'Enable the Perkins review gate.' }],
+  }),
 };
+
+function fallbackGate(runFallbackReview: () => Promise<readonly never[]>): Pick<WaveRunnerOptions, 'fallbackGate'> {
+  const skillPath = join(temp('gru-onboarding-proof-skill-'), 'bmad-review', 'SKILL.md');
+  mkdirSync(dirname(skillPath), { recursive: true });
+  writeFileSync(skillPath, '---\nname: bmad-review\n---\ninstalled skill bytes\n');
+  return { fallbackGate: { skillPath, runFallbackReview, fixDirectiveSink: async () => ({ delivered: true as const }) } };
+}
 
 describe('the review fence', () => {
   it('Force: the owner forcing review before a pass is refused with the onboarding reason, at every entry, and audited unforced', async () => {
@@ -615,15 +1191,86 @@ describe('the review fence', () => {
     expect(ledger.listRounds(JOB)).toHaveLength(0);
   });
 
+  it('A newest delivery that names no commit is refused with the hint that the minion must deliver again', async () => {
+    const { ledger, wave } = await fencedLane();
+    deliver(ledger, null);
+    const refused = await wave.requestReview({ jobId: JOB, force: true }).then(() => null, (error: unknown) => error);
+    expect(refused).toBeInstanceOf(BranchBusyError);
+    expect((refused as BranchBusyError).refusal()).toMatchObject({
+      blockers: [expect.objectContaining({ onboarding_proof_required_head: null })], hint: BRANCH_BUSY_ONBOARDING_NO_HEAD_HINT,
+    });
+  });
+
   it('A minion\'s self-review request is queued, not refused, and replayed on the onboarding.proof event', async () => {
     const { ledger, wave } = await fencedLane();
     const queued = await wave.requestReview({ jobId: JOB, handoff: true });
     expect(queued.route).toBe('queued');
     proofEvent(ledger, 'fixture-settled', true);
-    for (let spins = 0; spins < 200 && ledger.latestJobEvent(JOB, 'job.review-handoff-claimed') === null; spins += 1) {
-      await new Promise<void>((resolve) => setImmediate(resolve));
-    }
-    expect(ledger.latestJobEvent(JOB, 'job.review-handoff-claimed')).not.toBeNull();
+    await until(() => ledger.latestJobEvent(JOB, 'job.review-handoff-claimed') !== null, 'the replay claim');
+  });
+
+  it('A failed proof re-queues a queued self-review request: it stays queued, and a later pass replays it', async () => {
+    const { ledger, wave } = await fencedLane();
+    expect((await wave.requestReview({ jobId: JOB, handoff: true })).route).toBe('queued');
+    proofEvent(ledger, 'fixture-settled', false);
+    await until(() => ledger.latestJobEvent(JOB, 'job.review-handoff-requeued') !== null, 'the re-queue');
+    expect(ledger.latestJobEvent(JOB, 'job.review-handoff-started')).toBeNull();
+    expect(ledger.latestJobEvent(JOB, 'job.review-handoff-failed')).toBeNull();
+    // A new head is offered too, and waits for its own proof.
+    deliver(ledger, 'fixture-next');
+    await until(() => ledger.listJobEventsByKinds(JOB, ['job.review-handoff-requeued']).length === 2, 'the second re-queue');
+    proofEvent(ledger, 'fixture-next', true);
+    const passed = ledger.latestJobEvent(JOB, ONBOARDING_EVENTS.proof)!.seq;
+    await until(() => (ledger.latestJobEvent(JOB, 'job.review-handoff-claimed')?.seq ?? 0) > passed, 'the replay claim after the pass');
+  });
+
+  it('A queued self-review request survives a restart: a proof that lands while no wave listens is replayed by the next wave', async () => {
+    const lane = await fencedLane();
+    expect((await lane.wave.requestReview({ jobId: JOB, handoff: true })).route).toBe('queued');
+    await lane.wave.shutdown();
+    proofEvent(lane.ledger, 'fixture-settled', true);
+    expect(lane.ledger.latestJobEvent(JOB, 'job.review-handoff-claimed')).toBeNull();
+    lane.newWave().resumeQueuedHandoffs();
+    await until(() => lane.ledger.latestJobEvent(JOB, 'job.review-handoff-claimed') !== null, 'the resumed claim');
+  });
+
+  it('Fallback admission refuses an unproven head even under force, and its audit says force was asked for', async () => {
+    const lane: FencedLane = await fencedLane({
+      reviewPreflight: async () => {
+        // A new delivery lands while the preflight runs.
+        deliver(lane.ledger, 'fixture-next');
+        return PERKINS_DOWN.reviewPreflight!({ repoPath: '' });
+      },
+      ...fallbackGate(async () => []),
+    });
+    proofEvent(lane.ledger, 'fixture-settled', true);
+    lane.ledger.setJobStatus(JOB, 'delivered');
+    const refused = await lane.wave.requestReview({ jobId: JOB, force: true }).then(() => null, (error: unknown) => error);
+    expect(refused).toBeInstanceOf(BranchBusyError);
+    expect(String((refused as Error).message)).toMatch(/force cannot skip the proof/);
+    expect(lane.ledger.latestJobEvent(JOB, 'branch-idle.refused')?.payload).toMatchObject({
+      phase: 'arm', forced: true, blockers: [{ jobId: JOB, onboardingProof: { head: 'fixture-next', failed: false } }],
+    });
+    expect(lane.ledger.listJobEvents(JOB).filter((event) => event.kind === 'job.fallback-review')).toEqual([]);
+  });
+
+  it('A forced fallback gate stops before its next round once a new, unproven head is delivered (the iteration fence)', async () => {
+    const lane: FencedLane = await fencedLane({
+      ...PERKINS_DOWN,
+      ...fallbackGate(async () => {
+        // The minion delivers a new head while the fallback reviewer runs.
+        deliver(lane.ledger, 'fixture-next');
+        return [];
+      }),
+    });
+    proofEvent(lane.ledger, 'fixture-settled', true);
+    lane.ledger.setJobStatus(JOB, 'delivered');
+    const outcome = await lane.wave.requestReview({ jobId: JOB, force: true });
+    expect(outcome.route).toBe('bmad-review-fallback');
+    await (outcome as { readonly run: Promise<unknown> }).run;
+    const aborted = lane.ledger.listJobEvents(JOB).find((event) => event.kind === 'job.fallback-review' && (event.payload as { phase?: unknown }).phase === 'aborted');
+    expect(aborted?.payload).toMatchObject({ clearToMerge: false, reason: expect.stringContaining('has no passing onboarding proof of its delivered head') });
+    expect(lane.ledger.listJobEvents(JOB).some((event) => event.kind === 'job.fallback-review' && (event.payload as { phase?: unknown }).phase === 'pass')).toBe(false);
   });
 
   it('The Silas digest withholds the review offer until the head\'s proof passes; the PR offer is never withheld', async () => {
@@ -646,39 +1293,62 @@ describe('the review fence', () => {
 });
 
 // ------------------------------------------------------------------
-// The Perkins packet
+// The Perkins packet, and the freeze of the exact sha
 // ------------------------------------------------------------------
+
+interface PacketLane {
+  readonly repo: FixtureRepo;
+  readonly ledger: LedgerApi;
+  readonly branch: string;
+  /** The delivered head, proven passing. */
+  readonly target: string;
+  readonly artifacts: string;
+  /** A runner whose PR head probe reports `head` (default: the target). */
+  wave(head?: string): WaveRunner;
+}
+
+/** A PR-linked onboarding heist on a real lane and bare origin, its
+ * delivered head proven passing, with a whole-review double. */
+async function packetLane(): Promise<PacketLane> {
+  const repo = makeFixtureRepo('onboarding-proof-packet');
+  repos.push(repo);
+  const branch = 'feature/onboard';
+  repo.git(['checkout', '-b', branch]);
+  const target = repo.commitFile('.gru-command/worktree.toml', '[verify]\nfull = "npm test"\n');
+  const { ledger } = bootLedger();
+  const port = new GitReviewPort(temp('gru-onboarding-proof-packet-port-'), branch, target, ledger);
+  await port.createJobWorktree({ repoPath: repo.path, jobId: JOB });
+  const origin = join(temp('gru-onboarding-proof-packet-origin-'), 'origin.git');
+  repo.git(['init', '--bare', '--quiet', origin]);
+  repo.git(['remote', 'add', 'origin', origin]);
+  repo.git(['push', '--quiet', 'origin', `refs/heads/${branch}`]);
+  onboardingJob(ledger);
+  deliver(ledger, target);
+  ledger.setJobPr(JOB, 'https://git.example.invalid/acme/fixture-app/pull/7');
+  proofEvent(ledger, 'f'.repeat(40), true);
+  proofEvent(ledger, target, true);
+  const artifacts = temp('gru-onboarding-proof-packet-artifacts-');
+  return {
+    repo, ledger, branch, target, artifacts,
+    wave: (head = target) => {
+      const wave = new WaveRunner({
+        ledger, worktrees: port, reviewArtifactRoot: artifacts,
+        spawner: fakeWholeSpawner(temp('gru-onboarding-proof-packet-sessions-'), { specialists: [], childAnswer: () => '[]' }).spawner,
+        prHeadProbe: async () => ({ headRefName: branch, headSha: head }),
+      });
+      closers.push(() => wave.shutdown());
+      return wave;
+    },
+  };
+}
 
 describe('the Perkins packet', () => {
   it('a round on a proven head freezes the ONBOARDING PROOF block between the recorded verification and the CI evidence', async () => {
-    const repo = makeFixtureRepo('onboarding-proof-packet');
-    repos.push(repo);
-    const branch = 'feature/onboard';
-    repo.git(['checkout', '-b', branch]);
-    const target = repo.commitFile('.gru-command/worktree.toml', '[verify]\nfull = "npm test"\n');
-    const { ledger } = bootLedger();
-    const port = new GitReviewPort(temp('gru-onboarding-proof-packet-port-'), branch, target, ledger);
-    await port.createJobWorktree({ repoPath: repo.path, jobId: JOB });
-    const origin = join(temp('gru-onboarding-proof-packet-origin-'), 'origin.git');
-    repo.git(['init', '--bare', '--quiet', origin]);
-    repo.git(['remote', 'add', 'origin', origin]);
-    repo.git(['push', '--quiet', 'origin', `refs/heads/${branch}`]);
-    onboardingJob(ledger);
-    deliver(ledger, target);
-    ledger.setJobPr(JOB, 'https://git.example.invalid/acme/fixture-app/pull/7');
-    proofEvent(ledger, 'f'.repeat(40), true);
-    proofEvent(ledger, target, true);
-    const artifacts = temp('gru-onboarding-proof-packet-artifacts-');
-    const wave = new WaveRunner({
-      ledger, worktrees: port, reviewArtifactRoot: artifacts,
-      spawner: fakeWholeSpawner(temp('gru-onboarding-proof-packet-sessions-'), { specialists: [], childAnswer: () => '[]' }).spawner,
-      prHeadProbe: async () => ({ headRefName: branch, headSha: target }),
-    });
-    closers.push(() => wave.shutdown());
-    await expect(wave.runRound({ jobId: JOB })).resolves.toBeTruthy();
-    const round = ledger.listRounds(JOB)[0]!;
-    expect(round.targetRef).toBe(target);
-    const frozen = readFileSync(join(artifacts, round.id, 'spec-context.md'), 'utf8');
+    const lane = await packetLane();
+    await expect(lane.wave().runRound({ jobId: JOB })).resolves.toBeTruthy();
+    const round = lane.ledger.listRounds(JOB)[0]!;
+    expect(round.targetRef).toBe(lane.target);
+    const frozen = readFileSync(join(lane.artifacts, round.id, 'spec-context.md'), 'utf8');
     const verification = frozen.indexOf('--- HOST-RECORDED VERIFICATION');
     const proof = frozen.indexOf('--- ONBOARDING PROOF');
     const ci = frozen.indexOf('--- HOST-RECORDED CI EVIDENCE');
@@ -686,12 +1356,29 @@ describe('the Perkins packet', () => {
     expect(proof).toBeGreaterThan(verification);
     expect(ci).toBeGreaterThan(proof);
     expect(frozen.match(/--- ONBOARDING PROOF/gu)).toHaveLength(1);
-    expect(frozen).toContain(`head: ${target} (matches the frozen review target)`);
+    expect(frozen).toContain(`head: ${lane.target} (matches the frozen review target)`);
   });
 
-  it('renders only a proof of the exact reviewed sha, and an oversized block gives way to a notice that leaves the CI section room', () => {
+  it('the freeze checks the exact reviewed sha: a pass of the delivered head does not cover a commit pushed after it, even with force', async () => {
+    const lane = await packetLane();
+    const pushed = lane.repo.commitFile('NOTES.md', 'pushed after the delivery\n');
+    lane.repo.git(['push', '--quiet', 'origin', `refs/heads/${lane.branch}`]);
+    // The fence follows the delivered head, which passed.
+    expect(lane.ledger.onboardingProofDebt(JOB)).toBeNull();
+    const refused = await lane.wave(pushed).runRound({ jobId: JOB, force: true }).then(() => null, (error: unknown) => error);
+    expect(refused).toBeInstanceOf(BranchBusyError);
+    expect((refused as BranchBusyError).refusal()).toMatchObject({
+      blockers: [expect.objectContaining({ job_id: JOB, onboarding_proof_required_head: pushed })], hint: BRANCH_BUSY_ONBOARDING_HINT,
+    });
+    expect(lane.ledger.latestJobEvent(JOB, 'branch-idle.refused')?.payload).toMatchObject({
+      phase: 'freeze', forced: true, blockers: [{ jobId: JOB, onboardingProof: { head: pushed, failed: false } }],
+    });
+    expect(lane.ledger.listJobEvents(JOB).some((event) => event.kind === 'round.review-inputs-frozen')).toBe(false);
+  });
+
+  it('renders only a proof of the exact reviewed sha, bounded in bytes; the block leaves the actual CI block its room, and with no room even for its notice the freeze is refused', () => {
     const event = { ts: '2026-10-17T12:00:00.000Z', payload: onboardingProofPayload('fixture-app', JOB, result(H1)) };
-    const block = renderOnboardingProofEvidence(event, H1);
+    const block = renderOnboardingProofEvidence(event, H1)!;
     expect(block).toContain('result: PASS');
     expect(block).toContain('setup[1]: ok 1200 ms make deps');
     expect(block).toContain('verify.full: make test: exit 0 in 4.2 s');
@@ -699,12 +1386,42 @@ describe('the Perkins packet', () => {
     expect(renderOnboardingProofEvidence(event, H2)).toBeNull();
     expect(renderOnboardingProofEvidence(null, H1)).toBeNull();
     expect(renderOnboardingProofEvidence({ ts: 'x', payload: { head: H1 } }, H1)).toBeNull();
+    // A multibyte block past the bound is cut in bytes at a character boundary.
+    const heavy = result(H1, Array.from({ length: 40 }, (_, index) => `verify.full exited 1: ${'é'.repeat(200)} ${String(index)}`));
+    const bounded = renderOnboardingProofEvidence({ ts: event.ts, payload: onboardingProofPayload('fixture-app', JOB, heavy) }, H1)!;
+    expect(Buffer.byteLength(bounded, 'utf8')).toBeLessThanOrEqual(ONBOARDING_PROOF_EVIDENCE_MAX_BYTES);
+    expect(bounded).not.toContain('�');
+    expect(bounded.endsWith('(truncated)\n--- END ONBOARDING PROOF ---')).toBe(true);
+
     const spec = 'Acceptance: the manifest sets up the repo.';
-    expect(appendOnboardingProof({ spec, block, maxBytes: FROZEN_SPEC_MAX_BYTES })).toBe(`${spec}\n\n${block!}`);
-    expect(appendOnboardingProof({ spec, block: null, maxBytes: FROZEN_SPEC_MAX_BYTES })).toBe(spec);
-    const crowded = 'x'.repeat(FROZEN_SPEC_MAX_BYTES - 1024 - Buffer.byteLength(block!, 'utf8'));
-    const omitted = appendOnboardingProof({ spec: crowded, block, maxBytes: FROZEN_SPEC_MAX_BYTES });
+    const logs: string[] = [];
+    const append = (input: { readonly spec: string; readonly block: string | null; readonly ciBlock: string }): string =>
+      appendOnboardingProof({ ...input, maxBytes: FROZEN_SPEC_MAX_BYTES, log: (_level, msg) => { logs.push(msg); } });
+    expect(append({ spec, block, ciBlock: 'ci' })).toBe(`${spec}\n\n${block}`);
+    expect(append({ spec, block: null, ciBlock: 'ci' })).toBe(spec);
+    // The room kept is the actual CI block plus its blank-line join, no more.
+    const shortCi = 'c'.repeat(100);
+    const exact = 'x'.repeat(FROZEN_SPEC_MAX_BYTES - Buffer.byteLength(`\n\n${block}\n\n\n${shortCi}`, 'utf8'));
+    expect(append({ spec: exact, block, ciBlock: shortCi })).toBe(`${exact}\n\n${block}`);
+    expect(append({ spec: `${exact}x`, block, ciBlock: shortCi })).toContain('state: OMITTED (frozen spec bound)');
+    // A long CI block takes more than a kilobyte of room.
+    const longCi = 'c'.repeat(3000);
+    const crowded = 'x'.repeat(FROZEN_SPEC_MAX_BYTES - 1024 - Buffer.byteLength(`\n\n${block}\n`, 'utf8'));
+    const omitted = append({ spec: crowded, block, ciBlock: longCi });
     expect(omitted.startsWith(crowded)).toBe(true);
     expect(omitted).toContain('state: OMITTED (frozen spec bound)');
+    expect(logs.at(-1)).toContain('rendering the omission notice');
+    // No room even for the notice: the freeze is refused, and the log says so.
+    expect(() => append({ spec: 'x'.repeat(FROZEN_SPEC_MAX_BYTES), block, ciBlock: shortCi })).toThrow(/no room for the onboarding proof notice/);
+    expect(logs.at(-1)).toContain('refusing the freeze');
+    expect(logs.at(-1)).not.toContain('rendering');
+  });
+
+  it('every failure in the PR comment is a code span: a mention, an issue reference and HTML stay inert', () => {
+    const failure = 'setup command 1 failed: worktree setup command exited 1: npm i @types/node <b>bold</b> fixes #123';
+    const body = renderOnboardingProofComment(JOB, result(H1, [failure]));
+    const bullet = body.split('\n').find((line) => line.includes('@types/node'));
+    expect(bullet).toBe(`- \`${failure}\``);
+    expect(body.split('\n').filter((line) => line.includes('<b>'))).toEqual([bullet]);
   });
 });

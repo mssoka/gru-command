@@ -163,7 +163,7 @@ const PINS: Record<string, number> = {
   'onboarding-origin.test.ts': 7,
   'onboarding-service.test.ts': 29,
   'onboarding-real-service.test.ts': 1,
-  'onboarding-proof.test.ts': 21,
+  'onboarding-proof.test.ts': 50,
   'owner-actions.test.ts': 28,
   'property-dist-catalog.test.ts': 3,
   'property-report-cli.test.ts': 6,

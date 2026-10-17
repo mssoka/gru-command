@@ -249,7 +249,8 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   (`onboarding.proposal`, [ONBOARDING.md](./ONBOARDING.md)) is a registered
   owner kind with the same typed Accept/Decline; a dispatched onboarding
   heist is FYI activity, and a failed dispatch is Gru's
-  (`onboarding.dispatch-failed`). Routine recovery (crash-loop breakers,
+  (`onboarding.dispatch-failed`), as is a stuck onboarding proof
+  (`onboarding.proof-attention`). Routine recovery (crash-loop breakers,
   provider-wall stops, re-brief/directive reconciliation) stays machine
   attention. Every card is the same readable shared component in both
   surfaces: mixed-case prose, a short metadata label, typed decision
