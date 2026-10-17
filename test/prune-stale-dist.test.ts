@@ -63,10 +63,11 @@ describe('prune-stale-dist', () => {
     // (dist/onboarding/proof.js), the shared credential redaction it
     // and the Perkins publication use (dist/redaction.js), and the proof
     // record its one reader lives in, which the ledger reads too
-    // (dist/onboarding/proof-record.js).
-    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5207);
+    // (dist/onboarding/proof-record.js); #429 the intake breakdown and
+    // slicing modules (dist/intake/breakdown.js, dist/intake/slicing.js).
+    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5209);
     expect(createHash('sha256').update(`${[...PUBLIC_REVIEW_EXECUTABLE_PATHS].sort().join('\n')}\n`).digest('hex'))
-      .toBe('503f5479b36297e95e5166f07c6c03c93a4ce9c53e2be3ea738639c258906207');
+      .toBe('1317698727e967aafed58b42bf7ddd7664e7e50ca009212678d14d25c1d0a900');
     const root = fixtureRoot();
     touch(root, 'src/worktrees/handoff.ts'); touch(root, 'dist/worktrees/handoff.js');
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', dependencies: {} }));

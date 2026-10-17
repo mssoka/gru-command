@@ -14,12 +14,15 @@ approved portable knowledge belongs in {{context.knowledgeRoot}}.
 3. Record a working spec using [[gc-resource:skills/gc-build/spec-template.md]].
    Cover goal, scope, code map, ordered file-level tasks, acceptance scenarios,
    meaningful edge cases and deterministic verification. Keep one coherent goal.
+   Score its risk from the investigation, and add the I/O and edge-case matrix
+   when the change has meaningful inputs or states.
 4. Resolve engineering choices from evidence. Record owner-visible ambiguities
    and obtain owner decisions before performing irreversible/unauthorized work.
    Do not invent approval from an issue title or input document. When the existing
    assignment already settles scope/acceptance, do not add a redundant gate.
-5. Self-check the spec for actionable paths, dependency order, testable acceptance,
-   omissions and contradictions. Keep the approved intent stable; record necessary
+5. Self-check the spec for actionable paths, dependency order, testable acceptance
+   anchored at the surface the intent names, omissions and contradictions.
+   Keep the approved intent stable; record necessary
    owner-approved changes explicitly. No token or tool-call quota is a gate.
 
 Continue to [[gc-resource:skills/gc-build/implement.md]].

@@ -3,7 +3,7 @@ import { loadBundledWorkflowRuntime, type BundledWorkflowRuntime } from '../work
 import { REQUIRED_INTAKE_WORKFLOW_FILE } from '../workflows/manifest.js';
 import { isAbsolute, resolve } from 'node:path';
 import { canonicalManagedRepo, captureSources, INTAKE_MAX_DOCUMENTS, INTAKE_MAX_AGGREGATE_BYTES, INTAKE_MAX_REQUIREMENTS, type SourcePorts } from './sources.js';
-import { conservativePlan, validatePlan } from './planner.js';
+import { defaultPlan, validatePlan } from './planner.js';
 import { canonical, boundedCanonical, digest, IntakeError, type Capture, type DocumentInput, type IntakePlanner, type IntakeRequest, type IntakeSource, type Proposal } from './types.js';
 
 export const INTAKE_HELPER = REQUIRED_INTAKE_WORKFLOW_FILE;
@@ -179,7 +179,7 @@ export class IntakeService {
       }
       if (capture.requirements.length > INTAKE_MAX_REQUIREMENTS) throw new IntakeError('intake_source_bounds', 'source inventory exceeds 4000 nonblank lines; narrow the captured documents', 413);
       const candidate = request.plan === undefined
-        ? await (this.options.planner ?? conservativePlan)(structuredClone(capture))
+        ? await (this.options.planner ?? defaultPlan)(structuredClone(capture))
         : request.plan;
       plan = validatePlan(candidate, capture);
     } catch (error) {

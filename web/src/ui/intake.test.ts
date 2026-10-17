@@ -411,6 +411,15 @@ it('allows corrected selection only after a definite pre-acceptance refusal', as
   await h.click('Approve selected work'); expect(h.client.approve).toHaveBeenCalledTimes(2);
 });
 
+it('allows a corrected selection after the server refuses re-selecting an accepted heist (#429)', async () => {
+  const h = fixture(); await h.preview(); await h.click('Review this revision');
+  const checkbox = h.root.querySelector<HTMLInputElement>('input[type="checkbox"]')!; checkbox.checked = true; checkbox.dispatchEvent(new Event('change'));
+  h.client.approve.mockRejectedValueOnce(new IntakeClientError('intake_already_accepted', 'Heist one was already accepted'));
+  await h.click('Approve selected work');
+  expect(JSON.parse(sessionStorage.getItem('gru-intake-recovery')!).approvals).toEqual([]);
+  await h.click('Approve selected work'); expect(h.client.approve).toHaveBeenCalledTimes(2);
+});
+
 it('reports one failed historical receipt but continues healthy receipts and current draft without approval', async () => {
   const h = fixture();
   const request = { repoPath: proposal.repoPath, intakeId: proposal.intakeId, requestId: 'r1', revisionId: proposal.revisionId, expectedToken: reviewed.review!.token, selected: ['one'] };
@@ -607,4 +616,47 @@ it('keeps historical receipt concurrency bounded across overlapping recoveries a
   h.view.bind(h.client as unknown as IntakeClient); await vi.waitFor(() => expect(h.button('Choose repository').disabled).toBe(false)); expect(release).toHaveLength(4);
   release[0]!(partial); await vi.waitFor(() => expect(release).toHaveLength(5));
   h.view.bind(null); release.slice(1).forEach((done) => done(partial)); await Promise.resolve(); expect(h.root.textContent).not.toContain('one → accepted-one');
+});
+
+describe('intake slicing by a planning minion (#429)', () => {
+  it('commissions a planning minion for the shown revision and loads its sliced revision once it lands', async () => {
+    const h = fixture();
+    const commission = { repoPath: proposal.repoPath, intakeId: 'intake', requestId: 'r1', revisionId: proposal.revisionId, jobId: 'intake-slice-abc', resultRequestId: 'slice-abc', dispatched: true, jobStatus: 'queued' };
+    const slice = vi.fn(async (_request: Parameters<IntakeClient['slice']>[0]) => commission);
+    Object.assign(h.client, { slice });
+    await h.preview();
+    expect(h.button('Load sliced revision')).toBeUndefined();
+    await h.click('Slice into heists (planning minion)');
+    expect(slice).toHaveBeenCalledWith({ repoPath: proposal.repoPath, intakeId: 'intake', requestId: 'r1', revisionId: proposal.revisionId });
+    const status = () => h.root.querySelector('.intake-status')!.textContent;
+    expect(status()).toContain('Planning minion intake-slice-abc (queued) is slicing this revision. Its sliced plan lands as request slice-abc');
+    expect(h.client.approve).not.toHaveBeenCalled();
+    h.client.read.mockRejectedValueOnce(new IntakeClientError('intake_not_found', 'no completed preview'));
+    await h.click('Load sliced revision');
+    expect(status()).toBe('Planning minion intake-slice-abc has not submitted its breakdown yet.');
+    const sliced = { ...proposal, requestId: 'slice-abc', previousRequestId: 'r1', revisionId: '9'.repeat(64) };
+    h.client.read.mockResolvedValueOnce(sliced);
+    await h.click('Load sliced revision');
+    expect(h.client.read).toHaveBeenLastCalledWith(proposal.repoPath, 'intake', 'slice-abc');
+    expect(status()).toContain('Sliced revision loaded');
+    expect(h.root.textContent).toContain(`Snapshot revision: ${'9'.repeat(64)}`);
+    expect(h.button('Compare previous revision')).toBeDefined();
+    expect(h.button('Load sliced revision')).toBeUndefined();
+  });
+
+  it('offers no slicing for a revision that already has accepted work', async () => {
+    const h = fixture();
+    await h.preview(); await h.click('Review this revision');
+    const box = h.root.querySelector<HTMLInputElement>('input[type="checkbox"]')!; box.checked = true; box.dispatchEvent(new Event('change'));
+    expect(h.button('Slice into heists (planning minion)').disabled).toBe(false);
+    await h.click('Approve selected work');
+    expect(h.button('Slice into heists (planning minion)').disabled).toBe(true);
+  });
+
+  it('offers no slicing while captured sources have gaps', async () => {
+    const h = fixture();
+    h.client.preview.mockResolvedValueOnce({ ...proposal, gaps: [{ code: 'intake_missing_architecture', locator: 'architecture.md', question: 'Supply it.' }] });
+    await h.preview();
+    expect(h.button('Slice into heists (planning minion)').disabled).toBe(true);
+  });
 });

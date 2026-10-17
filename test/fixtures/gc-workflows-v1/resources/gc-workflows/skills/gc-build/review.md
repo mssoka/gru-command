@@ -1,0 +1,84 @@
+# Independent tracked development review
+
+Worktree: {{context.worktreeRoot}}; job: {{context.jobId}}.
+Private review evidence: {{context.artifactRoot}}. Context: {{context.contextFile}}.
+
+Capture the full canonical base and candidate head and complete diff, including
+new files. Review actual code and executed evidence, not the implementer's report.
+
+## Required reviewers
+
+For a GC-assigned job, launch fresh, context-free reviewers as service-tracked
+commissioned review jobs (megaminions), never generic child workers or untracked
+terminal agents. Use `POST /api/dispatch` with `deliverable: "review"`,
+`parent_job_id: "{{context.jobId}}"`, `target_ref` naming this job's ordinary PR and
+`target_sha` naming the exact committed candidate head. If needed, commit the
+verified candidate and publish its reviewable ordinary PR before commissioning;
+never merge it. Name the exact source for the review (issue #317): optional
+`target_base` (focused-delta base; the range reviewed is
+`target_base..target_sha`), `required_inputs` (`[{path, lens}]` content the
+review needs — only the `claims` lens accepts inputs, a `blind` lens is a 400)
+and `source_package` (`{path, sha256}` of a hash-pinned git bundle authorizing a
+repair). The service proves the actual selected object store holds the named
+target/base/range/inputs before the reviewer spawns; if it cannot, the dispatch
+is refused `422 review_source_unavailable` (`problems`, `retry_authorized:false`)
+— a refusal, not a report, and never an automatic retry. Dispatch to the
+repository that holds the commits, or re-dispatch with an explicit
+`source_package`. Retain each reviewer job identity and its recorded findings
+handback/disposition using the shipped minion playbook.
+
+Independent terminal sessions are permitted only for explicit owner-directed
+external development outside a GC job, with durable session/pane receipts; a GC
+minion must not use this exception. The normal route uses all three lenses in
+parallel when the runtime supports it:
+
+- [[gc-resource:skills/gc-build/review-prompts/adversarial.md]] — diff and repository,
+  without the author's explanation or self-review. This is the BLIND lens: commission it
+  with `"review_role": "blind"`, an `"input_package"` (`base_sha`, `target_sha`, the
+  base-to-target `diff` and/or exact target `files`) and `"parent_contract_sha256"` read
+  from `GET /api/dispatch/jobs/{{context.jobId}}/contract`. The service validates the package
+  against this job's effective `blind-isolation:` rule (administrative clarifications
+  included) BEFORE any reviewer spawns, and refuses task specs, prior assessments and
+  deferred/triage text carried by a document-like file (extensionless or `.md`/`.markdown`/
+  `.txt`/`.rst`/`.adoc`, whatever it is named) with a correction path; other file types are
+  path-checked only. Never hand a
+  blind reviewer an unfiltered historical diff, and never count a blind report as
+  independent coverage unless `GET /api/dispatch/jobs/<review job>/blind-coverage` says
+  `qualifying`; settling a report is not validity.
+- [[gc-resource:skills/gc-build/review-prompts/edge-cases.md]] — diff, relevant code and
+  acceptance scenarios; boundary/failure paths. Claims-needed lens: `"review_role": "claims"`.
+- [[gc-resource:skills/gc-build/review-prompts/verification.md]] — diff, approved intent,
+  tests and exact executed verification evidence. Claims-needed lens: `"review_role": "claims"`.
+
+The small-change route requires the fresh adversarial reviewer; add the other
+lenses when warranted. Never substitute author self-review for a reviewer. If
+independent execution is unavailable or fails, report the infrastructure failure;
+review remains incomplete, not a fabricated pass. Do not silently change the
+owner-selected review model or launch protocol.
+
+Bind each review result to a durable report under the private artifact root. Record
+actual run/session/pane identity, reviewer role/model, full base/head, completion
+state, report path and evidence. Track every launched reviewer to completion;
+a queued prompt is not a completed review. Reviewers are read-only and must not
+mutate the implementation or see each other's results before submitting theirs.
+
+There is no minimum finding quota, no total/per-phase tool-call ceiling and no
+minimum number of review rounds. A clean review may return `No actionable findings.`
+Do not manufacture defects to fill a target. These rules apply to both routes.
+
+## Triage and fixes
+
+Inspect each claim against code. Classify concrete actionable defects separately
+from speculation/style, explain severity/evidence, and record a reasoned disposition
+for every finding. Refute false positives with evidence, not dismissal. Use
+[[gc-resource:skills/gc-build/references/claims-check.md]] to check evidence honesty
+and [[gc-resource:skills/gc-build/references/deletion-check.md]] for removals.
+
+Fix all actionable in-scope defects and add/run regressions. When findings expose
+wrong acceptance, obtain an explicit owner decision; do not silently rewrite intent
+or create a completion claim. Do not offload known required work into new backlog.
+Re-engage independent reviewers on the resulting changed head; preserve previous
+receipts and record what changed. Re-run affected verification and confirm exact
+final-head coverage before concluding review.
+
+Continue to [[gc-resource:skills/gc-build/present.md]].

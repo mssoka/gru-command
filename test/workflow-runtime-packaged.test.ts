@@ -105,7 +105,7 @@ describe('GC-owned workflows in the actual distributable layout', () => {
     writeFileSync(contextFile, JSON.stringify(context));
     const env = { HOME: home, PATH: `${dirname(process.execPath)}:/usr/bin:/bin` };
     const verify = execFileSync(process.execPath, [join(stage, 'dist/cli/workflow-runtime.js'), 'verify', stage], { cwd: stage, env, encoding: 'utf-8' });
-    expect(verify).toContain('GC workflow gru-command-workflows@1 verified');
+    expect(verify).toContain('GC workflow gru-command-workflows@3 verified');
     const snapshots = new Set<string>();
     for (const route of ['normal', 'small-change']) {
       const result = JSON.parse(execFileSync(process.execPath, [join(stage, 'dist/cli/workflow-runtime.js'), 'render',
@@ -113,7 +113,7 @@ describe('GC-owned workflows in the actual distributable layout', () => {
         runtimeId: string; entrypoint: string; snapshotDir: string; contextFile: string;
       };
       snapshots.add(result.snapshotDir);
-      expect(result.runtimeId).toBe('gru-command-workflows@1');
+      expect(result.runtimeId).toBe('gru-command-workflows@3');
       expect(result.snapshotDir.startsWith(context.artifactRoot)).toBe(true);
       const source = readFileSync(result.entrypoint, 'utf-8');
       expect(source).toContain(context.jobId);
@@ -130,7 +130,7 @@ describe('GC-owned workflows in the actual distributable layout', () => {
     expect(snapshots.size).toBe(1);
     expect(git(lane, ['status', '--porcelain', '--untracked-files=all'])).toBe('');
     const record = JSON.parse(readFileSync(join(git(lane, ['rev-parse', '--path-format=absolute', '--git-dir']), 'gru-command/bmad-runtime.json'), 'utf-8')) as { runtime_id: string; runtime_dir: string };
-    expect(record.runtime_id).toBe('gru-command-workflows@1');
+    expect(record.runtime_id).toBe('gru-command-workflows@3');
     expect(record.runtime_dir.startsWith(store)).toBe(true);
     for (const root of [home, workspace, repo, lane]) {
       for (const path of ['_bmad', '.agents/skills/bmad-build', '.claude/skills/bmad-build']) expect(existsSync(join(root, path))).toBe(false);

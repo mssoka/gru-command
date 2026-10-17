@@ -207,7 +207,7 @@ describe('production owned workflow session binding', () => {
     const first = serviceWorkflowAuthority(a.dataDir, () => ledger).resolveReviewResources(a.lane.id);
     const pkg = join(b.root, 'package-b');
     cpSync(join(repoRoot, 'resources/gc-workflows'), join(pkg, 'resources/gc-workflows'), { recursive: true });
-    writeWorkflowManifest(pkg, 2);
+    writeWorkflowManifest(pkg, 4);
     const authority = serviceWorkflowAuthority(a.dataDir, () => ledger, pkg);
     const second = authority.resolveReviewResources(b.lane.id);
     const old = createBmadRuntimeBinder(join(a.dataDir, 'bmad-runtime'))(historical.lane.path);
@@ -284,7 +284,7 @@ describe('production owned workflow session binding', () => {
     const a = createWorkflowSessionBinder(f.dataDir, () => f.lane)({ cwd: f.lane.path });
     const pkg = join(f.root, 'package-b');
     cpSync(join(repoRoot, 'resources/gc-workflows'), join(pkg, 'resources/gc-workflows'), { recursive: true });
-    writeWorkflowManifest(pkg, 2);
+    writeWorkflowManifest(pkg, 4);
     const bindB = createWorkflowSessionBinder(f.dataDir, () => f.lane, pkg);
     expect(bindB({ cwd: f.lane.path })).toEqual(a);
     rmSync(join(pkg, 'resources'), { recursive: true });
@@ -324,7 +324,7 @@ describe('production owned workflow session binding', () => {
     rmSync(join(f.lane.path, 'gru-output'));
     const pkg = join(f.root, 'package-b');
     cpSync(join(repoRoot, 'resources/gc-workflows'), join(pkg, 'resources/gc-workflows'), { recursive: true });
-    writeWorkflowManifest(pkg, 2);
+    writeWorkflowManifest(pkg, 4);
     expect(createWorkflowSessionBinder(f.dataDir, () => f.lane, pkg)({ cwd: f.lane.path }).managedSkills!.runtimeId).toBe(loadBundledWorkflowRuntime(pkg).id);
   });
 
