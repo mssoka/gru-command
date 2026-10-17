@@ -54,16 +54,16 @@ parallel when the runtime supports it:
   small-change route the note's settled acceptance) quoted in its brief.
   Claims-needed lens: `"review_role": "claims"`.
 - [[gc-resource:skills/gc-build/review-prompts/intent-alignment.md]] — diff and its tests
-  plus the verbatim owner-approved intent quoted into the brief; never the author's
-  explanation, task list or self-review. Claims-needed lens: `"review_role": "claims"`.
+  plus the verbatim owner-approved intent quoted into the brief; the brief never
+  adds the author's explanation, task list or self-review. Claims-needed lens:
+  `"review_role": "claims"`.
 
 Hand the edge-case lens the diff without knowledge-root paths
 (`{{context.knowledgeRoot}}`), so a committed spec is not part of what it traces;
-the other lenses, intent alignment included, review those files. A change that
-touches only knowledge-root files gives the edge-case lens no code to trace: record
-it as not applicable, with that reason, instead of commissioning it. If an
-edge-case report says its brief carried claims, it is a failed lens: re-commission
-it with a brief that carries none.
+the other lenses, intent alignment included, review those files as part of the
+change. A change that touches only knowledge-root files gives the edge-case lens
+no code to trace: record it as not applicable, with that reason, instead of
+commissioning it.
 
 The small-change route requires the fresh adversarial reviewer and widens with the
 risk re-scored against the candidate diff: `medium` adds the verification and
@@ -97,10 +97,12 @@ the base), never a narrower focused delta; triage its findings when they arrive.
 A failed blind report never counts as coverage, whatever `blind-coverage` says. If
 its replacement is refused `409 blind_coverage_owned`, do not retry in a loop: the
 service accepts a same-head replacement only once the failed job is parked or
-binned. When fixes are due, commission the blind lens again on the next new head;
-otherwise escalate to the owner with the failed job's id, and once that job is
-parked or binned commission the same-head replacement. Review stays incomplete
-until every required lens is covered or recorded not applicable. Disregard any
+binned. Decide after triaging the other lenses: when fixes follow, commission the
+blind lens again on the new head; otherwise escalate to the owner with the failed
+job's id, and once that job is parked or binned commission the replacement on the
+then-current head. Review stays incomplete until every required lens is covered;
+only the edge-case lens on a knowledge-root-only change may instead be recorded
+not applicable. Disregard any
 severity a reviewer assigned. Record one row per finding in the review triage log
 of the working spec (or small-change note) under the private artifact root —
 reviewed head, verdict, evidence and a reasoned disposition for every finding;

@@ -9,8 +9,11 @@ unreadable, report exactly that and stop.
 
 Your task is strictly descriptive; do not prescribe additional work. Report:
 
-1. The defensible readings of the intent, enumerated.
-2. Which reading this diff implements, citing `file:line`.
+1. The defensible readings of the intent, enumerated from the intent text alone
+   before you read the diff.
+2. Which reading this diff implements, citing `file:line`. Documents in the diff —
+   specs, decisions, notes — are part of the change: judge them against the intent
+   like code; they never settle what the intent means.
 3. Where the readings and the diff diverge — specifically, the surface at which
    the intent's expectations live (a command's output, an HTTP response, rendered
    UI, a file a user opens, a persisted record) versus the surface the diff
