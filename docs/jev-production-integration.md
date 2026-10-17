@@ -82,39 +82,26 @@ floors bypass).
 
 ## Configuration
 
-Add the generated fragment to `$GRU_COMMAND_HOME/config.toml` (default:
-`~/.gru-command/config.toml`):
+A freshly generated `$GRU_COMMAND_HOME/config.toml` (default:
+`~/.gru-command/config.toml`) already contains the complete decisions
+fragment: Jev switched off, the four live surfaces in `shadow`, and the
+risk-class thresholds. Turn Jev on by editing `enabled = true` in its
+`[decisions.jev]` table. Never paste a second copy: a table defined twice
+fails to load.
+
+A config without a `[decisions]` section (generated before the fragment
+shipped) can append it:
 
 ```sh
-node dist/decisions/cli.js config-template
-# To generate the same complete fragment with enabled=true:
-node dist/decisions/cli.js config-template --enabled true
+node dist/decisions/cli.js config-template >> ~/.gru-command/config.toml
+# To append the same complete fragment with enabled=true:
+node dist/decisions/cli.js config-template --enabled true >> ~/.gru-command/config.toml
 ```
 
-The complete default-off fragment is:
-
-```toml
-[decisions.jev]
-enabled = false
-model = "~typesafe/jev-latest"
-endpoint = "https://openrouter.ai/api/alpha/decisions"
-timeout_ms = 5000
-
-[decisions.thresholds.read_only]
-act = 0.60
-confirm = 0.40
-require_confirm_on_act = false
-
-[decisions.thresholds.operational]
-act = 0.75
-confirm = 0.55
-require_confirm_on_act = false
-
-[decisions.thresholds.destructive]
-act = 0.85
-confirm = 0.70
-require_confirm_on_act = true
-```
+A `--force` regenerate keeps an existing decisions setup. A config that
+has Jev on or names surfaces keeps exactly its own surface entries; one
+with Jev off and no surfaces gets the four shadow surfaces. The generated
+reference in [`CONFIG.md`](./CONFIG.md) shows the full fragment.
 
 Configuration is strict: unknown fields, wrong types, out-of-range values, and
 `confirm >= act` are rejected. Destructive confirmation cannot be disabled.

@@ -584,8 +584,7 @@ timeout_ms = 5000 # Per-call limit; on timeout the deterministic answer is used.
 #                       node dist/decisions/cli.js backtest --surface <s> --profile <p> --cases <jsonl> --threshold <min> --save
 #   (no mode key)     Legacy, pre-#223: for event_triage and supervision_guidance
 #                     Gru Command USES Jev's answer with NO backtest gate.
-#                     Keep those two listed explicitly (as below) unless you
-#                     mean that.
+#                     Keep those two listed explicitly unless you mean that.
 #
 # Surfaces:
 #   event_triage          does an orchestration event need attention? (may only raise attention, never lower it)
@@ -595,7 +594,8 @@ timeout_ms = 5000 # Per-call limit; on timeout the deterministic answer is used.
 #   report_conclusion     clean pass / findings / inconclusive (backtest only; no live host yet)
 #
 # `provider` routes a surface to a provider profile (default: openrouter-jev).
-# Shorthand for routing only:  [decisions.surfaces]  event_triage = "typesafe-direct"
+# Shorthand for routing only, in place of that surface's table (never both):
+#   [decisions.surfaces]  event_triage = "typesafe-direct"
 [decisions.surfaces.event_triage]
 provider = "openrouter-jev"
 mode = "shadow"

@@ -1,6 +1,6 @@
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { decisionsConfigTemplate } from './decisions/config-template.js';
+import { decisionsConfigFor } from './decisions/config-template.js';
 import {
   CLAUDE_CODE_THINKING_LEVELS,
   DEFAULT_CLAUDE_MCP_MODE,
@@ -10,10 +10,13 @@ import {
   PI_THINKING_LEVELS,
   ROLES,
   RUNTIME_IDS,
+  tomlString,
   type GruCommandConfig,
   type Role,
   type RuntimeId,
 } from './config.js';
+
+export { tomlString };
 
 /**
  * THE single source of truth for the instance config reference.
@@ -87,6 +90,15 @@ export const CONFIG_SECTION_HEADERS: readonly string[] = [
   '[review]',
   '[verify]',
   '[decisions.jev]',
+  '[decisions.surfaces.event_triage]',
+  '[decisions.surfaces.supervision_guidance]',
+  '[decisions.surfaces.escalation_triage]',
+  '[decisions.surfaces.same_blocker]',
+  '[decisions.providers.typesafe-direct]',
+  '[decisions.providers.local]',
+  '[decisions.thresholds.read_only]',
+  '[decisions.thresholds.operational]',
+  '[decisions.thresholds.destructive]',
 ];
 
 /** Tables that must be ACTIVE (parseable) in every generated config —
@@ -146,29 +158,6 @@ export function portableStatePath(path: string, home: string = homedir()): strin
   if (path === home) return '~';
   if (path.startsWith(`${home}/`)) return `~${path.slice(home.length)}`;
   return path;
-}
-
-/** Escape a string for a TOML basic string literal. */
-export function tomlString(value: string): string {
-  let out = '';
-  for (const ch of value) {
-    switch (ch) {
-      case '\\': out += '\\\\'; break;
-      case '"': out += '\\"'; break;
-      case '\b': out += '\\b'; break;
-      case '\t': out += '\\t'; break;
-      case '\n': out += '\\n'; break;
-      case '\f': out += '\\f'; break;
-      case '\r': out += '\\r'; break;
-      default:
-        if (ch < ' ' || ch === '\u007f') {
-          out += `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`;
-        } else {
-          out += ch;
-        }
-    }
-  }
-  return `"${out}"`;
 }
 
 const inlineTableExample = (model: string): string =>
@@ -757,7 +746,7 @@ export function renderReferenceConfig(
     '# needed, and records the run as timed out / non-success.',
     `run_timeout_ms = ${preserved?.verify.runTimeoutMs ?? 1_800_000}`,
     '',
-    decisionsConfigTemplate(false, preserved?.decisions),
+    decisionsConfigFor(preserved?.decisions ?? null),
   );
   return `${lines.join('\n')}\n`;
 }

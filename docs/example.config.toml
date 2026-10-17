@@ -238,3 +238,18 @@ max_concurrent = 1                # concurrent runs; further requests queue FIFO
 worker_budget = 0                 # total test workers across runs; 0 = auto (cores - 2)
 lock_wait_timeout_ms = 900000     # queued request past this fails loud (never a silent hang)
 run_timeout_ms = 1800000          # per-run wall clock; expiry kills the process group
+
+[decisions.jev]                   # Jev decisions (docs/jev-production-integration.md) — off by default
+enabled = false                   # master switch; with it off no provider is ever contacted
+[decisions.surfaces.event_triage]
+provider = "openrouter-jev"
+mode = "shadow"                   # off | shadow (record only) | enforce (backtest-gated)
+[decisions.surfaces.supervision_guidance]
+provider = "openrouter-jev"
+mode = "shadow"
+[decisions.surfaces.escalation_triage]
+provider = "openrouter-jev"
+mode = "shadow"
+[decisions.surfaces.same_blocker]
+provider = "openrouter-jev"
+mode = "shadow"
