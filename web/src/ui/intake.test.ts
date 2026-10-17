@@ -612,7 +612,7 @@ it('keeps historical receipt concurrency bounded across overlapping recoveries a
 describe('intake slicing by a planning minion (#429)', () => {
   it('commissions a planning minion for the shown revision and loads its sliced revision once it lands', async () => {
     const h = fixture();
-    const commission = { repoPath: proposal.repoPath, intakeId: 'intake', requestId: 'r1', revisionId: proposal.revisionId, jobId: 'intake-slice-abc', resultRequestId: 'slice-abc', dispatched: true };
+    const commission = { repoPath: proposal.repoPath, intakeId: 'intake', requestId: 'r1', revisionId: proposal.revisionId, jobId: 'intake-slice-abc', resultRequestId: 'slice-abc', dispatched: true, jobStatus: 'queued' };
     const slice = vi.fn(async (_request: Parameters<IntakeClient['slice']>[0]) => commission);
     Object.assign(h.client, { slice });
     await h.preview();
@@ -620,7 +620,7 @@ describe('intake slicing by a planning minion (#429)', () => {
     await h.click('Slice into heists (planning minion)');
     expect(slice).toHaveBeenCalledWith({ repoPath: proposal.repoPath, intakeId: 'intake', requestId: 'r1', revisionId: proposal.revisionId });
     const status = () => h.root.querySelector('.intake-status')!.textContent;
-    expect(status()).toContain('Planning minion intake-slice-abc is slicing this revision. Its sliced plan lands as request slice-abc');
+    expect(status()).toContain('Planning minion intake-slice-abc (queued) is slicing this revision. Its sliced plan lands as request slice-abc');
     expect(h.client.approve).not.toHaveBeenCalled();
     h.client.read.mockRejectedValueOnce(new IntakeClientError('intake_not_found', 'no completed preview'));
     await h.click('Load sliced revision');

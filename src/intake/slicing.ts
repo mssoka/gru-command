@@ -4,8 +4,8 @@ import { REQUIRED_SLICING_WORKFLOW_FILE } from '../workflows/manifest.js';
 import { loadBundledWorkflowRuntime, type BundledWorkflowRuntime } from '../workflows/runtime.js';
 import { slicingPlan } from './breakdown.js';
 import { validatePlan } from './planner.js';
-import type { IntakeService } from './service.js';
-import { canonical, digest, IntakeError, type Proposal } from './types.js';
+import { INTAKE_MAX_OUTPUT_BYTES, type IntakeService } from './service.js';
+import { boundedCanonical, canonical, digest, IntakeError, type Proposal } from './types.js';
 
 export const SLICING_HELPER = REQUIRED_SLICING_WORKFLOW_FILE;
 /** FOR YOU: a planning minion's sliced plan landed in intake (#429). */
@@ -20,7 +20,7 @@ export interface IntakeSlicingDispatchInput {
 }
 export interface IntakeSlicingOptions {
   readonly intake: IntakeService;
-  readonly ledger: Pick<LedgerApi, 'getJob'>;
+  readonly ledger: Pick<LedgerApi, 'getJob' | 'getApprovedIntakeReview'>;
   /** The normal dispatch path (POST /api/dispatch's service). */
   readonly dispatch: (input: IntakeSlicingDispatchInput) => Promise<unknown>;
   readonly notifications: Pick<NotificationCenter, 'post'>;
@@ -37,6 +37,8 @@ export interface IntakeSlicingCommission {
   readonly resultRequestId: string;
   /** False when the planning minion was already commissioned. */
   readonly dispatched: boolean;
+  /** The planning job's current ledger status, e.g. `blocked` after a failed spawn. */
+  readonly jobStatus: string;
 }
 
 function fields(value: unknown, keys: readonly string[]): Record<string, string> & { readonly breakdown?: unknown } {
@@ -86,7 +88,7 @@ export class IntakeSlicingService {
     const at = (path: string): string => `${api ?? '<the service API>'}${path}`;
     const binding = { repoPath: proposal.repoPath, intakeId: proposal.intakeId, requestId: proposal.requestId, revisionId: proposal.revisionId };
     return [
-      `Planning-only heist (#429): slice captured intake ${proposal.intakeId} into ordered heists. Your deliverable is one intake revision, not code and not a pull request: commit nothing.`,
+      `Planning-only heist (#429): slice captured intake ${proposal.intakeId} into ordered heists. The artifact you hand back is the accepted intake revision itself, not code, a file or a pull request: there is nothing to commit.`,
       '',
       'Binding (exact; never change it):',
       `- repoPath: ${proposal.repoPath}`,
@@ -112,25 +114,34 @@ export class IntakeSlicingService {
     const proposal = this.exact(raw);
     if (proposal.gaps.length > 0) throw new IntakeError('intake_incomplete_sources', `Resolve the ${proposal.gaps.length} captured source gap(s) with a new preview before slicing; a planning minion cannot slice unknown sources`, 409);
     if (proposal.requirements.length === 0) throw new IntakeError('intake_incomplete_sources', 'The captured proposal has no source lines to slice', 409);
+    if (this.options.ledger.getApprovedIntakeReview(proposal.repoPath, proposal.intakeId, proposal.revisionId) !== null) throw new IntakeError('intake_slicing_approved', 'This revision already has accepted work; slicing it would plan that work twice', 409);
     const helper = this.helper();
     const { jobId, resultRequestId } = slicingIdentity(proposal);
     const commission = { repoPath: proposal.repoPath, intakeId: proposal.intakeId, requestId: proposal.requestId, revisionId: proposal.revisionId, jobId, resultRequestId };
-    if (this.options.ledger.getJob(jobId) !== null) return { ...commission, dispatched: false };
+    const status = (dispatched: boolean): IntakeSlicingCommission => ({ ...commission, dispatched, jobStatus: this.options.ledger.getJob(jobId)!.status });
+    if (this.options.ledger.getJob(jobId) !== null) return status(false);
     let pending = this.inflight.get(jobId);
     if (pending === undefined) {
+      // The dispatcher records the job before its first await, so the
+      // caller learns of the commission at once instead of waiting out the
+      // worker gate. A later failure blocks that job, visibly, on the board.
       pending = this.options.dispatch({ jobId, repoPath: proposal.repoPath, title: `Slice intake ${proposal.intakeId} into heists`, briefing: this.briefing(proposal, resultRequestId, helper), deliverable: 'investigation' })
         .finally(() => this.inflight.delete(jobId));
       this.inflight.set(jobId, pending);
+      if (this.options.ledger.getJob(jobId) !== null) {
+        pending.catch(() => { /* the dispatcher blocked the recorded job with its note */ });
+        return status(true);
+      }
     }
     try { await pending; } catch (error) {
-      if (this.options.ledger.getJob(jobId) !== null) return { ...commission, dispatched: true };
       throw new IntakeError('intake_slicing_dispatch_failed', `The planning minion was not dispatched: ${error instanceof Error ? error.message : String(error)}. Retry the identical request.`, 503);
     }
-    return { ...commission, dispatched: true };
+    return status(true);
   }
 
   /** The minion's breakdown becomes the refinement of the exact revision it
-   * sliced. A refused breakdown writes nothing; the identical one converges. */
+   * sliced. A breakdown refused by validation or the output bound writes
+   * nothing under the result request; the identical one converges. */
   async submit(value: unknown): Promise<Proposal> {
     const raw = fields(value, ['repoPath', 'intakeId', 'requestId', 'revisionId', 'breakdown']);
     const proposal = this.exact(raw);
@@ -138,17 +149,20 @@ export class IntakeSlicingService {
     if (this.options.ledger.getJob(jobId) === null) throw new IntakeError('intake_slicing_not_commissioned', `No planning minion was commissioned for revision ${proposal.revisionId}; commission one with POST /api/intake/slice`, 409);
     const plan = slicingPlan(raw['breakdown'], proposal);
     validatePlan(plan, proposal);
+    // revise() records its request before the proposal's output bound, so an
+    // oversized plan is refused here, leaving the result request unwritten.
+    boundedCanonical({ snapshots: proposal.snapshots, gaps: proposal.gaps, requirements: proposal.requirements, plan }, INTAKE_MAX_OUTPUT_BYTES - 64 * 1024);
     const result = await this.options.intake.revise({ repoPath: proposal.repoPath, intakeId: proposal.intakeId, requestId: resultRequestId, previousRequestId: proposal.requestId, revisionId: proposal.revisionId, plan });
     this.announce(result, jobId);
     return result;
   }
 
   private announce(result: Proposal, jobId: string): void {
-    const open = [
+    // plan.questions already holds every gap and unmapped question.
+    const open = [...new Set([
       ...result.plan.questions,
       ...result.plan.heists.flatMap(({ id, unresolvedQuestions }) => unresolvedQuestions.map((question) => `${id}: ${question}`)),
-      ...result.plan.unmapped.map(({ question }) => question),
-    ];
+    ])];
     const conflicts = open.filter((question) => /source conflict/iu.test(question));
     const rest = open.filter((question) => !conflicts.includes(question));
     const listed = [...conflicts, ...rest];

@@ -13,6 +13,14 @@ describe('IntakeClient exact authenticated requests', () => {
     await client().readback('/repo path', 'id', 'accepted-token');
     expect(fetcher.mock.calls[1]![0]).toContain('repoPath=%2Frepo+path&token=accepted-token');
   });
+  it('commissions slicing for an exact revision without a review token (#429)', async () => {
+    const commission = { repoPath: '/workspace/app', intakeId: 'intake', requestId: 'r1', revisionId: 'a'.repeat(64), jobId: 'intake-slice-1', resultRequestId: 'slice-1', dispatched: true, jobStatus: 'queued' };
+    const fetcher = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify(commission), { status: 202 }));
+    vi.stubGlobal('fetch', fetcher);
+    const input = { repoPath: '/workspace/app', intakeId: 'intake', requestId: 'r1', revisionId: 'a'.repeat(64) };
+    expect(await client().slice(input)).toEqual(commission);
+    expect(fetcher.mock.calls[0]).toEqual(['http://example.test/api/intake/slice', expect.objectContaining({ method: 'POST', body: JSON.stringify(input), headers: { authorization: 'Bearer paired', 'content-type': 'application/json' } })]);
+  });
   it('preserves named stale/conflict/partial responses and identities instead of substituting a plan', async () => {
     const readback = { review: null, accepted: [{ heistId: 'one', entryId: 'entry', state: 'waiting' }], remaining: [] };
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ error: 'intake_partial_failure', detail: 'Retry identical approval', readback }), { status: 503 })));

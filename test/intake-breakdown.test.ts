@@ -9,6 +9,7 @@ import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { IntakeService } from '../src/intake/service.js';
 import { validatePlan } from '../src/intake/planner.js';
+import { architectureSnapshots } from '../src/intake/breakdown.js';
 import { canonical, digest, type Proposal } from '../src/intake/types.js';
 import { ARCHITECTURE, EPIC, TICKETS } from './helpers/bmad-epic.js';
 
@@ -94,6 +95,96 @@ describe('BMAD v7 epic folder intake (#429)', () => {
   it('names an entry without a title as a visible gap and invents no heist from it', () => gapCase(TICKETS.replace('title = "Cart service scaffold"\n', ''), 'intake_malformed_breakdown', /entry 1 needs a title/u));
   it('names an unknown type as a visible gap and invents no heist from it', () => gapCase(TICKETS.replace('type = "story"', 'type = "chore"'), 'intake_malformed_breakdown', /entry 1 type "chore" is not one of story, spike, bug/u));
   it('names no entries as a visible gap and invents no heist from it', () => gapCase('# planned later\n', 'intake_malformed_breakdown', /has no \[\[entry\]\] tables/u));
+  it('names a mistyped hitl as a visible gap and invents no heist from it', () => gapCase(TICKETS.replace('hitl = true', 'hitl = "yes"'), 'intake_malformed_breakdown', /entry 1 hitl must be true or false/u));
+  it('names a mistyped description as a visible gap and invents no heist from it', () => gapCase(TICKETS.replace(/description = "Stands up[^\n]*/u, 'description = 7'), 'intake_malformed_breakdown', /entry 1 description must be a string without NUL characters/u));
+  it('names a NUL in a field as a visible gap and invents no heist from it', () => gapCase(TICKETS.replace('description = "Stands up', 'description = "Stands\\u0000up'), 'intake_malformed_breakdown', /entry 1 description must be a string without NUL characters/u));
+  it('names an entry table it cannot trace exactly as a visible gap and invents no heist from it', () => gapCase(TICKETS.replace(/description = "Stands up[^\n]*/u, 'description = """\nStands up the cart service.\n[notes]\n"""'), 'intake_malformed_breakdown', /each \[\[entry\]\] table must start at its own \[\[entry\]\] header line/u));
+
+  it('maps a breakdown saved with CRLF line endings exactly', async () => {
+    const h = epicFolder({ 'epic-cart/tickets.toml': TICKETS.replace(/\n/gu, '\r\n') });
+    const proposal = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source() });
+    expect(proposal.gaps).toEqual([]);
+    expect(proposal.plan.heists.map(({ id }) => id)).toEqual(['entry-1', 'entry-2', 'entry-3']);
+    expect(proposal.plan.heists[1]!.acceptance[0]!.traces[0]!.quote).toMatch(/^\[\[entry\]\]\r\nid = 2\r\n[\s\S]*risk = "medium"\r$/u);
+    expect(proposal.plan.unmapped).toEqual([]);
+  });
+
+  it("keeps spikes, checkpoints, refine requests, a missing verify and a quoted sibling id as that heist's questions", async () => {
+    const tickets = TICKETS.replace('id = 1\ntype = "story"', 'id = 1\ntype = "spike"\nplan_checkpoint = true\nrefine = true')
+      .replace('verify = "A valid code lowers the total; an expired one is refused with its reason."\n', '')
+      .replace('after = [2, "1.3"]', 'after = ["2"]');
+    const h = epicFolder({ 'epic-cart/tickets.toml': tickets });
+    const proposal = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source() });
+    const [one, two, three] = proposal.plan.heists;
+    expect(one!.unresolvedQuestions).toEqual([
+      expect.stringMatching(/^Entry 1 has a human step \(hitl\)/u),
+      'Entry 1 asks to be refined to full acceptance criteria (refine = true) before it starts. Write them into this heist before admitting it.',
+      'Entry 1 is a spike: its result is an answer, not shipped code. Settle it, or confirm it runs as a pull-request heist, before admitting it.',
+      "Entry 1 asks for a plan checkpoint (a person reviews the plan before work starts); GC has no such pause. Confirm the owner's PR review and merge cover it before admitting this heist.",
+    ]);
+    expect(two!.unresolvedQuestions).toContain('Entry 2 has no verify check.');
+    expect(two!.acceptance[0]).toMatchObject({ text: 'Clarify how entry 2 is checked; the breakdown gives no verify.', clarification: true });
+    expect(three!.dependencies).toEqual([]);
+    expect(three!.unresolvedQuestions).toEqual(['Entry 3 is after "2": BMAD reads a quoted number as a tracker id, not entry 2 of this breakdown. Write it bare (after = [2]) if it means that entry, or confirm the tracker work is done, before admitting this heist.']);
+  });
+
+  it('covers ids name only their own requirement line, under any requirements heading, and fall back to the whole epic without one', async () => {
+    const exact = epicFolder({ 'epic-cart/epic-cart.md': EPIC.replace('- R2: Apply', '- R1.1: Undo the last change.\n- R2: Apply') });
+    const first = await exact.service.preview({ repoPath: exact.repo, intakeId: 'cart', requestId: 'r1', source: exact.source() });
+    expect(first.plan.heists[0]!.acceptance[0]!.traces.slice(1).map(({ quote }) => quote)).toEqual(['- R1: Add, remove, and change quantity of any item; the total updates at once.']);
+    expect(first.plan.unmapped.map(({ question }) => question)).toEqual(['epic-cart/epic-cart.md: "- R1.1: Undo the last change." is a requirement no entry covers. Place it in an entry, or confirm it is out of scope.']);
+    const functional = epicFolder({ 'epic-cart/epic-cart.md': EPIC.replace('## Requirements', '## Functional Requirements') });
+    const named = await functional.service.preview({ repoPath: functional.repo, intakeId: 'cart', requestId: 'r1', source: functional.source() });
+    expect(named.plan.heists.map(({ unresolvedQuestions }) => unresolvedQuestions.filter((question) => question.includes('covers')))).toEqual([[], [], []]);
+    expect(named.plan.unmapped).toEqual([]);
+    const headless = epicFolder({ 'epic-cart/epic-cart.md': EPIC.replace('## Requirements\n', '') });
+    const loose = await headless.service.preview({ repoPath: headless.repo, intakeId: 'cart', requestId: 'r1', source: headless.source() });
+    expect(loose.plan.heists[0]!.acceptance[0]!.traces.slice(1).map(({ quote }) => quote)).toEqual(['- R1: Add, remove, and change quantity of any item; the total updates at once.']);
+    // A covered line is the entry's own deliverable, never also filed as context.
+    const context = loose.plan.heists[0]!.acceptance[1]!;
+    expect(context.text).toMatch(/^Epic context for the whole breakdown/u);
+    expect(context.requirementIds).not.toContain(loose.requirements.find(({ trace }) => trace.quote.startsWith('- R1'))!.id);
+  });
+
+  it('maps a v7 epic folder attached as service uploads', async () => {
+    const h = epicFolder();
+    const upload = (stamp: string, name: string, text: string): { uploadPath: string } => {
+      const uploadPath = join(h.dataDir, 'uploads', `${stamp}-11111111-2222-3333-4444-555555555555-${name}`);
+      writeFileSync(uploadPath, text);
+      return { uploadPath };
+    };
+    const source = { kind: 'bmad' as const, document: upload('1791633600000', 'epic-cart.md', EPIC), supporting: [upload('1791633600001', 'tickets.toml', TICKETS), upload('1791633600002', 'architecture-checkout.md', ARCHITECTURE)] };
+    const proposal = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source });
+    expect(proposal.gaps).toEqual([]);
+    expect(proposal.plan.heists.map(({ id }) => id)).toEqual(['entry-1', 'entry-2', 'entry-3']);
+    expect(proposal.plan.heists[0]!.acceptance[2]!.text).toMatch(/^Binding architecture for every entry/u);
+  });
+
+  it('binds architecture for BMAD sources only, by spine frontmatter or file name, and never the primary document', async () => {
+    const h = epicFolder({ 'spec.md': '# Spec\n\n## References\n\n- docs/architecture.md, to update with the new flow.\n' });
+    const spec = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: { kind: 'spec', document: { path: 'spec.md' } } });
+    expect(spec.gaps).toEqual([]);
+    const frontmatter = epicFolder({
+      'epic-cart/epic-cart.md': EPIC.replace('- constraint — architecture-checkout/architecture-checkout.md, AD-1\n', ''),
+      'epic-cart/tickets.toml': TICKETS.replace('references = ["architecture-checkout/architecture-checkout.md#ad-1"]\n', ''),
+      'design/spine-checkout.md': ARCHITECTURE,
+    });
+    const spine = await frontmatter.service.preview({ repoPath: frontmatter.repo, intakeId: 'cart', requestId: 'r1', source: frontmatter.source(['epic-cart/tickets.toml', 'design/spine-checkout.md']) });
+    expect(spine.gaps).toEqual([]);
+    expect(architectureSnapshots(spine).map(({ locator }) => locator)).toEqual(['design/spine-checkout.md']);
+    const primary = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r2', source: { kind: 'bmad', document: { path: 'architecture-checkout/architecture-checkout.md' } } });
+    expect(architectureSnapshots(primary)).toEqual([]);
+    expect(primary.gaps).toEqual([]);
+  });
+
+  it('a breakdown must sit beside its epic and is never the primary document', async () => {
+    const h = epicFolder({ 'other/tickets.toml': TICKETS });
+    const elsewhere = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source(['other/tickets.toml', 'architecture-checkout/architecture-checkout.md']) });
+    expect(elsewhere.gaps).toEqual([{ code: 'intake_malformed_breakdown', locator: 'other/tickets.toml', question: "other/tickets.toml is not in the epic's folder epic-cart; supply the tickets.toml that sits beside epic-cart/epic-cart.md. Nothing was mapped from the breakdown." }]);
+    expect(elsewhere.plan.heists.map(({ id }) => id)).toEqual(['entry-1', 'entry-2', 'entry-3']);
+    const alone = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r2', source: { kind: 'bmad', document: { path: 'epic-cart/tickets.toml' } } });
+    expect(alone.gaps).toContainEqual(expect.objectContaining({ code: 'intake_malformed_breakdown', question: expect.stringMatching(/^Supply the epic's Markdown as the primary document/u) }));
+  });
 
   it('refuses a second breakdown, other TOML and a misnamed breakdown by name', async () => {
     const h = epicFolder({ 'epic-cart/other.toml': TICKETS, 'other/tickets.toml': TICKETS });
@@ -137,12 +228,16 @@ describe('BMAD v7 epic folder intake (#429)', () => {
 });
 
 describe('approval of a v7 breakdown (#429)', () => {
-  function approvalFixture(tickets: string, files: Readonly<Record<string, string>> = {}) {
+  function approvalFixture(tickets: string, files: Readonly<Record<string, string>> = {}, available = 0) {
     const h = epicFolder({ 'epic-cart/tickets.toml': tickets, ...files });
     const db = new LedgerDb(join(h.root, 'ledger'));
     const ledger = new LedgerApi(db.handle);
-    const dispatch = vi.fn(async () => ({ settled: Promise.resolve() }));
-    const pipeline = new PipelineService({ ledger, dispatch: { dispatch }, capacity: () => ({ capacity: 1, occupied: 1, available: 0, queued: 0 }) });
+    const dispatch = vi.fn(async (input: { jobId: string; title: string; briefing: string }) => {
+      ledger.addJob({ id: input.jobId, repo: 'shop', title: input.title, briefing: input.briefing });
+      ledger.appendCustomEvent({ kind: 'job.minion-spawned', jobId: input.jobId, payload: {} });
+      return { settled: Promise.resolve() };
+    });
+    const pipeline = new PipelineService({ ledger, dispatch: { dispatch }, capacity: () => ({ capacity: 1, occupied: 1 - available, available, queued: 0 }) });
     const approval = new IntakeApprovalService({ intake: h.service, ledger, pipeline });
     cleanups.push(() => { pipeline.dispose(); db.close(); });
     return { ...h, ledger, pipeline, approval, dispatch };
@@ -168,8 +263,50 @@ describe('approval of a v7 breakdown (#429)', () => {
       expect(briefing.architecture.policy).toBe(ARCHITECTURE_POLICY);
     }
     expect(h.ledger.getJob(first!.id)).toBeNull();
+    expect(h.dispatch).not.toHaveBeenCalled();
     // A retry of the identical approval converges on the same entries.
     expect(h.approval.approve({ ...decision, expectedToken: token, selected: ['entry-1', 'entry-2'] }).review!.entries).toEqual(readback.review!.entries);
+  });
+
+  it('the owner settles a v7 question by refinement and approves it straight into a free pipeline slot', async () => {
+    const h = approvalFixture(TICKETS, {}, 1);
+    const first = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source() });
+    expect(first.plan.heists[0]!.unresolvedQuestions).toHaveLength(1);
+    const plan = { ...first.plan, heists: first.plan.heists.map((heist) => heist.id === 'entry-1' ? { ...heist, unresolvedQuestions: [] } : heist) };
+    const refined = await h.service.revise({ repoPath: h.repo, intakeId: 'cart', requestId: 'r2', previousRequestId: 'r1', revisionId: first.revisionId, plan });
+    const decision = { repoPath: h.repo, intakeId: 'cart', requestId: 'r2', revisionId: refined.revisionId, expectedToken: null };
+    const token = h.approval.review(decision).review!.token;
+    const readback = h.approval.approve({ ...decision, expectedToken: token, selected: ['entry-1'] });
+    expect(readback.accepted.map(({ heistId }) => heistId)).toEqual(['entry-1']);
+    await h.pipeline.whenIdle();
+    expect(h.dispatch).toHaveBeenCalledTimes(1);
+    expect(h.dispatch.mock.calls[0]![0]).toMatchObject({ title: 'Cart service scaffold' });
+  });
+
+  it('a later revision approves a slice whose prerequisite an earlier approval accepted, without enqueueing it twice', async () => {
+    const h = approvalFixture(TICKETS.replace('hitl = true\n', ''));
+    const first = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source() });
+    const one = { repoPath: h.repo, intakeId: 'cart', requestId: 'r1', revisionId: first.revisionId, expectedToken: null };
+    const accepted = h.approval.approve({ ...one, expectedToken: h.approval.review(one).review!.token, selected: ['entry-1'] }).review!;
+    // Entry 2's unknown is settled later, in a new revision.
+    const plan = { ...first.plan, heists: first.plan.heists.map((heist) => heist.id === 'entry-2' ? { ...heist, unresolvedQuestions: [] } : heist) };
+    const second = await h.service.revise({ repoPath: h.repo, intakeId: 'cart', requestId: 'r2', previousRequestId: 'r1', revisionId: first.revisionId, plan });
+    const two = { repoPath: h.repo, intakeId: 'cart', requestId: 'r2', revisionId: second.revisionId, expectedToken: accepted.token };
+    const readback = h.approval.approve({ ...two, expectedToken: h.approval.review(two).review!.token, selected: ['entry-2'] });
+    expect(readback.review!.entries[0]!.prerequisites).toEqual([{ id: accepted.entries[0]!.id, milestone: 'merged' }]);
+    expect(h.ledger.listPipelineEntries().map(({ title }) => title).sort()).toEqual(['Apply and refuse discount codes', 'Cart service scaffold']);
+  });
+
+  it('refuses a heist that still carries breakdown placeholder text after its question is cleared', async () => {
+    const h = approvalFixture(settled.replace('description = "Stands up the cart service with one add-item path through UI, API, and store."\n', ''));
+    const first = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source() });
+    expect(first.plan.heists[0]!.goal.text).toBe('Clarify what entry 1 delivers; the breakdown gives no description.');
+    const plan = { ...first.plan, heists: first.plan.heists.map((heist) => heist.id === 'entry-1' ? { ...heist, unresolvedQuestions: [] } : heist) };
+    const cleared = await h.service.revise({ repoPath: h.repo, intakeId: 'cart', requestId: 'r2', previousRequestId: 'r1', revisionId: first.revisionId, plan });
+    const decision = { repoPath: h.repo, intakeId: 'cart', requestId: 'r2', revisionId: cleared.revisionId, expectedToken: null };
+    const token = h.approval.review(decision).review!.token;
+    expect(() => h.approval.approve({ ...decision, expectedToken: token, selected: ['entry-1'] })).toThrow(expect.objectContaining({ code: 'intake_incomplete_plan' }));
+    expect(h.ledger.listPipelineEntries()).toEqual([]);
   });
 
   it('an approval retry enqueues the frozen recorded entries, even when this build renders briefings differently', async () => {

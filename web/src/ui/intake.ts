@@ -369,12 +369,12 @@ export class IntakeView {
       checkbox.checked = this.selected.has(id);
       checkbox.disabled = approved || this.busy;
     }
-    action('Slice into heists (planning minion)', this.documentsError === null && !this.dirty() && this.proposal.gaps.length === 0, async (client, current) => {
+    action('Slice into heists (planning minion)', this.documentsError === null && !this.dirty() && this.proposal.gaps.length === 0 && !approved, async (client, current) => {
       const p = this.proposal!;
       const commission = await client.slice({ repoPath: p.repoPath, intakeId: p.intakeId, requestId: p.requestId, revisionId: p.revisionId });
       if (!current()) return;
       this.slicing = commission;
-      this.status.textContent = `Planning minion ${commission.jobId} ${commission.dispatched ? 'is slicing' : 'was already commissioned for'} this revision. Its sliced plan lands as request ${commission.resultRequestId}; FOR YOU says when it is ready. Nothing runs until you approve.`;
+      this.status.textContent = `Planning minion ${commission.jobId} (${commission.jobStatus}) ${commission.dispatched ? 'is slicing' : 'was already commissioned for'} this revision. Its sliced plan lands as request ${commission.resultRequestId}; FOR YOU says when it is ready. Nothing runs until you approve.`;
     });
     const slicing = this.slicing;
     if (slicing !== null && slicing.repoPath === this.proposal.repoPath && slicing.intakeId === this.proposal.intakeId && slicing.requestId === this.proposal.requestId) action('Load sliced revision', !this.dirty(), async (client, current) => {

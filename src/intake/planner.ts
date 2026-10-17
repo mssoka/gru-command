@@ -146,6 +146,6 @@ export function conservativePlan(capture: Capture): Plan {
 
 /** The default preview: a captured v7 breakdown maps one heist per entry, in
  * table order; every other capture gets the conservative plan. */
-export function defaultPlan(capture: Capture): Plan {
-  return breakdownPlan(capture) ?? conservativePlan(capture);
+export async function defaultPlan(capture: Capture): Promise<Plan> {
+  return await breakdownPlan(capture) ?? conservativePlan(capture);
 }

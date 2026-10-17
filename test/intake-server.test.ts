@@ -4,7 +4,7 @@ import { createServer, type Server } from 'node:http';
 import { createConnection, type AddressInfo } from 'node:net';
 import { digest, type Proposal } from '../src/intake/types.js';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadConfig } from '../src/config.js';
 import { createDispatchServer, type DispatchServer } from '../src/dispatch/server.js';
@@ -16,6 +16,7 @@ import { IntakeSlicingService } from '../src/intake/slicing.js';
 import { resolvedIntakePlan } from './helpers/intake-plan.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
+import { ARCHITECTURE, EPIC, TICKETS } from './helpers/bmad-epic.js';
 
 const TOKEN = 'intake-test-token';
 const cleanup: { root: string; server: Server; hook: DispatchServer; db: LedgerDb; pipeline: PipelineService }[] = [];
@@ -69,6 +70,23 @@ async function boot(hosted = true, slicing = false) {
 const query = (repo: string) => `repoPath=${encodeURIComponent(repo)}`;
 
 describe('intake slicing HTTP routes (#429)', () => {
+  it('previews a v7 epic folder over HTTP with zero jobs, lanes or pipeline entries', async () => {
+    const h = await boot();
+    for (const [path, text] of [['epic-cart/epic-cart.md', EPIC], ['epic-cart/tickets.toml', TICKETS], ['architecture-checkout/architecture-checkout.md', ARCHITECTURE]] as const) {
+      mkdirSync(dirname(join(h.repo, path)), { recursive: true });
+      writeFileSync(join(h.repo, path), text);
+    }
+    const source = { kind: 'bmad', document: { path: 'epic-cart/epic-cart.md' }, supporting: [{ path: 'epic-cart/tickets.toml' }, { path: 'architecture-checkout/architecture-checkout.md' }] };
+    const preview = await h.api('POST', '/api/intake/preview', { ...h.request, intakeId: 'cart', source });
+    expect(preview.status).toBe(200);
+    expect((preview.body as unknown as Proposal).plan.heists.map(({ id }) => id)).toEqual(['entry-1', 'entry-2', 'entry-3']);
+    expect(h.ledger.listJobs()).toEqual([]);
+    expect(h.ledger.listPipelineEntries()).toEqual([]);
+    expect(h.ledger.listWorktrees()).toEqual([]);
+    expect(h.dispatch).not.toHaveBeenCalled();
+    expect(h.minions).not.toHaveBeenCalled();
+  });
+
   it('guards, commissions once and turns the breakdown into a refinement; a refused breakdown is a named 400', async () => {
     const unhosted = await boot();
     const first = await unhosted.api('POST', '/api/intake/preview', unhosted.request);

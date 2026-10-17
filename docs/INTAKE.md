@@ -172,7 +172,8 @@ requirements and workflow identities. They remain non-executable.
 In BMAD v7 an epic is a folder: `epic-<slug>/epic-<slug>.md` plus a
 `tickets.toml` whose `[[entry]]` tables, in build order, are its agreed slices.
 Supply the epic as the primary document and the `tickets.toml` (and its
-architecture, below) as supporting documents:
+architecture, below) as supporting documents. The breakdown must sit beside the
+epic, in the same folder; uploads, which carry no folder, are exempt:
 
 ```json
 {"kind":"bmad","document":{"path":"_bmad-output/epic-cart/epic-cart.md"},"supporting":[{"path":"_bmad-output/epic-cart/tickets.toml"},{"path":"_bmad-output/architecture-checkout/architecture-checkout.md"}]}
@@ -184,38 +185,46 @@ The breakdown is parsed with the bundled TOML parser, never executed, and maps
 - heist `entry-<id>`, titled by the entry; `description` is its goal and
   `verify` its acceptance and verification. Each traces to the entry's exact
   `[[entry]]` table span and to the epic lines its `covers` ids start (inside the
-  epic's Requirements section when it has one).
+  epic's requirements sections, any heading containing "requirements", when it
+  has one). `R1` names neither `R10` nor a sub-requirement `R1.1`.
 - a bare-number `after` id names a sibling and becomes a `merged` dependency: a
   slice builds on its prerequisite's merged code. Every heist proposes
   `delivered` and `merged`.
-- `hitl = true`, an `unknown`, a `spike`, `plan_checkpoint`/`done_checkpoint`, a
-  quoted or cross-epic `after` (`"1.3"`, `"epic-<slug>"`, a tracker id) and a
-  `covers` id no epic line starts become that heist's unresolved questions. GC
-  cannot see work outside the epic, and runs no human step on its own.
+- `hitl = true`, an `unknown`, a `spike`, `plan_checkpoint`/`done_checkpoint`,
+  `refine = true`, a quoted or cross-epic `after` (`"1.3"`, `"epic-<slug>"`, a
+  tracker id; a quoted number is a tracker id in BMAD, and the question says so
+  when it matches a sibling) and a `covers` id no epic line starts become that
+  heist's unresolved questions. GC cannot see work outside the epic, and runs no
+  human step on its own. Settle them by refining the plan, then approve.
 - the epic's other lines and the breakdown's comments are mapped once, as
-  context, on the first entry. A Requirements line no entry covers stays an
-  unmapped question. A `Source conflict:` line in the epic stays open on the
-  entries whose `covers` it names, else on the whole plan.
+  context, on the first entry. A requirements line no entry covers stays an
+  unmapped question. A `Source conflict:` line in the epic or its architecture
+  stays open on the entries whose `covers` it names, else on the whole plan.
 
 A breakdown that does not parse or resolve is a named gap, and the preview falls
 back to the conservative plan: `intake_malformed_breakdown` (invalid TOML,
 `[[epic]]` initiative tables, no entries, a missing/duplicate id, title or type,
-mistyped fields, an entry table GC cannot trace exactly, or a second
-`tickets.toml`), `intake_breakdown_prerequisite` (a bare `after` id naming no
-entry) and `intake_breakdown_cycle`. No heist is invented from a broken
+mistyped fields or NUL characters, an entry table GC cannot trace exactly, a
+second `tickets.toml`, a breakdown outside the epic's folder or supplied as the
+primary document), `intake_breakdown_prerequisite` (a bare `after` id naming no
+entry) and `intake_breakdown_cycle`. The TOML parser loads only when a breakdown
+is captured, so every other source previews from the bare package. No heist is invented from a broken
 breakdown; correct the file and preview again.
 
 ## Architecture binds every heist
 
-A captured architecture document, meaning a BMAD v7 spine (frontmatter
-`type: architecture-spine`) or a Markdown file named `architecture*.md`, binds
-every heist of the proposal by its exact bytes. GC never links to
+In a BMAD intake, a captured supporting document that is an architecture
+document binds every heist of the proposal by its exact bytes. That means a v7
+spine (frontmatter `type: architecture-spine` or `type: architecture`) or a
+Markdown file named `architecture*.md`. The primary document is the work
+itself and never binds. Spec and issue intake are unchanged. GC never links to
 `_bmad-output`, because a minion's fresh worktree may not hold that directory and
 the file can change after approval. Instead:
 
-- any `architecture*.md` path named in a captured document (its References,
-  v6 `inputDocuments`, a `tickets.toml` entry's `references`) that is not itself
-  captured is an `intake_missing_architecture` gap, matched by file name. Supply
+- any `architecture*.md` path a captured BMAD document names (in its
+  frontmatter, such as v6 `inputDocuments`, or under a References heading, or
+  anywhere in its `tickets.toml`) that is not itself captured is an
+  `intake_missing_architecture` gap, matched by file name, ignoring case. Supply
   it as a supporting document.
 - its lines are mapped once, on the first heist, as binding architecture.
 - every approved briefing carries an `architecture` section naming the captured
@@ -232,10 +241,16 @@ reads the codebase. `POST /api/intake/slice` with `repoPath`, `intakeId`,
 `requestId` and the exact `revisionId` dispatches one tracked `investigation`
 job through the normal dispatch path. It returns `jobId`, the `resultRequestId`
 its plan will land at, and `dispatched` (`202`; `200` with `false` when it was
-already commissioned). Both ids derive from the exact revision, so retries
-converge on one minion. A proposal with source gaps or no source lines is
-refused (`409 intake_incomplete_sources`), as is a changed revision
-(`409 intake_stale_revision`).
+already commissioned), plus the job's `jobStatus`. It answers as soon as the
+job is recorded, without waiting for a worker slot. Both ids derive from the
+exact revision, so retries converge on one minion. A proposal with source gaps
+or no source lines is refused (`409 intake_incomplete_sources`), as are a changed
+revision (`409 intake_stale_revision`) and a revision that already has accepted
+work (`409 intake_slicing_approved`). A dispatch that fails before the job is
+recorded is `503 intake_slicing_dispatch_failed`; retry the identical request.
+If the planning minion ends without a sliced revision (its job blocked or
+closed), preview the sources again and slice the new revision. Any captured
+source can be sliced; the method is written for epics.
 
 The job's briefing binds that revision and embeds the verified GC slicing
 helper (`skills/gc-build/slice.md`, with its sha256). The minion reads the
@@ -246,10 +261,12 @@ never offsets, plus `after` sibling ids, `hitl`, `unknown`, `lane` and
 `rationale`. Its `context` lists the framing lines and `questions` the
 epic-level ones, each `Source conflict:` included. GC traces each entry to the
 exact captured lines its ids name and maps entries to heists exactly as for a
-v7 breakdown. It validates the result with `validatePlan` before writing
-anything: an entry without `covers` must say `"clarification": true`, or its
-untraced acceptance is refused `400 intake_invalid_plan`. An unknown id, a
-cycle or an unsupported field is refused the same way.
+v7 breakdown. It validates the result with `validatePlan` and the 2 MiB output
+bound before writing anything: an entry without `covers` must say
+`"clarification": true`, or its untraced acceptance is refused
+`400 intake_invalid_plan`. An unknown id, a cycle, a mistyped field or an
+unsupported field is refused the same way, and an oversized plan
+`413 intake_output_bounds`; a corrected breakdown can still land.
 
 An accepted breakdown becomes a refinement: request `resultRequestId` with
 `previousRequestId` set to the sliced request and the same captured bytes.
@@ -367,7 +384,8 @@ reselecting sources and a new preview, not deleting questions in the plan editor
 Editable plan questions/unmapped requirements require refinement and renewed review.
 
 Click **Review this revision**, select the complete heists and their prerequisite
-closure, then **Approve selected work**. Selection never implies approval.
+closure (less any prerequisite an earlier approval of this intake accepted),
+then **Approve selected work**. Selection never implies approval.
 **Reject revision** invalidates the reviewed token, creating no executable work.
 Rejected revisions cannot reopen: use a new edited revision. Dependencies enter
 as existing GC milestone gates: imported “done”, “approved”, or “merged” labels
@@ -389,10 +407,14 @@ Approval freezes exact briefings/provenance and stable pipeline/job/request IDs
 in the configured private ledger **before** enqueue effects. A briefing carries
 the approved heist, the approval binding, the captured snapshots and, when
 captured, the binding architecture section. It does not repeat the requirement
-inventory, because each heist's traces hold the exact quotes it maps; this keeps
-a 12-entry chained epic with its architecture inside one approval. A retry of
-the identical approval enqueues the recorded entries, even when a newer GC
-renders briefings differently. It does not create
+inventory, because each heist's traces hold the exact quotes it maps. Every
+briefing still carries all captured sources, so one approval of 12 heists fits
+when the sources total roughly 80 KiB. A prerequisite an earlier approval of the
+same intake already accepted needs no second selection: the new entry waits on
+that accepted entry, so an epic can be approved a few slices at a time, each
+batch from a new revision, without enqueueing a slice twice. A retry of the
+identical approval enqueues the recorded entries, even when a newer GC renders
+briefings differently. It does not create
 another queue. If enqueue is interrupted, `503 intake_partial_failure` includes
 accepted and remaining identities in `readback`. Read back after a timeout,
 reconnect or reload; then explicitly retry the identical approval. Replays

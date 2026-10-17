@@ -1,4 +1,3 @@
-import { parse } from 'smol-toml';
 import { canonical, IntakeError, type Acceptance, type Capture, type Heist, type Plan, type Requirement, type Snapshot, type Statement, type Trace } from './types.js';
 
 /** The breakdown file of a BMAD v7 epic folder: `[[entry]]` tables in build order (#429). */
@@ -8,12 +7,26 @@ type EntryType = typeof ENTRY_TYPES[number];
 const ENTRY_ID = /^[0-9A-Za-z]{1,64}$/u;
 const ENTRY_HEADER = /^\uFEFF?[ \t]*\[\[[ \t]*entry[ \t]*\]\][ \t]*(?:#.*)?\r?$/u;
 const TABLE_HEADER = /^\uFEFF?[ \t]*\[\[?[ \t]*([A-Za-z0-9_"'. \t-]+?)[ \t]*\]\]?[ \t]*(?:#.*)?\r?$/u;
-const REQUIREMENTS_HEADING = /^(#{1,6})[ \t]+requirements[ \t]*#*[ \t]*\r?$/iu;
+// "Requirements", "Functional Requirements", "Requirements Inventory"…
+const REQUIREMENTS_HEADING = /^(#{1,6})[ \t]+(?:.*[ \t])?requirements\b.*$/iu;
+const REFERENCES_HEADING = /^(#{1,6})[ \t]+(?:.*[ \t])?references\b.*$/iu;
 const SOURCE_CONFLICT = /^\uFEFF?[ \t]*(?:[-*+][ \t]+)?(?:\*\*|__)?source conflict(?:\*\*|__)?[ \t]*:/iu;
 // Mapped once, on the first entry: every briefing already carries all
 // captured sources, so repeating these spans per heist only spends the
 // approval's briefing budget.
 const CONTEXT_TEXT = "Epic context for the whole breakdown, mapped here once and not this entry's own deliverable: the captured lines this traces (frontmatter, title, description, outcome, Done when, boundaries, references, notes) frame every entry. The epic's Done when is the owner's end check across all entries.";
+
+type TomlParse = (text: string) => unknown;
+let tomlParser: Promise<TomlParse> | null = null;
+/** The bundled TOML parser loads only when a breakdown is captured, so every
+ * other intake source still previews from the bare package archive. */
+export function loadTomlParser(): Promise<TomlParse> {
+  tomlParser ??= import('smol-toml').then((toml) => toml.parse, (error: unknown) => {
+    tomlParser = null;
+    throw new IntakeError('intake_workflow_unavailable', `the bundled TOML parser smol-toml is unavailable (${error instanceof Error ? error.message : String(error)}); reinstall GC to read a ${BREAKDOWN_FILE}`, 503);
+  });
+  return tomlParser;
+}
 
 export interface BreakdownProblem {
   readonly code: 'intake_malformed_breakdown' | 'intake_breakdown_prerequisite' | 'intake_breakdown_cycle';
@@ -29,10 +42,13 @@ interface BreakdownEntry {
   readonly verify: string;
   readonly unknown: string;
   readonly hitl: boolean;
+  readonly refine: boolean;
   readonly checkpoints: readonly ('plan' | 'done')[];
   /** Sibling keys only; prerequisites outside the breakdown are `external`. */
   readonly after: readonly string[];
   readonly external: readonly string[];
+  /** Quoted all-digit `after` refs naming a sibling's id: a BMAD tracker id, not that entry. */
+  readonly quoted: readonly string[];
   /** The entry's own captured `tickets.toml` table; null for minion output. */
   readonly table: { readonly trace: Trace; readonly requirementIds: readonly string[] } | null;
   /** `covers` as written: epic requirement ids, or inventory ids from a minion. */
@@ -95,25 +111,50 @@ export function documentName(locator: string): string {
 export function isBreakdownLocator(locator: string): boolean {
   return (UPLOAD_PREFIX.test(locator) || !locator.startsWith('upload:')) && documentName(locator) === BREAKDOWN_FILE;
 }
-/** An architecture document: a BMAD v7 spine (`type: architecture-spine`)
- * or a Markdown file named `architecture*.md`. Its captured bytes bind every
- * heist of the proposal. */
-export function isArchitectureSnapshot(snapshot: Pick<Snapshot, 'kind' | 'locator' | 'frontmatter'>): boolean {
-  if (snapshot.kind !== 'spec' && snapshot.kind !== 'bmad') return false;
-  return /^architecture[^/]*\.md$/iu.test(documentName(snapshot.locator)) ||
-    /^type[ \t]*:[ \t]*(['"]?)architecture(?:-spine)?\1[ \t]*(?:#.*)?\r?$/mu.test(snapshot.frontmatter ?? '');
+/** A BMAD architecture document: a v7 spine (`type: architecture-spine`, or
+ * `type: architecture`) or a Markdown file named `architecture*.md`. */
+function isArchitectureDocument(snapshot: Pick<Snapshot, 'kind' | 'locator' | 'frontmatter'>): boolean {
+  return snapshot.kind === 'bmad' && (/^architecture[^/]*\.md$/iu.test(documentName(snapshot.locator)) ||
+    /^type[ \t]*:[ \t]*(['"]?)architecture(?:-spine)?\1[ \t]*(?:#.*)?\r?$/mu.test(snapshot.frontmatter ?? ''));
 }
-/** Architecture documents a source names: `architecture*.md` paths anywhere
- * in a Markdown document (References, v6 `inputDocuments`) and in a
- * breakdown's `references`. Compared by file name. */
+/** The captured architecture of a BMAD proposal, whose exact bytes bind
+ * every heist: supporting documents only, since the primary document (the
+ * first snapshot) is the work itself. */
+export function architectureSnapshots(capture: Pick<Capture, 'snapshots'>): readonly Snapshot[] {
+  return capture.snapshots.slice(1).filter(isArchitectureDocument);
+}
+/** Lines under a Markdown heading the pattern matches, until the next heading
+ * of the same or a higher level; `#` lines in fenced code are not headings. */
+function sectionRanges(text: string, heading: RegExp): readonly { readonly start: number; readonly end: number }[] {
+  const result: { readonly start: number; readonly end: number }[] = [];
+  let open: { readonly level: number; readonly start: number } | null = null;
+  let fence: string | null = null;
+  for (const line of lines(text)) {
+    const marker = /^[ ]{0,3}(`{3,}|~{3,})/u.exec(line.text)?.[1] ?? null;
+    if (marker !== null && (fence === null || (marker[0] === fence[0] && marker.length >= fence.length))) { fence = fence === null ? marker : null; continue; }
+    if (fence !== null) continue;
+    const level = /^(#{1,6})[ \t]/u.exec(line.text)?.[1]!.length ?? null;
+    if (open !== null && level !== null && level <= open.level) { result.push({ start: open.start, end: line.start }); open = null; }
+    const match = heading.exec(line.text);
+    if (open === null && match !== null) open = { level: match[1]!.length, start: line.end };
+  }
+  if (open !== null) result.push({ start: open.start, end: text.length });
+  return result;
+}
+/** Architecture documents a BMAD source names, by lowercase file name:
+ * `architecture*.md` paths in a Markdown document's frontmatter (v6
+ * `inputDocuments`) or References sections, and anywhere in a breakdown. */
 export function referencedArchitecture(snapshot: Snapshot): readonly string[] {
-  const names = [...snapshot.text.matchAll(/(?:^|[\s"'`([<,=])((?:[\w.-]+\/)*architecture[\w.-]*\.md)(?=[\s"'`)\]>,#:;]|$)/giu)].map((match) => match[1]!);
-  return [...new Set(names.map((name) => name.slice(name.lastIndexOf('/') + 1)))];
+  const scanned = isBreakdownLocator(snapshot.locator)
+    ? [snapshot.text]
+    : [snapshot.frontmatter ?? '', ...sectionRanges(snapshot.text, REFERENCES_HEADING).map(({ start, end }) => snapshot.text.slice(start, end))];
+  const names = scanned.flatMap((text) => [...text.matchAll(/(?:^|[\s"'`([<,=])((?:[\w.-]+\/)*architecture[\w.-]*\.md)(?=[\s"'`)\]>,#:;]|$)/giu)].map((match) => match[1]!));
+  return [...new Set(names.map((name) => name.slice(name.lastIndexOf('/') + 1).toLowerCase()))];
 }
 
 /** Parse one epic's `tickets.toml` as BMAD v7 writes it. Every problem is
  * named; a breakdown with any problem maps to no heists. */
-export function parseBreakdown(text: string): { readonly entries: readonly TomlEntry[]; readonly problems: readonly BreakdownProblem[] } {
+export function parseBreakdown(text: string, parse: TomlParse): { readonly entries: readonly TomlEntry[]; readonly problems: readonly BreakdownProblem[] } {
   const problems: BreakdownProblem[] = [];
   const malformed = (detail: string): void => { problems.push({ code: 'intake_malformed_breakdown', detail }); };
   const done = (entries: readonly TomlEntry[] = []) => ({ entries: problems.length === 0 ? entries : [], problems });
@@ -145,10 +186,11 @@ export function parseBreakdown(text: string): { readonly entries: readonly TomlE
     if (!ENTRY_TYPES.includes(type as EntryType)) malformed(`${label} type ${JSON.stringify(type ?? null)} is not one of ${ENTRY_TYPES.join(', ')}`);
     const title = row['title'];
     if (typeof title !== 'string' || title.trim() === '') malformed(`${label} needs a title`);
+    if (typeof title === 'string' && title.includes('\0')) malformed(`${label} title contains a NUL character`);
     const textField = (name: string): string => {
       const value = row[name];
       if (value === undefined) return '';
-      if (typeof value !== 'string') { malformed(`${label} ${name} must be a string`); return ''; }
+      if (typeof value !== 'string' || value.includes('\0')) { malformed(`${label} ${name} must be a string without NUL characters`); return ''; }
       return value.trim();
     };
     const flag = (name: string): boolean => {
@@ -193,14 +235,16 @@ export function parseBreakdown(text: string): { readonly entries: readonly TomlE
   const resolved = parsed.map((entry) => {
     const after: string[] = [];
     const external: string[] = [];
+    const quoted: string[] = [];
     for (const { bare, ref } of entry.rawAfter) {
       if (bare) {
         if (siblings.has(ref)) after.push(ref);
         else problems.push({ code: 'intake_breakdown_prerequisite', detail: `${BREAKDOWN_FILE} entry ${entry.key} is after ${ref}, which names no entry in this breakdown` });
       } else if (/[A-Za-z]/u.test(ref) && siblings.has(ref)) after.push(ref);
+      else if (/^\d+$/u.test(ref) && siblings.has(ref.replace(/^0+(?=\d)/u, ''))) quoted.push(ref);
       else external.push(ref);
     }
-    return { ...entry, after: [...new Set(after)], external: [...new Set(external)] };
+    return { ...entry, after: [...new Set(after)], external: [...new Set(external)], quoted: [...new Set(quoted)] };
   });
   const loop = cycle(resolved);
   if (loop !== null) problems.push({ code: 'intake_breakdown_cycle', detail: `${BREAKDOWN_FILE} entries wait on each other in a cycle: ${loop}` });
@@ -222,7 +266,8 @@ export function parseBreakdown(text: string): { readonly entries: readonly TomlE
   });
   const exact = spans.length === rows.length && spans.every(({ start, end, position }) => {
     try {
-      const alone = parse(text.slice(start, end).replace(/^\uFEFF/u, '')) as Record<string, unknown>;
+      // A CRLF span ends with its last line's \r, which TOML reads only with its newline.
+      const alone = parse(text.slice(start, end).replace(/^\uFEFF/u, '').replace(/\r$/u, '')) as Record<string, unknown>;
       return Array.isArray(alone['entry']) && alone['entry'].length === 1 && Object.keys(alone).length === 1 && canonical(alone['entry'][0]) === canonical(rows[position]);
     } catch { return false; }
   });
@@ -230,32 +275,16 @@ export function parseBreakdown(text: string): { readonly entries: readonly TomlE
     malformed(`${BREAKDOWN_FILE}: each [[entry]] table must start at its own [[entry]] header line so its exact span can be traced; move other tables and multi-line text out of the entry tables`);
     return done();
   }
-  return done(resolved.map(({ refine: _refine, rawAfter: _rawAfter, ...entry }, index) => ({ ...entry, span: { start: spans[index]!.start, end: spans[index]!.end } })));
+  return done(resolved.map(({ rawAfter: _rawAfter, ...entry }, index) => ({ ...entry, span: { start: spans[index]!.start, end: spans[index]!.end } })));
 }
 
 function trace(snapshot: Snapshot, start: number, end: number): Trace {
   return { snapshotId: snapshot.id, start, end, quote: snapshot.text.slice(start, end) };
 }
-/** Lines under a Markdown "Requirements" heading: covered by an entry or
+/** Lines under a Markdown requirements heading: covered by an entry or
  * left as open questions, never filed as context. */
 function requirementSectionIds(capture: Capture, documents: readonly Snapshot[]): ReadonlySet<string> {
-  const ranges = documents.flatMap((snapshot) => {
-    const result: { readonly id: string; readonly start: number; readonly end: number }[] = [];
-    let open: { readonly level: number; readonly start: number } | null = null;
-    let fence: string | null = null;
-    for (const line of lines(snapshot.text)) {
-      // A `#` line inside fenced code is not a heading.
-      const marker = /^[ ]{0,3}(`{3,}|~{3,})/u.exec(line.text)?.[1] ?? null;
-      if (marker !== null && (fence === null || (marker[0] === fence[0] && marker.length >= fence.length))) { fence = fence === null ? marker : null; continue; }
-      if (fence !== null) continue;
-      const heading = /^(#{1,6})[ \t]/u.exec(line.text);
-      if (open !== null && heading !== null && heading[1]!.length <= open.level) { result.push({ id: snapshot.id, start: open.start, end: line.start }); open = null; }
-      const requirements = REQUIREMENTS_HEADING.exec(line.text);
-      if (open === null && requirements !== null) open = { level: requirements[1]!.length, start: line.end };
-    }
-    if (open !== null) result.push({ id: snapshot.id, start: open.start, end: snapshot.text.length });
-    return result;
-  });
+  const ranges = documents.flatMap((snapshot) => sectionRanges(snapshot.text, REQUIREMENTS_HEADING).map((range) => ({ ...range, id: snapshot.id })));
   return new Set(capture.requirements.filter(({ trace }) => ranges.some((range) => range.id === trace.snapshotId && trace.start >= range.start && trace.end <= range.end)).map(({ id }) => id));
 }
 /** One trace per consecutive run of selected inventory lines. */
@@ -282,11 +311,12 @@ const heistId = (key: string): string => `entry-${key}`;
 /** The one mapping from breakdown entries to heists, shared by the v7
  * `tickets.toml` source and the planning minion's slicing output. */
 function toPlan(entries: readonly BreakdownEntry[], context: ReadonlySet<string>, questions: readonly string[], capture: Capture, origin: 'tickets' | 'slicing'): Plan {
-  const architecture = capture.snapshots.filter(isArchitectureSnapshot);
+  const architecture = architectureSnapshots(capture);
   const documents = epicDocuments(capture);
   const requirementLines = requirementSectionIds(capture, documents);
   const architectureIds = new Set(capture.requirements.filter(({ trace }) => architecture.some(({ id }) => id === trace.snapshotId)).map(({ id }) => id));
-  const contextIds = new Set(capture.requirements.filter(({ id }) => context.has(id) && !requirementLines.has(id) && !architectureIds.has(id)).map(({ id }) => id));
+  const coveredIds = new Set(entries.flatMap(({ covered }) => covered.map(({ id }) => id)));
+  const contextIds = new Set(capture.requirements.filter(({ id }) => context.has(id) && !requirementLines.has(id) && !architectureIds.has(id) && !coveredIds.has(id)).map(({ id }) => id));
   const shared: Acceptance[] = [
     ...(contextIds.size === 0 ? [] : [{ text: CONTEXT_TEXT, traces: runs(capture, contextIds), clarification: true, requirementIds: [...contextIds] }]),
     ...(architectureIds.size === 0 ? [] : [{
@@ -296,7 +326,8 @@ function toPlan(entries: readonly BreakdownEntry[], context: ReadonlySet<string>
   ];
   // Recorded source conflicts stay open: on the entries whose covers the
   // line names, else on the whole plan.
-  const conflicts = capture.requirements.filter(({ id, trace }) => !architectureIds.has(id) && documents.some((doc) => doc.id === trace.snapshotId) && SOURCE_CONFLICT.test(trace.quote));
+  const markdown = new Set([...documents, ...architecture].map(({ id }) => id));
+  const conflicts = capture.requirements.filter(({ trace }) => markdown.has(trace.snapshotId) && SOURCE_CONFLICT.test(trace.quote));
   const conflictQuestion = (quote: string): string => `Settle the recorded source conflict before admitting it: ${quote.trim()}`;
   const names = (quote: string, entry: BreakdownEntry): boolean => entry.coverIds.some((id) => new RegExp(`(?<![0-9A-Za-z])${id.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}(?![0-9A-Za-z])`, 'u').test(quote));
   const unowned = conflicts.filter(({ trace }) => !entries.some((entry) => names(trace.quote, entry)));
@@ -309,12 +340,11 @@ function toPlan(entries: readonly BreakdownEntry[], context: ReadonlySet<string>
     const said = (text: string): Statement => ({ text, traces: own, clarification: proposed });
     const asked = (text: string): Statement => ({ text, traces: own, clarification: true });
     const label = `Entry ${entry.key}`;
-    const others = entries.filter((other) => other !== entry).map(({ key }) => heistId(key));
     return {
       id: heistId(entry.key), title: entry.title,
       goal: entry.description !== '' ? said(entry.description) : asked(`Clarify what entry ${entry.key} delivers; the breakdown gives no description.`),
       scope: [said(`${entry.type[0]!.toUpperCase()}${entry.type.slice(1)}: ${entry.title}`), ...covered.map(({ trace }) => ({ text: trace.quote.trim(), traces: [trace], clarification: false }))],
-      exclusions: [{ text: others.length === 0 ? 'Nothing outside this entry is in scope.' : `The other entries of this breakdown (${others.join(', ')}) are separate heists; nothing outside this entry is in scope.`, traces: [], clarification: true }],
+      exclusions: [{ text: entries.length === 1 ? 'Nothing outside this entry is in scope.' : "The breakdown's other entries are separate heists; nothing outside this entry is in scope.", traces: [], clarification: true }],
       acceptance: [
         { ...(entry.verify !== '' ? said(entry.verify) : asked(`Clarify how entry ${entry.key} is checked; the breakdown gives no verify.`)), requirementIds: [...(entry.table?.requirementIds ?? []), ...covered.map(({ id }) => id)] },
         ...(position === 0 ? shared : []),
@@ -326,8 +356,10 @@ function toPlan(entries: readonly BreakdownEntry[], context: ReadonlySet<string>
       unresolvedQuestions: [
         ...(entry.hitl ? [`${label} has a human step (hitl): a person must act for it. Say who does it, or drop the step, before admitting this heist.`] : []),
         ...(entry.unknown !== '' ? [`${label} has an unknown to settle before it starts: ${entry.unknown}`] : []),
+        ...(entry.refine ? [`${label} asks to be refined to full acceptance criteria (refine = true) before it starts. Write them into this heist before admitting it.`] : []),
         ...(entry.type === 'spike' ? [`${label} is a spike: its result is an answer, not shipped code. Settle it, or confirm it runs as a pull-request heist, before admitting it.`] : []),
         ...entry.checkpoints.map((kind) => `${label} asks for a ${kind} checkpoint (a person ${kind === 'plan' ? 'reviews the plan before work starts' : 'says continue after it'}); GC has no such pause. Confirm the owner's PR review and merge cover it before admitting this heist.`),
+        ...entry.quoted.map((ref) => `${label} is after "${ref}": BMAD reads a quoted number as a tracker id, not entry ${ref.replace(/^0+(?=\d)/u, '')} of this breakdown. Write it bare (after = [${ref.replace(/^0+(?=\d)/u, '')}]) if it means that entry, or confirm the tracker work is done, before admitting this heist.`),
         ...entry.external.map((ref) => `${label} is after ${JSON.stringify(ref)}, outside this breakdown; GC cannot see that work. Confirm it is done, or drop the prerequisite, before admitting this heist.`),
         ...entry.missing.map((id) => `${label} covers ${JSON.stringify(id)}, but no captured epic line starts with that id. Correct covers, or supply the epic that defines it.`),
         ...(entry.description === '' ? [`${label} has no description.`] : []),
@@ -351,7 +383,14 @@ function toPlan(entries: readonly BreakdownEntry[], context: ReadonlySet<string>
 /** The epic's own documents: every captured snapshot except a breakdown and
  * architecture, which are mapped separately. */
 function epicDocuments(capture: Capture): readonly Snapshot[] {
-  return capture.snapshots.filter((snapshot) => !(snapshot.kind === 'bmad' && isBreakdownLocator(snapshot.locator)) && !isArchitectureSnapshot(snapshot));
+  const architecture = architectureSnapshots(capture);
+  return capture.snapshots.filter((snapshot) => !(snapshot.kind === 'bmad' && isBreakdownLocator(snapshot.locator)) && !architecture.includes(snapshot));
+}
+
+/** Text the breakdown mapping writes where the source gave nothing: approval
+ * refuses a heist still carrying one, as for the conservative plan. */
+export function isBreakdownPlaceholder(text: string): boolean {
+  return /^Clarify (?:what entry \S+ delivers; the breakdown gives no description\.|how entry \S+ is checked; the breakdown gives no verify\.|a runnable check for entry \S+\.)$/u.test(text.trim());
 }
 
 /** Covers ids name the epic's requirement lines: a line starting with the id
@@ -366,7 +405,8 @@ function coveredLines(capture: Capture, ids: readonly string[]): { readonly cove
   const missing: string[] = [];
   for (const id of ids) {
     const escaped = id.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
-    const defines = new RegExp(`^\\uFEFF?[ \\t]*(?:#{1,6}[ \\t]+)?(?:[-*+][ \\t]+|\\d+[.)][ \\t]+)?(?:\\*\\*|__)?\\[?${escaped}(?![0-9A-Za-z])`, 'u');
+    // `R1` claims neither `R10` nor a sub-requirement `R1.1` / `R1-a`.
+    const defines = new RegExp(`^\\uFEFF?[ \\t]*(?:#{1,6}[ \\t]+)?(?:[-*+][ \\t]+|\\d+[.)][ \\t]+)?(?:\\*\\*|__)?\\[?${escaped}(?![.-]?[0-9A-Za-z])`, 'u');
     const found = pool.filter(({ trace }) => defines.test(trace.quote));
     if (found.length === 0) missing.push(id);
     covered.push(...found);
@@ -376,11 +416,11 @@ function coveredLines(capture: Capture, ids: readonly string[]): { readonly cove
 
 /** Default mapping of a captured v7 breakdown: one heist per entry, in table
  * order. Null when the capture has no single valid breakdown. */
-export function breakdownPlan(capture: Capture): Plan | null {
+export async function breakdownPlan(capture: Capture): Promise<Plan | null> {
   const tables = capture.snapshots.filter(({ kind, locator }) => kind === 'bmad' && isBreakdownLocator(locator));
   if (tables.length !== 1) return null;
   const table = tables[0]!;
-  const parsed = parseBreakdown(table.text);
+  const parsed = parseBreakdown(table.text, await loadTomlParser());
   if (parsed.problems.length > 0) return null;
   const spans = parsed.entries.map(({ span }) => span);
   const inTable = (requirement: Requirement, span: { readonly start: number; readonly end: number }): boolean =>
@@ -451,7 +491,7 @@ export function slicingPlan(value: unknown, capture: Capture): Plan {
   for (const draft of drafts) {
     for (const ref of draft.after) if (typeof ref !== 'string' || !keys.has(ref)) invalid(`breakdown entry ${draft.key} is after ${JSON.stringify(ref)}, which names no entry of this breakdown`);
   }
-  const entries = drafts.map((draft): BreakdownEntry => ({ ...draft, after: [...new Set(draft.after as string[])], external: [], checkpoints: [], table: null, missing: [] }));
+  const entries = drafts.map((draft): BreakdownEntry => ({ ...draft, after: [...new Set(draft.after as string[])], external: [], quoted: [], refine: false, checkpoints: [], table: null, missing: [] }));
   const loop = cycle(entries);
   if (loop !== null) invalid(`breakdown entries wait on each other in a cycle: ${loop}`);
   const context = new Set(items(raw['context'], 'breakdown.context').map((id) => known(id, 'breakdown.context')));

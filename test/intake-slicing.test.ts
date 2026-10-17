@@ -6,13 +6,21 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { IntakeService } from '../src/intake/service.js';
 import { IntakeSlicingService, INTAKE_SLICING_RESULT_KIND, SLICING_HELPER, slicingIdentity, type IntakeSlicingDispatchInput } from '../src/intake/slicing.js';
 import { validatePlan } from '../src/intake/planner.js';
-import type { LedgerApi } from '../src/ledger/api.js';
+import { IntakeApprovalService } from '../src/intake/approval.js';
+import { PipelineService } from '../src/dispatch/pipeline.js';
+import { LedgerApi } from '../src/ledger/api.js';
+import { LedgerDb } from '../src/ledger/db.js';
+import { ownerAttentionFor } from '../src/notifications/attention.js';
 import { loadBundledWorkflowRuntime } from '../src/workflows/runtime.js';
 import type { Proposal } from '../src/intake/types.js';
 import { ARCHITECTURE, EPIC } from './helpers/bmad-epic.js';
 
 const roots: string[] = [];
-afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+const cleanups: (() => void)[] = [];
+afterEach(() => {
+  for (const cleanup of cleanups.splice(0)) cleanup();
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
 
 function fixture() {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'gc-slicing-')));
@@ -26,13 +34,17 @@ function fixture() {
   write('epic-cart/epic-cart.md', EPIC);
   write('architecture-checkout/architecture-checkout.md', ARCHITECTURE);
   const intake = new IntakeService({ dataDir, workspaceRoot: join(root, 'workspace'), uploadsDir: join(dataDir, 'uploads'), managedRepos: () => [repo] });
-  const jobs = new Map<string, IntakeSlicingDispatchInput>();
-  const dispatch = vi.fn(async (input: IntakeSlicingDispatchInput) => { jobs.set(input.jobId, input); return { settled: Promise.resolve() }; });
+  const db = new LedgerDb(join(root, 'ledger'));
+  const ledger = new LedgerApi(db.handle);
+  // The dispatcher records the job row before its first await.
+  const dispatch = vi.fn(async (input: IntakeSlicingDispatchInput) => { ledger.addJob({ id: input.jobId, repo: 'shop', title: input.title, briefing: input.briefing, deliverable: input.deliverable }); return { settled: Promise.resolve() }; });
   const post = vi.fn();
-  const ledger = { getJob: (id: string) => (jobs.has(id) ? { id } : null) } as unknown as Pick<LedgerApi, 'getJob'>;
   const slicing = new IntakeSlicingService({ intake, ledger, dispatch, notifications: { post }, apiBase: () => 'http://127.0.0.1:4100' });
+  const pipeline = new PipelineService({ ledger, dispatch: { dispatch: vi.fn(async () => ({ settled: Promise.resolve() })) }, capacity: () => ({ capacity: 1, occupied: 1, available: 0, queued: 0 }) });
+  const approval = new IntakeApprovalService({ intake, ledger, pipeline });
+  cleanups.push(() => { pipeline.dispose(); db.close(); });
   const source = { kind: 'bmad' as const, document: { path: 'epic-cart/epic-cart.md' }, supporting: [{ path: 'architecture-checkout/architecture-checkout.md' }] };
-  return { root, repo, write, intake, slicing, dispatch, post, jobs, source };
+  return { root, repo, write, intake, slicing, dispatch, post, ledger, approval, source };
 }
 const lineId = (proposal: Proposal, prefix: string): string => proposal.requirements.find(({ trace }) => trace.quote.startsWith(prefix))!.id;
 /** The fake model boundary: what a planning minion reads (the captured
@@ -57,7 +69,7 @@ describe('intake slicing by a commissioned planning minion (#429)', () => {
     const request = { repoPath: h.repo, intakeId: 'cart', requestId: 'r1', revisionId: preview.revisionId };
     const commission = await h.slicing.commission(request);
     const identity = slicingIdentity(preview);
-    expect(commission).toEqual({ ...request, ...identity, dispatched: true });
+    expect(commission).toEqual({ ...request, ...identity, dispatched: true, jobStatus: 'dispatched' });
     expect(h.dispatch).toHaveBeenCalledTimes(1);
     const input = h.dispatch.mock.calls[0]![0];
     expect(input).toMatchObject({ jobId: identity.jobId, repoPath: h.repo, deliverable: 'investigation', title: 'Slice intake cart into heists' });
@@ -70,7 +82,7 @@ describe('intake slicing by a commissioned planning minion (#429)', () => {
     expect(input.briefing).toContain(`GET http://127.0.0.1:4100/api/intake/cart/requests/r1?repoPath=${encodeURIComponent(h.repo)}`);
     expect(input.briefing).toContain(`POST http://127.0.0.1:4100/api/intake/slice/result with {"repoPath":${JSON.stringify(h.repo)},"intakeId":"cart","requestId":"r1","revisionId":"${preview.revisionId}","breakdown":<your breakdown>}`);
     // Retries converge on the one job; no second minion is dispatched.
-    expect(await h.slicing.commission(request)).toEqual({ ...request, ...identity, dispatched: false });
+    expect(await h.slicing.commission(request)).toEqual({ ...request, ...identity, dispatched: false, jobStatus: 'dispatched' });
     expect(h.dispatch).toHaveBeenCalledTimes(1);
     await expect(h.slicing.commission({ ...request, revisionId: 'f'.repeat(64) })).rejects.toMatchObject({ code: 'intake_stale_revision', status: 409 });
   });
@@ -150,5 +162,99 @@ describe('intake slicing by a commissioned planning minion (#429)', () => {
     const b = await h.slicing.commission({ repoPath: h.repo, intakeId: 'cart', requestId: 'r2', revisionId: second.revisionId });
     expect(b.jobId).not.toBe(a.jobId);
     expect(h.dispatch).toHaveBeenCalledTimes(2);
+  });
+  it('posts its FOR YOU card through a registered owner kind, counting each open question once', async () => {
+    expect(ownerAttentionFor(INTAKE_SLICING_RESULT_KIND)).toBe('owner-required');
+    const h = fixture();
+    const preview = await h.intake.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source });
+    const request = { repoPath: h.repo, intakeId: 'cart', requestId: 'r1', revisionId: preview.revisionId };
+    await h.slicing.commission(request);
+    // R1 uncovered: one unmapped line, which plan.questions already lists.
+    await h.slicing.submit({ ...request, breakdown: minionBreakdown(preview, { first: { covers: [], clarification: true }, questions: [] }) });
+    const card = h.post.mock.calls[0]![0] as { detail: string };
+    expect(card.detail).toContain('0 source conflict(s) and 3 other open question(s) block approval');
+    expect(card.detail.split('\n').filter((line) => line.includes('is a requirement no entry covers'))).toHaveLength(1);
+  });
+
+  it('a mistyped human step is refused, never read as no step', async () => {
+    const h = fixture();
+    const preview = await h.intake.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source });
+    const request = { repoPath: h.repo, intakeId: 'cart', requestId: 'r1', revisionId: preview.revisionId };
+    await h.slicing.commission(request);
+    await expect(h.slicing.submit({ ...request, breakdown: minionBreakdown(preview, { first: { hitl: 'true' } }) })).rejects.toMatchObject({ code: 'intake_invalid_plan', message: 'breakdown entry 1 hitl must be true or false' });
+  });
+
+  it('a dispatch that fails before recording the job is a named 503, and the identical retry dispatches it', async () => {
+    const h = fixture();
+    const preview = await h.intake.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source });
+    const request = { repoPath: h.repo, intakeId: 'cart', requestId: 'r1', revisionId: preview.revisionId };
+    h.dispatch.mockRejectedValueOnce(new Error('worktree creation failed'));
+    await expect(h.slicing.commission(request)).rejects.toMatchObject({ code: 'intake_slicing_dispatch_failed', status: 503, message: expect.stringContaining('worktree creation failed') });
+    expect(await h.slicing.commission(request)).toMatchObject({ dispatched: true, jobStatus: 'dispatched' });
+    expect(h.dispatch).toHaveBeenCalledTimes(2);
+  });
+
+  it('answers once the job is recorded, without waiting on the dispatch, and later reports its status', async () => {
+    const h = fixture();
+    const preview = await h.intake.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source });
+    const request = { repoPath: h.repo, intakeId: 'cart', requestId: 'r1', revisionId: preview.revisionId };
+    let fail!: (error: Error) => void;
+    h.dispatch.mockImplementationOnce((input) => {
+      h.ledger.addJob({ id: input.jobId, repo: 'shop', title: input.title, briefing: input.briefing, deliverable: input.deliverable });
+      return new Promise((_resolve, reject) => { fail = reject; });
+    });
+    expect(await h.slicing.commission(request)).toMatchObject({ dispatched: true, jobStatus: 'dispatched' });
+    fail(new Error('spawn failed'));
+    const { jobId } = slicingIdentity(preview);
+    h.ledger.setJobStatus(jobId, 'blocked');
+    expect(await h.slicing.commission(request)).toMatchObject({ dispatched: false, jobStatus: 'blocked', jobId });
+    expect(h.dispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses without the slicing helper, and for a revision that already has accepted work', async () => {
+    const h = fixture();
+    const preview = await h.intake.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source });
+    const request = { repoPath: h.repo, intakeId: 'cart', requestId: 'r1', revisionId: preview.revisionId };
+    const runtime = loadBundledWorkflowRuntime();
+    const { [SLICING_HELPER]: _helper, ...files } = runtime.manifest.files;
+    const older = { ...runtime, manifest: { ...runtime.manifest, files }, files: new Map([...runtime.files].filter(([path]) => path !== SLICING_HELPER)) };
+    const withoutHelper = new IntakeSlicingService({ intake: h.intake, ledger: h.ledger, dispatch: h.dispatch, notifications: { post: h.post }, workflow: () => older });
+    await expect(withoutHelper.commission(request)).rejects.toMatchObject({ code: 'intake_workflow_unavailable', status: 503, message: expect.stringContaining(SLICING_HELPER) });
+    const plan = { ...preview.plan, questions: [], heists: preview.plan.heists.map((heist) => ({ ...heist, unresolvedQuestions: [] })) };
+    expect(plan.heists).toHaveLength(1);
+    const refined = await h.intake.revise({ ...request, requestId: 'r2', previousRequestId: 'r1', plan: { ...plan, heists: plan.heists.map((heist) => ({ ...heist, goal: { text: 'Shoppers manage their cart.', traces: [], clarification: true }, scope: [{ text: 'The cart UI.', traces: [], clarification: true }], exclusions: [{ text: 'Pricing and tax.', traces: [], clarification: true }], acceptance: heist.acceptance.map((item) => ({ ...item, text: `Delivered: ${item.traces[0]!.quote}` })), verification: [{ text: 'The cart end-to-end suite passes.', traces: [], clarification: true }], splitMergeRationale: { text: 'One cohesive cart change.', traces: [], clarification: true } })) } });
+    const decision = { repoPath: h.repo, intakeId: 'cart', requestId: 'r2', revisionId: refined.revisionId, expectedToken: null };
+    h.approval.approve({ ...decision, expectedToken: h.approval.review(decision).review!.token, selected: [plan.heists[0]!.id] });
+    await expect(h.slicing.commission({ repoPath: h.repo, intakeId: 'cart', requestId: 'r2', revisionId: refined.revisionId })).rejects.toMatchObject({ code: 'intake_slicing_approved', status: 409 });
+    expect(h.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('an oversized plan is refused without writing the result request, so a corrected breakdown still lands', async () => {
+    const h = fixture();
+    const preview = await h.intake.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source });
+    const request = { repoPath: h.repo, intakeId: 'cart', requestId: 'r1', revisionId: preview.revisionId };
+    const { resultRequestId } = await h.slicing.commission(request);
+    const base = minionBreakdown(preview);
+    const words = 'w'.repeat(4000);
+    const huge = { ...base, entries: Array.from({ length: 200 }, (_, index) => ({ ...base.entries[0], id: String(index + 1), description: words, verify: words, rationale: words })) };
+    await expect(h.slicing.submit({ ...request, breakdown: huge })).rejects.toMatchObject({ code: 'intake_output_bounds' });
+    expect(() => h.intake.read(h.repo, 'cart', resultRequestId)).toThrow(expect.objectContaining({ code: 'intake_not_found' }));
+    expect((await h.slicing.submit({ ...request, breakdown: base })).requestId).toBe(resultRequestId);
+  });
+
+  it('the owner settles a sliced plan by refinement and approves a slice from it', async () => {
+    const h = fixture();
+    const preview = await h.intake.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source });
+    const request = { repoPath: h.repo, intakeId: 'cart', requestId: 'r1', revisionId: preview.revisionId };
+    const { resultRequestId } = await h.slicing.commission(request);
+    const sliced = await h.slicing.submit({ ...request, breakdown: minionBreakdown(preview) });
+    // The owner settles the recorded conflict: the plan-level question goes.
+    const settled = await h.intake.revise({ repoPath: h.repo, intakeId: 'cart', requestId: 'r3', previousRequestId: resultRequestId, revisionId: sliced.revisionId, plan: { ...sliced.plan, questions: [] } });
+    const decision = { repoPath: h.repo, intakeId: 'cart', requestId: 'r3', revisionId: settled.revisionId, expectedToken: null };
+    const token = h.approval.review(decision).review!.token;
+    expect(() => h.approval.approve({ ...decision, expectedToken: token, selected: ['entry-2'] })).toThrow(expect.objectContaining({ code: 'intake_incomplete_plan' }));
+    const readback = h.approval.approve({ ...decision, expectedToken: token, selected: ['entry-1'] });
+    expect(readback.accepted.map(({ heistId }) => heistId)).toEqual(['entry-1']);
+    expect(h.ledger.listPipelineEntries().map(({ title }) => title)).toEqual(['Cart service scaffold']);
   });
 });

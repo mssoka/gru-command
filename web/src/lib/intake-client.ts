@@ -16,6 +16,7 @@ export interface SlicingCommission {
   readonly jobId: string;
   readonly resultRequestId: string;
   readonly dispatched: boolean;
+  readonly jobStatus: string;
 }
 export class IntakeClientError extends Error {
   constructor(readonly code: string, message: string, readonly readback?: IntakeReadback) { super(message); this.name = 'IntakeClientError'; }

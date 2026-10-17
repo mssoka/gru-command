@@ -9855,6 +9855,14 @@ export class LedgerApi {
     return row === undefined ? null : this.getIntakeReview(repoPath, intakeId, row.token);
   }
 
+  /** Every approved decision of an intake, oldest first (#429): a heist an
+   * earlier revision accepted satisfies a later revision's prerequisite. */
+  listApprovedIntakeReviews(repoPath: string, intakeId: string): readonly IntakeReviewRecord[] {
+    this.verifyIntakeHistoryBudget(repoPath, intakeId);
+    const rows = this.db.prepare("SELECT token FROM intake_reviews WHERE repo_path = ? AND intake_id = ? AND status = 'approved' ORDER BY rowid").all(repoPath, intakeId) as { token: string }[];
+    return rows.map(({ token }) => this.getIntakeReview(repoPath, intakeId, token)!);
+  }
+
   getIntakeReview(repoPath: string, intakeId: string, token?: string): IntakeReviewRecord | null {
     this.verifyIntakeHistoryBudget(repoPath, intakeId);
     const row = token === undefined
