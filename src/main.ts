@@ -1434,6 +1434,7 @@ async function main(): Promise<number> {
       notifications,
       dispatch: (input) => dispatcher.dispatch(input),
       apiBase: () => config.server.port === 0 ? null : `http://${dialHost(config.server.host)}:${String(config.server.port)}`,
+      log: (level, msg, fields) => logger.log(level, msg, fields),
     }),
     propertyCampaigns,
     dispatch: dispatcher,

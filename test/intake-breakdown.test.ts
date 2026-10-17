@@ -133,10 +133,10 @@ describe('BMAD v7 epic folder intake (#429)', () => {
     const first = await exact.service.preview({ repoPath: exact.repo, intakeId: 'cart', requestId: 'r1', source: exact.source() });
     expect(first.plan.heists[0]!.acceptance[0]!.traces.slice(1).map(({ quote }) => quote)).toEqual(['- R1: Add, remove, and change quantity of any item; the total updates at once.']);
     expect(first.plan.unmapped.map(({ question }) => question)).toEqual(['epic-cart/epic-cart.md: "- R1.1: Undo the last change." is a requirement no entry covers. Place it in an entry, or confirm it is out of scope.']);
-    const functional = epicFolder({ 'epic-cart/epic-cart.md': EPIC.replace('## Requirements', '## Functional Requirements') });
+    const functional = epicFolder({ 'epic-cart/epic-cart.md': EPIC.replace('## Requirements', '## Functional Requirements').replace('before tax.\n', 'before tax.\n- R4: Saved carts survive a sign-out.\n') });
     const named = await functional.service.preview({ repoPath: functional.repo, intakeId: 'cart', requestId: 'r1', source: functional.source() });
     expect(named.plan.heists.map(({ unresolvedQuestions }) => unresolvedQuestions.filter((question) => question.includes('covers')))).toEqual([[], [], []]);
-    expect(named.plan.unmapped).toEqual([]);
+    expect(named.plan.unmapped.map(({ question }) => question)).toEqual(['epic-cart/epic-cart.md: "- R4: Saved carts survive a sign-out." is a requirement no entry covers. Place it in an entry, or confirm it is out of scope.']);
     const headless = epicFolder({ 'epic-cart/epic-cart.md': EPIC.replace('## Requirements\n', '') });
     const loose = await headless.service.preview({ repoPath: headless.repo, intakeId: 'cart', requestId: 'r1', source: headless.source() });
     expect(loose.plan.heists[0]!.acceptance[0]!.traces.slice(1).map(({ quote }) => quote)).toEqual(['- R1: Add, remove, and change quantity of any item; the total updates at once.']);
@@ -181,9 +181,41 @@ describe('BMAD v7 epic folder intake (#429)', () => {
     const h = epicFolder({ 'other/tickets.toml': TICKETS });
     const elsewhere = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source(['other/tickets.toml', 'architecture-checkout/architecture-checkout.md']) });
     expect(elsewhere.gaps).toEqual([{ code: 'intake_malformed_breakdown', locator: 'other/tickets.toml', question: "other/tickets.toml is not in the epic's folder epic-cart; supply the tickets.toml that sits beside epic-cart/epic-cart.md. Nothing was mapped from the breakdown." }]);
-    expect(elsewhere.plan.heists.map(({ id }) => id)).toEqual(['entry-1', 'entry-2', 'entry-3']);
+    expect(elsewhere.plan.heists.map(({ id }) => id)).toEqual(['heist-1']);
     const alone = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r2', source: { kind: 'bmad', document: { path: 'epic-cart/tickets.toml' } } });
     expect(alone.gaps).toContainEqual(expect.objectContaining({ code: 'intake_malformed_breakdown', question: expect.stringMatching(/^Supply the epic's Markdown as the primary document/u) }));
+  });
+
+  it('scopes requirements and finds referenced architecture in a CRLF epic', async () => {
+    const crlf = (text: string): string => text.replace(/\n/gu, '\r\n');
+    const h = epicFolder({ 'epic-cart/epic-cart.md': crlf(EPIC), 'epic-cart/tickets.toml': crlf(TICKETS.replace('covers = ["R3"]', 'covers = []')) });
+    const missing = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source(['epic-cart/tickets.toml']) });
+    expect(missing.gaps).toEqual([expect.objectContaining({ code: 'intake_missing_architecture', locator: 'architecture-checkout.md' })]);
+    const bound = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r2', source: h.source() });
+    expect(bound.plan.unmapped.map(({ question }) => question)).toEqual(['epic-cart/epic-cart.md: "- R3: The total shown is the total charged, before tax." is a requirement no entry covers. Place it in an entry, or confirm it is out of scope.']);
+  });
+
+  it('finds a v6 inputDocuments architecture and matches captured names ignoring case', async () => {
+    const v6 = EPIC.replace('risk: medium\n', 'risk: medium\ninputDocuments: [prd.md, architecture.md]\n').replace('- constraint — architecture-checkout/architecture-checkout.md, AD-1\n', '');
+    const h = epicFolder({ 'epic-cart/epic-cart.md': v6, 'epic-cart/tickets.toml': TICKETS.replace('references = ["architecture-checkout/architecture-checkout.md#ad-1"]\n', ''), 'planning/Architecture.md': ARCHITECTURE });
+    const missing = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source(['epic-cart/tickets.toml']) });
+    expect(missing.gaps).toEqual([expect.objectContaining({ code: 'intake_missing_architecture', locator: 'architecture.md' })]);
+    const supplied = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r2', source: h.source(['epic-cart/tickets.toml', 'planning/Architecture.md']) });
+    expect(supplied.gaps).toEqual([]);
+    expect(architectureSnapshots(supplied).map(({ locator }) => locator)).toEqual(['planning/Architecture.md']);
+  });
+
+  it('names an architecture supplied as the primary document instead of calling it uncaptured', async () => {
+    const h = epicFolder();
+    const proposal = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: { kind: 'bmad', document: { path: 'architecture-checkout/architecture-checkout.md' }, supporting: [{ path: 'epic-cart/epic-cart.md' }] } });
+    expect(proposal.gaps).toEqual([expect.objectContaining({ code: 'intake_missing_architecture', question: expect.stringMatching(/which was supplied as the primary document; the primary is the work itself and never binds/u) })]);
+  });
+
+  it('a spec intake never binds architecture, even a supplied architecture.md', async () => {
+    const h = epicFolder({ 'spec.md': '# Spec\nShip the cart.\n', 'docs/architecture.md': ARCHITECTURE });
+    const proposal = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: { kind: 'spec', document: { path: 'spec.md' }, supporting: [{ path: 'docs/architecture.md' }] } });
+    expect(proposal.gaps).toEqual([]);
+    expect(architectureSnapshots(proposal)).toEqual([]);
   });
 
   it('refuses a second breakdown, other TOML and a misnamed breakdown by name', async () => {
@@ -212,11 +244,17 @@ describe('BMAD v7 epic folder intake (#429)', () => {
   });
 
   it('a recorded source conflict stays open on the entries whose covers it names, else on the whole plan', async () => {
-    const h = epicFolder({ 'epic-cart/epic-cart.md': EPIC.replace('- Decision: codes', '- Source conflict: R2 — the epic allows one code vs AD-1 which allows stacking.\n- Source conflict: tax rounding — the PRD and the code disagree.\n- Decision: codes') });
+    const h = epicFolder({
+      'epic-cart/epic-cart.md': EPIC.replace('- Decision: codes', '- Source conflict: R2 — the epic allows one code vs AD-1 which allows stacking.\n- Source conflict: tax rounding — the PRD and the code disagree.\n- Decision: codes'),
+      'architecture-checkout/architecture-checkout.md': `${ARCHITECTURE}\n## Notes\n\n- Source conflict: AD-1 — the PRD asks the cart to recompute totals offline.\n`,
+    });
     const proposal = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source() });
     expect(proposal.plan.heists[1]!.unresolvedQuestions).toContain('Settle the recorded source conflict before admitting it: - Source conflict: R2 — the epic allows one code vs AD-1 which allows stacking.');
     expect(proposal.plan.heists[0]!.unresolvedQuestions.some((question) => question.includes('Source conflict'))).toBe(false);
-    expect(proposal.plan.questions).toEqual(['Settle the recorded source conflict before admitting it: - Source conflict: tax rounding — the PRD and the code disagree.']);
+    expect(proposal.plan.questions).toEqual([
+      'Settle the recorded source conflict before admitting it: - Source conflict: tax rounding — the PRD and the code disagree.',
+      'Settle the recorded source conflict before admitting it: - Source conflict: AD-1 — the PRD asks the cart to recompute totals offline.',
+    ]);
   });
 
   it('an uncovered requirement line and a covers id the epic lacks stay visible', async () => {
@@ -240,7 +278,7 @@ describe('approval of a v7 breakdown (#429)', () => {
     const pipeline = new PipelineService({ ledger, dispatch: { dispatch }, capacity: () => ({ capacity: 1, occupied: 1 - available, available, queued: 0 }) });
     const approval = new IntakeApprovalService({ intake: h.service, ledger, pipeline });
     cleanups.push(() => { pipeline.dispose(); db.close(); });
-    return { ...h, ledger, pipeline, approval, dispatch };
+    return { ...h, db, ledger, pipeline, approval, dispatch };
   }
   const settled = TICKETS.replace('hitl = true\n', '').replace('unknown = "Can the discount engine answer within 300 ms?"\n', '');
 
@@ -307,6 +345,42 @@ describe('approval of a v7 breakdown (#429)', () => {
     const token = h.approval.review(decision).review!.token;
     expect(() => h.approval.approve({ ...decision, expectedToken: token, selected: ['entry-1'] })).toThrow(expect.objectContaining({ code: 'intake_incomplete_plan' }));
     expect(h.ledger.listPipelineEntries()).toEqual([]);
+  });
+
+  it('an accepted prerequisite satisfies a later revision only with identical content, while it is in the pipeline, and is never re-selected', async () => {
+    const h = approvalFixture(TICKETS.replace('hitl = true\n', ''));
+    const first = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source() });
+    const one = { repoPath: h.repo, intakeId: 'cart', requestId: 'r1', revisionId: first.revisionId, expectedToken: null };
+    let head = h.approval.approve({ ...one, expectedToken: h.approval.review(one).review!.token, selected: ['entry-1'] }).review!;
+    const acceptedEntry = head.entries[0]!.id;
+    const revise = async (requestId: string, previous: Proposal, edit: (heist: Proposal['plan']['heists'][number]) => Proposal['plan']['heists'][number]): Promise<Proposal> =>
+      h.service.revise({ repoPath: h.repo, intakeId: 'cart', requestId, previousRequestId: previous.requestId, revisionId: previous.revisionId, plan: { ...previous.plan, heists: previous.plan.heists.map(edit) } });
+    const review = (proposal: Proposal) => {
+      const decision = { repoPath: h.repo, intakeId: 'cart', requestId: proposal.requestId, revisionId: proposal.revisionId, expectedToken: head.token };
+      head = h.approval.review(decision).review!;
+      return { ...decision, expectedToken: head.token };
+    };
+    const settledTwo = (heist: Proposal['plan']['heists'][number]) => heist.id === 'entry-2' ? { ...heist, unresolvedQuestions: [] } : heist;
+    // A re-slice that reuses the id `entry-1` for different work satisfies nothing.
+    const changed = await revise('r2', first, (heist) => heist.id === 'entry-1' ? { ...heist, title: 'Cart service scaffold, rewritten' } : settledTwo(heist));
+    expect(() => h.approval.approve({ ...review(changed), selected: ['entry-2'] })).toThrow(expect.objectContaining({ code: 'intake_dependency_selection' }));
+    const same = await revise('r3', first, settledTwo);
+    const decision = review(same);
+    expect(() => h.approval.approve({ ...decision, selected: ['entry-1', 'entry-2'] })).toThrow(expect.objectContaining({ code: 'intake_already_accepted' }));
+    // An accepted entry that never reached the pipeline satisfies nothing either.
+    h.db.handle.prepare('DELETE FROM pipeline_entries WHERE id = ?').run(acceptedEntry);
+    expect(() => h.approval.approve({ ...decision, selected: ['entry-2'] })).toThrow(expect.objectContaining({ code: 'intake_dependency_selection' }));
+  });
+
+  it('refuses a heist that still carries the missing-verify placeholders after its question is cleared', async () => {
+    const h = approvalFixture(settled.replace('verify = "A shopper adds one item and sees it in the cart."\n', ''));
+    const first = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source() });
+    expect(first.plan.heists[0]!.verification[0]!.text).toBe('Clarify a runnable check for entry 1.');
+    const plan = { ...first.plan, heists: first.plan.heists.map((heist) => heist.id === 'entry-1' ? { ...heist, unresolvedQuestions: [] } : heist) };
+    const cleared = await h.service.revise({ repoPath: h.repo, intakeId: 'cart', requestId: 'r2', previousRequestId: 'r1', revisionId: first.revisionId, plan });
+    const decision = { repoPath: h.repo, intakeId: 'cart', requestId: 'r2', revisionId: cleared.revisionId, expectedToken: null };
+    const token = h.approval.review(decision).review!.token;
+    expect(() => h.approval.approve({ ...decision, expectedToken: token, selected: ['entry-1'] })).toThrow(expect.objectContaining({ code: 'intake_incomplete_plan' }));
   });
 
   it('an approval retry enqueues the frozen recorded entries, even when this build renders briefings differently', async () => {

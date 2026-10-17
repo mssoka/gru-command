@@ -27,6 +27,7 @@ export interface IntakeSlicingOptions {
   readonly workflow?: () => BundledWorkflowRuntime;
   /** The service's local base URL, named in the minion's briefing. */
   readonly apiBase?: () => string | null;
+  readonly log?: (level: 'info' | 'warn' | 'error', message: string, fields?: Record<string, unknown>) => void;
 }
 export interface IntakeSlicingCommission {
   readonly repoPath: string;
@@ -118,22 +119,28 @@ export class IntakeSlicingService {
     const helper = this.helper();
     const { jobId, resultRequestId } = slicingIdentity(proposal);
     const commission = { repoPath: proposal.repoPath, intakeId: proposal.intakeId, requestId: proposal.requestId, revisionId: proposal.revisionId, jobId, resultRequestId };
-    const status = (dispatched: boolean): IntakeSlicingCommission => ({ ...commission, dispatched, jobStatus: this.options.ledger.getJob(jobId)!.status });
+    const status = (dispatched: boolean): IntakeSlicingCommission => {
+      const job = this.options.ledger.getJob(jobId);
+      if (job === null) throw new IntakeError('intake_slicing_dispatch_failed', `The dispatch returned without recording planning job ${jobId}; nothing is slicing this revision. Retry the identical request.`, 503);
+      return { ...commission, dispatched, jobStatus: job.status };
+    };
     if (this.options.ledger.getJob(jobId) !== null) return status(false);
     let pending = this.inflight.get(jobId);
     if (pending === undefined) {
       // The dispatcher records the job before its first await, so the
       // caller learns of the commission at once instead of waiting out the
-      // worker gate. A later failure blocks that job, visibly, on the board.
+      // worker gate. A later failure is the dispatcher's to record on the
+      // job; it is logged here, and a retry reports the job's status.
       pending = this.options.dispatch({ jobId, repoPath: proposal.repoPath, title: `Slice intake ${proposal.intakeId} into heists`, briefing: this.briefing(proposal, resultRequestId, helper), deliverable: 'investigation' })
         .finally(() => this.inflight.delete(jobId));
       this.inflight.set(jobId, pending);
       if (this.options.ledger.getJob(jobId) !== null) {
-        pending.catch(() => { /* the dispatcher blocked the recorded job with its note */ });
+        pending.catch((error: unknown) => { this.options.log?.('error', 'intake planning minion dispatch failed after its job was recorded', { job: jobId, error: error instanceof Error ? error.message : String(error) }); });
         return status(true);
       }
     }
     try { await pending; } catch (error) {
+      if (this.options.ledger.getJob(jobId) !== null) return status(true);
       throw new IntakeError('intake_slicing_dispatch_failed', `The planning minion was not dispatched: ${error instanceof Error ? error.message : String(error)}. Retry the identical request.`, 503);
     }
     return status(true);
@@ -146,12 +153,19 @@ export class IntakeSlicingService {
     const raw = fields(value, ['repoPath', 'intakeId', 'requestId', 'revisionId', 'breakdown']);
     const proposal = this.exact(raw);
     const { jobId, resultRequestId } = slicingIdentity(proposal);
+    if (this.options.ledger.getApprovedIntakeReview(proposal.repoPath, proposal.intakeId, proposal.revisionId) !== null) throw new IntakeError('intake_slicing_approved', 'The sliced revision gained accepted work after its planning minion was commissioned; a sliced plan of it would plan that work twice', 409);
     if (this.options.ledger.getJob(jobId) === null) throw new IntakeError('intake_slicing_not_commissioned', `No planning minion was commissioned for revision ${proposal.revisionId}; commission one with POST /api/intake/slice`, 409);
     const plan = slicingPlan(raw['breakdown'], proposal);
     validatePlan(plan, proposal);
-    // revise() records its request before the proposal's output bound, so an
-    // oversized plan is refused here, leaving the result request unwritten.
-    boundedCanonical({ snapshots: proposal.snapshots, gaps: proposal.gaps, requirements: proposal.requirements, plan }, INTAKE_MAX_OUTPUT_BYTES - 64 * 1024);
+    // revise() records its request before the proposal's output bound, so the
+    // exact proposal it would publish is bounded here, leaving an oversized
+    // plan's result request unwritten.
+    const questions = [...new Set([...plan.questions, ...proposal.gaps.map(({ question }) => question), ...plan.unmapped.map(({ question }) => question)])];
+    boundedCanonical({
+      schemaVersion: 1, executable: false, projectKey: proposal.projectKey, repoPath: proposal.repoPath, intakeId: proposal.intakeId,
+      requestId: resultRequestId, previousRequestId: proposal.requestId, workflow: proposal.workflow,
+      snapshots: proposal.snapshots, gaps: proposal.gaps, requirements: proposal.requirements, plan: { ...plan, questions }, revisionId: '0'.repeat(64),
+    }, INTAKE_MAX_OUTPUT_BYTES);
     const result = await this.options.intake.revise({ repoPath: proposal.repoPath, intakeId: proposal.intakeId, requestId: resultRequestId, previousRequestId: proposal.requestId, revisionId: proposal.revisionId, plan });
     this.announce(result, jobId);
     return result;

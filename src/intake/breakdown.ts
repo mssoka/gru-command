@@ -8,8 +8,10 @@ const ENTRY_ID = /^[0-9A-Za-z]{1,64}$/u;
 const ENTRY_HEADER = /^\uFEFF?[ \t]*\[\[[ \t]*entry[ \t]*\]\][ \t]*(?:#.*)?\r?$/u;
 const TABLE_HEADER = /^\uFEFF?[ \t]*\[\[?[ \t]*([A-Za-z0-9_"'. \t-]+?)[ \t]*\]\]?[ \t]*(?:#.*)?\r?$/u;
 // "Requirements", "Functional Requirements", "Requirements Inventory"…
-const REQUIREMENTS_HEADING = /^(#{1,6})[ \t]+(?:.*[ \t])?requirements\b.*$/iu;
-const REFERENCES_HEADING = /^(#{1,6})[ \t]+(?:.*[ \t])?references\b.*$/iu;
+const REQUIREMENTS_HEADING = /^(#{1,6})[ \t]+(?:[^\r\n]*[ \t])?requirements\b[^\r\n]*\r?$/iu;
+const BREAKDOWN_GAPS: readonly string[] = ['intake_malformed_breakdown', 'intake_breakdown_prerequisite', 'intake_breakdown_cycle'];
+/** `R1` names neither `R10` nor a sub-requirement `R1.1` / `R1-a`. */
+const idPattern = (id: string): string => `${id.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}(?![.-]?[0-9A-Za-z])`;
 const SOURCE_CONFLICT = /^\uFEFF?[ \t]*(?:[-*+][ \t]+)?(?:\*\*|__)?source conflict(?:\*\*|__)?[ \t]*:/iu;
 // Mapped once, on the first entry: every briefing already carries all
 // captured sources, so repeating these spans per heist only spends the
@@ -141,14 +143,11 @@ function sectionRanges(text: string, heading: RegExp): readonly { readonly start
   if (open !== null) result.push({ start: open.start, end: text.length });
   return result;
 }
-/** Architecture documents a BMAD source names, by lowercase file name:
- * `architecture*.md` paths in a Markdown document's frontmatter (v6
- * `inputDocuments`) or References sections, and anywhere in a breakdown. */
+/** Architecture documents a BMAD source names anywhere (References, v6
+ * `inputDocuments`, Notes, a breakdown's `references`), by lowercase file
+ * name: a mention the capture lacks must never be silently forgotten. */
 export function referencedArchitecture(snapshot: Snapshot): readonly string[] {
-  const scanned = isBreakdownLocator(snapshot.locator)
-    ? [snapshot.text]
-    : [snapshot.frontmatter ?? '', ...sectionRanges(snapshot.text, REFERENCES_HEADING).map(({ start, end }) => snapshot.text.slice(start, end))];
-  const names = scanned.flatMap((text) => [...text.matchAll(/(?:^|[\s"'`([<,=])((?:[\w.-]+\/)*architecture[\w.-]*\.md)(?=[\s"'`)\]>,#:;]|$)/giu)].map((match) => match[1]!));
+  const names = [...snapshot.text.matchAll(/(?:^|[\s"'`([<,=])((?:[\w.-]+\/)*architecture[\w.-]*\.md)(?=[\s"'`)\]>,#:;]|$)/giu)].map((match) => match[1]!);
   return [...new Set(names.map((name) => name.slice(name.lastIndexOf('/') + 1).toLowerCase()))];
 }
 
@@ -329,7 +328,7 @@ function toPlan(entries: readonly BreakdownEntry[], context: ReadonlySet<string>
   const markdown = new Set([...documents, ...architecture].map(({ id }) => id));
   const conflicts = capture.requirements.filter(({ trace }) => markdown.has(trace.snapshotId) && SOURCE_CONFLICT.test(trace.quote));
   const conflictQuestion = (quote: string): string => `Settle the recorded source conflict before admitting it: ${quote.trim()}`;
-  const names = (quote: string, entry: BreakdownEntry): boolean => entry.coverIds.some((id) => new RegExp(`(?<![0-9A-Za-z])${id.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}(?![0-9A-Za-z])`, 'u').test(quote));
+  const names = (quote: string, entry: BreakdownEntry): boolean => entry.coverIds.some((id) => new RegExp(`(?<![0-9A-Za-z])${idPattern(id)}`, 'u').test(quote));
   const unowned = conflicts.filter(({ trace }) => !entries.some((entry) => names(trace.quote, entry)));
   const heists = entries.map((entry, position): Heist => {
     const covered = unique(entry.covered, ({ id }) => id);
@@ -404,9 +403,7 @@ function coveredLines(capture: Capture, ids: readonly string[]): { readonly cove
   const covered: Requirement[] = [];
   const missing: string[] = [];
   for (const id of ids) {
-    const escaped = id.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
-    // `R1` claims neither `R10` nor a sub-requirement `R1.1` / `R1-a`.
-    const defines = new RegExp(`^\\uFEFF?[ \\t]*(?:#{1,6}[ \\t]+)?(?:[-*+][ \\t]+|\\d+[.)][ \\t]+)?(?:\\*\\*|__)?\\[?${escaped}(?![.-]?[0-9A-Za-z])`, 'u');
+    const defines = new RegExp(`^\\uFEFF?[ \\t]*(?:#{1,6}[ \\t]+)?(?:[-*+][ \\t]+|\\d+[.)][ \\t]+)?(?:\\*\\*|__)?\\[?${idPattern(id)}`, 'u');
     const found = pool.filter(({ trace }) => defines.test(trace.quote));
     if (found.length === 0) missing.push(id);
     covered.push(...found);
@@ -415,10 +412,11 @@ function coveredLines(capture: Capture, ids: readonly string[]): { readonly cove
 }
 
 /** Default mapping of a captured v7 breakdown: one heist per entry, in table
- * order. Null when the capture has no single valid breakdown. */
+ * order. Null when the capture has no single valid breakdown, including one a
+ * breakdown gap names (outside the epic's folder, the primary document). */
 export async function breakdownPlan(capture: Capture): Promise<Plan | null> {
   const tables = capture.snapshots.filter(({ kind, locator }) => kind === 'bmad' && isBreakdownLocator(locator));
-  if (tables.length !== 1) return null;
+  if (tables.length !== 1 || capture.gaps.some(({ code }) => BREAKDOWN_GAPS.includes(code))) return null;
   const table = tables[0]!;
   const parsed = parseBreakdown(table.text, await loadTomlParser());
   if (parsed.problems.length > 0) return null;

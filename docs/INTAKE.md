@@ -207,7 +207,8 @@ back to the conservative plan: `intake_malformed_breakdown` (invalid TOML,
 mistyped fields or NUL characters, an entry table GC cannot trace exactly, a
 second `tickets.toml`, a breakdown outside the epic's folder or supplied as the
 primary document), `intake_breakdown_prerequisite` (a bare `after` id naming no
-entry) and `intake_breakdown_cycle`. The TOML parser loads only when a breakdown
+entry) and `intake_breakdown_cycle`. Any of these gaps maps no heist from the
+breakdown. The TOML parser loads only when a breakdown
 is captured, so every other source previews from the bare package. No heist is invented from a broken
 breakdown; correct the file and preview again.
 
@@ -221,11 +222,11 @@ itself and never binds. Spec and issue intake are unchanged. GC never links to
 `_bmad-output`, because a minion's fresh worktree may not hold that directory and
 the file can change after approval. Instead:
 
-- any `architecture*.md` path a captured BMAD document names (in its
-  frontmatter, such as v6 `inputDocuments`, or under a References heading, or
-  anywhere in its `tickets.toml`) that is not itself captured is an
-  `intake_missing_architecture` gap, matched by file name, ignoring case. Supply
-  it as a supporting document.
+- any `architecture*.md` path a captured BMAD document names anywhere (its
+  References, v6 `inputDocuments` frontmatter, Notes, a `tickets.toml` entry's
+  `references`) that is not itself captured is an `intake_missing_architecture`
+  gap, matched by file name, ignoring case. Supply it as a supporting document;
+  an architecture supplied as the primary document is named as such.
 - its lines are mapped once, on the first heist, as binding architecture.
 - every approved briefing carries an `architecture` section naming the captured
   documents (snapshot id, locator, sha256) with the binding policy: build within
@@ -246,7 +247,8 @@ job is recorded, without waiting for a worker slot. Both ids derive from the
 exact revision, so retries converge on one minion. A proposal with source gaps
 or no source lines is refused (`409 intake_incomplete_sources`), as are a changed
 revision (`409 intake_stale_revision`) and a revision that already has accepted
-work (`409 intake_slicing_approved`). A dispatch that fails before the job is
+work (`409 intake_slicing_approved`, also returned to a breakdown submitted
+after the revision gained accepted work). A dispatch that fails before the job is
 recorded is `503 intake_slicing_dispatch_failed`; retry the identical request.
 If the planning minion ends without a sliced revision (its job blocked or
 closed), preview the sources again and slice the new revision. Any captured
@@ -409,10 +411,14 @@ the approved heist, the approval binding, the captured snapshots and, when
 captured, the binding architecture section. It does not repeat the requirement
 inventory, because each heist's traces hold the exact quotes it maps. Every
 briefing still carries all captured sources, so one approval of 12 heists fits
-when the sources total roughly 80 KiB. A prerequisite an earlier approval of the
-same intake already accepted needs no second selection: the new entry waits on
-that accepted entry, so an epic can be approved a few slices at a time, each
-batch from a new revision, without enqueueing a slice twice. A retry of the
+when the sources total roughly 80 KiB. A prerequisite that an approval of
+another revision of the same intake accepted, still in the pipeline and with
+identical heist content, needs no second selection: the new entry waits on that
+accepted entry. Selecting such a heist again is refused
+`409 intake_already_accepted`. So an epic can be approved a few slices at a
+time, each batch from a new revision, without enqueueing a slice twice. A heist
+whose content changed under the same id is new work, and its dependents must
+select it. A retry of the
 identical approval enqueues the recorded entries, even when a newer GC renders
 briefings differently. It does not create
 another queue. If enqueue is interrupted, `503 intake_partial_failure` includes

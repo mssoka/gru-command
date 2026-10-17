@@ -362,7 +362,10 @@ export async function captureSources(repo: string, source: IntakeSource, ports: 
         if (bound.includes(snapshot)) continue;
         for (const name of referencedArchitecture(snapshot)) if (!architecture.has(name)) missing.set(name, [...(missing.get(name) ?? []), snapshot.locator]);
       }
-      for (const [name, by] of missing) addGap({ code: 'intake_missing_architecture', locator: name, question: `${by.join(' and ')} ${by.length === 1 ? 'references' : 'reference'} the architecture document ${name}, which is not captured; its contents are unknown. Supply it as a supporting document so every heist carries its exact bytes.` });
+      const first = snapshots[0] === undefined ? null : documentName(snapshots[0].locator).toLowerCase();
+      for (const [name, by] of missing) addGap({ code: 'intake_missing_architecture', locator: name, question: name === first
+        ? `${by.join(' and ')} ${by.length === 1 ? 'references' : 'reference'} the architecture document ${name}, which was supplied as the primary document; the primary is the work itself and never binds. Supply the epic as the primary document and ${name} as a supporting one.`
+        : `${by.join(' and ')} ${by.length === 1 ? 'references' : 'reference'} the architecture document ${name}, which is not captured; its contents are unknown. Supply it as a supporting document so every heist carries its exact bytes.` });
     }
   }
   // Conservative inventory: every nonblank line, including metadata/status,

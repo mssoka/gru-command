@@ -635,6 +635,15 @@ describe('intake slicing by a planning minion (#429)', () => {
     expect(h.button('Load sliced revision')).toBeUndefined();
   });
 
+  it('offers no slicing for a revision that already has accepted work', async () => {
+    const h = fixture();
+    await h.preview(); await h.click('Review this revision');
+    const box = h.root.querySelector<HTMLInputElement>('input[type="checkbox"]')!; box.checked = true; box.dispatchEvent(new Event('change'));
+    expect(h.button('Slice into heists (planning minion)').disabled).toBe(false);
+    await h.click('Approve selected work');
+    expect(h.button('Slice into heists (planning minion)').disabled).toBe(true);
+  });
+
   it('offers no slicing while captured sources have gaps', async () => {
     const h = fixture();
     h.client.preview.mockResolvedValueOnce({ ...proposal, gaps: [{ code: 'intake_missing_architecture', locator: 'architecture.md', question: 'Supply it.' }] });

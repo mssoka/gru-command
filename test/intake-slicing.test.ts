@@ -10,6 +10,12 @@ import { IntakeApprovalService } from '../src/intake/approval.js';
 import { PipelineService } from '../src/dispatch/pipeline.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
+import { DispatchService } from '../src/dispatch/service.js';
+import { EventBus } from '../src/events/bus.js';
+import { PacingGate } from '../src/runtime/pacing.js';
+import type { AgentHandle } from '../src/runtime/types.js';
+import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
+import { makeFixtureRepo } from './helpers/fixture-repo.js';
 import { ownerAttentionFor } from '../src/notifications/attention.js';
 import { loadBundledWorkflowRuntime } from '../src/workflows/runtime.js';
 import type { Proposal } from '../src/intake/types.js';
@@ -256,5 +262,57 @@ describe('intake slicing by a commissioned planning minion (#429)', () => {
     const readback = h.approval.approve({ ...decision, expectedToken: token, selected: ['entry-1'] });
     expect(readback.accepted.map(({ heistId }) => heistId)).toEqual(['entry-1']);
     expect(h.ledger.listPipelineEntries().map(({ title }) => title)).toEqual(['Cart service scaffold']);
+  });
+  it('refuses a breakdown for a revision that gained accepted work after its minion was commissioned', async () => {
+    const h = fixture();
+    const preview = await h.intake.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source });
+    const request = { repoPath: h.repo, intakeId: 'cart', requestId: 'r1', revisionId: preview.revisionId };
+    await h.slicing.commission(request);
+    const heist = preview.plan.heists[0]!;
+    const concrete = { ...heist, unresolvedQuestions: [], goal: { text: 'Shoppers manage their cart.', traces: [], clarification: true }, scope: [{ text: 'The cart UI.', traces: [], clarification: true }], exclusions: [{ text: 'Pricing and tax.', traces: [], clarification: true }], acceptance: heist.acceptance.map((item) => ({ ...item, text: `Delivered: ${item.traces[0]!.quote}` })), verification: [{ text: 'The cart end-to-end suite passes.', traces: [], clarification: true }], splitMergeRationale: { text: 'One cohesive cart change.', traces: [], clarification: true } };
+    const refined = await h.intake.revise({ ...request, requestId: 'r2', previousRequestId: 'r1', plan: { ...preview.plan, questions: [], heists: [concrete] } });
+    await h.slicing.commission({ ...request, requestId: 'r2', revisionId: refined.revisionId });
+    const decision = { repoPath: h.repo, intakeId: 'cart', requestId: 'r2', revisionId: refined.revisionId, expectedToken: null };
+    h.approval.approve({ ...decision, expectedToken: h.approval.review(decision).review!.token, selected: [heist.id] });
+    const reread = h.intake.read(h.repo, 'cart', 'r2');
+    await expect(h.slicing.submit({ ...request, requestId: 'r2', revisionId: refined.revisionId, breakdown: minionBreakdown(reread) })).rejects.toMatchObject({ code: 'intake_slicing_approved', status: 409 });
+  });
+
+  it('a dispatch that returns without recording the job is a named 503', async () => {
+    const h = fixture();
+    const preview = await h.intake.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source });
+    h.dispatch.mockImplementationOnce(async () => ({ settled: Promise.resolve() }));
+    await expect(h.slicing.commission({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', revisionId: preview.revisionId })).rejects.toMatchObject({ code: 'intake_slicing_dispatch_failed', status: 503, message: expect.stringContaining('without recording planning job') });
+  });
+});
+
+describe('intake slicing through the real dispatch service (#429)', () => {
+  it('answers with the recorded investigation job while the worker gate holds the minion back', async () => {
+    const repo = makeFixtureRepo('intake-slicing-dispatch');
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'gc-slicing-dispatch-')));
+    roots.push(root);
+    const repoPath = realpathSync(repo.path);
+    mkdirSync(join(repoPath, 'epic-cart'), { recursive: true });
+    mkdirSync(join(repoPath, 'architecture-checkout'), { recursive: true });
+    writeFileSync(join(repoPath, 'epic-cart/epic-cart.md'), EPIC);
+    writeFileSync(join(repoPath, 'architecture-checkout/architecture-checkout.md'), ARCHITECTURE);
+    const db = new LedgerDb(join(root, 'ledger'));
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    cleanups.push(() => { db.close(); repo.cleanup(); });
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0, record: () => {} });
+    const handle = (id: string) => ({ id, role: 'minion' as const, sessionFile: join(root, `${id}.jsonl`), prompt: () => new Promise<void>(() => {}) }) as unknown as AgentHandle;
+    let spawned = 0;
+    const dispatcher = new DispatchService({ ledger, worktrees: new InMemoryWorktreePort(join(root, 'lanes'), ledger), spawner: async () => handle(`minion-${++spawned}`), workerGate: gate });
+    // Another heist holds the only worker slot.
+    await dispatcher.dispatch({ jobId: 'busy', repoPath, title: 'Busy', briefing: 'busy' });
+    const intake = new IntakeService({ dataDir: join(root, 'private-home'), workspaceRoot: dirname(repoPath), uploadsDir: join(root, 'private-home', 'uploads'), managedRepos: () => [repoPath] });
+    mkdirSync(join(root, 'private-home', 'uploads'), { recursive: true, mode: 0o700 });
+    const slicing = new IntakeSlicingService({ intake, ledger, dispatch: (input) => dispatcher.dispatch(input), notifications: { post: vi.fn() } });
+    const preview = await intake.preview({ repoPath, intakeId: 'cart', requestId: 'r1', source: { kind: 'bmad', document: { path: 'epic-cart/epic-cart.md' }, supporting: [{ path: 'architecture-checkout/architecture-checkout.md' }] } });
+    const commission = await slicing.commission({ repoPath, intakeId: 'cart', requestId: 'r1', revisionId: preview.revisionId });
+    expect(commission).toMatchObject({ dispatched: true, jobId: slicingIdentity(preview).jobId, jobStatus: expect.any(String) });
+    expect(ledger.getJob(commission.jobId)).toMatchObject({ deliverable: 'investigation', commissioner: 'gru' });
+    expect(gate.view().worker.queued.map(({ id }) => id)).toEqual([commission.jobId]);
+    expect(spawned).toBe(1);
   });
 });
