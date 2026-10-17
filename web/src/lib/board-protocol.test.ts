@@ -731,6 +731,56 @@ describe('board server-frame validator', () => {
   });
 });
 
+describe('vector raids block (#351)', () => {
+  const run = (): Record<string, unknown> => ({ repo: 'gru-command', packageDir: 'packages/web', roundsDone: 1, maxRounds: 4, startedAt: '2026-10-17T19:00:00.000Z' });
+  const vector = (): Record<string, unknown> => ({
+    enabled: true,
+    raidMode: 'proposed',
+    proposed: 1,
+    queued: 0,
+    running: [run()],
+    capUse: [{ repo: 'gru-command', used: 1 }],
+    maxRaidsPerDay: 2,
+    breakIns: 1,
+    fixesAwaitingOwner: 1,
+  });
+
+  it('is optional (an older server sends none), and a present block passes only with its full shape', () => {
+    expect(isValidSnapshot({ ...snapshot(), vector: undefined })).toBe(true);
+    expect(isValidSnapshot({ ...snapshot(), vector: null })).toBe(true);
+    expect(isValidSnapshot({ ...snapshot(), vector: vector() })).toBe(true);
+    expect(isValidSnapshot({ ...snapshot(), vector: { ...vector(), raidMode: 'autonomous', running: [], capUse: [] } })).toBe(true);
+    // Raids off: the block says only that.
+    expect(isValidSnapshot({ ...snapshot(), vector: { enabled: false, raidMode: 'proposed', maxRaidsPerDay: 2 } })).toBe(true);
+  });
+
+  it('rejects a malformed block, one field at a time: a guessed count or mode never renders', () => {
+    const broken: readonly Record<string, unknown>[] = [
+      { ...vector(), enabled: 'yes' },
+      { ...vector(), raidMode: 'manual' },
+      { ...vector(), proposed: -1 },
+      { ...vector(), queued: 1.5 },
+      { ...vector(), maxRaidsPerDay: null },
+      { ...vector(), breakIns: undefined },
+      { ...vector(), fixesAwaitingOwner: Number.NaN },
+      { ...vector(), running: null },
+      { ...vector(), capUse: undefined },
+      { ...vector(), capUse: [{ repo: 'gru-command', used: -1 }] },
+      { ...vector(), capUse: [{ repo: 7, used: 1 }] },
+      { ...vector(), running: [{ ...run(), repo: 7 }] },
+      { ...vector(), running: [{ ...run(), packageDir: 7 }] },
+      { ...vector(), running: [{ ...run(), roundsDone: -1 }] },
+      { ...vector(), running: [{ ...run(), roundsDone: '1' }] },
+      { ...vector(), running: [{ ...run(), maxRounds: null }] },
+      { ...vector(), running: [{ ...run(), startedAt: undefined }] },
+      { ...vector(), running: [{ ...run(), startedAt: 1 }] },
+      { enabled: false, raidMode: 'proposed' },
+      { enabled: false, raidMode: 'manual', maxRaidsPerDay: 2 },
+    ];
+    for (const block of broken) expect(isValidSnapshot({ ...snapshot(), vector: block }), JSON.stringify(block)).toBe(false);
+  });
+});
+
 describe('provider pacing mirror (server parity)', () => {
   /** A valid snapshot carrying the mirrored pacing gate block. */
   function pacingSnapshot(): Record<string, unknown> {
