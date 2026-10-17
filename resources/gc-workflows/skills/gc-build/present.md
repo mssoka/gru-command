@@ -21,7 +21,6 @@ project knowledge under {{context.knowledgeRoot}} through the assigned worktree.
 4. Give a concise handoff: changed paths, PR/commit, executed checks, the recorded
    risk and review outcome — naming every finding not fixed in this change
    (rejected, owner ruling, owner decision pending, pre-existing or unsettled) and
-   every corrected planning detail with the evidence that showed it wrong. Do not
-   create a
+   every corrected spec detail with its evidence. Do not create a
    documentation-only or run-all-tests completion issue, and do not hide missing
    required work behind a success summary.

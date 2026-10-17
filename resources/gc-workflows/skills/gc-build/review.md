@@ -46,18 +46,22 @@ parallel when the runtime supports it:
   independent coverage unless `GET /api/dispatch/jobs/<review job>/blind-coverage` says
   `qualifying`; settling a report is not validity.
 - [[gc-resource:skills/gc-build/review-prompts/edge-cases.md]] — diff and relevant code
-  only: never the spec, intent, task list or author's explanation, so nothing steers
-  its path tracing. Hand it the diff without the knowledge-root paths
-  (`{{context.knowledgeRoot}}`), so a committed spec cannot reach it, and commission
-  it with `"review_role": "claims"` and no `required_inputs`.
+  only: never the spec, intent, task list or author's explanation. Commission it
+  with `"review_role": "claims"` and no `required_inputs`.
 - [[gc-resource:skills/gc-build/review-prompts/verification.md]] — diff, tests and exact
-  executed verification evidence, with the approved intent and the claims it
-  falsifies quoted in its brief: the working spec's acceptance and tasks, or on the
-  small-change route the note's settled acceptance. Claims-needed lens:
-  `"review_role": "claims"`.
+  executed verification evidence, with the approved intent (the ground truth) and
+  the claims it falsifies (the working spec's acceptance and tasks, or on the
+  small-change route the note's settled acceptance) quoted in its brief.
+  Claims-needed lens: `"review_role": "claims"`.
 - [[gc-resource:skills/gc-build/review-prompts/intent-alignment.md]] — diff and its tests
   plus the verbatim owner-approved intent quoted into the brief; never the author's
   explanation, task list or self-review. Claims-needed lens: `"review_role": "claims"`.
+
+Hand the edge-case and intent-alignment lenses the diff without knowledge-root
+paths (`{{context.knowledgeRoot}}`), so a committed spec is not part of what they
+review; the other lenses review those files. A change that touches only
+knowledge-root files gives those two lenses nothing to review: record them as not
+applicable, with that reason, instead of commissioning them.
 
 The small-change route requires the fresh adversarial reviewer and widens with the
 risk re-scored against the candidate diff: `medium` adds the verification and
@@ -81,15 +85,19 @@ Do not manufacture defects to fill a target. These rules apply to both routes.
 ## Triage and fixes
 
 Triage only after every launched reviewer has reported or ended without a report.
-A reviewer job that ended without a report (crashed, cancelled, refused or stopped)
-or that reported its content missing or unreadable is a failed lens: record it,
+A failed lens is a reviewer job that ended without a report (crashed, cancelled,
+refused or stopped), reported its content missing or unreadable, or delivered a
+blind report that `blind-coverage` does not rate `qualifying`. Record it,
 re-commission it or report the infrastructure failure as above, and treat that
-lens's coverage as missing until a replacement reports; triage the replacement's
-findings when they arrive. A failed blind report never counts as coverage,
-whatever `blind-coverage` says; if its replacement is refused
-`409 blind_coverage_owned`, do not retry in a loop: commission the blind lens again
-on the next new head, or, when no new head is due, report the blind lens as missing
-coverage and escalate to the owner; review stays incomplete until it is covered. Disregard any severity a reviewer assigned.
+lens's coverage as missing until a replacement reports. A replacement or later
+re-review of that lens covers from the last head where it had counted coverage (or
+the base), never a narrower focused delta; triage its findings when they arrive.
+A failed blind report never counts as coverage, whatever `blind-coverage` says. If
+its replacement is refused `409 blind_coverage_owned`, do not retry in a loop: the
+service accepts a same-head replacement only once the failed job is parked or
+binned, so commission the blind lens again on the next new head or escalate to the
+owner with the failed job's id. Review stays incomplete until every required lens
+is covered. Disregard any severity a reviewer assigned.
 Record one row per finding in the review triage log of the working spec (or
 small-change note) under the private artifact root — reviewed head, verdict,
 evidence and a reasoned disposition for every finding; never drop, merge or
@@ -140,13 +148,13 @@ verdict. Then:
   with that note.
 - A defect this change neither caused nor exposed: log it as pre-existing with
   its evidence and name it in the handoff; do not open new backlog for it.
-- Findings that expose wrong owner-approved acceptance — what the approved intent
-  states, including a matrix row or task that restates it — need an explicit owner
-  decision; do not silently rewrite intent or create a completion claim. Any other
-  wrong planning detail (a task, a code-map entry, a matrix row) is corrected in
-  the spec with the evidence that shows it wrong — the approved-intent text it
-  contradicts, or the code or test that proves it unworkable — and named in the
-  handoff.
+- Findings that expose wrong expected behavior — an acceptance scenario or
+  matrix row — are corrected only by quoting the approved-intent text it
+  contradicts, never to match the code; any other doubt about expected behavior
+  needs an explicit owner decision. Do not silently rewrite intent or create a
+  completion claim. A wrong implementation-plan detail (a task, a code-map entry)
+  is corrected with its reason. Log each correction as `corrected` and name it in
+  the handoff.
 - Fix all actionable in-scope defects — every other surviving group — and
   add/run regressions.
 

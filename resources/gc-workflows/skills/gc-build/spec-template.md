@@ -51,7 +51,8 @@ into {{context.knowledgeRoot}}, never private prompts, logs or credentials.
 Append one row per reviewer finding on every review pass, carried rows included:
 reviewed head, reviewer, location, claim, verdict (`high`, `medium`, `low`,
 `false` or `maybe-false`), evidence and disposition — fixed with its commit,
-rejected with its reason, owner ruling with the ruling, owner decision pending,
-pre-existing, or unsettled with what would settle it. A carried row is marked
+corrected (a spec detail, with its evidence), rejected with its reason, owner
+ruling with the ruling, owner decision pending, pre-existing, or unsettled with
+what would settle it. A carried row is marked
 `carried`, records the head range it was compared over and keeps its original
 verdict and disposition.

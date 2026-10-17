@@ -16,11 +16,10 @@ executed evidence. When the spec has an I/O and edge-case matrix, every row need
 a test that verifies its expected behavior and that ran and passed in the recorded
 verification; a covering test that did not run (unregistered, filtered out,
 skipped or disabled) counts as missing. When a test disagrees with a row, never
-edit the expectation to match the code: fix the code. A row that restates
-owner-approved acceptance (what the approved intent states) changes only on an
-owner decision. Any other row that is itself wrong is corrected in the spec with
-the evidence that shows it wrong — the approved-intent text it contradicts, or the
-code or test that proves it unworkable — and named in the handoff. Finish
+edit the expectation to match the code: fix the code. A row is corrected only by
+quoting the approved-intent text it contradicts, and the correction is named in
+the handoff; any other doubt about a row needs an owner decision. Tasks and
+code-map entries are implementation plan, corrected with their reason. Finish
 missing work before claiming completion. Capture exact commands, outcomes and
 full canonical candidate head beneath the private artifact root. Do not claim a
 skipped/unexecuted test passed.
