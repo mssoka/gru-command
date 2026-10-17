@@ -275,6 +275,8 @@ It is **off by default**. While it is off, deterministic code makes every decisi
 - **Enforcement is gated.** Moving a surface from shadow to `enforce` requires a recorded backtest that meets its threshold, and your explicit decision. It is not usable on any surface yet. See the [Jev guide](docs/jev-production-integration.md).
 - **Authority stays with you.** Jev never decides merges, review verdicts, restarts or owner-only rulings. If OpenRouter is unreachable, Gru Command falls back to deterministic behaviour.
 
+Every command below (`npm run config:generate` and each `dist/decisions/cli.js` call) reads the instance from `GRU_COMMAND_HOME` (default `~/.gru-command`). If your service uses another value, run them with it: `install.sh` writes it into `~/Library/LaunchAgents/com.gru-command.service.plist` (macOS) or `${XDG_CONFIG_HOME:-~/.config}/systemd/user/gru-command.service` (Linux).
+
 **1. Store the key.** Use stdin only: never pass the key on the command line or put it in `config.toml`.
 
 Create a key at openrouter.ai → **Keys**. Copy **only the key**: it starts with `sk-or-v1-` and is 73 characters long, with no `OPENROUTER_API_KEY=` prefix and no quotes. Then, from the install directory:
@@ -307,10 +309,10 @@ This writes `~/.gru-command/credentials/openrouter.key` (or under `$GRU_COMMAND_
 **2. Enable Jev in shadow mode.** The service hot-reloads this section, so no restart is needed. Give every surface an explicit `mode = "shadow"`: an unlisted or mode-less `event_triage` or `supervision_guidance` would act on Jev's answer instead of only recording it.
 
 - **Fresh install:** `~/.gru-command/config.toml` already contains the Jev block, switched off, with every surface in shadow. Set `enabled = true` in its `[decisions.jev]` table. Edit in place; a pasted second copy of a table fails to load.
-- **Config generated before the block shipped, Jev still off:** run `npm run config:generate -- --force` from the install directory first, then set `enabled = true`. It backs the old file up and keeps your values, but drops hand-written comments, and adds the shadow surfaces only when no surface is listed; the [Jev guide](docs/jev-production-integration.md#configuration) has the details.
-- **Older config with Jev already on:** add the four surface tables below by hand right away. A regenerate keeps your current surface entries and adds none.
+- **Older config, Jev off, no surface listed:** run `npm run config:generate -- --force` from the install directory first, then set `enabled = true`. It backs the old file up and keeps your values, but drops hand-written comments; the [Jev guide](docs/jev-production-integration.md#configuration) has the details.
+- **Older config with any surface listed (Jev on or off):** a regenerate keeps exactly those entries, so edit by hand: set `mode = "shadow"` in each existing surface table (turn a shorthand `event_triage = "…"` key into a table), then add only the missing tables. Do it before turning Jev on, or right away if it is already on.
 
-Every `npm run` and `dist/decisions/cli.js` command reads the instance from `GRU_COMMAND_HOME` (default `~/.gru-command`), so run them with the service's value: `install.sh` writes it into `~/Library/LaunchAgents/com.gru-command.service.plist` (macOS) or `~/.config/systemd/user/gru-command.service` (Linux). The Jev and surface tables should read as follows (any provider and threshold tables after them stay as they are):
+The Jev and surface tables should read as follows (any provider and threshold tables after them stay as they are):
 
 ```toml
 [decisions.jev]

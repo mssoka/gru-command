@@ -192,12 +192,16 @@ describe('surface mode config parsing (issue #223)', () => {
     // live surface says why, and a missing mode is spelled out for all four.
     expect(template).toContain('Not usable on any surface yet (see each one below).');
     expect(template).toContain('Give every surface an explicit mode unless you mean that.');
+    expect(template).toContain('escalation_triage and same_blocker are never asked.');
+    expect(template).toContain('# Surfaces (the complete list; any other name fails to load):');
     for (const surface of ['event_triage', 'supervision_guidance']) {
       expect(template).toMatch(new RegExp(`#   ${surface} [^\\n]*\\n#\\s+off or shadow today: it has no registered backtest\\n`));
     }
     for (const surface of ['escalation_triage', 'same_blocker']) {
       expect(template).toMatch(
-        new RegExp(`#   ${surface} [^\\n]*\\n#\\s+off or shadow today: it asks Jev only in shadow \\(enforce acts like off\\)\\n`),
+        new RegExp(
+          `#   ${surface} [^\\n]*\\n#\\s+off or shadow today: it asks Jev only in shadow\\. enforce never asks,\\n#\\s+but still makes a Jev outage page you as if the surface acted\\n`,
+        ),
       );
     }
   });

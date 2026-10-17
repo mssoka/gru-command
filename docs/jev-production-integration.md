@@ -94,8 +94,9 @@ only the tables an operator added by hand. Bring it up to date before
 turning Jev on, from the install directory and with the same
 `GRU_COMMAND_HOME` the service uses: `install.sh` writes it into
 `~/Library/LaunchAgents/com.gru-command.service.plist` or
-`~/.config/systemd/user/gru-command.service` (default `~/.gru-command`; a
-service you start yourself uses whatever you set there). Every
+`${XDG_CONFIG_HOME:-~/.config}/systemd/user/gru-command.service` (default
+`~/.gru-command`; a service you start yourself uses whatever you set
+there). Every
 `dist/decisions/cli.js` command reads the same variable. The regenerate
 prints the path it wrote:
 
@@ -153,13 +154,15 @@ request is a wiring bug, not provider health); `401 → auth_rejected`,
 Example — route one surface through TypeSafe directly. Store the TypeSafe
 key first (see [Credentials](#credentials)), then probe it with
 `node dist/decisions/cli.js check --profile typesafe-direct --json` once
-`enabled = true`. Run the probe in a shell without `TYPESAFE_API_KEY`
-exported: the variable outranks the stored key file the service reads.
+`enabled = true`, in the same environment as the service: a
+`TYPESAFE_API_KEY` variable outranks the stored key file, so a variable
+exported only in your shell can make the probe pass while the service has
+no key (`status --json` shows each profile's credential source).
 `"status":"ready"` means the key works; while Jev is off the probe answers
 `"status":"disabled"` without reading the key. Check it rather than
 waiting for an alert: a bad key on a non-default profile never raises an
-owner incident. Turning Jev on also starts the default `openrouter-jev`
-profile on every surface still routed to it, so store that key too.
+owner incident. With Jev on, the default `openrouter-jev` profile is
+always probed, whatever the routing, so store its key too or override it.
 
 The built-in `typesafe-direct` profile needs no table of its own; change
 only the `provider` line in the surface's existing table:
@@ -180,9 +183,10 @@ Routing rules:
   `supervision_guidance` it means the legacy behavior (Jev's answer used
   with no backtest gate), and `escalation_triage` and `same_blocker` are
   never asked; prefer the table. Use one form per surface,
-  never both: a surface defined both ways fails to load. A name outside
-  the five known surfaces is rejected, so a typo cannot leave the real
-  surface unconfigured. Unlisted surfaces
+  never both: a surface defined both ways fails to load. Only the five
+  known surfaces (`event_triage`, `supervision_guidance`,
+  `escalation_triage`, `same_blocker`, `report_conclusion`) load; any other
+  name fails, so a typo cannot leave the real surface unconfigured. Unlisted surfaces
   (and omitted surface arguments) ride the default `openrouter-jev`
   profile — pre-profile behavior, unchanged. The deterministic fallback
   never changes and stays the floor.
@@ -202,8 +206,9 @@ Routing rules:
   pass the gate, and no surface can use `enforce` today. `event_triage` and
   `supervision_guidance` have no registered backtest, so enforce fails every
   request with that error. The `escalation_triage` and `same_blocker` hosts
-  ask Jev only in `shadow`, so enforce there acts like `off`: no asks, no
-  records, no incident. Enforcing them needs host changes as well as the
+  ask Jev only in `shadow`, so enforce there never asks or records anything,
+  but it still counts as an acting surface: a Jev outage then pages you as a
+  needs-owner incident instead of a board FYI. Enforcing them needs host changes as well as the
   evidence and owner decision above (and #219 for `escalation_triage`);
   `report_conclusion` has no live host. Use `off` or `shadow`. A surface
   with no `mode` key keeps the pre-#223 behavior without the gate.

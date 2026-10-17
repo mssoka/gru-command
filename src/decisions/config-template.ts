@@ -27,7 +27,7 @@ const FRESH_SURFACES: Readonly<Record<string, DecisionSurfaceConfig>> = Object.f
 );
 
 /** Surface and profile names are bare TOML keys: the loader only accepts
- * `[a-z0-9_]+` surfaces and `[A-Za-z0-9_-]+` profiles. */
+ * the `DECISION_SURFACES` names and `[A-Za-z0-9_-]+` profiles. */
 function surfaceLines(surfaces: Readonly<Record<string, DecisionSurfaceConfig>>): string[] {
   return Object.entries(surfaces).flatMap(([name, surface]) => [
     `[decisions.surfaces.${name}]`,
@@ -116,15 +116,17 @@ function renderDecisions(
     '#                     escalation_triage and same_blocker are never asked.',
     '#                     Give every surface an explicit mode unless you mean that.',
     '#',
-    '# Surfaces:',
+    '# Surfaces (the complete list; any other name fails to load):',
     '#   event_triage          does an orchestration event need attention? (may only raise attention, never lower it)',
     '#                         off or shadow today: it has no registered backtest',
     '#   supervision_guidance  classifies a runtime failure: restart vs escalate (restart counters stay deterministic)',
     '#                         off or shadow today: it has no registered backtest',
     '#   escalation_triage     is a Silas escalation a ruling or a status report?',
-    '#                         off or shadow today: it asks Jev only in shadow (enforce acts like off)',
+    '#                         off or shadow today: it asks Jev only in shadow. enforce never asks,',
+    '#                         but still makes a Jev outage page you as if the surface acted',
     '#   same_blocker          is this review blocker the same defect as last round?',
-    '#                         off or shadow today: it asks Jev only in shadow (enforce acts like off)',
+    '#                         off or shadow today: it asks Jev only in shadow. enforce never asks,',
+    '#                         but still makes a Jev outage page you as if the surface acted',
     '#   report_conclusion     clean pass / findings / inconclusive (backtest only; no live host yet)',
     '#',
     '# `provider` routes a surface to a provider profile (default: openrouter-jev);',
