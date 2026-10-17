@@ -347,6 +347,17 @@ describe('intake slicing by a commissioned planning minion (#429)', () => {
     expect(inline.dispatched).toBe(true);
     await vi.waitFor(() => expect(h.log).toHaveBeenCalledWith('error', 'intake planning minion dispatch failed after its job was recorded', { job: inline.jobId, error: 'worktree failed' }));
     expect(h.log).toHaveBeenCalledTimes(2);
+    // An unreadable job record (a ledger closed at shutdown) still logs the failure.
+    const third = await h.intake.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r3', source: h.source });
+    let fail!: (error: Error) => void;
+    h.dispatch.mockImplementationOnce((input) => {
+      h.ledger.addJob({ id: input.jobId, repo: 'shop', title: input.title, briefing: input.briefing, deliverable: input.deliverable });
+      return new Promise((_resolve, reject) => { fail = reject; });
+    });
+    const late = await h.slicing.commission({ ...request, requestId: 'r3', revisionId: third.revisionId });
+    vi.spyOn(h.ledger, 'getJob').mockImplementation(() => { throw new Error('ledger closed'); });
+    fail(new Error('spawn failed at shutdown'));
+    await vi.waitFor(() => expect(h.log).toHaveBeenCalledWith('error', 'intake planning minion dispatch failed; its job record could not be read', { job: late.jobId, error: 'spawn failed at shutdown' }));
   });
 });
 

@@ -139,7 +139,9 @@ export class IntakeSlicingService {
         const detail = { job: jobId, error: error instanceof Error ? error.message : String(error) };
         let recorded: boolean | null = null;
         try { recorded = this.options.ledger.getJob(jobId) !== null; } catch { /* logged below without the job check */ }
-        if (recorded !== false) this.options.log?.('error', recorded === true ? 'intake planning minion dispatch failed after its job was recorded' : 'intake planning minion dispatch failed; its job record could not be read', detail);
+        try {
+          if (recorded !== false) this.options.log?.('error', recorded === true ? 'intake planning minion dispatch failed after its job was recorded' : 'intake planning minion dispatch failed; its job record could not be read', detail);
+        } catch { /* a logger failing at shutdown has nowhere left to report */ }
       });
       this.inflight.set(jobId, pending);
       if (this.options.ledger.getJob(jobId) !== null) return status(true);
