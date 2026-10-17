@@ -42,6 +42,7 @@ The OS service manager is the SERVICE's out-of-band watcher (SPEC ruling
 ./install.sh --print      # render the platform unit; change nothing
 ./install.sh --uninstall  # stop the service and remove the unit
 gru-service roll          # self-roll: pull + rebuild + relaunch + verify
+gru-service reset         # service stopped: remove GC lanes, empty the data dir, keep config.toml
 ```
 
 The service can also roll **itself** — `gru-service roll` (CLI) or

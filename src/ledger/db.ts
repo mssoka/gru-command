@@ -1,7 +1,8 @@
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { LogLevel } from '../logger.js';
+import { RESET_LOCK_FILE } from './reset-lock.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -26,6 +27,34 @@ export interface Migration {
   readonly foreignKeysOff?: true;
 }
 
+/** Thrown when the ledger is opened while `gru-service reset` runs on its
+ * data directory (#427 PR 2b): the service does not start under a reset. */
+export class ResetRunningError extends Error {
+  constructor(file: string, cause: unknown) {
+    super(`gru-service reset is running on this data directory (it holds ${file}): start the service once it has ended`, { cause });
+    this.name = 'ResetRunningError';
+  }
+}
+
+/** Refuse to open the ledger while a reset holds its lock file; a lock file
+ * that cannot be read is refused by name too (delete it when no reset runs). */
+function refuseUnderReset(dataDir: string): void {
+  const file = join(dataDir, RESET_LOCK_FILE);
+  if (!existsSync(file)) return;
+  let probe: DatabaseSync | null = null;
+  try {
+    probe = new DatabaseSync(file, { timeout: 0 });
+    probe.prepare('SELECT count(*) FROM sqlite_master').get();
+  } catch (error) {
+    const code = (error as { readonly errcode?: unknown }).errcode;
+    // SQLITE_BUSY and SQLITE_LOCKED: reset holds it.
+    if (code === 5 || code === 6) throw new ResetRunningError(file, error);
+    throw new Error(`the reset lock ${file} cannot be read (${(error as Error).message}); if no gru-service reset is running, delete it and start the service again`, { cause: error });
+  } finally {
+    try { probe?.close(); } catch { /* the probe's own error is the one to report */ }
+  }
+}
+
 /**
  * SQLite ledger storage (EPICS E6 story 1): the durable operational record
  * in the instance data dir (`<data_dir>/ledger/ledger.db`). WAL mode so
@@ -41,6 +70,7 @@ export class LedgerDb {
 
   constructor(dataDir: string, opts: { log?: Log; migrations?: readonly Migration[] } = {}) {
     this.log = opts.log ?? (() => {});
+    refuseUnderReset(dataDir);
     const dir = join(dataDir, 'ledger');
     // The ledger carries operational history — owner-only like the rest of
     // the instance data dir.

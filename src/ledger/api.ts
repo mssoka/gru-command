@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
 import { loadWorktreeManifest, resolveVerifyCommand } from '../worktrees/manifest.js';
+import { HANDOFF_REBOUND_KIND, REPO_MOVED_KIND, type LaneRebind } from '../worktrees/handoff.js';
 import { isCommitId, readOnboardingProof } from '../onboarding/proof-record.js';
 import { readGitState } from '../verify/scheduler.js';
 import { planCommand } from '../verify/build-reuse.js';
@@ -2961,6 +2962,44 @@ export class LedgerApi {
     });
   }
 
+  /** Point a lane at its repository's new place (#427 PR 2b): `repo_path`
+   * changes (no migration: the column exists; it may stay the same when
+   * only the repository's git directory moved) and `worktree.repo-moved
+   * { id, from, to }` is recorded, with, in the same transaction and the
+   * very next event, the rebinding of the lane's creation handoff
+   * (`worktree.handoff-rebound { id, from, to, move_seq }`, `move_seq` the
+   * move's seq) when it has one. Custody takes a rebinding only so paired,
+   * and appendCustomEvent refuses both kinds. A move to the same
+   * `repo_path` is refused unless its rebinding moves the repository's
+   * real place or its git directory: nothing moved, so nothing is recorded. */
+  moveWorktreeRepo(input: { readonly id: string; readonly repoPath: string; readonly rebind: Pick<LaneRebind, 'from' | 'to'> | null }): WorktreeRecord {
+    if (input.repoPath === '') throw new Error('a moved worktree needs its new repo path');
+    return this.transaction(() => {
+      const current = this.getWorktree(input.id);
+      if (current === null) throw new RecordNotFound(`worktree "${input.id}" not found`);
+      if (input.repoPath === current.repoPath &&
+        (input.rebind === null || (input.rebind.from.repo === input.rebind.to.repo && input.rebind.from.common === input.rebind.to.common))) {
+        throw new Error(`worktree "${input.id}" did not move: its repository stays at ${current.repoPath} and its git directory did not move, so no move of it is recorded`);
+      }
+      this.db.prepare('UPDATE worktrees SET repo_path = ?, updated_at = ? WHERE id = ?').run(input.repoPath, nowIso(), input.id);
+      const move = this.appendEvent({
+        kind: REPO_MOVED_KIND,
+        jobId: current.jobId,
+        roundId: current.roundId,
+        payload: { id: input.id, from: current.repoPath, to: input.repoPath },
+      });
+      if (input.rebind !== null) {
+        this.appendEvent({
+          kind: HANDOFF_REBOUND_KIND,
+          jobId: current.jobId,
+          roundId: current.roundId,
+          payload: { id: input.id, from: input.rebind.from, to: input.rebind.to, move_seq: move.seq },
+        });
+      }
+      return this.getWorktree(input.id) as WorktreeRecord;
+    });
+  }
+
   /** Observed-process records (SPEC ruling 18b's spawned-processes arm):
    * every pid a pause or confirmed kill is grounded on lands here — the
    * registry is the authoritative map job → worktree → branch →
@@ -4026,6 +4065,11 @@ export class LedgerApi {
     lens?: string | null;
     payload?: unknown;
   }): BusEvent {
+    // A lane's move and its handoff's rebinding are custody facts only
+    // moveWorktreeRepo records, together (#427 PR 2b).
+    if (fields.kind === REPO_MOVED_KIND || fields.kind === HANDOFF_REBOUND_KIND) {
+      throw new Error(`${fields.kind} is recorded only with a lane's repository move (moveWorktreeRepo), never as a custom event`);
+    }
     return this.transaction(() => {
       if (fields.kind === 'silas.directive-producer-ceased' || fields.kind === 'silas.directive-producer-unknown') {
         this.validateDirectiveProducerReceipt(fields.jobId ?? null, fields.payload);

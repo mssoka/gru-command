@@ -233,7 +233,19 @@ npm start               # serve the web UI + /health on the configured bind
 ./install.sh --service  # register + start as a login OS service
 ./install.sh --uninstall
 gru-service roll        # graceful self-roll: pull + rebuild + relaunch + verify
+gru-service reset       # with the service stopped: remove GC's lanes, empty the data dir, keep config.toml
 ```
+
+`gru-service reset` is the clean fresh start. Stop the service first; reset
+lists what it will do and asks (or pass `--yes`). It removes every GC lane
+from the repository that registers it (`git worktree remove --force
+--force`, then `git worktree prune`) and deletes the data directory's
+contents except `config.toml`, the install's own files and any worktree of
+yours in it (with its repository when that is there too), the ledger last; a service started meanwhile refuses to open
+its ledger until reset ends. `gru/*` branches go only with
+`--delete-branches` and `refs/gru/*` only with `--delete-refs`; your own
+branches, worktrees and files are never touched
+([docs/WORKTREES.md](docs/WORKTREES.md#7-expiry-moved-repositories-and-reset-427)).
 
 Open `http://127.0.0.1:7665`, enter the pairing token from the wizard
 (or scan the QR from an already-paired device). To pair a phone, bind

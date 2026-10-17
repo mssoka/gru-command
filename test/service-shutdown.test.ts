@@ -337,6 +337,21 @@ describe('service shutdown orchestration (issue #341, R3-2 executable)', () => {
     expect(run.lines.filter((line) => line.level === 'error').map((line) => line.msg)).toEqual(['lane slimming stop failed']);
   });
 
+  it('stops expiry and the moved-repository follow-through after lane slimming; a failing stop never skips what follows (#427 PR 2b)', async () => {
+    const order: string[] = [];
+    const state: ServiceShutdownState = {
+      laneSlimmer: { stop: async () => { order.push('laneSlimmer.stop'); } },
+      expiry: { stop: () => { order.push('expiry.stop'); throw new Error('timer gone'); } },
+      repoMoves: { stop: () => { order.push('repoMoves.stop'); } },
+      handle: fakeHandle(order),
+    };
+    const run = runShutdown(state);
+    await run.exited;
+    expect(run.exits).toEqual([0]);
+    expect(order).toEqual(['laneSlimmer.stop', 'expiry.stop', 'repoMoves.stop', 'handle.stop']);
+    expect(run.lines.filter((line) => line.level === 'error').map((line) => line.msg)).toEqual(['expiry stop failed']);
+  });
+
   it('waits for a slow lane-slimming pass at most its bound, well inside the force-exit budget, then goes on (#427)', async () => {
     vi.useFakeTimers();
     try {

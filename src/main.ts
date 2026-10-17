@@ -59,6 +59,8 @@ import { IntakeSlicingService } from './intake/slicing.js';
 import { ChildWorkerService } from './dispatch/child-workers.js';
 import { createVerificationServer, type VerificationBudget } from './verify/server.js';
 import { laneLifecycleHooks, ReportLaneSlimmer, startLaneSlimmer } from './worktrees/slimming.js';
+import { ExpiryService, startExpiry } from './maintenance/expiry.js';
+import { RepoMoveReconciler } from './maintenance/repo-moves.js';
 import type { VerificationQueueView } from './verify/scheduler.js';
 import { createService } from './server.js';
 import { adoptRollMarker, reconcileStaleRoll } from './roll/adopt.js';
@@ -1112,6 +1114,26 @@ async function main(): Promise<number> {
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   laneManager = worktreeManager;
+  // Moved repositories (#427 PR 2b): before any turn runs, a lane whose
+  // repository moved (its folder, with workspace_root updated) is reconnected
+  // to it, and one whose name now holds a different repository is proposed
+  // for discard. This first slice repairs at most MOVED_LANES_PER_CHECK
+  // lanes; the first maintenance reconcile, right after start, repairs the
+  // rest in slices, and the hourly one checks again.
+  const repoMoves = new RepoMoveReconciler({
+    worktrees: worktreeManager,
+    ledger,
+    bus,
+    notifications,
+    workspaceRoot: config.workspaceRoot,
+    managedRepos: config.managedRepos,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  try {
+    repoMoves.check();
+  } catch (error) {
+    logger.log('error', 'the moved-repository check failed at start; the hourly reconcile retries it', { error: String(error) });
+  }
   const worktreeServer = createWorktreeServer({
     config,
     manager: worktreeManager,
@@ -1568,6 +1590,18 @@ async function main(): Promise<number> {
     onReconcile: laneHooks.settleLaneRows,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+  // Expiry (#427 PR 2b): review folders of jobs ended 14 days ago go;
+  // saved work of jobs ended 30 days ago is proposed to the owner. Its
+  // hourly reconcile runs the moved-repository check too.
+  const expiry = new ExpiryService({
+    ledger,
+    bus,
+    notifications,
+    reviewsRoot: join(config.dataDir, 'reviews'),
+    preserveRoot: config.worktrees.preserveRoot,
+    onReconcile: () => repoMoves.reconcile(),
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
   onboardingBudget = () => verifyServer.budget();
   state.verify = verifyServer;
   // The ONE attach flow's HTTP surface (SPEC ruling 19, this lane): the
@@ -1724,6 +1758,11 @@ async function main(): Promise<number> {
   // Lane slimming (#427) runs off the boot path and is never fatal.
   state.laneSlimmer = laneSlimmer;
   startLaneSlimmer(laneSlimmer, (level, msg, fields) => logger.log(level, msg, fields));
+  // Expiry and the moved-repository follow-through (#427 PR 2b) run off the
+  // boot path and are never fatal.
+  state.expiry = expiry;
+  state.repoMoves = repoMoves;
+  startExpiry({ expiry, repoMoves }, (level, msg, fields) => logger.log(level, msg, fields));
   if (silasSlot !== null) {
     // The driver starts after listen so its wake prompt carries the real
     // bound port (config port 0 = ephemeral); until then no sweeps run and

@@ -2,6 +2,8 @@ import type { VectorService } from './vector/service.js';
 import type { VectorRaidRunner } from './vector/runner.js';
 import type { OnboardingService } from './onboarding/service.js';
 import type { ReportLaneSlimmer } from './worktrees/slimming.js';
+import type { ExpiryService } from './maintenance/expiry.js';
+import type { RepoMoveReconciler } from './maintenance/repo-moves.js';
 import type { ServiceHandle } from './server.js';
 import type { RuntimeRegistry } from './runtime/registry.js';
 import type { SessionStore } from './sessions/store.js';
@@ -56,6 +58,10 @@ export interface ServiceShutdownState {
   /** Lane slimming (#427): its event follow-through and reconcile stop,
    * and the shutdown waits for a slim pass that is running. */
   laneSlimmer?: Pick<ReportLaneSlimmer, 'stop'>;
+  /** Expiry (#427 PR 2b): its hourly reconcile and decision follow-through stop. */
+  expiry?: Pick<ExpiryService, 'stop'>;
+  /** Moved repositories (#427 PR 2b): its decision follow-through stops. */
+  repoMoves?: Pick<RepoMoveReconciler, 'stop'>;
   silas?: SilasDriver;
   /** Issue #243: the autopilot ops the shutdown checkpoints and drains. */
   autopilot?: SilasAutopilotOpsHandle;
@@ -242,6 +248,20 @@ export function startServiceShutdown(options: ServiceShutdownOptions): void {
           logger.error('lane slimming stop failed', { error: String(error) });
         } finally {
           clearTimeout(waited);
+        }
+      }
+      if (state.expiry !== undefined) {
+        try {
+          state.expiry.stop();
+        } catch (error) {
+          logger.error('expiry stop failed', { error: String(error) });
+        }
+      }
+      if (state.repoMoves !== undefined) {
+        try {
+          state.repoMoves.stop();
+        } catch (error) {
+          logger.error('moved-repository follow-through stop failed', { error: String(error) });
         }
       }
       if (state.silas !== undefined) {
