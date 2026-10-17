@@ -234,10 +234,14 @@ export class VectorService {
   }
 
   /** The board's raid counts (the cockpit's VECTOR RAIDS card). Read with
-   * raids off too: the card then says so, and records kept from when they
-   * were on still count. */
+   * raids off too: the block then says only that they are off. A FOR YOU
+   * card counts as waiting while it is open and unanswered. */
   boardView(): VectorBoardView {
-    return vectorBoardView({ config: this.opts.vector, raids: this.store.raids(), breakIns: this.store.breakIns(), now: this.now() });
+    const awaitingOwner = (notificationId: string): boolean => {
+      const row = this.opts.ledger.getNotification(notificationId);
+      return row !== null && row.decidedOption === null && row.resolvedAt === null;
+    };
+    return vectorBoardView({ config: this.opts.vector, raids: this.store.raids(), breakIns: this.store.breakIns(), now: this.now(), awaitingOwner });
   }
 
   /**

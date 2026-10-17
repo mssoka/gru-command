@@ -2763,6 +2763,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/telemetry/yield.js",
   "dist/transcripts/service.js",
   "dist/vector/attack.js",
+  "dist/vector/board.js",
   "dist/vector/candidates.js",
   "dist/vector/fix.js",
   "dist/vector/ledger.js",

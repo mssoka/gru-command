@@ -316,24 +316,37 @@ export interface DiskView {
   readonly computedAt: string | null;
 }
 
+/** The raid modes the server can send (mirrors `VECTOR_MODES`; the drift
+ * alarm in test/board-frames.test.ts pins both lists). */
+export const VECTOR_RAID_MODES = ['proposed', 'autonomous'] as const;
+
 /** Vector's raids at a glance (#351; server mirror of `VectorBoardView`).
- * Sent with raids off too, as `enabled: false`. */
-export interface VectorView {
-  readonly enabled: boolean;
-  readonly raidMode: 'proposed' | 'autonomous';
-  /** Raids Gru picked that wait for the owner in FOR YOU. */
+ * With raids off the block says only that: nothing follows decisions,
+ * starts or closes a raid, so it claims no live counts. */
+export type VectorView = VectorOffView | VectorOnView;
+
+export interface VectorOffView {
+  readonly enabled: false;
+  readonly raidMode: (typeof VECTOR_RAID_MODES)[number];
+  readonly maxRaidsPerDay: number;
+}
+
+export interface VectorOnView {
+  readonly enabled: true;
+  readonly raidMode: (typeof VECTOR_RAID_MODES)[number];
+  /** Raids Gru picked whose FOR YOU card is open and unanswered. */
   readonly proposed: number;
   /** Launched raids waiting in Silas's raid queue. */
   readonly queued: number;
   /** Raids running now, newest start first (one per host in normal operation). */
   readonly running: readonly VectorRunningRaidView[];
-  /** Raids that started in the last 24 hours, across every repository. */
-  readonly startedLast24h: number;
+  /** Repositories using their daily cap now, busiest first. */
+  readonly capUse: readonly VectorCapUseView[];
   /** The per-repository cap on raids in any rolling 24 hours. */
   readonly maxRaidsPerDay: number;
   /** Every confirmed break-in so far. */
   readonly breakIns: number;
-  /** Break-ins whose fix heist waits for the owner in FOR YOU. */
+  /** Break-ins whose fix card is open and unanswered in FOR YOU. */
   readonly fixesAwaitingOwner: number;
 }
 
@@ -345,6 +358,12 @@ export interface VectorRunningRaidView {
   readonly roundsDone: number;
   readonly maxRounds: number;
   readonly startedAt: string;
+}
+
+/** One repository's use of its daily cap, counted as a pick is refused. */
+export interface VectorCapUseView {
+  readonly repo: string;
+  readonly used: number;
 }
 
 /** One disk the floor watches (#427 PR 3). */
@@ -1068,17 +1087,21 @@ function isVectorRunningRaidView(value: unknown): value is VectorRunningRaidView
   );
 }
 
+function isVectorCapUseView(value: unknown): value is VectorCapUseView {
+  return isRecord(value) && typeof value.repo === 'string' && isCount(value.used);
+}
+
 function isVectorView(value: unknown): value is VectorView {
+  if (!isRecord(value) || !(VECTOR_RAID_MODES as readonly unknown[]).includes(value.raidMode) || !isCount(value.maxRaidsPerDay)) return false;
+  if (value.enabled === false) return true;
   return (
-    isRecord(value) &&
-    typeof value.enabled === 'boolean' &&
-    (value.raidMode === 'proposed' || value.raidMode === 'autonomous') &&
+    value.enabled === true &&
     isCount(value.proposed) &&
     isCount(value.queued) &&
     Array.isArray(value.running) &&
     value.running.every(isVectorRunningRaidView) &&
-    isCount(value.startedLast24h) &&
-    isCount(value.maxRaidsPerDay) &&
+    Array.isArray(value.capUse) &&
+    value.capUse.every(isVectorCapUseView) &&
     isCount(value.breakIns) &&
     isCount(value.fixesAwaitingOwner)
   );

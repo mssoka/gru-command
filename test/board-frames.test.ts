@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import * as web from '../web/src/lib/board-protocol.js';
 import { BOARD_WS_PATH, parseBoardClientFrame } from '../src/board/frames.js';
+import { VECTOR_MODES } from '../src/config.js';
 import {
   REPO_OVERVIEW_FRESHNESS,
   REPO_OVERVIEW_RUN_STATES,
@@ -172,6 +173,10 @@ describe('managed repo overview cross-build drift alarm', () => {
     // make the web reject the WHOLE board. Fail here instead of at runtime.
     expect([...web.REPO_OVERVIEW_RUN_STATES]).toEqual([...REPO_OVERVIEW_RUN_STATES]);
     expect([...web.REPO_OVERVIEW_FRESHNESS]).toEqual([...REPO_OVERVIEW_FRESHNESS]);
+  });
+
+  it('the raid modes are identical on both builds (#351)', () => {
+    expect([...web.VECTOR_RAID_MODES]).toEqual([...VECTOR_MODES]);
   });
 });
 

@@ -283,22 +283,28 @@ as a number: turning raids off is your call.
 
 ## On the board
 
-The board snapshot carries a `vector` block, so the board can show raids
-without calling the raid API. It is sent with raids off too, as
-`enabled: false`, and counts records kept from when raids were on. It holds:
+The board snapshot carries a `vector` block, so a board can show raids
+without calling the raid API.
 
-- `enabled` and `raidMode`;
-- `proposed`: raids Gru picked that wait for you in FOR YOU;
-- `queued`: launched raids waiting in Silas's raid queue;
-- `running`: the raid running now, with its target, the attacks finished so
-  far (`roundsDone`, the one in progress is not counted), `maxRounds` and when
-  it started. One raid runs per host, so this holds at most one in normal
-  operation; a second is shown, never hidden;
-- `startedLast24h` (all repositories) and `maxRaidsPerDay` (the cap per
-  repository);
-- `breakIns`, every confirmed break-in so far, and `fixesAwaitingOwner`, the
-  break-ins whose fix heist waits for you.
+- **Raids off** (`enabled = false`): the block says only that, as
+  `{ enabled: false, raidMode, maxRaidsPerDay }`. With raids off nothing
+  follows decisions or starts or closes a raid, so it claims no live counts.
+- **Raids on**, the block holds:
+  - `proposed`: raids Gru picked whose FOR YOU card is open and unanswered. A
+    card you already answered, whose follow-through has not run yet, waits for
+    nobody and is not counted;
+  - `queued`: launched raids waiting in Silas's raid queue;
+  - `running`: the raid running now, with its target, the attacks finished
+    so far (`roundsDone`; the one in progress is not counted), `maxRounds` and
+    when it started. One raid runs per host, so this holds at most one in
+    normal operation; a second is shown, never hidden. Newest start first;
+  - `capUse`: each repository using its daily cap now, busiest first, counted
+    exactly as a pick is refused (started in the last 24 hours, waiting to
+    run, running, or ended before starting), next to `maxRaidsPerDay`, the cap
+    per repository;
+  - `breakIns`, every confirmed break-in so far, and `fixesAwaitingOwner`, the
+    break-ins whose fix card is open and unanswered in FOR YOU.
 
-An older server sends no block, and the board then shows no raids card rather
+An older server sends no block; a board reading it shows no raids card rather
 than zeros. A block that fails to read is logged and left out; the rest of the
 snapshot still renders.
