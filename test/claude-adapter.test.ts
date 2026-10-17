@@ -1362,8 +1362,11 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     expect(record!.argv[record!.argv.indexOf('--system-prompt') + 1]).toBe('isolated policy');
     expect(record!.argv).not.toContain('--append-system-prompt');
     expect(record!.argv).toEqual(expect.arrayContaining([
-      '--safe-mode', '--disable-slash-commands', '--strict-mcp-config', '--setting-sources', '', '--no-chrome',
+      '--disable-slash-commands', '--strict-mcp-config', '--setting-sources', '', '--no-chrome',
     ]));
+    // --safe-mode / --bare disable every MCP server, including the review bridge.
+    expect(record!.argv).not.toContain('--safe-mode');
+    expect(record!.argv).not.toContain('--bare');
     expect(record!.argv[record!.argv.indexOf('--setting-sources') + 1]).toBe('');
     expect(record!.argv).not.toContain('--allowedTools');
     expect(handle.reviewIsolation).toBe(true);

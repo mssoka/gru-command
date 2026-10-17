@@ -399,7 +399,7 @@ async function run() {
       process.exit(19);
     }
     const selected = flagValue('--model') ?? process.env.ANTHROPIC_MODEL ?? settings.model;
-    if (!argv.includes('--safe-mode') || flagValue('--setting-sources') !== '' ||
+    if (argv.includes('--safe-mode') || argv.includes('--bare') || process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY !== '1' || flagValue('--setting-sources') !== '' ||
         !argv.includes('--strict-mcp-config') || !argv.includes('--disable-slash-commands') ||
         !argv.includes('--no-chrome') || !argv.includes('--tools') ||
         settings.hooks !== undefined || settings.plugins !== undefined || settings.env?.NODE_OPTIONS !== undefined ||
