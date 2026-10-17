@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -13,7 +13,7 @@ import { extractSameBlockerCases } from '../src/decisions/cases/same-blocker-ext
 import { routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi, type EventRecord, type NotificationRecord } from '../src/ledger/api.js';
-import { LedgerDb } from '../src/ledger/db.js';
+import { LedgerDb, ResetRunningError } from '../src/ledger/db.js';
 import type { LogLevel } from '../src/logger.js';
 import {
   EXPIRY_EVENTS,
@@ -27,12 +27,12 @@ import {
   preserveExpiryCard,
   startExpiry,
 } from '../src/maintenance/expiry.js';
-import { REPO_MISMATCH_KIND, RepoMoveReconciler } from '../src/maintenance/repo-moves.js';
+import { LANE_TAMPERED_KIND, laneTamperedRowId, REPO_MISMATCH_KIND, RepoMoveReconciler } from '../src/maintenance/repo-moves.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import { ownerAttentionFor, requiresTypedDecision } from '../src/notifications/attention.js';
 import { PacingGate } from '../src/runtime/pacing.js';
 import type { AgentHandle } from '../src/runtime/types.js';
-import { captureCwdHandoff, WorktreeHandoffUnresolvedError } from '../src/worktrees/handoff.js';
+import { captureCwdHandoff, WorktreeHandoffUnresolvedError, type Receipt } from '../src/worktrees/handoff.js';
 import { normalizedOriginUrl, PRESERVED_REF_PREFIX, REPO_IDENTITY_EVENT, WorktreeManager, type ProcessEnumerator } from '../src/worktrees/manager.js';
 import { laneLifecycleHooks } from '../src/worktrees/slimming.js';
 
@@ -679,6 +679,35 @@ describe('a moved repository\'s lanes are repaired by identity (#427 PR 2b)', ()
     expect(h.logs.some((log) => log.msg.includes('matched by its base commit\'s root commits only') && log.fields?.['id'] === 'job-legacy')).toBe(true);
   });
 
+  it('a rebinding recorded and never published is finished after a second move: the repository moves A to B, B\'s receipt is not written, then B to C, and the lane works on C', async () => {
+    const h = harness();
+    const a = repoIn(tempDir('gru-cleanup-ws-a-'), 'app', { origin: true });
+    addJob(h, 'job-twice');
+    const lane = await h.manager().createJobWorktree({ repoPath: a, jobId: 'job-twice' });
+    const b = join(tempDir('gru-cleanup-ws-b-'), 'app');
+    renameSync(a, b);
+    const manager = h.manager();
+    const receiptIn = (repo: string): string => join(repo, '.git', 'worktrees', basename(lane.path), 'gru-creation-handoff.json');
+    const original = readFileSync(receiptIn(b), 'utf-8');
+    expect(manager.checkMovedRepositories({ managedRepos: ['app'], resolve: () => ({ kind: 'available', path: b }) }).map((outcome) => outcome.status)).toEqual(['repaired']);
+    // The move to B is recorded, its receipt never written (a stop, or a write refused).
+    writeFileSync(receiptIn(b), original);
+    // Before any check finishes it, the repository moves again.
+    const c = join(tempDir('gru-cleanup-ws-c-'), 'app');
+    renameSync(b, c);
+    expect(() => captureCwdHandoff(lane.path)).toThrow(WorktreeHandoffUnresolvedError);
+
+    const outcomes = manager.checkMovedRepositories({ managedRepos: ['app'], resolve: () => ({ kind: 'available', path: c }) });
+
+    expect(outcomes.map((outcome) => outcome.status)).toEqual(['repaired']);
+    expect(h.ledger.getWorktree('job-twice')?.repoPath).toBe(c);
+    expect(events(h, 'worktree.repo-moved').map(payloadOf)).toEqual([{ id: 'job-twice', from: a, to: b }, { id: 'job-twice', from: b, to: c }]);
+    expect(JSON.parse(readFileSync(receiptIn(c), 'utf-8'))).toMatchObject({ repo: c, common: join(c, '.git'), admin: join(c, '.git', 'worktrees', basename(lane.path)) });
+    expect(() => captureCwdHandoff(lane.path)()).not.toThrow();
+    expect(await manager.ensureReady('job-twice')).toEqual([{ id: 'job-twice', status: 'ready' }]);
+    expect(manager.checkMovedRepositories({ managedRepos: ['app'], resolve: () => ({ kind: 'available', path: c }) })).toEqual([]);
+  });
+
   it('the name now resolves to a different repository: one FOR YOU discard card; Decline keeps the lane and asks no more, Accept deletes the lane and marks it swept', async () => {
     const h = harness();
     const before = tempDir('gru-cleanup-ws-code-');
@@ -956,7 +985,7 @@ describe('a moved repository\'s lanes are repaired by identity (#427 PR 2b)', ()
     const moved = join(after, 'app');
     renameSync(app, moved);
 
-    new RepoMoveReconciler({ worktrees: h.manager(), ledger: h.ledger, bus: h.bus, notifications: h.notifications, workspaceRoot: after, managedRepos: ['app'] }).check();
+    await new RepoMoveReconciler({ worktrees: h.manager(), ledger: h.ledger, bus: h.bus, notifications: h.notifications, workspaceRoot: after, managedRepos: ['app'] }).reconcile();
 
     expect(h.ledger.getWorktree('job-released')?.repoPath).toBe(moved);
     expect(events(h, 'worktree.repo-moved').map(payloadOf)).toEqual([{ id: 'job-released', from: app, to: moved }]);
@@ -965,6 +994,75 @@ describe('a moved repository\'s lanes are repaired by identity (#427 PR 2b)', ()
     expect(card!.detail).toContain(`git -C ${moved} cherry-pick --no-commit ${saved.ref}`);
     expect(card!.detail).toContain(`cp -R ${saved.copy}/. ${moved}`);
     expect(card!.detail).not.toContain(before);
+  });
+
+  it('released lanes follow off the event loop: 200 swept rows over three base commits take a handful of rev-list calls while a timer keeps firing, and rows found different are not judged again', async () => {
+    const h = harness();
+    const before = tempDir('gru-cleanup-ws-code-');
+    const app = repoIn(before, 'app');
+    const bases = [git(app, ['rev-parse', 'HEAD'])];
+    for (const n of [2, 3]) {
+      git(app, ['commit', '-q', '--allow-empty', '-m', `commit ${String(n)}`]);
+      bases.push(git(app, ['rev-parse', 'HEAD']));
+    }
+    addJob(h, 'job-many');
+    // Released lanes made before identities were recorded, and ten whose base commit the repository does not hold.
+    const insert = h.db.handle.prepare(`INSERT INTO worktrees (id, kind, repo_path, repo_name, path, branch, sha, job_id, round_id, status, note, created_at, updated_at, base_source)
+      VALUES (?, 'child', ?, 'app', ?, NULL, ?, 'job-many', NULL, 'swept', NULL, ?, ?, NULL)`);
+    const at = new Date().toISOString();
+    h.db.handle.exec('BEGIN');
+    for (let n = 0; n < 210; n += 1) insert.run(`swept-${String(n)}`, app, join(h.lanesRoot, 'app', `child-${String(n)}`), n < 200 ? bases[n % 3]! : 'f'.repeat(40), at, at);
+    h.db.handle.exec('COMMIT');
+    const after = tempDir('gru-cleanup-ws-src-');
+    const moved = join(after, 'app');
+    renameSync(app, moved);
+    const manager = h.manager();
+    const names = { managedRepos: ['app'], resolve: () => ({ kind: 'available' as const, path: moved }) };
+    /** The git commands run while `run` runs, as git itself traces them. */
+    const traced = async (run: () => Promise<void>): Promise<string[]> => {
+      const trace = join(tempDir('gru-cleanup-trace-'), 'git.trace');
+      vi.stubEnv('GIT_TRACE', trace);
+      try {
+        await run();
+      } finally {
+        vi.unstubAllEnvs();
+      }
+      return existsSync(trace) ? readFileSync(trace, 'utf-8').split('\n').filter((line) => line.includes('trace: built-in: git ')) : [];
+    };
+    const count = (lines: readonly string[], command: string): number => lines.filter((line) => line.includes(`trace: built-in: git ${command} `)).length;
+    let ticks = 0;
+    let last = performance.now();
+    let longest = 0;
+    const timer = setInterval(() => {
+      const now = performance.now();
+      longest = Math.max(longest, now - last);
+      last = now;
+      ticks += 1;
+    }, 1);
+
+    let first: string[];
+    try {
+      first = await traced(() => manager.followSweptLanes(names));
+    } finally {
+      clearInterval(timer);
+    }
+
+    expect(h.ledger.listWorktrees().filter((row) => row.repoPath === moved)).toHaveLength(200);
+    expect(h.ledger.listWorktrees().filter((row) => row.repoPath === app).map((row) => row.id).sort()).toEqual(Array.from({ length: 10 }, (_, n) => `swept-${String(200 + n)}`));
+    // One identity read, and one per base commit: never one per row.
+    expect(count(first, 'rev-list')).toBeLessThanOrEqual(4);
+    expect(count(first, 'rev-parse')).toBeLessThanOrEqual(4);
+    expect(ticks).toBeGreaterThan(0);
+    expect(longest).toBeLessThan(1_000);
+    expect(h.logs.filter((log) => log.msg.includes('released lanes follow their moved repository')).map((log) => log.fields)).toEqual([
+      { from: app, to: moved, lanes: 200, matched_by_base_commit_only: 200 },
+    ]);
+
+    // The next check reads the repository's identity once and judges no row it found different again.
+    const second = await traced(() => manager.followSweptLanes(names));
+    expect(count(second, 'rev-list')).toBe(1);
+    expect(count(second, 'rev-parse')).toBe(0);
+    expect(h.ledger.listWorktrees().filter((row) => row.repoPath === app)).toHaveLength(10);
   });
 });
 
@@ -1016,7 +1114,52 @@ describe('a rebinding is taken only as a move of the repository (#427 PR 2b)', (
     expect(() => captureCwdHandoff(alone.path)).toThrow(WorktreeHandoffUnresolvedError);
     expect(() => captureCwdHandoff(other.path)).toThrow(WorktreeHandoffUnresolvedError);
   });
+
+  it('an administration swapped with no move is not re-bound: a forged worktrees/evil pointing back at the lane, with the lane\'s .git pointed at it, records no move, leaves custody refused and posts Gru one action-required row naming the lane', async () => {
+    const h = harness();
+    const app = repoIn(tempDir('gru-cleanup-ws-'), 'app');
+    addJob(h, 'job-swapped');
+    const lane = await h.manager().createJobWorktree({ repoPath: app, jobId: 'job-swapped' });
+    const original = join(app, '.git', 'worktrees', basename(lane.path));
+    const evil = join(app, '.git', 'worktrees', 'evil');
+    // Written from inside the lane, as a minion can: a copy of its administration, receipt included.
+    cpSync(original, evil, { recursive: true });
+    writeFileSync(join(lane.path, '.git'), `gitdir: ${evil}\n`);
+    expect(() => git(lane.path, ['status'])).not.toThrow();
+    const reconciler = new RepoMoveReconciler({ worktrees: h.manager(), ledger: h.ledger, bus: h.bus, notifications: h.notifications, workspaceRoot: dirname(app), managedRepos: ['app'] });
+
+    const outcomes = reconciler.check();
+
+    expect(outcomes.map((outcome) => outcome.status)).toEqual(['tampered']);
+    expect(events(h, 'worktree.repo-moved')).toEqual([]);
+    expect(events(h, 'worktree.handoff-rebound')).toEqual([]);
+    expect(readFileSync(join(lane.path, '.git'), 'utf-8')).toBe(`gitdir: ${evil}\n`);
+    expect(() => captureCwdHandoff(lane.path)).toThrow(WorktreeHandoffUnresolvedError);
+    const rows = openCards(h, LANE_TAMPERED_KIND);
+    expect(rows.map((row) => [row.id, row.routing])).toEqual([[laneTamperedRowId('job-swapped'), 'action-required']]);
+    expect(rows[0]!.title).toContain('Lane job-swapped (app)');
+    expect(rows[0]!.detail).toContain(`${evil}, not the one its handoff was issued with (${original})`);
+    // The next check posts no second row.
+    expect(reconciler.check().map((outcome) => outcome.status)).toEqual(['tampered']);
+    expect(openCards(h, LANE_TAMPERED_KIND)).toHaveLength(1);
+    // The ledger itself refuses a move to the same place that moves nothing.
+    const issued = payloadOf(events(h, 'worktree.handoff-completed')[0]) as unknown as Receipt;
+    expect(() => h.ledger.moveWorktreeRepo({ id: 'job-swapped', repoPath: app, rebind: null })).toThrow(/did not move/u);
+    expect(() => h.ledger.moveWorktreeRepo({ id: 'job-swapped', repoPath: app, rebind: { from: issued, to: { ...issued, admin: evil } } })).toThrow(/did not move/u);
+    expect(events(h, 'worktree.repo-moved')).toEqual([]);
+  });
 });
+
+/** Whether the temporary directory's volume ignores letter case (macOS's default). */
+const caseInsensitiveTmp = ((): boolean => {
+  const dir = mkdtempSync(join(tmpdir(), 'gru-cleanup-case-'));
+  try {
+    writeFileSync(join(dir, 'probe'), '');
+    return existsSync(join(dir, 'PROBE'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+})();
 
 describe('gru-service reset (#427 PR 2b)', () => {
   interface Instance {
@@ -1141,7 +1284,7 @@ describe('gru-service reset (#427 PR 2b)', () => {
     expect(git(at.app, ['for-each-ref', '--format=%(refname)', 'refs/heads'])).toBe(userBranches);
     expect(git(at.app, ['for-each-ref', '--format=%(refname)', 'refs/gru/'])).not.toBe('');
     expect(readFileSync(join(at.app, 'my-notes.txt'), 'utf-8')).toBe('mine\n');
-    expect(readdirSync(at.home).sort()).toEqual(['config.toml', 'credentials', 'identity', 'logs', 'perkins']);
+    expect(readdirSync(at.home).sort()).toEqual(['config.toml', 'credentials', 'identity', 'logs', 'perkins', 'reset.lock']);
     expect(readdirSync(join(at.home, 'logs'))).toEqual(['launchd.out.log']);
     expect(readFileSync(join(at.home, 'config.toml'), 'utf-8')).toContain('managed_repos = ["app"]');
     expect(RESET_KEEPS).toContain('config.toml');
@@ -1218,7 +1361,7 @@ describe('gru-service reset (#427 PR 2b)', () => {
     expect(laneTrees(at.api!, at.lanesRoot)).toEqual([]);
     expect(existsSync(apiLane)).toBe(false);
     expect(at.out.join('\n')).toContain(`removed lane ${apiLane} from ${realpathSync(join(at.api!, '.git'))}`);
-    expect(readdirSync(at.home).sort()).toEqual(['config.toml', 'credentials', 'identity', 'logs', 'perkins']);
+    expect(readdirSync(at.home).sort()).toEqual(['config.toml', 'credentials', 'identity', 'logs', 'perkins', 'reset.lock']);
   });
 
   it.skipIf(typeof process.getuid === 'function' && process.getuid() === 0)('a lane that cannot be removed leaves the data directory as it was, names the lane and exits 1', async () => {
@@ -1252,7 +1395,7 @@ describe('gru-service reset (#427 PR 2b)', () => {
     expect(code).toBe(0);
     expect(laneTrees(at.app, at.lanesRoot)).toEqual([`worktree ${ownTree}`]);
     expect(readFileSync(join(ownTree, 'draft.txt'), 'utf-8')).toBe('mine\n');
-    expect(readdirSync(at.home).sort()).toEqual(['config.toml', 'credentials', 'identity', 'logs', 'perkins', 'worktrees']);
+    expect(readdirSync(at.home).sort()).toEqual(['config.toml', 'credentials', 'identity', 'logs', 'perkins', 'reset.lock', 'worktrees']);
     expect(readdirSync(join(at.home, 'worktrees', 'app'))).toEqual(['my-own']);
     expect(git(at.app, ['worktree', 'list', '--porcelain'])).toContain(join(at.workspace, 'my-tree'));
     const said = at.out.join('\n');
@@ -1334,5 +1477,85 @@ describe('gru-service reset (#427 PR 2b)', () => {
     expect(at.err.join('\n')).toContain('is held open by a running process');
     expect(at.err.join('\n')).toContain('checked again before changing anything');
     untouched();
+  });
+
+  it('keeps a worktree of the user\'s at any depth in the data directory, with the folders that lead to it, and one nested beside a repository\'s .git with that repository; only their siblings are deleted', async () => {
+    const at = await instance();
+    // The user's own repository outside the data directory, with a worktree four levels deep in it.
+    const other = repoIn(at.workspace, 'other');
+    const deep = join(at.home, 'scratch', 'a', 'b', 'wt');
+    mkdirSync(dirname(deep), { recursive: true });
+    git(other, ['worktree', 'add', '-q', '-b', 'deep', deep]);
+    writeFileSync(join(deep, 'draft.txt'), 'deep work\n');
+    writeFileSync(join(at.home, 'scratch', 'junk.txt'), 'junk\n');
+    mkdirSync(join(at.home, 'scratch', 'a', 'old'));
+    writeFileSync(join(at.home, 'scratch', 'a', 'old', 'f.txt'), 'old\n');
+    // A repository of the user's in the data directory, its worktree beside its .git.
+    const x = repoIn(at.home, 'x');
+    git(x, ['worktree', 'add', '-q', '-b', 'nested', join(x, 'wt')]);
+    writeFileSync(join(x, 'wt', 'draft.txt'), 'nested work\n');
+
+    const code = await runResetCli(['--yes'], at.deps());
+
+    expect(at.err).toEqual([]);
+    expect(code).toBe(0);
+    expect(git(deep, ['status', '--porcelain'])).toBe('?? draft.txt');
+    expect(readdirSync(join(at.home, 'scratch'))).toEqual(['a']);
+    expect(readdirSync(join(at.home, 'scratch', 'a'))).toEqual(['b']);
+    expect(git(join(x, 'wt'), ['status', '--porcelain'])).toBe('?? draft.txt');
+    expect(git(x, ['log', '--format=%s'])).toBe('x: first');
+    expect(readdirSync(at.home).sort()).toEqual(['config.toml', 'credentials', 'identity', 'logs', 'perkins', 'reset.lock', 'scratch', 'x']);
+    const said = at.out.join('\n');
+    expect(said).toContain(`${deep} is a worktree or folder of your own: it is kept`);
+    expect(said).toContain(`${x} is a worktree or folder of your own: it is kept`);
+  });
+
+  it.skipIf(!caseInsensitiveTmp)('on a case-insensitive volume, refuses a data directory spelled in another letter case than the workspace it is, and changes nothing', async () => {
+    const at = await instance();
+    const shouted = join(dirname(at.workspace), basename(at.workspace).toUpperCase());
+    expect(shouted).not.toBe(at.workspace);
+
+    const code = await runResetCli(['--yes'], at.deps({ loadConfig: () => ({ ...loadConfig({ GRU_COMMAND_HOME: at.home }, '/home/tester'), dataDir: shouted }) }));
+
+    expect(code).toBe(1);
+    expect(at.err.join('\n')).toContain(`the data directory ${shouted} (${at.workspace}) holds the workspace root ${at.workspace}`);
+    expect(readFileSync(join(at.app, 'my-notes.txt'), 'utf-8')).toBe('mine\n');
+    expect(laneTrees(at.app, at.lanesRoot)).toHaveLength(2);
+  });
+
+  it('deletes the ledger last, after the lanes and the preserve copies, and holds reset.lock until it ends: a service starting meanwhile cannot open its ledger', async () => {
+    const at = await instance();
+    const copy = join(at.home, 'worktree-preserves', 'job-three', '20261017T000000Z');
+    mkdirSync(copy, { recursive: true });
+    writeFileSync(join(copy, 'notes.txt'), 'saved\n');
+    const said: string[] = [];
+    const starts: string[] = [];
+
+    const code = await runResetCli(['--yes'], at.deps({
+      stdout: (line) => {
+        said.push(line);
+        if (!line.startsWith('deleted ')) return;
+        // A service starting while reset deletes.
+        try {
+          new LedgerDb(at.home).close();
+          starts.push('started');
+        } catch (error) {
+          starts.push(error instanceof ResetRunningError ? 'refused' : String(error));
+        }
+      },
+    }));
+
+    expect(at.err).toEqual([]);
+    expect(code).toBe(0);
+    const deleted = said.filter((line) => line.startsWith('deleted ')).map((line) => line.slice('deleted '.length));
+    expect(deleted).toEqual(expect.arrayContaining([join(at.home, 'worktrees'), join(at.home, 'worktree-preserves'), join(at.home, 'reviews')]));
+    expect(deleted.at(-1)).toBe(join(at.home, 'ledger'));
+    const lanesRemoved = said.map((line, index) => (line.startsWith('removed lane ') ? index : -1)).filter((index) => index >= 0);
+    expect(lanesRemoved).toHaveLength(2);
+    expect(Math.max(...lanesRemoved)).toBeLessThan(said.indexOf(`deleted ${join(at.home, 'ledger')}`));
+    expect(starts).toEqual(deleted.map(() => 'refused'));
+    // Once reset has ended, the service starts on a fresh ledger.
+    new LedgerDb(at.home).close();
+    expect(existsSync(join(at.home, 'ledger', 'ledger.db'))).toBe(true);
   });
 });

@@ -2648,6 +2648,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/ledger/rebrief-evidence.js",
   "dist/ledger/recovery-owner.js",
   "dist/ledger/report-backfill.js",
+  "dist/ledger/reset-lock.js",
   "dist/ledger/states.js",
   "dist/lessons/bible.js",
   "dist/lessons/capture.js",

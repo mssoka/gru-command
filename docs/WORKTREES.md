@@ -728,7 +728,25 @@ binding issued before it, changes nothing else, and is paired with that
 lane's move (`move_seq` names the event right before it); no custom event
 may write either kind. The re-bound receipt is then written in the lane's
 administration, and a stop between the record and that write is finished by
-the next check. The lane's next turn, verify and release work as before.
+the next check, even after the repository moved again meanwhile: a receipt
+that is any earlier binding of the lane's own issued chain is replaced by the
+newest one. The lane's next turn, verify and release work as before.
+
+A new administration is taken only when a move explains it: the
+administration the handoff was issued with is gone (or is a link to the new
+one), its id (its name under `worktrees/`) is unchanged, and git registers
+the lane exactly once in the repository's common directory (`git worktree
+list`). Otherwise, as when a second administration was made for the lane and
+its `.git` pointed at it, nothing is re-bound and no move is recorded: the
+lane's custody stays refused, and Gru gets one action-required row
+(`worktree.lane-tampered`) naming the lane. The ledger itself refuses a move
+to the same `repo_path` unless the repository's real place or its git
+directory moved.
+
+Each check reads each repository's identity once, and each base commit's
+root commits once per repository. It runs on the event loop, so it repairs
+at most 100 lanes; the rest are repaired at the next check (the first
+reconcile runs right after start).
 
 Paths are compared as the filesystem resolves them. A repository moved with
 a link left at its old place still reaches its lanes through the link, but
@@ -737,9 +755,12 @@ repository really is, and their `repo_path` follows the managed name when it
 resolves there. A repository whose own git directory moved
 (`--separate-git-dir`), its folder in place, is repaired the same way and
 re-bound to the moved git directory, its `repo_path` unchanged. A released
-(swept) lane whose repository moved follows it too (`worktree.repo-moved`,
-nothing to repair), so its snapshot refs are still proposed for expiry and
-the card's restore commands name where the repository is now.
+(swept) lane whose repository moved follows it too, at each reconcile
+(`worktree.repo-moved`, nothing to repair), so its snapshot refs are still
+proposed for expiry and the card's restore commands name where the
+repository is now. That follow runs its git off the event loop and yields
+between rows, and a released lane found to be of a different repository is
+not judged again while the name holds that same repository.
 
 A **different** repository under the name gets one FOR YOU card for the lane
 (kind `worktree.repo-mismatch`, a typed owner decision): discarding a lane
@@ -773,7 +794,10 @@ gru-service reset [--yes] [--delete-branches] [--delete-refs]
    timeout included), or a ledger another process holds open (the service
    keeps no pid file; SQLite's lock on `ledger/ledger.db` is held while it
    runs) all refuse. It checks again after your confirmation, immediately
-   before the first change, and holds the ledger's lock until it is done.
+   before the first change. From then until it is done it holds its own
+   lock file, `reset.lock` in the data directory (kept, never deleted): a
+   service that starts meanwhile refuses to open its ledger and exits. It
+   also holds the ledger's lock, and deletes the ledger last.
 2. It lists what it will do, per repository and for the data directory.
 3. With `--yes`, or a `y` at the terminal, it:
    - removes every GC lane with `git worktree remove --force --force` (lanes
@@ -784,7 +808,9 @@ gru-service reset [--yes] [--delete-branches] [--delete-refs]
      file. A GC lane is a worktree the registry names, or one under the lanes
      root on a `gru/*` branch, locked by GC's creation or holding GC's
      handoff receipt; any other worktree is yours and is never touched, even
-     under the lanes root or in the data directory. A lane folder its
+     under the lanes root or in the data directory at any depth (a folder
+     holding a repository's own `.git` is searched too, never the `.git`
+     itself). A lane folder its
      repository does not register is deleted as a folder; one whose
      repository cannot be found is left and named. Then it runs
      `git worktree prune` in each managed repository, unless that would also
@@ -795,12 +821,17 @@ gru-service reset [--yes] [--delete-branches] [--delete-refs]
      snapshot refs) only with `--delete-refs`;
    - deletes the data directory's contents except `config.toml` and the
      install's own files (`identity/`, `credentials/`, `perkins/`,
-     `onboarding-consent.json`, `wizard-draft.json` and the service unit's
-     `logs/launchd.*.log`), keeping the directory.
+     `onboarding-consent.json`, `wizard-draft.json`, the service unit's
+     `logs/launchd.*.log` and `reset.lock`), keeping the directory. A
+     worktree of yours in it is kept with every folder that leads to it, and
+     with its repository when that is in the data directory too; only what
+     lies beside them is deleted. The `ledger/` folder goes last, after
+     every other entry.
 
 It prints what it removed. It never touches your own branches, worktrees or
 files. The data directory is compared as the filesystem resolves it (a link
-followed once), by path segment: one that is or holds your home directory
+followed once, the letter case made canonical, so on a case-insensitive
+volume `~/WORKSPACE` is your workspace), by path segment: one that is or holds your home directory
 or the filesystem root, holds the workspace root or a managed repository,
 holds the install or lies inside it, is refused. The delete never follows a
 link: a link is deleted as a link. When a lane is not removed, the data

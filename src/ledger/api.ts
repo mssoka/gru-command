@@ -2969,12 +2969,18 @@ export class LedgerApi {
    * very next event, the rebinding of the lane's creation handoff
    * (`worktree.handoff-rebound { id, from, to, move_seq }`, `move_seq` the
    * move's seq) when it has one. Custody takes a rebinding only so paired,
-   * and appendCustomEvent refuses both kinds. */
+   * and appendCustomEvent refuses both kinds. A move to the same
+   * `repo_path` is refused unless its rebinding moves the repository's
+   * real place or its git directory: nothing moved, so nothing is recorded. */
   moveWorktreeRepo(input: { readonly id: string; readonly repoPath: string; readonly rebind: Pick<LaneRebind, 'from' | 'to'> | null }): WorktreeRecord {
     if (input.repoPath === '') throw new Error('a moved worktree needs its new repo path');
     return this.transaction(() => {
       const current = this.getWorktree(input.id);
       if (current === null) throw new RecordNotFound(`worktree "${input.id}" not found`);
+      if (input.repoPath === current.repoPath &&
+        (input.rebind === null || (input.rebind.from.repo === input.rebind.to.repo && input.rebind.from.common === input.rebind.to.common))) {
+        throw new Error(`worktree "${input.id}" did not move: its repository stays at ${current.repoPath} and its git directory did not move, so no move of it is recorded`);
+      }
       this.db.prepare('UPDATE worktrees SET repo_path = ?, updated_at = ? WHERE id = ?').run(input.repoPath, nowIso(), input.id);
       const move = this.appendEvent({
         kind: REPO_MOVED_KIND,

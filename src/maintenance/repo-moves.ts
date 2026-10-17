@@ -20,6 +20,12 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * and the same `origin` when both have one) gets the lane back through
  * `git worktree repair`, and the registry's `repo_path` follows.
  *
+ * Released (swept) lanes follow their repository's move at each reconcile,
+ * off the event loop ({@link WorktreeManager.followSweptLanes}). A lane
+ * whose git administration changed with no move to explain it is left
+ * refused, and Gru gets one action-required row naming it
+ * ({@link LANE_TAMPERED_KIND}).
+ *
  * A different repository under the name gets one FOR YOU card for the lane
  * (kind {@link REPO_MISMATCH_KIND}): discarding the lane loses whatever it
  * holds, so it is the owner's call (owner ruling 2026-10-16). Accept deletes
@@ -36,6 +42,15 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
 /** The owner's Accept/Decline on discarding a lane whose repository is not there. */
 export const REPO_MISMATCH_KIND = 'worktree.repo-mismatch';
 
+/** Gru's row about a lane whose git administration changed with no move of
+ * its repository to explain it (#427 PR 2b): its custody stays refused. */
+export const LANE_TAMPERED_KIND = 'worktree.lane-tampered';
+
+/** The one row about a tampered lane. */
+export function laneTamperedRowId(laneId: string): string {
+  return `worktree-lane-tampered:${laneId}`;
+}
+
 /** A lane's card for one place its repository's name resolves to: a later
  * place gets a new card. The same place gets a next generation's card only
  * after its earlier card was closed without a Decline (withdrawn unanswered,
@@ -48,7 +63,7 @@ export function repoMismatchCardId(laneId: string, candidate: string, generation
 const OWNER_PROVENANCE = { credential: 'internal', declaredActor: null } as const;
 
 export interface RepoMoveReconcilerOptions {
-  readonly worktrees: Pick<WorktreeManager, 'checkMovedRepositories' | 'discardLane'>;
+  readonly worktrees: Pick<WorktreeManager, 'checkMovedRepositories' | 'followSweptLanes' | 'discardLane'>;
   readonly ledger: Pick<LedgerApi, 'getWorktree' | 'getNotification' | 'listOpenNotificationsByKinds' | 'resolveOwnerDecision' | 'withdrawOwnerProposal' | 'appendCustomEvent' | 'latestEventByPayloadField'>;
   readonly bus: EventBus;
   readonly notifications: Pick<NotificationCenter, 'post'>;
@@ -87,24 +102,24 @@ export class RepoMoveReconciler {
     this.unsubscribe = null;
   }
 
-  /** The check, then the answered cards (at start and every hour). */
+  /** The check, the released lanes' follow, then the answered cards (at
+   * start and every hour). */
   async reconcile(): Promise<void> {
     this.check();
+    await this.opts.worktrees.followSweptLanes(this.names());
     await this.followCards();
   }
 
   /** Repair what moved, propose a discard for a lane whose name now holds a
-   * different repository, and withdraw the cards of lanes reconnected or
-   * swept. Synchronous: main.ts runs it at start before any turn. */
+   * different repository, report a tampered lane to Gru, and withdraw the
+   * cards of lanes reconnected or swept. Synchronous: main.ts runs it at
+   * start before any turn. */
   check(): readonly RepoMoveOutcome[] {
-    const resolve = this.opts.resolve ?? resolveManagedRepoPathSync;
-    const outcomes = this.opts.worktrees.checkMovedRepositories({
-      managedRepos: this.opts.managedRepos,
-      resolve: (name) => resolve(this.opts.workspaceRoot, name),
-    });
+    const outcomes = this.opts.worktrees.checkMovedRepositories(this.names());
     for (const outcome of outcomes) {
       try {
         if (outcome.status === 'mismatch') this.propose(outcome);
+        else if (outcome.status === 'tampered') this.reportTampered(outcome);
         else if (outcome.status === 'repaired') this.withdraw(outcome.lane.id, null, 'the lane was reconnected to its repository');
       } catch (error) {
         this.log('error', 'a moved-repository outcome could not be followed; the next reconcile retries it', { id: outcome.lane.id, error: String(error) });
@@ -167,6 +182,30 @@ export class RepoMoveReconciler {
     this.close(card, outcome === 'discarded' ? `lane ${laneId} discarded`
       : outcome === 'reconnected' ? `nothing discarded: lane ${laneId} reaches its repository again`
       : `nothing discarded: lane ${laneId} is gone`);
+  }
+
+  /** The managed names, resolved now. */
+  private names(): { readonly managedRepos: readonly string[]; readonly resolve: (name: string) => ManagedRepoPath } {
+    const resolve = this.opts.resolve ?? resolveManagedRepoPathSync;
+    return { managedRepos: this.opts.managedRepos, resolve: (name) => resolve(this.opts.workspaceRoot, name) };
+  }
+
+  /** Gru's one row naming a lane whose administration changed with no move
+   * to explain it (posted once: its id is the lane's). */
+  private reportTampered(outcome: Extract<RepoMoveOutcome, { readonly status: 'tampered' }>): void {
+    const { lane, reason } = outcome;
+    this.opts.notifications.post({
+      id: laneTamperedRowId(lane.id),
+      kind: LANE_TAMPERED_KIND,
+      routing: 'action-required',
+      severity: 'error',
+      title: `Lane ${lane.id} (${lane.repoName}): its git administration changed with no move of its repository`,
+      detail: [
+        `Lane ${lane.id} (job ${lane.jobId ?? 'none'}) at ${lane.path}, made in ${lane.repoPath}: ${reason}.`,
+        'GC re-binds a lane\'s custody only when a move of its repository explains the change, so it re-bound nothing and recorded no move: the lane\'s turns, verify and release stay refused.',
+        'Find what changed the lane\'s .git file or its repository\'s worktrees/ folder; point the .git file back at the administration it was made with, or discard the lane.',
+      ].join('\n'),
+    });
   }
 
   private propose(outcome: Extract<RepoMoveOutcome, { readonly status: 'mismatch' }>): void {

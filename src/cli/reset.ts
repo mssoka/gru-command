@@ -6,6 +6,7 @@ import { createInterface } from 'node:readline/promises';
 import { defaultPackageRoot } from '../build-info.js';
 import { loadConfig, type GruCommandConfig } from '../config.js';
 import { repositoryGitEnv } from '../git-env.js';
+import { RESET_LOCK_FILE } from '../ledger/reset-lock.js';
 import { defaultListenerProbe, type ListenerProbe } from '../listener-probe.js';
 import { resolveManagedRepoPathSync } from '../repos/managed-names.js';
 import { dialHost } from './service.js';
@@ -20,8 +21,11 @@ import { dialHost } from './service.js';
  *    `/health` gives any answer but a refused connection (a timeout
  *    included), or its ledger is held open (SQLite's own lock, which the
  *    service holds while it runs; it keeps no pid file). It checks again
- *    after the confirmation, immediately before the first change, and holds
- *    the ledger's lock until it is done, so a service cannot start under it;
+ *    after the confirmation, immediately before the first change, and from
+ *    then until it is done holds its own lock file (`reset.lock`, which it
+ *    never deletes and under which the service's ledger refuses to open)
+ *    and the ledger's lock, deleting the ledger last, so a service cannot
+ *    start under it;
  * 2. lists what it will do;
  * 3. with `--yes`, or a confirmation at the terminal:
  *    - removes every GC lane with `git worktree remove --force --force` in
@@ -42,23 +46,27 @@ import { dialHost } from './service.js';
  *      and `refs/gru/*` only with `--delete-refs`;
  *    - deletes the data directory's contents except `config.toml`, the
  *      install's own files ({@link RESET_KEEPS}) and any worktree of the
- *      user's in it, keeping the directory. The delete never follows a link:
- *      a link is deleted as a link.
+ *      user's in it at any depth (with the folders that lead to it, and its
+ *      repository when that is in the data directory too), keeping the
+ *      directory; the ledger goes last. The delete never follows a link: a
+ *      link is deleted as a link.
  *
  * It prints what it removed. It never touches the user's own branches,
- * worktrees or files: a data directory (as the filesystem resolves it) that
- * is or holds the home directory, the filesystem root, the workspace or a
- * managed repository, or that holds the install or lies inside it, is
- * refused; a lane that is not removed leaves the data directory as it was.
+ * worktrees or files: a data directory (as the filesystem resolves it, in
+ * its canonical letter case) that is or holds the home directory, the
+ * filesystem root, the workspace or a managed repository, or that holds the
+ * install or lies inside it, is refused; a lane that is not removed leaves
+ * the data directory as it was.
  */
 
 /** What reset keeps in the data directory: the config, and the install's
  * own files (the instance identity, provider credentials, the Perkins
- * GitHub App bundle, the installer's consent and wizard draft, and the
- * service unit's own log files). A kept path's folders are kept too; what
- * else they hold is deleted. */
+ * GitHub App bundle, the installer's consent and wizard draft, the service
+ * unit's own log files, and reset's own lock file). A kept path's folders
+ * are kept too; what else they hold is deleted. */
 export const RESET_KEEPS: readonly string[] = [
   'config.toml',
+  RESET_LOCK_FILE,
   'identity',
   'credentials',
   'perkins',
@@ -210,11 +218,12 @@ export async function runResetCli(argv: readonly string[], overrides: Partial<Re
     return 1;
   }
 
-  // The data directory as the filesystem resolves it: every check, and the
-  // delete, use this one path.
+  // The data directory as the filesystem resolves it, in its canonical
+  // letter case (a case-insensitive volume answers to any spelling): every
+  // check, and the delete, use this one path.
   let realData: string | null;
   try {
-    realData = existsSync(config.dataDir) ? realpathSync(config.dataDir) : null;
+    realData = existsSync(config.dataDir) ? realpathSync.native(config.dataDir) : null;
   } catch (error) {
     deps.stderr(`gru-service reset: refused: the data directory ${config.dataDir} cannot be resolved: ${String((error as Error).message)}`);
     return 1;
@@ -283,23 +292,69 @@ export async function runResetCli(argv: readonly string[], overrides: Partial<Re
     }
   }
 
-  // Again, immediately before the first change: the service may have
-  // started while reset waited. The ledger's lock is held until reset ends.
-  const again = await serviceRunning(config, deps);
-  if (again !== null) {
-    deps.stderr(`gru-service reset: refused: ${again} (checked again before changing anything; nothing changed). ${STOP_HINT}`);
-    return 1;
-  }
-  const lock = await lockLedger(realData);
-  if (lock.kind === 'held') {
-    deps.stderr(`gru-service reset: refused: ${lock.detail} (checked again before changing anything; nothing changed). ${STOP_HINT}`);
+  // From here until reset ends it holds its own lock file, under which a
+  // starting service's ledger refuses to open.
+  const own = await lockReset(realData);
+  if (own.kind === 'held') {
+    deps.stderr(`gru-service reset: refused: ${own.detail} (nothing changed)`);
     return 1;
   }
   try {
-    return carryOut(deps, config, realData, repos, others, data);
+    // Again, immediately before the first change: the service may have
+    // started while reset waited. The ledger's lock is held until reset ends.
+    const again = await serviceRunning(config, deps);
+    if (again !== null) {
+      deps.stderr(`gru-service reset: refused: ${again} (checked again before changing anything; nothing changed). ${STOP_HINT}`);
+      return 1;
+    }
+    const lock = await lockLedger(realData);
+    if (lock.kind === 'held') {
+      deps.stderr(`gru-service reset: refused: ${lock.detail} (checked again before changing anything; nothing changed). ${STOP_HINT}`);
+      return 1;
+    }
+    try {
+      return carryOut(deps, config, realData, repos, others, data);
+    } finally {
+      if (lock.kind === 'locked') lock.release();
+    }
   } finally {
-    if (lock.kind === 'locked') lock.release();
+    own.release();
   }
+}
+
+/**
+ * Reset's own lock (`<data dir>/reset.lock`, {@link RESET_LOCK_FILE}): a
+ * SQLite file locked exclusively, which reset keeps and never deletes, so
+ * the lock lasts until `release` however the data directory empties. The
+ * service's ledger refuses to open while it is held. `held` when another
+ * reset holds it, or it cannot be locked; no lock without a data directory.
+ */
+async function lockReset(realData: string | null): Promise<{ readonly kind: 'held'; readonly detail: string } | { readonly kind: 'locked'; readonly release: () => void }> {
+  if (realData === null) return { kind: 'locked', release: () => {} };
+  const file = join(realData, RESET_LOCK_FILE);
+  const { DatabaseSync } = await import('node:sqlite');
+  let db: InstanceType<typeof DatabaseSync> | null = null;
+  try {
+    // A service probing the file holds it for a moment: wait that out.
+    db = new DatabaseSync(file, { timeout: 2_000 });
+    db.exec('PRAGMA locking_mode = EXCLUSIVE');
+    // No journal file beside it: nothing for the delete to meet.
+    db.exec('PRAGMA journal_mode = MEMORY');
+    db.exec('BEGIN EXCLUSIVE');
+    db.exec('CREATE TABLE IF NOT EXISTS reset_lock (held INTEGER)');
+    db.exec('COMMIT');
+  } catch (error) {
+    try { db?.close(); } catch { /* the lock's error is the one to report */ }
+    const code = (error as { readonly errcode?: unknown }).errcode;
+    return {
+      kind: 'held',
+      detail: code === SQLITE_BUSY || code === SQLITE_LOCKED
+        ? `another gru-service reset holds ${file}`
+        : `reset's lock file ${file} cannot be locked (${(error as Error).message}); if no other gru-service reset runs, delete it and run reset again`,
+    };
+  }
+  const held = db;
+  return { kind: 'locked', release: () => { try { held.close(); } catch { /* closed already */ } } };
 }
 
 function carryOut(
@@ -437,7 +492,7 @@ const SQLITE_NOTADB = 26;
  */
 async function lockLedger(realData: string | null): Promise<LedgerProbe> {
   if (realData === null) return { kind: 'absent' };
-  const file = join(realData, 'ledger', 'ledger.db');
+  const file = join(realData, LEDGER_DIR, 'ledger.db');
   if (!existsSync(file)) return { kind: 'absent' };
   // Loaded only here: `gru-service roll` never touches the ledger.
   const { DatabaseSync } = await import('node:sqlite');
@@ -494,13 +549,15 @@ function within(outer: string, inner: string): boolean {
 }
 
 /** A path as the filesystem resolves it: its nearest existing ancestor
- * resolved, the rest as spelled. */
+ * resolved, in its canonical letter case (`realpath(3)`: on a
+ * case-insensitive volume `WORKSPACE` and `workspace` are one folder, and
+ * only the canonical spelling compares as one), the rest as spelled. */
 function real(path: string): string {
   const missing: string[] = [];
   let at = resolve(path);
   for (;;) {
     try {
-      return join(realpathSync(at), ...[...missing].reverse());
+      return join(realpathSync.native(at), ...[...missing].reverse());
     } catch {
       const parent = dirname(at);
       if (parent === at) return resolve(path);
@@ -534,7 +591,7 @@ function gcLane(ctx: PlanContext, tree: string, facts: { readonly branch: string
   if (admin === null) return false;
   try {
     const receipt = JSON.parse(readFileSync(join(admin, 'gru-creation-handoff.json'), 'utf-8')) as { readonly path?: unknown };
-    return receipt.path === resolved;
+    return typeof receipt.path === 'string' && real(receipt.path) === resolved;
   } catch {
     return false;
   }
@@ -590,10 +647,11 @@ function planRepo(name: string, path: string, ctx: PlanContext, options: ResetOp
 /**
  * The lanes no managed repository lists (#427 PR 2b review): linked
  * worktrees (a `.git` FILE) under the lanes root (two levels deep) or in the
- * data directory (three), and the registry's lanes not yet swept. Each is
- * read from its own `.git` file, never through git:
+ * data directory (at any depth), and the registry's lanes not yet swept.
+ * Each is read from its own `.git` file, never through git:
  * - registered in an existing repository (an administration there points
- *   back at it): a GC lane is removed there; any other is the user's, kept;
+ *   back at it): a GC lane is removed there; any other is the user's, kept,
+ *   and so is its repository when that lies in the data directory;
  * - otherwise, a lane GC made (the registry names it, or it has a lane's
  *   place under the lanes root) is removed from the repository the registry
  *   records when that one lists it; else its folder is deleted when its
@@ -610,7 +668,7 @@ function planOtherLanes(ctx: PlanContext): OtherLanes {
     if (!ctx.listed.has(resolved) && !candidates.has(resolved)) candidates.set(resolved, path);
   };
   for (const root of ctx.laneRoots) for (const tree of linkedTrees(root, 2)) add(tree);
-  if (ctx.realData !== null) for (const tree of linkedTrees(ctx.realData, 3)) add(tree);
+  if (ctx.realData !== null) for (const tree of linkedTrees(ctx.realData)) add(tree);
   const registered = [...new Set(ctx.registry.values())];
   for (const lane of registered) if (existsSync(lane.path)) add(lane.path);
   const lanes: LanePlan[] = [];
@@ -632,13 +690,19 @@ function planOtherLanes(ctx: PlanContext): OtherLanes {
     return listings.get(lane.repoPath)?.has(resolved) === true ? lane.repoPath : null;
   };
   const keep = (resolved: string): void => {
-    if (ctx.realData !== null && within(ctx.realData, resolved)) ctx.protect.add(resolved);
+    if (ctx.realData !== null && resolved !== ctx.realData && within(ctx.realData, resolved)) ctx.protect.add(resolved);
   };
   for (const [resolved, tree] of [...candidates].sort(([a], [b]) => a.localeCompare(b))) {
     const link = linkedTree(tree);
     if (!('problem' in link) && link.admin !== null && link.common !== null) {
-      if (gcLane(ctx, tree, { ...adminFacts(link.admin), admin: link.admin })) lanes.push({ path: tree, at: ['--git-dir', link.common], repo: link.common });
-      else keep(resolved);
+      if (gcLane(ctx, tree, { ...adminFacts(link.admin), admin: link.admin })) {
+        lanes.push({ path: tree, at: ['--git-dir', link.common], repo: link.common });
+      } else {
+        keep(resolved);
+        // Its repository too, when it is in the data directory: the
+        // checkout around a `.git` directory, or a bare repository.
+        keep(real(basename(link.common) === '.git' ? dirname(link.common) : link.common));
+      }
       continue;
     }
     if (!ctx.registry.has(tree) && !ctx.registry.has(resolved) && !laneShaped(ctx, resolved)) {
@@ -659,10 +723,11 @@ function planOtherLanes(ctx: PlanContext): OtherLanes {
   return { lanes, left };
 }
 
-/** Real folders (never links) up to `depth` levels under `root` whose
- * `.git` is a file: linked worktrees. Their insides, and a folder holding a
- * repository's own `.git`, are not searched. */
-function linkedTrees(root: string, depth: number): string[] {
+/** Real folders (never links) up to `depth` levels under `root` (any
+ * depth by default) whose `.git` is a file: linked worktrees. Their insides
+ * and git directories (a `.git` folder, a bare repository) are not searched;
+ * every other folder is, those holding a repository's own `.git` included. */
+function linkedTrees(root: string, depth = Number.POSITIVE_INFINITY): string[] {
   const found: string[] = [];
   const walk = (dir: string, level: number): void => {
     let names: string[];
@@ -673,15 +738,15 @@ function linkedTrees(root: string, depth: number): string[] {
     }
     for (const name of names) {
       const path = join(dir, name);
-      let gitKind: 'file' | 'other' | 'none' = 'none';
+      let linked = false;
       try {
-        if (!lstatSync(path).isDirectory()) continue;
-        gitKind = lstatSync(join(path, '.git')).isFile() ? 'file' : 'other';
+        if (!lstatSync(path).isDirectory() || name === '.git') continue;
+        linked = lstatSync(join(path, '.git')).isFile();
       } catch {
         // not a folder, or no .git in it
       }
-      if (gitKind === 'file') found.push(path);
-      else if (gitKind === 'none' && level < depth) walk(path, level + 1);
+      if (linked) found.push(path);
+      else if (level < depth && !gitDirectory(path)) walk(path, level + 1);
     }
   };
   try {
@@ -784,7 +849,9 @@ function gitDirectory(dir: string): boolean {
 
 /** The data directory's entries to delete (relative paths) and those kept:
  * {@link RESET_KEEPS} and the user's worktrees in it, with the folders that
- * lead to them. */
+ * lead to them. The ledger is deleted last, after every other entry, so
+ * the ledger's lock reset holds keeps excluding a service for as long as
+ * the slow deletes run. */
 function planDataDir(realData: string | null, protect: ReadonlySet<string>): { readonly remove: readonly string[]; readonly keep: readonly string[] } {
   const remove: string[] = [];
   const keep: string[] = [];
@@ -805,8 +872,11 @@ function planDataDir(realData: string | null, protect: ReadonlySet<string>): { r
     }
   };
   walk('');
-  return { remove, keep };
+  return { remove: [...remove.filter((entry) => entry !== LEDGER_DIR), ...remove.filter((entry) => entry === LEDGER_DIR)], keep };
 }
+
+/** The ledger's folder in the data directory. */
+const LEDGER_DIR = 'ledger';
 
 /** Delete a path without ever following a link: a folder (by lstat) is
  * emptied and removed, anything else (a link included) is unlinked. */
