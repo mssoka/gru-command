@@ -119,7 +119,8 @@ export interface ExpirableReviews {
   readonly jobId: string;
   readonly rounds: readonly string[];
   readonly fallbackGates: readonly string[];
-  /** Each folder's path, rounds first. */
+  /** What expiry deletes, rounds first: each folder, or for a round folder
+   * holding a kept file ({@link REVIEW_KEPT_FILES}) its other entries. */
   readonly paths: readonly string[];
 }
 
@@ -235,8 +236,9 @@ export class ExpiryService {
 
   /** The review folders of every job terminal for at least `olderThanMs`
    * (default {@link REVIEW_EXPIRY_MS}), by job: what {@link expireReviews}
-   * deletes. An open job's folders, a job whose end cannot be read, and the
-   * folders of a round or job the ledger does not know are never listed.
+   * deletes. An open job's folders, a job whose end cannot be read, the
+   * folders of a round or job the ledger does not know, and a round folder
+   * holding nothing but its kept files (expired before) are never listed.
    * The disk budget (#427 PR 3) lists them with no wait (`olderThanMs: 0`). */
   expirableReviews(opts: { readonly olderThanMs?: number } = {}): readonly ExpirableReviews[] {
     const olderThan = opts.olderThanMs ?? REVIEW_EXPIRY_MS;
@@ -259,11 +261,21 @@ export class ExpiryService {
     for (const [jobId, found] of byJob) {
       const since = this.terminalSince(jobId);
       if (since === null || this.now() - since < olderThan) continue;
+      const rounds: string[] = [];
+      const roundPaths: string[] = [];
+      for (const name of found.rounds) {
+        const folder = join(this.opts.reviewsRoot, name);
+        const entries = expiredEntries(folder, REVIEW_KEPT_FILES);
+        if (entries.length === 0) continue;
+        rounds.push(name);
+        roundPaths.push(...(entries.length === readdirOrEmpty(folder).length ? [folder] : entries.map((entry) => join(folder, entry))));
+      }
+      if (rounds.length + found.gates.length === 0) continue;
       expirable.push({
         jobId,
-        rounds: found.rounds,
+        rounds,
         fallbackGates: found.gates,
-        paths: [...found.rounds.map((name) => join(this.opts.reviewsRoot, name)), ...found.gates.map((name) => join(this.opts.reviewsRoot, 'fallback-gate', name))],
+        paths: [...roundPaths, ...found.gates.map((name) => join(this.opts.reviewsRoot, 'fallback-gate', name))],
       });
     }
     return expirable;

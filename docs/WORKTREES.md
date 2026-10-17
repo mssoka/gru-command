@@ -899,9 +899,10 @@ again, so a lane made right after a reclaim does not start another.
 2. **Delete the review folders of finished jobs**, without
    [§7](#7-expiry-moved-repositories-and-reset-427)'s 14-day wait, keeping what
    expiry keeps (an open job's folders, a round or job the ledger does not
-   know). A job with a review round pending or live keeps its folders. The
-   folders are listed once per pass, and a step deletes exactly the folders it
-   names, each checked again.
+   know, each round's `consolidated.json`). A job with a review round pending
+   or live keeps its folders, and a round folder holding nothing but its
+   `consolidated.json` is not listed again. The folders are listed once per
+   pass, and a step deletes exactly the folders it names, each checked again.
 3. **Slim idle lanes**, oldest idle first: any job or writer-child lane whose
    job is not `working` (or `dispatched`), with no minion turn holding or
    waiting for a worker slot, no verification, no provider wait, no live
@@ -918,8 +919,8 @@ that ran a step as `disk.reclaim-pass` (with how many releases it left for the
 next). A skip is recorded once per kind of reason: its numbers (a pid, a count)
 are left out, so a watcher that respawns under a new pid is not recorded
 again, and a different reason is. What a step freed is the walk of what it
-touched: a released lane's bytes less its preserve copy, the deleted review
-folders, a slimmed lane before and after. The service's shutdown waits up to
+touched: a released lane's bytes less its preserve copy, the review folders
+before and after, a slimmed lane before and after. The service's shutdown waits up to
 five seconds for a step in flight.
 
 **`reclaim_mode = "proposed"`** does none of that. GC posts one FOR YOU card

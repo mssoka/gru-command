@@ -1518,8 +1518,12 @@ export class DiskService {
         // Exactly the listed folders, each checked again (P1).
         const expired = await this.opts.expiry.expireJobReviews({ jobId: step.jobId, rounds: step.rounds, fallbackGates: step.fallbackGates }, { olderThanMs: 0 });
         if (expired === null) return skip('none of the listed review folders could be deleted (gone, no longer the job\'s, or the job is not finished)');
+        // Before less after: a round keeps its consolidated.json (#427 PR 2b).
         let freed = 0;
-        for (const { name, path, gate } of listed) if ((gate ? expired.fallbackGates : expired.rounds).includes(name)) freed += sizes.get(path) ?? 0;
+        for (const { name, path, gate } of listed) {
+          if (!(gate ? expired.fallbackGates : expired.rounds).includes(name)) continue;
+          freed += Math.max(0, (sizes.get(path) ?? 0) - (await this.usage(path)).bytes);
+        }
         return done(freed);
       }
       const lane = this.opts.ledger.getWorktree(step.lane);
@@ -1999,7 +2003,7 @@ export class DiskService {
 
 const STEP_PROMISE: Readonly<Record<ReclaimStep['step'], string>> = {
   release: 'Its uncommitted work is saved first (a snapshot ref and a preserve copy).',
-  'expire-reviews': 'The ledger keeps the verdicts and findings, and the PR the published review.',
+  'expire-reviews': 'The ledger keeps the verdicts and findings, the PR the published review, and each round folder its consolidated.json.',
   slim: 'Only the folders its manifest says setup recreates; setup restores them before its next turn.',
 };
 

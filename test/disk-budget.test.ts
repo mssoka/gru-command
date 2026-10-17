@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, 
 import { createServer, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { BoardEngine } from '../src/board/engine.js';
 import { loadConfig } from '../src/config.js';
@@ -34,7 +34,7 @@ import {
   MAX_RELEASES_PER_PASS,
   RELEASE_RETRY_MS,
 } from '../src/maintenance/disk.js';
-import { ExpiryService } from '../src/maintenance/expiry.js';
+import { ExpiryService, REVIEW_KEPT_FILES } from '../src/maintenance/expiry.js';
 import { ownerAttentionFor, requiresTypedDecision } from '../src/notifications/attention.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import type { JobWorkerTurns } from '../src/runtime/pacing.js';
@@ -200,8 +200,14 @@ function usageOf(h: Harness): (path: string) => Promise<{ bytes: number; sharedB
     }
     if (basename(path) === 'node_modules') return existsSync(path) ? 2 * GIB : 0;
     const reviews = join(h.dataDir, 'reviews');
-    if (path === reviews) return existsSync(reviews) ? readdirSync(reviews).filter((name) => name !== 'fallback-gate').length * (GIB / 2) : 0;
-    if (path.startsWith(`${reviews}/`)) return existsSync(path) ? GIB / 2 : 0;
+    // A round's kept files (its consolidated.json) weigh nothing here, so a
+    // round folder expiry has emptied weighs nothing either.
+    const kept = (name: string): boolean => REVIEW_KEPT_FILES.includes(name);
+    if (path === reviews) return existsSync(reviews) ? readdirSync(reviews).filter((name) => name !== 'fallback-gate' && bytesOf(join(reviews, name)) > 0).length * (GIB / 2) : 0;
+    if (path.startsWith(`${reviews}/`)) {
+      if (!existsSync(path) || kept(basename(path))) return 0;
+      return dirname(path) === reviews && basename(path) !== 'fallback-gate' && readdirSync(path).every(kept) ? 0 : GIB / 2;
+    }
     if (path === h.preserveRoot) return readdirSync(h.preserveRoot).length * h.preserveCopyBytes;
     if (path.startsWith(`${h.preserveRoot}/`)) return h.preserveCopyBytes;
     return 0;
@@ -346,8 +352,15 @@ function reviewFolder(h: Harness, jobId: string, opts: { readonly onDisk?: boole
 }
 
 function writeReviewFolder(h: Harness, round: string): void {
-  mkdirSync(join(h.dataDir, 'reviews', round), { recursive: true });
+  mkdirSync(join(h.dataDir, 'reviews', round, 'pass-1'), { recursive: true });
+  writeFileSync(join(h.dataDir, 'reviews', round, 'pass-1', 'transcript.jsonl'), '{}\n');
   writeFileSync(join(h.dataDir, 'reviews', round, 'consolidated.json'), '{}\n');
+}
+
+/** What is left of a round folder on disk. */
+function reviewEntries(h: Harness, round: string): readonly string[] {
+  const folder = join(h.dataDir, 'reviews', round);
+  return existsSync(folder) ? readdirSync(folder).sort() : [];
 }
 
 function events(h: Harness, kind: string): readonly EventRecord[] {
@@ -631,7 +644,8 @@ describe('disk budget, automatic (#427 PR 3)', () => {
     expect(git(h.repo.path, ['show', `${ref}:.gitignore`])).toContain('an-edit');
     const [stamp] = readdirSync(join(h.preserveRoot, 'job-done-b'));
     expect(readdirSync(join(h.preserveRoot, 'job-done-b', stamp!))).toContain('notes.txt');
-    expect(existsSync(join(h.dataDir, 'reviews', round))).toBe(false);
+    // The round keeps its consolidated.json, as expiry keeps it (#427 PR 2b).
+    expect(reviewEntries(h, round)).toEqual(['consolidated.json']);
     expect(events(h, 'reviews.expired').map((event) => event.jobId)).toEqual(['job-done-b']);
     expect(existsSync(join(idle['job-idle-d']!, 'node_modules'))).toBe(false);
     expect(h.manager.isSlim('job-idle-d')).toBe(true);
@@ -648,7 +662,8 @@ describe('disk budget, automatic (#427 PR 3)', () => {
     expect(steps(h)).toHaveLength(7);
 
     // Over again (30.5 GB): the refusing lane's watcher respawned under a new
-    // pid, the same kind of reason, so it is not recorded again; the next
+    // pid, the same kind of reason, so it is not recorded again; the round
+    // that holds only its consolidated.json is not listed again; the next
     // oldest idle lanes are slimmed down to 26.5 GB.
     h.processes.set(doneA, [{ pid: 4243, command: 'node server.js', evidence: 'cwd' }]);
     h.fixed.set(join(h.dataDir, 'ledger'), 20 * GIB);
@@ -969,7 +984,7 @@ describe('disk budget, proposed (#427 PR 3)', () => {
     expect(card.decision?.options.map((option) => option.id)).toEqual(['accept', 'decline']);
     expect(card.detail).toContain(`GC uses 32.5 GB under ${h.dataDir}, over its 30.0 GB budget`);
     expect(card.detail).toContain('1. Release lane job-done (job lane of job job-done, done, in disk-app): about 1.0 GB.');
-    expect(card.detail).toContain(`2. Delete the 1 review folder of job job-done (done): ${round}: about 512.0 MB.`);
+    expect(card.detail).toContain(`2. Delete the 1 review folder of job job-done (done): ${round}: about 512.0 MB. The ledger keeps the verdicts and findings, the PR the published review, and each round folder its consolidated.json.`);
     expect(card.detail).toContain('3. Slim lane job-idle-old (node_modules) (job job-idle-old, delivered,');
     expect(card.detail).toContain('4. Slim lane job-idle-new (node_modules) (job job-idle-new, delivered,');
     expect(card.detail).toContain('stops once GC is at most 90% of its budget');
@@ -985,7 +1000,7 @@ describe('disk budget, proposed (#427 PR 3)', () => {
     expect(open(h, DISK_RECLAIM_KIND)).toHaveLength(1);
     expect(events(h, DISK_EVENTS.step)).toEqual([]);
     expect(existsSync(done)).toBe(true);
-    expect(existsSync(join(h.dataDir, 'reviews', round))).toBe(true);
+    expect(reviewEntries(h, round)).toEqual(['consolidated.json', 'pass-1']);
 
     // Folders the card never listed appear before the Accept: one of
     // job-done's own, and job-other's.
@@ -999,10 +1014,10 @@ describe('disk budget, proposed (#427 PR 3)', () => {
       ['release', 'job-done', 'done'], ['expire-reviews', 'job-done', 'done'], ['slim', 'job-idle-old', 'done'], ['slim', 'job-idle-new', 'done'],
     ]);
     expect(existsSync(done)).toBe(false);
-    expect(existsSync(join(h.dataDir, 'reviews', round))).toBe(false);
-    // Only the listed folder was deleted: job-done's later one is kept, and so is job-other's.
-    expect(existsSync(join(h.dataDir, 'reviews', later))).toBe(true);
-    expect(existsSync(join(h.dataDir, 'reviews', otherRound))).toBe(true);
+    expect(reviewEntries(h, round)).toEqual(['consolidated.json']);
+    // Only the listed folder was expired: job-done's later one is kept, and so is job-other's.
+    expect(reviewEntries(h, later)).toEqual(['consolidated.json', 'pass-1']);
+    expect(reviewEntries(h, otherRound)).toEqual(['consolidated.json', 'pass-1']);
     expect(events(h, 'reviews.expired').map((event) => [event.jobId, payloadOf(event)['rounds']])).toEqual([['job-done', [round]]]);
     expect(existsSync(join(older, 'node_modules'))).toBe(false);
     expect(existsSync(join(newer, 'node_modules'))).toBe(false);
