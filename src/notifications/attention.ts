@@ -48,6 +48,9 @@ const OWNER_REQUIRED_KINDS: readonly string[] = [
   // Onboarding heists (#427): onboarding mode = "proposed" puts each managed
   // repository whose origin has no manifest in FOR YOU for Accept or Decline.
   'onboarding.proposal',
+  // Intake slicing (#429): a planning minion's sliced plan, with any source
+  // conflicts first, is the owner's to review in intake.
+  'intake.slicing-result',
 ];
 
 /** Kinds that are always owner-facing, prefix match (dynamic suffixes,

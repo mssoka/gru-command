@@ -4,6 +4,7 @@ import { TextDecoder } from 'node:util';
 import { defaultGhRunner, ghApiJson, GhRateLimitedError, type GhCommandRunner } from '../dispatch/github-poll.js';
 import { isGitHubRemote, repoRemote, type RepoRemote } from '../dispatch/review-path.js';
 import { readServiceUploadIdentity } from '../review-inputs/evidence.js';
+import { BREAKDOWN_FILE, documentName, isArchitectureSnapshot, isBreakdownLocator, parseBreakdown, referencedArchitecture } from './breakdown.js';
 import { digest, IntakeError, type Capture, type DocumentInput, type Gap, type IntakeSource, type Snapshot } from './types.js';
 
 export const INTAKE_MAX_SOURCE_BYTES = 256 * 1024;
@@ -310,9 +311,11 @@ export async function captureSources(repo: string, source: IntakeSource, ports: 
       try {
         const location = documentLocation(repo, input, ports.uploadsDir);
         locator = location.locator;
-        if (!['.md', '.txt'].includes(extname(location.path).toLowerCase()) || (source.kind === 'bmad' && extname(location.path).toLowerCase() !== '.md')) fail('intake_document_type', 'specs require .md/.txt; BMAD source data requires .md');
+        // A BMAD v7 epic folder's breakdown is TOML data, never configuration.
+        const breakdown = source.kind === 'bmad' && isBreakdownLocator(location.locator);
+        if (!breakdown && (!['.md', '.txt'].includes(extname(location.path).toLowerCase()) || (source.kind === 'bmad' && extname(location.path).toLowerCase() !== '.md'))) fail('intake_document_type', `specs require .md/.txt; BMAD source data requires .md or the epic's ${BREAKDOWN_FILE}`);
         const raw = documentBytes(location.root, location.path);
-        const metadata = frontmatter(raw);
+        const metadata = breakdown ? { frontmatter: null, identifiers: {}, malformed: false, questions: [] } : frontmatter(raw);
         const snapshot: Snapshot = { id: `s${snapshots.length + 1}`, kind: source.kind, locator, revision: `sha256:${digest(raw)}`, sha256: digest(raw), raw, text: raw, frontmatter: metadata.frontmatter, identifiers: metadata.identifiers };
         snapshots.push(snapshot);
         for (const question of metadata.questions) addGap({ code: 'intake_identifying_metadata', locator, question });
@@ -322,7 +325,13 @@ export async function captureSources(repo: string, source: IntakeSource, ports: 
     }
     if (source.kind === 'bmad') {
       const capturedPaths = new Set(snapshots.filter((snapshot) => !snapshot.locator.startsWith('upload:')).map((snapshot) => snapshot.locator));
+      const breakdowns = snapshots.filter((snapshot) => isBreakdownLocator(snapshot.locator));
+      if (breakdowns.length > 1) addGap({ code: 'intake_malformed_breakdown', locator: breakdowns.map(({ locator }) => locator).join(', '), question: `One intake request slices one epic: supply exactly one ${BREAKDOWN_FILE}. Nothing was mapped from these breakdowns.` });
+      for (const snapshot of breakdowns) {
+        for (const problem of parseBreakdown(snapshot.text).problems) addGap({ code: problem.code, locator: snapshot.locator, question: `${problem.detail}. Correct the breakdown and preview again; no heist is mapped from it until then.` });
+      }
       for (const snapshot of snapshots) {
+        if (isBreakdownLocator(snapshot.locator)) continue;
         for (const { label, target } of storyReferences(snapshot.raw)) {
           try {
             const candidate = target === null ? null : storyPath(target, snapshot.locator);
@@ -334,6 +343,15 @@ export async function captureSources(repo: string, source: IntakeSource, ports: 
         }
       }
     }
+    // A referenced architecture binds every heist, so it must be captured
+    // with its exact bytes, never left as a path a minion may not have.
+    const architecture = new Set(snapshots.filter(isArchitectureSnapshot).map(({ locator }) => documentName(locator)));
+    const missing = new Map<string, string[]>();
+    for (const snapshot of snapshots) {
+      if (isArchitectureSnapshot(snapshot)) continue;
+      for (const name of referencedArchitecture(snapshot)) if (!architecture.has(name)) missing.set(name, [...(missing.get(name) ?? []), snapshot.locator]);
+    }
+    for (const [name, by] of missing) addGap({ code: 'intake_missing_architecture', locator: name, question: `${by.join(' and ')} ${by.length === 1 ? 'references' : 'reference'} the architecture document ${name}, which is not captured; its contents are unknown. Supply it as a supporting document so every heist carries its exact bytes.` });
   }
   // Conservative inventory: every nonblank line, including metadata/status,
   // stays traceable. Classification and satisfaction are never inferred.

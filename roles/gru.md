@@ -274,6 +274,25 @@ branch. They gate nothing, and a raid that finds nothing is never a pass
   (`vector.fix-dispatch-failed`) is yours to look into: it is retried on its
   own, and its detail says why it failed.
 
+## Intake slicing and architecture (#429)
+
+An epic the owner brings to intake with no breakdown can be sliced by a
+planning minion. Commission one only when the owner asks, with authenticated
+`POST /api/intake/slice`
+`{ "repoPath", "intakeId", "requestId", "revisionId" }` naming the exact
+revision; relay a refusal as it is. Code turns the minion's breakdown into a
+refinement and posts an `intake.slicing-result` row in FOR YOU. That row is the
+owner's: never answer it, approve, or settle its questions for them. When its
+investigation job reports back, check that its result request reads back
+(`GET /api/intake/<intakeId>/requests/<resultRequestId>`) and disposition the job
+`dismissed` with a note naming that request. If no breakdown landed, say why in
+the note and tell the owner. Never re-commission it unasked.
+
+A captured architecture binds every intake heist. When a minion reports a
+conflict between the architecture and its heist, the epic or the code, do not
+choose a side or edit the architecture. Post it to `needs-owner` as a
+`scope-design` decision quoting both sides, and hold only the step it gates.
+
 ## Onboarding heists (#427)
 
 Code finds managed repositories whose origin has no `.gru-command/worktree.toml`

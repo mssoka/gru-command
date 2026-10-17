@@ -7,6 +7,16 @@ export interface ReviewDecision {
   readonly revisionId: string;
   readonly expectedToken: string | null;
 }
+/** A commissioned planning minion and the request its sliced plan lands at (#429). */
+export interface SlicingCommission {
+  readonly repoPath: string;
+  readonly intakeId: string;
+  readonly requestId: string;
+  readonly revisionId: string;
+  readonly jobId: string;
+  readonly resultRequestId: string;
+  readonly dispatched: boolean;
+}
 export class IntakeClientError extends Error {
   constructor(readonly code: string, message: string, readonly readback?: IntakeReadback) { super(message); this.name = 'IntakeClientError'; }
 }
@@ -17,6 +27,7 @@ export class IntakeClient {
   review(request: ReviewDecision): Promise<IntakeReadback> { return this.post('/review', request); }
   reject(request: ReviewDecision): Promise<IntakeReadback> { return this.post('/reject', request); }
   approve(request: ReviewDecision & { readonly selected: readonly string[] }): Promise<IntakeReadback> { return this.post('/approve', request); }
+  slice(request: Omit<ReviewDecision, 'expectedToken'>): Promise<SlicingCommission> { return this.post('/slice', request); }
   read(repoPath: string, intakeId: string, requestId: string): Promise<Proposal> { return this.request(`/${encodeURIComponent(intakeId)}/requests/${encodeURIComponent(requestId)}?${new URLSearchParams({ repoPath })}`); }
   diff(repoPath: string, intakeId: string, from: string, to: string): Promise<unknown> { return this.request(`/${encodeURIComponent(intakeId)}/diff?${new URLSearchParams({ repoPath, from, to })}`); }
   readback(repoPath: string, intakeId: string, token?: string): Promise<IntakeReadback> { return this.request(`/${encodeURIComponent(intakeId)}/review?${new URLSearchParams({ repoPath, ...(token === undefined ? {} : { token }) })}`); }

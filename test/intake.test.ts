@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { chmodSync, cpSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { IntakeService, INTAKE_HELPER, type IntakeServiceOptions } from '../src/intake/service.js';
 import * as reviewPath from '../src/dispatch/review-path.js';
@@ -11,7 +11,8 @@ import { captureSources } from '../src/intake/sources.js';
 import { createManagedRepoIntakeResolver, managedRepoPathsForIntake, resolveManagedRepoPath } from '../src/repos/managed-names.js';
 import { canonical, boundedCanonical, INTAKE_MAX_JSON_NESTING, digest, type IntakeRequest, type Plan, type Proposal } from '../src/intake/types.js';
 import { loadBundledWorkflowRuntime, writeWorkflowManifest } from '../src/workflows/runtime.js';
-import { parseWorkflowManifest, WORKFLOW_MANIFEST } from '../src/workflows/manifest.js';
+import { parseWorkflowManifest, verifyWorkflowFiles, WORKFLOW_MANIFEST } from '../src/workflows/manifest.js';
+import { SLICING_HELPER } from '../src/intake/slicing.js';
 
 const roots: string[] = [];
 afterEach(() => { vi.unstubAllEnvs(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -691,6 +692,27 @@ describe('owned packaged intake workflow', () => {
     expect(parseWorkflowManifest(JSON.stringify(manifest), 'historical').id).toBe(manifest.id);
     expect(() => loadBundledWorkflowRuntime(pkg)).toThrow('required intake helper');
     expect(() => writeWorkflowManifest(pkg)).toThrow('required intake helper');
+  });
+  it('requires the slicing helper (#429) for current packages while an earlier package without it still verifies', () => {
+    const h = fixture();
+    const root = join(h.root, 'previous', 'resources', 'gc-workflows');
+    mkdirSync(dirname(root), { recursive: true });
+    cpSync('resources/gc-workflows', root, { recursive: true });
+    rmSync(join(root, SLICING_HELPER));
+    const intakeHelper = join(root, INTAKE_HELPER);
+    writeFileSync(intakeHelper, readFileSync(intakeHelper, 'utf8').replace('[[gc-resource:skills/gc-build/slice.md]]', 'the GC slicing helper'));
+    const manifest = JSON.parse(readFileSync(join(root, WORKFLOW_MANIFEST), 'utf8'));
+    delete manifest.files[SLICING_HELPER];
+    Object.assign(manifest, { version: 1, id: 'gru-command-workflows@1' });
+    manifest.files[INTAKE_HELPER] = digest(readFileSync(intakeHelper));
+    writeFileSync(join(root, WORKFLOW_MANIFEST), JSON.stringify(manifest));
+    // A lane bound to the earlier package validates it by its own manifest.
+    const parsed = parseWorkflowManifest(JSON.stringify(manifest), 'historical');
+    const files = new Map(Object.keys(manifest.files).map((path) => [path, readFileSync(join(root, path))]));
+    expect(() => verifyWorkflowFiles(parsed, files)).not.toThrow();
+    expect(parsed.id).toBe('gru-command-workflows@1');
+    expect(() => loadBundledWorkflowRuntime(join(h.root, 'previous'))).toThrow('required slicing helper');
+    expect(() => writeWorkflowManifest(join(h.root, 'previous'))).toThrow('required slicing helper');
   });
 });
 

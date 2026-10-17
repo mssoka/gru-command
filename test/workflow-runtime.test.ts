@@ -42,7 +42,7 @@ function textAt(snapshot: string, name: string): string { return readFileSync(jo
 describe('GC-owned workflow resources', () => {
   it('has a GC identity, ordinary local integrity, license/attribution and its own build verifier', () => {
     const bundle = loadBundledWorkflowRuntime(repoRoot);
-    expect(bundle.id).toBe('gru-command-workflows@1');
+    expect(bundle.id).toBe('gru-command-workflows@2');
     expect(bundle.manifest).not.toHaveProperty('upstream');
     expect(bundle.manifest).not.toHaveProperty('customization');
     expect(bundle.files.get('LICENSE')!.toString()).toContain('MIT License');
@@ -63,9 +63,9 @@ describe('GC-owned workflow resources', () => {
     appendFileSync(join(root, WORKFLOW_RESOURCE_DIR, 'scripts/render.mjs'), '\n// GC-maintained helper change.\n');
     expect(() => loadBundledWorkflowRuntime(root)).toThrow(/does not match its sha256/u);
     const lines: string[] = [];
-    runWorkflowRuntimeCli(['manifest', root, '--version', '2'], (line) => lines.push(line));
+    runWorkflowRuntimeCli(['manifest', root, '--version', '3'], (line) => lines.push(line));
     const after = loadBundledWorkflowRuntime(root);
-    expect(after.id).toBe('gru-command-workflows@2');
+    expect(after.id).toBe('gru-command-workflows@3');
     expect(after.contentSha256).not.toBe(before.contentSha256);
     expect(lines[0]).toContain('owned local resources');
     const invocation = renderWorkflow(materializeBmadRuntime(after, temp()), fixture());
@@ -241,13 +241,13 @@ describe('GC-owned workflow resources', () => {
     git(context.projectRoot, ['worktree', 'add', '-qb', 'two', two]);
     const store = temp();
     const rootB = packageCopy();
-    writeWorkflowManifest(rootB, 2);
+    writeWorkflowManifest(rootB, 3);
     const bindA = createWorkflowRuntimeBinder(store, repoRoot);
     const bindB = createWorkflowRuntimeBinder(store, rootB);
     const a = bindA(one);
     expect(bindB(one)).toEqual(a);
-    expect(bindB(two).runtimeId).toBe('gru-command-workflows@2');
-    expect(a).toMatchObject({ source: WORKFLOW_SOURCE, runtimeId: 'gru-command-workflows@1', laneBound: true });
+    expect(bindB(two).runtimeId).toBe('gru-command-workflows@3');
+    expect(a).toMatchObject({ source: WORKFLOW_SOURCE, runtimeId: 'gru-command-workflows@2', laneBound: true });
     const originalRecord = readFileSync(join(git(one, ['rev-parse', '--path-format=absolute', '--git-dir']), 'gru-command/bmad-runtime.json'), 'utf-8');
     rmSync(a.root, { recursive: true });
     expect(() => bindB(one)).toThrow(/never switches runtimes/u);
@@ -274,7 +274,7 @@ describe('GC-owned workflow resources', () => {
     const store = temp();
     const a = loadBundledWorkflowRuntime(repoRoot);
     const rootB = packageCopy();
-    writeWorkflowManifest(rootB, 2);
+    writeWorkflowManifest(rootB, 3);
     const b = loadBundledWorkflowRuntime(rootB);
     const result = bindWorkflowRuntime(lane, { storeRoot: store, bundled: () => b,
       beforePublish: () => { bindWorkflowRuntime(lane, { storeRoot: store, bundled: () => a }); } });
@@ -321,12 +321,12 @@ describe('GC-owned workflow resources', () => {
       expect(existsSync(valid.artifactRoot)).toBe(false);
     }
     const packageB = packageCopy();
-    writeWorkflowManifest(packageB, 2);
+    writeWorkflowManifest(packageB, 3);
     writeFileSync(file, JSON.stringify(valid));
     const output: string[] = [];
     runWorkflowRuntimeCli(['render', '--context', file, '--store', store, '--package-root', packageB], (line) => output.push(line));
-    expect(JSON.parse(output[0]!)).toMatchObject({ runtimeId: 'gru-command-workflows@2' });
-    expect(JSON.parse(readFileSync(bindingFile, 'utf-8'))).toMatchObject({ runtime_id: 'gru-command-workflows@2' });
+    expect(JSON.parse(output[0]!)).toMatchObject({ runtimeId: 'gru-command-workflows@3' });
+    expect(JSON.parse(readFileSync(bindingFile, 'utf-8'))).toMatchObject({ runtime_id: 'gru-command-workflows@3' });
   });
 
   it('CLI invocation validates a bound lane under retained A, not the installed B validator', () => {
@@ -344,18 +344,18 @@ describe('GC-owned workflow resources', () => {
       runWorkflowRuntimeCli(['render', '--context', file, '--store', store, '--package-root', packageRoot], (line) => output.push(line));
       return JSON.parse(output[0]!) as { runtimeId: string };
     };
-    expect(invoke(repoRoot).runtimeId).toBe('gru-command-workflows@1');
+    expect(invoke(repoRoot).runtimeId).toBe('gru-command-workflows@2');
     const bindingFile = join(git(lane, ['rev-parse', '--path-format=absolute', '--git-dir']), 'gru-command/bmad-runtime.json');
     const original = readFileSync(bindingFile, 'utf-8');
     rmSync((JSON.parse(original) as { runtime_dir: string }).runtime_dir, { recursive: true });
-    expect(invoke(repoRoot).runtimeId).toBe('gru-command-workflows@1'); // identical-byte restoration after validation
+    expect(invoke(repoRoot).runtimeId).toBe('gru-command-workflows@2'); // identical-byte restoration after validation
     expect(readFileSync(bindingFile, 'utf-8')).toBe(original);
     const packageB = packageCopy();
     const validator = join(packageB, WORKFLOW_RESOURCE_DIR, 'scripts/context.mjs');
     writeFileSync(validator, readFileSync(validator, 'utf-8').replace('export function validateContext(raw, protectedRoots = []) {',
       'export function validateContext(raw, protectedRoots = []) {\n  if (raw?.projectId === "legacy") throw new Error("B rejects legacy");'));
-    writeWorkflowManifest(packageB, 2);
-    expect(invoke(packageB).runtimeId).toBe('gru-command-workflows@1');
+    writeWorkflowManifest(packageB, 3);
+    expect(invoke(packageB).runtimeId).toBe('gru-command-workflows@2');
     expect(readFileSync(bindingFile, 'utf-8')).toBe(original);
     const next = { ...valid, worktreeRoot: fresh, knowledgeRoot: join(fresh, 'gru-output'), artifactRoot: join(temp(), 'new-job') };
     writeFileSync(file, JSON.stringify(next));
@@ -364,7 +364,7 @@ describe('GC-owned workflow resources', () => {
     expect(existsSync(next.artifactRoot)).toBe(false);
     rmSync(join(packageB, WORKFLOW_RESOURCE_DIR), { recursive: true });
     writeFileSync(file, JSON.stringify(valid));
-    expect(invoke(packageB).runtimeId).toBe('gru-command-workflows@1'); // no current bundle available
+    expect(invoke(packageB).runtimeId).toBe('gru-command-workflows@2'); // no current bundle available
   });
 
   it('the explicit render CLI records the bound workflow and rejects incomplete/unknown arguments', () => {
@@ -373,7 +373,7 @@ describe('GC-owned workflow resources', () => {
     writeFileSync(file, JSON.stringify(context));
     const lines: string[] = [];
     runWorkflowRuntimeCli(['render', '--context', file, '--store', temp(), '--package-root', repoRoot, '--route', 'small-change'], (line) => lines.push(line));
-    expect(JSON.parse(lines[0]!)).toMatchObject({ runtimeId: 'gru-command-workflows@1' });
+    expect(JSON.parse(lines[0]!)).toMatchObject({ runtimeId: 'gru-command-workflows@2' });
     for (const args of [[], ['verify', '--bogus'], ['manifest', repoRoot, '--version', '0'], ['render', '--context', file], ['render', '--unknown', 'x']]) {
       expect(() => runWorkflowRuntimeCli(args, () => {})).toThrow(/usage:/u);
     }

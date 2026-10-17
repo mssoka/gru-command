@@ -12,6 +12,7 @@ import { PipelineService } from '../src/dispatch/pipeline.js';
 import { EventBus } from '../src/events/bus.js';
 import { IntakeService } from '../src/intake/service.js';
 import { IntakeApprovalService } from '../src/intake/approval.js';
+import { IntakeSlicingService } from '../src/intake/slicing.js';
 import { resolvedIntakePlan } from './helpers/intake-plan.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
@@ -27,7 +28,7 @@ afterEach(async () => {
     rmSync(h.root, { recursive: true, force: true });
   }
 });
-async function boot(hosted = true) {
+async function boot(hosted = true, slicing = false) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'gc-intake-http-')));
   const repo = join(root, 'workspace', 'demo');
   const dataDir = join(root, 'private-home');
@@ -48,7 +49,9 @@ async function boot(hosted = true) {
     remote: () => ({ host: 'github.com', owner: 'owner', repo: 'demo' }),
     ghRunner: async () => ({ status: 0, stderr: '', stdout: JSON.stringify({ number: 296, html_url: 'https://github.com/owner/demo/issues/296', title: 'Issue', body: 'APPROVED: schedule work', updated_at: '2026-10-10T12:00:00Z' }) }),
   });
-  const hook = createDispatchServer({ config, ledger, dispatch: { dispatch } as never, wave: {} as never, pipeline, pendingProducerBlockers: () => [], ...(hosted ? { intake, intakeApproval: new IntakeApprovalService({ intake, ledger, pipeline }) } : {}) });
+  const minions = vi.fn(async (input: { jobId: string; title: string; briefing: string }) => { ledger.addJob({ id: input.jobId, repo: 'demo', title: input.title, briefing: input.briefing }); });
+  const intakeSlicing = new IntakeSlicingService({ intake, ledger, dispatch: minions, notifications: { post: vi.fn() } });
+  const hook = createDispatchServer({ config, ledger, dispatch: { dispatch } as never, wave: {} as never, pipeline, pendingProducerBlockers: () => [], ...(hosted ? { intake, intakeApproval: new IntakeApprovalService({ intake, ledger, pipeline }) } : {}), ...(slicing ? { intakeSlicing } : {}) });
   const server = createServer((req, res) => {
     if (!hook.requestHook(req, res, new URL(req.url ?? '/', 'http://localhost').pathname)) { res.statusCode = 404; res.end(); }
   });
@@ -61,9 +64,32 @@ async function boot(hosted = true) {
     const content = await response.text();
     return { status: response.status, body: content === '' ? {} : JSON.parse(content) as Record<string, unknown> };
   };
-  return { root, repo, dataDir, base, request, api, ledger, pipeline, dispatch };
+  return { root, repo, dataDir, base, request, api, ledger, pipeline, dispatch, minions };
 }
 const query = (repo: string) => `repoPath=${encodeURIComponent(repo)}`;
+
+describe('intake slicing HTTP routes (#429)', () => {
+  it('guards, commissions once and turns the breakdown into a refinement; a refused breakdown is a named 400', async () => {
+    const unhosted = await boot();
+    const first = await unhosted.api('POST', '/api/intake/preview', unhosted.request);
+    expect(await unhosted.api('POST', '/api/intake/slice', { repoPath: unhosted.repo, intakeId: 'intake-296', requestId: 'r1', revisionId: first.body.revisionId })).toMatchObject({ status: 503, body: { error: 'intake_slicing_not_hosted' } });
+    const h = await boot(true, true);
+    const preview = (await h.api('POST', '/api/intake/preview', h.request)).body as unknown as Proposal;
+    const request = { repoPath: h.repo, intakeId: 'intake-296', requestId: 'r1', revisionId: preview.revisionId };
+    expect((await h.api('POST', '/api/intake/slice', request, null)).status).toBe(401);
+    const commissioned = await h.api('POST', '/api/intake/slice', request);
+    expect(commissioned).toMatchObject({ status: 202, body: { dispatched: true, jobId: expect.stringMatching(/^intake-slice-[0-9a-f]{32}$/u) } });
+    expect(await h.api('POST', '/api/intake/slice', request)).toMatchObject({ status: 200, body: { dispatched: false, jobId: commissioned.body.jobId } });
+    expect(h.minions).toHaveBeenCalledTimes(1);
+    expect(h.dispatch).not.toHaveBeenCalled();
+    const [heading, line] = preview.requirements.map(({ id }) => id);
+    const entry = { id: '1', title: 'Intake', description: 'Delivers the captured line.', verify: 'The captured line holds.', covers: [] as string[] };
+    expect(await h.api('POST', '/api/intake/slice/result', { ...request, breakdown: { entries: [entry], context: [heading] } })).toMatchObject({ status: 400, body: { error: 'intake_invalid_plan' } });
+    const sliced = await h.api('POST', '/api/intake/slice/result', { ...request, breakdown: { entries: [{ ...entry, covers: [line] }], context: [heading] } });
+    expect(sliced).toMatchObject({ status: 200, body: { executable: false, previousRequestId: 'r1', requestId: commissioned.body.resultRequestId } });
+    expect(h.ledger.listPipelineEntries()).toEqual([]);
+  });
+});
 
 describe('native intake HTTP boundary — zero executable admission', () => {
   it('guards preview, read, diff and unhosted surfaces with the pairing token', async () => {

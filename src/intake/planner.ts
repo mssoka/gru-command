@@ -1,4 +1,5 @@
 import { isPipelineMilestone, isSafePipelineRecordId, type PipelineMilestone } from '../ledger/pipeline.js';
+import { breakdownPlan } from './breakdown.js';
 import { IntakeError, type Acceptance, type Capture, type Dependency, type Heist, type Plan, type Statement, type Trace } from './types.js';
 
 function invalid(message: string): never { throw new IntakeError('intake_invalid_plan', message); }
@@ -141,4 +142,10 @@ export function conservativePlan(capture: Capture): Plan {
       splitMergeRationale: proposed('Keep one cohesive heist until validated scope demonstrates independent deliverables; headings and BMAD epic boundaries alone do not justify splits.'),
     }], unmapped: [], questions,
   };
+}
+
+/** The default preview: a captured v7 breakdown maps one heist per entry, in
+ * table order; every other capture gets the conservative plan. */
+export function defaultPlan(capture: Capture): Plan {
+  return breakdownPlan(capture) ?? conservativePlan(capture);
 }

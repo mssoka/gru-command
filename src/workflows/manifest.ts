@@ -23,6 +23,9 @@ export const REQUIRED_WORKFLOW_FILES: readonly string[] = [
 
 /** Current intake needs this helper; historical lane manifests remain valid. */
 export const REQUIRED_INTAKE_WORKFLOW_FILE = 'skills/gc-build/intake.md';
+/** Intake slicing (#429) needs this helper, checked only when a planning
+ * minion is commissioned, so lanes bound to older packages remain valid. */
+export const REQUIRED_SLICING_WORKFLOW_FILE = 'skills/gc-build/slice.md';
 
 export class WorkflowResourceError extends Error {
   constructor(message: string) {

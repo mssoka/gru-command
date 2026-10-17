@@ -1,9 +1,12 @@
 # Native GC intake: review and explicit approval
 
-GitHub issues, Markdown/plain-text specs, and Markdown BMAD epics/stories enter
-one immutable GC proposal. BMAD is optional **source data**, not a runtime. No
-BMAD installation, model, new session, scheduler or credentials are required.
-Gru can supply a structured refinement from the existing conversation.
+GitHub issues, Markdown/plain-text specs, and BMAD epics, stories, v7
+`tickets.toml` breakdowns and architecture documents enter one immutable GC
+proposal. BMAD is optional **source data**, not a runtime. No BMAD
+installation, model, new session, scheduler or credentials are required for a
+preview. Gru can supply a structured refinement from the existing conversation,
+and the owner can ask a planning minion to slice an epic that has no breakdown
+([below](#slicing-an-epic-with-a-planning-minion)).
 
 **Preview creates zero executable work:** no jobs, minion dispatches, lanes,
 pipeline entries, or held entries. Imported commands, labels, statuses,
@@ -36,8 +39,11 @@ not accepted. Each logical `intakeId` has immutable
   defaults remain 16 MiB output/stderr and 30 seconds.
 - `spec`: `document` names a repository-relative `.md`/`.txt` `path` or an
   explicit service-managed `uploadPath` from the existing attach flow.
-- `bmad`: the same document shape, but Markdown only. Explicit `supporting`
-  documents supply stories; story links are never followed. Unprovided story
+- `bmad`: the same document shape, but Markdown only, plus at most one
+  document named exactly `tickets.toml` (an upload keeps its original name):
+  a v7 epic folder's breakdown ([below](#bmad-v7-epic-folders)). Explicit
+  `supporting` documents supply stories and architecture; story links are never
+  followed. Unprovided story
   links and unavailable supplied documents remain named gaps. Frontmatter and
   raw header bytes are retained verbatim as data, not configuration or authority.
   Inline and ordinary full/collapsed/shortcut reference-style story links support
@@ -161,9 +167,103 @@ curl -G -H "Authorization: Bearer $PAIRING_TOKEN" \
 Diffs show old/new snapshot and heist changes, gaps, questions, unmapped
 requirements and workflow identities. They remain non-executable.
 
+## BMAD v7 epic folders
+
+In BMAD v7 an epic is a folder: `epic-<slug>/epic-<slug>.md` plus a
+`tickets.toml` whose `[[entry]]` tables, in build order, are its agreed slices.
+Supply the epic as the primary document and the `tickets.toml` (and its
+architecture, below) as supporting documents:
+
+```json
+{"kind":"bmad","document":{"path":"_bmad-output/epic-cart/epic-cart.md"},"supporting":[{"path":"_bmad-output/epic-cart/tickets.toml"},{"path":"_bmad-output/architecture-checkout/architecture-checkout.md"}]}
+```
+
+The breakdown is parsed with the bundled TOML parser, never executed, and maps
+**one heist per entry in table order**, without re-slicing:
+
+- heist `entry-<id>`, titled by the entry; `description` is its goal and
+  `verify` its acceptance and verification. Each traces to the entry's exact
+  `[[entry]]` table span and to the epic lines its `covers` ids start (inside the
+  epic's Requirements section when it has one).
+- a bare-number `after` id names a sibling and becomes a `merged` dependency: a
+  slice builds on its prerequisite's merged code. Every heist proposes
+  `delivered` and `merged`.
+- `hitl = true`, an `unknown`, a `spike`, `plan_checkpoint`/`done_checkpoint`, a
+  quoted or cross-epic `after` (`"1.3"`, `"epic-<slug>"`, a tracker id) and a
+  `covers` id no epic line starts become that heist's unresolved questions. GC
+  cannot see work outside the epic, and runs no human step on its own.
+- the epic's other lines and the breakdown's comments are mapped once, as
+  context, on the first entry. A Requirements line no entry covers stays an
+  unmapped question. A `Source conflict:` line in the epic stays open on the
+  entries whose `covers` it names, else on the whole plan.
+
+A breakdown that does not parse or resolve is a named gap, and the preview falls
+back to the conservative plan: `intake_malformed_breakdown` (invalid TOML,
+`[[epic]]` initiative tables, no entries, a missing/duplicate id, title or type,
+mistyped fields, an entry table GC cannot trace exactly, or a second
+`tickets.toml`), `intake_breakdown_prerequisite` (a bare `after` id naming no
+entry) and `intake_breakdown_cycle`. No heist is invented from a broken
+breakdown; correct the file and preview again.
+
+## Architecture binds every heist
+
+A captured architecture document, meaning a BMAD v7 spine (frontmatter
+`type: architecture-spine`) or a Markdown file named `architecture*.md`, binds
+every heist of the proposal by its exact bytes. GC never links to
+`_bmad-output`, because a minion's fresh worktree may not hold that directory and
+the file can change after approval. Instead:
+
+- any `architecture*.md` path named in a captured document (its References,
+  v6 `inputDocuments`, a `tickets.toml` entry's `references`) that is not itself
+  captured is an `intake_missing_architecture` gap, matched by file name. Supply
+  it as a supporting document.
+- its lines are mapped once, on the first heist, as binding architecture.
+- every approved briefing carries an `architecture` section naming the captured
+  documents (snapshot id, locator, sha256) with the binding policy: build within
+  them; they grant no execution authority; a conflict with the heist, its sources
+  or the code is never settled silently and never by editing the architecture:
+  the minion stops that part and reports both exact quotes, and Gru raises it to
+  the owner as a FOR YOU decision.
+
+## Slicing an epic with a planning minion
+
+An epic without a breakdown can be sliced by a commissioned planning minion that
+reads the codebase. `POST /api/intake/slice` with `repoPath`, `intakeId`,
+`requestId` and the exact `revisionId` dispatches one tracked `investigation`
+job through the normal dispatch path. It returns `jobId`, the `resultRequestId`
+its plan will land at, and `dispatched` (`202`; `200` with `false` when it was
+already commissioned). Both ids derive from the exact revision, so retries
+converge on one minion. A proposal with source gaps or no source lines is
+refused (`409 intake_incomplete_sources`), as is a changed revision
+(`409 intake_stale_revision`).
+
+The job's briefing binds that revision and embeds the verified GC slicing
+helper (`skills/gc-build/slice.md`, with its sha256). The minion reads the
+captured proposal with `GET /api/intake/<intakeId>/requests/<requestId>`, then
+submits a breakdown to `POST /api/intake/slice/result` (the same binding plus
+`breakdown`). The breakdown's entries name inventory requirement ids in `covers`,
+never offsets, plus `after` sibling ids, `hitl`, `unknown`, `lane` and
+`rationale`. Its `context` lists the framing lines and `questions` the
+epic-level ones, each `Source conflict:` included. GC traces each entry to the
+exact captured lines its ids name and maps entries to heists exactly as for a
+v7 breakdown. It validates the result with `validatePlan` before writing
+anything: an entry without `covers` must say `"clarification": true`, or its
+untraced acceptance is refused `400 intake_invalid_plan`. An unknown id, a
+cycle or an unsupported field is refused the same way.
+
+An accepted breakdown becomes a refinement: request `resultRequestId` with
+`previousRequestId` set to the sliced request and the same captured bytes.
+The identical breakdown converges; a different one is
+`409 intake_replay_conflict`. A breakdown nobody commissioned is
+`409 intake_slicing_not_commissioned`. The refinement posts one FOR YOU row
+(`intake.slicing-result`) listing source conflicts first, then the other open
+questions. The minion never approves, admits or enqueues; review and approval
+are unchanged. A changed epic is a new preview request, and its slicing is a
+different minion. The earlier proposal and its sliced revision stay readable.
+
 ## Structured refinement
 
-The default deliberately proposes one cohesive heist with unresolved goal,
+Without a breakdown, the default deliberately proposes one cohesive heist with unresolved goal,
 scope, exclusions, acceptance and verification questions. It inventories every
 nonblank source line, including metadata, without assuming it is an instruction
 or satisfied requirement. Headings and BMAD boundaries do not mechanically split
@@ -247,6 +347,12 @@ remain bound to the picker/pairing that opened them, never a later chat/intake t
 Once a selection is captured, opening the ordinary chat picker does not discard
 its in-flight intake batch. No links are crawled, and no BMAD installation/configuration is consulted.
 
+**Slice into heists (planning minion)** commissions the planning minion for
+the shown revision when it has no source gaps. **Load sliced revision** reads
+its result request once FOR YOU says it is ready, and is a no-op until then.
+This tab keeps the commission in memory; after a reload, commissioning again
+returns the same minion and result request.
+
 **Preview sources** shows repository, exact source/version/hash, goal, scope,
 exclusions, acceptance, verification, dependencies and unresolved questions.
 The plan JSON is editable: retain requirement IDs and exact source traces while
@@ -280,7 +386,13 @@ Incomplete briefings return `intake_incomplete_plan`; missing prerequisite
 selection returns `intake_dependency_selection`.
 
 Approval freezes exact briefings/provenance and stable pipeline/job/request IDs
-in the configured private ledger **before** enqueue effects. It does not create
+in the configured private ledger **before** enqueue effects. A briefing carries
+the approved heist, the approval binding, the captured snapshots and, when
+captured, the binding architecture section. It does not repeat the requirement
+inventory, because each heist's traces hold the exact quotes it maps; this keeps
+a 12-entry chained epic with its architecture inside one approval. A retry of
+the identical approval enqueues the recorded entries, even when a newer GC
+renders briefings differently. It does not create
 another queue. If enqueue is interrupted, `503 intake_partial_failure` includes
 accepted and remaining identities in `readback`. Read back after a timeout,
 reconnect or reload; then explicitly retry the identical approval. Replays
