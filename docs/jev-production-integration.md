@@ -92,7 +92,9 @@ because a table defined twice fails to load.
 A config generated before the fragment shipped has no decisions block, or
 only the tables an operator added by hand. Bring it up to date before
 turning Jev on, from the install directory and with the same
-`GRU_COMMAND_HOME` the service uses (the command prints the path it wrote):
+`GRU_COMMAND_HOME` the service uses (`install.sh` writes it into the
+launchd plist or systemd unit, default `~/.gru-command`; the command prints
+the path it wrote):
 
 ```sh
 npm run config:generate -- --force
@@ -146,10 +148,17 @@ request is a wiring bug, not provider health); `401 → auth_rejected`,
 `403 → forbidden`, `429/5xx → provider_degraded` are unchanged.
 
 Example — route one surface through TypeSafe directly. Store the TypeSafe
-key first (`node dist/decisions/cli.js credentials set --slot typesafe
---stdin`, see [Credentials](#credentials)) and probe it with
-`node dist/decisions/cli.js check --profile typesafe-direct --json`: a
-non-default profile with a bad key falls back silently for its own calls.
+key first (see [Credentials](#credentials)) and, with `enabled = true`,
+probe it until it reports `"status":"ready"`. While Jev is off the probe
+answers `"status":"disabled"` without reading the key, and a non-default
+profile with a bad key later falls back for its own calls with only a
+logged warning, never an owner incident:
+
+```sh
+printf '%s\n' "$TYPESAFE_API_KEY" | node dist/decisions/cli.js credentials set --slot typesafe --stdin
+node dist/decisions/cli.js check --profile typesafe-direct --json
+```
+
 The built-in `typesafe-direct` profile needs no table of its own; change
 only the `provider` line in the surface's existing table:
 
@@ -185,10 +194,12 @@ Routing rules:
   `<data_dir>/decisions/backtests/<surface>.json`; missing or failing
   evidence fails the request loud (`EnforceGateError`) and posts a deduplicated
   needs-owner configuration incident. Only surfaces with registered labelled
-  backtests (`escalation_triage`, `same_blocker`, `report_conclusion`) may opt in
-  to `enforce`; today's production `event_triage` and `supervision_guidance`
-  surfaces can use `off` or `shadow` until their backtests exist. A surface
-  with no `mode` key keeps the pre-#223 behavior without the gate.
+  backtests (`escalation_triage`, `same_blocker`, `report_conclusion`) can
+  pass the gate, and none of the four live surfaces can use `enforce` today:
+  `event_triage` and `supervision_guidance` have no backtest harness yet, and
+  the `escalation_triage` and `same_blocker` hosts ask Jev only in `shadow`
+  (enforcing them is a future host change), so use `off` or `shadow`. A
+  surface with no `mode` key keeps the pre-#223 behavior without the gate.
 - **Earning enforce.** Extract labelled history to JSONL
   (`{ id, state, label }`), run the harness against any profile, and save
   the evidence together with its stated threshold:

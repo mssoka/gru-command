@@ -240,6 +240,8 @@ lock_wait_timeout_ms = 900000     # queued request past this fails loud (never a
 run_timeout_ms = 1800000          # per-run wall clock; expiry kills the process group
 
 [decisions.jev]                   # Jev decisions (docs/jev-production-integration.md) — off by default
+# Keep a mode on every surface: without one, event_triage and supervision_guidance
+# act on Jev's answer with no backtest gate, and the other two are never asked.
 enabled = false                   # master switch; with it off no provider is ever contacted
 [decisions.surfaces.event_triage]
 provider = "openrouter-jev"

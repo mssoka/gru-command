@@ -188,6 +188,11 @@ describe('surface mode config parsing (issue #223)', () => {
     const template = decisionsConfigTemplate(true);
     expect(template).toContain('mode = "shadow"');
     expect(template).toContain('decisions/backtests/');
+    // Every fresh config ships this legend: enforce is unavailable on the live
+    // surfaces, and a missing mode is spelled out for all four.
+    expect(template).toContain('Not available on the four live surfaces below yet.');
+    expect(template).toContain('escalation_triage and same_blocker are never asked.');
+    expect(template.match(/off or shadow today/g)).toHaveLength(4);
   });
 });
 
