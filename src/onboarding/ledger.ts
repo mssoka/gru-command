@@ -27,7 +27,7 @@ export const ONBOARDING_EVENTS = {
   dispatchFailed: 'onboarding.dispatch-failed',
   /** Code proved (passed or failed) an onboarding job's delivered head (#427 PR 1b); a job event. */
   proof: 'onboarding.proof',
-  /** A proof's PR comment is about to be posted: after a crash, look for its marker first. */
+  /** A proof's PR comment is about to be posted, with its marker's nonce: after a crash, look for that marker first. */
   proofCommentAttempt: 'onboarding.proof-comment-attempt',
   /** A proof's PR comment exists (posted, or found by its marker), or cannot be posted. */
   proofCommented: 'onboarding.proof-commented',
@@ -66,7 +66,9 @@ export interface ProofRecord {
    * read (an unknown outcome, malformed failures): that head's proof
    * stands as not passed and is never run again. */
   readonly result: OnboardingProofResult | null;
-  readonly commentAttempted: boolean;
+  /** The marker nonce of each recorded comment attempt, oldest first: only
+   * a comment whose marker carries one of them is GC's. */
+  readonly attemptNonces: readonly string[];
   readonly comment: { readonly id: number | null; readonly url: string | null; readonly detail: string } | null;
 }
 
@@ -235,12 +237,18 @@ export class OnboardingLedger {
         const list = this.proofs.get(jobId) ?? [];
         if (list.some((entry) => entry.head === head)) return;
         const result = readOnboardingProof(payload);
-        this.proofs.set(jobId, [...list, { repo, jobId, head, passed: result?.passed === true, at: ts, result, commentAttempted: false, comment: null }]);
+        this.proofs.set(jobId, [...list, { repo, jobId, head, passed: result?.passed === true, at: ts, result, attemptNonces: [], comment: null }]);
         return;
       }
-      case ONBOARDING_EVENTS.proofCommentAttempt:
-        this.updateProof(payload, (proof) => ({ ...proof, commentAttempted: true }));
+      case ONBOARDING_EVENTS.proofCommentAttempt: {
+        // An attempt recorded before markers carried a nonce has none: no
+        // comment can be matched to it, so GC posts its own.
+        const nonce = payload['nonce'];
+        this.updateProof(payload, (proof) => ({
+          ...proof, attemptNonces: typeof nonce === 'string' && nonce !== '' ? [...proof.attemptNonces, nonce] : proof.attemptNonces,
+        }));
         return;
+      }
       case ONBOARDING_EVENTS.proofCommented: {
         const id = payload['comment_id'];
         const url = payload['comment_url'];

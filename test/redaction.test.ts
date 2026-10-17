@@ -50,6 +50,34 @@ describe('redactCredentials', () => {
     }
   });
 
+  it('masks a JSON-quoted key and the compound secret keys: AWS secret access keys, a service-account private_key, kubeconfig client key data (#427)', () => {
+    const awsSecret = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY';
+    const pkcs8 = '-----BEGIN PRIVATE KEY-----\\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\\n-----END PRIVATE KEY-----\\n';
+    for (const [text, secret] of [
+      ['{"user": "ci", "password": "hunter22x"}', 'hunter22x'],
+      ["{'token': 'abcdef123456'}", 'abcdef123456'],
+      [`AWS_SECRET_ACCESS_KEY=${awsSecret}`, awsSecret],
+      [`aws_secret_access_key = ${awsSecret}`, awsSecret],
+      [`export SECRET-ACCESS-KEY=${awsSecret}`, awsSecret],
+      [`{"type": "service_account", "private_key": "${pkcs8}"}`, 'MIIEvQIBADANBgkqhkiG9w0BAQEFAASC'],
+      ['    client-key-data: LS0tLS1CRUdJTiBSU0EgUFJJVkFURSBLRVktLS0tLQo=', 'LS0tLS1CRUdJTiBSU0EgUFJJVkFURSBLRVktLS0tLQo='],
+      ['"client-secret": "oauth-client-s3cret"', 'oauth-client-s3cret'],
+      ['PRIVATE_KEY=abcdef0123456789', 'abcdef0123456789'],
+    ] as const) {
+      expect(redactCredentials(text), text).not.toContain(secret);
+      expect(redactCredentials(text), text).toContain(REDACTION_PLACEHOLDER);
+    }
+    // R3's value rule still holds after a quoted key.
+    expect(redactCredentials('{"password": "*****"}')).toBe('{"password": "*****"}');
+  });
+
+  it('masks every PRIVATE KEY header: PKCS#8\'s bare one, ENCRYPTED, OPENSSH and the algorithm-named ones (#427)', () => {
+    for (const words of ['', 'ENCRYPTED ', 'OPENSSH ', 'RSA ', 'EC ', 'DSA ']) {
+      const key = `-----BEGIN ${words}PRIVATE KEY-----\nMIIEsecretKEYbody\n-----END ${words}PRIVATE KEY-----`;
+      expect(redactCredentials(`before\n${key}\nafter`), words).toBe(`before\n${REDACTION_PLACEHOLDER}\nafter`);
+    }
+  });
+
   it('keeps the Perkins publication name as an alias of the same function', () => {
     expect(redactReviewForPublication).toBe(redactCredentials);
   });
@@ -62,5 +90,9 @@ describe('redactCredentialWindow', () => {
     // A whole key, and text either side, are left as redactCredentials leaves them.
     expect(redactCredentialWindow('a\n-----BEGIN RSA PRIVATE KEY-----\nbody\n-----END RSA PRIVATE KEY-----\nb')).toBe(`a\n${REDACTION_PLACEHOLDER}\nb`);
     expect(redactCredentialWindow('plain output\n')).toBe('plain output\n');
+    // PKCS#8's bare header and footer straddle a window the same way (#427).
+    expect(redactCredentialWindow('MIIEsecretbody\n-----END PRIVATE KEY-----\nafter\n')).toBe(`${REDACTION_PLACEHOLDER}\nafter\n`);
+    expect(redactCredentialWindow('before\n-----BEGIN PRIVATE KEY-----\nMIIEsecretbody\n')).toBe(`before\n${REDACTION_PLACEHOLDER}`);
+    expect(redactCredentialWindow('before\n-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIEsecretbody\n')).toBe(`before\n${REDACTION_PLACEHOLDER}`);
   });
 });

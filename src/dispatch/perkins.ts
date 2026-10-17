@@ -1949,6 +1949,18 @@ function captureFallbackInput(lanePath: string, baseRef: string): Pick<FallbackR
   return { headRef, diff, diffSha256: createHash('sha256').update(diff).digest('hex') };
 }
 
+/** #427 PR 1b: whether a lane holds uncommitted changes the fallback would
+ * review (tracked edits, untracked files git does not ignore: what
+ * `git status --porcelain` lists). Fails loud when git cannot say. */
+function laneHasUncommittedChanges(lanePath: string): boolean {
+  const run = spawnSync('git', ['-C', lanePath, '-c', 'core.fsmonitor=false', 'status', '--porcelain', '--untracked-files=normal'],
+    { encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 64 * 1024 * 1024, timeout: 30_000 });
+  if (run.error !== undefined || run.status !== 0) {
+    throw new Error(`cannot read the lane's uncommitted changes (git status): ${run.error?.message ?? run.stderr.trim().slice(0, 200)}`);
+  }
+  return run.stdout.trim() !== '';
+}
+
 /** A late delivered STATUS after an already-recorded delivery is harmless.
  * A working hop hidden by a later status is not: the old diff is obsolete.
  * If the bounded history cannot prove no hop occurred, fail closed. */
@@ -4051,33 +4063,34 @@ export class WaveRunner {
     throw new BranchBusyError(input.targetBranch, blockers, 'freeze');
   }
 
-  /** #427 PR 1b: when an arm names an explicit target, or the lane's HEAD
-   * is not the delivered head, the commit the round would review is
-   * resolved now and its first proof must have passed: a synchronous 409
-   * before any round row or review worktree exists. A target only a fetch
-   * or the live PR resolves is left to the freeze, which checks the exact
-   * sha last. Unforceable. */
+  /** #427 PR 1b: when an arm names an explicit target, the commit the
+   * round would review is resolved now and its first proof must have
+   * passed: a synchronous 409 before any round row or review worktree
+   * exists. With no target, the round reviews the live PR head (the lane
+   * HEAD may hold a commit never delivered, which the round never reviews):
+   * the delivered-head fence and the freeze's exact-sha check cover it. A
+   * target only a fetch or the live PR resolves is left to the freeze,
+   * which checks the exact sha last. Unforceable. */
   private refuseUnprovenOnboardingArmTarget(input: { readonly jobId: string; readonly targetRef?: string | undefined; readonly force?: boolean | undefined }): void {
     const job = this.opts.ledger.getJob(input.jobId);
     if (job === null || isJobTerminal(job.status) || !this.opts.ledger.isOnboardingJob(input.jobId)) return;
+    if (input.targetRef === undefined || input.targetRef.trim() === '') return;
     const lane = this.opts.worktrees.listWorktrees({ jobId: input.jobId })
       .find((candidate) => candidate.kind === 'job' && candidate.status !== 'swept') ?? null;
     if (lane === null) return; // Setup's canonical missing-lane refusal.
-    const explicit = input.targetRef !== undefined && input.targetRef.trim() !== '';
     // An origin branch is fetched fresh at the freeze; a local copy may be stale.
-    if (explicit && isExactOriginBranchSpelling(input.targetRef!)) return;
+    if (isExactOriginBranchSpelling(input.targetRef)) return;
     let sha: string;
     try {
-      sha = resolveGitCommit(lane.path, explicit ? input.targetRef! : 'HEAD');
+      sha = resolveGitCommit(lane.path, input.targetRef);
     } catch {
       return; // Not resolvable here: the freeze resolves it and checks it.
     }
-    if (!explicit && sha === this.opts.ledger.newestDeliveredHead(input.jobId)?.head) return;
     const onboardingProof = this.opts.ledger.onboardingProofDebtAt(input.jobId, sha);
     if (onboardingProof === null) return;
     const targetBranch = resolveReviewTargetBranch({
       jobId: input.jobId,
-      ...(explicit ? { targetRef: input.targetRef! } : {}),
+      targetRef: input.targetRef,
       lanePath: lane.path,
       laneBranch: lane.branch,
     });
@@ -4095,6 +4108,15 @@ export class WaveRunner {
   private onboardingLaneHeadDebt(jobId: string, lanePath: string): OnboardingProofDebt | null {
     if (!this.opts.ledger.isOnboardingJob(jobId)) return null;
     return this.opts.ledger.onboardingProofDebtAt(jobId, resolveGitCommit(lanePath, 'HEAD'));
+  }
+
+  /** #427 PR 1b: the fallback reviews the working tree, uncommitted bytes
+   * included (captureFallbackInput), and no proof ever ran those: an
+   * onboarding heist's lane must be clean. The debt names the lane HEAD;
+   * null when the job is no onboarding heist or its lane is clean. */
+  private onboardingLaneDirtyDebt(jobId: string, lanePath: string): OnboardingProofDebt | null {
+    if (!this.opts.ledger.isOnboardingJob(jobId) || !laneHasUncommittedChanges(lanePath)) return null;
+    return { head: resolveGitCommit(lanePath, 'HEAD'), reason: 'uncommitted' };
   }
 
   private enforceBranchIdle(input: {
@@ -4442,10 +4464,11 @@ export class WaveRunner {
       throw new BranchBusyError(targetBranch, blockers, 'arm');
     }
     // #427 PR 1b: an unproven onboarding head refuses fallback admission
-    // even under force: the delivered head, and the lane HEAD the fallback
-    // actually reviews.
+    // even under force: the delivered head, the lane HEAD the fallback
+    // actually reviews, and any uncommitted change it would review too.
     const onboardingProof = jobRow === null || isJobTerminal(jobRow.status)
-      ? null : this.opts.ledger.onboardingProofDebt(input.jobId) ?? this.onboardingLaneHeadDebt(input.jobId, lane.path);
+      ? null : this.opts.ledger.onboardingProofDebt(input.jobId) ?? this.onboardingLaneHeadDebt(input.jobId, lane.path) ??
+        this.onboardingLaneDirtyDebt(input.jobId, lane.path);
     if (jobRow !== null && onboardingProof !== null) {
       const targetBranch = resolveReviewTargetBranch({
         jobId: input.jobId,
@@ -4541,6 +4564,11 @@ export class WaveRunner {
     if (laneHeadDebt !== null) {
       throw new FallbackSafetyRefusal(
         `onboarding job "${input.jobId}" has no passing onboarding proof of its lane HEAD ${laneHeadDebt.head ?? ''}, the commit the fallback reviews — the gate stops before the next review round`,
+      );
+    }
+    if (this.onboardingLaneDirtyDebt(input.jobId, lane.path) !== null) {
+      throw new FallbackSafetyRefusal(
+        `onboarding job "${input.jobId}"'s lane holds uncommitted changes the proof never ran, and the fallback reviews the working tree — the gate stops before the next review round`,
       );
     }
     if (fallbackWorkingStartedSince(this.opts.ledger, input.jobId, admission.statusSeq) ||

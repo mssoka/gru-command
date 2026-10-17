@@ -20,6 +20,7 @@ import {
   GhCliApi,
   GhRateLimitedError,
   ghHttpStatus,
+  ghRateLimited,
   GitHubSignalPoll,
   branchStatePayload,
   ciFailureTier,
@@ -527,6 +528,18 @@ describe('gh CLI adapter', () => {
     expect(ghHttpStatus(new GhApiError('comment on acme/app#7 (HTTP 403)'))).toBeNull();
     expect(ghHttpStatus(new Error('gh: Resource not accessible by integration (HTTP 403)'))).toBeNull();
     expect(ghHttpStatus('(HTTP 403)')).toBeNull();
+  });
+
+  it('ghRateLimited reads a primary or secondary rate limit as one, even when GitHub answered HTTP 403, so a caller never takes it as a refusal for good (#427)', async () => {
+    const refusal = async (stderr: string): Promise<unknown> =>
+      new GhCliApi(async () => ({ status: 1, stdout: '', stderr })).commentOnPull({ repo: REPO, number: 7, body: 'x' }).then(() => null, (error: unknown) => error);
+    const secondary = await refusal('gh: You have exceeded a secondary rate limit. Please wait a few minutes before you try again. (HTTP 403)');
+    expect(secondary).toBeInstanceOf(GhRateLimitedError);
+    expect(ghHttpStatus(secondary)).toBe(403);
+    expect(ghRateLimited(secondary)).toBe(true);
+    expect(ghRateLimited(new GhApiError('comment on acme/app#7: gh exited 1', 'gh: API rate limit exceeded for user ID 1 (HTTP 403)'))).toBe(true);
+    expect(ghRateLimited(await refusal('gh: Resource not accessible by integration (HTTP 403)'))).toBe(false);
+    expect(ghRateLimited(new Error('API rate limit exceeded'))).toBe(false);
   });
 
   it('fails loud on unavailability, rate limits, and malformed responses', async () => {

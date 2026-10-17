@@ -418,8 +418,11 @@ export interface EventRecord {
  *   proven current candidate), so the minion must deliver again;
  * - `unproven`: the head has no proof yet;
  * - `failed`: the head's first proof failed, or its record is unreadable
- *   (a record no reader can read is never a pass). */
-export type OnboardingProofDebtReason = 'no-delivery' | 'no-commit' | 'unproven' | 'failed';
+ *   (a record no reader can read is never a pass);
+ * - `uncommitted`: the lane holds uncommitted changes the proof never ran,
+ *   which the bmad-review fallback would review (set by the fallback's
+ *   lane check, never by the ledger). */
+export type OnboardingProofDebtReason = 'no-delivery' | 'no-commit' | 'unproven' | 'failed' | 'uncommitted';
 
 /** An onboarding heist's unproven head (#427 PR 1b): the head review waits
  * on (null for `no-delivery` and `no-commit`) and why it waits. */

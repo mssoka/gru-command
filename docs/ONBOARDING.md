@@ -177,29 +177,38 @@ onboarding, never the gate on an open heist.
    the head. Both run with your git configuration, as a lane's
    `worktree add` does (hooks and fsmonitor off, no prompts), so filters
    give the content a lane gets. When the head uses Git LFS (a
-   `.gitattributes` names `filter=lfs`), the checkout's `origin` is your
-   repository's own `origin` (and its `lfs.url`, if set) and its LFS store
-   is your repository's: smudge reads your local store first and fetches
-   only missing objects from the real remote, into that same store, exactly
-   as a lane does. The checkout is bounded by `[worktrees] setup_timeout_ms`.
-   Your repository gains no worktree, branch, ref or index entry.
+   `.gitattributes` names `filter=lfs`), the checkout gets what a lane
+   shares with your repository: every repository-local `lfs.*`, `http.*`,
+   `credential.*` and `url.*` (`insteadOf`) entry, and your `origin`, are
+   written into the checkout's own config file (never onto a command line,
+   and no copied value is logged), and its LFS store is your repository's
+   (its `lfs.storage`, else `<git common dir>/lfs`). Smudge reads that store
+   first and fetches only missing objects, with your repository's own auth
+   and routing, into that same store, exactly as a lane does. The checkout
+   is bounded by the larger of `[worktrees] setup_timeout_ms` and
+   `[verify] run_timeout_ms`; one that runs past it is deferred, naming the
+   timeout. Your repository gains no worktree, branch, ref or index entry.
 2. That head's own manifest, applied as a lane's bootstrap applies it:
    `[[link]]` and `[[copy]]` from your checkout, then each `[[setup]]`
-   command, timed, under `[worktrees] setup_timeout_ms`. Unlike a lane,
-   each setup command's whole process group is ended (`SIGKILL`) once its
-   shell exits, so nothing setup starts (a daemon that redirects its output,
-   or ignores `SIGTERM`) writes into the checkout while it is measured. A
-   service stop ends a running setup command's whole process group too.
+   command, timed, under `[worktrees] setup_timeout_ms`. As in a lane, what
+   a setup command starts (a dev database or a mock server it backgrounds)
+   keeps running through verify, which may need it. A service stop ends a
+   running setup command's whole process group.
 3. `verify.full`, while holding one slot of the global verification budget
    (the same FIFO and lock-wait timeout as `POST /api/verify`). GC spawns it
    itself with the budget's environment and worker share, bounded by
    `[verify] run_timeout_ms`, and ends its whole process group. The shell
    evaluates the command, so it stays its group's leader, and its pid and
    argv are bound to the slot. After a crash, the restarted scheduler keeps
-   the slot while that pid lives, and onboarding's start, before it removes
-   leftover checkouts, ends the group of each such verify whose pid still
-   leads its group and runs the bound argv, then releases its slot. A live
-   pid that is not that verify is never signalled; its slot waits for the
+   the slot while that pid lives. Onboarding's start, before it removes
+   leftover checkouts, first ends every process carrying this instance's
+   marker or rooted under its probes folder (below), then ends the group
+   of each such verify whose pid still leads its group and runs the bound
+   argv, and releases its slot. A slot
+   is released as gone only when neither its pid nor any member of its
+   process group lives; a member that outlived its leader keeps the slot. A
+   live pid that is not that verify is never signalled, and a pid `ps`
+   cannot read is logged as an error; either slot waits for the
    scheduler's age limit. A stale release of this slot is logged at `warn`.
    The proof is not a verification of the job: no `verification.*` event is
    recorded for the `onboarding-proof` scope, no verification fence sees it,
@@ -207,7 +216,31 @@ onboarding, never the gate on an open heist.
    manifest that declares it is refused by name (the proof fails on it). A
    manifest without `verify.full` passes this step as "no verify command
    declared".
-4. Measuring, against a snapshot taken after the links and copies (so only
+4. Ending what the proof started, before anything is measured, and
+   whatever the outcome (a failed setup, a deferral, a stop): every process
+   the proof starts (the clone, the checkout, each setup command and
+   verify) carries the environment marker
+   `GRU_ONBOARDING_PROBE=<instance>.<run>`. Every process group setup and
+   verify started is ended (`SIGTERM`, then `SIGKILL` after a grace), then
+   every process still carrying the run's marker or rooted in the checkout,
+   which catches a daemon that left its group (`setsid` or a double fork,
+   as the Bazel server, a Gradle daemon or watchman do).
+   - The marker: Linux reads each process's environment from `/proc`;
+     elsewhere GC asks `ps -axEww`. A process that scrubbed its environment
+     cannot be found this way, and neither can any process on a platform
+     whose `ps` hides other processes' environments (current macOS shows a
+     process only its own).
+   - Rooted in the checkout: its working directory is inside the checkout,
+     or its command line names a path inside it, found the way the worktree
+     manager's sweep finds a lane's processes (`/proc` on Linux, `lsof` on
+     macOS). This works on every such platform and whatever the process did
+     to its environment, but not for a daemon that changed its working
+     directory out of the checkout and names no path inside it.
+
+   At start, GC does the same for every process carrying this instance's
+   marker or rooted under its probes folder: proofs run one at a time, so
+   any such process is an orphan of a crashed run.
+5. Measuring, against a snapshot taken after the links and copies (so only
    what setup and verify made counts): the git-ignored paths that appeared,
    each sized with an `lstat` walk that never follows a link, and the
    checkout's total size without `.git`. Each `reclaim` entry is checked by
@@ -217,14 +250,19 @@ onboarding, never the gate on an open heist.
 The checkout is removed whatever the outcome, and a start removes any a
 crash left behind. The output tail is cut from the failing command's latest
 16 KiB of output, redacted whole before it is cut: anything shaped like a
-credential (private keys, GitHub, GitLab, npm, Slack, OpenAI and AWS
-tokens, JWTs, URL userinfo, `Authorization` headers, `.npmrc` auth lines,
-and a keyword such as `token` or `password` assigned a value of six or more
-characters with a letter or digit) is masked, and a key whose BEGIN line
-fell before that window is masked from the window's start. The tail is then
-the last 4 KiB, starting at a whole line, so a cut never shows half a
-credential and the bound holds after redaction. Failures and commands are
-redacted the same way before they are recorded.
+credential (private keys under any `PRIVATE KEY` header, PKCS#8's bare one
+included; GitHub, GitLab, npm, Slack, OpenAI and AWS tokens; JWTs; URL
+userinfo; `Authorization` headers; `.npmrc` auth lines; and a keyword such
+as `token`, `password`, `aws_secret_access_key`, `private_key` or
+`client-key-data`, quoted as JSON quotes it or not, assigned a value of six
+or more characters with a letter or digit) is masked, and a key whose BEGIN
+line fell before that window is masked from the window's start. The tail is
+then the last 4 KiB, starting at a whole line, so a cut never shows half a
+credential and the bound holds after redaction. When one line is longer
+than the tail, its last bytes are kept after a first line
+`(output tail starts mid-line)`: a command that printed something never
+records an empty tail. Failures and commands are redacted the same way
+before they are recorded.
 
 **A proof fails** when a setup command fails or times out; when verify
 exits non-zero or times out; when verify exits 0 in under a second with no
@@ -252,22 +290,29 @@ proof.
   never a pass. It fences review like a failure, and that head is never
   proven again.
 - One PR comment per proven head, with the timings, sizes and lane size,
-  starting with a hidden marker `<!-- gru:onboarding-proof job=<id> head=<sha> -->`.
-  Each failure is rendered as code, so a mention, an issue reference or
-  HTML in it stays inert. The output tail is never posted (the PR may be
-  public): the comment says it is sent to the minion while this is the
-  job's newest head, and is kept in GC's ledger. GC records the attempt
-  before posting and the receipt after; after a crash it first looks for a
-  comment whose body starts with the marker (a quote or a mention of it is
-  someone else's comment), and never posts blind. After three failed
-  attempts for a head in one run of the service, each at least one
-  reconcile apart (a failed lookup counts, and a burst of triggers within
-  one interval counts once), GC records `onboarding.proof-commented` with
-  no comment and `cannot be posted: <reason>`, logs an error, and stops
-  trying. A refusal GitHub means for good (`HTTP 403`, `404`, `410` or
-  `422`, as `gh` reports it) is recorded that way at once, with no second
-  attempt. An unreadable record is recorded at once as
-  `cannot be posted: unreadable record`.
+  starting with a hidden marker
+  `<!-- gru:onboarding-proof job=<id> head=<sha> nonce=<nonce> -->`. Each
+  failure is rendered as code, so a mention, an issue reference or HTML in
+  it stays inert. The output tail is never posted (the PR may be public):
+  the comment says it is sent to the minion while this is the job's newest
+  head, and is kept in GC's ledger. GC records the attempt, with a fresh
+  random nonce, before posting and the receipt after. After an interrupted
+  post it first looks for a comment whose body starts with the marker of a
+  recorded attempt for that head, nonce included, and never posts blind.
+  Job and head are public but no one sees a nonce until GC posts it, so a
+  comment with GC's job and head and no or another nonce, a quote of the
+  marker, or a mention of it is someone else's (no author is asked). An
+  attempt recorded before markers carried a nonce matches no comment, so
+  GC posts its own. After three failed attempts for a head in one run of
+  the service, counted at most once per reconcile (a failed lookup counts,
+  and any burst of triggers between two reconciles counts once, whatever
+  the clock says), GC records `onboarding.proof-commented` with no comment
+  and `cannot be posted: <reason>`, logs an error, and stops trying. A
+  refusal GitHub means for good (`HTTP 403`, `404`, `410` or `422`, as `gh`
+  reports it) is recorded that way at once, with no second attempt. A rate
+  limit never is, even at `HTTP 403` (GitHub's secondary limit on comments
+  answers 403): it counts as a failed attempt and is retried. An unreadable
+  record is recorded at once as `cannot be posted: unreadable record`.
 - On a pass, review may arm, and the Perkins packet carries an
   `ONBOARDING PROOF` block when the proof's head is the reviewed sha. Every
   command, path and failure in the block is one line (a line break becomes
@@ -299,41 +344,50 @@ names the row, and the detail gives every one that holds:
 - `unanswered`: the minion finished the directive about its failure, and at
   a later reconcile its newest delivery still names that head;
 - `unadmitted`: the lane never admitted the directive (it was refused
-  before any row three times, each at least one reconcile apart);
+  before any row in three different reconciles);
 - `deferred`: its proof was deferred three times in a row in this run of
-  the service, each at least one reconcile apart (the detail gives the last
-  reason; a recorded proof starts the count again, and so does a restart);
+  the service, counted at most once per reconcile (the detail gives the
+  last reason; a recorded proof starts the count again, and so does a
+  restart);
 - `nohead`: the newest delivery names no full commit id (or is not a
   proven current candidate), so the minion must deliver again.
 
 There is at most one open row per job and head. Only onboarding closes a
 row, and a Gru disposition of it is refused: it closes when the head's
 proof passes, when a newer head is delivered, when the job ends (at once,
-on the job's terminal status), when the head is proven after a deferral, or
-when the head is stuck for another reason (a new row names that one). A
-later episode of the same head, such as a re-delivery after its row
-closed, or a second delivery that names no commit, gets a new row. A row's
-id is never posted again. An ended job whose rows are closed and whose
-comments are settled is not read again by the reconcile.
+on the job's terminal status), when the head is proven after a deferral,
+when the head is stuck for another reason (a new row names that one), or
+when its reason clears and no other holds (the lane admitted the
+directive, say). A later episode of the same head, such as a re-delivery
+after its row closed, or a second delivery that names no commit, gets a
+new row, and so does a reason that holds again after its row closed (its
+id ends `:2`, `:3`, and so on). A row's id is never posted again. An ended
+job whose rows are closed and whose comments are settled is not read again
+by the reconcile.
 
 **The fence.** Until a passing proof exists for the newest delivered head,
 the lane is busy on every path a corrective verification fences: arm,
 freeze, queued handoff, fallback admission and iteration, and the Silas
 review offer. The exact commit under review must pass too:
 
-- an arm that names a target, or whose lane HEAD is not the delivered
-  head, resolves that commit at once and is refused with a `409` before any
-  round or review worktree exists;
+- an arm that names a target resolves that commit at once and is refused
+  with a `409` before any round or review worktree exists. An arm with no
+  target reviews the live PR head, not the lane's HEAD, so a commit the
+  minion left unpushed in its lane does not refuse it;
 - the freeze checks the exact sha it reviews last, so a commit pushed after
   the delivery (a live PR head that moved) is refused there;
-- the bmad-review fallback reviews the lane's HEAD, so its admission and
-  each iteration also need a passing proof of that commit.
+- the bmad-review fallback reviews the lane's working tree, uncommitted
+  changes included, so its admission and each iteration need a passing
+  proof of the lane's HEAD and a clean lane: tracked changes, or untracked
+  files git does not ignore (`git status --porcelain`), are uncommitted
+  changes the proof never ran, and refuse it.
 
 `force` cannot waive any of it. The `409 branch_busy` blocker carries
 `onboarding_proof_required_head` and `onboarding_proof_reason`
-(`no-delivery`, `no-commit`, `unproven` or `failed`), and the hint says
-what is missing (a proof, a delivery that names a commit, or any delivery
-at all). Every `branch-idle.refused` audit records `forced` (whether force
+(`no-delivery`, `no-commit`, `unproven`, `failed`, or `uncommitted` for the
+fallback's lane check), and the hint says what is missing (a proof, a
+delivery that names a commit, any delivery at all, or a lane with nothing
+uncommitted). Every `branch-idle.refused` audit records `forced` (whether force
 was applied: never, for these) and `force_requested` (whether the request
 asked for it). A minion's own review request is queued, not refused, and is
 replayed when the `onboarding.proof` event lands, or at the next start if it
@@ -359,8 +413,8 @@ failed proof sends:
   failures, setup timings, the verify result, what appeared, each `reclaim`
   entry and the lane size
 - `onboarding.proof-comment-attempt` and `onboarding.proof-commented`, the
-  PR comment's attempt and receipt (posted, found by its marker, or
-  `cannot be posted`)
+  PR comment's attempt (with its marker's nonce) and receipt (posted, found
+  by its marker, or `cannot be posted`)
 - `onboarding.proof-attention-posted`, a job event: the head, the delivery
   seq and the reason of each attention row onboarding posted for Gru
 

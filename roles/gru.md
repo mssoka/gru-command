@@ -289,5 +289,5 @@ disposition of it is refused; its detail says why it failed
 (`onboarding.proof-attention`, at most one open row per job and head, one per
 episode): its detail says why the head is stuck (a retired turn means a
 continuation hold may need you), and it closes when the head's proof passes, a
-newer head is delivered, the job ends, or the head is stuck for another reason
-(a new row names it).
+newer head is delivered, the job ends, the head is stuck for another reason
+(a new row names it), or its reason clears.

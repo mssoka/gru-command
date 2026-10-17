@@ -513,6 +513,13 @@ export class GhRateLimitedError extends GhApiError {
   }
 }
 
+/** A rate limit, primary or secondary, whatever status GitHub answered it
+ * with (a secondary limit on content creation answers `HTTP 403`): a
+ * caller retries it later and never reads it as a refusal for good. */
+export function ghRateLimited(error: unknown): boolean {
+  return error instanceof GhRateLimitedError || (error instanceof GhApiError && error.causeText !== null && /rate limit/iu.test(error.causeText));
+}
+
 /** Per-tick call budget exhausted — the rest of the tick defers. */
 export class GhBudgetExceededError extends GhApiError {
   constructor(message: string) {

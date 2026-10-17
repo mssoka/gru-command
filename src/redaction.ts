@@ -23,8 +23,22 @@ const keepPrefix = (_match: string, prefix: string): string => `${prefix}${REDAC
  * digit, so a diagnostic such as `Unexpected token: ')'` is left whole. */
 const KEYWORD_VALUE = '(?:"(?=[^"]*[A-Za-z0-9])[^"]{6,}"|\'(?=[^\']*[A-Za-z0-9])[^\']{6,}\'|(?=[^\\s`\'"]*[A-Za-z0-9])[^\\s`\'"]{6,})';
 
+/** The keys whose assigned value is a credential, longest first (`_` or
+ * `-` between words, any case): AWS's secret access key, a private key in
+ * JSON (a service-account file), kubeconfig's client key data. */
+const KEYWORD_KEYS = [
+  'aws[_-]secret[_-]access[_-]key', 'secret[_-]access[_-]key', 'private[_-]key', 'client[_-]key[_-]data',
+  'api[_-]?key', 'access[_-]?token', 'auth[_-]?token', 'client[_-]?secret', 'refresh[_-]?token', 'secret[_-]?key', 'api[_-]?secret',
+  'password', 'secret', 'token',
+].join('|');
+
+/** A PEM private key header or footer word run: `PRIVATE KEY` alone
+ * (PKCS#8), or after algorithm and format words (`RSA`, `EC`, `OPENSSH`,
+ * `ENCRYPTED`). */
+const PEM_WORDS = '(?:[A-Z0-9]+ )*PRIVATE KEY';
+
 const PATTERNS: readonly (readonly [RegExp, (match: string, ...groups: string[]) => string])[] = [
-  [/-----BEGIN [^-\r\n]+ PRIVATE KEY-----[\s\S]*?-----END [^-\r\n]+ PRIVATE KEY-----/gu, redaction],
+  [new RegExp(`-----BEGIN ${PEM_WORDS}-----[\\s\\S]*?-----END ${PEM_WORDS}-----`, 'gu'), redaction],
   [/\bgh[pousr]_[A-Za-z0-9_]{20,}\b/gu, redaction],
   [/\bgithub_pat_[A-Za-z0-9_]{20,}\b/gu, redaction],
   [/\bglpat-[A-Za-z0-9_-]{20,}\b/gu, redaction],
@@ -37,7 +51,8 @@ const PATTERNS: readonly (readonly [RegExp, (match: string, ...groups: string[])
   [/(\bAuthorization\s*:\s*(?:Bearer|Basic)\s+)[^\s'"`]+/giu, keepPrefix],
   // An `.npmrc` registry credential: `//registry.example/:_authToken=…`.
   [/(\/\/\S*:_(?:authToken|auth|password)\s*=\s*)\S+/gu, keepPrefix],
-  [new RegExp(`(?<![A-Za-z0-9])(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|refresh[_-]?token|secret[_-]?key|api[_-]?secret|password|secret|token)\\s*[:=]\\s*${KEYWORD_VALUE}`, 'giu'), redaction],
+  // A key, then an optional closing quote (JSON's `"password": "…"`), then `:` or `=`.
+  [new RegExp(`(?<![A-Za-z0-9])(?:${KEYWORD_KEYS})["']?\\s*[:=]\\s*${KEYWORD_VALUE}`, 'giu'), redaction],
   [/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/gu, redaction],
 ];
 
@@ -50,8 +65,8 @@ export function redactCredentials(body: string): string {
  * moved it here and widened its use; existing imports keep this name). */
 export const redactReviewForPublication = redactCredentials;
 
-const PEM_BEGIN = /-----BEGIN [^-\r\n]+ PRIVATE KEY-----/u;
-const PEM_END = /-----END [^-\r\n]+ PRIVATE KEY-----/u;
+const PEM_BEGIN = new RegExp(`-----BEGIN ${PEM_WORDS}-----`, 'u');
+const PEM_END = new RegExp(`-----END ${PEM_WORDS}-----`, 'u');
 
 /**
  * {@link redactCredentials} for a window cut from a longer stream (the

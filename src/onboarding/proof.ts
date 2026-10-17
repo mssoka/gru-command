@@ -1,7 +1,7 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
-import { chmod, lstat, readdir, rm } from 'node:fs/promises';
+import { appendFile, chmod, lstat, readdir, readFile, rm } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import type { EventRecord } from '../ledger/api.js';
@@ -12,6 +12,7 @@ import { redactCredentials, redactCredentialWindow } from '../redaction.js';
 import { CI_EVIDENCE_OMITTED_NOTICE } from '../review-inputs/ci-evidence.js';
 import { VerificationDisposedError, VerificationLockTimeoutError, verificationEnvironment, type VerificationLease } from '../verify/scheduler.js';
 import { ONBOARDING_PROOF_SCOPE, type VerificationBudget } from '../verify/server.js';
+import { psEnumerator } from '../worktrees/manager.js';
 import { applyWorktreeManifest, loadWorktreeManifest, MANIFEST_PATH, WorktreeSetupError, type SetupStreamTail, type WorktreeManifest } from '../worktrees/manifest.js';
 import { isCommitId, readOnboardingProof, type OnboardingProofResult, type ProofPath, type ProofReclaim, type ProofSetupStep, type ProofVerify } from './proof-record.js';
 
@@ -51,10 +52,17 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  *   failed, the service is stopping, the head is not a commit id). Nothing
  *   is recorded; it runs again.
  *
- * The checkout is removed whatever the outcome; a boot ends any verify a
- * crash left running and removes any checkout it left behind. The output
- * tail and the failures are redacted before they leave the proof: they
- * reach the ledger and the minion.
+ * Every process the proof starts carries an environment marker
+ * ({@link ONBOARDING_PROBE_ENV}). What setup starts lives through verify
+ * (a service verify needs); before anything is measured, and whatever the
+ * outcome, every process group setup and verify started is ended, then
+ * every process still carrying the run's marker or rooted in the checkout
+ * (a daemon that left its group). The checkout is removed whatever the
+ * outcome; a boot ends every process carrying this instance's marker or
+ * rooted under its probes folder, then any verify a crash left running,
+ * and removes any checkout it left behind. The output tail and
+ * the failures are redacted before they leave the proof: they reach the
+ * ledger and the minion.
  */
 
 /** Where throwaway proof checkouts live, under the data directory. */
@@ -80,7 +88,8 @@ export function onboardingProbePath(probesDir: string, jobId: string, head: stri
 /** A verify run that exits 0 faster than this with no output tests nothing. */
 export const SUSPICIOUSLY_FAST_MS = 1_000;
 
-/** Grace between SIGTERM and SIGKILL for a verify run past its bound. */
+/** Grace between SIGTERM and SIGKILL for a verify run past its bound, and
+ * for what the proof ends before it measures (ProofProcesses). */
 const VERIFY_KILL_GRACE_MS = 5_000;
 /** Bytes of output kept for the record and the minion, after redaction. */
 const OUTPUT_TAIL_BYTES = 4 * 1024;
@@ -91,6 +100,17 @@ const OUTPUT_WINDOW_BYTES = 16 * 1024;
 const APPEARED_LISTED = 50;
 /** The environment variable a verify shell evaluates its command from. */
 const VERIFY_COMMAND_ENV = 'GRU_ONBOARDING_VERIFY';
+
+/** The environment marker every process a proof starts carries:
+ * `GRU_ONBOARDING_PROBE=<instance>.<run>`. A process that scrubs its
+ * environment drops it, and a platform whose `ps` hides other processes'
+ * environments (current macOS) cannot read it. */
+export const ONBOARDING_PROBE_ENV = 'GRU_ONBOARDING_PROBE';
+
+/** This GC instance's marker prefix: a digest of its probes folder, so one
+ * instance's boot never ends another instance's proof on the same host. */
+export const onboardingProbeInstance = (probesDir: string): string =>
+  createHash('sha256').update(resolve(probesDir)).digest('hex').slice(0, 12);
 
 export type OnboardingProofOutcome =
   | { readonly kind: 'proven'; readonly result: OnboardingProofResult }
@@ -146,9 +166,20 @@ function fromBoundary(text: string): string {
   return word === -1 ? '' : text.slice(word + 1);
 }
 
-/** The last `max` UTF-8 bytes of a text, starting at a boundary. */
-function boundedTail(text: string, max: number): string {
-  return Buffer.byteLength(text, 'utf8') <= max ? text : fromBoundary(utf8Tail(text, max));
+/** The first line of a tail that starts inside a line longer than the
+ * tail: a fragment is kept rather than nothing, and says so. */
+const MID_LINE = '(output tail starts mid-line)\n';
+
+/** The last `max` UTF-8 bytes of a text, starting at a boundary. With no
+ * boundary to start at (one line longer than the tail, or a text that
+ * already starts mid-line), its last bytes after {@link MID_LINE}: a
+ * command that printed something never records an empty tail. */
+function boundedTail(text: string, max: number, midLine: boolean): string {
+  const bytes = Buffer.byteLength(text, 'utf8');
+  if (bytes <= max && !midLine) return text;
+  const whole = bytes <= max ? '' : fromBoundary(utf8Tail(text, max));
+  if (whole.trim() !== '' || text.trim() === '') return whole;
+  return `${MID_LINE}${utf8Tail(text, max - Buffer.byteLength(MID_LINE, 'utf8'))}`;
 }
 
 /** One stream's latest output, as a command keeps it. */
@@ -159,15 +190,22 @@ type OutputWindow = SetupStreamTail;
  * redacted whole (a key whose BEGIN line fell before the window is
  * redacted from the window's start), then the last {@link OUTPUT_TAIL_BYTES}
  * cut at a line. The bound holds after redaction, and a cut never shows
- * half a credential.
+ * half a credential: a window that starts mid-stream is redacted from its
+ * first whole line, or, when one line fills it, whole (its start lies far
+ * before the tail's) and the tail is marked as starting mid-line.
  */
 function recordedTail(windows: readonly OutputWindow[]): string {
+  let midLine = false;
   const redacted = windows.map((window) => {
     const cut = Buffer.byteLength(window.text, 'utf8') > OUTPUT_WINDOW_BYTES;
     const text = cut ? utf8Tail(window.text, OUTPUT_WINDOW_BYTES) : window.text;
-    return redactCredentialWindow(cut || window.truncated ? fromBoundary(text) : text);
+    if (!cut && !window.truncated) return redactCredentialWindow(text);
+    const whole = fromBoundary(text);
+    if (whole.trim() !== '' || text.trim() === '') return redactCredentialWindow(whole);
+    midLine = true;
+    return redactCredentialWindow(text);
   }).filter((text) => text !== '');
-  return boundedTail(redacted.join('\n'), OUTPUT_TAIL_BYTES);
+  return boundedTail(redacted.join('\n'), OUTPUT_TAIL_BYTES, midLine);
 }
 
 class ProofStopping extends Error {
@@ -191,21 +229,32 @@ const probeGitEnv = (kind: ProbeGitEnv): NodeJS.ProcessEnv => (kind === 'lane'
   ? { ...repositoryGitEnv(true), GIT_TERMINAL_PROMPT: '0' }
   : { PATH: process.env['PATH'] ?? '/usr/bin:/bin', LC_ALL: 'C', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0' });
 
+interface ProbeGitOptions {
+  readonly env?: ProbeGitEnv;
+  readonly timeoutMs?: number;
+  /** Added to the environment (the proof's marker, for a step whose
+   * filters may leave a process behind). */
+  readonly marker?: Readonly<Record<string, string>>;
+}
+
 /** Git in a probe checkout: no hooks, no fsmonitor, no prompts, off the
- * event loop. Resolves with the exit code; a failure to run rejects. */
-function probeGitExit(cwd: string, args: readonly string[], opts: { readonly env?: ProbeGitEnv; readonly timeoutMs?: number } = {}): Promise<{ readonly code: number; readonly stdout: string; readonly stderr: string }> {
+ * event loop. Resolves with the exit code; a failure to run, or a run past
+ * its bound (named as such), rejects. */
+function probeGitExit(cwd: string, args: readonly string[], opts: ProbeGitOptions = {}): Promise<{ readonly code: number; readonly stdout: string; readonly stderr: string }> {
+  const timeoutMs = opts.timeoutMs ?? 300_000;
   return new Promise((resolve, reject) => {
     execFile('git', ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', ...args], {
-      cwd, encoding: 'utf8', timeout: opts.timeoutMs ?? 300_000, maxBuffer: 64 * 1024 * 1024, env: probeGitEnv(opts.env ?? 'measure'),
+      cwd, encoding: 'utf8', timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024, env: { ...probeGitEnv(opts.env ?? 'measure'), ...opts.marker },
     }, (error, stdout, stderr) => {
-      if (error !== null && typeof error.code !== 'number') reject(new Error(`git ${args[0] ?? ''} could not run: ${oneLine(error)}`));
+      if (error?.killed === true && error.code !== 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') reject(new Error(`git ${args[0] ?? ''} timed out after ${String(timeoutMs)} ms`));
+      else if (error !== null && typeof error.code !== 'number') reject(new Error(`git ${args[0] ?? ''} could not run: ${oneLine(error)}`));
       else resolve({ code: typeof error?.code === 'number' ? error.code : 0, stdout, stderr });
     });
   });
 }
 
 /** {@link probeGitExit} that requires success: the output. */
-async function probeGit(cwd: string, args: readonly string[], opts: { readonly env?: ProbeGitEnv; readonly timeoutMs?: number } = {}): Promise<string> {
+async function probeGit(cwd: string, args: readonly string[], opts: ProbeGitOptions = {}): Promise<string> {
   const run = await probeGitExit(cwd, args, opts);
   if (run.code !== 0) throw new Error(`git ${args[0] ?? ''} exited ${String(run.code)}: ${oneLine(run.stderr.trim() === '' ? '(no output)' : run.stderr)}`);
   return run.stdout;
@@ -219,24 +268,54 @@ async function repoConfig(repoPath: string, key: string): Promise<string | null>
   return run.stdout.trim() === '' ? null : run.stdout.trim();
 }
 
+/** The repository-local config a lane shares with its repository and an
+ * LFS smudge reads: LFS, HTTP, credential and URL-rewrite settings, and
+ * its origin. `lfs.storage` is resolved on its own (a relative one names a
+ * folder inside the repository's git dir). */
+const sharedLaneConfig = (key: string): boolean =>
+  (/^(?:lfs|http|credential|url)\./u.test(key) && key !== 'lfs.storage') || key === 'remote.origin.url';
+
+/** One config entry as git's config file spells it (`--list` gives
+ * `section[.subsection].name`, the section and name lowercased): quoted
+ * and escaped, so a value never needs a command line. */
+function configEntryText(key: string, value: string | null): string {
+  const first = key.indexOf('.');
+  const last = key.lastIndexOf('.');
+  // A subsection escapes only a backslash and a double quote (it holds no
+  // line break); a value escapes line breaks and tabs too.
+  const subsection = (text: string): string => `"${text.replace(/[\\"]/gu, (char) => `\\${char}`)}"`;
+  const quoted = (text: string): string => `"${text.replace(/[\\"]/gu, (char) => `\\${char}`).replace(/\n/gu, '\\n').replace(/\t/gu, '\\t')}"`;
+  const header = first === last ? `[${key.slice(0, first)}]` : `[${key.slice(0, first)} ${subsection(key.slice(first + 1, last))}]`;
+  return `${header}\n\t${key.slice(last + 1)}${value === null ? '' : ` = ${quoted(value)}`}\n`;
+}
+
 /**
  * A head that uses Git LFS (a `.gitattributes` names `filter=lfs`) is
- * checked out as a lane's `worktree add` checks it out: the probe's origin
- * is the managed repository's own origin (and its `lfs.url`, if set), and
- * its LFS store is the managed repository's, so smudge reads the local
- * store first and fetches only missing objects from the real remote, into
- * that same store. Only the probe's own config is written.
+ * checked out as a lane's `worktree add` checks it out. A lane shares its
+ * repository's config, so the probe gets every repository-local entry an
+ * LFS smudge reads (its LFS, HTTP, credential and URL-rewrite settings,
+ * and its origin), and its LFS store is the repository's own (its
+ * `lfs.storage`, else `<common dir>/lfs`): smudge reads the local store
+ * first and fetches only missing objects, with the repository's own auth,
+ * into that same store. Only the probe's own config file is written, and
+ * no copied value is logged or put on a command line.
  */
 async function shareLfsLikeALane(repoPath: string, dir: string, head: string): Promise<void> {
   const uses = await probeGitExit(dir, ['grep', '-q', '-e', 'filter=lfs', head, '--', ':(glob)**/.gitattributes'], { timeoutMs: 120_000 });
   if (uses.code === 1) return;
   if (uses.code !== 0) throw new Error(`git grep for LFS attributes exited ${String(uses.code)}: ${oneLine(uses.stderr.trim() === '' ? '(no output)' : uses.stderr)}`);
-  const origin = await repoConfig(repoPath, 'remote.origin.url');
-  const lfsUrl = await repoConfig(repoPath, 'lfs.url');
+  const local = await probeGit(repoPath, ['config', '--local', '--list', '-z'], { env: 'lane', timeoutMs: 30_000 });
+  const entries = local.split('\0').filter((entry) => entry !== '').map((entry) => {
+    const at = entry.indexOf('\n');
+    return at === -1 ? { key: entry, value: null } : { key: entry.slice(0, at), value: entry.slice(at + 1) };
+  }).filter((entry) => sharedLaneConfig(entry.key));
   const commonDir = resolve(repoPath, (await probeGit(repoPath, ['rev-parse', '--git-common-dir'], { env: 'lane', timeoutMs: 30_000 })).trim());
-  if (origin !== null) await probeGit(dir, ['config', 'remote.origin.url', origin]);
-  if (lfsUrl !== null) await probeGit(dir, ['config', 'lfs.url', lfsUrl]);
-  await probeGit(dir, ['config', 'lfs.storage', join(commonDir, 'lfs')]);
+  const storage = await repoConfig(repoPath, 'lfs.storage');
+  // The clone's own origin is the managed repository's path: the
+  // repository's origin, when it has one, replaces it.
+  if (entries.some((entry) => entry.key === 'remote.origin.url')) await probeGit(dir, ['config', '--unset-all', 'remote.origin.url']);
+  const copied = [...entries, { key: 'lfs.storage', value: storage === null ? join(commonDir, 'lfs') : resolve(commonDir, storage) }];
+  await appendFile(join(dir, '.git', 'config'), copied.map((entry) => configEntryText(entry.key, entry.value)).join(''), 'utf8');
 }
 
 /** Git refuses a pathspec that passes through a symbolic link (exit 128). */
@@ -368,29 +447,159 @@ function splitFailure(error: unknown): { readonly reason: string; readonly tail:
   return { reason, tail: error instanceof WorktreeSetupError ? recordedTail([error.output.stdout, error.output.stderr]) : '' };
 }
 
+/** Signal a process (a pid) or a process group (a negated pgid); false
+ * when nothing by that id lives (one that lives but is not ours counts). */
+function signalProcess(target: number, signal: NodeJS.Signals | 0): boolean {
+  try {
+    process.kill(target, signal);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/** End processes or groups: SIGTERM, then SIGKILL to what still lives after the grace. */
+async function endProcesses(targets: readonly number[], graceMs: number): Promise<void> {
+  const living = targets.filter((target) => signalProcess(target, 'SIGTERM'));
+  const deadline = Date.now() + graceMs;
+  while (living.some((target) => signalProcess(target, 0)) && Date.now() < deadline) await new Promise((wake) => { setTimeout(wake, 25); });
+  for (const target of living) signalProcess(target, 'SIGKILL');
+}
+
+/** The pids (never this process's own) whose environment carries a probe
+ * marker `matches` accepts. Linux reads each `/proc/<pid>/environ` (what
+ * `ps e` prints); elsewhere `ps -axEww` prints each environment after its
+ * command (on macOS `-E` shows the environment; `-e` selects every
+ * process). A process that scrubbed its environment is never found, nor is
+ * any where the platform hides other processes' environments (current
+ * macOS shows a process only its own). Throws when processes cannot be
+ * listed. */
+async function markedProcesses(matches: (marker: string) => boolean): Promise<readonly number[]> {
+  const prefix = `${ONBOARDING_PROBE_ENV}=`;
+  const marked = (entries: readonly string[]): boolean => entries.some((entry) => entry.startsWith(prefix) && matches(entry.slice(prefix.length)));
+  const pids: number[] = [];
+  if (process.platform === 'linux') {
+    for (const name of await readdir('/proc')) {
+      if (!/^\d+$/u.test(name) || Number(name) === process.pid) continue;
+      let environ: string;
+      try {
+        environ = await readFile(join('/proc', name, 'environ'), 'utf8');
+      } catch {
+        continue; // ended meanwhile, or another user's
+      }
+      if (marked(environ.split('\0'))) pids.push(Number(name));
+    }
+    return pids;
+  }
+  const listing = await new Promise<string>((resolveListing, reject) => {
+    execFile('ps', ['-axEww', '-o', 'pid=,command='], { encoding: 'utf8', timeout: 30_000, maxBuffer: 256 * 1024 * 1024 }, (error, stdout) => {
+      if (error !== null) reject(new Error(`ps could not list processes: ${oneLine(error)}`));
+      else resolveListing(stdout);
+    });
+  });
+  for (const line of listing.split('\n')) {
+    const row = /^\s*(\d+)\s+(.*)$/su.exec(line);
+    if (row === null || Number(row[1]) === process.pid) continue;
+    if (marked(row[2]!.split(/\s+/u))) pids.push(Number(row[1]));
+  }
+  return pids;
+}
+
+/** The pids rooted under a folder: a cwd inside it, or a command line that
+ * names a path inside it, as the worktree manager's sweep enumerates a
+ * lane's processes (Linux `/proc`, macOS `lsof`). It finds a daemon that
+ * left its group and scrubbed its environment, on every platform, while
+ * its cwd stays in the folder. Throws when processes cannot be listed. */
+function rootedProcesses(folder: string): readonly number[] {
+  return psEnumerator(folder).map((entry) => entry.pid);
+}
+
+/** The pids two listings name, each listed once; a listing that fails is
+ * logged and the other still counts. */
+async function strayPids(listings: readonly (readonly [string, () => Promise<readonly number[]> | readonly number[]])[], log: Log, what: string): Promise<readonly number[]> {
+  const pids = new Set<number>();
+  for (const [name, list] of listings) {
+    try {
+      for (const pid of await list()) pids.add(pid);
+    } catch (error) {
+      log('error', `onboarding proof: ${name} could not be listed; ${what}`, { error: oneLine(error) });
+    }
+  }
+  return [...pids];
+}
+
+/** The processes one proof starts. Each carries the run's marker, and each
+ * setup and verify command leads its own process group. */
+class ProofProcesses {
+  readonly marker: string;
+  private readonly groups = new Set<number>();
+  private ended = false;
+
+  constructor(probesDir: string, private readonly dir: string, private readonly graceMs: number, private readonly log: Log) {
+    this.marker = `${onboardingProbeInstance(probesDir)}.${randomBytes(6).toString('hex')}`;
+  }
+
+  get env(): Readonly<Record<string, string>> {
+    return { [ONBOARDING_PROBE_ENV]: this.marker };
+  }
+
+  /** A setup or verify command's pid, which leads its own process group. */
+  group(pid: number): void {
+    this.groups.add(pid);
+  }
+
+  /** Before anything is measured, and whatever the outcome: every process
+   * group setup and verify started, then every process still carrying the
+   * run's marker or rooted in the checkout (a daemon that left its group:
+   * `setsid`, a double fork), SIGTERM and then SIGKILL after the grace.
+   * Once: nothing the proof runs afterwards carries the marker or starts
+   * in the checkout before it is measured and removed. */
+  async end(): Promise<void> {
+    if (this.ended) return;
+    this.ended = true;
+    await endProcesses([...this.groups].map((pid) => -pid), this.graceMs);
+    const strays = await strayPids([
+      ['the processes carrying its marker', () => markedProcesses((marker) => marker === this.marker)],
+      ['the processes rooted in its checkout', () => rootedProcesses(this.dir)],
+    ], this.log, 'a daemon that left its process group may outlive the proof');
+    if (strays.length === 0) return;
+    this.log('info', 'onboarding proof: ending processes that left their process group but carry its marker or are rooted in its checkout', { pids: strays });
+    await endProcesses(strays, this.graceMs);
+  }
+}
+
 export async function runOnboardingProof(input: OnboardingProofInput): Promise<OnboardingProofOutcome> {
   // Refused before anything touches the disk: the head names the checkout
   // folder and reaches git's command line.
   if (!isCommitId(input.head)) return deferred(`the delivered head ${JSON.stringify(input.head.slice(0, 80))} is not a full commit id; nothing was cloned`);
   const log = input.log ?? (() => {});
   const dir = onboardingProbePath(input.probesDir, input.jobId, input.head);
+  const processes = new ProofProcesses(input.probesDir, dir, input.killGraceMs ?? VERIFY_KILL_GRACE_MS, log);
   try {
     if (input.signal.aborted) return deferred('the service is stopping');
     mkdirSync(input.probesDir, { recursive: true, mode: 0o700 });
     await removeProbe(dir);
     try {
-      await probeGit(input.probesDir, ['clone', '--quiet', '--shared', '--no-checkout', input.repoPath, dir], { env: 'lane' });
+      await probeGit(input.probesDir, ['clone', '--quiet', '--shared', '--no-checkout', input.repoPath, dir], { env: 'lane', marker: processes.env });
       await shareLfsLikeALane(input.repoPath, dir, input.head);
-      // Bounded like a lane's setup: an LFS smudge may fetch large content.
-      await probeGit(dir, ['checkout', '--quiet', '--detach', '--end-of-options', input.head], { env: 'lane', timeoutMs: input.setupTimeoutMs });
+      // An LFS smudge may fetch large content, and a lane's `worktree add`
+      // has no short bound: the larger of the setup and verify bounds.
+      // The head was checked to be a full hex commit id above, so it can
+      // never be read as an option; `--end-of-options` is not used because
+      // older `git checkout` rejects it (seen on 2.39, Debian bookworm's).
+      await probeGit(dir, ['checkout', '--quiet', '--detach', input.head], {
+        env: 'lane', marker: processes.env, timeoutMs: Math.max(input.setupTimeoutMs, input.runTimeoutMs),
+      });
     } catch (error) {
       return deferred(`the throwaway clone of ${input.head.slice(0, 12)} failed: ${oneLine(error)}`);
     }
-    return await prove(input, dir, log);
+    return await prove(input, dir, log, processes);
   } catch (error) {
     if (error instanceof ProofStopping) return deferred('the service is stopping');
     return deferred(`the proof could not run: ${oneLine(error)}`);
   } finally {
+    // Nothing the proof started outlives it, nor writes while it is removed.
+    await processes.end();
     try {
       await removeProbe(dir);
     } catch (error) {
@@ -399,7 +608,7 @@ export async function runOnboardingProof(input: OnboardingProofInput): Promise<O
   }
 }
 
-async function prove(input: OnboardingProofInput, dir: string, log: Log): Promise<OnboardingProofOutcome> {
+async function prove(input: OnboardingProofInput, dir: string, log: Log, processes: ProofProcesses): Promise<OnboardingProofOutcome> {
   // What leaves the proof reaches the ledger, the minion and a PR comment
   // that may be public: anything that looks like a credential is masked.
   // The output tail was redacted as it was cut (recordedTail).
@@ -426,10 +635,13 @@ async function prove(input: OnboardingProofInput, dir: string, log: Log): Promis
 
   // The head's own manifest, applied as a lane's bootstrap applies it:
   // links and copies from the repository checkout, then each setup command
-  // on its own so each is timed. Unlike a lane, nothing a setup command
-  // starts outlives it: it would write into the checkout while it is
-  // measured and removed.
-  const applyOptions = { sourceRoot: input.repoPath, worktreePath: dir, setupTimeoutMs: input.setupTimeoutMs, log, signal: input.signal, endGroupAfterExit: true };
+  // on its own so each is timed. As in a lane, what a setup command starts
+  // (a service verify needs) lives on; it is ended once verify ran, before
+  // anything is measured (ProofProcesses).
+  const applyOptions = {
+    sourceRoot: input.repoPath, worktreePath: dir, setupTimeoutMs: input.setupTimeoutMs, log, signal: input.signal,
+    env: processes.env, onSpawn: (pid: number) => processes.group(pid),
+  };
   try {
     await applyWorktreeManifest({ ...manifest, setup: [] }, applyOptions);
   } catch (error) {
@@ -462,7 +674,7 @@ async function prove(input: OnboardingProofInput, dir: string, log: Log): Promis
   if (command === null) {
     verify = { command: null, exitCode: null, signal: null, timedOut: false, ms: 0, queuedMs: 0, workers: null, outputBytes: 0 };
   } else {
-    const ran = await leasedVerify(input, dir, command, log);
+    const ran = await leasedVerify(input, dir, command, log, processes);
     if (ran.kind === 'deferred') return ran;
     verify = ran.verify;
     outputTail = ran.tail;
@@ -473,6 +685,8 @@ async function prove(input: OnboardingProofInput, dir: string, log: Log): Promis
     }
   }
 
+  // Nothing setup or verify started writes while the checkout is measured.
+  await processes.end();
   const after = await ignoredPaths(dir);
   const appearedPaths = after.filter((path) => !before.has(path));
   const appeared: ProofPath[] = [];
@@ -533,7 +747,7 @@ type LeasedRun =
  * restart judges an orphan by that pid), bounds it by `run_timeout_ms` with
  * a process-group kill, and releases the slot. The scheduler records nothing
  * for this scope. */
-async function leasedVerify(input: OnboardingProofInput, dir: string, command: string, log: Log): Promise<LeasedRun> {
+async function leasedVerify(input: OnboardingProofInput, dir: string, command: string, log: Log, processes: ProofProcesses): Promise<LeasedRun> {
   let budget: VerificationBudget;
   try {
     budget = input.budget();
@@ -557,8 +771,9 @@ async function leasedVerify(input: OnboardingProofInput, dir: string, command: s
   try {
     const queuedMs = Date.now() - queuedAt;
     const workers = budget.workersPerRun;
-    const env = verificationEnvironment(repositoryGitEnv(false), { runId: lease.runId, jobId: input.jobId, scope: ONBOARDING_PROOF_SCOPE, workers });
+    const env = { ...verificationEnvironment(repositoryGitEnv(false), { runId: lease.runId, jobId: input.jobId, scope: ONBOARDING_PROOF_SCOPE, workers }), ...processes.env };
     const onSpawn = (pid: number, processCommand: string): void => {
+      processes.group(pid);
       try {
         budget.bindPid(lease, pid, processCommand);
       } catch (error) {
@@ -671,26 +886,49 @@ async function runCommand(command: string, cwd: string, env: NodeJS.ProcessEnv, 
   return { exitCode: exit.code, signal: exit.signal, timedOut, stopped, spawnError: exit.error, ms, outputBytes, hasOutput, tail: recordedTail([{ text: window, truncated }]) };
 }
 
-/** What `ps` says of one pid: its process group and command line; null
- * when no such process lives. */
-function processOf(pid: number): Promise<{ readonly pgid: number; readonly command: string } | null> {
+/** What `ps` says of one live pid: its process group and command line.
+ * Rejects when `ps` cannot run or prints nothing it can read: never taken
+ * as the process being gone. */
+function processOf(pid: number): Promise<{ readonly pgid: number; readonly command: string }> {
   return new Promise((resolveProcess, reject) => {
     execFile('ps', ['-ww', '-o', 'pgid=', '-o', 'command=', '-p', String(pid)], { encoding: 'utf8', timeout: 30_000 }, (error, stdout) => {
       const line = /^\s*(\d+)\s+(.*?)\s*$/su.exec(stdout);
       if (line !== null) resolveProcess({ pgid: Number(line[1]), command: line[2]! });
-      else if (error !== null && typeof error.code === 'number') resolveProcess(null);
-      else reject(new Error(`ps could not read pid ${String(pid)}: ${oneLine(error ?? stdout)}`));
+      else reject(new Error(`ps could not read pid ${String(pid)}: ${oneLine(error ?? (stdout.trim() === '' ? '(no output)' : stdout))}`));
     });
   });
 }
 
 /**
- * Boot, before the leftover checkouts are removed: a verify a crashed run
+ * Boot, before the leftover checkouts are removed: proofs run one at a time
+ * and the service has just started, so every process carrying this
+ * instance's marker, or rooted under its probes folder (a setup's service
+ * or daemon, a verify, a daemon that left its group), is an orphan of a
+ * crashed run: each is ended, SIGTERM and then SIGKILL after the grace.
+ * Another instance's markers and probes are left alone. A failure to list
+ * processes is logged, never thrown.
+ */
+export async function endOrphanedProbeProcesses(probesDir: string, log: Log = () => {}, graceMs = VERIFY_KILL_GRACE_MS): Promise<void> {
+  const instance = `${onboardingProbeInstance(probesDir)}.`;
+  const orphans = await strayPids([
+    ['the processes carrying this instance\'s marker', () => markedProcesses((marker) => marker.startsWith(instance))],
+    ['the processes rooted under the probes folder', () => rootedProcesses(probesDir)],
+  ], log, 'such an orphan an earlier run left is not ended now');
+  if (orphans.length === 0) return;
+  await endProcesses(orphans, graceMs);
+  log('warn', 'onboarding proof: processes an earlier run left (they carry its marker or are rooted in its checkouts) were ended', { pids: orphans });
+}
+
+/**
+ * Boot, after {@link endOrphanedProbeProcesses}: a verify a crashed run
  * left behind still holds its budget slot (its pid was bound to it). Each
  * one whose pid is alive, leads its own process group and runs the argv
  * bound with it has that group ended (SIGKILL) and its slot released. A
- * live pid that is not that verify (a recycled pid) is never signalled:
- * its slot is left to the scheduler's age limit.
+ * slot is released as gone only when neither its pid nor any member of its
+ * process group lives (`kill(-pgid, 0)`): a group member that outlived its
+ * leader keeps the slot. A live pid that is not that verify (a recycled
+ * pid) is never signalled, and a pid `ps` cannot read is an error; either
+ * slot is left to the scheduler's age limit.
  */
 export async function endOrphanedProofVerifies(budget: () => VerificationBudget, log: Log = () => {}): Promise<void> {
   let slots: VerificationBudget;
@@ -704,12 +942,16 @@ export async function endOrphanedProofVerifies(budget: () => VerificationBudget,
     const fields = { run: holder.lease.runId, job: holder.lease.jobId, pid: holder.pid };
     // One slot that cannot be judged never holds up the rest, or the sweep after.
     try {
-      const running = await processOf(holder.pid);
-      if (running === null) {
+      if (!signalProcess(holder.pid, 0)) {
+        if (signalProcess(-holder.pid, 0)) {
+          log('warn', 'onboarding proof: a budget slot an earlier run left names a verify whose leader is gone but a member of its process group lives; the slot waits for the scheduler\'s age limit', fields);
+          continue;
+        }
         slots.release(holder.lease);
         log('warn', 'onboarding proof: a budget slot an earlier run left was released; its verify is gone', fields);
         continue;
       }
+      const running = await processOf(holder.pid);
       if (running.pgid !== holder.pid || holder.processCommand === null || running.command !== holder.processCommand) {
         log('warn', 'onboarding proof: a budget slot an earlier run left names a live pid that is not its verify; the pid is not signalled and the slot waits for the scheduler\'s age limit', {
           ...fields, recorded: holder.processCommand, running: running.command,
@@ -735,8 +977,14 @@ export async function endOrphanedProofVerifies(budget: () => VerificationBudget,
 
 // The payload and its reader: proof-record.ts.
 
-/** The hidden marker that identifies a proof's PR comment (one per head). */
-export const onboardingProofMarker = (jobId: string, head: string): string => `<!-- gru:onboarding-proof job=${jobId} head=${head} -->`;
+/** The hidden marker that identifies a proof's PR comment (one per head).
+ * The nonce is the one its `onboarding.proof-comment-attempt` recorded:
+ * job and head are public, the nonce is not until GC posts it, so no one
+ * else can post a comment GC would take as its own. */
+export const onboardingProofMarker = (jobId: string, head: string, nonce: string): string => `<!-- gru:onboarding-proof job=${jobId} head=${head} nonce=${nonce} -->`;
+
+/** A fresh nonce for one comment attempt's marker. */
+export const onboardingProofCommentNonce = (): string => randomBytes(8).toString('hex');
 
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${String(bytes)} B`;
@@ -768,10 +1016,10 @@ function verifyLine(verify: ProofVerify | null): string {
   return `${code(verify.command)}: ${ended} in ${seconds(verify.ms)}, ${formatBytes(verify.outputBytes)} of output`;
 }
 
-/** The PR comment: one per proven head, the marker first. */
-export function renderOnboardingProofComment(jobId: string, result: OnboardingProofResult): string {
+/** The PR comment: one per proven head, the marker (with its attempt's nonce) first. */
+export function renderOnboardingProofComment(jobId: string, result: OnboardingProofResult, nonce: string): string {
   const lines = [
-    onboardingProofMarker(jobId, result.head),
+    onboardingProofMarker(jobId, result.head, nonce),
     `### GC onboarding proof: ${result.passed ? 'passed' : 'failed'}`,
     '',
     `GC cloned \`${result.head}\` into a throwaway checkout, applied its \`${MANIFEST_PATH}\` setup, and ran \`verify.full\` under its verification budget.`,
@@ -834,8 +1082,10 @@ export const ONBOARDING_PROOF_EVIDENCE_MAX_BYTES = 4 * 1024;
  * the CI section needs: the CI block's when that block fits the spec on its
  * own, else the CI omission notice's (what appendCiEvidence then renders).
  * A block that does not fit beside it freezes as a short omission notice;
- * when not even the notice fits, the freeze is refused, naming the section
- * that did not fit. */
+ * a notice that does not fit beside the CI block still freezes when it fits
+ * beside the CI omission notice (appendCiEvidence then degrades to that).
+ * Only when the notice fits beside neither is the freeze refused, naming
+ * the section that did not fit. */
 export function appendOnboardingProof(input: {
   readonly spec: string;
   readonly block: string | null;
@@ -864,6 +1114,10 @@ export function appendOnboardingProof(input: {
   const fallback = `${input.spec}\n\n${omitted}`;
   if (fits(fallback, ciReserve)) {
     input.log?.('warn', 'the onboarding proof block does not fit the frozen spec bound beside the CI evidence; rendering the omission notice', sizes);
+    return fallback;
+  }
+  if (ciBlockFits && fits(fallback, ciRoom(CI_EVIDENCE_OMITTED_NOTICE))) {
+    input.log?.('warn', 'the onboarding proof notice does not fit the frozen spec bound beside the CI evidence block; rendering it beside the CI omission notice', sizes);
     return fallback;
   }
   if (!fits(input.spec, ciRoom(CI_EVIDENCE_OMITTED_NOTICE))) {

@@ -237,13 +237,16 @@ latest revision → verify → fresh review. The service enforces it centrally.
   route the corrective verification fences (arm, freeze, queued handoff, fallback admission
   and iteration, the Silas review offer); the blocker carries `onboarding_proof_required_head`
   (null when there is no head) and `onboarding_proof_reason` (`no-delivery`, `no-commit`,
-  `unproven` or `failed`). The exact commit under review must pass too: an arm that names a
-  target, or whose lane HEAD is not the delivered head, is refused at the arm with a `409`
-  before any round exists; the freeze checks the exact sha it reviews last (a live PR head
-  pushed after the delivery); and the bmad-review fallback, which reviews the lane HEAD, checks
-  that commit at admission and at each iteration. Like a pending correction, `force` never
-  waives it, and the `409 branch_busy` hint says so (or says the minion must deliver again, or
-  has not delivered yet). Every `branch-idle.refused` audit records `forced` (force was
+  `unproven`, `failed`, or `uncommitted`). The exact commit under review must pass too: an arm
+  that names a target is refused at the arm with a `409` before any round exists (an arm with
+  no target reviews the live PR head, never a commit left unpushed in the lane); the freeze
+  checks the exact sha it reviews last (a live PR head pushed after the delivery); and the
+  bmad-review fallback, which reviews the lane's working tree, needs a passing proof of the
+  lane HEAD and a lane with no uncommitted changes the proof never ran (tracked edits or
+  untracked files git does not ignore), at admission and at each iteration. Like a pending
+  correction, `force` never waives it, and the `409 branch_busy` hint says so (or says the
+  minion must deliver again, has not delivered yet, or must commit or discard its lane's
+  changes). Every `branch-idle.refused` audit records `forced` (force was
   applied: blockers waived) and `force_requested` (the request asked for force), so an
   onboarding refusal under force records `forced: false, force_requested: true`. A worker's own
   review request is queued and replayed on the `onboarding.proof` event, also after a restart.
@@ -254,8 +257,10 @@ latest revision → verify → fresh review. The service enforces it centrally.
   verification and the CI evidence; every minion-written field in it is one line that cannot
   carry the block's end marker. The block, or its omission notice, never takes the room the CI
   section needs: the CI block's when that block fits on its own, else the CI omission notice's.
-  A block that does not fit freezes as an omission notice, and when not even that fits, the
-  freeze is refused, naming the section that did not fit.
+  A block that does not fit freezes as an omission notice; a notice that does not fit beside
+  the CI block still freezes beside the CI omission notice, which the CI section then renders.
+  Only when the notice fits beside neither is the freeze refused, naming the section that did
+  not fit.
 - **A historical-only delivery owes a current inspection (owner decision 2026-10-16, #361).**
   When a job's newest delivery is history (a completion recorded without proving a current
   candidate) while a corrective verification or a contract revision is still owed, no

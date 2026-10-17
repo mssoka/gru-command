@@ -255,6 +255,32 @@ describe('worktree bootstrap manifest (E8, ruling 18a)', () => {
     }
   });
 
+  it('a lane setup that times out ends a member of its group that ignores SIGTERM and holds no pipe: the SIGKILL escalation stays armed while any member lives (#427)', async () => {
+    const repo = makeFixtureRepo('fixture-termdaemon');
+    try {
+      mkdirSync(join(repo.path, '.gru-command'), { recursive: true });
+      writeFileSync(
+        manifestFile(repo.path),
+        `[[setup]]\ncommand = '''sh -c 'trap "" TERM; echo ready > .daemon-ready; sleep 30' >/dev/null 2>&1 & echo $! > .daemon-pid; sleep 30'''\n`,
+      );
+      const manifest = loadWorktreeManifest(repo.path);
+      const worktreePath = join(repo.path, '..', 'fixture-termdaemon-wt');
+      repo.git(['worktree', 'add', worktreePath, 'HEAD']);
+      const applied = applyWorktreeManifest(manifest!, { sourceRoot: repo.path, worktreePath, setupTimeoutMs: 1_000 });
+      await expect(applied).rejects.toThrowError(/timed out after 1000ms/);
+      // The daemon set its trap before the timeout: SIGTERM alone never ends it.
+      expect(existsSync(join(worktreePath, '.daemon-ready'))).toBe(true);
+      const pid = Number(readFileSync(join(worktreePath, '.daemon-pid'), 'utf-8').trim());
+      expect(Number.isInteger(pid) && pid > 0).toBe(true);
+      await vi.waitFor(() => {
+        expect(() => process.kill(pid, 0)).toThrow();
+      }, { timeout: 5_000 });
+      repo.git(['worktree', 'remove', '--force', worktreePath]);
+    } finally {
+      repo.cleanup();
+    }
+  });
+
   it('refuses to overwrite anything already present in the worktree', async () => {
     const repo = makeFixtureRepo('fixture-clash');
     try {

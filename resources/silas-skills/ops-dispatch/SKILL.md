@@ -199,10 +199,12 @@ without a named rule is not yours to invent:
   proof itself, comments on the PR, and sends a failure to the minion; the
   digest withholds the review offer, never the PR registration, until it
   passes, and no `force` waives it). An onboarding round also reviews only
-  a commit whose own proof passed: a named target or a lane HEAD past the
-  proven delivery is refused at the arm, a commit pushed after it waits
-  for the minion to deliver it, and a delivery that names no full commit
-  id waits for the next one. Wait for the lane delivery (and its
+  a commit whose own proof passed: a named target past the proven delivery
+  is refused at the arm (with no target the round reviews the PR head), the
+  bmad-review fallback refuses a lane HEAD past it or a lane with
+  uncommitted changes, a commit pushed after it waits for the minion to
+  deliver it, and a delivery that names no full commit id waits for the
+  next one. Wait for the lane delivery (and its
   push) to settle and for any unresolved re-brief request to finalize or
   be recovered (a delivery alone does not clear that fence), then arm. If
   you cannot tell whether the lane is still

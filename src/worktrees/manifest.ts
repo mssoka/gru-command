@@ -304,10 +304,12 @@ export interface ApplyManifestOptions {
   /** Stops a running setup command (its whole process group: SIGTERM,
    * then SIGKILL after the grace) and rejects. Lanes pass none. */
   readonly signal?: AbortSignal;
-  /** SIGKILL each setup command's whole process group once its shell
-   * exits, as a verify run is ended, so nothing it started outlives it
-   * (#427 onboarding proof). Lanes keep what their setup starts. */
-  readonly endGroupAfterExit?: boolean;
+  /** Added to each setup command's environment (#427 onboarding proof: the
+   * marker its cleanup finds every process by). Lanes pass none. */
+  readonly env?: Readonly<Record<string, string>>;
+  /** Told each setup command's pid, which leads its own process group, so
+   * a caller can end the group later (#427 onboarding proof). */
+  readonly onSpawn?: (pid: number) => void;
 }
 
 /**
@@ -359,7 +361,8 @@ export async function applyWorktreeManifest(
     const started = Date.now();
     await execSetupCommand(entry.command, opts.worktreePath, opts.setupTimeoutMs, {
       ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
-      endGroupAfterExit: opts.endGroupAfterExit === true,
+      ...(opts.env !== undefined ? { env: opts.env } : {}),
+      ...(opts.onSpawn !== undefined ? { onSpawn: opts.onSpawn } : {}),
     });
     log('info', 'worktree manifest: setup command ran', {
       command: entry.command,
@@ -427,7 +430,8 @@ export class WorktreeSetupError extends Error {
  * blocks the event loop. */
 async function execSetupCommand(command: string, cwd: string, timeoutMs: number, opts: {
   readonly signal?: AbortSignal;
-  readonly endGroupAfterExit: boolean;
+  readonly env?: Readonly<Record<string, string>>;
+  readonly onSpawn?: (pid: number) => void;
 }): Promise<void> {
   const { signal } = opts;
   if (signal?.aborted === true) throw new Error(`worktree setup command was stopped before it started: ${command}`);
@@ -435,13 +439,14 @@ async function execSetupCommand(command: string, cwd: string, timeoutMs: number,
   try {
     child = spawn('/bin/sh', ['-c', command], {
       cwd,
-      env: repositoryGitEnv(false),
+      env: { ...repositoryGitEnv(false), ...opts.env },
       detached: true, // own process group: the timeout kill reaps children too
       stdio: ['ignore', 'pipe', 'pipe'],
     });
   } catch (error) {
     throw new Error(`worktree setup command failed to spawn (${command}): ${String(error)}`);
   }
+  if (child.pid !== undefined) opts.onSpawn?.(child.pid);
   const stdout = new OutputTail();
   const stderr = new OutputTail();
   child.stdout?.on('data', (chunk: Buffer) => stdout.push(chunk));
@@ -501,9 +506,6 @@ async function execSetupCommand(command: string, cwd: string, timeoutMs: number,
   } finally {
     clearTimeout(killTimer);
     signal?.removeEventListener('abort', onAbort);
-    // The shell is gone, but a member of its group that holds no pipe (a
-    // `cmd >/dev/null 2>&1 &` daemon) may live on.
-    if (opts.endGroupAfterExit) signalTree('SIGKILL');
     // A stop or a timeout keeps its SIGKILL escalation armed while any
     // member lives: one that ignored SIGTERM must not outlive it.
     if (forceKillTimer !== undefined && !((stopped || timedOut) && groupAlive())) clearTimeout(forceKillTimer);
