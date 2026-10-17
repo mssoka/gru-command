@@ -30,7 +30,7 @@ import {
   sweepOnboardingProbes,
   type OnboardingProofInput,
   type OnboardingProofOutcome,
-  type UnconfirmedProofSlot,
+  type KeptProofSlot,
 } from './proof.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -230,13 +230,15 @@ interface Throttled {
 }
 
 /** The time a throttled call names for its retry, from its error text: a
- * `Retry-After` in seconds, or an `X-RateLimit-Reset` epoch; 0 when it
- * names neither. */
+ * `Retry-After` in seconds, or an `X-RateLimit-Reset` epoch, as a header
+ * line or a JSON field (`"retry-after": "60"`); 0 when it names neither.
+ * The `gh` adapter's errors carry no response headers today (it does not
+ * run `gh api --include`), so this applies only when a hint is present. */
 function retryNotBefore(error: unknown, now: number): number {
   const text = [error instanceof Error ? error.message : String(error), (error as { readonly causeText?: unknown } | null)?.causeText]
     .filter((part): part is string => typeof part === 'string').join('\n');
-  const after = /retry-after["']?\s*[:=]?\s*(\d+)/iu.exec(text);
-  const reset = /x-ratelimit-reset["']?\s*[:=]?\s*(\d+)/iu.exec(text);
+  const after = /retry-after["']?\s*[:=]?\s*["']?(\d+)/iu.exec(text);
+  const reset = /x-ratelimit-reset["']?\s*[:=]?\s*["']?(\d+)/iu.exec(text);
   return Math.max(0, after === null ? 0 : now + Number(after[1]) * 1000, reset === null ? 0 : Number(reset[1]) * 1000);
 }
 
@@ -752,22 +754,30 @@ export class OnboardingService {
 
   /** Boot, before any proof: end every process a crashed run left carrying
    * this instance's marker, then the verifies it left (their budget slots
-   * are released; one kept for a group nothing confirms is the proof's
-   * gets Gru a row), then remove its leftover checkouts. */
+   * are released; each one kept gets Gru a row, and a row that cannot be
+   * posted is logged and holds up neither the others nor the sweep), then
+   * remove its leftover checkouts. */
   private sweepProbes(proof: OnboardingProofOptions): void {
     this.queueProof(async () => {
       await endOrphanedProbeProcesses(proof.probesDir, this.log);
-      for (const slot of await endOrphanedProofVerifies(proof.budget, proof.probesDir, this.log)) this.slotHeld(slot);
+      for (const slot of await endOrphanedProofVerifies(proof.budget, proof.probesDir, this.log)) {
+        try {
+          this.slotHeld(slot);
+        } catch (error) {
+          this.log('error', 'onboarding proof: the row for a kept verify slot could not be posted; the probe sweep goes on', { run: slot.lease.runId, error: oneLineErrorText(error, 400) });
+        }
+      }
       await sweepOnboardingProbes(proof.probesDir, this.log);
     });
   }
 
-  /** One action-required row for a verify slot the boot judge kept: it
-   * names the process group, the slot and the age limit that releases it.
-   * Recorded before it is posted; onboarding closes it once the slot is
-   * released ({@link closeReleasedSlotRows}). */
-  private slotHeld(slot: UnconfirmedProofSlot): void {
-    const { lease, pgid, ageLimitMs } = slot;
+  /** One action-required row for a verify slot the boot judge kept: why,
+   * the live processes it listed (pid, command line, working directory),
+   * the slot and the age limit that releases it. Recorded before it is
+   * posted; onboarding closes it once the slot is released
+   * ({@link closeReleasedSlotRows}). */
+  private slotHeld(slot: KeptProofSlot): void {
+    const { lease, pgid, ageLimitMs, why, members, unlisted } = slot;
     const id = onboardingProofSlotRowId(lease.runId);
     if (this.opts.ledger.getNotification(id) !== null) return;
     const repo = this.store.jobRepo(lease.jobId);
@@ -782,23 +792,33 @@ export class OnboardingService {
       severity: 'error',
       title: `A crashed onboarding proof's verify holds a verification slot${repo === null ? '' : `: ${shown(repo)}`}`,
       detail: [
-        `Verification budget slot ${lease.runId} (job ${lease.jobId}) still holds the verify of a proof a crash interrupted. Its leader, pid ${String(pgid)}, is gone, but process group ${String(pgid)} still has live members, and none is confirmed the proof's (its marker, or a working directory or command line under the probes folder), so GC does not signal the group: its id may belong to someone else's processes now.`,
-        `The slot stays held until that group is gone or the scheduler's age limit releases it (${duration(ageLimitMs)} after the slot was granted, at ${releasedAt}); until then other verifies may wait for it.`,
-        `If those processes are strays, end them (kill -TERM -- -${String(pgid)}); the next verify's stale check then releases the slot. Onboarding closes this row once the slot is released.`,
+        `Verification budget slot ${lease.runId} (job ${lease.jobId}) still holds the verify of a proof a crash interrupted. ${why}`,
+        ...(members === null
+          ? [`Its live processes could not be listed: ${unlisted ?? 'unknown error'}.`]
+          : members.length === 0
+            ? ['GC listed no live process of it.']
+            : ['Its live processes, as GC listed them:', ...members.map((member) =>
+              `- pid ${String(member.pid)}: ${member.command ?? '(command line unknown)'} (working directory ${member.cwd ?? 'unknown'})`)]),
+        `The slot stays held until process group ${String(pgid)} is gone or the scheduler's age limit releases it (${duration(ageLimitMs)} after the slot was granted, at ${releasedAt}); until then other verifies may wait for it.`,
+        'Confirm these processes are the proof\'s before ending them: their ids may belong to someone else\'s processes now. Once they are gone, onboarding\'s next reconcile releases the slot and closes this row.',
       ].join('\n'),
     });
-    this.log('error', 'onboarding proof: a crashed proof\'s verify slot is kept for a process group nothing confirms is the proof\'s; Gru has a row', {
-      job: lease.jobId, run: lease.runId, pgid, notification: id, released_at: releasedAt,
+    this.log('error', 'onboarding proof: a crashed proof\'s verify slot is kept; Gru has a row', {
+      job: lease.jobId, run: lease.runId, pgid, notification: id, released_at: releasedAt, why,
     });
   }
 
-  /** Close the row of each kept verify slot the budget no longer holds. */
+  /** Close the row of each kept verify slot the budget no longer holds,
+   * once the scheduler judged its stale slots (a slot whose processes are
+   * gone is released then, with no verify traffic needed). */
   private closeReleasedSlotRows(proof: OnboardingProofOptions): void {
     const open = this.store.slotRows().filter((row) => this.opts.ledger.getNotification(row.notificationId)?.resolvedAt === null);
     if (open.length === 0) return;
     let held: ReadonlySet<string>;
     try {
-      held = new Set(proof.budget().restored(ONBOARDING_PROOF_SCOPE).map((holder) => holder.lease.runId));
+      const budget = proof.budget();
+      budget.reconcileStale();
+      held = new Set(budget.restored(ONBOARDING_PROOF_SCOPE).map((holder) => holder.lease.runId));
     } catch (error) {
       this.log('debug', 'onboarding proof: the verification budget is unavailable, so a kept slot\'s row is checked at the next reconcile', { error: oneLineErrorText(error, 400) });
       return;
@@ -1008,15 +1028,14 @@ export class OnboardingService {
     if (first === undefined) {
       // A row of this head closes only once its reason is known to have
       // cleared; with no reason and no known clear it stays as it is.
-      const newestSeq = this.opts.ledger.newestDeliveredHead(jobId)?.seq ?? 0;
-      this.closeRows(jobId, (row) => row.head === head && this.reasonCleared(row, directive, newestSeq), 'the head is no longer stuck');
+      this.closeRows(jobId, (row) => row.head === head && this.reasonCleared(row, directive), 'the head is no longer stuck');
       return;
     }
     this.closeRows(jobId, (row) => row.reason !== first.reason, `the head is stuck for another reason now (${first.reason})`);
     const open = this.store.attentionRows(jobId).some((row) => row.head === head && row.reason === first.reason &&
       this.opts.ledger.getNotification(row.notificationId)?.resolvedAt === null);
     if (open) return;
-    const seq = this.opts.ledger.newestDeliveredHead(jobId)?.seq ?? 0;
+    const seq = first.reason === 'unanswered' && head !== null ? this.unansweredSeq(jobId, head) : this.opts.ledger.newestDeliveredHead(jobId)?.seq ?? 0;
     // A reason that holds again after its row closed gets a row of its own
     // (`:2`, `:3`, …): a resolved id is never posted again.
     const base = onboardingProofAttentionId(jobId, head, seq, first.reason);
@@ -1056,23 +1075,34 @@ export class OnboardingService {
    * rows before this). A reason whose evidence lives only in this
    * process's memory never clears because a restart emptied it: a deferral
    * clears only on a proof of its head; an unadmitted directive once the
-   * lane admitted it (live or settled); an unanswered failure only on a
-   * newer delivery (no further directive of a head follows a settled one,
-   * so none can answer the row; an unrelated directive on the job,
-   * Silas's or an ops one, never does). The other reasons rest on the
-   * ledger, so holding no more is their clear.
+   * lane admitted it (live or settled); an unanswered failure never here,
+   * only once a newer head is delivered (no further directive of a head
+   * follows a settled one, and a re-delivery of the same failed head
+   * answers nothing; an unrelated directive on the job, Silas's or an ops
+   * one, never does). The other reasons rest on the ledger, so holding no
+   * more is their clear.
    */
-  private reasonCleared(row: ProofAttentionRow, directive: DirectiveStanding | null, newestSeq: number): boolean {
+  private reasonCleared(row: ProofAttentionRow, directive: DirectiveStanding | null): boolean {
     switch (row.reason) {
       case 'deferred':
+      case 'unanswered':
         return false;
       case 'unadmitted':
         return directive === 'live' || directive === 'settled';
-      case 'unanswered':
-        return newestSeq > row.deliverySeq;
       default:
         return true;
     }
+  }
+
+  /** The delivery an `unanswered` row of a failed head is keyed by, which
+   * neither a re-delivery of that head nor a restart changes: the head's
+   * first delivery after its proof (the minion's answer to the directive),
+   * else, with none yet, the newest delivery. */
+  private unansweredSeq(jobId: string, head: string): number {
+    const proofSeq = this.opts.ledger.firstOnboardingProof(jobId, head)?.seq;
+    const after = proofSeq === undefined ? undefined : this.opts.ledger.listJobEventsByKinds(jobId, ['job.delivered'], { limit: 1000 })
+      .filter((event) => event.seq > proofSeq && (event.payload as { readonly sha?: unknown } | null)?.sha === head).at(-1);
+    return after?.seq ?? this.opts.ledger.newestDeliveredHead(jobId)?.seq ?? 0;
   }
 
   /** A failed head's directive settled while the newest delivery still
@@ -1108,10 +1138,11 @@ export class OnboardingService {
    * that cannot be posted; so, at once, is an unreadable record or one
    * GitHub refuses for good ({@link ONBOARDING_PROOF_COMMENT_REFUSED_STATUSES}).
    * Throttling (a rate limit, the abuse detection, content created too
-   * fast) spends no attempt: it is retried at a later reconcile, never on a
-   * trigger between two and never before a time GitHub named (a
-   * `Retry-After` or `X-RateLimit-Reset` in the error), logged at warn the
-   * first time, and once {@link ONBOARDING_PROOF_COMMENT_THROTTLE_LIMIT_MS}
+   * fast) spends no attempt: it is retried only at a later reconcile, never
+   * on a trigger, and never before a time GitHub named (a `Retry-After` or
+   * `X-RateLimit-Reset` in the error, when one is there:
+   * {@link retryNotBefore}), logged at warn the first time, and once
+   * {@link ONBOARDING_PROOF_COMMENT_THROTTLE_LIMIT_MS}
    * of wall clock passed since its first throttle in this process,
    * recorded as one that cannot be posted. An attempt recorded
    * before markers carried a nonce is looked up by the marker that build
@@ -1149,11 +1180,15 @@ export class OnboardingService {
     };
     const throttle = this.commentThrottles.get(key);
     // Throttled in this reconcile already, or before the time GitHub
-    // named: a later reconcile retries it, within the bound.
+    // named: a later reconcile retries it, within the bound. A wait that
+    // reaches into this reconcile counts it, so a trigger after the named
+    // time never retries; only the next reconcile does.
     if (throttle !== undefined && (throttle.countedAt === this.reconciles || this.now() < throttle.notBefore)) {
       if (throttle.countedAt !== this.reconciles && this.now() - throttle.since >= ONBOARDING_PROOF_COMMENT_THROTTLE_LIMIT_MS) {
         throttledFor(throttle, 'GitHub named a retry time past the bound');
+        return;
       }
+      this.commentThrottles.set(key, { ...throttle, countedAt: this.reconciles });
       return;
     }
     try {

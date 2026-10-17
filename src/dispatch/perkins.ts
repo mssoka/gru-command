@@ -3,7 +3,7 @@ import type { AgentHandle, PromptTurnVerdict } from '../runtime/types.js';
 import { promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync, writeFileSync, type Stats } from 'node:fs';
+import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, statSync, writeFileSync, type Stats } from 'node:fs';
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { LogLevel } from '../logger.js';
 import { DEFAULT_REVIEW_CHILDREN } from '../config.js';
@@ -1908,8 +1908,13 @@ export interface WaveOutcome {
  * admission). The gate stops fail-closed before the next diff intake or
  * reviewer spawn; it is never a partial round. */
 class FallbackSafetyRefusal extends Error {
-  /** A named reason the gate's abort records, with its way forward. */
-  constructor(message: string, readonly code: typeof FALLBACK_ONBOARDING_PROOF_REQUIRED | null = null) {
+  /** A named reason the gate's abort records, with its way forward (the
+   * code's own hint unless `hint` names a narrower one). */
+  constructor(
+    message: string,
+    readonly code: typeof FALLBACK_ONBOARDING_PROOF_REQUIRED | typeof FALLBACK_ONBOARDING_SOURCE_UNREADABLE | null = null,
+    readonly hint: string | null = null,
+  ) {
     super(message);
     this.name = 'FallbackSafetyRefusal';
   }
@@ -1928,6 +1933,24 @@ export const FALLBACK_ONBOARDING_PROOF_REQUIRED = 'onboarding-proof-required';
 export const FALLBACK_ONBOARDING_PROOF_HINT =
   'the minion must commit the fix, push it to the PR branch and deliver; GC proves the new head itself, and once that proof ' +
   'passes the Silas digest offers the review again (a self-review request the minion makes after it delivered the fix is queued and replayed on that pass)';
+
+/** #427 PR 1b: an onboarding heist's fallback admission or running gate
+ * stopped because a `[[link]]` target or `[[copy]]` source its lane's
+ * bootstrap placed from cannot be read in the owner's repository checkout:
+ * the lane check cannot tell what the bootstrap placed, and only the owner
+ * can fix it. */
+export const FALLBACK_ONBOARDING_SOURCE_UNREADABLE = 'onboarding-source-unreadable';
+
+/** The refusal of a bootstrap source that cannot be read: its message
+ * names the file, and its hint says the owner's checkout must be fixed. */
+function sourceUnreadableRefusal(jobId: string, error: BootstrapSourceUnreadableError): FallbackSafetyRefusal {
+  return new FallbackSafetyRefusal(
+    `onboarding job "${jobId}" cannot be reviewed until the owner fixes the repository checkout: ${error.message}`,
+    FALLBACK_ONBOARDING_SOURCE_UNREADABLE,
+    `the owner must fix the repository checkout: the ${error.what} ${JSON.stringify(error.source)} there must exist and be readable ` +
+      '(the minion cannot fix it); once it is, the review can be requested again',
+  );
+}
 
 /** A reviewed job's ledger row is gone at the freeze. Job rows are never
  * deleted, so nothing the freeze would record about it can be stated. */
@@ -1969,7 +1992,7 @@ function captureFallbackInput(lanePath: string, baseRef: string): Pick<FallbackR
  * repository checkout that cannot be read, so the lane check cannot tell
  * whether what the lane's bootstrap placed from it is still that. */
 export class BootstrapSourceUnreadableError extends Error {
-  constructor(what: '[[copy]] source' | '[[link]] target', source: string, cause: unknown) {
+  constructor(readonly what: '[[copy]] source' | '[[link]] target', readonly source: string, cause: unknown) {
     super(`the ${what} ${JSON.stringify(source)} in the repository checkout cannot be read: ${cause instanceof Error ? cause.message : String(cause)}`);
     this.name = 'BootstrapSourceUnreadableError';
   }
@@ -2012,9 +2035,10 @@ function sameBytes(source: string, placed: string, size: number, from: string): 
   }
 }
 
-/** Whether a lane path still holds what a copy of `source` placed: the
- * same bytes for a file, the same names and contents, recursively, for a
- * folder. A source that cannot be read throws, naming `from`. */
+/** Whether a lane path still holds what a copy of the file `source`
+ * placed: the same bytes. The bootstrap copies files only (it refuses a
+ * folder source), so a source that is no file placed nothing here. A source
+ * that cannot be read throws, naming `from`. */
 function copyIntact(source: string, placed: string, from: string): boolean {
   let want: Stats;
   try {
@@ -2029,17 +2053,7 @@ function copyIntact(source: string, placed: string, from: string): boolean {
     if (missing(error)) return false;
     throw error;
   }
-  if (want.isFile()) return got.isFile() && got.size === want.size && sameBytes(source, placed, want.size, from);
-  if (!want.isDirectory() || !got.isDirectory()) return false;
-  let names: string[];
-  try {
-    names = readdirSync(source).sort();
-  } catch (error) {
-    throw new BootstrapSourceUnreadableError('[[copy]] source', from, error);
-  }
-  const placedNames = readdirSync(placed).sort();
-  return names.length === placedNames.length && names.every((name, index) => name === placedNames[index]) &&
-    names.every((name) => copyIntact(join(source, name), join(placed, name), from));
+  return want.isFile() && got.isFile() && got.size === want.size && sameBytes(source, placed, want.size, from);
 }
 
 /** One path the lane's bootstrap placed. */
@@ -2056,9 +2070,9 @@ interface PlacedPath {
  * `[[link]]` `at` and `[[copy]]` `to`, lane-relative), each with whether it
  * is still exactly that, compared as git and the filesystem see it: a link
  * whose real path is its target's (`realpath` of both, however either is
- * spelled), a copy whose bytes (a folder's, recursively) equal its
- * source's in the repository checkout now. A source or target there that
- * cannot be read throws, named ({@link BootstrapSourceUnreadableError}).
+ * spelled), a copied file whose bytes equal its source's in the repository
+ * checkout now. A source or target there that cannot be read throws, named
+ * ({@link BootstrapSourceUnreadableError}).
  * The proof's own bootstrap places them the same way from the same
  * checkout. A manifest that cannot be read places nothing here, so every
  * path counts. A limit: a copy is compared with its source as it is now,
@@ -2113,30 +2127,51 @@ function bootstrapPlaced(lanePath: string, sourceRoot: string): readonly PlacedP
  * `node_modules/` ignore rule misses, since a link is no folder; a
  * `[[copy]]` the minion has not edited). Null when the lane is clean; else
  * `detail` names a placed path that is no longer what was placed (null for
- * any other change). One `git status` per check: untracked folders
- * collapsed to one entry each, unless a placed path lies inside a folder,
- * when every untracked file is listed. File contents are read only for a
- * placed copy. Fails loud when git cannot say (a timeout or an output past
- * its buffer included). */
+ * any other change). One `git status` of the lane, untracked folders
+ * collapsed to one entry each; only a collapsed folder that holds a placed
+ * path is listed file by file, by one more `git status` of just those
+ * folders. File contents are read only for a placed copy. Fails loud when
+ * git cannot say (a timeout or an output past its buffer included). */
 function laneUncommittedChange(lanePath: string, sourceRoot: string): { readonly detail: string | null } | null {
   const placed = bootstrapPlaced(lanePath, sourceRoot);
-  const untracked = placed.some((entry) => entry.path.includes('/')) ? 'all' : 'normal';
-  const run = spawnSync('git', ['--literal-pathspecs', '-C', lanePath, '-c', 'core.fsmonitor=false', 'status', '--porcelain', '-z', `--untracked-files=${untracked}`],
-    { encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 64 * 1024 * 1024, timeout: 30_000 });
-  if (run.error !== undefined || run.status !== 0) {
-    throw new Error(`cannot read the lane's uncommitted changes (git status): ${run.error?.message ?? run.stderr.trim().slice(0, 200)}`);
+  const status = (untracked: 'normal' | 'all', pathspec: readonly string[]): readonly string[] => {
+    const run = spawnSync('git', ['--literal-pathspecs', '-C', lanePath, '-c', 'core.fsmonitor=false', 'status', '--porcelain', '-z', `--untracked-files=${untracked}`, ...(pathspec.length === 0 ? [] : ['--', ...pathspec])],
+      { encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 64 * 1024 * 1024, timeout: 30_000 });
+    if (run.error !== undefined || run.status !== 0) {
+      throw new Error(`cannot read the lane's uncommitted changes (git status): ${run.error?.message ?? run.stderr.trim().slice(0, 200)}`);
+    }
+    const fields = run.stdout.split('\0');
+    const listed: string[] = [];
+    for (let index = 0; index < fields.length; index += 1) {
+      const field = fields[index]!;
+      if (field === '') continue;
+      // A rename or copy names its source in the next field.
+      if (/^(?:[RC].|.[RC]) /u.test(field)) listed.push(field.slice(3), fields[(index += 1)] ?? '');
+      else listed.push(field.slice(3));
+    }
+    return listed;
+  };
+  /** A listed path's change: none when it is a placed path still intact. */
+  const changed = (path: string): { readonly detail: string | null } | null => {
+    const entry = placed.find((candidate) => path === candidate.path || path.startsWith(`${candidate.path}/`));
+    if (entry === undefined) return { detail: null };
+    return entry.intact() ? null : { detail: entry.changed };
+  };
+  // A collapsed untracked folder ends in `/`; one that holds a placed path is listed file by file.
+  const expand: string[] = [];
+  for (const path of status('normal', [])) {
+    const folder = path.endsWith('/') ? path : null;
+    if (folder !== null && placed.some((entry) => entry.path.startsWith(folder))) {
+      expand.push(folder);
+      continue;
+    }
+    const change = changed(path.replace(/\/$/u, ''));
+    if (change !== null) return change;
   }
-  const fields = run.stdout.split('\0');
-  for (let index = 0; index < fields.length; index += 1) {
-    const field = fields[index]!;
-    if (field === '') continue;
-    // A rename or copy names its source in the next field; a collapsed
-    // untracked folder ends in `/`.
-    const paths = /^(?:[RC].|.[RC]) /u.test(field) ? [field.slice(3), fields[(index += 1)] ?? ''] : [field.slice(3)];
-    for (const path of paths.map((entry) => entry.replace(/\/$/u, ''))) {
-      const entry = placed.find((candidate) => path === candidate.path || path.startsWith(`${candidate.path}/`));
-      if (entry === undefined) return { detail: null };
-      if (!entry.intact()) return { detail: entry.changed };
+  if (expand.length > 0) {
+    for (const path of status('all', expand)) {
+      const change = changed(path.replace(/\/$/u, ''));
+      if (change !== null) return change;
     }
   }
   return null;
@@ -4294,10 +4329,19 @@ export class WaveRunner {
   /** #427 PR 1b: the fallback reviews the working tree, uncommitted bytes
    * included (captureFallbackInput), and no proof ever ran those: an
    * onboarding heist's lane must be clean. The debt names the lane HEAD;
-   * null when the job is no onboarding heist or its lane is clean. */
+   * null when the job is no onboarding heist or its lane is clean. A
+   * bootstrap source the owner's checkout cannot give is a refusal, at
+   * admission and at a running gate's recheck alike
+   * ({@link FALLBACK_ONBOARDING_SOURCE_UNREADABLE}). */
   private onboardingLaneDirtyDebt(jobId: string, lane: Pick<WorktreeLane, 'path' | 'repoPath'>): OnboardingProofDebt | null {
     if (!this.opts.ledger.isOnboardingJob(jobId)) return null;
-    const change = laneUncommittedChange(lane.path, lane.repoPath);
+    let change: ReturnType<typeof laneUncommittedChange>;
+    try {
+      change = laneUncommittedChange(lane.path, lane.repoPath);
+    } catch (error) {
+      if (error instanceof BootstrapSourceUnreadableError) throw sourceUnreadableRefusal(jobId, error);
+      throw error;
+    }
     if (change === null) return null;
     return { head: resolveGitCommit(lane.path, 'HEAD'), reason: 'uncommitted', ...(change.detail === null ? {} : { detail: change.detail }) };
   }
@@ -5128,13 +5172,14 @@ export class WaveRunner {
     if (state !== undefined) state.note = `bmad-review gate aborted: ${reason}`;
     // A named reason carries its way forward (#427 PR 1b: an onboarding
     // fix that needs a proof before review goes on).
-    const named = refusal.code === null ? {} : { code: refusal.code, hint: FALLBACK_ONBOARDING_PROOF_HINT };
+    const hint = refusal.hint ?? FALLBACK_ONBOARDING_PROOF_HINT;
+    const named = refusal.code === null ? {} : { code: refusal.code, hint };
     fallbackEvent({ phase: 'aborted', iteration, reason, reports, clearToMerge: false, ...named });
     this.escalate(
       `bmad-review gate ABORTED for job ${jobId}`,
       refusal.code === null
         ? `${reason}. No further review round ran; merge is NOT clear. Restore the Perkins gate for autonomous gating.`
-        : `${reason}. No further review round ran; merge is NOT clear. ${refusal.code}: ${FALLBACK_ONBOARDING_PROOF_HINT}.`,
+        : `${reason}. No further review round ran; merge is NOT clear. ${refusal.code}: ${hint}.`,
       { jobId },
     );
   }

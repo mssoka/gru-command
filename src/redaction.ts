@@ -44,39 +44,82 @@ const KEYWORD_ENDINGS = [
   'password', 'passwd', 'token', 'secret',
 ].join('|');
 
-/** A key that ends its identifier in `pwd` (`MYSQL_PWD`), except the
- * shell's own `PWD` and `OLDPWD` (the whole identifier) and one assigned a
- * path (`/…` or `~…`): a working directory is no secret. */
-const PWD_KEY = '(?!(?<![_-])(?:old)?pwd["\']?\\s*[:=])[A-Za-z0-9]*?pwd(?!["\']?\\s*[:=]\\s*["\']?[/~])';
+/** A key that ends its identifier in `pwd` (`MYSQL_PWD`, an ODBC string's
+ * `Pwd=`), except one assigned a path (`/…`, `~…` or a drive's `C:\…`), as
+ * the shell's own `PWD` and `OLDPWD` are: a working directory is no
+ * secret. */
+const PWD_KEY = '[A-Za-z0-9]*?pwd(?!["\']?\\s*[:=]\\s*["\']?(?:[/~]|[A-Za-z]:[\\\\/]))';
 
 /** A PEM private key header or footer word run: `PRIVATE KEY` alone
  * (PKCS#8), or after algorithm and format words (`RSA`, `EC`, `OPENSSH`,
  * `ENCRYPTED`); and an armored PGP secret key's `PGP PRIVATE KEY BLOCK`. */
 const PEM_WORDS = '(?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?';
 
-const PATTERNS: readonly (readonly [RegExp, (match: string, ...groups: string[]) => string])[] = [
-  [new RegExp(`-----BEGIN ${PEM_WORDS}-----[\\s\\S]*?-----END ${PEM_WORDS}-----`, 'gu'), redaction],
-  [/\bgh[pousr]_[A-Za-z0-9_]{20,}\b/gu, redaction],
-  [/\bgithub_pat_[A-Za-z0-9_]{20,}\b/gu, redaction],
-  [/\bglpat-[A-Za-z0-9_-]{20,}\b/gu, redaction],
-  [/\bsk-(?:proj-)?[A-Za-z0-9_-]{16,}\b/gu, redaction],
-  [/\bAKIA[0-9A-Z]{16}\b/gu, redaction],
-  [/\bnpm_[A-Za-z0-9]{36}\b/gu, redaction],
-  [/\bxox[abprs]-[A-Za-z0-9-]{10,}/gu, redaction],
+/** One pass of redaction over a text. */
+type Redaction = (text: string) => string;
+
+const replacing = (pattern: RegExp, replace: (match: string, ...groups: string[]) => string): Redaction =>
+  (text) => text.replace(pattern, replace);
+
+const NPMRC_KEY = /:_(?:authToken|auth|password)\s*=\s*/gu;
+const SPACE = /\s/u;
+
+/** An `.npmrc` registry credential (`//registry.example/:_authToken=…`, as
+ * npm prints it): the value of a `:_authToken`, `:_auth` or `:_password`
+ * key whose run of non-space characters holds a `//` before it. One pass
+ * that remembers where the last `//` and the last whitespace were, so no
+ * run is scanned again for each `//` in it: linear in the text. */
+function redactNpmrcAuth(text: string): string {
+  let out = '';
+  let copied = 0;
+  let seen = 0;
+  let slashes = -1;
+  let space = -1;
+  for (const match of text.matchAll(NPMRC_KEY)) {
+    if (match.index < copied) continue; // inside a value already masked
+    for (; seen < match.index; seen += 1) {
+      if (SPACE.test(text[seen]!)) space = seen;
+      else if (text[seen] === '/' && text[seen - 1] === '/') slashes = seen;
+    }
+    const valueAt = match.index + match[0].length;
+    let valueEnd = valueAt;
+    while (valueEnd < text.length && !SPACE.test(text[valueEnd]!)) valueEnd += 1;
+    if (slashes <= space || valueEnd === valueAt) continue;
+    out += `${text.slice(copied, valueAt)}${REDACTION_PLACEHOLDER}`;
+    copied = valueEnd;
+  }
+  return `${out}${text.slice(copied)}`;
+}
+
+const REDACTIONS: readonly Redaction[] = [
+  replacing(new RegExp(`-----BEGIN ${PEM_WORDS}-----[\\s\\S]*?-----END ${PEM_WORDS}-----`, 'gu'), redaction),
+  replacing(/\bgh[pousr]_[A-Za-z0-9_]{20,}\b/gu, redaction),
+  replacing(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/gu, redaction),
+  replacing(/\bglpat-[A-Za-z0-9_-]{20,}\b/gu, redaction),
+  replacing(/\bsk-(?:proj-)?[A-Za-z0-9_-]{16,}\b/gu, redaction),
+  replacing(/\bAKIA[0-9A-Z]{16}\b/gu, redaction),
+  replacing(/\bnpm_[A-Za-z0-9]{36}\b/gu, redaction),
+  replacing(/\bxox[abprs]-[A-Za-z0-9-]{10,}/gu, redaction),
   // URL userinfo (`https://user:secret@host`, as npm, pip and git print it).
-  [/(\b[A-Za-z][A-Za-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+(?=@)/gu, keepPrefix],
-  [/(\bAuthorization\s*:\s*(?:Bearer|Basic)\s+)[^\s'"`]+/giu, keepPrefix],
-  // An `.npmrc` registry credential: `//registry.example/:_authToken=…`.
-  [/(\/\/\S*:_(?:authToken|auth|password)\s*=\s*)\S+/gu, keepPrefix],
+  // Matched from its `://` (after a scheme's last character), so no start
+  // rescans a long run of scheme characters: linear in the text.
+  replacing(/(?<=[A-Za-z0-9+.-])(:\/\/)[^\s/@:]+:[^\s/@]+(?=@)/gu, keepPrefix),
+  replacing(/(\bAuthorization\s*:\s*(?:Bearer|Basic)\s+)[^\s'"`]+/giu, keepPrefix),
+  redactNpmrcAuth,
   // A key, then an optional closing quote (JSON's `"password": "…"`), then
-  // `:` or `=`. One a `/` precedes is a path's segment (`/etc/passwd:`).
-  [new RegExp(`(?<![A-Za-z0-9/])(?:${KEYWORD_KEYS}|[A-Za-z0-9]*?(?:${KEYWORD_ENDINGS})|${PWD_KEY})["']?\\s*[:=]\\s*${KEYWORD_VALUE}`, 'giu'), redaction],
-  [/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/gu, redaction],
+  // `:` or `=`. One whose identifier starts right after a `/` is part of a
+  // path (`/etc/passwd:`, `/run/secrets/db_password:`, `/etc/master.passwd:`);
+  // that look back is bounded, so a long run of identifier characters
+  // stays linear (a longer segment's key is redacted).
+  replacing(new RegExp(`(?<![A-Za-z0-9/])(?<!\\/[A-Za-z0-9._-]{1,64})(?:${KEYWORD_KEYS}|[A-Za-z0-9]*?(?:${KEYWORD_ENDINGS})|${PWD_KEY})["']?\\s*[:=]\\s*${KEYWORD_VALUE}`, 'giu'), redaction),
+  // A JWT, starting a run of its characters (`eyJ…`): a start inside one
+  // (`-eyJ`) would rescan the run for each, so it is not taken.
+  replacing(/(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/gu, redaction),
 ];
 
 /** Mask every span of the text that is shaped like a credential. */
 export function redactCredentials(body: string): string {
-  return PATTERNS.reduce((text, [pattern, replace]) => text.replace(pattern, replace), body);
+  return REDACTIONS.reduce((text, redact) => redact(text), body);
 }
 
 /** The Perkins publication's name for {@link redactCredentials} (#427 PR 1b

@@ -245,10 +245,12 @@ latest revision → verify → fresh review. The service enforces it centrally.
   lane HEAD and a lane with no uncommitted changes the proof never ran (tracked edits or
   untracked files git does not ignore, leaving out the `[[link]]` and `[[copy]]` paths the
   lane's bootstrap placed while each is still what it placed: a link whose real path is the
-  manifest target's, a copy whose bytes, a folder's recursively, equal its source's in the
-  repository checkout now; a source that cannot be read is a named error, and a copy whose
-  source changed since the lane was made is refused, naming it), at admission and at each
-  iteration. A gate that stops at an iteration for this (its fix left an unproven lane HEAD, a
+  manifest target's, a copied file whose bytes equal its source's in the repository checkout
+  now; a copy whose source changed since the lane was made is refused, naming it), at
+  admission and at each iteration. A link target or copy source the repository checkout
+  cannot give (gone, unreadable) refuses at admission and aborts a running gate with `code:
+  "onboarding-source-unreadable"`, a reason naming it, and a hint that the owner must fix the
+  checkout. A gate that stops at an iteration for this (its fix left an unproven lane HEAD, a
   new unproven delivery, or uncommitted changes) aborts with `code:
   "onboarding-proof-required"` and a hint: the minion commits, pushes and delivers the fix, GC
   proves the new head, and once that proof passes the Silas digest offers the review again; a

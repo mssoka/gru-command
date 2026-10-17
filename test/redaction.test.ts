@@ -136,7 +136,7 @@ describe('redactCredentials', () => {
   });
 
   it('leaves the shell\'s own PWD and OLDPWD, a ...PWD assigned a path, and a key a / precedes (a path\'s segment) whole; MYSQL_PWD and the token keys stay masked (#427)', () => {
-    for (const kept of ['PWD=/home/runner/app', 'OLDPWD=/tmp', '+ export PWD=/srv/app/build', 'pwd: /home/runner', 'BUILD_PWD=~/work', 'cat: /etc/passwd: Permission denied']) {
+    for (const kept of ['PWD=/opt/ci/work/app', 'OLDPWD=/tmp', '+ export PWD=/srv/app/build', 'pwd: /opt/ci/work', 'BUILD_PWD=~/work', 'cat: /etc/passwd: Permission denied']) {
       expect(redactCredentials(kept), kept).toBe(kept);
     }
     for (const [text, secret] of [
@@ -149,6 +149,58 @@ describe('redactCredentials', () => {
       expect(redactCredentials(text), text).not.toContain(secret);
       expect(redactCredentials(text), text).toContain(REDACTION_PLACEHOLDER);
     }
+  });
+
+  it('exempts a PWD key only when its value is a path: an ODBC Pwd= and a JSON "pwd" password are masked, PWD=/… and OLDPWD=~/… stay, and MYSQL_PWD stays masked (#427)', () => {
+    for (const [text, secret] of [
+      ['Driver={ODBC Driver 18};Server=db;Uid=sa;Pwd=Hunter22x;', 'Hunter22x'],
+      ['{"user": "sa", "pwd": "hunter22x"}', 'hunter22x'],
+      ['pwd: hunter22x', 'hunter22x'],
+      ['MYSQL_PWD=s3cretpw', 's3cretpw'],
+    ] as const) {
+      expect(redactCredentials(text), text).not.toContain(secret);
+      expect(redactCredentials(text), text).toContain(REDACTION_PLACEHOLDER);
+    }
+    for (const kept of ['PWD=/srv/app/build', 'OLDPWD=~/work', 'PWD=C:\\build\\app']) {
+      expect(redactCredentials(kept), kept).toBe(kept);
+    }
+  });
+
+  it('a key whose identifier starts right after a / is part of a path, not a key: permission errors on secret files survive, and the same key assigned is masked (#427)', () => {
+    for (const kept of ['cat: /run/secrets/db_password: Permission denied', '/etc/master.passwd: Permission denied', 'open /var/run/app/api-token: no such file or directory']) {
+      expect(redactCredentials(kept), kept).toBe(kept);
+    }
+    for (const [text, secret] of [['DB_PASSWORD=hunter22x', 'hunter22x'], ['spring.datasource.password=hunter22x', 'hunter22x']] as const) {
+      expect(redactCredentials(text), text).not.toContain(secret);
+    }
+  });
+
+  it('is linear on a long run of hyphen- or dot-joined tokens: a 1 MiB line of de-ad-be-ef-… is redacted in well under 5 s (#427)', () => {
+    for (const separator of ['-', '.']) {
+      const line = `${['de', 'ad', 'be', 'ef'].join(separator)}${separator}`.repeat(1024 * 1024 / 12);
+      const started = Date.now();
+      expect(redactCredentialWindow(line)).toBe(line);
+      expect(Date.now() - started, separator).toBeLessThan(5_000);
+    }
+  });
+
+  it('is linear on runs of slashes and of JWT-like starts: 1 MiB of ////, of x://, of :_auth= and of eyJ-eyJ-… is redacted in well under 5 s, and the .npmrc and JWT shapes are still masked (#427)', () => {
+    const MiB = 1024 * 1024;
+    for (const unit of ['//', 'x://', '//x:_auth=', 'eyJ-', 'eyJ_']) {
+      const line = unit.repeat(Math.floor(MiB / unit.length));
+      const started = Date.now();
+      redactCredentialWindow(line);
+      expect(Date.now() - started, unit).toBeLessThan(5_000);
+    }
+    const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJlLXNpZw';
+    expect(redactCredentials(`session ${jwt} done`)).toBe(`session ${REDACTION_PLACEHOLDER} done`);
+    expect(redactCredentials(`id=${jwt}`)).toBe(`id=${REDACTION_PLACEHOLDER}`);
+    const npmrc = redactCredentials('//npm.example:8443/repo/:_authToken = s3cretTokenValue next');
+    expect(npmrc).not.toContain('s3cretTokenValue');
+    expect(npmrc).toMatch(/^\/\/npm\.example:8443\/repo\/:_.*\[REDACTED\] next$/u);
+    expect(redactCredentials('a //r.example/:_auth=one b //r.example/:_auth=two')).toBe(`a //r.example/:_auth=${REDACTION_PLACEHOLDER} b //r.example/:_auth=${REDACTION_PLACEHOLDER}`);
+    // With no `//` in the key's run it is no registry credential.
+    for (const kept of ['x:_authToken=abc', '// x:_authToken=abc']) expect(redactCredentials(kept), kept).toBe(kept);
   });
 
   it('masks an armored PGP secret key, whole and in a window that cuts its BEGIN or END line off (#427)', () => {

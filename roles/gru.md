@@ -291,7 +291,10 @@ episode): its detail says why the head is stuck (a retired turn means a
 continuation hold may need you), and it closes when the head's proof passes, a
 newer head is delivered, the job ends, the head is stuck for another reason
 (a new row names it), or its reason clears. So does a crashed proof's verify
-slot (`onboarding.proof-slot-held`): GC keeps the slot because a process group
-it cannot confirm as the proof's still lives, and the row names that group, the
-slot and when the age limit frees it. If those processes are strays, ending them
-frees the slot; the row closes once the slot is released.
+slot (`onboarding.proof-slot-held`): GC keeps the slot because a process of the
+crashed verify still lives and GC did not or could not end it (it cannot confirm
+it as the proof's, its pid now runs something else, or `ps` failed), and the row
+says why, lists the live processes it found (pid, command line, working
+directory), and names the slot and when the age limit frees it. Confirm those
+processes are the proof's before ending any; once they are gone the next
+reconcile releases the slot and closes the row.

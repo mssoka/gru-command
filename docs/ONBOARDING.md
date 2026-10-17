@@ -226,19 +226,25 @@ onboarding, never the gate on an open heist.
      this instance's marker or is rooted under its probes folder). The
      slot is released once the group is gone.
    - If no member is confirmed, GC never signals the group, since its
-     process group id may belong to someone else by now. The slot stays
-     held until the group is gone or the scheduler's age limit (twice
-     `[verify] run_timeout_ms` after the slot was granted) releases it,
-     and every other verify may wait for it that long. So Gru gets one
-     action-required row, `onboarding.proof-slot-held`, id
-     `onboarding-proof-slot:<run id>`, naming the process group, the slot
-     and when the age limit releases it. If those processes are strays,
-     ending them frees the slot at the next verify's stale check. Only
-     onboarding closes the row, at the first reconcile after the slot is
-     released; a restart that keeps the slot posts no second row.
-   - A live pid that is not that verify is never signalled, and a pid
-     `ps` cannot read is logged as an error. Each such slot waits for the
-     age limit.
+     process group id may belong to someone else by now.
+   - A live pid that is not that verify (a reused pid) is never
+     signalled, and a pid `ps` cannot read is logged as an error.
+
+   Whenever the judge keeps a slot (an unconfirmed member, a reused pid,
+   an unreadable `ps`, or a group that outlived `SIGKILL`), the slot stays
+   held until the group is gone or the scheduler's age limit (twice
+   `[verify] run_timeout_ms` after the slot was granted) releases it, and
+   every other verify may wait for it that long. So Gru gets one
+   action-required row, `onboarding.proof-slot-held`, id
+   `onboarding-proof-slot:<run id>`. It says why the slot was kept, lists
+   the live processes as the judge found them (pid, command line, working
+   directory), and names the slot and when the age limit releases it. It
+   asks Gru to confirm these processes are the proof's before ending them.
+   At each reconcile onboarding has the scheduler judge its stale slots,
+   so once those processes are gone the slot is released and the row
+   closed, with no verify needed. Only onboarding closes the row; a
+   restart that keeps the slot posts no second row, and a row that cannot
+   be posted is logged and never stops the boot's probe sweep.
 
    A stale release of this slot is logged at `warn`.
 
@@ -278,13 +284,14 @@ onboarding, never the gate on an open heist.
      outside the checkout, escapes the cleanup once every member its
      group had when the shell exited is gone: nothing then ties the group
      to the proof, and GC does not signal it.
-   - The marker: Linux reads each process's environment from `/proc`, the
-     whole pass bounded at 30 seconds. A read that hangs, as one of a
-     process stuck on a hung network mount can, is abandoned and that
-     listing counts as failed; its pid is logged once at `warn` and never
-     read again while the service runs, so later listings complete without
-     it and no second read piles up on it (that process's marker then goes
-     unread). Elsewhere GC asks `ps -axEww`. A process
+   - The marker: Linux reads each process's environment from `/proc`,
+     each read bounded at 30 seconds on its own. A read that hangs, as
+     one of a process stuck on a hung network mount can, is abandoned and
+     that listing counts as failed; that process (its pid and start time)
+     is logged once at `warn` and never read again while the service runs,
+     so later listings complete without it and no second read piles up on
+     it (that process's marker then goes unread). A later process that
+     reuses its pid is read. Elsewhere GC asks `ps -axEww`. A process
      that scrubbed its environment cannot be found this way, and neither
      can any process on a platform whose `ps` hides other processes'
      environments (current macOS shows a process only its own). On Linux,
@@ -309,10 +316,12 @@ onboarding, never the gate on an open heist.
    - The wait after a signal lists the process table once per poll for
      every target, a zombie counting as gone, and waits at most a second
      for that listing; one still running is never started again, and a
-     later poll takes its answer. Until it answers, a poll goes by whether
-     the process or group still answers a signal. A table that cannot be
-     read has each target judged on its own (`ps -o stat=`, or `/proc`),
-     within the same second. However long the polls before it took, the
+     later poll takes its answer, even one that came between two polls.
+     Until it answers, a poll goes by whether the process or group still
+     answers a signal. A table that cannot be read has each target judged
+     on its own (`ps -o stat=`, or `/proc`), within the same second, with
+     at most one judge per target running, kept the same way. However long
+     the polls before it took, the
      wait after `SIGKILL` always lasts up to five seconds.
    - Per-user daemons: the proof ends any daemon its setup started,
      including one that is shared per user and that a lane might reuse
@@ -335,10 +344,10 @@ The checkout is removed whatever the outcome, and a start removes any a
 crash left behind.
 
 **The output tail** goes to the ledger and the minion, never to the PR.
-GC keeps the failing command's latest output: up to 1 MiB of verify's, and
-up to 64 KiB of each setup stream. That output is redacted whole before
-anything is cut from it, so no cut GC makes ever parts a key from its
-value. Anything shaped like a credential is masked: private keys under any
+GC keeps the failing command's latest output: up to 64 KiB of verify's,
+and up to 64 KiB of each setup stream, so what redaction runs over is
+bounded. That output is redacted whole before anything is cut from it, so
+no cut GC makes ever parts a key from its value. Anything shaped like a credential is masked: private keys under any
 `PRIVATE KEY` header (PKCS#8's bare one included) and armored PGP secret
 keys (`PGP PRIVATE KEY BLOCK`); GitHub, GitLab, npm, Slack, OpenAI and AWS
 tokens; JWTs; URL userinfo; `Authorization` headers; `.npmrc` auth lines;
@@ -352,10 +361,14 @@ with `_`, `-` or nothing between its words (so camelCase too: `secretKey`,
 `MYSQL_PWD`, `db_passwd`, `dbPassword`, `githubToken`, `access_token`,
 `stripeSecretKey`, `googleMapsApiKey`, `signingPrivateKey`, AWS STS's
 `SecretAccessKey` and `SessionToken`). Some look-alikes stay: `AccessKeyId`
-is no secret; the shell's own `PWD` and `OLDPWD`, and any `…PWD` assigned a
-path (`/…` or `~…`), are working directories; and a keyword right after a
-`/` is a path's segment (`cat: /etc/passwd: Permission denied`). A key
-whose BEGIN line fell before the kept output is masked from its start.
+is no secret; a `…PWD` key (the shell's own `PWD` and `OLDPWD` included)
+assigned a path (`/…`, `~…` or a drive's `C:\…`) is a working directory,
+while one assigned anything else (an ODBC string's `Pwd=…`, a JSON
+`"pwd"`) is masked; and a key whose identifier starts right after a `/` is
+part of a path (`cat: /etc/passwd: Permission denied`,
+`cat: /run/secrets/db_password: Permission denied`,
+`/etc/master.passwd`). A key whose BEGIN line fell before the kept output
+is masked from its start.
 
 The tail is then cut from each stream:
 
@@ -365,14 +378,16 @@ The tail is then cut from each stream:
   after the cut, after a first line `(output tail starts mid-line)`. With
   no whitespace at all, the tail records
   `(last line longer than 16 KiB, not shown)`.
-- Output whose start was dropped before GC saw it (a setup stream past
-  64 KiB, a verify past 1 MiB) keeps its whole lines when the dropped part
+- Output whose start was dropped before GC saw it (a setup stream or a
+  verify past 64 KiB) keeps its whole lines when the dropped part
   ended at a line break. When it did not, the kept output starts inside a
   line the earlier cut split. That cut happened before redaction and may
   fall inside a key's name, which no pattern then recognises, so that
   first line is dropped after redaction. With no line break at all, the
   tail records only `(output before this was cut mid-line; not shown)`:
-  never a fragment from a word, and no size is claimed.
+  never a fragment from a word, and no size is claimed. So a one-line
+  report longer than 64 KiB (a large `jest --json`) records only that
+  note: an accepted trade-off for keeping redaction bounded.
 
 The streams together are then cut to the last 4 KiB the same way, which
 is safe because that cut, too, comes after redaction. A command that
@@ -438,10 +453,14 @@ proof.
   Throttling never is, whatever its status: a rate limit (GitHub's
   secondary limit on comments answers 403), the abuse detection mechanism
   (403) or content `submitted too quickly` (422) never counts as a failed
-  attempt. It is retried at most once per reconcile, never on a trigger
-  between two (a delivery or a PR link), and never before a time GitHub
-  named (a `Retry-After` or an `X-RateLimit-Reset` in the error), and is
-  logged at `warn` the first time for a head. Once two hours of wall clock
+  attempt. It is retried only at a reconcile, at most once per reconcile,
+  never on a trigger (a delivery or a PR link), even one after the time
+  GitHub named, and never before that time (a `Retry-After` or an
+  `X-RateLimit-Reset` in the error, as a header line or a JSON field such
+  as `"retry-after": "60"`). GC's `gh` calls do not ask for response
+  headers today, so their errors carry none and this applies only when a
+  hint is present; otherwise the next reconcile retries. It is logged at
+  `warn` the first time for a head. Once two hours of wall clock
   have passed since GitHub first throttled that head's comment in this run
   of the service (a restart starts the clock again), however many
   reconciles ran, GC records
@@ -464,7 +483,9 @@ proof.
 **When a head is stuck, Gru gets one row per episode.** An action-required
 row, `onboarding.proof-attention`, id
 `onboarding-proof-attention:<job>:<sha12|nohead>:<delivery seq>:<reason>`,
-names the delivery that opened the episode and the reason. It is posted for
+names the delivery that opened the episode and the reason (for
+`unanswered`, the head's first delivery after its proof, else its newest,
+so neither a re-delivery of that head nor a restart changes it). It is posted for
 the job's current head when any of these hold; the first in this order
 names the row, and the detail gives every one that holds:
 
@@ -494,14 +515,12 @@ proof passes, when a newer head is delivered, when the job ends (at once,
 on the job's terminal status), when the head is proven after a deferral,
 when the head is stuck for another reason (a new row names that one), or
 when no reason holds and its own is known to have cleared: an `unadmitted`
-row once the lane admitted the directive (live or settled), an
-`unanswered` one on a newer delivery. No further directive about a head
-follows a settled one, so no directive clears an `unanswered` row, and an
-unrelated one on the job (Silas's or an ops one) never does. While the
-service runs, the minion delivering the same failed head again keeps the
-reason holding, so the row stays open; after a restart, a delivery made
-since the row closes it, and the reason holding again opens that
-delivery's own row.
+row once the lane admitted the directive (live or settled). An
+`unanswered` row clears only when a newer head is delivered: no further
+directive about a head follows a settled one, an unrelated one on the job
+(Silas's or an ops one) never answers it, and the minion delivering the
+same failed head again answers nothing, so the row stays open through
+such re-deliveries and through a restart, and no second row is posted.
 The counts behind `deferred`, `unadmitted` and `unanswered` live in the
 service's memory, so a restart empties them: a restart alone never closes
 a row (a deferral row closes only on a proof of its head), and the reason
@@ -527,21 +546,27 @@ review offer. The exact commit under review must pass too:
   changes included, so its admission and each iteration need a passing
   proof of the lane's HEAD and a clean lane: tracked changes, or untracked
   files git does not ignore, are uncommitted changes the proof never ran,
-  and refuse it. Each check runs one `git status --porcelain`: untracked
-  folders are collapsed to one entry each, unless the manifest places a
-  path inside a folder, when every untracked file is listed.
+  and refuse it. Each check runs one `git status --porcelain` with
+  untracked folders collapsed to one entry each; only a collapsed folder
+  that holds a path the manifest places is listed file by file, by one
+  more `git status` of just those folders, so an un-ignored `build/` of
+  many files stays one entry and a quick refusal.
 - What the lane's bootstrap placed is not uncommitted while it is still
   what it placed, compared as git and the filesystem see it: a `[[link]]`
   `at` that is still a link whose real path is its target's in your
   repository checkout, however either is spelled (a `node_modules` link
   that a `node_modules/` ignore rule misses, since a link is no folder),
-  and a `[[copy]]` `to` whose bytes equal its source's (a folder's,
-  file by file and recursively). File contents are read only for a
-  placed copy. An edited copy, or a link that points elsewhere now, is
-  uncommitted, and the refusal names it. A source or target in your
-  repository checkout that cannot be read (gone, unreadable) is a named
-  error, `the [[copy]] source "<from>" in the repository checkout cannot
-  be read: …`, never an edit.
+  and a `[[copy]]` `to` whose bytes equal its source file's (the bootstrap
+  copies files only). File contents are read only for a placed copy. An
+  edited copy, or a link that points elsewhere now, is uncommitted, and
+  the refusal names it. A source or target in your repository checkout
+  that cannot be read (gone, unreadable) is never an edit: admission and
+  a running gate's recheck alike refuse with
+  `code: "onboarding-source-unreadable"`, a reason that names it
+  (`the [[link]] target "<to>" in the repository checkout cannot be
+  read: …`, or the `[[copy]] source`), and a hint that the owner must fix
+  the repository checkout (the minion cannot). A running gate records
+  its aborted phase with that code and hint, and Gru gets its row.
 - A limit: a copy is compared with its source as it is now. When the
   source changed since the lane was made (you pulled, or rotated an env
   template), an untouched copy reads as changed, and the refusal says the

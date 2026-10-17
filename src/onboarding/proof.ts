@@ -1,7 +1,7 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
-import { appendFile, chmod, lstat, readdir, readFile, rm } from 'node:fs/promises';
+import { appendFile, chmod, lstat, readdir, readFile, readlink, rm } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import type { EventRecord } from '../ledger/api.js';
@@ -96,10 +96,12 @@ const VERIFY_KILL_GRACE_MS = 5_000;
 const OUTPUT_TAIL_BYTES = 4 * 1024;
 /** Bytes of one stream's output the tail is cut from, after redaction. */
 const OUTPUT_WINDOW_BYTES = 16 * 1024;
-/** Bytes of verify's latest output kept whole: redacted before anything is
- * cut, so a one-line report up to this size (`jest --json`) keeps its last
- * bytes. Setup keeps 64 KiB per stream (worktrees/manifest.ts). */
-const OUTPUT_CAPTURE_BYTES = 1024 * 1024;
+/** Bytes of verify's latest output kept, as setup keeps 64 KiB per stream
+ * (worktrees/manifest.ts): what redaction runs over is bounded. Output that
+ * fitted is redacted whole before anything is cut, so a one-line report up
+ * to this size (`jest --json`) keeps its last bytes; a longer one lost its
+ * start and records only a note (an accepted trade-off). */
+const OUTPUT_CAPTURE_BYTES = 64 * 1024;
 /** Appeared paths listed in the record (the count is always kept). */
 const APPEARED_LISTED = 50;
 /** The environment variable a verify shell evaluates its command from. */
@@ -617,39 +619,55 @@ export interface EndProcessesOptions {
   readonly pollListingMs?: number;
 }
 
+/** `work` run one at a time, each call waiting at most `ms` for an answer
+ * (null past it): a call joins the run in flight, or takes the answer a run
+ * settled with while no call waited, and only a call that took an answer
+ * lets the next call start a new run. `work` never rejects. */
+function polled<T>(work: () => Promise<T>): (ms: number) => Promise<T | null> {
+  let run: Promise<T> | null = null;
+  return async (ms) => {
+    const current = run ??= work();
+    const answer = await within(current, ms);
+    if (answer !== null && run === current) run = null;
+    return answer;
+  };
+}
+
 /** End processes or groups (a negated pgid): SIGTERM, then SIGKILL to what
  * still lives after the grace, then wait until every target is gone, a
  * zombie counting as gone, so a caller that judges them next sees them
  * gone. Each poll waits at most {@link KILL_POLL_LISTING_MS} for one listing
  * of the process table for every target; one still running is never
- * started again, and a later poll takes its answer. A table that cannot be
- * read has each target judged on its own, within the same bound. A poll
- * with no answer goes by `kill(…, 0)`. After SIGKILL the wait always lasts
- * up to {@link KILL_SETTLE_MS} of wall clock, however long the polls before
- * it took, then returns what is still there, which the caller logs.
- * Exported for its tests. */
+ * started again, and a later poll takes its answer, even one that came
+ * between two polls. A table that cannot be read has each target judged on
+ * its own, within the same bound, one judge per target at a time, kept the
+ * same way. A poll with no answer goes by `kill(…, 0)`. After SIGKILL the
+ * wait always lasts up to {@link KILL_SETTLE_MS} of wall clock, however
+ * long the polls before it took, then returns what is still there, which
+ * the caller logs. Exported for its tests. */
 export async function endProcesses(targets: readonly number[], graceMs: number, opts: EndProcessesOptions = {}): Promise<readonly number[]> {
   const table = opts.table ?? processTable;
   const judge = opts.judge ?? gone;
   const settleMs = opts.settleMs ?? KILL_SETTLE_MS;
   const pollMs = opts.pollListingMs ?? KILL_POLL_LISTING_MS;
-  let pending: Promise<readonly ProcessRow[] | 'unreadable'> | null = null;
-  const listing = (): Promise<readonly ProcessRow[] | 'unreadable'> => {
-    if (pending === null) {
-      const started = table().catch(() => 'unreadable' as const);
-      pending = started;
-      void started.then(() => { if (pending === started) pending = null; });
+  const listing = polled(() => table().catch(() => 'unreadable' as const));
+  const judges = new Map<number, (ms: number) => Promise<boolean | null>>();
+  const judged = (target: number): Promise<boolean | null> => {
+    let of = judges.get(target);
+    if (of === undefined) {
+      of = polled(() => judge(target).catch(() => false));
+      judges.set(target, of);
     }
-    return pending;
+    return of(pollMs);
   };
   const living = async (left: readonly number[]): Promise<readonly number[]> => {
     const present = left.filter((target) => signalProcess(target, 0));
     if (present.length === 0) return present;
-    const rows = await within(listing(), pollMs);
+    const rows = await listing(pollMs);
     if (rows === null) return present;
     if (rows !== 'unreadable') return present.filter((target) => !goneFrom(rows, target));
-    const judged = await within(Promise.all(present.map((target) => judge(target).catch(() => false))), pollMs);
-    return judged === null ? present : present.filter((_target, index) => !judged[index]);
+    const answers = await Promise.all(present.map(judged));
+    return present.filter((_target, index) => answers[index] !== true);
   };
   const killAt = Date.now() + graceMs;
   let deadline: number | null = null;
@@ -673,7 +691,19 @@ export async function endProcesses(targets: readonly number[], graceMs: number, 
 /** Reads one process's environment (Linux `/proc/<pid>/environ`). */
 export type EnvironReader = (pid: number) => Promise<string>;
 
+/** Reads one process's start time (Linux: field 22 of `/proc/<pid>/stat`,
+ * read after the command name's last `)`): with its pid, it names that
+ * process and no later one the pid is reused for. Rejects once it is gone. */
+export type StartTimeReader = (pid: number) => Promise<string>;
+
 const readEnviron: EnvironReader = (pid) => readFile(join('/proc', String(pid), 'environ'), 'utf8');
+
+const readStartTime: StartTimeReader = async (pid) => {
+  const stat = await readFile(join('/proc', String(pid), 'stat'), 'utf8');
+  const start = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19];
+  if (start === undefined || !/^\d+$/u.test(start)) throw new Error(`/proc/${String(pid)}/stat names no start time`);
+  return start;
+};
 
 /** Whether an environment's entries carry a probe marker `matches` accepts. */
 function markedEnvironment(entries: readonly string[], matches: (marker: string) => boolean): boolean {
@@ -681,69 +711,71 @@ function markedEnvironment(entries: readonly string[], matches: (marker: string)
   return entries.some((entry) => entry.startsWith(prefix) && matches(entry.slice(prefix.length)));
 }
 
-/** Pids whose environment read hung past its pass's bound (a process stuck
- * in the kernel, on a hung NFS mount, say), for this process's lifetime:
- * no later pass reads them again, so each pins at most the one threadpool
- * thread its first read holds, and a later listing completes without it. */
-const hungEnvironReads = new Set<number>();
+/** The processes whose environment read hung past its bound (a process
+ * stuck in the kernel, on a hung NFS mount, say), each pid with its start
+ * time, for this process's lifetime: no later pass reads that process
+ * again, so each pins at most the one threadpool thread its first read
+ * holds. A pid reused by a later process is read; an entry goes once its
+ * process is gone. */
+const hungEnvironReads = new Map<number, string>();
 
 /**
- * Linux: which of `pids` carry a probe marker `matches` accepts, read from
- * each one's environment. A process of this user whose environment cannot
- * be read (non-dumpable, as ssh-agent and gpg-agent are) is logged at
- * debug only: any of the user's processes may be one, so it is no lead.
- * The whole pass is bounded by `timeoutMs`: a read that hangs is abandoned,
- * never awaited, and the listing fails; its pid is named once at warn and
- * skipped by every later pass (`hung`), so no second read ever starts on a
- * pid whose first has not settled. Exported for its tests (`read`, `hung`).
+ * Linux: which of `pids` (the whole process listing) carry a probe marker
+ * `matches` accepts, read from each one's environment. A process of this
+ * user whose environment cannot be read (non-dumpable, as ssh-agent and
+ * gpg-agent are) is logged at debug only: any of the user's processes may
+ * be one, so it is no lead. Each read is bounded by `timeoutMs` on its own:
+ * one that hangs is abandoned, never awaited, and the listing fails; that
+ * process (its pid and start time) is named once at warn and skipped by
+ * every later pass (`hung`), so no second read ever starts on it, while a
+ * later process its pid is reused for is read. Exported for its tests
+ * (`read`, `started`, `hung`).
  */
 export async function environMarkedPids(pids: readonly number[], matches: (marker: string) => boolean, log: Log, opts: {
   readonly timeoutMs?: number;
   readonly read?: EnvironReader;
-  readonly hung?: Set<number>;
+  readonly started?: StartTimeReader;
+  readonly hung?: Map<number, string>;
 } = {}): Promise<readonly number[]> {
   const timeoutMs = opts.timeoutMs ?? LISTING_TIMEOUT_MS;
   const read = opts.read ?? readEnviron;
+  const started = opts.started ?? readStartTime;
   const hung = opts.hung ?? hungEnvironReads;
-  let abandoned = false;
-  /** The pid the pass is reading now: the one a timeout abandons. */
-  let reading: number | null = null;
-  const pass = async (): Promise<readonly number[]> => {
-    const found: number[] = [];
-    for (const pid of pids) {
-      if (abandoned) break;
-      if (hung.has(pid)) continue;
-      reading = pid;
-      let environ: string;
-      try {
-        environ = await read(pid);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'EACCES' && await ownedByThisUser(pid)) {
-          log('debug', 'onboarding proof: a process of this user hides its environment (non-dumpable), so its marker cannot be read', { pid });
-        }
-        continue; // ended meanwhile, or another user's
-      } finally {
-        if (!abandoned) reading = null;
-      }
-      if (markedEnvironment(environ.split('\0'), matches)) found.push(pid);
-    }
-    return found;
+  const listed = new Set(pids);
+  for (const pid of [...hung.keys()]) if (!listed.has(pid)) hung.delete(pid);
+  /** A read that hung: its process is skipped from now on (`start` '' when
+   * even its start time could not be read: then while its pid lists). */
+  const hangs = (pid: number, start: string, what: string): Error => {
+    hung.set(pid, start);
+    log('warn', 'onboarding proof: reading a process\'s environment hung, so its marker cannot be read; it is not read again while the service runs', { pid });
+    return new Error(`the process environments could not be read within ${String(timeoutMs)} ms: the read of pid ${String(pid)}'s ${what} hung`);
   };
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    return await Promise.race([pass(), new Promise<never>((_found, reject) => {
-      timer = setTimeout(() => {
-        abandoned = true;
-        if (reading !== null && !hung.has(reading)) {
-          hung.add(reading);
-          log('warn', 'onboarding proof: reading a process\'s environment hung, so its marker cannot be read; it is not read again while the service runs', { pid: reading });
-        }
-        reject(new Error(`the process environments could not be read within ${String(timeoutMs)} ms`));
-      }, timeoutMs);
-    })]);
-  } finally {
-    clearTimeout(timer);
+  const found: number[] = [];
+  for (const pid of pids) {
+    if (hung.get(pid) === '') continue;
+    let start: string | null;
+    try {
+      start = await within(started(pid), timeoutMs);
+    } catch {
+      hung.delete(pid);
+      continue; // ended meanwhile
+    }
+    if (start === null) throw hangs(pid, '', 'start time');
+    if (hung.get(pid) === start) continue;
+    hung.delete(pid);
+    let environ: string | null;
+    try {
+      environ = await within(read(pid), timeoutMs);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EACCES' && await ownedByThisUser(pid)) {
+        log('debug', 'onboarding proof: a process of this user hides its environment (non-dumpable), so its marker cannot be read', { pid });
+      }
+      continue; // ended meanwhile, or another user's
+    }
+    if (environ === null) throw hangs(pid, start, 'environment');
+    if (markedEnvironment(environ.split('\0'), matches)) found.push(pid);
   }
+  return found;
 }
 
 /** The pids (never this process's own) whose environment carries a probe
@@ -1152,6 +1184,48 @@ interface CommandRun {
   readonly tail: string;
 }
 
+/**
+ * A command's latest output, at most {@link OUTPUT_CAPTURE_BYTES} once it
+ * is finished, with whether what was dropped ended at a line break. It is
+ * cut back to that bound only once it passes twice it, so a chatty command
+ * costs one cut per bound's worth of output. Exported for its tests.
+ */
+export class OutputCapture {
+  private text = '';
+  private bytes = 0;
+  private truncated = false;
+  private startsAtLine = true;
+  private cutCount = 0;
+
+  /** How many times the kept output was cut. */
+  get cuts(): number {
+    return this.cutCount;
+  }
+
+  take(text: string): void {
+    this.text += text;
+    this.bytes += Buffer.byteLength(text, 'utf8');
+    if (this.bytes > 2 * OUTPUT_CAPTURE_BYTES) this.keep();
+  }
+
+  /** The kept output, cut to the bound. */
+  finish(): OutputWindow {
+    this.keep();
+    return { text: this.text, truncated: this.truncated, startsAtLine: this.startsAtLine };
+  }
+
+  /** Keep the latest {@link OUTPUT_CAPTURE_BYTES}, noting whether what is dropped ended at a line break. */
+  private keep(): void {
+    if (this.bytes <= OUTPUT_CAPTURE_BYTES) return;
+    const kept = utf8Tail(this.text, OUTPUT_CAPTURE_BYTES);
+    this.startsAtLine = this.text[this.text.length - kept.length - 1] === '\n';
+    this.text = kept;
+    this.bytes = Buffer.byteLength(kept, 'utf8');
+    this.truncated = true;
+    this.cutCount += 1;
+  }
+}
+
 /** One shell command in its own process group, so a timeout or a stop
  * reaches every process it started: SIGTERM, then SIGKILL after the grace.
  * The shell evaluates the command from its environment, so it stays the
@@ -1159,9 +1233,8 @@ interface CommandRun {
  * with a lone command) and its argv, bound to the budget slot with its pid,
  * names this run: after a crash the next start can tell the orphan is its
  * own. Each stream is decoded on its own, so a character split across
- * chunks stays whole; the latest {@link OUTPUT_CAPTURE_BYTES} are kept, with
- * whether what was dropped ended at a line break, and the recorded tail is
- * cut from them (recordedTail). */
+ * chunks stays whole; the latest output is kept ({@link OutputCapture}),
+ * and the recorded tail is cut from it (recordedTail). */
 async function runCommand(command: string, cwd: string, env: NodeJS.ProcessEnv, opts: {
   readonly timeoutMs: number;
   readonly graceMs: number;
@@ -1182,25 +1255,10 @@ async function runCommand(command: string, cwd: string, env: NodeJS.ProcessEnv, 
   if (child.pid !== undefined) opts.onSpawn(child.pid, child.spawnargs.join(' '));
   let outputBytes = 0;
   let hasOutput = false;
-  let window = '';
-  let windowBytes = 0;
-  let truncated = false;
-  let startsAtLine = true;
-  /** Keep the latest `max` bytes, noting whether what is dropped ended at a line break. */
-  const keep = (max: number): void => {
-    if (windowBytes <= max) return;
-    const kept = utf8Tail(window, max);
-    startsAtLine = window[window.length - kept.length - 1] === '\n';
-    window = kept;
-    windowBytes = Buffer.byteLength(kept, 'utf8');
-    truncated = true;
-  };
+  const capture = new OutputCapture();
   const take = (text: string): void => {
     if (!hasOutput && text.trim() !== '') hasOutput = true;
-    window += text;
-    windowBytes += Buffer.byteLength(text, 'utf8');
-    // Cut at twice the bound: a chatty command costs one cut per bound's worth of output.
-    keep(2 * OUTPUT_CAPTURE_BYTES);
+    capture.take(text);
   };
   const decoders = [new StringDecoder('utf8'), new StringDecoder('utf8')] as const;
   child.stdout?.on('data', (chunk: Buffer) => { outputBytes += chunk.length; take(decoders[0].write(chunk)); });
@@ -1240,8 +1298,7 @@ async function runCommand(command: string, cwd: string, env: NodeJS.ProcessEnv, 
   child.stdout?.destroy();
   child.stderr?.destroy();
   for (const decoder of decoders) take(decoder.end());
-  keep(OUTPUT_CAPTURE_BYTES);
-  return { exitCode: exit.code, signal: exit.signal, timedOut, stopped, spawnError: exit.error, ms, outputBytes, hasOutput, tail: recordedTail([{ text: window, truncated, startsAtLine }]) };
+  return { exitCode: exit.code, signal: exit.signal, timedOut, stopped, spawnError: exit.error, ms, outputBytes, hasOutput, tail: recordedTail([capture.finish()]) };
 }
 
 /** What `ps` says of one live pid: its process group and command line.
@@ -1285,6 +1342,63 @@ function instanceProcesses(probesDir: string, log: Log, what: string): Promise<r
   ], log, what);
 }
 
+/** One live process as Gru is shown it: its pid, command line (redacted)
+ * and working directory; null for what could not be read. */
+export interface ProcessFacts {
+  readonly pid: number;
+  readonly command: string | null;
+  readonly cwd: string | null;
+}
+
+/** Each pid's command line (`ps -ww`) and working directory (Linux
+ * `/proc/<pid>/cwd`, elsewhere `lsof`), each listing bounded; what cannot
+ * be read is null, never a guess. */
+async function processFacts(pids: readonly number[]): Promise<readonly ProcessFacts[]> {
+  if (pids.length === 0) return [];
+  const listed = (bin: string, args: readonly string[]): Promise<string> => new Promise((resolveOut) => {
+    execFile(bin, args, { encoding: 'utf8', timeout: LISTING_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 }, (_error, stdout) => { resolveOut(stdout ?? ''); });
+  });
+  const commands = new Map<number, string>();
+  for (const line of (await listed('ps', ['-ww', '-o', 'pid=', '-o', 'command=', '-p', pids.join(',')])).split('\n')) {
+    const row = /^\s*(\d+)\s+(.*?)\s*$/su.exec(line);
+    if (row !== null) commands.set(Number(row[1]), redactCredentials(row[2]!));
+  }
+  const cwds = new Map<number, string>();
+  if (process.platform === 'linux') {
+    for (const pid of pids) {
+      try {
+        cwds.set(pid, await readlink(join('/proc', String(pid), 'cwd')));
+      } catch {
+        // ended meanwhile, or another user's
+      }
+    }
+  } else {
+    let pid: number | null = null;
+    for (const line of (await listed('lsof', ['-w', '-a', '-p', pids.join(','), '-d', 'cwd', '-Fn'])).split('\n')) {
+      if (/^p\d+$/u.test(line)) pid = Number(line.slice(1));
+      else if (line.startsWith('n') && pid !== null) {
+        cwds.set(pid, line.slice(1));
+        pid = null;
+      }
+    }
+  }
+  return pids.map((pid) => ({ pid, command: commands.get(pid) ?? null, cwd: cwds.get(pid) ?? null }));
+}
+
+/** The live processes that keep a crashed verify's slot held: its pid while
+ * it lives and its process group's members (zombies left out), with their
+ * facts; or why they could not be listed. Never rejects. */
+async function slotHolders(pid: number): Promise<Pick<KeptProofSlot, 'members' | 'unlisted'>> {
+  try {
+    const rows = await groupMembers(pid);
+    const pids = new Set(rows.filter((row) => !row.zombie).map((row) => row.pid));
+    if (!rows.some((row) => row.pid === pid) && signalProcess(pid, 0)) pids.add(pid);
+    return { members: await processFacts([...pids].sort((a, b) => a - b)), unlisted: null };
+  } catch (error) {
+    return { members: null, unlisted: oneLine(error) };
+  }
+}
+
 /**
  * Boot, after {@link endOrphanedProbeProcesses}: a verify a crashed run
  * left behind still holds its budget slot (its pid was bound to it, as the
@@ -1295,13 +1409,14 @@ function instanceProcesses(probesDir: string, log: Log, what: string): Promise<r
  * lives, the group is ended as one, once a member is confirmed the
  * proof's (it carries this instance's marker or is rooted under its probes
  * folder), and the slot is released once it is gone; a group none of whose
- * members is confirmed is never signalled (its pgid may have been reused)
- * and keeps the slot; each such slot is returned, for Gru to be told. A
- * live pid that is not that verify (a recycled pid) is never signalled,
- * and a pid `ps` cannot read is an error; each such slot is left to the
- * scheduler's age limit.
+ * members is confirmed is never signalled (its pgid may have been reused).
+ * A live pid that is not that verify (a recycled pid) is never signalled,
+ * and a pid `ps` cannot read is an error. Every slot the judge keeps, for
+ * whatever reason (those, or a group that outlived SIGKILL), is left to the
+ * scheduler's age limit and returned with its live processes, for Gru to
+ * be told.
  */
-export async function endOrphanedProofVerifies(budget: () => VerificationBudget, probesDir: string, log: Log = () => {}, graceMs = VERIFY_KILL_GRACE_MS): Promise<readonly UnconfirmedProofSlot[]> {
+export async function endOrphanedProofVerifies(budget: () => VerificationBudget, probesDir: string, log: Log = () => {}, graceMs = VERIFY_KILL_GRACE_MS): Promise<readonly KeptProofSlot[]> {
   let slots: VerificationBudget;
   try {
     slots = budget();
@@ -1309,10 +1424,13 @@ export async function endOrphanedProofVerifies(budget: () => VerificationBudget,
     log('warn', 'onboarding proof: the verification budget is unavailable, so a verify an earlier run left is not ended now', { error: oneLine(error) });
     return [];
   }
-  const kept: UnconfirmedProofSlot[] = [];
+  const kept: KeptProofSlot[] = [];
   let confirmed: ReadonlySet<number> | null = null;
   for (const holder of slots.restored(ONBOARDING_PROOF_SCOPE)) {
     const fields = { run: holder.lease.runId, job: holder.lease.jobId, pid: holder.pid };
+    const keep = async (why: string): Promise<void> => {
+      kept.push({ lease: holder.lease, pgid: holder.pid, ageLimitMs: slots.ageLimitMs, why, ...await slotHolders(holder.pid) });
+    };
     // One slot that cannot be judged never holds up the rest, or the sweep after.
     try {
       if (!(await gone(holder.pid))) {
@@ -1328,10 +1446,12 @@ export async function endOrphanedProofVerifies(budget: () => VerificationBudget,
             log('warn', 'onboarding proof: a budget slot an earlier run left names a live pid that is not its verify; the pid is not signalled and the slot waits for the scheduler\'s age limit', {
               ...fields, recorded: holder.processCommand, running: running.command,
             });
+            await keep(`Its pid ${String(holder.pid)} is alive but does not run the verify bound to the slot (it may have been reused), so GC does not signal it.`);
             continue;
           }
           if ((await endProcesses([-holder.pid], 0)).length > 0) {
             log('error', 'onboarding proof: a verify an earlier run left running outlived SIGKILL; its slot waits for the scheduler\'s age limit', fields);
+            await keep(`GC ended its process group ${String(holder.pid)}, the verify's own, but it outlived SIGKILL.`);
             continue;
           }
           slots.release(holder.lease);
@@ -1346,11 +1466,12 @@ export async function endOrphanedProofVerifies(budget: () => VerificationBudget,
         confirmed ??= new Set(await instanceProcesses(probesDir, log, 'a verify group an earlier run left cannot be confirmed as its own'));
         if (!members.some((member) => !member.zombie && confirmed!.has(member.pid))) {
           log('warn', 'onboarding proof: a budget slot an earlier run left names a verify whose leader is gone while members of its process group live, none of them confirmed the proof\'s (its marker, or rooted under its probes folder); the group is not signalled and the slot waits for the scheduler\'s age limit', fields);
-          kept.push({ lease: holder.lease, pgid: holder.pid, ageLimitMs: slots.ageLimitMs });
+          await keep(`Its leader, pid ${String(holder.pid)}, is gone, but process group ${String(holder.pid)} still has live members, and none is confirmed the proof's (its marker, or a working directory or command line under the probes folder), so GC does not signal the group: its id may belong to someone else's processes now.`);
           continue;
         }
         if ((await endProcesses([-holder.pid], graceMs)).length > 0) {
           log('error', 'onboarding proof: the process group of a verify an earlier run left outlived SIGKILL; its slot waits for the scheduler\'s age limit', fields);
+          await keep(`Its leader, pid ${String(holder.pid)}, is gone; GC ended process group ${String(holder.pid)}, confirmed the proof's, but it outlived SIGKILL.`);
           continue;
         }
         slots.release(holder.lease);
@@ -1361,19 +1482,25 @@ export async function endOrphanedProofVerifies(budget: () => VerificationBudget,
       log('warn', 'onboarding proof: a budget slot an earlier run left was released; its verify is gone', fields);
     } catch (error) {
       log('error', 'onboarding proof: a verify an earlier run left could not be judged or ended; its slot waits for the scheduler\'s age limit', { ...fields, error: oneLine(error) });
+      await keep(`GC could not judge or end it: ${oneLine(error)}.`);
     }
   }
   return kept;
 }
 
-/** A budget slot the boot judge keeps because a member of its crashed
- * verify's process group lives that nothing confirms is the proof's. */
-export interface UnconfirmedProofSlot {
+/** A budget slot the boot judge keeps: its crashed verify's process group
+ * (or pid) lives and GC did not, or could not, end it. */
+export interface KeptProofSlot {
   readonly lease: VerificationLease;
-  /** The group (its lost leader's pid). */
+  /** The group (its leader's pid, bound to the slot). */
   readonly pgid: number;
   /** The scheduler's age limit, from the slot's grant. */
   readonly ageLimitMs: number;
+  /** Why the judge kept it, in a sentence for Gru. */
+  readonly why: string;
+  /** Its live processes as the judge listed them; null when they could not be listed (`unlisted` says why). */
+  readonly members: readonly ProcessFacts[] | null;
+  readonly unlisted: string | null;
 }
 
 // ------------------------------------------------------------------

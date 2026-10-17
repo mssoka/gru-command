@@ -93,6 +93,10 @@ export interface VerificationBudget {
   bindPid(lease: VerificationLease, pid: number, processCommand: string, opts?: { readonly leadsGroup?: boolean }): void;
   /** Slots of `scope` an earlier process left, still held for a live pid. */
   restored(scope: string): readonly { readonly lease: VerificationLease; readonly pid: number; readonly processCommand: string | null }[];
+  /** Judge the slots an earlier process left now (the scheduler's stale
+   * check): one whose pid and group are gone, or past the age limit, is
+   * released. */
+  reconcileStale(): void;
   release(lease: VerificationLease): void;
   readonly workersPerRun: number;
   /** The scheduler's age limit: a slot held this long after its grant is
@@ -601,6 +605,7 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
         acquire: (spec) => scheduler.acquire(spec),
         bindPid: (lease, pid, processCommand, opts) => scheduler.bindPid(lease, pid, processCommand, opts),
         restored: (scope) => scheduler.restoredHolders(scope),
+        reconcileStale: () => { scheduler.reconcileStale(); },
         release: (lease) => scheduler.release(lease),
         get workersPerRun() {
           return scheduler.workersPerRun;

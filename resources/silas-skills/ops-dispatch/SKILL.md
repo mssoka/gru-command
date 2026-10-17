@@ -211,7 +211,11 @@ without a named rule is not yours to invent:
   commits, pushes and delivers its fix, GC proves the new head, and the
   digest offers the review again once that proof passes (a self-review
   request the minion made after it delivered the fix is replayed on that
-  pass; nothing replays the aborted gate). Wait for the lane delivery (and its
+  pass; nothing replays the aborted gate). One refused or aborted with
+  `code: "onboarding-source-unreadable"` names a `[[link]]` target or
+  `[[copy]]` source the owner's repository checkout cannot give: neither
+  the minion nor another arm fixes it, so do not re-arm until the owner
+  has. Wait for the lane delivery (and its
   push) to settle and for any unresolved re-brief request to finalize or
   be recovered (a delivery alone does not clear that fence), then arm. If
   you cannot tell whether the lane is still
