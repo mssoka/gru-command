@@ -1,12 +1,51 @@
-import { DEFAULT_DECISIONS_CONFIG } from '../config.js';
+import { DEFAULT_DECISIONS_CONFIG, type DecisionsConfig } from '../config.js';
+import { tomlString } from '../config-reference.js';
 
 function bool(value: boolean): string {
   return value ? 'true' : 'false';
 }
 
+const DEFAULT_SURFACES = ['event_triage', 'supervision_guidance', 'escalation_triage', 'same_blocker'] as const;
+
+function tableKey(name: string): string {
+  return /^[A-Za-z0-9_-]+$/.test(name) ? name : tomlString(name);
+}
+
+/** Fresh installs (and re-runs over a config that never configured Jev)
+ * start every surface in shadow. A config that already enabled Jev or named
+ * surfaces keeps exactly its own entries: an absent mode is the legacy
+ * pre-#223 behavior and must not silently become shadow. */
+function surfaceLines(prior: DecisionsConfig | null): string[] {
+  const configured = prior !== null && (prior.jev.enabled || Object.keys(prior.surfaces).length > 0);
+  const surfaces: Readonly<Record<string, { readonly provider?: string; readonly mode?: string }>> = configured
+    ? prior.surfaces
+    : Object.fromEntries(DEFAULT_SURFACES.map((name) => [name, { provider: 'openrouter-jev', mode: 'shadow' }]));
+  return Object.entries(surfaces).flatMap(([name, surface]) => [
+    `[decisions.surfaces.${tableKey(name)}]`,
+    ...(surface.provider === undefined ? [] : [`provider = ${tomlString(surface.provider)}`]),
+    ...(surface.mode === undefined ? [] : [`mode = ${tomlString(surface.mode)}`]),
+    '',
+  ]);
+}
+
+/** Operator-defined profiles survive a regenerate as active tables. */
+function providerLines(prior: DecisionsConfig | null): string[] {
+  return Object.entries(prior?.providers ?? {}).flatMap(([name, profile]) => [
+    '',
+    `[decisions.providers.${tableKey(name)}]`,
+    `protocol = ${tomlString(profile.protocol)}`,
+    `endpoint = ${tomlString(profile.endpoint)}`,
+    `model = ${tomlString(profile.model)}`,
+    `credential = ${tomlString(profile.credential)}`,
+    `timeout_ms = ${profile.timeoutMs}`,
+    `input_price_per_mtok = ${profile.inputPricePerMtok}`,
+  ]);
+}
+
 /** Complete installer-owned append fragment; every supported key is taught here. */
-export function decisionsConfigTemplate(enabled = false): string {
-  const defaults = DEFAULT_DECISIONS_CONFIG;
+export function decisionsConfigTemplate(enabled = false, prior?: DecisionsConfig | null): string {
+  const defaults = prior ?? DEFAULT_DECISIONS_CONFIG;
+  const enabledValue = prior?.jev.enabled ?? enabled;
   return [
     '# ── Jev decisions (optional) ─────────────────────────────────────────',
     '# Jev is a small, cheap "System One" decision model (TypeSafe, via OpenRouter).',
@@ -19,7 +58,7 @@ export function decisionsConfigTemplate(enabled = false): string {
     '# then verify (no key material printed):',
     '#   node dist/decisions/cli.js status --json   and   node dist/decisions/cli.js check --json',
     '[decisions.jev]',
-    `enabled = ${bool(enabled)} # MASTER SWITCH. Off = no surface ever asks a provider. Hot-reloads; store the key first.`,
+    `enabled = ${bool(enabledValue)} # MASTER SWITCH. Off = no surface ever asks a provider. Hot-reloads; store the key first.`,
     `model = "${defaults.jev.model}" # OpenRouter Jev alias; feeds the openrouter-jev profile below.`,
     `endpoint = "${defaults.jev.endpoint}" # Credential-bearing traffic is restricted to this exact HTTPS endpoint.`,
     `timeout_ms = ${defaults.jev.timeoutMs} # Per-call limit; on timeout the deterministic answer is used. Raise it if timeouts recur on a healthy network.`,
@@ -55,22 +94,7 @@ export function decisionsConfigTemplate(enabled = false): string {
     '#',
     '# `provider` routes a surface to a provider profile (default: openrouter-jev).',
     '# Shorthand for routing only:  [decisions.surfaces]  event_triage = "typesafe-direct"',
-    '[decisions.surfaces.event_triage]',
-    'provider = "openrouter-jev"',
-    'mode = "shadow"',
-    '',
-    '[decisions.surfaces.supervision_guidance]',
-    'provider = "openrouter-jev"',
-    'mode = "shadow"',
-    '',
-    '[decisions.surfaces.escalation_triage]',
-    'provider = "openrouter-jev"',
-    'mode = "shadow"',
-    '',
-    '[decisions.surfaces.same_blocker]',
-    'provider = "openrouter-jev"',
-    'mode = "shadow"',
-    '',
+    ...surfaceLines(prior ?? null),
     '# ── Provider profiles (optional) ─────────────────────────────────────',
     '# Built-ins always exist: openrouter-jev (default), typesafe-direct and local.',
     '# Override one by re-declaring it, or define your own under a new name.',
@@ -90,6 +114,7 @@ export function decisionsConfigTemplate(enabled = false): string {
     '# model = "laya-421m"',
     '# credential = "none" # keyless is allowed ONLY for loopback hosts',
     '# timeout_ms = 5000',
+    ...providerLines(prior ?? null),
     '',
     '# ── Confidence thresholds (by risk class) ────────────────────────────',
     '# Read-only classification: mistakes are recoverable, so confidence bars are lower.',

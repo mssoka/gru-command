@@ -100,6 +100,7 @@ describe('config-generate CLI', () => {
       'concurrency',
       'review',
       'verify',
+      'decisions',
     ]);
     for (const section of [
       '[server]',
@@ -255,6 +256,64 @@ describe('config-generate CLI', () => {
       lock_wait_timeout_ms: 900000,
       run_timeout_ms: 1800000,
     });
+  });
+
+  it('a fresh config ships the Jev decisions block disabled, every surface in shadow', () => {
+    const root = tempDir('gru-command-config-jev-fresh-');
+    const instance = join(root, 'instance');
+    const result = run(instance);
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    const decisions = (parse(readFileSync(join(instance, 'config.toml'), 'utf-8')) as {
+      decisions: {
+        jev: { enabled: boolean };
+        surfaces: Record<string, { mode: string }>;
+        thresholds: { destructive: { require_confirm_on_act: boolean } };
+      };
+    }).decisions;
+    expect(decisions.jev.enabled).toBe(false);
+    expect(Object.keys(decisions.surfaces).sort()).toEqual([
+      'escalation_triage',
+      'event_triage',
+      'same_blocker',
+      'supervision_guidance',
+    ]);
+    for (const surface of Object.values(decisions.surfaces)) expect(surface.mode).toBe('shadow');
+    expect(decisions.thresholds.destructive.require_confirm_on_act).toBe(true);
+  });
+
+  it('a --force re-run keeps an operator-enabled Jev setup instead of resetting it', () => {
+    const root = tempDir('gru-command-config-jev-rerun-');
+    const instance = join(root, 'instance');
+    const workspace = join(root, 'workspace');
+    mkdirSync(join(workspace, 'alpha', '.git'), { recursive: true });
+    mkdirSync(instance, { recursive: true });
+    writeFileSync(
+      join(instance, 'config.toml'),
+      [
+        `workspace_root = ${JSON.stringify(workspace)}`,
+        'managed_repos = ["alpha"]',
+        '[decisions.jev]',
+        'enabled = true',
+        'timeout_ms = 9000',
+        '[decisions.surfaces.event_triage]',
+        'provider = "mine"',
+        'mode = "enforce"',
+        '[decisions.providers.mine]',
+        'protocol = "systemone"',
+        'endpoint = "http://127.0.0.1:8088/v1/systemone"',
+        'model = "laya-421m"',
+        'credential = "none"',
+        'timeout_ms = 3000',
+        '',
+      ].join('\n'),
+    );
+    const before = loadConfig({ GRU_COMMAND_HOME: instance }, root).decisions;
+    const result = run(instance, ['--force']);
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    const after = loadConfig({ GRU_COMMAND_HOME: instance }, root).decisions;
+    expect(after).toEqual(before);
+    expect(after.jev.enabled).toBe(true);
+    expect(after.surfaces).toEqual({ event_triage: { provider: 'mine', mode: 'enforce' } });
   });
 
   it('round trip: a --force re-run preserves user-set values and hand-tuned sections, with backup', () => {

@@ -220,7 +220,7 @@ const PINS: Record<string, number> = {
   'chat-session-state.test.ts': 6,
   'claude-adapter.test.ts': 186,
   'claude-directive.test.ts': 10,
-  'config-generate.test.ts': 19,
+  'config-generate.test.ts': 21,
   'config.test.ts': 83,
   'decisions-backtest.test.ts': 20,
   'decisions-cli.test.ts': 8,

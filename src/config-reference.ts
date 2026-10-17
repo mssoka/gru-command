@@ -1,5 +1,6 @@
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
+import { decisionsConfigTemplate } from './decisions/config-template.js';
 import {
   CLAUDE_CODE_THINKING_LEVELS,
   DEFAULT_CLAUDE_MCP_MODE,
@@ -85,6 +86,7 @@ export const CONFIG_SECTION_HEADERS: readonly string[] = [
   '[concurrency]',
   '[review]',
   '[verify]',
+  '[decisions.jev]',
 ];
 
 /** Tables that must be ACTIVE (parseable) in every generated config —
@@ -112,6 +114,8 @@ export const CONFIG_ACTIVE_TABLES: readonly string[] = [
   'concurrency',
   'review',
   'verify',
+  'decisions.jev',
+  'decisions.thresholds',
 ];
 
 export interface CompleteConfigValues {
@@ -753,6 +757,7 @@ export function renderReferenceConfig(
     '# needed, and records the run as timed out / non-success.',
     `run_timeout_ms = ${preserved?.verify.runTimeoutMs ?? 1_800_000}`,
     '',
+    decisionsConfigTemplate(false, preserved?.decisions),
   );
   return `${lines.join('\n')}\n`;
 }
