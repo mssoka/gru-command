@@ -361,6 +361,13 @@ test('wrong token: fatal inline error, stays on pairing across reload', async ({
 });
 
 test.describe('board (E6)', () => {
+  test('the real service wires Vector\'s raids block into the board: off by default, saying only that (#351)', async ({ page }) => {
+    const response = await page.request.get(`http://127.0.0.1:${REAL_PORT}/api/board`, { headers: { authorization: `Bearer ${REAL_TOKEN}` } });
+    expect(response.ok()).toBe(true);
+    const snapshot = (await response.json()) as { vector?: unknown };
+    expect(snapshot.vector).toEqual({ enabled: false, raidMode: 'proposed', maxRaidsPerDay: 2 });
+  });
+
   test('seeded jobs render repo-grouped with lens chips; live push updates', async ({ page }) => {
     // Seed the ledger through the real write API.
     const base = { authorization: `Bearer ${REAL_TOKEN}` };

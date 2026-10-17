@@ -12,6 +12,7 @@ import type { RepoOverviewView } from '../repos/overview.js';
 import type { VerificationQueueView } from '../verify/scheduler.js';
 import type { PacingGateView } from '../runtime/pacing.js';
 import type { DiskBoardView } from '../maintenance/disk.js';
+import type { VectorBoardView } from '../vector/board.js';
 import type { PipelineBoardView } from '../ledger/pipeline.js';
 import { ownerReadyPr, readBranchEvidence, type OwnerPrView } from './owner-actions.js';
 import {
@@ -309,6 +310,9 @@ export interface BoardSnapshot {
   /** GC's disk usage, free space, budget and floor (#427 PR 3; null when
    * unwired — the board then shows no disk row). */
   readonly disk: DiskBoardView | null;
+  /** Vector's raids at a glance (#351; null when unwired — the board then
+   * shows no raids card). Sent with raids off too, as `enabled: false`. */
+  readonly vector: VectorBoardView | null;
   /** Provider pacing gate (limits, running, queued with reasons). Null when
    * the pacing feature is off — the pre-pacing snapshot shape. */
   readonly pacing: PacingGateView | null;
@@ -498,6 +502,8 @@ export interface BoardEngineOptions {
   readonly verifyQueue?: () => VerificationQueueView | null;
   /** #427 PR 3: the disk row (late-bound disk service). */
   readonly disk?: () => DiskBoardView | null;
+  /** #351: the raids card (late-bound Vector service). */
+  readonly vector?: () => VectorBoardView | null;
   /** Provider pacing: gate view (late-bound; null when the feature is off). */
   readonly pacing?: () => PacingGateView | null;
   /** Durable pipeline queue projection (late-bound; null when unwired). */
@@ -540,6 +546,7 @@ export class BoardEngine {
     this.repoOverview = opts.repoOverview ?? (() => null);
     this.verifyQueue = opts.verifyQueue ?? (() => null);
     this.disk = opts.disk ?? (() => null);
+    this.vector = opts.vector ?? (() => null);
     this.pacing = opts.pacing ?? (() => null);
     this.pipeline = opts.pipeline ?? (() => null);
     this.selfHeal = opts.selfHeal ?? (() => null);
@@ -558,6 +565,7 @@ export class BoardEngine {
   private readonly repoOverview: () => RepoOverviewView | null;
   private readonly verifyQueue: () => VerificationQueueView | null;
   private readonly disk: () => DiskBoardView | null;
+  private readonly vector: () => VectorBoardView | null;
   private readonly pacing: () => PacingGateView | null;
   private readonly pipeline: () => PipelineBoardView | null;
   private readonly selfHeal: () => SelfHealView | null;
@@ -873,6 +881,7 @@ export class BoardEngine {
       silas: this.silasView(silasTurnOpen),
       verify: this.verifyQueue(),
       disk: this.diskView(),
+      vector: this.vectorView(),
       pacing: this.pacing(),
       pipeline: this.pipeline(),
       selfHeal: this.selfHeal(),
@@ -889,6 +898,17 @@ export class BoardEngine {
       return this.disk();
     } catch (error) {
       this.log('error', 'disk view read failed', { error: String(error) });
+      return null;
+    }
+  }
+
+  /** The raids card (#351); a failing read is logged and shows no card,
+   * never a broken snapshot. */
+  private vectorView(): VectorBoardView | null {
+    try {
+      return this.vector();
+    } catch (error) {
+      this.log('error', 'vector view read failed', { error: String(error) });
       return null;
     }
   }

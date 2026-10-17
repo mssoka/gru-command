@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { parse as parseToml } from 'smol-toml';
-import { DEFAULT_VECTOR_CONFIG, loadConfig, type VectorConfig } from '../src/config.js';
+import { DEFAULT_VECTOR_CONFIG, loadConfig, VECTOR_MODES, type VectorConfig } from '../src/config.js';
 import { renderReferenceConfig } from '../src/config-reference.js';
 import { ownerAttentionFor } from '../src/notifications/attention.js';
 import { EventBus } from '../src/events/bus.js';
@@ -15,10 +15,13 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import type { PackageResolution } from '../src/property/types.js';
 import { parseWorktreeManifest } from '../src/worktrees/manifest.js';
+import { BoardEngine } from '../src/board/engine.js';
+import { isValidSnapshot } from '../web/src/lib/board-protocol.js';
+import { vectorBoardView, type VectorBoardView, type VectorOnBoardView } from '../src/vector/board.js';
 import { buildRaidCandidates, rankScore } from '../src/vector/candidates.js';
-import { VECTOR_EVENTS, VectorLedger } from '../src/vector/ledger.js';
+import { VECTOR_EVENTS, VectorLedger, type RaidRecord } from '../src/vector/ledger.js';
 import { createVectorServer } from '../src/vector/server.js';
-import { RAID_CANDIDATES_KIND, RAID_LAUNCHED_KIND, RAID_PROPOSAL_KIND, startVectorHalves, VectorRefusal, VectorService } from '../src/vector/service.js';
+import { FIX_PROPOSAL_KIND, RAID_CANDIDATES_KIND, RAID_LAUNCHED_KIND, RAID_PROPOSAL_KIND, startVectorHalves, VectorRefusal, VectorService } from '../src/vector/service.js';
 
 /**
  * Vector's raids, planning half (#351 §1–2): config, the code-built
@@ -547,6 +550,170 @@ describe('raid service wiring (#351)', () => {
       expect(started, failing).toEqual(['planning', 'runner']);
       expect(logged, failing).toEqual([`error: vector raid ${failing} failed to start`]);
     }
+  });
+});
+
+describe('the board view: the cockpit raids card (#351)', () => {
+  const breakInPayload = (raidId: string, breakInId: string, invariant = 'refund(x) === x') => ({
+    break_in_id: breakInId, raid_id: raidId, repo: 'billing', package_dir: 'src/refunds', head_sha: 'h', source_identity: 's',
+    description: 'refund drops the cents', requirement_ref: 'REQ-1', invariant, frozen_sha256: 'f',
+    evidence_dir: '/evidence', test_path: 'refund.property.test.js', test_sha256: 't',
+  });
+  const on = (view: VectorBoardView): VectorOnBoardView => {
+    if (!view.enabled) throw new Error('expected the raids-on block');
+    return view;
+  };
+
+  it('follows one raid from proposal to a running attack; an answered card waits for nobody', () => {
+    const h = harness();
+    let now = new Date();
+    // Not started: decisions are followed by hand, so the gap between an
+    // answer and its follow-through is observable.
+    const service = h.service({ maxRounds: 4, maxRaidsPerDay: 2 }, () => now);
+    expect(service.boardView()).toEqual({
+      enabled: true, raidMode: 'proposed', proposed: 0, queued: 0, running: [], capUse: [], maxRaidsPerDay: 2, breakIns: 0, fixesAwaitingOwner: 0,
+    });
+    const [raid] = service.pick({ picks: [pickRefunds()], digest: null, requestedBy: 'gru' }).raids;
+    // A proposal waits in FOR YOU and does not count toward the cap.
+    expect(on(service.boardView())).toMatchObject({ proposed: 1, queued: 0, capUse: [] });
+    h.ledger.recordNotificationDecision(raid!.notificationId!, 'accept', 'web');
+    expect(on(service.boardView()).proposed).toBe(0);
+    service.followDecision(raid!.notificationId!);
+    // Queued: it counts toward the cap exactly as a pick is refused.
+    expect(on(service.boardView())).toMatchObject({ proposed: 0, queued: 1, running: [], capUse: [{ repo: 'billing', used: 1 }] });
+    const started = h.ledger.appendCustomEvent({ kind: VECTOR_EVENTS.started, payload: { raid_id: raid!.id, head_sha: 'h' } });
+    h.ledger.appendCustomEvent({ kind: VECTOR_EVENTS.round, payload: { raid_id: raid!.id, outcome: 'rejected', verdict: 'rejected' } });
+    expect(on(service.boardView())).toMatchObject({
+      queued: 0,
+      running: [{ repo: 'billing', packageDir: 'src/refunds', roundsDone: 1, maxRounds: 4, startedAt: started.ts }],
+      capUse: [{ repo: 'billing', used: 1 }],
+    });
+    h.ledger.appendCustomEvent({ kind: VECTOR_EVENTS.finished, payload: { raid_id: raid!.id, outcome: 'budget-exhausted', label: 'x', detail: 'd' } });
+    expect(on(service.boardView())).toMatchObject({ running: [], capUse: [{ repo: 'billing', used: 1 }] });
+    // The rolling day ends exactly 24 hours after the start.
+    now = new Date(Date.parse(started.ts) + 86_400_000 - 1);
+    expect(on(service.boardView()).capUse).toEqual([{ repo: 'billing', used: 1 }]);
+    now = new Date(Date.parse(started.ts) + 86_400_000);
+    expect(on(service.boardView()).capUse).toEqual([]);
+  });
+
+  it('a raid card Gru withdrew waits for nobody, even before the raid record follows', () => {
+    const h = harness();
+    const service = h.service();
+    const [raid] = service.pick({ picks: [pickRefunds()], digest: null, requestedBy: 'gru' }).raids;
+    expect(on(service.boardView()).proposed).toBe(1);
+    // A typed owner decision is answered or closed, never acknowledged, so
+    // "open" needs no Ack check.
+    expect(() => h.ledger.ackNotification(raid!.notificationId!, 'web')).toThrow(/an Ack cannot erase the question/u);
+    // Withdrawn as stale: the card closes before the raid record follows.
+    h.ledger.withdrawOwnerProposal(raid!.notificationId!, 'withdrawn: the target moved');
+    expect(service.raids().find((entry) => entry.id === raid!.id)?.state).toBe('proposed');
+    expect(on(service.boardView()).proposed).toBe(0);
+  });
+
+  it('counts a fix as waiting only while its FOR YOU card is unanswered: never before its card, never after a decline or an Accept', async () => {
+    const h = harness();
+    const service = h.service();
+    h.ledger.appendCustomEvent({ kind: VECTOR_EVENTS.breakIn, payload: breakInPayload('raid-1', 'bi-1') });
+    // Found, but its card is not posted yet: nothing waits for the owner.
+    expect(on(service.boardView())).toMatchObject({ breakIns: 1, fixesAwaitingOwner: 0 });
+    await service.onBreakIn('bi-1');
+    const [first] = h.rows(FIX_PROPOSAL_KIND);
+    expect(on(service.boardView()).fixesAwaitingOwner).toBe(1);
+    h.notifications.decide(first!.id, 'decline', 'web', first!.decision!);
+    await service.followFixDecision(first!.id);
+    expect(service.breakIns().find((entry) => entry.id === 'bi-1')?.fix?.state).toBe('declined');
+    expect(on(service.boardView())).toMatchObject({ breakIns: 1, fixesAwaitingOwner: 0 });
+    // A second break-in the owner accepted before its dispatch ran: the fix
+    // stays proposed in the record, yet nobody is asked any more.
+    h.ledger.appendCustomEvent({ kind: VECTOR_EVENTS.breakIn, payload: breakInPayload('raid-1', 'bi-2', 'refund(x) >= 0') });
+    await service.onBreakIn('bi-2');
+    const second = h.rows(FIX_PROPOSAL_KIND).find((row) => row.id !== first!.id)!;
+    expect(on(service.boardView()).fixesAwaitingOwner).toBe(1);
+    h.ledger.recordNotificationDecision(second.id, 'accept', 'web');
+    expect(service.breakIns().find((entry) => entry.id === 'bi-2')?.fix?.state).toBe('proposed');
+    expect(on(service.boardView())).toMatchObject({ breakIns: 2, fixesAwaitingOwner: 0 });
+  });
+
+  it('two running raids are both shown, newest start first; cap use lists the busiest repository first', () => {
+    const record = (id: string, repo: string, state: RaidRecord['state'], startedAt: string | null): RaidRecord => ({
+      id, target: { repo, packageDir: 'src/x' }, sourceIdentity: 's', headSha: 'h', reason: 'r', requestedBy: 'gru',
+      signals: { commitsSinceLastRaid: 0, escapedRegressions: 0, perkinsFindings: 0, daysSinceLastRaid: null },
+      pickedAt: '2026-10-17T10:00:00.000Z', state, notificationId: null, launchedBy: 'autonomous', launchedAt: '2026-10-17T10:00:00.000Z',
+      closedDetail: null, startedAt, runHeadSha: null, rounds: [], outcome: null, outcomeLabel: null, finishedAt: null, reportFile: null, metrics: null,
+    });
+    const view = vectorBoardView({
+      config: { enabled: true, raidMode: 'autonomous', maxRounds: 4, maxRaidsPerDay: 2 },
+      raids: [
+        record('older', 'billing', 'running', '2026-10-17T11:00:00.000Z'),
+        record('newer', 'ledger-svc', 'running', '2026-10-17T12:00:00+00:00'),
+        record('waiting', 'billing', 'queued', null),
+        // A proposal whose card was never posted waits for nobody.
+        record('cardless', 'billing', 'proposed', null),
+      ],
+      breakIns: [],
+      now: new Date('2026-10-17T13:00:00.000Z'),
+      awaitingOwner: () => true,
+    });
+    expect(on(view).running.map((entry) => entry.repo)).toEqual(['ledger-svc', 'billing']);
+    expect(on(view).capUse).toEqual([{ repo: 'billing', used: 2 }, { repo: 'ledger-svc', used: 1 }]);
+    expect(on(view).proposed).toBe(0);
+    // Equal starts keep one order whatever the record order: repository,
+    // then package.
+    const tie = (raids: readonly RaidRecord[]) => on(vectorBoardView({
+      config: { enabled: true, raidMode: 'autonomous', maxRounds: 4, maxRaidsPerDay: 2 },
+      raids, breakIns: [], now: new Date('2026-10-17T13:00:00.000Z'), awaitingOwner: () => true,
+    })).running.map((entry) => `${entry.repo}/${entry.packageDir}`);
+    const same = '2026-10-17T12:00:00.000Z';
+    const b = { ...record('b', 'billing', 'running', same), target: { repo: 'billing', packageDir: 'src/b' } };
+    const a = { ...record('a', 'billing', 'running', same), target: { repo: 'billing', packageDir: 'src/a' } };
+    const z = record('z', 'audit', 'running', same);
+    expect(tie([b, a, z])).toEqual(['audit/src/x', 'billing/src/a', 'billing/src/b']);
+    expect(tie([z, b, a])).toEqual(['audit/src/x', 'billing/src/a', 'billing/src/b']);
+  });
+
+  it('with raids off the block carries only the mode and the cap, even with raids on record', () => {
+    const h = harness();
+    const live = h.service({ raidMode: 'autonomous' });
+    live.pick({ picks: [pickRefunds()], digest: null, requestedBy: 'gru' });
+    const off = h.service({ enabled: false, raidMode: 'autonomous', maxRaidsPerDay: 3 });
+    off.start();
+    expect(off.boardView()).toEqual({ enabled: false, raidMode: 'autonomous', maxRaidsPerDay: 3 });
+  });
+
+  it('reaches the board snapshot, and the web validator accepts what the server built; a failing read shows no card', async () => {
+    const h = harness();
+    const service = h.service({ raidMode: 'autonomous' });
+    const [raid] = service.pick({ picks: [pickRefunds()], digest: null, requestedBy: 'gru' }).raids;
+    h.ledger.appendCustomEvent({ kind: VECTOR_EVENTS.started, payload: { raid_id: raid!.id, head_sha: 'h' } });
+    h.ledger.appendCustomEvent({ kind: VECTOR_EVENTS.breakIn, payload: breakInPayload(raid!.id, 'bi-1') });
+    await service.onBreakIn('bi-1');
+    const engine = new BoardEngine({ ledger: h.ledger, bus: h.bus, vector: () => service.boardView() });
+    const snapshot = JSON.parse(JSON.stringify(engine.snapshot())) as Record<string, unknown>;
+    expect(snapshot['vector']).toEqual(service.boardView());
+    expect(on(service.boardView()).running).toHaveLength(1);
+    expect(isValidSnapshot(snapshot)).toBe(true);
+    // Every mode the server can send passes the web validator (a one-sided
+    // addition would make the web reject the WHOLE board), on and off.
+    for (const raidMode of VECTOR_MODES) {
+      expect(isValidSnapshot({ ...snapshot, vector: { ...(snapshot['vector'] as object), raidMode } }), raidMode).toBe(true);
+      expect(isValidSnapshot({ ...snapshot, vector: { enabled: false, raidMode, maxRaidsPerDay: 2 } }), `${raidMode} off`).toBe(true);
+    }
+    const logged: string[] = [];
+    const broken = new BoardEngine({
+      ledger: h.ledger, bus: h.bus, log: (level, msg) => logged.push(`${level}: ${msg}`),
+      vector: () => { throw new Error('projection broke'); },
+    });
+    expect(broken.snapshot().vector).toBeNull();
+    expect(logged).toContain('error: vector view read failed');
+    expect(isValidSnapshot(JSON.parse(JSON.stringify(broken.snapshot())))).toBe(true);
+    expect(new BoardEngine({ ledger: h.ledger, bus: h.bus }).snapshot().vector).toBeNull();
+    // Raids off, through a real engine: the off block reaches the snapshot
+    // and the web validator accepts it.
+    const off = h.service({ enabled: false, maxRaidsPerDay: 3 });
+    const offSnapshot = JSON.parse(JSON.stringify(new BoardEngine({ ledger: h.ledger, bus: h.bus, vector: () => off.boardView() }).snapshot())) as Record<string, unknown>;
+    expect(offSnapshot['vector']).toEqual({ enabled: false, raidMode: 'proposed', maxRaidsPerDay: 3 });
+    expect(isValidSnapshot(offSnapshot)).toBe(true);
   });
 });
 

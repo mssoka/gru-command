@@ -7,6 +7,7 @@ import { parseNotificationDecision, type NotificationDecision } from '../ledger/
 import type { LogLevel } from '../logger.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { PackageResolution } from '../property/types.js';
+import { vectorBoardView, type VectorBoardView } from './board.js';
 import { buildRaidCandidates, RETRYABLE_OUTCOMES, type RaidCandidate, type RaidCandidateList } from './candidates.js';
 import { breakInContract, fixHeistJobId, fixHeistTitle, renderFixBriefing } from './fix.js';
 import {
@@ -230,6 +231,18 @@ export class VectorService {
   /** Spend and yield per repository across every raid that ran anything (#351 §5). */
   rollup(): readonly RepositoryRollup[] {
     return repositoryRollups(this.store.raids());
+  }
+
+  /** The board's raid counts (the cockpit's VECTOR RAIDS card). Read with
+   * raids off too: the block then says only that they are off. A FOR YOU
+   * card counts as waiting while it is open and unanswered (a typed owner
+   * decision cannot be acknowledged, only answered or closed). */
+  boardView(): VectorBoardView {
+    const awaitingOwner = (notificationId: string): boolean => {
+      const row = this.opts.ledger.getNotification(notificationId);
+      return row !== null && row.decidedOption === null && row.resolvedAt === null;
+    };
+    return vectorBoardView({ config: this.opts.vector, raids: this.store.raids(), breakIns: this.store.breakIns(), now: this.now(), awaitingOwner });
   }
 
   /**

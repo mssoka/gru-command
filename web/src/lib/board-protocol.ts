@@ -316,6 +316,56 @@ export interface DiskView {
   readonly computedAt: string | null;
 }
 
+/** The raid modes the server can send (mirrors `VECTOR_MODES`; the drift
+ * alarm in test/board-frames.test.ts pins both lists). */
+export const VECTOR_RAID_MODES = ['proposed', 'autonomous'] as const;
+
+/** Vector's raids at a glance (#351; server mirror of `VectorBoardView`).
+ * With raids off the block says only that: nothing follows decisions,
+ * starts or closes a raid, so it claims no live counts. */
+export type VectorView = VectorOffView | VectorOnView;
+
+export interface VectorOffView {
+  readonly enabled: false;
+  readonly raidMode: (typeof VECTOR_RAID_MODES)[number];
+  readonly maxRaidsPerDay: number;
+}
+
+export interface VectorOnView {
+  readonly enabled: true;
+  readonly raidMode: (typeof VECTOR_RAID_MODES)[number];
+  /** Raids Gru picked whose FOR YOU card is open and unanswered. */
+  readonly proposed: number;
+  /** Launched raids waiting in Silas's raid queue. */
+  readonly queued: number;
+  /** Raids running now, newest start first (one per host in normal operation). */
+  readonly running: readonly VectorRunningRaidView[];
+  /** Repositories using their daily cap now, busiest first. */
+  readonly capUse: readonly VectorCapUseView[];
+  /** The per-repository cap on raids in any rolling 24 hours. */
+  readonly maxRaidsPerDay: number;
+  /** Every confirmed break-in so far. */
+  readonly breakIns: number;
+  /** Break-ins whose fix card is open and unanswered in FOR YOU. */
+  readonly fixesAwaitingOwner: number;
+}
+
+/** A raid running right now (#351). */
+export interface VectorRunningRaidView {
+  readonly repo: string;
+  readonly packageDir: string;
+  /** Attacks that finished so far; the one in progress is not counted. */
+  readonly roundsDone: number;
+  readonly maxRounds: number;
+  readonly startedAt: string;
+}
+
+/** One repository's use of its daily cap, counted as a pick is refused. */
+export interface VectorCapUseView {
+  readonly repo: string;
+  readonly used: number;
+}
+
 /** One disk the floor watches (#427 PR 3). */
 export interface DiskVolumeView {
   /** What lives on it: `lanes`, `data_dir`, or both. */
@@ -601,6 +651,9 @@ export interface BoardSnapshot {
   /** #427 PR 3: absent on older servers and null when unwired (the strip
    * then shows no disk pair); a present block is validated strictly. */
   readonly disk?: DiskView | null;
+  /** #351: absent on older servers (the board then shows no raids card);
+   * a present block is validated strictly. */
+  readonly vector?: VectorView | null;
   /** Provider pacing gate (server mirror; absent on pre-pacing servers). */
   readonly pacing?: PacingGateView | null;
   /** Durable pipeline queue; absent on pre-upgrade servers (tolerated). */
@@ -1023,6 +1076,37 @@ function isDiskView(value: unknown): value is DiskView {
   );
 }
 
+function isVectorRunningRaidView(value: unknown): value is VectorRunningRaidView {
+  return (
+    isRecord(value) &&
+    typeof value.repo === 'string' &&
+    typeof value.packageDir === 'string' &&
+    isCount(value.roundsDone) &&
+    isCount(value.maxRounds) &&
+    typeof value.startedAt === 'string'
+  );
+}
+
+function isVectorCapUseView(value: unknown): value is VectorCapUseView {
+  return isRecord(value) && typeof value.repo === 'string' && isCount(value.used);
+}
+
+function isVectorView(value: unknown): value is VectorView {
+  if (!isRecord(value) || !(VECTOR_RAID_MODES as readonly unknown[]).includes(value.raidMode) || !isCount(value.maxRaidsPerDay)) return false;
+  if (value.enabled === false) return true;
+  return (
+    value.enabled === true &&
+    isCount(value.proposed) &&
+    isCount(value.queued) &&
+    Array.isArray(value.running) &&
+    value.running.every(isVectorRunningRaidView) &&
+    Array.isArray(value.capUse) &&
+    value.capUse.every(isVectorCapUseView) &&
+    isCount(value.breakIns) &&
+    isCount(value.fixesAwaitingOwner)
+  );
+}
+
 function isPacingQueueEntryView(value: unknown): value is PacingQueueEntryView {
   return (
     isRecord(value) &&
@@ -1345,6 +1429,7 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
   if (value.silas !== undefined && value.silas !== null && !isSilasView(value.silas)) return false;
   if (value.verify !== undefined && value.verify !== null && !isVerifyQueueView(value.verify)) return false;
   if (value.disk !== undefined && value.disk !== null && !isDiskView(value.disk)) return false;
+  if (value.vector !== undefined && value.vector !== null && !isVectorView(value.vector)) return false;
   if (value.pacing !== undefined && value.pacing !== null && !isPacingGateView(value.pacing)) return false;
   if (value.pipeline !== undefined && value.pipeline !== null && !isPipelineView(value.pipeline)) return false;
   if (value.selfHeal !== undefined && value.selfHeal !== null && !isSelfHealView(value.selfHeal)) return false;
