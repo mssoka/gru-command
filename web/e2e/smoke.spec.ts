@@ -637,7 +637,7 @@ test.describe('board (E6, mock feed)', () => {
     await expect(signal).toContainText('live');
     await expect(signal).toContainText('1 blocker');
     // The global NEEDS GRU number lives on the attention card's Gru line.
-    await expect(page.locator('.board-owner__gru')).toContainText('Gru is handling');
+    await expect(page.locator('.board-owner__gru')).toHaveText(/^\d+ live alerts? waits? for Gru$/u);
 
     // Expand the row, then the round row: all 9 lens chips appear.
     await job.locator('.board-job__toggle').click();
@@ -779,7 +779,8 @@ test.describe('board (E6, mock feed)', () => {
     const deploy = page.locator('.command-health__part[data-check="deploy"]');
     await expect(deploy).toContainText('3 behind');
     await expect(deploy.locator('.command-health__flag')).toHaveText('RESTART PENDING');
-    await expect(page.locator('#command-health')).toHaveAttribute('data-attention', 'true');
+    await expect(page.locator('#command-health')).toHaveAttribute('data-state', 'attention');
+    await expect(page.locator('#command-health')).toHaveAttribute('aria-label', 'System health');
     await expect(page.locator('.command-health__part').first()).toHaveAttribute('data-check', 'deploy');
     await expect(page.locator('.command-health__part[data-check="verify"]')).toContainText('lock free');
     // An unwired check stays out of the text and in the title (honest n/a).
@@ -798,6 +799,8 @@ test.describe('board (E6, mock feed)', () => {
       'COLD',
     ]);
     await expect(page.locator('#board-section-pipeline.board-folded__pill .board-folded__count')).toHaveText('—');
+    // Unknown reads dashed, so it never passes for a verified empty pill.
+    await expect(page.locator('#board-section-pipeline')).toHaveCSS('border-top-style', 'dashed');
     const bandSticky = await page
       .locator('.board-band--in-flight .board-band__head')
       .evaluate((node) => getComputedStyle(node).position);
@@ -862,7 +865,7 @@ test.describe('board (E6, mock feed)', () => {
       // review escalation (mock-n5) AND the provider-wall stop (mock-n4,
       // machine attention since the owner release), never the merged lane's
       // closed receipt.
-      await expect(page.locator('.board-owner__gru')).toHaveText('Gru is handling 2 more in FOR GRU');
+      await expect(page.locator('.board-owner__gru')).toHaveText('2 live alerts wait for Gru');
       // The line is the one NEEDS GRU surface (#400): no hidden duplicate,
       // and its title carries the live-queue explanation.
       await expect(page.locator('#board-unacked')).toHaveCount(0);
@@ -875,8 +878,8 @@ test.describe('board (E6, mock feed)', () => {
       // so the NEEDS GRU band and the waiting row get their own clips — the
       // band shows the closed-receipt exclusion, the row shows the
       // stopped-lane waiting state directly. The band sits directly under
-      // the sticky chip rail, so center each element before its clip — a
-      // minimal scroll would leave the rail overlaying the capture.
+      // the sticky command bar, so center each element before its clip — a
+      // minimal scroll would leave the bar overlaying the capture.
       const needsGruBand = page.locator('.board-band--needs-you');
       await needsGruBand.evaluate((node) => node.scrollIntoView({ block: 'center' }));
       await needsGruBand.screenshot({ path: testInfo.outputPath(`board-truth-needs-gru-${theme}.png`) });
@@ -1548,8 +1551,8 @@ test.describe('phone chrome', () => {
 
   const CHROME_CONTROLS = ['#theme-toggle', '#settings-toggle', '#sound-toggle'];
 
-  /** Top-anchored overlays must clear the sticky chrome (command bar plus
-   * the chip rail when shown) at whatever height it wraps to. The
+  /** Top-anchored overlays must clear the sticky chrome (the command bar)
+   * at whatever height it wraps to. The
    * clearance is DERIVED from the measured chrome (--chrome-h, set by
    * main.ts measureChrome), not a static token, so a wrapped nav at any
    * width — including 320-383px where it takes three rows — is covered.

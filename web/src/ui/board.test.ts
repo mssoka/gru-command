@@ -189,7 +189,7 @@ function mountBoardDom(): void {
       <span id="board-decisions"></span>
       <span id="board-wakes" hidden></span>
     </div>
-    <section id="board-kpis" hidden></section>
+    <div id="board-kpis" hidden></div>
     <nav id="board-nav" hidden></nav>
     <section id="board-owner" hidden></section>
     <div id="board-jobs"></div>
@@ -524,9 +524,12 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
     expect(document.getElementById('board-kpis')?.hidden).toBe(true);
     view.render(snapshot({ children: { active: 1, queued: 2, finished: 3, lifetimeCreations: 4 } }));
     expect(document.getElementById('command-health')?.hidden).toBe(false);
+    expect(document.getElementById('board-kpis')?.hidden).toBe(false);
     const cards = [...document.querySelectorAll<HTMLElement>('#board-kpis .cockpit-card')];
-    // No raids block from this server: five cards, never a raids card of zeros.
+    // No raids block from this server: five cards, never a raids card of zeros
+    // — and the grid knows it holds five, so it never leaves a sixth hole.
     expect(cards.map((card) => card.dataset.card)).toEqual(['heists', 'megaminions', 'crew', 'prs', 'reviews']);
+    expect(document.querySelector<HTMLElement>('.cockpit-kpis__grid')?.dataset.count).toBe('5');
     expect(cards.map((card) => card.querySelector('.cockpit-card__label')?.textContent)).toEqual(['HEISTS', 'MEGAMINIONS', 'CREW', 'PRS', 'REVIEWS']);
     // Each card names itself through its tone class (a rename must not drop it).
     expect(cards.map((card) => card.classList.contains(`cockpit-card--${card.dataset.card}`))).toEqual([true, true, true, true, true]);
@@ -555,10 +558,12 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
       }),
     );
     const pill = document.getElementById('command-health')!;
-    expect(pill.dataset.attention).toBe('true');
+    expect(pill.dataset.state).toBe('attention');
     expect(document.getElementById('command-health-summary')?.textContent).toBe('2 need a look');
     const parts = [...pill.querySelectorAll<HTMLElement>('.command-health__part')];
     expect(parts.map((part) => part.dataset.check)).toEqual(['deploy', 'verify']);
+    // Each problem is marked, so a phone keeps it while the calm checks fold.
+    expect(parts.map((part) => part.dataset.problem)).toEqual(['true', 'true']);
     const [deploy, verify] = parts;
     expect(deploy?.classList.contains('command-health__part--alert')).toBe(true);
     expect(deploy?.firstChild?.textContent).toBe('deploy 43 behind');
@@ -573,14 +578,24 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
     const view = new BoardView(() => {});
     view.render(snapshot());
     const pill = document.getElementById('command-health')!;
-    expect(pill.dataset.attention).toBe('false');
+    expect(pill.dataset.state).toBe('unwired');
     expect(document.getElementById('command-health-summary')?.textContent).toBe('Checks not wired');
     expect(pill.querySelectorAll('.command-health__part')).toHaveLength(0);
     for (const check of ['deploy', 'silas', 'verify', 'cure']) expect(pill.title).toContain(`${check}: n/a`);
-    // A wired, healthy check turns the summary to All healthy.
+    // A wired check with only a neutral fact (Silas, no wakes yet) is quiet,
+    // not healthy: nothing has read ok yet.
+    const noWakes: SilasView = {
+      lastWakeAt: null, lastTickAt: null, lastReconcileAt: null, lastReconcileFailedAt: null, reconcileFailedNewer: false,
+      lastUsefulActionAt: null, nextAction: null, openTurnSince: null, reconciliationsToday: 0, checkedAt: '2026-01-01T00:00:00.000Z',
+    };
+    view.render(snapshot({ silas: noWakes }));
+    expect(pill.dataset.state).toBe('quiet');
+    expect(document.getElementById('command-health-summary')?.textContent).toBe('No problems reported');
+    // A wired check that reads ok turns the summary to All healthy.
     view.render(snapshot({ verify: { lockInUse: false, activeRuns: 0, queuedRuns: 0, workerBudget: 8, workersPerRun: 4 } }));
+    expect(pill.dataset.state).toBe('healthy');
     expect(document.getElementById('command-health-summary')?.textContent).toBe('All healthy');
-    expect([...pill.querySelectorAll<HTMLElement>('.command-health__part')].map((part) => part.textContent)).toEqual(['verify lock free']);
+    expect([...pill.querySelectorAll<HTMLElement>('.command-health__part')].map((part) => [part.textContent, part.dataset.problem])).toEqual([['verify lock free', 'false']]);
   });
 
   it('renders every KPI as a data-kpi number matching boardKpis, each beside its visible label', () => {
@@ -676,12 +691,42 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
     expect(document.getElementById('board-unacked')).toBeNull();
     const lines = [...document.querySelectorAll<HTMLElement>('.board-owner__gru')];
     expect(lines).toHaveLength(1);
-    expect(lines[0]?.textContent).toBe('Gru is handling 2 more in FOR GRU');
+    expect(lines[0]?.textContent).toBe('2 live alerts wait for Gru');
+    // Live alerts carry the alert ink (with its ▲ in CSS), never calm text.
+    expect(lines[0]?.classList.contains('board-owner__gru--alert')).toBe(true);
     // The count is the LIVE machine queue: the line's title says so (A4).
     expect(lines[0]?.title).toContain('2 live machine-attention notifications awaiting a Gru disposition');
     expect(lines[0]?.title).toContain('closed receipts stay in the record');
     view.render(snapshot());
-    expect(document.querySelector('.board-owner__gru')?.textContent).toBe('nothing needs Gru either · the crew is on it');
+    const calm = document.querySelector<HTMLElement>('.board-owner__gru');
+    expect(calm?.textContent).toBe('nothing needs Gru either · the crew is on it');
+    expect(calm?.classList.contains('board-owner__gru--alert')).toBe(false);
+    // A last-known board says so rather than claiming calm.
+    view.markUnavailable('board socket lost');
+    expect(document.querySelector('.board-owner__gru')?.textContent).toBe('last-known · nothing needs Gru either · the crew is on it');
+  });
+
+  it('the attention card: the heading keeps FOR YOU and its count; what needs you and the Gru line sit under it', () => {
+    const pr = (jobId: string): NonNullable<BoardSnapshot['ownerPrs']>[number] => ({
+      id: `owner-pr:${jobId}`, jobId, jobTitle: `Heist ${jobId}`, repo: 'demo', prUrl: 'https://github.com/example/demo/pull/7',
+      sha: 'aaaa1111bbbb2222cccc3333dddd4444eeee5555', checkedAt: '2026-01-01T00:05:00.000Z',
+    });
+    const view = new BoardView(() => {});
+    view.render(snapshot({ ownerPrs: [pr('a'), pr('b')] }));
+    const band = document.getElementById('board-owner')!;
+    const head = band.querySelector<HTMLElement>('h2.board-band__head')!;
+    expect(head.textContent).toBe('FOR YOU2 pending');
+    expect(head.querySelector('.board-owner__gru, .board-owner__headline')).toBeNull();
+    const summary = band.querySelector<HTMLElement>(':scope > .board-owner__summary')!;
+    expect(summary.previousElementSibling).toBe(head);
+    expect(summary.querySelector('.board-owner__headline')?.textContent).toBe('2 things need you');
+    expect(summary.querySelector('.board-owner__gru')?.textContent).toBe('nothing needs Gru either · the crew is on it');
+    expect(band.dataset.empty).toBe('false');
+    view.render(snapshot({ ownerPrs: [pr('a')] }));
+    expect(band.querySelector('.board-owner__headline')?.textContent).toBe('1 thing needs you');
+    view.render(snapshot());
+    expect(band.querySelector('.board-owner__summary')).toBeNull();
+    expect(band.dataset.empty).toBe('true');
   });
 
   it('renders the four GRU wake truths, independent of Silas', () => {
@@ -821,7 +866,10 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
     expect(crew.querySelector('[data-kpi="children.active"]')?.textContent).toBe('2');
     expect(crew.querySelector('[data-kpi="children.active"]')?.nextElementSibling?.textContent).toBe('sub-minions');
     expect(crew.querySelector('[data-kpi="children.active"]')?.getAttribute('title')).toContain('6 created');
-    expect(crew.querySelector('.cockpit-fact--note')?.textContent).toBe('+1 queued');
+    // Queued sub-minions are a count with its own identity, not loose text.
+    expect(crew.querySelector('[data-kpi="children.queued"]')?.textContent).toBe('1');
+    expect(crew.querySelector('[data-kpi="children.queued"]')?.nextElementSibling?.textContent).toBe('queued');
+    expect(crew.querySelector('.cockpit-fact--note')).toBeNull();
   });
 
   it('shows the raids card only when the server sent its block: dashed when off, the running raid when on', () => {
@@ -838,6 +886,7 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
       fixesAwaitingOwner: 1,
     };
     view.render({ ...snapshot(), vector: { enabled: false, raidMode: 'proposed', maxRaidsPerDay: 2 } });
+    expect(document.querySelector<HTMLElement>('.cockpit-kpis__grid')?.dataset.count).toBe('6');
     const off = document.querySelector<HTMLElement>('.cockpit-card--raids');
     expect(off?.classList.contains('cockpit-card--off')).toBe(true);
     expect(off?.querySelector('.cockpit-card__big')?.textContent).toBe('off');
@@ -850,28 +899,35 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
     expect(on.querySelector('[data-kpi="vector.fixesAwaitingOwner"]')?.closest('.cockpit-fact')?.classList.contains('cockpit-fact--alert')).toBe(true);
     expect(on.querySelector('[data-kpi="vector.breakIns"]')?.textContent).toBe('2');
     expect(on.querySelector('.cockpit-fact--note')?.textContent).toBe('demo src/refunds · attack 2/4');
-    expect(on.querySelector('.cockpit-card__aside')?.textContent).toBe('1/2 today');
+    expect(on.querySelector('.cockpit-card__aside')?.textContent).toBe('1/2 in 24h');
     expect(on.querySelector('.cockpit-card__aside')?.getAttribute('title')).toBe('demo: 1 of 2 raids in the last 24 hours (the cap is per repository)');
     view.render(snapshot());
     expect(document.querySelector('.cockpit-card--raids')).toBeNull();
   });
 
   it('REVIEWS names the top round and counts today\'s verdicts and failures', () => {
-    const today = new Date().toISOString();
-    const view = new BoardView(() => {});
-    view.render(
-      snapshot({
-        jobs: [
-          baseJob({ id: 'a', rounds: [baseRound({ id: 'a-r3', seq: 3, status: 'live' })] }),
-          baseJob({ id: 'b', rounds: [baseRound({ id: 'b-r1', seq: 1, status: 'aborted', updatedAt: today }), baseRound({ id: 'b-r2', seq: 2, status: 'verdict-posted', updatedAt: today })] }),
-        ],
-      }),
-    );
-    const reviews = document.querySelector<HTMLElement>('.cockpit-card--reviews')!;
-    expect(reviews.querySelector('.cockpit-card__aside')?.textContent).toBe('round 3 live');
-    expect(reviews.querySelector('[data-kpi="reviews.active"]')?.textContent).toBe('1');
-    expect(reviews.querySelector('[data-kpi="reviews.verdictsToday"]')?.textContent).toBe('1');
-    expect(reviews.querySelector('[data-kpi="reviews.failedToday"]')?.closest('.cockpit-fact')?.classList.contains('cockpit-fact--alert')).toBe(true);
+    // A fixed clock: "today" never straddles local midnight mid-test.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-10-17T12:00:00.000Z'));
+    try {
+      const today = new Date().toISOString();
+      const view = new BoardView(() => {});
+      view.render(
+        snapshot({
+          jobs: [
+            baseJob({ id: 'a', rounds: [baseRound({ id: 'a-r3', seq: 3, status: 'live' })] }),
+            baseJob({ id: 'b', rounds: [baseRound({ id: 'b-r1', seq: 1, status: 'aborted', updatedAt: today }), baseRound({ id: 'b-r2', seq: 2, status: 'verdict-posted', updatedAt: today })] }),
+          ],
+        }),
+      );
+      const reviews = document.querySelector<HTMLElement>('.cockpit-card--reviews')!;
+      expect(reviews.querySelector('.cockpit-card__aside')?.textContent).toBe('round 3 live');
+      expect(reviews.querySelector('[data-kpi="reviews.active"]')?.textContent).toBe('1');
+      expect(reviews.querySelector('[data-kpi="reviews.verdictsToday"]')?.textContent).toBe('1');
+      expect(reviews.querySelector('[data-kpi="reviews.failedToday"]')?.closest('.cockpit-fact')?.classList.contains('cockpit-fact--alert')).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -1714,6 +1770,18 @@ describe('board v6 — bands', () => {
     expect(pill?.title).toBe('nothing needs Gru · the crew is on it');
   });
 
+  it('a last-known empty FOR GRU keeps its full card: the unavailable warning is never folded away', () => {
+    const view = new BoardView(() => {});
+    view.render({ ...snapshot(), mailbox: { items: [], counts: { threads: 0, incidents: 0, notifications: 0, needsGru: 0 } } });
+    expect(document.getElementById('board-section-for-gru')?.classList.contains('board-folded__pill')).toBe(true);
+    view.markUnavailable('board socket lost');
+    const section = document.getElementById('board-section-for-gru')!;
+    expect(section.classList.contains('board-folded__pill')).toBe(false);
+    expect(section.dataset.mailboxStatus).toBe('last-known');
+    expect(section.textContent).toContain('FOR GRU unavailable — rows and counts are last-known. board socket lost');
+    expect(section.querySelector('.board-band__count')?.textContent).toBe('last-known · 0 threads · 0 incidents · 0 notifications');
+  });
+
   it('folds every empty section into one Empty row when the board is quiet, in the approved order', () => {
     const view = new BoardView(() => {});
     // No repos, no jobs, and a wired-but-empty pipeline: every shortcut
@@ -1940,7 +2008,10 @@ describe('board agent rail — dense rows, tabs count, disposed collapse', () =>
     // A child row is labeled as a child and links back to its parent.
     const child = byAgentId.get('child-agent')!;
     expect(child.dataset.parentage).toBe('child');
-    expect(child.querySelector('.board-agent__role')?.textContent).toContain('child ·');
+    // The rail says sub-minion — the word CREW counts — in text and name.
+    expect(child.querySelector('.board-agent__role')?.textContent).toContain('sub-minion ·');
+    expect(child.querySelector('.board-agent__parentage')?.textContent).toBe('🧬 sub-minion');
+    expect(child.getAttribute('aria-label')).toContain('— sub-minion ·');
     expect(child.querySelector('.board-agent__parent-link')?.textContent).toContain('Payment lane');
     // A legacy row (no parentage field) is never claimed either way.
     const legacy = byAgentId.get('legacy-minion')!;
@@ -2356,7 +2427,7 @@ describe('board v6 — section truth: closed receipts never queue, stopped lanes
     // title carries the live-queue explanation for hover/AT consumers.
     const gru = document.querySelectorAll<HTMLElement>('.board-owner__gru');
     expect(gru).toHaveLength(1);
-    expect(gru[0]?.textContent).toBe('Gru is handling 1 more in FOR GRU');
+    expect(gru[0]?.textContent).toBe('1 live alert waits for Gru');
     expect(gru[0]?.title).toContain('1 live machine-attention notification awaiting a Gru disposition');
     // The record keeps BOTH durable rows. Machine rows clear through a Gru
     // disposition, not a human Ack, so neither carries an ack control.
@@ -2653,7 +2724,7 @@ describe('board v6 — section truth: closed receipts never queue, stopped lanes
     expect(row?.getAttribute('data-worker-state')).toBe('waiting');
     expect(row?.querySelector('.board-job__status')?.textContent).toBe('waiting · quota wall');
     expect(row?.querySelector('.board-job__signal')?.textContent).toContain('needs Gru');
-    expect(document.querySelector<HTMLElement>('.board-owner__gru')?.textContent).toMatch(/^Gru is handling \d+ more in FOR GRU$/u);
+    expect(document.querySelector<HTMLElement>('.board-owner__gru')?.textContent).toMatch(/^\d+ live alerts? waits? for Gru$/u);
   });
 
   it('the waiting truth is scoped to working lanes: an in-review lane with a live round keeps its true chip', () => {
@@ -4074,7 +4145,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
       expect(section('NEEDS GRU').textContent).not.toContain('Notice closed-machine');
       expect(section('FEED').querySelector('[data-receipt="closed"]')?.textContent).toContain('Notice closed-machine');
       expect(section('FEED').querySelector('.board-notification__ack')).toBeNull();
-      expect(document.querySelector('.board-owner__gru')?.textContent).toMatch(/^Gru is handling \d+ more in FOR GRU$/u);
+      expect(document.querySelector('.board-owner__gru')?.textContent).toMatch(/^\d+ live alerts? waits? for Gru$/u);
       expect(document.querySelector('.board-band--needs-you .board-job')).toBeNull();
       expect(client.ackNotification).not.toHaveBeenCalled();
       expect(machine.ackedAt).toBeNull();
@@ -4115,7 +4186,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const client2 = stubClient();
     document.body.innerHTML = `<div hidden><section id="board-owner"></section></div>
       <div id="command-health" hidden><span id="command-health-summary"></span><span id="command-health-parts"></span><span id="board-decisions"></span><span id="board-wakes" hidden></span></div>
-      <section id="board-kpis" hidden></section>
+      <div id="board-kpis" hidden></div>
       <div id="board-jobs"></div><div id="board-agents"></div><section id="board-repos" data-rail-panel="agents"></section><span id="rail-agents-count">0</span>
       <nav id="board-nav" hidden></nav>
       <button id="notification-bell"><span id="notification-badge">0</span></button>
@@ -4305,6 +4376,10 @@ describe('board — compact owner-first presentation (j-1064)', () => {
     const pipeline = document.getElementById('board-section-pipeline');
     expect(pipeline?.querySelector('.board-folded__count')?.textContent).toBe('—');
     expect(pipeline?.querySelector('.board-folded__reason')?.textContent).toBe('pipeline queue unavailable on this server');
+    // ...and its pill is marked unknown (dashed), unlike a verified empty one.
+    expect(pipeline?.dataset.unknown).toBe('true');
+    view.render(snapshot({ pipeline: { entries: [], pending: 0 } }));
+    expect(document.getElementById('board-section-pipeline')?.dataset.unknown).toBe('false');
   });
 
   it('keeps focus and disclosure state across ordinary live snapshot pushes', () => {

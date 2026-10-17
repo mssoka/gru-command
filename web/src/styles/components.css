@@ -235,6 +235,21 @@ body {
   white-space: nowrap;
 }
 
+/* RADAR holds its widest word (`RADAR SYNCING`) and ROUND two digits of
+   its number, so a reconnect or round 10 never moves the health pill
+   beside them. Monospace: ch per character plus its letter-spacing. */
+#command-radar-label {
+  display: inline-block;
+  min-width: calc(13 * (1ch + 0.06em));
+  text-align: center;
+}
+
+.command-pill__num {
+  display: inline-block;
+  min-width: calc(2 * (1ch + 0.06em));
+  text-align: center;
+}
+
 .command-pill .conn-dot {
   width: 9px;
   height: 9px;
@@ -272,11 +287,11 @@ body {
 
 /* A light alert tint (the calm checks keep >= 4.5:1 on it); dark mode
    keeps its own deep fill. */
-.command-health[data-attention='true'] {
+.command-health[data-state='attention'] {
   background: color-mix(in srgb, var(--alert) 22%, var(--card));
 }
 
-.dark .command-health[data-attention='true'] {
+.dark .command-health[data-state='attention'] {
   background: var(--danger-soft);
 }
 
@@ -284,6 +299,12 @@ body {
    gives way (its checks ellipsize), so nothing beside it moves. */
 .command-bar > .pp-btn {
   flex: none;
+}
+
+/* Before the first snapshot the pill is hidden: the buttons still sit at
+   the bar's right edge. */
+.command-health[hidden] + .board-sound {
+  margin-left: auto;
 }
 
 .command-health__dot {
@@ -295,8 +316,15 @@ body {
   background: var(--done);
 }
 
-.command-health[data-attention='true'] .command-health__dot {
+.command-health[data-state='attention'] .command-health__dot {
   background: var(--alert);
+}
+
+/* Nothing reads ok (no check wired, or only neutral facts): the dot is
+   muted, never the healthy green. */
+.command-health[data-state='quiet'] .command-health__dot,
+.command-health[data-state='unwired'] .command-health__dot {
+  background: var(--park);
 }
 
 .command-health__summary {
@@ -306,12 +334,12 @@ body {
   white-space: nowrap;
 }
 
-.command-health[data-attention='true'] .command-health__summary {
+.command-health[data-state='attention'] .command-health__summary {
   color: var(--band-needs-you-ink);
 }
 
 /* The ▲ beside the colour: attention is never carried by colour alone. */
-.command-health[data-attention='true'] .command-health__summary::before {
+.command-health[data-state='attention'] .command-health__summary::before {
   content: '▲ ';
   font-size: 10px;
 }
@@ -365,16 +393,26 @@ body {
 /* Below the cockpit width the health pill takes its own full-width row
    under the brand, pills and buttons. */
 @media (max-width: 1099px) {
+  /* Tighter gaps keep the brand, the pills and the buttons on one row
+     down to tablet width. */
+  .command-bar { column-gap: 8px; }
   .command-bar > .board-sound { margin-left: auto; }
   .command-health { order: 2; margin-left: 0; flex: 1 1 100%; max-width: none; }
 }
 
-/* Phone: the pills join the health pill's row; the checks' text gives way
-   to the summary, and the chips wrap inside the pill. */
+/* Phone: the pills join the health pill's row; the calm checks give way
+   to the summary, the checks that need a look keep a wrapping line of
+   their own, and the chips wrap inside the pill. */
 @media (max-width: 640px) {
+  /* The bar scrolls away with the page on a phone: wrapped to three rows
+     it would hold a quarter of the screen. The shortcut strip and the band
+     heads keep the top (main.ts measures --chrome-h as 0 here). */
+  .command-bar { position: relative; }
   .command-bar__ticker { order: 1; }
   .command-health { flex: 1 1 auto; flex-wrap: wrap; row-gap: 4px; border-radius: var(--radius-md); }
-  .command-health__parts { display: none; }
+  .command-health__parts { order: 1; flex: 1 1 100%; white-space: normal; }
+  .command-health:not([data-state='attention']) .command-health__parts,
+  .command-health__part[data-problem='false'] { display: none; }
   .command-health .board-decisions,
   .command-health .board-wakes { white-space: normal; }
 }
@@ -430,6 +468,8 @@ body {
 
 @container kpis (min-width: 1000px) {
   .cockpit-kpis__grid { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+  /* No raids block (an older server): five cards fill five columns. */
+  .cockpit-kpis__grid[data-count='5'] { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 }
 
 .cockpit-card {
@@ -786,7 +826,7 @@ body {
 
   /* Chat pane: full height and pinned — the board scrolls, chat does not
      leave the corner of the eye. --chrome-h is the measured command bar
-     + chip rail height (main.ts), 100px until measured. */
+     height (main.ts), 100px until measured. */
   .console__chat {
     min-width: 0;
     position: sticky;
@@ -1861,7 +1901,7 @@ body {
 
 /* Focusable controls inside the bands scroll into view like the sections
    themselves: a programmatic/restored focus must clear the measured sticky
-   chrome (command bar + chip rail), the shortcut strip AND the sticky band
+   chrome (the command bar), the shortcut strip AND the sticky band
    head that pins under them — otherwise the browser aligns the target flush
    to the viewport top, underneath the header (tablet 768-wide focus
    evidence: button rect y0 with html scroll-padding auto). The same
@@ -1964,6 +2004,10 @@ body {
 .board-folded__pill[data-section='pipeline'] { --pill-accent: var(--rev); }
 .board-folded__pill[data-section='for-gru'] { --pill-accent: var(--band-needs-you); }
 .board-folded__pill[data-section='settled'] { --pill-accent: var(--done); }
+
+.board-folded__pill[data-unknown='true'] {
+  border-style: dashed;
+}
 
 .board-folded__pill:focus-visible {
   outline: 3px solid var(--work);
@@ -2075,7 +2119,8 @@ body {
 }
 
 /* The attention card (cockpit rework): what needs you, then one line about
-   Gru's own queue. Empty, the card is one calm line. */
+   Gru's own queue, both under the heading. Empty, the card is one calm
+   line. */
 /* The head wraps between its parts, never inside a pill. */
 #board-owner .board-band__head {
   flex-wrap: wrap;
@@ -2085,6 +2130,14 @@ body {
 #board-owner .board-band__label,
 #board-owner .board-band__count {
   white-space: nowrap;
+}
+
+.board-owner__summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 12px;
+  padding: 2px 0 6px;
 }
 
 .board-owner__headline {
@@ -2099,6 +2152,17 @@ body {
   text-transform: none;
   font-weight: 700;
   color: var(--muted);
+}
+
+/* Live alerts waiting for Gru: the ▲ beside the colour (never colour
+   alone). */
+.board-owner__gru--alert {
+  color: var(--band-needs-you-ink);
+}
+
+.board-owner__gru--alert::before {
+  content: '▲ ';
+  font-size: 0.8em;
 }
 
 #board-owner[data-empty='true'] {
@@ -3345,13 +3409,14 @@ a.repo-row__name:hover {
 
 /* position: fixed (not absolute): a document-absolute panel slid under the
    sticky command bar as soon as the board scrolled (#28). Its top is
-   derived from the MEASURED chrome height (--chrome-h), so a nav that
+   derived from the MEASURED bar height (--command-bar-h, the bar's full
+   height even on a phone, where the bar scrolls away), so a bar that
    wraps to 2 or 3 rows still clears at every width. */
 .notification-panel {
   position: fixed;
   right: 16px;
-  top: calc(var(--chrome-h, 100px) + 8px);
-  max-height: calc(100vh - var(--chrome-h, 100px) - 16px);
+  top: calc(var(--command-bar-h, 100px) + 8px);
+  max-height: calc(100vh - var(--command-bar-h, 100px) - 16px);
   overflow-y: auto;
   width: min(420px, calc(100vw - 32px));
   z-index: 40;
@@ -3808,7 +3873,7 @@ a.repo-row__name:hover {
 
 .toast-stack {
   position: fixed;
-  top: calc(var(--chrome-h, 100px) + 8px);
+  top: calc(var(--command-bar-h, 100px) + 8px);
   right: 14px;
   z-index: 60;
   display: flex;

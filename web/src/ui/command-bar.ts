@@ -5,8 +5,10 @@
  * itself lives in index.html; this controller writes the two pills in
  * place — never rebuilding them, so the connection dot inside RADAR keeps
  * the state `renderConnectionDot` gave it — and survives every snapshot
- * push. There is no lens toggle: chat is always docked on desktop and the
- * FAB owns mobile chat.
+ * push. RADAR is the board socket's: its dot and its word follow the
+ * board client only (the chat socket's state is the chat pane's ONLINE
+ * badge). There is no lens toggle: chat is always docked on desktop and
+ * the FAB owns mobile chat.
  */
 
 import type { BoardConnectionState } from '../lib/board-client.js';
@@ -18,6 +20,7 @@ export class CommandBar {
   private readonly radar: HTMLElement;
   private readonly radarLabel: HTMLElement;
   private readonly round: HTMLElement;
+  private readonly roundLabel: HTMLElement;
   private boardState: BoardConnectionState | null = null;
   private snapshot: BoardSnapshot | null = null;
 
@@ -25,6 +28,7 @@ export class CommandBar {
     this.radar = mustGet('command-radar');
     this.radarLabel = mustGet('command-radar-label');
     this.round = mustGet('command-round');
+    this.roundLabel = mustGet('command-round-label');
     this.render();
   }
 
@@ -41,11 +45,18 @@ export class CommandBar {
 
   private render(): void {
     const [radar, round] = tickerSegments({ boardState: this.boardState, snapshot: this.snapshot });
-    if (radar === undefined || round === undefined) throw new Error('command bar: the ticker must yield the RADAR and ROUND pills');
     this.radar.className = `command-pill command-pill--${radar.tone}`;
     this.radarLabel.textContent = radar.label;
     this.round.className = `command-pill command-pill--round-${round.tone}`;
-    this.round.textContent = round.label;
+    if (round.round === null) {
+      this.roundLabel.textContent = round.label;
+    } else {
+      // The number rides a two-digit slot: round 10 never moves the pill.
+      const num = document.createElement('span');
+      num.className = 'command-pill__num';
+      num.textContent = String(round.round.seq);
+      this.roundLabel.replaceChildren('ROUND ', num, ` ${round.round.word}`);
+    }
   }
 }
 

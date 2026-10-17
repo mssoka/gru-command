@@ -69,7 +69,7 @@ describe('command-bar pills (cockpit rework)', () => {
     });
     expect(segments.map((segment) => segment.key)).toEqual(['radar', 'round']);
     expect(segments[0]).toEqual({ key: 'radar', label: 'RADAR LIVE', tone: 'ok' });
-    expect(segments[1]).toEqual({ key: 'round', label: 'ROUND 4 LIVE', tone: 'live' });
+    expect(segments[1]).toEqual({ key: 'round', label: 'ROUND 4 LIVE', tone: 'live', round: { seq: 4, word: 'LIVE' } });
     expect(segments.some((segment) => segment.label.includes('MODE'))).toBe(false);
   });
 
@@ -87,12 +87,12 @@ describe('command-bar pills (cockpit rework)', () => {
   it('labels a quiet board and an unpaired radar honestly', () => {
     const segments = tickerSegments({ boardState: null, snapshot: null });
     expect(segments[0]).toEqual({ key: 'radar', label: 'RADAR IDLE', tone: 'plain' });
-    expect(segments[1]).toEqual({ key: 'round', label: 'NO ROUND', tone: 'none' });
+    expect(segments[1]).toEqual({ key: 'round', label: 'NO ROUND', tone: 'none', round: null });
   });
 
   it('a pending round gets its own tone', () => {
     const [, pill] = tickerSegments({ boardState: 'open', snapshot: snapshot([job('a', [round(7, 'pending')])]) });
-    expect(pill).toEqual({ key: 'round', label: 'ROUND 7 PENDING', tone: 'pending' });
+    expect(pill).toEqual({ key: 'round', label: 'ROUND 7 PENDING', tone: 'pending', round: { seq: 7, word: 'PENDING' } });
   });
 });
 

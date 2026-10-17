@@ -103,13 +103,14 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   chips), the owner-chime speaker, the notification bell, theme and
   settings — no lens toggle: chat is always docked on desktop and the FAB
   owns mobile chat. The board column opens with six **KPI cards**:
-  HEISTS (with a stage bar toward done), MEGAMINIONS, CREW (sub-minions
-  folded in when reported), PRS, REVIEWS and VECTOR RAIDS (from the
-  snapshot's `vector` block; dashed `off` until raids are enabled, absent
-  from an older server). Every number is a `data-kpi` span tied to the same
-  derivations the v4 strip used; a headline number stands alone and grows
-  freely, fact counts reserve two digits (`tabular-nums` + a floor), so
-  0–99 never reflows a label. At ≥1100px it is three panes — chat (~30%, collapsible,
+  HEISTS (with a stage bar toward done), MEGAMINIONS (every job a minion
+  commissioned), CREW (sub-minions, active and queued, folded in when
+  reported), PRS, REVIEWS and VECTOR RAIDS (from the snapshot's `vector`
+  block; dashed `off` until raids are enabled, absent from an older
+  server). Every count is a `data-kpi` span tied to the same derivations
+  the v4 strip used; a headline number stands alone and grows freely, fact
+  counts reserve a two-digit slot (`tabular-nums` + a floor), so crossing
+  9→10 never reflows a label. At ≥1100px it is three panes — chat (~30%, collapsible,
   resizable) | board | crew rail — with 4px drag splitters (sizes persist
   per breakpoint; double-click resets). At 900–1099px the board + rail
   hold the page and chat overlays via the Gru FAB (right drawer, dimmed
@@ -160,8 +161,10 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   (an empty FOR GRU reads “nothing needs Gru · the crew is on it”). A
   last-known FOR GRU keeps its full card, so its warning stays visible.
   FOR YOU belongs only to the owner band, which reads as the attention
-  card: what needs you, then one line about Gru's own queue (`Gru is
-  handling 2 more in FOR GRU`, or `nothing needs Gru either`). SETTLED is a rolling
+  card: what needs you, then one line about Gru's own queue (`2 live
+  alerts wait for Gru`, or `nothing needs Gru either`; `last-known ·` while
+  the board is unavailable). A section the server does not send folds as
+  a dashed `—` pill (unknown, never a zero). SETTLED is a rolling
   window (latest 10 + `+K older settled`, session-expanded; concluded
   jobs render their last round quiescent — no stale blocker pills). Click
   a row to disclose lane + rounds (v3 collapse, persisted per job).

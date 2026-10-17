@@ -411,7 +411,7 @@ interface Geometry {
 }
 
 /** Measure the boxes a reserved slot must hold still: every fact label in
- * the KPI cards, every card's label, and the wake chip's parts (an aside is
+ * the KPI cards, every card's label, and the wake chip and its parts (an aside is
  * text — `round 9 live` — and changes with its value, so it is not one).
  * Targeted elements are REQUIRED (an absent one throws) and every box must
  * be positive. Headline numbers and their units are deliberately left out:
@@ -444,6 +444,9 @@ async function geometry(page: Page, opts: { expectAgeSplit?: boolean } = {}): Pr
           factLabels: all(kpis, '.cockpit-fact__label'),
           cardLabels: all(kpis, '.cockpit-card__label'),
           wakeCount: positive(wakes.querySelector('.board-wakes__count') ?? (() => { throw new Error('missing wake count'); })(), 'wake count'),
+          // The whole chip: its count, deferred and age slots sit inside, so
+          // a slot that grows moves the chip's edge.
+          wakeChip: positive(wakes, '#board-wakes'),
           age,
           decisions: positive(document.getElementById('board-decisions')!, '#board-decisions'),
         }),
@@ -453,9 +456,19 @@ async function geometry(page: Page, opts: { expectAgeSplit?: boolean } = {}): Pr
   );
 }
 
+/** Every box equal within 0.1px: a reflow moves a label by a glyph (~6px);
+ * layout's 1/64px rounding is not a move. */
 function compareLabels(before: Geometry, after: Geometry): void {
   expect(after.bodyOverflow, 'no horizontal body overflow').toBe(false);
-  expect(after.labelsJson, 'no label beside a reserved slot moved').toBe(before.labelsJson);
+  const near = (a: unknown, b: unknown): boolean =>
+    typeof a === 'number' && typeof b === 'number'
+      ? Math.abs(a - b) <= 0.1
+      : Array.isArray(a) && Array.isArray(b)
+        ? a.length === b.length && a.every((value, index) => near(value, b[index]))
+        : typeof a === 'object' && a !== null && typeof b === 'object' && b !== null
+          ? Object.keys(a).length === Object.keys(b).length && Object.keys(a).every((key) => near((a as Record<string, unknown>)[key], (b as Record<string, unknown>)[key]))
+          : a === b;
+  expect(near(JSON.parse(after.labelsJson), JSON.parse(before.labelsJson)), `no label beside a reserved slot moved:\n${before.labelsJson}\n${after.labelsJson}`).toBe(true);
 }
 
 async function waitForCount(page: Page, kpi: string, value: number, timeout = 5_000): Promise<void> {
@@ -473,7 +486,7 @@ async function expectSlots(page: Page, kpis: readonly string[], value: number): 
 
 /** familyA's fact counts (the headline numbers ride their own line). */
 const FAMILY_A_FACTS: readonly string[] = [
-  'jobs.working', 'jobs.inReview', 'jobs.merged', 'prs.mergedToday', 'lanes.midTurn', 'lanes.disposed',
+  'jobs.working', 'jobs.inReview', 'jobs.merged', 'prs.mergedToday', 'lanes.midTurn', 'lanes.disposed', 'reviews.failedToday',
 ];
 /** familyB's fact counts: derived PR conflict, heist merged/done/parked,
  * crew disposed. */
@@ -487,6 +500,8 @@ const VIEWPORTS: ReadonlyArray<[number, number]> = [
   [768, 1024],
   [360, 740],
 ];
+
+const RAIDS_OFF: Record<string, unknown> = { enabled: false, raidMode: 'proposed', maxRaidsPerDay: 2 };
 
 const RAIDS_ON: Record<string, unknown> = {
   enabled: true,
@@ -508,12 +523,17 @@ for (const [width, height] of VIEWPORTS) {
     await expectSlots(page, FAMILY_A_FACTS, 9);
     await expect(page.locator('#board-kpis [data-kpi="jobs.total"]')).toHaveText('28');
     await expect(page.locator('.board-wakes__count')).toHaveText('9');
+    // The pill's checks carry the same n: deploy behind, verify queued and
+    // cure orphaned all need a look.
+    await expect(page.locator('#command-health-summary')).toHaveText('3 need a look');
+    await expect(page.locator('.command-health__part[data-check="deploy"]')).toContainText('deploy 9 behind');
     const before = await geometry(page);
     expect(before.bodyOverflow).toBe(false);
     await send(makeSnapshot(familyA(10)));
     await expectSlots(page, FAMILY_A_FACTS, 10);
     await expect(page.locator('#board-kpis [data-kpi="jobs.total"]')).toHaveText('31');
     await expect(page.locator('.board-wakes__count')).toHaveText('10');
+    await expect(page.locator('.command-health__part[data-check="deploy"]')).toContainText('deploy 10 behind');
     compareLabels(before, await geometry(page));
   });
 
@@ -533,13 +553,13 @@ for (const [width, height] of VIEWPORTS) {
 
   test(`counts past the slot grow honestly — visible, wrapped, never clipped at ${width}×${height}`, async ({ page }) => {
     await page.setViewportSize({ width, height });
-    await harness(page, makeSnapshot({ ...familyC(10000), working: 100, wakes: 10000, behind: 10000, unacked: 10000, deferredCount: 10000, vector: RAIDS_ON }));
-    await waitForCount(page, 'jobs.total', 10000);
+    await harness(page, makeSnapshot({ ...familyC(1000), working: 100, wakes: 10000, behind: 10000, unacked: 10000, deferredCount: 10000, vector: RAIDS_ON }));
+    await waitForCount(page, 'jobs.total', 1000);
     await expect(page.locator('#board-kpis [data-kpi="jobs.working"]')).toHaveText('100');
     await expect(page.locator('.board-wakes__count')).toHaveText('10000');
     await expect(page.locator('.board-wakes__deferred')).toHaveText('10000');
     await expect(page.locator('.command-health__part[data-check="deploy"]')).toContainText('10000 behind');
-    await expect(page.locator('.board-owner__gru')).toHaveText('Gru is handling 10000 more in FOR GRU');
+    await expect(page.locator('.board-owner__gru')).toHaveText('10000 live alerts wait for Gru');
     const audit = await page.evaluate(() => {
       const visible = (el: Element | null): boolean => {
         if (el === null) return false;
@@ -559,12 +579,27 @@ for (const [width, height] of VIEWPORTS) {
           return box.left >= card.left - 0.5 && box.right <= card.right + 0.5;
         }),
         slots: ['#board-kpis [data-kpi="jobs.total"]', '#board-kpis [data-kpi="jobs.working"]', '.board-wakes__count', '.board-wakes__deferred'].map((sel) => visible(document.querySelector(sel))),
+        // The health pill stays on screen, and its summary and chips sit
+        // whole inside it (only the checks' text may ellipsize, by design).
+        pill: (() => {
+          const pill = document.getElementById('command-health')!.getBoundingClientRect();
+          const inside = ['#command-health-summary', '#board-decisions', '#board-wakes'].every((sel) => {
+            const box = document.querySelector(sel)!.getBoundingClientRect();
+            return box.width > 0 && box.left >= pill.left - 0.5 && box.right <= pill.right + 0.5 && box.bottom <= pill.bottom + 0.5;
+          });
+          const chipsWhole = ['#command-health-summary', '#board-decisions', '#board-wakes'].every((sel) => {
+            const el = document.querySelector<HTMLElement>(sel)!;
+            return el.scrollWidth - el.clientWidth <= 1;
+          });
+          return { onScreen: pill.left >= -0.5 && pill.right <= document.documentElement.clientWidth + 0.5, inside, chipsWhole };
+        })(),
       };
     });
     expect(audit.body, `no body overflow at ${width}×${height}`).toBe(false);
     expect(audit.maxInner, `no clipped card content at ${width}×${height}`).toBeLessThanOrEqual(1);
     expect(audit.bigsFit, `every headline number fits its card at ${width}×${height}`).toBe(true);
     expect(audit.slots.every(Boolean), `every grown count visible at ${width}×${height}`).toBe(true);
+    expect(audit.pill, `the health pill and its chips whole at ${width}×${height}`).toEqual({ onScreen: true, inside: true, chipsWhole: true });
   });
 }
 
@@ -594,19 +629,25 @@ test('GRU and SILAS wake ages vary independently; the Gru age crosses 9→10 ins
   await expect(gruNum).toHaveText('5'); // Gru genuinely untouched
 });
 
-test('KPI cards: two columns on a phone, three in the cockpit board column, every card on screen', async ({ page }) => {
+test('KPI cards: two columns on a phone, three in the cockpit board column, a row of their own on a wide board', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
-  await harness(page, makeSnapshot({ ...familyA(9), vector: RAIDS_ON }));
+  const send = await harness(page, makeSnapshot({ ...familyA(9), vector: RAIDS_ON }));
   await waitForCount(page, 'prs.open', 9);
   const columns = (): Promise<{ perRow: number; count: number; overflow: boolean }> => page.evaluate(() => {
     const cards = [...document.querySelectorAll<HTMLElement>('#board-kpis .cockpit-card')].map((card) => card.getBoundingClientRect());
     const firstRow = cards.filter((box) => Math.abs(box.y - cards[0]!.y) <= 0.5).length;
     return { perRow: firstRow, count: cards.length, overflow: document.documentElement.scrollWidth > document.documentElement.clientWidth };
   });
-  expect(await columns()).toEqual({ perRow: 3, count: 6, overflow: false });
-  await page.setViewportSize({ width: 360, height: 800 });
-  await settle(page);
-  expect(await columns()).toEqual({ perRow: 2, count: 6, overflow: false });
+  for (const [width, perRow] of [[1440, 3], [1200, 2], [768, 3], [360, 2], [2400, 6]] as const) {
+    await page.setViewportSize({ width, height: 900 });
+    await settleTransitions(page);
+    expect(await columns(), `${width}px`).toEqual({ perRow, count: 6, overflow: false });
+  }
+  // No raids block (an older server): five cards fill five columns — never
+  // six with a hole at the end.
+  await send(makeSnapshot(familyA(9)));
+  await expect(page.locator('#board-kpis .cockpit-card')).toHaveCount(5);
+  expect(await columns()).toEqual({ perRow: 5, count: 5, overflow: false });
 });
 
 test('essential text and numbers hold >=4.5:1 contrast in both themes', async ({ page }) => {
@@ -615,7 +656,7 @@ test('essential text and numbers hold >=4.5:1 contrast in both themes', async ({
   // loud): conflicting > 0 for the alert ink, a zero fact for the faint ink,
   // deferred > 0 for the wakes deferred slot, a raids block for its card,
   // and no pipeline block so PIPELINE folds into the Empty row.
-  await harness(page, makeSnapshot(slotSpec({ ...familyA(4), conflicting: 3, done: 0, deferredCount: 12, pending: 9, vector: RAIDS_ON })));
+  const send = await harness(page, makeSnapshot(slotSpec({ ...familyA(4), conflicting: 3, done: 0, deferredCount: 12, pending: 9, vector: RAIDS_ON })));
   await waitForCount(page, 'prs.conflicting', 3);
   const measure = (): Promise<Record<string, number>> =>
     page.evaluate(() => {
@@ -627,6 +668,17 @@ test('essential text and numbers hold >=4.5:1 contrast in both themes', async ({
         });
         return 0.2126 * r! + 0.7152 * g! + 0.0722 * b!;
       };
+      // The page background in the CURRENT theme, for an element whose
+      // ancestors are all transparent (resolved through a probe so the
+      // token's value, not a hard-coded light colour, is measured).
+      const pageBg = (): string => {
+        const probe = document.createElement('div');
+        probe.style.background = 'var(--bg)';
+        document.body.append(probe);
+        const color = getComputedStyle(probe).backgroundColor;
+        probe.remove();
+        return color;
+      };
       const bgOf = (el: Element): string => {
         let n: Element | null = el;
         while (n) {
@@ -634,7 +686,7 @@ test('essential text and numbers hold >=4.5:1 contrast in both themes', async ({
           if (c && c !== 'transparent' && !/rgba\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*0\s*\)/.test(c)) return c;
           n = n.parentElement;
         }
-        return 'rgb(250, 246, 239)';
+        return pageBg();
       };
       const ratioOf = (selector: string): number => {
         const el = document.querySelector<HTMLElement>(selector);
@@ -648,6 +700,7 @@ test('essential text and numbers hold >=4.5:1 contrast in both themes', async ({
         round: '#command-round',
         healthSummary: '#command-health-summary',
         healthProblem: '.command-health__part--alert',
+        healthWarn: '.command-health__part--warn',
         healthCalm: '.command-health__part--muted, .command-health__part--ok',
         healthFlag: '.command-health__flag',
         wakeCount: '.board-wakes__count',
@@ -667,9 +720,17 @@ test('essential text and numbers hold >=4.5:1 contrast in both themes', async ({
         bandCount: '.board-band__count',
         foldedLabel: '.board-folded__label',
         foldedCount: '.board-folded__count',
+        offLabel: '.cockpit-card--off .cockpit-card__label',
+        offBig: '.cockpit-card--off .cockpit-card__big',
+        offUnit: '.cockpit-card--off .cockpit-card__unit',
+        offNote: '.cockpit-card--off .cockpit-fact--note',
       };
       return Object.fromEntries(Object.entries(targets).map(([k, s]) => [k, Math.round(ratioOf(s) * 100) / 100]));
     });
+  // The raids card is on in the first frame and off in the second, so both
+  // faces are measured in each theme (an absent target reads -1 and fails).
+  const fixture = (vector: Record<string, unknown>): BoardSnapshot =>
+    makeSnapshot(slotSpec({ ...familyA(4), conflicting: 3, done: 0, deferredCount: 12, pending: 9, vector }));
   for (const theme of ['light', 'dark']) {
     if (theme === 'dark') {
       await page.locator('#theme-toggle').click();
@@ -678,7 +739,13 @@ test('essential text and numbers hold >=4.5:1 contrast in both themes', async ({
       // surface backgrounds transition on different elements (#402).
       await settleTransitions(page);
     }
-    const ratios = await measure();
+    await send(fixture(RAIDS_ON));
+    await expect(page.locator('.cockpit-card--raids')).not.toHaveClass(/cockpit-card--off/u);
+    const on = await measure();
+    await send(fixture(RAIDS_OFF));
+    await expect(page.locator('.cockpit-card--raids')).toHaveClass(/cockpit-card--off/u);
+    const off = await measure();
+    const ratios = { ...on, offLabel: off.offLabel!, offBig: off.offBig!, offUnit: off.offUnit!, offNote: off.offNote! };
     for (const [name, ratio] of Object.entries(ratios)) {
       expect(ratio, `${name} contrast (${theme})`).toBeGreaterThanOrEqual(4.5);
     }
@@ -694,15 +761,30 @@ test('CREW folds in sub-minions only when the server reported counters (absent i
   await send(makeSnapshot(slotSpec({ children: { active: 0, queued: 0, finished: 0, lifetimeCreations: 0 } })));
   await expect(crew.locator('[data-kpi="children.active"]')).toHaveText('0');
   await expect(crew.locator('[data-kpi="children.active"] + .cockpit-fact__label')).toHaveText('sub-minions');
-  // Present non-zero counts render truthfully; the queue rides a note and
-  // the lifetime count the title.
+  // Present non-zero counts render truthfully; the queue is a count of its
+  // own and the lifetime count rides the title.
   await send(makeSnapshot(slotSpec({ gruWakeAgeMs: 300_000, children: { active: 2, queued: 3, finished: 5, lifetimeCreations: 10 } })));
   await expect(crew.locator('[data-kpi="children.active"]')).toHaveText('2');
-  await expect(crew.locator('.cockpit-fact--note')).toHaveText('+3 queued');
+  await expect(crew.locator('[data-kpi="children.queued"]')).toHaveText('3');
+  await expect(crew.locator('[data-kpi="children.queued"] + .cockpit-fact__label')).toHaveText('queued');
   await expect(crew.locator('[data-kpi="children.active"]')).toHaveAttribute('title', /10 created/u);
-  // The extra fact wraps honestly: no body overflow at phone width.
+  // The extra facts wrap honestly: no body overflow and nothing clipped at
+  // phone width, measured after the resize settles.
   await page.setViewportSize({ width: 360, height: 800 });
-  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  await settleTransitions(page);
+  const fit = await page.evaluate(() => {
+    const card = document.querySelector<HTMLElement>('.cockpit-card--crew')!;
+    const box = card.getBoundingClientRect();
+    return {
+      body: document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+      card: card.scrollWidth - card.clientWidth <= 1,
+      facts: [...card.querySelectorAll('.cockpit-fact')].every((fact) => {
+        const f = fact.getBoundingClientRect();
+        return f.width > 0 && f.left >= box.left - 0.5 && f.right <= box.right + 0.5;
+      }),
+    };
+  });
+  expect(fit).toEqual({ body: true, card: true, facts: true });
 });
 
 test('deferred Gru wakes stay visible beside count and age (issue #219)', async ({ page }) => {
@@ -728,16 +810,84 @@ test('deferred Gru wakes stay visible beside count and age (issue #219)', async 
   compareLabels(deferred9, await geometry(page));
   // Deferred-only (zero fired wakes, no stamp): the honest no-wakes state
   // still shows the deferred demand — never a fabricated "unknown" time.
-  await send(makeSnapshot(slotSpec({ wakes: 0, gruWakeAgeMs: null, deferredCount: 1 })));
+  await send(makeSnapshot(slotSpec({ wakes: 0, gruWakeAgeMs: null, deferredCount: 9 })));
   await expect(wakes).toContainText('no wakes yet');
-  await expect(wakes).toContainText('1 deferred');
+  await expect(wakes).toContainText('9 deferred');
   await expect(wakes).not.toContainText('last wake unknown');
-  await geometry(page, { expectAgeSplit: false });
-  // A count with NO valid stamp is the honest "last wake unknown" state.
-  await send(makeSnapshot(slotSpec({ wakes: 12, gruWakeAgeMs: null, deferredCount: 0 })));
+  const quiet9 = await geometry(page, { expectAgeSplit: false });
+  await send(makeSnapshot(slotSpec({ wakes: 0, gruWakeAgeMs: null, deferredCount: 10 })));
+  await expect(wakes.locator('.board-wakes__deferred')).toHaveText('10');
+  compareLabels(quiet9, await geometry(page, { expectAgeSplit: false }));
+  // A count with NO valid stamp is the honest "last wake unknown" state,
+  // and its count crosses 9→10 in its slot as well.
+  await send(makeSnapshot(slotSpec({ wakes: 9, gruWakeAgeMs: null, deferredCount: 0 })));
   await expect(wakes).toContainText('last wake unknown');
-  await expect(wakes.locator('.board-wakes__count')).toHaveText('12');
-  await geometry(page, { expectAgeSplit: false });
+  await expect(wakes.locator('.board-wakes__count')).toHaveText('9');
+  const unknown9 = await geometry(page, { expectAgeSplit: false });
+  await send(makeSnapshot(slotSpec({ wakes: 10, gruWakeAgeMs: null, deferredCount: 0 })));
+  await expect(wakes.locator('.board-wakes__count')).toHaveText('10');
+  compareLabels(unknown9, await geometry(page, { expectAgeSplit: false }));
+});
+
+test('the health pill is a named group; on a phone it keeps the checks that need a look and folds the calm ones', async ({ page }) => {
+  await page.setViewportSize({ width: 360, height: 740 });
+  const send = await harness(page, makeSnapshot(familyA(2)));
+  const pill = page.locator('#command-health');
+  await expect(pill).toHaveAttribute('role', 'group');
+  await expect(pill).toHaveAttribute('aria-label', 'System health');
+  await expect(page.locator('#command-health-summary')).toHaveText('3 need a look');
+  // The problems stay readable on the phone; the calm Silas check folds.
+  for (const check of ['deploy', 'verify', 'cure']) {
+    await expect(page.locator(`.command-health__part[data-check="${check}"]`)).toBeVisible();
+  }
+  await expect(page.locator('.command-health__part[data-check="silas"]')).toBeHidden();
+  // Nothing needs a look: the summary alone carries the state on a phone.
+  await send(makeSnapshot(slotSpec({ gruWakeAgeMs: 300_000 })));
+  await expect(page.locator('#command-health-summary')).toHaveText('All healthy');
+  await expect(page.locator('#command-health-parts')).toBeHidden();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test('on a phone the command bar and the KPI cards scroll away; the shortcut strip keeps the top', async ({ page }) => {
+  await page.setViewportSize({ width: 360, height: 740 });
+  await harness(page, makeSnapshot({ ...familyA(4), pending: 30, vector: RAIDS_ON }));
+  const read = () => page.evaluate(() => {
+    const box = (id: string) => document.getElementById(id)!.getBoundingClientRect();
+    return {
+      bar: getComputedStyle(document.getElementById('command-bar')!).position,
+      kpis: getComputedStyle(document.getElementById('board-kpis')!).position,
+      barBottom: box('command-bar').bottom,
+      kpisTop: box('board-kpis').top,
+      navTop: box('board-nav').top,
+      barHeight: document.getElementById('command-bar')!.offsetHeight,
+      chromeH: getComputedStyle(document.documentElement).getPropertyValue('--chrome-h').trim(),
+    };
+  });
+  const top = await read();
+  // The bar is three rows tall here; sticky, it would hold a quarter of the
+  // screen. It is not sticky, so the sticky offsets do not count it.
+  expect(top.barBottom).toBeGreaterThan(150);
+  expect([top.bar, top.kpis, top.chromeH]).toEqual(['relative', 'static', '0px']);
+  // Far enough that the strip, under the bar and the cards, reaches the top.
+  await page.evaluate(() => window.scrollBy(0, 1400));
+  const scrolled = await read();
+  expect(scrolled.barBottom, 'the bar scrolled away').toBeLessThanOrEqual(0);
+  expect(scrolled.kpisTop, 'the cards scrolled away').toBeLessThan(top.kpisTop - 500);
+  expect(scrolled.navTop, 'the shortcut strip holds the top').toBeCloseTo(0, 0);
+  // The notification panel still clears the bar's full height at the top.
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await page.locator('#notification-bell').click();
+  const panelTop = await page.evaluate(() => document.getElementById('notification-panel')!.getBoundingClientRect().top);
+  expect(panelTop).toBeGreaterThanOrEqual(top.barBottom);
+  // A tablet keeps the sticky bar (the offsets count it again).
+  await page.locator('#notification-bell').click();
+  await page.setViewportSize({ width: 768, height: 1024 });
+  await settleTransitions(page);
+  // The re-measure runs on the resize's frame, so poll for it.
+  await expect.poll(async () => {
+    const tablet = await read();
+    return [tablet.bar, tablet.chromeH === `${tablet.barHeight}px`];
+  }).toEqual(['sticky', true]);
 });
 
 /** Visual evidence: real captures of the synthetic fixture at all four
@@ -748,49 +898,17 @@ test('visual captures for inspection — 1440/1200/768/360 in both themes', asyn
   await waitForCount(page, 'prs.open', 9);
   for (const [width, height] of VIEWPORTS) {
     await page.setViewportSize({ width, height });
-    await settle(page); // a resize re-renders; never capture a blend
+    await settleTransitions(page); // a resize re-renders; never capture a blend
     await page.screenshot({ path: `e2e-artifacts/cockpit-${width}-light.png`, fullPage: false });
   }
   await page.locator('#theme-toggle').click();
   await expect(page.locator('html')).toHaveClass(/dark/);
   for (const [width, height] of VIEWPORTS) {
     await page.setViewportSize({ width, height });
-    await settle(page); // the theme flip transitions body color/background
+    await settleTransitions(page); // the theme flip transitions body color/background
     await page.screenshot({ path: `e2e-artifacts/cockpit-${width}-dark.png`, fullPage: false });
   }
 });
-
-/**
- * Await real rendering settlement: every running CSS animation/transition on
- * the page finishes, then two frames pass, and no animation is running. A
- * fixed sleep proves nothing; this waits on the actual animation objects the
- * engine reports (the same discipline the contrast test uses).
- */
-async function settle(page: Page): Promise<void> {
-  await page.evaluate(async () => {
-    for (let pass = 0; pass < 60; pass += 1) {
-      // Only FINITE transitions (the same discipline the contrast test uses):
-      // the page also runs infinite keyframe animations (conn-pulse,
-      // caret-blink) whose `finished` never resolves.
-      const running = document
-        .getAnimations()
-        .filter((a): a is CSSTransition => a instanceof CSSTransition && a.playState === 'running');
-      if (running.length === 0) break;
-      await Promise.all(running.map((a) => a.finished.catch(() => undefined)));
-    }
-  });
-  await page.evaluate(() => new Promise<void>((resolve) => {
-    let frames = 0;
-    const tick = (): void => {
-      frames += 1;
-      if (frames >= 2) resolve();
-      else requestAnimationFrame(tick);
-    };
-    requestAnimationFrame(tick);
-    // rAF is faked under page.clock; a timer fallback keeps this bounded.
-    setTimeout(tick, 50);
-  }));
-}
 
 /** A1: the reserved numeric utility is scoped to the cockpit surfaces and
  * the For-you band. An unrelated surface must keep the app default — on an
@@ -806,7 +924,8 @@ test('A1: the reserved numeric slot is scoped — an unrelated surface keeps the
     };
     const factNum = document.querySelector('#board-kpis .cockpit-fact__num');
     const wakeNum = document.querySelector('#command-health .board-wakes__count');
-    if (!factNum || !wakeNum) throw new Error('missing cockpit numeric slot');
+    const ownerNum = document.querySelector('#board-owner .board-band__count-num');
+    if (!factNum || !wakeNum || !ownerNum) throw new Error('missing cockpit or owner numeric slot');
     // The probe goes on the app frame (body, a plain block container) — an
     // unrelated surface that is neither the cockpit nor the owner band.
     const probe = document.createElement('span');
@@ -815,11 +934,11 @@ test('A1: the reserved numeric slot is scoped — an unrelated surface keeps the
     document.body.append(probe);
     const probeStyle = read(probe);
     probe.remove();
-    return { fact: read(factNum), wake: read(wakeNum), probe: probeStyle };
+    return { fact: read(factNum), wake: read(wakeNum), owner: read(ownerNum), probe: probeStyle };
   });
   // The approved surfaces DO reserve the numeric slot (a flex item computes
   // its display as block; the reserved floor is the contract).
-  for (const slot of [styles.fact, styles.wake]) {
+  for (const slot of [styles.fact, styles.wake, styles.owner]) {
     expect(['inline-block', 'block']).toContain(slot.display);
     expect(parseFloat(slot.minWidth)).toBeGreaterThan(0);
   }
@@ -827,85 +946,4 @@ test('A1: the reserved numeric slot is scoped — an unrelated surface keeps the
   // min-width (Chromium resolves the unset value to 0px).
   expect(styles.probe.display).toBe('inline');
   expect(parseFloat(styles.probe.minWidth) || 0).toBe(0);
-});
-
-test('settleTransitions finishes running transitions and names every culprit it cannot finish (#402)', async ({ page }) => {
-  // No frame passes between the class change and the settle: the helper's
-  // getAnimations() style flush must find the just-started transitions.
-  const start = async () => {
-    await page.setContent([
-      '<style>.box{width:20px;height:20px;color:rgb(0,0,0);transition:color 30s linear}.box.on{color:rgb(255,0,0)}</style>',
-      '<div id="settles" class="box"></div><div id="stalled" class="box"></div>',
-    ].join(''));
-    await page.evaluate(() => {
-      for (const id of ['settles', 'stalled']) {
-        const box = document.getElementById(id)!;
-        void getComputedStyle(box).color; // commit the start style
-        box.classList.add('on');
-      }
-    });
-  };
-  const live = () => page.evaluate(() => document.getAnimations().filter((a) => a instanceof CSSTransition && a.playState !== 'finished' && a.playState !== 'idle').length);
-  const colorOf = (id: string) => page.evaluate((target) => getComputedStyle(document.getElementById(target)!).color, id);
-  // Overrides finish() on ONE element's transition (an own property, so the
-  // shared prototype is never touched): 'stall' makes it throw (a zero
-  // playback rate — Web Animations specifies InvalidStateError), 'restart'
-  // makes it a no-op so the transition never settles.
-  const sabotage = (id: string, how: 'stall' | 'restart') => page.evaluate(([target, mode]) => {
-    const element = document.getElementById(target);
-    const transition = document.getAnimations().find((a) => a instanceof CSSTransition && a.effect instanceof KeyframeEffect && a.effect.target === element);
-    if (transition === undefined) throw new Error(`fixture: no running transition on #${target}`);
-    if (mode === 'stall') transition.playbackRate = 0;
-    else Object.defineProperty(transition, 'finish', { value: () => {}, configurable: true });
-  }, [id, how] as const);
-  // The helper's own message: Playwright prefixes `page.evaluate: Error: `
-  // and appends the in-page stack.
-  const failureOf = () => settleTransitions(page, 3).then(() => null, (error: unknown) =>
-    (error instanceof Error ? error.message : String(error)).split('\n')[0]!.replace(/^page\.evaluate: Error: /u, ''));
-
-  // Settled straight after the class change — nothing else touched the
-  // animations first — every transition reaches its END state.
-  await start();
-  await settleTransitions(page);
-  expect([await colorOf('settles'), await colorOf('stalled'), await live()]).toEqual(['rgb(255, 0, 0)', 'rgb(255, 0, 0)', 0]);
-
-  await start();
-  await sabotage('stalled', 'stall');
-  const stalled = await failureOf();
-  expect(stalled).toMatch(/^a CSS transition could not be finished \(div#stalled\.box\.on color: InvalidStateError: [^;]+\)$/u);
-  expect(stalled, 'the transition that settled is no culprit').not.toContain('#settles');
-  expect(await colorOf('settles'), 'the OTHER transition still settles').toBe('rgb(255, 0, 0)');
-  // Once nothing is stalled, every transition settles to its END state.
-  await page.evaluate(() => { for (const a of document.getAnimations()) a.playbackRate = 1; });
-  await settleTransitions(page);
-  expect(await colorOf('stalled')).toBe('rgb(255, 0, 0)');
-  expect(await live()).toBe(0);
-
-  // Transitions that never settle within the bounded passes fail loud,
-  // each named exactly once.
-  await start();
-  await sabotage('settles', 'restart');
-  await sabotage('stalled', 'restart');
-  const restarting = await failureOf();
-  expect(restarting).toMatch(/^CSS transitions kept restarting after 3 settle passes: div#(settles|stalled)\.box\.on color, div#(settles|stalled)\.box\.on color$/u);
-  for (const id of ['#settles', '#stalled']) expect(restarting!.split(id).length - 1, id).toBe(1);
-
-  // Both failures at once are BOTH reported: neither hides the other.
-  await start();
-  await sabotage('stalled', 'stall');
-  await sabotage('settles', 'restart');
-  expect(await failureOf()).toMatch(
-    /^a CSS transition could not be finished \(div#stalled\.box\.on color: InvalidStateError: [^;]+\); CSS transitions kept restarting after 3 settle passes: div#settles\.box\.on color$/u,
-  );
-
-  // Both ends of the pass bound are accepted (on a fresh page)...
-  await start();
-  await settleTransitions(page, 1);
-  await settleTransitions(page, 1000);
-  expect(await live()).toBe(0);
-  // ...and the bound itself must be an integer from 1 to 1000.
-  for (const passes of [0, -0, -1, 1.5, 1000.5, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 1001, '5' as unknown as number]) {
-    const label = Object.is(passes, -0) ? '-0' : `${typeof passes} ${String(passes)}`;
-    await expect(settleTransitions(page, passes), label).rejects.toThrow(/settleTransitions: passes must be an integer from 1 to 1000/u);
-  }
 });

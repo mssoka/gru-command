@@ -19,12 +19,12 @@
       </span>
     </div>
     <div class="command-bar__ticker" id="command-ticker" role="status" aria-live="polite">
-      <span class="command-pill command-pill--plain" id="command-radar" data-segment="radar"><span class="conn-dot" id="conn-dot" title="socket: idle"></span><span class="command-pill__label" id="command-radar-label">RADAR IDLE</span></span>
-      <span class="command-pill command-pill--round-none" id="command-round" data-segment="round">NO ROUND</span>
+      <span class="command-pill command-pill--plain" id="command-radar" data-segment="radar"><span class="conn-dot" id="conn-dot" title="socket: idle" role="img" aria-label="socket: idle"></span><span class="command-pill__label" id="command-radar-label">RADAR IDLE</span></span>
+      <span class="command-pill command-pill--round-none" id="command-round" data-segment="round"><span class="command-pill__label" id="command-round-label">NO ROUND</span></span>
     </div>
     <!-- The health pill: rendered by BoardView once the first snapshot
          lands (hidden until then). The Jev and wake chips ride inside it. -->
-    <div class="command-health" id="command-health" hidden>
+    <div class="command-health" id="command-health" role="group" aria-label="System health" hidden>
       <span class="command-health__dot" aria-hidden="true"></span>
       <span class="command-health__summary" id="command-health-summary"></span>
       <span class="command-health__parts" id="command-health-parts"></span>
@@ -152,7 +152,7 @@
           <!-- KPI cards (cockpit rework 2026-10-17): heists, megaminions, crew,
                PRs, reviews and Vector raids. Rendered by BoardView once the
                first snapshot lands. -->
-          <section id="board-kpis" class="cockpit-kpis" aria-label="Board counts" hidden></section>
+          <div id="board-kpis" class="cockpit-kpis" hidden></div>
           <!-- Sticky section shortcut strip (owner approval j-1064): labelled
                uncapped counts that jump to each of the six sections. Rendered
                by BoardView.renderNav once the first snapshot lands. -->

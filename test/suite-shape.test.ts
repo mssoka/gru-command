@@ -424,10 +424,20 @@ describe('suite shape', () => {
 
   it('the cockpit scopes replace the retired slim-strip ones', () => {
     // The slim strip and its fail-before instrument were retired by the
-    // cockpit rework: no scope may still run them, and the cockpit's own
-    // unit and browser scopes exist.
-    const worktree = readFileSync(join(import.meta.dirname, '..', '.gru-command', 'worktree.toml'), 'utf-8');
-    expect(worktree).not.toMatch(/slim-strip\.baseline\.test\.ts|dashboard-strip\.spec\.ts|board-rail\.test\.ts|--project=strip\b/u);
+    // cockpit rework: no scope, script, Playwright project or workflow may
+    // still run them, and the cockpit's own unit and browser scopes exist.
+    const root = join(import.meta.dirname, '..');
+    const workflows = join(root, '.github', 'workflows');
+    const runners = [
+      join(root, '.gru-command', 'worktree.toml'),
+      join(root, 'package.json'),
+      join(root, 'web', 'package.json'),
+      join(root, 'web', 'playwright.config.ts'),
+      ...readdirSync(workflows).map((name) => join(workflows, name)),
+    ];
+    const retired = /slim-strip\.baseline\.test\.ts|dashboard-strip\.spec\.ts|board-rail\.test\.ts|--project=strip(?![\w-])|name: 'strip'|^strip-[\w-]+ =/mu;
+    for (const file of runners) expect(readFileSync(file, 'utf-8'), file).not.toMatch(retired);
+    const worktree = readFileSync(runners[0]!, 'utf-8');
     expect(worktree).toMatch(/^cockpit-unit = .*src\/lib\/cockpit\.test\.ts/mu);
     expect(worktree).toMatch(/^cockpit-browser = .*--project=cockpit e2e\/cockpit\.spec\.ts/mu);
   });

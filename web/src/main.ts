@@ -135,16 +135,22 @@ renderChatOnline('idle');
 
 /** Feed the sticky offsets their real height: the command bar is the only
  * sticky chrome (CSS carries a 100px fallback for the pre-measure first
- * paint). The health pill can wrap the bar onto a second line, so a
- * snapshot re-measures too. */
+ * paint). The bar wraps by fit — a health pill disclosed or grown, a chip
+ * wrapping, page zoom — so the bar's own size drives the re-measure, not
+ * only window resizes. */
 function measureChrome(): void {
-  const barHeight = document.getElementById('command-bar')?.offsetHeight ?? 0;
+  const bar = mustGet('command-bar');
+  const barHeight = bar.offsetHeight;
   if (barHeight > 0) {
-    document.documentElement.style.setProperty('--chrome-h', `${barHeight}px`);
+    // Overlays clear the bar wherever it is (--command-bar-h); the sticky
+    // offsets count it only while it sticks — on a phone it scrolls away.
+    const sticks = getComputedStyle(bar).position === 'sticky';
+    document.documentElement.style.setProperty('--chrome-h', `${sticks ? barHeight : 0}px`);
     document.documentElement.style.setProperty('--command-bar-h', `${barHeight}px`);
   }
 }
 measureChrome();
+if (typeof ResizeObserver !== 'undefined') new ResizeObserver(measureChrome).observe(mustGet('command-bar'));
 
 const splitterController = new SplitterController({
   root: mustGet('console'),
@@ -205,7 +211,8 @@ function showPairing(): void {
 }
 
 function onConnection(state: ConnectionState): void {
-  renderConnectionDot(state);
+  // The chat socket's state is the chat pane's badge; RADAR's dot belongs
+  // to the board socket (its word reads the board state beside it).
   renderChatOnline(state);
   // `open` is emitted at auth_ok, just before the required fresh context
   // snapshot. Keep stale controls disabled until that snapshot arrives.
@@ -366,9 +373,6 @@ function startBoard(token: string): void {
         boardView?.render(snapshot, source);
         chatView?.setManagedRepositoryNames(snapshot.repoOverview?.rows.map(({ key }) => key) ?? []);
         commandBar.setSnapshot(snapshot);
-        // The first snapshot discloses the health pill — the bar may have
-        // grown, so the sticky offsets re-measure.
-        measureChrome();
         decisionStatusCard.render(snapshot.decisions);
         // State joins the signature: a live agent turning disposed must
         // re-list transcripts so the collapsed rows move behind the toggle.

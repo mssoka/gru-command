@@ -4,10 +4,11 @@
  * per job, sticky attention-band separators, inline disclosure.
  *
  * The surface stack:
- *   - the status chip rail (v4 health row relocated; `board-rail.ts`)
- *     under the command bar carries whole-system state incl. the labeled
- *     heist/PR/minion counts, the live machine (ALERTS) count and the
- *     Jev/wake trackers;
+ *   - the cockpit (rework 2026-10-17): the command bar's health pill
+ *     (system checks, Jev and wake trackers) and the KPI cards at the top
+ *     of the board column (`lib/cockpit.ts`);
+ *   - FOR YOU, the attention card, with the live machine (NEEDS GRU)
+ *     count on its Gru line;
  *   - attention-bucketed job rows (NEEDS GRU / IN FLIGHT / SETTLED /
  *     COLD) with sticky headers and counts;
  *   - the crew rail (CREW/TRANSCRIPTS tabs, dense rows, disposed overflow);
@@ -646,24 +647,29 @@ export class BoardView {
     const head = el('h2', 'board-band__head');
     head.id = 'board-owner-head';
     // The pending number rides its own reserved tabular slot (9→10 moves
-    // no label), the same contract as the strip's counts.
+    // no label), the same contract as the cockpit's counts.
     const count = el('span', 'board-band__count lbl');
     count.append(el('span', 'num board-band__count-num', String(rows.length)), document.createTextNode(' pending'));
     head.append(el('span', 'board-band__label', 'FOR YOU'), count);
     // The attention card (cockpit rework): what needs you, then one line
     // about Gru's own queue (NEEDS GRU — the live machine count the strip's
-    // ALERTS pair used to carry).
-    const gru = gruQueueLine(snapshot.unackedActionRequired);
+    // ALERTS pair used to carry). Both sit outside the heading, so its
+    // accessible name stays `FOR YOU N pending`.
+    const gru = gruQueueLine(snapshot.unackedActionRequired, this.unavailableReason !== null);
     const gruLine = (className: string): HTMLElement => {
-      const node = el('span', className, gru.text);
+      const node = el('span', `${className}${gru.alert ? ' board-owner__gru--alert' : ''}`, gru.text);
       node.title = gru.title;
       return node;
     };
-    if (rows.length > 0) {
-      head.append(el('span', 'board-owner__headline', `${rows.length} ${rows.length === 1 ? 'thing needs' : 'things need'} you`));
-      head.append(gruLine('lbl board-owner__gru'));
-    }
     mount.append(head);
+    if (rows.length > 0) {
+      const summary = el('div', 'board-owner__summary');
+      summary.append(
+        el('span', 'board-owner__headline', `${rows.length} ${rows.length === 1 ? 'thing needs' : 'things need'} you`),
+        gruLine('lbl board-owner__gru'),
+      );
+      mount.append(summary);
+    }
     mount.hidden = false;
     mount.dataset.empty = String(rows.length === 0);
     if (rows.length === 0) {
@@ -1116,13 +1122,14 @@ export class BoardView {
   private renderHealth(snapshot: BoardSnapshot): void {
     const pill = healthPill(snapshot);
     this.healthMount.hidden = false;
-    this.healthMount.dataset.attention = String(pill.attention);
+    this.healthMount.dataset.state = pill.state;
     this.healthMount.title = pill.title;
     this.healthSummary.textContent = pill.summary;
     this.healthParts.replaceChildren();
     for (const part of pill.parts) {
       const node = el('span', `command-health__part command-health__part--${part.tone}`);
       node.dataset.check = part.id;
+      node.dataset.problem = String(part.problem);
       node.title = part.title;
       node.append(document.createTextNode(part.text));
       if (part.flag !== null) {
@@ -1138,8 +1145,11 @@ export class BoardView {
    * `data-kpi` identity; zeros fade, alerts carry a ▲ beside the colour. */
   private renderKpis(snapshot: BoardSnapshot): void {
     this.kpiMount.hidden = false;
+    const cards = cockpitCards(snapshot, Date.now(), this.sectionsFor(snapshot));
     const grid = el('div', 'cockpit-kpis__grid');
-    grid.append(...cockpitCards(snapshot).map((card) => this.kpiCard(card)));
+    // Five cards (no raids block) fill five columns, never six with a hole.
+    grid.dataset.count = String(cards.length);
+    grid.append(...cards.map((card) => this.kpiCard(card)));
     this.kpiMount.replaceChildren(grid);
   }
 
@@ -1180,8 +1190,8 @@ export class BoardView {
       node.append(bar);
     }
     const facts = el('p', 'cockpit-card__facts');
-    card.facts.forEach((fact, index) => {
-      const stage = flow?.[index]?.stage;
+    for (const fact of card.facts) {
+      const stage = fact.stage;
       const item = el(
         'span',
         `cockpit-fact${fact.value === 0 ? ' cockpit-fact--zero' : ''}${fact.alert ? ' cockpit-fact--alert' : ''}${stage === undefined ? '' : ` cockpit-fact--stage cockpit-fact--${stage}`}`,
@@ -1192,7 +1202,7 @@ export class BoardView {
       num.title = fact.title;
       item.append(num, el('span', 'cockpit-fact__label', fact.label));
       facts.append(item);
-    });
+    }
     for (const text of card.notes) facts.append(el('span', 'cockpit-fact cockpit-fact--note', text));
     if (facts.childElementCount > 0) node.append(facts);
     return node;
@@ -1214,8 +1224,8 @@ export class BoardView {
         : decisions.reason === null
           ? `Decision routing: ${decisions.status}.`
           : `Decision routing: ${decisions.status} (${decisions.reason}).`;
-    // NEEDS GRU (the LIVE machine queue) renders once, as the strip's ALERTS
-    // pair, whose title carries the full explanation (alertsCard). It never
+    // NEEDS GRU (the LIVE machine queue) renders once, as the attention
+    // card's Gru line, whose title carries the full explanation (alertsCard). It never
     // rings the owner bell — the FOR YOU band is the human-facing surface.
     // Wake tracker: every autonomous wake is a durable `gru.wake` event.
     // Count and last-wake time are INDEPENDENT facts derived ONLY from
@@ -1351,13 +1361,12 @@ export class BoardView {
    * Settled 3; For Gru and Cold render no rows until deliberately
    * expanded; disclosures are reversible and survive snapshot pushes. */
   /** The single per-render sections derivation (memoized for this
-   * render pass): the nav strip and the section bodies read the SAME
-   * classification — stopped/live-worker truth included — so their counts
-   * cannot drift apart between renders. */
+   * render pass): the nav strip, the cockpit's KPI cards and the
+   * section bodies read the SAME classification — stopped/live-worker
+   * truth included — so their counts cannot drift apart between renders. */
   private sectionsFor(snapshot: BoardSnapshot): ReturnType<typeof boardSections> {
-    // The same snapshot-only derivation the TRACKERS chip counts from
-    // (main's helper derives the stopped/live-worker truth from the same
-    // snapshot, so the strip and the section bodies still cannot drift).
+    // Snapshot-only: the stopped/live-worker truth derives from the same
+    // snapshot, so the cards and the section bodies cannot drift.
     this.currentSections ??= snapshotSections(snapshot, Date.now());
     return this.currentSections;
   }
@@ -1449,11 +1458,14 @@ export class BoardView {
   /** An empty section folds into the Empty row (cockpit rework): a pill
    * that keeps the section's id — the shortcut strip still lands on it —
    * and carries why it is empty for screen readers and the tooltip. */
-  private emptySection(sectionId: SectionId, label: string, count: string, reason: string): HTMLElement {
+  private emptySection(sectionId: SectionId, label: string, count: '0' | '—', reason: string): HTMLElement {
     const pill = el('span', 'board-folded__pill');
     pill.id = `board-section-${sectionId}`;
     pill.dataset.section = sectionId;
     pill.dataset.empty = 'true';
+    // `—` is unknown (the server does not send that section), never a zero:
+    // its pill is dashed so it cannot pass for a verified empty one.
+    pill.dataset.unknown = String(count === '—');
     pill.tabIndex = -1;
     pill.title = reason;
     pill.append(
@@ -2258,11 +2270,30 @@ export class BoardView {
       agent.sessionFile !== null
         ? `${[...(job !== undefined ? [job.title] : []), agent.id].join(' — ')} — open transcript`
         : `${[...(job !== undefined ? [job.title] : []), agent.id].join(' — ')} — no session file yet`;
+    // Issue #161: top-level minions vs minion-created child workers. The
+    // marker renders from the durable parentage field only; an omitted
+    // field (pre-upgrade server) or a null field (server says unknown)
+    // renders no marker — legacy rows are never claimed either way.
+    const parentage = agent.parentage;
+    const isChild = parentage === 'child';
+    // Cockpit rework: the worker of a megaminion heist reads megaminion, a
+    // child worker reads sub-minion (the word CREW counts), and Vector's
+    // raid session (Perkins's read-only role under the `vector` label,
+    // #351) reads as the raid it is.
+    const vectorRaid = agent.role === 'perkins' && agent.label === 'vector';
+    const roleWord = isChild
+      ? 'sub-minion'
+      : vectorRaid
+        ? 'vector raid'
+        : agent.role === 'minion' && (job?.parentJobId ?? null) !== null
+          ? BOARD_WORDS.megaminion
+          : agent.role;
     // G7: every rail row carries an accessible name; minions keep their
-    // full-identity shape, other roles announce label · id — role · state.
+    // full-identity shape, other roles announce label · id — role · state,
+    // with the same role word the row shows.
     row.setAttribute('aria-label', agent.role === 'minion'
-      ? `${name} · ${agent.id}${job !== undefined ? ` — ${job.title}` : ''} — ${agent.role} · ${status}`
-      : `${name} · ${agent.id} — ${agent.role} · ${status}`);
+      ? `${name} · ${agent.id}${job !== undefined ? ` — ${job.title}` : ''} — ${roleWord} · ${status}`
+      : `${name} · ${agent.id} — ${roleWord} · ${status}`);
     if (section === 'historical') {
       row.title += ' · historical: no current runtime owner — record retained';
     }
@@ -2297,31 +2328,16 @@ export class BoardView {
       ),
     );
     const subline = el('span', 'board-agent__sub lbl');
-    // Issue #161: top-level minions vs minion-created child workers. The
-    // marker renders from the durable parentage field only; an omitted
-    // field (pre-upgrade server) or a null field (server says unknown)
-    // renders no marker — legacy rows are never claimed either way.
-    const parentage = agent.parentage;
-    const isChild = parentage === 'child';
-    // Cockpit rework: the worker of a megaminion heist reads megaminion,
-    // and Vector's raid session (Perkins's read-only role under the
-    // `vector` label, #351) reads as the raid it is.
-    const vectorRaid = agent.role === 'perkins' && agent.label === 'vector';
-    const roleWord = vectorRaid
-      ? 'vector raid'
-      : agent.role === 'minion' && (job?.parentJobId ?? null) !== null
-        ? BOARD_WORDS.megaminion
-        : agent.role;
     subline.append(
       el('span', 'board-agent__emoji', vectorRaid ? '🦑' : ROLE_EMOJI[agent.role] ?? '🤖'),
-      el('span', 'board-agent__role', isChild ? `child · ${status}` : `${roleWord} · ${status}`),
+      el('span', 'board-agent__role', `${roleWord} · ${status}`),
     );
     if (parentage === 'top-level' || parentage === 'child') {
       subline.append(
         el(
           'span',
           `board-agent__parentage board-agent__parentage--${parentage}`,
-          isChild ? '🧬 child' : 'top-level',
+          isChild ? '🧬 sub-minion' : 'top-level',
         ),
       );
     }

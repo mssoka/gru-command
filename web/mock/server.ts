@@ -679,8 +679,9 @@ function defaultSampleSnapshot(): unknown {
       workerBudget: 8,
       workersPerRun: 4,
     },
-    // #351: one raid mid-attack, one waiting for the owner, and a break-in
-    // whose fix heist waits too — every raids-card state in one board.
+    // #351: one raid mid-attack, one whose FOR YOU card waits for the
+    // owner, and a break-in whose fix card waits for the owner too — the
+    // raids card's attack note, cap aside and alert fact in one board.
     vector: {
       enabled: true,
       raidMode: 'proposed',

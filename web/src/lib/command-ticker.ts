@@ -15,11 +15,19 @@ export interface TickerInput {
   readonly snapshot: BoardSnapshot | null;
 }
 
-export interface TickerSegment {
-  readonly key: 'radar' | 'round';
+export interface RadarSegment {
+  readonly key: 'radar';
   readonly label: string;
-  /** radar: ok/warn/alert/plain; round: live/pending/none. */
-  readonly tone: 'plain' | 'ok' | 'warn' | 'alert' | 'live' | 'pending' | 'none';
+  readonly tone: 'plain' | 'ok' | 'warn' | 'alert';
+}
+
+export interface RoundSegment {
+  readonly key: 'round';
+  readonly label: string;
+  readonly tone: 'live' | 'pending' | 'none';
+  /** The round's number and its state word, which the pill lays out with
+   * the number in a two-digit slot; null = no round. */
+  readonly round: { readonly seq: number; readonly word: 'LIVE' | 'PENDING' } | null;
 }
 
 /** Radar = the board socket's health in one word. */
@@ -62,17 +70,24 @@ export function topReviewRound(snapshot: BoardSnapshot | null): { seq: number; s
   return null;
 }
 
+const ROUND_WORDS = { live: 'LIVE', pending: 'PENDING' } as const;
+
 export function roundLabel(round: { seq: number; status: 'live' | 'pending' } | null): string {
   if (round === null) return 'NO ROUND';
-  return round.status === 'live' ? `ROUND ${round.seq} LIVE` : `ROUND ${round.seq} PENDING`;
+  return `ROUND ${round.seq} ${ROUND_WORDS[round.status]}`;
 }
 
 /** The two pills, in order. */
-export function tickerSegments(input: TickerInput): readonly TickerSegment[] {
+export function tickerSegments(input: TickerInput): readonly [RadarSegment, RoundSegment] {
   const radar = radarLabel(input.boardState);
   const round = topReviewRound(input.snapshot);
   return [
     { key: 'radar', label: `RADAR ${radar.label}`, tone: radar.tone },
-    { key: 'round', label: roundLabel(round), tone: round === null ? 'none' : round.status },
+    {
+      key: 'round',
+      label: roundLabel(round),
+      tone: round === null ? 'none' : round.status,
+      round: round === null ? null : { seq: round.seq, word: ROUND_WORDS[round.status] },
+    },
   ];
 }

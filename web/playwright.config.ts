@@ -100,8 +100,9 @@ export default defineConfig({
       // The cockpit synthetic proof suite (health pill + KPI cards, which
       // replaced the slim strip): its own project so an unfiltered
       // `--project=mock` run keeps the base smoke/working-flavor roster.
+      // The settle helper's self-test (#402) rides here: it needs no app.
       name: 'cockpit',
-      testMatch: 'cockpit.spec.ts',
+      testMatch: ['cockpit.spec.ts', 'settle-transitions.spec.ts'],
       use: { baseURL: `http://localhost:${PREVIEW_PORT}` },
     },
     {
