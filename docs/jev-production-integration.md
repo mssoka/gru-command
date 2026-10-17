@@ -91,7 +91,8 @@ because a table defined twice fails to load.
 
 A config generated before the fragment shipped has no decisions block, or
 only the tables an operator added by hand. Bring it up to date before
-turning Jev on, from the install directory:
+turning Jev on, from the install directory and with the same
+`GRU_COMMAND_HOME` the service uses (the command prints the path it wrote):
 
 ```sh
 npm run config:generate -- --force
@@ -101,10 +102,10 @@ The regenerate rebuilds the whole file from the reference. It backs the old
 file up first and keeps every value you set; hand-written comments anywhere
 in the file are not kept (the backup has them). A config with Jev off and no
 surfaces gains the four shadow surfaces. One that has Jev on or names
-surfaces keeps exactly its own surface entries, so list the missing
-surfaces with `mode = "shadow"` yourself before turning Jev on: an unlisted
-`event_triage` or `supervision_guidance` acts on Jev's answer with no
-backtest gate.
+surfaces keeps exactly its own surface entries, so give every kept surface
+`mode = "shadow"` and add the missing ones yourself, before turning Jev on
+(right away if it is already on): an unlisted or mode-less `event_triage`
+or `supervision_guidance` acts on Jev's answer with no backtest gate.
 
 `node dist/decisions/cli.js config-template` prints the same fragment, for
 reading or for copying into a config that has no decisions tables at all.
@@ -145,10 +146,12 @@ request is a wiring bug, not provider health); `401 → auth_rejected`,
 `403 → forbidden`, `429/5xx → provider_degraded` are unchanged.
 
 Example — route one surface through TypeSafe directly. Store the TypeSafe
-key first (`credentials set --slot typesafe --stdin`, see
-[Credentials](#credentials)). The built-in `typesafe-direct` profile needs
-no table of its own; change only the `provider` line in the surface's
-existing table:
+key first (`node dist/decisions/cli.js credentials set --slot typesafe
+--stdin`, see [Credentials](#credentials)) and probe it with
+`node dist/decisions/cli.js check --profile typesafe-direct --json`: a
+non-default profile with a bad key falls back silently for its own calls.
+The built-in `typesafe-direct` profile needs no table of its own; change
+only the `provider` line in the surface's existing table:
 
 ```toml
 [decisions.surfaces.event_triage]
@@ -164,7 +167,8 @@ Routing rules:
   `event_triage = "typesafe-direct"` under `[decisions.surfaces]`. The
   shorthand carries no `mode`, so for `event_triage` and
   `supervision_guidance` it means the legacy behavior (Jev's answer used
-  with no backtest gate); prefer the table. Use one form per surface,
+  with no backtest gate), and `escalation_triage` and `same_blocker` are
+  never asked; prefer the table. Use one form per surface,
   never both: a surface defined both ways fails to load. Unlisted surfaces
   (and omitted surface arguments) ride the default `openrouter-jev`
   profile — pre-profile behavior, unchanged. The deterministic fallback

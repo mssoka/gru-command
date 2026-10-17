@@ -582,13 +582,15 @@ timeout_ms = 5000 # Per-call limit; on timeout the deterministic answer is used.
 #                     <data_dir>/decisions/backtests/<surface>.json by:
 #                       node dist/decisions/cli.js extract-cases --surface <s> --out <jsonl>
 #                       node dist/decisions/cli.js backtest --surface <s> --profile <p> --cases <jsonl> --threshold <min> --save
+#                     Not available on the live surfaces below yet: see each one.
 #   (no mode key)     Legacy, pre-#223: for event_triage and supervision_guidance
-#                     Gru Command USES Jev's answer with NO backtest gate.
-#                     Keep those two listed explicitly unless you mean that.
+#                     Gru Command USES Jev's answer with NO backtest gate;
+#                     escalation_triage and same_blocker are never asked.
+#                     Keep every surface listed explicitly unless you mean that.
 #
 # Surfaces:
-#   event_triage          does an orchestration event need attention? (may only raise attention, never lower it)
-#   supervision_guidance  classifies a runtime failure: restart vs escalate (restart counters stay deterministic)
+#   event_triage          does an orchestration event need attention? (may only raise attention, never lower it; off or shadow today: no registered backtest)
+#   supervision_guidance  classifies a runtime failure: restart vs escalate (restart counters stay deterministic; off or shadow today: no registered backtest)
 #   escalation_triage     is a Silas escalation a ruling or a status report? (shadow only today)
 #   same_blocker          is this review blocker the same defect as last round? (shadow only today)
 #   report_conclusion     clean pass / findings / inconclusive (backtest only; no live host yet)
