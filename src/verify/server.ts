@@ -87,9 +87,10 @@ export interface VerificationBudget {
   acquire(spec: VerificationRunSpec): Promise<VerificationLease>;
   /** Bind the pid and argv of the command the holder spawned to its slot,
    * persisted as a scheduler run's child is: a restart then judges an
-   * orphaned slot by that pid's liveness instead of releasing it as
-   * runner-less, and the argv tells the holder the pid is still its own. */
-  bindPid(lease: VerificationLease, pid: number, processCommand: string): void;
+   * orphaned slot by that pid's liveness (by its whole process group when
+   * it `leadsGroup`) instead of releasing it as runner-less, and the argv
+   * tells the holder the pid is still its own. */
+  bindPid(lease: VerificationLease, pid: number, processCommand: string, opts?: { readonly leadsGroup?: boolean }): void;
   /** Slots of `scope` an earlier process left, still held for a live pid. */
   restored(scope: string): readonly { readonly lease: VerificationLease; readonly pid: number; readonly processCommand: string | null }[];
   release(lease: VerificationLease): void;
@@ -595,7 +596,7 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
     budget(): VerificationBudget {
       return {
         acquire: (spec) => scheduler.acquire(spec),
-        bindPid: (lease, pid, processCommand) => scheduler.bindPid(lease, pid, processCommand),
+        bindPid: (lease, pid, processCommand, opts) => scheduler.bindPid(lease, pid, processCommand, opts),
         restored: (scope) => scheduler.restoredHolders(scope),
         release: (lease) => scheduler.release(lease),
         get workersPerRun() {

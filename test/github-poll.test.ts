@@ -540,6 +540,14 @@ describe('gh CLI adapter', () => {
     expect(ghRateLimited(new GhApiError('comment on acme/app#7: gh exited 1', 'gh: API rate limit exceeded for user ID 1 (HTTP 403)'))).toBe(true);
     expect(ghRateLimited(await refusal('gh: Resource not accessible by integration (HTTP 403)'))).toBe(false);
     expect(ghRateLimited(new Error('API rate limit exceeded'))).toBe(false);
+    // GitHub's other throttling: the abuse detection mechanism, and content created too fast.
+    const abuse = await refusal('gh: You have triggered an abuse detection mechanism. Please wait a few minutes before you try again. (HTTP 403)');
+    expect(ghHttpStatus(abuse)).toBe(403);
+    expect(ghRateLimited(abuse)).toBe(true);
+    const tooQuickly = await refusal('gh: Validation Failed: was submitted too quickly (HTTP 422)');
+    expect(ghHttpStatus(tooQuickly)).toBe(422);
+    expect(ghRateLimited(tooQuickly)).toBe(true);
+    expect(ghRateLimited(await refusal('gh: Validation Failed: body is too long (HTTP 422)'))).toBe(false);
   });
 
   it('fails loud on unavailability, rate limits, and malformed responses', async () => {

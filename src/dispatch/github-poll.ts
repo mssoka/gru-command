@@ -513,11 +513,17 @@ export class GhRateLimitedError extends GhApiError {
   }
 }
 
-/** A rate limit, primary or secondary, whatever status GitHub answered it
- * with (a secondary limit on content creation answers `HTTP 403`): a
- * caller retries it later and never reads it as a refusal for good. */
+/** GitHub's throttling texts: a primary or secondary rate limit, the abuse
+ * detection mechanism, and content created too fast (`422 … was submitted
+ * too quickly`). */
+const GH_THROTTLED = /rate limit|abuse detection|submitted too quickly|secondary rate/iu;
+
+/** A rate limit or other throttling, whatever status GitHub answered it
+ * with (a secondary limit on content creation answers `HTTP 403`, content
+ * created too fast `HTTP 422`): a caller retries it later and never reads
+ * it as a refusal for good. */
 export function ghRateLimited(error: unknown): boolean {
-  return error instanceof GhRateLimitedError || (error instanceof GhApiError && error.causeText !== null && /rate limit/iu.test(error.causeText));
+  return error instanceof GhRateLimitedError || (error instanceof GhApiError && error.causeText !== null && GH_THROTTLED.test(error.causeText));
 }
 
 /** Per-tick call budget exhausted — the rest of the tick defers. */

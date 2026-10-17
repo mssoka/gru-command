@@ -178,11 +178,17 @@ onboarding, never the gate on an open heist.
    `worktree add` does (hooks and fsmonitor off, no prompts), so filters
    give the content a lane gets. When the head uses Git LFS (a
    `.gitattributes` names `filter=lfs`), the checkout gets what a lane
-   shares with your repository: every repository-local `lfs.*`, `http.*`,
-   `credential.*` and `url.*` (`insteadOf`) entry, and your `origin`, are
-   written into the checkout's own config file (never onto a command line,
-   and no copied value is logged), and its LFS store is your repository's
-   (its `lfs.storage`, else `<git common dir>/lfs`). Smudge reads that store
+   shares with your repository: every `lfs.*`, `http.*`, `credential.*`,
+   `url.*` (`insteadOf`), `remote.origin.*` (`url`, `lfsurl`) and
+   `core.sshCommand` entry of your repository's effective config (every
+   scope, with `include` and `includeIf` resolved against your
+   repository's own git dir, as `git -C <repo> config --includes --list`
+   reads it), less what the checkout already reads from your user and
+   system config (nothing is doubled), is written into the checkout's own
+   config file (never onto a command line, and no copied value is logged),
+   and its LFS store is your repository's (its `lfs.storage`, a relative
+   one resolved against the git common dir, else `<git common dir>/lfs`).
+   Smudge reads that store
    first and fetches only missing objects, with your repository's own auth
    and routing, into that same store, exactly as a lane does. The checkout
    is bounded by the larger of `[worktrees] setup_timeout_ms` and
@@ -199,17 +205,24 @@ onboarding, never the gate on an open heist.
    itself with the budget's environment and worker share, bounded by
    `[verify] run_timeout_ms`, and ends its whole process group. The shell
    evaluates the command, so it stays its group's leader, and its pid and
-   argv are bound to the slot. After a crash, the restarted scheduler keeps
-   the slot while that pid lives. Onboarding's start, before it removes
-   leftover checkouts, first ends every process carrying this instance's
-   marker or rooted under its probes folder (below), then ends the group
-   of each such verify whose pid still leads its group and runs the bound
-   argv, and releases its slot. A slot
-   is released as gone only when neither its pid nor any member of its
-   process group lives; a member that outlived its leader keeps the slot. A
-   live pid that is not that verify is never signalled, and a pid `ps`
-   cannot read is logged as an error; either slot waits for the
-   scheduler's age limit. A stale release of this slot is logged at `warn`.
+   argv are bound to the slot as the leader of its own process group. After
+   a crash, the restarted scheduler, and every later stale check (each
+   `acquire`), keeps the slot while any member of that group lives, its
+   leader or not. Onboarding's start, before it removes leftover
+   checkouts, first ends every process carrying this instance's marker or
+   rooted under its probes folder (below) and waits until each is gone
+   (a zombie counts as gone), then ends the group of each such verify
+   whose pid still leads its group and runs the bound argv, and releases
+   its slot once the group is gone. A pid `ps` cannot read is judged again
+   before it counts as unjudgeable (it may have just ended). When the
+   leader is gone but a member of its group lives, the group is ended as
+   one once a member is confirmed the proof's (it carries this instance's
+   marker or is rooted under its probes folder), and the slot is released
+   after; a group none of whose members is confirmed is never signalled
+   (its pgid may belong to someone else by now) and keeps the slot. A live
+   pid that is not that verify is never signalled, and a pid `ps` cannot
+   read is logged as an error; each such slot waits for the scheduler's
+   age limit. A stale release of this slot is logged at `warn`.
    The proof is not a verification of the job: no `verification.*` event is
    recorded for the `onboarding-proof` scope, no verification fence sees it,
    `POST /api/verify` refuses that scope (`400 reserved_scope`), and a
@@ -221,21 +234,42 @@ onboarding, never the gate on an open heist.
    the proof starts (the clone, the checkout, each setup command and
    verify) carries the environment marker
    `GRU_ONBOARDING_PROBE=<instance>.<run>`. Every process group setup and
-   verify started is ended (`SIGTERM`, then `SIGKILL` after a grace), then
-   every process still carrying the run's marker or rooted in the checkout,
-   which catches a daemon that left its group (`setsid` or a double fork,
-   as the Bazel server, a Gradle daemon or watchman do).
+   verify started that is still the proof's is ended (`SIGTERM`, then
+   `SIGKILL` after a grace, then a wait of up to five seconds until each
+   is gone), then every process still carrying the run's marker or rooted
+   in the checkout, which catches a daemon that left its group (`setsid`
+   or a double fork, as the Bazel server, a Gradle daemon or watchman do).
+   - A group is the proof's while one of its members was in it when its
+     command's shell exited, carries the run's marker, or is rooted in the
+     checkout (members are listed with `ps -o pid= -g <pgid>`, or from
+     `/proc` on Linux). A group already empty when its shell exited is no
+     longer tracked, and one that holds none of the proof's processes now
+     is never signalled: its process group id may have been reused by
+     another lane's verify or anything else.
    - The marker: Linux reads each process's environment from `/proc`;
      elsewhere GC asks `ps -axEww`. A process that scrubbed its environment
      cannot be found this way, and neither can any process on a platform
      whose `ps` hides other processes' environments (current macOS shows a
-     process only its own).
+     process only its own). On Linux, a process of your user that hides
+     its environment (a non-dumpable one, as `ssh-agent` and `gpg-agent`
+     make themselves) cannot be read either; GC logs each such process
+     once at `warn`, and only its process group or its working directory
+     in the checkout can end it.
    - Rooted in the checkout: its working directory is inside the checkout,
      or its command line names a path inside it, found the way the worktree
      manager's sweep finds a lane's processes (`/proc` on Linux, `lsof` on
-     macOS). This works on every such platform and whatever the process did
-     to its environment, but not for a daemon that changed its working
-     directory out of the checkout and names no path inside it.
+     macOS), off the service's event loop and bounded at 30 seconds. This
+     works on every such platform and whatever the process did to its
+     environment, but not for a daemon that changed its working directory
+     out of the checkout and names no path inside it.
+   - A listing that fails or runs past its bound is logged as an error,
+     and the other listing still counts; the proof is still recorded.
+   - Per-user daemons: the proof ends any daemon its setup started,
+     including one that is shared per user and that a lane might reuse
+     while the proof runs (a Gradle daemon, watchman, an ssh
+     `ControlMaster`): a lane's build or fetch that is using it then fails.
+     Lanes keep what their own setup starts; only a proof ends such a
+     daemon.
 
    At start, GC does the same for every process carrying this instance's
    marker or rooted under its probes folder: proofs run one at a time, so
@@ -251,18 +285,27 @@ The checkout is removed whatever the outcome, and a start removes any a
 crash left behind. The output tail is cut from the failing command's latest
 16 KiB of output, redacted whole before it is cut: anything shaped like a
 credential (private keys under any `PRIVATE KEY` header, PKCS#8's bare one
-included; GitHub, GitLab, npm, Slack, OpenAI and AWS tokens; JWTs; URL
-userinfo; `Authorization` headers; `.npmrc` auth lines; and a keyword such
-as `token`, `password`, `aws_secret_access_key`, `private_key` or
-`client-key-data`, quoted as JSON quotes it or not, assigned a value of six
-or more characters with a letter or digit) is masked, and a key whose BEGIN
-line fell before that window is masked from the window's start. The tail is
-then the last 4 KiB, starting at a whole line, so a cut never shows half a
-credential and the bound holds after redaction. When one line is longer
-than the tail, its last bytes are kept after a first line
-`(output tail starts mid-line)`: a command that printed something never
-records an empty tail. Failures and commands are redacted the same way
-before they are recorded.
+included, and armored PGP secret keys, `PGP PRIVATE KEY BLOCK`; GitHub,
+GitLab, npm, Slack, OpenAI and AWS tokens; JWTs; URL userinfo;
+`Authorization` headers; `.npmrc` auth lines; and a keyword such as
+`token`, `password`, `aws_secret_access_key`, `private_key` or
+`client-key-data`, with `_`, `-` or nothing between its words, so camelCase
+too (`secretKey`, `clientSecret`), or a key that ends an identifier in
+`password`, `token`, `secret` or `secretaccesskey` whatever starts it
+(`PGPASSWORD`, `dbPassword`, `githubToken`, AWS STS's `SecretAccessKey`
+and `SessionToken`; `AccessKeyId` is no secret and stays), quoted as JSON
+quotes it or not, assigned a value of six or more characters with a letter
+or digit) is masked, and a key whose BEGIN line fell before that window is
+masked from the window's start. The tail is then the last 4 KiB, starting
+at a whole line, so a cut never shows half a credential and the bound holds
+after redaction. When one line is longer than the tail (or a stream's kept
+output starts inside one, as a setup stream whose earlier output was
+dropped does), its last bytes are kept from the first whitespace after the
+cut, after a first line `(output tail starts mid-line)`, so a token the
+cut split never shows its back half; with no whitespace to start at, the
+tail records only `(last line longer than <N> KiB, not shown)`. A command
+that printed something never records an empty tail. Failures and commands
+are redacted the same way before they are recorded.
 
 **A proof fails** when a setup command fails or times out; when verify
 exits non-zero or times out; when verify exits 0 in under a second with no
@@ -302,16 +345,21 @@ proof.
   Job and head are public but no one sees a nonce until GC posts it, so a
   comment with GC's job and head and no or another nonce, a quote of the
   marker, or a mention of it is someone else's (no author is asked). An
-  attempt recorded before markers carried a nonce matches no comment, so
-  GC posts its own. After three failed attempts for a head in one run of
+  attempt recorded before markers carried a nonce (by an older build) is
+  looked up by that build's marker,
+  `<!-- gru:onboarding-proof job=<id> head=<sha> -->` at the start of a
+  comment, so an upgrade in the middle of an interrupted post never posts
+  twice. After three failed attempts for a head in one run of
   the service, counted at most once per reconcile (a failed lookup counts,
   and any burst of triggers between two reconciles counts once, whatever
   the clock says), GC records `onboarding.proof-commented` with no comment
   and `cannot be posted: <reason>`, logs an error, and stops trying. A
   refusal GitHub means for good (`HTTP 403`, `404`, `410` or `422`, as `gh`
-  reports it) is recorded that way at once, with no second attempt. A rate
-  limit never is, even at `HTTP 403` (GitHub's secondary limit on comments
-  answers 403): it counts as a failed attempt and is retried. An unreadable
+  reports it) is recorded that way at once, with no second attempt.
+  Throttling never is, whatever its status: a rate limit (GitHub's
+  secondary limit on comments answers 403), the abuse detection mechanism
+  (403) or content `submitted too quickly` (422) is retried at every
+  reconcile and never counts as a failed attempt. An unreadable
   record is recorded at once as `cannot be posted: unreadable record`.
 - On a pass, review may arm, and the Perkins packet carries an
   `ONBOARDING PROOF` block when the proof's head is the reviewed sha. Every
@@ -344,11 +392,12 @@ names the row, and the detail gives every one that holds:
 - `unanswered`: the minion finished the directive about its failure, and at
   a later reconcile its newest delivery still names that head;
 - `unadmitted`: the lane never admitted the directive (it was refused
-  before any row in three different reconciles);
+  before any row in three different reconciles; once the lane admits a
+  directive, the refusals before it count no more);
 - `deferred`: its proof was deferred three times in a row in this run of
   the service, counted at most once per reconcile (the detail gives the
   last reason; a recorded proof starts the count again, and so does a
-  restart);
+  restart, which never closes the row);
 - `nohead`: the newest delivery names no full commit id (or is not a
   proven current candidate), so the minion must deliver again.
 
@@ -357,8 +406,13 @@ row, and a Gru disposition of it is refused: it closes when the head's
 proof passes, when a newer head is delivered, when the job ends (at once,
 on the job's terminal status), when the head is proven after a deferral,
 when the head is stuck for another reason (a new row names that one), or
-when its reason clears and no other holds (the lane admitted the
-directive, say). A later episode of the same head, such as a re-delivery
+when no reason holds and its own is known to have cleared: an `unadmitted`
+row once the lane admitted the directive (live or settled), an
+`unanswered` one on a newer delivery or a new directive turn on the job.
+The counts behind `deferred`, `unadmitted` and `unanswered` live in the
+service's memory, so a restart empties them: a restart alone never closes
+a row (a deferral row closes only on a proof of its head), and the reason
+holding again keeps the same open row, never a `:2`. A later episode of the same head, such as a re-delivery
 after its row closed, or a second delivery that names no commit, gets a
 new row, and so does a reason that holds again after its row closed (its
 id ends `:2`, `:3`, and so on). A row's id is never posted again. An ended
@@ -380,7 +434,16 @@ review offer. The exact commit under review must pass too:
   changes included, so its admission and each iteration need a passing
   proof of the lane's HEAD and a clean lane: tracked changes, or untracked
   files git does not ignore (`git status --porcelain`), are uncommitted
-  changes the proof never ran, and refuse it.
+  changes the proof never ran, and refuse it. What the lane's bootstrap
+  placed is not uncommitted: the manifest's `[[link]]` `at` and `[[copy]]`
+  `to` paths are left out (a `node_modules` link that a `node_modules/`
+  ignore rule misses, since a link is no folder). A gate whose fix leaves
+  an unproven lane HEAD, a new unproven delivery or uncommitted changes
+  stops before its next round and aborts with `code:
+  "onboarding-proof-required"` and a hint: the minion commits the fix,
+  pushes it to the PR branch and delivers; GC proves the new head itself,
+  and review re-arms once that proof passes (the Silas digest offers the
+  review again, and a queued self-review request is replayed).
 
 `force` cannot waive any of it. The `409 branch_busy` blocker carries
 `onboarding_proof_required_head` and `onboarding_proof_reason`

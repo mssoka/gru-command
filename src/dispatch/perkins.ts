@@ -4,7 +4,7 @@ import { promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { basename, join, resolve } from 'node:path';
+import { basename, join, relative, resolve, sep } from 'node:path';
 import type { LogLevel } from '../logger.js';
 import { DEFAULT_REVIEW_CHILDREN } from '../config.js';
 import type { JobStatus, LedgerApi, OnboardingProofDebt, RoundRecord, RoundVerdict } from '../ledger/api.js';
@@ -31,6 +31,7 @@ import type { EventBus } from '../events/bus.js';
 import { validReviewOwnerGeneration, type ResidentReviewRound, type ReviewOwnerMarker } from '../runtime/registry.js';
 import { settleRetries, type PacingGate, type PacingLease, type RateLimitBackoffPolicy, type RetrySettlement } from '../runtime/pacing.js';
 import { isExactOriginBranchSpelling } from '../worktrees/manager.js';
+import { loadWorktreeManifest } from '../worktrees/manifest.js';
 import { deliveredTargetSha } from './silas-driver.js';
 import type { CanonicalReviewVerdict, VerifiedFinding } from './perkins-review/types.js';
 import { PerkinsWholeReview, verifiedSpecialistCheckpointResults, type PerkinsWholeResult, type RoundBudgetRefusal } from './perkins-review/whole.js';
@@ -1907,11 +1908,23 @@ export interface WaveOutcome {
  * admission). The gate stops fail-closed before the next diff intake or
  * reviewer spawn; it is never a partial round. */
 class FallbackSafetyRefusal extends Error {
-  constructor(message: string) {
+  /** A named reason the gate's abort records, with its way forward. */
+  constructor(message: string, readonly code: typeof FALLBACK_ONBOARDING_PROOF_REQUIRED | null = null) {
     super(message);
     this.name = 'FallbackSafetyRefusal';
   }
 }
+
+/** #427 PR 1b: the bmad-review fallback gate of an onboarding heist stopped
+ * because a head, a lane HEAD or uncommitted changes no onboarding proof
+ * ran stand where it would review next (its fix produced them, say). */
+export const FALLBACK_ONBOARDING_PROOF_REQUIRED = 'onboarding-proof-required';
+
+/** The way forward that abort records: the gate cannot wait for a proof,
+ * so the fix goes through delivery, the proof, then review again. */
+export const FALLBACK_ONBOARDING_PROOF_HINT =
+  'the minion must commit the fix, push it to the PR branch and deliver; GC proves the new head itself, and review ' +
+  're-arms once that proof passes (the Silas digest offers the review again, and a self-review request is replayed on the pass)';
 
 /** A reviewed job's ledger row is gone at the freeze. Job rows are never
  * deleted, so nothing the freeze would record about it can be stated. */
@@ -1949,16 +1962,46 @@ function captureFallbackInput(lanePath: string, baseRef: string): Pick<FallbackR
   return { headRef, diff, diffSha256: createHash('sha256').update(diff).digest('hex') };
 }
 
+/** #427 PR 1b: the lane-relative paths the lane's bootstrap placed (its
+ * manifest's `[[link]]` `at` and `[[copy]]` `to`): GC put them there, and
+ * the proof's own bootstrap places them the same way. A manifest that
+ * cannot be read places nothing here, so every path counts. */
+function bootstrapPlacedPaths(lanePath: string): readonly string[] {
+  let manifest;
+  try {
+    manifest = loadWorktreeManifest(lanePath);
+  } catch {
+    return [];
+  }
+  if (manifest === null) return [];
+  return [...manifest.links.map((link) => link.at), ...manifest.copies.map((copy) => copy.to)]
+    .map((path) => relative(lanePath, resolve(lanePath, path)).split(sep).join('/'))
+    .filter((path) => path !== '' && !path.startsWith('..'));
+}
+
 /** #427 PR 1b: whether a lane holds uncommitted changes the fallback would
  * review (tracked edits, untracked files git does not ignore: what
- * `git status --porcelain` lists). Fails loud when git cannot say. */
+ * `git status --porcelain` lists, each untracked file on its own), leaving
+ * out what the lane's bootstrap placed (a `node_modules` link a
+ * `node_modules/` ignore rule misses, since a link is no folder). Fails
+ * loud when git cannot say. */
 function laneHasUncommittedChanges(lanePath: string): boolean {
-  const run = spawnSync('git', ['-C', lanePath, '-c', 'core.fsmonitor=false', 'status', '--porcelain', '--untracked-files=normal'],
+  const run = spawnSync('git', ['-C', lanePath, '-c', 'core.fsmonitor=false', 'status', '--porcelain', '-z', '--untracked-files=all'],
     { encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 64 * 1024 * 1024, timeout: 30_000 });
   if (run.error !== undefined || run.status !== 0) {
     throw new Error(`cannot read the lane's uncommitted changes (git status): ${run.error?.message ?? run.stderr.trim().slice(0, 200)}`);
   }
-  return run.stdout.trim() !== '';
+  const placed = bootstrapPlacedPaths(lanePath);
+  const isPlaced = (path: string): boolean => placed.some((at) => path === at || path.startsWith(`${at}/`));
+  const fields = run.stdout.split('\0');
+  for (let index = 0; index < fields.length; index += 1) {
+    const field = fields[index]!;
+    if (field === '') continue;
+    // A rename or copy names its source in the next field.
+    const paths = /^(?:[RC].|.[RC]) /u.test(field) ? [field.slice(3), fields[(index += 1)] ?? ''] : [field.slice(3)];
+    if (!paths.every(isPlaced)) return true;
+  }
+  return false;
 }
 
 /** A late delivered STATUS after an already-recorded delivery is harmless.
@@ -4558,17 +4601,20 @@ export class WaveRunner {
     if (this.opts.ledger.onboardingProofDebt(input.jobId) !== null) {
       throw new FallbackSafetyRefusal(
         `onboarding job "${input.jobId}" has no passing onboarding proof of its delivered head — the gate stops before the next review round`,
+        FALLBACK_ONBOARDING_PROOF_REQUIRED,
       );
     }
     const laneHeadDebt = this.onboardingLaneHeadDebt(input.jobId, lane.path);
     if (laneHeadDebt !== null) {
       throw new FallbackSafetyRefusal(
         `onboarding job "${input.jobId}" has no passing onboarding proof of its lane HEAD ${laneHeadDebt.head ?? ''}, the commit the fallback reviews — the gate stops before the next review round`,
+        FALLBACK_ONBOARDING_PROOF_REQUIRED,
       );
     }
     if (this.onboardingLaneDirtyDebt(input.jobId, lane.path) !== null) {
       throw new FallbackSafetyRefusal(
         `onboarding job "${input.jobId}"'s lane holds uncommitted changes the proof never ran, and the fallback reviews the working tree — the gate stops before the next review round`,
+        FALLBACK_ONBOARDING_PROOF_REQUIRED,
       );
     }
     if (fallbackWorkingStartedSince(this.opts.ledger, input.jobId, admission.statusSeq) ||
@@ -4764,7 +4810,7 @@ export class WaveRunner {
           recheck();
         } catch (error) {
           if (error instanceof FallbackSafetyRefusal) {
-            this.terminalFallbackAborted(job.id, error.message, iteration, [...state.reportFiles], fallbackEvent, state);
+            this.terminalFallbackAborted(job.id, error, iteration, [...state.reportFiles], fallbackEvent, state);
             return;
           }
           throw error;
@@ -4788,7 +4834,7 @@ export class WaveRunner {
         captured = captureFallbackInput(lanePath, baseRef);
       } catch (error) {
         if (error instanceof FallbackSafetyRefusal) {
-          this.terminalFallbackAborted(job.id, error.message, iteration, [...state.reportFiles], fallbackEvent, state);
+          this.terminalFallbackAborted(job.id, error, iteration, [...state.reportFiles], fallbackEvent, state);
         } else {
           this.terminalFallbackBlocked(job.id, `fallback round ${iteration} input failed: ${sanitizeErrorLog(error)}`, iteration, [...state.reportFiles], fallbackEvent, state);
         }
@@ -4815,7 +4861,7 @@ export class WaveRunner {
       } catch (error) {
         if (existsSync(reportFile)) state.reportFiles.push(reportFile);
         if (error instanceof FallbackSafetyRefusal) {
-          this.terminalFallbackAborted(job.id, error.message, iteration, [...state.reportFiles], fallbackEvent, state);
+          this.terminalFallbackAborted(job.id, error, iteration, [...state.reportFiles], fallbackEvent, state);
           return;
         }
         this.terminalFallbackBlocked(job.id, `bmad-review round ${iteration} failed: ${sanitizeErrorLog(error)}`, iteration, [...state.reportFiles], fallbackEvent, state);
@@ -4856,7 +4902,7 @@ export class WaveRunner {
         });
       } catch (error) {
         if (error instanceof FallbackSafetyRefusal) {
-          this.terminalFallbackAborted(job.id, error.message, iteration, [...state.reportFiles], fallbackEvent, state);
+          this.terminalFallbackAborted(job.id, error, iteration, [...state.reportFiles], fallbackEvent, state);
           return;
         }
         this.terminalFallbackBlocked(
@@ -4927,21 +4973,27 @@ export class WaveRunner {
 
   private terminalFallbackAborted(
     jobId: string,
-    reason: string,
+    refusal: FallbackSafetyRefusal,
     iteration: number,
     reports: readonly string[],
     fallbackEvent: (payload: Record<string, unknown>) => void,
     state?: FallbackGateState,
   ): void {
+    const reason = refusal.message;
     if (this.supersededFallbackGates.has(jobId)) {
       this.terminalFallbackSuperseded(jobId, reason, iteration, reports, fallbackEvent, state);
       return;
     }
     if (state !== undefined) state.note = `bmad-review gate aborted: ${reason}`;
-    fallbackEvent({ phase: 'aborted', iteration, reason, reports, clearToMerge: false });
+    // A named reason carries its way forward (#427 PR 1b: an onboarding
+    // fix that needs a proof before review goes on).
+    const named = refusal.code === null ? {} : { code: refusal.code, hint: FALLBACK_ONBOARDING_PROOF_HINT };
+    fallbackEvent({ phase: 'aborted', iteration, reason, reports, clearToMerge: false, ...named });
     this.escalate(
       `bmad-review gate ABORTED for job ${jobId}`,
-      `${reason}. No further review round ran; merge is NOT clear. Restore the Perkins gate for autonomous gating.`,
+      refusal.code === null
+        ? `${reason}. No further review round ran; merge is NOT clear. Restore the Perkins gate for autonomous gating.`
+        : `${reason}. No further review round ran; merge is NOT clear. ${refusal.code}: ${FALLBACK_ONBOARDING_PROOF_HINT}.`,
       { jobId },
     );
   }

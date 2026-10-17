@@ -243,7 +243,12 @@ latest revision → verify → fresh review. The service enforces it centrally.
   checks the exact sha it reviews last (a live PR head pushed after the delivery); and the
   bmad-review fallback, which reviews the lane's working tree, needs a passing proof of the
   lane HEAD and a lane with no uncommitted changes the proof never ran (tracked edits or
-  untracked files git does not ignore), at admission and at each iteration. Like a pending
+  untracked files git does not ignore, leaving out the `[[link]]` and `[[copy]]` paths the
+  lane's bootstrap placed), at admission and at each iteration. A gate that stops at an
+  iteration for this (its fix left an unproven lane HEAD, a new unproven delivery, or
+  uncommitted changes) aborts with `code: "onboarding-proof-required"` and a hint: the minion
+  commits, pushes and delivers the fix, GC proves the new head, and review re-arms on the pass
+  (the Silas review offer returns; a queued self-review request is replayed). Like a pending
   correction, `force` never waives it, and the `409 branch_busy` hint says so (or says the
   minion must deliver again, has not delivered yet, or must commit or discard its lane's
   changes). Every `branch-idle.refused` audit records `forced` (force was

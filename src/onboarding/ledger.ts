@@ -69,6 +69,9 @@ export interface ProofRecord {
   /** The marker nonce of each recorded comment attempt, oldest first: only
    * a comment whose marker carries one of them is GC's. */
   readonly attemptNonces: readonly string[];
+  /** An attempt was recorded by a build whose marker carried no nonce:
+   * its comment starts with that build's marker. */
+  readonly legacyAttempt: boolean;
   readonly comment: { readonly id: number | null; readonly url: string | null; readonly detail: string } | null;
 }
 
@@ -237,15 +240,18 @@ export class OnboardingLedger {
         const list = this.proofs.get(jobId) ?? [];
         if (list.some((entry) => entry.head === head)) return;
         const result = readOnboardingProof(payload);
-        this.proofs.set(jobId, [...list, { repo, jobId, head, passed: result?.passed === true, at: ts, result, attemptNonces: [], comment: null }]);
+        this.proofs.set(jobId, [...list, { repo, jobId, head, passed: result?.passed === true, at: ts, result, attemptNonces: [], legacyAttempt: false, comment: null }]);
         return;
       }
       case ONBOARDING_EVENTS.proofCommentAttempt: {
-        // An attempt recorded before markers carried a nonce has none: no
-        // comment can be matched to it, so GC posts its own.
+        // An attempt recorded before markers carried a nonce has none: its
+        // comment carries that build's marker, with no nonce.
         const nonce = payload['nonce'];
+        const carried = typeof nonce === 'string' && nonce !== '';
         this.updateProof(payload, (proof) => ({
-          ...proof, attemptNonces: typeof nonce === 'string' && nonce !== '' ? [...proof.attemptNonces, nonce] : proof.attemptNonces,
+          ...proof,
+          attemptNonces: carried ? [...proof.attemptNonces, nonce] : proof.attemptNonces,
+          legacyAttempt: proof.legacyAttempt || !carried,
         }));
         return;
       }

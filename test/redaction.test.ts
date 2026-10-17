@@ -71,6 +71,55 @@ describe('redactCredentials', () => {
     expect(redactCredentials('{"password": "*****"}')).toBe('{"password": "*****"}');
   });
 
+  it('masks camelCase and joined keys, and a key that ends an identifier whatever starts it; AWS STS JSON keeps its AccessKeyId and loses its secret and session token (#427)', () => {
+    const sts = [
+      '{',
+      '    "Credentials": {',
+      '        "AccessKeyId": "ASIAIOSFODNN7EXAMPLE",',
+      '        "SecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",',
+      '        "SessionToken": "IQoJb3JpZ2luX2VjEXAMPLEtokenBODY",',
+      '        "Expiration": "2026-10-17T12:00:00+00:00"',
+      '    }',
+      '}',
+    ].join('\n');
+    const redacted = redactCredentials(sts);
+    expect(redacted).not.toContain('wJalrXUtnFEMI');
+    expect(redacted).not.toContain('IQoJb3JpZ2lu');
+    expect(redacted).toContain('"AccessKeyId": "ASIAIOSFODNN7EXAMPLE"');
+    expect(redacted).toContain('"Expiration": "2026-10-17T12:00:00+00:00"');
+    for (const [text, secret] of [
+      ['SecretAccessKey=wJalrXUtnFEMI', 'wJalrXUtnFEMI'],
+      ['AwsSecretAccessKey: wJalrXUtnFEMI', 'wJalrXUtnFEMI'],
+      ['secretaccesskey=wJalrXUtnFEMI', 'wJalrXUtnFEMI'],
+      ['"secretKey": "abcdef123456"', 'abcdef123456'],
+      ['{"dbPassword": "hunter22x"}', 'hunter22x'],
+      ['"githubToken": "abcdef123456"', 'abcdef123456'],
+      ['+ PGPASSWORD=s3cretpw psql -h db', 's3cretpw'],
+      ['clientSecret = "oauth-client-s3cret"', 'oauth-client-s3cret'],
+      ['SessionToken=IQoJb3JpZ2lu', 'IQoJb3JpZ2lu'],
+      ['npmAuthToken: abcdef123456', 'abcdef123456'],
+      ['DB_PASSWORD=hunter22x', 'hunter22x'],
+      ['vaultsecret=abcdef123456', 'abcdef123456'],
+    ] as const) {
+      expect(redactCredentials(text), text).not.toContain(secret);
+      expect(redactCredentials(text), text).toContain(REDACTION_PLACEHOLDER);
+    }
+    // A key that only starts with one, or names no secret, is left whole; so is R3's short value.
+    for (const kept of ['AccessKeyId=ASIAIOSFODNN7EXAMPLE', 'max_tokens=409600', 'tokenizer=wordpiece', 'passwordless=enabled', 'dbPassword: *****', 'hasToken: false']) {
+      expect(redactCredentials(kept), kept).toBe(kept);
+    }
+  });
+
+  it('masks an armored PGP secret key, whole and in a window that cuts its BEGIN or END line off (#427)', () => {
+    const block = '-----BEGIN PGP PRIVATE KEY BLOCK-----\n\nlQOYBGXpgpSecretBODY\n=abcd\n-----END PGP PRIVATE KEY BLOCK-----';
+    expect(redactCredentials(`before\n${block}\nafter`)).toBe(`before\n${REDACTION_PLACEHOLDER}\nafter`);
+    expect(redactCredentialWindow('lQOYBGXpgpSecretBODY\n=abcd\n-----END PGP PRIVATE KEY BLOCK-----\nafter\n')).toBe(`${REDACTION_PLACEHOLDER}\nafter\n`);
+    expect(redactCredentialWindow('before\n-----BEGIN PGP PRIVATE KEY BLOCK-----\n\nlQOYBGXpgpSecretBODY\n')).toBe(`before\n${REDACTION_PLACEHOLDER}`);
+    // A public key block is not a secret.
+    const publicKey = '-----BEGIN PGP PUBLIC KEY BLOCK-----\nmQINBGXpublic\n-----END PGP PUBLIC KEY BLOCK-----';
+    expect(redactCredentials(publicKey)).toBe(publicKey);
+  });
+
   it('masks every PRIVATE KEY header: PKCS#8\'s bare one, ENCRYPTED, OPENSSH and the algorithm-named ones (#427)', () => {
     for (const words of ['', 'ENCRYPTED ', 'OPENSSH ', 'RSA ', 'EC ', 'DSA ']) {
       const key = `-----BEGIN ${words}PRIVATE KEY-----\nMIIEsecretKEYbody\n-----END ${words}PRIVATE KEY-----`;

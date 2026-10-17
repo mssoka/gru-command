@@ -12,7 +12,7 @@ import { redactCredentials, redactCredentialWindow } from '../redaction.js';
 import { CI_EVIDENCE_OMITTED_NOTICE } from '../review-inputs/ci-evidence.js';
 import { VerificationDisposedError, VerificationLockTimeoutError, verificationEnvironment, type VerificationLease } from '../verify/scheduler.js';
 import { ONBOARDING_PROOF_SCOPE, type VerificationBudget } from '../verify/server.js';
-import { psEnumerator } from '../worktrees/manager.js';
+import { psEnumeratorAsync } from '../worktrees/manager.js';
 import { applyWorktreeManifest, loadWorktreeManifest, MANIFEST_PATH, WorktreeSetupError, type SetupStreamTail, type WorktreeManifest } from '../worktrees/manifest.js';
 import { isCommitId, readOnboardingProof, type OnboardingProofResult, type ProofPath, type ProofReclaim, type ProofSetupStep, type ProofVerify } from './proof-record.js';
 
@@ -55,9 +55,10 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * Every process the proof starts carries an environment marker
  * ({@link ONBOARDING_PROBE_ENV}). What setup starts lives through verify
  * (a service verify needs); before anything is measured, and whatever the
- * outcome, every process group setup and verify started is ended, then
- * every process still carrying the run's marker or rooted in the checkout
- * (a daemon that left its group). The checkout is removed whatever the
+ * outcome, every process group setup and verify started that is still the
+ * proof's is ended, then every process still carrying the run's marker or
+ * rooted in the checkout (a daemon that left its group), each waited for
+ * until it is gone. The checkout is removed whatever the
  * outcome; a boot ends every process carrying this instance's marker or
  * rooted under its probes folder, then any verify a crash left running,
  * and removes any checkout it left behind. The output tail and
@@ -167,19 +168,35 @@ function fromBoundary(text: string): string {
 }
 
 /** The first line of a tail that starts inside a line longer than the
- * tail: a fragment is kept rather than nothing, and says so. */
+ * tail: its words are kept rather than nothing, and it says so. */
 const MID_LINE = '(output tail starts mid-line)\n';
 
+/** What stands for a last line with no word boundary to start at: none of
+ * it is shown, since its first bytes could be the back half of a token. */
+const longLine = (bytes: number): string => `(last line longer than ${String(Math.max(1, Math.floor(bytes / 1024)))} KiB, not shown)\n`;
+
+/** The mid-line fallback, for kept bytes whose cut has no line boundary
+ * after it: everything up to and including their first whitespace is
+ * dropped (a token the cut split never shows its back half); with no
+ * whitespace followed by anything, nothing is. */
+function fromWord(kept: string): string | null {
+  const word = kept.search(/\s/u);
+  const rest = word === -1 ? '' : kept.slice(word + 1);
+  return rest.trim() === '' ? null : rest;
+}
+
 /** The last `max` UTF-8 bytes of a text, starting at a boundary. With no
- * boundary to start at (one line longer than the tail, or a text that
- * already starts mid-line), its last bytes after {@link MID_LINE}: a
- * command that printed something never records an empty tail. */
+ * line boundary to start at (one line longer than the tail), its last
+ * bytes from their first word boundary after {@link MID_LINE}, or, with
+ * none, {@link longLine}: a command that printed something never records an
+ * empty tail. `midLine`: the text already starts mid-line. */
 function boundedTail(text: string, max: number, midLine: boolean): string {
-  const bytes = Buffer.byteLength(text, 'utf8');
-  if (bytes <= max && !midLine) return text;
-  const whole = bytes <= max ? '' : fromBoundary(utf8Tail(text, max));
+  const marked = midLine ? `${MID_LINE}${text}` : text;
+  if (Buffer.byteLength(marked, 'utf8') <= max) return marked;
+  const whole = fromBoundary(utf8Tail(text, max));
   if (whole.trim() !== '' || text.trim() === '') return whole;
-  return `${MID_LINE}${utf8Tail(text, max - Buffer.byteLength(MID_LINE, 'utf8'))}`;
+  const rest = fromWord(utf8Tail(text, max - Buffer.byteLength(MID_LINE, 'utf8')));
+  return rest === null ? longLine(max) : `${MID_LINE}${rest}`;
 }
 
 /** One stream's latest output, as a command keeps it. */
@@ -190,9 +207,11 @@ type OutputWindow = SetupStreamTail;
  * redacted whole (a key whose BEGIN line fell before the window is
  * redacted from the window's start), then the last {@link OUTPUT_TAIL_BYTES}
  * cut at a line. The bound holds after redaction, and a cut never shows
- * half a credential: a window that starts mid-stream is redacted from its
- * first whole line, or, when one line fills it, whole (its start lies far
- * before the tail's) and the tail is marked as starting mid-line.
+ * half a credential: a window that starts mid-stream (cut here, or a setup
+ * stream whose earlier chunks were dropped, however short what is left) is
+ * redacted from its first whole line, or, when one line fills it, from its
+ * first word, and the tail is marked as starting mid-line; one with no word
+ * boundary at all shows none of that line ({@link longLine}).
  */
 function recordedTail(windows: readonly OutputWindow[]): string {
   let midLine = false;
@@ -202,8 +221,10 @@ function recordedTail(windows: readonly OutputWindow[]): string {
     if (!cut && !window.truncated) return redactCredentialWindow(text);
     const whole = fromBoundary(text);
     if (whole.trim() !== '' || text.trim() === '') return redactCredentialWindow(whole);
+    const rest = fromWord(text);
+    if (rest === null) return longLine(Buffer.byteLength(text, 'utf8'));
     midLine = true;
-    return redactCredentialWindow(text);
+    return redactCredentialWindow(rest);
   }).filter((text) => text !== '');
   return boundedTail(redacted.join('\n'), OUTPUT_TAIL_BYTES, midLine);
 }
@@ -268,12 +289,21 @@ async function repoConfig(repoPath: string, key: string): Promise<string | null>
   return run.stdout.trim() === '' ? null : run.stdout.trim();
 }
 
-/** The repository-local config a lane shares with its repository and an
- * LFS smudge reads: LFS, HTTP, credential and URL-rewrite settings, and
- * its origin. `lfs.storage` is resolved on its own (a relative one names a
- * folder inside the repository's git dir). */
+/** The config a lane shares with its repository and an LFS smudge and its
+ * auth read (`--list` lowercases section and name): LFS, HTTP, credential
+ * and URL-rewrite settings, its origin (`lfsurl` included), and the SSH
+ * command (a per-repository deploy key). `lfs.storage` is resolved on its
+ * own (a relative one names a folder inside the repository's git dir). */
 const sharedLaneConfig = (key: string): boolean =>
-  (/^(?:lfs|http|credential|url)\./u.test(key) && key !== 'lfs.storage') || key === 'remote.origin.url';
+  (/^(?:lfs|http|credential|url|remote\.origin)\./u.test(key) && key !== 'lfs.storage') || key === 'core.sshcommand';
+
+/** `git config --list -z` entries, in order. */
+function configEntries(listing: string): readonly { readonly key: string; readonly value: string | null }[] {
+  return listing.split('\0').filter((entry) => entry !== '').map((entry) => {
+    const at = entry.indexOf('\n');
+    return at === -1 ? { key: entry, value: null } : { key: entry.slice(0, at), value: entry.slice(at + 1) };
+  });
+}
 
 /** One config entry as git's config file spells it (`--list` gives
  * `section[.subsection].name`, the section and name lowercased): quoted
@@ -292,29 +322,40 @@ function configEntryText(key: string, value: string | null): string {
 /**
  * A head that uses Git LFS (a `.gitattributes` names `filter=lfs`) is
  * checked out as a lane's `worktree add` checks it out. A lane shares its
- * repository's config, so the probe gets every repository-local entry an
- * LFS smudge reads (its LFS, HTTP, credential and URL-rewrite settings,
- * and its origin), and its LFS store is the repository's own (its
- * `lfs.storage`, else `<common dir>/lfs`): smudge reads the local store
- * first and fetches only missing objects, with the repository's own auth,
- * into that same store. Only the probe's own config file is written, and
- * no copied value is logged or put on a command line.
+ * repository's config, so the probe gets every entry of the repository's
+ * effective config (every scope, its `include` and `includeIf` resolved
+ * against the repository's own git dir) that an LFS smudge and its auth
+ * read ({@link sharedLaneConfig}), less what the probe already reads (the
+ * user's and system config: nothing is doubled), and its LFS store is the
+ * repository's own (its `lfs.storage`, else `<common dir>/lfs`): smudge
+ * reads the local store first and fetches only missing objects, with the
+ * repository's own auth, into that same store. Only the probe's own config
+ * file is written, and no copied value is logged or put on a command line.
  */
 async function shareLfsLikeALane(repoPath: string, dir: string, head: string): Promise<void> {
   const uses = await probeGitExit(dir, ['grep', '-q', '-e', 'filter=lfs', head, '--', ':(glob)**/.gitattributes'], { timeoutMs: 120_000 });
   if (uses.code === 1) return;
   if (uses.code !== 0) throw new Error(`git grep for LFS attributes exited ${String(uses.code)}: ${oneLine(uses.stderr.trim() === '' ? '(no output)' : uses.stderr)}`);
-  const local = await probeGit(repoPath, ['config', '--local', '--list', '-z'], { env: 'lane', timeoutMs: 30_000 });
-  const entries = local.split('\0').filter((entry) => entry !== '').map((entry) => {
-    const at = entry.indexOf('\n');
-    return at === -1 ? { key: entry, value: null } : { key: entry.slice(0, at), value: entry.slice(at + 1) };
-  }).filter((entry) => sharedLaneConfig(entry.key));
+  const effective = (cwd: string): Promise<string> => probeGit(cwd, ['config', '--includes', '--list', '-z'], { env: 'lane', timeoutMs: 30_000 });
+  const entries = configEntries(await effective(repoPath)).filter((entry) => sharedLaneConfig(entry.key));
   const commonDir = resolve(repoPath, (await probeGit(repoPath, ['rev-parse', '--git-common-dir'], { env: 'lane', timeoutMs: 30_000 })).trim());
   const storage = await repoConfig(repoPath, 'lfs.storage');
   // The clone's own origin is the managed repository's path: the
   // repository's origin, when it has one, replaces it.
   if (entries.some((entry) => entry.key === 'remote.origin.url')) await probeGit(dir, ['config', '--unset-all', 'remote.origin.url']);
-  const copied = [...entries, { key: 'lfs.storage', value: storage === null ? join(commonDir, 'lfs') : resolve(commonDir, storage) }];
+  // What the probe reads already (the user's and system config, the
+  // clone's own) is not copied again: a doubled `http.extraheader` would
+  // send its header twice.
+  const held = new Map<string, number>();
+  const id = (entry: { readonly key: string; readonly value: string | null }): string => `${entry.key}\0${entry.value ?? '\0'}`;
+  for (const entry of configEntries(await effective(dir))) held.set(id(entry), (held.get(id(entry)) ?? 0) + 1);
+  const added = entries.filter((entry) => {
+    const count = held.get(id(entry)) ?? 0;
+    if (count === 0) return true;
+    held.set(id(entry), count - 1);
+    return false;
+  });
+  const copied = [...added, { key: 'lfs.storage', value: storage === null ? join(commonDir, 'lfs') : resolve(commonDir, storage) }];
   await appendFile(join(dir, '.git', 'config'), copied.map((entry) => configEntryText(entry.key, entry.value)).join(''), 'utf8');
 }
 
@@ -458,13 +499,101 @@ function signalProcess(target: number, signal: NodeJS.Signals | 0): boolean {
   }
 }
 
-/** End processes or groups: SIGTERM, then SIGKILL to what still lives after the grace. */
-async function endProcesses(targets: readonly number[], graceMs: number): Promise<void> {
-  const living = targets.filter((target) => signalProcess(target, 'SIGTERM'));
-  const deadline = Date.now() + graceMs;
-  while (living.some((target) => signalProcess(target, 0)) && Date.now() < deadline) await new Promise((wake) => { setTimeout(wake, 25); });
-  for (const target of living) signalProcess(target, 'SIGKILL');
+const pause = (ms: number): Promise<void> => new Promise((wake) => { setTimeout(wake, ms); });
+
+/** How long a listing of processes may run before it counts as failed. */
+const LISTING_TIMEOUT_MS = 30_000;
+/** How long {@link endProcesses} waits for what it SIGKILLed to be gone. */
+const KILL_SETTLE_MS = 5_000;
+
+/** One process as the process table shows it. */
+interface ProcessRow {
+  readonly pid: number;
+  /** Ended and not yet reaped: it counts as gone. */
+  readonly zombie: boolean;
 }
+
+/** Linux: each `/proc/<pid>/stat`'s state and process group (of `pids`,
+ * else of every process), read after the command name's last `)` (a name
+ * may hold spaces or parentheses). */
+async function procRows(keep: (pid: number, pgid: number) => boolean, pids?: readonly number[]): Promise<readonly ProcessRow[]> {
+  const rows: ProcessRow[] = [];
+  for (const name of pids?.map(String) ?? await readdir('/proc')) {
+    if (!/^\d+$/u.test(name)) continue;
+    let stat: string;
+    try {
+      stat = await readFile(join('/proc', name, 'stat'), 'utf8');
+    } catch {
+      continue; // ended meanwhile
+    }
+    const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+    if (keep(Number(name), Number(fields[2]))) rows.push({ pid: Number(name), zombie: fields[0] === 'Z' });
+  }
+  return rows;
+}
+
+/** Elsewhere: `ps -o pid=,stat= <selection>`. Exit 1 with no output is no
+ * process (macOS `ps` answers so when none is selected). */
+function psRows(selection: readonly string[]): Promise<readonly ProcessRow[]> {
+  return new Promise((resolveRows, reject) => {
+    execFile('ps', ['-o', 'pid=,stat=', ...selection], { encoding: 'utf8', timeout: LISTING_TIMEOUT_MS }, (error, stdout, stderr) => {
+      if (error !== null && !(error.code === 1 && stdout.trim() === '' && stderr.trim() === '')) {
+        reject(new Error(`ps could not list ${selection.join(' ')}: ${oneLine(error)}`));
+        return;
+      }
+      resolveRows(stdout.split('\n').flatMap((line) => {
+        const row = /^\s*(\d+)\s+(\S+)/u.exec(line);
+        return row === null ? [] : [{ pid: Number(row[1]), zombie: row[2]!.startsWith('Z') }];
+      }));
+    });
+  });
+}
+
+/** The members of a process group (Linux `/proc`, elsewhere
+ * `ps -o pid= -g <pgid>`). Throws when they cannot be listed. */
+function groupMembers(pgid: number): Promise<readonly ProcessRow[]> {
+  return process.platform === 'linux' ? procRows((_pid, group) => group === pgid) : psRows(['-g', String(pgid)]);
+}
+
+/** Whether a process (a pid) or a whole group (a negated pgid) is gone:
+ * nothing by that id lives, or all that does is a zombie. A table that
+ * cannot be read leaves it living. */
+async function gone(target: number): Promise<boolean> {
+  if (!signalProcess(target, 0)) return true;
+  try {
+    const rows = target < 0
+      ? await groupMembers(-target)
+      : process.platform === 'linux' ? await procRows(() => true, [target]) : await psRows(['-p', String(target)]);
+    return rows.every((row) => row.zombie);
+  } catch {
+    return false;
+  }
+}
+
+/** The targets still not gone. */
+async function living(targets: readonly number[]): Promise<readonly number[]> {
+  const left: number[] = [];
+  for (const target of targets) if (!(await gone(target))) left.push(target);
+  return left;
+}
+
+/** End processes or groups: SIGTERM, then SIGKILL to what still lives after
+ * the grace, then wait (bounded) until every SIGKILLed target is gone, a
+ * zombie counting as gone, so a caller that judges them next sees them
+ * gone. Returns what is still there after that bound. */
+async function endProcesses(targets: readonly number[], graceMs: number): Promise<readonly number[]> {
+  let left: readonly number[] = targets.filter((target) => signalProcess(target, 'SIGTERM'));
+  const deadline = Date.now() + graceMs;
+  while ((left = await living(left)).length > 0 && Date.now() < deadline) await pause(25);
+  for (const target of left) signalProcess(target, 'SIGKILL');
+  const settled = Date.now() + KILL_SETTLE_MS;
+  while ((left = await living(left)).length > 0 && Date.now() < settled) await pause(25);
+  return left;
+}
+
+/** Same-user processes whose environment could not be read, already logged
+ * (each once). */
+const unreadableLogged = new Set<number>();
 
 /** The pids (never this process's own) whose environment carries a probe
  * marker `matches` accepts. Linux reads each `/proc/<pid>/environ` (what
@@ -472,9 +601,10 @@ async function endProcesses(targets: readonly number[], graceMs: number): Promis
  * command (on macOS `-E` shows the environment; `-e` selects every
  * process). A process that scrubbed its environment is never found, nor is
  * any where the platform hides other processes' environments (current
- * macOS shows a process only its own). Throws when processes cannot be
- * listed. */
-async function markedProcesses(matches: (marker: string) => boolean): Promise<readonly number[]> {
+ * macOS shows a process only its own), nor, on Linux, one of this user's
+ * whose environment cannot be read (non-dumpable: ssh-agent, gpg-agent),
+ * which is logged once at warn. Throws when processes cannot be listed. */
+async function markedProcesses(matches: (marker: string) => boolean, log: Log): Promise<readonly number[]> {
   const prefix = `${ONBOARDING_PROBE_ENV}=`;
   const marked = (entries: readonly string[]): boolean => entries.some((entry) => entry.startsWith(prefix) && matches(entry.slice(prefix.length)));
   const pids: number[] = [];
@@ -484,7 +614,11 @@ async function markedProcesses(matches: (marker: string) => boolean): Promise<re
       let environ: string;
       try {
         environ = await readFile(join('/proc', name, 'environ'), 'utf8');
-      } catch {
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'EACCES' && !unreadableLogged.has(Number(name)) && await ownedByThisUser(Number(name))) {
+          unreadableLogged.add(Number(name));
+          log('warn', 'onboarding proof: a process of this user hides its environment (non-dumpable, as ssh-agent is), so its marker cannot be read; if a proof started it, only its process group or its working directory in the checkout can end it', { pid: Number(name) });
+        }
         continue; // ended meanwhile, or another user's
       }
       if (marked(environ.split('\0'))) pids.push(Number(name));
@@ -492,7 +626,7 @@ async function markedProcesses(matches: (marker: string) => boolean): Promise<re
     return pids;
   }
   const listing = await new Promise<string>((resolveListing, reject) => {
-    execFile('ps', ['-axEww', '-o', 'pid=,command='], { encoding: 'utf8', timeout: 30_000, maxBuffer: 256 * 1024 * 1024 }, (error, stdout) => {
+    execFile('ps', ['-axEww', '-o', 'pid=,command='], { encoding: 'utf8', timeout: LISTING_TIMEOUT_MS, maxBuffer: 256 * 1024 * 1024 }, (error, stdout) => {
       if (error !== null) reject(new Error(`ps could not list processes: ${oneLine(error)}`));
       else resolveListing(stdout);
     });
@@ -505,18 +639,30 @@ async function markedProcesses(matches: (marker: string) => boolean): Promise<re
   return pids;
 }
 
+/** Linux: whether a process's real uid is this process's
+ * (`/proc/<pid>/status` stays readable when its environment is not). */
+async function ownedByThisUser(pid: number): Promise<boolean> {
+  try {
+    const uid = /^Uid:\s+(\d+)/mu.exec(await readFile(join('/proc', String(pid), 'status'), 'utf8'));
+    return uid !== null && Number(uid[1]) === process.getuid?.();
+  } catch {
+    return false;
+  }
+}
+
 /** The pids rooted under a folder: a cwd inside it, or a command line that
  * names a path inside it, as the worktree manager's sweep enumerates a
- * lane's processes (Linux `/proc`, macOS `lsof`). It finds a daemon that
- * left its group and scrubbed its environment, on every platform, while
- * its cwd stays in the folder. Throws when processes cannot be listed. */
-function rootedProcesses(folder: string): readonly number[] {
-  return psEnumerator(folder).map((entry) => entry.pid);
+ * lane's processes (Linux `/proc`, macOS `lsof`), off the event loop and
+ * bounded. It finds a daemon that left its group and scrubbed its
+ * environment, on every platform, while its cwd stays in the folder.
+ * Rejects when processes cannot be listed in time. */
+async function rootedProcesses(folder: string): Promise<readonly number[]> {
+  return (await psEnumeratorAsync(folder, { timeoutMs: LISTING_TIMEOUT_MS })).map((entry) => entry.pid);
 }
 
 /** The pids two listings name, each listed once; a listing that fails is
  * logged and the other still counts. */
-async function strayPids(listings: readonly (readonly [string, () => Promise<readonly number[]> | readonly number[]])[], log: Log, what: string): Promise<readonly number[]> {
+async function strayPids(listings: readonly (readonly [string, () => Promise<readonly number[]>])[], log: Log, what: string): Promise<readonly number[]> {
   const pids = new Set<number>();
   for (const [name, list] of listings) {
     try {
@@ -532,7 +678,9 @@ async function strayPids(listings: readonly (readonly [string, () => Promise<rea
  * setup and verify command leads its own process group. */
 class ProofProcesses {
   readonly marker: string;
-  private readonly groups = new Set<number>();
+  /** Each tracked group's pgid, with the members it had when its command
+   * exited (null until then, or when they could not be listed). */
+  private readonly groups = new Map<number, ReadonlySet<number> | null>();
   private ended = false;
 
   constructor(probesDir: string, private readonly dir: string, private readonly graceMs: number, private readonly log: Log) {
@@ -545,26 +693,77 @@ class ProofProcesses {
 
   /** A setup or verify command's pid, which leads its own process group. */
   group(pid: number): void {
-    this.groups.add(pid);
+    this.groups.set(pid, null);
+  }
+
+  /** Right after a command exited: a group with no member left is no
+   * longer tracked (its pgid may be reused by anyone's), and one that has
+   * members (a service setup started) remembers them. */
+  async settle(): Promise<void> {
+    for (const [pgid, known] of this.groups) {
+      if (known !== null) continue;
+      if (!signalProcess(-pgid, 0)) {
+        this.groups.delete(pgid);
+        continue;
+      }
+      try {
+        const members = (await groupMembers(pgid)).filter((member) => !member.zombie).map((member) => member.pid);
+        if (members.length === 0) this.groups.delete(pgid);
+        else this.groups.set(pgid, new Set(members));
+      } catch (error) {
+        this.log('error', 'onboarding proof: the members of a process group it started could not be listed; at its end the group is signalled only if a member carries its marker or is rooted in its checkout', { pgid, error: oneLine(error) });
+      }
+    }
+  }
+
+  /** The pids carrying the run's marker or rooted in the checkout; a
+   * listing that fails is logged and the other still counts. */
+  private ours(what: string): Promise<readonly number[]> {
+    return strayPids([
+      ['the processes carrying its marker', () => markedProcesses((marker) => marker === this.marker, this.log)],
+      ['the processes rooted in its checkout', () => rootedProcesses(this.dir)],
+    ], this.log, what);
   }
 
   /** Before anything is measured, and whatever the outcome: every process
-   * group setup and verify started, then every process still carrying the
-   * run's marker or rooted in the checkout (a daemon that left its group:
-   * `setsid`, a double fork), SIGTERM and then SIGKILL after the grace.
-   * Once: nothing the proof runs afterwards carries the marker or starts
-   * in the checkout before it is measured and removed. */
+   * group setup and verify started that is still the proof's (one of its
+   * members was in it when its command exited, carries the run's marker or
+   * is rooted in the checkout: a group whose pgid was reused is never
+   * signalled), then every process still carrying the run's marker or
+   * rooted in the checkout (a daemon that left its group: `setsid`, a
+   * double fork), SIGTERM and then SIGKILL after the grace, waiting until
+   * they are gone. Once: nothing the proof runs afterwards carries the
+   * marker or starts in the checkout before it is measured and removed. */
   async end(): Promise<void> {
     if (this.ended) return;
     this.ended = true;
-    await endProcesses([...this.groups].map((pid) => -pid), this.graceMs);
-    const strays = await strayPids([
-      ['the processes carrying its marker', () => markedProcesses((marker) => marker === this.marker)],
-      ['the processes rooted in its checkout', () => rootedProcesses(this.dir)],
-    ], this.log, 'a daemon that left its process group may outlive the proof');
+    const targets: number[] = [];
+    let ours: ReadonlySet<number> | null = null;
+    for (const [pgid, known] of this.groups) {
+      if (!signalProcess(-pgid, 0)) continue;
+      let members: readonly ProcessRow[];
+      try {
+        members = await groupMembers(pgid);
+      } catch (error) {
+        this.log('error', 'onboarding proof: the members of a process group it started could not be listed, so the group is not signalled', { pgid, error: oneLine(error) });
+        continue;
+      }
+      if (!members.some((member) => known?.has(member.pid) === true)) {
+        ours ??= new Set(await this.ours('a process group it started cannot be confirmed as its own'));
+        if (!members.some((member) => ours!.has(member.pid))) {
+          this.log('warn', 'onboarding proof: a process group it started holds none of its own processes now (its pgid may have been reused), so it is not signalled', { pgid });
+          continue;
+        }
+      }
+      targets.push(-pgid);
+    }
+    const left = await endProcesses(targets, this.graceMs);
+    if (left.length > 0) this.log('error', 'onboarding proof: process groups it started outlived SIGKILL', { pgids: left.map((target) => -target) });
+    const strays = await this.ours('a daemon that left its process group may outlive the proof');
     if (strays.length === 0) return;
     this.log('info', 'onboarding proof: ending processes that left their process group but carry its marker or are rooted in its checkout', { pids: strays });
-    await endProcesses(strays, this.graceMs);
+    const outlived = await endProcesses(strays, this.graceMs);
+    if (outlived.length > 0) this.log('error', 'onboarding proof: processes it started outlived SIGKILL', { pids: outlived });
   }
 }
 
@@ -661,10 +860,13 @@ async function prove(input: OnboardingProofInput, dir: string, log: Log, process
       setup.push({ command: entry.command, ms: Date.now() - started, ok: true });
     } catch (error) {
       setup.push({ command: entry.command, ms: Date.now() - started, ok: false });
+      await processes.settle();
       if (input.signal.aborted) throw new ProofStopping();
       const { reason, tail } = splitFailure(error);
       return proven({ failures: [`setup command ${String(index + 1)} failed: ${reason}`], setup, outputTail: tail });
     }
+    // The command's shell exited: its group is dropped if empty, else its members are remembered.
+    await processes.settle();
   }
 
   const failures: string[] = [];
@@ -675,6 +877,7 @@ async function prove(input: OnboardingProofInput, dir: string, log: Log, process
     verify = { command: null, exitCode: null, signal: null, timedOut: false, ms: 0, queuedMs: 0, workers: null, outputBytes: 0 };
   } else {
     const ran = await leasedVerify(input, dir, command, log, processes);
+    await processes.settle();
     if (ran.kind === 'deferred') return ran;
     verify = ran.verify;
     outputTail = ran.tail;
@@ -743,8 +946,8 @@ type LeasedRun =
   | { readonly kind: 'deferred'; readonly reason: string };
 
 /** `verify.full` under one slot of the global budget: GC spawns it with the
- * budget's environment and worker share, binds its pid to the slot (a
- * restart judges an orphan by that pid), bounds it by `run_timeout_ms` with
+ * budget's environment and worker share, binds its pid to the slot as the
+ * leader of its own group (a restart judges an orphan by that group), bounds it by `run_timeout_ms` with
  * a process-group kill, and releases the slot. The scheduler records nothing
  * for this scope. */
 async function leasedVerify(input: OnboardingProofInput, dir: string, command: string, log: Log, processes: ProofProcesses): Promise<LeasedRun> {
@@ -775,7 +978,7 @@ async function leasedVerify(input: OnboardingProofInput, dir: string, command: s
     const onSpawn = (pid: number, processCommand: string): void => {
       processes.group(pid);
       try {
-        budget.bindPid(lease, pid, processCommand);
+        budget.bindPid(lease, pid, processCommand, { leadsGroup: true });
       } catch (error) {
         log('error', 'onboarding proof: the verify pid could not be bound to its budget slot; a restart may release the slot early', { pid, error: oneLine(error) });
       }
@@ -904,33 +1107,45 @@ function processOf(pid: number): Promise<{ readonly pgid: number; readonly comma
  * and the service has just started, so every process carrying this
  * instance's marker, or rooted under its probes folder (a setup's service
  * or daemon, a verify, a daemon that left its group), is an orphan of a
- * crashed run: each is ended, SIGTERM and then SIGKILL after the grace.
- * Another instance's markers and probes are left alone. A failure to list
- * processes is logged, never thrown.
+ * crashed run: each is ended, SIGTERM and then SIGKILL after the grace,
+ * and waited for until it is gone (a zombie counts), so the verify judge
+ * that runs next sees it gone. Another instance's markers and probes are
+ * left alone. A failure to list processes is logged, never thrown.
  */
 export async function endOrphanedProbeProcesses(probesDir: string, log: Log = () => {}, graceMs = VERIFY_KILL_GRACE_MS): Promise<void> {
-  const instance = `${onboardingProbeInstance(probesDir)}.`;
-  const orphans = await strayPids([
-    ['the processes carrying this instance\'s marker', () => markedProcesses((marker) => marker.startsWith(instance))],
-    ['the processes rooted under the probes folder', () => rootedProcesses(probesDir)],
-  ], log, 'such an orphan an earlier run left is not ended now');
+  const orphans = await instanceProcesses(probesDir, log, 'such an orphan an earlier run left is not ended now');
   if (orphans.length === 0) return;
-  await endProcesses(orphans, graceMs);
+  const left = await endProcesses(orphans, graceMs);
   log('warn', 'onboarding proof: processes an earlier run left (they carry its marker or are rooted in its checkouts) were ended', { pids: orphans });
+  if (left.length > 0) log('error', 'onboarding proof: processes an earlier run left outlived SIGKILL', { pids: left });
+}
+
+/** The pids carrying this instance's marker or rooted under its probes
+ * folder; a listing that fails is logged and the other still counts. */
+function instanceProcesses(probesDir: string, log: Log, what: string): Promise<readonly number[]> {
+  const instance = `${onboardingProbeInstance(probesDir)}.`;
+  return strayPids([
+    ['the processes carrying this instance\'s marker', () => markedProcesses((marker) => marker.startsWith(instance), log)],
+    ['the processes rooted under the probes folder', () => rootedProcesses(probesDir)],
+  ], log, what);
 }
 
 /**
  * Boot, after {@link endOrphanedProbeProcesses}: a verify a crashed run
- * left behind still holds its budget slot (its pid was bound to it). Each
- * one whose pid is alive, leads its own process group and runs the argv
- * bound with it has that group ended (SIGKILL) and its slot released. A
- * slot is released as gone only when neither its pid nor any member of its
- * process group lives (`kill(-pgid, 0)`): a group member that outlived its
- * leader keeps the slot. A live pid that is not that verify (a recycled
- * pid) is never signalled, and a pid `ps` cannot read is an error; either
+ * left behind still holds its budget slot (its pid was bound to it, as the
+ * leader of its own process group). Each one whose pid is alive and runs
+ * the argv bound with it has that group ended and its slot released. A pid
+ * `ps` cannot read is judged again (it may have just ended). When the
+ * leader is gone (a zombie counts as gone) but a member of its group
+ * lives, the group is ended as one, once a member is confirmed the
+ * proof's (it carries this instance's marker or is rooted under its probes
+ * folder), and the slot is released once it is gone; a group none of whose
+ * members is confirmed is never signalled (its pgid may have been reused)
+ * and keeps the slot. A live pid that is not that verify (a recycled pid)
+ * is never signalled, and a pid `ps` cannot read is an error; each such
  * slot is left to the scheduler's age limit.
  */
-export async function endOrphanedProofVerifies(budget: () => VerificationBudget, log: Log = () => {}): Promise<void> {
+export async function endOrphanedProofVerifies(budget: () => VerificationBudget, probesDir: string, log: Log = () => {}, graceMs = VERIFY_KILL_GRACE_MS): Promise<void> {
   let slots: VerificationBudget;
   try {
     slots = budget();
@@ -938,33 +1153,54 @@ export async function endOrphanedProofVerifies(budget: () => VerificationBudget,
     log('warn', 'onboarding proof: the verification budget is unavailable, so a verify an earlier run left is not ended now', { error: oneLine(error) });
     return;
   }
+  let confirmed: ReadonlySet<number> | null = null;
   for (const holder of slots.restored(ONBOARDING_PROOF_SCOPE)) {
     const fields = { run: holder.lease.runId, job: holder.lease.jobId, pid: holder.pid };
     // One slot that cannot be judged never holds up the rest, or the sweep after.
     try {
-      if (!signalProcess(holder.pid, 0)) {
-        if (signalProcess(-holder.pid, 0)) {
-          log('warn', 'onboarding proof: a budget slot an earlier run left names a verify whose leader is gone but a member of its process group lives; the slot waits for the scheduler\'s age limit', fields);
+      if (!(await gone(holder.pid))) {
+        let running: { readonly pgid: number; readonly command: string } | null = null;
+        try {
+          running = await processOf(holder.pid);
+        } catch (error) {
+          // It may have ended while `ps` ran: judged as gone only if it is.
+          if (!(await gone(holder.pid))) throw error;
+        }
+        if (running !== null) {
+          if (running.pgid !== holder.pid || holder.processCommand === null || running.command !== holder.processCommand) {
+            log('warn', 'onboarding proof: a budget slot an earlier run left names a live pid that is not its verify; the pid is not signalled and the slot waits for the scheduler\'s age limit', {
+              ...fields, recorded: holder.processCommand, running: running.command,
+            });
+            continue;
+          }
+          if ((await endProcesses([-holder.pid], 0)).length > 0) {
+            log('error', 'onboarding proof: a verify an earlier run left running outlived SIGKILL; its slot waits for the scheduler\'s age limit', fields);
+            continue;
+          }
+          slots.release(holder.lease);
+          log('warn', 'onboarding proof: a verify an earlier run left running was ended and its budget slot released', fields);
+          continue;
+        }
+      }
+      if (!(await gone(-holder.pid))) {
+        // Its leader is gone and a member of its group lives: ended as a
+        // group only once a member is confirmed the proof's.
+        const members = await groupMembers(holder.pid);
+        confirmed ??= new Set(await instanceProcesses(probesDir, log, 'a verify group an earlier run left cannot be confirmed as its own'));
+        if (!members.some((member) => !member.zombie && confirmed!.has(member.pid))) {
+          log('warn', 'onboarding proof: a budget slot an earlier run left names a verify whose leader is gone while members of its process group live, none of them confirmed the proof\'s (its marker, or rooted under its probes folder); the group is not signalled and the slot waits for the scheduler\'s age limit', fields);
+          continue;
+        }
+        if ((await endProcesses([-holder.pid], graceMs)).length > 0) {
+          log('error', 'onboarding proof: the process group of a verify an earlier run left outlived SIGKILL; its slot waits for the scheduler\'s age limit', fields);
           continue;
         }
         slots.release(holder.lease);
-        log('warn', 'onboarding proof: a budget slot an earlier run left was released; its verify is gone', fields);
+        log('warn', 'onboarding proof: a verify an earlier run left had lost its leader; its process group, confirmed the proof\'s, was ended and its budget slot released', fields);
         continue;
-      }
-      const running = await processOf(holder.pid);
-      if (running.pgid !== holder.pid || holder.processCommand === null || running.command !== holder.processCommand) {
-        log('warn', 'onboarding proof: a budget slot an earlier run left names a live pid that is not its verify; the pid is not signalled and the slot waits for the scheduler\'s age limit', {
-          ...fields, recorded: holder.processCommand, running: running.command,
-        });
-        continue;
-      }
-      try {
-        process.kill(-holder.pid, 'SIGKILL');
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
       }
       slots.release(holder.lease);
-      log('warn', 'onboarding proof: a verify an earlier run left running was ended and its budget slot released', fields);
+      log('warn', 'onboarding proof: a budget slot an earlier run left was released; its verify is gone', fields);
     } catch (error) {
       log('error', 'onboarding proof: a verify an earlier run left could not be judged or ended; its slot waits for the scheduler\'s age limit', { ...fields, error: oneLine(error) });
     }
@@ -982,6 +1218,10 @@ export async function endOrphanedProofVerifies(budget: () => VerificationBudget,
  * job and head are public, the nonce is not until GC posts it, so no one
  * else can post a comment GC would take as its own. */
 export const onboardingProofMarker = (jobId: string, head: string, nonce: string): string => `<!-- gru:onboarding-proof job=${jobId} head=${head} nonce=${nonce} -->`;
+
+/** The marker a build before the nonce posted: an attempt it recorded (with
+ * no nonce) still finds its comment by it after an upgrade. Never posted. */
+export const onboardingProofLegacyMarker = (jobId: string, head: string): string => `<!-- gru:onboarding-proof job=${jobId} head=${head} -->`;
 
 /** A fresh nonce for one comment attempt's marker. */
 export const onboardingProofCommentNonce = (): string => randomBytes(8).toString('hex');

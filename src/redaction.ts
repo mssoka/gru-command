@@ -23,19 +23,26 @@ const keepPrefix = (_match: string, prefix: string): string => `${prefix}${REDAC
  * digit, so a diagnostic such as `Unexpected token: ')'` is left whole. */
 const KEYWORD_VALUE = '(?:"(?=[^"]*[A-Za-z0-9])[^"]{6,}"|\'(?=[^\']*[A-Za-z0-9])[^\']{6,}\'|(?=[^\\s`\'"]*[A-Za-z0-9])[^\\s`\'"]{6,})';
 
-/** The keys whose assigned value is a credential, longest first (`_` or
- * `-` between words, any case): AWS's secret access key, a private key in
- * JSON (a service-account file), kubeconfig's client key data. */
+/** The keys whose assigned value is a credential, longest first (`_`, `-`
+ * or nothing between words, any case, so camelCase too): AWS's secret
+ * access key, a private key in JSON (a service-account file), kubeconfig's
+ * client key data. Each starts its identifier. */
 const KEYWORD_KEYS = [
-  'aws[_-]secret[_-]access[_-]key', 'secret[_-]access[_-]key', 'private[_-]key', 'client[_-]key[_-]data',
+  'aws[_-]?secret[_-]?access[_-]?key', 'secret[_-]?access[_-]?key', 'private[_-]?key', 'client[_-]?key[_-]?data',
   'api[_-]?key', 'access[_-]?token', 'auth[_-]?token', 'client[_-]?secret', 'refresh[_-]?token', 'secret[_-]?key', 'api[_-]?secret',
   'password', 'secret', 'token',
 ].join('|');
 
+/** The keys that are a credential's however the identifier begins, as long
+ * as they end it (`PGPASSWORD`, `dbPassword`, `githubToken`, AWS STS's
+ * `SessionToken` and `SecretAccessKey`). A key that only starts with one of
+ * them (`tokens`, `AccessKeyId`) is not one. */
+const KEYWORD_ENDINGS = ['secret[_-]?access[_-]?key', 'password', 'token', 'secret'].join('|');
+
 /** A PEM private key header or footer word run: `PRIVATE KEY` alone
  * (PKCS#8), or after algorithm and format words (`RSA`, `EC`, `OPENSSH`,
- * `ENCRYPTED`). */
-const PEM_WORDS = '(?:[A-Z0-9]+ )*PRIVATE KEY';
+ * `ENCRYPTED`); and an armored PGP secret key's `PGP PRIVATE KEY BLOCK`. */
+const PEM_WORDS = '(?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?';
 
 const PATTERNS: readonly (readonly [RegExp, (match: string, ...groups: string[]) => string])[] = [
   [new RegExp(`-----BEGIN ${PEM_WORDS}-----[\\s\\S]*?-----END ${PEM_WORDS}-----`, 'gu'), redaction],
@@ -52,7 +59,7 @@ const PATTERNS: readonly (readonly [RegExp, (match: string, ...groups: string[])
   // An `.npmrc` registry credential: `//registry.example/:_authToken=…`.
   [/(\/\/\S*:_(?:authToken|auth|password)\s*=\s*)\S+/gu, keepPrefix],
   // A key, then an optional closing quote (JSON's `"password": "…"`), then `:` or `=`.
-  [new RegExp(`(?<![A-Za-z0-9])(?:${KEYWORD_KEYS})["']?\\s*[:=]\\s*${KEYWORD_VALUE}`, 'giu'), redaction],
+  [new RegExp(`(?<![A-Za-z0-9])(?:${KEYWORD_KEYS}|[A-Za-z0-9]*?(?:${KEYWORD_ENDINGS}))["']?\\s*[:=]\\s*${KEYWORD_VALUE}`, 'giu'), redaction],
   [/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/gu, redaction],
 ];
 

@@ -8297,8 +8297,9 @@ describe('repair pass 3: publication completeness, GitLab wording, and v2 integr
         specialists: [],
         // Assembled body stays under the limit; the fixed [REDACTED]
         // placeholders expand it past it — the POSTED bytes are what the
-        // bound must govern.
-        transformReport: (report) => `${report}\n${'token=x '.repeat(7_000)}\n`,
+        // bound must govern. URL userinfo still expands: a keyword value
+        // needs six characters (#427), so `token=x` no longer would.
+        transformReport: (report) => `${report}\n${'https://u:p@h '.repeat(4_000)}\n`,
       }).spawner,
       poster, reviewArtifactRoot: artifacts,
       prHeadProbe: localHeadProbe('feature/p3-redact-overflow'),

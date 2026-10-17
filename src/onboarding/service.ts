@@ -21,6 +21,7 @@ import {
   endOrphanedProbeProcesses,
   endOrphanedProofVerifies,
   onboardingProofCommentNonce,
+  onboardingProofLegacyMarker,
   onboardingProofMarker,
   onboardingProofPayload,
   renderOnboardingProofComment,
@@ -82,8 +83,9 @@ export const ONBOARDING_PROOF_DIRECTIVE_REFUSALS_FOR_GRU = 3;
 export const ONBOARDING_PROOF_COMMENT_ATTEMPTS = 3;
 /** GitHub statuses that refuse a comment for good (forbidden, gone,
  * unprocessable): recorded as one that cannot be posted at once, never
- * retried. A rate limit never is, whatever its status (a secondary limit
- * answers 403): it counts as a failed attempt. */
+ * retried. Throttling never is, whatever its status (a secondary limit or
+ * the abuse detection answers 403, content created too fast 422): it is
+ * retried at every reconcile and never counts as a failed attempt. */
 export const ONBOARDING_PROOF_COMMENT_REFUSED_STATUSES: readonly number[] = [403, 404, 410, 422];
 
 /** Why a head is stuck, in the order a row names them (the first is the row's reason). */
@@ -693,7 +695,7 @@ export class OnboardingService {
   private sweepProbes(proof: OnboardingProofOptions): void {
     this.queueProof(async () => {
       await endOrphanedProbeProcesses(proof.probesDir, this.log);
-      await endOrphanedProofVerifies(proof.budget, this.log);
+      await endOrphanedProofVerifies(proof.budget, proof.probesDir, this.log);
       await sweepOnboardingProbes(proof.probesDir, this.log);
     });
   }
@@ -873,12 +875,13 @@ export class OnboardingService {
    * Gru's rows for the job: at most one open row per (job, head), for the
    * head's current episode, naming its current reason. A row closes when the
    * job ends, the head's proof passes, a newer head is delivered, its reason
-   * gives way to another (a new row names that one), the head is no longer
-   * stuck for any reason (a directive the lane now admitted, a deferral
-   * whose head was proven), or, for a deferral, once the head is proven. A
-   * later episode of the same head (a re-delivery after its row closed), or
-   * a reason that holds again after its row closed, gets a new row; no id
-   * is posted twice.
+   * gives way to another (a new row names that one), or the head is stuck
+   * for no reason and its own is known to have cleared (reasonCleared: a
+   * directive the lane now admitted, a deferral whose head was proven). A
+   * restart, which empties the in-memory counts, closes nothing. A later
+   * episode of the same head (a re-delivery after its row closed), or a
+   * reason that holds again after its row closed, gets a new row; no id is
+   * posted twice.
    */
   private attend(repo: string, jobId: string, debt: OnboardingProofDebt | null, current: ProofRecord | null, directive: DirectiveStanding | null): void {
     if (debt === null) {
@@ -892,8 +895,10 @@ export class OnboardingService {
     const reasons = this.stuckReasons(repo, jobId, debt, current, directive);
     const first = reasons[0];
     if (first === undefined) {
-      // Whatever its reason, a row of this head whose reason no longer holds closes.
-      this.closeRows(jobId, (row) => row.head === head, 'the head is no longer stuck');
+      // A row of this head closes only once its reason is known to have
+      // cleared; with no reason and no known clear it stays as it is.
+      const newestSeq = this.opts.ledger.newestDeliveredHead(jobId)?.seq ?? 0;
+      this.closeRows(jobId, (row) => row.head === head && this.reasonCleared(jobId, row, directive, newestSeq), 'the head is no longer stuck');
       return;
     }
     this.closeRows(jobId, (row) => row.reason !== first.reason, `the head is stuck for another reason now (${first.reason})`);
@@ -934,6 +939,30 @@ export class OnboardingService {
     this.log('error', 'onboarding proof is stuck; Gru has a row', { repo, job: jobId, head, notification: id, reason: first.reason });
   }
 
+  /**
+   * Whether a row's reason is known to have cleared, on a head stuck for no
+   * reason now (its proof, the head moving on and the job ending close
+   * rows before this). A reason whose evidence lives only in this
+   * process's memory never clears because a restart emptied it: a deferral
+   * clears only on a proof of its head; an unadmitted directive once the
+   * lane admitted it (live or settled); an unanswered failure on a newer
+   * delivery or a new directive turn on the job. The other reasons rest on
+   * the ledger, so holding no more is their clear.
+   */
+  private reasonCleared(jobId: string, row: ProofAttentionRow, directive: DirectiveStanding | null, newestSeq: number): boolean {
+    switch (row.reason) {
+      case 'deferred':
+        return false;
+      case 'unadmitted':
+        return directive === 'live' || directive === 'settled';
+      case 'unanswered':
+        return newestSeq > row.deliverySeq || directive === 'live' ||
+          this.opts.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length > 0;
+      default:
+        return true;
+    }
+  }
+
   /** A failed head's directive settled while the newest delivery still
    * names that head: true from the reconcile after the one that first saw it. */
   private settledAgain(jobId: string, head: string): boolean {
@@ -965,8 +994,11 @@ export class OnboardingService {
    * times in this process, counted once per reconcile (a failed
    * lookup counts, and never leads to a blind post), is recorded as one
    * that cannot be posted; so, at once, is an unreadable record or one
-   * GitHub refuses for good ({@link ONBOARDING_PROOF_COMMENT_REFUSED_STATUSES};
-   * a rate limit never is). */
+   * GitHub refuses for good ({@link ONBOARDING_PROOF_COMMENT_REFUSED_STATUSES}).
+   * Throttling (a rate limit, the abuse detection, content created too
+   * fast) is retried at every reconcile and spends no attempt. An attempt
+   * recorded before markers carried a nonce is looked up by the marker that
+   * build posted ({@link onboardingProofLegacyMarker}). */
   private async commentProof(record: ProofRecord, proof: OnboardingProofOptions): Promise<void> {
     if (record.comment !== null) return;
     const { repo, jobId, head } = record;
@@ -985,8 +1017,11 @@ export class OnboardingService {
     const target = { repo: { host: pr.host, owner: pr.owner, repo: pr.repo }, number: pr.number };
     const key = `${jobId}\n${head}`;
     try {
-      if (record.attemptNonces.length > 0) {
-        const markers = record.attemptNonces.map((nonce) => onboardingProofMarker(jobId, head, nonce));
+      if (record.attemptNonces.length > 0 || record.legacyAttempt) {
+        const markers = [
+          ...record.attemptNonces.map((nonce) => onboardingProofMarker(jobId, head, nonce)),
+          ...(record.legacyAttempt ? [onboardingProofLegacyMarker(jobId, head)] : []),
+        ];
         const found = await this.markedComment(target, markers, proof);
         if (found !== null) {
           this.store.record(ONBOARDING_EVENTS.proofCommented, { repo, job_id: jobId, head, comment_id: found.id, comment_url: found.url,
@@ -1002,8 +1037,14 @@ export class OnboardingService {
       this.commentAttempts.delete(key);
     } catch (error) {
       const reason = redactCredentials(oneLineErrorText(error instanceof Error ? error.message : error, 400));
+      if (ghRateLimited(error)) {
+        // Throttling clears on its own: retried at every reconcile, and it
+        // never spends an attempt.
+        this.log('warn', 'onboarding proof comment not posted: GitHub is throttling GC; the next reconcile retries it (no attempt spent)', { repo, job: jobId, head, error: reason });
+        return;
+      }
       const status = ghHttpStatus(error);
-      const refused = !ghRateLimited(error) && status !== null && ONBOARDING_PROOF_COMMENT_REFUSED_STATUSES.includes(status);
+      const refused = status !== null && ONBOARDING_PROOF_COMMENT_REFUSED_STATUSES.includes(status);
       const attempts = this.spaced(this.commentAttempts.get(key));
       if (!refused && attempts.count < ONBOARDING_PROOF_COMMENT_ATTEMPTS) {
         this.commentAttempts.set(key, attempts);
@@ -1024,8 +1065,9 @@ export class OnboardingService {
    * marker (after leading whitespace) of one of the head's recorded
    * attempts, nonce included. A comment with the job and head but no or
    * another nonce, a quote of the marker (`> <!-- …`) or a mention of it
-   * mid-body is someone else's. No author is asked: the gh login can
-   * change, and an app token has none. */
+   * mid-body is someone else's; only an attempt an older build recorded,
+   * with no nonce, accepts that build's marker. No author is asked: the gh
+   * login can change, and an app token has none. */
   private async markedComment(target: { readonly repo: RepoRef; readonly number: number }, markers: readonly string[], proof: OnboardingProofOptions): Promise<GhIssueComment | null> {
     return (await proof.github.listIssueComments(target)).find((comment) => markers.some((marker) => comment.body.trimStart().startsWith(marker))) ?? null;
   }
@@ -1038,6 +1080,7 @@ export class OnboardingService {
    * telling stands. */
   private directSoon(record: ProofRecord & { readonly result: OnboardingProofResult }, proof: OnboardingProofOptions): DirectiveStanding {
     const { jobId, head } = record;
+    const key = `${jobId}\n${head}`;
     let requestId: string | null = null;
     for (let attempt = 1; attempt <= ONBOARDING_PROOF_DIRECTIVE_ATTEMPTS; attempt += 1) {
       const id = onboardingProofDirectiveId(jobId, head, attempt);
@@ -1048,15 +1091,18 @@ export class OnboardingService {
       }
       // Retired: the writer stopped with no terminal receipt, and a
       // continuation hold may keep automation off the lane. Settled or
-      // live: told, or being told.
+      // live: told, or being told; the lane admitted it, so the refusals
+      // before it count no more.
       if (row.state === 'retired') return 'retired';
-      if (row.state !== 'failed') return (LIVE_DIRECTIVE_STATES as readonly string[]).includes(row.state) ? 'live' : 'settled';
+      if (row.state !== 'failed') {
+        this.directRefusals.delete(key);
+        return (LIVE_DIRECTIVE_STATES as readonly string[]).includes(row.state) ? 'live' : 'settled';
+      }
     }
     if (requestId === null) return 'exhausted';
     if (this.directing.has(jobId) || this.abort.signal.aborted) return 'asking';
     this.directing.add(jobId);
     const sent = requestId;
-    const key = `${jobId}\n${head}`;
     this.track(proof.direct({ jobId, requestId: sent, directive: renderOnboardingProofDirective(record.result), signal: this.abort.signal })
       .then(() => {
         this.directRefusals.delete(key);
@@ -1064,8 +1110,10 @@ export class OnboardingService {
       })
       .catch((error: unknown) => {
         const reason = redactCredentials(oneLineErrorText(error instanceof Error ? error.message : error, 400));
-        // Refused before any row: nothing was accepted, so it counts.
+        // Refused before any row: nothing was accepted, so it counts. A row
+        // means the lane admitted it: the refusals before it count no more.
         if (this.opts.ledger.getDirective(sent) === null) this.directRefusals.set(key, { reason, ...this.spaced(this.directRefusals.get(key)) });
+        else this.directRefusals.delete(key);
         this.log('warn', 'onboarding proof: the failure could not be sent to the minion; the next reconcile retries it', { job: jobId, head, request: sent, error: reason });
       })
       .finally(() => this.directing.delete(jobId)));

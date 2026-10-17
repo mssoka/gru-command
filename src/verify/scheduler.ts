@@ -313,6 +313,9 @@ interface PersistedSlot {
   /** The argv a holder that spawns its own command bound with its pid
    * (#427 onboarding proof): the pid's command evidence after a restart. */
   readonly process_command?: string | null;
+  /** The bound pid leads its own process group: the holder lives while
+   * any member of that group does. */
+  readonly process_group?: boolean;
 }
 
 interface PersistedAttempt {
@@ -405,6 +408,8 @@ interface ActiveSlot {
   pid: number | null;
   /** The argv bound with {@link VerificationScheduler.bindPid}, else null. */
   processCommand: string | null;
+  /** The bound pid leads its own process group (judged by the group). */
+  leadsGroup: boolean;
   child: ChildProcess | null;
   /** Client request identities bound to this holder. */
   requestIds: readonly string[];
@@ -556,6 +561,18 @@ export function pidAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/** Does any member of a process group exist (`kill(-pgid, 0)`)? EPERM
+ * also proves existence. */
+function groupAlive(pgid: number): boolean {
+  if (!Number.isInteger(pgid) || pgid <= 1) return false;
+  try {
+    process.kill(-pgid, 0);
     return true;
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === 'EPERM';
@@ -827,6 +844,7 @@ export class VerificationScheduler {
         },
         pid: slot.pid,
         processCommand: slot.process_command ?? null,
+        leadsGroup: slot.process_group === true,
         owned: false,
         child: null,
         requestIds: slot.request_ids ?? [],
@@ -866,7 +884,9 @@ export class VerificationScheduler {
       let reason: StaleRelease['reason'] | null = null;
       if (slot.pid === null) {
         reason = 'no-runner';
-      } else if (!pidAlive(slot.pid)) {
+      } else if (!pidAlive(slot.pid) && !(slot.leadsGroup && groupAlive(slot.pid))) {
+        // A holder that leads its own group lives while any member does: a
+        // command its leader started may outlive it (#427 onboarding proof).
         reason = 'holder-dead';
       } else if (ageMs > this.staleMaxAgeMs) {
         reason = 'max-age';
@@ -930,6 +950,7 @@ export class VerificationScheduler {
         owned: true,
         pid: null,
         processCommand: null,
+        leadsGroup: false,
         child: null,
         requestIds: spec.requestId === undefined ? [] : [spec.requestId],
       });
@@ -1017,14 +1038,17 @@ export class VerificationScheduler {
    * the lease's slot, persisted as {@link run} records its child: a restart
    * then judges the loaded slot by that pid's liveness (holder-dead, or
    * max-age) instead of releasing it as `no-runner` while the command may
-   * still run. A slot already released holds nothing to bind.
+   * still run. `leadsGroup`: the pid leads its own process group, so the
+   * slot is judged by the group (`kill(-pgid, 0)`): a member that outlived
+   * its leader keeps it held. A slot already released holds nothing to bind.
    */
-  bindPid(lease: VerificationLease, pid: number, processCommand: string): void {
+  bindPid(lease: VerificationLease, pid: number, processCommand: string, opts: { readonly leadsGroup?: boolean } = {}): void {
     if (!Number.isInteger(pid) || pid <= 0) throw new Error(`a verification slot binds a positive integer pid, got ${String(pid)}`);
     const slot = this.slots.get(lease.runId);
     if (slot === undefined) return;
     slot.pid = pid;
     slot.processCommand = processCommand;
+    slot.leadsGroup = opts.leadsGroup === true;
     this.persistBestEffort();
   }
 
@@ -1803,6 +1827,7 @@ export class VerificationScheduler {
         owned: true,
         pid: null,
         processCommand: null,
+        leadsGroup: false,
         child: null,
         requestIds: waiter.spec.requestId === undefined ? [] : [waiter.spec.requestId],
       });
@@ -2190,6 +2215,7 @@ export class VerificationScheduler {
         request_ids: slot.requestIds,
         granted_at: slot.lease.grantedAt,
         ...(slot.processCommand === null ? {} : { process_command: slot.processCommand }),
+        ...(slot.leadsGroup ? { process_group: true } : {}),
       })),
       attempts: this.persistedAttempts(),
     };

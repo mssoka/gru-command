@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -15,7 +15,7 @@ import {
   laneIsBusy,
 } from '../src/dispatch/branch-idle.js';
 import { GhApiError, type GhIssueComment, type RepoRef } from '../src/dispatch/github-poll.js';
-import { WaveRunner, type WaveRunnerOptions } from '../src/dispatch/perkins.js';
+import { FALLBACK_ONBOARDING_PROOF_HINT, FALLBACK_ONBOARDING_PROOF_REQUIRED, WaveRunner, type WaveRunnerOptions } from '../src/dispatch/perkins.js';
 import type { FallbackFinding } from '../src/dispatch/review-path.js';
 import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
 import { EventBus } from '../src/events/bus.js';
@@ -27,6 +27,7 @@ import { writeOnboardingConsent, onboardingConsentPath } from '../src/onboarding
 import { ONBOARDING_EVENTS, OnboardingLedger } from '../src/onboarding/ledger.js';
 import {
   appendOnboardingProof,
+  endOrphanedProbeProcesses,
   endOrphanedProofVerifies,
   ONBOARDING_PROBE_ENV,
   onboardingProbeInstance,
@@ -52,7 +53,7 @@ import {
   onboardingProofDirectiveId,
   type OnboardingProofDirective,
 } from '../src/onboarding/service.js';
-import { VerificationScheduler, type VerificationRecord } from '../src/verify/scheduler.js';
+import { VerificationLockTimeoutError, VerificationScheduler, type VerificationRecord } from '../src/verify/scheduler.js';
 import { createVerificationServer, ONBOARDING_PROOF_SCOPE, type VerificationBudget, type VerificationServer } from '../src/verify/server.js';
 import { FROZEN_SPEC_MAX_BYTES } from '../src/dispatch/perkins-review/artifacts.js';
 import { appendCiEvidence, CI_EVIDENCE_OMITTED_NOTICE } from '../src/review-inputs/ci-evidence.js';
@@ -215,6 +216,7 @@ const verificationEvents = (ledger: LedgerApi): readonly unknown[] =>
   ledger.listEvents({ limit: 1000 }).filter((event) => event.kind.startsWith('verification.'));
 
 const gitLfs = spawnSync('git', ['lfs', 'version'], { encoding: 'utf8' }).status === 0;
+const python3 = spawnSync('python3', ['--version'], { encoding: 'utf8' }).status === 0;
 
 /** Whether this platform shows one process another's environment, which
  * the proof's marker sweep needs to find a daemon that left its process
@@ -230,14 +232,17 @@ const markerVisible = ((): boolean => {
 /** A daemon that leaves its process group the way the Bazel server or a
  * Gradle daemon does (fork, `setsid`, fork again), ignores SIGTERM, and
  * writes its pid to the file named by its first argument. `scrubbed`: it
- * then runs on with an empty environment (no marker), its cwd unchanged. */
-function detachingDaemon(scrubbed = false): string {
+ * then runs on with an empty environment (no marker), its cwd unchanged.
+ * `elsewhere`: it changes its working directory to `/`, as a classic
+ * daemon does, so nothing roots it in the checkout. */
+function detachingDaemon(scrubbed = false, elsewhere = false): string {
   const script = join(temp('gru-onboarding-proof-daemon-'), 'daemon.pl');
   writeFileSync(script, [
     'use POSIX;',
     'my $pidfile = shift;',
     'exit 0 if fork();',
     'POSIX::setsid();',
+    ...(elsewhere ? ["chdir('/');"] : []),
     'exit 0 if fork();',
     "open(STDIN, '<', '/dev/null'); open(STDOUT, '>', '/dev/null'); open(STDERR, '>', '/dev/null');",
     "$SIG{TERM} = 'IGNORE';",
@@ -588,14 +593,25 @@ describe('the proof (real checkout, setup and leased verify)', () => {
     expect(renderOnboardingProofDirective(readOnboardingProof(payload)!)).toContain('registry auth failed for [REDACTED]');
   });
 
-  it('A final output line longer than the tail keeps its last bytes, marked as starting mid-line: the recorded tail is never empty when the command printed something', async () => {
-    const lane = await proofLane('[verify]\nfull = \'\'\'head -c 20480 /dev/zero | tr "\\000" x; echo; exit 1\'\'\'\n');
-    const result = proven(await lane.prove());
-    expect(result.failures).toEqual(['verify.full exited 1']);
-    expect(result.outputTail.startsWith('(output tail starts mid-line)\nxxxx')).toBe(true);
-    expect(result.outputTail.endsWith('x\n')).toBe(true);
-    expect(Buffer.byteLength(result.outputTail, 'utf8')).toBeLessThanOrEqual(4 * 1024);
-    expect(Buffer.byteLength(result.outputTail, 'utf8')).toBeGreaterThan(4 * 1024 - 100);
+  it('A final output line longer than the tail never shows a fragment a mid-line cut split, on the verify path and the setup path: its words from the first whitespace after the cut, marked as starting mid-line, or, with no whitespace, a note that it is not shown', async () => {
+    // 64 hex characters no redaction knows: the 4 KiB cut falls 20 characters before its end.
+    const SECRET = 'deadbeef'.repeat(8);
+    const words = `head -c 16000 /dev/zero | tr '\\000' x; printf ' %s ' ${SECRET}; head -c 4044 /dev/zero | tr '\\000' z; echo; exit 1`;
+    const bare = 'head -c 20480 /dev/zero | tr \'\\000\' x; echo; exit 1';
+    const tails: string[] = [];
+    for (const manifest of [`[verify]\nfull = '''${words}'''\n`, `[[setup]]\ncommand = '''${words}'''\n[verify]\nfull = "echo never"\n`]) {
+      const result = proven(await (await proofLane(manifest)).prove());
+      expect(result.passed).toBe(false);
+      expect(result.outputTail).not.toContain(SECRET.slice(-20));
+      expect(result.outputTail).toBe(`(output tail starts mid-line)\n${'z'.repeat(4044)}\n`);
+      tails.push(result.outputTail);
+    }
+    for (const manifest of [`[verify]\nfull = '''${bare}'''\n`, `[[setup]]\ncommand = '''${bare}'''\n[verify]\nfull = "echo never"\n`]) {
+      const result = proven(await (await proofLane(manifest)).prove());
+      expect(result.passed).toBe(false);
+      expect(result.outputTail).toBe('(last line longer than 16 KiB, not shown)\n');
+    }
+    expect(tails).toHaveLength(2);
   });
 
   it('A service a [[setup]] command starts lives through verify.full, which uses it; once verify ran its group is ended, before anything is measured, and nothing is left', async () => {
@@ -616,9 +632,9 @@ describe('the proof (real checkout, setup and leased verify)', () => {
     expect(readdirSync(lane.probes)).toEqual([]);
   });
 
-  it.skipIf(!markerVisible)('A daemon a [[setup]] command detaches from its group (fork, setsid, fork) carries the proof\'s marker and is ended with the rest, though it ignores SIGTERM', async () => {
+  it.skipIf(!markerVisible)('A daemon a [[setup]] command detaches from its group (fork, setsid, fork) and moves out of the checkout (chdir /) is found by the proof\'s marker alone and ended with the rest, though it ignores SIGTERM', async () => {
     const pidFile = join(temp('gru-onboarding-proof-pid-'), 'daemon.pid');
-    const lane = await proofLane(`[[setup]]\ncommand = "perl ${detachingDaemon()} ${pidFile}"\n[verify]\nfull = "echo tests passed"\n`);
+    const lane = await proofLane(`[[setup]]\ncommand = "perl ${detachingDaemon(false, true)} ${pidFile}"\n[verify]\nfull = "echo tests passed"\n`);
     const result = proven(await lane.prove({ killGraceMs: 300 }));
     expect(result).toMatchObject({ passed: true, setup: [{ ok: true }] });
     await expectGone(await pidFrom(pidFile));
@@ -634,6 +650,115 @@ describe('the proof (real checkout, setup and leased verify)', () => {
     await expectGone(await pidFrom(pidFile));
     expect(logs).toContainEqual(expect.stringContaining('carry its marker or are rooted in its checkout'));
     expect(readdirSync(lane.probes)).toEqual([]);
+  });
+
+  it('A member a [[setup]] command leaves in its group with no marker and its cwd outside the checkout (env -i, cd /) is ended by the setup-group kill alone', async () => {
+    const pidFile = join(temp('gru-onboarding-proof-pid-'), 'member.pid');
+    const lane = await proofLane(`[[setup]]\ncommand = '''(cd / && exec env -i sleep 30) >/dev/null 2>&1 & echo $! > ${pidFile}'''\n[verify]\nfull = "echo tests passed"\n`);
+    const result = proven(await lane.prove({ killGraceMs: 300 }));
+    expect(result).toMatchObject({ passed: true, setup: [{ ok: true }] });
+    await expectGone(await pidFrom(pidFile));
+    expect(readdirSync(lane.probes)).toEqual([]);
+  });
+
+  it('What setup started is ended before anything is measured: a service that writes an ignored folder when SIGTERM ends it shows that folder in appeared, and one that would write later never does', async () => {
+    const lane = await proofLane([
+      '[[setup]]',
+      `command = '''sh -c 'trap "mkdir -p build; echo bye > build/terminated; exit 0" TERM; while :; do sleep 0.05; done' >/dev/null 2>&1 & sh -c 'sleep 3; mkdir -p late; echo late > late/file' >/dev/null 2>&1 &'''`,
+      '[verify]',
+      'full = "sleep 0.5; echo tests passed"',
+      '',
+    ].join('\n'), { files: { '.gitignore': 'build/\nlate/\n' } });
+    const result = proven(await lane.prove({ killGraceMs: 2_000 }));
+    expect(result.passed).toBe(true);
+    expect(result.appeared?.map((entry) => entry.path)).toEqual(['build/']);
+    expect(readdirSync(lane.probes)).toEqual([]);
+  });
+
+  it('A process group the proof tracked is never signalled once it may not be its own: one empty when its setup shell exited is dropped, and one whose pgid now holds none of its processes (a reused pgid) is left alone', async () => {
+    const dir = temp('gru-onboarding-proof-pid-');
+    const first = join(dir, 'first.pid');
+    const second = join(dir, 'second.pid');
+    const lane = await proofLane([
+      '[[setup]]',
+      `command = "echo $$ > ${first}"`,
+      '[[setup]]',
+      // A member that lives past its shell, then ends before verify does.
+      `command = '''(cd / && exec env -i sleep 0.5) >/dev/null 2>&1 & echo $$ > ${second}'''`,
+      '[verify]',
+      'full = "sleep 1.5; echo tests passed"',
+      '',
+    ].join('\n'));
+    const kill = process.kill.bind(process);
+    const pgid = (file: string): number | null => (existsSync(file) && readFileSync(file, 'utf8').trim() !== '' ? Number(readFileSync(file, 'utf8').trim()) : null);
+    const signals: (readonly [number, string | number])[] = [];
+    // Once the second group is empty, its pgid is taken by someone else's group.
+    const spy = vi.spyOn(process, 'kill').mockImplementation((target: number, signal?: string | number) => {
+      signals.push([target, signal ?? 'SIGTERM']);
+      if (target === -(pgid(second) ?? Number.NaN) && signal === 0) {
+        try {
+          return kill(target, 0);
+        } catch {
+          return true;
+        }
+      }
+      return kill(target, signal);
+    });
+    const logs: { readonly level: string; readonly msg: string }[] = [];
+    try {
+      const result = proven(await lane.prove({ killGraceMs: 300, log: (level, msg) => { logs.push({ level, msg }); } }));
+      expect(result.passed).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+    for (const file of [first, second]) {
+      const group = pgid(file);
+      expect(group).not.toBeNull();
+      expect(signals.filter(([target, signal]) => target === -group! && signal !== 0)).toEqual([]);
+    }
+    expect(logs).toContainEqual({ level: 'warn', msg: expect.stringContaining('holds none of its own processes now (its pgid may have been reused), so it is not signalled') });
+  });
+
+  it('A process listing that fails is logged as an error and the other still counts: the proof records its result', async () => {
+    const lane = await proofLane('[verify]\nfull = "echo tests passed"\n');
+    const fakeBin = temp('gru-onboarding-proof-ps-');
+    writeFileSync(join(fakeBin, 'ps'), '#!/bin/sh\necho "ps: cannot list processes" >&2\nexit 1\n', { mode: 0o755 });
+    const path = process.env['PATH'];
+    process.env['PATH'] = `${fakeBin}:${path ?? ''}`;
+    const logs: { readonly level: string; readonly msg: string }[] = [];
+    try {
+      const result = proven(await lane.prove({ killGraceMs: 300, log: (level, msg) => { logs.push({ level, msg }); } }));
+      expect(result).toMatchObject({ passed: true, failures: [] });
+    } finally {
+      process.env['PATH'] = path;
+    }
+    expect(logs).toContainEqual({ level: 'error', msg: expect.stringContaining('the processes rooted in its checkout could not be listed') });
+    expect(readdirSync(lane.probes)).toEqual([]);
+  });
+
+  it('Process listings run off the event loop: timers keep firing while a slow listing runs', async () => {
+    const lane = await proofLane('[verify]\nfull = "echo tests passed"\n');
+    const realPs = spawnSync('/bin/sh', ['-c', 'command -v ps'], { encoding: 'utf8' }).stdout.trim();
+    const fakeBin = temp('gru-onboarding-proof-ps-');
+    writeFileSync(join(fakeBin, 'ps'), `#!/bin/sh\nsleep 2\nexec ${realPs} "$@"\n`, { mode: 0o755 });
+    const path = process.env['PATH'];
+    process.env['PATH'] = `${fakeBin}:${path ?? ''}`;
+    let last = Date.now();
+    let widest = 0;
+    const timer = setInterval(() => {
+      widest = Math.max(widest, Date.now() - last);
+      last = Date.now();
+    }, 20);
+    try {
+      const started = Date.now();
+      expect(proven(await lane.prove({ killGraceMs: 300 })).passed).toBe(true);
+      // The slow listing ran (the proof took its time) while the loop kept turning.
+      expect(Date.now() - started).toBeGreaterThan(2_000);
+    } finally {
+      clearInterval(timer);
+      process.env['PATH'] = path;
+    }
+    expect(widest).toBeLessThan(1_000);
   });
 
   it('LFS parity with the repository\'s own config: its local lfs.storage, URL rewrites, http and credential entries reach the probe, and its origin replaces the clone\'s, with no copied value logged', async () => {
@@ -662,15 +787,55 @@ describe('the proof (real checkout, setup and leased verify)', () => {
     expect(readdirSync(lane.probes)).toEqual([]);
   });
 
-  it('The checkout is bounded by the larger of the setup and verify bounds: a smudge filter that hangs past it defers the proof, naming the timeout, and nothing is left', async () => {
+  it('LFS parity with the repository\'s effective config: its remote.origin.lfsurl, core.sshCommand and an [include] file\'s lfs.url reach the probe, a relative lfs.storage is resolved against the common dir, and nothing the user\'s config already gives is doubled', async () => {
+    const include = join(temp('gru-onboarding-proof-include-'), 'lfs.gitconfig');
+    writeFileSync(include, '[lfs]\n\turl = https://lfs.example.invalid/included\n');
     const gitconfig = join(temp('gru-onboarding-proof-gitconfig-'), 'gitconfig');
-    writeFileSync(gitconfig, '[filter "slow"]\n\tsmudge = sleep 5; cat\n\tclean = cat\n');
+    writeFileSync(gitconfig, '[http]\n\textraheader = X-Global: once\n');
     const previous = process.env['GIT_CONFIG_GLOBAL'];
     process.env['GIT_CONFIG_GLOBAL'] = gitconfig;
     try {
-      const lane = await proofLane('[verify]\nfull = "echo tests passed"\n', { files: { '.gitattributes': 'slow.txt filter=slow\n', 'slow.txt': 'content\n' } });
+      const check = (key: string, expected: string): string[] => ['[[setup]]', `command = '''test "$(git config --local --get-all ${key})" = '${expected}' '''`];
+      const lane = await proofLane([
+        ...check('remote.origin.lfsurl', 'https://lfs.example.invalid/acme/app.git/info/lfs'),
+        ...check('core.sshCommand', 'ssh -i /keys/acme_deploy'),
+        ...check('lfs.url', 'https://lfs.example.invalid/included'),
+        '[[setup]]',
+        // The user's own entry is read once: the probe's config does not repeat it.
+        `command = '''test "$(git config --get-all http.extraheader)" = 'X-Global: once' '''`,
+        '[[setup]]',
+        'command = \'\'\'test "$(git config --local --get lfs.storage)" = "$GRU_TEST_LFS_STORE"\'\'\'',
+        '',
+      ].join('\n'), { files: { '.gitattributes': 'big.bin filter=lfs diff=lfs merge=lfs -text\n' } });
+      lane.repo.git(['config', 'remote.origin.lfsurl', 'https://lfs.example.invalid/acme/app.git/info/lfs']);
+      lane.repo.git(['config', 'core.sshCommand', 'ssh -i /keys/acme_deploy']);
+      lane.repo.git(['config', 'include.path', include]);
+      lane.repo.git(['config', 'lfs.storage', 'lfs-store']);
+      // The fixture repository's common dir is its .git.
+      process.env['GRU_TEST_LFS_STORE'] = join(lane.repo.path, '.git', 'lfs-store');
+      const result = proven(await lane.prove());
+      expect(result.failures).toEqual([]);
+      expect(result.setup.map((step) => step.ok)).toEqual([true, true, true, true, true]);
+      expect(readdirSync(lane.probes)).toEqual([]);
+    } finally {
+      delete process.env['GRU_TEST_LFS_STORE'];
+      if (previous === undefined) delete process.env['GIT_CONFIG_GLOBAL'];
+      else process.env['GIT_CONFIG_GLOBAL'] = previous;
+    }
+  });
+
+  it('The checkout is bounded by the larger of the setup and verify bounds: a smudge that fits only the larger (here the verify bound) checks out, and one that hangs past it defers the proof, naming the timeout, and nothing is left', async () => {
+    const gitconfig = join(temp('gru-onboarding-proof-gitconfig-'), 'gitconfig');
+    writeFileSync(gitconfig, '[filter "slow"]\n\tsmudge = sleep 1; cat\n\tclean = cat\n[filter "hung"]\n\tsmudge = sleep 5; cat\n\tclean = cat\n');
+    const previous = process.env['GIT_CONFIG_GLOBAL'];
+    process.env['GIT_CONFIG_GLOBAL'] = gitconfig;
+    try {
+      // A one-second smudge: past the setup bound, inside the verify bound.
+      const fits = await proofLane('[verify]\nfull = "echo tests passed"\n', { files: { '.gitattributes': 'slow.txt filter=slow\n', 'slow.txt': 'content\n' } });
+      expect(proven(await fits.prove({ setupTimeoutMs: 300, runTimeoutMs: 5_000, killGraceMs: 200 })).passed).toBe(true);
+      const lane = await proofLane('[verify]\nfull = "echo tests passed"\n', { files: { '.gitattributes': 'slow.txt filter=hung\n', 'slow.txt': 'content\n' } });
       const started = Date.now();
-      const outcome = await lane.prove({ setupTimeoutMs: 400, runTimeoutMs: 200, killGraceMs: 200 });
+      const outcome = await lane.prove({ setupTimeoutMs: 200, runTimeoutMs: 400, killGraceMs: 200 });
       expect(outcome).toEqual({ kind: 'deferred', reason: expect.stringMatching(/^the throwaway clone of \w{12} failed: git checkout timed out after 400 ms$/u) });
       expect(Date.now() - started).toBeLessThan(4_500);
       expect(readdirSync(lane.probes)).toEqual([]);
@@ -774,6 +939,18 @@ async function crashedProofSlot(config: ReturnType<typeof loadConfig>, recorded?
   return orphan.pid!;
 }
 
+/** A verify's process group whose leader exited: its shell, run in `cwd`,
+ * backgrounds a member that lives on, then exits (and is reaped). */
+async function groupWithLostLeader(cwd: string): Promise<{ readonly leader: number; readonly member: number; readonly argv: string }> {
+  const shell = spawn('/bin/sh', ['-c', 'sleep 30 >/dev/null 2>&1 & echo $!'], { cwd, detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
+  closers.push(() => { try { process.kill(-shell.pid!, 'SIGKILL'); } catch { /* already ended */ } });
+  const member = Number(await new Promise<string>((resolve) => { shell.stdout!.once('data', (chunk: Buffer) => resolve(chunk.toString('utf8').trim())); }));
+  await new Promise<void>((resolve) => { if (shell.exitCode !== null) resolve(); else shell.once('exit', () => resolve()); });
+  await until(() => !alive(shell.pid!), 'the verify leader to be gone');
+  expect(alive(member)).toBe(true);
+  return { leader: shell.pid!, member, argv: shell.spawnargs.join(' ') };
+}
+
 describe('the proof\'s budget slot across a restart', () => {
   it('a verify pid bound to the slot keeps it held on reload while that pid lives, and releases it once the pid is dead', async () => {
     const limits = { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 1_000, runTimeoutMs: 60_000 };
@@ -856,29 +1033,52 @@ describe('the proof\'s budget slot across a restart', () => {
     expect(h.logs).toContainEqual({ level: 'warn', msg: expect.stringContaining('or are rooted in its checkouts) were ended') });
   });
 
-  it('a slot whose verify leader exited while a member of its process group lives is kept, never released as gone; a pid ps cannot read is an error that keeps its slot', async () => {
+  it('a verify whose leader died while a member of its process group lives keeps its slot through a restart and a later acquire; the boot judge ends that group once a member is confirmed the proof\'s (rooted in its checkout), and only then releases the slot', async () => {
     const config = verifyConfig();
+    const probes = join(temp('gru-onboarding-proof-svc-'), 'onboarding-probes');
+    const checkout = join(probes, `${JOB}-${H1.slice(0, 12)}`);
+    mkdirSync(checkout, { recursive: true });
     const crashed = new VerificationScheduler({ storageDir: join(config.dataDir, 'verify'), limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 1_000, runTimeoutMs: 60_000 } });
     closers.push(() => crashed.dispose());
-    const lease = await crashed.acquire({ jobId: JOB, scope: ONBOARDING_PROOF_SCOPE, command: 'make test', cwd: config.dataDir, head: H1 });
-    // The verify's shell backgrounds a server, then exits when its stdin closes.
-    const leader = spawn('/bin/sh', ['-c', 'sleep 30 >/dev/null 2>&1 & echo $!; read line'], { detached: true, stdio: ['pipe', 'pipe', 'ignore'] });
-    closers.push(() => { try { process.kill(-leader.pid!, 'SIGKILL'); } catch { /* already ended */ } });
-    const member = Number(await new Promise<string>((resolve) => { leader.stdout!.once('data', (chunk: Buffer) => resolve(chunk.toString('utf8').trim())); }));
-    crashed.bindPid(lease, leader.pid!, leader.spawnargs.join(' '));
+    const lease = await crashed.acquire({ jobId: JOB, scope: ONBOARDING_PROOF_SCOPE, command: 'make test', cwd: checkout, head: H1 });
+    const { leader, member, argv } = await groupWithLostLeader(checkout);
+    crashed.bindPid(lease, leader, argv, { leadsGroup: true });
+    // The leader died before the restart: the restarted scheduler keeps the slot while the member lives.
     const { ledger } = bootLedger();
     const server = createVerificationServer({ config, ledger, worktrees: new InMemoryWorktreePort(temp('gru-onboarding-proof-wt-'), ledger) });
     closers.push(() => server.dispose());
     expect(server.view()).toMatchObject({ lockInUse: true });
-    // The leader exits after the restarted scheduler kept the slot, before onboarding judges it.
-    leader.stdin!.end();
-    await until(() => !alive(leader.pid!), 'the verify leader to exit');
-    expect(alive(member)).toBe(true);
-    const logs: { readonly level: string; readonly msg: string }[] = [];
-    await endOrphanedProofVerifies(() => server.budget(), (level, msg) => { logs.push({ level, msg }); });
+    // A later acquire judges the slot again and keeps it: it waits, and times out.
+    await expect(server.budget().acquire({ jobId: 'heist-later', scope: 'full', command: 'npm test', cwd: config.dataDir })).rejects.toBeInstanceOf(VerificationLockTimeoutError);
     expect(server.view()).toMatchObject({ lockInUse: true });
     expect(alive(member)).toBe(true);
-    expect(logs).toContainEqual({ level: 'warn', msg: expect.stringContaining('whose leader is gone but a member of its process group lives') });
+    const logs: { readonly level: string; readonly msg: string }[] = [];
+    await endOrphanedProofVerifies(() => server.budget(), probes, (level, msg) => { logs.push({ level, msg }); }, 300);
+    await expectGone(member);
+    expect(server.view()).toMatchObject({ lockInUse: false });
+    expect(logs).toContainEqual({ level: 'warn', msg: expect.stringContaining('its process group, confirmed the proof\'s, was ended and its budget slot released') });
+    // The later acquire's own lock timeout is its job's; nothing names the proof's scope.
+    expect(verificationEvents(ledger).filter((event) => JSON.stringify(event).includes(ONBOARDING_PROOF_SCOPE))).toEqual([]);
+  });
+
+  it('a slot whose verify leader exited while a member of its process group lives, none of them confirmed the proof\'s, is kept and its group never signalled; a pid ps cannot read is an error that keeps its slot', async () => {
+    const config = verifyConfig();
+    const probes = join(temp('gru-onboarding-proof-svc-'), 'onboarding-probes');
+    const crashed = new VerificationScheduler({ storageDir: join(config.dataDir, 'verify'), limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 1_000, runTimeoutMs: 60_000 } });
+    closers.push(() => crashed.dispose());
+    const lease = await crashed.acquire({ jobId: JOB, scope: ONBOARDING_PROOF_SCOPE, command: 'make test', cwd: config.dataDir, head: H1 });
+    // The member runs outside the probes folder with no marker: nothing confirms it is the proof's.
+    const { leader, member, argv } = await groupWithLostLeader(temp('gru-onboarding-proof-elsewhere-'));
+    crashed.bindPid(lease, leader, argv, { leadsGroup: true });
+    const { ledger } = bootLedger();
+    const server = createVerificationServer({ config, ledger, worktrees: new InMemoryWorktreePort(temp('gru-onboarding-proof-wt-'), ledger) });
+    closers.push(() => server.dispose());
+    expect(server.view()).toMatchObject({ lockInUse: true });
+    const logs: { readonly level: string; readonly msg: string }[] = [];
+    await endOrphanedProofVerifies(() => server.budget(), probes, (level, msg) => { logs.push({ level, msg }); }, 300);
+    expect(server.view()).toMatchObject({ lockInUse: true });
+    expect(alive(member)).toBe(true);
+    expect(logs).toContainEqual({ level: 'warn', msg: expect.stringContaining('none of them confirmed the proof\'s') });
 
     // A live verify whose pid a broken ps cannot read: an error, and the slot is kept.
     const liveConfig = verifyConfig();
@@ -891,13 +1091,57 @@ describe('the proof\'s budget slot across a restart', () => {
     process.env['PATH'] = `${fakeBin}:${path ?? ''}`;
     const brokenLogs: { readonly level: string; readonly msg: string }[] = [];
     try {
-      await endOrphanedProofVerifies(() => liveServer.budget(), (level, msg) => { brokenLogs.push({ level, msg }); });
+      await endOrphanedProofVerifies(() => liveServer.budget(), probes, (level, msg) => { brokenLogs.push({ level, msg }); });
     } finally {
       process.env['PATH'] = path;
     }
     expect(alive(pid)).toBe(true);
     expect(liveServer.view()).toMatchObject({ lockInUse: true });
     expect(brokenLogs).toContainEqual({ level: 'error', msg: expect.stringContaining('could not be judged or ended') });
+  });
+
+  it.skipIf(process.platform !== 'linux' || !python3)('a process of this user whose environment cannot be read (non-dumpable, as ssh-agent is) is logged once at warn, never passed over in silence, and is left alone', async () => {
+    const child = spawn('python3', ['-c', 'import ctypes, time; ctypes.CDLL(None).prctl(4, 0, 0, 0, 0); print("ready", flush=True); time.sleep(30)'], { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
+    closers.push(() => { try { process.kill(-child.pid!, 'SIGKILL'); } catch { /* already ended */ } });
+    await new Promise<void>((resolve) => { child.stdout!.once('data', () => resolve()); });
+    const probes = join(temp('gru-onboarding-proof-svc-'), 'onboarding-probes');
+    const warned: unknown[] = [];
+    const log = (level: string, msg: string, fields?: Record<string, unknown>): void => {
+      if (level === 'warn' && msg.includes('hides its environment')) warned.push(fields?.['pid']);
+    };
+    await endOrphanedProbeProcesses(probes, log, 300);
+    await endOrphanedProbeProcesses(probes, log, 300);
+    expect(warned.filter((pid) => pid === child.pid)).toHaveLength(1);
+    expect(alive(child.pid!)).toBe(true);
+  });
+
+  it('an orphaned verify that ignores SIGTERM is SIGKILLed by the boot\'s process sweep and waited for, so it is gone before the verify judge runs, which releases its slot', async () => {
+    const config = verifyConfig();
+    const probes = join(temp('gru-onboarding-proof-svc-'), 'onboarding-probes');
+    const checkout = join(probes, `${JOB}-${H1.slice(0, 12)}`);
+    mkdirSync(checkout, { recursive: true });
+    const crashed = new VerificationScheduler({ storageDir: join(config.dataDir, 'verify'), limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 1_000, runTimeoutMs: 60_000 } });
+    closers.push(() => crashed.dispose());
+    const lease = await crashed.acquire({ jobId: JOB, scope: ONBOARDING_PROOF_SCOPE, command: 'make test', cwd: checkout, head: H1 });
+    // The crashed run's verify leads its group in its checkout and ignores SIGTERM, as a slow test server may.
+    const ready = join(temp('gru-onboarding-proof-ready-'), 'ready');
+    const orphan = spawn('/bin/sh', ['-c', `trap "" TERM; echo ready > ${ready}; sleep 30; true`], { cwd: checkout, detached: true, stdio: 'ignore' });
+    closers.push(() => { try { process.kill(-orphan.pid!, 'SIGKILL'); } catch { /* already ended */ } });
+    await until(() => existsSync(ready), 'the orphan\'s trap');
+    crashed.bindPid(lease, orphan.pid!, orphan.spawnargs.join(' '), { leadsGroup: true });
+    const { ledger } = bootLedger();
+    const server = createVerificationServer({ config, ledger, worktrees: new InMemoryWorktreePort(temp('gru-onboarding-proof-wt-'), ledger) });
+    closers.push(() => server.dispose());
+    expect(server.view()).toMatchObject({ lockInUse: true });
+    const logs: { readonly level: string; readonly msg: string }[] = [];
+    const log = (level: string, msg: string): void => { logs.push({ level, msg }); };
+    // As onboarding's start runs them: the process sweep, then the verify judge.
+    await endOrphanedProbeProcesses(probes, log, 300);
+    await endOrphanedProofVerifies(() => server.budget(), probes, log, 300);
+    expect(alive(orphan.pid!)).toBe(false);
+    expect(server.view()).toMatchObject({ lockInUse: false });
+    expect(logs).toContainEqual({ level: 'warn', msg: expect.stringContaining('a budget slot an earlier run left was released; its verify is gone') });
+    expect(logs.filter((entry) => entry.level === 'error')).toEqual([]);
   });
 
   it('a live pid whose command is not the recorded verify is never signalled, and its slot waits for the age limit; a dead one is released with a warn and no verification event', async () => {
@@ -907,7 +1151,7 @@ describe('the proof\'s budget slot across a restart', () => {
     const { ledger } = bootLedger();
     const server = createVerificationServer({ config, ledger, worktrees: new InMemoryWorktreePort(temp('gru-onboarding-proof-wt-'), ledger) });
     closers.push(() => server.dispose());
-    await endOrphanedProofVerifies(() => server.budget(), (level, msg) => { logs.push({ level, msg }); });
+    await endOrphanedProofVerifies(() => server.budget(), temp('gru-onboarding-proof-probes-'), (level, msg) => { logs.push({ level, msg }); });
     expect(alive(pid)).toBe(true);
     expect(server.view()).toMatchObject({ lockInUse: true });
     expect(logs).toContainEqual({ level: 'warn', msg: expect.stringContaining('names a live pid that is not its verify') });
@@ -981,6 +1225,8 @@ interface ServiceHarness {
   refuseLookup: string | null;
   /** The directive path refuses with this while set. */
   refuseDirective: string | null;
+  /** The directive path admits the request (its row is begun), then throws this, while set. */
+  admitThenFail: string | null;
   /** What resolving the managed repository answers (default: available). */
   repoPath: ManagedRepoPath;
   /** The global verification budget the service reads (default: not up). */
@@ -1008,6 +1254,7 @@ function serviceHarness(): ServiceHarness {
     refusePost: null,
     refuseLookup: null,
     refuseDirective: null,
+    admitThenFail: null,
     repoPath: AVAILABLE,
     budget: () => { throw new Error('the stand-in proof needs no budget'); },
     service(opts = {}) {
@@ -1055,6 +1302,7 @@ function serviceHarness(): ServiceHarness {
             if (h.refuseDirective !== null) throw new Error(h.refuseDirective);
             h.directives.push(input);
             ledger.beginDirectiveIntent({ jobId: input.jobId, directive: input.directive, holder: 'onboarding-proof', requestId: input.requestId });
+            if (h.admitThenFail !== null) throw new Error(h.admitThenFail);
           },
         },
         setInterval: ((run: () => void) => { h.intervals.push(run); return { unref() {} }; }) as unknown as typeof setInterval,
@@ -1304,22 +1552,44 @@ describe('the service: once per (job, head), after the PR, with its comment', ()
     }
   });
 
-  it('A rate limit is never a refusal for good, even at HTTP 403 (GitHub\'s secondary limit on comments): the attempt counts and the next reconcile retries it', async () => {
+  it('Throttling is never a refusal for good and never spends an attempt, even at HTTP 403 or 422: a rate limit, the abuse detection or content submitted too quickly is retried at every reconcile', async () => {
+    for (const throttled of [
+      'gh: You have exceeded a secondary rate limit. Please wait a few minutes before you try again. (HTTP 403)',
+      'gh: You have triggered an abuse detection mechanism. Please wait a few minutes before you try again. (HTTP 403)',
+      'gh: Validation Failed: was submitted too quickly (HTTP 422)',
+    ]) {
+      const h = serviceHarness();
+      onboardingJob(h.ledger);
+      h.ledger.setJobPr(JOB, PR_URL);
+      h.refusePost = throttled;
+      const service = await started(h.service());
+      deliver(h.ledger, H1);
+      await service.idle();
+      // Three throttled reconciles: more than the attempt bound, and still no record.
+      for (let reconcile = 0; reconcile < 3; reconcile += 1) await tick(h, service);
+      expect(h.postAttempts, throttled).toBe(4);
+      expect(commentReceipts(h.ledger), throttled).toEqual([]);
+      expect(h.logs.some((entry) => entry.msg.includes('GitHub refused it') || entry.msg.includes('cannot be posted')), throttled).toBe(false);
+      h.refusePost = null;
+      await tick(h, service);
+      expect(h.postAttempts, throttled).toBe(5);
+      expect(commentReceipts(h.ledger), throttled).toEqual([expect.objectContaining({ head: H1, comment_id: 100, detail: 'posted' })]);
+    }
+  });
+
+  it('An attempt recorded by a build before the nonce still finds its comment by that build\'s marker after an upgrade, and posts no second one', async () => {
     const h = serviceHarness();
     onboardingJob(h.ledger);
     h.ledger.setJobPr(JOB, PR_URL);
-    h.refusePost = 'gh: You have exceeded a secondary rate limit. Please wait a few minutes before you try again. (HTTP 403)';
-    const service = await started(h.service());
     deliver(h.ledger, H1);
-    await service.idle();
-    expect(h.postAttempts).toBe(1);
-    expect(commentReceipts(h.ledger)).toEqual([]);
-    expect(h.logs.some((entry) => entry.msg.includes('GitHub refused it'))).toBe(false);
-    h.refusePost = null;
-    await tick(h, service);
+    proofEvent(h.ledger, H1, true);
+    // The older build recorded its attempt with no nonce, posted, and stopped before the receipt.
+    h.ledger.appendCustomEvent({ kind: ONBOARDING_EVENTS.proofCommentAttempt, jobId: JOB, payload: { repo: 'fixture-app', job_id: JOB, head: H1, pr_url: PR_URL } });
+    h.comments.push({ id: 70, body: `<!-- gru:onboarding-proof job=${JOB} head=${H1} -->\n### GC onboarding proof: passed`, url: `${PR_URL}#issuecomment-70`, pr: 'acme/fixture-app#7' });
+    await started(h.service());
     expect(h.lookups).toEqual([7]);
-    expect(h.postAttempts).toBe(2);
-    expect(commentReceipts(h.ledger)).toEqual([expect.objectContaining({ head: H1, comment_id: 100, detail: 'posted' })]);
+    expect(h.postAttempts).toBe(0);
+    expect(commentReceipts(h.ledger)).toEqual([expect.objectContaining({ head: H1, comment_id: 70, detail: 'found by its marker after an interrupted post' })]);
   });
 
   it('A comment with GC\'s job and head but no nonce, or another nonce, is not GC\'s: after an interrupted post GC ignores it and posts its own', async () => {
@@ -1850,6 +2120,95 @@ describe('the service: one row for Gru per stuck episode', () => {
     expect(h.attention().filter((row) => row.open)).toEqual([expect.objectContaining({ id: `${unadmitted}:2`, detail: expect.stringContaining('the lane is held again') })]);
   });
 
+  it('A restart never closes a row: the deferred, unadmitted and unanswered rows a run opened stay open through a fresh service on the same ledger and several reconciles, and no :2 is posted', async () => {
+    const opened: { readonly h: ServiceHarness; readonly service: OnboardingService; readonly id: string }[] = [];
+    // Deferred three times.
+    const d = serviceHarness();
+    onboardingJob(d.ledger);
+    d.ledger.setJobPr(JOB, PR_URL);
+    const deferredAt = deliver(d.ledger, H1);
+    d.outcome = () => ({ kind: 'deferred', reason: 'the verification budget wait timed out' });
+    const deferring = await started(d.service());
+    await tick(d, deferring);
+    await tick(d, deferring);
+    opened.push({ h: d, service: deferring, id: rowId(H1, deferredAt, 'deferred') });
+    // A directive the lane never admits.
+    const u = serviceHarness();
+    onboardingJob(u.ledger);
+    u.ledger.setJobPr(JOB, PR_URL);
+    u.outcome = (input) => failing(input);
+    u.refuseDirective = 'the lane is held by a review round';
+    const refusing = await started(u.service());
+    const unadmittedAt = deliver(u.ledger, H1);
+    await refusing.idle();
+    for (let reconcile = 0; reconcile < 3; reconcile += 1) await tick(u, refusing);
+    opened.push({ h: u, service: refusing, id: rowId(H1, unadmittedAt, 'unadmitted') });
+    // A settled directive whose head is delivered again.
+    const a = serviceHarness();
+    onboardingJob(a.ledger);
+    a.ledger.setJobPr(JOB, PR_URL);
+    a.outcome = (input) => failing(input);
+    const answering = await started(a.service());
+    deliver(a.ledger, H1);
+    await answering.idle();
+    a.db.handle.prepare("UPDATE pending_directives SET state = 'settled' WHERE request_id = ?").run(onboardingProofDirectiveId(JOB, H1, 1));
+    const unansweredAt = deliver(a.ledger, H1);
+    await answering.idle();
+    await tick(a, answering);
+    opened.push({ h: a, service: answering, id: rowId(H1, unansweredAt, 'unanswered') });
+
+    for (const { h, service, id } of opened) {
+      expect(h.attention(), id).toEqual([expect.objectContaining({ id, open: true })]);
+      // A deploy restarts GC: a fresh service on the same ledger, its in-memory counts empty.
+      service.stop();
+      const restarted = await started(h.service());
+      expect(h.attention(), id).toEqual([expect.objectContaining({ id, open: true })]);
+      for (let reconcile = 0; reconcile < 4; reconcile += 1) await tick(h, restarted);
+      expect(h.attention(), id).toEqual([expect.objectContaining({ id, open: true })]);
+      expect(h.ledger.getNotification(`${id}:2`), id).toBeNull();
+    }
+  });
+
+  it('Admission resets the refusal count: after the lane admitted the directive, one and then two new refusals post no :2, and the third, in a third reconcile, does', async () => {
+    const h = serviceHarness();
+    onboardingJob(h.ledger);
+    h.ledger.setJobPr(JOB, PR_URL);
+    h.outcome = (input) => failing(input);
+    h.refuseDirective = 'the lane is held by a review round';
+    const service = await started(h.service());
+    const first = deliver(h.ledger, H1);
+    await service.idle();
+    for (let reconcile = 0; reconcile < 3; reconcile += 1) await tick(h, service);
+    const unadmitted = rowId(H1, first, 'unadmitted');
+    expect(h.attention()).toEqual([expect.objectContaining({ id: unadmitted, open: true })]);
+    // The lane admits request 1 (its row is begun), and the turn then fails.
+    h.refuseDirective = null;
+    h.admitThenFail = 'the minion\'s session ended before any prompt';
+    await tick(h, service);
+    expect(h.ledger.getDirective(onboardingProofDirectiveId(JOB, H1, 1))).not.toBeNull();
+    h.admitThenFail = null;
+    const trigger = async (): Promise<void> => {
+      h.ledger.setJobPr(JOB, PR_URL);
+      await service.idle();
+    };
+    await trigger();
+    expect(h.attention()).toEqual([expect.objectContaining({ id: unadmitted, open: false })]);
+    // That request is refused before any prompt, and the lane refuses the next ones again.
+    h.ledger.failDirective({ requestId: onboardingProofDirectiveId(JOB, H1, 1), reason: 'the lane refused it before any prompt' });
+    h.refuseDirective = 'the lane is held again';
+    const open = (): readonly string[] => h.attention().filter((row) => row.open).map((row) => row.id);
+    await tick(h, service);
+    await trigger();
+    expect(open()).toEqual([]);
+    await tick(h, service);
+    await trigger();
+    expect(open()).toEqual([]);
+    // The third refusal, in a third reconcile: the next trigger posts the row.
+    await tick(h, service);
+    await trigger();
+    expect(open()).toEqual([`${unadmitted}:2`]);
+  });
+
   it('A deferral row closes once its head is proven, even when the proof is the job\'s first failure and no other reason holds', async () => {
     const h = serviceHarness();
     onboardingJob(h.ledger);
@@ -2258,6 +2617,57 @@ describe('the review fence', () => {
     await (edited as { readonly run: Promise<unknown> }).run;
     expect(aborted(editing)).toMatchObject({ clearToMerge: false, reason: expect.stringContaining('lane holds uncommitted changes the proof never ran') });
     expect(passed(editing)).toBe(false);
+  });
+
+  it('Fallback admission leaves out what the lane\'s bootstrap placed: a [[link]] node_modules that a node_modules/ ignore rule misses (a link is no folder) and a [[copy]] are not uncommitted; any other untracked file still is', async () => {
+    const lane: FencedLane = await fencedLane({ ...PERKINS_DOWN, ...fallbackGate(async () => []) });
+    lane.repo.commitFile('.gitignore', 'node_modules/\n');
+    lane.repo.commitFile('.env.example', 'KEY=example\n');
+    const head = lane.repo.commitFile('.gru-command/worktree.toml', '[[link]]\nat = "node_modules"\nto = "node_modules"\n[[copy]]\nfrom = ".env.example"\nto = "config/local.env"\n[verify]\nfull = "npm test"\n');
+    deliver(lane.ledger, head);
+    proofEvent(lane.ledger, head, true);
+    lane.ledger.setJobStatus(JOB, 'delivered');
+    // What the lane's bootstrap placed: git lists both as untracked.
+    symlinkSync(temp('gru-onboarding-proof-modules-'), join(lane.repo.path, 'node_modules'));
+    mkdirSync(join(lane.repo.path, 'config'));
+    writeFileSync(join(lane.repo.path, 'config', 'local.env'), 'KEY=example\n');
+    expect(lane.repo.git(['status', '--porcelain', '--untracked-files=all']).split('\n').sort()).toEqual(['?? config/local.env', '?? node_modules']);
+    const outcome = await lane.wave.requestReview({ jobId: JOB, force: true });
+    expect(outcome.route).toBe('bmad-review-fallback');
+    await (outcome as { readonly run: Promise<unknown> }).run;
+    expect(lane.ledger.listJobEvents(JOB).some((event) => event.kind === 'job.fallback-review' && (event.payload as { phase?: unknown }).phase === 'pass')).toBe(true);
+    // Anything else untracked is still uncommitted.
+    writeFileSync(join(lane.repo.path, 'config', 'extra.env'), 'OTHER=1\n');
+    await expect(lane.wave.requestReview({ jobId: JOB, force: true })).rejects.toThrow(/uncommitted changes the proof never ran/);
+  });
+
+  it('An onboarding fallback gate that stops on its fix\'s unproven lane HEAD aborts with a named reason and the way forward; the fix delivered and proven, the review is offered again', async () => {
+    let fixed = '';
+    const lane: FencedLane = await fencedLane({
+      ...PERKINS_DOWN,
+      ...fallbackGate(async () => [BLOCKER], async () => {
+        fixed = lane.repo.commitFile('.gru-command/worktree.toml', '[verify]\nfull = "npm test -- --all"\n');
+        return { delivered: true };
+      }),
+    });
+    lane.ledger.setJobPr(JOB, PR_URL);
+    proofEvent(lane.ledger, lane.target, true);
+    lane.ledger.setJobStatus(JOB, 'delivered');
+    const run = await lane.wave.requestReview({ jobId: JOB, force: true });
+    expect(run.route).toBe('bmad-review-fallback');
+    await (run as { readonly run: Promise<unknown> }).run;
+    const aborted = lane.ledger.listJobEvents(JOB).find((event) => event.kind === 'job.fallback-review' && (event.payload as { phase?: unknown }).phase === 'aborted');
+    expect(aborted?.payload).toMatchObject({ clearToMerge: false, code: FALLBACK_ONBOARDING_PROOF_REQUIRED, hint: FALLBACK_ONBOARDING_PROOF_HINT });
+    expect(FALLBACK_ONBOARDING_PROOF_HINT).toMatch(/commit the fix, push it to the PR branch and deliver; GC proves the new head itself, and review re-arms once that proof passes/u);
+    const digest = async (): Promise<readonly string[]> => (await computeSilasDigest({
+      ledger: lane.ledger, blockersForRound: async () => ({ blockers: [], note: null }), config: DEFAULT_SILAS_CONFIG, trigger: 'sweep',
+    })).prWithoutReview.map((row) => row.jobId);
+    expect(await digest()).toEqual([]);
+    // The minion pushes and delivers the fix: no offer until GC's proof of it passes.
+    deliver(lane.ledger, fixed);
+    expect(await digest()).toEqual([]);
+    proofEvent(lane.ledger, fixed, true);
+    expect(await digest()).toEqual([JOB]);
   });
 
   it('The Silas digest withholds the review offer until the head\'s proof passes; the PR offer is never withheld', async () => {
