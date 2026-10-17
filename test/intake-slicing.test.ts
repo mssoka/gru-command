@@ -285,6 +285,7 @@ describe('intake slicing by a commissioned planning minion (#429)', () => {
     const preview = await h.intake.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source });
     h.dispatch.mockImplementationOnce(async () => ({ settled: Promise.resolve() }));
     await expect(h.slicing.commission({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', revisionId: preview.revisionId })).rejects.toMatchObject({ code: 'intake_slicing_dispatch_failed', status: 503, message: expect.stringContaining('without recording planning job') });
+    expect(h.log).not.toHaveBeenCalled();
   });
   it('an identical breakdown retried after approval still converges on the landed revision', async () => {
     const h = fixture();
@@ -330,7 +331,11 @@ describe('intake slicing by a commissioned planning minion (#429)', () => {
       h.ledger.addJob({ id: input.jobId, repo: 'shop', title: input.title, briefing: input.briefing, deliverable: input.deliverable });
       throw new Error('spawn failed after recording');
     });
-    expect(await h.slicing.commission(request)).toMatchObject({ dispatched: true, jobStatus: 'dispatched' });
+    // Two callers await the one in-flight dispatch; its failure is logged once.
+    const both = await Promise.all([h.slicing.commission(request), h.slicing.commission(request)]);
+    expect(both.map(({ dispatched, jobStatus }) => [dispatched, jobStatus])).toEqual([[true, 'dispatched'], [true, 'dispatched']]);
+    expect(h.dispatch).toHaveBeenCalledTimes(1);
+    expect(h.log).toHaveBeenCalledTimes(1);
     expect(h.log).toHaveBeenCalledWith('error', 'intake planning minion dispatch failed after its job was recorded', { job: jobId, error: 'spawn failed after recording' });
     const other = await h.intake.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r2', source: h.source });
     h.dispatch.mockImplementationOnce((input) => {
@@ -340,6 +345,7 @@ describe('intake slicing by a commissioned planning minion (#429)', () => {
     const inline = await h.slicing.commission({ ...request, requestId: 'r2', revisionId: other.revisionId });
     expect(inline.dispatched).toBe(true);
     await vi.waitFor(() => expect(h.log).toHaveBeenCalledWith('error', 'intake planning minion dispatch failed after its job was recorded', { job: inline.jobId, error: 'worktree failed' }));
+    expect(h.log).toHaveBeenCalledTimes(2);
   });
 });
 

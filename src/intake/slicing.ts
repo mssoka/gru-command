@@ -134,7 +134,10 @@ export class IntakeSlicingService {
       pending = this.options.dispatch({ jobId, repoPath: proposal.repoPath, title: `Slice intake ${proposal.intakeId} into heists`, briefing: this.briefing(proposal, resultRequestId, helper), deliverable: 'investigation' })
         .finally(() => this.inflight.delete(jobId));
       pending.catch((error: unknown) => {
-        if (this.options.ledger.getJob(jobId) !== null) this.options.log?.('error', 'intake planning minion dispatch failed after its job was recorded', { job: jobId, error: error instanceof Error ? error.message : String(error) });
+        // Detached: a closed ledger at shutdown must not become an unhandled rejection.
+        try {
+          if (this.options.ledger.getJob(jobId) !== null) this.options.log?.('error', 'intake planning minion dispatch failed after its job was recorded', { job: jobId, error: error instanceof Error ? error.message : String(error) });
+        } catch { /* the awaiting caller reports the failure */ }
       });
       this.inflight.set(jobId, pending);
       if (this.options.ledger.getJob(jobId) !== null) return status(true);

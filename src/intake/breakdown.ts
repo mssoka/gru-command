@@ -145,8 +145,9 @@ function sectionRanges(text: string, heading: RegExp): readonly { readonly start
  * `inputDocuments`, Notes, a breakdown's `references`), by lowercase file
  * name: a mention the capture lacks must never be silently forgotten. */
 export function referencedArchitecture(snapshot: Snapshot): readonly string[] {
-  // The file name alone, after any directory, `~/` or `{variable}/`.
-  const names = [...snapshot.text.matchAll(/(?<![\w.-])architecture[\w.-]*\.md(?![\w-]|\.\w)/giu)].map(([name]) => name.toLowerCase());
+  // The file name alone, after any directory, `~/` or `{variable}/`; never
+  // the tail of a URL, which names another project's document.
+  const names = [...snapshot.text.matchAll(/(?<![\w.-])(?<!:\/\/\S*)architecture[\w.-]*\.md(?![\w-]|\.\w)/giu)].map(([name]) => name.toLowerCase());
   return [...new Set(names)];
 }
 

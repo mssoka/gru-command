@@ -219,13 +219,12 @@ describe('BMAD v7 epic folder intake (#429)', () => {
   });
 
   it('finds an architecture named anywhere in a BMAD document, sentence-final or in bold, but not a longer file name', async () => {
-    const notes = EPIC.replace('- constraint — architecture-checkout/architecture-checkout.md, AD-1\n', '').replace('- Decision: codes', '- Totals follow **architecture-checkout.md**.\n- See also architecture-payments.md.\n- An old copy sits in architecture-legacy.md.bak.\n- UX rules: {planning_artifacts}/architecture-ux.md and /srv/docs/architecture-ops.md\n- Decision: codes');
+    const notes = EPIC.replace('- constraint — architecture-checkout/architecture-checkout.md, AD-1\n', '').replace('- Decision: codes', '- Totals follow **architecture-checkout.md**.\n- See also architecture-payments.md.\n- An old copy sits in architecture-legacy.md.bak.\n- UX rules: {planning_artifacts}/architecture-ux.md and /srv/docs/architecture-ops.md\n- Not ours: https://github.com/acme/lib/blob/main/docs/architecture.md, ux-architecture.md, solution_architecture.md\n- Decision: codes');
     expect(notes).not.toContain('architecture-checkout/architecture-checkout.md');
     const h = epicFolder({ 'epic-cart/epic-cart.md': notes, 'epic-cart/tickets.toml': TICKETS.replace('references = ["architecture-checkout/architecture-checkout.md#ad-1"]\n', '') });
     const proposal = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source(['epic-cart/tickets.toml']) });
     expect(proposal.gaps.map(({ code, locator }) => [code, locator])).toEqual(['architecture-checkout.md', 'architecture-payments.md', 'architecture-ux.md', 'architecture-ops.md'].map((name) => ['intake_missing_architecture', name]));
   });
-
 
   it('refuses a second breakdown, other TOML and a misnamed breakdown by name', async () => {
     const h = epicFolder({ 'epic-cart/other.toml': TICKETS, 'other/tickets.toml': TICKETS });
@@ -415,6 +414,19 @@ describe('approval of a v7 breakdown (#429)', () => {
     expect(h.pipeline.entry(id)!.state).toBe('admitted');
     h.ledger.setJobStatus(id, 'binned');
   }, 1));
+
+  it('a recorded conflict refuses approval of any slice until a refinement settles it', async () => {
+    const h = approvalFixture(settled, { 'epic-cart/epic-cart.md': EPIC.replace('- Decision: codes', '- Source conflict: R2 — the epic allows one code vs AD-1 which allows stacking.\n- Decision: codes') });
+    const first = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source() });
+    expect(first.plan.questions).toHaveLength(1);
+    const one = { repoPath: h.repo, intakeId: 'cart', requestId: 'r1', revisionId: first.revisionId, expectedToken: null };
+    const reviewed = h.approval.review(one).review!;
+    expect(() => h.approval.approve({ ...one, expectedToken: reviewed.token, selected: ['entry-1'] })).toThrow(expect.objectContaining({ code: 'intake_incomplete_plan' }));
+    const settledPlan = await h.service.revise({ repoPath: h.repo, intakeId: 'cart', requestId: 'r2', previousRequestId: 'r1', revisionId: first.revisionId, plan: { ...first.plan, questions: [] } });
+    const two = { repoPath: h.repo, intakeId: 'cart', requestId: 'r2', revisionId: settledPlan.revisionId, expectedToken: reviewed.token };
+    const readback = h.approval.approve({ ...two, expectedToken: h.approval.review(two).review!.token, selected: ['entry-1'] });
+    expect(readback.accepted.map(({ heistId }) => heistId)).toEqual(['entry-1']);
+  });
 
   it('an approval retry enqueues the frozen recorded entries, even when this build renders briefings differently', async () => {
     const h = approvalFixture(settled);
