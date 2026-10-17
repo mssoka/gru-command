@@ -68,7 +68,7 @@ import {
   SETTLED_PREVIEW_SIZE,
   type SectionId,
 } from '../lib/board-sections.js';
-import { railChips, type RailChip } from '../lib/board-rail.js';
+import { cockpitCards, gruQueueLine, healthPill, type CockpitCard } from '../lib/cockpit.js';
 import { BOARD_WORDS, heistCount, megaminionCount } from '../lib/board-vocabulary.js';
 import { familyStatusBreakdown, isLiveMegaminion } from '../lib/board-family.js';
 import { formatAge } from '../lib/board-time.js';
@@ -142,13 +142,6 @@ const LENS_STATE_LABEL: Readonly<Record<string, string>> = {
   unused: '—',
 };
 
-/** Slim-strip group marker tones (Heists / PRs / Crew), by group label. */
-const STRIP_GROUP_TONE: Readonly<Record<string, string>> = {
-  HEISTS: 'work',
-  PRS: 'rev',
-  CREW: 'done',
-};
-
 function validWakeStamp(stamp: string | null): string | null {
   if (stamp === null || stamp === '') return null;
   const parsed = Date.parse(stamp);
@@ -185,7 +178,11 @@ export class BoardView {
   private readonly mount: HTMLElement;
   private readonly ownerMount: HTMLElement;
   private readonly boardNav: HTMLElement;
-  private readonly chipRail: HTMLElement;
+  /** Cockpit: the command bar's health pill and the KPI cards. */
+  private readonly healthMount: HTMLElement;
+  private readonly healthSummary: HTMLElement;
+  private readonly healthParts: HTMLElement;
+  private readonly kpiMount: HTMLElement;
   private readonly agentsCount: HTMLElement;
   /** Managed repository overview (compact rows A) — rendered below the
    * crew list inside the same rail panel. */
@@ -311,7 +308,10 @@ export class BoardView {
       const observer = new ResizeObserver(() => this.measureNav());
       observer.observe(this.boardNav);
     }
-    this.chipRail = mustGet('chip-rail');
+    this.healthMount = mustGet('command-health');
+    this.healthSummary = mustGet('command-health-summary');
+    this.healthParts = mustGet('command-health-parts');
+    this.kpiMount = mustGet('board-kpis');
     this.agentsCount = mustGet('rail-agents-count');
     this.repoOverview = new RepoOverviewPanel(mustGet('board-repos'), {
       ageNode: (className, since, prefix, suffix) => this.ageNode(className, since, prefix, suffix),
@@ -453,7 +453,8 @@ export class BoardView {
     const ownerFocus = captureOwnerFocusKey(this.ownerMount);
     this.currentSections = null; // one fresh derivation per render
     this.renderOwnerActions(effective);
-    this.renderRail(effective);
+    this.renderHealth(effective);
+    this.renderKpis(effective);
     this.renderNav(effective);
     this.renderJobs(effective);
     this.restoreFocusKey(focusKey);
@@ -649,8 +650,22 @@ export class BoardView {
     const count = el('span', 'board-band__count lbl');
     count.append(el('span', 'num board-band__count-num', String(rows.length)), document.createTextNode(' pending'));
     head.append(el('span', 'board-band__label', 'FOR YOU'), count);
+    // The attention card (cockpit rework): what needs you, then one line
+    // about Gru's own queue (NEEDS GRU — the live machine count the strip's
+    // ALERTS pair used to carry).
+    const gru = gruQueueLine(snapshot.unackedActionRequired);
+    const gruLine = (className: string): HTMLElement => {
+      const node = el('span', className, gru.text);
+      node.title = gru.title;
+      return node;
+    };
+    if (rows.length > 0) {
+      head.append(el('span', 'board-owner__headline', `${rows.length} ${rows.length === 1 ? 'thing needs' : 'things need'} you`));
+      head.append(gruLine('lbl board-owner__gru'));
+    }
     mount.append(head);
     mount.hidden = false;
+    mount.dataset.empty = String(rows.length === 0);
     if (rows.length === 0) {
       // An empty owner list is healthy, not absence — the calm clear
       // state NEEDS GRU uses (never hidden, never a false alarm).
@@ -658,7 +673,7 @@ export class BoardView {
       clear.append(
         el('span', 'board-band__clear-mark', '✓'),
         el('div', 'board-band__clear-text', 'nothing needs you'),
-        el('div', 'lbl board-band__clear-hint', 'pending owner actions land here'),
+        gruLine('lbl board-band__clear-hint board-owner__gru'),
       );
       mount.append(clear);
     } else {
@@ -1089,116 +1104,98 @@ export class BoardView {
   }
 
   // ------------------------------------------------------------------
-  // Slim status strip (v7 compact density): one wrapping status row plus
-  // three stable count groups — same snapshot and derivations as the pill
-  // rail it replaces, so the strip can never disagree with the board.
+  // Cockpit (owner-approved rework 2026-10-17): the command bar's health
+  // pill and the KPI cards at the top of the board column. They replace
+  // the slim status strip and read its derivations, so neither can
+  // disagree with the board below them.
   // ------------------------------------------------------------------
 
-  private renderRail(snapshot: BoardSnapshot): void {
-    this.chipRail.hidden = false;
-    const chips = railChips(snapshot);
+  /** The health pill: the checks that need a look first (pink, with their
+   * flag), then the rest; the Jev and wake chips ride at its end. The dot
+   * is decoration — the summary text carries the fact (never colour alone). */
+  private renderHealth(snapshot: BoardSnapshot): void {
+    const pill = healthPill(snapshot);
+    this.healthMount.hidden = false;
+    this.healthMount.dataset.attention = String(pill.attention);
+    this.healthMount.title = pill.title;
+    this.healthSummary.textContent = pill.summary;
+    this.healthParts.replaceChildren();
+    for (const part of pill.parts) {
+      const node = el('span', `command-health__part command-health__part--${part.tone}`);
+      node.dataset.check = part.id;
+      node.title = part.title;
+      node.append(document.createTextNode(part.text));
+      if (part.flag !== null) {
+        node.append(el('span', `pp-chip ${part.tone === 'alert' ? 'pp-chip--alert' : 'pp-chip--work'} command-health__flag`, part.flag));
+      }
+      this.healthParts.append(node);
+    }
     this.renderTrackerChips(snapshot);
-    this.chipRail.replaceChildren();
-    const row = el('div', 'strip-status');
-    for (const chip of chips) {
-      if (chip.id !== 'trackers') row.append(this.statusPairNode(chip));
+  }
+
+  /** Six KPI cards (five when the server sends no raids block): a headline
+   * number that stands alone, then labelled facts. Every number keeps its
+   * `data-kpi` identity; zeros fade, alerts carry a ▲ beside the colour. */
+  private renderKpis(snapshot: BoardSnapshot): void {
+    this.kpiMount.hidden = false;
+    const grid = el('div', 'cockpit-kpis__grid');
+    grid.append(...cockpitCards(snapshot).map((card) => this.kpiCard(card)));
+    this.kpiMount.replaceChildren(grid);
+  }
+
+  private kpiCard(card: CockpitCard): HTMLElement {
+    // A labelled group, not a heading or region landmark (#401): the cards
+    // render on every page, and six headings ahead of FOR YOU would pad
+    // screen-reader navigation. The visible label is its accessible name.
+    const node = el('article', `cockpit-card cockpit-card--${card.id}${card.off ? ' cockpit-card--off' : ''}`);
+    node.dataset.card = card.id;
+    node.setAttribute('role', 'group');
+    node.setAttribute('aria-label', card.label);
+    const head = el('div', 'cockpit-card__head');
+    const mark = el('span', 'cockpit-card__mark');
+    mark.setAttribute('aria-hidden', 'true');
+    head.append(mark, el('span', 'cockpit-card__label', card.label));
+    if (card.aside !== null) {
+      const aside = el('span', 'cockpit-card__aside', card.aside);
+      if (card.asideTitle !== undefined && card.asideTitle !== null) aside.title = card.asideTitle;
+      head.append(aside);
     }
-    row.append(this.decisionsChip, this.wakesChip);
-    this.chipRail.append(
-      row,
-      this.stripGroupsNode(chips.find((chip) => chip.id === 'trackers') ?? null),
-    );
-  }
-
-  /** One terse labeled pair; the tone dot is decoration — the label and
-   * value text carry the fact (never colour alone). */
-  private statusPairNode(chip: RailChip): HTMLElement {
-    const pair = el('span', `strip-pair strip-pair--${chip.tone}`);
-    pair.dataset.chip = chip.id;
-    pair.title = chip.titleAttr;
-    const dot = el('span', 'strip-dot');
-    dot.setAttribute('aria-hidden', 'true');
-    pair.append(dot, el('span', 'strip-key', chip.label), this.stripValueNode(chip));
-    if (chip.flag !== null) pair.append(this.stripFlagNode(chip));
-    return pair;
-  }
-
-  /** The value with its numeric part in a reserved tabular slot, fed by
-   * the same derivation that produced the plain string — never re-derived. */
-  private stripValueNode(chip: RailChip): HTMLElement {
-    const value = el('span', 'strip-value');
-    const split = chip.valueSplit;
-    if (split.lead !== '') value.append(el('span', 'strip-value__txt', `${split.lead} `));
-    if (split.num !== null) value.append(el('span', 'num strip-value__num', String(split.num)));
-    if (split.unit !== '') value.append(el('span', 'strip-value__txt', split.unit));
-    if (value.childElementCount === 0) value.append(el('span', 'strip-value__txt', chip.value));
-    return value;
-  }
-
-  /** Flags split their numeric part too ("3" + " FAILED"). */
-  private stripFlagNode(chip: RailChip): HTMLElement {
-    const flag = el('span', 'pp-chip pp-chip--alert strip-flag');
-    flag.title = chip.titleAttr;
-    const split = chip.flagSplit;
-    if (split !== null && split.num !== null) {
-      flag.append(el('span', 'num strip-flag__num', String(split.num)));
-      flag.append(el('span', 'strip-flag__txt', split.unit));
-    } else {
-      flag.append(el('span', 'strip-flag__txt', chip.flag ?? ''));
-    }
-    return flag;
-  }
-
-  /** Heists / PRs / Crew (plus CHILDREN when the server reported it):
-   * stable groups with a reserved total slot and one labeled pair per
-   * count. Every number keeps its `data-kpi` identity. */
-  private stripGroupsNode(trackers: RailChip | null): HTMLElement {
-    const groups = el('div', 'strip-groups');
-    if (trackers === null) return groups;
-    groups.dataset.chip = 'trackers';
-    // The chip's long-form explanation survives the re-face (preserved
-    // title text): hover/AT users keep the Heists/PRs/minions + Jev fact.
-    groups.title = trackers.titleAttr;
-    for (const group of trackers.kpis ?? []) {
-      // A labelled group, not a heading or region landmark (#401): the
-      // sticky strip renders on every page, and three h2s/regions ahead of
-      // FOR YOU would pad screen-reader heading/landmark navigation. The
-      // visible label is also its accessible name; the full status
-      // enumeration remains available through the tooltip below.
-      const groupNode = el('div', `strip-group strip-group--${STRIP_GROUP_TONE[group.label] ?? 'park'}`);
-      groupNode.setAttribute('role', 'group');
-      groupNode.setAttribute('aria-label', group.label);
-      const head = el('div', 'strip-group__head');
-      const mark = el('span', 'strip-group__mark');
-      mark.setAttribute('aria-hidden', 'true');
-      head.append(mark, el('span', 'strip-group__name', group.label));
-      if (group.total !== undefined) {
-        const total = el('span', 'strip-group__total');
-        const totalNum = el('span', 'num strip-group__total-num', String(group.total.value));
-        totalNum.dataset.kpi = group.total.kpi;
-        totalNum.title = group.total.title;
-        total.append(totalNum);
-        head.append(total, el('span', 'strip-group__unit', group.total.label));
+    const headline = el('div', 'cockpit-card__headline');
+    const big = el('span', 'num cockpit-card__big', card.headline.value);
+    if (card.headline.kpi !== null) big.dataset.kpi = card.headline.kpi;
+    big.title = card.headline.title;
+    headline.append(big, el('span', 'cockpit-card__unit', card.headline.unit));
+    node.append(head, headline);
+    const flow = card.flow;
+    if (flow !== null) {
+      const bar = el('div', 'cockpit-flow');
+      bar.setAttribute('role', 'img');
+      bar.setAttribute('aria-label', flow.map((stage) => `${stage.value} ${stage.stage.replace('-', ' ')}`).join(', '));
+      for (const stage of flow) {
+        if (stage.value === 0) continue;
+        const segment = el('span', `cockpit-flow__seg cockpit-flow__seg--${stage.stage}`);
+        segment.style.flexGrow = String(stage.value);
+        bar.append(segment);
       }
-      const pairs = el('p', 'strip-group__pairs');
-      pairs.title = group.title;
-      for (const value of group.values) {
-        const item = el('span', 'strip-kpi');
-        const key = el('span', 'strip-kpi__k', value.label);
-        key.title = value.title;
-        const num = el('span', 'num strip-kpi__num', String(value.value));
-        num.dataset.kpi = value.kpi;
-        num.title = value.title;
-        if (value.kpi === 'prs.conflicting' && value.value > 0) {
-          num.classList.add('strip-kpi__num--alert');
-        }
-        item.append(key, num);
-        pairs.append(item);
-      }
-      groupNode.append(head, pairs);
-      groups.append(groupNode);
+      node.append(bar);
     }
-    return groups;
+    const facts = el('p', 'cockpit-card__facts');
+    card.facts.forEach((fact, index) => {
+      const stage = flow?.[index]?.stage;
+      const item = el(
+        'span',
+        `cockpit-fact${fact.value === 0 ? ' cockpit-fact--zero' : ''}${fact.alert ? ' cockpit-fact--alert' : ''}${stage === undefined ? '' : ` cockpit-fact--stage cockpit-fact--${stage}`}`,
+      );
+      item.title = fact.title;
+      const num = el('span', 'num cockpit-fact__num', String(fact.value));
+      num.dataset.kpi = fact.kpi;
+      num.title = fact.title;
+      item.append(num, el('span', 'cockpit-fact__label', fact.label));
+      facts.append(item);
+    });
+    for (const text of card.notes) facts.append(el('span', 'cockpit-fact cockpit-fact--note', text));
+    if (facts.childElementCount > 0) node.append(facts);
+    return node;
   }
 
   // ------------------------------------------------------------------
@@ -1378,11 +1375,22 @@ export class BoardView {
     const sections = this.sectionsFor(snapshot);
     const stoppedWorkers = stoppedWorkersByJob(snapshot.agents);
     this.jobSignals = { unacked, stoppedWorkers };
-    this.mount.append(this.jobsSection('in-flight', sections.bands.get('in-flight') ?? [], unacked, stoppedWorkers));
-    this.mount.append(this.pipelineSection(sections));
-    this.mount.append(this.forGruSection(sections.bands.get('needs-you') ?? [], unacked, stoppedWorkers, snapshot));
-    this.mount.append(this.jobsSection('settled', settledJobs(sections.bands.get('settled') ?? []), unacked, stoppedWorkers));
-    this.mount.append(this.coldSection(sections.bands.get('cold') ?? [], unacked, stoppedWorkers));
+    const nodes = [
+      this.jobsSection('in-flight', sections.bands.get('in-flight') ?? [], unacked, stoppedWorkers),
+      this.pipelineSection(sections),
+      this.forGruSection(sections.bands.get('needs-you') ?? [], unacked, stoppedWorkers, snapshot),
+      this.jobsSection('settled', settledJobs(sections.bands.get('settled') ?? []), unacked, stoppedWorkers),
+      this.coldSection(sections.bands.get('cold') ?? [], unacked, stoppedWorkers),
+    ];
+    // Cockpit rework: a section with rows is a card, in the approved order;
+    // only EMPTY sections fold into the one Empty row after the cards.
+    const empty = nodes.filter((node) => node.dataset.empty === 'true');
+    this.mount.append(...nodes.filter((node) => node.dataset.empty !== 'true'));
+    if (empty.length > 0) {
+      const row = el('div', 'board-folded');
+      row.append(el('span', 'board-folded__lead lbl', 'Empty'), ...empty);
+      this.mount.append(row);
+    }
     const seenIds = new Set<string>();
     for (const group of sections.bands.values()) for (const entry of group) seenIds.add(entry.job.id);
     for (const group of sections.children.values()) for (const entry of group) seenIds.add(entry.job.id);
@@ -1438,6 +1446,24 @@ export class BoardView {
     return el('div', 'board-band__empty lbl', text);
   }
 
+  /** An empty section folds into the Empty row (cockpit rework): a pill
+   * that keeps the section's id — the shortcut strip still lands on it —
+   * and carries why it is empty for screen readers and the tooltip. */
+  private emptySection(sectionId: SectionId, label: string, count: string, reason: string): HTMLElement {
+    const pill = el('span', 'board-folded__pill');
+    pill.id = `board-section-${sectionId}`;
+    pill.dataset.section = sectionId;
+    pill.dataset.empty = 'true';
+    pill.tabIndex = -1;
+    pill.title = reason;
+    pill.append(
+      el('span', 'board-folded__label', label),
+      el('span', 'num board-folded__count', count),
+      el('span', 'board-folded__reason', reason),
+    );
+    return pill;
+  }
+
   /** In flight (preview 5) and Settled (preview 3): the existing
    * authoritative band order, bounded; Show all/Show fewer reversible. */
   private jobsSection(
@@ -1447,11 +1473,10 @@ export class BoardView {
     stoppedWorkers: ReadonlyMap<string, WorkerStopView>,
   ): HTMLElement {
     const label = band === 'in-flight' ? BAND_LABELS['in-flight'] : BAND_LABELS.settled;
-    const { section, body, bodyId } = this.sectionShell(band, band, label, heistCount(jobs.length));
     if (jobs.length === 0) {
-      body.append(this.emptyLine(band === 'in-flight' ? 'nothing in flight right now' : 'nothing settled yet'));
-      return section;
+      return this.emptySection(band, label, '0', band === 'in-flight' ? 'nothing in flight right now' : 'nothing settled yet');
     }
+    const { section, body, bodyId } = this.sectionShell(band, band, label, heistCount(jobs.length));
     const expanded = band === 'in-flight' ? this.inFlightExpanded : this.settledExpanded;
     const window = band === 'in-flight' ? inFlightWindow(jobs, expanded) : settledPreview(jobs, expanded);
     const rows = el('div', 'board-band__rows');
@@ -1492,6 +1517,12 @@ export class BoardView {
    * entries are labelled honestly. */
   private pipelineSection(sections: ReturnType<typeof boardSections>): HTMLElement {
     const entries = sections.pipelineEntries;
+    if (!sections.pipelineAvailable) {
+      return this.emptySection('pipeline', 'PIPELINE', '—', 'pipeline queue unavailable on this server');
+    }
+    if (entries.length === 0 && sections.counts.pipeline === 0) {
+      return this.emptySection('pipeline', 'PIPELINE', '0', 'no approved work waiting');
+    }
     const { section, body, bodyId } = this.sectionShell(
       'pipeline',
       'pipeline',
@@ -1500,10 +1531,6 @@ export class BoardView {
       // the preview window only bounds the rows.
       `${sections.counts.pipeline} queued`,
     );
-    if (!sections.pipelineAvailable) {
-      body.append(this.emptyLine('pipeline queue unavailable on this server'));
-      return section;
-    }
     if (entries.length === 0) {
       body.append(this.emptyLine('no approved work waiting'));
       return section;
@@ -1545,6 +1572,16 @@ export class BoardView {
     stoppedWorkers: ReadonlyMap<string, WorkerStopView>,
     snapshot: BoardSnapshot,
   ): HTMLElement {
+    // A last-known board keeps the full card: its warning must stay visible.
+    if (this.unavailableReason === null) {
+      if (snapshot.mailbox === undefined || snapshot.mailbox === null) {
+        return this.emptySection('for-gru', BAND_LABELS['needs-you'], '—', 'FOR GRU mailbox unavailable on this server');
+      }
+      const open = snapshot.mailbox.items.some((item) => item.kind === 'incident' && item.state !== 'resolved');
+      if (jobs.length === 0 && !open && snapshot.mailbox.counts.threads + snapshot.mailbox.counts.incidents === 0) {
+        return this.emptySection('for-gru', BAND_LABELS['needs-you'], '0', 'nothing needs Gru · the crew is on it');
+      }
+    }
     const { section, head, body, bodyId } = this.sectionShell(
       'for-gru',
       'needs-you',
@@ -1620,11 +1657,8 @@ export class BoardView {
     unacked: ReadonlyMap<string, number>,
     stoppedWorkers: ReadonlyMap<string, WorkerStopView>,
   ): HTMLElement {
+    if (jobs.length === 0) return this.emptySection('cold', BAND_LABELS.cold, '0', 'no cold records');
     const { section, head, body, bodyId } = this.sectionShell('cold', 'cold', BAND_LABELS.cold, heistCount(jobs.length));
-    if (jobs.length === 0) {
-      body.append(this.emptyLine('no cold records'));
-      return section;
-    }
     const toggle = this.sectionToggle({
       sectionId: 'cold',
       bodyId,
@@ -2269,9 +2303,18 @@ export class BoardView {
     // renders no marker — legacy rows are never claimed either way.
     const parentage = agent.parentage;
     const isChild = parentage === 'child';
+    // Cockpit rework: the worker of a megaminion heist reads megaminion,
+    // and Vector's raid session (Perkins's read-only role under the
+    // `vector` label, #351) reads as the raid it is.
+    const vectorRaid = agent.role === 'perkins' && agent.label === 'vector';
+    const roleWord = vectorRaid
+      ? 'vector raid'
+      : agent.role === 'minion' && (job?.parentJobId ?? null) !== null
+        ? BOARD_WORDS.megaminion
+        : agent.role;
     subline.append(
-      el('span', 'board-agent__emoji', ROLE_EMOJI[agent.role] ?? '🤖'),
-      el('span', 'board-agent__role', isChild ? `child · ${status}` : `${agent.role} · ${status}`),
+      el('span', 'board-agent__emoji', vectorRaid ? '🦑' : ROLE_EMOJI[agent.role] ?? '🤖'),
+      el('span', 'board-agent__role', isChild ? `child · ${status}` : `${roleWord} · ${status}`),
     );
     if (parentage === 'top-level' || parentage === 'child') {
       subline.append(

@@ -95,19 +95,21 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
 
 ## The UI (`web/`)
 
-- **Cockpit (v6.1):** the estate is full-width. The sticky **command bar**
-  carries the brand + `ONE GRU · ONE WINDOW`, the monospace ticker
-  (`MODE` · `RADAR` · top review round), the notification bell, the
-  owner-chime speaker, theme and
+- **Cockpit (rework, owner-approved 2026-10-17):** the estate is
+  full-width. The sticky **command bar** — the only sticky chrome above the
+  board — carries the logo badge + `ONE GRU · ONE WINDOW`, the RADAR and
+  ROUND pills, the **health pill** (deploy, Silas, verify, disk and cure,
+  the ones that need a look first, then the Jev decisions and Gru wake
+  chips), the owner-chime speaker, the notification bell, theme and
   settings — no lens toggle: chat is always docked on desktop and the FAB
-  owns mobile chat. Below it the sticky **slim status strip** renders the
-  v4 health row as labelled status pairs (DEPLOY → REVIEWS → SILAS →
-  ALERTS → VERIFY → CURE) plus the Jev decisions / NEEDS GRU / wake facts
-  and the HEISTS / PRS / CREW count groups (`HEISTS 17 · working 2 · in
-  review 2 · …`, every number a `data-kpi` span tied to the same
-  `boardKpis` derivation the v4 strip used). Numeric slots are reserved
-  (`tabular-nums` + a floor), so a count crossing 9→10→100→1000 never
-  reflows its neighbours. At ≥1100px it is three panes — chat (~30%, collapsible,
+  owns mobile chat. The board column opens with six **KPI cards**:
+  HEISTS (with a stage bar toward done), MEGAMINIONS, CREW (sub-minions
+  folded in when reported), PRS, REVIEWS and VECTOR RAIDS (from the
+  snapshot's `vector` block; dashed `off` until raids are enabled, absent
+  from an older server). Every number is a `data-kpi` span tied to the same
+  derivations the v4 strip used; a headline number stands alone and grows
+  freely, fact counts reserve two digits (`tabular-nums` + a floor), so
+  0–99 never reflows a label. At ≥1100px it is three panes — chat (~30%, collapsible,
   resizable) | board | crew rail — with 4px drag splitters (sizes persist
   per breakpoint; double-click resets). At 900–1099px the board + rail
   hold the page and chat overlays via the Gru FAB (right drawer, dimmed
@@ -151,9 +153,15 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   (line 1: dot + title + status chip; line 2: repo + branch + heist/minion
   ages + PR link), with sticky band headers carrying counts and hairline
   dividers. Failing rows (blocked/error, aborted round, errored lenses
-  without a verdict) are tinted with a left alert accent. NEEDS GRU is
-  always visible (empty = calm “nothing needs Gru”); FOR YOU belongs only
-  to the owner band. SETTLED is a rolling
+  without a verdict) are tinted with a left alert accent. Each band with
+  rows is a card (cockpit rework); every EMPTY section folds into one
+  Empty row of pills after the cards, each pill keeping its section's id
+  (so the shortcut strip still lands on it) and saying why it is empty
+  (an empty FOR GRU reads “nothing needs Gru · the crew is on it”). A
+  last-known FOR GRU keeps its full card, so its warning stays visible.
+  FOR YOU belongs only to the owner band, which reads as the attention
+  card: what needs you, then one line about Gru's own queue (`Gru is
+  handling 2 more in FOR GRU`, or `nothing needs Gru either`). SETTLED is a rolling
   window (latest 10 + `+K older settled`, session-expanded; concluded
   jobs render their last round quiescent — no stale blocker pills). Click
   a row to disclose lane + rounds (v3 collapse, persisted per job).
@@ -188,8 +196,8 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   CURRENT singleton-role owner (`gru`/`silas`/`bob`) is marked `⚠
   duplicate` — an anomaly surfaced, never silently discarded; a review
   pool (`perkins`) runs lead + specialists concurrently and never
-  triggers the mark. The TRACKERS crew counts follow the same
-  classification and derived status, so the strip and the rail cannot
+  triggers the mark. The CREW card counts follow the same
+  classification and derived status, so the card and the rail cannot
   disagree. Clicking an agent with a session file opens its transcript.
   Supervision activity (open turn/control/tool calls) changes without a
   ledger event, so the board also refreshes every heartbeat interval —
@@ -237,7 +245,7 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   including those older than the recent feed; it wakes Gru once and
   refuses human Ack. Rows bound to a terminal merged/done/binned lane are
   CLOSED RECEIPTS: they render under FEED, never as live queue entries,
-  and the strip's live ALERTS count does not count them), and FEED (FYI rows
+  and the attention card's live NEEDS GRU count does not count them), and FEED (FYI rows
   plus closed receipts). Route assignment is enforced server-side: only
   registered owner-reserved kinds can reach FOR YOU; a `needs-owner`
   request from any unregistered or machine kind is routed to Gru

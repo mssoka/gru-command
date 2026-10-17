@@ -147,12 +147,15 @@ body {
 /* App shell                                                           */
 /* ------------------------------------------------------------------ */
 
-/* ── Global command bar (v6): one flat row — brand + ticker + lenses ── */
+/* ── Global command bar (cockpit rework 2026-10-17): logo badge, the
+   RADAR/ROUND pills, the health pill, then chime/bell/theme/settings. The
+   only sticky chrome above the board; it wraps instead of clipping. ── */
 
 .command-bar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 14px;
+  gap: 8px 12px;
   min-height: 56px;
   padding: 8px 16px;
   border-bottom: var(--outline);
@@ -162,16 +165,27 @@ body {
   z-index: 30;
 }
 
+/* The brand never shrinks: the health pill is the one that gives way. */
 .command-bar__brand {
+  flex: none;
   display: flex;
   align-items: center;
   gap: 10px;
   min-width: 0;
 }
 
+/* The logo badge: the brain on a minion-yellow coin. */
 .command-bar__logo {
-  font-size: 24px;
-  filter: drop-shadow(2px 2px 0 rgba(34, 48, 74, 0.2));
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  border: var(--outline);
+  border-radius: 50%;
+  background: var(--work);
+  font-size: 19px;
+  box-shadow: var(--shadow-btn-pressed);
 }
 
 .command-bar__names {
@@ -182,7 +196,7 @@ body {
 }
 
 .command-bar__title {
-  font-size: 16px;
+  font-size: 17px;
   font-weight: 800;
   letter-spacing: 0.01em;
   white-space: nowrap;
@@ -197,31 +211,173 @@ body {
   white-space: nowrap;
 }
 
-/* The ticker: monospace, pipe-separated, one calm line. */
+/* RADAR + ROUND: two mono pills. RADAR's dot is the connection dot. */
 .command-bar__ticker {
-  flex: 1;
-  min-width: 0;
+  flex: none;
   display: flex;
   align-items: center;
   gap: 8px;
-  overflow: hidden;
-  white-space: nowrap;
+}
+
+.command-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 12px;
+  border: var(--outline-thin);
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--ink);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+}
+
+.command-pill .conn-dot {
+  width: 9px;
+  height: 9px;
+  border-width: 2px;
+}
+
+.command-pill--ok { background: var(--done); color: var(--on-state); }
+.command-pill--warn { background: var(--work); color: var(--on-state); }
+.command-pill--alert { background: var(--alert); color: var(--on-state); }
+.command-pill--round-none { border-style: dashed; background: transparent; color: var(--muted); }
+.command-pill--round-live { background: var(--perkins); color: var(--on-state); }
+.command-pill--round-pending { background: var(--soft); color: var(--ink); }
+
+/* The health pill: the system checks in one line, problems first. The
+   parts ellipsize inside the pill; the title keeps every check whole. */
+/* Line breaking sees only the pill's floor (260px), so the bar stays one
+   row while the pill fits and wraps it — never overflows — when it does
+   not (a narrow pane or page zoom, which media queries cannot see); the
+   pill then grows up to its content and its checks ellipsize. */
+.command-health {
+  margin-left: auto;
+  flex: 1 1 0;
+  min-width: min(100%, 260px);
+  max-width: max-content;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  padding: 4px 6px 4px 12px;
+  border: var(--outline);
+  border-radius: 20px;
+  background: var(--card);
+  box-shadow: var(--shadow-btn-pressed);
+}
+
+/* A light alert tint (the calm checks keep >= 4.5:1 on it); dark mode
+   keeps its own deep fill. */
+.command-health[data-attention='true'] {
+  background: color-mix(in srgb, var(--alert) 22%, var(--card));
+}
+
+.dark .command-health[data-attention='true'] {
+  background: var(--danger-soft);
+}
+
+/* The buttons never shrink: when the bar is tight, the health pill alone
+   gives way (its checks ellipsize), so nothing beside it moves. */
+.command-bar > .pp-btn {
+  flex: none;
+}
+
+.command-health__dot {
+  flex: none;
+  width: 10px;
+  height: 10px;
+  border: 2px solid var(--line);
+  border-radius: 50%;
+  background: var(--done);
+}
+
+.command-health[data-attention='true'] .command-health__dot {
+  background: var(--alert);
+}
+
+.command-health__summary {
+  flex: none;
+  font-size: 13px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.command-health[data-attention='true'] .command-health__summary {
+  color: var(--band-needs-you-ink);
+}
+
+/* The ▲ beside the colour: attention is never carried by colour alone. */
+.command-health[data-attention='true'] .command-health__summary::before {
+  content: '▲ ';
+  font-size: 10px;
+}
+
+/* The checks fill the room left on the pill's first line and ellipsize;
+   their small floor keeps line breaking from pushing them to a line of
+   their own. A pill too narrow for its chips wraps them under it. */
+.command-health__parts {
+  flex: 1 1 0;
+  min-width: 48px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
   font-weight: 700;
-  letter-spacing: 0.05em;
   color: var(--muted);
 }
 
-.command-ticker__segment {
-  overflow: hidden;
-  text-overflow: ellipsis;
+.command-health__part + .command-health__part::before {
+  content: '·';
+  margin: 0 6px;
+  color: var(--faint);
 }
 
-.command-ticker__segment--ok { color: var(--ink); }
-.command-ticker__segment--warn { color: var(--band-needs-you-ink); }
-.command-ticker__segment--alert { color: var(--band-needs-you-ink); }
-.command-ticker__sep { color: var(--faint); }
+.command-health__part--alert,
+.command-health__part--warn {
+  color: var(--band-needs-you-ink);
+  font-weight: 800;
+}
+
+.command-health__flag {
+  margin-left: 5px;
+  padding: 1px 7px;
+  font-size: 9.5px;
+}
+
+.command-health .board-decisions,
+.command-health .board-wakes {
+  flex: none;
+  font-size: 10.5px;
+  padding: 2px 9px;
+}
+
+/* The wakes chip carries its own ink (the chip's card fill flips
+   instantly on a theme change while an inherited body color would still
+   be animating — an inherited ink can never be the chip's contrast). */
+.command-health .board-wakes {
+  color: var(--ink);
+}
+
+/* Below the cockpit width the health pill takes its own full-width row
+   under the brand, pills and buttons. */
+@media (max-width: 1099px) {
+  .command-bar > .board-sound { margin-left: auto; }
+  .command-health { order: 2; margin-left: 0; flex: 1 1 100%; max-width: none; }
+}
+
+/* Phone: the pills join the health pill's row; the checks' text gives way
+   to the summary, and the chips wrap inside the pill. */
+@media (max-width: 640px) {
+  .command-bar__ticker { order: 1; }
+  .command-health { flex: 1 1 auto; flex-wrap: wrap; row-gap: 4px; border-radius: var(--radius-md); }
+  .command-health__parts { display: none; }
+  .command-health .board-decisions,
+  .command-health .board-wakes { white-space: normal; }
+}
 
 .conn-dot {
   width: 12px;
@@ -252,232 +408,222 @@ body {
   50% { opacity: 0.35; }
 }
 
-/* ── Slim status strip (v7 compact density, approved sample #spec2): one
-   wrapping status row + three stable count groups. Same derivations as
-   the pill rail it replaces; density comes from hierarchy/spacing only.
-   The rail is a size container: the group columns engage at its 640px
-   inline-size transition (the sample's), so 768px keeps tablet density
-   and 360px stacks naturally. Never nowrap, never overflow-masked. ── */
+/* ── Cockpit KPI cards (cockpit rework 2026-10-17): six cards at the top
+   of the board column — heists, megaminions, crew, PRs, reviews, Vector
+   raids. Two columns, three from 520px, six from 1000px (the wrapper is a
+   size container, so a collapsed chat or a dragged splitter re-flows them
+   like a resize). Never nowrap-clipped: facts wrap. ── */
+.cockpit-kpis {
+  container: kpis / inline-size;
+  min-width: 0;
+}
 
-.chip-rail {
-  position: sticky;
-  top: var(--command-bar-h, 56px);
-  z-index: 29;
+.cockpit-kpis__grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+@container kpis (min-width: 520px) {
+  .cockpit-kpis__grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+@container kpis (min-width: 1000px) {
+  .cockpit-kpis__grid { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+}
+
+.cockpit-card {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 4px;
+  padding: 10px 13px 11px;
+  border: var(--outline);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  box-shadow: var(--shadow-btn);
+}
+
+/* An off feature (raids before opt-in): dashed and flat, never alarming. */
+.cockpit-card--off {
+  border-style: dashed;
+  background: var(--soft);
+  box-shadow: none;
+}
+
+.cockpit-card__head {
   display: flex;
-  flex-direction: column;
-  container-type: inline-size;
-  padding: 6px 12px 8px;
-  background: var(--paper);
-  border-bottom: 2px solid var(--line);
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
 }
 
-/* Phone/tablet-portrait: the wrapped strip is tall (stacked groups), so a
-   sticky copy would permanently cover a third of the viewport and occlude
-   owner actions scrolled beneath it. Below 900px it scrolls away with the
-   page instead; the sticky offsets ignore it (see measureChrome). */
-@media (max-width: 899px) {
-  .chip-rail {
-    position: static;
-  }
+.cockpit-card__mark {
+  flex: none;
+  width: 14px;
+  height: 8px;
+  border: 1.5px solid var(--line);
+  border-radius: 5px;
+  background: var(--park);
 }
 
-/* Reserved tabular numeric slot: the NUMBER part only. Digits grow inside
-   the reserved box (9→10→100→1000 move nothing); counts beyond four digits
-   grow honestly and wrap — never clip. SCOPED to the two approved slim
-   surfaces (status strip + For-you band): a `.num` element anywhere else
-   keeps the app default, so this utility can never repaint an unrelated
-   band/panel (acceptance D). The e2e probe test and geometry measurements
-   in web/e2e/dashboard-strip.spec.ts prove both, not this declaration. */
-#chip-rail .num,
+.cockpit-card--heists .cockpit-card__mark { background: var(--work); }
+.cockpit-card--megaminions .cockpit-card__mark { background: linear-gradient(90deg, var(--work) 0 50%, var(--card) 50%); }
+.cockpit-card--crew .cockpit-card__mark { background: var(--done); }
+.cockpit-card--prs .cockpit-card__mark { background: var(--rev); }
+.cockpit-card--reviews .cockpit-card__mark { background: var(--perkins); }
+.cockpit-card--raids .cockpit-card__mark { background: repeating-linear-gradient(135deg, var(--work) 0 3px, var(--line) 3px 5.5px); }
+
+.cockpit-card__label {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.cockpit-card__aside {
+  margin-left: auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--faint);
+}
+
+.cockpit-card__headline {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* The headline number stands alone on its line (owner pick 2026-10-17):
+   when it grows only its own unit moves, so it reserves no slot. */
+.cockpit-card__big {
+  font-size: 28px;
+  font-weight: 800;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.cockpit-card--off .cockpit-card__big {
+  font-size: 20px;
+  color: var(--faint);
+}
+
+.cockpit-card__unit {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--muted);
+}
+
+/* HEISTS: the stages toward done, one segment per non-empty stage. */
+.cockpit-flow {
+  display: flex;
+  height: 9px;
+  margin-top: 3px;
+  border: 2px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--soft);
+}
+
+.cockpit-flow__seg { min-width: 6px; }
+.cockpit-flow__seg + .cockpit-flow__seg { border-left: 2px solid var(--line); }
+.cockpit-flow__seg--working,
+.cockpit-fact--working::before { background: var(--work); }
+.cockpit-flow__seg--in-review,
+.cockpit-fact--in-review::before { background: var(--rev); }
+.cockpit-flow__seg--merged,
+.cockpit-fact--merged::before { background: var(--done); }
+.cockpit-flow__seg--done,
+.cockpit-fact--done::before { background: color-mix(in srgb, var(--done) 45%, var(--card)); }
+
+.cockpit-card__facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+  margin: 2px 0 0;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--muted);
+}
+
+.cockpit-fact {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.cockpit-fact__num {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+  color: var(--ink);
+}
+
+/* Zeros step back (faint ink, still >= 4.5:1); real counts keep full ink. */
+.cockpit-fact--zero,
+.cockpit-fact--zero .cockpit-fact__num {
+  color: var(--faint);
+  font-weight: 600;
+}
+
+.cockpit-fact--alert,
+.cockpit-fact--alert .cockpit-fact__num {
+  color: var(--band-needs-you-ink);
+  font-weight: 800;
+}
+
+.cockpit-fact--alert::before {
+  content: '▲';
+  align-self: center;
+  font-size: 8px;
+}
+
+.cockpit-fact--stage::before {
+  content: '';
+  align-self: center;
+  width: 8px;
+  height: 8px;
+  border: 1.5px solid var(--line);
+  border-radius: 2px;
+}
+
+.cockpit-fact--note {
+  white-space: normal;
+  font-weight: 600;
+  color: var(--faint);
+}
+
+/* Reserved tabular numeric slots, SCOPED to the cockpit cards, the health
+   pill's wake chip and the For-you band (a `.num` anywhere else keeps the
+   app default). Fact counts and wake numbers reserve two digits (owner pick 2026-10-17: 0–99 never move a
+   label; larger counts grow honestly and wrap — never clip). The For-you
+   pending count keeps its four-digit floor. */
+#board-kpis .cockpit-fact__num,
+#command-health .num,
 #board-owner .num {
   font-variant-numeric: tabular-nums;
   display: inline-block;
   text-align: right;
 }
 
-/* Four digits must fit INSIDE the floor in each surface's own font
-   metrics (measured r6): the mono strip slots overshoot 4ch by up to
-   1/64px of sub-pixel rounding, and the sans tabular band slot overshoots
-   by a full digit advance (tabular figures are wider than the '0' glyph
-   the ch unit is derived from). These floors keep 9/10, 99/100 and
-   999/1000 inside ONE box per surface; 5-digit values (10000) still
-   exceed the floor and grow honestly. Geometry proven by measurement in
-   web/e2e/dashboard-strip.spec.ts, not by this declaration. */
-#chip-rail .num { min-width: calc(4ch + 1px); }
+/* The +1px absorbs the mono digits' sub-pixel overshoot of 2ch (up to
+   1/64px), so 9 and 10 sit in ONE box; 100 still grows honestly. */
+#board-kpis .cockpit-fact__num,
+#command-health .num { min-width: calc(2ch + 1px); }
 #board-owner .num { min-width: calc(4ch + 1em); }
 
-.strip-status {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  column-gap: 18px;
-  row-gap: 4px;
-  padding: 4px 0 8px;
-}
-
-.strip-pair {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 5px;
-  min-width: 0;
-  font-size: 12.5px;
-  font-weight: 700;
-}
-
-.strip-dot {
-  flex: none;
-  align-self: center;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--park);
-  border: 1.5px solid var(--line);
-}
-
-/* ONE tone per pair: a token-coloured dot beside the label; the label and
-   value text carry the fact (never colour alone). */
-.strip-pair--ok .strip-dot { background: var(--done); }
-.strip-pair--warn .strip-dot { background: var(--work); }
-.strip-pair--alert .strip-dot { background: var(--alert); }
-.strip-pair--muted .strip-dot { background: var(--park); }
-
-.strip-key {
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-}
-
-.strip-value,
-.strip-value__txt {
-  color: var(--ink);
-  font-weight: 700;
-}
-
-.strip-flag {
-  font-size: 10px;
-  padding: 2px 8px;
-}
-
-/* Stable count groups: three columns from the 640px container transition,
-   hairline separators between neighbours, natural stacking below it. */
-.strip-groups {
-  display: grid;
-  gap: 0;
-  padding: 0;
-}
-
-.strip-group {
-  min-width: 0;
-  padding: 8px 0 4px;
-}
-
-.strip-group + .strip-group {
-  border-top: 2px solid var(--line);
-}
-
-.strip-group__head {
-  display: flex;
-  align-items: baseline;
-  gap: 7px;
-  margin: 0 0 5px;
-}
-
-.strip-group__mark {
-  flex: none;
-  align-self: center;
-  width: 14px;
-  height: 8px;
-  border-radius: 5px;
-  background: var(--gmark, var(--park));
-  border: 1.5px solid var(--line);
-}
-
-.strip-group--work { --gmark: var(--work); }
-.strip-group--rev { --gmark: var(--rev); }
-.strip-group--done { --gmark: var(--done); }
-
-.strip-group__name {
-  font-size: 13px;
-  font-weight: 800;
-  letter-spacing: 0.01em;
-}
-
-.strip-group__total {
-  color: var(--ink);
-  font-size: 16.5px;
-  font-weight: 800;
-  line-height: 1;
-}
-
-.strip-group__unit {
-  font-size: 10.5px;
-  font-weight: 800;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: var(--faint);
-}
-
-.strip-group__pairs {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  column-gap: 16px;
-  row-gap: 4px;
-  margin: 0;
-  font-size: 12.5px;
-}
-
-.strip-kpi {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 5px;
-}
-
-.strip-kpi + .strip-kpi::before {
-  content: '·';
-  margin-right: 16px;
-  font-weight: 800;
-  color: var(--faint);
-}
-
-.strip-kpi__k {
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-}
-
-.strip-kpi__num {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 13px;
-  font-weight: 700;
-  color: var(--ink);
-}
-
-.strip-kpi__num--alert {
-  color: var(--band-needs-you-ink);
-  font-weight: 800;
-}
-
-/* Jev / GRU-wake chips keep their pp-chip faces inside the
-   status row — but NOT its nowrap: chip facts wrap honestly like every
-   other label (no clipping, no overflow masking). */
-.strip-status .pp-chip {
-  white-space: normal;
-}
-
-.strip-status .board-decisions,
-.strip-status .board-wakes {
-  font-size: 10.5px;
-  padding: 3px 10px;
-}
-
-/* The wakes chip carries its own ink (the chip's card fill flips
-   instantly on a theme change while an inherited body color would still
-   be animating — an inherited ink can never be the chip's contrast). */
-.strip-status .board-wakes {
-  color: var(--ink);
-}
-
+/* The wake chip's count and ages (inside the health pill). */
 .board-wakes__count {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-weight: 800;
@@ -487,44 +633,6 @@ body {
 .board-age-split__lead,
 .board-age-split__unit {
   font-weight: 700;
-}
-
-@container (min-width: 640px) {
-  .strip-groups {
-    grid-template-columns: repeat(3, 1fr);
-    padding: 6px 0 2px;
-  }
-
-  .strip-group {
-    padding: 0 18px 4px;
-  }
-
-  .strip-group:first-child {
-    padding-left: 0;
-  }
-
-  .strip-group:last-child {
-    padding-right: 0;
-  }
-
-  .strip-group + .strip-group {
-    border-top: 0;
-    border-left: 2px solid var(--line);
-  }
-
-  /* Row-edge alignment for a 4th group (CHILDREN) wrapping to a second
-     grid row: the row's first item gets the row separator and no in-row
-     left padding (flush with the first column), the row's last item is
-     flush right — matching the 1-row layout's edges. */
-  .strip-group:nth-child(3n) {
-    padding-right: 0;
-  }
-
-  .strip-group:nth-child(3n + 1):not(:first-child) {
-    border-left: 0;
-    border-top: 2px solid var(--line);
-    padding-left: 0;
-  }
 }
 
 .app-main {
@@ -1659,8 +1767,11 @@ body {
   align-content: start;
 }
 
-/* Center column: the dense job-row list. */
+/* Center column: the dense job-row list. A size container, so the band
+   cards follow the column's own width (a dragged splitter, a collapsed
+   chat, page zoom), not the viewport's. */
 .board-main {
+  container: board-main / inline-size;
   display: grid;
   gap: 16px;
   min-width: 0;
@@ -1674,11 +1785,17 @@ body {
 
 /* v4 attention bands, v6 cockpit: priority first. Band headers are
    STICKY separators with counts; each band carries ONE accent (the
-   label pill only — rows stay calm until they fail). */
+   label pill only — rows stay calm until they fail). Cockpit rework: a
+   band with rows is a card; empty bands fold into the Empty row. */
 .board-band {
   display: grid;
   gap: 0;
   --band-accent: var(--park);
+  padding: 0 14px 12px;
+  border: var(--outline);
+  border-radius: var(--radius-lg);
+  background: var(--card);
+  box-shadow: var(--shadow-card);
 }
 
 .board-band--needs-you { --band-accent: var(--band-needs-you); }
@@ -1766,8 +1883,8 @@ body {
   align-items: center;
   gap: 10px;
   margin: 0;
-  padding: 8px 4px 6px;
-  background: var(--paper);
+  padding: 10px 2px 8px;
+  background: var(--card);
   font-size: 13px;
   letter-spacing: 0.1em;
 }
@@ -1790,11 +1907,81 @@ body {
   color: var(--muted);
 }
 
-/* Compact empty state for any section (never omission — a shortcut still
-   has a valid labelled target). */
+/* A narrow board column (a phone, a squeezed pane, page zoom): the band
+   cards go full-bleed (no side padding, side borders or shadow), so a row
+   keeps the width it had before the cards. */
+@container board-main (max-width: 440px) {
+  .board-band {
+    padding-left: 0;
+    padding-right: 0;
+    border-left-width: 0;
+    border-right-width: 0;
+    border-radius: 0;
+    box-shadow: none;
+  }
+}
+
+/* Compact empty state inside a card (a last-known or count-only body). */
 .board-band__empty {
   padding: 12px 8px;
   color: var(--muted);
+}
+
+/* The Empty row (cockpit rework): every empty section as one pill that
+   keeps the section's id, so a shortcut still lands on a labelled target.
+   The reason is read aloud and shown in the tooltip. */
+.board-folded {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 4px;
+}
+
+.board-folded__lead {
+  margin-right: 2px;
+}
+
+.board-folded__pill {
+  --pill-accent: var(--line);
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 3px 11px;
+  border: 2.5px solid var(--pill-accent);
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+  scroll-margin-top: calc(var(--chrome-h, 100px) + var(--board-nav-h, 0px) + 40px);
+}
+
+.board-folded__pill[data-section='in-flight'] { --pill-accent: var(--work); }
+.board-folded__pill[data-section='pipeline'] { --pill-accent: var(--rev); }
+.board-folded__pill[data-section='for-gru'] { --pill-accent: var(--band-needs-you); }
+.board-folded__pill[data-section='settled'] { --pill-accent: var(--done); }
+
+.board-folded__pill:focus-visible {
+  outline: 3px solid var(--work);
+  outline-offset: 2px;
+}
+
+.board-folded__count {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.board-folded__reason {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 /* ── Pipeline rows (durable queue): two dense lines per entry — state
@@ -1885,6 +2072,55 @@ body {
    dividers like the job rows — never a card grid. ───────────────── */
 .board-band--owner {
   --band-accent: var(--rev);
+}
+
+/* The attention card (cockpit rework): what needs you, then one line about
+   Gru's own queue. Empty, the card is one calm line. */
+/* The head wraps between its parts, never inside a pill. */
+#board-owner .board-band__head {
+  flex-wrap: wrap;
+  row-gap: 4px;
+}
+
+#board-owner .board-band__label,
+#board-owner .board-band__count {
+  white-space: nowrap;
+}
+
+.board-owner__headline {
+  font-size: 16px;
+  font-weight: 800;
+  letter-spacing: 0;
+  color: var(--ink);
+}
+
+.board-owner__gru {
+  letter-spacing: 0.02em;
+  text-transform: none;
+  font-weight: 700;
+  color: var(--muted);
+}
+
+#board-owner[data-empty='true'] {
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  column-gap: 12px;
+  padding-bottom: 0;
+}
+
+#board-owner .board-band__clear {
+  flex-wrap: wrap;
+  padding: 6px 0;
+  border: 0;
+  background: transparent;
+}
+
+#board-owner .board-band__clear-text {
+  font-size: 16px;
+}
+
+#board-owner .board-band__clear-text::first-letter {
+  text-transform: uppercase;
 }
 
 .board-owner__rows {
@@ -3852,7 +4088,7 @@ a.repo-row__name:hover {
 /*                                                                     */
 /* The single-row header (logo + title + status + speaker/bell/        */
 /* theme/settings) tightens on a phone: the decorative tagline and     */
-/* the wide-viewport ticker drop, the title block shrinks, spacing     */
+/* drops, the title block shrinks, the pills and health pill wrap,    */
 /* narrows — the header fits a 390px viewport with zero horizontal     */
 /* overflow. Below 640px the command-bar icon controls compact         */
 /* further so the owner-chime speaker keeps row 1 inside the phone    */
@@ -3864,7 +4100,6 @@ a.repo-row__name:hover {
 /* ------------------------------------------------------------------ */
 @media (max-width: 560px) {
   .command-bar {
-    flex-wrap: wrap;
     column-gap: 10px;
     row-gap: 8px;
     padding: 8px 12px;
@@ -3884,11 +4119,8 @@ a.repo-row__name:hover {
     display: none;
   }
 
-  /* The ticker is a wide-viewport instrument; the chip rail below still
-     carries whole-system state on a phone. */
-  .command-bar__ticker {
-    display: none;
-  }
+  /* The RADAR/ROUND pills stay on a phone (no strip carries the radar
+     any more); they wrap to the second row with the health pill. */
 }
 
 /* ≤640px: command-bar icon controls compact so the owner-chime speaker

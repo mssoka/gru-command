@@ -1,33 +1,30 @@
 /**
- * Command bar (board UX v6.1): the full-width cockpit chrome — brand +
- * tagline, the inline status ticker, the notification bell, theme and
- * settings. The bar itself lives in index.html; this controller owns the
- * ticker's content (the three pipe-separated segments) and survives every
- * snapshot push. There is no lens toggle: chat is always docked on
- * desktop and the FAB owns mobile chat.
+ * Command bar (cockpit rework 2026-10-17): the full-width cockpit chrome —
+ * logo badge + tagline, the RADAR and ROUND pills, the health pill
+ * (rendered by BoardView), the chime, bell, theme and settings. The bar
+ * itself lives in index.html; this controller writes the two pills in
+ * place — never rebuilding them, so the connection dot inside RADAR keeps
+ * the state `renderConnectionDot` gave it — and survives every snapshot
+ * push. There is no lens toggle: chat is always docked on desktop and the
+ * FAB owns mobile chat.
  */
 
 import type { BoardConnectionState } from '../lib/board-client.js';
 import type { BoardSnapshot } from '../lib/board-protocol.js';
 import { tickerSegments } from '../lib/command-ticker.js';
-import { consoleModeForWidth, type ConsoleMode } from '../lib/console-layout.js';
-import { el, mustGet } from './dom.js';
+import { mustGet } from './dom.js';
 
 export class CommandBar {
-  private readonly ticker: HTMLElement;
-  private layout: ConsoleMode;
+  private readonly radar: HTMLElement;
+  private readonly radarLabel: HTMLElement;
+  private readonly round: HTMLElement;
   private boardState: BoardConnectionState | null = null;
   private snapshot: BoardSnapshot | null = null;
 
   constructor() {
-    this.ticker = mustGet('command-ticker');
-    this.layout = consoleModeForWidth(typeof window === 'undefined' ? 0 : window.innerWidth);
-    this.render();
-  }
-
-  setLayout(layout: ConsoleMode): void {
-    if (this.layout === layout) return;
-    this.layout = layout;
+    this.radar = mustGet('command-radar');
+    this.radarLabel = mustGet('command-radar-label');
+    this.round = mustGet('command-round');
     this.render();
   }
 
@@ -43,22 +40,12 @@ export class CommandBar {
   }
 
   private render(): void {
-    const segments = tickerSegments({
-      layout: this.layout,
-      boardState: this.boardState,
-      snapshot: this.snapshot,
-    });
-    const nodes: HTMLElement[] = [];
-    for (const segment of segments) {
-      const node = el('span', `command-ticker__segment command-ticker__segment--${segment.tone}`, segment.label);
-      node.dataset.segment = segment.key;
-      nodes.push(node);
-    }
-    this.ticker.replaceChildren();
-    nodes.forEach((node, index) => {
-      if (index > 0) this.ticker.append(el('span', 'command-ticker__sep', '|'));
-      this.ticker.append(node);
-    });
+    const [radar, round] = tickerSegments({ boardState: this.boardState, snapshot: this.snapshot });
+    if (radar === undefined || round === undefined) throw new Error('command bar: the ticker must yield the RADAR and ROUND pills');
+    this.radar.className = `command-pill command-pill--${radar.tone}`;
+    this.radarLabel.textContent = radar.label;
+    this.round.className = `command-pill command-pill--round-${round.tone}`;
+    this.round.textContent = round.label;
   }
 }
 

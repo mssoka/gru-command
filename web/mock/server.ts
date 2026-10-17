@@ -679,6 +679,19 @@ function defaultSampleSnapshot(): unknown {
       workerBudget: 8,
       workersPerRun: 4,
     },
+    // #351: one raid mid-attack, one waiting for the owner, and a break-in
+    // whose fix heist waits too — every raids-card state in one board.
+    vector: {
+      enabled: true,
+      raidMode: 'proposed',
+      proposed: 1,
+      queued: 0,
+      running: [{ repo: 'demo-api', packageDir: 'src/payments', roundsDone: 1, maxRounds: 4, startedAt: new Date(Date.now() - 600_000).toISOString() }],
+      capUse: [{ repo: 'demo-api', used: 1 }],
+      maxRaidsPerDay: 2,
+      breakIns: 1,
+      fixesAwaitingOwner: 1,
+    },
     selfHeal: null,
   };
 }

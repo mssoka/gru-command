@@ -61,18 +61,16 @@ function snapshot(jobs: readonly JobView[]): BoardSnapshot {
   };
 }
 
-describe('command ticker (v6)', () => {
-  it('renders MODE / RADAR / ROUND segments in order', () => {
+describe('command-bar pills (cockpit rework)', () => {
+  it('renders the RADAR and ROUND pills in order; the MODE segment is gone', () => {
     const segments = tickerSegments({
-      layout: 'cockpit',
       boardState: 'open',
       snapshot: snapshot([job('j1', [round(4, 'live')]), job('j2', [round(6, 'pending')])]),
     });
-    expect(segments.map((segment) => segment.key)).toEqual(['mode', 'radar', 'round']);
-    expect(segments[0]?.label).toBe('MODE: COCKPIT');
-    expect(segments[1]?.label).toBe('RADAR: LIVE');
-    expect(segments[1]?.tone).toBe('ok');
-    expect(segments[2]?.label).toBe('ROUND 4 ACTIVE');
+    expect(segments.map((segment) => segment.key)).toEqual(['radar', 'round']);
+    expect(segments[0]).toEqual({ key: 'radar', label: 'RADAR LIVE', tone: 'ok' });
+    expect(segments[1]).toEqual({ key: 'round', label: 'ROUND 4 LIVE', tone: 'live' });
+    expect(segments.some((segment) => segment.label.includes('MODE'))).toBe(false);
   });
 
   it('maps socket states onto radar words and tones', () => {
@@ -86,15 +84,15 @@ describe('command ticker (v6)', () => {
     expect(radarLabel(null)).toEqual({ label: 'IDLE', tone: 'plain' });
   });
 
-  it('labels the mobile layout and a quiet board honestly', () => {
-    const segments = tickerSegments({
-      layout: 'single',
-      boardState: null,
-      snapshot: null,
-    });
-    expect(segments[0]?.label).toBe('MODE: MOBILE');
-    expect(segments[1]?.label).toBe('RADAR: IDLE');
-    expect(segments[2]?.label).toBe('NO ROUND ACTIVE');
+  it('labels a quiet board and an unpaired radar honestly', () => {
+    const segments = tickerSegments({ boardState: null, snapshot: null });
+    expect(segments[0]).toEqual({ key: 'radar', label: 'RADAR IDLE', tone: 'plain' });
+    expect(segments[1]).toEqual({ key: 'round', label: 'NO ROUND', tone: 'none' });
+  });
+
+  it('a pending round gets its own tone', () => {
+    const [, pill] = tickerSegments({ boardState: 'open', snapshot: snapshot([job('a', [round(7, 'pending')])]) });
+    expect(pill).toEqual({ key: 'round', label: 'ROUND 7 PENDING', tone: 'pending' });
   });
 });
 
@@ -110,10 +108,10 @@ describe('command ticker — top review round', () => {
     expect(roundLabel(top)).toBe('ROUND 7 PENDING');
   });
 
-  it('reports NO ROUND ACTIVE for an empty or concluded board', () => {
+  it('reports NO ROUND for an empty or concluded board', () => {
     expect(topReviewRound(null)).toBeNull();
     expect(topReviewRound(snapshot([]))).toBeNull();
     expect(topReviewRound(snapshot([job('a', [round(1, 'aborted'), round(2, 'verdict-posted')])]))).toBeNull();
-    expect(roundLabel(null)).toBe('NO ROUND ACTIVE');
+    expect(roundLabel(null)).toBe('NO ROUND');
   });
 });

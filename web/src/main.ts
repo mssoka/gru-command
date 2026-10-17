@@ -13,7 +13,6 @@ import { IntakeClient } from './lib/intake-client.js';
 import { IntakeView } from './ui/intake.js';
 import { WS_PATH, type LoggedFrame } from './lib/protocol.js';
 import { BoardClient } from './lib/board-client.js';
-import { consoleModeForWidth } from './lib/console-layout.js';
 import { applyTheme, getTheme, setTheme } from './theme.js';
 import { clearBanner, showBanner } from './ui/banner.js';
 import { ChatView, renderConnectionDot } from './ui/chat.js';
@@ -127,25 +126,21 @@ function failPairing(message: string): void {
 }
 
 // ---------------------------------------------------------------------
-// Command bar + cockpit chrome (board UX v6): the ticker segments, the
+// Command bar + cockpit chrome (cockpit rework): the RADAR/ROUND pills, the
 // measured chrome height (sticky offsets), and the drag splitters.
 // ---------------------------------------------------------------------
 
 const commandBar = new CommandBar();
 renderChatOnline('idle');
 
-/** Feed the sticky offsets their real height: the command bar + chip rail
- * (CSS carries a 100px fallback for the pre-measure first paint). */
+/** Feed the sticky offsets their real height: the command bar is the only
+ * sticky chrome (CSS carries a 100px fallback for the pre-measure first
+ * paint). The health pill can wrap the bar onto a second line, so a
+ * snapshot re-measures too. */
 function measureChrome(): void {
   const barHeight = document.getElementById('command-bar')?.offsetHeight ?? 0;
-  const rail = document.getElementById('chip-rail');
-  // A static (phone) strip scrolls away with the page, so it contributes
-  // no sticky offset.
-  const railHeight =
-    rail === null || rail.hidden || getComputedStyle(rail).position !== 'sticky' ? 0 : rail.offsetHeight;
-  const total = barHeight + railHeight;
-  if (total > 0) {
-    document.documentElement.style.setProperty('--chrome-h', `${total}px`);
+  if (barHeight > 0) {
+    document.documentElement.style.setProperty('--chrome-h', `${barHeight}px`);
     document.documentElement.style.setProperty('--command-bar-h', `${barHeight}px`);
   }
 }
@@ -161,11 +156,9 @@ const splitterController = new SplitterController({
 // The agents rail's CREW / TRANSCRIPTS tabs (v6).
 new RailTabs(mustGet('agents-rail'));
 
-/** Keep the ticker's layout segment and the splitter bounds in step with
- * the viewport (the shell's matchMedia owns the FAB contract; both read
- * the same console-layout thresholds). */
+/** Keep the splitter bounds and the sticky offsets in step with the
+ * viewport (the shell's matchMedia owns the FAB contract). */
 function syncCockpit(): void {
-  commandBar.setLayout(consoleModeForWidth(window.innerWidth));
   splitterController.sync();
   measureChrome();
 }
@@ -373,8 +366,8 @@ function startBoard(token: string): void {
         boardView?.render(snapshot, source);
         chatView?.setManagedRepositoryNames(snapshot.repoOverview?.rows.map(({ key }) => key) ?? []);
         commandBar.setSnapshot(snapshot);
-        // The first snapshot discloses the chip rail — the chrome just
-        // grew, so the sticky offsets re-measure.
+        // The first snapshot discloses the health pill — the bar may have
+        // grown, so the sticky offsets re-measure.
         measureChrome();
         decisionStatusCard.render(snapshot.decisions);
         // State joins the signature: a live agent turning disposed must

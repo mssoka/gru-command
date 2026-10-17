@@ -268,10 +268,13 @@ function nodeFetch(base: string): {
 
 function mountBoardDom(): void {
   document.body.innerHTML = `
-    <div id="chip-rail" hidden>
+    <div id="command-health" hidden>
+      <span id="command-health-summary"></span>
+      <span id="command-health-parts"></span>
       <span id="board-decisions"></span>
       <span id="board-wakes" hidden></span>
     </div>
+    <section id="board-kpis" hidden></section>
     <nav id="board-nav" hidden></nav>
     <section id="board-owner" hidden></section>
     <div id="board-jobs"></div>

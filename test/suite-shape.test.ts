@@ -422,15 +422,14 @@ describe('suite shape', () => {
     expect(workflow).toContain('run: npm test');
   });
 
-  it('the SLIM baseline scope names every independently measured instrument surface', () => {
+  it('the cockpit scopes replace the retired slim-strip ones', () => {
+    // The slim strip and its fail-before instrument were retired by the
+    // cockpit rework: no scope may still run them, and the cockpit's own
+    // unit and browser scopes exist.
     const worktree = readFileSync(join(import.meta.dirname, '..', '.gru-command', 'worktree.toml'), 'utf-8');
-    const line = worktree.split('\n').find((candidate) => candidate.startsWith('dashboard-slim-strip-baseline = '));
-    const allowlist = /--require-file-substr "([^"]+)"/u.exec(line ?? '')?.[1]?.split(',') ?? [];
-    expect(allowlist).toEqual([
-      'slim strip labelled status pairs',
-      'slim strip Heists/PRs/Crew count groups',
-      'reserved numeric slot for strip KPIs',
-    ]);
+    expect(worktree).not.toMatch(/slim-strip\.baseline\.test\.ts|dashboard-strip\.spec\.ts|board-rail\.test\.ts|--project=strip\b/u);
+    expect(worktree).toMatch(/^cockpit-unit = .*src\/lib\/cockpit\.test\.ts/mu);
+    expect(worktree).toMatch(/^cockpit-browser = .*--project=cockpit e2e\/cockpit\.spec\.ts/mu);
   });
 
   it('distinguishes unsupported R2 shell wrappers from inert shell text', () => {

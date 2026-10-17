@@ -1,37 +1,29 @@
 /**
- * Command-bar ticker (board UX v6): the inline status readout at the top
- * of the cockpit. Three pipe-separated, monospace segments — the layout
- * mode, the board socket's radar state, and the top review round on the
- * board. Pure so every combination is unit-testable without a DOM; the
- * view (`ui/command-bar.ts`) renders the segments into spans. There is
- * no lens segment: v6.1 removed the Chat/Board toggle.
+ * Command-bar pills (cockpit rework 2026-10-17): the RADAR and ROUND pills
+ * beside the logo — the board socket's radar state and the top review
+ * round on the board. The old MODE segment is gone (owner pick: the layout
+ * is visible on screen). Pure so every combination is unit-testable without
+ * a DOM; the view (`ui/command-bar.ts`) writes them into the static pills.
  */
 
 import type { BoardConnectionState } from './board-client.js';
 import type { BoardSnapshot } from './board-protocol.js';
-import type { ConsoleMode } from './console-layout.js';
 
 export interface TickerInput {
-  readonly layout: ConsoleMode;
   /** Board socket state; null before the board client exists (pairing). */
   readonly boardState: BoardConnectionState | null;
   readonly snapshot: BoardSnapshot | null;
 }
 
 export interface TickerSegment {
-  readonly key: 'mode' | 'radar' | 'round';
+  readonly key: 'radar' | 'round';
   readonly label: string;
-  readonly tone: 'plain' | 'ok' | 'warn' | 'alert';
+  /** radar: ok/warn/alert/plain; round: live/pending/none. */
+  readonly tone: 'plain' | 'ok' | 'warn' | 'alert' | 'live' | 'pending' | 'none';
 }
 
-const LAYOUT_LABELS: Readonly<Record<ConsoleMode, string>> = {
-  cockpit: 'COCKPIT',
-  'two-pane': 'DESKTOP',
-  single: 'MOBILE',
-};
-
 /** Radar = the board socket's health in one word. */
-export function radarLabel(state: BoardConnectionState | null): { label: string; tone: TickerSegment['tone'] } {
+export function radarLabel(state: BoardConnectionState | null): { label: string; tone: 'plain' | 'ok' | 'warn' | 'alert' } {
   switch (state) {
     case 'open':
       return { label: 'LIVE', tone: 'ok' };
@@ -71,17 +63,16 @@ export function topReviewRound(snapshot: BoardSnapshot | null): { seq: number; s
 }
 
 export function roundLabel(round: { seq: number; status: 'live' | 'pending' } | null): string {
-  if (round === null) return 'NO ROUND ACTIVE';
-  return round.status === 'live' ? `ROUND ${round.seq} ACTIVE` : `ROUND ${round.seq} PENDING`;
+  if (round === null) return 'NO ROUND';
+  return round.status === 'live' ? `ROUND ${round.seq} LIVE` : `ROUND ${round.seq} PENDING`;
 }
 
-/** The three ticker segments, in order. */
+/** The two pills, in order. */
 export function tickerSegments(input: TickerInput): readonly TickerSegment[] {
   const radar = radarLabel(input.boardState);
   const round = topReviewRound(input.snapshot);
   return [
-    { key: 'mode', label: `MODE: ${LAYOUT_LABELS[input.layout]}`, tone: 'plain' },
-    { key: 'radar', label: `RADAR: ${radar.label}`, tone: radar.tone },
-    { key: 'round', label: roundLabel(round), tone: round?.status === 'live' ? 'ok' : 'plain' },
+    { key: 'radar', label: `RADAR ${radar.label}`, tone: radar.tone },
+    { key: 'round', label: roundLabel(round), tone: round === null ? 'none' : round.status },
   ];
 }
