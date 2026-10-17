@@ -49,7 +49,11 @@ export interface HealthPill {
    * neutral facts (no wakes yet, disk still walking); unwired: no check is
    * wired. Unknown never reads healthy. */
   readonly state: 'attention' | 'healthy' | 'quiet' | 'unwired';
-  /** `2 need a look`, `All healthy`, `No problems reported`, `Checks not wired`. */
+  /** The snapshot is last-known (the board socket is stale or down, or the
+   * board is unavailable): the summary says so and never claims calm. */
+  readonly lastKnown: boolean;
+  /** `2 need a look`, `All healthy`, `No problems reported`, `Checks not
+   * wired` — prefixed `last-known · ` on a last-known snapshot. */
   readonly summary: string;
   /** Checks that need a look first, then the rest; a check whose source is
    * not wired (`n/a`) stays out of the visible text and in the title. */
@@ -60,7 +64,7 @@ export interface HealthPill {
 
 const needsLook = (card: HealthCardView): boolean => card.tone === 'alert' || card.tone === 'warn' || card.flag !== null;
 
-export function healthPill(snapshot: BoardSnapshot, now = Date.now()): HealthPill {
+export function healthPill(snapshot: BoardSnapshot, now = Date.now(), lastKnown = false): HealthPill {
   const cards = healthCards(snapshot, now).filter((card) => HEALTH_PLACEMENT[card.id] === 'pill');
   const problems = cards.filter(needsLook);
   const calm = cards.filter((card) => !needsLook(card) && card.value !== 'n/a');
@@ -73,7 +77,8 @@ export function healthPill(snapshot: BoardSnapshot, now = Date.now()): HealthPil
   }[state];
   return {
     state,
-    summary,
+    lastKnown,
+    summary: lastKnown ? `last-known · ${summary}` : summary,
     parts: [...problems, ...calm].map((card) => ({
       id: card.id,
       text: `${card.title} ${card.value}`,
@@ -139,7 +144,11 @@ export function cockpitCards(snapshot: BoardSnapshot, now = Date.now(), sections
   // the same rule the crew rail's role word follows.
   const family = all.filter((job) => (job.parentJobId ?? null) !== null && job.parentJobId !== job.id);
   const liveMega = family.filter(isLiveMegaminion).length;
-  const parents = new Set(family.map((job) => job.parentJobId)).size;
+  // "across N heists" names heists the owner can find on the board; a
+  // megaminion whose heist left the board says so instead.
+  const onBoard = new Set(all.map((job) => job.id));
+  const parents = new Set(family.map((job) => job.parentJobId).filter((id) => onBoard.has(id ?? ''))).size;
+  const orphans = family.filter((job) => !onBoard.has(job.parentJobId ?? '')).length;
   const children = kpis.children;
   const cards: CockpitCard[] = [
     {
@@ -170,7 +179,12 @@ export function cockpitCards(snapshot: BoardSnapshot, now = Date.now(), sections
       aside: null,
       headline: { kpi: 'megaminions.live', value: String(liveMega), unit: 'live', title: `${liveMega} live ${liveMega === 1 ? BOARD_WORDS.megaminion : BOARD_WORDS.megaminions}` },
       facts: family.length === 0 ? [] : [fact('megaminions.finished', family.length - liveMega, 'finished', `${family.length - liveMega} finished (delivered, done, merged or binned)`)],
-      notes: family.length === 0 ? ['none commissioned'] : [`across ${heistCount(parents)}`],
+      notes: family.length === 0
+        ? ['none commissioned']
+        : [
+            ...(parents > 0 ? [`across ${heistCount(parents)}`] : []),
+            ...(orphans > 0 ? [`${orphans} whose ${orphans === 1 ? BOARD_WORDS.heist : BOARD_WORDS.heists} left the board`] : []),
+          ],
       flow: null,
       off: false,
     },
@@ -189,7 +203,9 @@ export function cockpitCards(snapshot: BoardSnapshot, now = Date.now(), sections
           : [
               fact('children.active', children.active, children.active === 1 ? 'sub-minion' : 'sub-minions',
                 `${pluralCount(children.active, 'sub-minion')} active · ${children.queued} queued · ${children.finished} finished · ${children.lifetimeCreations} created (lifetime logical creations)`),
-              ...(children.queued > 0 ? [fact('children.queued', children.queued, 'queued', `${pluralCount(children.queued, 'sub-minion')} queued`)] : []),
+              ...(children.queued > 0
+                ? [fact('children.queued', children.queued, `${children.queued === 1 ? 'sub-minion' : 'sub-minions'} queued`, `${pluralCount(children.queued, 'sub-minion')} queued`)]
+                : []),
             ]),
       ],
       notes: [],
@@ -229,10 +245,23 @@ export function cockpitCards(snapshot: BoardSnapshot, now = Date.now(), sections
 }
 
 /** #351: the raids card, only when the server sent its block (an older
- * server's board shows no card rather than zeros). */
+ * server's board shows no card rather than zeros). A block the server
+ * could not read (`null`) is unknown: a dashed card says so. */
 function raidsCard(snapshot: BoardSnapshot): CockpitCard | null {
-  const vector = snapshot.vector ?? null;
-  if (vector === null) return null;
+  const vector = snapshot.vector;
+  if (vector === undefined) return null;
+  if (vector === null) {
+    return {
+      id: 'raids',
+      label: 'VECTOR RAIDS',
+      aside: null,
+      headline: { kpi: null, value: '—', unit: 'unavailable', title: 'The server could not read the raids; the card returns with the next board update that can.' },
+      facts: [],
+      notes: ['the server could not read the raids'],
+      flow: null,
+      off: true,
+    };
+  }
   if (!vector.enabled) {
     return {
       id: 'raids',
@@ -275,15 +304,15 @@ function raidsCard(snapshot: BoardSnapshot): CockpitCard | null {
 
 /** The attention card's line about Gru's own queue: the live machine rows
  * awaiting a Gru disposition (NEEDS GRU, the count the strip's ALERTS pair
- * used to carry), with that pair's long explanation as its title. A
+ * used to carry), with that pair's long explanation as its title. It is
+ * Gru's work, never the owner's, so it stays a muted sub-line. A
  * last-known board says so rather than claiming calm. */
-export function gruQueueLine(unackedActionRequired: number, lastKnown = false): { readonly text: string; readonly title: string; readonly alert: boolean } {
+export function gruQueueLine(unackedActionRequired: number, lastKnown = false): { readonly text: string; readonly title: string } {
   const text = unackedActionRequired === 0
     ? 'nothing needs Gru either · the crew is on it'
-    : `${unackedActionRequired} live ${unackedActionRequired === 1 ? 'alert waits' : 'alerts wait'} for Gru`;
+    : `Gru is handling ${pluralCount(unackedActionRequired, 'live alert')}`;
   return {
     text: lastKnown ? `last-known · ${text}` : text,
     title: alertsCard(unackedActionRequired).titleAttr,
-    alert: unackedActionRequired > 0,
   };
 }

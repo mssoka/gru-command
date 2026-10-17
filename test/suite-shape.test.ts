@@ -363,7 +363,7 @@ const PINS: Record<string, number> = {
   'specialist-dispose-bounded.test.ts': 2,
   'static.test.ts': 10,
   'stub-runtime.test.ts': 14,
-  'suite-shape.test.ts': 5,
+  'suite-shape.test.ts': 6,
   'supervisor.test.ts': 231,
   'tool-heartbeat.test.ts': 2,
   'transcripts.test.ts': 16,
@@ -435,11 +435,27 @@ describe('suite shape', () => {
       join(root, 'web', 'playwright.config.ts'),
       ...readdirSync(workflows).map((name) => join(workflows, name)),
     ];
-    const retired = /slim-strip\.baseline\.test\.ts|dashboard-strip\.spec\.ts|board-rail\.test\.ts|--project=strip(?![\w-])|name: 'strip'|^strip-[\w-]+ =/mu;
+    // Any spelling of the retired project or scopes: `--project=strip`,
+    // `--project strip`, quoted values, a `name: "strip"` project, or a
+    // bare or quoted `strip-*` scope key.
+    const retired = /slim-strip\.baseline\.test\.ts|dashboard-strip\.spec\.ts|board-rail\.test\.ts|--project[= ]['"]?strip(?![\w-])|name: ['"]strip['"]|^['"]?strip-[\w-]+['"]? =/mu;
     for (const file of runners) expect(readFileSync(file, 'utf-8'), file).not.toMatch(retired);
+    for (const spelling of ['--project=strip', '--project strip', '--project="strip"', "name: 'strip'", 'name: "strip"', 'strip-smoke = "x"', '"strip-themes" = "x"']) {
+      expect(spelling, spelling).toMatch(retired);
+    }
+    for (const kept of ['--project=strip-free', '--project=cockpit', "name: 'stripes'", 'cockpit-themes = "x"']) expect(kept, kept).not.toMatch(retired);
     const worktree = readFileSync(runners[0]!, 'utf-8');
     expect(worktree).toMatch(/^cockpit-unit = .*src\/lib\/cockpit\.test\.ts/mu);
     expect(worktree).toMatch(/^cockpit-browser = .*--project=cockpit e2e\/cockpit\.spec\.ts/mu);
+  });
+
+  it('every web e2e spec runs in some Playwright project (a moved spec never silently stops running)', () => {
+    const web = join(import.meta.dirname, '..', 'web');
+    const config = readFileSync(join(web, 'playwright.config.ts'), 'utf-8');
+    const matched = new Set([...config.matchAll(/'([\w.-]+\.spec\.ts)'/gu)].map((match) => match[1]));
+    const specs = readdirSync(join(web, 'e2e')).filter((name) => name.endsWith('.spec.ts'));
+    expect(specs.length).toBeGreaterThan(0);
+    for (const spec of specs) expect(matched, spec).toContain(spec);
   });
 
   it('distinguishes unsupported R2 shell wrappers from inert shell text', () => {

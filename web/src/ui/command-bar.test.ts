@@ -15,7 +15,7 @@ import { CommandBar } from './command-bar.js';
 function mount(): void {
   document.body.innerHTML = `
     <div id="command-ticker">
-      <span class="command-pill command-pill--plain" id="command-radar"><span class="conn-dot" id="conn-dot" role="img" aria-label="socket: idle"></span><span id="command-radar-label">RADAR IDLE</span></span>
+      <span class="command-pill command-pill--plain" id="command-radar"><span class="conn-dot" id="conn-dot" aria-hidden="true"></span><span id="command-radar-label">RADAR IDLE</span></span>
       <span class="command-pill command-pill--round-none" id="command-round"><span id="command-round-label">NO ROUND</span></span>
     </div>`;
 }
@@ -85,6 +85,23 @@ const roundPill = (): HTMLElement => document.getElementById('command-round')!;
 beforeEach(mount);
 
 describe('command bar (cockpit rework)', () => {
+  it('index.html: the dot is decoration inside the RADAR live region, and the KPI mount is no landmark', async () => {
+    // vitest's web root is the workspace dir, so index.html is cwd-relative.
+    const { readFileSync } = await import('node:fs');
+    document.documentElement.innerHTML = readFileSync('index.html', 'utf-8');
+    const ticker = document.getElementById('command-ticker')!;
+    expect([ticker.getAttribute('role'), ticker.getAttribute('aria-live')]).toEqual(['status', 'polite']);
+    const dot = document.getElementById('conn-dot')!;
+    expect(dot.closest('#command-radar')).not.toBeNull();
+    expect([dot.getAttribute('aria-hidden'), dot.getAttribute('role'), dot.getAttribute('aria-label')]).toEqual(['true', null, null]);
+    expect(document.getElementById('command-round-label')?.closest('#command-round')).not.toBeNull();
+    // #401: the KPI cards add no region landmark ahead of FOR YOU.
+    const kpis = document.getElementById('board-kpis')!;
+    expect([kpis.tagName, kpis.getAttribute('role'), kpis.getAttribute('aria-label')]).toEqual(['DIV', null, null]);
+    const health = document.getElementById('command-health')!;
+    expect([health.getAttribute('role'), health.getAttribute('aria-label')]).toEqual(['group', 'System health']);
+  });
+
   it('starts idle with no round, before any board socket or snapshot', () => {
     new CommandBar();
     expect(radarPill().className).toBe('command-pill command-pill--plain');
@@ -103,7 +120,7 @@ describe('command bar (cockpit rework)', () => {
     // Written in place: the same dot, still carrying the socket's state.
     expect(document.getElementById('conn-dot')).toBe(dot);
     expect(dot?.classList.contains('conn-dot--open')).toBe(true);
-    expect(dot?.getAttribute('aria-label')).toBe('socket: open');
+    expect(dot?.title).toBe('socket: open');
     bar.setBoardState('stale');
     expect(radarPill().className).toBe('command-pill command-pill--warn');
     expect(radarPill().textContent).toBe('RADAR STALE');
@@ -124,6 +141,13 @@ describe('command bar (cockpit rework)', () => {
     bar.setSnapshot(snapshot([job([round(2, 'pending'), round(1, 'live')])]));
     expect(roundPill().className).toBe('command-pill command-pill--round-live');
     expect(roundPill().textContent).toBe('ROUND 1 LIVE');
+    // The pills sit in a polite live region: a push that changes no reading
+    // writes nothing, so nothing is re-announced.
+    const num = roundPill().querySelector('.command-pill__num');
+    bar.setSnapshot(snapshot([job([round(2, 'pending'), round(1, 'live')])]));
+    bar.setBoardState(null);
+    bar.setBoardState(null);
+    expect(roundPill().querySelector('.command-pill__num')).toBe(num);
     bar.setSnapshot(snapshot([]));
     expect(roundPill().textContent).toBe('NO ROUND');
     expect(roundPill().querySelector('.command-pill__num')).toBeNull();

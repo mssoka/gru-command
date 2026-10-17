@@ -637,7 +637,7 @@ test.describe('board (E6, mock feed)', () => {
     await expect(signal).toContainText('live');
     await expect(signal).toContainText('1 blocker');
     // The global NEEDS GRU number lives on the attention card's Gru line.
-    await expect(page.locator('.board-owner__gru')).toHaveText(/^\d+ live alerts? waits? for Gru$/u);
+    await expect(page.locator('.board-owner__gru')).toHaveText(/^Gru is handling \d+ live alerts?$/u);
 
     // Expand the row, then the round row: all 9 lens chips appear.
     await job.locator('.board-job__toggle').click();
@@ -865,7 +865,7 @@ test.describe('board (E6, mock feed)', () => {
       // review escalation (mock-n5) AND the provider-wall stop (mock-n4,
       // machine attention since the owner release), never the merged lane's
       // closed receipt.
-      await expect(page.locator('.board-owner__gru')).toHaveText('2 live alerts wait for Gru');
+      await expect(page.locator('.board-owner__gru')).toHaveText('Gru is handling 2 live alerts');
       // The line is the one NEEDS GRU surface (#400): no hidden duplicate,
       // and its title carries the live-queue explanation.
       await expect(page.locator('#board-unacked')).toHaveCount(0);

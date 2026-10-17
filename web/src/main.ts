@@ -139,14 +139,9 @@ renderChatOnline('idle');
  * wrapping, page zoom — so the bar's own size drives the re-measure, not
  * only window resizes. */
 function measureChrome(): void {
-  const bar = mustGet('command-bar');
-  const barHeight = bar.offsetHeight;
+  const barHeight = mustGet('command-bar').offsetHeight;
   if (barHeight > 0) {
-    // Overlays clear the bar wherever it is (--command-bar-h); the sticky
-    // offsets count it only while it sticks — on a phone it scrolls away.
-    const sticks = getComputedStyle(bar).position === 'sticky';
-    document.documentElement.style.setProperty('--chrome-h', `${sticks ? barHeight : 0}px`);
-    document.documentElement.style.setProperty('--command-bar-h', `${barHeight}px`);
+    document.documentElement.style.setProperty('--chrome-h', `${barHeight}px`);
   }
 }
 measureChrome();

@@ -123,7 +123,12 @@ describe('cockpit cards', () => {
     expect(cockpitCards(snapshot([]), NOW).map((entry) => entry.id)).toEqual(['heists', 'megaminions', 'crew', 'prs', 'reviews']);
     const vector: VectorView = { enabled: false, raidMode: 'proposed', maxRaidsPerDay: 2 };
     expect(cockpitCards(snapshot([], [], null, { vector }), NOW).map((entry) => entry.id)).toEqual(['heists', 'megaminions', 'crew', 'prs', 'reviews', 'raids']);
-    expect(cockpitCards(snapshot([], [], null, { vector: null }), NOW).map((entry) => entry.id)).not.toContain('raids');
+    // An older server sends no block: no card. A block the server could
+    // not read (null) is unknown: a dashed card says so, never hidden.
+    expect(cockpitCards(snapshot([], [], null), NOW).map((entry) => entry.id)).not.toContain('raids');
+    expect(card(cockpitCards(snapshot([], [], null, { vector: null }), NOW), 'raids')).toMatchObject({
+      off: true, headline: { kpi: null, value: '—', unit: 'unavailable' }, facts: [], notes: ['the server could not read the raids'],
+    });
   });
 
   it('every count equals the v4 KPI derivation on the same snapshot', () => {
@@ -200,7 +205,7 @@ describe('cockpit cards', () => {
       { vector: vector(1) },
     ), NOW));
     expect(one).toEqual(expect.arrayContaining([
-      'crew:minion', 'children.active:sub-minion', 'children.queued:queued', 'reviews:round active', 'reviews.verdictsToday:verdict today',
+      'crew:minion', 'children.active:sub-minion', 'children.queued:sub-minion queued', 'reviews:round active', 'reviews.verdictsToday:verdict today',
       'vector.fixesAwaitingOwner:fix awaiting you', 'vector.breakIns:break-in',
     ]));
     const two = labels(cockpitCards(snapshot(
@@ -210,7 +215,7 @@ describe('cockpit cards', () => {
       { vector: vector(2) },
     ), NOW));
     expect(two).toEqual(expect.arrayContaining([
-      'crew:minions', 'children.active:sub-minions', 'reviews:rounds active', 'reviews.verdictsToday:verdicts today',
+      'crew:minions', 'children.active:sub-minions', 'children.queued:sub-minions queued', 'reviews:rounds active', 'reviews.verdictsToday:verdicts today',
       'vector.fixesAwaitingOwner:fixes awaiting you', 'vector.breakIns:break-ins',
     ]));
   });
@@ -226,7 +231,7 @@ describe('cockpit cards', () => {
       ['lanes.midTurn', 0, 'mid-turn'],
       ['lanes.disposed', 0, 'disposed'],
       ['children.active', 3, 'sub-minions'],
-      ['children.queued', 2, 'queued'],
+      ['children.queued', 2, 'sub-minions queued'],
     ]);
     expect(queued.notes).toEqual([]);
   });
@@ -258,7 +263,12 @@ describe('cockpit cards', () => {
     const mega = card(cockpitCards(snapshot(jobs), NOW), 'megaminions');
     expect(mega.headline).toMatchObject({ kpi: 'megaminions.live', value: '2', unit: 'live' });
     expect(mega.facts).toEqual([expect.objectContaining({ kpi: 'megaminions.finished', value: 2 })]);
-    expect(mega.notes).toEqual(['across 3 heists']);
+    // "across N heists" names the heists on the board; the orphan's heist
+    // left it, which the card says rather than counting a heist nobody
+    // can find.
+    expect(mega.notes).toEqual(['across 2 heists', '1 whose heist left the board']);
+    const orphansOnly = card(cockpitCards(snapshot([job('o1', 'working', { parentJobId: 'gone' }), job('o2', 'done', { parentJobId: 'lost' })]), NOW), 'megaminions');
+    expect(orphansOnly.notes).toEqual(['2 whose heists left the board']);
     expect(card(cockpitCards(snapshot([job('solo', 'working')]), NOW), 'megaminions').notes).toEqual(['none commissioned']);
   });
 
@@ -324,6 +334,14 @@ describe('cockpit health pill', () => {
     for (const check of ['deploy', 'silas', 'verify', 'cure']) expect(unwired.title).toContain(`${check}: n/a`);
   });
 
+  it('a last-known snapshot says so in the summary, whatever the state', () => {
+    const calm = healthPill(snapshot([], [], null, { silas: NO_WAKES, disk: disk() }), NOW, true);
+    expect(calm).toMatchObject({ state: 'healthy', lastKnown: true, summary: 'last-known · All healthy' });
+    const loud = healthPill(snapshot([], [], null, { build: BEHIND }), NOW, true);
+    expect(loud).toMatchObject({ state: 'attention', lastKnown: true, summary: 'last-known · 1 needs a look' });
+    expect(healthPill(snapshot([], [], null, { build: BEHIND }), NOW)).toMatchObject({ lastKnown: false, summary: '1 needs a look' });
+  });
+
   it('reads healthy only when a wired check reads ok; neutral facts alone are quiet', () => {
     // Silas with no wakes yet and a disk still walking: wired, nothing wrong,
     // nothing verified ok either.
@@ -353,16 +371,16 @@ describe('cockpit health pill', () => {
 });
 
 describe('cockpit Gru line', () => {
-  it('says nothing needs Gru, or how many live alerts wait for Gru, with the live-queue explanation', () => {
-    expect(gruQueueLine(0)).toMatchObject({ text: 'nothing needs Gru either · the crew is on it', alert: false });
-    expect(gruQueueLine(1)).toMatchObject({ text: '1 live alert waits for Gru', alert: true });
+  it('says nothing needs Gru, or how many live alerts Gru is handling, with the live-queue explanation', () => {
+    expect(gruQueueLine(0).text).toBe('nothing needs Gru either · the crew is on it');
+    expect(gruQueueLine(1).text).toBe('Gru is handling 1 live alert');
     const busy = gruQueueLine(3);
-    expect(busy).toMatchObject({ text: '3 live alerts wait for Gru', alert: true });
+    expect(busy.text).toBe('Gru is handling 3 live alerts');
     expect(busy.title).toContain('3 live machine-attention notifications awaiting a Gru disposition');
   });
 
   it('a last-known board says so rather than claiming calm', () => {
     expect(gruQueueLine(0, true).text).toBe('last-known · nothing needs Gru either · the crew is on it');
-    expect(gruQueueLine(2, true)).toMatchObject({ text: 'last-known · 2 live alerts wait for Gru', alert: true });
+    expect(gruQueueLine(2, true).text).toBe('last-known · Gru is handling 2 live alerts');
   });
 });

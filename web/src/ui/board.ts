@@ -387,6 +387,13 @@ export class BoardView {
     if (this.snapshot !== null) this.renderSnapshot(this.snapshot);
   }
 
+  /** The snapshot on screen is last-known: the board is unavailable, or its
+   * socket went stale or down since the last fresh snapshot. Surfaces that
+   * would otherwise claim calm (the health pill, the Gru line) say so. */
+  private lastKnown(): boolean {
+    return this.unavailableReason !== null || !this.snapshotIsCurrent;
+  }
+
   /** A disconnected board cannot authorize actions from its last-known snapshot. */
   markSnapshotStale(): void {
     if (!this.snapshotIsCurrent) return;
@@ -655,9 +662,9 @@ export class BoardView {
     // about Gru's own queue (NEEDS GRU — the live machine count the strip's
     // ALERTS pair used to carry). Both sit outside the heading, so its
     // accessible name stays `FOR YOU N pending`.
-    const gru = gruQueueLine(snapshot.unackedActionRequired, this.unavailableReason !== null);
+    const gru = gruQueueLine(snapshot.unackedActionRequired, this.lastKnown());
     const gruLine = (className: string): HTMLElement => {
-      const node = el('span', `${className}${gru.alert ? ' board-owner__gru--alert' : ''}`, gru.text);
+      const node = el('span', className, gru.text);
       node.title = gru.title;
       return node;
     };
@@ -1120,9 +1127,10 @@ export class BoardView {
    * flag), then the rest; the Jev and wake chips ride at its end. The dot
    * is decoration — the summary text carries the fact (never colour alone). */
   private renderHealth(snapshot: BoardSnapshot): void {
-    const pill = healthPill(snapshot);
+    const pill = healthPill(snapshot, Date.now(), this.lastKnown());
     this.healthMount.hidden = false;
     this.healthMount.dataset.state = pill.state;
+    this.healthMount.dataset.lastKnown = String(pill.lastKnown);
     this.healthMount.title = pill.title;
     this.healthSummary.textContent = pill.summary;
     this.healthParts.replaceChildren();
@@ -2276,24 +2284,24 @@ export class BoardView {
     // renders no marker — legacy rows are never claimed either way.
     const parentage = agent.parentage;
     const isChild = parentage === 'child';
-    // Cockpit rework: the worker of a megaminion heist reads megaminion, a
-    // child worker reads sub-minion (the word CREW counts), and Vector's
-    // raid session (Perkins's read-only role under the `vector` label,
-    // #351) reads as the raid it is.
+    // Cockpit rework: the worker of a megaminion heist reads megaminion,
+    // and Vector's raid session (Perkins's read-only role under the
+    // `vector` label, #351) reads as the raid it is. A child worker keeps
+    // its role word; its 🧬 marker names it a sub-minion (the word CREW
+    // counts).
     const vectorRaid = agent.role === 'perkins' && agent.label === 'vector';
-    const roleWord = isChild
-      ? 'sub-minion'
-      : vectorRaid
-        ? 'vector raid'
-        : agent.role === 'minion' && (job?.parentJobId ?? null) !== null
-          ? BOARD_WORDS.megaminion
-          : agent.role;
+    const roleWord = vectorRaid
+      ? 'vector raid'
+      : agent.role === 'minion' && (job?.parentJobId ?? null) !== null
+        ? BOARD_WORDS.megaminion
+        : agent.role;
     // G7: every rail row carries an accessible name; minions keep their
     // full-identity shape, other roles announce label · id — role · state,
-    // with the same role word the row shows.
+    // with the words the row shows.
+    const spoken = isChild ? 'sub-minion' : roleWord;
     row.setAttribute('aria-label', agent.role === 'minion'
-      ? `${name} · ${agent.id}${job !== undefined ? ` — ${job.title}` : ''} — ${roleWord} · ${status}`
-      : `${name} · ${agent.id} — ${roleWord} · ${status}`);
+      ? `${name} · ${agent.id}${job !== undefined ? ` — ${job.title}` : ''} — ${spoken} · ${status}`
+      : `${name} · ${agent.id} — ${spoken} · ${status}`);
     if (section === 'historical') {
       row.title += ' · historical: no current runtime owner — record retained';
     }

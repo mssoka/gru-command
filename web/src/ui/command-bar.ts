@@ -7,8 +7,10 @@
  * the state `renderConnectionDot` gave it — and survives every snapshot
  * push. RADAR is the board socket's: its dot and its word follow the
  * board client only (the chat socket's state is the chat pane's ONLINE
- * badge). There is no lens toggle: chat is always docked on desktop and
- * the FAB owns mobile chat.
+ * badge). The pills sit in a polite live region, so they are written only
+ * when a reading changes, and the dot is decoration (aria-hidden): the
+ * word beside it says the state. There is no lens toggle: chat is always
+ * docked on desktop and the FAB owns mobile chat.
  */
 
 import type { BoardConnectionState } from '../lib/board-client.js';
@@ -23,6 +25,7 @@ export class CommandBar {
   private readonly roundLabel: HTMLElement;
   private boardState: BoardConnectionState | null = null;
   private snapshot: BoardSnapshot | null = null;
+  private written: string | null = null;
 
   constructor() {
     this.radar = mustGet('command-radar');
@@ -45,6 +48,9 @@ export class CommandBar {
 
   private render(): void {
     const [radar, round] = tickerSegments({ boardState: this.boardState, snapshot: this.snapshot });
+    const reading = `${radar.tone}|${radar.label}|${round.tone}|${round.label}`;
+    if (reading === this.written) return;
+    this.written = reading;
     this.radar.className = `command-pill command-pill--${radar.tone}`;
     this.radarLabel.textContent = radar.label;
     this.round.className = `command-pill command-pill--round-${round.tone}`;

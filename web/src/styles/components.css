@@ -237,16 +237,17 @@ body {
 
 /* RADAR holds its widest word (`RADAR SYNCING`) and ROUND two digits of
    its number, so a reconnect or round 10 never moves the health pill
-   beside them. Monospace: ch per character plus its letter-spacing. */
+   beside them. Monospace: ch per character plus its letter-spacing, and
+   1px for glyph rounding (the fact slots' `2ch + 1px` precedent). */
 #command-radar-label {
   display: inline-block;
-  min-width: calc(13 * (1ch + 0.06em));
+  min-width: calc(13 * (1ch + 0.06em) + 1px);
   text-align: center;
 }
 
 .command-pill__num {
   display: inline-block;
-  min-width: calc(2 * (1ch + 0.06em));
+  min-width: calc(2 * (1ch + 0.06em) + 1px);
   text-align: center;
 }
 
@@ -320,10 +321,11 @@ body {
   background: var(--alert);
 }
 
-/* Nothing reads ok (no check wired, or only neutral facts): the dot is
-   muted, never the healthy green. */
+/* Nothing reads ok (no check wired, only neutral facts, or a last-known
+   snapshot): the dot is muted, never the healthy green. */
 .command-health[data-state='quiet'] .command-health__dot,
-.command-health[data-state='unwired'] .command-health__dot {
+.command-health[data-state='unwired'] .command-health__dot,
+.command-health[data-last-known='true']:not([data-state='attention']) .command-health__dot {
   background: var(--park);
 }
 
@@ -400,15 +402,13 @@ body {
   .command-health { order: 2; margin-left: 0; flex: 1 1 100%; max-width: none; }
 }
 
-/* Phone: the pills join the health pill's row; the calm checks give way
+/* Phone (the approved mock's rule): the bar stays one sticky row of brand
+   and buttons above the health pill. The RADAR and ROUND pills step aside
+   (a lost connection still shows as the banner); the calm checks give way
    to the summary, the checks that need a look keep a wrapping line of
-   their own, and the chips wrap inside the pill. */
+   their own, and the Jev and wake chips wrap inside the pill. */
 @media (max-width: 640px) {
-  /* The bar scrolls away with the page on a phone: wrapped to three rows
-     it would hold a quarter of the screen. The shortcut strip and the band
-     heads keep the top (main.ts measures --chrome-h as 0 here). */
-  .command-bar { position: relative; }
-  .command-bar__ticker { order: 1; }
+  .command-bar__ticker { display: none; }
   .command-health { flex: 1 1 auto; flex-wrap: wrap; row-gap: 4px; border-radius: var(--radius-md); }
   .command-health__parts { order: 1; flex: 1 1 100%; white-space: normal; }
   .command-health:not([data-state='attention']) .command-health__parts,
@@ -2154,17 +2154,6 @@ body {
   color: var(--muted);
 }
 
-/* Live alerts waiting for Gru: the ▲ beside the colour (never colour
-   alone). */
-.board-owner__gru--alert {
-  color: var(--band-needs-you-ink);
-}
-
-.board-owner__gru--alert::before {
-  content: '▲ ';
-  font-size: 0.8em;
-}
-
 #board-owner[data-empty='true'] {
   grid-template-columns: auto minmax(0, 1fr);
   align-items: center;
@@ -3409,14 +3398,13 @@ a.repo-row__name:hover {
 
 /* position: fixed (not absolute): a document-absolute panel slid under the
    sticky command bar as soon as the board scrolled (#28). Its top is
-   derived from the MEASURED bar height (--command-bar-h, the bar's full
-   height even on a phone, where the bar scrolls away), so a bar that
+   derived from the MEASURED chrome height (--chrome-h), so a bar that
    wraps to 2 or 3 rows still clears at every width. */
 .notification-panel {
   position: fixed;
   right: 16px;
-  top: calc(var(--command-bar-h, 100px) + 8px);
-  max-height: calc(100vh - var(--command-bar-h, 100px) - 16px);
+  top: calc(var(--chrome-h, 100px) + 8px);
+  max-height: calc(100vh - var(--chrome-h, 100px) - 16px);
   overflow-y: auto;
   width: min(420px, calc(100vw - 32px));
   z-index: 40;
@@ -3873,7 +3861,7 @@ a.repo-row__name:hover {
 
 .toast-stack {
   position: fixed;
-  top: calc(var(--command-bar-h, 100px) + 8px);
+  top: calc(var(--chrome-h, 100px) + 8px);
   right: 14px;
   z-index: 60;
   display: flex;
@@ -4188,16 +4176,16 @@ a.repo-row__name:hover {
      any more); they wrap to the second row with the health pill. */
 }
 
-/* ≤640px: command-bar icon controls compact so the owner-chime speaker
-   fits the phone row-1 budget (≤560px) and the bar has control-room to
-   spare at 561–640px. Height stays full — only padding tightens. */
+/* ≤640px: command-bar icon controls compact so the brand and all four
+   buttons share row 1 down to 360px (the approved mock's phone row), with
+   control-room to spare at 561–640px. Only padding tightens. */
 @media (max-width: 640px) {
   .command-bar {
     gap: 8px;
   }
 
   .command-bar .pp-btn--icon {
-    padding: 8px 6px;
+    padding: 7px 5px;
     font-size: 15px;
   }
 }

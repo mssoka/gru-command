@@ -691,19 +691,35 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
     expect(document.getElementById('board-unacked')).toBeNull();
     const lines = [...document.querySelectorAll<HTMLElement>('.board-owner__gru')];
     expect(lines).toHaveLength(1);
-    expect(lines[0]?.textContent).toBe('2 live alerts wait for Gru');
-    // Live alerts carry the alert ink (with its ▲ in CSS), never calm text.
-    expect(lines[0]?.classList.contains('board-owner__gru--alert')).toBe(true);
+    expect(lines[0]?.textContent).toBe('Gru is handling 2 live alerts');
     // The count is the LIVE machine queue: the line's title says so (A4).
     expect(lines[0]?.title).toContain('2 live machine-attention notifications awaiting a Gru disposition');
     expect(lines[0]?.title).toContain('closed receipts stay in the record');
     view.render(snapshot());
-    const calm = document.querySelector<HTMLElement>('.board-owner__gru');
-    expect(calm?.textContent).toBe('nothing needs Gru either · the crew is on it');
-    expect(calm?.classList.contains('board-owner__gru--alert')).toBe(false);
+    expect(document.querySelector('.board-owner__gru')?.textContent).toBe('nothing needs Gru either · the crew is on it');
     // A last-known board says so rather than claiming calm.
     view.markUnavailable('board socket lost');
     expect(document.querySelector('.board-owner__gru')?.textContent).toBe('last-known · nothing needs Gru either · the crew is on it');
+  });
+
+  it('a stale or down board socket marks the health pill and the Gru line last-known until a fresh snapshot', () => {
+    const view = new BoardView(() => {});
+    const verify = { lockInUse: false, activeRuns: 0, queuedRuns: 0, workerBudget: 8, workersPerRun: 4 };
+    view.render(snapshot({ verify }));
+    const pill = document.getElementById('command-health')!;
+    expect(document.getElementById('command-health-summary')?.textContent).toBe('All healthy');
+    expect(pill.dataset.lastKnown).toBe('false');
+    // The socket went stale: the frozen snapshot never reads as current calm.
+    view.markSnapshotStale();
+    expect(document.getElementById('command-health-summary')?.textContent).toBe('last-known · All healthy');
+    expect(pill.dataset.lastKnown).toBe('true');
+    expect(pill.dataset.state).toBe('healthy');
+    expect(document.querySelector('.board-owner__gru')?.textContent).toBe('last-known · nothing needs Gru either · the crew is on it');
+    // A fresh snapshot is current again.
+    view.render(snapshot({ verify }));
+    expect(document.getElementById('command-health-summary')?.textContent).toBe('All healthy');
+    expect(pill.dataset.lastKnown).toBe('false');
+    expect(document.querySelector('.board-owner__gru')?.textContent).toBe('nothing needs Gru either · the crew is on it');
   });
 
   it('the attention card: the heading keeps FOR YOU and its count; what needs you and the Gru line sit under it', () => {
@@ -868,7 +884,7 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
     expect(crew.querySelector('[data-kpi="children.active"]')?.getAttribute('title')).toContain('6 created');
     // Queued sub-minions are a count with its own identity, not loose text.
     expect(crew.querySelector('[data-kpi="children.queued"]')?.textContent).toBe('1');
-    expect(crew.querySelector('[data-kpi="children.queued"]')?.nextElementSibling?.textContent).toBe('queued');
+    expect(crew.querySelector('[data-kpi="children.queued"]')?.nextElementSibling?.textContent).toBe('sub-minion queued');
     expect(crew.querySelector('.cockpit-fact--note')).toBeNull();
   });
 
@@ -903,6 +919,13 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
     expect(on.querySelector('.cockpit-card__aside')?.getAttribute('title')).toBe('demo: 1 of 2 raids in the last 24 hours (the cap is per repository)');
     view.render(snapshot());
     expect(document.querySelector('.cockpit-card--raids')).toBeNull();
+    // A block the server could not read is unknown: dashed, never hidden.
+    view.render({ ...snapshot(), vector: null });
+    const unknown = document.querySelector<HTMLElement>('.cockpit-card--raids');
+    expect(unknown?.classList.contains('cockpit-card--off')).toBe(true);
+    expect(unknown?.querySelector('.cockpit-card__big')?.textContent).toBe('—');
+    expect(unknown?.querySelector('[data-kpi]')).toBeNull();
+    expect(unknown?.textContent).toContain('the server could not read the raids');
   });
 
   it('REVIEWS names the top round and counts today\'s verdicts and failures', () => {
@@ -1955,6 +1978,11 @@ describe('board agent rail — dense rows, tabs count, disposed collapse', () =>
     // Every other Perkins session keeps its role word and glyph.
     expect(sub('lens')).toBe('perkins · idle');
     expect(emoji('lens')).toBe('🔍');
+    // The accessible name says the same role word the row shows.
+    const name = (id: string): string => document.querySelector(`#board-agents .board-agent[data-agent-id="${id}"]`)?.getAttribute('aria-label') ?? '';
+    expect(name('mega-worker')).toContain('— megaminion · streaming');
+    expect(name('raid-session')).toContain('— vector raid · streaming');
+    expect(name('lens')).toContain('— perkins · idle');
   });
 
   it('distinguishes child workers from top-level minions with a parent link and family counters', () => {
@@ -2008,8 +2036,9 @@ describe('board agent rail — dense rows, tabs count, disposed collapse', () =>
     // A child row is labeled as a child and links back to its parent.
     const child = byAgentId.get('child-agent')!;
     expect(child.dataset.parentage).toBe('child');
-    // The rail says sub-minion — the word CREW counts — in text and name.
-    expect(child.querySelector('.board-agent__role')?.textContent).toContain('sub-minion ·');
+    // The marker says sub-minion — the word CREW counts — once; the role
+    // line keeps the worker's role, and the accessible name says both.
+    expect(child.querySelector('.board-agent__role')?.textContent).toMatch(/^minion · /u);
     expect(child.querySelector('.board-agent__parentage')?.textContent).toBe('🧬 sub-minion');
     expect(child.getAttribute('aria-label')).toContain('— sub-minion ·');
     expect(child.querySelector('.board-agent__parent-link')?.textContent).toContain('Payment lane');
@@ -2427,7 +2456,7 @@ describe('board v6 — section truth: closed receipts never queue, stopped lanes
     // title carries the live-queue explanation for hover/AT consumers.
     const gru = document.querySelectorAll<HTMLElement>('.board-owner__gru');
     expect(gru).toHaveLength(1);
-    expect(gru[0]?.textContent).toBe('1 live alert waits for Gru');
+    expect(gru[0]?.textContent).toBe('Gru is handling 1 live alert');
     expect(gru[0]?.title).toContain('1 live machine-attention notification awaiting a Gru disposition');
     // The record keeps BOTH durable rows. Machine rows clear through a Gru
     // disposition, not a human Ack, so neither carries an ack control.
@@ -2724,7 +2753,7 @@ describe('board v6 — section truth: closed receipts never queue, stopped lanes
     expect(row?.getAttribute('data-worker-state')).toBe('waiting');
     expect(row?.querySelector('.board-job__status')?.textContent).toBe('waiting · quota wall');
     expect(row?.querySelector('.board-job__signal')?.textContent).toContain('needs Gru');
-    expect(document.querySelector<HTMLElement>('.board-owner__gru')?.textContent).toMatch(/^\d+ live alerts? waits? for Gru$/u);
+    expect(document.querySelector<HTMLElement>('.board-owner__gru')?.textContent).toMatch(/^Gru is handling \d+ live alerts?$/u);
   });
 
   it('the waiting truth is scoped to working lanes: an in-review lane with a live round keeps its true chip', () => {
@@ -4145,7 +4174,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
       expect(section('NEEDS GRU').textContent).not.toContain('Notice closed-machine');
       expect(section('FEED').querySelector('[data-receipt="closed"]')?.textContent).toContain('Notice closed-machine');
       expect(section('FEED').querySelector('.board-notification__ack')).toBeNull();
-      expect(document.querySelector('.board-owner__gru')?.textContent).toMatch(/^\d+ live alerts? waits? for Gru$/u);
+      expect(document.querySelector('.board-owner__gru')?.textContent).toMatch(/^Gru is handling \d+ live alerts?$/u);
       expect(document.querySelector('.board-band--needs-you .board-job')).toBeNull();
       expect(client.ackNotification).not.toHaveBeenCalled();
       expect(machine.ackedAt).toBeNull();
