@@ -713,6 +713,13 @@ describe('docs/example.config.toml', () => {
     expect(config.thinking.default).toBe('default');
     expect(config.runtimes.policies['pi']?.roles).toEqual({});
     expect(config.onboarding.mode).toBe('proposed');
+    expect(config.decisions.jev.enabled).toBe(false);
+    expect(Object.values(config.decisions.surfaces).map((surface) => surface.mode)).toEqual([
+      'shadow',
+      'shadow',
+      'shadow',
+      'shadow',
+    ]);
   });
 });
 

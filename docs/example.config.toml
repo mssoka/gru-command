@@ -243,7 +243,7 @@ run_timeout_ms = 1800000          # per-run wall clock; expiry kills the process
 enabled = false                   # master switch; with it off no provider is ever contacted
 [decisions.surfaces.event_triage]
 provider = "openrouter-jev"
-mode = "shadow"                   # off | shadow (record only) | enforce (backtest-gated)
+mode = "shadow"                   # off | shadow (record only); enforce needs a recorded backtest (see the Jev guide)
 [decisions.surfaces.supervision_guidance]
 provider = "openrouter-jev"
 mode = "shadow"

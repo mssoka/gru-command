@@ -595,7 +595,8 @@ timeout_ms = 5000 # Per-call limit; on timeout the deterministic answer is used.
 #
 # `provider` routes a surface to a provider profile (default: openrouter-jev).
 # Shorthand for routing only, in place of that surface's table (never both):
-#   [decisions.surfaces]  event_triage = "typesafe-direct"
+#   [decisions.surfaces]
+#   event_triage = "typesafe-direct"
 [decisions.surfaces.event_triage]
 provider = "openrouter-jev"
 mode = "shadow"

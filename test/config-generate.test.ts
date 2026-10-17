@@ -366,7 +366,7 @@ describe('config-generate CLI', () => {
 
   function expectFreshShadowSurfaces(decisions: readonly string[]): void {
     const { before, after } = regenerateDecisions('unconfigured', decisions);
-    expect(after.jev).toEqual(before.jev);
+    expect({ ...after, surfaces: before.surfaces }).toEqual(before);
     expect(after.surfaces).toEqual(FRESH_SHADOW_SURFACES);
   }
 
@@ -375,7 +375,21 @@ describe('config-generate CLI', () => {
   });
 
   it('a --force re-run with Jev switched off and no surfaces gets the shadow surfaces', () => {
-    expectFreshShadowSurfaces(['[decisions.jev]', 'enabled = false', 'timeout_ms = 7000']);
+    expectFreshShadowSurfaces([
+      '[decisions.jev]',
+      'enabled = false',
+      'timeout_ms = 7000',
+      '[decisions.providers.mine]',
+      'protocol = "systemone"',
+      'endpoint = "http://127.0.0.1:8088/v1/systemone"',
+      'model = "laya-421m"',
+      'credential = "none"',
+      'timeout_ms = 3000',
+      'input_price_per_mtok = 0',
+      '[decisions.thresholds.read_only]',
+      'act = 0.7',
+      'confirm = 0.5',
+    ]);
   });
 
   it('round trip: a --force re-run preserves user-set values and hand-tuned sections, with backup', () => {

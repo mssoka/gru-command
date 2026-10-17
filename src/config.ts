@@ -573,29 +573,6 @@ export interface ReviewConfig {
   readonly maxConcurrentChildren: number;
 }
 
-/** Escape a string for a TOML basic string literal. */
-export function tomlString(value: string): string {
-  let out = '';
-  for (const ch of value) {
-    switch (ch) {
-      case '\\': out += '\\\\'; break;
-      case '"': out += '\\"'; break;
-      case '\b': out += '\\b'; break;
-      case '\t': out += '\\t'; break;
-      case '\n': out += '\\n'; break;
-      case '\f': out += '\\f'; break;
-      case '\r': out += '\\r'; break;
-      default:
-        if (ch < ' ' || ch === '\u007f') {
-          out += `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`;
-        } else {
-          out += ch;
-        }
-    }
-  }
-  return `"${out}"`;
-}
-
 export interface JevConfig {
   readonly enabled: boolean;
   readonly model: string;
@@ -900,6 +877,29 @@ export function expandTilde(path: string, home: string = homedir()): string {
   if (path === '~') return home;
   if (path.startsWith('~/')) return join(home, path.slice(2));
   return path;
+}
+
+/** Escape a string for a TOML basic string literal. */
+export function tomlString(value: string): string {
+  let out = '';
+  for (const ch of value) {
+    switch (ch) {
+      case '\\': out += '\\\\'; break;
+      case '"': out += '\\"'; break;
+      case '\b': out += '\\b'; break;
+      case '\t': out += '\\t'; break;
+      case '\n': out += '\\n'; break;
+      case '\f': out += '\\f'; break;
+      case '\r': out += '\\r'; break;
+      default:
+        if (ch < ' ' || ch === '\u007f') {
+          out += `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`;
+        } else {
+          out += ch;
+        }
+    }
+  }
+  return `"${out}"`;
 }
 
 const TOP_LEVEL_KEYS = [

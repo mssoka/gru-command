@@ -16,8 +16,6 @@ import {
   type RuntimeId,
 } from './config.js';
 
-export { tomlString };
-
 /**
  * THE single source of truth for the instance config reference.
  *

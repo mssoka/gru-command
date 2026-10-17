@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawnSync } from 'node:child_process';
+import { loadConfig } from '../src/config.js';
 
 const CLI = join(process.cwd(), 'dist', 'decisions', 'cli.js');
 const cleanup: string[] = [];
@@ -46,6 +47,19 @@ describe('compiled decisions CLI seam', () => {
     expect(off.stdout).toContain('require_confirm_on_act = true');
     expect(off.stdout).toContain('enabled = false');
     expect(on.stdout).toBe(off.stdout.replace('enabled = false', 'enabled = true'));
+    // The documented upgrade: appended to a config with no decisions tables, it loads.
+    const appended = home();
+    mkdirSync(appended.instance, { recursive: true });
+    writeFileSync(join(appended.instance, 'config.toml'), `[logging]\nmax_bytes = 1048576\n\n${on.stdout}`);
+    const decisions = loadConfig({ GRU_COMMAND_HOME: appended.instance }, appended.root).decisions;
+    expect(decisions.jev.enabled).toBe(true);
+    expect(Object.keys(decisions.surfaces)).toEqual([
+      'event_triage',
+      'supervision_guidance',
+      'escalation_triage',
+      'same_blocker',
+    ]);
+    expect(Object.values(decisions.surfaces).every((surface) => surface.mode === 'shadow')).toBe(true);
   });
 
   it('stores one stdin-only key atomically, never echoes it, and resolves it after a fresh process restart', () => {
