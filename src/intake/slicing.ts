@@ -130,20 +130,17 @@ export class IntakeSlicingService {
       // The dispatcher records the job before its first await, so the
       // caller learns of the commission at once instead of waiting out the
       // worker gate. A later failure is the dispatcher's to record on the
-      // job; it is logged here, and a retry reports the job's status.
+      // job; it is logged once here, and a retry reports the job's status.
       pending = this.options.dispatch({ jobId, repoPath: proposal.repoPath, title: `Slice intake ${proposal.intakeId} into heists`, briefing: this.briefing(proposal, resultRequestId, helper), deliverable: 'investigation' })
         .finally(() => this.inflight.delete(jobId));
+      pending.catch((error: unknown) => {
+        if (this.options.ledger.getJob(jobId) !== null) this.options.log?.('error', 'intake planning minion dispatch failed after its job was recorded', { job: jobId, error: error instanceof Error ? error.message : String(error) });
+      });
       this.inflight.set(jobId, pending);
-      if (this.options.ledger.getJob(jobId) !== null) {
-        pending.catch((error: unknown) => { this.options.log?.('error', 'intake planning minion dispatch failed after its job was recorded', { job: jobId, error: error instanceof Error ? error.message : String(error) }); });
-        return status(true);
-      }
+      if (this.options.ledger.getJob(jobId) !== null) return status(true);
     }
     try { await pending; } catch (error) {
-      if (this.options.ledger.getJob(jobId) !== null) {
-        this.options.log?.('error', 'intake planning minion dispatch failed after its job was recorded', { job: jobId, error: error instanceof Error ? error.message : String(error) });
-        return status(true);
-      }
+      if (this.options.ledger.getJob(jobId) !== null) return status(true);
       throw new IntakeError('intake_slicing_dispatch_failed', `The planning minion was not dispatched: ${error instanceof Error ? error.message : String(error)}. Retry the identical request.`, 503);
     }
     return status(true);
@@ -158,12 +155,13 @@ export class IntakeSlicingService {
     const { jobId, resultRequestId } = slicingIdentity(proposal);
     // An identical retry of a landed breakdown converges below even after
     // approval; only a new sliced plan of approved work is refused.
-    let landed = true;
-    try { this.options.intake.read(proposal.repoPath, proposal.intakeId, resultRequestId); } catch (error) {
-      if (!(error instanceof IntakeError) || error.code !== 'intake_not_found') throw error;
-      landed = false;
-    }
-    if (!landed && this.options.ledger.getApprovedIntakeReview(proposal.repoPath, proposal.intakeId, proposal.revisionId) !== null) throw new IntakeError('intake_slicing_approved', 'The sliced revision gained accepted work after its planning minion was commissioned; a sliced plan of it would plan that work twice', 409);
+    const landed = (): boolean => {
+      try { this.options.intake.read(proposal.repoPath, proposal.intakeId, resultRequestId); return true; } catch (error) {
+        if (error instanceof IntakeError && error.code === 'intake_not_found') return false;
+        throw error;
+      }
+    };
+    if (this.options.ledger.getApprovedIntakeReview(proposal.repoPath, proposal.intakeId, proposal.revisionId) !== null && !landed()) throw new IntakeError('intake_slicing_approved', 'The sliced revision gained accepted work after its planning minion was commissioned; a sliced plan of it would plan that work twice', 409);
     if (this.options.ledger.getJob(jobId) === null) throw new IntakeError('intake_slicing_not_commissioned', `No planning minion was commissioned for revision ${proposal.revisionId}; commission one with POST /api/intake/slice`, 409);
     const plan = slicingPlan(raw['breakdown'], proposal);
     validatePlan(plan, proposal);

@@ -53,8 +53,6 @@ interface BreakdownEntry {
   readonly quoted: readonly string[];
   /** The entry's own captured `tickets.toml` table; null for minion output. */
   readonly table: { readonly trace: Trace; readonly requirementIds: readonly string[] } | null;
-  /** `covers` as written: epic requirement ids, or inventory ids from a minion. */
-  readonly coverIds: readonly string[];
   readonly covered: readonly Requirement[];
   /** `covers` ids that name no captured epic line. */
   readonly missing: readonly string[];
@@ -62,7 +60,7 @@ interface BreakdownEntry {
   readonly lane: string;
   readonly rationale: string;
 }
-interface TomlEntry extends Omit<BreakdownEntry, 'table' | 'coverIds' | 'covered' | 'missing' | 'clarification' | 'lane' | 'rationale'> {
+interface TomlEntry extends Omit<BreakdownEntry, 'table' | 'covered' | 'missing' | 'clarification' | 'lane' | 'rationale'> {
   readonly covers: readonly string[];
   readonly span: { readonly start: number; readonly end: number };
 }
@@ -147,8 +145,9 @@ function sectionRanges(text: string, heading: RegExp): readonly { readonly start
  * `inputDocuments`, Notes, a breakdown's `references`), by lowercase file
  * name: a mention the capture lacks must never be silently forgotten. */
 export function referencedArchitecture(snapshot: Snapshot): readonly string[] {
-  const names = [...snapshot.text.matchAll(/(?<![\w./-])((?:[\w.-]+\/)*architecture[\w.-]*\.md)(?![\w-]|\.\w)/giu)].map((match) => match[1]!);
-  return [...new Set(names.map((name) => name.slice(name.lastIndexOf('/') + 1).toLowerCase()))];
+  // The file name alone, after any directory, `~/` or `{variable}/`.
+  const names = [...snapshot.text.matchAll(/(?<![\w.-])architecture[\w.-]*\.md(?![\w-]|\.\w)/giu)].map(([name]) => name.toLowerCase());
+  return [...new Set(names)];
 }
 
 /** Parse one epic's `tickets.toml` as BMAD v7 writes it. Every problem is
@@ -323,22 +322,12 @@ function toPlan(entries: readonly BreakdownEntry[], context: ReadonlySet<string>
       traces: runs(capture, architectureIds), clarification: true, requirementIds: [...architectureIds],
     }]),
   ];
-  // Recorded source conflicts stay open: on the entries whose covers the
-  // line names, else on the whole plan.
+  // A recorded source conflict blocks the whole plan until the owner settles
+  // it by refinement: attributing it to entries by the ids it mentions would
+  // under-block every id form the matching missed.
   const markdown = new Set([...documents, ...architecture].map(({ id }) => id));
-  const conflicts = capture.requirements.filter(({ trace }) => markdown.has(trace.snapshotId) && SOURCE_CONFLICT.test(trace.quote));
-  const conflictQuestion = (quote: string): string => `Settle the recorded source conflict before admitting it: ${quote.trim()}`;
-  // A conflict names an entry through any covers id it mentions, sub-ids
-  // (`R1.1` names R1) and same-prefix ranges (`R1-R3` names R2) included:
-  // over-blocking an entry is the safe side. `AD-1` names no id `1`.
-  const names = (quote: string, entry: BreakdownEntry): boolean => {
-    const ranged = new Set([...quote.matchAll(/(?<![0-9A-Za-z])([A-Za-z]+)(\d+)[ \t]*[-–—][ \t]*\1(\d+)(?![0-9A-Za-z])/gu)].flatMap(([, prefix, from, to]) => {
-      const [low, high] = [Number(from), Number(to)];
-      return high >= low && high - low <= 200 ? Array.from({ length: high - low + 1 }, (_, step) => `${prefix!}${low + step}`) : [];
-    }));
-    return entry.coverIds.some((id) => ranged.has(id) || new RegExp(`(?<![0-9A-Za-z])(?<![0-9A-Za-z][.-])${id.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}(?![0-9A-Za-z])`, 'u').test(quote));
-  };
-  const unowned = conflicts.filter(({ trace }) => !entries.some((entry) => names(trace.quote, entry)));
+  const conflicts = capture.requirements.filter(({ trace }) => markdown.has(trace.snapshotId) && SOURCE_CONFLICT.test(trace.quote))
+    .map(({ trace }) => `Settle the recorded source conflict before approval: ${trace.quote.trim()}`);
   const heists = entries.map((entry, position): Heist => {
     const covered = unique(entry.covered, ({ id }) => id);
     const own = [...(entry.table === null ? [] : [entry.table.trace]), ...covered.map(({ trace }) => trace)];
@@ -372,7 +361,6 @@ function toPlan(entries: readonly BreakdownEntry[], context: ReadonlySet<string>
         ...entry.missing.map((id) => `${label} covers ${JSON.stringify(id)}, but no captured epic line starts with that id. Correct covers, or supply the epic that defines it.`),
         ...(entry.description === '' ? [`${label} has no description.`] : []),
         ...(entry.verify === '' ? [`${label} has no verify check.`] : []),
-        ...conflicts.filter(({ trace }) => names(trace.quote, entry)).map(({ trace }) => conflictQuestion(trace.quote)),
       ],
       splitMergeRationale: origin === 'tickets'
         ? { text: `One heist per entry of the captured ${BREAKDOWN_FILE}, in its table order; its slicing is kept as written.`, traces: own, clarification: false }
@@ -385,7 +373,7 @@ function toPlan(entries: readonly BreakdownEntry[], context: ReadonlySet<string>
     requirementId: id,
     question: `${locators.get(trace.snapshotId)}: ${JSON.stringify(trace.quote.trim())} is ${requirementLines.has(id) ? 'a requirement no entry covers' : 'in no entry and not context'}. Place it in an entry, or confirm it is out of scope.`,
   }));
-  return { heists, unmapped, questions: [...questions, ...unowned.map(({ trace }) => conflictQuestion(trace.quote))] };
+  return { heists, unmapped, questions: [...questions, ...conflicts] };
 }
 
 /** The epic's own documents: every captured snapshot except a breakdown and
@@ -404,7 +392,7 @@ export function isBreakdownPlaceholder(text: string): boolean {
 /** Covers ids name the epic's requirement lines: a line starting with the id
  * (after an optional list marker or emphasis), inside a Requirements section
  * when the documents have one. */
-function coveredLines(capture: Capture, ids: readonly string[]): { readonly coverIds: readonly string[]; readonly covered: readonly Requirement[]; readonly missing: readonly string[] } {
+function coveredLines(capture: Capture, ids: readonly string[]): { readonly covered: readonly Requirement[]; readonly missing: readonly string[] } {
   const documents = epicDocuments(capture);
   const ids_ = new Set(documents.map(({ id }) => id));
   const section = requirementSectionIds(capture, documents);
@@ -417,7 +405,7 @@ function coveredLines(capture: Capture, ids: readonly string[]): { readonly cove
     if (found.length === 0) missing.push(id);
     covered.push(...found);
   }
-  return { coverIds: ids, covered, missing };
+  return { covered, missing };
 }
 
 /** Default mapping of a captured v7 breakdown: one heist per entry, in table
@@ -489,7 +477,7 @@ export function slicingPlan(value: unknown, capture: Capture): Plan {
       key, type: type as EntryType, title: words(entry['title'], `${label} title`), description: words(entry['description'], `${label} description`),
       verify: words(entry['verify'], `${label} verify`), unknown: words(entry['unknown'], `${label} unknown`, true), hitl: entry['hitl'] === true,
       after: items(entry['after'], `${label} after`).map((ref) => typeof ref === 'number' ? String(ref) : ref),
-      coverIds: covers, covered: covers.map((id) => requirements.get(id)!), clarification: entry['clarification'] === true,
+      covered: covers.map((id) => requirements.get(id)!), clarification: entry['clarification'] === true,
       lane: words(entry['lane'], `${label} lane`, true), rationale: words(entry['rationale'], `${label} rationale`, true),
     };
   });

@@ -218,20 +218,14 @@ describe('BMAD v7 epic folder intake (#429)', () => {
     expect(architectureSnapshots(proposal)).toEqual([]);
   });
 
-  it('finds an architecture named anywhere in a BMAD document, sentence-final or emphasised', async () => {
-    const notes = EPIC.replace('- constraint — architecture-checkout/architecture-checkout.md, AD-1\n', '').replace('- Decision: codes', '- Totals follow **architecture-checkout.md**.\n- See also architecture-payments.md.\n- Decision: codes');
+  it('finds an architecture named anywhere in a BMAD document, sentence-final or in bold, but not a longer file name', async () => {
+    const notes = EPIC.replace('- constraint — architecture-checkout/architecture-checkout.md, AD-1\n', '').replace('- Decision: codes', '- Totals follow **architecture-checkout.md**.\n- See also architecture-payments.md.\n- An old copy sits in architecture-legacy.md.bak.\n- UX rules: {planning_artifacts}/architecture-ux.md and /srv/docs/architecture-ops.md\n- Decision: codes');
+    expect(notes).not.toContain('architecture-checkout/architecture-checkout.md');
     const h = epicFolder({ 'epic-cart/epic-cart.md': notes, 'epic-cart/tickets.toml': TICKETS.replace('references = ["architecture-checkout/architecture-checkout.md#ad-1"]\n', '') });
     const proposal = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source(['epic-cart/tickets.toml']) });
-    expect(proposal.gaps.map(({ code, locator }) => [code, locator])).toEqual([['intake_missing_architecture', 'architecture-checkout.md'], ['intake_missing_architecture', 'architecture-payments.md']]);
+    expect(proposal.gaps.map(({ code, locator }) => [code, locator])).toEqual(['architecture-checkout.md', 'architecture-payments.md', 'architecture-ux.md', 'architecture-ops.md'].map((name) => ['intake_missing_architecture', name]));
   });
 
-  it('a conflict naming a sub-id or a range stays open on every entry whose covers it reaches', async () => {
-    const h = epicFolder({ 'epic-cart/epic-cart.md': EPIC.replace('- Decision: codes', '- Source conflict: R1.1 — undo is out of scope in the PRD.\n- Source conflict: R1-R3 — totals rounding differs from AD-1.\n- Decision: codes') });
-    const proposal = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source() });
-    const conflicts = proposal.plan.heists.map(({ unresolvedQuestions }) => unresolvedQuestions.filter((question) => question.includes('Source conflict')).map((question) => question.slice(question.indexOf('Source conflict: ') + 17, question.indexOf(' —'))));
-    expect(conflicts).toEqual([['R1.1', 'R1-R3'], ['R1-R3'], ['R1-R3']]);
-    expect(proposal.plan.questions).toEqual([]);
-  });
 
   it('refuses a second breakdown, other TOML and a misnamed breakdown by name', async () => {
     const h = epicFolder({ 'epic-cart/other.toml': TICKETS, 'other/tickets.toml': TICKETS });
@@ -258,17 +252,17 @@ describe('BMAD v7 epic folder intake (#429)', () => {
     expect(architecture.requirementIds).toEqual(bound.requirements.filter(({ trace }) => trace.snapshotId === 's3').map(({ id }) => id));
   });
 
-  it('a recorded source conflict stays open on the entries whose covers it names, else on the whole plan', async () => {
+  it('every recorded source conflict, in the epic or its architecture, blocks the whole plan until settled', async () => {
     const h = epicFolder({
       'epic-cart/epic-cart.md': EPIC.replace('- Decision: codes', '- Source conflict: R2 — the epic allows one code vs AD-1 which allows stacking.\n- Source conflict: tax rounding — the PRD and the code disagree.\n- Decision: codes'),
       'architecture-checkout/architecture-checkout.md': `${ARCHITECTURE}\n## Notes\n\n- Source conflict: AD-1 — the PRD asks the cart to recompute totals offline.\n`,
     });
     const proposal = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source() });
-    expect(proposal.plan.heists[1]!.unresolvedQuestions).toContain('Settle the recorded source conflict before admitting it: - Source conflict: R2 — the epic allows one code vs AD-1 which allows stacking.');
-    expect(proposal.plan.heists[0]!.unresolvedQuestions.some((question) => question.includes('Source conflict'))).toBe(false);
+    expect(proposal.plan.heists.flatMap(({ unresolvedQuestions }) => unresolvedQuestions).some((question) => question.includes('Source conflict'))).toBe(false);
     expect(proposal.plan.questions).toEqual([
-      'Settle the recorded source conflict before admitting it: - Source conflict: tax rounding — the PRD and the code disagree.',
-      'Settle the recorded source conflict before admitting it: - Source conflict: AD-1 — the PRD asks the cart to recompute totals offline.',
+      'Settle the recorded source conflict before approval: - Source conflict: R2 — the epic allows one code vs AD-1 which allows stacking.',
+      'Settle the recorded source conflict before approval: - Source conflict: tax rounding — the PRD and the code disagree.',
+      'Settle the recorded source conflict before approval: - Source conflict: AD-1 — the PRD asks the cart to recompute totals offline.',
     ]);
   });
 
@@ -398,20 +392,29 @@ describe('approval of a v7 breakdown (#429)', () => {
     expect(() => h.approval.approve({ ...decision, expectedToken: token, selected: ['entry-1'] })).toThrow(expect.objectContaining({ code: 'intake_incomplete_plan' }));
   });
 
-  it('a cancelled accepted prerequisite satisfies nothing and can be selected again', async () => {
-    const h = approvalFixture(TICKETS.replace('hitl = true\n', ''));
+  const deadPrerequisite = async (kill: (h: ReturnType<typeof approvalFixture>, entryId: string) => void, available = 0): Promise<void> => {
+    const h = approvalFixture(TICKETS.replace('hitl = true\n', ''), {}, available);
     const first = await h.service.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source() });
     const one = { repoPath: h.repo, intakeId: 'cart', requestId: 'r1', revisionId: first.revisionId, expectedToken: null };
     const accepted = h.approval.approve({ ...one, expectedToken: h.approval.review(one).review!.token, selected: ['entry-1'] }).review!;
-    h.db.handle.prepare("UPDATE pipeline_entries SET state = 'cancelled' WHERE id = ?").run(accepted.entries[0]!.id);
+    await h.pipeline.whenIdle();
+    kill(h, accepted.entries[0]!.id);
     const plan = { ...first.plan, heists: first.plan.heists.map((heist) => heist.id === 'entry-2' ? { ...heist, unresolvedQuestions: [] } : heist) };
     const second = await h.service.revise({ repoPath: h.repo, intakeId: 'cart', requestId: 'r2', previousRequestId: 'r1', revisionId: first.revisionId, plan });
     const two = { repoPath: h.repo, intakeId: 'cart', requestId: 'r2', revisionId: second.revisionId, expectedToken: accepted.token };
     const token = h.approval.review(two).review!.token;
     expect(() => h.approval.approve({ ...two, expectedToken: token, selected: ['entry-2'] })).toThrow(expect.objectContaining({ code: 'intake_dependency_selection' }));
     const readback = h.approval.approve({ ...two, expectedToken: token, selected: ['entry-1', 'entry-2'] });
-    expect(readback.accepted.map(({ heistId }) => heistId)).toEqual(['entry-1', 'entry-2']);
-  });
+    const [again, dependent] = readback.review!.entries;
+    expect(again!.id).not.toBe(accepted.entries[0]!.id);
+    expect(dependent!.prerequisites).toEqual([{ id: again!.id, milestone: 'merged' }]);
+  };
+  it('a cancelled accepted prerequisite satisfies nothing; selected again, its dependent waits on the new entry', () => deadPrerequisite((h, id) => { h.db.handle.prepare("UPDATE pipeline_entries SET state = 'cancelled' WHERE id = ?").run(id); }));
+  it('a failed accepted prerequisite satisfies nothing; selected again, its dependent waits on the new entry', () => deadPrerequisite((h, id) => { h.db.handle.prepare("UPDATE pipeline_entries SET state = 'failed' WHERE id = ?").run(id); }));
+  it('a binned accepted prerequisite satisfies nothing; selected again, its dependent waits on the new entry', () => deadPrerequisite((h, id) => {
+    expect(h.pipeline.entry(id)!.state).toBe('admitted');
+    h.ledger.setJobStatus(id, 'binned');
+  }, 1));
 
   it('an approval retry enqueues the frozen recorded entries, even when this build renders briefings differently', async () => {
     const h = approvalFixture(settled);

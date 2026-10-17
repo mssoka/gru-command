@@ -3,11 +3,10 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { IntakeService } from '../src/intake/service.js';
+import { IntakeService, INTAKE_MAX_OUTPUT_BYTES } from '../src/intake/service.js';
 import { IntakeSlicingService, INTAKE_SLICING_RESULT_KIND, SLICING_HELPER, slicingIdentity, type IntakeSlicingDispatchInput } from '../src/intake/slicing.js';
 import { validatePlan } from '../src/intake/planner.js';
 import { slicingPlan } from '../src/intake/breakdown.js';
-import { INTAKE_MAX_OUTPUT_BYTES } from '../src/intake/service.js';
 import { IntakeApprovalService } from '../src/intake/approval.js';
 import { PipelineService } from '../src/dispatch/pipeline.js';
 import { LedgerApi } from '../src/ledger/api.js';
@@ -47,12 +46,13 @@ function fixture() {
   // The dispatcher records the job row before its first await.
   const dispatch = vi.fn(async (input: IntakeSlicingDispatchInput) => { ledger.addJob({ id: input.jobId, repo: 'shop', title: input.title, briefing: input.briefing, deliverable: input.deliverable }); return { settled: Promise.resolve() }; });
   const post = vi.fn();
-  const slicing = new IntakeSlicingService({ intake, ledger, dispatch, notifications: { post }, apiBase: () => 'http://127.0.0.1:4100' });
+  const log = vi.fn();
+  const slicing = new IntakeSlicingService({ intake, ledger, dispatch, notifications: { post }, apiBase: () => 'http://127.0.0.1:4100', log });
   const pipeline = new PipelineService({ ledger, dispatch: { dispatch: vi.fn(async () => ({ settled: Promise.resolve() })) }, capacity: () => ({ capacity: 1, occupied: 1, available: 0, queued: 0 }) });
   const approval = new IntakeApprovalService({ intake, ledger, pipeline });
   cleanups.push(() => { pipeline.dispose(); db.close(); });
   const source = { kind: 'bmad' as const, document: { path: 'epic-cart/epic-cart.md' }, supporting: [{ path: 'architecture-checkout/architecture-checkout.md' }] };
-  return { root, repo, write, intake, slicing, dispatch, post, ledger, approval, source };
+  return { root, repo, write, intake, slicing, dispatch, post, log, ledger, approval, source };
 }
 const lineId = (proposal: Proposal, prefix: string): string => proposal.requirements.find(({ trace }) => trace.quote.startsWith(prefix))!.id;
 /** The fake model boundary: what a planning minion reads (the captured
@@ -299,6 +299,7 @@ describe('intake slicing by a commissioned planning minion (#429)', () => {
     const decision = { ...request, expectedToken: null };
     h.approval.approve({ ...decision, expectedToken: h.approval.review(decision).review!.token, selected: [heist.id] });
     expect(await h.slicing.submit({ ...request, breakdown })).toEqual(landed);
+    await expect(h.slicing.submit({ ...request, breakdown: { ...breakdown, questions: [] } })).rejects.toMatchObject({ code: 'intake_replay_conflict', status: 409 });
   });
 
   it('bounds the exact proposal it would publish, unmapped questions included, before writing the result request', async () => {
@@ -318,6 +319,27 @@ describe('intake slicing by a commissioned planning minion (#429)', () => {
     await expect(h.slicing.submit({ ...request, breakdown: loose })).rejects.toMatchObject({ code: 'intake_output_bounds' });
     expect(() => h.intake.read(h.repo, 'cart', resultRequestId)).toThrow(expect.objectContaining({ code: 'intake_not_found' }));
     expect((await h.slicing.submit({ ...request, breakdown: base })).requestId).toBe(resultRequestId);
+  });
+  it('logs a dispatch failure after the job is recorded, on the inline and the awaited path', async () => {
+    const h = fixture();
+    const preview = await h.intake.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r1', source: h.source });
+    const request = { repoPath: h.repo, intakeId: 'cart', requestId: 'r1', revisionId: preview.revisionId };
+    const { jobId } = slicingIdentity(preview);
+    h.dispatch.mockImplementationOnce(async (input) => {
+      await Promise.resolve();
+      h.ledger.addJob({ id: input.jobId, repo: 'shop', title: input.title, briefing: input.briefing, deliverable: input.deliverable });
+      throw new Error('spawn failed after recording');
+    });
+    expect(await h.slicing.commission(request)).toMatchObject({ dispatched: true, jobStatus: 'dispatched' });
+    expect(h.log).toHaveBeenCalledWith('error', 'intake planning minion dispatch failed after its job was recorded', { job: jobId, error: 'spawn failed after recording' });
+    const other = await h.intake.preview({ repoPath: h.repo, intakeId: 'cart', requestId: 'r2', source: h.source });
+    h.dispatch.mockImplementationOnce((input) => {
+      h.ledger.addJob({ id: input.jobId, repo: 'shop', title: input.title, briefing: input.briefing, deliverable: input.deliverable });
+      return Promise.reject(new Error('worktree failed'));
+    });
+    const inline = await h.slicing.commission({ ...request, requestId: 'r2', revisionId: other.revisionId });
+    expect(inline.dispatched).toBe(true);
+    await vi.waitFor(() => expect(h.log).toHaveBeenCalledWith('error', 'intake planning minion dispatch failed after its job was recorded', { job: inline.jobId, error: 'worktree failed' }));
   });
 });
 
