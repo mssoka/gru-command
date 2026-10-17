@@ -180,13 +180,31 @@ function issuedBinding(original: Receipt, laneId: string, ledger: LedgerApi): Is
   }
 }
 
+/** Every lane's completion facts by lane id, read once on first use (#427
+ * PR 2b): a moved-repository check passes one to each lane it settles or
+ * re-binds, so it reads the facts once, never once per lane. */
+export type LaneCompletions = () => ReadonlyMap<string, readonly Receipt[]>;
+
+/** A {@link LaneCompletions} over the ledger's completion facts as they are
+ * when it is first called. */
+export function laneCompletionsOnce(ledger: LedgerApi): LaneCompletions {
+  let byLane: ReadonlyMap<string, readonly Receipt[]> | null = null;
+  return () => {
+    if (byLane === null) {
+      const read = new Map<string, readonly Receipt[]>();
+      for (const { payload } of completionFacts(ledger)) read.set(payload.id, [...(read.get(payload.id) ?? []), payload]);
+      byLane = read;
+    }
+    return byLane;
+  };
+}
+
 /** The issued binding of a lane, or null when no completion names it (a
  * lane made before handoffs were recorded). */
-function laneBinding(laneId: string, ledger: LedgerApi): IssuedBinding | null {
-  const facts = [];
-  for (const event of completionFacts(ledger)) if (event.payload.id === laneId) facts.push(event);
+function laneBinding(laneId: string, ledger: LedgerApi, completions: LaneCompletions): IssuedBinding | null {
+  const facts = completions().get(laneId) ?? [];
   if (facts.length > 1) throw new Error('conflicting service handoff issuance');
-  return facts.length === 0 ? null : issuedBinding(facts[0]!.payload, laneId, ledger);
+  return facts.length === 0 ? null : issuedBinding(facts[0]!, laneId, ledger);
 }
 
 /** A rebinding of a moved lane's handoff, ready to record and publish. */
@@ -208,10 +226,11 @@ export interface LaneRebind {
  * the new binding nor any binding of the lane's own issued chain. An
  * earlier binding than the issued one is a rebinding recorded and never
  * published, then a second move (A→B recorded, its receipt not written,
- * then B→C): the newest binding is recorded and published over it.
+ * then B→C): the newest binding is recorded and published over it. The
+ * lane's completion is looked up in the check's `completions`.
  */
-export function prepareLaneRebind(lane: WorktreeRecord, repoPath: string, ledger: LedgerApi): LaneRebind | null {
-  const issued = laneBinding(lane.id, ledger);
+export function prepareLaneRebind(lane: WorktreeRecord, repoPath: string, ledger: LedgerApi, completions: LaneCompletions): LaneRebind | null {
+  const issued = laneBinding(lane.id, ledger, completions);
   if (issued === null) return null;
   const admin = adminFor(lane.path);
   const common = laneCommonDirectory(admin);
@@ -268,11 +287,12 @@ export function publishLaneRebind(rebind: Pick<LaneRebind, 'to' | 'admin'>): voi
 /** Finish a rebinding the ledger recorded and the disk did not get (a stop
  * between the two, perhaps more than once): when the lane's receipt is an
  * earlier binding of its own issued chain, publish the newest one. True
- * when it published. */
-export function settleLaneRebind(lane: WorktreeRecord, ledger: LedgerApi): boolean {
+ * when it published. The lane's completion is looked up in the check's
+ * `completions`. */
+export function settleLaneRebind(lane: WorktreeRecord, ledger: LedgerApi, completions: LaneCompletions): boolean {
   // Most lanes were never re-bound: one indexed look before any fact is read.
   if (ledger.listEventsAfter(0, { kinds: [HANDOFF_REBOUND_KIND], payload: { key: 'id', equals: lane.id }, limit: 1 }).length === 0) return false;
-  const issued = laneBinding(lane.id, ledger);
+  const issued = laneBinding(lane.id, ledger, completions);
   if (issued === null || issued.previous === null) return false;
   const admin = adminFor(lane.path);
   const disk = JSON.stringify(parseReceipt(readWorktreeMetadata(join(admin, receiptName))));

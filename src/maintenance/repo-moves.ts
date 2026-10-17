@@ -18,7 +18,11 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * ({@link WorktreeManager.checkMovedRepositories}): the managed repository
  * of the same name that holds the same repository (a shared root commit,
  * and the same `origin` when both have one) gets the lane back through
- * `git worktree repair`, and the registry's `repo_path` follows.
+ * `git worktree repair`, and the registry's `repo_path` follows. The check
+ * runs in slices of at most `MOVED_LANES_PER_CHECK` repairs (and about
+ * `MOVED_CHECK_REPAIR_MS`): start runs the first, and each reconcile (the
+ * first right after start) runs slices, yielding between them, until no
+ * lane waits.
  *
  * Released (swept) lanes follow their repository's move at each reconcile,
  * off the event loop ({@link WorktreeManager.followSweptLanes}). A lane
@@ -79,6 +83,7 @@ export class RepoMoveReconciler {
   private unsubscribe: (() => void) | null = null;
   private following: Promise<void> | null = null;
   private followAgain = false;
+  private stopped = false;
   /** Why each accepted card's discard is kept for now, logged once per change. */
   private readonly keptNotes = new Map<string, string>();
 
@@ -97,25 +102,40 @@ export class RepoMoveReconciler {
     });
   }
 
+  /** Stop following answers; a reconcile running its check stops at its
+   * next slice. */
   stop(): void {
+    this.stopped = true;
     this.unsubscribe?.();
     this.unsubscribe = null;
   }
 
-  /** The check, the released lanes' follow, then the answered cards (at
-   * start and every hour). */
+  /** The check, in slices until no lane is deferred, the released lanes'
+   * follow, then the answered cards (at start and every hour). Each slice
+   * runs on the event loop and repairs a bounded number of lanes
+   * (MOVED_LANES_PER_CHECK, none started after MOVED_CHECK_REPAIR_MS but the
+   * first); timers run between slices, and the next slice checks only the
+   * lanes the slice before deferred. */
   async reconcile(): Promise<void> {
-    this.check();
+    let deferred: ReadonlySet<string> | undefined;
+    do {
+      const outcomes = this.check(deferred);
+      deferred = new Set(outcomes.filter((outcome) => outcome.status === 'deferred').map((outcome) => outcome.lane.id));
+      // Through the timers phase, so a timer always runs between two slices.
+      if (deferred.size > 0) await new Promise<void>((resolveTurn) => { setTimeout(resolveTurn, 0); });
+    } while (deferred.size > 0 && !this.stopped);
     await this.opts.worktrees.followSweptLanes(this.names());
     await this.followCards();
   }
 
-  /** Repair what moved, propose a discard for a lane whose name now holds a
-   * different repository, report a tampered lane to Gru, and withdraw the
-   * cards of lanes reconnected or swept. Synchronous: main.ts runs it at
-   * start before any turn. */
-  check(): readonly RepoMoveOutcome[] {
-    const outcomes = this.opts.worktrees.checkMovedRepositories(this.names());
+  /** One slice of the check (of `lanes` only, when given): repair what
+   * moved, propose a discard for a lane whose name now holds a different
+   * repository, report a tampered lane to Gru, and withdraw the cards of
+   * lanes reconnected or swept. Synchronous: main.ts runs its first slice at
+   * start before any turn; a lane it deferred is refused its turns until the
+   * first reconcile, right after start, repairs it. */
+  check(lanes?: ReadonlySet<string>): readonly RepoMoveOutcome[] {
+    const outcomes = this.opts.worktrees.checkMovedRepositories({ ...this.names(), ...(lanes !== undefined ? { lanes } : {}) });
     for (const outcome of outcomes) {
       try {
         if (outcome.status === 'mismatch') this.propose(outcome);

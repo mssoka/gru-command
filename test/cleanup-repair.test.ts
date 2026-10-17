@@ -33,7 +33,7 @@ import { ownerAttentionFor, requiresTypedDecision } from '../src/notifications/a
 import { PacingGate } from '../src/runtime/pacing.js';
 import type { AgentHandle } from '../src/runtime/types.js';
 import { captureCwdHandoff, WorktreeHandoffUnresolvedError, type Receipt } from '../src/worktrees/handoff.js';
-import { normalizedOriginUrl, PRESERVED_REF_PREFIX, REPO_IDENTITY_EVENT, WorktreeManager, type ProcessEnumerator } from '../src/worktrees/manager.js';
+import { MOVED_LANES_PER_CHECK, normalizedOriginUrl, PRESERVED_REF_PREFIX, REPO_IDENTITY_EVENT, WorktreeManager, type ProcessEnumerator } from '../src/worktrees/manager.js';
 import { laneLifecycleHooks } from '../src/worktrees/slimming.js';
 
 /**
@@ -1064,6 +1064,84 @@ describe('a moved repository\'s lanes are repaired by identity (#427 PR 2b)', ()
     expect(count(second, 'rev-parse')).toBe(0);
     expect(h.ledger.listWorktrees().filter((row) => row.repoPath === app)).toHaveLength(10);
   });
+
+  /** `count` job lanes of one repository, which then moves to a new
+   * workspace root: the moved repository, the lanes' paths, and the
+   * reconciler of a service started after the move. */
+  async function movedLanes(h: Harness, count: number): Promise<{ readonly moved: string; readonly paths: readonly string[]; readonly reconciler: RepoMoveReconciler }> {
+    const app = repoIn(tempDir('gru-cleanup-ws-code-'), 'app', { origin: true });
+    const creator = h.manager();
+    const paths: string[] = [];
+    for (let n = 0; n < count; n += 1) {
+      const id = `job-${String(n).padStart(3, '0')}`;
+      addJob(h, id);
+      paths.push((await creator.createJobWorktree({ repoPath: app, jobId: id })).path);
+    }
+    const moved = join(tempDir('gru-cleanup-ws-src-'), 'app');
+    renameSync(app, moved);
+    return { moved, paths, reconciler: new RepoMoveReconciler({ worktrees: h.manager(), ledger: h.ledger, bus: h.bus, notifications: h.notifications, workspaceRoot: dirname(moved), managedRepos: ['app'] }) };
+  }
+
+  it('the check repairs in bounded slices and reads the completion facts once per slice: of 100 moved lanes (and 5,000 other lanes\' completion facts), start repairs at most MOVED_LANES_PER_CHECK and the rest wait, refused their turns, until the reconcile repairs them with a timer firing between slices; the next check settles all 100 re-bound lanes with one read', async () => {
+    const h = harness();
+    const { moved, paths, reconciler } = await movedLanes(h, 100);
+    const repaired = (): number => h.ledger.listWorktrees().filter((row) => row.repoPath === moved).length;
+    // A long-lived ledger: the completion facts of 5,000 other lanes.
+    const sample = h.ledger.listEventsAfter(0, { kinds: ['worktree.handoff-completed'], limit: 1 })[0]!;
+    h.db.handle.exec('BEGIN');
+    for (let n = 0; n < 5_000; n += 1) {
+      forgeEvent(h, 'worktree.handoff-completed', sample.jobId!, { ...(sample.payload as Receipt), id: `gone-${String(n)}`, token: `gru-creation:${randomUUID()}` });
+    }
+    h.db.handle.exec('COMMIT');
+    const reads = vi.spyOn(h.ledger, 'listEventsAfter');
+    const slices = vi.spyOn(reconciler, 'check');
+    cleanups.push(() => { reads.mockRestore(); slices.mockRestore(); });
+    const factReads = (): number => reads.mock.calls.filter(([seq, opts]) => seq === 0 && opts?.kinds?.includes('worktree.handoff-completed') === true).length;
+
+    const first = reconciler.check();
+
+    const firstSlice = first.filter((outcome) => outcome.status === 'repaired').length;
+    expect(firstSlice).toBeGreaterThan(0);
+    expect(firstSlice).toBeLessThanOrEqual(MOVED_LANES_PER_CHECK);
+    expect(first.filter((outcome) => outcome.status === 'deferred')).toHaveLength(100 - firstSlice);
+    expect(repaired()).toBe(firstSlice);
+    expect(factReads()).toBe(1);
+    expect(() => captureCwdHandoff(first.find((outcome) => outcome.status === 'deferred')!.lane.path)).toThrow(WorktreeHandoffUnresolvedError);
+
+    const seen: number[] = [];
+    let last = performance.now();
+    let longest = 0;
+    const timer = setInterval(() => {
+      const now = performance.now();
+      longest = Math.max(longest, now - last);
+      last = now;
+      seen.push(repaired());
+    }, 1);
+    try {
+      await reconciler.reconcile();
+    } finally {
+      clearInterval(timer);
+    }
+
+    expect(repaired()).toBe(100);
+    expect(h.ledger.listEventsAfter(0, { kinds: ['worktree.handoff-rebound'], limit: 1000 })).toHaveLength(100);
+    // The timer fired between slices: never more than one slice's repairs between two of its ticks.
+    const counts = [firstSlice, ...seen, 100];
+    expect(Math.max(...counts.slice(1).map((count, n) => count - counts[n]!))).toBeLessThanOrEqual(MOVED_LANES_PER_CHECK);
+    expect(longest).toBeLessThan(1_000);
+    // One read of the completion facts per slice, never one per lane.
+    expect(factReads()).toBeLessThanOrEqual(slices.mock.calls.length);
+    expect(slices.mock.calls.length).toBeLessThan(100);
+    // A lane waiting for its slice is not a lane that cannot be reconnected.
+    expect(h.logs.filter((log) => log.level === 'warn')).toEqual([]);
+    reads.mockClear();
+
+    // The next check settles each of the 100 re-bound lanes: one read for all of them.
+    expect(reconciler.check()).toEqual([]);
+
+    expect(factReads()).toBe(1);
+    for (const path of paths) expect(() => captureCwdHandoff(path)()).not.toThrow();
+  });
 });
 
 describe('a rebinding is taken only as a move of the repository (#427 PR 2b)', () => {
@@ -1508,6 +1586,54 @@ describe('gru-service reset (#427 PR 2b)', () => {
     const said = at.out.join('\n');
     expect(said).toContain(`${deep} is a worktree or folder of your own: it is kept`);
     expect(said).toContain(`${x} is a worktree or folder of your own: it is kept`);
+  });
+
+  it('keeps the git directory a checkout of the user\'s in the data directory names: a --separate-git-dir one beside it, and a submodule\'s .git/modules/<name>, with their history', async () => {
+    const at = await instance();
+    const separate = join(at.home, 'sepco');
+    git(at.home, ['init', '-q', '-b', 'main', '--separate-git-dir', join(at.home, 'sep.git'), separate]);
+    writeFileSync(join(separate, 'notes.txt'), 'mine\n');
+    git(separate, ['add', '.']);
+    git(separate, ['commit', '-qm', 'sep: first']);
+    const lib = repoIn(at.workspace, 'lib');
+    const sup = repoIn(at.home, 'super');
+    git(sup, ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', lib, 'sub']);
+    git(sup, ['commit', '-qm', 'super: add sub']);
+    writeFileSync(join(sup, 'sub', 'draft.txt'), 'sub work\n');
+
+    const code = await runResetCli(['--yes'], at.deps());
+
+    expect(at.err).toEqual([]);
+    expect(code).toBe(0);
+    expect(git(separate, ['log', '--format=%s'])).toBe('sep: first');
+    expect(git(separate, ['status', '--porcelain'])).toBe('');
+    expect(git(join(sup, 'sub'), ['log', '--format=%s'])).toBe('lib: first');
+    expect(git(join(sup, 'sub'), ['status', '--porcelain'])).toBe('?? draft.txt');
+    expect(readdirSync(at.home).sort()).toEqual(['config.toml', 'credentials', 'identity', 'logs', 'perkins', 'reset.lock', 'sep.git', 'sepco', 'super']);
+    expect(readdirSync(join(sup, '.git'))).toEqual(['modules']);
+    const said = at.out.join('\n');
+    expect(said).toContain(`${join(at.home, 'sep.git')} is a worktree or folder of your own: it is kept`);
+    expect(said).toContain(`${join(sup, '.git', 'modules', 'sub')} is a worktree or folder of your own: it is kept`);
+  });
+
+  it('keeps the data directory\'s own .git, with its history, when the data directory is a checkout of the user\'s holding a worktree of theirs', async () => {
+    const at = await instance();
+    git(at.home, ['init', '-q', '-b', 'main']);
+    git(at.home, ['add', 'config.toml']);
+    git(at.home, ['commit', '-qm', 'data: first']);
+    const tree = join(at.home, 'wt');
+    git(at.home, ['worktree', 'add', '-q', '-b', 'mine-wt', tree]);
+    writeFileSync(join(tree, 'draft.txt'), 'wt work\n');
+
+    const code = await runResetCli(['--yes'], at.deps());
+
+    expect(at.err).toEqual([]);
+    expect(code).toBe(0);
+    expect(git(at.home, ['log', '--format=%s'])).toBe('data: first');
+    expect(git(tree, ['log', '--format=%s'])).toBe('data: first');
+    expect(git(tree, ['status', '--porcelain'])).toBe('?? draft.txt');
+    expect(readdirSync(at.home).sort()).toEqual(['.git', 'config.toml', 'credentials', 'identity', 'logs', 'perkins', 'reset.lock', 'wt']);
+    expect(at.out.join('\n')).toContain(`${join(at.home, '.git')} is a worktree or folder of your own: it is kept`);
   });
 
   it.skipIf(!caseInsensitiveTmp)('on a case-insensitive volume, refuses a data directory spelled in another letter case than the workspace it is, and changes nothing', async () => {

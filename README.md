@@ -241,7 +241,7 @@ lists what it will do and asks (or pass `--yes`). It removes every GC lane
 from the repository that registers it (`git worktree remove --force
 --force`, then `git worktree prune`) and deletes the data directory's
 contents except `config.toml`, the install's own files and any worktree of
-yours in it, the ledger last; a service started meanwhile refuses to open
+yours in it (with its repository when that is there too), the ledger last; a service started meanwhile refuses to open
 its ledger until reset ends. `gru/*` branches go only with
 `--delete-branches` and `refs/gru/*` only with `--delete-refs`; your own
 branches, worktrees and files are never touched

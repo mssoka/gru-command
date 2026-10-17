@@ -651,13 +651,16 @@ function planRepo(name: string, path: string, ctx: PlanContext, options: ResetOp
  * Each is read from its own `.git` file, never through git:
  * - registered in an existing repository (an administration there points
  *   back at it): a GC lane is removed there; any other is the user's, kept,
- *   and so is its repository when that lies in the data directory;
+ *   and so is its repository when that lies in the data directory (the
+ *   data directory's own `.git` when the data directory is that checkout);
  * - otherwise, a lane GC made (the registry names it, or it has a lane's
  *   place under the lanes root) is removed from the repository the registry
  *   records when that one lists it; else its folder is deleted when its
  *   existing repository registers it nowhere; else, its repository not
  *   found or its `.git` file unreadable, it is left and named. Any other
- *   folder is kept.
+ *   folder is kept, and so is the git directory its `.git` file names when
+ *   that is a whole one in the data directory (`--separate-git-dir`, a
+ *   submodule's).
  * A registry lane whose folder is gone is deregistered from the repository
  * the registry records, when that one still lists it.
  */
@@ -700,13 +703,20 @@ function planOtherLanes(ctx: PlanContext): OtherLanes {
       } else {
         keep(resolved);
         // Its repository too, when it is in the data directory: the
-        // checkout around a `.git` directory, or a bare repository.
-        keep(real(basename(link.common) === '.git' ? dirname(link.common) : link.common));
+        // checkout around a `.git` directory (that `.git` alone when the
+        // checkout is the data directory itself), or a bare repository.
+        const repo = real(basename(link.common) === '.git' ? dirname(link.common) : link.common);
+        keep(repo === ctx.realData ? real(link.common) : repo);
       }
       continue;
     }
     if (!ctx.registry.has(tree) && !ctx.registry.has(resolved) && !laneShaped(ctx, resolved)) {
       keep(resolved);
+      // A checkout whose `.git` file names a whole git directory, not an
+      // administration (a `--separate-git-dir` repository's, or a
+      // submodule's `.git/modules/<name>`): that git directory too, when it
+      // is in the data directory.
+      if (!('problem' in link) && gitDirectory(link.named)) keep(real(link.named));
       continue;
     }
     const recorded = recordedRepository(tree, resolved);

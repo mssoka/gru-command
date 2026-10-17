@@ -1,4 +1,4 @@
-import { readWorktreeMetadata, repositoryCommonDirectory, capturePortLaneHandoff, captureCwdHandoff, beginLaneHandoff, completeLaneHandoff, rememberManagedLane, registerHandoffManager, assertPendingLaneHandoff, captureCleanupHandoff, assertLaneResourcesAbsent, WorktreeHandoffUnresolvedError, prepareLaneRebind, publishLaneRebind, settleLaneRebind, laneReceiptStale } from './handoff.js';
+import { readWorktreeMetadata, repositoryCommonDirectory, capturePortLaneHandoff, captureCwdHandoff, beginLaneHandoff, completeLaneHandoff, rememberManagedLane, registerHandoffManager, assertPendingLaneHandoff, captureCleanupHandoff, assertLaneResourcesAbsent, WorktreeHandoffUnresolvedError, prepareLaneRebind, publishLaneRebind, settleLaneRebind, laneReceiptStale, laneCompletionsOnce, type LaneCompletions } from './handoff.js';
 import { execFile, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
@@ -603,26 +603,43 @@ export const REPO_IDENTITY_EVENT = 'worktree.repo-identity';
 /** What the moved-repository check found for one lane (#427 PR 2b):
  * repaired (its registry `repo_path` moved from `from` to `to`), a
  * different repository under its name (`candidate`: the caller proposes the
- * discard), or not judged now (`reason`, judged again at the next check). */
+ * discard), not judged now (`reason`, judged again at the next check), or
+ * deferred (the check spent its repairs, {@link MOVED_LANES_PER_CHECK}
+ * lanes or {@link MOVED_CHECK_REPAIR_MS}; the caller's next slice repairs
+ * it). */
 export type RepoMoveOutcome =
   | { readonly status: 'repaired'; readonly lane: WorktreeRecord; readonly from: string; readonly to: string }
   | { readonly status: 'mismatch'; readonly lane: WorktreeRecord; readonly candidate: string; readonly reason: string }
   | { readonly status: 'unresolved'; readonly lane: WorktreeRecord; readonly reason: string }
   /** Its administration changed with no move of its repository to explain
    * it: nothing is re-bound or recorded, and its custody stays refused. */
-  | { readonly status: 'tampered'; readonly lane: WorktreeRecord; readonly reason: string };
+  | { readonly status: 'tampered'; readonly lane: WorktreeRecord; readonly reason: string }
+  | { readonly status: 'deferred'; readonly lane: WorktreeRecord };
 
 /** The lanes one moved-repository check repairs at most (#427 PR 2b): the
- * check runs on the event loop, so the rest wait for the next check. */
-export const MOVED_LANES_PER_CHECK = 100;
+ * check runs on the event loop, and a repair takes tens of milliseconds, so
+ * one check stays well under a second; the rest are deferred to the next
+ * slice (the maintenance reconcile runs slices, yielding between them,
+ * until no lane is deferred). */
+export const MOVED_LANES_PER_CHECK = 10;
 
-/** What one moved-repository check reads once (#427 PR 2b): each
- * candidate's identity (its root set), and the root commits of a base
- * commit in a candidate (`<candidate>\0<sha>`), and how many lanes it
- * repaired so far. */
+/** How long one moved-repository check repairs (#427 PR 2b): once this much
+ * has passed since it began, it starts no further repair (it always makes
+ * one), so a slow disk or a loaded machine still keeps it well under a
+ * second. */
+export const MOVED_CHECK_REPAIR_MS = 250;
+
+/** What one moved-repository check reads once (#427 PR 2b): where each
+ * managed name resolves, each candidate's identity (its root set), the root
+ * commits of a base commit in a candidate (`<candidate>\0<sha>`), every
+ * lane's completion facts (on first use); and when it began
+ * (`performance.now()`) and how many lanes it repaired so far. */
 interface MoveCheckCache {
+  readonly began: number;
+  readonly places: Map<string, ManagedRepoPath>;
   readonly identities: Map<string, RepoIdentity | { readonly error: unknown }>;
   readonly baseRoots: Map<string, BaseRoots>;
+  readonly completions: LaneCompletions;
   repairs: number;
 }
 
@@ -1477,19 +1494,24 @@ export class WorktreeManager {
    * reaches as the filesystem resolves them: the repository moved with a
    * link left at its old place, or its own git directory moved. An
    * administration that changed with no such move to explain it is
-   * `tampered`. Each repository's identity, and each base commit's roots,
-   * are read once per check; at most {@link MOVED_LANES_PER_CHECK} lanes are
-   * repaired per check (it runs on the event loop), the rest at the next.
-   * Released lanes follow at {@link followSweptLanes}.
+   * `tampered`. Each managed name's place, each repository's identity, each
+   * base commit's roots, and the completion facts every settled or re-bound
+   * lane's handoff is read from, are read once per check. It runs on the
+   * event loop, so it repairs at most {@link MOVED_LANES_PER_CHECK} lanes,
+   * and starts none but the first after {@link MOVED_CHECK_REPAIR_MS}: the
+   * rest are `deferred` to the next slice, which checks only `lanes` (the
+   * ones the slice before deferred). Released lanes follow at
+   * {@link followSweptLanes}.
    */
   checkMovedRepositories(input: {
     readonly managedRepos: readonly string[];
     readonly resolve: (name: string) => ManagedRepoPath;
+    readonly lanes?: ReadonlySet<string>;
   }): readonly RepoMoveOutcome[] {
     const outcomes: RepoMoveOutcome[] = [];
-    const cache: MoveCheckCache = { identities: new Map(), baseRoots: new Map(), repairs: 0 };
+    const cache: MoveCheckCache = { began: performance.now(), places: new Map(), identities: new Map(), baseRoots: new Map(), completions: laneCompletionsOnce(this.opts.ledger), repairs: 0 };
     for (const row of this.opts.ledger.listWorktrees()) {
-      if (row.status === 'swept' || !existsSync(row.path)) continue;
+      if (row.status === 'swept' || !existsSync(row.path) || (input.lanes !== undefined && !input.lanes.has(row.id))) continue;
       let outcome: RepoMoveOutcome | null;
       try {
         outcome = this.checkMovedLane(row, input, cache);
@@ -1498,6 +1520,10 @@ export class WorktreeManager {
       }
       if (outcome === null) {
         this.moveNotes.delete(row.id);
+        continue;
+      }
+      if (outcome.status === 'deferred') {
+        outcomes.push(outcome);
         continue;
       }
       if (outcome.status !== 'repaired') {
@@ -1517,6 +1543,8 @@ export class WorktreeManager {
       }
       outcomes.push(outcome);
     }
+    const deferred = outcomes.filter((outcome) => outcome.status === 'deferred').length;
+    if (deferred > 0) this.log('info', 'moved lanes wait for the next slice of the check: one slice repairs a bounded number of lanes', { attempted: cache.repairs, deferred });
     return outcomes;
   }
 
@@ -1524,18 +1552,23 @@ export class WorktreeManager {
     readonly managedRepos: readonly string[];
     readonly resolve: (name: string) => ManagedRepoPath;
   }, cache: MoveCheckCache): RepoMoveOutcome | null {
-    const deferred = (): RepoMoveOutcome => ({ status: 'unresolved', lane: row, reason: `this check repaired ${String(MOVED_LANES_PER_CHECK)} lanes already; the next check repairs this one` });
+    const deferred = (): RepoMoveOutcome => ({ status: 'deferred', lane: row });
+    const spent = (): boolean => cache.repairs >= MOVED_LANES_PER_CHECK || (cache.repairs > 0 && performance.now() - cache.began >= MOVED_CHECK_REPAIR_MS);
+    const place = (name: string): ManagedRepoPath => {
+      if (!cache.places.has(name)) cache.places.set(name, input.resolve(name));
+      return cache.places.get(name)!;
+    };
     if (laneReachesRepository(row.path, row.repoPath)) {
-      if (settleLaneRebind(row, this.opts.ledger)) {
+      if (settleLaneRebind(row, this.opts.ledger, cache.completions)) {
         this.log('info', 'a moved lane\'s re-bound handoff receipt was published after an interrupted repair', { id: row.id });
       }
       if (laneReceiptStale(row)) {
         // The link reaches the repository only through a link left at its
         // old place, or its own git directory moved: the lane follows the
         // managed repository of its name when that is the same place.
-        const resolved = input.managedRepos.includes(row.repoName) ? input.resolve(row.repoName) : null;
+        const resolved = input.managedRepos.includes(row.repoName) ? place(row.repoName) : null;
         const candidate = resolved?.kind === 'available' && samePlace(resolved.path, row.repoPath) ? resolved.path : row.repoPath;
-        return cache.repairs >= MOVED_LANES_PER_CHECK ? deferred() : this.repairMovedLane(row, candidate, cache, true);
+        return spent() ? deferred() : this.repairMovedLane(row, candidate, cache, true);
       }
       this.recordRepoIdentity(row, cache);
       return null;
@@ -1543,7 +1576,7 @@ export class WorktreeManager {
     if (!input.managedRepos.includes(row.repoName)) {
       return { status: 'unresolved', lane: row, reason: `its git link does not reach ${row.repoPath}, and ${row.repoName} is not a managed repository` };
     }
-    const resolved = input.resolve(row.repoName);
+    const resolved = place(row.repoName);
     if (resolved.kind !== 'available') {
       return { status: 'unresolved', lane: row, reason: `its git link does not reach ${row.repoPath}, and the managed repository ${row.repoName} cannot be used: ${resolved.kind === 'unavailable' ? resolved.reason : resolved.error}` };
     }
@@ -1556,7 +1589,7 @@ export class WorktreeManager {
     if (verdict.byBaseOnly) {
       this.log('info', 'a lane made before repository identities were recorded was matched by its base commit\'s root commits only: its repository was already gone, so no origin could be compared', { id: row.id, repo_path: row.repoPath, candidate: resolved.path });
     }
-    return cache.repairs >= MOVED_LANES_PER_CHECK ? deferred() : this.repairMovedLane(row, resolved.path, cache, false);
+    return spent() ? deferred() : this.repairMovedLane(row, resolved.path, cache, false);
   }
 
   /**
@@ -1574,9 +1607,9 @@ export class WorktreeManager {
     readonly managedRepos: readonly string[];
     readonly resolve: (name: string) => ManagedRepoPath;
   }): Promise<void> {
-    const cache: MoveCheckCache = { identities: new Map(), baseRoots: new Map(), repairs: 0 };
+    const cache: MoveCheckCache = { began: performance.now(), places: new Map(), identities: new Map(), baseRoots: new Map(), completions: laneCompletionsOnce(this.opts.ledger), repairs: 0 };
     const present = new Map<string, boolean>();
-    const places = new Map<string, ManagedRepoPath>();
+    const { places } = cache;
     const followed = new Map<string, { readonly from: string; readonly to: string; lanes: number; byBaseOnly: number }>();
     for (const row of this.opts.ledger.listWorktrees()) {
       if (row.status !== 'swept' || !input.managedRepos.includes(row.repoName)) continue;
@@ -1653,7 +1686,7 @@ export class WorktreeManager {
     if (!laneReachesRepository(row.path, candidate)) {
       return { status: 'unresolved', lane: row, reason: `git worktree repair in ${candidate} did not reconnect the lane: that repository has no record of it` };
     }
-    const rebind = prepareLaneRebind(row, candidate, this.opts.ledger);
+    const rebind = prepareLaneRebind(row, candidate, this.opts.ledger, cache.completions);
     if (rebind === null && candidate === row.repoPath) {
       this.log('info', 'a lane\'s git link was repaired in place', { id: row.id, repo_path: row.repoPath });
       return { status: 'repaired', lane: row, from: row.repoPath, to: candidate };

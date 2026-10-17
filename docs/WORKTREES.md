@@ -743,10 +743,14 @@ lane's custody stays refused, and Gru gets one action-required row
 to the same `repo_path` unless the repository's real place or its git
 directory moved.
 
-Each check reads each repository's identity once, and each base commit's
-root commits once per repository. It runs on the event loop, so it repairs
-at most 100 lanes; the rest are repaired at the next check (the first
-reconcile runs right after start).
+Each check reads each managed name's place and each repository's identity
+once, each base commit's root commits once per repository, and the ledger's
+handoff completions once (never once per lane). It runs on the event loop,
+so one slice of it repairs at most 10 lanes and starts no repair after
+250 ms but its first: start runs one slice before any turn, and each
+reconcile (the first right after start) runs slices, letting the service's
+timers and requests run between them, until no lane waits. A lane waiting
+for its slice is refused its turns until it is repaired.
 
 Paths are compared as the filesystem resolves them. A repository moved with
 a link left at its old place still reaches its lanes through the link, but
@@ -823,10 +827,13 @@ gru-service reset [--yes] [--delete-branches] [--delete-refs]
      install's own files (`identity/`, `credentials/`, `perkins/`,
      `onboarding-consent.json`, `wizard-draft.json`, the service unit's
      `logs/launchd.*.log` and `reset.lock`), keeping the directory. A
-     worktree of yours in it is kept with every folder that leads to it, and
-     with its repository when that is in the data directory too; only what
-     lies beside them is deleted. The `ledger/` folder goes last, after
-     every other entry.
+     worktree or checkout of yours in it is kept with every folder that
+     leads to it, and with its repository when that is in the data
+     directory too: the checkout around its `.git` folder (only that `.git`
+     when the checkout is the data directory itself), a bare repository, a
+     `--separate-git-dir` git directory beside it, or a submodule's
+     `.git/modules/<name>`; only what lies beside them is deleted. The
+     `ledger/` folder goes last, after every other entry.
 
 It prints what it removed. It never touches your own branches, worktrees or
 files. The data directory is compared as the filesystem resolves it (a link

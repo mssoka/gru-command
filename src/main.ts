@@ -1117,7 +1117,9 @@ async function main(): Promise<number> {
   // Moved repositories (#427 PR 2b): before any turn runs, a lane whose
   // repository moved (its folder, with workspace_root updated) is reconnected
   // to it, and one whose name now holds a different repository is proposed
-  // for discard. The hourly maintenance reconcile checks again.
+  // for discard. This first slice repairs at most MOVED_LANES_PER_CHECK
+  // lanes; the first maintenance reconcile, right after start, repairs the
+  // rest in slices, and the hourly one checks again.
   const repoMoves = new RepoMoveReconciler({
     worktrees: worktreeManager,
     ledger,
