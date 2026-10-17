@@ -130,6 +130,26 @@ describe('command bar (cockpit rework)', () => {
     expect(document.getElementById('conn-dot')).toBe(dot);
   });
 
+  it('marks the board lost from stale, reconnecting or offline until it reopens; boot never reads lost', () => {
+    const bar = new CommandBar();
+    const lost = () => document.getElementById('command-ticker')?.dataset.boardLost;
+    for (const state of ['connecting', 'authenticating', 'open'] as const) {
+      bar.setBoardState(state);
+      expect(lost(), state).not.toBe('true');
+    }
+    bar.setBoardState('stale');
+    expect(lost()).toBe('true');
+    // Reconnecting through connecting/authenticating is still the outage.
+    for (const state of ['reconnecting', 'authenticating'] as const) {
+      bar.setBoardState(state);
+      expect(lost(), state).toBe('true');
+    }
+    bar.setBoardState('open');
+    expect(lost()).toBe('false');
+    bar.setBoardState('offline');
+    expect(lost()).toBe('true');
+  });
+
   it('shows the top review round from each snapshot, live before pending', () => {
     const bar = new CommandBar();
     const dot = document.getElementById('conn-dot');

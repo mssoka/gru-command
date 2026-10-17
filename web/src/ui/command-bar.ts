@@ -19,6 +19,7 @@ import { tickerSegments } from '../lib/command-ticker.js';
 import { mustGet } from './dom.js';
 
 export class CommandBar {
+  private readonly ticker: HTMLElement;
   private readonly radar: HTMLElement;
   private readonly radarLabel: HTMLElement;
   private readonly round: HTMLElement;
@@ -29,6 +30,7 @@ export class CommandBar {
   private writtenRound: string | null = null;
 
   constructor() {
+    this.ticker = mustGet('command-ticker');
     this.radar = mustGet('command-radar');
     this.radarLabel = mustGet('command-radar-label');
     this.round = mustGet('command-round');
@@ -39,6 +41,11 @@ export class CommandBar {
   setBoardState(state: BoardConnectionState | null): void {
     if (this.boardState === state) return;
     this.boardState = state;
+    // Lost from stale, reconnecting or offline until the socket reopens
+    // (connecting and authenticating keep the last word): a phone shows
+    // RADAR only while it is lost, so a normal boot never flashes it.
+    if (state === 'open') this.ticker.dataset.boardLost = 'false';
+    else if (state === 'stale' || state === 'reconnecting' || state === 'offline') this.ticker.dataset.boardLost = 'true';
     this.render();
   }
 

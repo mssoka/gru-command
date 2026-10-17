@@ -916,11 +916,39 @@ test('on a phone the bar stays one sticky row of brand and buttons above the hea
   // The board socket drops (reconnects refused): RADAR returns on the phone
   // in its warning colour — nothing else there would say so. ROUND stays
   // aside.
+  const liveHeights = new Map<number, number>();
+  for (const width of [360, 390, 430]) {
+    await page.setViewportSize({ width, height: 740 });
+    await settleTransitions(page);
+    liveHeights.set(width, await page.evaluate(() => document.getElementById('command-bar')!.offsetHeight));
+  }
+  await page.setViewportSize({ width: 360, height: 740 });
+  await settleTransitions(page);
   await dropBoardSocket(page);
   await expect(page.locator('#command-radar')).toBeVisible();
   await expect(page.locator('#command-radar')).toHaveClass(/command-pill--(warn|alert)/u);
   await expect(page.locator('#command-round')).toBeHidden();
   await expect(page.locator('#command-health-summary')).toHaveText(/^last-known · /u);
+  // RADAR returns after the buttons, on a row of its own above the health
+  // pill: the buttons keep the brand's row.
+  for (const width of [360, 390, 430]) {
+    await page.setViewportSize({ width, height: 740 });
+    await settleTransitions(page);
+    const lost = await page.evaluate(() => {
+      const box = (id: string) => document.getElementById(id)!.getBoundingClientRect();
+      const brand = document.querySelector('.command-bar__brand')!.getBoundingClientRect();
+      const mid = (b: DOMRect): number => b.top + b.height / 2;
+      return {
+        buttonsOnRow1: ['sound-toggle', 'notification-bell', 'theme-toggle', 'settings-toggle'].every((id) => Math.abs(mid(box(id)) - mid(brand)) <= 2),
+        radarBetween: box('command-radar').top >= brand.bottom && box('command-radar').bottom <= box('command-health').top,
+        barHeight: document.getElementById('command-bar')!.offsetHeight,
+        radarRow: box('command-radar').height + parseFloat(getComputedStyle(document.getElementById('command-bar')!).rowGap),
+      };
+    });
+    expect([lost.buttonsOnRow1, lost.radarBetween], `${width}px`).toEqual([true, true]);
+    // The outage costs exactly RADAR's own row — the signal — and nothing else.
+    expect(lost.barHeight - liveHeights.get(width)!, `${width}px bar growth`).toBeLessThanOrEqual(lost.radarRow + 1);
+  }
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
 
@@ -968,21 +996,21 @@ test('the health pill dot and ink say the state: muted when nothing reads ok or 
   await expect.poll(read).toEqual({ summary: 'last-known · 3 need a look', dot: 'alert', mark: '"▲ "' });
 });
 
-test('a dropped board socket on a calm board reads last-known with a muted dot, even after the HTTP catch-up', async ({ page }) => {
+test('a dropped board socket on a calm board reads last-known with a muted dot, even after the HTTP catch-up lands', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   const send = await harness(page, makeSnapshot(familyA(0)));
-  await send(makeSnapshot(familyA(0)));
   await expect(page.locator('#command-health-summary')).toHaveText('All healthy');
-  // Reconnects are refused but the HTTP catch-up still answers: the board
-  // stays last-known until the socket itself reopens.
-  await page.context().routeWebSocket(/\/board\/ws/, (ws) => { void ws.close(); });
+  // Reconnects open a socket that never authenticates (the client waits in
+  // `authenticating`), while the HTTP catch-up answers with a visibly newer
+  // state: proof the catch-up rendered before the summary is read.
+  await page.context().routeWebSocket(/\/board\/ws/, () => { /* never answers */ });
+  send.stage(makeSnapshot(slotSpec({ ...familyA(0), wakes: 7, gruWakeAgeMs: 300_000 })));
   for (const socket of sockets) await socket.close();
   await expect(page.locator('#command-health')).toHaveAttribute('data-last-known', 'true');
-  // Two reconnect cycles (each fetches the snapshot over HTTP first).
-  for (const ms of [1_000, 2_000]) {
-    await page.clock.runFor(ms);
-    await expect(page.locator('#command-health-summary')).toHaveText('last-known · All healthy');
-  }
+  await page.clock.runFor(1_000); // the first reconnect: HTTP catch-up, then the hanging socket
+  await expect(page.locator('#board-wakes .board-wakes__count')).toHaveText('7');
+  await expect(page.locator('#command-health-summary')).toHaveText('last-known · All healthy');
+  await expect(page.locator('#command-radar-label')).toHaveText('RADAR SYNCING');
   const dot = await page.evaluate(() => {
     const probe = document.createElement('div');
     probe.style.background = 'var(--park)';
@@ -1019,7 +1047,7 @@ test('RADAR follows the board socket only: the chat socket dropping leaves its d
   await expect(page.locator('#conn-dot')).toHaveAttribute('title', 'socket: open');
 });
 
-test('the RADAR and ROUND pills keep one width through every word and round 9→10', async ({ page }) => {
+test('the RADAR and ROUND pills keep one width through every word, every round state and round 9→10', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await harness(page, makeSnapshot(familyA(1)));
   const widths = await page.evaluate(() => {
@@ -1031,8 +1059,8 @@ test('the RADAR and ROUND pills keep one width through every word and round 9→
     });
     const round = document.getElementById('command-round')!;
     const roundLabel = document.getElementById('command-round-label')!;
-    const roundWidths = [9, 10].map((seq) => {
-      roundLabel.innerHTML = `ROUND <span class="command-pill__num">${seq}</span> LIVE`;
+    const roundWidths = ['NO ROUND', 'ROUND <span class="command-pill__num">9</span> LIVE', 'ROUND <span class="command-pill__num">10</span> LIVE', 'ROUND <span class="command-pill__num">99</span> PENDING'].map((html) => {
+      roundLabel.innerHTML = html;
       return round.getBoundingClientRect().width;
     });
     return { radarWidths, roundWidths };
@@ -1050,14 +1078,16 @@ test('the RADAR and ROUND pills keep one width through every word and round 9→
     const label = document.getElementById('command-radar-label')!;
     label.textContent = 'RADAR SYNCING';
     const roundLabel = document.getElementById('command-round-label')!;
-    roundLabel.innerHTML = 'ROUND <span class="command-pill__num">10</span> LIVE';
-    return { radar: room(label), num: room(roundLabel.querySelector<HTMLElement>('.command-pill__num')!) };
+    roundLabel.innerHTML = 'ROUND <span class="command-pill__num">99</span> PENDING';
+    const widest = room(roundLabel);
+    return { radar: room(label), round: widest, num: room(roundLabel.querySelector<HTMLElement>('.command-pill__num')!) };
   });
   expect(slack.radar, 'RADAR SYNCING inside its slot').toBeGreaterThanOrEqual(0.5);
+  expect(slack.round, 'ROUND 99 PENDING inside its slot').toBeGreaterThanOrEqual(0.5);
   expect(slack.num, 'a two-digit round inside its slot').toBeGreaterThanOrEqual(0.5);
 });
 
-test('the command bar keeps the brand, the pills and the buttons on one row from tablet up, two rows on a small tablet, buttons at the edge before the first snapshot', async ({ page }) => {
+test('the command bar keeps the brand, the pills and the buttons on one row from 800px, two rows on a small tablet in every round state, buttons at the edge before the first snapshot', async ({ page }) => {
   // Before pairing the health pill is hidden: the buttons still sit at the
   // bar's right edge.
   await page.setViewportSize({ width: 1440, height: 900 });
@@ -1070,8 +1100,8 @@ test('the command bar keeps the brand, the pills and the buttons on one row from
     return bar.getBoundingClientRect().right - pad - document.getElementById('settings-toggle')!.getBoundingClientRect().right;
   });
   expect(Math.abs(edge)).toBeLessThanOrEqual(1);
-  await harness(page, makeSnapshot(familyA(9)));
-  for (const width of [768, 1000, 1440]) {
+  const send = await harness(page, makeSnapshot(familyA(9)));
+  for (const width of [800, 1000, 1440]) {
     await page.setViewportSize({ width, height: 900 });
     await settleTransitions(page);
     const rows = await page.evaluate(() => {
@@ -1081,21 +1111,69 @@ test('the command bar keeps the brand, the pills and the buttons on one row from
     });
     expect(rows, `${width}px`).toEqual([true, true, true]);
   }
-  // A small tablet: the buttons keep the brand's row and the pills join the
-  // health pill's — two rows, never a row of stray buttons.
-  await page.setViewportSize({ width: 700, height: 900 });
-  await settleTransitions(page);
-  const small = await page.evaluate(() => {
-    const mid = (el: Element): number => { const b = el.getBoundingClientRect(); return b.top + b.height / 2; };
-    const brand = mid(document.querySelector('.command-bar__brand')!);
-    const pill = document.getElementById('command-health')!.getBoundingClientRect();
-    const ticker = mid(document.getElementById('command-ticker')!);
+  // A small tablet (641–799px): ROUND steps aside (the REVIEWS card names
+  // the round), so the brand, RADAR and the buttons share row 1 in every
+  // round state, and the health pill keeps its own row.
+  const roundsAs = (status: 'pending' | null): BoardSnapshot => {
+    const value = makeSnapshot(familyA(9));
     return {
-      buttons: ['sound-toggle', 'notification-bell', 'theme-toggle', 'settings-toggle'].every((id) => Math.abs(mid(document.getElementById(id)!) - brand) <= 2),
-      tickerOnPillRow: ticker >= pill.top && ticker <= pill.bottom,
+      ...value,
+      repos: value.repos.map((repo) => ({
+        ...repo,
+        jobs: repo.jobs.map((job) => ({ ...job, rounds: status === null ? [] : job.rounds.map((round) => ({ ...round, status })) })),
+      })),
     };
-  });
-  expect(small).toEqual({ buttons: true, tickerOnPillRow: true });
+  };
+  for (const [state, snapshot] of [['live', makeSnapshot(familyA(9))], ['pending', roundsAs('pending')], ['none', roundsAs(null)]] as const) {
+    await send(snapshot);
+    await expect(page.locator('#command-round-label')).toHaveText(state === 'none' ? 'NO ROUND' : state === 'live' ? /LIVE$/u : /PENDING$/u);
+    for (const width of [641, 700, 744, 767, 799]) {
+      await page.setViewportSize({ width, height: 900 });
+      await settleTransitions(page);
+      const small = await page.evaluate(() => {
+        const mid = (el: Element): number => { const b = el.getBoundingClientRect(); return b.top + b.height / 2; };
+        const brand = mid(document.querySelector('.command-bar__brand')!);
+        const pill = document.getElementById('command-health')!.getBoundingClientRect();
+        const radar = document.getElementById('command-radar')!.getBoundingClientRect();
+        return {
+          buttons: ['sound-toggle', 'notification-bell', 'theme-toggle', 'settings-toggle'].every((id) => Math.abs(mid(document.getElementById(id)!) - brand) <= 2),
+          radarOnRow1: radar.width > 0 && Math.abs(radar.top + radar.height / 2 - brand) <= 2,
+          roundHidden: document.getElementById('command-round')!.getBoundingClientRect().width === 0,
+          pillBelow: pill.top >= radar.bottom,
+        };
+      });
+      expect(small, `${width}px, round ${state}`).toEqual({ buttons: true, radarOnRow1: true, roundHidden: true, pillBelow: true });
+    }
+  }
+});
+
+test('the crew rail sets each sub-minion indented under the minion that created it', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const base = makeSnapshot(familyA(1));
+  // Server order puts the sub-minion first; the rail moves it under its creator.
+  const crew = {
+    ...base,
+    agents: [
+      { ...agent('sub-worker', 'streaming'), parentage: 'child', parentAgentId: 'lead-minion' },
+      { ...agent('lead-minion', 'streaming'), parentage: 'top-level' },
+      { ...agent('other-minion', 'idle'), parentage: 'top-level' },
+    ],
+  } as unknown as BoardSnapshot;
+  const send = await harness(page, base);
+  await send(crew);
+  const rows = page.locator('#board-agents .board-agent');
+  await expect(rows).toHaveCount(3);
+  const layout = await page.evaluate(() => [...document.querySelectorAll<HTMLElement>('#board-agents .board-agent')].map((row) => ({
+    id: row.dataset.agentId,
+    left: row.getBoundingClientRect().left,
+    right: row.getBoundingClientRect().right,
+  })));
+  expect(layout.map((row) => row.id)).toEqual(['lead-minion', 'sub-worker', 'other-minion']);
+  const [lead, sub, other] = layout;
+  expect(sub!.left - lead!.left, 'one indent step').toBeCloseTo(16, 0);
+  expect(other!.left).toBeCloseTo(lead!.left, 0);
+  // The indented row still ends at the rail's edge (never overflows it).
+  expect(sub!.right).toBeCloseTo(lead!.right, 0);
 });
 
 /** Visual evidence: real captures of the synthetic fixture at all four

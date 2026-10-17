@@ -250,12 +250,13 @@ owns the numbers; CSS mirrors them):
   a dimmed board (scrim).
 - **< 900px — single column:** board-first (SPEC ruling 11) with the
   rail stacked below; the FAB opens the bottom-sheet chat. The command bar
-  wraps: the health pill sits on its own row. On a phone (≤ 640px) ROUND
-  steps aside, and RADAR too while the board socket is live (it returns in
-  its warning colour while the board syncs, goes stale or drops); the
-  compact buttons share the brand's row, so the bar stays sticky: the
-  brand row, then the health pill with its chips and any checks that need
-  a look.
+  wraps: the health pill sits on its own row. Below 800px ROUND steps
+  aside; on a phone (≤ 640px) RADAR does too unless the board socket is lost (stale,
+  reconnecting or offline, until it reopens) — then it returns after the
+  buttons, on a row of its own, in its warning or alert colour; the
+  compact buttons always share the brand's row, so the bar stays sticky:
+  the brand row, then the health pill with its chips and any checks that
+  need a look.
 
 The **global command bar** (cockpit rework, owner-approved 2026-10-17) is
 the only sticky chrome above the board column, at every width (inside the
@@ -270,9 +271,11 @@ badge. No Chat/Board lens toggle (v6.1): chat is always docked on desktop
 and the FAB owns mobile chat. The bar wraps by fit rather than at a fixed
 width (so page zoom and a narrow pane wrap it too, never overflow it), and
 its measured height feeds the sticky offsets whenever it changes. Below
-1100px the health pill takes its own row; from 641 to 744px, where the
-brand, the pills and the buttons cannot share a row, the pills join the
-health pill's row instead (two rows, never the buttons alone).
+1100px the health pill takes its own row; below 800px, where the brand,
+both pills and the buttons cannot share a row, ROUND steps aside (the
+REVIEWS card names the top round), so the brand, RADAR and the buttons
+keep row 1. RADAR and ROUND hold one width whatever they read, so a
+reconnect or a round going live never reflows the bar.
 
 The **health pill** (a group named “System health”) carries the system
 checks (deploy, Silas, verify, disk, cure) in one line, the ones that need
@@ -342,9 +345,10 @@ readiness rule. It reads as the attention card (cockpit rework): under
 its `FOR YOU · N pending` heading, `2 things need you`, then one line about
 Gru's own queue — the live NEEDS GRU count, a muted sub-line because it
 is Gru's work, never yours (`Gru is handling 2 live alerts`, or `nothing
-needs Gru either · the crew is on it`; FOR GRU's folded pill says the
-same; prefixed `last-known ·` while the
-board socket is stale or down, or the board is unavailable). Its empty state is the calm clear state (an empty owner
+needs Gru either · the crew is on it`; prefixed `last-known ·` while the
+board socket is lost or the board is unavailable — an empty FOR GRU folded
+while the socket is lost carries the same prefix, and an unavailable FOR
+GRU keeps its full card with its warning). Its empty state is the calm clear state (an empty owner
 list is healthy); its rows are keyboard-focusable and a snapshot
 re-render preserves focus (stable action ids) and never toasts or rings
 a chime.
@@ -427,7 +431,8 @@ Two section-truth rules keep the bands honest (2026-09-29):
   TRANSCRIPTS rail, whose rows name each worker's role in words —
   `megaminion` for the worker of a commissioned job, `vector raid` (🦑)
   for Vector's raid session, and a `🧬 sub-minion` marker on a #161 child
-  worker — in the row and its accessible name. At ≥1100px the chat pane joins it on the left with
+  worker — in the row and its accessible name; each sub-minion sits
+  indented right under the minion that created it, in every band. At ≥1100px the chat pane joins it on the left with
   drag splitters; below that the board is the full page and chat
   overlays. Round rows carry their per-lens live chips (the round's own
   recorded catalog; 9 for a current full round) behind the row's

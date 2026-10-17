@@ -81,7 +81,8 @@ export function isLiveMegaminion(job: JobView): boolean {
  * A child whose creator is elsewhere (another band, or gone) stays where
  * it was, flat, with its parent link. `depth` is the indent: 0 for a row
  * in its own place, 1 under its creator, 2 under a sub-minion. A parent
- * cycle still renders every row once (never vanishing).
+ * cycle still renders every row once (never vanishing): its first member
+ * in place, the rest of the cycle under it.
  */
 export function subMinionTree(agents: readonly AgentView[]): readonly { readonly agent: AgentView; readonly depth: number }[] {
   const ids = new Set(agents.map((agent) => agent.id));
@@ -103,7 +104,8 @@ export function subMinionTree(agents: readonly AgentView[]): readonly { readonly
     for (const child of children.get(agent.id) ?? []) place(child, depth + 1);
   };
   for (const agent of agents) if (parentOf(agent) === null) place(agent, 0);
-  // Rows only reachable through a cycle: flat, in their own order.
+  // Rows only reachable through a cycle: the first in place, the rest
+  // nested under it.
   for (const agent of agents) place(agent, 0);
   return out;
 }

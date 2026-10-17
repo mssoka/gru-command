@@ -99,7 +99,8 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   full-width. The sticky **command bar** — the only sticky chrome above the
   board column at every width (the shortcut strip and band heads pin under
   it) — carries the logo badge + `ONE GRU · ONE WINDOW`, the RADAR and
-  ROUND pills (stepping aside on a phone), the **health pill** (deploy, Silas, verify, disk and cure,
+  ROUND pills (below 800px ROUND steps aside, and on a phone RADAR too
+  unless the board socket is lost), the **health pill** (deploy, Silas, verify, disk and cure,
   the ones that need a look first, then the Jev decisions and Gru wake
   chips), the owner-chime speaker, the notification bell, theme and
   settings — no lens toggle: chat is always docked on desktop and the FAB
@@ -159,12 +160,14 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   rows is a card (cockpit rework); every EMPTY section folds into one
   Empty row of pills after the cards, each pill keeping its section's id
   (so the shortcut strip still lands on it) and saying why it is empty
-  (an empty FOR GRU reads “nothing needs Gru · the crew is on it”). A
-  last-known FOR GRU keeps its full card, so its warning stays visible.
+  (an empty FOR GRU reads “nothing needs Gru · the crew is on it”, with a
+  `last-known ·` prefix while the board socket is lost). An unavailable
+  FOR GRU keeps its full card, so its warning stays visible.
   FOR YOU belongs only to the owner band, which reads as the attention
   card: what needs you, then a muted line about Gru's own queue (`Gru is
   handling 2 live alerts`, or `nothing needs Gru either`; `last-known ·`
-  while the board socket is stale or down, or the board is unavailable). A section the server does not send folds as
+  from the moment the board socket is lost until it reopens, or while the
+  board is unavailable). A section the server does not send folds as
   a dashed `—` pill (unknown, never a zero). SETTLED is a rolling
   window (latest 10 + `+K older settled`, session-expanded; concluded
   jobs render their last round quiescent — no stale blocker pills). Click
@@ -180,7 +183,10 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   collisions; full title and id stay in the row's tooltip and accessible
   name), a `role · state` subline (with turn age, supervision marks and
   runtime marks), and a right-aligned state chip; error rows carry the alert
-  accent; disposed rows collapse behind a dashed `+N disposed` footer.
+  accent; disposed rows collapse behind a dashed `+N disposed` footer. A
+  #161 sub-minion sits indented right under the minion that created it
+  (when that minion is in the same band), with its `🧬 sub-minion`
+  marker and a link to the parent.
   Liveness is runtime ownership, not the raw stored state: each row
   carries a `runtime` classification — `current` (the live runtime owns
   it: registry handle, supervision adoption or a hydrated durable stop —

@@ -704,6 +704,19 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
     expect(document.querySelector('.board-owner__gru')?.textContent).toBe('last-known · nothing needs Gru either · the crew is on it');
   });
 
+  it('a re-pair starts the new board socket as not lost', () => {
+    const view = new BoardView(() => {});
+    const verify = { lockInUse: false, activeRuns: 0, queuedRuns: 0, workerBudget: 8, workersPerRun: 4 };
+    view.render(snapshot({ verify }));
+    view.setSocketState('offline');
+    expect(document.getElementById('command-health-summary')?.textContent).toBe('last-known · All healthy');
+    // The old client stopped; a new one binds and serves a fresh snapshot
+    // before its own socket opens: a fresh board, not the old outage.
+    view.bindClient({ ackNotification: vi.fn(), markNotificationShown: vi.fn() } as unknown as import('../lib/board-client.js').BoardClient);
+    view.render(snapshot({ verify }));
+    expect(document.getElementById('command-health-summary')?.textContent).toBe('All healthy');
+  });
+
   it('a lost board socket stays last-known through an HTTP catch-up, until the socket reopens', () => {
     const view = new BoardView(() => {});
     const verify = { lockInUse: false, activeRuns: 0, queuedRuns: 0, workerBudget: 8, workersPerRun: 4 };
@@ -1983,6 +1996,23 @@ describe('board agent rail — dense rows, tabs count, disposed collapse', () =>
     expect(row?.querySelector('.board-agent__state')?.textContent).toBe('streaming');
   });
 
+  it('nests sub-minions under their creator in the disposed and history bands too', () => {
+    const view = new BoardView(() => {});
+    const crew = (id: string, extra: Partial<AgentView>) => agent(id, { role: 'minion', state: 'disposed', ...extra });
+    view.render(snapshot({
+      agents: [
+        agent('live-one', { role: 'minion', state: 'streaming' }),
+        // Server order: the sub-minion before its creator.
+        crew('gone-child', { parentage: 'child', parentAgentId: 'gone-parent' }),
+        crew('gone-parent', { parentage: 'top-level' }),
+      ],
+    }));
+    document.querySelector<HTMLButtonElement>('.board-agent-toggle[data-section="disposed"]')?.click();
+    const disposed = [...document.querySelectorAll<HTMLElement>('#board-agents .board-agent--disposed')];
+    expect(disposed.map((row) => row.dataset.agentId)).toEqual(['gone-parent', 'gone-child']);
+    expect(disposed.map((row) => row.classList.contains('board-agent--sub'))).toEqual([false, true]);
+  });
+
   it('names a megaminion worker and Vector\'s raid session for what they are (cockpit rework)', () => {
     const view = new BoardView(() => {});
     view.render(
@@ -2056,7 +2086,8 @@ describe('board agent rail — dense rows, tabs count, disposed collapse', () =>
     );
     const rows = [...document.querySelectorAll<HTMLElement>('#board-agents .board-agent')];
     // The sub-minion sits indented right under the minion that created it
-    // (owner pick); a top-level or legacy row is never indented.
+    // (owner pick); a top-level or legacy row is never indented. The
+    // disposed band nests too (below).
     expect(rows.map((row) => row.dataset.agentId)).toEqual(['parent-minion', 'child-agent', 'legacy-minion']);
     expect(rows.map((row) => row.classList.contains('board-agent--sub'))).toEqual([false, true, false]);
     expect(rows[1]?.style.getPropertyValue('--sub-depth')).toBe('1');

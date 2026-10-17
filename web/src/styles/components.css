@@ -235,15 +235,20 @@ body {
   white-space: nowrap;
 }
 
-/* RADAR holds its widest word (`RADAR SYNCING`) and ROUND two digits of
-   its number, so a reconnect or round 10 never moves the health pill
-   beside them. Monospace: ch per character plus its letter-spacing, and
-   1px for glyph rounding (the fact slots' `2ch + 1px` precedent). */
-#command-radar-label {
+/* Each pill holds its widest reading (`RADAR SYNCING`, `ROUND 99
+   PENDING`), and the round number two digits, so a reconnect, a round
+   going live or round 10 never moves the health pill or the bar's rows.
+   Monospace: ch per character plus its letter-spacing, and 1px for glyph
+   rounding (the fact slots' `2ch + 1px` precedent). */
+#command-radar-label,
+#command-round-label {
   display: inline-block;
-  min-width: calc(13 * (1ch + 0.06em) + 1px);
   text-align: center;
 }
+
+#command-radar-label { min-width: calc(13 * (1ch + 0.06em) + 1px); }
+/* + 2px: the number's own slot carries its 1px inside the label. */
+#command-round-label { min-width: calc(16 * (1ch + 0.06em) + 2px); }
 
 .command-pill__num {
   display: inline-block;
@@ -402,25 +407,25 @@ body {
   .command-health { order: 2; margin-left: 0; flex: 1 1 100%; max-width: none; }
 }
 
-/* Small tablets (641–744px): brand, pills and buttons need 713px of row,
-   so the pills move after the buttons and wrap onto the health pill's row
-   — two rows, never the buttons on a row of their own. From 745px all
-   three share row 1 in their own order. */
-@media (min-width: 641px) and (max-width: 744px) {
-  .command-bar__ticker { order: 1; }
-  .command-health { flex: 1 1 260px; }
+/* Below 800px the brand, both pills and the buttons need more row than
+   there is (about 735px), so ROUND steps aside — the REVIEWS card names
+   the top round in its aside. Brand, RADAR and the buttons then share row
+   1 down to 641px with room to spare, and the health pill keeps its own
+   full row. */
+@media (max-width: 799px) {
+  .command-bar__ticker #command-round { display: none; }
 }
 
 /* Phone (the approved mock's rule): the bar stays one sticky row of brand
-   and buttons above the health pill. ROUND steps aside, and RADAR too
-   while the board socket is live — it returns, in its warning colour,
-   whenever the board is syncing, stale or down (nothing else on a phone
-   says so). The calm checks give way to the summary, the checks that need
-   a look keep a wrapping line of their own, and the Jev and wake chips
-   wrap inside the pill. */
+   and buttons above the health pill. RADAR steps aside too (ROUND already
+   has) unless the board socket is lost — then it returns after the buttons, on
+   a row of its own, in its warning or alert colour (nothing else on a
+   phone says so). The calm checks give way to the summary, the checks
+   that need a look keep a wrapping line of their own, and the Jev and
+   wake chips wrap inside the pill. */
 @media (max-width: 640px) {
-  .command-bar__ticker #command-round { display: none; }
-  .command-bar__ticker:not(:has(.command-pill--warn, .command-pill--alert)) { display: none; }
+  .command-bar__ticker { order: 1; }
+  .command-bar__ticker:not([data-board-lost='true']) { display: none; }
   .command-health { flex: 1 1 auto; flex-wrap: wrap; row-gap: 4px; border-radius: var(--radius-md); }
   .command-health__parts { order: 1; flex: 1 1 100%; white-space: normal; }
   .command-health:not([data-state='attention']) .command-health__parts,
@@ -4163,7 +4168,8 @@ a.repo-row__name:hover {
 /* Phone chrome (≤560px + ≤640px icon compaction)                     */
 /*                                                                     */
 /* On a phone the sticky bar is the brand and the four buttons on row  */
-/* 1 with the health pill under it: the decorative tagline drops, the  */
+/* 1 with the health pill under it (RADAR between them while the board */
+/* socket is lost): the decorative tagline drops, the                  */
 /* title shrinks and the icon controls compact (≤640px) so all four    */
 /* buttons share the brand's row down to 360px. flex-wrap is           */
 /* insurance: the bar grows rows instead of pushing sideways. It is    */
