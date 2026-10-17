@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type Server as HttpServer } from 'node:http';
 import { createServer as createNetServer, type AddressInfo, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -23,7 +23,6 @@ import {
   DISK_FOLLOW_UP_MS,
   DISK_FULL_KIND,
   DISK_RECLAIM_KIND,
-  DISK_RELEASE_REMOTE_TIMEOUT_MS,
   DISK_RECONCILE_INTERVAL_MS,
   DISK_VIEW_MAX_AGE_MS,
   diskFloorFor,
@@ -42,7 +41,7 @@ import type { JobWorkerTurns } from '../src/runtime/pacing.js';
 import type { AgentCapabilities, AgentHandle, AgentState } from '../src/runtime/types.js';
 import { PRESERVED_REF_PREFIX, WorktreeManager, type TreeProcess } from '../src/worktrees/manager.js';
 import { isValidSnapshot } from '../web/src/lib/board-protocol.js';
-import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { attachBareOrigin, makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 
 /**
  * The disk view, budget and floor (#427 PR 3), over real git lanes (real
@@ -55,8 +54,11 @@ import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
  *   first, until at most 90% of the budget, recording each step (a skip
  *   once per kind of reason), at most three releases a pass, one process
  *   listing a pass, a refused release not asked again until news, a remote
- *   that hangs refusing the release without stalling the event loop, and no
- *   review folder of a job a Perkins review owns deleted;
+ *   that hangs refusing the release without stalling the event loop, a slow
+ *   remote waited for off the event loop and never asked after the removal
+ *   (the branch kept), a slow removal off the event loop, a partial process
+ *   listing refusing the release, and no review folder of a job a Perkins
+ *   review owns deleted;
  * - in proposed mode one FOR YOU card lists the steps and nothing is done
  *   until Accept, which runs exactly the listed steps (a slim only the
  *   entries listed); Decline holds from the usage when the owner declined; a
@@ -137,7 +139,16 @@ interface Harness {
   reviewListings: number;
 }
 
-function harness(): Harness {
+interface HarnessOptions {
+  /** The manager's fetch budget (default its own, 30 s). */
+  readonly fetchTimeoutMs?: number;
+  /** The manager lists processes itself (`ps`), reading their working
+   * directories from this seam, instead of answering from
+   * `managerProcesses`. */
+  readonly listProcessCwds?: (timeoutMs: number) => Promise<Map<number, string> | null>;
+}
+
+function harness(opts: HarnessOptions = {}): Harness {
   const repo = makeFixtureRepo(REPO);
   cleanups.push(() => repo.cleanup());
   repo.commitFile('.gitignore', 'node_modules/\n');
@@ -158,7 +169,8 @@ function harness(): Harness {
     preserveRoot,
     setupTimeoutMs: 30_000,
     killGraceMs: 25,
-    enumerateProcesses: (path) => managerProcesses.get(path) ?? [],
+    ...(opts.fetchTimeoutMs !== undefined ? { fetchTimeoutMs: opts.fetchTimeoutMs } : {}),
+    ...(opts.listProcessCwds !== undefined ? { listProcessCwds: opts.listProcessCwds } : { enumerateProcesses: (path: string) => managerProcesses.get(path) ?? [] }),
     log: (level, msg, fields) => { logs.push({ level, msg, ...(fields !== undefined ? { fields } : {}) }); },
   });
   let openSlow = (): void => {};
@@ -328,6 +340,51 @@ function service(h: Harness, opts: ServiceOptions): Service {
 
 function git(cwd: string, args: readonly string[]): string {
   return execFileSync('git', [...IDENTITY, ...args], { cwd, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+}
+
+/** The git every shim runs, found before any shim is on PATH. */
+const REAL_GIT = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf-8' }).trim();
+/** What a slow origin takes to answer a call (the stubs below). */
+const SLOW_ORIGIN_MS = 8_000;
+/** What a slow `git worktree remove` takes (the stub below). */
+const SLOW_REMOVAL_MS = 3_000;
+
+/** Put a `git` first on PATH, until the test's end, that logs each call's
+ * arguments and runs `script` (shell, `$1`… the arguments) before the real
+ * git. Answers the calls logged so far. */
+function gitShim(script: string): () => readonly string[] {
+  const dir = tempDir('gru-disk-git-shim-');
+  const log = join(dir, 'calls.log');
+  writeFileSync(join(dir, 'git'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\n${script}\nexec '${REAL_GIT}' "$@"\n`, { mode: 0o755 });
+  const path = process.env['PATH'] ?? '';
+  process.env['PATH'] = `${dir}:${path}`;
+  cleanups.push(() => { process.env['PATH'] = path; });
+  return () => (existsSync(log) ? readFileSync(log, 'utf-8').split('\n').filter((line) => line !== '') : []);
+}
+
+/** A bare `origin` holding the fixture's main (no network). */
+function originOf(h: Harness): void {
+  attachBareOrigin(h.repo);
+  h.repo.git(['push', '--quiet', 'origin', 'main']);
+}
+
+/** Run `run` with a 20 ms timer ticking: how long it took, and the longest
+ * the timer waited between ticks (what the event loop was blocked for). */
+async function ticking(run: () => Promise<unknown>): Promise<{ readonly took: number; readonly longest: number }> {
+  const started = Date.now();
+  let last = started;
+  let longest = 0;
+  const ticker = setInterval(() => {
+    const now = Date.now();
+    longest = Math.max(longest, now - last);
+    last = now;
+  }, 20);
+  try {
+    await run();
+  } finally {
+    clearInterval(ticker);
+  }
+  return { took: Date.now() - started, longest: Math.max(longest, Date.now() - last) };
 }
 
 /** Run `run` with the ledger's clock (Date only) at `at`. */
@@ -788,8 +845,10 @@ describe('disk budget, automatic (#427 PR 3)', () => {
     expect(h.releases).toBe(2);
   });
 
-  it('a remote that does not answer never stalls GC: the budget\'s release asks origin off the event loop and refuses once the bound passes, while timers keep firing; the lane is untouched', async () => {
-    const h = harness();
+  it('a remote that does not answer never stalls GC: the budget\'s release asks origin off the event loop and refuses once the fetch bound passes, while timers keep firing; the lane is untouched', async () => {
+    // The manager's fetch budget (30 s by default) cut short for the test.
+    const bound = 2_000;
+    const h = harness({ fetchTimeoutMs: bound });
     const path = await laneOf(h, 'job-done', 'done');
     // origin accepts the connection and never answers (a blackholed network).
     const sockets = new Set<Socket>();
@@ -805,31 +864,138 @@ describe('disk budget, automatic (#427 PR 3)', () => {
     git(h.repo.path, ['remote', 'add', 'origin', `git://127.0.0.1:${String((remote.address() as AddressInfo).port)}/${REPO}.git`]);
     h.fixed.set(join(h.dataDir, 'ledger'), 40 * GIB);
     const { disk } = service(h, { budgetGb: 30, floorGb: 0 });
-    let last = Date.now();
-    let longest = 0;
-    const ticker = setInterval(() => {
-      const now = Date.now();
-      longest = Math.max(longest, now - last);
-      last = now;
-    }, 20);
-    cleanups.push(() => clearInterval(ticker));
 
-    const started = Date.now();
-    await disk.check('reconcile');
-    const took = Date.now() - started;
-    clearInterval(ticker);
+    const { took, longest } = await ticking(() => disk.check('reconcile'));
 
     const [release] = steps(h).filter((step) => step.step === 'release');
     expect(release).toMatchObject({ lane: 'job-done', outcome: 'skipped' });
-    expect(String(release!['reason'])).toMatch(new RegExp(`^the release refused: sweep refused: origin did not answer git ls-remote --symref origin HEAD within ${String(DISK_RELEASE_REMOTE_TIMEOUT_MS)} ms, so fresh required containment cannot be proven for `, 'u'));
+    expect(String(release!['reason'])).toMatch(new RegExp(`^the release refused: sweep refused: origin did not answer git ls-remote --symref origin HEAD within ${String(bound)} ms, so fresh required containment cannot be proven for `, 'u'));
     expect(sockets.size).toBeGreaterThan(0);
-    expect(took).toBeGreaterThanOrEqual(DISK_RELEASE_REMOTE_TIMEOUT_MS - 50);
+    expect(took).toBeGreaterThanOrEqual(bound - 50);
     // The event loop stayed free while origin hung: a 20 ms timer never
     // waited anywhere near the bound.
-    expect(longest).toBeLessThan(DISK_RELEASE_REMOTE_TIMEOUT_MS / 2);
+    expect(longest).toBeLessThan(bound / 2);
     expect(existsSync(join(path, 'node_modules'))).toBe(true);
     expect(h.ledger.getWorktree('job-done')?.status).toBe('active');
     expect(existsSync(join(h.preserveRoot, 'job-done'))).toBe(false);
+  });
+
+  it('origin slow to answer is not refused: an ls-remote that answers in 8 s lets the budget\'s release proceed within the normal 30 s fetch bound, off the event loop, and the head its proof fetched is the one recorded', async () => {
+    const h = harness();
+    originOf(h);
+    const path = await laneOf(h, 'job-done', 'done');
+    const calls = gitShim(`[ "$1" = ls-remote ] && sleep ${String(SLOW_ORIGIN_MS / 1000)}`);
+    h.fixed.set(join(h.dataDir, 'ledger'), 40 * GIB);
+    const { disk } = service(h, { budgetGb: 30, floorGb: 0 });
+
+    const { took, longest } = await ticking(() => disk.check('reconcile'));
+
+    expect(steps(h).filter((step) => step.step === 'release')).toMatchObject([{ lane: 'job-done', outcome: 'done', reason: null }]);
+    expect(existsSync(path)).toBe(false);
+    expect(h.ledger.getWorktree('job-done')?.status).toBe('swept');
+    expect(calls().filter((call) => call.startsWith('ls-remote '))).toHaveLength(1);
+    expect(took).toBeGreaterThanOrEqual(SLOW_ORIGIN_MS - 50);
+    expect(longest).toBeLessThan(SLOW_ORIGIN_MS / 2);
+    expect(payloadOf(events(h, 'worktree.swept')[0])).toMatchObject({ id: 'job-done', freshHead: h.repo.head() });
+  });
+
+  it('after its removal a budget release asks origin nothing: origin taking 8 s a call once the lane is gone costs it nothing, timers keep firing, and the lane\'s branch is retained (retained-budget on worktree.swept)', async () => {
+    const h = harness();
+    originOf(h);
+    const path = await laneOf(h, 'job-done', 'done');
+    // origin answers at once while the lane is there, and slowly once it is gone.
+    const calls = gitShim(`case "$1" in ls-remote|fetch) [ -d '${path}' ] || sleep ${String(SLOW_ORIGIN_MS / 1000)} ;; esac`);
+    h.fixed.set(join(h.dataDir, 'ledger'), 40 * GIB);
+    const { disk } = service(h, { budgetGb: 30, floorGb: 0 });
+
+    const { took, longest } = await ticking(() => disk.check('reconcile'));
+
+    expect(steps(h).filter((step) => step.step === 'release')).toMatchObject([{ lane: 'job-done', outcome: 'done', reason: null }]);
+    expect(existsSync(path)).toBe(false);
+    expect(h.ledger.getWorktree('job-done')?.status).toBe('swept');
+    // The proof asked origin before the removal; nothing asked it after.
+    const log = calls();
+    const removal = log.indexOf(`worktree remove --force ${path}`);
+    const remote = log.flatMap((call, index) => (/^(?:ls-remote|fetch) /u.test(call) ? [index] : []));
+    expect(removal).toBeGreaterThan(-1);
+    expect(remote.length).toBeGreaterThan(0);
+    expect(Math.max(...remote)).toBeLessThan(removal);
+    expect(took).toBeLessThan(SLOW_ORIGIN_MS);
+    expect(longest).toBeLessThan(SLOW_ORIGIN_MS / 2);
+    // Lossless: the branch stays for a later release to dispose of.
+    expect(git(h.repo.path, ['rev-parse', '--verify', '--quiet', 'refs/heads/gru/job-done'])).toBe(h.repo.head());
+    expect(payloadOf(events(h, 'worktree.swept')[0])).toMatchObject({ id: 'job-done', branch: 'retained-budget', freshHead: h.repo.head() });
+  });
+
+  it('a budget release of a lane whose folder is already gone reconciles it without asking origin anything, however slow origin is: the branch is retained (retained-budget on worktree.reconciled)', async () => {
+    const h = harness();
+    originOf(h);
+    const path = await laneOf(h, 'job-done', 'done');
+    // A kill between the removal and the registry write left the row active.
+    git(h.repo.path, ['worktree', 'remove', '--force', path]);
+    expect(existsSync(path)).toBe(false);
+    const calls = gitShim(`case "$1" in ls-remote|fetch) sleep ${String(SLOW_ORIGIN_MS / 1000)} ;; esac`);
+    h.fixed.set(join(h.dataDir, 'ledger'), 40 * GIB);
+    const { disk } = service(h, { budgetGb: 30, floorGb: 0 });
+
+    const { took, longest } = await ticking(() => disk.check('reconcile'));
+
+    expect(steps(h).filter((step) => step.step === 'release')).toMatchObject([{ lane: 'job-done', outcome: 'done', reason: null }]);
+    expect(h.ledger.getWorktree('job-done')?.status).toBe('swept');
+    expect(calls().filter((call) => /^(?:ls-remote|fetch) /u.test(call))).toEqual([]);
+    expect(took).toBeLessThan(SLOW_ORIGIN_MS);
+    expect(longest).toBeLessThan(SLOW_ORIGIN_MS / 2);
+    expect(git(h.repo.path, ['rev-parse', '--verify', '--quiet', 'refs/heads/gru/job-done'])).toBe(h.repo.head());
+    expect(payloadOf(events(h, 'worktree.reconciled')[0])).toMatchObject({ id: 'job-done', branch: 'retained-budget' });
+  });
+
+  it('a budget release removes its lane off the event loop: a removal that takes 3 s leaves timers firing throughout', async () => {
+    const h = harness();
+    const path = await laneOf(h, 'job-done', 'done');
+    const calls = gitShim(`[ "$1" = worktree ] && [ "$2" = remove ] && sleep ${String(SLOW_REMOVAL_MS / 1000)}`);
+    h.fixed.set(join(h.dataDir, 'ledger'), 40 * GIB);
+    const { disk } = service(h, { budgetGb: 30, floorGb: 0 });
+
+    const { took, longest } = await ticking(() => disk.check('reconcile'));
+
+    expect(steps(h).filter((step) => step.step === 'release')).toMatchObject([{ lane: 'job-done', outcome: 'done', reason: null }]);
+    expect(existsSync(path)).toBe(false);
+    expect(h.ledger.getWorktree('job-done')?.status).toBe('swept');
+    expect(calls()).toContain(`worktree remove --force ${path}`);
+    expect(took).toBeGreaterThanOrEqual(SLOW_REMOVAL_MS - 50);
+    expect(longest).toBeLessThan(SLOW_REMOVAL_MS / 2);
+  });
+
+  it('a budget release never removes on a partial process listing: working directories that cannot be listed (lsof timed out), or a platform with no such listing, refuse it — no process can be proven absent — and the lane is untouched; a full listing lets it proceed', async () => {
+    let cwds: (timeoutMs: number) => Promise<Map<number, string> | null> = async (timeoutMs) => {
+      throw new Error(`lsof timed out after ${String(timeoutMs)} ms`);
+    };
+    const h = harness({ listProcessCwds: (timeoutMs) => cwds(timeoutMs) });
+    const path = await laneOf(h, 'job-done', 'done');
+    writeFileSync(join(path, 'notes.txt'), 'minion notes\n');
+    h.fixed.set(join(h.dataDir, 'ledger'), 40 * GIB);
+    const { disk } = service(h, { budgetGb: 30, floorGb: 0 });
+
+    await disk.check('reconcile');
+
+    const [release] = steps(h).filter((step) => step.step === 'release');
+    expect(release).toMatchObject({ lane: 'job-done', outcome: 'skipped' });
+    expect(String(release!['reason'])).toMatch(/^the release refused: sweep refused: cannot prove no process works in .+ — the processes' working directories could not be listed \(lsof timed out after 30000 ms\), and a listing by command line alone is partial/u);
+    expect(h.ledger.getWorktree('job-done')?.status).toBe('active');
+    expect(existsSync(join(path, 'node_modules'))).toBe(true);
+    expect(existsSync(join(path, 'notes.txt'))).toBe(true);
+    expect(existsSync(join(h.preserveRoot, 'job-done'))).toBe(false);
+    expect(events(h, 'worktree.paused')).toEqual([]);
+
+    const budgetRelease = (): ReturnType<WorktreeManager['release']> =>
+      h.manager.release({ worktreeId: 'job-done', requireReleaseProofs: true, onLiveProcess: 'refuse', diskBudget: true });
+    cwds = async () => null;
+    await expect(budgetRelease()).rejects.toThrow(/^sweep refused: cannot prove no process works in .+ has no listing of process working directories GC can read/u);
+    expect(existsSync(join(path, 'notes.txt'))).toBe(true);
+
+    cwds = async () => new Map();
+    expect(await budgetRelease()).toMatchObject({ status: 'swept' });
+    expect(existsSync(path)).toBe(false);
   });
 
   it('never expires the review folders of a job a Perkins review owns: a fallback gate running for a merged job keeps its folder, unlisted by the budget and skipped by an accepted card, until the review ends', async () => {

@@ -43,10 +43,13 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  *   order, until its usage is at most {@link BUDGET_LOW_WATER} of the
  *   budget and the disks are at or above the floor: it releases the lanes
  *   of jobs that ended at least {@link RELEASE_MIN_TERMINAL_MS} ago and
- *   have settled (the existing release, which snapshots their work, and
- *   refuses rather than pause on a live process or wait on a remote that
- *   does not answer within {@link DISK_RELEASE_REMOTE_TIMEOUT_MS}; at most
- *   {@link MAX_RELEASES_PER_PASS} a pass), deletes the review folders of
+ *   have settled (the existing release, as `diskBudget`: it snapshots
+ *   their work, asks origin only before the removal and off the event loop,
+ *   within the normal fetch bound, removes off the event loop, keeps the
+ *   lane's branch for a later release, and refuses rather than pause on a
+ *   live process, wait past the bound or trust a process listing that could
+ *   not read working directories; at most {@link MAX_RELEASES_PER_PASS} a
+ *   pass), deletes the review folders of
  *   finished jobs no Perkins review owns (no round pending or live, no
  *   fallback gate or setup running, no superseded round not proven stopped;
  *   keeping what 2b's expiry keeps), then slims idle lanes, oldest idle
@@ -102,10 +105,6 @@ export const BUDGET_LOW_WATER = 0.9;
 export const RELEASE_MIN_TERMINAL_MS = 10 * 60_000;
 /** Lane releases one pass runs at most: each makes synchronous git calls. */
 export const MAX_RELEASES_PER_PASS = 3;
-/** A release's calls to origin are bounded by this: its proof asks origin
- * off the event loop and refuses when origin does not answer in time, so a
- * remote that hangs never stalls GC. */
-export const DISK_RELEASE_REMOTE_TIMEOUT_MS = 5_000;
 /** A lane whose release refused is asked again once its job has news, or this long after. */
 export const RELEASE_RETRY_MS = 60 * 60_000;
 /** The owner's Accept/Decline on freeing space (`reclaim_mode = "proposed"`). */
@@ -1501,13 +1500,15 @@ export class DiskService {
         if (this.stopped) return skip('the service is stopping');
         ctx.releases += 1;
         // Unattended, as the autopilot's release: fresh containment proven
-        // first (off the event loop: origin not answering within the bound
-        // refuses it), the lane's work snapshotted before its removal, and a
-        // process that appeared since the listing refuses it (no pause, no
-        // card, nothing killed).
+        // first, off the event loop (origin not answering within the fetch
+        // bound refuses it), the lane's work snapshotted before its removal,
+        // which runs off the event loop, nothing asked of origin after it
+        // (the branch is kept), and a process that appeared since the
+        // listing, or a listing that could not read working directories,
+        // refuses it (no pause, no card, nothing killed).
         let result: Awaited<ReturnType<WorktreeManager['release']>>;
         try {
-          result = await this.opts.worktrees.release({ worktreeId: lane.id, requireReleaseProofs: true, onLiveProcess: 'refuse', remoteTimeoutMs: DISK_RELEASE_REMOTE_TIMEOUT_MS });
+          result = await this.opts.worktrees.release({ worktreeId: lane.id, requireReleaseProofs: true, onLiveProcess: 'refuse', diskBudget: true });
         } catch (error) {
           this.rememberRefusal(lane);
           return skip(`the release refused: ${oneLine(error)}`);

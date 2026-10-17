@@ -501,8 +501,12 @@ export class DispatchService {
       // the lane waits, FIFO, with the honest reason on the job, while GC
       // frees space; it is created once the free space is back at the floor.
       // The wait comes before the admission is reserved, so the owner may
-      // bin or park the job meanwhile; that ends the wait.
-      floorAdmission = await this.waitAtDiskFloor(job.id, input.title);
+      // bin or park the job meanwhile; that ends the wait. With no floor
+      // there is no wait, not even a turn of the event loop: the job reaches
+      // the worker gate as promptly as before (#429: a commission answers
+      // with the recorded job while that gate holds it).
+      const floor = this.opts.diskFloor;
+      if (floor !== undefined) floorAdmission = await this.waitAtDiskFloor(floor, job.id, input.title);
       assertAdmissible();
 
       // No registered agent exists yet while worktree/pacing/spawn awaits.
@@ -837,10 +841,8 @@ export class DispatchService {
    * note on the job (updated as GC's answer changes) and the admission
    * noted. The service's stop ends the wait, and so does the job leaving
    * the states a lane may still be made in (binned, parked, blocked,
-   * finished). Null with no floor. */
-  private async waitAtDiskFloor(jobId: string, label: string): Promise<FloorAdmission | null> {
-    const floor = this.opts.diskFloor;
-    if (floor === undefined) return null;
+   * finished). */
+  private async waitAtDiskFloor(floor: Pick<DiskFloorGate, 'admitLane'>, jobId: string, label: string): Promise<FloorAdmission> {
     const jobEnded = new AbortController();
     const unsubscribe = this.opts.bus?.subscribe((event) => {
       if (event.kind !== 'job.status' || event.jobId !== jobId) return;
