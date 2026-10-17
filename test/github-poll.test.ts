@@ -19,6 +19,8 @@ import {
   GhApiError,
   GhCliApi,
   GhRateLimitedError,
+  ghHttpStatus,
+  ghRateLimited,
   GitHubSignalPoll,
   branchStatePayload,
   ciFailureTier,
@@ -36,6 +38,7 @@ import {
   type GhCheckRun,
   type GhCommandResult,
   type GhCommandRunner,
+  type GhIssueComment,
   type GhPull,
   type GitHubPollNotifications,
   type GitHubSignalContext,
@@ -481,6 +484,72 @@ describe('gh CLI adapter', () => {
     expect(asked[0]).toContain('state=open');
   });
 
+  it('commentOnPull POSTs the body as one raw field; listIssueComments pages to a short page and never reads a truncated history as complete (#427)', async () => {
+    const calls: string[][] = [];
+    const page = (count: number, from: number): unknown[] =>
+      Array.from({ length: count }, (_, index) => ({ id: from + index, body: `comment ${String(from + index)}`, html_url: `https://github.com/acme/app/pull/7#issuecomment-${String(from + index)}`, created_at: '2026-10-17T12:00:00Z', user: { login: 'gru-bot' } }));
+    const body = '@not-a-file <!-- gru:onboarding-proof job=onboard-app head=abc -->\nline two';
+    const runner: GhCommandRunner = async (args) => {
+      calls.push([...args]);
+      if (args.includes('POST')) {
+        return { status: 0, stdout: JSON.stringify({ id: 99, body, html_url: 'https://github.com/acme/app/pull/7#issuecomment-99', user: { login: 'gru-bot' } }), stderr: '' };
+      }
+      const pageNumber = Number(/[?&]page=(\d+)/u.exec(args.at(-1) ?? '')?.[1]);
+      return { status: 0, stdout: JSON.stringify(pageNumber === 1 ? page(100, 1) : page(3, 101)), stderr: '' };
+    };
+    const api = new GhCliApi(runner);
+    expect(await api.commentOnPull({ repo: REPO, number: 7, body })).toEqual({ id: 99, body, url: 'https://github.com/acme/app/pull/7#issuecomment-99', createdAt: null });
+    // `-f` is a raw string: a leading @ is never read as a file.
+    expect(calls[0]).toEqual(['api', '--hostname', 'github.com', '--method', 'POST', 'repos/acme/app/issues/7/comments', '-f', `body=${body}`]);
+    const comments = await api.listIssueComments({ repo: REPO, number: 7 });
+    expect(comments).toHaveLength(103);
+    expect(comments[102]).toEqual({ id: 103, body: 'comment 103', url: 'https://github.com/acme/app/pull/7#issuecomment-103', createdAt: '2026-10-17T12:00:00Z' });
+    expect(calls.slice(1).map((call) => call.at(-1))).toEqual([
+      'repos/acme/app/issues/7/comments?per_page=100&page=1',
+      'repos/acme/app/issues/7/comments?per_page=100&page=2',
+    ]);
+    const endless = new GhCliApi(async () => ({ status: 0, stdout: JSON.stringify(page(100, 1)), stderr: '' }));
+    await expect(endless.listIssueComments({ repo: REPO, number: 7 })).rejects.toThrow(/more than 1000 comments; the rest were not read/);
+    const refused = new GhCliApi(async () => ({ status: 1, stdout: '', stderr: 'HTTP 403: Resource not accessible by integration' }));
+    await expect(refused.commentOnPull({ repo: REPO, number: 7, body })).rejects.toBeInstanceOf(GhApiError);
+  });
+
+  it('ghHttpStatus reads the status gh printed for a refused call, and is null when gh named none or the error is not gh\'s (#427)', async () => {
+    const refusing = (stderr: string): GhCliApi => new GhCliApi(async () => ({ status: 1, stdout: '', stderr }));
+    const refusal = async (api: GhCliApi): Promise<unknown> => api.commentOnPull({ repo: REPO, number: 7, body: 'x' }).then(() => null, (error: unknown) => error);
+    const forbidden = await refusal(refusing('gh: Resource not accessible by integration (HTTP 403)'));
+    expect(forbidden).toBeInstanceOf(GhApiError);
+    expect(ghHttpStatus(forbidden)).toBe(403);
+    expect(ghHttpStatus(await refusal(refusing('gh: Validation Failed (HTTP 422)\n{"message":"Validation Failed"}')))).toBe(422);
+    expect(ghHttpStatus(await refusal(refusing('gh: API rate limit exceeded (HTTP 429)')))).toBe(429);
+    // No status printed, no cause kept, or not gh's error: null.
+    expect(ghHttpStatus(await refusal(refusing('error connecting to api.github.com')))).toBeNull();
+    expect(ghHttpStatus(await refusal(new GhCliApi(async () => ({ status: 0, stdout: 'not json', stderr: '' }))))).toBeNull();
+    expect(ghHttpStatus(new GhApiError('comment on acme/app#7 (HTTP 403)'))).toBeNull();
+    expect(ghHttpStatus(new Error('gh: Resource not accessible by integration (HTTP 403)'))).toBeNull();
+    expect(ghHttpStatus('(HTTP 403)')).toBeNull();
+  });
+
+  it('ghRateLimited reads a primary or secondary rate limit as one, even when GitHub answered HTTP 403, so a caller never takes it as a refusal for good (#427)', async () => {
+    const refusal = async (stderr: string): Promise<unknown> =>
+      new GhCliApi(async () => ({ status: 1, stdout: '', stderr })).commentOnPull({ repo: REPO, number: 7, body: 'x' }).then(() => null, (error: unknown) => error);
+    const secondary = await refusal('gh: You have exceeded a secondary rate limit. Please wait a few minutes before you try again. (HTTP 403)');
+    expect(secondary).toBeInstanceOf(GhRateLimitedError);
+    expect(ghHttpStatus(secondary)).toBe(403);
+    expect(ghRateLimited(secondary)).toBe(true);
+    expect(ghRateLimited(new GhApiError('comment on acme/app#7: gh exited 1', 'gh: API rate limit exceeded for user ID 1 (HTTP 403)'))).toBe(true);
+    expect(ghRateLimited(await refusal('gh: Resource not accessible by integration (HTTP 403)'))).toBe(false);
+    expect(ghRateLimited(new Error('API rate limit exceeded'))).toBe(false);
+    // GitHub's other throttling: the abuse detection mechanism, and content created too fast.
+    const abuse = await refusal('gh: You have triggered an abuse detection mechanism. Please wait a few minutes before you try again. (HTTP 403)');
+    expect(ghHttpStatus(abuse)).toBe(403);
+    expect(ghRateLimited(abuse)).toBe(true);
+    const tooQuickly = await refusal('gh: Validation Failed: was submitted too quickly (HTTP 422)');
+    expect(ghHttpStatus(tooQuickly)).toBe(422);
+    expect(ghRateLimited(tooQuickly)).toBe(true);
+    expect(ghRateLimited(await refusal('gh: Validation Failed: body is too long (HTTP 422)'))).toBe(false);
+  });
+
   it('fails loud on unavailability, rate limits, and malformed responses', async () => {
     const unavailable = new GhCliApi(async () => ({ status: -1, stdout: '', stderr: '', error: 'spawn gh ENOENT' }));
     await expect(unavailable.listPulls({ repo: REPO, limit: 1 })).rejects.toThrow(/gh is unavailable/);
@@ -507,7 +576,7 @@ describe('gh CLI adapter', () => {
 // ------------------------------------------------------------------
 
 interface FakeCall {
-  readonly kind: 'listPulls' | 'listPullsForHead' | 'getPull' | 'listCheckRuns';
+  readonly kind: 'listPulls' | 'listPullsForHead' | 'getPull' | 'listCheckRuns' | 'commentOnPull' | 'listIssueComments';
   readonly repo: string;
   readonly arg: number | string | null;
 }
@@ -553,6 +622,16 @@ class FakeGhApi implements GhApiPort {
     const repo = repoFullName(input.repo);
     this.calls.push({ kind: 'listCheckRuns', repo, arg: input.sha });
     return this.checks.get(`${repo}@${input.sha}`) ?? [];
+  }
+
+  async commentOnPull(input: { repo: RepoRef; number: number; body: string }): Promise<GhIssueComment> {
+    this.calls.push({ kind: 'commentOnPull', repo: repoFullName(input.repo), arg: input.number });
+    throw new Error('the signal poll never comments');
+  }
+
+  async listIssueComments(input: { repo: RepoRef; number: number }): Promise<readonly GhIssueComment[]> {
+    this.calls.push({ kind: 'listIssueComments', repo: repoFullName(input.repo), arg: input.number });
+    return [];
   }
 
   count(kind: FakeCall['kind']): number {

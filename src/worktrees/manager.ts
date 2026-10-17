@@ -1,5 +1,5 @@
 import { readWorktreeMetadata, repositoryCommonDirectory, capturePortLaneHandoff, captureCwdHandoff, beginLaneHandoff, completeLaneHandoff, rememberManagedLane, registerHandoffManager, assertPendingLaneHandoff, captureCleanupHandoff, assertLaneResourcesAbsent, WorktreeHandoffUnresolvedError } from './handoff.js';
-import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { execFile, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
   copyFileSync,
@@ -14,6 +14,7 @@ import {
   symlinkSync,
   type Stats,
 } from 'node:fs';
+import { readdir as readdirAsync, readlink as readlinkAsync } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import type { LogLevel } from '../logger.js';
 import type { LedgerApi, WorktreeBaseSource, WorktreeRecord } from '../ledger/api.js';
@@ -160,7 +161,12 @@ function processCwds(): Map<number, string> | null {
  * its cwd is the tree (Perkins r1 B3: argv-only enumeration removed
  * trees under live agents). */
 export function psEnumerator(treePath: string): readonly TreeProcess[] {
-  const out = execFileSyncGuard('ps', ['-axo', 'pid=,command=']);
+  return treeProcesses(treePath, execFileSyncGuard('ps', ['-axo', 'pid=,command=']), processCwds());
+}
+
+/** The processes a `ps -axo pid=,command=` listing and the per-process
+ * cwds tie to a tree (by argv path boundary, or by cwd). */
+function treeProcesses(treePath: string, out: string, cwds: Map<number, string> | null): readonly TreeProcess[] {
   // Compare against BOTH the registered path and its realpath: the OS
   // reports resolved paths (/var → /private/var) while argv keeps the
   // spelling the spawner used.
@@ -170,7 +176,6 @@ export function psEnumerator(treePath: string): readonly TreeProcess[] {
   } catch {
     /* the sweep's own guards handle a missing tree */
   }
-  const cwds = processCwds();
   const processes: TreeProcess[] = [];
   for (const line of out.split('\n')) {
     const trimmed = line.trim();
@@ -197,6 +202,73 @@ export function psEnumerator(treePath: string): readonly TreeProcess[] {
 
 function execFileSyncGuard(bin: string, args: readonly string[]): string {
   return execFileSync(bin, args, { encoding: 'utf-8', maxBuffer: 16 * 1024 * 1024 });
+}
+
+/** One listing command, off the event loop and bounded; rejects, naming
+ * the command, when it cannot run, fails or runs past its bound. */
+function execFileBounded(bin: string, args: readonly string[], timeoutMs: number): Promise<string> {
+  return new Promise((resolveOut, reject) => {
+    execFile(bin, args, { encoding: 'utf-8', maxBuffer: 16 * 1024 * 1024, timeout: timeoutMs }, (error, stdout) => {
+      if (error === null) resolveOut(stdout);
+      else reject(new Error(error.killed ? `${bin} timed out after ${String(timeoutMs)} ms` : `${bin} failed: ${error.message.split('\n')[0] ?? ''}`));
+    });
+  });
+}
+
+/** {@link processCwds} off the event loop: Linux `/proc`, macOS `lsof`
+ * (bounded); null on any other platform. Rejects when the listing fails
+ * (`/proc` cannot be read, `lsof` failed or timed out), so its caller is
+ * told ({@link psEnumeratorAsync}'s `onCwdError`) rather than lose the cwd
+ * evidence silently. */
+async function processCwdsAsync(timeoutMs: number): Promise<Map<number, string> | null> {
+  if (process.platform === 'linux') {
+    const cwds = new Map<number, string>();
+    for (const entry of await readdirAsync('/proc')) {
+      if (!/^\d+$/.test(entry)) continue;
+      try {
+        cwds.set(Number(entry), await readlinkAsync(`/proc/${entry}/cwd`));
+      } catch {
+        // Not ours / gone — unresolvable pids are simply not cwd-evidence.
+      }
+    }
+    return cwds;
+  }
+  if (process.platform !== 'darwin') return null;
+  const out = await execFileBounded('lsof', ['-w', '-a', '-d', 'cwd', '-Fn'], timeoutMs);
+  const cwds = new Map<number, string>();
+  let pid: number | null = null;
+  for (const line of out.split('\n')) {
+    if (line.startsWith('p') && /^p\d+$/.test(line)) {
+      pid = Number(line.slice(1));
+    } else if (line.startsWith('n') && pid !== null) {
+      cwds.set(pid, line.slice(1));
+      pid = null;
+    }
+  }
+  return cwds;
+}
+
+/** {@link psEnumerator} off the event loop, each listing bounded by
+ * `timeoutMs` (#427 onboarding proof: a slow `lsof` on a loaded host must
+ * not stall the service). Rejects when `ps` fails or times out, whatever
+ * the working directories did. When `ps` answered and only the working
+ * directories cannot be listed (`/proc` unreadable, `lsof` failed or timed
+ * out), `onCwdError` is told and the argv matches still count, as the
+ * synchronous enumerator's null cwds do: never silently. That enumerator,
+ * which the sweep uses, is unchanged. `listCwds`: its tests' seam. */
+export async function psEnumeratorAsync(treePath: string, opts: {
+  readonly timeoutMs?: number;
+  readonly onCwdError: (error: unknown) => void;
+  readonly listCwds?: (timeoutMs: number) => Promise<Map<number, string> | null>;
+}): Promise<readonly TreeProcess[]> {
+  const timeoutMs = opts.timeoutMs ?? 30_000;
+  const [listed, cwds] = await Promise.allSettled([
+    execFileBounded('ps', ['-axo', 'pid=,command='], timeoutMs),
+    (opts.listCwds ?? processCwdsAsync)(timeoutMs),
+  ]);
+  if (listed.status === 'rejected') throw listed.reason instanceof Error ? listed.reason : new Error(String(listed.reason));
+  if (cwds.status === 'rejected') opts.onCwdError(cwds.reason);
+  return treeProcesses(treePath, listed.value, cwds.status === 'fulfilled' ? cwds.value : null);
 }
 
 export interface SweepPreservation {

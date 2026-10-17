@@ -194,7 +194,28 @@ without a named rule is not yours to invent:
   while any lane is ACTIVE on the same target — a rebase/force-push or an
   ordinary conflict-integration push; the round
   races the push and dies obsolete — or while the job's contract revision
-  is pending delivery (the candidate is outdated). Wait for the lane delivery (and its
+  is pending delivery (the candidate is outdated), or while an onboarding
+  heist's delivered head has no passing onboarding proof (GC runs the
+  proof itself, comments on the PR, and sends a failure to the minion; the
+  digest withholds the review offer, never the PR registration, until it
+  passes, and no `force` waives it). An onboarding round also reviews only
+  a commit whose own proof passed: a named target past the proven delivery
+  is refused at the arm (with no target the round reviews the PR head), the
+  bmad-review fallback refuses a lane HEAD past it or a lane with
+  uncommitted changes (what the lane's bootstrap placed, its `[[link]]`
+  and `[[copy]]` paths, is not uncommitted while it is still what it
+  placed; an edited copy is), a commit pushed after it
+  waits for the minion to deliver it, and a delivery that names no full
+  commit id waits for the next one. A fallback gate that stops for this
+  mid-loop aborts with `code: "onboarding-proof-required"`: the minion
+  commits, pushes and delivers its fix, GC proves the new head, and the
+  digest offers the review again once that proof passes (a self-review
+  request the minion made after it delivered the fix is replayed on that
+  pass; nothing replays the aborted gate). One refused or aborted with
+  `code: "onboarding-source-unreadable"` names a `[[link]]` target or
+  `[[copy]]` source the owner's repository checkout cannot give: neither
+  the minion nor another arm fixes it, so do not re-arm until the owner
+  has. Wait for the lane delivery (and its
   push) to settle and for any unresolved re-brief request to finalize or
   be recovered (a delivery alone does not clear that fence), then arm. If
   you cannot tell whether the lane is still

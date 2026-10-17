@@ -12,6 +12,7 @@ import type {
   JobRecord,
   JobStatus,
   LedgerApi,
+  OnboardingProofDebt,
   PendingRebriefRecord,
   ProviderWaitRecord,
   RoundRecord,
@@ -308,6 +309,9 @@ export interface DigestLedger {
   workRevisionState(jobId: string): WorkRevisionState;
   /** A corrective delivery's unpaid verification (option A), or null. */
   correctiveVerificationDebt(jobId: string): { readonly revision: number; readonly head: string | null } | null;
+  /** An onboarding heist's unproven delivered head (#427 PR 1b), or null:
+   * GC proves it itself, so the digest owes no row for it, only no review. */
+  onboardingProofDebt(jobId: string): OnboardingProofDebt | null;
   /** Accepted amendments (version order): the revision-continuation row
    * names the material versions its one continuation carries. */
   listJobAmendments(jobId: string): readonly JobAmendmentRecord[];
@@ -1636,8 +1640,11 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     // An unresolved re-brief fences every row: the open re-brief turn is the
     // lane's target-owned work, so an OLDER delivery is never offered for
     // first review, re-review or clean-abort rearm.
+    // #427 PR 1b: an onboarding heist's head is offered for review only once
+    // its onboarding proof passed. The PR itself is never withheld (row 1
+    // above): the proof runs only once the job has a PR.
     if (currentPhaseDelivered && !liveDirectiveOwns && job.prUrl !== null && reviewPending && !rebriefPending &&
-        revision === null && verificationDebt === null) {
+        revision === null && verificationDebt === null && input.ledger.onboardingProofDebt(job.id) === null) {
       if (cleanAbort && newestRound !== null) {
         digest.prWithoutReview.push({ jobId: job.id, repo: job.repo, prUrl: job.prUrl,
           priorRounds: rounds.length, cleanAbort: { roundId: newestRound.id, ruleId: 'clean-abort-service-restart' } });
@@ -2233,7 +2240,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       return job !== null && pendingWorkRevision(input.ledger, job) !== null;
     }),
     prWithoutReview: digest.prWithoutReview.filter((row) => {
-      if (!reviewOfferFencesHold(row.jobId)) return false;
+      if (!reviewOfferFencesHold(row.jobId) || input.ledger.onboardingProofDebt(row.jobId) !== null) return false;
       const job = input.ledger.getJob(row.jobId);
       // A review admitted for a new state flips the job (working/delivered →
       // in-review), which the phase-identity recheck above already catches;

@@ -211,6 +211,7 @@ max_raids_per_day = 2             # per repository, rolling 24 hours (started, w
 mode = "proposed"                 # "proposed": one FOR YOU card per repository
                                   # "autonomous": dispatch the heist and post an FYI row
                                   # "off": nothing is checked, proposed or dispatched
+                                  # (an open onboarding heist is still proven before review)
 
 [review]
 max_concurrent_children = 2     # lead-selected lens-children ceiling in the pool (<= 32); a round still caps at 16 runs / 2 attempts per lens

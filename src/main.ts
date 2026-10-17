@@ -34,7 +34,7 @@ import { spawnSilasWithActionTool } from './dispatch/silas-model-action.js';
 import { composeDeterministicPass, createSilasAutopilotHook } from './dispatch/silas-autopilot-pass.js';
 import { createSilasAutopilotOps } from './dispatch/silas-autopilot-ops.js';
 import { createProductionDeterministicPass } from './dispatch/durable-reconcile.js';
-import { DirectiveProgressService } from './dispatch/directive-progress.js';
+import { DirectiveProgressService, executeAcceptedDirective } from './dispatch/directive-progress.js';
 import { ProviderRecoverySensor, bootProviderRecovery, establishProviderWait, handBackThenStartSupervision } from './provider-recovery/sensor.js';
 import { ModelRuntimeProbe } from './provider-recovery/probe.js';
 import {
@@ -57,7 +57,7 @@ import { IntakeService } from './intake/service.js';
 import { IntakeApprovalService } from './intake/approval.js';
 import { IntakeSlicingService } from './intake/slicing.js';
 import { ChildWorkerService } from './dispatch/child-workers.js';
-import { createVerificationServer } from './verify/server.js';
+import { createVerificationServer, type VerificationBudget } from './verify/server.js';
 import type { VerificationQueueView } from './verify/scheduler.js';
 import { createService } from './server.js';
 import { adoptRollMarker, reconcileStaleRoll } from './roll/adopt.js';
@@ -86,7 +86,8 @@ import { createReviewOutcomeCapture } from './lessons/review-capture.js';
 import { createLessonsServer } from './lessons/server.js';
 import { startVectorHalves, VectorService } from './vector/service.js';
 import { createVectorServer } from './vector/server.js';
-import { OnboardingService, startOnboarding, type OnboardingDispatchInput } from './onboarding/service.js';
+import { OnboardingService, startOnboarding, type OnboardingDispatchInput, type OnboardingProofDirective } from './onboarding/service.js';
+import { onboardingProbesDir } from './onboarding/proof.js';
 import { createOnboardingServer } from './onboarding/server.js';
 import { heistWorkWaiting as raidHeistWorkWaiting, VectorRaidRunner } from './vector/runner.js';
 import { DecisionRuntime } from './decisions/runtime.js';
@@ -622,8 +623,11 @@ async function main(): Promise<number> {
   const vectorServer = createVectorServer({ token: config.auth.token, service: vector, log: (level, msg, fields) => logger.log(level, msg, fields) });
   // Onboarding heists (#427): code finds managed repositories whose origin
   // has no manifest and proposes (or dispatches) a manifest PR for each. The
-  // dispatcher is built further down; a heist reaches it late-bound.
+  // dispatcher is built further down; a heist reaches it late-bound. So do
+  // a proof's verification budget and its failure directive (#427 PR 1b).
   let dispatchOnboardingHeist: ((input: OnboardingDispatchInput) => Promise<unknown>) | null = null;
+  let onboardingBudget: (() => VerificationBudget) | null = null;
+  let directOnboardingProof: ((input: OnboardingProofDirective) => Promise<void>) | null = null;
   const onboarding = new OnboardingService({
     onboarding: config.onboarding,
     workspaceRoot: config.workspaceRoot,
@@ -635,6 +639,20 @@ async function main(): Promise<number> {
     dispatch: async (input) => {
       if (dispatchOnboardingHeist === null) throw new Error('the dispatch service is not up yet');
       return await dispatchOnboardingHeist(input);
+    },
+    proof: {
+      probesDir: onboardingProbesDir(config.dataDir),
+      setupTimeoutMs: config.worktrees.setupTimeoutMs,
+      runTimeoutMs: config.verify.runTimeoutMs,
+      budget: () => {
+        if (onboardingBudget === null) throw new Error('the verification server is not up yet');
+        return onboardingBudget();
+      },
+      github: new GhCliApi(),
+      direct: async (input) => {
+        if (directOnboardingProof === null) throw new Error('the directive path is not up yet');
+        await directOnboardingProof(input);
+      },
     },
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
@@ -1423,6 +1441,20 @@ async function main(): Promise<number> {
     });
   const propertyCampaigns = createPropertyCampaignService({ ledger, registry, worktrees: worktreeManager, wave, notifications, observeBlindTurn, artifactsRoot: join(config.dataDir, 'property-campaigns'), pendingProducerBlockers: (jobId) => supervisorLive.pendingProducerBlockers(jobId), workerGate: pacing.gate, retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId), parentTools: parentToolsFor, ...(config.lessons.enabled ? { lessons: lessonReferences } : {}) });
   state.propertyCampaigns = propertyCampaigns;
+  // A failed onboarding proof goes to the minion the way an approved
+  // property repair does (#427 PR 1b): one durable directive request, run
+  // through the native-admission path. A review owning the lane, or a live
+  // writer request, refuses it before any row; the next reconcile retries.
+  directOnboardingProof = async (input) => {
+    wave.assertWriterAdmissible(input.jobId);
+    ledger.beginDirectiveIntent({ jobId: input.jobId, directive: input.directive, holder: 'onboarding-proof', requestId: input.requestId });
+    await executeAcceptedDirective({
+      ledger, registry, worktrees: worktreeManager, notifications, signal: input.signal, observeBlindTurn,
+      pendingProducerBlockers: (jobId) => supervisorLive.pendingProducerBlockers(jobId), workerGate: pacing.gate,
+      retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId), parentTools: parentToolsFor,
+      ...(config.lessons.enabled ? { lessons: lessonReferences } : {}),
+    }, input.requestId);
+  };
   const dispatchServer = createDispatchServer({
     config,
     intake,
@@ -1491,6 +1523,7 @@ async function main(): Promise<number> {
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   verificationView = () => verifyServer.view();
+  onboardingBudget = () => verifyServer.budget();
   state.verify = verifyServer;
   // The ONE attach flow's HTTP surface (SPEC ruling 19, this lane): the
   // same seam chat and dispatch both ride — workspace browse (on-disk

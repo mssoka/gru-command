@@ -226,6 +226,53 @@ latest revision → verify → fresh review. The service enforces it centrally.
   When no unresolved same-head repair remains, the full Silas digest still offers
   `verificationsOwed`. Dismissal never rewrites FAILED receipts or grants review:
   the unchanged corrective-verification gate remains until eligible proof exists.
+- **Onboarding heists are reviewed only on a proven head (#427 PR 1b).** A job an
+  `onboarding.dispatched` event names owes a passing `onboarding.proof` on its newest
+  delivered head: GC clones that head, applies its manifest, runs `verify.full` under the
+  verification budget, and measures it ([ONBOARDING.md](./ONBOARDING.md#proof-before-review)).
+  The head is read as the corrective-verification gate reads the newest delivery: one that is
+  not a proven current candidate, or whose sha is not a full commit id, identifies no head, and
+  review waits for the minion's next delivery. The first proof of a head stands, and a record
+  the one proof reader cannot read is never a pass. Until it passes, the lane is busy on every
+  route the corrective verification fences (arm, freeze, queued handoff, fallback admission
+  and iteration, the Silas review offer); the blocker carries `onboarding_proof_required_head`
+  (null when there is no head) and `onboarding_proof_reason` (`no-delivery`, `no-commit`,
+  `unproven`, `failed`, or `uncommitted`). The exact commit under review must pass too: an arm
+  that names a target is refused at the arm with a `409` before any round exists (an arm with
+  no target reviews the live PR head, never a commit left unpushed in the lane); the freeze
+  checks the exact sha it reviews last (a live PR head pushed after the delivery); and the
+  bmad-review fallback, which reviews the lane's working tree, needs a passing proof of the
+  lane HEAD and a lane with no uncommitted changes the proof never ran (tracked edits or
+  untracked files git does not ignore, leaving out the `[[link]]` and `[[copy]]` paths the
+  lane's bootstrap placed while each is still what it placed: a link whose real path is the
+  manifest target's, a copied file whose bytes equal its source's in the repository checkout
+  now; a copy whose source changed since the lane was made is refused, naming it), at
+  admission and at each iteration. A link target or copy source the repository checkout
+  cannot give (gone, unreadable) refuses at admission and aborts a running gate with `code:
+  "onboarding-source-unreadable"`, a reason naming it, and a hint that the owner must fix the
+  checkout. A gate that stops at an iteration for this (its fix left an unproven lane HEAD, a
+  new unproven delivery, or uncommitted changes) aborts with `code:
+  "onboarding-proof-required"` and a hint: the minion commits, pushes and delivers the fix, GC
+  proves the new head, and once that proof passes the Silas digest offers the review again; a
+  self-review request made after the fix was delivered is queued and replayed on that pass
+  (nothing replays the aborted gate itself). Like a pending
+  correction, `force` never waives it, and the `409 branch_busy` hint says so (or says the
+  minion must deliver again, has not delivered yet, or must commit or discard its lane's
+  changes). Every `branch-idle.refused` audit records `forced` (force was
+  applied: blockers waived) and `force_requested` (the request asked for force), so an
+  onboarding refusal under force records `forced: false, force_requested: true`. A worker's own
+  review request is queued and replayed on the `onboarding.proof` event, also after a restart.
+  The proof is never verification evidence (no `verification.*` event exists for it,
+  `POST /api/verify` refuses the reserved `onboarding-proof` scope with `400 reserved_scope`,
+  and a manifest that declares that scope is refused by name). When the proof's head is the
+  reviewed sha, the frozen packet carries an `ONBOARDING PROOF` block between the recorded
+  verification and the CI evidence; every minion-written field in it is one line that cannot
+  carry the block's end marker. The block, or its omission notice, never takes the room the CI
+  section needs: the CI block's when that block fits on its own, else the CI omission notice's.
+  A block that does not fit freezes as an omission notice; a notice that does not fit beside
+  the CI block still freezes beside the CI omission notice, which the CI section then renders.
+  Only when the notice fits beside neither is the freeze refused, naming the section that did
+  not fit.
 - **A historical-only delivery owes a current inspection (owner decision 2026-10-16, #361).**
   When a job's newest delivery is history (a completion recorded without proving a current
   candidate) while a corrective verification or a contract revision is still owed, no

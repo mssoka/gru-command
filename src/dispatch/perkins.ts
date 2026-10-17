@@ -3,11 +3,11 @@ import type { AgentHandle, PromptTurnVerdict } from '../runtime/types.js';
 import { promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { basename, join, resolve } from 'node:path';
+import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, statSync, writeFileSync, type Stats } from 'node:fs';
+import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { LogLevel } from '../logger.js';
 import { DEFAULT_REVIEW_CHILDREN } from '../config.js';
-import type { JobStatus, LedgerApi, RoundRecord, RoundVerdict } from '../ledger/api.js';
+import type { JobStatus, LedgerApi, OnboardingProofDebt, RoundRecord, RoundVerdict } from '../ledger/api.js';
 import { requireSafeRecordId } from '../ledger/api.js';
 import { isJobTerminal, isRoundTerminal } from '../ledger/states.js';
 import type { WorktreeLane, WorktreePort } from './worktree-port.js';
@@ -31,6 +31,7 @@ import type { EventBus } from '../events/bus.js';
 import { validReviewOwnerGeneration, type ResidentReviewRound, type ReviewOwnerMarker } from '../runtime/registry.js';
 import { settleRetries, type PacingGate, type PacingLease, type RateLimitBackoffPolicy, type RetrySettlement } from '../runtime/pacing.js';
 import { isExactOriginBranchSpelling } from '../worktrees/manager.js';
+import { loadWorktreeManifest } from '../worktrees/manifest.js';
 import { deliveredTargetSha } from './silas-driver.js';
 import type { CanonicalReviewVerdict, VerifiedFinding } from './perkins-review/types.js';
 import { PerkinsWholeReview, verifiedSpecialistCheckpointResults, type PerkinsWholeResult, type RoundBudgetRefusal } from './perkins-review/whole.js';
@@ -82,6 +83,8 @@ import {
 import { admissionPreflight, ADMISSION_REMOTE_PROBE_TIMEOUT_MS, ReviewAdmissionError, type AdmissionMissingInput } from './perkins-review/admission.js';
 import { evidenceRequestFingerprint, type ReviewEvidenceRequest } from '../review-inputs/evidence.js';
 import { parseGitHubPrUrl } from './github-poll.js';
+import { appendOnboardingProof, renderOnboardingProofEvidence } from '../onboarding/proof.js';
+import { REDACTION_PLACEHOLDER, redactReviewForPublication } from '../redaction.js';
 import {
   boundedDiff,
   fallbackReviewPolicy,
@@ -123,31 +126,9 @@ export function lensAgentLabel(lens: string, attempt: number): string {
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
-const REDACTION_PLACEHOLDER = '[REDACTED]';
-
-function redaction(_value: string): string {
-  // A fixed placeholder: any digest of the redacted bytes would publish an
-  // offline brute-force oracle for low-entropy secrets. The scope-disclosure
-  // decoder uses the same literal to distinguish evidence erased by a
-  // redaction span from an authentic pre-disclosure absence.
-  return REDACTION_PLACEHOLDER;
-}
-
-/** Keep verification evidence private when it resembles a credential. The
- * durable local report remains unchanged; only the PR-facing copy is masked. */
-export function redactReviewForPublication(body: string): string {
-  const patterns = [
-    /-----BEGIN [^-\r\n]+ PRIVATE KEY-----[\s\S]*?-----END [^-\r\n]+ PRIVATE KEY-----/gu,
-    /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/gu,
-    /\bgithub_pat_[A-Za-z0-9_]{20,}\b/gu,
-    /\bglpat-[A-Za-z0-9_-]{20,}\b/gu,
-    /\bsk-(?:proj-)?[A-Za-z0-9_-]{16,}\b/gu,
-    /\bAKIA[0-9A-Z]{16}\b/gu,
-    /(?<![A-Za-z0-9])(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|refresh[_-]?token|secret[_-]?key|api[_-]?secret|password|secret|token)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s`'"]+)/giu,
-    /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/gu,
-  ];
-  return patterns.reduce((text, pattern) => text.replace(pattern, redaction), body);
-}
+// Moved to src/redaction.ts (#427 PR 1b: the onboarding proof redacts with it
+// too); re-exported here for its existing importers.
+export { redactReviewForPublication };
 
 /** Publication kinds the appendix can describe truthfully. The wording
  * follows the PR/MR URL FORM (pull/N vs merge_requests/N), which is the
@@ -1927,9 +1908,56 @@ export interface WaveOutcome {
  * admission). The gate stops fail-closed before the next diff intake or
  * reviewer spawn; it is never a partial round. */
 class FallbackSafetyRefusal extends Error {
-  constructor(message: string) {
+  /** A named reason the gate's abort records, with its way forward (the
+   * code's own hint unless `hint` names a narrower one). */
+  constructor(
+    message: string,
+    readonly code: typeof FALLBACK_ONBOARDING_PROOF_REQUIRED | typeof FALLBACK_ONBOARDING_SOURCE_UNREADABLE | null = null,
+    readonly hint: string | null = null,
+  ) {
     super(message);
     this.name = 'FallbackSafetyRefusal';
+  }
+}
+
+/** #427 PR 1b: the bmad-review fallback gate of an onboarding heist stopped
+ * because a head, a lane HEAD or uncommitted changes no onboarding proof
+ * ran stand where it would review next (its fix produced them, say). */
+export const FALLBACK_ONBOARDING_PROOF_REQUIRED = 'onboarding-proof-required';
+
+/** The way forward that abort records: the gate cannot wait for a proof,
+ * so the fix goes through delivery, the proof, then review again. Nothing
+ * replays the aborted gate itself; a self-review request made once the fix
+ * is delivered, while its proof is owed, is queued and replayed on that
+ * proof's pass. */
+export const FALLBACK_ONBOARDING_PROOF_HINT =
+  'the minion must commit the fix, push it to the PR branch and deliver; GC proves the new head itself, and once that proof ' +
+  'passes the Silas digest offers the review again (a self-review request the minion makes after it delivered the fix is queued and replayed on that pass)';
+
+/** #427 PR 1b: an onboarding heist's fallback admission or running gate
+ * stopped because a `[[link]]` target or `[[copy]]` source its lane's
+ * bootstrap placed from cannot be read in the owner's repository checkout:
+ * the lane check cannot tell what the bootstrap placed, and only the owner
+ * can fix it. */
+export const FALLBACK_ONBOARDING_SOURCE_UNREADABLE = 'onboarding-source-unreadable';
+
+/** The refusal of a bootstrap source that cannot be read: its message
+ * names the file, and its hint says the owner's checkout must be fixed. */
+function sourceUnreadableRefusal(jobId: string, error: BootstrapSourceUnreadableError): FallbackSafetyRefusal {
+  return new FallbackSafetyRefusal(
+    `onboarding job "${jobId}" cannot be reviewed until the owner fixes the repository checkout: ${error.message}`,
+    FALLBACK_ONBOARDING_SOURCE_UNREADABLE,
+    `the owner must fix the repository checkout: the ${error.what} ${JSON.stringify(error.source)} there must exist and be readable ` +
+      '(the minion cannot fix it); once it is, the review can be requested again',
+  );
+}
+
+/** A reviewed job's ledger row is gone at the freeze. Job rows are never
+ * deleted, so nothing the freeze would record about it can be stated. */
+export class ReviewJobMissingError extends Error {
+  constructor(readonly jobId: string) {
+    super(`job "${jobId}" has no ledger row at the freeze — a reviewed job's row is never removed, so the round cannot freeze`);
+    this.name = 'ReviewJobMissingError';
   }
 }
 
@@ -1958,6 +1986,195 @@ function captureFallbackInput(lanePath: string, baseRef: string): Pick<FallbackR
     throw new Error('complete working diff exceeds the fallback transport size; no truncated review can pass. Restore native Perkins review or reduce the candidate scope');
   }
   return { headRef, diff, diffSha256: createHash('sha256').update(diff).digest('hex') };
+}
+
+/** #427 PR 1b: a `[[copy]]` source or a `[[link]]` target in the
+ * repository checkout that cannot be read, so the lane check cannot tell
+ * whether what the lane's bootstrap placed from it is still that. */
+export class BootstrapSourceUnreadableError extends Error {
+  constructor(readonly what: '[[copy]] source' | '[[link]] target', readonly source: string, cause: unknown) {
+    super(`the ${what} ${JSON.stringify(source)} in the repository checkout cannot be read: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = 'BootstrapSourceUnreadableError';
+  }
+}
+
+const missing = (error: unknown): boolean => ['ENOENT', 'ENOTDIR'].includes(String((error as NodeJS.ErrnoException).code));
+
+/** Whether two files of `size` bytes hold the same bytes, read 64 KiB at a
+ * time (never a whole file at once). `source` is the checkout's: a read of
+ * it that fails is a {@link BootstrapSourceUnreadableError}. */
+function sameBytes(source: string, placed: string, size: number, from: string): boolean {
+  let sourceFd: number;
+  try {
+    sourceFd = openSync(source, 'r');
+  } catch (error) {
+    throw new BootstrapSourceUnreadableError('[[copy]] source', from, error);
+  }
+  try {
+    const placedFd = openSync(placed, 'r');
+    try {
+      const want = Buffer.alloc(64 * 1024);
+      const got = Buffer.alloc(64 * 1024);
+      for (let at = 0; at < size;) {
+        let read: number;
+        try {
+          read = readSync(sourceFd, want, 0, want.length, at);
+        } catch (error) {
+          throw new BootstrapSourceUnreadableError('[[copy]] source', from, error);
+        }
+        if (read === 0) return false;
+        if (readSync(placedFd, got, 0, read, at) !== read || !want.subarray(0, read).equals(got.subarray(0, read))) return false;
+        at += read;
+      }
+      return true;
+    } finally {
+      closeSync(placedFd);
+    }
+  } finally {
+    closeSync(sourceFd);
+  }
+}
+
+/** Whether a lane path still holds what a copy of the file `source`
+ * placed: the same bytes. The bootstrap copies files only (it refuses a
+ * folder source), so a source that is no file placed nothing here. A source
+ * that cannot be read throws, naming `from`. */
+function copyIntact(source: string, placed: string, from: string): boolean {
+  let want: Stats;
+  try {
+    want = statSync(source);
+  } catch (error) {
+    throw new BootstrapSourceUnreadableError('[[copy]] source', from, error);
+  }
+  let got: Stats;
+  try {
+    got = lstatSync(placed);
+  } catch (error) {
+    if (missing(error)) return false;
+    throw error;
+  }
+  return want.isFile() && got.isFile() && got.size === want.size && sameBytes(source, placed, want.size, from);
+}
+
+/** One path the lane's bootstrap placed. */
+interface PlacedPath {
+  /** Lane-relative, `/`-separated. */
+  readonly path: string;
+  /** Whether it is still exactly what the bootstrap placed (judged once per check). */
+  readonly intact: () => boolean;
+  /** What a refusal says when it is not. */
+  readonly changed: string;
+}
+
+/** #427 PR 1b: what the lane's bootstrap placed (its manifest's
+ * `[[link]]` `at` and `[[copy]]` `to`, lane-relative), each with whether it
+ * is still exactly that, compared as git and the filesystem see it: a link
+ * whose real path is its target's (`realpath` of both, however either is
+ * spelled), a copied file whose bytes equal its source's in the repository
+ * checkout now. A source or target there that cannot be read throws, named
+ * ({@link BootstrapSourceUnreadableError}).
+ * The proof's own bootstrap places them the same way from the same
+ * checkout. A manifest that cannot be read places nothing here, so every
+ * path counts. A limit: a copy is compared with its source as it is now,
+ * so a source that changed since the lane was made makes an untouched copy
+ * read as changed; the refusal says so. */
+function bootstrapPlaced(lanePath: string, sourceRoot: string): readonly PlacedPath[] {
+  let manifest;
+  try {
+    manifest = loadWorktreeManifest(lanePath);
+  } catch {
+    return [];
+  }
+  if (manifest === null) return [];
+  const laneRelative = (path: string): string => relative(lanePath, resolve(lanePath, path)).split(sep).join('/');
+  const once = (judge: () => boolean): (() => boolean) => {
+    let judged: boolean | null = null;
+    return () => (judged ??= judge());
+  };
+  return [
+    ...manifest.links.map((link) => ({
+      path: laneRelative(link.at),
+      intact: once(() => {
+        let target: string;
+        try {
+          target = realpathSync(isAbsolute(link.to) ? resolve(link.to) : resolve(sourceRoot, link.to));
+        } catch (error) {
+          throw new BootstrapSourceUnreadableError('[[link]] target', link.to, error);
+        }
+        try {
+          const at = resolve(lanePath, link.at);
+          return lstatSync(at).isSymbolicLink() && realpathSync(at) === target;
+        } catch (error) {
+          if (missing(error)) return false; // gone, or pointing at nothing now
+          throw error;
+        }
+      }),
+      changed: `the [[link]] ${JSON.stringify(link.at)} no longer points at ${JSON.stringify(link.to)} in the repository checkout`,
+    })),
+    ...manifest.copies.map((copy) => ({
+      path: laneRelative(copy.to),
+      intact: once(() => copyIntact(resolve(sourceRoot, copy.from), resolve(lanePath, copy.to), copy.from)),
+      changed: `the [[copy]] ${JSON.stringify(copy.to)} no longer matches its source ${JSON.stringify(copy.from)} in the repository checkout: ` +
+        'the minion edited it, or the source changed since the lane was made (copying the source again makes it match)',
+    })),
+  ].filter((entry) => entry.path !== '' && !entry.path.startsWith('..'));
+}
+
+/** #427 PR 1b: what makes a lane hold uncommitted changes the fallback
+ * would review (tracked edits, untracked files git does not ignore: what
+ * `git status --porcelain` lists), leaving out what the lane's bootstrap
+ * placed while it is still what it placed (a `node_modules` link a
+ * `node_modules/` ignore rule misses, since a link is no folder; a
+ * `[[copy]]` the minion has not edited). Null when the lane is clean; else
+ * `detail` names a placed path that is no longer what was placed (null for
+ * any other change). One `git status` of the lane, untracked folders
+ * collapsed to one entry each; only a collapsed folder that holds a placed
+ * path is listed file by file, by one more `git status` of just those
+ * folders. File contents are read only for a placed copy. Fails loud when
+ * git cannot say (a timeout or an output past its buffer included). */
+function laneUncommittedChange(lanePath: string, sourceRoot: string): { readonly detail: string | null } | null {
+  const placed = bootstrapPlaced(lanePath, sourceRoot);
+  const status = (untracked: 'normal' | 'all', pathspec: readonly string[]): readonly string[] => {
+    const run = spawnSync('git', ['--literal-pathspecs', '-C', lanePath, '-c', 'core.fsmonitor=false', 'status', '--porcelain', '-z', `--untracked-files=${untracked}`, ...(pathspec.length === 0 ? [] : ['--', ...pathspec])],
+      { encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 64 * 1024 * 1024, timeout: 30_000 });
+    if (run.error !== undefined || run.status !== 0) {
+      throw new Error(`cannot read the lane's uncommitted changes (git status): ${run.error?.message ?? run.stderr.trim().slice(0, 200)}`);
+    }
+    const fields = run.stdout.split('\0');
+    const listed: string[] = [];
+    for (let index = 0; index < fields.length; index += 1) {
+      const field = fields[index]!;
+      if (field === '') continue;
+      // A rename or copy names its source in the next field.
+      if (/^(?:[RC].|.[RC]) /u.test(field)) listed.push(field.slice(3), fields[(index += 1)] ?? '');
+      else listed.push(field.slice(3));
+    }
+    return listed;
+  };
+  /** A listed path's change: none when it is a placed path still intact. */
+  const changed = (path: string): { readonly detail: string | null } | null => {
+    const entry = placed.find((candidate) => path === candidate.path || path.startsWith(`${candidate.path}/`));
+    if (entry === undefined) return { detail: null };
+    return entry.intact() ? null : { detail: entry.changed };
+  };
+  // A collapsed untracked folder ends in `/`; one that holds a placed path is listed file by file.
+  const expand: string[] = [];
+  for (const path of status('normal', [])) {
+    const folder = path.endsWith('/') ? path : null;
+    if (folder !== null && placed.some((entry) => entry.path.startsWith(folder))) {
+      expand.push(folder);
+      continue;
+    }
+    const change = changed(path.replace(/\/$/u, ''));
+    if (change !== null) return change;
+  }
+  if (expand.length > 0) {
+    for (const path of status('all', expand)) {
+      const change = changed(path.replace(/\/$/u, ''));
+      if (change !== null) return change;
+    }
+  }
+  return null;
 }
 
 /** A late delivered STATUS after an already-recorded delivery is harmless.
@@ -2199,6 +2416,10 @@ export class WaveRunner {
         // Option A (owner, 2026-10-09): a corrective delivery waits for a
         // passing verification on its head; that pass re-offers the request.
         void this.startHandoff(event.jobId, pending);
+      } else if (event.kind === 'onboarding.proof' && event.seq > pending.seq) {
+        // #427 PR 1b: an onboarding heist's request waits for its head's
+        // onboarding proof; the proof re-offers it (a failure re-queues it).
+        void this.startHandoff(event.jobId, pending);
       }
     }) ?? (() => {});
   }
@@ -2279,10 +2500,13 @@ export class WaveRunner {
         // A terminal marker for a DIFFERENT request does not satisfy this one.
       }
       const delivered = this.opts.ledger.latestCandidateDelivery(job.id);
-      // A pass that paid a corrective delivery's verification (option A)
-      // re-offers the request just like a delivery does.
+      // A pass that paid a corrective delivery's verification (option A),
+      // or an onboarding proof (#427 PR 1b), re-offers the request just like
+      // a delivery does.
       const verifiedAfter = this.opts.ledger.latestJobEvent(job.id, 'verification.completed');
-      if ((delivered !== null && delivered.seq > queued.seq) || (verifiedAfter !== null && verifiedAfter.seq > queued.seq)) {
+      const provenAfter = this.opts.ledger.latestJobEvent(job.id, 'onboarding.proof');
+      if ((delivered !== null && delivered.seq > queued.seq) || (verifiedAfter !== null && verifiedAfter.seq > queued.seq) ||
+        (provenAfter !== null && provenAfter.seq > queued.seq)) {
         void this.startHandoff(job.id, pending);
       }
     }
@@ -3497,7 +3721,8 @@ export class WaveRunner {
     let idleRequest: ReviewRequestInput = input;
     let forceAuthorization: ForceAuthorization | undefined;
     try {
-      this.refuseOwnUnwaivableReviewDebt(input.jobId);
+      this.refuseOwnUnwaivableReviewDebt(input.jobId, input.force === true);
+      this.refuseUnprovenOnboardingArmTarget(input);
       armedTargetRef = this.resolveLocalRequestTarget(input);
       idleRequest = { ...input, ...(armedTargetRef !== undefined ? { targetRef: armedTargetRef } : {}) };
       forceAuthorization = this.enforceBranchIdleForRequest(idleRequest);
@@ -3859,7 +4084,8 @@ export class WaveRunner {
      * receipt); Stage-5 carry-forward always re-verifies claimed priors. */
     claimedFixedPriors?: readonly number[];
   }): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
-    this.refuseOwnUnwaivableReviewDebt(input.jobId);
+    this.refuseOwnUnwaivableReviewDebt(input.jobId, input.force === true);
+    this.refuseUnprovenOnboardingArmTarget(input);
     const armedTargetRef = this.resolveLocalRequestTarget(input);
     const forceAuthorization = this.enforceBranchIdleForRequest({ ...input,
       ...(armedTargetRef !== undefined ? { targetRef: armedTargetRef } : {}) });
@@ -3902,15 +4128,17 @@ export class WaveRunner {
     return this.localTargetIdentity(lane.path, ref) ?? undefined;
   }
 
-  /** Own recovery/material debt is unwaivable regardless of target validity.
-   * Use the existing refusal/audit path before inspecting a caller's ref. */
-  private refuseOwnUnwaivableReviewDebt(jobId: string): void {
+  /** Own recovery/material/onboarding-proof debt is unwaivable regardless of
+   * target validity. Use the existing refusal/audit path before inspecting a
+   * caller's ref; the audit says whether the request asked for force. */
+  private refuseOwnUnwaivableReviewDebt(jobId: string, forceRequested: boolean): void {
     const job = this.opts.ledger.getJob(jobId);
     if (job === null || isJobTerminal(job.status) ||
-      (!this.opts.ledger.hasOpenDirectiveRecoveryHold(jobId) && pendingWorkRevision(this.opts.ledger, job) === null)) return;
+      (!this.opts.ledger.hasOpenDirectiveRecoveryHold(jobId) && pendingWorkRevision(this.opts.ledger, job) === null &&
+        this.opts.ledger.onboardingProofDebt(jobId) === null)) return;
     const jobLane = this.opts.worktrees.listWorktrees({ jobId }).find((lane) => lane.kind === 'job') ?? null;
     if (jobLane === null) return; // Preserve setup's canonical missing-lane refusal.
-    this.enforceBranchIdle({ job, jobLane, phase: 'arm',
+    this.enforceBranchIdle({ job, jobLane, phase: 'arm', forceRequested,
       targetBranch: normalizeBranch(jobLane.branch ?? laneBranch(jobId)) });
   }
 
@@ -3988,13 +4216,16 @@ export class WaveRunner {
     const revision = jobNow === null ? null : pendingWorkRevision(this.opts.ledger, jobNow);
     const verification = jobNow === null || isJobTerminal(jobNow.status) || revision !== null
       ? null : this.opts.ledger.correctiveVerificationDebt(input.job.id);
+    // #427 PR 1b: an onboarding heist's own unproven head fences ANY target.
+    const onboardingProof = jobNow === null || isJobTerminal(jobNow.status)
+      ? null : this.opts.ledger.onboardingProofDebt(input.job.id);
     if (
       jobNow !== null &&
       !isJobTerminal(jobNow.status) &&
       !blockers.some((blocker) => blocker.jobId === input.job.id) &&
       (this.opts.ledger.listPendingRebriefs({ jobId: input.job.id }).length > 0 ||
         this.opts.ledger.hasOpenDirectiveRecoveryHold(input.job.id) ||
-        revision !== null || verification !== null)
+        revision !== null || verification !== null || onboardingProof !== null)
     ) {
       blockers.push({
         jobId: input.job.id,
@@ -4004,6 +4235,7 @@ export class WaveRunner {
           : laneBranch(input.job.id),
         ...(revision !== null ? { revision } : {}),
         ...(verification !== null ? { verification } : {}),
+        ...(onboardingProof !== null ? { onboardingProof } : {}),
       });
     }
     return { targetBranch, blockers };
@@ -4011,17 +4243,107 @@ export class WaveRunner {
 
   private refuseUnauditedBlockers(
     jobId: string, roundId: string, idle: { readonly targetBranch: string; readonly blockers: readonly BranchIdleBlocker[] },
-    authorization: ForceAuthorization,
+    authorization: ForceAuthorization, forceRequested: boolean,
   ): void {
-    const unaudited = idle.blockers.filter((blocker) => blocker.revision !== undefined ||
+    const unaudited = idle.blockers.filter((blocker) => blocker.revision !== undefined || blocker.onboardingProof !== undefined ||
       this.opts.ledger.hasOpenDirectiveRecoveryHold(blocker.jobId) ||
       !forceCoversBlocker(this.opts.ledger, authorization, blocker));
     if (unaudited.length === 0) return;
     this.opts.ledger.appendCustomEvent({
       kind: 'branch-idle.refused', jobId, roundId,
-      payload: { phase: 'freeze', forced: false, targetBranch: idle.targetBranch, blockers: unaudited },
+      payload: { phase: 'freeze', forced: false, force_requested: forceRequested, targetBranch: idle.targetBranch, blockers: unaudited },
     });
     throw new BranchBusyError(idle.targetBranch, unaudited, 'freeze');
+  }
+
+  /** #427 PR 1b: refuse to freeze an onboarding heist's sha unless the
+   * first proof of exactly that sha passed. Unforceable and audited like
+   * the arm-time onboarding refusal: `forced` is false (nothing was
+   * waived), `force_requested` says whether force was asked for. The
+   * caller passes the job's status from before this round's flip. */
+  private refuseUnprovenOnboardingTarget(input: {
+    readonly jobId: string;
+    readonly status: JobStatus;
+    readonly roundId: string;
+    readonly targetBranch: string;
+    readonly targetSha: string;
+    readonly force: boolean;
+  }): void {
+    const onboardingProof = this.opts.ledger.onboardingProofDebtAt(input.jobId, input.targetSha);
+    if (onboardingProof === null) return;
+    const blockers: readonly BranchIdleBlocker[] = [{ jobId: input.jobId, status: input.status, branch: input.targetBranch, onboardingProof }];
+    this.opts.ledger.appendCustomEvent({
+      kind: 'branch-idle.refused', jobId: input.jobId, roundId: input.roundId,
+      payload: { phase: 'freeze', forced: false, force_requested: input.force, targetBranch: input.targetBranch, blockers },
+    });
+    throw new BranchBusyError(input.targetBranch, blockers, 'freeze');
+  }
+
+  /** #427 PR 1b: when an arm names an explicit target, the commit the
+   * round would review is resolved now and its first proof must have
+   * passed: a synchronous 409 before any round row or review worktree
+   * exists. With no target, the round reviews the live PR head (the lane
+   * HEAD may hold a commit never delivered, which the round never reviews):
+   * the delivered-head fence and the freeze's exact-sha check cover it. A
+   * target only a fetch or the live PR resolves is left to the freeze,
+   * which checks the exact sha last. Unforceable. */
+  private refuseUnprovenOnboardingArmTarget(input: { readonly jobId: string; readonly targetRef?: string | undefined; readonly force?: boolean | undefined }): void {
+    const job = this.opts.ledger.getJob(input.jobId);
+    if (job === null || isJobTerminal(job.status) || !this.opts.ledger.isOnboardingJob(input.jobId)) return;
+    if (input.targetRef === undefined || input.targetRef.trim() === '') return;
+    const lane = this.opts.worktrees.listWorktrees({ jobId: input.jobId })
+      .find((candidate) => candidate.kind === 'job' && candidate.status !== 'swept') ?? null;
+    if (lane === null) return; // Setup's canonical missing-lane refusal.
+    // An origin branch is fetched fresh at the freeze; a local copy may be stale.
+    if (isExactOriginBranchSpelling(input.targetRef)) return;
+    let sha: string;
+    try {
+      sha = resolveGitCommit(lane.path, input.targetRef);
+    } catch {
+      return; // Not resolvable here: the freeze resolves it and checks it.
+    }
+    const onboardingProof = this.opts.ledger.onboardingProofDebtAt(input.jobId, sha);
+    if (onboardingProof === null) return;
+    const targetBranch = resolveReviewTargetBranch({
+      jobId: input.jobId,
+      targetRef: input.targetRef,
+      lanePath: lane.path,
+      laneBranch: lane.branch,
+    });
+    const blockers: readonly BranchIdleBlocker[] = [{ jobId: input.jobId, status: job.status, branch: targetBranch, onboardingProof }];
+    this.opts.ledger.appendCustomEvent({
+      kind: 'branch-idle.refused', jobId: input.jobId,
+      payload: { phase: 'arm', forced: false, force_requested: input.force === true, targetBranch, blockers },
+    });
+    throw new BranchBusyError(targetBranch, blockers, 'arm');
+  }
+
+  /** #427 PR 1b: the proof debt of an onboarding heist's lane HEAD, the
+   * commit a bmad-review fallback reviews (captureFallbackInput). Null when
+   * the job is no onboarding heist or that commit's first proof passed. */
+  private onboardingLaneHeadDebt(jobId: string, lanePath: string): OnboardingProofDebt | null {
+    if (!this.opts.ledger.isOnboardingJob(jobId)) return null;
+    return this.opts.ledger.onboardingProofDebtAt(jobId, resolveGitCommit(lanePath, 'HEAD'));
+  }
+
+  /** #427 PR 1b: the fallback reviews the working tree, uncommitted bytes
+   * included (captureFallbackInput), and no proof ever ran those: an
+   * onboarding heist's lane must be clean. The debt names the lane HEAD;
+   * null when the job is no onboarding heist or its lane is clean. A
+   * bootstrap source the owner's checkout cannot give is a refusal, at
+   * admission and at a running gate's recheck alike
+   * ({@link FALLBACK_ONBOARDING_SOURCE_UNREADABLE}). */
+  private onboardingLaneDirtyDebt(jobId: string, lane: Pick<WorktreeLane, 'path' | 'repoPath'>): OnboardingProofDebt | null {
+    if (!this.opts.ledger.isOnboardingJob(jobId)) return null;
+    let change: ReturnType<typeof laneUncommittedChange>;
+    try {
+      change = laneUncommittedChange(lane.path, lane.repoPath);
+    } catch (error) {
+      if (error instanceof BootstrapSourceUnreadableError) throw sourceUnreadableRefusal(jobId, error);
+      throw error;
+    }
+    if (change === null) return null;
+    return { head: resolveGitCommit(lane.path, 'HEAD'), reason: 'uncommitted', ...(change.detail === null ? {} : { detail: change.detail }) };
   }
 
   private enforceBranchIdle(input: {
@@ -4039,6 +4361,9 @@ export class WaveRunner {
     reviewedStatus?: { readonly jobId: string; readonly status: JobStatus } | undefined;
     /** A forced check covers only the work its arm snapshot holds (#267). */
     forceAuthorization?: ForceAuthorization;
+    /** For the audit only: the request asked for force even though this
+     * check does not apply it (an unwaivable debt's own refusal). */
+    forceRequested?: boolean;
   }): { readonly targetBranch: string; readonly blockers: readonly BranchIdleBlocker[]; readonly authorization: ForceAuthorization } {
     const { targetBranch, blockers } = this.branchIdleBlockers(input);
     // Snapshot before publishing an audit: synchronous ledger observers can
@@ -4047,9 +4372,10 @@ export class WaveRunner {
     // A retirement hold is a fresh-authorization boundary, not ordinary
     // branch activity. Neither force nor a foreign target may waive it. A
     // pending material correction is the same (owner rule 2): the candidate
-    // is outdated by an approved change, and no override reviews it.
+    // is outdated by an approved change, and no override reviews it. So is
+    // an unproven onboarding head (#427 PR 1b): force is not a proof.
     const held = blockers.some((blocker) =>
-      blocker.revision !== undefined || this.opts.ledger.hasOpenDirectiveRecoveryHold(blocker.jobId));
+      blocker.revision !== undefined || blocker.onboardingProof !== undefined || this.opts.ledger.hasOpenDirectiveRecoveryHold(blocker.jobId));
     if (blockers.length === 0 && input.force !== true) return { targetBranch, blockers, authorization };
     const forced = input.force === true && !held && (input.forceAuthorization === undefined ||
       blockers.every((blocker) => forceCoversBlocker(this.opts.ledger, input.forceAuthorization!, blocker, authorization.get(blocker.jobId))));
@@ -4057,7 +4383,9 @@ export class WaveRunner {
       kind: forced ? 'branch-idle.forced' : 'branch-idle.refused',
       jobId: input.job.id,
       ...(input.roundId !== undefined ? { roundId: input.roundId } : {}),
-      payload: { phase: input.phase, forced, targetBranch, blockers },
+      // `forced`: force was applied (blockers waived); `force_requested`:
+      // the request asked for it, applied or not.
+      payload: { phase: input.phase, forced, force_requested: input.force === true || input.forceRequested === true, targetBranch, blockers },
     });
     if (!forced) throw new BranchBusyError(targetBranch, blockers, input.phase);
     return { targetBranch, blockers, authorization };
@@ -4337,7 +4665,7 @@ export class WaveRunner {
           this.opts.ledger.appendCustomEvent({
             kind: 'branch-idle.refused',
             jobId: input.jobId,
-            payload: { phase: 'arm', forced: false, targetBranch, blockers },
+            payload: { phase: 'arm', forced: false, force_requested: false, targetBranch, blockers },
           });
           throw new BranchBusyError(targetBranch, blockers, 'arm');
         }
@@ -4358,7 +4686,28 @@ export class WaveRunner {
       this.opts.ledger.appendCustomEvent({
         kind: 'branch-idle.refused',
         jobId: input.jobId,
-        payload: { phase: 'arm', forced: false, targetBranch, blockers },
+        payload: { phase: 'arm', forced: false, force_requested: input.force === true, targetBranch, blockers },
+      });
+      throw new BranchBusyError(targetBranch, blockers, 'arm');
+    }
+    // #427 PR 1b: an unproven onboarding head refuses fallback admission
+    // even under force: the delivered head, the lane HEAD the fallback
+    // actually reviews, and any uncommitted change it would review too.
+    const onboardingProof = jobRow === null || isJobTerminal(jobRow.status)
+      ? null : this.opts.ledger.onboardingProofDebt(input.jobId) ?? this.onboardingLaneHeadDebt(input.jobId, lane.path) ??
+        this.onboardingLaneDirtyDebt(input.jobId, lane);
+    if (jobRow !== null && onboardingProof !== null) {
+      const targetBranch = resolveReviewTargetBranch({
+        jobId: input.jobId,
+        ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
+        lanePath: lane.path,
+        laneBranch: lane.branch,
+      });
+      const blockers: readonly BranchIdleBlocker[] = [{ jobId: input.jobId, status: jobRow.status, branch: targetBranch, onboardingProof }];
+      this.opts.ledger.appendCustomEvent({
+        kind: 'branch-idle.refused',
+        jobId: input.jobId,
+        payload: { phase: 'arm', forced: false, force_requested: input.force === true, targetBranch, blockers },
       });
       throw new BranchBusyError(targetBranch, blockers, 'arm');
     }
@@ -4433,6 +4782,26 @@ export class WaveRunner {
         `an approved material correction for job "${input.jobId}" is pending delivery — the old diff cannot pass`,
       );
     }
+    if (this.opts.ledger.onboardingProofDebt(input.jobId) !== null) {
+      throw new FallbackSafetyRefusal(
+        `onboarding job "${input.jobId}" has no passing onboarding proof of its delivered head — the gate stops before the next review round`,
+        FALLBACK_ONBOARDING_PROOF_REQUIRED,
+      );
+    }
+    const laneHeadDebt = this.onboardingLaneHeadDebt(input.jobId, lane.path);
+    if (laneHeadDebt !== null) {
+      throw new FallbackSafetyRefusal(
+        `onboarding job "${input.jobId}" has no passing onboarding proof of its lane HEAD ${laneHeadDebt.head ?? ''}, the commit the fallback reviews — the gate stops before the next review round`,
+        FALLBACK_ONBOARDING_PROOF_REQUIRED,
+      );
+    }
+    const dirty = this.onboardingLaneDirtyDebt(input.jobId, lane);
+    if (dirty !== null) {
+      throw new FallbackSafetyRefusal(
+        `onboarding job "${input.jobId}"'s lane holds uncommitted changes the proof never ran, and the fallback reviews the working tree — the gate stops before the next review round${dirty.detail === undefined ? '' : ` (${dirty.detail})`}`,
+        FALLBACK_ONBOARDING_PROOF_REQUIRED,
+      );
+    }
     if (fallbackWorkingStartedSince(this.opts.ledger, input.jobId, admission.statusSeq) ||
         (this.opts.ledger.latestCandidateDelivery(input.jobId)?.seq ?? 0) !== admission.deliverySeq ||
         (this.opts.ledger.latestJobEvent(input.jobId, 'silas.rebrief-settled')?.seq ?? 0) !== admission.settlementSeq ||
@@ -4481,7 +4850,7 @@ export class WaveRunner {
       ...findBusyLanes({ ledger: this.opts.ledger, lanes: lanesNow, targetBranch: admission.targetBranch }),
       ...findBusyLanes({ ledger: this.opts.ledger, lanes: [lane], targetBranch: normalizeBranch(lane.branch ?? laneBranch(input.jobId)) }),
     ];
-    if (busyNow.some((blocker) => input.force !== true || blocker.revision !== undefined ||
+    if (busyNow.some((blocker) => input.force !== true || blocker.revision !== undefined || blocker.onboardingProof !== undefined ||
       this.opts.ledger.hasOpenDirectiveRecoveryHold(blocker.jobId) ||
       !forceCoversBlocker(this.opts.ledger, admission.forceAuthorization, blocker))) {
       throw new FallbackSafetyRefusal(
@@ -4626,7 +4995,7 @@ export class WaveRunner {
           recheck();
         } catch (error) {
           if (error instanceof FallbackSafetyRefusal) {
-            this.terminalFallbackAborted(job.id, error.message, iteration, [...state.reportFiles], fallbackEvent, state);
+            this.terminalFallbackAborted(job.id, error, iteration, [...state.reportFiles], fallbackEvent, state);
             return;
           }
           throw error;
@@ -4650,7 +5019,7 @@ export class WaveRunner {
         captured = captureFallbackInput(lanePath, baseRef);
       } catch (error) {
         if (error instanceof FallbackSafetyRefusal) {
-          this.terminalFallbackAborted(job.id, error.message, iteration, [...state.reportFiles], fallbackEvent, state);
+          this.terminalFallbackAborted(job.id, error, iteration, [...state.reportFiles], fallbackEvent, state);
         } else {
           this.terminalFallbackBlocked(job.id, `fallback round ${iteration} input failed: ${sanitizeErrorLog(error)}`, iteration, [...state.reportFiles], fallbackEvent, state);
         }
@@ -4677,7 +5046,7 @@ export class WaveRunner {
       } catch (error) {
         if (existsSync(reportFile)) state.reportFiles.push(reportFile);
         if (error instanceof FallbackSafetyRefusal) {
-          this.terminalFallbackAborted(job.id, error.message, iteration, [...state.reportFiles], fallbackEvent, state);
+          this.terminalFallbackAborted(job.id, error, iteration, [...state.reportFiles], fallbackEvent, state);
           return;
         }
         this.terminalFallbackBlocked(job.id, `bmad-review round ${iteration} failed: ${sanitizeErrorLog(error)}`, iteration, [...state.reportFiles], fallbackEvent, state);
@@ -4718,7 +5087,7 @@ export class WaveRunner {
         });
       } catch (error) {
         if (error instanceof FallbackSafetyRefusal) {
-          this.terminalFallbackAborted(job.id, error.message, iteration, [...state.reportFiles], fallbackEvent, state);
+          this.terminalFallbackAborted(job.id, error, iteration, [...state.reportFiles], fallbackEvent, state);
           return;
         }
         this.terminalFallbackBlocked(
@@ -4789,21 +5158,28 @@ export class WaveRunner {
 
   private terminalFallbackAborted(
     jobId: string,
-    reason: string,
+    refusal: FallbackSafetyRefusal,
     iteration: number,
     reports: readonly string[],
     fallbackEvent: (payload: Record<string, unknown>) => void,
     state?: FallbackGateState,
   ): void {
+    const reason = refusal.message;
     if (this.supersededFallbackGates.has(jobId)) {
       this.terminalFallbackSuperseded(jobId, reason, iteration, reports, fallbackEvent, state);
       return;
     }
     if (state !== undefined) state.note = `bmad-review gate aborted: ${reason}`;
-    fallbackEvent({ phase: 'aborted', iteration, reason, reports, clearToMerge: false });
+    // A named reason carries its way forward (#427 PR 1b: an onboarding
+    // fix that needs a proof before review goes on).
+    const hint = refusal.hint ?? FALLBACK_ONBOARDING_PROOF_HINT;
+    const named = refusal.code === null ? {} : { code: refusal.code, hint };
+    fallbackEvent({ phase: 'aborted', iteration, reason, reports, clearToMerge: false, ...named });
     this.escalate(
       `bmad-review gate ABORTED for job ${jobId}`,
-      `${reason}. No further review round ran; merge is NOT clear. Restore the Perkins gate for autonomous gating.`,
+      refusal.code === null
+        ? `${reason}. No further review round ran; merge is NOT clear. Restore the Perkins gate for autonomous gating.`
+        : `${reason}. No further review round ran; merge is NOT clear. ${refusal.code}: ${hint}.`,
       { jobId },
     );
   }
@@ -5077,6 +5453,15 @@ export class WaveRunner {
           evidence,
           log: (level, msg, fields) => this.log(level, msg, { job: job.id, ...fields }),
         });
+        // #427 PR 1b: an onboarding heist's proof of exactly this head (the
+        // first proof of a head stands, as the freeze check reads it).
+        spec = appendOnboardingProof({
+          spec,
+          block: renderOnboardingProofEvidence(this.opts.ledger.firstOnboardingProof(job.id, targetSha), targetSha),
+          ciBlock: ci.block,
+          maxBytes: FROZEN_SPEC_MAX_BYTES,
+          log: (level, msg, fields) => this.log(level, msg, { job: job.id, ...fields }),
+        });
         spec = appendCiEvidence({
           spec,
           block: ci.block,
@@ -5164,7 +5549,7 @@ export class WaveRunner {
         ...(flippedFrom !== null ? { reviewedStatus: { jobId: job.id, status: flippedFrom } } : {}),
       };
       const current = input.force === true ? this.branchIdleBlockers(recheck) : this.enforceBranchIdle(recheck);
-      this.refuseUnauditedBlockers(job.id, round.id, current, input.forceAuthorization ?? new Map());
+      this.refuseUnauditedBlockers(job.id, round.id, current, input.forceAuthorization ?? new Map(), input.force === true);
     };
     try {
       reviewWorktree = await this.opts.worktrees.createReviewWorktree({
@@ -5180,7 +5565,8 @@ export class WaveRunner {
           : new Error('Perkins review service shut down during review setup');
       }
       const jobAtFreeze = this.opts.ledger.getJob(job.id);
-      if (jobAtFreeze !== null && isJobTerminal(jobAtFreeze.status)) {
+      if (jobAtFreeze === null) throw new ReviewJobMissingError(job.id);
+      if (isJobTerminal(jobAtFreeze.status)) {
         throw new Error(`job "${job.id}" is ${jobAtFreeze.status} — terminal lanes do not go back under review`);
       }
       if (input.armedTargetRef !== undefined) this.assertNamedTargetIdentity(jobWorktree.path, input.armedTargetRef);
@@ -5199,6 +5585,13 @@ export class WaveRunner {
         ...(flippedFrom !== null ? { reviewedStatus: { jobId: job.id, status: flippedFrom } } : {}),
       };
       const idle = this.enforceBranchIdle(idleInput);
+      // #427 PR 1b: an onboarding heist freezes only a sha whose own proof
+      // passed. The fence above follows the delivered head; an explicit
+      // target, or a commit pushed after the delivery, can freeze another.
+      // The blocker names the status from before this round flipped it.
+      this.refuseUnprovenOnboardingTarget({
+        jobId: job.id, status: job.status, roundId: round.id, targetBranch: idle.targetBranch, targetSha, force: input.force === true,
+      });
       // A clean-abort re-arm proved ONE delivered head at request time; the
       // awaited pre-flight/capacity/setup window can admit a newer delivery.
       // Re-prove the unchanged-head precondition here, at the last boundary
@@ -5351,7 +5744,7 @@ export class WaveRunner {
         // Unforced: the ordinary refusal (audited). Forced: its audit already
         // stands — only a blocker it never covered is refused (audited below).
         const afterProbe = input.force === true ? this.branchIdleBlockers(recheck) : this.enforceBranchIdle(recheck);
-        this.refuseUnauditedBlockers(job.id, round.id, afterProbe, input.forceAuthorization ?? new Map());
+        this.refuseUnauditedBlockers(job.id, round.id, afterProbe, input.forceAuthorization ?? new Map(), input.force === true);
         // Owner rule 3: a setup superseded while it awaited (an approved
         // material change, or a writer that owns the lane) withdraws here,
         // before any admission effect — the rollback below unwinds it.

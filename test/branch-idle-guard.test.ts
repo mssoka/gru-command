@@ -510,6 +510,7 @@ describe('branch-idle guard', () => {
       hasOpenDirectiveRecoveryHold: (): boolean => false,
       workRevisionState: () => ({ required: 0, delivered: 0 }),
       correctiveVerificationDebt: () => null,
+      onboardingProofDebt: () => null,
     };
     const busy = (id: string): boolean => laneIsBusy(ledger, ledger.listJobs().find((job) => job.id === id)!);
     expect(busy('never-started')).toBe(true);
@@ -584,6 +585,7 @@ describe('branch-idle guard', () => {
       hasOpenDirectiveRecoveryHold: (): boolean => false,
       workRevisionState: () => ({ required: 0, delivered: 0 }),
       correctiveVerificationDebt: () => null,
+      onboardingProofDebt: () => null,
     };
     expect(laneIsBusy(paged, paged.listJobs()[0]!)).toBe(false);
 
@@ -609,6 +611,7 @@ describe('branch-idle guard', () => {
       hasOpenDirectiveRecoveryHold: (): boolean => false,
       workRevisionState: () => ({ required: 0, delivered: 0 }),
       correctiveVerificationDebt: () => null,
+      onboardingProofDebt: () => null,
     };
     expect(laneIsBusy(capped, capped.listJobs()[0]!)).toBe(false);
   });
@@ -857,6 +860,7 @@ describe('branch-idle guard', () => {
       hasOpenDirectiveRecoveryHold: (): boolean => false,
       workRevisionState: () => ({ required: 0, delivered: 0 }),
       correctiveVerificationDebt: () => null,
+      onboardingProofDebt: () => null,
     };
     const busy = (id: string): boolean => laneIsBusy(ledger, ledger.listJobs().find((job) => job.id === id)!);
     expect(busy('working-pending')).toBe(true);
@@ -1530,6 +1534,7 @@ describe('branch-idle guard', () => {
       hasOpenDirectiveRecoveryHold: (): boolean => false,
       workRevisionState: () => ({ required: 0, delivered: 0 }),
       correctiveVerificationDebt: () => null,
+      onboardingProofDebt: () => null,
     };
     const lanes = [
       laneRecord('marker-owner', 'marker-owner', 'gru/marker-owner'),
@@ -1651,6 +1656,9 @@ describe('branch-idle guard', () => {
       release.release();
       const aborted = await abortedPromise;
       expect(aborted.payload).toMatchObject({ phase: 'aborted', clearToMerge: false });
+      // Only an onboarding heist's abort carries a named reason (#427).
+      expect(aborted.payload).not.toHaveProperty('code');
+      expect(aborted.payload).not.toHaveProperty('hint');
       expect(h.ledger.listJobEvents('fallback-stale-pass').some((event) =>
         event.kind === 'job.fallback-review' && (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
     } finally {

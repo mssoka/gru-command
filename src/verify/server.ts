@@ -5,7 +5,7 @@ import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { LedgerApi } from '../ledger/api.js';
 import type { WorktreePort } from '../dispatch/worktree-port.js';
-import { loadWorktreeManifest, resolveVerifyCommand } from '../worktrees/manifest.js';
+import { loadWorktreeManifest, RESERVED_VERIFY_SCOPE, resolveVerifyCommand } from '../worktrees/manifest.js';
 import {
   VerificationDuplicateError,
   VerificationLockTimeoutError,
@@ -17,6 +17,7 @@ import {
   type VerificationLease,
   type VerificationProgress,
   type VerificationQueueView,
+  type VerificationRunSpec,
   type VerificationSchedulerOptions,
 } from './scheduler.js';
 
@@ -74,8 +75,42 @@ export interface VerificationServer {
   requestHook(req: IncomingMessage, res: ServerResponse, path: string): boolean;
   /** Board health row (board UX v4): live lock/queue/budget counters. */
   view(): VerificationQueueView;
+  /** The global budget's lease primitives, for a holder that spawns its own
+   * command (#427 onboarding proof): one FIFO slot under the same lock-wait
+   * timeout, and the per-run worker share to hand that command. */
+  budget(): VerificationBudget;
   dispose(): Promise<void>;
 }
+
+/** One slot of the global verification budget, held by its caller. */
+export interface VerificationBudget {
+  acquire(spec: VerificationRunSpec): Promise<VerificationLease>;
+  /** Bind the pid and argv of the command the holder spawned to its slot,
+   * persisted as a scheduler run's child is: a restart then judges an
+   * orphaned slot by that pid's liveness (by its whole process group when
+   * it `leadsGroup`) instead of releasing it as runner-less, and the argv
+   * tells the holder the pid is still its own. */
+  bindPid(lease: VerificationLease, pid: number, processCommand: string, opts?: { readonly leadsGroup?: boolean }): void;
+  /** Slots of `scope` an earlier process left, still held for a live pid. */
+  restored(scope: string): readonly { readonly lease: VerificationLease; readonly pid: number; readonly processCommand: string | null }[];
+  /** Judge the slots an earlier process left now (the scheduler's stale
+   * check): one whose pid and group are gone, or past the age limit, is
+   * released. */
+  reconcileStale(): void;
+  release(lease: VerificationLease): void;
+  readonly workersPerRun: number;
+  /** The scheduler's age limit: a slot held this long after its grant is
+   * released as stale at the next stale check. */
+  readonly ageLimitMs: number;
+}
+
+/**
+ * The scope an onboarding proof (#427) holds its budget slot under. A proof
+ * is never a verification of its job: the scheduler's record callback drops
+ * every event that names this scope, so no `verification.*` event exists for
+ * a proof and the job's verification fences never see one.
+ */
+export const ONBOARDING_PROOF_SCOPE = RESERVED_VERIFY_SCOPE;
 
 const MAX_BODY_BYTES = 64 * 1024;
 
@@ -192,6 +227,15 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
         runTimeoutMs: options.config.verify.runTimeoutMs,
       },
       record: (event) => {
+        // An onboarding proof's slot (a lock-wait timeout, a stale release)
+        // is never the job's verification evidence. A stale release is
+        // still worth a warn: a slot was held for a proof that is gone.
+        if (event.payload['scope'] === ONBOARDING_PROOF_SCOPE) {
+          if (event.kind === 'verification.stale-released') {
+            log('warn', 'onboarding proof: a budget slot an earlier run left was released (not verification evidence)', { job: event.jobId, ...event.payload });
+          }
+          return;
+        }
         if (event.kind === 'verification.no-start' && ledger.hasJobEventWithPayloadValues(event.jobId, ['verification.no-start'],
           [{ key: 'run_id', value: String(event.payload['run_id']) }], 0)) return;
         ledger.appendCustomEvent({
@@ -314,6 +358,15 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
     const body = await readBody(req);
     const jobId = strField(body, 'job_id');
     const scope = optStrField(body, 'scope') ?? DEFAULT_VERIFY_SCOPE;
+    if (scope === ONBOARDING_PROOF_SCOPE) {
+      // Every event of this scope is dropped (an onboarding proof is never
+      // verification evidence): a run under it would leave no record.
+      json(res, 400, {
+        error: 'reserved_scope',
+        detail: `verify scope "${ONBOARDING_PROOF_SCOPE}" is reserved for GC's onboarding proof and cannot be requested; name the manifest's scope differently`,
+      });
+      return;
+    }
     const requestId = optStrField(body, 'request_id');
     if (requestId !== undefined && !isValidVerificationRequestId(requestId)) {
       json(res, 400, {
@@ -545,6 +598,22 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
   return {
     view(): VerificationQueueView {
       return scheduler.view();
+    },
+
+    budget(): VerificationBudget {
+      return {
+        acquire: (spec) => scheduler.acquire(spec),
+        bindPid: (lease, pid, processCommand, opts) => scheduler.bindPid(lease, pid, processCommand, opts),
+        restored: (scope) => scheduler.restoredHolders(scope),
+        reconcileStale: () => { scheduler.reconcileStale(); },
+        release: (lease) => scheduler.release(lease),
+        get workersPerRun() {
+          return scheduler.workersPerRun;
+        },
+        get ageLimitMs() {
+          return scheduler.staleMaxAge;
+        },
+      };
     },
 
     requestHook(req, res, path): boolean {

@@ -249,10 +249,13 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   (`onboarding.proposal`, [ONBOARDING.md](./ONBOARDING.md)) is a registered
   owner kind with the same typed Accept/Decline; a dispatched onboarding
   heist is FYI activity, and a failed dispatch is Gru's
-  (`onboarding.dispatch-failed`). A planning minion's sliced intake plan
-  (`intake.slicing-result`, [INTAKE.md](./INTAKE.md)) is a registered owner
-  kind without a typed decision: it lists source conflicts first and is
-  reviewed in intake, then acknowledged. Routine recovery (crash-loop breakers,
+  (`onboarding.dispatch-failed`), as is a stuck onboarding proof
+  (`onboarding.proof-attention`, one row per stuck episode, naming its
+  reason) and a crashed proof's verify slot kept for a process group GC
+  cannot confirm (`onboarding.proof-slot-held`). A planning minion's sliced
+  intake plan (`intake.slicing-result`, [INTAKE.md](./INTAKE.md)) is a
+  registered owner kind without a typed decision: it lists source conflicts
+  first and is reviewed in intake, then acknowledged. Routine recovery (crash-loop breakers,
   provider-wall stops, re-brief/directive reconciliation) stays machine
   attention. Every card is the same readable shared component in both
   surfaces: mixed-case prose, a short metadata label, typed decision

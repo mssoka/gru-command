@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
 import { loadWorktreeManifest, resolveVerifyCommand } from '../worktrees/manifest.js';
+import { isCommitId, readOnboardingProof } from '../onboarding/proof-record.js';
 import { readGitState } from '../verify/scheduler.js';
 import { planCommand } from '../verify/build-reuse.js';
 import { FROZEN_MANIFEST_MAX_BYTES, readReviewCheckpointBytes, type FrozenReviewInputs } from '../dispatch/perkins-review/artifacts.js';
@@ -411,6 +412,28 @@ export interface EventRecord {
   readonly payload: unknown;
 }
 
+/** Why an onboarding heist owes a proof (#427 PR 1b):
+ * - `no-delivery`: the job has not delivered, so there is no head yet;
+ * - `no-commit`: the newest delivery names no full commit id (or is not a
+ *   proven current candidate), so the minion must deliver again;
+ * - `unproven`: the head has no proof yet;
+ * - `failed`: the head's first proof failed, or its record is unreadable
+ *   (a record no reader can read is never a pass);
+ * - `uncommitted`: the lane holds uncommitted changes the proof never ran,
+ *   which the bmad-review fallback would review (set by the fallback's
+ *   lane check, never by the ledger). */
+export type OnboardingProofDebtReason = 'no-delivery' | 'no-commit' | 'unproven' | 'failed' | 'uncommitted';
+
+/** An onboarding heist's unproven head (#427 PR 1b): the head review waits
+ * on (null for `no-delivery` and `no-commit`) and why it waits. */
+export interface OnboardingProofDebt {
+  readonly head: string | null;
+  readonly reason: OnboardingProofDebtReason;
+  /** For `uncommitted`: a path the lane's bootstrap placed that is no
+   * longer what it placed, named with what may have changed it. */
+  readonly detail?: string;
+}
+
 /** Notification routing (SPEC ruling 13; owner routing split 2026-09-23):
  * 'fyi' → the standing feed; 'action-required' → MACHINE attention — it
  * wakes Gru (per the wake policy) and never rings the owner bell;
@@ -430,6 +453,10 @@ const PRODUCER_RESOLVED_KINDS: Readonly<Record<string, string>> = {
   'lessons.dream-failed': 'a completed dream pass',
   // #427: the row drives onboarding's retry; a disposition would stop it.
   'onboarding.dispatch-failed': 'a dispatched onboarding heist, or a scan that finds none is needed',
+  // #427 PR 1b: one row per stuck (job, head); onboarding closes it.
+  'onboarding.proof-attention': 'a passing proof, a newer delivered head, or the onboarding job ending',
+  // #427 PR 1b: a crashed proof's verify slot the boot judge kept; onboarding closes it.
+  'onboarding.proof-slot-held': 'the slot being released',
 };
 
 // The alias d is an immutable delivery. A protected root must cite its
@@ -2680,6 +2707,72 @@ export class LedgerApi {
            AND seq > ? AND COALESCE(json_extract(payload, '$.tracked_dirty'), 0) != 1 ORDER BY seq DESC LIMIT 1`,
       ).get(jobId, newest.seq)) as { ok: number | null } | undefined;
     return latest?.ok === 1 ? null : { revision, head };
+  }
+
+  /** The job's newest `job.delivered`, read as correctiveVerificationDebt
+   * reads it (`latestDeliveryForGates(jobId, false)`), and the head it
+   * identifies for review: its sha, or null when that delivery is not a
+   * proven current candidate (historical bookkeeping, an unproven native
+   * candidate, original native gate debt) or names no full commit id (40 or
+   * 64 lowercase hex characters, the only head a proof clones). Null when
+   * the job has no delivery. The onboarding fence and the onboarding
+   * service's follow-through both read the head here (#427 PR 1b). */
+  newestDeliveredHead(jobId: string): { readonly seq: number; readonly head: string | null } | null {
+    const newest = this.latestDeliveryForGates(jobId, false);
+    if (newest === null) return null;
+    const payload = (typeof newest.payload === 'object' && newest.payload !== null ? newest.payload : {}) as { candidate_delivery_proven?: unknown; sha?: unknown };
+    if (payload.candidate_delivery_proven === false || this.db.prepare(`SELECT 1 FROM events d WHERE d.seq = ? AND (${ORIGINAL_NATIVE_GATE_DEBT_SQL} OR ${UNPROVEN_NATIVE_CANDIDATE_SQL})`).get(newest.seq) !== undefined) {
+      // A current candidate delivery must identify the head.
+      return { seq: newest.seq, head: null };
+    }
+    return { seq: newest.seq, head: typeof payload.sha === 'string' && isCommitId(payload.sha) ? payload.sha : null };
+  }
+
+  /** #427 PR 1b: an onboarding heist (a job an `onboarding.dispatched`
+   * event names; that event carries the job only in its payload) is
+   * reviewed only on a head code has proven. The head is the one
+   * {@link newestDeliveredHead} identifies; the debt stands until the
+   * FIRST `onboarding.proof` of that exact head passed (the first proof of
+   * a head stands, as the onboarding service reads it). Null = no debt;
+   * otherwise the head that must pass (null when there is none) and why. */
+  onboardingProofDebt(jobId: string): OnboardingProofDebt | null {
+    if (!this.isOnboardingJob(jobId)) return null;
+    const newest = this.newestDeliveredHead(jobId);
+    if (newest === null) return { head: null, reason: 'no-delivery' };
+    return newest.head === null ? { head: null, reason: 'no-commit' } : this.onboardingProofOf(jobId, newest.head);
+  }
+
+  /** The proof debt of one exact head (#427 PR 1b): what a freeze of that
+   * sha owes. Null when the job is no onboarding heist or the first proof
+   * of that head passed. */
+  onboardingProofDebtAt(jobId: string, head: string): OnboardingProofDebt | null {
+    return this.isOnboardingJob(jobId) ? this.onboardingProofOf(jobId, head) : null;
+  }
+
+  /** #427: a job is an onboarding heist only when an `onboarding.dispatched` event names it. */
+  isOnboardingJob(jobId: string): boolean {
+    return this.db.prepare(
+      `SELECT 1 FROM events WHERE kind = 'onboarding.dispatched' AND json_extract(payload, '$.job_id') = ? LIMIT 1`,
+    ).get(jobId) !== undefined;
+  }
+
+  /** The FIRST `onboarding.proof` of one head of a job: the proof that
+   * stands for that head (#427 PR 1b), or null when it has none. */
+  firstOnboardingProof(jobId: string, head: string): EventRecord | null {
+    const row = this.db.prepare(
+      `SELECT * FROM events WHERE job_id = ? AND kind = 'onboarding.proof'
+         AND json_extract(payload, '$.head') = ? ORDER BY seq ASC LIMIT 1`,
+    ).get(jobId, head) as Row | undefined;
+    return row === undefined ? null : this.eventFromRow(row);
+  }
+
+  /** Read by the one proof reader: a first record it cannot read (an
+   * unknown outcome, malformed failures) fences like a failure and never
+   * lifts the fence. */
+  private onboardingProofOf(jobId: string, head: string): OnboardingProofDebt | null {
+    const first = this.firstOnboardingProof(jobId, head);
+    if (first === null) return { head, reason: 'unproven' };
+    return readOnboardingProof(first.payload)?.passed === true ? null : { head, reason: 'failed' };
   }
 
   private amendmentFromRow(row: Row): JobAmendmentRecord {

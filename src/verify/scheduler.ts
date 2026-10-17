@@ -310,6 +310,12 @@ interface PersistedSlot {
   /** Client request identities bound to this holder (reconcile across restart). */
   readonly request_ids?: readonly string[];
   readonly granted_at: number;
+  /** The argv a holder that spawns its own command bound with its pid
+   * (#427 onboarding proof): the pid's command evidence after a restart. */
+  readonly process_command?: string | null;
+  /** The bound pid leads its own process group: the holder lives while
+   * any member of that group does. */
+  readonly process_group?: boolean;
 }
 
 interface PersistedAttempt {
@@ -400,6 +406,10 @@ interface ActiveSlot {
    * process are never owned — they are judged by pid/age alone. */
   readonly owned: boolean;
   pid: number | null;
+  /** The argv bound with {@link VerificationScheduler.bindPid}, else null. */
+  processCommand: string | null;
+  /** The bound pid leads its own process group (judged by the group). */
+  leadsGroup: boolean;
   child: ChildProcess | null;
   /** Client request identities bound to this holder. */
   requestIds: readonly string[];
@@ -551,6 +561,18 @@ export function pidAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/** Does any member of a process group exist (`kill(-pgid, 0)`)? EPERM
+ * also proves existence. */
+function groupAlive(pgid: number): boolean {
+  if (!Number.isInteger(pgid) || pgid <= 1) return false;
+  try {
+    process.kill(-pgid, 0);
     return true;
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === 'EPERM';
@@ -744,6 +766,11 @@ export class VerificationScheduler {
     return Math.max(1, Math.floor(this.workerBudget / this.concurrencyLimit));
   }
 
+  /** How long after its grant a held slot is released as stale (`max-age`). */
+  get staleMaxAge(): number {
+    return this.staleMaxAgeMs;
+  }
+
   activeCount(): number {
     return this.slots.size;
   }
@@ -821,6 +848,8 @@ export class VerificationScheduler {
           grantedAt: slot.granted_at,
         },
         pid: slot.pid,
+        processCommand: slot.process_command ?? null,
+        leadsGroup: slot.process_group === true,
         owned: false,
         child: null,
         requestIds: slot.request_ids ?? [],
@@ -860,7 +889,9 @@ export class VerificationScheduler {
       let reason: StaleRelease['reason'] | null = null;
       if (slot.pid === null) {
         reason = 'no-runner';
-      } else if (!pidAlive(slot.pid)) {
+      } else if (!pidAlive(slot.pid) && !(slot.leadsGroup && groupAlive(slot.pid))) {
+        // A holder that leads its own group lives while any member does: a
+        // command its leader started may outlive it (#427 onboarding proof).
         reason = 'holder-dead';
       } else if (ageMs > this.staleMaxAgeMs) {
         reason = 'max-age';
@@ -923,6 +954,8 @@ export class VerificationScheduler {
         lease,
         owned: true,
         pid: null,
+        processCommand: null,
+        leadsGroup: false,
         child: null,
         requestIds: spec.requestId === undefined ? [] : [spec.requestId],
       });
@@ -1002,6 +1035,39 @@ export class VerificationScheduler {
       throw error;
     }
     return promise;
+  }
+
+  /**
+   * Bind the pid of a command a lease holder spawned itself (the holder
+   * runs its own command under {@link acquire}, #427 onboarding proof) to
+   * the lease's slot, persisted as {@link run} records its child: a restart
+   * then judges the loaded slot by that pid's liveness (holder-dead, or
+   * max-age) instead of releasing it as `no-runner` while the command may
+   * still run. `leadsGroup`: the pid leads its own process group, so the
+   * slot is judged by the group (`kill(-pgid, 0)`): a member that outlived
+   * its leader keeps it held. A slot already released holds nothing to bind.
+   */
+  bindPid(lease: VerificationLease, pid: number, processCommand: string, opts: { readonly leadsGroup?: boolean } = {}): void {
+    if (!Number.isInteger(pid) || pid <= 0) throw new Error(`a verification slot binds a positive integer pid, got ${String(pid)}`);
+    const slot = this.slots.get(lease.runId);
+    if (slot === undefined) return;
+    slot.pid = pid;
+    slot.processCommand = processCommand;
+    slot.leadsGroup = opts.leadsGroup === true;
+    this.persistBestEffort();
+  }
+
+  /**
+   * The slots of one scope that an earlier process left and this one still
+   * holds (their bound pid was alive at the last stale check), with the
+   * pid and argv their holder bound. The holder that spawns its own
+   * command may end such an orphan and release its slot (#427 onboarding
+   * proof); nothing else is offered.
+   */
+  restoredHolders(scope: string): readonly { readonly lease: VerificationLease; readonly pid: number; readonly processCommand: string | null }[] {
+    return [...this.slots.values()]
+      .filter((slot) => !slot.owned && slot.lease.scope === scope && slot.pid !== null)
+      .map((slot) => ({ lease: slot.lease, pid: slot.pid!, processCommand: slot.processCommand }));
   }
 
   /** Release a lease (idempotent) and grant the next FIFO waiter. */
@@ -1765,6 +1831,8 @@ export class VerificationScheduler {
         lease,
         owned: true,
         pid: null,
+        processCommand: null,
+        leadsGroup: false,
         child: null,
         requestIds: waiter.spec.requestId === undefined ? [] : [waiter.spec.requestId],
       });
@@ -2151,6 +2219,8 @@ export class VerificationScheduler {
         head: slot.lease.head,
         request_ids: slot.requestIds,
         granted_at: slot.lease.grantedAt,
+        ...(slot.processCommand === null ? {} : { process_command: slot.processCommand }),
+        ...(slot.leadsGroup ? { process_group: true } : {}),
       })),
       attempts: this.persistedAttempts(),
     };

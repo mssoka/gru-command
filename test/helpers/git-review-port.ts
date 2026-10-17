@@ -104,9 +104,10 @@ export class GitReviewPort implements WorktreePort {
     return resolveReviewTargetReal(input.repoPath, input.ref);
   }
 
-  async createJobWorktree(input: { repoPath: string; jobId: string }): Promise<WorktreeLane> {
+  /** `path`: a worktree the caller made (default: the repository checkout itself). */
+  async createJobWorktree(input: { repoPath: string; jobId: string; path?: string }): Promise<WorktreeLane> {
     const lane: WorktreeLane = {
-      id: input.jobId, kind: 'job', repoPath: input.repoPath, repoName: 'fixture', path: input.repoPath,
+      id: input.jobId, kind: 'job', repoPath: input.repoPath, repoName: 'fixture', path: input.path ?? input.repoPath,
       branch: this.branch, sha: this.sha, jobId: input.jobId, roundId: null, status: 'active',
     };
     this.lanes.set(lane.id, lane);

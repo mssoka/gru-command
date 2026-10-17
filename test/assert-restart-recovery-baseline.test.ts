@@ -64,7 +64,7 @@ if (entry.endsWith('patch-vitest-rpc-timeout.mjs')) process.exit(0);
 if (entry.endsWith('vitest.mjs')) {
   const repo = process.env.GRU_BASELINE_FIXTURE_REPO;
   const mode = process.env.GRU_BASELINE_FIXTURE_MODE;
-  if (mode === 'head') execFileSync('git', ['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-q', '--allow-empty', '-m', 'moved'], { cwd: repo });
+  if (mode === 'head') execFileSync('git', ['-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-q', '--allow-empty', '-m', 'moved'], { cwd: repo });
   if (mode === 'dirty') writeFileSync(join(repo, 'stray.txt'), 'x\\n');
   const { testName, assertionLine } = JSON.parse(readFileSync(join(process.cwd(), '..', 'manifest.json'), 'utf8'));
   const message = 'AssertionError: expected [] to have a length of 1 but got +0\\n at ' + process.cwd() + '/test/pi-adapter.test.ts:' + assertionLine + ':24';
@@ -77,6 +77,10 @@ if (entry.endsWith('vitest.mjs')) {
 
 interface DriverRun { readonly exitCode: number | null; readonly manifest: { readonly classification: string; readonly error?: string } }
 
+/** Git in the disposable clone never starts background gc or maintenance,
+ * which could still write into `.git` while the clone is removed. */
+const NO_BACKGROUND_GIT = ['-c', 'gc.auto=0', '-c', 'maintenance.auto=false'];
+
 /** The real driver, run as its scope runs it, in a disposable clone of this checkout's HEAD. */
 async function driveBaseline(mode: 'none' | 'head' | 'dirty'): Promise<DriverRun> {
   const root = join(import.meta.dirname, '..');
@@ -84,8 +88,8 @@ async function driveBaseline(mode: 'none' | 'head' | 'dirty'): Promise<DriverRun
   try {
     const clone = join(dir, 'repo');
     const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
-    execFileSync('git', ['clone', '-q', '--shared', '--no-checkout', root, clone]);
-    execFileSync('git', ['checkout', '-q', '--detach', head], { cwd: clone });
+    execFileSync('git', [...NO_BACKGROUND_GIT, 'clone', '-q', '--shared', '--no-checkout', root, clone]);
+    execFileSync('git', [...NO_BACKGROUND_GIT, 'checkout', '-q', '--detach', head], { cwd: clone });
     symlinkSync(join(root, 'node_modules'), join(clone, 'node_modules'), 'dir');
     appendFileSync(join(clone, '.git', 'info', 'exclude'), '/node_modules\n');
     const preload = join(dir, 'probe-preload.mjs');
@@ -101,7 +105,7 @@ async function driveBaseline(mode: 'none' | 'head' | 'dirty'): Promise<DriverRun
     if (made.length !== 1) throw new Error(`the driver (${mode}) left ${String(made.length)} attempts, exit ${String(exitCode)}:\n${output}`);
     const attempt = made[0]!;
     return { exitCode, manifest: JSON.parse(readFileSync(join(attempts, attempt, 'manifest.json'), 'utf8')) as DriverRun['manifest'] };
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); }
 }
 
 describe('restart recovery baseline driver final authority (#363 S09-2-02)', () => {
