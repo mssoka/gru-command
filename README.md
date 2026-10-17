@@ -238,9 +238,9 @@ gru-service reset       # with the service stopped: remove GC's lanes, empty the
 
 `gru-service reset` is the clean fresh start. Stop the service first; reset
 lists what it will do and asks (or pass `--yes`). It removes every GC lane
-from each managed repository (`git worktree remove --force`, then
-`git worktree prune`) and deletes the data directory's contents except
-`config.toml` and the install's own files. `gru/*` branches go only with
+from the repository that registers it (`git worktree remove --force
+--force`, then `git worktree prune`) and deletes the data directory's
+contents except `config.toml` and the install's own files. `gru/*` branches go only with
 `--delete-branches` and `refs/gru/*` only with `--delete-refs`; your own
 branches, worktrees and files are never touched
 ([docs/WORKTREES.md](docs/WORKTREES.md#7-expiry-moved-repositories-and-reset-427)).

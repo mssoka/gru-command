@@ -24,25 +24,32 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * (kind {@link REPO_MISMATCH_KIND}): discarding the lane loses whatever it
  * holds, so it is the owner's call (owner ruling 2026-10-16). Accept deletes
  * the lane folder and marks the lane swept, unless the lane reaches its
- * repository again by then. Decline keeps the lane; the card is not posted
- * again while the name resolves to that repository. A card whose lane was
- * reconnected or swept before anyone answered is withdrawn.
+ * repository again by then; while the lane is paused over live processes,
+ * has a process rooted in it, or is no real folder under the lanes root,
+ * nothing is deleted and the card stays open until a later reconcile can.
+ * Decline keeps the lane; the card is not posted again while the name
+ * resolves to that repository. A card whose lane was reconnected or swept
+ * before anyone answered is withdrawn; when the lane's name later resolves
+ * to that place again, a new card asks.
  */
 
 /** The owner's Accept/Decline on discarding a lane whose repository is not there. */
 export const REPO_MISMATCH_KIND = 'worktree.repo-mismatch';
 
 /** A lane's card for one place its repository's name resolves to: a later
- * place gets a new card, the same place never a second one. */
-export function repoMismatchCardId(laneId: string, candidate: string): string {
-  return `worktree-repo-mismatch:${laneId}:${createHash('sha256').update(candidate).digest('hex').slice(0, 12)}`;
+ * place gets a new card. The same place gets a next generation's card only
+ * after its earlier card was closed without a Decline (withdrawn unanswered,
+ * or accepted with nothing discarded); a Decline is never asked again. */
+export function repoMismatchCardId(laneId: string, candidate: string, generation = 1): string {
+  const subject = generation === 1 ? candidate : `${candidate}\n${String(generation)}`;
+  return `worktree-repo-mismatch:${laneId}:${createHash('sha256').update(subject).digest('hex').slice(0, 12)}`;
 }
 
 const OWNER_PROVENANCE = { credential: 'internal', declaredActor: null } as const;
 
 export interface RepoMoveReconcilerOptions {
   readonly worktrees: Pick<WorktreeManager, 'checkMovedRepositories' | 'discardLane'>;
-  readonly ledger: Pick<LedgerApi, 'getWorktree' | 'listOpenNotificationsByKinds' | 'resolveOwnerDecision' | 'withdrawOwnerProposal' | 'appendCustomEvent' | 'latestEventByPayloadField'>;
+  readonly ledger: Pick<LedgerApi, 'getWorktree' | 'getNotification' | 'listOpenNotificationsByKinds' | 'resolveOwnerDecision' | 'withdrawOwnerProposal' | 'appendCustomEvent' | 'latestEventByPayloadField'>;
   readonly bus: EventBus;
   readonly notifications: Pick<NotificationCenter, 'post'>;
   readonly workspaceRoot: string;
@@ -57,6 +64,8 @@ export class RepoMoveReconciler {
   private unsubscribe: (() => void) | null = null;
   private following: Promise<void> | null = null;
   private followAgain = false;
+  /** Why each accepted card's discard is kept for now, logged once per change. */
+  private readonly keptNotes = new Map<string, string>();
 
   constructor(private readonly opts: RepoMoveReconcilerOptions) {
     this.log = opts.log ?? (() => {});
@@ -145,6 +154,16 @@ export class RepoMoveReconciler {
     }
     const reason = String((proposal.payload as { readonly reason?: unknown }).reason ?? 'its repository is not there');
     const outcome = await this.opts.worktrees.discardLane(laneId, reason);
+    if (typeof outcome === 'object') {
+      // Never over live processes, nor through a link: the card stays open
+      // and the next reconcile asks the lane again.
+      if (this.keptNotes.get(card.id) !== outcome.kept) {
+        this.keptNotes.set(card.id, outcome.kept);
+        this.log('warn', 'an accepted lane discard waits: nothing is deleted while this holds, and the next reconcile tries again', { notification: card.id, id: laneId, reason: outcome.kept });
+      }
+      return;
+    }
+    this.keptNotes.delete(card.id);
     this.close(card, outcome === 'discarded' ? `lane ${laneId} discarded`
       : outcome === 'reconnected' ? `nothing discarded: lane ${laneId} reaches its repository again`
       : `nothing discarded: lane ${laneId} is gone`);
@@ -152,9 +171,10 @@ export class RepoMoveReconciler {
 
   private propose(outcome: Extract<RepoMoveOutcome, { readonly status: 'mismatch' }>): void {
     const { lane, candidate, reason } = outcome;
-    const id = repoMismatchCardId(lane.id, candidate);
+    const id = this.cardFor(lane.id, candidate);
     // A card about an earlier place of the name asks a question that no longer exists.
     this.withdraw(lane.id, id, `${lane.repoName} now resolves to ${candidate}`);
+    if (id === null) return;
     if (this.opts.ledger.latestEventByPayloadField('worktree.repo-mismatch-proposed', 'notification_id', id) === null) {
       this.opts.ledger.appendCustomEvent({
         kind: 'worktree.repo-mismatch-proposed',
@@ -177,6 +197,19 @@ export class RepoMoveReconciler {
       ].join('\n'),
       decision: repoMismatchDecision(lane.id, lane.path, lane.repoName, candidate),
     });
+  }
+
+  /** The card to post for a lane and the place its name resolves to: the
+   * first generation's, or the next one's once an earlier card for that
+   * place was closed without a Decline (a withdrawn row is never re-posted);
+   * null when the owner declined it for that place. */
+  private cardFor(laneId: string, candidate: string): string | null {
+    for (let generation = 1; ; generation += 1) {
+      const id = repoMismatchCardId(laneId, candidate, generation);
+      const card = this.opts.ledger.getNotification(id);
+      if (card === null || card.resolvedAt === null) return id;
+      if (card.decidedOption === 'decline') return null;
+    }
   }
 
   /** Withdraw the undecided cards of a lane (all but `keep`). */

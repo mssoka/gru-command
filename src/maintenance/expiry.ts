@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, readdirSync, realpathSync } from 'node:fs';
-import { isAbsolute, join, relative } from 'node:path';
+import { isAbsolute, join, relative, sep } from 'node:path';
 import type { EventBus } from '../events/bus.js';
 import { repositoryGitEnv } from '../git-env.js';
 import { NotificationDecisionRefusal, type EventRecord, type LedgerApi, type NotificationRecord, type WorktreeRecord } from '../ledger/api.js';
@@ -19,13 +19,18 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * loses nothing, and proposed to the owner when it would.
  *
  * - **Review artifacts.** Once a job has been terminal (merged, done or
- *   binned) for {@link REVIEW_EXPIRY_MS}, its `reviews/<round>` folders and
- *   its `reviews/fallback-gate/<job>-*` folders are deleted automatically:
- *   the ledger keeps the verdicts and findings, the PR keeps the published
- *   review, and nothing reviews a terminal job again. Each pass records
- *   `reviews.expired { job_id, rounds, fallback_gates, bytes }` for each job
- *   it deleted something of. A folder whose delete fails stays, and the next
- *   reconcile tries it again.
+ *   binned) for {@link REVIEW_EXPIRY_MS}, its `reviews/<round>` folders are
+ *   emptied except {@link REVIEW_KEPT_FILES} and its
+ *   `reviews/fallback-gate/<job>-*` folders are deleted, automatically: the
+ *   ledger keeps the verdicts and findings, the PR keeps the published
+ *   review, and nothing reviews a terminal job again. Each round's
+ *   `consolidated.json` stays because readers outlive the job: the decision
+ *   backtest's same-blocker corpus (`gru-decisions extract-cases --surface
+ *   same_blocker`, src/decisions/cases/same-blocker-extract.ts) and the
+ *   digest's blocker reader (src/dispatch/silas-driver.ts) read it. Each
+ *   pass records `reviews.expired { job_id, rounds, fallback_gates, bytes }`
+ *   for each job it deleted something of. A file whose delete fails stays,
+ *   and the next reconcile tries it again.
  * - **Saved work.** Preserve copies (`<preserve_root>/<lane>/<stamp>`) and
  *   snapshot refs (`refs/gru/preserved/<lane>/<stamp>`) hold minion work, so
  *   they are never deleted automatically (owner ruling 2026-10-16). Once a
@@ -34,8 +39,15 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  *   listing them, their sizes and how to restore each. The list is recorded
  *   first (`preserves.proposed`). Accept deletes exactly what it lists
  *   (`preserves.deleted`): a copy by its path, a ref only while it still
- *   names the listed commit. Decline keeps them (`preserves.declined`), and
- *   GC proposes again {@link PRESERVE_REPROPOSE_MS} later.
+ *   names the listed commit. Accept follows the list recorded before the
+ *   card, re-checked: a copy only while it is still that lane's folder under
+ *   the preserve root with its listed size, a ref only while it is that
+ *   lane's snapshot ref of this repository naming the listed commit;
+ *   anything else is kept and proposed again. A pass that cannot delete all
+ *   of it records what it did (`preserves.delete-incomplete`) and keeps the
+ *   card open; the pass that finishes records the sum. Decline keeps them
+ *   (`preserves.declined`), and GC proposes again
+ *   {@link PRESERVE_REPROPOSE_MS} later.
  *
  * Both run at start and every hour ({@link EXPIRY_RECONCILE_INTERVAL_MS}),
  * one pass at a time, with no migration: ledger events and notification
@@ -63,7 +75,13 @@ export const EXPIRY_EVENTS = {
   preservesProposed: 'preserves.proposed',
   preservesDeclined: 'preserves.declined',
   preservesDeleted: 'preserves.deleted',
+  preservesDeleteIncomplete: 'preserves.delete-incomplete',
 } as const;
+
+/** The files of an expired round folder that are kept: long-lived readers
+ * read them after the job ends (the decision backtest's same-blocker
+ * corpus, the digest's blocker reader). Kept only as regular files. */
+export const REVIEW_KEPT_FILES: readonly string[] = ['consolidated.json'];
 
 /** A review round id as `reviewArtifactDirectory` accepts it for a folder name. */
 const ROUND_FOLDER = /^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$/u;
@@ -104,8 +122,8 @@ interface Proposal extends ExpiredWork {
 
 export interface ExpiryServiceOptions {
   readonly ledger: Pick<LedgerApi,
-    'getJob' | 'getRound' | 'listJobEventsByKinds' | 'listWorktrees' | 'appendCustomEvent' | 'listOpenNotificationsByKinds' |
-    'resolveOwnerDecision' | 'latestEventByPayloadField' | 'listEventsAfter'>;
+    'getJob' | 'getRound' | 'listJobEventsByKinds' | 'listWorktrees' | 'getWorktree' | 'appendCustomEvent' | 'listOpenNotificationsByKinds' |
+    'resolveOwnerDecision' | 'listEventsAfter'>;
   readonly bus: EventBus;
   readonly notifications: Pick<NotificationCenter, 'post'>;
   /** `<data_dir>/reviews`: round folders and `fallback-gate/`. */
@@ -224,18 +242,27 @@ export class ExpiryService {
       const gates: string[] = [];
       const failed: { readonly folder: string; readonly error: string }[] = [];
       let bytes = 0;
-      const remove = async (folder: string, done: string[], name: string): Promise<void> => {
-        const size = await treeBytes(folder);
-        try {
-          await removeTree(folder);
-          done.push(name);
-          bytes += size;
-        } catch (error) {
-          failed.push({ folder, error: String(error) });
+      /** Delete a folder (a fallback gate's), or a round folder's entries
+       * but its kept files; `done` names it once nothing else is left. */
+      const remove = async (folder: string, done: string[], name: string, keepFiles: readonly string[]): Promise<void> => {
+        const entries = keepFiles.length === 0 ? null : expiredEntries(folder, keepFiles);
+        if (entries !== null && entries.length === 0) return; // expired before
+        const targets = entries === null || entries.length === readdirOrEmpty(folder).length ? [folder] : entries.map((entry) => join(folder, entry));
+        let complete = true;
+        for (const target of targets) {
+          const size = await treeBytes(target);
+          try {
+            await removeTree(target);
+            bytes += size;
+          } catch (error) {
+            complete = false;
+            failed.push({ folder: target, error: String(error) });
+          }
         }
+        if (complete) done.push(name);
       };
-      for (const name of found.rounds) await remove(join(this.opts.reviewsRoot, name), rounds, name);
-      for (const name of found.gates) await remove(join(this.opts.reviewsRoot, 'fallback-gate', name), gates, name);
+      for (const name of found.rounds) await remove(join(this.opts.reviewsRoot, name), rounds, name, REVIEW_KEPT_FILES);
+      for (const name of found.gates) await remove(join(this.opts.reviewsRoot, 'fallback-gate', name), gates, name, []);
       if (rounds.length + gates.length > 0) {
         this.opts.ledger.appendCustomEvent({ kind: EXPIRY_EVENTS.reviewsExpired, jobId, payload: { job_id: jobId, rounds, fallback_gates: gates, bytes } });
         this.log('info', 'review folders of a finished job expired', { job: jobId, rounds: rounds.length, fallback_gates: gates.length, bytes });
@@ -366,25 +393,51 @@ export class ExpiryService {
   }
 
   private async deleteListed(card: NotificationRecord, proposal: Proposal): Promise<void> {
+    const earlier = this.earlierPasses(card.id);
     const failed: { readonly item: string; readonly error: string }[] = [];
     const kept: { readonly item: string; readonly reason: string }[] = [];
+    const copies: string[] = [];
+    const refs: string[] = [];
     let bytes = 0;
+    /** A lane the card lists: released, of this repository when `repoPath` is given. */
+    const releasedLane = (id: string, repoPath: string | null): boolean => {
+      const lane = this.opts.ledger.getWorktree(id);
+      return lane !== null && lane.status === 'swept' && (repoPath === null || lane.repoPath === repoPath);
+    };
     for (const copy of proposal.copies) {
+      if (earlier.copies.has(copy.path)) continue;
+      const parts = relative(this.opts.preserveRoot, copy.path).split(sep);
+      if (!releasedLane(copy.lane, null) || parts.length !== 2 || parts[0] !== copy.lane || !inside(this.opts.preserveRoot, copy.path)) {
+        kept.push({ item: copy.path, reason: 'it is not a preserve copy of a released lane this card lists' });
+        continue;
+      }
       if (!existsSync(copy.path)) continue;
       if (!insideReally(this.opts.preserveRoot, copy.path)) {
         kept.push({ item: copy.path, reason: 'it is not a folder under the preserve root (a link, or reached through one)' });
         continue;
       }
+      // A copy a failed pass began deleting is finished, whatever is left.
+      if (!earlier.attempted.has(copy.path) && await treeBytes(copy.path) !== copy.bytes) {
+        kept.push({ item: copy.path, reason: 'it changed since the card listed it' });
+        continue;
+      }
       try {
         await removeTree(copy.path);
         bytes += copy.bytes;
+        copies.push(copy.path);
       } catch (error) {
         failed.push({ item: copy.path, error: String(error) });
       }
     }
     for (const ref of proposal.refs) {
+      if (earlier.refs.has(ref.ref)) continue;
+      const parts = ref.ref.startsWith(`${PRESERVED_REF_PREFIX}/`) ? ref.ref.slice(PRESERVED_REF_PREFIX.length + 1).split('/') : [];
       if (!existsSync(proposal.repoPath)) {
         kept.push({ item: ref.ref, reason: `the repository is no longer at ${proposal.repoPath}` });
+        continue;
+      }
+      if (!releasedLane(ref.lane, proposal.repoPath) || parts.length !== 2 || parts[0] !== preservedRefComponent(ref.lane) || parts[1] === '') {
+        kept.push({ item: ref.ref, reason: 'it is not a snapshot ref of a released lane of this repository' });
         continue;
       }
       const now = git(proposal.repoPath, ['rev-parse', '--verify', '--quiet', ref.ref]);
@@ -398,11 +451,23 @@ export class ExpiryService {
         continue;
       }
       const deleted = git(proposal.repoPath, ['update-ref', '-d', ref.ref, ref.sha]);
-      if (deleted.status === 0) bytes += ref.bytes ?? 0;
-      else failed.push({ item: ref.ref, error: deleted.stderr.trim() || `git update-ref exited ${String(deleted.status)}` });
+      if (deleted.status === 0) {
+        bytes += ref.bytes ?? 0;
+        refs.push(ref.ref);
+      } else {
+        failed.push({ item: ref.ref, error: deleted.stderr.trim() || `git update-ref exited ${String(deleted.status)}` });
+      }
     }
     if (failed.length > 0) {
-      this.log('warn', 'saved work the owner accepted to delete could not all be deleted; the next reconcile deletes what is left', { notification: card.id, failed });
+      // Recorded when it changed something or failed something new, so a
+      // card that keeps failing adds no record per pass.
+      if (copies.length + refs.length > 0 || failed.some((entry) => !earlier.attempted.has(entry.item))) {
+        this.opts.ledger.appendCustomEvent({
+          kind: EXPIRY_EVENTS.preservesDeleteIncomplete,
+          payload: { repo_path: proposal.repoPath, notification_id: card.id, copies, refs, bytes, failed: failed.map((entry) => entry.item) },
+        });
+      }
+      this.log('warn', 'saved work the owner accepted to delete could not all be deleted; the card stays open and the next reconcile deletes what is left', { notification: card.id, failed });
       return;
     }
     this.opts.ledger.appendCustomEvent({
@@ -410,17 +475,41 @@ export class ExpiryService {
       payload: {
         repo_path: proposal.repoPath,
         notification_id: card.id,
-        copies: proposal.copies.filter((copy) => !kept.some((entry) => entry.item === copy.path)).map((copy) => copy.path),
-        refs: proposal.refs.filter((ref) => !kept.some((entry) => entry.item === ref.ref)).map((ref) => ref.ref),
+        copies: [...earlier.copies, ...copies],
+        refs: [...earlier.refs, ...refs],
         kept,
-        bytes,
+        bytes: earlier.bytes + bytes,
       },
     });
     this.close(card, kept.length === 0 ? 'deleted everything the card listed' : `deleted what the card listed, except ${kept.map((entry) => `${entry.item} (${entry.reason})`).join('; ')}`);
   }
 
+  /** What earlier passes of an accepted card deleted, and began deleting,
+   * before one of them failed (`preserves.delete-incomplete`). */
+  private earlierPasses(notificationId: string): { readonly copies: ReadonlySet<string>; readonly refs: ReadonlySet<string>; readonly attempted: ReadonlySet<string>; readonly bytes: number } {
+    const copies = new Set<string>();
+    const refs = new Set<string>();
+    const attempted = new Set<string>();
+    let bytes = 0;
+    const strings = (value: unknown): string[] => (Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []);
+    for (let cursor = 0; ;) {
+      const page = this.opts.ledger.listEventsAfter(cursor, { kinds: [EXPIRY_EVENTS.preservesDeleteIncomplete], payload: { key: 'notification_id', equals: notificationId }, limit: 500 });
+      if (page.length === 0) return { copies, refs, attempted, bytes };
+      for (const event of page) {
+        cursor = event.seq;
+        const payload = (event.payload ?? {}) as { readonly copies?: unknown; readonly refs?: unknown; readonly failed?: unknown; readonly bytes?: unknown };
+        for (const path of strings(payload.copies)) copies.add(path);
+        for (const ref of strings(payload.refs)) refs.add(ref);
+        for (const item of strings(payload.failed)) attempted.add(item);
+        if (typeof payload.bytes === 'number' && Number.isFinite(payload.bytes)) bytes += payload.bytes;
+      }
+    }
+  }
+
+  /** The list recorded before the card was posted: the first
+   * `preserves.proposed` naming it (a later one is never what the owner saw). */
   private proposal(notificationId: string): Proposal | null {
-    const event = this.opts.ledger.latestEventByPayloadField(EXPIRY_EVENTS.preservesProposed, 'notification_id', notificationId);
+    const event = this.opts.ledger.listEventsAfter(0, { kinds: [EXPIRY_EVENTS.preservesProposed], payload: { key: 'notification_id', equals: notificationId }, order: 'asc', limit: 1 })[0] ?? null;
     const payload = (event?.payload ?? null) as Record<string, unknown> | null;
     if (payload === null || typeof payload['repo_path'] !== 'string' || !Array.isArray(payload['copies']) || !Array.isArray(payload['refs'])) return null;
     return {
@@ -522,10 +611,34 @@ function folders(dir: string): string[] {
   });
 }
 
-/** Whether `path` lies strictly inside `root`, by its spelling. */
+/** Whether `path` lies strictly inside `root`, by its spelling and path
+ * segment (`<root>/..x` lies inside, `<root>-2` does not). */
 function inside(root: string, path: string): boolean {
   const rel = relative(root, path);
-  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
+  return rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+}
+
+/** A folder's names, sorted; none when it cannot be read. */
+function readdirOrEmpty(dir: string): string[] {
+  try {
+    return readdirSync(dir).sort();
+  } catch {
+    return [];
+  }
+}
+
+/** The entries of an expired round folder to delete: all but the kept
+ * files, each kept only as a regular file (a link or folder of that name
+ * goes). */
+function expiredEntries(folder: string, keepFiles: readonly string[]): string[] {
+  return readdirOrEmpty(folder).filter((name) => {
+    if (!keepFiles.includes(name)) return true;
+    try {
+      return !lstatSync(join(folder, name)).isFile();
+    } catch {
+      return false;
+    }
+  });
 }
 
 /** Whether `path` is a real folder (not a link) lying inside `root` as the

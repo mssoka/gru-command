@@ -124,19 +124,26 @@ function assertIssued(receipt: Receipt, lane: WorktreeRecord, ledger: LedgerApi)
 }
 
 /** A lane's handoff re-bound to its repository's new place (#427 PR 2b):
- * `{ id, from, to }`, two ready receipts that differ only in `repo`,
- * `common` and `admin`. Recorded in the transaction that moves the lane's
- * registry `repo_path` (LedgerApi.moveWorktreeRepo), never on its own. */
+ * `{ id, from, to, move_seq }`, two ready receipts that differ only in
+ * `repo`, `common` and `admin`. Recorded only by LedgerApi.moveWorktreeRepo,
+ * as the event right after the lane's {@link REPO_MOVED_KIND} (`move_seq`),
+ * in the same transaction; never on its own. */
 export const HANDOFF_REBOUND_KIND = 'worktree.handoff-rebound';
+
+/** A lane's registry `repo_path` moved (#427 PR 2b): `{ id, from, to }`. */
+export const REPO_MOVED_KIND = 'worktree.repo-moved';
 
 /** The receipt fields a move changes: where the repository, its common
  * directory and the lane's administration live. */
 const REBOUND_FIELDS: ReadonlySet<string> = new Set(['repo', 'common', 'admin']);
 
 /** The binding a lane's handoff holds now: its one original completion,
- * with each rebinding applied in order (each must start from the binding
- * before it), and the binding the newest rebinding replaced (null when
- * there is none). An inconsistent chain is refused by name. */
+ * with each rebinding applied in order, and the binding the newest
+ * rebinding replaced (null when there is none). Each rebinding must start
+ * from the binding before it, change nothing but the repository's paths,
+ * and be paired with the lane's move: the event right before it, in its
+ * transaction, is the {@link REPO_MOVED_KIND} of the same lane its
+ * `move_seq` names. An inconsistent chain is refused by name. */
 function issuedBinding(original: Receipt, laneId: string, ledger: LedgerApi): { readonly binding: Receipt; readonly previous: Receipt | null } {
   let binding = original;
   let previous: Receipt | null = null;
@@ -147,10 +154,15 @@ function issuedBinding(original: Receipt, laneId: string, ledger: LedgerApi): { 
     for (const event of page) {
       if (event.kind !== HANDOFF_REBOUND_KIND || event.seq <= cursor) throw new Error('handoff rebinding inventory changed or is incomplete');
       cursor = event.seq;
-      const { from, to } = (event.payload ?? {}) as { readonly from?: unknown; readonly to?: unknown };
+      const { from, to, move_seq: moveSeq } = (event.payload ?? {}) as { readonly from?: unknown; readonly to?: unknown; readonly move_seq?: unknown };
       if (!isReceipt(from) || !isReceipt(to) || to.state !== 'ready' || JSON.stringify(from) !== JSON.stringify(binding) ||
         Object.keys(from).some((key) => !REBOUND_FIELDS.has(key) && JSON.stringify(from[key as keyof Receipt]) !== JSON.stringify(to[key as keyof Receipt]))) {
         throw new Error('handoff rebinding conflicts with the issued binding');
+      }
+      const move = moveSeq === event.seq - 1 ? ledger.getEvent(moveSeq) : null;
+      if (move?.kind !== REPO_MOVED_KIND || (move.payload as { readonly id?: unknown } | null)?.id !== laneId ||
+        move.jobId !== event.jobId || move.roundId !== event.roundId) {
+        throw new Error('handoff rebinding is not paired with a move of the lane\'s repository');
       }
       previous = binding;
       binding = to;
@@ -200,6 +212,22 @@ export function prepareLaneRebind(lane: WorktreeRecord, repoPath: string, ledger
   const disk = JSON.stringify(parseReceipt(readWorktreeMetadata(join(admin, receiptName))));
   if (disk !== JSON.stringify(from) && disk !== JSON.stringify(to)) throw new Error(`lane administration ${admin} holds a handoff receipt GC did not issue: it is not re-bound`);
   return { id: lane.id, from, to, admin };
+}
+
+/** Whether a lane whose git link works holds a handoff receipt naming other
+ * repository paths than the ones the link reaches as the filesystem
+ * resolves them (#427 PR 2b): the repository moved with a link left at its
+ * old place, or its own git directory moved. Read from the files, before
+ * any ledger fact; a lane with no readable receipt is not stale here
+ * (custody speaks for it). */
+export function laneReceiptStale(lane: WorktreeRecord): boolean {
+  try {
+    const admin = adminFor(lane.path);
+    const receipt = parseReceipt(readWorktreeMetadata(join(admin, receiptName)));
+    return receipt.admin !== admin || receipt.common !== laneCommonDirectory(admin) || receipt.repo !== resolvedPath('repository', lane.repoPath);
+  } catch {
+    return false;
+  }
 }
 
 /** Publish a recorded rebinding's receipt in the lane's administration:

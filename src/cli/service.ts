@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig, type GruCommandConfig } from '../config.js';
 import { defaultListenerProbe, type ListenerOwner, type ListenerProbe } from '../listener-probe.js';
 import type { RollState } from '../roll/state.js';
-import { runResetCli } from './reset.js';
+import { runResetCli, type ResetCliDeps } from './reset.js';
 
 /**
  * `gru-service` — the operator CLI for the service's own lifecycle.
@@ -158,9 +158,14 @@ function phaseLine(state: RollState): string {
 
 export async function runServiceCli(
   argv: readonly string[],
-  overrides: Partial<ServiceCliDeps> = {},
+  overrides: Partial<ServiceCliDeps> & { readonly reset?: Partial<ResetCliDeps> } = {},
 ): Promise<number> {
-  if (argv[0] === 'reset') return runResetCli(argv.slice(1));
+  if (argv[0] === 'reset') {
+    // The seams both commands share pass through; `reset` holds reset's own.
+    const { loadConfig: load, fetchFn, stdout, stderr, probeListeners, reset } = overrides;
+    const shared = Object.fromEntries(Object.entries({ loadConfig: load, fetchFn, stdout, stderr, probeListeners }).filter(([, value]) => value !== undefined));
+    return runResetCli(argv.slice(1), { ...shared, ...reset });
+  }
   const deps: ServiceCliDeps = { ...defaultDeps(), ...overrides };
   const parsed = parseServiceArgs(argv);
   if (!parsed.ok) {
