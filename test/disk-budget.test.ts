@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type Server as HttpServer } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { createServer as createNetServer, type AddressInfo, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -23,6 +23,7 @@ import {
   DISK_FOLLOW_UP_MS,
   DISK_FULL_KIND,
   DISK_RECLAIM_KIND,
+  DISK_RELEASE_REMOTE_TIMEOUT_MS,
   DISK_RECONCILE_INTERVAL_MS,
   DISK_VIEW_MAX_AGE_MS,
   diskFloorFor,
@@ -53,10 +54,13 @@ import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
  *   jobs, deletes their review folders, then slims idle lanes, oldest idle
  *   first, until at most 90% of the budget, recording each step (a skip
  *   once per kind of reason), at most three releases a pass, one process
- *   listing a pass, and a refused release not asked again until news;
+ *   listing a pass, a refused release not asked again until news, a remote
+ *   that hangs refusing the release without stalling the event loop, and no
+ *   review folder of a job a Perkins review owns deleted;
  * - in proposed mode one FOR YOU card lists the steps and nothing is done
- *   until Accept, which runs exactly the listed steps; Decline holds from
- *   the usage when the owner declined;
+ *   until Accept, which runs exactly the listed steps (a slim only the
+ *   entries listed); Decline holds from the usage when the owner declined; a
+ *   card posted for the budget alone never hides a floor wait;
  * - below the floor (of the lanes disk or data_dir's) a new job lane waits
  *   with an honest queue note, GC frees space at once without waiting for a
  *   walk, and lanes are admitted one at a time once the floor is met; a
@@ -254,11 +258,14 @@ interface ServiceOptions {
   readonly verificationBusy?: (jobId: string) => boolean;
   /** The floor's poll and settle timers are captured, not real. */
   readonly fakeFloorTimers?: boolean;
+  /** Whether a Perkins review owns the job (main.ts: the review wave's). */
+  readonly reviewActive?: (jobId: string) => boolean;
 }
 
 interface Service {
   readonly disk: DiskService;
   readonly floor: DiskFloorGate;
+  readonly expiry: ExpiryService;
   readonly timers: { reconcile?: () => void; readonly timeouts: Timer[]; readonly floorTimeouts: Timer[] };
 }
 
@@ -283,7 +290,7 @@ function service(h: Harness, opts: ServiceOptions): Service {
     pollMs: 60_000,
     ...(opts.fakeFloorTimers === true ? captured(timers.floorTimeouts) : {}),
   });
-  const expiry = new ExpiryService({ ledger: h.ledger, bus: h.bus, notifications: h.notifications, reviewsRoot: join(h.dataDir, 'reviews'), preserveRoot: h.preserveRoot });
+  const expiry = new ExpiryService({ ledger: h.ledger, bus: h.bus, notifications: h.notifications, reviewsRoot: join(h.dataDir, 'reviews'), preserveRoot: h.preserveRoot, reviewActive: opts.reviewActive ?? (() => false) });
   const disk = diskServiceFor(config, {
     ledger: h.ledger,
     bus: h.bus,
@@ -295,6 +302,7 @@ function service(h: Harness, opts: ServiceOptions): Service {
         return expiry.expirableReviews(listing);
       },
       expireJobReviews: (listed, expiring) => expiry.expireJobReviews(listed, expiring),
+      reviewsInUse: (jobId) => expiry.reviewsInUse(jobId),
     },
     floor,
     workerTurns: opts.workerTurns ?? (() => ({ held: 0, queued: 0 })),
@@ -315,7 +323,7 @@ function service(h: Harness, opts: ServiceOptions): Service {
     ...captured(timers.timeouts),
   });
   cleanups.push(() => disk.stop());
-  return { disk, floor, timers };
+  return { disk, floor, expiry, timers };
 }
 
 function git(cwd: string, args: readonly string[]): string {
@@ -780,6 +788,92 @@ describe('disk budget, automatic (#427 PR 3)', () => {
     expect(h.releases).toBe(2);
   });
 
+  it('a remote that does not answer never stalls GC: the budget\'s release asks origin off the event loop and refuses once the bound passes, while timers keep firing; the lane is untouched', async () => {
+    const h = harness();
+    const path = await laneOf(h, 'job-done', 'done');
+    // origin accepts the connection and never answers (a blackholed network).
+    const sockets = new Set<Socket>();
+    const remote = createNetServer((socket) => {
+      sockets.add(socket);
+      socket.on('error', () => {});
+    });
+    await new Promise<void>((resolveListen) => remote.listen(0, '127.0.0.1', resolveListen));
+    cleanups.push(() => new Promise<void>((resolveClose) => {
+      for (const socket of sockets) socket.destroy();
+      remote.close(() => resolveClose());
+    }));
+    git(h.repo.path, ['remote', 'add', 'origin', `git://127.0.0.1:${String((remote.address() as AddressInfo).port)}/${REPO}.git`]);
+    h.fixed.set(join(h.dataDir, 'ledger'), 40 * GIB);
+    const { disk } = service(h, { budgetGb: 30, floorGb: 0 });
+    let last = Date.now();
+    let longest = 0;
+    const ticker = setInterval(() => {
+      const now = Date.now();
+      longest = Math.max(longest, now - last);
+      last = now;
+    }, 20);
+    cleanups.push(() => clearInterval(ticker));
+
+    const started = Date.now();
+    await disk.check('reconcile');
+    const took = Date.now() - started;
+    clearInterval(ticker);
+
+    const [release] = steps(h).filter((step) => step.step === 'release');
+    expect(release).toMatchObject({ lane: 'job-done', outcome: 'skipped' });
+    expect(String(release!['reason'])).toMatch(new RegExp(`^the release refused: sweep refused: origin did not answer git ls-remote --symref origin HEAD within ${String(DISK_RELEASE_REMOTE_TIMEOUT_MS)} ms, so fresh required containment cannot be proven for `, 'u'));
+    expect(sockets.size).toBeGreaterThan(0);
+    expect(took).toBeGreaterThanOrEqual(DISK_RELEASE_REMOTE_TIMEOUT_MS - 50);
+    // The event loop stayed free while origin hung: a 20 ms timer never
+    // waited anywhere near the bound.
+    expect(longest).toBeLessThan(DISK_RELEASE_REMOTE_TIMEOUT_MS / 2);
+    expect(existsSync(join(path, 'node_modules'))).toBe(true);
+    expect(h.ledger.getWorktree('job-done')?.status).toBe('active');
+    expect(existsSync(join(h.preserveRoot, 'job-done'))).toBe(false);
+  });
+
+  it('never expires the review folders of a job a Perkins review owns: a fallback gate running for a merged job keeps its folder, unlisted by the budget and skipped by an accepted card, until the review ends', async () => {
+    const h = harness();
+    h.ledger.addJob({ id: 'job-merged', repo: REPO, title: 'job job-merged' });
+    h.ledger.setJobStatus('job-merged', 'working');
+    h.ledger.setJobStatus('job-merged', 'in-review');
+    h.ledger.setJobStatus('job-merged', 'merged');
+    const gate = join(h.dataDir, 'reviews', 'fallback-gate', 'job-merged-1700000000000-abc123');
+    mkdirSync(gate, { recursive: true });
+    writeFileSync(join(gate, 'review-1.json'), '{}\n');
+    h.fixed.set(join(h.dataDir, 'ledger'), 40 * GIB);
+    let gateRunning = true;
+    const reviewActive = (jobId: string): boolean => gateRunning && jobId === 'job-merged';
+
+    const automatic = service(h, { budgetGb: 30, floorGb: 0, reviewActive });
+    await automatic.disk.check('reconcile');
+    expect(steps(h).filter((step) => step.step === 'expire-reviews')).toEqual([]);
+    expect(existsSync(join(gate, 'review-1.json'))).toBe(true);
+    await automatic.disk.stop();
+
+    // The card lists the folder while no review runs; the gate starts before the Accept.
+    gateRunning = false;
+    const proposed = service(h, { budgetGb: 30, floorGb: 0, mode: 'proposed', reviewActive });
+    proposed.disk.start();
+    await proposed.disk.idle();
+    const [card] = open(h, DISK_RECLAIM_KIND);
+    expect(card?.detail).toContain('1. Delete the 1 review folder of job job-merged (merged): job-merged-1700000000000-abc123: about 512.0 MB.');
+    gateRunning = true;
+    h.notifications.decide(card!.id, 'accept', 'owner');
+    await proposed.disk.idle();
+    expect(steps(h)).toEqual([{
+      step: 'expire-reviews', lane: undefined, job_id: 'job-merged', outcome: 'skipped', freed_bytes: 0,
+      reason: 'a Perkins review owns the job (a fallback gate running, a setup in progress, or a superseded round not proven stopped)',
+    }]);
+    expect(existsSync(join(gate, 'review-1.json'))).toBe(true);
+    expect(events(h, 'reviews.expired')).toEqual([]);
+
+    // Once the review ends, expiry deletes the folder.
+    gateRunning = false;
+    expect((await proposed.expiry.expireReviews({ olderThanMs: 0 })).map((done) => [done.jobId, done.fallbackGates])).toEqual([['job-merged', [basename(gate)]]]);
+    expect(existsSync(gate)).toBe(false);
+  });
+
   it('runs at most three releases a pass (each makes synchronous git calls) and lists processes once a pass; the rest follow soon, a refusing lane is not asked again until an hour passes, and only then is nothing left to free', async () => {
     const h = harness();
     for (const id of ['job-a', 'job-b', 'job-c', 'job-d', 'job-r']) h.laneModules.set(await laneOf(h, id, 'done'), 0);
@@ -1060,6 +1154,36 @@ describe('disk budget, proposed (#427 PR 3)', () => {
     expect(card?.detail).not.toContain('job-restore');
   });
 
+  it('Accept slims only the reclaim entries its card listed: a .next built after the card was posted survives the Accept', async () => {
+    const h = harness();
+    const app = makeFixtureRepo('disk-app-next');
+    cleanups.push(() => app.cleanup());
+    app.commitFile('.gitignore', 'node_modules/\n.next/\n');
+    app.commitFile('.gru-command/worktree.toml', ['reclaim = ["node_modules", ".next"]', '', '[[setup]]', `command = "${SETUP}"`, ''].join('\n'));
+    const lane = await laneOf(h, 'job-next', 'delivered', Date.now() - 3 * HOUR, app);
+    h.fixed.set(join(h.dataDir, 'ledger'), 40 * GIB);
+    const { disk } = service(h, { budgetGb: 30, floorGb: 0, mode: 'proposed' });
+    disk.start();
+    await disk.idle();
+    const [card] = open(h, DISK_RECLAIM_KIND);
+    expect(card?.detail).toContain('1. Slim lane job-next (node_modules) (job job-next, delivered,');
+    const listed = payloadOf(events(h, DISK_EVENTS.proposed)[0])['steps'] as { step: string; entries: unknown }[];
+    expect(listed.map(({ step, entries }) => [step, entries])).toEqual([['slim', ['node_modules']]]);
+
+    // A build makes .next after the card is posted, before the Accept.
+    mkdirSync(join(lane, '.next', 'cache'), { recursive: true });
+    writeFileSync(join(lane, '.next', 'cache', 'build.bin'), 'built\n');
+    h.notifications.decide(card!.id, 'accept', 'owner');
+    await disk.idle();
+
+    expect(steps(h).map(({ step, lane: id, outcome }) => [step, id, outcome])).toEqual([['slim', 'job-next', 'done']]);
+    expect(existsSync(join(lane, 'node_modules'))).toBe(false);
+    expect(existsSync(join(lane, '.next', 'cache', 'build.bin'))).toBe(true);
+    const slimmed = payloadOf(events(h, 'worktree.slimmed')[0]);
+    expect((slimmed['entries'] as { path: string }[]).map((entry) => entry.path)).toEqual(['node_modules']);
+    expect(slimmed['skipped']).toEqual([{ path: '.next', reason: 'the list this slim runs from (the card the owner accepted) does not name it' }]);
+  });
+
   it('Decline changes nothing and holds from GC\'s usage when the owner declined, until it grows by 10% of the budget; a card nobody answered is withdrawn once the condition clears', async () => {
     const h = harness();
     const { done } = await overBudget(h, 26.5);
@@ -1244,6 +1368,47 @@ describe('disk floor (#427 PR 3)', () => {
     expect(created).toBe(true);
     expect(existsSync(outcome.worktree.path)).toBe(true);
     expect(floor.view()).toEqual([]);
+  });
+
+  it('a card posted for the budget alone never hides a floor wait: once the disk falls below the floor while it is open, Gru is told and the lane\'s note says the card waits for the owner; the answer closes that row and what it leaves is told afresh', async () => {
+    const h = harness();
+    await laneOf(h, 'job-old', 'done');
+    h.fixed.set(join(h.dataDir, 'ledger'), 40 * GIB);
+    let free = 100 * GIB;
+    h.free = () => free;
+    const { disk, floor } = service(h, { budgetGb: 30, floorGb: 10, mode: 'proposed' });
+    disk.start();
+    await disk.idle();
+    const [card] = open(h, DISK_RECLAIM_KIND);
+    expect(card?.detail).not.toContain('floor ([worktrees] min_free_disk_gb)');
+    expect(payloadOf(events(h, DISK_EVENTS.proposed)[0])['below_floor']).toBe(false);
+
+    free = 6 * GIB;
+    const dispatched = dispatcher(h, floor).dispatch({ jobId: 'job-new', repoPath: h.repo.path, title: 'a new heist', briefing: 'do the work' });
+    await until(() => floor.view().length === 1, 'the lane to wait at the floor');
+    await disk.idle();
+
+    expect(h.ledger.getJob('job-new')?.note).toBe(PROPOSED);
+    expect(floor.view()).toMatchObject([{ id: 'job-new', reason: PROPOSED }]);
+    const [row] = open(h, DISK_FULL_KIND);
+    expect(row?.title).toBe('Disk below the floor, and the open reclaim card does not cover it');
+    expect(row?.detail).toContain('The disk has 6.0 GB free, below the 10.0 GB floor ([worktrees] min_free_disk_gb); new job and writer-child lanes wait.');
+    expect(row?.detail).toContain('GC\'s open reclaim card was posted for the budget alone, before the disk fell below the floor');
+    expect(open(h, DISK_RECLAIM_KIND).map((still) => still.id)).toEqual([card!.id]);
+    expect(events(h, DISK_EVENTS.step)).toEqual([]);
+
+    h.notifications.decide(card!.id, 'decline', 'owner');
+    await disk.idle();
+    expect(h.ledger.getNotification(row!.id)?.resolvedBy).toBe('disk-reclaim-answered');
+    const [after] = open(h, DISK_FULL_KIND);
+    expect(after?.detail).toContain('The owner declined GC\'s reclaim card, and lanes wait at the floor meanwhile');
+    expect(h.ledger.getJob('job-new')?.note).toBe(NOTHING);
+
+    free = 100 * GIB;
+    floor.recheck();
+    const outcome = await dispatched;
+    await outcome.settled;
+    expect(existsSync(outcome.worktree.path)).toBe(true);
   });
 
   it('a lane waiting at the floor ends with the service\'s stop, and creates nothing', async () => {

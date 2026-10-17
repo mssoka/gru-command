@@ -30,7 +30,10 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  *   digest's blocker reader (src/dispatch/silas-driver.ts) read it. Each
  *   pass records `reviews.expired { job_id, rounds, fallback_gates, bytes }`
  *   for each job it deleted something of. A file whose delete fails stays,
- *   and the next reconcile tries it again.
+ *   and the next reconcile tries it again. Nothing of a job is deleted while
+ *   a Perkins review owns it (#427 PR 3: a fallback gate running for a
+ *   merged job, a setup in progress, a superseded round not proven stopped),
+ *   which may still write its folders.
  * - **Saved work.** Preserve copies (`<preserve_root>/<lane>/<stamp>`) and
  *   snapshot refs (`refs/gru/preserved/<lane>/<stamp>`) hold minion work, so
  *   they are never deleted automatically (owner ruling 2026-10-16). Once a
@@ -148,6 +151,11 @@ export interface ExpiryServiceOptions {
   readonly reviewsRoot: string;
   /** `[worktrees] preserve_root`. */
   readonly preserveRoot: string;
+  /** True while a Perkins review owns the job (main.ts: the review wave's
+   * `activeReview`): a fallback gate running, a setup in progress, or a
+   * superseded round whose stop is not proven. Its review folders are kept
+   * meanwhile (#427 PR 3). */
+  readonly reviewActive: (jobId: string) => boolean;
   /** Run at the start of every pass (main.ts: the moved-repository check). A
    * failure is logged. */
   readonly onReconcile?: () => Promise<void> | void;
@@ -301,12 +309,19 @@ export class ExpiryService {
    * the disk budget's step, or the card the owner accepted, listed), each
    * checked again first, without listing every review: the job is still
    * terminal for at least `olderThanMs` (default {@link REVIEW_EXPIRY_MS}),
-   * and each folder is still there and still that job's. One
+   * no Perkins review owns it ({@link reviewsInUse}, asked again before each
+   * folder), and each folder is still there and still that job's. One
    * `reviews.expired` records what was deleted; null when nothing was. */
   async expireJobReviews(listed: Pick<ExpirableReviews, 'jobId' | 'rounds' | 'fallbackGates'>, opts: { readonly olderThanMs?: number } = {}): Promise<ReviewsExpired | null> {
     const { jobId } = listed;
     const since = this.terminalSince(jobId);
     if (since === null || this.now() - since < (opts.olderThanMs ?? REVIEW_EXPIRY_MS)) return null;
+    const inUse = (): boolean => {
+      const why = this.reviewsInUse(jobId);
+      if (why !== null) this.log('info', 'review folders of a finished job are kept: a Perkins review owns the job', { job: jobId, why });
+      return why !== null;
+    };
+    if (inUse()) return null;
     const rounds: string[] = [];
     const gates: string[] = [];
     const failed: { readonly folder: string; readonly error: string }[] = [];
@@ -332,12 +347,12 @@ export class ExpiryService {
       if (complete) done.push(name);
     };
     for (const name of listed.rounds) {
-      if (this.stopped) break;
+      if (this.stopped || inUse()) break;
       if (name === 'fallback-gate' || !ROUND_FOLDER.test(name) || this.opts.ledger.getRound(name)?.jobId !== jobId) continue;
       await remove(join(this.opts.reviewsRoot, name), rounds, name, REVIEW_KEPT_FILES);
     }
     for (const name of listed.fallbackGates) {
-      if (this.stopped) break;
+      if (this.stopped || inUse()) break;
       if (FALLBACK_GATE_FOLDER.exec(name)?.[1] !== jobId) continue;
       await remove(join(this.opts.reviewsRoot, 'fallback-gate', name), gates, name, []);
     }
@@ -346,6 +361,14 @@ export class ExpiryService {
     this.opts.ledger.appendCustomEvent({ kind: EXPIRY_EVENTS.reviewsExpired, jobId, payload: { job_id: jobId, rounds, fallback_gates: gates, bytes } });
     this.log('info', 'review folders of a finished job expired', { job: jobId, rounds: rounds.length, fallback_gates: gates.length, bytes });
     return { jobId, rounds, fallbackGates: gates, bytes };
+  }
+
+  /** Why a finished job's review folders are not expired now, or null: a
+   * Perkins review owns the job ({@link ExpiryServiceOptions.reviewActive}). */
+  reviewsInUse(jobId: string): string | null {
+    return this.opts.reviewActive(jobId)
+      ? 'a Perkins review owns the job (a fallback gate running, a setup in progress, or a superseded round not proven stopped)'
+      : null;
   }
 
   /** When the job became terminal (its newest `job.status` to that status),

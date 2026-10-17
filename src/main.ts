@@ -1612,6 +1612,8 @@ async function main(): Promise<number> {
     notifications,
     reviewsRoot: join(config.dataDir, 'reviews'),
     preserveRoot: config.worktrees.preserveRoot,
+    // A job's review folders stay while a Perkins review owns it (#427 PR 3).
+    reviewActive: (jobId) => wave.activeReview(jobId) !== null,
     onReconcile: () => repoMoves.reconcile(),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });

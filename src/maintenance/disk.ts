@@ -44,17 +44,24 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  *   budget and the disks are at or above the floor: it releases the lanes
  *   of jobs that ended at least {@link RELEASE_MIN_TERMINAL_MS} ago and
  *   have settled (the existing release, which snapshots their work, and
- *   refuses rather than pause on a live process; at most
+ *   refuses rather than pause on a live process or wait on a remote that
+ *   does not answer within {@link DISK_RELEASE_REMOTE_TIMEOUT_MS}; at most
  *   {@link MAX_RELEASES_PER_PASS} a pass), deletes the review folders of
- *   finished jobs with no review round in flight (keeping what 2b's expiry
- *   keeps), then slims idle lanes, oldest idle first (2a's `slim()` with its
- *   checks). Each step is recorded (`disk.reclaim-step`; a skip once per
- *   kind of reason). The budget never stops or refuses a heist.
+ *   finished jobs no Perkins review owns (no round pending or live, no
+ *   fallback gate or setup running, no superseded round not proven stopped;
+ *   keeping what 2b's expiry keeps), then slims idle lanes, oldest idle
+ *   first (2a's `slim()` with its checks). Each step is recorded
+ *   (`disk.reclaim-step`; a skip once per kind of reason). The budget never
+ *   stops or refuses a heist.
  * - **`proposed` mode** does none of that: one typed FOR YOU card
  *   ({@link DISK_RECLAIM_KIND}) lists each step and the space it frees,
  *   recorded first (`disk.reclaim-proposed`). Accept runs exactly those
- *   steps; Decline holds until GC's usage grows by a further
- *   {@link DECLINE_REGROWTH} of the budget past its usage at the Decline.
+ *   steps (a slim deletes only the entries its step listed); Decline holds
+ *   until GC's usage grows by a further {@link DECLINE_REGROWTH} of the
+ *   budget past its usage at the Decline. A card posted for the budget
+ *   alone does not cover the floor: lanes that start to wait at the floor
+ *   while it is open are never held silently (Gru is told, and the queue
+ *   note says the card waits for the owner).
  * - **The floor** (`[worktrees] min_free_disk_gb`): a job or writer-child
  *   lane waits in the {@link DiskFloorGate} FIFO while a disk it watches
  *   (where lanes are created, and data_dir's) has less free space, and GC
@@ -95,6 +102,10 @@ export const BUDGET_LOW_WATER = 0.9;
 export const RELEASE_MIN_TERMINAL_MS = 10 * 60_000;
 /** Lane releases one pass runs at most: each makes synchronous git calls. */
 export const MAX_RELEASES_PER_PASS = 3;
+/** A release's calls to origin are bounded by this: its proof asks origin
+ * off the event loop and refuses when origin does not answer in time, so a
+ * remote that hangs never stalls GC. */
+export const DISK_RELEASE_REMOTE_TIMEOUT_MS = 5_000;
 /** A lane whose release refused is asked again once its job has news, or this long after. */
 export const RELEASE_RETRY_MS = 60 * 60_000;
 /** The owner's Accept/Decline on freeing space (`reclaim_mode = "proposed"`). */
@@ -766,11 +777,12 @@ export interface DiskPaths {
 
 /** One lossless step, as a plan or a card lists it. `bytes`: what it is
  * expected to free (null when not estimated). An expire-reviews step names
- * exactly the folders it deletes. */
+ * exactly the folders it deletes; a card's slim step the reclaim entries it
+ * deletes (`entries`; null in automatic mode: whatever `slim()` finds). */
 export type ReclaimStep =
   | { readonly step: 'release'; readonly lane: string; readonly jobId: string; readonly bytes: number | null; readonly detail: string }
   | { readonly step: 'expire-reviews'; readonly jobId: string; readonly rounds: readonly string[]; readonly fallbackGates: readonly string[]; readonly bytes: number | null; readonly detail: string }
-  | { readonly step: 'slim'; readonly lane: string; readonly jobId: string; readonly bytes: number | null; readonly detail: string };
+  | { readonly step: 'slim'; readonly lane: string; readonly jobId: string; readonly entries: readonly string[] | null; readonly bytes: number | null; readonly detail: string };
 
 /** What a step did. */
 export interface StepOutcome {
@@ -788,7 +800,7 @@ export interface DiskServiceOptions {
   readonly bus: EventBus;
   readonly notifications: Pick<NotificationCenter, 'post'>;
   readonly worktrees: Pick<WorktreeManager, 'listWorktrees' | 'isSlim' | 'release' | 'slim' | 'slimRecordRefusal'>;
-  readonly expiry: Pick<ExpiryService, 'expirableReviews' | 'expireJobReviews'>;
+  readonly expiry: Pick<ExpiryService, 'expirableReviews' | 'expireJobReviews' | 'reviewsInUse'>;
   /** The floor queue; the service frees space when a lane starts to wait. */
   readonly floor: DiskFloorGate;
   /** The job's minion turns at the pacing gate. */
@@ -832,8 +844,9 @@ interface PassContext {
   deferred: number;
 }
 
-/** Why a row says nothing is left to free. */
-type NothingCause = 'exhausted' | 'accepted' | 'declined';
+/** Why a row says nothing is left to free (or, `proposed-open`, that the
+ * open card does not cover the floor lanes wait at). */
+type NothingCause = 'exhausted' | 'accepted' | 'declined' | 'proposed-open';
 
 /** A skip's reason with its volatile details (pids, counts, sizes) left
  * out: a skip is recorded again only when this changes. */
@@ -1381,15 +1394,16 @@ export class DiskService {
       const jobId = lane.jobId!;
       const since = idleSince === null ? 'no recorded activity' : `idle since ${new Date(idleSince).toISOString()}`;
       let bytes: number | null = null;
-      let entries = '';
+      let entries: readonly string[] | null = null;
       if (opts.estimate) {
         const estimate = await this.slimEstimate(lane);
         if (estimate === null || (await this.whyProcesses(lane, ctx)) !== null) continue;
         bytes = estimate.bytes;
-        entries = ` (${estimate.entries.join(', ')})`;
+        entries = estimate.entries;
         estimated += bytes;
       }
-      steps.push({ step: 'slim', lane: lane.id, jobId, bytes, detail: `Slim lane ${lane.id}${entries} (job ${jobId}, ${this.jobStatus(jobId)}, ${since})` });
+      const listed = entries === null ? '' : ` (${entries.join(', ')})`;
+      steps.push({ step: 'slim', lane: lane.id, jobId, entries, bytes, detail: `Slim lane ${lane.id}${listed} (job ${jobId}, ${this.jobStatus(jobId)}, ${since})` });
     }
     return steps;
   }
@@ -1487,12 +1501,13 @@ export class DiskService {
         if (this.stopped) return skip('the service is stopping');
         ctx.releases += 1;
         // Unattended, as the autopilot's release: fresh containment proven
-        // first, the lane's work snapshotted before its removal, and a
+        // first (off the event loop: origin not answering within the bound
+        // refuses it), the lane's work snapshotted before its removal, and a
         // process that appeared since the listing refuses it (no pause, no
         // card, nothing killed).
         let result: Awaited<ReturnType<WorktreeManager['release']>>;
         try {
-          result = await this.opts.worktrees.release({ worktreeId: lane.id, requireReleaseProofs: true, onLiveProcess: 'refuse' });
+          result = await this.opts.worktrees.release({ worktreeId: lane.id, requireReleaseProofs: true, onLiveProcess: 'refuse', remoteTimeoutMs: DISK_RELEASE_REMOTE_TIMEOUT_MS });
         } catch (error) {
           this.rememberRefusal(lane);
           return skip(`the release refused: ${oneLine(error)}`);
@@ -1530,7 +1545,8 @@ export class DiskService {
       if (lane === null || lane.status !== 'active') return skip('the lane is gone or not active');
       const before = await this.laneBytes(lane);
       if (this.stopped) return skip('the service is stopping');
-      const result = await this.opts.worktrees.slim({ worktreeId: lane.id, idle: () => this.whyNotIdle(step.jobId), signal: this.stopping.signal });
+      // A card's step slims only the entries it listed (an entry built since is kept).
+      const result = await this.opts.worktrees.slim({ worktreeId: lane.id, idle: () => this.whyNotIdle(step.jobId), signal: this.stopping.signal, ...(step.entries === null ? {} : { only: step.entries }) });
       if (result.status === 'not-slimmed') {
         if (result.permanent) this.unslimmable.add(lane.id);
         return skip(result.reason);
@@ -1633,10 +1649,13 @@ export class DiskService {
   }
 
   /** Why a finished job's review folders are not deleted now, or null: a
-   * review round of it still pending or live (R2). */
+   * review round of it still pending or live (R2), or a Perkins review that
+   * owns the job (a fallback gate running, a setup in progress, a superseded
+   * round not proven stopped). */
   private whyReviewsBusy(jobId: string): string | null {
     const rounds = this.opts.ledger.listRounds(jobId).filter((round) => round.status === 'pending' || round.status === 'live');
-    return rounds.length === 0 ? null : `the job has ${String(rounds.length)} review round(s) pending or live`;
+    if (rounds.length > 0) return `the job has ${String(rounds.length)} review round(s) pending or live`;
+    return this.opts.expiry.reviewsInUse(jobId);
   }
 
   /** Processes rooted in the lane, by the pass's one listing (nothing is
@@ -1738,10 +1757,17 @@ export class DiskService {
 
   /** One card at a time; none within one interval of an Accept carried
    * out; none while a Decline holds (but Gru is told when lanes wait at the
-   * floor meanwhile). */
+   * floor meanwhile, and when they wait while the open card was posted for
+   * the budget alone). */
   private async propose(usage: DiskUsage | null, reads: readonly VolumeRead[], ctx: PassContext): Promise<void> {
-    if (this.opts.ledger.listOpenNotificationsByKinds([DISK_RECLAIM_KIND]).length > 0) {
+    const open = this.opts.ledger.listOpenNotificationsByKinds([DISK_RECLAIM_KIND]);
+    if (open.length > 0) {
       this.opts.floor.setReclaimState('proposed');
+      // A card posted before the disk fell below the floor says nothing of
+      // it: lanes waiting there are never held silently.
+      if (this.opts.floor.belowFloor(reads).length > 0 && this.opts.floor.view().length > 0 && !open.some((card) => this.coversFloor(card.id))) {
+        await this.nothingToFree([], 'proposed-open');
+      }
       return;
     }
     if (this.acceptedAt !== null && this.now() - this.acceptedAt < DISK_RECONCILE_INTERVAL_MS) return;
@@ -1765,6 +1791,7 @@ export class DiskService {
       budget_bytes: this.budgetBytes,
       free_bytes: reads.some((read) => read.space !== null) ? Math.min(...reads.flatMap((read) => (read.space === null ? [] : [read.space.freeBytes]))) : null,
       floor_bytes: this.floorBytes,
+      below_floor: this.opts.floor.belowFloor(reads).length > 0,
       steps,
     });
     this.opts.notifications.post(this.card(id, usage, reads, steps));
@@ -1808,6 +1835,9 @@ export class DiskService {
     for (const card of this.opts.ledger.listOpenNotificationsByKinds([DISK_RECLAIM_KIND])) {
       if (this.stopped) return accepted;
       if (card.decidedOption === null) continue;
+      // Gru's row posted while this card was open spoke of it waiting; what
+      // the answer leaves is told afresh.
+      for (const row of this.opts.ledger.listOpenNotificationsByKinds([DISK_FULL_KIND])) this.opts.ledger.resolveNotificationById(row.id, 'disk-reclaim-answered');
       const proposal = this.proposal(card.id);
       if (proposal === null) {
         this.closeCard(card, 'nothing done: GC has no record of what this card listed');
@@ -1837,10 +1867,21 @@ export class DiskService {
     const event = this.opts.ledger.latestEventByPayloadField(DISK_EVENTS.proposed, 'notification_id', notificationId);
     const payload = (event?.payload ?? null) as Record<string, unknown> | null;
     if (payload === null || !Array.isArray(payload['steps'])) return null;
-    const steps = (payload['steps'] as ReclaimStep[]).map((step) => (step.step === 'expire-reviews'
-      ? { ...step, rounds: Array.isArray(step.rounds) ? step.rounds : [], fallbackGates: Array.isArray(step.fallbackGates) ? step.fallbackGates : [] }
-      : step));
+    // What a recorded step does not list is not run: no review folder, no
+    // reclaim entry.
+    const steps = (payload['steps'] as ReclaimStep[]).map((step): ReclaimStep => {
+      if (step.step === 'expire-reviews') return { ...step, rounds: Array.isArray(step.rounds) ? step.rounds : [], fallbackGates: Array.isArray(step.fallbackGates) ? step.fallbackGates : [] };
+      if (step.step === 'slim') return { ...step, entries: Array.isArray(step.entries) ? step.entries : [] };
+      return step;
+    });
     return { usageBytes: typeof payload['usage_bytes'] === 'number' ? payload['usage_bytes'] : Number.NaN, steps };
+  }
+
+  /** Whether the card was posted while a disk was below the floor, so its
+   * steps were planned for the floor too. */
+  private coversFloor(notificationId: string): boolean {
+    const event = this.opts.ledger.latestEventByPayloadField(DISK_EVENTS.proposed, 'notification_id', notificationId);
+    return (event?.payload as { readonly below_floor?: unknown } | null | undefined)?.below_floor === true;
   }
 
   private closeCard(card: NotificationRecord, detail: string): void {
@@ -1912,9 +1953,10 @@ export class DiskService {
   // ------------------------------------------------------------------
 
   /** One action-required row for Gru, naming the cause with numbers; the
-   * floor queue's notes say Gru has been told. */
+   * floor queue's notes say Gru has been told (or, while the open card
+   * waits, that it waits for the owner). */
   private async nothingToFree(skipped: readonly StepOutcome[], cause: NothingCause): Promise<void> {
-    this.opts.floor.setReclaimState('nothing');
+    this.opts.floor.setReclaimState(cause === 'proposed-open' ? 'proposed' : 'nothing');
     if (this.opts.ledger.listOpenNotificationsByKinds([DISK_FULL_KIND]).length > 0) return;
     // Fresh numbers: a reclaim this pass dropped the cached walk.
     const usage = this.cachedUsage() ?? await this.measure().catch(() => null);
@@ -1945,7 +1987,9 @@ export class DiskService {
       kind: DISK_FULL_KIND,
       routing: 'action-required',
       severity: 'error',
-      title: below ? 'Disk below the floor, and nothing GC can free' : 'GC over its disk budget, and nothing it can free',
+      title: cause === 'proposed-open'
+        ? 'Disk below the floor, and the open reclaim card does not cover it'
+        : below ? 'Disk below the floor, and nothing GC can free' : 'GC over its disk budget, and nothing it can free',
       detail: lines.join('\n'),
     });
     this.log('warn', 'over the disk budget or below the floor with nothing to free; Gru is told', { usage_bytes: usage?.totalBytes ?? null, cause });
@@ -2011,6 +2055,7 @@ const NOTHING_CAUSE: Readonly<Record<NothingCause, string>> = {
   exhausted: 'Nothing GC can free losslessly remains: no lane of a finished, settled job it can release, no review folder of a finished job, and no idle lane it can slim (a lane in use, one with a process rooted in it, or one whose manifest declares no reclaim and setup is never slimmed).',
   accepted: 'The reclaim the owner accepted ran, and GC is still over its budget or the disk below the floor. GC proposes again after its next check if more can be freed.',
   declined: 'The owner declined GC\'s reclaim card, and lanes wait at the floor meanwhile: GC frees nothing until its usage grows by another tenth of the budget, or the owner frees space.',
+  'proposed-open': 'GC\'s open reclaim card was posted for the budget alone, before the disk fell below the floor, and lanes wait at the floor meanwhile: GC frees nothing until the owner answers it in FOR YOU (Accept runs exactly its steps, which may free enough), or frees space.',
 };
 
 /** Whether `inner` lies strictly inside `outer`. */
