@@ -305,6 +305,19 @@ morning_digest_gap_ms = 28800000
 # preserve_root = "~/.gru-command/worktree-preserves"
 # Budget per one-time bootstrap setup command.
 setup_timeout_ms = 120000
+# Disk (#427, docs/WORKTREES.md): the board and GET /api/disk show what GC
+# uses under data_dir, by category. Over disk_budget_gb (GB of 2^30 bytes),
+# GC frees space losslessly: it releases the lanes of finished jobs, deletes
+# their review folders, then slims idle lanes. The budget never stops a
+# heist. 0 disables it.
+disk_budget_gb = 30
+# With less than min_free_disk_gb free on the disk, new job and writer-child
+# lanes wait in a queue while GC frees space (review lanes never wait).
+# 0 disables the floor.
+min_free_disk_gb = 10
+# "automatic": GC frees space on its own. "proposed": GC posts one FOR YOU
+# card listing each step and the space it frees; Accept runs them.
+reclaim_mode = "automatic"
 
 [dispatch]
 # Bob consolidation knock; 0 (the default) disables it. The due-based dream
@@ -655,6 +668,44 @@ describes the whole flow.
 If origin cannot be reached, nothing happens: GC logs why and checks again at
 the next start. Answering yes to the wizard's "Onboard them now?" skips the
 cards for those repositories in any mode except `"off"`.
+
+### Disk: `disk_budget_gb`, `min_free_disk_gb` and `reclaim_mode`
+
+Three `[worktrees]` keys keep GC from filling the disk (#427).
+[WORKTREES.md](./WORKTREES.md#8-disk-view-budget-and-floor-427) describes the
+whole flow. GB here is 2^30 bytes, as `df -h` counts. Each GB value is a
+finite number from 0 to 1000000; anything else refuses to load, naming the
+key.
+
+- **`disk_budget_gb = 30`** (default). Say GC uses 34 GB under `data_dir`: three
+  lanes of merged jobs, five idle lanes and their review folders. At its next
+  check (every five minutes, and after each lane is created) GC releases the
+  merged jobs' lanes once they have settled (their work is saved first),
+  deletes those jobs' review folders, then slims idle lanes, oldest idle first.
+  It stops once it uses at most 27 GB (90% of the budget), and starts again
+  only over 30 GB. Each step is recorded. The budget never stops or refuses a
+  heist.
+- **`min_free_disk_gb = 10`** (default). Say the disk lanes are created on (or
+  `data_dir`'s) has 6 GB free. A new job lane, or a writer child's lane, waits
+  in a queue, and its note says "queued: 6.0 GB free is below the 10 GB floor
+  ([worktrees] min_free_disk_gb)" and what GC is doing about it ("GC is freeing
+  space", "the reclaim card is waiting for the owner's decision", or "nothing
+  more can be freed without losing work; Gru has been told"). GC frees space at
+  once, and once the disk has 10 GB free the lanes are created one at a time.
+  Review lanes never wait. A floor at or above the disk's size could never be
+  met: GC treats it as off and tells Gru.
+- **`reclaim_mode = "automatic"`** (default) frees the space on its own. With
+  **`"proposed"`**, GC posts one FOR YOU card listing each step and the space
+  it frees, and does nothing until you Accept. Decline changes nothing, and GC
+  asks again once its usage grows by another 10% of the budget past its usage
+  when you declined. Switching back to `"automatic"` withdraws an open card at
+  the next start.
+
+When GC is over the budget or under the floor and nothing it can free remains
+(every lane in use, say), Gru gets one row naming GC's usage by category, the
+largest lanes and how much of the disk is not GC's. The row closes itself once
+the condition clears. `0` turns the budget or the floor off; the board's disk
+row and `GET /api/disk` still show the numbers.
 
 ### Mailbox recovery cadence
 

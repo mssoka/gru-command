@@ -11,6 +11,7 @@ import type { DeployDriftView } from './deploy-drift.js';
 import type { RepoOverviewView } from '../repos/overview.js';
 import type { VerificationQueueView } from '../verify/scheduler.js';
 import type { PacingGateView } from '../runtime/pacing.js';
+import type { DiskBoardView } from '../maintenance/disk.js';
 import type { PipelineBoardView } from '../ledger/pipeline.js';
 import { ownerReadyPr, readBranchEvidence, type OwnerPrView } from './owner-actions.js';
 import {
@@ -305,6 +306,9 @@ export interface BoardSnapshot {
   readonly silas: SilasView;
   /** Verification scheduler queue (null until its API is wired). */
   readonly verify: VerificationQueueView | null;
+  /** GC's disk usage, free space, budget and floor (#427 PR 3; null when
+   * unwired — the board then shows no disk row). */
+  readonly disk: DiskBoardView | null;
   /** Provider pacing gate (limits, running, queued with reasons). Null when
    * the pacing feature is off — the pre-pacing snapshot shape. */
   readonly pacing: PacingGateView | null;
@@ -492,6 +496,8 @@ export interface BoardEngineOptions {
   readonly repoOverview?: () => RepoOverviewView | null;
   /** Board UX v4: verification queue view (late-bound scheduler). */
   readonly verifyQueue?: () => VerificationQueueView | null;
+  /** #427 PR 3: the disk row (late-bound disk service). */
+  readonly disk?: () => DiskBoardView | null;
   /** Provider pacing: gate view (late-bound; null when the feature is off). */
   readonly pacing?: () => PacingGateView | null;
   /** Durable pipeline queue projection (late-bound; null when unwired). */
@@ -533,6 +539,7 @@ export class BoardEngine {
     this.buildDrift = opts.buildDrift ?? (() => null);
     this.repoOverview = opts.repoOverview ?? (() => null);
     this.verifyQueue = opts.verifyQueue ?? (() => null);
+    this.disk = opts.disk ?? (() => null);
     this.pacing = opts.pacing ?? (() => null);
     this.pipeline = opts.pipeline ?? (() => null);
     this.selfHeal = opts.selfHeal ?? (() => null);
@@ -550,6 +557,7 @@ export class BoardEngine {
   private readonly buildDrift: () => DeployDriftView | null;
   private readonly repoOverview: () => RepoOverviewView | null;
   private readonly verifyQueue: () => VerificationQueueView | null;
+  private readonly disk: () => DiskBoardView | null;
   private readonly pacing: () => PacingGateView | null;
   private readonly pipeline: () => PipelineBoardView | null;
   private readonly selfHeal: () => SelfHealView | null;
@@ -864,6 +872,7 @@ export class BoardEngine {
       },
       silas: this.silasView(silasTurnOpen),
       verify: this.verifyQueue(),
+      disk: this.diskView(),
       pacing: this.pacing(),
       pipeline: this.pipeline(),
       selfHeal: this.selfHeal(),
@@ -871,6 +880,17 @@ export class BoardEngine {
       activeDecisionCount: this.ledger.countDecisions({ activeOnly: true }),
       ownerPrs: this.ownerPrs(repos),
     };
+  }
+
+  /** The disk row (#427 PR 3); a failing read is logged and shows no row,
+   * never a broken snapshot. */
+  private diskView(): DiskBoardView | null {
+    try {
+      return this.disk();
+    } catch (error) {
+      this.log('error', 'disk view read failed', { error: String(error) });
+      return null;
+    }
   }
 
   /** Decision memory projection (issue #218): bounded active decisions,

@@ -153,13 +153,14 @@ function openCards(h: Harness, kind: string): readonly NotificationRecord[] {
   return h.ledger.listOpenNotificationsByKinds([kind]);
 }
 
-function expiry(h: Harness, now: () => number): ExpiryService {
+function expiry(h: Harness, now: () => number, reviewActive: (jobId: string) => boolean = () => false): ExpiryService {
   const service = new ExpiryService({
     ledger: h.ledger,
     bus: h.bus,
     notifications: h.notifications,
     reviewsRoot: join(h.dataDir, 'reviews'),
     preserveRoot: h.preserveRoot,
+    reviewActive,
     now,
     log: (level, msg, fields) => { h.logs.push({ level, msg, ...(fields !== undefined ? { fields } : {}) }); },
     setInterval: ((_callback: () => void, ms: number) => {
@@ -260,6 +261,36 @@ describe('review artifacts expire 14 days after their job ends (#427 PR 2b)', ()
     expect(readdirSync(join(reviews, recentRound))).toEqual(['consolidated.json']);
     expect(events(h, EXPIRY_EVENTS.reviewsExpired).map((event) => event.jobId)).toEqual(['job-merged', 'job-recent']);
     expect(existsSync(join(reviews, openRound))).toBe(true);
+  });
+
+  it('keeps every folder of a job a Perkins review owns (a fallback gate running for a merged job) until the review ends (#427 PR 3)', async () => {
+    const h = harness();
+    const reviews = join(h.dataDir, 'reviews');
+    const t0 = Date.now();
+    dateAt(t0);
+    addJob(h, 'job-merged');
+    const round = h.ledger.addRound({ jobId: 'job-merged' }).id;
+    h.ledger.setJobStatus('job-merged', 'in-review');
+    h.ledger.setJobStatus('job-merged', 'merged');
+    vi.useRealTimers();
+    folder(join(reviews, round));
+    const gate = join(reviews, 'fallback-gate', 'job-merged-1700000000000-abc123');
+    folder(gate);
+    let gateRunning = true;
+    const reviewActive = (jobId: string): boolean => gateRunning && jobId === 'job-merged';
+
+    await expiry(h, () => t0 + 20 * DAY, reviewActive).reconcile();
+
+    expect(existsSync(join(gate, 'transcript.md'))).toBe(true);
+    expect(readdirSync(join(reviews, round)).sort()).toEqual(['consolidated.json', 'transcript.md']);
+    expect(events(h, EXPIRY_EVENTS.reviewsExpired)).toEqual([]);
+    expect(h.logs).toContainEqual(expect.objectContaining({ level: 'info', msg: 'review folders of a finished job are kept: a Perkins review owns the job', fields: expect.objectContaining({ job: 'job-merged' }) }));
+
+    gateRunning = false;
+    await expiry(h, () => t0 + 20 * DAY, reviewActive).reconcile();
+    expect(existsSync(gate)).toBe(false);
+    expect(readdirSync(join(reviews, round))).toEqual(['consolidated.json']);
+    expect(events(h, EXPIRY_EVENTS.reviewsExpired).map((event) => event.jobId)).toEqual(['job-merged']);
   });
 
   it.skipIf(typeof process.getuid === 'function' && process.getuid() === 0)('a delete that fails is retried at the next reconcile, and only what was deleted is recorded', async () => {
@@ -549,6 +580,7 @@ describe('saved work of jobs ended 30 days ago is proposed, never deleted on its
       notifications: h.notifications,
       reviewsRoot: reviews,
       preserveRoot: h.preserveRoot,
+      reviewActive: () => false,
       onReconcile: async () => { checks += 1; await repoMoves.reconcile(); },
       now: () => t0 + 40 * DAY,
       log,

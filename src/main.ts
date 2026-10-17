@@ -60,6 +60,7 @@ import { ChildWorkerService } from './dispatch/child-workers.js';
 import { createVerificationServer, type VerificationBudget } from './verify/server.js';
 import { laneLifecycleHooks, ReportLaneSlimmer, startLaneSlimmer } from './worktrees/slimming.js';
 import { ExpiryService, startExpiry } from './maintenance/expiry.js';
+import { createDiskServer, diskFloorFor, diskServiceFor, startDisk, type DiskBoardView } from './maintenance/disk.js';
 import { RepoMoveReconciler } from './maintenance/repo-moves.js';
 import type { VerificationQueueView } from './verify/scheduler.js';
 import { createService } from './server.js';
@@ -462,6 +463,9 @@ async function main(): Promise<number> {
   // Late-bound (the verification server lands below) — same pattern as
   // supervisionFor / decisionsStatus above.
   let verificationView: () => VerificationQueueView | null = () => null;
+  // The disk row (#427 PR 3): late-bound too — the disk service needs the
+  // worktree manager, expiry and the verification server below.
+  let diskBoardView: () => DiskBoardView | null = () => null;
   // Durable pipeline queue (owner approvals j-239/j-1064): late-bound too —
   // the mechanical consumer is constructed after the dispatcher it feeds.
   let pipelineView: () => import('./ledger/pipeline.js').PipelineBoardView | null = () => null;
@@ -525,6 +529,7 @@ async function main(): Promise<number> {
     buildDrift: () => deployDrift.view(),
     repoOverview: () => repoOverview.view(),
     verifyQueue: () => verificationView(),
+    disk: () => diskBoardView(),
     pipeline: () => pipelineView(),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
@@ -1140,6 +1145,11 @@ async function main(): Promise<number> {
     ledger,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+  // The disk floor (#427 PR 3): below [worktrees] min_free_disk_gb free on
+  // the disk lanes are created on (or data_dir's), a new job or
+  // writer-child lane waits in this FIFO (its note says why) while the disk
+  // service frees space.
+  const diskFloor = diskFloorFor(config, { ledger, log: (level, msg, fields) => logger.log(level, msg, fields) });
   // Tracked child workers (issue #161): GC-owned nested workers. Kids
   // ride the SAME spawner, resident budget and pacing gate as any other
   // minion turn; GC owns admission, parentage, lifecycle and results.
@@ -1156,6 +1166,7 @@ async function main(): Promise<number> {
     workerGate: pacing.gate,
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     stopSignal: serviceStop.signal,
+    diskFloor,
     reserveResident: (signal) => registry.reserveResident(signal),
     residentProbe: () => ({
       // The REAL budget eligibility (idle + its own reclaim predicate),
@@ -1184,6 +1195,8 @@ async function main(): Promise<number> {
     workerGate: pacing.gate,
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     stopSignal: serviceStop.signal,
+    diskFloor,
+    bus,
     parentTools: parentToolsFor,
     reviewSource: gitReviewSourcePreflight,
     ...(config.lessons.enabled ? { lessons: lessonReferences, lessonsCapture } : {}),
@@ -1599,9 +1612,27 @@ async function main(): Promise<number> {
     notifications,
     reviewsRoot: join(config.dataDir, 'reviews'),
     preserveRoot: config.worktrees.preserveRoot,
+    // A job's review folders stay while a Perkins review owns it (#427 PR 3).
+    reviewActive: (jobId) => wave.activeReview(jobId) !== null,
     onReconcile: () => repoMoves.reconcile(),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+  // The disk view, budget and floor (#427 PR 3): GC's usage by category;
+  // over the budget (or under the floor) GC frees space losslessly, or, with
+  // reclaim_mode = "proposed", asks the owner in FOR YOU.
+  const disk = diskServiceFor(config, {
+    ledger,
+    bus,
+    notifications,
+    worktrees: worktreeManager,
+    expiry,
+    floor: diskFloor,
+    workerTurns: (jobId) => pacing.gate.workerTurnsFor(jobId),
+    verificationBusy: (jobId) => verifyServer.jobHasRun(jobId),
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  diskBoardView = () => disk.boardView();
+  const diskServer = createDiskServer({ token: config.auth.token, service: disk, log: (level, msg, fields) => logger.log(level, msg, fields) });
   onboardingBudget = () => verifyServer.budget();
   state.verify = verifyServer;
   // The ONE attach flow's HTTP surface (SPEC ruling 19, this lane): the
@@ -1676,6 +1707,7 @@ async function main(): Promise<number> {
         lessonsServer.requestHook(req, res, path) ||
         vectorServer.requestHook(req, res, path) ||
         onboardingServer.requestHook(req, res, path) ||
+        diskServer.requestHook(req, res, path) ||
         rollServer.requestHook(req, res, path) ||
         attachmentsServer.requestHook(req, res, path) ||
         worktreeServer.requestHook(req, res, path) ||
@@ -1763,6 +1795,10 @@ async function main(): Promise<number> {
   state.expiry = expiry;
   state.repoMoves = repoMoves;
   startExpiry({ expiry, repoMoves }, (level, msg, fields) => logger.log(level, msg, fields));
+  // The disk budget and floor (#427 PR 3) run off the boot path and are
+  // never fatal.
+  state.disk = disk;
+  startDisk(disk, (level, msg, fields) => logger.log(level, msg, fields));
   if (silasSlot !== null) {
     // The driver starts after listen so its wake prompt carries the real
     // bound port (config port 0 = ephemeral); until then no sweeps run and

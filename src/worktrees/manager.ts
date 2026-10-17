@@ -278,11 +278,22 @@ async function processCwdsAsync(timeoutMs: number): Promise<Map<number, string> 
  * out), `onCwdError` is told and the argv matches still count, as the
  * synchronous enumerator's null cwds do: never silently. That enumerator,
  * which the sweep uses, is unchanged. `listCwds`: its tests' seam. */
-export async function psEnumeratorAsync(treePath: string, opts: {
+export async function psEnumeratorAsync(treePath: string, opts: ProcessListingOptions): Promise<readonly TreeProcess[]> {
+  return (await processListingAsync(opts))(treePath);
+}
+
+/** {@link psEnumeratorAsync}'s options. */
+export interface ProcessListingOptions {
   readonly timeoutMs?: number;
   readonly onCwdError: (error: unknown) => void;
   readonly listCwds?: (timeoutMs: number) => Promise<Map<number, string> | null>;
-}): Promise<readonly TreeProcess[]> {
+}
+
+/** One process listing (`ps` and the working directories, read once, off
+ * the event loop, as {@link psEnumeratorAsync} reads them) that answers for
+ * any number of trees (#427 PR 3: the disk budget lists once per pass, not
+ * once per lane). */
+export async function processListingAsync(opts: ProcessListingOptions): Promise<(treePath: string) => readonly TreeProcess[]> {
   const timeoutMs = opts.timeoutMs ?? 30_000;
   const [listed, cwds] = await Promise.allSettled([
     execFileBounded('ps', ['-axo', 'pid=,command='], timeoutMs),
@@ -290,7 +301,9 @@ export async function psEnumeratorAsync(treePath: string, opts: {
   ]);
   if (listed.status === 'rejected') throw listed.reason instanceof Error ? listed.reason : new Error(String(listed.reason));
   if (cwds.status === 'rejected') opts.onCwdError(cwds.reason);
-  return treeProcesses(treePath, listed.value, cwds.status === 'fulfilled' ? cwds.value : null);
+  const out = listed.value;
+  const cwdMap = cwds.status === 'fulfilled' ? cwds.value : null;
+  return (treePath) => treeProcesses(treePath, out, cwdMap);
 }
 
 export interface SweepPreservation {
@@ -336,6 +349,41 @@ export class LaneSnapshotError extends Error {
   constructor(readonly path: string, readonly detail: string) {
     super(`sweep refused: the snapshot of the uncommitted work in ${path} ${detail} — the tree is retained; resolve what git reported (or stop what still writes in the lane), then release again`);
     this.name = 'LaneSnapshotError';
+  }
+}
+
+/** A release that does not pause to ask (#427 PR 3: the disk budget's,
+ * which nobody answers) met processes rooted in the lane. Refused by name
+ * before anything is removed: the tree is retained, nothing is killed and
+ * no owner card is raised. */
+export class LaneLiveProcessError extends Error {
+  constructor(readonly path: string, readonly processes: readonly TreeProcess[]) {
+    super(`sweep refused: ${String(processes.length)} live process(es) rooted in ${path} (pids ${processes.map((proc) => proc.pid).join(', ')}), and this release does not pause to ask — the tree is retained and nothing is killed`);
+    this.name = 'LaneLiveProcessError';
+  }
+}
+
+/** A disk budget release (#427 PR 3) could not read the working
+ * directories of the processes it listed (`lsof` timed out or failed,
+ * `/proc` could not be read, or the platform has no such listing), and a
+ * listing by command line alone misses a process rooted in the lane only
+ * by its working directory. Refused by name before anything is removed:
+ * the tree is retained and nothing is killed. */
+export class LaneProcessListingError extends Error {
+  constructor(readonly path: string, readonly detail: string) {
+    super(`sweep refused: cannot prove no process works in ${path} — the processes' working directories could not be listed (${detail}), and a listing by command line alone is partial; the tree is retained and nothing is killed`);
+    this.name = 'LaneProcessListingError';
+  }
+}
+
+/** A disk budget release (#427 PR 3, which a timer drives) asked origin
+ * off the event loop, and origin did not answer within the manager's fetch
+ * budget. Refused by name before anything is touched: the tree is retained,
+ * and nothing waits on the remote. */
+export class LaneRemoteTimeoutError extends Error {
+  constructor(readonly path: string, readonly command: string, readonly timeoutMs: number) {
+    super(`sweep refused: origin did not answer git ${command} within ${String(timeoutMs)} ms, so fresh required containment cannot be proven for ${path} — the tree is retained; release again once origin answers`);
+    this.name = 'LaneRemoteTimeoutError';
   }
 }
 
@@ -463,6 +511,32 @@ export interface SweepRequest {
    * `worktree.submodule-work-discarded`, naming each submodule. The
    * autopilot never passes it. */
   readonly discardSubmoduleWork?: string;
+  /** #427 PR 3: what a live process rooted in the lane does to the release.
+   * `pause` (the default) records it and asks ({@link onSweepPaused});
+   * `refuse` throws {@link LaneLiveProcessError} instead, for a caller nobody
+   * answers (the disk budget): no pause, no card, and no process is reaped
+   * or killed, GC's own services included. */
+  readonly onLiveProcess?: 'pause' | 'refuse';
+  /** #427 PR 3: a release the disk budget starts (a timer drives it, and
+   * nobody waits on it) never blocks the event loop on the network or on a
+   * large tree:
+   * - a lane whose folder is already gone is reconciled without asking
+   *   origin anything;
+   * - otherwise it first proves fresh required containment (as
+   *   `requireReleaseProofs` does) off the event loop, each call to origin
+   *   bounded by the manager's fetch budget: origin not answering in time
+   *   refuses it by name ({@link LaneRemoteTimeoutError}) before anything is
+   *   touched, never a wait;
+   * - its process check lists off the event loop, and a listing that could
+   *   not read the processes' working directories refuses it
+   *   ({@link LaneProcessListingError}) rather than trust command lines
+   *   alone;
+   * - its removal runs off the event loop;
+   * - after the removal it never asks origin again: the lane's branch is
+   *   retained (lossless; `branch: 'retained-budget'` on `worktree.swept`
+   *   and `worktree.reconciled`) for a later release or the autopilot to
+   *   dispose of, and its `freshHead` is the one its proof resolved. */
+  readonly diskBudget?: boolean;
 }
 
 /** One release attempt's state across its steps (#427). */
@@ -477,6 +551,9 @@ interface SweepAttempt {
   readonly aborted: AbortedRelease | null;
   /** This attempt reuses the aborted release's preserve copy. */
   preserveReused: boolean;
+  /** A disk budget release ({@link SweepRequest.diskBudget}), with the head
+   * its proof resolved; null for every other release. */
+  readonly budget: { readonly freshHead: string } | null;
 }
 
 /** What `worktree.release-aborted` names (#427): a release that failed
@@ -558,7 +635,14 @@ export interface WorktreeManagerOptions {
    * slimmed again, and Gru hears about it once per lane
    * ({@link restoreIncompleteNotice}). */
   readonly onRestoreIncomplete?: (input: { readonly worktree: WorktreeRecord; readonly missing: readonly string[] }) => void;
+  /** The processes rooted in a tree (default {@link psEnumerator}). A disk
+   * budget release ({@link SweepRequest.diskBudget}) lists off the event
+   * loop ({@link psEnumeratorAsync}), unless this is given: then it answers
+   * that release too. */
   readonly enumerateProcesses?: ProcessEnumerator;
+  /** Seam: the processes' working directories a disk budget release's
+   * listing reads (default `/proc` on Linux, `lsof` on macOS). */
+  readonly listProcessCwds?: (timeoutMs: number) => Promise<Map<number, string> | null>;
   readonly log?: Log;
 }
 
@@ -757,6 +841,62 @@ interface ResolvedBase {
   readonly fallbackDetail: string | null;
 }
 
+/** The origin default branch as resolved ({@link WorktreeManager}'s
+ * `resolveDefaultBranch`). */
+interface DefaultBranch {
+  readonly branch: string | null;
+  readonly liveDetail: string | null;
+  readonly authoritativeAbsence: boolean;
+  /** True ONLY when the LIVE probe named the branch — a cache-guessed
+   * default is never verified freshness (Perkins r6 B1). */
+  readonly verified: boolean;
+}
+
+/** A fetched origin branch's tip, or why it could not be had. */
+type OriginTip = { ok: true; sha: string } | { ok: false; detail: string };
+
+/** One git call of a base resolution (#427 PR 3). The resolution is written
+ * once, as the calls it makes ({@link GitSteps}), and run on the event loop
+ * ({@link runGitSteps}, as every lane creation and release does) or off it
+ * ({@link runGitStepsAsync}, the proof of a release a timer drives). */
+interface GitStep {
+  readonly args: readonly string[];
+  readonly opts: Pick<SpawnGitOptions, 'timeoutMs' | 'noPrompt'>;
+}
+type GitOutcome = ReturnType<typeof spawnGit>;
+type GitSteps<T> = Generator<GitStep, T, GitOutcome>;
+
+/** Run the steps' git calls on the event loop, as {@link spawnGit} runs them. */
+function runGitSteps<T>(repoPath: string, steps: GitSteps<T>): T {
+  let step = steps.next();
+  while (step.done !== true) step = steps.next(spawnGit(repoPath, step.value.args, step.value.opts));
+  return step.value;
+}
+
+/** Run the steps' git calls off the event loop (#427 PR 3). A call that
+ * runs past its `timeoutMs` is ended and rejects with `timedOut`'s error:
+ * the caller refuses, it never waits on the remote. */
+async function runGitStepsAsync<T>(repoPath: string, steps: GitSteps<T>, timedOut: (command: string, timeoutMs: number) => Error): Promise<T> {
+  let step = steps.next();
+  while (step.done !== true) {
+    const { args, opts } = step.value;
+    const outcome = await spawnGitAsync(repoPath, args, opts);
+    if (outcome.timedOut) throw timedOut(args.join(' '), opts.timeoutMs ?? 0);
+    step = steps.next(outcome);
+  }
+  return step.value;
+}
+
+/** A git call that must succeed: its trimmed output, or a throw as
+ * {@link runGit} throws. */
+function* gitOk(repoPath: string, args: readonly string[]): GitSteps<string> {
+  const { status, stdout, stderr, error } = yield { args, opts: {} };
+  if (status !== 0) {
+    throw new Error(`git ${args.join(' ')} failed (exit ${status}) in ${repoPath}: ${stderr.trim() || error || stdout.trim()}`);
+  }
+  return stdout.trim();
+}
+
 /** True when a ref's SPELLING names an EXACT origin remote branch — the
  * origin prefix stripped, the remainder is a syntactically plausible
  * branch name. Origin-prefixed REVISION EXPRESSIONS (origin/main~1,
@@ -778,6 +918,11 @@ export class WorktreeManager {
   private readonly opts: WorktreeManagerOptions;
   private readonly log: Log;
   private readonly enumerate: ProcessEnumerator;
+  /** {@link enumerate} off the event loop, for a disk budget release (#427
+   * PR 3): a listing that could not read the processes' working directories
+   * rejects ({@link LaneProcessListingError}), never answers by command
+   * lines alone. */
+  private readonly enumerateAsync: (treePath: string) => Promise<readonly TreeProcess[]>;
   private readonly fetchTimeoutMs: number;
   /** Same-repo serialization (ruling 18e): one creation at a time. */
   private readonly repoLocks = new Map<string, Promise<unknown>>();
@@ -799,6 +944,20 @@ export class WorktreeManager {
     this.opts = opts;
     this.log = opts.log ?? (() => {});
     this.enumerate = opts.enumerateProcesses ?? psEnumerator;
+    const injected = opts.enumerateProcesses;
+    const listCwds = opts.listProcessCwds ?? processCwdsAsync;
+    this.enumerateAsync = injected !== undefined
+      ? async (treePath) => injected(treePath)
+      : (treePath) => psEnumeratorAsync(treePath, {
+        listCwds: async (timeoutMs) => {
+          const cwds = await listCwds(timeoutMs);
+          if (cwds === null) throw new Error(`${process.platform} has no listing of process working directories GC can read`);
+          return cwds;
+        },
+        onCwdError: (error) => {
+          throw new LaneProcessListingError(treePath, oneLineErrorText(error instanceof Error ? error.message : error, 400));
+        },
+      });
     this.fetchTimeoutMs = opts.fetchTimeoutMs ?? 30_000;
   }
 
@@ -833,12 +992,19 @@ export class WorktreeManager {
    * worktree-host clone's local checkout, which can be hours stale. The
    * degraded path is DECLARED: a fetch failure falls back to local HEAD
    * with baseSource 'local-head-fallback' (recorded in the registry row,
-   * surfaced by an FYI) — staleness is visible, never silent.
+   * surfaced by an FYI) — staleness is visible, never silent. Each call to
+   * origin is bounded by the manager's fetch budget.
    */
   private resolveBase(repoPath: string): ResolvedBase {
-    const resolved = this.resolveDefaultBranch(repoPath);
+    return runGitSteps(repoPath, this.baseSteps(repoPath, this.fetchTimeoutMs));
+  }
+
+  /** {@link resolveBase}'s git calls, which {@link runGitSteps} runs on the
+   * event loop and {@link runGitStepsAsync} off it (#427 PR 3). */
+  private *baseSteps(repoPath: string, timeoutMs: number): GitSteps<ResolvedBase> {
+    const resolved = yield* this.defaultBranchSteps(timeoutMs);
     const defaultBranch = resolved.branch;
-    const localHead = (): string => runGit(repoPath, ['rev-parse', 'HEAD']);
+    const localHead = (): GitSteps<string> => gitOk(repoPath, ['rev-parse', 'HEAD']);
     if (defaultBranch === null) {
       const detail = resolved.authoritativeAbsence
         ? `origin default branch is unresolvable — the reachable remote's HEAD names no branch ` +
@@ -847,9 +1013,9 @@ export class WorktreeManager {
             resolved.liveDetail ?? 'named no branch'
           }, no cached origin/HEAD`;
       this.log('warn', 'base resolution degraded to the local checkout', { repo: repoPath, detail });
-      return { sha: localHead(), baseSource: 'local-head-fallback', defaultBranch: null, fallbackDetail: detail };
+      return { sha: yield* localHead(), baseSource: 'local-head-fallback', defaultBranch: null, fallbackDetail: detail };
     }
-    const fetched = this.fetchOriginTip(repoPath, defaultBranch);
+    const fetched = yield* this.originTipSteps(defaultBranch, timeoutMs);
     // A cache-guessed default (the live probe FAILED — offline or
     // transient) is NEVER verified freshness, even when the fetch
     // succeeds (Perkins r6 B1): the fetch proves the branch exists, not
@@ -869,7 +1035,7 @@ export class WorktreeManager {
         detail,
       });
       return {
-        sha: localHead(),
+        sha: yield* localHead(),
         baseSource: 'local-head-fallback',
         defaultBranch,
         fallbackDetail: detail,
@@ -884,7 +1050,7 @@ export class WorktreeManager {
       detail: fetched.detail,
     });
     return {
-      sha: localHead(),
+      sha: yield* localHead(),
       baseSource: 'local-head-fallback',
       defaultBranch,
       fallbackDetail: fetched.detail,
@@ -897,9 +1063,9 @@ export class WorktreeManager {
    * renamed main→trunk while main stayed fetchable — lanes branched
    * from the stale main recorded as 'origin'); only the live answer
    * proves what the remote calls default TODAY. */
-  private liveDefaultBranch(
-    repoPath: string,
-  ): {
+  private *liveDefaultBranchSteps(
+    timeoutMs: number,
+  ): GitSteps<{
     readonly branch: string | null;
     readonly detail: string | null;
     /** True when the probe SUCCEEDED and authoritatively found no default
@@ -909,11 +1075,8 @@ export class WorktreeManager {
      * as 'origin'). False when the probe failed/unreachable — the cache
      * remains the declared offline guess. */
     readonly authoritativeAbsence: boolean;
-  } {
-    const live = spawnGit(repoPath, ['ls-remote', '--symref', 'origin', 'HEAD'], {
-      timeoutMs: this.fetchTimeoutMs,
-      noPrompt: true,
-    });
+  }> {
+    const live = yield { args: ['ls-remote', '--symref', 'origin', 'HEAD'], opts: { timeoutMs, noPrompt: true } };
     if (live.status === 0) {
       const match = /^ref:\s+refs\/heads\/([^\s]+)\s+HEAD$/mu.exec(live.stdout);
       if (match !== null && match[1] !== undefined && match[1] !== '') {
@@ -944,15 +1107,13 @@ export class WorktreeManager {
    * blocker). Null = nothing names a default; the caller declares the
    * degraded fallback.
    */
-  private resolveDefaultBranch(repoPath: string): {
-    readonly branch: string | null;
-    readonly liveDetail: string | null;
-    readonly authoritativeAbsence: boolean;
-    /** True ONLY when the LIVE probe named the branch — a cache-guessed
-     * default is never verified freshness (Perkins r6 B1). */
-    readonly verified: boolean;
-  } {
-    const live = this.liveDefaultBranch(repoPath);
+  private resolveDefaultBranch(repoPath: string): DefaultBranch {
+    return runGitSteps(repoPath, this.defaultBranchSteps(this.fetchTimeoutMs));
+  }
+
+  /** {@link resolveDefaultBranch}'s git calls (#427 PR 3). */
+  private *defaultBranchSteps(timeoutMs: number): GitSteps<DefaultBranch> {
+    const live = yield* this.liveDefaultBranchSteps(timeoutMs);
     if (live.branch !== null) {
       return { branch: live.branch, liveDetail: null, authoritativeAbsence: false, verified: true };
     }
@@ -965,7 +1126,7 @@ export class WorktreeManager {
     if (live.authoritativeAbsence) {
       return { branch: null, liveDetail: live.detail, authoritativeAbsence: true, verified: false };
     }
-    const cached = spawnGit(repoPath, ['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']);
+    const cached = yield { args: ['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD'], opts: {} };
     if (cached.status === 0) {
       const name = cached.stdout.trim();
       const prefix = 'origin/';
@@ -989,15 +1150,14 @@ export class WorktreeManager {
   /** `git fetch origin <branch>` with an explicit refspec so the
    * remote-tracking ref updates deterministically, then resolve its tip
    * commit. Never throws: the caller owns the declared fallback. */
-  private fetchOriginTip(
-    repoPath: string,
-    branch: string,
-  ): { ok: true; sha: string } | { ok: false; detail: string } {
+  private fetchOriginTip(repoPath: string, branch: string): OriginTip {
+    return runGitSteps(repoPath, this.originTipSteps(branch, this.fetchTimeoutMs));
+  }
+
+  /** {@link fetchOriginTip}'s git calls (#427 PR 3). */
+  private *originTipSteps(branch: string, timeoutMs: number): GitSteps<OriginTip> {
     const refspec = `+refs/heads/${branch}:refs/remotes/origin/${branch}`;
-    const fetched = spawnGit(repoPath, ['fetch', '--no-tags', 'origin', refspec], {
-      timeoutMs: this.fetchTimeoutMs,
-      noPrompt: true,
-    });
+    const fetched = yield { args: ['fetch', '--no-tags', 'origin', refspec], opts: { timeoutMs, noPrompt: true } };
     if (fetched.status !== 0) {
       const detail = fetched.stderr.trim() || fetched.error || fetched.stdout.trim();
       return {
@@ -1005,7 +1165,7 @@ export class WorktreeManager {
         detail: redactedText(detail === '' ? `git fetch exited ${String(fetched.status)}` : detail, 500),
       };
     }
-    const tip = spawnGit(repoPath, ['rev-parse', '--verify', `refs/remotes/origin/${branch}^{commit}`]);
+    const tip = yield { args: ['rev-parse', '--verify', `refs/remotes/origin/${branch}^{commit}`], opts: {} };
     const sha = tip.stdout.trim();
     if (tip.status !== 0 || sha === '') {
       const detail = tip.stderr.trim() || tip.error || 'empty revision';
@@ -1839,6 +1999,18 @@ export class WorktreeManager {
       [{ key: 'id', value: row.id }, { key: 'reason', value: SETUP_INCOMPLETE }], 0);
   }
 
+  /** Why the ledger says a slim of the lane would be refused for good
+   * (#427 PR 3: the disk budget's estimate leaves such a lane out), or null:
+   * it has no bootstrap record, or a restore of it did not get back what
+   * setup made. What its base manifest says is the caller's to read. */
+  slimRecordRefusal(laneId: string): string | null {
+    const row = this.opts.ledger.getWorktree(laneId);
+    if (row === null) return 'the lane is not in the registry';
+    if (this.setupMade(row) === null) return 'the lane has no bootstrap record, so a restore could not tell what it must bring back';
+    if (this.restoreWasIncomplete(row)) return 'a restore of the lane did not get back what setup made, so it is never slimmed again';
+    return null;
+  }
+
   /** The manifest the lane was built from (#427): the one committed at its
    * base (the registry row's `sha`, which bootstrap applied), never its
    * HEAD, so a minion's commit chooses neither what a slim deletes nor what
@@ -1890,8 +2062,12 @@ export class WorktreeManager {
    * What was really freed follows: `worktree.slim-done`, or, when a delete
    * failed or the `signal` (the service's stop, checked between entries and
    * at every path of a delete) cut the pass short, `worktree.slim-incomplete`.
+   *
+   * `only` (#427 PR 3: the entries an owner's Accept of a disk card listed)
+   * limits the slim to those entries: any other is never deleted, and is
+   * skipped by name when it is there.
    */
-  async slim(input: { readonly worktreeId: string; readonly idle: () => string | null; readonly signal?: AbortSignal }): Promise<SlimResult> {
+  async slim(input: { readonly worktreeId: string; readonly idle: () => string | null; readonly signal?: AbortSignal; readonly only?: readonly string[] }): Promise<SlimResult> {
     return this.withLaneLock(input.worktreeId, async () => {
       const notSlimmed = (reason: string, permanent = false, skipped: SlimResult['skipped'] | null = null): SlimResult =>
         ({ status: 'not-slimmed', reason, permanent, planned: skipped !== null, skipped: skipped ?? [] });
@@ -1938,6 +2114,12 @@ export class WorktreeManager {
       let fixedSkips = 0;
       for (const entry of manifest.reclaim) {
         if (stopped()) return notSlimmed(stopping);
+        if (input.only !== undefined && !input.only.includes(entry)) {
+          if ((await reclaimState(row.path, entry).catch(() => 'unreadable' as const)) !== 'absent') {
+            skipped.push({ path: entry, reason: 'the list this slim runs from (the card the owner accepted) does not name it' });
+          }
+          continue;
+        }
         const destination = destinations.find((path) => path === entry || path.startsWith(`${entry}/`));
         if (destination !== undefined) {
           skipped.push({ path: entry, reason: `the manifest's [[link]] or [[copy]] destination ${destination} lies at or under it, and a restore runs only [[setup]]` });
@@ -2206,7 +2388,11 @@ export class WorktreeManager {
       return this.withRepoLock(row.repoPath, async () => {
         assertLaneResourcesAbsent(row);
         let branchOutcome: 'deleted' | 'retained' | 'none' = 'none';
-        if ((row.kind === 'job' || row.kind === 'child') && row.branch !== null) {
+        if (input.diskBudget === true) {
+          // A disk budget release never asks origin after a removal (#427
+          // PR 3): a branch still there is kept for a later release.
+          branchOutcome = this.budgetBranch(row);
+        } else if ((row.kind === 'job' || row.kind === 'child') && row.branch !== null) {
           const present = spawnGit(row.repoPath, [
             'rev-parse',
             '--verify',
@@ -2228,7 +2414,7 @@ export class WorktreeManager {
             this.log('warn', 'sweep-completion notice resolution failed', { id: row.id, error: String(error) });
           }
         }
-        const freshHead = this.safeFreshHead(row.repoPath);
+        const freshHead = input.diskBudget === true ? '' : this.safeFreshHead(row.repoPath);
         assertLaneResourcesAbsent(row);
         return { status: 'swept', preserved: null, branch: branchOutcome, freshHead } as const;
       });
@@ -2276,15 +2462,21 @@ export class WorktreeManager {
       if (!existsSync(row.path)) {
         // The reconcile disposes the branch exactly like finishSweep
         // (Perkins lane-B r3): containment-verified delete, or retain +
-        // note — and the response reports the TRUE outcome.
-        const reconciled = this.reconcileMissingTree(row, input.baseBranch);
+        // note — and the response reports the TRUE outcome. A disk budget
+        // release asks origin nothing here (#427 PR 3): the branch is kept.
+        const reconciled = this.reconcileMissingTree(row, input.baseBranch, input.diskBudget === true);
         return { status: 'swept', preserved: null, ...reconciled } as const;
       }
       // (0.9) AUTOMATIC RELEASE PROOFS (issue #243 F-H1): an unattended sweep
       // must refuse BEFORE the forced removal when fresh required containment
       // cannot be proven. Dirty tracked work no longer refuses it: the
-      // removal tail snapshots it first (#427).
-      if (input.requireReleaseProofs === true) {
+      // removal tail snapshots it first (#427). A disk budget release (#427
+      // PR 3) proves off the event loop: origin not answering within the
+      // fetch budget refuses it before anything is touched, and the head
+      // its proof resolved is the one it reports (it never asks origin after
+      // the removal).
+      const budget = input.diskBudget === true ? { freshHead: await this.assertAutomaticReleaseProofsAsync(row) } : null;
+      if (input.requireReleaseProofs === true && budget === null) {
         this.assertAutomaticReleaseProofs(row);
       }
       // (0.95) REFUSE EARLY (#427): the structural checks run before an
@@ -2304,6 +2496,7 @@ export class WorktreeManager {
         copyRecorded: false,
         aborted: this.abortedRelease(row),
         preserveReused: false,
+        budget,
       };
       // (1) Preserve untracked deliverables FIRST — before any process
       // decision, before any removal. Deliverables are never hostages.
@@ -2339,11 +2532,18 @@ export class WorktreeManager {
     // is dual-keyed (registry row live AND still enumerated in the tree)
     // so a recycled pid can never redirect it; foreign processes keep the
     // full pause-and-ask contract below.
-    const reaped = await this.reapTrackedServiceProcesses(row);
+    const refuse = input.onLiveProcess === 'refuse';
+    const reaped = refuse ? [] : await this.reapTrackedServiceProcesses(row);
     assertCleanup();
 
-    // (2) Enumerate processes rooted in the tree BEFORE removal.
-    const processes = this.enumerate(row.path).filter((proc) => !reaped.includes(proc.pid));
+    // (2) Enumerate processes rooted in the tree BEFORE removal (off the
+    // event loop for a disk budget release, which refuses on a listing that
+    // could not read working directories, #427 PR 3).
+    const rooted = attempt.budget === null ? this.enumerate(row.path) : await this.enumerateAsync(row.path);
+    const processes = rooted.filter((proc) => !reaped.includes(proc.pid));
+    // A release nobody answers refuses instead of pausing (#427 PR 3): the
+    // caller's catch withdraws the preserve copy, and the tree is retained.
+    if (processes.length > 0 && refuse) throw new LaneLiveProcessError(row.path, processes);
     if (processes.length > 0) {
       // Perkins r2 B2: confirmKill is answered against the RECORDED set
       // (ruling 18b rows from a prior pause), never a fresh enumeration
@@ -2933,6 +3133,23 @@ export class WorktreeManager {
     }
   }
 
+  /** {@link assertAutomaticReleaseProofs} off the event loop, each call to
+   * origin bounded by the manager's fetch budget (#427 PR 3): origin slow
+   * to answer within it costs the event loop nothing, and origin not
+   * answering in time refuses the release ({@link LaneRemoteTimeoutError}),
+   * never a wait. Resolves with the head the proof resolved. */
+  private async assertAutomaticReleaseProofsAsync(row: WorktreeRecord): Promise<string> {
+    try {
+      const base = await runGitStepsAsync(row.repoPath, this.baseSteps(row.repoPath, this.fetchTimeoutMs), (command, bound) => new LaneRemoteTimeoutError(row.path, command, bound));
+      return base.sha;
+    } catch (error) {
+      if (error instanceof LaneRemoteTimeoutError) throw error;
+      throw new Error(
+        `automatic sweep refused: fresh required containment cannot be proven for ${row.path} (${String(error)}) — the tree is retained`,
+      );
+    }
+  }
+
   /** Copy untracked-not-ignored deliverables into the preserve root.
    *
    * Perkins r1 B1: paths come from `--porcelain -z` — NUL-delimited and
@@ -3187,14 +3404,16 @@ export class WorktreeManager {
     return this.finishSweep(row, preserved, baseBranch, assertCleanup, attempt);
   }
 
-  /** Removal + containment branch delete + fresh head (shared tail). */
-  private finishSweep(
+  /** Removal + containment branch delete + fresh head (shared tail). A
+   * disk budget release (#427 PR 3) removes off the event loop and asks
+   * origin nothing after the removal: its branch is retained. */
+  private async finishSweep(
     row: WorktreeRecord,
     preserved: SweepPreservation | null,
     baseBranch: string | undefined,
     assertCleanup: () => void,
     attempt: SweepAttempt,
-  ): SweepResult {
+  ): Promise<SweepResult> {
     // (4a) Worktree removal. A failure HERE throws with the tree intact
     // and the row unchanged — retry-safe.
     assertCleanup();
@@ -3228,7 +3447,11 @@ export class WorktreeManager {
     try {
       snapshot = built === null ? null : this.reusableSnapshot(row, built, attempt.aborted) ?? this.saveSnapshot(row, built);
       try {
-        runGit(row.repoPath, ['worktree', 'remove', '--force', row.path]);
+        // The removal's cost grows with the tree, and the disk budget
+        // releases the largest lanes first: its removal runs off the event
+        // loop (#427 PR 3), after the same records and ref.
+        if (attempt.budget === null) runGit(row.repoPath, ['worktree', 'remove', '--force', row.path]);
+        else await runGitAsync(row.repoPath, ['worktree', 'remove', '--force', row.path]);
       } catch (removal) {
         // Git deletes the lane's git folder even when it could not delete all
         // of its tree (#427): no git command runs in what is left, so GC
@@ -3251,26 +3474,37 @@ export class WorktreeManager {
     let branchOutcome: 'deleted' | 'retained' | 'none' = 'none';
     let freshHead = '';
     try {
-      // Release re-resolves the FRESH head FIRST (ruling 18e; Perkins
-      // r7/r8): the fetch makes the CURRENT remote state known BEFORE the
-      // branch decision, and ONLY a successfully-fetched, verified default
-      // yields a remote witness for the disposal — a fetch failure or an
-      // unverified default means stale tracking refs witness nothing.
-      // (A freshHead failure here skips the disposition — fail-safe: the
-      // branch is retained.)
-      const base = this.resolveBase(row.repoPath);
-      freshHead = base.sha;
-      assertLaneResourcesAbsent(row);
-      // Containment-verified branch delete — job and writer-child lanes;
-      // a branch is deleted only when its tip is provably contained in a
-      // durable local ref or the freshly verified remote default;
-      // otherwise it is RETAINED, noted, and the reason reported.
-      if ((row.kind === 'job' || row.kind === 'child') && row.branch !== null) {
-        branchOutcome = this.deleteBranchContained(
-          row,
-          baseBranch,
-          base.baseSource === 'origin' ? base.defaultBranch : null,
-        );
+      if (attempt.budget !== null) {
+        // A disk budget release never asks origin after the removal (#427
+        // PR 3): a timer drives it, so a slow origin must cost nothing here.
+        // Its head is the one its proof resolved before the removal, and
+        // the lane's branch is retained (lossless) for a later release or
+        // the autopilot to dispose of.
+        freshHead = attempt.budget.freshHead;
+        assertLaneResourcesAbsent(row);
+        branchOutcome = this.budgetBranch(row);
+      } else {
+        // Release re-resolves the FRESH head FIRST (ruling 18e; Perkins
+        // r7/r8): the fetch makes the CURRENT remote state known BEFORE the
+        // branch decision, and ONLY a successfully-fetched, verified default
+        // yields a remote witness for the disposal — a fetch failure or an
+        // unverified default means stale tracking refs witness nothing.
+        // (A freshHead failure here skips the disposition — fail-safe: the
+        // branch is retained.)
+        const base = this.resolveBase(row.repoPath);
+        freshHead = base.sha;
+        assertLaneResourcesAbsent(row);
+        // Containment-verified branch delete — job and writer-child lanes;
+        // a branch is deleted only when its tip is provably contained in a
+        // durable local ref or the freshly verified remote default;
+        // otherwise it is RETAINED, noted, and the reason reported.
+        if ((row.kind === 'job' || row.kind === 'child') && row.branch !== null) {
+          branchOutcome = this.deleteBranchContained(
+            row,
+            baseBranch,
+            base.baseSource === 'origin' ? base.defaultBranch : null,
+          );
+        }
       }
     } catch (error) {
       if (error instanceof WorktreeHandoffUnresolvedError) throw error;
@@ -3293,8 +3527,9 @@ export class WorktreeManager {
         error: String(flipError),
       });
     }
-    this.recordSweepEvent(row, preserved, branchOutcome, freshHead, snapshot);
-    this.log('info', 'worktree swept', { id: row.id, branch: branchOutcome, freshHead, snapshot: snapshot?.ref ?? null });
+    const recordedBranch = attempt.budget !== null && branchOutcome === 'retained' ? 'retained-budget' : branchOutcome;
+    this.recordSweepEvent(row, preserved, recordedBranch, freshHead, snapshot);
+    this.log('info', 'worktree swept', { id: row.id, branch: recordedBranch, freshHead, snapshot: snapshot?.ref ?? null });
     try {
       this.opts.onSwept?.({ worktree: row });
     } catch (error) {
@@ -4018,10 +4253,13 @@ export class WorktreeManager {
    * containment-verified disposal finishSweep runs. Abandoning the
    * branch here left merged lanes unreusable ('branch already exists')
    * behind a swept row that early-returns forever. Returns the true
-   * branch outcome for the release response. */
+   * branch outcome for the release response. A disk budget release (#427
+   * PR 3) asks origin nothing: the branch is retained, and no head is
+   * resolved. */
   private reconcileMissingTree(
     row: WorktreeRecord,
     baseBranch: string | undefined,
+    diskBudget: boolean,
   ): { readonly branch: 'deleted' | 'retained' | 'none'; readonly freshHead: string } {
     assertLaneResourcesAbsent(row);
     this.log('warn', 'worktree tree missing under a non-swept row — reconciling swept', {
@@ -4029,15 +4267,21 @@ export class WorktreeManager {
       path: row.path,
       status: row.status,
     });
-    // DISPOSE FIRST, flip second (Perkins lane-B r4: mirror finishSweep —
-    // flipping first re-opened the r3 wedge silently: a crash between the
-    // flip and the disposal left every retry early-returning 'none').
-    // The disposal resolves FRESH remote state first (Perkins r8): a
-    // retry must never delete on the witness of stale tracking refs.
-    const remote = this.safeFreshRemoteBranch(row.repoPath);
-    assertLaneResourcesAbsent(row);
-    const branchOutcome = this.disposeLaneBranch(row, baseBranch, remote);
-    const freshHead = this.safeFreshHead(row.repoPath);
+    let branchOutcome: 'deleted' | 'retained' | 'none';
+    let freshHead = '';
+    if (diskBudget) {
+      branchOutcome = this.budgetBranch(row);
+    } else {
+      // DISPOSE FIRST, flip second (Perkins lane-B r4: mirror finishSweep —
+      // flipping first re-opened the r3 wedge silently: a crash between the
+      // flip and the disposal left every retry early-returning 'none').
+      // The disposal resolves FRESH remote state first (Perkins r8): a
+      // retry must never delete on the witness of stale tracking refs.
+      const remote = this.safeFreshRemoteBranch(row.repoPath);
+      assertLaneResourcesAbsent(row);
+      branchOutcome = this.disposeLaneBranch(row, baseBranch, remote);
+      freshHead = this.safeFreshHead(row.repoPath);
+    }
     assertLaneResourcesAbsent(row);
     try {
       this.opts.ledger.setWorktreeStatus(row.id, 'swept');
@@ -4045,7 +4289,7 @@ export class WorktreeManager {
         kind: 'worktree.reconciled',
         jobId: row.jobId,
         roundId: row.roundId,
-        payload: { id: row.id, path: row.path, priorStatus: row.status, branch: branchOutcome },
+        payload: { id: row.id, path: row.path, priorStatus: row.status, branch: diskBudget && branchOutcome === 'retained' ? 'retained-budget' : branchOutcome },
       });
     } catch (error) {
       this.log('error', 'reconciliation write failed — retry will reconcile again', {
@@ -4095,6 +4339,16 @@ export class WorktreeManager {
     }
   }
 
+  /** What a disk budget release leaves of the lane's branch (#427 PR 3):
+   * it asks origin nothing after a removal, so it disposes of nothing; a
+   * branch still there is retained (lossless) for a later release or the
+   * autopilot, which prove containment against a fresh fetch. */
+  private budgetBranch(row: WorktreeRecord): 'retained' | 'none' {
+    if ((row.kind !== 'job' && row.kind !== 'child') || row.branch === null) return 'none';
+    const present = spawnGit(row.repoPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${row.branch}`]);
+    return present.status === 0 ? 'retained' : 'none';
+  }
+
   private safeFreshHead(repoPath: string): string {
     try {
       return this.freshHead(repoPath);
@@ -4122,7 +4376,7 @@ export class WorktreeManager {
   private recordSweepEvent(
     row: WorktreeRecord,
     preserved: SweepPreservation | null,
-    branchOutcome: 'deleted' | 'retained' | 'none',
+    branchOutcome: 'deleted' | 'retained' | 'retained-budget' | 'none',
     freshHead: string,
     snapshot: SweepSnapshot | null,
   ): void {
@@ -4282,7 +4536,7 @@ async function reclaimVerdict(lanePath: string, entry: string): Promise<string |
 
 /** A manifest `[[link]]` `at` or `[[copy]]` `to` in the form of a reclaim
  * entry (`./a/b/` → `a/b`). */
-function normalizedManifestPath(path: string): string {
+export function normalizedManifestPath(path: string): string {
   return path.trim().split(/[\\/]/u).filter((segment) => segment !== '' && segment !== '.').join('/');
 }
 
@@ -4965,19 +5219,44 @@ function repositoryVerdict(candidate: string, found: RepoIdentity | { readonly e
 }
 
 /** {@link spawnGit} off the event loop (#427 PR 2b): git's exit status and
- * output, never a rejection. */
-function spawnGitAsync(repoPath: string, args: readonly string[]): Promise<{ readonly status: number | null; readonly stdout: string; readonly stderr: string; readonly error: string | null }> {
+ * output, never a rejection. With `timeoutMs` (#427 PR 3), git runs in its
+ * own process group, and once the bound passes the group is killed (a
+ * transport helper such as ssh with it) and the call answers `timedOut`
+ * at once, without waiting for the output to close. */
+function spawnGitAsync(repoPath: string, args: readonly string[], opts: Pick<SpawnGitOptions, 'timeoutMs' | 'noPrompt'> = {}): Promise<{ readonly status: number | null; readonly stdout: string; readonly stderr: string; readonly error: string | null; readonly timedOut: boolean }> {
   return new Promise((resolveOut) => {
-    const child = execFile('git', [...args], { cwd: repoPath, encoding: 'utf-8', maxBuffer: 16 * 1024 * 1024, env: repositoryGitEnv(false) }, (error, stdout, stderr) => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let settled = false;
+    const settle = (outcome: { readonly status: number | null; readonly stdout: string; readonly stderr: string; readonly error: string | null; readonly timedOut: boolean }): void => {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) clearTimeout(timer);
+      resolveOut(outcome);
+    };
+    const child = execFile('git', [...args], {
+      cwd: repoPath,
+      encoding: 'utf-8',
+      maxBuffer: 16 * 1024 * 1024,
+      env: { ...repositoryGitEnv(false), ...(opts.noPrompt === true ? { GIT_TERMINAL_PROMPT: '0' } : {}) },
+      ...(opts.timeoutMs !== undefined ? { detached: true } : {}),
+    }, (error, stdout, stderr) => {
       const code = (error as { readonly code?: unknown } | null)?.code;
-      resolveOut({
+      settle({
         status: error === null ? 0 : typeof code === 'number' ? code : null,
         stdout: stdout ?? '',
         stderr: stderr ?? '',
         error: error === null || typeof code === 'number' ? null : String(error),
+        timedOut: false,
       });
     });
     child.stdin?.end();
+    if (opts.timeoutMs !== undefined) {
+      const timeoutMs = opts.timeoutMs;
+      timer = setTimeout(() => {
+        if (child.pid !== undefined) signalProcessGroup(child.pid, 'SIGKILL');
+        settle({ status: null, stdout: '', stderr: '', error: `git ${args.join(' ')} timed out after ${String(timeoutMs)} ms`, timedOut: true });
+      }, timeoutMs);
+    }
   });
 }
 

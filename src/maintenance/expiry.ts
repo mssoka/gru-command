@@ -30,7 +30,10 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  *   digest's blocker reader (src/dispatch/silas-driver.ts) read it. Each
  *   pass records `reviews.expired { job_id, rounds, fallback_gates, bytes }`
  *   for each job it deleted something of. A file whose delete fails stays,
- *   and the next reconcile tries it again.
+ *   and the next reconcile tries it again. Nothing of a job is deleted while
+ *   a Perkins review owns it (#427 PR 3: a fallback gate running for a
+ *   merged job, a setup in progress, a superseded round not proven stopped),
+ *   which may still write its folders.
  * - **Saved work.** Preserve copies (`<preserve_root>/<lane>/<stamp>`) and
  *   snapshot refs (`refs/gru/preserved/<lane>/<stamp>`) hold minion work, so
  *   they are never deleted automatically (owner ruling 2026-10-16). Once a
@@ -114,6 +117,24 @@ export interface ExpiredWork {
   readonly refs: readonly ExpiredRef[];
 }
 
+/** A finished job's review folders ({@link ExpiryService.expirableReviews}). */
+export interface ExpirableReviews {
+  readonly jobId: string;
+  readonly rounds: readonly string[];
+  readonly fallbackGates: readonly string[];
+  /** What expiry deletes, rounds first: each folder, or for a round folder
+   * holding a kept file ({@link REVIEW_KEPT_FILES}) its other entries. */
+  readonly paths: readonly string[];
+}
+
+/** What one `reviews.expired` recorded. */
+export interface ReviewsExpired {
+  readonly jobId: string;
+  readonly rounds: readonly string[];
+  readonly fallbackGates: readonly string[];
+  readonly bytes: number;
+}
+
 /** A recorded proposal (`preserves.proposed`), as its card's Accept reads it. */
 interface Proposal extends ExpiredWork {
   readonly notificationId: string;
@@ -130,6 +151,11 @@ export interface ExpiryServiceOptions {
   readonly reviewsRoot: string;
   /** `[worktrees] preserve_root`. */
   readonly preserveRoot: string;
+  /** True while a Perkins review owns the job (main.ts: the review wave's
+   * `activeReview`): a fallback gate running, a setup in progress, or a
+   * superseded round whose stop is not proven. Its review folders are kept
+   * meanwhile (#427 PR 3). */
+  readonly reviewActive: (jobId: string) => boolean;
   /** Run at the start of every pass (main.ts: the moved-repository check). A
    * failure is logged. */
   readonly onReconcile?: () => Promise<void> | void;
@@ -198,7 +224,7 @@ export class ExpiryService {
   private async pass(): Promise<void> {
     const steps: readonly [string, () => Promise<void> | void][] = [
       ['the moved-repository check', () => this.opts.onReconcile?.()],
-      ['review expiry', () => this.expireReviews()],
+      ['review expiry', async () => { await this.expireReviews(); }],
       ['saved-work decisions', () => this.followCards()],
       ['saved-work proposals', () => this.proposeExpiredWork()],
     ];
@@ -216,9 +242,14 @@ export class ExpiryService {
   // Review artifacts
   // ------------------------------------------------------------------
 
-  /** Delete the review folders of every job terminal for at least
-   * {@link REVIEW_EXPIRY_MS}; record one `reviews.expired` per job. */
-  async expireReviews(): Promise<void> {
+  /** The review folders of every job terminal for at least `olderThanMs`
+   * (default {@link REVIEW_EXPIRY_MS}), by job: what {@link expireReviews}
+   * deletes. An open job's folders, a job whose end cannot be read, the
+   * folders of a round or job the ledger does not know, and a round folder
+   * holding nothing but its kept files (expired before) are never listed.
+   * The disk budget (#427 PR 3) lists them with no wait (`olderThanMs: 0`). */
+  expirableReviews(opts: { readonly olderThanMs?: number } = {}): readonly ExpirableReviews[] {
+    const olderThan = opts.olderThanMs ?? REVIEW_EXPIRY_MS;
     const byJob = new Map<string, { rounds: string[]; gates: string[] }>();
     const of = (jobId: string): { rounds: string[]; gates: string[] } => {
       const entry = byJob.get(jobId) ?? { rounds: [], gates: [] };
@@ -234,41 +265,110 @@ export class ExpiryService {
       const jobId = FALLBACK_GATE_FOLDER.exec(name)?.[1];
       if (jobId !== undefined) of(jobId).gates.push(name);
     }
+    const expirable: ExpirableReviews[] = [];
     for (const [jobId, found] of byJob) {
-      if (this.stopped) return;
       const since = this.terminalSince(jobId);
-      if (since === null || this.now() - since < REVIEW_EXPIRY_MS) continue;
+      if (since === null || this.now() - since < olderThan) continue;
       const rounds: string[] = [];
-      const gates: string[] = [];
-      const failed: { readonly folder: string; readonly error: string }[] = [];
-      let bytes = 0;
-      /** Delete a folder (a fallback gate's), or a round folder's entries
-       * but its kept files; `done` names it once nothing else is left. */
-      const remove = async (folder: string, done: string[], name: string, keepFiles: readonly string[]): Promise<void> => {
-        const entries = keepFiles.length === 0 ? null : expiredEntries(folder, keepFiles);
-        if (entries !== null && entries.length === 0) return; // expired before
-        const targets = entries === null || entries.length === readdirOrEmpty(folder).length ? [folder] : entries.map((entry) => join(folder, entry));
-        let complete = true;
-        for (const target of targets) {
-          const size = await treeBytes(target);
-          try {
-            await removeTree(target);
-            bytes += size;
-          } catch (error) {
-            complete = false;
-            failed.push({ folder: target, error: String(error) });
-          }
-        }
-        if (complete) done.push(name);
-      };
-      for (const name of found.rounds) await remove(join(this.opts.reviewsRoot, name), rounds, name, REVIEW_KEPT_FILES);
-      for (const name of found.gates) await remove(join(this.opts.reviewsRoot, 'fallback-gate', name), gates, name, []);
-      if (rounds.length + gates.length > 0) {
-        this.opts.ledger.appendCustomEvent({ kind: EXPIRY_EVENTS.reviewsExpired, jobId, payload: { job_id: jobId, rounds, fallback_gates: gates, bytes } });
-        this.log('info', 'review folders of a finished job expired', { job: jobId, rounds: rounds.length, fallback_gates: gates.length, bytes });
+      const roundPaths: string[] = [];
+      for (const name of found.rounds) {
+        const folder = join(this.opts.reviewsRoot, name);
+        const entries = expiredEntries(folder, REVIEW_KEPT_FILES);
+        if (entries.length === 0) continue;
+        rounds.push(name);
+        roundPaths.push(...(entries.length === readdirOrEmpty(folder).length ? [folder] : entries.map((entry) => join(folder, entry))));
       }
-      if (failed.length > 0) this.log('warn', 'review folders of a finished job could not be deleted; the next reconcile tries again', { job: jobId, failed });
+      if (rounds.length + found.gates.length === 0) continue;
+      expirable.push({
+        jobId,
+        rounds,
+        fallbackGates: found.gates,
+        paths: [...roundPaths, ...found.gates.map((name) => join(this.opts.reviewsRoot, 'fallback-gate', name))],
+      });
     }
+    return expirable;
+  }
+
+  /** Delete the review folders of every job terminal for at least
+   * `olderThanMs` (default {@link REVIEW_EXPIRY_MS}; `jobs`: only those
+   * jobs'); record one `reviews.expired` per job, and return what each
+   * record says. */
+  async expireReviews(opts: { readonly olderThanMs?: number; readonly jobs?: readonly string[] } = {}): Promise<readonly ReviewsExpired[]> {
+    const olderThanMs = opts.olderThanMs ?? REVIEW_EXPIRY_MS;
+    const expired: ReviewsExpired[] = [];
+    for (const found of this.expirableReviews({ olderThanMs })) {
+      if (this.stopped) break;
+      if (opts.jobs !== undefined && !opts.jobs.includes(found.jobId)) continue;
+      const done = await this.expireJobReviews(found, { olderThanMs });
+      if (done !== null) expired.push(done);
+    }
+    return expired;
+  }
+
+  /** Delete exactly the listed review folders of one job (#427 PR 3: what
+   * the disk budget's step, or the card the owner accepted, listed), each
+   * checked again first, without listing every review: the job is still
+   * terminal for at least `olderThanMs` (default {@link REVIEW_EXPIRY_MS}),
+   * no Perkins review owns it ({@link reviewsInUse}, asked again before each
+   * folder), and each folder is still there and still that job's. One
+   * `reviews.expired` records what was deleted; null when nothing was. */
+  async expireJobReviews(listed: Pick<ExpirableReviews, 'jobId' | 'rounds' | 'fallbackGates'>, opts: { readonly olderThanMs?: number } = {}): Promise<ReviewsExpired | null> {
+    const { jobId } = listed;
+    const since = this.terminalSince(jobId);
+    if (since === null || this.now() - since < (opts.olderThanMs ?? REVIEW_EXPIRY_MS)) return null;
+    const inUse = (): boolean => {
+      const why = this.reviewsInUse(jobId);
+      if (why !== null) this.log('info', 'review folders of a finished job are kept: a Perkins review owns the job', { job: jobId, why });
+      return why !== null;
+    };
+    if (inUse()) return null;
+    const rounds: string[] = [];
+    const gates: string[] = [];
+    const failed: { readonly folder: string; readonly error: string }[] = [];
+    let bytes = 0;
+    /** Delete a folder (a fallback gate's), or a round folder's entries
+     * but its kept files; `done` names it once nothing else is left. */
+    const remove = async (folder: string, done: string[], name: string, keepFiles: readonly string[]): Promise<void> => {
+      if (!existsSync(folder)) return;
+      const entries = keepFiles.length === 0 ? null : expiredEntries(folder, keepFiles);
+      if (entries !== null && entries.length === 0) return; // expired before
+      const targets = entries === null || entries.length === readdirOrEmpty(folder).length ? [folder] : entries.map((entry) => join(folder, entry));
+      let complete = true;
+      for (const target of targets) {
+        const size = await treeBytes(target);
+        try {
+          await removeTree(target);
+          bytes += size;
+        } catch (error) {
+          complete = false;
+          failed.push({ folder: target, error: String(error) });
+        }
+      }
+      if (complete) done.push(name);
+    };
+    for (const name of listed.rounds) {
+      if (this.stopped || inUse()) break;
+      if (name === 'fallback-gate' || !ROUND_FOLDER.test(name) || this.opts.ledger.getRound(name)?.jobId !== jobId) continue;
+      await remove(join(this.opts.reviewsRoot, name), rounds, name, REVIEW_KEPT_FILES);
+    }
+    for (const name of listed.fallbackGates) {
+      if (this.stopped || inUse()) break;
+      if (FALLBACK_GATE_FOLDER.exec(name)?.[1] !== jobId) continue;
+      await remove(join(this.opts.reviewsRoot, 'fallback-gate', name), gates, name, []);
+    }
+    if (failed.length > 0) this.log('warn', 'review folders of a finished job could not be deleted; the next reconcile tries again', { job: jobId, failed });
+    if (rounds.length + gates.length === 0) return null;
+    this.opts.ledger.appendCustomEvent({ kind: EXPIRY_EVENTS.reviewsExpired, jobId, payload: { job_id: jobId, rounds, fallback_gates: gates, bytes } });
+    this.log('info', 'review folders of a finished job expired', { job: jobId, rounds: rounds.length, fallback_gates: gates.length, bytes });
+    return { jobId, rounds, fallbackGates: gates, bytes };
+  }
+
+  /** Why a finished job's review folders are not expired now, or null: a
+   * Perkins review owns the job ({@link ExpiryServiceOptions.reviewActive}). */
+  reviewsInUse(jobId: string): string | null {
+    return this.opts.reviewActive(jobId)
+      ? 'a Perkins review owns the job (a fallback gate running, a setup in progress, or a superseded round not proven stopped)'
+      : null;
   }
 
   /** When the job became terminal (its newest `job.status` to that status),

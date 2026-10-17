@@ -27,3 +27,10 @@ export const SHUTDOWN_FORCE_EXIT_MS =
  * entries once told to, and one cut short after its record is safe (the
  * lane is slim, and its next turn restores it). */
 export const LANE_SLIMMER_STOP_WAIT_MS = 5_000;
+
+/** How long shutdown waits for a running disk reclaim step (#427 PR 3), as
+ * for a slim pass: the pass stops before its next step once told to (a slim
+ * between reclaim entries), and a release or slim cut short is safe (the
+ * release's records come first, and a slim lane is restored by its next
+ * turn). */
+export const DISK_RECLAIM_STOP_WAIT_MS = 5_000;

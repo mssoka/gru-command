@@ -57,6 +57,10 @@ const OWNER_REQUIRED_KINDS: readonly string[] = [
   // or Decline.
   'worktree.preserve-expiry',
   'worktree.repo-mismatch',
+  // The disk budget (#427 PR 3): reclaim_mode = "proposed" puts the lossless
+  // steps GC would take to get under its budget or above the floor in FOR
+  // YOU for Accept or Decline.
+  'disk.reclaim-proposal',
 ];
 
 /** Kinds that are always owner-facing, prefix match (dynamic suffixes,
@@ -78,6 +82,7 @@ const OWNER_ALLOWED_PREFIXES: readonly string[] = ['decisions.degraded.'];
  * decision attached (validated at the write boundary). */
 const DECISION_REQUIRED_KINDS: readonly string[] = [
   'gru.owner-escalation', 'vector.raid-proposal', 'vector.fix-proposal', 'onboarding.proposal', 'worktree.preserve-expiry', 'worktree.repo-mismatch',
+  'disk.reclaim-proposal',
 ];
 
 export function ownerAttentionFor(kind: string): OwnerAttention {

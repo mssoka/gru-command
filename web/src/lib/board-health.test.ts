@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type {
   BoardSnapshot,
   BuildView,
+  DiskView,
   JobView,
   RoundView,
 } from './board-protocol.js';
@@ -9,6 +10,7 @@ import {
   alertsCard,
   cureCard,
   deployDriftCard,
+  diskCard,
   healthCards,
   restartPending,
   reviewCard,
@@ -229,6 +231,76 @@ describe('the remaining health cards render truthfully or n/a', () => {
     expect(wired.flag).toBe('2 QUEUED');
     expect(verifyCard(null).value).toBe('n/a');
     expect(verifyCard(undefined).tone).toBe('muted');
+  });
+
+  it('Disk (#427 PR 3): GC\'s usage, free space, budget and floor; below the floor is an alert with its queue, over budget a warning', () => {
+    const GB = 1024 ** 3;
+    const disk = (overrides: Partial<DiskView> = {}): DiskView => ({
+      usedBytes: 12 * GB,
+      sharedBytes: 0,
+      categories: { lanes: 9 * GB, reviews: GB, preserves: 0, probes: 0, ledger: GB, logs: GB, other: 0 },
+      freeBytes: 100 * GB,
+      totalBytes: 500 * GB,
+      volumes: [{ names: ['lanes', 'data_dir'], path: '/data/worktrees', freeBytes: 100 * GB, totalBytes: 500 * GB, belowFloor: false }],
+      budgetBytes: 30 * GB,
+      floorBytes: 10 * GB,
+      reclaimMode: 'automatic',
+      overBudget: false,
+      belowFloor: false,
+      queuedLanes: 0,
+      floorQueue: [],
+      computedAt: ISO(-30_000),
+      ...overrides,
+    });
+    const fine = diskCard(disk());
+    expect(fine.value).toBe('12.0 GB');
+    expect(fine.detail).toBe('100.0 GB free · budget 30.0 GB · floor 10.0 GB');
+    expect(fine.tone).toBe('ok');
+    expect(fine.flag).toBeNull();
+    expect(fine.titleAttr).toContain('lanes 9.0 · reviews 1.0 · preserves 0.0 · probes 0.0 · ledger 1.0 · logs 1.0 · other 0.0 GB');
+    const over = diskCard(disk({ usedBytes: 34 * GB, overBudget: true }));
+    expect([over.tone, over.flag]).toEqual(['warn', 'OVER BUDGET']);
+    const reason = 'queued: 6.0 GB free is below the 10 GB floor ([worktrees] min_free_disk_gb); the reclaim card is waiting for the owner\'s decision';
+    const below = diskCard(disk({
+      freeBytes: 6 * GB,
+      belowFloor: true,
+      queuedLanes: 2,
+      reclaimMode: 'proposed',
+      floorQueue: [
+        { id: 'job-a', label: 'a heist', queuedAt: ISO(-60_000), reason },
+        { id: 'child-b', label: 'a writer child', queuedAt: ISO(-30_000), reason },
+      ],
+    }));
+    expect([below.tone, below.flag]).toEqual(['alert', '2 QUEUED']);
+    expect(below.flagSplit).toEqual({ num: 2, unit: ' QUEUED' });
+    // Every lane waiting at the floor is named, with its reason.
+    expect(below.titleAttr).toContain(`waiting at the floor: a heist (job-a): ${reason}; a writer child (child-b): ${reason}`);
+    expect(diskCard(disk({ freeBytes: 6 * GB, belowFloor: true })).flag).toBe('BELOW FLOOR');
+    // A free space is rounded down: 9.96 GB is never "10.0 GB free" below a 10 GB floor.
+    expect(diskCard(disk({ freeBytes: 9.96 * GB, belowFloor: true })).detail).toBe('9.9 GB free · budget 30.0 GB · floor 10.0 GB');
+    // Lanes on another disk than data_dir: each disk is named; shared bytes are shown apart.
+    const two = diskCard(disk({
+      sharedBytes: 2 * GB,
+      freeBytes: 6 * GB,
+      belowFloor: true,
+      volumes: [
+        { names: ['lanes'], path: '/mnt/lanes', freeBytes: 6 * GB, totalBytes: 50 * GB, belowFloor: true },
+        { names: ['data_dir'], path: '/data', freeBytes: 100 * GB, totalBytes: 500 * GB, belowFloor: false },
+      ],
+    }));
+    expect(two.titleAttr).toContain('the lanes disk (/mnt/lanes) has 6.0 GB free of 50.0 GB, below the floor; the data_dir disk (/data) has 100.0 GB free of 500.0 GB');
+    expect(two.titleAttr).toContain('2.0 GB hard-linked from outside, not counted');
+    const off = diskCard(disk({ budgetBytes: 0, floorBytes: 0, usedBytes: null, categories: null, freeBytes: null }));
+    expect([off.value, off.detail, off.tone]).toEqual(['walking', 'free unknown · budget off · floor off', 'muted']);
+
+    // The pair sits next to the verify queue, and only when the server sends it.
+    const snapshot = {
+      repos: [], agents: [], notifications: [],
+      decisions: { enabled: false, status: 'disabled', reason: null, model: 'm', endpoint: 'e', credentialPresent: false, credentialSource: 'none', checkedAt: null, incarnation: 'x', generation: 0 },
+      unackedActionRequired: 0, unackedNeedsOwner: 0, wakes: { count: 0, lastAt: null },
+    } as BoardSnapshot;
+    expect(healthCards({ ...snapshot, disk: disk() }, NOW.getTime()).map((c) => c.id)).toEqual(['deploy', 'reviews', 'silas', 'alerts', 'verify', 'disk', 'cure']);
+    expect(healthCards({ ...snapshot, disk: null }, NOW.getTime()).map((c) => c.id)).toEqual(['deploy', 'reviews', 'silas', 'alerts', 'verify', 'cure']);
   });
 
   it('Cure efficacy: resumed vs orphaned, n/a when data is absent', () => {

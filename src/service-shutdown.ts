@@ -4,6 +4,7 @@ import type { OnboardingService } from './onboarding/service.js';
 import type { ReportLaneSlimmer } from './worktrees/slimming.js';
 import type { ExpiryService } from './maintenance/expiry.js';
 import type { RepoMoveReconciler } from './maintenance/repo-moves.js';
+import type { DiskService } from './maintenance/disk.js';
 import type { ServiceHandle } from './server.js';
 import type { RuntimeRegistry } from './runtime/registry.js';
 import type { SessionStore } from './sessions/store.js';
@@ -27,7 +28,7 @@ import type { ManagedRepoOverviewTracker } from './repos/overview.js';
 import type { SilasAutopilotOpsHandle } from './dispatch/silas-autopilot-ops.js';
 import type { LedgerApi } from './ledger/api.js';
 import { disposeDirectiveResources, type DirectiveProgressService } from './dispatch/directive-progress.js';
-import { LANE_SLIMMER_STOP_WAIT_MS, SHUTDOWN_FORCE_EXIT_MS } from './shutdown-budget.js';
+import { DISK_RECLAIM_STOP_WAIT_MS, LANE_SLIMMER_STOP_WAIT_MS, SHUTDOWN_FORCE_EXIT_MS } from './shutdown-budget.js';
 
 /**
  * Graceful-shutdown orchestration (issue #341). Extracted from `main.ts` with
@@ -62,6 +63,10 @@ export interface ServiceShutdownState {
   expiry?: Pick<ExpiryService, 'stop'>;
   /** Moved repositories (#427 PR 2b): its decision follow-through stops. */
   repoMoves?: Pick<RepoMoveReconciler, 'stop'>;
+  /** The disk budget and floor (#427 PR 3): its checks stop, the floor
+   * stops polling, and the shutdown waits (bounded) for a running pass to
+   * stop before its next step. */
+  disk?: Pick<DiskService, 'stop'>;
   silas?: SilasDriver;
   /** Issue #243: the autopilot ops the shutdown checkpoints and drains. */
   autopilot?: SilasAutopilotOpsHandle;
@@ -76,6 +81,40 @@ export interface ServiceShutdownState {
   deployDrift?: DeployDriftTracker;
   directiveProgress?: DirectiveProgressService;
   repoOverview?: ManagedRepoOverviewTracker;
+}
+
+/** Run a stage's stop and wait for it at most `boundMs` (#427): a failure
+ * is logged as `failed`, a stop that outlasts the bound as `late`, and the
+ * shutdown goes on either way. */
+async function stopWithin(
+  logger: ServiceShutdownLogger,
+  stop: () => Promise<void>,
+  boundMs: number,
+  failed: string,
+  late: string,
+): Promise<void> {
+  let waited: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const stopping = stop().then(
+      () => true,
+      (error: unknown) => {
+        logger.error(failed, { error: String(error) });
+        return true;
+      },
+    );
+    const stopped = await Promise.race([
+      stopping,
+      new Promise<false>((resolveWait) => {
+        waited = setTimeout(() => resolveWait(false), boundMs);
+        waited.unref?.();
+      }),
+    ]);
+    if (!stopped) logger.warn?.(late, { waited_ms: boundMs });
+  } catch (error) {
+    logger.error(failed, { error: String(error) });
+  } finally {
+    clearTimeout(waited);
+  }
 }
 
 /** The logger surface the shutdown path uses; `Logger` satisfies it. */
@@ -225,30 +264,9 @@ export function startServiceShutdown(options: ServiceShutdownOptions): void {
       }
       if (state.laneSlimmer !== undefined) {
         // Bounded (#427): a slow pass never holds the rest of shutdown.
-        let waited: ReturnType<typeof setTimeout> | undefined;
-        try {
-          const stopping = state.laneSlimmer.stop().then(
-            () => true,
-            (error: unknown) => {
-              logger.error('lane slimming stop failed', { error: String(error) });
-              return true;
-            },
-          );
-          const stopped = await Promise.race([
-            stopping,
-            new Promise<false>((resolveWait) => {
-              waited = setTimeout(() => resolveWait(false), LANE_SLIMMER_STOP_WAIT_MS);
-              waited.unref?.();
-            }),
-          ]);
-          if (!stopped) {
-            logger.warn?.('lane slimming did not stop in time; shutdown goes on (a lane slimmed part way is restored by its next turn)', { waited_ms: LANE_SLIMMER_STOP_WAIT_MS });
-          }
-        } catch (error) {
-          logger.error('lane slimming stop failed', { error: String(error) });
-        } finally {
-          clearTimeout(waited);
-        }
+        const slimmer = state.laneSlimmer;
+        await stopWithin(logger, () => slimmer.stop(), LANE_SLIMMER_STOP_WAIT_MS, 'lane slimming stop failed',
+          'lane slimming did not stop in time; shutdown goes on (a lane slimmed part way is restored by its next turn)');
       }
       if (state.expiry !== undefined) {
         try {
@@ -263,6 +281,13 @@ export function startServiceShutdown(options: ServiceShutdownOptions): void {
         } catch (error) {
           logger.error('moved-repository follow-through stop failed', { error: String(error) });
         }
+      }
+      if (state.disk !== undefined) {
+        // Bounded (#427 PR 3), as lane slimming: a reclaim step in flight
+        // (a release, a slim) gets its bound to finish.
+        const disk = state.disk;
+        await stopWithin(logger, () => disk.stop(), DISK_RECLAIM_STOP_WAIT_MS, 'disk budget stop failed',
+          'the disk budget did not stop in time; shutdown goes on (a release keeps its records first, and a lane slimmed part way is restored by its next turn)');
       }
       if (state.silas !== undefined) {
         try {
