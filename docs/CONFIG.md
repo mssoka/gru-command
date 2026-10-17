@@ -673,23 +673,33 @@ cards for those repositories in any mode except `"off"`.
 
 Three `[worktrees]` keys keep GC from filling the disk (#427).
 [WORKTREES.md](./WORKTREES.md#8-disk-view-budget-and-floor-427) describes the
-whole flow. GB here is 2^30 bytes, as `df -h` counts.
+whole flow. GB here is 2^30 bytes, as `df -h` counts. Each GB value is a
+finite number from 0 to 1000000; anything else refuses to load, naming the
+key.
 
 - **`disk_budget_gb = 30`** (default). Say GC uses 34 GB under `data_dir`: three
   lanes of merged jobs, five idle lanes and their review folders. At its next
   check (every five minutes, and after each lane is created) GC releases the
-  merged jobs' lanes (their work is saved first), deletes those jobs' review
-  folders, then slims idle lanes, oldest idle first, stopping once it is under
-  30 GB. Each step is recorded. The budget never stops or refuses a heist.
-- **`min_free_disk_gb = 10`** (default). Say the disk has 6 GB free. A new job
-  lane, or a writer child's lane, waits in a queue, and its board note says
-  "queued: 6.0 GB free is below the 10 GB floor ([worktrees] min_free_disk_gb);
-  GC is freeing space". GC frees space at once, and the lane is created as soon
-  as the disk has 10 GB free. Review lanes never wait.
+  merged jobs' lanes once they have settled (their work is saved first),
+  deletes those jobs' review folders, then slims idle lanes, oldest idle first.
+  It stops once it uses at most 27 GB (90% of the budget), and starts again
+  only over 30 GB. Each step is recorded. The budget never stops or refuses a
+  heist.
+- **`min_free_disk_gb = 10`** (default). Say the disk lanes are created on (or
+  `data_dir`'s) has 6 GB free. A new job lane, or a writer child's lane, waits
+  in a queue, and its note says "queued: 6.0 GB free is below the 10 GB floor
+  ([worktrees] min_free_disk_gb)" and what GC is doing about it ("GC is freeing
+  space", "the reclaim card is waiting for the owner's decision", or "nothing
+  more can be freed without losing work; Gru has been told"). GC frees space at
+  once, and once the disk has 10 GB free the lanes are created one at a time.
+  Review lanes never wait. A floor at or above the disk's size could never be
+  met: GC treats it as off and tells Gru.
 - **`reclaim_mode = "automatic"`** (default) frees the space on its own. With
   **`"proposed"`**, GC posts one FOR YOU card listing each step and the space
   it frees, and does nothing until you Accept. Decline changes nothing, and GC
-  asks again once its usage grows by another 10% of the budget.
+  asks again once its usage grows by another 10% of the budget past its usage
+  when you declined. Switching back to `"automatic"` withdraws an open card at
+  the next start.
 
 When GC is over the budget or under the floor and nothing it can free remains
 (every lane in use, say), Gru gets one row naming GC's usage by category, the

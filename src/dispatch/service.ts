@@ -5,7 +5,7 @@ import type { LogLevel } from '../logger.js';
 import type { JobDeliverable, LedgerApi, JobRecord } from '../ledger/api.js';
 import { requireSafeRecordId } from '../ledger/api.js';
 import type { CompletionHandoffIntent } from '../ledger/obligations.js';
-import { isJobTerminal } from '../ledger/states.js';
+import { isJobStatus, isJobTerminal } from '../ledger/states.js';
 import type { Role } from '../config.js';
 import type { AgentHandle, NativeAgentTool, SpawnOptions } from '../runtime/types.js';
 import { requireSpawnCwd } from '../roles.js';
@@ -17,7 +17,8 @@ import { recordFollowUpDelivery } from './fix-directive.js';
 import { isPromptTurnVerdict, promptVerdictFromHealth } from '../runtime/prompt-verdict.js';
 import type { PromptTurnVerdict } from '../runtime/types.js';
 import { settleRetries, RetrySettlementUnavailableError, type PacingGate, type PacingLease, type RetrySettlement } from '../runtime/pacing.js';
-import type { DiskFloorGate } from '../maintenance/disk.js';
+import type { DiskFloorGate, FloorAdmission } from '../maintenance/disk.js';
+import type { EventBus } from '../events/bus.js';
 import { WORKER_RULE_BLOCKS } from './worker-rules.js';
 import {
   assertLaneUsesBoundStore,
@@ -154,9 +155,13 @@ export interface DispatchServiceOptions {
    * settlement wait below observe shutdown instead of hanging. Absent =
    * settlement is hook-owned and the queue wait is uncancellable. */
   readonly stopSignal?: AbortSignal;
-  /** The disk floor (#427 PR 3): awaited before the job lane is created.
-   * Absent = no floor. */
+  /** The disk floor (#427 PR 3): awaited before the job's admission is
+   * reserved and its lane created. Absent = no floor. */
   readonly diskFloor?: Pick<DiskFloorGate, 'admitLane'>;
+  /** The job events (#427 PR 3): a lane waiting at the disk floor ends when
+   * its job is binned, parked, blocked or finished meanwhile. Absent = only
+   * the service's stop ends that wait. */
+  readonly bus?: Pick<EventBus, 'subscribe'>;
   /** Book of Lessons injection: pointer lines only, never chapter bodies. */
   readonly lessons?: LessonsReferencePort;
   /** Extracts a minion's opt-in lessons block at delivery settle. */
@@ -460,6 +465,7 @@ export class DispatchService {
     // evidence already exists (the boot reconciler finishes it instead).
     let deliveredRecorded = false;
     let workerLease: PacingLease | null = null;
+    let floorAdmission: FloorAdmission | null = null;
     let releaseAdmission: (() => void) | null = null;
     const releaseJobAdmission = (): void => {
       const release = releaseAdmission;
@@ -479,10 +485,6 @@ export class DispatchService {
     };
     try {
       const working = this.opts.ledger.setJobStatus(job.id, 'working');
-      // No registered agent exists yet while worktree/pacing/spawn awaits.
-      // Reserve that runtime side effect so a concurrent bin cannot close
-      // the lane then receive a late briefing.
-      releaseAdmission = this.opts.ledger.beginJobAdmission(job.id, 'initial dispatch');
 
       // (2b) Explicit completion intent BEFORE admission/side effects: the
       // durable guard row exists before any worktree or spawn, so a crash
@@ -498,27 +500,27 @@ export class DispatchService {
       // (3a) The disk floor (#427 PR 3): below [worktrees] min_free_disk_gb
       // the lane waits, FIFO, with the honest reason on the job, while GC
       // frees space; it is created once the free space is back at the floor.
-      if (this.opts.diskFloor !== undefined) {
-        let floorQueued = false;
-        const admitted = await this.opts.diskFloor.admitLane({
-          id: job.id,
-          label: input.title,
-          jobId: job.id,
-          ...(this.opts.stopSignal !== undefined ? { signal: this.opts.stopSignal } : {}),
-          queued: (info) => {
-            floorQueued = true;
-            this.opts.ledger.noteJob(job.id, info.reason);
-          },
-        });
-        if (floorQueued) this.opts.ledger.noteJob(job.id, `disk floor: admitted after ${admitted.waitedMs} ms queue wait`);
-        assertAdmissible();
-      }
+      // The wait comes before the admission is reserved, so the owner may
+      // bin or park the job meanwhile; that ends the wait.
+      floorAdmission = await this.waitAtDiskFloor(job.id, input.title);
+      assertAdmissible();
 
-      // (3) One worktree per job, fresh head, own branch (ruling 18).
-      const worktree = await this.opts.worktrees.createJobWorktree({
-        repoPath: input.repoPath,
-        jobId: job.id,
-      });
+      // No registered agent exists yet while worktree/pacing/spawn awaits.
+      // Reserve that runtime side effect so a concurrent bin cannot close
+      // the lane then receive a late briefing.
+      releaseAdmission = this.opts.ledger.beginJobAdmission(job.id, 'initial dispatch');
+
+      // (3) One worktree per job, fresh head, own branch (ruling 18). A lane
+      // the floor admitted holds the next waiter back until it is made.
+      let worktree: WorktreeLane;
+      try {
+        worktree = await this.opts.worktrees.createJobWorktree({
+          repoPath: input.repoPath,
+          jobId: job.id,
+        });
+      } finally {
+        floorAdmission?.done();
+      }
       const assertHandoff = capturePortLaneHandoff(this.opts.worktrees, worktree);
       if (reviewSource !== null) {
         try {
@@ -818,6 +820,7 @@ export class DispatchService {
 
       return { job: working, worktree, agentId: handle.id, settled };
     } catch (error) {
+      floorAdmission?.done();
       releaseWorker();
       releaseJobAdmission();
       const current = this.opts.ledger.getJob(job.id);
@@ -827,6 +830,39 @@ export class DispatchService {
       }
       this.closeHandoffQuietly(handoffPhaseId, `dispatch failed before admission: ${String(error)}`);
       throw error;
+    }
+  }
+
+  /** The disk floor's wait for one job lane (#427 PR 3), with the queue
+   * note on the job (updated as GC's answer changes) and the admission
+   * noted. The service's stop ends the wait, and so does the job leaving
+   * the states a lane may still be made in (binned, parked, blocked,
+   * finished). Null with no floor. */
+  private async waitAtDiskFloor(jobId: string, label: string): Promise<FloorAdmission | null> {
+    const floor = this.opts.diskFloor;
+    if (floor === undefined) return null;
+    const jobEnded = new AbortController();
+    const unsubscribe = this.opts.bus?.subscribe((event) => {
+      if (event.kind !== 'job.status' || event.jobId !== jobId) return;
+      const to = (event.payload as { readonly to?: unknown } | null)?.to;
+      if (typeof to === 'string' && isJobStatus(to) && (isJobTerminal(to) || to === 'parked' || to === 'blocked')) jobEnded.abort(`job "${jobId}" is ${to}`);
+    });
+    let floorQueued = false;
+    try {
+      const admitted = await floor.admitLane({
+        id: jobId,
+        label,
+        jobId,
+        signal: this.opts.stopSignal === undefined ? jobEnded.signal : AbortSignal.any([jobEnded.signal, this.opts.stopSignal]),
+        queued: (info) => {
+          floorQueued = true;
+          this.opts.ledger.noteJob(jobId, info.reason);
+        },
+      });
+      if (floorQueued) this.opts.ledger.noteJob(jobId, `disk floor: admitted after ${admitted.waitedMs} ms queue wait`);
+      return admitted;
+    } finally {
+      unsubscribe?.();
     }
   }
 

@@ -294,9 +294,14 @@ export interface VerifyQueueView {
  * the server could not read them yet. */
 export interface DiskView {
   readonly usedBytes: number | null;
+  /** Bytes of files also hard-linked from outside their walk (not in `usedBytes`). */
+  readonly sharedBytes: number | null;
   readonly categories: Readonly<Record<'lanes' | 'reviews' | 'preserves' | 'probes' | 'ledger' | 'logs' | 'other', number>> | null;
+  /** The watched disk with the least free space. */
   readonly freeBytes: number | null;
   readonly totalBytes: number | null;
+  /** Each disk the floor watches (where lanes are created, and data_dir's). */
+  readonly volumes: readonly DiskVolumeView[];
   /** 0 = the budget is off. */
   readonly budgetBytes: number;
   /** 0 = the floor is off. */
@@ -306,7 +311,27 @@ export interface DiskView {
   readonly belowFloor: boolean;
   /** Lanes waiting at the floor. */
   readonly queuedLanes: number;
+  /** Those lanes, in order, each with its honest reason. */
+  readonly floorQueue: readonly DiskFloorQueueEntryView[];
   readonly computedAt: string | null;
+}
+
+/** One disk the floor watches (#427 PR 3). */
+export interface DiskVolumeView {
+  /** What lives on it: `lanes`, `data_dir`, or both. */
+  readonly names: readonly string[];
+  readonly path: string;
+  readonly freeBytes: number;
+  readonly totalBytes: number;
+  readonly belowFloor: boolean;
+}
+
+/** One lane waiting at the disk floor (#427 PR 3). */
+export interface DiskFloorQueueEntryView {
+  readonly id: string;
+  readonly label: string;
+  readonly queuedAt: string;
+  readonly reason: string;
 }
 
 /** Provider pacing gate (server mirror; board protocol parity). A capped
@@ -953,20 +978,47 @@ function isByteCount(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
+function isDiskVolumeView(value: unknown): value is DiskVolumeView {
+  return (
+    isRecord(value) &&
+    Array.isArray(value.names) &&
+    value.names.every((name) => typeof name === 'string') &&
+    typeof value.path === 'string' &&
+    isByteCount(value.freeBytes) &&
+    isByteCount(value.totalBytes) &&
+    typeof value.belowFloor === 'boolean'
+  );
+}
+
+function isDiskFloorQueueEntryView(value: unknown): value is DiskFloorQueueEntryView {
+  return (
+    isRecord(value) &&
+    typeof value.id === 'string' &&
+    typeof value.label === 'string' &&
+    typeof value.queuedAt === 'string' &&
+    typeof value.reason === 'string'
+  );
+}
+
 function isDiskView(value: unknown): value is DiskView {
   if (!isRecord(value)) return false;
   const categories = value.categories;
   return (
     (value.usedBytes === null || isByteCount(value.usedBytes)) &&
+    (value.sharedBytes === null || isByteCount(value.sharedBytes)) &&
     (categories === null || (isRecord(categories) && DISK_CATEGORY_KEYS.every((key) => isByteCount(categories[key])))) &&
     (value.freeBytes === null || isByteCount(value.freeBytes)) &&
     (value.totalBytes === null || isByteCount(value.totalBytes)) &&
+    Array.isArray(value.volumes) &&
+    value.volumes.every(isDiskVolumeView) &&
     isByteCount(value.budgetBytes) &&
     isByteCount(value.floorBytes) &&
     (value.reclaimMode === 'automatic' || value.reclaimMode === 'proposed') &&
     typeof value.overBudget === 'boolean' &&
     typeof value.belowFloor === 'boolean' &&
     isByteCount(value.queuedLanes) &&
+    Array.isArray(value.floorQueue) &&
+    value.floorQueue.every(isDiskFloorQueueEntryView) &&
     (value.computedAt === null || typeof value.computedAt === 'string')
   );
 }

@@ -274,44 +274,66 @@ export class ExpiryService {
    * jobs'); record one `reviews.expired` per job, and return what each
    * record says. */
   async expireReviews(opts: { readonly olderThanMs?: number; readonly jobs?: readonly string[] } = {}): Promise<readonly ReviewsExpired[]> {
+    const olderThanMs = opts.olderThanMs ?? REVIEW_EXPIRY_MS;
     const expired: ReviewsExpired[] = [];
-    for (const found of this.expirableReviews(opts.olderThanMs === undefined ? {} : { olderThanMs: opts.olderThanMs })) {
+    for (const found of this.expirableReviews({ olderThanMs })) {
       if (this.stopped) break;
-      const { jobId } = found;
-      if (opts.jobs !== undefined && !opts.jobs.includes(jobId)) continue;
-      const rounds: string[] = [];
-      const gates: string[] = [];
-      const failed: { readonly folder: string; readonly error: string }[] = [];
-      let bytes = 0;
-      /** Delete a folder (a fallback gate's), or a round folder's entries
-       * but its kept files; `done` names it once nothing else is left. */
-      const remove = async (folder: string, done: string[], name: string, keepFiles: readonly string[]): Promise<void> => {
-        const entries = keepFiles.length === 0 ? null : expiredEntries(folder, keepFiles);
-        if (entries !== null && entries.length === 0) return; // expired before
-        const targets = entries === null || entries.length === readdirOrEmpty(folder).length ? [folder] : entries.map((entry) => join(folder, entry));
-        let complete = true;
-        for (const target of targets) {
-          const size = await treeBytes(target);
-          try {
-            await removeTree(target);
-            bytes += size;
-          } catch (error) {
-            complete = false;
-            failed.push({ folder: target, error: String(error) });
-          }
-        }
-        if (complete) done.push(name);
-      };
-      for (const name of found.rounds) await remove(join(this.opts.reviewsRoot, name), rounds, name, REVIEW_KEPT_FILES);
-      for (const name of found.fallbackGates) await remove(join(this.opts.reviewsRoot, 'fallback-gate', name), gates, name, []);
-      if (rounds.length + gates.length > 0) {
-        this.opts.ledger.appendCustomEvent({ kind: EXPIRY_EVENTS.reviewsExpired, jobId, payload: { job_id: jobId, rounds, fallback_gates: gates, bytes } });
-        this.log('info', 'review folders of a finished job expired', { job: jobId, rounds: rounds.length, fallback_gates: gates.length, bytes });
-        expired.push({ jobId, rounds, fallbackGates: gates, bytes });
-      }
-      if (failed.length > 0) this.log('warn', 'review folders of a finished job could not be deleted; the next reconcile tries again', { job: jobId, failed });
+      if (opts.jobs !== undefined && !opts.jobs.includes(found.jobId)) continue;
+      const done = await this.expireJobReviews(found, { olderThanMs });
+      if (done !== null) expired.push(done);
     }
     return expired;
+  }
+
+  /** Delete exactly the listed review folders of one job (#427 PR 3: what
+   * the disk budget's step, or the card the owner accepted, listed), each
+   * checked again first, without listing every review: the job is still
+   * terminal for at least `olderThanMs` (default {@link REVIEW_EXPIRY_MS}),
+   * and each folder is still there and still that job's. One
+   * `reviews.expired` records what was deleted; null when nothing was. */
+  async expireJobReviews(listed: Pick<ExpirableReviews, 'jobId' | 'rounds' | 'fallbackGates'>, opts: { readonly olderThanMs?: number } = {}): Promise<ReviewsExpired | null> {
+    const { jobId } = listed;
+    const since = this.terminalSince(jobId);
+    if (since === null || this.now() - since < (opts.olderThanMs ?? REVIEW_EXPIRY_MS)) return null;
+    const rounds: string[] = [];
+    const gates: string[] = [];
+    const failed: { readonly folder: string; readonly error: string }[] = [];
+    let bytes = 0;
+    /** Delete a folder (a fallback gate's), or a round folder's entries
+     * but its kept files; `done` names it once nothing else is left. */
+    const remove = async (folder: string, done: string[], name: string, keepFiles: readonly string[]): Promise<void> => {
+      if (!existsSync(folder)) return;
+      const entries = keepFiles.length === 0 ? null : expiredEntries(folder, keepFiles);
+      if (entries !== null && entries.length === 0) return; // expired before
+      const targets = entries === null || entries.length === readdirOrEmpty(folder).length ? [folder] : entries.map((entry) => join(folder, entry));
+      let complete = true;
+      for (const target of targets) {
+        const size = await treeBytes(target);
+        try {
+          await removeTree(target);
+          bytes += size;
+        } catch (error) {
+          complete = false;
+          failed.push({ folder: target, error: String(error) });
+        }
+      }
+      if (complete) done.push(name);
+    };
+    for (const name of listed.rounds) {
+      if (this.stopped) break;
+      if (name === 'fallback-gate' || !ROUND_FOLDER.test(name) || this.opts.ledger.getRound(name)?.jobId !== jobId) continue;
+      await remove(join(this.opts.reviewsRoot, name), rounds, name, REVIEW_KEPT_FILES);
+    }
+    for (const name of listed.fallbackGates) {
+      if (this.stopped) break;
+      if (FALLBACK_GATE_FOLDER.exec(name)?.[1] !== jobId) continue;
+      await remove(join(this.opts.reviewsRoot, 'fallback-gate', name), gates, name, []);
+    }
+    if (failed.length > 0) this.log('warn', 'review folders of a finished job could not be deleted; the next reconcile tries again', { job: jobId, failed });
+    if (rounds.length + gates.length === 0) return null;
+    this.opts.ledger.appendCustomEvent({ kind: EXPIRY_EVENTS.reviewsExpired, jobId, payload: { job_id: jobId, rounds, fallback_gates: gates, bytes } });
+    this.log('info', 'review folders of a finished job expired', { job: jobId, rounds: rounds.length, fallback_gates: gates.length, bytes });
+    return { jobId, rounds, fallbackGates: gates, bytes };
   }
 
   /** When the job became terminal (its newest `job.status` to that status),

@@ -278,11 +278,22 @@ async function processCwdsAsync(timeoutMs: number): Promise<Map<number, string> 
  * out), `onCwdError` is told and the argv matches still count, as the
  * synchronous enumerator's null cwds do: never silently. That enumerator,
  * which the sweep uses, is unchanged. `listCwds`: its tests' seam. */
-export async function psEnumeratorAsync(treePath: string, opts: {
+export async function psEnumeratorAsync(treePath: string, opts: ProcessListingOptions): Promise<readonly TreeProcess[]> {
+  return (await processListingAsync(opts))(treePath);
+}
+
+/** {@link psEnumeratorAsync}'s options. */
+export interface ProcessListingOptions {
   readonly timeoutMs?: number;
   readonly onCwdError: (error: unknown) => void;
   readonly listCwds?: (timeoutMs: number) => Promise<Map<number, string> | null>;
-}): Promise<readonly TreeProcess[]> {
+}
+
+/** One process listing (`ps` and the working directories, read once, off
+ * the event loop, as {@link psEnumeratorAsync} reads them) that answers for
+ * any number of trees (#427 PR 3: the disk budget lists once per pass, not
+ * once per lane). */
+export async function processListingAsync(opts: ProcessListingOptions): Promise<(treePath: string) => readonly TreeProcess[]> {
   const timeoutMs = opts.timeoutMs ?? 30_000;
   const [listed, cwds] = await Promise.allSettled([
     execFileBounded('ps', ['-axo', 'pid=,command='], timeoutMs),
@@ -290,7 +301,9 @@ export async function psEnumeratorAsync(treePath: string, opts: {
   ]);
   if (listed.status === 'rejected') throw listed.reason instanceof Error ? listed.reason : new Error(String(listed.reason));
   if (cwds.status === 'rejected') opts.onCwdError(cwds.reason);
-  return treeProcesses(treePath, listed.value, cwds.status === 'fulfilled' ? cwds.value : null);
+  const out = listed.value;
+  const cwdMap = cwds.status === 'fulfilled' ? cwds.value : null;
+  return (treePath) => treeProcesses(treePath, out, cwdMap);
 }
 
 export interface SweepPreservation {
@@ -336,6 +349,17 @@ export class LaneSnapshotError extends Error {
   constructor(readonly path: string, readonly detail: string) {
     super(`sweep refused: the snapshot of the uncommitted work in ${path} ${detail} — the tree is retained; resolve what git reported (or stop what still writes in the lane), then release again`);
     this.name = 'LaneSnapshotError';
+  }
+}
+
+/** A release that does not pause to ask (#427 PR 3: the disk budget's,
+ * which nobody answers) met processes rooted in the lane. Refused by name
+ * before anything is removed: the tree is retained, nothing is killed and
+ * no owner card is raised. */
+export class LaneLiveProcessError extends Error {
+  constructor(readonly path: string, readonly processes: readonly TreeProcess[]) {
+    super(`sweep refused: ${String(processes.length)} live process(es) rooted in ${path} (pids ${processes.map((proc) => proc.pid).join(', ')}), and this release does not pause to ask — the tree is retained and nothing is killed`);
+    this.name = 'LaneLiveProcessError';
   }
 }
 
@@ -463,6 +487,12 @@ export interface SweepRequest {
    * `worktree.submodule-work-discarded`, naming each submodule. The
    * autopilot never passes it. */
   readonly discardSubmoduleWork?: string;
+  /** #427 PR 3: what a live process rooted in the lane does to the release.
+   * `pause` (the default) records it and asks ({@link onSweepPaused});
+   * `refuse` throws {@link LaneLiveProcessError} instead, for a caller nobody
+   * answers (the disk budget): no pause, no card, and no process is reaped
+   * or killed, GC's own services included. */
+  readonly onLiveProcess?: 'pause' | 'refuse';
 }
 
 /** One release attempt's state across its steps (#427). */
@@ -1839,6 +1869,18 @@ export class WorktreeManager {
       [{ key: 'id', value: row.id }, { key: 'reason', value: SETUP_INCOMPLETE }], 0);
   }
 
+  /** Why the ledger says a slim of the lane would be refused for good
+   * (#427 PR 3: the disk budget's estimate leaves such a lane out), or null:
+   * it has no bootstrap record, or a restore of it did not get back what
+   * setup made. What its base manifest says is the caller's to read. */
+  slimRecordRefusal(laneId: string): string | null {
+    const row = this.opts.ledger.getWorktree(laneId);
+    if (row === null) return 'the lane is not in the registry';
+    if (this.setupMade(row) === null) return 'the lane has no bootstrap record, so a restore could not tell what it must bring back';
+    if (this.restoreWasIncomplete(row)) return 'a restore of the lane did not get back what setup made, so it is never slimmed again';
+    return null;
+  }
+
   /** The manifest the lane was built from (#427): the one committed at its
    * base (the registry row's `sha`, which bootstrap applied), never its
    * HEAD, so a minion's commit chooses neither what a slim deletes nor what
@@ -2339,11 +2381,15 @@ export class WorktreeManager {
     // is dual-keyed (registry row live AND still enumerated in the tree)
     // so a recycled pid can never redirect it; foreign processes keep the
     // full pause-and-ask contract below.
-    const reaped = await this.reapTrackedServiceProcesses(row);
+    const refuse = input.onLiveProcess === 'refuse';
+    const reaped = refuse ? [] : await this.reapTrackedServiceProcesses(row);
     assertCleanup();
 
     // (2) Enumerate processes rooted in the tree BEFORE removal.
     const processes = this.enumerate(row.path).filter((proc) => !reaped.includes(proc.pid));
+    // A release nobody answers refuses instead of pausing (#427 PR 3): the
+    // caller's catch withdraws the preserve copy, and the tree is retained.
+    if (processes.length > 0 && refuse) throw new LaneLiveProcessError(row.path, processes);
     if (processes.length > 0) {
       // Perkins r2 B2: confirmKill is answered against the RECORDED set
       // (ruling 18b rows from a prior pause), never a fresh enumeration
@@ -4282,7 +4328,7 @@ async function reclaimVerdict(lanePath: string, entry: string): Promise<string |
 
 /** A manifest `[[link]]` `at` or `[[copy]]` `to` in the form of a reclaim
  * entry (`./a/b/` → `a/b`). */
-function normalizedManifestPath(path: string): string {
+export function normalizedManifestPath(path: string): string {
   return path.trim().split(/[\\/]/u).filter((segment) => segment !== '' && segment !== '.').join('/');
 }
 

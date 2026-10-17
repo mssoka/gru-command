@@ -82,8 +82,9 @@ export const LAST_ACTIVITY_KINDS = ['agent.state', 'job.delivered', 'job.status'
 
 /** The job events after which a lane the manager declined is asked again:
  * a turn, a delivery, a verification, a restore or a claimed provider
- * continuation. */
-const ANSWER_KINDS = [
+ * continuation. The disk budget (#427 PR 3) asks a lane whose release
+ * refused again after the same news. */
+export const ANSWER_KINDS = [
   ...LAST_ACTIVITY_KINDS,
   'verification.requested', 'verification.no-start', 'worktree.rehydrate-failed', 'provider.recovery-claimed',
 ] as const;

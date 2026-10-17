@@ -6,7 +6,7 @@ import {
   type ServiceShutdownLogger,
   type ServiceShutdownState,
 } from '../src/service-shutdown.js';
-import { LANE_SLIMMER_STOP_WAIT_MS, SHUTDOWN_FORCE_EXIT_MS } from '../src/shutdown-budget.js';
+import { DISK_RECLAIM_STOP_WAIT_MS, LANE_SLIMMER_STOP_WAIT_MS, SHUTDOWN_FORCE_EXIT_MS } from '../src/shutdown-budget.js';
 import { CESSATION_IDLE_TIMEOUT_MS } from '../src/runtime/pi-adapter.js';
 import type { RuntimeRegistry } from '../src/runtime/registry.js';
 import type { SessionStore } from '../src/sessions/store.js';
@@ -352,18 +352,56 @@ describe('service shutdown orchestration (issue #341, R3-2 executable)', () => {
     expect(run.lines.filter((line) => line.level === 'error').map((line) => line.msg)).toEqual(['expiry stop failed']);
   });
 
-  it('stops the disk budget after the moved-repository follow-through; a failing stop never skips what follows (#427 PR 3)', async () => {
+  it('stops the disk budget after the moved-repository follow-through and waits for its reclaim step in flight; a failing stop never skips what follows (#427 PR 3)', async () => {
     const order: string[] = [];
+    let finishStep!: () => void;
     const state: ServiceShutdownState = {
       repoMoves: { stop: () => { order.push('repoMoves.stop'); } },
-      disk: { stop: () => { order.push('disk.stop'); throw new Error('timer gone'); } },
+      disk: {
+        stop: async () => {
+          order.push('disk.stop');
+          await new Promise<void>((resolveStep) => { finishStep = resolveStep; });
+          order.push('disk.step-finished');
+          throw new Error('the step ended in error');
+        },
+      },
       handle: fakeHandle(order),
     };
     const run = runShutdown(state);
+    await vi.waitFor(() => expect(order).toContain('disk.stop'));
+    for (let i = 0; i < 10; i += 1) await new Promise((resolveTick) => setTimeout(resolveTick, 0));
+    expect(order).toEqual(['repoMoves.stop', 'disk.stop']);
+    finishStep();
     await run.exited;
     expect(run.exits).toEqual([0]);
-    expect(order).toEqual(['repoMoves.stop', 'disk.stop', 'handle.stop']);
+    expect(order).toEqual(['repoMoves.stop', 'disk.stop', 'disk.step-finished', 'handle.stop']);
     expect(run.lines.filter((line) => line.level === 'error').map((line) => line.msg)).toEqual(['disk budget stop failed']);
+  });
+
+  it('waits for a slow disk reclaim step at most its bound, well inside the force-exit budget, then goes on (#427 PR 3)', async () => {
+    vi.useFakeTimers();
+    try {
+      const order: string[] = [];
+      const state: ServiceShutdownState = {
+        // A release whose git never returns in time.
+        disk: { stop: async () => { order.push('disk.stop'); await new Promise<void>(() => {}); } },
+        handle: fakeHandle(order),
+      };
+      expect(DISK_RECLAIM_STOP_WAIT_MS).toBeLessThan(SHUTDOWN_FORCE_EXIT_MS / 2);
+      const run = runShutdown(state);
+      await vi.advanceTimersByTimeAsync(DISK_RECLAIM_STOP_WAIT_MS - 1);
+      expect(order).toEqual(['disk.stop']);
+      await vi.advanceTimersByTimeAsync(1);
+      await run.exited;
+      expect(run.exits).toEqual([0]);
+      expect(run.forced()).toBe(false);
+      expect(order).toEqual(['disk.stop', 'handle.stop']);
+      expect(run.lines.filter((line) => line.level === 'warn').map((line) => line.msg)).toEqual([
+        'the disk budget did not stop in time; shutdown goes on (a release keeps its records first, and a lane slimmed part way is restored by its next turn)',
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('waits for a slow lane-slimming pass at most its bound, well inside the force-exit budget, then goes on (#427)', async () => {

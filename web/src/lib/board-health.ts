@@ -293,21 +293,36 @@ function gib(bytes: number): string {
   return (bytes / 1024 ** 3).toFixed(1);
 }
 
-/** The disk pair (#427 PR 3): GC's usage, the disk's free space, the budget
- * and the floor. Below the floor is an alert (new lanes wait), over the
- * budget a warning (GC frees space; the budget never stops a heist). */
+/** {@link gib} rounded down, for a free space read against the floor: 9.96
+ * GB free reads "9.9", never "10.0" below a 10 GB floor. */
+function gibDown(bytes: number): string {
+  return (Math.floor((bytes / 1024 ** 3) * 10 + 1e-9) / 10).toFixed(1);
+}
+
+/** The disk pair (#427 PR 3): GC's usage, the free space of the disk it
+ * watches with the least, the budget and the floor; the tooltip names each
+ * watched disk and every lane waiting at the floor with its reason. Below
+ * the floor is an alert (new lanes wait), over the budget a warning (GC
+ * frees space; the budget never stops a heist). */
 export function diskCard(disk: DiskView): HealthCardView {
   const used = disk.usedBytes === null ? null : `${gib(disk.usedBytes)} GB`;
   const value = used ?? 'walking';
   const budget = disk.budgetBytes === 0 ? 'budget off' : `budget ${gib(disk.budgetBytes)} GB`;
   const floor = disk.floorBytes === 0 ? 'floor off' : `floor ${gib(disk.floorBytes)} GB`;
-  const free = disk.freeBytes === null ? 'free unknown' : `${gib(disk.freeBytes)} GB free`;
+  const free = disk.freeBytes === null ? 'free unknown' : `${gibDown(disk.freeBytes)} GB free`;
   const flag = disk.queuedLanes > 0
     ? `${disk.queuedLanes} QUEUED`
     : disk.belowFloor ? 'BELOW FLOOR' : disk.overBudget ? 'OVER BUDGET' : null;
   const categories = disk.categories === null
     ? 'usage not walked yet'
     : `lanes ${gib(disk.categories.lanes)} · reviews ${gib(disk.categories.reviews)} · preserves ${gib(disk.categories.preserves)} · probes ${gib(disk.categories.probes)} · ledger ${gib(disk.categories.ledger)} · logs ${gib(disk.categories.logs)} · other ${gib(disk.categories.other)} GB`;
+  const shared = disk.sharedBytes !== null && disk.sharedBytes > 0 ? `; ${gib(disk.sharedBytes)} GB hard-linked from outside, not counted` : '';
+  const disks = disk.volumes.length > 1
+    ? `; ${disk.volumes.map((volume) => `the ${volume.names.join(' and ')} disk (${volume.path}) has ${gibDown(volume.freeBytes)} GB free of ${gib(volume.totalBytes)} GB${volume.belowFloor ? ', below the floor' : ''}`).join('; ')}`
+    : `; the disk has ${free}${disk.totalBytes === null ? '' : ` of ${gib(disk.totalBytes)} GB`}`;
+  const waiting = disk.floorQueue.length === 0
+    ? ''
+    : `; waiting at the floor: ${disk.floorQueue.map((entry) => `${entry.label} (${entry.id}): ${entry.reason}`).join('; ')}`;
   return card(
     'disk',
     'disk',
@@ -315,9 +330,8 @@ export function diskCard(disk: DiskView): HealthCardView {
     `${free} · ${budget} · ${floor}`,
     disk.belowFloor ? 'alert' : disk.overBudget ? 'warn' : used === null ? 'muted' : 'ok',
     flag,
-    `GC uses ${used ?? 'an unknown amount'} under data_dir (${categories}); the disk has ${free}${disk.totalBytes === null ? '' : ` of ${gib(disk.totalBytes)} GB`}; ${budget}, ${floor}; reclaim ${disk.reclaimMode}` +
-      (disk.queuedLanes > 0 ? `; ${disk.queuedLanes} lane(s) wait at the floor` : '') +
-      ' · blocks an APFS clone shares cannot be seen, so they are counted in full',
+    `GC uses ${used ?? 'an unknown amount'} under data_dir (${categories}${shared})${disks}; ${budget}, ${floor}; reclaim ${disk.reclaimMode}${waiting}` +
+      ' · blocks an APFS clone shares cannot be detected, so they are counted in full',
     { lead: '', num: null, unit: value },
     disk.queuedLanes > 0 ? { num: disk.queuedLanes, unit: ' QUEUED' } : flag === null ? null : { num: null, unit: flag },
   );

@@ -675,11 +675,12 @@ describe('tracked child workers: lifecycle, results and recovery', () => {
     h.close();
   });
 
-  it('a writer child\'s new lane waits at the disk floor with a note on its job, and is created once free space is back; a read-only child\'s never waits (#427 PR 3)', async () => {
+  it('a writer child\'s new lane waits at the disk floor with the note on its own record (never over the parent job\'s), and is created once free space is back; a read-only child\'s never waits (#427 PR 3)', async () => {
     let free = 6 * GIB;
     let statfsCalls = 0;
-    const floor = new DiskFloorGate({ floorGb: 10, path: tmpdir(), statfs: async () => { statfsCalls += 1; return { freeBytes: free, totalBytes: 500 * GIB }; }, pollMs: 60_000 });
+    const floor = new DiskFloorGate({ floorGb: 10, volumes: [{ name: 'lanes', path: tmpdir() }], statfs: async () => { statfsCalls += 1; return { freeBytes: free, totalBytes: 500 * GIB }; }, device: async () => 'disk', pollMs: 60_000 });
     const h = makeHarness({ diskFloor: floor });
+    const parentNote = h.ledger.noteJob('job-1', 'the parent\'s own note').note;
     const reader = h.request({ idempotencyKey: 'key-reader' });
     await waitForChild(h, reader.record.id, (state) => state === 'done');
     expect(statfsCalls).toBe(0);
@@ -688,15 +689,35 @@ describe('tracked child workers: lifecycle, results and recovery', () => {
     await waitFor(() => floor.view().length === 1, 'the writer child to wait at the floor');
     expect(h.worktrees.getWorktree(admission.record.id)).toBeNull();
     expect(h.ledger.getChildWorker(admission.record.id)?.state).toBe('queued');
-    expect(h.ledger.getJob('job-1')?.note).toBe(
-      `child worker ${admission.record.id} queued: 6.0 GB free is below the 10 GB floor ([worktrees] min_free_disk_gb); GC is freeing space`,
-    );
+    const childNotes = (): readonly unknown[] => h.ledger.listEvents({ limit: 2000 }).slice().reverse()
+      .filter((event) => event.kind === 'child.note' && (event.payload as { childId?: unknown }).childId === admission.record.id)
+      .map((event) => (event.payload as { note?: unknown }).note);
+    expect(childNotes()).toEqual(['queued: 6.0 GB free is below the 10 GB floor ([worktrees] min_free_disk_gb); GC is checking what it can free']);
+    expect(h.ledger.getJob('job-1')?.note).toBe(parentNote);
 
     free = 12 * GIB;
     floor.recheck();
     await waitForChild(h, admission.record.id, (state) => state === 'done');
     expect(h.worktrees.getWorktree(admission.record.id)?.branch).toBe(`gru/job-1-child-${admission.record.id}`);
-    expect(h.ledger.getJob('job-1')?.note).toMatch(new RegExp(`^disk floor: child worker ${admission.record.id} admitted after \\d+ ms queue wait$`, 'u'));
+    expect(childNotes()[1]).toMatch(/^disk floor: admitted after \d+ ms queue wait$/u);
+    expect(h.ledger.getJob('job-1')?.note).toBe(parentNote);
+    floor.stop();
+    h.close();
+  });
+
+  it('a writer child waiting at the disk floor ends on its own cancel: cancelled, no lane made, and the floor queue empty (#427 PR 3)', async () => {
+    const floor = new DiskFloorGate({ floorGb: 10, volumes: [{ name: 'lanes', path: tmpdir() }], statfs: async () => ({ freeBytes: 6 * GIB, totalBytes: 500 * GIB }), device: async () => 'disk', pollMs: 60_000 });
+    const h = makeHarness({ diskFloor: floor });
+    const admission = h.request({ authority: 'writer', idempotencyKey: 'key-cancelled' });
+    await waitFor(() => floor.view().length === 1, 'the writer child to wait at the floor');
+
+    const cancelled = await h.service.cancel(admission.record.id, 'the owner stopped it');
+
+    expect(cancelled.state).toBe('cancelled');
+    expect(h.ledger.getChildWorker(admission.record.id)?.resultState).toBe('cancelled');
+    expect(h.worktrees.getWorktree(admission.record.id)).toBeNull();
+    expect(floor.view()).toEqual([]);
+    expect(h.spawns).toHaveLength(0);
     floor.stop();
     h.close();
   });

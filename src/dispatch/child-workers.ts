@@ -22,7 +22,7 @@ import {
 import { parseTranscriptContent } from '../transcripts/service.js';
 import type { Role } from '../config.js';
 import type { WorktreeLane, WorktreePort } from './worktree-port.js';
-import type { DiskFloorGate } from '../maintenance/disk.js';
+import type { DiskFloorGate, FloorAdmission } from '../maintenance/disk.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -1016,42 +1016,53 @@ export class ChildWorkerService {
 
   /** Reuse a lane that survived a restart; otherwise create the child
    * worker's own lane at the parent lane's current HEAD. A writer child's
-   * new lane first waits at the disk floor (#427 PR 3), as a job lane does;
-   * a read-only child's does not (it holds no work). */
+   * new lane first waits at the disk floor (#427 PR 3), as a job lane does,
+   * until its own cancel or the service's stop; its queue note goes on the
+   * child's record (`child.note`), never over the parent job's note. A
+   * read-only child's lane does not wait (it holds no work). */
   private async ensureLane(record: ChildWorkerRecord, signal: AbortSignal): Promise<WorktreeLane> {
     const existing = this.opts.worktrees.getWorktree(record.id);
     if (existing !== null && existing.status !== 'swept') { capturePortLaneHandoff(this.opts.worktrees, existing)(); return existing; }
+    let admission: FloorAdmission | null = null;
     if (record.authority === 'writer' && this.opts.diskFloor !== undefined) {
+      const note = (text: string): void => {
+        this.opts.ledger.appendCustomEvent({ kind: 'child.note', jobId: record.jobId, payload: { childId: record.id, note: text } });
+      };
       let floorQueued = false;
-      const admitted = await this.opts.diskFloor.admitLane({
+      admission = await this.opts.diskFloor.admitLane({
         id: record.id,
         label: record.label ?? record.purpose,
         jobId: record.jobId,
         signal,
         queued: (info) => {
           floorQueued = true;
-          this.opts.ledger.noteJob(record.jobId, `child worker ${record.id} ${info.reason}`);
+          note(info.reason);
         },
       });
-      if (floorQueued) this.opts.ledger.noteJob(record.jobId, `disk floor: child worker ${record.id} admitted after ${admitted.waitedMs} ms queue wait`);
-      if (signal.aborted) throw new Error('stopped while the lane waited at the disk floor');
+      if (floorQueued) note(`disk floor: admitted after ${admission.waitedMs} ms queue wait`);
     }
-    const parentLane = this.opts.worktrees
-      .listWorktrees({ jobId: record.jobId })
-      .find((lane) => lane.kind === 'job' && lane.status === 'active');
-    if (parentLane === undefined) {
-      throw new Error(
-        `job "${record.jobId}" has no active parent lane — a child lane must base on a live parent lane`,
-      );
+    try {
+      if (admission !== null && signal.aborted) throw new Error('stopped while the lane waited at the disk floor');
+      const parentLane = this.opts.worktrees
+        .listWorktrees({ jobId: record.jobId })
+        .find((lane) => lane.kind === 'job' && lane.status === 'active');
+      if (parentLane === undefined) {
+        throw new Error(
+          `job "${record.jobId}" has no active parent lane — a child lane must base on a live parent lane`,
+        );
+      }
+      capturePortLaneHandoff(this.opts.worktrees, parentLane)();
+      return await this.opts.worktrees.createChildWorktree({
+        repoPath: parentLane.repoPath,
+        jobId: record.jobId,
+        childId: record.id,
+        parentPath: parentLane.path,
+        authority: record.authority,
+      });
+    } finally {
+      // A lane the floor admitted holds the next waiter back until it is made.
+      admission?.done();
     }
-    capturePortLaneHandoff(this.opts.worktrees, parentLane)();
-    return this.opts.worktrees.createChildWorktree({
-      repoPath: parentLane.repoPath,
-      jobId: record.jobId,
-      childId: record.id,
-      parentPath: parentLane.path,
-      authority: record.authority,
-    });
   }
 
   private async releaseLaneQuietly(worktreeId: string): Promise<void> {

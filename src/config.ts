@@ -1050,6 +1050,20 @@ function requireNonNegativeNumber(value: unknown, file: string, field: string): 
   return value;
 }
 
+/** The highest `[worktrees] disk_budget_gb` and `min_free_disk_gb` (#427
+ * PR 3): a million GB keeps every byte count well inside
+ * `Number.MAX_SAFE_INTEGER`. */
+export const MAX_DISK_GB = 1_000_000;
+
+/** `[worktrees] disk_budget_gb` or `min_free_disk_gb` (#427 PR 3): a finite
+ * number of GB from 0 to {@link MAX_DISK_GB}. */
+function requireDiskGb(value: unknown, file: string, field: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > MAX_DISK_GB) {
+    throw new ConfigError(`${field} must be a finite number of GB from 0 to ${String(MAX_DISK_GB)}, got: ${String(value)}`, file, field);
+  }
+  return value;
+}
+
 /** `[worktrees] reclaim_mode` (#427 PR 3); absent is `automatic`. */
 function requireReclaimMode(value: unknown, file: string): ReclaimMode {
   if (value === undefined) return 'automatic';
@@ -1494,8 +1508,8 @@ export function loadConfig(
         root: table['root'] !== undefined ? expandTilde(requireString(table['root'], file, 'worktrees.root'), home) : '',
         preserveRoot: table['preserve_root'] !== undefined ? expandTilde(requireString(table['preserve_root'], file, 'worktrees.preserve_root'), home) : '',
         setupTimeoutMs: table['setup_timeout_ms'] !== undefined ? requirePositiveInt(table['setup_timeout_ms'], file, 'worktrees.setup_timeout_ms') : 120_000,
-        diskBudgetGb: table['disk_budget_gb'] !== undefined ? requireNonNegativeNumber(table['disk_budget_gb'], file, 'worktrees.disk_budget_gb') : DEFAULT_DISK_BUDGET_GB,
-        minFreeDiskGb: table['min_free_disk_gb'] !== undefined ? requireNonNegativeNumber(table['min_free_disk_gb'], file, 'worktrees.min_free_disk_gb') : DEFAULT_MIN_FREE_DISK_GB,
+        diskBudgetGb: table['disk_budget_gb'] !== undefined ? requireDiskGb(table['disk_budget_gb'], file, 'worktrees.disk_budget_gb') : DEFAULT_DISK_BUDGET_GB,
+        minFreeDiskGb: table['min_free_disk_gb'] !== undefined ? requireDiskGb(table['min_free_disk_gb'], file, 'worktrees.min_free_disk_gb') : DEFAULT_MIN_FREE_DISK_GB,
         reclaimMode: requireReclaimMode(table['reclaim_mode'], file),
       };
     }

@@ -879,6 +879,9 @@ describe('worktrees config (E8, manager lane)', () => {
       root: join(home, 'worktrees'),
       preserveRoot: join(home, 'worktree-preserves'),
       setupTimeoutMs: 120_000,
+      diskBudgetGb: 30,
+      minFreeDiskGb: 10,
+      reclaimMode: 'automatic',
     });
   });
 

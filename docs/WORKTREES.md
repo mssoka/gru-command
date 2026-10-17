@@ -855,84 +855,150 @@ inside a size and off a full disk ([CONFIG.md](./CONFIG.md)).
 queue, show GC's usage under `data_dir` by category: each live lane (job,
 review or child, slim or not), review artifacts (`reviews/`), preserve copies
 (`preserve_root`), onboarding probes, the ledger database (`ledger/`), logs, and
-everything else under `data_dir`; plus the disk's free space and total
-(`fs.statfs` of `data_dir`), the budget and the floor. Usage is the walk of
-[§6](#6-lane-slimming-427): allocated blocks, each inode once within a walk,
-never through a link. Blocks an APFS clone shares with another file cannot be
-seen by the walk and are counted in full, and the view says so. The walk is
-async, runs at most once a minute and is cached; a lane root or preserve root
-configured outside `data_dir` still counts as GC's.
+everything else under `data_dir`. They also show the free space and total
+(`fs.statfs`) of each disk the floor watches: the one lanes are created on
+(`[worktrees] root`) and `data_dir`'s, one entry when they share a disk. The
+budget and the floor are shown too. Usage is the walk of
+[§6](#6-lane-slimming-427): allocated blocks, never through a link, with each
+hard-linked file counted once within a walk (each lane, each category). A file
+also hard-linked from outside its walk (a package store's links) is shown
+apart, as shared bytes, and is not in the usage: deleting the walk frees none
+of it. Blocks an APFS clone shares with another file cannot be detected and
+are counted in full; the view's note says so. The walk is async, runs at most
+once a minute and is cached; a reclaim that freed space drops the cache, so
+the next numbers are walked afresh. A lane root or preserve root configured
+outside `data_dir` still counts as GC's.
 
 **The budget** (`disk_budget_gb`, default 30) is checked at start, every five
 minutes and after each lane is created. Over it, with `reclaim_mode =
-"automatic"` (the default), GC frees space losslessly, in this order, and
-stops once it is under the budget and the disk at or above the floor:
+"automatic"` (the default), GC frees space losslessly, in this order. It stops
+once its usage is at most 90% of the budget (27 GB of 30) and the disks are at
+or above the floor. The next reclaim starts only once GC is over the budget
+again, so a lane made right after a reclaim does not start another.
 
-1. **Release the lanes of terminal jobs** (merged, done or binned), largest
-   first: the existing release of [§3](#3-preserve-first-ordered-sweep-18c),
-   unattended as the autopilot's (`requireReleaseProofs`), which saves the
-   lane's work before removing it. A lane with a process rooted in it, a paused
-   release, a job lane whose child workers have not finished, or a lane an
-   active `sweep-ack` decision holds is skipped, and so is a lane whose release
-   refuses: nothing is killed and no work is discarded.
-2. **Delete the review folders of terminal jobs**, without
+1. **Release the lanes of finished jobs** (merged, done or binned) that have
+   settled, largest first. This is the existing release of
+   [§3](#3-preserve-first-ordered-sweep-18c), unattended as the autopilot's
+   (`requireReleaseProofs`), which saves the lane's work before removing it. A
+   lane is released only when all of these hold:
+   - the job ended at least 10 minutes ago;
+   - no review round of the job is pending or live;
+   - no verification run of the job is unsettled;
+   - no child worker of the job is unfinished (for the job's lane and each
+     child's lane);
+   - the lane's release is not paused;
+   - no active `sweep-ack` decision holds it;
+   - no process is rooted in it (one listing per pass).
+
+   A process that appears while the release copies the lane's untracked files
+   makes it refuse rather than pause: no owner card, nothing killed, and no
+   preserve copy left behind. A lane whose release refused is not asked again
+   until its job has news (a turn, a delivery, a verification, a restore) or an
+   hour has passed. A pass runs at most three releases (each makes synchronous
+   git calls); the rest follow in a pass 15 seconds later.
+2. **Delete the review folders of finished jobs**, without
    [§7](#7-expiry-moved-repositories-and-reset-427)'s 14-day wait, keeping what
    expiry keeps (an open job's folders, a round or job the ledger does not
-   know).
+   know). A job with a review round pending or live keeps its folders. The
+   folders are listed once per pass, and a step deletes exactly the folders it
+   names, each checked again.
 3. **Slim idle lanes**, oldest idle first: any job or writer-child lane whose
    job is not `working` (or `dispatched`), with no minion turn holding or
-   waiting for a worker slot, no verification, no provider wait and no live
-   directive, re-brief or revision, and whose job's last activity is at least
-   30 minutes old. The slim is [§6](#6-lane-slimming-427)'s `slim()`, with all
-   its checks; a lane it declines is skipped.
+   waiting for a worker slot, no verification, no provider wait, no live
+   directive, re-brief or revision and no unfinished child worker, and whose
+   job's last activity (a turn's end, a delivery, a restore of its lanes, a
+   verification's end) is at least 30 minutes old. A lane restored in the last
+   30 minutes is never slimmed again. The slim is
+   [§6](#6-lane-slimming-427)'s `slim()`, with all its checks; a lane it
+   declines is skipped.
 
-Each step is recorded as `disk.reclaim-step { step, lane?, job_id, outcome,
-freed_bytes, reason, trigger }`, and each pass that ran a step as
-`disk.reclaim-pass`. What a step freed is the walk of what it touched: a
-released lane's bytes less its preserve copy, the deleted review folders, a
-slimmed lane before and after.
+Each step is recorded as `disk.reclaim-step { step, lane? | rounds and
+fallback_gates, job_id, outcome, freed_bytes, reason, trigger }`, and each pass
+that ran a step as `disk.reclaim-pass` (with how many releases it left for the
+next). A skip is recorded once per kind of reason: its numbers (a pid, a count)
+are left out, so a watcher that respawns under a new pid is not recorded
+again, and a different reason is. What a step freed is the walk of what it
+touched: a released lane's bytes less its preserve copy, the deleted review
+folders, a slimmed lane before and after. The service's shutdown waits up to
+five seconds for a step in flight.
 
 **`reclaim_mode = "proposed"`** does none of that. GC posts one FOR YOU card
 (kind `disk.reclaim-proposal`, a typed owner decision) listing exactly the steps
 it would take, each with the space it would free, stopping the list once the
-estimates get it under the budget and above the floor. The list is recorded
-first (`disk.reclaim-proposed`). **Accept** runs exactly those steps, in order,
-each checked again (a lane in use by then is skipped), stopping once satisfied.
-**Decline** changes nothing (`disk.reclaim-declined`) and holds until GC's
-usage grows by another 10% of the budget (of the floor, when the budget is
-off); once the condition clears, the hold ends (`disk.reclaim-hold-ended`). A
-card nobody answered is withdrawn when the condition clears. One card at a
-time.
+estimates reach 90% of the budget and the floor. The card lists at most three
+releases, and no slim that `slim()` would refuse for good: a lane with no
+bootstrap record, one whose restore came back incomplete, or a reclaim folder
+a `[[link]]` or `[[copy]]` destination lies under. The list is recorded first
+(`disk.reclaim-proposed`). **Accept** runs exactly those steps, in order, each
+checked again (a lane in use by then is skipped; a review step deletes only
+the folders it names), stopping once satisfied. An Accept that leaves GC over
+its budget or the disk below the floor tells Gru (the row below), and no new
+card is posted for one check interval (five minutes). **Decline** changes
+nothing (`disk.reclaim-declined`, with GC's usage when the owner declined) and
+holds until GC's usage grows by another 10% of the budget past that usage (of
+the floor, when the budget is off). Once the condition clears, the hold ends
+(`disk.reclaim-hold-ended`). While a Decline holds and lanes wait at the floor,
+Gru is told, so nothing waits silently. A card nobody answered is withdrawn
+when the condition clears. One card at a time. When `reclaim_mode` becomes
+`"automatic"` (or the budget and floor are both turned off), the next start
+closes any open card: an unanswered one is withdrawn by GC, and an answered
+one is closed without being carried out.
 
 **The floor** (`min_free_disk_gb`, default 10). Before a job lane or a
-writer-child lane is created, the disk's free space is read; below the floor
-the lane waits in a FIFO, its job note saying "queued: <free> GB free is below
-the <floor> GB floor ([worktrees] min_free_disk_gb); GC is freeing space"
-(`disk.floor-queued`). GC runs the reclaim at once, in any mode (in
-`"proposed"` mode it posts the card at once). Each waiting lane is created, in
-order, as soon as the free space is at or above the floor (read every 15
-seconds, and after each reclaim step; `disk.floor-admitted`), and its note
-says it was admitted. Review lanes never wait: they help work finish. A free
-space that cannot be read cannot be judged: the lane is created, with an error
-log.
+writer-child lane is created, the free space of each watched disk is read.
+While one is below the floor the lane waits in a FIFO (`disk.floor-queued`),
+its note saying what GC is doing about it, with the free space rounded down
+(9.96 GB reads "9.9 GB"), and naming the disk when lanes and `data_dir` are on
+different disks:
+
+- "queued: 6.0 GB free is below the 10 GB floor ([worktrees] min_free_disk_gb);
+  GC is checking what it can free", when it starts to wait;
+- "...; GC is freeing space", while reclaim steps run;
+- "...; the reclaim card is waiting for the owner's decision", in
+  `"proposed"` mode;
+- "...; nothing more can be freed without losing work; Gru has been told", when
+  nothing is left.
+
+A job lane's note is the job's; a writer child's note goes on the child's
+record (`child.note`), never over its parent job's. The board's disk pair
+lists each waiting lane with its note. GC runs the reclaim at once, in any
+mode (in `"proposed"` mode it posts the card at once), without waiting for a
+usage walk. Once every watched disk is at or above the floor (read every 15
+seconds, and after each reclaim step), the first lane in the queue is created
+(`disk.floor-admitted`, and its note says it was admitted). The next is
+admitted only after that lane's creation finished (or 30 seconds passed) and
+the free space was read again, so a crossing never lets every waiting lane
+fill the disk at once. A lane that arrives with nobody queued and the floor
+met goes straight through. Binning, parking or blocking a job ends its lane's
+wait, and so does cancelling a writer child or stopping the service. Review
+lanes never wait: they help work finish. A free space that cannot be read
+cannot be judged: the lane is created, with an error log. A floor at or above a
+watched disk's total size could never be met: GC treats it as off (no lane
+waits for it, and nothing is freed for it), logs an error and posts one
+action-required row for Gru (kind `disk.floor-impossible`, producer-resolved).
+That row closes itself once a restart finds the floor fits.
 
 **Nothing left to free.** Over the budget or under the floor with nothing
 reclaimable left, Gru gets one **action-required** row (kind
 `disk.nothing-to-free`, producer-resolved) naming GC's usage by category, the
-largest live lanes and how much of the disk is used by things that are not
-GC's. It closes itself once GC is under its budget and the disk at or above
-the floor.
+largest live lanes and how much of each watched disk is used by things that
+are not GC's. It closes itself once GC is under its budget and the disk at or
+above the floor, or when a new reclaim card shows something can be freed again.
 
-`0` turns the budget or the floor off; with both off nothing is checked, and
-the view is still shown. The budget never stops or refuses a heist.
+`0` turns the budget or the floor off; with both off nothing is checked (the
+next start closes GC's open disk rows and cards), and the view is still shown.
+The budget never stops or refuses a heist.
 
 ## Endpoints
 
 `GET /api/disk` — the disk view of [§8](#8-disk-view-budget-and-floor-427):
-`usage { computedAt, totalBytes, categories, lanes }` (null until the first
-walk), `disk { freeBytes, totalBytes, notGcBytes }`, `budgetBytes`,
-`floorBytes`, `reclaimMode`, `overBudget`, `belowFloor`, `floorQueue` and the
-APFS-clone `note`. Authenticated like every product surface.
+`usage { computedAt, totalBytes, sharedBytes, categories, lanes }` (null until
+the first walk), `volumes [{ names, path, freeBytes, totalBytes, notGcBytes,
+belowFloor }]` (each watched disk), `unreadable` (a watched folder whose disk
+could not be read), `budgetBytes`, `floorBytes`, `floorOff` (why a configured
+floor is treated as off, or null), `reclaimMode`, `overBudget`, `belowFloor`,
+`floorQueue` and the usage `note` (shared bytes, APFS clones). Authenticated
+like every product surface.
 
 `POST /api/dispatch/release` — `{ job_id | round_id | worktree_id,
 confirm_kill?, base_branch?, discard_submodule_work? }`. The paused response carries the FULL

@@ -60,7 +60,7 @@ import { ChildWorkerService } from './dispatch/child-workers.js';
 import { createVerificationServer, type VerificationBudget } from './verify/server.js';
 import { laneLifecycleHooks, ReportLaneSlimmer, startLaneSlimmer } from './worktrees/slimming.js';
 import { ExpiryService, startExpiry } from './maintenance/expiry.js';
-import { createDiskServer, DiskFloorGate, DiskService, startDisk, type DiskBoardView } from './maintenance/disk.js';
+import { createDiskServer, diskFloorFor, diskServiceFor, startDisk, type DiskBoardView } from './maintenance/disk.js';
 import { RepoMoveReconciler } from './maintenance/repo-moves.js';
 import type { VerificationQueueView } from './verify/scheduler.js';
 import { createService } from './server.js';
@@ -1146,16 +1146,10 @@ async function main(): Promise<number> {
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   // The disk floor (#427 PR 3): below [worktrees] min_free_disk_gb free on
-  // the data_dir disk, a new job or writer-child lane waits in this FIFO
-  // (its job note says why) while the disk service frees space.
-  const diskFloor = new DiskFloorGate({
-    floorGb: config.worktrees.minFreeDiskGb,
-    path: config.dataDir,
-    record: (event) => {
-      ledger.appendCustomEvent({ kind: event.kind, jobId: event.jobId, payload: event.payload });
-    },
-    log: (level, msg, fields) => logger.log(level, msg, fields),
-  });
+  // the disk lanes are created on (or data_dir's), a new job or
+  // writer-child lane waits in this FIFO (its note says why) while the disk
+  // service frees space.
+  const diskFloor = diskFloorFor(config, { ledger, log: (level, msg, fields) => logger.log(level, msg, fields) });
   // Tracked child workers (issue #161): GC-owned nested workers. Kids
   // ride the SAME spawner, resident budget and pacing gate as any other
   // minion turn; GC owns admission, parentage, lifecycle and results.
@@ -1202,6 +1196,7 @@ async function main(): Promise<number> {
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     stopSignal: serviceStop.signal,
     diskFloor,
+    bus,
     parentTools: parentToolsFor,
     reviewSource: gitReviewSourcePreflight,
     ...(config.lessons.enabled ? { lessons: lessonReferences, lessonsCapture } : {}),
@@ -1623,7 +1618,7 @@ async function main(): Promise<number> {
   // The disk view, budget and floor (#427 PR 3): GC's usage by category;
   // over the budget (or under the floor) GC frees space losslessly, or, with
   // reclaim_mode = "proposed", asks the owner in FOR YOU.
-  const disk = new DiskService({
+  const disk = diskServiceFor(config, {
     ledger,
     bus,
     notifications,
@@ -1632,16 +1627,6 @@ async function main(): Promise<number> {
     floor: diskFloor,
     workerTurns: (jobId) => pacing.gate.workerTurnsFor(jobId),
     verificationBusy: (jobId) => verifyServer.jobHasRun(jobId),
-    budgetGb: config.worktrees.diskBudgetGb,
-    mode: config.worktrees.reclaimMode,
-    paths: {
-      dataDir: config.dataDir,
-      reviews: join(config.dataDir, 'reviews'),
-      preserves: config.worktrees.preserveRoot,
-      probes: onboardingProbesDir(config.dataDir),
-      ledger: join(config.dataDir, 'ledger'),
-      logs: join(config.dataDir, 'logs'),
-    },
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   diskBoardView = () => disk.boardView();
