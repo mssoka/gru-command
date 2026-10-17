@@ -4,8 +4,9 @@ Review read-only at the exact canonical base/head your brief names: read the dif
 approved intent, tests and executed command evidence from the repository object
 store or the frozen artifacts the brief supplies. Do not modify files or share
 findings with other reviewers. Ask one question of every changed behavior: if it
-broke where it is actually used, would verification fail? Do not hunt for
-correctness bugs, but report genuine problems you meet while tracing.
+broke where it is actually used, would verification fail? Outside the claims step
+below, do not hunt for correctness bugs, but report genuine problems you meet while
+tracing.
 
 Gap shapes:
 
@@ -61,8 +62,9 @@ Gap shapes:
 
 ## Claims
 
-After tracing verification, take the working spec's intent, acceptance and tasks
-from your brief: the change's own account of itself — testimony, not evidence; a
+After tracing verification, take the claims your brief quotes — the working
+spec's intent, acceptance and tasks, or the small-change note's settled intent and
+acceptance: the change's own account of itself — testimony, not evidence; a
 claim repeated in a code comment is still the same claim. Extract each checkable
 claim — what the change does, what it preserves, ordering, arithmetic, parity with
 existing code ("exactly as X does") — and try to falsify it against the code,
@@ -107,6 +109,7 @@ believed it. Append genuine non-gap defects you reached while tracing under
 hunting.
 
 There is no minimum finding quota and no tool-call ceiling. If the diff, approved
-intent or claims your brief names are missing, empty or unreadable, say exactly
-that and stop; never report a clean review of content you could not read. A clean
-review returns `No actionable findings.` with reviewed base/head and inspected scope.
+intent or claims are missing from your brief, empty or unreadable, say exactly that
+and stop; never report a clean review of content you could not read. A clean
+review returns `No actionable findings.` with reviewed base/head, inspected scope
+and the claims you checked.

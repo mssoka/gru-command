@@ -47,11 +47,14 @@ parallel when the runtime supports it:
   `qualifying`; settling a report is not validity.
 - [[gc-resource:skills/gc-build/review-prompts/edge-cases.md]] — diff and relevant code
   only: never the spec, intent, task list or author's explanation, so nothing steers
-  its path tracing. Commission it with `"review_role": "claims"` and no
-  `required_inputs`.
-- [[gc-resource:skills/gc-build/review-prompts/verification.md]] — diff, approved intent,
-  the working spec's acceptance and tasks as the claims it falsifies, tests and exact
-  executed verification evidence. Claims-needed lens: `"review_role": "claims"`.
+  its path tracing. Hand it the diff without the knowledge-root paths
+  (`{{context.knowledgeRoot}}`), so a committed spec cannot reach it, and commission
+  it with `"review_role": "claims"` and no `required_inputs`.
+- [[gc-resource:skills/gc-build/review-prompts/verification.md]] — diff, tests and exact
+  executed verification evidence, with the approved intent and the claims it
+  falsifies quoted in its brief: the working spec's acceptance and tasks, or on the
+  small-change route the note's settled acceptance. Claims-needed lens:
+  `"review_role": "claims"`.
 - [[gc-resource:skills/gc-build/review-prompts/intent-alignment.md]] — diff and its tests
   plus the verbatim owner-approved intent quoted into the brief; never the author's
   explanation, task list or self-review. Claims-needed lens: `"review_role": "claims"`.
@@ -84,22 +87,23 @@ re-commission it or report the infrastructure failure as above, and treat that
 lens's coverage as missing until a replacement reports; triage the replacement's
 findings when they arrive. A failed blind report never counts as coverage,
 whatever `blind-coverage` says; if its replacement is refused
-`409 blind_coverage_owned`, do not retry in a loop: report the blind lens as missing
-coverage, and review stays incomplete. Disregard any severity a reviewer assigned.
+`409 blind_coverage_owned`, do not retry in a loop: commission the blind lens again
+on the next new head, or, when no new head is due, report the blind lens as missing
+coverage and escalate to the owner; review stays incomplete until it is covered. Disregard any severity a reviewer assigned.
 Record one row per finding in the review triage log of the working spec (or
 small-change note) under the private artifact root — reviewed head, verdict,
 evidence and a reasoned disposition for every finding; never drop, merge or
 silently skip one.
 
 On a re-review of a changed head, match each finding against the logged rows
-first. Carry a row forward only when all of these hold: its disposition is
-rejected, owner ruling or pre-existing; the finding has the same location and
-claim; and since the head the row was logged at, the cited code, the code its
-evidence relied on and the approved intent are unchanged and no change adds a new
-caller of or path into the cited code. Log it again as `carried`, keeping its
-original verdict and disposition, without re-verifying it. A finding that matches
-a row that is fixed, awaiting an owner decision or unsettled is verified again; a
-fix that missed or a decision not yet made is never carried. Verify everything else.
+first. Carry a row forward when the finding has the same location and claim and,
+since the head the row was logged at, nothing changed the cited code, the code its
+evidence relied on, any caller of or path into the cited code, or the approved
+intent. Log it again as `carried` with the head range compared, keeping its
+original verdict and disposition, without re-verifying or re-fixing it; a carried
+pending owner decision stays pending until the owner rules. A row marked fixed is
+never carried: the same finding at unchanged code means the fix missed, so verify
+it again. Verify everything else.
 
 Verify each remaining claim: at the cited file and line, does the bad outcome
 actually occur? Read past the changed lines — callers, upstream guards — until you
@@ -136,11 +140,13 @@ verdict. Then:
   with that note.
 - A defect this change neither caused nor exposed: log it as pre-existing with
   its evidence and name it in the handoff; do not open new backlog for it.
-- Findings that expose wrong owner-approved acceptance need an explicit owner
-  decision; do not silently rewrite intent or create a completion claim. A wrong
-  planning detail that is not owner-approved acceptance (an I/O matrix row, a task)
-  is corrected in the spec with the approved-intent text it contradicts quoted,
-  and the correction is named in the handoff.
+- Findings that expose wrong owner-approved acceptance — what the approved intent
+  states, including a matrix row or task that restates it — need an explicit owner
+  decision; do not silently rewrite intent or create a completion claim. Any other
+  wrong planning detail (a task, a code-map entry, a matrix row) is corrected in
+  the spec with the evidence that shows it wrong — the approved-intent text it
+  contradicts, or the code or test that proves it unworkable — and named in the
+  handoff.
 - Fix all actionable in-scope defects — every other surviving group — and
   add/run regressions.
 

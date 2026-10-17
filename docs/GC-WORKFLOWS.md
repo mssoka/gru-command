@@ -62,8 +62,9 @@ this is routing compatibility, not an external BMAD dependency.
   verification and ordinary PR handoff. Generic child workers/untracked terminals
   do not replace a GC job's commissioned review handback/disposition.
 - Small-change route — reduced planning plus at least one fresh independent
-  adversarial reviewer, widened by the risk recorded before review (`medium` adds
-  the verification and edge-case lenses, `high` or unrecorded uses all four),
+  adversarial reviewer, widened by the risk re-scored against the candidate diff
+  (`medium` adds the verification and edge-case lenses, `high` or unrecorded uses
+  all four; a risk raised during review adds its lenses on the same head),
   reasoned fixes, verification and ordinary PR handoff.
 - Planning and review helper entrypoints are also independently resolvable.
 
@@ -79,10 +80,11 @@ Triage verifies every finding at its cited location and gives exactly one verdic
 ignored. `false` findings are rejected on their refutation. A `low` finding is
 rejected when users or developers are unlikely to meet it in everyday use and its
 fix adds complexity beyond a direct correction or deletion (owner ruling
-2026-10-17). On a re-review, a rejected, owner-ruled or pre-existing row is carried
-forward without re-verification only while its cited code, evidence, the approved
-intent and the paths into the cited code are unchanged since its logged head;
-fixed, owner-pending and unsettled rows are verified again. The edge-case lens
+2026-10-17). On a re-review, a matching row is carried forward without
+re-verification while nothing changed its cited code, evidence code, the callers
+of or paths into the cited code, or the approved intent since its logged head; a
+row marked fixed is never carried, because the same finding means the fix missed.
+The edge-case lens
 receives no claims, so nothing steers its path tracing; the verification lens
 falsifies the spec's claims. Every finding keeps a
 row and reason in the private triage log; pre-existing defects and unsettled
@@ -179,8 +181,9 @@ Edit GC templates/helpers directly, then refresh **local GC integrity**:
 
 ```sh
 npx tsc
-node dist/cli/workflow-runtime.js manifest .              # keeps the version in runtime.json
-node dist/cli/workflow-runtime.js manifest . --version N  # N: the next unused version
+node dist/cli/workflow-runtime.js manifest .   # current version still unreleased: keep it
+# or, once per release after the current version shipped:
+# node dist/cli/workflow-runtime.js manifest . --version N   # N: the next unused version
 npm test
 npm pack
 ```

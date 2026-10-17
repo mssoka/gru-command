@@ -53,4 +53,5 @@ reviewed head, reviewer, location, claim, verdict (`high`, `medium`, `low`,
 `false` or `maybe-false`), evidence and disposition — fixed with its commit,
 rejected with its reason, owner ruling with the ruling, owner decision pending,
 pre-existing, or unsettled with what would settle it. A carried row is marked
-`carried` and keeps its original verdict and disposition.
+`carried`, records the head range it was compared over and keeps its original
+verdict and disposition.
