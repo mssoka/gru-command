@@ -186,7 +186,8 @@ describe('redactCredentials', () => {
 
   it('is linear on runs of slashes and of JWT-like starts: 1 MiB of ////, of x://, of :_auth= and of eyJ-eyJ-… is redacted in well under 5 s, and the .npmrc and JWT shapes are still masked (#427)', () => {
     const MiB = 1024 * 1024;
-    for (const unit of ['//', 'x://', '//x:_auth=', 'eyJ-', 'eyJ_']) {
+    // `:_auth=` with no `//` anywhere: each key used to rescan the rest of the run.
+    for (const unit of ['//', 'x://', '//x:_auth=', ':_auth=', 'eyJ-', 'eyJ_']) {
       const line = unit.repeat(Math.floor(MiB / unit.length));
       const started = Date.now();
       redactCredentialWindow(line);

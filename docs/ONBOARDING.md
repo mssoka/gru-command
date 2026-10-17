@@ -237,7 +237,7 @@ onboarding, never the gate on an open heist.
    every other verify may wait for it that long. So Gru gets one
    action-required row, `onboarding.proof-slot-held`, id
    `onboarding-proof-slot:<run id>`. It says why the slot was kept, lists
-   the live processes as the judge found them (pid, command line, working
+   the live processes as the judge found them (pid, executable name, working
    directory), and names the slot and when the age limit releases it. It
    asks Gru to confirm these processes are the proof's before ending them.
    At each reconcile onboarding has the scheduler judge its stale slots,

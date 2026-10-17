@@ -294,7 +294,7 @@ newer head is delivered, the job ends, the head is stuck for another reason
 slot (`onboarding.proof-slot-held`): GC keeps the slot because a process of the
 crashed verify still lives and GC did not or could not end it (it cannot confirm
 it as the proof's, its pid now runs something else, or `ps` failed), and the row
-says why, lists the live processes it found (pid, command line, working
+says why, lists the live processes it found (pid, executable name, working
 directory), and names the slot and when the age limit frees it. Confirm those
 processes are the proof's before ending any; once they are gone the next
 reconcile releases the slot and closes the row.

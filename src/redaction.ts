@@ -81,10 +81,14 @@ function redactNpmrcAuth(text: string): string {
       if (SPACE.test(text[seen]!)) space = seen;
       else if (text[seen] === '/' && text[seen - 1] === '/') slashes = seen;
     }
+    // No `//` since the last whitespace: not an `.npmrc` line, and its value
+    // is not scanned (a long run of keys with no `//` would otherwise be
+    // rescanned at every match: quadratic).
+    if (slashes <= space) continue;
     const valueAt = match.index + match[0].length;
     let valueEnd = valueAt;
     while (valueEnd < text.length && !SPACE.test(text[valueEnd]!)) valueEnd += 1;
-    if (slashes <= space || valueEnd === valueAt) continue;
+    if (valueEnd === valueAt) continue;
     out += `${text.slice(copied, valueAt)}${REDACTION_PLACEHOLDER}`;
     copied = valueEnd;
   }

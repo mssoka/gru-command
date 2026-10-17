@@ -1492,7 +1492,7 @@ describe('the proof\'s budget slot across a restart', () => {
     expect(brokenLogs).toContainEqual({ level: 'error', msg: expect.stringContaining('could not be judged or ended') });
   });
 
-  it('a slot the boot judge keeps for a group nothing confirms is the proof\'s gets Gru one action-required row naming the group, its live members (pid, command, cwd), the slot and the age limit, with no blind kill advice; a restart posts no second one, and the next reconcile closes it once the group is gone, with no verify traffic', async () => {
+  it('a slot the boot judge keeps for a group nothing confirms is the proof\'s gets Gru one action-required row naming the group, its live members (pid, executable, cwd), the slot and the age limit, with no blind kill advice; a restart posts no second one, and the next reconcile closes it once the group is gone, with no verify traffic', async () => {
     const config = verifyConfig();
     const h = serviceHarness();
     onboardingJob(h.ledger);
@@ -1515,7 +1515,7 @@ describe('the proof\'s budget slot across a restart', () => {
     expect(row!.detail).toContain(`process group ${String(leader)} still has live members`);
     expect(row!.detail).toContain(`at ${new Date(lease.grantedAt + server.budget().ageLimitMs).toISOString()})`);
     expect(row!.detail).toContain('Its live processes, as GC listed them:');
-    expect(row!.detail).toMatch(new RegExp(`\\n- pid ${String(member)}: sleep 30 \\(working directory [^)]*gru-onboarding-proof-elsewhere-`, 'u'));
+    expect(row!.detail).toMatch(new RegExp(`\\n- pid ${String(member)}: sleep \\(working directory [^)]*gru-onboarding-proof-elsewhere-`, 'u'));
     expect(row!.detail).toContain('Confirm these processes are the proof\'s before ending them');
     expect(row!.detail).not.toContain('kill -TERM');
     // Gru cannot dispose of it: only the slot's release closes it.
@@ -1534,7 +1534,7 @@ describe('the proof\'s budget slot across a restart', () => {
     expect(h.ledger.getNotification(id)?.resolvedBy).toBe('onboarding-proof');
   });
 
-  it('every slot the boot judge keeps gets the row: a recycled pid that runs something else is listed with its command and cwd, never signalled, and the next reconcile closes the row once it is gone', async () => {
+  it('every slot the boot judge keeps gets the row: a recycled pid that runs something else is listed with its executable (never its arguments) and cwd, never signalled, and the next reconcile closes the row once it is gone', async () => {
     const config = verifyConfig();
     const pid = await crashedProofSlot(config, '/bin/sh -c npm test');
     const h = serviceHarness();
@@ -1548,7 +1548,10 @@ describe('the proof\'s budget slot across a restart', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ routing: 'action-required', resolvedAt: null });
     expect(rows[0]!.detail).toContain(`Its pid ${String(pid)} is alive but does not run the verify bound to the slot`);
-    expect(rows[0]!.detail).toContain(`- pid ${String(pid)}: /bin/sh -c sleep 30; true (working directory `);
+    // The executable's name only: a command line's arguments may carry a
+    // password (`mysql -p…`), and this process is not even the proof's.
+    expect(rows[0]!.detail).toContain(`- pid ${String(pid)}: sh (working directory `);
+    expect(rows[0]!.detail).not.toContain('sleep 30');
     expect(rows[0]!.detail).not.toContain('working directory unknown');
     process.kill(-pid, 'SIGKILL');
     await until(() => !alive(pid), 'the recycled pid to be gone');

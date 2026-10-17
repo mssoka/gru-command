@@ -2,7 +2,7 @@ import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { appendFile, chmod, lstat, readdir, readFile, readlink, rm } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import type { EventRecord } from '../ledger/api.js';
 import type { LogLevel } from '../logger.js';
@@ -1361,7 +1361,10 @@ async function processFacts(pids: readonly number[]): Promise<readonly ProcessFa
   const commands = new Map<number, string>();
   for (const line of (await listed('ps', ['-ww', '-o', 'pid=', '-o', 'command=', '-p', pids.join(',')])).split('\n')) {
     const row = /^\s*(\d+)\s+(.*?)\s*$/su.exec(line);
-    if (row !== null) commands.set(Number(row[1]), redactCredentials(row[2]!));
+    // The executable's name only: a command line's arguments may carry a
+    // password no pattern recognises (`mysql -p…`, `curl -u user:…`), and
+    // these processes may not even be the proof's.
+    if (row !== null) commands.set(Number(row[1]), basename(row[2]!.split(/\s/u)[0] ?? ''));
   }
   const cwds = new Map<number, string>();
   if (process.platform === 'linux') {
