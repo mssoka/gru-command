@@ -324,7 +324,10 @@ for a lane is the lane's to tear down — not a stranger's.
      one), and `git update-ref refs/gru/preserved/<lane>/<UTC stamp>
      <commit>` names it, just before the removal: a release refused on the
      way leaves no ref behind. The ref is never a branch or a tag and needs
-     no reflog. GC never deletes these refs (expiry is a later change).
+     no reflog. GC never deletes these refs on its own: once the lane's job
+     has been over for 30 days, it proposes their deletion to the owner
+     ([§7](#7-expiry-moved-repositories-and-reset-427)), as it does the
+     preserve copies.
    - If anything after those records fails (the ref cannot be written, or
      `worktree remove` fails, on a busy mount say), the tree is retained and
      GC records `worktree.release-aborted { id, path, preserved: {
@@ -637,6 +640,122 @@ against on 2026-10-17: it needs a ledger migration, a decision at about 35
 places that read a lane's status, a byte-identical reinstall of git admin
 state and handoff receipts, and at least 8 restore entry points. Slimming
 takes about 95% of the bytes with none of that.
+
+## 7. Expiry, moved repositories and reset (#427)
+
+**Review artifacts expire.** Once a job has been terminal (merged, done or
+binned) for **14 days**, GC deletes its review folders: `<data_dir>/reviews/
+<round>` for each of its rounds, and `<data_dir>/reviews/fallback-gate/
+<job>-<time>-<random>`. This loses nothing: the ledger keeps the verdicts
+and findings, the PR keeps the published review, and nothing reviews a
+terminal job again. When a job ended is the time of its newest `job.status`
+to that status; a time GC cannot read is never old (one warn). Each pass
+records `reviews.expired { job_id, rounds, fallback_gates, bytes }` for each
+job it deleted something of. A folder whose delete fails stays, and the next
+pass tries it again. An open job's folders, and the folders of a round or job
+the ledger does not know, are never touched.
+
+**Saved work is proposed, never deleted on its own.** Preserve copies
+(`<preserve_root>/<lane>/<stamp>`) and snapshot refs
+(`refs/gru/preserved/<lane>/<stamp>`) hold minion work (owner ruling
+2026-10-16: anything that loses data stays a FOR YOU proposal). Once a swept
+lane's job has been terminal for **30 days**, GC posts one FOR YOU card per
+repository (kind `worktree.preserve-expiry`, a typed owner decision) listing
+each expired copy and ref, its size (a copy's bytes on disk; a ref's
+objects no other ref reaches, `git rev-list --objects --disk-usage`), and
+how to restore it (`cp -R <copy>/. <repo>`, `git -C <repo> cherry-pick
+--no-commit <ref>`). The list is recorded before the card is posted
+(`preserves.proposed`). **Accept** deletes exactly what the card listed and
+nothing else: each copy by its path, each ref only while it still names the
+listed commit (`git update-ref -d <ref> <sha>`; a ref moved since is kept,
+named, and proposed again as it is now). Work that expired after the card
+waits for the next one. A delete that fails keeps the card open, and the next
+pass deletes what is left; then `preserves.deleted` names what went.
+**Decline** keeps everything (`preserves.declined`), and GC proposes again
+30 days later. A repository with an open card gets no second one.
+
+Both run at start and every hour, with no migration: ledger events and
+notification rows only. The 14 and 30 days are constants for now.
+
+**Moved repositories are repaired by identity.** Moving a managed
+repository's folder used to break every lane that pointed at it: a lane's
+`.git` file names its administration inside the repository's `.git`, which
+moved. At service start, before any turn runs, and at the hourly reconcile,
+GC checks every lane (active or paused, its folder present) whose git link
+no longer reaches the repository at its registry `repo_path`. The managed
+repository of the same name, resolved now (after you update
+`workspace_root`), holds the same repository when both hold:
+
+- **a shared root commit** (`git rev-list --max-parents=0 HEAD`, any match);
+- **the same `origin` URL**, when both have one.
+
+The lane's side is `worktree.repo-identity { id, repo_path, roots, origin }`,
+recorded when a lane is created (and by the check, for a lane whose link
+works and has none for its place). A lane made before identities were
+recorded has only its base commit, whose roots are read in the candidate,
+and no origin to compare. A git failure is never a verdict: the lane is left
+as it is, the reason logged once, and the next check judges it again.
+
+The same repository gets the lane back: `git worktree repair <lane>` runs
+from the new place, the lane's link must then reach it, and the registry's
+`repo_path` moves there (no migration: the column exists), recorded as
+`worktree.repo-moved { id, from, to }`. In the same transaction the lane's
+creation handoff (the custody receipt every turn, verify and release
+checks) is re-bound to the new place: `worktree.handoff-rebound { id, from,
+to }`, two receipts that differ only in where the repository, its git
+directory and the lane's administration are. Custody accepts a rebinding
+only when it starts from the binding issued before it and changes nothing
+else; the re-bound receipt is then written in the lane's administration, and
+a stop between the record and that write is finished by the next check. The
+lane's next turn, verify and release work as before.
+
+A **different** repository under the name gets one FOR YOU card for the lane
+(kind `worktree.repo-mismatch`, a typed owner decision): discarding a lane
+loses whatever it holds. **Accept** records `worktree.discarded { id, path,
+repo_path, reason }`, deletes the lane folder and marks the lane swept,
+unless the lane reaches its repository again by then. **Decline** keeps the
+lane; the card is not posted again while the name resolves to that
+repository. A card whose lane was reconnected or swept before anyone
+answered is withdrawn. A lane whose repository is gone and whose name is not
+managed, or not available, is only logged, and so is one whose name holds the
+same repository without the lane's record in it (a fresh clone, not the moved
+folder): `git worktree repair` cannot reconnect a lane the repository does
+not know. Each check judges such a lane again.
+
+**`gru-service reset`** is the clean fresh start that keeps `config.toml`
+(deleting `~/.gru-command` by hand also deleted the config and left dangling
+worktree registrations and `gru/*` branches in every managed repository):
+
+```sh
+gru-service reset [--yes] [--delete-branches] [--delete-refs]
+```
+
+1. It refuses while the service runs (something listens on its port, or its
+   `/health` answers), naming how to stop it (`launchctl bootout
+   gui/$(id -u)/com.gru-command.service` on macOS, `systemctl --user stop
+   gru-command` on Linux).
+2. It lists what it will do, per managed repository and for the data
+   directory.
+3. With `--yes`, or a `y` at the terminal, it:
+   - removes every GC lane registered in each managed repository (a worktree
+     under `[worktrees] root`) with `git worktree remove --force` (twice
+     forced for one git holds locked), then runs `git worktree prune`, unless
+     that would also drop one of your own worktrees whose folder is missing
+     (then it says so and skips the prune);
+   - deletes `gru/*` branches only with `--delete-branches` (one your own
+     worktree has checked out is kept, named), and `refs/gru/*` (the
+     snapshot refs) only with `--delete-refs`;
+   - deletes the data directory's contents except `config.toml` and the
+     install's own files (`identity/`, `credentials/`, `perkins/`,
+     `onboarding-consent.json`, `wizard-draft.json` and the service unit's
+     `logs/launchd.*.log`), keeping the directory.
+
+It prints what it removed. It never touches your own branches, worktrees or
+files: a data directory that holds the workspace root, a managed repository
+or your home directory is refused, and when a lane cannot be removed the data
+directory is left as it was. A lane root or preserve root configured outside
+the data directory is left as it is. Start the service again with
+`./install.sh --service` (or `npm start`).
 
 ## Endpoints
 

@@ -38,7 +38,9 @@ export class WorktreeHandoffUnresolvedError extends Error {
   }
 }
 
-interface Receipt {
+/** A lane's creation handoff receipt, as its administration holds it and
+ * the ledger's completion (and any rebinding) records it. */
+export interface Receipt {
   readonly state: 'pending' | 'ready';
   readonly token: string;
   readonly id: string;
@@ -117,8 +119,122 @@ function assertIssued(receipt: Receipt, lane: WorktreeRecord, ledger: LedgerApi)
   }
   if (facts.length !== 1) throw new Error('original unique service handoff issuance is unavailable');
   const fact = facts[0]!;
-  if (fact.jobId !== lane.jobId || fact.roundId !== lane.roundId || JSON.stringify(fact.payload) !== JSON.stringify(receipt) ||
+  if (fact.jobId !== lane.jobId || fact.roundId !== lane.roundId || JSON.stringify(issuedBinding(fact.payload, lane.id, ledger).binding) !== JSON.stringify(receipt) ||
     JSON.stringify(ledger.getEvent(fact.seq)) !== JSON.stringify(fact)) throw new Error('service handoff issuance conflicts with original binding');
+}
+
+/** A lane's handoff re-bound to its repository's new place (#427 PR 2b):
+ * `{ id, from, to }`, two ready receipts that differ only in `repo`,
+ * `common` and `admin`. Recorded in the transaction that moves the lane's
+ * registry `repo_path` (LedgerApi.moveWorktreeRepo), never on its own. */
+export const HANDOFF_REBOUND_KIND = 'worktree.handoff-rebound';
+
+/** The receipt fields a move changes: where the repository, its common
+ * directory and the lane's administration live. */
+const REBOUND_FIELDS: ReadonlySet<string> = new Set(['repo', 'common', 'admin']);
+
+/** The binding a lane's handoff holds now: its one original completion,
+ * with each rebinding applied in order (each must start from the binding
+ * before it), and the binding the newest rebinding replaced (null when
+ * there is none). An inconsistent chain is refused by name. */
+function issuedBinding(original: Receipt, laneId: string, ledger: LedgerApi): { readonly binding: Receipt; readonly previous: Receipt | null } {
+  let binding = original;
+  let previous: Receipt | null = null;
+  let cursor = 0;
+  for (;;) {
+    const page = ledger.listEventsAfter(cursor, { kinds: [HANDOFF_REBOUND_KIND], payload: { key: 'id', equals: laneId }, limit: factPageSize });
+    if (page.length === 0) return { binding, previous };
+    for (const event of page) {
+      if (event.kind !== HANDOFF_REBOUND_KIND || event.seq <= cursor) throw new Error('handoff rebinding inventory changed or is incomplete');
+      cursor = event.seq;
+      const { from, to } = (event.payload ?? {}) as { readonly from?: unknown; readonly to?: unknown };
+      if (!isReceipt(from) || !isReceipt(to) || to.state !== 'ready' || JSON.stringify(from) !== JSON.stringify(binding) ||
+        Object.keys(from).some((key) => !REBOUND_FIELDS.has(key) && JSON.stringify(from[key as keyof Receipt]) !== JSON.stringify(to[key as keyof Receipt]))) {
+        throw new Error('handoff rebinding conflicts with the issued binding');
+      }
+      previous = binding;
+      binding = to;
+    }
+  }
+}
+
+/** The issued binding of a lane, or null when no completion names it (a
+ * lane made before handoffs were recorded). */
+function laneBinding(laneId: string, ledger: LedgerApi): { readonly binding: Receipt; readonly previous: Receipt | null } | null {
+  const facts = [];
+  for (const event of completionFacts(ledger)) if (event.payload.id === laneId) facts.push(event);
+  if (facts.length > 1) throw new Error('conflicting service handoff issuance');
+  return facts.length === 0 ? null : issuedBinding(facts[0]!.payload, laneId, ledger);
+}
+
+/** A rebinding of a moved lane's handoff, ready to record and publish. */
+export interface LaneRebind {
+  readonly id: string;
+  readonly from: Receipt;
+  readonly to: Receipt;
+  /** The lane's administration, where the receipt is published. */
+  readonly admin: string;
+}
+
+/**
+ * The rebinding of a lane whose repository moved (#427 PR 2b), once
+ * `git worktree repair` pointed its `.git` file at `repoPath`'s
+ * administration of it: the binding the ledger issued, and the same binding
+ * at the new place. Null for a lane with no issued handoff, or one already
+ * bound there. Refused by name when the lane's administration is not
+ * `repoPath`'s, or when the receipt on disk is neither binding (it is not
+ * GC's to rewrite).
+ */
+export function prepareLaneRebind(lane: WorktreeRecord, repoPath: string, ledger: LedgerApi): LaneRebind | null {
+  const issued = laneBinding(lane.id, ledger);
+  if (issued === null) return null;
+  const admin = adminFor(lane.path);
+  const common = laneCommonDirectory(admin);
+  if (repositoryCommonDirectory(repoPath) !== common || dirname(admin) !== join(common, 'worktrees') ||
+    adminBackPointer(admin) !== resolvedPath("checkout's git file", join(lane.path, '.git'))) {
+    throw new Error(`lane ${lane.path} is not administered by ${repoPath}: its handoff cannot be re-bound there`);
+  }
+  const from = issued.binding;
+  const to: Receipt = { ...from, repo: resolvedPath('repository', repoPath), common, admin };
+  if (JSON.stringify(to) === JSON.stringify(from)) return null;
+  const disk = JSON.stringify(parseReceipt(readWorktreeMetadata(join(admin, receiptName))));
+  if (disk !== JSON.stringify(from) && disk !== JSON.stringify(to)) throw new Error(`lane administration ${admin} holds a handoff receipt GC did not issue: it is not re-bound`);
+  return { id: lane.id, from, to, admin };
+}
+
+/** Publish a recorded rebinding's receipt in the lane's administration:
+ * written whole beside it, then renamed over it. */
+export function publishLaneRebind(rebind: Pick<LaneRebind, 'to' | 'admin'>): void {
+  const file = join(rebind.admin, receiptName);
+  const temp = `${file}.rebound-${process.pid}-${Date.now()}`;
+  try {
+    const fd = openSync(temp, 'wx');
+    try {
+      writeFileSync(fd, JSON.stringify(rebind.to));
+      durably(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temp, file);
+  } catch (error) {
+    try { unlinkSync(temp); } catch { /* never written, or already renamed */ }
+    throw new Error(`lane administration ${rebind.admin} cannot take its re-bound handoff receipt (${errnoOf(error)})`, { cause: error });
+  }
+}
+
+/** Finish a rebinding the ledger recorded and the disk did not get (a stop
+ * between the two): when the lane's receipt is the binding the newest
+ * rebinding replaced, publish the one it names. True when it published. */
+export function settleLaneRebind(lane: WorktreeRecord, ledger: LedgerApi): boolean {
+  // Most lanes were never re-bound: one indexed look before any fact is read.
+  if (ledger.listEventsAfter(0, { kinds: [HANDOFF_REBOUND_KIND], payload: { key: 'id', equals: lane.id }, limit: 1 }).length === 0) return false;
+  const issued = laneBinding(lane.id, ledger);
+  if (issued === null || issued.previous === null) return false;
+  const admin = adminFor(lane.path);
+  const disk = JSON.stringify(parseReceipt(readWorktreeMetadata(join(admin, receiptName))));
+  if (disk !== JSON.stringify(issued.previous) || issued.binding.admin !== admin) return false;
+  publishLaneRebind({ to: issued.binding, admin });
+  return true;
 }
 
 const GITDIR_PREFIX = 'gitdir: ';

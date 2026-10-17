@@ -1,4 +1,4 @@
-import { readWorktreeMetadata, repositoryCommonDirectory, capturePortLaneHandoff, captureCwdHandoff, beginLaneHandoff, completeLaneHandoff, rememberManagedLane, registerHandoffManager, assertPendingLaneHandoff, captureCleanupHandoff, assertLaneResourcesAbsent, WorktreeHandoffUnresolvedError } from './handoff.js';
+import { readWorktreeMetadata, repositoryCommonDirectory, capturePortLaneHandoff, captureCwdHandoff, beginLaneHandoff, completeLaneHandoff, rememberManagedLane, registerHandoffManager, assertPendingLaneHandoff, captureCleanupHandoff, assertLaneResourcesAbsent, WorktreeHandoffUnresolvedError, prepareLaneRebind, publishLaneRebind, settleLaneRebind } from './handoff.js';
 import { execFile, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
@@ -42,6 +42,7 @@ import { redactedText } from '../decisions/questions.js';
 import { boundedTail, recordedTail, redactCredentialWindow } from '../redaction.js';
 import { oneLineErrorText } from '../property/error-text.js';
 import { repositoryGitEnv } from '../dispatch/perkins-review/artifacts.js';
+import type { ManagedRepoPath } from '../repos/managed-names.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -585,6 +586,34 @@ export interface SavedWork {
   readonly preserved: SweepPreservation | null;
 }
 
+/** A repository's identity (#427 PR 2b): its root commits and its
+ * `origin` URL (null when it has none). Two places hold the same repository
+ * when they share a root commit and, when both have one, their origin. */
+export interface RepoIdentity {
+  readonly roots: readonly string[];
+  readonly origin: string | null;
+}
+
+/** The record of the repository a lane was made in (#427 PR 2b):
+ * `worktree.repo-identity { id, repo_path, roots, origin }`, written when the
+ * lane is created and by a moved-repository check that finds a lane's
+ * repository with none for its place. */
+export const REPO_IDENTITY_EVENT = 'worktree.repo-identity';
+
+/** What the moved-repository check found for one lane (#427 PR 2b):
+ * repaired (its registry `repo_path` moved from `from` to `to`), a
+ * different repository under its name (`candidate`: the caller proposes the
+ * discard), or not judged now (`reason`, judged again at the next check). */
+export type RepoMoveOutcome =
+  | { readonly status: 'repaired'; readonly lane: WorktreeRecord; readonly from: string; readonly to: string }
+  | { readonly status: 'mismatch'; readonly lane: WorktreeRecord; readonly candidate: string; readonly reason: string }
+  | { readonly status: 'unresolved'; readonly lane: WorktreeRecord; readonly reason: string };
+
+/** How an owner's discard of a lane whose repository is not there ended
+ * (#427 PR 2b): discarded, or not, because the lane is swept or gone, or
+ * because it reaches its repository again. */
+export type LaneDiscard = 'discarded' | 'gone' | 'reconnected';
+
 /** The bound for a listing of every path in a lane (`ls-files -s`). */
 const LISTING_MAX_BUFFER = 512 * 1024 * 1024;
 
@@ -709,6 +738,9 @@ export class WorktreeManager {
   private readonly laneLocks = new Map<string, Promise<unknown>>();
   /** Set by finishSweep's tail guard; drained by recordSweepEvent. */
   private tailFailure: string | null = null;
+  /** Why each lane the moved-repository check could not judge was not
+   * judged, logged once per change (#427 PR 2b). */
+  private readonly moveNotes = new Map<string, string>();
 
   constructor(opts: WorktreeManagerOptions) {
     registerHandoffManager(this, opts.ledger);
@@ -1118,6 +1150,7 @@ export class WorktreeManager {
       }
       this.handoffLane(repo.repoPath, path, custody, record);
       this.recordBootstrap(record, bootstrapped);
+      this.recordRepoIdentity(record);
       this.log('info', 'job worktree created', {
         job: input.jobId,
         path,
@@ -1187,6 +1220,7 @@ export class WorktreeManager {
         throw error;
       }
       this.handoffLane(repo.repoPath, path, custody, record);
+      this.recordRepoIdentity(record);
       this.log('info', 'review worktree created (detached)', {
         round: input.roundId,
         path,
@@ -1286,6 +1320,7 @@ export class WorktreeManager {
       this.handoffLane(repo.repoPath, path, custody, record, assertParent);
       assertParent();
       this.recordBootstrap(record, bootstrapped);
+      this.recordRepoIdentity(record);
       this.log('info', 'child worktree created', {
         child: input.childId,
         job: input.jobId,
@@ -1381,6 +1416,217 @@ export class WorktreeManager {
   getWorktree(id: string): WorktreeRecord | null {
     const lane = this.opts.ledger.getWorktree(id);
     return lane === null ? null : rememberManagedLane(lane, this.opts.ledger);
+  }
+
+  /**
+   * Moved repositories (#427 PR 2b), at service start and at the hourly
+   * maintenance reconcile. A lane (active or paused, its folder on disk)
+   * whose git link no longer reaches the repository at its registry
+   * `repo_path` is matched with the managed repository of the same name,
+   * resolved now. They are the same repository when they share a root
+   * commit and, when both have one, their `origin` URL. The lane's side is
+   * its `worktree.repo-identity`; a lane made before identities were
+   * recorded has only its base commit (the registry's `sha`), whose roots
+   * are read in the candidate, and no origin to compare. The same
+   * repository is repaired ({@link repairMovedLane}); a different one is a
+   * `mismatch`, for the caller's discard proposal. A lane that cannot be
+   * judged now (no managed repository of that name, an unavailable one, a
+   * git failure) is `unresolved`: nothing changes, the reason is logged once,
+   * and the next check judges it again. A lane whose link works records its
+   * repository's identity when none names that place, and finishes a
+   * rebinding a stop interrupted.
+   */
+  checkMovedRepositories(input: {
+    readonly managedRepos: readonly string[];
+    readonly resolve: (name: string) => ManagedRepoPath;
+  }): readonly RepoMoveOutcome[] {
+    const outcomes: RepoMoveOutcome[] = [];
+    for (const row of this.opts.ledger.listWorktrees()) {
+      if (row.status === 'swept' || !existsSync(row.path)) continue;
+      let outcome: RepoMoveOutcome | null;
+      try {
+        outcome = this.checkMovedLane(row, input);
+      } catch (error) {
+        outcome = { status: 'unresolved', lane: row, reason: `the check failed: ${oneLineErrorText(error instanceof Error ? error.message : error, 400)}` };
+      }
+      if (outcome === null) {
+        this.moveNotes.delete(row.id);
+        continue;
+      }
+      if (outcome.status !== 'repaired') {
+        const note = outcome.status === 'mismatch' ? `mismatch: ${outcome.candidate}: ${outcome.reason}` : outcome.reason;
+        if (this.moveNotes.get(row.id) !== note) {
+          this.moveNotes.set(row.id, note);
+          this.log('warn', outcome.status === 'mismatch'
+            ? 'a lane\'s repository is gone and the managed repository of its name is a different repository'
+            : 'a lane\'s repository is gone and the lane cannot be reconnected now; the next check tries again', {
+            id: row.id, repo_path: row.repoPath, ...(outcome.status === 'mismatch' ? { candidate: outcome.candidate } : {}), reason: outcome.reason,
+          });
+        }
+      } else {
+        this.moveNotes.delete(row.id);
+      }
+      outcomes.push(outcome);
+    }
+    return outcomes;
+  }
+
+  private checkMovedLane(row: WorktreeRecord, input: {
+    readonly managedRepos: readonly string[];
+    readonly resolve: (name: string) => ManagedRepoPath;
+  }): RepoMoveOutcome | null {
+    if (laneReachesRepository(row.path, row.repoPath)) {
+      if (settleLaneRebind(row, this.opts.ledger)) {
+        this.log('info', 'a moved lane\'s re-bound handoff receipt was published after an interrupted repair', { id: row.id });
+      }
+      this.recordRepoIdentity(row);
+      return null;
+    }
+    if (!input.managedRepos.includes(row.repoName)) {
+      return { status: 'unresolved', lane: row, reason: `its git link does not reach ${row.repoPath}, and ${row.repoName} is not a managed repository` };
+    }
+    const resolved = input.resolve(row.repoName);
+    if (resolved.kind !== 'available') {
+      return { status: 'unresolved', lane: row, reason: `its git link does not reach ${row.repoPath}, and the managed repository ${row.repoName} cannot be used: ${resolved.kind === 'unavailable' ? resolved.reason : resolved.error}` };
+    }
+    const verdict = this.sameRepository(row, resolved.path);
+    if (verdict.kind === 'unknown') return { status: 'unresolved', lane: row, reason: verdict.reason };
+    if (verdict.kind === 'different') return { status: 'mismatch', lane: row, candidate: resolved.path, reason: verdict.reason };
+    return this.repairMovedLane(row, resolved.path);
+  }
+
+  /** Whether `candidate` holds the repository the lane was made in: a git
+   * failure is `unknown` (never a mismatch), an answer is `same` or
+   * `different` with the reason. */
+  private sameRepository(row: WorktreeRecord, candidate: string):
+    | { readonly kind: 'same' }
+    | { readonly kind: 'different' | 'unknown'; readonly reason: string } {
+    const unknown = (error: unknown): { readonly kind: 'unknown'; readonly reason: string } =>
+      ({ kind: 'unknown', reason: `${candidate} could not be compared with the lane's repository: ${oneLineErrorText(error instanceof Error ? error.message : error, 400)}` });
+    let found: RepoIdentity;
+    try {
+      found = repoIdentity(candidate);
+    } catch (error) {
+      return unknown(error);
+    }
+    const recorded = this.recordedIdentity(row);
+    let roots: readonly string[];
+    if (recorded !== null) {
+      roots = recorded.roots;
+    } else {
+      const base = spawnGit(candidate, ['rev-parse', '--verify', '--quiet', `${row.sha}^{commit}`]);
+      if (base.status === 1) return { kind: 'different', reason: `${candidate} does not hold the lane's base commit ${row.sha}` };
+      if (base.status !== 0) return unknown(base.stderr.trim() || base.error || `git rev-parse exited ${String(base.status)}`);
+      try {
+        roots = runGit(candidate, ['rev-list', '--max-parents=0', row.sha]).split('\n').filter((line) => line !== '');
+      } catch (error) {
+        return unknown(error);
+      }
+    }
+    if (!roots.some((root) => found.roots.includes(root))) {
+      return { kind: 'different', reason: `${candidate} shares no root commit with the lane's repository (${roots.join(', ') || 'none recorded'})` };
+    }
+    if (recorded?.origin != null && found.origin !== null && recorded.origin !== found.origin) {
+      return { kind: 'different', reason: `${candidate}'s origin is ${found.origin}, the lane's repository's was ${recorded.origin}` };
+    }
+    return { kind: 'same' };
+  }
+
+  /**
+   * Reconnect a lane to its repository's new place (#427 PR 2b):
+   * `git worktree repair <lane>` from there, then the lane's git link must
+   * reach it. The lane's creation handoff is re-bound to the new place
+   * (`prepareLaneRebind`), and the registry's `repo_path` moves there with
+   * `worktree.repo-moved` and the rebinding, in one transaction, before the
+   * re-bound receipt is published (a stop between the two is finished by
+   * the next check). The lane's identity is recorded for its new place.
+   */
+  private repairMovedLane(row: WorktreeRecord, candidate: string): RepoMoveOutcome {
+    try {
+      runGit(candidate, ['worktree', 'repair', row.path]);
+    } catch (error) {
+      return { status: 'unresolved', lane: row, reason: `git worktree repair failed in ${candidate}: ${oneLineErrorText(error instanceof Error ? error.message : error, 400)}` };
+    }
+    if (!laneReachesRepository(row.path, candidate)) {
+      return { status: 'unresolved', lane: row, reason: `git worktree repair in ${candidate} did not reconnect the lane: that repository has no record of it` };
+    }
+    if (candidate === row.repoPath) {
+      this.log('info', 'a lane\'s git link was repaired in place', { id: row.id, repo_path: row.repoPath });
+      return { status: 'repaired', lane: row, from: row.repoPath, to: candidate };
+    }
+    const rebind = prepareLaneRebind(row, candidate, this.opts.ledger);
+    const moved = this.opts.ledger.moveWorktreeRepo({ id: row.id, repoPath: candidate, rebind });
+    if (rebind !== null) publishLaneRebind(rebind);
+    rememberManagedLane(moved, this.opts.ledger);
+    this.recordRepoIdentity(moved);
+    this.log('info', 'lane reconnected to its moved repository', { id: row.id, from: row.repoPath, to: candidate });
+    return { status: 'repaired', lane: moved, from: row.repoPath, to: candidate };
+  }
+
+  /** The newest repository identity recorded for this lane (the place it
+   * last reached), or null when none was recorded. */
+  private recordedIdentity(row: WorktreeRecord): RepoIdentity | null {
+    const event = row.jobId === null
+      ? this.opts.ledger.latestEventByPayloadField(REPO_IDENTITY_EVENT, 'id', row.id)
+      : this.opts.ledger.latestJobEventByPayloadField(row.jobId, REPO_IDENTITY_EVENT, 'id', row.id);
+    const payload = (event?.payload ?? null) as { readonly roots?: unknown; readonly origin?: unknown } | null;
+    if (payload === null || !Array.isArray(payload.roots) || !payload.roots.every((root) => typeof root === 'string')) return null;
+    return { roots: payload.roots as string[], origin: typeof payload.origin === 'string' ? payload.origin : null };
+  }
+
+  /** Record the identity of the repository at the lane's `repo_path`
+   * (`worktree.repo-identity`) unless the lane's newest record names that
+   * place already. Best-effort: a failure is logged, and the next check
+   * records it. */
+  private recordRepoIdentity(row: WorktreeRecord): void {
+    try {
+      const event = row.jobId === null
+        ? this.opts.ledger.latestEventByPayloadField(REPO_IDENTITY_EVENT, 'id', row.id)
+        : this.opts.ledger.latestJobEventByPayloadField(row.jobId, REPO_IDENTITY_EVENT, 'id', row.id);
+      if ((event?.payload as { readonly repo_path?: unknown } | null)?.repo_path === row.repoPath) return;
+      const identity = repoIdentity(row.repoPath);
+      this.opts.ledger.appendCustomEvent({
+        kind: REPO_IDENTITY_EVENT,
+        jobId: row.jobId,
+        roundId: row.roundId,
+        payload: { id: row.id, repo_path: row.repoPath, roots: identity.roots, origin: identity.origin },
+      });
+    } catch (error) {
+      this.log('warn', 'the identity of a lane\'s repository could not be recorded; the next check records it', { id: row.id, repo_path: row.repoPath, error: String(error) });
+    }
+  }
+
+  /**
+   * The owner's discard of a lane whose repository is not there (#427 PR
+   * 2b: they accepted the proposal a `mismatch` made). Under the lane's
+   * lock: a lane swept or gone since is `gone`, and one whose git link
+   * reaches its repository again (the repository came back, or the check
+   * reconnected it) is `reconnected`, with nothing deleted. Otherwise
+   * `worktree.discarded { id, path, repo_path, reason }` is recorded first
+   * (when it cannot be, nothing is deleted), the lane's folder is deleted
+   * with whatever it held, and the lane is marked swept.
+   */
+  async discardLane(laneId: string, reason: string): Promise<LaneDiscard> {
+    return this.withLaneLock(laneId, async () => {
+      const row = this.opts.ledger.getWorktree(laneId);
+      if (row === null || row.status === 'swept') return 'gone';
+      if (existsSync(row.path) && laneReachesRepository(row.path, row.repoPath)) return 'reconnected';
+      this.opts.ledger.appendCustomEvent({
+        kind: 'worktree.discarded',
+        jobId: row.jobId,
+        roundId: row.roundId,
+        payload: { id: row.id, path: row.path, repo_path: row.repoPath, reason },
+      });
+      await removeTree(row.path);
+      this.opts.ledger.setWorktreeStatus(row.id, 'swept', `discarded by the owner: ${reason}`);
+      this.log('warn', 'lane discarded by the owner: its repository is not there', { id: row.id, path: row.path, repo_path: row.repoPath, reason });
+      try {
+        this.opts.onSwept?.({ worktree: row });
+      } catch (error) {
+        this.log('warn', 'sweep-completion notice resolution failed', { id: row.id, error: String(error) });
+      }
+      return 'discarded';
+    });
   }
 
   /** Slim state is a projection of the lane's events, not a column (#427):
@@ -4408,6 +4654,31 @@ export function restoreIncompleteNoticeId(laneId: string): string {
   return `worktree-restore-incomplete:${laneId}`;
 }
 
+/** Whether a lane's git link reaches the repository at `repoPath` (#427 PR
+ * 2b): the common git directory its `.git` file leads to is that
+ * repository's. Read from the files, never through git, so a dangling link
+ * is an answer, not a walk up to some repository around the lane. */
+function laneReachesRepository(lanePath: string, repoPath: string): boolean {
+  try {
+    return repositoryCommonDirectory(lanePath) === repositoryCommonDirectory(repoPath);
+  } catch {
+    return false;
+  }
+}
+
+/** The identity of the repository at `repoPath` (#427 PR 2b): the root
+ * commits of its HEAD and its `origin` URL (null when it has none). A git
+ * failure throws. */
+export function repoIdentity(repoPath: string): RepoIdentity {
+  const roots = runGit(repoPath, ['rev-list', '--max-parents=0', 'HEAD']).split('\n').filter((line) => line !== '');
+  const origin = spawnGit(repoPath, ['config', '--get', 'remote.origin.url']);
+  if (origin.status !== 0 && origin.status !== 1) {
+    throw new Error(`git config --get remote.origin.url failed (exit ${String(origin.status)}) in ${repoPath}: ${origin.stderr.trim() || origin.error || ''}`);
+  }
+  const url = origin.stdout.trim();
+  return { roots, origin: origin.status === 0 && url !== '' ? url : null };
+}
+
 /** A word a POSIX shell reads back as itself: as it is when it holds only
  * characters no shell treats specially, else single-quoted. */
 function shellWord(word: string): string {
@@ -4416,7 +4687,7 @@ function shellWord(word: string): string {
 
 /** A lane id as one ref-name component: as it is when git accepts it there,
  * else hex-encoded (a job's lane id already names its `gru/<id>` branch). */
-function preservedRefComponent(id: string): string {
+export function preservedRefComponent(id: string): string {
   const plain = /^[A-Za-z0-9_][A-Za-z0-9._-]*$/u.test(id) && !id.includes('..') && !id.endsWith('.lock') && !id.endsWith('.');
   return plain ? id : `x-${Buffer.from(id, 'utf8').toString('hex')}`;
 }

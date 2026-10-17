@@ -66,10 +66,13 @@ describe('prune-stale-dist', () => {
     // (dist/onboarding/proof-record.js); #429 the intake breakdown and
     // slicing modules (dist/intake/breakdown.js, dist/intake/slicing.js);
     // then lane slimming's shared reclaim checks (dist/worktrees/reclaim.js)
-    // and the report-lane slimmer (dist/worktrees/slimming.js).
-    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5211);
+    // and the report-lane slimmer (dist/worktrees/slimming.js); #427 PR 2b
+    // expiry and the moved-repository follow-through
+    // (dist/maintenance/expiry.js, dist/maintenance/repo-moves.js) and
+    // gru-service reset (dist/cli/reset.js).
+    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5214);
     expect(createHash('sha256').update(`${[...PUBLIC_REVIEW_EXECUTABLE_PATHS].sort().join('\n')}\n`).digest('hex'))
-      .toBe('40ad6f43bfaee5f5756027484a4d182cf5a962da02f88447049d12987773245d');
+      .toBe('cc77afa0fc5e3c3a6285681f3084b2ee9b2f2d8b915035f4bdfd5a19afc4d2d1');
     const root = fixtureRoot();
     touch(root, 'src/worktrees/handoff.ts'); touch(root, 'dist/worktrees/handoff.js');
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', dependencies: {} }));

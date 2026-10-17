@@ -51,6 +51,12 @@ const OWNER_REQUIRED_KINDS: readonly string[] = [
   // Intake slicing (#429): a planning minion's sliced plan, with any source
   // conflicts first, is the owner's to review in intake.
   'intake.slicing-result',
+  // Cleanup and repair (#427 PR 2b): deleting the saved work of jobs that
+  // ended 30 days ago, and discarding a lane whose repository's name now
+  // holds a different repository, lose data, so each is the owner's Accept
+  // or Decline.
+  'worktree.preserve-expiry',
+  'worktree.repo-mismatch',
 ];
 
 /** Kinds that are always owner-facing, prefix match (dynamic suffixes,
@@ -70,7 +76,9 @@ const OWNER_ALLOWED_PREFIXES: readonly string[] = ['decisions.degraded.'];
 
 /** Kinds that only ever route `needs-owner` with a typed reserved
  * decision attached (validated at the write boundary). */
-const DECISION_REQUIRED_KINDS: readonly string[] = ['gru.owner-escalation', 'vector.raid-proposal', 'vector.fix-proposal', 'onboarding.proposal'];
+const DECISION_REQUIRED_KINDS: readonly string[] = [
+  'gru.owner-escalation', 'vector.raid-proposal', 'vector.fix-proposal', 'onboarding.proposal', 'worktree.preserve-expiry', 'worktree.repo-mismatch',
+];
 
 export function ownerAttentionFor(kind: string): OwnerAttention {
   if (OWNER_REQUIRED_KINDS.includes(kind)) return 'owner-required';

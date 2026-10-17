@@ -5,11 +5,13 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig, type GruCommandConfig } from '../config.js';
 import { defaultListenerProbe, type ListenerOwner, type ListenerProbe } from '../listener-probe.js';
 import type { RollState } from '../roll/state.js';
+import { runResetCli } from './reset.js';
 
 /**
  * `gru-service` — the operator CLI for the service's own lifecycle.
  *
  *   gru-service roll [--no-wait] [--json] [--reason <text>] [--timeout-ms <n>]
+ *   gru-service reset [--yes] [--delete-branches] [--delete-refs]   (src/cli/reset.ts)
  *
  * The command asks the running service to roll itself (POST /api/roll,
  * operator-guarded with the pairing token) and — unless --no-wait —
@@ -24,10 +26,14 @@ const POLL_INTERVAL_MS = 2_000;
 const HEALTH_VERIFY_TIMEOUT_MS = 60_000;
 
 const USAGE = `usage: gru-service roll [--no-wait] [--json] [--reason <text>] [--timeout-ms <n>]
+       gru-service reset [--yes] [--delete-branches] [--delete-refs]
 
   roll   pull + rebuild the deploy clone on the running service, drain
          in-flight work, then let the OS service manager relaunch it into
          the new build. Exit 0 only after /health reports the target SHA.
+  reset  with the service stopped: remove every GC lane from the managed
+         repositories and empty the data directory, keeping config.toml
+         (gru-service reset --help).
 `;
 
 export interface ServiceCliOptions {
@@ -154,6 +160,7 @@ export async function runServiceCli(
   argv: readonly string[],
   overrides: Partial<ServiceCliDeps> = {},
 ): Promise<number> {
+  if (argv[0] === 'reset') return runResetCli(argv.slice(1));
   const deps: ServiceCliDeps = { ...defaultDeps(), ...overrides };
   const parsed = parseServiceArgs(argv);
   if (!parsed.ok) {

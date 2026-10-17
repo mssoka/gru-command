@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
 import { loadWorktreeManifest, resolveVerifyCommand } from '../worktrees/manifest.js';
+import { HANDOFF_REBOUND_KIND, type LaneRebind } from '../worktrees/handoff.js';
 import { isCommitId, readOnboardingProof } from '../onboarding/proof-record.js';
 import { readGitState } from '../verify/scheduler.js';
 import { planCommand } from '../verify/build-reuse.js';
@@ -2958,6 +2959,35 @@ export class LedgerApi {
         payload: { id, note },
       });
       return this.getWorktree(id) as WorktreeRecord;
+    });
+  }
+
+  /** Point a lane at its repository's new place (#427 PR 2b): `repo_path`
+   * changes (no migration: the column exists) and `worktree.repo-moved
+   * { id, from, to }` is recorded, with, in the same transaction, the
+   * rebinding of the lane's creation handoff (`worktree.handoff-rebound
+   * { id, from, to }`) when it has one. */
+  moveWorktreeRepo(input: { readonly id: string; readonly repoPath: string; readonly rebind: Pick<LaneRebind, 'from' | 'to'> | null }): WorktreeRecord {
+    if (input.repoPath === '') throw new Error('a moved worktree needs its new repo path');
+    return this.transaction(() => {
+      const current = this.getWorktree(input.id);
+      if (current === null) throw new RecordNotFound(`worktree "${input.id}" not found`);
+      this.db.prepare('UPDATE worktrees SET repo_path = ?, updated_at = ? WHERE id = ?').run(input.repoPath, nowIso(), input.id);
+      this.appendEvent({
+        kind: 'worktree.repo-moved',
+        jobId: current.jobId,
+        roundId: current.roundId,
+        payload: { id: input.id, from: current.repoPath, to: input.repoPath },
+      });
+      if (input.rebind !== null) {
+        this.appendEvent({
+          kind: HANDOFF_REBOUND_KIND,
+          jobId: current.jobId,
+          roundId: current.roundId,
+          payload: { id: input.id, from: input.rebind.from, to: input.rebind.to },
+        });
+      }
+      return this.getWorktree(input.id) as WorktreeRecord;
     });
   }
 
