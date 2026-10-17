@@ -110,63 +110,96 @@ for a lane is the lane's to tear down — not a stranger's.
      Entries outside the cone are absent from disk and marked skip-worktree,
      so GC cannot tell them from files a minion deleted, and a snapshot
      could record the wrong tree. The refusal says to commit and push the
-     lane's work, or run `git sparse-checkout disable` in the lane.
-   - **Submodule work that would be lost.** A lane's submodules keep their
-     git data under the lane's own git folder (or in a `.git` inside their
-     checkout), which the removal deletes, and the snapshot records only a
-     submodule's gitlink. Detection ignores every display setting: the
-     submodule status runs with `--ignore-submodules=none` and
-     `-c diff.ignoreSubmodules=none`, so neither user, repository nor global
-     config hides anything. What counts as work is GC's policy:
-     - **a commit that survives nowhere else** is refused: the submodule's
-       HEAD, the gitlink the lane's HEAD or index records, the tip of any
-       local branch of the lane's copy, or any stash entry (`refs/stash` and
-       its reflog), when it is in the lane's copy of the submodule but in
-       none of that copy's remote-tracking refs or tags, and not in the main
-       checkout's own copy of the submodule (`<git common dir>/modules/<name>`),
-       which outlives the lane. The gitlink the lane's **base** records
-       (the registry row's `sha`) is never the lane's work: a lane that
-       touched nothing is released even when that pin is reachable only from
-       a tag or was fetched by its sha into a shallow copy. A lane that
-       committed a gitlink bump to an unpushed submodule commit is refused
-       even with a clean status. (A tag a minion made in the submodule
-       itself counts as a tag too.)
-     - **modified tracked content** is always refused, whatever
-       `.gitmodules` `ignore =` says (`ignore = dirty` quiets `git status`;
-       it does not make the content disposable);
-     - **untracked content** is never refused: step 1 copies it into the
-       preserve folder, under the submodule's path. The exception is a
-       submodule whose `.gitmodules` at the lane's base sets
+     lane's work, or run `git sparse-checkout disable` in the lane, and Gru
+     gets one **action-required** row for the lane (kind
+     `worktree.sparse-checkout`, closed once the lane is gone, as below).
+     Lanes are never sparse by GC's doing: `git worktree add` gives a new
+     lane the owner checkout's sparse-checkout, so GC runs
+     `git sparse-checkout disable` in each new lane, before anything runs in
+     it, when the repository keeps per-worktree config
+     (`extensions.worktreeConfig`, which `git sparse-checkout` itself turns
+     on): only the lane changes, and the owner's checkout stays as sparse as
+     it was. A repository whose sparse checkout is in its shared config
+     (`core.sparseCheckout` set in `.git/config` by hand, with no
+     per-worktree config) gives every lane one, and GC leaves it, with a
+     warn: disabling it there would change the owner's repository config.
+     Such a lane, or one a minion or a setup made sparse, is refused as
+     above.
+   - **Work in a nested repository that would be lost.** A nested
+     repository is every git repository inside the lane other than the lane
+     itself: its submodules at any depth, and any repository its index or
+     HEAD records as a gitlink (an embedded repository committed or staged
+     with no `.gitmodules`). Each keeps its git data under the lane's own
+     git folder or in a `.git` inside its checkout, which the removal
+     deletes, and the snapshot records only its gitlink. GC finds them in
+     the lane with one bounded `git ls-files -s` (mode `160000`), a staged
+     diff for gitlinks HEAD records and the index no longer does, and the
+     `.gitmodules` at the lane's base, HEAD and working tree, whether or not
+     a `.gitmodules` exists; then the same inside each nested repository
+     with a checkout. Detection ignores every display setting (`-c
+     diff.ignoreSubmodules=none`, `--ignore-submodules=none`), so neither
+     user, repository nor global config hides anything. (An untracked folder
+     holding a `.git` is no gitlink: step 1 copies it whole, its `.git` and
+     commits with it.) A nested repository is safe to remove with the lane
+     only when both hold:
+     - **its index and working tree are clean** (its own `git status`,
+       untracked files included): modified or staged tracked content is
+       refused by its path, whatever `.gitmodules` `ignore =` says
+       (`ignore = dirty` quiets `git status`; it does not make the content
+       disposable). Untracked content is no loss: step 1 copies it into the
+       preserve folder under its path in the lane, at any depth. The
+       exception is a submodule whose `.gitmodules` at the lane's base sets
        `ignore = untracked` or `ignore = all`: the user declared its
        untracked files disposable (build leftovers), so they are neither
-       copied nor refused.
-
-     The check is cheap when there are no submodules: with no `.gitmodules`
-     at HEAD or in the working tree, only the staged change is read (an
-     embedded repository staged as a gitlink), and no tree listing runs.
-     Otherwise one bounded `ls-files -s` finds the index's gitlinks, and
-     `ls-tree` reads HEAD's and the base's only at the submodule paths.
+       copied nor refused. A change inside a repository nested in it is
+       judged in that repository, never in the one around it.
+     - **every commit it can reach survives**: each commit reachable from
+       its HEAD, its branches, its tags, its stash and the reflogs of HEAD,
+       the branches and the stash (`git rev-list` over them `--not
+       --remotes`, bounded) is the gitlink the lane's **base** (the registry
+       row's `sha`) records for it or an ancestor of that, or is in one of
+       its remote-tracking refs, or is in the main checkout's own copy of it
+       (`<git common dir>/modules/<name>`, which outlives the lane). A tag in
+       the lane's own copy is no evidence: it goes with the lane, so an
+       unpushed commit `npm version` tagged is refused. A commit only the
+       reflog holds (a detached-HEAD commit a later `git submodule update`
+       put back at the pin) is refused, and so is a gitlink bump to an
+       unpushed commit with a clean status. A lane that touched nothing is
+       released even when its base's pin is reachable only from a tag or was
+       fetched by its sha into a shallow copy.
 
      A staged `git rm` of a submodule, an update to commits its remote has
      (`git submodule update --remote`) and a pushed commit are not refused.
-     The refusal names each submodule and what it holds ("push the
-     submodule commit"), and carries a **digest** of that work: each
-     submodule's path, states and HEAD, a hash of its tracked content
-     (`git diff --binary HEAD` inside it), its sorted untracked paths, and
-     the commits found at risk. It is recorded once per lane and digest
-     (for a lane with no job too) as `worktree.submodule-work-refused { id,
-     path, digest, submodules }`, and Gru gets one **action-required** row
-     per lane and digest (kind `worktree.submodule-work`) naming the
-     submodules, their commits or states, what to do (tell the minion to
+     The refusal names each nested repository by its path and what it holds
+     (the first commits at risk, each with where it was found: its HEAD, a
+     branch, a tag, a stash entry, its reflog; "push the submodule
+     commit"), and carries a **digest** of that work: each repository's
+     path, states and HEAD, the commits at risk, and a hash of its tracked
+     content (`git diff --binary HEAD` inside it). Untracked files are not
+     in the digest: step 1 keeps them, no discard covers them, and a
+     watcher writing caches does not move it. The refusal is recorded once
+     per lane and digest (for a lane with no job too) as
+     `worktree.submodule-work-refused { id, path, digest, submodules }`, and
+     Gru is told at every refusal, one **action-required** row per lane and
+     digest (kind `worktree.submodule-work`, the row id keeps it to one, so
+     a notice that failed once is posted by the next refusal) naming the
+     repositories, their commits or states, what to do (tell the minion to
      push the submodule commit, or ask the owner to discard with the digest)
-     and the digest. A refusal with a newer digest closes the older row; the
-     lane's release closes the last one (producer-resolved: a disposition
-     cannot close it). Only an **operator** release may discard the work, by
-     passing `discard_submodule_work: "<digest>"`: the discard covers
-     exactly the work that refusal showed, and when the lane's submodule
-     work changed since (a new commit, more edits, another submodule), the
-     release refuses again with the new digest. A discard without a digest
-     is refused. The discard is recorded first as
+     and the digest. A refusal with a newer digest closes the older row.
+     Every row about a lane (submodule work, a sparse checkout, a restore
+     that came back incomplete) closes when the lane is swept by any path (a
+     release, the reconcile of a lane whose tree is gone, a removal GC
+     finished), and the slimmer's five-minute reconcile closes any whose
+     lane is swept or out of the registry, or whose job ended with its tree
+     gone (producer-resolved: a disposition cannot close them). Only an
+     **operator** release may discard the work, by passing
+     `discard_submodule_work: "<digest>"`: the discard covers exactly the
+     work that refusal showed, and when the lane's nested work changed since
+     (a new commit, more edits, another repository), the release refuses
+     again with the new digest, and the error and the new row say so: if it
+     keeps changing, something is still writing into the submodule, so stop
+     that process first, then discard the newest digest. A discard without a
+     digest is refused. The discard is recorded first as
      `worktree.submodule-work-discarded { id, path, digest, submodules:
      [{ path, state, head }] }`. The autopilot and a Silas release never pass
      it.
@@ -176,7 +209,9 @@ for a lane is the lane's to tear down — not a stranger's.
 1. **Preserve** untracked deliverables FIRST (`--porcelain -z` — never
    C-quoted paths; `--untracked-files=all`, so a repository whose
    `status.showUntrackedFiles` hides untracked files still has every one
-   copied; a submodule's untracked content too (step 0); symlinks are
+   copied; an untracked folder holding a `.git` is copied whole, its `.git`
+   with it; the untracked content of nested repositories too, at any depth
+   (step 0); symlinks are
    preserved AS LINKS; a genuine mid-sweep vanish is skipped+logged; any
    other preserve failure ABORTS the sweep with the tree intact and the
    partial copy withdrawn — deliverables are never sacrificed). The copy is
@@ -214,16 +249,25 @@ for a lane is the lane's to tear down — not a stranger's.
      not hashed again), with the index file's own times: git hashes again
      any entry written in the index's last second ("racily clean"), as the
      real index would have it, so a file rewritten at the same size in that
-     second is saved as rewritten. Only when that copy cannot be made (the
-     lane's index is missing or unreadable) is the temporary index read
-     from HEAD instead (`git read-tree HEAD`), with one warn naming the
-     files staged new in the lane's index, which are then in neither the
-     snapshot nor the preserve copy. The temporary index is removed
-     afterwards.
+     second is saved as rewritten. The copy goes to the system's temporary
+     folder, else (that folder full or unwritable) to the preserve root. A
+     readable index that cannot be copied to either refuses the release by
+     name, saying how many files it stages new: a snapshot from HEAD would
+     lose them. Only when the lane's index cannot be read at all (it is
+     missing or unreadable) is the temporary index read from HEAD instead
+     (`git read-tree HEAD`), with one warn saying that which files it staged
+     new cannot be known and none is in the snapshot (with no index, git
+     counts every file in the lane untracked, so the preserve copy holds
+     them all). The temporary index is removed afterwards.
    - On the temporary index, the assume-unchanged and skip-worktree bits
      are cleared for every entry whose file is on disk (`git ls-files -v`
      shows them), so an edit behind either is saved. An entry absent from
-     disk keeps its bits.
+     disk keeps its bits. Those bits are also how a local file is kept out
+     of `git status` on purpose (a tracked `config/database.yml` or
+     `.env.development` with local values, possibly credentials), so such a
+     file is saved too, into the local `refs/gru/preserved/*` commit. These
+     refs stay in the user's own repository: GC never pushes them (a
+     `git push --mirror` of your own would).
    - `GIT_INDEX_FILE=<tmp> git add -u` adds every tracked edit and
      deletion, and `git write-tree` writes the tree. If either fails (a
      tracked file git cannot read, say), the release is refused by name,
@@ -245,13 +289,29 @@ for a lane is the lane's to tear down — not a stranger's.
    - If anything after those records fails (the ref cannot be written, or
      `worktree remove` fails, on a busy mount say), the tree is retained and
      GC records `worktree.release-aborted { id, path, preserved: {
-     destination, files }, snapshot: { ref, sha }, discarded, error }`,
+     destination, files }, snapshot: { ref, sha, files }, discarded, error }`,
      naming the preserve folder and any ref already written. A retry reuses
      that preserve copy while the lane's untracked files are unchanged (the
      same paths, links and bytes), that ref while it names a commit of the
      same tree on the same HEAD, and that discard record: it makes no new
      folder, ref or record, and a retry that fails the same way adds no
      second `worktree.release-aborted`.
+   - A `worktree remove` that fails part way (a read-only folder, a busy
+     mount) has already deleted the lane's git folder (`.git/worktrees/<id>`)
+     and part of its tree: git deletes that folder whatever happened to the
+     tree, and no git command runs in what is left. GC checks the
+     repository's worktree records; when none names the lane any more, it
+     deletes what is left of the tree (read-only folders made writable
+     first, a link removed as a link), runs `git worktree prune`, and the
+     release completes as usual (the lane swept, the owner told what was
+     saved), with `worktree.sweep-tail-failed { id, stage: "remove", error }`
+     naming what happened. When the rest cannot be deleted either, the
+     release is refused by name with what is left in place. A release of a
+     lane found in that state (the git folder gone, part of the tree left)
+     takes the same path and then reconciles the lane as removed; unless an
+     aborted release of GC's saved the lane's work before its removal began,
+     it first copies what is left, whole, into the preserve root
+     (`worktree.preserved`, with `remains: true`).
 
    `<lane>` is the lane id when git accepts it as one ref-name component
    (letters, digits, `.`, `_` and `-`, not starting with `.` or `-`, no
@@ -348,14 +408,17 @@ manifest's blob, and the restore runs exactly that blob. A lane whose base
 has no manifest, no `reclaim`, or no `[[setup]]` (nothing could restore
 it) is never slimmed.
 
-**What setup makes, recorded at bootstrap.** When a lane is bootstrapped
-(created, or restored), GC records `worktree.bootstrapped { id,
-manifest_blob, setup_made }`: the `reclaim` entries absent before the
-manifest was applied and present right after it. A restore must bring
-those back; any other entry is optional (build output a build or verify
-makes). A lane with no bootstrap record (one created before GC recorded
-them) is never slimmed, since a restore could not tell what it must bring
-back.
+**What setup makes, recorded at bootstrap.** When a lane is created and
+bootstrapped, GC records `worktree.bootstrapped { id, manifest_blob,
+setup_made }`: the `reclaim` entries absent before the manifest was applied
+and present right after it. It is written once; a restore never rewrites
+it, so what a restore requires never shrinks. A restore must bring those
+back; any other entry is optional (build output a build or verify makes). A
+lane with no bootstrap record (one created before GC recorded them) is
+never slimmed, since a restore could not tell what it must bring back. The
+blob is read in the source checkout at the commit the lane was made from,
+so nothing reads the lane's HEAD or refs before the creation's custody
+proof.
 
 **What is deleted.** Each `reclaim` entry is deleted only when it exists,
 no part of its path is a symbolic link, no manifest `[[link]]` `at` or
@@ -377,12 +440,23 @@ idempotent). Each entry is checked again just before its delete, so one
 that became a link since the plan is never followed. What was really freed
 follows: `worktree.slim-done { id, freed_bytes, shared_bytes }` when every
 delete completed, or `worktree.slim-incomplete { id, failed: [{ path,
-reason }], freed_bytes, shared_bytes }` when a delete failed or a service
-stop cut the pass short. A delete checks the stop at every path it
-removes, so a stop ends it there; an entry a stop cut short counts no
-freed bytes. A pass the shutdown outran (the ledger closed first) leaves a
-`worktree.slimmed` with no follow-up: the lane is slim, and its next turn
-restores it.
+reason }], partial, freed_bytes, shared_bytes }` when a delete failed or a
+service stop cut the pass short; `partial` names the entries whose delete
+began and did not finish, so part of each is gone. A delete checks the stop
+at every path it removes, so a stop ends it there; an entry a stop cut
+short counts no freed bytes. A pass the shutdown outran (the ledger closed
+first) leaves a `worktree.slimmed` with no follow-up: the lane is slim, and
+its next turn restores it. A half-deleted entry is never counted as there:
+before setup runs, a restore finishes the delete of each entry the slim
+named `partial` (or, after a slim with no follow-up at all, of each entry
+it planned that is still there) and records `worktree.slim-completed { id,
+entries }` (every entry finished so far, so a later restore never deletes
+it again, even after a minion rebuilt it). Setup then makes it whole, or it
+counts as missing: a required entry fails the restore as below, an optional
+one is named in `not_recreated`. An entry whose delete cannot be finished
+(its folder is read-only, say) is never counted whole either: a required
+one fails the restore (the lane stays slim, the next turn retries), an
+optional one is named in `not_recreated`.
 
 **Bytes on disk.** Sizes come from an `lstat` walk that never follows a
 link and counts each inode's allocated blocks (`blocks × 512`; its size
@@ -455,8 +529,9 @@ runs, and the turn's stop or cancel ends setup's process group. A
 provider-recovery continuation takes no worker slot (by design, no second
 capacity counter), so it calls the same restore directly, after its claim
 and before its prompt; the service's stop ends its setup and the
-continuation: nothing is spawned or prompted during shutdown (recorded as
-`provider.continuation-failed`, stage `authorization`). `POST
+continuation: nothing is spawned or prompted during shutdown, and its claim
+is handed back (the wait is `recovered-pending` again,
+`provider.continuation-released`), so the next start replays it. `POST
 /api/verify` restores the job's lanes once its run holds a verification
 slot and before its command spawns: restores share the verification budget
 (`max_concurrent`), and the run's slot keeps the job busy, so no slim can
@@ -468,8 +543,7 @@ reconciles by request id), so it does not end a restore either.
 
 A restore whose setup succeeds and brings back everything its setup made
 at bootstrap is a restore: GC records `worktree.rehydrated { id, ms,
-not_recreated? }` and a new `worktree.bootstrapped`, and the lane is no
-longer slim. `not_recreated` names each other deleted entry setup did not
+not_recreated? }`, and the lane is no longer slim. `not_recreated` names each other deleted entry setup did not
 bring back; build output such as Rust's `target/` or a `dist/` comes back
 with the next build or verify, as the onboarding proof allows (an entry may
 appear after setup or after `verify.full`), and a later slim deletes it
@@ -481,8 +555,8 @@ is done) is a failed restore: GC records `worktree.rehydrate-failed { id,
 error: "setup did not recreate X …", manifest, missing, reason:
 "setup-incomplete" }`, the lane stays slim (each turn runs setup again) and
 is never slimmed again, and Gru gets one **action-required** row for the
-lane (kind `worktree.restore-incomplete`, closed by the lane's release)
-naming what is missing and the likely stamp file.
+lane (kind `worktree.restore-incomplete`, closed once the lane is gone, as
+for submodule work) naming what is missing and the likely stamp file.
 
 When setup fails or is stopped, GC records `worktree.rehydrate-failed { id,
 error, manifest? }` and logs a warning. The error is at most 4 KiB,

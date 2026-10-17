@@ -2,6 +2,7 @@ import { readWorktreeMetadata, repositoryCommonDirectory, capturePortLaneHandoff
 import { execFile, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
+  chmodSync,
   closeSync,
   copyFileSync,
   cpSync,
@@ -372,7 +373,7 @@ export class LaneSubmoduleWorkError extends Error {
         .join('; ')}) — push the submodule commit (git push inside the submodule), and commit and push ` +
         'modified content inside each submodule, ' +
         `or discard exactly this work with an operator release that passes discard_submodule_work: "${digest}"` +
-        `${staleDiscard === null ? '' : ` (the discard named ${staleDiscard}, which is not the work the lane holds now)`}; the tree is retained`,
+        `${staleDiscard === null ? '' : ` (the discard named ${staleDiscard}, which is not the work the lane holds now: ${SUBMODULE_WORK_CHANGING})`}; the tree is retained`,
     );
     this.name = 'LaneSubmoduleWorkError';
   }
@@ -409,7 +410,7 @@ export type SlimResult =
 
 /** What a restore before a turn or a verification did for one lane (#427).
  * `notRecreated`: deleted entries setup did not bring back (a build or
- * verify makes them). */
+ * verify makes them), and any whose cut-short delete could not be finished. */
 export type LaneRestore =
   | { readonly id: string; readonly status: 'ready' }
   | { readonly id: string; readonly status: 'rehydrated'; readonly ms: number; readonly notRecreated: readonly string[] }
@@ -473,13 +474,13 @@ interface SweepAttempt {
  * after its records, so a retry can reuse what it saved. */
 interface AbortedRelease {
   readonly preserved: SweepPreservation | null;
-  readonly snapshot: { readonly ref: string; readonly sha: string } | null;
+  readonly snapshot: SweepSnapshot | null;
   readonly discarded: string | null;
 }
 
-/** What the submodule check found (#427): the work a removal would
- * destroy, its digest, and the submodules whose untracked content the
- * preserve copy takes. */
+/** What the nested-repository check found (#427): the work a removal
+ * would destroy, its digest, and the untracked files of the nested
+ * repositories (by their paths in the lane) that the preserve copy takes. */
 interface SubmoduleScan {
   readonly work: readonly SubmoduleWork[];
   readonly digest: string;
@@ -527,15 +528,22 @@ export interface WorktreeManagerOptions {
    * both. Called once per release that saved either, after the sweep, so
    * the owner can be told where it is ({@link sweepWorkNotice}). */
   readonly onWorkSaved?: (input: SavedWork) => void;
-  /** A release was refused for submodule work (#427): called once per lane
-   * and digest, so Gru hears about it ({@link submoduleWorkNotice}).
-   * `previousDigest`: the lane's earlier refusal this one supersedes. */
+  /** A release was refused for submodule work (#427): called at every
+   * refusal, so Gru hears about it ({@link submoduleWorkNotice}, one row per
+   * lane and digest). `previousDigest`: the lane's earlier refusal this one
+   * supersedes, when the digest changed. `staleDiscard`: the digest an
+   * operator's discard named, when the work changed since. */
   readonly onSubmoduleWorkRefused?: (input: {
     readonly worktree: WorktreeRecord;
     readonly submodules: readonly SubmoduleWork[];
     readonly digest: string;
     readonly previousDigest: string | null;
+    readonly staleDiscard: string | null;
   }) => void;
+  /** A release was refused because the lane is a sparse checkout (#427):
+   * called at every refusal, so Gru hears about it
+   * ({@link sparseCheckoutNotice}, one row per lane). */
+  readonly onSparseCheckoutRefused?: (input: { readonly worktree: WorktreeRecord }) => void;
   /** A restore's setup succeeded but did not recreate what it made when
    * the lane was bootstrapped (#427): the lane stays slim and is never
    * slimmed again, and Gru hears about it once per lane
@@ -1059,7 +1067,7 @@ export class WorktreeManager {
       let bootstrapped: LaneBootstrap | null;
       try {
         await this.addLane(repo.repoPath, path, custody);
-        bootstrapped = await this.bootstrap(repo.repoPath, path);
+        bootstrapped = await this.bootstrap(repo.repoPath, path, custody.sha);
         this.assertCreationIdentity(path, custody);
         this.assertCreationCustody(repo.repoPath, path, custody);
         beginLaneHandoff({ id: input.jobId, kind: 'job', jobId: input.jobId, roundId: null, repoPath: repo.repoPath, path, branch: custody.branch, sha: custody.sha },
@@ -1221,7 +1229,7 @@ export class WorktreeManager {
       try {
         await this.addLane(repo.repoPath, path, custody, assertParent);
         assertParent();
-        if (input.authority === 'writer') bootstrapped = await this.bootstrap(repo.repoPath, path);
+        if (input.authority === 'writer') bootstrapped = await this.bootstrap(repo.repoPath, path, custody.sha);
         assertParent();
         this.assertCreationIdentity(path, custody);
         const sha = runGit(path, ['rev-parse', 'HEAD']);
@@ -1265,7 +1273,7 @@ export class WorktreeManager {
   /** Bootstrap manifest (18a): auto-apply at creation; missing = no-op.
    * Async: setup commands run off the event loop, so a slow bootstrap
    * (npm ci) never freezes chat/supervision while dispatch awaits the lane. */
-  private async bootstrap(sourceRoot: string, worktreePath: string): Promise<LaneBootstrap | null> {
+  private async bootstrap(sourceRoot: string, worktreePath: string, sha: string): Promise<LaneBootstrap | null> {
     // The lane's own committed manifest is applied (#427): a job lane is
     // fresh from origin, so a merged manifest takes effect before the user's
     // checkout pulls it, and an uncommitted local one never does. Its
@@ -1285,7 +1293,10 @@ export class WorktreeManager {
       log: this.log,
     });
     const after = await presentReclaimEntries(worktreePath, reclaim);
-    const blob = spawnGit(worktreePath, ['rev-parse', '--verify', '--quiet', `HEAD:${MANIFEST_PATH}`]).stdout.trim();
+    // The blob at the commit the lane was made from, read in the source
+    // checkout: git in the lane reads its HEAD and refs, which only the
+    // creation's custody proof, after this, may touch (GH-270).
+    const blob = spawnGit(sourceRoot, ['rev-parse', '--verify', '--quiet', `${sha}:${MANIFEST_PATH}`]).stdout.trim();
     return { blob: blob === '' ? null : blob, setupMade: reclaim.filter((entry) => after.has(entry) && !before.has(entry)) };
   }
 
@@ -1368,6 +1379,27 @@ export class WorktreeManager {
     const payload = this.opts.ledger.latestJobEventByPayloadField(row.jobId, 'worktree.bootstrapped', 'id', row.id)?.payload as { readonly setup_made?: unknown } | undefined;
     if (payload === undefined) return null;
     return Array.isArray(payload.setup_made) ? payload.setup_made.filter((entry): entry is string => typeof entry === 'string') : [];
+  }
+
+  /** The entries of the lane's newest slim whose delete began and did not
+   * finish (#427), less those a restore has finished since
+   * (`worktree.slim-completed`, which lists every one finished so far):
+   * those `worktree.slim-incomplete` names `partial`, or, when the slim
+   * recorded no outcome at all (it was cut off), every entry it planned. */
+  private partlyDeleted(row: WorktreeRecord, slimmedSeq: number, entries: readonly string[]): { readonly partial: readonly string[]; readonly completed: readonly string[] } {
+    const after = (kind: string): { readonly payload: unknown } | null => {
+      const event = this.opts.ledger.latestJobEventByPayloadField(row.jobId!, kind, 'id', row.id);
+      return event !== null && event.seq > slimmedSeq ? event : null;
+    };
+    const named = (event: { readonly payload: unknown } | null, field: string): readonly string[] | null => {
+      const value = (event?.payload as Record<string, unknown> | null | undefined)?.[field];
+      return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : null;
+    };
+    if (after('worktree.slim-done') !== null) return { partial: [], completed: [] };
+    const completed = named(after('worktree.slim-completed'), 'entries') ?? [];
+    const incomplete = after('worktree.slim-incomplete');
+    const begun = incomplete === null ? entries : named(incomplete, 'partial') ?? entries;
+    return { partial: entries.filter((entry) => begun.includes(entry) && !completed.includes(entry)), completed };
   }
 
   /** Whether a restore of this lane ever ran setup and found something it
@@ -1508,19 +1540,24 @@ export class WorktreeManager {
       // runs setup.
       const deleted: { path: string; bytes: number; sharedBytes: number }[] = [];
       const failed: { path: string; reason: string }[] = [];
+      // Entries whose delete began and did not finish: part of each is gone.
+      const partial: string[] = [];
       for (const entry of planned) {
         // A stop between entries leaves the rest: the lane is slim already.
         if (stopped()) {
           failed.push({ path: entry.path, reason: 'the service stopped before it was deleted' });
           continue;
         }
+        let begun = false;
         try {
           // A link that appeared on the path since the plan is never followed.
           const state = await reclaimState(row.path, entry.path);
           if (state !== 'present') throw new Error(state === 'link' ? 'a link appeared on its path after the slim was planned' : 'it was gone when its delete ran');
+          begun = true;
           await removeTree(join(row.path, entry.path), input.signal);
           deleted.push(entry);
         } catch (error) {
+          if (begun) partial.push(entry.path);
           // A delete the stop cut short freed an unknown part: none is counted.
           failed.push({ path: entry.path, reason: stopped()
             ? 'the service stopped while it was being deleted'
@@ -1534,7 +1571,7 @@ export class WorktreeManager {
       }
       try {
         this.opts.ledger.appendCustomEvent(failed.length > 0
-          ? { kind: 'worktree.slim-incomplete', jobId: row.jobId, payload: { id: row.id, failed, freed_bytes: freedBytes, shared_bytes: sharedBytes } }
+          ? { kind: 'worktree.slim-incomplete', jobId: row.jobId, payload: { id: row.id, failed, partial, freed_bytes: freedBytes, shared_bytes: sharedBytes } }
           : { kind: 'worktree.slim-done', jobId: row.jobId, payload: { id: row.id, freed_bytes: freedBytes, shared_bytes: sharedBytes } });
       } catch (error) {
         this.log('error', `worktree.${failed.length > 0 ? 'slim-incomplete' : 'slim-done'} event write failed`, { id: row.id, error: String(error) });
@@ -1552,15 +1589,17 @@ export class WorktreeManager {
    * (links and copies were never deleted), under the lane's lock, so a
    * restore that arrives while a slim runs waits and then restores.
    *
+   * An entry the slim began and did not finish deleting is deleted whole
+   * first (`worktree.slim-completed`), so a half-deleted folder never counts
+   * as restored; one whose delete cannot be finished never counts as there.
    * A setup that succeeds must bring back what the lane's setup made when it
-   * was bootstrapped (`worktree.bootstrapped`'s `setup_made`). When it did,
-   * GC records `worktree.rehydrated`, naming any other deleted entry still
-   * absent (`not_recreated`: a build or verify makes it), and
-   * `worktree.bootstrapped` for what this setup made; the lane is no longer
-   * slim. When it did not (a stamp file outside `reclaim` can make setup
-   * skip its work), GC records `worktree.rehydrate-failed` ("setup did not
-   * recreate X"): the lane stays slim, is never slimmed again, and Gru hears
-   * about it once. A setup that fails or is stopped records
+   * was created (`worktree.bootstrapped`'s `setup_made`, which a restore
+   * never rewrites). When it did, GC records `worktree.rehydrated`, naming
+   * any other deleted entry still absent (`not_recreated`: a build or verify
+   * makes it); the lane is no longer slim. When it did not (a stamp file
+   * outside `reclaim` can make setup skip its work), GC records
+   * `worktree.rehydrate-failed` ("setup did not recreate X"): the lane stays
+   * slim, is never slimmed again, and Gru hears about it once. A setup that fails or is stopped records
    * `worktree.rehydrate-failed` with a warn log: the lane stays slim so the
    * next turn retries. Either way the caller proceeds. The signal (the
    * turn's, the run's or the continuation's stop) ends setup's process
@@ -1599,7 +1638,8 @@ export class WorktreeManager {
       row = this.opts.ledger.getWorktree(laneId);
       if (row === null || row.status !== 'active' || row.jobId === null || !existsSync(row.path) || !this.slimRow(row)) return { id: laneId, status: 'ready' };
       const started = Date.now();
-      const record = slimRecord(this.opts.ledger.latestJobEventByPayloadField(row.jobId, 'worktree.slimmed', 'id', row.id));
+      const slimmed = this.opts.ledger.latestJobEventByPayloadField(row.jobId, 'worktree.slimmed', 'id', row.id);
+      const record = slimRecord(slimmed);
       let manifest: WorktreeManifest;
       if (record.blob === null) {
         // A slim recorded before slims named their manifest: the base's.
@@ -1614,7 +1654,23 @@ export class WorktreeManager {
       }
       const required = this.setupMade(row) ?? [];
       const reclaim = manifest.reclaim ?? [];
-      const before = await presentReclaimEntries(row.path, reclaim);
+      // An entry the slim began and did not finish deleting is no entry: its
+      // delete is finished first (once, recorded), so setup makes it whole or
+      // the check below finds it missing.
+      const { partial, completed } = this.partlyDeleted(row, slimmed!.seq, record.entries);
+      // One whose delete cannot be finished either is never counted whole.
+      const unfinished = new Map<string, string>();
+      for (const entry of partial) {
+        try {
+          if ((await reclaimState(row.path, entry)) === 'present') await removeTree(join(row.path, entry), signal);
+        } catch (error) {
+          if (signal?.aborted === true) throw error;
+          unfinished.set(entry, oneLineErrorText(error instanceof Error ? error.message : error, 200));
+        }
+      }
+      if (partial.length > unfinished.size) {
+        this.opts.ledger.appendCustomEvent({ kind: 'worktree.slim-completed', jobId: row.jobId, payload: { id: row.id, entries: [...completed, ...partial.filter((entry) => !unfinished.has(entry))] } });
+      }
       await applyWorktreeManifest({ ...manifest, links: [], copies: [] }, {
         sourceRoot: row.repoPath,
         worktreePath: row.path,
@@ -1623,6 +1679,11 @@ export class WorktreeManager {
         ...(signal !== undefined ? { signal } : {}),
       });
       const after = await presentReclaimEntries(row.path, [...new Set([...reclaim, ...required, ...record.entries])]);
+      for (const entry of unfinished.keys()) after.delete(entry);
+      const unfinishedRequired = required.filter((entry) => unfinished.has(entry));
+      if (unfinishedRequired.length > 0) {
+        return failedRestore(`the slim's delete of ${unfinishedRequired.map((entry) => `${entry} (${unfinished.get(entry)!})`).join(', ')} was cut short and could not be finished, so setup cannot be trusted to have made ${unfinishedRequired.length === 1 ? 'it' : 'them'} whole; the lane stays slim and the next turn retries`);
+      }
       const missing = required.filter((entry) => !after.has(entry));
       if (missing.length > 0) {
         const first = !this.restoreWasIncomplete(row);
@@ -1647,7 +1708,8 @@ export class WorktreeManager {
         jobId: row.jobId,
         payload: { id: row.id, ms, ...(notRecreated.length > 0 ? { not_recreated: notRecreated } : {}) },
       });
-      this.recordBootstrap(row, { blob, setupMade: reclaim.filter((entry) => after.has(entry) && !before.has(entry)) });
+      // What setup made at the lane's creation stays what a restore requires:
+      // a restore never rewrites that record (#427).
       this.log('info', 'slim lane restored', { id: row.id, ms, ...(notRecreated.length > 0 ? { not_recreated: notRecreated } : {}) });
       return { id: laneId, status: 'rehydrated', ms, notRecreated };
     } catch (error) {
@@ -1738,6 +1800,27 @@ export class WorktreeManager {
         const freshHead = this.safeFreshHead(row.repoPath);
         assertLaneResourcesAbsent(row);
         return { status: 'swept', preserved: null, branch: branchOutcome, freshHead } as const;
+      });
+    }
+    // A removal git left part way (#427): git deleted the lane's git folder
+    // and part of its tree, so no git command runs in what is left. The
+    // release deletes the rest and reconciles the lane as removed below.
+    // What is left is kept first unless an aborted release of GC's already
+    // saved the lane's work before its removal began.
+    if (existsSync(row.path) && this.laneAdminGone(row)) {
+      await this.withRepoLock(row.repoPath, async () => {
+        if (!existsSync(row.path) || !this.laneAdminGone(row)) return;
+        const aborted = this.abortedRelease(row);
+        const remains = aborted === null ? this.preserveRemains(row) : null;
+        this.removeLaneRemains(row);
+        this.recordRemovalFinished(row, 'a git worktree remove failed part way, after git had deleted the lane\'s git folder');
+        const saved = aborted ?? { snapshot: null, preserved: remains };
+        if (saved.snapshot === null && saved.preserved === null) return;
+        try {
+          this.opts.onWorkSaved?.({ worktree: row, snapshot: saved.snapshot, preserved: saved.preserved });
+        } catch (error) {
+          this.log('warn', 'saved-work notice failed; what was saved is on the lane\'s records', { id: row.id, error: String(error) });
+        }
       });
     }
     // An unfinished merge, rebase, cherry-pick, revert or bisect refuses
@@ -1957,6 +2040,23 @@ export class WorktreeManager {
       ...(custody.branch === null ? ['--detach'] : []), path, custody.branch ?? custody.sha]);
     assertSource?.();
     this.assertCreationIdentity(path, custody);
+    this.disableSparseCheckout(path);
+  }
+
+  /** A lane is never sparse (#427): `git worktree add` gives a lane the
+   * owner checkout's sparse-checkout, and a sparse lane's release is refused
+   * ({@link LaneSparseCheckoutError}). With per-worktree config
+   * (`extensions.worktreeConfig`, which `git sparse-checkout` turns on) the
+   * lane's sparse checkout is disabled, in the lane only, before anything
+   * runs in it. With the older shared `core.sparseCheckout` it is left as it
+   * is: disabling it there would change the owner's repository config. */
+  private disableSparseCheckout(path: string): void {
+    if (spawnGit(path, ['config', '--bool', '--get', 'core.sparseCheckout']).stdout.trim() !== 'true') return;
+    if (spawnGit(path, ['config', '--bool', '--get', 'extensions.worktreeConfig']).stdout.trim() !== 'true') {
+      this.log('warn', 'lane is sparse through the repository\'s shared core.sparseCheckout; it is left sparse, and its release is refused until the sparse checkout is disabled in it', { path });
+      return;
+    }
+    runGit(path, ['sparse-checkout', 'disable']);
   }
 
   /** Read-only creation metadata while a ref transaction owns its lock.
@@ -2404,14 +2504,16 @@ export class WorktreeManager {
    * (ENOENT) is skipped and logged; ANY OTHER preserve failure ABORTS the
    * sweep with the tree intact — deliverables are never sacrificed to a
    * removal step. */
-  private preserveUntracked(row: WorktreeRecord, submodules: readonly string[], attempt: SweepAttempt): SweepPreservation | null {
+  private preserveUntracked(row: WorktreeRecord, nested: readonly string[], attempt: SweepAttempt): SweepPreservation | null {
     // `--untracked-files=all` overrides the repository's own
     // `status.showUntrackedFiles` (#427): a repository that hides untracked
-    // files from `git status` still has every one copied. A submodule's
-    // untracked content (#427) is copied too, under its path.
+    // files from `git status` still has every one copied. An untracked
+    // folder holding a `.git` is copied whole, its `.git` with it. The
+    // untracked files of nested repositories (#427, at any depth) are
+    // copied too, under their paths.
     const untracked = [
       ...porcelainUntracked(runGit(row.path, ['status', '--porcelain', '-z', '--untracked-files=all'])),
-      ...submodules.flatMap((sub) => porcelainUntracked(runGit(join(row.path, sub), ['status', '--porcelain', '-z', '--untracked-files=all'])).map((rel) => `${sub}/${rel}`)),
+      ...nested,
     ];
     if (untracked.length === 0) return null;
     // A retry of a release that aborted after its records (#427) reuses that
@@ -2663,7 +2765,16 @@ export class WorktreeManager {
     let snapshot: SweepSnapshot | null = null;
     try {
       snapshot = built === null ? null : this.reusableSnapshot(row, built, attempt.aborted) ?? this.saveSnapshot(row, built);
-      runGit(row.repoPath, ['worktree', 'remove', '--force', row.path]);
+      try {
+        runGit(row.repoPath, ['worktree', 'remove', '--force', row.path]);
+      } catch (removal) {
+        // Git deletes the lane's git folder even when it could not delete all
+        // of its tree (#427): no git command runs in what is left, so GC
+        // finishes the removal rather than leave a lane no release completes.
+        if (!this.laneAdminGone(row)) throw removal;
+        this.removeLaneRemains(row);
+        this.recordRemovalFinished(row, `git worktree remove failed part way (${oneLineErrorText(removal instanceof Error ? removal.message : removal, 400)}), after git had deleted the lane's git folder`);
+      }
     } catch (error) {
       // After the records (#427): say what is saved, so the copy and the ref
       // are accounted for, and a retry reuses them while the work is the same.
@@ -2770,171 +2881,180 @@ export class WorktreeManager {
   }
 
   /** Refuse a sparse checkout by name (#427): GC cannot save its work
-   * without risking a wrong tree ({@link LaneSparseCheckoutError}). */
+   * without risking a wrong tree ({@link LaneSparseCheckoutError}). Gru is
+   * told at every refusal (one row per lane). */
   private assertNotSparse(row: WorktreeRecord): void {
     const sparse = spawnGit(row.path, ['config', '--bool', '--get', 'core.sparseCheckout']);
-    if (sparse.status === 0 && sparse.stdout.trim() === 'true') throw new LaneSparseCheckoutError(row.path);
+    if (sparse.status !== 0 || sparse.stdout.trim() !== 'true') return;
+    try {
+      this.opts.onSparseCheckoutRefused?.({ worktree: row });
+    } catch (error) {
+      this.log('warn', 'sparse-checkout notice failed; the refusal names the lane', { id: row.id, error: String(error) });
+    }
+    throw new LaneSparseCheckoutError(row.path);
   }
 
   /**
-   * Submodule work the removal would destroy (#427). A lane's submodules
-   * keep their git data under the lane's own git folder (or in a `.git`
-   * inside their checkout), which the removal deletes, and the snapshot
-   * holds only their gitlinks. Detection ignores every display setting
-   * (`--ignore-submodules=none`, `diff.ignoreSubmodules=none`); what counts
-   * as work is GC's policy:
+   * Work in the lane's nested repositories that the removal would destroy
+   * (#427). A nested repository is every git repository inside the lane
+   * other than the lane itself: its submodules at any depth, and any
+   * repository its index or HEAD records as a gitlink (an embedded
+   * repository committed or staged with no `.gitmodules`). Each keeps its
+   * git data in the lane's own git folder or in a `.git` inside its checkout,
+   * which the removal deletes, and the snapshot holds only its gitlink. An
+   * untracked folder holding a `.git` is no gitlink: the preserve copy takes
+   * it whole, `.git` included. Detection ignores every display setting
+   * (`--ignore-submodules=none`, `diff.ignoreSubmodules=none`). A nested
+   * repository is safe to remove with the lane only when:
    *
-   * - **a commit that survives nowhere else** is refused: the submodule's
-   *   HEAD, the gitlink the lane's HEAD or index records, the tip of any of
-   *   its copy's local branches, or any stash entry, when it is in the
-   *   lane's copy of the submodule but in none of that copy's
-   *   remote-tracking refs or tags and not in the main checkout's own copy
-   *   (`<git common dir>/modules/<name>`), which outlives the lane. The
-   *   gitlink the lane's base (`row.sha`) records is never the lane's work;
-   * - **modified tracked content** is always refused, whatever `.gitmodules`
-   *   `ignore =` says;
-   * - **untracked content** is never refused: the preserve copy takes it,
-   *   unless the base's `.gitmodules` sets `ignore = untracked` or
-   *   `ignore = all` for that submodule (the user declared it disposable).
+   * - **its index and working tree are clean** (its own `status`, untracked
+   *   files included). Untracked content is no loss: the preserve copy takes
+   *   it under its path, unless the `.gitmodules` that records it (at the
+   *   lane's base) sets `ignore = untracked` or `ignore = all` (the user
+   *   declared it disposable). A nested repository's own changes are judged
+   *   in it, never in the repository around it;
+   * - **every commit it can reach survives**: each commit reachable from its
+   *   HEAD, branches, tags, stash and the reflogs of those is the gitlink the
+   *   lane's base records for it (or an ancestor of that), is in one of its
+   *   remote-tracking refs, or is in the main checkout's own copy
+   *   (`<git common dir>/modules/<name>`), which outlives the lane. A tag in
+   *   the lane's own copy is no evidence: it goes with the lane.
    *
    * Work at risk is refused by name ({@link LaneSubmoduleWorkError},
    * recorded once per lane and digest as `worktree.submodule-work-refused`,
-   * and Gru told once), unless an operator release's discard carries the
-   * digest of exactly this work. Returns what is discarded, and the
-   * submodules whose untracked content the preserve copy takes.
+   * with Gru told), unless an operator release's discard carries the digest
+   * of exactly this work. Returns what is discarded, and the untracked files
+   * of the nested repositories (by their paths in the lane) that the
+   * preserve copy takes.
    */
   private assertSubmoduleWork(row: WorktreeRecord, discard: string | null): { readonly discarded: readonly SubmoduleWork[]; readonly untracked: readonly string[] } {
     const scan = this.submoduleWork(row);
     if (scan.work.length === 0) return { discarded: [], untracked: scan.untracked };
     if (discard === scan.digest) return { discarded: scan.work, untracked: scan.untracked };
-    this.recordSubmoduleRefusal(row, scan.work, scan.digest);
+    this.recordSubmoduleRefusal(row, scan.work, scan.digest, discard);
     throw new LaneSubmoduleWorkError(row.path, scan.work, scan.digest, discard);
   }
 
   private submoduleWork(row: WorktreeRecord): SubmoduleScan {
-    const none: SubmoduleScan = { work: [], digest: '', untracked: [] };
-    // Cheap first (#427): with no `.gitmodules` at HEAD or in the working
-    // tree, only a staged gitlink (an embedded repository added) can be a
-    // submodule, and the staged change shows it without listing the tree.
-    const gitmodules = spawnGit(row.path, ['cat-file', '-e', 'HEAD:.gitmodules']).status === 0 || pathOnDisk(join(row.path, '.gitmodules'));
-    if (!gitmodules && !stagedGitlink(spawnGit(row.path, ['diff', '--cached', '--raw', '-z', '--no-renames', 'HEAD', '--']).stdout)) return none;
-    // Content, with nothing hidden by any config.
-    const content = new Map<string, { readonly modified: boolean; readonly untracked: boolean }>();
-    const records = runGit(row.path, ['-c', 'diff.ignoreSubmodules=none', 'status', '--porcelain=v2', '-z', '--ignore-submodules=none', '--untracked-files=all'], { maxBuffer: LISTING_MAX_BUFFER }).split('\0');
-    for (let index = 0; index < records.length; index += 1) {
-      const record = records[index]!;
-      const kind = record.charAt(0);
-      // A rename's original path follows it as its own field.
-      if (kind === '2') index += 1;
-      if (kind !== '1' && kind !== '2' && kind !== 'u') continue;
-      const fields = record.split(' ');
-      const sub = fields[2] ?? 'N...';
-      if (!sub.startsWith('S')) continue;
-      const state = { modified: sub.charAt(2) === 'M', untracked: sub.charAt(3) === 'U' };
-      if (state.modified || state.untracked) content.set(fields.slice(kind === '1' ? 8 : kind === '2' ? 9 : 10).join(' '), state);
-    }
-    // Commits: the gitlinks the index records (one bounded listing), and
-    // those the lane's HEAD and its base record at the submodule paths.
-    const staged = gitlinks(runGit(row.path, ['ls-files', '-s', '-z'], { maxBuffer: LISTING_MAX_BUFFER }), 'index');
-    const names = this.submoduleNames(row, 'HEAD');
-    const paths = [...new Set([...names.keys(), ...staged.keys(), ...content.keys()])].sort();
-    if (paths.length === 0) return none;
-    const recorded = gitlinks(runGit(row.path, ['ls-tree', '-z', 'HEAD', '--', ...paths], { maxBuffer: LISTING_MAX_BUFFER }), 'tree');
-    const base = gitlinks(spawnGit(row.path, ['ls-tree', '-z', row.sha, '--', ...paths], { maxBuffer: LISTING_MAX_BUFFER }).stdout, 'tree');
-    const baseIgnore = this.submoduleIgnore(row);
-    const mainModules = resolve(row.repoPath, runGit(row.repoPath, ['rev-parse', '--git-common-dir']), 'modules');
     const work: SubmoduleWork[] = [];
     const fingerprints: string[] = [];
     const untracked: string[] = [];
-    for (const path of paths) {
-      const name = names.get(path) ?? path;
-      const state = content.get(path);
-      const ignore = baseIgnore.get(name);
-      if (state?.untracked === true && ignore !== 'untracked' && ignore !== 'all') untracked.push(path);
-      const gitDir = this.laneSubmoduleGitDir(row, path, name);
-      const head = gitDir === null ? null : spawnGit(gitDir, ['--git-dir', gitDir, 'rev-parse', '--verify', '--quiet', 'HEAD^{commit}']).stdout.trim() || null;
-      const commits = new Map<string, string>();
-      const candidates: (readonly [string | null | undefined, string])[] = [
-        [head, 'its HEAD'],
-        [recorded.get(path), 'recorded in the lane\'s HEAD'],
-        [staged.get(path), 'staged in the lane\'s index'],
-        ...(gitDir === null ? [] : submoduleLocalCommits(gitDir)),
-      ];
-      // The gitlink the lane's base records is the pin it started from.
-      for (const [commit, where] of candidates) if (commit != null && commit !== base.get(path) && !commits.has(commit)) commits.set(commit, where);
-      const lost = gitDir === null ? [] : [...commits].filter(([commit]) => !submoduleCommitSurvives(gitDir, join(mainModules, name), commit));
-      const states = [
-        ...lost.map(([commit, where]) => `commit ${commit} (${where}) is on no remote-tracking ref or tag and not in the main checkout's copy`),
-        ...(state?.modified === true ? ['modified tracked content'] : []),
-      ];
-      if (states.length === 0) continue;
-      work.push({ path, state: states, head });
-      fingerprints.push(this.submoduleContentFingerprint(row, path, lost.map(([commit]) => commit), state?.untracked === true && ignore !== 'untracked' && ignore !== 'all'));
-    }
+    const seen = new Set<string>();
+    const common = resolve(row.repoPath, runGit(row.repoPath, ['rev-parse', '--git-common-dir']));
+    const visit = (parent: NestedParent, depth: number): void => {
+      for (const child of this.nestedRepos(parent)) {
+        // Never initialized in the lane: nothing of it is the lane's to lose.
+        if (child.gitDir === null || seen.has(child.gitDir)) continue;
+        seen.add(child.gitDir);
+        const checkout = child.populated ? join(row.path, child.path) : null;
+        const head = spawnGit(child.gitDir, ['--git-dir', child.gitDir, '--work-tree', child.gitDir, 'rev-parse', '--verify', '--quiet', 'HEAD^{commit}']).stdout.trim() || null;
+        const commits = nestedLostCommits(child, head);
+        const status = checkout === null ? null : nestedStatus(checkout);
+        if (status !== null && !child.disposable) untracked.push(...status.untracked.map((rel) => `${child.path}/${rel}`));
+        const deeper = checkout !== null && depth >= NESTED_DEPTH_LIMIT && this.nestedRepos(nestedParent(child, checkout)).length > 0;
+        const states = [
+          ...commits.states,
+          ...(status?.modified === true ? ['modified tracked content'] : []),
+          ...(deeper ? [`repositories nested more than ${String(NESTED_DEPTH_LIMIT)} levels deep, which GC does not check`] : []),
+        ];
+        if (states.length > 0) {
+          work.push({ path: child.path, state: states, head });
+          fingerprints.push(this.submoduleContentFingerprint(checkout, commits.lost));
+        }
+        if (checkout !== null && !deeper) visit(nestedParent(child, checkout), depth + 1);
+      }
+    };
+    visit({
+      path: '',
+      checkout: row.path,
+      modules: resolve(row.path, runGit(row.path, ['rev-parse', '--git-path', 'modules'])),
+      basePin: row.sha,
+      mainModules: join(common, 'modules'),
+    }, 1);
     return { work, digest: submoduleWorkDigest(work, fingerprints), untracked };
   }
 
-  /** What a refused submodule holds, as a hash (#427): its tracked content
-   * against its HEAD (`git diff --binary HEAD`), its untracked paths, and the
-   * commits found at risk. More edits after a refusal change it. */
-  private submoduleContentFingerprint(row: WorktreeRecord, path: string, commits: readonly string[], withUntracked: boolean): string {
-    const checkout = join(row.path, path);
+  /** The repositories nested directly in one (#427): every gitlink its index
+   * records (one bounded `ls-files -s`), every gitlink its HEAD records that
+   * the index no longer does (a staged removal), and every path its
+   * `.gitmodules` names (at its base, at HEAD and in its working tree). */
+  private nestedRepos(parent: NestedParent): readonly NestedRepo[] {
+    const at = parent.checkout;
+    const staged = gitlinks(runGit(at, ['ls-files', '-s', '-z'], { maxBuffer: LISTING_MAX_BUFFER }), 'index');
+    const removed = removedGitlinks(runGit(at, [
+      '-c', 'diff.ignoreSubmodules=none', 'diff', '--cached', '--raw', '-z', '--no-abbrev', '--no-renames', '--ignore-submodules=none', '--diff-filter=DT', 'HEAD', '--',
+    ], { maxBuffer: LISTING_MAX_BUFFER }));
+    const names = new Map<string, string>();
+    const ignore = new Map<string, string>();
+    const declared = [
+      ...(parent.basePin === null ? [] : gitmodulesEntries(at, ['--blob', `${parent.basePin}:.gitmodules`]).map((entry) => [...entry, true] as const)),
+      ...gitmodulesEntries(at, ['--blob', 'HEAD:.gitmodules']).map((entry) => [...entry, false] as const),
+      ...gitmodulesEntries(at, ['--file', '.gitmodules']).map((entry) => [...entry, false] as const),
+    ];
+    for (const [name, key, value, atBase] of declared) {
+      if (key === 'path') names.set(value, name);
+      // What the user declared at the lane's base, never a minion's later edit.
+      if (key === 'ignore' && atBase) ignore.set(name, value);
+    }
+    const paths = [...new Set([...staged.keys(), ...removed, ...names.keys()])].sort();
+    if (paths.length === 0) return [];
+    const recorded = gitlinks(runGit(at, ['ls-tree', '-z', 'HEAD', '--', ...paths], { maxBuffer: LISTING_MAX_BUFFER }), 'tree');
+    const base = parent.basePin === null ? new Map<string, string>() : gitlinks(spawnGit(at, ['ls-tree', '-z', parent.basePin, '--', ...paths], { maxBuffer: LISTING_MAX_BUFFER }).stdout, 'tree');
+    const where = parent.path === '' ? 'the lane\'s' : `${parent.path}'s`;
+    return paths.map((path) => {
+      const name = names.get(path) ?? path;
+      const checkout = join(at, path);
+      const populated = pathOnDisk(join(checkout, '.git'));
+      const modules = join(parent.modules, name);
+      return {
+        path: parent.path === '' ? path : `${parent.path}/${path}`,
+        name,
+        populated,
+        gitDir: populated ? runGit(checkout, ['rev-parse', '--absolute-git-dir']) : existsSync(modules) ? modules : null,
+        basePin: base.get(path) ?? null,
+        mainCopy: parent.mainModules === null ? null : join(parent.mainModules, name),
+        disposable: ignore.get(name) === 'untracked' || ignore.get(name) === 'all',
+        gitlinks: [[recorded.get(path), `recorded in ${where} HEAD`], [staged.get(path), `staged in ${where} index`]],
+      };
+    });
+  }
+
+  /** What a refused nested repository holds, as a hash (#427): the commits
+   * found at risk and its tracked content against its HEAD (`git diff
+   * --binary HEAD`). More edits or commits after a refusal change it; its
+   * untracked files do not (the preserve copy takes them, no discard covers
+   * them). */
+  private submoduleContentFingerprint(checkout: string | null, commits: readonly string[]): string {
     const hash = createHash('sha256').update(JSON.stringify(commits));
-    if (!pathOnDisk(join(checkout, '.git'))) return hash.digest('hex');
+    if (checkout === null) return hash.digest('hex');
     const diff = spawnGit(checkout, ['diff', '--binary', '--no-ext-diff', '--no-textconv', 'HEAD', '--'], { maxBuffer: LISTING_MAX_BUFFER });
     hash.update(`\0${String(diff.status)}\0`).update(diff.stdout);
-    if (withUntracked) hash.update('\0').update(JSON.stringify([...porcelainUntracked(spawnGit(checkout, ['status', '--porcelain', '-z', '--untracked-files=all'], { maxBuffer: LISTING_MAX_BUFFER }).stdout)].sort()));
     return hash.digest('hex');
-  }
-
-  /** Submodule names by path, from `.gitmodules` at a revision and in the
-   * lane's working tree (which wins); a path with neither is its own name. */
-  private submoduleNames(row: WorktreeRecord, revision: string): Map<string, string> {
-    const names = new Map<string, string>();
-    for (const [name, key, value] of [...gitmodulesEntries(row.path, ['--blob', `${revision}:.gitmodules`]), ...gitmodulesEntries(row.path, ['--file', '.gitmodules'])]) {
-      if (key === 'path') names.set(value, name);
-    }
-    return names;
-  }
-
-  /** Each submodule's `ignore =` by name, from `.gitmodules` at the lane's
-   * base (#427): what the user declared, never a minion's later edit. */
-  private submoduleIgnore(row: WorktreeRecord): Map<string, string> {
-    const ignore = new Map<string, string>();
-    for (const [name, key, value] of gitmodulesEntries(row.path, ['--blob', `${row.sha}:.gitmodules`])) if (key === 'ignore') ignore.set(name, value);
-    return ignore;
-  }
-
-  /** The lane's own copy of a submodule's git data: a `.git` inside its
-   * checkout, else `modules/<name>` under the lane's git folder; null when
-   * the lane has none (it never initialized the submodule). */
-  private laneSubmoduleGitDir(row: WorktreeRecord, path: string, name: string): string | null {
-    const checkout = join(row.path, path);
-    if (existsSync(join(checkout, '.git'))) return runGit(checkout, ['rev-parse', '--absolute-git-dir']);
-    const modules = resolve(row.path, runGit(row.path, ['rev-parse', '--git-path', `modules/${name}`]));
-    return existsSync(modules) ? modules : null;
   }
 
   /** A submodule refusal on the record, once per lane and digest (a lane
    * with no job too): what the operator was shown, so a discard can name
-   * it. Gru is told once per lane and digest. */
-  private recordSubmoduleRefusal(row: WorktreeRecord, work: readonly SubmoduleWork[], digest: string): void {
+   * it. Gru is told at every refusal; the notice's row id (lane and digest)
+   * keeps it to one row per digest, so a notice that failed once is posted
+   * by the next refusal. */
+  private recordSubmoduleRefusal(row: WorktreeRecord, work: readonly SubmoduleWork[], digest: string, staleDiscard: string | null): void {
     let previousDigest: string | null = null;
     try {
       const last = (this.opts.ledger.latestEventByPayloadField('worktree.submodule-work-refused', 'id', row.id)?.payload ?? null) as { readonly digest?: unknown } | null;
-      if (last?.digest === digest) return;
-      previousDigest = typeof last?.digest === 'string' ? last.digest : null;
-      this.opts.ledger.appendCustomEvent({
-        kind: 'worktree.submodule-work-refused',
-        jobId: row.jobId,
-        roundId: row.roundId,
-        payload: { id: row.id, path: row.path, digest, submodules: work },
-      });
+      if (last?.digest !== digest) {
+        previousDigest = typeof last?.digest === 'string' ? last.digest : null;
+        this.opts.ledger.appendCustomEvent({
+          kind: 'worktree.submodule-work-refused',
+          jobId: row.jobId,
+          roundId: row.roundId,
+          payload: { id: row.id, path: row.path, digest, submodules: work },
+        });
+      }
     } catch (error) {
       this.log('error', 'worktree.submodule-work-refused event write failed; the refusal still names its digest', { id: row.id, error: String(error) });
     }
     try {
-      this.opts.onSubmoduleWorkRefused?.({ worktree: row, submodules: work, digest, previousDigest });
+      this.opts.onSubmoduleWorkRefused?.({ worktree: row, submodules: work, digest, previousDigest, staleDiscard });
     } catch (error) {
       this.log('warn', 'submodule-work notice failed; the refusal and its record name the digest', { id: row.id, error: String(error) });
     }
@@ -2949,10 +3069,12 @@ export class WorktreeManager {
    *   (a plain read that takes no `index.lock`; the stat cache comes along,
    *   so an unchanged file is not hashed again, and the index's own mtime
    *   keeps git's racy-clean check: an entry written in the index's second
-   *   is hashed again, as the real index would have it). Only when that
-   *   copy cannot be made (the lane's index is missing or unreadable) is the
-   *   temporary index read from HEAD, with a warn naming the staged new
-   *   files that are then not in the snapshot.
+   *   is hashed again, as the real index would have it), in the system's
+   *   temporary folder, else in the preserve root. A readable index that
+   *   cannot be copied to either refuses: HEAD would lose what it stages
+   *   new. Only when the lane's index cannot be read at all (it is missing
+   *   or unreadable) is the temporary index read from HEAD, with a warn
+   *   saying the files it staged new cannot be known.
    * - The assume-unchanged and skip-worktree bits are cleared on every entry
    *   whose file is on disk, so an edit behind either is saved.
    * - `git add -u` adds every tracked edit and deletion, `git write-tree`
@@ -2965,35 +3087,71 @@ export class WorktreeManager {
    * ({@link LaneSnapshotError}), naming the file when git does.
    */
   private buildSnapshot(row: WorktreeRecord): BuiltSnapshot | null {
-    const scratch = mkdtempSync(join(tmpdir(), 'gru-sweep-snapshot-'));
-    const index = { indexFile: join(scratch, 'index') };
+    const scratches: string[] = [];
     const oneLine = (error: unknown): string => oneLineErrorText(error instanceof Error ? error.message : error, 400);
     const cannotBuild = (error: unknown): LaneSnapshotError => {
       const file = gitNamedFile(error instanceof Error ? error.message : String(error));
       return new LaneSnapshotError(row.path, `could not be built${file === null ? '' : `: git could not read ${file}`} (${oneLine(error)})`);
     };
+    // A temporary index in the system's temporary folder, else in the
+    // preserve root (a full temporary folder must not cost the snapshot).
+    const roots: readonly (readonly [string, string])[] = [[tmpdir(), 'gru-sweep-snapshot-'], [this.opts.preserveRoot, '.gru-sweep-snapshot-']];
+    const temporaryIndex = (write: (file: string) => void): { readonly file: string | null; readonly failures: readonly string[] } => {
+      const failures: string[] = [];
+      for (const [root, prefix] of roots) {
+        try {
+          const scratch = mkdtempSync(join(root, prefix));
+          scratches.push(scratch);
+          const file = join(scratch, 'index');
+          write(file);
+          return { file, failures };
+        } catch (error) {
+          failures.push(`${root}: ${oneLine(error)}`);
+        }
+      }
+      return { file: null, failures };
+    };
     try {
       let head: string;
       let tree: string;
+      let index: SpawnGitOptions;
       try {
         head = runGit(row.path, ['rev-parse', '--verify', 'HEAD^{commit}']);
         const laneIndex = resolve(row.path, runGit(row.path, ['rev-parse', '--git-path', 'index']));
+        let readable = true;
         try {
+          closeSync(openSync(laneIndex, 'r'));
+        } catch (unreadable) {
+          readable = false;
+          this.warnIndexFallback(row, unreadable);
+        }
+        if (readable) {
           // The times before the bytes: an index rewritten meanwhile leaves
           // the copy older than its content, which only makes more entries racy.
           const { atime, mtime } = statSync(laneIndex);
-          copyFileSync(laneIndex, index.indexFile);
-          utimesSync(index.indexFile, atime, mtime);
-        } catch (copied) {
-          this.warnIndexFallback(row, head, copied);
-          rmSync(index.indexFile, { force: true });
-          runGit(row.path, ['read-tree', head], index);
+          const copied = temporaryIndex((file) => {
+            copyFileSync(laneIndex, file);
+            utimesSync(file, atime, mtime);
+          });
+          // A readable index is never traded for HEAD: what it stages new
+          // would be in neither the snapshot nor the preserve copy.
+          if (copied.file === null) {
+            const staged = spawnGit(row.path, ['diff', '--cached', '--name-only', '--no-renames', '--diff-filter=A', '-z', head, '--']);
+            const stagedNew = staged.status === 0 ? staged.stdout.split('\0').filter((entry) => entry !== '').length : null;
+            throw new LaneSnapshotError(row.path, `could not be built: the lane's index could not be copied to a temporary location (${copied.failures.join('; ')})${
+              stagedNew === null ? '' : `, and it stages ${String(stagedNew)} new file(s) a snapshot from HEAD would lose`}`);
+          }
+          index = { indexFile: copied.file };
+        } else {
+          const fromHead = temporaryIndex((file) => { runGit(row.path, ['read-tree', head], { indexFile: file }); });
+          if (fromHead.file === null) throw new Error(`no temporary index could be made (${fromHead.failures.join('; ')})`);
+          index = { indexFile: fromHead.file };
         }
         this.clearHiddenEntryBits(row, index);
         runGit(row.path, ['add', '-u'], index);
         tree = runGit(row.path, ['write-tree'], index);
       } catch (error) {
-        throw cannotBuild(error);
+        throw error instanceof LaneSnapshotError ? error : cannotBuild(error);
       }
       const differs = spawnGit(row.path, ['diff', '--quiet', '--ignore-submodules=all', tree, '--'], index);
       if (differs.status !== 0) {
@@ -3004,20 +3162,19 @@ export class WorktreeManager {
       const files = runGit(row.path, ['diff-tree', '-r', '--no-renames', '--name-only', '-z', head, tree]).split('\0').filter((entry) => entry !== '').length;
       return { head, tree, files };
     } finally {
-      rmSync(scratch, { recursive: true, force: true });
+      for (const scratch of scratches) rmSync(scratch, { recursive: true, force: true });
     }
   }
 
-  /** The snapshot falls back to HEAD (#427): files staged new in the
-   * lane's index are then in neither the snapshot nor the preserve copy, so
-   * the warn names them when the lane's index can be listed at all. */
-  private warnIndexFallback(row: WorktreeRecord, head: string, error: unknown): void {
-    const listed = spawnGit(row.path, ['diff', '--cached', '--name-only', '--no-renames', '--diff-filter=A', '-z', head, '--']);
-    const stagedNew = listed.status === 0 ? listed.stdout.split('\0').filter((entry) => entry !== '') : null;
-    this.log('warn', 'the snapshot could not be built from a copy of the lane\'s index; building it from HEAD (files staged new in the lane\'s index are not in it)', {
+  /** The snapshot falls back to HEAD (#427) only when the lane's index
+   * cannot be read at all (it is missing or unreadable): which files it
+   * staged new cannot be known then, and none is in the snapshot. With no
+   * index, git counts every file in the lane untracked, so the preserve copy
+   * holds them all. */
+  private warnIndexFallback(row: WorktreeRecord, error: unknown): void {
+    this.log('warn', 'the lane\'s index cannot be read, so the snapshot is built from HEAD: any file staged new in that index cannot be known and is not in it (with no index, git counts every file untracked, so the preserve copy holds them)', {
       id: row.id,
       error: oneLineErrorText(error instanceof Error ? error.message : error, 400),
-      ...(stagedNew === null ? { staged_new: 'the lane\'s index cannot be listed' } : { staged_new: stagedNew.slice(0, 50), staged_new_count: stagedNew.length }),
     });
   }
 
@@ -3081,12 +3238,97 @@ export class WorktreeManager {
     }
     if (payload === null) return null;
     const preserved = payload.preserved as { readonly destination?: unknown; readonly files?: unknown } | null | undefined;
-    const snapshot = payload.snapshot as { readonly ref?: unknown; readonly sha?: unknown } | null | undefined;
+    const snapshot = payload.snapshot as { readonly ref?: unknown; readonly sha?: unknown; readonly files?: unknown } | null | undefined;
     return {
       preserved: typeof preserved?.destination === 'string' && typeof preserved.files === 'number' ? { destination: preserved.destination, count: preserved.files } : null,
-      snapshot: typeof snapshot?.ref === 'string' && typeof snapshot.sha === 'string' ? { ref: snapshot.ref, sha: snapshot.sha } : null,
+      snapshot: typeof snapshot?.ref === 'string' && typeof snapshot.sha === 'string'
+        ? { ref: snapshot.ref, sha: snapshot.sha, files: typeof snapshot.files === 'number' ? snapshot.files : 0 }
+        : null,
       discarded: typeof payload.discarded === 'string' ? payload.discarded : null,
     };
+  }
+
+  /** Whether git already deleted the lane's own git folder (#427): a
+   * `worktree remove` that fails part way deletes it whatever happened to the
+   * tree. The repository decides: no folder under its `worktrees` names this
+   * tree (the lane's `.git` file may be gone too, or name a folder that is). */
+  private laneAdminGone(row: WorktreeRecord): boolean {
+    try {
+      const text = readWorktreeMetadata(join(row.path, '.git')).trim();
+      if (text.startsWith('gitdir: ') && existsSync(resolve(row.path, text.slice('gitdir: '.length)))) return false;
+    } catch {
+      // missing or not a plain file: the repository's records decide
+    }
+    const container = join(repositoryCommonDirectory(row.repoPath), 'worktrees');
+    if (!existsSync(container)) return true;
+    const tree = new Set([join(row.path, '.git'), join(realpathSync(dirname(row.path)), basename(row.path), '.git')]);
+    for (const entry of readdirSync(container, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const admin = join(container, entry.name);
+      let backlink: string;
+      try {
+        backlink = resolve(admin, readWorktreeMetadata(join(admin, 'gitdir')).trim());
+      } catch {
+        continue; // a folder with no backlink names no tree
+      }
+      if (tree.has(backlink) || (existsSync(dirname(backlink)) && tree.has(join(realpathSync(dirname(backlink)), '.git')))) return false;
+    }
+    return true;
+  }
+
+  /** Finish a removal git left part way (#427): delete what is left of the
+   * lane's tree (read-only folders made writable first, a link removed as a
+   * link) and prune the repository's worktree records. When the tree cannot
+   * be deleted, refuses by name with what is left in place. */
+  private removeLaneRemains(row: WorktreeRecord): void {
+    try {
+      removeTreeSync(row.path);
+    } catch (error) {
+      throw new Error(
+        `sweep refused: git deleted the git folder of ${row.path} but not all of its tree, and GC could not delete the rest ` +
+          `(${oneLineErrorText(error instanceof Error ? error.message : error, 400)}) — free what holds it (a busy mount, a read-only file system), then release again`,
+      );
+    }
+    try {
+      runGit(row.repoPath, ['worktree', 'prune']);
+    } catch (error) {
+      this.log('warn', 'git worktree prune failed after a removal GC finished; the lane\'s tree is gone', { id: row.id, error: String(error) });
+    }
+  }
+
+  /** Say how a removal was finished (#427): `worktree.sweep-tail-failed
+   * { id, stage: 'remove', error }`, best-effort. */
+  private recordRemovalFinished(row: WorktreeRecord, cause: string): void {
+    const error = `${cause}; GC deleted the rest of the tree and pruned the worktree`;
+    this.log('warn', 'lane removal finished by GC after git stopped part way', { id: row.id, error });
+    try {
+      this.opts.ledger.appendCustomEvent({ kind: 'worktree.sweep-tail-failed', jobId: row.jobId, roundId: row.roundId, payload: { id: row.id, stage: 'remove', error } });
+    } catch (eventError) {
+      this.log('error', 'sweep-tail-failed event write failed', { id: row.id, error: String(eventError) });
+    }
+  }
+
+  /** Copy what a part-way removal left of a lane into the preserve root
+   * (#427), whole, with no git to say what is tracked: no record says what
+   * was saved before that removal began. Recorded as `worktree.preserved`. */
+  private preserveRemains(row: WorktreeRecord): SweepPreservation | null {
+    const destination = join(this.opts.preserveRoot, row.id, new Date().toISOString().replace(/[:.]/g, '-'));
+    let count: number;
+    try {
+      count = this.copyUntracked(row, readdirSync(row.path), destination);
+    } catch (error) {
+      this.withdrawPreservation(row, { count: 0, destination });
+      throw error;
+    }
+    if (count === 0) return null;
+    const preserved = { count, destination };
+    this.opts.ledger.appendCustomEvent({
+      kind: 'worktree.preserved',
+      jobId: row.jobId,
+      roundId: row.roundId,
+      payload: { id: row.id, files: count, destination, remains: true },
+    });
+    return preserved;
   }
 
   /** A release that failed after its records (#427): `worktree.release-
@@ -3095,7 +3337,7 @@ export class WorktreeManager {
    * of them (a retry that reused both and failed again adds no row). */
   private recordAbortedRelease(row: WorktreeRecord, saved: { readonly preserved: SweepPreservation | null; readonly snapshot: SweepSnapshot | null; readonly discarded: string | null }, error: unknown): void {
     const preserved = saved.preserved === null ? null : { destination: saved.preserved.destination, files: saved.preserved.count };
-    const snapshot = saved.snapshot === null ? null : { ref: saved.snapshot.ref, sha: saved.snapshot.sha };
+    const snapshot = saved.snapshot === null ? null : { ref: saved.snapshot.ref, sha: saved.snapshot.sha, files: saved.snapshot.files };
     const detail = oneLineErrorText(error instanceof Error ? error.message : error, 400);
     this.log('error', 'release aborted after its records; the tree is retained and a retry reuses what was saved', { id: row.id, preserved, snapshot, error: detail });
     try {
@@ -3418,33 +3660,149 @@ function gitlinks(listing: string, from: 'tree' | 'index'): Map<string, string> 
   return links;
 }
 
-/** Whether a submodule commit outlives the lane (#427): one of the remote-
- * tracking refs or tags of the lane's copy contains it, or the main
- * checkout's own copy has it. A commit the lane's copy lacks is not the
- * lane's to lose. */
-function submoduleCommitSurvives(gitDir: string, mainCopy: string, commit: string): boolean {
-  if (spawnGit(gitDir, ['--git-dir', gitDir, 'cat-file', '-e', `${commit}^{commit}`]).status !== 0) return true;
-  if (runGit(gitDir, ['--git-dir', gitDir, 'for-each-ref', '--count=1', '--contains', commit, '--format=%(refname)', 'refs/remotes', 'refs/tags']) !== '') return true;
-  return existsSync(mainCopy) && spawnGit(mainCopy, ['--git-dir', mainCopy, 'cat-file', '-e', `${commit}^{commit}`]).status === 0;
-}
-
-/** The commits a submodule copy holds beyond its HEAD (#427): the tip of
- * each local branch, and each stash entry, named for the refusal. */
-function submoduleLocalCommits(gitDir: string): (readonly [string, string])[] {
-  const commits: (readonly [string, string])[] = [];
-  for (const line of spawnGit(gitDir, ['--git-dir', gitDir, 'for-each-ref', '--format=%(objectname) %(refname:short)', 'refs/heads']).stdout.split('\n')) {
-    const space = line.indexOf(' ');
-    if (space > 0) commits.push([line.slice(0, space), `branch ${line.slice(space + 1)}`]);
+/** The paths of the gitlinks a `git diff --cached --raw -z` shows leaving
+ * the index (deleted, or replaced by a file): HEAD records them, the index
+ * no longer does. */
+function removedGitlinks(raw: string): string[] {
+  const fields = raw.split('\0');
+  const paths: string[] = [];
+  for (let index = 0; index + 1 < fields.length; index += 2) {
+    if (/^:160000 \d{6} /u.test(fields[index]!)) paths.push(fields[index + 1]!);
   }
-  const stash = spawnGit(gitDir, ['--git-dir', gitDir, 'log', '-g', '--format=%H', 'refs/stash', '--']);
-  if (stash.status === 0) stash.stdout.split('\n').filter((sha) => sha !== '').forEach((sha, index) => commits.push([sha, `stash@{${String(index)}}`]));
-  return commits;
+  return paths;
 }
 
-/** Whether `git diff --cached --raw -z` shows a gitlink (mode 160000) on
- * either side: an embedded repository staged with no `.gitmodules`. */
-function stagedGitlink(raw: string): boolean {
-  return raw.split('\0').some((field) => /^:\d{6} \d{6} /u.test(field) && (field.slice(1, 7) === '160000' || field.slice(8, 14) === '160000'));
+/** How deep GC looks for repositories nested in repositories (#427). */
+const NESTED_DEPTH_LIMIT = 16;
+
+/** How many commits at risk GC lists per nested repository (#427). */
+const NESTED_COMMIT_LIMIT = 1000;
+
+/** How many commits at risk a refusal names per nested repository. */
+const NESTED_COMMITS_NAMED = 5;
+
+/** A repository whose nested repositories are looked for (#427): the lane,
+ * or a nested repository with a checkout. */
+interface NestedParent {
+  /** Its path in the lane ('' for the lane). */
+  readonly path: string;
+  /** Its checkout. */
+  readonly checkout: string;
+  /** Where its submodules keep their git data (`<git dir>/modules`). */
+  readonly modules: string;
+  /** The commit of it the lane's base records (`row.sha` for the lane). */
+  readonly basePin: string | null;
+  /** The main checkout's copy's `modules` folder, when there is one. */
+  readonly mainModules: string | null;
+}
+
+/** A repository nested in the lane (#427). */
+interface NestedRepo {
+  /** Its path in the lane. */
+  readonly path: string;
+  /** Its submodule name (its path in its parent when `.gitmodules` names none). */
+  readonly name: string;
+  /** Its checkout holds a `.git`. */
+  readonly populated: boolean;
+  /** Its git data in the lane; null when the lane never initialized it. */
+  readonly gitDir: string | null;
+  /** The gitlink the lane's base records for it. */
+  readonly basePin: string | null;
+  /** The main checkout's own copy of it (it may not exist). */
+  readonly mainCopy: string | null;
+  /** Its `.gitmodules` at the lane's base declares its untracked content disposable. */
+  readonly disposable: boolean;
+  /** The commits its parent's HEAD and index record for it, named. */
+  readonly gitlinks: readonly (readonly [string | undefined, string])[];
+}
+
+function nestedParent(child: NestedRepo, checkout: string): NestedParent {
+  return {
+    path: child.path,
+    checkout,
+    modules: join(child.gitDir ?? join(checkout, '.git'), 'modules'),
+    basePin: child.basePin,
+    mainModules: child.mainCopy !== null && existsSync(child.mainCopy) ? join(child.mainCopy, 'modules') : null,
+  };
+}
+
+/** A nested repository's own state (#427): whether its index or working
+ * tree holds a tracked change (staged or not; a change inside a repository
+ * nested in it is judged there), and its untracked paths. */
+function nestedStatus(checkout: string): { readonly modified: boolean; readonly untracked: readonly string[] } {
+  const records = runGit(checkout, ['-c', 'diff.ignoreSubmodules=none', 'status', '--porcelain=v2', '-z', '--ignore-submodules=none', '--untracked-files=all'], { maxBuffer: LISTING_MAX_BUFFER }).split('\0');
+  let modified = false;
+  const untracked: string[] = [];
+  for (let index = 0; index < records.length; index += 1) {
+    const record = records[index]!;
+    const kind = record.charAt(0);
+    // A rename's original path follows it as its own field.
+    if (kind === '2') index += 1;
+    if (kind === '?') {
+      if (record.length > 2) untracked.push(record.slice(2));
+      continue;
+    }
+    if (kind !== '1' && kind !== '2' && kind !== 'u') continue;
+    const [, xy = '..', sub = 'N...'] = record.split(' ');
+    if (sub.startsWith('S') && xy.charAt(0) === '.') continue;
+    modified = true;
+  }
+  return { modified, untracked };
+}
+
+/** The commits a nested repository can reach that survive nowhere else
+ * (#427): every commit reachable from its HEAD, branches, tags and stash,
+ * from the reflogs of those, and from the gitlinks its parent records, that
+ * is neither the lane's base pin for it (nor an ancestor of that), nor in
+ * one of its remote-tracking refs, nor in the main checkout's own copy.
+ * Bounded; the refusal's words name the first few. */
+function nestedLostCommits(repo: NestedRepo, head: string | null): { readonly lost: readonly string[]; readonly states: readonly string[] } {
+  const gitDir = repo.gitDir!;
+  // `--work-tree` at the git folder itself: a module's core.worktree may name
+  // a checkout that is gone (a staged git rm), and none of this reads one.
+  const git = (dir: string, args: readonly string[], opts: SpawnGitOptions = {}): string => runGit(dir, ['--git-dir', dir, '--work-tree', dir, ...args], opts);
+  const labels = new Map<string, string>();
+  const name = (sha: string | null | undefined, what: string): void => {
+    if (sha != null && /^[0-9a-f]{40,64}$/u.test(sha) && !labels.has(sha)) labels.set(sha, what);
+  };
+  name(head, 'its HEAD');
+  for (const [sha, what] of repo.gitlinks) name(sha, what);
+  for (const line of git(gitDir, ['for-each-ref', '--format=%(objectname) %(refname)', 'refs/heads', 'refs/tags', 'refs/stash']).split('\n')) {
+    const [sha, ref = ''] = line.split(' ');
+    name(sha, ref.startsWith('refs/heads/') ? `branch ${ref.slice('refs/heads/'.length)}` : ref.startsWith('refs/tags/') ? `tag ${ref.slice('refs/tags/'.length)}` : 'stash@{0}');
+  }
+  const reflogs = [...(head === null ? [] : ['HEAD']), '--branches', '--glob=refs/stas[h]'];
+  for (const line of git(gitDir, ['log', '-g', '--format=%H %gd', ...reflogs, '--'], { maxBuffer: LISTING_MAX_BUFFER }).split('\n')) {
+    const [sha, selector = ''] = line.split(' ');
+    name(sha, selector.startsWith('stash@') ? selector : `in its reflog as ${selector}`);
+  }
+  if (labels.size === 0) return { lost: [], states: [] };
+  const outside = (also: readonly string[]): string[] => git(gitDir, ['rev-list', '--ignore-missing', `--max-count=${String(NESTED_COMMIT_LIMIT + 1)}`, '--stdin'], {
+    input: `${[...labels.keys(), '--not', '--remotes', ...(repo.basePin === null ? [] : [repo.basePin]), ...also].join('\n')}\n`,
+  }).split('\n').filter((sha) => sha !== '');
+  let lost = outside([]);
+  // The main checkout's copy outlives the lane: what it holds survives.
+  if (lost.length > 0 && repo.mainCopy !== null && existsSync(repo.mainCopy)) {
+    const main = repo.mainCopy;
+    const tips = [...git(main, ['for-each-ref', '--format=%(objectname)']).split('\n'), spawnGit(main, ['--git-dir', main, '--work-tree', main, 'rev-parse', '--verify', '--quiet', 'HEAD']).stdout.trim()]
+      .filter((sha) => /^[0-9a-f]{40,64}$/u.test(sha));
+    if (tips.length > 0) lost = outside(tips);
+    if (lost.length > 0) {
+      const present = new Set(git(main, ['cat-file', '--batch-check'], { input: `${lost.join('\n')}\n` }).split('\n')
+        .filter((line) => !line.endsWith(' missing')).map((line) => line.split(' ')[0]));
+      lost = lost.filter((sha) => !present.has(sha));
+    }
+  }
+  const truncated = lost.length > NESTED_COMMIT_LIMIT;
+  const named = [...lost].sort((left, right) => Number(!labels.has(left)) - Number(!labels.has(right))).slice(0, NESTED_COMMITS_NAMED);
+  const rest = Math.min(lost.length, NESTED_COMMIT_LIMIT) - named.length;
+  return {
+    lost: lost.slice(0, NESTED_COMMIT_LIMIT),
+    states: [
+      ...named.map((sha) => `commit ${sha} (${labels.get(sha) ?? 'reachable from them'}) is on no remote-tracking ref and not in the main checkout's copy`),
+      ...(rest > 0 ? [`${truncated ? 'more than ' : ''}${String(rest)} other commit(s) like them`] : []),
+    ],
+  };
 }
 
 /** `submodule.<name>.<key> = value` triples (path and ignore) from a
@@ -3474,6 +3832,29 @@ function submoduleWorkDigest(work: readonly SubmoduleWork[], fingerprints: reado
 /** The untracked paths in `git status --porcelain -z` output. */
 function porcelainUntracked(status: string): string[] {
   return status.split('\0').filter((entry) => entry.startsWith('?? ')).map((entry) => entry.slice(3)).filter((rel) => rel !== '');
+}
+
+/** Remove a tree, a link inside it as a link; a failed removal makes the
+ * tree's folders writable (never following a link) and tries once more. */
+function removeTreeSync(dir: string): void {
+  try {
+    rmSync(dir, { recursive: true, force: true });
+    return;
+  } catch {
+    // retried below once the tree is writable
+  }
+  const stack = [dir];
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    try {
+      if (!lstatSync(current).isDirectory()) continue;
+      chmodSync(current, 0o700);
+      for (const name of readdirSync(current)) stack.push(join(current, name));
+    } catch {
+      // gone, or not ours to change: the retry reports what stays
+    }
+  }
+  rmSync(dir, { recursive: true, force: true });
 }
 
 /** Whether something (a link included, never followed) is at a path. */
@@ -3604,9 +3985,11 @@ export function sweepWorkNotice(input: SavedWork): {
 }
 
 /** Gru's row for a release refused over submodule work (#427): one per
- * lane and digest (its id), naming each submodule and what it holds, what
- * to do, and the digest. The lane's release closes it. */
-export function submoduleWorkNotice(input: { readonly worktree: WorktreeRecord; readonly submodules: readonly SubmoduleWork[]; readonly digest: string }): {
+ * lane and digest (its id), naming each nested repository and what it
+ * holds, what to do, and the digest; and, when an operator's discard named
+ * an older digest, that the work changed (stop what writes into it). It
+ * closes once the lane is gone. */
+export function submoduleWorkNotice(input: { readonly worktree: WorktreeRecord; readonly submodules: readonly SubmoduleWork[]; readonly digest: string; readonly staleDiscard?: string | null }): {
   readonly id: string;
   readonly kind: typeof SUBMODULE_WORK_NOTICE_KIND;
   readonly routing: 'action-required';
@@ -3614,7 +3997,7 @@ export function submoduleWorkNotice(input: { readonly worktree: WorktreeRecord; 
   readonly title: string;
   readonly detail: string;
 } {
-  const { worktree, submodules, digest } = input;
+  const { worktree, submodules, digest, staleDiscard = null } = input;
   return {
     id: submoduleWorkNoticeId(worktree.id, digest),
     kind: SUBMODULE_WORK_NOTICE_KIND,
@@ -3625,9 +4008,14 @@ export function submoduleWorkNotice(input: { readonly worktree: WorktreeRecord; 
       `Lane ${worktree.id} (job ${worktree.jobId ?? 'none'}) holds submodule work its removal would destroy: ` +
       `${submodules.map((sub) => `${sub.path}: ${sub.state.join(', ')}`).join('; ')}. ` +
       'Tell the minion to push the submodule commit (git push inside the submodule) and to commit and push modified content inside each submodule, then release the lane again; ' +
-      `or ask the owner to discard exactly this work with an operator release that passes discard_submodule_work: "${digest}". Digest: ${digest}.`,
+      `or ask the owner to discard exactly this work with an operator release that passes discard_submodule_work: "${digest}". Digest: ${digest}.` +
+      `${staleDiscard === null ? '' : ` A discard named ${staleDiscard}, but the work changed since it was shown: ${SUBMODULE_WORK_CHANGING}.`}`,
   };
 }
+
+/** What a refusal says when a discard's digest no longer matches (#427):
+ * the work changed, and if it keeps changing something is writing into it. */
+const SUBMODULE_WORK_CHANGING = 'if it keeps changing, something is still writing into the submodule (a minion, a watcher or a build), so stop that process first, then discard the newest digest';
 
 /** The kind of {@link submoduleWorkNotice}'s rows. */
 export const SUBMODULE_WORK_NOTICE_KIND = 'worktree.submodule-work';
@@ -3639,7 +4027,7 @@ export function submoduleWorkNoticeId(laneId: string, digest: string): string {
 
 /** Gru's row for a lane whose restore ran setup and did not get back what
  * setup made at bootstrap (#427): one per lane (its id). The lane stays
- * slim and is never slimmed again; its release closes the row. */
+ * slim and is never slimmed again; the row closes once the lane is gone. */
 export function restoreIncompleteNotice(input: { readonly worktree: WorktreeRecord; readonly missing: readonly string[] }): {
   readonly id: string;
   readonly kind: typeof RESTORE_INCOMPLETE_NOTICE_KIND;
@@ -3660,6 +4048,38 @@ export function restoreIncompleteNotice(input: { readonly worktree: WorktreeReco
       `${missing.join(', ')}, although setup made ${missing.length === 1 ? 'it' : 'them'} when the lane was built. A likely cause is a stamp file outside reclaim that makes setup think its work is done. ` +
       'The lane stays slim (each turn runs setup again) and is never slimmed again. Tell the minion to rebuild what is missing, and fix the manifest (list the stamp file under reclaim, or make setup check what it makes).',
   };
+}
+
+/** Gru's row for a lane whose release is refused because it is a sparse
+ * checkout (#427): one per lane (its id). It closes once the lane is gone. */
+export function sparseCheckoutNotice(input: { readonly worktree: WorktreeRecord }): {
+  readonly id: string;
+  readonly kind: typeof SPARSE_CHECKOUT_NOTICE_KIND;
+  readonly routing: 'action-required';
+  readonly severity: 'error';
+  readonly title: string;
+  readonly detail: string;
+} {
+  const { worktree } = input;
+  return {
+    id: sparseCheckoutNoticeId(worktree.id),
+    kind: SPARSE_CHECKOUT_NOTICE_KIND,
+    routing: 'action-required',
+    severity: 'error',
+    title: `Lane ${worktree.id} (${worktree.repoName}) cannot be released: it is a sparse checkout`,
+    detail:
+      `Lane ${worktree.id} (job ${worktree.jobId ?? 'none'}) at ${worktree.path} is a sparse checkout (core.sparseCheckout is on), and GC cannot save its uncommitted work without risking a wrong tree, so its release is refused. ` +
+      'Tell the minion to commit and push the lane\'s work, or to run git sparse-checkout disable in the lane, then release it again. ' +
+      'GC disables the sparse checkout of new lanes itself when the repository keeps per-worktree config; a repository whose sparse checkout is in its shared config (core.sparseCheckout in .git/config) gives every new lane one.',
+  };
+}
+
+/** The kind of {@link sparseCheckoutNotice}'s rows. */
+export const SPARSE_CHECKOUT_NOTICE_KIND = 'worktree.sparse-checkout';
+
+/** The id of a lane's sparse-checkout row. */
+export function sparseCheckoutNoticeId(laneId: string): string {
+  return `worktree-sparse-checkout:${laneId}`;
 }
 
 /** The kind of {@link restoreIncompleteNotice}'s rows. */

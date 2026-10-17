@@ -123,6 +123,7 @@ function harness(opts: {
     onWorkSaved: hooks.onWorkSaved,
     onSubmoduleWorkRefused: hooks.onSubmoduleWorkRefused,
     onRestoreIncomplete: hooks.onRestoreIncomplete,
+    onSparseCheckoutRefused: hooks.onSparseCheckoutRefused,
     log: (level, msg, fields) => { logs.push({ level, msg, ...(fields !== undefined ? { fields } : {}) }); },
   });
   return { repo, db, ledger, bus, manager, hooks, stop, notifications, enumerator, logs, dataDir, preserveRoot };
@@ -181,6 +182,26 @@ function addSubmodule(h: Harness): string {
   return sub;
 }
 
+/** A source repository with one committed file, on main; returns its path. */
+function sourceRepo(prefix: string, file: string): string {
+  const source = tempDir(prefix);
+  git(source, ['init', '-q', '-b', 'main']);
+  writeFileSync(join(source, file), `${file}\n`);
+  git(source, ['add', '.']);
+  git(source, ['commit', '-qm', file]);
+  return source;
+}
+
+/** deps/mid as a submodule of the fixture, itself holding inner as a submodule. */
+function addNestedSubmodule(h: Harness): void {
+  const inner = sourceRepo('gru-lane-lifecycle-inner-', 'inner.txt');
+  const mid = sourceRepo('gru-lane-lifecycle-mid-', 'mid.txt');
+  git(mid, ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', inner, 'inner']);
+  git(mid, ['commit', '-qm', 'add inner']);
+  git(h.repo.path, ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', mid, 'deps/mid']);
+  git(h.repo.path, ['commit', '-qm', 'add mid']);
+}
+
 function initSubmodule(lanePath: string): void {
   git(lanePath, ['-c', 'protocol.file.allow=always', 'submodule', 'update', '--init', '-q']);
 }
@@ -217,6 +238,7 @@ function slimmerFor(h: Harness, gate: PacingGate, opts: {
       return { unref: () => {} } as unknown as ReturnType<typeof setInterval>;
     }) as unknown as typeof setInterval,
     clearInterval: (() => {}) as unknown as typeof clearInterval,
+    onReconcile: h.hooks.settleLaneRows,
   });
   cleanups.push(() => slimmer.stop());
   return slimmer;
@@ -462,13 +484,16 @@ describe('lossless sweep: uncommitted work is saved before removal (#427)', () =
     expect(existsSync(join(result.preserved!.destination, 'setup-runs.log'))).toBe(false);
   });
 
-  it('an untracked nested git repository with no commit never blocks a release: it goes to the preserve copy, and the snapshot holds the tracked edit', async () => {
+  it('an untracked nested git repository never blocks a release: the preserve copy takes it whole, its .git and commits included, and the snapshot holds the tracked edit', async () => {
     const h = harness({ manifest: null });
     addJob(h, 'job-nested');
     const lane = await h.manager.createJobWorktree({ repoPath: h.repo.path, jobId: 'job-nested' });
     mkdirSync(join(lane.path, 'tmp'));
     git(join(lane.path, 'tmp'), ['init', '-q', 'fixture']);
     writeFileSync(join(lane.path, 'tmp', 'fixture', 'script.sh'), 'echo testing a script\n');
+    git(join(lane.path, 'tmp', 'fixture'), ['add', 'script.sh']);
+    git(join(lane.path, 'tmp', 'fixture'), ['commit', '-qm', 'a script, committed only here']);
+    const commit = git(join(lane.path, 'tmp', 'fixture'), ['rev-parse', 'HEAD']);
     writeFileSync(join(lane.path, 'README.md'), 'a tracked edit beside it\n');
 
     const result = await h.manager.release({ worktreeId: 'job-nested', requireReleaseProofs: true });
@@ -477,7 +502,9 @@ describe('lossless sweep: uncommitted work is saved before removal (#427)', () =
     const [ref] = preservedRefs(h.repo);
     expect(h.repo.git(['ls-tree', '-r', '--name-only', ref!]).split('\n')).not.toContain('tmp/fixture');
     expect(h.repo.git(['show', `${ref!}:README.md`])).toBe('a tracked edit beside it');
-    expect(readFileSync(join(result.preserved!.destination, 'tmp', 'fixture', 'script.sh'), 'utf-8')).toBe('echo testing a script\n');
+    const copy = join(result.preserved!.destination, 'tmp', 'fixture');
+    expect(readFileSync(join(copy, 'script.sh'), 'utf-8')).toBe('echo testing a script\n');
+    expect(git(copy, ['log', '-1', '--format=%H %s'])).toBe(`${commit} a script, committed only here`);
   });
 
   it('builds the snapshot from a copy of the lane\'s index, so an unchanged tracked file is not hashed again (a clean filter counts what git hashes)', async () => {
@@ -626,7 +653,7 @@ describe('lossless sweep: uncommitted work is saved before removal (#427)', () =
     for (const requireReleaseProofs of [true, false]) {
       const refusal = await h.manager.release({ worktreeId: 'job-sub', requireReleaseProofs }).catch((error: unknown) => error);
       expect(refusal).toBeInstanceOf(LaneSubmoduleWorkError);
-      expect(String((refusal as Error).message)).toMatch(new RegExp(`deps/lib: commit ${commit} \\(its HEAD\\) is on no remote-tracking ref or tag and not in the main checkout's copy.*push the submodule commit.*discard_submodule_work: "[0-9a-f]{16}"`, 'u'));
+      expect(String((refusal as Error).message)).toMatch(new RegExp(`deps/lib: commit ${commit} \\(its HEAD\\) is on no remote-tracking ref and not in the main checkout's copy.*push the submodule commit.*discard_submodule_work: "[0-9a-f]{16}"`, 'u'));
       digest = (refusal as LaneSubmoduleWorkError).digest;
     }
     expect(existsSync(lane.path)).toBe(true);
@@ -709,7 +736,7 @@ describe('lossless sweep: uncommitted work is saved before removal (#427)', () =
 
     const unpushed = await bump('job-bump');
     await expect(h.manager.release({ worktreeId: 'job-bump', requireReleaseProofs: true }))
-      .rejects.toThrow(new RegExp(`deps/lib: commit ${unpushed.commit} \\(its HEAD\\) is on no remote-tracking ref or tag`, 'u'));
+      .rejects.toThrow(new RegExp(`deps/lib: commit ${unpushed.commit} \\(its HEAD\\) is on no remote-tracking ref and not in the main checkout's copy`, 'u'));
     expect(existsSync(unpushed.lanePath)).toBe(true);
 
     const pushed = await bump('job-pushed');
@@ -946,7 +973,7 @@ describe('lossless sweep: uncommitted work is saved before removal (#427)', () =
     expect(result.status).toBe('swept');
     const [ref] = preservedRefs(h.repo);
     expect(h.repo.git(['show', `${ref!}:README.md`])).toBe('edited, and the index is gone');
-    expect(h.logs.filter((line) => line.msg.startsWith('the snapshot could not be built from a copy of the lane\'s index'))).toHaveLength(1);
+    expect(h.logs.filter((line) => line.msg.startsWith('the lane\'s index cannot be read, so the snapshot is built from HEAD'))).toHaveLength(1);
   });
 
   it.skipIf(typeof process.getuid === 'function' && process.getuid() === 0)('a tracked file git cannot read never refuses before the pause; once the processes are handled the tail refuses by name, never building from HEAD instead, with the tree retained and no ref; once it can be read the release completes', async () => {
@@ -971,7 +998,7 @@ describe('lossless sweep: uncommitted work is saved before removal (#427)', () =
     expect(alive()).toBe(false);
     expect(existsSync(readme)).toBe(true);
     expect(preservedRefs(h.repo)).toEqual([]);
-    expect(h.logs.filter((line) => line.msg.startsWith('the snapshot could not be built from a copy'))).toEqual([]);
+    expect(h.logs.filter((line) => line.msg.startsWith('the lane\'s index cannot be read'))).toEqual([]);
     chmodSync(readme, 0o644);
     const result = await h.manager.release({ worktreeId: 'job-unreadable' });
     expect(result.status).toBe('swept');
@@ -1037,23 +1064,120 @@ describe('lossless sweep: uncommitted work is saved before removal (#427)', () =
     expect((await h.manager.release({ worktreeId: 'job-tag-pin', requireReleaseProofs: true })).status).toBe('swept');
   });
 
-  it('releases a lane whose submodule moved to a commit only a tag of its remote reaches: the tag outlives the lane', async () => {
+  it('refuses an unpushed submodule commit only a tag in the lane\'s own copy reaches (an npm version-style local tag): the tag goes with the lane', async () => {
     const h = harness({ manifest: null });
-    const source = addSubmodule(h);
-    addJob(h, 'job-tagged');
-    const lane = await h.manager.createJobWorktree({ repoPath: h.repo.path, jobId: 'job-tagged' });
-    git(source, ['checkout', '-q', '--detach']);
-    git(source, ['commit', '-q', '--allow-empty', '-m', 'release 2']);
-    git(source, ['tag', 'v2']);
-    const tagged = git(source, ['rev-parse', 'HEAD']);
-    git(source, ['checkout', '-q', 'main']);
+    addSubmodule(h);
+    addJob(h, 'job-local-tag');
+    const lane = await h.manager.createJobWorktree({ repoPath: h.repo.path, jobId: 'job-local-tag' });
     initSubmodule(lane.path);
     const sub = join(lane.path, 'deps', 'lib');
-    git(sub, ['fetch', '-q', '--tags', 'origin']);
-    git(sub, ['checkout', '-q', 'v2']);
-    expect(git(sub, ['for-each-ref', '--format=%(refname)', `--contains=${tagged}`])).toBe('refs/tags/v2');
+    writeFileSync(join(sub, 'lib.txt'), 'library 1.0.1\n');
+    git(sub, ['commit', '-qam', '1.0.1']);
+    git(sub, ['tag', 'v1.0.1']);
+    const tagged = git(sub, ['rev-parse', 'HEAD']);
+    expect(git(sub, ['for-each-ref', '--format=%(refname)', `--contains=${tagged}`])).toBe('refs/tags/v1.0.1');
 
-    expect((await h.manager.release({ worktreeId: 'job-tagged', requireReleaseProofs: true })).status).toBe('swept');
+    await expect(h.manager.release({ worktreeId: 'job-local-tag', requireReleaseProofs: true }))
+      .rejects.toThrow(new RegExp(`deps/lib: commit ${tagged} \\(its HEAD\\) is on no remote-tracking ref and not in the main checkout's copy`, 'u'));
+    expect(existsSync(lane.path)).toBe(true);
+  });
+
+  it('refuses a submodule commit only its reflog holds (a detached-HEAD commit a later git submodule update put back at the pin), with the superproject clean', async () => {
+    const h = harness({ manifest: null });
+    addSubmodule(h);
+    addJob(h, 'job-reflog');
+    const lane = await h.manager.createJobWorktree({ repoPath: h.repo.path, jobId: 'job-reflog' });
+    initSubmodule(lane.path);
+    const sub = join(lane.path, 'deps', 'lib');
+    const pin = git(sub, ['rev-parse', 'HEAD']);
+    writeFileSync(join(sub, 'lib.txt'), 'a fix on a detached HEAD\n');
+    git(sub, ['commit', '-qam', 'fix the library']);
+    const fix = git(sub, ['rev-parse', 'HEAD']);
+    // A restore's [[setup]] (or anyone) runs git submodule update.
+    initSubmodule(lane.path);
+    expect(git(sub, ['rev-parse', 'HEAD'])).toBe(pin);
+    expect(git(lane.path, ['status', '--porcelain'])).toBe('');
+    expect(git(sub, ['for-each-ref', `--contains=${fix}`])).toBe('');
+
+    await expect(h.manager.release({ worktreeId: 'job-reflog', requireReleaseProofs: true }))
+      .rejects.toThrow(new RegExp(`deps/lib: commit ${fix} \\(in its reflog as HEAD@\\{\\d+\\}\\) is on no remote-tracking ref`, 'u'));
+    expect(git(sub, ['cat-file', '-t', fix])).toBe('commit');
+  });
+
+  it('looks into a submodule nested in a submodule: its untracked content goes to the preserve copy under its path, and its modified tracked content is refused by its path', async () => {
+    const h = harness({ manifest: null });
+    addNestedSubmodule(h);
+    const lane = async (jobId: string): Promise<string> => {
+      addJob(h, jobId);
+      const created = await h.manager.createJobWorktree({ repoPath: h.repo.path, jobId });
+      git(created.path, ['-c', 'protocol.file.allow=always', 'submodule', 'update', '--init', '--recursive', '-q']);
+      return created.path;
+    };
+    const notes = await lane('job-nested-notes');
+    writeFileSync(join(notes, 'deps', 'mid', 'inner', 'NOTES.md'), 'notes a minion left\n');
+    expect(git(join(notes, 'deps', 'mid'), ['status', '--porcelain'])).toBe('M inner');
+    const edited = await lane('job-nested-edit');
+    writeFileSync(join(edited, 'deps', 'mid', 'inner', 'inner.txt'), 'an uncommitted edit two levels down\n');
+
+    const released = await h.manager.release({ worktreeId: 'job-nested-notes', requireReleaseProofs: true });
+    expect(released.status).toBe('swept');
+    expect(readFileSync(join(released.preserved!.destination, 'deps', 'mid', 'inner', 'NOTES.md'), 'utf-8')).toBe('notes a minion left\n');
+
+    const refusal = await h.manager.release({ worktreeId: 'job-nested-edit', requireReleaseProofs: true }).catch((error: unknown) => error) as LaneSubmoduleWorkError;
+    expect(refusal).toBeInstanceOf(LaneSubmoduleWorkError);
+    expect(refusal.submodules).toEqual([{ path: 'deps/mid/inner', state: ['modified tracked content'], head: expect.stringMatching(/^[0-9a-f]{40}$/u) }]);
+    expect(readFileSync(join(edited, 'deps', 'mid', 'inner', 'inner.txt'), 'utf-8')).toBe('an uncommitted edit two levels down\n');
+  });
+
+  it('refuses an embedded repository committed as a gitlink with no .gitmodules once a minion commits in it', async () => {
+    const h = harness({ manifest: null });
+    const origin = sourceRepo('gru-lane-lifecycle-embedded-', 'tool.txt');
+    git(h.repo.path, ['clone', '-q', origin, 'vendor/tool']);
+    git(h.repo.path, ['add', 'vendor/tool']);
+    git(h.repo.path, ['commit', '-qm', 'vendor the tool as an embedded repository']);
+    expect(existsSync(join(h.repo.path, '.gitmodules'))).toBe(false);
+    addJob(h, 'job-embedded');
+    const lane = await h.manager.createJobWorktree({ repoPath: h.repo.path, jobId: 'job-embedded' });
+    const tool = join(lane.path, 'vendor', 'tool');
+    rmSync(tool, { recursive: true, force: true });
+    git(join(lane.path, 'vendor'), ['clone', '-q', origin, 'tool']);
+    writeFileSync(join(tool, 'tool.txt'), 'patched\n');
+    git(tool, ['commit', '-qam', 'patch the tool']);
+    const patch = git(tool, ['rev-parse', 'HEAD']);
+
+    await expect(h.manager.release({ worktreeId: 'job-embedded', requireReleaseProofs: true }))
+      .rejects.toThrow(new RegExp(`vendor/tool: commit ${patch} \\(its HEAD\\) is on no remote-tracking ref`, 'u'));
+    expect(git(tool, ['cat-file', '-t', patch])).toBe('commit');
+  });
+
+  it('refuses an embedded repository staged as a gitlink with no .gitmodules, whatever diff.ignoreSubmodules says', async () => {
+    const h = harness({ manifest: null });
+    addJob(h, 'job-staged-embedded');
+    const lane = await h.manager.createJobWorktree({ repoPath: h.repo.path, jobId: 'job-staged-embedded' });
+    const tool = join(lane.path, 'tool');
+    git(lane.path, ['init', '-q', '-b', 'main', 'tool']);
+    writeFileSync(join(tool, 'tool.txt'), 'a tool with no remote\n');
+    git(tool, ['add', '.']);
+    git(tool, ['commit', '-qm', 'the tool']);
+    const commit = git(tool, ['rev-parse', 'HEAD']);
+    git(lane.path, ['add', 'tool']);
+    h.repo.git(['config', 'diff.ignoreSubmodules', 'all']);
+    expect(git(lane.path, ['diff', '--cached', '--raw', 'HEAD'])).toBe('');
+
+    await expect(h.manager.release({ worktreeId: 'job-staged-embedded', requireReleaseProofs: true }))
+      .rejects.toThrow(new RegExp(`tool: commit ${commit} \\(its HEAD\\) is on no remote-tracking ref`, 'u'));
+    expect(existsSync(join(tool, '.git'))).toBe(true);
+  });
+
+  it('releases a pristine initialized submodule at the base pin', async () => {
+    const h = harness({ manifest: null });
+    addSubmodule(h);
+    addJob(h, 'job-pristine');
+    const lane = await h.manager.createJobWorktree({ repoPath: h.repo.path, jobId: 'job-pristine' });
+    initSubmodule(lane.path);
+
+    expect((await h.manager.release({ worktreeId: 'job-pristine', requireReleaseProofs: true })).status).toBe('swept');
+    expect(events(h, 'worktree.submodule-work-refused')).toHaveLength(0);
   });
 
   it('never refuses the base\'s own pin: a shallow submodule whose pinned commit was fetched by its sha (on no ref) is released', async () => {
@@ -1084,7 +1208,7 @@ describe('lossless sweep: uncommitted work is saved before removal (#427)', () =
     expect((await h.manager.release({ worktreeId: 'job-shallow', requireReleaseProofs: true })).status).toBe('swept');
   });
 
-  it('releases a lane whose submodule commit is on no remote-tracking ref or tag but is in the main checkout\'s own copy', async () => {
+  it('releases a lane whose submodule commit is on no remote-tracking ref but is in the main checkout\'s own copy', async () => {
     const h = harness({ manifest: null });
     addSubmodule(h);
     const mainSub = join(h.repo.path, 'deps', 'lib');
@@ -1125,9 +1249,9 @@ describe('lossless sweep: uncommitted work is saved before removal (#427)', () =
     for (const lane of [side, stashed]) expect(git(lane.path, ['status', '--porcelain'])).toBe('');
 
     await expect(h.manager.release({ worktreeId: 'job-side', requireReleaseProofs: true }))
-      .rejects.toThrow(new RegExp(`deps/lib: commit ${fix} \\(branch fix\\) is on no remote-tracking ref or tag`, 'u'));
+      .rejects.toThrow(new RegExp(`deps/lib: commit ${fix} \\(branch fix\\) is on no remote-tracking ref`, 'u'));
     await expect(h.manager.release({ worktreeId: 'job-stashed', requireReleaseProofs: true }))
-      .rejects.toThrow(/deps\/lib: commit [0-9a-f]{40} \(stash@\{0\}\) is on no remote-tracking ref or tag/u);
+      .rejects.toThrow(/deps\/lib: commit [0-9a-f]{40} \(stash@\{0\}\) is on no remote-tracking ref/u);
     expect(existsSync(side.path) && existsSync(stashed.path)).toBe(true);
   });
 
@@ -1179,6 +1303,16 @@ describe('lossless sweep: uncommitted work is saved before removal (#427)', () =
     expect(stale.digest).not.toBe(first.digest);
     expect(readFileSync(join(sub, 'lib.txt'), 'utf-8')).toBe('the edit the operator saw, and ten more lines\n');
     expect(events(h, 'worktree.submodule-work-discarded')).toHaveLength(0);
+    // A digest that keeps moving means something writes into the submodule: the row says so.
+    for (const said of [stale.message, h.ledger.getNotification(`worktree-submodule-work:job-more-edits:${stale.digest}`)?.detail ?? '']) {
+      expect(said).toContain(`${first.digest}`);
+      expect(said).toContain('something is still writing into the submodule');
+      expect(said).toContain('stop that process first, then discard the newest digest');
+    }
+    // Untracked files a writer leaves are preserved, never discarded: they do not move the digest.
+    writeFileSync(join(sub, 'cache.json'), '{}\n');
+    const same = await h.manager.release({ worktreeId: 'job-more-edits' }).catch((error: unknown) => error) as LaneSubmoduleWorkError;
+    expect(same.digest).toBe(stale.digest);
   });
 
   it('records a submodule refusal once per lane and digest for a lane with no job', async () => {
@@ -1228,7 +1362,7 @@ describe('lossless sweep: uncommitted work is saved before removal (#427)', () =
     expect(open()).toEqual([]);
   });
 
-  it('runs no submodule listing in a repository with no .gitmodules: no ls-tree, ls-files -s or submodule status', async () => {
+  it('a repository with no nested repository costs one ls-files -s per check and nothing per repository: no ls-tree, status --porcelain=v2 or rev-list', async () => {
     const h = harness({ manifest: null });
     addJob(h, 'job-no-modules');
     const lane = await h.manager.createJobWorktree({ repoPath: h.repo.path, jobId: 'job-no-modules' });
@@ -1242,7 +1376,9 @@ describe('lossless sweep: uncommitted work is saved before removal (#427)', () =
     const ran = shim.calls();
     // The spy sees GC's git: the snapshot ran through it.
     expect(ran.some((call) => call.includes('write-tree'))).toBe(true);
-    expect(ran.filter((call) => / ls-tree | ls-files -s |status --porcelain=v2/u.test(` ${call} `))).toEqual([]);
+    expect(ran.filter((call) => / ls-tree |status --porcelain=v2| rev-list /u.test(` ${call} `))).toEqual([]);
+    // The check runs before anything is copied and again before the removal.
+    expect(ran.filter((call) => call.startsWith('ls-files -s '))).toHaveLength(2);
   });
 
   it('a snapshot ref that cannot be written aborts the release after its records: worktree.release-aborted names the preserve copy, which stays, and retries reuse it, with no new folder, ref or record', async () => {
@@ -1306,6 +1442,189 @@ describe('lossless sweep: uncommitted work is saved before removal (#427)', () =
     expect(events(h, 'worktree.release-aborted')).toHaveLength(1);
   });
 
+  it.skipIf(typeof process.getuid === 'function' && process.getuid() === 0)('finishes a removal git left part way (a read-only folder in the lane): git deleted the lane\'s git folder, so GC deletes the rest, prunes, and flips the lane swept with an event naming it, the saved work kept', async () => {
+    const h = harness({ manifest: null });
+    addJob(h, 'job-part-removed');
+    const lane = await h.manager.createJobWorktree({ repoPath: h.repo.path, jobId: 'job-part-removed' });
+    writeFileSync(join(lane.path, 'README.md'), 'a tracked edit\n');
+    writeFileSync(join(lane.path, 'deliverable.txt'), 'an untracked deliverable\n');
+    // An ignored build folder git cannot empty: it is read-only.
+    const locked = join(lane.path, 'node_modules', 'locked');
+    mkdirSync(locked, { recursive: true });
+    writeFileSync(join(locked, 'built.js'), 'built\n');
+    chmodSync(locked, 0o500);
+    cleanups.push(() => { if (existsSync(locked)) chmodSync(locked, 0o700); });
+
+    const result = await h.manager.release({ worktreeId: 'job-part-removed' });
+
+    expect(result).toMatchObject({ status: 'swept', snapshot: { files: 1 }, preserved: { count: 1 } });
+    expect(existsSync(lane.path)).toBe(false);
+    expect(h.ledger.getWorktree('job-part-removed')?.status).toBe('swept');
+    expect(h.repo.git(['worktree', 'list', '--porcelain'])).not.toContain('job-part-removed');
+    expect(payloadOf(events(h, 'worktree.sweep-tail-failed')[0])).toMatchObject({
+      id: 'job-part-removed', stage: 'remove',
+      error: expect.stringMatching(/^git worktree remove failed part way \(.*\), after git had deleted the lane's git folder; GC deleted the rest of the tree and pruned the worktree$/u),
+    });
+    expect(events(h, 'worktree.release-aborted')).toHaveLength(0);
+    const [ref] = preservedRefs(h.repo);
+    expect(h.repo.git(['show', `${ref!}:README.md`])).toBe('a tracked edit');
+    expect(readFileSync(join(result.preserved!.destination, 'deliverable.txt'), 'utf-8')).toBe('an untracked deliverable\n');
+  });
+
+  it.skipIf(typeof process.getuid === 'function' && process.getuid() === 0)('a release of a lane git already part-removed (its git folder gone, part of its tree left) keeps what is left in the preserve copy, deletes it and reconciles the lane, never failing on "not a git repository"', async () => {
+    const h = harness({ manifest: null });
+    addJob(h, 'job-orphaned');
+    const lane = await h.manager.createJobWorktree({ repoPath: h.repo.path, jobId: 'job-orphaned' });
+    const locked = join(lane.path, 'node_modules', 'locked');
+    mkdirSync(locked, { recursive: true });
+    writeFileSync(join(locked, 'built.js'), 'built\n');
+    chmodSync(locked, 0o500);
+    cleanups.push(() => { if (existsSync(locked)) chmodSync(locked, 0o700); });
+    // A removal outside GC (or an older GC) stopped part way.
+    const removal = spawnSync('git', ['worktree', 'remove', '--force', lane.path], { cwd: h.repo.path, encoding: 'utf-8' });
+    expect(removal.status).not.toBe(0);
+    expect(existsSync(join(locked, 'built.js'))).toBe(true);
+    expect(h.repo.git(['worktree', 'list', '--porcelain'])).not.toContain('job-orphaned');
+
+    const result = await h.manager.release({ worktreeId: 'job-orphaned' });
+
+    expect(result.status).toBe('swept');
+    expect(existsSync(lane.path)).toBe(false);
+    expect(h.ledger.getWorktree('job-orphaned')?.status).toBe('swept');
+    expect(events(h, 'worktree.reconciled')).toHaveLength(1);
+    expect(payloadOf(events(h, 'worktree.sweep-tail-failed')[0])).toMatchObject({ id: 'job-orphaned', stage: 'remove' });
+    const destination = String(payloadOf(events(h, 'worktree.preserved')[0])['destination']);
+    cleanups.push(() => { const copy = join(destination, 'node_modules', 'locked'); if (existsSync(copy)) chmodSync(copy, 0o700); });
+    expect(readFileSync(join(destination, 'node_modules', 'locked', 'built.js'), 'utf-8')).toBe('built\n');
+    // What git left (a tracked file it had not reached yet, maybe) is all kept, and the owner is told where.
+    expect(h.ledger.listNotifications({ limit: 50 }).filter((row) => row.kind === 'worktree-work-saved').map((row) => row.detail)).toEqual([
+      expect.stringMatching(new RegExp(`^Lane job-orphaned \\(job job-orphaned\\) was released with \\d+ untracked file\\(s\\), copied to ${destination.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}\\.$`, 'u')),
+    ]);
+  });
+
+  it('a lane made from a sparse owner checkout is not sparse: GC disables the sparse checkout in the lane only, and the release saves the work', async () => {
+    const h = harness({ manifest: null });
+    h.repo.git(['sparse-checkout', 'set', '--no-cone', '/src/']);
+    expect(existsSync(join(h.repo.path, 'README.md'))).toBe(false);
+    addJob(h, 'job-from-sparse');
+    const lane = await h.manager.createJobWorktree({ repoPath: h.repo.path, jobId: 'job-from-sparse' });
+    expect(git(lane.path, ['config', '--bool', '--get', 'core.sparseCheckout'])).toBe('false');
+    expect(existsSync(join(lane.path, 'README.md'))).toBe(true);
+    writeFileSync(join(lane.path, 'README.md'), 'an edit outside the owner\'s sparse checkout\n');
+
+    const result = await h.manager.release({ worktreeId: 'job-from-sparse', requireReleaseProofs: true });
+
+    expect(result.status).toBe('swept');
+    expect(h.repo.git(['show', `${preservedRefs(h.repo)[0]!}:README.md`])).toBe('an edit outside the owner\'s sparse checkout');
+    // The owner's checkout is as sparse as it was.
+    expect(h.repo.git(['config', '--bool', '--get', 'core.sparseCheckout'])).toBe('true');
+    expect(existsSync(join(h.repo.path, 'README.md'))).toBe(false);
+  });
+
+  it('a lane from an owner checkout whose sparse checkout is in the shared config stays sparse: each release is refused by name, Gru gets one row, and the lane\'s release closes it', async () => {
+    const h = harness({ manifest: null });
+    h.repo.git(['config', 'core.sparseCheckout', 'true']);
+    mkdirSync(join(h.repo.path, '.git', 'info'), { recursive: true });
+    writeFileSync(join(h.repo.path, '.git', 'info', 'sparse-checkout'), '/src/\n');
+    h.repo.git(['read-tree', '-mu', 'HEAD']);
+    addJob(h, 'job-shared-sparse');
+    const lane = await h.manager.createJobWorktree({ repoPath: h.repo.path, jobId: 'job-shared-sparse' });
+    expect(existsSync(join(lane.path, 'README.md'))).toBe(false);
+    expect(h.logs.some((line) => line.level === 'warn' && line.msg.startsWith('lane is sparse through the repository\'s shared core.sparseCheckout'))).toBe(true);
+    const rows = (): ReturnType<LedgerApi['listNotifications']> => h.ledger.listNotifications({ limit: 50 }).filter((row) => row.kind === 'worktree.sparse-checkout');
+
+    for (let attempt = 0; attempt < 2; attempt += 1) await expect(h.manager.release({ worktreeId: 'job-shared-sparse' })).rejects.toThrow(LaneSparseCheckoutError);
+
+    expect(rows()).toHaveLength(1);
+    expect(rows()[0]).toMatchObject({ routing: 'action-required', resolvedAt: null });
+    expect(rows()[0]!.detail).toContain('git sparse-checkout disable');
+    git(lane.path, ['sparse-checkout', 'disable']);
+    expect((await h.manager.release({ worktreeId: 'job-shared-sparse' })).status).toBe('swept');
+    expect(rows()[0]!.resolvedAt).not.toBeNull();
+  });
+
+  it('copies the lane\'s index to the preserve root when the temporary folder cannot take it, and the snapshot keeps a file staged new', async () => {
+    const h = harness({ manifest: null });
+    addJob(h, 'job-full-tmp');
+    const lane = await h.manager.createJobWorktree({ repoPath: h.repo.path, jobId: 'job-full-tmp' });
+    writeFileSync(join(lane.path, 'staged-new.txt'), 'staged, never committed\n');
+    git(lane.path, ['add', 'staged-new.txt']);
+    const saved = process.env['TMPDIR'];
+    const restoreTmp = (): void => { if (saved === undefined) delete process.env['TMPDIR']; else process.env['TMPDIR'] = saved; };
+    cleanups.push(restoreTmp);
+    process.env['TMPDIR'] = join(tempDir('gru-lane-lifecycle-no-tmp-'), 'missing');
+
+    const result = await h.manager.release({ worktreeId: 'job-full-tmp' });
+    restoreTmp();
+
+    expect(result.status).toBe('swept');
+    expect(h.repo.git(['show', `${preservedRefs(h.repo)[0]!}:staged-new.txt`])).toBe('staged, never committed');
+    // The temporary index in the preserve root is gone with the release.
+    expect(readdirSync(h.preserveRoot)).toEqual([]);
+    expect(h.logs.filter((line) => line.msg.startsWith('the lane\'s index cannot be read'))).toEqual([]);
+  });
+
+  it.skipIf(typeof process.getuid === 'function' && process.getuid() === 0)('refuses, never building from HEAD, when the lane\'s readable index can be copied neither to the temporary folder nor to the preserve root while it stages a new file', async () => {
+    const h = harness({ manifest: null });
+    addJob(h, 'job-no-room');
+    const lane = await h.manager.createJobWorktree({ repoPath: h.repo.path, jobId: 'job-no-room' });
+    writeFileSync(join(lane.path, 'staged-new.txt'), 'staged, never committed\n');
+    git(lane.path, ['add', 'staged-new.txt']);
+    const saved = process.env['TMPDIR'];
+    cleanups.push(() => { if (saved === undefined) delete process.env['TMPDIR']; else process.env['TMPDIR'] = saved; });
+    process.env['TMPDIR'] = join(tempDir('gru-lane-lifecycle-no-tmp-'), 'missing');
+    chmodSync(h.preserveRoot, 0o500);
+    cleanups.push(() => { chmodSync(h.preserveRoot, 0o700); });
+
+    await expect(h.manager.release({ worktreeId: 'job-no-room' }))
+      .rejects.toThrow(/the snapshot of the uncommitted work in .* could not be built: the lane's index could not be copied to a temporary location \(.*\), and it stages 1 new file\(s\) a snapshot from HEAD would lose/u);
+
+    expect(preservedRefs(h.repo)).toEqual([]);
+    expect(readFileSync(join(lane.path, 'staged-new.txt'), 'utf-8')).toBe('staged, never committed\n');
+    expect(h.ledger.getWorktree('job-no-room')?.status).toBe('active');
+  });
+
+  it('closes every Gru row about a lane once it is gone: a reconciled lane closes each digest\'s submodule-work row, and a reconcile settles the rows of a lane swept without telling anyone or whose job ended with its tree gone', async () => {
+    const h = harness({ manifest: null });
+    addSubmodule(h);
+    addJob(h, 'job-rows');
+    const lane = await h.manager.createJobWorktree({ repoPath: h.repo.path, jobId: 'job-rows' });
+    initSubmodule(lane.path);
+    const sub = join(lane.path, 'deps', 'lib');
+    const open = (laneId: string): readonly string[] => h.ledger.listNotifications({ limit: 100 })
+      .filter((row) => row.resolvedAt === null && row.id.includes(`:${laneId}`)).map((row) => row.id);
+    for (const message of ['one unpushed commit', 'another']) {
+      git(sub, ['commit', '-q', '--allow-empty', '-m', message]);
+      await expect(h.manager.release({ worktreeId: 'job-rows' })).rejects.toBeInstanceOf(LaneSubmoduleWorkError);
+    }
+    expect(open('job-rows')).toHaveLength(1);
+    // The lane's tree goes outside any release; the next release reconciles it.
+    rmSync(lane.path, { recursive: true, force: true });
+    h.repo.git(['worktree', 'prune']);
+    expect((await h.manager.release({ worktreeId: 'job-rows' })).status).toBe('swept');
+    expect(open('job-rows')).toEqual([]);
+
+    // Rows whose lane left with no notice: one flipped swept, one of a job that ended with its tree gone.
+    for (const jobId of ['job-flipped', 'job-ended']) {
+      addJob(h, jobId);
+      const made = await h.manager.createJobWorktree({ repoPath: h.repo.path, jobId });
+      h.hooks.onRestoreIncomplete({ worktree: made, missing: ['node_modules'] });
+      h.hooks.onSparseCheckoutRefused({ worktree: made });
+      h.hooks.onSubmoduleWorkRefused({ worktree: made, submodules: [], digest: 'feedfacefeedface', previousDigest: null, staleDiscard: null });
+      expect(open(jobId)).toHaveLength(3);
+    }
+    h.ledger.setWorktreeStatus('job-flipped', 'swept');
+    rmSync(h.ledger.getWorktree('job-ended')!.path, { recursive: true, force: true });
+    h.ledger.setJobStatus('job-ended', 'binned');
+    const slimmer = slimmerFor(h, restoringGate(h));
+
+    slimmer.start();
+    await slimmer.idle();
+
+    expect(open('job-flipped')).toEqual([]);
+    expect(open('job-ended')).toEqual([]);
+  });
+
   it('tells the owner about a lane whose only work is untracked: the FYI row names the preserve folder and its file count', async () => {
     const h = harness({ manifest: null });
     addJob(h, 'job-untracked-only');
@@ -1334,7 +1653,8 @@ describe('lane slimming: delivered report lanes lose their reclaim folders (#427
 
     h.ledger.setJobStatus('job-report', 'delivered');
 
-    await vi.waitFor(() => expect(events(h, 'worktree.slimmed')).toHaveLength(1), { timeout: 30_000 });
+    // The slim is recorded before its deletes; slim-done follows them.
+    await vi.waitFor(() => expect(events(h, 'worktree.slim-done')).toHaveLength(1), { timeout: 30_000 });
     expect(existsSync(join(lane.path, 'node_modules'))).toBe(false);
     expect(readFileSync(join(lane.path, 'README.md'), 'utf-8')).toBe('the report draft\n');
     expect(h.repo.git(['status', '--porcelain'], lane.path)).toBe('M README.md');
@@ -1836,13 +2156,15 @@ describe('lane slimming: delivered report lanes lose their reclaim folders (#427
     expect(payloadOf(events(h, 'worktree.slim-incomplete')[0])).toEqual({
       id: 'job-swapped',
       failed: [{ path: 'through/inner', reason: 'deleting it failed: a link appeared on its path after the slim was planned' }],
+      // Its delete never began: nothing of it is gone.
+      partial: [],
       freed_bytes: nodeModules,
       shared_bytes: 0,
     });
     expect(h.manager.isSlim('job-swapped')).toBe(true);
   });
 
-  it.skipIf(typeof process.getuid === 'function' && process.getuid() === 0)('a delete that fails is recorded in worktree.slim-incomplete, and the lane is slim so its next turn runs setup', async () => {
+  it.skipIf(typeof process.getuid === 'function' && process.getuid() === 0)('a delete that fails is recorded in worktree.slim-incomplete as partial, and the lane is slim so its next turn runs setup; an entry whose delete the restore cannot finish is never counted whole', async () => {
     const h = harness({ gitignore: `${IGNORED}locked/\n`, manifest: ['reclaim = ["locked/deep", "node_modules"]', '', '[[setup]]', `command = "${SETUP}"`, ''].join('\n') });
     const lanePath = await deliveredReportLane(h, 'job-locked');
     mkdirSync(join(lanePath, 'locked', 'deep'), { recursive: true });
@@ -1857,9 +2179,11 @@ describe('lane slimming: delivered report lanes lose their reclaim folders (#427
     expect(existsSync(join(lanePath, 'locked', 'deep', 'built.js'))).toBe(true);
     const incomplete = payloadOf(events(h, 'worktree.slim-incomplete')[0]);
     expect(incomplete['failed']).toEqual([{ path: 'locked/deep', reason: expect.stringMatching(/^deleting it failed: .*(EACCES|EPERM)/u) }]);
+    expect(incomplete['partial']).toEqual(['locked/deep']);
     expect(incomplete['freed_bytes']).toBe(result.status === 'slimmed' ? result.freedBytes : -1);
     expect(h.manager.isSlim('job-locked')).toBe(true);
-    expect((await h.manager.ensureReady('job-locked'))[0]).toMatchObject({ status: 'rehydrated', notRecreated: [] });
+    expect((await h.manager.ensureReady('job-locked'))[0]).toMatchObject({ status: 'rehydrated', notRecreated: ['locked/deep'] });
+    expect(existsSync(join(lanePath, 'node_modules', 'pkg', 'index.js'))).toBe(true);
   });
 
   it('a stop between entries leaves the rest: the slim is on the record, what was not deleted is in worktree.slim-incomplete, and the next turn restores the lane', async () => {
@@ -2291,6 +2615,54 @@ describe('a slim lane is restored before its next turn or verification (#427)', 
     expect(rows()[0]!.resolvedAt).not.toBeNull();
   });
 
+  it('a delete a stop cut short is finished before the restore\'s setup, once: a stamp-skipping setup then fails the restore, never counting the half-deleted folder as restored', async () => {
+    const stamped = '[ -e deps.stamp ] || { mkdir -p node_modules/pkg && echo stamped > node_modules/pkg/index.js && touch deps.stamp; }';
+    const h = harness({ gitignore: `${IGNORED}deps.stamp\n`, manifest: ['reclaim = ["node_modules"]', '', '[[setup]]', `command = "${stamped}"`, ''].join('\n') });
+    addJob(h, 'job-half');
+    const lane = await h.manager.createJobWorktree({ repoPath: h.repo.path, jobId: 'job-half' });
+    h.ledger.setJobStatus('job-half', 'delivered');
+    const nodeModules = join(lane.path, 'node_modules');
+    for (let index = 0; index < 3_000; index += 1) {
+      mkdirSync(join(nodeModules, `dep-${String(index)}`));
+      writeFileSync(join(nodeModules, `dep-${String(index)}`, 'index.js'), MODULE);
+    }
+    const before = readdirSync(nodeModules).length;
+    const stop = new AbortController();
+    // The service stops as soon as the delete has begun.
+    const watch = setInterval(() => { if (existsSync(nodeModules) && readdirSync(nodeModules).length < before) stop.abort(); }, 5);
+    cleanups.push(() => { clearInterval(watch); });
+    expect((await h.manager.slim({ worktreeId: 'job-half', idle: () => null, signal: stop.signal })).status).toBe('slimmed');
+    clearInterval(watch);
+    expect(payloadOf(events(h, 'worktree.slim-incomplete')[0])).toMatchObject({ partial: ['node_modules'] });
+    expect(readdirSync(nodeModules).length).toBeGreaterThan(0);
+
+    const [outcome] = await h.manager.ensureReady('job-half');
+
+    expect(outcome).toMatchObject({ status: 'rehydrate-failed', error: expect.stringMatching(/^setup did not recreate node_modules/u) });
+    expect(existsSync(nodeModules)).toBe(false);
+    expect(events(h, 'worktree.slim-completed').map(payloadOf)).toEqual([{ id: 'job-half', entries: ['node_modules'] }]);
+    expect(events(h, 'worktree.rehydrated')).toHaveLength(0);
+    // The minion rebuilds it; the next restore never deletes it again.
+    mkdirSync(join(nodeModules, 'pkg'), { recursive: true });
+    writeFileSync(join(nodeModules, 'pkg', 'index.js'), MODULE);
+    expect((await h.manager.ensureReady('job-half'))[0]).toMatchObject({ status: 'rehydrated' });
+    expect(readFileSync(join(nodeModules, 'pkg', 'index.js'), 'utf-8')).toBe(MODULE);
+  }, 60_000);
+
+  it('a restore never rewrites the bootstrap record: what setup made at the lane\'s creation stays what every later restore requires', async () => {
+    const h = harness();
+    await deliveredReportLane(h, 'job-record');
+    const created = events(h, 'worktree.bootstrapped').map(payloadOf);
+    expect(created).toEqual([{ id: 'job-record', manifest_blob: manifestBlob(h), setup_made: ['node_modules'] }]);
+
+    for (let round = 0; round < 2; round += 1) {
+      expect((await h.manager.slim({ worktreeId: 'job-record', idle: () => null })).status).toBe('slimmed');
+      expect((await h.manager.ensureReady('job-record'))[0]).toMatchObject({ status: 'rehydrated' });
+    }
+
+    expect(events(h, 'worktree.bootstrapped').map(payloadOf)).toEqual(created);
+  });
+
   it('never slims a lane with no bootstrap record (one made before GC recorded what its setup makes)', async () => {
     const h = harness();
     const lanePath = await deliveredReportLane(h, 'job-old-lane');
@@ -2384,7 +2756,7 @@ describe('a slim lane is restored before its next turn or verification (#427)', 
     expect(events(h, 'verification.no-start')).toHaveLength(1);
   }, 30_000);
 
-  it('the service\'s stop ends a provider continuation\'s restore (its setup process group) and the continuation: nothing is spawned or prompted', async () => {
+  it('the service\'s stop ends a provider continuation\'s restore (its setup process group) and the continuation: nothing is spawned or prompted, and the claim is handed back so the next start replays it', async () => {
     const h = harness();
     const lanePath = await deliveredReportLane(h, 'job-recovery-stop');
     expect((await h.manager.slim({ worktreeId: 'job-recovery-stop', idle: () => null })).status).toBe('slimmed');
@@ -2416,13 +2788,23 @@ describe('a slim lane is restored before its next turn or verification (#427)', 
     const started = Date.now();
     h.stop.abort();
 
-    expect(await claim).toMatchObject({ outcome: 'skipped', why: expect.stringMatching(/the service stopped before the continuation spawned/u) });
+    expect(await claim).toMatchObject({ outcome: 'skipped', why: 'the service stopped before the continuation spawned (claim released; the next start replays it)' });
     expect(Date.now() - started).toBeLessThan(10_000);
     expect(() => process.kill(-pid, 0)).toThrow();
     expect(spawns).toBe(0);
     expect(prompts).toBe(0);
     expect(String(payloadOf(events(h, 'worktree.rehydrate-failed')[0])['error'])).toMatch(/stopped/u);
-    expect(payloadOf(events(h, 'provider.continuation-failed')[0])).toMatchObject({ wait_id: waitId, stage: 'authorization', error: expect.stringMatching(/the service is stopping/u) });
+    expect(events(h, 'provider.continuation-failed')).toHaveLength(0);
+    expect(payloadOf(events(h, 'provider.continuation-released')[0])).toMatchObject({ wait_id: waitId, released: true });
+    expect(h.ledger.getProviderWait(waitId)?.status).toBe('recovered-pending');
+
+    // The next start (a new service, its own stop) replays the continuation.
+    rmSync(join(lanePath, 'slow-setup'));
+    const restarted = laneLifecycleHooks({ manager: () => h.manager, notifications: h.notifications, ledger: h.ledger, stopSignal: new AbortController().signal });
+    expect(await claimProviderRecoveryContinuation({ ...deps, ensureReady: restarted.beforeContinuation }, waitId, 'silas')).toMatchObject({ outcome: 'continued' });
+    expect(spawns).toBe(1);
+    expect(prompts).toBe(1);
+    expect(h.ledger.getProviderWait(waitId)?.status).toBe('claimed');
   }, 30_000);
 
   it('POST /api/verify on a slim lane restores it inside its verification slot, then runs', async () => {

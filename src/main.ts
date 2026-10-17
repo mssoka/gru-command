@@ -1103,10 +1103,12 @@ async function main(): Promise<number> {
     },
     // A release that saved a lane's work tells the owner where it is
     // (#427): one FYI board row per release, never FOR YOU. A release refused
-    // over submodule work, and a restore without what setup made, tell Gru.
+    // over submodule work or a sparse checkout, and a restore without what
+    // setup made, tell Gru.
     onWorkSaved: laneHooks.onWorkSaved,
     onSubmoduleWorkRefused: laneHooks.onSubmoduleWorkRefused,
     onRestoreIncomplete: laneHooks.onRestoreIncomplete,
+    onSparseCheckoutRefused: laneHooks.onSparseCheckoutRefused,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   laneManager = worktreeManager;
@@ -1562,6 +1564,8 @@ async function main(): Promise<number> {
     worktrees: worktreeManager,
     workerTurns: (jobId) => pacing.gate.workerTurnsFor(jobId),
     verificationBusy: (jobId) => verifyServer.jobHasRun(jobId),
+    // Each reconcile also closes the lane rows whose lane is gone.
+    onReconcile: laneHooks.settleLaneRows,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   onboardingBudget = () => verifyServer.budget();

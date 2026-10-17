@@ -457,10 +457,12 @@ const PRODUCER_RESOLVED_KINDS: Readonly<Record<string, string>> = {
   'onboarding.proof-attention': 'a passing proof, a newer delivered head, or the onboarding job ending',
   // #427 PR 1b: a crashed proof's verify slot the boot judge kept; onboarding closes it.
   'onboarding.proof-slot-held': 'the slot being released',
-  // #427 PR 2a: one row per lane and digest; the lane's release closes it.
-  'worktree.submodule-work': 'the lane\'s release, or a refusal of it with a newer digest',
+  // #427 PR 2a: one row per lane and digest; the lane's sweep (any path) closes it.
+  'worktree.submodule-work': 'the lane being swept or gone, or a refusal of it with a newer digest',
   // #427 PR 2a: one row per lane whose setup did not recreate what it made.
-  'worktree.restore-incomplete': 'the lane\'s release',
+  'worktree.restore-incomplete': 'the lane being swept or gone',
+  // #427 PR 2a: one row per lane whose release a sparse checkout refuses.
+  'worktree.sparse-checkout': 'the lane being swept or gone',
 };
 
 // The alias d is an immutable delivery. A protected root must cite its
@@ -4829,6 +4831,27 @@ export class LedgerApi {
     });
   }
 
+  /** Hand a claimed wait back (#427): compare-and-set claimed →
+   * recovered-pending, only for a claim whose continuation never spawned
+   * (the service stopped while it restored the job's lanes), so the next
+   * claimant replays it. Returns true when THIS call released it. */
+  releaseProviderWaitClaim(id: string, payload?: Record<string, unknown>): boolean {
+    return this.transaction(() => {
+      const result = this.db
+        .prepare("UPDATE provider_waits SET status = 'recovered-pending', updated_at = ? WHERE id = ? AND status = 'claimed'")
+        .run(nowIso(), id);
+      if (result.changes !== 1) return false;
+      const wait = this.getProviderWait(id);
+      this.appendEvent({
+        kind: 'provider.wait-status',
+        jobId: wait?.jobId ?? null,
+        agentId: wait?.agentId ?? null,
+        payload: { id, from: 'claimed', to: 'recovered-pending', ...(payload ?? {}) },
+      });
+      return true;
+    });
+  }
+
   /** Link a machine-owned stop incident onto an established wait (the
    * incident lifecycle resolves with the wait's own terminal transition). */
   setProviderWaitIncident(id: string, incidentId: string): void {
@@ -5341,6 +5364,37 @@ export class LedgerApi {
       }
       return resolved;
     });
+  }
+
+  /** Resolve every open row whose id starts with `prefix` (#427: the rows
+   * about one lane, `worktree-submodule-work:<lane>:` for each digest).
+   * Unanswered typed owner decisions remain open, as for kind prefixes. */
+  resolveNotificationsByIdPrefix(prefix: string, by: string): readonly NotificationRecord[] {
+    if (prefix === '' || by === '') throw new Error('resolution prefix/by must be non-empty');
+    return this.transaction(() => {
+      const escaped = prefix.replace(/[\\%_]/g, '\\$&');
+      const rows = this.db
+        .prepare(
+          "SELECT id FROM notifications WHERE id LIKE ? ESCAPE '\\' AND resolved_at IS NULL AND NOT (routing = 'needs-owner' AND decision_json IS NOT NULL AND decided_at IS NULL) ORDER BY ts, id",
+        )
+        .all(`${escaped}%`) as Row[];
+      const resolved: NotificationRecord[] = [];
+      for (const raw of rows) {
+        const record = this.resolveNotificationById(str(raw.id), by);
+        if (record !== null) resolved.push(record);
+      }
+      return resolved;
+    });
+  }
+
+  /** The open (unresolved) rows of some kinds (#427: the lane rows a
+   * reconcile settles once their lane is gone). */
+  listOpenNotificationsByKinds(kinds: readonly string[]): readonly NotificationRecord[] {
+    if (kinds.length === 0) return [];
+    const rows = this.db
+      .prepare(`SELECT id FROM notifications WHERE kind IN (${kinds.map(() => '?').join(', ')}) AND resolved_at IS NULL ORDER BY ts, id`)
+      .all(...kinds) as Row[];
+    return rows.map((raw) => this.getNotification(str(raw.id))).filter((record): record is NotificationRecord => record !== null);
   }
 
   /** Resolve every open row of an EXACT kind (no LIKE wildcard semantics):

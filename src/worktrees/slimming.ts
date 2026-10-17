@@ -1,13 +1,20 @@
+import { existsSync } from 'node:fs';
 import type { EventBus } from '../events/bus.js';
 import type { LedgerApi, WorktreeRecord } from '../ledger/api.js';
 import { isReportDeliverable } from '../ledger/obligations.js';
+import { isJobTerminal } from '../ledger/states.js';
 import type { LogLevel } from '../logger.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { JobWorkerTurns, PrepareWorkerTurn } from '../runtime/pacing.js';
 import { laneIsBusy } from '../dispatch/branch-idle.js';
 import {
+  RESTORE_INCOMPLETE_NOTICE_KIND,
   restoreIncompleteNotice,
   restoreIncompleteNoticeId,
+  SPARSE_CHECKOUT_NOTICE_KIND,
+  sparseCheckoutNotice,
+  sparseCheckoutNoticeId,
+  SUBMODULE_WORK_NOTICE_KIND,
   submoduleWorkNotice,
   submoduleWorkNoticeId,
   sweepWorkNotice,
@@ -92,6 +99,10 @@ export interface ReportLaneSlimmerOptions {
   readonly log?: Log;
   readonly setInterval?: typeof setInterval;
   readonly clearInterval?: typeof clearInterval;
+  /** Run at the start of every reconcile (at start and every five minutes):
+   * main.ts settles the lane rows whose lane is gone
+   * ({@link LaneLifecycleHooks.settleLaneRows}). A failure is logged. */
+  readonly onReconcile?: () => void;
 }
 
 export class ReportLaneSlimmer {
@@ -159,6 +170,11 @@ export class ReportLaneSlimmer {
 
   /** Try every delivered report job's lanes. */
   reconcile(): void {
+    try {
+      this.opts.onReconcile?.();
+    } catch (error) {
+      this.log('error', 'lane row settlement failed; the next reconcile retries it', { error: String(error) });
+    }
     for (const job of this.opts.ledger.listJobs()) {
       if (job.status === 'delivered' && job.deliverable !== null && isReportDeliverable(job.deliverable)) this.slimSoon(job.id);
     }
@@ -291,9 +307,19 @@ export interface LaneLifecycleHooks {
   /** `WorktreeManagerOptions.onRestoreIncomplete`: one action-required row
    * for Gru per lane. */
   readonly onRestoreIncomplete: NonNullable<WorktreeManagerOptions['onRestoreIncomplete']>;
-  /** Part of `WorktreeManagerOptions.onSwept`: the lane's release closes its
-   * submodule-work and restore-incomplete rows. */
+  /** `WorktreeManagerOptions.onSparseCheckoutRefused`: one action-required
+   * row for Gru per lane. */
+  readonly onSparseCheckoutRefused: NonNullable<WorktreeManagerOptions['onSparseCheckoutRefused']>;
+  /** Part of `WorktreeManagerOptions.onSwept`: a lane swept by any path
+   * closes every submodule-work row of it (each digest), and its
+   * restore-incomplete and sparse-checkout rows. */
   readonly onSwept: (input: { readonly worktree: WorktreeRecord }) => void;
+  /** Close the lane rows (submodule work, restore incomplete, sparse
+   * checkout) whose lane is swept or no longer in the registry, or whose
+   * job is terminal and whose tree is gone: the sweep that should have
+   * closed them may never have told anyone (a crash between the two). Run
+   * by the slimmer's reconcile ({@link ReportLaneSlimmerOptions.onReconcile}). */
+  readonly settleLaneRows: () => void;
   /** The pacing gate's `prepareWorkerTurn`: the turn's stop or cancel ends
    * a restore's setup. */
   readonly beforeWorkerTurn: PrepareWorkerTurn;
@@ -315,7 +341,7 @@ export interface LaneLifecycleHooks {
 export function laneLifecycleHooks(deps: {
   readonly manager: () => Pick<WorktreeManager, 'ensureReady'> | null;
   readonly notifications: Pick<NotificationCenter, 'post'>;
-  readonly ledger: Pick<LedgerApi, 'resolveNotificationById' | 'latestEventByPayloadField'>;
+  readonly ledger: Pick<LedgerApi, 'resolveNotificationById' | 'resolveNotificationsByIdPrefix' | 'listOpenNotificationsByKinds' | 'getWorktree' | 'getJob'>;
   /** The service's stop: it ends a continuation's restore, and the
    * continuation with it. */
   readonly stopSignal: AbortSignal;
@@ -326,18 +352,31 @@ export function laneLifecycleHooks(deps: {
     await manager.ensureReady(jobId, signal === undefined ? {} : { signal });
   };
   const resolved = 'lane-released';
+  const closeLaneRows = (laneId: string, by: string): void => {
+    deps.ledger.resolveNotificationsByIdPrefix(submoduleWorkNoticeId(laneId, ''), by);
+    deps.ledger.resolveNotificationById(restoreIncompleteNoticeId(laneId), by);
+    deps.ledger.resolveNotificationById(sparseCheckoutNoticeId(laneId), by);
+  };
   return {
     onWorkSaved: (input: SavedWork) => { deps.notifications.post(sweepWorkNotice(input)); },
-    onSubmoduleWorkRefused: ({ worktree, submodules, digest, previousDigest }) => {
-      deps.notifications.post(submoduleWorkNotice({ worktree, submodules, digest }));
+    onSubmoduleWorkRefused: ({ worktree, submodules, digest, previousDigest, staleDiscard }) => {
+      deps.notifications.post(submoduleWorkNotice({ worktree, submodules, digest, staleDiscard }));
       // The digest an older row names would be refused now: that row is done.
       if (previousDigest !== null) deps.ledger.resolveNotificationById(submoduleWorkNoticeId(worktree.id, previousDigest), 'submodule-work-changed');
     },
     onRestoreIncomplete: (input) => { deps.notifications.post(restoreIncompleteNotice(input)); },
-    onSwept: ({ worktree }) => {
-      const refused = deps.ledger.latestEventByPayloadField('worktree.submodule-work-refused', 'id', worktree.id)?.payload as { readonly digest?: unknown } | undefined;
-      if (typeof refused?.digest === 'string') deps.ledger.resolveNotificationById(submoduleWorkNoticeId(worktree.id, refused.digest), resolved);
-      deps.ledger.resolveNotificationById(restoreIncompleteNoticeId(worktree.id), resolved);
+    onSparseCheckoutRefused: (input) => { deps.notifications.post(sparseCheckoutNotice(input)); },
+    onSwept: ({ worktree }) => { closeLaneRows(worktree.id, resolved); },
+    settleLaneRows: () => {
+      for (const row of deps.ledger.listOpenNotificationsByKinds([SUBMODULE_WORK_NOTICE_KIND, RESTORE_INCOMPLETE_NOTICE_KIND, SPARSE_CHECKOUT_NOTICE_KIND])) {
+        const laneId = laneOfRow(row.id);
+        if (laneId === null) continue;
+        const lane = deps.ledger.getWorktree(laneId);
+        const job = lane?.jobId == null ? null : deps.ledger.getJob(lane.jobId);
+        const gone = lane === null || lane.status === 'swept' ||
+          (!existsSync(lane.path) && (lane.jobId === null || job === null || isJobTerminal(job.status)));
+        if (gone) closeLaneRows(laneId, 'lane-gone');
+      }
     },
     beforeWorkerTurn: restore,
     beforeContinuation: async (jobId) => {
@@ -346,6 +385,21 @@ export function laneLifecycleHooks(deps: {
     },
     beforeVerification: restore,
   };
+}
+
+/** The lane a lane row names (its id: `<prefix>:<lane>`, and `:<digest>`
+ * after it for a submodule-work row), or null for an id of another shape. */
+function laneOfRow(id: string): string | null {
+  const submodule = submoduleWorkNoticeId('', '').slice(0, -1);
+  if (id.startsWith(submodule)) {
+    const rest = id.slice(submodule.length);
+    const digest = rest.lastIndexOf(':');
+    return digest > 0 ? rest.slice(0, digest) : null;
+  }
+  for (const prefix of [restoreIncompleteNoticeId(''), sparseCheckoutNoticeId('')]) {
+    if (id.startsWith(prefix) && id.length > prefix.length) return id.slice(prefix.length);
+  }
+  return null;
 }
 
 /** Start the slimmer after the service listens: off the heist path, so a

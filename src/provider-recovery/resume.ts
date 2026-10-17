@@ -62,7 +62,8 @@ export interface RecoveryClaimDeps {
    * `laneLifecycleHooks().beforeContinuation`, whose `WorktreeManager.
    * ensureReady` never rejects and whose stop (the service's) ends a running
    * setup. `'stopped'`: the service is stopping, so the continuation
-   * neither spawns nor prompts. */
+   * neither spawns nor prompts, and its claim is released (the wait is
+   * recovered-pending again) for the next start to replay. */
   readonly ensureReady?: (jobId: string) => Promise<'ready' | 'stopped'>;
 }
 
@@ -339,7 +340,16 @@ async function claimJobMinion(
         deps.log?.('error', 'lane restore before a provider continuation failed; the continuation proceeds', { wait_id: wait.id, job: job.id, error: String(error) });
       }
     }
-    if (stopped) throw new ProviderContinuationIneligibleError(`provider continuation refused — the service is stopping, so nothing was spawned for job "${job.id}"`);
+    if (stopped) {
+      // Nothing spawned or prompted: the claim is handed back, so the next
+      // start replays the continuation (#427).
+      const released = deps.ledger.releaseProviderWaitClaim(wait.id, { by, why: 'the service stopped before the continuation spawned' });
+      deps.ledger.appendCustomEvent({ kind: 'provider.continuation-released', jobId: wait.jobId, agentId: wait.agentId, payload: { wait_id: wait.id, by, released } });
+      deps.log?.('info', 'provider continuation not started — the service is stopping; the claim is released for the next start to replay', { wait_id: wait.id, job: wait.jobId, released });
+      return { outcome: 'skipped', waitId: wait.id, why: released
+        ? 'the service stopped before the continuation spawned (claim released; the next start replays it)'
+        : 'the service stopped before the continuation spawned (the claim could not be released)' };
+    }
     result = await rebriefFreshMinion({
       registry: deps.registry,
       ledger: deps.ledger,
@@ -400,14 +410,10 @@ async function claimJobMinion(
         payload: { wait_id: wait.id, by, stage: cleanupUnknown ? 'cleanup' : 'authorization', error: String(error).slice(0, 300) } });
       deps.log?.(cleanupUnknown ? 'error' : 'info', cleanupUnknown
         ? 'provider continuation cleanup unknown — ownership retained; stop the returned minion before reconciliation'
-        : stopped
-          ? 'provider continuation not started — the service is stopping; saved prompt not delivered'
-          : 'provider continuation authority changed — saved prompt not delivered', { wait_id: wait.id, job: wait.jobId, error: String(error) });
+        : 'provider continuation authority changed — saved prompt not delivered', { wait_id: wait.id, job: wait.jobId, error: String(error) });
       return { outcome: 'skipped', waitId: wait.id, why: cleanupUnknown
         ? 'continuation cleanup unknown after atomic claim (ownership retained; no automatic replay)'
-        : stopped
-          ? 'the service stopped before the continuation spawned (recorded; no automatic replay)'
-          : 'continuation authority changed after atomic claim (recorded; no automatic replay)' };
+        : 'continuation authority changed after atomic claim (recorded; no automatic replay)' };
     }
     // The claim won but the spawn/continuation failed DETERMINISTICALLY.
     // Never blind-retry (crash/ambiguous delivery must be reconciled, not

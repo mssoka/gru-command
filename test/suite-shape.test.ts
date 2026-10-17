@@ -252,7 +252,7 @@ const PINS: Record<string, number> = {
   'intake.test.ts': 73,
   'job-amendments.test.ts': 11,
   'lan-phone-raw-client.test.ts': 6,
-  'lane-lifecycle.test.ts': 87,
+  'lane-lifecycle.test.ts': 101,
   'ledger-api.test.ts': 99,
   'ledger-pipeline.test.ts': 22,
   'ledger-db.test.ts': 10,
