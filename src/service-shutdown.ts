@@ -1,6 +1,7 @@
 import type { VectorService } from './vector/service.js';
 import type { VectorRaidRunner } from './vector/runner.js';
 import type { OnboardingService } from './onboarding/service.js';
+import type { ReportLaneSlimmer } from './worktrees/slimming.js';
 import type { ServiceHandle } from './server.js';
 import type { RuntimeRegistry } from './runtime/registry.js';
 import type { SessionStore } from './sessions/store.js';
@@ -24,7 +25,7 @@ import type { ManagedRepoOverviewTracker } from './repos/overview.js';
 import type { SilasAutopilotOpsHandle } from './dispatch/silas-autopilot-ops.js';
 import type { LedgerApi } from './ledger/api.js';
 import { disposeDirectiveResources, type DirectiveProgressService } from './dispatch/directive-progress.js';
-import { SHUTDOWN_FORCE_EXIT_MS } from './shutdown-budget.js';
+import { LANE_SLIMMER_STOP_WAIT_MS, SHUTDOWN_FORCE_EXIT_MS } from './shutdown-budget.js';
 
 /**
  * Graceful-shutdown orchestration (issue #341). Extracted from `main.ts` with
@@ -52,6 +53,9 @@ export interface ServiceShutdownState {
   vectorRaids?: Pick<VectorRaidRunner, 'stop'>;
   /** Onboarding (#427): its event follow-through and reconcile stop, and in-flight origin probes abort. */
   onboarding?: Pick<OnboardingService, 'stop'>;
+  /** Lane slimming (#427): its event follow-through and reconcile stop,
+   * and the shutdown waits for a slim pass that is running. */
+  laneSlimmer?: Pick<ReportLaneSlimmer, 'stop'>;
   silas?: SilasDriver;
   /** Issue #243: the autopilot ops the shutdown checkpoints and drains. */
   autopilot?: SilasAutopilotOpsHandle;
@@ -211,6 +215,33 @@ export function startServiceShutdown(options: ServiceShutdownOptions): void {
           state.onboarding.stop();
         } catch (error) {
           logger.error('onboarding stop failed', { error: String(error) });
+        }
+      }
+      if (state.laneSlimmer !== undefined) {
+        // Bounded (#427): a slow pass never holds the rest of shutdown.
+        let waited: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const stopping = state.laneSlimmer.stop().then(
+            () => true,
+            (error: unknown) => {
+              logger.error('lane slimming stop failed', { error: String(error) });
+              return true;
+            },
+          );
+          const stopped = await Promise.race([
+            stopping,
+            new Promise<false>((resolveWait) => {
+              waited = setTimeout(() => resolveWait(false), LANE_SLIMMER_STOP_WAIT_MS);
+              waited.unref?.();
+            }),
+          ]);
+          if (!stopped) {
+            logger.warn?.('lane slimming did not stop in time; shutdown goes on (a lane slimmed part way is restored by its next turn)', { waited_ms: LANE_SLIMMER_STOP_WAIT_MS });
+          }
+        } catch (error) {
+          logger.error('lane slimming stop failed', { error: String(error) });
+        } finally {
+          clearTimeout(waited);
         }
       }
       if (state.silas !== undefined) {

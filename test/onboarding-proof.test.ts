@@ -278,9 +278,13 @@ describe('the proof (real checkout, setup and leased verify)', () => {
     expect(result).toMatchObject({ head: lane.head, passed: true, failures: [], appearedCount: 1, outputTail: '' });
     expect(result.setup).toEqual([{ command: 'mkdir -p build && printf 12345 > build/out', ms: expect.any(Number), ok: true }]);
     expect(result.verify).toMatchObject({ command: 'test -f build/out && echo tests passed', exitCode: 0, timedOut: false, workers: 2, outputBytes: 13 });
-    expect(result.appeared).toEqual([{ path: 'build/', bytes: 5 }]);
-    expect(result.reclaim).toEqual([{ path: 'build', appeared: true, ignored: true, trackedFiles: 0, bytes: 5, link: false }]);
-    expect(result.laneBytes).toBeGreaterThan(5);
+    // Sizes are bytes on disk (allocated blocks, #427 PR 2a): the 5 bytes
+    // written take at least one block.
+    expect(result.appeared).toEqual([{ path: 'build/', bytes: expect.any(Number) }]);
+    const built = result.appeared![0]!.bytes;
+    expect(built).toBeGreaterThan(0);
+    expect(result.reclaim).toEqual([{ path: 'build', appeared: true, ignored: true, trackedFiles: 0, bytes: built, link: false }]);
+    expect(result.laneBytes).toBeGreaterThan(built);
     // The proof leaves nothing behind and touches nothing of the user's.
     expect(readdirSync(lane.probes)).toEqual([]);
     expect(lane.userRepoState()).toBe(before);
@@ -288,6 +292,25 @@ describe('the proof (real checkout, setup and leased verify)', () => {
     expect(verificationEvents(lane.ledger)).toEqual([]);
     expect(lane.ledger.correctiveVerificationDebt(JOB)).toEqual(debtBefore);
     expect(lane.server.view()).toMatchObject({ activeRuns: 0, queuedRuns: 0 });
+  });
+
+  it('The lane size counts every file once, one hard-linked from outside the checkout (a package store\'s) included: what the lane holds, not what deleting it frees', async () => {
+    const store = temp('gru-onboarding-proof-store-');
+    writeFileSync(join(store, 'package.bin'), 'p'.repeat(2 * 1024 * 1024));
+    const lane = await proofLane([
+      'reclaim = ["build"]',
+      '[[setup]]',
+      `command = "mkdir -p build && ln ${join(store, 'package.bin')} build/package.bin"`,
+      '[verify]',
+      'full = "test -f build/package.bin && echo tests passed"',
+      '',
+    ].join('\n'));
+
+    const result = proven(await lane.prove());
+
+    expect(result.passed).toBe(true);
+    expect(result.laneBytes).toBeGreaterThanOrEqual(2 * 1024 * 1024);
+    expect(result.reclaim[0]!.bytes).toBeGreaterThanOrEqual(2 * 1024 * 1024);
   });
 
   it('Setup fails: a setup command exits 2 — failed with its output tail; verify never runs', async () => {
@@ -348,7 +371,8 @@ describe('the proof (real checkout, setup and leased verify)', () => {
       'reclaim "missing" did not appear after setup and verify.full',
       'reclaim "cache" is not git-ignored',
     ]);
-    expect(result.reclaim.find((entry) => entry.path === 'build')).toEqual({ path: 'build', appeared: true, ignored: true, trackedFiles: 0, bytes: 0, link: false });
+    // An empty folder's own blocks (none on APFS, one on ext4).
+    expect(result.reclaim.find((entry) => entry.path === 'build')).toEqual({ path: 'build', appeared: true, ignored: true, trackedFiles: 0, bytes: expect.any(Number), link: false });
     expect(readdirSync(lane.probes)).toEqual([]);
   });
 
@@ -377,8 +401,9 @@ describe('the proof (real checkout, setup and leased verify)', () => {
     ]);
     expect(result.reclaim).toEqual([
       { path: 'node_modules/.cache', appeared: false, ignored: false, trackedFiles: 0, bytes: null, link: true },
-      { path: 'seeded', appeared: false, ignored: true, trackedFiles: 0, bytes: 7, link: false },
+      { path: 'seeded', appeared: false, ignored: true, trackedFiles: 0, bytes: expect.any(Number), link: false },
     ]);
+    expect(result.reclaim[1]!.bytes).toBeGreaterThan(0);
     // Neither the link nor the copy appeared: setup and verify made nothing.
     expect(result).toMatchObject({ appeared: [], appearedCount: 0 });
     // The link fact is in the record, and the comment and packet render it.

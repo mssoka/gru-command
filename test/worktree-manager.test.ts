@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync, spawn } from 'node:child_process';
-import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LedgerDb } from '../src/ledger/db.js';
@@ -36,6 +36,7 @@ interface Harness {
   baseFallbacks: BaseFallbackNotice[];
   logs: { level: string; msg: string; fields: Record<string, unknown> }[];
   enumerator: ReturnType<typeof vi.fn>;
+  preserveRoot: string;
   make: (name?: string) => FixtureRepo;
   dispose: () => Promise<void>;
 }
@@ -49,10 +50,11 @@ function makeHarness(useDefaultEnumerator = false): Harness {
   const ledgerDb = new LedgerDb(mkdtempSync(join(tmpdir(), 'gru-command-wtdata-')));
   const ledger = new LedgerApi(ledgerDb.handle, { bus: new EventBus({}) });
   const enumerator = vi.fn<(treePath: string) => readonly TreeProcess[]>(() => []);
+  const preserveRoot = mkdtempSync(join(tmpdir(), 'gru-command-wtpreserve-'));
   const manager = new WorktreeManager({
     ledger,
     root: mkdtempSync(join(tmpdir(), 'gru-command-wtroot-')),
-    preserveRoot: mkdtempSync(join(tmpdir(), 'gru-command-wtpreserve-')),
+    preserveRoot,
     setupTimeoutMs: 30_000,
     killGraceMs: 25, // real-signal tests stay fast; production default is 1.5 s
     onSweepPaused: ({ worktree, processes }) => {
@@ -77,6 +79,7 @@ function makeHarness(useDefaultEnumerator = false): Harness {
     baseFallbacks,
     logs,
     enumerator,
+    preserveRoot,
     make(name?: string): FixtureRepo {
       const repo = makeFixtureRepo(name ?? 'fixture-wt');
       repos.push(repo);
@@ -1214,22 +1217,30 @@ describe('Perkins r1 B1: quoted deliverables are never destroyed', () => {
   });
 
   it.skipIf(typeof process.getuid === 'function' && process.getuid() === 0)(
-    'aborts the sweep (tree intact) when a deliverable cannot be preserved — never sacrifices it',
+    'aborts the sweep (tree intact) when a deliverable cannot be preserved — never sacrifices it — and withdraws the partial copy (#427)',
     async () => {
       const h = harness();
       const repo = h.make();
       ledgerJob(h, 'job-unpreservable', repo);
       const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-unpreservable' });
+      // #427: the snapshot holds tracked work only, so the copy is what
+      // meets the unreadable deliverable. One readable file is copied first:
+      // the refusal withdraws that partial copy too.
+      writeFileSync(join(row.path, 'a-first.txt'), 'copied before the failure');
       const guarded = join(row.path, 'guarded.txt');
       writeFileSync(guarded, 'must not be lost');
       chmodSync(guarded, 0o000); // copy will fail: present, but unreadable
       try {
         await expect(h.manager.release({ worktreeId: 'job-unpreservable' })).rejects.toThrowError(
-          /sweep aborted: deliverable "guarded.txt" could not be preserved/,
+          /sweep aborted: deliverable "guarded\.txt" could not be preserved .*the tree is retained/,
         );
         // ABORT means the tree is retained and the deliverable still exists.
         expect(existsSync(guarded)).toBe(true);
+        expect(existsSync(join(row.path, 'a-first.txt'))).toBe(true);
         expect(h.ledger.getWorktree('job-unpreservable')?.status).toBe('active');
+        // The partial copy is withdrawn: no new folder under the preserve root, no record.
+        expect(readdirSync(h.preserveRoot)).toEqual([]);
+        expect(h.ledger.listEvents({ limit: 200 }).filter((event) => event.kind === 'worktree.preserved')).toEqual([]);
       } finally {
         chmodSync(guarded, 0o644);
       }
@@ -2086,21 +2097,20 @@ describe('Perkins lane-B r4: a swept row with a surviving branch HEALS on releas
 // ------------------------------------------------------------------
 
 describe('issue #243 F-H1 automatic release proofs', () => {
-  it('refuses an UNATTENDED release that would destroy dirty tracked work, retaining the tree', async () => {
+  it('an UNATTENDED release of dirty tracked work snapshots it instead of refusing (#427 replaced the refusal)', async () => {
     const h = harness();
     const repo = h.make();
     ledgerJob(h, 'job-fh1-dirty', repo);
     const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-fh1-dirty' });
-    // A tracked modification the forced removal would destroy (only `??`
-    // untracked entries are preserved by the sweep).
+    // A tracked modification `remove --force` would destroy (only `??`
+    // untracked entries are preserved): the sweep saves it to a ref first.
     writeFileSync(join(row.path, 'README.md'), 'modified tracked content\n');
-    await expect(
-      h.manager.release({ worktreeId: 'job-fh1-dirty', requireReleaseProofs: true }),
-    ).rejects.toThrow(/automatic sweep refused: 1 tracked change/);
-    // The tree and the registry row are retained for the operator to resolve.
-    expect(existsSync(row.path)).toBe(true);
-    expect(h.ledger.getWorktree('job-fh1-dirty')?.status).toBe('active');
-    expect(readFileSync(join(row.path, 'README.md'), 'utf-8')).toBe('modified tracked content\n');
+    const result = await h.manager.release({ worktreeId: 'job-fh1-dirty', requireReleaseProofs: true });
+    expect(result.status).toBe('swept');
+    expect(existsSync(row.path)).toBe(false);
+    const snapshot = result.status === 'swept' ? result.snapshot : null;
+    expect(snapshot?.ref).toMatch(/^refs\/gru\/preserved\/job-fh1-dirty\//u);
+    expect(repo.git(['show', `${snapshot!.ref}:README.md`])).toBe('modified tracked content');
   });
 
   it('sweeps an UNATTENDED release of a clean lane (intact-positive control)', async () => {
@@ -2121,5 +2131,7 @@ describe('issue #243 F-H1 automatic release proofs', () => {
     writeFileSync(join(row.path, 'README.md'), 'operator chose to discard this\n');
     const result = await h.manager.release({ worktreeId: 'job-fh1-oper' });
     expect(result.status).toBe('swept');
+    // Lossless since #427: the operator's sweep keeps the edit on a ref.
+    expect(result.status === 'swept' ? result.snapshot?.files : null).toBe(1);
   });
 });

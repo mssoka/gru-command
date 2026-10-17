@@ -457,6 +457,10 @@ const PRODUCER_RESOLVED_KINDS: Readonly<Record<string, string>> = {
   'onboarding.proof-attention': 'a passing proof, a newer delivered head, or the onboarding job ending',
   // #427 PR 1b: a crashed proof's verify slot the boot judge kept; onboarding closes it.
   'onboarding.proof-slot-held': 'the slot being released',
+  // #427 PR 2a: one row per lane and digest; the lane's release closes it.
+  'worktree.submodule-work': 'the lane\'s release, or a refusal of it with a newer digest',
+  // #427 PR 2a: one row per lane whose setup did not recreate what it made.
+  'worktree.restore-incomplete': 'the lane\'s release',
 };
 
 // The alias d is an immutable delivery. A protected root must cite its
@@ -1293,6 +1297,18 @@ export class LedgerApi {
     const row = this.db
       .prepare('SELECT * FROM events WHERE kind = ? ORDER BY seq DESC LIMIT 1')
       .get(kind) as Row | undefined;
+    return row === undefined ? null : this.eventFromRow(row);
+  }
+
+  /** The newest event of one kind whose top-level payload `field` equals
+   * `value`, whatever its job (#427: a lane's own records, which a lane
+   * with no job carries too). Meant for rare kinds: it reads every event of
+   * the kind. */
+  latestEventByPayloadField(kind: string, field: string, value: string): EventRecord | null {
+    if (!/^[a-z][a-z0-9_]*$/u.test(field)) throw new Error(`latestEventByPayloadField: "${field}" is not a plain snake_case payload field`);
+    const row = this.db
+      .prepare('SELECT * FROM events WHERE kind = ? AND json_extract(payload, ?) = ? ORDER BY seq DESC LIMIT 1')
+      .get(kind, `$.${field}`, value) as Row | undefined;
     return row === undefined ? null : this.eventFromRow(row);
   }
 
@@ -4721,6 +4737,19 @@ export class LedgerApi {
          ORDER BY created_at DESC, id LIMIT 1`,
       )
       .get(agentId) as Row | undefined;
+    return row === undefined ? null : this.providerWaitFromRow(row);
+  }
+
+  /** The open (waiting/recovered-pending) provider wait of one job, or
+   * null — lane slimming (#427) treats a job whose minion may still be
+   * continued as busy. */
+  openProviderWaitForJob(jobId: string): ProviderWaitRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM provider_waits WHERE job_id = ? AND status IN ('waiting','recovered-pending')
+         ORDER BY created_at DESC, id LIMIT 1`,
+      )
+      .get(jobId) as Row | undefined;
     return row === undefined ? null : this.providerWaitFromRow(row);
   }
 

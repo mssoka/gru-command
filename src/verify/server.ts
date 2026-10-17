@@ -67,6 +67,13 @@ export interface VerificationServerOptions {
    * covered by this guard.
    */
   readonly heartbeatMs?: number;
+  /** Readies the job's lanes once its run holds a verification slot and
+   * before its command spawns (#427: restores a slim lane), so restores
+   * are bounded by `max_concurrent` and the slot shows the job busy the
+   * whole time. The signal is the run's: a cancelled run (the server is
+   * disposed) ends the restore's setup. It must not reject; when it does,
+   * the run still goes ahead. */
+  readonly ensureReady?: (jobId: string, signal: AbortSignal) => Promise<void>;
   readonly log?: Log;
 }
 
@@ -75,6 +82,9 @@ export interface VerificationServer {
   requestHook(req: IncomingMessage, res: ServerResponse, path: string): boolean;
   /** Board health row (board UX v4): live lock/queue/budget counters. */
   view(): VerificationQueueView;
+  /** True while a verification of the job is being readied, queued or
+   * running (#427: a lane is idle for slimming only when this is false). */
+  jobHasRun(jobId: string): boolean;
   /** The global budget's lease primitives, for a holder that spawns its own
    * command (#427 onboarding proof): one FIFO slot under the same lock-wait
    * timeout, and the per-run worker share to hand that command. */
@@ -215,6 +225,9 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
    * never run. dispose() stops them all before awaiting the scheduler.
    */
   const responseHeartbeats = new Set<ReturnType<typeof setInterval>>();
+  /** Requests per job from their arrival until their run settles: the
+   * scheduler knows a run only once it is submitted (#427). */
+  const requestsByJob = new Map<string, number>();
 
   const scheduler =
     options.scheduler ??
@@ -509,7 +522,14 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
     heartbeat.unref?.();
     responseHeartbeats.add(heartbeat);
 
+    requestsByJob.set(jobId, (requestsByJob.get(jobId) ?? 0) + 1);
+    const ensureReady = options.ensureReady;
     try {
+      // A slim lane gets its setup back before the run (#427), once the run
+      // holds its slot: restores share the verification budget, and a slim
+      // cannot delete again before the command spawns. The stream is open
+      // and pinged meanwhile; a failed restore is recorded by the restore
+      // itself and the run goes ahead.
       await scheduler.run(
         {
           jobId,
@@ -520,6 +540,7 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
           ...(requestId === undefined ? {} : { requestId }),
         },
         writeFrame,
+        ensureReady === undefined ? {} : { beforeSpawn: async (signal) => { await ensureReady(jobId, signal); } },
       );
     } catch (error) {
       if (error instanceof VerificationLockTimeoutError) {
@@ -557,6 +578,9 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
         });
       }
     } finally {
+      const pending = (requestsByJob.get(jobId) ?? 1) - 1;
+      if (pending > 0) requestsByJob.set(jobId, pending);
+      else requestsByJob.delete(jobId);
       stopHeartbeat();
       if (!res.writableEnded) res.end();
     }
@@ -598,6 +622,10 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
   return {
     view(): VerificationQueueView {
       return scheduler.view();
+    },
+
+    jobHasRun(jobId: string): boolean {
+      return (requestsByJob.get(jobId) ?? 0) > 0 || scheduler.hasRunFor(jobId);
     },
 
     budget(): VerificationBudget {

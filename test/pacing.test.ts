@@ -659,3 +659,106 @@ describe('pacing ledger honesty (r4 triage rows A3/A4/A9)', () => {
     ).toThrow(/maxConcurrentReviewTurns must be a finite number/);
   });
 });
+
+describe('worker-turn preparation and per-job turn knowledge (#427 lane slimming)', () => {
+  it('awaits prepareWorkerTurn after the grant and before the lease, holding the slot meanwhile; review turns and job-less turns skip it', async () => {
+    const prepared: string[] = [];
+    let finish!: () => void;
+    const gate = new PacingGate({
+      enabled: true,
+      maxConcurrentMinions: 0,
+      maxConcurrentReviewTurns: 0,
+      prepareWorkerTurn: (jobId) => {
+        prepared.push(jobId);
+        return new Promise<void>((resolve) => { finish = resolve; });
+      },
+    });
+    let leased = false;
+    const turn = gate.acquireWorkerTurn({ id: 'job-a', label: 'Job A', jobId: 'job-a' }).then((lease) => {
+      leased = true;
+      return lease;
+    });
+    for (let i = 0; i < 20; i += 1) await Promise.resolve();
+    expect(prepared).toEqual(['job-a']);
+    expect(leased).toBe(false);
+    // The turn holds its slot while it is readied.
+    expect(gate.view().worker.running).toBe(1);
+    expect(gate.workerTurnsFor('job-a')).toEqual({ held: 1, queued: 0 });
+    finish();
+    const lease = await turn;
+    expect(leased).toBe(true);
+
+    const review = await gate.acquireReviewTurn({ id: 'round-1', label: 'lead', jobId: 'job-a' });
+    const jobless = await gate.acquireWorkerTurn({ id: 'agent-1', label: 'restart', jobId: null });
+    expect(prepared).toEqual(['job-a']);
+    for (const held of [lease, review, jobless]) held.release();
+    expect(gate.workerTurnsFor('job-a')).toEqual({ held: 0, queued: 0 });
+  });
+
+  it('readies a queued turn when the slot is handed to it, and counts held and queued turns per job', async () => {
+    const prepared: string[] = [];
+    const gate = new PacingGate({
+      enabled: true,
+      maxConcurrentMinions: 1,
+      maxConcurrentReviewTurns: 0,
+      prepareWorkerTurn: async (jobId) => { prepared.push(jobId); },
+    });
+    const first = await gate.acquireWorkerTurn({ id: 'job-a', label: 'Job A', jobId: 'job-a' });
+    const second = gate.acquireWorkerTurn({ id: 'job-b', label: 'Job B', jobId: 'job-b' });
+    expect(gate.workerTurnsFor('job-a')).toEqual({ held: 1, queued: 0 });
+    expect(gate.workerTurnsFor('job-b')).toEqual({ held: 0, queued: 1 });
+    expect(prepared).toEqual(['job-a']);
+    first.release();
+    expect(gate.workerTurnsFor('job-a')).toEqual({ held: 0, queued: 0 });
+    expect(gate.workerTurnsFor('job-b')).toEqual({ held: 1, queued: 0 });
+    const lease = await second;
+    expect(prepared).toEqual(['job-a', 'job-b']);
+    lease.release();
+    expect(gate.workerTurnsFor('job-b')).toEqual({ held: 0, queued: 0 });
+  });
+
+  it('never blocks a turn on a failed preparation: the lease is handed over and the failure is recorded', async () => {
+    const events: Array<{ kind: string; jobId: string | null | undefined; payload?: unknown }> = [];
+    const gate = new PacingGate({
+      enabled: true,
+      maxConcurrentMinions: 0,
+      maxConcurrentReviewTurns: 0,
+      record: (event) => events.push({ kind: event.kind, jobId: event.jobId, payload: event.payload }),
+      prepareWorkerTurn: async () => { throw new Error('setup exploded'); },
+    });
+    const lease = await gate.acquireWorkerTurn({ id: 'job-a', label: 'Job A', jobId: 'job-a' });
+    expect(gate.workerTurnsFor('job-a')).toEqual({ held: 1, queued: 0 });
+    expect(events).toEqual([{ kind: 'pacing.prepare-failed', jobId: 'job-a', payload: { id: 'job-a', label: 'Job A', pool: 'worker', error: 'Error: setup exploded' } }]);
+    lease.release();
+  });
+
+  it('resolvePacingPolicy forwards prepareWorkerTurn to the gate it builds: the hook gets the job id and the turn\'s own signal, and the lease waits for it, queued or not', async () => {
+    const calls: Array<{ jobId: string; signal: AbortSignal | undefined }> = [];
+    const finishers: Array<() => void> = [];
+    const resolved = resolvePacingPolicy(pacingConfig({ maxConcurrentMinions: 1 }), {
+      prepareWorkerTurn: (jobId, signal) => {
+        calls.push({ jobId, signal });
+        return new Promise<void>((resolve) => { finishers.push(resolve); });
+      },
+    });
+    const first = new AbortController();
+    const second = new AbortController();
+    let firstLeased = false;
+    const turnA = resolved.gate.acquireWorkerTurn({ id: 'job-a', label: 'A', jobId: 'job-a', signal: first.signal }).then((lease) => {
+      firstLeased = true;
+      return lease;
+    });
+    const turnB = resolved.gate.acquireWorkerTurn({ id: 'job-b', label: 'B', jobId: 'job-b', signal: second.signal });
+    for (let i = 0; i < 20; i += 1) await Promise.resolve();
+    expect(calls).toEqual([{ jobId: 'job-a', signal: first.signal }]);
+    expect(firstLeased).toBe(false);
+    finishers[0]!();
+    const leaseA = await turnA;
+    leaseA.release();
+    for (let i = 0; i < 20; i += 1) await Promise.resolve();
+    // The queued turn is readied with its own signal when the slot reaches it.
+    expect(calls).toEqual([{ jobId: 'job-a', signal: first.signal }, { jobId: 'job-b', signal: second.signal }]);
+    finishers[1]!();
+    (await turnB).release();
+  });
+});

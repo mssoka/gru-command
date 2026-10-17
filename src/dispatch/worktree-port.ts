@@ -110,8 +110,10 @@ export interface WorktreePort {
     worktreeId: string;
     confirmKill?: boolean;
     baseBranch?: string;
-    /** Issue #243 F-H1: an unattended release proves tracked cleanliness and
-     * fresh required containment before any forced removal. */
+    /** Issue #243 F-H1: an unattended release proves fresh required
+     * containment before any forced removal (uncommitted work is
+     * snapshotted by every release since #427, never refused). The port
+     * carries no submodule discard: only an operator release may pass one. */
     requireReleaseProofs?: boolean;
   }): Promise<WorktreeSweepResult>;
 }

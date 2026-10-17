@@ -3,7 +3,10 @@
  * a PR comment, and, for the onboarding proof (#427), the ledger record of
  * a command's output and failures and the minion directive that carries
  * them. Spans that look like a credential become one fixed placeholder;
- * the caller keeps no unredacted copy of what it records or sends.
+ * the caller keeps no unredacted copy of what it records or sends. The
+ * bounded tail of a redacted text is cut here too (the onboarding proof's
+ * output tail, a failed lane restore's error), so a cut never shows half a
+ * credential and never leaves nothing.
  */
 
 export const REDACTION_PLACEHOLDER = '[REDACTED]';
@@ -149,4 +152,94 @@ export function redactCredentialWindow(window: string): string {
   text = redactCredentials(text);
   const open = PEM_BEGIN.exec(text);
   return open === null ? text : `${text.slice(0, open.index)}${REDACTION_PLACEHOLDER}`;
+}
+
+/** The last `max` UTF-8 bytes of a text, cut at a character boundary. */
+export function utf8Tail(text: string, max: number): string {
+  const bytes = Buffer.from(text, 'utf8');
+  if (bytes.length <= max) return text;
+  let start = bytes.length - max;
+  while (start < bytes.length && (bytes[start]! & 0xc0) === 0x80) start += 1;
+  return bytes.subarray(start).toString('utf8');
+}
+
+/** The first line of a tail that starts inside a line longer than the
+ * tail: its words are kept rather than nothing, and it says so. */
+const MID_LINE = '(output tail starts mid-line)\n';
+
+/** What stands for a last line with no word boundary to start at: none of
+ * it is shown, since its first bytes could be the back half of a token. */
+const longLine = (bytes: number): string => `(last line longer than ${String(Math.max(1, Math.floor(bytes / 1024)))} KiB, not shown)\n`;
+
+/** What stands for kept output whose first line the stream's earlier,
+ * dropped output began: none of it is shown, and no size is claimed. */
+const CUT_MID_LINE = '(output before this was cut mid-line; not shown)\n';
+
+/** The mid-line fallback, for kept bytes whose cut has no line boundary
+ * after it: everything up to and including their first whitespace is
+ * dropped (a token the cut split never shows its back half); with no
+ * whitespace followed by anything, nothing is. */
+function fromWord(kept: string): string | null {
+  const word = kept.search(/\s/u);
+  const rest = word === -1 ? '' : kept.slice(word + 1);
+  return rest.trim() === '' ? null : rest;
+}
+
+/** The last `max` UTF-8 bytes of a redacted text, starting at a whole
+ * line. When its last line alone is longer than that, that line's last
+ * bytes from their first word, after {@link MID_LINE}; with no word
+ * boundary, {@link longLine}: a command that printed something never
+ * records an empty tail. Only ever cut after redaction, so the cut never
+ * parts a key from its value. */
+export function boundedTail(text: string, max: number): string {
+  if (Buffer.byteLength(text, 'utf8') <= max) return text;
+  const tail = utf8Tail(text, max);
+  const line = tail.indexOf('\n');
+  const whole = line === -1 ? '' : tail.slice(line + 1);
+  if (whole.trim() !== '' || text.trim() === '') return whole;
+  const rest = fromWord(utf8Tail(text, max - Buffer.byteLength(MID_LINE, 'utf8')));
+  return rest === null ? longLine(max) : `${MID_LINE}${rest}`;
+}
+
+/** Bytes of output kept for the record and the minion, after redaction (#427). */
+const OUTPUT_TAIL_BYTES = 4 * 1024;
+/** Bytes of one stream's output the tail is cut from, after redaction. */
+const OUTPUT_WINDOW_BYTES = 16 * 1024;
+
+/** One stream's latest output, as a command keeps it (a setup command's
+ * is worktrees/manifest.ts's `SetupStreamTail`). */
+export interface OutputWindow {
+  readonly text: string;
+  /** Earlier output was dropped: the text starts mid-stream. */
+  readonly truncated: boolean;
+  /** The text starts at a whole line: nothing was dropped, or what was
+   * dropped ended at a line break. */
+  readonly startsAtLine: boolean;
+}
+
+/**
+ * The recorded output tail (#427: the onboarding proof's, and a failed lane
+ * restore's). Each stream's kept output is redacted whole first (a key
+ * whose BEGIN line fell before it is redacted from its start), and only
+ * then cut, so no cut GC makes parts a key from its value:
+ * - output GC kept whole (none dropped, however long) keeps its last
+ *   {@link OUTPUT_WINDOW_BYTES} ({@link boundedTail});
+ * - output whose start was dropped before GC saw it keeps what follows
+ *   the drop when the dropped part ended at a line break; when it did not,
+ *   the first line is dropped after redaction (the earlier cut may have
+ *   split a key's name, which no pattern then recognises), and with no
+ *   line break at all only {@link CUT_MID_LINE} is recorded: a fragment
+ *   the earlier cut made is never shown, not even from a word.
+ * The streams together are then cut to the last `max` bytes (default
+ * {@link OUTPUT_TAIL_BYTES}) the same way.
+ */
+export function recordedTail(windows: readonly OutputWindow[], max = OUTPUT_TAIL_BYTES): string {
+  const kept = windows.map((window) => {
+    const whole = redactCredentialWindow(window.text);
+    if (!window.truncated || window.startsAtLine) return boundedTail(whole, OUTPUT_WINDOW_BYTES);
+    const line = whole.indexOf('\n');
+    const rest = line === -1 ? '' : whole.slice(line + 1);
+    return rest.trim() === '' ? CUT_MID_LINE : boundedTail(rest, OUTPUT_WINDOW_BYTES);
+  }).filter((text) => text !== '');
+  return boundedTail(kept.join('\n'), max);
 }

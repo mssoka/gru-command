@@ -6,7 +6,7 @@ import {
   type ServiceShutdownLogger,
   type ServiceShutdownState,
 } from '../src/service-shutdown.js';
-import { SHUTDOWN_FORCE_EXIT_MS } from '../src/shutdown-budget.js';
+import { LANE_SLIMMER_STOP_WAIT_MS, SHUTDOWN_FORCE_EXIT_MS } from '../src/shutdown-budget.js';
 import { CESSATION_IDLE_TIMEOUT_MS } from '../src/runtime/pi-adapter.js';
 import type { RuntimeRegistry } from '../src/runtime/registry.js';
 import type { SessionStore } from '../src/sessions/store.js';
@@ -24,7 +24,7 @@ import type { WaveRunner } from '../src/dispatch/perkins.js';
  */
 
 interface LogLine {
-  readonly level: 'info' | 'error';
+  readonly level: 'info' | 'warn' | 'error';
   readonly msg: string;
   readonly fields?: Record<string, unknown>;
 }
@@ -34,6 +34,7 @@ function recordingLogger(): ServiceShutdownLogger & { readonly lines: LogLine[] 
   return {
     lines,
     info: (msg, fields) => { lines.push({ level: 'info', msg, ...(fields !== undefined ? { fields } : {}) }); },
+    warn: (msg, fields) => { lines.push({ level: 'warn', msg, ...(fields !== undefined ? { fields } : {}) }); },
     error: (msg, fields) => { lines.push({ level: 'error', msg, ...(fields !== undefined ? { fields } : {}) }); },
   };
 }
@@ -310,6 +311,58 @@ describe('service shutdown orchestration (issue #341, R3-2 executable)', () => {
     expect(run.lines.filter((line) => line.level === 'error').map((line) => line.msg)).toEqual(['onboarding stop failed']);
   });
 
+  it('stops lane slimming after onboarding and waits for the slim pass that is running; a failing stop never skips what follows (#427)', async () => {
+    const order: string[] = [];
+    let finishPass!: () => void;
+    const state: ServiceShutdownState = {
+      onboarding: { stop: () => { order.push('onboarding.stop'); } },
+      laneSlimmer: {
+        stop: async () => {
+          order.push('laneSlimmer.stop');
+          await new Promise<void>((resolvePass) => { finishPass = resolvePass; });
+          order.push('laneSlimmer.pass-finished');
+          throw new Error('the pass ended in error');
+        },
+      },
+      handle: fakeHandle(order),
+    };
+    const run = runShutdown(state);
+    await vi.waitFor(() => expect(order).toContain('laneSlimmer.stop'));
+    for (let i = 0; i < 10; i += 1) await new Promise((resolveTick) => setTimeout(resolveTick, 0));
+    expect(order).toEqual(['onboarding.stop', 'laneSlimmer.stop']);
+    finishPass();
+    await run.exited;
+    expect(run.exits).toEqual([0]);
+    expect(order).toEqual(['onboarding.stop', 'laneSlimmer.stop', 'laneSlimmer.pass-finished', 'handle.stop']);
+    expect(run.lines.filter((line) => line.level === 'error').map((line) => line.msg)).toEqual(['lane slimming stop failed']);
+  });
+
+  it('waits for a slow lane-slimming pass at most its bound, well inside the force-exit budget, then goes on (#427)', async () => {
+    vi.useFakeTimers();
+    try {
+      const order: string[] = [];
+      const state: ServiceShutdownState = {
+        // A pass deleting a huge folder that never finishes in time.
+        laneSlimmer: { stop: async () => { order.push('laneSlimmer.stop'); await new Promise<void>(() => {}); } },
+        handle: fakeHandle(order),
+      };
+      expect(LANE_SLIMMER_STOP_WAIT_MS).toBeLessThan(SHUTDOWN_FORCE_EXIT_MS / 2);
+      const run = runShutdown(state);
+      await vi.advanceTimersByTimeAsync(LANE_SLIMMER_STOP_WAIT_MS - 1);
+      expect(order).toEqual(['laneSlimmer.stop']);
+      await vi.advanceTimersByTimeAsync(1);
+      await run.exited;
+      expect(run.exits).toEqual([0]);
+      expect(run.forced()).toBe(false);
+      expect(order).toEqual(['laneSlimmer.stop', 'handle.stop']);
+      expect(run.lines.filter((line) => line.level === 'warn').map((line) => line.msg)).toEqual([
+        'lane slimming did not stop in time; shutdown goes on (a lane slimmed part way is restored by its next turn)',
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('is the orchestration main.ts actually invokes (wiring alarm)', () => {
     const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
     expect(mainSource).toContain("from './service-shutdown.js'");
@@ -325,5 +378,8 @@ describe('service shutdown orchestration (issue #341, R3-2 executable)', () => {
     // #427: onboarding reaches the state bag before it starts scanning.
     expect(mainSource.indexOf('state.onboarding = onboarding;')).toBeGreaterThan(-1);
     expect(mainSource.indexOf('startOnboarding(onboarding,')).toBeGreaterThan(mainSource.indexOf('state.onboarding = onboarding;'));
+    // #427: lane slimming reaches the state bag before it starts.
+    expect(mainSource.indexOf('state.laneSlimmer = laneSlimmer;')).toBeGreaterThan(-1);
+    expect(mainSource.indexOf('startLaneSlimmer(laneSlimmer,')).toBeGreaterThan(mainSource.indexOf('state.laneSlimmer = laneSlimmer;'));
   });
 });

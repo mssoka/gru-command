@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -294,6 +294,54 @@ describe('worktree lane release endpoint (r4)', () => {
       await h.close();
     }
   });
+
+  it('discard_submodule_work reaches the release (#427): without it a lane whose submodule holds an unpushed commit is refused by name with the digest, a discard without that digest is refused, a silas release cannot carry it, and an operator release with the digest sweeps, audited', async () => {
+    const h = await bootLane();
+    const repo = makeFixtureRepo('fixture-wt-submodule');
+    cleanupRepos.push(repo);
+    const sub = mkdtempSync(join(tmpdir(), 'gru-command-wtserver-sub-'));
+    cleanupDirs.push(sub);
+    const git = (cwd: string, args: readonly string[]): string => execFileSync('git', [
+      '-c', 'user.name=Server Tests', '-c', 'user.email=server@example.invalid', '-c', 'protocol.file.allow=always', ...args,
+    ], { cwd, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    try {
+      git(sub, ['init', '-q', '-b', 'main']);
+      writeFileSync(join(sub, 'lib.txt'), 'library\n');
+      git(sub, ['add', '.']);
+      git(sub, ['commit', '-qm', 'library']);
+      git(repo.path, ['submodule', 'add', '-q', sub, 'deps/lib']);
+      git(repo.path, ['commit', '-qm', 'add the library']);
+      h.ledger.addJob({ id: 'job-sub', repo: 'fixture-wt-submodule', title: 'x' });
+      h.ledger.setJobStatus('job-sub', 'working');
+      const lane = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-sub' });
+      git(lane.path, ['submodule', 'update', '--init', '-q']);
+      git(join(lane.path, 'deps', 'lib'), ['commit', '-q', '--allow-empty', '-m', 'unpushed work']);
+
+      const refused = await call(h.port, '/api/dispatch/release', { job_id: 'job-sub' }, TOKEN);
+      expect(refused.status).toBe(400);
+      expect(field<string>(refused.json, 'detail')).toMatch(/deps\/lib: commit [0-9a-f]{40} \(its HEAD\) is on no remote-tracking ref.*discard_submodule_work/u);
+      const digest = field<string>(refused.json, 'digest');
+      expect(digest).toMatch(/^[0-9a-f]{16}$/u);
+      expect(field<string>(refused.json, 'detail')).toContain(`discard_submodule_work: "${digest}"`);
+      const blanket = await call(h.port, '/api/dispatch/release', { job_id: 'job-sub', discard_submodule_work: true }, TOKEN);
+      expect(blanket.status).toBe(400);
+      expect(field<string>(blanket.json, 'detail')).toContain('carries the digest a submodule refusal named');
+      const silas = await call(h.port, '/api/dispatch/release', {
+        job_id: 'job-sub', by: 'silas', rule_id: 'sweep-ack', discard_submodule_work: digest,
+      }, TOKEN);
+      expect(silas.status).toBe(400);
+      expect(field<string>(silas.json, 'detail')).toContain('operator decision');
+      expect(h.manager.getWorktree('job-sub')?.status).toBe('active');
+
+      const swept = await call(h.port, '/api/dispatch/release', { job_id: 'job-sub', discard_submodule_work: digest }, TOKEN);
+      expect(swept.status).toBe(200);
+      expect(field<string>(swept.json, 'status')).toBe('swept');
+      expect(existsSync(lane.path)).toBe(false);
+      expect(h.ledger.listJobEvents('job-sub').filter((event) => event.kind === 'worktree.submodule-work-discarded')).toHaveLength(1);
+    } finally {
+      await h.close();
+    }
+  }, 90_000);
 
   it('a silas release of a non-job lane refuses before releasing — no job, no receipt, no sweep', async () => {
     const h = await bootLane();

@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
-import type { WorktreeManager } from './manager.js';
+import { LaneSubmoduleWorkError, type WorktreeManager } from './manager.js';
 import type { LedgerApi } from '../ledger/api.js';
 import { isJobTerminal } from '../ledger/states.js';
 import { parseSilasActionRuleId } from '../dispatch/silas-rules.js';
@@ -111,6 +111,19 @@ export function createWorktreeServer(options: WorktreeServerOptions): WorktreeSe
     if (!authed(req, res)) return;
     const body = await readBody(req);
     const confirmKill = body['confirm_kill'] === true;
+    // #427: an operator may discard submodule work the removal destroys
+    // (every other release refuses it by name), naming the digest of the
+    // refusal it answers: the discard covers only the work that refusal
+    // showed, and the manager refuses again when it changed. It audits it.
+    const discardField = body['discard_submodule_work'];
+    if (discardField !== undefined && discardField !== false && (typeof discardField !== 'string' || !/^[0-9a-f]{16}$/u.test(discardField))) {
+      json(res, 400, {
+        error: 'bad_request',
+        detail: 'discard_submodule_work carries the digest a submodule refusal named (16 hex characters): it discards only the work that refusal showed',
+      });
+      return;
+    }
+    const discardSubmoduleWork = typeof discardField === 'string' ? discardField : undefined;
     const baseBranch = optStrField(body, 'base_branch');
     // Sweep-ack provenance (issue #117, g21): a silas release must name the
     // rule that fired it (sweep-ack — the releaseEligible digest row), so
@@ -199,6 +212,13 @@ export function createWorktreeServer(options: WorktreeServerOptions): WorktreeSe
         });
         return;
       }
+      if (discardSubmoduleWork !== undefined) {
+        json(res, 400, {
+          error: 'bad_request',
+          detail: 'a silas release cannot carry discard_submodule_work — destroying submodule work is an operator decision',
+        });
+        return;
+      }
       if (lane?.status === 'swept') {
         json(res, 409, {
           error: 'already_swept',
@@ -226,6 +246,7 @@ export function createWorktreeServer(options: WorktreeServerOptions): WorktreeSe
     const result = await manager.release({
       worktreeId,
       ...(confirmKill ? { confirmKill: true } : {}),
+      ...(discardSubmoduleWork !== undefined ? { discardSubmoduleWork } : {}),
       ...(baseBranch !== undefined ? { baseBranch } : {}),
     });
     if (silasRelease && options.ledger !== undefined) {
@@ -261,7 +282,9 @@ export function createWorktreeServer(options: WorktreeServerOptions): WorktreeSe
         .catch((error: unknown) => {
           const message = String(error instanceof Error ? error.message : error);
           log('error', 'worktree release handler failed', { path, error: message });
-          if (!res.headersSent) json(res, 400, { error: 'bad_request', detail: message });
+          // A submodule refusal carries the digest a discard must name (#427).
+          const submodules = error instanceof LaneSubmoduleWorkError ? { digest: error.digest, submodules: error.submodules } : {};
+          if (!res.headersSent) json(res, 400, { error: 'bad_request', detail: message, ...submodules });
         })
         .finally(() => {
           log('info', 'worktree release request', {

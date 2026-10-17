@@ -58,6 +58,7 @@ import { IntakeApprovalService } from './intake/approval.js';
 import { IntakeSlicingService } from './intake/slicing.js';
 import { ChildWorkerService } from './dispatch/child-workers.js';
 import { createVerificationServer, type VerificationBudget } from './verify/server.js';
+import { laneLifecycleHooks, ReportLaneSlimmer, startLaneSlimmer } from './worktrees/slimming.js';
 import type { VerificationQueueView } from './verify/scheduler.js';
 import { createService } from './server.js';
 import { adoptRollMarker, reconcileStaleRoll } from './roll/adopt.js';
@@ -469,6 +470,20 @@ async function main(): Promise<number> {
   // Every queue/admission lands on the ledger; the board snapshot carries
   // the live gate view. Default admission is enabled and unlimited; operators set
   // turn caps independently of the resident-session budget.
+  // A minion turn that is granted its slot first restores the job's slim
+  // lanes (#427); so do a verification and a provider continuation (the
+  // service's stop ends its restore and the continuation), a release that
+  // saved a lane's work tells the owner, and a lane refused over submodule
+  // work or restored without what its setup made tells Gru. One factory
+  // makes these hooks (the tests run the same ones). Late-bound: the
+  // worktree manager and the notification center land below.
+  let laneManager: WorktreeManager | null = null;
+  const laneHooks = laneLifecycleHooks({
+    manager: () => laneManager,
+    notifications: { post: (input) => notifications.post(input) },
+    ledger,
+    stopSignal: serviceStop.signal,
+  });
   const pacing = resolvePacingPolicy(config.pacing, {
     record: (event) => {
       ledger.appendCustomEvent({
@@ -478,6 +493,7 @@ async function main(): Promise<number> {
         payload: event.payload,
       });
     },
+    prepareWorkerTurn: laneHooks.beforeWorkerTurn,
   });
   const engine = new BoardEngine({
     ledger,
@@ -1080,11 +1096,20 @@ async function main(): Promise<number> {
       });
     },
     onSwept: ({ worktree }) => {
-      // A completed sweep IS the evidence its pause notice asked for.
+      // A completed sweep IS the evidence its pause notice asked for, and
+      // the end of the lane's submodule-work and restore rows (#427).
       notifications.resolveIncidents(`worktree-sweep-paused:${worktree.id}:`, 'sweep-completed');
+      laneHooks.onSwept({ worktree });
     },
+    // A release that saved a lane's work tells the owner where it is
+    // (#427): one FYI board row per release, never FOR YOU. A release refused
+    // over submodule work, and a restore without what setup made, tell Gru.
+    onWorkSaved: laneHooks.onWorkSaved,
+    onSubmoduleWorkRefused: laneHooks.onSubmoduleWorkRefused,
+    onRestoreIncomplete: laneHooks.onRestoreIncomplete,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+  laneManager = worktreeManager;
   const worktreeServer = createWorktreeServer({
     config,
     manager: worktreeManager,
@@ -1495,6 +1520,9 @@ async function main(): Promise<number> {
                     slotReArm: slotReArmPort,
                     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
                     observeBlindTurn,
+                    // A slim lane is restored before the continuation (#427);
+                    // the service's stop ends its setup and the continuation.
+                    ensureReady: laneHooks.beforeContinuation,
                     log: (level, msg, fields) => logger.log(level, msg, fields),
                   },
                   waitId,
@@ -1520,9 +1548,22 @@ async function main(): Promise<number> {
     config,
     ledger,
     worktrees: worktreeManager,
+    // A slim lane gets its setup back before its verification runs (#427);
+    // the run's cancellation ends its setup.
+    ensureReady: laneHooks.beforeVerification,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   verificationView = () => verifyServer.view();
+  // Report-lane slimming (#427): a delivered, idle report job's lane loses
+  // its manifest's reclaim folders; the lane's setup brings them back.
+  const laneSlimmer = new ReportLaneSlimmer({
+    ledger,
+    bus,
+    worktrees: worktreeManager,
+    workerTurns: (jobId) => pacing.gate.workerTurnsFor(jobId),
+    verificationBusy: (jobId) => verifyServer.jobHasRun(jobId),
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
   onboardingBudget = () => verifyServer.budget();
   state.verify = verifyServer;
   // The ONE attach flow's HTTP surface (SPEC ruling 19, this lane): the
@@ -1676,6 +1717,9 @@ async function main(): Promise<number> {
   // for shutdown first, so a stop during a scan aborts its origin probes.
   state.onboarding = onboarding;
   startOnboarding(onboarding, (level, msg, fields) => logger.log(level, msg, fields));
+  // Lane slimming (#427) runs off the boot path and is never fatal.
+  state.laneSlimmer = laneSlimmer;
+  startLaneSlimmer(laneSlimmer, (level, msg, fields) => logger.log(level, msg, fields));
   if (silasSlot !== null) {
     // The driver starts after listen so its wake prompt carries the real
     // bound port (config port 0 = ephemeral); until then no sweeps run and

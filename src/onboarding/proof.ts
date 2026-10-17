@@ -1,19 +1,20 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
-import { appendFile, chmod, lstat, readdir, readFile, readlink, rm } from 'node:fs/promises';
+import { appendFile, readdir, readFile, readlink } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import type { EventRecord } from '../ledger/api.js';
 import type { LogLevel } from '../logger.js';
 import { repositoryGitEnv } from '../git-env.js';
 import { oneLineErrorText } from '../property/error-text.js';
-import { redactCredentials, redactCredentialWindow } from '../redaction.js';
+import { recordedTail, redactCredentials, utf8Tail, type OutputWindow } from '../redaction.js';
 import { CI_EVIDENCE_OMITTED_NOTICE } from '../review-inputs/ci-evidence.js';
 import { VerificationDisposedError, VerificationLockTimeoutError, verificationEnvironment, type VerificationLease } from '../verify/scheduler.js';
 import { ONBOARDING_PROOF_SCOPE, type VerificationBudget } from '../verify/server.js';
 import { psEnumeratorAsync } from '../worktrees/manager.js';
-import { applyWorktreeManifest, loadWorktreeManifest, MANIFEST_PATH, WorktreeSetupError, type SetupStreamTail, type WorktreeManifest } from '../worktrees/manifest.js';
+import { applyWorktreeManifest, loadWorktreeManifest, MANIFEST_PATH, WorktreeSetupError, type WorktreeManifest } from '../worktrees/manifest.js';
+import { reclaimIgnored, reclaimState, reclaimTrackedFiles, removeTree, treeBytes } from '../worktrees/reclaim.js';
 import { isCommitId, readOnboardingProof, type OnboardingProofResult, type ProofPath, type ProofReclaim, type ProofSetupStep, type ProofVerify } from './proof-record.js';
 
 // The record's shape and its one reader live in proof-record.ts (the ledger
@@ -92,10 +93,6 @@ export const SUSPICIOUSLY_FAST_MS = 1_000;
 /** Grace between SIGTERM and SIGKILL for a verify run past its bound, and
  * for what the proof ends before it measures (ProofProcesses). */
 const VERIFY_KILL_GRACE_MS = 5_000;
-/** Bytes of output kept for the record and the minion, after redaction. */
-const OUTPUT_TAIL_BYTES = 4 * 1024;
-/** Bytes of one stream's output the tail is cut from, after redaction. */
-const OUTPUT_WINDOW_BYTES = 16 * 1024;
 /** Bytes of verify's latest output kept, as setup keeps 64 KiB per stream
  * (worktrees/manifest.ts): what redaction runs over is bounded. Output that
  * fitted is redacted whole before anything is cut, so a one-line report up
@@ -153,81 +150,9 @@ function utf8Head(text: string, max: number): string {
   return bytes.subarray(0, end).toString('utf8');
 }
 
-/** The last `max` UTF-8 bytes of a text, cut at a character boundary. */
-function utf8Tail(text: string, max: number): string {
-  const bytes = Buffer.from(text, 'utf8');
-  if (bytes.length <= max) return text;
-  let start = bytes.length - max;
-  while (start < bytes.length && (bytes[start]! & 0xc0) === 0x80) start += 1;
-  return bytes.subarray(start).toString('utf8');
-}
-
-/** The first line of a tail that starts inside a line longer than the
- * tail: its words are kept rather than nothing, and it says so. */
-const MID_LINE = '(output tail starts mid-line)\n';
-
-/** What stands for a last line with no word boundary to start at: none of
- * it is shown, since its first bytes could be the back half of a token. */
-const longLine = (bytes: number): string => `(last line longer than ${String(Math.max(1, Math.floor(bytes / 1024)))} KiB, not shown)\n`;
-
-/** What stands for kept output whose first line the stream's earlier,
- * dropped output began: none of it is shown, and no size is claimed. */
-const CUT_MID_LINE = '(output before this was cut mid-line; not shown)\n';
-
-/** The mid-line fallback, for kept bytes whose cut has no line boundary
- * after it: everything up to and including their first whitespace is
- * dropped (a token the cut split never shows its back half); with no
- * whitespace followed by anything, nothing is. */
-function fromWord(kept: string): string | null {
-  const word = kept.search(/\s/u);
-  const rest = word === -1 ? '' : kept.slice(word + 1);
-  return rest.trim() === '' ? null : rest;
-}
-
-/** The last `max` UTF-8 bytes of a redacted text, starting at a whole
- * line. When its last line alone is longer than that, that line's last
- * bytes from their first word, after {@link MID_LINE}; with no word
- * boundary, {@link longLine}: a command that printed something never
- * records an empty tail. Only ever cut after redaction, so the cut never
- * parts a key from its value. */
-function boundedTail(text: string, max: number): string {
-  if (Buffer.byteLength(text, 'utf8') <= max) return text;
-  const tail = utf8Tail(text, max);
-  const line = tail.indexOf('\n');
-  const whole = line === -1 ? '' : tail.slice(line + 1);
-  if (whole.trim() !== '' || text.trim() === '') return whole;
-  const rest = fromWord(utf8Tail(text, max - Buffer.byteLength(MID_LINE, 'utf8')));
-  return rest === null ? longLine(max) : `${MID_LINE}${rest}`;
-}
-
-/** One stream's latest output, as a command keeps it. */
-type OutputWindow = SetupStreamTail;
-
-/**
- * The recorded output tail. Each stream's kept output is redacted whole
- * first (a key whose BEGIN line fell before it is redacted from its
- * start), and only then cut, so no cut GC makes parts a key from its value:
- * - output GC kept whole (none dropped, however long) keeps its last
- *   {@link OUTPUT_WINDOW_BYTES} ({@link boundedTail});
- * - output whose start was dropped before GC saw it keeps what follows
- *   the drop when the dropped part ended at a line break; when it did not,
- *   the first line is dropped after redaction (the earlier cut may have
- *   split a key's name, which no pattern then recognises), and with no
- *   line break at all only {@link CUT_MID_LINE} is recorded: a fragment
- *   the earlier cut made is never shown, not even from a word.
- * The streams together are then cut to the last {@link OUTPUT_TAIL_BYTES}
- * the same way. Exported for its tests.
- */
-export function recordedTail(windows: readonly OutputWindow[]): string {
-  const kept = windows.map((window) => {
-    const whole = redactCredentialWindow(window.text);
-    if (!window.truncated || window.startsAtLine) return boundedTail(whole, OUTPUT_WINDOW_BYTES);
-    const line = whole.indexOf('\n');
-    const rest = line === -1 ? '' : whole.slice(line + 1);
-    return rest.trim() === '' ? CUT_MID_LINE : boundedTail(rest, OUTPUT_WINDOW_BYTES);
-  }).filter((text) => text !== '');
-  return boundedTail(kept.join('\n'), OUTPUT_TAIL_BYTES);
-}
+// The recorded output tail ({@link recordedTail}) lives in src/redaction.ts
+// (#427: a lane restore records a setup failure the same way).
+export { recordedTail };
 
 class ProofStopping extends Error {
   constructor() {
@@ -241,8 +166,9 @@ class ProofStopping extends Error {
  * - `lane`: the clone and checkout, built as a lane's `worktree add` is
  *   (the user's and system config, so LFS and other filters give the
  *   content a lane gets), with no prompts;
- * - `measure`: status, check-ignore and ls-files, with no user or system
- *   config, so the repository's own ignore rules decide.
+ * - `measure`: status, with no user or system config, so the repository's
+ *   own ignore rules decide (the `reclaim` checks in reclaim.ts run
+ *   check-ignore and ls-files the same way).
  */
 type ProbeGitEnv = 'lane' | 'measure';
 
@@ -366,72 +292,6 @@ async function shareLfsLikeALane(repoPath: string, dir: string, head: string): P
   await appendFile(join(dir, '.git', 'config'), copied.map((entry) => configEntryText(entry.key, entry.value)).join(''), 'utf8');
 }
 
-/** Git refuses a pathspec that passes through a symbolic link (exit 128). */
-const beyondLink = (run: { readonly code: number; readonly stderr: string }): boolean => run.code === 128 && /beyond a symbolic link/u.test(run.stderr);
-
-/** Whether the repository's ignore rules ignore a path (an empty folder
- * included, which `git status` never lists); `link` when git refuses the
- * path because it passes through a link. */
-async function gitIgnores(dir: string, path: string): Promise<boolean | 'link'> {
-  const run = await probeGitExit(dir, ['check-ignore', '-q', '--', path], { timeoutMs: 120_000 });
-  if (run.code === 0) return true;
-  if (run.code === 1) return false;
-  if (beyondLink(run)) return 'link';
-  throw new Error(`git check-ignore exited ${String(run.code)}: ${oneLine(run.stderr)}`);
-}
-
-/** Tracked files at or under a path; `link` when git refuses the path
- * because it passes through a link. */
-async function trackedFiles(dir: string, path: string): Promise<number | 'link'> {
-  const run = await probeGitExit(dir, ['--literal-pathspecs', 'ls-files', '-z', '--', path], { timeoutMs: 120_000 });
-  if (beyondLink(run)) return 'link';
-  if (run.code !== 0) throw new Error(`git ls-files exited ${String(run.code)}: ${oneLine(run.stderr.trim() === '' ? '(no output)' : run.stderr)}`);
-  return run.stdout.split('\0').filter((entry) => entry !== '').length;
-}
-
-/** Where a reclaim entry (normalized `a/b`) stands, by an `lstat` of each
- * path prefix in turn: a link anywhere on the path is reported, never
- * walked through. */
-async function reclaimState(dir: string, entry: string): Promise<'absent' | 'link' | 'present'> {
-  const segments = entry.split('/');
-  for (let depth = 1; depth <= segments.length; depth += 1) {
-    let stat;
-    try {
-      stat = await lstat(join(dir, ...segments.slice(0, depth)));
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === 'ENOENT' || code === 'ENOTDIR') return 'absent';
-      throw error;
-    }
-    if (stat.isSymbolicLink()) return 'link';
-  }
-  return 'present';
-}
-
-/** Remove one checkout. Some setups leave read-only folders behind, so a
- * failed removal makes the tree writable (never following a link) and tries
- * once more. */
-async function removeProbe(dir: string): Promise<void> {
-  try {
-    await rm(dir, { recursive: true, force: true });
-    return;
-  } catch {
-    // retried below once the tree is writable
-  }
-  const stack = [dir];
-  while (stack.length > 0) {
-    const current = stack.pop()!;
-    try {
-      if (!(await lstat(current)).isDirectory()) continue;
-      await chmod(current, 0o700);
-      for (const name of await readdir(current)) stack.push(join(current, name));
-    } catch {
-      // gone, or not ours to change: the retry reports what stays
-    }
-  }
-  await rm(dir, { recursive: true, force: true });
-}
-
 /** Boot: remove every checkout a crash left in the probes folder. */
 export async function sweepOnboardingProbes(probesDir: string, log: Log = () => {}): Promise<void> {
   let names: string[];
@@ -444,40 +304,12 @@ export async function sweepOnboardingProbes(probesDir: string, log: Log = () => 
   for (const name of names) {
     const path = join(probesDir, name);
     try {
-      await removeProbe(path);
+      await removeTree(path);
       log('info', 'onboarding proof: a checkout left by an earlier run was removed', { path });
     } catch (error) {
       log('error', 'onboarding proof: a leftover checkout could not be removed; remove it by hand', { path, error: oneLine(error) });
     }
   }
-}
-
-/** Bytes under a path, by `lstat` (a link counts as itself, never its
- * target). `skip` names one child of the root to leave out. */
-async function treeBytes(root: string, skip: string | null = null): Promise<number> {
-  let total = 0;
-  const stack = [root];
-  while (stack.length > 0) {
-    const current = stack.pop()!;
-    let stat;
-    try {
-      stat = await lstat(current);
-    } catch {
-      continue;
-    }
-    if (!stat.isDirectory()) {
-      total += stat.size;
-      continue;
-    }
-    let names: string[];
-    try {
-      names = await readdir(current);
-    } catch {
-      continue;
-    }
-    for (const name of names) if (!(current === root && name === skip)) stack.push(join(current, name));
-  }
-  return total;
 }
 
 /** The repo-relative paths git reports ignored (a folder ends with `/`). */
@@ -950,7 +782,7 @@ export async function runOnboardingProof(input: OnboardingProofInput): Promise<O
   try {
     if (input.signal.aborted) return deferred('the service is stopping');
     mkdirSync(input.probesDir, { recursive: true, mode: 0o700 });
-    await removeProbe(dir);
+    await removeTree(dir);
     try {
       await probeGit(input.probesDir, ['clone', '--quiet', '--shared', '--no-checkout', input.repoPath, dir], { env: 'lane', marker: processes.env });
       await shareLfsLikeALane(input.repoPath, dir, input.head);
@@ -973,7 +805,7 @@ export async function runOnboardingProof(input: OnboardingProofInput): Promise<O
     // Nothing the proof started outlives it, nor writes while it is removed.
     await processes.end();
     try {
-      await removeProbe(dir);
+      await removeTree(dir);
     } catch (error) {
       log('error', 'onboarding proof: its checkout could not be removed; the next start removes it', { path: dir, error: oneLine(error) });
     }
@@ -1080,8 +912,8 @@ async function prove(input: OnboardingProofInput, dir: string, log: Log, process
       linked();
       continue;
     }
-    const tracked = await trackedFiles(dir, entry);
-    const ignored = state === 'present' ? await gitIgnores(dir, entry) : false;
+    const tracked = await reclaimTrackedFiles(dir, entry);
+    const ignored = state === 'present' ? await reclaimIgnored(dir, entry) : false;
     if (tracked === 'link' || ignored === 'link') {
       linked();
       continue;

@@ -55,6 +55,15 @@ export interface RecoveryClaimDeps {
    * prohibited read during a resume invalidates blind coverage. Wired by the
    * service to `DispatchService.observeBlindSession`; absent = no observation. */
   readonly observeBlindTurn?: (jobId: string, sessionFile: string | null) => void;
+  /** #427: restores the job's slim lanes before the continuation's prompt
+   * (the restore every other minion turn gets from the worker gate). This
+   * path takes no worker slot by design (no second capacity counter, see
+   * above), so it calls the restore directly; wired by the service to
+   * `laneLifecycleHooks().beforeContinuation`, whose `WorktreeManager.
+   * ensureReady` never rejects and whose stop (the service's) ends a running
+   * setup. `'stopped'`: the service is stopping, so the continuation
+   * neither spawns nor prompts. */
+  readonly ensureReady?: (jobId: string) => Promise<'ready' | 'stopped'>;
 }
 
 /** The fresh provider-recovery worker's contract half: the effective
@@ -315,7 +324,22 @@ async function claimJobMinion(
   const admitted = { recorded: false };
   let releaseAllowed = true;
   let result: Awaited<ReturnType<typeof rebriefFreshMinion>>;
+  let stopped = false;
   try {
+    // A slim lane gets its setup back before the continuation runs in it
+    // (#427). The claim above already makes the lane busy, so no slim can
+    // run again before the prompt; a failed restore is recorded by the
+    // restore itself and the continuation proceeds. A service stop ends
+    // the restore and the continuation with it: nothing spawns or prompts
+    // during shutdown.
+    if (deps.ensureReady !== undefined) {
+      try {
+        stopped = (await deps.ensureReady(job.id)) === 'stopped';
+      } catch (error) {
+        deps.log?.('error', 'lane restore before a provider continuation failed; the continuation proceeds', { wait_id: wait.id, job: job.id, error: String(error) });
+      }
+    }
+    if (stopped) throw new ProviderContinuationIneligibleError(`provider continuation refused — the service is stopping, so nothing was spawned for job "${job.id}"`);
     result = await rebriefFreshMinion({
       registry: deps.registry,
       ledger: deps.ledger,
@@ -376,10 +400,14 @@ async function claimJobMinion(
         payload: { wait_id: wait.id, by, stage: cleanupUnknown ? 'cleanup' : 'authorization', error: String(error).slice(0, 300) } });
       deps.log?.(cleanupUnknown ? 'error' : 'info', cleanupUnknown
         ? 'provider continuation cleanup unknown — ownership retained; stop the returned minion before reconciliation'
-        : 'provider continuation authority changed — saved prompt not delivered', { wait_id: wait.id, job: wait.jobId, error: String(error) });
+        : stopped
+          ? 'provider continuation not started — the service is stopping; saved prompt not delivered'
+          : 'provider continuation authority changed — saved prompt not delivered', { wait_id: wait.id, job: wait.jobId, error: String(error) });
       return { outcome: 'skipped', waitId: wait.id, why: cleanupUnknown
         ? 'continuation cleanup unknown after atomic claim (ownership retained; no automatic replay)'
-        : 'continuation authority changed after atomic claim (recorded; no automatic replay)' };
+        : stopped
+          ? 'the service stopped before the continuation spawned (recorded; no automatic replay)'
+          : 'continuation authority changed after atomic claim (recorded; no automatic replay)' };
     }
     // The claim won but the spawn/continuation failed DETERMINISTICALLY.
     // Never blind-retry (crash/ambiguous delivery must be reconciled, not
