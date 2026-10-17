@@ -8,7 +8,7 @@ import type { EventRecord } from '../ledger/api.js';
 import type { LogLevel } from '../logger.js';
 import { repositoryGitEnv } from '../git-env.js';
 import { oneLineErrorText } from '../property/error-text.js';
-import { redactCredentials, redactCredentialWindow } from '../redaction.js';
+import { REDACTION_PLACEHOLDER, redactCredentials, redactCredentialWindow } from '../redaction.js';
 import { CI_EVIDENCE_OMITTED_NOTICE } from '../review-inputs/ci-evidence.js';
 import { VerificationDisposedError, VerificationLockTimeoutError, verificationEnvironment, type VerificationLease } from '../verify/scheduler.js';
 import { ONBOARDING_PROOF_SCOPE, type VerificationBudget } from '../verify/server.js';
@@ -209,24 +209,29 @@ type OutputWindow = SetupStreamTail;
  * cut at a line. The bound holds after redaction, and a cut never shows
  * half a credential: a window that starts mid-stream (cut here, or a setup
  * stream whose earlier chunks were dropped, however short what is left) is
- * redacted from its first whole line, or, when one line fills it, from its
- * first word, and the tail is marked as starting mid-line; one with no word
- * boundary at all shows none of that line ({@link longLine}).
+ * redacted whole first, so dropping its first line or word never parts a
+ * key from its value; it then starts at its first whole line, or, when one
+ * line fills it, at its first word, and the tail is marked as starting
+ * mid-line; one with no word boundary at all shows none of that line
+ * ({@link longLine}). A window whose start the redaction replaced (a key
+ * whose BEGIN line fell before it) has no partial first line, and keeps
+ * that placeholder. Exported for its tests.
  */
-function recordedTail(windows: readonly OutputWindow[]): string {
-  let midLine = false;
+export function recordedTail(windows: readonly OutputWindow[]): string {
   const redacted = windows.map((window) => {
     const cut = Buffer.byteLength(window.text, 'utf8') > OUTPUT_WINDOW_BYTES;
     const text = cut ? utf8Tail(window.text, OUTPUT_WINDOW_BYTES) : window.text;
-    if (!cut && !window.truncated) return redactCredentialWindow(text);
-    const whole = fromBoundary(text);
-    if (whole.trim() !== '' || text.trim() === '') return redactCredentialWindow(whole);
-    const rest = fromWord(text);
-    if (rest === null) return longLine(Buffer.byteLength(text, 'utf8'));
-    midLine = true;
-    return redactCredentialWindow(rest);
+    const whole = redactCredentialWindow(text);
+    if (!cut && !window.truncated) return whole;
+    if (whole.startsWith(REDACTION_PLACEHOLDER) && !text.startsWith(REDACTION_PLACEHOLDER)) return whole;
+    const fromLine = fromBoundary(whole);
+    if (fromLine.trim() !== '' || whole.trim() === '') return fromLine;
+    // One line longer than the window, cut before it was redacted: the cut
+    // may fall inside a key's name (`sword": "…"`), which no pattern then
+    // recognises, so none of that line is shown.
+    return longLine(Buffer.byteLength(text, 'utf8'));
   }).filter((text) => text !== '');
-  return boundedTail(redacted.join('\n'), OUTPUT_TAIL_BYTES, midLine);
+  return boundedTail(redacted.join('\n'), OUTPUT_TAIL_BYTES, false);
 }
 
 class ProofStopping extends Error {
@@ -326,7 +331,9 @@ function configEntryText(key: string, value: string | null): string {
  * effective config (every scope, its `include` and `includeIf` resolved
  * against the repository's own git dir) that an LFS smudge and its auth
  * read ({@link sharedLaneConfig}), less what the probe already reads (the
- * user's and system config: nothing is doubled), and its LFS store is the
+ * user's and system config: nothing is doubled; the repository's origin is
+ * written first, so an `includeIf "hasconfig:remote.*.url:…"` that matches
+ * it is read by the probe already and never copied), and its LFS store is the
  * repository's own (its `lfs.storage`, else `<common dir>/lfs`): smudge
  * reads the local store first and fetches only missing objects, with the
  * repository's own auth, into that same store. Only the probe's own config
@@ -341,11 +348,16 @@ async function shareLfsLikeALane(repoPath: string, dir: string, head: string): P
   const commonDir = resolve(repoPath, (await probeGit(repoPath, ['rev-parse', '--git-common-dir'], { env: 'lane', timeoutMs: 30_000 })).trim());
   const storage = await repoConfig(repoPath, 'lfs.storage');
   // The clone's own origin is the managed repository's path: the
-  // repository's origin, when it has one, replaces it.
-  if (entries.some((entry) => entry.key === 'remote.origin.url')) await probeGit(dir, ['config', '--unset-all', 'remote.origin.url']);
+  // repository's origin, when it has one, replaces it, before the probe's
+  // config is read (an include conditioned on the origin then applies).
+  const origin = entries.filter((entry) => entry.key === 'remote.origin.url');
+  if (origin.length > 0) {
+    await probeGit(dir, ['config', '--unset-all', 'remote.origin.url']);
+    await appendFile(join(dir, '.git', 'config'), origin.map((entry) => configEntryText(entry.key, entry.value)).join(''), 'utf8');
+  }
   // What the probe reads already (the user's and system config, the
-  // clone's own) is not copied again: a doubled `http.extraheader` would
-  // send its header twice.
+  // clone's own, the origin just written and what includes it) is not
+  // copied again: a doubled `http.extraheader` would send its header twice.
   const held = new Map<string, number>();
   const id = (entry: { readonly key: string; readonly value: string | null }): string => `${entry.key}\0${entry.value ?? '\0'}`;
   for (const entry of configEntries(await effective(dir))) held.set(id(entry), (held.get(id(entry)) ?? 0) + 1);
@@ -480,8 +492,9 @@ async function ignoredPaths(dir: string): Promise<readonly string[]> {
 }
 
 /** Setup's thrown message is `<what failed>\noutput tail:\n<tail>`; the
- * recorded tail is cut from the raw streams the error keeps. */
-function splitFailure(error: unknown): { readonly reason: string; readonly tail: string } {
+ * recorded tail is cut from the raw streams the error keeps. Exported for
+ * its tests. */
+export function splitFailure(error: unknown): { readonly reason: string; readonly tail: string } {
   const message = error instanceof Error ? error.message : String(error);
   const at = message.indexOf('\noutput tail:\n');
   const reason = oneLine(at === -1 ? message : message.slice(0, at));
@@ -503,12 +516,16 @@ const pause = (ms: number): Promise<void> => new Promise((wake) => { setTimeout(
 
 /** How long a listing of processes may run before it counts as failed. */
 const LISTING_TIMEOUT_MS = 30_000;
-/** How long {@link endProcesses} waits for what it SIGKILLed to be gone. */
+/** How long, past the grace, {@link endProcesses} waits for what it ended to be gone. */
 const KILL_SETTLE_MS = 5_000;
+/** How often {@link endProcesses} lists the process table while it waits. */
+const KILL_POLL_MS = 100;
 
 /** One process as the process table shows it. */
-interface ProcessRow {
+export interface ProcessRow {
   readonly pid: number;
+  /** Its process group. */
+  readonly pgid: number;
   /** Ended and not yet reaped: it counts as gone. */
   readonly zombie: boolean;
 }
@@ -527,26 +544,32 @@ async function procRows(keep: (pid: number, pgid: number) => boolean, pids?: rea
       continue; // ended meanwhile
     }
     const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-    if (keep(Number(name), Number(fields[2]))) rows.push({ pid: Number(name), zombie: fields[0] === 'Z' });
+    if (keep(Number(name), Number(fields[2]))) rows.push({ pid: Number(name), pgid: Number(fields[2]), zombie: fields[0] === 'Z' });
   }
   return rows;
 }
 
-/** Elsewhere: `ps -o pid=,stat= <selection>`. Exit 1 with no output is no
- * process (macOS `ps` answers so when none is selected). */
+/** Elsewhere: `ps -o pid=,pgid=,stat= <selection>`. Exit 1 with no output
+ * is no process (macOS `ps` answers so when none is selected). */
 function psRows(selection: readonly string[]): Promise<readonly ProcessRow[]> {
   return new Promise((resolveRows, reject) => {
-    execFile('ps', ['-o', 'pid=,stat=', ...selection], { encoding: 'utf8', timeout: LISTING_TIMEOUT_MS }, (error, stdout, stderr) => {
+    execFile('ps', ['-o', 'pid=,pgid=,stat=', ...selection], { encoding: 'utf8', timeout: LISTING_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024 }, (error, stdout, stderr) => {
       if (error !== null && !(error.code === 1 && stdout.trim() === '' && stderr.trim() === '')) {
         reject(new Error(`ps could not list ${selection.join(' ')}: ${oneLine(error)}`));
         return;
       }
       resolveRows(stdout.split('\n').flatMap((line) => {
-        const row = /^\s*(\d+)\s+(\S+)/u.exec(line);
-        return row === null ? [] : [{ pid: Number(row[1]), zombie: row[2]!.startsWith('Z') }];
+        const row = /^\s*(\d+)\s+(\d+)\s+(\S+)/u.exec(line);
+        return row === null ? [] : [{ pid: Number(row[1]), pgid: Number(row[2]), zombie: row[3]!.startsWith('Z') }];
       }));
     });
   });
+}
+
+/** The whole process table in one listing (Linux `/proc`, elsewhere
+ * `ps -A`). Throws when it cannot be read. */
+function processTable(): Promise<readonly ProcessRow[]> {
+  return process.platform === 'linux' ? procRows(() => true) : psRows(['-A']);
 }
 
 /** The members of a process group (Linux `/proc`, elsewhere
@@ -570,61 +593,128 @@ async function gone(target: number): Promise<boolean> {
   }
 }
 
-/** The targets still not gone. */
-async function living(targets: readonly number[]): Promise<readonly number[]> {
-  const left: number[] = [];
-  for (const target of targets) if (!(await gone(target))) left.push(target);
-  return left;
+/** Whether a target (a pid, or a negated pgid) is gone from a listing:
+ * nothing by that id is in it, or all that is is a zombie. */
+const goneFrom = (rows: readonly ProcessRow[], target: number): boolean =>
+  rows.every((row) => (target < 0 ? row.pgid !== -target : row.pid !== target) || row.zombie);
+
+/** The targets still not gone, by one listing of the process table for all
+ * of them, cut short at `deadline`: a target no process by that id answers
+ * is gone without it, and a table that cannot be read (or not in time)
+ * leaves the rest living. */
+async function living(targets: readonly number[], table: () => Promise<readonly ProcessRow[]>, deadline: number): Promise<readonly number[]> {
+  const present = targets.filter((target) => signalProcess(target, 0));
+  if (present.length === 0) return present;
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const rows = await Promise.race([table(), new Promise<null>((resolveLate) => { timer = setTimeout(() => resolveLate(null), Math.max(0, deadline - Date.now())); })]);
+    return rows === null ? present : present.filter((target) => !goneFrom(rows, target));
+  } catch {
+    return present;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-/** End processes or groups: SIGTERM, then SIGKILL to what still lives after
- * the grace, then wait (bounded) until every SIGKILLed target is gone, a
+/** End processes or groups (a negated pgid): SIGTERM, then SIGKILL to what
+ * still lives after the grace, then wait until every target is gone, a
  * zombie counting as gone, so a caller that judges them next sees them
- * gone. Returns what is still there after that bound. */
-async function endProcesses(targets: readonly number[], graceMs: number): Promise<readonly number[]> {
+ * gone. Each poll lists the process table once for every target, and the
+ * whole wait, a slow listing included, ends at the grace plus
+ * {@link KILL_SETTLE_MS} of wall clock. Returns what is still there at that
+ * deadline, which the caller logs. Exported for its tests (`table`: the
+ * one listing each poll makes). */
+export async function endProcesses(targets: readonly number[], graceMs: number, table: () => Promise<readonly ProcessRow[]> = processTable): Promise<readonly number[]> {
+  const killAt = Date.now() + graceMs;
+  const deadline = killAt + KILL_SETTLE_MS;
   let left: readonly number[] = targets.filter((target) => signalProcess(target, 'SIGTERM'));
-  const deadline = Date.now() + graceMs;
-  while ((left = await living(left)).length > 0 && Date.now() < deadline) await pause(25);
-  for (const target of left) signalProcess(target, 'SIGKILL');
-  const settled = Date.now() + KILL_SETTLE_MS;
-  while ((left = await living(left)).length > 0 && Date.now() < settled) await pause(25);
+  let killed = false;
+  while (left.length > 0) {
+    left = await living(left, table, deadline);
+    if (left.length === 0) break;
+    if (!killed && Date.now() >= killAt) {
+      for (const target of left) signalProcess(target, 'SIGKILL');
+      killed = true;
+    } else if (Date.now() >= deadline) {
+      break;
+    }
+    await pause(KILL_POLL_MS);
+  }
   return left;
 }
 
-/** Same-user processes whose environment could not be read, already logged
- * (each once). */
-const unreadableLogged = new Set<number>();
+/** Reads one process's environment (Linux `/proc/<pid>/environ`). */
+export type EnvironReader = (pid: number) => Promise<string>;
 
-/** The pids (never this process's own) whose environment carries a probe
- * marker `matches` accepts. Linux reads each `/proc/<pid>/environ` (what
- * `ps e` prints); elsewhere `ps -axEww` prints each environment after its
- * command (on macOS `-E` shows the environment; `-e` selects every
- * process). A process that scrubbed its environment is never found, nor is
- * any where the platform hides other processes' environments (current
- * macOS shows a process only its own), nor, on Linux, one of this user's
- * whose environment cannot be read (non-dumpable: ssh-agent, gpg-agent),
- * which is logged once at warn. Throws when processes cannot be listed. */
-async function markedProcesses(matches: (marker: string) => boolean, log: Log): Promise<readonly number[]> {
+const readEnviron: EnvironReader = (pid) => readFile(join('/proc', String(pid), 'environ'), 'utf8');
+
+/** Whether an environment's entries carry a probe marker `matches` accepts. */
+function markedEnvironment(entries: readonly string[], matches: (marker: string) => boolean): boolean {
   const prefix = `${ONBOARDING_PROBE_ENV}=`;
-  const marked = (entries: readonly string[]): boolean => entries.some((entry) => entry.startsWith(prefix) && matches(entry.slice(prefix.length)));
-  const pids: number[] = [];
-  if (process.platform === 'linux') {
-    for (const name of await readdir('/proc')) {
-      if (!/^\d+$/u.test(name) || Number(name) === process.pid) continue;
+  return entries.some((entry) => entry.startsWith(prefix) && matches(entry.slice(prefix.length)));
+}
+
+/**
+ * Linux: which of `pids` carry a probe marker `matches` accepts, read from
+ * each one's environment. A process of this user whose environment cannot
+ * be read (non-dumpable, as ssh-agent and gpg-agent are) is logged at
+ * debug only: any of the user's processes may be one, so it is no lead.
+ * The whole pass is bounded by `timeoutMs`: a read that hangs (a process
+ * stuck in the kernel, on a hung NFS mount, say) is abandoned, never
+ * awaited, and the listing fails. Exported for its tests (`read`).
+ */
+export async function environMarkedPids(pids: readonly number[], matches: (marker: string) => boolean, log: Log, opts: {
+  readonly timeoutMs?: number;
+  readonly read?: EnvironReader;
+} = {}): Promise<readonly number[]> {
+  const timeoutMs = opts.timeoutMs ?? LISTING_TIMEOUT_MS;
+  const read = opts.read ?? readEnviron;
+  let abandoned = false;
+  const pass = async (): Promise<readonly number[]> => {
+    const found: number[] = [];
+    for (const pid of pids) {
+      if (abandoned) break;
       let environ: string;
       try {
-        environ = await readFile(join('/proc', name, 'environ'), 'utf8');
+        environ = await read(pid);
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'EACCES' && !unreadableLogged.has(Number(name)) && await ownedByThisUser(Number(name))) {
-          unreadableLogged.add(Number(name));
-          log('warn', 'onboarding proof: a process of this user hides its environment (non-dumpable, as ssh-agent is), so its marker cannot be read; if a proof started it, only its process group or its working directory in the checkout can end it', { pid: Number(name) });
+        if ((error as NodeJS.ErrnoException).code === 'EACCES' && await ownedByThisUser(pid)) {
+          log('debug', 'onboarding proof: a process of this user hides its environment (non-dumpable), so its marker cannot be read', { pid });
         }
         continue; // ended meanwhile, or another user's
       }
-      if (marked(environ.split('\0'))) pids.push(Number(name));
+      if (markedEnvironment(environ.split('\0'), matches)) found.push(pid);
     }
-    return pids;
+    return found;
+  };
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([pass(), new Promise<never>((_found, reject) => {
+      timer = setTimeout(() => {
+        abandoned = true;
+        reject(new Error(`the process environments could not be read within ${String(timeoutMs)} ms`));
+      }, timeoutMs);
+    })]);
+  } finally {
+    clearTimeout(timer);
   }
+}
+
+/** The pids (never this process's own) whose environment carries a probe
+ * marker `matches` accepts. Linux reads each `/proc/<pid>/environ` (what
+ * `ps e` prints), bounded ({@link environMarkedPids}); elsewhere
+ * `ps -axEww` prints each environment after its command (on macOS `-E`
+ * shows the environment; `-e` selects every process). A process that
+ * scrubbed its environment is never found, nor is any where the platform
+ * hides other processes' environments (current macOS shows a process only
+ * its own), nor, on Linux, one of this user's whose environment cannot be
+ * read (non-dumpable). Throws when processes cannot be listed in time. */
+async function markedProcesses(matches: (marker: string) => boolean, log: Log): Promise<readonly number[]> {
+  if (process.platform === 'linux') {
+    const pids = (await readdir('/proc')).filter((name) => /^\d+$/u.test(name)).map(Number).filter((pid) => pid !== process.pid);
+    return environMarkedPids(pids, matches, log);
+  }
+  const pids: number[] = [];
   const listing = await new Promise<string>((resolveListing, reject) => {
     execFile('ps', ['-axEww', '-o', 'pid=,command='], { encoding: 'utf8', timeout: LISTING_TIMEOUT_MS, maxBuffer: 256 * 1024 * 1024 }, (error, stdout) => {
       if (error !== null) reject(new Error(`ps could not list processes: ${oneLine(error)}`));
@@ -634,7 +724,7 @@ async function markedProcesses(matches: (marker: string) => boolean, log: Log): 
   for (const line of listing.split('\n')) {
     const row = /^\s*(\d+)\s+(.*)$/su.exec(line);
     if (row === null || Number(row[1]) === process.pid) continue;
-    if (marked(row[2]!.split(/\s+/u))) pids.push(Number(row[1]));
+    if (markedEnvironment(row[2]!.split(/\s+/u), matches)) pids.push(Number(row[1]));
   }
   return pids;
 }
@@ -655,9 +745,14 @@ async function ownedByThisUser(pid: number): Promise<boolean> {
  * lane's processes (Linux `/proc`, macOS `lsof`), off the event loop and
  * bounded. It finds a daemon that left its group and scrubbed its
  * environment, on every platform, while its cwd stays in the folder.
- * Rejects when processes cannot be listed in time. */
-async function rootedProcesses(folder: string): Promise<readonly number[]> {
-  return (await psEnumeratorAsync(folder, { timeoutMs: LISTING_TIMEOUT_MS })).map((entry) => entry.pid);
+ * Rejects when processes cannot be listed in time; when only their working
+ * directories cannot (macOS `lsof`), that is logged and the command-line
+ * matches still count. */
+async function rootedProcesses(folder: string, log: Log): Promise<readonly number[]> {
+  const onCwdError = (error: unknown): void => {
+    log('error', 'onboarding proof: the working directories of processes could not be listed, so processes are matched by their command line alone', { error: oneLine(error) });
+  };
+  return (await psEnumeratorAsync(folder, { timeoutMs: LISTING_TIMEOUT_MS, onCwdError })).map((entry) => entry.pid);
 }
 
 /** The pids two listings name, each listed once; a listing that fails is
@@ -721,7 +816,7 @@ class ProofProcesses {
   private ours(what: string): Promise<readonly number[]> {
     return strayPids([
       ['the processes carrying its marker', () => markedProcesses((marker) => marker === this.marker, this.log)],
-      ['the processes rooted in its checkout', () => rootedProcesses(this.dir)],
+      ['the processes rooted in its checkout', () => rootedProcesses(this.dir, this.log)],
     ], this.log, what);
   }
 
@@ -1126,7 +1221,7 @@ function instanceProcesses(probesDir: string, log: Log, what: string): Promise<r
   const instance = `${onboardingProbeInstance(probesDir)}.`;
   return strayPids([
     ['the processes carrying this instance\'s marker', () => markedProcesses((marker) => marker.startsWith(instance), log)],
-    ['the processes rooted under the probes folder', () => rootedProcesses(probesDir)],
+    ['the processes rooted under the probes folder', () => rootedProcesses(probesDir, log)],
   ], log, what);
 }
 

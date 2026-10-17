@@ -35,9 +35,13 @@ const KEYWORD_KEYS = [
 
 /** The keys that are a credential's however the identifier begins, as long
  * as they end it (`PGPASSWORD`, `dbPassword`, `githubToken`, AWS STS's
- * `SessionToken` and `SecretAccessKey`). A key that only starts with one of
- * them (`tokens`, `AccessKeyId`) is not one. */
-const KEYWORD_ENDINGS = ['secret[_-]?access[_-]?key', 'password', 'token', 'secret'].join('|');
+ * `SessionToken` and `SecretAccessKey`, `stripeSecretKey`,
+ * `googleMapsApiKey`, `signingPrivateKey`, `MYSQL_PWD`, `db_passwd`). A key
+ * that only starts with one of them (`tokens`, `AccessKeyId`) is not one. */
+const KEYWORD_ENDINGS = [
+  'secret[_-]?access[_-]?key', 'secret[_-]?key', 'api[_-]?key', 'private[_-]?key', 'access[_-]?token', 'auth[_-]?token',
+  'password', 'passwd', 'pwd', 'token', 'secret',
+].join('|');
 
 /** A PEM private key header or footer word run: `PRIVATE KEY` alone
  * (PKCS#8), or after algorithm and format words (`RSA`, `EC`, `OPENSSH`,

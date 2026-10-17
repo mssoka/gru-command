@@ -85,8 +85,19 @@ export const ONBOARDING_PROOF_COMMENT_ATTEMPTS = 3;
  * unprocessable): recorded as one that cannot be posted at once, never
  * retried. Throttling never is, whatever its status (a secondary limit or
  * the abuse detection answers 403, content created too fast 422): it is
- * retried at every reconcile and never counts as a failed attempt. */
+ * retried once per reconcile and never counts as a failed attempt. */
 export const ONBOARDING_PROOF_COMMENT_REFUSED_STATUSES: readonly number[] = [403, 404, 410, 422];
+/** Reconciles (about an hour) in which GitHub throttled a head's comment
+ * (counted once per reconcile, apart from failed attempts) before it is
+ * recorded as one that cannot be posted. */
+export const ONBOARDING_PROOF_COMMENT_THROTTLED_RECONCILES = 12;
+/** A legacy attempt's comment (an older build recorded the attempt with no
+ * nonce) is taken by that build's marker only when GitHub created it
+ * within this long after the attempt was recorded. */
+export const ONBOARDING_PROOF_LEGACY_COMMENT_WINDOW_MS = 10 * 60_000;
+/** How much earlier than its attempt's record a legacy comment's creation
+ * time may read: GitHub gives whole seconds, and the clocks differ. */
+const LEGACY_COMMENT_SKEW_MS = 60_000;
 
 /** Why a head is stuck, in the order a row names them (the first is the row's reason). */
 export const ONBOARDING_PROOF_STUCK_REASONS = [
@@ -231,6 +242,8 @@ export class OnboardingService {
   private readonly deferrals = new Map<string, Spaced & { readonly head: string; readonly reason: string }>();
   /** Failed comment attempts per `job\nhead`. */
   private readonly commentAttempts = new Map<string, Spaced>();
+  /** Reconciles in which GitHub throttled the comment, per `job\nhead`. */
+  private readonly commentThrottles = new Map<string, Spaced>();
   /** Directive attempts the lane refused before any row, per `job\nhead`. */
   private readonly directRefusals = new Map<string, Spaced & { readonly reason: string }>();
   /** The reconcile in which a failed head's settled directive was first seen still standing, per `job\nhead`. */
@@ -946,8 +959,9 @@ export class OnboardingService {
    * process's memory never clears because a restart emptied it: a deferral
    * clears only on a proof of its head; an unadmitted directive once the
    * lane admitted it (live or settled); an unanswered failure on a newer
-   * delivery or a new directive turn on the job. The other reasons rest on
-   * the ledger, so holding no more is their clear.
+   * delivery, or a turn of this proof's own directive taken after the row
+   * (an unrelated directive on the job, Silas's or an ops one, is none).
+   * The other reasons rest on the ledger, so holding no more is their clear.
    */
   private reasonCleared(jobId: string, row: ProofAttentionRow, directive: DirectiveStanding | null, newestSeq: number): boolean {
     switch (row.reason) {
@@ -956,11 +970,21 @@ export class OnboardingService {
       case 'unadmitted':
         return directive === 'live' || directive === 'settled';
       case 'unanswered':
-        return newestSeq > row.deliverySeq || directive === 'live' ||
-          this.opts.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length > 0;
+        return newestSeq > row.deliverySeq || (row.head !== null && this.proofDirectiveSince(jobId, row.head, row.postedSeq));
       default:
         return true;
     }
+  }
+
+  /** Whether the lane took a directive of this head's proof (holder
+   * `onboarding-proof`, one of its request ids), live or settled, accepted
+   * at or after the event seq `seq`. */
+  private proofDirectiveSince(jobId: string, head: string, seq: number): boolean {
+    for (let attempt = 1; attempt <= ONBOARDING_PROOF_DIRECTIVE_ATTEMPTS; attempt += 1) {
+      const row = this.opts.ledger.getDirective(onboardingProofDirectiveId(jobId, head, attempt));
+      if (row !== null && row.claim?.holder === 'onboarding-proof' && row.state !== 'failed' && row.state !== 'retired' && row.baselineSeq >= seq) return true;
+    }
+    return false;
   }
 
   /** A failed head's directive settled while the newest delivery still
@@ -996,9 +1020,13 @@ export class OnboardingService {
    * that cannot be posted; so, at once, is an unreadable record or one
    * GitHub refuses for good ({@link ONBOARDING_PROOF_COMMENT_REFUSED_STATUSES}).
    * Throttling (a rate limit, the abuse detection, content created too
-   * fast) is retried at every reconcile and spends no attempt. An attempt
-   * recorded before markers carried a nonce is looked up by the marker that
-   * build posted ({@link onboardingProofLegacyMarker}). */
+   * fast) spends no attempt: it is retried once per reconcile, never on a
+   * trigger between two, logged at warn the first time, and after
+   * {@link ONBOARDING_PROOF_COMMENT_THROTTLED_RECONCILES} throttled
+   * reconciles recorded as one that cannot be posted. An attempt recorded
+   * before markers carried a nonce is looked up by the marker that build
+   * posted ({@link onboardingProofLegacyMarker}), on a comment created soon
+   * after it. */
   private async commentProof(record: ProofRecord, proof: OnboardingProofOptions): Promise<void> {
     if (record.comment !== null) return;
     const { repo, jobId, head } = record;
@@ -1016,17 +1044,19 @@ export class OnboardingService {
     }
     const target = { repo: { host: pr.host, owner: pr.owner, repo: pr.repo }, number: pr.number };
     const key = `${jobId}\n${head}`;
+    // Throttled in this reconcile already: the next one retries it.
+    if (this.commentThrottles.get(key)?.countedAt === this.reconciles) return;
+    const settle = (): void => {
+      this.commentAttempts.delete(key);
+      this.commentThrottles.delete(key);
+    };
     try {
-      if (record.attemptNonces.length > 0 || record.legacyAttempt) {
-        const markers = [
-          ...record.attemptNonces.map((nonce) => onboardingProofMarker(jobId, head, nonce)),
-          ...(record.legacyAttempt ? [onboardingProofLegacyMarker(jobId, head)] : []),
-        ];
-        const found = await this.markedComment(target, markers, proof);
+      if (record.attemptNonces.length > 0 || record.legacyAttempts.length > 0) {
+        const found = await this.markedComment(target, record, proof);
         if (found !== null) {
           this.store.record(ONBOARDING_EVENTS.proofCommented, { repo, job_id: jobId, head, comment_id: found.id, comment_url: found.url,
             detail: 'found by its marker after an interrupted post' }, jobId);
-          this.commentAttempts.delete(key);
+          settle();
           return;
         }
       }
@@ -1034,13 +1064,26 @@ export class OnboardingService {
       this.store.record(ONBOARDING_EVENTS.proofCommentAttempt, { repo, job_id: jobId, head, pr_url: prUrl, nonce }, jobId);
       const posted = await proof.github.commentOnPull({ ...target, body: renderOnboardingProofComment(jobId, record.result, nonce) });
       this.store.record(ONBOARDING_EVENTS.proofCommented, { repo, job_id: jobId, head, comment_id: posted.id, comment_url: posted.url, detail: 'posted' }, jobId);
-      this.commentAttempts.delete(key);
+      settle();
     } catch (error) {
       const reason = redactCredentials(oneLineErrorText(error instanceof Error ? error.message : error, 400));
       if (ghRateLimited(error)) {
-        // Throttling clears on its own: retried at every reconcile, and it
-        // never spends an attempt.
-        this.log('warn', 'onboarding proof comment not posted: GitHub is throttling GC; the next reconcile retries it (no attempt spent)', { repo, job: jobId, head, error: reason });
+        // Throttling spends no attempt and backs off to the next reconcile,
+        // within its own bound.
+        const throttled = this.spaced(this.commentThrottles.get(key));
+        if (throttled.count < ONBOARDING_PROOF_COMMENT_THROTTLED_RECONCILES) {
+          this.commentThrottles.set(key, throttled);
+          this.log(throttled.count === 1 ? 'warn' : 'debug', 'onboarding proof comment not posted: GitHub is throttling GC; the next reconcile retries it (no attempt spent)', {
+            repo, job: jobId, head, throttled_reconciles: throttled.count, error: reason,
+          });
+          return;
+        }
+        settle();
+        this.store.record(ONBOARDING_EVENTS.proofCommented, { repo, job_id: jobId, head, comment_id: null, comment_url: null,
+          detail: 'cannot be posted: GitHub kept throttling the comment' }, jobId);
+        this.log('error', `onboarding proof comment cannot be posted: GitHub throttled it in ${String(throttled.count)} reconciles; the proof stands in the ledger and is not posted`, {
+          repo, job: jobId, head, error: reason,
+        });
         return;
       }
       const status = ghHttpStatus(error);
@@ -1051,7 +1094,7 @@ export class OnboardingService {
         this.log('warn', 'onboarding proof comment not posted; the next reconcile looks for its marker, then retries', { repo, job: jobId, head, attempt: attempts.count, error: reason });
         return;
       }
-      this.commentAttempts.delete(key);
+      settle();
       this.store.record(ONBOARDING_EVENTS.proofCommented, { repo, job_id: jobId, head, comment_id: null, comment_url: null, detail: `cannot be posted: ${reason}` }, jobId);
       this.log('error', refused
         ? `onboarding proof comment cannot be posted: GitHub refused it (HTTP ${String(status)}); the proof stands in the ledger and is not posted`
@@ -1066,10 +1109,23 @@ export class OnboardingService {
    * attempts, nonce included. A comment with the job and head but no or
    * another nonce, a quote of the marker (`> <!-- …`) or a mention of it
    * mid-body is someone else's; only an attempt an older build recorded,
-   * with no nonce, accepts that build's marker. No author is asked: the gh
-   * login can change, and an app token has none. */
-  private async markedComment(target: { readonly repo: RepoRef; readonly number: number }, markers: readonly string[], proof: OnboardingProofOptions): Promise<GhIssueComment | null> {
-    return (await proof.github.listIssueComments(target)).find((comment) => markers.some((marker) => comment.body.trimStart().startsWith(marker))) ?? null;
+   * with no nonce, accepts that build's marker, and only on a comment
+   * GitHub created within {@link ONBOARDING_PROOF_LEGACY_COMMENT_WINDOW_MS}
+   * after that attempt was recorded (job and head are public: a later one
+   * is anyone's). No author is asked: the gh login can change, and an app
+   * token has none. */
+  private async markedComment(target: { readonly repo: RepoRef; readonly number: number }, record: ProofRecord, proof: OnboardingProofOptions): Promise<GhIssueComment | null> {
+    const markers = record.attemptNonces.map((nonce) => onboardingProofMarker(record.jobId, record.head, nonce));
+    const legacy = onboardingProofLegacyMarker(record.jobId, record.head);
+    const legacyAt = record.legacyAttempts.map((at) => Date.parse(at));
+    const soonAfterLegacy = (createdAt: string | null): boolean => {
+      const created = createdAt === null ? Number.NaN : Date.parse(createdAt);
+      return legacyAt.some((at) => created >= at - LEGACY_COMMENT_SKEW_MS && created <= at + ONBOARDING_PROOF_LEGACY_COMMENT_WINDOW_MS);
+    };
+    return (await proof.github.listIssueComments(target)).find((comment) => {
+      const body = comment.body.trimStart();
+      return markers.some((marker) => body.startsWith(marker)) || (body.startsWith(legacy) && soonAfterLegacy(comment.createdAt));
+    }) ?? null;
   }
 
   /** A failed proof goes to the minion as one durable directive. A request

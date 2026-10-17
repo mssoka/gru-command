@@ -3,8 +3,8 @@ import type { AgentHandle, PromptTurnVerdict } from '../runtime/types.js';
 import { promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { basename, join, relative, resolve, sep } from 'node:path';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, writeFileSync } from 'node:fs';
+import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { LogLevel } from '../logger.js';
 import { DEFAULT_REVIEW_CHILDREN } from '../config.js';
 import type { JobStatus, LedgerApi, OnboardingProofDebt, RoundRecord, RoundVerdict } from '../ledger/api.js';
@@ -1921,10 +1921,12 @@ class FallbackSafetyRefusal extends Error {
 export const FALLBACK_ONBOARDING_PROOF_REQUIRED = 'onboarding-proof-required';
 
 /** The way forward that abort records: the gate cannot wait for a proof,
- * so the fix goes through delivery, the proof, then review again. */
+ * so the fix goes through delivery, the proof, then review again. Nothing
+ * replays the aborted gate itself; a self-review request made while the
+ * new head's proof is owed is queued and replayed on that proof's event. */
 export const FALLBACK_ONBOARDING_PROOF_HINT =
-  'the minion must commit the fix, push it to the PR branch and deliver; GC proves the new head itself, and review ' +
-  're-arms once that proof passes (the Silas digest offers the review again, and a self-review request is replayed on the pass)';
+  'the minion must commit the fix, push it to the PR branch and deliver; GC proves the new head itself, and once that proof ' +
+  'passes the Silas digest offers the review again; a self-review request the minion makes before then is queued and replayed on the pass';
 
 /** A reviewed job's ledger row is gone at the freeze. Job rows are never
  * deleted, so nothing the freeze would record about it can be stated. */
@@ -1962,11 +1964,14 @@ function captureFallbackInput(lanePath: string, baseRef: string): Pick<FallbackR
   return { headRef, diff, diffSha256: createHash('sha256').update(diff).digest('hex') };
 }
 
-/** #427 PR 1b: the lane-relative paths the lane's bootstrap placed (its
- * manifest's `[[link]]` `at` and `[[copy]]` `to`): GC put them there, and
- * the proof's own bootstrap places them the same way. A manifest that
- * cannot be read places nothing here, so every path counts. */
-function bootstrapPlacedPaths(lanePath: string): readonly string[] {
+/** #427 PR 1b: what the lane's bootstrap placed (its manifest's
+ * `[[link]]` `at` and `[[copy]]` `to`, lane-relative), each with whether it
+ * is still exactly that: a copy whose bytes equal its source's in the
+ * repository checkout, a link that still points at the manifest's target.
+ * The proof's own bootstrap places them the same way from the same
+ * checkout. A manifest that cannot be read places nothing here, so every
+ * path counts. */
+function bootstrapPlaced(lanePath: string, sourceRoot: string): readonly { readonly path: string; readonly intact: () => boolean }[] {
   let manifest;
   try {
     manifest = loadWorktreeManifest(lanePath);
@@ -1974,34 +1979,64 @@ function bootstrapPlacedPaths(lanePath: string): readonly string[] {
     return [];
   }
   if (manifest === null) return [];
-  return [...manifest.links.map((link) => link.at), ...manifest.copies.map((copy) => copy.to)]
-    .map((path) => relative(lanePath, resolve(lanePath, path)).split(sep).join('/'))
-    .filter((path) => path !== '' && !path.startsWith('..'));
+  const laneRelative = (path: string): string => relative(lanePath, resolve(lanePath, path)).split(sep).join('/');
+  const holds = (check: () => boolean): (() => boolean) => () => {
+    try {
+      return check();
+    } catch {
+      return false; // gone, or no longer a link or a file
+    }
+  };
+  return [
+    ...manifest.links.map((link) => ({
+      path: laneRelative(link.at),
+      intact: holds(() => readlinkSync(resolve(lanePath, link.at)) === (isAbsolute(link.to) ? resolve(link.to) : resolve(sourceRoot, link.to))),
+    })),
+    ...manifest.copies.map((copy) => ({
+      path: laneRelative(copy.to),
+      intact: holds(() => lstatSync(resolve(lanePath, copy.to)).isFile() &&
+        readFileSync(resolve(lanePath, copy.to)).equals(readFileSync(resolve(sourceRoot, copy.from)))),
+    })),
+  ].filter((entry) => entry.path !== '' && !entry.path.startsWith('..'));
 }
 
 /** #427 PR 1b: whether a lane holds uncommitted changes the fallback would
  * review (tracked edits, untracked files git does not ignore: what
- * `git status --porcelain` lists, each untracked file on its own), leaving
- * out what the lane's bootstrap placed (a `node_modules` link a
- * `node_modules/` ignore rule misses, since a link is no folder). Fails
- * loud when git cannot say. */
-function laneHasUncommittedChanges(lanePath: string): boolean {
-  const run = spawnSync('git', ['-C', lanePath, '-c', 'core.fsmonitor=false', 'status', '--porcelain', '-z', '--untracked-files=all'],
-    { encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 64 * 1024 * 1024, timeout: 30_000 });
-  if (run.error !== undefined || run.status !== 0) {
-    throw new Error(`cannot read the lane's uncommitted changes (git status): ${run.error?.message ?? run.stderr.trim().slice(0, 200)}`);
-  }
-  const placed = bootstrapPlacedPaths(lanePath);
-  const isPlaced = (path: string): boolean => placed.some((at) => path === at || path.startsWith(`${at}/`));
-  const fields = run.stdout.split('\0');
-  for (let index = 0; index < fields.length; index += 1) {
-    const field = fields[index]!;
-    if (field === '') continue;
-    // A rename or copy names its source in the next field.
-    const paths = /^(?:[RC].|.[RC]) /u.test(field) ? [field.slice(3), fields[(index += 1)] ?? ''] : [field.slice(3)];
-    if (!paths.every(isPlaced)) return true;
-  }
-  return false;
+ * `git status --porcelain` lists, an untracked folder collapsed to one
+ * entry), leaving out what the lane's bootstrap placed while it is still
+ * what it placed (a `node_modules` link a `node_modules/` ignore rule
+ * misses, since a link is no folder; a `[[copy]]` the minion has not
+ * edited). A collapsed folder that holds a placed path is read file by
+ * file, that folder alone. Fails loud when git cannot say (a timeout or an
+ * output past its buffer included). */
+function laneHasUncommittedChanges(lanePath: string, sourceRoot: string): boolean {
+  const status = (args: readonly string[]): readonly string[] => {
+    const run = spawnSync('git', ['--literal-pathspecs', '-C', lanePath, '-c', 'core.fsmonitor=false', 'status', '--porcelain', '-z', ...args],
+      { encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 64 * 1024 * 1024, timeout: 30_000 });
+    if (run.error !== undefined || run.status !== 0) {
+      throw new Error(`cannot read the lane's uncommitted changes (git status): ${run.error?.message ?? run.stderr.trim().slice(0, 200)}`);
+    }
+    return run.stdout.split('\0');
+  };
+  const placed = bootstrapPlaced(lanePath, sourceRoot);
+  const isPlaced = (path: string): boolean => placed.some((entry) => (path === entry.path || path.startsWith(`${entry.path}/`)) && entry.intact());
+  const uncommitted = (fields: readonly string[], expand: boolean): boolean => {
+    for (let index = 0; index < fields.length; index += 1) {
+      const field = fields[index]!;
+      if (field === '') continue;
+      // A rename or copy names its source in the next field.
+      const paths = /^(?:[RC].|.[RC]) /u.test(field) ? [field.slice(3), fields[(index += 1)] ?? ''] : [field.slice(3)];
+      const folder = field.startsWith('?? ') && paths[0]!.endsWith('/') ? paths[0]!.slice(0, -1) : null;
+      if (folder !== null && !isPlaced(folder)) {
+        if (!expand || !placed.some((entry) => entry.path.startsWith(`${folder}/`))) return true;
+        if (uncommitted(status(['--untracked-files=all', '--', folder]), false)) return true;
+        continue;
+      }
+      if (!paths.every(isPlaced)) return true;
+    }
+    return false;
+  };
+  return uncommitted(status(['--untracked-files=normal']), true);
 }
 
 /** A late delivered STATUS after an already-recorded delivery is harmless.
@@ -4157,9 +4192,9 @@ export class WaveRunner {
    * included (captureFallbackInput), and no proof ever ran those: an
    * onboarding heist's lane must be clean. The debt names the lane HEAD;
    * null when the job is no onboarding heist or its lane is clean. */
-  private onboardingLaneDirtyDebt(jobId: string, lanePath: string): OnboardingProofDebt | null {
-    if (!this.opts.ledger.isOnboardingJob(jobId) || !laneHasUncommittedChanges(lanePath)) return null;
-    return { head: resolveGitCommit(lanePath, 'HEAD'), reason: 'uncommitted' };
+  private onboardingLaneDirtyDebt(jobId: string, lane: Pick<WorktreeLane, 'path' | 'repoPath'>): OnboardingProofDebt | null {
+    if (!this.opts.ledger.isOnboardingJob(jobId) || !laneHasUncommittedChanges(lane.path, lane.repoPath)) return null;
+    return { head: resolveGitCommit(lane.path, 'HEAD'), reason: 'uncommitted' };
   }
 
   private enforceBranchIdle(input: {
@@ -4511,7 +4546,7 @@ export class WaveRunner {
     // actually reviews, and any uncommitted change it would review too.
     const onboardingProof = jobRow === null || isJobTerminal(jobRow.status)
       ? null : this.opts.ledger.onboardingProofDebt(input.jobId) ?? this.onboardingLaneHeadDebt(input.jobId, lane.path) ??
-        this.onboardingLaneDirtyDebt(input.jobId, lane.path);
+        this.onboardingLaneDirtyDebt(input.jobId, lane);
     if (jobRow !== null && onboardingProof !== null) {
       const targetBranch = resolveReviewTargetBranch({
         jobId: input.jobId,
@@ -4611,7 +4646,7 @@ export class WaveRunner {
         FALLBACK_ONBOARDING_PROOF_REQUIRED,
       );
     }
-    if (this.onboardingLaneDirtyDebt(input.jobId, lane.path) !== null) {
+    if (this.onboardingLaneDirtyDebt(input.jobId, lane) !== null) {
       throw new FallbackSafetyRefusal(
         `onboarding job "${input.jobId}"'s lane holds uncommitted changes the proof never ran, and the fallback reviews the working tree — the gate stops before the next review round`,
         FALLBACK_ONBOARDING_PROOF_REQUIRED,

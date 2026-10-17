@@ -203,12 +203,15 @@ without a named rule is not yours to invent:
   is refused at the arm (with no target the round reviews the PR head), the
   bmad-review fallback refuses a lane HEAD past it or a lane with
   uncommitted changes (what the lane's bootstrap placed, its `[[link]]`
-  and `[[copy]]` paths, is not uncommitted), a commit pushed after it
+  and `[[copy]]` paths, is not uncommitted while it is still what it
+  placed; an edited copy is), a commit pushed after it
   waits for the minion to deliver it, and a delivery that names no full
   commit id waits for the next one. A fallback gate that stops for this
   mid-loop aborts with `code: "onboarding-proof-required"`: the minion
   commits, pushes and delivers its fix, GC proves the new head, and the
-  digest offers the review again once that proof passes. Wait for the lane delivery (and its
+  digest offers the review again once that proof passes (a self-review
+  request the minion made before then is replayed on the pass; nothing
+  replays the aborted gate). Wait for the lane delivery (and its
   push) to settle and for any unresolved re-brief request to finalize or
   be recovered (a delivery alone does not clear that fence), then arm. If
   you cannot tell whether the lane is still

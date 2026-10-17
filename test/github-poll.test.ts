@@ -487,7 +487,7 @@ describe('gh CLI adapter', () => {
   it('commentOnPull POSTs the body as one raw field; listIssueComments pages to a short page and never reads a truncated history as complete (#427)', async () => {
     const calls: string[][] = [];
     const page = (count: number, from: number): unknown[] =>
-      Array.from({ length: count }, (_, index) => ({ id: from + index, body: `comment ${String(from + index)}`, html_url: `https://github.com/acme/app/pull/7#issuecomment-${String(from + index)}`, user: { login: 'gru-bot' } }));
+      Array.from({ length: count }, (_, index) => ({ id: from + index, body: `comment ${String(from + index)}`, html_url: `https://github.com/acme/app/pull/7#issuecomment-${String(from + index)}`, created_at: '2026-10-17T12:00:00Z', user: { login: 'gru-bot' } }));
     const body = '@not-a-file <!-- gru:onboarding-proof job=onboard-app head=abc -->\nline two';
     const runner: GhCommandRunner = async (args) => {
       calls.push([...args]);
@@ -498,12 +498,12 @@ describe('gh CLI adapter', () => {
       return { status: 0, stdout: JSON.stringify(pageNumber === 1 ? page(100, 1) : page(3, 101)), stderr: '' };
     };
     const api = new GhCliApi(runner);
-    expect(await api.commentOnPull({ repo: REPO, number: 7, body })).toEqual({ id: 99, body, url: 'https://github.com/acme/app/pull/7#issuecomment-99' });
+    expect(await api.commentOnPull({ repo: REPO, number: 7, body })).toEqual({ id: 99, body, url: 'https://github.com/acme/app/pull/7#issuecomment-99', createdAt: null });
     // `-f` is a raw string: a leading @ is never read as a file.
     expect(calls[0]).toEqual(['api', '--hostname', 'github.com', '--method', 'POST', 'repos/acme/app/issues/7/comments', '-f', `body=${body}`]);
     const comments = await api.listIssueComments({ repo: REPO, number: 7 });
     expect(comments).toHaveLength(103);
-    expect(comments[102]).toEqual({ id: 103, body: 'comment 103', url: 'https://github.com/acme/app/pull/7#issuecomment-103' });
+    expect(comments[102]).toEqual({ id: 103, body: 'comment 103', url: 'https://github.com/acme/app/pull/7#issuecomment-103', createdAt: '2026-10-17T12:00:00Z' });
     expect(calls.slice(1).map((call) => call.at(-1))).toEqual([
       'repos/acme/app/issues/7/comments?per_page=100&page=1',
       'repos/acme/app/issues/7/comments?per_page=100&page=2',

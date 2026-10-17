@@ -127,6 +127,8 @@ export interface GhIssueComment {
   readonly id: number;
   readonly body: string;
   readonly url: string | null;
+  /** When GitHub created it (`created_at`); null when it does not say. */
+  readonly createdAt: string | null;
 }
 
 /** The outbound GitHub port (real implementation: {@link GhCliApi}). */
@@ -814,7 +816,7 @@ function mapIssueComment(value: unknown): GhIssueComment | null {
   const id = numOrNull(raw['id']);
   const body = typeof raw['body'] === 'string' ? raw['body'] : null;
   if (id === null || body === null) return null;
-  return { id, body, url: strOrNull(raw['html_url']) };
+  return { id, body, url: strOrNull(raw['html_url']), createdAt: strOrNull(raw['created_at']) };
 }
 
 // ------------------------------------------------------------------

@@ -218,7 +218,7 @@ function execFileBounded(bin: string, args: readonly string[], timeoutMs: number
 /** {@link processCwds} off the event loop: Linux `/proc`, macOS `lsof`
  * (bounded); null on any other platform. A failed or timed-out `lsof`
  * rejects: an async caller logs it rather than lose the cwd evidence
- * silently. */
+ * silently ({@link psEnumeratorAsync}). */
 async function processCwdsAsync(timeoutMs: number): Promise<Map<number, string> | null> {
   if (process.platform === 'linux') {
     const cwds = new Map<number, string>();
@@ -249,12 +249,22 @@ async function processCwdsAsync(timeoutMs: number): Promise<Map<number, string> 
 
 /** {@link psEnumerator} off the event loop, each listing bounded by
  * `timeoutMs` (#427 onboarding proof: a slow `lsof` on a loaded host must
- * not stall the service). Rejects when either listing fails or times out;
- * the synchronous enumerator the sweep uses is unchanged. */
-export async function psEnumeratorAsync(treePath: string, opts: { readonly timeoutMs?: number } = {}): Promise<readonly TreeProcess[]> {
+ * not stall the service). Rejects when `ps` fails or times out; when only
+ * the working directories cannot be listed (`lsof` failed or timed out),
+ * `onCwdError` is told and the argv matches still count, as the
+ * synchronous enumerator's null cwds do. That enumerator, which the sweep
+ * uses, is unchanged. */
+export async function psEnumeratorAsync(treePath: string, opts: {
+  readonly timeoutMs?: number;
+  readonly onCwdError?: (error: unknown) => void;
+} = {}): Promise<readonly TreeProcess[]> {
   const timeoutMs = opts.timeoutMs ?? 30_000;
-  const [out, cwds] = await Promise.all([execFileBounded('ps', ['-axo', 'pid=,command='], timeoutMs), processCwdsAsync(timeoutMs)]);
-  return treeProcesses(treePath, out, cwds);
+  const cwds = processCwdsAsync(timeoutMs).catch((error: unknown) => {
+    opts.onCwdError?.(error);
+    return null;
+  });
+  const [out, resolved] = await Promise.all([execFileBounded('ps', ['-axo', 'pid=,command='], timeoutMs), cwds]);
+  return treeProcesses(treePath, out, resolved);
 }
 
 export interface SweepPreservation {

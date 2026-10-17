@@ -110,6 +110,31 @@ describe('redactCredentials', () => {
     }
   });
 
+  it('masks a key that ends its identifier in secretkey, apikey, privatekey, accesstoken, authtoken, passwd, pwd, password, token or secret, in any case and with or without _ or -; AccessKeyId and keys that only start with one stay (#427)', () => {
+    for (const [text, secret] of [
+      ['stripeSecretKey: "sk_live_51Habcdef"', 'sk_live_51Habcdef'],
+      ['STRIPE_SECRET_KEY=sk_live_51Habcdef', 'sk_live_51Habcdef'],
+      ['googleMapsApiKey=AIzaSyA1b2C3d4', 'AIzaSyA1b2C3d4'],
+      ['maps-api-key: AIzaSyA1b2C3d4', 'AIzaSyA1b2C3d4'],
+      ['signingPrivateKey=MIIEabcdef123', 'MIIEabcdef123'],
+      ['"SIGNING_PRIVATE_KEY": "MIIEabcdef123"', 'MIIEabcdef123'],
+      ['slackAccessToken=abcdef123456', 'abcdef123456'],
+      ['registry-auth-token: abcdef123456', 'abcdef123456'],
+      ['+ MYSQL_PWD=hunter22x mysql -h db', 'hunter22x'],
+      ['db_passwd: hunter22x', 'hunter22x'],
+      ['{"dbPasswd": "hunter22x"}', 'hunter22x'],
+      ['rootPassword=hunter22x', 'hunter22x'],
+      ['githubToken: abcdef123456', 'abcdef123456'],
+      ['webhookSecret=abcdef123456', 'abcdef123456'],
+    ] as const) {
+      expect(redactCredentials(text), text).not.toContain(secret);
+      expect(redactCredentials(text), text).toContain(REDACTION_PLACEHOLDER);
+    }
+    for (const kept of ['AccessKeyId=ASIAIOSFODNN7EXAMPLE', 'apiKeyId=abcdef123456', 'publicKey=abcdef123456', 'pwdHash: sha256', 'secretKeys: rotated']) {
+      expect(redactCredentials(kept), kept).toBe(kept);
+    }
+  });
+
   it('masks an armored PGP secret key, whole and in a window that cuts its BEGIN or END line off (#427)', () => {
     const block = '-----BEGIN PGP PRIVATE KEY BLOCK-----\n\nlQOYBGXpgpSecretBODY\n=abcd\n-----END PGP PRIVATE KEY BLOCK-----';
     expect(redactCredentials(`before\n${block}\nafter`)).toBe(`before\n${REDACTION_PLACEHOLDER}\nafter`);

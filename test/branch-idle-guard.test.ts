@@ -1656,6 +1656,9 @@ describe('branch-idle guard', () => {
       release.release();
       const aborted = await abortedPromise;
       expect(aborted.payload).toMatchObject({ phase: 'aborted', clearToMerge: false });
+      // Only an onboarding heist's abort carries a named reason (#427).
+      expect(aborted.payload).not.toHaveProperty('code');
+      expect(aborted.payload).not.toHaveProperty('hint');
       expect(h.ledger.listJobEvents('fallback-stale-pass').some((event) =>
         event.kind === 'job.fallback-review' && (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
     } finally {

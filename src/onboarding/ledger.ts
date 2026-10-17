@@ -69,9 +69,10 @@ export interface ProofRecord {
   /** The marker nonce of each recorded comment attempt, oldest first: only
    * a comment whose marker carries one of them is GC's. */
   readonly attemptNonces: readonly string[];
-  /** An attempt was recorded by a build whose marker carried no nonce:
-   * its comment starts with that build's marker. */
-  readonly legacyAttempt: boolean;
+  /** When each attempt a build whose marker carried no nonce recorded was
+   * recorded, oldest first: its comment starts with that build's marker
+   * and was created soon after. */
+  readonly legacyAttempts: readonly string[];
   readonly comment: { readonly id: number | null; readonly url: string | null; readonly detail: string } | null;
 }
 
@@ -84,6 +85,8 @@ export interface ProofAttentionRow {
   readonly deliverySeq: number;
   /** Why the head was stuck when the row was posted. */
   readonly reason: string;
+  /** The seq of the event that recorded the row. */
+  readonly postedSeq: number;
 }
 
 export class OnboardingRecordError extends Error {
@@ -127,7 +130,7 @@ export class OnboardingLedger {
       const page = this.ledger.listEventsAfter(this.cursor, { kinds: ONBOARDING_EVENT_KINDS, limit: PAGE });
       for (const event of page) {
         try {
-          this.apply(event.kind, (typeof event.payload === 'object' && event.payload !== null ? event.payload : {}) as Payload, event.ts);
+          this.apply(event.kind, (typeof event.payload === 'object' && event.payload !== null ? event.payload : {}) as Payload, event.ts, event.seq);
         } catch (error) {
           this.log('error', 'onboarding event skipped: it does not apply to the projection', { seq: event.seq, kind: event.kind, error: error instanceof Error ? error.message : String(error) });
         } finally {
@@ -144,7 +147,7 @@ export class OnboardingLedger {
     if (!ONBOARDING_EVENT_KINDS.includes(kind)) throw new OnboardingRecordError(`unknown onboarding event kind "${kind}"`);
     this.refresh();
     const event = this.ledger.appendCustomEvent({ kind, payload, ...(jobId === null ? {} : { jobId }) });
-    this.apply(kind, payload, event.ts);
+    this.apply(kind, payload, event.ts, event.seq);
     this.cursor = Math.max(this.cursor, event.seq);
   }
 
@@ -203,7 +206,7 @@ export class OnboardingLedger {
     return null;
   }
 
-  private apply(kind: string, payload: Payload, ts: string): void {
+  private apply(kind: string, payload: Payload, ts: string, seq: number): void {
     const repo = text(payload, 'repo');
     const current = this.repos.get(repo) ?? empty(repo);
     switch (kind) {
@@ -240,7 +243,7 @@ export class OnboardingLedger {
         const list = this.proofs.get(jobId) ?? [];
         if (list.some((entry) => entry.head === head)) return;
         const result = readOnboardingProof(payload);
-        this.proofs.set(jobId, [...list, { repo, jobId, head, passed: result?.passed === true, at: ts, result, attemptNonces: [], legacyAttempt: false, comment: null }]);
+        this.proofs.set(jobId, [...list, { repo, jobId, head, passed: result?.passed === true, at: ts, result, attemptNonces: [], legacyAttempts: [], comment: null }]);
         return;
       }
       case ONBOARDING_EVENTS.proofCommentAttempt: {
@@ -251,7 +254,7 @@ export class OnboardingLedger {
         this.updateProof(payload, (proof) => ({
           ...proof,
           attemptNonces: carried ? [...proof.attemptNonces, nonce] : proof.attemptNonces,
-          legacyAttempt: proof.legacyAttempt || !carried,
+          legacyAttempts: carried ? proof.legacyAttempts : [...proof.legacyAttempts, ts],
         }));
         return;
       }
@@ -267,10 +270,10 @@ export class OnboardingLedger {
       case ONBOARDING_EVENTS.proofAttentionPosted: {
         const jobId = text(payload, 'job_id');
         const head = payload['head'];
-        const seq = payload['delivery_seq'];
+        const deliverySeq = payload['delivery_seq'];
         if (head !== null && (typeof head !== 'string' || head === '')) throw new OnboardingRecordError('onboarding attention row names no head');
-        if (typeof seq !== 'number' || !Number.isSafeInteger(seq)) throw new OnboardingRecordError('onboarding attention row names no delivery seq');
-        const row = { notificationId: text(payload, 'notification_id'), head, deliverySeq: seq, reason: text(payload, 'reason') };
+        if (typeof deliverySeq !== 'number' || !Number.isSafeInteger(deliverySeq)) throw new OnboardingRecordError('onboarding attention row names no delivery seq');
+        const row = { notificationId: text(payload, 'notification_id'), head, deliverySeq, reason: text(payload, 'reason'), postedSeq: seq };
         const rows = this.attention.get(jobId) ?? [];
         if (!rows.some((entry) => entry.notificationId === row.notificationId)) this.attention.set(jobId, [...rows, row]);
         return;
