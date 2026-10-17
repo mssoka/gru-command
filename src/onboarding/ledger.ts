@@ -3,9 +3,10 @@ import type { LogLevel } from '../logger.js';
 
 /**
  * Onboarding records (#427), kept as append-only `onboarding.*` ledger
- * events and projected per repository in memory (the src/vector/ledger.ts
- * pattern): no table, no migration. Jobs, cards and decisions keep their own
- * rows; these events record only what onboarding itself decided.
+ * events and projected per repository (and, for proofs, per job) in memory
+ * (the src/vector/ledger.ts pattern): no table, no migration. Jobs, cards,
+ * decisions and directives keep their own rows; these events record only
+ * what onboarding itself decided or proved.
  */
 
 export const ONBOARDING_EVENTS = {
@@ -23,6 +24,12 @@ export const ONBOARDING_EVENTS = {
   dispatched: 'onboarding.dispatched',
   /** A dispatch failed before its job existed: a new retryable row was posted for Gru. */
   dispatchFailed: 'onboarding.dispatch-failed',
+  /** Code proved (passed or failed) an onboarding job's delivered head (#427 PR 1b); a job event. */
+  proof: 'onboarding.proof',
+  /** A proof's PR comment is about to be posted: after a crash, look for its marker first. */
+  proofCommentAttempt: 'onboarding.proof-comment-attempt',
+  /** A proof's PR comment exists (posted, or found by its marker), or cannot be posted. */
+  proofCommented: 'onboarding.proof-commented',
 } as const;
 
 export const ONBOARDING_EVENT_KINDS: readonly string[] = Object.values(ONBOARDING_EVENTS);
@@ -42,6 +49,19 @@ export interface RepoOnboarding {
   /** Failure episodes ever posted; the latest one's row, open until a dispatch or a scan that needs none closes it. */
   readonly failures: number;
   readonly failedRow: string | null;
+}
+
+/** One proven head of an onboarding job, and what its PR comment did. */
+export interface ProofRecord {
+  readonly repo: string;
+  readonly jobId: string;
+  readonly head: string;
+  readonly passed: boolean;
+  readonly at: string;
+  /** The `onboarding.proof` payload (the comment and directive render from it). */
+  readonly payload: Readonly<Record<string, unknown>>;
+  readonly commentAttempted: boolean;
+  readonly comment: { readonly id: number | null; readonly url: string | null; readonly detail: string } | null;
 }
 
 export class OnboardingRecordError extends Error {
@@ -70,6 +90,10 @@ const empty = (repo: string): RepoOnboarding => ({ repo, proposals: 0, lastPropo
 export class OnboardingLedger {
   private cursor = 0;
   private readonly repos = new Map<string, RepoOnboarding>();
+  /** Onboarding job → its repository: only an `onboarding.dispatched` event makes a job one. */
+  private readonly jobs = new Map<string, string>();
+  /** Per job, its proven heads in proof order (the first proof of a head stands). */
+  private readonly proofs = new Map<string, ProofRecord[]>();
 
   constructor(private readonly ledger: LedgerApi, private readonly log: (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void = () => {}) {}
 
@@ -90,13 +114,45 @@ export class OnboardingLedger {
     }
   }
 
-  /** Append one `onboarding.*` fact and apply it. */
-  record(kind: string, payload: Payload): void {
+  /** Append one `onboarding.*` fact and apply it. A proof fact names its
+   * job, so it is also a job event (the review fence and its replay read it). */
+  record(kind: string, payload: Payload, jobId: string | null = null): void {
     if (!ONBOARDING_EVENT_KINDS.includes(kind)) throw new OnboardingRecordError(`unknown onboarding event kind "${kind}"`);
     this.refresh();
-    const event = this.ledger.appendCustomEvent({ kind, payload });
+    const event = this.ledger.appendCustomEvent({ kind, payload, ...(jobId === null ? {} : { jobId }) });
     this.apply(kind, payload, event.ts);
     this.cursor = Math.max(this.cursor, event.seq);
+  }
+
+  /** The repository of an onboarding job; null for any other job. */
+  jobRepo(jobId: string): string | null {
+    this.refresh();
+    return this.jobs.get(jobId) ?? null;
+  }
+
+  /** Every onboarding job ever dispatched. */
+  onboardingJobs(): readonly string[] {
+    this.refresh();
+    return [...this.jobs.keys()];
+  }
+
+  /** The job's proven heads, oldest first. */
+  jobProofs(jobId: string): readonly ProofRecord[] {
+    this.refresh();
+    return this.proofs.get(jobId) ?? [];
+  }
+
+  proof(jobId: string, head: string): ProofRecord | null {
+    return this.jobProofs(jobId).find((entry) => entry.head === head) ?? null;
+  }
+
+  private updateProof(payload: Payload, change: (proof: ProofRecord) => ProofRecord): void {
+    const jobId = text(payload, 'job_id');
+    const head = text(payload, 'head');
+    const list = this.proofs.get(jobId) ?? [];
+    const index = list.findIndex((entry) => entry.head === head);
+    if (index === -1) throw new OnboardingRecordError(`no onboarding proof of ${head} on job ${jobId} to attach a comment to`);
+    this.proofs.set(jobId, list.map((entry, at) => (at === index ? change(entry) : entry)));
   }
 
   repo(name: string): RepoOnboarding {
@@ -140,11 +196,34 @@ export class OnboardingLedger {
         const launchedBy = text(payload, 'launched_by');
         if (!(LAUNCHES as readonly string[]).includes(launchedBy)) throw new OnboardingRecordError(`onboarding dispatch names an unknown launch "${launchedBy}"`);
         this.repos.set(repo, { ...current, consent: null, dispatches: [...current.dispatches, { jobId: text(payload, 'job_id'), launchedBy: launchedBy as OnboardingLaunch, at: ts }] });
+        this.jobs.set(text(payload, 'job_id'), repo);
         return;
       }
       case ONBOARDING_EVENTS.dispatchFailed:
         this.repos.set(repo, { ...current, failures: current.failures + 1, failedRow: text(payload, 'notification_id') });
         return;
+      case ONBOARDING_EVENTS.proof: {
+        const jobId = text(payload, 'job_id');
+        const head = text(payload, 'head');
+        const outcome = text(payload, 'outcome');
+        if (outcome !== 'passed' && outcome !== 'failed') throw new OnboardingRecordError(`onboarding proof names an unknown outcome "${outcome}"`);
+        const list = this.proofs.get(jobId) ?? [];
+        if (list.some((entry) => entry.head === head)) return;
+        this.proofs.set(jobId, [...list, { repo, jobId, head, passed: outcome === 'passed', at: ts, payload, commentAttempted: false, comment: null }]);
+        return;
+      }
+      case ONBOARDING_EVENTS.proofCommentAttempt:
+        this.updateProof(payload, (proof) => ({ ...proof, commentAttempted: true }));
+        return;
+      case ONBOARDING_EVENTS.proofCommented: {
+        const id = payload['comment_id'];
+        const url = payload['comment_url'];
+        this.updateProof(payload, (proof) => ({
+          ...proof,
+          comment: { id: typeof id === 'number' ? id : null, url: typeof url === 'string' ? url : null, detail: text(payload, 'detail') },
+        }));
+        return;
+      }
       default:
         throw new OnboardingRecordError(`unhandled onboarding event kind "${kind}"`);
     }

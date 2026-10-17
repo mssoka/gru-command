@@ -110,6 +110,7 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
   { file: 'lan-phone-raw-client.test.ts', workload: 'real service over sockets with the raw client' },
   { file: 'listener-probe.test.ts', workload: 'real child listeners and service port-guard probes' },
   { file: 'onboarding-real-service.test.ts', workload: 'boots the compiled dist/main.js service and calls its onboarding route over HTTP' },
+  { file: 'onboarding-proof.test.ts', workload: 'real throwaway git clones running manifest commands under the real verification budget, plus a whole review round over a real git lane' },
   { file: 'lessons-dream-service.test.ts', workload: 'real compiled service boots: a failing dream pass, and a proposal accepted over HTTP' },
   {
     file: 'perkins-admission-preflight.test.ts',

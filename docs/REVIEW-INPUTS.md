@@ -226,6 +226,18 @@ latest revision → verify → fresh review. The service enforces it centrally.
   When no unresolved same-head repair remains, the full Silas digest still offers
   `verificationsOwed`. Dismissal never rewrites FAILED receipts or grants review:
   the unchanged corrective-verification gate remains until eligible proof exists.
+- **Onboarding heists are reviewed only on a proven head (#427 PR 1b).** A job an
+  `onboarding.dispatched` event names owes a passing `onboarding.proof` on its newest
+  delivered head: GC clones that head, applies its manifest, runs `verify.full` under the
+  verification budget, and measures it ([ONBOARDING.md](./ONBOARDING.md#proof-before-review)).
+  Until the proof passes, the lane is busy on every route the corrective verification fences
+  (arm, freeze, queued handoff, fallback admission and iteration, the Silas review offer); the
+  blocker carries `onboarding_proof_required_head`. Like a pending correction, `force` never
+  waives it, and the `409 branch_busy` hint says so. A worker's own review request is queued
+  and replayed on the `onboarding.proof` event. The proof is never verification evidence (no
+  `verification.*` event exists for it). When the proof's head is the reviewed sha, the frozen
+  packet carries an `ONBOARDING PROOF` block between the recorded verification and the CI
+  evidence; a block that would crowd out the CI section freezes as an omission notice.
 - **A historical-only delivery owes a current inspection (owner decision 2026-10-16, #361).**
   When a job's newest delivery is history (a completion recorded without proving a current
   candidate) while a corrective verification or a contract revision is still owed, no

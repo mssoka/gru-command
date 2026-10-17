@@ -194,7 +194,11 @@ without a named rule is not yours to invent:
   while any lane is ACTIVE on the same target — a rebase/force-push or an
   ordinary conflict-integration push; the round
   races the push and dies obsolete — or while the job's contract revision
-  is pending delivery (the candidate is outdated). Wait for the lane delivery (and its
+  is pending delivery (the candidate is outdated), or while an onboarding
+  heist's delivered head has no passing onboarding proof (GC runs the
+  proof itself, comments on the PR, and sends a failure to the minion; the
+  digest withholds the review offer, never the PR registration, until it
+  passes, and no `force` waives it). Wait for the lane delivery (and its
   push) to settle and for any unresolved re-brief request to finalize or
   be recovered (a delivery alone does not clear that fence), then arm. If
   you cannot tell whether the lane is still

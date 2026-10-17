@@ -468,7 +468,8 @@ max_raids_per_day = 2
 # Decline is remembered until you ask Gru to propose it again.
 # "autonomous": GC dispatches the heist and posts a board FYI row.
 # "off": nothing is checked, proposed or dispatched, and the installer's
-# consent is not read.
+# consent is not read. An open onboarding heist is still proven before
+# review in every mode.
 mode = "proposed"
 
 [roll]
@@ -646,7 +647,10 @@ describes the whole flow.
   YOU. Only a repository's first onboarding heist starts this way. If it ends
   without the manifest reaching origin, the next scan asks you with a card.
 - **`"off"`.** Nothing is checked, proposed or dispatched, and the installer's
-  consent file is not read.
+  consent file is not read. An onboarding heist that is already open is still
+  proven before review
+  ([ONBOARDING.md](./ONBOARDING.md#proof-before-review)): `off` stops new
+  onboarding, never the gate on an open PR.
 
 If origin cannot be reached, nothing happens: GC logs why and checks again at
 the next start. Answering yes to the wizard's "Onboard them now?" skips the

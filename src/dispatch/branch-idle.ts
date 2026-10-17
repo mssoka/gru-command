@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import type { DirectiveRequestRecord, EventRecord, JobRecord, PendingRebriefRecord } from '../ledger/api.js';
+import type { DirectiveRequestRecord, EventRecord, JobRecord, OnboardingProofDebt, PendingRebriefRecord } from '../ledger/api.js';
 import { isJobTerminal, type JobStatus } from '../ledger/states.js';
 import { LIVE_DIRECTIVE_STATES, type DirectiveState } from '../ledger/directives.js';
 import type { WorkRevisionState } from '../review-inputs/amendments.js';
@@ -46,7 +46,11 @@ import { repositoryGitEnv } from './perkins-review/artifacts.js';
  * 4. a CORRECTIVE delivery owes its verification (owner decision
  *    2026-10-09, option A): the first delivery carrying a new work revision
  *    may be reviewed only after a passing scheduler verification on its
- *    exact head. Ordinary deliveries keep the in-flight check only.
+ *    exact head. Ordinary deliveries keep the in-flight check only; or
+ * 5. an ONBOARDING heist's newest delivered head has no passing onboarding
+ *    proof (#427 PR 1b): code has not yet shown that its manifest sets up
+ *    and verifies a fresh clone. Like a pending correction, force never
+ *    waives it.
  *
  * Terminal (`merged`/`done`/`binned`) jobs are never busy: a stale marker
  * left on a terminal job must not block an unrelated review or resurrect
@@ -62,6 +66,19 @@ export const BRANCH_BUSY_HINT =
 export const BRANCH_BUSY_REVISION_HINT =
   'an approved material correction is pending delivery — send ONE continuation carrying the contract revision ' +
   '(the service attaches the amendments); force cannot review an obsolete candidate';
+
+/** The hint when a blocker is an unproven onboarding head (#427 PR 1b):
+ * force is not offered, because it cannot stand in for the proof. */
+export const BRANCH_BUSY_ONBOARDING_HINT =
+  'this onboarding heist\'s manifest has no passing onboarding proof on its delivered head — GC proves each new ' +
+  'head itself and sends a failure back to the minion; force cannot skip the proof';
+
+/** The refusal hint for a blocker set: the unforceable reasons first. */
+export function branchBusyHint(blockers: readonly BranchIdleBlocker[]): string {
+  if (blockers.some((blocker) => blocker.revision !== undefined)) return BRANCH_BUSY_REVISION_HINT;
+  if (blockers.some((blocker) => blocker.onboardingProof !== undefined)) return BRANCH_BUSY_ONBOARDING_HINT;
+  return BRANCH_BUSY_HINT;
+}
 
 /** Statuses whose lane may be mid-flight (dispatched = the lane is about to
  * be created and pushed; working = the attempt is open; in-review = a PR
@@ -80,6 +97,9 @@ export interface BranchIdleBlocker {
   /** Present when a corrective delivery still owes its passing
    * verification on this head (owner decision 2026-10-09, option A). */
   readonly verification?: { readonly revision: number; readonly head: string | null };
+  /** Present when an onboarding heist's delivered head has no passing
+   * onboarding proof (#427 PR 1b). Never forceable. */
+  readonly onboardingProof?: OnboardingProofDebt;
 }
 
 /** The 409 body shape (snake_case: this is the wire contract). */
@@ -92,6 +112,7 @@ export interface BranchBusyResponse {
     readonly required_revision?: number;
     readonly delivered_revision?: number;
     readonly verification_required_head?: string | null;
+    readonly onboarding_proof_required_head?: string | null;
   }[];
   readonly hint: string;
 }
@@ -120,8 +141,9 @@ export function branchBusyPayload(input: {
         ? { required_revision: blocker.revision.required, delivered_revision: blocker.revision.delivered }
         : {}),
       ...(blocker.verification !== undefined ? { verification_required_head: blocker.verification.head } : {}),
+      ...(blocker.onboardingProof !== undefined ? { onboarding_proof_required_head: blocker.onboardingProof.head } : {}),
     })),
-    hint: input.blockers.some((blocker) => blocker.revision !== undefined) ? BRANCH_BUSY_REVISION_HINT : BRANCH_BUSY_HINT,
+    hint: branchBusyHint(input.blockers),
   };
 }
 
@@ -135,7 +157,7 @@ export class BranchBusyError extends Error {
     super(
       `branch "${targetBranch}" is busy (${blockers
         .map((blocker) => `${blocker.jobId}: ${blocker.status}`)
-        .join(', ')}); ${blockers.some((blocker) => blocker.revision !== undefined) ? BRANCH_BUSY_REVISION_HINT : BRANCH_BUSY_HINT}`,
+        .join(', ')}); ${branchBusyHint(blockers)}`,
     );
     this.name = 'BranchBusyError';
     this.targetBranch = targetBranch;
@@ -177,6 +199,8 @@ export interface BranchIdleLedger {
   workRevisionState(jobId: string): WorkRevisionState;
   /** A corrective delivery's unpaid verification (option A), or null. */
   correctiveVerificationDebt(jobId: string): { readonly revision: number; readonly head: string | null } | null;
+  /** An onboarding heist's unproven delivered head (#427 PR 1b), or null. */
+  onboardingProofDebt(jobId: string): OnboardingProofDebt | null;
 }
 
 /** The pending correction, when one fences the lane: required > delivered
@@ -348,6 +372,8 @@ export function laneIsBusy(ledger: BranchIdleLedger, job: JobRecord): boolean {
   if (pendingWorkRevision(ledger, job) !== null) return true;
   // A corrective delivery is reviewed only on a verified head (option A).
   if (ledger.correctiveVerificationDebt(job.id) !== null) return true;
+  // An onboarding heist is reviewed only on a proven head (#427 PR 1b).
+  if (ledger.onboardingProofDebt(job.id) !== null) return true;
   // An accepted directive request may already be prompting a writer before
   // its admission event lands: review must not arm on that head (issue #162).
   if (ledger.listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES }).length > 0) return true;
@@ -411,10 +437,12 @@ export function findBusyLanes(input: {
     // A verification debt only matters once no revision is pending: an
     // outdated head is never verified for review.
     const verification = revision === null ? input.ledger.correctiveVerificationDebt(job.id) : null;
+    const onboardingProof = input.ledger.onboardingProofDebt(job.id);
     blockers.push({
       jobId: job.id, status, branch,
       ...(revision !== null ? { revision } : {}),
       ...(verification !== null ? { verification } : {}),
+      ...(onboardingProof !== null ? { onboardingProof } : {}),
     });
   }
   return blockers;
@@ -473,7 +501,8 @@ export function snapshotForceAuthorization(
 /** Does the arm-time snapshot cover this blocker? Only work that already
  * existed then does: nothing newer may have started, and every pending
  * request now must have been pending at the arm. A pending material
- * correction is never covered (owner rule 2). */
+ * correction (owner rule 2) and an unproven onboarding head (#427 PR 1b)
+ * are never covered. */
 export function forceCoversBlocker(
   ledger: BranchIdleLedger,
   authorization: ForceAuthorization,
@@ -481,7 +510,8 @@ export function forceCoversBlocker(
   now = branchIdleWorkGeneration(ledger, blocker.jobId, blocker.branch),
 ): boolean {
   const armed = authorization.get(blocker.jobId);
-  if (armed === undefined || blocker.revision !== undefined || ledger.listJobAdmissions?.(blocker.jobId).some((kind) => kind.startsWith('property '))) return false;
+  if (armed === undefined || blocker.revision !== undefined || blocker.onboardingProof !== undefined ||
+    ledger.listJobAdmissions?.(blocker.jobId).some((kind) => kind.startsWith('property '))) return false;
   return now.branch === armed.branch &&
     now.deliverySeq <= armed.deliverySeq &&
     now.directiveSeq <= armed.directiveSeq &&

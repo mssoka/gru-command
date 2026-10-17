@@ -51,8 +51,9 @@ and that git ignores, so GC may delete and recreate them. Each entry is
 normalized (`./build/` → `build`). An entry fails loud, naming it, when it is
 empty or `.`, absolute, contains `..` or NUL, has a `.git` or `.gru-command`
 segment (it is, or sits inside, one), or repeats an earlier entry. Nothing
-consumes `reclaim` yet. Onboarding heists write it
-([ONBOARDING.md](./ONBOARDING.md)).
+deletes `reclaim` folders yet. Onboarding heists write it, and an onboarding
+proof fails a manifest whose entry does not appear, is not git-ignored, or
+holds tracked files ([ONBOARDING.md](./ONBOARDING.md#proof-before-review)).
 
 GC-owned workflows need no BMAD manifest entry or project/global installation.
 New lanes bind the owned workflow and explicit artifact context when the minion

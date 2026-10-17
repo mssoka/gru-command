@@ -122,6 +122,13 @@ export interface GhCheckRun {
   readonly url: string | null;
 }
 
+/** One pull-request conversation comment (the issues comments endpoint). */
+export interface GhIssueComment {
+  readonly id: number;
+  readonly body: string;
+  readonly url: string | null;
+}
+
 /** The outbound GitHub port (real implementation: {@link GhCliApi}). */
 export interface GhApiPort {
   listPulls(input: { readonly repo: RepoRef; readonly limit: number }): Promise<readonly GhPull[]>;
@@ -133,6 +140,11 @@ export interface GhApiPort {
   listPullsForHead(input: { readonly repo: RepoRef; readonly head: string }): Promise<readonly GhPull[]>;
   getPull(input: { readonly repo: RepoRef; readonly number: number }): Promise<GhPull>;
   listCheckRuns(input: { readonly repo: RepoRef; readonly sha: string }): Promise<readonly GhCheckRun[]>;
+  /** Post one conversation comment on a pull request; the created comment. */
+  commentOnPull(input: { readonly repo: RepoRef; readonly number: number; readonly body: string }): Promise<GhIssueComment>;
+  /** Every conversation comment on a pull request, oldest first. Fails loud
+   * when the history is longer than the adapter reads: absence is then unknown. */
+  listIssueComments(input: { readonly repo: RepoRef; readonly number: number }): Promise<readonly GhIssueComment[]>;
 }
 
 // ------------------------------------------------------------------
@@ -609,7 +621,25 @@ export async function ghApiJson(
   host: string,
   path: string,
 ): Promise<unknown> {
-  const result = await run(['api', '--hostname', host, path]);
+  return ghResultJson(await run(['api', '--hostname', host, path]), binary, label);
+}
+
+/** POST one `gh api` request with raw string fields (`-f key=value`: never
+ * read as a file or typed value) under the same fail-loud rules as
+ * {@link ghApiJson}; the response document. */
+export async function ghApiPostJson(
+  run: GhCommandRunner,
+  binary: string,
+  label: string,
+  host: string,
+  path: string,
+  fields: Readonly<Record<string, string>>,
+): Promise<unknown> {
+  const raw = Object.entries(fields).flatMap(([key, value]) => ['-f', `${key}=${value}`]);
+  return ghResultJson(await run(['api', '--hostname', host, '--method', 'POST', path, ...raw]), binary, label);
+}
+
+function ghResultJson(result: GhCommandResult, binary: string, label: string): unknown {
   if (result.status !== 0) {
     const stderr = result.stderr.trim().slice(0, 300);
     if (result.error !== undefined && result.error !== '') {
@@ -728,6 +758,40 @@ export class GhCliApi implements GhApiPort {
     }
     return runs.map(mapCheckRun).filter((run): run is GhCheckRun => run !== null);
   }
+
+  async commentOnPull(input: { readonly repo: RepoRef; readonly number: number; readonly body: string }): Promise<GhIssueComment> {
+    const label = `comment on ${repoFullName(input.repo)}#${input.number}`;
+    const parsed = await ghApiPostJson(this.run, this.binary, label, input.repo.host,
+      `repos/${input.repo.owner}/${input.repo.repo}/issues/${input.number}/comments`, { body: input.body });
+    const comment = mapIssueComment(parsed);
+    if (comment === null) throw new GhApiError(`${label}: the response is not a comment`);
+    return comment;
+  }
+
+  async listIssueComments(input: { readonly repo: RepoRef; readonly number: number }): Promise<readonly GhIssueComment[]> {
+    const label = `list comments ${repoFullName(input.repo)}#${input.number}`;
+    const comments: GhIssueComment[] = [];
+    for (let page = 1; page <= GITHUB_COMMENT_PAGES; page += 1) {
+      const parsed = await this.apiJson(label, input.repo,
+        `repos/${input.repo.owner}/${input.repo.repo}/issues/${input.number}/comments?per_page=100&page=${page}`);
+      if (!Array.isArray(parsed)) throw new GhApiError(`${label}: expected a JSON array`);
+      comments.push(...parsed.map(mapIssueComment).filter((comment): comment is GhIssueComment => comment !== null));
+      if (parsed.length < 100) return comments;
+    }
+    throw new GhApiError(`${label}: more than ${GITHUB_COMMENT_PAGES * 100} comments; the rest were not read`);
+  }
+}
+
+/** Pages of 100 comments {@link GhCliApi.listIssueComments} reads before it gives up. */
+export const GITHUB_COMMENT_PAGES = 10;
+
+function mapIssueComment(value: unknown): GhIssueComment | null {
+  const raw = record(value);
+  if (raw === null) return null;
+  const id = numOrNull(raw['id']);
+  const body = typeof raw['body'] === 'string' ? raw['body'] : null;
+  if (id === null || body === null) return null;
+  return { id, body, url: strOrNull(raw['html_url']) };
 }
 
 // ------------------------------------------------------------------

@@ -2665,6 +2665,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/onboarding/consent.js",
   "dist/onboarding/ledger.js",
   "dist/onboarding/origin-manifest.js",
+  "dist/onboarding/proof.js",
   "dist/onboarding/server.js",
   "dist/onboarding/service.js",
   "dist/property/adapters/matrix.js",

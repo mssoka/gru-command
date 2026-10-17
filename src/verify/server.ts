@@ -17,6 +17,7 @@ import {
   type VerificationLease,
   type VerificationProgress,
   type VerificationQueueView,
+  type VerificationRunSpec,
   type VerificationSchedulerOptions,
 } from './scheduler.js';
 
@@ -74,8 +75,27 @@ export interface VerificationServer {
   requestHook(req: IncomingMessage, res: ServerResponse, path: string): boolean;
   /** Board health row (board UX v4): live lock/queue/budget counters. */
   view(): VerificationQueueView;
+  /** The global budget's lease primitives, for a holder that spawns its own
+   * command (#427 onboarding proof): one FIFO slot under the same lock-wait
+   * timeout, and the per-run worker share to hand that command. */
+  budget(): VerificationBudget;
   dispose(): Promise<void>;
 }
+
+/** One slot of the global verification budget, held by its caller. */
+export interface VerificationBudget {
+  acquire(spec: VerificationRunSpec): Promise<VerificationLease>;
+  release(lease: VerificationLease): void;
+  readonly workersPerRun: number;
+}
+
+/**
+ * The scope an onboarding proof (#427) holds its budget slot under. A proof
+ * is never a verification of its job: the scheduler's record callback drops
+ * every event that names this scope, so no `verification.*` event exists for
+ * a proof and the job's verification fences never see one.
+ */
+export const ONBOARDING_PROOF_SCOPE = 'onboarding-proof';
 
 const MAX_BODY_BYTES = 64 * 1024;
 
@@ -192,6 +212,9 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
         runTimeoutMs: options.config.verify.runTimeoutMs,
       },
       record: (event) => {
+        // An onboarding proof's slot (a lock-wait timeout, a stale release)
+        // is never the job's verification evidence.
+        if (event.payload['scope'] === ONBOARDING_PROOF_SCOPE) return;
         if (event.kind === 'verification.no-start' && ledger.hasJobEventWithPayloadValues(event.jobId, ['verification.no-start'],
           [{ key: 'run_id', value: String(event.payload['run_id']) }], 0)) return;
         ledger.appendCustomEvent({
@@ -545,6 +568,16 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
   return {
     view(): VerificationQueueView {
       return scheduler.view();
+    },
+
+    budget(): VerificationBudget {
+      return {
+        acquire: (spec) => scheduler.acquire(spec),
+        release: (lease) => scheduler.release(lease),
+        get workersPerRun() {
+          return scheduler.workersPerRun;
+        },
+      };
     },
 
     requestHook(req, res, path): boolean {

@@ -1,16 +1,30 @@
 import type { OnboardingConfig } from '../config.js';
+import { parseGitHubPrUrl, type GhApiPort } from '../dispatch/github-poll.js';
 import type { EventBus } from '../events/bus.js';
 import { NotificationDecisionRefusal, type LedgerApi, type NotificationRecord } from '../ledger/api.js';
 import { parseNotificationDecision, type NotificationDecision } from '../ledger/notification-decision.js';
 import { isJobStatus, isJobTerminal } from '../ledger/states.js';
 import type { LogLevel } from '../logger.js';
 import type { NotificationCenter } from '../notifications/center.js';
+import { oneLineErrorText } from '../property/error-text.js';
 import { displayManagedRepoName, resolveManagedRepoPath, type ManagedRepoPath } from '../repos/managed-names.js';
+import type { VerificationBudget } from '../verify/server.js';
 import { MANIFEST_PATH } from '../worktrees/manifest.js';
 import { onboardingJobId, onboardingKeyOfJob, onboardingRepoKey, onboardingTitle, renderOnboardingBriefing } from './briefing.js';
 import { OnboardingConsentError, onboardingConsentPath, readOnboardingConsent, removeOnboardingConsent } from './consent.js';
-import { ONBOARDING_EVENTS, OnboardingLedger, type OnboardingLaunch } from './ledger.js';
+import { ONBOARDING_EVENTS, OnboardingLedger, type OnboardingLaunch, type ProofRecord } from './ledger.js';
 import { probeOriginManifest, type OriginManifestProbe, type OriginManifestState, type VerifiedOrigin } from './origin-manifest.js';
+import {
+  onboardingProofMarker,
+  onboardingProofPayload,
+  readOnboardingProof,
+  renderOnboardingProofComment,
+  renderOnboardingProofDirective,
+  runOnboardingProof,
+  sweepOnboardingProbes,
+  type OnboardingProofInput,
+  type OnboardingProofOutcome,
+} from './proof.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -26,6 +40,14 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * lacks a manifest, no onboarding job is open, no card is waiting and the
  * owner has not declined. A decline (or a binned onboarding job) holds until
  * the propose route reopens it.
+ *
+ * Proofs (#427 PR 1b): once an onboarding job has a PR, code proves its
+ * newest delivered head (src/onboarding/proof.ts), once per head and one
+ * proof at a time, on a delivery or PR link, at start, and at each
+ * reconcile. Each proven head gets one PR comment; a failed one goes to the
+ * minion as a directive, and a third failure on a job reaches Gru. Review
+ * waits for a pass (LedgerApi.onboardingProofDebt). Proofs run in every
+ * mode: "off" stops new onboarding, never the gate on an open heist.
  */
 
 /** The owner's Accept/Decline on onboarding one repository. */
@@ -35,8 +57,19 @@ export const ONBOARDING_DISPATCHED_KIND = 'onboarding.dispatched';
 /** Gru's attention: an onboarding heist could not be dispatched (retried at the next reconcile). */
 export const ONBOARDING_DISPATCH_FAILED_KIND = 'onboarding.dispatch-failed';
 
-/** How often undone follow-through (an accepted card, a failed dispatch) is retried. */
+/** Gru's attention: an onboarding job's manifest failed its proof this many times. */
+export const ONBOARDING_PROOF_FAILING_KIND = 'onboarding.proof-failing';
+/** Failed proofs on one job before Gru gets a row. */
+export const ONBOARDING_PROOF_FAILURES_FOR_GRU = 3;
+/** Directive requests per failed proof whose admission was refused before the minion is no longer asked. */
+export const ONBOARDING_PROOF_DIRECTIVE_ATTEMPTS = 3;
+
+/** How often undone follow-through (an accepted card, a failed dispatch, a proof) is retried. */
 export const ONBOARDING_RECONCILE_INTERVAL_MS = 300_000;
+
+/** A failed proof's directive request id: deterministic per (job, head), numbered per admission attempt. */
+export const onboardingProofDirectiveId = (jobId: string, head: string, attempt: number): string =>
+  `onboarding-proof-${jobId}-${head.slice(0, 12)}-${String(attempt)}`;
 
 /** Who decided a card on the installer's behalf (consent standing in for Accept). */
 const CONSENT_DECIDER = 'installer-consent';
@@ -79,6 +112,29 @@ export interface OnboardingDispatchInput {
   readonly briefing: string;
 }
 
+/** A failed proof handed to the minion: one durable directive request. */
+export interface OnboardingProofDirective {
+  readonly jobId: string;
+  readonly requestId: string;
+  readonly directive: string;
+  readonly signal: AbortSignal;
+}
+
+export interface OnboardingProofOptions {
+  /** `<data_dir>/onboarding-probes`. */
+  readonly probesDir: string;
+  readonly setupTimeoutMs: number;
+  readonly runTimeoutMs: number;
+  /** The global verification budget (late-bound: the verify server starts later). */
+  readonly budget: () => VerificationBudget;
+  readonly github: Pick<GhApiPort, 'commentOnPull' | 'listIssueComments'>;
+  /** Begin and execute the directive (the property-campaign path). Throws
+   * when the lane cannot take it now; the next reconcile retries. */
+  readonly direct: (input: OnboardingProofDirective) => Promise<void>;
+  /** Proof seam (default: the real throwaway-checkout proof). */
+  readonly run?: (input: OnboardingProofInput) => Promise<OnboardingProofOutcome>;
+}
+
 export interface OnboardingServiceOptions {
   readonly onboarding: OnboardingConfig;
   readonly workspaceRoot: string;
@@ -93,6 +149,8 @@ export interface OnboardingServiceOptions {
   /** Origin probe seam (default: the real git probe). */
   readonly probe?: (repoPath: string, opts: { readonly signal: AbortSignal }) => Promise<OriginManifestProbe>;
   readonly resolveRepoPath?: (workspaceRoot: string, name: string) => Promise<ManagedRepoPath>;
+  /** Proving onboarding PRs before review; absent = no proofs (and none owed by this service). */
+  readonly proof?: OnboardingProofOptions;
   readonly log?: Log;
   readonly setInterval?: typeof setInterval;
   readonly clearInterval?: typeof clearInterval;
@@ -118,6 +176,11 @@ export class OnboardingService {
   /** One scan at a time per repository: no second card, no second dispatch. */
   private readonly repoLocks = new Map<string, Promise<unknown>>();
   private readonly inFlight = new Set<Promise<unknown>>();
+  /** One proof at a time across the service; a job is queued at most once. */
+  private proofChain: Promise<void> = Promise.resolve();
+  private readonly proofQueued = new Set<string>();
+  /** Jobs whose failed-proof directive is being admitted or run right now. */
+  private readonly directing = new Set<string>();
 
   constructor(private readonly opts: OnboardingServiceOptions) {
     this.log = opts.log ?? (() => {});
@@ -130,19 +193,25 @@ export class OnboardingService {
 
   /** Boot: close what nothing will carry out any more, take the installer's
    * consent, follow decisions, scan every managed repository off the boot
-   * path. `off` only closes its earlier cards and rows. */
+   * path, and prove open onboarding heists. `off` only closes its earlier
+   * cards and rows, and still proves open heists. */
   start(): void {
     this.closeStale();
-    if (this.mode === 'off') {
-      this.log('info', 'onboarding is off ([onboarding] mode = "off"): no scan, no card, no heist; installer consent is not read', {
+    const off = this.mode === 'off';
+    if (off) {
+      this.log('info', `onboarding is off ([onboarding] mode = "off"): no scan, no card, no heist; installer consent is not read${this.opts.proof === undefined ? '' : '; open onboarding heists are still proven before review'}`, {
         consent_file: onboardingConsentPath(this.opts.instanceDir),
       });
-      return;
+      if (this.opts.proof === undefined) return;
     }
     if (this.unsubscribe !== null) return;
+    // A crash's leftover checkouts go before any proof can start.
+    if (this.opts.proof !== undefined) this.sweepProbes(this.opts.proof);
     this.unsubscribe = this.opts.bus.subscribe((event) => {
       try {
-        if (event.kind === 'notification.decision') this.onDecision(event.payload);
+        if ((event.kind === 'job.delivered' || event.kind === 'job.pr') && event.jobId !== null) this.proveSoon(event.jobId);
+        else if (off) return;
+        else if (event.kind === 'notification.decision') this.onDecision(event.payload);
         else if (event.kind === 'job.status' && event.jobId !== null) this.onJobStatus(event.jobId, event.payload);
       } catch (error) {
         this.log('error', 'onboarding follow-through failed; the next reconcile retries it', { kind: event.kind, error: String(error) });
@@ -152,6 +221,8 @@ export class OnboardingService {
       try { this.reconcile(); } catch (error) { this.log('error', 'onboarding reconcile failed; the next interval retries it', { error: String(error) }); }
     }, ONBOARDING_RECONCILE_INTERVAL_MS);
     this.reconcileTimer.unref?.();
+    this.proveAll();
+    if (off) return;
     try {
       this.takeConsent();
     } catch (error) {
@@ -204,12 +275,17 @@ export class OnboardingService {
    * dispatch failed, are scanned again; nothing else is (no periodic probe).
    */
   reconcile(): void {
-    for (const repo of this.opts.managedRepos) {
-      const failedRow = this.store.repo(repo).failedRow;
-      const failed = failedRow === null ? null : this.opts.ledger.getNotification(failedRow);
-      const card = this.openCard(repo);
-      if ((failed !== null && failed.resolvedAt === null) || (card !== null && card.decidedOption !== null)) this.track(this.scanRepo(repo));
+    if (this.mode !== 'off') {
+      for (const repo of this.opts.managedRepos) {
+        const failedRow = this.store.repo(repo).failedRow;
+        const failed = failedRow === null ? null : this.opts.ledger.getNotification(failedRow);
+        const card = this.openCard(repo);
+        if ((failed !== null && failed.resolvedAt === null) || (card !== null && card.decidedOption !== null)) this.track(this.scanRepo(repo));
+      }
     }
+    // A deferred proof, an unposted comment and an unsent directive are
+    // retried here.
+    this.proveAll();
   }
 
   private track<T>(work: Promise<T>): Promise<T> {
@@ -545,6 +621,175 @@ export class OnboardingService {
       this.store.record(ONBOARDING_EVENTS.declined, { repo, by: 'a binned onboarding job', detail: `job ${jobId} was binned`, job_id: jobId });
     }
     this.track(this.scanRepo(repo));
+  }
+
+  // ------------------------------------------------------------------
+  // Proofs (#427 PR 1b)
+  // ------------------------------------------------------------------
+
+  private sweepProbes(proof: OnboardingProofOptions): void {
+    this.queueProof(async () => {
+      await sweepOnboardingProbes(proof.probesDir, this.log);
+    });
+  }
+
+  /** Run one step on the service's single proof queue. */
+  private queueProof(step: () => Promise<void>): void {
+    const next = this.proofChain.then(step);
+    this.proofChain = next.catch((error: unknown) => {
+      this.log('error', 'onboarding proof step failed; the next reconcile retries it', { error: oneLineErrorText(error, 400) });
+    });
+    this.track(this.proofChain);
+  }
+
+  /** Every open onboarding job, at start and at each reconcile. */
+  private proveAll(): void {
+    if (this.opts.proof === undefined) return;
+    for (const jobId of this.store.onboardingJobs()) this.proveSoon(jobId);
+  }
+
+  /** Queue the job's proof and follow-through, once while it waits. Only a
+   * job an `onboarding.dispatched` event names is an onboarding job. */
+  private proveSoon(jobId: string): void {
+    const proof = this.opts.proof;
+    if (proof === undefined || this.abort.signal.aborted || this.proofQueued.has(jobId) || this.store.jobRepo(jobId) === null) return;
+    this.proofQueued.add(jobId);
+    this.queueProof(async () => {
+      this.proofQueued.delete(jobId);
+      await this.proveJob(jobId, proof);
+    });
+  }
+
+  /** Prove the job's newest delivered head once it has a PR, unless that
+   * head was proven before; then carry each proof's follow-through. */
+  private async proveJob(jobId: string, proof: OnboardingProofOptions): Promise<void> {
+    const repo = this.store.jobRepo(jobId);
+    const job = this.opts.ledger.getJob(jobId);
+    if (repo === null || job === null || isJobTerminal(job.status) || this.abort.signal.aborted) return;
+    const debt = this.opts.ledger.onboardingProofDebt(jobId);
+    if (job.prUrl !== null && debt !== null && debt.head !== null && this.store.proof(jobId, debt.head) === null) {
+      await this.runProof(repo, jobId, debt.head, proof);
+    }
+    await this.followProofs(repo, jobId, proof);
+  }
+
+  private async runProof(repo: string, jobId: string, head: string, proof: OnboardingProofOptions): Promise<void> {
+    const resolved = await (this.opts.resolveRepoPath ?? resolveManagedRepoPath)(this.opts.workspaceRoot, repo);
+    if (resolved.kind !== 'available') {
+      this.log('warn', 'onboarding proof deferred: the repository is unavailable; the next reconcile retries it', {
+        repo, job: jobId, head, detail: resolved.kind === 'unavailable' ? resolved.reason : resolved.error,
+      });
+      return;
+    }
+    const outcome = await (proof.run ?? runOnboardingProof)({
+      jobId, head, repoPath: resolved.path, probesDir: proof.probesDir, setupTimeoutMs: proof.setupTimeoutMs, runTimeoutMs: proof.runTimeoutMs,
+      budget: proof.budget, signal: this.abort.signal, log: this.log,
+    });
+    if (outcome.kind === 'deferred') {
+      this.log('warn', 'onboarding proof deferred; the next reconcile retries it (nothing posted, nothing sent)', { repo, job: jobId, head, reason: outcome.reason });
+      return;
+    }
+    this.store.record(ONBOARDING_EVENTS.proof, onboardingProofPayload(repo, jobId, outcome.result), jobId);
+    this.log(outcome.result.passed ? 'info' : 'warn', `onboarding proof ${outcome.result.passed ? 'passed' : 'failed'}`, {
+      repo, job: jobId, head, failures: outcome.result.failures,
+    });
+  }
+
+  private async followProofs(repo: string, jobId: string, proof: OnboardingProofOptions): Promise<void> {
+    const proofs = this.store.jobProofs(jobId);
+    for (const record of proofs) await this.commentProof(record, proof);
+    const last = proofs.at(-1);
+    const delivered = this.opts.ledger.latestJobEvent(jobId, 'job.delivered');
+    const head = (delivered?.payload as { sha?: unknown } | null)?.sha;
+    // Only the head the minion stands on is worth a directive: a newer
+    // delivery already answers an older failure.
+    if (last !== undefined && !last.passed && last.head === head) this.directSoon(last, proof);
+    const failed = proofs.filter((entry) => !entry.passed);
+    if (failed.length >= ONBOARDING_PROOF_FAILURES_FOR_GRU) {
+      const newest = failed.at(-1)!;
+      const result = readOnboardingProof(newest.payload);
+      this.opts.notifications.post({
+        id: `onboarding-proof-failing:${jobId}`,
+        kind: ONBOARDING_PROOF_FAILING_KIND,
+        routing: 'action-required',
+        severity: 'error',
+        title: `Onboarding proof failed ${String(failed.length)} times: ${shown(repo)}`,
+        detail: [
+          `Job ${jobId}'s ${MANIFEST_PATH} failed GC's onboarding proof ${String(failed.length)} times. The last, at ${newest.head.slice(0, 12)}:`,
+          ...(result?.failures ?? ['(the proof record is unreadable)']).map((failure) => `- ${failure}`),
+          'Each failure went back to the minion; review stays fenced until a proof passes.',
+        ].join('\n'),
+      });
+    }
+  }
+
+  /** One PR comment per proven head. The attempt is recorded before the
+   * post and the receipt after; once an attempt stands, the marker is looked
+   * for first, so a crash between the two never posts twice. */
+  private async commentProof(record: ProofRecord, proof: OnboardingProofOptions): Promise<void> {
+    if (record.comment !== null) return;
+    const { repo, jobId, head } = record;
+    const prUrl = this.opts.ledger.getJob(jobId)?.prUrl ?? null;
+    const pr = prUrl === null ? null : parseGitHubPrUrl(prUrl);
+    if (pr === null) {
+      this.store.record(ONBOARDING_EVENTS.proofCommented, { repo, job_id: jobId, head, comment_id: null, comment_url: null,
+        detail: `not posted: ${prUrl ?? 'the job has no PR link'} is not a GitHub pull request` }, jobId);
+      return;
+    }
+    const result = readOnboardingProof(record.payload);
+    if (result === null) throw new Error(`the onboarding proof of ${head} on job ${jobId} is unreadable`);
+    const target = { repo: { host: pr.host, owner: pr.owner, repo: pr.repo }, number: pr.number };
+    const marker = onboardingProofMarker(jobId, head);
+    try {
+      if (record.commentAttempted) {
+        const found = (await proof.github.listIssueComments(target)).find((comment) => comment.body.includes(marker));
+        if (found !== undefined) {
+          this.store.record(ONBOARDING_EVENTS.proofCommented, { repo, job_id: jobId, head, comment_id: found.id, comment_url: found.url,
+            detail: 'found by its marker after an interrupted post' }, jobId);
+          return;
+        }
+      }
+      this.store.record(ONBOARDING_EVENTS.proofCommentAttempt, { repo, job_id: jobId, head, pr_url: prUrl }, jobId);
+      const posted = await proof.github.commentOnPull({ ...target, body: renderOnboardingProofComment(jobId, result) });
+      this.store.record(ONBOARDING_EVENTS.proofCommented, { repo, job_id: jobId, head, comment_id: posted.id, comment_url: posted.url, detail: 'posted' }, jobId);
+    } catch (error) {
+      this.log('warn', 'onboarding proof comment not posted; the next reconcile looks for its marker, then retries', { repo, job: jobId, head, error: oneLineErrorText(error, 400) });
+    }
+  }
+
+  /** A failed proof goes to the minion as one durable directive. A request
+   * refused before any prompt (state `failed`) is asked again under the next
+   * id, a bounded number of times; a request the lane could not take at all
+   * leaves no row, and the next reconcile asks again. */
+  private directSoon(record: ProofRecord, proof: OnboardingProofOptions): void {
+    const { jobId, head } = record;
+    if (this.directing.has(jobId) || this.abort.signal.aborted) return;
+    let requestId: string | null = null;
+    for (let attempt = 1; attempt <= ONBOARDING_PROOF_DIRECTIVE_ATTEMPTS; attempt += 1) {
+      const id = onboardingProofDirectiveId(jobId, head, attempt);
+      const row = this.opts.ledger.getDirective(id);
+      if (row === null) {
+        requestId = id;
+        break;
+      }
+      // Settled, live, or closed by its own recovery: told, being told, or
+      // not for this service to resume.
+      if (row.state !== 'failed') return;
+    }
+    if (requestId === null) {
+      this.log('error', `onboarding proof: ${String(ONBOARDING_PROOF_DIRECTIVE_ATTEMPTS)} directives about this failed proof were refused before any prompt; no more are sent for this head`, { job: jobId, head });
+      return;
+    }
+    const result = readOnboardingProof(record.payload);
+    if (result === null) return;
+    this.directing.add(jobId);
+    const sent = requestId;
+    this.track(proof.direct({ jobId, requestId: sent, directive: renderOnboardingProofDirective(result), signal: this.abort.signal })
+      .then(() => this.log('info', 'onboarding proof: the failure was sent to the minion', { job: jobId, head, request: sent }))
+      .catch((error: unknown) => this.log('warn', 'onboarding proof: the failure could not be sent to the minion; the next reconcile retries it', {
+        job: jobId, head, request: sent, error: oneLineErrorText(error, 400),
+      }))
+      .finally(() => this.directing.delete(jobId)));
   }
 
   private isOnboardingJob(repo: string, jobId: string): boolean {

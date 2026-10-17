@@ -411,6 +411,14 @@ export interface EventRecord {
   readonly payload: unknown;
 }
 
+/** An onboarding heist's unproven head (#427 PR 1b): the head review waits
+ * on (null when the newest delivery named none) and whether its proof
+ * already failed. */
+export interface OnboardingProofDebt {
+  readonly head: string | null;
+  readonly failed: boolean;
+}
+
 /** Notification routing (SPEC ruling 13; owner routing split 2026-09-23):
  * 'fyi' → the standing feed; 'action-required' → MACHINE attention — it
  * wakes Gru (per the wake policy) and never rings the owner bell;
@@ -2680,6 +2688,28 @@ export class LedgerApi {
            AND seq > ? AND COALESCE(json_extract(payload, '$.tracked_dirty'), 0) != 1 ORDER BY seq DESC LIMIT 1`,
       ).get(jobId, newest.seq)) as { ok: number | null } | undefined;
     return latest?.ok === 1 ? null : { revision, head };
+  }
+
+  /** #427 PR 1b: an onboarding heist (a job an `onboarding.dispatched`
+   * event names; that event carries the job only in its payload) is
+   * reviewed only on a head code has proven. The head is the newest
+   * `job.delivered` sha; the debt stands until an `onboarding.proof` of that
+   * exact head passed. Null = no debt; otherwise the head that must pass
+   * (null when the delivery named none) and whether its proof failed. */
+  onboardingProofDebt(jobId: string): OnboardingProofDebt | null {
+    const onboarding = this.db.prepare(
+      `SELECT 1 FROM events WHERE kind = 'onboarding.dispatched' AND json_extract(payload, '$.job_id') = ? LIMIT 1`,
+    ).get(jobId);
+    if (onboarding === undefined) return null;
+    const delivered = this.latestJobEvent(jobId, 'job.delivered');
+    const sha = (delivered?.payload as { sha?: unknown } | null | undefined)?.sha;
+    if (typeof sha !== 'string' || sha === '') return { head: null, failed: false };
+    const proof = this.db.prepare(
+      `SELECT json_extract(payload, '$.outcome') AS outcome FROM events WHERE job_id = ? AND kind = 'onboarding.proof'
+         AND json_extract(payload, '$.head') = ? ORDER BY seq DESC LIMIT 1`,
+    ).get(jobId, sha) as { outcome: unknown } | undefined;
+    if (proof?.outcome === 'passed') return null;
+    return { head: sha, failed: proof?.outcome === 'failed' };
   }
 
   private amendmentFromRow(row: Row): JobAmendmentRecord {

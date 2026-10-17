@@ -82,6 +82,7 @@ import {
 import { admissionPreflight, ADMISSION_REMOTE_PROBE_TIMEOUT_MS, ReviewAdmissionError, type AdmissionMissingInput } from './perkins-review/admission.js';
 import { evidenceRequestFingerprint, type ReviewEvidenceRequest } from '../review-inputs/evidence.js';
 import { parseGitHubPrUrl } from './github-poll.js';
+import { appendOnboardingProof, renderOnboardingProofEvidence } from '../onboarding/proof.js';
 import {
   boundedDiff,
   fallbackReviewPolicy,
@@ -2199,6 +2200,10 @@ export class WaveRunner {
         // Option A (owner, 2026-10-09): a corrective delivery waits for a
         // passing verification on its head; that pass re-offers the request.
         void this.startHandoff(event.jobId, pending);
+      } else if (event.kind === 'onboarding.proof' && event.seq > pending.seq) {
+        // #427 PR 1b: an onboarding heist's request waits for its head's
+        // onboarding proof; the proof re-offers it (a failure re-queues it).
+        void this.startHandoff(event.jobId, pending);
       }
     }) ?? (() => {});
   }
@@ -2279,10 +2284,13 @@ export class WaveRunner {
         // A terminal marker for a DIFFERENT request does not satisfy this one.
       }
       const delivered = this.opts.ledger.latestCandidateDelivery(job.id);
-      // A pass that paid a corrective delivery's verification (option A)
-      // re-offers the request just like a delivery does.
+      // A pass that paid a corrective delivery's verification (option A),
+      // or an onboarding proof (#427 PR 1b), re-offers the request just like
+      // a delivery does.
       const verifiedAfter = this.opts.ledger.latestJobEvent(job.id, 'verification.completed');
-      if ((delivered !== null && delivered.seq > queued.seq) || (verifiedAfter !== null && verifiedAfter.seq > queued.seq)) {
+      const provenAfter = this.opts.ledger.latestJobEvent(job.id, 'onboarding.proof');
+      if ((delivered !== null && delivered.seq > queued.seq) || (verifiedAfter !== null && verifiedAfter.seq > queued.seq) ||
+        (provenAfter !== null && provenAfter.seq > queued.seq)) {
         void this.startHandoff(job.id, pending);
       }
     }
@@ -3902,12 +3910,14 @@ export class WaveRunner {
     return this.localTargetIdentity(lane.path, ref) ?? undefined;
   }
 
-  /** Own recovery/material debt is unwaivable regardless of target validity.
-   * Use the existing refusal/audit path before inspecting a caller's ref. */
+  /** Own recovery/material/onboarding-proof debt is unwaivable regardless of
+   * target validity. Use the existing refusal/audit path before inspecting a
+   * caller's ref. */
   private refuseOwnUnwaivableReviewDebt(jobId: string): void {
     const job = this.opts.ledger.getJob(jobId);
     if (job === null || isJobTerminal(job.status) ||
-      (!this.opts.ledger.hasOpenDirectiveRecoveryHold(jobId) && pendingWorkRevision(this.opts.ledger, job) === null)) return;
+      (!this.opts.ledger.hasOpenDirectiveRecoveryHold(jobId) && pendingWorkRevision(this.opts.ledger, job) === null &&
+        this.opts.ledger.onboardingProofDebt(jobId) === null)) return;
     const jobLane = this.opts.worktrees.listWorktrees({ jobId }).find((lane) => lane.kind === 'job') ?? null;
     if (jobLane === null) return; // Preserve setup's canonical missing-lane refusal.
     this.enforceBranchIdle({ job, jobLane, phase: 'arm',
@@ -3988,13 +3998,16 @@ export class WaveRunner {
     const revision = jobNow === null ? null : pendingWorkRevision(this.opts.ledger, jobNow);
     const verification = jobNow === null || isJobTerminal(jobNow.status) || revision !== null
       ? null : this.opts.ledger.correctiveVerificationDebt(input.job.id);
+    // #427 PR 1b: an onboarding heist's own unproven head fences ANY target.
+    const onboardingProof = jobNow === null || isJobTerminal(jobNow.status)
+      ? null : this.opts.ledger.onboardingProofDebt(input.job.id);
     if (
       jobNow !== null &&
       !isJobTerminal(jobNow.status) &&
       !blockers.some((blocker) => blocker.jobId === input.job.id) &&
       (this.opts.ledger.listPendingRebriefs({ jobId: input.job.id }).length > 0 ||
         this.opts.ledger.hasOpenDirectiveRecoveryHold(input.job.id) ||
-        revision !== null || verification !== null)
+        revision !== null || verification !== null || onboardingProof !== null)
     ) {
       blockers.push({
         jobId: input.job.id,
@@ -4004,6 +4017,7 @@ export class WaveRunner {
           : laneBranch(input.job.id),
         ...(revision !== null ? { revision } : {}),
         ...(verification !== null ? { verification } : {}),
+        ...(onboardingProof !== null ? { onboardingProof } : {}),
       });
     }
     return { targetBranch, blockers };
@@ -4013,7 +4027,7 @@ export class WaveRunner {
     jobId: string, roundId: string, idle: { readonly targetBranch: string; readonly blockers: readonly BranchIdleBlocker[] },
     authorization: ForceAuthorization,
   ): void {
-    const unaudited = idle.blockers.filter((blocker) => blocker.revision !== undefined ||
+    const unaudited = idle.blockers.filter((blocker) => blocker.revision !== undefined || blocker.onboardingProof !== undefined ||
       this.opts.ledger.hasOpenDirectiveRecoveryHold(blocker.jobId) ||
       !forceCoversBlocker(this.opts.ledger, authorization, blocker));
     if (unaudited.length === 0) return;
@@ -4047,9 +4061,10 @@ export class WaveRunner {
     // A retirement hold is a fresh-authorization boundary, not ordinary
     // branch activity. Neither force nor a foreign target may waive it. A
     // pending material correction is the same (owner rule 2): the candidate
-    // is outdated by an approved change, and no override reviews it.
+    // is outdated by an approved change, and no override reviews it. So is
+    // an unproven onboarding head (#427 PR 1b): force is not a proof.
     const held = blockers.some((blocker) =>
-      blocker.revision !== undefined || this.opts.ledger.hasOpenDirectiveRecoveryHold(blocker.jobId));
+      blocker.revision !== undefined || blocker.onboardingProof !== undefined || this.opts.ledger.hasOpenDirectiveRecoveryHold(blocker.jobId));
     if (blockers.length === 0 && input.force !== true) return { targetBranch, blockers, authorization };
     const forced = input.force === true && !held && (input.forceAuthorization === undefined ||
       blockers.every((blocker) => forceCoversBlocker(this.opts.ledger, input.forceAuthorization!, blocker, authorization.get(blocker.jobId))));
@@ -4362,6 +4377,24 @@ export class WaveRunner {
       });
       throw new BranchBusyError(targetBranch, blockers, 'arm');
     }
+    // #427 PR 1b: an unproven onboarding head refuses fallback admission
+    // even under force.
+    const onboardingProof = jobRow === null || isJobTerminal(jobRow.status) ? null : this.opts.ledger.onboardingProofDebt(input.jobId);
+    if (jobRow !== null && onboardingProof !== null) {
+      const targetBranch = resolveReviewTargetBranch({
+        jobId: input.jobId,
+        ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
+        lanePath: lane.path,
+        laneBranch: lane.branch,
+      });
+      const blockers: readonly BranchIdleBlocker[] = [{ jobId: input.jobId, status: jobRow.status, branch: targetBranch, onboardingProof }];
+      this.opts.ledger.appendCustomEvent({
+        kind: 'branch-idle.refused',
+        jobId: input.jobId,
+        payload: { phase: 'arm', forced: false, targetBranch, blockers },
+      });
+      throw new BranchBusyError(targetBranch, blockers, 'arm');
+    }
     if (input.fromHandoff === true) {
       const pending = this.handoffs.get(input.jobId);
       this.assertHandoffAuthorized(input.jobId, pending?.seq ?? -1);
@@ -4433,6 +4466,11 @@ export class WaveRunner {
         `an approved material correction for job "${input.jobId}" is pending delivery — the old diff cannot pass`,
       );
     }
+    if (this.opts.ledger.onboardingProofDebt(input.jobId) !== null) {
+      throw new FallbackSafetyRefusal(
+        `onboarding job "${input.jobId}" has no passing onboarding proof of its delivered head — the gate stops before the next review round`,
+      );
+    }
     if (fallbackWorkingStartedSince(this.opts.ledger, input.jobId, admission.statusSeq) ||
         (this.opts.ledger.latestCandidateDelivery(input.jobId)?.seq ?? 0) !== admission.deliverySeq ||
         (this.opts.ledger.latestJobEvent(input.jobId, 'silas.rebrief-settled')?.seq ?? 0) !== admission.settlementSeq ||
@@ -4481,7 +4519,7 @@ export class WaveRunner {
       ...findBusyLanes({ ledger: this.opts.ledger, lanes: lanesNow, targetBranch: admission.targetBranch }),
       ...findBusyLanes({ ledger: this.opts.ledger, lanes: [lane], targetBranch: normalizeBranch(lane.branch ?? laneBranch(input.jobId)) }),
     ];
-    if (busyNow.some((blocker) => input.force !== true || blocker.revision !== undefined ||
+    if (busyNow.some((blocker) => input.force !== true || blocker.revision !== undefined || blocker.onboardingProof !== undefined ||
       this.opts.ledger.hasOpenDirectiveRecoveryHold(blocker.jobId) ||
       !forceCoversBlocker(this.opts.ledger, admission.forceAuthorization, blocker))) {
       throw new FallbackSafetyRefusal(
@@ -5075,6 +5113,15 @@ export class WaveRunner {
         spec = appendRecordedVerification({
           spec,
           evidence,
+          log: (level, msg, fields) => this.log(level, msg, { job: job.id, ...fields }),
+        });
+        // #427 PR 1b: an onboarding heist's proof of exactly this head.
+        const proof = this.opts.ledger.listJobEventsByKinds(job.id, ['onboarding.proof'], { limit: 50 })
+          .find((event) => renderOnboardingProofEvidence(event, targetSha) !== null) ?? null;
+        spec = appendOnboardingProof({
+          spec,
+          block: renderOnboardingProofEvidence(proof, targetSha),
+          maxBytes: FROZEN_SPEC_MAX_BYTES,
           log: (level, msg, fields) => this.log(level, msg, { job: job.id, ...fields }),
         });
         spec = appendCiEvidence({

@@ -152,10 +152,82 @@ minion no new authority: it can already run any command in its lane.
 checkout's manifest differs from the lane's, the lane has none, or yours cannot
 be read, GC logs a `warn` that names both files.
 
+## Proof before review
+
+A minion wrote the manifest, so before Perkins or you review the PR, GC
+proves it in a throwaway checkout. The proof runs only the manifest's own
+commands; GC knows no ecosystem.
+
+**Which heads.** A job is an onboarding job only when an
+`onboarding.dispatched` event names it. Once the job has a PR, GC proves
+its newest delivered head (the `sha` of its newest `job.delivered`), once
+per head and one proof at a time across the service. A proof starts on a
+delivery or PR link, at service start, and at the five-minute reconcile.
+Proofs run in every mode: `off` stops new onboarding, never the gate on an
+open heist.
+
+**What runs:**
+
+1. `git clone --shared --no-checkout` of the managed repository into
+   `<data_dir>/onboarding-probes/<job>-<sha12>`, then a detached checkout of
+   the head. Your repository gains no worktree, branch, ref or index entry.
+2. That head's own manifest, applied as a lane's bootstrap applies it:
+   `[[link]]` and `[[copy]]` from your checkout, then each `[[setup]]`
+   command, timed, under `[worktrees] setup_timeout_ms`.
+3. `verify.full`, while holding one slot of the global verification budget
+   (the same FIFO and lock-wait timeout as `POST /api/verify`). GC spawns it
+   itself with the budget's environment and worker share, bounded by
+   `[verify] run_timeout_ms`, and ends its whole process group. It is not a
+   verification of the job: no `verification.*` event is recorded for the
+   `onboarding-proof` scope, and no verification fence sees it. A manifest
+   without `verify.full` passes this step as "no verify command declared".
+4. Measuring: the git-ignored paths that appeared, each sized with an
+   `lstat` walk that never follows a link, and the checkout's total size
+   without `.git`.
+
+The checkout is removed whatever the outcome, and a start removes any a
+crash left behind.
+
+**A proof fails** when a setup command fails or times out; when verify
+exits non-zero or times out; when verify exits 0 in under a second with no
+output ("suspiciously empty": it may test nothing); or when a `reclaim`
+entry did not appear, is not git-ignored, or holds tracked files.
+
+**A proof is deferred, never failed,** when the cause is infrastructure:
+the budget wait timed out, the repository is unavailable, the clone failed,
+or the service is stopping. Nothing is recorded, posted or sent; the next
+reconcile proves the head again.
+
+**What follows a proof:**
+
+- One `onboarding.proof` event, passed or failed, on the job.
+- One PR comment per proven head, with the timings, sizes and lane size,
+  carrying a hidden marker `<!-- gru:onboarding-proof job=<id> head=<sha> -->`.
+  GC records the attempt before posting and the receipt after; after a
+  crash it looks for a comment with the marker first and never posts blind.
+- On a pass, review may arm, and the Perkins packet carries an
+  `ONBOARDING PROOF` block when the proof's head is the reviewed sha.
+- On a failure, while that head is still the newest, the minion gets one
+  directive with the failure and the output tail (the property-repair
+  path). A lane that cannot take it now is asked again at the next
+  reconcile. A job's third failed proof also posts an action-required row
+  for Gru, `onboarding.proof-failing`, naming the job and the last failure.
+
+**The fence.** Until a passing proof exists for the newest delivered head,
+the lane is busy on every path a corrective verification fences: arm,
+freeze, queued handoff, fallback admission and iteration, and the Silas
+review offer. `force` cannot waive it (the `409 branch_busy` blocker
+carries `onboarding_proof_required_head`). A minion's own review request is
+queued, not refused, and is replayed when the `onboarding.proof` event
+lands. A new delivery is a new head: an earlier head's pass no longer
+counts. The Silas digest still offers registering the PR, since the proof
+needs it.
+
 ## Records
 
 Onboarding writes only `onboarding.*` ledger events (no table and no migration),
-its own notifications, and the heists it dispatches:
+its own notifications, the heists it dispatches, and the directives a
+failed proof sends:
 
 - `onboarding.proposed`
 - `onboarding.declined`
@@ -165,11 +237,15 @@ its own notifications, and the heists it dispatches:
 - `onboarding.dispatched`, carrying `launched_by`: `owner-accept`,
   `autonomous` or `installer-consent`
 - `onboarding.dispatch-failed`, naming each failure episode's row
+- `onboarding.proof`, a job event: the head, `passed` or `failed`, the
+  failures, setup timings, the verify result, what appeared, each `reclaim`
+  entry and the lane size
+- `onboarding.proof-comment-attempt` and `onboarding.proof-commented`, the
+  PR comment's attempt and receipt
 
 ## Not yet
 
-- Proving the manifest in a throwaway lane before review: setup, `verify.full`,
-  and measured `reclaim`.
 - Manifests kept in GC's own folder, for repositories GC cannot open a PR on.
 - Proposing re-onboarding when a repository's lanes keep failing setup.
-- Anything that uses `reclaim`. Today it is validated and recorded, nothing more.
+- Anything that deletes `reclaim` folders. Today they are validated, and an
+  onboarding proof checks them, nothing more.
