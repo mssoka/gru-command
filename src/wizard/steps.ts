@@ -19,13 +19,12 @@ import {
   expandTilde,
   type GruCommandConfig,
   loadConfig,
-  tomlString,
 } from '../config.js';
 import { discoverManagedRepos } from '../repos/discovery.js';
 import { renderReferenceConfig } from '../config-reference.js';
 import { DEFAULT_NEW_INSTALL_RUNTIME, type WizardAnswers } from './answers.js';
 
-export { tomlString, discoverManagedRepos };
+export { discoverManagedRepos };
 
 /**
  * Wizard steps (E9): the pure, testable half of the setup wizard —

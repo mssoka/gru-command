@@ -85,28 +85,30 @@ floors bypass).
 A freshly generated `$GRU_COMMAND_HOME/config.toml` (default:
 `~/.gru-command/config.toml`) already contains the complete decisions
 fragment: Jev switched off, the four live surfaces in `shadow`, and the
-risk-class thresholds. Turn Jev on by editing `enabled = true` in its
-`[decisions.jev]` table. Never paste a second copy: a table defined twice
-fails to load.
+risk-class thresholds. Turn Jev on by setting `enabled = true` in its
+`[decisions.jev]` table. Edit tables in place; never paste a second copy,
+because a table defined twice fails to load.
 
-A config with no decisions tables at all (no line starting with
-`[decisions`) can append it. A config hand-edited under earlier versions of
-this guide already has `[decisions.jev]`; edit that one in place instead.
+A config generated before the fragment shipped has no decisions block, or
+only the tables an operator added by hand. Bring it up to date before
+turning Jev on, from the install directory:
 
 ```sh
-CONFIG="${GRU_COMMAND_HOME:-$HOME/.gru-command}/config.toml"
-grep -q '^\[decisions' "$CONFIG" || node dist/decisions/cli.js config-template >> "$CONFIG"
-# To append the same complete fragment with enabled=true:
-grep -q '^\[decisions' "$CONFIG" || node dist/decisions/cli.js config-template --enabled true >> "$CONFIG"
+npm run config:generate -- --force
 ```
 
-Alternatively, regenerate the whole file with `npm run config:generate --
---force` from the checkout: it backs the old file up first and keeps every
-value you set. The decisions values come back in table form with defaults
-written out, and hand-written comments in the block are replaced. A config
-that has Jev on or names surfaces keeps exactly its own surface entries; one
-with Jev off and no surfaces gets the four shadow surfaces. The generated
-reference in [`CONFIG.md`](./CONFIG.md) shows the full fragment.
+The regenerate rebuilds the whole file from the reference. It backs the old
+file up first and keeps every value you set; hand-written comments anywhere
+in the file are not kept (the backup has them). A config with Jev off and no
+surfaces gains the four shadow surfaces. One that has Jev on or names
+surfaces keeps exactly its own surface entries, so list the missing
+surfaces with `mode = "shadow"` yourself before turning Jev on: an unlisted
+`event_triage` or `supervision_guidance` acts on Jev's answer with no
+backtest gate.
+
+`node dist/decisions/cli.js config-template` prints the same fragment, for
+reading or for copying into a config that has no decisions tables at all.
+The generated reference in [`CONFIG.md`](./CONFIG.md) shows it too.
 
 Configuration is strict: unknown fields, wrong types, out-of-range values, and
 `confirm >= act` are rejected. Destructive confirmation cannot be disabled.
@@ -142,32 +144,31 @@ Error mapping adds `422 → malformed_request` (a structurally rejected
 request is a wiring bug, not provider health); `401 → auth_rejected`,
 `403 → forbidden`, `429/5xx → provider_degraded` are unchanged.
 
-Example — route one surface through TypeSafe directly. A generated config
-already has a `[decisions.surfaces.event_triage]` table, so change its
-`provider` in place rather than adding a second definition:
+Example — route one surface through TypeSafe directly. Store the TypeSafe
+key first (`credentials set --slot typesafe --stdin`, see
+[Credentials](#credentials)). The built-in `typesafe-direct` profile needs
+no table of its own; change only the `provider` line in the surface's
+existing table:
 
 ```toml
-[decisions.providers.typesafe-direct]
-protocol = "systemone"
-endpoint = "https://api.typesafe.ai/v1/systemone"
-model = "jev-latest"
-credential = "typesafe"
-timeout_ms = 5000
-
 [decisions.surfaces.event_triage]
-provider = "typesafe-direct"
+provider = "typesafe-direct"   # was "openrouter-jev"
 mode = "shadow"
 ```
 
 Routing rules:
 
-- `[decisions.surfaces.<surface>]` maps a surface name to a profile name —
-  as the shorthand `event_triage = "typesafe-direct"` or as the explicit
-  table `[decisions.surfaces.event_triage]` with `provider =
-  "typesafe-direct"`. Use one form per surface, never both: a surface
-  defined as a table and as a shorthand key fails to load. Unlisted surfaces (and omitted surface arguments)
-  ride the default `openrouter-jev` profile — pre-profile behavior,
-  unchanged. The deterministic fallback never changes and stays the floor.
+- `[decisions.surfaces.<surface>]` maps a surface name to a profile name,
+  as the explicit table `[decisions.surfaces.event_triage]` with
+  `provider = "typesafe-direct"` or as the shorthand key
+  `event_triage = "typesafe-direct"` under `[decisions.surfaces]`. The
+  shorthand carries no `mode`, so for `event_triage` and
+  `supervision_guidance` it means the legacy behavior (Jev's answer used
+  with no backtest gate); prefer the table. Use one form per surface,
+  never both: a surface defined both ways fails to load. Unlisted surfaces
+  (and omitted surface arguments) ride the default `openrouter-jev`
+  profile — pre-profile behavior, unchanged. The deterministic fallback
+  never changes and stays the floor.
 - **Per-surface mode (issue #223).** The explicit table form also accepts
   `mode = "off" | "shadow" | "enforce"`. `off` serves the deterministic
   answer and never calls the provider. `shadow` asks the provider and

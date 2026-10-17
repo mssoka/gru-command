@@ -593,10 +593,8 @@ timeout_ms = 5000 # Per-call limit; on timeout the deterministic answer is used.
 #   same_blocker          is this review blocker the same defect as last round? (shadow only today)
 #   report_conclusion     clean pass / findings / inconclusive (backtest only; no live host yet)
 #
-# `provider` routes a surface to a provider profile (default: openrouter-jev).
-# Shorthand for routing only, in place of that surface's table (never both):
-#   [decisions.surfaces]
-#   event_triage = "typesafe-direct"
+# `provider` routes a surface to a provider profile (default: openrouter-jev);
+# change it in the surface's own table.
 [decisions.surfaces.event_triage]
 provider = "openrouter-jev"
 mode = "shadow"

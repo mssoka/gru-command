@@ -714,12 +714,12 @@ describe('docs/example.config.toml', () => {
     expect(config.runtimes.policies['pi']?.roles).toEqual({});
     expect(config.onboarding.mode).toBe('proposed');
     expect(config.decisions.jev.enabled).toBe(false);
-    expect(Object.values(config.decisions.surfaces).map((surface) => surface.mode)).toEqual([
-      'shadow',
-      'shadow',
-      'shadow',
-      'shadow',
-    ]);
+    expect(config.decisions.surfaces).toEqual({
+      event_triage: { provider: 'openrouter-jev', mode: 'shadow' },
+      supervision_guidance: { provider: 'openrouter-jev', mode: 'shadow' },
+      escalation_triage: { provider: 'openrouter-jev', mode: 'shadow' },
+      same_blocker: { provider: 'openrouter-jev', mode: 'shadow' },
+    });
   });
 });
 
