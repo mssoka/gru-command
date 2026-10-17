@@ -200,7 +200,7 @@ const PINS: Record<string, number> = {
   'gc-bootstrap-retirement.test.ts': 6,
   'bmad-runtime-packaged.test.ts': 1,
   'bmad-runtime.test.ts': 15,
-  'workflow-runtime.test.ts': 17,
+  'workflow-runtime.test.ts': 20,
   'workflow-runtime-packaged.test.ts': 2,
   'workflow-session.test.ts': 21,
   'worker-verification-policy.test.ts': 57,

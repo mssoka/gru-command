@@ -18,6 +18,9 @@ project knowledge under {{context.knowledgeRoot}} through the assigned worktree.
 3. Development review is not native Perkins clearance. Preserve the existing
    native independent-review and exact-final-head Perkins release gates.
    A fallback or development PASS must never be presented as native READY.
-4. Give a concise handoff: changed paths, PR/commit, executed checks and review
-   outcome. Do not create a documentation-only or run-all-tests completion issue,
-   and do not hide missing required work behind a success summary.
+4. Give a concise handoff: changed paths, PR/commit, executed checks, the recorded
+   risk and review outcome — naming every finding not fixed in this change
+   (rejected, owner ruling, owner decision pending, pre-existing or unsettled) and
+   every corrected spec detail with its evidence. Do not create a
+   documentation-only or run-all-tests completion issue, and do not hide missing
+   required work behind a success summary.

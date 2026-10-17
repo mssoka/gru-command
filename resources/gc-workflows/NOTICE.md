@@ -3,6 +3,9 @@
 The build/planning/review templates are adapted from the useful BMad Method
 6.12.0 delivery templates initially bundled by GC in #283, from
 https://github.com/bmad-code-org/BMAD-METHOD (© BMad Code, LLC, MIT).
+The verification-gap, edge-case and intent-alignment review methods, the
+finding-verdict triage and the risk/I-O-matrix planning fields were later
+adapted from the BMad Method 6.13.0-next delivery skills from the same source.
 The original license is retained beside this notice as LICENSE.
 
 These are directly editable GC resources. GC owns the resulting workflows,
