@@ -57,11 +57,14 @@ this is routing compatibility, not an external BMAD dependency.
 ## Supported delivery paths
 
 - `gc-build`: normal route — investigate/plan, implement, independent tracked
-  three-lens review via commissioned service review jobs, reasoned fixes,
+  four-lens review via commissioned service review jobs (blind adversarial,
+  edge-case path tracing, verification gaps, intent alignment), reasoned fixes,
   verification and ordinary PR handoff. Generic child workers/untracked terminals
   do not replace a GC job's commissioned review handback/disposition.
 - Small-change route — reduced planning plus at least one fresh independent
-  adversarial reviewer, reasoned fixes, verification and ordinary PR handoff.
+  adversarial reviewer, widened by the risk recorded before review (`medium` adds
+  the verification and edge-case lenses, `high` or unrecorded uses all four),
+  reasoned fixes, verification and ordinary PR handoff.
 - Planning and review helper entrypoints are also independently resolvable.
 
 All required templates, reviewer prompts, evidence/deletion checks and the
@@ -70,6 +73,16 @@ global skill or unshipped checkout file is required for these new resources.
 No minimum finding quota or total/per-phase tool-call ceiling applies; a clean
 review may return `No actionable findings.` Review needs actual independent
 tracked runs/sessions, not author self-review or merely sending a prompt.
+
+Triage verifies every finding at its cited location and gives exactly one verdict:
+`high`, `medium`, `low`, `false` or `maybe-false`. Reviewer-assigned severity is
+ignored. `false` findings are rejected on their refutation. A `low` finding is
+rejected when users or developers are unlikely to meet it in everyday use and its
+fix adds complexity beyond a direct correction or deletion (owner ruling
+2026-10-17). On a re-review, a finding that matches a logged row whose code is
+unchanged is carried forward, not re-verified or re-fixed. Every finding keeps a
+row and reason in the private triage log; pre-existing defects and unsettled
+`maybe-false` findings are named in the handoff, not opened as new backlog.
 Development/fallback PASS is never native exact-final-head Perkins READY.
 
 ## Explicit invocation context

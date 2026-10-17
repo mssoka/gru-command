@@ -12,8 +12,13 @@ fallbacks. Record decisions and deviations with reasons.
 
 Stage and inspect the complete diff against the recorded base, including new files.
 Audit every task, acceptance scenario and meaningful edge case against code and
-executed evidence. Finish missing work before claiming completion. Capture exact
-commands, outcomes and full canonical candidate head beneath the private artifact
-root. Do not claim a skipped/unexecuted test passed.
+executed evidence. When the spec has an I/O and edge-case matrix, every row needs
+a test that verifies its expected behavior and that ran and passed in the recorded
+verification; a covering test that did not run (unregistered, filtered out,
+skipped or disabled) counts as missing. When a test disagrees with a row, never
+edit the expectation to match the code: fix the code, or obtain an owner decision
+when the row itself is ambiguous. Finish missing work before claiming completion.
+Capture exact commands, outcomes and full canonical candidate head beneath the
+private artifact root. Do not claim a skipped/unexecuted test passed.
 
 Continue to [[gc-resource:skills/gc-build/review.md]].

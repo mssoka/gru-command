@@ -29,7 +29,7 @@ handback/disposition using the shipped minion playbook.
 
 Independent terminal sessions are permitted only for explicit owner-directed
 external development outside a GC job, with durable session/pane receipts; a GC
-minion must not use this exception. The normal route uses all three lenses in
+minion must not use this exception. The normal route uses all four lenses in
 parallel when the runtime supports it:
 
 - [[gc-resource:skills/gc-build/review-prompts/adversarial.md]] — diff and repository,
@@ -45,13 +45,19 @@ parallel when the runtime supports it:
   blind reviewer an unfiltered historical diff, and never count a blind report as
   independent coverage unless `GET /api/dispatch/jobs/<review job>/blind-coverage` says
   `qualifying`; settling a report is not validity.
-- [[gc-resource:skills/gc-build/review-prompts/edge-cases.md]] — diff, relevant code and
-  acceptance scenarios; boundary/failure paths. Claims-needed lens: `"review_role": "claims"`.
+- [[gc-resource:skills/gc-build/review-prompts/edge-cases.md]] — diff and relevant code,
+  with the working spec's intent and acceptance as the claims input it reads only after
+  tracing paths. Claims-needed lens: `"review_role": "claims"`.
 - [[gc-resource:skills/gc-build/review-prompts/verification.md]] — diff, approved intent,
   tests and exact executed verification evidence. Claims-needed lens: `"review_role": "claims"`.
+- [[gc-resource:skills/gc-build/review-prompts/intent-alignment.md]] — diff and its tests
+  plus the verbatim owner-approved intent quoted into the brief; never the author's
+  explanation, task list or self-review. Claims-needed lens: `"review_role": "claims"`.
 
-The small-change route requires the fresh adversarial reviewer; add the other
-lenses when warranted. Never substitute author self-review for a reviewer. If
+The small-change route requires the fresh adversarial reviewer and widens with the
+risk recorded before review: `medium` adds the verification and edge-case lenses,
+`high` uses all four, and an unrecorded risk counts as `high`. Never substitute
+author self-review for a reviewer. If
 independent execution is unavailable or fails, report the infrastructure failure;
 review remains incomplete, not a fabricated pass. Do not silently change the
 owner-selected review model or launch protocol.
@@ -68,15 +74,59 @@ Do not manufacture defects to fill a target. These rules apply to both routes.
 
 ## Triage and fixes
 
-Inspect each claim against code. Classify concrete actionable defects separately
-from speculation/style, explain severity/evidence, and record a reasoned disposition
-for every finding. Refute false positives with evidence, not dismissal. Use
-[[gc-resource:skills/gc-build/references/claims-check.md]] to check evidence honesty
-and [[gc-resource:skills/gc-build/references/deletion-check.md]] for removals.
+Triage only after every launched reviewer has reported. Disregard any severity a
+reviewer assigned. Record one row per finding in the review triage log of the
+working spec (or small-change note) under the private artifact root — verdict,
+evidence and a reasoned disposition for every finding; never drop, merge or
+silently skip one.
 
-Fix all actionable in-scope defects and add/run regressions. When findings expose
-wrong acceptance, obtain an explicit owner decision; do not silently rewrite intent
-or create a completion claim. Do not offload known required work into new backlog.
+On a re-review of a changed head, match each finding against the logged rows
+first. Same location and same claim as a logged row, and the code there still
+reads as the row describes: keep that row's verdict and disposition and log it
+again as `carried`, without re-verifying or re-fixing it. Verify everything else.
+
+Verify each remaining claim: at the cited file and line, does the bad outcome
+actually occur? Read past the changed lines — callers, upstream guards — until you
+can answer yes or no. A different finding about nearby code does not settle this
+one; judge whether the problem is real, not whether the proposed fix is plausible.
+Code that fails loudly on a state you have not shown the program can reach is
+correct behavior, not a defect. Render exactly one verdict:
+
+- `high` (intolerable), `medium` (tolerable) or `low` (cosmetic or negligible) —
+  the bad outcome is real. Grade by harm to users or developers; for a
+  developer-only problem name where it causes trouble (which caller diverges,
+  which rule breaks). A complaint with no named harm is not a grade: use `false`
+  or `maybe-false`. When the harm is real but its size is unclear, grade higher.
+- `false` — you checked and the outcome does not occur. Record what disproves this
+  specific claim; a true fact about nearby code is not a disproof.
+- `maybe-false` — the diff and surrounding code cannot decide it. Record what
+  would.
+
+Reject `false` findings on their refutation. Reject a `low` finding when users or
+developers are unlikely to meet the defect in everyday use (judged plainly; no
+proof needed) and its fix is more than a direct correction or deletion — new
+guards, branches, parameters or other complexity. Treat a finding as out of scope
+only when the approved intent itself excludes it, not because the spec's task
+list or the diff's shape leaves it out. Each rejection keeps its row and reason.
+
+Group the survivors by shared root cause — the same defect produced both, not
+merely the same location or the same fix — and give each group its highest
+verdict. Then:
+
+- A group of only `maybe-false` members that would be `medium` or `high` if true:
+  run the check that decides it (read the deciding code, run the test) and grade
+  it again. One that cannot be settled is named in the handoff with what would
+  settle it; one that would only be `low` is rejected with that note.
+- A defect this change neither caused nor exposed: log it as pre-existing with
+  its evidence and name it in the handoff; do not open new backlog for it.
+- Findings that expose wrong or incomplete acceptance need an explicit owner
+  decision; do not silently rewrite intent or create a completion claim.
+- Fix all actionable in-scope defects — every other surviving group — and
+  add/run regressions.
+
+Use [[gc-resource:skills/gc-build/references/claims-check.md]] to check evidence
+honesty and [[gc-resource:skills/gc-build/references/deletion-check.md]] for
+removals. Do not offload known required work into new backlog.
 Re-engage independent reviewers on the resulting changed head; preserve previous
 receipts and record what changed. Re-run affected verification and confirm exact
 final-head coverage before concluding review.
