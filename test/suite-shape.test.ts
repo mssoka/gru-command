@@ -253,7 +253,7 @@ const PINS: Record<string, number> = {
   'job-amendments.test.ts': 11,
   'lan-phone-raw-client.test.ts': 6,
   'lane-lifecycle.test.ts': 111,
-  'cleanup-repair.test.ts': 38,
+  'cleanup-repair.test.ts': 41,
   'disk-budget.test.ts': 34,
   'ledger-api.test.ts': 99,
   'ledger-pipeline.test.ts': 22,
