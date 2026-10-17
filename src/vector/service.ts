@@ -7,6 +7,7 @@ import { parseNotificationDecision, type NotificationDecision } from '../ledger/
 import type { LogLevel } from '../logger.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { PackageResolution } from '../property/types.js';
+import { vectorBoardView, type VectorBoardView } from './board.js';
 import { buildRaidCandidates, RETRYABLE_OUTCOMES, type RaidCandidate, type RaidCandidateList } from './candidates.js';
 import { breakInContract, fixHeistJobId, fixHeistTitle, renderFixBriefing } from './fix.js';
 import {
@@ -230,6 +231,13 @@ export class VectorService {
   /** Spend and yield per repository across every raid that ran anything (#351 §5). */
   rollup(): readonly RepositoryRollup[] {
     return repositoryRollups(this.store.raids());
+  }
+
+  /** The board's raid counts (the cockpit's VECTOR RAIDS card). Read with
+   * raids off too: the card then says so, and records kept from when they
+   * were on still count. */
+  boardView(): VectorBoardView {
+    return vectorBoardView({ config: this.opts.vector, raids: this.store.raids(), breakIns: this.store.breakIns(), now: this.now() });
   }
 
   /**

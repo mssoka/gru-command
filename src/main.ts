@@ -89,6 +89,7 @@ import { createSessionLessonsCapture } from './lessons/capture.js';
 import { createReviewOutcomeCapture } from './lessons/review-capture.js';
 import { createLessonsServer } from './lessons/server.js';
 import { startVectorHalves, VectorService } from './vector/service.js';
+import type { VectorBoardView } from './vector/board.js';
 import { createVectorServer } from './vector/server.js';
 import { OnboardingService, startOnboarding, type OnboardingDispatchInput, type OnboardingProofDirective } from './onboarding/service.js';
 import { onboardingProbesDir } from './onboarding/proof.js';
@@ -466,6 +467,9 @@ async function main(): Promise<number> {
   // The disk row (#427 PR 3): late-bound too — the disk service needs the
   // worktree manager, expiry and the verification server below.
   let diskBoardView: () => DiskBoardView | null = () => null;
+  // The raids card (#351): late-bound too — the Vector service is built
+  // after the engine.
+  let vectorBoardView: () => VectorBoardView | null = () => null;
   // Durable pipeline queue (owner approvals j-239/j-1064): late-bound too —
   // the mechanical consumer is constructed after the dispatcher it feeds.
   let pipelineView: () => import('./ledger/pipeline.js').PipelineBoardView | null = () => null;
@@ -530,6 +534,7 @@ async function main(): Promise<number> {
     repoOverview: () => repoOverview.view(),
     verifyQueue: () => verificationView(),
     disk: () => diskBoardView(),
+    vector: () => vectorBoardView(),
     pipeline: () => pipelineView(),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
@@ -643,6 +648,7 @@ async function main(): Promise<number> {
     },
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+  vectorBoardView = () => vector.boardView();
   const vectorServer = createVectorServer({ token: config.auth.token, service: vector, log: (level, msg, fields) => logger.log(level, msg, fields) });
   // Onboarding heists (#427): code finds managed repositories whose origin
   // has no manifest and proposes (or dispatches) a manifest PR for each. The

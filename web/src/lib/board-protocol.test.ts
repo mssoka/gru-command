@@ -731,6 +731,44 @@ describe('board server-frame validator', () => {
   });
 });
 
+describe('vector raids block (#351)', () => {
+  const vector = (): Record<string, unknown> => ({
+    enabled: true,
+    raidMode: 'proposed',
+    proposed: 1,
+    queued: 0,
+    running: [{ repo: 'gru-command', packageDir: 'packages/web', roundsDone: 1, maxRounds: 4, startedAt: '2026-10-17T19:00:00.000Z' }],
+    startedLast24h: 1,
+    maxRaidsPerDay: 2,
+    breakIns: 1,
+    fixesAwaitingOwner: 1,
+  });
+
+  it('is optional (an older server sends none), and a present block passes only with its full shape', () => {
+    expect(isValidSnapshot({ ...snapshot(), vector: undefined })).toBe(true);
+    expect(isValidSnapshot({ ...snapshot(), vector: null })).toBe(true);
+    expect(isValidSnapshot({ ...snapshot(), vector: vector() })).toBe(true);
+    expect(isValidSnapshot({ ...snapshot(), vector: { ...vector(), enabled: false, raidMode: 'autonomous', running: [] } })).toBe(true);
+  });
+
+  it('rejects a malformed block: a guessed count or mode never renders', () => {
+    const broken: readonly Record<string, unknown>[] = [
+      { ...vector(), enabled: 'yes' },
+      { ...vector(), raidMode: 'manual' },
+      { ...vector(), proposed: -1 },
+      { ...vector(), queued: 1.5 },
+      { ...vector(), startedLast24h: '1' },
+      { ...vector(), maxRaidsPerDay: null },
+      { ...vector(), breakIns: undefined },
+      { ...vector(), fixesAwaitingOwner: Number.NaN },
+      { ...vector(), running: null },
+      { ...vector(), running: [{ repo: 'gru-command', packageDir: 'packages/web', roundsDone: 1, maxRounds: 4 }] },
+      { ...vector(), running: [{ repo: 'gru-command', packageDir: 7, roundsDone: 1, maxRounds: 4, startedAt: 'x' }] },
+    ];
+    for (const block of broken) expect(isValidSnapshot({ ...snapshot(), vector: block }), JSON.stringify(block)).toBe(false);
+  });
+});
+
 describe('provider pacing mirror (server parity)', () => {
   /** A valid snapshot carrying the mirrored pacing gate block. */
   function pacingSnapshot(): Record<string, unknown> {

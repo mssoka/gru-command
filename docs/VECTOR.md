@@ -280,3 +280,25 @@ as a number: turning raids off is your call.
   finds the fix heist's job already exists (the earlier dispatch landed but
   its record did not) counts it as dispatched and never dispatches twice. A
   successful retry closes the row.
+
+## On the board
+
+The board snapshot carries a `vector` block, so the board can show raids
+without calling the raid API. It is sent with raids off too, as
+`enabled: false`, and counts records kept from when raids were on. It holds:
+
+- `enabled` and `raidMode`;
+- `proposed`: raids Gru picked that wait for you in FOR YOU;
+- `queued`: launched raids waiting in Silas's raid queue;
+- `running`: the raid running now, with its target, the attacks finished so
+  far (`roundsDone`, the one in progress is not counted), `maxRounds` and when
+  it started. One raid runs per host, so this holds at most one in normal
+  operation; a second is shown, never hidden;
+- `startedLast24h` (all repositories) and `maxRaidsPerDay` (the cap per
+  repository);
+- `breakIns`, every confirmed break-in so far, and `fixesAwaitingOwner`, the
+  break-ins whose fix heist waits for you.
+
+An older server sends no block, and the board then shows no raids card rather
+than zeros. A block that fails to read is logged and left out; the rest of the
+snapshot still renders.

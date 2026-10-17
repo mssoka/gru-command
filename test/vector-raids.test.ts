@@ -15,6 +15,7 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import type { PackageResolution } from '../src/property/types.js';
 import { parseWorktreeManifest } from '../src/worktrees/manifest.js';
+import { BoardEngine } from '../src/board/engine.js';
 import { buildRaidCandidates, rankScore } from '../src/vector/candidates.js';
 import { VECTOR_EVENTS, VectorLedger } from '../src/vector/ledger.js';
 import { createVectorServer } from '../src/vector/server.js';
@@ -547,6 +548,70 @@ describe('raid service wiring (#351)', () => {
       expect(started, failing).toEqual(['planning', 'runner']);
       expect(logged, failing).toEqual([`error: vector raid ${failing} failed to start`]);
     }
+  });
+});
+
+describe('the board view: the cockpit raids card (#351)', () => {
+  const breakInPayload = (raidId: string, breakInId: string) => ({
+    break_in_id: breakInId, raid_id: raidId, repo: 'billing', package_dir: 'src/refunds', head_sha: 'h', source_identity: 's',
+    description: 'refund drops the cents', requirement_ref: 'REQ-1', invariant: 'refund(x) === x', frozen_sha256: 'f',
+    evidence_dir: '/evidence', test_path: 'refund.property.test.js', test_sha256: 't',
+  });
+
+  it('follows one raid from proposal to a running attack to a break-in whose fix waits for the owner', () => {
+    const h = harness();
+    const start = new Date();
+    let now = start;
+    const service = h.service({ maxRounds: 4, maxRaidsPerDay: 2 }, () => now);
+    service.start();
+    expect(service.boardView()).toEqual({
+      enabled: true, raidMode: 'proposed', proposed: 0, queued: 0, running: [], startedLast24h: 0, maxRaidsPerDay: 2, breakIns: 0, fixesAwaitingOwner: 0,
+    });
+    const [raid] = service.pick({ picks: [pickRefunds()], digest: null, requestedBy: 'gru' }).raids;
+    expect(service.boardView()).toMatchObject({ proposed: 1, queued: 0 });
+    const [card] = h.rows(RAID_PROPOSAL_KIND);
+    h.notifications.decide(card!.id, 'accept', 'web', card!.decision!);
+    expect(service.boardView()).toMatchObject({ proposed: 0, queued: 1, running: [] });
+    h.ledger.appendCustomEvent({ kind: VECTOR_EVENTS.started, payload: { raid_id: raid!.id, head_sha: 'h' } });
+    h.ledger.appendCustomEvent({ kind: VECTOR_EVENTS.round, payload: { raid_id: raid!.id, outcome: 'rejected', verdict: 'rejected' } });
+    const running = service.boardView();
+    expect(running).toMatchObject({ queued: 0, startedLast24h: 1, running: [{ repo: 'billing', packageDir: 'src/refunds', roundsDone: 1, maxRounds: 4 }] });
+    expect(Date.parse(running.running[0]!.startedAt)).not.toBeNaN();
+    h.ledger.appendCustomEvent({ kind: VECTOR_EVENTS.breakIn, payload: breakInPayload(raid!.id, 'bi-1') });
+    h.ledger.appendCustomEvent({ kind: VECTOR_EVENTS.fixProposed, payload: { break_in_id: 'bi-1', notification_id: 'vector-fix:bi-1' } });
+    h.ledger.appendCustomEvent({ kind: VECTOR_EVENTS.finished, payload: { raid_id: raid!.id, outcome: 'found', label: 'found a break-in', detail: 'd' } });
+    expect(service.boardView()).toMatchObject({ running: [], startedLast24h: 1, breakIns: 1, fixesAwaitingOwner: 1 });
+    // A dispatched fix no longer waits for the owner; the break-in still counts.
+    h.ledger.appendCustomEvent({ kind: VECTOR_EVENTS.fixDispatched, payload: { break_in_id: 'bi-1', job_id: 'job-fix', launched_by: 'owner-accept' } });
+    expect(service.boardView()).toMatchObject({ breakIns: 1, fixesAwaitingOwner: 0 });
+    // The rolling day ends 24 hours after the start.
+    now = new Date(start.getTime() + 25 * 3_600_000);
+    expect(service.boardView()).toMatchObject({ startedLast24h: 0 });
+  });
+
+  it('with raids off the card still gets its block, saying so, and records kept from when they were on still count', () => {
+    const h = harness();
+    const on = h.service({ raidMode: 'autonomous' });
+    on.pick({ picks: [pickRefunds()], digest: null, requestedBy: 'gru' });
+    const off = h.service({ enabled: false, raidMode: 'autonomous' });
+    off.start();
+    expect(off.boardView()).toMatchObject({ enabled: false, raidMode: 'autonomous', queued: 1 });
+  });
+
+  it('reaches the board snapshot; a failing read is logged and shows no card, never a broken snapshot', () => {
+    const h = harness();
+    const service = h.service();
+    const engine = new BoardEngine({ ledger: h.ledger, bus: h.bus, vector: () => service.boardView() });
+    const snapshot = JSON.parse(JSON.stringify(engine.snapshot())) as Record<string, unknown>;
+    expect(snapshot['vector']).toEqual(service.boardView());
+    const logged: string[] = [];
+    const broken = new BoardEngine({
+      ledger: h.ledger, bus: h.bus, log: (level, msg) => logged.push(`${level}: ${msg}`),
+      vector: () => { throw new Error('projection broke'); },
+    });
+    expect(broken.snapshot().vector).toBeNull();
+    expect(logged).toContain('error: vector view read failed');
+    expect(new BoardEngine({ ledger: h.ledger, bus: h.bus }).snapshot().vector).toBeNull();
   });
 });
 
