@@ -2544,7 +2544,8 @@ export class WorktreeManager {
     // `--untracked-files=all` overrides the repository's own
     // `status.showUntrackedFiles` (#427): a repository that hides untracked
     // files from `git status` still has every one copied. An untracked
-    // folder holding a `.git` is copied whole, its `.git` with it. The
+    // folder holding a `.git` is copied whole, its `.git` with it, all but
+    // what that repository ignores ({@link nestedIgnored}). The
     // untracked files of nested repositories (#427, at any depth) are
     // copied too, under their paths, unless an untracked folder holds them
     // already (a submodule folder only the lane's git folder still names).
@@ -2552,10 +2553,11 @@ export class WorktreeManager {
     const folders = listed.filter((rel) => rel.endsWith('/'));
     const untracked = [...new Set([...listed, ...nested.filter((rel) => !folders.some((folder) => rel !== folder && rel.startsWith(folder)))])];
     if (untracked.length === 0) return null;
+    const excluded = await this.nestedIgnored(row.path, untracked);
     // A retry of a release that aborted after its records (#427) reuses that
     // release's copy while the untracked files are unchanged: no new folder
     // and no new record.
-    const reused = this.reusablePreservation(row, untracked, attempt.aborted);
+    const reused = this.reusablePreservation(row, untracked, excluded, attempt.aborted);
     if (reused !== null) {
       attempt.preserveReused = true;
       attempt.copyRecorded = true;
@@ -2565,7 +2567,7 @@ export class WorktreeManager {
     const destination = join(this.opts.preserveRoot, row.id, new Date().toISOString().replace(/[:.]/g, '-'));
     let preservedCount = 0;
     try {
-      preservedCount = await this.copyUntracked(row, untracked, destination);
+      preservedCount = await this.copyUntracked(row, untracked, destination, excluded);
     } catch (error) {
       // A copy that failed part way is not kept (#427): the tree is.
       this.withdrawPreservation(row, { count: 0, destination });
@@ -2581,12 +2583,13 @@ export class WorktreeManager {
   }
 
   /** An aborted release's preserve copy, when it still holds exactly the
-   * lane's untracked files (the same paths, links and bytes); else null. */
-  private reusablePreservation(row: WorktreeRecord, untracked: readonly string[], aborted: AbortedRelease | null): SweepPreservation | null {
+   * lane's untracked files (the same paths, links and bytes, `excluded`
+   * left out as the copy leaves them out); else null. */
+  private reusablePreservation(row: WorktreeRecord, untracked: readonly string[], excluded: ReadonlySet<string>, aborted: AbortedRelease | null): SweepPreservation | null {
     const copy = aborted?.preserved ?? null;
     if (copy === null || !existsSync(copy.destination)) return null;
     try {
-      return contentFingerprint(row.path, untracked) === contentFingerprint(copy.destination, null) ? copy : null;
+      return contentFingerprint(row.path, untracked, excluded) === contentFingerprint(copy.destination, null) ? copy : null;
     } catch (error) {
       this.log('warn', 'an aborted release\'s preserve copy could not be compared with the lane; the untracked files are copied afresh', { id: row.id, destination: copy.destination, error: String(error) });
       return null;
@@ -2625,8 +2628,10 @@ export class WorktreeManager {
 
   /** Copy paths of a lane into `destination`, off the event loop (#427). A
    * FIFO, socket or device, named or met inside a folder, is skipped with a
-   * warn naming it and never opened: opening a FIFO waits for a writer. */
-  private async copyUntracked(row: WorktreeRecord, untracked: readonly string[], destination: string): Promise<number> {
+   * warn naming it and never opened: opening a FIFO waits for a writer. A
+   * path in `excluded` (by its path in the lane) met inside a folder is not
+   * copied. */
+  private async copyUntracked(row: WorktreeRecord, untracked: readonly string[], destination: string, excluded: ReadonlySet<string>): Promise<number> {
     let preservedCount = 0;
     const special = (rel: string): void => {
       this.log('warn', 'special file not preserved: a FIFO, socket or device is never opened', { id: row.id, rel });
@@ -2665,6 +2670,7 @@ export class WorktreeManager {
           await cpAsync(source, dest, {
             recursive: true,
             filter: async (from) => {
+              if (excluded.has(relative(row.path, from))) return false;
               const entry = await lstatAsync(from);
               if (entry.isFile() || entry.isDirectory() || entry.isSymbolicLink()) return true;
               special(relative(row.path, from));
@@ -3024,9 +3030,16 @@ export class WorktreeManager {
       for (const child of [...this.nestedRepos(parent), ...this.ignoredRepos(parent)]) {
         // A gitlink folder holding files but no `.git`: a submodule never
         // initialized there, where something wrote files git does not list.
-        // They are untracked content: the preserve copy takes them.
+        // They are untracked content: the preserve copy takes them, all but
+        // what the repository around it ignores.
         if (!child.populated && !child.disposable && child.gitlinks.some(([sha]) => sha !== undefined) && folderHoldsFiles(join(row.path, child.path))) {
-          untracked.push(`${child.path}/`);
+          const rel = parent.path === '' ? child.path : child.path.slice(parent.path.length + 1);
+          // An index that does not exist holds no gitlink to hide the folder.
+          const listed = runGit(parent.checkout, ['ls-files', '-z', '--others', '--exclude-standard', '--', `${rel}/`], {
+            indexFile: join(tmpdir(), `gru-no-index-${randomUUID()}`, 'index'),
+            maxBuffer: LISTING_MAX_BUFFER,
+          });
+          untracked.push(...listed.split('\0').filter((entry) => entry !== '').map((entry) => (parent.path === '' ? entry : `${parent.path}/${entry}`)));
         }
         // Never initialized in the lane: nothing else of it is the lane's to lose.
         if (child.gitDir === null || seen.has(directoryKey(child.gitDir))) continue;
@@ -3092,16 +3105,16 @@ export class WorktreeManager {
   private ignoredRepos(parent: NestedParent): readonly NestedRepo[] {
     const listed = runGit(parent.checkout, ['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory'], { maxBuffer: LISTING_MAX_BUFFER });
     const repos: NestedRepo[] = [];
-    const look = (rel: string, depth: number): void => {
-      if (basename(rel) === 'node_modules') return;
-      const dir = join(parent.checkout, rel);
-      if (pathOnDisk(join(dir, '.git'))) {
+    for (const entry of listed.split('\0')) {
+      if (!entry.endsWith('/')) continue;
+      for (const rel of this.repositoryFolders(parent.checkout, entry.slice(0, -1))) {
+        const dir = join(parent.checkout, rel);
         const found = spawnGit(dir, ['rev-parse', '--absolute-git-dir', '--show-toplevel']);
         const [gitDir = '', top = ''] = found.stdout.trim().split('\n');
         // Git found the repository around it: the `.git` there is none.
         if (found.status !== 0 || directoryKey(top) !== directoryKey(dir)) {
           this.log('warn', 'an ignored folder holds a .git that git does not read as a repository; nothing in it is checked', { path: dir });
-          return;
+          continue;
         }
         repos.push({
           path: parent.path === '' ? rel : `${parent.path}/${rel}`,
@@ -3113,20 +3126,45 @@ export class WorktreeManager {
           disposable: false,
           gitlinks: [],
         });
-        return;
       }
-      if (depth >= IGNORED_REPO_DEPTH) return;
-      let entries: Dirent[];
-      try {
-        entries = readdirSync(dir, { withFileTypes: true });
-      } catch (error) {
-        this.log('warn', 'an ignored folder could not be read; GC does not look for repositories in it', { path: dir, error: String(error) });
-        return;
-      }
-      for (const entry of entries) if (entry.isDirectory()) look(`${rel}/${entry.name}`, depth + 1);
-    };
-    for (const entry of listed.split('\0')) if (entry.endsWith('/')) look(entry.slice(0, -1), 0);
+    }
     return repos;
+  }
+
+  /** {@link repositoryFolders}, a folder that cannot be read logged by name. */
+  private repositoryFolders(root: string, rel: string): string[] {
+    return repositoryFolders(root, rel, (dir, error) => {
+      this.log('warn', 'a folder could not be read; GC does not look for repositories in it', { path: dir, error: String(error) });
+    });
+  }
+
+  /** What a copy of whole folders leaves out (#427): each folder in
+   * `untracked` (a path ending in `/`), and each folder in it, that holds a
+   * `.git` git reads as its own is a repository whose ignored paths (`git
+   * ls-files --others --ignored --exclude-standard --directory` there) are
+   * not copied, `.env.local` with them. An ignored folder that is, or holds,
+   * a repository is copied (its repositories judged the same way): its
+   * commits live nowhere else. By their paths below `root`. */
+  private async nestedIgnored(root: string, untracked: readonly string[]): Promise<ReadonlySet<string>> {
+    const excluded = new Set<string>();
+    const queue = untracked.filter((rel) => rel.endsWith('/')).flatMap((rel) => this.repositoryFolders(root, rel.slice(0, -1)));
+    for (let repo = queue.shift(); repo !== undefined; repo = queue.shift()) {
+      const dir = join(root, repo);
+      // An error is an answer here: git does not read it as a repository.
+      const top = (await runGitAsync(dir, ['rev-parse', '--show-toplevel']).catch(() => '')).trim();
+      if (top === '' || directoryKey(top) !== directoryKey(dir)) {
+        this.log('warn', 'a folder being copied holds a .git that git does not read as its own repository; what it ignores is copied with it', { path: dir });
+        continue;
+      }
+      for (const entry of (await runGitAsync(dir, ['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory'], { maxBuffer: LISTING_MAX_BUFFER })).split('\0')) {
+        if (entry === '') continue;
+        const rel = `${repo}/${entry.replace(/\/$/u, '')}`;
+        const held = entry.endsWith('/') ? this.repositoryFolders(root, rel) : [];
+        if (held.length > 0) queue.push(...held);
+        else excluded.add(rel);
+      }
+    }
+    return excluded;
   }
 
   /** The repositories nested directly in one (#427): every gitlink its index
@@ -3469,11 +3507,11 @@ export class WorktreeManager {
    * as `worktree.preserved` with `remains: true`. */
   private async preserveRemains(row: WorktreeRecord): Promise<SweepPreservation | null> {
     const remains = await this.remainsToCopy(row);
-    if (remains.length === 0) return null;
+    if (remains.paths.length === 0) return null;
     const destination = join(this.opts.preserveRoot, row.id, new Date().toISOString().replace(/[:.]/g, '-'));
     let count: number;
     try {
-      count = await this.copyUntracked(row, remains, destination);
+      count = await this.copyUntracked(row, remains.paths, destination, remains.excluded);
     } catch (error) {
       this.withdrawPreservation(row, { count: 0, destination });
       throw error;
@@ -3497,9 +3535,15 @@ export class WorktreeManager {
    * `.gitignore` in that index is marked skip-worktree, so git reads one it
    * already deleted from the commit: the repository's ignore rules decide,
    * as they did in the lane, and an ignored file (`.env.local`,
-   * `node_modules`) is never copied. Neither is a path gone from disk, nor
-   * a manifest `[[copy]]` destination (the manifest at the lane's base). */
-  private async remainsToCopy(row: WorktreeRecord): Promise<string[]> {
+   * `node_modules`) is never copied. Every gitlink leaves that index: a
+   * submodule folder holding a `.git` is then listed as a repository, and
+   * one holding none (never initialized, or its git folder gone with the
+   * lane's) file by file under those rules. An ignored folder that is, or
+   * holds, a repository ({@link repositoryFolders}) is kept whole. Never
+   * copied: a path gone from disk, a manifest `[[copy]]` destination (the
+   * manifest at the lane's base), and what a repository copied whole
+   * ignores ({@link nestedIgnored}); `excluded` names those last two. */
+  private async remainsToCopy(row: WorktreeRecord): Promise<{ readonly paths: readonly string[]; readonly excluded: ReadonlySet<string> }> {
     const common = repositoryCommonDirectory(row.repoPath);
     const branch = row.branch === null ? '' : spawnGit(row.repoPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${row.branch}^{commit}`]).stdout.trim();
     const copies = (this.baseManifest(row, row.repoPath)?.manifest.copies ?? []).map((copy) => normalizedManifestPath(copy.to));
@@ -3521,8 +3565,12 @@ export class WorktreeManager {
       await git(['read-tree', branch === '' ? row.sha : branch]);
       const rules = paths(await git(['ls-files', '-z', '--', ':(glob)**/.gitignore']));
       if (rules.length > 0) await git(['update-index', '--skip-worktree', '-z', '--stdin'], `${rules.join('\0')}\0`);
+      const links = [...gitlinks(await git(['ls-files', '-s', '-z']), 'index').keys()];
+      if (links.length > 0) await git(['update-index', '--force-remove', '-z', '--stdin'], `${links.join('\0')}\0`);
+      const repositories = paths(await git(['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory']))
+        .filter((rel) => rel.endsWith('/') && this.repositoryFolders(row.path, rel.slice(0, -1)).length > 0);
       const kept: string[] = [];
-      for (const rel of new Set(paths(await git(['ls-files', '-z', '--cached', '--others', '--exclude-standard'])))) {
+      for (const rel of new Set([...paths(await git(['ls-files', '-z', '--cached', '--others', '--exclude-standard'])), ...repositories])) {
         const bare = rel.replace(/\/$/u, '');
         if (copies.some((to) => bare === to || bare.startsWith(`${to}/`))) continue;
         try {
@@ -3534,7 +3582,7 @@ export class WorktreeManager {
         }
         kept.push(rel);
       }
-      return kept;
+      return { paths: kept, excluded: new Set([...await this.nestedIgnored(row.path, kept), ...copies]) };
     } finally {
       await rmAsync(scratch, { recursive: true, force: true });
     }
@@ -3809,7 +3857,9 @@ function writerLane(row: WorktreeRecord): boolean {
 /** What a reclaim entry's on-disk checks say (#427): null when it is
  * missing (skipped silently), the reason it is skipped by name, or its
  * size when it may be deleted (what deleting it frees, and what it holds
- * that stays linked from outside it). */
+ * that stays linked from outside it). An entry that is, or holds, a git
+ * repository ({@link repositoryFolders}) is never deleted: its commits may
+ * live nowhere else. */
 async function reclaimVerdict(lanePath: string, entry: string): Promise<string | { readonly bytes: number; readonly sharedBytes: number } | null> {
   const linked = 'it is, or lies under, a link';
   const state = await reclaimState(lanePath, entry);
@@ -3821,6 +3871,10 @@ async function reclaimVerdict(lanePath: string, entry: string): Promise<string |
   const ignored = await reclaimIgnored(lanePath, entry);
   if (ignored === 'link') return linked;
   if (!ignored) return 'git does not ignore it';
+  const [repository] = repositoryFolders(lanePath, entry, (dir, error) => {
+    throw new Error(`${dir} could not be read to look for a git repository: ${oneLineErrorText(error instanceof Error ? error.message : error, 200)}`);
+  });
+  if (repository !== undefined) return `it holds a git repository (${repository}/.git)`;
   return treeUsage(join(lanePath, entry));
 }
 
@@ -3886,6 +3940,35 @@ const NESTED_DEPTH_LIMIT = 16;
 
 /** How many levels below an ignored folder GC looks for a repository (#427). */
 const IGNORED_REPO_DEPTH = 3;
+
+/** The folders below `root` that are `rel` or lie in it and hold a `.git`
+ * (#427), by their paths below `root`: `rel` itself and folders at most
+ * {@link IGNORED_REPO_DEPTH} levels below it, never through a link, never
+ * into a `node_modules`, never below a folder holding one. A folder that
+ * cannot be read goes to `unreadable`. */
+function repositoryFolders(root: string, rel: string, unreadable: (dir: string, error: unknown) => void): string[] {
+  const found: string[] = [];
+  const look = (at: string, depth: number): void => {
+    if (basename(at) === 'node_modules') return;
+    const dir = join(root, at);
+    if (pathOnDisk(join(dir, '.git'))) {
+      found.push(at);
+      return;
+    }
+    if (depth >= IGNORED_REPO_DEPTH) return;
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch (error) {
+      // A file holds no repository.
+      if ((error as NodeJS.ErrnoException).code !== 'ENOTDIR') unreadable(dir, error);
+      return;
+    }
+    for (const entry of entries) if (entry.isDirectory()) look(`${at}/${entry.name}`, depth + 1);
+  };
+  look(rel, 0);
+  return found;
+}
 
 /** How many commits at risk GC lists per nested repository (#427). */
 const NESTED_COMMIT_LIMIT = 1000;
@@ -4107,10 +4190,12 @@ function gitNamedFile(message: string): string | null {
 
 /** The bytes and links under paths of a tree, as one hash (#427): each
  * file's content and each link's target, by its path below `root`, never
- * following a link. `rels` null: everything under `root`. */
-function contentFingerprint(root: string, rels: readonly string[] | null): string {
+ * following a link, and nothing at a path in `excluded`. `rels` null:
+ * everything under `root`. */
+function contentFingerprint(root: string, rels: readonly string[] | null, excluded: ReadonlySet<string> = new Set()): string {
   const entries = new Set<string>();
   const visit = (rel: string): void => {
+    if (excluded.has(rel)) return;
     const path = join(root, rel);
     let stat: Stats;
     try {

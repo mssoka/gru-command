@@ -159,11 +159,15 @@ for a lane is the lane's to tear down — not a stranger's.
        and the release deletes it with the lane.
      - **Submodule folders never initialized.** A gitlink folder (index or
        HEAD) holding files but no `.git`: git lists none of them, so step 1
-       copies the folder whole (unless the submodule's `.gitmodules` at the
-       base says `ignore = untracked` or `all`).
+       copies them (unless the submodule's `.gitmodules` at the base says
+       `ignore = untracked` or `all`), all but what the repository around
+       it ignores: `git ls-files --others --exclude-standard` lists them
+       there with an index that does not exist, so no gitlink hides the
+       folder.
 
      (An untracked folder holding a `.git` is no gitlink: step 1 copies it
-     whole, its `.git` and commits with it.) A release refuses (never
+     whole, its `.git` and commits with it, all but what that repository
+     ignores.) A release refuses (never
      deletes) a nested repository whose commits would not survive. The
      nested-repo scan covers submodules (initialized or only in the admin
      folder), embedded and ignored repositories within the depth bound, and
@@ -238,7 +242,11 @@ for a lane is the lane's to tear down — not a stranger's.
    C-quoted paths; `--untracked-files=all`, so a repository whose
    `status.showUntrackedFiles` hides untracked files still has every one
    copied; an untracked folder holding a `.git` is copied whole, its `.git`
-   with it; the untracked content of nested repositories too, at any depth
+   with it, all but what that repository ignores (`git ls-files --others
+   --ignored --exclude-standard --directory` there, so its `.env.local`
+   stays out; an ignored folder in it that is, or holds, a repository, by
+   the walk of step 0, is copied, the same rule applied to each one); the
+   untracked content of nested repositories too, at any depth
    (step 0); symlinks are
    preserved AS LINKS; a FIFO, socket or device (one met inside a copied
    folder too) is skipped with a warn naming it and never opened, since
@@ -347,11 +355,24 @@ for a lane is the lane's to tear down — not a stranger's.
      remains, with the repository's git folder and a temporary index of the
      lane's commit (its branch, else its base) in which every `.gitignore` is
      marked skip-worktree, so a `.gitignore` git already deleted still
-     applies. An ignored file (`.env.local`, `node_modules`), a manifest
+     applies. Every gitlink leaves that index too: a submodule folder
+     holding a `.git` is listed as a repository and copied whole like an
+     untracked one (all but what it ignores, as in step 1), and one holding
+     none (never initialized, or its git folder gone with the lane's) file
+     by file under those rules. An ignored folder that is, or holds, a
+     repository (the walk of step 0: three levels deep, never into a
+     `node_modules`, never through a link) is kept whole, by the same rule.
+     Any other ignored file (`.env.local`, `node_modules`), a manifest
      `[[copy]]` destination, a file already gone and a FIFO are never
      copied. If the remains then cannot be deleted, GC records
      `worktree.release-aborted` with that copy, and a retry reuses it instead
-     of copying again.
+     of copying again. **Limit:** the remains are judged by the ignore rules
+     of the lane's commit, since the lane's index went with its git folder.
+     A file the minion staged with `git add -f`, or one an uncommitted
+     `.gitignore` edit stopped ignoring, is recovered from the snapshot ref
+     when GC took one before the removal (a release of GC's that stopped
+     part way); a removal the owner ran by hand, outside GC, took no
+     snapshot, and such a file is not copied.
 
    `<lane>` is the lane id when git accepts it as one ref-name component
    (letters, digits, `.`, `_` and `-`, not starting with `.` or `-`, no
@@ -464,8 +485,11 @@ proof.
 no part of its path is a symbolic link, no manifest `[[link]]` `at` or
 `[[copy]]` `to` lies at or under it (a restore runs only `[[setup]]`, so
 those would never come back), `git ls-files` lists nothing tracked under
-it, and `git check-ignore` says the repository ignores it (git runs with no
-user or system config). Any other entry is skipped by name, and so is one
+it, `git check-ignore` says the repository ignores it (git runs with no
+user or system config), and it neither is nor holds a git repository (a
+`.git` at it or at most three levels below it, never into a `node_modules`,
+never through a link: "it holds a git repository (vendor/lib/.git)"), so a
+slim never deletes commits. Any other entry is skipped by name, and so is one
 whose check fails (an error, not an answer); a missing one is skipped
 silently.
 

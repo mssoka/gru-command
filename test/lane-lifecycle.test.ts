@@ -1194,18 +1194,21 @@ describe('lossless sweep: uncommitted work is saved before removal (#427)', () =
     expect(result.status).toBe('swept');
   });
 
-  it('copies the files a minion wrote into a submodule folder the lane never initialized (git lists none of them) into the preserve copy, and releases the lane', async () => {
+  it('copies the files a minion wrote into a submodule folder the lane never initialized (git lists none of them) into the preserve copy, all but what the lane ignores, and releases the lane', async () => {
     const h = harness({ manifest: null });
     addSubmodule(h);
     addJob(h, 'job-uninit-sub');
     const lane = await h.manager.createJobWorktree({ repoPath: h.repo.path, jobId: 'job-uninit-sub' });
     writeFileSync(join(lane.path, 'deps', 'lib', 'notes.md'), 'the minion wrote this\n');
+    mkdirSync(join(lane.path, 'deps', 'lib', 'node_modules', 'pkg'), { recursive: true });
+    writeFileSync(join(lane.path, 'deps', 'lib', 'node_modules', 'pkg', 'index.js'), MODULE);
     expect(git(lane.path, ['-c', 'diff.ignoreSubmodules=none', 'status', '--porcelain', '--ignore-submodules=none', '--untracked-files=all'])).toBe('');
 
     const result = await h.manager.release({ worktreeId: 'job-uninit-sub' });
 
     expect(result.status).toBe('swept');
     expect(readFileSync(join(result.preserved!.destination, 'deps', 'lib', 'notes.md'), 'utf-8')).toBe('the minion wrote this\n');
+    expect(existsSync(join(result.preserved!.destination, 'deps', 'lib', 'node_modules'))).toBe(false);
   });
 
   it('refuses an unpushed commit in a repository inside an ignored folder (vendor/lib, which git status never lists) by its path; one inside a node_modules is past the documented bound', async () => {
@@ -1612,6 +1615,63 @@ describe('lossless sweep: uncommitted work is saved before removal (#427)', () =
     }
   });
 
+  it('a part-way removal\'s copy keeps an ignored folder holding a repository (tmp/repo, with an unpushed commit) whole; the rest of the ignored content, and what that repository ignores, stay out', async () => {
+    const h = harness({ manifest: null, gitignore: `${IGNORED}tmp/\n` });
+    addJob(h, 'job-remains-repo');
+    const lane = await h.manager.createJobWorktree({ repoPath: h.repo.path, jobId: 'job-remains-repo' });
+    const repo = join(lane.path, 'tmp', 'repo');
+    mkdirSync(repo, { recursive: true });
+    git(repo, ['init', '-q', '-b', 'main']);
+    writeFileSync(join(repo, '.gitignore'), '.env.local\n');
+    writeFileSync(join(repo, 'patch.txt'), 'a local patch\n');
+    git(repo, ['add', '.']);
+    git(repo, ['commit', '-qm', 'an unpushed patch']);
+    const commit = git(repo, ['rev-parse', 'HEAD']);
+    writeFileSync(join(repo, '.env.local'), 'API_KEY=sk-live-123\n');
+    mkdirSync(join(lane.path, 'node_modules', 'pkg'), { recursive: true });
+    writeFileSync(join(lane.path, 'node_modules', 'pkg', 'index.js'), MODULE);
+    // The part-way removal: git deleted the lane's git folder, its .git and the root .gitignore.
+    rmSync(git(lane.path, ['rev-parse', '--absolute-git-dir']), { recursive: true, force: true });
+    for (const gone of ['.git', '.gitignore']) rmSync(join(lane.path, gone));
+
+    const result = await h.manager.release({ worktreeId: 'job-remains-repo' });
+
+    expect(result.status).toBe('swept');
+    expect(existsSync(lane.path)).toBe(false);
+    const copy = String(payloadOf(events(h, 'worktree.preserved')[0])['destination']);
+    expect(git(join(copy, 'tmp', 'repo'), ['cat-file', '-t', commit])).toBe('commit');
+    expect(readFileSync(join(copy, 'tmp', 'repo', 'patch.txt'), 'utf-8')).toBe('a local patch\n');
+    for (const left of ['tmp/repo/.env.local', 'node_modules']) expect(existsSync(join(copy, left)), left).toBe(false);
+  });
+
+  it('a part-way removal\'s copy of a committed submodule leaves out what the submodule ignores (its .env.local), and keeps its .git with an unpushed commit', async () => {
+    const h = harness({ manifest: null });
+    const source = sourceRepo('gru-lane-lifecycle-lib-', 'lib.txt');
+    addJob(h, 'job-remains-sub');
+    const lane = await h.manager.createJobWorktree({ repoPath: h.repo.path, jobId: 'job-remains-sub' });
+    const sub = join(lane.path, 'deps', 'lib');
+    git(lane.path, ['clone', '-q', source, sub]);
+    writeFileSync(join(sub, '.gitignore'), '.env.local\n');
+    git(sub, ['add', '.gitignore']);
+    git(sub, ['commit', '-qm', 'an unpushed commit']);
+    const commit = git(sub, ['rev-parse', 'HEAD']);
+    git(lane.path, ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', source, 'deps/lib']);
+    git(lane.path, ['commit', '-qm', 'add the library']);
+    expect(lstatSync(join(sub, '.git')).isDirectory()).toBe(true);
+    writeFileSync(join(sub, '.env.local'), 'API_KEY=sk-live-secret\n');
+    // The part-way removal: git deleted the lane's git folder, its .git and the root .gitignore.
+    rmSync(git(lane.path, ['rev-parse', '--absolute-git-dir']), { recursive: true, force: true });
+    for (const gone of ['.git', '.gitignore']) rmSync(join(lane.path, gone));
+
+    const result = await h.manager.release({ worktreeId: 'job-remains-sub' });
+
+    expect(result.status).toBe('swept');
+    const copy = String(payloadOf(events(h, 'worktree.preserved')[0])['destination']);
+    expect(existsSync(join(copy, 'deps', 'lib', '.env.local'))).toBe(false);
+    expect(git(join(copy, 'deps', 'lib'), ['cat-file', '-t', commit])).toBe('commit');
+    expect(readFileSync(join(copy, 'deps', 'lib', 'lib.txt'), 'utf-8')).toBe('lib.txt\n');
+  });
+
   it.skipIf(typeof process.getuid === 'function' && process.getuid() === 0)('a part-way removal\'s remains that cannot be deleted after their copy record worktree.release-aborted with that copy: the retry reuses it, copying nothing again', async () => {
     const h = harness({ manifest: null });
     addJob(h, 'job-remains-stuck');
@@ -1648,7 +1708,7 @@ describe('lossless sweep: uncommitted work is saved before removal (#427)', () =
     ]);
   });
 
-  it('never opens a FIFO inside an untracked nested repository: the copy skips it with a warn naming it, and a retry\'s comparison with that copy skips it too', async () => {
+  it('never opens a FIFO inside an untracked nested repository, nor copies what that repository ignores: the copy skips the FIFO with a warn naming it, and a retry\'s comparison with that copy skips both too', async () => {
     const h = harness({ manifest: null });
     addJob(h, 'job-fifo');
     const lane = await h.manager.createJobWorktree({ repoPath: h.repo.path, jobId: 'job-fifo' });
@@ -1656,8 +1716,10 @@ describe('lossless sweep: uncommitted work is saved before removal (#427)', () =
     mkdirSync(fixture, { recursive: true });
     git(fixture, ['init', '-q', '-b', 'main']);
     writeFileSync(join(fixture, 'script.sh'), 'echo testing a script\n');
-    git(fixture, ['add', 'script.sh']);
+    writeFileSync(join(fixture, '.gitignore'), '.env.local\n');
+    git(fixture, ['add', 'script.sh', '.gitignore']);
     git(fixture, ['commit', '-qm', 'a script']);
+    writeFileSync(join(fixture, '.env.local'), 'API_KEY=sk-live-123\n');
     execFileSync('mkfifo', [join(fixture, 'dev.pipe')]);
     writeFileSync(join(lane.path, 'README.md'), 'a tracked edit\n');
     // A ref at the lane's own prefix: the release aborts after its copy.
@@ -1668,6 +1730,8 @@ describe('lossless sweep: uncommitted work is saved before removal (#427)', () =
     const destination = String(payloadOf(events(h, 'worktree.preserved')[0])['destination']);
     expect(readFileSync(join(destination, 'tmp', 'fixture', 'script.sh'), 'utf-8')).toBe('echo testing a script\n');
     expect(existsSync(join(destination, 'tmp', 'fixture', 'dev.pipe'))).toBe(false);
+    expect(existsSync(join(destination, 'tmp', 'fixture', '.env.local'))).toBe(false);
+    expect(existsSync(join(destination, 'tmp', 'fixture', '.git', 'HEAD'))).toBe(true);
     expect(h.logs.filter((line) => line.msg.startsWith('special file not preserved')).map((line) => line.fields?.['rel'])).toEqual(['tmp/fixture/dev.pipe']);
 
     h.repo.git(['update-ref', '-d', `${PRESERVED_REF_PREFIX}/job-fifo`]);
@@ -2437,6 +2501,38 @@ describe('lane slimming: delivered report lanes lose their reclaim folders (#427
     await slimmer.idle();
     expect(events(h, 'worktree.slimmed')).toHaveLength(3);
     expect(skipLogs().map((line) => line.fields?.['skipped'])).toEqual([[vendor], [vendor, { path: 'linked', reason: 'it is, or lies under, a link' }]]);
+  });
+
+  it('never deletes a repository: a reclaim entry holding one (vendor/lib, with an unpushed commit) is skipped by name, logged once, and its commit and files survive every slim', async () => {
+    const h = harness({
+      gitignore: `${IGNORED}vendor/\n`,
+      manifest: ['reclaim = ["vendor", "node_modules"]', '', '[[setup]]', `command = "${SETUP}"`, ''].join('\n'),
+    });
+    const lanePath = await deliveredReportLane(h, 'job-vendored');
+    const vendored = join(lanePath, 'vendor', 'lib');
+    mkdirSync(vendored, { recursive: true });
+    git(vendored, ['init', '-q', '-b', 'main']);
+    writeFileSync(join(vendored, 'patch.txt'), 'a local patch\n');
+    git(vendored, ['add', 'patch.txt']);
+    git(vendored, ['commit', '-qm', 'an unpushed patch']);
+    const commit = git(vendored, ['rev-parse', 'HEAD']);
+    const timers: { tick?: () => void } = {};
+    const logs: LogCall[] = [];
+    const slimmer = slimmerFor(h, restoringGate(h), { timers, logs });
+    const skipped = [{ path: 'vendor', reason: 'it holds a git repository (vendor/lib/.git)' }];
+
+    slimmer.start();
+    await slimmer.idle();
+    expect(existsSync(join(lanePath, 'node_modules'))).toBe(false);
+    await h.manager.ensureReady('job-vendored');
+    timers.tick!();
+    await slimmer.idle();
+
+    expect(events(h, 'worktree.slimmed').map((event) => payloadOf(event)['skipped'])).toEqual([skipped, skipped]);
+    expect(logs.filter((line) => line.msg === 'lane slimming skipped reclaim entries'))
+      .toEqual([{ level: 'warn', msg: 'lane slimming skipped reclaim entries', fields: { lane: 'job-vendored', skipped } }]);
+    expect(git(vendored, ['cat-file', '-t', commit])).toBe('commit');
+    expect(readFileSync(join(vendored, 'patch.txt'), 'utf-8')).toBe('a local patch\n');
   });
 
   it('a stop mid-delete ends the delete at its next path: the pass returns at once, worktree.slimmed carries planned_bytes and no freed_bytes, no slim-done is recorded, and the lane is slim', async () => {
