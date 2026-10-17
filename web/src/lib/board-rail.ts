@@ -2,7 +2,8 @@
  * Status derivation rail (board UX v7): the v4 health row + folded counts
  * rendered as the slim strip's status pairs and count groups (see
  * `board.ts` for the DOM). Seven chips in a fixed order: deploy, reviews,
- * silas, alerts, verify, cure, trackers.
+ * silas, alerts, verify, cure, trackers; an eighth, disk, sits after verify
+ * when the server sends its disk block (#427 PR 3).
  *
  * The heist/PR/minion counts folded into the TRACKERS chip come from the
  * SAME `boardKpis` derivation the v4 KPI strip used, so the strip can
@@ -39,7 +40,7 @@ export interface RailKpiGroup {
 }
 
 export interface RailChip {
-  readonly id: 'deploy' | 'reviews' | 'silas' | 'alerts' | 'verify' | 'cure' | 'trackers';
+  readonly id: 'deploy' | 'reviews' | 'silas' | 'alerts' | 'verify' | 'disk' | 'cure' | 'trackers';
   readonly label: string;
   readonly value: string;
   readonly detail: string;

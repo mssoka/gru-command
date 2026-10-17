@@ -289,6 +289,26 @@ export interface VerifyQueueView {
   readonly workersPerRun: number;
 }
 
+/** GC's disk usage, the disk's free space, the budget and the floor
+ * (#427 PR 3; server mirror of `DiskBoardView`). Byte counts; null where
+ * the server could not read them yet. */
+export interface DiskView {
+  readonly usedBytes: number | null;
+  readonly categories: Readonly<Record<'lanes' | 'reviews' | 'preserves' | 'probes' | 'ledger' | 'logs' | 'other', number>> | null;
+  readonly freeBytes: number | null;
+  readonly totalBytes: number | null;
+  /** 0 = the budget is off. */
+  readonly budgetBytes: number;
+  /** 0 = the floor is off. */
+  readonly floorBytes: number;
+  readonly reclaimMode: 'automatic' | 'proposed';
+  readonly overBudget: boolean;
+  readonly belowFloor: boolean;
+  /** Lanes waiting at the floor. */
+  readonly queuedLanes: number;
+  readonly computedAt: string | null;
+}
+
 /** Provider pacing gate (server mirror; board protocol parity). A capped
  * pool's honest state: the configured limit, how many turns run, and every
  * queued entry with its queue time and reason. */
@@ -553,6 +573,9 @@ export interface BoardSnapshot {
   readonly build?: BuildView | null;
   readonly silas?: SilasView | null;
   readonly verify?: VerifyQueueView | null;
+  /** #427 PR 3: absent on older servers and null when unwired (the strip
+   * then shows no disk pair); a present block is validated strictly. */
+  readonly disk?: DiskView | null;
   /** Provider pacing gate (server mirror; absent on pre-pacing servers). */
   readonly pacing?: PacingGateView | null;
   /** Durable pipeline queue; absent on pre-upgrade servers (tolerated). */
@@ -924,6 +947,30 @@ function isVerifyQueueView(value: unknown): value is VerifyQueueView {
   );
 }
 
+const DISK_CATEGORY_KEYS = ['lanes', 'reviews', 'preserves', 'probes', 'ledger', 'logs', 'other'] as const;
+
+function isByteCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isDiskView(value: unknown): value is DiskView {
+  if (!isRecord(value)) return false;
+  const categories = value.categories;
+  return (
+    (value.usedBytes === null || isByteCount(value.usedBytes)) &&
+    (categories === null || (isRecord(categories) && DISK_CATEGORY_KEYS.every((key) => isByteCount(categories[key])))) &&
+    (value.freeBytes === null || isByteCount(value.freeBytes)) &&
+    (value.totalBytes === null || isByteCount(value.totalBytes)) &&
+    isByteCount(value.budgetBytes) &&
+    isByteCount(value.floorBytes) &&
+    (value.reclaimMode === 'automatic' || value.reclaimMode === 'proposed') &&
+    typeof value.overBudget === 'boolean' &&
+    typeof value.belowFloor === 'boolean' &&
+    isByteCount(value.queuedLanes) &&
+    (value.computedAt === null || typeof value.computedAt === 'string')
+  );
+}
+
 function isPacingQueueEntryView(value: unknown): value is PacingQueueEntryView {
   return (
     isRecord(value) &&
@@ -1245,6 +1292,7 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
   if (value.build !== undefined && value.build !== null && !isBuildView(value.build)) return false;
   if (value.silas !== undefined && value.silas !== null && !isSilasView(value.silas)) return false;
   if (value.verify !== undefined && value.verify !== null && !isVerifyQueueView(value.verify)) return false;
+  if (value.disk !== undefined && value.disk !== null && !isDiskView(value.disk)) return false;
   if (value.pacing !== undefined && value.pacing !== null && !isPacingGateView(value.pacing)) return false;
   if (value.pipeline !== undefined && value.pipeline !== null && !isPipelineView(value.pipeline)) return false;
   if (value.selfHeal !== undefined && value.selfHeal !== null && !isSelfHealView(value.selfHeal)) return false;

@@ -114,6 +114,23 @@ export interface ExpiredWork {
   readonly refs: readonly ExpiredRef[];
 }
 
+/** A finished job's review folders ({@link ExpiryService.expirableReviews}). */
+export interface ExpirableReviews {
+  readonly jobId: string;
+  readonly rounds: readonly string[];
+  readonly fallbackGates: readonly string[];
+  /** Each folder's path, rounds first. */
+  readonly paths: readonly string[];
+}
+
+/** What one `reviews.expired` recorded. */
+export interface ReviewsExpired {
+  readonly jobId: string;
+  readonly rounds: readonly string[];
+  readonly fallbackGates: readonly string[];
+  readonly bytes: number;
+}
+
 /** A recorded proposal (`preserves.proposed`), as its card's Accept reads it. */
 interface Proposal extends ExpiredWork {
   readonly notificationId: string;
@@ -198,7 +215,7 @@ export class ExpiryService {
   private async pass(): Promise<void> {
     const steps: readonly [string, () => Promise<void> | void][] = [
       ['the moved-repository check', () => this.opts.onReconcile?.()],
-      ['review expiry', () => this.expireReviews()],
+      ['review expiry', async () => { await this.expireReviews(); }],
       ['saved-work decisions', () => this.followCards()],
       ['saved-work proposals', () => this.proposeExpiredWork()],
     ];
@@ -216,9 +233,13 @@ export class ExpiryService {
   // Review artifacts
   // ------------------------------------------------------------------
 
-  /** Delete the review folders of every job terminal for at least
-   * {@link REVIEW_EXPIRY_MS}; record one `reviews.expired` per job. */
-  async expireReviews(): Promise<void> {
+  /** The review folders of every job terminal for at least `olderThanMs`
+   * (default {@link REVIEW_EXPIRY_MS}), by job: what {@link expireReviews}
+   * deletes. An open job's folders, a job whose end cannot be read, and the
+   * folders of a round or job the ledger does not know are never listed.
+   * The disk budget (#427 PR 3) lists them with no wait (`olderThanMs: 0`). */
+  expirableReviews(opts: { readonly olderThanMs?: number } = {}): readonly ExpirableReviews[] {
+    const olderThan = opts.olderThanMs ?? REVIEW_EXPIRY_MS;
     const byJob = new Map<string, { rounds: string[]; gates: string[] }>();
     const of = (jobId: string): { rounds: string[]; gates: string[] } => {
       const entry = byJob.get(jobId) ?? { rounds: [], gates: [] };
@@ -234,10 +255,30 @@ export class ExpiryService {
       const jobId = FALLBACK_GATE_FOLDER.exec(name)?.[1];
       if (jobId !== undefined) of(jobId).gates.push(name);
     }
+    const expirable: ExpirableReviews[] = [];
     for (const [jobId, found] of byJob) {
-      if (this.stopped) return;
       const since = this.terminalSince(jobId);
-      if (since === null || this.now() - since < REVIEW_EXPIRY_MS) continue;
+      if (since === null || this.now() - since < olderThan) continue;
+      expirable.push({
+        jobId,
+        rounds: found.rounds,
+        fallbackGates: found.gates,
+        paths: [...found.rounds.map((name) => join(this.opts.reviewsRoot, name)), ...found.gates.map((name) => join(this.opts.reviewsRoot, 'fallback-gate', name))],
+      });
+    }
+    return expirable;
+  }
+
+  /** Delete the review folders of every job terminal for at least
+   * `olderThanMs` (default {@link REVIEW_EXPIRY_MS}; `jobs`: only those
+   * jobs'); record one `reviews.expired` per job, and return what each
+   * record says. */
+  async expireReviews(opts: { readonly olderThanMs?: number; readonly jobs?: readonly string[] } = {}): Promise<readonly ReviewsExpired[]> {
+    const expired: ReviewsExpired[] = [];
+    for (const found of this.expirableReviews(opts.olderThanMs === undefined ? {} : { olderThanMs: opts.olderThanMs })) {
+      if (this.stopped) break;
+      const { jobId } = found;
+      if (opts.jobs !== undefined && !opts.jobs.includes(jobId)) continue;
       const rounds: string[] = [];
       const gates: string[] = [];
       const failed: { readonly folder: string; readonly error: string }[] = [];
@@ -262,13 +303,15 @@ export class ExpiryService {
         if (complete) done.push(name);
       };
       for (const name of found.rounds) await remove(join(this.opts.reviewsRoot, name), rounds, name, REVIEW_KEPT_FILES);
-      for (const name of found.gates) await remove(join(this.opts.reviewsRoot, 'fallback-gate', name), gates, name, []);
+      for (const name of found.fallbackGates) await remove(join(this.opts.reviewsRoot, 'fallback-gate', name), gates, name, []);
       if (rounds.length + gates.length > 0) {
         this.opts.ledger.appendCustomEvent({ kind: EXPIRY_EVENTS.reviewsExpired, jobId, payload: { job_id: jobId, rounds, fallback_gates: gates, bytes } });
         this.log('info', 'review folders of a finished job expired', { job: jobId, rounds: rounds.length, fallback_gates: gates.length, bytes });
+        expired.push({ jobId, rounds, fallbackGates: gates, bytes });
       }
       if (failed.length > 0) this.log('warn', 'review folders of a finished job could not be deleted; the next reconcile tries again', { job: jobId, failed });
     }
+    return expired;
   }
 
   /** When the job became terminal (its newest `job.status` to that status),

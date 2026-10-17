@@ -62,9 +62,10 @@ export interface NotificationDecision {
  * thing proposed changed before the owner answered (#351: a raid target's
  * code moved; #427: the repository left managed_repos, or onboarding was
  * turned off; #427 PR 2b: a lane proposed for discard was reconnected to
- * its repository, or swept). Every other undecided owner row stays open
- * until answered. */
-const PRODUCER_WITHDRAWABLE_KINDS: readonly string[] = ['vector.raid-proposal', 'onboarding.proposal', 'worktree.repo-mismatch'];
+ * its repository, or swept; #427 PR 3: GC got under its disk budget and
+ * above the floor without the proposed reclaim). Every other undecided
+ * owner row stays open until answered. */
+const PRODUCER_WITHDRAWABLE_KINDS: readonly string[] = ['vector.raid-proposal', 'onboarding.proposal', 'worktree.repo-mismatch', 'disk.reclaim-proposal'];
 
 export function producerWithdrawable(kind: string): boolean {
   return PRODUCER_WITHDRAWABLE_KINDS.includes(kind);

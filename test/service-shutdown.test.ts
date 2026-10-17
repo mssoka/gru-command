@@ -352,6 +352,20 @@ describe('service shutdown orchestration (issue #341, R3-2 executable)', () => {
     expect(run.lines.filter((line) => line.level === 'error').map((line) => line.msg)).toEqual(['expiry stop failed']);
   });
 
+  it('stops the disk budget after the moved-repository follow-through; a failing stop never skips what follows (#427 PR 3)', async () => {
+    const order: string[] = [];
+    const state: ServiceShutdownState = {
+      repoMoves: { stop: () => { order.push('repoMoves.stop'); } },
+      disk: { stop: () => { order.push('disk.stop'); throw new Error('timer gone'); } },
+      handle: fakeHandle(order),
+    };
+    const run = runShutdown(state);
+    await run.exited;
+    expect(run.exits).toEqual([0]);
+    expect(order).toEqual(['repoMoves.stop', 'disk.stop', 'handle.stop']);
+    expect(run.lines.filter((line) => line.level === 'error').map((line) => line.msg)).toEqual(['disk budget stop failed']);
+  });
+
   it('waits for a slow lane-slimming pass at most its bound, well inside the force-exit budget, then goes on (#427)', async () => {
     vi.useFakeTimers();
     try {

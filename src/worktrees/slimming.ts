@@ -70,13 +70,15 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
 export const SLIM_RECONCILE_INTERVAL_MS = 300_000;
 
 /** How long ago a report job's last activity must be before its lanes are
- * slimmed (#427; PR 3 moves it to config). */
+ * slimmed (#427; a constant for now). The disk budget's idle-lane slims
+ * (#427 PR 3) use it too. */
 export const SLIM_MIN_IDLE_MS = 30 * 60_000;
 
 /** The job events that are its activity: a minion's state change (a turn's
  * end sets it idle), the job's delivery and its status change to
- * `delivered`, a restore of its lanes, and the end of a verification run. */
-const LAST_ACTIVITY_KINDS = ['agent.state', 'job.delivered', 'job.status', 'worktree.rehydrated', 'verification.completed'] as const;
+ * `delivered`, a restore of its lanes, and the end of a verification run.
+ * The disk budget's idle-lane slims (#427 PR 3) read the same clock. */
+export const LAST_ACTIVITY_KINDS = ['agent.state', 'job.delivered', 'job.status', 'worktree.rehydrated', 'verification.completed'] as const;
 
 /** The job events after which a lane the manager declined is asked again:
  * a turn, a delivery, a verification, a restore or a claimed provider

@@ -86,6 +86,7 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
   { file: 'branch-idle-guard.test.ts', workload: 'real service and git lane lifecycle' },
   { file: 'claude-adapter.test.ts', workload: 'real CLI child processes over stdio per test' },
   { file: 'cleanup-repair.test.ts', workload: 'real git lanes released, moved with their repository and repaired, review and preserve expiry over real folders and refs, and gru-service reset over real worktrees' },
+  { file: 'disk-budget.test.ts', workload: 'real git lanes created, released and slimmed by the disk budget and floor, and a real dispatch waiting at the floor' },
   {
     file: 'decisions-service-integration.test.ts',
     workload: 'boots and restarts the real service with compiled CLIs',

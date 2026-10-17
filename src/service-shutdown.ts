@@ -4,6 +4,7 @@ import type { OnboardingService } from './onboarding/service.js';
 import type { ReportLaneSlimmer } from './worktrees/slimming.js';
 import type { ExpiryService } from './maintenance/expiry.js';
 import type { RepoMoveReconciler } from './maintenance/repo-moves.js';
+import type { DiskService } from './maintenance/disk.js';
 import type { ServiceHandle } from './server.js';
 import type { RuntimeRegistry } from './runtime/registry.js';
 import type { SessionStore } from './sessions/store.js';
@@ -62,6 +63,9 @@ export interface ServiceShutdownState {
   expiry?: Pick<ExpiryService, 'stop'>;
   /** Moved repositories (#427 PR 2b): its decision follow-through stops. */
   repoMoves?: Pick<RepoMoveReconciler, 'stop'>;
+  /** The disk budget and floor (#427 PR 3): its checks stop, a running
+   * pass stops before its next step, and the floor stops polling. */
+  disk?: Pick<DiskService, 'stop'>;
   silas?: SilasDriver;
   /** Issue #243: the autopilot ops the shutdown checkpoints and drains. */
   autopilot?: SilasAutopilotOpsHandle;
@@ -262,6 +266,13 @@ export function startServiceShutdown(options: ServiceShutdownOptions): void {
           state.repoMoves.stop();
         } catch (error) {
           logger.error('moved-repository follow-through stop failed', { error: String(error) });
+        }
+      }
+      if (state.disk !== undefined) {
+        try {
+          state.disk.stop();
+        } catch (error) {
+          logger.error('disk budget stop failed', { error: String(error) });
         }
       }
       if (state.silas !== undefined) {

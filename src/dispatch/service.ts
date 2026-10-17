@@ -17,6 +17,7 @@ import { recordFollowUpDelivery } from './fix-directive.js';
 import { isPromptTurnVerdict, promptVerdictFromHealth } from '../runtime/prompt-verdict.js';
 import type { PromptTurnVerdict } from '../runtime/types.js';
 import { settleRetries, RetrySettlementUnavailableError, type PacingGate, type PacingLease, type RetrySettlement } from '../runtime/pacing.js';
+import type { DiskFloorGate } from '../maintenance/disk.js';
 import { WORKER_RULE_BLOCKS } from './worker-rules.js';
 import {
   assertLaneUsesBoundStore,
@@ -153,6 +154,9 @@ export interface DispatchServiceOptions {
    * settlement wait below observe shutdown instead of hanging. Absent =
    * settlement is hook-owned and the queue wait is uncancellable. */
   readonly stopSignal?: AbortSignal;
+  /** The disk floor (#427 PR 3): awaited before the job lane is created.
+   * Absent = no floor. */
+  readonly diskFloor?: Pick<DiskFloorGate, 'admitLane'>;
   /** Book of Lessons injection: pointer lines only, never chapter bodies. */
   readonly lessons?: LessonsReferencePort;
   /** Extracts a minion's opt-in lessons block at delivery settle. */
@@ -489,6 +493,25 @@ export class DispatchService {
           source: 'dispatch',
           intent: input.completionHandoff,
         }).record.phaseId;
+      }
+
+      // (3a) The disk floor (#427 PR 3): below [worktrees] min_free_disk_gb
+      // the lane waits, FIFO, with the honest reason on the job, while GC
+      // frees space; it is created once the free space is back at the floor.
+      if (this.opts.diskFloor !== undefined) {
+        let floorQueued = false;
+        const admitted = await this.opts.diskFloor.admitLane({
+          id: job.id,
+          label: input.title,
+          jobId: job.id,
+          ...(this.opts.stopSignal !== undefined ? { signal: this.opts.stopSignal } : {}),
+          queued: (info) => {
+            floorQueued = true;
+            this.opts.ledger.noteJob(job.id, info.reason);
+          },
+        });
+        if (floorQueued) this.opts.ledger.noteJob(job.id, `disk floor: admitted after ${admitted.waitedMs} ms queue wait`);
+        assertAdmissible();
       }
 
       // (3) One worktree per job, fresh head, own branch (ruling 18).

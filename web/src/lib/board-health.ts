@@ -12,6 +12,7 @@
 import type {
   BoardSnapshot,
   BuildView,
+  DiskView,
   JobView,
   SelfHealView,
   SilasView,
@@ -49,7 +50,7 @@ function ageSplitValue(lead: string, age: string, tail: string): ValueSplit {
 }
 
 export interface HealthCardView {
-  readonly id: 'deploy' | 'reviews' | 'silas' | 'alerts' | 'verify' | 'cure';
+  readonly id: 'deploy' | 'reviews' | 'silas' | 'alerts' | 'verify' | 'disk' | 'cure';
   readonly title: string;
   readonly value: string;
   readonly detail: string;
@@ -70,6 +71,7 @@ const N_A_DETAIL: Readonly<Record<HealthCardView['id'], string>> = {
   silas: 'silas health not wired',
   alerts: 'nothing awaiting ack',
   verify: 'verification scheduler not wired yet',
+  disk: 'disk usage not walked yet',
   cure: 'self-heal stats not wired yet',
 };
 
@@ -286,6 +288,41 @@ export function verifyCard(verify: VerifyQueueView | null | undefined): HealthCa
   );
 }
 
+/** GB of 2^30 bytes, one decimal (the server's config unit). */
+function gib(bytes: number): string {
+  return (bytes / 1024 ** 3).toFixed(1);
+}
+
+/** The disk pair (#427 PR 3): GC's usage, the disk's free space, the budget
+ * and the floor. Below the floor is an alert (new lanes wait), over the
+ * budget a warning (GC frees space; the budget never stops a heist). */
+export function diskCard(disk: DiskView): HealthCardView {
+  const used = disk.usedBytes === null ? null : `${gib(disk.usedBytes)} GB`;
+  const value = used ?? 'walking';
+  const budget = disk.budgetBytes === 0 ? 'budget off' : `budget ${gib(disk.budgetBytes)} GB`;
+  const floor = disk.floorBytes === 0 ? 'floor off' : `floor ${gib(disk.floorBytes)} GB`;
+  const free = disk.freeBytes === null ? 'free unknown' : `${gib(disk.freeBytes)} GB free`;
+  const flag = disk.queuedLanes > 0
+    ? `${disk.queuedLanes} QUEUED`
+    : disk.belowFloor ? 'BELOW FLOOR' : disk.overBudget ? 'OVER BUDGET' : null;
+  const categories = disk.categories === null
+    ? 'usage not walked yet'
+    : `lanes ${gib(disk.categories.lanes)} · reviews ${gib(disk.categories.reviews)} · preserves ${gib(disk.categories.preserves)} · probes ${gib(disk.categories.probes)} · ledger ${gib(disk.categories.ledger)} · logs ${gib(disk.categories.logs)} · other ${gib(disk.categories.other)} GB`;
+  return card(
+    'disk',
+    'disk',
+    value,
+    `${free} · ${budget} · ${floor}`,
+    disk.belowFloor ? 'alert' : disk.overBudget ? 'warn' : used === null ? 'muted' : 'ok',
+    flag,
+    `GC uses ${used ?? 'an unknown amount'} under data_dir (${categories}); the disk has ${free}${disk.totalBytes === null ? '' : ` of ${gib(disk.totalBytes)} GB`}; ${budget}, ${floor}; reclaim ${disk.reclaimMode}` +
+      (disk.queuedLanes > 0 ? `; ${disk.queuedLanes} lane(s) wait at the floor` : '') +
+      ' · blocks an APFS clone shares cannot be seen, so they are counted in full',
+    { lead: '', num: null, unit: value },
+    disk.queuedLanes > 0 ? { num: disk.queuedLanes, unit: ' QUEUED' } : flag === null ? null : { num: null, unit: flag },
+  );
+}
+
 export function cureCard(selfHeal: SelfHealView | null | undefined): HealthCardView {
   if (selfHeal === null || selfHeal === undefined) return notAvailable('cure', 'cure');
   return card(
@@ -301,7 +338,9 @@ export function cureCard(selfHeal: SelfHealView | null | undefined): HealthCardV
   );
 }
 
-/** The whole row, in fixed order. */
+/** The whole row, in fixed order. The disk pair (#427 PR 3) sits next to
+ * the verify queue and shows only when the server sends a disk block: an
+ * older server's board keeps its six pairs. */
 export function healthCards(snapshot: BoardSnapshot, now = Date.now()): readonly HealthCardView[] {
   const jobs = collectJobs(snapshot);
   return [
@@ -310,6 +349,7 @@ export function healthCards(snapshot: BoardSnapshot, now = Date.now()): readonly
     silasCard(snapshot.silas ?? null, now),
     alertsCard(snapshot.unackedActionRequired),
     verifyCard(snapshot.verify ?? null),
+    ...(snapshot.disk === undefined || snapshot.disk === null ? [] : [diskCard(snapshot.disk)]),
     cureCard(snapshot.selfHeal ?? null),
   ];
 }

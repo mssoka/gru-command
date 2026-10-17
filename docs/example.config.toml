@@ -130,6 +130,15 @@ morning_digest_gap_ms = 28800000
 # root = "~/.gru-command/worktrees" # omitted so it follows data_dir
 # preserve_root = "~/.gru-command/worktree-preserves"
 setup_timeout_ms = 120000
+# Disk (#427): over this many GB (2^30 bytes) under data_dir, GC frees space
+# losslessly (finished jobs' lanes, then their review folders, then idle
+# lanes slimmed); it never stops a heist. 0 disables it.
+disk_budget_gb = 30
+# Below this many GB free on the disk, new job and writer-child lanes wait
+# while GC frees space. 0 disables it.
+min_free_disk_gb = 10
+# "automatic" frees space on its own; "proposed" posts one FOR YOU card.
+reclaim_mode = "automatic"
 
 [dispatch]                        # dispatch flow (E8) — all optional
 # Bob's consolidation knock ships 0 (disabled): the due-based dream pass is

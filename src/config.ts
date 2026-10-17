@@ -210,6 +210,12 @@ export interface ChatConfig {
   readonly morningDigestGapMs: number;
 }
 
+/** How GC frees disk space over `[worktrees] disk_budget_gb` or under
+ * `min_free_disk_gb` (#427 PR 3): `automatic` frees it losslessly on its
+ * own; `proposed` posts one FOR YOU card listing what it would free. */
+export const RECLAIM_MODES = ['automatic', 'proposed'] as const;
+export type ReclaimMode = (typeof RECLAIM_MODES)[number];
+
 /** Worktree manager policy (E8; SPEC ruling 18). */
 export interface WorktreesConfig {
   /** Root under which job/review worktrees are created. */
@@ -218,7 +224,17 @@ export interface WorktreesConfig {
   readonly preserveRoot: string;
   /** Budget per one-time bootstrap setup command (ms). */
   readonly setupTimeoutMs: number;
+  /** GC's disk budget in GB of 2^30 bytes (#427 PR 3): over it, GC frees
+   * space losslessly; it never stops a heist. 0 disables it. */
+  readonly diskBudgetGb: number;
+  /** The disk's free-space floor in GB (#427 PR 3): below it, new job and
+   * writer-child lanes wait while GC frees space. 0 disables it. */
+  readonly minFreeDiskGb: number;
+  readonly reclaimMode: ReclaimMode;
 }
+
+export const DEFAULT_DISK_BUDGET_GB = 30;
+export const DEFAULT_MIN_FREE_DISK_GB = 10;
 
 /** Dispatch flow policy (E8). */
 export interface DispatchConfig {
@@ -1034,6 +1050,15 @@ function requireNonNegativeNumber(value: unknown, file: string, field: string): 
   return value;
 }
 
+/** `[worktrees] reclaim_mode` (#427 PR 3); absent is `automatic`. */
+function requireReclaimMode(value: unknown, file: string): ReclaimMode {
+  if (value === undefined) return 'automatic';
+  if (typeof value !== 'string' || !(RECLAIM_MODES as readonly string[]).includes(value)) {
+    throw new ConfigError(`worktrees.reclaim_mode must be one of ${RECLAIM_MODES.map((entry) => `"${entry}"`).join(', ')}, got: ${JSON.stringify(value)}`, file, 'worktrees.reclaim_mode');
+  }
+  return value as ReclaimMode;
+}
+
 function requireUnitNumber(value: unknown, file: string, field: string): number {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) {
     throw new ConfigError(`${field} must be a finite number between 0 and 1`, file, field);
@@ -1457,9 +1482,9 @@ export function loadConfig(
     if (raw['worktrees'] !== undefined) {
       const table = requireTable(raw['worktrees'], file, 'worktrees');
       for (const key of Object.keys(table)) {
-        if (!['root', 'preserve_root', 'setup_timeout_ms'].includes(key)) {
+        if (!['root', 'preserve_root', 'setup_timeout_ms', 'disk_budget_gb', 'min_free_disk_gb', 'reclaim_mode'].includes(key)) {
           throw new ConfigError(
-            `unknown key \`${key}\` in [worktrees] (valid keys: root, preserve_root, setup_timeout_ms)`,
+            `unknown key \`${key}\` in [worktrees] (valid keys: root, preserve_root, setup_timeout_ms, disk_budget_gb, min_free_disk_gb, reclaim_mode)`,
             file,
             `worktrees.${key}`,
           );
@@ -1469,6 +1494,9 @@ export function loadConfig(
         root: table['root'] !== undefined ? expandTilde(requireString(table['root'], file, 'worktrees.root'), home) : '',
         preserveRoot: table['preserve_root'] !== undefined ? expandTilde(requireString(table['preserve_root'], file, 'worktrees.preserve_root'), home) : '',
         setupTimeoutMs: table['setup_timeout_ms'] !== undefined ? requirePositiveInt(table['setup_timeout_ms'], file, 'worktrees.setup_timeout_ms') : 120_000,
+        diskBudgetGb: table['disk_budget_gb'] !== undefined ? requireNonNegativeNumber(table['disk_budget_gb'], file, 'worktrees.disk_budget_gb') : DEFAULT_DISK_BUDGET_GB,
+        minFreeDiskGb: table['min_free_disk_gb'] !== undefined ? requireNonNegativeNumber(table['min_free_disk_gb'], file, 'worktrees.min_free_disk_gb') : DEFAULT_MIN_FREE_DISK_GB,
+        reclaimMode: requireReclaimMode(table['reclaim_mode'], file),
       };
     }
     if (raw['dispatch'] !== undefined) {
@@ -1838,6 +1866,9 @@ export function loadConfig(
         worktrees !== null && worktrees.preserveRoot !== '' ? worktrees.preserveRoot : join(dataDir, 'worktree-preserves'),
       ),
       setupTimeoutMs: worktrees?.setupTimeoutMs ?? 120_000,
+      diskBudgetGb: worktrees?.diskBudgetGb ?? DEFAULT_DISK_BUDGET_GB,
+      minFreeDiskGb: worktrees?.minFreeDiskGb ?? DEFAULT_MIN_FREE_DISK_GB,
+      reclaimMode: worktrees?.reclaimMode ?? 'automatic',
     },
     dispatch,
     lessons,

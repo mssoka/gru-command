@@ -464,6 +464,8 @@ const PRODUCER_RESOLVED_KINDS: Readonly<Record<string, string>> = {
   'worktree.restore-incomplete': 'the lane being swept or gone',
   // #427 PR 2a: one row per lane whose release a sparse checkout refuses.
   'worktree.sparse-checkout': 'the lane being swept or gone',
+  // #427 PR 3: over the disk budget or under the floor with nothing GC can free.
+  'disk.nothing-to-free': 'GC\'s usage being under its budget and the disk\'s free space at or above the floor',
 };
 
 // The alias d is an immutable delivery. A protected root must cite its

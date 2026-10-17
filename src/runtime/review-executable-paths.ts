@@ -2662,6 +2662,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/listener-probe.js",
   "dist/logger.js",
   "dist/main.js",
+  "dist/maintenance/disk.js",
   "dist/maintenance/expiry.js",
   "dist/maintenance/repo-moves.js",
   "dist/notifications/attention.js",
