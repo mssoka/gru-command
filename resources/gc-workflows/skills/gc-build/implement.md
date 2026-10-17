@@ -16,8 +16,9 @@ executed evidence. When the spec has an I/O and edge-case matrix, every row need
 a test that verifies its expected behavior and that ran and passed in the recorded
 verification; a covering test that did not run (unregistered, filtered out,
 skipped or disabled) counts as missing. When a test disagrees with a row, never
-edit the expectation to match the code: fix the code, or obtain an owner decision
-when the row itself is ambiguous. Finish missing work before claiming completion.
+edit the expectation to match the code: fix the code. A row that is itself wrong
+against the approved intent is corrected in the spec with the evidence recorded;
+a row that encodes owner-approved acceptance changes only on an owner decision. Finish missing work before claiming completion.
 Capture exact commands, outcomes and full canonical candidate head beneath the
 private artifact root. Do not claim a skipped/unexecuted test passed.
 

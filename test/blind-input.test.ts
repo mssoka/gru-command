@@ -632,7 +632,8 @@ describe('GC review workflow carries the isolation contract', () => {
     expect(review).toContain('"input_package"');
     expect(review).toContain('"parent_contract_sha256"');
     expect(review).toContain('blind-coverage');
-    expect(review.match(/"review_role": "claims"/gu)).toHaveLength(2);
+    expect(review.match(/"review_role": "claims"/gu)).toHaveLength(3);
+    expect(review.match(/"review_role": "blind"/gu)).toHaveLength(1);
     const manifest = JSON.parse(readFileSync('resources/gc-workflows/runtime.json', 'utf-8')) as { files: Record<string, string> };
     expect(manifest.files['skills/gc-build/review.md']).toBe(createHash('sha256').update(review).digest('hex'));
   });

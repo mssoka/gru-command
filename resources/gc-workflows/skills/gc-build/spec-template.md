@@ -15,8 +15,9 @@ the intent is frozen: only the owner changes it, and each change is recorded.
 ## Risk
 
 `low`, `medium` or `high` — the business impact if this change is wrong — with a
-one-line reason. Raise it when investigation shows more; lower it only on an
-owner decision. It sizes small-change review breadth.
+one-line reason from the investigation; raise it when evidence shows more. This
+route always reviews with all four lenses; the small-change route records the
+same field in its note, where it sizes review breadth.
 
 ## Code map and ordered tasks
 
@@ -49,4 +50,5 @@ into {{context.knowledgeRoot}}, never private prompts, logs or credentials.
 Append one row per reviewer finding on every review pass, carried rows included:
 reviewer, location, claim, verdict (`high`, `medium`, `low`, `false` or
 `maybe-false`), evidence and disposition (fixed with its commit, rejected with
-its reason, owner decision, pre-existing or `carried`).
+its reason, owner decision or pre-existing). A carried row is marked `carried`
+and keeps its original verdict and disposition.

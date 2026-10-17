@@ -47,7 +47,10 @@ parallel when the runtime supports it:
   `qualifying`; settling a report is not validity.
 - [[gc-resource:skills/gc-build/review-prompts/edge-cases.md]] — diff and relevant code,
   with the working spec's intent and acceptance as the claims input it reads only after
-  tracing paths. Claims-needed lens: `"review_role": "claims"`.
+  tracing paths. Pass the claims as a `required_inputs` path (`"lens": "claims"`) when
+  the approved spec is committed under the knowledge root; otherwise quote them only in
+  a final brief section marked for its claims step. Claims-needed lens:
+  `"review_role": "claims"`.
 - [[gc-resource:skills/gc-build/review-prompts/verification.md]] — diff, approved intent,
   tests and exact executed verification evidence. Claims-needed lens: `"review_role": "claims"`.
 - [[gc-resource:skills/gc-build/review-prompts/intent-alignment.md]] — diff and its tests
@@ -74,16 +77,24 @@ Do not manufacture defects to fill a target. These rules apply to both routes.
 
 ## Triage and fixes
 
-Triage only after every launched reviewer has reported. Disregard any severity a
-reviewer assigned. Record one row per finding in the review triage log of the
+Triage only after every launched reviewer has reported or ended without a report.
+A reviewer job that ended without a report (crashed, cancelled, refused or stopped)
+or that reported its content missing or unreadable is a failed lens: record it,
+re-commission it or report the infrastructure failure as above, and treat that
+lens's coverage as missing until a replacement reports; triage the replacement's
+findings when they arrive. Disregard any severity a reviewer assigned. Record one row per finding in the review triage log of the
 working spec (or small-change note) under the private artifact root — verdict,
 evidence and a reasoned disposition for every finding; never drop, merge or
 silently skip one.
 
 On a re-review of a changed head, match each finding against the logged rows
-first. Same location and same claim as a logged row, and the code there still
-reads as the row describes: keep that row's verdict and disposition and log it
-again as `carried`, without re-verifying or re-fixing it. Verify everything else.
+first. Carry a row forward only when its disposition was a rejection (`false`, a
+rejected `low`, out of scope) or pre-existing, the finding has the same location
+and claim, and both the cited code and the code its evidence relied on are
+unchanged since the row was logged: log it again as `carried`, keeping its original
+verdict and disposition, without re-verifying it. A finding that matches a row marked fixed or
+awaiting an owner decision is verified again; a fix that missed or a decision not
+yet made is never carried. Verify everything else.
 
 Verify each remaining claim: at the cited file and line, does the bad outcome
 actually occur? Read past the changed lines — callers, upstream guards — until you
@@ -119,8 +130,8 @@ verdict. Then:
   settle it; one that would only be `low` is rejected with that note.
 - A defect this change neither caused nor exposed: log it as pre-existing with
   its evidence and name it in the handoff; do not open new backlog for it.
-- Findings that expose wrong or incomplete acceptance need an explicit owner
-  decision; do not silently rewrite intent or create a completion claim.
+- Findings that expose wrong acceptance need an explicit owner decision; do not
+  silently rewrite intent or create a completion claim.
 - Fix all actionable in-scope defects — every other surviving group — and
   add/run regressions.
 

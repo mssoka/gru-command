@@ -79,8 +79,9 @@ Triage verifies every finding at its cited location and gives exactly one verdic
 ignored. `false` findings are rejected on their refutation. A `low` finding is
 rejected when users or developers are unlikely to meet it in everyday use and its
 fix adds complexity beyond a direct correction or deletion (owner ruling
-2026-10-17). On a re-review, a finding that matches a logged row whose code is
-unchanged is carried forward, not re-verified or re-fixed. Every finding keeps a
+2026-10-17). On a re-review, a rejected or pre-existing row whose cited code and
+evidence are unchanged is carried forward without re-verification; a finding that
+matches a fixed or owner-pending row is verified again. Every finding keeps a
 row and reason in the private triage log; pre-existing defects and unsettled
 `maybe-false` findings are named in the handoff, not opened as new backlog.
 Development/fallback PASS is never native exact-final-head Perkins READY.
@@ -141,7 +142,7 @@ same package-relative helper launcher using a supplied absolute context file;
 
 ## Identity, integrity and lane continuity
 
-`runtime.json` uses schema 2, a GC name/version (`gru-command-workflows@1`),
+`runtime.json` uses schema 2, a GC name/version (currently `gru-command-workflows@2`),
 supported entrypoints/skill names and per-resource sha256. There are no upstream
 archive/identity sections. Missing/corrupt/undeclared/symlinked files fail with
 `WorkflowResourceError`; no ambient workflow fallback is permitted. Required
@@ -175,7 +176,7 @@ Edit GC templates/helpers directly, then refresh **local GC integrity**:
 
 ```sh
 npx tsc
-node dist/cli/workflow-runtime.js manifest . --version 2
+node dist/cli/workflow-runtime.js manifest . --version <next>   # one above the version in runtime.json
 npm test
 npm pack
 ```
