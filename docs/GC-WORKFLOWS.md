@@ -83,12 +83,15 @@ fix adds complexity beyond a direct correction or deletion (owner ruling
 2026-10-17). On a re-review, a matching row is carried forward without
 re-verification while nothing changed its cited code, evidence code, the callers
 of or paths into the cited code, or the approved intent since its logged head; a
-row marked fixed is never carried, because the same finding means the fix missed.
+row marked fixed or corrected is never carried, because the same finding means the
+fix missed.
 The edge-case lens
-receives no claims, so no claims are handed to its path tracing; the verification
-lens falsifies the spec's claims against the approved intent. Expected behavior
-(acceptance scenarios, matrix rows) changes only by quoting the approved intent it
-contradicts, or by owner decision — never to match the code. Every finding keeps a
+receives no claims (owner ruling 2026-10-17) and no knowledge-root files, so no
+claims are handed to its path tracing; the verification lens falsifies the spec's
+claims against the code and the approved intent. Expected behavior (acceptance
+scenarios, matrix rows) changes only by quoting the approved intent it
+contradicts, then the code follows it, or by owner decision — never to match the
+code. Every finding keeps a
 row and reason in the private triage log; pre-existing defects and unsettled
 `maybe-false` findings are named in the handoff, not opened as new backlog.
 Development/fallback PASS is never native exact-final-head Perkins READY.

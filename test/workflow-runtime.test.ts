@@ -183,9 +183,11 @@ describe('GC-owned workflow resources', () => {
     // The path tracer gets no claims; the verification lens falsifies them.
     expect(bullet('edge-cases')).toMatch(/only: never the spec, intent, task list or author's explanation\. Commission it\s+with `"review_role": "claims"` and no `required_inputs`/u);
     expect(bullet('verification')).toMatch(/with the approved intent \(the ground truth\) and\s+the claims it falsifies \(the working spec's acceptance and tasks, or on the\s+small-change route the note's settled acceptance\) quoted in its brief/u);
-    expect(review).toMatch(/Hand the edge-case and intent-alignment lenses the diff without knowledge-root\s+paths/u);
-    expect(review).toContain(`paths (\`${context.knowledgeRoot}\`), so a committed spec is not part of what they`);
-    expect(review).toMatch(/A change that touches only\s+knowledge-root files gives those two lenses nothing to review: record them as not\s+applicable/u);
+    expect(review).toMatch(/Hand the edge-case lens the diff without knowledge-root paths/u);
+    expect(review).toContain(`(\`${context.knowledgeRoot}\`), so a committed spec is not part of what it traces;`);
+    expect(review).toMatch(/the other lenses, intent alignment included, review those files/u);
+    expect(review).toMatch(/A change that\s+touches only knowledge-root files gives the edge-case lens no code to trace: record\s+it as not applicable/u);
+    expect(review).toMatch(/If an\s+edge-case report says its brief carried claims, it is a failed lens: re-commission\s+it with a brief that carries none/u);
     expect(bullet('intent-alignment')).toMatch(/plus the verbatim owner-approved intent quoted into the brief; never the author's\s+explanation, task list or self-review/u);
     expect(intent).toMatch(/surface at\s+which\s+the intent's\s+expectations\s+live/u);
     expect(intent).toMatch(/internal proxy/u);
@@ -203,10 +205,10 @@ describe('GC-owned workflow resources', () => {
     expect(review).toMatch(/treat that\s+lens's coverage as missing until a replacement reports/u);
     expect(review).toMatch(/A replacement or later\s+re-review of that lens covers from the last head where it had counted coverage \(or\s+the base\), never a narrower focused delta/u);
     expect(review).toMatch(/A failed blind report never counts as coverage, whatever `blind-coverage` says\. If\s+its replacement is refused `409 blind_coverage_owned`, do not retry in a loop/u);
-    expect(review).toMatch(/the\s+service accepts a same-head replacement only once the failed job is parked or\s+binned, so commission the blind lens again on the next new head or escalate to the\s+owner with the failed job's id/u);
-    expect(review).toMatch(/Review stays incomplete until every required lens\s+is covered/u);
+    expect(review).toMatch(/service accepts a same-head replacement only once the failed job is parked or\s+binned\. When fixes are due, commission the blind lens again on the next new head;\s+otherwise escalate to the owner with the failed job's id, and once that job is\s+parked or binned commission the same-head replacement/u);
+    expect(review).toMatch(/Review stays incomplete\s+until every required lens is covered or recorded not applicable/u);
     // Exactly one defined verdict per finding.
-    expect(review).toMatch(/Disregard any severity a reviewer assigned/u);
+    expect(review).toMatch(/Disregard any\s+severity a reviewer assigned/u);
     expect(review).toMatch(/Render exactly one verdict:/u);
     expect(review).toMatch(/- `high` \(intolerable\), `medium` \(tolerable\) or `low` \(cosmetic or negligible\) —\s+the bad outcome is real/u);
     expect(review).toMatch(/- `false` — you checked and the outcome does not occur/u);
@@ -215,7 +217,7 @@ describe('GC-owned workflow resources', () => {
     // Carried rows: unchanged code, evidence, callers and intent since the logged head; never a row marked fixed.
     expect(review).toMatch(/Carry a row forward when the finding has the same location and claim and,\s+since the head the row was logged at, nothing changed the cited code, the code its\s+evidence relied on, any caller of or path into the cited code, or the approved\s+intent/u);
     expect(review).toMatch(/Log it again as `carried` with the head range compared, keeping its\s+original verdict and disposition, without re-verifying or re-fixing it/u);
-    expect(review).toMatch(/A row marked fixed is\s+never carried: the same finding at unchanged code means the fix missed/u);
+    expect(review).toMatch(/A row marked fixed or\s+corrected is never carried: the same finding at unchanged code means the fix\s+missed/u);
     expect(review).toMatch(/a carried\s+pending owner decision stays pending until the owner rules/u);
     // Owner ruling 2026-10-17: unlikely low findings whose fix adds complexity are rejected.
     expect(review).toMatch(/Reject a `low` finding when users or\s+developers are unlikely to meet the defect in everyday use/u);
@@ -225,8 +227,8 @@ describe('GC-owned workflow resources', () => {
     expect(review).toMatch(/Group the survivors by shared root cause — the same defect produced both, not\s+merely the same location or the same fix — and give each group its highest\s+verdict/u);
     expect(review).toMatch(/One that cannot be settled is logged as unsettled and named in the\s+handoff with what would settle it/u);
     expect(review).toMatch(/log it as pre-existing with\s+its evidence and name it in the handoff; do not open new backlog for it/u);
-    expect(review).toMatch(/Findings that expose wrong expected behavior — an acceptance scenario or\s+matrix row — are corrected only by quoting the approved-intent text it\s+contradicts, never to match the code; any other doubt about expected behavior\s+needs an explicit owner decision/u);
-    expect(review).toMatch(/A wrong implementation-plan detail \(a task, a code-map entry\)\s+is corrected with its reason\. Log each correction as `corrected` and name it in\s+the handoff/u);
+    expect(review).toMatch(/Findings that expose wrong expected behavior — an acceptance scenario or\s+matrix row — are corrected only by quoting the approved-intent text it\s+contradicts, never to match the code; then fix the code and its tests to the\s+corrected expectation with a regression\. Any other doubt about expected behavior\s+needs an explicit owner decision/u);
+    expect(review).toMatch(/A wrong implementation-plan detail \(a task, a code-map entry\)\s+is corrected with its reason, never to drop work the approved intent or\s+acceptance still requires\. Log each correction as `corrected` \(with the commit\s+of any code fix\) and name it in the handoff/u);
     expect(review).not.toMatch(/proves it unworkable/u);
     expect(review).toContain('Do not offload known required work into new backlog.');
     expect(review).not.toMatch(/deferred-work|defer list/iu);
@@ -243,6 +245,8 @@ describe('GC-owned workflow resources', () => {
     expect(verification).toContain('`expect(x ?? DEFAULT).toBe(DEFAULT)` passes when `x` is missing');
     expect(verification).toMatch(/## Claims\s+After tracing verification, take the claims your brief quotes — the working\s+spec's acceptance and tasks, or the small-change note's settled acceptance/u);
     expect(verification).toMatch(/The approved intent is not a claim; it is\s+what the claims are checked against/u);
+    expect(verification).toMatch(/and against the approved intent\. Verified claims produce\s+nothing/u);
+    expect(verification).toMatch(/what contradicts it — the code\s+\(`file:line`, with what it actually does\) or the approved intent \(quoted\)/u);
     expect(verification).toMatch(/the approved intent and the claims are quoted in the\s+brief/u);
     expect(verification).toMatch(/testimony, not evidence/u);
     expect(verification).toMatch(/Outside the claims step\s+below, do not hunt for correctness bugs/u);
@@ -257,6 +261,7 @@ describe('GC-owned workflow resources', () => {
     expect(edges).toMatch(/where\s+removed code was referenced, and where other writers or readers share the state/u);
     expect(edges).toMatch(/assign severity or confidence/u);
     expect(edges).not.toMatch(/high\/medium\/low\s+confidence|claims input|reach you anyway/u);
+    expect(edges).toMatch(/If your brief carries claims about the change\s+anyway, do not use them and say so first in your report/u);
     for (const lens of [verification, edges, textAt(invocation.snapshotDir, 'review-prompts/intent-alignment.md')]) {
       expect(lens).toContain('No actionable findings.');
       expect(lens).toMatch(/Do not rank or\s+assign severity|no severity, confidence or\s+ranking/u);
@@ -264,7 +269,7 @@ describe('GC-owned workflow resources', () => {
     }
     const spec = textAt(invocation.snapshotDir, 'spec-template.md');
     expect(spec).toMatch(/## Risk\s+`low`, `medium` or `high` — the business impact if this change is wrong/u);
-    expect(spec).toMatch(/This route always reviews with all four lenses; the\s+small-change route records the same field in its note, where it sizes review\s+breadth/u);
+    expect(spec).toMatch(/This route reviews with all four lenses whatever the\s+risk; the small-change route records the same field in its note, where it sizes\s+review breadth/u);
     expect(spec).toContain('| Scenario | Input / state | Expected output / behavior | Error handling |');
     expect(spec).toMatch(/outermost surface the intent names/u);
     expect(spec).toMatch(/## Review triage log\s+Append one row per reviewer finding on every review pass, carried rows included:\s+reviewed head/u);
@@ -274,8 +279,8 @@ describe('GC-owned workflow resources', () => {
     const implement = textAt(invocation.snapshotDir, 'implement.md');
     expect(implement).toMatch(/\(unregistered, filtered out,\s+skipped or disabled\) counts as missing/u);
     expect(implement).toMatch(/never\s+edit the expectation to match the code/u);
-    expect(implement).toMatch(/A row is corrected only by\s+quoting the approved-intent text it contradicts, and the correction is named in\s+the handoff; any other doubt about a row needs an owner decision/u);
-    expect(implement).toMatch(/Tasks and\s+code-map entries are implementation plan, corrected with their reason/u);
+    expect(implement).toMatch(/An acceptance scenario or\s+row is corrected only by quoting the approved-intent text it contradicts, and the\s+code and tests then follow the corrected expectation; any other doubt about one\s+needs an owner decision/u);
+    expect(implement).toMatch(/Tasks and code-map entries are implementation plan,\s+corrected with their reason but never to drop required work/u);
     expect(implement).not.toMatch(/proves it unworkable/u);
   });
 

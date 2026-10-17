@@ -16,9 +16,9 @@ the intent is frozen: only the owner changes it, and each change is recorded.
 
 `low`, `medium` or `high` — the business impact if this change is wrong — with a
 one-line reason from the investigation; raise it when evidence shows more. It
-is reported in the handoff. This route always reviews with all four lenses; the
-small-change route records the same field in its note, where it sizes review
-breadth.
+is reported in the handoff. This route reviews with all four lenses whatever the
+risk; the small-change route records the same field in its note, where it sizes
+review breadth.
 
 ## Code map and ordered tasks
 

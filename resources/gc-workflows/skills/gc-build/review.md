@@ -57,11 +57,13 @@ parallel when the runtime supports it:
   plus the verbatim owner-approved intent quoted into the brief; never the author's
   explanation, task list or self-review. Claims-needed lens: `"review_role": "claims"`.
 
-Hand the edge-case and intent-alignment lenses the diff without knowledge-root
-paths (`{{context.knowledgeRoot}}`), so a committed spec is not part of what they
-review; the other lenses review those files. A change that touches only
-knowledge-root files gives those two lenses nothing to review: record them as not
-applicable, with that reason, instead of commissioning them.
+Hand the edge-case lens the diff without knowledge-root paths
+(`{{context.knowledgeRoot}}`), so a committed spec is not part of what it traces;
+the other lenses, intent alignment included, review those files. A change that
+touches only knowledge-root files gives the edge-case lens no code to trace: record
+it as not applicable, with that reason, instead of commissioning it. If an
+edge-case report says its brief carried claims, it is a failed lens: re-commission
+it with a brief that carries none.
 
 The small-change route requires the fresh adversarial reviewer and widens with the
 risk re-scored against the candidate diff: `medium` adds the verification and
@@ -95,13 +97,14 @@ the base), never a narrower focused delta; triage its findings when they arrive.
 A failed blind report never counts as coverage, whatever `blind-coverage` says. If
 its replacement is refused `409 blind_coverage_owned`, do not retry in a loop: the
 service accepts a same-head replacement only once the failed job is parked or
-binned, so commission the blind lens again on the next new head or escalate to the
-owner with the failed job's id. Review stays incomplete until every required lens
-is covered. Disregard any severity a reviewer assigned.
-Record one row per finding in the review triage log of the working spec (or
-small-change note) under the private artifact root — reviewed head, verdict,
-evidence and a reasoned disposition for every finding; never drop, merge or
-silently skip one.
+binned. When fixes are due, commission the blind lens again on the next new head;
+otherwise escalate to the owner with the failed job's id, and once that job is
+parked or binned commission the same-head replacement. Review stays incomplete
+until every required lens is covered or recorded not applicable. Disregard any
+severity a reviewer assigned. Record one row per finding in the review triage log
+of the working spec (or small-change note) under the private artifact root —
+reviewed head, verdict, evidence and a reasoned disposition for every finding;
+never drop, merge or silently skip one.
 
 On a re-review of a changed head, match each finding against the logged rows
 first. Carry a row forward when the finding has the same location and claim and,
@@ -109,9 +112,9 @@ since the head the row was logged at, nothing changed the cited code, the code i
 evidence relied on, any caller of or path into the cited code, or the approved
 intent. Log it again as `carried` with the head range compared, keeping its
 original verdict and disposition, without re-verifying or re-fixing it; a carried
-pending owner decision stays pending until the owner rules. A row marked fixed is
-never carried: the same finding at unchanged code means the fix missed, so verify
-it again. Verify everything else.
+pending owner decision stays pending until the owner rules. A row marked fixed or
+corrected is never carried: the same finding at unchanged code means the fix
+missed, so verify it again. Verify everything else.
 
 Verify each remaining claim: at the cited file and line, does the bad outcome
 actually occur? Read past the changed lines — callers, upstream guards — until you
@@ -150,11 +153,13 @@ verdict. Then:
   its evidence and name it in the handoff; do not open new backlog for it.
 - Findings that expose wrong expected behavior — an acceptance scenario or
   matrix row — are corrected only by quoting the approved-intent text it
-  contradicts, never to match the code; any other doubt about expected behavior
+  contradicts, never to match the code; then fix the code and its tests to the
+  corrected expectation with a regression. Any other doubt about expected behavior
   needs an explicit owner decision. Do not silently rewrite intent or create a
   completion claim. A wrong implementation-plan detail (a task, a code-map entry)
-  is corrected with its reason. Log each correction as `corrected` and name it in
-  the handoff.
+  is corrected with its reason, never to drop work the approved intent or
+  acceptance still requires. Log each correction as `corrected` (with the commit
+  of any code fix) and name it in the handoff.
 - Fix all actionable in-scope defects — every other surviving group — and
   add/run regressions.
 

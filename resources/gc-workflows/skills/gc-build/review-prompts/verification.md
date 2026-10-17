@@ -70,8 +70,9 @@ code comment is still the same claim. The approved intent is not a claim; it is
 what the claims are checked against. Extract each checkable
 claim — what the change does, what it preserves, ordering, arithmetic, parity with
 existing code ("exactly as X does") — and try to falsify it against the code,
-reading the code that decides it: the compared-to function, the actual callee, the
-state the claim assumes. Verified claims produce nothing.
+reading the code that decides it (the compared-to function, the actual callee, the
+state the claim assumes), and against the approved intent. Verified claims produce
+nothing.
 
 ## What counts as a test
 
@@ -104,11 +105,11 @@ ranking — the commissioner's triage grades findings:
   undetected, and why the tests you checked would not fail.
 - Fix: the test to add, fitted to the repository's own way of verifying.
 
-For each falsified claim give the claim (quoted), where the code contradicts it
-(`file:line`), what the code actually does and the consequence for someone who
-believed it. Append genuine non-gap defects you reached while tracing under
-`Other findings`, description only; this permits reporting what you met, not extra
-hunting.
+For each falsified claim give the claim (quoted), what contradicts it — the code
+(`file:line`, with what it actually does) or the approved intent (quoted) — and
+the consequence for someone who believed it. Append genuine non-gap defects you
+reached while tracing under `Other findings`, description only; this permits
+reporting what you met, not extra hunting.
 
 There is no minimum finding quota and no tool-call ceiling. If the diff your brief
 names, or the approved intent or claims it quotes, are missing, empty or
