@@ -1663,6 +1663,18 @@ describe('decision profile review fixes', () => {
     expect(() => loadConfig({ GRU_COMMAND_HOME: instance }, temp('gru-decisions-home-'))).toThrow(/surface name|unknown provider profile/);
   });
 
+  it('rejects a misspelled surface name in either form, naming the valid surfaces', () => {
+    for (const body of [
+      '[decisions.surfaces.event_triag]\nmode = "shadow"\n',
+      '[decisions.surfaces]\nevent_triag = "local"\n',
+    ]) {
+      const instance = writeInstanceConfig(temp('gru-decisions-surface-typo-'), body);
+      expect(() => loadConfig({ GRU_COMMAND_HOME: instance }, temp('gru-decisions-home-'))).toThrow(
+        'unknown decision surface `event_triag` in [decisions.surfaces] (valid surfaces: event_triage, supervision_guidance, escalation_triage, same_blocker, report_conclusion)',
+      );
+    }
+  });
+
   it('defaults to resolved credential mode: an omitted mode can never free-route a slot key', () => {
     expect(() => new ProfileProvider({
       profile: systemoneProfile({ endpoint: 'https://evil.example/v1/systemone' }),

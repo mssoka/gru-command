@@ -92,9 +92,12 @@ because a table defined twice fails to load.
 A config generated before the fragment shipped has no decisions block, or
 only the tables an operator added by hand. Bring it up to date before
 turning Jev on, from the install directory and with the same
-`GRU_COMMAND_HOME` the service uses (`install.sh` writes it into the
-launchd plist or systemd unit, default `~/.gru-command`; the command prints
-the path it wrote):
+`GRU_COMMAND_HOME` the service uses: `install.sh` writes it into
+`~/Library/LaunchAgents/com.gru-command.service.plist` or
+`~/.config/systemd/user/gru-command.service` (default `~/.gru-command`; a
+service you start yourself uses whatever you set there). Every
+`dist/decisions/cli.js` command reads the same variable. The regenerate
+prints the path it wrote:
 
 ```sh
 npm run config:generate -- --force
@@ -148,16 +151,15 @@ request is a wiring bug, not provider health); `401 → auth_rejected`,
 `403 → forbidden`, `429/5xx → provider_degraded` are unchanged.
 
 Example — route one surface through TypeSafe directly. Store the TypeSafe
-key first (see [Credentials](#credentials)) and, with `enabled = true`,
-probe it until it reports `"status":"ready"`. While Jev is off the probe
-answers `"status":"disabled"` without reading the key, and a non-default
-profile with a bad key later falls back for its own calls with only a
-logged warning, never an owner incident:
-
-```sh
-printf '%s\n' "$TYPESAFE_API_KEY" | node dist/decisions/cli.js credentials set --slot typesafe --stdin
-node dist/decisions/cli.js check --profile typesafe-direct --json
-```
+key first (see [Credentials](#credentials)), then probe it with
+`node dist/decisions/cli.js check --profile typesafe-direct --json` once
+`enabled = true`. Run the probe in a shell without `TYPESAFE_API_KEY`
+exported: the variable outranks the stored key file the service reads.
+`"status":"ready"` means the key works; while Jev is off the probe answers
+`"status":"disabled"` without reading the key. Check it rather than
+waiting for an alert: a bad key on a non-default profile never raises an
+owner incident. Turning Jev on also starts the default `openrouter-jev`
+profile on every surface still routed to it, so store that key too.
 
 The built-in `typesafe-direct` profile needs no table of its own; change
 only the `provider` line in the surface's existing table:
@@ -178,7 +180,9 @@ Routing rules:
   `supervision_guidance` it means the legacy behavior (Jev's answer used
   with no backtest gate), and `escalation_triage` and `same_blocker` are
   never asked; prefer the table. Use one form per surface,
-  never both: a surface defined both ways fails to load. Unlisted surfaces
+  never both: a surface defined both ways fails to load. A name outside
+  the five known surfaces is rejected, so a typo cannot leave the real
+  surface unconfigured. Unlisted surfaces
   (and omitted surface arguments) ride the default `openrouter-jev`
   profile — pre-profile behavior, unchanged. The deterministic fallback
   never changes and stays the floor.
@@ -195,11 +199,14 @@ Routing rules:
   evidence fails the request loud (`EnforceGateError`) and posts a deduplicated
   needs-owner configuration incident. Only surfaces with registered labelled
   backtests (`escalation_triage`, `same_blocker`, `report_conclusion`) can
-  pass the gate, and none of the four live surfaces can use `enforce` today:
-  `event_triage` and `supervision_guidance` have no backtest harness yet, and
-  the `escalation_triage` and `same_blocker` hosts ask Jev only in `shadow`
-  (enforcing them is a future host change), so use `off` or `shadow`. A
-  surface with no `mode` key keeps the pre-#223 behavior without the gate.
+  pass the gate, and no surface can use `enforce` today. `event_triage` and
+  `supervision_guidance` have no registered backtest, so enforce fails every
+  request with that error. The `escalation_triage` and `same_blocker` hosts
+  ask Jev only in `shadow`, so enforce there acts like `off`: no asks, no
+  records, no incident. Enforcing them needs host changes as well as the
+  evidence and owner decision above (and #219 for `escalation_triage`);
+  `report_conclusion` has no live host. Use `off` or `shadow`. A surface
+  with no `mode` key keeps the pre-#223 behavior without the gate.
 - **Earning enforce.** Extract labelled history to JSONL
   (`{ id, state, label }`), run the harness against any profile, and save
   the evidence together with its stated threshold:

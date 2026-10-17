@@ -4,6 +4,7 @@ import { isAbsolute, join, relative, resolve } from 'node:path';
 import { parse, type TomlPrimitive } from 'smol-toml';
 import { parseQuietHours } from './chat/wake-policy.js';
 import { DEFAULT_INPUT_PRICE_PER_MTOK, validateProviderProfile } from './decisions/profile.js';
+import { DECISION_SURFACES } from './decisions/questions.js';
 import { displayManagedRepoName, managedRepoNameError } from './repos/managed-names.js';
 import type { SurfaceMode } from './decisions/types.js';
 import { SILAS_AUTOPILOT_RULE_IDS } from './dispatch/silas-rules.js';
@@ -2262,6 +2263,15 @@ function readDecisionsConfig(
       if (!/^[a-z0-9_]+$/u.test(surface)) {
         throw new ConfigError(
           `decision surface name \`${surface}\` must match [a-z0-9_]+`,
+          file,
+          `decisions.surfaces.${surface}`,
+        );
+      }
+      // A misspelled surface would load clean and leave the real one
+      // mode-less, which acts on Jev's answer ungated.
+      if (!(DECISION_SURFACES as readonly string[]).includes(surface)) {
+        throw new ConfigError(
+          `unknown decision surface \`${surface}\` in [decisions.surfaces] (valid surfaces: ${DECISION_SURFACES.join(', ')})`,
           file,
           `decisions.surfaces.${surface}`,
         );

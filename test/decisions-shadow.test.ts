@@ -188,11 +188,18 @@ describe('surface mode config parsing (issue #223)', () => {
     const template = decisionsConfigTemplate(true);
     expect(template).toContain('mode = "shadow"');
     expect(template).toContain('decisions/backtests/');
-    // Every fresh config ships this legend: enforce is unavailable on the live
-    // surfaces, and a missing mode is spelled out for all four.
-    expect(template).toContain('Not available on the four live surfaces below yet.');
-    expect(template).toContain('escalation_triage and same_blocker are never asked.');
-    expect(template.match(/off or shadow today/g)).toHaveLength(4);
+    // Every fresh config ships this legend: enforce is unusable today, each
+    // live surface says why, and a missing mode is spelled out for all four.
+    expect(template).toContain('Not usable on any surface yet (see each one below).');
+    expect(template).toContain('Give every surface an explicit mode unless you mean that.');
+    for (const surface of ['event_triage', 'supervision_guidance']) {
+      expect(template).toMatch(new RegExp(`#   ${surface} [^\\n]*\\n#\\s+off or shadow today: it has no registered backtest\\n`));
+    }
+    for (const surface of ['escalation_triage', 'same_blocker']) {
+      expect(template).toMatch(
+        new RegExp(`#   ${surface} [^\\n]*\\n#\\s+off or shadow today: it asks Jev only in shadow \\(enforce acts like off\\)\\n`),
+      );
+    }
   });
 });
 
