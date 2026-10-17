@@ -115,8 +115,9 @@ for a lane is the lane's to tear down — not a stranger's.
      `worktree.sparse-checkout`, closed once the lane is gone, as below).
      Lanes are never sparse by GC's doing: `git worktree add` gives a new
      lane the owner checkout's sparse-checkout, so GC runs
-     `git sparse-checkout disable` in each new lane, before anything runs in
-     it, when the repository keeps per-worktree config
+     `git sparse-checkout disable` in each new lane (off the event loop: it
+     checks the whole tree out), before anything runs in it, when the
+     repository keeps per-worktree config
      (`extensions.worktreeConfig`, which `git sparse-checkout` itself turns
      on): only the lane changes, and the owner's checkout stays as sparse as
      it was. A repository whose sparse checkout is in its shared config
@@ -138,9 +139,36 @@ for a lane is the lane's to tear down — not a stranger's.
      a `.gitmodules` exists; then the same inside each nested repository
      with a checkout. Detection ignores every display setting (`-c
      diff.ignoreSubmodules=none`, `--ignore-submodules=none`), so neither
-     user, repository nor global config hides anything. (An untracked folder
-     holding a `.git` is no gitlink: step 1 copies it whole, its `.git` and
-     commits with it.) A nested repository is safe to remove with the lane
+     user, repository nor global config hides anything. Three more places
+     hold nested repositories that no listing above names:
+     - **The lane's own `modules` folder** (`git rev-parse --git-path
+       modules`, under `.git/worktrees/<id>`): every submodule repository
+       the lane ever initialized, whether or not any path names it now (a
+       submodule added and then reset away leaves a folder holding only its
+       gitfile). Each git folder there not met above is judged by itself
+       (`git --git-dir <dir> rev-list … --not …`), with its own `git status`
+       when its `core.worktree` names a checkout in the lane whose `.git`
+       leads back to it.
+     - **Ignored folders.** `git ls-files --others --ignored
+       --exclude-standard --directory` lists them without descending into
+       one; each that is a repository (it holds a `.git` git reads as one)
+       or holds one at most three levels below it is judged as above. The
+       walk never follows a link and never looks into a folder named
+       `node_modules`. **Limits:** a repository deeper than three levels
+       below an ignored folder, or inside a `node_modules`, is not found,
+       and the release deletes it with the lane.
+     - **Submodule folders never initialized.** A gitlink folder (index or
+       HEAD) holding files but no `.git`: git lists none of them, so step 1
+       copies the folder whole (unless the submodule's `.gitmodules` at the
+       base says `ignore = untracked` or `all`).
+
+     (An untracked folder holding a `.git` is no gitlink: step 1 copies it
+     whole, its `.git` and commits with it.) A release refuses (never
+     deletes) a nested repository whose commits would not survive. The
+     nested-repo scan covers submodules (initialized or only in the admin
+     folder), embedded and ignored repositories within the depth bound, and
+     uninitialized submodule folders; what lies beyond the bound is a
+     documented limit. A nested repository is safe to remove with the lane
      only when both hold:
      - **its index and working tree are clean** (its own `git status`,
        untracked files included): modified or staged tracked content is
@@ -212,7 +240,10 @@ for a lane is the lane's to tear down — not a stranger's.
    copied; an untracked folder holding a `.git` is copied whole, its `.git`
    with it; the untracked content of nested repositories too, at any depth
    (step 0); symlinks are
-   preserved AS LINKS; a genuine mid-sweep vanish is skipped+logged; any
+   preserved AS LINKS; a FIFO, socket or device (one met inside a copied
+   folder too) is skipped with a warn naming it and never opened, since
+   opening a FIFO waits for a writer; the copy runs off the event loop; a
+   genuine mid-sweep vanish is skipped+logged; any
    other preserve failure ABORTS the sweep with the tree intact and the
    partial copy withdrawn — deliverables are never sacrificed). The copy is
    recorded (`worktree.preserved`) when the release pauses or reaches the
@@ -310,8 +341,17 @@ for a lane is the lane's to tear down — not a stranger's.
      lane found in that state (the git folder gone, part of the tree left)
      takes the same path and then reconciles the lane as removed; unless an
      aborted release of GC's saved the lane's work before its removal began,
-     it first copies what is left, whole, into the preserve root
-     (`worktree.preserved`, with `remains: true`).
+     it first copies what is left into the preserve root, off the event loop
+     (`worktree.preserved`, with `remains: true`). Only what git would keep
+     is copied: `git ls-files --cached --others --exclude-standard` over the
+     remains, with the repository's git folder and a temporary index of the
+     lane's commit (its branch, else its base) in which every `.gitignore` is
+     marked skip-worktree, so a `.gitignore` git already deleted still
+     applies. An ignored file (`.env.local`, `node_modules`), a manifest
+     `[[copy]]` destination, a file already gone and a FIFO are never
+     copied. If the remains then cannot be deleted, GC records
+     `worktree.release-aborted` with that copy, and a retry reuses it instead
+     of copying again.
 
    `<lane>` is the lane id when git accepts it as one ref-name component
    (letters, digits, `.`, `_` and `-`, not starting with `.` or `-`, no
