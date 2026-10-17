@@ -597,6 +597,20 @@ describe('the board view: the cockpit raids card (#351)', () => {
     expect(on(service.boardView()).capUse).toEqual([]);
   });
 
+  it('a raid card Gru withdrew waits for nobody, even before the raid record follows', () => {
+    const h = harness();
+    const service = h.service();
+    const [raid] = service.pick({ picks: [pickRefunds()], digest: null, requestedBy: 'gru' }).raids;
+    expect(on(service.boardView()).proposed).toBe(1);
+    // A typed owner decision is answered or closed, never acknowledged, so
+    // "open" needs no Ack check.
+    expect(() => h.ledger.ackNotification(raid!.notificationId!, 'web')).toThrow(/an Ack cannot erase the question/u);
+    // Withdrawn as stale: the card closes before the raid record follows.
+    h.ledger.withdrawOwnerProposal(raid!.notificationId!, 'withdrawn: the target moved');
+    expect(service.raids().find((entry) => entry.id === raid!.id)?.state).toBe('proposed');
+    expect(on(service.boardView()).proposed).toBe(0);
+  });
+
   it('counts a fix as waiting only while its FOR YOU card is unanswered: never before its card, never after a decline or an Accept', async () => {
     const h = harness();
     const service = h.service();
@@ -607,7 +621,7 @@ describe('the board view: the cockpit raids card (#351)', () => {
     const [first] = h.rows(FIX_PROPOSAL_KIND);
     expect(on(service.boardView()).fixesAwaitingOwner).toBe(1);
     h.notifications.decide(first!.id, 'decline', 'web', first!.decision!);
-    service.followDecision(first!.id);
+    await service.followFixDecision(first!.id);
     expect(service.breakIns().find((entry) => entry.id === 'bi-1')?.fix?.state).toBe('declined');
     expect(on(service.boardView())).toMatchObject({ breakIns: 1, fixesAwaitingOwner: 0 });
     // A second break-in the owner accepted before its dispatch ran: the fix
@@ -644,9 +658,21 @@ describe('the board view: the cockpit raids card (#351)', () => {
     expect(on(view).running.map((entry) => entry.repo)).toEqual(['ledger-svc', 'billing']);
     expect(on(view).capUse).toEqual([{ repo: 'billing', used: 2 }, { repo: 'ledger-svc', used: 1 }]);
     expect(on(view).proposed).toBe(0);
+    // Equal starts keep one order whatever the record order: repository,
+    // then package.
+    const tie = (raids: readonly RaidRecord[]) => on(vectorBoardView({
+      config: { enabled: true, raidMode: 'autonomous', maxRounds: 4, maxRaidsPerDay: 2 },
+      raids, breakIns: [], now: new Date('2026-10-17T13:00:00.000Z'), awaitingOwner: () => true,
+    })).running.map((entry) => `${entry.repo}/${entry.packageDir}`);
+    const same = '2026-10-17T12:00:00.000Z';
+    const b = { ...record('b', 'billing', 'running', same), target: { repo: 'billing', packageDir: 'src/b' } };
+    const a = { ...record('a', 'billing', 'running', same), target: { repo: 'billing', packageDir: 'src/a' } };
+    const z = record('z', 'audit', 'running', same);
+    expect(tie([b, a, z])).toEqual(['audit/src/x', 'billing/src/a', 'billing/src/b']);
+    expect(tie([z, b, a])).toEqual(['audit/src/x', 'billing/src/a', 'billing/src/b']);
   });
 
-  it('with raids off the block says only that: nothing follows decisions or closes raids, so no live count is claimed', () => {
+  it('with raids off the block carries only the mode and the cap, even with raids on record', () => {
     const h = harness();
     const live = h.service({ raidMode: 'autonomous' });
     live.pick({ picks: [pickRefunds()], digest: null, requestedBy: 'gru' });
@@ -680,7 +706,14 @@ describe('the board view: the cockpit raids card (#351)', () => {
     });
     expect(broken.snapshot().vector).toBeNull();
     expect(logged).toContain('error: vector view read failed');
+    expect(isValidSnapshot(JSON.parse(JSON.stringify(broken.snapshot())))).toBe(true);
     expect(new BoardEngine({ ledger: h.ledger, bus: h.bus }).snapshot().vector).toBeNull();
+    // Raids off, through a real engine: the off block reaches the snapshot
+    // and the web validator accepts it.
+    const off = h.service({ enabled: false, maxRaidsPerDay: 3 });
+    const offSnapshot = JSON.parse(JSON.stringify(new BoardEngine({ ledger: h.ledger, bus: h.bus, vector: () => off.boardView() }).snapshot())) as Record<string, unknown>;
+    expect(offSnapshot['vector']).toEqual({ enabled: false, raidMode: 'proposed', maxRaidsPerDay: 3 });
+    expect(isValidSnapshot(offSnapshot)).toBe(true);
   });
 });
 

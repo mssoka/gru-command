@@ -235,7 +235,8 @@ export class VectorService {
 
   /** The board's raid counts (the cockpit's VECTOR RAIDS card). Read with
    * raids off too: the block then says only that they are off. A FOR YOU
-   * card counts as waiting while it is open and unanswered. */
+   * card counts as waiting while it is open and unanswered (a typed owner
+   * decision cannot be acknowledged, only answered or closed). */
   boardView(): VectorBoardView {
     const awaitingOwner = (notificationId: string): boolean => {
       const row = this.opts.ledger.getNotification(notificationId);

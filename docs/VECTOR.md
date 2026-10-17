@@ -289,15 +289,18 @@ without calling the raid API.
 - **Raids off** (`enabled = false`): the block says only that, as
   `{ enabled: false, raidMode, maxRaidsPerDay }`. With raids off nothing
   follows decisions or starts or closes a raid, so it claims no live counts.
-- **Raids on**, the block holds:
+- **Raids on**, the block is `{ enabled: true, raidMode, proposed, queued,
+  running, capUse, maxRaidsPerDay, breakIns, fixesAwaitingOwner }`:
   - `proposed`: raids Gru picked whose FOR YOU card is open and unanswered. A
-    card you already answered, whose follow-through has not run yet, waits for
+    card you already answered (whose follow-through has not run yet), or one
+    closed without an answer (a stale proposal Gru withdrew), waits for
     nobody and is not counted;
   - `queued`: launched raids waiting in Silas's raid queue;
   - `running`: the raid running now, with its target, the attacks finished
     so far (`roundsDone`; the one in progress is not counted), `maxRounds` and
     when it started. One raid runs per host, so this holds at most one in
-    normal operation; a second is shown, never hidden. Newest start first;
+    normal operation; a second is shown, never hidden. Newest start first,
+    then by repository and package;
   - `capUse`: each repository using its daily cap now, busiest first, counted
     exactly as a pick is refused (started in the last 24 hours, waiting to
     run, running, or ended before starting), next to `maxRaidsPerDay`, the cap
@@ -306,5 +309,5 @@ without calling the raid API.
     break-ins whose fix card is open and unanswered in FOR YOU.
 
 An older server sends no block; a board reading it shows no raids card rather
-than zeros. A block that fails to read is logged and left out; the rest of the
-snapshot still renders.
+than zeros. A block that fails to read is logged and sent as `vector: null`
+(the board then shows no raids card); the rest of the snapshot still renders.

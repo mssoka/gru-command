@@ -40,7 +40,8 @@ export interface VectorOnBoardView {
   readonly proposed: number;
   /** Launched raids waiting in Silas's raid queue. */
   readonly queued: number;
-  /** Raids running now, newest start first. One runs per host, so this
+  /** Raids running now, newest start first (then by repository and
+   * package, so equal starts keep one order). One runs per host, so this
    * holds at most one in normal operation; a second is shown, never hidden. */
   readonly running: readonly VectorRunningRaidView[];
   /** Repositories using their cap now, busiest first (none listed = no
@@ -82,7 +83,10 @@ export function vectorBoardView(input: VectorBoardInput): VectorBoardView {
         startedAt: raid.startedAt,
       };
     })
-    .sort((left, right) => Date.parse(right.startedAt) - Date.parse(left.startedAt));
+    .sort((left, right) =>
+      Date.parse(right.startedAt) - Date.parse(left.startedAt)
+      || left.repo.localeCompare(right.repo)
+      || left.packageDir.localeCompare(right.packageDir));
   const repos = [...new Set(raids.map((raid) => raid.target.repo))];
   const capUse = repos
     .map((repo): VectorCapUseView => ({ repo, used: raidsTowardCap(raids, repo, now) }))
