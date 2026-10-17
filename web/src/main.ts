@@ -339,6 +339,9 @@ function startBoard(token: string): void {
     storage, // card disclosure persists per job (safeStorage-wrapped localStorage)
   );
   boardClient?.stop();
+  // The stop above reports `offline` while the old client is still current:
+  // the command bar starts this pairing's RADAR fresh.
+  commandBar.reset();
   // Every callback checks it still belongs to the CURRENT board client:
   // work an older pairing started (a fetch, a late 401) never touches this
   // session.

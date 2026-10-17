@@ -917,7 +917,7 @@ test('on a phone the bar stays one sticky row of brand and buttons above the hea
   // in its warning colour — nothing else there would say so. ROUND stays
   // aside.
   const liveHeights = new Map<number, number>();
-  for (const width of [360, 390, 430]) {
+  for (const width of [360, 390, 430, 561, 640]) {
     await page.setViewportSize({ width, height: 740 });
     await settleTransitions(page);
     liveHeights.set(width, await page.evaluate(() => document.getElementById('command-bar')!.offsetHeight));
@@ -930,8 +930,8 @@ test('on a phone the bar stays one sticky row of brand and buttons above the hea
   await expect(page.locator('#command-round')).toBeHidden();
   await expect(page.locator('#command-health-summary')).toHaveText(/^last-known · /u);
   // RADAR returns after the buttons, on a row of its own above the health
-  // pill: the buttons keep the brand's row.
-  for (const width of [360, 390, 430]) {
+  // pill: the buttons keep the brand's row, on a wide phone too.
+  for (const width of [360, 390, 430, 561, 640]) {
     await page.setViewportSize({ width, height: 740 });
     await settleTransitions(page);
     const lost = await page.evaluate(() => {
@@ -941,11 +941,12 @@ test('on a phone the bar stays one sticky row of brand and buttons above the hea
       return {
         buttonsOnRow1: ['sound-toggle', 'notification-bell', 'theme-toggle', 'settings-toggle'].every((id) => Math.abs(mid(box(id)) - mid(brand)) <= 2),
         radarBetween: box('command-radar').top >= brand.bottom && box('command-radar').bottom <= box('command-health').top,
+        settingsAtEdge: Math.abs(document.getElementById('command-bar')!.getBoundingClientRect().right - parseFloat(getComputedStyle(document.getElementById('command-bar')!).paddingRight) - box('settings-toggle').right) <= 1,
         barHeight: document.getElementById('command-bar')!.offsetHeight,
         radarRow: box('command-radar').height + parseFloat(getComputedStyle(document.getElementById('command-bar')!).rowGap),
       };
     });
-    expect([lost.buttonsOnRow1, lost.radarBetween], `${width}px`).toEqual([true, true]);
+    expect([lost.buttonsOnRow1, lost.radarBetween, lost.settingsAtEdge], `${width}px`).toEqual([true, true, true]);
     // The outage costs exactly RADAR's own row — the signal — and nothing else.
     expect(lost.barHeight - liveHeights.get(width)!, `${width}px bar growth`).toBeLessThanOrEqual(lost.radarRow + 1);
   }
@@ -1107,9 +1108,11 @@ test('the command bar keeps the brand, the pills and the buttons on one row from
     const rows = await page.evaluate(() => {
       const mid = (el: Element): number => { const b = el.getBoundingClientRect(); return b.top + b.height / 2; };
       const brand = mid(document.querySelector('.command-bar__brand')!);
-      return ['command-ticker', 'sound-toggle', 'settings-toggle'].map((id) => Math.abs(mid(document.getElementById(id)!) - brand) <= 2);
+      const shared = ['command-ticker', 'command-round', 'sound-toggle', 'settings-toggle'].map((id) => Math.abs(mid(document.getElementById(id)!) - brand) <= 2);
+      return [...shared, document.getElementById('command-round')!.getBoundingClientRect().width > 0];
     });
-    expect(rows, `${width}px`).toEqual([true, true, true]);
+    // ROUND is back from 800px, on row 1 with the brand, RADAR and buttons.
+    expect(rows, `${width}px`).toEqual([true, true, true, true, true]);
   }
   // A small tablet (641–799px): ROUND steps aside (the REVIEWS card names
   // the round), so the brand, RADAR and the buttons share row 1 in every
@@ -1174,6 +1177,51 @@ test('the crew rail sets each sub-minion indented under the minion that created 
   expect(other!.left).toBeCloseTo(lead!.left, 0);
   // The indented row still ends at the rail's edge (never overflows it).
   expect(sub!.right).toBeCloseTo(lead!.right, 0);
+});
+
+test('on a phone a normal boot never flashes RADAR: syncing is not an outage', async ({ page }) => {
+  await page.setViewportSize({ width: 360, height: 740 });
+  const initial = makeSnapshot(familyA(1));
+  await page.route(/\/api\/board/, (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(initial) }));
+  // The board socket opens but never authenticates: RADAR reads SYNCING.
+  await page.context().routeWebSocket(/\/board\/ws/, () => { /* never answers */ });
+  await pair(page);
+  await expect(page.locator('#command-health')).toBeVisible();
+  await expect(page.locator('#command-radar-label')).toHaveText('RADAR SYNCING');
+  await expect(page.locator('#command-ticker')).toBeHidden();
+});
+
+test('on a phone a re-pair starts RADAR fresh: the replaced board client stopping is no outage', async ({ page }) => {
+  await page.setViewportSize({ width: 360, height: 740 });
+  const chats: WebSocketRoute[] = [];
+  let refuse = false;
+  await page.context().routeWebSocket((url) => url.pathname === '/ws', (ws) => {
+    chats.push(ws);
+    ws.onMessage((data) => {
+      if (!String(data).includes('"type":"auth"')) return;
+      if (refuse) {
+        ws.send(JSON.stringify({ type: 'error', message: 'token revoked', fatal: true }));
+        void ws.close();
+      } else {
+        ws.send(JSON.stringify({ type: 'auth_ok', seq: 0 }));
+      }
+    });
+  });
+  await harness(page, makeSnapshot(familyA(1)));
+  await expect(page.locator('#command-ticker')).toBeHidden();
+  // The chat's next authentication is refused fatally: the pairing card.
+  refuse = true;
+  for (const chat of chats) await chat.close();
+  await expect(page.locator('#pairing-view')).toBeVisible();
+  // Pair again: the old board client stops (reporting offline) and a new one
+  // connects; its socket authenticates but has no frame yet.
+  refuse = false;
+  await page.locator('#pair-token').fill(MOCK_TOKEN);
+  await page.locator('#pair-submit').click();
+  await expect(page.locator('#board-view')).toBeVisible();
+  await expect(page.locator('#command-radar-label')).toHaveText('RADAR SYNCING');
+  await expect(page.locator('#command-ticker')).toHaveAttribute('data-board-lost', 'false');
+  await expect(page.locator('#command-ticker')).toBeHidden();
 });
 
 /** Visual evidence: real captures of the synthetic fixture at all four

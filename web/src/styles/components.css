@@ -424,7 +424,9 @@ body {
    that need a look keep a wrapping line of their own, and the Jev and
    wake chips wrap inside the pill. */
 @media (max-width: 640px) {
-  .command-bar__ticker { order: 1; }
+  /* A full row of its own whatever the width: on a wide phone RADAR would
+     otherwise fit after the gear and drag the buttons off the edge. */
+  .command-bar__ticker { order: 1; flex: 1 1 100%; }
   .command-bar__ticker:not([data-board-lost='true']) { display: none; }
   .command-health { flex: 1 1 auto; flex-wrap: wrap; row-gap: 4px; border-radius: var(--radius-md); }
   .command-health__parts { order: 1; flex: 1 1 100%; white-space: normal; }

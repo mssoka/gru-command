@@ -49,6 +49,14 @@ export class CommandBar {
     this.render();
   }
 
+  /** A new pairing starts RADAR fresh: the replaced board client's own
+   * stop reports `offline`, which is not an outage of the new one. */
+  reset(): void {
+    this.boardState = null;
+    this.ticker.dataset.boardLost = 'false';
+    this.render();
+  }
+
   setSnapshot(snapshot: BoardSnapshot | null): void {
     this.snapshot = snapshot;
     this.render();

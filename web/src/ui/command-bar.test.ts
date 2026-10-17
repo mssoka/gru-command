@@ -148,6 +148,12 @@ describe('command bar (cockpit rework)', () => {
     expect(lost()).toBe('false');
     bar.setBoardState('offline');
     expect(lost()).toBe('true');
+    // A new pairing starts fresh: the replaced client's stop is no outage.
+    bar.reset();
+    expect(lost()).toBe('false');
+    expect(radarPill().textContent).toBe('RADAR IDLE');
+    bar.setBoardState('connecting');
+    expect(lost()).toBe('false');
   });
 
   it('shows the top review round from each snapshot, live before pending', () => {
