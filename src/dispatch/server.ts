@@ -12,6 +12,7 @@ import type { PipelineService } from './pipeline.js';
 import type { IntakeService } from '../intake/service.js';
 import { IntakeError } from '../intake/types.js';
 import { IntakePartialFailure, type IntakeApprovalService } from '../intake/approval.js';
+import type { IntakeSlicingService } from '../intake/slicing.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { DispatchService } from './service.js';
 import { pendingPublicationAttempt } from './publication-evidence.js';
@@ -98,6 +99,8 @@ export interface DispatchServerOptions {
   /** Preview remains read-only; approval is a separate explicit boundary. */
   readonly intake?: IntakeService;
   readonly intakeApproval?: IntakeApprovalService;
+  /** Intake slicing (#429): commission a planning minion, accept its breakdown. */
+  readonly intakeSlicing?: IntakeSlicingService;
   /** Owner pairing-token actions only; never exposed as reviewer tools. */
   readonly propertyCampaigns?: PropertyCampaignService;
   /** Book of Lessons injection for directives/re-briefs (pointers only). */
@@ -446,7 +449,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         return true;
       }
       try {
-        if (req.method === 'POST' && ['/api/intake/preview', '/api/intake/revision', '/api/intake/review', '/api/intake/reject', '/api/intake/approve'].includes(path)) {
+        if (req.method === 'POST' && ['/api/intake/preview', '/api/intake/revision', '/api/intake/review', '/api/intake/reject', '/api/intake/approve', '/api/intake/slice', '/api/intake/slice/result'].includes(path)) {
           let body: Record<string, unknown>;
           try { body = await readBody(req, false); } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
@@ -454,6 +457,13 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           }
           if (path === '/api/intake/preview' || path === '/api/intake/revision') {
             json(res, 200, await (path.endsWith('/preview') ? intake.preview(body) : intake.revise(body)) as unknown as Record<string, unknown>);
+          } else if (path === '/api/intake/slice' || path === '/api/intake/slice/result') {
+            const slicing = options.intakeSlicing;
+            if (slicing === undefined) throw new IntakeError('intake_slicing_not_hosted', 'Intake slicing is not hosted on this service', 503);
+            if (path === '/api/intake/slice') {
+              const commission = await slicing.commission(body);
+              json(res, commission.dispatched ? 202 : 200, commission as unknown as Record<string, unknown>);
+            } else json(res, 200, await slicing.submit(body) as unknown as Record<string, unknown>);
           } else {
             const approval = options.intakeApproval;
             if (approval === undefined) throw new IntakeError('intake_approval_not_hosted', 'Explicit intake approval is not hosted on this service', 503);

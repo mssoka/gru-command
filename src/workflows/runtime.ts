@@ -10,7 +10,7 @@ import type { ManagedSkillSet } from '../runtime/types.js';
 import {
   parseWorkflowManifest, verifyWorkflowFiles, workflowContentHash, workflowDirName, workflowId,
   WorkflowResourceError, WORKFLOW_ENTRYPOINTS, WORKFLOW_MANIFEST, WORKFLOW_RESOURCE_DIR, WORKFLOW_SOURCE,
-  REQUIRED_INTAKE_WORKFLOW_FILE,
+  REQUIRED_INTAKE_WORKFLOW_FILE, REQUIRED_SLICING_WORKFLOW_FILE,
   type WorkflowManifest, type WorkflowRoute,
 } from './manifest.js';
 
@@ -127,6 +127,7 @@ export function writeWorkflowManifest(packageRoot: string, version?: number): Wo
   }), root);
   verifyWorkflowFiles(manifest, files);
   if (!files.has(REQUIRED_INTAKE_WORKFLOW_FILE)) throw new WorkflowResourceError(`missing required intake helper ${REQUIRED_INTAKE_WORKFLOW_FILE}`);
+  if (!files.has(REQUIRED_SLICING_WORKFLOW_FILE)) throw new WorkflowResourceError(`missing required slicing helper ${REQUIRED_SLICING_WORKFLOW_FILE}`);
   writeFileSync(join(root, WORKFLOW_MANIFEST), `${JSON.stringify(manifest, null, 2)}\n`);
   return manifest;
 }

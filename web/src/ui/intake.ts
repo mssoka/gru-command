@@ -1,4 +1,4 @@
-import { IntakeClient, IntakeClientError, type IntakeReadback, type Proposal, type Plan, type ReviewDecision } from '../lib/intake-client.js';
+import { IntakeClient, IntakeClientError, type IntakeReadback, type Proposal, type Plan, type ReviewDecision, type SlicingCommission } from '../lib/intake-client.js';
 import type { AttachmentChip } from '../lib/protocol.js';
 import { el } from './dom.js';
 import { uuidV4 } from '../lib/uuid.js';
@@ -78,6 +78,8 @@ export class IntakeView {
   private readonly selected = new Set<string>();
   private buttons: HTMLButtonElement[] = [];
   private identity: RecoveryIdentity | null = null;
+  /** The planning minion commissioned from this tab and its result request (#429). */
+  private slicing: SlicingCommission | null = null;
 
   constructor(private readonly root: HTMLElement, private readonly picker: Picker, private readonly storage: Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> | null = null) {
     const disclosure = el('details', 'intake');
@@ -129,7 +131,7 @@ export class IntakeView {
     this.generation += 1; this.wakeReceiptWaiters(); this.sourceGeneration += 1; this.client = client; this.busy = false; this.lockedInputs = null;
     this.proposal = null; this.readback = null; this.selected.clear(); this.reviewBody.replaceChildren(); this.editor.value = ''; this.editor.hidden = true;
     this.documentsPending = false; this.documentsError = null; this.files = []; this.repo.value = ''; this.issue.value = ''; this.comments.value = ''; this.renderFiles();
-    this.identity = null; this.approvals = []; this.pendingRevision = null; this.approvalReadbacks.clear(); this.approvalErrors.clear();
+    this.identity = null; this.approvals = []; this.pendingRevision = null; this.approvalReadbacks.clear(); this.approvalErrors.clear(); this.slicing = null;
     this.storageError = false;
     try {
       if (this.storage === null) throw new Error('Durable tab storage is unavailable');
@@ -212,7 +214,7 @@ export class IntakeView {
     } catch (error) {
       if (current() && error instanceof IntakeClientError) {
         if (error.readback) this.rememberApproval(request, error.readback);
-        else if (['intake_dependency_selection', 'intake_incomplete_plan', 'intake_invalid_request', 'intake_invalid_plan', 'intake_output_bounds', 'intake_stale_review', 'intake_stale_revision'].includes(error.code)) {
+        else if (['intake_dependency_selection', 'intake_already_accepted', 'intake_incomplete_plan', 'intake_invalid_request', 'intake_invalid_plan', 'intake_output_bounds', 'intake_stale_review', 'intake_stale_revision'].includes(error.code)) {
           // These named refusals precede acceptance; a corrected selection is safe.
           this.commitRecovery(this.identity, this.pendingRevision, this.approvals.filter((item) => item.request !== request || item.token !== undefined));
         }
@@ -367,6 +369,28 @@ export class IntakeView {
       checkbox.checked = this.selected.has(id);
       checkbox.disabled = approved || this.busy;
     }
+    action('Slice into heists (planning minion)', this.documentsError === null && !this.dirty() && this.proposal.gaps.length === 0 && !approved, async (client, current) => {
+      const p = this.proposal!;
+      const commission = await client.slice({ repoPath: p.repoPath, intakeId: p.intakeId, requestId: p.requestId, revisionId: p.revisionId });
+      if (!current()) return;
+      this.slicing = commission;
+      this.status.textContent = `Planning minion ${commission.jobId} (${commission.jobStatus}) ${commission.dispatched ? 'is slicing' : 'was already commissioned for'} this revision. Its sliced plan lands as request ${commission.resultRequestId}; FOR YOU says when it is ready. Nothing runs until you approve.`;
+    });
+    const slicing = this.slicing;
+    if (slicing !== null && slicing.repoPath === this.proposal.repoPath && slicing.intakeId === this.proposal.intakeId && slicing.requestId === this.proposal.requestId) action('Load sliced revision', !this.dirty(), async (client, current) => {
+      let proposal: Proposal;
+      try { proposal = await client.read(slicing.repoPath, slicing.intakeId, slicing.resultRequestId); }
+      catch (error) {
+        if (current() && error instanceof IntakeClientError && error.code === 'intake_not_found') { this.status.textContent = `Planning minion ${slicing.jobId} has not submitted its breakdown yet.`; return; }
+        throw error;
+      }
+      if (!current()) return;
+      this.showProposal(proposal);
+      const readback = await client.readback(proposal.repoPath, proposal.intakeId);
+      if (!current()) return;
+      this.readback = readback;
+      this.status.textContent = 'Sliced revision loaded: compare it with the previous revision, settle its questions, then review it before approval.';
+    });
     if (this.proposal.previousRequestId) action('Compare previous revision', true, async (client, current) => {
       const p = this.proposal!; const comparison = await client.diff(p.repoPath, p.intakeId, p.previousRequestId!, p.requestId);
       if (!current()) return;

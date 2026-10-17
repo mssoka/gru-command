@@ -67,6 +67,17 @@ this is routing compatibility, not an external BMAD dependency.
   all four; a risk raised during review adds its lenses on the same head),
   reasoned fixes, verification and ordinary PR handoff.
 - Planning and review helper entrypoints are also independently resolvable.
+- Intake helpers, read by intake rather than rendered into a lane:
+  `skills/gc-build/intake.md` (the planning contract) and, since
+  `gru-command-workflows@3`, `skills/gc-build/slice.md` (#429). The slicing
+  helper ports the "Epic into stories" method of BMad's `bmad-ticket`: one
+  minion-session slice per step toward the epic's Done when, a tracer bullet
+  first, lanes that never touch the same code, one runnable check per slice,
+  split never shrink, eight to twelve slices typical. It drops the ticket store,
+  the closing refactor sweep and every deferred-work list. When the owner asks
+  for an epic with no breakdown to be sliced, intake embeds the verified helper
+  bytes and their sha256 in a planning-only investigation job's briefing; see
+  [INTAKE.md](INTAKE.md#slicing-an-epic-with-a-planning-minion).
 
 All required templates, reviewer prompts, evidence/deletion checks and the
 standard-library-only Node helper are shipped. No project `_bmad`, Python/uv,
@@ -157,6 +168,10 @@ supported entrypoints/skill names and per-resource sha256. There are no upstream
 archive/identity sections. Missing/corrupt/undeclared/symlinked files fail with
 `WorkflowResourceError`; no ambient workflow fallback is permitted. Required
 helpers and reference closure must remain complete even during manifest refresh.
+A manifest refresh requires the intake and slicing helpers, and commissioning a
+planning minion refuses a package without the slicing helper. Neither helper is
+in the manifest's required list, so a lane bound to `@1` or `@2`, which predate
+the slicing helper, keeps validating and keeps its package.
 
 `loadBundledWorkflowRuntime`, `materializeBmadRuntime` and
 `bindWorkflowRuntime` reuse #283's content-addressed immutable store and atomic

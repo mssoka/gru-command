@@ -55,6 +55,7 @@ import { createPropertyCampaignService } from './dispatch/property-campaigns.js'
 import { PipelineService } from './dispatch/pipeline.js';
 import { IntakeService } from './intake/service.js';
 import { IntakeApprovalService } from './intake/approval.js';
+import { IntakeSlicingService } from './intake/slicing.js';
 import { ChildWorkerService } from './dispatch/child-workers.js';
 import { createVerificationServer } from './verify/server.js';
 import type { VerificationQueueView } from './verify/scheduler.js';
@@ -1426,6 +1427,15 @@ async function main(): Promise<number> {
     config,
     intake,
     intakeApproval: new IntakeApprovalService({ intake, ledger, pipeline }),
+    // Intake slicing (#429): a planning-only minion through the normal dispatch path.
+    intakeSlicing: new IntakeSlicingService({
+      intake,
+      ledger,
+      notifications,
+      dispatch: (input) => dispatcher.dispatch(input),
+      apiBase: () => config.server.port === 0 ? null : `http://${dialHost(config.server.host)}:${String(config.server.port)}`,
+      log: (level, msg, fields) => logger.log(level, msg, fields),
+    }),
     propertyCampaigns,
     dispatch: dispatcher,
     wave,
