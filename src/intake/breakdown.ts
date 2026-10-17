@@ -146,8 +146,10 @@ function sectionRanges(text: string, heading: RegExp): readonly { readonly start
  * name: a mention the capture lacks must never be silently forgotten. */
 export function referencedArchitecture(snapshot: Snapshot): readonly string[] {
   // The file name alone, after any directory, `~/` or `{variable}/`; never
-  // the tail of a URL, which names another project's document.
-  const names = [...snapshot.text.matchAll(/(?<![\w.-])(?<!:\/\/\S*)architecture[\w.-]*\.md(?![\w-]|\.\w)/giu)].map(([name]) => name.toLowerCase());
+  // a URL or the label of a link to one, which name another project's
+  // document. Labels are blanked first, keeping every other offset.
+  const text = snapshot.text.replace(/\[[^\]\n]*\]\([a-z][a-z0-9+.-]*:\/\/[^)\s]*\)/giu, (link) => ' '.repeat(link.length));
+  const names = [...text.matchAll(/(?<![\w.-])(?<!:\/\/[^\s"'<>()[\],;|]*)architecture[\w.-]*\.md(?![\w-]|\.\w)/giu)].map(([name]) => name.toLowerCase());
   return [...new Set(names)];
 }
 

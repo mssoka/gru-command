@@ -198,6 +198,7 @@ describe('intake slicing by a commissioned planning minion (#429)', () => {
     const request = { repoPath: h.repo, intakeId: 'cart', requestId: 'r1', revisionId: preview.revisionId };
     h.dispatch.mockRejectedValueOnce(new Error('worktree creation failed'));
     await expect(h.slicing.commission(request)).rejects.toMatchObject({ code: 'intake_slicing_dispatch_failed', status: 503, message: expect.stringContaining('worktree creation failed') });
+    expect(h.log).not.toHaveBeenCalled();
     expect(await h.slicing.commission(request)).toMatchObject({ dispatched: true, jobStatus: 'dispatched' });
     expect(h.dispatch).toHaveBeenCalledTimes(2);
   });
