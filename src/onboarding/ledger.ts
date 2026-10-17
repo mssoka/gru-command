@@ -1,5 +1,6 @@
 import type { LedgerApi } from '../ledger/api.js';
 import type { LogLevel } from '../logger.js';
+import { readOnboardingProof, type OnboardingProofResult } from './proof-record.js';
 
 /**
  * Onboarding records (#427), kept as append-only `onboarding.*` ledger
@@ -30,6 +31,8 @@ export const ONBOARDING_EVENTS = {
   proofCommentAttempt: 'onboarding.proof-comment-attempt',
   /** A proof's PR comment exists (posted, or found by its marker), or cannot be posted. */
   proofCommented: 'onboarding.proof-commented',
+  /** Gru's attention row for one stuck (job, head) episode was posted, with its reason; a job event. */
+  proofAttentionPosted: 'onboarding.proof-attention-posted',
 } as const;
 
 export const ONBOARDING_EVENT_KINDS: readonly string[] = Object.values(ONBOARDING_EVENTS);
@@ -56,12 +59,26 @@ export interface ProofRecord {
   readonly repo: string;
   readonly jobId: string;
   readonly head: string;
+  /** True only for a readable record of a pass. */
   readonly passed: boolean;
   readonly at: string;
-  /** The `onboarding.proof` payload (the comment and directive render from it). */
-  readonly payload: Readonly<Record<string, unknown>>;
+  /** The record as the one proof reader reads it; null when it cannot be
+   * read (an unknown outcome, malformed failures): that head's proof
+   * stands as not passed and is never run again. */
+  readonly result: OnboardingProofResult | null;
   readonly commentAttempted: boolean;
   readonly comment: { readonly id: number | null; readonly url: string | null; readonly detail: string } | null;
+}
+
+/** One attention row onboarding posted for Gru about a stuck (job, head). */
+export interface ProofAttentionRow {
+  readonly notificationId: string;
+  /** Null for a delivery that names no commit. */
+  readonly head: string | null;
+  /** The delivery seq that opened the episode. */
+  readonly deliverySeq: number;
+  /** Why the head was stuck when the row was posted. */
+  readonly reason: string;
 }
 
 export class OnboardingRecordError extends Error {
@@ -94,6 +111,8 @@ export class OnboardingLedger {
   private readonly jobs = new Map<string, string>();
   /** Per job, its proven heads in proof order (the first proof of a head stands). */
   private readonly proofs = new Map<string, ProofRecord[]>();
+  /** Per job, the attention rows posted for it, oldest first. */
+  private readonly attention = new Map<string, ProofAttentionRow[]>();
 
   constructor(private readonly ledger: LedgerApi, private readonly log: (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void = () => {}) {}
 
@@ -144,6 +163,12 @@ export class OnboardingLedger {
 
   proof(jobId: string, head: string): ProofRecord | null {
     return this.jobProofs(jobId).find((entry) => entry.head === head) ?? null;
+  }
+
+  /** The attention rows posted for the job, oldest first. */
+  attentionRows(jobId: string): readonly ProofAttentionRow[] {
+    this.refresh();
+    return this.attention.get(jobId) ?? [];
   }
 
   private updateProof(payload: Payload, change: (proof: ProofRecord) => ProofRecord): void {
@@ -203,13 +228,14 @@ export class OnboardingLedger {
         this.repos.set(repo, { ...current, failures: current.failures + 1, failedRow: text(payload, 'notification_id') });
         return;
       case ONBOARDING_EVENTS.proof: {
+        // Kept even when unreadable (the ledger's fence reads it the same
+        // way): it stands for its head, as not passed.
         const jobId = text(payload, 'job_id');
         const head = text(payload, 'head');
-        const outcome = text(payload, 'outcome');
-        if (outcome !== 'passed' && outcome !== 'failed') throw new OnboardingRecordError(`onboarding proof names an unknown outcome "${outcome}"`);
         const list = this.proofs.get(jobId) ?? [];
         if (list.some((entry) => entry.head === head)) return;
-        this.proofs.set(jobId, [...list, { repo, jobId, head, passed: outcome === 'passed', at: ts, payload, commentAttempted: false, comment: null }]);
+        const result = readOnboardingProof(payload);
+        this.proofs.set(jobId, [...list, { repo, jobId, head, passed: result?.passed === true, at: ts, result, commentAttempted: false, comment: null }]);
         return;
       }
       case ONBOARDING_EVENTS.proofCommentAttempt:
@@ -222,6 +248,17 @@ export class OnboardingLedger {
           ...proof,
           comment: { id: typeof id === 'number' ? id : null, url: typeof url === 'string' ? url : null, detail: text(payload, 'detail') },
         }));
+        return;
+      }
+      case ONBOARDING_EVENTS.proofAttentionPosted: {
+        const jobId = text(payload, 'job_id');
+        const head = payload['head'];
+        const seq = payload['delivery_seq'];
+        if (head !== null && (typeof head !== 'string' || head === '')) throw new OnboardingRecordError('onboarding attention row names no head');
+        if (typeof seq !== 'number' || !Number.isSafeInteger(seq)) throw new OnboardingRecordError('onboarding attention row names no delivery seq');
+        const row = { notificationId: text(payload, 'notification_id'), head, deliverySeq: seq, reason: text(payload, 'reason') };
+        const rows = this.attention.get(jobId) ?? [];
+        if (!rows.some((entry) => entry.notificationId === row.notificationId)) this.attention.set(jobId, [...rows, row]);
         return;
       }
       default:

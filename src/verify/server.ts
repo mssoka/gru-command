@@ -5,7 +5,7 @@ import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { LedgerApi } from '../ledger/api.js';
 import type { WorktreePort } from '../dispatch/worktree-port.js';
-import { loadWorktreeManifest, resolveVerifyCommand } from '../worktrees/manifest.js';
+import { loadWorktreeManifest, RESERVED_VERIFY_SCOPE, resolveVerifyCommand } from '../worktrees/manifest.js';
 import {
   VerificationDuplicateError,
   VerificationLockTimeoutError,
@@ -85,10 +85,13 @@ export interface VerificationServer {
 /** One slot of the global verification budget, held by its caller. */
 export interface VerificationBudget {
   acquire(spec: VerificationRunSpec): Promise<VerificationLease>;
-  /** Bind the pid of the command the holder spawned to its slot, persisted
-   * as a scheduler run's child is: a restart then judges an orphaned slot
-   * by that pid's liveness instead of releasing it as runner-less. */
-  bindPid(lease: VerificationLease, pid: number): void;
+  /** Bind the pid and argv of the command the holder spawned to its slot,
+   * persisted as a scheduler run's child is: a restart then judges an
+   * orphaned slot by that pid's liveness instead of releasing it as
+   * runner-less, and the argv tells the holder the pid is still its own. */
+  bindPid(lease: VerificationLease, pid: number, processCommand: string): void;
+  /** Slots of `scope` an earlier process left, still held for a live pid. */
+  restored(scope: string): readonly { readonly lease: VerificationLease; readonly pid: number; readonly processCommand: string | null }[];
   release(lease: VerificationLease): void;
   readonly workersPerRun: number;
 }
@@ -99,7 +102,7 @@ export interface VerificationBudget {
  * every event that names this scope, so no `verification.*` event exists for
  * a proof and the job's verification fences never see one.
  */
-export const ONBOARDING_PROOF_SCOPE = 'onboarding-proof';
+export const ONBOARDING_PROOF_SCOPE = RESERVED_VERIFY_SCOPE;
 
 const MAX_BODY_BYTES = 64 * 1024;
 
@@ -217,8 +220,14 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
       },
       record: (event) => {
         // An onboarding proof's slot (a lock-wait timeout, a stale release)
-        // is never the job's verification evidence.
-        if (event.payload['scope'] === ONBOARDING_PROOF_SCOPE) return;
+        // is never the job's verification evidence. A stale release is
+        // still worth a warn: a slot was held for a proof that is gone.
+        if (event.payload['scope'] === ONBOARDING_PROOF_SCOPE) {
+          if (event.kind === 'verification.stale-released') {
+            log('warn', 'onboarding proof: a budget slot an earlier run left was released (not verification evidence)', { job: event.jobId, ...event.payload });
+          }
+          return;
+        }
         if (event.kind === 'verification.no-start' && ledger.hasJobEventWithPayloadValues(event.jobId, ['verification.no-start'],
           [{ key: 'run_id', value: String(event.payload['run_id']) }], 0)) return;
         ledger.appendCustomEvent({
@@ -586,7 +595,8 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
     budget(): VerificationBudget {
       return {
         acquire: (spec) => scheduler.acquire(spec),
-        bindPid: (lease, pid) => scheduler.bindPid(lease, pid),
+        bindPid: (lease, pid, processCommand) => scheduler.bindPid(lease, pid, processCommand),
+        restored: (scope) => scheduler.restoredHolders(scope),
         release: (lease) => scheduler.release(lease),
         get workersPerRun() {
           return scheduler.workersPerRun;

@@ -198,10 +198,11 @@ without a named rule is not yours to invent:
   heist's delivered head has no passing onboarding proof (GC runs the
   proof itself, comments on the PR, and sends a failure to the minion; the
   digest withholds the review offer, never the PR registration, until it
-  passes, and no `force` waives it). An onboarding round also freezes only
-  a sha whose own proof passed: a commit pushed after the proven delivery
-  waits for the minion to deliver it, and a delivery that names no commit
-  waits for the next one. Wait for the lane delivery (and its
+  passes, and no `force` waives it). An onboarding round also reviews only
+  a commit whose own proof passed: a named target or a lane HEAD past the
+  proven delivery is refused at the arm, a commit pushed after it waits
+  for the minion to deliver it, and a delivery that names no full commit
+  id waits for the next one. Wait for the lane delivery (and its
   push) to settle and for any unresolved re-brief request to finalize or
   be recovered (a delivery alone does not clear that fence), then arm. If
   you cannot tell whether the lane is still

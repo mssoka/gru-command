@@ -41,6 +41,18 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  */
 
 export const MANIFEST_DIR = '.gru-command';
+/** The verify scope GC's onboarding proof (#427) holds its budget slot
+ * under. A manifest may not declare it: the verification server records
+ * nothing for this scope, so a run of it would leave no evidence. */
+export const RESERVED_VERIFY_SCOPE = 'onboarding-proof';
+
+/** A manifest declares a verify scope GC reserves for itself. */
+export class ReservedVerifyScopeError extends Error {
+  constructor(readonly source: string, readonly scope: string) {
+    super(`worktree manifest ${source} [verify] scope "${scope}" is reserved for GC's onboarding proof; name the scope differently`);
+    this.name = 'ReservedVerifyScopeError';
+  }
+}
 export const MANIFEST_FILE = 'worktree.toml';
 export const MANIFEST_PATH = join(MANIFEST_DIR, MANIFEST_FILE);
 
@@ -164,6 +176,7 @@ export function parseWorktreeManifest(text: string, source = MANIFEST_PATH): Wor
           `worktree manifest ${source} [verify] scope "${scope}" must be a lowercase identifier (a-z, 0-9, _, -, ≤32 chars)`,
         );
       }
+      if (scope === RESERVED_VERIFY_SCOPE) throw new ReservedVerifyScopeError(source, scope);
       verifyEntries[scope] = nonEmptyString(command, `${source} verify.${scope}`);
     }
   }
@@ -291,6 +304,10 @@ export interface ApplyManifestOptions {
   /** Stops a running setup command (its whole process group: SIGTERM,
    * then SIGKILL after the grace) and rejects. Lanes pass none. */
   readonly signal?: AbortSignal;
+  /** SIGKILL each setup command's whole process group once its shell
+   * exits, as a verify run is ended, so nothing it started outlives it
+   * (#427 onboarding proof). Lanes keep what their setup starts. */
+  readonly endGroupAfterExit?: boolean;
 }
 
 /**
@@ -340,7 +357,10 @@ export async function applyWorktreeManifest(
 
   for (const [index, entry] of manifest.setup.entries()) {
     const started = Date.now();
-    await execSetupCommand(entry.command, opts.worktreePath, opts.setupTimeoutMs, opts.signal);
+    await execSetupCommand(entry.command, opts.worktreePath, opts.setupTimeoutMs, {
+      ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
+      endGroupAfterExit: opts.endGroupAfterExit === true,
+    });
     log('info', 'worktree manifest: setup command ran', {
       command: entry.command,
       index,
@@ -360,6 +380,8 @@ const SETUP_KILL_GRACE_MS = 1_000;
 class OutputTail {
   private readonly chunks: Buffer[] = [];
   private bytes = 0;
+  /** Earlier output was dropped: the text starts mid-stream. */
+  private dropped = false;
 
   push(chunk: Buffer): void {
     this.chunks.push(chunk);
@@ -368,11 +390,33 @@ class OutputTail {
       const dropped = this.chunks.shift();
       if (dropped === undefined) return;
       this.bytes -= dropped.length;
+      this.dropped = true;
     }
   }
 
   text(): string {
     return Buffer.concat(this.chunks).toString('utf-8');
+  }
+
+  stream(): SetupStreamTail {
+    return { text: this.text(), truncated: this.dropped };
+  }
+}
+
+/** One stream of a setup command's latest output (up to 64 KiB). */
+export interface SetupStreamTail {
+  readonly text: string;
+  /** Earlier output was dropped: the text starts mid-stream. */
+  readonly truncated: boolean;
+}
+
+/** A setup command failed, timed out or was stopped. The message names it
+ * with a short output tail; `output` keeps each stream's bounded raw tail
+ * for a caller that redacts before it records (#427 onboarding proof). */
+export class WorktreeSetupError extends Error {
+  constructor(message: string, readonly output: { readonly stdout: SetupStreamTail; readonly stderr: SetupStreamTail }) {
+    super(message);
+    this.name = 'WorktreeSetupError';
   }
 }
 
@@ -381,7 +425,11 @@ class OutputTail {
  * command runs as its own process group so a timeout or abort kill reaches
  * the children a shell command spawns (npm ci), and awaiting it never
  * blocks the event loop. */
-async function execSetupCommand(command: string, cwd: string, timeoutMs: number, signal?: AbortSignal): Promise<void> {
+async function execSetupCommand(command: string, cwd: string, timeoutMs: number, opts: {
+  readonly signal?: AbortSignal;
+  readonly endGroupAfterExit: boolean;
+}): Promise<void> {
+  const { signal } = opts;
   if (signal?.aborted === true) throw new Error(`worktree setup command was stopped before it started: ${command}`);
   let child: ChildProcess;
   try {
@@ -417,6 +465,16 @@ async function execSetupCommand(command: string, cwd: string, timeoutMs: number,
       }
     }
   };
+  /** A member of the setup group still lives (the shell may be gone). */
+  const groupAlive = (): boolean => {
+    if (child.pid === undefined) return false;
+    try {
+      process.kill(-child.pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
   let timedOut = false;
   let stopped = false;
   let forceKillTimer: NodeJS.Timeout | undefined;
@@ -442,31 +500,22 @@ async function execSetupCommand(command: string, cwd: string, timeoutMs: number,
     throw new Error(`worktree setup command failed to spawn (${command}): ${String(error)}`);
   } finally {
     clearTimeout(killTimer);
-    if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
     signal?.removeEventListener('abort', onAbort);
+    // The shell is gone, but a member of its group that holds no pipe (a
+    // `cmd >/dev/null 2>&1 &` daemon) may live on.
+    if (opts.endGroupAfterExit) signalTree('SIGKILL');
+    // A stop or a timeout keeps its SIGKILL escalation armed while any
+    // member lives: one that ignored SIGTERM must not outlive it.
+    if (forceKillTimer !== undefined && !((stopped || timedOut) && groupAlive())) clearTimeout(forceKillTimer);
   }
 
-  const outputTail = tail(stdout.text()) + tail(stderr.text());
-  if (stopped) {
-    throw new Error(
-      `worktree setup command was stopped (its caller aborted): ${command}\noutput tail:\n${outputTail}`,
-    );
-  }
-  if (timedOut) {
-    throw new Error(
-      `worktree setup command timed out after ${timeoutMs}ms: ${command}\noutput tail:\n${outputTail}`,
-    );
-  }
-  if (outcome.code === null) {
-    throw new Error(
-      `worktree setup command was killed by ${String(outcome.signal)}: ${command}\noutput tail:\n${outputTail}`,
-    );
-  }
-  if (outcome.code !== 0) {
-    throw new Error(
-      `worktree setup command exited ${outcome.code}: ${command}\noutput tail:\n${outputTail}`,
-    );
-  }
+  const output = { stdout: stdout.stream(), stderr: stderr.stream() };
+  const outputTail = tail(output.stdout.text) + tail(output.stderr.text);
+  const failed = (what: string): WorktreeSetupError => new WorktreeSetupError(`${what}: ${command}\noutput tail:\n${outputTail}`, output);
+  if (stopped) throw failed('worktree setup command was stopped (its caller aborted)');
+  if (timedOut) throw failed(`worktree setup command timed out after ${timeoutMs}ms`);
+  if (outcome.code === null) throw failed(`worktree setup command was killed by ${String(outcome.signal)}`);
+  if (outcome.code !== 0) throw failed(`worktree setup command exited ${outcome.code}`);
 }
 
 function tail(text: string, max = 2_000): string {

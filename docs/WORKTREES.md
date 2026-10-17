@@ -30,6 +30,10 @@ full = "npm test"        #   see FLOW.md §4c — default scope `full`)
 quick = "npm run lint"
 ```
 
+Scope names are lowercase identifiers; `onboarding-proof` is reserved for
+GC's onboarding proof ([ONBOARDING.md](./ONBOARDING.md#proof-before-review)),
+and a manifest that declares it is refused by name.
+
 A missing manifest is a no-op; a malformed one fails loud and rolls the
 worktree back **all the way** (worktree AND the branch the failed call
 created — a leftover `gru/<job>` would wedge the job id forever).

@@ -231,22 +231,31 @@ latest revision → verify → fresh review. The service enforces it centrally.
   delivered head: GC clones that head, applies its manifest, runs `verify.full` under the
   verification budget, and measures it ([ONBOARDING.md](./ONBOARDING.md#proof-before-review)).
   The head is read as the corrective-verification gate reads the newest delivery: one that is
-  not a proven current candidate, or names no commit, identifies no head, and review waits for
-  the minion's next delivery. The first proof of a head stands. Until it passes, the lane is
-  busy on every route the corrective verification fences (arm, freeze, queued handoff, fallback
-  admission and iteration, the Silas review offer); the blocker carries
-  `onboarding_proof_required_head` (null when there is no head). The freeze also checks the
-  exact sha it reviews: a pass of the delivered head does not cover an explicit target or a
-  commit pushed after the delivery. Like a pending correction, `force` never waives it, the
-  `409 branch_busy` hint says so (or says the minion must deliver again), and a refusal's audit
-  records whether force was asked for. A worker's own review request is queued and replayed
-  on the `onboarding.proof` event, also after a restart. The proof is never verification
-  evidence (no `verification.*` event exists for it, and `POST /api/verify` refuses the
-  reserved `onboarding-proof` scope with `400 reserved_scope`). When the proof's head is the
+  not a proven current candidate, or whose sha is not a full commit id, identifies no head, and
+  review waits for the minion's next delivery. The first proof of a head stands, and a record
+  the one proof reader cannot read is never a pass. Until it passes, the lane is busy on every
+  route the corrective verification fences (arm, freeze, queued handoff, fallback admission
+  and iteration, the Silas review offer); the blocker carries `onboarding_proof_required_head`
+  (null when there is no head) and `onboarding_proof_reason` (`no-delivery`, `no-commit`,
+  `unproven` or `failed`). The exact commit under review must pass too: an arm that names a
+  target, or whose lane HEAD is not the delivered head, is refused at the arm with a `409`
+  before any round exists; the freeze checks the exact sha it reviews last (a live PR head
+  pushed after the delivery); and the bmad-review fallback, which reviews the lane HEAD, checks
+  that commit at admission and at each iteration. Like a pending correction, `force` never
+  waives it, and the `409 branch_busy` hint says so (or says the minion must deliver again, or
+  has not delivered yet). Every `branch-idle.refused` audit records `forced` (force was
+  applied: blockers waived) and `force_requested` (the request asked for force), so an
+  onboarding refusal under force records `forced: false, force_requested: true`. A worker's own
+  review request is queued and replayed on the `onboarding.proof` event, also after a restart.
+  The proof is never verification evidence (no `verification.*` event exists for it,
+  `POST /api/verify` refuses the reserved `onboarding-proof` scope with `400 reserved_scope`,
+  and a manifest that declares that scope is refused by name). When the proof's head is the
   reviewed sha, the frozen packet carries an `ONBOARDING PROOF` block between the recorded
-  verification and the CI evidence. The block must leave room for the actual CI block that
-  follows it; when it does not, it freezes as an omission notice, and when not even the
-  notice fits, the freeze is refused, as for the CI section.
+  verification and the CI evidence; every minion-written field in it is one line that cannot
+  carry the block's end marker. The block, or its omission notice, never takes the room the CI
+  section needs: the CI block's when that block fits on its own, else the CI omission notice's.
+  A block that does not fit freezes as an omission notice, and when not even that fits, the
+  freeze is refused, naming the section that did not fit.
 - **A historical-only delivery owes a current inspection (owner decision 2026-10-16, #361).**
   When a job's newest delivery is history (a completion recorded without proving a current
   candidate) while a corrective verification or a contract revision is still owed, no

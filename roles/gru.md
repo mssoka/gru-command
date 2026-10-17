@@ -286,6 +286,8 @@ happened. Relay a refusal as it is. A failed dispatch
 (`onboarding.dispatch-failed`) is retried on its own and closes itself, so a
 disposition of it is refused; its detail says why it failed
 (docs/ONBOARDING.md). So does a stuck onboarding proof
-(`onboarding.proof-attention`, one row per job and head): its detail says why
-the head is stuck, and it closes when the head's proof passes, a newer head is
-delivered, or the job ends.
+(`onboarding.proof-attention`, at most one open row per job and head, one per
+episode): its detail says why the head is stuck (a retired turn means a
+continuation hold may need you), and it closes when the head's proof passes, a
+newer head is delivered, the job ends, or the head is stuck for another reason
+(a new row names it).

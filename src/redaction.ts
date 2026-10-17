@@ -1,7 +1,9 @@
 /**
- * Credential redaction for text GC publishes or hands on (a PR comment, a
- * review body, a minion directive, a ledger record that may be relayed):
- * spans that look like a credential become one fixed placeholder.
+ * Credential redaction for text GC publishes or hands on: a PR review body,
+ * a PR comment, and, for the onboarding proof (#427), the ledger record of
+ * a command's output and failures and the minion directive that carries
+ * them. Spans that look like a credential become one fixed placeholder;
+ * the caller keeps no unredacted copy of what it records or sends.
  */
 
 export const REDACTION_PLACEHOLDER = '[REDACTED]';
@@ -14,18 +16,57 @@ function redaction(_value: string): string {
   return REDACTION_PLACEHOLDER;
 }
 
-/** Keep verification evidence private when it resembles a credential. The
- * durable local report remains unchanged; only the PR-facing copy is masked. */
-export function redactReviewForPublication(body: string): string {
-  const patterns = [
-    /-----BEGIN [^-\r\n]+ PRIVATE KEY-----[\s\S]*?-----END [^-\r\n]+ PRIVATE KEY-----/gu,
-    /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/gu,
-    /\bgithub_pat_[A-Za-z0-9_]{20,}\b/gu,
-    /\bglpat-[A-Za-z0-9_-]{20,}\b/gu,
-    /\bsk-(?:proj-)?[A-Za-z0-9_-]{16,}\b/gu,
-    /\bAKIA[0-9A-Z]{16}\b/gu,
-    /(?<![A-Za-z0-9])(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|refresh[_-]?token|secret[_-]?key|api[_-]?secret|password|secret|token)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s`'"]+)/giu,
-    /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/gu,
-  ];
-  return patterns.reduce((text, pattern) => text.replace(pattern, redaction), body);
+/** Keep the text before the credential (a scheme, a header or key name). */
+const keepPrefix = (_match: string, prefix: string): string => `${prefix}${REDACTION_PLACEHOLDER}`;
+
+/** A keyword assignment's value: at least 6 characters with a letter or a
+ * digit, so a diagnostic such as `Unexpected token: ')'` is left whole. */
+const KEYWORD_VALUE = '(?:"(?=[^"]*[A-Za-z0-9])[^"]{6,}"|\'(?=[^\']*[A-Za-z0-9])[^\']{6,}\'|(?=[^\\s`\'"]*[A-Za-z0-9])[^\\s`\'"]{6,})';
+
+const PATTERNS: readonly (readonly [RegExp, (match: string, ...groups: string[]) => string])[] = [
+  [/-----BEGIN [^-\r\n]+ PRIVATE KEY-----[\s\S]*?-----END [^-\r\n]+ PRIVATE KEY-----/gu, redaction],
+  [/\bgh[pousr]_[A-Za-z0-9_]{20,}\b/gu, redaction],
+  [/\bgithub_pat_[A-Za-z0-9_]{20,}\b/gu, redaction],
+  [/\bglpat-[A-Za-z0-9_-]{20,}\b/gu, redaction],
+  [/\bsk-(?:proj-)?[A-Za-z0-9_-]{16,}\b/gu, redaction],
+  [/\bAKIA[0-9A-Z]{16}\b/gu, redaction],
+  [/\bnpm_[A-Za-z0-9]{36}\b/gu, redaction],
+  [/\bxox[abprs]-[A-Za-z0-9-]{10,}/gu, redaction],
+  // URL userinfo (`https://user:secret@host`, as npm, pip and git print it).
+  [/(\b[A-Za-z][A-Za-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+(?=@)/gu, keepPrefix],
+  [/(\bAuthorization\s*:\s*(?:Bearer|Basic)\s+)[^\s'"`]+/giu, keepPrefix],
+  // An `.npmrc` registry credential: `//registry.example/:_authToken=…`.
+  [/(\/\/\S*:_(?:authToken|auth|password)\s*=\s*)\S+/gu, keepPrefix],
+  [new RegExp(`(?<![A-Za-z0-9])(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|refresh[_-]?token|secret[_-]?key|api[_-]?secret|password|secret|token)\\s*[:=]\\s*${KEYWORD_VALUE}`, 'giu'), redaction],
+  [/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/gu, redaction],
+];
+
+/** Mask every span of the text that is shaped like a credential. */
+export function redactCredentials(body: string): string {
+  return PATTERNS.reduce((text, [pattern, replace]) => text.replace(pattern, replace), body);
+}
+
+/** The Perkins publication's name for {@link redactCredentials} (#427 PR 1b
+ * moved it here and widened its use; existing imports keep this name). */
+export const redactReviewForPublication = redactCredentials;
+
+const PEM_BEGIN = /-----BEGIN [^-\r\n]+ PRIVATE KEY-----/u;
+const PEM_END = /-----END [^-\r\n]+ PRIVATE KEY-----/u;
+
+/**
+ * {@link redactCredentials} for a window cut from a longer stream (the
+ * latest output of a command): a private key whose BEGIN line fell before
+ * the window's start is redacted from that start to its END line, and one
+ * whose END line never came is redacted to the window's end.
+ */
+export function redactCredentialWindow(window: string): string {
+  let text = window;
+  const end = PEM_END.exec(text);
+  const begin = PEM_BEGIN.exec(text);
+  if (end !== null && (begin === null || begin.index > end.index)) {
+    text = `${REDACTION_PLACEHOLDER}${text.slice(end.index + end[0].length)}`;
+  }
+  text = redactCredentials(text);
+  const open = PEM_BEGIN.exec(text);
+  return open === null ? text : `${text.slice(0, open.index)}${REDACTION_PLACEHOLDER}`;
 }

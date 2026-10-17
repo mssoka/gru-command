@@ -127,8 +127,6 @@ export interface GhIssueComment {
   readonly id: number;
   readonly body: string;
   readonly url: string | null;
-  /** The author's login (`user.login`); null when the API names none. */
-  readonly author: string | null;
 }
 
 /** The outbound GitHub port (real implementation: {@link GhCliApi}). */
@@ -147,8 +145,6 @@ export interface GhApiPort {
   /** Every conversation comment on a pull request, oldest first. Fails loud
    * when the history is longer than the adapter reads: absence is then unknown. */
   listIssueComments(input: { readonly repo: RepoRef; readonly number: number }): Promise<readonly GhIssueComment[]>;
-  /** The login gh is authenticated as on a host (`gh api user`). */
-  viewerLogin(input: { readonly host: string }): Promise<string>;
 }
 
 // ------------------------------------------------------------------
@@ -500,6 +496,15 @@ export class GhApiError extends Error {
   }
 }
 
+/** The HTTP status GitHub answered a failed `gh api` call with, as gh
+ * prints it in stderr (`… (HTTP 403)`, kept as {@link GhApiError.causeText});
+ * null for any other error, or when gh named no status. */
+export function ghHttpStatus(error: unknown): number | null {
+  if (!(error instanceof GhApiError) || error.causeText === null) return null;
+  const status = /\(HTTP (\d{3})\)/u.exec(error.causeText);
+  return status === null ? null : Number(status[1]);
+}
+
 /** A rate-limit response — the tick must stop calling, never hammer. */
 export class GhRateLimitedError extends GhApiError {
   constructor(message: string, causeText: string | null = null) {
@@ -785,12 +790,6 @@ export class GhCliApi implements GhApiPort {
     throw new GhApiError(`${label}: more than ${GITHUB_COMMENT_PAGES * 100} comments; the rest were not read`);
   }
 
-  async viewerLogin(input: { readonly host: string }): Promise<string> {
-    const label = `viewer login on ${input.host}`;
-    const login = strOrNull(record(await ghApiJson(this.run, this.binary, label, input.host, 'user'))?.['login']);
-    if (login === null) throw new GhApiError(`${label}: the response names no login`);
-    return login;
-  }
 }
 
 /** Pages of 100 comments {@link GhCliApi.listIssueComments} reads before it gives up. */
@@ -802,7 +801,7 @@ function mapIssueComment(value: unknown): GhIssueComment | null {
   const id = numOrNull(raw['id']);
   const body = typeof raw['body'] === 'string' ? raw['body'] : null;
   if (id === null || body === null) return null;
-  return { id, body, url: strOrNull(raw['html_url']), author: strOrNull(record(raw['user'])?.['login']) };
+  return { id, body, url: strOrNull(raw['html_url']) };
 }
 
 // ------------------------------------------------------------------

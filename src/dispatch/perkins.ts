@@ -7,7 +7,7 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'n
 import { basename, join, resolve } from 'node:path';
 import type { LogLevel } from '../logger.js';
 import { DEFAULT_REVIEW_CHILDREN } from '../config.js';
-import type { JobStatus, LedgerApi, RoundRecord, RoundVerdict } from '../ledger/api.js';
+import type { JobStatus, LedgerApi, OnboardingProofDebt, RoundRecord, RoundVerdict } from '../ledger/api.js';
 import { requireSafeRecordId } from '../ledger/api.js';
 import { isJobTerminal, isRoundTerminal } from '../ledger/states.js';
 import type { WorktreeLane, WorktreePort } from './worktree-port.js';
@@ -1913,6 +1913,15 @@ class FallbackSafetyRefusal extends Error {
   }
 }
 
+/** A reviewed job's ledger row is gone at the freeze. Job rows are never
+ * deleted, so nothing the freeze would record about it can be stated. */
+export class ReviewJobMissingError extends Error {
+  constructor(readonly jobId: string) {
+    super(`job "${jobId}" has no ledger row at the freeze — a reviewed job's row is never removed, so the round cannot freeze`);
+    this.name = 'ReviewJobMissingError';
+  }
+}
+
 /** The existing working-tree intake, now fail-closed at every Git boundary.
  * Capturing again after a reviewer settles binds its report to actual bytes,
  * not just ledger events. Untracked and uncommitted changes are included. */
@@ -3484,7 +3493,8 @@ export class WaveRunner {
     let idleRequest: ReviewRequestInput = input;
     let forceAuthorization: ForceAuthorization | undefined;
     try {
-      this.refuseOwnUnwaivableReviewDebt(input.jobId);
+      this.refuseOwnUnwaivableReviewDebt(input.jobId, input.force === true);
+      this.refuseUnprovenOnboardingArmTarget(input);
       armedTargetRef = this.resolveLocalRequestTarget(input);
       idleRequest = { ...input, ...(armedTargetRef !== undefined ? { targetRef: armedTargetRef } : {}) };
       forceAuthorization = this.enforceBranchIdleForRequest(idleRequest);
@@ -3846,7 +3856,8 @@ export class WaveRunner {
      * receipt); Stage-5 carry-forward always re-verifies claimed priors. */
     claimedFixedPriors?: readonly number[];
   }): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
-    this.refuseOwnUnwaivableReviewDebt(input.jobId);
+    this.refuseOwnUnwaivableReviewDebt(input.jobId, input.force === true);
+    this.refuseUnprovenOnboardingArmTarget(input);
     const armedTargetRef = this.resolveLocalRequestTarget(input);
     const forceAuthorization = this.enforceBranchIdleForRequest({ ...input,
       ...(armedTargetRef !== undefined ? { targetRef: armedTargetRef } : {}) });
@@ -3891,15 +3902,15 @@ export class WaveRunner {
 
   /** Own recovery/material/onboarding-proof debt is unwaivable regardless of
    * target validity. Use the existing refusal/audit path before inspecting a
-   * caller's ref. */
-  private refuseOwnUnwaivableReviewDebt(jobId: string): void {
+   * caller's ref; the audit says whether the request asked for force. */
+  private refuseOwnUnwaivableReviewDebt(jobId: string, forceRequested: boolean): void {
     const job = this.opts.ledger.getJob(jobId);
     if (job === null || isJobTerminal(job.status) ||
       (!this.opts.ledger.hasOpenDirectiveRecoveryHold(jobId) && pendingWorkRevision(this.opts.ledger, job) === null &&
         this.opts.ledger.onboardingProofDebt(jobId) === null)) return;
     const jobLane = this.opts.worktrees.listWorktrees({ jobId }).find((lane) => lane.kind === 'job') ?? null;
     if (jobLane === null) return; // Preserve setup's canonical missing-lane refusal.
-    this.enforceBranchIdle({ job, jobLane, phase: 'arm',
+    this.enforceBranchIdle({ job, jobLane, phase: 'arm', forceRequested,
       targetBranch: normalizeBranch(jobLane.branch ?? laneBranch(jobId)) });
   }
 
@@ -4004,7 +4015,7 @@ export class WaveRunner {
 
   private refuseUnauditedBlockers(
     jobId: string, roundId: string, idle: { readonly targetBranch: string; readonly blockers: readonly BranchIdleBlocker[] },
-    authorization: ForceAuthorization,
+    authorization: ForceAuthorization, forceRequested: boolean,
   ): void {
     const unaudited = idle.blockers.filter((blocker) => blocker.revision !== undefined || blocker.onboardingProof !== undefined ||
       this.opts.ledger.hasOpenDirectiveRecoveryHold(blocker.jobId) ||
@@ -4012,17 +4023,19 @@ export class WaveRunner {
     if (unaudited.length === 0) return;
     this.opts.ledger.appendCustomEvent({
       kind: 'branch-idle.refused', jobId, roundId,
-      payload: { phase: 'freeze', forced: false, targetBranch: idle.targetBranch, blockers: unaudited },
+      payload: { phase: 'freeze', forced: false, force_requested: forceRequested, targetBranch: idle.targetBranch, blockers: unaudited },
     });
     throw new BranchBusyError(idle.targetBranch, unaudited, 'freeze');
   }
 
   /** #427 PR 1b: refuse to freeze an onboarding heist's sha unless the
    * first proof of exactly that sha passed. Unforceable and audited like
-   * the arm-time onboarding refusal (the audit says whether force was
-   * asked for). */
+   * the arm-time onboarding refusal: `forced` is false (nothing was
+   * waived), `force_requested` says whether force was asked for. The
+   * caller passes the job's status from before this round's flip. */
   private refuseUnprovenOnboardingTarget(input: {
     readonly jobId: string;
+    readonly status: JobStatus;
     readonly roundId: string;
     readonly targetBranch: string;
     readonly targetSha: string;
@@ -4030,14 +4043,58 @@ export class WaveRunner {
   }): void {
     const onboardingProof = this.opts.ledger.onboardingProofDebtAt(input.jobId, input.targetSha);
     if (onboardingProof === null) return;
-    const blockers: readonly BranchIdleBlocker[] = [{
-      jobId: input.jobId, status: this.opts.ledger.getJob(input.jobId)?.status ?? 'working', branch: input.targetBranch, onboardingProof,
-    }];
+    const blockers: readonly BranchIdleBlocker[] = [{ jobId: input.jobId, status: input.status, branch: input.targetBranch, onboardingProof }];
     this.opts.ledger.appendCustomEvent({
       kind: 'branch-idle.refused', jobId: input.jobId, roundId: input.roundId,
-      payload: { phase: 'freeze', forced: input.force, targetBranch: input.targetBranch, blockers },
+      payload: { phase: 'freeze', forced: false, force_requested: input.force, targetBranch: input.targetBranch, blockers },
     });
     throw new BranchBusyError(input.targetBranch, blockers, 'freeze');
+  }
+
+  /** #427 PR 1b: when an arm names an explicit target, or the lane's HEAD
+   * is not the delivered head, the commit the round would review is
+   * resolved now and its first proof must have passed: a synchronous 409
+   * before any round row or review worktree exists. A target only a fetch
+   * or the live PR resolves is left to the freeze, which checks the exact
+   * sha last. Unforceable. */
+  private refuseUnprovenOnboardingArmTarget(input: { readonly jobId: string; readonly targetRef?: string | undefined; readonly force?: boolean | undefined }): void {
+    const job = this.opts.ledger.getJob(input.jobId);
+    if (job === null || isJobTerminal(job.status) || !this.opts.ledger.isOnboardingJob(input.jobId)) return;
+    const lane = this.opts.worktrees.listWorktrees({ jobId: input.jobId })
+      .find((candidate) => candidate.kind === 'job' && candidate.status !== 'swept') ?? null;
+    if (lane === null) return; // Setup's canonical missing-lane refusal.
+    const explicit = input.targetRef !== undefined && input.targetRef.trim() !== '';
+    // An origin branch is fetched fresh at the freeze; a local copy may be stale.
+    if (explicit && isExactOriginBranchSpelling(input.targetRef!)) return;
+    let sha: string;
+    try {
+      sha = resolveGitCommit(lane.path, explicit ? input.targetRef! : 'HEAD');
+    } catch {
+      return; // Not resolvable here: the freeze resolves it and checks it.
+    }
+    if (!explicit && sha === this.opts.ledger.newestDeliveredHead(input.jobId)?.head) return;
+    const onboardingProof = this.opts.ledger.onboardingProofDebtAt(input.jobId, sha);
+    if (onboardingProof === null) return;
+    const targetBranch = resolveReviewTargetBranch({
+      jobId: input.jobId,
+      ...(explicit ? { targetRef: input.targetRef! } : {}),
+      lanePath: lane.path,
+      laneBranch: lane.branch,
+    });
+    const blockers: readonly BranchIdleBlocker[] = [{ jobId: input.jobId, status: job.status, branch: targetBranch, onboardingProof }];
+    this.opts.ledger.appendCustomEvent({
+      kind: 'branch-idle.refused', jobId: input.jobId,
+      payload: { phase: 'arm', forced: false, force_requested: input.force === true, targetBranch, blockers },
+    });
+    throw new BranchBusyError(targetBranch, blockers, 'arm');
+  }
+
+  /** #427 PR 1b: the proof debt of an onboarding heist's lane HEAD, the
+   * commit a bmad-review fallback reviews (captureFallbackInput). Null when
+   * the job is no onboarding heist or that commit's first proof passed. */
+  private onboardingLaneHeadDebt(jobId: string, lanePath: string): OnboardingProofDebt | null {
+    if (!this.opts.ledger.isOnboardingJob(jobId)) return null;
+    return this.opts.ledger.onboardingProofDebtAt(jobId, resolveGitCommit(lanePath, 'HEAD'));
   }
 
   private enforceBranchIdle(input: {
@@ -4055,6 +4112,9 @@ export class WaveRunner {
     reviewedStatus?: { readonly jobId: string; readonly status: JobStatus } | undefined;
     /** A forced check covers only the work its arm snapshot holds (#267). */
     forceAuthorization?: ForceAuthorization;
+    /** For the audit only: the request asked for force even though this
+     * check does not apply it (an unwaivable debt's own refusal). */
+    forceRequested?: boolean;
   }): { readonly targetBranch: string; readonly blockers: readonly BranchIdleBlocker[]; readonly authorization: ForceAuthorization } {
     const { targetBranch, blockers } = this.branchIdleBlockers(input);
     // Snapshot before publishing an audit: synchronous ledger observers can
@@ -4074,7 +4134,9 @@ export class WaveRunner {
       kind: forced ? 'branch-idle.forced' : 'branch-idle.refused',
       jobId: input.job.id,
       ...(input.roundId !== undefined ? { roundId: input.roundId } : {}),
-      payload: { phase: input.phase, forced, targetBranch, blockers },
+      // `forced`: force was applied (blockers waived); `force_requested`:
+      // the request asked for it, applied or not.
+      payload: { phase: input.phase, forced, force_requested: input.force === true || input.forceRequested === true, targetBranch, blockers },
     });
     if (!forced) throw new BranchBusyError(targetBranch, blockers, input.phase);
     return { targetBranch, blockers, authorization };
@@ -4354,7 +4416,7 @@ export class WaveRunner {
           this.opts.ledger.appendCustomEvent({
             kind: 'branch-idle.refused',
             jobId: input.jobId,
-            payload: { phase: 'arm', forced: false, targetBranch, blockers },
+            payload: { phase: 'arm', forced: false, force_requested: false, targetBranch, blockers },
           });
           throw new BranchBusyError(targetBranch, blockers, 'arm');
         }
@@ -4375,13 +4437,15 @@ export class WaveRunner {
       this.opts.ledger.appendCustomEvent({
         kind: 'branch-idle.refused',
         jobId: input.jobId,
-        payload: { phase: 'arm', forced: false, targetBranch, blockers },
+        payload: { phase: 'arm', forced: false, force_requested: input.force === true, targetBranch, blockers },
       });
       throw new BranchBusyError(targetBranch, blockers, 'arm');
     }
     // #427 PR 1b: an unproven onboarding head refuses fallback admission
-    // even under force.
-    const onboardingProof = jobRow === null || isJobTerminal(jobRow.status) ? null : this.opts.ledger.onboardingProofDebt(input.jobId);
+    // even under force: the delivered head, and the lane HEAD the fallback
+    // actually reviews.
+    const onboardingProof = jobRow === null || isJobTerminal(jobRow.status)
+      ? null : this.opts.ledger.onboardingProofDebt(input.jobId) ?? this.onboardingLaneHeadDebt(input.jobId, lane.path);
     if (jobRow !== null && onboardingProof !== null) {
       const targetBranch = resolveReviewTargetBranch({
         jobId: input.jobId,
@@ -4390,11 +4454,10 @@ export class WaveRunner {
         laneBranch: lane.branch,
       });
       const blockers: readonly BranchIdleBlocker[] = [{ jobId: input.jobId, status: jobRow.status, branch: targetBranch, onboardingProof }];
-      // The audit says whether force was asked for: it was refused all the same.
       this.opts.ledger.appendCustomEvent({
         kind: 'branch-idle.refused',
         jobId: input.jobId,
-        payload: { phase: 'arm', forced: input.force === true, targetBranch, blockers },
+        payload: { phase: 'arm', forced: false, force_requested: input.force === true, targetBranch, blockers },
       });
       throw new BranchBusyError(targetBranch, blockers, 'arm');
     }
@@ -4472,6 +4535,12 @@ export class WaveRunner {
     if (this.opts.ledger.onboardingProofDebt(input.jobId) !== null) {
       throw new FallbackSafetyRefusal(
         `onboarding job "${input.jobId}" has no passing onboarding proof of its delivered head — the gate stops before the next review round`,
+      );
+    }
+    const laneHeadDebt = this.onboardingLaneHeadDebt(input.jobId, lane.path);
+    if (laneHeadDebt !== null) {
+      throw new FallbackSafetyRefusal(
+        `onboarding job "${input.jobId}" has no passing onboarding proof of its lane HEAD ${laneHeadDebt.head ?? ''}, the commit the fallback reviews — the gate stops before the next review round`,
       );
     }
     if (fallbackWorkingStartedSince(this.opts.ledger, input.jobId, admission.statusSeq) ||
@@ -5214,7 +5283,7 @@ export class WaveRunner {
         ...(flippedFrom !== null ? { reviewedStatus: { jobId: job.id, status: flippedFrom } } : {}),
       };
       const current = input.force === true ? this.branchIdleBlockers(recheck) : this.enforceBranchIdle(recheck);
-      this.refuseUnauditedBlockers(job.id, round.id, current, input.forceAuthorization ?? new Map());
+      this.refuseUnauditedBlockers(job.id, round.id, current, input.forceAuthorization ?? new Map(), input.force === true);
     };
     try {
       reviewWorktree = await this.opts.worktrees.createReviewWorktree({
@@ -5230,7 +5299,8 @@ export class WaveRunner {
           : new Error('Perkins review service shut down during review setup');
       }
       const jobAtFreeze = this.opts.ledger.getJob(job.id);
-      if (jobAtFreeze !== null && isJobTerminal(jobAtFreeze.status)) {
+      if (jobAtFreeze === null) throw new ReviewJobMissingError(job.id);
+      if (isJobTerminal(jobAtFreeze.status)) {
         throw new Error(`job "${job.id}" is ${jobAtFreeze.status} — terminal lanes do not go back under review`);
       }
       if (input.armedTargetRef !== undefined) this.assertNamedTargetIdentity(jobWorktree.path, input.armedTargetRef);
@@ -5252,7 +5322,10 @@ export class WaveRunner {
       // #427 PR 1b: an onboarding heist freezes only a sha whose own proof
       // passed. The fence above follows the delivered head; an explicit
       // target, or a commit pushed after the delivery, can freeze another.
-      this.refuseUnprovenOnboardingTarget({ jobId: job.id, roundId: round.id, targetBranch: idle.targetBranch, targetSha, force: input.force === true });
+      // The blocker names the status from before this round flipped it.
+      this.refuseUnprovenOnboardingTarget({
+        jobId: job.id, status: job.status, roundId: round.id, targetBranch: idle.targetBranch, targetSha, force: input.force === true,
+      });
       // A clean-abort re-arm proved ONE delivered head at request time; the
       // awaited pre-flight/capacity/setup window can admit a newer delivery.
       // Re-prove the unchanged-head precondition here, at the last boundary
@@ -5405,7 +5478,7 @@ export class WaveRunner {
         // Unforced: the ordinary refusal (audited). Forced: its audit already
         // stands — only a blocker it never covered is refused (audited below).
         const afterProbe = input.force === true ? this.branchIdleBlockers(recheck) : this.enforceBranchIdle(recheck);
-        this.refuseUnauditedBlockers(job.id, round.id, afterProbe, input.forceAuthorization ?? new Map());
+        this.refuseUnauditedBlockers(job.id, round.id, afterProbe, input.forceAuthorization ?? new Map(), input.force === true);
         // Owner rule 3: a setup superseded while it awaited (an approved
         // material change, or a writer that owns the lane) withdraws here,
         // before any admission effect — the rollback below unwinds it.

@@ -73,18 +73,25 @@ export const BRANCH_BUSY_ONBOARDING_HINT =
   'this onboarding heist\'s manifest has no passing onboarding proof of the head under review — GC proves each ' +
   'delivered head itself and sends a failure back to the minion; force cannot skip the proof';
 
-/** The hint when an onboarding heist's newest delivery names no commit:
- * there is no head to prove until the minion delivers again. */
+/** The hint when an onboarding heist's newest delivery names no full
+ * commit id: there is no head to prove until the minion delivers again. */
 export const BRANCH_BUSY_ONBOARDING_NO_HEAD_HINT =
-  'this onboarding heist\'s newest delivery names no commit, so GC has no head to prove — the minion must deliver ' +
-  'again; force cannot skip the proof';
+  'this onboarding heist\'s newest delivery names no full commit id, so GC has no head to prove — the minion must ' +
+  'deliver again; force cannot skip the proof';
+
+/** The hint when an onboarding heist has not delivered at all: there is no
+ * head to prove until its first delivery. */
+export const BRANCH_BUSY_ONBOARDING_NO_DELIVERY_HINT =
+  'this onboarding heist has not delivered yet, so GC has no head to prove — wait for the minion\'s delivery; ' +
+  'force cannot skip the proof';
 
 /** The refusal hint for a blocker set: the unforceable reasons first. */
 export function branchBusyHint(blockers: readonly BranchIdleBlocker[]): string {
   if (blockers.some((blocker) => blocker.revision !== undefined)) return BRANCH_BUSY_REVISION_HINT;
-  const onboarding = blockers.filter((blocker) => blocker.onboardingProof !== undefined);
-  if (onboarding.some((blocker) => blocker.onboardingProof!.head !== null)) return BRANCH_BUSY_ONBOARDING_HINT;
-  if (onboarding.length > 0) return BRANCH_BUSY_ONBOARDING_NO_HEAD_HINT;
+  const reasons = new Set(blockers.flatMap((blocker) => (blocker.onboardingProof === undefined ? [] : [blocker.onboardingProof.reason])));
+  if (reasons.has('unproven') || reasons.has('failed')) return BRANCH_BUSY_ONBOARDING_HINT;
+  if (reasons.has('no-commit')) return BRANCH_BUSY_ONBOARDING_NO_HEAD_HINT;
+  if (reasons.has('no-delivery')) return BRANCH_BUSY_ONBOARDING_NO_DELIVERY_HINT;
   return BRANCH_BUSY_HINT;
 }
 
@@ -105,8 +112,8 @@ export interface BranchIdleBlocker {
   /** Present when a corrective delivery still owes its passing
    * verification on this head (owner decision 2026-10-09, option A). */
   readonly verification?: { readonly revision: number; readonly head: string | null };
-  /** Present when an onboarding heist's delivered head has no passing
-   * onboarding proof (#427 PR 1b). Never forceable. */
+  /** Present when an onboarding heist's head under review has no passing
+   * onboarding proof, with why (#427 PR 1b). Never forceable. */
   readonly onboardingProof?: OnboardingProofDebt;
 }
 
@@ -121,6 +128,7 @@ export interface BranchBusyResponse {
     readonly delivered_revision?: number;
     readonly verification_required_head?: string | null;
     readonly onboarding_proof_required_head?: string | null;
+    readonly onboarding_proof_reason?: OnboardingProofDebt['reason'];
   }[];
   readonly hint: string;
 }
@@ -149,7 +157,9 @@ export function branchBusyPayload(input: {
         ? { required_revision: blocker.revision.required, delivered_revision: blocker.revision.delivered }
         : {}),
       ...(blocker.verification !== undefined ? { verification_required_head: blocker.verification.head } : {}),
-      ...(blocker.onboardingProof !== undefined ? { onboarding_proof_required_head: blocker.onboardingProof.head } : {}),
+      ...(blocker.onboardingProof !== undefined
+        ? { onboarding_proof_required_head: blocker.onboardingProof.head, onboarding_proof_reason: blocker.onboardingProof.reason }
+        : {}),
     })),
     hint: branchBusyHint(input.blockers),
   };

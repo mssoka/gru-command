@@ -310,6 +310,9 @@ interface PersistedSlot {
   /** Client request identities bound to this holder (reconcile across restart). */
   readonly request_ids?: readonly string[];
   readonly granted_at: number;
+  /** The argv a holder that spawns its own command bound with its pid
+   * (#427 onboarding proof): the pid's command evidence after a restart. */
+  readonly process_command?: string | null;
 }
 
 interface PersistedAttempt {
@@ -400,6 +403,8 @@ interface ActiveSlot {
    * process are never owned — they are judged by pid/age alone. */
   readonly owned: boolean;
   pid: number | null;
+  /** The argv bound with {@link VerificationScheduler.bindPid}, else null. */
+  processCommand: string | null;
   child: ChildProcess | null;
   /** Client request identities bound to this holder. */
   requestIds: readonly string[];
@@ -821,6 +826,7 @@ export class VerificationScheduler {
           grantedAt: slot.granted_at,
         },
         pid: slot.pid,
+        processCommand: slot.process_command ?? null,
         owned: false,
         child: null,
         requestIds: slot.request_ids ?? [],
@@ -923,6 +929,7 @@ export class VerificationScheduler {
         lease,
         owned: true,
         pid: null,
+        processCommand: null,
         child: null,
         requestIds: spec.requestId === undefined ? [] : [spec.requestId],
       });
@@ -1012,12 +1019,26 @@ export class VerificationScheduler {
    * max-age) instead of releasing it as `no-runner` while the command may
    * still run. A slot already released holds nothing to bind.
    */
-  bindPid(lease: VerificationLease, pid: number): void {
+  bindPid(lease: VerificationLease, pid: number, processCommand: string): void {
     if (!Number.isInteger(pid) || pid <= 0) throw new Error(`a verification slot binds a positive integer pid, got ${String(pid)}`);
     const slot = this.slots.get(lease.runId);
     if (slot === undefined) return;
     slot.pid = pid;
+    slot.processCommand = processCommand;
     this.persistBestEffort();
+  }
+
+  /**
+   * The slots of one scope that an earlier process left and this one still
+   * holds (their bound pid was alive at the last stale check), with the
+   * pid and argv their holder bound. The holder that spawns its own
+   * command may end such an orphan and release its slot (#427 onboarding
+   * proof); nothing else is offered.
+   */
+  restoredHolders(scope: string): readonly { readonly lease: VerificationLease; readonly pid: number; readonly processCommand: string | null }[] {
+    return [...this.slots.values()]
+      .filter((slot) => !slot.owned && slot.lease.scope === scope && slot.pid !== null)
+      .map((slot) => ({ lease: slot.lease, pid: slot.pid!, processCommand: slot.processCommand }));
   }
 
   /** Release a lease (idempotent) and grant the next FIFO waiter. */
@@ -1781,6 +1802,7 @@ export class VerificationScheduler {
         lease,
         owned: true,
         pid: null,
+        processCommand: null,
         child: null,
         requestIds: waiter.spec.requestId === undefined ? [] : [waiter.spec.requestId],
       });
@@ -2167,6 +2189,7 @@ export class VerificationScheduler {
         head: slot.lease.head,
         request_ids: slot.requestIds,
         granted_at: slot.lease.grantedAt,
+        ...(slot.processCommand === null ? {} : { process_command: slot.processCommand }),
       })),
       attempts: this.persistedAttempts(),
     };

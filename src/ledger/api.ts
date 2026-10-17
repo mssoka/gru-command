@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
 import { loadWorktreeManifest, resolveVerifyCommand } from '../worktrees/manifest.js';
+import { isCommitId, readOnboardingProof } from '../onboarding/proof-record.js';
 import { readGitState } from '../verify/scheduler.js';
 import { planCommand } from '../verify/build-reuse.js';
 import { FROZEN_MANIFEST_MAX_BYTES, readReviewCheckpointBytes, type FrozenReviewInputs } from '../dispatch/perkins-review/artifacts.js';
@@ -411,12 +412,20 @@ export interface EventRecord {
   readonly payload: unknown;
 }
 
+/** Why an onboarding heist owes a proof (#427 PR 1b):
+ * - `no-delivery`: the job has not delivered, so there is no head yet;
+ * - `no-commit`: the newest delivery names no full commit id (or is not a
+ *   proven current candidate), so the minion must deliver again;
+ * - `unproven`: the head has no proof yet;
+ * - `failed`: the head's first proof failed, or its record is unreadable
+ *   (a record no reader can read is never a pass). */
+export type OnboardingProofDebtReason = 'no-delivery' | 'no-commit' | 'unproven' | 'failed';
+
 /** An onboarding heist's unproven head (#427 PR 1b): the head review waits
- * on (null when the newest delivery named none) and whether its proof
- * already failed. */
+ * on (null for `no-delivery` and `no-commit`) and why it waits. */
 export interface OnboardingProofDebt {
   readonly head: string | null;
-  readonly failed: boolean;
+  readonly reason: OnboardingProofDebtReason;
 }
 
 /** Notification routing (SPEC ruling 13; owner routing split 2026-09-23):
@@ -2696,9 +2705,10 @@ export class LedgerApi {
    * reads it (`latestDeliveryForGates(jobId, false)`), and the head it
    * identifies for review: its sha, or null when that delivery is not a
    * proven current candidate (historical bookkeeping, an unproven native
-   * candidate, original native gate debt) or names no commit. Null when the
-   * job has no delivery. The onboarding fence and the onboarding service's
-   * follow-through both read the head here (#427 PR 1b). */
+   * candidate, original native gate debt) or names no full commit id (40 or
+   * 64 lowercase hex characters, the only head a proof clones). Null when
+   * the job has no delivery. The onboarding fence and the onboarding
+   * service's follow-through both read the head here (#427 PR 1b). */
   newestDeliveredHead(jobId: string): { readonly seq: number; readonly head: string | null } | null {
     const newest = this.latestDeliveryForGates(jobId, false);
     if (newest === null) return null;
@@ -2707,7 +2717,7 @@ export class LedgerApi {
       // A current candidate delivery must identify the head.
       return { seq: newest.seq, head: null };
     }
-    return { seq: newest.seq, head: typeof payload.sha === 'string' && payload.sha !== '' ? payload.sha : null };
+    return { seq: newest.seq, head: typeof payload.sha === 'string' && isCommitId(payload.sha) ? payload.sha : null };
   }
 
   /** #427 PR 1b: an onboarding heist (a job an `onboarding.dispatched`
@@ -2716,12 +2726,12 @@ export class LedgerApi {
    * {@link newestDeliveredHead} identifies; the debt stands until the
    * FIRST `onboarding.proof` of that exact head passed (the first proof of
    * a head stands, as the onboarding service reads it). Null = no debt;
-   * otherwise the head that must pass (null when the newest delivery
-   * identifies none) and whether its proof failed. */
+   * otherwise the head that must pass (null when there is none) and why. */
   onboardingProofDebt(jobId: string): OnboardingProofDebt | null {
     if (!this.isOnboardingJob(jobId)) return null;
-    const head = this.newestDeliveredHead(jobId)?.head ?? null;
-    return head === null ? { head: null, failed: false } : this.onboardingProofOf(jobId, head);
+    const newest = this.newestDeliveredHead(jobId);
+    if (newest === null) return { head: null, reason: 'no-delivery' };
+    return newest.head === null ? { head: null, reason: 'no-commit' } : this.onboardingProofOf(jobId, newest.head);
   }
 
   /** The proof debt of one exact head (#427 PR 1b): what a freeze of that
@@ -2731,7 +2741,8 @@ export class LedgerApi {
     return this.isOnboardingJob(jobId) ? this.onboardingProofOf(jobId, head) : null;
   }
 
-  private isOnboardingJob(jobId: string): boolean {
+  /** #427: a job is an onboarding heist only when an `onboarding.dispatched` event names it. */
+  isOnboardingJob(jobId: string): boolean {
     return this.db.prepare(
       `SELECT 1 FROM events WHERE kind = 'onboarding.dispatched' AND json_extract(payload, '$.job_id') = ? LIMIT 1`,
     ).get(jobId) !== undefined;
@@ -2747,10 +2758,13 @@ export class LedgerApi {
     return row === undefined ? null : this.eventFromRow(row);
   }
 
+  /** Read by the one proof reader: a first record it cannot read (an
+   * unknown outcome, malformed failures) fences like a failure and never
+   * lifts the fence. */
   private onboardingProofOf(jobId: string, head: string): OnboardingProofDebt | null {
-    const outcome = (this.firstOnboardingProof(jobId, head)?.payload as { outcome?: unknown } | null | undefined)?.outcome;
-    if (outcome === 'passed') return null;
-    return { head, failed: outcome === 'failed' };
+    const first = this.firstOnboardingProof(jobId, head);
+    if (first === null) return { head, reason: 'unproven' };
+    return readOnboardingProof(first.payload)?.passed === true ? null : { head, reason: 'failed' };
   }
 
   private amendmentFromRow(row: Row): JobAmendmentRecord {
