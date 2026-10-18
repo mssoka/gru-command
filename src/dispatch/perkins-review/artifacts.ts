@@ -6,7 +6,7 @@ const execFileAsPromised = promisify(execFileCallback);
 import { createHash } from 'node:crypto';
 import { closeSync, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, rmSync, unlinkSync, writeFileSync, constants } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 import type { BranchIdleTag } from '../branch-idle.js';
 import { repositoryGitEnv } from '../../git-env.js';
 import type { CiEvidenceRecord } from '../../review-inputs/ci-evidence.js';
@@ -133,6 +133,10 @@ export interface FrozenReview {
     readonly attachments: readonly FrozenEvidenceRuntimeAttachment[];
     readonly ci: CiEvidenceRecord | null;
   };
+  /** Where reviewers read the frozen tree when it differs from the checkout:
+   * the link-text view that withReviewTree supplies for a target that tracks
+   * symlinks. Absent means the checkout itself. */
+  readonly readTreeRoot?: string;
 }
 
 function gitRaw(
@@ -867,15 +871,142 @@ export function reviewArtifactDirectory(artifactRoot: string, roundId: string): 
   return directory;
 }
 
-function assertFrozenTreeHasNoSymlinks(repoPath: string, targetSha: string): void {
-  const entries = gitRaw(repoPath, ['ls-tree', '-r', '-z', targetSha, '--']).split('\0').filter(Boolean);
-  for (const entry of entries) {
+interface TreeEntry {
+  readonly mode: string;
+  readonly oid: string;
+  readonly path: string;
+}
+
+/** Every blob entry of the frozen target, from `git ls-tree -r -z`. */
+function frozenTreeEntries(repoPath: string, targetSha: string): readonly TreeEntry[] {
+  const entries: TreeEntry[] = [];
+  for (const entry of gitRaw(repoPath, ['ls-tree', '-r', '-z', targetSha, '--']).split('\0').filter(Boolean)) {
     const tab = entry.indexOf('\t');
-    const metadata = tab === -1 ? entry : entry.slice(0, tab);
-    const path = tab === -1 ? '(unknown)' : entry.slice(tab + 1);
-    if (metadata.startsWith('120000 ')) {
-      throw new Error(`frozen target contains a symlink, which review tools may not observe: ${path}`);
+    if (tab === -1) continue;
+    const [mode, , oid] = entry.slice(0, tab).split(' ');
+    entries.push({ mode: mode!, oid: oid!, path: entry.slice(tab + 1) });
+  }
+  return entries;
+}
+
+/** A symlink tracked by the frozen target, shown to reviewers as its path plus
+ * link text and never followed. */
+export interface FrozenSymlink {
+  readonly path: string;
+  readonly linkText: string;
+}
+
+const FROZEN_SYMLINK_MAX_TEXT_BYTES = 4096;
+
+/** True when the link text, resolved lexically from the link's own directory,
+ * leaves the repository (absolute, or `..` past the root). This is a fail-early
+ * screen, not the boundary: it does not resolve a path component that is itself
+ * a tracked link. The boundary is materializeReviewView, in which no link is a
+ * link. */
+function symlinkEscapesRepository(path: string, linkText: string): boolean {
+  if (linkText === '' || isAbsolute(linkText) || posix.isAbsolute(linkText) || /^[A-Za-z]:/u.test(linkText) || linkText.startsWith('\\')) {
+    return true;
+  }
+  const resolved = posix.normalize(posix.join(posix.dirname(path), linkText.replaceAll('\\', '/')));
+  return resolved === '..' || resolved.startsWith('../');
+}
+
+/** Every symlink the frozen target tracks, as path plus link text. A link that
+ * escapes the repository is refused by name; every other link is allowed
+ * because no review read path follows it (see materializeReviewView). */
+export function frozenTreeSymlinks(repoPath: string, targetSha: string): readonly FrozenSymlink[] {
+  const links = frozenTreeEntries(repoPath, targetSha).filter((entry) => entry.mode === '120000');
+  if (links.length === 0) return [];
+  const batch = execFileSync('git', ['-C', repoPath, 'cat-file', '--batch'], {
+    input: `${links.map((link) => link.oid).join('\n')}\n`,
+    maxBuffer: GIT_MAX_BUFFER,
+    timeout: 30_000,
+    env: repositoryGitEnv(false),
+  });
+  const texts: string[] = [];
+  let offset = 0;
+  for (const link of links) {
+    const lineEnd = batch.indexOf(0x0a, offset);
+    const [, type, size] = batch.subarray(offset, lineEnd).toString('utf8').split(' ');
+    const bytes = Number(size);
+    if (lineEnd === -1 || type !== 'blob' || !Number.isSafeInteger(bytes) || bytes > FROZEN_SYMLINK_MAX_TEXT_BYTES) {
+      throw new Error(`frozen target symlink has unreadable or oversized link text (limit ${FROZEN_SYMLINK_MAX_TEXT_BYTES} bytes): ${link.path}`);
     }
+    texts.push(batch.subarray(lineEnd + 1, lineEnd + 1 + bytes).toString('utf8'));
+    offset = lineEnd + 1 + bytes + 1;
+  }
+  const symlinks = links.map((link, index) => ({ path: link.path, linkText: texts[index]! }));
+  const escaping = symlinks.find((link) => symlinkEscapesRepository(link.path, link.linkText));
+  if (escaping !== undefined) {
+    throw new Error(`frozen target contains a symlink that escapes the repository, which review will not follow: ${escaping.path} -> ${escaping.linkText}`);
+  }
+  return symlinks;
+}
+
+const REVIEW_VIEW_PREFIX = 'gru-review-view-';
+/** A view older than this belongs to a round that died without cleanup. */
+const STALE_REVIEW_VIEW_MS = 24 * 60 * 60 * 1000;
+
+function sweepStaleReviewViews(now: number): void {
+  const base = tmpdir();
+  for (const name of readdirSync(base)) {
+    if (!name.startsWith(REVIEW_VIEW_PREFIX)) continue;
+    try {
+      const path = join(base, name);
+      if (now - lstatSync(path).mtimeMs > STALE_REVIEW_VIEW_MS) rmSync(path, { recursive: true, force: true });
+    } catch {
+      // Another process removed or still owns it; a sweep is best effort.
+    }
+  }
+}
+
+/** A private checkout of the frozen target in which git writes each symlink as
+ * a regular file holding its link text (core.symlinks=false). A reviewer's Read,
+ * Grep and Glob can then see a link as path plus link text but cannot follow
+ * it, inside or outside the repository. The caller owns `dispose`. */
+export async function materializeReviewView(
+  repoPath: string,
+  targetSha: string,
+  signal?: AbortSignal,
+): Promise<{ readonly directory: string; readonly dispose: () => void }> {
+  sweepStaleReviewViews(Date.now());
+  const root = mkdtempSync(join(tmpdir(), REVIEW_VIEW_PREFIX));
+  const directory = join(root, 'tree');
+  const dispose = (): void => rmSync(root, { recursive: true, force: true });
+  try {
+    mkdirSync(directory, { mode: 0o700 });
+    const env = { ...repositoryGitEnv(false), GIT_INDEX_FILE: join(root, 'index') };
+    const run = async (args: readonly string[]): Promise<void> => {
+      await execFileAsPromised('git', ['-C', repoPath, '-c', 'core.symlinks=false', ...args], {
+        env, maxBuffer: GIT_MAX_BUFFER, timeout: 120_000, ...(signal !== undefined ? { signal } : {}),
+      });
+    };
+    await run(['read-tree', targetSha]);
+    await run(['checkout-index', '--all', '--force', `--prefix=${directory}${sep}`]);
+    return { directory, dispose };
+  } catch (error) {
+    dispose();
+    throw new Error(`could not materialize the review view of ${targetSha}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/** Runs `use` against the review the reviewers should read. A target without
+ * symlinks is read in the checkout as is; otherwise `use` gets the same review
+ * with `readTreeRoot` set to a link-text view that is removed afterwards, even
+ * when `use` throws. Re-derived from the frozen target, so a recovered round
+ * gets the same view as a fresh one and a link that escapes is refused here
+ * too, before any reviewer starts. */
+export async function withReviewTree<T>(
+  review: FrozenReview,
+  use: (readable: FrozenReview) => Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (frozenTreeSymlinks(review.manifest.repoPath, review.manifest.targetSha).length === 0) return use(review);
+  const view = await materializeReviewView(review.manifest.repoPath, review.manifest.targetSha, signal);
+  try {
+    return await use({ ...review, readTreeRoot: view.directory });
+  } finally {
+    view.dispose();
   }
 }
 
@@ -916,7 +1047,8 @@ function conventionPaths(changedFiles: readonly string[], tracked: ReadonlySet<s
 }
 
 function readConventions(repoPath: string, targetSha: string, changedFiles: readonly string[]): string {
-  const tracked = new Set(gitRaw(repoPath, ['ls-tree', '-r', '--name-only', '-z', targetSha, '--']).split('\0').filter(Boolean));
+  const modes = new Map(frozenTreeEntries(repoPath, targetSha).map((entry) => [entry.path, entry.mode] as const));
+  const tracked = new Set(modes.keys());
   const parts: string[] = [];
   let totalBytes = 0;
   for (const name of conventionPaths(changedFiles, tracked)) {
@@ -937,7 +1069,10 @@ function readConventions(repoPath: string, targetSha: string, changedFiles: read
     if (Buffer.byteLength(contents) !== size) {
       throw new Error(`project convention ${name} changed while frozen bytes were read`);
     }
-    parts.push(`--- ${name} ---\n${contents.trimEnd()}`);
+    // A convention file that is a symlink is shown as its link text and never
+    // followed; its target is read at its own path.
+    const heading = modes.get(name) === '120000' ? `${name} (symlink to ${contents.trimEnd()}; not followed)` : name;
+    parts.push(`--- ${heading} ---\n${contents.trimEnd()}`);
   }
   return parts.length === 0 ? 'No repository convention file was supplied.' : `${parts.join('\n\n')}\n`;
 }
@@ -975,7 +1110,7 @@ export function freezeReviewInputs(input: FreezeReviewInput): FrozenReview {
   const baseRefSha = resolveGitCommit(input.repoPath, input.baseRef);
   const diffBaseSha = git(input.repoPath, ['merge-base', baseRefSha, targetSha]);
   assertReviewCheckoutClean(input.repoPath);
-  assertFrozenTreeHasNoSymlinks(input.repoPath, targetSha);
+  frozenTreeSymlinks(input.repoPath, targetSha);
   const diff = gitRaw(input.repoPath, [
     'diff',
     '--no-ext-diff',

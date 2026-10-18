@@ -12,10 +12,14 @@ export function claudeCliModel(ref: string): string | undefined {
 }
 
 /** Both the auth probe and every review turn must disable ambient Claude
- * customizations. --settings is a separate, narrowly curated auth source. */
+ * customizations. --settings is a separate, narrowly curated auth source.
+ * Never add --safe-mode (or --bare) here: safe mode disables every MCP server,
+ * including the review bridge passed with --mcp-config, so the lead cannot
+ * submit. Isolation comes from the flags below plus CLAUDE_CODE_DISABLE_AUTO_MEMORY
+ * (see claudeReviewProcessEnv). */
 export function claudeReviewIsolationArgs(settingsFile?: string): string[] {
   return [
-    '--safe-mode', '--disable-slash-commands', '--strict-mcp-config',
+    '--disable-slash-commands', '--strict-mcp-config',
     '--setting-sources', '', '--no-chrome',
     ...(settingsFile === undefined ? [] : ['--settings', settingsFile]),
   ];
