@@ -111,8 +111,9 @@ surfaces keeps exactly its own surface entries, so give every kept surface
 `mode = "shadow"` and add the missing ones yourself, before turning Jev on
 (right away if it is already on): an unlisted or mode-less `event_triage`
 or `supervision_guidance` acts on Jev's answer with no backtest gate. With
-Jev on and no surface listed, setting `enabled = false` (it hot-reloads)
-and then regenerating adds the four shadow surfaces for you.
+Jev on and no surface listed (every transient outage pages you meanwhile),
+set `enabled = false` (it hot-reloads), regenerate to add the four shadow
+surfaces, then set `enabled = true` again: the regenerate keeps it off.
 
 `node dist/decisions/cli.js config-template` prints the same fragment, for
 reading or for copying into a config that has no decisions tables at all.
@@ -130,7 +131,7 @@ Invalid reloads keep the product usable in deterministic degraded mode.
 
 Jev is reachable through three exchangeable provider profiles. All three are
 always present; `[decisions.providers.<name>]` overrides a built-in by
-re-declaring it (every key is required) or defines a new profile:
+re-declaring it (every key but `input_price_per_mtok` is required) or defines a new profile:
 
 | Profile | Protocol | Endpoint | Model | Credential |
 |---|---|---|---|---|
@@ -156,8 +157,9 @@ Example — route one surface through TypeSafe directly. Store the TypeSafe
 key first (see [Credentials](#credentials)), then probe it with
 the CLI once `enabled = true`. A `TYPESAFE_API_KEY` variable outranks the
 stored key file, and the CLI reads your shell's environment, not the
-service's. A service installed by `install.sh` sets no key variables and
-reads only the files, so probe without the variable:
+service's. `install.sh` puts no key variable in the service unit, so unless
+you added one to the service's environment, the service uses the files;
+probe without the variable:
 
 ```sh
 env -u TYPESAFE_API_KEY node dist/decisions/cli.js check --profile typesafe-direct --json
@@ -218,9 +220,10 @@ Routing rules:
   asks or records anything; enforcing those two needs host changes as well
   as the evidence and owner decision above (and #219 for
   `escalation_triage`). `report_conclusion` has no live host. On any
-  surface, enforce still counts as acting: a transient (timeout or network)
-  outage of the default `openrouter-jev` profile then pages you as a
-  needs-owner incident instead of a board FYI. Use `off` or `shadow`. A surface
+  surface, enforce still counts as acting: a transient (timeout, network
+  or provider 429/5xx) outage of the default `openrouter-jev` profile then
+  pages you as a needs-owner incident instead of a board FYI. Use `off` or
+  `shadow`. A surface
   with no `mode` key keeps the pre-#223 behavior without the gate.
 - **Earning enforce.** Extract labelled history to JSONL
   (`{ id, state, label }`), run the harness against any profile, and save

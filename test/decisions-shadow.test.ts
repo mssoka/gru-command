@@ -189,19 +189,22 @@ describe('surface mode config parsing (issue #223)', () => {
     expect(template).toContain('mode = "shadow"');
     expect(template).toContain('decisions/backtests/');
     // Every fresh config ships this legend: enforce is unusable today, each
-    // live surface says why, and a missing mode is spelled out for all four.
+    // surface says why, and a missing mode is spelled out for all five.
     expect(template).toContain('Not usable on any surface yet (see each one below).');
     expect(template).toContain('Give every surface an explicit mode unless you mean that.');
     expect(template).toContain('escalation_triage, same_blocker and report_conclusion are never asked.');
+    expect(template).toContain('A transient outage then pages you too, as with enforce.');
     expect(template).toContain('# Surfaces (the complete list; any other name fails to load):');
     expect(template).toMatch(
-      /Setting it anywhere still makes a transient \(timeout or\n#\s+network\) outage of the default openrouter-jev profile\n#\s+page you instead of posting a board FYI\.\n/,
+      /Setting it anywhere still makes a transient \(timeout,\n#\s+network or provider 429\/5xx\) outage of the default\n#\s+openrouter-jev profile page you instead of a board FYI\.\n/,
     );
     expect(template).toMatch(/# {3}report_conclusion [^\n]*\n#\s+backtest only: no live host yet, so enforce never asks\n/);
     for (const surface of DECISION_SURFACES) expect(template).toContain(`#   ${surface} `);
     for (const surface of ['event_triage', 'supervision_guidance']) {
       expect(template).toMatch(
-        new RegExp(`#   ${surface} [^\\n]*\\n#\\s+off or shadow today: no registered backtest, so enforce fails and pages you\\n`),
+        new RegExp(
+          `#   ${surface} [^\\n]*\\n#\\s+off or shadow today: no registered backtest, so enforce rejects every\\n#\\s+Jev ask \\(the deterministic answer still serves\\) and opens an owner incident\\n`,
+        ),
       );
     }
     for (const surface of ['escalation_triage', 'same_blocker']) {
@@ -559,6 +562,7 @@ describe('shadow misses are evidence, not incidents (2026-10-06 owner page)', ()
     for (let i = 0; i < SHADOW_MISS_DEGRADE_THRESHOLD; i += 1) {
       await actingRuntime.decide(eventRequest(), { surface: 'event_triage' });
     }
+    expect(legacy.postIncident).toHaveBeenCalledTimes(1);
     expect(legacy.postIncident.mock.calls[0]![0]).toMatchObject({ routing: 'needs-owner' });
     actingRuntime.dispose();
 
@@ -569,6 +573,7 @@ describe('shadow misses are evidence, not incidents (2026-10-06 owner page)', ()
     auth.postIncident.mockClear();
     await authRuntime.decide(eventRequest(), { surface: 'event_triage' });
     expect(authRuntime.status()).toMatchObject({ status: 'degraded', reason: 'auth_rejected' });
+    expect(auth.postIncident).toHaveBeenCalledTimes(1);
     expect(auth.postIncident.mock.calls[0]![0]).toMatchObject({ kind: 'decisions.degraded.auth_rejected', routing: 'needs-owner' });
     authRuntime.dispose();
   });
