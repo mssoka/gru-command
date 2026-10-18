@@ -138,7 +138,7 @@ export function boardSections(
       'in-flight': byBand.get('in-flight')?.length ?? 0,
       pipeline: pipeline?.pending ?? 0,
       // The section's own authoritative count is the machine band it
-      // contains (the global live machine count is the strip's ALERTS pair).
+      // contains (the global live machine count is the attention card's Gru line).
       'for-gru': (snapshot.mailbox?.counts.threads ?? 0) + (snapshot.mailbox?.counts.incidents ?? 0),
       settled: byBand.get('settled')?.length ?? 0,
       cold: byBand.get('cold')?.length ?? 0,

@@ -1,9 +1,9 @@
 import { withMailboxFixture } from './mailbox-fixture.test-support.js';
 import { describe, expect, it } from 'vitest';
 import { bucketSnapshot } from './board-bands.js';
-import { familyStatusBreakdown, isLiveMegaminion, jobFamilies } from './board-family.js';
+import { familyStatusBreakdown, isLiveMegaminion, jobFamilies, subMinionTree } from './board-family.js';
 import { boardKpis } from './board-kpi.js';
-import type { BoardSnapshot, JobView } from './board-protocol.js';
+import type { AgentView, BoardSnapshot, JobView } from './board-protocol.js';
 import { boardSections, snapshotSections } from './board-sections.js';
 
 const NOW = Date.parse('2026-10-07T20:10:00.000Z');
@@ -180,5 +180,28 @@ describe('heist counts exclude nested megaminions', () => {
     const rows = [...sections.bands.values()].reduce((sum, group) => sum + group.length, 0);
     expect(boardKpis(withSurfaced, new Date(NOW), sections.topLevel).jobs.total).toBe(rows);
     expect(rows).toBe(3);
+  });
+});
+
+describe('sub-minions under their creator in the crew rail (cockpit rework)', () => {
+  const crew = (id: string, parentAgentId: string | null = null): AgentView => ({
+    id, role: 'minion', label: id, state: 'streaming', lastActivity: null, sessionFile: null, jobId: null, roundId: null, supervision: null,
+    parentage: parentAgentId === null ? 'top-level' : 'child', parentAgentId,
+  });
+  const order = (agents: readonly AgentView[]) => subMinionTree(agents).map(({ agent, depth }) => `${agent.id}:${depth}`);
+
+  it('moves each sub-minion just after the minion that created it, its own sub-minions after it', () => {
+    // Server order puts the children before and between their creators.
+    expect(order([crew('c1', 'p'), crew('q'), crew('p'), crew('g', 'c1'), crew('c2', 'p')])).toEqual(['q:0', 'p:0', 'c1:1', 'g:2', 'c2:1']);
+  });
+
+  it('a sub-minion whose creator is not in the list keeps its place, flat; a cycle still renders every row once', () => {
+    expect(order([crew('a'), crew('orphan', 'gone'), crew('b')])).toEqual(['a:0', 'orphan:0', 'b:0']);
+    const cycle = order([crew('x', 'y'), crew('y', 'x'), crew('z')]);
+    expect(cycle.map((entry) => entry.split(':')[0]).sort()).toEqual(['x', 'y', 'z']);
+    expect(cycle).toHaveLength(3);
+    // Only the durable `child` parentage nests: a stray parent id on a
+    // top-level row is not a claim.
+    expect(order([{ ...crew('p') }, { ...crew('t'), parentAgentId: 'p' }])).toEqual(['p:0', 't:0']);
   });
 });

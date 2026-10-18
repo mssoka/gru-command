@@ -97,11 +97,12 @@ export default defineConfig({
       use: { baseURL: `http://localhost:${PREVIEW_PORT}` },
     },
     {
-      // The slim-strip synthetic proof suite: its own project so an
-      // unfiltered `--project=mock` run (crew-rail-captures and other
-      // scopes) keeps the base smoke/working-flavor roster unchanged.
-      name: 'strip',
-      testMatch: 'dashboard-strip.spec.ts',
+      // The cockpit synthetic proof suite (health pill + KPI cards, which
+      // replaced the slim strip): its own project so an unfiltered
+      // `--project=mock` run keeps the base smoke/working-flavor roster.
+      // The settle helper's self-test (#402) rides here: it needs no app.
+      name: 'cockpit',
+      testMatch: ['cockpit.spec.ts', 'settle-transitions.spec.ts'],
       use: { baseURL: `http://localhost:${PREVIEW_PORT}` },
     },
     {

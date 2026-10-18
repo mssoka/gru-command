@@ -363,7 +363,7 @@ const PINS: Record<string, number> = {
   'specialist-dispose-bounded.test.ts': 2,
   'static.test.ts': 10,
   'stub-runtime.test.ts': 14,
-  'suite-shape.test.ts': 5,
+  'suite-shape.test.ts': 6,
   'supervisor.test.ts': 231,
   'tool-heartbeat.test.ts': 2,
   'transcripts.test.ts': 16,
@@ -422,15 +422,40 @@ describe('suite shape', () => {
     expect(workflow).toContain('run: npm test');
   });
 
-  it('the SLIM baseline scope names every independently measured instrument surface', () => {
-    const worktree = readFileSync(join(import.meta.dirname, '..', '.gru-command', 'worktree.toml'), 'utf-8');
-    const line = worktree.split('\n').find((candidate) => candidate.startsWith('dashboard-slim-strip-baseline = '));
-    const allowlist = /--require-file-substr "([^"]+)"/u.exec(line ?? '')?.[1]?.split(',') ?? [];
-    expect(allowlist).toEqual([
-      'slim strip labelled status pairs',
-      'slim strip Heists/PRs/Crew count groups',
-      'reserved numeric slot for strip KPIs',
-    ]);
+  it('the cockpit scopes replace the retired slim-strip ones', () => {
+    // The slim strip and its fail-before instrument were retired by the
+    // cockpit rework: no scope, script, Playwright project or workflow may
+    // still run them, and the cockpit's own unit and browser scopes exist.
+    const root = join(import.meta.dirname, '..');
+    const workflows = join(root, '.github', 'workflows');
+    const runners = [
+      join(root, '.gru-command', 'worktree.toml'),
+      join(root, 'package.json'),
+      join(root, 'web', 'package.json'),
+      join(root, 'web', 'playwright.config.ts'),
+      ...readdirSync(workflows).map((name) => join(workflows, name)),
+    ];
+    // Any spelling of the retired project or scopes: `--project=strip`,
+    // `--project strip`, quoted values, a `name: "strip"` project, or a
+    // bare or quoted `strip-*` scope key.
+    const retired = /slim-strip\.baseline\.test\.ts|dashboard-strip\.spec\.ts|board-rail\.test\.ts|--project[= ]['"]?strip(?![\w-])|name: ['"]strip['"]|^['"]?strip-[\w-]+['"]? =/mu;
+    for (const file of runners) expect(readFileSync(file, 'utf-8'), file).not.toMatch(retired);
+    for (const spelling of ['--project=strip', '--project strip', '--project="strip"', "name: 'strip'", 'name: "strip"', 'strip-smoke = "x"', '"strip-themes" = "x"']) {
+      expect(spelling, spelling).toMatch(retired);
+    }
+    for (const kept of ['--project=strip-free', '--project=cockpit', "name: 'stripes'", 'cockpit-themes = "x"']) expect(kept, kept).not.toMatch(retired);
+    const worktree = readFileSync(runners[0]!, 'utf-8');
+    expect(worktree).toMatch(/^cockpit-unit = .*src\/lib\/cockpit\.test\.ts/mu);
+    expect(worktree).toMatch(/^cockpit-browser = .*--project=cockpit e2e\/cockpit\.spec\.ts/mu);
+  });
+
+  it('every web e2e spec runs in some Playwright project (a moved spec never silently stops running)', () => {
+    const web = join(import.meta.dirname, '..', 'web');
+    const config = readFileSync(join(web, 'playwright.config.ts'), 'utf-8');
+    const matched = new Set([...config.matchAll(/'([\w.-]+\.spec\.ts)'/gu)].map((match) => match[1]));
+    const specs = readdirSync(join(web, 'e2e')).filter((name) => name.endsWith('.spec.ts'));
+    expect(specs.length).toBeGreaterThan(0);
+    for (const spec of specs) expect(matched, spec).toContain(spec);
   });
 
   it('distinguishes unsupported R2 shell wrappers from inert shell text', () => {

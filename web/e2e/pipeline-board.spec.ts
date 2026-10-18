@@ -477,7 +477,7 @@ async function collectFailureContext(page: Page, selector: string): Promise<void
       },
       chrome: {
         commandBar: rectOf(document.getElementById('command-bar')),
-        chipRail: rectOf(document.getElementById('chip-rail')),
+        kpis: rectOf(document.getElementById('board-kpis')),
         nav: rectOf(document.getElementById('board-nav')),
       },
       bandHead: head === null ? null : { element: describe(head), rect: rectOf(head) },

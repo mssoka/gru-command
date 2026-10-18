@@ -1278,7 +1278,7 @@ export function renderConnectionDot(state: ConnectionState | 'stale'): void {
   else if (state === 'connecting' || state === 'authenticating' || state === 'reconnecting')
     dot.classList.add('conn-dot--busy');
   else dot.classList.add('conn-dot--down');
-  const label = `socket: ${state}`;
-  dot.title = label;
-  dot.setAttribute('aria-label', label);
+  // The dot is decoration inside RADAR (aria-hidden): the pill's word
+  // carries the state; the title keeps the raw socket state for hover.
+  dot.title = `socket: ${state}`;
 }

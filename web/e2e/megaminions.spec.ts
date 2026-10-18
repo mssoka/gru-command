@@ -110,7 +110,14 @@ test.describe('megaminions nest under their heist (synthetic fixture)', () => {
     const inFlight = page.locator('#board-section-in-flight');
     await expect(inFlight.locator('.board-band__count')).toHaveText('2 heists');
     await expect(inFlight.locator('.board-band__rows > .board-job')).toHaveCount(2);
-    await expect(page.locator('#board-section-settled .board-band__count')).toHaveText('0 heists');
+    // An empty SETTLED folds into the Empty row (cockpit rework): 0, not a card.
+    await expect(page.locator('#board-section-settled.board-folded__pill .board-folded__count')).toHaveText('0');
+    // The MEGAMINIONS card counts the specialists the HEISTS card leaves out.
+    const mega = page.locator('#board-kpis .cockpit-card--megaminions');
+    await expect(mega.locator('[data-kpi="megaminions.live"]')).toHaveText('2');
+    await expect(mega.locator('[data-kpi="megaminions.finished"]')).toHaveText('1');
+    await expect(mega.locator('.cockpit-fact--note')).toHaveText('across 1 heist');
+    await expect(page.locator('#board-kpis [data-kpi="jobs.total"]')).toHaveText('2');
 
     const parent = page.locator(`.board-job[data-job-id="${PARENT.id}"]`);
     await expect(parent.locator('.board-job__family-chip')).toHaveText('↳ 3 megaminions · 2 working · 1 delivered');

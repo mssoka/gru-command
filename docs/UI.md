@@ -249,26 +249,76 @@ owns the numbers; CSS mirrors them):
   into the overlay sheet and the Gru FAB (bottom-right, 🧠) opens it over
   a dimmed board (scrim).
 - **< 900px — single column:** board-first (SPEC ruling 11) with the
-  rail stacked below; the FAB opens the bottom-sheet chat. The chip rail
-  becomes one horizontally scrollable row.
+  rail stacked below; the FAB opens the bottom-sheet chat. The command bar
+  wraps: the health pill sits on its own row. Below 800px ROUND steps
+  aside; on a phone (≤ 640px) RADAR does too unless the board socket is lost (stale,
+  reconnecting or offline, until it reopens) — then it returns after the
+  buttons, on a row of its own, in its warning or alert colour; the
+  compact buttons always share the brand's row, so the bar stays sticky:
+  the brand row, then the health pill with its chips and any checks that
+  need a look.
 
-The **global command bar** (sticky, ~56px) is one flat row: logo +
-product + `ONE GRU · ONE WINDOW`, the inline monospace status **ticker**
-(`MODE: COCKPIT | RADAR: LIVE | ROUND 4 ACTIVE` — layout, the board
-socket's radar state, the top live/pending review round), the
-notification bell, theme and settings. No Chat/Board lens toggle (v6.1):
-chat is always docked on desktop and the FAB owns mobile chat. Below it
-the **slim status strip** (sticky, wrapping on desktop) renders the v4
-health row as labelled status pairs — DEPLOY → REVIEWS → SILAS → ALERTS →
-VERIFY → CURE, each pair a key and its value with the card's flags (e.g.
-REVIEWS carries `12 FAILED`) — plus the Jev decisions, NEEDS GRU and wake
-facts, and three stable count groups: **HEISTS** / **PRS** / **CREW**
-(each with a reserved-width total and its labelled fields; the CHILDREN
-group appears only when the server actually reported counters). Every
-number is a `data-kpi` span tied to the same `boardKpis` derivation the v4
-strip used, and every numeric slot is `tabular-nums` with a reserved floor,
-so a count crossing 9→10→100→1000 moves nothing beside it. No bare slash
-counters survive: every value carries its label beside it.
+The **global command bar** (cockpit rework, owner-approved 2026-10-17) is
+the only sticky chrome above the board column, at every width (inside the
+column, the section shortcut strip and the band heads pin under it): the
+logo badge + `ONE GRU · ONE
+WINDOW`, two mono pills — **RADAR** (the board socket's state; its dot is
+the connection dot) and **ROUND** (the top live/pending review round,
+dashed `NO ROUND` when none) — the **health pill**, then the owner-chime
+speaker, the notification bell, theme and settings. RADAR follows the
+board socket only; the chat socket's state is the chat pane's ONLINE
+badge. No Chat/Board lens toggle (v6.1): chat is always docked on desktop
+and the FAB owns mobile chat. The bar wraps by fit rather than at a fixed
+width (so page zoom and a narrow pane wrap it too, never overflow it), and
+its measured height feeds the sticky offsets whenever it changes. Below
+1100px the health pill takes its own row; below 800px, where the brand,
+both pills and the buttons cannot share a row, ROUND steps aside (the
+REVIEWS card names the top round), so the brand, RADAR and the buttons
+keep row 1. RADAR and ROUND hold one width whatever they read, so a
+reconnect or a round going live never reflows the bar.
+
+The **health pill** (a group named “System health”) carries the system
+checks (deploy, Silas, verify, disk, cure) in one line, the ones that need
+a look first — a warning, an alert, or any check carrying a flag such as
+`1 QUEUED`, shown with that flag (e.g. `deploy 3 behind RESTART PENDING`)
+— then the rest; it ends with the Jev decisions chip and the Gru wake
+chip. Its summary reads `2 need a look` (pink, ▲), `All healthy` (some
+check reads ok and none needs a look), `No problems reported` (wired checks
+report only neutral facts such as no wakes yet; muted dot), or `Checks not
+wired` (muted dot) — unknown never reads healthy. From the moment the
+board socket is lost (stale, reconnecting, offline) until it reopens — an
+HTTP catch-up meanwhile is still last-known — or while the board is
+unavailable, the summary is prefixed `last-known ·` and the dot is muted
+unless something needs a look. A check whose source is
+not wired (`n/a`) stays out of the text and in the tooltip. On a phone the
+calm checks fold away and the ones that need a look keep a line of their
+own inside the pill.
+
+The **KPI cards** sit at the top of the board column: **HEISTS** (the total
+on the board, a stage bar working → in review → merged → done, and every
+status count), **MEGAMINIONS** (every job a minion commissioned — nested,
+surfaced, or top-level because its parent left the board — live,
+finished, across how many heists on the board, and how many whose heist
+left it), **CREW** (minions, mid-turn, disposed,
+and sub-minions — #161 child workers, `2 sub-minions`, or `2 sub-minions
+active · 1 queued` once some wait —
+only when the server reported counters), **PRS**, **REVIEWS** (rounds active, the top
+round, verdicts and failures today) and **VECTOR RAIDS** (dashed `off`
+until `[vector] enabled = true`; when on, the running raid and its attack,
+raids awaiting you, queued, fixes awaiting you, break-ins, and the busiest
+repository's use of its cap over the last 24 hours — `1/2 in 24h`, every
+repository in the tooltip; a dashed `— unavailable` card when the server
+could not read the raids; no card at all from a server that sends no
+raids block). Two columns on a phone, three from 520px, six from 1000px of
+board column (five when there is no raids card). Every count is a
+`data-kpi` span tied to the derivation the v4 strip used, and carries its
+label beside it; the context lines (a raid's attack, `across 2 heists`)
+and the card asides are text. Zeros fade; a count that needs attention
+turns pink with ▲. A card's headline number stands alone on its line and
+grows freely; fact counts and the wake chip's numbers reserve a two-digit
+slot (`tabular-nums` + a floor), so a count crossing 9→10 never moves a
+label beside it, and larger counts grow honestly and wrap — never clip.
+The cards scroll with the board; they are never sticky.
 
 **Display vocabulary (v6.1):** the render boundary renders `lane` /
 `job(s)` as **heist(s)** and the worker-meta word as **minion**; the
@@ -277,7 +327,8 @@ is display-only: API payloads, code identifiers, and the ledger keep
 `lane`, `job`, and `agent`.
 
 `web/src/ui/console.ts` owns the FAB contract; `web/src/ui/splitters.ts`
-owns pane sizes; `web/src/ui/command-bar.ts` owns the ticker;
+owns pane sizes; `web/src/ui/command-bar.ts` owns the RADAR/ROUND pills
+(`web/src/lib/cockpit.ts` derives the health pill and the KPI cards);
 `web/src/ui/rail-tabs.ts` owns the CREW/TRANSCRIPTS tabs. `ChatView`
 owns the unread math (a message counts only while no chat surface is in
 sight).
@@ -290,7 +341,14 @@ ABOVE the job bands — typed owner decisions with recorded choices,
 owner-only notices (no fake Ack) and evidence-bound ready PRs
 (OPEN PR, external https link only) —
 see [BOARD.md](./BOARD.md) for the semantics and the fail-closed
-readiness rule. Its empty state is the calm clear state (an empty owner
+readiness rule. It reads as the attention card (cockpit rework): under
+its `FOR YOU · N pending` heading, `2 things need you`, then one line about
+Gru's own queue — the live NEEDS GRU count, a muted sub-line because it
+is Gru's work, never yours (`Gru is handling 2 live alerts`, or `nothing
+needs Gru either · the crew is on it`; prefixed `last-known ·` while the
+board socket is lost or the board is unavailable — an empty FOR GRU folded
+while the socket is lost carries the same prefix, and an unavailable FOR
+GRU keeps its full card with its warning). Its empty state is the calm clear state (an empty owner
 list is healthy); its rows are keyboard-focusable and a snapshot
 re-render preserves focus (stable action ids) and never toasts or rings
 a chime.
@@ -304,8 +362,12 @@ in monospace. Band headers are **sticky separators with counts**;
 dividers are hairlines (zebra-free); failing rows (blocked/error status,
 aborted newest round, unresolved lens errors) are tinted with a left
 alert accent. Clicking anywhere on a row expands the v3 detail inline —
-a row is never a card until it is expanded. NEEDS GRU is always visible
-(an empty band shows a calm “nothing needs Gru” state); SETTLED is a
+a row is never a card until it is expanded. A band with rows sits in a
+card (cockpit rework; full-bleed when the board column is under 440px);
+every EMPTY section folds into one Empty row of pills after the cards,
+each keeping its section id and its reason (an empty FOR GRU reads
+“nothing needs Gru · the crew is on it”); a section the server does not
+send reads `—` on a dashed pill (unknown, never a zero); SETTLED is a
 rolling window — the latest 10 rows, then `+K older settled`
 (session-expanded), and a concluded job's round history renders
 quiescent (no blocker/failure pills; a “review history on the ledger”
@@ -318,7 +380,7 @@ Two section-truth rules keep the bands honest (2026-09-29):
   escalation rows keep living in the notification record as closed
   receipts (they clear through a Gru disposition, never a human Ack),
   but they no longer promote the lane, alert its row, or count into the
-  strip's live ALERTS count (the service counts live rows only); in the bell
+  attention card's live NEEDS GRU count (the service counts live rows only); in the bell
   they render under FEED, not in the live NEEDS GRU queue. A merged lane
   renders in SETTLED/COLD as a receipt.
 - **Stopped lanes wait with their reason.** A working lane whose minion
@@ -363,9 +425,14 @@ Two section-truth rules keep the bands honest (2026-09-29):
   stay visible and are sent once to the authoritative winning epoch.
   Compact success/failure and unsolicited provider outcomes are announced in
   a dedicated persistent live region that idle usage refreshes cannot erase.
-- **Board (E6/v6)** — always on the page: the global status chip rail
-  above, then attention-banded dense job rows + the CREW (n) /
-  TRANSCRIPTS rail. At ≥1100px the chat pane joins it on the left with
+- **Board (E6/v6)** — always on the page: the KPI cards above, then
+  attention-banded dense job rows (each band with rows is a card; empty
+  bands fold into one Empty row of pills) + the CREW (n) /
+  TRANSCRIPTS rail, whose rows name each worker's role in words —
+  `megaminion` for the worker of a commissioned job, `vector raid` (🦑)
+  for Vector's raid session, and a `🧬 sub-minion` marker on a #161 child
+  worker — in the row and its accessible name; each sub-minion sits
+  indented right under the minion that created it, in every band. At ≥1100px the chat pane joins it on the left with
   drag splitters; below that the board is the full page and chat
   overlays. Round rows carry their per-lens live chips (the round's own
   recorded catalog; 9 for a current full round) behind the row's
