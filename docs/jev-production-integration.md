@@ -131,7 +131,9 @@ Invalid reloads keep the product usable in deterministic degraded mode.
 
 Jev is reachable through three exchangeable provider profiles. All three are
 always present; `[decisions.providers.<name>]` overrides a built-in by
-re-declaring it (every key but `input_price_per_mtok` is required) or defines a new profile:
+re-declaring it (every key but `input_price_per_mtok` is required; an omitted
+price falls back to `0.042`, not the built-in's own value) or defines a new
+profile:
 
 | Profile | Protocol | Endpoint | Model | Credential |
 |---|---|---|---|---|
@@ -221,7 +223,7 @@ Routing rules:
   as the evidence and owner decision above (and #219 for
   `escalation_triage`). `report_conclusion` has no live host. On any
   surface, enforce still counts as acting: a transient (timeout, network
-  or provider 429/5xx) outage of the default `openrouter-jev` profile then
+  or provider-error) outage of the default `openrouter-jev` profile then
   pages you as a needs-owner incident instead of a board FYI. Use `off` or
   `shadow`. A surface
   with no `mode` key keeps the pre-#223 behavior without the gate.

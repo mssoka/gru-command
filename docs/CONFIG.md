@@ -584,12 +584,13 @@ timeout_ms = 5000 # Per-call limit; on timeout the deterministic answer is used.
 #                       node dist/decisions/cli.js backtest --surface <s> --profile <p> --cases <jsonl> --threshold <min> --save
 #                     Not usable on any surface yet (see each one below).
 #                     Setting it anywhere still makes a transient (timeout,
-#                     network or provider 429/5xx) outage of the default
+#                     network or provider-error) outage of the default
 #                     openrouter-jev profile page you instead of a board FYI.
 #   (no mode key)     Legacy, pre-#223: for event_triage and supervision_guidance
 #                     Gru Command USES Jev's answer with NO backtest gate;
 #                     escalation_triage, same_blocker and report_conclusion are never asked.
-#                     A transient outage then pages you too, as with enforce.
+#                     A mode-less event_triage or supervision_guidance also makes
+#                     a transient outage page you.
 #                     Give every surface an explicit mode unless you mean that.
 #
 # Surfaces (the complete list; any other name fails to load):
@@ -643,6 +644,7 @@ mode = "shadow"
 # model = "laya-421m"
 # credential = "none" # keyless is allowed ONLY for loopback hosts
 # timeout_ms = 5000
+# input_price_per_mtok = 0 # an omitted price falls back to 0.042, not the built-in's 0
 
 # ── Confidence thresholds (by risk class) ────────────────────────────
 # Read-only classification: mistakes are recoverable, so confidence bars are lower.

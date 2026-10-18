@@ -193,10 +193,10 @@ describe('surface mode config parsing (issue #223)', () => {
     expect(template).toContain('Not usable on any surface yet (see each one below).');
     expect(template).toContain('Give every surface an explicit mode unless you mean that.');
     expect(template).toContain('escalation_triage, same_blocker and report_conclusion are never asked.');
-    expect(template).toContain('A transient outage then pages you too, as with enforce.');
+    expect(template).toContain('A mode-less event_triage or supervision_guidance also makes');
     expect(template).toContain('# Surfaces (the complete list; any other name fails to load):');
     expect(template).toMatch(
-      /Setting it anywhere still makes a transient \(timeout,\n#\s+network or provider 429\/5xx\) outage of the default\n#\s+openrouter-jev profile page you instead of a board FYI\.\n/,
+      /Setting it anywhere still makes a transient \(timeout,\n#\s+network or provider-error\) outage of the default\n#\s+openrouter-jev profile page you instead of a board FYI\.\n/,
     );
     expect(template).toMatch(/# {3}report_conclusion [^\n]*\n#\s+backtest only: no live host yet, so enforce never asks\n/);
     for (const surface of DECISION_SURFACES) expect(template).toContain(`#   ${surface} `);

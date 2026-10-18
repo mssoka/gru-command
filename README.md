@@ -275,16 +275,18 @@ It is **off by default**. While it is off, deterministic code makes every decisi
 - **Enforcement is gated.** Moving a surface from shadow to `enforce` requires a recorded backtest that meets its threshold, and your explicit decision. It is not usable on any surface yet. See the [Jev guide](docs/jev-production-integration.md).
 - **Authority stays with you.** Jev never decides merges, review verdicts, restarts or owner-only rulings. If OpenRouter is unreachable, Gru Command falls back to deterministic behaviour.
 
-Every command below (`npm run config:generate` and each `dist/decisions/cli.js` call) reads the instance from `GRU_COMMAND_HOME` (default `~/.gru-command`). If your service uses another value, export it first. `install.sh` wrote it into the service file; run the line for your OS (it exports nothing when the file has no value):
+Every command below (`npm run config:generate` and each `dist/decisions/cli.js` call) reads the instance from `GRU_COMMAND_HOME` (default `~/.gru-command`). If your service uses another value, export it first. `install.sh` wrote it into the service file; run the block for your OS. It exports nothing when the file has no value, and prints the instance the commands will use:
 
 ```bash
 # macOS
-v="$(plutil -extract EnvironmentVariables.GRU_COMMAND_HOME raw -o - ~/Library/LaunchAgents/com.gru-command.service.plist 2>/dev/null)"; [ -n "$v" ] && export GRU_COMMAND_HOME="$v"
+v="$(plutil -extract EnvironmentVariables.GRU_COMMAND_HOME raw -o - ~/Library/LaunchAgents/com.gru-command.service.plist 2>/dev/null)"; [ -n "$v" ] && export GRU_COMMAND_HOME="$v"; unset v
+echo "instance: ${GRU_COMMAND_HOME:-$HOME/.gru-command}"
 ```
 
 ```bash
-# Linux (install.sh quotes a path containing spaces; tr drops those quotes)
-v="$(sed -n 's/^Environment=GRU_COMMAND_HOME=//p' "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/gru-command.service" 2>/dev/null | tr -d '"')"; [ -n "$v" ] && export GRU_COMMAND_HOME="$v"
+# Linux (systemd uses the last assignment; install.sh quotes a path containing spaces, tr drops those quotes)
+v="$(sed -n 's/^Environment=GRU_COMMAND_HOME=//p' "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/gru-command.service" 2>/dev/null | tail -n 1 | tr -d '"')"; [ -n "$v" ] && export GRU_COMMAND_HOME="$v"; unset v
+echo "instance: ${GRU_COMMAND_HOME:-$HOME/.gru-command}"
 ```
 
 **1. Store the key.** Use stdin only: never pass the key on the command line or put it in `config.toml`.
@@ -356,7 +358,7 @@ env -u OPENROUTER_API_KEY node dist/decisions/cli.js status --json   # credentia
 env -u OPENROUTER_API_KEY node dist/decisions/cli.js check --json    # one tiny live probe; expect "status":"ready"
 ```
 
-`install.sh` puts no key variable in the service unit, so unless you added one to the service's environment, the service uses the key file.
+`install.sh` puts no key variable in the service unit, so unless you added one to the service's environment, the service uses the key file. If the service does get `OPENROUTER_API_KEY` from its environment (check with `launchctl getenv OPENROUTER_API_KEY` on macOS or `systemctl --user show-environment` on Linux), run these commands with that value exported instead, and expect `credential_source: "environment"`.
 
 `check` only probes while `enabled = true`; while Jev is off it reports `disabled`. If it isn't `ready`, set `enabled = false` until it is. Otherwise a running service reports the provider as degraded and raises an alert.
 
