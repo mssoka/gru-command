@@ -309,5 +309,6 @@ without calling the raid API.
     break-ins whose fix card is open and unanswered in FOR YOU.
 
 An older server sends no block; a board reading it shows no raids card rather
-than zeros. A block that fails to read is logged and sent as `vector: null`
-(the board then shows no raids card); the rest of the snapshot still renders.
+than zeros. A block that fails to read is logged and sent as `vector: null`;
+the board then shows a dashed `— unavailable` raids card (unknown, never
+zeros and never hidden), and the rest of the snapshot still renders.

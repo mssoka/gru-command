@@ -139,10 +139,13 @@ function mountBoardDom(): void {
   // Mirrors web/index.html's mounts, including the FOR YOU owner band and
   // the wakes chip the BoardView constructor requires on current main.
   document.body.innerHTML = `
-    <div id="chip-rail" hidden>
+    <div id="command-health" hidden>
+      <span id="command-health-summary"></span>
+      <span id="command-health-parts"></span>
       <span id="board-decisions"></span>
       <span id="board-wakes" hidden></span>
     </div>
+    <div id="board-kpis" hidden></div>
     <nav id="board-nav" hidden></nav>
     <section id="board-owner" hidden></section>
     <div id="board-jobs"></div>
@@ -204,9 +207,10 @@ describe('board rendered regression — concluded jobs and stale review history'
       }),
     );
     expect(bandIds('needs-you')).toEqual([]);
-    // The band's calm clear copy carries current main's Gru-theme label.
-    expect(document.querySelector('.board-band--needs-you .board-band__clear-text')?.textContent).toBe(
-      'nothing needs Gru',
+    // The section's calm clear copy carries the Gru-theme label, folded
+    // into the Empty row's FOR GRU pill.
+    expect(document.querySelector('#board-section-for-gru .board-folded__reason')?.textContent).toBe(
+      'nothing needs Gru · the crew is on it',
     );
     expect(bandIds('settled')).toEqual(['lane-parity-fix']);
     expandCold();

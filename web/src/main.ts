@@ -13,7 +13,6 @@ import { IntakeClient } from './lib/intake-client.js';
 import { IntakeView } from './ui/intake.js';
 import { WS_PATH, type LoggedFrame } from './lib/protocol.js';
 import { BoardClient } from './lib/board-client.js';
-import { consoleModeForWidth } from './lib/console-layout.js';
 import { applyTheme, getTheme, setTheme } from './theme.js';
 import { clearBanner, showBanner } from './ui/banner.js';
 import { ChatView, renderConnectionDot } from './ui/chat.js';
@@ -127,29 +126,26 @@ function failPairing(message: string): void {
 }
 
 // ---------------------------------------------------------------------
-// Command bar + cockpit chrome (board UX v6): the ticker segments, the
+// Command bar + cockpit chrome (cockpit rework): the RADAR/ROUND pills, the
 // measured chrome height (sticky offsets), and the drag splitters.
 // ---------------------------------------------------------------------
 
 const commandBar = new CommandBar();
 renderChatOnline('idle');
 
-/** Feed the sticky offsets their real height: the command bar + chip rail
- * (CSS carries a 100px fallback for the pre-measure first paint). */
+/** Feed the sticky offsets their real height: the command bar is the only
+ * sticky chrome (CSS carries a 100px fallback for the pre-measure first
+ * paint). The bar wraps by fit — a health pill disclosed or grown, a chip
+ * wrapping, page zoom — so the bar's own size drives the re-measure, not
+ * only window resizes. */
 function measureChrome(): void {
-  const barHeight = document.getElementById('command-bar')?.offsetHeight ?? 0;
-  const rail = document.getElementById('chip-rail');
-  // A static (phone) strip scrolls away with the page, so it contributes
-  // no sticky offset.
-  const railHeight =
-    rail === null || rail.hidden || getComputedStyle(rail).position !== 'sticky' ? 0 : rail.offsetHeight;
-  const total = barHeight + railHeight;
-  if (total > 0) {
-    document.documentElement.style.setProperty('--chrome-h', `${total}px`);
-    document.documentElement.style.setProperty('--command-bar-h', `${barHeight}px`);
+  const barHeight = mustGet('command-bar').offsetHeight;
+  if (barHeight > 0) {
+    document.documentElement.style.setProperty('--chrome-h', `${barHeight}px`);
   }
 }
 measureChrome();
+if (typeof ResizeObserver !== 'undefined') new ResizeObserver(measureChrome).observe(mustGet('command-bar'));
 
 const splitterController = new SplitterController({
   root: mustGet('console'),
@@ -161,11 +157,9 @@ const splitterController = new SplitterController({
 // The agents rail's CREW / TRANSCRIPTS tabs (v6).
 new RailTabs(mustGet('agents-rail'));
 
-/** Keep the ticker's layout segment and the splitter bounds in step with
- * the viewport (the shell's matchMedia owns the FAB contract; both read
- * the same console-layout thresholds). */
+/** Keep the splitter bounds and the sticky offsets in step with the
+ * viewport (the shell's matchMedia owns the FAB contract). */
 function syncCockpit(): void {
-  commandBar.setLayout(consoleModeForWidth(window.innerWidth));
   splitterController.sync();
   measureChrome();
 }
@@ -212,7 +206,8 @@ function showPairing(): void {
 }
 
 function onConnection(state: ConnectionState): void {
-  renderConnectionDot(state);
+  // The chat socket's state is the chat pane's badge; RADAR's dot belongs
+  // to the board socket (its word reads the board state beside it).
   renderChatOnline(state);
   // `open` is emitted at auth_ok, just before the required fresh context
   // snapshot. Keep stale controls disabled until that snapshot arrives.
@@ -344,6 +339,9 @@ function startBoard(token: string): void {
     storage, // card disclosure persists per job (safeStorage-wrapped localStorage)
   );
   boardClient?.stop();
+  // The stop above reports `offline` while the old client is still current:
+  // the command bar starts this pairing's RADAR fresh.
+  commandBar.reset();
   // Every callback checks it still belongs to the CURRENT board client:
   // work an older pairing started (a fetch, a late 401) never touches this
   // session.
@@ -357,6 +355,7 @@ function startBoard(token: string): void {
         // as "open" while the board was frozen. Last-known actions and
         // visibility receipts stay read-only until a fresh snapshot arrives.
         renderConnectionDot(state);
+        boardView?.setSocketState(state);
         if (state === 'stale' || state === 'reconnecting' || state === 'offline') {
           boardView?.markSnapshotStale();
         }
@@ -373,9 +372,6 @@ function startBoard(token: string): void {
         boardView?.render(snapshot, source);
         chatView?.setManagedRepositoryNames(snapshot.repoOverview?.rows.map(({ key }) => key) ?? []);
         commandBar.setSnapshot(snapshot);
-        // The first snapshot discloses the chip rail — the chrome just
-        // grew, so the sticky offsets re-measure.
-        measureChrome();
         decisionStatusCard.render(snapshot.decisions);
         // State joins the signature: a live agent turning disposed must
         // re-list transcripts so the collapsed rows move behind the toggle.
