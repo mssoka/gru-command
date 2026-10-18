@@ -583,18 +583,19 @@ timeout_ms = 5000 # Per-call limit; on timeout the deterministic answer is used.
 #                       node dist/decisions/cli.js extract-cases --surface <s> --out <jsonl>
 #                       node dist/decisions/cli.js backtest --surface <s> --profile <p> --cases <jsonl> --threshold <min> --save
 #                     Not usable on any surface yet (see each one below).
-#                     Setting it anywhere still makes an outage of the default
-#                     openrouter-jev profile page you instead of a board FYI.
+#                     Setting it anywhere still makes a transient (timeout or
+#                     network) outage of the default openrouter-jev profile
+#                     page you instead of posting a board FYI.
 #   (no mode key)     Legacy, pre-#223: for event_triage and supervision_guidance
 #                     Gru Command USES Jev's answer with NO backtest gate;
-#                     escalation_triage and same_blocker are never asked.
+#                     escalation_triage, same_blocker and report_conclusion are never asked.
 #                     Give every surface an explicit mode unless you mean that.
 #
 # Surfaces (the complete list; any other name fails to load):
 #   event_triage          does an orchestration event need attention? (may only raise attention, never lower it)
-#                         off or shadow today: it has no registered backtest
+#                         off or shadow today: no registered backtest, so enforce fails and pages you
 #   supervision_guidance  classifies a runtime failure: restart vs escalate (restart counters stay deterministic)
-#                         off or shadow today: it has no registered backtest
+#                         off or shadow today: no registered backtest, so enforce fails and pages you
 #   escalation_triage     is a Silas escalation a ruling or a status report?
 #                         off or shadow today: it asks Jev only in shadow, so enforce never asks
 #   same_blocker          is this review blocker the same defect as last round?

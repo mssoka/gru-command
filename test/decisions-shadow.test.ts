@@ -192,12 +192,17 @@ describe('surface mode config parsing (issue #223)', () => {
     // live surface says why, and a missing mode is spelled out for all four.
     expect(template).toContain('Not usable on any surface yet (see each one below).');
     expect(template).toContain('Give every surface an explicit mode unless you mean that.');
-    expect(template).toContain('escalation_triage and same_blocker are never asked.');
+    expect(template).toContain('escalation_triage, same_blocker and report_conclusion are never asked.');
     expect(template).toContain('# Surfaces (the complete list; any other name fails to load):');
-    expect(template).toContain('Setting it anywhere still makes an outage of the default');
+    expect(template).toMatch(
+      /Setting it anywhere still makes a transient \(timeout or\n#\s+network\) outage of the default openrouter-jev profile\n#\s+page you instead of posting a board FYI\.\n/,
+    );
+    expect(template).toMatch(/# {3}report_conclusion [^\n]*\n#\s+backtest only: no live host yet, so enforce never asks\n/);
     for (const surface of DECISION_SURFACES) expect(template).toContain(`#   ${surface} `);
     for (const surface of ['event_triage', 'supervision_guidance']) {
-      expect(template).toMatch(new RegExp(`#   ${surface} [^\\n]*\\n#\\s+off or shadow today: it has no registered backtest\\n`));
+      expect(template).toMatch(
+        new RegExp(`#   ${surface} [^\\n]*\\n#\\s+off or shadow today: no registered backtest, so enforce fails and pages you\\n`),
+      );
     }
     for (const surface of ['escalation_triage', 'same_blocker']) {
       expect(template).toMatch(
@@ -536,6 +541,7 @@ describe('shadow misses are evidence, not incidents (2026-10-06 owner page)', ()
       await runtime.decide(eventRequest(), { surface: 'event_triage' });
     }
     expect(runtime.status()).toMatchObject({ status: 'degraded', reason: 'timeout' });
+    expect(postIncident).toHaveBeenCalledTimes(1);
     expect(postIncident.mock.calls[0]![0]).toMatchObject({ kind: 'decisions.degraded.timeout', routing: 'needs-owner' });
     runtime.dispose();
   });

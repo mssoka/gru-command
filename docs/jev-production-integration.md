@@ -92,9 +92,10 @@ because a table defined twice fails to load.
 A config generated before the fragment shipped has no decisions block, or
 only the tables an operator added by hand. Bring it up to date before
 turning Jev on, from the install directory and with the same
-`GRU_COMMAND_HOME` the service uses (default `~/.gru-command`; the README
-shows how to read it from the launchd plist or systemd unit `install.sh`
-wrote, and a service you start yourself uses whatever you set there).
+`GRU_COMMAND_HOME` the service uses (default `~/.gru-command`; the
+[README](../README.md#optional-jev-decisions-openrouter-key) shows how to
+read it from the launchd plist or systemd unit `install.sh` wrote, and a
+service you start yourself uses whatever you set there).
 Every `dist/decisions/cli.js` command reads the same variable. The
 regenerate prints the path it wrote:
 
@@ -109,7 +110,9 @@ surfaces gains the four shadow surfaces. One that has Jev on or names
 surfaces keeps exactly its own surface entries, so give every kept surface
 `mode = "shadow"` and add the missing ones yourself, before turning Jev on
 (right away if it is already on): an unlisted or mode-less `event_triage`
-or `supervision_guidance` acts on Jev's answer with no backtest gate.
+or `supervision_guidance` acts on Jev's answer with no backtest gate. With
+Jev on and no surface listed, setting `enabled = false` (it hot-reloads)
+and then regenerating adds the four shadow surfaces for you.
 
 `node dist/decisions/cli.js config-template` prints the same fragment, for
 reading or for copying into a config that has no decisions tables at all.
@@ -153,8 +156,8 @@ Example — route one surface through TypeSafe directly. Store the TypeSafe
 key first (see [Credentials](#credentials)), then probe it with
 the CLI once `enabled = true`. A `TYPESAFE_API_KEY` variable outranks the
 stored key file, and the CLI reads your shell's environment, not the
-service's. When the service relies on the file, probe without the
-variable:
+service's. A service installed by `install.sh` sets no key variables and
+reads only the files, so probe without the variable:
 
 ```sh
 env -u TYPESAFE_API_KEY node dist/decisions/cli.js check --profile typesafe-direct --json
@@ -166,8 +169,8 @@ waiting for an alert: a bad key on a non-default profile never raises an
 owner incident. With Jev on, the default `openrouter-jev` profile is
 always probed whatever the routing: without its key it degrades with
 `credential_missing` and pages you. Store that key too, or re-declare
-`[decisions.providers.openrouter-jev]` (every key required) to point it
-elsewhere.
+`[decisions.providers.openrouter-jev]` (every key but `input_price_per_mtok`
+required) to point it elsewhere.
 
 The built-in `typesafe-direct` profile needs no table of its own; change
 only the `provider` line in the surface's existing table:
@@ -192,10 +195,9 @@ Routing rules:
   known surfaces (`event_triage`, `supervision_guidance`,
   `escalation_triage`, `same_blocker`, `report_conclusion`) load; any other
   name fails, so a typo cannot leave the real surface unconfigured.
-  Unlisted surfaces
-  (and omitted surface arguments) ride the default `openrouter-jev`
-  profile — pre-profile behavior, unchanged. The deterministic fallback
-  never changes and stays the floor.
+  Unlisted surfaces (and omitted surface arguments) ride the default
+  `openrouter-jev` profile — pre-profile behavior, unchanged. The
+  deterministic fallback never changes and stays the floor.
 - **Per-surface mode (issue #223).** The explicit table form also accepts
   `mode = "off" | "shadow" | "enforce"`. `off` serves the deterministic
   answer and never calls the provider. `shadow` asks the provider and
@@ -211,14 +213,14 @@ Routing rules:
   backtests (`escalation_triage`, `same_blocker`, `report_conclusion`) can
   pass the gate, and no surface can use `enforce` today. `event_triage` and
   `supervision_guidance` have no registered backtest, so enforce fails every
-  request with that error. The `escalation_triage` and `same_blocker` hosts
-  ask Jev only in `shadow`, so enforce there never asks or records
-  anything. On any surface, enforce still counts as acting: an outage of
-  the default `openrouter-jev` profile then pages you as a needs-owner
-  incident instead of a board FYI. Enforcing them needs host changes as
-  well as the
-  evidence and owner decision above (and #219 for `escalation_triage`);
-  `report_conclusion` has no live host. Use `off` or `shadow`. A surface
+  request with that error and pages you. The `escalation_triage` and
+  `same_blocker` hosts ask Jev only in `shadow`, so enforce there never
+  asks or records anything; enforcing those two needs host changes as well
+  as the evidence and owner decision above (and #219 for
+  `escalation_triage`). `report_conclusion` has no live host. On any
+  surface, enforce still counts as acting: a transient (timeout or network)
+  outage of the default `openrouter-jev` profile then pages you as a
+  needs-owner incident instead of a board FYI. Use `off` or `shadow`. A surface
   with no `mode` key keeps the pre-#223 behavior without the gate.
 - **Earning enforce.** Extract labelled history to JSONL
   (`{ id, state, label }`), run the harness against any profile, and save

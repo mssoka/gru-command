@@ -275,7 +275,14 @@ It is **off by default**. While it is off, deterministic code makes every decisi
 - **Enforcement is gated.** Moving a surface from shadow to `enforce` requires a recorded backtest that meets its threshold, and your explicit decision. It is not usable on any surface yet. See the [Jev guide](docs/jev-production-integration.md).
 - **Authority stays with you.** Jev never decides merges, review verdicts, restarts or owner-only rulings. If OpenRouter is unreachable, Gru Command falls back to deterministic behaviour.
 
-Every command below (`npm run config:generate` and each `dist/decisions/cli.js` call) reads the instance from `GRU_COMMAND_HOME` (default `~/.gru-command`). If your service uses another value, export it first. `install.sh` wrote it into the service file; read it with `plutil -extract EnvironmentVariables.GRU_COMMAND_HOME raw -o - ~/Library/LaunchAgents/com.gru-command.service.plist` (macOS) or `grep '^Environment=GRU_COMMAND_HOME=' "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/gru-command.service"` (Linux).
+Every command below (`npm run config:generate` and each `dist/decisions/cli.js` call) reads the instance from `GRU_COMMAND_HOME` (default `~/.gru-command`). If your service uses another value, export it first. `install.sh` wrote it into the service file:
+
+```bash
+# macOS
+export GRU_COMMAND_HOME="$(plutil -extract EnvironmentVariables.GRU_COMMAND_HOME raw -o - ~/Library/LaunchAgents/com.gru-command.service.plist)"
+# Linux (install.sh quotes a path containing spaces; drop those quotes)
+export GRU_COMMAND_HOME="$(sed -n 's/^Environment=GRU_COMMAND_HOME=//p' "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/gru-command.service" | tr -d '"')"
+```
 
 **1. Store the key.** Use stdin only: never pass the key on the command line or put it in `config.toml`.
 
@@ -303,14 +310,14 @@ This writes `~/.gru-command/credentials/openrouter.key` (or under `$GRU_COMMAND_
 |---|---|
 | `off` | Deterministic only; Jev is never asked |
 | `shadow` | Asks Jev and records its answer, but always uses the deterministic answer. **Start here.** |
-| `enforce` | Uses Jev's answer, with deterministic fallback. It refuses to run until a recorded backtest meets its threshold. Not usable on any surface yet, and setting it still makes a default-profile outage page you. |
+| `enforce` | Uses Jev's answer, with deterministic fallback. It refuses to run until a recorded backtest meets its threshold. Not usable on any surface yet: on `event_triage` and `supervision_guidance` it fails every request and pages you, elsewhere it never asks, and anywhere it makes a transient default-profile outage page you. |
 | *(no mode key)* | Legacy behaviour. `event_triage` and `supervision_guidance` use Jev's answer with **no** backtest gate; `escalation_triage` and `same_blocker` never ask Jev. Avoid it by giving every surface an explicit mode. |
 
 **2. Enable Jev in shadow mode.** The service hot-reloads this section, so no restart is needed. Give every surface an explicit `mode = "shadow"`: an unlisted or mode-less `event_triage` or `supervision_guidance` would act on Jev's answer instead of only recording it.
 
 - **Fresh install:** your `config.toml` already contains the Jev block, switched off, with every surface in shadow. Set `enabled = true` in its `[decisions.jev]` table. Edit in place; a pasted second copy of a table fails to load.
 - **Older config, Jev off, no surface listed:** run `npm run config:generate -- --force` from the install directory first, then set `enabled = true`. It backs the old file up and keeps your values, but drops hand-written comments; the [Jev guide](docs/jev-production-integration.md#configuration) has the details.
-- **Older config with Jev on, or with any surface listed:** a regenerate keeps exactly those surface entries (none, if none are listed), so edit by hand: set `mode = "shadow"` in each existing surface table, turn a shorthand `event_triage = "<profile>"` key into a table that keeps `provider = "<profile>"`, then add only the missing tables. Do it before turning Jev on, or right away if it is already on.
+- **Older config with Jev on, or with any surface listed:** a regenerate keeps exactly those surface entries (none, if none are listed). With Jev on and no surface listed, the quickest fix is to set `enabled = false` (hot-reloads), regenerate, then turn it back on. Otherwise edit by hand: set `mode = "shadow"` in each existing surface table, turn a shorthand `event_triage = "<profile>"` key into a table that keeps `provider = "<profile>"`, then add only the missing tables. Do it before turning Jev on, or right away if it is already on.
 
 The Jev and surface tables should read as follows (any provider and threshold tables after them stay as they are):
 
@@ -344,6 +351,8 @@ mode = "shadow"
 node dist/decisions/cli.js status --json   # credential_present: true, credential_source: "file"
 node dist/decisions/cli.js check --json    # one tiny live probe; expect "status":"ready"
 ```
+
+A service installed by `install.sh` reads only the key file. An `OPENROUTER_API_KEY` exported in your shell outranks that file for these commands, so run them as `env -u OPENROUTER_API_KEY node dist/decisions/cli.js …` to see what the service sees.
 
 `check` only probes while `enabled = true`; while Jev is off it reports `disabled`. If it isn't `ready`, set `enabled = false` until it is. Otherwise a running service reports the provider as degraded and raises an alert.
 
