@@ -6,7 +6,7 @@ import type { AgentSpawner } from '../service.js';
 import type { AgentHandle, NativeAgentTool, PromptOptions } from '../../runtime/types.js';
 import type { PacingGate, PacingLease, PacingEventRecorder, RateLimitBackoffPolicy } from '../../runtime/pacing.js';
 import { withRateLimitRetries, type RateLimitRetryOptions } from '../../runtime/rate-limit-retry.js';
-import { assertFrozenPromptBounds, compatibleReviewIdentity, frozenTreeSymlinks, materializeReviewView, repositoryGitEnv, proveRecoveredBaseMergeability, publishedReportMatches, readReviewArtifact, readReviewCheckpoint, sourceMovementSinceFreeze, SPECIALIST_CHECKPOINT_MAX_BYTES, writeReviewArtifact, type FrozenReview, type SourceMovement, type SourceMovementOptions } from './artifacts.js';
+import { assertFrozenPromptBounds, compatibleReviewIdentity, withReviewTree, repositoryGitEnv, proveRecoveredBaseMergeability, publishedReportMatches, readReviewArtifact, readReviewCheckpoint, sourceMovementSinceFreeze, SPECIALIST_CHECKPOINT_MAX_BYTES, writeReviewArtifact, type FrozenReview, type SourceMovement, type SourceMovementOptions } from './artifacts.js';
 import { applyConvergenceDeferral, classifyPriorFindings, convergedVerdict, deltaSince, integrationSince, parsePriorConvergenceMeta, probeIntegrationLineage, type DeltaSince, type PriorCarryClassification } from './convergence.js';
 import { MAX_PROPERTY_PROPOSALS_PER_ROUND, MAX_PROPERTY_PROPOSALS_PER_SUBMISSION, parsePropertyContractsSubmission, PROPERTY_CONTRACTS_INPUT_SCHEMA, PROPERTY_CONTRACTS_TOOL_NAME, recordPropertyProposals, renderPropertyContractsGuidance } from './property-contracts.js';
 import { propertyCampaignRunningForReview, propertyEvidenceForReview, renderPropertyCampaignEvidence } from '../../property/pipeline.js';
@@ -576,13 +576,10 @@ const GIT_PROOF_TIMEOUT_MS = 30_000;
  * safe for the whole round. */
 const blobCache = new WeakMap<FrozenReview, Map<string, string | null>>();
 
-/** Where reviewers read the frozen tree: the checkout itself, or — when the
- * target tracks symlinks — a private view in which each link is a regular file
- * holding its link text, so no read path can follow it. */
-const reviewTreeRoots = new WeakMap<FrozenReview, string>();
-
+/** Where reviewers read the frozen tree: the checkout, or the link-text view
+ * withReviewTree supplies when the target tracks symlinks. */
 function reviewTreeRoot(review: FrozenReview): string {
-  return reviewTreeRoots.get(review) ?? review.manifest.repoPath;
+  return review.readTreeRoot ?? review.manifest.repoPath;
 }
 
 function frozenBlob(review: FrozenReview, path: string): string | null {
@@ -1168,18 +1165,7 @@ export class PerkinsWholeReview {
   async run(input: RunWholeReviewInput): Promise<PerkinsWholeResult> {
     const review = input.frozenReview;
     assertFrozenPromptBounds(review);
-    // Re-derived from the frozen target (also refuses a link that escapes the
-    // repository), so a recovered round gets the same view as a fresh one.
-    const view = frozenTreeSymlinks(review.manifest.repoPath, review.manifest.targetSha).length === 0
-      ? null
-      : materializeReviewView(review.manifest.repoPath, review.manifest.targetSha);
-    if (view !== null) reviewTreeRoots.set(review, view.directory);
-    try {
-      return await this.runFrozen(input);
-    } finally {
-      reviewTreeRoots.delete(review);
-      view?.dispose();
-    }
+    return withReviewTree(review, (readable) => this.runFrozen({ ...input, frozenReview: readable }), input.signal);
   }
 
   private async runFrozen(input: RunWholeReviewInput): Promise<PerkinsWholeResult> {
