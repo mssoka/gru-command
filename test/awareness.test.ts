@@ -2360,9 +2360,52 @@ describe('GH-305 mailbox reconciliation through existing awareness gates', () =>
       awareness.commit(injection, 'wake');
       awareness.noteWakeOutcome(true, undefined, injection);
     };
-    return { dir, api, mailbox, awareness, delivered, receive, turns: () => turns,
+    return { dir, bus, api, mailbox, awareness, delivered, receive, turns: () => turns,
       close: () => { awareness.dispose(); db.close(); } };
   }
+
+  it('a red default branch wakes; the repository hold is a restriction on a later red head, which still wakes (#446)', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-18T12:00:00Z'));
+    const rig = mailboxRig();
+    try {
+      const watch = new DefaultBranchCiWatch({ ledger: rig.api, notifications: new NotificationCenter({ ledger: rig.api, bus: rig.bus }) });
+      const repo = { host: 'github.com', owner: 'acme', repo: 'alpha' };
+      const red = (id: number, headSha: string): RepoOverviewRunRaw => ({
+        id, name: 'CI', status: 'completed', conclusion: 'failure', url: null, runNumber: id,
+        createdAt: `2026-10-18T10:${String(id).padStart(2, '0')}:00.000Z`, startedAt: null, updatedAt: null,
+        workflowId: 7, headSha, event: 'push', headRepository: 'acme/alpha',
+      });
+      const subject = 'incident:github.default-branch-ci-failed:acme/alpha';
+      const itemFor = (sha: string) => rig.mailbox.snapshot().items
+        .find((item) => item.subject === subject && item.reasons.some((reason) => reason.label.endsWith(`:7:${sha}`)));
+      rig.awareness.setWakeSink(rig.receive);
+
+      watch.observe({ repo, branch: 'develop', runs: [red(9, '3684087c00000000000000000000000000000002')] });
+      vi.advanceTimersByTime(1000);
+      expect(rig.turns()).toBe(1);
+      expect(itemFor('3684087c00000000000000000000000000000002')).toMatchObject({ kind: 'incident', restrictions: [] });
+
+      // Gru opens the fix heist and holds the repository subject.
+      rig.api.recordDecision({
+        subject, decision: 'hold', covers: ['ci-failed'], basisFingerprint: null,
+        reason: 'fix heist j-fix in flight', by: 'gru', clientKey: 'hold-alpha-develop',
+      });
+      vi.advanceTimersByTime(1000);
+      expect(rig.turns()).toBe(1);
+
+      // A later red head is a new item: it carries the hold as a restriction and still wakes once.
+      watch.observe({ repo, branch: 'develop', runs: [red(11, '3684087c00000000000000000000000000000003')] });
+      vi.advanceTimersByTime(1000);
+      expect(rig.turns()).toBe(2);
+      const later = itemFor('3684087c00000000000000000000000000000003');
+      expect(later?.restrictions).toEqual(['gru: fix heist j-fix in flight']);
+      expect(later?.receipt).toMatchObject({ source: 'wake', basis: later?.basis });
+      expect(rig.delivered).toHaveLength(2);
+      vi.advanceTimersByTime(5000);
+      expect(rig.turns()).toBe(2);
+    } finally { rig.close(); vi.useRealTimers(); }
+  });
 
   it('recovers startup backlog larger than a page fairly and delivery never resolves jobs', () => {
     vi.useFakeTimers();
@@ -3281,19 +3324,26 @@ describe('red default branch alerts (#446)', () => {
   const failedRun = (id: number, workflowId: number, headSha: string): RepoOverviewRunRaw => ({
     id, name: 'CI', status: 'completed', conclusion: 'failure', url: null, runNumber: id,
     createdAt: `2026-10-18T10:${String(id).padStart(2, '0')}:00.000Z`, startedAt: null, updatedAt: null, workflowId, headSha,
+    event: 'push', headRepository: null,
   });
 
-  it('the wake instruction names the repository subject and the head-sha basis', () => {
-    expect(AWARENESS_WAKE_INSTRUCTION).toContain(
-      'a red default branch (github.default-branch-ci-failed:<owner>/<repo>:<workflow>:<sha>) has no lane, so its subject is ' +
-        '"incident:github.default-branch-ci-failed:<owner>/<repo>" with the head SHA as basis_fingerprint',
+  it('the wake instruction names the repository subject as a restriction, never a deferral', () => {
+    const instruction = AWARENESS_WAKE_INSTRUCTION;
+    expect(instruction).toContain(
+      'A red default branch (github.default-branch-ci-failed:<owner>/<repo>:<workflow id>:<sha>) has no lane: open a fix ' +
+        'heist from the current head, hold "incident:github.default-branch-ci-failed:<owner>/<repo>" (covers "ci-failed") ' +
+        'so later red heads of that repository carry the in-flight fix as a restriction, and disposition each item as ' +
+        'waiting on the fix job; a later red head is a new item and wakes once.',
     );
+    expect(instruction).toContain('It resolves itself when a newer run of that workflow passes or the failing run is re-run green.');
   });
 
-  it('a red workflow wakes Gru; one repository hold defers every workflow at the held head; a new head or another repository wakes', () => {
+  // Production always wires the mailbox, which owns admission (see the
+  // GH-305 mailbox scenario above); this pins the mailbox-less coverage path.
+  it('without a mailbox: a red workflow wakes Gru; one repository hold defers every workflow at the held head; a new head or another repository wakes', () => {
     vi.useFakeTimers();
     try {
-      vi.setSystemTime(new Date('2026-10-18T12:00:00'));
+      vi.setSystemTime(new Date('2026-10-18T12:00:00Z'));
       const rig = boot({ wakeMode: 'action-required' });
       const watch = new DefaultBranchCiWatch({ ledger: rig.api, notifications: rig.notifications });
       watch.observe({ repo: ALPHA, branch: 'develop', runs: [failedRun(9, 7, HELD)] });

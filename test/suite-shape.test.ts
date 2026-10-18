@@ -189,7 +189,7 @@ const PINS: Record<string, number> = {
   'artifact-context.test.ts': 34,
   'attachments.test.ts': 28,
 
-  'awareness.test.ts': 139,
+  'awareness.test.ts': 140,
   'awareness-adversarial.test.ts': 2,
 
 
@@ -229,7 +229,7 @@ const PINS: Record<string, number> = {
   'decisions-service-integration.test.ts': 2,
   'decisions-shadow.test.ts': 29,
   'decisions.test.ts': 96,
-  'default-branch-ci.test.ts': 21,
+  'default-branch-ci.test.ts': 30,
   'deploy-drift.test.ts': 10,
   'dispatch-e2e.test.ts': 6,
   'dispatch-joins.test.ts': 2,

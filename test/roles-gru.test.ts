@@ -59,12 +59,18 @@ describe('gru role definition', () => {
     expect(gru).toContain('holds only the step it gates');
   });
 
-  it('the chief owns a red default branch: diagnose, fix heist from the current head, hold the repository subject (#446)', () => {
+  it('the chief owns a red default branch: fix heist from the current head, the repository hold is a restriction (#446)', () => {
     const gru = ROLE_DEFINITIONS.gru.systemPrompt.replace(/\s+/gu, ' ');
-    expect(gru).toContain('No lane owns a red default branch');
-    expect(gru).toContain('diagnose the failing run, open a fix heist from the current head');
-    expect(gru).toContain('hold `incident:github.default-branch-ci-failed:<owner>/<repo>` (covers `ci-failed`, basis the head SHA) while the fix is in flight');
-    expect(gru).toContain('The alert resolves itself when a newer run of that workflow passes.');
+    expect(gru).toContain('No lane owns a red default branch (`github.default-branch-ci-failed:<owner>/<repo>:<workflow id>:<sha>`)');
+    expect(gru).toContain('diagnose the failing run and open a fix heist from the current head');
+    expect(gru).toContain(
+      'Hold `incident:github.default-branch-ci-failed:<owner>/<repo>` (covers `ci-failed`) so later red heads of that ' +
+        'repository carry the in-flight fix as a restriction, and disposition each item as waiting on the fix job; ' +
+        'a later red head is a new item and wakes you once.',
+    );
+    expect(gru).toContain('The alert resolves itself when a newer run of that workflow passes or the failing run is re-run green.');
+    // A hold never claims to defer the wake.
+    expect(gru).not.toContain('while the fix is in flight');
   });
 
   it('the role config maps the permission set (tools + workspace cwd)', () => {

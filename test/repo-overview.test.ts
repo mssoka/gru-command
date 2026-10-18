@@ -64,6 +64,8 @@ function rawRun(over: Partial<RepoOverviewRunRaw> = {}): RepoOverviewRunRaw {
     updatedAt: '2026-10-07T10:05:00.000Z',
     workflowId: 101,
     headSha: '3684087c0000000000000000000000000000beef',
+    event: 'push',
+    headRepository: 'acme/alpha',
     ...over,
   };
 }
@@ -805,6 +807,8 @@ describe('managed repo overview — gh adapter', () => {
               updated_at: '2026-10-07T10:05:00Z',
               workflow_id: 7001,
               head_sha: '3684087cabcdef0123456789abcdef0123456789',
+              event: 'push',
+              head_repository: { full_name: 'acme/alpha' },
             },
           ],
         }),
@@ -831,6 +835,8 @@ describe('managed repo overview — gh adapter', () => {
           updatedAt: '2026-10-07T10:05:00Z',
           workflowId: 7001,
           headSha: '3684087cabcdef0123456789abcdef0123456789',
+          event: 'push',
+          headRepository: 'acme/alpha',
         },
       ],
     });
@@ -2396,15 +2402,18 @@ describe('managed repo overview tracker — default-branch CI hook (#446)', () =
     expect(isValidSnapshot(validBoardSnapshot(h.tracker.view()))).toBe(true);
   });
 
-  it('maps workflow_id and head_sha, dropping a malformed value to null', async () => {
+  it('maps workflow_id, head_sha (lowercased), event and head repository, dropping a malformed value to null', async () => {
     const adapter = new GhRepoOverviewApi(
       ghRunner([
         ok(
           JSON.stringify({
             workflow_runs: [
-              { id: 1, status: 'completed', conclusion: 'failure', workflow_id: 55, head_sha: '3684087C' },
-              { id: 2, status: 'completed', conclusion: 'failure', workflow_id: -1, head_sha: 'abc:def0' },
-              { id: 3, status: 'completed', conclusion: 'failure', workflow_id: '55', head_sha: 'not-a-sha' },
+              {
+                id: 1, status: 'completed', conclusion: 'failure', workflow_id: 55, head_sha: '3684087C',
+                event: 'pull_request', head_repository: { full_name: 'fork/alpha' },
+              },
+              { id: 2, status: 'completed', conclusion: 'failure', workflow_id: -1, head_sha: 'abc:def0', event: 7, head_repository: 'acme/alpha' },
+              { id: 3, status: 'completed', conclusion: 'failure', workflow_id: '55', head_sha: 'not-a-sha', head_repository: null },
               { id: 4, status: 'completed', conclusion: 'failure' },
             ],
           }),
@@ -2413,11 +2422,11 @@ describe('managed repo overview tracker — default-branch CI hook (#446)', () =
     );
     const result = await adapter.latestRuns({ repo: githubRef('alpha'), branch: 'main', limit: 20 });
     if (result.kind !== 'ok') throw new Error('expected ok');
-    expect(result.value.map((entry) => [entry.workflowId, entry.headSha])).toEqual([
-      [55, '3684087C'],
-      [null, null],
-      [null, null],
-      [null, null],
+    expect(result.value.map((entry) => [entry.workflowId, entry.headSha, entry.event, entry.headRepository])).toEqual([
+      [55, '3684087c', 'pull_request', 'fork/alpha'],
+      [null, null, null, null],
+      [null, null, null, null],
+      [null, null, null, null],
     ]);
   });
 });

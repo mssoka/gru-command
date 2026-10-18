@@ -252,17 +252,21 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   and the same page feeds an alert that is always on for every
   `managed_repos` entry (no config key, no extra GitHub call). Per
   `workflow_id`, the verdict is the newest decisive run by (created, id) —
-  passed, failed, timed-out or startup-failure; queued, running,
-  cancelled, skipped, neutral, action-required and stale runs never mask
-  it, alert or resolve. A workflow turning red posts one `action-required`
+  passed, failed, timed-out or startup-failure; queued, waiting, running,
+  cancelled, skipped, neutral, action-required, stale and unrecognized
+  (`unknown`) runs never mask it, alert or resolve, and `pull_request` /
+  `pull_request_target` or fork runs that merely share the branch name
+  never count. A workflow turning red posts one `action-required`
   incident per repo + workflow + head sha
-  (`github.default-branch-ci-failed:<owner>/<repo>:<workflowId>:<sha>`,
+  (`github.default-branch-ci-failed:<owner>/<repo>:<workflow id>:<sha>`,
   severity error) that wakes Gru whatever the check is named — never the
-  owner bell, never a Silas digest row. A newer passing run of that
-  workflow, or the failing run re-run green, resolves its open incidents.
-  Changes are recorded as `repo.default-branch-ci` events and deduped
-  against the latest one, so a restart never re-raises. A watcher error is
-  logged at error level and never degrades the row or the pass.
+  owner bell, never a Silas digest row — and resolves that workflow's row
+  for the previous red head. A newer passing run of that workflow, or the
+  failing run re-run green, resolves its open incidents (even with no
+  recorded cursor). Changes are recorded as `repo.default-branch-ci`
+  events and deduped against the latest one, so a restart never
+  re-raises. A watcher error is logged at error level and never degrades
+  the row or the pass.
 - **Notification center (E7; routing split 2026-09-23; owner-attention
   registry 2026-10-11; section truth 2026-09-29):** the bell panel
   renders the durable notification log in three bands — FOR YOU (pending

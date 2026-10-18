@@ -7,9 +7,9 @@ import { EventBus } from '../src/events/bus.js';
 import { LedgerApi, type NotificationRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
+import { DEFAULT_BRANCH_CI_FAILED_KIND } from '../src/chat/incident.js';
 import {
   DEFAULT_BRANCH_CI_EVENT,
-  DEFAULT_BRANCH_CI_FAILED_KIND,
   DefaultBranchCiWatch,
   defaultBranchCiFailedKind,
   defaultBranchVerdicts,
@@ -26,6 +26,7 @@ const ALPHA: RepoRef = { host: 'github.com', owner: 'acme', repo: 'alpha' };
 const ALPHA_TWO: RepoRef = { host: 'github.com', owner: 'acme', repo: 'alpha-two' };
 const W = 7;
 const X = 71;
+const S1 = '3684087c00000000000000000000000000000001';
 const S2 = '3684087c00000000000000000000000000000002';
 const S3 = '3684087c00000000000000000000000000000003';
 
@@ -43,6 +44,9 @@ function run(id: number, over: Partial<RepoOverviewRunRaw> = {}): RepoOverviewRu
     updatedAt: null,
     workflowId: W,
     headSha: S2,
+    event: 'push',
+    // The observed repository's own runs; null is "the provider omitted it".
+    headRepository: null,
     ...over,
   };
 }
@@ -55,13 +59,16 @@ interface Rig {
   readonly dir: string;
   db: LedgerDb;
   ledger: LedgerApi;
+  notifications: NotificationCenter;
   watch: DefaultBranchCiWatch;
   readonly woke: NotificationRecord[];
-  readonly logs: { level: string; msg: string }[];
+  readonly logs: Log[];
   observe(runs: readonly RepoOverviewRunRaw[], repo?: RepoRef): void;
   /** Close the ledger and boot a fresh ledger, center and watch over it. */
   restart(): void;
 }
+
+interface Log { readonly level: string; readonly msg: string; readonly fields: Record<string, unknown> | null }
 
 const rigs: Rig[] = [];
 afterEach(() => {
@@ -71,7 +78,7 @@ afterEach(() => {
   }
 });
 
-function boot(dir: string, rig: Pick<Rig, 'woke' | 'logs'>): Pick<Rig, 'db' | 'ledger' | 'watch'> {
+function boot(dir: string, rig: Pick<Rig, 'woke' | 'logs'>): Pick<Rig, 'db' | 'ledger' | 'notifications' | 'watch'> {
   const db = new LedgerDb(dir);
   const bus = new EventBus();
   const ledger = new LedgerApi(db.handle, { bus });
@@ -79,14 +86,14 @@ function boot(dir: string, rig: Pick<Rig, 'woke' | 'logs'>): Pick<Rig, 'db' | 'l
   const watch = new DefaultBranchCiWatch({
     ledger,
     notifications,
-    log: (level, msg) => rig.logs.push({ level, msg }),
+    log: (level, msg, fields) => rig.logs.push({ level, msg, fields: fields ?? null }),
   });
-  return { db, ledger, watch };
+  return { db, ledger, notifications, watch };
 }
 
 function rig(): Rig {
   const dir = mkdtempSync(join(tmpdir(), 'gru-default-branch-ci-'));
-  const state = { woke: [] as NotificationRecord[], logs: [] as { level: string; msg: string }[] };
+  const state = { woke: [] as NotificationRecord[], logs: [] as Log[] };
   const created: Rig = {
     dir,
     ...state,
@@ -129,20 +136,20 @@ describe('default-branch verdicts (#446)', () => {
       failed(9),
       passed(12, { workflowId: X }),
       failed(10, { workflowId: X, createdAt: '2026-10-18T09:00:00.000Z' }),
-    ]);
+    ], ALPHA);
     expect(verdicts.map((verdict) => [verdict.workflowId, verdict.verdict, verdict.runId])).toEqual([
       [W, 'red', 9],
       [X, 'passed', 12],
     ]);
     // Equal creation: the larger id wins, in either list order.
     const tie = '2026-10-18T10:00:00.000Z';
-    expect(defaultBranchVerdicts([failed(5, { createdAt: tie }), passed(6, { createdAt: tie })])[0]?.runId).toBe(6);
-    expect(defaultBranchVerdicts([passed(6, { createdAt: tie }), failed(5, { createdAt: tie })])[0]?.runId).toBe(6);
+    expect(defaultBranchVerdicts([failed(5, { createdAt: tie }), passed(6, { createdAt: tie })], ALPHA)[0]?.runId).toBe(6);
+    expect(defaultBranchVerdicts([passed(6, { createdAt: tie }), failed(5, { createdAt: tie })], ALPHA)[0]?.runId).toBe(6);
   });
 
   it('reads failed, timed-out and startup-failure as red', () => {
     for (const [conclusion, state] of [['failure', 'failed'], ['timed_out', 'timed-out'], ['startup_failure', 'startup-failure']] as const) {
-      expect(defaultBranchVerdicts([run(9, { conclusion })])[0]).toMatchObject({ verdict: 'red', state, sha: S2 });
+      expect(defaultBranchVerdicts([run(9, { conclusion })], ALPHA)[0]).toMatchObject({ verdict: 'red', state, sha: S2 });
     }
   });
 
@@ -158,14 +165,28 @@ describe('default-branch verdicts (#446)', () => {
       run(17, { conclusion: 'stale' }),
       run(18, { conclusion: 'mystery' }),
     ];
-    expect(defaultBranchVerdicts([...maskers, failed(9)]).map((verdict) => verdict.runId)).toEqual([9]);
-    expect(defaultBranchVerdicts(maskers)).toEqual([]);
+    expect(defaultBranchVerdicts([...maskers, failed(9)], ALPHA).map((verdict) => verdict.runId)).toEqual([9]);
+    expect(defaultBranchVerdicts(maskers, ALPHA)).toEqual([]);
+  });
+
+  it('a pull-request or fork run sharing the branch name never counts; every other event does', () => {
+    // A fork PR from `develop`, or a gitflow develop→main PR, matches `branch=develop`.
+    for (const event of ['pull_request', 'pull_request_target']) {
+      expect(defaultBranchVerdicts([failed(10, { event }), passed(9)], ALPHA)[0], event).toMatchObject({ verdict: 'passed', runId: 9 });
+    }
+    expect(defaultBranchVerdicts([failed(10, { headRepository: 'someone/alpha' }), passed(9)], ALPHA)[0]).toMatchObject({ runId: 9 });
+    // The observed repository's own head counts, compared case-insensitively.
+    expect(defaultBranchVerdicts([failed(10, { headRepository: 'ACME/Alpha' })], ALPHA)[0]).toMatchObject({ verdict: 'red', runId: 10 });
+    // Bots and other triggers count: "whatever the check is named".
+    for (const event of ['push', 'schedule', 'workflow_dispatch', 'workflow_run', 'merge_group', 'dynamic', null]) {
+      expect(defaultBranchVerdicts([failed(10, { event, headRepository: 'acme/alpha' })], ALPHA)[0], String(event)).toMatchObject({ verdict: 'red' });
+    }
   });
 
   it('ignores a run without an id, workflow id or head sha', () => {
-    expect(defaultBranchVerdicts([failed(9, { id: null }), failed(10, { workflowId: null }), failed(11, { headSha: null })])).toEqual([]);
+    expect(defaultBranchVerdicts([failed(9, { id: null }), failed(10, { workflowId: null }), failed(11, { headSha: null })], ALPHA)).toEqual([]);
     // An ignored newer run does not mask an older decisive one either.
-    expect(defaultBranchVerdicts([failed(11, { headSha: null }), passed(8)])[0]).toMatchObject({ verdict: 'passed', runId: 8 });
+    expect(defaultBranchVerdicts([failed(11, { headSha: null }), passed(8)], ALPHA)[0]).toMatchObject({ verdict: 'passed', runId: 8 });
   });
 });
 
@@ -258,16 +279,130 @@ describe('default-branch CI watch (#446)', () => {
     expectOpen(r, []);
   });
 
-  it('still red at a new head: a new incident for the new sha, the old one stays open', () => {
+  it('still red at a new head: a new incident for the new sha supersedes the old one', () => {
     const r = rig();
     r.observe([failed(9)]);
     r.observe([failed(11, { headSha: S3 }), failed(9)]);
     expect(events(r).at(-1)).toMatchObject({ verdict: 'red', run_id: 11, sha: S3 });
-    expectOpen(r, [kindOf(S2), kindOf(S3)]);
+    expectOpen(r, [kindOf(S3)]);
+    expect(rows(r).find((row) => row.kind === kindOf(S2))?.resolvedBy).toBe('default-branch-ci');
     expect(r.woke).toHaveLength(2);
-    // Both resolve once the workflow passes.
+    // The superseding head resolves once the workflow passes.
     r.observe([passed(12, { headSha: S3 })]);
     expectOpen(r, []);
+  });
+
+  it('superseding resolves only that workflow\'s exact old head', () => {
+    const r = rig();
+    r.observe([failed(9), failed(10, { workflowId: X })]);
+    r.observe([failed(9)], ALPHA_TWO);
+    r.observe([failed(11, { headSha: S3 }), failed(10, { workflowId: X })]);
+    expectOpen(r, [kindOf(S3), kindOf(S2, X), kindOf(S2, W, ALPHA_TWO)]);
+  });
+
+  it('red at one head, a pass at the next, then a newer failure at that head opens a row for it', () => {
+    const r = rig();
+    r.observe([failed(9, { headSha: S1 })]);
+    r.observe([passed(10), failed(9, { headSha: S1 })]);
+    r.observe([failed(11), passed(10)]);
+    expectOpen(r, [kindOf(S2)]);
+  });
+
+  it('timed-out and startup-failure verdicts raise through the watch', () => {
+    const r = rig();
+    r.observe([run(9, { conclusion: 'timed_out' }), run(10, { conclusion: 'startup_failure', workflowId: X })]);
+    expectOpen(r, [kindOf(S2), kindOf(S2, X)]);
+    expect(events(r).map((payload) => [payload['workflow_id'], payload['state']])).toEqual([[W, 'timed-out'], [X, 'startup-failure']]);
+    expect(r.woke).toHaveLength(2);
+  });
+
+  it('a pull-request run on the branch name never alerts through the watch', () => {
+    const r = rig();
+    r.observe([failed(10, { event: 'pull_request' }), failed(11, { headRepository: 'someone/alpha' })]);
+    expect(events(r)).toEqual([]);
+    expect(rows(r)).toEqual([]);
+  });
+
+  it('a pass with no cursor resolves an orphaned row and writes nothing', () => {
+    const r = rig();
+    // The row a crash between post and cursor leaves behind.
+    r.notifications.postIncident({ kind: kindOf(S2), routing: 'action-required', severity: 'error', title: 'orphan', dedupe: 'active' });
+    r.observe([passed(10)]);
+    expectOpen(r, []);
+    expect(rows(r)[0]?.resolvedBy).toBe('default-branch-ci');
+    expect(events(r)).toEqual([]);
+  });
+
+  it('a post that throws once leaves nothing behind; the re-observe leaves exactly one open row', () => {
+    const r = rig();
+    let failPost = true;
+    const watch = new DefaultBranchCiWatch({
+      ledger: r.ledger,
+      notifications: {
+        postIncident: (input) => {
+          if (failPost) {
+            failPost = false;
+            throw new Error('database is locked');
+          }
+          return r.notifications.postIncident(input);
+        },
+        resolveIncidents: (prefix, by) => r.notifications.resolveIncidents(prefix, by),
+        resolveExactKind: (kind, by) => r.notifications.resolveExactKind(kind, by),
+      },
+    });
+    watch.observe({ repo: ALPHA, branch: 'develop', runs: [failed(9)] });
+    expect(rows(r)).toEqual([]);
+    expect(events(r)).toEqual([]);
+    watch.observe({ repo: ALPHA, branch: 'develop', runs: [failed(9)] });
+    expectOpen(r, [kindOf(S2)]);
+    expect(events(r)).toHaveLength(1);
+  });
+
+  it('a cursor append that throws once after the post leaves exactly one open row on re-observe', () => {
+    const r = rig();
+    let failAppend = true;
+    const watch = new DefaultBranchCiWatch({
+      ledger: {
+        latestEventByPayloadField: (kind, field, value) => r.ledger.latestEventByPayloadField(kind, field, value),
+        appendCustomEvent: (fields) => {
+          if (failAppend) {
+            failAppend = false;
+            throw new Error('disk I/O error');
+          }
+          return r.ledger.appendCustomEvent(fields);
+        },
+      },
+      notifications: r.notifications,
+    });
+    watch.observe({ repo: ALPHA, branch: 'develop', runs: [failed(9)] });
+    expectOpen(r, [kindOf(S2)]);
+    expect(events(r)).toEqual([]);
+    watch.observe({ repo: ALPHA, branch: 'develop', runs: [failed(9)] });
+    expect(rows(r)).toHaveLength(1);
+    expectOpen(r, [kindOf(S2)]);
+    expect(events(r)).toHaveLength(1);
+  });
+
+  it('one workflow that throws is logged and never skips the repository\'s other workflows', () => {
+    const r = rig();
+    const watch = new DefaultBranchCiWatch({
+      ledger: {
+        latestEventByPayloadField: (kind, field, value) => {
+          if (value === 'acme/alpha:7') throw new Error('malformed JSON in events.payload');
+          return r.ledger.latestEventByPayloadField(kind, field, value);
+        },
+        appendCustomEvent: (fields) => r.ledger.appendCustomEvent(fields),
+      },
+      notifications: r.notifications,
+      log: (level, msg, fields) => r.logs.push({ level, msg, fields: fields ?? null }),
+    });
+    watch.observe({ repo: ALPHA, branch: 'develop', runs: [failed(9), failed(10, { workflowId: X })] });
+    expectOpen(r, [kindOf(S2, X)]);
+    expect(r.logs).toContainEqual({
+      level: 'error',
+      msg: 'default-branch CI: workflow verdict could not be applied — retried next pass',
+      fields: { repo: 'acme/alpha', workflow_id: W, error: 'malformed JSON in events.payload' },
+    });
   });
 
   it('a newer failing run at the same head advances the cursor without a second incident', () => {
@@ -337,7 +472,7 @@ describe('default-branch CI watch (#446)', () => {
     const r = rig();
     r.ledger.appendCustomEvent({ kind: DEFAULT_BRANCH_CI_EVENT, payload: { scope: 'acme/alpha:7', verdict: 'maybe' } });
     r.observe([failed(9)]);
-    expect(r.logs).toContainEqual({ level: 'warn', msg: 'default-branch CI: cursor event has a malformed payload — re-observing' });
+    expect(r.logs).toContainEqual(expect.objectContaining({ level: 'warn', msg: 'default-branch CI: cursor event has a malformed payload — re-observing' }));
     expectOpen(r, [kindOf(S2)]);
   });
 });

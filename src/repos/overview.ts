@@ -195,8 +195,13 @@ export interface RepoOverviewRunRaw {
   /** The run's workflow (`workflow_id`) — the default-branch alert's
    * per-workflow verdict key; null when the provider omits it. */
   readonly workflowId: number | null;
-  /** The commit the run tested (`head_sha`); null unless it is hex. */
+  /** The commit the run tested (`head_sha`), lowercased; null unless it is hex. */
   readonly headSha: string | null;
+  /** What triggered the run (`event`): a `pull_request` run can share the
+   * default branch's name without testing it. */
+  readonly event: string | null;
+  /** The head repository (`head_repository.full_name`); a fork's differs. */
+  readonly headRepository: string | null;
 }
 
 /** The complete default-branch run page one observation read, handed to
@@ -253,10 +258,11 @@ function isoOrNull(value: unknown): string | null {
   return value;
 }
 
-/** A commit id is usable only as plain hex: it is embedded in alert kinds
- * and decision bases, where a separator would change the identity. */
+/** A commit id is usable only as plain hex, lowercased: it is embedded in
+ * alert kinds and decision bases, where a separator or a case change would
+ * change the identity. */
 function shaOrNull(value: unknown): string | null {
-  return typeof value === 'string' && /^[0-9a-f]{7,64}$/iu.test(value) ? value : null;
+  return typeof value === 'string' && /^[0-9a-f]{7,64}$/iu.test(value) ? value.toLowerCase() : null;
 }
 
 /** Map a completed/incomplete run's raw status+conclusion to the fixed
@@ -539,6 +545,8 @@ function mapRun(value: unknown): RepoOverviewRunRaw | null {
     updatedAt: isoOrNull(raw['updated_at']),
     workflowId: countOrNull(raw['workflow_id']),
     headSha: shaOrNull(raw['head_sha']),
+    event: strOrNull(raw['event']),
+    headRepository: strOrNull(record(raw['head_repository'])?.['full_name']),
   };
 }
 

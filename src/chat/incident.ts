@@ -24,21 +24,22 @@ import type { NotificationRecord } from '../ledger/api.js';
  *   the dot-scoped producers (`supervision.provider-wall.<agent>.<class>`,
  *   `supervision.turn-orphaned.<lane>`) carry their subject.
  * - A red default branch (#446,
- *   `github.default-branch-ci-failed:<owner>/<repo>:<workflowId>:<sha>`)
- *   has no lane: its subject is the repository, so one hold covers every
- *   workflow of it, and its basis is the head SHA alone.
+ *   `github.default-branch-ci-failed:<owner>/<repo>:<workflow id>:<sha>`)
+ *   has no lane: its subject is the repository, so one hold applies to
+ *   every workflow of it, and its basis is the head SHA alone.
  */
 
 /** The minimal row shape the wake path consumes. */
 export type IncidentRow = Pick<NotificationRecord, 'kind' | 'title' | 'routing'>;
 
-const DEFAULT_BRANCH_CI_FAILED = 'github.default-branch-ci-failed';
+/** The red default-branch alert kind prefix (#446), shared with its producer. */
+export const DEFAULT_BRANCH_CI_FAILED_KIND = 'github.default-branch-ci-failed';
 
 /** The repository and head SHA of a default-branch CI row (#446); null
  * for every other kind. */
 function defaultBranchCiScope(kind: string): { readonly repo: string; readonly sha: string } | null {
-  if (!kind.startsWith(`${DEFAULT_BRANCH_CI_FAILED}:`)) return null;
-  const parts = kind.slice(DEFAULT_BRANCH_CI_FAILED.length + 1).split(':');
+  if (!kind.startsWith(`${DEFAULT_BRANCH_CI_FAILED_KIND}:`)) return null;
+  const parts = kind.slice(DEFAULT_BRANCH_CI_FAILED_KIND.length + 1).split(':');
   if (parts.length !== 3 || parts.some((part) => part === '')) return null;
   return { repo: parts[0] as string, sha: parts[2] as string };
 }
@@ -81,7 +82,7 @@ export function incidentKeyOf(row: IncidentRow): string {
  */
 export function incidentSubjectOf(row: IncidentRow): string {
   const defaultBranch = defaultBranchCiScope(row.kind);
-  if (defaultBranch !== null) return `incident:${DEFAULT_BRANCH_CI_FAILED}:${defaultBranch.repo}`;
+  if (defaultBranch !== null) return `incident:${DEFAULT_BRANCH_CI_FAILED_KIND}:${defaultBranch.repo}`;
   const rebrief = /^silas\.rebrief-unreconciled\.([^.]+)$/.exec(row.kind);
   if (rebrief !== null) return `job:${rebrief[1] ?? ''}`;
   const colon = row.kind.indexOf(':');

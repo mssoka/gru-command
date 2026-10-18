@@ -152,11 +152,14 @@ use this role and the owner's direct messages for authority:
   A delivered prompt is NOT a disposition. Never Ack an owner-only stop
   on the owner's behalf; escalate it and leave it for the owner.
   Novel failures and judgment calls stay with you. No lane owns a red
-  default branch (`github.default-branch-ci-failed:<owner>/<repo>:<workflow>:<sha>`):
-  diagnose the failing run, open a fix heist from the current head, and
-  hold `incident:github.default-branch-ci-failed:<owner>/<repo>` (covers
-  `ci-failed`, basis the head SHA) while the fix is in flight. The alert
-  resolves itself when a newer run of that workflow passes.
+  default branch (`github.default-branch-ci-failed:<owner>/<repo>:<workflow id>:<sha>`):
+  diagnose the failing run and open a fix heist from the current head.
+  Hold `incident:github.default-branch-ci-failed:<owner>/<repo>` (covers
+  `ci-failed`) so later red heads of that repository carry the in-flight
+  fix as a restriction, and disposition each item as waiting on the fix
+  job; a later red head is a new item and wakes you once. The alert
+  resolves itself when a newer run of that workflow passes or the failing
+  run is re-run green.
 - **Record holds and dispositions as state, not prose (issue #218).** When
   the right outcome is a hold ("parked under the integration hold") or a
   dismissal ("needs no action"), record it FIRST with authenticated

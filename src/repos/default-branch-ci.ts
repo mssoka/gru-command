@@ -1,3 +1,4 @@
+import { DEFAULT_BRANCH_CI_FAILED_KIND } from '../chat/incident.js';
 import type { LedgerApi } from '../ledger/api.js';
 import type { LogLevel } from '../logger.js';
 import type { NotificationCenter } from '../notifications/center.js';
@@ -18,14 +19,22 @@ import {
  *
  * - The verdict, per `workflow_id`, is the newest DECISIVE run by
  *   (createdAt, id): passed, failed, timed-out or startup-failure. Queued,
- *   running, cancelled, skipped, neutral, action-required and stale runs
- *   never mask a verdict, never alert and never resolve.
+ *   running, cancelled, skipped, neutral, action-required, stale and
+ *   unrecognized runs never mask a verdict, never alert and never resolve.
+ *   The runs API matches `branch=` on the head branch, so `pull_request` /
+ *   `pull_request_target` runs and runs from another head repository (a
+ *   fork) are not default-branch runs and never count; every other event,
+ *   bots included, does.
  * - A red verdict raises one `action-required` incident per repo +
  *   workflow + head sha — it wakes Gru whatever the check is named (no
- *   mechanical tier, no Silas digest row). No lane owns a default branch,
- *   so the hold subject is the repository (see src/chat/incident.ts).
+ *   mechanical tier, no Silas digest row) — and resolves the row for the
+ *   workflow's previous red head, which the new head supersedes. No lane
+ *   owns a default branch, so the hold subject is the repository (see
+ *   src/chat/incident.ts).
  * - A newer passing run of that workflow — or the failing run itself,
- *   re-run green — resolves its open incidents.
+ *   re-run green — resolves its open incidents. With no usable cursor (a
+ *   crash between post and cursor, a malformed cursor) a pass still
+ *   resolves any open row of the workflow, and records nothing.
  * - Dedupe is by observed change against the latest
  *   `repo.default-branch-ci` event for the workflow, so a restart re-reads
  *   the same cursor and never re-raises; a verdict never steps back to an
@@ -37,12 +46,12 @@ import {
 
 /** The cursor event: one per observed change, never per pass. */
 export const DEFAULT_BRANCH_CI_EVENT = 'repo.default-branch-ci';
-/** Alert kind prefix: `<prefix>:<owner>/<repo>:<workflowId>:<sha>`. */
-export const DEFAULT_BRANCH_CI_FAILED_KIND = 'github.default-branch-ci-failed';
 const RESOLVED_BY = 'default-branch-ci';
 
 const RED_STATES = ['failed', 'timed-out', 'startup-failure'] as const;
 const DECISIVE_STATES: readonly string[] = ['passed', ...RED_STATES];
+/** Runs that test a pull request's head, not the default branch. */
+const PULL_REQUEST_EVENTS: readonly string[] = ['pull_request', 'pull_request_target'];
 
 export interface DefaultBranchVerdict {
   readonly workflowId: number;
@@ -63,12 +72,16 @@ export function defaultBranchCiFailedKind(repo: RepoRef, workflowId: number, sha
   return `${DEFAULT_BRANCH_CI_FAILED_KIND}:${repoFullName(repo)}:${workflowId}:${sha}`;
 }
 
-/** Per workflow, the newest decisive run on the page (sorted by workflow
- * id). A run without an id, workflow id or head sha is ignored. */
-export function defaultBranchVerdicts(runs: readonly RepoOverviewRunRaw[]): readonly DefaultBranchVerdict[] {
+/** Per workflow, the newest decisive run of `repo`'s default branch on the
+ * page (sorted by workflow id). A run without an id, workflow id or head
+ * sha is ignored, as is a pull-request or fork run. */
+export function defaultBranchVerdicts(runs: readonly RepoOverviewRunRaw[], repo: RepoRef): readonly DefaultBranchVerdict[] {
+  const fullName = repoFullName(repo).toLowerCase();
   const byWorkflow = new Map<number, RepoOverviewRunRaw[]>();
   for (const run of runs) {
     if (run.id === null || run.workflowId === null || run.headSha === null) continue;
+    if (run.event !== null && PULL_REQUEST_EVENTS.includes(run.event)) continue;
+    if (run.headRepository !== null && run.headRepository.toLowerCase() !== fullName) continue;
     if (!DECISIVE_STATES.includes(runStateOf(run.status, run.conclusion))) continue;
     byWorkflow.set(run.workflowId, [...(byWorkflow.get(run.workflowId) ?? []), run]);
   }
@@ -100,7 +113,7 @@ interface RecordedVerdict {
 
 export interface DefaultBranchCiWatchOptions {
   readonly ledger: Pick<LedgerApi, 'latestEventByPayloadField' | 'appendCustomEvent'>;
-  readonly notifications: Pick<NotificationCenter, 'postIncident' | 'resolveIncidents'>;
+  readonly notifications: Pick<NotificationCenter, 'postIncident' | 'resolveIncidents' | 'resolveExactKind'>;
   readonly log?: (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 }
 
@@ -111,9 +124,20 @@ export class DefaultBranchCiWatch {
     this.log = opts.log ?? (() => {});
   }
 
-  /** Apply one committed overview observation (the tracker's hook). */
+  /** Apply one committed overview observation (the tracker's hook). One
+   * workflow's failure is logged and never skips the repository's others. */
   observe(observation: DefaultBranchRunsObservation): void {
-    for (const verdict of defaultBranchVerdicts(observation.runs)) this.apply(observation, verdict);
+    for (const verdict of defaultBranchVerdicts(observation.runs, observation.repo)) {
+      try {
+        this.apply(observation, verdict);
+      } catch (error) {
+        this.log('error', 'default-branch CI: workflow verdict could not be applied — retried next pass', {
+          repo: repoFullName(observation.repo),
+          workflow_id: verdict.workflowId,
+          error: (error instanceof Error ? error.message : String(error)).slice(0, 300),
+        });
+      }
+    }
   }
 
   private apply(observation: DefaultBranchRunsObservation, verdict: DefaultBranchVerdict): void {
@@ -130,12 +154,28 @@ export class DefaultBranchCiWatch {
     }
     const url = safeRunUrl(verdict.url, observation.repo.host);
     if (verdict.verdict === 'red') {
+      if (previous?.verdict === 'red' && previous.sha !== verdict.sha) {
+        // The new red head supersedes the old one's row.
+        this.opts.notifications.resolveExactKind(defaultBranchCiFailedKind(observation.repo, verdict.workflowId, previous.sha), RESOLVED_BY);
+      }
       // The incident is posted BEFORE its cursor: a crash between the two
       // re-raises onto the same open row instead of losing the alert.
       if (previous?.verdict !== 'red' || previous.sha !== verdict.sha) this.raise(observation, verdict, url);
     } else {
-      if (previous === null || previous.verdict !== 'red') return;
+      if (previous?.verdict === 'passed') return;
       const resolved = this.opts.notifications.resolveIncidents(`${DEFAULT_BRANCH_CI_FAILED_KIND}:${scope}:`, RESOLVED_BY);
+      // No usable cursor: an orphaned row is closed, but a first green is
+      // never recorded.
+      if (previous === null) {
+        if (resolved.length > 0) {
+          this.log('info', 'default-branch CI: workflow passed with no cursor, open incidents resolved', {
+            repo,
+            workflow_id: verdict.workflowId,
+            resolved: resolved.length,
+          });
+        }
+        return;
+      }
       this.log('info', 'default-branch CI: workflow passed again, incidents resolved', {
         repo,
         workflow_id: verdict.workflowId,
@@ -174,9 +214,10 @@ export class DefaultBranchCiWatch {
       title: `Default branch ${observation.branch} is red: ${workflow} (${repo})`,
       detail: [
         `${workflow} ${run} ${verdict.state} on ${observation.branch} at ${verdict.sha}.${url !== null ? ` ${url}` : ''}`,
-        `No lane owns ${observation.branch}: diagnose the run, open a fix heist from the current head, and hold ` +
-          `incident:${DEFAULT_BRANCH_CI_FAILED_KIND}:${repo} (covers ci-failed, basis ${verdict.sha}) while it is in flight.`,
-        `Resolves itself when a newer ${workflow} run on ${observation.branch} passes.`,
+        `No lane owns ${observation.branch}: open a fix heist from the current head, hold ` +
+          `incident:${DEFAULT_BRANCH_CI_FAILED_KIND}:${repo} (covers ci-failed) so later red heads carry the fix as a ` +
+          'restriction, and disposition this item as waiting on the fix job.',
+        `Resolves itself when a newer ${workflow} run on ${observation.branch} passes or this run is re-run green.`,
       ].join('\n'),
       dedupe: 'active',
     });
