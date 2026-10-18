@@ -217,7 +217,9 @@ Routing rules:
   backtests (`escalation_triage`, `same_blocker`, `report_conclusion`) can
   pass the gate, and no surface can use `enforce` today. `event_triage` and
   `supervision_guidance` have no registered backtest, so enforce fails every
-  request with that error and pages you. The `escalation_triage` and
+  request with that error and pages you; the `supervision_guidance` host
+  asks without checking the master switch, so that incident opens even
+  with `enabled = false`. The `escalation_triage` and
   `same_blocker` hosts ask Jev only in `shadow`, so enforce there never
   asks or records anything; enforcing those two needs host changes as well
   as the evidence and owner decision above (and #219 for

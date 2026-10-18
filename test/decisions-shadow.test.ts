@@ -194,6 +194,7 @@ describe('surface mode config parsing (issue #223)', () => {
     expect(template).toContain('Give every surface an explicit mode unless you mean that.');
     expect(template).toContain('escalation_triage, same_blocker and report_conclusion are never asked.');
     expect(template).toContain('A mode-less event_triage or supervision_guidance also makes');
+    expect(template).toContain('(its host asks even with the master switch off, so this incident opens then too)');
     expect(template).toContain('# Surfaces (the complete list; any other name fails to load):');
     expect(template).toMatch(
       /Setting it anywhere still makes a transient \(timeout,\n#\s+network or provider-error\) outage of the default\n#\s+openrouter-jev profile page you instead of a board FYI\.\n/,

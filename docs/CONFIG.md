@@ -600,6 +600,7 @@ timeout_ms = 5000 # Per-call limit; on timeout the deterministic answer is used.
 #   supervision_guidance  classifies a runtime failure: restart vs escalate (restart counters stay deterministic)
 #                         off or shadow today: no registered backtest, so enforce rejects every
 #                         Jev ask (the deterministic answer still serves) and opens an owner incident
+#                         (its host asks even with the master switch off, so this incident opens then too)
 #   escalation_triage     is a Silas escalation a ruling or a status report?
 #                         off or shadow today: it asks Jev only in shadow, so enforce never asks
 #   same_blocker          is this review blocker the same defect as last round?
