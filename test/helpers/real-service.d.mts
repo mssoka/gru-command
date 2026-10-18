@@ -54,6 +54,10 @@ export declare function startRealService(options?: {
   nodeImport?: string;
   /** Write [chat] notify_wake with this mode (wake-on-alert e2e). */
   notifyWake?: 'never' | 'action-required' | 'all';
+  /** Write [review] enabled (default true). Chat-shaped suites pass false:
+   *  a review-enabled instance with no Perkins App bundle raises the
+   *  owner-required boot notice, which rides the next chat turn. */
+  reviewEnabled?: boolean;
   /** Additional non-secret test controls for the child process. */
   extraEnv?: NodeJS.ProcessEnv;
 }): Promise<RealServiceHandle>;

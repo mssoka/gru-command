@@ -221,6 +221,16 @@ describe('owner-notice guidance — honest scope per kind, never parsed prose', 
     expect(enforceGate).not.toContain('credential');
   });
 
+  it('the Perkins App bundle notice names the install step and the clearing evidence (#444)', () => {
+    const guidance = ownerNoticeGuidance('perkins-app-bundle-missing');
+    expect(guidance).toContain('Install the Perkins GitHub App bundle');
+    expect(guidance).toContain('restart the service');
+    expect(guidance).toContain('clears at the first boot that resolves the bundle');
+    expect(guidance).toContain('GitLab-only instance is unaffected');
+    expect(guidance).not.toContain('Ack');
+    expect(guidance).not.toContain('No in-app action is supported');
+  });
+
   it('sweep confirmations and blocked wakes name the manual step', () => {
     expect(ownerNoticeGuidance('worktree-sweep-paused')).toContain('Confirm nothing live is rooted');
     expect(ownerNoticeGuidance('worktree-sweep-paused:lane-a:pause-1')).toContain('the notice clears when that worktree is swept');

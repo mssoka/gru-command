@@ -15,6 +15,13 @@
  *   node test/helpers/real-service.mjs            (manual/standalone boot)
  * CLI knobs: REAL_SERVICE_PORT, REAL_SERVICE_TOKEN (defaults shared with
  * web/playwright.config.ts and web/e2e/real-server.spec.ts).
+ *
+ * `reviewEnabled` (default true) writes `[review] enabled`. Chat-shaped
+ * suites pass `false`: a review-enabled instance with no Perkins App
+ * bundle correctly raises the owner-required
+ * `perkins-app-bundle-missing` boot notice (issue #444), and that notice
+ * rides the next chat turn as owner context — unrelated to a socket or
+ * wake assertion.
  */
 
 import { createServer } from 'node:net';
@@ -128,6 +135,7 @@ export async function startRealService({
   decisionKey,
   nodeImport,
   notifyWake,
+  reviewEnabled = true,
   extraEnv = {},
 } = {}) {
   // Port-squat prevention: ephemeral or an explicit high-range override —
@@ -180,6 +188,8 @@ export async function startRealService({
       ...(notifyWake !== undefined
         ? ['[chat]', `notify_wake = ${JSON.stringify(notifyWake)}`, 'wake_min_interval_ms = 0']
         : []),
+      '[review]',
+      `enabled = ${reviewEnabled}`,
       '',
     ].join('\n'),
     'utf-8',

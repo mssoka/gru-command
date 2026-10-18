@@ -150,7 +150,9 @@ describe('W5 — LAN-phone send path over the real socket', () => {
 
   beforeAll(async () => {
     const port = await pickFreePort();
-    service = await startRealService({ port, token: W5_TOKEN, requireWebDist: false });
+    // Chat-shaped fixture: no review gate, so no owner-required Perkins
+    // App-bundle boot notice rides the first chat turn (#444).
+    service = await startRealService({ port, token: W5_TOKEN, requireWebDist: false, reviewEnabled: false });
     url = `ws://127.0.0.1:${port}/ws`;
     // Co-tenant boot headroom (see helpers/real-service.mjs): the real
     // service must finish booting inside the hook so the helper's own

@@ -320,6 +320,17 @@ bundle is installed; with a bundle, github.com publication is App-authored
 while the review preflight still probes remotes through `gh` (see
 [PERKINS-APP-PUBLICATION.md](./PERKINS-APP-PUBLICATION.md)).
 
+Beside the four route-deciding legs, the same pass evaluates the
+**non-blocking advisory leg `verdict-publication-identity`** (issue #444):
+on a github.com remote with `[review] enabled = true` and no Perkins App
+bundle resolving, the advisory names the gap — `verdict publication
+identity: MISSING — reviews will run but verdicts cannot post (self-author
+422)` — and logs it with the round. An advisory never changes the route
+(the round still runs through Perkins) and never counts as a failed leg;
+the boot check raises the same gap as one owner-required incident, so the
+prerequisite is visible at install time and at every restart, not only
+after a round's delivery fails.
+
 Report artifacts persist before delivery, but the local round verdict is
 recorded only after SHA-bound delivery proof succeeds; delivery failure
 terminalizes the round as durable INCOMPLETE alongside the preserved

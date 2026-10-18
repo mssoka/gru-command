@@ -73,7 +73,7 @@ describe('wake-on-alert real service (offline)', () => {
     db.close();
     try {
       service = await startRealService({ port: await pickFreePort(), home, workspace,
-        notifyWake: 'action-required', requireWebDist: false });
+        notifyWake: 'action-required', requireWebDist: false, reviewEnabled: false });
       const { socket, frames } = await authedSocket(service);
       try {
         await waitForFrame(frames, (frame) => frame.type === 'turn' && frame.state === 'start', 'seeded wake receipt');
@@ -111,7 +111,7 @@ describe('wake-on-alert real service (offline)', () => {
     const detail = 'Gru opened a repair lane from inside the wake turn';
     try {
       service = await startRealService({
-        port, home, workspace, notifyWake: 'action-required', requireWebDist: false,
+        port, home, workspace, notifyWake: 'action-required', requireWebDist: false, reviewEnabled: false,
         extraEnv: { CLAUDE_DOUBLE_GRU_ACT: JSON.stringify({ baseUrl: `http://127.0.0.1:${port}`, token: REAL_SERVICE_TOKEN, detail }) },
       });
       const { socket, frames } = await authedSocket(service);
@@ -171,7 +171,7 @@ describe('wake-on-alert real service (offline)', () => {
       foreign.listen(port, '127.0.0.1', resolve);
     });
     try {
-      await expect(startRealService({ port, home, workspace, notifyWake: 'action-required', requireWebDist: false }))
+      await expect(startRealService({ port, home, workspace, notifyWake: 'action-required', requireWebDist: false, reviewEnabled: false }))
         .rejects.toThrow(/service exited|service never answered/);
       const reread = new LedgerDb(home);
       try {
@@ -195,7 +195,7 @@ describe('wake-on-alert real service (offline)', () => {
     service = await startRealService({
       port,
       notifyWake: 'action-required',
-      requireWebDist: false,
+      requireWebDist: false, reviewEnabled: false,
       extraEnv: { CLAUDE_DOUBLE_LOG: logFile },
     });
     const { socket, frames } = await authedSocket(service);
