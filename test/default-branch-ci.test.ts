@@ -128,6 +128,44 @@ function expectOpen(r: Rig, kinds: readonly string[]): void {
 
 const kindOf = (sha: string, workflowId = W, repo = ALPHA) => defaultBranchCiFailedKind(repo, workflowId, sha);
 
+type Fault = 'append' | 'resolve' | 'resolveExact';
+
+/** A watch over the rig's real ledger and center whose calls can each fail
+ * once (set a fault to true) and whose prefix resolves are counted. */
+function faultyWatch(r: Rig, faults: Partial<Record<Fault, boolean>> = {}) {
+  const fail: Partial<Record<Fault, boolean>> = { ...faults };
+  const calls = { resolve: 0 };
+  const trip = (fault: Fault, message: string): void => {
+    if (fail[fault] === true) {
+      fail[fault] = false;
+      throw new Error(message);
+    }
+  };
+  const watch = new DefaultBranchCiWatch({
+    ledger: {
+      latestEventByPayloadField: (kind, field, value) => r.ledger.latestEventByPayloadField(kind, field, value),
+      appendCustomEvent: (fields) => {
+        trip('append', 'disk I/O error');
+        return r.ledger.appendCustomEvent(fields);
+      },
+    },
+    notifications: {
+      postIncident: (input) => r.notifications.postIncident(input),
+      resolveIncidents: (prefix, by) => {
+        calls.resolve += 1;
+        trip('resolve', 'database is locked');
+        return r.notifications.resolveIncidents(prefix, by);
+      },
+      resolveExactKind: (kind, by) => {
+        trip('resolveExact', 'database is locked');
+        return r.notifications.resolveExactKind(kind, by);
+      },
+    },
+    log: (level, msg, fields) => r.logs.push({ level, msg, fields: fields ?? null }),
+  });
+  return { fail, calls, observe: (runs: readonly RepoOverviewRunRaw[]) => watch.observe({ repo: ALPHA, branch: 'develop', runs }) };
+}
+
 describe('default-branch verdicts (#446)', () => {
   it('takes the newest decisive run per workflow by (createdAt, id), never list order', () => {
     const verdicts = defaultBranchVerdicts([
@@ -278,7 +316,7 @@ describe('default-branch CI watch (#446)', () => {
     expectOpen(r, []);
   });
 
-  it('a superseding post that throws leaves the old head open until the next pass', () => {
+  it('a superseding post that throws leaves the old head open until the next observation', () => {
     const r = rig();
     r.observe([failed(9)]);
     let failPost = true;
@@ -402,7 +440,7 @@ describe('default-branch CI watch (#446)', () => {
     observe([failed(9, { headSha: S1 })]);
     observe([passed(10), failed(9, { headSha: S1 })]);
     expect(events(r).at(-1)).toMatchObject({ verdict: 'passed', run_id: 10 });
-    observe([passed(10)]); // settled by the red→passed transition: no further query
+    observe([passed(10)]); // the same pass again: no further query
     expect(prefixes).toHaveLength(1);
     // A new red head is posted, but its cursor never lands: the cursor still reads passed.
     failAppend = true;
@@ -414,6 +452,67 @@ describe('default-branch CI watch (#446)', () => {
     expectOpen(r, []);
     expect(prefixes).toHaveLength(2);
     expect(events(r).at(-1)).toMatchObject({ verdict: 'passed', run_id: 10 });
+  });
+
+  it('past a passed cursor, a same-run pass never settles a row raised after it while that run re-runs', () => {
+    const r = rig();
+    const f = faultyWatch(r);
+    f.observe([failed(9, { headSha: S1 })]);
+    f.observe([passed(10), failed(9, { headSha: S1 })]);
+    // #11 is posted but its cursor never lands: the cursor still reads passed #10.
+    f.fail.append = true;
+    f.observe([failed(11, { headSha: S3 }), passed(10)]);
+    expectOpen(r, [kindOf(S3)]);
+    // #11 re-running: the newest decisive run is the cursor's own pass.
+    f.observe([pending(11, 'in_progress', { headSha: S3 }), passed(10)]);
+    expectOpen(r, [kindOf(S3)]);
+    // #11 re-run green is newer than the cursor: it settles.
+    f.observe([passed(11, { headSha: S3 }), passed(10)]);
+    expectOpen(r, []);
+  });
+
+  it('a settle whose resolve throws is not memoized: the next pass queries again', () => {
+    const r = rig();
+    const f = faultyWatch(r, { resolve: true });
+    f.observe([passed(8)]);
+    expect(r.logs).toContainEqual(expect.objectContaining({ level: 'error', fields: expect.objectContaining({ workflow_id: W }) }));
+    f.observe([passed(8)]);
+    f.observe([passed(8)]);
+    expect(f.calls.resolve).toBe(2);
+    expect(events(r)).toEqual([]);
+  });
+
+  it('a new watch (a restart) settles exactly once again', () => {
+    const r = rig();
+    const first = faultyWatch(r);
+    first.observe([passed(8)]);
+    first.observe([passed(8)]);
+    expect(first.calls.resolve).toBe(1);
+    const second = faultyWatch(r);
+    second.observe([passed(8)]);
+    second.observe([passed(8)]);
+    expect(second.calls.resolve).toBe(1);
+  });
+
+  it('the raise log counts the superseded head row', () => {
+    const r = rig();
+    r.observe([failed(9)]);
+    r.observe([failed(11, { headSha: S3 }), failed(9)]);
+    expect(r.logs.filter((entry) => entry.msg === 'default-branch CI: workflow turned red').map((entry) => entry.fields?.['superseded']))
+      .toEqual([0, 1]);
+  });
+
+  it('a supersede that throws after the post is retried by the next observation onto the same new-head row', () => {
+    const r = rig();
+    r.observe([failed(9)]);
+    const f = faultyWatch(r, { resolveExact: true });
+    f.observe([failed(11, { headSha: S3 }), failed(9)]);
+    expectOpen(r, [kindOf(S2), kindOf(S3)]);
+    expect(events(r)).toHaveLength(1);
+    f.observe([failed(11, { headSha: S3 }), failed(9)]);
+    expectOpen(r, [kindOf(S3)]);
+    expect(rows(r).filter((row) => row.kind === kindOf(S3))).toHaveLength(1);
+    expect(events(r).at(-1)).toMatchObject({ verdict: 'red', run_id: 11, sha: S3 });
   });
 
   it('a pass with no cursor resolves an orphaned row and writes nothing', () => {

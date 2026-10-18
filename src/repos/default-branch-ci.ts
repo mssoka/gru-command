@@ -37,7 +37,8 @@ import {
  *   crash between post and cursor, a malformed cursor) a pass still
  *   resolves any open row of the workflow — once per process per workflow
  *   until the next raise, since the prefix resolve scans every row — and
- *   records nothing.
+ *   records nothing; with a passed cursor only a newer pass does, since a
+ *   row raised after it may still be re-running.
  * - Dedupe is by observed change against the latest
  *   `repo.default-branch-ci` event for the workflow, so a restart re-reads
  *   the same cursor and never re-raises; a verdict never steps back to an
@@ -146,15 +147,19 @@ export class DefaultBranchCiWatch {
     const repo = repoFullName(observation.repo);
     const scope = `${repo}:${verdict.workflowId}`;
     const previous = this.recorded(scope);
+    const newer = previous !== null &&
+      isNewerRun({ createdAt: verdict.createdAt, id: verdict.runId }, { createdAt: previous.createdAt, id: previous.runId });
     if (verdict.verdict === 'passed' && previous?.verdict !== 'red') {
-      this.settle(scope, verdict);
+      // A same-run or older pass proves nothing about a row raised after
+      // the passed cursor (its re-run may still be in progress).
+      if (previous === null || newer) this.settle(scope, repo, verdict);
       return;
     }
     if (previous !== null) {
       if (previous.runId === verdict.runId) {
         // The same run re-observed; only a re-run that changed its outcome counts.
         if (previous.verdict === verdict.verdict) return;
-      } else if (!isNewerRun({ createdAt: verdict.createdAt, id: verdict.runId }, { createdAt: previous.createdAt, id: previous.runId })) {
+      } else if (!newer) {
         return;
       }
     }
@@ -164,7 +169,7 @@ export class DefaultBranchCiWatch {
       // re-raises onto the same open row instead of losing the alert. A new
       // red head supersedes the old head's row only once its own is posted.
       if (previous?.verdict !== 'red' || previous.sha !== verdict.sha) {
-        this.raise(observation, verdict, url, previous?.verdict === 'red' ? previous.sha : null);
+        this.raise(observation, verdict, url, scope, previous?.verdict === 'red' ? previous.sha : null);
       }
     } else {
       const resolved = this.opts.notifications.resolveIncidents(`${DEFAULT_BRANCH_CI_FAILED_KIND}:${scope}:`, RESOLVED_BY);
@@ -199,14 +204,15 @@ export class DefaultBranchCiWatch {
   /** A pass without a red cursor writes nothing, but closes any row a
    * crash left open (between post and cursor, or a malformed cursor) — once
    * per process per scope until the next raise. */
-  private settle(scope: string, verdict: DefaultBranchVerdict): void {
+  private settle(scope: string, repo: string, verdict: DefaultBranchVerdict): void {
     if (this.settled.has(scope)) return;
     const resolved = this.opts.notifications.resolveIncidents(`${DEFAULT_BRANCH_CI_FAILED_KIND}:${scope}:`, RESOLVED_BY);
     this.settled.add(scope);
     if (resolved.length > 0) {
       this.log('info', 'default-branch CI: workflow passed without a red cursor, open incidents resolved', {
-        scope,
+        repo,
         workflow_id: verdict.workflowId,
+        run_id: verdict.runId,
         resolved: resolved.length,
       });
     }
@@ -216,10 +222,11 @@ export class DefaultBranchCiWatch {
     observation: DefaultBranchRunsObservation,
     verdict: DefaultBranchVerdict,
     url: string | null,
+    scope: string,
     supersededSha: string | null,
   ): void {
     const repo = repoFullName(observation.repo);
-    this.settled.delete(`${repo}:${verdict.workflowId}`);
+    this.settled.delete(scope);
     const workflow = (verdict.workflow ?? `workflow ${verdict.workflowId}`).slice(0, 120);
     const run = verdict.runNumber !== null ? `run #${verdict.runNumber}` : `run ${verdict.runId}`;
     this.opts.notifications.postIncident({
@@ -232,7 +239,8 @@ export class DefaultBranchCiWatch {
         `No lane owns ${observation.branch}: diagnose the run, open a fix heist from the current head, hold ` +
           `incident:${DEFAULT_BRANCH_CI_FAILED_KIND}:${repo} (covers ci-failed) with no basis_fingerprint so later red ` +
           'heads carry the fix as a restriction, and disposition this item as waiting on the fix job.',
-        `Resolves itself when a newer ${workflow} run on ${observation.branch} passes or this run is re-run green.`,
+        `Resolves itself when a newer ${workflow} run on ${observation.branch} passes, this run is re-run green, or a ` +
+          `later red head of ${workflow} replaces it.`,
       ].join('\n'),
       dedupe: 'active',
     });

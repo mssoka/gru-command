@@ -45,8 +45,9 @@ import { gitProbeEnvironment, resolveManagedRepoPath, type ManagedRepoPath } fro
  * merely shares the branch name) is selected by (createdAt, id), so a
  * newer queued/running run supersedes an older passed one. `no-workflow`
  * requires the workflows endpoint to prove the repo has none — an empty
- * run page alone never infers it; with workflows present but no run on
- * the branch the state is `never-run`.
+ * run page alone never infers it; with workflows present but no
+ * default-branch run among the newest runs read (none at all, or only
+ * pull-request/fork runs) the state is `never-run`.
  *
  * The same run page feeds the default-branch CI alert (#446) through the
  * optional `onDefaultBranchRuns` hook, called once per complete

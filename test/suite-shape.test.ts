@@ -229,7 +229,7 @@ const PINS: Record<string, number> = {
   'decisions-service-integration.test.ts': 2,
   'decisions-shadow.test.ts': 29,
   'decisions.test.ts': 96,
-  'default-branch-ci.test.ts': 34,
+  'default-branch-ci.test.ts': 39,
   'deploy-drift.test.ts': 10,
   'dispatch-e2e.test.ts': 6,
   'dispatch-joins.test.ts': 2,

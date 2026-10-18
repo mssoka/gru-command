@@ -2397,6 +2397,7 @@ describe('GH-305 mailbox reconciliation through existing awareness gates', () =>
         basis: first.basis, state: 'waiting', owner: 'minion-j-fix', detail: 'waiting on fix job j-fix', dependency: 'j-fix',
         recheckAt: new Date(Date.now() + 3_600_000).toISOString(), references: first.references,
       });
+      // Five 1 s mailbox reconcile ticks: the waiting disposition admits no wake on any of them.
       vi.advanceTimersByTime(5000);
       expect(rig.turns()).toBe(1);
 
@@ -3344,10 +3345,14 @@ describe('red default branch alerts (#446)', () => {
         'the run, open a fix heist from the current head, and hold "incident:github.default-branch-ci-failed:<owner>/<repo>" ' +
         '(covers "ci-failed") with no basis_fingerprint, so the hold reaches every later head and later red heads of that ' +
         'repository carry the in-flight fix as a restriction; disposition each item as waiting on the fix job; a later red ' +
-        'head is a new item and wakes once.',
+        'head is a new item that resolves the earlier head\'s item and wakes once.',
     );
     expect(instruction).toContain('It resolves itself when a newer run of that workflow passes or the failing run is re-run green.');
-    expect(instruction).not.toContain('with the head SHA as basis_fingerprint');
+    // The SHA-basis rule is scoped to job-scoped kinds, so it never reaches the default-branch hold.
+    expect(instruction).toContain(
+      'for job-scoped alert kinds that is "job:<job id>" — for those job-scoped kinds use the head SHA as ' +
+        'basis_fingerprint only when the kind embeds one (github.ci-failed:<job>:<sha>)',
+    );
   });
 
   // Production always wires the mailbox, which owns admission (see the
