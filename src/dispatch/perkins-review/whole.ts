@@ -6,7 +6,7 @@ import type { AgentSpawner } from '../service.js';
 import type { AgentHandle, NativeAgentTool, PromptOptions } from '../../runtime/types.js';
 import type { PacingGate, PacingLease, PacingEventRecorder, RateLimitBackoffPolicy } from '../../runtime/pacing.js';
 import { withRateLimitRetries, type RateLimitRetryOptions } from '../../runtime/rate-limit-retry.js';
-import { assertFrozenPromptBounds, compatibleReviewIdentity, repositoryGitEnv, proveRecoveredBaseMergeability, publishedReportMatches, readReviewArtifact, readReviewCheckpoint, sourceMovementSinceFreeze, SPECIALIST_CHECKPOINT_MAX_BYTES, writeReviewArtifact, type FrozenReview, type SourceMovement, type SourceMovementOptions } from './artifacts.js';
+import { assertFrozenPromptBounds, compatibleReviewIdentity, frozenTreeSymlinks, materializeReviewView, repositoryGitEnv, proveRecoveredBaseMergeability, publishedReportMatches, readReviewArtifact, readReviewCheckpoint, sourceMovementSinceFreeze, SPECIALIST_CHECKPOINT_MAX_BYTES, writeReviewArtifact, type FrozenReview, type SourceMovement, type SourceMovementOptions } from './artifacts.js';
 import { applyConvergenceDeferral, classifyPriorFindings, convergedVerdict, deltaSince, integrationSince, parsePriorConvergenceMeta, probeIntegrationLineage, type DeltaSince, type PriorCarryClassification } from './convergence.js';
 import { MAX_PROPERTY_PROPOSALS_PER_ROUND, MAX_PROPERTY_PROPOSALS_PER_SUBMISSION, parsePropertyContractsSubmission, PROPERTY_CONTRACTS_INPUT_SCHEMA, PROPERTY_CONTRACTS_TOOL_NAME, recordPropertyProposals, renderPropertyContractsGuidance } from './property-contracts.js';
 import { propertyCampaignRunningForReview, propertyEvidenceForReview, renderPropertyCampaignEvidence } from '../../property/pipeline.js';
@@ -575,6 +575,15 @@ const GIT_PROOF_TIMEOUT_MS = 30_000;
  * and each read is a subprocess. The SHAs are immutable, so the cache is
  * safe for the whole round. */
 const blobCache = new WeakMap<FrozenReview, Map<string, string | null>>();
+
+/** Where reviewers read the frozen tree: the checkout itself, or — when the
+ * target tracks symlinks — a private view in which each link is a regular file
+ * holding its link text, so no read path can follow it. */
+const reviewTreeRoots = new WeakMap<FrozenReview, string>();
+
+function reviewTreeRoot(review: FrozenReview): string {
+  return reviewTreeRoots.get(review) ?? review.manifest.repoPath;
+}
 
 function frozenBlob(review: FrozenReview, path: string): string | null {
   let cache = blobCache.get(review);
@@ -1159,6 +1168,22 @@ export class PerkinsWholeReview {
   async run(input: RunWholeReviewInput): Promise<PerkinsWholeResult> {
     const review = input.frozenReview;
     assertFrozenPromptBounds(review);
+    // Re-derived from the frozen target (also refuses a link that escapes the
+    // repository), so a recovered round gets the same view as a fresh one.
+    const view = frozenTreeSymlinks(review.manifest.repoPath, review.manifest.targetSha).length === 0
+      ? null
+      : materializeReviewView(review.manifest.repoPath, review.manifest.targetSha);
+    if (view !== null) reviewTreeRoots.set(review, view.directory);
+    try {
+      return await this.runFrozen(input);
+    } finally {
+      reviewTreeRoots.delete(review);
+      view?.dispose();
+    }
+  }
+
+  private async runFrozen(input: RunWholeReviewInput): Promise<PerkinsWholeResult> {
+    const review = input.frozenReview;
     const propertyEvidence = propertyEvidenceForReview(review.manifest.repoPath, review.manifest.targetSha);
     if (propertyEvidence !== null) writeReviewArtifact(review, 'property/host-evidence.json', propertyEvidence);
     const catalog = input.noSpec
@@ -1554,7 +1579,7 @@ export class PerkinsWholeReview {
           // The blind child is rooted OUTSIDE the repository: even a future
           // tool leak would find no repo to read. Other children read the
           // frozen tree.
-          cwd: lens === 'blind' ? review.directory : review.manifest.repoPath,
+          cwd: lens === 'blind' ? review.directory : reviewTreeRoot(review),
           isolatedReview: {
             systemPrompt: lens === 'blind' ? BLIND_SYSTEM_PROMPT : LENS_SYSTEM_PROMPT,
             tools: lens === 'blind' ? [] : ['read', 'grep', 'find', 'ls'],
@@ -2746,7 +2771,7 @@ export class PerkinsWholeReview {
     try {
       reviewLease = await this.acquireReviewTurnSlot('lead', input.signal);
       lead = await boundedSpawn(() => this.spawner('perkins', {
-        cwd: review.manifest.repoPath,
+        cwd: reviewTreeRoot(review),
         reviewLead: {
           systemPrompt,
           tools: ['read', 'grep', 'find', 'ls'],

@@ -761,7 +761,7 @@ describe('whole-PR freeze (no chunk partitioning)', () => {
     })).toThrow(/frozen spec context exceeds/);
   });
 
-  it('rejects writeReviewArtifact traversal and unsafe round ids, and refuses a symlinked frozen tree', () => {
+  it('rejects writeReviewArtifact traversal and unsafe round ids, and refuses a frozen tree whose symlink escapes the repository', () => {
     const repo = makeFixtureRepo('whole-guards');
     repos.push(repo);
     const base = repo.head();
@@ -786,7 +786,7 @@ describe('whole-PR freeze (no chunk partitioning)', () => {
     expect(() => freezeReviewInputs({
       roundId: 'symlink-round', repoPath: symlinkRepo.path, artifactRoot: temp('perkins-symlink-'),
       baseRef: symlinkBase, targetRef: symlinkRepo.head(), movementRef: 'feature/symlink', spec: 'no symlinks',
-    })).toThrow(/symlink/);
+    })).toThrow(/symlink that escapes the repository.*: link -> \/etc\/hosts/);
   });
 
   it('rejects freezeReviewInputs ingress conflicts (spec+noSpec, neither) and an empty diff', () => {
