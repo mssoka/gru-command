@@ -1,12 +1,81 @@
-import { DEFAULT_DECISIONS_CONFIG } from '../config.js';
+import {
+  DEFAULT_DECISION_PROFILE,
+  DEFAULT_DECISIONS_CONFIG,
+  tomlString,
+  type DecisionsConfig,
+  type DecisionSurfaceConfig,
+} from '../config.js';
+import {
+  DECISION_SURFACE_ESCALATION_TRIAGE,
+  DECISION_SURFACE_EVENT_TRIAGE,
+  DECISION_SURFACE_SAME_BLOCKER,
+  DECISION_SURFACE_SUPERVISION,
+} from './questions.js';
 
 function bool(value: boolean): string {
   return value ? 'true' : 'false';
 }
 
-/** Complete installer-owned append fragment; every supported key is taught here. */
+/** Every live surface, listed explicitly so none rides the legacy no-mode behavior. */
+const FRESH_SURFACES: Readonly<Record<string, DecisionSurfaceConfig>> = Object.fromEntries(
+  [
+    DECISION_SURFACE_EVENT_TRIAGE,
+    DECISION_SURFACE_SUPERVISION,
+    DECISION_SURFACE_ESCALATION_TRIAGE,
+    DECISION_SURFACE_SAME_BLOCKER,
+  ].map((name) => [name, { provider: DEFAULT_DECISION_PROFILE, mode: 'shadow' }]),
+);
+
+/** Surface and profile names are bare TOML keys: the loader only accepts
+ * the `DECISION_SURFACES` names and `[A-Za-z0-9_-]+` profiles. */
+function surfaceLines(surfaces: Readonly<Record<string, DecisionSurfaceConfig>>): string[] {
+  return Object.entries(surfaces).flatMap(([name, surface]) => [
+    `[decisions.surfaces.${name}]`,
+    ...(surface.provider === undefined ? [] : [`provider = ${tomlString(surface.provider)}`]),
+    ...(surface.mode === undefined ? [] : [`mode = ${tomlString(surface.mode)}`]),
+    '',
+  ]);
+}
+
+function providerLines(providers: DecisionsConfig['providers']): string[] {
+  return Object.entries(providers).flatMap(([name, profile]) => [
+    '',
+    `[decisions.providers.${name}]`,
+    `protocol = ${tomlString(profile.protocol)}`,
+    `endpoint = ${tomlString(profile.endpoint)}`,
+    `model = ${tomlString(profile.model)}`,
+    `credential = ${tomlString(profile.credential)}`,
+    `timeout_ms = ${profile.timeoutMs}`,
+    `input_price_per_mtok = ${profile.inputPricePerMtok}`,
+  ]);
+}
+
+/** Complete installer-owned fragment for a fresh config; every supported key is taught here. */
 export function decisionsConfigTemplate(enabled = false): string {
-  const defaults = DEFAULT_DECISIONS_CONFIG;
+  const config = { ...DEFAULT_DECISIONS_CONFIG, jev: { ...DEFAULT_DECISIONS_CONFIG.jev, enabled } };
+  return renderDecisions(config, FRESH_SURFACES);
+}
+
+/**
+ * The fragment for a regenerated config: every value comes from `prior`, the
+ * loaded config. A config that enabled Jev or named surfaces keeps exactly its
+ * own surface entries, because an absent mode is the legacy pre-#223 behavior
+ * and must not silently become shadow. A config with Jev off and no surfaces
+ * (every config written before the fragment shipped, or one switched off
+ * after legacy use) has no surface behavior to keep, so it gets the fresh
+ * shadow entries: turning Jev on later only records, never acts.
+ */
+export function decisionsConfigFor(prior: DecisionsConfig | null): string {
+  if (prior === null) return decisionsConfigTemplate();
+  const configured = prior.jev.enabled || Object.keys(prior.surfaces).length > 0;
+  return renderDecisions(prior, configured ? prior.surfaces : FRESH_SURFACES);
+}
+
+function renderDecisions(
+  config: DecisionsConfig,
+  surfaces: Readonly<Record<string, DecisionSurfaceConfig>>,
+): string {
+  const { jev, thresholds } = config;
   return [
     '# ── Jev decisions (optional) ─────────────────────────────────────────',
     '# Jev is a small, cheap "System One" decision model (TypeSafe, via OpenRouter).',
@@ -19,10 +88,10 @@ export function decisionsConfigTemplate(enabled = false): string {
     '# then verify (no key material printed):',
     '#   node dist/decisions/cli.js status --json   and   node dist/decisions/cli.js check --json',
     '[decisions.jev]',
-    `enabled = ${bool(enabled)} # MASTER SWITCH. Off = no surface ever asks a provider. Hot-reloads; store the key first.`,
-    `model = "${defaults.jev.model}" # OpenRouter Jev alias; feeds the openrouter-jev profile below.`,
-    `endpoint = "${defaults.jev.endpoint}" # Credential-bearing traffic is restricted to this exact HTTPS endpoint.`,
-    `timeout_ms = ${defaults.jev.timeoutMs} # Per-call limit; on timeout the deterministic answer is used. Raise it if timeouts recur on a healthy network.`,
+    `enabled = ${bool(jev.enabled)} # MASTER SWITCH. Off = no surface ever asks a provider. Hot-reloads; store the key first.`,
+    `model = ${tomlString(jev.model)} # OpenRouter Jev alias; feeds the openrouter-jev profile below.`,
+    `endpoint = ${tomlString(jev.endpoint)} # Credential-bearing traffic is restricted to this exact HTTPS endpoint.`,
+    `timeout_ms = ${jev.timeoutMs} # Per-call limit; on timeout the deterministic answer is used. Raise it if timeouts recur on a healthy network.`,
     '',
     '# ── Surface modes: how each decision point uses Jev ──────────────────',
     '# With the master switch on, every [decisions.surfaces.<surface>] picks a mode:',
@@ -41,36 +110,35 @@ export function decisionsConfigTemplate(enabled = false): string {
     '#                     <data_dir>/decisions/backtests/<surface>.json by:',
     '#                       node dist/decisions/cli.js extract-cases --surface <s> --out <jsonl>',
     '#                       node dist/decisions/cli.js backtest --surface <s> --profile <p> --cases <jsonl> --threshold <min> --save',
+    '#                     Not usable on any surface yet (see each one below).',
+    '#                     Setting it anywhere still makes a transient (timeout,',
+    '#                     network or provider-error) outage of the default',
+    '#                     openrouter-jev profile page you instead of a board FYI.',
     '#   (no mode key)     Legacy, pre-#223: for event_triage and supervision_guidance',
-    '#                     Gru Command USES Jev\'s answer with NO backtest gate.',
-    '#                     Keep those two listed explicitly (as below) unless you',
-    '#                     mean that.',
+    '#                     Gru Command USES Jev\'s answer with NO backtest gate;',
+    '#                     escalation_triage, same_blocker and report_conclusion are never asked.',
+    '#                     A mode-less event_triage or supervision_guidance also makes',
+    '#                     a transient outage page you.',
+    '#                     Give every surface an explicit mode unless you mean that.',
     '#',
-    '# Surfaces:',
+    '# Surfaces (the complete list; any other name fails to load):',
     '#   event_triage          does an orchestration event need attention? (may only raise attention, never lower it)',
+    '#                         off or shadow today: no registered backtest, so enforce rejects every',
+    '#                         Jev ask (the deterministic answer still serves) and opens an owner incident',
     '#   supervision_guidance  classifies a runtime failure: restart vs escalate (restart counters stay deterministic)',
-    '#   escalation_triage     is a Silas escalation a ruling or a status report? (shadow only today)',
-    '#   same_blocker          is this review blocker the same defect as last round? (shadow only today)',
-    '#   report_conclusion     clean pass / findings / inconclusive (backtest only; no live host yet)',
+    '#                         off or shadow today: no registered backtest, so enforce rejects every',
+    '#                         Jev ask (the deterministic answer still serves) and opens an owner incident',
+    '#                         (its host asks even with the master switch off, so this incident opens then too)',
+    '#   escalation_triage     is a Silas escalation a ruling or a status report?',
+    '#                         off or shadow today: it asks Jev only in shadow, so enforce never asks',
+    '#   same_blocker          is this review blocker the same defect as last round?',
+    '#                         off or shadow today: it asks Jev only in shadow, so enforce never asks',
+    '#   report_conclusion     clean pass / findings / inconclusive',
+    '#                         backtest only: no live host yet, so enforce never asks',
     '#',
-    '# `provider` routes a surface to a provider profile (default: openrouter-jev).',
-    '# Shorthand for routing only:  [decisions.surfaces]  event_triage = "typesafe-direct"',
-    '[decisions.surfaces.event_triage]',
-    'provider = "openrouter-jev"',
-    'mode = "shadow"',
-    '',
-    '[decisions.surfaces.supervision_guidance]',
-    'provider = "openrouter-jev"',
-    'mode = "shadow"',
-    '',
-    '[decisions.surfaces.escalation_triage]',
-    'provider = "openrouter-jev"',
-    'mode = "shadow"',
-    '',
-    '[decisions.surfaces.same_blocker]',
-    'provider = "openrouter-jev"',
-    'mode = "shadow"',
-    '',
+    '# `provider` routes a surface to a provider profile (default: openrouter-jev);',
+    '# change it in the surface\'s own table.',
+    ...surfaceLines(surfaces),
     '# ── Provider profiles (optional) ─────────────────────────────────────',
     '# Built-ins always exist: openrouter-jev (default), typesafe-direct and local.',
     '# Override one by re-declaring it, or define your own under a new name.',
@@ -90,25 +158,27 @@ export function decisionsConfigTemplate(enabled = false): string {
     '# model = "laya-421m"',
     '# credential = "none" # keyless is allowed ONLY for loopback hosts',
     '# timeout_ms = 5000',
+    '# input_price_per_mtok = 0 # an omitted price falls back to 0.042, not the built-in\'s 0',
+    ...providerLines(config.providers),
     '',
     '# ── Confidence thresholds (by risk class) ────────────────────────────',
     '# Read-only classification: mistakes are recoverable, so confidence bars are lower.',
     '[decisions.thresholds.read_only]',
-    `act = ${defaults.thresholds.read_only.act} # metric >= act enters the high band.`,
-    `confirm = ${defaults.thresholds.read_only.confirm} # confirm <= metric < act flags for confirmation.`,
-    `require_confirm_on_act = ${bool(defaults.thresholds.read_only.requireConfirmOnAct)} # High read-only routes need no added confirmation.`,
+    `act = ${thresholds.read_only.act} # metric >= act enters the high band.`,
+    `confirm = ${thresholds.read_only.confirm} # confirm <= metric < act flags for confirmation.`,
+    `require_confirm_on_act = ${bool(thresholds.read_only.requireConfirmOnAct)} # High read-only routes need no added confirmation.`,
     '',
     '# Operational routing can spend turns/quota or alter restart guidance.',
     '[decisions.thresholds.operational]',
-    `act = ${defaults.thresholds.operational.act} # High-confidence operational guidance is eligible within existing authority.`,
-    `confirm = ${defaults.thresholds.operational.confirm} # Medium confidence flags; below this uses deterministic fallback.`,
-    `require_confirm_on_act = ${bool(defaults.thresholds.operational.requireConfirmOnAct)} # Existing operational guards still apply.`,
+    `act = ${thresholds.operational.act} # High-confidence operational guidance is eligible within existing authority.`,
+    `confirm = ${thresholds.operational.confirm} # Medium confidence flags; below this uses deterministic fallback.`,
+    `require_confirm_on_act = ${bool(thresholds.operational.requireConfirmOnAct)} # Existing operational guards still apply.`,
     '',
     '# Destructive routing never grants permission: every passable band still requires a human.',
     '[decisions.thresholds.destructive]',
-    `act = ${defaults.thresholds.destructive.act} # High bar for destructive triage.`,
-    `confirm = ${defaults.thresholds.destructive.confirm} # Medium band pauses/asks; below uses deterministic fallback.`,
-    `require_confirm_on_act = ${bool(defaults.thresholds.destructive.requireConfirmOnAct)} # Must stay true; config validation rejects false.`,
+    `act = ${thresholds.destructive.act} # High bar for destructive triage.`,
+    `confirm = ${thresholds.destructive.confirm} # Medium band pauses/asks; below uses deterministic fallback.`,
+    `require_confirm_on_act = ${bool(thresholds.destructive.requireConfirmOnAct)} # Must stay true; config validation rejects false.`,
     '',
   ].join('\n');
 }

@@ -3,6 +3,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawnSync } from 'node:child_process';
+import { loadConfig } from '../src/config.js';
+import { parseAnswers } from '../src/wizard/answers.js';
+import { generateConfigToml } from '../src/wizard/steps.js';
 
 const CLI = join(process.cwd(), 'dist', 'decisions', 'cli.js');
 const cleanup: string[] = [];
@@ -46,6 +49,27 @@ describe('compiled decisions CLI seam', () => {
     expect(off.stdout).toContain('require_confirm_on_act = true');
     expect(off.stdout).toContain('enabled = false');
     expect(on.stdout).toBe(off.stdout.replace('enabled = false', 'enabled = true'));
+    // Copied into a config generated before the block shipped, it loads.
+    const appended = home();
+    const workspace = join(appended.root, 'workspace');
+    mkdirSync(join(workspace, 'alpha', '.git'), { recursive: true });
+    mkdirSync(appended.instance, { recursive: true });
+    const generated = generateConfigToml({
+      answers: parseAnswers(JSON.stringify({ workspace_root: workspace, repos: ['alpha'] })),
+      instanceDir: appended.instance,
+    });
+    const preBlock = generated.slice(0, generated.indexOf('# ── Jev decisions'));
+    expect(preBlock).not.toContain('[decisions');
+    writeFileSync(join(appended.instance, 'config.toml'), `${preBlock}\n${on.stdout}`);
+    const decisions = loadConfig({ GRU_COMMAND_HOME: appended.instance }, appended.root).decisions;
+    expect(decisions.jev.enabled).toBe(true);
+    expect(Object.keys(decisions.surfaces)).toEqual([
+      'event_triage',
+      'supervision_guidance',
+      'escalation_triage',
+      'same_blocker',
+    ]);
+    expect(Object.values(decisions.surfaces).every((surface) => surface.mode === 'shadow')).toBe(true);
   });
 
   it('stores one stdin-only key atomically, never echoes it, and resolves it after a fresh process restart', () => {

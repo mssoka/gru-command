@@ -16,6 +16,14 @@ export const DECISION_SURFACE_SUPERVISION = 'supervision_guidance';
 export const DECISION_SURFACE_ESCALATION_TRIAGE = 'escalation_triage';
 export const DECISION_SURFACE_SAME_BLOCKER = 'same_blocker';
 export const DECISION_SURFACE_REPORT_CONCLUSION = 'report_conclusion';
+/** Every surface `[decisions.surfaces]` may name; anything else is a typo. */
+export const DECISION_SURFACES = [
+  DECISION_SURFACE_EVENT_TRIAGE,
+  DECISION_SURFACE_SUPERVISION,
+  DECISION_SURFACE_ESCALATION_TRIAGE,
+  DECISION_SURFACE_SAME_BLOCKER,
+  DECISION_SURFACE_REPORT_CONCLUSION,
+] as const;
 
 const SECRET_KEY_CANONICAL = /(?:authorization|proxyauthorization|apikey|token|accesstoken|refreshtoken|idtoken|password|passwd|secret|clientsecret|credential|cookie|sessionid|sessionkey|sessiontoken|awssecretaccesskey|privatekey)/i;
 const SECRET_FIELD = String.raw`(?:authorization|proxy[-_\s]?authorization|api[-_\s]?key|(?:access|refresh|id)[-_\s]?token|token|password|passwd|(?:client[-_\s]?)?secret|credential|cookie|session[-_\s]?(?:id|key|token)|aws[-_\s]?secret[-_\s]?access[-_\s]?key|private[-_\s]?key)`;

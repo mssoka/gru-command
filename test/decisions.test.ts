@@ -28,6 +28,7 @@ import {
   writeCredential,
 } from '../src/decisions/credentials.js';
 import {
+  DECISION_SURFACES,
   ESCALATION_TRIAGE_QUESTIONS,
   REPORT_CONCLUSION_QUESTIONS,
   SAME_BLOCKER_QUESTIONS,
@@ -44,7 +45,7 @@ import {
   supervisionDecisionRequest,
 } from '../src/decisions/questions.js';
 import type { EscalationFacts } from '../src/decisions/questions.js';
-import { surfaceCaseSpec } from '../src/decisions/cases/registry.js';
+import { BACKTEST_SURFACES, surfaceCaseSpec } from '../src/decisions/cases/registry.js';
 import { ProfileDecisionService, ProfileProvider } from '../src/decisions/provider.js';
 import { checkDecisionProfile, DecisionRuntime, TRANSIENT_RECHECK_FACTORS } from '../src/decisions/runtime.js';
 import { deterministicOutcome } from '../src/decisions/service.js';
@@ -1652,15 +1653,32 @@ describe('decision profile review fixes', () => {
     const merged = effectiveDecisionProviders(hostile);
     expect(Object.prototype.hasOwnProperty.call(merged, '__proto__')).toBe(true);
     expect(merged['__proto__']).toMatchObject({ model: 'injected' });
-    // A surface naming an inherited member is rejected loudly — by the name
-    // pattern for mixed-case members, and by the own-property existence
-    // check for any that slipped through (never silently accepted as a
-    // valid profile route).
+    // A surface naming an inherited member is rejected loudly by the known
+    // surface allowlist (never silently accepted as a valid profile route).
     const instance = writeInstanceConfig(temp('gru-222-review-proto-'), [
       '[decisions.surfaces]',
       'toString = "local"',
     ].join('\n'));
-    expect(() => loadConfig({ GRU_COMMAND_HOME: instance }, temp('gru-decisions-home-'))).toThrow(/surface name|unknown provider profile/);
+    expect(() => loadConfig({ GRU_COMMAND_HOME: instance }, temp('gru-decisions-home-'))).toThrow(/unknown decision surface `toString`/);
+  });
+
+  it('rejects a misspelled surface name in either form, naming the valid surfaces', () => {
+    for (const [name, body] of [
+      ['event_triag', '[decisions.surfaces.event_triag]\nmode = "shadow"\n'],
+      ['event_triag', '[decisions.surfaces]\nevent_triag = "local"\n'],
+      ['event-triage', '[decisions.surfaces.event-triage]\nmode = "shadow"\n'],
+      ['event-triage', '[decisions.surfaces]\n"event-triage" = "local"\n'],
+      ['Event_Triage', '[decisions.surfaces.Event_Triage]\nmode = "shadow"\n'],
+    ] as const) {
+      const instance = writeInstanceConfig(temp('gru-decisions-surface-typo-'), body);
+      expect(() => loadConfig({ GRU_COMMAND_HOME: instance }, temp('gru-decisions-home-'))).toThrow(
+        `unknown decision surface \`${name}\` in [decisions.surfaces] (valid surfaces: event_triage, supervision_guidance, escalation_triage, same_blocker, report_conclusion)`,
+      );
+    }
+  });
+
+  it('every surface with a registered backtest can be configured', () => {
+    for (const surface of BACKTEST_SURFACES) expect(DECISION_SURFACES).toContain(surface);
   });
 
   it('defaults to resolved credential mode: an omitted mode can never free-route a slot key', () => {

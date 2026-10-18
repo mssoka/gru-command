@@ -13,15 +13,18 @@ import {
 import { join } from 'node:path';
 import { parse } from 'smol-toml';
 import { homedir } from 'node:os';
-import { configPathFor, DEFAULT_INSTANCE_PORT, expandTilde, type GruCommandConfig, loadConfig } from '../config.js';
-import { discoverManagedRepos } from '../repos/discovery.js';
 import {
-  renderReferenceConfig,
-  tomlString,
-} from '../config-reference.js';
+  configPathFor,
+  DEFAULT_INSTANCE_PORT,
+  expandTilde,
+  type GruCommandConfig,
+  loadConfig,
+} from '../config.js';
+import { discoverManagedRepos } from '../repos/discovery.js';
+import { renderReferenceConfig } from '../config-reference.js';
 import { DEFAULT_NEW_INSTALL_RUNTIME, type WizardAnswers } from './answers.js';
 
-export { tomlString, discoverManagedRepos };
+export { discoverManagedRepos };
 
 /**
  * Wizard steps (E9): the pure, testable half of the setup wizard —

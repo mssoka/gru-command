@@ -272,8 +272,22 @@ It is **off by default**. While it is off, deterministic code makes every decisi
 
 - **Shadow mode first.** You start in shadow mode: Jev is asked and its answers are recorded in the ledger (`decisions.shadow`), but Gru Command keeps using the deterministic answer. Behaviour cannot change.
 - **The cost is tiny.** Jev costs about $0.04 per million input tokens, and a decision is a few hundred tokens (about $0.00002). Use a **dedicated OpenRouter key with a low credit limit**.
-- **Enforcement is gated.** Moving a surface from shadow to `enforce` requires a recorded backtest that meets its threshold, and your explicit decision. See the [Jev guide](docs/jev-production-integration.md).
+- **Enforcement is gated.** Moving a surface from shadow to `enforce` requires a recorded backtest that meets its threshold, and your explicit decision. It is not usable on any surface yet. See the [Jev guide](docs/jev-production-integration.md).
 - **Authority stays with you.** Jev never decides merges, review verdicts, restarts or owner-only rulings. If OpenRouter is unreachable, Gru Command falls back to deterministic behaviour.
+
+Every command below (`npm run config:generate` and each `dist/decisions/cli.js` call) reads the instance from `GRU_COMMAND_HOME` (default `~/.gru-command`). If your service uses another value, export it first. `install.sh` wrote it into the service file; run the block for your OS. It exports nothing when the file has no value, and prints the instance the commands will use:
+
+```bash
+# macOS
+v="$(plutil -extract EnvironmentVariables.GRU_COMMAND_HOME raw -o - ~/Library/LaunchAgents/com.gru-command.service.plist 2>/dev/null)"; [ -n "$v" ] && export GRU_COMMAND_HOME="$v"; unset v
+echo "instance: ${GRU_COMMAND_HOME:-$HOME/.gru-command}"
+```
+
+```bash
+# Linux (systemd uses the last assignment; install.sh quotes a path containing spaces, tr drops those quotes)
+v="$(sed -n 's/^Environment=GRU_COMMAND_HOME=//p' "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/gru-command.service" 2>/dev/null | tail -n 1 | tr -d '"')"; [ -n "$v" ] && export GRU_COMMAND_HOME="$v"; unset v
+echo "instance: ${GRU_COMMAND_HOME:-$HOME/.gru-command}"
+```
 
 **1. Store the key.** Use stdin only: never pass the key on the command line or put it in `config.toml`.
 
@@ -301,10 +315,16 @@ This writes `~/.gru-command/credentials/openrouter.key` (or under `$GRU_COMMAND_
 |---|---|
 | `off` | Deterministic only; Jev is never asked |
 | `shadow` | Asks Jev and records its answer, but always uses the deterministic answer. **Start here.** |
-| `enforce` | Uses Jev's answer, with deterministic fallback. It refuses to run until a recorded backtest meets its threshold. |
-| *(no mode key)* | Legacy behaviour, for `event_triage` and `supervision_guidance` only: uses Jev's answer with **no** backtest gate. Avoid it by listing those surfaces explicitly. |
+| `enforce` | Uses Jev's answer, with deterministic fallback. It refuses to run until a recorded backtest meets its threshold. Not usable on any surface yet: on `event_triage` and `supervision_guidance` it rejects every Jev ask (the deterministic answer still serves) and opens an owner incident, elsewhere it never asks, and anywhere it makes a transient default-profile outage page you. |
+| *(no mode key)* | Legacy behaviour. `event_triage` and `supervision_guidance` use Jev's answer with **no** backtest gate, and a transient outage pages you; `escalation_triage`, `same_blocker` and `report_conclusion` never ask Jev. Avoid it by giving every surface an explicit mode. |
 
-**2. Enable Jev in shadow mode.** Add this to `~/.gru-command/config.toml`. The service hot-reloads this section, so no restart is needed. Keep every surface listed explicitly: a surface that isn't listed would act on Jev's answer instead of only recording it.
+**2. Enable Jev in shadow mode.** The service hot-reloads this section, so no restart is needed. Give every surface an explicit `mode = "shadow"`: an unlisted or mode-less `event_triage` or `supervision_guidance` would act on Jev's answer instead of only recording it.
+
+- **Fresh install:** your `config.toml` already contains the Jev block, switched off, with every surface in shadow. Set `enabled = true` in its `[decisions.jev]` table. Edit in place; a pasted second copy of a table fails to load.
+- **Older config, Jev off, no surface listed:** run `npm run config:generate -- --force` from the install directory first, then set `enabled = true`. It backs the old file up and keeps your values, but drops hand-written comments; the [Jev guide](docs/jev-production-integration.md#configuration) has the details.
+- **Older config with Jev on, or with any surface listed:** a regenerate keeps exactly those surface entries (none, if none are listed). With Jev on and no surface listed, every transient outage pages you and two surfaces act ungated, so fix it now: set `enabled = false` (hot-reloads), run `npm run config:generate -- --force` (it drops hand-written comments; the backup keeps them), then set `enabled = true` again. Otherwise edit by hand: set `mode = "shadow"` in each existing surface table, turn a shorthand `event_triage = "<profile>"` key into a table that keeps `provider = "<profile>"`, then add only the missing tables. Do it before turning Jev on, or right away if it is already on.
+
+The Jev and surface tables should read as follows (any provider and threshold tables after them stay as they are):
 
 ```toml
 [decisions.jev]
@@ -333,9 +353,12 @@ mode = "shadow"
 **3. Verify.** No key material is printed.
 
 ```bash
-node dist/decisions/cli.js status --json   # credential_present: true, credential_source: "file"
-node dist/decisions/cli.js check --json    # one tiny live probe; expect "status":"ready"
+# An OPENROUTER_API_KEY exported in your shell outranks the key file; use env -u so you see what the service sees
+env -u OPENROUTER_API_KEY node dist/decisions/cli.js status --json   # credential_present: true, credential_source: "file"
+env -u OPENROUTER_API_KEY node dist/decisions/cli.js check --json    # one tiny live probe; expect "status":"ready"
 ```
+
+`install.sh` puts no key variable in the service unit, so unless you added one to the service's environment, the service uses the key file. If the service does get `OPENROUTER_API_KEY` from its environment (check with `launchctl getenv OPENROUTER_API_KEY` on macOS or `systemctl --user show-environment` on Linux), run these commands with that value exported instead, and expect `credential_source: "environment"`.
 
 `check` only probes while `enabled = true`; while Jev is off it reports `disabled`. If it isn't `ready`, set `enabled = false` until it is. Otherwise a running service reports the provider as degraded and raises an alert.
 

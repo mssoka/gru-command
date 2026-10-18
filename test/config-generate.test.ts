@@ -100,6 +100,7 @@ describe('config-generate CLI', () => {
       'concurrency',
       'review',
       'verify',
+      'decisions',
     ]);
     for (const section of [
       '[server]',
@@ -255,6 +256,140 @@ describe('config-generate CLI', () => {
       lock_wait_timeout_ms: 900000,
       run_timeout_ms: 1800000,
     });
+  });
+
+  it('a fresh config ships the Jev decisions block disabled, every surface in shadow', () => {
+    const root = tempDir('gru-command-config-jev-fresh-');
+    const instance = join(root, 'instance');
+    const result = run(instance);
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    const decisions = (parse(readFileSync(join(instance, 'config.toml'), 'utf-8')) as {
+      decisions: {
+        jev: { enabled: boolean };
+        surfaces: Record<string, { mode: string }>;
+        thresholds: { destructive: { require_confirm_on_act: boolean } };
+      };
+    }).decisions;
+    expect(decisions.jev.enabled).toBe(false);
+    expect(Object.keys(decisions.surfaces).sort()).toEqual([
+      'escalation_triage',
+      'event_triage',
+      'same_blocker',
+      'supervision_guidance',
+    ]);
+    for (const surface of Object.values(decisions.surfaces)) expect(surface.mode).toBe('shadow');
+    expect(decisions.thresholds.destructive.require_confirm_on_act).toBe(true);
+  });
+
+  /** Write `decisions` lines under a minimal prior config, run `--force`, and
+   * return the loaded decisions before and after the regenerate. */
+  function regenerateDecisions(label: string, decisions: readonly string[]) {
+    const root = tempDir(`gru-command-config-jev-${label}-`);
+    const instance = join(root, 'instance');
+    const workspace = join(root, 'workspace');
+    mkdirSync(join(workspace, 'alpha', '.git'), { recursive: true });
+    mkdirSync(instance, { recursive: true });
+    writeFileSync(
+      join(instance, 'config.toml'),
+      [`workspace_root = ${JSON.stringify(workspace)}`, 'managed_repos = ["alpha"]', ...decisions, ''].join('\n'),
+    );
+    const before = loadConfig({ GRU_COMMAND_HOME: instance }, root).decisions;
+    const result = run(instance, ['--force']);
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    return { before, after: loadConfig({ GRU_COMMAND_HOME: instance }, root).decisions };
+  }
+
+  const FRESH_SHADOW_SURFACES = {
+    event_triage: { provider: 'openrouter-jev', mode: 'shadow' },
+    supervision_guidance: { provider: 'openrouter-jev', mode: 'shadow' },
+    escalation_triage: { provider: 'openrouter-jev', mode: 'shadow' },
+    same_blocker: { provider: 'openrouter-jev', mode: 'shadow' },
+  };
+
+  it('a --force re-run keeps every operator-set Jev value instead of resetting it', () => {
+    const { before, after } = regenerateDecisions('rerun', [
+      '[decisions.jev]',
+      'enabled = true',
+      'model = "jev \\"beta\\" \\\\b"',
+      'timeout_ms = 9000',
+      '[decisions.surfaces.event_triage]',
+      'provider = "mine"',
+      'mode = "enforce"',
+      '[decisions.providers.mine]',
+      'protocol = "systemone"',
+      'endpoint = "http://127.0.0.1:8088/v1/systemone"',
+      'model = "laya-421m"',
+      'credential = "none"',
+      'timeout_ms = 3000',
+      'input_price_per_mtok = 0',
+      '[decisions.thresholds.operational]',
+      'act = 0.8',
+      'confirm = 0.6',
+    ]);
+    expect(after).toEqual(before);
+    expect(after.jev).toMatchObject({ enabled: true, model: 'jev "beta" \\b', timeoutMs: 9000 });
+    expect(after.surfaces).toEqual({ event_triage: { provider: 'mine', mode: 'enforce' } });
+    expect(after.providers['mine']?.inputPricePerMtok).toBe(0);
+    expect(after.thresholds.operational).toMatchObject({ act: 0.8, confirm: 0.6 });
+  });
+
+  function expectConfiguredSurfacesKept(decisions: readonly string[], surfaces: Record<string, unknown>): void {
+    const { before, after } = regenerateDecisions('configured', decisions);
+    expect(after).toEqual(before);
+    expect(after.surfaces).toEqual(surfaces);
+  }
+
+  it('a --force re-run keeps legacy Jev-on with no surfaces listed (never shadow)', () => {
+    expectConfiguredSurfacesKept(['[decisions.jev]', 'enabled = true'], {});
+  });
+
+  it('a --force re-run keeps surfaces named while Jev is off (never shadow)', () => {
+    expectConfiguredSurfacesKept(
+      [
+        '[decisions.jev]',
+        'enabled = false',
+        '[decisions.surfaces.event_triage]',
+        'mode = "off"',
+        '[decisions.surfaces.supervision_guidance]',
+        'provider = "typesafe-direct"',
+      ],
+      { event_triage: { mode: 'off' }, supervision_guidance: { provider: 'typesafe-direct' } },
+    );
+  });
+
+  it('a --force re-run keeps shorthand routing with no mode (never shadow)', () => {
+    expectConfiguredSurfacesKept(
+      ['[decisions.jev]', 'enabled = true', '[decisions.surfaces]', 'event_triage = "typesafe-direct"'],
+      { event_triage: { provider: 'typesafe-direct' } },
+    );
+  });
+
+  function expectFreshShadowSurfaces(decisions: readonly string[]): void {
+    const { before, after } = regenerateDecisions('unconfigured', decisions);
+    expect({ ...after, surfaces: before.surfaces }).toEqual(before);
+    expect(after.surfaces).toEqual(FRESH_SHADOW_SURFACES);
+  }
+
+  it('a --force re-run over a config written before the Jev block shipped gets the shadow surfaces', () => {
+    expectFreshShadowSurfaces([]);
+  });
+
+  it('a --force re-run with Jev switched off and no surfaces gets the shadow surfaces', () => {
+    expectFreshShadowSurfaces([
+      '[decisions.jev]',
+      'enabled = false',
+      'timeout_ms = 7000',
+      '[decisions.providers.mine]',
+      'protocol = "systemone"',
+      'endpoint = "http://127.0.0.1:8088/v1/systemone"',
+      'model = "laya-421m"',
+      'credential = "none"',
+      'timeout_ms = 3000',
+      'input_price_per_mtok = 0',
+      '[decisions.thresholds.read_only]',
+      'act = 0.7',
+      'confirm = 0.5',
+    ]);
   });
 
   it('round trip: a --force re-run preserves user-set values and hand-tuned sections, with backup', () => {
