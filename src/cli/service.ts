@@ -3,6 +3,8 @@ import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, type GruCommandConfig } from '../config.js';
+import { readBuildInfo, type BuildInfo } from '../build-info.js';
+import { SERVICE_NAME, VERSION } from '../version.js';
 import { defaultListenerProbe, type ListenerOwner, type ListenerProbe } from '../listener-probe.js';
 import type { RollState } from '../roll/state.js';
 import { runResetCli, type ResetCliDeps } from './reset.js';
@@ -11,14 +13,15 @@ import { runResetCli, type ResetCliDeps } from './reset.js';
  * `gru-service` — the operator CLI for the service's own lifecycle.
  *
  *   gru-service roll [--no-wait] [--json] [--reason <text>] [--timeout-ms <n>]
+ *   gru-service version [--json]                 (offline: no service needed)
  *   gru-service reset [--yes] [--delete-branches] [--delete-refs]   (src/cli/reset.ts)
  *
- * The command asks the running service to roll itself (POST /api/roll,
- * operator-guarded with the pairing token) and — unless --no-wait —
- * follows the roll record until the relaunched service reports the target
- * build SHA on /health. An accepted roll always completes the service-side
- * handoff even if this CLI is interrupted: exit 75 signals the OS service
- * manager to relaunch the unit.
+ * The roll command asks the running service to roll itself (POST
+ * /api/roll, operator-guarded with the pairing token) and — unless
+ * --no-wait — follows the roll record until the relaunched service
+ * reports the target build SHA on /health. An accepted roll always
+ * completes the service-side handoff even if this CLI is interrupted:
+ * exit 75 signals the OS service manager to relaunch the unit.
  */
 
 const DEFAULT_FOLLOW_TIMEOUT_MS = 30 * 60_000;
@@ -26,6 +29,7 @@ const POLL_INTERVAL_MS = 2_000;
 const HEALTH_VERIFY_TIMEOUT_MS = 60_000;
 
 const USAGE = `usage: gru-service roll [--no-wait] [--json] [--reason <text>] [--timeout-ms <n>]
+       gru-service version [--json]
        gru-service reset [--yes] [--delete-branches] [--delete-refs]
 
   roll   pull + rebuild the deploy clone on the running service, drain
@@ -35,6 +39,66 @@ const USAGE = `usage: gru-service roll [--no-wait] [--json] [--reason <text>] [-
          repositories and empty the data directory, keeping config.toml
          (gru-service reset --help).
 `;
+
+const VERSION_USAGE = `usage: gru-service version [--json]
+
+  version  print the installed GC version and the build stamp this
+           installation was compiled from (no config, no network).
+`;
+
+/** The installed CLI's own identity — package version plus the build
+ * stamp written at build time. Not the RUNNING service's identity: this
+ * command is offline and never guesses across a mismatched checkout. */
+export interface VersionInfo {
+  readonly service: string;
+  readonly version: string;
+  readonly rev: string | null;
+  readonly committedAt: string | null;
+  readonly builtAt: string | null;
+}
+
+export function currentVersionInfo(build: BuildInfo = readBuildInfo()): VersionInfo {
+  return {
+    service: SERVICE_NAME,
+    version: VERSION,
+    rev: build.rev,
+    committedAt: build.committedAt,
+    builtAt: build.builtAt,
+  };
+}
+
+/** Machine form is one JSON object; human form is one line a user can
+ * paste into a bug report. */
+export function formatVersion(info: VersionInfo, json: boolean): string {
+  if (json) return JSON.stringify(info);
+  const rev = info.rev === null ? 'unknown' : info.rev.slice(0, 7);
+  const when = info.committedAt ?? info.builtAt;
+  return `${info.service} ${info.version} · build ${rev}${when === null ? '' : ` (${when})`}`;
+}
+
+export interface VersionCliDeps {
+  readonly stdout: (line: string) => void;
+  readonly stderr: (line: string) => void;
+  readonly build: () => BuildInfo;
+}
+
+/** `gru-service version [--json]`: offline, strict, no config read. */
+export function runVersionCli(args: readonly string[], deps: VersionCliDeps): number {
+  let json = false;
+  for (const arg of args) {
+    if (arg === '--json') json = true;
+    else if (arg === '-h' || arg === '--help') {
+      deps.stderr(VERSION_USAGE.trimEnd());
+      return 0;
+    } else {
+      deps.stderr(`gru-service: unknown argument: ${arg}`);
+      deps.stderr(VERSION_USAGE.trimEnd());
+      return 2;
+    }
+  }
+  deps.stdout(formatVersion(currentVersionInfo(deps.build()), json));
+  return 0;
+}
 
 export interface ServiceCliOptions {
   readonly action: 'roll';
@@ -158,8 +222,15 @@ function phaseLine(state: RollState): string {
 
 export async function runServiceCli(
   argv: readonly string[],
-  overrides: Partial<ServiceCliDeps> & { readonly reset?: Partial<ResetCliDeps> } = {},
+  overrides: Partial<ServiceCliDeps> & { readonly reset?: Partial<ResetCliDeps>; readonly build?: () => BuildInfo } = {},
 ): Promise<number> {
+  if (argv[0] === 'version') {
+    return runVersionCli(argv.slice(1), {
+      stdout: overrides.stdout ?? ((line) => process.stdout.write(`${line}\n`)),
+      stderr: overrides.stderr ?? ((line) => process.stderr.write(`${line}\n`)),
+      build: overrides.build ?? readBuildInfo,
+    });
+  }
   if (argv[0] === 'reset') {
     // The seams both commands share pass through; `reset` holds reset's own.
     const { loadConfig: load, fetchFn, stdout, stderr, probeListeners, reset } = overrides;

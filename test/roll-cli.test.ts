@@ -5,12 +5,16 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { loadConfig, type GruCommandConfig } from '../src/config.js';
 import {
   dialHost,
+  formatVersion,
   parseServiceArgs,
   runServiceCli,
+  runVersionCli,
   serviceBaseUrl,
   type ServiceCliDeps,
+  type VersionInfo,
 } from '../src/cli/service.js';
 import type { RollState } from '../src/roll/state.js';
+import { VERSION } from '../src/version.js';
 
 /**
  * `gru-service roll`: argument contract, service URL resolution, and the
@@ -280,5 +284,67 @@ describe('gru-service roll follow loop', () => {
     const code = await runServiceCli(['roll', '--timeout-ms', '10000'], h.deps);
     expect(code).toBe(1);
     expect(h.stderr.join('\n')).toContain('did not complete within 10000 ms');
+  });
+});
+
+describe('gru-service version — the installed build identity, offline', () => {
+  const INFO: VersionInfo = {
+    service: 'gru-command',
+    version: '1.0.1',
+    rev: 'dd052df2aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    committedAt: '2026-10-18T08:12:00+01:00',
+    builtAt: '2026-10-18T07:13:00.000Z',
+  };
+
+  it('prints one human line with the version and the short build SHA', () => {
+    expect(formatVersion(INFO, false)).toBe('gru-command 1.0.1 · build dd052df (2026-10-18T08:12:00+01:00)');
+  });
+
+  it('prints one JSON object with the full SHA for scripts', () => {
+    expect(JSON.parse(formatVersion(INFO, true))).toEqual(INFO);
+  });
+
+  it('renders a missing build stamp as unknown, never as a guessed SHA', () => {
+    const unknown = formatVersion({ ...INFO, rev: null, committedAt: null, builtAt: null }, false);
+    expect(unknown).toBe('gru-command 1.0.1 · build unknown');
+  });
+
+  it('runVersionCli is strict: --json works, anything else exits 2, --help exits 0', () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const deps = { stdout: (line: string) => stdout.push(line), stderr: (line: string) => stderr.push(line), build: () => ({
+      rev: INFO.rev,
+      committedAt: INFO.committedAt,
+      builtAt: INFO.builtAt,
+    }) };
+
+    expect(runVersionCli(['--json'], deps)).toBe(0);
+    expect(JSON.parse(stdout.join('\n'))).toEqual(INFO);
+    expect(stderr).toEqual([]);
+
+    stdout.length = 0;
+    expect(runVersionCli(['--shout'], deps)).toBe(2);
+    expect(stdout).toEqual([]);
+    expect(stderr.join('\n')).toContain('unknown argument: --shout');
+
+    stderr.length = 0;
+    expect(runVersionCli(['--help'], deps)).toBe(0);
+    expect(stderr.join('\n')).toContain('gru-service version');
+  });
+
+  it('runServiceCli routes version before config/network and reports the package version', async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const code = await runServiceCli(['version', '--json'], {
+      stdout: (line) => stdout.push(line),
+      stderr: (line) => stderr.push(line),
+      build: () => ({ rev: INFO.rev, committedAt: INFO.committedAt, builtAt: INFO.builtAt }),
+      // A version read must not need the instance config or a reachable service.
+      loadConfig: () => { throw new Error('version must not read config'); },
+      fetchFn: () => { throw new Error('version must not dial'); },
+    });
+    expect(code).toBe(0);
+    expect(stderr).toEqual([]);
+    expect(JSON.parse(stdout.join('\n'))).toMatchObject({ service: 'gru-command', version: VERSION, rev: INFO.rev });
   });
 });
