@@ -29,6 +29,9 @@ function drift(overrides: Partial<BuildView> = {}): BuildView {
     originMainRev: 'b'.repeat(40),
     originMainCommittedAt: ISO(-3_600_000),
     commitsBehind: 43,
+    latestTag: null,
+    buildTag: null,
+    updateAvailable: null,
     checkedAt: ISO(-60_000),
     checkError: null,
     ...overrides,
@@ -75,6 +78,49 @@ describe('deploy drift math — the card that catches a 43-commit-behind service
     const card = deployDriftCard(null, NOW.getTime());
     expect(card.value).toBe('n/a');
     expect(card.tone).toBe('muted');
+  });
+
+  it('names the newer release and flags UPDATE AVAILABLE (the tag is the update signal)', () => {
+    const card = deployDriftCard(
+      drift({ commitsBehind: 12, latestTag: 'v1.0.2', buildTag: 'v1.0.1', updateAvailable: true }),
+      NOW.getTime(),
+    );
+    expect(card.value).toBe('v1.0.2');
+    expect(card.flag).toBe('UPDATE AVAILABLE');
+    expect(card.tone).toBe('alert');
+    expect(card.detail).toContain('contains v1.0.1');
+    expect(card.detail).toContain('run gru-service roll');
+    expect(card.titleAttr).toContain('older than release v1.0.2');
+  });
+
+  it('does not flag an update when the build already contains the newest release', () => {
+    const card = deployDriftCard(
+      drift({ commitsBehind: 0, latestTag: 'v1.0.2', buildTag: 'v1.0.2', updateAvailable: false }),
+      NOW.getTime(),
+    );
+    expect(card.value).toBe('current');
+    expect(card.flag).toBeNull();
+    expect(card.detail).toContain('build contains v1.0.2');
+  });
+
+  it('keeps the commit count when the newest release is already in the build (unreleased main)', () => {
+    const card = deployDriftCard(
+      drift({ commitsBehind: 5, latestTag: 'v1.0.2', buildTag: 'v1.0.2', updateAvailable: false }),
+      NOW.getTime(),
+    );
+    expect(card.value).toBe('5 behind');
+    expect(card.flag).toBe('RESTART PENDING');
+    expect(card.detail).toContain('latest release v1.0.2');
+  });
+
+  it('never flags an update from an unknown tag side (only an earned claim)', () => {
+    const card = deployDriftCard(
+      drift({ commitsBehind: 0, latestTag: 'v1.0.2', buildTag: null, updateAvailable: null }),
+      NOW.getTime(),
+    );
+    expect(card.value).toBe('current');
+    expect(card.flag).toBeNull();
+    expect(card.detail).toContain('latest release v1.0.2');
   });
 });
 

@@ -264,6 +264,9 @@ describe('board server-frame validator', () => {
         originMainRev: 'b'.repeat(40),
         originMainCommittedAt: null,
         commitsBehind: 43,
+        latestTag: 'v1.0.1',
+        buildTag: 'v1.0.0',
+        updateAvailable: true,
         checkedAt: '2026-01-01T00:00:00.000Z',
         checkError: null,
       },
@@ -287,6 +290,9 @@ describe('board server-frame validator', () => {
     // A present-but-malformed block is a server bug — reject loudly.
     for (const [field, broken] of [
       ['build', { ...(wired as { build: object }).build, commitsBehind: '43' }],
+      ['build', { ...(wired as { build: object }).build, updateAvailable: 'yes' }],
+      ['build', { ...(wired as { build: object }).build, latestTag: 7 }],
+      ['build', { ...(wired as { build: object }).build, buildTag: undefined }],
       ['silas', { ...(wired as { silas: object }).silas, reconciliationsToday: -1 }],
       ['silas', { ...(wired as { silas: object }).silas, reconcileFailedNewer: 'no' }],
       ['silas', { ...(wired as { silas: object }).silas, reconcileFailedNewer: undefined }],

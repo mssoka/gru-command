@@ -259,6 +259,13 @@ export interface BuildView {
   readonly originMainCommittedAt: string | null;
   /** origin/main commits not reachable from the build. */
   readonly commitsBehind: number | null;
+  /** Newest stable release tag on origin (null = unknown). */
+  readonly latestTag: string | null;
+  /** Highest stable release tag reachable from the build (null = unknown). */
+  readonly buildTag: string | null;
+  /** Whether origin has a newer release than the build contains (null =
+   * unknown — the card never fabricates an update). */
+  readonly updateAvailable: boolean | null;
   readonly checkedAt: string | null;
   /** Why the last check could not fully prove the count (null = clean). */
   readonly checkError: string | null;
@@ -991,6 +998,9 @@ function isBuildView(value: unknown): value is BuildView {
     (value.originMainCommittedAt === null || typeof value.originMainCommittedAt === 'string') &&
     (value.commitsBehind === null ||
       (typeof value.commitsBehind === 'number' && Number.isSafeInteger(value.commitsBehind) && value.commitsBehind >= 0)) &&
+    (value.latestTag === null || typeof value.latestTag === 'string') &&
+    (value.buildTag === null || typeof value.buildTag === 'string') &&
+    (value.updateAvailable === null || typeof value.updateAvailable === 'boolean') &&
     (value.checkedAt === null || typeof value.checkedAt === 'string') &&
     (value.checkError === null || typeof value.checkError === 'string')
   );

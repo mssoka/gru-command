@@ -173,7 +173,14 @@ repo/instance — and if that unit is missing entirely (deleted plist,
 failed prior install), the updater registers it afresh: prompted
 interactively, automatic under `--no-interact` or whenever no terminal is
 available (cron/CI); declining keeps the run green and prints the
-`./install.sh --service` hint. Generate a fresh complete config separately with:
+`./install.sh --service` hint. You do not have to poll the repository to
+notice a release: the board's **deploy** check compares the build's
+`dist/build-rev.json` with `origin/main` (every 5 minutes) and with
+origin's newest stable `vX.Y.Z` tag. A build behind main reads `N
+behind` with a `RESTART PENDING` flag; a build older than a release
+reads the tag with an `UPDATE AVAILABLE` flag naming the version to move
+to; `gru-service version` prints the installed version and build SHA
+offline. Generate a fresh complete config separately with:
 
 ```bash
 npm run config:generate                 # refuses an existing file
@@ -233,6 +240,7 @@ npm start               # serve the web UI + /health on the configured bind
 ./install.sh --service  # register + start as a login OS service
 ./install.sh --uninstall
 gru-service roll        # graceful self-roll: pull + rebuild + relaunch + verify
+gru-service version     # installed version + build SHA (offline; --json)
 gru-service reset       # with the service stopped: remove GC's lanes, empty the data dir, keep config.toml
 ```
 

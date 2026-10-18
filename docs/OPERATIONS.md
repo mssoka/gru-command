@@ -42,8 +42,21 @@ The OS service manager is the SERVICE's out-of-band watcher (SPEC ruling
 ./install.sh --print      # render the platform unit; change nothing
 ./install.sh --uninstall  # stop the service and remove the unit
 gru-service roll          # self-roll: pull + rebuild + relaunch + verify
+gru-service version       # installed version + build SHA (offline; --json)
 gru-service reset         # service stopped: remove GC lanes, empty the data dir, keep config.toml
 ```
+
+**Noticing a release.** The board's `deploy` check is the operator-facing
+update signal. Every 5 minutes the service reads `origin/main` and origin's
+stable `vX.Y.Z` tags: a build behind main renders `N behind` with a
+`RESTART PENDING` flag; a build that contains an older release than
+origin's newest tag renders that tag with an `UPDATE AVAILABLE` flag,
+naming the version to move to.
+The check starts from the revision stamped into `dist/build-rev.json` at
+build time (never the live `git HEAD`), falls back to the last fetched
+refs when origin is unreachable (`checkError` says so), and reports
+`unknown` rather than guessing. `gru-service version` gives the same
+installed identity on a shell, with no config read and no network.
 
 The service can also roll **itself** — `gru-service roll` (CLI) or
 `POST /api/roll` (pairing-token guarded) pulls and rebuilds the deploy

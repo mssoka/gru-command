@@ -280,9 +280,10 @@ reconnect or a round going live never reflows the bar.
 The **health pill** (a group named “System health”) carries the system
 checks (deploy, Silas, verify, disk, cure) in one line, the ones that need
 a look first — a warning, an alert, or any check carrying a flag such as
-`1 QUEUED`, shown with that flag (e.g. `deploy 3 behind RESTART PENDING`)
-— then the rest; it ends with the Jev decisions chip and the Gru wake
-chip. Its summary reads `2 need a look` (pink, ▲), `All healthy` (some
+`1 QUEUED`, shown with that flag (`deploy 3 behind RESTART PENDING`, or
+`deploy v1.0.2 UPDATE AVAILABLE` when origin has a newer release tag than
+the build contains) — then the rest; it ends with the Jev decisions chip
+and the Gru wake chip. Its summary reads `2 need a look` (pink, ▲), `All healthy` (some
 check reads ok and none needs a look), `No problems reported` (wired checks
 report only neutral facts such as no wakes yet; muted dot), or `Checks not
 wired` (muted dot) — unknown never reads healthy. From the moment the

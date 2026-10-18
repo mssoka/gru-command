@@ -115,13 +115,41 @@ export function restartPending(build: BuildView | null | undefined): boolean {
 
 export function deployDriftCard(build: BuildView | null | undefined, now = Date.now()): HealthCardView {
   if (build === null || build === undefined) return notAvailable('deploy', 'deploy');
+
+  // A newer tagged release is the strongest update signal: it names the
+  // version to move to, so "there is an update" does not require reading
+  // a raw commit count. Unknowns never flag.
+  if (build.updateAvailable === true && build.latestTag !== null) {
+    const have = build.buildTag === null ? 'no release in this build' : `contains ${build.buildTag}`;
+    const age = build.buildCommittedAt === null ? '' : ` (${formatAge(build.buildCommittedAt, now)} old)`;
+    return card(
+      'deploy',
+      'deploy',
+      build.latestTag,
+      `build ${shortRev(build.buildRev)}${age} ${have} · ${build.latestTag} released — run gru-service roll`,
+      'alert',
+      'UPDATE AVAILABLE',
+      `running build ${shortRev(build.buildRev)} is older than release ${build.latestTag} (${have}) — rebuild + restart`,
+      { lead: '', num: null, unit: '' },
+    );
+  }
+
+  // The tag line only decorates a check whose counting succeeded; an
+  // unknown count keeps its `checkError` as the whole story.
+  const release =
+    build.latestTag === null
+      ? null
+      : build.buildTag === null
+        ? `latest release ${build.latestTag}`
+        : `latest release ${build.latestTag} · build contains ${build.buildTag}`;
+
   if (build.commitsBehind === null) {
     const why = build.checkError ?? 'origin/main not checked yet';
     return card(
       'deploy',
       'deploy',
       'unknown',
-      `build ${shortRev(build.buildRev)} · ${why}`,
+      `build ${shortRev(build.buildRev)} · ${why}${release === null ? '' : ` · ${release}`}`,
       'warn',
       null,
       `running build ${shortRev(build.buildRev)}; drift unknown — ${why}`,
@@ -133,10 +161,10 @@ export function deployDriftCard(build: BuildView | null | undefined, now = Date.
       'deploy',
       'deploy',
       'current',
-      `build ${shortRev(build.buildRev)} · checked ${formatAge(build.checkedAt, now)} ago`,
+      `build ${shortRev(build.buildRev)} · checked ${formatAge(build.checkedAt, now)} ago${release === null ? '' : ` · ${release}`}`,
       'ok',
       null,
-      `running build ${shortRev(build.buildRev)} matches origin/main ${shortRev(build.originMainRev)}`,
+      `running build ${shortRev(build.buildRev)} matches origin/main ${shortRev(build.originMainRev)}${release === null ? '' : ` · ${release}`}`,
       { lead: '', num: null, unit: 'current' },
     );
   }
@@ -144,7 +172,7 @@ export function deployDriftCard(build: BuildView | null | undefined, now = Date.
     'deploy',
     'deploy',
     `${build.commitsBehind} behind`,
-    `build ${shortRev(build.buildRev)} (${formatAge(build.buildCommittedAt, now)} old) · main ${shortRev(build.originMainRev)}`,
+    `build ${shortRev(build.buildRev)} (${formatAge(build.buildCommittedAt, now)} old) · main ${shortRev(build.originMainRev)}${release === null ? '' : ` · ${release}`}`,
     'alert',
     'RESTART PENDING',
     `running build ${shortRev(build.buildRev)} is ${build.commitsBehind} commits behind origin/main ${shortRev(build.originMainRev)} — rebuild + restart`,

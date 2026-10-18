@@ -89,6 +89,9 @@ const BEHIND: BuildView = {
   originMainRev: 'b'.repeat(40),
   originMainCommittedAt: new Date(NOW).toISOString(),
   commitsBehind: 3,
+  latestTag: 'v1.0.1',
+  buildTag: 'v1.0.1',
+  updateAvailable: false,
   checkedAt: new Date(NOW).toISOString(),
   checkError: null,
 };

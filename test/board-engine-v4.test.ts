@@ -53,6 +53,9 @@ describe('board engine — v4 snapshot blocks', () => {
       originMainRev: 'b'.repeat(40),
       originMainCommittedAt: '2026-09-22T08:00:00.000Z',
       commitsBehind: 43,
+      latestTag: 'v1.0.1',
+      buildTag: 'v1.0.0',
+      updateAvailable: true,
       checkedAt: '2026-09-23T12:00:00.000Z',
       checkError: null,
     };
