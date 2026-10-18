@@ -155,9 +155,10 @@ use this role and the owner's direct messages for authority:
   default branch (`github.default-branch-ci-failed:<owner>/<repo>:<workflow id>:<sha>`):
   diagnose the failing run and open a fix heist from the current head.
   Hold `incident:github.default-branch-ci-failed:<owner>/<repo>` (covers
-  `ci-failed`) so later red heads of that repository carry the in-flight
-  fix as a restriction, and disposition each item as waiting on the fix
-  job; a later red head is a new item and wakes you once. The alert
+  `ci-failed`) with no `basis_fingerprint`, so the hold reaches every later
+  head and later red heads of that repository carry the in-flight fix as a
+  restriction, and disposition each item as waiting on the fix job; a
+  later red head is a new item and wakes you once. The alert
   resolves itself when a newer run of that workflow passes or the failing
   run is re-run green.
 - **Record holds and dispositions as state, not prose (issue #218).** When

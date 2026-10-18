@@ -248,22 +248,23 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   it on TRANSCRIPTS. Reads and disclosures are display-only — nothing
   here acks, executes or changes GitHub state.
   **Default-branch CI alert (#446):** the one runs call reads the 20
-  newest default-branch runs; the chip still shows the newest run overall,
-  and the same page feeds an alert that is always on for every
+  newest default-branch runs; the chip shows the newest of them that tested
+  the branch itself — `pull_request*` and fork runs that merely share its
+  name are skipped, and a page of only those reads never-run — and the
+  full page feeds an alert that is always on for every
   `managed_repos` entry (no config key, no extra GitHub call). Per
   `workflow_id`, the verdict is the newest decisive run by (created, id) —
-  passed, failed, timed-out or startup-failure; queued, waiting, running,
-  cancelled, skipped, neutral, action-required, stale and unrecognized
-  (`unknown`) runs never mask it, alert or resolve, and `pull_request` /
-  `pull_request_target` or fork runs that merely share the branch name
-  never count. A workflow turning red posts one `action-required`
+  passed, failed, timed-out or startup-failure; queued (incl. waiting/
+  pending/requested), running, cancelled, skipped, neutral,
+  action-required, stale-run and unknown runs never mask it, alert or
+  resolve, and `pull_request*` or fork runs never count. A workflow turning red posts one `action-required`
   incident per repo + workflow + head sha
   (`github.default-branch-ci-failed:<owner>/<repo>:<workflow id>:<sha>`,
   severity error) that wakes Gru whatever the check is named — never the
   owner bell, never a Silas digest row — and resolves that workflow's row
   for the previous red head. A newer passing run of that workflow, or the
-  failing run re-run green, resolves its open incidents (even with no
-  recorded cursor). Changes are recorded as `repo.default-branch-ci`
+  failing run re-run green, resolves its open incidents (without a red
+  cursor, once per process per workflow until the next raise). Changes are recorded as `repo.default-branch-ci`
   events and deduped against the latest one, so a restart never
   re-raises. A watcher error is logged at error level and never degrades
   the row or the pass.

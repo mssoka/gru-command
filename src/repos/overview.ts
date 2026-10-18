@@ -41,7 +41,8 @@ import { gitProbeEnvironment, resolveManagedRepoPath, type ManagedRepoPath } fro
  * deliberately unused because it folds PRs into issues. An
  * `incomplete_results` search is NOT presented as an exact count.
  *
- * The newest default-branch run is selected by (createdAt, id), so a
+ * The newest default-branch run (never a `pull_request*` or fork run that
+ * merely shares the branch name) is selected by (createdAt, id), so a
  * newer queued/running run supersedes an older passed one. `no-workflow`
  * requires the workflows endpoint to prove the repo has none — an empty
  * run page alone never infers it; with workflows present but no run on
@@ -197,11 +198,21 @@ export interface RepoOverviewRunRaw {
   readonly workflowId: number | null;
   /** The commit the run tested (`head_sha`), lowercased; null unless it is hex. */
   readonly headSha: string | null;
-  /** What triggered the run (`event`): a `pull_request` run can share the
+  /** What triggered the run (`event`): a `pull_request*` run can share the
    * default branch's name without testing it. */
   readonly event: string | null;
-  /** The head repository (`head_repository.full_name`); a fork's differs. */
-  readonly headRepository: string | null;
+  /** Whether the head repository differs from the run's own repository,
+   * read from the same payload (ids, else full names); null when unknown.
+   * Never compared with the configured name: a renamed or transferred
+   * repository keeps its old name in the origin remote. */
+  readonly fromFork: boolean | null;
+}
+
+/** A run that tested the default branch itself: neither a fork's run nor a
+ * `pull_request*` run whose head branch merely shares the name (a gitflow
+ * release PR, a fork's `develop`). Unknown fork state counts as not a fork. */
+export function isDefaultBranchRun(run: Pick<RepoOverviewRunRaw, 'event' | 'fromFork'>): boolean {
+  return run.fromFork !== true && !(run.event ?? '').startsWith('pull_request');
 }
 
 /** The complete default-branch run page one observation read, handed to
@@ -256,6 +267,21 @@ function countOrNull(value: unknown): number | null {
 function isoOrNull(value: unknown): string | null {
   if (typeof value !== 'string' || value === '' || !Number.isFinite(Date.parse(value))) return null;
   return value;
+}
+
+/** The fork flag from one run payload: head and base repository ids when
+ * both are numbers, else their full names (case-insensitive), else null. */
+function fromForkOf(raw: Record<string, unknown>): boolean | null {
+  const head = record(raw['head_repository']);
+  const base = record(raw['repository']);
+  if (head === null || base === null) return null;
+  const headId = countOrNull(head['id']);
+  const baseId = countOrNull(base['id']);
+  if (headId !== null && baseId !== null) return headId !== baseId;
+  const headName = strOrNull(head['full_name']);
+  const baseName = strOrNull(base['full_name']);
+  if (headName !== null && baseName !== null) return headName.toLowerCase() !== baseName.toLowerCase();
+  return null;
 }
 
 /** A commit id is usable only as plain hex, lowercased: it is embedded in
@@ -546,7 +572,7 @@ function mapRun(value: unknown): RepoOverviewRunRaw | null {
     workflowId: countOrNull(raw['workflow_id']),
     headSha: shaOrNull(raw['head_sha']),
     event: strOrNull(raw['event']),
-    headRepository: strOrNull(record(raw['head_repository'])?.['full_name']),
+    fromFork: fromForkOf(raw),
   };
 }
 
@@ -1266,7 +1292,8 @@ export class ManagedRepoOverviewTracker {
             run = runUnavailableView(branch);
           } else {
             observed = { repo: ref, branch, runs: runs.value };
-            const latest = selectLatestRun(runs.value);
+            // The chip shows the branch's own newest run; the hook gets the full page.
+            const latest = selectLatestRun(runs.value.filter(isDefaultBranchRun));
             run =
               latest === null
                 ? {

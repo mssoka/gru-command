@@ -45,8 +45,7 @@ function run(id: number, over: Partial<RepoOverviewRunRaw> = {}): RepoOverviewRu
     workflowId: W,
     headSha: S2,
     event: 'push',
-    // The observed repository's own runs; null is "the provider omitted it".
-    headRepository: null,
+    fromFork: false,
     ...over,
   };
 }
@@ -136,20 +135,20 @@ describe('default-branch verdicts (#446)', () => {
       failed(9),
       passed(12, { workflowId: X }),
       failed(10, { workflowId: X, createdAt: '2026-10-18T09:00:00.000Z' }),
-    ], ALPHA);
+    ]);
     expect(verdicts.map((verdict) => [verdict.workflowId, verdict.verdict, verdict.runId])).toEqual([
       [W, 'red', 9],
       [X, 'passed', 12],
     ]);
     // Equal creation: the larger id wins, in either list order.
     const tie = '2026-10-18T10:00:00.000Z';
-    expect(defaultBranchVerdicts([failed(5, { createdAt: tie }), passed(6, { createdAt: tie })], ALPHA)[0]?.runId).toBe(6);
-    expect(defaultBranchVerdicts([passed(6, { createdAt: tie }), failed(5, { createdAt: tie })], ALPHA)[0]?.runId).toBe(6);
+    expect(defaultBranchVerdicts([failed(5, { createdAt: tie }), passed(6, { createdAt: tie })])[0]?.runId).toBe(6);
+    expect(defaultBranchVerdicts([passed(6, { createdAt: tie }), failed(5, { createdAt: tie })])[0]?.runId).toBe(6);
   });
 
   it('reads failed, timed-out and startup-failure as red', () => {
     for (const [conclusion, state] of [['failure', 'failed'], ['timed_out', 'timed-out'], ['startup_failure', 'startup-failure']] as const) {
-      expect(defaultBranchVerdicts([run(9, { conclusion })], ALPHA)[0]).toMatchObject({ verdict: 'red', state, sha: S2 });
+      expect(defaultBranchVerdicts([run(9, { conclusion })])[0]).toMatchObject({ verdict: 'red', state, sha: S2 });
     }
   });
 
@@ -165,28 +164,28 @@ describe('default-branch verdicts (#446)', () => {
       run(17, { conclusion: 'stale' }),
       run(18, { conclusion: 'mystery' }),
     ];
-    expect(defaultBranchVerdicts([...maskers, failed(9)], ALPHA).map((verdict) => verdict.runId)).toEqual([9]);
-    expect(defaultBranchVerdicts(maskers, ALPHA)).toEqual([]);
+    expect(defaultBranchVerdicts([...maskers, failed(9)]).map((verdict) => verdict.runId)).toEqual([9]);
+    expect(defaultBranchVerdicts(maskers)).toEqual([]);
   });
 
   it('a pull-request or fork run sharing the branch name never counts; every other event does', () => {
     // A fork PR from `develop`, or a gitflow develop→main PR, matches `branch=develop`.
-    for (const event of ['pull_request', 'pull_request_target']) {
-      expect(defaultBranchVerdicts([failed(10, { event }), passed(9)], ALPHA)[0], event).toMatchObject({ verdict: 'passed', runId: 9 });
+    for (const event of ['pull_request', 'pull_request_target', 'pull_request_review', 'pull_request_review_comment']) {
+      expect(defaultBranchVerdicts([failed(10, { event }), passed(9)])[0], event).toMatchObject({ verdict: 'passed', runId: 9 });
     }
-    expect(defaultBranchVerdicts([failed(10, { headRepository: 'someone/alpha' }), passed(9)], ALPHA)[0]).toMatchObject({ runId: 9 });
-    // The observed repository's own head counts, compared case-insensitively.
-    expect(defaultBranchVerdicts([failed(10, { headRepository: 'ACME/Alpha' })], ALPHA)[0]).toMatchObject({ verdict: 'red', runId: 10 });
+    expect(defaultBranchVerdicts([failed(10, { fromFork: true }), passed(9)])[0]).toMatchObject({ runId: 9 });
+    // A renamed repository's own runs (fork state read from the payload) and unknown fork state count.
+    expect(defaultBranchVerdicts([failed(10, { fromFork: null })])[0]).toMatchObject({ verdict: 'red', runId: 10 });
     // Bots and other triggers count: "whatever the check is named".
     for (const event of ['push', 'schedule', 'workflow_dispatch', 'workflow_run', 'merge_group', 'dynamic', null]) {
-      expect(defaultBranchVerdicts([failed(10, { event, headRepository: 'acme/alpha' })], ALPHA)[0], String(event)).toMatchObject({ verdict: 'red' });
+      expect(defaultBranchVerdicts([failed(10, { event })])[0], String(event)).toMatchObject({ verdict: 'red' });
     }
   });
 
   it('ignores a run without an id, workflow id or head sha', () => {
-    expect(defaultBranchVerdicts([failed(9, { id: null }), failed(10, { workflowId: null }), failed(11, { headSha: null })], ALPHA)).toEqual([]);
+    expect(defaultBranchVerdicts([failed(9, { id: null }), failed(10, { workflowId: null }), failed(11, { headSha: null })])).toEqual([]);
     // An ignored newer run does not mask an older decisive one either.
-    expect(defaultBranchVerdicts([failed(11, { headSha: null }), passed(8)], ALPHA)[0]).toMatchObject({ verdict: 'passed', runId: 8 });
+    expect(defaultBranchVerdicts([failed(11, { headSha: null }), passed(8)])[0]).toMatchObject({ verdict: 'passed', runId: 8 });
   });
 });
 
@@ -279,6 +278,30 @@ describe('default-branch CI watch (#446)', () => {
     expectOpen(r, []);
   });
 
+  it('a superseding post that throws leaves the old head open until the next pass', () => {
+    const r = rig();
+    r.observe([failed(9)]);
+    let failPost = true;
+    const watch = new DefaultBranchCiWatch({
+      ledger: r.ledger,
+      notifications: {
+        postIncident: (input) => {
+          if (failPost) {
+            failPost = false;
+            throw new Error('database is locked');
+          }
+          return r.notifications.postIncident(input);
+        },
+        resolveIncidents: (prefix, by) => r.notifications.resolveIncidents(prefix, by),
+        resolveExactKind: (kind, by) => r.notifications.resolveExactKind(kind, by),
+      },
+    });
+    watch.observe({ repo: ALPHA, branch: 'develop', runs: [failed(11, { headSha: S3 }), failed(9)] });
+    expectOpen(r, [kindOf(S2)]);
+    watch.observe({ repo: ALPHA, branch: 'develop', runs: [failed(11, { headSha: S3 }), failed(9)] });
+    expectOpen(r, [kindOf(S3)]);
+  });
+
   it('still red at a new head: a new incident for the new sha supersedes the old one', () => {
     const r = rig();
     r.observe([failed(9)]);
@@ -318,9 +341,79 @@ describe('default-branch CI watch (#446)', () => {
 
   it('a pull-request run on the branch name never alerts through the watch', () => {
     const r = rig();
-    r.observe([failed(10, { event: 'pull_request' }), failed(11, { headRepository: 'someone/alpha' })]);
+    r.observe([failed(10, { event: 'pull_request' }), failed(11, { fromFork: true })]);
     expect(events(r)).toEqual([]);
     expect(rows(r)).toEqual([]);
+  });
+
+  it('a newer passing pull-request or fork run never resolves a real red', () => {
+    const r = rig();
+    r.observe([failed(9)]);
+    r.observe([passed(10, { event: 'pull_request' }), passed(11, { fromFork: true }), failed(9)]);
+    expectOpen(r, [kindOf(S2)]);
+    expect(events(r)).toHaveLength(1);
+  });
+
+  it('two passes with no cursor issue the resolve query once', () => {
+    const r = rig();
+    const prefixes: string[] = [];
+    const watch = new DefaultBranchCiWatch({
+      ledger: r.ledger,
+      notifications: {
+        postIncident: (input) => r.notifications.postIncident(input),
+        resolveIncidents: (prefix, by) => {
+          prefixes.push(prefix);
+          return r.notifications.resolveIncidents(prefix, by);
+        },
+        resolveExactKind: (kind, by) => r.notifications.resolveExactKind(kind, by),
+      },
+    });
+    watch.observe({ repo: ALPHA, branch: 'develop', runs: [passed(8)] });
+    watch.observe({ repo: ALPHA, branch: 'develop', runs: [passed(10), passed(8)] });
+    expect(prefixes).toEqual([`${DEFAULT_BRANCH_CI_FAILED_KIND}:acme/alpha:7:`]);
+    expect(events(r)).toEqual([]);
+  });
+
+  it('a raise whose cursor append fails is resolved by the next pass, even after the cursor read passed', () => {
+    const r = rig();
+    let failAppend = false;
+    const prefixes: string[] = [];
+    const watch = new DefaultBranchCiWatch({
+      ledger: {
+        latestEventByPayloadField: (kind, field, value) => r.ledger.latestEventByPayloadField(kind, field, value),
+        appendCustomEvent: (fields) => {
+          if (failAppend) {
+            failAppend = false;
+            throw new Error('disk I/O error');
+          }
+          return r.ledger.appendCustomEvent(fields);
+        },
+      },
+      notifications: {
+        postIncident: (input) => r.notifications.postIncident(input),
+        resolveIncidents: (prefix, by) => {
+          prefixes.push(prefix);
+          return r.notifications.resolveIncidents(prefix, by);
+        },
+        resolveExactKind: (kind, by) => r.notifications.resolveExactKind(kind, by),
+      },
+    });
+    const observe = (runs: readonly RepoOverviewRunRaw[]) => watch.observe({ repo: ALPHA, branch: 'develop', runs });
+    observe([failed(9, { headSha: S1 })]);
+    observe([passed(10), failed(9, { headSha: S1 })]);
+    expect(events(r).at(-1)).toMatchObject({ verdict: 'passed', run_id: 10 });
+    observe([passed(10)]); // settled by the red→passed transition: no further query
+    expect(prefixes).toHaveLength(1);
+    // A new red head is posted, but its cursor never lands: the cursor still reads passed.
+    failAppend = true;
+    observe([failed(11, { headSha: S3 }), passed(10)]);
+    expectOpen(r, [kindOf(S3)]);
+    expect(events(r).at(-1)).toMatchObject({ verdict: 'passed', run_id: 10 });
+    // The raise un-settled the workflow: the next pass resolves it again.
+    observe([passed(12, { headSha: S3 }), failed(11, { headSha: S3 })]);
+    expectOpen(r, []);
+    expect(prefixes).toHaveLength(2);
+    expect(events(r).at(-1)).toMatchObject({ verdict: 'passed', run_id: 10 });
   });
 
   it('a pass with no cursor resolves an orphaned row and writes nothing', () => {
@@ -456,9 +549,9 @@ describe('default-branch CI watch (#446)', () => {
     const r = rig();
     r.observe([failed(9), failed(10, { workflowId: X })]);
     r.observe([failed(9)], ALPHA_TWO);
-    expectOpen(r, [kindOf(S2, W, ALPHA), kindOf(S2, X, ALPHA), kindOf(S2, W, ALPHA_TWO)]);
+    expectOpen(r, [kindOf(S2, W), kindOf(S2, X), kindOf(S2, W, ALPHA_TWO)]);
     r.observe([passed(11), failed(10, { workflowId: X })]);
-    expectOpen(r, [kindOf(S2, X, ALPHA), kindOf(S2, W, ALPHA_TWO)]);
+    expectOpen(r, [kindOf(S2, X), kindOf(S2, W, ALPHA_TWO)]);
   });
 
   it('a run link on another host never reaches the record or the incident', () => {
