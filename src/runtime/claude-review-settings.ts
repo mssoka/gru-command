@@ -127,7 +127,9 @@ export function claudeReviewProcessEnv(configuration: ClaudeReviewConfiguration)
   for (const name of Object.keys(env)) {
     if (AUTH_ENV.test(name)) delete env[name];
   }
-  return { ...env, ...configuration.authEnv };
+  // Without --safe-mode the CLI would load the user's auto-memory into the
+  // review; the flag is set last so authEnv cannot re-enable it.
+  return { ...env, ...configuration.authEnv, CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' };
 }
 
 /** Do not put credentials on argv. Claude --settings accepts a path; keep
