@@ -713,6 +713,13 @@ describe('docs/example.config.toml', () => {
     expect(config.thinking.default).toBe('default');
     expect(config.runtimes.policies['pi']?.roles).toEqual({});
     expect(config.onboarding.mode).toBe('proposed');
+    expect(config.decisions.jev.enabled).toBe(false);
+    expect(config.decisions.surfaces).toEqual({
+      event_triage: { provider: 'openrouter-jev', mode: 'shadow' },
+      supervision_guidance: { provider: 'openrouter-jev', mode: 'shadow' },
+      escalation_triage: { provider: 'openrouter-jev', mode: 'shadow' },
+      same_blocker: { provider: 'openrouter-jev', mode: 'shadow' },
+    });
   });
 });
 

@@ -549,6 +549,120 @@ lock_wait_timeout_ms = 900000
 # needed, and records the run as timed out / non-success.
 run_timeout_ms = 1800000
 
+# ── Jev decisions (optional) ─────────────────────────────────────────
+# Jev is a small, cheap "System One" decision model (TypeSafe, via OpenRouter).
+# Gru Command runs fully without it: with Jev off, deterministic code makes
+# every decision and no provider is ever contacted.
+#
+# Credentials never belong in TOML. Store the OpenRouter key from stdin with:
+#   pbpaste | node dist/decisions/cli.js credentials set --stdin           # macOS clipboard
+#   node dist/decisions/cli.js credentials set --slot typesafe --stdin     # TypeSafe direct
+# then verify (no key material printed):
+#   node dist/decisions/cli.js status --json   and   node dist/decisions/cli.js check --json
+[decisions.jev]
+enabled = false # MASTER SWITCH. Off = no surface ever asks a provider. Hot-reloads; store the key first.
+model = "~typesafe/jev-latest" # OpenRouter Jev alias; feeds the openrouter-jev profile below.
+endpoint = "https://openrouter.ai/api/alpha/decisions" # Credential-bearing traffic is restricted to this exact HTTPS endpoint.
+timeout_ms = 5000 # Per-call limit; on timeout the deterministic answer is used. Raise it if timeouts recur on a healthy network.
+
+# ── Surface modes: how each decision point uses Jev ──────────────────
+# With the master switch on, every [decisions.surfaces.<surface>] picks a mode:
+#
+#   mode = "off"      Deterministic only. Jev is never asked; zero cost.
+#   mode = "shadow"   Jev IS asked and its answer is recorded next to the
+#                     deterministic one (ledger event decisions.shadow), but
+#                     Gru Command always USES the deterministic answer:
+#                     behavior cannot change. START HERE. A single slow or
+#                     failed ask is recorded, not an incident; 3 in a row
+#                     mark Jev degraded (a board FYI while every acting
+#                     surface is shadow/off) with automatic rechecks.
+#   mode = "enforce"  Gru Command USES Jev's answer (deterministic fallback on
+#                     failure or low confidence). Refuses to run until a
+#                     recorded backtest meets its threshold, saved at
+#                     <data_dir>/decisions/backtests/<surface>.json by:
+#                       node dist/decisions/cli.js extract-cases --surface <s> --out <jsonl>
+#                       node dist/decisions/cli.js backtest --surface <s> --profile <p> --cases <jsonl> --threshold <min> --save
+#                     Not usable on any surface yet (see each one below).
+#                     Setting it anywhere still makes a transient (timeout,
+#                     network or provider 429/5xx) outage of the default
+#                     openrouter-jev profile page you instead of a board FYI.
+#   (no mode key)     Legacy, pre-#223: for event_triage and supervision_guidance
+#                     Gru Command USES Jev's answer with NO backtest gate;
+#                     escalation_triage, same_blocker and report_conclusion are never asked.
+#                     A transient outage then pages you too, as with enforce.
+#                     Give every surface an explicit mode unless you mean that.
+#
+# Surfaces (the complete list; any other name fails to load):
+#   event_triage          does an orchestration event need attention? (may only raise attention, never lower it)
+#                         off or shadow today: no registered backtest, so enforce rejects every
+#                         Jev ask (the deterministic answer still serves) and opens an owner incident
+#   supervision_guidance  classifies a runtime failure: restart vs escalate (restart counters stay deterministic)
+#                         off or shadow today: no registered backtest, so enforce rejects every
+#                         Jev ask (the deterministic answer still serves) and opens an owner incident
+#   escalation_triage     is a Silas escalation a ruling or a status report?
+#                         off or shadow today: it asks Jev only in shadow, so enforce never asks
+#   same_blocker          is this review blocker the same defect as last round?
+#                         off or shadow today: it asks Jev only in shadow, so enforce never asks
+#   report_conclusion     clean pass / findings / inconclusive
+#                         backtest only: no live host yet, so enforce never asks
+#
+# `provider` routes a surface to a provider profile (default: openrouter-jev);
+# change it in the surface's own table.
+[decisions.surfaces.event_triage]
+provider = "openrouter-jev"
+mode = "shadow"
+
+[decisions.surfaces.supervision_guidance]
+provider = "openrouter-jev"
+mode = "shadow"
+
+[decisions.surfaces.escalation_triage]
+provider = "openrouter-jev"
+mode = "shadow"
+
+[decisions.surfaces.same_blocker]
+provider = "openrouter-jev"
+mode = "shadow"
+
+# ── Provider profiles (optional) ─────────────────────────────────────
+# Built-ins always exist: openrouter-jev (default), typesafe-direct and local.
+# Override one by re-declaring it, or define your own under a new name.
+# Probe any of them (master switch on) with:
+#   node dist/decisions/cli.js check --profile <name>
+# [decisions.providers.typesafe-direct]
+# protocol = "systemone"
+# endpoint = "https://api.typesafe.ai/v1/systemone"
+# model = "jev-latest"
+# credential = "typesafe" # env TYPESAFE_API_KEY or credentials/typesafe.key; bound to api.typesafe.ai
+# timeout_ms = 5000
+# input_price_per_mtok = 0.042 # cost fallback when a response carries no usage.cost
+#
+# [decisions.providers.local]
+# protocol = "systemone"
+# endpoint = "http://127.0.0.1:8088/v1/systemone"
+# model = "laya-421m"
+# credential = "none" # keyless is allowed ONLY for loopback hosts
+# timeout_ms = 5000
+
+# ── Confidence thresholds (by risk class) ────────────────────────────
+# Read-only classification: mistakes are recoverable, so confidence bars are lower.
+[decisions.thresholds.read_only]
+act = 0.6 # metric >= act enters the high band.
+confirm = 0.4 # confirm <= metric < act flags for confirmation.
+require_confirm_on_act = false # High read-only routes need no added confirmation.
+
+# Operational routing can spend turns/quota or alter restart guidance.
+[decisions.thresholds.operational]
+act = 0.75 # High-confidence operational guidance is eligible within existing authority.
+confirm = 0.55 # Medium confidence flags; below this uses deterministic fallback.
+require_confirm_on_act = false # Existing operational guards still apply.
+
+# Destructive routing never grants permission: every passable band still requires a human.
+[decisions.thresholds.destructive]
+act = 0.85 # High bar for destructive triage.
+confirm = 0.7 # Medium band pauses/asks; below uses deterministic fallback.
+require_confirm_on_act = true # Must stay true; config validation rejects false.
+
 ```
 <!-- END GENERATED CONFIG REFERENCE -->
 

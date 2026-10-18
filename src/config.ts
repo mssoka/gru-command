@@ -4,6 +4,7 @@ import { isAbsolute, join, relative, resolve } from 'node:path';
 import { parse, type TomlPrimitive } from 'smol-toml';
 import { parseQuietHours } from './chat/wake-policy.js';
 import { DEFAULT_INPUT_PRICE_PER_MTOK, validateProviderProfile } from './decisions/profile.js';
+import { DECISION_SURFACES } from './decisions/questions.js';
 import { displayManagedRepoName, managedRepoNameError } from './repos/managed-names.js';
 import type { SurfaceMode } from './decisions/types.js';
 import { SILAS_AUTOPILOT_RULE_IDS } from './dispatch/silas-rules.js';
@@ -877,6 +878,29 @@ export function expandTilde(path: string, home: string = homedir()): string {
   if (path === '~') return home;
   if (path.startsWith('~/')) return join(home, path.slice(2));
   return path;
+}
+
+/** Escape a string for a TOML basic string literal. */
+export function tomlString(value: string): string {
+  let out = '';
+  for (const ch of value) {
+    switch (ch) {
+      case '\\': out += '\\\\'; break;
+      case '"': out += '\\"'; break;
+      case '\b': out += '\\b'; break;
+      case '\t': out += '\\t'; break;
+      case '\n': out += '\\n'; break;
+      case '\f': out += '\\f'; break;
+      case '\r': out += '\\r'; break;
+      default:
+        if (ch < ' ' || ch === '\u007f') {
+          out += `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`;
+        } else {
+          out += ch;
+        }
+    }
+  }
+  return `"${out}"`;
 }
 
 const TOP_LEVEL_KEYS = [
@@ -2236,9 +2260,11 @@ function readDecisionsConfig(
     const effective = effectiveDecisionProviders({ ...defaults, jev, providers, surfaces: {} });
     for (const surface of Object.keys(surfacesTable)) {
       if (!Object.prototype.hasOwnProperty.call(surfacesTable, surface)) continue;
-      if (!/^[a-z0-9_]+$/u.test(surface)) {
+      // A misspelled surface would load clean and leave the real one
+      // mode-less, which acts on Jev's answer ungated.
+      if (!(DECISION_SURFACES as readonly string[]).includes(surface)) {
         throw new ConfigError(
-          `decision surface name \`${surface}\` must match [a-z0-9_]+`,
+          `unknown decision surface \`${surface}\` in [decisions.surfaces] (valid surfaces: ${DECISION_SURFACES.join(', ')})`,
           file,
           `decisions.surfaces.${surface}`,
         );
