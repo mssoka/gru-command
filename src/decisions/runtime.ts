@@ -41,6 +41,16 @@ const TRANSIENT_REASONS: ReadonlySet<DecisionFailureReason> = new Set<DecisionFa
   'provider_degraded',
 ]);
 
+/** Remediation hints for issue #442's owner-action reasons, whose fix is
+ * NOT the local credentials command. Every other reason — including older
+ * non-transient ones such as endpoint_untrusted and malformed_response —
+ * keeps the default credential-oriented hint. */
+const OWNER_REMEDIATIONS: Readonly<Partial<Record<DecisionFailureReason, string>>> = {
+  credit_exhausted: 'Add credit to the provider account key',
+  endpoint_not_found: 'Fix the profile endpoint path or model name (the provider answered 404)',
+  malformed_request: 'Check the profile model/endpoint wiring (the provider rejected the request shape)',
+};
+
 /** Consecutive transient default-profile shadow misses before the runtime
  * degrades. A single slow shadow ask is evidence, not an incident: on
  * 2026-10-06 one 2 s timeout on a fire-and-forget escalation-triage ask
@@ -846,14 +856,14 @@ export class DecisionRuntime implements DecisionService {
       severity: 'error',
       title: 'Jev degraded — deterministic fallback active',
       detail: ownerAction
-        ? `${reason}. Run the local credentials command if needed, then use Recheck; Gru Command remains usable.`
+        ? `${reason}. ${OWNER_REMEDIATIONS[reason] ?? 'Run the local credentials command if needed, then use Recheck'}; Gru Command remains usable.`
         : `${reason}. Every acting Jev surface is in shadow, so behavior is unchanged; Gru Command rechecks automatically on a bounded backoff. No action needed.`,
       // Acknowledgement records that a human saw the incident; it does not
       // resolve the still-degraded system state. Keep one active row until
       // recovery/disable resolves it, then allow a later recurrence.
       dedupe: 'active',
     }));
-    if (reason === 'timeout' || reason === 'network_error' || reason === 'provider_degraded') {
+    if (TRANSIENT_REASONS.has(reason)) {
       this.scheduleTransientRecovery();
     }
     return this.status();

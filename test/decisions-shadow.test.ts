@@ -6,6 +6,7 @@ import {
   DEFAULT_DECISIONS_CONFIG,
   loadConfig,
   type DecisionsConfig,
+  type GruCommandConfig,
 } from '../src/config.js';
 import { decisionsConfigTemplate } from '../src/decisions/config-template.js';
 import {
@@ -442,10 +443,13 @@ describe('the enforce gate (issue #223)', () => {
 });
 
 describe('shadow misses are evidence, not incidents (2026-10-06 owner page)', () => {
-  type Step = 'ok' | 'timeout' | 'auth';
+  type Step = 'ok' | 'timeout' | 'auth' | 'out-of-credit' | 'not-found' | 'bad-request' | 'provider-down';
 
   /** Call 1 is the default profile's startup probe; each later call is one
-   * shadow ask. A timeout is the provider's own abort, as in production. */
+   * shadow ask. A timeout is the provider's own abort, as in production.
+   * `out-of-credit` answers 402 (a spent OpenRouter key), `not-found`
+   * answers 404, `bad-request` answers 400, and `provider-down` answers
+   * 503, as in production. */
   function scriptedFetch(steps: readonly Step[]): typeof fetch {
     let call = 0;
     return (async (_url: string | URL | Request, init?: RequestInit) => {
@@ -453,6 +457,10 @@ describe('shadow misses are evidence, not incidents (2026-10-06 owner page)', ()
       call += 1;
       if (step === 'timeout') throw Object.assign(new Error('This operation was aborted'), { name: 'AbortError' });
       if (step === 'auth') return new Response('denied', { status: 401 });
+      if (step === 'out-of-credit') return new Response('payment required', { status: 402 });
+      if (step === 'not-found') return new Response('no such endpoint', { status: 404 });
+      if (step === 'bad-request') return new Response('bad model name', { status: 400 });
+      if (step === 'provider-down') return new Response('provider down', { status: 503 });
       return new Response(JSON.stringify(answerEnvelope(String(init?.body))), { status: 200 });
     }) as unknown as typeof fetch;
   }
@@ -577,6 +585,92 @@ describe('shadow misses are evidence, not incidents (2026-10-06 owner page)', ()
     expect(auth.postIncident).toHaveBeenCalledTimes(1);
     expect(auth.postIncident.mock.calls[0]![0]).toMatchObject({ kind: 'decisions.degraded.auth_rejected', routing: 'needs-owner' });
     authRuntime.dispose();
+  });
+
+  it('a 402 out-of-credit key pages the owner on the first shadow miss even when every surface is in shadow (#442)', async () => {
+    const { center, postIncident } = notificationStub();
+    const runtime = await shadowRuntime(ALL_SHADOW, ['ok', 'out-of-credit'], { notifications: center, records: [] });
+    postIncident.mockClear();
+    await runtime.decide(eventRequest(), { surface: 'event_triage' });
+    expect(runtime.status()).toMatchObject({ status: 'degraded', reason: 'credit_exhausted' });
+    expect(postIncident).toHaveBeenCalledTimes(1);
+    expect(postIncident.mock.calls[0]![0]).toMatchObject({
+      kind: 'decisions.degraded.credit_exhausted',
+      routing: 'needs-owner',
+      detail: expect.stringContaining('Add credit'),
+    });
+    runtime.dispose();
+  });
+
+  it('a 404 endpoint miss pages the owner on the first shadow miss even when every surface is in shadow (#442)', async () => {
+    const { center, postIncident } = notificationStub();
+    const runtime = await shadowRuntime(ALL_SHADOW, ['ok', 'not-found'], { notifications: center, records: [] });
+    postIncident.mockClear();
+    await runtime.decide(eventRequest(), { surface: 'event_triage' });
+    expect(runtime.status()).toMatchObject({ status: 'degraded', reason: 'endpoint_not_found' });
+    expect(postIncident).toHaveBeenCalledTimes(1);
+    expect(postIncident.mock.calls[0]![0]).toMatchObject({
+      kind: 'decisions.degraded.endpoint_not_found',
+      routing: 'needs-owner',
+      detail: expect.stringContaining('Fix the profile endpoint path'),
+    });
+    runtime.dispose();
+  });
+
+  it('a 400 malformed request pages the owner on the first shadow miss even when every surface is in shadow (#442)', async () => {
+    const { center, postIncident } = notificationStub();
+    const runtime = await shadowRuntime(ALL_SHADOW, ['ok', 'bad-request'], { notifications: center, records: [] });
+    postIncident.mockClear();
+    await runtime.decide(eventRequest(), { surface: 'event_triage' });
+    expect(runtime.status()).toMatchObject({ status: 'degraded', reason: 'malformed_request' });
+    expect(postIncident).toHaveBeenCalledTimes(1);
+    expect(postIncident.mock.calls[0]![0]).toMatchObject({
+      kind: 'decisions.degraded.malformed_request',
+      routing: 'needs-owner',
+      detail: expect.stringContaining('Check the profile model/endpoint wiring'),
+    });
+    runtime.dispose();
+  });
+
+  it('a credit_exhausted degrade never schedules an automatic recheck: a spent key is not re-probed (#442)', async () => {
+    const { center } = notificationStub();
+    const fetchMock = vi.fn(scriptedFetch(['ok', 'out-of-credit']));
+    const runtime = new DecisionRuntime(configWithSurfaces(ALL_SHADOW), {
+      instanceDir: temp('gru-decisions-shadow-credit-recheck-'),
+      env: { OPENROUTER_API_KEY: 'test-key' },
+      fetchImpl: fetchMock as unknown as typeof fetch,
+      watchConfig: false,
+      transientRecoveryMs: 10, // a wrongly scheduled recheck would fire within 10 ms
+      // An ENABLED on-disk config makes a wrongly scheduled recheck visible
+      // as fetch call #3 instead of hiding behind a default-off disk read.
+      loadConfig: () => ({ decisions: configWithSurfaces(ALL_SHADOW) }) as unknown as GruCommandConfig,
+      notifications: center,
+      onShadowRecord: () => {},
+    });
+    expect(await runtime.start()).toMatchObject({ status: 'ready' });
+    await runtime.decide(eventRequest(), { surface: 'event_triage' }); // 402 → degrade
+    expect(runtime.status()).toMatchObject({ status: 'degraded', reason: 'credit_exhausted' });
+    await new Promise((resolve) => { setTimeout(resolve, 80); }); // past the first backoff step
+    expect(fetchMock).toHaveBeenCalledTimes(2); // startup probe + one shadow ask; never a recheck
+    expect(runtime.status()).toMatchObject({ status: 'degraded', reason: 'credit_exhausted' });
+    runtime.dispose();
+  });
+
+  it('a 503 degrade stays an FYI when every acting surface is in shadow (#442)', async () => {
+    const { center, postIncident } = notificationStub();
+    const runtime = await shadowRuntime(
+      ALL_SHADOW,
+      ['ok', 'provider-down', 'provider-down', 'provider-down'],
+      { notifications: center, records: [] },
+    );
+    postIncident.mockClear();
+    for (let i = 0; i < SHADOW_MISS_DEGRADE_THRESHOLD; i += 1) {
+      await runtime.decide(eventRequest(), { surface: 'event_triage' });
+    }
+    expect(runtime.status()).toMatchObject({ status: 'degraded', reason: 'provider_degraded' });
+    expect(postIncident).toHaveBeenCalledTimes(1);
+    expect(postIncident.mock.calls[0]![0]).toMatchObject({ kind: 'decisions.degraded.provider_degraded', routing: 'fyi' });
+    runtime.dispose();
   });
 });
 

@@ -366,9 +366,14 @@ env -u OPENROUTER_API_KEY node dist/decisions/cli.js check --json    # one tiny 
 |---|---|
 | `credential_missing` | No key stored. Do step 1. |
 | `auth_rejected` | OpenRouter refused the key. You copied something other than the bare `sk-or-v1-…` key, or the key is revoked. Repeat step 1. |
+| `credit_exhausted` | The key's credit limit is spent (HTTP 402). Add credit to the account, then recheck. Only you can fix this; it never heals on its own. |
+| `forbidden` | The key is valid but has no access to the decisions model. Check the key's model limits. |
 | `credential_invalid` | The file holds more than one line. Repeat step 1 instead of editing the file. |
 | `credential_unsafe` | Folder or file permissions are too open, or the file is a symlink. Remove `~/.gru-command/credentials` and repeat step 1. |
+| `endpoint_untrusted` | The configured endpoint is not a verified HTTPS decisions endpoint. Restore it. |
+| `endpoint_not_found` / `malformed_request` | The endpoint path or model name is wrong (HTTP 404/400/422). Check the `model` and `endpoint` values above. |
 | `probe_failed` / `malformed_response` | OpenRouter answered, but not as expected. Check the `model` and `endpoint` values above. |
+| `provider_degraded` / `network_error` | Transient provider trouble (HTTP 408/429, 5xx, or no connection). Jev rechecks automatically on a bounded backoff; use Recheck if it persists. |
 | `timeout` | Answers are slower than `timeout_ms`. A single slow shadow ask is only recorded; 3 in a row mark Jev degraded, and it rechecks automatically. If this keeps happening on a healthy network, raise `timeout_ms` (for example to 8000). |
 
 Full reference (provider profiles including TypeSafe direct and a local `/v1/systemone` model, backtests, enforcement): [docs/jev-production-integration.md](docs/jev-production-integration.md).

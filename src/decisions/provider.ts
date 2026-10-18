@@ -271,9 +271,21 @@ export class ProfileProvider {
         cancelResponseBody(response);
         if (response.status >= 300 && response.status < 400) throw new DecisionProviderError('endpoint_untrusted');
         if (response.status === 401) throw new DecisionProviderError('auth_rejected');
+        // 402 is an out-of-credit key: only the owner can fix it, and it
+        // never heals on its own (issue #442). Say so in the message.
+        if (response.status === 402) throw new DecisionProviderError('credit_exhausted', 'provider key is out of credit — add credit, then recheck');
         if (response.status === 403) throw new DecisionProviderError('forbidden');
+        // A wrong endpoint path is a wiring fault, not provider health.
+        if (response.status === 404) throw new DecisionProviderError('endpoint_not_found');
         if (response.status === 422) throw new DecisionProviderError('malformed_request');
-        throw new DecisionProviderError('provider_degraded');
+        // Only genuinely transient HTTP states stay provider_degraded:
+        // request timeout, rate limit, and server faults.
+        if (response.status === 408 || response.status === 429 || response.status >= 500) {
+          throw new DecisionProviderError('provider_degraded');
+        }
+        // Any other 4xx is a persistent client-side fault (wiring or
+        // request shape); it never heals itself, so it must reach the owner.
+        throw new DecisionProviderError('malformed_request', `HTTP ${response.status}`);
       }
       // This refusal is decided from headers, before attempting any body read.
       const declared = Number(response.headers.get('content-length'));
