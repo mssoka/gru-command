@@ -12,12 +12,25 @@
  * inventing a revision.
  */
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import process from 'node:process';
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
+
+/** Package version at build time — the identity the built artifacts ship.
+ * A later pull must not change what this build reports. */
+function packageVersion() {
+  try {
+    const parsed = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf-8'));
+    return typeof parsed.version === 'string' && /^\d+\.\d+\.\d+$/.test(parsed.version)
+      ? parsed.version
+      : null;
+  } catch {
+    return null;
+  }
+}
 
 /** Git output or null — a missing git/checkout must never fail the build. */
 function git(args) {
@@ -35,6 +48,7 @@ function git(args) {
 
 const rev = git(['rev-parse', 'HEAD']);
 const payload = {
+  version: packageVersion(),
   rev,
   committedAt: rev === null ? null : git(['log', '-1', '--format=%cI', rev]),
   builtAt: new Date().toISOString(),

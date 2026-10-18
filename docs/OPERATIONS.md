@@ -47,16 +47,18 @@ gru-service reset         # service stopped: remove GC lanes, empty the data dir
 ```
 
 **Noticing a release.** The board's `deploy` check is the operator-facing
-update signal. Every 5 minutes the service reads `origin/main` and origin's
-stable `vX.Y.Z` tags: a build behind main renders `N behind` with a
-`RESTART PENDING` flag; a build that contains an older release than
-origin's newest tag renders that tag with an `UPDATE AVAILABLE` flag,
-naming the version to move to.
+update signal. Every 5 minutes the service reads `origin/main` and the
+newest stable `vX.Y.Z` reachable from it: a build older than that release
+renders the tag with an `UPDATE AVAILABLE` flag (this state wins over the
+commit count); otherwise a build behind main renders `N behind` with a
+`RESTART PENDING` flag. A release on another ref is never advertised —
+pulling main could not deliver it — and is named in `checkError` instead.
 The check starts from the revision stamped into `dist/build-rev.json` at
 build time (never the live `git HEAD`), falls back to the last fetched
-refs when origin is unreachable (`checkError` says so), and reports
-`unknown` rather than guessing. `gru-service version` gives the same
-installed identity on a shell, with no config read and no network.
+refs when origin is unreachable (the fallback is named once; a count that
+could not be proven shows the full error), and reports `unknown` rather
+than guessing. `gru-service version` prints the version stamped at build
+time plus the build SHA, with no config read and no network.
 
 The service can also roll **itself** — `gru-service roll` (CLI) or
 `POST /api/roll` (pairing-token guarded) pulls and rebuilds the deploy

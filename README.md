@@ -175,12 +175,14 @@ interactively, automatic under `--no-interact` or whenever no terminal is
 available (cron/CI); declining keeps the run green and prints the
 `./install.sh --service` hint. You do not have to poll the repository to
 notice a release: the board's **deploy** check compares the build's
-`dist/build-rev.json` with `origin/main` (every 5 minutes) and with
-origin's newest stable `vX.Y.Z` tag. A build behind main reads `N
-behind` with a `RESTART PENDING` flag; a build older than a release
-reads the tag with an `UPDATE AVAILABLE` flag naming the version to move
-to; `gru-service version` prints the installed version and build SHA
-offline. Generate a fresh complete config separately with:
+`dist/build-rev.json` with `origin/main` (every 5 minutes) and with the
+newest stable `vX.Y.Z` reachable from `origin/main` (a tag on another ref
+is never advertised — pulling main could not deliver it). A build older
+than that release reads the tag with an `UPDATE AVAILABLE` flag and that
+state wins over the commit count; otherwise a build behind main reads
+`N behind` with a `RESTART PENDING` flag. `gru-service version` prints
+the version stamped into the build plus its SHA, offline. Generate a
+fresh complete config separately with:
 
 ```bash
 npm run config:generate                 # refuses an existing file

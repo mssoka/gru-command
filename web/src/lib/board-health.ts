@@ -107,41 +107,48 @@ function notAvailable(id: HealthCardView['id'], title: string, titleAttr?: strin
   });
 }
 
-/** The restart-pending flag: the running build is behind origin/main, so a
- * restart (after rebuild) is owed. Unknown counts never flag. */
+/** The restart-pending flag: the running build is behind origin/main or
+ * lacks the newest deliverable release. Unknowns never flag. */
 export function restartPending(build: BuildView | null | undefined): boolean {
+  if (build?.updateAvailable === true) return true;
   return (build?.commitsBehind ?? null) !== null && (build?.commitsBehind ?? 0) > 0;
 }
 
 export function deployDriftCard(build: BuildView | null | undefined, now = Date.now()): HealthCardView {
   if (build === null || build === undefined) return notAvailable('deploy', 'deploy');
+  // A pre-change server omits these fields; the wire validator accepts that
+  // during a roll, so treat undefined exactly like null here.
+  const latestTag = build.latestTag ?? null;
+  const buildTag = build.buildTag ?? null;
+  const updateAvailable = build.updateAvailable ?? null;
+  const stale = build.checkError === null ? '' : ` · ${build.checkError}`;
 
   // A newer tagged release is the strongest update signal: it names the
   // version to move to, so "there is an update" does not require reading
   // a raw commit count. Unknowns never flag.
-  if (build.updateAvailable === true && build.latestTag !== null) {
-    const have = build.buildTag === null ? 'no release in this build' : `contains ${build.buildTag}`;
+  if (updateAvailable === true && latestTag !== null) {
+    const have = buildTag === null ? 'no release in this build' : `contains ${buildTag}`;
     const age = build.buildCommittedAt === null ? '' : ` (${formatAge(build.buildCommittedAt, now)} old)`;
     return card(
       'deploy',
       'deploy',
-      build.latestTag,
-      `build ${shortRev(build.buildRev)}${age} ${have} · ${build.latestTag} released — run gru-service roll`,
+      latestTag,
+      `build ${shortRev(build.buildRev)}${age} ${have} · ${latestTag} released — update with ./install.sh or gru-service roll`,
       'alert',
       'UPDATE AVAILABLE',
-      `running build ${shortRev(build.buildRev)} is older than release ${build.latestTag} (${have}) — rebuild + restart`,
-      { lead: '', num: null, unit: '' },
+      `running build ${shortRev(build.buildRev)} is older than release ${latestTag} (${have}) — rebuild + restart${stale}`,
+      { lead: '', num: null, unit: latestTag },
     );
   }
 
   // The tag line only decorates a check whose counting succeeded; an
   // unknown count keeps its `checkError` as the whole story.
   const release =
-    build.latestTag === null
+    latestTag === null
       ? null
-      : build.buildTag === null
-        ? `latest release ${build.latestTag}`
-        : `latest release ${build.latestTag} · build contains ${build.buildTag}`;
+      : buildTag === null
+        ? `latest release ${latestTag}`
+        : `latest release ${latestTag} · build contains ${buildTag}`;
 
   if (build.commitsBehind === null) {
     const why = build.checkError ?? 'origin/main not checked yet';
@@ -164,7 +171,7 @@ export function deployDriftCard(build: BuildView | null | undefined, now = Date.
       `build ${shortRev(build.buildRev)} · checked ${formatAge(build.checkedAt, now)} ago${release === null ? '' : ` · ${release}`}`,
       'ok',
       null,
-      `running build ${shortRev(build.buildRev)} matches origin/main ${shortRev(build.originMainRev)}${release === null ? '' : ` · ${release}`}`,
+      `running build ${shortRev(build.buildRev)} matches origin/main ${shortRev(build.originMainRev)}${release === null ? '' : ` · ${release}`}${stale}`,
       { lead: '', num: null, unit: 'current' },
     );
   }
@@ -175,7 +182,7 @@ export function deployDriftCard(build: BuildView | null | undefined, now = Date.
     `build ${shortRev(build.buildRev)} (${formatAge(build.buildCommittedAt, now)} old) · main ${shortRev(build.originMainRev)}${release === null ? '' : ` · ${release}`}`,
     'alert',
     'RESTART PENDING',
-    `running build ${shortRev(build.buildRev)} is ${build.commitsBehind} commits behind origin/main ${shortRev(build.originMainRev)} — rebuild + restart`,
+    `running build ${shortRev(build.buildRev)} is ${build.commitsBehind} commits behind origin/main ${shortRev(build.originMainRev)} — rebuild + restart${stale}`,
     { lead: '', num: build.commitsBehind, unit: ' behind' },
   );
 }

@@ -14,6 +14,7 @@ import { runResetCli, type ResetCliDeps } from './reset.js';
  *
  *   gru-service roll [--no-wait] [--json] [--reason <text>] [--timeout-ms <n>]
  *   gru-service version [--json]                 (offline: no service needed)
+ *   gru-service --version                        (alias of version)
  *   gru-service reset [--yes] [--delete-branches] [--delete-refs]   (src/cli/reset.ts)
  *
  * The roll command asks the running service to roll itself (POST
@@ -29,7 +30,7 @@ const POLL_INTERVAL_MS = 2_000;
 const HEALTH_VERIFY_TIMEOUT_MS = 60_000;
 
 const USAGE = `usage: gru-service roll [--no-wait] [--json] [--reason <text>] [--timeout-ms <n>]
-       gru-service version [--json]
+       gru-service version [--json]   (or --version / -v)
        gru-service reset [--yes] [--delete-branches] [--delete-refs]
 
   roll   pull + rebuild the deploy clone on the running service, drain
@@ -60,7 +61,9 @@ export interface VersionInfo {
 export function currentVersionInfo(build: BuildInfo = readBuildInfo()): VersionInfo {
   return {
     service: SERVICE_NAME,
-    version: VERSION,
+    // The stamp is what this installation BUILT. Fall back to the checkout's
+    // package.json only for pre-stamp builds (the SHA is still exact).
+    version: build.version ?? VERSION,
     rev: build.rev,
     committedAt: build.committedAt,
     builtAt: build.builtAt,
@@ -224,7 +227,7 @@ export async function runServiceCli(
   argv: readonly string[],
   overrides: Partial<ServiceCliDeps> & { readonly reset?: Partial<ResetCliDeps>; readonly build?: () => BuildInfo } = {},
 ): Promise<number> {
-  if (argv[0] === 'version') {
+  if (argv[0] === 'version' || argv[0] === '--version' || argv[0] === '-v') {
     return runVersionCli(argv.slice(1), {
       stdout: overrides.stdout ?? ((line) => process.stdout.write(`${line}\n`)),
       stderr: overrides.stderr ?? ((line) => process.stderr.write(`${line}\n`)),

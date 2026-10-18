@@ -1,6 +1,6 @@
 {
   "name": "gru-command",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "A standalone, installable multi-agent orchestrator: one service hosting every agent as a headless session behind a pluggable runtime adapter.",
   "type": "module",
   "license": "MIT",

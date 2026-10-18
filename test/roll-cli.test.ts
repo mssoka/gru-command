@@ -300,6 +300,12 @@ describe('gru-service version — the installed build identity, offline', () => 
     expect(formatVersion(INFO, false)).toBe('gru-command 1.0.1 · build dd052df (2026-10-18T08:12:00+01:00)');
   });
 
+  it('falls back to the build time when the commit time is unknown', () => {
+    expect(formatVersion({ ...INFO, committedAt: null }, false)).toBe(
+      'gru-command 1.0.1 · build dd052df (2026-10-18T07:13:00.000Z)',
+    );
+  });
+
   it('prints one JSON object with the full SHA for scripts', () => {
     expect(JSON.parse(formatVersion(INFO, true))).toEqual(INFO);
   });
@@ -309,15 +315,21 @@ describe('gru-service version — the installed build identity, offline', () => 
     expect(unknown).toBe('gru-command 1.0.1 · build unknown');
   });
 
-  it('runVersionCli is strict: --json works, anything else exits 2, --help exits 0', () => {
+  it('runVersionCli is strict: plain/--json work, anything else exits 2, --help exits 0', () => {
     const stdout: string[] = [];
     const stderr: string[] = [];
     const deps = { stdout: (line: string) => stdout.push(line), stderr: (line: string) => stderr.push(line), build: () => ({
+      version: INFO.version,
       rev: INFO.rev,
       committedAt: INFO.committedAt,
       builtAt: INFO.builtAt,
     }) };
 
+    expect(runVersionCli([], deps)).toBe(0);
+    expect(stdout.join('\n')).toContain('gru-command 1.0.1 · build dd052df');
+    expect(stderr).toEqual([]);
+
+    stdout.length = 0;
     expect(runVersionCli(['--json'], deps)).toBe(0);
     expect(JSON.parse(stdout.join('\n'))).toEqual(INFO);
     expect(stderr).toEqual([]);
@@ -332,19 +344,46 @@ describe('gru-service version — the installed build identity, offline', () => 
     expect(stderr.join('\n')).toContain('gru-service version');
   });
 
-  it('runServiceCli routes version before config/network and reports the package version', async () => {
+  it('reports the version stamped at build time, not a newer checkout package', async () => {
     const stdout: string[] = [];
     const stderr: string[] = [];
-    const code = await runServiceCli(['version', '--json'], {
+    const deps = {
+      stdout: (line: string) => stdout.push(line),
+      stderr: (line: string) => stderr.push(line),
+      build: () => ({ version: '1.0.1', rev: INFO.rev, committedAt: INFO.committedAt, builtAt: INFO.builtAt }),
+    };
+    // The checkout is VERSION (1.0.2); the build shipped 1.0.1.
+    await expect(runServiceCli(['version', '--json'], deps)).resolves.toBe(0);
+    expect(JSON.parse(stdout.join('\n'))).toMatchObject({ version: '1.0.1', rev: INFO.rev });
+    expect(stderr).toEqual([]);
+  });
+
+  it('falls back to the checkout version for a pre-stamp build', async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    await runServiceCli(['version', '--json'], {
       stdout: (line) => stdout.push(line),
       stderr: (line) => stderr.push(line),
-      build: () => ({ rev: INFO.rev, committedAt: INFO.committedAt, builtAt: INFO.builtAt }),
-      // A version read must not need the instance config or a reachable service.
-      loadConfig: () => { throw new Error('version must not read config'); },
-      fetchFn: () => { throw new Error('version must not dial'); },
+      build: () => ({ version: null, rev: INFO.rev, committedAt: INFO.committedAt, builtAt: INFO.builtAt }),
     });
-    expect(code).toBe(0);
+    expect(JSON.parse(stdout.join('\n')).version).toBe(VERSION);
     expect(stderr).toEqual([]);
-    expect(JSON.parse(stdout.join('\n'))).toMatchObject({ service: 'gru-command', version: VERSION, rev: INFO.rev });
+  });
+
+  it('routes version/--version/-v before config/network, and they never dial', async () => {
+    for (const argv of [['version'], ['--version'], ['-v']] as const) {
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const code = await runServiceCli([...argv], {
+        stdout: (line) => stdout.push(line),
+        stderr: (line) => stderr.push(line),
+        build: () => ({ version: INFO.version, rev: INFO.rev, committedAt: INFO.committedAt, builtAt: INFO.builtAt }),
+        loadConfig: () => { throw new Error('version must not read config'); },
+        fetchFn: () => { throw new Error('version must not dial'); },
+      });
+      expect(code, argv.join(' ')).toBe(0);
+      expect(stderr).toEqual([]);
+      expect(stdout.join('\n')).toContain('gru-command 1.0.1');
+    }
   });
 });

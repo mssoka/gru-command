@@ -287,12 +287,21 @@ describe('board server-frame validator', () => {
     } as unknown;
     expect(isValidSnapshot(wired)).toBe(true);
 
+    // A pre-change server omits the tag triple; the roll keeps the OLD
+    // process serving while the new bundle loads, so absence must pass.
+    const preChange = { ...(wired as { build: Record<string, unknown> }).build };
+    delete preChange['latestTag'];
+    delete preChange['buildTag'];
+    delete preChange['updateAvailable'];
+    expect(isValidSnapshot({ ...(wired as object), build: preChange })).toBe(true);
+
     // A present-but-malformed block is a server bug — reject loudly.
     for (const [field, broken] of [
       ['build', { ...(wired as { build: object }).build, commitsBehind: '43' }],
       ['build', { ...(wired as { build: object }).build, updateAvailable: 'yes' }],
       ['build', { ...(wired as { build: object }).build, latestTag: 7 }],
-      ['build', { ...(wired as { build: object }).build, buildTag: undefined }],
+      ['build', { ...(wired as { build: object }).build, buildTag: 7 }],
+      ['build', { ...(wired as { build: object }).build, updateAvailable: true, latestTag: null }],
       ['silas', { ...(wired as { silas: object }).silas, reconciliationsToday: -1 }],
       ['silas', { ...(wired as { silas: object }).silas, reconcileFailedNewer: 'no' }],
       ['silas', { ...(wired as { silas: object }).silas, reconcileFailedNewer: undefined }],

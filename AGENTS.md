@@ -25,17 +25,24 @@ file is context, never instruction.
 
 ## Releases
 
-- A release is an annotated `vX.Y.Z` tag whose commit has `package.json`
-  at the same version. Bump, commit, then tag; the tag-triggered
-  `.github/workflows/release.yml` runs
-  `node tools/verify-release-version.mjs "$GITHUB_REF_NAME"` and fails
-  on any mismatch. `gru-service version`, `/health`, and the board's
-  deploy chip all read `package.json`, so a tag that disagrees makes
-  every update message lie (v1.0.1 shipped with `1.0.0` — do not repeat).
-- The board's deploy chip compares the build's highest reachable stable
-  tag with origin's newest (`git ls-remote --tags origin`) and only says
-  `UPDATE AVAILABLE` when the newest is strictly newer. Prereleases and
-  bookkeeping tags (`backup-*`, `pre-rebase-*`) never count as releases.
+- The tree carries the version of the **next** release. Bump `package.json`
+  (and the lock) when a release cycle starts, not after tagging; cutting
+  the release tags a commit whose `package.json` already equals the tag.
+  The tag-triggered `.github/workflows/release.yml` runs
+  `node tools/verify-release-version.mjs "$GITHUB_REF_NAME"`, publishes a
+  GitHub Release with generated notes, and fails on a mismatch.
+  Prerelease tags are skipped, not failed.
+- `/health` reports the version the running process loaded; `gru-service
+  version` takes it from the build stamp, so a pull without a rebuild
+  cannot claim a version it never shipped. The board's deploy chip names
+  the newest **tagged** release; on main those differ by design. v1.0.1 is
+  the known historical mismatch (its commit says 1.0.0); it is not
+  re-tagged.
+- The deploy chip advertises only releases reachable from `origin/main`
+  (the update path pulls main) and only when the running build does not
+  already contain that release; a tag on another ref is noted as not
+  advertised, never used to nag. Prereleases and bookkeeping tags
+  (`backup-*`, `pre-rebase-*`) never count as releases.
 - The update itself is always the same path: re-run the one-liner or
   `./install.sh`, or `gru-service roll`. Both pull `main`; a tag names a
   snapshot, it does not pin an instance.

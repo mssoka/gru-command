@@ -9,10 +9,11 @@
  * the cached view — one git check per interval, never one per client.
  *
  * Release tags are the second signal: `latestTag` is the newest stable
- * `vX.Y.Z` on origin, `buildTag` the highest one reachable from the build,
- * and `updateAvailable` is true only when the former is strictly newer
- * than the latter. An operator on main (no tagged release yet) keeps the
- * commits-behind signal; an operator on a release learns the tag's name.
+ * `vX.Y.Z` reachable from origin/main (the only thing an update can
+ * deliver), `buildTag` the highest one reachable from the build, and
+ * `updateAvailable` is true only when the build does not contain that
+ * deliverable release. A tag that is not on origin/main is never
+ * advertised — otherwise `roll` (pull main) could never clear the flag.
  *
  * Every git step is best-effort and loud in `checkError`: an offline host
  * still renders (against the last fetched origin/main and tags), it never
@@ -36,7 +37,9 @@ export interface DeployDriftView {
   readonly originMainCommittedAt: string | null;
   /** origin/main commits not reachable from the build (null = unknown). */
   readonly commitsBehind: number | null;
-  /** Newest stable release tag on origin (null = none read / unknown). */
+  /** Newest stable release tag reachable from origin/main (null = none
+   * read / unknown). A tag on another ref is not deliverable and is not
+   * advertised here. */
   readonly latestTag: string | null;
   /** Highest stable release tag reachable from the build (null = unknown). */
   readonly buildTag: string | null;
@@ -69,7 +72,7 @@ const FETCH_TIMEOUT_MS = 30_000;
 const SHA_PATTERN = /^[0-9a-f]{7,64}$/;
 /** Release tags are stable `vX.Y.Z` only: a prerelease or a bookkeeping
  * tag (backup-*, pre-rebase-*) must never read as "an update available". */
-const RELEASE_TAG_PATTERN = /^v(\d+)\.(\d+)\.(\d+)$/;
+const RELEASE_TAG_PATTERN = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 
 interface ReleaseTag {
   readonly major: number;
@@ -286,35 +289,87 @@ export class DeployDriftTracker {
       }
     }
 
-    // 4. Release tags: the newest stable tag on origin vs. the highest one
-    //    reachable from the running build. The tag read is its own step —
-    //    offline it falls back to the last fetched tags, and an unknown
-    //    side leaves `updateAvailable` null rather than claiming an update.
+    // 4. Release tags: the newest release reachable from origin/main (the
+    //    only thing the documented update path can deliver) vs. the highest
+    //    release already contained in the running build. Remote names are
+    //    truth; local tags are fetched on demand when the newest one is
+    //    absent, so a tag created on an already-present commit cannot hide.
+    //    Nothing here may claim an update the build already contains or
+    //    that pulling main cannot deliver.
     let latestTag: string | null = null;
     let buildTag: string | null = null;
     let updateAvailable: boolean | null = null;
+
+    let remoteTagNames: readonly string[] | null = null;
+    let tagsFromRemote = false;
     try {
-      latestTag = highestReleaseTag(await this.remoteTagNames());
+      remoteTagNames = await this.remoteTagNames();
+      tagsFromRemote = true;
     } catch (error) {
       try {
-        latestTag = highestReleaseTag(await this.localTagNames());
+        remoteTagNames = await this.localTagNames();
         // origin/main's failure already named the outage; don't repeat it.
         if (remoteRev !== null) {
-          noteError(`release tags: origin unreachable (${messageOf(error)}) — using last fetched tags`);
+          noteError(`release tags: read failed (${messageOf(error)}) — using last fetched tags`);
         }
       } catch {
         noteError(`release tags unavailable (${messageOf(error)})`);
       }
     }
-    if (buildRev !== null) {
-      try {
-        buildTag = highestReleaseTag(await this.mergedTagNames(buildRev));
-      } catch {
-        buildTag = null; // tag list unreadable — unknown, never "current"
+
+    if (remoteTagNames !== null) {
+      const remoteNames = new Set(remoteTagNames);
+      const newestRemote = highestReleaseTag(remoteTagNames);
+      let tagsFresh = true;
+      if (newestRemote !== null) {
+        try {
+          const localNames = await this.localTagNames();
+          // Any missing stable tag can hide the build's own release (a tag
+          // created on a commit the clone already has), not just the newest.
+          const missing = remoteTagNames.some(
+            (name) => parseReleaseTag(name) !== null && !localNames.includes(name),
+          );
+          if (missing) {
+            await this.runGit(['fetch', '--quiet', '--tags', 'origin'], FETCH_TIMEOUT_MS);
+          }
+        } catch (error) {
+          tagsFresh = false;
+          noteError(`release tags: could not fetch release tags (${messageOf(error)}) — update signal may be stale`);
+        }
       }
-    }
-    if (latestTag !== null && buildTag !== null) {
-      updateAvailable = (compareReleaseTags(latestTag, buildTag) ?? 0) > 0;
+
+      if (originMainRev !== null) {
+        try {
+          const mergedMain = await this.mergedTagNames(originMainRev);
+          latestTag = highestReleaseTag(mergedMain.filter((name) => remoteNames.has(name)));
+        } catch (error) {
+          noteError(`release tags: origin/main tag list unavailable (${messageOf(error)}) — update signal unknown`);
+        }
+      }
+
+      let buildTagsReadable = false;
+      if (buildRev !== null) {
+        try {
+          buildTag = highestReleaseTag(await this.mergedTagNames(buildRev));
+          buildTagsReadable = true;
+        } catch (error) {
+          noteError(`release tags: build tag list unavailable (${messageOf(error)}) — update signal unknown`);
+        }
+      }
+
+      if (latestTag !== null && buildTagsReadable) {
+        updateAvailable = buildTag === null || (compareReleaseTags(latestTag, buildTag) ?? 0) > 0;
+      }
+
+      if (
+        tagsFresh &&
+        tagsFromRemote &&
+        newestRemote !== null &&
+        latestTag !== null &&
+        (compareReleaseTags(newestRemote, latestTag) ?? 0) > 0
+      ) {
+        noteError(`release ${newestRemote} is not in origin/main — not advertised`);
+      }
     }
 
     return {

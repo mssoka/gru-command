@@ -998,9 +998,15 @@ function isBuildView(value: unknown): value is BuildView {
     (value.originMainCommittedAt === null || typeof value.originMainCommittedAt === 'string') &&
     (value.commitsBehind === null ||
       (typeof value.commitsBehind === 'number' && Number.isSafeInteger(value.commitsBehind) && value.commitsBehind >= 0)) &&
-    (value.latestTag === null || typeof value.latestTag === 'string') &&
-    (value.buildTag === null || typeof value.buildTag === 'string') &&
-    (value.updateAvailable === null || typeof value.updateAvailable === 'boolean') &&
+    // The tag fields are absent from a pre-change server's frames. A roll
+    // builds the new web bundle while the OLD process still serves, so a
+    // reload can see the old snapshot shape; accept absence, reject junk.
+    (value.latestTag === undefined || value.latestTag === null || typeof value.latestTag === 'string') &&
+    (value.buildTag === undefined || value.buildTag === null || typeof value.buildTag === 'string') &&
+    (value.updateAvailable === undefined || value.updateAvailable === null || typeof value.updateAvailable === 'boolean') &&
+    // An "update available" with no named release is self-contradictory;
+    // the card would silently demote it to the count branch.
+    !(value.updateAvailable === true && (value.latestTag === undefined || value.latestTag === null)) &&
     (value.checkedAt === null || typeof value.checkedAt === 'string') &&
     (value.checkError === null || typeof value.checkError === 'string')
   );

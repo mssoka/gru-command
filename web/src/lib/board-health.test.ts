@@ -86,11 +86,43 @@ describe('deploy drift math — the card that catches a 43-commit-behind service
       NOW.getTime(),
     );
     expect(card.value).toBe('v1.0.2');
+    expect(card.valueSplit).toEqual({ lead: '', num: null, unit: 'v1.0.2' });
     expect(card.flag).toBe('UPDATE AVAILABLE');
     expect(card.tone).toBe('alert');
     expect(card.detail).toContain('contains v1.0.1');
-    expect(card.detail).toContain('run gru-service roll');
+    expect(card.detail).toContain('./install.sh');
+    expect(card.detail).toContain('gru-service roll');
     expect(card.titleAttr).toContain('older than release v1.0.2');
+  });
+
+  it('wins over an unknown commit count, so a known release is never demoted to unknown', () => {
+    const card = deployDriftCard(
+      drift({ commitsBehind: null, latestTag: 'v1.0.2', buildTag: 'v1.0.1', updateAvailable: true }),
+      NOW.getTime(),
+    );
+    expect(card.value).toBe('v1.0.2');
+    expect(card.flag).toBe('UPDATE AVAILABLE');
+    expect(card.tone).toBe('alert');
+  });
+
+  it('names a build with no release at all and omits an unknown age', () => {
+    const card = deployDriftCard(
+      drift({
+        buildCommittedAt: null,
+        latestTag: 'v1.0.2',
+        buildTag: null,
+        updateAvailable: true,
+      }),
+      NOW.getTime(),
+    );
+    expect(card.detail).toContain('no release in this build');
+    expect(card.detail).not.toContain(' old)');
+    expect(card.flag).toBe('UPDATE AVAILABLE');
+  });
+
+  it('flags restart pending for an available release even when main is current', () => {
+    expect(restartPending(drift({ commitsBehind: 0, updateAvailable: true }))).toBe(true);
+    expect(restartPending(drift({ commitsBehind: 0, updateAvailable: false }))).toBe(false);
   });
 
   it('does not flag an update when the build already contains the newest release', () => {
@@ -121,6 +153,15 @@ describe('deploy drift math — the card that catches a 43-commit-behind service
     expect(card.value).toBe('current');
     expect(card.flag).toBeNull();
     expect(card.detail).toContain('latest release v1.0.2');
+  });
+
+  it('keeps a known count visible when the release check itself was stale', () => {
+    const card = deployDriftCard(
+      drift({ commitsBehind: 3, latestTag: 'v1.0.1', buildTag: 'v1.0.1', updateAvailable: false, checkError: 'release tags: read failed (offline)' }),
+      NOW.getTime(),
+    );
+    expect(card.value).toBe('3 behind');
+    expect(card.titleAttr).toContain('read failed (offline)');
   });
 });
 

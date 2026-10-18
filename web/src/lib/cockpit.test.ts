@@ -339,6 +339,21 @@ describe('cockpit health pill', () => {
     expect(pill.parts.map((part) => part.id)).not.toContain('alerts');
   });
 
+  it('shows an available release as deploy <tag> UPDATE AVAILABLE', () => {
+    const update: BuildView = {
+      ...BEHIND,
+      latestTag: 'v1.0.2',
+      buildTag: 'v1.0.1',
+      updateAvailable: true,
+    };
+    const pill = healthPill(snapshot([], [], null, { build: update }), NOW);
+    expect(pill.state).toBe('attention');
+    expect(pill.summary).toBe('1 needs a look');
+    expect(pill.parts.map((part) => [part.id, part.text, part.flag, part.tone, part.problem])).toEqual([
+      ['deploy', 'deploy v1.0.2', 'UPDATE AVAILABLE', 'alert', true],
+    ]);
+  });
+
   it('one problem reads singular; an all-unwired board never reads healthy', () => {
     expect(healthPill(snapshot([], [], null, { build: BEHIND }), NOW).summary).toBe('1 needs a look');
     const unwired = healthPill(snapshot([], [], null), NOW);

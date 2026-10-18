@@ -18,7 +18,9 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import process from 'node:process';
 
-const RELEASE_TAG = /^v(\d+)\.(\d+)\.(\d+)$/;
+const SEMVER = '(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)';
+const RELEASE_TAG = new RegExp(`^v${SEMVER}$`);
+const PACKAGE_VERSION = new RegExp(`^${SEMVER}$`);
 const defaultPackage = join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
 
 function fail(message, code) {
@@ -63,7 +65,7 @@ try {
   fail(`cannot read package metadata at ${packagePath}: ${error instanceof Error ? error.message : String(error)}`, 1);
 }
 const version = parsed?.version;
-if (typeof version !== 'string' || !/^\d+\.\d+\.\d+$/.test(version)) {
+if (typeof version !== 'string' || !PACKAGE_VERSION.test(version)) {
   fail(`package.json version is not MAJOR.MINOR.PATCH: ${JSON.stringify(version)}`, 1);
 }
 

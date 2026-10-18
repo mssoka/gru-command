@@ -539,7 +539,7 @@ describe('W-C (E9 r3 carry): /health disclosure split', () => {
     const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
     const identity = loadOrCreateIdentity(config.dataDir);
     const service = createService(config, identity, () => {}, () => null, {
-      buildInfo: () => ({ rev: 'f'.repeat(40), committedAt: null, builtAt: '2026-09-23T00:00:00.000Z' }),
+      buildInfo: () => ({ version: '1.0.2', rev: 'f'.repeat(40), committedAt: null, builtAt: '2026-09-23T00:00:00.000Z' }),
     });
     const handle = await service.start();
     try {
