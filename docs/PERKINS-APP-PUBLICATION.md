@@ -77,9 +77,48 @@ personal credential:
 | Bundle | github.com publication |
 |---|---|
 | `<instance_dir>/perkins/config` present (or `<data_dir>/perkins/config` for a relocated deployment) | Perkins App poster |
-| absent from both roots | legacy `gh` poster, byte-for-byte unchanged |
+| absent from both roots | legacy `gh` poster, byte-for-byte unchanged — and named loudly (below) |
 
 GitLab routing is untouched in both modes.
+
+**The bundle is an install prerequisite, and its absence is named.** The
+legacy `gh` poster is a compatibility boundary, never a silent one (issue
+#444: a fresh install with no bundle ran a complete round, then died on
+`422 APPROVE, self-author` — the personal `gh` identity cannot approve the
+PR it authored). Two surfaces say so before a round is wasted:
+
+- **Boot** — `[review] enabled = true` with no bundle resolving logs an
+error line on EVERY boot and posts ONE owner-required incident (kind
+`perkins-app-bundle-missing`, `active` dedupe: restarts reuse the one
+unresolved row instead of minting a second one) carrying `verdict
+publication identity: MISSING — reviews will run but verdicts cannot post
+(self-author 422)` and the remediation. Positive evidence at boot — a
+resolved bundle, or reviews disabled — resolves the incident, so the
+notice clears by itself once the prerequisite is met. An owner Ack
+(`POST /api/notifications/<id>/ack` — the FOR YOU band renders no Ack
+control for a notice) is an acknowledgement, never a fix: it silences the
+bell for that instance (the row leaves FOR YOU), while the boot error line
+and the per-request advisory below keep naming the gap until positive
+evidence resolves it.
+(Presence selects the App poster; the bundle's validity is still proven at
+publication, so a broken bundle fails that review loudly, never at boot.)
+The boot line, incident title and scope field are github.com-scoped: on an
+instance that reviews only GitLab remotes nothing is broken (GitLab notes
+publish on their own token path), so that instance can acknowledge the
+notice through the notification API and the boot line keeps saying so
+until a bundle is added or the gate is turned off.
+- **Review request** — the four-leg pre-flight also evaluates the
+non-blocking advisory leg `verdict-publication-identity` for github.com
+remotes (GitLab remotes are unaffected) and logs it beside the round. The
+advisory never changes the route: the round still runs through Perkins.
+
+The setup wizard prints the same status (with the setup guide inline) at
+the end of any setup run — a fresh install, `--force`, `--answers`, or a
+direct wizard invocation — and a preserved `[review] enabled = false` is
+reported as "not required" instead of a gap. The plain update path
+(`./install.sh` on a configured instance) skips the wizard, so it surfaces
+the gap at the next service boot instead. README "Prerequisites" carries
+the guide too.
 
 With a bundle present, github.com is the **only** supported GitHub host.
 The service's GitHub discriminator routes `github.com`, its subdomains,
@@ -250,5 +289,8 @@ publisher — do not claim App activation before then.
 | File | Role |
 |---|---|
 | `src/dispatch/perkins-github-app.ts` | bundle parsing, JWT, token mint, App poster, startup factory |
-| `src/main.ts` | one-line poster injection at startup (`createStartupVerdictPoster`) |
+| `src/dispatch/verdict-publication-identity.ts` | the install-prerequisite check: boot incident, pre-flight advisory leg, setup guide (#444) |
+| `src/main.ts` | one-line poster injection at startup (`createStartupVerdictPoster`) and the boot report (#444) |
+| `src/wizard/main.ts` | installer flow: prerequisite status + setup guide at the end of setup (#444) |
 | `test/perkins-github-app.test.ts` | behavioral suite (synthetic keys, fixture homes, mocked HTTP) |
+| `test/verdict-publication-identity.test.ts` | prerequisite suite (boot incident, advisory leg, installer note) |

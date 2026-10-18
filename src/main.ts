@@ -28,6 +28,11 @@ import { WorktreeManager } from './worktrees/manager.js';
 import { createWorktreeServer } from './worktrees/server.js';
 import { createReviewEscalationNotifier } from './dispatch/escalation-identity.js';
 import { createStartupVerdictPoster } from './dispatch/perkins-github-app.js';
+import {
+  assessVerdictPublicationIdentity,
+  reportVerdictPublicationIdentity,
+  verdictPublicationIdentityWarning,
+} from './dispatch/verdict-publication-identity.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { SilasDriver, computeSilasDigest, consolidatedBlockersFor, supervisionLookup } from './dispatch/silas-driver.js';
 import { spawnSilasWithActionTool } from './dispatch/silas-model-action.js';
@@ -163,7 +168,8 @@ function reportForeignListener(
   });
 }
 
-/** Fail-closed four-leg review pre-flight (user amendment 2026-09-20). */
+/** Fail-closed four-leg review pre-flight (user amendment 2026-09-20),
+ * plus the non-blocking verdict-publication-identity advisory (issue #444). */
 async function reviewPreflightCheck(
   config: ReturnType<typeof loadConfig>,
   registry: RuntimeRegistry,
@@ -191,7 +197,24 @@ async function reviewPreflightCheck(
     },
     'review-policy': () => probeReviewPolicy({ reviewEnabled: () => config.review.enabled }),
   });
-  return preflight.ok && thinking !== undefined ? { ...preflight, reviewThinkingLevel: thinking } : preflight;
+  const result = preflight.ok && thinking !== undefined ? { ...preflight, reviewThinkingLevel: thinking } : preflight;
+  // Named, non-blocking advisory (issue #444): `[review] enabled = true`
+  // with no Perkins App bundle means this round would run and then fail to
+  // publish on a self-author 422. The route is deliberately unchanged (the
+  // documented legacy publisher stays a compatibility boundary); the gap is
+  // named at the request instead of after a full wasted round. The remote
+  // probe runs only when the gap exists, so App-mode requests pay nothing.
+  const identity = assessVerdictPublicationIdentity({
+    instanceDir: config.instanceDir,
+    dataDir: config.dataDir,
+    reviewEnabled: config.review.enabled,
+  });
+  // The advisory belongs to the Perkins route only: a failed leg already
+  // routes to the fallback gate, which posts no Perkins verdict.
+  const warning = !result.ok || identity.gap === null
+    ? null
+    : verdictPublicationIdentityWarning(identity, repoRemote(repoPath));
+  return warning === null ? result : { ...result, warnings: [...(result.warnings ?? []), warning] };
 }
 import { ChatFrameLog } from './chat/frame-log.js';
 import { createChatServer } from './chat/server.js';
@@ -1043,6 +1066,29 @@ async function main(): Promise<number> {
       },
     );
   };
+  // Install prerequisite (issue #444): github.com verdicts are published by
+  // the installed Perkins App (`perkins-review[bot]`), never the personal
+  // `gh` identity — and the poster is selected once, at startup. A missing
+  // bundle is therefore a BOOT fact: say so now (error line + one
+  // owner-required incident, resolved once the bundle resolves or reviews
+  // are off) instead of letting a complete review round die on a
+  // self-author 422. Posted after `surfaceInChat` is bound so the owner bell
+  // (chat notice) actually rings, and guarded like every other boot notice:
+  // a prerequisite must never keep the service from starting.
+  try {
+    reportVerdictPublicationIdentity({
+      instanceDir: config.instanceDir,
+      dataDir: config.dataDir,
+      reviewEnabled: config.review.enabled,
+      notifications,
+      log: (level, msg, fields) => logger.log(level, msg, fields),
+    });
+  } catch (error) {
+    logger.error('verdict publication identity check failed — booting anyway', {
+      error: String(error),
+      instance_dir: config.instanceDir,
+    });
+  }
   state.supervisor = supervisorLive;
   // Enabled installs perform exactly one bounded synthetic check before
   // the server listens; disabled installs do not resolve a credential or

@@ -121,6 +121,7 @@ test.beforeAll(async () => {
     decisionKey: 'E2E-FILE-CREDENTIAL-CANARY',
     nodeImport: JEV_PRELOAD,
     extraEnv: { JEV_FETCH_LOG, JEV_FETCH_MODE_FILE: JEV_MODE_FILE },
+    reviewEnabled: false,
   });
   durableHome = service.home;
   durableWorkspace = service.workspace;
@@ -303,6 +304,7 @@ test('service restart drops the socket; reconnect keeps history and flushes the 
     workspace: durableWorkspace,
     nodeImport: JEV_PRELOAD,
     extraEnv: { JEV_FETCH_LOG, JEV_FETCH_MODE_FILE: JEV_MODE_FILE },
+    reviewEnabled: false,
   });
   await expect(page.locator('#banners .banner:visible')).toHaveCount(0, { timeout: 15_000 });
   const flushedReply = echoReplies(page, 'typed while down').last();
@@ -588,6 +590,7 @@ test.describe('themes', () => {
       port: themesPort,
       token: REAL_TOKEN,
       requireWebDist: false,
+      reviewEnabled: false,
     });
   });
   test.afterAll(async () => {
@@ -678,6 +681,7 @@ test('missing-key enabled startup is durable degraded: a browser connected AFTER
     decisionsEnabled: true,
     nodeImport: JEV_PRELOAD,
     extraEnv: { JEV_FETCH_LOG, JEV_FETCH_MODE_FILE: JEV_MODE_FILE },
+    reviewEnabled: false,
   });
   try {
     await page.goto(`http://127.0.0.1:${port}`);

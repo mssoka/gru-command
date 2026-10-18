@@ -36,6 +36,11 @@ const OWNER_REQUIRED_KINDS: readonly string[] = [
   'gru.owner-escalation',
   'port-squat',
   'roll-port-squat',
+  // Install prerequisite (issue #444): only the owner can install the
+  // Perkins GitHub App, and without its bundle every github.com review
+  // verdict dies on a self-author 422. The boot check posts it and resolves
+  // it once the bundle (or a disabled review gate) makes it moot.
+  'perkins-app-bundle-missing',
   'worktree-sweep-paused',
   // Unconfirmed native cleanup after a refused replacement can need a human
   // when the original owner is lost (issue #280): main's owner-facing notice.
