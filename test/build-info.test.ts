@@ -22,6 +22,7 @@ function rootWith(artifact: string | null): string {
 describe('build info — the running build stamp', () => {
   it('reads the build-time git stamp written by tools/write-build-rev.mjs', () => {
     const art = {
+      version: '1.0.2',
       rev: 'abc123'.repeat(7),
       committedAt: '2026-09-20T10:00:00.000Z',
       builtAt: '2026-09-20T10:05:00.000Z',
@@ -44,7 +45,14 @@ describe('build info — the running build stamp', () => {
   });
 
   it('a null rev with timestamps still parses (artifact from a non-git build)', () => {
-    const parsed = readBuildInfo(rootWith(JSON.stringify({ rev: null, committedAt: null, builtAt: '2026-09-20T10:05:00.000Z' })));
-    expect(parsed).toEqual({ rev: null, committedAt: null, builtAt: '2026-09-20T10:05:00.000Z' });
+    const parsed = readBuildInfo(rootWith(JSON.stringify({ version: null, rev: null, committedAt: null, builtAt: '2026-09-20T10:05:00.000Z' })));
+    expect(parsed).toEqual({ version: null, rev: null, committedAt: null, builtAt: '2026-09-20T10:05:00.000Z' });
+  });
+
+  it('a pre-version stamp still parses with version null', () => {
+    const parsed = readBuildInfo(
+      rootWith(JSON.stringify({ rev: null, committedAt: null, builtAt: '2026-09-20T10:05:00.000Z' })),
+    );
+    expect(parsed.version).toBeNull();
   });
 });

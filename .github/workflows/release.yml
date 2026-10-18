@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Verify and publish the release
+    runs-on: ubuntu-latest
+    # Needed only for the GitHub Release step; the tag is already public
+    # when this runs, so a mismatch failures the release notes, not the tag.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      # The board's deploy chip and `gru-service version` read the build's
+      # package version; a tag that disagrees makes every update message
+      # lie. Prereleases are not releases here — skip them, don't fail.
+      - name: Verify the tag names the packaged version
+        id: verify
+        run: |
+          if [[ "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "stable=true" >> "$GITHUB_OUTPUT"
+            node tools/verify-release-version.mjs "$GITHUB_REF_NAME"
+          else
+            echo "stable=false" >> "$GITHUB_OUTPUT"
+            echo "not a stable release tag — skipped"
+          fi
+
+      # The release is how operators read WHAT changed; the chip only says
+      # a newer tag exists. Generated notes keep that answer on the tag.
+      - name: Publish release notes
+        if: steps.verify.outputs.stable == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --title "Gru Command $GITHUB_REF_NAME"
