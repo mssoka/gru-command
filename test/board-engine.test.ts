@@ -1113,6 +1113,17 @@ describe('board engine — managed repository overview wiring', () => {
     expect(runtimeSource).toMatch(/managedRepos:\s*config\.managedRepos/);
     expect(mainSource).toMatch(/repoOverview:\s*\(\)\s*=>\s*repoOverview\.view\(\)/);
     expect(mainSource).toMatch(/repoOverview\.start\(\)/);
+    // The default-branch CI alert (#446) is fed by the tracker, and the
+    // tracker starts only once the notification center and the watch exist
+    // (a first pass before them would be lost to the alert).
+    expect(mainSource).toContain('onDefaultBranchRuns: (observation) => defaultBranchCi.observe(observation)');
+    const centerAt = mainSource.indexOf('const notifications = new NotificationCenter(');
+    const watchAt = mainSource.indexOf('const defaultBranchCi = new DefaultBranchCiWatch(');
+    const startAt = mainSource.indexOf('repoOverview.start()');
+    expect(centerAt).toBeGreaterThan(0);
+    expect(watchAt).toBeGreaterThan(centerAt);
+    expect(startAt).toBeGreaterThan(watchAt);
+    expect(mainSource.indexOf('repoOverview.start()', startAt + 1)).toBe(-1);
     // The stop moved into the extracted shutdown orchestration (issue #341),
     // which main.ts invokes; the alarm follows the production wiring.
     const shutdownSource = readFileSync(join(import.meta.dirname, '..', 'src', 'service-shutdown.ts'), 'utf8');

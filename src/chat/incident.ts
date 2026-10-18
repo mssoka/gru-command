@@ -23,10 +23,25 @@ import type { NotificationRecord } from '../ledger/api.js';
  * - Every other kind is scoped by its normalized title, which is where
  *   the dot-scoped producers (`supervision.provider-wall.<agent>.<class>`,
  *   `supervision.turn-orphaned.<lane>`) carry their subject.
+ * - A red default branch (#446,
+ *   `github.default-branch-ci-failed:<owner>/<repo>:<workflowId>:<sha>`)
+ *   has no lane: its subject is the repository, so one hold covers every
+ *   workflow of it, and its basis is the head SHA alone.
  */
 
 /** The minimal row shape the wake path consumes. */
 export type IncidentRow = Pick<NotificationRecord, 'kind' | 'title' | 'routing'>;
+
+const DEFAULT_BRANCH_CI_FAILED = 'github.default-branch-ci-failed';
+
+/** The repository and head SHA of a default-branch CI row (#446); null
+ * for every other kind. */
+function defaultBranchCiScope(kind: string): { readonly repo: string; readonly sha: string } | null {
+  if (!kind.startsWith(`${DEFAULT_BRANCH_CI_FAILED}:`)) return null;
+  const parts = kind.slice(DEFAULT_BRANCH_CI_FAILED.length + 1).split(':');
+  if (parts.length !== 3 || parts.some((part) => part === '')) return null;
+  return { repo: parts[0] as string, sha: parts[2] as string };
+}
 
 /** Title normalizer for unscoped kinds: case- and whitespace-insensitive,
  * bounded, so a producer's stable title template yields a stable key. */
@@ -60,9 +75,13 @@ export function incidentKeyOf(row: IncidentRow): string {
  * Job-scoped kinds are colon-scoped (`github.ci-failed:<job>:<sha>`)
  * plus the one dot-scoped producer that names its lane,
  * `silas.rebrief-unreconciled.<job>` — a job hold must defer that row,
- * so it maps to the same job subject.
+ * so it maps to the same job subject. A red default branch is never
+ * job-scoped: it maps to
+ * `incident:github.default-branch-ci-failed:<owner>/<repo>`.
  */
 export function incidentSubjectOf(row: IncidentRow): string {
+  const defaultBranch = defaultBranchCiScope(row.kind);
+  if (defaultBranch !== null) return `incident:${DEFAULT_BRANCH_CI_FAILED}:${defaultBranch.repo}`;
   const rebrief = /^silas\.rebrief-unreconciled\.([^.]+)$/.exec(row.kind);
   if (rebrief !== null) return `job:${rebrief[1] ?? ''}`;
   const colon = row.kind.indexOf(':');
@@ -81,9 +100,11 @@ export function incidentSubjectOf(row: IncidentRow): string {
  * names (`pr-conflict`, `ci-failed`, …). Producer namespacing
  * (`github.`, `silas.`) is stripped and the scope suffix dropped;
  * unscoped kinds are their own signal. The dot-scoped rebrief producer
- * maps to its family token like the colon-scoped ones.
+ * maps to its family token like the colon-scoped ones; a red default
+ * branch is the `ci-failed` family.
  */
 export function incidentSignalOf(row: IncidentRow): string {
+  if (defaultBranchCiScope(row.kind) !== null) return 'ci-failed';
   const rebrief = /^silas\.rebrief-unreconciled\./.exec(row.kind);
   if (rebrief !== null) return 'rebrief-unreconciled';
   const withoutNamespace = row.kind.replace(/^(github|silas)\./, '');
@@ -99,9 +120,12 @@ export function incidentSignalOf(row: IncidentRow): string {
  * stable stand-in meaning "this exact incident, unchanged". A decision
  * recorded with a null basis covers any basis; a decision recorded with a
  * different basis (a NEW sha under the same lane) does not cover this row,
- * which is exactly how a basis change re-opens a held subject.
+ * which is exactly how a basis change re-opens a held subject. A red
+ * default branch's basis is its head SHA, never the workflow id before it.
  */
 export function incidentBasisOf(row: IncidentRow): string {
+  const defaultBranch = defaultBranchCiScope(row.kind);
+  if (defaultBranch !== null) return defaultBranch.sha;
   const parts = row.kind.split(':');
   if (parts.length >= 3 && parts[0] !== '' && parts[2] !== '') return parts.slice(2).join(':');
   return incidentKeyOf(row);

@@ -105,6 +105,7 @@ describe('managed repository config-to-runtime wiring', () => {
 
     const api = new ProviderSpy();
     const resolvedPaths: string[] = [];
+    const defaultBranchPages: string[] = [];
     const tracker = createManagedRepoOverviewTracker(config, {
       api,
       intervalMs: 0,
@@ -114,10 +115,13 @@ describe('managed repository config-to-runtime wiring', () => {
         resolvedPaths.push(path);
         return defaultRemoteResolver(path);
       },
+      // The default-branch CI alert (#446) hook passes through the adapter.
+      onDefaultBranchRuns: (observation) => defaultBranchPages.push(`${observation.repo.owner}/${observation.repo.repo}@${observation.branch}`),
     });
     const view = await tracker.refresh();
     expect(view?.rows.map((row) => row.key)).toEqual(['alpha', 'gamma']);
     expect(resolvedPaths.map((path) => path.split('/').at(-1))).toEqual(['alpha', 'gamma']);
+    expect(defaultBranchPages).toEqual(['acme/alpha@main', 'acme/gamma@main']);
     expect(new Set(api.calls.map((call) => call.split(':')[1])).size).toBe(2);
     expect(api.calls.some((call) => call.includes('/beta'))).toBe(false);
 

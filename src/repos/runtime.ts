@@ -2,6 +2,7 @@ import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import {
   ManagedRepoOverviewTracker,
+  type DefaultBranchRunsObservation,
   type RemoteResolver,
   type RepoOverviewApiPort,
 } from './overview.js';
@@ -10,6 +11,8 @@ export interface ManagedRepoOverviewRuntimeOptions {
   readonly api: RepoOverviewApiPort;
   readonly log?: (level: LogLevel, message: string, fields?: Record<string, unknown>) => void;
   readonly resolveRemote?: RemoteResolver;
+  /** The default-branch CI alert (#446) fed by each committed observation. */
+  readonly onDefaultBranchRuns?: (observation: DefaultBranchRunsObservation) => void;
   /** Deterministic tracker seams used by the runtime integration tests. */
   readonly intervalMs?: number;
   readonly sleep?: (ms: number) => Promise<void>;
@@ -28,6 +31,7 @@ export function createManagedRepoOverviewTracker(
     api: options.api,
     ...(options.log !== undefined ? { log: options.log } : {}),
     ...(options.resolveRemote !== undefined ? { resolveRemote: options.resolveRemote } : {}),
+    ...(options.onDefaultBranchRuns !== undefined ? { onDefaultBranchRuns: options.onDefaultBranchRuns } : {}),
     ...(options.intervalMs !== undefined ? { intervalMs: options.intervalMs } : {}),
     ...(options.sleep !== undefined ? { sleep: options.sleep } : {}),
     ...(options.now !== undefined ? { now: options.now } : {}),

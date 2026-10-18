@@ -791,6 +791,25 @@ the judgment; the dispatch surface is the mechanical hand.
   opens no second turn for it; a hold recorded through
   `POST /api/decisions` (issue #218) with a matching basis defers the
   wake to the hold's recheck instead.
+- **The default-branch CI alert (#446)** rides the managed repository
+  overview pass, not the lane poll: each committed observation hands its
+  default-branch run page (20 runs, the same single call) to a watch. Per
+  `workflow_id`, the newest decisive run (passed, failed, timed-out,
+  startup-failure) is the verdict; pending, cancelled, skipped, neutral,
+  action-required and stale runs never count. Each observed change is
+  recorded once as a `repo.default-branch-ci` event (payload `scope` =
+  `<owner>/<repo>:<workflowId>`) and deduped against the latest one, so a
+  restart re-reads the cursor and a verdict never steps back to an older
+  run. Turning red posts
+  `github.default-branch-ci-failed:<owner>/<repo>:<workflowId>:<sha>` as
+  `action-required` (severity error) — it wakes Gru for any check name;
+  there is no mechanical tier and no Silas digest row. A newer passing run
+  of the workflow, or the failing run re-run green, resolves that
+  workflow's open incidents. No lane owns a default branch, so the wake
+  path's subject is `incident:github.default-branch-ci-failed:<owner>/<repo>`
+  (signal `ci-failed`, basis the head sha): Gru diagnoses the run, opens a
+  fix heist from the current head and holds that subject while the fix is
+  in flight. Always on for every `managed_repos` entry; no config key.
 - **The digest** handed to every wake carries the actionable states,
   computed from the ledger: delivered jobs with no PR registered; PRs
   whose follow-up delivery proves the lane head moved past the newest

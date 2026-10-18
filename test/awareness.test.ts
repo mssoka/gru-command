@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import {
   AWARENESS_STATE_NAME,
+  AWARENESS_WAKE_INSTRUCTION,
   GruAwareness,
   type AwarenessInjection,
   type AwarenessLimits,
@@ -17,6 +18,8 @@ import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
+import { DefaultBranchCiWatch } from '../src/repos/default-branch-ci.js';
+import type { RepoOverviewRunRaw } from '../src/repos/overview.js';
 
 /**
  * Gru awareness: escalations and lane digests reaching the chat brain.
@@ -3268,5 +3271,53 @@ describe('GH-122 (g26): credential-bearing detail never reaches an autonomous pr
     expect(block!.text).toContain('agent m1: errored');
     expect(block!.text).toContain('[redacted]');
     expect(block!.text).not.toContain(TOKEN);
+  });
+});
+
+describe('red default branch alerts (#446)', () => {
+  const ALPHA = { host: 'github.com', owner: 'acme', repo: 'alpha' };
+  const HELD = '3684087c00000000000000000000000000000002';
+  const NEXT = '3684087c00000000000000000000000000000003';
+  const failedRun = (id: number, workflowId: number, headSha: string): RepoOverviewRunRaw => ({
+    id, name: 'CI', status: 'completed', conclusion: 'failure', url: null, runNumber: id,
+    createdAt: `2026-10-18T10:${String(id).padStart(2, '0')}:00.000Z`, startedAt: null, updatedAt: null, workflowId, headSha,
+  });
+
+  it('the wake instruction names the repository subject and the head-sha basis', () => {
+    expect(AWARENESS_WAKE_INSTRUCTION).toContain(
+      'a red default branch (github.default-branch-ci-failed:<owner>/<repo>:<workflow>:<sha>) has no lane, so its subject is ' +
+        '"incident:github.default-branch-ci-failed:<owner>/<repo>" with the head SHA as basis_fingerprint',
+    );
+  });
+
+  it('a red workflow wakes Gru; one repository hold defers every workflow at the held head; a new head or another repository wakes', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-18T12:00:00'));
+      const rig = boot({ wakeMode: 'action-required' });
+      const watch = new DefaultBranchCiWatch({ ledger: rig.api, notifications: rig.notifications });
+      watch.observe({ repo: ALPHA, branch: 'develop', runs: [failedRun(9, 7, HELD)] });
+      expect(rig.woke).toHaveLength(1);
+      expect(rig.wakeBlocks[0]).toContain('Default branch develop is red');
+      // Gru opens the fix heist and holds the repository at that head.
+      rig.api.recordDecision({
+        subject: 'incident:github.default-branch-ci-failed:acme/alpha',
+        decision: 'hold', covers: ['ci-failed'], basisFingerprint: HELD,
+        reason: 'fix heist in flight', by: 'gru', clientKey: 'hold-alpha-develop',
+        recheckAt: new Date(Date.now() + 3_600_000).toISOString(),
+      });
+      // Another workflow failing at the held head is covered by the same hold.
+      watch.observe({ repo: ALPHA, branch: 'develop', runs: [failedRun(10, 71, HELD), failedRun(9, 7, HELD)] });
+      expect(rig.woke).toHaveLength(1);
+      expect(rig.api.listEventsAfter(0, { kinds: ['gru.wake-deferred'] }).map((event) => (event.payload as { reason: string }).reason)).toEqual(['covered']);
+      // Another repository is another subject.
+      watch.observe({ repo: { ...ALPHA, repo: 'alpha-two' }, branch: 'main', runs: [failedRun(9, 7, HELD)] });
+      expect(rig.woke).toHaveLength(2);
+      // Still red at a new head: the hold's basis no longer matches.
+      watch.observe({ repo: ALPHA, branch: 'develop', runs: [failedRun(11, 7, NEXT)] });
+      expect(rig.woke).toHaveLength(3);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

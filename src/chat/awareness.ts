@@ -109,7 +109,9 @@ export const AWARENESS_WAKE_INSTRUCTION =
   'recorded as state keeps the incident from re-waking you; prose does not. Use the ' +
   'subject the wake path consults: for job-scoped alert kinds that is "job:<job id>" — use ' +
   'the head SHA as basis_fingerprint only when the kind embeds one (github.ci-failed:<job>:<sha>); ' +
-  'omit basis_fingerprint entirely for kinds without a SHA (github.pr-conflict:<job>), and name ' +
+  'omit basis_fingerprint entirely for kinds without a SHA (github.pr-conflict:<job>); a red default branch ' +
+  '(github.default-branch-ci-failed:<owner>/<repo>:<workflow>:<sha>) has no lane, so its subject is ' +
+  '"incident:github.default-branch-ci-failed:<owner>/<repo>" with the head SHA as basis_fingerprint; and name ' +
   'covers with the signal family ("ci-failed", "pr-conflict", "rebrief-unreconciled"). In all mode, ' +
   'FYI and needs-owner rows can also wake you; do not act on or Ack an owner-only stop on the ' +
   'owner’s behalf. Escalate decisions that are theirs; if nothing is actionable, say so briefly.';

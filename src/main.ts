@@ -45,6 +45,7 @@ import {
 import { claimProviderRecoveryContinuation } from './provider-recovery/resume.js';
 import { GhCliApi, GitHubSignalPoll, type LaneRemoteResolver } from './dispatch/github-poll.js';
 import { GhRepoOverviewApi } from './repos/overview.js';
+import { DefaultBranchCiWatch } from './repos/default-branch-ci.js';
 import { createManagedRepoOverviewTracker } from './repos/runtime.js';
 import { createManagedRepoIntakeResolver } from './repos/managed-names.js';
 import { routeFixDirectiveToMinion } from './dispatch/fix-directive.js';
@@ -457,9 +458,13 @@ async function main(): Promise<number> {
   // Own bounded cadence (never per-render, never per-tab), coalesced,
   // server-side through the existing gh auth seam; the snapshot carries
   // the cached view. Rows are absent (null) until the first pass runs.
+  // Each committed observation also feeds the default-branch CI alert
+  // (#446), built once the notification center exists below — the tracker
+  // starts only after that, so no first pass is lost.
   const repoOverview = createManagedRepoOverviewTracker(config, {
     api: new GhRepoOverviewApi(),
     log: (level, msg, fields) => logger.log(level, msg, fields),
+    onDefaultBranchRuns: (observation) => defaultBranchCi.observe(observation),
   });
   // Late-bound (the verification server lands below) — same pattern as
   // supervisionFor / decisionsStatus above.
@@ -544,8 +549,6 @@ async function main(): Promise<number> {
   });
   deployDrift.start();
   state.deployDrift = deployDrift;
-  repoOverview.start();
-  state.repoOverview = repoOverview;
 
   // Chat (E4): the single Gru session behind /ws. The durable frame log
   // loads and boot-settles BEFORE the HTTP server accepts anything (r1
@@ -573,6 +576,15 @@ async function main(): Promise<number> {
     onNeedsOwner: (notification) => surfaceInChat(notification),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+  // Default-branch CI alert (#446): a managed repo's default-branch
+  // workflow turning red wakes Gru; a newer passing run resolves it.
+  const defaultBranchCi = new DefaultBranchCiWatch({
+    ledger,
+    notifications,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  repoOverview.start();
+  state.repoOverview = repoOverview;
   // Owner-attention migration (owner release 2026-10-11): unacked
   // needs-owner rows from before the responsibility chain was enforced are
   // re-triaged to Gru's machine queue with a recorded note (full detail
