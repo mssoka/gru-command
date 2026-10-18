@@ -475,6 +475,21 @@ describe('trusted Jev provider', () => {
   it('falls back with a safe reason for HTTP 429', async () => {
     await expectHttpFallback(429, 'provider_degraded');
   });
+
+  it('maps a spent key (402) to credit_exhausted, not a transient degrade (#442)', async () => {
+    await expectHttpFallback(402, 'credit_exhausted');
+  });
+
+  it('maps 400 and 404 to owner-action reasons, never provider_degraded (#442)', async () => {
+    await expectHttpFallback(400, 'malformed_request');
+    await expectHttpFallback(404, 'endpoint_not_found');
+  });
+
+  it('maps 408 and 5xx to provider_degraded; other 4xx stay owner-action (#442)', async () => {
+    await expectHttpFallback(408, 'provider_degraded');
+    await expectHttpFallback(503, 'provider_degraded');
+    await expectHttpFallback(418, 'malformed_request');
+  });
 });
 
 describe('outbound state filtering', () => {
@@ -1946,6 +1961,12 @@ describe('systemone failure-path mapping (review: both protocols covered)', () =
   });
   it('maps 403 → forbidden on the systemone protocol', async () => {
     await expectSystemoneFallback(403, 'forbidden');
+  });
+  it('maps 402 → credit_exhausted on the systemone protocol (#442)', async () => {
+    await expectSystemoneFallback(402, 'credit_exhausted');
+  });
+  it('maps 404 → endpoint_not_found on the systemone protocol (#442)', async () => {
+    await expectSystemoneFallback(404, 'endpoint_not_found');
   });
   it('maps 429 → provider_degraded on the systemone protocol', async () => {
     await expectSystemoneFallback(429, 'provider_degraded');

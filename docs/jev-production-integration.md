@@ -151,9 +151,12 @@ response validation is identical. A `systemone` response that reports only
 token counts gets its input cost computed from the profile's optional
 `input_price_per_mtok` (default `0.042`); a reported `usage.cost` always
 wins; when neither exists the cost is recorded as null, never invented.
-Error mapping adds `422 → malformed_request` (a structurally rejected
-request is a wiring bug, not provider health); `401 → auth_rejected`,
-`403 → forbidden`, `429/5xx → provider_degraded` are unchanged.
+Error mapping keeps transient HTTP states transient: `408/429/5xx →
+provider_degraded`. Every other non-OK status is a fault only a human can
+fix (issue #442): `400 → malformed_request`, `401 → auth_rejected`,
+`402 → credit_exhausted` (the key's credit is spent — add credit),
+`403 → forbidden`, `404 → endpoint_not_found`, `422 → malformed_request`,
+and any other 4xx → `malformed_request` with the status in the detail.
 
 Example — route one surface through TypeSafe directly. Store the TypeSafe
 key first (see [Credentials](#credentials)), then probe it with
@@ -417,7 +420,8 @@ The Settings page shows only `disabled`, `ready`, or `degraded`, sanitized
 reason text, model/endpoint, credential presence/source, last-check time, and
 the per-process generation. It never shows key material. A degraded
 transition creates one durable notification: FOR YOU (`needs-owner`) when a
-human must act (credential, auth, config, schema) or a surface acts on Jev
+human must act (credential, auth, credit, config, schema, endpoint wiring)
+or a surface acts on Jev
 (`enforce`, or a modeless `event_triage`/`supervision_guidance`), and a board
 FYI when the failure is transient and every acting surface is `shadow`/`off`.
 A recovery (or an explicit disable) resolves it with a durable FYI
@@ -450,10 +454,12 @@ schemes, URL userinfo, opaque key formats, private-key blocks).
 | `credential_invalid` | Remove whitespace/empty environment input or rewrite one non-empty line through the CLI. |
 | `credential_unsafe` | Remove symlinks; set the credentials directory to `0700` and key file to `0600`; re-provision if ownership is uncertain. |
 | `auth_rejected` / `forbidden` | Verify the OpenRouter credential and access, then recheck. |
-| `provider_degraded` | Transient: automatic rechecks run on a bounded backoff (1, 5, 15, 60 min); if still degraded after the last one, wait for provider/rate-limit recovery and use Recheck — deterministic behavior remains active. |
+| `credit_exhausted` | The provider key's credit limit is spent (HTTP 402). Add credit to the account, then recheck; only the owner can fix this, and it pages even when every surface is in shadow. |
+| `provider_degraded` | Transient (HTTP 408/429 or 5xx): automatic rechecks run on a bounded backoff (1, 5, 15, 60 min); if still degraded after the last one, wait for provider/rate-limit recovery and use Recheck — deterministic behavior remains active. |
 | `timeout` / `network_error` | Transient: automatic rechecks run on a bounded backoff (1, 5, 15, 60 min); if still degraded, verify DNS/TLS/connectivity to `openrouter.ai` and use Recheck. Inspect the shadow record's `fallback_reason`, or the request warning's `reason` for any mode, plus elapsed time and `request_diagnostics`, before changing `timeout_ms` (default 5000). The section hot-reloads, but increasing the budget is not a diagnosis and will not explain local capacity refusals. |
 | `malformed_response` | Leave deterministic fallback active and inspect the configured model/endpoint compatibility. |
-| `malformed_request` | The provider rejected the request shape (HTTP 422). Check the surface wiring/model name; this is a caller bug, not provider health. |
+| `malformed_request` | The provider rejected the request shape (HTTP 400/422, or another unmapped 4xx). Check the surface wiring/model name; this is a caller bug, not provider health. |
+| `endpoint_not_found` | The provider answered 404 for the configured endpoint path or model. Fix the profile's `endpoint`/`model`, then recheck. |
 | `endpoint_untrusted` | Restore the verified HTTPS endpoint. Resolved portable credentials are never sent elsewhere. |
 | `config_invalid` | Correct the named strict config error; the service remains deterministic/degraded (an instance with Jev off stays off). |
 | `probe_failed` | The provider answered but did not confirm the synthetic health check; verify the configured model/endpoint compatibility, then recheck. |

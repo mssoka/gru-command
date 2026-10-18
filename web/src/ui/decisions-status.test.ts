@@ -55,6 +55,18 @@ describe('decision status card', () => {
     expect(document.querySelector<HTMLElement>('#decisions-setup')?.hidden).toBe(true);
   });
 
+  it('renders the #442 owner-action reason summaries instead of raw reason codes', () => {
+    const card = new DecisionStatusCard(() => null);
+    const summary = (): string => document.querySelector('#decisions-summary')?.textContent ?? '';
+    card.render({ ...status(5, 'degraded'), reason: 'credit_exhausted' });
+    expect(summary()).toContain('out of credit (HTTP 402). Add credit');
+    card.render({ ...status(6, 'degraded'), reason: 'endpoint_not_found' });
+    expect(summary()).toContain('answered 404 for the configured endpoint path or model');
+    card.render({ ...status(7, 'degraded'), reason: 'malformed_request' });
+    expect(summary()).toContain('rejected the request shape');
+    expect(summary()).toContain('Deterministic fallback is active.');
+  });
+
   it('recovers the Recheck control after a transport failure without replacing the safe status', async () => {
     const card = new DecisionStatusCard(() => Promise.reject(new Error('offline')));
     const button = document.querySelector<HTMLButtonElement>('#decisions-recheck')!;
