@@ -1181,6 +1181,20 @@ test('the crew rail sets each sub-minion indented under the minion that created 
 
 test('on a phone a normal boot never flashes RADAR: syncing is not an outage', async ({ page }) => {
   await page.setViewportSize({ width: 360, height: 740 });
+  // Record every value the lost flag takes from the first paint on: a
+  // flash would set it, however briefly.
+  await page.addInitScript(() => {
+    const seen: string[] = [];
+    (window as unknown as { __lostSeen: string[] }).__lostSeen = seen;
+    const watch = (): void => {
+      const ticker = document.getElementById('command-ticker');
+      if (ticker === null) return;
+      seen.push(ticker.dataset.boardLost ?? '');
+      new MutationObserver(() => seen.push(ticker.dataset.boardLost ?? '')).observe(ticker, { attributes: true, attributeFilter: ['data-board-lost'] });
+    };
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', watch, { once: true });
+    else watch();
+  });
   const initial = makeSnapshot(familyA(1));
   await page.route(/\/api\/board/, (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(initial) }));
   // The board socket opens but never authenticates: RADAR reads SYNCING.
@@ -1189,6 +1203,9 @@ test('on a phone a normal boot never flashes RADAR: syncing is not an outage', a
   await expect(page.locator('#command-health')).toBeVisible();
   await expect(page.locator('#command-radar-label')).toHaveText('RADAR SYNCING');
   await expect(page.locator('#command-ticker')).toBeHidden();
+  const seen = await page.evaluate(() => (window as unknown as { __lostSeen: string[] }).__lostSeen);
+  expect(seen.length, 'the observer watched the boot').toBeGreaterThan(0);
+  expect(seen, 'the lost flag never turned on during the boot').not.toContain('true');
 });
 
 test('on a phone a re-pair starts RADAR fresh: the replaced board client stopping is no outage', async ({ page }) => {
