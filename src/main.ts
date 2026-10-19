@@ -33,7 +33,7 @@ import {
   reportVerdictPublicationIdentity,
   verdictPublicationIdentityWarning,
 } from './dispatch/verdict-publication-identity.js';
-import { BOB_STATE_FILE, BobScheduler, bobStateFile } from './dispatch/bob-scheduler.js';
+import { BOB_STATE_FILE, BobScheduler, bobStateFile, singleFlightSlot } from './dispatch/bob-scheduler.js';
 import { SilasDriver, computeSilasDigest, consolidatedBlockersFor, supervisionLookup } from './dispatch/silas-driver.js';
 import { spawnSilasWithActionTool } from './dispatch/silas-model-action.js';
 import { composeDeterministicPass, createSilasAutopilotHook } from './dispatch/silas-autopilot-pass.js';
@@ -454,8 +454,9 @@ async function main(): Promise<number> {
   // Perkins verdicts are learning inputs (issue #221): every posted round
   // verdict journals its consolidated blockers as deliberate finding
   // entries (source perkins:<round>), so the dream learns from reviews
-  // without Bob's hourly pass. Idempotent per round via a sidecar next to
-  // the review artifacts; runs regardless of [lessons] enabled — capture
+  // without waiting for Bob's periodic pass. Idempotent per round via a
+  // sidecar next to the review artifacts; runs regardless of [lessons]
+  // enabled — capture
   // is deliberate and must never be lost.
   createReviewOutcomeCapture({
     bus,
@@ -1473,9 +1474,13 @@ async function main(): Promise<number> {
     role: 'bob',
     spawn: (spawnOptions) => registry.spawn('bob', spawnOptions ?? {}),
   });
+  // One memory agent, two triggers: the dream pass and Bob's knock can both
+  // be due at boot, so their concurrent ensures are coalesced onto one spawn
+  // instead of creating two bob sessions before either adopts.
+  const memorySlot = singleFlightSlot(bobSlot);
   const bob = new BobScheduler({
     intervalMs: config.dispatch.bobIntervalMs,
-    slot: bobSlot,
+    slot: memorySlot,
     // Due-based cadence (issue #451): the schedule persists in the data
     // home, so a restart no longer resets a week-long interval.
     state: bobStateFile(join(config.dataDir, BOB_STATE_FILE)),
@@ -1494,7 +1499,7 @@ async function main(): Promise<number> {
         journal,
         bible,
         distiller: new AgentLessonsDistiller({
-          slot: bobSlot,
+          slot: memorySlot,
           bibleDir: bible.dir,
           log: (level, msg, fields) => logger.log(level, msg, fields),
         }),

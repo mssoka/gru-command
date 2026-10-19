@@ -262,7 +262,8 @@ export interface LessonsConfig {
    * on-boot pass only when already due; 0 disables the periodic trigger.
    * Default 7 days (issue #451; it was 12 h). */
   readonly dreamIntervalMs: number;
-  /** Run one dream pass at service boot when new journal entries exist. */
+  /** Run one dream pass at service boot when the dream is already due
+   * (a beat with no new journal entries never calls the distiller). */
   readonly dreamOnBoot: boolean;
   /** Hard cap per chapter file; the dream trims to fit. */
   readonly chapterCapBytes: number;

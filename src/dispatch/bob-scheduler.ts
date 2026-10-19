@@ -114,6 +114,26 @@ export function bobStateFile(file: string): BobStatePort {
   };
 }
 
+/**
+ * Coalesce concurrent ensures onto one spawn. The dream pass and Bob's knock
+ * share one supervised slot (one memory agent, two triggers) and both are
+ * due at first boot: two concurrent ensures would each spawn a session
+ * before either adopts one. Callers on one slot pass the same options.
+ */
+export function singleFlightSlot(slot: BobSlot): BobSlot {
+  let inFlight: Promise<AgentHandle> | null = null;
+  return {
+    ensure: (options) => {
+      if (inFlight === null) {
+        inFlight = slot.ensure(options).finally(() => {
+          inFlight = null;
+        });
+      }
+      return inFlight;
+    },
+  };
+}
+
 export interface BobSchedulerOptions {
   /** Consolidation interval; 0 disables the trigger. */
   readonly intervalMs: number;
@@ -162,7 +182,11 @@ export class BobScheduler {
         `persisted bob state has an unparsable lastBobAt ${JSON.stringify(lastBobAt)} — inspect or remove the bob state file`,
       );
     }
-    return Math.max(0, last + this.opts.intervalMs - this.now().getTime());
+    // Never wait longer than one interval: a timestamp ahead of the clock
+    // (rollback, restored snapshot, hand edit) must not silence the knock
+    // past the cadence, and the delay must stay under Node's timer ceiling
+    // (config caps intervalMs there, the computed delay could exceed it).
+    return Math.min(this.opts.intervalMs, Math.max(0, last + this.opts.intervalMs - this.now().getTime()));
   }
 
   start(): void {

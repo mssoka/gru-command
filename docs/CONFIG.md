@@ -332,8 +332,8 @@ bob_interval_ms = 604800000
 # the dream cadence and pointer injection; the journal API stays
 # available because capture is deliberate and must never be lost.
 enabled = true
-# Dream cadence: due lastDreamAt + interval (ms), rebased on restart;
-# 0 = no periodic pass. Ships 7 days.
+# Dream cadence: due lastDreamAt + interval (ms); a restart waits out
+# the remainder instead of resetting it. 0 = no periodic pass. Ships weekly.
 dream_interval_ms = 604800000
 dream_on_boot = true
 # Hard caps (bytes): each chapter file, and the index — the only part

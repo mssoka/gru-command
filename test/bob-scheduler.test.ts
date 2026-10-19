@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -10,6 +10,7 @@ import {
   bobStateFile,
   loadBobState,
   saveBobState,
+  singleFlightSlot,
   type BobSlot,
   type BobStatePort,
 } from '../src/dispatch/bob-scheduler.js';
@@ -255,6 +256,28 @@ describe('bob scheduler: due-based cadence (issue #451)', () => {
     expect(state.beats).toHaveLength(1);
   });
 
+  it('a completed beat still counts when its schedule timestamp cannot be persisted', async () => {
+    const s = makeSlot();
+    const { logs, log } = collectLogs();
+    const scheduler = new BobScheduler({
+      intervalMs: WEEK_MS,
+      slot: s.slot,
+      state: {
+        lastBobAt: () => null,
+        recordBeat: () => {
+          throw new Error('disk full');
+        },
+      },
+      log,
+    });
+    await expect(scheduler.tick()).resolves.toEqual({ prompted: true });
+    expect(s.prompts).toHaveLength(1);
+    expect(logs).toContainEqual({
+      level: 'error',
+      msg: 'bob consolidation completed but its schedule timestamp could not be persisted',
+    });
+  });
+
   it('a failed consolidation does not advance lastBobAt — the next beat retries', async () => {
     const s = makeSlot();
     s.failWith = new Error('model outage');
@@ -264,6 +287,34 @@ describe('bob scheduler: due-based cadence (issue #451)', () => {
     expect(result.prompted).toBe(false);
     expect(state.beats).toEqual([]);
     expect(state.last()).toBeNull();
+  });
+
+  it('a future lastBobAt never delays a beat past one interval (clock rollback)', async () => {
+    await withClock('2026-10-19T12:00:00.000Z', async () => {
+      const s = makeSlot();
+      const state = makeState('2026-10-21T12:00:00.000Z'); // 2 days AHEAD of the clock
+      const scheduler = new BobScheduler({ intervalMs: WEEK_MS, slot: s.slot, state });
+      scheduler.start();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(s.prompts).toHaveLength(0); // not due yet
+      await vi.advanceTimersByTimeAsync(WEEK_MS - 1);
+      expect(s.prompts).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(1);
+      // Clamped to one interval, not lastBobAt + interval (9 days).
+      expect(s.prompts).toHaveLength(1);
+      expect(state.beats).toEqual(['2026-10-26T12:00:00.000Z']);
+      scheduler.stop();
+    });
+  });
+
+  it('an unparsable persisted timestamp refuses to arm instead of guessing', () => {
+    const scheduler = new BobScheduler({
+      intervalMs: WEEK_MS,
+      slot: makeSlot().slot,
+      state: { lastBobAt: () => 'soon', recordBeat: () => {} },
+    });
+    expect(() => scheduler.start()).toThrow(BobScheduleError);
+    expect(scheduler.running).toBe(false);
   });
 
   it('interval 0 stays the hard off switch, even when long overdue', async () => {
@@ -301,11 +352,44 @@ describe('bob schedule persistence (issue #451)', () => {
     }
   });
 
+  it('a failed write is a named error with no staging debris', () => {
+    const root = dir();
+    const file = join(root, 'missing', BOB_STATE_FILE);
+    expect(() => saveBobState(file, { version: 1, lastBobAt: null })).toThrow(BobScheduleError);
+    expect(readdirSync(root)).toEqual([]);
+  });
+
   it('saving never leaves a half-written file behind', () => {
     const file = join(dir(), BOB_STATE_FILE);
     saveBobState(file, { version: 1, lastBobAt: '2026-10-19T12:00:00.000Z' });
     saveBobState(file, { version: 1, lastBobAt: '2026-10-26T12:00:00.000Z' });
     expect(loadBobState(file).lastBobAt).toBe('2026-10-26T12:00:00.000Z');
     expect(readFileSync(file, 'utf-8')).toBe('{\n  "version": 1,\n  "lastBobAt": "2026-10-26T12:00:00.000Z"\n}\n');
+  });
+});
+
+describe('single-flight slot (issue #451: one memory agent, two triggers)', () => {
+  it('coalesces concurrent ensures onto one spawn and clears after it settles', async () => {
+    const handle = {} as AgentHandle;
+    let spawns = 0;
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const slot = singleFlightSlot({
+      ensure: async () => {
+        spawns += 1;
+        await gate;
+        return handle;
+      },
+    });
+    const first = slot.ensure();
+    const second = slot.ensure();
+    expect(spawns).toBe(1); // the dream pass and Bob's knock share one spawn
+    release();
+    await expect(Promise.all([first, second])).resolves.toEqual([handle, handle]);
+    // Once settled, the next ensure is a fresh spawn, not a cached handle.
+    await expect(slot.ensure()).resolves.toBe(handle);
+    expect(spawns).toBe(2);
   });
 });
