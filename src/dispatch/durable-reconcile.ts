@@ -223,7 +223,7 @@ export function reconcileReportClosures(
       examined += 1;
       try {
         const recovered = deps.ledger.reconcileReportHandback(job.id);
-        let active = recovered?.obligation ?? deps.ledger.findReportObligation(job.id);
+        const active = recovered?.obligation ?? deps.ledger.findReportObligation(job.id);
         if (recovered?.created === true) opened += 1;
         if (active === null || (active.state !== 'open' && active.state !== 'waiting' && active.state !== 'suspended')) {
           continue; // report acceptance or an ineligible delivery is not completion
