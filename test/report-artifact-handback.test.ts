@@ -59,10 +59,10 @@ function fixture(jobId: string, opts: { readonly dirty?: boolean; readonly candi
 }
 
 function settleSeededDirective(f: Fixture, markDelivered = true): void {
-  f.db.handle.prepare("UPDATE pending_directives SET state = 'settled', delivery_seq = ?, updated_at = ? WHERE request_id = ?")
-    .run(f.deliverySeq, new Date().toISOString(), f.requestId);
   f.api.appendCustomEvent({ kind: 'silas.directive-settled', jobId: f.jobId,
     payload: { request_id: f.requestId, delivery_seq: f.deliverySeq, candidate_delivery_proven: false } });
+  f.db.handle.prepare("UPDATE pending_directives SET state = 'settled', delivery_seq = ?, updated_at = ? WHERE request_id = ?")
+    .run(f.deliverySeq, new Date().toISOString(), f.requestId);
   if (markDelivered) f.api.setJobStatus(f.jobId, 'delivered');
 }
 
@@ -86,7 +86,7 @@ describe('native report artifact handback', () => {
 
     const closed = f.api.settleReportDisposition({ jobId: f.jobId, outcome: 'acted', directiveJobId: 'downstream-repair', by: 'gru' });
     expect(closed.job.status).toBe('done');
-    expect(closed.obligation.state).toBe('closed');
+    expect(closed.obligation.state).toBe('settled');
     expect(f.api.latestJobEvent(f.jobId, 'job.report-disposition')?.payload)
       .toMatchObject({ outcome: 'acted', directive_job_id: 'downstream-repair', obligation_id: closed.obligation.id });
     expect(() => f.api.settleReportDisposition({ jobId: f.jobId, outcome: 'acted', directiveJobId: 'downstream-repair', by: 'gru' }))
