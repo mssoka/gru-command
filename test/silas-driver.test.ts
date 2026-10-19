@@ -5208,7 +5208,7 @@ describe('report-job auto-supersede in the deterministic pass (issue #220)', () 
     }
   });
 
-  it('R13 production report backstop ignores historical-only delivery then opens exactly one current-candidate handback', async () => {
+  it('R13 production report backstop refuses historical and generic deliveries without native report proof', async () => {
     const h0 = makeLedger();
     const center = new NotificationCenter({ ledger: h0.ledger, bus: h0.bus });
     const h = makeDriverWithProductionPass(h0, { notifications: center });
@@ -5222,16 +5222,15 @@ describe('report-job auto-supersede in the deterministic pass (issue #220)', () 
       await h.driver.trigger({ kind: 'sweep' }); await h.driver.trigger({ kind: 'sweep' });
       expect(h.ledger.listObligations({ jobId })).toEqual([]);
       expect(h.ledger.findNotificationByKind(`silas.report-handback.${jobId}`, 'any')).toBeNull();
-      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: 'later-current-report-head' } });
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: 'later-generic-report-head' } });
       await h.driver.trigger({ kind: 'sweep' }); await h.driver.trigger({ kind: 'sweep' });
-      expect(h.ledger.listObligations({ jobId })).toHaveLength(1);
-      expect(h.ledger.listObligations({ jobId })[0]).toMatchObject({ state: 'open', incidentKey: `report:${jobId}` });
-      expect(h.ledger.listNotifications({ limit: 100 }).filter((row) => row.kind === `silas.report-handback.${jobId}`)).toHaveLength(1);
+      expect(h.ledger.listObligations({ jobId })).toEqual([]);
+      expect(h.ledger.listNotifications({ limit: 100 }).filter((row) => row.kind === `silas.report-handback.${jobId}`)).toEqual([]);
       expect(h.ledger.getEvent(historical.seq)).toEqual(historical);
     } finally { h.cleanup(); }
   });
 
-  it('the pass backstops a delivered report whose obligation open was lost — and never touches legacy NULL rows', async () => {
+  it('the pass does not promote a generic report delivery or touch legacy NULL rows', async () => {
     const h0 = makeLedger();
     const h = makeDriverWithProductionPass(h0);
     try {
@@ -5250,12 +5249,11 @@ describe('report-job auto-supersede in the deterministic pass (issue #220)', () 
 
       await h.driver.trigger({ kind: 'sweep' });
 
-      const obligation = h.ledger.listObligations({ jobId: 'report-lost-open' })[0];
-      expect(obligation?.incidentKey).toBe('report:report-lost-open');
-      expect(obligation?.state).toBe('open');
-      // The pass is idempotent: a second tick opens nothing new.
+      expect(h.ledger.listObligations({ jobId: 'report-lost-open' })).toEqual([]);
+      // Without exact native completion and cessation, repeated passes retain
+      // the evidence as-is and never manufacture commissioner disposition.
       await h.driver.trigger({ kind: 'sweep' });
-      expect(h.ledger.listObligations({ jobId: 'report-lost-open' })).toHaveLength(1);
+      expect(h.ledger.listObligations({ jobId: 'report-lost-open' })).toEqual([]);
       expect(h.ledger.listObligations({ jobId: 'legacy-null-row' })).toHaveLength(0);
       expect(h.ledger.getJob('legacy-null-row')?.deliverable).toBeNull();
     } finally {

@@ -553,7 +553,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(readFileSync(f.file, 'utf8')).toBe(bytes); expect(f.spawns).toEqual([]); expect(f.native.prompts).toEqual([]);
   });
 
-  it('R14 first-implementation publisher never opens report handback before independent native candidate settlement', async () => {
+  it('R14 exact native report completion opens handback without granting code-candidate eligibility', async () => {
     const f = await completeBeforeOriginalOwnerPark(true, false);
     const bytes = readFileSync(f.file, 'utf8');
     writeFileSync(join(f.lane.path, 'report-material-input.ts'), 'export const pendingReportInput = true;\n');
@@ -562,8 +562,8 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     const delivery = f.ledger.latestJobEventByRequestId(f.intent.jobId, 'job.delivered', f.intent.requestId)!;
     expect(delivery.payload).toMatchObject({ candidate_delivery_proven: false });
     expect(f.ledger.latestCandidateDelivery(f.intent.jobId)).toBeNull();
-    expect(f.ledger.findReportObligation(f.intent.jobId)).toBeNull();
-    expect(f.ledger.listJobEventsByKinds(f.intent.jobId, ['job.report-handback'])).toEqual([]);
+    expect(f.ledger.findReportObligation(f.intent.jobId)).toMatchObject({ state: 'open', firstOriginSeq: delivery.seq });
+    expect(f.ledger.listJobEventsByKinds(f.intent.jobId, ['job.report-handback'])).toHaveLength(1);
     expect(f.ledger.listObligations({ jobId: f.intent.jobId }).find((row) => row.incidentKey === `directive-current-gates:${f.intent.requestId}`)?.state).toBe('open');
     expect(readFileSync(f.file, 'utf8')).toBe(bytes); expect(f.spawns).toEqual([]); expect(f.native.prompts).toEqual([]);
   });
