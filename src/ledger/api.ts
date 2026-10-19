@@ -2662,7 +2662,8 @@ export class LedgerApi {
   latestReportHandbackDelivery(jobId: string): EventRecord | null {
     const job = this.getJob(jobId);
     if (job === null || job.deliverable === null || !isReportDeliverable(job.deliverable)) return null;
-    const rows = this.db.prepare("SELECT * FROM events WHERE job_id = ? AND kind = 'job.delivered' ORDER BY seq DESC")
+    const rows = this.db.prepare(`SELECT * FROM events WHERE job_id = ? AND kind = 'job.delivered'
+      AND json_extract(payload, '$.source') IN ('silas-directive', 'silas-rebrief') ORDER BY seq DESC`)
       .all(jobId) as Row[];
     for (const row of rows) {
       const event = this.eventFromRow(row);
@@ -2679,6 +2680,14 @@ export class LedgerApi {
       const job = this.getJob(jobId);
       if (job === null || (job.status !== 'working' && job.status !== 'delivered') ||
           job.deliverable === null || !isReportDeliverable(job.deliverable)) return null;
+      // Steady state: a delivered report already carrying its live obligation
+      // needs no revalidation — skip the native-evidence rescan entirely.
+      if (job.status === 'delivered') {
+        const existing = this.findReportObligation(jobId);
+        if (existing !== null && (existing.state === 'open' || existing.state === 'waiting' || existing.state === 'suspended')) {
+          return { obligation: existing, created: false };
+        }
+      }
       const delivery = this.latestReportHandbackDelivery(jobId);
       if (delivery === null) return null;
       // A previous successful report does not prove a later follow-through
@@ -2692,13 +2701,20 @@ export class LedgerApi {
       if (this.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES, limit: 1 }).length > 0 ||
           this.listPendingRebriefs({ jobId }).length > 0) return null;
       if (job.status === 'working') this.setJobStatus(jobId, 'delivered');
-      const opened = this.openReportObligation({ jobId, observedAtSeq: delivery.seq });
-      if (opened.created) {
-        this.appendEvent({ kind: 'job.report-handback', jobId,
-          payload: { obligation_id: opened.obligation.id, delivered_seq: delivery.seq } });
-      }
-      return opened;
+      return this.openReportHandbackLineage(jobId, delivery.seq);
     });
+  }
+
+  /** Open (idempotently) the one canonical commissioner obligation and
+   * record its exact delivery lineage. Shared by settlement-time handback
+   * and crash-window recovery so the open+lineage pair cannot drift apart. */
+  private openReportHandbackLineage(jobId: string, deliveredSeq: number): { readonly obligation: ObligationRecord; readonly created: boolean } {
+    const opened = this.openReportObligation({ jobId, observedAtSeq: deliveredSeq });
+    if (opened.created) {
+      this.appendEvent({ kind: 'job.report-handback', jobId,
+        payload: { obligation_id: opened.obligation.id, delivered_seq: deliveredSeq } });
+    }
+    return opened;
   }
 
   /** Non-candidate history still owes its separate current-candidate gate.
@@ -7473,14 +7489,19 @@ export class LedgerApi {
 
   /** Validate an actual report handback from its settled request and current
    * native receipt/cessation evidence. Candidate-tree cleanliness is
-   * deliberately not consulted here. */
+   * deliberately not consulted here. This is one of four hand-maintained
+   * encodings of the request↔receipt correlation family — keep it in sync
+   * with UNPROVEN_NATIVE_CANDIDATE_SQL, isReconstructedReportCandidateDelivery,
+   * and assertNativeSettlementCandidate when the correlation rules change. */
   private isNativeReportHandbackDelivery(event: EventRecord): boolean {
     if (event.kind !== 'job.delivered' || event.jobId === null) return false;
     const payload = typeof event.payload === 'object' && event.payload !== null ? event.payload as Record<string, unknown> : null;
     if (payload === null || (payload['source'] !== 'silas-directive' && payload['source'] !== 'silas-rebrief') ||
         typeof payload['request_id'] !== 'string' || payload['request_id'].trim() === '' ||
         typeof payload['candidate_delivery_proven'] !== 'boolean') return false;
-    if (payload['historical_bookkeeping_only'] === true) return false;
+    const historical = payload['historical_bookkeeping_only'];
+    if (historical !== undefined && typeof historical !== 'boolean') return false;
+    if (historical === true) return false;
     const request = this.getDirective(payload['request_id']);
     const expectedSource = request?.requestKind === 'rebrief' ? 'silas-rebrief' : 'silas-directive';
     if (request === null || request.jobId !== event.jobId || request.requestKind === null || payload['source'] !== expectedSource ||
@@ -7494,11 +7515,15 @@ export class LedgerApi {
       if (!isDeepStrictEqual(completion['identity'], identity) || !isDeepStrictEqual(completion['binding'], request.nativeBinding)) return false;
       this.assertNativeDirectiveDelivery(request, payload);
       return true;
-    } catch {
-      // Proof is fail-closed. The caller can retain the delivered report and
-      // retry after its original native evidence becomes readable; no fact is
-      // repaired or inferred by this projection.
-      return false;
+    } catch (error) {
+      // A proof mismatch is not completion: fail closed, retain the delivered
+      // report, and let a later pass retry once the original native evidence
+      // is readable again. No fact is repaired or inferred here. Unreadable
+      // evidence is not a mismatch — it must surface to the caller's failure
+      // accounting, never silently disqualify (same idiom as the settlement
+      // candidate projection).
+      if (error instanceof DirectiveCheckpointError) return false;
+      throw error;
     }
   }
 
@@ -7531,11 +7556,7 @@ export class LedgerApi {
         !this.isNativeReportHandbackDelivery(delivery) && !this.isReconstructedReportCandidateDelivery(delivery)) return;
     const job = this.getJob(jobId);
     if (job === null || job.deliverable === null || !isReportDeliverable(job.deliverable)) return;
-    const opened = this.openReportObligation({ jobId, observedAtSeq: deliveredSeq });
-    if (opened.created) {
-      this.appendEvent({ kind: 'job.report-handback', jobId,
-        payload: { obligation_id: opened.obligation.id, delivered_seq: deliveredSeq } });
-    }
+    this.openReportHandbackLineage(jobId, deliveredSeq);
   }
 
   /** One job's rowid (keyset pagination anchor). */

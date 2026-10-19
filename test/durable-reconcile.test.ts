@@ -393,3 +393,33 @@ describe('durable reconciliation pass (issue #163)', () => {
     expect(posts).toHaveLength(0);
   });
 });
+
+describe('report closure failure accounting (review findings)', () => {
+  it('a delivered report with only a generic delivery is examined, never failed or opened', () => {
+    const { api } = freshLedger();
+    const posts: Post[] = [];
+    api.addJob({ id: 'generic-only-delivery', repo: 'demo', title: 'Review report', deliverable: 'review', commissioner: 'gru' });
+    api.setJobStatus('generic-only-delivery', 'working');
+    api.setJobStatus('generic-only-delivery', 'delivered');
+    api.appendCustomEvent({ kind: 'job.delivered', jobId: 'generic-only-delivery',
+      payload: { sha: 'a'.repeat(40), candidate_delivery_proven: false } });
+    const report = reconcileDurableWork({ ledger: api, notifications: fakeNotifications(posts) });
+    expect(report.reports).toMatchObject({ examined: 1, opened: 0, published: 0, failed: 0 });
+    expect(api.listObligations({ jobId: 'generic-only-delivery' })).toEqual([]);
+    expect(posts).toHaveLength(0);
+  });
+
+  it('a delivered report with no delivery event at all is counted failed and logged', () => {
+    const { api } = freshLedger();
+    const posts: Post[] = [];
+    const logs: string[] = [];
+    api.addJob({ id: 'no-delivery-event', repo: 'demo', title: 'Review report', deliverable: 'review', commissioner: 'gru' });
+    api.setJobStatus('no-delivery-event', 'working');
+    api.setJobStatus('no-delivery-event', 'delivered');
+    const report = reconcileDurableWork({ ledger: api, notifications: fakeNotifications(posts),
+      log: (_level, msg) => { logs.push(msg); } });
+    expect(report.reports).toMatchObject({ examined: 1, opened: 0, published: 0, failed: 1 });
+    expect(logs.some((msg) => msg.includes('no delivery event'))).toBe(true);
+    expect(posts).toHaveLength(0);
+  });
+});

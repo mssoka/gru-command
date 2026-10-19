@@ -24,7 +24,6 @@ interface Fixture {
   readonly jobId: string;
   readonly requestId: string;
   readonly deliverySeq: number;
-  readonly nativeCompletion: ReturnType<typeof nativeDirectiveFixtureDeliveryProof>['native_completion'];
 }
 
 function fixture(jobId: string, opts: { readonly dirty?: boolean; readonly candidate?: boolean } = {}): Fixture {
@@ -55,7 +54,7 @@ function fixture(jobId: string, opts: { readonly dirty?: boolean; readonly candi
     payload: { request_id: requestId, agentId: proof.native_completion.binding.agentId, source: 'silas-directive',
       sha: head, work_revision: api.getDirective(requestId)!.workRevision,
       candidate_delivery_proven: opts.candidate ?? !opts.dirty, native_completion: proof.native_completion } });
-  return { api, db, root, jobId, requestId, deliverySeq: delivery.seq, nativeCompletion: proof.native_completion };
+  return { api, db, root, jobId, requestId, deliverySeq: delivery.seq };
 }
 
 function settleSeededDirective(f: Fixture, markDelivered = true): void {
@@ -183,6 +182,28 @@ describe('native report artifact handback', () => {
     f.api.setJobStatus(f.jobId, 'delivered');
 
     expect(f.api.latestReportHandbackDelivery(f.jobId)).toBeNull();
+    expect(reconcile(f).reports.opened).toBe(0);
+    expect(f.api.findReportObligation(f.jobId)).toBeNull();
+  });
+
+  it('mismatched-native-report-proof-variants-refused', () => {
+    const f = fixture('mismatched-variants-report', { dirty: true, candidate: false });
+    settleSeededDirective(f, true);
+    const base = f.api.getEvent(f.deliverySeq)!.payload as Record<string, unknown>;
+    const native = base['native_completion'] as Record<string, unknown>;
+    const binding = native['binding'] as Record<string, unknown>;
+    const variants: readonly { readonly name: string; readonly payload: Record<string, unknown> }[] = [
+      { name: 'source kind disagrees with the settled request', payload: { ...base, source: 'silas-rebrief' } },
+      { name: 'work revision disagrees with the settled request', payload: { ...base, work_revision: (base['work_revision'] as number) + 1 } },
+      { name: 'native completion binding is foreign', payload: { ...base, native_completion: { ...native, binding: { ...binding, sessionId: 'foreign-session' } } } },
+      { name: 'historical bookkeeping marker is not a boolean', payload: { ...base, historical_bookkeeping_only: 1 } },
+    ];
+    for (const variant of variants) {
+      const bad = f.api.appendCustomEvent({ kind: 'job.delivered', jobId: f.jobId, payload: variant.payload });
+      f.db.handle.prepare('UPDATE pending_directives SET delivery_seq = ?, updated_at = ? WHERE request_id = ?')
+        .run(bad.seq, new Date().toISOString(), f.requestId);
+      expect(f.api.latestReportHandbackDelivery(f.jobId), variant.name).toBeNull();
+    }
     expect(reconcile(f).reports.opened).toBe(0);
     expect(f.api.findReportObligation(f.jobId)).toBeNull();
   });

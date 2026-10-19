@@ -169,8 +169,9 @@ export function reconcileDurableWork(
 
 /**
  * Report-job closure (issue #220): handback debt recovery, the
- * commissioner's action-required card, and auto-supersede. Ledger-only,
- * no filesystem probing.
+ * commissioner's action-required card, and auto-supersede. Reads ledger
+ * rows plus each candidate's own persisted native evidence files (session
+ * transcript, producers, lock) — never probes repositories or worktrees.
  *
  *  1. BACKSTOP — a working/delivered report-type job with a lost status or
  *     handback transition is recovered only from its settled, exact successful
@@ -226,6 +227,14 @@ export function reconcileReportClosures(
         const active = recovered?.obligation ?? deps.ledger.findReportObligation(job.id);
         if (recovered?.created === true) opened += 1;
         if (active === null || (active.state !== 'open' && active.state !== 'waiting' && active.state !== 'suspended')) {
+          // An ineligible-but-present delivery is examined, not failed. A
+          // delivered report with no delivery event at all is ledger damage:
+          // count it and say so instead of passing silently.
+          if (active === null && job.status === 'delivered' &&
+              deps.ledger.latestJobEvent(job.id, 'job.delivered') === null) {
+            failed += 1;
+            deps.log?.('error', 'delivered report job has no delivery event — cannot open its obligation', { job: job.id });
+          }
           continue; // report acceptance or an ineligible delivery is not completion
         }
         // The card: live debts only. A backfilled debt was surfaced to the
