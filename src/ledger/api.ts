@@ -7477,7 +7477,13 @@ export class LedgerApi {
     const payload = typeof event.payload === 'object' && event.payload !== null ? event.payload as Record<string, unknown> : null;
     if (payload === null || (payload['source'] !== 'silas-directive' && payload['source'] !== 'silas-rebrief') ||
         typeof payload['request_id'] !== 'string' || payload['request_id'].trim() === '' ||
-        typeof payload['candidate_delivery_proven'] !== 'boolean' || payload['historical_bookkeeping_only'] === true) return false;
+        typeof payload['candidate_delivery_proven'] !== 'boolean') return false;
+    // A recovered historical delivery can open its report handback only when
+    // the existing independent current-candidate projection still proves it.
+    // Preserve its historical flag; never use an old unproven completion as
+    // current report/candidate evidence.
+    if (payload['historical_bookkeeping_only'] === true &&
+        (payload['candidate_delivery_proven'] !== true || this.latestCandidateDelivery(event.jobId)?.seq !== event.seq)) return false;
     const request = this.getDirective(payload['request_id']);
     const expectedSource = request?.requestKind === 'rebrief' ? 'silas-rebrief' : 'silas-directive';
     if (request === null || request.jobId !== event.jobId || request.requestKind === null || payload['source'] !== expectedSource ||
