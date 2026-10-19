@@ -31,6 +31,7 @@ import { MAX_ATTACHMENTS_PER_MESSAGE } from '../lib/protocol.js';
 import { renderMarkdown } from '../lib/markdown.js';
 import { WORKING_FLAVOR_INTERVAL_MS, WorkingFlavorDeck } from '../lib/working-flavor.js';
 import { el, mustGet } from './dom.js';
+import { confirmModal } from './modal.js';
 
 /** The chat overlay takes over below the cockpit width (v6). */
 const OVERLAY_QUERY = `(max-width: ${COCKPIT_MIN_WIDTH - 1}px)`;
@@ -275,10 +276,7 @@ export class ChatView {
       this.beginControl('compact');
     });
     this.newChatButton.addEventListener('click', () => {
-      if (!window.confirm('Start a new chat? Durable history is kept, but this active view will clear.')) {
-        return;
-      }
-      this.beginControl('new_chat');
+      void this.confirmNewChat();
     });
     this.renderContext();
 
@@ -355,6 +353,30 @@ export class ChatView {
   bindControls(request: ((action: ControlAction) => boolean) | null): void {
     this.requestControl = request;
     this.renderContext();
+  }
+
+  /** New chat wipes the active view, so the gesture double-checks first —
+   * through the themed Gru modal (center screen, at the button), never
+   * the browser's native confirm, which parks its buttons at the top of
+   * the viewport far from the click that opened it. */
+  private async confirmNewChat(): Promise<void> {
+    const accepted = await confirmModal({
+      glyph: '🧽',
+      title: 'New chat, boss?',
+      body: 'Durable history is kept — the minions file it all away — but this active view will clear.',
+      confirmLabel: 'Fresh start',
+      cancelLabel: 'Keep plotting',
+    });
+    if (!accepted) return;
+    // The dialog opened a human-scale gap: the authoritative context may
+    // have moved on (socket drop, a busy turn) while the boss decided.
+    // Re-check the same predicate that gates the button — a stale
+    // confirm surfaces a note instead of silently no-opping.
+    if (this.newChatButton.disabled) {
+      this.ephemeralNote('New chat is no longer available — the context changed while you decided.');
+      return;
+    }
+    this.beginControl('new_chat');
   }
 
   private beginControl(action: ControlAction): void {

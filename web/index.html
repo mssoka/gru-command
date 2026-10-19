@@ -57,8 +57,10 @@
       <div class="pairing__error" id="pair-error" hidden></div>
     </section>
 
-    <section id="settings-view" class="pp-card settings reveal" hidden>
-      <div class="lbl">Settings</div>
+    <!-- Settings: borrowed content for the Gru modal (see ui/settings.ts) —
+         the section itself carries no card chrome; the dialog paints it
+         (and owns the title — no in-panel heading). -->
+    <section id="settings-view" class="settings" hidden>
       <div class="settings__row">
         <strong>Theme</strong>
         <button id="settings-theme" class="pp-btn pp-btn--secondary">☀️ light</button>

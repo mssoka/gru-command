@@ -304,12 +304,15 @@ test('context controls compact in place and New chat advances a reload-safe empt
   ).toBeVisible();
   await expect(page.locator('.msg--user', { hasText: 'context control old words' })).toHaveCount(1);
 
-  page.once('dialog', (dialog) => dialog.dismiss());
+  // New chat asks through the themed Gru modal (center screen), never
+  // the browser's native confirm.
   await page.locator('#chat-new').click();
+  await expect(page.locator('.gru-modal__cancel')).toBeVisible();
+  await page.locator('.gru-modal__cancel').click();
   await expect(page.locator('.msg--user', { hasText: 'context control old words' })).toHaveCount(1);
 
-  page.once('dialog', (dialog) => dialog.accept());
   await page.locator('#chat-new').click();
+  await page.locator('.gru-modal__confirm').click();
   await expect(page.locator('.msg--user', { hasText: 'context control old words' })).toHaveCount(0);
   await page.reload();
   await expect(page.locator('.msg--user', { hasText: 'context control old words' })).toHaveCount(0);
@@ -324,8 +327,8 @@ test('failed New chat restores history and delivers a word typed in the pending 
   });
   expect(armFailure.ok()).toBe(true);
 
-  page.once('dialog', (dialog) => dialog.accept());
   await page.locator('#chat-new').click();
+  await page.locator('.gru-modal__confirm').click();
   await expect(page.locator('#chat-context-status')).toHaveText('Starting new chat…');
   await expect(page.locator('.msg--user', { hasText: 'retired words before failed reset' })).toHaveCount(0);
   await page.locator('#chat-input').fill('word typed during failed reset');
