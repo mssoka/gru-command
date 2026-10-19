@@ -7478,12 +7478,7 @@ export class LedgerApi {
     if (payload === null || (payload['source'] !== 'silas-directive' && payload['source'] !== 'silas-rebrief') ||
         typeof payload['request_id'] !== 'string' || payload['request_id'].trim() === '' ||
         typeof payload['candidate_delivery_proven'] !== 'boolean') return false;
-    // A recovered historical delivery can open its report handback only when
-    // the existing independent current-candidate projection still proves it.
-    // Preserve its historical flag; never use an old unproven completion as
-    // current report/candidate evidence.
-    if (payload['historical_bookkeeping_only'] === true &&
-        (payload['candidate_delivery_proven'] !== true || this.latestCandidateDelivery(event.jobId)?.seq !== event.seq)) return false;
+    if (payload['historical_bookkeeping_only'] === true) return false;
     const request = this.getDirective(payload['request_id']);
     const expectedSource = request?.requestKind === 'rebrief' ? 'silas-rebrief' : 'silas-directive';
     if (request === null || request.jobId !== event.jobId || request.requestKind === null || payload['source'] !== expectedSource ||
@@ -7505,12 +7500,33 @@ export class LedgerApi {
     }
   }
 
-  /** Ensure a durable report handback accompanies every correlated report
-   * delivery. Called inside the owning ledger transaction so a failed open
-   * cannot settle the directive while losing the handback. */
+  /** Existing lost-delivery reconstruction is report-qualified only when its
+   * own native path recorded the complete original facts and the ordinary
+   * candidate projection still identifies this exact delivery. It remains
+   * explicitly historical and cannot qualify a dirty/non-candidate tree. */
+  private isReconstructedReportCandidateDelivery(event: EventRecord): boolean {
+    if (event.kind !== 'job.delivered' || event.jobId === null) return false;
+    const job = this.getJob(event.jobId);
+    const payload = typeof event.payload === 'object' && event.payload !== null ? event.payload as Record<string, unknown> : null;
+    const provenance = payload?.['provenance'];
+    const currentProof = payload?.['current_candidate_proof'];
+    return job !== null && job.deliverable !== null && isReportDeliverable(job.deliverable) && payload !== null &&
+      payload['source'] === 'silas-rebrief' && payload['historical_bookkeeping_only'] === true &&
+      payload['candidate_delivery_proven'] === true && typeof payload['marker_id'] === 'string' &&
+      typeof payload['payload_hash'] === 'string' && typeof provenance === 'object' && provenance !== null &&
+      !Array.isArray(provenance) && (provenance as Record<string, unknown>)['kind'] === 'original-correlated-completion' &&
+      typeof currentProof === 'object' && currentProof !== null && !Array.isArray(currentProof) &&
+      this.latestCandidateDelivery(event.jobId)?.seq === event.seq;
+  }
+
+  /** Ensure a durable report handback accompanies a correlated native report
+   * or a reconstructed historical report whose independent candidate proof is
+   * still current. Called inside the owning transaction so the open and the
+   * cited delivery cannot be split across a crash. */
   private ensureReportHandback(jobId: string, deliveredSeq: number): void {
     const delivery = this.getEvent(deliveredSeq);
-    if (delivery === null || delivery.jobId !== jobId || !this.isNativeReportHandbackDelivery(delivery)) return;
+    if (delivery === null || delivery.jobId !== jobId ||
+        !this.isNativeReportHandbackDelivery(delivery) && !this.isReconstructedReportCandidateDelivery(delivery)) return;
     const job = this.getJob(jobId);
     if (job === null || job.deliverable === null || !isReportDeliverable(job.deliverable)) return;
     const opened = this.openReportObligation({ jobId, observedAtSeq: deliveredSeq });
