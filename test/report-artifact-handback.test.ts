@@ -116,18 +116,35 @@ describe('native report artifact handback', () => {
     expect(f.api.latestCandidateDelivery(f.jobId)).toBeNull();
   });
 
-  it('report-backstop-does-not-promote-stale-reopened-report', () => {
-    const f = fixture('stale-reopened-report', { dirty: true, candidate: false });
-    settleSeededDirective(f);
+  it('report-backstop-does-not-promote-while-new-followthrough-is-live', () => {
+    const f = fixture('live-followthrough-report', { dirty: true, candidate: false });
+    settleSeededDirective(f, false);
     const oldDelivery = f.api.latestReportHandbackDelivery(f.jobId)!;
-    f.api.setJobStatus(f.jobId, 'working');
     f.api.beginDirectiveIntent({ jobId: f.jobId, requestId: 'new-report-followthrough',
       directive: 'complete the newer report follow-through', holder: 'gru' });
 
-    expect(oldDelivery.seq).toBeLessThan(f.api.latestJobEvent(f.jobId, 'job.status')!.seq);
+    expect(f.api.getJob(f.jobId)?.status).toBe('working');
+    expect(f.api.latestJobEventByPayloadField(f.jobId, 'job.status', 'to', 'working')?.seq).toBeLessThan(oldDelivery.seq);
     expect(reconcile(f).reports.opened).toBe(0);
     expect(f.api.getJob(f.jobId)?.status).toBe('working');
     expect(f.api.getDirective('new-report-followthrough')?.state).toBe('dispatching');
+    expect(f.api.findReportObligation(f.jobId)).toBeNull();
+    expect(f.api.listJobEventsByKinds(f.jobId, ['job.report-handback'])).toEqual([]);
+  });
+
+  it('report-backstop-does-not-reopen-stale-report-after-delivered-followthrough', () => {
+    const f = fixture('stale-delivered-followthrough-report', { dirty: true, candidate: false });
+    settleSeededDirective(f);
+    const oldDelivery = f.api.latestReportHandbackDelivery(f.jobId)!;
+    f.api.setJobStatus(f.jobId, 'working');
+    f.api.appendCustomEvent({ kind: 'job.delivered', jobId: f.jobId,
+      payload: { source: 'silas-directive', sha: 'later-unproven-report-head', candidate_delivery_proven: false } });
+    f.api.setJobStatus(f.jobId, 'delivered');
+
+    expect(f.api.latestReportHandbackDelivery(f.jobId)?.seq).toBe(oldDelivery.seq);
+    expect(f.api.latestJobEventByPayloadField(f.jobId, 'job.status', 'to', 'working')?.seq).toBeGreaterThan(oldDelivery.seq);
+    expect(reconcile(f).reports.opened).toBe(0);
+    expect(f.api.getJob(f.jobId)?.status).toBe('delivered');
     expect(f.api.findReportObligation(f.jobId)).toBeNull();
     expect(f.api.listJobEventsByKinds(f.jobId, ['job.report-handback'])).toEqual([]);
   });

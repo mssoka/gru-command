@@ -2681,15 +2681,17 @@ export class LedgerApi {
           job.deliverable === null || !isReportDeliverable(job.deliverable)) return null;
       const delivery = this.latestReportHandbackDelivery(jobId);
       if (delivery === null) return null;
-      if (job.status === 'working') {
-        // A previous successful report does not prove a later follow-through
-        // that reopened the lane. Promote only when this exact delivery
-        // postdates the latest transition to working.
-        const latestStatus = this.latestJobEvent(jobId, 'job.status');
-        const statusPayload = latestStatus?.payload as { readonly to?: unknown } | undefined;
-        if (latestStatus === null || latestStatus.seq >= delivery.seq || statusPayload?.to !== 'working') return null;
-        this.setJobStatus(jobId, 'delivered');
-      }
+      // A previous successful report does not prove a later follow-through
+      // that reopened the lane. The exact receipt must postdate the latest
+      // transition to working regardless of the job's current status: a newer
+      // non-native/missing receipt may already have changed it back to delivered.
+      const latestWorking = this.latestJobEventByPayloadField(jobId, 'job.status', 'to', 'working');
+      if (latestWorking === null || latestWorking.seq >= delivery.seq) return null;
+      // A newer request may own the lane without having changed its status yet.
+      // Do not let the old report complete its handback while that work is live.
+      if (this.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES, limit: 1 }).length > 0 ||
+          this.listPendingRebriefs({ jobId }).length > 0) return null;
+      if (job.status === 'working') this.setJobStatus(jobId, 'delivered');
       const opened = this.openReportObligation({ jobId, observedAtSeq: delivery.seq });
       if (opened.created) {
         this.appendEvent({ kind: 'job.report-handback', jobId,
