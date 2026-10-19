@@ -116,6 +116,22 @@ describe('native report artifact handback', () => {
     expect(f.api.latestCandidateDelivery(f.jobId)).toBeNull();
   });
 
+  it('report-backstop-does-not-promote-stale-reopened-report', () => {
+    const f = fixture('stale-reopened-report', { dirty: true, candidate: false });
+    settleSeededDirective(f);
+    const oldDelivery = f.api.latestReportHandbackDelivery(f.jobId)!;
+    f.api.setJobStatus(f.jobId, 'working');
+    f.api.beginDirectiveIntent({ jobId: f.jobId, requestId: 'new-report-followthrough',
+      directive: 'complete the newer report follow-through', holder: 'gru' });
+
+    expect(oldDelivery.seq).toBeLessThan(f.api.latestJobEvent(f.jobId, 'job.status')!.seq);
+    expect(reconcile(f).reports.opened).toBe(0);
+    expect(f.api.getJob(f.jobId)?.status).toBe('working');
+    expect(f.api.getDirective('new-report-followthrough')?.state).toBe('dispatching');
+    expect(f.api.findReportObligation(f.jobId)).toBeNull();
+    expect(f.api.listJobEventsByKinds(f.jobId, ['job.report-handback'])).toEqual([]);
+  });
+
   it('report-disposition-requires-actual-routed-job', () => {
     const f = fixture('route-required-report', { candidate: true });
     f.api.recordDirectiveDelivery({ requestId: f.requestId, eventSeq: f.deliverySeq });

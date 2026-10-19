@@ -2681,7 +2681,15 @@ export class LedgerApi {
           job.deliverable === null || !isReportDeliverable(job.deliverable)) return null;
       const delivery = this.latestReportHandbackDelivery(jobId);
       if (delivery === null) return null;
-      if (job.status === 'working') this.setJobStatus(jobId, 'delivered');
+      if (job.status === 'working') {
+        // A previous successful report does not prove a later follow-through
+        // that reopened the lane. Promote only when this exact delivery
+        // postdates the latest transition to working.
+        const latestStatus = this.latestJobEvent(jobId, 'job.status');
+        const statusPayload = latestStatus?.payload as { readonly to?: unknown } | undefined;
+        if (latestStatus === null || latestStatus.seq >= delivery.seq || statusPayload?.to !== 'working') return null;
+        this.setJobStatus(jobId, 'delivered');
+      }
       const opened = this.openReportObligation({ jobId, observedAtSeq: delivery.seq });
       if (opened.created) {
         this.appendEvent({ kind: 'job.report-handback', jobId,

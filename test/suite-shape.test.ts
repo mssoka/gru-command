@@ -239,7 +239,7 @@ const PINS: Record<string, number> = {
   'fix-directive.test.ts': 43,
   'github-poll.test.ts': 43,
   'gru-mailbox.test.ts': 39,
-  'report-artifact-handback.test.ts': 6,
+  'report-artifact-handback.test.ts': 7,
   'report-handback-mailbox.test.ts': 31,
   'health.test.ts': 19,
   'incident.test.ts': 9,
