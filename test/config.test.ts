@@ -919,10 +919,10 @@ describe('worktrees config (E8, manager lane)', () => {
 });
 
 describe('dispatch config (E8)', () => {
-  it("Bob's consolidation knock ships disabled by default (the dream is the learning loop)", () => {
+  it("Bob's consolidation knock ships weekly (issue #451)", () => {
     const home = tmpHome();
     const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
-    expect(config.dispatch).toEqual({ bobIntervalMs: 0 });
+    expect(config.dispatch).toEqual({ bobIntervalMs: 604_800_000 });
   });
 
   it('an explicit bob_interval_ms is preserved verbatim', () => {
@@ -1250,12 +1250,12 @@ describe('pacing config (FIFO admission caps + rate-limit backoff; owner heist 2
 });
 
 describe('lessons config (Book of Lessons)', () => {
-  it('dreams on boot + every 12h by default, with the pinned caps', () => {
+  it('dreams on boot when due + weekly by default, with the pinned caps (issue #451)', () => {
     const home = tmpHome();
     const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
     expect(config.lessons).toEqual({
       enabled: true,
-      dreamIntervalMs: 43_200_000,
+      dreamIntervalMs: 604_800_000,
       dreamOnBoot: true,
       chapterCapBytes: 4_096,
       indexCapBytes: 1_024,

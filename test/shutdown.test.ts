@@ -155,12 +155,20 @@ describe('graceful shutdown', () => {
       expect(existsSync(snapshotFile)).toBe(true);
       const snapshot = JSON.parse(readFileSync(snapshotFile, 'utf-8')) as Record<string, number>;
       const files = Object.keys(snapshot);
-      expect(files).toHaveLength(1);
-      const file = files[0]!;
-      expect(file.startsWith(join(home, 'sessions', 'gru') + '/')).toBe(true);
+      // Bob's due-based boot beat (issue #451) spawns the bob slot on a
+      // fresh install, so the snapshot legitimately holds that session
+      // too; the gru-main session is still exactly the one below.
+      const gruRoot = join(home, 'sessions', 'gru') + '/';
+      const bobRoot = join(home, 'sessions', 'bob') + '/';
+      const gruFiles = files.filter((path) => path.startsWith(gruRoot));
+      expect(gruFiles).toHaveLength(1);
+      for (const path of files) {
+        expect(path.startsWith(gruRoot) || path.startsWith(bobRoot), path).toBe(true);
+        expect(Number.isSafeInteger(snapshot[path]), path).toBe(true);
+        expect(snapshot[path], path).toBe(readFileSync(path).length);
+      }
+      const file = gruFiles[0]!;
       const bytes = readFileSync(file);
-      expect(Number.isSafeInteger(snapshot[file])).toBe(true);
-      expect(snapshot[file]).toBe(bytes.length);
       expect(snapshot[file]).toBeGreaterThan(0);
       const entries = bytes.toString('utf8').trim().split('\n').map((line) => JSON.parse(line) as { type: string; id?: string });
       expect(entries[0]).toMatchObject({ type: 'session', id: expect.any(String) });

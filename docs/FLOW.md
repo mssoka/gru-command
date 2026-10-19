@@ -1070,16 +1070,20 @@ section). Service restarts remain manual until self-roll-34 lands.
 
 ## Bob (periodic memory)
 
-Bob's consolidation trigger ships **disabled** (`[dispatch]
-bob_interval_ms = 0`, issue #221): the due-based dream pass (Book of
-Lessons) is the learning loop that feeds the crew — it reads journal
-entries, including the blockers Perkins journals from every posted
-review verdict — and an hourly knock mostly found nothing, writing
-memory files no role prompt or code path reads. The trigger remains
-available for installs that want it (any positive `bob_interval_ms`
-enables; `0` disables): it knocks on the bob role's supervised slot
-with consolidation instructions; the role's persona (`roles/bob.md`)
-governs the craft. Never overlapping, never blocking a live operation.
+Bob's consolidation trigger is **live and weekly by default** (`[dispatch]
+bob_interval_ms = 604800000`, issue #451; the weekly cadence answers the
+"hourly knock found nothing" evidence of #221). The knock is
+**due-based**, like the dream: the next consolidation is due
+`lastBobAt + bob_interval_ms`, with `lastBobAt` persisted under the data
+home (`<data_dir>/bob-state.json`), so a restart inherits the week
+instead of resetting it. The boot beat fires only when already due; a
+restart mid-week waits out the remainder as the first beat. `0` stays
+the hard off switch and any positive value is honored verbatim. It knocks
+on the bob role's supervised slot with consolidation instructions; the
+role's persona (`roles/bob.md`) governs the craft. Never overlapping (a
+slow consolidation skips its beat and says so), never blocking a live
+operation; a failed knock does not advance the schedule and retries at
+the next cadence.
 
 ## Self-roll (the service deploys itself)
 
@@ -1171,7 +1175,7 @@ or an outside shell to avoid waiting out the drain bound.
 # setup_timeout_ms = 120000
 
 [dispatch]
-# bob_interval_ms = 3600000        # ships 0: disabled — the due-based dream is the loop
+# bob_interval_ms = 604800000      # weekly; due lastBobAt + interval (restarts inherit it)
 
 [silas]
 # hosted ops session (see "Ops follow-through" above); live by default

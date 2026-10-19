@@ -33,7 +33,7 @@ import {
   reportVerdictPublicationIdentity,
   verdictPublicationIdentityWarning,
 } from './dispatch/verdict-publication-identity.js';
-import { BobScheduler } from './dispatch/bob-scheduler.js';
+import { BOB_STATE_FILE, BobScheduler, bobStateFile } from './dispatch/bob-scheduler.js';
 import { SilasDriver, computeSilasDigest, consolidatedBlockersFor, supervisionLookup } from './dispatch/silas-driver.js';
 import { spawnSilasWithActionTool } from './dispatch/silas-model-action.js';
 import { composeDeterministicPass, createSilasAutopilotHook } from './dispatch/silas-autopilot-pass.js';
@@ -1476,6 +1476,9 @@ async function main(): Promise<number> {
   const bob = new BobScheduler({
     intervalMs: config.dispatch.bobIntervalMs,
     slot: bobSlot,
+    // Due-based cadence (issue #451): the schedule persists in the data
+    // home, so a restart no longer resets a week-long interval.
+    state: bobStateFile(join(config.dataDir, BOB_STATE_FILE)),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   // The dream pass shares Bob's supervised slot (one memory agent, two
