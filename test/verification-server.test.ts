@@ -251,6 +251,27 @@ describe('POST /api/verify', () => {
     expect(() => resolveVerifyCommand(manifest!, 'typo')).toThrow(/not declared/);
   });
 
+  it('refuses a new verification on a parked job and records the durable refusal (#455)', async () => {
+    const harness = await boot();
+    harness.ledger.setJobStatus(harness.jobId, 'parked');
+    try {
+      const result = await call(harness.port, { job_id: harness.jobId, scope: 'full' });
+      expect(result.status).toBe(409);
+      expect(result.json).toEqual({
+        error: 'job_held',
+        detail: expect.stringContaining('resume the lane first'),
+      });
+      expect(harness.ledger.latestJobEvent(harness.jobId, 'verification.refused')?.payload).toMatchObject({
+        scope: 'full',
+        code: 'job_held',
+        status: 'parked',
+      });
+      expect(harness.ledger.latestJobEvent(harness.jobId, 'verification.started')).toBeNull();
+    } finally {
+      await harness.close();
+    }
+  });
+
   it('runs the declared command in the lane worktree and records the outcome + duration', async () => {
     const harness = await boot();
     const { status, frames } = await call(harness.port, { job_id: harness.jobId, scope: 'full' });

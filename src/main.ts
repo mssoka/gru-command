@@ -63,6 +63,7 @@ import { IntakeService } from './intake/service.js';
 import { IntakeApprovalService } from './intake/approval.js';
 import { IntakeSlicingService } from './intake/slicing.js';
 import { ChildWorkerService } from './dispatch/child-workers.js';
+import { JobExecutionStop } from './dispatch/job-stop.js';
 import { createVerificationServer, type VerificationBudget } from './verify/server.js';
 import { laneLifecycleHooks, ReportLaneSlimmer, startLaneSlimmer } from './worktrees/slimming.js';
 import { ExpiryService, startExpiry } from './maintenance/expiry.js';
@@ -1373,6 +1374,57 @@ async function main(): Promise<number> {
     log: (level, msg, fields) => logger.log(level, msg, fields),
   } });
   state.wave = wave;
+  // Issue #455: parking is an explicit owner hold, so the service physically
+  // stops the job's live producers instead of relying on the model to reread
+  // the amended contract. The stop's own verdict is durable and separate
+  // from the hold: a producer whose cessation cannot be proven stays
+  // `unproven` rather than being reported stopped.
+  const jobExecutionStop = new JobExecutionStop({
+    ledger,
+    handles: { get: (agentId) => registry.getHandle(agentId) },
+    children: childWorkers,
+    reviews: wave,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  bus.subscribe((event) => {
+    if (event.kind !== 'job.status') return;
+    const jobId = event.jobId;
+    if (jobId === null) return;
+    const to = (event.payload as { readonly to?: unknown } | null)?.to;
+    if (to !== 'parked') return;
+    void jobExecutionStop
+      .stop({
+        jobId,
+        by: 'service:park',
+        reason: 'job parked — the explicit owner hold stops live producers',
+      })
+      .then((outcome) => {
+        if (outcome.state === 'stopped') return;
+        // An administrative hold that could not prove the producer stopped
+        // is the owner's decision now — never a silent downgrade.
+        const residue = [
+          ...outcome.agents.filter((agent) => agent.state === 'unproven').map((agent) => `${agent.agentId}: ${agent.detail ?? 'unproven'}`),
+          ...outcome.children.filter((child) => child.state === 'unproven').map((child) => `${child.childId}: ${child.detail ?? 'unproven'}`),
+          ...(outcome.reviews.state === 'unproven' ? [`review: ${outcome.reviews.detail ?? 'unproven'}`] : []),
+          ...outcome.outstanding,
+        ];
+        notifications.post({
+          kind: 'job-stop-unproven',
+          routing: 'needs-owner',
+          severity: 'error',
+          title: `Parked job ${jobId}: producer stop is unproven`,
+          detail:
+            `The explicit owner hold is recorded, but the service cannot prove every producer stopped: ${residue.join('; ')}. ` +
+            'The job stays parked and new verifications, child workers and initial dispatches are refused until the residue settles.',
+        });
+      })
+      .catch((error: unknown) => {
+        logger.log('error', 'job parked: producer stop failed', {
+          job: jobId,
+          error: String(error),
+        });
+      });
+  });
   // Notification-driven re-arms share Perkins' current-candidate writer
   // fence, including in-flight setup operations that have no round row yet.
   supervisorLive.setActiveReviewProbe((jobId) => wave.activeReview(jobId) !== null);

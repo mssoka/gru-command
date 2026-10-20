@@ -45,6 +45,10 @@ const OWNER_REQUIRED_KINDS: readonly string[] = [
   // Unconfirmed native cleanup after a refused replacement can need a human
   // when the original owner is lost (issue #280): main's owner-facing notice.
   'supervision.restart-cleanup-unconfirmed',
+  // An explicit owner hold could not prove every producer stopped (issue
+  // #455): the residue is the owner's to settle — never a silent downgrade
+  // to an administrative park.
+  'job-stop-unproven',
   // Vector's raids (#351): raid_mode = "proposed" puts each raid Gru picks
   // in FOR YOU for the owner's Accept or Decline; fix_mode = "proposed"
   // does the same for each break-in's fix heist.

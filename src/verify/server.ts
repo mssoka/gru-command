@@ -402,6 +402,23 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
       json(res, 404, { error: 'job_not_found', detail: `job "${jobId}" not found` });
       return;
     }
+    // Issue #455: parking is an explicit owner hold. A new verification
+    // request arriving after the hold is refused at the operation boundary
+    // and recorded — never admitted on the strength of an older turn.
+    if (job.status === 'parked') {
+      ledger.appendCustomEvent({
+        kind: 'verification.refused',
+        jobId,
+        payload: { scope, code: 'job_held', status: job.status },
+      });
+      json(res, 409, {
+        error: 'job_held',
+        detail:
+          `job "${jobId}" is parked — an explicit owner hold admits no new verification; ` +
+          'resume the lane first',
+      });
+      return;
+    }
     const lane = worktrees
       .listWorktrees({ jobId })
       .find((candidate) => candidate.kind === 'job' && candidate.status !== 'swept');

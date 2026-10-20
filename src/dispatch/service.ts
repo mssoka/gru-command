@@ -1017,6 +1017,17 @@ export class DispatchService {
   private recordSettleOutcome(jobId: string, status: 'delivered' | 'blocked'): void {
     const current = this.opts.ledger.getJob(jobId);
     if (current === null || current.status === status) return;
+    // Issue #455: a disposed producer is the CONSEQUENCE of an explicit
+    // owner hold, not a fresh blocker. Parking stays parked until the owner
+    // resumes; the turn's own error is still recorded separately.
+    if (current.status === 'parked') {
+      this.log('info', 'settle status skipped — job is under an explicit owner hold', {
+        job: jobId,
+        status: current.status,
+        settle: status,
+      });
+      return;
+    }
     const legal = status === 'blocked' ? !isJobTerminal(current.status) : current.status === 'working';
     if (!legal) {
       this.log('info', 'settle status skipped — job already advanced', {
