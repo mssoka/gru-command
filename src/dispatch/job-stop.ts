@@ -1,7 +1,8 @@
+import type { BusEvent } from '../events/bus.js';
 import type { LedgerApi } from '../ledger/api.js';
 import { RecordNotFound } from '../ledger/api.js';
 import type { LogLevel } from '../logger.js';
-import type { AgentHandle } from '../runtime/types.js';
+import { adapterCessationEvidence, type AgentHandle } from '../runtime/types.js';
 import type { ChildWorkerService } from './child-workers.js';
 import type { WaveRunner } from './perkins.js';
 
@@ -26,8 +27,8 @@ export interface JobStopChildOutcome {
 }
 
 export interface JobStopReviewOutcome {
-  /** `skipped` means no review service is wired here — it is never a
-   * claim that review stopped. */
+  /** `skipped` means no review service is wired AND the ledger records no
+   * live round — it is never a claim that review stopped. */
   readonly state: JobStopTargetState | 'skipped';
   readonly roundIds: readonly string[];
   readonly detail: string | null;
@@ -38,6 +39,10 @@ export interface JobStopOutcome {
   /** `stopped` requires EVERY live target to be positively proven stopped.
    * Anything less is `unproven` with the exact residue named. */
   readonly state: JobStopTargetState;
+  /** True when the job left the owner hold while this pass was awaited:
+   * the physical results are still reported, but the verdict no longer
+   * governs the lane and must not read as a current stop. */
+  readonly superseded: boolean;
   readonly by: string;
   readonly reason: string;
   readonly agents: readonly JobStopAgentOutcome[];
@@ -50,7 +55,10 @@ export interface JobStopDeps {
   readonly ledger: Pick<
     LedgerApi,
     | 'getJob'
+    | 'listJobs'
+    | 'latestJobEvent'
     | 'listAgents'
+    | 'listRounds'
     | 'listChildWorkers'
     | 'listJobAdmissions'
     | 'hasUnsettledVerificationRun'
@@ -59,11 +67,13 @@ export interface JobStopDeps {
   /** The runtime's own live-handle view. A ledger row claiming an open
    * turn is never proof of a handle, and a handle is never proof of a
    * ledger row — both are consulted. */
-  readonly handles: { readonly get: (agentId: string) => AgentHandle | null };
+  readonly handles: { readonly list: () => readonly AgentHandle[] };
   /** Tracked child workers, when the service hosts them. */
   readonly children: Pick<ChildWorkerService, 'cancel'> | null;
   /** The review service, when the service hosts it. */
   readonly reviews: Pick<WaveRunner, 'supersedeReviews'> | null;
+  /** Called once for every unproven pass, including boot re-proofs. */
+  readonly notifyUnproven?: (outcome: JobStopOutcome) => void;
   readonly log: Log;
 }
 
@@ -71,15 +81,31 @@ function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** The residue an owner must inspect when a stop is not proven. Pure and
+ * exported so the owner-facing notice and the durable event cannot drift. */
+export function jobStopResidue(outcome: JobStopOutcome): readonly string[] {
+  return [
+    ...outcome.agents
+      .filter((agent) => agent.state === 'unproven')
+      .map((agent) => `${agent.agentId}: ${agent.detail ?? 'unproven'}`),
+    ...outcome.children
+      .filter((child) => child.state === 'unproven')
+      .map((child) => `${child.childId}: ${child.detail ?? 'unproven'}`),
+    ...(outcome.reviews.state === 'unproven' ? [`review: ${outcome.reviews.detail ?? 'unproven'}`] : []),
+    ...outcome.outstanding,
+  ];
+}
+
 /**
  * Physical producer stop for an explicit owner hold (issue #455).
  *
  * Parking records an administrative hold; this service answers the
  * SEPARATE question a hold cannot: is a live producer actually gone?
- * It disposes every runtime handle bound to the job, cancels tracked
- * child workers, supersedes live reviews, and then reports each target's
- * own evidence. A disposal that returned, a client that exited, or a job
- * row that reads parked are never treated as cessation.
+ * It disposes every runtime handle bound to the job (regardless of what
+ * the durable agent row currently says), cancels tracked child workers,
+ * supersedes live reviews, and then reports each target's own evidence.
+ * A disposal that returned, a client that exited, or a job row that reads
+ * parked are never treated as cessation.
  *
  * The durable `job.execution-stop` event is written twice: `requested`
  * before any effect (so a crash mid-stop leaves honest intent), then the
@@ -100,12 +126,45 @@ export class JobExecutionStop {
     return pass;
   }
 
+  /** Await every pass started so far (shutdown join). */
+  async settled(): Promise<void> {
+    while (this.inFlight.size > 0) {
+      await Promise.allSettled([...this.inFlight.values()]);
+    }
+  }
+
+  /** Re-prove stops a restart interrupted (`requested`) or could not prove
+   * (`unproven`) for lanes that are still parked. Returns the pass count. */
+  async reconcileOnBoot(): Promise<number> {
+    let passes = 0;
+    for (const job of this.deps.ledger.listJobs()) {
+      if (job.status !== 'parked') continue;
+      const latest = this.deps.ledger.latestJobEvent(job.id, 'job.execution-stop');
+      const state = (latest?.payload as { readonly state?: unknown } | null)?.state;
+      if (state !== 'requested' && state !== 'unproven') continue;
+      passes += 1;
+      try {
+        await this.stop({
+          jobId: job.id,
+          by: 'service:boot',
+          reason: 're-proving an interrupted or unproven producer stop for a parked lane',
+        });
+      } catch (error) {
+        this.deps.log('error', 'job execution stop boot re-proof failed', {
+          job: job.id,
+          error: describe(error),
+        });
+      }
+    }
+    return passes;
+  }
+
   private async run(input: {
     readonly jobId: string;
     readonly by: string;
     readonly reason: string;
   }): Promise<JobStopOutcome> {
-    const { ledger } = this.deps;
+    const { ledger, log } = this.deps;
     const job = ledger.getJob(input.jobId);
     if (job === null) throw new RecordNotFound(`job "${input.jobId}" not found`);
 
@@ -115,44 +174,57 @@ export class JobExecutionStop {
       payload: { state: 'requested', by: input.by, reason: input.reason, job_status: job.status },
     });
 
+    const jobAgents = ledger.listAgents().filter((agent) => agent.jobId === input.jobId);
+    const openChildren = ledger.listChildWorkers({ jobId: input.jobId }).filter((child) => child.resultState === null);
+    // A tracked child's own agent row is answered by the child cancellation
+    // target below; reporting it twice would make a proven stop look unproven.
+    const childAgentIds = new Set(openChildren.flatMap((child) => (child.agentId === null ? [] : [child.agentId])));
+    const agentById = new Map(jobAgents.map((agent) => [agent.id, agent]));
     const agents: JobStopAgentOutcome[] = [];
-    for (const agent of ledger.listAgents()) {
-      if (agent.jobId !== input.jobId) continue;
-      if (agent.state !== 'spawning' && agent.state !== 'streaming') continue;
-      const handle = this.deps.handles.get(agent.id);
-      if (handle === null) {
-        agents.push({
-          agentId: agent.id,
-          role: agent.role,
-          state: 'unproven',
-          detail: `ledger records an open ${agent.state} turn but the runtime holds no handle — cessation is unproven (not a claim of stop)`,
-        });
-        continue;
-      }
+    const covered = new Set<string>();
+    // A live handle is a producer even when its agent row reads idle/error:
+    // the row is a projection, the runtime handle is the process.
+    for (const handle of this.deps.handles.list()) {
+      const agent = agentById.get(handle.id);
+      if (agent === undefined) continue;
+      covered.add(agent.id);
       try {
         await handle.dispose();
-        const evidence = handle.cessationEvidence?.() ?? 'unknown';
-        agents.push({
-          agentId: agent.id,
-          role: agent.role,
-          state: evidence === 'ceased' ? 'stopped' : 'unproven',
-          detail:
-            evidence === 'ceased'
-              ? null
-              : 'disposal returned without the adapter observing cessation of every owned run and child',
-        });
       } catch (error) {
         agents.push({
           agentId: agent.id,
-          role: agent.role,
+          role: handle.role,
           state: 'unproven',
           detail: `dispose failed: ${describe(error)}`,
         });
+        continue;
       }
+      const evidence = adapterCessationEvidence(handle);
+      agents.push({
+        agentId: agent.id,
+        role: handle.role,
+        state: evidence === 'ceased' ? 'stopped' : 'unproven',
+        detail:
+          evidence === 'ceased'
+            ? null
+            : 'disposal returned without the adapter observing cessation of every owned run and child',
+      });
+    }
+    // The other direction: the ledger claims an open turn the runtime no
+    // longer holds. That is not a proven stop either.
+    for (const agent of jobAgents) {
+      if (covered.has(agent.id)) continue;
+      if (childAgentIds.has(agent.id)) continue;
+      if (agent.state !== 'spawning' && agent.state !== 'streaming') continue;
+      agents.push({
+        agentId: agent.id,
+        role: agent.role,
+        state: 'unproven',
+        detail: `ledger records an open ${agent.state} turn but the runtime holds no handle — cessation is unproven (not a claim of stop)`,
+      });
     }
 
     const children: JobStopChildOutcome[] = [];
-    const openChildren = ledger.listChildWorkers({ jobId: input.jobId }).filter((child) => child.resultState === null);
     if (openChildren.length > 0 && this.deps.children === null) {
       for (const child of openChildren) {
         children.push({
@@ -177,9 +249,7 @@ export class JobExecutionStop {
     }
 
     let reviews: JobStopReviewOutcome;
-    if (this.deps.reviews === null) {
-      reviews = { state: 'skipped', roundIds: [], detail: 'no review service is wired on this host' };
-    } else {
+    if (this.deps.reviews !== null) {
       try {
         const outcome = await this.deps.reviews.supersedeReviews({
           jobId: input.jobId,
@@ -194,6 +264,19 @@ export class JobExecutionStop {
       } catch (error) {
         reviews = { state: 'unproven', roundIds: [], detail: `review supersession failed: ${describe(error)}` };
       }
+    } else {
+      // No review service here: only a ledger with no live round makes
+      // `skipped` honest.
+      const liveRounds = ledger
+        .listRounds(input.jobId)
+        .filter((round) => round.status === 'pending' || round.status === 'live');
+      reviews = liveRounds.length > 0
+        ? {
+            state: 'unproven',
+            roundIds: liveRounds.map((round) => round.id),
+            detail: 'live review round(s) are recorded but this service hosts no review stop',
+          }
+        : { state: 'skipped', roundIds: [], detail: 'no review service is wired and no live round is recorded' };
     }
 
     // A pre-existing verification cannot be interrupted through the
@@ -216,10 +299,13 @@ export class JobExecutionStop {
       outstanding.length === 0
         ? 'stopped'
         : 'unproven';
+    const current = ledger.getJob(input.jobId);
+    const superseded = current === null || current.status !== 'parked';
 
     const outcome: JobStopOutcome = {
       jobId: input.jobId,
       state,
+      superseded,
       by: input.by,
       reason: input.reason,
       agents,
@@ -231,7 +317,10 @@ export class JobExecutionStop {
       kind: 'job.execution-stop',
       jobId: input.jobId,
       payload: {
-        state,
+        state: superseded ? 'superseded' : state,
+        physical_state: state,
+        superseded,
+        job_status: current?.status ?? null,
         by: input.by,
         reason: input.reason,
         agents: outcome.agents,
@@ -240,13 +329,50 @@ export class JobExecutionStop {
         outstanding: outcome.outstanding,
       },
     });
-    this.deps.log(state === 'stopped' ? 'info' : 'warn', `job execution stop ${state}`, {
+    log(superseded || state === 'stopped' ? 'info' : 'warn', `job execution stop ${superseded ? 'superseded' : state}`, {
       job: input.jobId,
       agents: outcome.agents.length,
       children: outcome.children.length,
       reviews: outcome.reviews.state,
       outstanding: outcome.outstanding.length,
     });
+    if (!superseded && state === 'unproven') this.deps.notifyUnproven?.(outcome);
     return outcome;
   }
+}
+
+export interface JobStopWatcherDeps {
+  readonly bus: { subscribe(listener: (event: BusEvent) => void): () => void };
+  readonly stop: Pick<JobExecutionStop, 'stop'>;
+  readonly notifyFailed: (jobId: string, error: unknown) => void;
+  readonly log: Log;
+}
+
+/** Watch the durable park transition and run the physical stop. Kept as a
+ * small seam so the wiring itself (not just the stop pass) is testable. */
+export function watchParkedJobs(deps: JobStopWatcherDeps): () => void {
+  return deps.bus.subscribe((event) => {
+    if (event.kind !== 'job.status') return;
+    const jobId = event.jobId;
+    if (jobId === null) return;
+    const to = (event.payload as { readonly to?: unknown } | null)?.to;
+    if (to !== 'parked') return;
+    void deps.stop
+      .stop({
+        jobId,
+        by: 'service:park',
+        reason: 'job parked — the explicit owner hold stops live producers',
+      })
+      .catch((error: unknown) => {
+        deps.log('error', 'job parked: producer stop failed', { job: jobId, error: describe(error) });
+        try {
+          deps.notifyFailed(jobId, error);
+        } catch (notifyError) {
+          deps.log('error', 'job parked: stop-failure notice failed', {
+            job: jobId,
+            error: describe(notifyError),
+          });
+        }
+      });
+  });
 }

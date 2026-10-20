@@ -84,6 +84,7 @@ export type ChildWorkerRefusalCode =
   | 'parent_not_permitted'
   | 'nested_delegation'
   | 'parent_expired'
+  | 'job_held'
   | 'job_mismatch'
   | 'parent_lane_unavailable'
   | 'fanout_cap'
@@ -584,7 +585,7 @@ export class ChildWorkerService {
     // may not commission fresh producers while the hold stands.
     if (job.status === 'parked') {
       throw new ChildWorkerRefusal(
-        'parent_expired',
+        'job_held',
         409,
         `job "${jobId}" is parked — an explicit owner hold admits no fresh child worker; resume the lane first`,
       );

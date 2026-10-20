@@ -28,7 +28,7 @@ import type { ManagedRepoOverviewTracker } from './repos/overview.js';
 import type { SilasAutopilotOpsHandle } from './dispatch/silas-autopilot-ops.js';
 import type { LedgerApi } from './ledger/api.js';
 import { disposeDirectiveResources, type DirectiveProgressService } from './dispatch/directive-progress.js';
-import { DISK_RECLAIM_STOP_WAIT_MS, LANE_SLIMMER_STOP_WAIT_MS, SHUTDOWN_FORCE_EXIT_MS } from './shutdown-budget.js';
+import { DISK_RECLAIM_STOP_WAIT_MS, JOB_STOP_JOIN_WAIT_MS, LANE_SLIMMER_STOP_WAIT_MS, SHUTDOWN_FORCE_EXIT_MS } from './shutdown-budget.js';
 
 /**
  * Graceful-shutdown orchestration (issue #341). Extracted from `main.ts` with
@@ -74,6 +74,9 @@ export interface ServiceShutdownState {
   ledger?: Pick<LedgerApi, 'appendCustomEvent'>;
   providerRecovery?: ProviderRecoverySensor;
   wave?: WaveRunner;
+  /** Issue #455: join an in-flight producer stop before the wave/registry
+   * teardown it drives; a pass cut short is re-proved at the next boot. */
+  jobExecutionStop?: { settled(): Promise<void> };
   propertyCampaigns?: PropertyCampaignService;
   childWorkers?: ChildWorkerService;
   verify?: ReturnType<typeof createVerificationServer>;
@@ -309,6 +312,11 @@ export function startServiceShutdown(options: ServiceShutdownOptions): void {
         } catch (error) {
           logger.error('property campaign shutdown failed', { error: String(error) });
         }
+      }
+      if (state.jobExecutionStop !== undefined) {
+        const jobStop = state.jobExecutionStop;
+        await stopWithin(logger, () => jobStop.settled(), JOB_STOP_JOIN_WAIT_MS, 'job execution stop join failed',
+          'the job execution stop did not settle in time; shutdown goes on (its requested record is re-proved at the next boot)');
       }
       if (state.wave !== undefined) {
         try {

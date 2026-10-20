@@ -1,11 +1,16 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
-import { EventBus } from '../src/events/bus.js';
-import { JobExecutionStop, type JobStopDeps } from '../src/dispatch/job-stop.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { EventBus, type BusEvent } from '../src/events/bus.js';
+import {
+  JobExecutionStop,
+  jobStopResidue,
+  watchParkedJobs,
+  type JobStopDeps,
+} from '../src/dispatch/job-stop.js';
 import { DispatchService } from '../src/dispatch/service.js';
-import { LedgerApi } from '../src/ledger/api.js';
+import { LedgerApi, type ChildWorkerRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import type { AgentHandle } from '../src/runtime/types.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
@@ -17,7 +22,6 @@ interface Fixture {
   readonly ledger: LedgerApi;
   readonly db: LedgerDb;
   readonly stop: JobExecutionStop;
-  readonly handles: Map<string, AgentHandle>;
   readonly close: () => void;
 }
 
@@ -28,7 +32,13 @@ afterEach(() => {
   while (dirs.length > 0) rmSync(dirs.pop()!, { recursive: true, force: true });
 });
 
-function fakeHandle(id: string, evidence: 'ceased' | 'unknown', reject = false): AgentHandle {
+interface FakeHandleOptions {
+  readonly reject?: boolean;
+  readonly gate?: Promise<void>;
+  readonly dispose?: () => void;
+}
+
+function fakeHandle(id: string, evidence: 'ceased' | 'unknown', opts: FakeHandleOptions = {}): AgentHandle {
   return {
     id,
     role: 'minion',
@@ -36,16 +46,19 @@ function fakeHandle(id: string, evidence: 'ceased' | 'unknown', reject = false):
     capabilities: {},
     health: () => ({ state: 'streaming', lastActivity: null, sessionFile: null }),
     dispose: async () => {
-      if (reject) throw new Error('dispose rejected');
+      opts.dispose?.();
+      await opts.gate;
+      if (opts.reject === true) throw new Error('dispose rejected');
     },
     cessationEvidence: () => evidence,
   } as unknown as AgentHandle;
 }
 
 function fixture(opts: {
-  readonly agents?: readonly { readonly id: string; readonly state: 'spawning' | 'streaming' }[];
+  readonly agents?: readonly { readonly id: string; readonly state: 'spawning' | 'idle' | 'streaming' | 'error' }[];
   readonly handles?: ReadonlyMap<string, AgentHandle>;
   readonly reviews?: JobStopDeps['reviews'];
+  readonly notifyUnproven?: JobStopDeps['notifyUnproven'];
 } = {}): Fixture {
   const dir = mkdtempSync(join(tmpdir(), 'gru-job-stop-'));
   dirs.push(dir);
@@ -53,6 +66,7 @@ function fixture(opts: {
   const ledger = new LedgerApi(db.handle, { bus: new EventBus({}) });
   ledger.addJob({ id: JOB, repo: 'gru-command', title: 'stop the producers', briefing: 'b' });
   ledger.setJobStatus(JOB, 'working');
+  ledger.setJobStatus(JOB, 'parked');
   for (const agent of opts.agents ?? []) {
     ledger.registerAgent({ id: agent.id, role: 'minion', jobId: JOB, parentage: 'top-level' });
     ledger.setAgentState(agent.id, agent.state);
@@ -60,12 +74,20 @@ function fixture(opts: {
   const handles = new Map(opts.handles ?? []);
   const stop = new JobExecutionStop({
     ledger,
-    handles: { get: (agentId) => handles.get(agentId) ?? null },
+    handles: { list: () => [...handles.values()] },
     children: null,
     reviews: opts.reviews === undefined ? null : opts.reviews,
+    ...(opts.notifyUnproven === undefined ? {} : { notifyUnproven: opts.notifyUnproven }),
     log: () => {},
   });
-  return { ledger, db, stop, handles, close: () => db.close() };
+  return { ledger, db, stop, close: () => db.close() };
+}
+
+function eventStates(ledger: LedgerApi): readonly string[] {
+  return ledger
+    .listJobEventsByKinds(JOB, ['job.execution-stop'])
+    .map((event) => (event.payload as { state: string }).state)
+    .reverse();
 }
 
 describe('job execution stop (issue #455)', () => {
@@ -78,10 +100,29 @@ describe('job execution stop (issue #455)', () => {
     try {
       const outcome = await f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
       expect(outcome.state).toBe('stopped');
+      expect(outcome.superseded).toBe(false);
       expect(outcome.agents).toEqual([{ agentId: 'minion-1', role: 'minion', state: 'stopped', detail: null }]);
       expect(outcome.reviews.state).toBe('stopped');
-      const events = f.ledger.listJobEventsByKinds(JOB, ['job.execution-stop']);
-      expect(events.map((event) => (event.payload as { state: string }).state).reverse()).toEqual(['requested', 'stopped']);
+      expect(eventStates(f.ledger)).toEqual(['requested', 'stopped']);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('disposes a live handle whose ledger row reads idle, and proves it from the adapter', async () => {
+    // The durable agent row is a projection: a turn_end leaves it idle while
+    // the runtime session still owns the process. The stop must not trust it.
+    const dispose = vi.fn();
+    const f = fixture({
+      agents: [{ id: 'minion-idle', state: 'idle' }],
+      handles: new Map([['minion-idle', fakeHandle('minion-idle', 'ceased', { dispose })]]),
+      reviews: { supersedeReviews: async () => ({ jobId: JOB, roundIds: [], operations: 0, confirmed: true, detail: null }) },
+    });
+    try {
+      const outcome = await f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
+      expect(dispose).toHaveBeenCalledTimes(1);
+      expect(outcome.agents).toEqual([{ agentId: 'minion-idle', role: 'minion', state: 'stopped', detail: null }]);
+      expect(outcome.state).toBe('stopped');
     } finally {
       f.close();
     }
@@ -97,8 +138,7 @@ describe('job execution stop (issue #455)', () => {
       expect(outcome.state).toBe('unproven');
       expect(outcome.agents[0]?.state).toBe('unproven');
       expect(outcome.agents[0]?.detail).toMatch(/without the adapter observing cessation/);
-      const events = f.ledger.listJobEventsByKinds(JOB, ['job.execution-stop']);
-      expect((events[0]?.payload as { state: string }).state).toBe('unproven');
+      expect(eventStates(f.ledger).at(-1)).toBe('unproven');
     } finally {
       f.close();
     }
@@ -118,7 +158,7 @@ describe('job execution stop (issue #455)', () => {
   it('names a failed dispose instead of claiming the producer stopped', async () => {
     const f = fixture({
       agents: [{ id: 'minion-4', state: 'streaming' }],
-      handles: new Map([['minion-4', fakeHandle('minion-4', 'ceased', true)]]),
+      handles: new Map([['minion-4', fakeHandle('minion-4', 'ceased', { reject: true })]]),
     });
     try {
       const outcome = await f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
@@ -130,12 +170,16 @@ describe('job execution stop (issue #455)', () => {
   });
 
   it('does not hide an unsettled verification behind a stopped verdict', async () => {
-    const f = fixture({ agents: [{ id: 'minion-5', state: 'streaming' }], handles: new Map([['minion-5', fakeHandle('minion-5', 'ceased')]]) });
+    const f = fixture({
+      agents: [{ id: 'minion-5', state: 'streaming' }],
+      handles: new Map([['minion-5', fakeHandle('minion-5', 'ceased')]]),
+    });
     try {
       f.ledger.appendCustomEvent({ kind: 'verification.requested', jobId: JOB, payload: { run_id: 'run-open' } });
       const outcome = await f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
       expect(outcome.state).toBe('unproven');
       expect(outcome.outstanding.join(' ')).toMatch(/unsettled verification run/);
+      expect(jobStopResidue(outcome).join(' ')).toMatch(/unsettled verification run/);
     } finally {
       f.close();
     }
@@ -153,6 +197,133 @@ describe('job execution stop (issue #455)', () => {
       expect(outcome.reviews).toEqual({ state: 'unproven', roundIds: [], detail: 'session still live' });
     } finally {
       f.close();
+    }
+  });
+
+  it('without a review service, a recorded live round is unproven — not a skipped pass', async () => {
+    const f = fixture();
+    try {
+      f.ledger.addRound({ jobId: JOB });
+      const outcome = await f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
+      expect(outcome.state).toBe('unproven');
+      expect(outcome.reviews.state).toBe('unproven');
+      expect(outcome.reviews.roundIds).toHaveLength(1);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('cancels tracked child workers and proves a terminal child result', async () => {
+    const f = fixture({ agents: [{ id: 'minion-6', state: 'streaming' }] });
+    try {
+      f.ledger.admitChildWorker({
+        id: 'child-1',
+        parentAgentId: 'minion-6',
+        jobId: JOB,
+        purpose: 'research',
+        authority: 'read-only',
+        task: 'read the lane',
+        idempotencyKey: 'k-child',
+      });
+      const record = f.ledger.getChildWorker('child-1')!;
+      const cancel = vi.fn(async (): Promise<ChildWorkerRecord> => ({ ...record, resultState: 'cancelled' }));
+      const stop = new JobExecutionStop({
+        ledger: f.ledger,
+        handles: { list: () => [fakeHandle('minion-6', 'ceased')] },
+        children: { cancel },
+        reviews: { supersedeReviews: async () => ({ jobId: JOB, roundIds: [], operations: 0, confirmed: true, detail: null }) },
+        log: () => {},
+      });
+      const outcome = await stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
+      expect(cancel).toHaveBeenCalledWith('child-1', expect.stringContaining('owner cancelled implementation'));
+      expect(outcome.children).toEqual([{ childId: 'child-1', state: 'stopped', detail: null }]);
+      expect(outcome.state).toBe('stopped');
+    } finally {
+      f.close();
+    }
+  });
+
+  it('notifies the owner exactly once when the stop is unproven', async () => {
+    const notify = vi.fn();
+    const f = fixture({
+      agents: [{ id: 'minion-7', state: 'streaming' }],
+      handles: new Map([['minion-7', fakeHandle('minion-7', 'unknown')]]),
+      notifyUnproven: notify,
+    });
+    try {
+      await f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
+      expect(notify).toHaveBeenCalledTimes(1);
+      expect((notify.mock.calls[0]?.[0] as { state: string }).state).toBe('unproven');
+    } finally {
+      f.close();
+    }
+  });
+
+  it('marks a pass superseded when the owner resumes the lane mid-stop', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const f = fixture({
+      agents: [{ id: 'minion-8', state: 'streaming' }],
+      handles: new Map([['minion-8', fakeHandle('minion-8', 'ceased', { gate })]]),
+      reviews: { supersedeReviews: async () => ({ jobId: JOB, roundIds: [], operations: 0, confirmed: true, detail: null }) },
+    });
+    try {
+      f.ledger.setJobStatus(JOB, 'parked');
+      const running = f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
+      f.ledger.setJobStatus(JOB, 'working');
+      release();
+      const outcome = await running;
+      expect(outcome.superseded).toBe(true);
+      expect(eventStates(f.ledger).at(-1)).toBe('superseded');
+    } finally {
+      f.close();
+    }
+  });
+
+  it('re-proves an interrupted or unproven stop at boot for parked lanes', async () => {
+    let disposed = 0;
+    const f = fixture({
+      agents: [{ id: 'minion-9', state: 'streaming' }],
+      handles: new Map([['minion-9', fakeHandle('minion-9', 'ceased', { dispose: () => { disposed += 1; } })]]),
+      reviews: { supersedeReviews: async () => ({ jobId: JOB, roundIds: [], operations: 0, confirmed: true, detail: null }) },
+    });
+    try {
+      f.ledger.setJobStatus(JOB, 'parked');
+      f.ledger.appendCustomEvent({ kind: 'job.execution-stop', jobId: JOB, payload: { state: 'requested', by: 'crash', reason: 'interrupted' } });
+      const passes = await f.stop.reconcileOnBoot();
+      expect(passes).toBe(1);
+      expect(disposed).toBe(1);
+      expect(eventStates(f.ledger).at(-1)).toBe('stopped');
+    } finally {
+      f.close();
+    }
+  });
+
+  it('watches park transitions and escalates a failed pass', async () => {
+    const bus = new EventBus({});
+    const stop = { stop: vi.fn(async () => { throw new Error('ledger unavailable'); }) };
+    const notifyFailed = vi.fn();
+    const log = vi.fn();
+    const unsubscribe = watchParkedJobs({ bus, stop, notifyFailed, log });
+    try {
+      bus.publish({
+        seq: 1,
+        ts: '0',
+        kind: 'job.status',
+        jobId: JOB,
+        agentId: null,
+        roundId: null,
+        lens: null,
+        payload: { from: 'working', to: 'parked' },
+      } satisfies BusEvent);
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(stop.stop).toHaveBeenCalledWith(expect.objectContaining({ jobId: JOB, by: 'service:park' }));
+      expect(notifyFailed).toHaveBeenCalledWith(JOB, expect.any(Error));
+      expect(log).toHaveBeenCalled();
+    } finally {
+      unsubscribe();
     }
   });
 

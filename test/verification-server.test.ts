@@ -251,6 +251,35 @@ describe('POST /api/verify', () => {
     expect(() => resolveVerifyCommand(manifest!, 'typo')).toThrow(/not declared/);
   });
 
+  it('replays a recorded request_id on a parked lane instead of refusing it as new (#455)', async () => {
+    const harness = await boot();
+    try {
+      const first = await call(harness.port, { job_id: harness.jobId, scope: 'full', request_id: 'parked-replay' });
+      expect(first.status).toBe(200);
+      expect(outcomeOf(completedFrame(first.frames))['ok']).toBe(true);
+      harness.ledger.setJobStatus(harness.jobId, 'parked');
+      const replay = await call(harness.port, { job_id: harness.jobId, scope: 'full', request_id: 'parked-replay' });
+      expect(replay.status).toBe(200);
+      expect(completedFrame(replay.frames)).toMatchObject({ reconciled: true });
+      expect(harness.ledger.latestJobEvent(harness.jobId, 'verification.refused')).toBeNull();
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('validates the scope before recording a parked refusal (#455)', async () => {
+    const harness = await boot();
+    harness.ledger.setJobStatus(harness.jobId, 'parked');
+    try {
+      const result = await call(harness.port, { job_id: harness.jobId, scope: 'typo' });
+      expect(result.status).toBe(400);
+      expect(result.json).toMatchObject({ error: 'unknown_scope' });
+      expect(harness.ledger.latestJobEvent(harness.jobId, 'verification.refused')).toBeNull();
+    } finally {
+      await harness.close();
+    }
+  });
+
   it('refuses a new verification on a parked job and records the durable refusal (#455)', async () => {
     const harness = await boot();
     harness.ledger.setJobStatus(harness.jobId, 'parked');

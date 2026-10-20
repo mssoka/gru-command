@@ -1017,10 +1017,12 @@ export class DispatchService {
   private recordSettleOutcome(jobId: string, status: 'delivered' | 'blocked'): void {
     const current = this.opts.ledger.getJob(jobId);
     if (current === null || current.status === status) return;
-    // Issue #455: a disposed producer is the CONSEQUENCE of an explicit
-    // owner hold, not a fresh blocker. Parking stays parked until the owner
-    // resumes; the turn's own error is still recorded separately.
-    if (current.status === 'parked') {
+    // Issue #455: a producer disposed by the owner hold settles as an error.
+    // That error is the CONSEQUENCE of the hold, not a fresh blocker: parking
+    // stays parked until the owner resumes, while `job.minion-error` keeps
+    // the failure itself on the record. A genuine completed turn still walks
+    // the ordinary (illegal-from-parked) settle path.
+    if (status === 'blocked' && current.status === 'parked') {
       this.log('info', 'settle status skipped — job is under an explicit owner hold', {
         job: jobId,
         status: current.status,

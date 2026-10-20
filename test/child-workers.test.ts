@@ -394,7 +394,7 @@ describe('tracked child workers: admission (issue #161)', () => {
       refusal = error as ChildWorkerRefusal;
     }
     expect(refusal).toBeInstanceOf(ChildWorkerRefusal);
-    expect(refusal?.code).toBe('parent_expired');
+    expect(refusal?.code).toBe('job_held');
     expect(refusal?.message).toMatch(/is parked/);
     expect(h.ledger.listChildWorkers({ parentAgentId: 'parent-1' })).toHaveLength(0);
     h.close();

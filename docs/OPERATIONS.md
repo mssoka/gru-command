@@ -191,9 +191,10 @@ explicit owner hold. It is an administrative state, not proof that a
 producer stopped, so the service answers the two facts separately.
 
 - **The hold refuses new work.** Initial dispatch already refuses a parked
-  lane; a fresh child worker is refused (`409 parent_expired`) and a new
+  lane; a fresh child worker is refused (`409 job_held`) and a new
   verification is refused with `409 job_held` (`verification.refused` is
-  recorded). Review handoffs already require a working/delivered/in-review
+  recorded); a duplicate `request_id` still attaches or replays.
+  Review handoffs already require a working/delivered/in-review
   status and are revoked by parking.
 - **Live producers are physically stopped.** The service disposes every
   runtime handle bound to the job, cancels tracked child workers and
@@ -211,6 +212,10 @@ producer stopped, so the service answers the two facts separately.
   back to a working status. The stop record and the hold are separate rows,
   so a later reader can tell an administrative hold from a proven producer
   stop.
+- **A restart re-proves the stop.** A crash between `requested` and the
+  verdict, or an unproven residue, is retried at the next boot for lanes
+  that are still parked; shutdown joins an in-flight pass (bounded) before
+  the wave and runtime teardown it drives.
 
 ## Administrative closeout of a parked PR-backed lane
 

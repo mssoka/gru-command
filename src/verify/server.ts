@@ -402,23 +402,6 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
       json(res, 404, { error: 'job_not_found', detail: `job "${jobId}" not found` });
       return;
     }
-    // Issue #455: parking is an explicit owner hold. A new verification
-    // request arriving after the hold is refused at the operation boundary
-    // and recorded — never admitted on the strength of an older turn.
-    if (job.status === 'parked') {
-      ledger.appendCustomEvent({
-        kind: 'verification.refused',
-        jobId,
-        payload: { scope, code: 'job_held', status: job.status },
-      });
-      json(res, 409, {
-        error: 'job_held',
-        detail:
-          `job "${jobId}" is parked — an explicit owner hold admits no new verification; ` +
-          'resume the lane first',
-      });
-      return;
-    }
     const lane = worktrees
       .listWorktrees({ jobId })
       .find((candidate) => candidate.kind === 'job' && candidate.status !== 'swept');
@@ -449,6 +432,30 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
         declared_scopes: Object.keys(manifest.verify).sort(),
       });
       return;
+    }
+
+    // Issue #455: parking is an explicit owner hold. A NEW verification is
+    // refused at the operation boundary and recorded; an attached duplicate
+    // or a request_id replay is an existing producer/record, not a new
+    // admission, and still reconciles below. The scope is already validated,
+    // so the refusal row names a declared scope.
+    if (job.status === 'parked') {
+      const prior = requestId === undefined ? 'unknown' : scheduler.attemptStatus({ requestId }).state;
+      const existing = prior === 'accepted' || prior === 'running' || prior === 'completed';
+      if (!existing) {
+        ledger.appendCustomEvent({
+          kind: 'verification.refused',
+          jobId,
+          payload: { scope, command, code: 'job_held', status: job.status },
+        });
+        json(res, 409, {
+          error: 'job_held',
+          detail:
+            `job "${jobId}" is parked — an explicit owner hold admits no new verification; ` +
+            'resume the lane first (an existing request_id still reconciles)',
+        });
+        return;
+      }
     }
 
     // Exact-head evidence (issue #159): when the caller names the head it
