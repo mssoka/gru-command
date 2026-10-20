@@ -176,7 +176,8 @@ How `POST /api/vector/raids` behaves:
   - The caps are `max_rounds` attacks, `max_runs` sandboxed runs, the
     `max_raid_ms` wall clock and `max_raid_tokens`.
   - Token usage is each Vector session's context size at the end of its
-    round, as the runtime reports it. The token cap counts the rounds that
+    round, as the runtime reports it (pi and claude-code both do; see
+    `docs/RUNTIMES.md`, "Context controls"). The token cap counts the rounds that
     reported usage. When a round reports none, the report says how many
     did not, and the round, run and time caps bound the rest.
   - One attack costs at least three runs: both controls and the attack. A

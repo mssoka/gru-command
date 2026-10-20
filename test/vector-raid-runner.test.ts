@@ -3,14 +3,17 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, sy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { DEFAULT_VECTOR_CONFIG, type VectorConfig } from '../src/config.js';
+import { configPathFor, DEFAULT_VECTOR_CONFIG, loadConfig, type VectorConfig } from '../src/config.js';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import { propertyCampaignRunningForReview, propertyEvidenceForReview, type PropertyCampaignResult } from '../src/property/pipeline.js';
 import type { PackageResolution, RetainedCounterexample } from '../src/property/types.js';
+import { ClaudeCodeRuntime } from '../src/runtime/claude-adapter.js';
+import { withFallbacks } from '../src/runtime/fallbacks.js';
 import type { AgentHandle, IsolatedReviewPolicy } from '../src/runtime/types.js';
+import { SessionStore } from '../src/sessions/store.js';
 import { metricsOf, RAID_OUTCOMES, raidsTowardCap, repositoryRollups, VECTOR_EVENTS, ZERO_BREAK_IN_FLAG_RAIDS, type RaidRecord } from '../src/vector/ledger.js';
 import { isAttackPathFault, NODE_CONTROL_FS, raidOutcomeLabel, VectorRaidRunner, type ControlFs, type RaidCampaign } from '../src/vector/runner.js';
 import { FIX_DISPATCH_FAILED_KIND, FIX_DISPATCHED_KIND, FIX_PROPOSAL_KIND, VectorService } from '../src/vector/service.js';
@@ -138,7 +141,9 @@ function harness(opts: { readonly scripts: Script[]; readonly vector?: Partial<V
   /** Every fetch of origin fails (the cached default branch decides). */
   readonly fetchFails?: boolean;
   /** Control file operations to override (the rest are node:fs). */
-  readonly controlFs?: Partial<ControlFs>; } ): RunnerHarness {
+  readonly controlFs?: Partial<ControlFs>;
+  /** Vector on a real runtime instead of the scripted session. */
+  readonly spawnVector?: (input: { readonly policy: IsolatedReviewPolicy; readonly cwd: string }) => Promise<AgentHandle>; } ): RunnerHarness {
   const root = tempDir('gru-vector-runner-');
   const repo = join(root, 'billing');
   mkdirSync(join(repo, 'src', 'refunds'), { recursive: true });
@@ -172,7 +177,7 @@ function harness(opts: { readonly scripts: Script[]; readonly vector?: Partial<V
   } as unknown as RunnerHarness;
   let deadline: (() => void) | null = null;
   let current: Script = {};
-  const spawnVector = fakeVector(() => { current = queue.shift() ?? { attack: null }; return current; }, opts.tokens === undefined ? 1000 : opts.tokens);
+  const spawnVector = opts.spawnVector ?? fakeVector(() => { current = queue.shift() ?? { attack: null }; return current; }, opts.tokens === undefined ? 1000 : opts.tokens);
   const campaign: RaidCampaign = {
     run: async (spec, artifactsDir) => {
       h.lastSpec = spec;
@@ -196,7 +201,7 @@ function harness(opts: { readonly scripts: Script[]; readonly vector?: Partial<V
   const runner = new VectorRaidRunner({
     vector, workspaceRoot: root, ledger, raidsDir: join(dataDir, 'vector', 'raids'),
     spawnVector: async (input) => { h.spawned += 1; return spawnVector(input); },
-    disposeVector: async () => {},
+    disposeVector: (handle) => handle.dispose(),
     heistWorkWaiting: () => h.heistWaiting,
     notifications,
     onBreakIn: (breakIn) => { void service.onBreakIn(breakIn.id); },
@@ -323,6 +328,31 @@ describe('Silas\'s raid queue (#351 §3)', () => {
     const report = JSON.parse(readFileSync(raid(h, id).reportFile!, 'utf8')) as { metrics: { tokens: number; roundsWithoutTokenUsage: number }; token_usage: string; cost_per_break_in: unknown };
     expect(report.metrics).toMatchObject({ tokens: 0, roundsWithoutTokenUsage: 1, totalTokenCost: null });
     expect(report).toMatchObject({ cost_per_break_in: null, token_usage: expect.stringMatching(/^1 round\(s\) reported no usage; the token cap counted the rounds that did/u) });
+  });
+
+  it('a Claude-runtime round adds its provider-reported tokens toward the cap (#461)', async () => {
+    const home = tempDir('gru-vector-claude-');
+    const workspace = tempDir('gru-vector-claude-ws-');
+    writeFileSync(configPathFor(home), `workspace_root = "${workspace}"\n`, 'utf-8');
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    const claude = withFallbacks(new ClaudeCodeRuntime({
+      config,
+      store: new SessionStore(config.dataDir),
+      binary: join(import.meta.dirname, 'helpers', 'claude-double.mjs'),
+      reviewSettingsFile: join(home, 'absent-review-settings.json'),
+    }));
+    // One recorded turn (2 + 643 + 77,264 of a 1,000,000 window) stands in for Vector's session.
+    process.env['CLAUDE_DOUBLE_REPLAY'] = join(import.meta.dirname, 'fixtures', 'claude-stream', 'context-usage-turn.jsonl');
+    try {
+      const h = harness({ vector: { maxRounds: 1 }, scripts: [], spawnVector: ({ policy, cwd }) => claude.spawn('perkins', { cwd, isolatedReview: policy }) });
+      const id = h.launch();
+      await h.runner.tick();
+      expect(h.spawned).toBe(1);
+      const report = JSON.parse(readFileSync(raid(h, id).reportFile!, 'utf8')) as { metrics: { tokens: number; roundsWithoutTokenUsage: number } };
+      expect(report.metrics).toMatchObject({ tokens: 77_909, roundsWithoutTokenUsage: 0 });
+    } finally {
+      delete process.env['CLAUDE_DOUBLE_REPLAY'];
+    }
   });
 
   it('main moving mid-raid voids it: no evidence crosses heads, not even a break-in', async () => {

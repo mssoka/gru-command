@@ -70,8 +70,18 @@ single-operation queue.
   and emits exactly one failed terminal if disposal wins. The terminal event is
   the result authority (missing/failed terminals reject), and the adapter
   verifies the session id/file did not change.
-- **Claude Code:** print mode does not expose trustworthy whole-context
-  usage, so usage is deliberately unavailable. Compaction runs native
+- **Claude Code:** usage is measured live from each turn's stream-json and
+  never seeded from transcripts. `tokens` is `input_tokens +
+  cache_creation_input_tokens + cache_read_input_tokens` of the turn's
+  latest main-thread assistant frame. The blocks of one API message repeat
+  that call's usage, so the latest frame replaces and never adds. Frames
+  with a `parent_tool_use_id` belong to subagents and never count, and the
+  CLI's synthetic API-error message is not an API call. `contextWindow` is
+  the result frame's `modelUsage[<that frame's model>].contextWindow`; that
+  map's token counts are cumulative over the turn and are not used. Usage is
+  `null` when the window is missing, from the start of a turn or compaction
+  until a turn ends with a measured result, and on a fresh or resumed handle
+  before its first such turn. Compaction runs native
   `/compact` through a dedicated `--resume <same uuid>` machine-output
   process. Its frames append to the same product transcript for forensics,
   but a control-only translator suppresses all command output from chat.

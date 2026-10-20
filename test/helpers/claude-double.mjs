@@ -59,6 +59,9 @@
  *   CLAUDE_DOUBLE_WORKFLOW_CANDIDATE=1 emit one security finding plus verifier response
  *   CLAUDE_DOUBLE_GRU_ACT={baseUrl,token,detail} on a wake prompt, POST the
  *                               notification disposition itself (Gru-authored action)
+ *   CLAUDE_DOUBLE_REPLAY=<file> after init, every non-/compact turn is that
+ *                               file's recorded stream-json frames (session id
+ *                               re-stamped), e.g. test/fixtures/claude-stream/
  *   CLAUDE_DOUBLE_ECHO=mutate|skip  the prompt echo carries other text, or never comes
  *   CLAUDE_DOUBLE_TOOL_INPUT_DRIFT=1 the permission request names other input than the tool_use
  */
@@ -443,6 +446,15 @@ async function run() {
     out(assistantFrame([{ type: 'tool_use', id: 'toolu_interrupted', name: 'Bash', input: { command: 'make' } }]));
     process.stderr.write('double died mid-turn\n');
     process.exit(2);
+  }
+
+  const recorded = process.env['CLAUDE_DOUBLE_REPLAY'];
+  if (recorded !== undefined && recorded !== '' && prompt !== '/compact') {
+    // The real CLI's recorded machine frames, verbatim but for the session id.
+    for (const line of readFileSync(recorded, 'utf8').split('\n')) {
+      if (line.trim() !== '') out({ ...JSON.parse(line), session_id: sessionId });
+    }
+    return;
   }
 
   const gruAct = process.env['CLAUDE_DOUBLE_GRU_ACT'];

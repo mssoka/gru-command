@@ -20,8 +20,10 @@ import { ChatFrameLog } from '../src/chat/frame-log.js';
 import { createChatServer, type ChatServer } from '../src/chat/server.js';
 import { AWARENESS_WAKE_INSTRUCTION, type AwarenessInjection, type GruAwarenessPort } from '../src/chat/awareness.js';
 import { GruSessionPointer, SESSION_STATE_NAME } from '../src/chat/session-state.js';
-import type { GruCommandConfig } from '../src/config.js';
+import { configPathFor, loadConfig, type GruCommandConfig } from '../src/config.js';
+import { ClaudeCodeRuntime } from '../src/runtime/claude-adapter.js';
 import { withFallbacks } from '../src/runtime/fallbacks.js';
+import { SessionStore } from '../src/sessions/store.js';
 import type {
   AgentCapabilities,
   AgentHandle,
@@ -40,6 +42,9 @@ import type {
  */
 
 const TOKEN = 'test-token';
+/** The stubbed `claude` CLI and one recorded turn it can replay (#461). */
+const CLAUDE_DOUBLE = join(import.meta.dirname, 'helpers', 'claude-double.mjs');
+const RECORDED_TURN = join(import.meta.dirname, 'fixtures', 'claude-stream', 'context-usage-turn.jsonl');
 const cleanupDirs: string[] = [];
 afterAll(() => {
   for (const dir of cleanupDirs) rmSync(dir, { recursive: true, force: true });
@@ -307,6 +312,8 @@ async function makeHarness(options: {
    * legacy single-failure tests keep retrying immediately). */
   readonly spawnBackoffBaseMs?: number;
   readonly spawnBackoffMaxMs?: number;
+  /** Gru on a real runtime instead of the stub (the stub stays `h.handle`). */
+  readonly spawnGru?: (resumeFile: string | null) => Promise<AgentHandle>;
 } = {}): Promise<Harness> {
   const dir = options.reuseDir ?? mkdtempSync(join(tmpdir(), 'gru-command-e4-'));
   cleanupDirs.push(dir);
@@ -360,6 +367,7 @@ async function makeHarness(options: {
     ...(options.siblingUpgradePaths !== undefined ? { siblingUpgradePaths: options.siblingUpgradePaths } : {}),
     spawnGru: (resumeFile) => {
       spawnCalls.push(resumeFile);
+      if (options.spawnGru !== undefined) return options.spawnGru(resumeFile);
       if (spawnFailure !== null) {
         const error = spawnFailure;
         spawnFailure = null;
@@ -2012,6 +2020,68 @@ describe('chat context controls and durable new-chat boundaries', () => {
       await reader.close();
     } finally {
       await h.close();
+    }
+  });
+
+  it('a claude-code Gru idle after a measured turn reports its provider usage; busy and compacting carry none (#461)', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'gru-command-claude-chat-'));
+    const workspace = mkdtempSync(join(tmpdir(), 'gru-command-claude-chat-ws-'));
+    cleanupDirs.push(home, workspace);
+    writeFileSync(configPathFor(home), `workspace_root = "${workspace}"\n`, 'utf-8');
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    const claude = withFallbacks(new ClaudeCodeRuntime({
+      config,
+      store: new SessionStore(config.dataDir),
+      binary: CLAUDE_DOUBLE,
+      reviewSettingsFile: join(home, 'absent-review-settings.json'),
+    }));
+    process.env['CLAUDE_DOUBLE_REPLAY'] = RECORDED_TURN;
+    const h = await makeHarness({ spawnGru: () => claude.spawn('gru') });
+    try {
+      const writer = await authedClient(h.port, TOKEN, undefined, true);
+      writer.send('how full is the context?', 'claude-measure');
+      await writer.waitFor(isTurnEndFrame, 'measured claude turn', 10_000);
+      expect(
+        await writer.waitFor(
+          (frame) => frame.type === 'context' && frame.state === 'idle' && frame.usage !== null,
+          'measured idle context',
+          10_000,
+        ),
+      ).toMatchObject({ session_active: true, usage: { tokens: 77_909, context_window: 1_000_000, percent: 7.7909 } });
+      const busy = writer.frames.filter((frame) => frame.type === 'context' && frame.state === 'busy');
+      expect(busy.length).toBeGreaterThan(0);
+      expect(busy.every((frame) => frame.type === 'context' && frame.usage === null)).toBe(true);
+
+      writer.control('compact', 'claude-compact');
+      const compacting = await writer.waitFor((frame) => frame.type === 'context' && frame.state === 'compacting', 'compacting context');
+      expect(compacting).toMatchObject({ usage: null });
+      const after = (index: number) => (frame: Received) => writer.frames.indexOf(frame) > index;
+      const compactingAt = writer.frames.indexOf(compacting);
+      expect(
+        await writer.waitFor(
+          (frame) => frame.type === 'control_result' && frame.request_id === 'claude-compact',
+          'compact result',
+          10_000,
+        ),
+      ).toMatchObject({ ok: true });
+      // Compaction leaves no measurement until the next measured turn.
+      const compacted = await writer.waitFor(
+        (frame) => after(compactingAt)(frame) && frame.type === 'context' && frame.state === 'idle',
+        'idle after compact',
+      );
+      expect(compacted).toMatchObject({ session_active: true, usage: null });
+      writer.send('and after compacting?', 'claude-after-compact');
+      expect(
+        await writer.waitFor(
+          (frame) => after(writer.frames.indexOf(compacted))(frame) && frame.type === 'context' && frame.state === 'idle' && frame.usage !== null,
+          'measured again after compact',
+          10_000,
+        ),
+      ).toMatchObject({ usage: { tokens: 77_909, context_window: 1_000_000, percent: 7.7909 } });
+      await writer.close();
+    } finally {
+      await h.close();
+      delete process.env['CLAUDE_DOUBLE_REPLAY'];
     }
   });
 
