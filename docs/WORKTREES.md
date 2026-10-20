@@ -448,11 +448,19 @@ the receipt intact does it act: a committed ref with no checkout is
 resumed at ITS recorded base (the creation is never re-based onto a moved
 head), a checkout whose admin entry carries the same token is rolled back
 and remade, and a transaction that never committed is closed as spent.
-The retry performs no second creation transaction, so a lost response
-cannot author a duplicate branch.
+On the resume path the retry performs no second creation transaction, so a
+lost response cannot author a duplicate branch; a transaction that never
+committed is closed as spent and a fresh one starts.
+
+Only branch-creating lanes keep a receipt — job lanes and writer children.
+Review lanes and read-only child lanes create no branch, so a crash inside
+their `worktree add` is no more reconcilable than before.
 
 A ref with no receipt is still refused: absence of a record is never
-evidence that an earlier attempt did not run.
+evidence that an earlier attempt did not run. A receipt whose every
+resource is gone (no ref, no ref lock, no administration entry, no
+checkout) protects nothing, and is closed rather than left to fence a
+branch after the lane root or repository path moves.
 
 ## 5. Concurrency (18e)
 

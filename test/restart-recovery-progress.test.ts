@@ -777,6 +777,23 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(retired.record.state).toBe('retired');
   });
 
+  it('an interrupted preparation that journaled a producer but retained no target stays retirable (#453)', async () => {
+    const f = await fixture();
+    // The crash window's durable residue: the physical producer journal was
+    // flushed, while the ledger never recorded a target or a start. No native
+    // turn can have run, so this must not fence the request forever.
+    prepareDirectiveProducer({ identity: f.identity, agentId: 'logical-minion', sessionId: f.native.sessionId, sessionFile: f.file });
+    expect(f.ledger.getDirective(f.intent.requestId)?.nativeTarget).toBeNull();
+    expect(f.ledger.latestJobEventByRequestId(f.intent.jobId, 'silas.directive-producer-started', f.intent.requestId)).toBeNull();
+    expect(f.native.prompts).toEqual([]);
+    const head = resolveGitCommit(f.lane.path, 'HEAD');
+    const retired = f.ledger.retireInterruptedDirective({ requestId: f.intent.requestId, expectedJobId: f.intent.jobId,
+      expectedState: 'dispatching', expectedPayloadHash: f.intent.payloadHash, expectedHead: head,
+      lane: { id: f.lane.id, resolvedHead: head },
+      reason: 'interrupted before any target was retained', by: 'gru' });
+    expect(retired.record.state).toBe('retired');
+  });
+
   async function assertStaleTerminalTail(tail: 'user' | 'branch' | 'assistant' | 'partial') {
     const f = await fixture(); f.seed(); f.native.finish();
     expect(inspectDirectiveCheckpoint(f.file, f.identity)).toMatchObject({ state: 'terminal', ok: true });

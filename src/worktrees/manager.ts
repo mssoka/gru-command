@@ -33,7 +33,7 @@ import {
   rm as rmAsync,
   symlink as symlinkAsync,
 } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { LogLevel } from '../logger.js';
 import type { LedgerApi, WorktreeBaseSource, WorktreeRecord } from '../ledger/api.js';
@@ -1345,9 +1345,7 @@ export class WorktreeManager {
       // not actually branch from (the 'freshHead lie' of 2026-09-23). A
       // retained receipt keeps ITS fixed base — reconciliation never
       // re-bases an interrupted creation onto a moved head.
-      const base = retained !== null
-        ? { sha: retained.sha, baseSource: retained.baseSource ?? 'origin' as const, defaultBranch: null, fallbackDetail: null }
-        : this.resolveBase(repo.repoPath);
+      const base = retained !== null ? this.adoptedBase(retained) : this.resolveBase(repo.repoPath);
       const sha = base.sha;
       const custody = retained !== null ? this.adoptedCustody(retained, lane) : this.creationCustody(branch, sha, lane, base.baseSource);
       let record;
@@ -2698,6 +2696,15 @@ export class WorktreeManager {
 
   /** Issue #453: a retained receipt's fixed base and token are adopted as
    * the ONLY authority for finishing that same creation. */
+  /** A retained job receipt records the provenance its creation resolved.
+   * A guessed source would make the registry row claim a base it never had. */
+  private adoptedBase(retained: CreationIntent): ResolvedBase {
+    if (retained.baseSource === null) {
+      throw new CreationIntentError(`retained creation receipt for branch ${retained.branch} has no base provenance — refusing to record a guess`);
+    }
+    return { sha: retained.sha, baseSource: retained.baseSource, defaultBranch: null, fallbackDetail: null };
+  }
+
   private adoptedCustody(retained: CreationIntent, lane: CreationIntentLane): CreationCustody {
     return { token: retained.token, branch: retained.branch, sha: retained.sha, lane, baseSource: retained.baseSource, branchCreated: true, addAttempted: true };
   }
@@ -2736,15 +2743,38 @@ export class WorktreeManager {
     const refuse = (detail: string): never => {
       throw new CreationIntentError(`retained creation receipt for branch ${branch} ${detail} — resources retained, inspect before retrying`);
     };
+    // A live same-host writer is not history to reconcile: the recorded pid
+    // is no cessation proof, but a LIVE one proves a creation is in flight.
+    // This process's own pid is the ordinary in-process retry.
+    if (retained.host === hostname() && retained.pid !== process.pid) {
+      let live = true;
+      try { process.kill(retained.pid, 0); } catch (error) { live = (error as NodeJS.ErrnoException).code !== 'ESRCH'; }
+      if (live) refuse(`was written by live process ${retained.pid} on this host — another invocation owns this creation`);
+    }
+    const ref = `refs/heads/${branch}`;
+    const lock = join(common, 'refs/heads', `${branch}.lock`);
+    const tip = spawnGit(repoPath, ['rev-parse', '--verify', '--quiet', ref]);
+    const checkout = existsSync(retained.lane.path);
+    const admins = this.creationAdminEntries(retained.lane.path, common);
+    // A receipt whose every resource is gone protects nothing. Close it and
+    // let the ordinary creation proceed, whatever the root, repository path
+    // or repository name is now: a spent receipt must never fence a branch.
+    if (tip.status !== 0 && !existsSync(lock) && admins.length === 0 && !checkout) {
+      clearCreationIntent(common, branch, retained.token);
+      this.log('info', 'retained lane creation receipt closed with nothing left to protect', { branch, lane: retained.lane.id });
+      return null;
+    }
+    // A live ref transaction is git's own lock, not this receipt's to judge.
+    if (existsSync(lock)) refuse(`has an unsettled ref transaction (${lock})`);
+    // Publication owns a registered lane; this receipt never may.
+    if (this.opts.ledger.getWorktree(lane.id) !== null) {
+      refuse('names a lane the ledger already registered — publication owns it, not this receipt');
+    }
     if (retained.repoPath !== repoPath) refuse(`names repository ${retained.repoPath}, not ${repoPath}`);
     if (retained.lane.id !== lane.id || retained.lane.kind !== lane.kind || retained.lane.jobId !== lane.jobId ||
         retained.lane.roundId !== lane.roundId || retained.lane.path !== lane.path) {
       refuse(`belongs to another lane (${retained.lane.kind} ${retained.lane.id} at ${retained.lane.path})`);
     }
-    const lock = join(common, 'refs/heads', `${branch}.lock`);
-    if (existsSync(lock)) refuse(`has an unsettled ref transaction (${lock})`);
-    const ref = `refs/heads/${branch}`;
-    const tip = spawnGit(repoPath, ['rev-parse', '--verify', '--quiet', ref]);
     const custody: CreationCustody = { token: retained.token, branch, sha: retained.sha, lane: retained.lane,
       baseSource: retained.baseSource, branchCreated: tip.status === 0, addAttempted: true };
     const abandon = async (): Promise<null> => {
@@ -3086,24 +3116,47 @@ export class WorktreeManager {
 
   /** A failed hook can remove the checkout while leaving Git's locked
    * administration entry. Its backlink and nonce still prove custody. */
-  private orphanCreationAdmin(repoPath: string, path: string, custody: CreationCustody,
-    common = realpathSync(runGit(repoPath, ['rev-parse', '--path-format=absolute', '--git-common-dir']))): string | null {
+  /** Administration entries whose backlink names exactly `path`. An entry
+   * that names no path at all is skipped: one unrelated half-written
+   * administration must not make every creation in the repository fail. */
+  private creationAdminEntries(path: string, common: string): readonly string[] {
     const container = join(common, 'worktrees');
-    if (!existsSync(container)) return null;
-    const expected = join(realpathSync(dirname(path)), basename(path), '.git');
+    if (!existsSync(container)) return [];
+    let expected: string;
+    try { expected = join(realpathSync(dirname(path)), basename(path), '.git'); }
+    catch { expected = join(dirname(path), basename(path), '.git'); } // a removed lane root is compared as written
+    const admins: string[] = [];
     for (const entry of readdirSync(container, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
       const admin = join(container, entry.name);
-      const backlink = resolve(admin, readWorktreeMetadata(join(admin, 'gitdir')).trim());
-      if (backlink !== expected) continue;
-      readWorktreeMetadata(join(admin, 'HEAD'));
-      if (realpathSync(resolve(admin, readWorktreeMetadata(join(admin, 'commondir')).trim())) !== common) throw new Error('orphan creation common directory changed');
-      if (readWorktreeMetadata(join(admin, 'locked')).trim() !== custody.token) {
-        throw new Error('orphaned worktree custody receipt does not match this invocation');
-      }
-      return admin;
+      let backlink: string;
+      try { backlink = resolve(admin, readWorktreeMetadata(join(admin, 'gitdir')).trim()); }
+      catch { continue; } // an unrelated, torn administration is not this lane's evidence
+      if (backlink === expected) admins.push(admin);
     }
-    return null;
+    return admins;
+  }
+
+  private orphanCreationAdmin(repoPath: string, path: string, custody: CreationCustody,
+    common = realpathSync(runGit(repoPath, ['rev-parse', '--path-format=absolute', '--git-common-dir']))): string | null {
+    const admins = this.creationAdminEntries(path, common);
+    if (admins.length === 0) return null;
+    if (admins.length > 1) {
+      throw new CreationIntentError(`several worktree administrations claim ${path} (${admins.join(', ')}) — inspect them before retrying`);
+    }
+    const admin = admins[0]!;
+    try {
+      readWorktreeMetadata(join(admin, 'HEAD'));
+      if (realpathSync(resolve(admin, readWorktreeMetadata(join(admin, 'commondir')).trim())) !== common) {
+        throw new Error('names a different common directory');
+      }
+      if (readWorktreeMetadata(join(admin, 'locked')).trim() !== custody.token) {
+        throw new Error(`is locked for another creation, not ${custody.token}`);
+      }
+    } catch (error) {
+      throw new CreationIntentError(`lane administration ${admin} belongs to ${path} but ${error instanceof Error ? error.message : String(error)} — inspect it before retrying`, { cause: error });
+    }
+    return admin;
   }
 
   private handoffLane(repoPath: string, path: string, custody: CreationCustody, record: WorktreeRecord, assertSource?: () => void): void {
@@ -3171,12 +3224,17 @@ export class WorktreeManager {
   }
 
   private branchHasForeignHolder(trees: string, ref: string, ownedPath: string | null): boolean {
+    // A removed lane root is compared as written: a missing directory is a
+    // refusal reason, not a bare ENOENT out of the custody proof.
+    const canonical = (path: string): string => {
+      try { return join(realpathSync(dirname(path)), basename(path)); } catch { return join(dirname(path), basename(path)); }
+    };
     return trees.split('\0\0').some((entry) => {
       const fields = entry.split('\0');
       if (!fields.includes(`branch ${ref}`)) return false;
       const tree = fields.find((field) => field.startsWith('worktree '))?.slice('worktree '.length);
       return ownedPath === null || tree === undefined ||
-        join(realpathSync(dirname(tree)), basename(tree)) !== join(realpathSync(dirname(ownedPath)), basename(ownedPath));
+        canonical(tree) !== canonical(ownedPath);
     });
   }
 

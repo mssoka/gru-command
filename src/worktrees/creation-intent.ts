@@ -29,6 +29,7 @@ import { closeSync, fsyncSync, linkSync, mkdirSync, openSync, readFileSync, unli
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 import type { WorktreeBaseSource } from '../ledger/api.js';
+import { CREATION_TOKEN } from './handoff.js';
 
 /** Where a lane's creation receipt lives, under the repository's common
  * directory: the same authority as the ref it protects, and readable
@@ -120,7 +121,10 @@ export function readCreationIntent(commonDir: string, branch: string): CreationI
   if (storedBranch !== branch) throw new CreationIntentError(`creation receipt ${file} names branch ${String(storedBranch)}, not ${branch}`);
   if (typeof sha !== 'string' || !SHA.test(sha)) throw new CreationIntentError(`creation receipt ${file} has a malformed base sha`);
   if (!(baseSource === null || baseSource === 'origin' || baseSource === 'local-head-fallback')) throw new CreationIntentError(`creation receipt ${file} has an unknown base source`);
-  if (typeof token !== 'string' || !token.startsWith(TOKEN_PREFIX) || token.length === TOKEN_PREFIX.length) throw new CreationIntentError(`creation receipt ${file} has a malformed creation token`);
+  // The canonical spelling every downstream receipt parser accepts — a token
+  // that only LOOKS like one would be adopted here and refused after
+  // registration, stranding a published lane (issue #453 review).
+  if (typeof token !== 'string' || !CREATION_TOKEN.test(token)) throw new CreationIntentError(`creation receipt ${file} has a malformed creation token`);
   if (typeof host !== 'string' || host === '' || !Number.isSafeInteger(pid) || (pid as number) <= 0) throw new CreationIntentError(`creation receipt ${file} has a malformed writer identity`);
   if (typeof createdAt !== 'string' || Number.isNaN(Date.parse(createdAt))) throw new CreationIntentError(`creation receipt ${file} has a malformed timestamp`);
   return { version: INTENT_VERSION, lane: assertLane(receipt['lane'], file), repoPath, branch, sha, baseSource, token, host, pid: pid as number, createdAt };
@@ -134,6 +138,7 @@ export function writeCreationIntent(commonDir: string, intent: Omit<CreationInte
   const file = receiptPath(commonDir, intent.branch);
   const receipt: CreationIntent = { version: INTENT_VERSION, ...intent, host: hostname(), pid: process.pid, createdAt: new Date().toISOString() };
   const temp = join(directory, `.${receipt.token.slice(TOKEN_PREFIX.length)}.tmp`);
+  let failed: unknown;
   try {
     mkdirSync(directory, { recursive: true });
     syncDirectory(commonDir); // the new directory's own entry is durable before it is used
@@ -143,12 +148,20 @@ export function writeCreationIntent(commonDir: string, intent: Omit<CreationInte
     linkSync(temp, file); // atomic publication, never an overwrite
     syncDirectory(directory);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-      throw new CreationIntentError(`branch ${intent.branch} already has an unreconciled creation receipt — inspect it before retrying`, { cause: error });
+    failed = error; // named below, after our own temporary name is gone
+  }
+  try { unlinkSync(temp); } catch (error) {
+    // Our own temporary name is absent when the exclusive open never ran.
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw new CreationIntentError(`temporary creation receipt ${temp} could not be removed`,
+        { cause: failed === undefined ? error : new AggregateError([failed, error], 'receipt publication and its temporary name both failed') });
     }
-    throw new CreationIntentError(`creation receipt for branch ${intent.branch} could not be published`, { cause: error });
-  } finally {
-    try { unlinkSync(temp); } catch { /* never created, or already removed */ }
+  }
+  if (failed !== undefined) {
+    if ((failed as NodeJS.ErrnoException).code === 'EEXIST') {
+      throw new CreationIntentError(`branch ${intent.branch} already has an unreconciled creation receipt — inspect it before retrying`, { cause: failed });
+    }
+    throw new CreationIntentError(`creation receipt for branch ${intent.branch} could not be published`, { cause: failed });
   }
   return receipt;
 }

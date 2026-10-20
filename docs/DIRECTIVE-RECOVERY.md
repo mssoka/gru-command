@@ -285,11 +285,17 @@ host and PID. Dispatch reservation is not native admission or producer start.
 The physical receipt is flushed before native execution, and the real Pi tool
 hook flushes exact assistant tool intent before a tool can run. Preparation
 attests the runtime's own idle/independence state and journals that physical
-producer BEFORE any target is retained (issue #453): a refused or interrupted
-preparation therefore leaves no target to fence forever, and a retained target
-can never exist without a physical producer record to inspect. A target whose
-producer journal is missing, torn or foreign is still UNKNOWN, never a
-fabricated never-started receipt. Native
+producer BEFORE any target is retained (issue #453): a refused preparation
+therefore leaves no target to fence forever, and a retained target can never
+exist without a physical producer record to inspect. A target whose producer
+journal is missing, torn or foreign is still UNKNOWN, never a fabricated
+never-started receipt. An INTERRUPTED preparation can leave that producer
+record with no target and no ledger start: the request stays retirable (no
+target, no correlated start), and only a newer producer on the same session
+must settle it — this record is a preparation artifact, not a delivered turn.
+The idle attestation is adapter-strength: Pi proves idle plus no independent
+bash controller, Claude Code proves idle only (its controller is recorded at
+spawn). Native
 independent bash controllers leave durable uncertainty until genuine cleanup.
 Only exact-incarnation cleanup or an original same-host PID returning ESRCH
 can establish original host cessation; a live/frozen/reused PID, foreign host,

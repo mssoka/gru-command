@@ -595,6 +595,11 @@ describe('child lane parent custody, called directly (#373)', () => {
       const dir = join(realpathSync(join(repoPath, '.git')), 'worktrees');
       return existsSync(dir) ? readdirSync(dir).sort() : [];
     };
+    /** Retained creation receipts (#453): a rolled-back attempt spends its own. */
+    const creationReceipts = (repoPath: string): string[] => {
+      const dir = join(realpathSync(join(repoPath, '.git')), 'gru-creation');
+      return existsSync(dir) ? readdirSync(dir).filter((entry) => entry.endsWith('.json')) : [];
+    };
     /** Every lane checkout under a manager's root, as `<repo>/<lane>`. */
     const checkouts = (root: string): string[] => (existsSync(root)
       ? readdirSync(root, { withFileTypes: true }).filter((entry) => entry.isDirectory())
@@ -619,6 +624,8 @@ describe('child lane parent custody, called directly (#373)', () => {
       // No checkout is left behind (a review lane is detached: it never had a branch).
       expect(checkouts(h.root), kind).toEqual(lanesBefore);
       if (kind === 'job') expect(git(repo.path, ['branch', '--list', `gru/${job.id}`])).toBe('');
+      // The creation receipt is spent with the rollback (#453).
+      expect(creationReceipts(repo.path), kind).toEqual([]);
     }
     // A child lane.
     const f = await parentFixture('custody-undurable');
@@ -628,6 +635,7 @@ describe('child lane parent custody, called directly (#373)', () => {
     } finally { fsHooks.beforeFsync = null; }
     f.childLeftNothing();
     expect(admins(f.repo.path)).toEqual([basename(f.admin)]);
+    expect(creationReceipts(f.repo.path)).toEqual([]);
   });
 
   it('a receipt gone after capture is refused by name at the next check', async () => {
