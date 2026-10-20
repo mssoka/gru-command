@@ -3360,7 +3360,7 @@ describe('Claude context usage from recorded stream-json (#461)', () => {
     expect(measure([...frames, synthetic, { ...result, is_error: true, api_error_status: 429 }])).toEqual(MEASURED);
   });
 
-  it('a fresh handle is unmeasured; a replayed turn measures; a turn without a result clears it', async () => {
+  it('a fresh handle is unmeasured; a replayed turn measures; a turn without a result clears it #contract:context-usage:claude-code', async () => {
     const fx = fixture();
     const handle = await fx.runtime.spawn('gru');
     try {
