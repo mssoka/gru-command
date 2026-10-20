@@ -2710,6 +2710,28 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       }
     });
 
+    it('a CLI that closes stdin under the prompt write fails the turn instead of crashing the service', async () => {
+      // The real failure: the CLI is gone before it reads its frame, so the
+      // stdin write rejects with EPIPE. An unhandled stream 'error' was an
+      // uncaught exception that took the whole service down (CI, no CLI).
+      const child = Object.assign(new EventEmitter(), {
+        stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+        pid: 4343, exitCode: null, signalCode: null, kill: () => true,
+      });
+      const fx = fixture({ spawnProcess: (() => child) as unknown as typeof spawn, killGraceMs: 20 });
+      const handle = await fx.runtime.spawn('gru');
+      const frames: string[] = [];
+      child.stdin.on('data', (chunk: Buffer) => frames.push(chunk.toString('utf8')));
+      const turn = handle.prompt('read this frame').catch((error: Error) => error.message);
+      await vi.waitFor(() => expect(frames.join('')).toContain('read this frame'));
+      // The adapter owns the stream error; the child's own close settles the turn.
+      expect(() => child.stdin.emit('error', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))).not.toThrow();
+      expect(fx.logs.some((line) => line.msg === 'claude stdin is closed; the prompt frame could not be written')).toBe(true);
+      child.emit('close', 1, null);
+      expect(await turn).toMatch(/claude ended via exit 1/u);
+      await handle.dispose();
+    });
+
     it('a turn admitted at the echo that never reaches a result is no delivery', async () => {
       const fx = fixture();
       const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
