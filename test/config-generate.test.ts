@@ -547,6 +547,7 @@ describe('config-generate CLI', () => {
       'enabled = true',
       '[silas.autopilot]',
       'enabled = true',
+      'default_mode = "enforce"',
       '[silas.autopilot.rules]',
       'verdict-rung-directive = "enforce"',
       'sweep-ack = "off"',
@@ -555,14 +556,16 @@ describe('config-generate CLI', () => {
     const forced = run(instance, ['--force']);
     expect(forced.status, `${forced.stdout}\n${forced.stderr}`).toBe(0);
     const raw = parse(readFileSync(join(instance, 'config.toml'), 'utf-8')) as Record<string, unknown>;
-    const silas = raw.silas as { autopilot: { enabled: boolean; rules: Record<string, string> } };
+    const silas = raw.silas as { autopilot: { enabled: boolean; default_mode: string; rules: Record<string, string> } };
     expect(silas.autopilot).toEqual({
       enabled: true,
+      default_mode: 'enforce',
       rules: { 'sweep-ack': 'off', 'verdict-rung-directive': 'enforce' },
     });
     const loaded = loadConfig({ GRU_COMMAND_HOME: instance }, root);
     expect(loaded.silas.autopilot).toEqual({
       enabled: true,
+      defaultMode: 'enforce',
       rules: { 'sweep-ack': 'off', 'verdict-rung-directive': 'enforce' },
     });
   });

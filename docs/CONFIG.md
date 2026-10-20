@@ -382,14 +382,17 @@ escalate_at = 4
 
 [silas.autopilot]
 # Issue #243: the unambiguous rule families executed in code, BEFORE any
-# LLM wake. `enabled` is the global kill switch (default off); every rule
-# defaults to `dry-run`, so enabling the autopilot never enforces a family
-# by itself.
+# LLM wake. `enabled` is the global kill switch (default off). Issue #443:
+# `default_mode` applies to EVERY family without an explicit entry below —
+# including families added by later releases — and defaults to `dry-run`,
+# so enabling the autopilot never enforces a family by itself.
 enabled = false
+default_mode = "dry-run"
 
 [silas.autopilot.rules]
 # Per-family mode: "off" (records nothing, calls nothing), "dry-run"
 # (records the would-call), or "enforce" (performs exactly one call).
+# A family listed here always overrides `default_mode`.
 
 [provider_recovery]
 # Provider-recovery sensor (owner-approved 2026-09-28): watches EXPLICIT

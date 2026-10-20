@@ -974,8 +974,9 @@ describe('dispatch config (E8)', () => {
       rebriefAt: 3,
       escalateAt: 4,
       // The autopilot is OFF by default (the owner's kill switch) and every
-      // family would default to dry-run once it is on (issue #243).
-      autopilot: { enabled: false, rules: {} },
+      // family defaults to dry-run once it is on (issue #243); `defaultMode`
+      // is the fallback every unlisted family follows (issue #443).
+      autopilot: { enabled: false, defaultMode: 'dry-run', rules: {} },
     });
   });
 
@@ -991,7 +992,7 @@ describe('dispatch config (E8)', () => {
       directiveAt: 1,
       rebriefAt: 2,
       escalateAt: 3,
-      autopilot: { enabled: false, rules: {} },
+      autopilot: { enabled: false, defaultMode: 'dry-run', rules: {} },
     });
     const bad: readonly string[] = [
       '[silas]\nunknown = 1\n',
@@ -1009,6 +1010,8 @@ describe('dispatch config (E8)', () => {
       '[silas.autopilot]\nenabled = true\n\n[silas.autopilot.rules]\nsweep-ack = "shadow"\n',
       '[silas.autopilot]\nenabled = "yes"\n',
       '[silas.autopilot]\nunknown_key = 1\n',
+      '[silas.autopilot]\ndefault_mode = "shadow"\n',
+      '[silas.autopilot]\ndefault_mode = true\n',
     ];
     for (const text of bad) {
       const h2 = tmpHome();
@@ -1021,8 +1024,46 @@ describe('dispatch config (E8)', () => {
     const home = tmpHome();
     expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').silas.autopilot).toEqual({
       enabled: false,
+      defaultMode: 'dry-run',
       rules: {},
     });
+  });
+
+  // Issue #443: one `default_mode` for every family, overridable per family.
+  it('applies default_mode with no per-family rules table at all', () => {
+    const home = tmpHome();
+    writeConfig(home, '[silas.autopilot]\nenabled = true\ndefault_mode = "enforce"\n');
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').silas.autopilot).toEqual({
+      enabled: true,
+      defaultMode: 'enforce',
+      rules: {},
+    });
+  });
+
+  it('parses default_mode and lets a per-family entry override it', () => {
+    const home = tmpHome();
+    writeConfig(
+      home,
+      '[silas.autopilot]\nenabled = true\ndefault_mode = "enforce"\n\n[silas.autopilot.rules]\nsweep-ack = "dry-run"\n',
+    );
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').silas.autopilot).toEqual({
+      enabled: true,
+      defaultMode: 'enforce',
+      rules: { 'sweep-ack': 'dry-run' },
+    });
+  });
+
+  it('names the invalid default_mode field on refusal', () => {
+    const home = tmpHome();
+    writeConfig(home, '[silas.autopilot]\ndefault_mode = "enforced"\n');
+    let error: ConfigError | undefined;
+    try {
+      loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    } catch (caught) {
+      error = caught as ConfigError;
+    }
+    expect(error?.field).toBe('silas.autopilot.default_mode');
+    expect(error?.message).toContain('"off", "dry-run", "enforce"');
   });
 
   it('parses one spelling per family mode, and names the invalid field on refusal', () => {
@@ -1034,6 +1075,7 @@ describe('dispatch config (E8)', () => {
     );
     expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').silas.autopilot).toEqual({
       enabled: true,
+      defaultMode: 'dry-run',
       rules: {
         'verdict-rung-directive': 'enforce',
         'delivered-pr-register': 'off',

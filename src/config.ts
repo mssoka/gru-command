@@ -391,17 +391,24 @@ export interface SilasConfig {
 export type SilasAutopilotRuleMode = 'off' | 'dry-run' | 'enforce';
 
 /**
- * Silas autopilot policy (issue #243). `enabled` is the global kill switch
- * — default OFF, so no autopilot decision is recorded or acted on until an
- * owner turns it on. `rules` overlays per-family modes on the `dry-run`
- * default: enabling the autopilot never enforces a family by itself.
+ * Silas autopilot policy (issue #243, issue #443). `enabled` is the global
+ * kill switch — default OFF, so no autopilot decision is recorded or acted
+ * on until an owner turns it on. `defaultMode` is the fallback every family
+ * without an explicit entry follows; it defaults to `dry-run`, so enabling
+ * the autopilot never enforces a family by itself. `rules` overlays
+ * per-family modes on that default.
  */
 export interface SilasAutopilotConfig {
   readonly enabled: boolean;
+  readonly defaultMode: SilasAutopilotRuleMode;
   readonly rules: Readonly<Record<string, SilasAutopilotRuleMode>>;
 }
 
-export const DEFAULT_SILAS_AUTOPILOT_CONFIG: SilasAutopilotConfig = { enabled: false, rules: {} };
+export const DEFAULT_SILAS_AUTOPILOT_CONFIG: SilasAutopilotConfig = {
+  enabled: false,
+  defaultMode: 'dry-run',
+  rules: {},
+};
 
 export const DEFAULT_SILAS_CONFIG: SilasConfig = {
   enabled: true,
@@ -1948,7 +1955,7 @@ const PACING_KEYS = [
  * which is exactly the mistake a rollout relies on this parser to catch. */
 function readSilasAutopilotConfig(value: unknown, file: string): SilasAutopilotConfig {
   const table = requireTable(value, file, 'silas.autopilot');
-  const VALID = ['enabled', 'rules'];
+  const VALID = ['enabled', 'default_mode', 'rules'];
   for (const key of Object.keys(table)) {
     if (!VALID.includes(key)) {
       throw new ConfigError(
@@ -1962,7 +1969,11 @@ function readSilasAutopilotConfig(value: unknown, file: string): SilasAutopilotC
     table['enabled'] !== undefined
       ? requireBool(table['enabled'], file, 'silas.autopilot.enabled')
       : DEFAULT_SILAS_AUTOPILOT_CONFIG.enabled;
-  if (table['rules'] === undefined) return { enabled, rules: {} };
+  const defaultMode =
+    table['default_mode'] === undefined
+      ? DEFAULT_SILAS_AUTOPILOT_CONFIG.defaultMode
+      : requireAutopilotMode(table['default_mode'], file, 'silas.autopilot.default_mode');
+  if (table['rules'] === undefined) return { enabled, defaultMode, rules: {} };
   const rulesTable = requireTable(table['rules'], file, 'silas.autopilot.rules');
   // Null-prototype map: a rule id like "__proto__" must land as an own
   // entry, never mutate the map's prototype or vanish silently.
@@ -1979,16 +1990,26 @@ function readSilasAutopilotConfig(value: unknown, file: string): SilasAutopilotC
         `silas.autopilot.rules.${ruleId}`,
       );
     }
-    if (mode !== 'off' && mode !== 'dry-run' && mode !== 'enforce') {
-      throw new ConfigError(
-        `silas.autopilot.rules.${ruleId} must be one of "off", "dry-run", "enforce", got: ${JSON.stringify(mode)}`,
-        file,
-        `silas.autopilot.rules.${ruleId}`,
-      );
-    }
-    rules[ruleId] = mode;
+    rules[ruleId] = requireAutopilotMode(mode, file, `silas.autopilot.rules.${ruleId}`);
   }
-  return { enabled, rules };
+  return { enabled, defaultMode, rules };
+}
+
+/** One spelling per mode. An unknown value is refused by name, with the
+ * accepted set, at the field that carried it (issue #443). */
+function requireAutopilotMode(
+  value: unknown,
+  file: string,
+  field: string,
+): SilasAutopilotRuleMode {
+  if (value !== 'off' && value !== 'dry-run' && value !== 'enforce') {
+    throw new ConfigError(
+      `${field} must be one of "off", "dry-run", "enforce", got: ${JSON.stringify(value)}`,
+      file,
+      field,
+    );
+  }
+  return value;
 }
 
 /** Parse a [pacing] table. Fail loud on unknown

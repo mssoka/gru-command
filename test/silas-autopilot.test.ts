@@ -18,6 +18,7 @@ import { BranchBusyError } from '../src/dispatch/branch-idle.js';
 import { createSilasAutopilotOps, type SilasAutopilotOpsDeps } from '../src/dispatch/silas-autopilot-ops.js';
 import { composeDeterministicPass, createSilasAutopilotHook } from '../src/dispatch/silas-autopilot-pass.js';
 import { ReviewInProgressError, WaveRunner } from '../src/dispatch/perkins.js';
+import { SILAS_AUTOPILOT_RULE_IDS } from '../src/dispatch/silas-rules.js';
 import type { AgentSpawner } from '../src/dispatch/service.js';
 import { SilasDriver } from '../src/dispatch/silas-driver.js';
 import { PacingGate } from '../src/runtime/pacing.js';
@@ -340,7 +341,10 @@ function deliveredRow(overrides: Partial<DeliveredWithoutPrRow> = {}): Delivered
   };
 }
 
-const enabled = (rules: SilasAutopilotConfig['rules'] = {}): SilasAutopilotConfig => ({ enabled: true, rules });
+const enabled = (
+  rules: SilasAutopilotConfig['rules'] = {},
+  defaultMode: NonNullable<SilasAutopilotConfig['defaultMode']> = 'dry-run',
+): SilasAutopilotConfig => ({ enabled: true, defaultMode, rules });
 
 // ------------------------------------------------------------------
 // The mode matrix
@@ -353,12 +357,27 @@ describe('autopilot mode resolution (kill switch + per-family modes)', () => {
     expect(autopilotRuleMode(enabled({ 'sweep-ack': 'enforce' }), 'sweep-ack')).toBe('enforce');
   });
 
+  // Issue #443: `default_mode` is the fallback for every unlisted family.
+  it('applies default_mode to unlisted families, while a per-family entry wins', () => {
+    expect(autopilotRuleMode(enabled({}, 'enforce'), 'sweep-ack')).toBe('enforce');
+    expect(autopilotRuleMode(enabled({}, 'enforce'), 'pr-review-trigger')).toBe('enforce');
+    expect(autopilotRuleMode(enabled({ 'sweep-ack': 'dry-run' }, 'enforce'), 'sweep-ack')).toBe('dry-run');
+    expect(autopilotRuleMode(enabled({ 'sweep-ack': 'off' }, 'enforce'), 'sweep-ack')).toBe('off');
+  });
+
+  it('applies default_mode to every family when no rules are configured', () => {
+    for (const ruleId of SILAS_AUTOPILOT_RULE_IDS) {
+      expect(autopilotRuleMode(enabled({}, 'enforce'), ruleId)).toBe('enforce');
+      expect(autopilotRuleMode(enabled({}, 'off'), ruleId)).toBe('off');
+    }
+  });
+
   it('a disabled autopilot records nothing and calls nothing', async () => {
     const ledger = new FakeLedger().job('job-release', 'done');
     const { ops, calls } = fakeOps();
     const result = await runSilasAutopilot({
       digest: digest({ releaseEligible: [releaseRow()] }),
-      config: { enabled: false, rules: { 'sweep-ack': 'enforce' } },
+      config: { enabled: false, defaultMode: 'enforce', rules: { 'sweep-ack': 'enforce' } },
       ledger: ledger.port,
       ops,
     });
@@ -1894,7 +1913,7 @@ describe('the production autopilot hook runs inside a driver trigger (issue #243
     const released: string[] = [];
     const hook = createSilasAutopilotHook({
       ledger: ledger as unknown as AutopilotLedger,
-      config: { enabled: true, rules: { 'sweep-ack': 'enforce' } },
+      config: { enabled: true, defaultMode: 'dry-run', rules: { 'sweep-ack': 'enforce' } },
       ops: {
         listOpenPrsForHead: async () => [],
         registerPr: async () => {},
@@ -1928,7 +1947,7 @@ describe('the production autopilot hook runs inside a driver trigger (issue #243
         escalateAt: 4,
         stallThresholdMs: 1_800_000,
         unchangedRewakeMs: 21_600_000,
-        autopilot: { enabled: true, rules: { 'sweep-ack': 'enforce' } },
+        autopilot: { enabled: true, defaultMode: 'dry-run', rules: { 'sweep-ack': 'enforce' } },
       },
       skills: [],
       now: () => 0,
@@ -3214,7 +3233,7 @@ describe('F-M4 the production composition fails the pass on either half failure'
         escalateAt: 4,
         stallThresholdMs: 1_800_000,
         unchangedRewakeMs: 21_600_000,
-        autopilot: { enabled: false, rules: {} },
+        autopilot: { enabled: false, defaultMode: 'dry-run', rules: {} },
       },
       skills: [],
       now: () => 0,
@@ -3276,7 +3295,7 @@ describe('F-M1 the real driver does not wake for verdict work an accepted produc
         escalateAt: 4,
         stallThresholdMs: 1_800_000,
         unchangedRewakeMs: 21_600_000,
-        autopilot: { enabled: false, rules: {} },
+        autopilot: { enabled: false, defaultMode: 'dry-run', rules: {} },
       },
       skills: [],
       now: () => 0,
