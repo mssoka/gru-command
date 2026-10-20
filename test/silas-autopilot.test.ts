@@ -377,7 +377,7 @@ describe('autopilot mode resolution (kill switch + per-family modes)', () => {
     const { ops, calls } = fakeOps();
     const result = await runSilasAutopilot({
       digest: digest({ releaseEligible: [releaseRow()] }),
-      config: { enabled: false, defaultMode: 'dry-run', rules: { 'sweep-ack': 'enforce' } },
+      config: { enabled: false, defaultMode: 'enforce', rules: { 'sweep-ack': 'enforce' } },
       ledger: ledger.port,
       ops,
     });
