@@ -76,10 +76,11 @@ describe('prune-stale-dist', () => {
     // verdict-publication-identity prerequisite check
     // (dist/dispatch/verdict-publication-identity.js); #453 the durable
     // creation receipt the worktree manager writes before its ref
-    // transaction (dist/worktrees/creation-intent.js).
-    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5219);
+    // transaction (dist/worktrees/creation-intent.js); #446 the
+    // default-branch CI alert (dist/repos/default-branch-ci.js).
+    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5220);
     expect(createHash('sha256').update(`${[...PUBLIC_REVIEW_EXECUTABLE_PATHS].sort().join('\n')}\n`).digest('hex'))
-      .toBe('fd12cfd1ee60db3d8363075963b946f249b47f5e76e12833bbc531aa4b3ac81f');
+      .toBe('4e55127ca771aab9ad2eedef99d22118aae262022a12f0cc30a0743957f0ec3a');
     const root = fixtureRoot();
     touch(root, 'src/worktrees/handoff.ts'); touch(root, 'dist/worktrees/handoff.js');
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', dependencies: {} }));

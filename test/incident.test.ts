@@ -7,6 +7,8 @@ import {
   isHardFloorRow,
   normalizeIncidentTitle,
 } from '../src/chat/incident.js';
+import { validateDecisionSignal, validateDecisionSubject } from '../src/ledger/decision-memory.js';
+import { defaultBranchCiFailedKind } from '../src/repos/default-branch-ci.js';
 
 /**
  * Incident identity (issue #219): the wake dedupes and consults hold
@@ -102,4 +104,35 @@ describe('incident identity — review additions (issue #219)', () => {
 it('concrete directive and historical rebrief recovery debt cannot be covered by a generic Ops hold', () => {
   expect(isHardFloorRow({ kind: 'silas.directive-unreconciled.request-286', title: 'recovery owed', routing: 'action-required' })).toBe(true);
   expect(isHardFloorRow({ kind: 'silas.rebrief-unreconciled.job-286', title: 'recovery owed', routing: 'action-required' })).toBe(true);
+});
+
+describe('incident identity — red default branch (#446)', () => {
+  const sha = '3684087c00000000000000000000000000000002';
+  const row = (kind: string) => ({ kind, title: 'Default branch develop is red: CI (acme/alpha)', routing: 'action-required' as const });
+
+  it('the producer kind maps to the repository subject, the ci-failed family and its head sha', () => {
+    const kind = defaultBranchCiFailedKind({ host: 'github.com', owner: 'acme', repo: 'alpha' }, 7, sha);
+    expect(kind).toBe(`github.default-branch-ci-failed:acme/alpha:7:${sha}`);
+    // Never a job subject: no lane owns a default branch.
+    expect(incidentSubjectOf(row(kind))).toBe('incident:github.default-branch-ci-failed:acme/alpha');
+    expect(incidentSignalOf(row(kind))).toBe('ci-failed');
+    // The basis is the sha alone, never `<workflowId>:<sha>`.
+    expect(incidentBasisOf(row(kind))).toBe(sha);
+    // The wake dedupe key stays the full kind: one incident per workflow + head.
+    expect(incidentKeyOf(row(kind))).toBe(kind);
+    expect(isHardFloorRow(row(kind))).toBe(false);
+  });
+
+  it('every workflow of one repository shares the subject; another repository does not', () => {
+    const subject = (repo: string, workflowId: number) =>
+      incidentSubjectOf(row(defaultBranchCiFailedKind({ host: 'github.com', owner: 'acme', repo }, workflowId, sha)));
+    expect(subject('alpha', 7)).toBe(subject('alpha', 71));
+    expect(subject('alpha-two', 7)).toBe('incident:github.default-branch-ci-failed:acme/alpha-two');
+  });
+
+  it('a decision recorded on the mapped subject passes the write-boundary validator', () => {
+    const kind = defaultBranchCiFailedKind({ host: 'github.com', owner: 'Acme-Org', repo: 'right.tenantry' }, 123456789, sha);
+    expect(validateDecisionSubject(incidentSubjectOf(row(kind)))).toBe('incident:github.default-branch-ci-failed:Acme-Org/right.tenantry');
+    expect(validateDecisionSignal(incidentSignalOf(row(kind)))).toBe('ci-failed');
+  });
 });

@@ -41,11 +41,18 @@ import { gitProbeEnvironment, resolveManagedRepoPath, type ManagedRepoPath } fro
  * deliberately unused because it folds PRs into issues. An
  * `incomplete_results` search is NOT presented as an exact count.
  *
- * The newest default-branch run is selected by (createdAt, id), so a
+ * The newest default-branch run (never a `pull_request*` or fork run that
+ * merely shares the branch name) is selected by (createdAt, id), so a
  * newer queued/running run supersedes an older passed one. `no-workflow`
  * requires the workflows endpoint to prove the repo has none — an empty
- * run page alone never infers it; with workflows present but no run on
- * the branch the state is `never-run`.
+ * run page alone never infers it; with workflows present but no
+ * default-branch run among the newest runs read (none at all, or only
+ * pull-request/fork runs) the state is `never-run`.
+ *
+ * The same run page feeds the default-branch CI alert (#446) through the
+ * optional `onDefaultBranchRuns` hook, called once per complete
+ * observation after the row is committed — no extra GitHub call, and a
+ * hook failure is logged without touching the row or the pass.
  */
 
 // ------------------------------------------------------------------
@@ -141,8 +148,10 @@ export const REPO_OVERVIEW_REFRESH_MS = 300_000;
 export const REPO_OVERVIEW_STALE_AFTER_MS = REPO_OVERVIEW_REFRESH_MS * 3;
 /** `gh` calls allowed per refresh (≈20 repos at ≤5 calls). */
 export const REPO_OVERVIEW_MAX_CALLS_PER_REFRESH = 100;
-/** Runs read per repository so the newest is selectable robustly. */
-export const REPO_OVERVIEW_RUNS_PER_FETCH = 3;
+/** Runs read per repository (one call): enough that the newest is
+ * selectable robustly and each workflow's latest finished run is usually
+ * on the page for the default-branch CI alert (#446). */
+export const REPO_OVERVIEW_RUNS_PER_FETCH = 20;
 /** Sustained search-API pacing: GitHub allows 30 Search requests/minute,
  * and every repository costs two. One search call every 2 s keeps the
  * pass inside the sustained quota instead of self-inflicting a 403 that
@@ -185,6 +194,34 @@ export interface RepoOverviewRunRaw {
    * a newer run was created. Never substituted for the creation key. */
   readonly startedAt: string | null;
   readonly updatedAt: string | null;
+  /** The run's workflow (`workflow_id`) — the default-branch alert's
+   * per-workflow verdict key; null when the provider omits it. */
+  readonly workflowId: number | null;
+  /** The commit the run tested (`head_sha`), lowercased; null unless it is hex. */
+  readonly headSha: string | null;
+  /** What triggered the run (`event`): a `pull_request*` run can share the
+   * default branch's name without testing it. */
+  readonly event: string | null;
+  /** Whether the head repository differs from the run's own repository,
+   * read from the same payload (ids, else full names); null when unknown.
+   * Never compared with the configured name: a renamed or transferred
+   * repository keeps its old name in the origin remote. */
+  readonly fromFork: boolean | null;
+}
+
+/** A run that tested the default branch itself: neither a fork's run nor a
+ * `pull_request*` run whose head branch merely shares the name (a gitflow
+ * release PR, a fork's `develop`). Unknown fork state counts as not a fork. */
+export function isDefaultBranchRun(run: Pick<RepoOverviewRunRaw, 'event' | 'fromFork'>): boolean {
+  return run.fromFork !== true && !(run.event ?? '').startsWith('pull_request');
+}
+
+/** The complete default-branch run page one observation read, handed to
+ * the default-branch CI alert (#446). */
+export interface DefaultBranchRunsObservation {
+  readonly repo: RepoRef;
+  readonly branch: string;
+  readonly runs: readonly RepoOverviewRunRaw[];
 }
 
 /** Actions endpoints can be permanently unavailable (Actions disabled):
@@ -233,6 +270,28 @@ function isoOrNull(value: unknown): string | null {
   return value;
 }
 
+/** The fork flag from one run payload: head and base repository ids when
+ * both are numbers, else their full names (case-insensitive), else null. */
+function fromForkOf(raw: Record<string, unknown>): boolean | null {
+  const head = record(raw['head_repository']);
+  const base = record(raw['repository']);
+  if (head === null || base === null) return null;
+  const headId = countOrNull(head['id']);
+  const baseId = countOrNull(base['id']);
+  if (headId !== null && baseId !== null) return headId !== baseId;
+  const headName = strOrNull(head['full_name']);
+  const baseName = strOrNull(base['full_name']);
+  if (headName !== null && baseName !== null) return headName.toLowerCase() !== baseName.toLowerCase();
+  return null;
+}
+
+/** A commit id is usable only as plain hex, lowercased: it is embedded in
+ * alert kinds and decision bases, where a separator or a case change would
+ * change the identity. */
+function shaOrNull(value: unknown): string | null {
+  return typeof value === 'string' && /^[0-9a-f]{7,64}$/iu.test(value) ? value.toLowerCase() : null;
+}
+
 /** Map a completed/incomplete run's raw status+conclusion to the fixed
  * display state list; anything unrecognized is `unknown` (never a guess). */
 export function runStateOf(status: string | null, conclusion: string | null): RepoOverviewRunState {
@@ -273,31 +332,34 @@ export function runStateOf(status: string | null, conclusion: string | null): Re
   }
 }
 
-/** Newest run wins: max by the ACTUAL CREATION time (createdAt), then id.
- * A run without a parseable creation time only wins over another
- * unparseable one with a larger id — provider list order is never trusted
- * alone, and a delayed `run_started_at` can never promote an older run
- * over a newer queued one. */
+/** The newest-run order: true when `run` is newer than `than` by the
+ * ACTUAL CREATION time (createdAt), then id. A run without a parseable
+ * creation time is newer only than another unparseable one with a
+ * smaller id. */
+export function isNewerRun(
+  run: Pick<RepoOverviewRunRaw, 'createdAt' | 'id'>,
+  than: Pick<RepoOverviewRunRaw, 'createdAt' | 'id'>,
+): boolean {
+  const runMs = Date.parse(run.createdAt ?? '');
+  const thanMs = Date.parse(than.createdAt ?? '');
+  const runTime = Number.isFinite(runMs) ? runMs : null;
+  const thanTime = Number.isFinite(thanMs) ? thanMs : null;
+  if (runTime !== null && thanTime !== null) {
+    return runTime > thanTime || (runTime === thanTime && (run.id ?? 0) > (than.id ?? 0));
+  }
+  if (runTime !== null) return true;
+  return thanTime === null && (run.id ?? 0) > (than.id ?? 0);
+}
+
+/** Newest run wins by {@link isNewerRun} — provider list order is never
+ * trusted alone, and a delayed `run_started_at` can never promote an older
+ * run over a newer queued one. */
 export function selectLatestRun(
   runs: readonly RepoOverviewRunRaw[],
 ): RepoOverviewRunRaw | null {
   let best: RepoOverviewRunRaw | null = null;
   for (const run of runs) {
-    if (best === null) {
-      best = run;
-      continue;
-    }
-    const runMs = Date.parse(run.createdAt ?? '');
-    const bestMs = Date.parse(best.createdAt ?? '');
-    const runTime = Number.isFinite(runMs) ? runMs : null;
-    const bestTime = Number.isFinite(bestMs) ? bestMs : null;
-    if (runTime !== null && bestTime !== null) {
-      if (runTime > bestTime || (runTime === bestTime && (run.id ?? 0) > (best.id ?? 0))) best = run;
-    } else if (runTime !== null && bestTime === null) {
-      best = run;
-    } else if (runTime === null && bestTime === null && (run.id ?? 0) > (best.id ?? 0)) {
-      best = run;
-    }
+    if (best === null || isNewerRun(run, best)) best = run;
   }
   return best;
 }
@@ -508,6 +570,10 @@ function mapRun(value: unknown): RepoOverviewRunRaw | null {
     createdAt: isoOrNull(raw['created_at']),
     startedAt: isoOrNull(raw['run_started_at']),
     updatedAt: isoOrNull(raw['updated_at']),
+    workflowId: countOrNull(raw['workflow_id']),
+    headSha: shaOrNull(raw['head_sha']),
+    event: strOrNull(raw['event']),
+    fromFork: fromForkOf(raw),
   };
 }
 
@@ -749,6 +815,10 @@ export interface ManagedRepoOverviewOptions {
   readonly sleep?: (ms: number) => Promise<void>;
   readonly now?: () => number;
   readonly log?: (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
+  /** The default-branch CI alert (#446): receives each complete
+   * observation's run page after the row is committed. A throw is logged
+   * at error level and never degrades the row or the pass. */
+  readonly onDefaultBranchRuns?: (observation: DefaultBranchRunsObservation) => void;
 }
 
 interface ObserveOutcome {
@@ -1176,6 +1246,7 @@ export class ManagedRepoOverviewTracker {
     const state = this.states.get(name) as RepoSourceState;
     const ref = state.ref as RepoRef;
     try {
+      let observed: DefaultBranchRunsObservation | null = null;
       const meta = await this.spend(budget, () => this.opts.api.fetchRepo({ repo: ref }));
       const openPrs = await this.spendSearch(budget, () => this.opts.api.countOpenPulls({ repo: ref }));
       const openIssues = await this.spendSearch(budget, () => this.opts.api.countOpenIssues({ repo: ref }));
@@ -1221,7 +1292,9 @@ export class ManagedRepoOverviewTracker {
           if (runs.kind === 'actions-unavailable') {
             run = runUnavailableView(branch);
           } else {
-            const latest = selectLatestRun(runs.value);
+            observed = { repo: ref, branch, runs: runs.value };
+            // The chip shows the branch's own newest run; the hook gets the full page.
+            const latest = selectLatestRun(runs.value.filter(isDefaultBranchRun));
             run =
               latest === null
                 ? {
@@ -1246,6 +1319,7 @@ export class ManagedRepoOverviewTracker {
       state.checkedAt = completedAt;
       state.lastAttemptAt = completedAt;
       state.error = null;
+      if (observed !== null) this.reportDefaultBranchRuns(name, observed);
       return { aborted: false, retry: false, detail: null };
     } catch (error) {
       if (error instanceof GhBudgetExceededError) {
@@ -1265,6 +1339,21 @@ export class ManagedRepoOverviewTracker {
       });
       const fatal = kind === 'rate-limit' || kind === 'auth';
       return { aborted: fatal, retry: false, detail: fatal ? `${kind}: ${state.error}` : null };
+    }
+  }
+
+  /** Hand a committed observation's run page to the default-branch CI
+   * alert. The row is already recorded: a hook failure is logged loud and
+   * never reaches the observation's own failure path. */
+  private reportDefaultBranchRuns(name: string, observed: DefaultBranchRunsObservation): void {
+    if (this.opts.onDefaultBranchRuns === undefined) return;
+    try {
+      this.opts.onDefaultBranchRuns(observed);
+    } catch (error) {
+      this.log('error', 'repo overview: default-branch CI watch failed — the row is unaffected', {
+        repo: name,
+        error: messageOf(error).slice(0, 300),
+      });
     }
   }
 

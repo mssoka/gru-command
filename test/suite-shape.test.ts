@@ -189,7 +189,7 @@ const PINS: Record<string, number> = {
   'artifact-context.test.ts': 34,
   'attachments.test.ts': 28,
 
-  'awareness.test.ts': 137,
+  'awareness.test.ts': 140,
   'awareness-adversarial.test.ts': 2,
 
 
@@ -230,6 +230,7 @@ const PINS: Record<string, number> = {
   'decisions-service-integration.test.ts': 2,
   'decisions-shadow.test.ts': 29,
   'decisions.test.ts': 96,
+  'default-branch-ci.test.ts': 39,
   'deploy-drift.test.ts': 22,
   'dispatch-e2e.test.ts': 6,
   'dispatch-joins.test.ts': 2,
@@ -243,7 +244,7 @@ const PINS: Record<string, number> = {
   'report-artifact-handback.test.ts': 9,
   'report-handback-mailbox.test.ts': 31,
   'health.test.ts': 19,
-  'incident.test.ts': 9,
+  'incident.test.ts': 12,
   'identity.test.ts': 3,
   'install-one-line.test.ts': 48,
   'install.test.ts': 19,
@@ -312,7 +313,7 @@ const PINS: Record<string, number> = {
   'restart-recovery-progress.test.ts': 197,
   'restart-recovery-schema.test.ts': 4,
   'rebrief-recovery.test.ts': 99,
-  'repo-overview.test.ts': 88,
+  'repo-overview.test.ts': 97,
   'rehearsal.test.ts': 4,
   'release-version.test.ts': 10,
   'resident-budget.test.ts': 7,
@@ -334,7 +335,7 @@ const PINS: Record<string, number> = {
   'review-path.test.ts': 26,
   'roles-definitions.test.ts': 18,
   'roles-installed-playbook.test.ts': 7,
-  'roles-gru.test.ts': 6,
+  'roles-gru.test.ts': 7,
   'roll-cli.test.ts': 23,
   'roll-controller.test.ts': 11,
   'roll-e2e.test.ts': 1,

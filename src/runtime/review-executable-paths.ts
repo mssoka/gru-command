@@ -2701,6 +2701,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/provider-recovery/sensor.js",
   "dist/provider-recovery/settle-attribution.js",
   "dist/redaction.js",
+  "dist/repos/default-branch-ci.js",
   "dist/repos/discovery.js",
   "dist/repos/managed-names.js",
   "dist/repos/overview.js",

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import {
   AWARENESS_STATE_NAME,
+  AWARENESS_WAKE_INSTRUCTION,
   GruAwareness,
   type AwarenessInjection,
   type AwarenessLimits,
@@ -17,6 +18,8 @@ import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
+import { DefaultBranchCiWatch } from '../src/repos/default-branch-ci.js';
+import type { RepoOverviewRunRaw } from '../src/repos/overview.js';
 
 /**
  * Gru awareness: escalations and lane digests reaching the chat brain.
@@ -2357,9 +2360,63 @@ describe('GH-305 mailbox reconciliation through existing awareness gates', () =>
       awareness.commit(injection, 'wake');
       awareness.noteWakeOutcome(true, undefined, injection);
     };
-    return { dir, api, mailbox, awareness, delivered, receive, turns: () => turns,
+    return { dir, bus, api, mailbox, awareness, delivered, receive, turns: () => turns,
       close: () => { awareness.dispose(); db.close(); } };
   }
+
+  it('a red default branch wakes; the repository hold is a restriction on a later red head, which still wakes (#446)', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-18T12:00:00Z'));
+    const rig = mailboxRig();
+    try {
+      const watch = new DefaultBranchCiWatch({ ledger: rig.api, notifications: new NotificationCenter({ ledger: rig.api, bus: rig.bus }) });
+      const repo = { host: 'github.com', owner: 'acme', repo: 'alpha' };
+      const red = (id: number, headSha: string): RepoOverviewRunRaw => ({
+        id, name: 'CI', status: 'completed', conclusion: 'failure', url: null, runNumber: id,
+        createdAt: `2026-10-18T10:${String(id).padStart(2, '0')}:00.000Z`, startedAt: null, updatedAt: null,
+        workflowId: 7, headSha, event: 'push', fromFork: false,
+      });
+      const subject = 'incident:github.default-branch-ci-failed:acme/alpha';
+      const itemFor = (sha: string) => rig.mailbox.snapshot().items
+        .find((item) => item.subject === subject && item.reasons.some((reason) => reason.label.endsWith(`:7:${sha}`)));
+      rig.awareness.setWakeSink(rig.receive);
+
+      watch.observe({ repo, branch: 'develop', runs: [red(9, '3684087c00000000000000000000000000000002')] });
+      vi.advanceTimersByTime(1000);
+      expect(rig.turns()).toBe(1);
+      expect(itemFor('3684087c00000000000000000000000000000002')).toMatchObject({ kind: 'incident', restrictions: [] });
+
+      // Gru opens the fix heist, holds the repository subject with no basis,
+      // and dispositions the item as waiting on the fix job.
+      rig.api.recordDecision({
+        subject, decision: 'hold', covers: ['ci-failed'], basisFingerprint: null,
+        reason: 'fix heist j-fix in flight', by: 'gru', clientKey: 'hold-alpha-develop',
+      });
+      const first = itemFor('3684087c00000000000000000000000000000002')!;
+      rig.mailbox.disposition(first.id, {
+        basis: first.basis, state: 'waiting', owner: 'minion-j-fix', detail: 'waiting on fix job j-fix', dependency: 'j-fix',
+        recheckAt: new Date(Date.now() + 3_600_000).toISOString(), references: first.references,
+      });
+      // Five 1 s mailbox reconcile ticks: the waiting disposition admits no wake on any of them.
+      vi.advanceTimersByTime(5000);
+      expect(rig.turns()).toBe(1);
+
+      // A later red head is a new item: it carries the hold as a restriction and still wakes once.
+      watch.observe({ repo, branch: 'develop', runs: [red(11, '3684087c00000000000000000000000000000003')] });
+      vi.advanceTimersByTime(1000);
+      expect(rig.turns()).toBe(2);
+      // The superseded head's row is resolved and its item leaves the mailbox.
+      const superseded = rig.api.listNotifications({ limit: 50 }).find((row) => row.kind.endsWith(':7:3684087c00000000000000000000000000000002'));
+      expect(superseded?.resolvedBy).toBe('default-branch-ci');
+      expect(rig.mailbox.snapshot().items.filter((item) => item.state !== 'resolved').map((item) => item.id)).not.toContain(first.id);
+      const later = itemFor('3684087c00000000000000000000000000000003');
+      expect(later?.restrictions).toEqual(['gru: fix heist j-fix in flight']);
+      expect(later?.receipt).toMatchObject({ source: 'wake', basis: later?.basis });
+      expect(rig.delivered).toHaveLength(2);
+      vi.advanceTimersByTime(5000);
+      expect(rig.turns()).toBe(2);
+    } finally { rig.close(); vi.useRealTimers(); }
+  });
 
   it('recovers startup backlog larger than a page fairly and delivery never resolves jobs', () => {
     vi.useFakeTimers();
@@ -3268,5 +3325,66 @@ describe('GH-122 (g26): credential-bearing detail never reaches an autonomous pr
     expect(block!.text).toContain('agent m1: errored');
     expect(block!.text).toContain('[redacted]');
     expect(block!.text).not.toContain(TOKEN);
+  });
+});
+
+describe('red default branch alerts (#446)', () => {
+  const ALPHA = { host: 'github.com', owner: 'acme', repo: 'alpha' };
+  const HELD = '3684087c00000000000000000000000000000002';
+  const NEXT = '3684087c00000000000000000000000000000003';
+  const failedRun = (id: number, workflowId: number, headSha: string): RepoOverviewRunRaw => ({
+    id, name: 'CI', status: 'completed', conclusion: 'failure', url: null, runNumber: id,
+    createdAt: `2026-10-18T10:${String(id).padStart(2, '0')}:00.000Z`, startedAt: null, updatedAt: null, workflowId, headSha,
+    event: 'push', fromFork: null,
+  });
+
+  it('the wake instruction names the repository subject as a restriction, never a deferral', () => {
+    const instruction = AWARENESS_WAKE_INSTRUCTION;
+    expect(instruction).toContain(
+      'A red default branch (github.default-branch-ci-failed:<owner>/<repo>:<workflow id>:<sha>) has no lane: diagnose ' +
+        'the run, open a fix heist from the current head, and hold "incident:github.default-branch-ci-failed:<owner>/<repo>" ' +
+        '(covers "ci-failed") with no basis_fingerprint, so the hold reaches every later head and later red heads of that ' +
+        'repository carry the in-flight fix as a restriction; disposition each item as waiting on the fix job; a later red ' +
+        'head is a new item that resolves the earlier head\'s item and wakes once.',
+    );
+    expect(instruction).toContain('It resolves itself when a newer run of that workflow passes or the failing run is re-run green.');
+    // The SHA-basis rule is scoped to job-scoped kinds, so it never reaches the default-branch hold.
+    expect(instruction).toContain(
+      'for job-scoped alert kinds that is "job:<job id>" — for those job-scoped kinds use the head SHA as ' +
+        'basis_fingerprint only when the kind embeds one (github.ci-failed:<job>:<sha>)',
+    );
+  });
+
+  // Production always wires the mailbox, which owns admission (see the
+  // GH-305 mailbox scenario above); this pins the mailbox-less coverage path.
+  it('without a mailbox: a red workflow wakes Gru; one repository hold defers every workflow at the held head; a new head or another repository wakes', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-18T12:00:00Z'));
+      const rig = boot({ wakeMode: 'action-required' });
+      const watch = new DefaultBranchCiWatch({ ledger: rig.api, notifications: rig.notifications });
+      watch.observe({ repo: ALPHA, branch: 'develop', runs: [failedRun(9, 7, HELD)] });
+      expect(rig.woke).toHaveLength(1);
+      expect(rig.wakeBlocks[0]).toContain('Default branch develop is red');
+      // Gru opens the fix heist and holds the repository at that head.
+      rig.api.recordDecision({
+        subject: 'incident:github.default-branch-ci-failed:acme/alpha',
+        decision: 'hold', covers: ['ci-failed'], basisFingerprint: HELD,
+        reason: 'fix heist in flight', by: 'gru', clientKey: 'hold-alpha-develop',
+        recheckAt: new Date(Date.now() + 3_600_000).toISOString(),
+      });
+      // Another workflow failing at the held head is covered by the same hold.
+      watch.observe({ repo: ALPHA, branch: 'develop', runs: [failedRun(10, 71, HELD), failedRun(9, 7, HELD)] });
+      expect(rig.woke).toHaveLength(1);
+      expect(rig.api.listEventsAfter(0, { kinds: ['gru.wake-deferred'] }).map((event) => (event.payload as { reason: string }).reason)).toEqual(['covered']);
+      // Another repository is another subject.
+      watch.observe({ repo: { ...ALPHA, repo: 'alpha-two' }, branch: 'main', runs: [failedRun(9, 7, HELD)] });
+      expect(rig.woke).toHaveLength(2);
+      // Still red at a new head: the hold's basis no longer matches.
+      watch.observe({ repo: ALPHA, branch: 'develop', runs: [failedRun(11, 7, NEXT)] });
+      expect(rig.woke).toHaveLength(3);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

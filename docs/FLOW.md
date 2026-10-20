@@ -802,6 +802,38 @@ the judgment; the dispatch surface is the mechanical hand.
   opens no second turn for it; a hold recorded through
   `POST /api/decisions` (issue #218) with a matching basis defers the
   wake to the hold's recheck instead.
+- **The default-branch CI alert (#446)** rides the managed repository
+  overview pass, not the lane poll: each committed observation hands its
+  default-branch run page (20 runs, the same single call) to a watch. Per
+  `workflow_id`, the newest decisive run (passed, failed, timed-out,
+  startup-failure) is the verdict; queued (incl. waiting/pending/
+  requested), running, cancelled, skipped, neutral, action-required,
+  stale-run and unknown runs never count, nor do `pull_request*` or fork
+  runs (fork read from the run's own head/base repository) that merely
+  share the branch name; an unknown fork state (a deleted fork) counts, as
+  does a `workflow_run` started by a same-repo PR run, which the payload
+  cannot tell apart. Each observed change is
+  recorded once as a `repo.default-branch-ci` event (payload `scope` =
+  `<owner>/<repo>:<workflow id>`) and deduped against the latest one, so a
+  restart re-reads the cursor and a verdict never steps back to an older
+  run. Turning red posts
+  `github.default-branch-ci-failed:<owner>/<repo>:<workflow id>:<sha>` as
+  `action-required` (severity error) — it wakes Gru for any check name;
+  there is no mechanical tier and no Silas digest row — then resolves the
+  workflow's row for the previous red head. A newer passing run of the
+  workflow, or the failing run re-run green, resolves that workflow's open
+  incidents; without a red cursor a pass still resolves them, once per
+  process per workflow until the next raise (past a passed cursor only a
+  newer pass), and writes nothing. No lane
+  owns a default branch, so the subject is
+  `incident:github.default-branch-ci-failed:<owner>/<repo>` (signal
+  `ci-failed`): Gru diagnoses the run, opens a fix heist from the current
+  head, holds that subject (covers `ci-failed`) with no
+  `basis_fingerprint` so it reaches every later head and later red heads
+  of the repository carry the in-flight fix as a mailbox restriction, and
+  dispositions each item as waiting on the fix job; a later red head is a
+  new item that resolves the earlier head's item and wakes once. Always on
+  for every `managed_repos` entry; no config key.
 - **The digest** handed to every wake carries the actionable states,
   computed from the ledger: delivered jobs with no PR registered; PRs
   whose follow-up delivery proves the lane head moved past the newest

@@ -30,10 +30,12 @@ import {
   classifyRemote,
   freshnessOf,
   githubRepoLink,
+  isDefaultBranchRun,
   runStateOf,
   safeRunUrl,
   selectLatestRun,
   type ActionsAvailability,
+  type DefaultBranchRunsObservation,
   type RepoOverviewApiPort,
   type RepoOverviewMeta,
   type RepoOverviewRunRaw,
@@ -61,6 +63,10 @@ function rawRun(over: Partial<RepoOverviewRunRaw> = {}): RepoOverviewRunRaw {
     createdAt: '2026-10-07T10:00:00.000Z',
     startedAt: '2026-10-07T10:00:00.000Z',
     updatedAt: '2026-10-07T10:05:00.000Z',
+    workflowId: 101,
+    headSha: '3684087c0000000000000000000000000000beef',
+    event: 'push',
+    fromFork: false,
     ...over,
   };
 }
@@ -145,6 +151,8 @@ interface Harness {
   readonly sleeps: number[];
   failure: string | null;
   failureFields: Record<string, unknown> | null;
+  /** Every log line, any level. */
+  readonly logs: { level: string; msg: string; fields: Record<string, unknown> | null }[];
 }
 
 const T0 = Date.parse('2026-10-07T12:00:00.000Z');
@@ -157,6 +165,7 @@ function harness(options: {
   staleAfterMs?: number;
   /** Leave `intervalMs` unset so the tracker's own default cadence applies. */
   defaultCadence?: boolean;
+  onDefaultBranchRuns?: (observation: DefaultBranchRunsObservation) => void;
 } = {}): Harness {
   const names = [...(options.names ?? ['alpha'])];
   const api = options.api ?? new FakeApi();
@@ -179,6 +188,7 @@ function harness(options: {
     sleeps,
     failure: null,
     failureFields: null,
+    logs: [],
   };
   state.tracker = new ManagedRepoOverviewTracker({
     workspaceRoot: '/ws',
@@ -208,11 +218,13 @@ function harness(options: {
       state.clock.ms += ms;
     },
     log: (level, msg, fields) => {
+      state.logs.push({ level, msg, fields: fields ?? null });
       if (level === 'warn') {
         state.failure = msg;
         state.failureFields = fields ?? null;
       }
     },
+    ...(options.onDefaultBranchRuns !== undefined ? { onDefaultBranchRuns: options.onDefaultBranchRuns } : {}),
   });
   return state;
 }
@@ -794,6 +806,11 @@ describe('managed repo overview — gh adapter', () => {
               created_at: '2026-10-07T09:59:00Z',
               run_started_at: '2026-10-07T10:00:00Z',
               updated_at: '2026-10-07T10:05:00Z',
+              workflow_id: 7001,
+              head_sha: '3684087cabcdef0123456789abcdef0123456789',
+              event: 'push',
+              repository: { id: 900, full_name: 'acme/alpha' },
+              head_repository: { id: 900, full_name: 'acme/alpha' },
             },
           ],
         }),
@@ -818,6 +835,10 @@ describe('managed repo overview — gh adapter', () => {
           createdAt: '2026-10-07T09:59:00Z',
           startedAt: '2026-10-07T10:00:00Z',
           updatedAt: '2026-10-07T10:05:00Z',
+          workflowId: 7001,
+          headSha: '3684087cabcdef0123456789abcdef0123456789',
+          event: 'push',
+          fromFork: false,
         },
       ],
     });
@@ -2289,5 +2310,182 @@ describe('managed repo overview tracker — run timestamp semantics', () => {
     expect(entry.run?.runCreatedAt).toBe('2026-10-07T11:00:00.000Z');
     expect(entry.run?.runStartedAt).toBeNull();
     expect(isValidSnapshot(validBoardSnapshot(tracker.view()))).toBe(true);
+  });
+});
+
+describe('managed repo overview tracker — default-branch CI hook (#446)', () => {
+  it('reads 20 runs in the one runs call, through the real adapter', async () => {
+    expect(REPO_OVERVIEW_RUNS_PER_FETCH).toBe(20);
+    const paths: string[] = [];
+    const runner: GhCommandRunner = async (args) => {
+      const path = args[3] ?? '';
+      paths.push(path);
+      if (path === 'repos/acme/alpha') return ok(JSON.stringify({ default_branch: 'develop' }));
+      if (path.startsWith('search/issues')) return ok(JSON.stringify({ total_count: 0, incomplete_results: false }));
+      if (path.startsWith('repos/acme/alpha/actions/workflows')) return ok(JSON.stringify({ total_count: 2 }));
+      if (path.startsWith('repos/acme/alpha/actions/runs')) return ok(JSON.stringify({ workflow_runs: [] }));
+      return { status: 1, stdout: '', stderr: `unexpected path ${path}` };
+    };
+    const seen: DefaultBranchRunsObservation[] = [];
+    const tracker = new ManagedRepoOverviewTracker({
+      workspaceRoot: '/ws',
+      managedRepos: ['alpha'],
+      api: new GhRepoOverviewApi(runner),
+      scanRepos: () => ['alpha'],
+      resolveRepoPath: (_workspaceRoot, name) => ({ kind: 'available', path: `/ws/${name}` }),
+      resolveRemote: () => githubRef('alpha'),
+      now: () => T0,
+      sleep: async () => {},
+      onDefaultBranchRuns: (observation) => seen.push(observation),
+    });
+    await tracker.refresh();
+    // The same five calls as before: the alert costs no extra GitHub call.
+    expect(paths).toHaveLength(5);
+    expect(paths.filter((path) => path.includes('/actions/runs'))).toEqual(['repos/acme/alpha/actions/runs?branch=develop&per_page=20']);
+    expect(seen).toEqual([{ repo: githubRef('alpha'), branch: 'develop', runs: [] }]);
+  });
+
+  it('hands the committed observation run page to the hook after the row is recorded; the chip keeps the newest run overall', async () => {
+    const page = [
+      rawRun({ id: 9, conclusion: 'failure', createdAt: '2026-10-07T10:00:00.000Z' }),
+      rawRun({ id: 10, status: 'queued', conclusion: null, createdAt: '2026-10-07T11:00:00.000Z', workflowId: 202 }),
+    ];
+    const api = new FakeApi().set('alpha', { defaultBranch: 'develop', runs: { kind: 'ok', value: page } });
+    const seen: { observation: DefaultBranchRunsObservation; row: RepoOverviewRowView }[] = [];
+    const h: Harness = harness({
+      api,
+      onDefaultBranchRuns: (observation) => seen.push({ observation, row: row(h.tracker.view(), 'alpha') }),
+    });
+    await h.tracker.refresh();
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.observation).toEqual({ repo: githubRef('alpha'), branch: 'develop', runs: page });
+    // Called after the commit: the row it sees is already this observation.
+    expect(seen[0]?.row).toMatchObject({ freshness: 'fresh', error: null, run: { state: 'queued' } });
+    expect(row(h.tracker.view(), 'alpha').run?.state).toBe('queued');
+  });
+
+  it('never calls the hook for a failed observation or one without a run page', async () => {
+    const cases: readonly FakeFacts[] = [
+      { errors: { latestRuns: new GhApiError('runs acme/alpha@main: response carries a malformed workflow_runs entry') } },
+      { errors: { countOpenIssues: new GhApiError('search: incomplete_results') } },
+      { defaultBranch: null },
+      { workflows: { kind: 'ok', value: 0 } },
+      { workflows: { kind: 'actions-unavailable' } },
+      { runs: { kind: 'actions-unavailable' } },
+    ];
+    for (const facts of cases) {
+      const seen: DefaultBranchRunsObservation[] = [];
+      const h = harness({ api: new FakeApi().set('alpha', facts), onDefaultBranchRuns: (observation) => seen.push(observation) });
+      await h.tracker.refresh();
+      expect(seen, JSON.stringify(facts)).toEqual([]);
+    }
+  });
+
+  it('a throwing hook keeps the observed row, finishes the pass and logs at error level', async () => {
+    const api = new FakeApi()
+      .set('alpha', { openPrs: 2, runs: { kind: 'ok', value: [rawRun({ id: 9, conclusion: 'failure' })] } })
+      .set('beta', { openPrs: 5 });
+    const h = harness({
+      names: ['alpha', 'beta'],
+      api,
+      onDefaultBranchRuns: (observation) => {
+        if (observation.repo.repo === 'alpha') throw new Error('database is locked');
+      },
+    });
+    const view = await h.tracker.refresh();
+    expect(row(view, 'alpha')).toMatchObject({ freshness: 'fresh', error: null, openPrs: 2, run: { state: 'failed', runNumber: 1 } });
+    expect(row(view, 'beta')).toMatchObject({ freshness: 'fresh', error: null, openPrs: 5 });
+    expect(h.logs).toContainEqual({
+      level: 'error',
+      msg: 'repo overview: default-branch CI watch failed — the row is unaffected',
+      fields: { repo: 'alpha', error: 'database is locked' },
+    });
+    expect(h.logs.some((entry) => entry.level === 'warn')).toBe(false);
+    expect(isValidSnapshot(validBoardSnapshot(h.tracker.view()))).toBe(true);
+  });
+
+  it('maps workflow_id, head_sha (lowercased) and event, dropping a malformed value to null', async () => {
+    const adapter = new GhRepoOverviewApi(
+      ghRunner([
+        ok(
+          JSON.stringify({
+            workflow_runs: [
+              { id: 1, status: 'completed', conclusion: 'failure', workflow_id: 55, head_sha: '3684087C', event: 'pull_request' },
+              { id: 2, status: 'completed', conclusion: 'failure', workflow_id: -1, head_sha: 'abc:def0', event: 7 },
+              { id: 3, status: 'completed', conclusion: 'failure', workflow_id: '55', head_sha: 'not-a-sha' },
+              { id: 4, status: 'completed', conclusion: 'failure' },
+            ],
+          }),
+        ),
+      ]).runner,
+    );
+    const result = await adapter.latestRuns({ repo: githubRef('alpha'), branch: 'main', limit: 20 });
+    if (result.kind !== 'ok') throw new Error('expected ok');
+    expect(result.value.map((entry) => [entry.workflowId, entry.headSha, entry.event])).toEqual([
+      [55, '3684087c', 'pull_request'],
+      [null, null, null],
+      [null, null, null],
+      [null, null, null],
+    ]);
+  });
+
+  it('reads the fork flag from the run payload itself, never the configured name (a renamed repository still counts)', async () => {
+    const run = (id: number, extra: Record<string, unknown>) => ({ id, status: 'completed', conclusion: 'failure', ...extra });
+    const adapter = new GhRepoOverviewApi(
+      ghRunner([
+        ok(
+          JSON.stringify({
+            workflow_runs: [
+              // Renamed/transferred: the origin still says acme/alpha, the payload the new name; ids match.
+              run(1, { repository: { id: 5, full_name: 'acme-org/alpha-renamed' }, head_repository: { id: 5, full_name: 'acme-org/alpha-renamed' } }),
+              // A fork: ids differ even when the names look alike.
+              run(2, { repository: { id: 5, full_name: 'acme/alpha' }, head_repository: { id: 6, full_name: 'acme/alpha' } }),
+              // No ids: the full-name pair decides, case-insensitively.
+              run(3, { repository: { full_name: 'acme/alpha' }, head_repository: { full_name: 'ACME/Alpha' } }),
+              run(4, { repository: { full_name: 'acme/alpha' }, head_repository: { full_name: 'someone/alpha' } }),
+              // Unknown: counts as not a fork.
+              run(5, { head_repository: { id: 6, full_name: 'someone/alpha' } }),
+              run(6, {}),
+            ],
+          }),
+        ),
+      ]).runner,
+    );
+    const result = await adapter.latestRuns({ repo: githubRef('alpha'), branch: 'develop', limit: 20 });
+    if (result.kind !== 'ok') throw new Error('expected ok');
+    expect(result.value.map((entry) => entry.fromFork)).toEqual([false, true, false, true, null, null]);
+    expect(result.value.map((entry) => isDefaultBranchRun(entry))).toEqual([true, false, true, false, true, true]);
+  });
+
+  it('pull_request* runs are never default-branch runs; workflow_run and every other event are', () => {
+    for (const event of ['pull_request', 'pull_request_target', 'pull_request_review', 'pull_request_review_comment']) {
+      expect(isDefaultBranchRun({ event, fromFork: false }), event).toBe(false);
+    }
+    for (const event of ['push', 'schedule', 'workflow_dispatch', 'workflow_run', 'merge_group', null]) {
+      expect(isDefaultBranchRun({ event, fromFork: null }), String(event)).toBe(true);
+    }
+    expect(isDefaultBranchRun({ event: 'push', fromFork: true })).toBe(false);
+  });
+
+  it('the chip never takes a newer pull_request or fork run named like the default branch; the hook still gets the full page', async () => {
+    const own = rawRun({ id: 9, conclusion: 'failure', createdAt: '2026-10-07T10:00:00.000Z', url: 'https://github.com/acme/alpha/actions/runs/9' });
+    const pullRequest = rawRun({ id: 10, event: 'pull_request', createdAt: '2026-10-07T11:00:00.000Z', url: 'https://github.com/acme/alpha/actions/runs/10' });
+    const fork = rawRun({ id: 11, fromFork: true, createdAt: '2026-10-07T12:00:00.000Z', url: 'https://github.com/acme/alpha/actions/runs/11' });
+    const seen: DefaultBranchRunsObservation[] = [];
+    const api = new FakeApi().set('alpha', { defaultBranch: 'develop', runs: { kind: 'ok', value: [own, pullRequest] } });
+    const h = harness({ api, onDefaultBranchRuns: (observation) => seen.push(observation) });
+    expect(row(await h.tracker.refresh(), 'alpha').run).toMatchObject({ state: 'failed', url: 'https://github.com/acme/alpha/actions/runs/9' });
+    api.set('alpha', { defaultBranch: 'develop', runs: { kind: 'ok', value: [own, fork] } });
+    expect(row(await h.tracker.refresh(), 'alpha').run).toMatchObject({ state: 'failed', url: 'https://github.com/acme/alpha/actions/runs/9' });
+    expect(seen.map((observation) => observation.runs)).toEqual([[own, pullRequest], [own, fork]]);
+  });
+
+  it('a page of only pull-request runs reads never-run', async () => {
+    const api = new FakeApi().set('alpha', {
+      runs: { kind: 'ok', value: [rawRun({ id: 10, event: 'pull_request' }), rawRun({ id: 11, event: 'pull_request_target' })] },
+    });
+    const h = harness({ api });
+    expect(row(await h.tracker.refresh(), 'alpha').run?.state).toBe('never-run');
+    expect(isValidSnapshot(validBoardSnapshot(h.tracker.view()))).toBe(true);
   });
 });
