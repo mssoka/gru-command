@@ -1379,21 +1379,35 @@ async function main(): Promise<number> {
   // the amended contract. The stop's own verdict is durable and separate
   // from the hold: a producer whose cessation cannot be proven stays
   // `unproven` rather than being reported stopped.
+  const jobStopIncident = (jobId: string): string => `job-stop-unproven:${jobId}`;
+  const openJobStopIncident = (jobId: string, title: string, detail: string): void => {
+    const { record, created } = notifications.openIncident({
+      kind: jobStopIncident(jobId),
+      routing: 'needs-owner',
+      severity: 'error',
+      title,
+      detail,
+      dedupe: 'active',
+    });
+    // A boot re-proof or a re-park reuses the one open owner row; a changed
+    // residue refreshes it instead of ringing the bell again.
+    if (!created) notifications.updateDetail(record.id, detail, title);
+  };
   const jobExecutionStop = new JobExecutionStop({
     ledger,
     handles: { list: () => registry.listHandles() },
     children: childWorkers,
     reviews: wave,
     notifyUnproven: (outcome) => {
-      notifications.post({
-        kind: 'job-stop-unproven',
-        routing: 'needs-owner',
-        severity: 'error',
-        title: `Parked job ${outcome.jobId}: producer stop is unproven`,
-        detail:
-          `The explicit owner hold is recorded, but the service cannot prove every producer stopped: ${jobStopResidue(outcome).join('; ')}. ` +
+      openJobStopIncident(
+        outcome.jobId,
+        `Parked job ${outcome.jobId}: producer stop is unproven`,
+        `The explicit owner hold is recorded, but the service cannot prove every producer stopped: ${jobStopResidue(outcome).join('; ')}. ` +
           'The job stays parked and new verifications, child workers and initial dispatches are refused until the residue settles.',
-      });
+      );
+    },
+    notifyResolved: (outcome) => {
+      notifications.resolveExactKind(jobStopIncident(outcome.jobId), 'job-service-stop');
     },
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
@@ -1402,15 +1416,12 @@ async function main(): Promise<number> {
     bus,
     stop: jobExecutionStop,
     notifyFailed: (jobId, error) => {
-      notifications.post({
-        kind: 'job-stop-unproven',
-        routing: 'needs-owner',
-        severity: 'error',
-        title: `Parked job ${jobId}: producer stop failed`,
-        detail:
-          `The explicit owner hold is recorded, but the stop pass itself failed: ${String(error)}. ` +
+      openJobStopIncident(
+        jobId,
+        `Parked job ${jobId}: producer stop failed`,
+        `The explicit owner hold is recorded, but the stop pass itself failed: ${String(error)}. ` +
           'Live producers may remain; inspect the job before resuming.',
-      });
+      );
     },
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });

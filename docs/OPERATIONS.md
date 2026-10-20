@@ -205,7 +205,9 @@ producer stopped, so the service answers the two facts separately.
 - **An unproven stop is named, never fabricated.** A failed dispose, a
   ledger open turn the runtime no longer holds, an unsettled verification
   run or an in-flight producer admission leaves `state: "unproven"` with the
-  exact residue in the event, and posts a `needs-owner` notification. A
+  exact residue in the event, and opens one `needs-owner`
+  `job-stop-unproven:<jobId>` incident (reused across boot re-proofs and
+  resolved when a later pass proves the stop). A
   pre-existing verification is never reported stopped merely because the
   job is parked; it may still finish.
 - **Stopping is not closing.** The job stays parked until the owner moves it

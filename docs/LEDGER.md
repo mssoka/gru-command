@@ -144,7 +144,7 @@ publishes it on the in-process event bus (`src/events/bus.ts`).
 | `job.created` | repo, title, display_name |
 | `job.status` / `job.note` / `job.pr` / `job.target` | from→to / note / url / ref (`binned` uses the ordinary from→to event) |
 | `job.admin-closeout` | disposition (`closed-without-merge`), expected status/url, provider evidence (state/merged/head/closed_at), the cited `github.branch-state` observation (event seq + identity), reason, request sha256 |
-| `job.execution-stop` | `requested` before any effect, then `stopped` only when every live producer has positive cessation evidence; otherwise `unproven` with per-agent/child/review detail and the outstanding residue (unsettled verification, in-flight admission). An unproven stop also posts a `needs-owner` `job-stop-unproven` notice (issue #455) |
+| `job.execution-stop` | `requested` before any effect, then `stopped` only when every live producer has positive cessation evidence; otherwise `unproven` with per-agent/child/review detail and the outstanding residue (unsettled verification, in-flight admission). An unproven stop also opens one `needs-owner` `job-stop-unproven:<jobId>` incident (issue #455), refreshed on later passes and resolved when a pass proves the stop or the owner resumes |
 | `round.created` / `round.status` / `round.verdict` / `round.target` | seq, lenses / from→to / verdict / ref |
 | `lens.bound` / `lens.status` | agentId / from→to (+note) |
 | `agent.spawned` / `agent.state` / `agent.error` | role, label / from→to (+error) / error, fatal |

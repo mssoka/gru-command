@@ -11,6 +11,7 @@ import {
 } from '../src/dispatch/job-stop.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { LedgerApi, type ChildWorkerRecord } from '../src/ledger/api.js';
+import { ownerAttentionFor } from '../src/notifications/attention.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import type { AgentHandle } from '../src/runtime/types.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
@@ -59,6 +60,7 @@ function fixture(opts: {
   readonly handles?: ReadonlyMap<string, AgentHandle>;
   readonly reviews?: JobStopDeps['reviews'];
   readonly notifyUnproven?: JobStopDeps['notifyUnproven'];
+  readonly notifyResolved?: JobStopDeps['notifyResolved'];
 } = {}): Fixture {
   const dir = mkdtempSync(join(tmpdir(), 'gru-job-stop-'));
   dirs.push(dir);
@@ -78,6 +80,7 @@ function fixture(opts: {
     children: null,
     reviews: opts.reviews === undefined ? null : opts.reviews,
     ...(opts.notifyUnproven === undefined ? {} : { notifyUnproven: opts.notifyUnproven }),
+    ...(opts.notifyResolved === undefined ? {} : { notifyResolved: opts.notifyResolved }),
     log: () => {},
   });
   return { ledger, db, stop, close: () => db.close() };
@@ -92,10 +95,14 @@ function eventStates(ledger: LedgerApi): readonly string[] {
 
 describe('job execution stop (issue #455)', () => {
   it('records stopped only on positive adapter cessation evidence', async () => {
+    const notifyUnproven = vi.fn();
+    const notifyResolved = vi.fn();
     const f = fixture({
       agents: [{ id: 'minion-1', state: 'streaming' }],
       handles: new Map([['minion-1', fakeHandle('minion-1', 'ceased')]]),
       reviews: { supersedeReviews: async () => ({ jobId: JOB, roundIds: [], operations: 0, confirmed: true, detail: null }) },
+      notifyUnproven,
+      notifyResolved,
     });
     try {
       const outcome = await f.stop.stop({ jobId: JOB, by: 'tester', reason: 'owner cancelled implementation' });
@@ -104,6 +111,8 @@ describe('job execution stop (issue #455)', () => {
       expect(outcome.agents).toEqual([{ agentId: 'minion-1', role: 'minion', state: 'stopped', detail: null }]);
       expect(outcome.reviews.state).toBe('stopped');
       expect(eventStates(f.ledger)).toEqual(['requested', 'stopped']);
+      expect(notifyUnproven).not.toHaveBeenCalled();
+      expect(notifyResolved).toHaveBeenCalledTimes(1);
     } finally {
       f.close();
     }
@@ -257,6 +266,10 @@ describe('job execution stop (issue #455)', () => {
     } finally {
       f.close();
     }
+  });
+
+  it('escalates a job-scoped owner incident kind', () => {
+    expect(ownerAttentionFor('job-stop-unproven:job-1')).toBe('owner-required');
   });
 
   it('marks a pass superseded when the owner resumes the lane mid-stop', async () => {

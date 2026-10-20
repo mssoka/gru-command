@@ -76,6 +76,9 @@ const OWNER_REQUIRED_KINDS: readonly string[] = [
  * including the worktree-scoped `worktree-sweep-paused:<id>:<pause>` form). */
 const OWNER_REQUIRED_PREFIXES: readonly string[] = [
   'gru.wake-blocked.',
+  // Job-scoped unproven producer stop (issue #455): one owner incident per
+  // job, reused across boot re-proofs and resolved when a later pass proves it.
+  'job-stop-unproven:',
   'gru.wake-blocked-mailbox.',
   'gru.wake-failed-escalation.',
   'decisions.enforce-gate.',

@@ -74,6 +74,9 @@ export interface JobStopDeps {
   readonly reviews: Pick<WaveRunner, 'supersedeReviews'> | null;
   /** Called once for every unproven pass, including boot re-proofs. */
   readonly notifyUnproven?: (outcome: JobStopOutcome) => void;
+  /** Called when a later pass proves the stop (or the owner resumed):
+   * the producer-side incident is settled, never left ringing. */
+  readonly notifyResolved?: (outcome: JobStopOutcome) => void;
   readonly log: Log;
 }
 
@@ -337,6 +340,7 @@ export class JobExecutionStop {
       outstanding: outcome.outstanding.length,
     });
     if (!superseded && state === 'unproven') this.deps.notifyUnproven?.(outcome);
+    else this.deps.notifyResolved?.(outcome);
     return outcome;
   }
 }
