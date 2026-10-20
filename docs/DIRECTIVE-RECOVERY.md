@@ -291,8 +291,10 @@ exist without a physical producer record to inspect. A target whose producer
 journal is missing, torn or foreign is still UNKNOWN, never a fabricated
 never-started receipt. An INTERRUPTED preparation can leave that producer
 record with no target and no ledger start: the request stays retirable (no
-target, no correlated start), and only a newer producer on the same session
-must settle it — this record is a preparation artifact, not a delivered turn.
+target, no correlated start). The residue is a journal entry whose evidence
+is `host-absent` while its pid is gone — it fences nothing — but a REUSED pid
+reads `unknown` and fences later work on that session until a cessation
+receipt supersedes it. It is a preparation artifact, not a delivered turn.
 The idle attestation is adapter-strength: Pi proves idle plus no independent
 bash controller, Claude Code proves idle only (its controller is recorded at
 spawn). Native

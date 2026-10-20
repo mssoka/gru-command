@@ -2536,6 +2536,73 @@ if (argv.includes('POST')) {
     }
   });
 
+  it('closes a receipt that protects nothing when the lane root moved, and creates at the new root (#453)', async () => {
+    const repo = fixture('issue-453-moved-root');
+    const { ledger, worktrees } = manager();
+    ledger.addJob({ id: 'moved-root-job', repo: 'assigned', title: 'moved root', baseBranch: 'main' });
+    const branch = 'gru/moved-root-job';
+    const proxy = transactionProxy(repo, 'commit-stop-once', branch);
+    const servicePath = process.env.PATH ?? '';
+    vi.stubEnv('PATH', `${proxy.root}:${servicePath}`);
+    await expect(worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'moved-root-job' })).rejects.toThrow(/did not close within 1000ms/);
+    vi.stubEnv('PATH', servicePath);
+    assertOwnedChildDead(proxy);
+    // Nothing survives the interrupted attempt except its receipt.
+    git(repo.path, ['update-ref', '-d', `refs/heads/${branch}`]);
+    expect(receiptFiles(repo)).toHaveLength(1);
+    // A different configured root: the receipt's recorded path no longer exists.
+    const movedRoot = directory();
+    const moved = new WorktreeManager({ ledger, root: movedRoot, preserveRoot: directory(), setupTimeoutMs: 30_000, enumerateProcesses: () => [] });
+    const lane = await moved.createJobWorktree({ repoPath: repo.path, jobId: 'moved-root-job' });
+    expect(lane.path).toBe(join(movedRoot, realpathSync(repo.path).split('/').pop()!, 'job-moved-root-job'));
+    expect(git(lane.path, ['rev-parse', 'HEAD'])).toBe(lane.sha);
+    expect(ledger.getWorktree('moved-root-job')?.status).toBe('active');
+    // The spent receipt was closed, not carried into the new root.
+    expect(receiptFiles(repo)).toHaveLength(0);
+  });
+
+  it('names a torn, foreign or duplicated worktree administration that claims the lane path (#453)', async () => {
+    const plant = (repo: FixtureRepo, lanePath: string, name: string, locked: string, head: boolean): void => {
+      const admin = join(commonDir(repo), 'worktrees', name);
+      mkdirSync(admin, { recursive: true });
+      writeFileSync(join(admin, 'gitdir'), `${join(lanePath, '.git')}\n`);
+      if (head) writeFileSync(join(admin, 'HEAD'), 'ref: refs/heads/gru/administration-job\n');
+      writeFileSync(join(admin, 'commondir'), '../..\n');
+      writeFileSync(join(admin, 'locked'), `${locked}\n`);
+    };
+    type Case = { readonly name: string; readonly plant: (repo: FixtureRepo, lanePath: string) => void; readonly error: RegExp };
+    const cases: readonly Case[] = [
+      { name: 'foreign-token', error: /but is locked for another creation/,
+        plant: (repo, lanePath) => plant(repo, lanePath, 'foreign-claim', `gru-creation:${randomUUID()}`, true) },
+      { name: 'torn-metadata', error: /belongs to .* but ENOENT|belongs to .* but .*no such file/,
+        plant: (repo, lanePath) => plant(repo, lanePath, 'torn-claim', 'gru-creation:unused', false) },
+      { name: 'duplicate-claims', error: /several worktree administrations claim/,
+        plant: (repo, lanePath) => {
+          plant(repo, lanePath, 'first-claim', `gru-creation:${randomUUID()}`, true);
+          plant(repo, lanePath, 'second-claim', `gru-creation:${randomUUID()}`, true);
+        } },
+    ];
+    for (const entry of cases) {
+      const repo = fixture(`issue-453-administration-${entry.name}`);
+      const { ledger, worktrees, root } = manager();
+      ledger.addJob({ id: 'administration-job', repo: 'assigned', title: 'administration', baseBranch: 'main' });
+      const branch = 'gru/administration-job';
+      const proxy = transactionProxy(repo, 'commit-stop-once', branch);
+      const servicePath = process.env.PATH ?? '';
+      vi.stubEnv('PATH', `${proxy.root}:${servicePath}`);
+      await expect(worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'administration-job' }), entry.name).rejects.toThrow(/did not close within 1000ms/);
+      vi.stubEnv('PATH', servicePath);
+      assertOwnedChildDead(proxy);
+      const lanePath = join(root, realpathSync(repo.path).split('/').pop()!, 'job-administration-job');
+      entry.plant(repo, lanePath);
+      await expect(worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'administration-job' }), entry.name)
+        .rejects.toThrow(/lane administration .* belongs to|several worktree administrations claim/);
+      expect(git(repo.path, ['rev-parse', branch]), entry.name).toBe(git(repo.path, ['rev-parse', 'main']));
+      expect(receiptFiles(repo), entry.name).toHaveLength(1);
+      vi.stubEnv('PATH', servicePath);
+    }
+  });
+
   it('refuses a retained receipt that names a lane the ledger already registered (#453)', async () => {
     const repo = fixture('issue-453-registered');
     const { ledger, worktrees } = manager();
@@ -2545,7 +2612,7 @@ if (argv.includes('POST')) {
     writeCreationIntent(commonDir(repo), { lane: { id: 'registered-job', kind: 'job', jobId: 'registered-job', roundId: null, path: lane.path },
       repoPath: realpathSync(repo.path), branch: 'gru/registered-job', sha: lane.sha, baseSource: lane.baseSource, token: `gru-creation:${randomUUID()}` });
     await expect(worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'registered-job' }))
-      .rejects.toThrow(/names a lane the ledger already registered/);
+      .rejects.toThrow(/names a lane the ledger already holds as active/);
     // Publication still owns the lane and everything it points at.
     expect(git(lane.path, ['rev-parse', 'HEAD'])).toBe(lane.sha);
     expect(ledger.getWorktree('registered-job')?.status).toBe('active');

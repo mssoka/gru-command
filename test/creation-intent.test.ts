@@ -85,6 +85,7 @@ describe('creation receipt (#453)', () => {
       [(value: Record<string, unknown>) => { value['sha'] = 'not-a-sha'; }, /malformed base sha/],
       [(value: Record<string, unknown>) => { value['baseSource'] = 'guessed'; }, /unknown base source/],
       [(value: Record<string, unknown>) => { (value['lane'] as Record<string, unknown>)['id'] = 'other'; }, /does not bind the job to its own lane/],
+      [(value: Record<string, unknown>) => { value['baseSource'] = null; }, /has no base provenance for a job lane/],
     ] as const) {
       const dir = common();
       writeCreationIntent(dir, receipt());

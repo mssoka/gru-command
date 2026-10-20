@@ -127,7 +127,11 @@ export function readCreationIntent(commonDir: string, branch: string): CreationI
   if (typeof token !== 'string' || !CREATION_TOKEN.test(token)) throw new CreationIntentError(`creation receipt ${file} has a malformed creation token`);
   if (typeof host !== 'string' || host === '' || !Number.isSafeInteger(pid) || (pid as number) <= 0) throw new CreationIntentError(`creation receipt ${file} has a malformed writer identity`);
   if (typeof createdAt !== 'string' || Number.isNaN(Date.parse(createdAt))) throw new CreationIntentError(`creation receipt ${file} has a malformed timestamp`);
-  return { version: INTENT_VERSION, lane: assertLane(receipt['lane'], file), repoPath, branch, sha, baseSource, token, host, pid: pid as number, createdAt };
+  const lane = assertLane(receipt['lane'], file);
+  // A job lane always resolves its provenance; a receipt that lost it can
+  // never be honoured, so it is refused where it is read.
+  if (lane.kind === 'job' && baseSource === null) throw new CreationIntentError(`creation receipt ${file} has no base provenance for a job lane`);
+  return { version: INTENT_VERSION, lane, repoPath, branch, sha, baseSource, token, host, pid: pid as number, createdAt };
 }
 
 /** Publish the receipt durably BEFORE the ref transaction. An existing

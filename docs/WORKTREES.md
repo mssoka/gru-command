@@ -441,16 +441,20 @@ provenance, and the creation token. It is cleared once the lane is
 registered or rolled back under its own proof.
 
 A retry of the same creation reads that receipt and refuses anything it
-cannot attribute: a different lane or repository, a changed tip, a reflog
-that no longer carries the token, a symbolic ref, an unsettled
-`refs/heads/<branch>.lock`, or a holder in `git worktree list`. Only with
+cannot attribute: a different lane or repository, a lane the ledger
+already holds (any status — that id is not reusable), a changed tip, a
+reflog that no longer carries the token, a symbolic ref, an unsettled
+`refs/heads/<branch>.lock`, a holder in `git worktree list`, or an
+administration entry that claims the lane path while being torn,
+duplicated or locked for another token. A ref it cannot read at all is
+also a refusal: only git's own "no such ref" counts as absence. Only with
 the receipt intact does it act: a committed ref with no checkout is
 resumed at ITS recorded base (the creation is never re-based onto a moved
-head), a checkout whose admin entry carries the same token is rolled back
-and remade, and a transaction that never committed is closed as spent.
-On the resume path the retry performs no second creation transaction, so a
-lost response cannot author a duplicate branch; a transaction that never
-committed is closed as spent and a fresh one starts.
+head), and a checkout whose admin entry carries the same token is rolled
+back and remade. On the resume path the retry performs no second creation
+transaction, so a lost response cannot author a duplicate branch; a
+transaction that never committed is closed as spent and a fresh one
+starts.
 
 Only branch-creating lanes keep a receipt — job lanes and writer children.
 Review lanes and read-only child lanes create no branch, so a crash inside
@@ -460,7 +464,13 @@ A ref with no receipt is still refused: absence of a record is never
 evidence that an earlier attempt did not run. A receipt whose every
 resource is gone (no ref, no ref lock, no administration entry, no
 checkout) protects nothing, and is closed rather than left to fence a
-branch after the lane root or repository path moves.
+branch after the lane root moves.
+
+Reconciliation is serialized in-process (`withRepoLock`). The receipt's
+host and pid are diagnostic: they are never read as cessation OR liveness
+proof, so two service processes sharing one repository are not
+coordinated by this receipt (a pid namespace reset makes a recorded pid
+look live again, which is why it is not a gate).
 
 ## 5. Concurrency (18e)
 

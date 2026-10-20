@@ -33,7 +33,7 @@ import {
   rm as rmAsync,
   symlink as symlinkAsync,
 } from 'node:fs/promises';
-import { hostname, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { LogLevel } from '../logger.js';
 import type { LedgerApi, WorktreeBaseSource, WorktreeRecord } from '../ledger/api.js';
@@ -2743,33 +2743,34 @@ export class WorktreeManager {
     const refuse = (detail: string): never => {
       throw new CreationIntentError(`retained creation receipt for branch ${branch} ${detail} — resources retained, inspect before retrying`);
     };
-    // A live same-host writer is not history to reconcile: the recorded pid
-    // is no cessation proof, but a LIVE one proves a creation is in flight.
-    // This process's own pid is the ordinary in-process retry.
-    if (retained.host === hostname() && retained.pid !== process.pid) {
-      let live = true;
-      try { process.kill(retained.pid, 0); } catch (error) { live = (error as NodeJS.ErrnoException).code !== 'ESRCH'; }
-      if (live) refuse(`was written by live process ${retained.pid} on this host — another invocation owns this creation`);
+    // Publication owns a registered lane; this receipt never may. A swept
+    // row is not publication's authority, but the id is still not reusable
+    // (registerWorktree refuses any existing row), so the status is said and
+    // the receipt stays for the operator who repairs it.
+    const registered = this.opts.ledger.getWorktree(lane.id);
+    if (registered !== null) {
+      refuse(`names a lane the ledger already holds as ${registered.status} (${registered.path}) — that id is not reusable, and the receipt is not its authority`);
     }
     const ref = `refs/heads/${branch}`;
     const lock = join(common, 'refs/heads', `${branch}.lock`);
     const tip = spawnGit(repoPath, ['rev-parse', '--verify', '--quiet', ref]);
+    // Only git's own "no such ref" is absence. A failed probe proves nothing
+    // and must not unlink the only record of a ref that may exist.
+    if (tip.status !== 0 && (tip.status !== 1 || tip.error !== null)) {
+      refuse(`could not be read (git exited ${String(tip.status)}: ${tip.stderr.trim() || tip.error || 'no diagnostic'})`);
+    }
     const checkout = existsSync(retained.lane.path);
     const admins = this.creationAdminEntries(retained.lane.path, common);
     // A receipt whose every resource is gone protects nothing. Close it and
     // let the ordinary creation proceed, whatever the root, repository path
     // or repository name is now: a spent receipt must never fence a branch.
-    if (tip.status !== 0 && !existsSync(lock) && admins.length === 0 && !checkout) {
+    if (tip.status === 1 && !existsSync(lock) && admins.length === 0 && !checkout) {
       clearCreationIntent(common, branch, retained.token);
       this.log('info', 'retained lane creation receipt closed with nothing left to protect', { branch, lane: retained.lane.id });
       return null;
     }
     // A live ref transaction is git's own lock, not this receipt's to judge.
     if (existsSync(lock)) refuse(`has an unsettled ref transaction (${lock})`);
-    // Publication owns a registered lane; this receipt never may.
-    if (this.opts.ledger.getWorktree(lane.id) !== null) {
-      refuse('names a lane the ledger already registered — publication owns it, not this receipt');
-    }
     if (retained.repoPath !== repoPath) refuse(`names repository ${retained.repoPath}, not ${repoPath}`);
     if (retained.lane.id !== lane.id || retained.lane.kind !== lane.kind || retained.lane.jobId !== lane.jobId ||
         retained.lane.roundId !== lane.roundId || retained.lane.path !== lane.path) {
