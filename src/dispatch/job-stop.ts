@@ -76,7 +76,7 @@ export interface JobStopDeps {
   readonly notifyUnproven?: (outcome: JobStopOutcome) => void;
   /** Called when a later pass proves the stop (or the owner resumed):
    * the producer-side incident is settled, never left ringing. */
-  readonly notifyResolved?: (outcome: JobStopOutcome) => void;
+  readonly notifyResolved?: (jobId: string) => void;
   readonly log: Log;
 }
 
@@ -137,14 +137,20 @@ export class JobExecutionStop {
   }
 
   /** Re-prove stops a restart interrupted (`requested`) or could not prove
-   * (`unproven`) for lanes that are still parked. Returns the pass count. */
+   * (`unproven`) for lanes that are still parked, and settle an open
+   * producer incident for a lane the owner resumed. Returns the pass count. */
   async reconcileOnBoot(): Promise<number> {
     let passes = 0;
     for (const job of this.deps.ledger.listJobs()) {
-      if (job.status !== 'parked') continue;
       const latest = this.deps.ledger.latestJobEvent(job.id, 'job.execution-stop');
       const state = (latest?.payload as { readonly state?: unknown } | null)?.state;
       if (state !== 'requested' && state !== 'unproven') continue;
+      if (job.status !== 'parked') {
+        // The hold was lifted (or the job moved on): no stop pass will run
+        // again, so the open owner incident is settled here.
+        this.deps.notifyResolved?.(job.id);
+        continue;
+      }
       passes += 1;
       try {
         await this.stop({
@@ -340,7 +346,7 @@ export class JobExecutionStop {
       outstanding: outcome.outstanding.length,
     });
     if (!superseded && state === 'unproven') this.deps.notifyUnproven?.(outcome);
-    else this.deps.notifyResolved?.(outcome);
+    else this.deps.notifyResolved?.(input.jobId);
     return outcome;
   }
 }

@@ -314,6 +314,20 @@ describe('job execution stop (issue #455)', () => {
     }
   });
 
+  it('settles an open producer incident at boot when the owner already resumed', async () => {
+    const notifyResolved = vi.fn();
+    const f = fixture({ notifyResolved });
+    try {
+      f.ledger.appendCustomEvent({ kind: 'job.execution-stop', jobId: JOB, payload: { state: 'unproven' } });
+      f.ledger.setJobStatus(JOB, 'working');
+      const passes = await f.stop.reconcileOnBoot();
+      expect(passes).toBe(0);
+      expect(notifyResolved).toHaveBeenCalledWith(JOB);
+    } finally {
+      f.close();
+    }
+  });
+
   it('watches park transitions and escalates a failed pass', async () => {
     const bus = new EventBus({});
     const stop = { stop: vi.fn(async () => { throw new Error('ledger unavailable'); }) };

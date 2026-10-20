@@ -1406,8 +1406,8 @@ async function main(): Promise<number> {
           'The job stays parked and new verifications, child workers and initial dispatches are refused until the residue settles.',
       );
     },
-    notifyResolved: (outcome) => {
-      notifications.resolveExactKind(jobStopIncident(outcome.jobId), 'job-service-stop');
+    notifyResolved: (jobId) => {
+      notifications.resolveExactKind(jobStopIncident(jobId), 'job-service-stop');
     },
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });

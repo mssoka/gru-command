@@ -255,7 +255,7 @@ const PINS: Record<string, number> = {
   'intake-slicing.test.ts': 18,
   'intake.test.ts': 73,
   'job-amendments.test.ts': 11,
-  'job-stop.test.ts': 15,
+  'job-stop.test.ts': 16,
   'lan-phone-raw-client.test.ts': 6,
   'lane-lifecycle.test.ts': 111,
   'cleanup-repair.test.ts': 41,
