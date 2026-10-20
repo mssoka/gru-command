@@ -2589,6 +2589,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/dispatch/escalation-identity.js",
   "dist/dispatch/fix-directive.js",
   "dist/dispatch/github-poll.js",
+  "dist/dispatch/job-stop.js",
   "dist/dispatch/line-safe.js",
   "dist/dispatch/obligations.js",
   "dist/dispatch/perkins-github-app.js",

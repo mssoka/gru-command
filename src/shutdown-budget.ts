@@ -34,3 +34,8 @@ export const LANE_SLIMMER_STOP_WAIT_MS = 5_000;
  * release's records come first, and a slim lane is restored by its next
  * turn). */
 export const DISK_RECLAIM_STOP_WAIT_MS = 5_000;
+
+/** How long shutdown waits for an in-flight producer stop (issue #455) before
+ * the wave and registry teardown it drives are disposed underneath it. A pass
+ * cut short leaves its `requested` record, which the next boot re-proves. */
+export const JOB_STOP_JOIN_WAIT_MS = 5_000;

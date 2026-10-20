@@ -384,6 +384,22 @@ describe('tracked child workers: admission (issue #161)', () => {
     h.close();
   });
 
+  it('refuses a fresh child worker while the job is under an explicit owner hold (#455)', async () => {
+    const h = makeHarness();
+    h.ledger.setJobStatus('job-1', 'parked');
+    let refusal: ChildWorkerRefusal | undefined;
+    try {
+      h.request({ idempotencyKey: 'k-parked' });
+    } catch (error) {
+      refusal = error as ChildWorkerRefusal;
+    }
+    expect(refusal).toBeInstanceOf(ChildWorkerRefusal);
+    expect(refusal?.code).toBe('job_held');
+    expect(refusal?.message).toMatch(/is parked/);
+    expect(h.ledger.listChildWorkers({ parentAgentId: 'parent-1' })).toHaveLength(0);
+    h.close();
+  });
+
   it('names unknown, non-minion and nested parents as refusal preconditions', async () => {
     const h = makeHarness();
     const refusalOf = (fn: () => unknown): ChildWorkerRefusal => {

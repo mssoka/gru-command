@@ -63,6 +63,7 @@ import { IntakeService } from './intake/service.js';
 import { IntakeApprovalService } from './intake/approval.js';
 import { IntakeSlicingService } from './intake/slicing.js';
 import { ChildWorkerService } from './dispatch/child-workers.js';
+import { JobExecutionStop, jobStopResidue, watchParkedJobs } from './dispatch/job-stop.js';
 import { createVerificationServer, type VerificationBudget } from './verify/server.js';
 import { laneLifecycleHooks, ReportLaneSlimmer, startLaneSlimmer } from './worktrees/slimming.js';
 import { ExpiryService, startExpiry } from './maintenance/expiry.js';
@@ -1373,6 +1374,57 @@ async function main(): Promise<number> {
     log: (level, msg, fields) => logger.log(level, msg, fields),
   } });
   state.wave = wave;
+  // Issue #455: parking is an explicit owner hold, so the service physically
+  // stops the job's live producers instead of relying on the model to reread
+  // the amended contract. The stop's own verdict is durable and separate
+  // from the hold: a producer whose cessation cannot be proven stays
+  // `unproven` rather than being reported stopped.
+  const jobStopIncident = (jobId: string): string => `job-stop-unproven:${jobId}`;
+  const openJobStopIncident = (jobId: string, title: string, detail: string): void => {
+    const { record, created } = notifications.openIncident({
+      kind: jobStopIncident(jobId),
+      routing: 'needs-owner',
+      severity: 'error',
+      title,
+      detail,
+      dedupe: 'active',
+    });
+    // A boot re-proof or a re-park reuses the one open owner row; a changed
+    // residue refreshes it instead of ringing the bell again.
+    if (!created) notifications.updateDetail(record.id, detail, title);
+  };
+  const jobExecutionStop = new JobExecutionStop({
+    ledger,
+    handles: { list: () => registry.listHandles() },
+    children: childWorkers,
+    reviews: wave,
+    notifyUnproven: (outcome) => {
+      openJobStopIncident(
+        outcome.jobId,
+        `Parked job ${outcome.jobId}: producer stop is unproven`,
+        `The explicit owner hold is recorded, but the service cannot prove every producer stopped: ${jobStopResidue(outcome).join('; ')}. ` +
+          'The job stays parked and new verifications, child workers and initial dispatches are refused until the residue settles.',
+      );
+    },
+    notifyResolved: (jobId) => {
+      notifications.resolveExactKind(jobStopIncident(jobId), 'job-service-stop');
+    },
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  state.jobExecutionStop = jobExecutionStop;
+  watchParkedJobs({
+    bus,
+    stop: jobExecutionStop,
+    notifyFailed: (jobId, error) => {
+      openJobStopIncident(
+        jobId,
+        `Parked job ${jobId}: producer stop failed`,
+        `The explicit owner hold is recorded, but the stop pass itself failed: ${String(error)}. ` +
+          'Live producers may remain; inspect the job before resuming.',
+      );
+    },
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
   // Notification-driven re-arms share Perkins' current-candidate writer
   // fence, including in-flight setup operations that have no round row yet.
   supervisorLive.setActiveReviewProbe((jobId) => wave.activeReview(jobId) !== null);
@@ -1381,6 +1433,16 @@ async function main(): Promise<number> {
   // Automatic admission retries live in memory (owner decision 2026-10-08):
   // one pending when the service stopped escalates now instead of resuming.
   wave.escalateInterruptedAdmissionRetries();
+  // A crash between `requested` and the verdict, or a stop that could not be
+  // proven, is re-attempted once the review/child recovery seams are up.
+  void jobExecutionStop.reconcileOnBoot().then(
+    (passes) => {
+      if (passes > 0) logger.log('info', 'job execution stop boot re-proof', { passes });
+    },
+    (error: unknown) => {
+      logger.log('error', 'job execution stop boot re-proof failed', { error: String(error) });
+    },
+  );
   // Historical re-brief markers never authorize replay. Observe a bounded
   // page for genuine spent/terminal evidence or concrete Gru judgment;
   // DirectiveProgressService ticks fairly visit the remaining generations.

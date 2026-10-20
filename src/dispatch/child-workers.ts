@@ -84,6 +84,7 @@ export type ChildWorkerRefusalCode =
   | 'parent_not_permitted'
   | 'nested_delegation'
   | 'parent_expired'
+  | 'job_held'
   | 'job_mismatch'
   | 'parent_lane_unavailable'
   | 'fanout_cap'
@@ -580,6 +581,15 @@ export class ChildWorkerService {
         `job "${jobId}" is ${job.status} — an expired lane admits no fresh child worker`,
       );
     }
+    // Issue #455: a parked lane is an explicit owner hold; its live turns
+    // may not commission fresh producers while the hold stands.
+    if (job.status === 'parked') {
+      throw new ChildWorkerRefusal(
+        'job_held',
+        409,
+        `job "${jobId}" is parked — an explicit owner hold admits no fresh child worker; resume the lane first`,
+      );
+    }
     if (parent.state === 'disposed' || parent.state === 'error') {
       throw new ChildWorkerRefusal(
         'parent_expired',
@@ -655,6 +665,7 @@ export class ChildWorkerService {
     const job = this.opts.ledger.getJob(record.jobId);
     if (job === null) return `job "${record.jobId}" no longer exists`;
     if (isJobTerminal(job.status)) return `job "${record.jobId}" is ${job.status} — the lane expired`;
+    if (job.status === 'parked') return `job "${record.jobId}" is parked — an explicit owner hold admits no fresh child worker`;
     return null;
   }
 

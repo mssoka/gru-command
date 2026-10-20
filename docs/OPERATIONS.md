@@ -184,6 +184,41 @@ To talk to the Gru brain directly with a runtime CLI (pi or claude):
   ledger is the authoritative map job → worktree → branch → processes
   ([WORKTREES.md](./WORKTREES.md)).
 
+## Parking a job (explicit owner hold)
+
+Parking (`POST /api/jobs/:id/status` with `{"status":"parked"}`) is an
+explicit owner hold. It is an administrative state, not proof that a
+producer stopped, so the service answers the two facts separately.
+
+- **The hold refuses new work.** Initial dispatch already refuses a parked
+  lane; a fresh child worker is refused (`409 job_held`) and a new
+  verification is refused with `409 job_held` (`verification.refused` is
+  recorded); a duplicate `request_id` still attaches or replays.
+  Review handoffs already require a working/delivered/in-review
+  status and are revoked by parking.
+- **Live producers are physically stopped.** The service disposes every
+  runtime handle bound to the job, cancels tracked child workers and
+  supersedes live review rounds. It writes `job.execution-stop` with
+  `state: "stopped"` only when every target has positive cessation
+  evidence (the adapter's own observation, a terminal child result, a
+  confirmed review supersession).
+- **An unproven stop is named, never fabricated.** A failed dispose, a
+  ledger open turn the runtime no longer holds, an unsettled verification
+  run or an in-flight producer admission leaves `state: "unproven"` with the
+  exact residue in the event, and opens one `needs-owner`
+  `job-stop-unproven:<jobId>` incident (reused across boot re-proofs and
+  resolved when a later pass proves the stop). A
+  pre-existing verification is never reported stopped merely because the
+  job is parked; it may still finish.
+- **Stopping is not closing.** The job stays parked until the owner moves it
+  back to a working status. The stop record and the hold are separate rows,
+  so a later reader can tell an administrative hold from a proven producer
+  stop.
+- **A restart re-proves the stop.** A crash between `requested` and the
+  verdict, or an unproven residue, is retried at the next boot for lanes
+  that are still parked; shutdown joins an in-flight pass (bounded) before
+  the wave and runtime teardown it drives.
+
 ## Administrative closeout of a parked PR-backed lane
 
 When a parked lane's PR is confirmed CLOSED on the host (never merged),
