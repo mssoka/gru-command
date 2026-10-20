@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { closeSync, existsSync, fstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, relative as relativePath } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -25,6 +25,18 @@ afterEach(() => { fsHooks.beforeWrite = null; fsHooks.beforeUnlink = null; fsHoo
 /** An fsync hook failing only a directory's sync — by what the fd is, never by counting syncs. */
 const failDirectorySync = (code: string) => (fd: number): void => {
   if (fstatSync(fd).isDirectory()) throw Object.assign(new Error('sync failed'), { code });
+};
+/** Fail only the WORKTREE ADMIN directory's fsync, so an earlier durable
+ * creation receipt (issue #453) is written normally and the handoff
+ * receipt's own durability is the one under test. */
+const failWorktreeAdminSync = (code: string, repoPath: string) => (fd: number): void => {
+  if (!fstatSync(fd).isDirectory()) return;
+  const container = join(realpathSync(join(repoPath, '.git')), 'worktrees');
+  if (!existsSync(container)) return;
+  const ino = fstatSync(fd).ino;
+  if (readdirSync(container).some((entry) => { try { return statSync(join(container, entry)).ino === ino; } catch { return false; } })) {
+    throw Object.assign(new Error('sync failed'), { code });
+  }
 };
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
@@ -595,7 +607,7 @@ describe('child lane parent custody, called directly (#373)', () => {
       const job = h.ledger.addJob({ id: `undurable-${kind}`, repo: 'assigned', title: kind });
       const before = admins(repo.path);
       const lanesBefore = checkouts(h.root);
-      fsHooks.beforeFsync = failDirectorySync('EIO');
+      fsHooks.beforeFsync = failWorktreeAdminSync('EIO', repo.path);
       try {
         const creating = kind === 'job'
           ? h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id })
@@ -610,7 +622,7 @@ describe('child lane parent custody, called directly (#373)', () => {
     }
     // A child lane.
     const f = await parentFixture('custody-undurable');
-    fsHooks.beforeFsync = failDirectorySync('EIO');
+    fsHooks.beforeFsync = failWorktreeAdminSync('EIO', f.repo.path);
     try {
       await expect(f.createChild()).rejects.toThrow(/published its handoff receipt but could not make it durable \(EIO\)$/u);
     } finally { fsHooks.beforeFsync = null; }

@@ -11,7 +11,7 @@ import { rebriefFreshMinion } from '../src/dispatch/fix-directive.js';
 import { PacingGate } from '../src/runtime/pacing.js';
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -2164,27 +2164,30 @@ if (argv.includes('POST')) {
     }
   });
 
-  function transactionProxy(repo: FixtureRepo, mode: 'stdout' | 'protocol' | 'prepare-timeout' | 'commit-stop' | 'trailing') {
+  function transactionProxy(repo: FixtureRepo, mode: 'stdout' | 'protocol' | 'prepare-timeout' | 'commit-stop' | 'commit-stop-once' | 'trailing', branch = 'gru/bounded-job') {
     const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
     const root = directory();
     const proof = join(root, 'prepared.json');
     const term = join(root, 'term');
+    const stall = join(root, 'stalled');
+    const refLock = join(repo.path, '.git/refs/heads', `${branch}.lock`);
     writeFileSync(join(root, 'git'), '#!/usr/bin/env node\n' +
       'const cp = require("node:child_process"), fs = require("node:fs"); const args = process.argv.slice(2);\n' +
-      `const mode = ${JSON.stringify(mode)}, proof = ${JSON.stringify(proof)}, term = ${JSON.stringify(term)};\n` +
+      `const mode = ${JSON.stringify(mode)}, proof = ${JSON.stringify(proof)}, term = ${JSON.stringify(term)}, stallFile = ${JSON.stringify(stall)};\n` +
       `if (args[0] !== 'update-ref' || !args.includes('--stdin')) { const r = cp.spawnSync(${JSON.stringify(realGit)}, args, {stdio:'inherit'}); process.exit(r.status ?? 1); }\n` +
       `const r = cp.spawn(${JSON.stringify(realGit)}, args, {stdio:['pipe','pipe','pipe']});\n` +
+      'const stall = mode !== "prepare-timeout" && mode !== "trailing" && (mode !== "commit-stop-once" || !fs.existsSync(stallFile)); if (mode === "commit-stop-once") fs.writeFileSync(stallFile, "1");\n' +
       'r.stdin.on("error", () => {}); process.stdin.pipe(r.stdin); r.stderr.pipe(process.stderr);\n' +
       'let pending = "", exited = false, forced = false;\n' +
       'process.on("SIGTERM", () => fs.writeFileSync(term, "owned SIGTERM"));\n' +
       'const backstop = setTimeout(() => { forced = true; r.stdin.end("abort\\n"); if (exited) process.exit(0); }, 6000);\n' +
       'r.stdout.setEncoding("utf8").on("data", text => { pending += text; let n; while ((n = pending.indexOf("\\n")) !== -1) {\n' +
       ' const line = pending.slice(0,n); pending = pending.slice(n+1);\n' +
-      ` if (line === 'prepare: ok') { fs.writeFileSync(proof, JSON.stringify({pid:process.pid, gitPid:r.pid, lock:fs.existsSync(${JSON.stringify(join(repo.path, '.git/refs/heads/gru/bounded-job.lock'))})}));\n` +
+      ` if (line === 'prepare: ok') { fs.writeFileSync(proof, JSON.stringify({pid:process.pid, gitPid:r.pid, lock:fs.existsSync(${JSON.stringify(refLock)}), receipts:(() => { try { return fs.readdirSync(${JSON.stringify(join(repo.path, '.git/gru-creation'))}).filter(f => f.endsWith('.json')).length; } catch (e) { return 0; } })()}));\n` +
       '  if (mode === "prepare-timeout") continue; if (mode === "protocol") { process.stdout.write("wrong: ok\\n"); continue; }\n' +
       '  if (mode === "stdout") { process.stdout.write(Buffer.alloc(17*1024*1024, 120)); process.stdout.write("\\n"); continue; } }\n' +
       ' process.stdout.write(line+"\\n"); if (mode === "trailing" && line === "commit: ok") process.stdout.write("junk"); } });\n' +
-      `r.on("close", code => { exited = true; if (mode === 'protocol') { fs.mkdirSync(${JSON.stringify(join(repo.path, '.git/refs/heads/gru'))}, {recursive:true}); fs.writeFileSync(${JSON.stringify(join(repo.path, '.git/refs/heads/gru/bounded-job.lock'))}, 'unrelated replacement lock'); } if (mode === "prepare-timeout" || mode === "trailing" || forced) { clearTimeout(backstop); process.exit(code ?? 1); }\n` +
+      `r.on("close", code => { exited = true; if (mode === 'protocol') { fs.mkdirSync(${JSON.stringify(join(repo.path, '.git/refs/heads/gru'))}, {recursive:true}); fs.writeFileSync(${JSON.stringify(refLock)}, 'unrelated replacement lock'); } if (!stall || forced) { clearTimeout(backstop); process.exit(code ?? 1); }\n` +
       ' setInterval(() => {}, 1000); });\n');
     chmodSync(join(root, 'git'), 0o755);
     return { root, proof, term, realGit };
@@ -2321,6 +2324,81 @@ if (argv.includes('POST')) {
       expect(git(repo.path, ['worktree', 'list', '--porcelain']).match(/^worktree /gm)).toHaveLength(1);
       vi.stubEnv('PATH', servicePath);
     }
+  });
+
+  it('records durable custody before the ref transaction it authorizes (#453)', async () => {
+    const repo = fixture('issue-453-before-ref');
+    const { ledger, worktrees } = manager();
+    ledger.addJob({ id: 'before-ref-job', repo: 'assigned', title: 'before ref', baseBranch: 'main' });
+    const proxy = transactionProxy(repo, 'commit-stop', 'gru/before-ref-job');
+    vi.stubEnv('PATH', `${proxy.root}:${process.env.PATH ?? ''}`);
+    await expect(worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'before-ref-job' })).rejects.toThrow(/did not close within 1000ms/);
+    vi.stubEnv('PATH', process.env.PATH ?? '');
+    // At `prepare: ok` the branch still did not exist: the receipt was already on disk.
+    expect(JSON.parse(readFileSync(proxy.proof, 'utf8')).receipts).toBe(1);
+  });
+
+  it('adopts an interrupted branch creation from its own receipt, never creating it twice (#453)', async () => {
+    const repo = fixture('issue-453-adopt');
+    const { ledger, worktrees, root } = manager();
+    ledger.addJob({ id: 'resume-job', repo: 'assigned', title: 'resume', baseBranch: 'main' });
+    const branch = 'gru/resume-job';
+    const proxy = transactionProxy(repo, 'commit-stop-once', branch);
+    const servicePath = process.env.PATH ?? '';
+    vi.stubEnv('PATH', `${proxy.root}:${servicePath}`);
+    await expect(worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'resume-job' })).rejects.toThrow(/did not close within 1000ms/);
+    // The interrupted state: the ref exists at the fixed base, nothing else.
+    const base = git(repo.path, ['rev-parse', branch]);
+    const lanePath = join(root, realpathSync(repo.path).split('/').pop()!, 'job-resume-job');
+    expect(existsSync(lanePath)).toBe(false);
+    expect(ledger.getWorktree('resume-job')).toBeNull();
+    expect(readdirSync(join(repo.path, '.git/gru-creation')).filter((entry) => entry.endsWith('.json'))).toHaveLength(1);
+    // The retry finishes that same transaction instead of authoring a new one.
+    const lane = await worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'resume-job' });
+    vi.stubEnv('PATH', servicePath);
+    expect(lane.branch).toBe(branch);
+    expect(git(lane.path, ['rev-parse', 'HEAD'])).toBe(base);
+    expect(git(repo.path, ['reflog', 'show', '--format=%H', `refs/heads/${branch}`]).split('\n').filter(Boolean)).toHaveLength(1);
+    expect(ledger.getWorktree('resume-job')?.status).toBe('active');
+    expect(readdirSync(join(repo.path, '.git/gru-creation')).filter((entry) => entry.endsWith('.json'))).toHaveLength(0);
+  });
+
+  it('refuses a retained creation whose ref moved, and keeps the foreign ref (#453)', async () => {
+    const repo = fixture('issue-453-changed-ref');
+    const { ledger, worktrees } = manager();
+    ledger.addJob({ id: 'moved-job', repo: 'assigned', title: 'moved', baseBranch: 'main' });
+    const branch = 'gru/moved-job';
+    const proxy = transactionProxy(repo, 'commit-stop-once', branch);
+    const servicePath = process.env.PATH ?? '';
+    vi.stubEnv('PATH', `${proxy.root}:${servicePath}`);
+    await expect(worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'moved-job' })).rejects.toThrow(/did not close within 1000ms/);
+    vi.stubEnv('PATH', servicePath);
+    // A later actor moves the retained branch: it is no longer our transaction.
+    writeFileSync(join(repo.path, 'moved.txt'), 'foreign\n');
+    git(repo.path, ['add', 'moved.txt']);
+    git(repo.path, ['commit', '-qm', 'foreign move']);
+    const moved = git(repo.path, ['rev-parse', 'HEAD']);
+    git(repo.path, ['update-ref', `refs/heads/${branch}`, moved]);
+    await expect(worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'moved-job' })).rejects.toThrow(/retained creation receipt for branch .* names base/);
+    expect(git(repo.path, ['rev-parse', branch])).toBe(moved);
+    expect(ledger.getWorktree('moved-job')).toBeNull();
+  });
+
+  it('refuses a retained creation whose path holds a checkout it does not own (#453)', async () => {
+    const repo = fixture('issue-453-foreign-path');
+    const { ledger, worktrees, root } = manager();
+    ledger.addJob({ id: 'held-job', repo: 'assigned', title: 'held', baseBranch: 'main' });
+    const branch = 'gru/held-job';
+    const proxy = transactionProxy(repo, 'commit-stop-once', branch);
+    const servicePath = process.env.PATH ?? '';
+    vi.stubEnv('PATH', `${proxy.root}:${servicePath}`);
+    await expect(worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'held-job' })).rejects.toThrow(/did not close within 1000ms/);
+    vi.stubEnv('PATH', servicePath);
+    const lanePath = join(root, realpathSync(repo.path).split('/').pop()!, 'job-held-job');
+    mkdirSync(lanePath, { recursive: true });
+    await expect(worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'held-job' })).rejects.toThrow(/checkout at .* that this receipt does not own/);
+    expect(git(repo.path, ['rev-parse', branch])).toBe(git(repo.path, ['rev-parse', 'main']));
+    expect(ledger.getWorktree('held-job')).toBeNull();
   });
 
   async function assertSymbolicBranchCollision(authority: 'job' | 'writer', timing: 'existing' | 'concurrent'): Promise<void> {

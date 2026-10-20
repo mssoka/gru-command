@@ -423,6 +423,37 @@ check out DETACHED worktrees at the ref under review (reviews never
 grow branch debris). Review lanes record their owning job at creation —
 every pause is answerable by construction (job id or round id).
 
+## 4a. Creation custody across an interruption (issue #453)
+
+A lane's branch is created inside one prepared `git update-ref`
+transaction, and that transaction can commit without settling: the owned
+child outlives its close budget, or the service dies after `commit: ok`.
+The ref then exists at the fixed base while the checkout, the handoff
+receipt and the ledger row do not — and the token that proved authorship
+used to live only in the creating process's memory, so the taken branch
+name refused every retry.
+
+Before the transaction starts, a creation receipt is published durably at
+`<common-dir>/gru-creation/<hash-of-branch>.json` (fsynced file and
+directory). It binds the lane identity (job/round/child, kind, checkout
+path), the repository, the branch, the fixed base sha, the base
+provenance, and the creation token. It is cleared once the lane is
+registered or rolled back under its own proof.
+
+A retry of the same creation reads that receipt and refuses anything it
+cannot attribute: a different lane or repository, a changed tip, a reflog
+that no longer carries the token, a symbolic ref, an unsettled
+`refs/heads/<branch>.lock`, or a holder in `git worktree list`. Only with
+the receipt intact does it act: a committed ref with no checkout is
+resumed at ITS recorded base (the creation is never re-based onto a moved
+head), a checkout whose admin entry carries the same token is rolled back
+and remade, and a transaction that never committed is closed as spent.
+The retry performs no second creation transaction, so a lost response
+cannot author a duplicate branch.
+
+A ref with no receipt is still refused: absence of a record is never
+evidence that an earlier attempt did not run.
+
 ## 5. Concurrency (18e)
 
 Same-repo creation is sequential (git index/refs contention); every
