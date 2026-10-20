@@ -340,7 +340,10 @@ function deliveredRow(overrides: Partial<DeliveredWithoutPrRow> = {}): Delivered
   };
 }
 
-const enabled = (rules: SilasAutopilotConfig['rules'] = {}): SilasAutopilotConfig => ({ enabled: true, rules });
+const enabled = (
+  rules: SilasAutopilotConfig['rules'] = {},
+  defaultMode: NonNullable<SilasAutopilotConfig['defaultMode']> = 'dry-run',
+): SilasAutopilotConfig => ({ enabled: true, defaultMode, rules });
 
 // ------------------------------------------------------------------
 // The mode matrix
@@ -351,6 +354,18 @@ describe('autopilot mode resolution (kill switch + per-family modes)', () => {
     expect(autopilotRuleMode(enabled(), 'sweep-ack')).toBe('dry-run');
     expect(autopilotRuleMode(enabled({ 'sweep-ack': 'off' }), 'sweep-ack')).toBe('off');
     expect(autopilotRuleMode(enabled({ 'sweep-ack': 'enforce' }), 'sweep-ack')).toBe('enforce');
+  });
+
+  // Issue #443: `default_mode` is the fallback for every unlisted family.
+  it('applies default_mode to unlisted families, while a per-family entry wins', () => {
+    expect(autopilotRuleMode(enabled({}, 'enforce'), 'sweep-ack')).toBe('enforce');
+    expect(autopilotRuleMode(enabled({}, 'enforce'), 'pr-review-trigger')).toBe('enforce');
+    expect(autopilotRuleMode(enabled({ 'sweep-ack': 'dry-run' }, 'enforce'), 'sweep-ack')).toBe('dry-run');
+    expect(autopilotRuleMode(enabled({ 'sweep-ack': 'off' }, 'enforce'), 'sweep-ack')).toBe('off');
+  });
+
+  it('keeps the absent-key default at dry-run', () => {
+    expect(autopilotRuleMode({ enabled: true, rules: {} }, 'sweep-ack')).toBe('dry-run');
   });
 
   it('a disabled autopilot records nothing and calls nothing', async () => {

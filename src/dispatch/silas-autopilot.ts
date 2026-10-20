@@ -166,12 +166,15 @@ export type AutopilotLedger = Pick<
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
-/** One family's resolved setting for this pass. */
+/** One family's resolved setting for this pass: an explicit per-family
+ * entry wins, then the owner-wide `default_mode`, then `dry-run` for a
+ * config that predates the key (issue #443). The kill switch is enforced
+ * by the caller, not here. */
 export function autopilotRuleMode(
   config: SilasAutopilotConfig,
   ruleId: SilasAutopilotRuleId,
 ): SilasAutopilotRuleMode {
-  return config.rules[ruleId] ?? 'dry-run';
+  return config.rules[ruleId] ?? config.defaultMode ?? 'dry-run';
 }
 
 /** A call the family would make (recorded verbatim in the decision event,
