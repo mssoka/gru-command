@@ -4,6 +4,10 @@ import type { WorktreePort, WorktreeLane } from '../dispatch/worktree-port.js';
 import type { LedgerApi, WorktreeRecord } from '../ledger/api.js';
 
 const receiptName = 'gru-creation-handoff.json';
+/** The one canonical creation token. Both the handoff receipt and the
+ * creation receipt that precedes it must accept exactly this spelling
+ * (issue #453): a value one reader refuses may never be adopted by the other. */
+export const CREATION_TOKEN = /^gru-creation:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const knownLanes = new Map<string, { readonly lane: WorktreeRecord; readonly ledger: LedgerApi }>();
 const managers = new WeakMap<object, LedgerApi>();
 const completionKind = 'worktree.handoff-completed';
@@ -62,7 +66,7 @@ function isReceipt(value: unknown): value is Receipt {
   return typeof value === 'object' && value !== null && !Array.isArray(value) &&
     Object.keys(value).length === receiptFields.size && Object.keys(value).every((key) => receiptFields.has(key)) &&
     'state' in value && (value.state === 'pending' || value.state === 'ready') &&
-    'token' in value && typeof value.token === 'string' && /^gru-creation:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(value.token) &&
+    'token' in value && typeof value.token === 'string' && CREATION_TOKEN.test(value.token) &&
     'id' in value && typeof value.id === 'string' && value.id !== '' &&
     'kind' in value && (value.kind === 'job' || value.kind === 'review' || value.kind === 'child') &&
     'jobId' in value && (value.jobId === null || typeof value.jobId === 'string' && value.jobId !== '') &&

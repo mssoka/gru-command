@@ -266,8 +266,14 @@ export async function executeAcceptedDirective(deps: DirectiveProgressDeps, requ
         preparedHandle = handle;
         check(deps, identity);
         assertNativeDirectiveRuntime(handle);
-        deps.ledger.prepareDirectiveTarget(requestId, { agentId: handle.id, sessionFile: handle.sessionFile });
+        // Issue #453: the runtime's idle/independence attestation and the
+        // physical producer journal come BEFORE any retained target. A
+        // refusal here (busy session, independent controller, compaction)
+        // or a crash in this window leaves no target to fence, so the
+        // request stays retirable; the target can never exist without a
+        // physical producer record that a later reader can inspect.
         preparedProducer = handle.prepareDirectiveProducer(identity);
+        deps.ledger.prepareDirectiveTarget(requestId, { agentId: handle.id, sessionFile: handle.sessionFile });
         producerStartSeq = deps.ledger.startDirectiveProducer(identity, preparedProducer);
       },
       directiveTurn: { identity, beforeAdmission: () => checkFreshAdmission(),
