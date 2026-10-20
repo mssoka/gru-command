@@ -141,10 +141,10 @@ min_free_disk_gb = 10
 reclaim_mode = "automatic"
 
 [dispatch]                        # dispatch flow (E8) — all optional
-# Bob's consolidation knock ships 0 (disabled): the due-based dream pass is
-# the learning loop that feeds the crew; an hourly knock mostly found
-# nothing. Re-enable deliberately.
-# bob_interval_ms = 3600000
+# Bob's consolidation knock ships weekly; it is due-based (due at
+# lastBobAt + interval, persisted under the data home), so a restart
+# inherits the cadence instead of resetting it. 0 disables the knock.
+bob_interval_ms = 604800000
 
 [lessons]                         # Book of Lessons — all optional, live by default
 # Deliberate journal entries (Gru/Silas via /api/journal, minion lessons blocks)
@@ -152,7 +152,7 @@ reclaim_mode = "automatic"
 # carry pointer lines only (chapter bodies are read on demand, never inlined).
 enabled = true                    # false disables the dream cadence and pointer injection
                                   # (the journal API stays available — capture is never lost)
-dream_interval_ms = 43200000      # due lastDreamAt + interval (restarts inherit the cadence); 0 = no periodic pass
+dream_interval_ms = 604800000     # weekly, due lastDreamAt + interval (restarts inherit the cadence); 0 = no periodic pass
 dream_on_boot = true              # boot pass fires only when the dream is already due
 chapter_cap_bytes = 4096          # hard cap per chapter; the dream trims to fit
 index_cap_bytes = 1024           # hard cap for INDEX.md — the only part ever embedded

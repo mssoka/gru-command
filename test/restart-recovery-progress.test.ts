@@ -553,7 +553,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(readFileSync(f.file, 'utf8')).toBe(bytes); expect(f.spawns).toEqual([]); expect(f.native.prompts).toEqual([]);
   });
 
-  it('R14 first-implementation publisher never opens report handback before independent native candidate settlement', async () => {
+  it('R14 exact native report completion opens handback without granting code-candidate eligibility', async () => {
     const f = await completeBeforeOriginalOwnerPark(true, false);
     const bytes = readFileSync(f.file, 'utf8');
     writeFileSync(join(f.lane.path, 'report-material-input.ts'), 'export const pendingReportInput = true;\n');
@@ -562,8 +562,8 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     const delivery = f.ledger.latestJobEventByRequestId(f.intent.jobId, 'job.delivered', f.intent.requestId)!;
     expect(delivery.payload).toMatchObject({ candidate_delivery_proven: false });
     expect(f.ledger.latestCandidateDelivery(f.intent.jobId)).toBeNull();
-    expect(f.ledger.findReportObligation(f.intent.jobId)).toBeNull();
-    expect(f.ledger.listJobEventsByKinds(f.intent.jobId, ['job.report-handback'])).toEqual([]);
+    expect(f.ledger.findReportObligation(f.intent.jobId)).toMatchObject({ state: 'open', firstOriginSeq: delivery.seq });
+    expect(f.ledger.listJobEventsByKinds(f.intent.jobId, ['job.report-handback'])).toHaveLength(1);
     expect(f.ledger.listObligations({ jobId: f.intent.jobId }).find((row) => row.incidentKey === `directive-current-gates:${f.intent.requestId}`)?.state).toBe('open');
     expect(readFileSync(f.file, 'utf8')).toBe(bytes); expect(f.spawns).toEqual([]); expect(f.native.prompts).toEqual([]);
   });
@@ -747,6 +747,51 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     const service = new DirectiveProgressService(deps); service.reconsider(); await service.settled(); expect(f.spawns).toEqual([]);
     blocked = false; service.reconsider(); await service.settled(); await service.dispose();
     expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('settled'); expect(f.native.prompts).toHaveLength(1); expect(f.native.continuations).toBe(0);
+  });
+
+  it('a runtime that refuses preparation leaves no retained target, so the same request stays retirable (#453)', async () => {
+    const f = await fixture();
+    const refusing: DirectiveRegistry = {
+      getHandle: (agentId) => f.deps.registry.getHandle(agentId),
+      async spawn(role, options) {
+        const handle = await f.deps.registry.spawn(role, options);
+        // The runtime refuses AFTER the route has decided to prepare: the
+        // fixture stands in for a busy session or an independent controller.
+        Object.defineProperty(handle, 'prepareDirectiveProducer', {
+          configurable: true,
+          value: () => { throw new DirectiveCheckpointError('native producer preparation requires genuine idle without independent controllers'); },
+        });
+        return handle;
+      },
+      async disposeHandle(handle) { await f.deps.registry.disposeHandle(handle); },
+    };
+    await executeAcceptedDirective({ ...f.deps, registry: refusing }, f.intent.requestId);
+    expect(f.native.prompts).toEqual([]);
+    // Nothing durable claims a native start, so nothing fenced the request.
+    expect(f.ledger.getDirective(f.intent.requestId)?.nativeTarget).toBeNull();
+    const head = resolveGitCommit(f.lane.path, 'HEAD');
+    const retired = f.ledger.retireInterruptedDirective({ requestId: f.intent.requestId, expectedJobId: f.intent.jobId,
+      expectedState: f.ledger.getDirective(f.intent.requestId)!.state as 'dispatching', expectedPayloadHash: f.intent.payloadHash,
+      expectedHead: head, lane: { id: f.lane.id, resolvedHead: head },
+      reason: 'preparation refused before any native target', by: 'gru' });
+    expect(retired.record.state).toBe('retired');
+  });
+
+  it('an interrupted preparation that journaled a producer but retained no target stays retirable (#453)', async () => {
+    const f = await fixture();
+    // The crash window's durable residue: the physical producer journal was
+    // flushed, while the ledger never recorded a target or a start. No native
+    // turn can have run, so this must not fence the request forever.
+    prepareDirectiveProducer({ identity: f.identity, agentId: 'logical-minion', sessionId: f.native.sessionId, sessionFile: f.file });
+    expect(f.ledger.getDirective(f.intent.requestId)?.nativeTarget).toBeNull();
+    expect(f.ledger.latestJobEventByRequestId(f.intent.jobId, 'silas.directive-producer-started', f.intent.requestId)).toBeNull();
+    expect(f.native.prompts).toEqual([]);
+    const head = resolveGitCommit(f.lane.path, 'HEAD');
+    const retired = f.ledger.retireInterruptedDirective({ requestId: f.intent.requestId, expectedJobId: f.intent.jobId,
+      expectedState: 'dispatching', expectedPayloadHash: f.intent.payloadHash, expectedHead: head,
+      lane: { id: f.lane.id, resolvedHead: head },
+      reason: 'interrupted before any target was retained', by: 'gru' });
+    expect(retired.record.state).toBe('retired');
   });
 
   async function assertStaleTerminalTail(tail: 'user' | 'branch' | 'assistant' | 'partial') {

@@ -134,18 +134,21 @@ function checkedJsonRecord(bytes: Buffer, kind: 'dependency' | 'build'): Buffer 
   const rev = fields['rev'];
   const committedAt = fields['committedAt'];
   const builtAt = fields['builtAt'];
+  const hasVersion = Object.prototype.hasOwnProperty.call(fields, 'version');
+  const version = fields['version'];
   const gitDate = typeof committedAt === 'string' &&
     /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-](?:0\d|1[0-4]):[0-5]\d)$/u.test(committedAt) &&
     Number.isFinite(Date.parse(committedAt));
-  if (Object.keys(fields).sort().join(',') !== 'builtAt,committedAt,rev' ||
+  if (Object.keys(fields).sort().join(',') !== (hasVersion ? 'builtAt,committedAt,rev,version' : 'builtAt,committedAt,rev') ||
     !(rev === null || (typeof rev === 'string' && /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/u.test(rev))) ||
     !(committedAt === null || gitDate) || (rev === null && committedAt !== null) ||
     typeof builtAt !== 'string' ||
     !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(builtAt) ||
+    !(version === undefined || version === null || (typeof version === 'string' && /^\d+\.\d+\.\d+$/u.test(version))) ||
     !Number.isFinite(Date.parse(builtAt))) {
     throw new Error('review build identity has an unsafe schema');
   }
-  // builtAt is valid metadata for the UI, not executable behavior.
+  // builtAt and version are valid metadata for the UI, not executable behavior.
   return Buffer.from(JSON.stringify([rev, committedAt]));
 }
 

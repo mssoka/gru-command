@@ -8,9 +8,16 @@
  * origin/main commits not reachable from it. The board snapshot carries
  * the cached view — one git check per interval, never one per client.
  *
+ * Release tags are the second signal: `latestTag` is the newest stable
+ * `vX.Y.Z` reachable from origin/main (the only thing an update can
+ * deliver), `buildTag` the highest one reachable from the build, and
+ * `updateAvailable` is true only when the build does not contain that
+ * deliverable release. A tag that is not on origin/main is never
+ * advertised — otherwise `roll` (pull main) could never clear the flag.
+ *
  * Every git step is best-effort and loud in `checkError`: an offline host
- * still renders (against the last fetched origin/main), it never invents
- * a count.
+ * still renders (against the last fetched origin/main and tags), it never
+ * invents a count or an "update available" claim.
  */
 import { execFile } from 'node:child_process';
 import type { LogLevel } from '../logger.js';
@@ -30,6 +37,15 @@ export interface DeployDriftView {
   readonly originMainCommittedAt: string | null;
   /** origin/main commits not reachable from the build (null = unknown). */
   readonly commitsBehind: number | null;
+  /** Newest stable release tag reachable from origin/main (null = none
+   * read / unknown). A tag on another ref is not deliverable and is not
+   * advertised here. */
+  readonly latestTag: string | null;
+  /** Highest stable release tag reachable from the build (null = unknown). */
+  readonly buildTag: string | null;
+  /** True when origin has a newer stable release than the build contains
+   * (null when either side is unknown — never guessed). */
+  readonly updateAvailable: boolean | null;
   /** When this view was last computed (ISO). */
   readonly checkedAt: string | null;
   /** Why the last check could not fully prove the count (null = clean). */
@@ -54,6 +70,59 @@ const REV_PARSE_TIMEOUT_MS = 5_000;
 const REV_LIST_TIMEOUT_MS = 10_000;
 const FETCH_TIMEOUT_MS = 30_000;
 const SHA_PATTERN = /^[0-9a-f]{7,64}$/;
+/** Release tags are stable `vX.Y.Z` only: a prerelease or a bookkeeping
+ * tag (backup-*, pre-rebase-*) must never read as "an update available". */
+const RELEASE_TAG_PATTERN = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+
+interface ReleaseTag {
+  readonly major: number;
+  readonly minor: number;
+  readonly patch: number;
+}
+
+/** Parse a stable release tag; anything else (prerelease, non-semver)
+ * returns null. Exported so the board's "update available" claim has one
+ * tested definition of "a release". */
+export function parseReleaseTag(name: string): ReleaseTag | null {
+  const match = RELEASE_TAG_PATTERN.exec(name.trim());
+  if (match === null) return null;
+  const [, major = '', minor = '', patch = ''] = match;
+  return { major: Number(major), minor: Number(minor), patch: Number(patch) };
+}
+
+/** Semver order between two release tags (null when either is not one). */
+export function compareReleaseTags(a: string, b: string): number | null {
+  const left = parseReleaseTag(a);
+  const right = parseReleaseTag(b);
+  if (left === null || right === null) return null;
+  return left.major - right.major || left.minor - right.minor || left.patch - right.patch;
+}
+
+/** Highest stable release tag among `names` (null when none parse). */
+export function highestReleaseTag(names: readonly string[]): string | null {
+  let best: string | null = null;
+  for (const name of names) {
+    if (parseReleaseTag(name) === null) continue;
+    if (best === null || (compareReleaseTags(name, best) ?? 0) > 0) best = name;
+  }
+  return best;
+}
+
+/** Tag names from `git ls-remote --tags origin` output (the peeled
+ * `^{}` duplicate of an annotated tag is the same tag, not a second one). */
+export function parseRemoteTagNames(stdout: string): readonly string[] {
+  const names: string[] = [];
+  for (const line of stdout.split('\n')) {
+    const tab = line.indexOf('\t');
+    if (tab < 0) continue;
+    const ref = line.slice(tab + 1).trim();
+    if (!ref.startsWith('refs/tags/')) continue;
+    const name = ref.slice('refs/tags/'.length);
+    if (name.endsWith('^{}')) continue;
+    names.push(name);
+  }
+  return names;
+}
 
 /** `git -C <root> <args>` as an async runner (never blocks the event loop). */
 export function gitRunnerFor(repoRoot: string): GitRunner {
@@ -98,6 +167,9 @@ export class DeployDriftTracker {
       originMainRev: null,
       originMainCommittedAt: null,
       commitsBehind: null,
+      latestTag: null,
+      buildTag: null,
+      updateAvailable: null,
       checkedAt: null,
       checkError: null,
     };
@@ -148,6 +220,9 @@ export class DeployDriftTracker {
     const { rev: buildRev, committedAt: buildCommittedAt } = this.opts.build;
     const checkedAt = new Date(this.now()).toISOString();
     let checkError: string | null = null;
+    const noteError = (message: string): void => {
+      checkError = checkError === null ? message : `${checkError}; ${message}`;
+    };
 
     // 1. Find origin/main. `ls-remote` is the remote truth; the local
     //    remote-tracking ref is the offline fallback (and is honest about
@@ -214,12 +289,98 @@ export class DeployDriftTracker {
       }
     }
 
+    // 4. Release tags: the newest release reachable from origin/main (the
+    //    only thing the documented update path can deliver) vs. the highest
+    //    release already contained in the running build. Remote names are
+    //    truth; local tags are fetched on demand when the newest one is
+    //    absent, so a tag created on an already-present commit cannot hide.
+    //    Nothing here may claim an update the build already contains or
+    //    that pulling main cannot deliver.
+    let latestTag: string | null = null;
+    let buildTag: string | null = null;
+    let updateAvailable: boolean | null = null;
+
+    let remoteTagNames: readonly string[] | null = null;
+    let tagsFromRemote = false;
+    try {
+      remoteTagNames = await this.remoteTagNames();
+      tagsFromRemote = true;
+    } catch (error) {
+      try {
+        remoteTagNames = await this.localTagNames();
+        // origin/main's failure already named the outage; don't repeat it.
+        if (remoteRev !== null) {
+          noteError(`release tags: read failed (${messageOf(error)}) — using last fetched tags`);
+        }
+      } catch {
+        noteError(`release tags unavailable (${messageOf(error)})`);
+      }
+    }
+
+    if (remoteTagNames !== null) {
+      const remoteNames = new Set(remoteTagNames);
+      const newestRemote = highestReleaseTag(remoteTagNames);
+      let tagsFresh = true;
+      if (newestRemote !== null) {
+        try {
+          const localNames = await this.localTagNames();
+          // Any missing stable tag can hide the build's own release (a tag
+          // created on a commit the clone already has), not just the newest.
+          const missing = remoteTagNames.some(
+            (name) => parseReleaseTag(name) !== null && !localNames.includes(name),
+          );
+          if (missing) {
+            await this.runGit(['fetch', '--quiet', '--tags', 'origin'], FETCH_TIMEOUT_MS);
+          }
+        } catch (error) {
+          tagsFresh = false;
+          noteError(`release tags: could not fetch release tags (${messageOf(error)}) — update signal may be stale`);
+        }
+      }
+
+      if (originMainRev !== null) {
+        try {
+          const mergedMain = await this.mergedTagNames(originMainRev);
+          latestTag = highestReleaseTag(mergedMain.filter((name) => remoteNames.has(name)));
+        } catch (error) {
+          noteError(`release tags: origin/main tag list unavailable (${messageOf(error)}) — update signal unknown`);
+        }
+      }
+
+      let buildTagsReadable = false;
+      if (buildRev !== null) {
+        try {
+          buildTag = highestReleaseTag(await this.mergedTagNames(buildRev));
+          buildTagsReadable = true;
+        } catch (error) {
+          noteError(`release tags: build tag list unavailable (${messageOf(error)}) — update signal unknown`);
+        }
+      }
+
+      if (latestTag !== null && buildTagsReadable) {
+        updateAvailable = buildTag === null || (compareReleaseTags(latestTag, buildTag) ?? 0) > 0;
+      }
+
+      if (
+        tagsFresh &&
+        tagsFromRemote &&
+        newestRemote !== null &&
+        latestTag !== null &&
+        (compareReleaseTags(newestRemote, latestTag) ?? 0) > 0
+      ) {
+        noteError(`release ${newestRemote} is not in origin/main — not advertised`);
+      }
+    }
+
     return {
       buildRev,
       buildCommittedAt,
       originMainRev,
       originMainCommittedAt,
       commitsBehind,
+      latestTag,
+      buildTag,
+      updateAvailable,
       checkedAt,
       checkError,
     };
@@ -258,5 +419,21 @@ export class DeployDriftTracker {
     const stdout = await this.runGit(['log', '-1', '--format=%cI', rev], REV_PARSE_TIMEOUT_MS);
     const stamp = stdout.trim();
     return stamp === '' ? null : stamp;
+  }
+
+  private async remoteTagNames(): Promise<readonly string[]> {
+    return parseRemoteTagNames(await this.runGit(['ls-remote', '--tags', 'origin'], LS_REMOTE_TIMEOUT_MS));
+  }
+
+  /** Last fetched tags — the offline fallback, honest about its age. */
+  private async localTagNames(): Promise<readonly string[]> {
+    const stdout = await this.runGit(['tag', '--list', 'v*'], REV_PARSE_TIMEOUT_MS);
+    return stdout.split('\n').map((line) => line.trim()).filter((line) => line !== '');
+  }
+
+  /** Release tags reachable from the build commit (the build's own tags). */
+  private async mergedTagNames(rev: string): Promise<readonly string[]> {
+    const stdout = await this.runGit(['tag', '--merged', rev, '--list', 'v*'], REV_PARSE_TIMEOUT_MS);
+    return stdout.split('\n').map((line) => line.trim()).filter((line) => line !== '');
   }
 }

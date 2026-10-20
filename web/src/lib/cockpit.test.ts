@@ -89,6 +89,9 @@ const BEHIND: BuildView = {
   originMainRev: 'b'.repeat(40),
   originMainCommittedAt: new Date(NOW).toISOString(),
   commitsBehind: 3,
+  latestTag: 'v1.0.1',
+  buildTag: 'v1.0.1',
+  updateAvailable: false,
   checkedAt: new Date(NOW).toISOString(),
   checkError: null,
 };
@@ -334,6 +337,21 @@ describe('cockpit health pill', () => {
     // REVIEWS has its own card and ALERTS rides the attention card.
     expect(pill.parts.map((part) => part.id)).not.toContain('reviews');
     expect(pill.parts.map((part) => part.id)).not.toContain('alerts');
+  });
+
+  it('shows an available release as deploy <tag> UPDATE AVAILABLE', () => {
+    const update: BuildView = {
+      ...BEHIND,
+      latestTag: 'v1.0.2',
+      buildTag: 'v1.0.1',
+      updateAvailable: true,
+    };
+    const pill = healthPill(snapshot([], [], null, { build: update }), NOW);
+    expect(pill.state).toBe('attention');
+    expect(pill.summary).toBe('1 needs a look');
+    expect(pill.parts.map((part) => [part.id, part.text, part.flag, part.tone, part.problem])).toEqual([
+      ['deploy', 'deploy v1.0.2', 'UPDATE AVAILABLE', 'alert', true],
+    ]);
   });
 
   it('one problem reads singular; an all-unwired board never reads healthy', () => {

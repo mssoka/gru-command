@@ -980,7 +980,7 @@ function validateLessonProposal(value: unknown, where: string): LessonProposal {
 }
 
 /**
- * Cadence trigger for the dream (default: on boot + every 12h), due-based
+ * Cadence trigger for the dream (ships weekly, issue #451), due-based
  * (issue #221): the next pass is due `lastDreamAt + intervalMs`, read from
  * the persisted dream state at start, so a service restart inherits the
  * running cadence instead of resetting it. The on-boot pass fires only

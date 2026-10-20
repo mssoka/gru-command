@@ -19,6 +19,11 @@ export default tseslint.config(
       // fetch/timers; they are archived verification artifacts, not
       // repository source, so they are not linted.
       'docs/evidence/**',
+      // The same applies to the gitignored BMAD/evidence workspace: local
+      // capture scripts there use browser and harness globals and are never
+      // part of the repository source (CI's clean clone has only tracked
+      // files, but a developer checkout must lint the same set).
+      '_bmad-output/**',
     ],
   },
   js.configs.recommended,

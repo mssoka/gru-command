@@ -121,6 +121,7 @@ test.beforeAll(async () => {
     decisionKey: 'E2E-FILE-CREDENTIAL-CANARY',
     nodeImport: JEV_PRELOAD,
     extraEnv: { JEV_FETCH_LOG, JEV_FETCH_MODE_FILE: JEV_MODE_FILE },
+    reviewEnabled: false,
   });
   durableHome = service.home;
   durableWorkspace = service.workspace;
@@ -223,8 +224,8 @@ test('real native compact preserves history and New chat starts unresumed behind
   const oldPointer = readPointer();
   const oldBytes = readFileSync(oldPointer.sessionFile);
 
-  page.once('dialog', (dialog) => dialog.accept());
   await page.locator('#chat-new').click();
+  await page.locator('.gru-modal__confirm').click();
   await expect(page.locator('.msg--user', { hasText: 'real context control old words' })).toHaveCount(0);
   // The UI clears before the service has necessarily persisted the new
   // epoch pointer (the write is asynchronous): wait for the durable advance
@@ -303,6 +304,7 @@ test('service restart drops the socket; reconnect keeps history and flushes the 
     workspace: durableWorkspace,
     nodeImport: JEV_PRELOAD,
     extraEnv: { JEV_FETCH_LOG, JEV_FETCH_MODE_FILE: JEV_MODE_FILE },
+    reviewEnabled: false,
   });
   await expect(page.locator('#banners .banner:visible')).toHaveCount(0, { timeout: 15_000 });
   const flushedReply = echoReplies(page, 'typed while down').last();
@@ -588,6 +590,7 @@ test.describe('themes', () => {
       port: themesPort,
       token: REAL_TOKEN,
       requireWebDist: false,
+      reviewEnabled: false,
     });
   });
   test.afterAll(async () => {
@@ -639,6 +642,11 @@ test('Settings recheck shows real degraded → recovered Jev state and resolved 
     await pair(page);
     await page.locator('#settings-toggle').click();
     await expect(page.locator('#settings-view')).toBeVisible();
+    // The modal owns the title: exactly one "Settings" heading renders
+    // (the borrowed panel's own .lbl row is gone), and the classifier's
+    // sub-label survives inside the body.
+    await expect(page.locator('.gru-modal__title')).toHaveText('Settings');
+    await expect(page.locator('.gru-modal__card .lbl')).toHaveCount(1);
     await expect(page.locator('#decisions-stamp')).toHaveText('READY');
     await expect(page.locator('#decisions-meta')).toContainText('file credential');
 
@@ -652,6 +660,10 @@ test('Settings recheck shows real degraded → recovered Jev state and resolved 
     await expect(page.locator('#decisions-stamp')).toHaveText('READY');
     await expect(page.locator('#decisions-recheck')).toBeEnabled();
 
+    // The settings dialog is modal: close it before reaching past the
+    // scrim for the notification bell.
+    await page.locator('.gru-modal__close').click();
+    await expect(page.locator('.gru-modal')).toHaveCount(0);
     await page.locator('#notification-bell').click();
     const incident = page.locator('.board-notification', { hasText: 'Jev degraded' }).first();
     await expect(incident).toContainText('resolved');
@@ -678,6 +690,7 @@ test('missing-key enabled startup is durable degraded: a browser connected AFTER
     decisionsEnabled: true,
     nodeImport: JEV_PRELOAD,
     extraEnv: { JEV_FETCH_LOG, JEV_FETCH_MODE_FILE: JEV_MODE_FILE },
+    reviewEnabled: false,
   });
   try {
     await page.goto(`http://127.0.0.1:${port}`);
@@ -689,6 +702,10 @@ test('missing-key enabled startup is durable degraded: a browser connected AFTER
     await page.locator('#settings-toggle').click();
     await expect(page.locator('#decisions-stamp')).toHaveText('FALLBACK');
     await expect(page.locator('#decisions-summary')).toContainText('credential');
+    // The settings dialog is modal: close it before reaching past the
+    // scrim for the notification bell.
+    await page.locator('.gru-modal__close').click();
+    await expect(page.locator('.gru-modal')).toHaveCount(0);
     // And the durable incident is on the authenticated BOARD surface for a
     // browser that connected after startup (no CLI-only error, no phantom
     // receipt). The panel lives inside #board-view — open it from the bell.

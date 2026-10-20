@@ -1442,12 +1442,13 @@ describe('board server — report-handback decision signals (issue #314)', () =>
     harness.api.addJob({ id: jobId, repo: 'r', title: 'Review report', deliverable: 'review', commissioner: 'gru' });
     harness.api.setJobStatus(jobId, 'working');
     harness.api.setJobStatus(jobId, 'delivered');
-    harness.api.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: 'reviewed-head' } });
+    const delivery = harness.api.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: 'reviewed-head' } });
+    harness.api.openReportObligation({ jobId, observedAtSeq: delivery.seq });
     const result = reconcileReportClosures({
       ledger: harness.api,
       notifications: new NotificationCenter({ ledger: harness.api, bus: harness.bus }),
     });
-    expect(result).toMatchObject({ opened: 1, published: 1, failed: 0 });
+    expect(result).toMatchObject({ opened: 0, published: 1, failed: 0 });
     return harness.api.findNotificationByKind(`silas.report-handback.${jobId}`, 'active')!.id;
   }
 

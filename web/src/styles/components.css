@@ -706,10 +706,10 @@ body {
   gap: 16px;
 }
 
-/* The unpaired/settings cards stay a comfortable reading column even on
-   the full-estate console (the console itself is the wide surface). */
-#pairing-view,
-#settings-view {
+/* The unpaired pairing card stays a comfortable reading column even on
+   the full-estate console (the console itself is the wide surface);
+   settings rides the Gru modal, which caps its own width. */
+#pairing-view {
   width: min(920px, 100%);
   justify-self: center;
 }
@@ -1680,10 +1680,11 @@ body {
 /* Settings stub                                                       */
 /* ------------------------------------------------------------------ */
 
+/* Settings content rides the Gru modal; the dialog's card owns the
+   padding — the grid here only spaces the rows. */
 .settings {
   display: grid;
   gap: 12px;
-  padding: 18px;
 }
 
 .settings__row {
@@ -4233,3 +4234,106 @@ a.repo-row__name:hover {
 
 .mailbox-detail { padding: .5rem 1rem; font-size: .8rem; color: var(--muted); overflow-wrap: anywhere; }
 .mailbox-incident { padding: .75rem; border: 1px solid currentColor; border-radius: .4rem; }
+
+/* ── Gru modal dialogs: the themed overlay ──────────────────────
+   The ONE in-app dialog surface (confirmations replace window.confirm;
+   Settings rides it as borrowed content). A dim scrim plus a card at
+   the middle of the viewport — wherever the opening gesture happened
+   to be — instead of browser chrome parked at the top of the screen. */
+.gru-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 70; /* above the transcript drawer (60); the scrim owns clicks */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(20, 26, 43, 0.45);
+  animation: scrim-in 0.18s ease;
+}
+
+/* The page behind an open dialog neither scrolls nor steals the gesture. */
+html.gru-modal-open {
+  overflow: hidden;
+}
+
+.gru-modal__card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: min(480px, 100%);
+  max-height: calc(100vh - 40px);
+  max-height: calc(100dvh - 40px);
+  padding: 18px;
+  animation: gru-modal-pop 0.22s var(--ease-pop);
+}
+
+@keyframes gru-modal-pop {
+  from { transform: translateY(12px) scale(0.96); opacity: 0; }
+  to { transform: translateY(0) scale(1); opacity: 1; }
+}
+
+.gru-modal__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.gru-modal__glyph {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border: var(--outline);
+  border-radius: 50%;
+  background: var(--work);
+  font-size: 17px;
+  box-shadow: var(--shadow-btn-pressed);
+}
+
+.gru-modal__title {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  font-size: 17px;
+  font-weight: 800;
+  overflow-wrap: anywhere;
+}
+
+.gru-modal__close {
+  flex: none;
+  padding: 6px 10px;
+}
+
+.gru-modal__body {
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  gap: 12px;
+  align-content: start;
+}
+
+.gru-modal__text {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.gru-modal__actions {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.gru-modal__confirm--danger {
+  background: var(--alert);
+}
+
+.gru-modal__confirm-card {
+  display: grid;
+  gap: 12px;
+}

@@ -12,8 +12,8 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * Perkins review outcome capture (issue #221): when a review round posts
  * a verdict, every blocker in its durable consolidated record becomes ONE
  * deliberate journal entry, so the dream learns from reviews without
- * Bob's hourly consolidation pass. The entry is exactly the shape the
- * journal validates: kind `finding`, source `perkins:<roundId>` (valid
+ * waiting for Bob's periodic consolidation pass. The entry is exactly the
+ * shape the journal validates: kind `finding`, source `perkins:<roundId>` (valid
  * under SOURCE_PATTERN), tags `repo:<repo>`, `review:blocker`,
  * `category:<category>`, and a bounded, redacted
  * `<title> — <location>: <detail>` body.

@@ -44,16 +44,16 @@ behind the pairing token, like every other mutating surface.
 ### 2. Dream (distillation)
 
 A cadence job, **due-based** (`[lessons]` `dream_interval_ms`,
-`dream_on_boot`): the next pass is due `lastDreamAt + interval`, read
-from the persisted dream state, so a service restart inherits the
-running cadence instead of resetting it (issue #221 — with a long
-interval and a service that restarts daily, a boot-reset timer would
-never fire). The on-boot pass runs only when the dream is already due,
-and a beat with no new journal entries never calls the distiller. Bob
-reads the journal entries newer than the last dream, merges repeats
-into their existing lesson (`recurred: N`, provenance unioned),
-rewrites **only the affected chapters**, and enforces the caps by
-trimming — never by appending journal text verbatim. Every lesson
+`dream_on_boot`), shipping **weekly** since issue #451: the next pass is
+due `lastDreamAt + interval`, read from the persisted dream state, so a
+service restart inherits the running cadence instead of resetting it
+(issue #221 — with a long interval and a service that restarts daily, a
+boot-reset timer would never fire). The on-boot pass runs only when the
+dream is already due, and a beat with no new journal entries never calls
+the distiller. Bob reads the journal entries newer than the last dream,
+merges repeats into their existing lesson (`recurred: N`, provenance
+unioned), rewrites **only the affected chapters**, and enforces the caps
+by trimming — never by appending journal text verbatim. Every lesson
 cites its journal ids and dates.
 
 The cursor only advances after a successful apply: a failed pass retries
@@ -103,7 +103,7 @@ callers that want them explicitly.
 ```toml
 [lessons]
 enabled = true               # false: no dream cadence, no pointer injection
-dream_interval_ms = 43200000 # due lastDreamAt + interval; 0 disables the periodic pass
+dream_interval_ms = 604800000 # weekly; due lastDreamAt + interval; 0 disables the periodic pass
 dream_on_boot = true         # boot pass only when the dream is already due
 chapter_cap_bytes = 4096     # per chapter; the dream trims to fit
 index_cap_bytes = 1024       # INDEX.md hard cap — the only embedded part

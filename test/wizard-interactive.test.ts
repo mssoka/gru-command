@@ -48,9 +48,12 @@ function ptyWizard(steps: readonly Step[], env: NodeJS.ProcessEnv, flags: readon
       env: { ...process.env, ...env }, encoding: 'utf-8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'],
     });
   } catch (error) {
-    const err = error as { stdout?: string; status?: number };
-    output = err.stdout ?? '';
+    // The wizard's own diagnosis is on stderr; a bare `spawn …` stdout echo
+    // is unreadable in CI. Both streams and the exit code travel together.
+    const err = error as { stdout?: string; stderr?: string; status?: number };
     status = err.status ?? 1;
+    const stderr = err.stderr?.trim();
+    output = `${err.stdout ?? ''}${stderr === undefined || stderr === '' ? '' : `\n--- expect stderr ---\n${stderr}`}\n--- exit ${String(status)} ---`;
   }
   return { output: output.replace(/\r/g, ''), status };
 }

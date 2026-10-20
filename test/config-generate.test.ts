@@ -133,10 +133,12 @@ describe('config-generate CLI', () => {
     expect(loaded.managedRepos).toEqual([]);
     expect(loaded.models.default).toBe('default');
     expect(loaded.thinking.default).toBe('default');
-    // Issue #221 headline default, pinned at the generator: a fresh install
-    // ships with Bob's knock disabled (restoring 3_600_000 must fail here).
-    expect((raw.dispatch as Record<string, number>).bob_interval_ms).toBe(0);
-    expect(loaded.dispatch.bobIntervalMs).toBe(0);
+    // Issue #451 headline default, pinned at the generator: a fresh install
+    // ships with Bob's weekly knock (and the weekly dream) enabled.
+    expect((raw.dispatch as Record<string, number>).bob_interval_ms).toBe(604_800_000);
+    expect(loaded.dispatch.bobIntervalMs).toBe(604_800_000);
+    expect(raw.lessons).toMatchObject({ dream_interval_ms: 604_800_000 });
+    expect(loaded.lessons.dreamIntervalMs).toBe(604_800_000);
     expect(raw.concurrency).toMatchObject({ max_workers: 4 });
     expect(raw.review).toMatchObject({ max_concurrent_children: 2 });
     // #427: onboarding is proposed (FOR YOU cards) on a fresh install.

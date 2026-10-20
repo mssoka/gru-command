@@ -37,6 +37,9 @@ export function ownerNoticeGuidance(kind: string): string {
   if (kind.startsWith('decisions.degraded.')) {
     return 'Fix the decision-provider credential or configuration, then use Recheck. This notice clears when the decision service recovers.';
   }
+  if (kind === 'perkins-app-bundle-missing') {
+    return 'Install the Perkins GitHub App bundle in the instance dir (README Prerequisites) and restart the service — github.com verdicts publish as the App identity. The notice clears at the first boot that resolves the bundle, or when [review] is disabled; a GitLab-only instance is unaffected.';
+  }
   if (kind === 'worktree-sweep-paused' || kind.startsWith('worktree-sweep-paused:')) {
     return 'Confirm nothing live is rooted in the listed worktree. The sweep stays paused until an operator deliberately completes it; the notice clears when that worktree is swept.';
   }

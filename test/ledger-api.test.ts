@@ -1273,9 +1273,10 @@ describe('decision memory (issue #218)', () => {
       ledger.addJob({ id: jobId, repo: 'r', title: 'Review report', deliverable: 'review', commissioner: 'gru' });
       ledger.setJobStatus(jobId, 'working');
       ledger.setJobStatus(jobId, 'delivered');
-      ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: 'reviewed-head' } });
+      const delivery = ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: 'reviewed-head' } });
+      ledger.openReportObligation({ jobId, observedAtSeq: delivery.seq });
       expect(reconcileReportClosures({ ledger, notifications: new NotificationCenter({ ledger, bus: new EventBus() }) }))
-        .toMatchObject({ opened: 1, published: 1, failed: 0 });
+        .toMatchObject({ opened: 0, published: 1, failed: 0 });
       const notificationId = ledger.findNotificationByKind(`silas.report-handback.${jobId}`, 'active')!.id;
       const mailbox = new GruMailbox(ledger, () => now);
       const item = mailbox.snapshot().items.find((row) => row.notificationIds.includes(notificationId))!;

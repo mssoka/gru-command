@@ -169,14 +169,17 @@ export function reconcileDurableWork(
 
 /**
  * Report-job closure (issue #220): handback debt recovery, the
- * commissioner's action-required card, and auto-supersede. Ledger-only,
- * no filesystem probing.
+ * commissioner's action-required card, and auto-supersede. Reads ledger
+ * rows plus each candidate's own persisted native evidence files (session
+ * transcript, producers, lock) — never probes repositories or worktrees.
  *
- *  1. BACKSTOP — a delivered report-type job whose handback lost its
- *     obligation open (crash between the delivery event and the insert)
- *     is re-opened from its own delivery event (idempotent). Legacy NULL
- *     rows are deliberately excluded: the backfill CLI owns those and the
- *     owner reviews its dry-run list before anything writes.
+ *  1. BACKSTOP — a working/delivered report-type job with a lost status or
+ *     handback transition is recovered only from its settled, exact successful
+ *     native delivery with matching receipt and positive physical cessation.
+ *     A proven working report advances to delivered; code-candidate cleanliness
+ *     is not required for this report duty.
+ *     Legacy NULL rows are deliberately excluded: the backfill CLI owns
+ *     those and the owner reviews its dry-run list before anything writes.
  *  2. CARD — every LIVE report obligation (not one the backfill already
  *     surfaced to the owner via its dry-run list) gets ONE stable-kind
  *     action-required card, deduped across passes and restarts.
@@ -212,7 +215,7 @@ export function reconcileReportClosures(
   // (1+2) Backstop + card, paged under a durable cursor.
   let backstopCursor = deps.ledger.readReconcileCursor(REPORT_BACKSTOP_SCOPE) ?? 0;
   for (let page = 0; page < maxPages; page += 1) {
-    const rows = deps.ledger.listDeliveredReportJobs(pageSize, { cursor: backstopCursor });
+    const rows = deps.ledger.listReportHandbackRecoveryJobs(pageSize, { cursor: backstopCursor });
     if (rows.length === 0) {
       backstopCursor = 0;
       break;
@@ -220,17 +223,19 @@ export function reconcileReportClosures(
     for (const job of rows) {
       examined += 1;
       try {
-        let active = deps.ledger.findReportObligation(job.id);
+        const recovered = deps.ledger.reconcileReportHandback(job.id);
+        const active = recovered?.obligation ?? deps.ledger.findReportObligation(job.id);
+        if (recovered?.created === true) opened += 1;
         if (active === null || (active.state !== 'open' && active.state !== 'waiting' && active.state !== 'suspended')) {
-          const delivered = deps.ledger.latestCandidateDelivery(job.id);
-          if (delivered === null) {
+          // An ineligible-but-present delivery is examined, not failed. A
+          // delivered report with no delivery event at all is ledger damage:
+          // count it and say so instead of passing silently.
+          if (active === null && job.status === 'delivered' &&
+              deps.ledger.latestJobEvent(job.id, 'job.delivered') === null) {
             failed += 1;
             deps.log?.('error', 'delivered report job has no delivery event — cannot open its obligation', { job: job.id });
-            continue;
           }
-          const result = deps.ledger.openReportObligation({ jobId: job.id, observedAtSeq: delivered.seq });
-          active = result.obligation;
-          if (result.created) opened += 1;
+          continue; // report acceptance or an ineligible delivery is not completion
         }
         // The card: live debts only. A backfilled debt was surfaced to the
         // owner as a dry-run row before --apply, so carding it here would

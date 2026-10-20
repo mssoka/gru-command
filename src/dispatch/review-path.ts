@@ -26,6 +26,13 @@ export const REVIEW_CAPABILITY_LEGS = [
 
 export type ReviewCapabilityLeg = (typeof REVIEW_CAPABILITY_LEGS)[number];
 
+/** Non-blocking advisory legs: named capability gaps that do not decide the
+ * route. `verdict-publication-identity` (issue #444) is the case where the
+ * Perkins gate runs but its verdict cannot post as the designed identity. */
+export const REVIEW_ADVISORY_LEGS = ['verdict-publication-identity'] as const;
+
+export type ReviewAdvisoryLeg = (typeof REVIEW_ADVISORY_LEGS)[number];
+
 export interface ReviewCapabilityFailure {
   readonly leg: ReviewCapabilityLeg;
   readonly detail: string;
@@ -33,9 +40,21 @@ export interface ReviewCapabilityFailure {
   readonly remediation: string;
 }
 
+/** A named leg that is DEGRADED, not failed: the round still routes to
+ * Perkins exactly as it would without the advisory. */
+export interface ReviewPreflightWarning {
+  readonly leg: ReviewAdvisoryLeg;
+  readonly detail: string;
+  /** User-facing instruction for restoring the full capability. */
+  readonly remediation: string;
+}
+
 export interface ReviewPreflightResult {
   readonly ok: boolean;
   readonly failures: readonly ReviewCapabilityFailure[];
+  /** Non-blocking advisories evaluated on the same pass. Never changes the
+   * route; the caller reports them and continues. */
+  readonly warnings?: readonly ReviewPreflightWarning[];
   /** In-memory request-owned proof, never included in fallback findings. */
   readonly reviewModel?: ClaudeReviewSnapshot;
   /** Effective non-secret thinking policy captured beside the model probe. */
@@ -59,6 +78,18 @@ export type ReviewLegCheck = () => void | Promise<void>;
 
 export function preflightFailure(leg: ReviewCapabilityLeg, detail: string): ReviewCapabilityFailure {
   return { leg, detail, remediation: LEG_REMEDIATION[leg] };
+}
+
+/** The round-side report of non-blocking advisories (issue #444): a route
+ * that continues must still name what is degraded. Null when there is
+ * nothing to say, so the caller never logs an empty advisory line. */
+export function preflightAdvisoryFields(result: ReviewPreflightResult): Record<string, unknown> | null {
+  const warnings = result.warnings ?? [];
+  if (warnings.length === 0) return null;
+  return {
+    advisories: warnings.map((warning) => `${warning.leg}: ${warning.detail}`),
+    remediation: warnings.map((warning) => warning.remediation),
+  };
 }
 
 /** Fail-closed four-leg pre-flight. Every check runs; failures accumulate

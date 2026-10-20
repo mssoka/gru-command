@@ -14,7 +14,8 @@
  * (byte-identical payload shape to the web pairing screen; the smoke's
  * discovered port when ephemeral) → onboarding consent file → optional
  * OS-service registration (install.sh --service — one mechanism, only
- * after a green smoke).
+ * after a green smoke) → Perkins App bundle prerequisite status with the
+ * setup guide inline (issue #444).
  */
 
 import { spawn, spawnSync } from 'node:child_process';
@@ -938,6 +939,15 @@ async function main(argv: readonly string[]): Promise<number> {
       fail(`service registration failed (exit ${result.status ?? 'signal'})`);
     }
   }
+
+  // Install prerequisite (issue #444): review verdicts on github.com publish
+  // as the installed Perkins App, never the personal `gh` identity. The
+  // wizard writes [review] enabled = true, so a missing bundle is named here
+  // — with the setup guide inline — instead of surfacing after a full review
+  // round dies on a self-author 422. Loaded dynamically so the wizard's
+  // static module graph stays light (it drags the dispatch/perkins graph).
+  const { renderPerkinsAppPrerequisiteNote } = await import('../dispatch/verdict-publication-identity.js');
+  stdout.write(`\n${renderPerkinsAppPrerequisiteNote(instanceDir, prior?.dataDir, prior?.review.enabled ?? true)}`);
 
   stdout.write('\nSetup complete. Start the service: node dist/main.js (or ./install.sh --service).\n');
   return 0;

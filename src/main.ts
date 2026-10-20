@@ -28,7 +28,12 @@ import { WorktreeManager } from './worktrees/manager.js';
 import { createWorktreeServer } from './worktrees/server.js';
 import { createReviewEscalationNotifier } from './dispatch/escalation-identity.js';
 import { createStartupVerdictPoster } from './dispatch/perkins-github-app.js';
-import { BobScheduler } from './dispatch/bob-scheduler.js';
+import {
+  assessVerdictPublicationIdentity,
+  reportVerdictPublicationIdentity,
+  verdictPublicationIdentityWarning,
+} from './dispatch/verdict-publication-identity.js';
+import { BOB_STATE_FILE, BobScheduler, bobStateFile, singleFlightSlot } from './dispatch/bob-scheduler.js';
 import { SilasDriver, computeSilasDigest, consolidatedBlockersFor, supervisionLookup } from './dispatch/silas-driver.js';
 import { spawnSilasWithActionTool } from './dispatch/silas-model-action.js';
 import { composeDeterministicPass, createSilasAutopilotHook } from './dispatch/silas-autopilot-pass.js';
@@ -164,7 +169,8 @@ function reportForeignListener(
   });
 }
 
-/** Fail-closed four-leg review pre-flight (user amendment 2026-09-20). */
+/** Fail-closed four-leg review pre-flight (user amendment 2026-09-20),
+ * plus the non-blocking verdict-publication-identity advisory (issue #444). */
 async function reviewPreflightCheck(
   config: ReturnType<typeof loadConfig>,
   registry: RuntimeRegistry,
@@ -192,7 +198,24 @@ async function reviewPreflightCheck(
     },
     'review-policy': () => probeReviewPolicy({ reviewEnabled: () => config.review.enabled }),
   });
-  return preflight.ok && thinking !== undefined ? { ...preflight, reviewThinkingLevel: thinking } : preflight;
+  const result = preflight.ok && thinking !== undefined ? { ...preflight, reviewThinkingLevel: thinking } : preflight;
+  // Named, non-blocking advisory (issue #444): `[review] enabled = true`
+  // with no Perkins App bundle means this round would run and then fail to
+  // publish on a self-author 422. The route is deliberately unchanged (the
+  // documented legacy publisher stays a compatibility boundary); the gap is
+  // named at the request instead of after a full wasted round. The remote
+  // probe runs only when the gap exists, so App-mode requests pay nothing.
+  const identity = assessVerdictPublicationIdentity({
+    instanceDir: config.instanceDir,
+    dataDir: config.dataDir,
+    reviewEnabled: config.review.enabled,
+  });
+  // The advisory belongs to the Perkins route only: a failed leg already
+  // routes to the fallback gate, which posts no Perkins verdict.
+  const warning = !result.ok || identity.gap === null
+    ? null
+    : verdictPublicationIdentityWarning(identity, repoRemote(repoPath));
+  return warning === null ? result : { ...result, warnings: [...(result.warnings ?? []), warning] };
 }
 import { ChatFrameLog } from './chat/frame-log.js';
 import { createChatServer } from './chat/server.js';
@@ -432,8 +455,9 @@ async function main(): Promise<number> {
   // Perkins verdicts are learning inputs (issue #221): every posted round
   // verdict journals its consolidated blockers as deliberate finding
   // entries (source perkins:<round>), so the dream learns from reviews
-  // without Bob's hourly pass. Idempotent per round via a sidecar next to
-  // the review artifacts; runs regardless of [lessons] enabled — capture
+  // without waiting for Bob's periodic pass. Idempotent per round via a
+  // sidecar next to the review artifacts; runs regardless of [lessons]
+  // enabled — capture
   // is deliberate and must never be lost.
   createReviewOutcomeCapture({
     bus,
@@ -1055,6 +1079,29 @@ async function main(): Promise<number> {
       },
     );
   };
+  // Install prerequisite (issue #444): github.com verdicts are published by
+  // the installed Perkins App (`perkins-review[bot]`), never the personal
+  // `gh` identity — and the poster is selected once, at startup. A missing
+  // bundle is therefore a BOOT fact: say so now (error line + one
+  // owner-required incident, resolved once the bundle resolves or reviews
+  // are off) instead of letting a complete review round die on a
+  // self-author 422. Posted after `surfaceInChat` is bound so the owner bell
+  // (chat notice) actually rings, and guarded like every other boot notice:
+  // a prerequisite must never keep the service from starting.
+  try {
+    reportVerdictPublicationIdentity({
+      instanceDir: config.instanceDir,
+      dataDir: config.dataDir,
+      reviewEnabled: config.review.enabled,
+      notifications,
+      log: (level, msg, fields) => logger.log(level, msg, fields),
+    });
+  } catch (error) {
+    logger.error('verdict publication identity check failed — booting anyway', {
+      error: String(error),
+      instance_dir: config.instanceDir,
+    });
+  }
   state.supervisor = supervisorLive;
   // Enabled installs perform exactly one bounded synthetic check before
   // the server listens; disabled installs do not resolve a credential or
@@ -1439,9 +1486,16 @@ async function main(): Promise<number> {
     role: 'bob',
     spawn: (spawnOptions) => registry.spawn('bob', spawnOptions ?? {}),
   });
+  // One memory agent, two triggers: the dream pass and Bob's knock can both
+  // be due at boot, so their concurrent ensures are coalesced onto one spawn
+  // instead of creating two bob sessions before either adopts.
+  const memorySlot = singleFlightSlot(bobSlot);
   const bob = new BobScheduler({
     intervalMs: config.dispatch.bobIntervalMs,
-    slot: bobSlot,
+    slot: memorySlot,
+    // Due-based cadence (issue #451): the schedule persists in the data
+    // home, so a restart no longer resets a week-long interval.
+    state: bobStateFile(join(config.dataDir, BOB_STATE_FILE)),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   // The dream pass shares Bob's supervised slot (one memory agent, two
@@ -1457,7 +1511,7 @@ async function main(): Promise<number> {
         journal,
         bible,
         distiller: new AgentLessonsDistiller({
-          slot: bobSlot,
+          slot: memorySlot,
           bibleDir: bible.dir,
           log: (level, msg, fields) => logger.log(level, msg, fields),
         }),

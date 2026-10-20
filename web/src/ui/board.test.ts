@@ -551,6 +551,9 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
           originMainRev: 'b'.repeat(40),
           originMainCommittedAt: new Date().toISOString(),
           commitsBehind: 43,
+          latestTag: null,
+          buildTag: null,
+          updateAvailable: null,
           checkedAt: new Date().toISOString(),
           checkError: null,
         },
@@ -572,6 +575,33 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
     expect(verify?.classList.contains('command-health__part--warn')).toBe(true);
     expect(verify?.firstChild?.textContent).toBe('verify lock held');
     expect(verify?.querySelector('.command-health__flag')?.textContent).toBe('2 QUEUED');
+  });
+
+  it('renders an available release as the deploy alert with its tag and flag', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        build: {
+          buildRev: 'a'.repeat(40),
+          buildCommittedAt: new Date(Date.now() - 6 * 3_600_000).toISOString(),
+          originMainRev: 'b'.repeat(40),
+          originMainCommittedAt: new Date().toISOString(),
+          commitsBehind: 43,
+          latestTag: 'v1.0.2',
+          buildTag: 'v1.0.1',
+          updateAvailable: true,
+          checkedAt: new Date().toISOString(),
+          checkError: null,
+        },
+      }),
+    );
+    const pill = document.getElementById('command-health')!;
+    expect(pill.dataset.state).toBe('attention');
+    expect(document.getElementById('command-health-summary')?.textContent).toBe('1 needs a look');
+    const deploy = pill.querySelector<HTMLElement>('.command-health__part[data-check="deploy"]')!;
+    expect(deploy.firstChild?.textContent).toBe('deploy v1.0.2');
+    expect(deploy.querySelector('.command-health__flag')?.textContent).toBe('UPDATE AVAILABLE');
+    expect(deploy.classList.contains('command-health__part--alert')).toBe(true);
   });
 
   it('never reads an unwired board as healthy: n/a checks stay out of the text and in the title', () => {

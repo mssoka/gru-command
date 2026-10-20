@@ -240,11 +240,16 @@ export const DEFAULT_MIN_FREE_DISK_GB = 10;
 /** Dispatch flow policy (E8). */
 export interface DispatchConfig {
   /** Bob's periodic consolidation interval; 0 disables the trigger. Ships
-   * 0 (issue #221): the due-based dream pass is the learning loop that
-   * feeds the crew, and the hourly knock mostly found nothing — its
-   * memory files feed no code path. Re-enable deliberately. */
+   * 7 days (owner instruction 2026-10-19, issue #451). The knock is
+   * due-based — due at `lastBobAt + bobIntervalMs` from persisted state —
+   * so a restart inherits the cadence instead of resetting a week-long
+   * timer. */
   readonly bobIntervalMs: number;
 }
+
+export const DEFAULT_DISPATCH_CONFIG: DispatchConfig = {
+  bobIntervalMs: 604_800_000,
+};
 
 /** Book of Lessons policy (owner design 2026-09-23): journal capture →
  * dream distillation → bible references. */
@@ -253,10 +258,12 @@ export interface LessonsConfig {
    * journal API stays available either way (capture is deliberate, and a
    * disabled dream must never lose entries). */
   readonly enabled: boolean;
-  /** Dream cadence in ms: on boot plus every interval; 0 disables the
-   * periodic trigger (the on-boot pass still runs). Default 12 h. */
+  /** Dream cadence in ms: due `lastDreamAt + dreamIntervalMs`, with an
+   * on-boot pass only when already due; 0 disables the periodic trigger.
+   * Default 7 days (issue #451; it was 12 h). */
   readonly dreamIntervalMs: number;
-  /** Run one dream pass at service boot when new journal entries exist. */
+  /** Run one dream pass at service boot when the dream is already due
+   * (a beat with no new journal entries never calls the distiller). */
   readonly dreamOnBoot: boolean;
   /** Hard cap per chapter file; the dream trims to fit. */
   readonly chapterCapBytes: number;
@@ -268,7 +275,7 @@ export interface LessonsConfig {
 
 export const DEFAULT_LESSONS_CONFIG: LessonsConfig = {
   enabled: true,
-  dreamIntervalMs: 43_200_000,
+  dreamIntervalMs: 604_800_000,
   dreamOnBoot: true,
   chapterCapBytes: 4_096,
   indexCapBytes: 1_024,
@@ -1216,7 +1223,7 @@ export function loadConfig(
     morningDigestGapMs: 28_800_000,
   };
   let worktrees: WorktreesConfig | null = null;
-  let dispatch: DispatchConfig = { bobIntervalMs: 0 };
+  let dispatch: DispatchConfig = DEFAULT_DISPATCH_CONFIG;
   let lessons: LessonsConfig = DEFAULT_LESSONS_CONFIG;
   let silas: SilasConfig = DEFAULT_SILAS_CONFIG;
   let providerRecovery: ProviderRecoveryConfig = DEFAULT_PROVIDER_RECOVERY_CONFIG;

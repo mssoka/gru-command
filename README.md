@@ -76,6 +76,46 @@ here before the v1.0.0 tag)*
   ([PERKINS-APP-PUBLICATION.md](docs/PERKINS-APP-PUBLICATION.md)). Run
   `gh auth login` with a token that can read the repositories (`repo`
   scope for private repos) and confirm with `gh auth status`.
+- **Perkins App bundle — install prerequisite for review verdicts.** On
+  github.com, Perkins publishes its verdicts as the installed GitHub App
+  (`perkins-review[bot]`), never your personal `gh` account (owner ruling
+  2026-09-27): GitHub rejects an account approving its own pull request,
+  and every heist PR is created by that same `gh` identity. The service
+  selects its publisher once at startup, so provision the bundle before
+  the first review round:
+
+  1. **GitHub App** — install it (id `4366368` for this deployment) in the
+     org that hosts the reviewed repositories, with access to those
+     repositories. Note each owner's **installation id** from the
+     installation URL.
+  2. **Bundle** — in the instance dir (default `~/.gru-command/`), as
+     literal `KEY=VALUE` data (parsed as bytes, never sourced as a shell
+     script):
+
+     ```text
+     ~/.gru-command/perkins/config        # 0600
+       app_id=4366368
+       key_path="/absolute/path/to/app-key.pem"
+       installation_id_<owner>=<installation id>   # one per reviewed owner
+     ~/.gru-command/perkins/app-key.pem   # 0600, the RSA PEM from the App settings page
+     ```
+
+     Regular files owned by the service user, owner-only (`0600`; a
+     hardened `0400` is accepted); the bundle directory itself exactly
+     `0700`. One `installation_id_<owner>` per reviewed repository owner
+     (case-insensitive, hyphens fine).
+  3. **Restart the service** — the poster resolves the bundle at startup
+     only.
+  4. **Verify** — run a review round; the verdict must post as
+     `perkins-review[bot]`. If it posts as your personal account, the
+     bundle did not resolve.
+
+  With `[review] enabled = true`, the setup wizard and every service boot
+  name the gap (`verdict publication identity: MISSING — reviews will run
+  but verdicts cannot post (self-author 422)`) instead of letting a full
+  round die on the `422`; the legacy personal-`gh` publisher remains a
+  documented compatibility fallback, never a silent one. Full reference:
+  [PERKINS-APP-PUBLICATION.md](docs/PERKINS-APP-PUBLICATION.md).
 
 GitHub signal ingestion is poll-only — no webhooks, no inbound tunnel.
 
@@ -83,8 +123,12 @@ GitHub signal ingestion is poll-only — no webhooks, no inbound tunnel.
 
 1. **Install** — the one-liner (or clone + `./install.sh`) below installs
    dependencies, builds the service and web UI, and runs the wizard. The
-   wizard writes the live config at `~/.gru-command/config.toml` and
-   smoke-tests first boot. Re-running the one-liner is a safe updater.
+   wizard writes the live config at `~/.gru-command/config.toml`,
+   smoke-tests first boot, and prints whether the Perkins App bundle (the
+   verdict-publication prerequisite above) is in place — with the setup
+   guide inline when it is not. Re-running the one-liner is a safe updater;
+   it keeps the existing config, skips the wizard, and surfaces a missing
+   bundle at the next service boot.
 2. **Register the service** — `./install.sh --service` registers and
    starts the login OS service (see [Run](#run)); `./install.sh
    --uninstall` removes it.
@@ -173,7 +217,16 @@ repo/instance — and if that unit is missing entirely (deleted plist,
 failed prior install), the updater registers it afresh: prompted
 interactively, automatic under `--no-interact` or whenever no terminal is
 available (cron/CI); declining keeps the run green and prints the
-`./install.sh --service` hint. Generate a fresh complete config separately with:
+`./install.sh --service` hint. You do not have to poll the repository to
+notice a release: the board's **deploy** check compares the build's
+`dist/build-rev.json` with `origin/main` (every 5 minutes) and with the
+newest stable `vX.Y.Z` reachable from `origin/main` (a tag on another ref
+is never advertised — pulling main could not deliver it). A build older
+than that release reads the tag with an `UPDATE AVAILABLE` flag and that
+state wins over the commit count; otherwise a build behind main reads
+`N behind` with a `RESTART PENDING` flag. `gru-service version` prints
+the version stamped into the build plus its SHA, offline. Generate a
+fresh complete config separately with:
 
 ```bash
 npm run config:generate                 # refuses an existing file
@@ -233,6 +286,7 @@ npm start               # serve the web UI + /health on the configured bind
 ./install.sh --service  # register + start as a login OS service
 ./install.sh --uninstall
 gru-service roll        # graceful self-roll: pull + rebuild + relaunch + verify
+gru-service version     # installed version + build SHA (offline; --json)
 gru-service reset       # with the service stopped: remove GC's lanes, empty the data dir, keep config.toml
 ```
 

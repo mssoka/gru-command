@@ -91,6 +91,7 @@ import {
   isGitHubRemote,
   isGitLabRemote,
   parseFallbackFindingsReport,
+  preflightAdvisoryFields,
   renderFixDirective,
   repoRemote,
   skillInstalled,
@@ -3890,6 +3891,9 @@ export class WaveRunner {
       ...(armedTargetRef !== undefined ? { armedTargetRef } : {}), reviewModel: result.reviewModel,
       reviewThinkingLevel: result.reviewThinkingLevel,
       ...(forceAuthorization !== undefined ? { forceAuthorization } : {}) });
+    // The round is ADMITTED (a refusal above never reports it): the named
+    // advisories are reported exactly once, beside the round they qualify.
+    this.reportPreflightWarnings(input.jobId, result);
     return { route: 'perkins', round: begun.round, run: begun.run };
   }
 
@@ -4091,18 +4095,31 @@ export class WaveRunner {
       ...(armedTargetRef !== undefined ? { targetRef: armedTargetRef } : {}) });
     let reviewModel: ReviewPreflightResult['reviewModel'];
     let reviewThinkingLevel: string | undefined;
+    let result: ReviewPreflightResult | null = null;
     if (this.opts.reviewPreflight !== undefined) {
       const repoPath = this.resolveReviewRequestRepo(input);
       if (repoPath !== null) {
-        const result = await this.opts.reviewPreflight({ repoPath });
+        result = await this.opts.reviewPreflight({ repoPath });
         if (!result.ok) throw new FallbackGateRequiredError(result.failures);
         reviewModel = result.reviewModel;
         reviewThinkingLevel = result.reviewThinkingLevel;
       }
     }
-    return this.beginPerkinsRound({ ...input,
+    const begun = await this.beginPerkinsRound({ ...input,
       ...(armedTargetRef !== undefined ? { armedTargetRef } : {}), reviewModel, reviewThinkingLevel,
       ...(forceAuthorization !== undefined ? { forceAuthorization } : {}) });
+    if (result !== null) this.reportPreflightWarnings(input.jobId, result);
+    return begun;
+  }
+
+  /** Non-blocking pre-flight advisories (issue #444): called on the Perkins
+   * route ONLY — a degraded leg is named so the round does not run blind
+   * into a failure it could have shouted about first, and a fallback route
+   * (which posts no Perkins verdict) never claims "the round continues". */
+  private reportPreflightWarnings(jobId: string, result: ReviewPreflightResult): void {
+    const fields = preflightAdvisoryFields(result);
+    if (fields === null) return;
+    this.log('warn', 'review pre-flight advisory (non-blocking)', { job: jobId, ...fields });
   }
 
   private resolveReviewRequestRepo(input: { jobId: string }): string | null {

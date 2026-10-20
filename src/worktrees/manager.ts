@@ -1,4 +1,5 @@
 import { readWorktreeMetadata, repositoryCommonDirectory, capturePortLaneHandoff, captureCwdHandoff, beginLaneHandoff, completeLaneHandoff, rememberManagedLane, registerHandoffManager, assertPendingLaneHandoff, captureCleanupHandoff, assertLaneResourcesAbsent, WorktreeHandoffUnresolvedError, prepareLaneRebind, publishLaneRebind, settleLaneRebind, laneReceiptStale, laneCompletionsOnce, type LaneCompletions } from './handoff.js';
+import { CreationIntentError, clearCreationIntent, readCreationIntent, writeCreationIntent, type CreationIntent, type CreationIntentLane } from './creation-intent.js';
 import { execFile, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
@@ -828,6 +829,9 @@ interface CreationCustody {
   readonly token: string;
   readonly branch: string | null;
   readonly sha: string;
+  /** The lane this creation belongs to (issue #453). */
+  readonly lane: CreationIntentLane;
+  readonly baseSource: WorktreeBaseSource | null;
   branchCreated: boolean;
   addAttempted: boolean;
 }
@@ -1321,20 +1325,29 @@ export class WorktreeManager {
     return this.withRepoLock(input.repoPath, async () => {
       const repo = this.assertRepo(input.repoPath);
       const branch = `gru/${input.jobId}`;
-      const existing = spawnGit(repo.repoPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`]);
-      if (existing.status === 0) {
-        throw new Error(`branch ${branch} already exists — one lane per job, never a reused held branch`);
-      }
       const path = join(this.opts.root, repo.repoName, `job-${input.jobId}`);
-      if (existsSync(path)) {
-        throw new Error(`worktree path already exists: ${path}`);
+      const lane = { id: input.jobId, kind: 'job' as const, jobId: input.jobId, roundId: null, path };
+      // Issue #453: an interrupted earlier attempt may have committed the ref
+      // without its checkout. Only its own retained receipt may be adopted; a
+      // ref nobody can attribute stays a refusal.
+      const retained = await this.reconcileInterruptedCreation(repo.repoPath, lane, branch);
+      if (retained === null) {
+        const existing = spawnGit(repo.repoPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`]);
+        if (existing.status === 0) {
+          throw new Error(`branch ${branch} already exists — one lane per job, never a reused held branch`);
+        }
+        if (existsSync(path)) {
+          throw new Error(`worktree path already exists: ${path}`);
+        }
       }
       // The base is resolved ONCE, and the SAME sha is branched from and
       // recorded: the registry row can never name a commit the lane did
-      // not actually branch from (the 'freshHead lie' of 2026-09-23).
-      const base = this.resolveBase(repo.repoPath);
+      // not actually branch from (the 'freshHead lie' of 2026-09-23). A
+      // retained receipt keeps ITS fixed base — reconciliation never
+      // re-bases an interrupted creation onto a moved head.
+      const base = retained !== null ? this.adoptedBase(retained) : this.resolveBase(repo.repoPath);
       const sha = base.sha;
-      const custody = this.creationCustody(branch, sha);
+      const custody = retained !== null ? this.adoptedCustody(retained, lane) : this.creationCustody(branch, sha, lane, base.baseSource);
       let record;
       let bootstrapped: LaneBootstrap | null;
       try {
@@ -1355,9 +1368,13 @@ export class WorktreeManager {
           baseSource: base.baseSource,
           jobId: input.jobId,
         });
+        this.clearCreationIntent(repo.repoPath, custody);
       } catch (error) {
         if (this.opts.ledger.getWorktree(input.jobId) !== null) throw error; // committed publication retains unresolved custody
         await this.rollbackPartialLane(repo.repoPath, path, custody, error);
+        // Only a proven ownership is spent with the rollback. An unproven
+        // create keeps its receipt: the ref it names may outlive the process.
+        if (custody.branchCreated) this.clearCreationIntent(repo.repoPath, custody);
         throw error;
       }
       this.handoffLane(repo.repoPath, path, custody, record);
@@ -1403,7 +1420,7 @@ export class WorktreeManager {
         throw new Error(`worktree path already exists: ${path}`);
       }
       const resolved = this.resolveReviewRef(repo.repoPath, input.ref);
-      const custody = this.creationCustody(null, resolved.sha);
+      const custody = this.creationCustody(null, resolved.sha, { id: input.roundId, kind: 'review', jobId: input.jobId ?? null, roundId: input.roundId, path }, resolved.baseSource);
       let record;
       try {
         await this.addLane(repo.repoPath, path, custody);
@@ -1487,17 +1504,26 @@ export class WorktreeManager {
       assertParent();
       const parentHead = runGit(input.parentPath, ['rev-parse', 'HEAD']);
       const path = join(this.opts.root, repo.repoName, `child-${input.childId}`);
-      if (existsSync(path)) {
-        throw new Error(`worktree path already exists: ${path}`);
-      }
       const branch = input.authority === 'writer' ? `gru/${input.jobId}-child-${input.childId}` : null;
-      if (branch !== null) {
-        const existing = spawnGit(repo.repoPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`]);
-        if (existing.status === 0) {
-          throw new Error(`branch ${branch} already exists — one lane per child, never a reused held branch`);
+      const lane = { id: input.childId, kind: 'child' as const, jobId: input.jobId, roundId: null, path };
+      // Issue #453: the same retained-receipt reconciliation as a job lane.
+      // A writer child's branch is its own creation; a read-only child has
+      // none to reconcile.
+      const retained = branch === null ? null : await this.reconcileInterruptedCreation(repo.repoPath, lane, branch);
+      if (retained === null) {
+        if (existsSync(path)) {
+          throw new Error(`worktree path already exists: ${path}`);
+        }
+        if (branch !== null) {
+          const existing = spawnGit(repo.repoPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`]);
+          if (existing.status === 0) {
+            throw new Error(`branch ${branch} already exists — one lane per child, never a reused held branch`);
+          }
         }
       }
-      const custody = this.creationCustody(branch, parentHead);
+      const custody = retained !== null
+        ? this.adoptedCustody(retained, lane)
+        : this.creationCustody(branch, parentHead, lane, null);
       let record;
       let bootstrapped: LaneBootstrap | null = null;
       try {
@@ -1523,9 +1549,11 @@ export class WorktreeManager {
           baseSource: null,
           jobId: input.jobId,
         });
+        this.clearCreationIntent(repo.repoPath, custody);
       } catch (error) {
         if (this.opts.ledger.getWorktree(input.childId) !== null) throw error; // committed publication retains unresolved custody
         await this.rollbackPartialLane(repo.repoPath, path, custody, error);
+        if (custody.branchCreated) this.clearCreationIntent(repo.repoPath, custody);
         throw error;
       }
       assertParent(); // registration observers cannot invalidate the original source
@@ -2662,14 +2690,132 @@ export class WorktreeManager {
     return killed;
   }
 
-  private creationCustody(branch: string | null, sha: string): CreationCustody {
-    return { token: `gru-creation:${randomUUID()}`, branch, sha, branchCreated: false, addAttempted: false };
+  private creationCustody(branch: string | null, sha: string, lane: CreationIntentLane, baseSource: WorktreeBaseSource | null): CreationCustody {
+    return { token: `gru-creation:${randomUUID()}`, branch, sha, lane, baseSource, branchCreated: false, addAttempted: false };
+  }
+
+  /** Issue #453: a retained receipt's fixed base and token are adopted as
+   * the ONLY authority for finishing that same creation. */
+  /** A retained job receipt records the provenance its creation resolved.
+   * A guessed source would make the registry row claim a base it never had. */
+  private adoptedBase(retained: CreationIntent): ResolvedBase {
+    if (retained.baseSource === null) {
+      throw new CreationIntentError(`retained creation receipt for branch ${retained.branch} has no base provenance — refusing to record a guess`);
+    }
+    return { sha: retained.sha, baseSource: retained.baseSource, defaultBranch: null, fallbackDetail: null };
+  }
+
+  private adoptedCustody(retained: CreationIntent, lane: CreationIntentLane): CreationCustody {
+    return { token: retained.token, branch: retained.branch, sha: retained.sha, lane, baseSource: retained.baseSource, branchCreated: true, addAttempted: true };
+  }
+
+  /** The receipt is durable BEFORE the ref transaction it authorizes. */
+  private recordCreationIntent(repoPath: string, custody: CreationCustody): void {
+    if (custody.branch === null) return;
+    writeCreationIntent(this.creationCommonDirectory(repoPath), {
+      lane: custody.lane, repoPath, branch: custody.branch, sha: custody.sha, baseSource: custody.baseSource, token: custody.token,
+    });
+  }
+
+  /** The receipt is spent once the lane is published or rolled back. */
+  private clearCreationIntent(repoPath: string, custody: CreationCustody): void {
+    if (custody.branch === null) return;
+    clearCreationIntent(this.creationCommonDirectory(repoPath), custody.branch, custody.token);
+  }
+
+  /** A checkout may only be finished from a ref that is STILL exactly the
+   * transaction the retained receipt names: same tip, same token, same
+   * reflog entry, no unsettled lock, no foreign holder. Anything else
+   * refuses with the resources retained. */
+  private async assertRetainedCreation(repoPath: string, custody: CreationCustody): Promise<void> {
+    await this.assertBranchCreationCustody(repoPath, custody, null, this.creationCommonDirectory(repoPath), () => {});
+  }
+
+  /** Issue #453: reconcile only THIS lane's retained creation. The receipt
+   * names the lane, the fixed base, the branch and the token; the ref and
+   * the ref lock are the only other evidence consulted. A half-made
+   * checkout of ours is rolled back under its own token, a foreign one is
+   * refused, and a transaction that never committed is closed as spent. */
+  private async reconcileInterruptedCreation(repoPath: string, lane: CreationIntentLane, branch: string): Promise<CreationIntent | null> {
+    const common = this.creationCommonDirectory(repoPath);
+    const retained = readCreationIntent(common, branch);
+    if (retained === null) return null; // no record: the ordinary ref/path refusals stand
+    const refuse = (detail: string): never => {
+      throw new CreationIntentError(`retained creation receipt for branch ${branch} ${detail} — resources retained, inspect before retrying`);
+    };
+    // Publication owns a registered lane; this receipt never may. A swept
+    // row is not publication's authority, but the id is still not reusable
+    // (registerWorktree refuses any existing row), so the status is said and
+    // the receipt stays for the operator who repairs it.
+    const registered = this.opts.ledger.getWorktree(lane.id);
+    if (registered !== null) {
+      refuse(`names a lane the ledger already holds as ${registered.status} (${registered.path}) — that id is not reusable, and the receipt is not its authority`);
+    }
+    const ref = `refs/heads/${branch}`;
+    const lock = join(common, 'refs/heads', `${branch}.lock`);
+    const tip = spawnGit(repoPath, ['rev-parse', '--verify', '--quiet', ref]);
+    // Only git's own "no such ref" is absence. A failed probe proves nothing
+    // and must not unlink the only record of a ref that may exist.
+    if (tip.status !== 0 && (tip.status !== 1 || tip.error !== null)) {
+      refuse(`could not be read (git exited ${String(tip.status)}: ${tip.stderr.trim() || tip.error || 'no diagnostic'})`);
+    }
+    const checkout = existsSync(retained.lane.path);
+    const admins = this.creationAdminEntries(retained.lane.path, common);
+    // A receipt whose every resource is gone protects nothing. Close it and
+    // let the ordinary creation proceed, whatever the root, repository path
+    // or repository name is now: a spent receipt must never fence a branch.
+    if (tip.status === 1 && !existsSync(lock) && admins.length === 0 && !checkout) {
+      clearCreationIntent(common, branch, retained.token);
+      this.log('info', 'retained lane creation receipt closed with nothing left to protect', { branch, lane: retained.lane.id });
+      return null;
+    }
+    // A live ref transaction is git's own lock, not this receipt's to judge.
+    if (existsSync(lock)) refuse(`has an unsettled ref transaction (${lock})`);
+    if (retained.repoPath !== repoPath) refuse(`names repository ${retained.repoPath}, not ${repoPath}`);
+    if (retained.lane.id !== lane.id || retained.lane.kind !== lane.kind || retained.lane.jobId !== lane.jobId ||
+        retained.lane.roundId !== lane.roundId || retained.lane.path !== lane.path) {
+      refuse(`belongs to another lane (${retained.lane.kind} ${retained.lane.id} at ${retained.lane.path})`);
+    }
+    const custody: CreationCustody = { token: retained.token, branch, sha: retained.sha, lane: retained.lane,
+      baseSource: retained.baseSource, branchCreated: tip.status === 0, addAttempted: true };
+    const abandon = async (): Promise<null> => {
+      await this.rollbackPartialLane(repoPath, lane.path, custody,
+        new CreationIntentError(`interrupted creation of branch ${branch} was retained without a lane — reconciling it under its own receipt`));
+      this.clearCreationIntent(repoPath, custody);
+      return null;
+    };
+    // A checkout at our path is ours only when its admin entry carries this
+    // receipt's token; orphanCreationAdmin refuses a different token by name.
+    const orphan = this.orphanCreationAdmin(repoPath, lane.path, custody, common);
+    if (orphan !== null) return abandon();
+    if (existsSync(lane.path)) refuse(`has a checkout at ${lane.path} that this receipt does not own`);
+    if (tip.status !== 0) {
+      // The transaction never committed (or was rolled back): the receipt is
+      // spent, and nothing it protected exists.
+      this.clearCreationIntent(repoPath, custody);
+      this.log('info', 'retained lane creation receipt closed without a ref', { branch, lane: lane.id });
+      return null;
+    }
+    if (tip.stdout.trim() !== retained.sha) refuse(`names base ${retained.sha} but the branch is at ${tip.stdout.trim()}`);
+    const reflog = spawnGit(repoPath, ['reflog', 'show', '-1', '--format=%H%x00%gs', ref]);
+    if (reflog.status !== 0 || reflog.stdout.trim() !== `${retained.sha}\0${retained.token}`) refuse('no longer carries its own creation reflog entry');
+    if (spawnGit(repoPath, ['symbolic-ref', '--quiet', '--no-recurse', ref]).status !== 1) refuse('is a symbolic ref');
+    const trees = spawnGit(repoPath, ['worktree', 'list', '--porcelain', '-z']);
+    if (trees.status !== 0) refuse('cannot read the worktree registry');
+    if (this.branchHasForeignHolder(trees.stdout, ref, null)) refuse('is held by a worktree that this receipt does not own');
+    this.log('warn', 'resuming an interrupted lane creation from its retained receipt', { branch, lane: lane.id, sha: retained.sha });
+    return retained;
   }
 
   private async addLane(repoPath: string, path: string, custody: CreationCustody, assertSource?: () => void): Promise<void> {
     if (custody.branch !== null) {
-      await this.updateDirectCreationRef(repoPath, custody, 'create');
-      custody.branchCreated = true;
+      if (custody.branchCreated) {
+        await this.assertRetainedCreation(repoPath, custody);
+      } else {
+        this.recordCreationIntent(repoPath, custody);
+        await this.updateDirectCreationRef(repoPath, custody, 'create');
+        custody.branchCreated = true;
+      }
     }
     assertSource?.(); // original parent after the awaited named-ref transaction
     custody.addAttempted = true;
@@ -2971,24 +3117,47 @@ export class WorktreeManager {
 
   /** A failed hook can remove the checkout while leaving Git's locked
    * administration entry. Its backlink and nonce still prove custody. */
-  private orphanCreationAdmin(repoPath: string, path: string, custody: CreationCustody,
-    common = realpathSync(runGit(repoPath, ['rev-parse', '--path-format=absolute', '--git-common-dir']))): string | null {
+  /** Administration entries whose backlink names exactly `path`. An entry
+   * that names no path at all is skipped: one unrelated half-written
+   * administration must not make every creation in the repository fail. */
+  private creationAdminEntries(path: string, common: string): readonly string[] {
     const container = join(common, 'worktrees');
-    if (!existsSync(container)) return null;
-    const expected = join(realpathSync(dirname(path)), basename(path), '.git');
+    if (!existsSync(container)) return [];
+    let expected: string;
+    try { expected = join(realpathSync(dirname(path)), basename(path), '.git'); }
+    catch { expected = join(dirname(path), basename(path), '.git'); } // a removed lane root is compared as written
+    const admins: string[] = [];
     for (const entry of readdirSync(container, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
       const admin = join(container, entry.name);
-      const backlink = resolve(admin, readWorktreeMetadata(join(admin, 'gitdir')).trim());
-      if (backlink !== expected) continue;
-      readWorktreeMetadata(join(admin, 'HEAD'));
-      if (realpathSync(resolve(admin, readWorktreeMetadata(join(admin, 'commondir')).trim())) !== common) throw new Error('orphan creation common directory changed');
-      if (readWorktreeMetadata(join(admin, 'locked')).trim() !== custody.token) {
-        throw new Error('orphaned worktree custody receipt does not match this invocation');
-      }
-      return admin;
+      let backlink: string;
+      try { backlink = resolve(admin, readWorktreeMetadata(join(admin, 'gitdir')).trim()); }
+      catch { continue; } // an unrelated, torn administration is not this lane's evidence
+      if (backlink === expected) admins.push(admin);
     }
-    return null;
+    return admins;
+  }
+
+  private orphanCreationAdmin(repoPath: string, path: string, custody: CreationCustody,
+    common = realpathSync(runGit(repoPath, ['rev-parse', '--path-format=absolute', '--git-common-dir']))): string | null {
+    const admins = this.creationAdminEntries(path, common);
+    if (admins.length === 0) return null;
+    if (admins.length > 1) {
+      throw new CreationIntentError(`several worktree administrations claim ${path} (${admins.join(', ')}) — inspect them before retrying`);
+    }
+    const admin = admins[0]!;
+    try {
+      readWorktreeMetadata(join(admin, 'HEAD'));
+      if (realpathSync(resolve(admin, readWorktreeMetadata(join(admin, 'commondir')).trim())) !== common) {
+        throw new Error('names a different common directory');
+      }
+      if (readWorktreeMetadata(join(admin, 'locked')).trim() !== custody.token) {
+        throw new Error(`is locked for another creation, not ${custody.token}`);
+      }
+    } catch (error) {
+      throw new CreationIntentError(`lane administration ${admin} belongs to ${path} but ${error instanceof Error ? error.message : String(error)} — inspect it before retrying`, { cause: error });
+    }
+    return admin;
   }
 
   private handoffLane(repoPath: string, path: string, custody: CreationCustody, record: WorktreeRecord, assertSource?: () => void): void {
@@ -3036,6 +3205,9 @@ export class WorktreeManager {
       this.assertRollbackBranchMetadata(repoPath, custody, common); // reprove after every awaited query
       return result;
     };
+    if (existsSync(join(common, 'refs/heads', `${custody.branch}.lock`))) {
+      throw new Error(`created branch ${ref} is locked by an unsettled ref transaction`);
+    }
     if ((await query(['symbolic-ref', '--quiet', '--no-recurse', ref])).status !== 1) {
       throw new Error(`created branch ${ref} is no longer a direct ref`);
     }
@@ -3053,12 +3225,17 @@ export class WorktreeManager {
   }
 
   private branchHasForeignHolder(trees: string, ref: string, ownedPath: string | null): boolean {
+    // A removed lane root is compared as written: a missing directory is a
+    // refusal reason, not a bare ENOENT out of the custody proof.
+    const canonical = (path: string): string => {
+      try { return join(realpathSync(dirname(path)), basename(path)); } catch { return join(dirname(path), basename(path)); }
+    };
     return trees.split('\0\0').some((entry) => {
       const fields = entry.split('\0');
       if (!fields.includes(`branch ${ref}`)) return false;
       const tree = fields.find((field) => field.startsWith('worktree '))?.slice('worktree '.length);
       return ownedPath === null || tree === undefined ||
-        join(realpathSync(dirname(tree)), basename(tree)) !== join(realpathSync(dirname(ownedPath)), basename(ownedPath));
+        canonical(tree) !== canonical(ownedPath);
     });
   }
 

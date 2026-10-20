@@ -112,7 +112,10 @@ describe('graceful shutdown', () => {
     cleanupDirs.push(home);
     writeFileSync(
       configPathFor(home),
-      '[server]\nhost = "127.0.0.1"\nport = 0\n',
+      // Bob's due-based boot beat (issue #451) would spawn a second session;
+      // pin it off so this test's snapshot invariant stays exactly one
+      // session. The boot beat itself is pinned in bob-state-service.test.ts.
+      '[server]\nhost = "127.0.0.1"\nport = 0\n[dispatch]\nbob_interval_ms = 0\n',
       'utf-8',
     );
 

@@ -127,6 +127,16 @@ async function settle(): Promise<void> {
   await Promise.resolve();
 }
 
+/** New chat asks through the themed Gru modal: click the button, then
+ * accept the dialog, then let the async confirm continuation run. */
+async function clickThroughNewChatConfirm(): Promise<void> {
+  document.getElementById('chat-new')!.click();
+  const confirm = document.querySelector<HTMLButtonElement>('.gru-modal__confirm');
+  if (confirm === null) throw new Error('new chat confirm dialog did not render');
+  confirm.click();
+  await settle();
+}
+
 beforeEach(() => installChatDom());
 
 describe('chat context control rendering', () => {
@@ -162,7 +172,7 @@ describe('chat context control rendering', () => {
     expect([compact.disabled, fresh.disabled]).toEqual([true, true]);
   });
 
-  it('renders authoritative usage and announces optimistic New chat progress accessibly', () => {
+  it('renders authoritative usage and announces optimistic New chat progress accessibly', async () => {
     const view = new ChatView(() => true);
     const request = vi.fn(() => true);
     view.bindControls(request);
@@ -187,8 +197,7 @@ describe('chat context control rendering', () => {
     expect(status.getAttribute('role')).toBe('status');
     expect(status.getAttribute('aria-live')).toBe('polite');
 
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
-    document.getElementById('chat-new')!.click();
+    await clickThroughNewChatConfirm();
     expect(request).toHaveBeenCalledWith('new_chat');
     expect(status.textContent).toBe('Starting new chat…');
     expect(status.hasAttribute('aria-busy')).toBe(true);
@@ -245,7 +254,7 @@ describe('chat context control rendering', () => {
     expect(announcement.textContent).toContain('supervision is degraded');
   });
 
-  it('clears the active view immediately for New chat and restores it on rejection', () => {
+  it('clears the active view immediately for New chat and restores it on rejection', async () => {
     const view = new ChatView(() => true);
     view.bindControls(() => true);
     view.setControlsConnected(true);
@@ -262,8 +271,7 @@ describe('chat context control rendering', () => {
     view.addFrame({ type: 'notice', text: 'retired transcript', seq: 11 }, false);
     expect(document.getElementById('chat-log')?.textContent).toContain('retired transcript');
 
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
-    document.getElementById('chat-new')!.click();
+    await clickThroughNewChatConfirm();
     expect(document.getElementById('chat-log')?.textContent).not.toContain('retired transcript');
     view.upsertMessage({
       client_msg_id: 'pending-after-reset',

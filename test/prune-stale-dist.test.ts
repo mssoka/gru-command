@@ -72,11 +72,15 @@ describe('prune-stale-dist', () => {
     // gru-service reset (dist/cli/reset.js) and its lock name, which the
     // ledger reads without loading SQLite (dist/ledger/reset-lock.js); #427
     // PR 3 the disk view, budget and floor (dist/maintenance/disk.js);
-    // #351 the board's raid counts (dist/vector/board.js); #446 the
+    // #351 the board's raid counts (dist/vector/board.js); #444 the
+    // verdict-publication-identity prerequisite check
+    // (dist/dispatch/verdict-publication-identity.js); #453 the durable
+    // creation receipt the worktree manager writes before its ref
+    // transaction (dist/worktrees/creation-intent.js); #446 the
     // default-branch CI alert (dist/repos/default-branch-ci.js).
-    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5218);
+    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5220);
     expect(createHash('sha256').update(`${[...PUBLIC_REVIEW_EXECUTABLE_PATHS].sort().join('\n')}\n`).digest('hex'))
-      .toBe('1538835ec18ad85673d4a2617b4dd86b06f0bdde6b4116d852c1ed15c24cae3f');
+      .toBe('4e55127ca771aab9ad2eedef99d22118aae262022a12f0cc30a0743957f0ec3a');
     const root = fixtureRoot();
     touch(root, 'src/worktrees/handoff.ts'); touch(root, 'dist/worktrees/handoff.js');
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', dependencies: {} }));

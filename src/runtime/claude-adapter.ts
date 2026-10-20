@@ -1771,6 +1771,13 @@ export class ClaudeCodeHandle implements AgentHandle {
       child.stderr?.on('data', (chunk: Buffer) => {
         stderrTail = (stderrTail + chunk.toString('utf8')).slice(-STDERR_TAIL_BYTES);
       });
+      // A CLI that died before it could read its prompt closes stdin under the
+      // frame write (EPIPE). That is the child's failure, reported below by its
+      // own 'error'/'close'; an unhandled stream 'error' would instead take the
+      // whole service down.
+      child.stdin?.on('error', (error: Error) => {
+        this.log('warn', 'claude compaction stdin is closed; the prompt frame could not be written', { error: String(error) });
+      });
       child.on('error', (error: Error) => {
         this.onInfraError(error);
         fail(`claude compaction process failed to spawn: ${String(error)}`);
@@ -2162,6 +2169,12 @@ export class ClaudeCodeHandle implements AgentHandle {
       child.stdout?.on('data', (chunk: Buffer) => parser.push(chunk));
       child.stderr?.on('data', (chunk: Buffer) => {
         stderrTail = (stderrTail + chunk.toString('utf8')).slice(-STDERR_TAIL_BYTES);
+      });
+      // A CLI that died before it could read its prompt closes stdin under the
+      // frame write (EPIPE). The turn settles from the child's own 'error'/
+      // 'close'; an unhandled stream 'error' would crash the whole service.
+      child.stdin?.on('error', (error: Error) => {
+        this.log('warn', 'claude stdin is closed; the prompt frame could not be written', { error: String(error) });
       });
       child.on('error', (error: Error) => {
         // Async spawn failure (ENOENT when the binary is missing, ...).
