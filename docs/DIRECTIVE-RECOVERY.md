@@ -283,7 +283,13 @@ Physical ownership is recorded separately in `<session.jsonl>.producers.jsonl`:
 request/hash/revision/epoch, logical minion, native session/file, physical UUID,
 host and PID. Dispatch reservation is not native admission or producer start.
 The physical receipt is flushed before native execution, and the real Pi tool
-hook flushes exact assistant tool intent before a tool can run. Native
+hook flushes exact assistant tool intent before a tool can run. Preparation
+attests the runtime's own idle/independence state and journals that physical
+producer BEFORE any target is retained (issue #453): a refused or interrupted
+preparation therefore leaves no target to fence forever, and a retained target
+can never exist without a physical producer record to inspect. A target whose
+producer journal is missing, torn or foreign is still UNKNOWN, never a
+fabricated never-started receipt. Native
 independent bash controllers leave durable uncertainty until genuine cleanup.
 Only exact-incarnation cleanup or an original same-host PID returning ESRCH
 can establish original host cessation; a live/frozen/reused PID, foreign host,

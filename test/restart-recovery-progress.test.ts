@@ -749,6 +749,34 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('settled'); expect(f.native.prompts).toHaveLength(1); expect(f.native.continuations).toBe(0);
   });
 
+  it('a runtime that refuses preparation leaves no retained target, so the same request stays retirable (#453)', async () => {
+    const f = await fixture();
+    const refusing: DirectiveRegistry = {
+      getHandle: (agentId) => f.deps.registry.getHandle(agentId),
+      async spawn(role, options) {
+        const handle = await f.deps.registry.spawn(role, options);
+        // The runtime refuses AFTER the route has decided to prepare: the
+        // fixture stands in for a busy session or an independent controller.
+        Object.defineProperty(handle, 'prepareDirectiveProducer', {
+          configurable: true,
+          value: () => { throw new DirectiveCheckpointError('native producer preparation requires genuine idle without independent controllers'); },
+        });
+        return handle;
+      },
+      async disposeHandle(handle) { await f.deps.registry.disposeHandle(handle); },
+    };
+    await executeAcceptedDirective({ ...f.deps, registry: refusing }, f.intent.requestId);
+    expect(f.native.prompts).toEqual([]);
+    // Nothing durable claims a native start, so nothing fenced the request.
+    expect(f.ledger.getDirective(f.intent.requestId)?.nativeTarget).toBeNull();
+    const head = resolveGitCommit(f.lane.path, 'HEAD');
+    const retired = f.ledger.retireInterruptedDirective({ requestId: f.intent.requestId, expectedJobId: f.intent.jobId,
+      expectedState: f.ledger.getDirective(f.intent.requestId)!.state as 'dispatching', expectedPayloadHash: f.intent.payloadHash,
+      expectedHead: head, lane: { id: f.lane.id, resolvedHead: head },
+      reason: 'preparation refused before any native target', by: 'gru' });
+    expect(retired.record.state).toBe('retired');
+  });
+
   async function assertStaleTerminalTail(tail: 'user' | 'branch' | 'assistant' | 'partial') {
     const f = await fixture(); f.seed(); f.native.finish();
     expect(inspectDirectiveCheckpoint(f.file, f.identity)).toMatchObject({ state: 'terminal', ok: true });
