@@ -400,7 +400,7 @@ export type SilasAutopilotRuleMode = 'off' | 'dry-run' | 'enforce';
  */
 export interface SilasAutopilotConfig {
   readonly enabled: boolean;
-  readonly defaultMode?: SilasAutopilotRuleMode;
+  readonly defaultMode: SilasAutopilotRuleMode;
   readonly rules: Readonly<Record<string, SilasAutopilotRuleMode>>;
 }
 
@@ -1971,7 +1971,7 @@ function readSilasAutopilotConfig(value: unknown, file: string): SilasAutopilotC
       : DEFAULT_SILAS_AUTOPILOT_CONFIG.enabled;
   const defaultMode =
     table['default_mode'] === undefined
-      ? (DEFAULT_SILAS_AUTOPILOT_CONFIG.defaultMode ?? 'dry-run')
+      ? DEFAULT_SILAS_AUTOPILOT_CONFIG.defaultMode
       : requireAutopilotMode(table['default_mode'], file, 'silas.autopilot.default_mode');
   if (table['rules'] === undefined) return { enabled, defaultMode, rules: {} };
   const rulesTable = requireTable(table['rules'], file, 'silas.autopilot.rules');

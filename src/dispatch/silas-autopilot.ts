@@ -19,10 +19,11 @@
  * Posture (the issue's rollout):
  *  - `enabled` is the global kill switch. When it is false nothing is
  *    recorded and nothing is called.
- *  - every family's mode defaults to `dry-run`: the decision is recorded
- *    as a `silas.autopilot-decision` event naming the call it WOULD make,
- *    and no call is made. `enforce` performs exactly one call. `off` does
- *    neither.
+ *  - every family's mode is its own `[silas.autopilot.rules]` entry, else
+ *    the owner-wide `default_mode` (default `dry-run`, issue #443). `dry-run`
+ *    records a `silas.autopilot-decision` event naming the call it WOULD
+ *    make, and no call is made. `enforce` performs exactly one call. `off`
+ *    does neither.
  *  - a REFUSAL is not a decision: the family declines (the case is not
  *    unambiguous), records nothing that #214 could read as agreement, and
  *    leaves the row to LLM Silas. Refusals are logged and counted.
@@ -174,7 +175,7 @@ export function autopilotRuleMode(
   config: SilasAutopilotConfig,
   ruleId: SilasAutopilotRuleId,
 ): SilasAutopilotRuleMode {
-  return config.rules[ruleId] ?? config.defaultMode ?? 'dry-run';
+  return config.rules[ruleId] ?? config.defaultMode;
 }
 
 /** A call the family would make (recorded verbatim in the decision event,

@@ -1030,6 +1030,16 @@ describe('dispatch config (E8)', () => {
   });
 
   // Issue #443: one `default_mode` for every family, overridable per family.
+  it('applies default_mode with no per-family rules table at all', () => {
+    const home = tmpHome();
+    writeConfig(home, '[silas.autopilot]\nenabled = true\ndefault_mode = "enforce"\n');
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').silas.autopilot).toEqual({
+      enabled: true,
+      defaultMode: 'enforce',
+      rules: {},
+    });
+  });
+
   it('parses default_mode and lets a per-family entry override it', () => {
     const home = tmpHome();
     writeConfig(
