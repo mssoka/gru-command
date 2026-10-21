@@ -13,7 +13,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, onTestFinished } from 'vitest';
 import { WebSocket } from 'ws';
 import * as web from '../web/src/lib/protocol.js';
 import { ChatFrameLog } from '../src/chat/frame-log.js';
@@ -2035,8 +2035,20 @@ describe('chat context controls and durable new-chat boundaries', () => {
       binary: CLAUDE_DOUBLE,
       reviewSettingsFile: join(home, 'absent-review-settings.json'),
     }));
+    // chat.dispose() leaves the agent handle to its owner, so the test disposes it.
+    const spawned: AgentHandle[] = [];
+    onTestFinished(async () => {
+      delete process.env['CLAUDE_DOUBLE_REPLAY'];
+      for (const handle of spawned) await handle.dispose();
+    });
     process.env['CLAUDE_DOUBLE_REPLAY'] = RECORDED_TURN;
-    const h = await makeHarness({ spawnGru: () => claude.spawn('gru') });
+    const h = await makeHarness({
+      spawnGru: async () => {
+        const handle = await claude.spawn('gru');
+        spawned.push(handle);
+        return handle;
+      },
+    });
     try {
       const writer = await authedClient(h.port, TOKEN, undefined, true);
       writer.send('how full is the context?', 'claude-measure');
@@ -2081,7 +2093,6 @@ describe('chat context controls and durable new-chat boundaries', () => {
       await writer.close();
     } finally {
       await h.close();
-      delete process.env['CLAUDE_DOUBLE_REPLAY'];
     }
   });
 

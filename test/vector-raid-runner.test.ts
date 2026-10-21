@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, onTestFinished } from 'vitest';
 import { configPathFor, DEFAULT_VECTOR_CONFIG, loadConfig, type VectorConfig } from '../src/config.js';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
@@ -342,17 +342,14 @@ describe('Silas\'s raid queue (#351 §3)', () => {
       reviewSettingsFile: join(home, 'absent-review-settings.json'),
     }));
     // One recorded turn (2 + 643 + 77,264 of a 1,000,000 window) stands in for Vector's session.
+    onTestFinished(() => { delete process.env['CLAUDE_DOUBLE_REPLAY']; });
     process.env['CLAUDE_DOUBLE_REPLAY'] = join(import.meta.dirname, 'fixtures', 'claude-stream', 'context-usage-turn.jsonl');
-    try {
-      const h = harness({ vector: { maxRounds: 1 }, scripts: [], spawnVector: ({ policy, cwd }) => claude.spawn('perkins', { cwd, isolatedReview: policy }) });
-      const id = h.launch();
-      await h.runner.tick();
-      expect(h.spawned).toBe(1);
-      const report = JSON.parse(readFileSync(raid(h, id).reportFile!, 'utf8')) as { metrics: { tokens: number; roundsWithoutTokenUsage: number } };
-      expect(report.metrics).toMatchObject({ tokens: 77_909, roundsWithoutTokenUsage: 0 });
-    } finally {
-      delete process.env['CLAUDE_DOUBLE_REPLAY'];
-    }
+    const h = harness({ vector: { maxRounds: 1 }, scripts: [], spawnVector: ({ policy, cwd }) => claude.spawn('perkins', { cwd, isolatedReview: policy }) });
+    const id = h.launch();
+    await h.runner.tick();
+    expect(h.spawned).toBe(1);
+    const report = JSON.parse(readFileSync(raid(h, id).reportFile!, 'utf8')) as { metrics: { tokens: number; roundsWithoutTokenUsage: number } };
+    expect(report.metrics).toMatchObject({ tokens: 77_909, roundsWithoutTokenUsage: 0 });
   });
 
   it('main moving mid-raid voids it: no evidence crosses heads, not even a break-in', async () => {

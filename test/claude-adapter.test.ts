@@ -3276,8 +3276,10 @@ describe('ClaudeControlTranslator (pure)', () => {
   });
 });
 
-/** One recorded Gru turn (Claude Code 2.1.305), content trimmed: two API
- * calls whose blocks repeat their usage, a subagent frame, then the result. */
+/** One Gru turn recorded from Claude Code 2.1.305, content trimmed: two API
+ * calls whose blocks repeat their usage, then the result. Two lines are
+ * synthesized from the recorded shape: the last call's closing text block
+ * (the recorded call ended in a tool call) and the subagent frame. */
 const RECORDED_TURN = join(import.meta.dirname, 'fixtures', 'claude-stream', 'context-usage-turn.jsonl');
 const recordedFrames = (): StreamFrame[] =>
   readFileSync(RECORDED_TURN, 'utf8').split('\n').filter((line) => line.trim() !== '').map((line) => JSON.parse(line) as StreamFrame);
@@ -3297,6 +3299,18 @@ describe('Claude context usage from recorded stream-json (#461)', () => {
   const withResult = (edit: (result: StreamFrame) => StreamFrame) =>
     recordedFrames().map((frame) => (frame['type'] === 'result' ? edit(frame) : frame));
   /** The recorded turn with the LAST main-thread frame's usage rebuilt by `edit`. */
+  /** The recorded turn ending in the CLI's in-band API error: its synthetic
+   * message, then an is_error result that still carries the window. */
+  const inBandErrorTurn = () => {
+    const frames = recordedFrames();
+    const result = frames.pop()!;
+    const synthetic = {
+      type: 'assistant', parent_tool_use_id: null, session_id: 'recorded-session', is_api_error_message: true, error: 'rate_limit', api_error_status: 429,
+      message: { id: 'msg_synthetic', model: '<synthetic>', role: 'assistant', content: [{ type: 'text', text: "You've hit your limit" }],
+        usage: { input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 } },
+    };
+    return [...frames, synthetic, { ...result, is_error: true, api_error_status: 429 }];
+  };
   const withLastUsage = (edit: (usage: StreamFrame) => StreamFrame) => {
     const frames = recordedFrames();
     const last = lastMainIndex(frames);
@@ -3349,15 +3363,44 @@ describe('Claude context usage from recorded stream-json (#461)', () => {
     expect(measure(frames)).toBeNull();
   });
 
-  it('an in-band API error keeps the last real call: the synthetic message is not an API call', () => {
+  it('an errored turn measures nothing: the provider never measured its failing request (owner ruling 2026-10-21)', () => {
+    expect(measure(inBandErrorTurn())).toBeNull();
+    expect(measure(withResult((result) => ({ ...result, is_error: true })))).toBeNull();
+  });
+
+  it('a zero-token synthetic reply is no API call and never replaces the measurement', () => {
     const frames = recordedFrames();
     const result = frames.pop()!;
-    const synthetic = {
-      type: 'assistant', parent_tool_use_id: null, session_id: 'recorded-session', is_api_error_message: true, error: 'rate_limit', api_error_status: 429,
-      message: { id: 'msg_synthetic', model: '<synthetic>', role: 'assistant', content: [{ type: 'text', text: "You've hit your limit" }],
+    // The CLI's own unflagged reply, as Claude Code transcripts record it.
+    const noResponse = {
+      type: 'assistant', parent_tool_use_id: null, session_id: 'recorded-session',
+      message: { id: 'msg_no_response', model: '<synthetic>', role: 'assistant', content: [{ type: 'text', text: 'No response requested.' }],
         usage: { input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 } },
     };
-    expect(measure([...frames, synthetic, { ...result, is_error: true, api_error_status: 429 }])).toEqual(MEASURED);
+    expect(measure([...frames, noResponse, result])).toEqual(MEASURED);
+  });
+
+  it('a native compaction inside the turn resets the measurement until a later call', () => {
+    const frames = recordedFrames();
+    const result = frames.pop()!;
+    const boundary = { type: 'system', subtype: 'compact_boundary', session_id: 'recorded-session' };
+    expect(measure([...frames, boundary, result])).toBeNull();
+    expect(measure([...frames, { type: 'compact_boundary', session_id: 'recorded-session' }, result])).toBeNull();
+    const lastMain = frames[lastMainIndex(frames)]!;
+    expect(measure([...frames, boundary, lastMain, result])).toEqual(MEASURED);
+  });
+
+  it('with several models in the result, the main-thread call reads its own model\'s window', () => {
+    const frames = withResult((result) => ({
+      ...result,
+      modelUsage: { 'claude-haiku-4-5': { contextWindow: 200_000 }, ...(result['modelUsage'] as StreamFrame), 'claude-sonnet-5-5': { contextWindow: 400_000 } },
+    }));
+    expect(measure(frames)).toEqual(MEASURED);
+  });
+
+  it('percent is capped at 100 when the reported prompt exceeds the window', () => {
+    const frames = withResult((result) => ({ ...result, modelUsage: { 'claude-opus-5-5': { contextWindow: 50_000 } } }));
+    expect(measure(frames)).toEqual({ tokens: 77_909, contextWindow: 50_000, percent: 100 });
   });
 
   it('a fresh handle is unmeasured; a replayed turn measures; a turn without a result clears it #contract:context-usage:claude-code', async () => {
@@ -3370,8 +3413,8 @@ describe('Claude context usage from recorded stream-json (#461)', () => {
       await handle.prompt('measure this turn');
       expect(deltas(events, 'text_delta').join('')).toContain('Recorded turn answer.');
       expect(handle.getContextUsage?.()).toEqual(MEASURED);
-      // A running turn has no current measurement, and one that never reports
-      // a result leaves none behind.
+      // A running turn has no current measurement, and a turn the provider did
+      // not measure (the double's own frames carry no window) leaves none behind.
       delete process.env['CLAUDE_DOUBLE_REPLAY'];
       const release = join(fx.home, 'release-measured-hold');
       const held = handle.prompt(`hold:${release}`);
@@ -3383,6 +3426,7 @@ describe('Claude context usage from recorded stream-json (#461)', () => {
       process.env['CLAUDE_DOUBLE_REPLAY'] = RECORDED_TURN;
       await handle.prompt('measure again');
       expect(handle.getContextUsage?.()).toEqual(MEASURED);
+      // A turn that dies without a result frame leaves none behind either.
       await expect(handle.prompt('crash')).rejects.toThrow();
       expect(handle.getContextUsage?.()).toBeNull();
     } finally {
@@ -3421,14 +3465,38 @@ describe('Claude context usage from recorded stream-json (#461)', () => {
     }
   });
 
+  it('an in-band error leaves the handle in error with no measurement; the next measured turn restores it', async () => {
+    const fx = fixture();
+    const handle = await fx.runtime.spawn('gru');
+    try {
+      process.env['CLAUDE_DOUBLE_REPLAY'] = RECORDED_TURN;
+      await handle.prompt('measure first');
+      expect(handle.getContextUsage?.()).toEqual(MEASURED);
+      const errored = join(fx.home, 'in-band-error-turn.jsonl');
+      writeFileSync(errored, inBandErrorTurn().map((frame) => JSON.stringify(frame)).join('\n'));
+      process.env['CLAUDE_DOUBLE_REPLAY'] = errored;
+      await handle.prompt('hit the limit');
+      expect(handle.health().state).toBe('error');
+      expect(handle.getContextUsage?.()).toBeNull();
+      process.env['CLAUDE_DOUBLE_REPLAY'] = RECORDED_TURN;
+      await handle.prompt('after the limit resets');
+      expect(handle.getContextUsage?.()).toEqual(MEASURED);
+    } finally {
+      await handle.dispose();
+    }
+  });
+
   it('a resumed session is unmeasured before its first turn, never seeded from its transcript', async () => {
     const fx = fixture();
     const first = await fx.runtime.spawn('gru');
-    process.env['CLAUDE_DOUBLE_REPLAY'] = RECORDED_TURN;
-    await first.prompt('measure, then restart');
-    expect(first.getContextUsage?.()).toEqual(MEASURED);
+    try {
+      process.env['CLAUDE_DOUBLE_REPLAY'] = RECORDED_TURN;
+      await first.prompt('measure, then restart');
+      expect(first.getContextUsage?.()).toEqual(MEASURED);
+    } finally {
+      await first.dispose();
+    }
     const file = first.sessionFile!;
-    await first.dispose();
     expect(readFileSync(file, 'utf8')).toContain('"cache_read_input_tokens":77264');
     const resumed = await fx.runtime.spawn('gru', { resumeFile: file });
     try {

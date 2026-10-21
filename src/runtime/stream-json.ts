@@ -269,19 +269,25 @@ export class ClaudeTurnTranslator {
   /** Provider-reported context usage after this turn (#461): the latest
    * main-thread call's whole prompt over the result's window for that call's
    * model. Null until both halves are present and well formed — no window
-   * table, no estimate. */
+   * table, no estimate — and after an errored turn, whose failing request
+   * the provider never measured (owner ruling 2026-10-21). */
   get contextUsage(): ContextUsage | null {
-    if (this.occupancy === null || this.modelUsage === null) return null;
+    if (this.occupancy === null || this.modelUsage === null || this.resultInfo?.isError !== false) return null;
     const { tokens, model } = this.occupancy;
     const entry = Object.hasOwn(this.modelUsage, model) ? this.modelUsage[model] : undefined;
     const contextWindow = typeof entry === 'object' && entry !== null ? (entry as StreamFrame)['contextWindow'] : undefined;
     if (typeof contextWindow !== 'number' || !Number.isSafeInteger(contextWindow) || contextWindow <= 0) return null;
-    return { tokens, contextWindow, percent: (tokens * 100) / contextWindow };
+    return { tokens, contextWindow, percent: Math.min(100, (tokens * 100) / contextWindow) };
   }
 
   /** Consume one parsed frame; returns the interface events it implies. */
   ingest(frame: StreamFrame): RuntimeEvent[] {
     const type = frame['type'];
+    // A native compaction inside the turn (auto-compact) replaces the context
+    // the earlier calls measured: only a call after it measures again.
+    if ((type === 'system' && frame['subtype'] === 'compact_boundary') || type === 'compact_boundary') {
+      this.occupancy = null;
+    }
     switch (type) {
       case 'system':
         return this.ingestSystem(frame);
@@ -359,9 +365,12 @@ export class ClaudeTurnTranslator {
     }
     // Context occupancy (#461): each content block of one API message repeats
     // that call's usage, so the latest main-thread frame replaces, never adds.
-    // Subagent frames (a parent tool call) measure another context.
+    // Subagent frames (a parent tool call) measure another context, and a
+    // zero-token prompt is no API call: the CLI's own `<synthetic>` replies
+    // ("No response requested.") report all-zero usage.
     if ((frame['parent_tool_use_id'] ?? null) === null) {
-      this.occupancy = promptOccupancy(message as StreamFrame);
+      const call = promptOccupancy(message as StreamFrame);
+      if (call === null || call.tokens > 0) this.occupancy = call;
     }
     // Dedupe granularity: per message id when partials carry ids, else the
     // turn-global per-kind flags.
