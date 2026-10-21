@@ -8,7 +8,7 @@ import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { LogLevel } from '../logger.js';
 import { DEFAULT_REVIEW_CHILDREN } from '../config.js';
 import type { JobStatus, LedgerApi, OnboardingProofDebt, RoundRecord, RoundVerdict } from '../ledger/api.js';
-import { requireSafeRecordId } from '../ledger/api.js';
+import { NoSpawnProofRefusedError, requireSafeRecordId } from '../ledger/api.js';
 import { isJobTerminal, isRoundTerminal } from '../ledger/states.js';
 import type { WorktreeLane, WorktreePort } from './worktree-port.js';
 import {
@@ -3599,21 +3599,25 @@ export class WaveRunner {
    * the crash beat its owner marker. A live round keeps the parent-incident
    * abort and never gets a receipt; its marker binds the cessation proof. A
    * pending round whose receipt the ledger refuses (only a ledger defect can)
-   * takes that same abort, escalated, so it never stays pending. */
+   * takes that same abort, escalated, so it never stays pending. Any other
+   * failure propagates: the round stays pending for the next restart. */
   private abortInterruptedRound(round: RoundRecord, note: string): void {
-    if (round.status === 'pending') {
-      try {
-        this.opts.ledger.abortReviewSetupWithoutSpawn(round.id);
-        return;
-      } catch (error) {
-        this.escalate(
-          `Review round ${round.id} has no no-spawn proof after service restart`,
-          `${String(error)} — it is aborted without a receipt, so a replacement review waits until its ownership is reconciled`,
-          { jobId: round.jobId, roundId: round.id },
-        );
-      }
+    if (round.status !== 'pending') {
+      this.abortRound(round, note);
+      return;
     }
-    this.abortRound(round, note);
+    try {
+      this.opts.ledger.abortReviewSetupWithoutSpawn(round.id);
+      return;
+    } catch (error) {
+      if (!(error instanceof NoSpawnProofRefusedError)) throw error;
+      this.abortRound(round, `${note}; ${error.message}`);
+      this.escalate(
+        `Review round ${round.id} has no no-spawn proof after service restart`,
+        `${error.message} — it was aborted as a round that went live; a replacement review is admitted only once its ownership is proven`,
+        { jobId: round.jobId, roundId: round.id },
+      );
+    }
   }
 
   /** A write-once pre-spawn event, not a ledger lifecycle state, binds

@@ -190,14 +190,14 @@ that receipt, written atomically with the abort, even when the crash came
 before the owner marker (`round.review-owner`). Its INCOMPLETE reason is
 the one startup recovery always records: `service_restart`,
 `service_restart_missing_review_lane` when no review lane is registered,
-or `superseded` for a superseded round. On a restart reason, Silas's
-`clean-abort-service-restart` row re-arms it and the replacement review is
-admitted. A round that went `live` never gets a receipt: its owner marker
-binds the cessation proof instead. A pending round whose receipt the
-ledger refuses (a duplicate owner marker, or agents or specialist starts
-on a round that never went live) gets the live round's abort and an
-escalation naming the refusal; its replacement waits until its ownership
-is reconciled.
+or `superseded` for a superseded round. The receipt admits the replacement
+review; on a restart reason, Silas's `clean-abort-service-restart` row
+re-arms it. A round that went `live` never gets a receipt: its owner
+marker binds the cessation proof instead. A pending round whose receipt
+the ledger refuses (a duplicate owner marker, or agents or specialist
+starts on a round that never went live) is aborted as if it had gone
+live, with a parent incident naming the refusal, and escalated; its
+replacement is admitted only once its ownership is proven.
 
 A revision-expression or tag pin
 (`origin/topic~1`, `origin/v1`) is not a branch spelling: the

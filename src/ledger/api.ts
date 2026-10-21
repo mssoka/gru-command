@@ -704,6 +704,15 @@ export class StaleContinuationError extends Error {
   }
 }
 
+/** A round's evidence cannot prove that no review owner started, so no
+ * `round.review-no-spawn` receipt is written (#466). */
+export class NoSpawnProofRefusedError extends Error {
+  constructor(readonly roundId: string) {
+    super(`round ${roundId} cannot prove no review owner started: the proof needs a pending or aborted round that never went live, with no specialist starts, no registered agents, no earlier no-spawn receipt and at most one owner marker`);
+    this.name = 'NoSpawnProofRefusedError';
+  }
+}
+
 /** The obligation is held by another live request's claim. Lease expiry
  * alone does NOT authorize replacing the holder (see ObligationClaim). */
 export class ClaimHeldError extends Error {
@@ -1368,7 +1377,7 @@ export class LedgerApi {
           .get(roundId) !== undefined ||
         this.listRoundSpecialistStarts(roundId).length !== 0 ||
         this.listAgents().some((agent) => agent.roundId === roundId)) {
-        throw new Error(`round ${roundId} cannot prove no review owner started: the proof needs a pending or aborted round that never went live, with no specialist starts, no registered agents, no earlier no-spawn receipt and at most one owner marker`);
+        throw new NoSpawnProofRefusedError(roundId);
       }
       const generation = randomUUID();
       this.appendEvent({ kind: 'round.review-no-spawn', jobId: round.jobId, roundId,

@@ -236,6 +236,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Review round ${String(lane.roundId)} could not be processed during startup recovery`', '{ ...(lane.jobId !== null ? { jobId: lane.jobId } : {}), ...(lane.roundId !== null ? { roundId: lane.roundId } : {}), }'],
       ['`Review round ${round.id} is INCOMPLETE after service restart`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Review round ${String(round.id)} could not be processed during startup recovery`', '{ jobId: job.id, roundId: round.id }'],
+      ['`Review round ${round.id} has no no-spawn proof after service restart`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Queued review handoff for job ${jobId} is held`', '{ jobId }'],
       ['`Queued review handoff failed for job ${jobId}`', '{ jobId }'],
       // Owner decision 2026-10-08: a transient refusal retries; only the
@@ -270,8 +271,9 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
     expect(sites.map((site) => [site.title, site.context])).toEqual(expected);
     // 37 pre-existing wave call sites + the 13 durable-publication-recovery
     // escalations added by the PR #289 native correction cycle, its
-    // amendments and the native R2 byte/identity fences.
-    expect(sites).toHaveLength(50);
-    expect(sites.filter((site) => site.context !== null)).toHaveLength(47);
+    // amendments and the native R2 byte/identity fences, + the #466
+    // refused no-spawn proof at startup recovery.
+    expect(sites).toHaveLength(51);
+    expect(sites.filter((site) => site.context !== null)).toHaveLength(48);
   });
 });
