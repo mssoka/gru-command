@@ -2830,22 +2830,24 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       await handle.dispose();
     });
 
-    it('a turn whose CLI reports success with neither an echo nor an answer is no delivery', async () => {
-      const fx = fixture();
-      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
-      const identity = identityFor('claude-bare-result');
-      const admitted: DirectiveNativeBinding[] = [];
-      const dir = mkdtempSync(join(tmpdir(), 'gru-command-bare-result-'));
-      cleanupDirs.push(dir);
-      const recorded = join(dir, 'frames.jsonl');
-      writeFileSync(recorded, `${JSON.stringify({ type: 'result', uuid: 'result-bare', subtype: 'success', is_error: false, duration_ms: 1, num_turns: 1, result: 'done', usage: { input_tokens: 1, output_tokens: 1 } })}\n`);
-      process.env['CLAUDE_DOUBLE_ECHO'] = 'skip';
-      process.env['CLAUDE_DOUBLE_REPLAY'] = recorded;
-      await expect(handle.prompt('follow it', { directive: { identity, beforeAdmission: () => {}, onAdmitted: (binding) => admitted.push(binding) } }))
-        .rejects.toThrow(/^directive turn ended without the CLI's admission echo; nothing it did counts as delivered$/u);
-      expect(admitted).toEqual([]);
-      expect(handle.inspectDirective!(identity)).toMatchObject({ state: 'unknown', reason: 'the native turn proceeded without an exact admission receipt' });
-      await handle.dispose();
+    it('a turn whose CLI reports a result, success or error, with neither an echo nor an answer is no delivery', async () => {
+      for (const [subtype, isError] of [['success', false], ['error_during_execution', true]] as const) {
+        const fx = fixture();
+        const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+        const identity = identityFor(`claude-bare-${subtype}`);
+        const admitted: DirectiveNativeBinding[] = [];
+        const dir = mkdtempSync(join(tmpdir(), 'gru-command-bare-result-'));
+        cleanupDirs.push(dir);
+        const recorded = join(dir, 'frames.jsonl');
+        writeFileSync(recorded, `${JSON.stringify({ type: 'result', uuid: 'result-bare', subtype, is_error: isError, duration_ms: 1, num_turns: 1, result: 'done', usage: { input_tokens: 1, output_tokens: 1 } })}\n`);
+        process.env['CLAUDE_DOUBLE_ECHO'] = 'skip';
+        process.env['CLAUDE_DOUBLE_REPLAY'] = recorded;
+        await expect(handle.prompt('follow it', { directive: { identity, beforeAdmission: () => {}, onAdmitted: (binding) => admitted.push(binding) } }), subtype)
+          .rejects.toThrow(/^directive turn ended without the CLI's admission echo; nothing it did counts as delivered$/u);
+        expect(admitted, subtype).toEqual([]);
+        expect(handle.inspectDirective!(identity), subtype).toMatchObject({ state: 'unknown', reason: 'the native turn proceeded without an exact admission receipt' });
+        await handle.dispose();
+      }
     });
 
     it('a directive quoting markup the CLI reserves (whose echo the CLI withholds) is sent as entities, echoed, and admitted (#472)', async () => {
@@ -2876,6 +2878,8 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       const admitted: DirectiveNativeBinding[] = [];
       process.env['CLAUDE_DOUBLE_INIT_DELAY_MS'] = '300';
       process.env['CLAUDE_DOUBLE_PRE_ECHO'] = '1';
+      // The double announces itself only once it has taken the prompt: a host
+      // that waited for init before writing it would never see this turn end.
       await handle.prompt('tool:Read follow it', { directive: { identity, beforeAdmission: () => {}, onAdmitted: (binding) => admitted.push(binding) } });
       const transcript = frames(handle.sessionFile!);
       const at = (match: (frame: StreamFrame) => boolean): number => transcript.findIndex(match);
@@ -2891,12 +2895,16 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       await handle.dispose();
     });
 
-    it('the double withholds its echo exactly as the real CLI does: never for the entity form, never for raw reserved markup (#472)', () => {
+    it('the double withholds its echo as the CLI 2.1.306 filter it models does: for raw reserved markup, never for the entity form (#472)', () => {
+      const cwd = mkdtempSync(join(tmpdir(), 'gru-command-double-probe-'));
+      cleanupDirs.push(cwd);
       const echoes = (text: string): unknown[] => {
         const run = spawnSync(process.execPath, [DOUBLE, '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
           '--replay-user-messages', '--permission-prompt-tool', 'stdio', '--session-id', 'double-probe'],
-        { input: `${JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text }] } })}\n`, encoding: 'utf8', env: { ...process.env, CLAUDE_DOUBLE_LOG: '' } });
-        expect(run.status, text).toBe(0);
+        { input: `${JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text }] } })}\n`, encoding: 'utf8', cwd,
+          env: { ...process.env, CLAUDE_DOUBLE_LOG: '' }, timeout: 15_000, killSignal: 'SIGKILL' });
+        expect(run.error, text).toBeUndefined();
+        expect(run.status, `${text}: ${run.stderr}`).toBe(0);
         return run.stdout.split('\n').filter((line) => line.trim() !== '').map((line) => JSON.parse(line) as StreamFrame)
           .filter((frame) => frame['type'] === 'user' && frame['isReplay'] === true).map((frame) => frame['message']);
       };

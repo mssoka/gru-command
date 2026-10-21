@@ -230,16 +230,19 @@ describe('Claude directive content (#472)', () => {
     const teammate: readonly [string, string][] = [
       ['  <teammate-message from="peer">hi</teammate-message>', '  &lt;teammate-message from="peer"&gt;hi</teammate-message>'],
       ['Another Claude session sent a message:\n<teammate-message from="peer">hi', 'Another Claude session sent a message:\n&lt;teammate-message from="peer"&gt;hi'],
+      ['<teammate-message from=peer\nwarn when n > 3', '&lt;teammate-message from=peer\nwarn when n > 3'],
     ];
     for (const [raw, sent] of teammate) {
       expect(withheld(raw), raw).toBe(true);
       expect(textOf(raw), raw).toBe(sent);
       expect(withheld(sent), raw).toBe(false);
     }
+    // Wherever it stands (the CLI withholds it only in the lead), never past its line.
+    expect(textOf('peers get a <teammate-message from="x"> prefix; warn when n > 3')).toBe('peers get a &lt;teammate-message from="x"&gt; prefix; warn when n > 3');
   });
 
   it('leaves every other text exactly as written, one text block', () => {
-    const plain = 'Re-brief — job x\n<div class="a">code</div> </task-notification> <tick/> <tick attr> <ticket> <tickle> <task-notifications> <TICK> <system-reminder> a < b && c > d &lt;kept&gt;';
+    const plain = 'Re-brief — job x\n<div class="a">code</div> </task-notification> <tick/> <tick attr> <ticket> <tickle> <task-notifications> <TICK> <teammate-message\tx> <system-reminder> a < b && c > d &lt;kept&gt;';
     expect(withheld(plain)).toBe(false);
     expect(claudeDirectiveContent(plain)).toEqual([{ type: 'text', text: plain }]);
   });
