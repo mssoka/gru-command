@@ -1500,6 +1500,14 @@ async function main(): Promise<number> {
       escalated: legacyDirectiveRecovery.escalated,
     });
   }
+  // A named recovery successor that ended unadmitted before #470 stranded
+  // its predecessor's debt on a consumed generation; reopen it for Gru.
+  const strandedRecovery = ledger.reopenStrandedRecoveryDebts();
+  if (strandedRecovery.reopened > 0) logger.info('stranded directive recovery debt reopened', { reopened: strandedRecovery.reopened });
+  for (const failure of strandedRecovery.failures) {
+    logger.log('error', 'stranded directive recovery debt could not be reopened', { job: failure.jobId, request: failure.predecessorId,
+      successor: failure.successorId, error: failure.error });
+  }
   const directiveProgress = new DirectiveProgressService({ ledger, registry, worktrees: worktreeManager, notifications, observeBlindTurn,
     clearLaneForWriter: (input) => wave.clearLaneForWriter(input),
     pendingProducerBlockers: (jobId, currentNative) => supervisorLive.pendingProducerBlockers(jobId, currentNative), signal: serviceStop.signal,

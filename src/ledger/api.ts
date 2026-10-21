@@ -8838,7 +8838,7 @@ export class LedgerApi {
       const payload = event.payload as { fingerprint: string; generation: number; decision: { kind: string; requestId?: string }; owner_transfer?: RecoveryOwnerTransfer; current_inspection_obligation_id?: string };
       if (typeof payload.fingerprint !== 'string') throw new DirectiveCheckpointError('recovery decision history lacks its immutable fingerprint');
       return { eventSeq: event.seq, fingerprint: payload.fingerprint, generation: payload.generation,
-        successorId: payload.decision.kind === 'successor' ? payload.decision.requestId ?? null : null,
+        successorId: payload.decision.kind === 'successor' || payload.decision.kind === 'rebrief-successor' ? payload.decision.requestId ?? null : null,
         ownerTransfer: payload.owner_transfer ?? null, currentInspectionObligationId: payload.current_inspection_obligation_id ?? null };
     });
   }
@@ -9117,7 +9117,8 @@ export class LedgerApi {
       description: `Request ${requestId}; hash ${row.payloadHash}; revision ${String(row.workRevision)}; epoch ${String(row.authorityEpoch)}; ${reason}`,
       nextAction: { kind: 'gru-decision', decision: this.directiveCleanupBlockers(row.jobId).length > 0
         ? 'inspect the exact original producer start and native/controller evidence; obtain original producer cessation attestation before guarded retirement/successor; if inaccessible, report the missing restart capability — never replay or infer cessation'
-        : 'inspect exact native request evidence; choose a guarded fresh successor or name the reserved owner decision' } }));
+        : 'inspect exact native request evidence; choose a guarded fresh successor (rebrief-successor when the work needs a fresh session) or name the reserved owner decision; ' +
+          'if it was already retired and a later request carrying its work was actually admitted, settle with reconcile-admitted naming that request' } }));
   }
 
   settleDirectiveRecoveryDebt(requestId: string, eventSeq: number, eventKind: string): void {
@@ -9199,7 +9200,8 @@ export class LedgerApi {
   validateRecoverySuccessorBeforeWriterClearance(input: (
     ({ readonly subjectKind: 'directive' } & Parameters<LedgerApi['consumeDirectiveRecoveryDecision']>[0]) |
     ({ readonly subjectKind: 'rebrief' } & Parameters<LedgerApi['consumeRebriefRecoveryDecision']>[0])
-  ) & { readonly decision: { readonly kind: 'successor'; readonly requestId: string; readonly directive: string } }): string | null {
+  ) & { readonly decision: { readonly kind: 'successor'; readonly requestId: string; readonly directive: string } |
+    { readonly kind: 'rebrief-successor'; readonly requestId: string; readonly note: string } }): string | null {
     if (input.subjectKind === 'directive') {
       const row = this.getDirective(input.requestId);
       if (row === null) throw new RecordNotFound(`directive request "${input.requestId}" not found`);
@@ -9217,7 +9219,8 @@ export class LedgerApi {
         const changes = this.db.prepare(`SELECT kind FROM events WHERE job_id = ? AND seq > ? AND seq <= ? AND (${DIRECTIVE_CONTROL_SQL})`).all(row.jobId, row.authorityEpoch, input.expectedEpoch) as Row[];
         if (!owner.confirmed && (changes.length === 0 || changes.some((event) => event.kind !== 'job.amendment-accepted'))) throw new DirectiveCheckpointError('non-amendment authority change cannot revive the old request');
       }
-      if (input.decision.requestId === row.requestId || !input.decision.requestId.trim() || !input.decision.directive.trim() || this.getDirective(input.decision.requestId) !== null) throw new DirectiveCheckpointError('successor must name a fresh unused request and nonempty directive');
+      const text = input.decision.kind === 'successor' ? input.decision.directive : input.decision.note;
+      if (input.decision.requestId === row.requestId || !input.decision.requestId.trim() || !text.trim() || this.getDirective(input.decision.requestId) !== null) throw new DirectiveCheckpointError('successor must name a fresh unused request and nonempty directive or note');
       this.assertNoCompletedNativeRetirement(row);
       return row.jobId;
     }
@@ -9359,7 +9362,13 @@ export class LedgerApi {
     readonly expectedHead: string; readonly expectedEpoch: number; readonly expectedWorkRevision?: number; readonly expectedContractSha256?: string; readonly lane: { readonly id: string; readonly resolvedHead: string };
     readonly reason: string;
     readonly decision: { readonly kind: 'successor'; readonly requestId: string; readonly directive: string } |
-      { readonly kind: 'owner-decision'; readonly obligationId: string };
+      // A fresh-session successor (#470): accepted as a rebrief, the only
+      // request kind dispatched with `freshSession`.
+      { readonly kind: 'rebrief-successor'; readonly requestId: string; readonly note: string } |
+      { readonly kind: 'owner-decision'; readonly obligationId: string } |
+      // Non-executing (#470): an already-retired request's debt settles on a
+      // later request's actual native admission on the same lane.
+      { readonly kind: 'reconcile-admitted'; readonly admittedRequestId: string };
   }): { readonly successor: DirectiveRequestRecord | null; readonly idempotent: boolean } {
     const facts = [input.requestId, input.generation, input.expectedPayloadHash, input.expectedHead, input.expectedEpoch, input.expectedWorkRevision, input.expectedContractSha256, input.reason, input.decision];
     // Canonical, like the rebrief decision's (#363 S02-0-02): the same
@@ -9381,11 +9390,18 @@ export class LedgerApi {
       if (!debt || debt.generation !== input.generation || row.payloadHash !== input.expectedPayloadHash ||
           this.directiveRecoveryEpoch(row.jobId) !== input.expectedEpoch || input.expectedHead !== input.lane.resolvedHead || !input.reason.trim()) throw new DirectiveCheckpointError('recovery generation/hash/head/epoch decision is stale or incomplete');
       const job = this.getJob(row.jobId);
-      if (!job || isJobTerminal(job.status) || isDirectiveTerminal(row.state)) throw new DirectiveCheckpointError('terminal work cannot be revived by recovery');
+      if (!job || isJobTerminal(job.status)) throw new DirectiveCheckpointError('terminal work cannot be revived by recovery');
+      if (input.decision.kind === 'reconcile-admitted' ? row.state !== 'retired' : isDirectiveTerminal(row.state)) {
+        throw new DirectiveCheckpointError(input.decision.kind === 'reconcile-admitted'
+          ? `request is ${row.state}, not retired — a live request takes a successor decision; only a retired request's debt reconciles to a later admission`
+          : 'terminal work cannot be revived by recovery');
+      }
       let successor: DirectiveRequestRecord | null = null;
       let ownerTransfer: RecoveryOwnerTransfer | null = null;
+      let admission: { readonly requestId: string; readonly admissionSeq: number; readonly admissionMinion: string | null; readonly workRevision: number;
+        readonly retiredWorkRevision: number; readonly retirementSeq: number; readonly laneId: string } | null = null;
       const ownerBasis = this.recoveryOwnerBasis('directive', row.requestId);
-      if (input.decision.kind === 'successor') {
+      if (input.decision.kind === 'successor' || input.decision.kind === 'rebrief-successor') {
         if (ownerBasis.changed && !ownerBasis.confirmed) throw new DirectiveCheckpointError('governing owner stop has no genuine confirmed resolution — fresh work remains forbidden');
         this.assertRecoveryJobPermission(row.jobId);
         this.assertFreshRecoveryContract(row.jobId, input.expectedWorkRevision, input.expectedContractSha256);
@@ -9396,22 +9412,129 @@ export class LedgerApi {
         if (input.decision.requestId === row.requestId || this.getDirective(input.decision.requestId) !== null) throw new DirectiveCheckpointError('successor must name a fresh unused request id');
         this.retireInterruptedDirective({ requestId: row.requestId, expectedJobId: row.jobId, expectedState: row.state as LiveDirectiveState,
           expectedPayloadHash: input.expectedPayloadHash, expectedHead: input.expectedHead, lane: input.lane, reason: input.reason, by: 'gru-recovery' });
-        successor = this.beginDirectiveIntent({ jobId: row.jobId, requestId: input.decision.requestId, directive: input.decision.directive, holder: 'gru-recovery' }).record;
+        successor = (input.decision.kind === 'successor'
+          ? this.beginDirectiveIntent({ jobId: row.jobId, requestId: input.decision.requestId, directive: input.decision.directive, holder: 'gru-recovery' })
+          : this.beginRebriefIntent({ jobId: row.jobId, requestId: input.decision.requestId, note: input.decision.note, holder: 'gru-recovery' })).record;
+      } else if (input.decision.kind === 'reconcile-admitted') {
+        if (debt.claim !== null) throw new DirectiveCheckpointError(`recovery debt is claimed by request ${debt.claim.requestId} — release it before reconciling`);
+        admission = this.laterSameLaneAdmission(row, input.decision.admittedRequestId, input.lane.id);
       } else {
         ownerTransfer = this.makeOwnerRecoveryTransfer(this.recoverySubject('directive', row.requestId), debt, input.decision.obligationId);
       }
       const event = this.appendEvent({ kind: 'silas.directive-recovery-decided', jobId: row.jobId,
         payload: { request_id: row.requestId, generation: input.generation, payload_hash: row.payloadHash, expected_head: input.expectedHead,
           authority_epoch: input.expectedEpoch, expected_work_revision: input.expectedWorkRevision, expected_contract_sha256: input.expectedContractSha256,
-          fingerprint, owner_transfer: ownerTransfer, owner_resolution_event_seq: ownerBasis.resolutionEventSeq, decision: input.decision, reason: input.reason } });
+          fingerprint, owner_transfer: ownerTransfer, owner_resolution_event_seq: ownerBasis.resolutionEventSeq, decision: input.decision, reason: input.reason,
+          ...(admission === null ? {} : { admission: { request_id: admission.requestId, admission_seq: admission.admissionSeq, admission_minion: admission.admissionMinion,
+            work_revision: admission.workRevision, retired_work_revision: admission.retiredWorkRevision, retirement_seq: admission.retirementSeq, lane_id: admission.laneId } }) } });
       this.db.prepare('UPDATE pending_directives SET recovery_decision = ? WHERE request_id = ?').run(JSON.stringify({ fingerprint, successorId: successor?.requestId ?? null, eventSeq: event.seq }), row.requestId);
       if (ownerTransfer !== null) {
         this.closeOwnerTransferredRecoveryDebt(debt, ownerTransfer, event);
         const card = this.findNotificationByKind(`silas.directive-unreconciled.${row.requestId}`, 'active');
         if (card?.routing === 'action-required') this.resolveNotificationById(card.id, 'directive-recovery-owner-transfer');
       }
+      if (admission !== null) {
+        this.settleObligation({ obligationId: debt.id, settlement: { kind: 'executed-action',
+          action: `retired request's recovery reconciled to the later actual native admission of ${admission.requestId} (decision event ${event.seq})`,
+          evidenceEventSeq: admission.admissionSeq, evidenceEventKind: 'silas.directive-sent' } });
+        const card = this.findNotificationByKind(`silas.directive-unreconciled.${row.requestId}`, 'active');
+        if (card?.routing === 'action-required') this.resolveNotificationById(card.id, 'directive-recovery-evidence');
+      }
       return { successor, idempotent: false };
     });
+  }
+
+  /** The evidence an orphaned retired request's debt settles on (#470): a
+   * different request of the same job whose ACTUAL native admission (its
+   * correlated `silas.directive-sent`) postdates the retirement, at the same
+   * or a higher work revision, while the lane the retirement bound is still
+   * the job's one live lane. Admission requires that single live lane, so an
+   * admission after the retirement ran on it. Acceptance alone, an earlier
+   * admission or a lower revision never qualifies. */
+  private laterSameLaneAdmission(row: DirectiveRequestRecord, admittedRequestId: string, laneId: string) {
+    const retired = this.latestJobEventByRequestId(row.jobId, 'silas.directive-retired', row.requestId);
+    if (retired === null) throw new DirectiveCheckpointError(`retired request ${row.requestId} has no silas.directive-retired receipt — retirement evidence is missing`);
+    const retiredLane = (retired.payload as { lane_id?: unknown }).lane_id;
+    if (retiredLane !== laneId) throw new DirectiveCheckpointError(`the retirement bound lane ${String(retiredLane)}, not the job's live lane ${laneId} — a later admission is not on the same lane`);
+    const admitted = this.getDirective(admittedRequestId);
+    if (admitted === null || admitted.requestId === row.requestId) {
+      throw new DirectiveCheckpointError(`reconcile-admitted must name another request of job ${row.jobId}; "${admittedRequestId}" is not one`);
+    }
+    if (admitted.jobId !== row.jobId) throw new DirectiveCheckpointError(`request ${admitted.requestId} belongs to job ${admitted.jobId}, not ${row.jobId}`);
+    const sent = admitted.admissionSeq === null ? null : this.getEvent(admitted.admissionSeq);
+    if (admitted.nativeBinding === null || sent === null || sent.kind !== 'silas.directive-sent' || sent.jobId !== row.jobId ||
+        (sent.payload as { request_id?: unknown }).request_id !== admitted.requestId ||
+        !isDeepStrictEqual((sent.payload as { native_binding?: unknown }).native_binding, admitted.nativeBinding)) {
+      throw new DirectiveCheckpointError(`request ${admitted.requestId} has no actual native admission (state ${admitted.state}) — acceptance alone never settles recovery debt`);
+    }
+    if (sent.seq <= retired.seq) throw new DirectiveCheckpointError(`request ${admitted.requestId} was admitted at seq ${sent.seq}, before the retirement at seq ${retired.seq} — only a later admission can carry the retired work`);
+    if (row.workRevision === null || admitted.workRevision === null || admitted.workRevision < row.workRevision) {
+      throw new DirectiveCheckpointError(`request ${admitted.requestId} carries work revision ${String(admitted.workRevision)}, lower than (or unknown against) the retired request's ${String(row.workRevision)} — it does not cover the retired work`);
+    }
+    return { requestId: admitted.requestId, admissionSeq: sent.seq, admissionMinion: admitted.admissionMinion, workRevision: admitted.workRevision,
+      retiredWorkRevision: row.workRevision, retirementSeq: retired.seq, laneId };
+  }
+
+  /** A named recovery successor that ends (failed or retired) without actual
+   * native admission can never settle its predecessor's debt, and that
+   * debt's generation is already consumed by the decision (#470). Supersede
+   * the debt into a fresh generation (still suspended if it was), so Gru can
+   * settle it with `reconcile-admitted` once a later request carrying the
+   * work is admitted instead of leaving it stranded. Runs inside the
+   * successor's terminal transition and from the boot repair below; the
+   * consumed-generation match makes it fire once. Returns debts reopened. */
+  private reopenStrandedRecoveryDebt(successor: DirectiveRequestRecord): number {
+    if (successor.admissionSeq !== null || (successor.state !== 'failed' && successor.state !== 'retired')) return 0;
+    const predecessors = this.db.prepare("SELECT request_id FROM pending_directives WHERE job_id = ? AND json_extract(recovery_decision, '$.successorId') = ?")
+      .all(successor.jobId, successor.requestId) as Row[];
+    let reopened = 0;
+    for (const predecessor of predecessors) {
+      const requestId = str(predecessor.request_id);
+      const debt = this.recoveryObligation(successor.jobId, 'directive', requestId);
+      if (debt === null || !['open', 'waiting', 'suspended'].includes(debt.state) ||
+          !this.recoveryDecisionHistory('directive', requestId).some((decision) => decision.generation === debt.generation && decision.successorId === successor.requestId)) continue;
+      const cause = `named successor ${successor.requestId} ended ${successor.state} without native admission`;
+      // The newest seq on the job: the new incarnation can never read as a stale replay.
+      const audit = this.appendEvent({ kind: 'silas.directive-recovery-reopened', jobId: debt.jobId,
+        payload: { request_id: requestId, successor_request_id: successor.requestId, successor_state: successor.state,
+          superseded_obligation_id: debt.id, consumed_generation: debt.generation } });
+      this.settleObligation({ obligationId: debt.id, settlement: { kind: 'superseded',
+        byObligationId: this.nextIncarnationId(obligationId(debt.jobId, 'operation', debt.incidentKey)), reason: cause } });
+      const next = this.observeRecoveryDebt('directive', requestId, debt.jobId, audit.seq, { logicalStep: 'operation', incidentKey: debt.incidentKey,
+        category: debt.category, observedAtSeq: audit.seq, ...(debt.description === null ? {} : { description: debt.description }),
+        nextAction: { kind: 'gru-decision', decision: `${cause}, so it cannot settle this retired request's debt, and the retired request takes no new successor. ` +
+          'First inspect the job\'s later requests: if one carrying the approved work is live or already admitted, use it; only otherwise begin a fresh ' +
+          'request (POST /api/silas/directive or /api/silas/rebrief). Once that request is actually admitted on this lane, settle this debt at its new ' +
+          `generation with POST /api/silas/directives/${requestId}/recover decision reconcile-admitted naming it` } });
+      const reopenedDebt = debt.state === 'suspended' && next.state !== 'suspended' ? this.suspendObligation(next.id, `suspension carried over from superseded ${debt.id}`) : next;
+      // The old card names the consumed generation and advises a successor
+      // the retired request can no longer take. An open reopened debt reaches
+      // Gru through the obligation mailbox; a suspended one does not, so its
+      // card stays as the only pointer to the debt (read its generation back).
+      const card = this.findNotificationByKind(`silas.directive-unreconciled.${requestId}`, 'active');
+      if (reopenedDebt.state !== 'suspended' && card?.routing === 'action-required') this.resolveNotificationById(card.id, 'directive-recovery-reopened');
+      reopened += 1;
+    }
+    return reopened;
+  }
+
+  /** Boot repair (#470): reopen debts stranded by named successors that ended
+   * unadmitted before the terminal-transition hook existed. Idempotent. Each
+   * successor repairs in its own transaction; one that refuses is reported
+   * by name and never blocks the others or the service start. */
+  reopenStrandedRecoveryDebts(): { readonly reopened: number; readonly failures: readonly {
+    readonly jobId: string; readonly predecessorId: string; readonly successorId: string; readonly error: string }[] } {
+    const rows = this.db.prepare(`SELECT DISTINCT p.job_id, p.request_id AS predecessor_id, s.request_id AS successor_id FROM pending_directives p
+      JOIN pending_directives s ON s.request_id = json_extract(p.recovery_decision, '$.successorId')
+      WHERE s.admission_seq IS NULL AND s.state IN ('failed', 'retired') ORDER BY p.rowid`).all() as Row[];
+    let reopened = 0;
+    const failures: { readonly jobId: string; readonly predecessorId: string; readonly successorId: string; readonly error: string }[] = [];
+    for (const row of rows) {
+      const successorId = str(row.successor_id);
+      try { reopened += this.transaction(() => this.reopenStrandedRecoveryDebt(this.getDirective(successorId) as DirectiveRequestRecord)); }
+      catch (error) { failures.push({ jobId: str(row.job_id), predecessorId: str(row.predecessor_id), successorId, error: String(error) }); }
+    }
+    return { reopened, failures };
   }
 
   /** Bind a request to its ACTUAL native admission: the correlated
@@ -9701,7 +9824,9 @@ export class LedgerApi {
       });
       const phase = this.findPhaseHandoffByRequest({ jobId: row.jobId, requestId: row.requestId });
       if (phase?.state === 'awaiting') this.closePhaseHandoff({ phaseId: phase.phaseId, reason: input.reason });
-      return this.getDirective(input.requestId) as DirectiveRequestRecord;
+      const record = this.getDirective(input.requestId) as DirectiveRequestRecord;
+      this.reopenStrandedRecoveryDebt(record);
+      return record;
     });
   }
 
@@ -10000,7 +10125,9 @@ export class LedgerApi {
           phase_handoff_closed: phaseClosed,
         },
       });
-      return { record: this.getDirective(row.requestId) as DirectiveRequestRecord, idempotent: false, phaseClosed };
+      const record = this.getDirective(row.requestId) as DirectiveRequestRecord;
+      this.reopenStrandedRecoveryDebt(record);
+      return { record, idempotent: false, phaseClosed };
     });
   }
 

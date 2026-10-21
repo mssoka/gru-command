@@ -1602,13 +1602,19 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         return true;
       }
       const choice = decision as Record<string, unknown>;
-      if (body['by'] !== 'gru' || (choice['kind'] !== 'successor' && choice['kind'] !== 'owner-decision' &&
-          !(directiveRecovery[1] === 'rebriefs' && choice['kind'] === 'reconcile-completed'))) {
-        json(res, 400, { error: 'bad_request', detail: 'concrete recovery judgment must be attributed to Gru; generic Ops holds are not decisions' });
+      const direct = directiveRecovery[1] === 'directives';
+      // `rebrief-successor` and `reconcile-admitted` (#470) judge native
+      // directive debt only; `reconcile-completed` is legacy-marker only.
+      const kinds = direct ? ['successor', 'rebrief-successor', 'owner-decision', 'reconcile-admitted'] : ['successor', 'owner-decision', 'reconcile-completed'];
+      if (body['by'] !== 'gru' || typeof choice['kind'] !== 'string' || !kinds.includes(choice['kind'])) {
+        json(res, 400, { error: 'bad_request', detail: `concrete recovery judgment must be attributed to Gru and be one of ${kinds.join(', ')}; generic Ops holds are not decisions` });
         return true;
       }
+      // Executing judgments bind current approved authority; an owner
+      // transfer or a reconciliation to a recorded admission starts no work.
+      const authorityBound = choice['kind'] !== 'owner-decision' && choice['kind'] !== 'reconcile-admitted';
       const revision = body['expected_work_revision'];
-      if (choice['kind'] !== 'owner-decision' && (typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 0 ||
+      if (authorityBound && (typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 0 ||
           typeof body['expected_contract_sha256'] !== 'string' || !/^[a-f0-9]{64}$/.test(body['expected_contract_sha256']))) {
         json(res, 400, { error: 'bad_request', detail: 'successor requires current expected_work_revision and expected_contract_sha256' });
         return true;
@@ -1619,7 +1625,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
           requestId, generation, expectedPayloadHash: strField(body, 'expected_payload_hash'),
           expectedHead: strField(body, 'expected_head'), expectedEpoch: epoch,
-          ...(choice['kind'] !== 'owner-decision' ? { expectedWorkRevision: revision as number, expectedContractSha256: strField(body, 'expected_contract_sha256') } : {}), reason: strField(body, 'reason'),
+          ...(authorityBound ? { expectedWorkRevision: revision as number, expectedContractSha256: strField(body, 'expected_contract_sha256') } : {}), reason: strField(body, 'reason'),
         } as const;
         let outcome: ReturnType<typeof recoverInterruptedDirectiveFromRoute>;
         if (choice['kind'] === 'reconcile-completed') {
@@ -1627,46 +1633,61 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
             decision: { kind: 'reconcile-completed', inspectionRequestId: strField(choice, 'inspection_request_id') },
             expectedReceiptEvidenceSha256: strField(body, 'expected_receipt_evidence_sha256') });
         } else {
-          const nativeDecision = choice['kind'] === 'successor'
-            ? { kind: 'successor' as const, requestId: strField(choice, 'request_id'), directive: strField(choice, 'directive') }
-            : { kind: 'owner-decision' as const, obligationId: strField(choice, 'obligation_id') };
-          const direct = directiveRecovery[1] === 'directives';
-          const receiptSha256 = direct ? undefined : strField(body, 'expected_receipt_evidence_sha256');
-          if (nativeDecision.kind === 'successor') {
-            // Consumed generations are ledger-only, even after the lane is
-            // gone. Neither an exact nor a conflicting replay may stop work.
-            const consumed = direct
-              ? options.ledger.recoveryDecisionHistory('directive', requestId).some((entry) => entry.generation === generation)
-              : options.ledger.getRebriefRecoveryDecision(requestId, generation) !== null;
-            const subject = direct ? options.ledger.getDirective(requestId) : options.ledger.listPendingRebriefs().find((entry) => entry.id === requestId);
-            if (!consumed && subject != null && options.wave.activeReview(subject.jobId) !== null) {
-              const lane = resolveRetirementLane(ops.worktrees, subject.jobId);
-              const resolved = { id: lane.id, resolvedHead: resolveGitCommit(lane.path, 'HEAD') };
-              const jobId = options.ledger.validateRecoverySuccessorBeforeWriterClearance(direct
-                ? { ...recoveryInput, subjectKind: 'directive', decision: nativeDecision, lane: resolved }
-                : { ...recoveryInput, subjectKind: 'rebrief', markerId: requestId, expectedReceiptEvidenceSha256: receiptSha256!, decision: nativeDecision, lane: resolved });
-              if (jobId !== null) {
-                try {
-                  options.wave.assertWriterAdmissible(jobId); // only approved obsolete candidates
-                  await options.wave.clearLaneForWriter({ jobId, writer: `directive ${nativeDecision.requestId}` });
-                } catch (error) { throw new DirectiveCheckpointError(`obsolete review writer clearance remains unproven: ${String(error)}`); }
-              }
-            }
-          }
+          // A successor stops an active obsolete review first. Consumed
+          // generations are ledger-only, even after the lane is gone: neither
+          // an exact nor a conflicting replay may stop work.
+          const clearObsoleteReview = async (jobId: string | undefined, consumed: boolean, writer: string,
+            validate: (lane: { readonly id: string; readonly resolvedHead: string }) => string | null): Promise<void> => {
+            if (consumed || jobId === undefined || options.wave.activeReview(jobId) === null) return;
+            const lane = resolveRetirementLane(ops.worktrees, jobId);
+            const cleared = validate({ id: lane.id, resolvedHead: resolveGitCommit(lane.path, 'HEAD') });
+            if (cleared === null) return;
+            try {
+              options.wave.assertWriterAdmissible(cleared); // only approved obsolete candidates
+              await options.wave.clearLaneForWriter({ jobId: cleared, writer });
+            } catch (error) { throw new DirectiveCheckpointError(`obsolete review writer clearance remains unproven: ${String(error)}`); }
+          };
           // Re-resolve/revalidate after the awaited positive stop. The
           // retirement/decision predicates are unchanged; clearance grants
           // neither cessation of any other producer nor fresh work permission.
-          outcome = direct ? recoverInterruptedDirectiveFromRoute({ ...recoveryInput, decision: nativeDecision }) :
-            recoverInterruptedRebriefFromRoute({ ...recoveryInput, markerId: requestId, decision: nativeDecision,
-              expectedReceiptEvidenceSha256: receiptSha256! });
+          if (direct) {
+            const nativeDecision = choice['kind'] === 'successor'
+              ? { kind: 'successor' as const, requestId: strField(choice, 'request_id'), directive: strField(choice, 'directive') }
+              : choice['kind'] === 'rebrief-successor'
+                ? { kind: 'rebrief-successor' as const, requestId: strField(choice, 'request_id'), note: strField(choice, 'note') }
+                : choice['kind'] === 'reconcile-admitted'
+                  ? { kind: 'reconcile-admitted' as const, admittedRequestId: strField(choice, 'admitted_request_id') }
+                  : { kind: 'owner-decision' as const, obligationId: strField(choice, 'obligation_id') };
+            if (nativeDecision.kind === 'successor' || nativeDecision.kind === 'rebrief-successor') {
+              await clearObsoleteReview(options.ledger.getDirective(requestId)?.jobId,
+                options.ledger.recoveryDecisionHistory('directive', requestId).some((entry) => entry.generation === generation),
+                `${nativeDecision.kind === 'successor' ? 'directive' : 'rebrief'} ${nativeDecision.requestId}`,
+                (lane) => options.ledger.validateRecoverySuccessorBeforeWriterClearance({ ...recoveryInput, subjectKind: 'directive', decision: nativeDecision, lane }));
+            }
+            outcome = recoverInterruptedDirectiveFromRoute({ ...recoveryInput, decision: nativeDecision });
+          } else {
+            const markerDecision = choice['kind'] === 'successor'
+              ? { kind: 'successor' as const, requestId: strField(choice, 'request_id'), directive: strField(choice, 'directive') }
+              : { kind: 'owner-decision' as const, obligationId: strField(choice, 'obligation_id') };
+            const receiptSha256 = strField(body, 'expected_receipt_evidence_sha256');
+            if (markerDecision.kind === 'successor') {
+              await clearObsoleteReview(options.ledger.listPendingRebriefs().find((entry) => entry.id === requestId)?.jobId,
+                options.ledger.getRebriefRecoveryDecision(requestId, generation) !== null, `directive ${markerDecision.requestId}`,
+                (lane) => options.ledger.validateRecoverySuccessorBeforeWriterClearance({ ...recoveryInput, subjectKind: 'rebrief', markerId: requestId,
+                  expectedReceiptEvidenceSha256: receiptSha256, decision: markerDecision, lane }));
+            }
+            outcome = recoverInterruptedRebriefFromRoute({ ...recoveryInput, markerId: requestId, decision: markerDecision, expectedReceiptEvidenceSha256: receiptSha256 });
+          }
         }
         if (choice['kind'] === 'owner-decision') surfaceRecoveryOwnerTransfer({ ledger: options.ledger, notifications: ops.notifications },
           directiveRecovery[1] === 'directives' ? 'directive' : 'rebrief', requestId);
-        // Execution is owned by the same server and scheduled once only.
+        // Execution is owned by the same server and scheduled once only. A
+        // rebrief successor clears the lane like any accepted rebrief.
         if (!outcome.idempotent && outcome.successor !== null) {
           const controller = new AbortController();
           directiveControllers.add(controller);
           const run = executeAcceptedDirective({ registry: ops.registry, ledger: options.ledger, worktrees: ops.worktrees,
+            clearLaneForWriter: (input) => options.wave.clearLaneForWriter(input),
             notifications: ops.notifications, pendingProducerBlockers: options.pendingProducerBlockers, signal: controller.signal,
             ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
             ...(options.retrySettlement !== undefined ? { retrySettlement: options.retrySettlement } : {}),

@@ -393,6 +393,117 @@ debt. Generic Ops holds or notification prose cannot cover recovery debt.
 The existing bearer boundary authenticates the call; `by` remains audit
 attribution, not cryptographic role identity.
 
+### Fresh-session successor (#470)
+
+A `successor` is a directive, and every directive resumes the worker's
+existing session. When that session cannot be resumed (for example a
+directive turn in it is refused by name, or the runtime keeps failing to
+admit on it), name a **fresh-session** successor instead:
+
+```json
+"decision": {
+  "kind": "rebrief-successor",
+  "request_id": "<explicit fresh unused ID>",
+  "note": "<concrete approved follow-through>"
+}
+```
+
+The rest of the body is the same as for `successor`, including the
+current `expected_work_revision` and `expected_contract_sha256`. It takes
+the same fences in the same transaction: generation, payload hash, HEAD,
+epoch, current revision and contract, owner stops, and proven producer
+cessation (a live, queued or unproven producer refuses with 409). The
+stuck request is retired and the successor is accepted as a **rebrief**,
+the one request kind dispatched with a fresh session. It runs on the same
+job lane, branch and PR, and any resident session is disposed first. The
+debt settles on the successor's actual native admission, never on
+acceptance. An identical replay appends nothing and starts no second
+worker. Only `/api/silas/directives/{id}/recover` accepts this kind; a
+legacy marker's `/recover` refuses it with 400.
+
+### Settling an orphaned retired request (#470)
+
+A request retired outside `/recover` (for example by the standalone
+`/retire`) keeps its open recovery debt: retirement grants no authority
+and settles nothing. If a separate request that carries its approved
+work was later admitted, Gru settles that debt with an explicit,
+non-executing judgment that names the later request:
+
+```json
+{
+  "by": "gru",
+  "expected_generation": 1,
+  "expected_payload_hash": "<the retired request's accepted hash>",
+  "expected_head": "<fresh checkout HEAD>",
+  "expected_epoch": 0,
+  "reason": "approved work completed by the later fresh-session rebrief",
+  "decision": { "kind": "reconcile-admitted", "admitted_request_id": "<later admitted request>" }
+}
+```
+
+The ledger checks, in one transaction, that:
+
+- the generation, payload hash, HEAD and epoch are current;
+- the subject request is `retired` (a live request takes a successor
+  decision instead) and its debt is open or waiting and unclaimed;
+- the lane the retirement bound is still the job's single live lane;
+- the named request is a different request of the same job with an
+  actual native admission (its correlated `silas.directive-sent`), and
+  that admission comes **after** the retirement;
+- its work revision is the same as or higher than the retired request's.
+
+A live request, a request that was only accepted, an admission that
+predates the retirement, a lower or unknown revision, a request of
+another job and a claimed debt are each refused with 409; nothing
+changes. A legacy marker's `/recover` refuses this kind with 400.
+
+The settlement proves admission, not completion: the later request may
+still be running or may end without delivery. Lane identity is the
+job's lane id, which is the job id, so "same lane" means the job's one
+live lane still exists under the id the retirement bound. Native
+admission itself requires the job's single live lane at that moment, its
+registered branch and a session started in its checkout; a lane swept and
+re-created under the same id between the two would not be told apart.
+A pre-revision (legacy) request has no known revision and cannot be
+reconciled; that refusal is deliberate.
+
+On success, `silas.directive-recovery-decided` records the decision and
+an `admission` block (the admitted request, its admission seq, minion,
+revision, the retired revision, the retirement seq and the lane). The
+debt settles as `executed-action`, citing that admission's
+`silas.directive-sent` event, and the action-required card resolves. No
+worker starts and no work revision or current authority is required. An
+identical replay returns `idempotent: true` and appends nothing. There
+is no age policy: an orphan settles only through this explicit call.
+
+The retired request takes no new successor. Gru first checks the job for
+a later request that already carries the work, live or admitted, and uses
+it; only when there is none does Gru start one itself (`POST
+/api/silas/directive` or `/api/silas/rebrief`). It reconciles once that
+request is admitted.
+
+A request retired **by** a `successor` or `rebrief-successor` decision
+has already used its debt's generation on that decision. If the named
+successor then ends without native admission (a positive no-effect
+failure, or its own retirement), it can never settle the debt. In the
+same transaction the ledger records `silas.directive-recovery-reopened`,
+closes that debt as `superseded` and opens the next incarnation with a
+fresh generation (still suspended if the old one was, or while the job
+is parked). The new incarnation's next action tells Gru to look first
+for a later request already carrying the work (live or admitted), begin
+one only if there is none, and then use `reconcile-admitted`. An open
+reopened debt reaches Gru through the obligation mailbox, so the old
+action-required card, which names the consumed generation, is resolved;
+a suspended one keeps its card as the pointer. The old
+generation stays consumed: replaying any other decision for it is
+refused as a conflict. A chain is handled link by link: when Gru
+recovers a stuck successor B with C, retiring B reopens A's debt, C's
+admission settles B's debt directly, and Gru reconciles A against C.
+At boot the service reopens, once, any debt left stranded this way by a
+build that predates this behaviour (`reopenStrandedRecoveryDebts`). Each
+successor repairs in its own transaction; one that refuses is logged by
+name and never blocks the others or the service start.
+
 Historical `pending_rebriefs` retain their original markers and audit.
 Their old blind replay/fresh-session boot pipeline is removed. Spent
 correlated evidence can settle, and terminal administrative retirement
@@ -428,7 +539,7 @@ contract. Original native admission/delivery revisions are never rewritten.
 
 Historical observation uses bounded whole-job row-cursor pages at boot and on ticks. Neither wall-clock age nor a newer same-job event is correlation. Cancellation does not consume an unobserved page; unresolved early groups cannot starve independent later completion.
 
-Authenticated legacy GET `/api/silas/rebriefs/{marker_id}` exposes versioned `receipt_evidence` and `receipt_evidence_sha256`. The canonical SHA256 covers the exact stored generation, immutable original phase facts and relevant accepted/unproven receipt candidates. Explicit other jobs/generations do not perturb it. A legacy `/recover` judgment **requires** `expected_receipt_evidence_sha256`; the ledger recomputes it inside the write transaction. The hash fences stale intent only: it grants no permission and proves neither cessation nor effects. Native `/recover` request bodies are unchanged.
+Authenticated legacy GET `/api/silas/rebriefs/{marker_id}` exposes versioned `receipt_evidence` and `receipt_evidence_sha256`. The canonical SHA256 covers the exact stored generation, immutable original phase facts and relevant accepted/unproven receipt candidates. Explicit other jobs/generations do not perturb it. A legacy `/recover` judgment **requires** `expected_receipt_evidence_sha256`; the ledger recomputes it inside the write transaction. The hash fences stale intent only: it grants no permission and proves neither cessation nor effects. Native `/recover` bodies take no receipt evidence hash.
 
 An unmarked historical receipt needs explicit exact marker identity/hash, original bound minion and revision. A marked receipt needs a phase independently belonging to the exact original generation and consistent original minion facts. Missing duplicated revision on old marked `silas.rebrief` receipts remains absent; all available original marker/receipt revisions must agree. Reused/rebound/foreign phases, conflicting minions/revisions and same-job late unrelated events are not proof.
 

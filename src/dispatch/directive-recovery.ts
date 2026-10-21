@@ -155,8 +155,7 @@ export function recoverInterruptedDirectiveFromRoute(input: {
   readonly expectedWorkRevision?: number;
   readonly expectedContractSha256?: string;
   readonly reason: string;
-  readonly decision: { readonly kind: 'successor'; readonly requestId: string; readonly directive: string } |
-    { readonly kind: 'owner-decision'; readonly obligationId: string };
+  readonly decision: Parameters<LedgerApi['consumeDirectiveRecoveryDecision']>[0]['decision'];
 }): ReturnType<LedgerApi['consumeDirectiveRecoveryDecision']> {
   const row = input.ledger.getDirective(input.requestId);
   if (row === null) throw new RecordNotFound(`directive request "${input.requestId}" not found`);
@@ -164,7 +163,7 @@ export function recoverInterruptedDirectiveFromRoute(input: {
   if (input.ledger.recoveryDecisionHistory('directive', row.requestId).some((decision) => decision.generation === input.generation)) return input.ledger.consumeDirectiveRecoveryDecision({ ...input,
     lane: { id: '', resolvedHead: input.expectedHead } });
   const lane = resolveRetirementLane(input.worktrees, row.jobId);
-  if (input.decision.kind === 'successor') {
+  if (input.decision.kind === 'successor' || input.decision.kind === 'rebrief-successor') {
     const supervised = input.pendingProducerBlockers(row.jobId);
     const durable = input.ledger.directiveProgressBlockers(row.requestId, lane.id);
     const ids = new Set(input.ledger.listAgents().filter((agent) => agent.jobId === row.jobId).map((agent) => agent.id));
