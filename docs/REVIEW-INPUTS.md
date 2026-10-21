@@ -290,7 +290,9 @@ latest revision → verify → fresh review. The service enforces it centrally.
 
   The stop is proven the same way the next round's setup proves a predecessor stopped: a
   trusted no-spawn receipt, or the runtime proving the round's owner marker and every
-  registered session ceased. A superseded fallback gate's reviewer sessions are proven too;
+  registered session ceased. Startup recovery writes that receipt for a round that never
+  went live (#466), so a restart that interrupted the supersession of a round still in setup
+  re-proves it without the runtime. A superseded fallback gate's reviewer sessions are proven too;
   its debt lives on the job (`job.review-superseded` / `job.review-supersession-*`). The outcome is recorded as `round.supersession-confirmed`, or as
   `round.supersession-unconfirmed` plus one action-required escalation. A round whose stop
   stays unproven keeps owning the lane, even though it is terminal: every later writer

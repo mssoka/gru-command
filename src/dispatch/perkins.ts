@@ -3598,10 +3598,22 @@ export class WaveRunner {
    * with the atomic no-spawn receipt the replacement gate trusts, even when
    * the crash beat its owner marker. A live round keeps the parent-incident
    * abort and never gets a receipt; its marker binds the cessation proof. A
-   * refused receipt throws and leaves the round pending for inspection. */
+   * pending round whose receipt the ledger refuses (only a ledger defect can)
+   * takes that same abort, escalated, so it never stays pending. */
   private abortInterruptedRound(round: RoundRecord, note: string): void {
-    if (round.status === 'pending') this.opts.ledger.abortReviewSetupWithoutSpawn(round.id);
-    else this.abortRound(round, note);
+    if (round.status === 'pending') {
+      try {
+        this.opts.ledger.abortReviewSetupWithoutSpawn(round.id);
+        return;
+      } catch (error) {
+        this.escalate(
+          `Review round ${round.id} has no no-spawn proof after service restart`,
+          `${String(error)} — it is aborted without a receipt, so a replacement review waits until its ownership is reconciled`,
+          { jobId: round.jobId, roundId: round.id },
+        );
+      }
+    }
+    this.abortRound(round, note);
   }
 
   /** A write-once pre-spawn event, not a ledger lifecycle state, binds
@@ -5836,7 +5848,7 @@ export class WaveRunner {
           });
         } else {
           // The immutable negative receipt and abort commit together. A
-          // failure after the owner marker is never eligible for this proof.
+          // round that went live is never eligible for this proof.
           this.opts.ledger.abortReviewSetupWithoutSpawn(round.id);
         }
       } catch (proofError) {

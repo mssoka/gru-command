@@ -1368,7 +1368,7 @@ export class LedgerApi {
           .get(roundId) !== undefined ||
         this.listRoundSpecialistStarts(roundId).length !== 0 ||
         this.listAgents().some((agent) => agent.roundId === roundId)) {
-        throw new Error(`round ${roundId} cannot prove no review owner started`);
+        throw new Error(`round ${roundId} cannot prove no review owner started: the proof needs a pending or aborted round that never went live, with no specialist starts, no registered agents, no earlier no-spawn receipt and at most one owner marker`);
       }
       const generation = randomUUID();
       this.appendEvent({ kind: 'round.review-no-spawn', jobId: round.jobId, roundId,

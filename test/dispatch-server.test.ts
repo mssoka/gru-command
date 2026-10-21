@@ -1611,8 +1611,8 @@ if (argv.includes('--method') && argv.includes('POST')) {
         spawner: async () => { throw new Error('the crashed setup never reaches a spawn'); },
         reviewRuntimeIdentity: () => ({ id: 'claude-code', version: 'fixture' }),
       });
-      void dying.runRound({ jobId }).catch(() => {});
-      await crashed;
+      // A setup that settles before the crash point fails with its own cause.
+      await Promise.race([crashed, dying.runRound({ jobId }).then(() => { throw new Error('review setup settled before the injected crash'); })]);
       const [round] = h.ledger.listRounds(jobId);
       expect(round?.status).toBe('pending');
       expect(h.ledger.latestRoundEvent(round!.id, 'round.review-owner')).toBeNull();
@@ -1622,6 +1622,7 @@ if (argv.includes('--method') && argv.includes('POST')) {
       await h.wave.recoverInterruptedRounds();
       expect(h.ledger.getRound(round!.id)?.status).toBe('aborted');
       expect(h.ledger.uniqueRoundNoSpawnReceipt(round!.id)?.payload).toMatchObject({ roundId: round!.id, ownerGeneration: null });
+      expect(h.ledger.latestRoundEvent(round!.id, 'round.parent-incident')).toBeNull();
       expect(h.ledger.latestRoundEvent(round!.id, 'round.perkins-incomplete')?.payload).toMatchObject({ reason: 'service_restart' });
       const digest = await computeSilasDigest({ ledger: h.ledger, blockersForRound: async () => ({ blockers: [], note: null }),
         config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
