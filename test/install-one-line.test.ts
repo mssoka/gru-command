@@ -1093,7 +1093,7 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(existsSync(join(outside, 'systemd'))).toBe(false);
   });
 
-  it('in-service restart delegates to gru-service roll and never unload/loads', async () => {
+  it('in-service restart delegates to gru roll --detach and never unload/loads', async () => {
     // Function-level pin for the delegation branch: the in-service process
     // group IS detected (fake manager reports our own pgid), the unit IS
     // owned, and the served restart must be the roll CLI — never the unit
@@ -1134,9 +1134,10 @@ describe('install.sh setup mode (one-line path)', () => {
       env: { ...process.env, HOME: home },
       encoding: 'utf-8',
     });
-    expect(stdout).toContain("delegating the restart to 'gru roll --no-wait'");
-    // The relaunch ends this shell with the service: it never waits for verification.
-    expect(readFileSync(rollLog, 'utf-8')).toBe('argv:roll --no-wait\n');
+    expect(stdout).toContain("delegating the restart to 'gru roll --detach'");
+    expect(stdout).toContain('the service relaunches itself once its drain settles; check it afterwards with: gru status');
+    // Through preflight only: the relaunch ends this shell with the service.
+    expect(readFileSync(rollLog, 'utf-8')).toBe('argv:roll --detach\n');
     const calls = existsSync(managerLog) ? readFileSync(managerLog, 'utf-8') : '';
     expect(calls).not.toMatch(/^unload/m);
     expect(calls).not.toMatch(/^load/m);
@@ -1287,7 +1288,7 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(insideStop.stderr).toContain("run 'gru stop' from a terminal outside the service");
     const insideRestart = await run(install, ['--restart'], { ...base, ...inside.env });
     expect(insideRestart.status).not.toBe(0);
-    expect(insideRestart.stderr).toContain("use 'gru restart --no-wait' instead");
+    expect(insideRestart.stderr).toContain("use 'gru restart --detach' instead");
     expect(calls(inside)).toEqual([]);
 
     // A foreign unit is never touched.

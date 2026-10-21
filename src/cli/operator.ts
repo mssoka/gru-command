@@ -30,7 +30,8 @@ export function installerRunnerFor(packageRoot: string): InstallerRunner {
     const result = spawnSync('bash', [script, ...args], {
       cwd: packageRoot,
       stdio: 'inherit',
-      env: { ...process.env, GRU_COMMAND_NODE: process.execPath },
+      // The caller's directory, for hints install.sh prints to them.
+      env: { ...process.env, GRU_COMMAND_NODE: process.execPath, GRU_COMMAND_LAUNCH_PWD: process.cwd() },
     });
     if (result.error !== undefined) {
       process.stderr.write(`gru: could not run ${script}: ${result.error.message}\n`);

@@ -9,7 +9,7 @@ import { createHash } from 'node:crypto';
 
 /**
  * tools/prune-stale-dist.mjs contract. `tsc` never deletes outputs of a
- * removed source, and `gru-service roll` rebuilds the deploy clone in place
+ * removed source, and `gru roll` rebuilds the deploy clone in place
  * (no clean), so a deleted module's dist/*.js survived every roll until the
  * Perkins runtime fingerprint refused it as "an unproven executable path"
  * (owner incident 2026-10-07: dist/dispatch/perkins-review/hybrid.js). The

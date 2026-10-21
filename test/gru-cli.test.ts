@@ -123,15 +123,17 @@ describe('gru update / stop / start / restart --now hand off to install.sh', () 
     cleanupDirs.push(root);
     const record = join(root, 'record.txt');
     writeFileSync(join(root, 'install.sh'),
-      `printf '%s\\n' "$*" "$GRU_COMMAND_NODE" "$(pwd -P)" "$PATH" > ${JSON.stringify(record)}\nexit 7\n`);
+      `printf '%s\\n' "$*" "$GRU_COMMAND_NODE" "$(pwd -P)" "$PATH" "$GRU_COMMAND_LAUNCH_PWD" > ${JSON.stringify(record)}\nexit 7\n`);
     expect(installerRunnerFor(root)(['--stop'])).toBe(7);
-    const [args, node, cwd, path] = readFileSync(record, 'utf8').trimEnd().split('\n');
+    const [args, node, cwd, path, launchPwd] = readFileSync(record, 'utf8').trimEnd().split('\n');
     expect(args).toBe('--stop');
     // install.sh decides: the shell's node, or this one when the shell's is missing or too old.
     expect(node).toBe(process.execPath);
     // From the checkout, so a version manager never picks a node from the caller's directory.
     expect(cwd).toBe(root);
     expect(path).toBe(process.env['PATH']);
+    // Hints install.sh prints (`<path>/install.sh --service`) are for the caller's directory.
+    expect(launchPwd).toBe(process.cwd());
   });
 
   it('every subcommand answers --help with usage and exit 0, running nothing', async () => {

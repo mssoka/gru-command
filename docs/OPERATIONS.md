@@ -77,13 +77,17 @@ on.
 
 From inside the service (an agent's shell), `gru stop` and
 `gru restart --now` refuse, because the service manager would end them with
-the service. Use `gru restart --no-wait` there; `gru update` from inside
-already hands off to `gru roll --no-wait`. The drain counts the calling
-session's own turn, and the relaunch ends that shell with the service, so
-waiting would only sit out the drain bound and never see the result. The CLI reads the instance's `config.toml` to reach the
-service, so an edit to `[server]` host/port or `[auth]` token is applied
-with `gru restart --now` from a terminal — the service cannot apply it from
-inside, and that restart cuts the turns in flight.
+the service. Use `gru restart --detach` or `gru roll --detach` there:
+`--detach` follows the roll through preflight (a refused roll still fails,
+loud) and returns once the drain begins. `gru update` from inside already
+hands off to `gru roll --detach`. Waiting longer is pointless there: the
+drain counts the calling session's own turn, and the relaunch ends that
+shell with the service before any verification.
+
+The CLI reads the instance's `config.toml` to reach the service, so an edit
+to `[server]` host/port or `[auth]` token is applied with `gru restart
+--now` from a terminal. The service cannot apply it from inside, and that
+restart cuts the turns in flight.
 
 **Noticing a release.** The board's `deploy` check is the operator-facing
 update signal. Every 5 minutes the service reads `origin/main` and the

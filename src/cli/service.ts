@@ -53,12 +53,13 @@ const USAGE = `usage: gru <command> [options]
 
   update [--no-interact]   pull main, rebuild, and restart the service
                            (the deploy clone's install.sh --update)
-  restart [--now]          relaunch the service on the build it already has,
+  restart [--now]          relaunch the service on the installed build,
                            e.g. after editing config.toml. It first waits for
                            in-flight turns to settle (up to [roll]
                            drain_timeout_ms); --now restarts at once and boot
                            recovery resumes the turns it cut. Also takes
-                           --no-wait, --json, --reason and --timeout-ms.
+                           --no-wait, --detach, --json, --reason and
+                           --timeout-ms.
   stop                     stop the service; it stays down until gru start, a
                            reboot or your next login
   start                    start the service
@@ -70,9 +71,11 @@ const USAGE = `usage: gru <command> [options]
                            with the service stopped: remove every GC lane from
                            the managed repositories and empty the data
                            directory, keeping config.toml (gru reset --help)
-  roll [--no-wait] [--json] [--reason <text>] [--timeout-ms <n>]
+  roll [--no-wait | --detach] [--json] [--reason <text>] [--timeout-ms <n>]
                            update through the running service: pull and
-                           rebuild, drain, relaunch, and verify on /health
+                           rebuild, drain, relaunch, and verify on /health.
+                           --detach returns once preflight passes (use it
+                           from inside the service, which the relaunch ends)
 
   gru-service is the same command under its older name.
 `;
@@ -143,6 +146,9 @@ export interface ServiceCliOptions {
   /** `restart` is a roll in restart mode: no pull, no build. */
   readonly action: 'roll' | 'restart';
   readonly wait: boolean;
+  /** Follow only through preflight (a refused roll fails loud), then return:
+   * for a caller inside the service, which the relaunch would end. */
+  readonly detach: boolean;
   readonly json: boolean;
   readonly reason: string | null;
   readonly timeoutMs: number;
@@ -166,12 +172,14 @@ export function parseServiceArgs(argv: readonly string[]): ServiceCliParse {
   }
   args.shift();
   let wait = true;
+  let detach = false;
   let json = false;
   let reason: string | null = null;
   let timeoutMs = DEFAULT_FOLLOW_TIMEOUT_MS;
   while (args.length > 0) {
     const arg = args.shift() as string;
     if (arg === '--no-wait') wait = false;
+    else if (arg === '--detach') detach = true;
     else if (arg === '--json') json = true;
     else if (arg === '--reason') {
       const value = args.shift();
@@ -191,7 +199,10 @@ export function parseServiceArgs(argv: readonly string[]): ServiceCliParse {
       return { ok: false, error: `unknown argument: ${arg}`, help: true };
     }
   }
-  return { ok: true, options: { action, wait, json, reason, timeoutMs } };
+  if (detach && !wait) {
+    return { ok: false, error: '--detach already returns early (after preflight); drop --no-wait', help: false };
+  }
+  return { ok: true, options: { action, wait, detach, json, reason, timeoutMs } };
 }
 
 /** Host to DIAL (a wildcard bind is dialed on loopback). */
@@ -380,10 +391,10 @@ export async function runServiceCli(
     deps.stderr(
       `gru: roll refused (HTTP ${res.status}): ${body.detail ?? body.error ?? 'unknown error'}`,
     );
-    // Anything but our own validation error (400) may be the edited config
-    // talking: a new token (401), one added where none was (503), or the new
-    // port reaching another listener (404, 405, 500, ...).
-    if (res.status !== 400) configChangeHint(deps.stderr);
+    // Anything but our own validation error may be the edited config talking:
+    // a new token (401), one added where none was (503), or the new port
+    // reaching another listener (404, 405, 500, even a foreign 400).
+    if (!(res.status === 400 && body.error === 'bad_request')) configChangeHint(deps.stderr);
     return 1;
   }
   if (!options.wait) return 0;
@@ -408,6 +419,11 @@ export async function runServiceCli(
     }
     if (state !== null && state.phase === 'failed') {
       return 1;
+    }
+    if (options.detach && state !== null && state.phase !== 'preflight') {
+      if (options.json) deps.stdout(JSON.stringify({ event: 'detached', roll: state }));
+      else deps.stdout(`roll ${state.rollId} passed preflight; the service relaunches once its drain settles (check it with gru status)`);
+      return 0;
     }
     if (state !== null && state.phase === 'done') {
       healthDeadline ??= deps.now() + HEALTH_VERIFY_TIMEOUT_MS;

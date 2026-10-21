@@ -5,7 +5,7 @@
  * `node tools/prune-stale-dist.mjs [packageRoot]`).
  *
  * Why: `tsc` never deletes outputs of a removed source. `prepack` empties
- * dist/ first, but `gru-service roll` rebuilds the deploy clone in place
+ * dist/ first, but `gru roll` rebuilds the deploy clone in place
  * (`npm run build`) while the old build keeps serving, so emptying dist/
  * there is not an option. A deleted module's dist/*.js then survived every
  * roll, and the Perkins runtime fingerprint (src/runtime/review-build-

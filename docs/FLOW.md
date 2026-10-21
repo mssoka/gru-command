@@ -1194,11 +1194,12 @@ agent-owned pty.
 **install.sh --update is now a client of this path.** When the updater
 detects it is running inside the managed service's process group (the
 service main pid IS the group leader), it delegates the restart to
-`gru roll --no-wait` and never calls `unload`/`load` (the relaunch ends
-that shell with the service, so it cannot wait for verification); the
-register prompt is
-skipped with an announced default instead of reading `/dev/tty`. Run from
-a human terminal, the update path is unchanged.
+`gru roll --detach` and never calls `unload`/`load`. `--detach` follows the
+roll through preflight, so a refused roll fails the update, then returns:
+the relaunch ends that shell with the service, so it could never wait for
+verification. The register prompt is skipped with an announced default
+instead of reading `/dev/tty`. Run from a human terminal, the update path
+is unchanged.
 
 **Rollback safety (no auto-rollback v1).** If the new build fails to boot,
 launchd throttles (5 s `ThrottleInterval`) and systemd backs off

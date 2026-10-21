@@ -147,6 +147,7 @@ describe('gru roll argument contract', () => {
       expect(parsed.options).toEqual({
         action: 'roll',
         wait: false,
+        detach: false,
         json: true,
         reason: 'config edit',
         timeoutMs: 5_000,
@@ -213,10 +214,13 @@ describe('gru roll follow loop', () => {
       expect(await runServiceCli([command], rejected.deps)).toBe(1);
       expect(rejected.stderr.join('\n')).toContain('apply the edit with gru restart --now, from a terminal outside the service');
     }
-    // Our own validation error is not the config talking.
+    // Our own validation error is not the config talking; a foreign 400 may be.
     const invalid = await harness({ post: jsonResponse(400, { error: 'bad_request', detail: 'mode must be "update" or "restart"' }) });
     expect(await runServiceCli(['restart'], invalid.deps)).toBe(1);
     expect(invalid.stderr.join('\n')).not.toContain('gru restart --now');
+    const foreign = await harness({ post: jsonResponse(400, { message: 'not this API' }) });
+    expect(await runServiceCli(['restart'], foreign.deps)).toBe(1);
+    expect(foreign.stderr.join('\n')).toContain('gru restart --now');
   });
 
   it('gru restart refuses, non-zero, while another roll is in progress — it never attaches to it', async () => {
@@ -280,6 +284,26 @@ describe('gru roll follow loop', () => {
     const code = await runServiceCli(['roll'], h.deps);
     expect(code).toBe(1);
     expect(h.stderr.join('\n')).toContain('service unreachable');
+    // An edited [server]/[auth] is one reason it cannot be reached.
+    expect(h.stderr.join('\n')).toContain('apply the edit with gru restart --now, from a terminal outside the service');
+  });
+
+  it('--detach (#463) follows through preflight, then returns once the roll drains; a refused preflight still fails', async () => {
+    const h = await harness({
+      post: jsonResponse(202, { status: 'accepted', roll: rollState('preflight') }),
+      polls: [jsonResponse(200, { roll: rollState('preflight') }), jsonResponse(200, { roll: rollState('drain') })],
+    });
+    expect(await runServiceCli(['roll', '--detach'], h.deps)).toBe(0);
+    expect(h.stdout.join('\n')).toContain('roll roll-cli-1 passed preflight; the service relaunches once its drain settles');
+    expect(h.requests.some((url) => url.endsWith('/health'))).toBe(false);
+    const failed = { ...rollState('failed'), error: { phase: 'preflight' as const, detail: 'refusing to roll a dirty deploy clone' } };
+    const refused = await harness({
+      post: jsonResponse(202, { status: 'accepted', roll: rollState('preflight') }),
+      polls: [jsonResponse(200, { roll: failed })],
+    });
+    expect(await runServiceCli(['restart', '--detach'], refused.deps)).toBe(1);
+    expect(refused.stdout.join('\n')).toContain('refusing to roll a dirty deploy clone');
+    expect(parseServiceArgs(['roll', '--detach', '--no-wait']).ok).toBe(false);
   });
 
   it('a done record whose /health sha never matches times out non-zero with the bail hint', async () => {
