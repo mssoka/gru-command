@@ -2231,14 +2231,15 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       expected: { jobId: f.intent.jobId, state: 'dispatching', payloadHash: f.successor.payloadHash, head: resolveGitCommit(f.lane.path, 'HEAD') } });
     const reopened = f.ledger.recoveryObligation(f.intent.jobId, 'directive', f.intent.requestId)!;
     expect(f.ledger.getObligation(f.debt.id)).toMatchObject({ state: 'closed', settlement: { kind: 'superseded', byObligationId: reopened.id } });
-    expect(reopened).toMatchObject({ state: 'open', nextAction: { kind: 'gru-decision', decision: expect.stringMatching(/Begin a fresh request.*reconcile-admitted/u) } });
+    expect(reopened).toMatchObject({ state: 'open', nextAction: { kind: 'gru-decision',
+      decision: expect.stringMatching(/First inspect the job's later requests: if one carrying the approved work is live or already admitted, use it; only otherwise begin a fresh request.*reconcile-admitted/u) } });
     expect(reopened.generation).toBeGreaterThan(f.debt.generation);
     expect(f.ledger.latestJobEvent(f.intent.jobId, 'silas.directive-recovery-reopened')?.payload).toEqual({ request_id: f.intent.requestId,
       successor_request_id: f.successor.requestId, successor_state: end, superseded_obligation_id: f.debt.id, consumed_generation: f.debt.generation });
     // The old card names the consumed generation and a successor the retired request can no longer take.
     expect(f.card()).toBeNull();
     // Re-running the boot repair finds nothing left to reopen.
-    expect(f.ledger.reopenStrandedRecoveryDebts()).toBe(0);
+    expect(f.ledger.reopenStrandedRecoveryDebts()).toEqual({ reopened: 0, failures: [] });
     // A later request carries the work; only its admission plus Gru's reconciliation settles the reopened debt.
     const admitted = await f.admitLater('later-rebrief');
     expect(f.ledger.getObligation(reopened.id)?.state).toBe('open');
@@ -2262,6 +2263,9 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       decision: { kind: 'rebrief-successor', requestId: 'final-successor', note: 'finish the approved work fresh' } }).successor!;
     const reopened = f.ledger.recoveryObligation(f.intent.jobId, 'directive', f.intent.requestId)!;
     expect(reopened.generation).toBeGreaterThan(f.debt.generation); expect(reopened.state).toBe('open');
+    // The reopened debt points Gru at the already-live request rather than a duplicate one.
+    expect(reopened.nextAction).toMatchObject({ decision: expect.stringContaining('if one carrying the approved work is live or already admitted, use it') });
+    expect(f.ledger.getDirective(final.requestId)?.state).toBe('dispatching');
     await executeAcceptedDirective(f.deps, final.requestId);
     const admitted = f.ledger.getDirective(final.requestId)!;
     // The final admission settles its direct predecessor's debt; the first predecessor takes Gru's reconciliation.
@@ -2279,18 +2283,54 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     const reopened = f.ledger.recoveryObligation(f.intent.jobId, 'directive', f.intent.requestId)!;
     expect(reopened.id).not.toBe(f.debt.id); expect(reopened.generation).toBeGreaterThan(f.debt.generation);
     expect(reopened.state).toBe('suspended');
+    // A suspended debt is not in Gru's mailbox, so its card stays as the pointer.
+    expect(f.card()).not.toBeNull();
   });
 
-  it('the boot repair reopens a debt stranded before the hook existed, once (#470)', async () => {
+  it('the boot repair reopens only debts stranded before the hook existed, one row at a time (#470)', async () => {
     const f = await strandableSuccessor('successor');
-    // A build without the hook recorded the successor's failure and left the debt on its consumed generation.
-    f.db.handle.prepare("UPDATE pending_directives SET state = 'failed', fail_reason = 'pre-#470 build' WHERE request_id = ?").run(f.successor.requestId);
-    expect(f.ledger.recoveryObligation(f.intent.jobId, 'directive', f.intent.requestId)?.id).toBe(f.debt.id);
-    expect(f.ledger.reopenStrandedRecoveryDebts()).toBe(1);
-    const reopened = f.ledger.recoveryObligation(f.intent.jobId, 'directive', f.intent.requestId)!;
-    expect(reopened.id).not.toBe(f.debt.id); expect(reopened.generation).toBeGreaterThan(f.debt.generation);
-    expect(f.ledger.getObligation(f.debt.id)?.state).toBe('closed');
-    expect(f.ledger.reopenStrandedRecoveryDebts()).toBe(0);
+    // A retirement written by a build without the hook: full audit facts, no reopen.
+    const preHookRetire = (requestId: string) => f.db.handle.prepare(`UPDATE pending_directives SET state = 'retired', retired_at = ?, retired_by = 'gru',
+      retire_reason = 'pre-#470 build: never admitted', retire_expected_state = 'dispatching', retire_expected_head = ? WHERE request_id = ?`)
+      .run(new Date().toISOString(), resolveGitCommit(f.lane.path, 'HEAD'), requestId);
+    // An admitted successor settles its predecessor; retiring it later strands nothing.
+    await executeAcceptedDirective(f.deps, f.successor.requestId);
+    expect(f.ledger.getObligation(f.debt.id)?.state).toBe('settled');
+    preHookRetire(f.successor.requestId);
+    // The production shape: a build without the hook retired the named successor
+    // unadmitted and left the predecessor's debt on its consumed generation.
+    const strand = (requestId: string) => {
+      const stuck = f.ledger.beginDirectiveIntent({ jobId: f.intent.jobId, requestId, directive: 'approved correction', holder: 'gru' }).record;
+      surfaceDirectiveRecovery(f.deps, requestId, 'accepted, never admitted');
+      const debt = f.ledger.recoveryObligation(f.intent.jobId, 'directive', requestId)!;
+      const authority = f.ledger.directiveCurrentAuthority(f.intent.jobId);
+      const successor = recoverInterruptedDirectiveFromRoute({ ...f.deps, requestId, generation: debt.generation, expectedPayloadHash: stuck.payloadHash,
+        expectedHead: resolveGitCommit(f.lane.path, 'HEAD'), expectedEpoch: f.ledger.directiveRecoveryEpoch(f.intent.jobId),
+        expectedWorkRevision: authority.workRevision, expectedContractSha256: authority.contractSha256, reason: 'finish the approved work',
+        decision: { kind: 'rebrief-successor', requestId: `${requestId}-successor`, note: 'finish the approved work fresh' } }).successor!;
+      preHookRetire(successor.requestId);
+      return debt;
+    };
+    const first = strand('stranded-one'); const second = strand('stranded-two');
+    const card = (requestId: string) => f.ledger.findNotificationByKind(`silas.directive-unreconciled.${requestId}`, 'active');
+    // One row that refuses is reported by name and leaves the others repairing.
+    const history = f.ledger.recoveryDecisionHistory.bind(f.ledger);
+    const malformed = vi.spyOn(f.ledger, 'recoveryDecisionHistory').mockImplementation((kind, id) => {
+      if (id === 'stranded-one') throw new Error('malformed decision history');
+      return history(kind, id);
+    });
+    expect(f.ledger.reopenStrandedRecoveryDebts()).toEqual({ reopened: 1,
+      failures: [{ successorId: 'stranded-one-successor', error: expect.stringContaining('malformed decision history') }] });
+    malformed.mockRestore();
+    expect(f.ledger.recoveryObligation(f.intent.jobId, 'directive', 'stranded-one')).toMatchObject({ id: first.id, state: 'open' });
+    expect(card('stranded-one')).not.toBeNull();
+    const reopened = f.ledger.recoveryObligation(f.intent.jobId, 'directive', 'stranded-two')!;
+    expect(reopened.generation).toBeGreaterThan(second.generation); expect(f.ledger.getObligation(second.id)?.state).toBe('closed');
+    expect(card('stranded-two')).toBeNull();
+    expect(f.ledger.reopenStrandedRecoveryDebts()).toEqual({ reopened: 1, failures: [] });
+    expect(f.ledger.recoveryObligation(f.intent.jobId, 'directive', 'stranded-one')?.generation).toBeGreaterThan(first.generation);
+    expect(f.ledger.reopenStrandedRecoveryDebts()).toEqual({ reopened: 0, failures: [] });
+    expect(f.ledger.getObligation(f.debt.id)?.state).toBe('settled');
   });
 
   it('owner stops refuse a successor; a concrete reserved-owner obligation settles only Gru recovery debt', async () => {

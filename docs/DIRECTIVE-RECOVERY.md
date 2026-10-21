@@ -453,16 +453,20 @@ failure, or its own retirement), it can never settle the debt. In the
 same transaction the ledger records `silas.directive-recovery-reopened`,
 closes that debt as `superseded` and opens the next incarnation with a
 fresh generation (still suspended if the old one was, or while the job
-is parked). The new incarnation's next action tells Gru to begin a fresh
-request carrying the work and then use `reconcile-admitted`; the old
-action-required card, which names the consumed generation, is resolved
-and the reopened debt is swept like any recovery debt. The old
+is parked). The new incarnation's next action tells Gru to look first
+for a later request already carrying the work (live or admitted), begin
+one only if there is none, and then use `reconcile-admitted`. An open
+reopened debt reaches Gru through the obligation mailbox, so the old
+action-required card, which names the consumed generation, is resolved;
+a suspended one keeps its card as the pointer. The old
 generation stays consumed: replaying any other decision for it is
 refused as a conflict. A chain is handled link by link: when Gru
 recovers a stuck successor B with C, retiring B reopens A's debt, C's
 admission settles B's debt directly, and Gru reconciles A against C.
 At boot the service reopens, once, any debt left stranded this way by a
-build that predates this behaviour (`reopenStrandedRecoveryDebts`).
+build that predates this behaviour (`reopenStrandedRecoveryDebts`). Each
+successor repairs in its own transaction; one that refuses is logged by
+name and never blocks the others or the service start.
 
 Historical `pending_rebriefs` retain their original markers and audit.
 Their old blind replay/fresh-session boot pipeline is removed. Spent

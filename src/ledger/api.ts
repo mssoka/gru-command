@@ -9503,25 +9503,36 @@ export class LedgerApi {
       const next = this.observeRecoveryDebt('directive', requestId, debt.jobId, audit.seq, { logicalStep: 'operation', incidentKey: debt.incidentKey,
         category: debt.category, observedAtSeq: audit.seq, ...(debt.description === null ? {} : { description: debt.description }),
         nextAction: { kind: 'gru-decision', decision: `${cause}, so it cannot settle this retired request's debt, and the retired request takes no new successor. ` +
-          'Begin a fresh request carrying the approved work (POST /api/silas/directive or /api/silas/rebrief); once it is actually admitted on this lane, ' +
-          `settle this debt at its new generation with POST /api/silas/directives/${requestId}/recover decision reconcile-admitted naming that request` } });
-      if (debt.state === 'suspended' && next.state !== 'suspended') this.suspendObligation(next.id, `suspension carried over from superseded ${debt.id}`);
+          'First inspect the job\'s later requests: if one carrying the approved work is live or already admitted, use it; only otherwise begin a fresh ' +
+          'request (POST /api/silas/directive or /api/silas/rebrief). Once that request is actually admitted on this lane, settle this debt at its new ' +
+          `generation with POST /api/silas/directives/${requestId}/recover decision reconcile-admitted naming it` } });
+      const reopenedDebt = debt.state === 'suspended' && next.state !== 'suspended' ? this.suspendObligation(next.id, `suspension carried over from superseded ${debt.id}`) : next;
       // The old card names the consumed generation and advises a successor
-      // the retired request can no longer take; the reopened debt is swept.
+      // the retired request can no longer take. An open reopened debt reaches
+      // Gru through the obligation mailbox; a suspended one does not, so its
+      // card stays as the pointer until the debt is resumed.
       const card = this.findNotificationByKind(`silas.directive-unreconciled.${requestId}`, 'active');
-      if (card?.routing === 'action-required') this.resolveNotificationById(card.id, 'directive-recovery-reopened');
+      if (reopenedDebt.state !== 'suspended' && card?.routing === 'action-required') this.resolveNotificationById(card.id, 'directive-recovery-reopened');
       reopened += 1;
     }
     return reopened;
   }
 
   /** Boot repair (#470): reopen debts stranded by named successors that ended
-   * unadmitted before the terminal-transition hook existed. Idempotent. */
-  reopenStrandedRecoveryDebts(): number {
-    return this.transaction(() => (this.db.prepare(`SELECT DISTINCT s.request_id FROM pending_directives p
+   * unadmitted before the terminal-transition hook existed. Idempotent. Each
+   * successor repairs in its own transaction; one that refuses is reported
+   * by name and never blocks the others or the service start. */
+  reopenStrandedRecoveryDebts(): { readonly reopened: number; readonly failures: readonly { readonly successorId: string; readonly error: string }[] } {
+    const successors = (this.db.prepare(`SELECT DISTINCT s.request_id FROM pending_directives p
       JOIN pending_directives s ON s.request_id = json_extract(p.recovery_decision, '$.successorId')
-      WHERE s.admission_seq IS NULL AND s.state IN ('failed', 'retired')`).all() as Row[])
-      .reduce((count, row) => count + this.reopenStrandedRecoveryDebt(this.getDirective(str(row.request_id)) as DirectiveRequestRecord), 0));
+      WHERE s.admission_seq IS NULL AND s.state IN ('failed', 'retired')`).all() as Row[]).map((row) => str(row.request_id));
+    let reopened = 0;
+    const failures: { readonly successorId: string; readonly error: string }[] = [];
+    for (const successorId of successors) {
+      try { reopened += this.transaction(() => this.reopenStrandedRecoveryDebt(this.getDirective(successorId) as DirectiveRequestRecord)); }
+      catch (error) { failures.push({ successorId, error: String(error) }); }
+    }
+    return { reopened, failures };
   }
 
   /** Bind a request to its ACTUAL native admission: the correlated
