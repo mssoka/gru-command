@@ -29,6 +29,7 @@ import {
 import type { AgentSpawner } from './service.js';
 import type { EventBus } from '../events/bus.js';
 import { validReviewOwnerGeneration, type ResidentReviewRound, type ReviewOwnerMarker } from '../runtime/registry.js';
+import type { ReviewHostExitInput, ReviewHostExitResult } from '../runtime/review-host-exit.js';
 import { settleRetries, type PacingGate, type PacingLease, type RateLimitBackoffPolicy, type RetrySettlement } from '../runtime/pacing.js';
 import { isExactOriginBranchSpelling } from '../worktrees/manager.js';
 import { loadWorktreeManifest } from '../worktrees/manifest.js';
@@ -1829,6 +1830,10 @@ export interface WaveRunnerOptions {
   readonly reviewThinkingLevel?: () => string;
   /** Runtime-owned proof that an interrupted owner has actually ceased. */
   readonly reconcileReviewAgent?: (agentId: string, marker: ReviewOwnerMarker | null) => Promise<boolean>;
+  /** #464: the runtime's dead-host proof for an owner whose host is gone
+   * without a durable cessation record; a passing proof is recorded, so
+   * `reconcileReviewAgent` then answers from that record. */
+  readonly proveReviewHostExit?: (input: ReviewHostExitInput) => Promise<ReviewHostExitResult>;
   readonly maxConcurrentChildren?: number;
   /** Ledger bus used to admit a worker's durable handoff after its turn delivers. */
   readonly bus?: EventBus;
@@ -2642,14 +2647,38 @@ export class WaveRunner {
     if (marker === null && agents.length === 0) {
       return `round ${round.id} has neither a no-spawn proof nor an owner marker — a spawn before registration cannot be ruled out`;
     }
-    if (marker !== null && agents.length === 0 && await this.opts.reconcileReviewAgent?.('', marker) !== true) {
-      return `round ${round.id}'s review owner may still run before agent registration`;
-    }
-    const running: string[] = [];
-    for (const agent of agents) {
-      if (await this.opts.reconcileReviewAgent?.(agent.id, marker) !== true) running.push(agent.id);
-    }
-    return running.length === 0 ? null : `round ${round.id} review session(s) ${running.join(', ')} not proven ceased`;
+    const unproven = await this.unprovenReviewOwners(round, marker, agents);
+    if (unproven.ids.length === 0) return null;
+    return agents.length === 0
+      ? `round ${round.id}'s review owner may still run before agent registration${unproven.detail}`
+      : `round ${round.id} review session(s) ${unproven.ids.join(', ')} not proven ceased${unproven.detail}`;
+  }
+
+  /** The round's review sessions (or `''`, its owner before any session
+   * registered) not proven ceased. The runtime answers first: this
+   * process's adapter evidence, or the durable record the owning process
+   * wrote (#464). An owner the runtime cannot clear may still be proven
+   * gone by its dead-host proof, which the runtime records before the
+   * runtime is asked again. `detail` is the proof's refusal, ready to
+   * append to a message ('' when the proof never ran). */
+  private async unprovenReviewOwners(round: RoundRecord, marker: ReviewOwnerMarker | null,
+    agents: readonly { readonly id: string; readonly sessionFile: string | null }[]): Promise<{ readonly ids: readonly string[]; readonly detail: string }> {
+    const owners = agents.length === 0 ? [''] : agents.map((agent) => agent.id);
+    const unproven = async (): Promise<string[]> => {
+      const left: string[] = [];
+      for (const id of owners) if (await this.opts.reconcileReviewAgent?.(id, marker) !== true) left.push(id);
+      return left;
+    };
+    const left = await unproven();
+    if (left.length === 0 || marker === null || this.opts.proveReviewHostExit === undefined) return { ids: left, detail: '' };
+    const lane = this.opts.worktrees.getWorktree(round.id);
+    const proof = await this.opts.proveReviewHostExit({
+      marker,
+      worktreePath: lane?.kind === 'review' ? lane.path : null,
+      sessions: agents.map((agent) => ({ agentId: agent.id, sessionFile: agent.sessionFile })),
+    });
+    if (!proof.ok) return { ids: left, detail: ` (dead-host proof refused: ${proof.problem})` };
+    return { ids: await unproven(), detail: '' };
   }
 
   /** True when a MATERIAL amendment was accepted after `seq`: anything
@@ -5513,13 +5542,14 @@ export class WaveRunner {
       if (!noSpawn && marker === null && agents.length === 0) {
         throw new Error(`review round ${oldRound.id} has no trusted no-spawn proof or owner marker; ownership is unknown (including a possible spawn-before-registration crash) — reconcile cessation manually before replacement`);
       }
-      if (!noSpawn && marker !== null && agents.length === 0 &&
-        await this.opts.reconcileReviewAgent?.('', marker) !== true) {
-        throw new Error(`review owner marker from round ${oldRound.id} may still run before agent registration; reconcile runtime cessation before replacement`);
-      }
-      for (const agent of agents) {
-        if (await this.opts.reconcileReviewAgent?.(agent.id, marker) !== true) {
-          throw new Error(`review owner ${agent.id} from round ${oldRound.id} may still run; reconcile runtime cessation before starting a replacement writer`);
+      if (!noSpawn) {
+        // Re-checked on every request: a refused dead-host proof clears
+        // once its evidence does (the named process exits).
+        const unproven = await this.unprovenReviewOwners(oldRound, marker, agents);
+        if (unproven.ids.length > 0) {
+          throw new Error(agents.length === 0
+            ? `review owner marker from round ${oldRound.id} may still run before agent registration; reconcile runtime cessation before replacement${unproven.detail}`
+            : `review owner ${unproven.ids[0]!} from round ${oldRound.id} may still run; reconcile runtime cessation before starting a replacement writer${unproven.detail}`);
         }
       }
     }
@@ -6575,7 +6605,11 @@ export class WaveRunner {
         payload: {
           // A superseded round (owner rule 3) is routine history, never a
           // clean-abort re-arm candidate or an action-required incident.
-          reason: signal.reason instanceof ReviewSupersededError ? 'superseded' : signal.aborted ? 'cancelled' : 'workflow_error',
+          // One cut by a graceful service shutdown is the restart's clean
+          // abort (#464), which Silas re-arms on the unchanged head after
+          // boot, exactly as startup recovery's own `service_restart`.
+          reason: signal.reason instanceof ReviewSupersededError ? 'superseded'
+            : signal.aborted ? (this.shuttingDown ? 'service_restart' : 'cancelled') : 'workflow_error',
           error: detail.slice(0, 500),
           reportFile,
           executionFacts,

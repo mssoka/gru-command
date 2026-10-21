@@ -1042,6 +1042,9 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(readFileSync(outcome.reportFile, 'utf8')).toContain('INCOMPLETE');
     expect(port.getWorktree(outcome.round.id)?.status).toBe('swept');
     expect(disposed).toBe(true);
+    // #464: a graceful shutdown's abort is the restart's clean abort, which
+    // the clean-abort-service-restart row re-arms after boot (never `cancelled`).
+    expect(ledger.latestRoundEvent(outcome.round.id, 'round.perkins-incomplete')?.payload).toMatchObject({ reason: 'service_restart' });
     rmSync(root, { recursive: true, force: true });
     rmSync(artifacts, { recursive: true, force: true });
     rmSync(sessions, { recursive: true, force: true });

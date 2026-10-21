@@ -889,6 +889,11 @@ export interface WorktreeRecord {
   readonly updatedAt: string;
 }
 
+/** Durable review-owner cessation (#464): recorded only through
+ * `recordReviewOwnerCessation`, which binds it to the round's owner
+ * marker, never as a custom event. */
+export const REVIEW_OWNER_CEASED_KIND = 'round.review-owner-ceased';
+
 // ------------------------------------------------------------------
 // Pending re-briefs (Silas follow-through restart safety): the durable
 // request marker written BEFORE a re-brief worker is spawned. Each marker
@@ -1343,6 +1348,60 @@ export class LedgerApi {
       "SELECT * FROM events WHERE round_id = ? AND kind = 'round.review-owner' ORDER BY seq ASC LIMIT 2",
     ).all(roundId) as Row[];
     return rows.length === 1 ? this.eventFromRow(rows[0]!) : null;
+  }
+
+  /** Durable review-owner cessation (#464), bound to the round's unique
+   * owner marker. `adapter`: the owning process saw its adapter report one
+   * review session ceased (the record keeps the observer's pid, never
+   * requires it: a session id exists only in the process that spawned it).
+   * `host-exit`: a later process proved the marker's host and every
+   * session of the round gone. A record that binds no unique marker is
+   * refused by name, and nothing is written. */
+  recordReviewOwnerCessation(input:
+    | { readonly source: 'adapter'; readonly agentId: string; readonly generation: string }
+    | { readonly source: 'host-exit'; readonly roundId: string; readonly generation: string; readonly pid: number;
+      readonly evidence: Readonly<Record<string, unknown>> }): EventRecord {
+    return this.transaction(() => {
+      const candidates = input.source === 'adapter'
+        ? this.db.prepare(
+          "SELECT * FROM events WHERE kind = 'round.review-owner' AND json_extract(payload, '$.generation') = ? ORDER BY seq ASC LIMIT 2",
+        ).all(input.generation) as Row[]
+        : this.db.prepare(
+          "SELECT * FROM events WHERE round_id = ? AND kind = 'round.review-owner' ORDER BY seq ASC LIMIT 2",
+        ).all(input.roundId) as Row[];
+      const marker = candidates.length === 1 ? this.eventFromRow(candidates[0]!) : null;
+      const owner = marker?.payload as { generation?: unknown; pid?: unknown } | null | undefined;
+      if (marker === null || marker.roundId === null || owner?.generation !== input.generation ||
+        (input.source === 'host-exit' && owner.pid !== input.pid) ||
+        (input.source === 'adapter' && input.agentId.trim() === '') ||
+        this.uniqueRoundReviewOwnerMarker(marker.roundId)?.seq !== marker.seq) {
+        throw new Error(`review-owner cessation (${input.source}) for generation ${input.generation} binds no unique round owner marker; nothing recorded`);
+      }
+      return this.appendEvent({
+        kind: REVIEW_OWNER_CEASED_KIND, jobId: marker.jobId, roundId: marker.roundId,
+        agentId: input.source === 'adapter' ? input.agentId : null,
+        payload: input.source === 'adapter'
+          ? { source: 'adapter', roundId: marker.roundId, agentId: input.agentId, generation: input.generation, observerPid: process.pid }
+          : { source: 'host-exit', roundId: marker.roundId, generation: input.generation, pid: input.pid,
+            observerPid: process.pid, evidence: input.evidence },
+      });
+    });
+  }
+
+  /** Whether a durable record proves `agentId` ceased under exactly this
+   * owner marker. A `host-exit` proof covers the whole owner, including
+   * `''` (the owner before any session registered); an `adapter` record
+   * covers only its own session. */
+  reviewOwnerCessationRecorded(agentId: string, marker: { readonly roundId: string; readonly generation: string; readonly pid: number }): boolean {
+    const rows = this.db.prepare('SELECT * FROM events WHERE round_id = ? AND kind = ? ORDER BY seq ASC')
+      .all(marker.roundId, REVIEW_OWNER_CEASED_KIND) as Row[];
+    return rows.some((row) => {
+      const record = this.eventFromRow(row).payload as Record<string, unknown> | null;
+      if (record === null || typeof record !== 'object' || record['roundId'] !== marker.roundId ||
+        record['generation'] !== marker.generation) return false;
+      if (record['source'] === 'host-exit') return record['pid'] === marker.pid;
+      return record['source'] === 'adapter' && agentId !== '' && record['agentId'] === agentId;
+    });
   }
 
   /** A single ledger-bound negative proof for a setup that never initiated
@@ -4135,6 +4194,9 @@ export class LedgerApi {
     // moveWorktreeRepo records, together (#427 PR 2b).
     if (fields.kind === REPO_MOVED_KIND || fields.kind === HANDOFF_REBOUND_KIND) {
       throw new Error(`${fields.kind} is recorded only with a lane's repository move (moveWorktreeRepo), never as a custom event`);
+    }
+    if (fields.kind === REVIEW_OWNER_CEASED_KIND) {
+      throw new Error(`${fields.kind} is recorded only through recordReviewOwnerCessation, which binds it to the round's owner marker, never as a custom event`);
     }
     return this.transaction(() => {
       if (fields.kind === 'silas.directive-producer-ceased' || fields.kind === 'silas.directive-producer-unknown') {

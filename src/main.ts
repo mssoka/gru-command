@@ -6,7 +6,7 @@ import { configPathFor, loadConfig, ConfigError } from './config.js';
 import { loadOrCreateIdentity } from './identity.js';
 import { startServiceShutdown, type ServiceShutdownState } from './service-shutdown.js';
 import { Logger } from './logger.js';
-import { RuntimeRegistry, serviceRegistryOptions } from './runtime/registry.js';
+import { RuntimeRegistry, ledgerReviewOwnerCessation, serviceRegistryOptions } from './runtime/registry.js';
 import { resolvePacingPolicy } from './runtime/pacing.js';
 import { SessionStore } from './sessions/store.js';
 import { LedgerDb } from './ledger/db.js';
@@ -406,6 +406,8 @@ async function main(): Promise<number> {
     workflowBuildFor: workflowAuthority.workflowBuildFor,
     workflowAgentFor: workflowAuthority.workflowAgentFor,
     log: (level, msg, fields) => logger.log(level, msg, fields),
+    // #464: review-owner cessation outlives the process that observed it.
+    reviewOwnerCessation: ledgerReviewOwnerCessation(() => ledger),
   }));
   const growth = registry.boot();
   state.store = store;
@@ -1333,6 +1335,7 @@ async function main(): Promise<number> {
     poster: createStartupVerdictPoster(config),
     reserveReviewRound: (signal) => registry.reserveReviewRound(signal),
     reconcileReviewAgent: async (agentId, marker) => registry.reviewOwnerCeased(agentId, marker),
+    proveReviewHostExit: (proofInput) => registry.proveReviewHostExit(proofInput),
     maxConcurrentChildren: config.review.maxConcurrentChildren,
     bus,
     reviewArtifactRoot: join(config.dataDir, 'reviews'),

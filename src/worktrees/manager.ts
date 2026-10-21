@@ -99,9 +99,12 @@ export function commandReferencesTree(command: string, treePath: string): boolea
   return pattern.test(command);
 }
 
-/** A process cwd belongs to the tree when it IS the tree or sits under it. */
+/** A process cwd belongs to the tree when it IS the tree or sits under it.
+ * Linux names a removed directory `<path> (deleted)`: a process that
+ * outlived its swept tree is still rooted in it (#464). */
 function cwdInsideTree(cwd: string, treePath: string): boolean {
-  return cwd === treePath || cwd.startsWith(`${treePath}/`);
+  const path = cwd.endsWith(' (deleted)') ? cwd.slice(0, -' (deleted)'.length) : cwd;
+  return path === treePath || path.startsWith(`${treePath}/`);
 }
 
 /** Liveness without EPERM confusion (EPERM still proves the pid exists). */
@@ -200,14 +203,7 @@ function treeProcesses(treePath: string, out: string, cwds: Map<number, string> 
     /* the sweep's own guards handle a missing tree */
   }
   const processes: TreeProcess[] = [];
-  for (const line of out.split('\n')) {
-    const trimmed = line.trim();
-    if (trimmed === '') continue;
-    const space = trimmed.indexOf(' ');
-    if (space <= 0) continue;
-    const pid = Number(trimmed.slice(0, space));
-    const command = trimmed.slice(space + 1).trim();
-    if (!Number.isInteger(pid) || pid === process.pid) continue;
+  for (const { pid, command } of listedProcesses(out)) {
     // Registry paths only: every match names the registered tree itself.
     if ([...candidates].some((candidate) => commandReferencesTree(command, candidate))) {
       processes.push({ pid, command, evidence: 'argv' });
@@ -221,6 +217,22 @@ function treeProcesses(treePath: string, out: string, cwds: Map<number, string> 
     }
   }
   return processes;
+}
+
+/** Every other process a `ps -axo pid=,command=` listing names. */
+function listedProcesses(out: string): readonly { readonly pid: number; readonly command: string }[] {
+  const listed: { pid: number; command: string }[] = [];
+  for (const line of out.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed === '') continue;
+    const space = trimmed.indexOf(' ');
+    if (space <= 0) continue;
+    const pid = Number(trimmed.slice(0, space));
+    const command = trimmed.slice(space + 1).trim();
+    if (!Number.isInteger(pid) || pid === process.pid) continue;
+    listed.push({ pid, command });
+  }
+  return listed;
 }
 
 function execFileSyncGuard(bin: string, args: readonly string[]): string {
@@ -295,6 +307,22 @@ export interface ProcessListingOptions {
  * any number of trees (#427 PR 3: the disk budget lists once per pass, not
  * once per lane). */
 export async function processListingAsync(opts: ProcessListingOptions): Promise<(treePath: string) => readonly TreeProcess[]> {
+  return (await processTableAsync(opts)).rootedIn;
+}
+
+/** {@link processListingAsync}'s one listing, which also answers which
+ * processes name a token in their command line (#464: a Claude review CLI
+ * carries its session id in argv). `cwdsListed` is false when no working
+ * directories were read (`onCwdError` was told, or the platform has no
+ * source), so a caller that needs the whole picture refuses rather than
+ * trusting argv alone. */
+export interface ProcessTable {
+  readonly rootedIn: (treePath: string) => readonly TreeProcess[];
+  readonly naming: (token: string) => readonly TreeProcess[];
+  readonly cwdsListed: boolean;
+}
+
+export async function processTableAsync(opts: ProcessListingOptions): Promise<ProcessTable> {
   const timeoutMs = opts.timeoutMs ?? 30_000;
   const [listed, cwds] = await Promise.allSettled([
     execFileBounded('ps', ['-axo', 'pid=,command='], timeoutMs),
@@ -304,7 +332,12 @@ export async function processListingAsync(opts: ProcessListingOptions): Promise<
   if (cwds.status === 'rejected') opts.onCwdError(cwds.reason);
   const out = listed.value;
   const cwdMap = cwds.status === 'fulfilled' ? cwds.value : null;
-  return (treePath) => treeProcesses(treePath, out, cwdMap);
+  return {
+    rootedIn: (treePath) => treeProcesses(treePath, out, cwdMap),
+    naming: (token) => listedProcesses(out).filter((entry) => entry.command.includes(token))
+      .map((entry) => ({ ...entry, evidence: 'argv' as const })),
+    cwdsListed: cwdMap !== null,
+  };
 }
 
 export interface SweepPreservation {

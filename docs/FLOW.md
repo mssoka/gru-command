@@ -240,7 +240,33 @@ degenerate into check-failed movement.
   source/checkout, unsupported evidence, invalid audit, or delivery failure
   durably terminalizes the round as INCOMPLETE. It can
   neither post nor record approval. Startup reconciliation marks interrupted
-  rounds INCOMPLETE and releases their owned detached lanes.
+  rounds INCOMPLETE and releases their owned detached lanes. A round cut by
+  a graceful service shutdown records its INCOMPLETE reason as
+  `service_restart`, the same reason startup recovery gives a round a crash
+  interrupted. Silas's `clean-abort-service-restart` row then re-arms it
+  after boot (#464).
+- A replacement round is admitted only once every earlier round's review
+  owner is proven ceased. Ledger disposal state is not proof.
+  - **Durable record.** When the owning process's adapter reports a review
+    session `ceased`, the process writes `round.review-owner-ceased`
+    (source `adapter`), bound to the round's unique owner marker. A
+    restarted service still accepts it (#464).
+  - **Dead-host proof.** An owner hosted by another process that left no
+    record (a crash, or a round older than the record) may instead be
+    proven gone. Claude Code needs all of these:
+    - the host pid is dead;
+    - no live process is rooted (argv or cwd) in the round's review
+      worktree;
+    - no live process names one of the round's session ids;
+    - no session lock of the round is held by a live pid.
+
+    pi still accepts its host's OS-proven death. Unreadable evidence
+    refuses. A passing proof is recorded (source `host-exit`), so it is never
+    re-decided.
+  - **Refusal.** A refused request answers 400 naming what may still run.
+    Every later request re-checks, so the replacement starts once the named
+    process exits. See [RUNTIME-PARITY.md](./RUNTIME-PARITY.md) ("A review
+    owner from another process").
 - The base is changed source only when the locally resolved base ref no
   longer contains the frozen merge-base (rewritten past it) or no longer
   resolves; nothing is fetched, so a host-side rewrite counts once it is
@@ -838,7 +864,8 @@ the judgment; the dispatch surface is the mechanical hand.
   computed from the ledger: delivered jobs with no PR registered; PRs
   whose follow-up delivery proves the lane head moved past the newest
   round's reviewed target (first review AND re-review after a fix round);
-  or a proven `service_restart` abort on the unchanged delivered head,
+  or a proven `service_restart` abort on the unchanged delivered head (a
+  round cut by a graceful shutdown, or found interrupted at startup),
   once per source round under `clean-abort-service-restart`. Other aborts
   and unchanged heads warrant no round. The re-arm is bound to the proved
   delivered head: an explicit `target_ref` must name that sha and an
