@@ -183,7 +183,10 @@ function nativeHeaderLine(fd: number): string {
 class NativeTurn {
   private readonly lines: NativeLines;
   private count = 0;
-  constructor(fd: number, private readonly start: number, private readonly tail: 'whole' | 'accepted') { this.lines = new NativeLines(fd, start); }
+  constructor(fd: number, private start: number, private readonly tail: 'whole' | 'accepted') { this.lines = new NativeLines(fd, start); }
+  /** The turn ended at the last line read. What is read after it only looks
+   * ahead, under its own bound: it is never charged to this turn. */
+  end(): void { this.start = this.lines.end; this.count = 0; }
   /** The turn's next line, or undefined at its end. */
   next(): string | undefined {
     const line = this.lines.next(MAX_NATIVE_TRANSCRIPT_BYTES - (this.lines.end - this.start) - 1, TURN_OVERSIZED);
@@ -208,6 +211,8 @@ interface PiTranscript {
   readonly malformed: boolean;
   /** Null without the baseline. */
   readonly turn: PiTurn | null;
+  /** The turn ended at the last entry read (see NativeTurn.end). */
+  readonly endTurn: () => void;
 }
 function withPiTranscript<T>(file: string, baseline: string | null, tail: 'whole' | 'accepted', inspect: (transcript: PiTranscript) => T): T {
   return withNativeTranscript(file, (fd) => {
@@ -230,7 +235,7 @@ function withPiTranscript<T>(file: string, baseline: string | null, tail: 'whole
     }
     if (!found) {
       if (lines.partial && tail === 'whole') throw new DirectiveCheckpointError('native transcript has a partial entry');
-      return inspect({ header, ids, malformed, turn: null });
+      return inspect({ header, ids, malformed, turn: null, endTurn: () => {} });
     }
     const after = new NativeTurn(fd, lines.end, tail);
     const seen = new Set<string>();
@@ -244,7 +249,7 @@ function withPiTranscript<T>(file: string, baseline: string | null, tail: 'whole
       }
       return entries[index];
     };
-    return inspect({ header, ids, malformed, turn });
+    return inspect({ header, ids, malformed, turn, endTurn: () => after.end() });
   });
 }
 /** Header facts come from the first line alone. They identify a session/cwd,
@@ -397,7 +402,7 @@ export function inspectDirectiveCheckpoint(file: string, identity: DirectiveTurn
 }
 /** The walk reads the turn only up to its own end (#469): its terminal and
  * the few entries that show what follows it. */
-function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { header, malformed, turn: native }: PiTranscript): DirectiveCheckpoint {
+function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { header, malformed, turn: native, endTurn }: PiTranscript): DirectiveCheckpoint {
   const { identity } = binding;
   const unknown = (reason: string): DirectiveCheckpoint => ({ state: 'unknown', reason });
   const MALFORMED = 'native checkpoint has a malformed or duplicate entry identity';
@@ -448,6 +453,8 @@ function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { 
       if (pending.size === 0) {
         if (!['stop', 'error', 'aborted', 'length'].includes(String(message.stopReason))) return unknown('malformed native assistant terminal');
         terminal = true;
+        // Whatever follows (a later request, its controls) is lookahead.
+        endTurn();
       }
     } else if (message.role === 'toolResult') {
       if (typeof message.toolCallId !== 'string' || !pending.has(message.toolCallId) || pending.get(message.toolCallId) !== message.toolName || typeof message.isError !== 'boolean') return unknown('unmatched/malformed native tool result');

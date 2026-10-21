@@ -281,15 +281,22 @@ continuations and `/recover` successors.
   inspection walks:
   - admission stops at its receipt;
   - a checkpoint stops at its result, or at its terminal plus the next
-    bound request;
+    bound request (that lookahead is never charged to the turn);
   - a tool fence reads the live turn.
 
-  Only what is read counts against 32 MiB and 250,000 entries, so a
-  session's later work never refuses an earlier directive.
+  Only the turn's own lines count against 32 MiB and 250,000 entries, so a
+  session's later growth never pushes an earlier directive past the limits.
 
-What is still refused by name: a directive turn past either limit, a torn,
-corrupted or reused-id entry where a walk reads it, a changed prefix, and a
-missing baseline.
+What is still refused by name:
+
+- a directive turn past either limit;
+- a torn entry, invalid UTF-8, or a reused or missing entry id, wherever a
+  walk reads it;
+- a missing baseline;
+- for Claude Code, a changed byte prefix.
+
+A pi entry that is not JSON still fails as a JSON parse error, as it did
+before #469.
 
 Boot and bounded deterministic reconsideration inspect correlated ledger
 completion, then exact native completion, **before** considering execution.

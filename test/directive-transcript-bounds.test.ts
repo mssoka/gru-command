@@ -340,6 +340,20 @@ describe('an earlier directive on a session that kept working (#469)', () => {
     expect(() => inspectDirectiveCheckpoint(file, latestIdentity)).toThrow(/^native directive turn exceeds the 33554432-byte inspection limit$/u);
   });
 
+  it('pi: a turn just under the limit stays inspectable once a later request follows it; that lookahead is not charged to it', () => {
+    const file = sessionFile(piHeader);
+    preparePi(file);
+    const receipt = `${JSON.stringify({ type: 'message', id: 'receipt-a', parentId: null, message: prompt(text) })}\n`;
+    const terminal = (body: string) => `${JSON.stringify({ type: 'message', id: 'answer-a', parentId: 'receipt-a', message: { ...answer, content: [{ type: 'text', text: body }] } })}\n`;
+    // The whole turn, receipt and terminal, is 10 bytes under the limit.
+    appendFileSync(file, receipt + terminal('x'.repeat(LIMIT - 10 - Buffer.byteLength(receipt) - Buffer.byteLength(terminal('')))));
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: 'answer-a' });
+    preparePi(file, laterIdentity, 'the next approved step');
+    piEntry(file, 'receipt-b', 'answer-a', prompt('the next approved step'));
+    expect(inspectDirectiveAdmission(file, laterIdentity)).toMatchObject({ userEntryId: 'receipt-b' });
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: 'answer-a' });
+  });
+
   it('Claude Code: stays inspectable after a later directive turn past the limit, reading only through its own turn', () => {
     const file = sessionFile(claudeHeader);
     prepareClaude(file);
