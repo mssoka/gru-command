@@ -686,8 +686,11 @@ can restore a lost ledger bind without repeating a consumed request.
 
 A durable recovery checkpoint claim has no expiry-based retry. Recovery
 judgment is a generation-fenced `restart-recovery` Gru obligation, settled
-only by correlated actual handoff/completion or a concrete reserved-owner
-decision. `silas.directive-recovery-decided` plus the retired request and
+only by correlated actual handoff/completion, a concrete reserved-owner
+decision, or (for a retired request, #470) an explicit `reconcile-admitted`
+judgment citing a later request's actual native admission. A named
+successor that ends without admission supersedes its predecessor's debt
+into a fresh generation instead of stranding it. `silas.directive-recovery-decided` plus the retired request and
 fresh successor acceptance commit transactionally. Historical marker
 recovery uses `rebrief_recovery_decisions` for exact decision replay and
 records the marker pair in `silas.rebrief-retired` audit; the fresh

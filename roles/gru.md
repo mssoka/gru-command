@@ -246,7 +246,14 @@ continuation, call `POST /api/silas/directives/<request_id>/recover` with
 `decision: { "kind": "successor", "request_id": "<fresh unused id>",
 "directive": "<explicit approved follow-through>" }` or
 `decision: { "kind": "owner-decision", "obligation_id": "<real outstanding
-owner decision>" }`. Historical marker cards use the corresponding
+owner decision>" }`. When the work can only be finished in a fresh session
+(the old session cannot be resumed), use `decision: { "kind":
+"rebrief-successor", "request_id": "<fresh unused id>", "note": "<explicit
+approved follow-through>" }`; it takes the same fences as a successor.
+When the request is already retired and a later request carrying its work
+was actually admitted on the lane, settle the debt with `decision: { "kind":
+"reconcile-admitted", "admitted_request_id": "<that request>" }`; it starts
+no work and takes no `expected_work_revision` or contract SHA. Historical marker cards use the corresponding
 `/api/silas/rebriefs/<marker_id>` readback/recover route. A successor is
 accepted atomically with guarded retirement, and actual admission—not
 acceptance or retirement—settles the handoff debt. Generic Ops holds,

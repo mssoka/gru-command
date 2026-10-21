@@ -391,9 +391,9 @@ legacy marker's `/recover` refuses it with 400.
 
 A request retired outside `/recover` (for example by the standalone
 `/retire`) keeps its open recovery debt: retirement grants no authority
-and settles nothing. If its approved work was later completed by a
-separate request, Gru settles that debt with an explicit, non-executing
-judgment that names the later request:
+and settles nothing. If a separate request that carries its approved
+work was later admitted, Gru settles that debt with an explicit,
+non-executing judgment that names the later request:
 
 ```json
 {
@@ -412,17 +412,25 @@ The ledger checks, in one transaction, that:
 - the generation, payload hash, HEAD and epoch are current;
 - the subject request is `retired` (a live request takes a successor
   decision instead) and its debt is open or waiting and unclaimed;
-- the retirement bound the job's current single live lane;
+- the lane the retirement bound is still the job's single live lane;
 - the named request is a different request of the same job with an
   actual native admission (its correlated `silas.directive-sent`), and
   that admission comes **after** the retirement;
 - its work revision is the same as or higher than the retired request's.
 
-A request that was only accepted, an admission that predates the
-retirement, a lower or unknown revision, and a request of another job
-are each refused with 409; nothing changes. Admission requires the job's
-single live lane, so an admission after the retirement on that same live
-lane ran on the lane the retirement bound.
+A live request, a request that was only accepted, an admission that
+predates the retirement, a lower or unknown revision, a request of
+another job and a claimed debt are each refused with 409; nothing
+changes. A legacy marker's `/recover` refuses this kind with 400.
+
+The settlement proves admission, not completion: the later request may
+still be running or may end without delivery. Lane identity is the
+job's lane id, which is the job id, so "same lane" means the job's one
+live lane still exists and is the lane the retirement bound. Native
+admission itself requires that single live lane, its registered branch
+and a session started in its checkout, so a later admission ran there.
+A pre-revision (legacy) request has no known revision and cannot be
+reconciled; that refusal is deliberate.
 
 On success, `silas.directive-recovery-decided` records the decision and
 an `admission` block (the admitted request, its admission seq, minion,
@@ -432,6 +440,16 @@ debt settles as `executed-action`, citing that admission's
 worker starts and no work revision or current authority is required. An
 identical replay returns `idempotent: true` and appends nothing. There
 is no age policy: an orphan settles only through this explicit call.
+
+A request retired **by** a `successor` or `rebrief-successor` decision
+has already used its debt's generation on that decision. If the named
+successor then ends without native admission (a positive no-effect
+failure, or its own retirement), it can never settle the debt. In the
+same transaction the ledger closes that debt as `superseded` and opens
+the next incarnation with a fresh generation. The new incarnation's next
+action names `reconcile-admitted`, and Gru settles it as above once a
+later request carrying the work is admitted. The old generation stays
+consumed: replaying any other decision for it is refused as a conflict.
 
 Historical `pending_rebriefs` retain their original markers and audit.
 Their old blind replay/fresh-session boot pipeline is removed. Spent
@@ -468,7 +486,7 @@ contract. Original native admission/delivery revisions are never rewritten.
 
 Historical observation uses bounded whole-job row-cursor pages at boot and on ticks. Neither wall-clock age nor a newer same-job event is correlation. Cancellation does not consume an unobserved page; unresolved early groups cannot starve independent later completion.
 
-Authenticated legacy GET `/api/silas/rebriefs/{marker_id}` exposes versioned `receipt_evidence` and `receipt_evidence_sha256`. The canonical SHA256 covers the exact stored generation, immutable original phase facts and relevant accepted/unproven receipt candidates. Explicit other jobs/generations do not perturb it. A legacy `/recover` judgment **requires** `expected_receipt_evidence_sha256`; the ledger recomputes it inside the write transaction. The hash fences stale intent only: it grants no permission and proves neither cessation nor effects. Native `/recover` request bodies are unchanged.
+Authenticated legacy GET `/api/silas/rebriefs/{marker_id}` exposes versioned `receipt_evidence` and `receipt_evidence_sha256`. The canonical SHA256 covers the exact stored generation, immutable original phase facts and relevant accepted/unproven receipt candidates. Explicit other jobs/generations do not perturb it. A legacy `/recover` judgment **requires** `expected_receipt_evidence_sha256`; the ledger recomputes it inside the write transaction. The hash fences stale intent only: it grants no permission and proves neither cessation nor effects. Native `/recover` bodies take no receipt evidence hash.
 
 An unmarked historical receipt needs explicit exact marker identity/hash, original bound minion and revision. A marked receipt needs a phase independently belonging to the exact original generation and consistent original minion facts. Missing duplicated revision on old marked `silas.rebrief` receipts remains absent; all available original marker/receipt revisions must agree. Reused/rebound/foreign phases, conflicting minions/revisions and same-job late unrelated events are not proof.
 

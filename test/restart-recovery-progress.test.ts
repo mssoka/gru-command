@@ -17,7 +17,7 @@ import { DirectiveCheckpointError, inspectDirectiveAdmission, inspectDirectiveCh
 import { RuntimeRegistry, WorkerDisposalInProgressError } from '../src/runtime/registry.js';
 import { configPathFor, loadConfig } from '../src/config.js';
 import { DirectiveProgressService, DirectivePromptRefusedError, executeAcceptedDirective, promptRefusalUnproven, settleNativeDirective, surfaceDirectiveRecovery } from '../src/dispatch/directive-progress.js';
-import { recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute } from '../src/dispatch/directive-recovery.js';
+import { recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute, retireInterruptedDirectiveFromRoute } from '../src/dispatch/directive-recovery.js';
 import { DirectiveRetirementError } from '../src/ledger/directives.js';
 import { reconcilePendingLegacyDirectives, reconcilePendingRebriefs, settleDirectivesFromEvidence } from '../src/dispatch/rebrief-recovery.js';
 import type { AgentHandle, SpawnOptions } from '../src/runtime/types.js';
@@ -2158,12 +2158,14 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       decision: { kind: 'rebrief-successor' as const, requestId: 'fresh-session-successor', note: 'finish the approved revision from current artifacts' } };
     const queued = { view: () => ({ worker: { queued: [{ id: f.intent.jobId, label: 'queued job turn' }] } }) } as never;
     const watermark = f.ledger.latestEventSeq();
-    const stale: readonly (readonly [string, Partial<typeof input> & { readonly workerGate?: never }])[] = [
-      ['generation', { generation: debt.generation + 1 }], ['hash', { expectedPayloadHash: 'b'.repeat(64) }], ['head', { expectedHead: 'c'.repeat(40) }],
-      ['epoch', { expectedEpoch: 99 }], ['revision', { expectedWorkRevision: authority.workRevision + 1 }], ['contract', { expectedContractSha256: 'd'.repeat(64) }],
-      ['queued producer', { workerGate: queued }]];
-    for (const [label, changed] of stale) {
-      expect(() => recoverInterruptedDirectiveFromRoute({ ...input, ...changed }), label).toThrow();
+    const stale: readonly (readonly [string, Partial<typeof input> & { readonly workerGate?: never }, RegExp])[] = [
+      ['generation', { generation: debt.generation + 1 }, /stale/u], ['hash', { expectedPayloadHash: 'b'.repeat(64) }, /stale/u],
+      ['head', { expectedHead: 'c'.repeat(40) }, /stale/u], ['epoch', { expectedEpoch: 99 }, /stale/u],
+      ['revision', { expectedWorkRevision: authority.workRevision + 1 }, /revision\/contract expectations are stale/u],
+      ['contract', { expectedContractSha256: 'd'.repeat(64) }, /revision\/contract expectations are stale/u],
+      ['queued producer', { workerGate: queued }, /cessation is not proven/u]];
+    for (const [label, changed, refusal] of stale) {
+      expect(() => recoverInterruptedDirectiveFromRoute({ ...input, ...changed }), label).toThrow(refusal);
       expect(f.ledger.latestEventSeq(), label).toBe(watermark);
       expect(f.ledger.getDirective(f.intent.requestId)?.state, label).toBe('dispatching');
       expect(f.ledger.getDirective('fresh-session-successor'), label).toBeNull();
@@ -2196,6 +2198,38 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(f.spawns).toHaveLength(2);
   });
 
+  async function assertStrandedSuccessorReopensDebt(end: 'failed' | 'retired') {
+    const f = await fixture(); surfaceDirectiveRecovery(f.deps, f.intent.requestId, 'accepted, never admitted');
+    const debt = f.ledger.listObligations({ jobId: f.intent.jobId })[0]!;
+    const authority = f.ledger.directiveCurrentAuthority(f.intent.jobId);
+    const successor = recoverInterruptedDirectiveFromRoute({ ...f.deps, requestId: f.intent.requestId, generation: debt.generation,
+      expectedPayloadHash: f.intent.payloadHash, expectedHead: resolveGitCommit(f.lane.path, 'HEAD'), expectedEpoch: f.ledger.directiveRecoveryEpoch(f.intent.jobId),
+      expectedWorkRevision: authority.workRevision, expectedContractSha256: authority.contractSha256, reason: 'finish in a fresh session',
+      decision: { kind: 'rebrief-successor', requestId: 'unadmitted-successor', note: 'finish the approved work fresh' } }).successor!;
+    // The named successor ends without native admission, so it can never settle the debt.
+    if (end === 'failed') f.ledger.failDirective({ requestId: successor.requestId, reason: 'positive no-effect before any prompt' });
+    else retireInterruptedDirectiveFromRoute({ ...f.deps, requestId: successor.requestId, reason: 'stuck before admission; ceased', by: 'silas-ops',
+      expected: { jobId: f.intent.jobId, state: 'dispatching', payloadHash: successor.payloadHash, head: resolveGitCommit(f.lane.path, 'HEAD') } });
+    const reopened = f.ledger.recoveryObligation(f.intent.jobId, 'directive', f.intent.requestId)!;
+    expect(f.ledger.getObligation(debt.id), end).toMatchObject({ state: 'closed', settlement: { kind: 'superseded', byObligationId: reopened.id } });
+    expect(reopened, end).toMatchObject({ state: 'open', nextAction: { kind: 'gru-decision', decision: expect.stringContaining('reconcile-admitted') } });
+    expect(reopened.generation, end).toBeGreaterThan(debt.generation);
+    // A later request carries the work; only its admission settles the reopened debt.
+    f.ledger.beginRebriefIntent({ jobId: f.intent.jobId, requestId: 'later-rebrief', note: 'finish the approved work fresh', holder: 'gru' });
+    await executeAcceptedDirective(f.deps, 'later-rebrief');
+    const admitted = f.ledger.getDirective('later-rebrief')!;
+    expect(admitted.admissionSeq, end).not.toBeNull();
+    const reconcile = { ...f.deps, requestId: f.intent.requestId, expectedPayloadHash: f.intent.payloadHash, expectedHead: resolveGitCommit(f.lane.path, 'HEAD'),
+      expectedEpoch: f.ledger.directiveRecoveryEpoch(f.intent.jobId), reason: 'the later rebrief carried the retired work',
+      decision: { kind: 'reconcile-admitted' as const, admittedRequestId: admitted.requestId } };
+    expect(() => recoverInterruptedDirectiveFromRoute({ ...reconcile, generation: debt.generation }), end).toThrow(/conflicts/u);
+    expect(recoverInterruptedDirectiveFromRoute({ ...reconcile, generation: reopened.generation }), end).toMatchObject({ successor: null, idempotent: false });
+    expect(f.ledger.getObligation(reopened.id), end).toMatchObject({ state: 'settled',
+      settlement: { kind: 'executed-action', evidenceEventSeq: admitted.admissionSeq, evidenceEventKind: 'silas.directive-sent' } });
+  }
+  it('a fresh-session successor that fails before native admission reopens the retired predecessor debt for reconcile-admitted (#470)', () => assertStrandedSuccessorReopensDebt('failed'));
+  it('a fresh-session successor retired before native admission reopens the retired predecessor debt for reconcile-admitted (#470)', () => assertStrandedSuccessorReopensDebt('retired'));
+
   it('owner stops refuse a successor; a concrete reserved-owner obligation settles only Gru recovery debt', async () => {
     const f = await fixture(); surfaceDirectiveRecovery(f.deps, f.intent.requestId, 'unknown');
     const debt = f.ledger.listObligations({ jobId: f.intent.jobId })[0]!;
@@ -2203,6 +2237,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     const input = { ledger: f.ledger, worktrees: f.worktrees, pendingProducerBlockers: () => [], requestId: f.intent.requestId, generation: debt.generation,
       expectedPayloadHash: f.intent.payloadHash, expectedHead: resolveGitCommit(f.lane.path, 'HEAD'), expectedEpoch: f.ledger.directiveRecoveryEpoch(f.intent.jobId), expectedWorkRevision: f.ledger.directiveCurrentAuthority(f.intent.jobId).workRevision, expectedContractSha256: f.ledger.directiveCurrentAuthority(f.intent.jobId).contractSha256, reason: 'destructive step is reserved for owner' };
     expect(() => recoverInterruptedDirectiveFromRoute({ ...input, decision: { kind: 'successor', requestId: 'forbidden-successor', directive: 'run' } })).toThrow(/owner/);
+    expect(() => recoverInterruptedDirectiveFromRoute({ ...input, decision: { kind: 'rebrief-successor', requestId: 'forbidden-rebrief', note: 'run fresh' } })).toThrow(/owner/);
     recoverInterruptedDirectiveFromRoute({ ...input, decision: { kind: 'owner-decision', obligationId: reserved.id } });
     expect(f.ledger.getObligation(debt.id)?.state).toBe('settled'); expect(f.ledger.getObligation(reserved.id)?.state).toBe('open');
     expect(f.native.prompts).toEqual([]); expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('dispatching');
