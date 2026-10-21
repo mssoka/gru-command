@@ -3298,7 +3298,6 @@ describe('Claude context usage from recorded stream-json (#461)', () => {
   /** The recorded turn with its result frame rebuilt by `edit`. */
   const withResult = (edit: (result: StreamFrame) => StreamFrame) =>
     recordedFrames().map((frame) => (frame['type'] === 'result' ? edit(frame) : frame));
-  /** The recorded turn with the LAST main-thread frame's usage rebuilt by `edit`. */
   /** The recorded turn ending in the CLI's in-band API error: its synthetic
    * message, then an is_error result that still carries the window. */
   const inBandErrorTurn = () => {
@@ -3311,6 +3310,7 @@ describe('Claude context usage from recorded stream-json (#461)', () => {
     };
     return [...frames, synthetic, { ...result, is_error: true, api_error_status: 429 }];
   };
+  /** The recorded turn with the LAST main-thread frame's usage rebuilt by `edit`. */
   const withLastUsage = (edit: (usage: StreamFrame) => StreamFrame) => {
     const frames = recordedFrames();
     const last = lastMainIndex(frames);
@@ -3388,6 +3388,8 @@ describe('Claude context usage from recorded stream-json (#461)', () => {
     expect(measure([...frames, { type: 'compact_boundary', session_id: 'recorded-session' }, result])).toBeNull();
     const lastMain = frames[lastMainIndex(frames)]!;
     expect(measure([...frames, boundary, lastMain, result])).toEqual(MEASURED);
+    // A subagent's compaction is another context: the main measurement stands.
+    expect(measure([...frames, { ...boundary, parent_tool_use_id: 'toolu_subagent_context_461' }, result])).toEqual(MEASURED);
   });
 
   it('with several models in the result, the main-thread call reads its own model\'s window', () => {
@@ -3398,9 +3400,11 @@ describe('Claude context usage from recorded stream-json (#461)', () => {
     expect(measure(frames)).toEqual(MEASURED);
   });
 
-  it('percent is capped at 100 when the reported prompt exceeds the window', () => {
+  it('a prompt larger than the reported window measures nothing: that window cannot be the call\'s', () => {
     const frames = withResult((result) => ({ ...result, modelUsage: { 'claude-opus-5-5': { contextWindow: 50_000 } } }));
-    expect(measure(frames)).toEqual({ tokens: 77_909, contextWindow: 50_000, percent: 100 });
+    expect(measure(frames)).toBeNull();
+    const exact = withResult((result) => ({ ...result, modelUsage: { 'claude-opus-5-5': { contextWindow: 77_909 } } }));
+    expect(measure(exact)).toEqual({ tokens: 77_909, contextWindow: 77_909, percent: 100 });
   });
 
   it('a fresh handle is unmeasured; a replayed turn measures; a turn without a result clears it #contract:context-usage:claude-code', async () => {

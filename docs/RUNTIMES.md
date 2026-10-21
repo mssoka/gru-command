@@ -77,19 +77,25 @@ single-operation queue.
     frame: the prompt that call sent, without its own reply. The blocks of
     one API message repeat that call's usage, so the latest frame replaces
     and never adds.
-  - These frames never count: frames with a `parent_tool_use_id`, which
-    belong to subagents, and zero-token frames, which are the CLI's own
-    `<synthetic>` replies, API errors included. A native `compact_boundary`
-    inside a turn resets the measurement until a later call.
+  - These frames never count:
+    - frames with a `parent_tool_use_id`, which belong to subagents;
+    - the CLI's flagged API-error message;
+    - zero-token frames, which are the CLI's own `<synthetic>` replies such
+      as "No response requested.".
+  - A main-thread `compact_boundary` inside a turn resets the measurement
+    until a later call.
   - `contextWindow` is the result frame's
     `modelUsage[<that frame's model>].contextWindow`. That map's token
-    counts are cumulative over the turn and are not used. `percent` is
-    capped at 100.
-  - Usage is `null` when the window is missing, after a turn whose result is
-    an error (the provider never measured the failing request; owner ruling
-    2026-10-21), from the start of a turn or compaction until a turn ends
-    with a measured result, and on a fresh or resumed handle before its
-    first such turn.
+    counts are cumulative over the turn and are not used.
+  - Usage is `null` when any of these holds:
+    - the window is missing;
+    - the prompt exceeds the window (a call that succeeded fit its window,
+      so that window cannot be the call's);
+    - the turn's result is an error, whose end state the provider never
+      measured (owner ruling 2026-10-21; pi keeps reporting);
+    - a turn or compaction has started, until a turn ends with a measured
+      result;
+    - the handle is fresh or resumed and has not yet had such a turn.
 - **Claude Code compaction** runs native
   `/compact` through a dedicated `--resume <same uuid>` machine-output
   process. Its frames append to the same product transcript for forensics,

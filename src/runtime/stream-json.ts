@@ -269,23 +269,28 @@ export class ClaudeTurnTranslator {
   /** Provider-reported context usage after this turn (#461): the latest
    * main-thread call's whole prompt over the result's window for that call's
    * model. Null until both halves are present and well formed — no window
-   * table, no estimate — and after an errored turn, whose failing request
-   * the provider never measured (owner ruling 2026-10-21). */
+   * table, no estimate. Also null after an errored turn, whose end state
+   * the provider never measured (owner ruling 2026-10-21), and when the
+   * prompt exceeds the window: a call that succeeded fit its window, so the
+   * window cannot be that call's. */
   get contextUsage(): ContextUsage | null {
     if (this.occupancy === null || this.modelUsage === null || this.resultInfo?.isError !== false) return null;
     const { tokens, model } = this.occupancy;
     const entry = Object.hasOwn(this.modelUsage, model) ? this.modelUsage[model] : undefined;
     const contextWindow = typeof entry === 'object' && entry !== null ? (entry as StreamFrame)['contextWindow'] : undefined;
     if (typeof contextWindow !== 'number' || !Number.isSafeInteger(contextWindow) || contextWindow <= 0) return null;
-    return { tokens, contextWindow, percent: Math.min(100, (tokens * 100) / contextWindow) };
+    if (tokens > contextWindow) return null;
+    return { tokens, contextWindow, percent: (tokens * 100) / contextWindow };
   }
 
   /** Consume one parsed frame; returns the interface events it implies. */
   ingest(frame: StreamFrame): RuntimeEvent[] {
     const type = frame['type'];
-    // A native compaction inside the turn (auto-compact) replaces the context
-    // the earlier calls measured: only a call after it measures again.
-    if ((type === 'system' && frame['subtype'] === 'compact_boundary') || type === 'compact_boundary') {
+    // A native compaction of the main thread inside the turn (auto-compact)
+    // replaces the context the earlier calls measured: only a call after it
+    // measures again. A subagent's compaction is another context.
+    if (((type === 'system' && frame['subtype'] === 'compact_boundary') || type === 'compact_boundary') &&
+        (frame['parent_tool_use_id'] ?? null) === null) {
       this.occupancy = null;
     }
     switch (type) {
