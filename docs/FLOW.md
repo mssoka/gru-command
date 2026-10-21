@@ -181,7 +181,25 @@ is one parent incident, never a slate of failed specialists. A PRE-SPAWN
 interruption (setup shutdown or a pre-spawn workflow failure) is not a
 parent incident: it leaves the durable negative owner receipt
 (`round.review-no-spawn`) and an INCOMPLETE report whose heading says
-setup refusal/interruption — no incident event exists to find. A revision-expression or tag pin
+setup refusal/interruption — no incident event exists to find.
+
+A crash during setup is the same case, found at startup (#466).
+`beginSpawn` records the round `live` before any spawner runs, so a round
+that never went `live` spawned nothing. Startup recovery aborts it with
+that receipt, written atomically with the abort, even when the crash came
+before the owner marker (`round.review-owner`). Its INCOMPLETE reason is
+the one startup recovery always records: `service_restart`,
+`service_restart_missing_review_lane` when no review lane is registered,
+or `superseded` for a superseded round. The receipt admits the replacement
+review; on a restart reason, Silas's `clean-abort-service-restart` row
+re-arms it. A round that went `live` never gets a receipt: its owner
+marker binds the cessation proof instead. A pending round whose receipt
+the ledger refuses (a duplicate owner marker, or agents or specialist
+starts on a round that never went live) is aborted as if it had gone
+live, with a parent incident naming the refusal, and escalated; its
+replacement is admitted only once its ownership is proven.
+
+A revision-expression or tag pin
 (`origin/topic~1`, `origin/v1`) is not a branch spelling: the
 advertised-tip movement probe skips it (the pin still binds through local
 resolution and the pristine-checkout proof), so pinned rounds no longer

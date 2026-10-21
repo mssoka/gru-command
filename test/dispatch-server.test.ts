@@ -1586,6 +1586,55 @@ if (argv.includes('--method') && argv.includes('POST')) {
     }
   }, 120_000);
 
+  it('admits the replacement review after a crash between round admission and its owner marker (#466)', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-pre-marker-crash');
+    cleanupRepos.push(repo);
+    attachBareOrigin(repo);
+    try {
+      const jobId = 'pre-marker-crash';
+      await call(h.port, 'POST', '/api/dispatch', { job_id: jobId, repo_path: repo.path, title: jobId, briefing: 'b' }, TOKEN);
+      await waitForDelivery(h, jobId);
+      expect((await call(h.port, 'POST', '/api/dispatch/pr', { job_id: jobId, url: PR_URL }, TOKEN)).status).toBe(200);
+      // The process that admitted the round dies inside setup: its review
+      // lane exists, its owner marker was never written.
+      const createReview = h.worktrees.createReviewWorktree.bind(h.worktrees);
+      let crash!: () => void;
+      const crashed = new Promise<void>((resolveCrash) => { crash = resolveCrash; });
+      vi.spyOn(h.worktrees, 'createReviewWorktree').mockImplementationOnce(async (input) => {
+        await createReview(input);
+        crash();
+        return new Promise<never>(() => {});
+      });
+      const dying = new WaveRunner({
+        ledger: h.ledger, worktrees: h.worktrees, reviewArtifactRoot: h.reviewArtifactRoot, prHeadProbe: originHeadProbe(),
+        spawner: async () => { throw new Error('the crashed setup never reaches a spawn'); },
+        reviewRuntimeIdentity: () => ({ id: 'claude-code', version: 'fixture' }),
+      });
+      // A setup that settles before the crash point fails with its own cause.
+      await Promise.race([crashed, dying.runRound({ jobId }).then(() => { throw new Error('review setup settled before the injected crash'); })]);
+      const [round] = h.ledger.listRounds(jobId);
+      expect(round?.status).toBe('pending');
+      expect(h.ledger.latestRoundEvent(round!.id, 'round.review-owner')).toBeNull();
+
+      // The restarted service never saw that setup; startup recovery proves
+      // the never-live round spawned nothing.
+      await h.wave.recoverInterruptedRounds();
+      expect(h.ledger.getRound(round!.id)?.status).toBe('aborted');
+      expect(h.ledger.uniqueRoundNoSpawnReceipt(round!.id)?.payload).toMatchObject({ roundId: round!.id, ownerGeneration: null });
+      expect(h.ledger.latestRoundEvent(round!.id, 'round.parent-incident')).toBeNull();
+      expect(h.ledger.latestRoundEvent(round!.id, 'round.perkins-incomplete')?.payload).toMatchObject({ reason: 'service_restart' });
+      const digest = await computeSilasDigest({ ledger: h.ledger, blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
+      expect(digest.prWithoutReview).toMatchObject([{ jobId, cleanAbort: { roundId: round!.id, ruleId: 'clean-abort-service-restart' } }]);
+      const review = await call(h.port, 'POST', '/api/dispatch/review', {
+        job_id: jobId, by: 'silas', rule_id: 'clean-abort-service-restart', source_round_id: round!.id,
+      }, TOKEN);
+      expect(review).toMatchObject({ status: 202, json: { route: 'perkins', source_round_id: round!.id } });
+      expect(h.ledger.listRounds(jobId)).toHaveLength(2);
+    } finally { await h.close(); }
+  }, 90_000);
+
   it('binds a clean-abort re-arm to the proved delivered head, never a moved live PR head', async () => {
     const h = await boot();
     const repo = makeFixtureRepo('fixture-clean-abort-target');

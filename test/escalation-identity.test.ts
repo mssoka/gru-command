@@ -238,6 +238,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Perkins publication for round ${round.id} could not be reconciled after restart`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Review round ${round.id} is INCOMPLETE after service restart`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Review round ${String(round.id)} could not be processed during startup recovery`', '{ jobId: job.id, roundId: round.id }'],
+      ['`Review round ${round.id} has no no-spawn proof after service restart`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Queued review handoff for job ${jobId} is held`', '{ jobId }'],
       ['`Queued review handoff failed for job ${jobId}`', '{ jobId }'],
       // Owner decision 2026-10-08: a transient refusal retries; only the
@@ -273,8 +274,9 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
     // 37 pre-existing wave call sites + the 13 durable-publication-recovery
     // escalations added by the PR #289 native correction cycle, its
     // amendments and the native R2 byte/identity fences, + #464's delivery
-    // cut reconciliation.
-    expect(sites).toHaveLength(51);
-    expect(sites.filter((site) => site.context !== null)).toHaveLength(48);
+    // cut reconciliation, + the #466 refused no-spawn proof at startup
+    // recovery.
+    expect(sites).toHaveLength(52);
+    expect(sites.filter((site) => site.context !== null)).toHaveLength(49);
   });
 });
