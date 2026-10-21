@@ -81,6 +81,7 @@ import {
   type DirectiveNativeBinding,
   type DirectiveProducer,
   type DirectiveTurnIdentity,
+  claudeAnswerFrame,
 } from './directive-checkpoint.js';
 import { ClaudeDirectivePermissionChannel, privateClaudeDirectiveSettings, type ClaudeToolDecision, type ClaudeToolRequest } from './claude-directive.js';
 import { resolveGitCommit } from '../dispatch/perkins-review/artifacts.js';
@@ -992,17 +993,19 @@ function claudeHeaderOf(head: string): { readonly id: string; readonly cwd: stri
 }
 
 /**
- * Markup the Claude CLI reserves for its own user frames (#472). Its
+ * The opening tags the Claude CLI reserves for its own user frames (#472). Its
  * --replay-user-messages never echoes a user message whose text holds one of
- * these opening tags, or starts with a teammate message — read from Claude
- * Code 2.1.306's replay filter. A directive quoting one (a re-brief warning
- * against `<task-notification>`) would never be admitted.
+ * the first six, or starts with a teammate message — read from Claude Code
+ * 2.1.306's replay filter. A directive quoting one (a re-brief warning against
+ * `<task-notification>`) would never be admitted. A later CLI that reserves
+ * more fails loud at the turn's first answer, never silently.
  */
-const CLAUDE_RESERVED_TAG = /<\/?(?:task-notification|tick|bash-stdout|bash-stderr|local-command-stdout|local-command-stderr|teammate-message)(?=[\s/>])[^<>]*>?/gu;
+const CLAUDE_RESERVED_TAG = /<(?:task-notification|tick|bash-stdout|bash-stderr|local-command-stdout|local-command-stderr)>|<teammate-message\s[^<>]*>?/gu;
 
 /** A directive's exact user content (#424): always an array, text only, so
- * the CLI's echo binds it byte for byte. Markup the CLI reserves is written
- * as entities (#472), which the model reads the same and the CLI echoes. */
+ * the CLI's echo binds it byte for byte. Only the reserved opening tags are
+ * written as entities (#472); the CLI echoes those, and the rest of the text
+ * reaches the model as written. */
 export function claudeDirectiveContent(text: string): readonly StreamFrame[] {
   return [{ type: 'text', text: text.replace(CLAUDE_RESERVED_TAG, (tag) => tag.replaceAll('<', '&lt;').replaceAll('>', '&gt;')) }];
 }
@@ -1936,8 +1939,8 @@ export class ClaudeCodeHandle implements AgentHandle {
     }
     // Before its echo the turn may only announce itself (the checkpoint's own
     // rule): an answer first can never be admitted, so it ends here (#472).
-    if (turn.admission === null && turn.failure === null && (frame['type'] === 'assistant' || frame['type'] === 'stream_event')) {
-      this.failDirective(turn, new DirectiveCheckpointError('the Claude CLI began answering without echoing the directive instruction (--replay-user-messages withholds text holding markup the CLI reserves), so its admission cannot be proven'), abortTurn);
+    if (turn.admission === null && turn.failure === null && claudeAnswerFrame(frame)) {
+      this.failDirective(turn, new DirectiveCheckpointError('the Claude CLI began answering without echoing the directive instruction (--replay-user-messages), so its admission cannot be proven; look for markup in it that this CLI reserves for its own frames'), abortTurn);
       return;
     }
     if (frame['type'] === 'result' && frame['subtype'] === 'success' && frame['is_error'] === false) {

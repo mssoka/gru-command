@@ -78,7 +78,7 @@ that proves it on each adapter.
 | `blind-transcript-reader` | The blind-access reader pairs each read result with the file its call named, read from each runtime's real persisted record shape | `test/blind-review.test.ts` | `test/blind-review.test.ts` |
 | `blind-read-invalidates` | Through the ledger, an absolute read inside the job's recorded lane invalidates blind coverage | `test/blind-review.test.ts` | `test/blind-review.test.ts` |
 | `blind-resumed-turn-scan` | A prohibited read during a provider-recovery resumed turn invalidates blind coverage | `test/provider-recovery-resume.test.ts` | `test/provider-recovery-resume.test.ts` |
-| `native-directive-admission` | A Silas directive's native admission and producer ownership are attested before any effect, and the directive settles with its delivery. pi: an accepted directive runs as its exact SDK producer. Claude Code (#424): the binding is durable before the CLI starts, admission is the CLI's own echo of the prompt (`--replay-user-messages`; markup the CLI reserves for its own frames, such as `<task-notification>`, whose echo it withholds, is sent as entities, and a turn that answers before its echo ends at once, #472), every tool asks the host through the stdio permission prompt and is allowed only once its intent is durable and the directive's authority still holds, and completion is the turn's own result | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts`, `test/restart-recovery-progress.test.ts` |
+| `native-directive-admission` | A Silas directive's native admission and producer ownership are attested before any effect, and the directive settles with its delivery. pi: an accepted directive runs as its exact SDK producer. Claude Code (#424): the binding is durable before the CLI starts, admission is the CLI's own echo of the prompt (`--replay-user-messages`; the opening tags the CLI reserves for its own frames, such as `<task-notification>`, whose echo it withholds, are sent as entities; a keepalive ping may precede the echo, but a turn that answers before it ends at once, #472), every tool asks the host through the stdio permission prompt and is allowed only once its intent is durable and the directive's authority still holds, and completion is the turn's own result | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts`, `test/restart-recovery-progress.test.ts` |
 | `rate-limit-retry` | An in-band 429 keeps the delivery pending until the supervisor's automatic retry recovers; driven through `AgentHandle` | `test/supervisor.test.ts` | `test/supervisor.test.ts` |
 | `supervisor-restart-ladder` | A hung agent climbs the restart ladder and is restored by resume; driven through `AgentHandle` | `test/supervisor.test.ts` | `test/supervisor.test.ts` |
 | `provider-recovery-continuation` | A provider-recovery claim resumes the interrupted session and re-delivers its continuation prompt; driven through `AgentHandle` | `test/provider-recovery-resume.test.ts` | `test/provider-recovery-resume.test.ts` |
@@ -187,7 +187,13 @@ writes each runtime's own record shape during a resumed turn.
   never re-sent.
 - **Directive content.** A Claude directive is text only (an image is refused
   by name): the CLI may transform an image, which would break the byte-exact
-  echo admission binds.
+  echo admission binds. The CLI never echoes text holding an opening tag it
+  reserves for its own frames (`<task-notification>`, `<tick>`,
+  `<bash-stdout>`, `<bash-stderr>`, `<local-command-stdout>`,
+  `<local-command-stderr>`, or a leading `<teammate-message …>`), so those
+  tags reach the minion as entities (`&lt;task-notification&gt;`) and the
+  rest of the text as written (#472). A literal `&lt;tick&gt;` and `<tick>`
+  therefore look alike to the minion.
 - **A review owner from another process (#464).** A replacement Perkins round
   starts only once every earlier round's review owner is proven ceased. On
   both runtimes the proof is either this process's adapter evidence or the

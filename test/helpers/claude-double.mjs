@@ -65,6 +65,7 @@
  *                               re-stamped), e.g. test/fixtures/claude-stream/
  *   CLAUDE_DOUBLE_ECHO=mutate|skip  the prompt echo carries other text, or never comes
  *   CLAUDE_DOUBLE_INIT_DELAY_MS=<ms> wait this long after taking the prompt before init
+ *   CLAUDE_DOUBLE_PRE_ECHO=1    a request status and a keepalive ping between init and the echo
  *   CLAUDE_DOUBLE_TOOL_INPUT_DRIFT=1 the permission request names other input than the tool_use
  */
 import process from 'node:process';
@@ -315,7 +316,8 @@ async function emitToolTurn(toolName, toolError = false) {
 function replayWithheld(content) {
   const text = (typeof content === 'string' ? content : content.filter((block) => block?.type === 'text').map((block) => block.text).join('\n')).trim();
   return ['task-notification', 'tick', 'bash-stdout', 'bash-stderr', 'local-command-stdout', 'local-command-stderr'].some((tag) => text.includes(`<${tag}>`)) ||
-    text.startsWith('<teammate-message ');
+    text.startsWith('<teammate-message ') ||
+    text.startsWith('Another Claude session sent a message') && text.startsWith('<teammate-message ', text.indexOf('\n') + 1);
 }
 
 /** The CLI's own echo of the prompt it accepted (--replay-user-messages). */
@@ -452,6 +454,12 @@ async function run() {
     const initDelayMs = Number(process.env['CLAUDE_DOUBLE_INIT_DELAY_MS'] ?? '0');
     if (Number.isFinite(initDelayMs) && initDelayMs > 0) await delay(initDelayMs);
     out(initFrame());
+    if (process.env['CLAUDE_DOUBLE_PRE_ECHO'] === '1') {
+      // What the real CLI may write before its echo: the request status, and
+      // the keepalive ping it streams while that request stalls.
+      out({ type: 'system', subtype: 'status', status: 'requesting', session_id: sessionId, uuid: randomUUID() });
+      streamEvent({ type: 'ping' });
+    }
     echoPrompt();
   }
 
