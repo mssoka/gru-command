@@ -59,8 +59,8 @@ const USAGE = `usage: gru <command> [options]
                            drain_timeout_ms); --now restarts at once and boot
                            recovery resumes the turns it cut. Also takes
                            --no-wait, --json, --reason and --timeout-ms.
-  stop                     stop the service; it stays down until gru start or
-                           your next login
+  stop                     stop the service; it stays down until gru start, a
+                           reboot or your next login
   start                    start the service
   status [--json]          running build, installed build, and how far behind
                            main; exits 1 when the service is not running
@@ -380,7 +380,8 @@ export async function runServiceCli(
     deps.stderr(
       `gru: roll refused (HTTP ${res.status}): ${body.detail ?? body.error ?? 'unknown error'}`,
     );
-    if (options.action === 'restart' && res.status === 401) configChangeHint(deps.stderr);
+    // 401: a new token; 503: a token added where none was; 404: the port now names another listener.
+    if (options.action === 'restart' && [401, 404, 503].includes(res.status)) configChangeHint(deps.stderr);
     return 1;
   }
   if (!options.wait) return 0;
@@ -515,7 +516,7 @@ function bailHint(stderr: (line: string) => void, state: RollState | null): void
   stderr(
     `bail: the swap marker is the only handoff state — to return the service, restore the ` +
       `checkout, rebuild (npm ci && npm run build && npm run build:web in ${root}), and ` +
-      'restart the unit (gru restart --now, or launchctl kickstart -k gui/$(id -u)/com.gru-command.service | systemctl --user restart gru-command)',
+      'restart the unit (gru restart --now; or launchctl kickstart -k gui/$(id -u)/com.gru-command.service on macOS, systemctl --user restart gru-command on Linux)',
   );
 }
 

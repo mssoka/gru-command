@@ -292,10 +292,10 @@ installer says when that directory is not on your PATH). It runs this
 checkout's CLI from any directory:
 
 ```bash
-gru update              # pull main, rebuild, restart (same as ./install.sh --update)
+gru update              # pull main, rebuild, restart (./install.sh --update, from anywhere)
 gru restart             # apply config.toml edits: drain in-flight turns, relaunch the installed build
 gru restart --now       # restart at once; boot recovery resumes the turns it cut
-gru stop                # stop the service (down until gru start or your next login)
+gru stop                # stop the service (down until gru start, a reboot or your next login)
 gru start               # start it again
 gru status              # running build, installed build, how far behind main
 gru logs -f             # follow the service log

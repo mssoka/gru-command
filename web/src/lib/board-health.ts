@@ -133,7 +133,7 @@ export function deployDriftCard(build: BuildView | null | undefined, now = Date.
       'deploy',
       'deploy',
       latestTag,
-      `build ${shortRev(build.buildRev)}${age} ${have} · ${latestTag} released — update with gru update`,
+      `build ${shortRev(build.buildRev)}${age} ${have} · ${latestTag} released — update with gru update (or ./install.sh --update in the deploy clone)`,
       'alert',
       'UPDATE AVAILABLE',
       `running build ${shortRev(build.buildRev)} is older than release ${latestTag} (${have}) — rebuild + restart${stale}`,

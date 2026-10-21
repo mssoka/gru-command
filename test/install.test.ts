@@ -365,8 +365,7 @@ describe('the gru launcher (#463)', () => {
       'set -euo pipefail',
       'err() { echo "install.sh: $*" >&2; }',
       ...Object.entries(vars).map(([name, value]) => `${name}=${shellQuote(value)}`),
-      'LAUNCHER_MARKER="# gru-command launcher (managed by install.sh)"',
-      `eval "$(sed -n '/^launcher_path()/,/^}/p;/^is_our_launcher()/,/^}/p;/^sh_single_quote()/,/^}/p;/^write_launcher()/,/^}/p;/^link_cli()/,/^}/p' ${shellQuote(installScript)})"`,
+      `eval "$(sed -n '/^LAUNCHER_MARKER=/p;/^launcher_path()/,/^}/p;/^is_our_launcher()/,/^}/p;/^sh_single_quote()/,/^}/p;/^write_launcher()/,/^}/p;/^link_cli()/,/^}/p' ${shellQuote(installScript)})"`,
       body,
     ].join('\n');
     return spawnSync('bash', ['-c', script], {
@@ -405,12 +404,17 @@ describe('the gru launcher (#463)', () => {
     expect(run({ ...withoutHome, GRU_COMMAND_HOME: '/explicit' }).stdout).toBe('HOME=/explicit ARGS=status|a b\n');
   });
 
-  it('a vanished node or checkout names the repair instead of a bare exec error', () => {
+  it('a vanished node or checkout names its own repair instead of a bare exec error', () => {
     const { bin, clone, vars } = stage();
     expect(launcherShell({ ...vars, NODE_BIN: join(clone, 'gone', 'node') }, 'link_cli').status).toBe(0);
-    const broken = spawnSync(join(bin, 'gru'), ['version'], { encoding: 'utf8' });
-    expect(broken.status).toBe(1);
-    expect(broken.stderr).toContain(`re-run ${clone}/install.sh to repair this command`);
+    const noNode = spawnSync(join(bin, 'gru'), ['version'], { encoding: 'utf8' });
+    expect(noNode.status).toBe(1);
+    expect(noNode.stderr).toContain(`is gone; run ${clone}/install.sh --update from a shell with Node.js 22.19+`);
+    expect(launcherShell(vars, 'link_cli').status).toBe(0);
+    rmSync(join(clone, 'dist', 'cli', 'service.js'));
+    const noCheckout = spawnSync(join(bin, 'gru'), ['version'], { encoding: 'utf8' });
+    expect(noCheckout.status).toBe(1);
+    expect(noCheckout.stderr).toContain(`the Gru Command checkout at ${clone} is gone; reinstall it with the one-line installer`);
   });
 
   it('warns about a gru earlier on PATH, and stays quiet when ours is first', () => {

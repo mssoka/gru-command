@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -118,16 +118,33 @@ describe('gru update / stop / start / restart --now hand off to install.sh', () 
     expect(h.stderr.join('\n')).toContain('restart --now takes no other options');
   });
 
-  it('runs the real install.sh with exactly those flags, on the pinned node, and returns its exit code', () => {
+  it('runs the real install.sh with exactly those flags and its exit code; the shell\'s node wins, the pinned one is the fallback', () => {
     const root = mkdtempSync(join(tmpdir(), 'gru-command-installer-'));
     cleanupDirs.push(root);
     const record = join(root, 'record.txt');
     writeFileSync(join(root, 'install.sh'),
       `printf '%s\\n' "$*" "$(command -v node)" > ${JSON.stringify(record)}\nexit 7\n`);
-    expect(installerRunnerFor(root)(['--stop'])).toBe(7);
-    const [args, node] = readFileSync(record, 'utf8').trimEnd().split('\n');
+    // A PATH with bash and nothing else, and one with a different node first.
+    const bashOnly = join(root, 'bash-only');
+    mkdirSync(bashOnly);
+    symlinkSync('/bin/bash', join(bashOnly, 'bash'));
+    const shellNode = join(root, 'shell-node');
+    mkdirSync(shellNode);
+    writeFileSync(join(shellNode, 'node'), '#!/bin/sh\n', { mode: 0o755 });
+    const recorded = (path: string): readonly string[] => {
+      const original = process.env['PATH'];
+      process.env['PATH'] = path;
+      try {
+        expect(installerRunnerFor(root)(['--stop'])).toBe(7);
+      } finally {
+        process.env['PATH'] = original;
+      }
+      return readFileSync(record, 'utf8').trimEnd().split('\n');
+    };
+    const [args, fallback] = recorded(bashOnly);
     expect(args).toBe('--stop');
-    expect(dirname(node!)).toBe(dirname(process.execPath));
+    expect(dirname(fallback!)).toBe(dirname(process.execPath));
+    expect(recorded(`${shellNode}:${bashOnly}`)[1]).toBe(join(shellNode, 'node'));
   });
 
   it('every subcommand answers --help with usage and exit 0, running nothing', async () => {

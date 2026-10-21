@@ -208,9 +208,11 @@ describe('gru roll follow loop', () => {
     expect(await runServiceCli(['restart'], down.deps)).toBe(1);
     expect(down.stderr.join('\n')).toContain('start it with gru start');
     expect(down.stderr.join('\n')).toContain('apply the edit with gru restart --now');
-    const rejected = await harness({ post: jsonResponse(401, { error: 'unauthorized' }) });
-    expect(await runServiceCli(['restart'], rejected.deps)).toBe(1);
-    expect(rejected.stderr.join('\n')).toContain('[auth] token');
+    for (const status of [401, 404, 503]) {
+      const rejected = await harness({ post: jsonResponse(status, { error: 'refused' }) });
+      expect(await runServiceCli(['restart'], rejected.deps)).toBe(1);
+      expect(rejected.stderr.join('\n')).toContain('[auth] token');
+    }
     // A plain roll keeps its own refusal without the restart hint.
     const roll = await harness({ post: jsonResponse(401, { error: 'unauthorized' }) });
     expect(await runServiceCli(['roll'], roll.deps)).toBe(1);
@@ -290,6 +292,8 @@ describe('gru roll follow loop', () => {
     expect(code).toBe(1);
     expect(h.stderr.join('\n')).toContain('does not report the target build');
     expect(h.stderr.join('\n')).toContain('bail:');
+    expect(h.stderr.join('\n')).toContain('gru restart --now; or launchctl kickstart -k');
+    expect(h.stderr.join('\n')).toContain('systemctl --user restart gru-command on Linux');
   });
 
   it('REFUSES a foreign listener answering /health even when the build sha matches (pid evidence, not a 200)', async () => {

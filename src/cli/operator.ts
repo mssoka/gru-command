@@ -23,9 +23,11 @@ export function installerRunnerFor(packageRoot: string): InstallerRunner {
       process.stderr.write(`gru: ${packageRoot} is not a Gru Command checkout (no install.sh) — reinstall with the one-line installer\n`);
       return 1;
     }
-    // install.sh resolves `node` from PATH: hand it the node this command was
-    // pinned to, never whatever the caller's shell would find first.
-    const path = [dirname(process.execPath), process.env['PATH'] ?? ''].join(delimiter);
+    // install.sh takes `node` from PATH, as ./install.sh --update does: the
+    // shell's node wins (a Node upgrade is picked up), and the node this
+    // command runs on is the fallback for a shell that has none. Appended,
+    // so nothing else install.sh looks up (python3, git, npm) is shadowed.
+    const path = [process.env['PATH'], dirname(process.execPath)].filter((entry) => entry !== undefined && entry !== '').join(delimiter);
     const result = spawnSync('bash', [script, ...args], { stdio: 'inherit', env: { ...process.env, PATH: path } });
     if (result.error !== undefined) {
       process.stderr.write(`gru: could not run ${script}: ${result.error.message}\n`);

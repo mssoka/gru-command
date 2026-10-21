@@ -1278,11 +1278,12 @@ describe('install.sh setup mode (one-line path)', () => {
 
     // Inside the managed service: stop and an immediate restart refuse.
     const inside = inServiceManagerSeam(home);
-    for (const mode of ['--stop', '--restart']) {
-      const refused = await run(install, [mode], { ...base, ...inside.env });
-      expect(refused.status).not.toBe(0);
-      expect(refused.stderr).toContain("use 'gru restart --no-wait' instead");
-    }
+    const insideStop = await run(install, ['--stop'], { ...base, ...inside.env });
+    expect(insideStop.status).not.toBe(0);
+    expect(insideStop.stderr).toContain("run 'gru stop' from a terminal outside the service");
+    const insideRestart = await run(install, ['--restart'], { ...base, ...inside.env });
+    expect(insideRestart.status).not.toBe(0);
+    expect(insideRestart.stderr).toContain("use 'gru restart --no-wait' instead");
     expect(calls(inside)).toEqual([]);
 
     // A foreign unit is never touched.
@@ -1351,6 +1352,8 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(existsSync(unit)).toBe(false);
     expect((await run(join(fixture, 'install.sh'), ['--service'], env)).status).toBe(0);
     expect(readFileSync(unit, 'utf-8')).toBe(rendered.stdout);
+    // --service refreshes the launcher with the unit (#463), after --uninstall removed it.
+    expect(readFileSync(join(home, '.local', 'bin', 'gru'), 'utf-8')).toContain(`GRU_COMMAND_HOME='${instance}'`);
   });
 
   it('inside a clone: no flags clone the product — deps+build+wizard only', async () => {

@@ -27,7 +27,7 @@ export interface Migration {
   readonly foreignKeysOff?: true;
 }
 
-/** Thrown when the ledger is opened while `gru-service reset` runs on its
+/** Thrown when the ledger is opened while `gru reset` runs on its
  * data directory (#427 PR 2b): the service does not start under a reset. */
 export class ResetRunningError extends Error {
   constructor(file: string, cause: unknown) {

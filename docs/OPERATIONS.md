@@ -41,7 +41,7 @@ The OS service manager is the SERVICE's out-of-band watcher (SPEC ruling
 ./install.sh --service    # register + start the service (launchd/systemd)
 ./install.sh --print      # render the platform unit; change nothing
 ./install.sh --uninstall  # stop the service and remove the unit (and the gru launcher)
-./install.sh --stop       # stop the owned service (down until --start or next login)
+./install.sh --stop       # stop the owned service (down until --start, a reboot or next login)
 ./install.sh --start      # start it
 ./install.sh --restart    # restart it now (turns in flight resume through boot recovery)
 ```
@@ -67,14 +67,22 @@ same bounded drain (`[roll] drain_timeout_ms`, default 15 minutes; new
 turns are not held back, so a busy fleet may wait the whole bound), then
 the relaunch and the `/health` check. Use it to apply `config.toml` edits.
 `gru restart --now` restarts through the service manager at once; boot
-recovery resumes the turns it cut. From inside the service (an agent's
-shell), `gru stop` and `gru restart --now` refuse, because the service
-manager would end them with the service; `gru restart` and `gru update`
-work there. Pass `--no-wait` to `gru restart` from inside: the drain counts
-the calling session's own turn, so waiting would only sit out the drain
-bound. The CLI reads the instance's `config.toml` to reach the service, so
-after an edit to `[server]` host/port or `[auth]` token use
-`gru restart --now`.
+recovery resumes the turns it cut.
+
+`gru update` runs the deploy clone's `install.sh --update` on your shell's
+Node.js, exactly as running it there would, so a Node upgrade is picked up;
+only a shell with no `node` falls back to the Node.js `gru` was installed
+with.
+
+From inside the service (an agent's shell), `gru stop` and
+`gru restart --now` refuse, because the service manager would end them with
+the service. Use `gru restart --no-wait` and `gru roll --no-wait` there
+(`gru update` from inside hands off to a waiting `gru roll`): the drain
+counts the calling session's own turn, so waiting would only sit out the
+drain bound. The CLI reads the instance's `config.toml` to reach the
+service, so an edit to `[server]` host/port or `[auth]` token is applied
+with `gru restart --now` from a terminal — the service cannot apply it from
+inside, and that restart cuts the turns in flight.
 
 **Noticing a release.** The board's `deploy` check is the operator-facing
 update signal. Every 5 minutes the service reads `origin/main` and the
@@ -181,7 +189,7 @@ To talk to the Gru brain directly with a runtime CLI (pi or claude):
 3. Edit/inspect as needed. The product transcript is the forensic
    record, not the console's input — for claude, the CLI reads its own
    store; the emergency edit applies to pi-style session files.
-4. Restart the service. **Boot growth detection** (SPEC ruling 12)
+4. Restart the service (`gru start`). **Boot growth detection** (SPEC ruling 12)
    re-scans every session file: anything that grew, shrank, or vanished
    while you were in there is reported via `/health`
    (`liveness.signals.session_growth`) and a warn log line — an

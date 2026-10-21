@@ -33,7 +33,7 @@
 #   ./install.sh --uninstall         stop the service and remove the unit
 #                                    (and the `gru` command it installed)
 #   ./install.sh --stop              stop the owned service; it stays down
-#                                    until --start or the next login
+#                                    until --start, a reboot or the next login
 #   ./install.sh --start             start the owned service (no-op when
 #                                    it already runs)
 #   ./install.sh --restart           restart the owned service NOW; turns
@@ -505,7 +505,11 @@ require_owned_unit() {
 refuse_inside_service() {
   if inside_managed_service_pgroup; then
     err "cannot $1 the service from inside it: the service manager would end this command with it"
-    err "use 'gru restart --no-wait' instead: the service drains in-flight work and relaunches itself (its drain counts this session's own turn, so waiting on it would only wait out the drain bound)"
+    if [[ "$1" == "restart" ]]; then
+      err "use 'gru restart --no-wait' instead: the service drains in-flight work and relaunches itself (its drain counts this session's own turn, so waiting on it would only wait out the drain bound)"
+    else
+      err "run 'gru stop' from a terminal outside the service"
+    fi
     exit 1
   fi
 }
@@ -535,7 +539,7 @@ stop_service() {
     # systemctl stop is a no-op on an inactive unit and ends a crash loop.
     linux) "$SYSTEMCTL_BIN" --user stop gru-command.service ;;
   esac
-  echo "stopped the Gru Command service; it stays down until 'gru start' (a reboot or your next login starts it again)"
+  echo "stopped the Gru Command service; it stays down until gru start, a reboot or your next login"
 }
 
 start_service() {
@@ -593,9 +597,9 @@ sh_single_quote() {
   printf "'%s'" "${1//$quote/$quote\\$quote$quote}"
 }
 
-# The launcher pins what the unit pins: this install's node, its checkout and
-# its instance directory (an explicit GRU_COMMAND_HOME still wins). If the
-# node or checkout is gone it says how to repair, instead of a bare error.
+# The launcher pins this install's node, checkout and instance directory, the
+# three the unit runs with (an explicit GRU_COMMAND_HOME still wins). If the
+# checkout or node is gone it names the repair, instead of a bare error.
 write_launcher() {
   local node cli setup
   node="$(sh_single_quote "$NODE_BIN")"
@@ -603,8 +607,11 @@ write_launcher() {
   setup="$(sh_single_quote "$REPO_ROOT/install.sh")"
   printf '#!/bin/sh\n%s\n' "$LAUNCHER_MARKER"
   printf 'if [ -z "${GRU_COMMAND_HOME:-}" ]; then GRU_COMMAND_HOME=%s; export GRU_COMMAND_HOME; fi\n' "$(sh_single_quote "$INSTANCE_DIR")"
-  printf 'if [ ! -x %s ] || [ ! -f %s ]; then\n' "$node" "$cli"
-  printf '  printf %s %s %s %s >&2\n' "'gru: %s or %s is missing; re-run %s to repair this command\\n'" "$node" "$cli" "$setup"
+  printf 'if [ ! -f %s ]; then\n' "$cli"
+  printf '  printf %s %s >&2\n' "'gru: the Gru Command checkout at %s is gone; reinstall it with the one-line installer\\n'" "$(sh_single_quote "$REPO_ROOT")"
+  printf '  exit 1\nfi\n'
+  printf 'if [ ! -x %s ]; then\n' "$node"
+  printf '  printf %s %s %s >&2\n' "'gru: the Node.js it was installed with (%s) is gone; run %s --update from a shell with Node.js 22.19+\\n'" "$node" "$setup"
   printf '  exit 1\nfi\n'
   printf 'exec %s %s "$@"\n' "$node" "$cli"
 }
@@ -1005,6 +1012,8 @@ case "$MODE" in
       exit 1
     fi
     install_service
+    # The launcher follows the unit to this node and instance.
+    link_cli
     ;;
   setup)
     run_setup

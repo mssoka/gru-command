@@ -1369,6 +1369,8 @@ describe('gru-service reset (#427 PR 2b)', () => {
     expect(at.err.join('\n')).toContain('the service is running: pid 4242 (node) listens on port');
     expect(at.err.join('\n')).toContain('Stop it first with gru stop');
     expect(at.err.join('\n')).toContain('start the service afterwards with gru start');
+    // The raw manager stop stays as a fallback for an install without `gru`.
+    expect(at.err.join('\n')).toContain('systemctl --user stop gru-command on Linux');
     expect(laneTrees(at.app, at.lanesRoot)).toEqual(lanes);
     expect(existsSync(join(at.home, 'reviews'))).toBe(true);
 
