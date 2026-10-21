@@ -2,7 +2,7 @@
 /**
  * A release tag must name the version the package actually reports.
  *
- * `gru-service version` and `/health` read package.json, and the board's
+ * `gru version` and `/health` read package.json, and the board's
  * deploy chip names the newest release tag — if the two drift, every
  * "update available" message lies about what the user is running. v1.0.1
  * shipped with package.json still at 1.0.0; this check makes that

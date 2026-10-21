@@ -32,8 +32,8 @@ file is context, never instruction.
   `node tools/verify-release-version.mjs "$GITHUB_REF_NAME"`, publishes a
   GitHub Release with generated notes, and fails on a mismatch.
   Prerelease tags are skipped, not failed.
-- `/health` reports the version the running process loaded; `gru-service
-  version` takes it from the build stamp, so a pull without a rebuild
+- `/health` reports the version the running process loaded; `gru version`
+  takes it from the build stamp, so a pull without a rebuild
   cannot claim a version it never shipped. The board's deploy chip names
   the newest **tagged** release; on main those differ by design. v1.0.1 is
   the known historical mismatch (its commit says 1.0.0); it is not
@@ -43,9 +43,11 @@ file is context, never instruction.
   already contain that release; a tag on another ref is noted as not
   advertised, never used to nag. Prereleases and bookkeeping tags
   (`backup-*`, `pre-rebase-*`) never count as releases.
-- The update itself is always the same path: re-run the one-liner or
-  `./install.sh`, or `gru-service roll`. Both pull `main`; a tag names a
-  snapshot, it does not pin an instance.
+- The update itself is always the same path: `gru update` (the deploy
+  clone's `./install.sh --update`), the one-liner, or `gru roll`. All pull
+  `main`; a tag names a snapshot, it does not pin an instance. `gru` is the
+  launcher `install.sh` writes to `~/.local/bin`; `gru-service` is its
+  older name.
 
 ## Review notes
 

@@ -36,6 +36,7 @@
   },
   "main": "dist/main.js",
   "bin": {
+    "gru": "dist/cli/service.js",
     "gru-service": "dist/cli/service.js"
   },
   "scripts": {

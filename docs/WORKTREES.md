@@ -849,17 +849,16 @@ same repository without the lane's record in it (a fresh clone, not the moved
 folder): `git worktree repair` cannot reconnect a lane the repository does
 not know. Each check judges such a lane again.
 
-**`gru-service reset`** is the clean fresh start that keeps `config.toml`
+**`gru reset`** is the clean fresh start that keeps `config.toml`
 (deleting `~/.gru-command` by hand also deleted the config and left dangling
 worktree registrations and `gru/*` branches in every managed repository):
 
 ```sh
-gru-service reset [--yes] [--delete-branches] [--delete-refs]
+gru reset [--yes] [--delete-branches] [--delete-refs]
 ```
 
 1. It refuses unless the service is provably stopped, naming how to stop it
-   (`launchctl bootout gui/$(id -u)/com.gru-command.service` on macOS,
-   `systemctl --user stop gru-command` on Linux): something listening on its
+   (`gru stop`): something listening on its
    port, a `/health` that gives any answer but a refused connection (a
    timeout included), or a ledger another process holds open (the service
    keeps no pid file; SQLite's lock on `ledger/ledger.db` is held while it

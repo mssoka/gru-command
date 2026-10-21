@@ -79,7 +79,7 @@ both mean **no managed repositories**. Discovery only supplies installer
 choices; new siblings are never enrolled automatically. To configure an
 existing installation, choose the intended names yourself, edit the live
 `<instance>/config.toml` list without changing unrelated settings, save it,
-and restart Gru Command through the normal service lifecycle. No selection is
+and run `gru restart` to apply it. No selection is
 inferred or written for you, and there is no hot reload. A selected but
 unavailable directory stays selected and is shown as unavailable rather than
 being replaced by another workspace child. Existing jobs and history are not
@@ -117,12 +117,12 @@ example line activates that override.
 # This is the live file read from <instance>/config.toml — and it doubles
 # as the reference: every documented section is present with its default
 # and a one-line purpose comment. Full per-runtime semantics (binding, session flags, effort mapping, resolution order): docs/RUNTIMES.md.
-# Edit values in place, then restart only your Gru Command service.
+# Edit values in place, then apply them with `gru restart`.
 
 # Shared project directory; it may also contain repositories Gru Command does not manage.
 workspace_root = "~/code"
 # Explicit project directory names relative to workspace_root; only these are managed.
-# An empty list manages none. Add names here deliberately, then restart the service.
+# An empty list manages none. Add names here deliberately, then run `gru restart`.
 managed_repos = ["project-a", "project-c"]
 # Root: per-instance state. ~-anchored so a restored config re-anchors to
 # the NEW machine's home — an absolute machine-specific path would

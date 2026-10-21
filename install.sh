@@ -18,7 +18,7 @@
 #                                    case-insensitive). Run from inside the
 #                                    managed service (an agent-owned shell),
 #                                    the restart is delegated to
-#                                    `gru-service roll` — never unload/load:
+#                                    `gru roll --detach` — never unload/load:
 #                                    launchd SIGTERMs the job's whole process
 #                                    group, killing the updater before it can
 #                                    reload the unit (observed 2026-09-23)
@@ -26,11 +26,25 @@
 #   ./install.sh --answers '<json>'  fresh non-interactive setup overrides;
 #                                    secrets are forbidden in answers
 #   ./install.sh --force             allow wizard/config replacement with backup
-#   ./install.sh --service           register + start the OS service only
+#   ./install.sh --service           register + start the OS service (and
+#                                    refresh the `gru` command for it)
 #                                    (the E7 path; also how the wizard
 #                                    registers the service — one mechanism)
 #   ./install.sh --print             render the unit to stdout; change nothing
 #   ./install.sh --uninstall         stop the service and remove the unit
+#                                    (and the `gru` command it installed)
+#   ./install.sh --stop              stop the owned service; it stays down
+#                                    until --start, a reboot or the next login
+#   ./install.sh --start             start the owned service (no-op when
+#                                    it already runs)
+#   ./install.sh --restart           restart the owned service NOW; turns
+#                                    in flight are cut and resumed by boot
+#                                    recovery (`gru restart` drains first)
+#
+# Setup, update and --service also install the `gru` command: a launcher in
+# ~/.local/bin that runs this checkout's CLI from any directory (`gru
+# update`, `gru restart`, `gru status`, ...). A `gru` there that this
+# installer did not write is never replaced.
 #
 # Everything is resolved ABSOLUTELY at install time (repo root, node
 # binary, instance dir) — service managers do not inherit your shell
@@ -39,6 +53,10 @@
 # Test/install seams (also handy for real users):
 #   GRU_COMMAND_ORIGIN   clone URL when piped (default: the GitHub repo)
 #   GRU_COMMAND_TARGET   clone destination    (default: ~/gru-command)
+#   GRU_COMMAND_BIN_DIR  where the `gru` launcher goes (default: ~/.local/bin)
+#   GRU_COMMAND_NODE     the node `gru` runs on, which `gru` hands over: used
+#                        when the shell has no node, or one below 22.19
+#   GRU_COMMAND_LAUNCH_PWD  the directory `gru` was run from (for hints)
 #   GRU_COMMAND_REVIEW_PYTHON  macOS: pinned absolute Python 3 path used by
 #                                    the launchd service for review identity.
 #                                    Setup/update/service require a working
@@ -53,6 +71,8 @@ REPO_ROOT="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
 INSTANCE_DIR="${GRU_COMMAND_HOME:-$HOME/.gru-command}"
 CLONE_ORIGIN="${GRU_COMMAND_ORIGIN:-https://github.com/mssoka/gru-command.git}"
 CLONE_TARGET="${GRU_COMMAND_TARGET:-$HOME/gru-command}"
+BIN_DIR="${GRU_COMMAND_BIN_DIR:-$HOME/.local/bin}"
+LAUNCHER_MARKER="# gru-command launcher (managed by install.sh)"
 MODE="setup"
 ANSWERS=""
 ANSWERS_SET=0
@@ -61,7 +81,7 @@ FORCE=0
 UPDATE_REQUESTED=0
 # The caller's cwd at launch (before build_product cds into the checkout):
 # the post-update recovery hint is read by a human in THAT directory.
-LAUNCH_PWD="$PWD"
+LAUNCH_PWD="${GRU_COMMAND_LAUNCH_PWD:-$PWD}"
 LAUNCHCTL_BIN="${GRU_COMMAND_LAUNCHCTL:-launchctl}"
 SYSTEMCTL_BIN="${GRU_COMMAND_SYSTEMCTL:-systemctl}"
 
@@ -79,6 +99,9 @@ while [[ $# -gt 0 ]]; do
     --print) MODE="print" ; shift ;;
     --uninstall) MODE="uninstall" ; shift ;;
     --service) MODE="service" ; shift ;;
+    --start) MODE="start" ; shift ;;
+    --stop) MODE="stop" ; shift ;;
+    --restart) MODE="restart" ; shift ;;
     --update) UPDATE_REQUESTED=1; shift ;;
     --no-interact) NO_INTERACT=1; shift ;;
     --force) FORCE=1; shift ;;
@@ -88,7 +111,7 @@ while [[ $# -gt 0 ]]; do
     --answers=*)
       ANSWERS="${1#--answers=}"; ANSWERS_SET=1; NO_INTERACT=1; shift ;;
     -h|--help) usage; exit 0 ;;
-    *) err "unknown flag: $1 (valid: --update, --no-interact, --answers <json>, --force, --service, --print, --uninstall, -h|--help)"; exit 2 ;;
+    *) err "unknown flag: $1 (valid: --update, --no-interact, --answers <json>, --force, --service, --start, --stop, --restart, --print, --uninstall, -h|--help)"; exit 2 ;;
   esac
 done
 
@@ -116,23 +139,46 @@ fi
 # Resolve node to its REAL path: version managers (fnm/nvm/asdf) put
 # ephemeral per-shell symlinks on PATH — a service unit pointing at one
 # breaks on the next shell. The resolved install path is stable.
-NODE_BIN="$(command -v node || true)"
-if [[ -n "$NODE_BIN" ]]; then
-  # Resolve the executable symlink too, not just its parent directory:
-  # fnm's per-shell bin can disappear after the installing shell exits.
-  resolved="$("$NODE_BIN" -p 'require("node:fs").realpathSync(process.execPath)' 2>/dev/null || true)"
-  [[ -n "$resolved" && -x "$resolved" ]] && NODE_BIN="$resolved"
-fi
-
-if [[ -z "$NODE_BIN" ]]; then
-  err "node was not found on PATH — install Node.js >= 22.19 first (https://nodejs.org)"
-  exit 1
-fi
-
 node_ok() {
   "$NODE_BIN" -e 'const [M,m]=process.versions.node.split(".").map(Number);
     if (M < 22 || (M === 22 && m < 19)) process.exit(1)' 2>/dev/null
 }
+
+# The shell's node, as running this script yourself would use. `gru` hands
+# over the node it runs on as GRU_COMMAND_NODE (#463): used only when the
+# shell has no node, or one older than the minimum (a non-interactive ssh
+# or cron shell without the version manager loaded).
+select_node_bin() {
+  local resolved
+  NODE_BIN="$(command -v node || true)"
+  BUILD_NODE_DIR=""
+  if [[ -n "$NODE_BIN" ]]; then
+    # Resolve the executable symlink too, not just its parent directory:
+    # fnm's per-shell bin can disappear after the installing shell exits.
+    resolved="$("$NODE_BIN" -p 'require("node:fs").realpathSync(process.execPath)' 2>/dev/null || true)"
+    [[ -n "$resolved" && -x "$resolved" ]] && NODE_BIN="$resolved"
+  fi
+  if [[ "${GRU_COMMAND_NODE:-}" == /* && -x "$GRU_COMMAND_NODE" ]] && { [[ -z "$NODE_BIN" ]] || ! node_ok; }; then
+    NODE_BIN="$GRU_COMMAND_NODE"
+    # npm and the build's own `node` steps resolve through PATH: the build
+    # (and only the build) finds them beside this node — see with_build_path.
+    BUILD_NODE_DIR="${NODE_BIN%/*}"
+  fi
+}
+
+# Run one build command with the chosen node's directory first on PATH when
+# that node was handed over (npm lives beside Node); everything else this
+# script looks up (python3, git, gru) keeps the caller's PATH.
+with_build_path() {
+  local -x PATH="${BUILD_NODE_DIR:+$BUILD_NODE_DIR:}$PATH"
+  "$@"
+}
+select_node_bin
+
+if [[ -z "$NODE_BIN" ]]; then
+  err "node was not found on PATH — install Node.js >= 22.19 first (https://nodejs.org)${GRU_COMMAND_NODE:+ (the node gru handed over, $GRU_COMMAND_NODE, is missing, not executable or not an absolute path)}"
+  exit 1
+fi
 
 detect_os() {
   case "$(uname -s)" in
@@ -464,6 +510,195 @@ uninstall_systemd() {
 }
 
 # ---------------------------------------------------------------------------
+# Service lifecycle for the `gru` command (#463): stop, start and an
+# immediate restart act on the OWNED unit only, never a foreign or absent one.
+# ---------------------------------------------------------------------------
+require_owned_unit() {
+  case "$(service_ownership)" in
+    owned) ;;
+    absent)
+      err "no Gru Command service is installed — register it with: $REPO_ROOT/install.sh --service"
+      exit 1
+      ;;
+    *)
+      err "refusing to touch unrelated service unit: $(service_target)"
+      exit 1
+      ;;
+  esac
+}
+
+# The service manager ends the whole service, this command included, so a
+# stop or immediate restart from an agent-owned shell would die half-way.
+refuse_inside_service() {
+  if inside_managed_service_pgroup; then
+    err "cannot $1 the service from inside it: the service manager would end this command with it"
+    case "$1" in
+      restart) err "use 'gru restart --detach' instead: the service drains in-flight work and relaunches itself (its drain counts this session's own turn, so waiting on it would only wait out the drain bound)" ;;
+      *) err "run 'gru $1' from a terminal outside the service" ;;
+    esac
+    exit 1
+  fi
+}
+
+running_service_pid() {
+  local pid
+  pid="$(managed_service_pid)"
+  [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 0 )) && printf '%s' "$pid"
+}
+
+launchd_job_loaded() {
+  "$LAUNCHCTL_BIN" list 2>/dev/null | awk -v label="$LABEL" '$3 == label { found = 1 } END { exit found ? 0 : 1 }'
+}
+
+stop_service() {
+  require_owned_unit
+  refuse_inside_service stop
+  case "$OS" in
+    darwin)
+      # unload of a job launchd does not hold is an error, not a stop.
+      if ! launchd_job_loaded; then
+        echo "the Gru Command service is already stopped"
+        return 0
+      fi
+      "$LAUNCHCTL_BIN" unload "$(service_target)"
+      ;;
+    # systemctl stop is a no-op on an inactive unit and ends a crash loop.
+    linux) "$SYSTEMCTL_BIN" --user stop gru-command.service ;;
+  esac
+  echo "stopped the Gru Command service; it stays down until gru start, a reboot or your next login"
+}
+
+start_service() {
+  local pid
+  require_owned_unit
+  if pid="$(running_service_pid)"; then
+    echo "the Gru Command service is already running (pid $pid)"
+    return 0
+  fi
+  case "$OS" in
+    darwin)
+      if launchd_job_loaded; then
+        "$LAUNCHCTL_BIN" kickstart "gui/$(id -u)/$LABEL"
+      else
+        "$LAUNCHCTL_BIN" load "$(service_target)"
+      fi
+      ;;
+    linux) "$SYSTEMCTL_BIN" --user start gru-command.service ;;
+  esac
+  echo "started the Gru Command service"
+}
+
+restart_service_now() {
+  require_owned_unit
+  refuse_inside_service restart
+  case "$OS" in
+    darwin)
+      if launchd_job_loaded; then
+        "$LAUNCHCTL_BIN" kickstart -k "gui/$(id -u)/$LABEL"
+      else
+        "$LAUNCHCTL_BIN" load "$(service_target)"
+      fi
+      ;;
+    linux) "$SYSTEMCTL_BIN" --user restart gru-command.service ;;
+  esac
+  echo "restarted the Gru Command service; turns that were in flight resume through boot recovery"
+}
+
+# ---------------------------------------------------------------------------
+# The `gru` command (#463): a launcher, not a symlink — the compiled CLI is
+# not executable, and a terminal's `node` can differ from the service's, so
+# it pins this install's node exactly as the unit does. The marker line is
+# the ownership proof: a `gru` without it is someone else's and is left alone.
+# ---------------------------------------------------------------------------
+launcher_path() {
+  printf '%s/gru' "$BIN_DIR"
+}
+
+is_our_launcher() {
+  [[ -f "$1" && ! -L "$1" ]] && grep -qxF "$LAUNCHER_MARKER" "$1"
+}
+
+sh_single_quote() {
+  local quote="'"
+  printf "'%s'" "${1//$quote/$quote\\$quote$quote}"
+}
+
+# The launcher pins this install's node, checkout and instance directory, the
+# three the unit runs with (an explicit GRU_COMMAND_HOME still wins). If the
+# checkout, its build or the node is gone it names that repair, instead of a
+# bare error; the repair command carries the instance it was installed for.
+write_launcher() {
+  local node cli setup repair
+  node="$(sh_single_quote "$NODE_BIN")"
+  cli="$(sh_single_quote "$REPO_ROOT/dist/cli/service.js")"
+  setup="$(sh_single_quote "$REPO_ROOT/install.sh")"
+  # Each part quoted on its own, so the printed command pastes as one.
+  repair="$(sh_single_quote "GRU_COMMAND_HOME=$(sh_single_quote "$INSTANCE_DIR") $(sh_single_quote "$REPO_ROOT/install.sh") --update")"
+  printf '#!/bin/sh\n%s\n' "$LAUNCHER_MARKER"
+  printf 'if [ -z "${GRU_COMMAND_HOME:-}" ]; then GRU_COMMAND_HOME=%s; export GRU_COMMAND_HOME; fi\n' "$(sh_single_quote "$INSTANCE_DIR")"
+  printf 'if [ ! -f %s ]; then\n' "$setup"
+  printf '  printf %s %s >&2\n' "'gru: the Gru Command checkout at %s is gone; reinstall it with the one-line installer\\n'" "$(sh_single_quote "$REPO_ROOT")"
+  printf '  exit 1\nfi\n'
+  printf 'if [ ! -f %s ]; then\n' "$cli"
+  printf '  printf %s %s >&2\n' "'gru: this install is not built; rebuild it (this also pulls main and restarts the service) with: %s\\n'" "$repair"
+  printf '  exit 1\nfi\n'
+  printf 'if [ ! -x %s ]; then\n' "$node"
+  printf '  printf %s %s %s >&2\n' "'gru: the Node.js it was installed with (%s) is gone; from a shell with a current Node.js run (this also pulls main and restarts the service): %s\\n'" "$node" "$repair"
+  printf '  exit 1\nfi\n'
+  printf 'exec %s %s "$@"\n' "$node" "$cli"
+}
+
+link_cli() {
+  local launcher found staged
+  launcher="$(launcher_path)"
+  if [[ -e "$launcher" || -L "$launcher" ]] && ! is_our_launcher "$launcher"; then
+    err "not installing the 'gru' command: $launcher exists and was not written by this installer"
+    err "rename or remove it, then re-run install.sh to get 'gru'"
+    return 0
+  fi
+  # An executable launcher already saying exactly this (an update, or the
+  # wizard's --service right after setup) is left as it is, quietly.
+  if ! { is_our_launcher "$launcher" && [[ -x "$launcher" ]] && write_launcher | cmp -s - "$launcher"; }; then
+    # Best effort: a launcher that cannot be written never stops the install
+    # or update around it (the service reconciliation still has to run).
+    if ! mkdir -p "$BIN_DIR" 2>/dev/null || ! staged="$(mktemp "$BIN_DIR/.gru.XXXXXX" 2>/dev/null)"; then
+      err "could not install the 'gru' command in $BIN_DIR; continuing without it"
+      return 0
+    fi
+    if ! write_launcher > "$staged" || ! chmod 755 "$staged" || ! mv -f "$staged" "$launcher"; then
+      rm -f "$staged"
+      err "could not install the 'gru' command at $launcher; continuing without it"
+      return 0
+    fi
+    echo "installed the 'gru' command: $launcher"
+    case ":$PATH:" in
+      *":$BIN_DIR:"*) ;;
+      *)
+        echo "note: $BIN_DIR is not on your PATH; add this line to your shell profile:"
+        echo "  export PATH=\"$BIN_DIR:\$PATH\""
+        ;;
+    esac
+  fi
+  # Another `gru` the shell would run instead of ours, whenever it appeared
+  # (ahead of ours, or found while ours is off PATH), is reported.
+  found="$(command -v gru 2>/dev/null || true)"
+  if [[ -n "$found" && ! "$found" -ef "$launcher" ]]; then
+    err "your shell runs another 'gru': $found — run $launcher, or put $BIN_DIR earlier in PATH"
+  fi
+}
+
+unlink_cli() {
+  local launcher
+  launcher="$(launcher_path)"
+  if is_our_launcher "$launcher"; then
+    rm -f "$launcher"
+    echo "removed the 'gru' command: $launcher"
+  elif [[ -e "$launcher" || -L "$launcher" ]]; then
+    echo "left $launcher in place: this installer did not write it"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Full setup (E9): the one-line-install pipeline. When this script runs
 # from a download/pipe (no checkout around it), clone first and re-exec
 # inside the clone; inside a checkout, deps+build if needed, then wizard.
@@ -535,15 +770,15 @@ build_product() {
     # Reproducible and non-mutating: `npm install` can rewrite a stale root
     # package version in package-lock.json, making the managed checkout
     # dirty and causing the next safe update to refuse itself.
-    npm ci --no-audit --no-fund
+    with_build_path npm ci --no-audit --no-fund
   else
-    npm install --no-audit --no-fund
+    with_build_path npm install --no-audit --no-fund
   fi
   echo "building service and local CLIs…"
-  npm run build
+  with_build_path npm run build
   if "$NODE_BIN" -e "const p=require('./package.json'); process.exit(p.scripts?.['build:web'] ? 0 : 1)"; then
     echo "building web UI…"
-    npm run build:web
+    with_build_path npm run build:web
   fi
   for artifact in dist/main.js dist/wizard/main.js dist/cli/config-generate.js dist/runtime/review-mcp-server.mjs resources/perkins-code-review/policy.json tools/verify-perkins-resource.mjs; do
     if [[ ! -f "$artifact" ]]; then
@@ -620,8 +855,9 @@ prompt_register_service() {
 # the service's own roll path: preflight already ran here, the roll drains,
 # writes the swap marker, exits 75 (restart-worthy for launchd KeepAlive
 # {SuccessfulExit=false} and systemd Restart=on-failure), and the
-# relaunched build verifies itself; the CLI waits for /health to report
-# the target build SHA and only then exits 0.
+# relaunched build verifies itself. The CLI detaches once preflight passes
+# (#463): the relaunch ends this shell with the service, before any
+# verification.
 restart_owned_service_in_service() {
   local cli="$REPO_ROOT/dist/cli/service.js"
   if [[ ! -f "$cli" ]]; then
@@ -629,8 +865,16 @@ restart_owned_service_in_service() {
     err "a successful build produces it; run this update from a terminal instead"
     exit 1
   fi
-  echo "update is running inside the managed service — delegating the restart to 'gru-service roll'…"
-  "$NODE_BIN" "$cli" roll
+  # --detach: follow the roll through preflight (a refused roll fails this
+  # update, loud), then return. This shell is a child of the service, so the
+  # relaunch ends it before it could verify anything, and waiting would only
+  # sit out the drain, which counts this session's own turn.
+  echo "update is running inside the managed service — delegating the restart to 'gru roll --detach'…"
+  if ! "$NODE_BIN" "$cli" roll --detach; then
+    err "the service refused the roll: the new build is on disk but the service still runs the old one — see the roll's error above, then run gru update again"
+    exit 1
+  fi
+  echo "the service relaunches itself once its drain settles, unless the roll fails later; check it with gru status and gru logs"
 }
 
 # Restart an OWNED installed unit (the owned arm of the updater).
@@ -726,6 +970,7 @@ run_setup() {
   fi
 
   build_product
+  link_cli
 
   # A configured instance is an update, never a request to regenerate user
   # settings.
@@ -796,7 +1041,11 @@ case "$MODE" in
       darwin) uninstall_launchd ;;
       *) uninstall_systemd ;;
     esac
+    unlink_cli
     ;;
+  start) start_service ;;
+  stop) stop_service ;;
+  restart) restart_service_now ;;
   service)
     if ! node_ok; then
       err "node >= 22.19 required, found $("$NODE_BIN" --version) — upgrade Node.js first"
@@ -809,6 +1058,8 @@ case "$MODE" in
       exit 1
     fi
     install_service
+    # The launcher follows the unit to this node and instance.
+    link_cli
     ;;
   setup)
     run_setup

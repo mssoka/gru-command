@@ -2549,6 +2549,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/chat/wake-policy.js",
   "dist/cli/bmad-runtime.js",
   "dist/cli/config-generate.js",
+  "dist/cli/operator.js",
   "dist/cli/property-check.js",
   "dist/cli/property-report.js",
   "dist/cli/report-jobs-backfill.js",

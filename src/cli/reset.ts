@@ -12,7 +12,7 @@ import { resolveManagedRepoPathSync } from '../repos/managed-names.js';
 import { dialHost } from './service.js';
 
 /**
- * `gru-service reset` (#427 PR 2b): a clean fresh start that keeps the
+ * `gru reset` (#427 PR 2b): a clean fresh start that keeps the
  * config. Deleting `~/.gru-command` by hand also deleted `config.toml` and
  * left dangling worktree registrations and `gru/*` branches in every
  * managed repository. In order, reset:
@@ -76,7 +76,7 @@ export const RESET_KEEPS: readonly string[] = [
   'logs/launchd.err.log',
 ];
 
-const USAGE = `usage: gru-service reset [--yes] [--delete-branches] [--delete-refs]
+const USAGE = `usage: gru reset [--yes] [--delete-branches] [--delete-refs]
 
   reset   stop-the-world fresh start that keeps config.toml: removes every GC
           lane from the repository that registers it (git worktree remove
@@ -198,14 +198,14 @@ interface PlanContext {
 }
 
 const STOP_HINT =
-  'Stop it first: launchctl bootout gui/$(id -u)/com.gru-command.service (macOS) or systemctl --user stop gru-command (Linux), ' +
-  'or end the npm start it runs in; then run gru-service reset again, and start the service afterwards with ./install.sh --service.';
+  'Stop it first with gru stop (or launchctl bootout gui/$(id -u)/com.gru-command.service on macOS, systemctl --user stop gru-command on Linux, ' +
+  'or end the npm start it runs in), then run gru reset again, and start the service afterwards with gru start.';
 
 export async function runResetCli(argv: readonly string[], overrides: Partial<ResetCliDeps> = {}): Promise<number> {
   const deps: ResetCliDeps = { ...defaultDeps(), ...overrides };
   const parsed = parseResetArgs(argv);
   if (!parsed.ok) {
-    if (parsed.error !== '') deps.stderr(`gru-service reset: ${parsed.error}`);
+    if (parsed.error !== '') deps.stderr(`gru reset: ${parsed.error}`);
     deps.stderr(USAGE.trimEnd());
     return parsed.error === '' ? 0 : 2;
   }
@@ -214,7 +214,7 @@ export async function runResetCli(argv: readonly string[], overrides: Partial<Re
   try {
     config = deps.loadConfig();
   } catch (error) {
-    deps.stderr(`gru-service reset: cannot load instance config: ${String((error as Error).message)}`);
+    deps.stderr(`gru reset: cannot load instance config: ${String((error as Error).message)}`);
     return 1;
   }
 
@@ -225,24 +225,24 @@ export async function runResetCli(argv: readonly string[], overrides: Partial<Re
   try {
     realData = existsSync(config.dataDir) ? realpathSync.native(config.dataDir) : null;
   } catch (error) {
-    deps.stderr(`gru-service reset: refused: the data directory ${config.dataDir} cannot be resolved: ${String((error as Error).message)}`);
+    deps.stderr(`gru reset: refused: the data directory ${config.dataDir} cannot be resolved: ${String((error as Error).message)}`);
     return 1;
   }
   const refusal = dataDirRefusal(config, realData, deps);
   if (refusal !== null) {
-    deps.stderr(`gru-service reset: refused: ${refusal}`);
+    deps.stderr(`gru reset: refused: ${refusal}`);
     return 1;
   }
 
   // 1. Never while the service may run.
   const running = await serviceRunning(config, deps);
   if (running !== null) {
-    deps.stderr(`gru-service reset: refused: ${running}. ${STOP_HINT}`);
+    deps.stderr(`gru reset: refused: ${running}. ${STOP_HINT}`);
     return 1;
   }
   const first = await lockLedger(realData);
   if (first.kind === 'held') {
-    deps.stderr(`gru-service reset: refused: ${first.detail}. ${STOP_HINT}`);
+    deps.stderr(`gru reset: refused: ${first.detail}. ${STOP_HINT}`);
     return 1;
   }
   let registry: readonly RegistryLane[] = [];
@@ -272,7 +272,7 @@ export async function runResetCli(argv: readonly string[], overrides: Partial<Re
     try {
       repos.push(planRepo(name, resolved.path, ctx, options));
     } catch (error) {
-      deps.stderr(`gru-service reset: refused: ${name} (${resolved.path}) cannot be read: ${String((error as Error).message)}`);
+      deps.stderr(`gru reset: refused: ${name} (${resolved.path}) cannot be read: ${String((error as Error).message)}`);
       return 1;
     }
   }
@@ -283,7 +283,7 @@ export async function runResetCli(argv: readonly string[], overrides: Partial<Re
   // 3. Only with --yes or a confirmation.
   if (!options.yes) {
     if (deps.confirm === null) {
-      deps.stderr('gru-service reset: no terminal to confirm at; nothing changed. Pass --yes to reset.');
+      deps.stderr('gru reset: no terminal to confirm at; nothing changed. Pass --yes to reset.');
       return 1;
     }
     if (!(await deps.confirm('Proceed? [y/N] '))) {
@@ -296,7 +296,7 @@ export async function runResetCli(argv: readonly string[], overrides: Partial<Re
   // starting service's ledger refuses to open.
   const own = await lockReset(realData);
   if (own.kind === 'held') {
-    deps.stderr(`gru-service reset: refused: ${own.detail} (nothing changed)`);
+    deps.stderr(`gru reset: refused: ${own.detail} (nothing changed)`);
     return 1;
   }
   try {
@@ -304,12 +304,12 @@ export async function runResetCli(argv: readonly string[], overrides: Partial<Re
     // started while reset waited. The ledger's lock is held until reset ends.
     const again = await serviceRunning(config, deps);
     if (again !== null) {
-      deps.stderr(`gru-service reset: refused: ${again} (checked again before changing anything; nothing changed). ${STOP_HINT}`);
+      deps.stderr(`gru reset: refused: ${again} (checked again before changing anything; nothing changed). ${STOP_HINT}`);
       return 1;
     }
     const lock = await lockLedger(realData);
     if (lock.kind === 'held') {
-      deps.stderr(`gru-service reset: refused: ${lock.detail} (checked again before changing anything; nothing changed). ${STOP_HINT}`);
+      deps.stderr(`gru reset: refused: ${lock.detail} (checked again before changing anything; nothing changed). ${STOP_HINT}`);
       return 1;
     }
     try {
@@ -349,8 +349,8 @@ async function lockReset(realData: string | null): Promise<{ readonly kind: 'hel
     return {
       kind: 'held',
       detail: code === SQLITE_BUSY || code === SQLITE_LOCKED
-        ? `another gru-service reset holds ${file}`
-        : `reset's lock file ${file} cannot be locked (${(error as Error).message}); if no other gru-service reset runs, delete it and run reset again`,
+        ? `another gru reset holds ${file}`
+        : `reset's lock file ${file} cannot be locked (${(error as Error).message}); if no other gru reset runs, delete it and run reset again`,
     };
   }
   const held = db;
@@ -369,7 +369,7 @@ function carryOut(
         deps.stdout(`removed lane folder ${lane.path} (${lane.repo} does not register it)`);
       } catch (error) {
         failed.push(lane.path);
-        deps.stderr(`gru-service reset: lane folder ${lane.path} could not be deleted: ${String((error as Error).message)}`);
+        deps.stderr(`gru reset: lane folder ${lane.path} could not be deleted: ${String((error as Error).message)}`);
       }
       return;
     }
@@ -377,19 +377,19 @@ function carryOut(
     if (removed.status === 0) deps.stdout(`removed lane ${lane.path} from ${lane.repo}`);
     else {
       failed.push(lane.path);
-      deps.stderr(`gru-service reset: lane ${lane.path} could not be removed from ${lane.repo}: ${removed.stderr.trim()}`);
+      deps.stderr(`gru reset: lane ${lane.path} could not be removed from ${lane.repo}: ${removed.stderr.trim()}`);
     }
   };
   for (const repo of repos) for (const lane of repo.lanes) removeLane(lane);
   for (const lane of others.lanes) removeLane(lane);
   for (const { path, reason } of others.left) {
     failed.push(path);
-    deps.stderr(`gru-service reset: lane ${path} was not removed: ${reason}`);
+    deps.stderr(`gru reset: lane ${path} was not removed: ${reason}`);
   }
   for (const repo of repos) {
     if (repo.userPrunable.length === 0) {
       const pruned = git(['-C', repo.path, 'worktree', 'prune']);
-      if (pruned.status !== 0) deps.stderr(`gru-service reset: git worktree prune failed in ${repo.name}: ${pruned.stderr.trim()}`);
+      if (pruned.status !== 0) deps.stderr(`gru reset: git worktree prune failed in ${repo.name}: ${pruned.stderr.trim()}`);
     } else {
       deps.stdout(`skipped git worktree prune in ${repo.name}: it would also drop your own worktree(s) whose folder is missing: ${repo.userPrunable.join(', ')}`);
     }
@@ -397,16 +397,16 @@ function carryOut(
       // `git branch -D` refuses a branch checked out anywhere, a lane included.
       const deleted = git(['-C', repo.path, 'branch', '-D', branch]);
       if (deleted.status === 0) deps.stdout(`deleted branch ${branch} in ${repo.name}`);
-      else deps.stderr(`gru-service reset: branch ${branch} in ${repo.name} was kept: ${deleted.stderr.trim()}`);
+      else deps.stderr(`gru reset: branch ${branch} in ${repo.name} was kept: ${deleted.stderr.trim()}`);
     }
     for (const ref of repo.refs) {
       const deleted = git(['-C', repo.path, 'update-ref', '-d', ref]);
       if (deleted.status === 0) deps.stdout(`deleted ref ${ref} in ${repo.name}`);
-      else deps.stderr(`gru-service reset: ref ${ref} in ${repo.name} was kept: ${deleted.stderr.trim()}`);
+      else deps.stderr(`gru reset: ref ${ref} in ${repo.name} was kept: ${deleted.stderr.trim()}`);
     }
   }
   if (failed.length > 0) {
-    deps.stderr(`gru-service reset: ${String(failed.length)} lane(s) were not removed (${failed.join(', ')}), so the data directory ${config.dataDir} was left as it was; fix what held them and run reset again.`);
+    deps.stderr(`gru reset: ${String(failed.length)} lane(s) were not removed (${failed.join(', ')}), so the data directory ${config.dataDir} was left as it was; fix what held them and run reset again.`);
     return 1;
   }
   if (realData === null) {
@@ -422,7 +422,7 @@ function carryOut(
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
       incomplete = true;
-      deps.stderr(`gru-service reset: ${full} could not be deleted: ${String((error as Error).message)}`);
+      deps.stderr(`gru reset: ${full} could not be deleted: ${String((error as Error).message)}`);
     }
   }
   if (incomplete) return 1;
@@ -494,7 +494,7 @@ async function lockLedger(realData: string | null): Promise<LedgerProbe> {
   if (realData === null) return { kind: 'absent' };
   const file = join(realData, LEDGER_DIR, 'ledger.db');
   if (!existsSync(file)) return { kind: 'absent' };
-  // Loaded only here: `gru-service roll` never touches the ledger.
+  // Loaded only here: `gru roll` never touches the ledger.
   const { DatabaseSync } = await import('node:sqlite');
   let db: InstanceType<typeof DatabaseSync> | null = null;
   try {
@@ -903,7 +903,7 @@ function printPlan(
   deps: ResetCliDeps, config: GruCommandConfig, options: ResetOptions, repos: readonly RepoPlan[], others: OtherLanes, ctx: PlanContext,
   data: { readonly remove: readonly string[]; readonly keep: readonly string[] },
 ): void {
-  deps.stdout('gru-service reset will:');
+  deps.stdout('gru reset will:');
   for (const repo of repos) {
     deps.stdout(`  in ${repo.name} (${repo.path}):`);
     deps.stdout(repo.lanes.length === 0 ? '    remove no lane (none is registered)' : `    remove ${String(repo.lanes.length)} GC lane(s) (git worktree remove --force --force): ${repo.lanes.map((lane) => lane.path).join(', ')}`);

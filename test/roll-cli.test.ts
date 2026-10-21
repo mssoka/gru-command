@@ -17,7 +17,7 @@ import type { RollState } from '../src/roll/state.js';
 import { VERSION } from '../src/version.js';
 
 /**
- * `gru-service roll`: argument contract, service URL resolution, and the
+ * `gru roll` / `gru restart`: argument contract, service URL resolution, and the
  * follow loop — accepted → phase transitions → done → /health build-sha
  * verification. Exit 0 means the relaunched service really reports the
  * target build; every ambiguity (refused, failed, unreachable, unverified
@@ -74,10 +74,12 @@ function jsonResponse(status: number, body: unknown): Response {
 }
 
 interface CliHarness {
-  readonly deps: ServiceCliDeps;
+  readonly deps: Partial<ServiceCliDeps>;
   readonly stdout: string[];
   readonly stderr: string[];
   readonly requests: string[];
+  /** POST bodies, in order. */
+  readonly bodies: unknown[];
   readonly clock: { now: number };
 }
 
@@ -91,11 +93,13 @@ async function harness(script: {
   const stdout: string[] = [];
   const stderr: string[] = [];
   const requests: string[] = [];
+  const bodies: unknown[] = [];
   const clock = { now: 1_000_000 };
   let pollIndex = 0;
-  const fetchFn: typeof fetch = async (input) => {
+  const fetchFn: typeof fetch = async (input, init) => {
     const url = String(input);
     requests.push(url);
+    if (typeof init?.body === 'string') bodies.push(JSON.parse(init.body));
     if (url.endsWith('/api/roll') && requests.filter((r) => r.endsWith('/api/roll')).length === 1) {
       if (script.post === 'unreachable') throw new Error('connect ECONNREFUSED');
       return script.post.clone();
@@ -122,15 +126,16 @@ async function harness(script: {
     stdout,
     stderr,
     requests,
+    bodies,
     clock,
   };
 }
 
-describe('gru-service roll argument contract', () => {
+describe('gru roll argument contract', () => {
   it('rejects a missing command and unknown commands with usage', () => {
     const missing = parseServiceArgs([]);
     expect(missing.ok).toBe(false);
-    const unknown = parseServiceArgs(['restart']);
+    const unknown = parseServiceArgs(['reload']);
     expect(unknown.ok).toBe(false);
     if (!unknown.ok) expect(unknown.error).toContain('unknown command');
   });
@@ -142,6 +147,7 @@ describe('gru-service roll argument contract', () => {
       expect(parsed.options).toEqual({
         action: 'roll',
         wait: false,
+        detach: false,
         json: true,
         reason: 'config edit',
         timeoutMs: 5_000,
@@ -166,7 +172,7 @@ describe('gru-service roll argument contract', () => {
   });
 });
 
-describe('gru-service roll target resolution', () => {
+describe('gru roll target resolution', () => {
   it('dials loopback for wildcard binds and brackets IPv6 hosts', () => {
     expect(dialHost('0.0.0.0')).toBe('127.0.0.1');
     expect(dialHost('127.0.0.1')).toBe('127.0.0.1');
@@ -181,7 +187,49 @@ describe('gru-service roll target resolution', () => {
   });
 });
 
-describe('gru-service roll follow loop', () => {
+describe('gru roll follow loop', () => {
+  it('gru restart (#463) is the same follow in restart mode: the body asks for no pull or build', async () => {
+    const restartState = (phase: RollState['phase']): RollState => ({ ...rollState(phase), mode: 'restart', fromSha: 'b'.repeat(40) });
+    const h = await harness({
+      post: jsonResponse(202, { status: 'accepted', roll: restartState('preflight') }),
+      polls: [jsonResponse(200, { roll: restartState('drain') }), jsonResponse(200, { roll: restartState('done') })],
+      health: jsonResponse(200, { build: { rev: 'b'.repeat(40) } }),
+    });
+    const code = await runServiceCli(['restart', '--reason', 'config edit'], h.deps);
+    expect(code).toBe(0);
+    expect(h.bodies).toEqual([{ requested_by: 'gru-service-cli', reason: 'config edit', mode: 'restart' }]);
+    expect(h.stdout.join('\n')).toContain('preflight: checking the installed build (restart: no pull, no build)');
+    expect(h.stdout.join('\n')).toContain(`restarted on build ${'b'.repeat(40)} (verified on /health)`);
+    const parsed = parseServiceArgs(['restart', '--no-wait', '--json']);
+    expect(parsed.ok && parsed.options.action).toBe('restart');
+  });
+
+  it('a restart that cannot reach or authenticate names gru start and the config-edit case', async () => {
+    const down = await harness({ post: 'unreachable' });
+    expect(await runServiceCli(['restart'], down.deps)).toBe(1);
+    expect(down.stderr.join('\n')).toContain('start it with gru start');
+    expect(down.stderr.join('\n')).toContain('apply the edit with gru restart --now');
+    for (const [command, status] of [['restart', 401], ['restart', 404], ['restart', 503], ['restart', 500], ['roll', 401]] as const) {
+      const rejected = await harness({ post: jsonResponse(status, { error: 'refused' }) });
+      expect(await runServiceCli([command], rejected.deps)).toBe(1);
+      expect(rejected.stderr.join('\n')).toContain('apply the edit with gru restart --now, from a terminal outside the service');
+    }
+    // Our own validation error is not the config talking; a foreign 400 may be.
+    const invalid = await harness({ post: jsonResponse(400, { error: 'bad_request', detail: 'mode must be "update" or "restart"' }) });
+    expect(await runServiceCli(['restart'], invalid.deps)).toBe(1);
+    expect(invalid.stderr.join('\n')).not.toContain('gru restart --now');
+    const foreign = await harness({ post: jsonResponse(400, { message: 'not this API' }) });
+    expect(await runServiceCli(['restart'], foreign.deps)).toBe(1);
+    expect(foreign.stderr.join('\n')).toContain('gru restart --now');
+  });
+
+  it('gru restart refuses, non-zero, while another roll is in progress — it never attaches to it', async () => {
+    const h = await harness({ post: jsonResponse(409, { error: 'roll_in_progress', roll: rollState('drain') }) });
+    expect(await runServiceCli(['restart'], h.deps)).toBe(1);
+    expect(h.stderr.join('\n')).toContain('a roll is already in progress (update, drain)');
+    expect(h.requests.filter((url) => url.endsWith('/api/roll'))).toHaveLength(1);
+  });
+
   it('exits 0 only after /health reports the target build sha', async () => {
     const h = await harness({
       post: jsonResponse(202, { status: 'accepted', roll: rollState('preflight') }),
@@ -196,6 +244,8 @@ describe('gru-service roll follow loop', () => {
     expect(code).toBe(0);
     expect(h.stdout.join('\n')).toContain(`rolled ${'a'.repeat(40)} → ${'b'.repeat(40)} (verified on /health)`);
     expect(h.stderr).toEqual([]);
+    // An update roll's body is unchanged: no mode.
+    expect(h.bodies).toEqual([{ requested_by: 'gru-service-cli' }]);
   });
 
   it('--no-wait returns right after the 202 acceptance', async () => {
@@ -234,6 +284,48 @@ describe('gru-service roll follow loop', () => {
     const code = await runServiceCli(['roll'], h.deps);
     expect(code).toBe(1);
     expect(h.stderr.join('\n')).toContain('service unreachable');
+    // An edited [server]/[auth] is one reason it cannot be reached.
+    expect(h.stderr.join('\n')).toContain('apply the edit with gru restart --now, from a terminal outside the service');
+  });
+
+  it('--detach (#463) follows through preflight, then returns once the roll drains; a refused preflight still fails', async () => {
+    const h = await harness({
+      post: jsonResponse(202, { status: 'accepted', roll: rollState('preflight') }),
+      polls: [jsonResponse(200, { roll: rollState('preflight') }), jsonResponse(200, { roll: rollState('drain') })],
+    });
+    expect(await runServiceCli(['roll', '--detach'], h.deps)).toBe(0);
+    expect(h.stdout.join('\n')).toContain('roll roll-cli-1 passed preflight; the service relaunches once its drain settles, unless the roll fails later');
+    expect(h.requests.some((url) => url.endsWith('/health'))).toBe(false);
+    const failed = { ...rollState('failed'), error: { phase: 'preflight' as const, detail: 'refusing to roll a dirty deploy clone' } };
+    const refused = await harness({
+      post: jsonResponse(202, { status: 'accepted', roll: rollState('preflight') }),
+      polls: [jsonResponse(200, { roll: failed })],
+    });
+    expect(await runServiceCli(['restart', '--detach'], refused.deps)).toBe(1);
+    expect(refused.stdout.join('\n')).toContain('refusing to roll a dirty deploy clone');
+    expect(parseServiceArgs(['roll', '--detach', '--no-wait']).ok).toBe(false);
+  });
+
+  it('--detach answers only for its own roll, says so on a deadline, and emits a detached JSON event', async () => {
+    const replaced = await harness({
+      post: jsonResponse(202, { status: 'accepted', roll: rollState('preflight') }),
+      polls: [jsonResponse(200, { roll: { ...rollState('drain'), rollId: 'someone-elses-roll' } })],
+    });
+    expect(await runServiceCli(['roll', '--detach'], replaced.deps)).toBe(1);
+    expect(replaced.stderr.join('\n')).toContain('roll roll-cli-1 was replaced by roll someone-elses-roll before it passed preflight');
+    const slow = await harness({
+      post: jsonResponse(202, { status: 'accepted', roll: rollState('preflight') }),
+      polls: [jsonResponse(200, { roll: rollState('preflight') })],
+    });
+    expect(await runServiceCli(['roll', '--detach', '--timeout-ms', '5000'], slow.deps)).toBe(1);
+    expect(slow.stderr.join('\n')).toContain('is still in preflight after 5000 ms; it continues on the service');
+    expect(slow.stderr.join('\n')).not.toContain('bail:');
+    const json = await harness({
+      post: jsonResponse(202, { status: 'accepted', roll: rollState('preflight') }),
+      polls: [jsonResponse(200, { roll: rollState('drain') })],
+    });
+    expect(await runServiceCli(['roll', '--detach', '--json'], json.deps)).toBe(0);
+    expect(JSON.parse(json.stdout.at(-1)!)).toMatchObject({ event: 'detached', roll: { phase: 'drain', rollId: 'roll-cli-1' } });
   });
 
   it('a done record whose /health sha never matches times out non-zero with the bail hint', async () => {
@@ -246,6 +338,8 @@ describe('gru-service roll follow loop', () => {
     expect(code).toBe(1);
     expect(h.stderr.join('\n')).toContain('does not report the target build');
     expect(h.stderr.join('\n')).toContain('bail:');
+    expect(h.stderr.join('\n')).toContain('gru restart --now; or launchctl kickstart -k');
+    expect(h.stderr.join('\n')).toContain('systemctl --user restart gru-command on Linux');
   });
 
   it('REFUSES a foreign listener answering /health even when the build sha matches (pid evidence, not a 200)', async () => {
@@ -287,7 +381,7 @@ describe('gru-service roll follow loop', () => {
   });
 });
 
-describe('gru-service version — the installed build identity, offline', () => {
+describe('gru version — the installed build identity, offline', () => {
   const INFO: VersionInfo = {
     service: 'gru-command',
     version: '1.0.1',
@@ -341,7 +435,7 @@ describe('gru-service version — the installed build identity, offline', () => 
 
     stderr.length = 0;
     expect(runVersionCli(['--help'], deps)).toBe(0);
-    expect(stderr.join('\n')).toContain('gru-service version');
+    expect(stderr.join('\n')).toContain('usage: gru version');
   });
 
   it('reports the version stamped at build time, not a newer checkout package', async () => {

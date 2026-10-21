@@ -9,7 +9,7 @@
  * second name, possibly outside the audited tree, and the check cannot tell
  * a benign link from an alias. esbuild's own postinstall hard-links its
  * platform binary over `esbuild/bin/esbuild` on macOS/Linux, and every
- * `npm ci` (install.sh --update, gru-service roll) re-creates that link, so
+ * `npm ci` (install.sh --update, gru roll) re-creates that link, so
  * the strict check never passed on a real install: owner incident
  * 2026-10-07, "review runtime file must be bounded, regular and
  * single-linked". The check stays strict; the install conforms to it.

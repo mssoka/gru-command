@@ -224,7 +224,7 @@ newest stable `vX.Y.Z` reachable from `origin/main` (a tag on another ref
 is never advertised — pulling main could not deliver it). A build older
 than that release reads the tag with an `UPDATE AVAILABLE` flag and that
 state wins over the commit count; otherwise a build behind main reads
-`N behind` with a `RESTART PENDING` flag. `gru-service version` prints
+`N behind` with a `RESTART PENDING` flag. `gru version` prints
 the version stamped into the build plus its SHA, offline. Generate a
 fresh complete config separately with:
 
@@ -283,14 +283,31 @@ workflow selection. [docs/BMAD-RUNTIME.md](docs/BMAD-RUNTIME.md) covers:
 
 ```bash
 npm start               # serve the web UI + /health on the configured bind
-./install.sh --service  # register + start as a login OS service
+./install.sh --service  # register + start as a login OS service (and refresh gru)
 ./install.sh --uninstall
-gru-service roll        # graceful self-roll: pull + rebuild + relaunch + verify
-gru-service version     # installed version + build SHA (offline; --json)
-gru-service reset       # with the service stopped: remove GC's lanes, empty the data dir, keep config.toml
 ```
 
-`gru-service reset` is the clean fresh start. Stop the service first; reset
+Install and update also put a `gru` command in `~/.local/bin` (the
+installer says when that directory is not on your PATH). It runs this
+checkout's CLI from any directory:
+
+```bash
+gru update              # pull main, rebuild, restart (./install.sh --update, from anywhere)
+gru restart             # apply config.toml edits: drain in-flight turns, relaunch the installed build
+gru restart --now       # restart at once; boot recovery resumes the turns it cut
+gru stop                # stop the service (down until gru start, a reboot or your next login)
+gru start               # start it again
+gru status              # running build, installed build, how far behind main
+gru logs -f             # follow the service log
+gru version             # installed version + build SHA (offline; --json)
+gru reset               # with the service stopped: remove GC's lanes, empty the data dir, keep config.toml
+gru roll [--detach]     # the self-roll; inside the service use --detach (gru update does)
+```
+
+`gru-service` is the same command under its older name. A `gru` already in
+`~/.local/bin` that the installer did not write is left alone.
+
+`gru reset` is the clean fresh start. Stop the service first (`gru stop`); reset
 lists what it will do and asks (or pass `--yes`). It removes every GC lane
 from the repository that registers it (`git worktree remove --force
 --force`, then `git worktree prune`) and deletes the data directory's

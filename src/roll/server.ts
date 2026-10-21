@@ -3,7 +3,7 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import { RollBusyError, type RollController } from './controller.js';
-import type { RollState } from './state.js';
+import type { RollMode, RollState } from './state.js';
 
 /** What the roll server needs from the controller (fake-able in tests). */
 export type RollControllerPort = Pick<RollController, 'isBusy' | 'state' | 'roll'>;
@@ -12,7 +12,7 @@ export type RollControllerPort = Pick<RollController, 'isBusy' | 'state' | 'roll
  * Roll HTTP surface (graceful self-roll): operator-guarded, same pairing
  * token and constant-time comparison as every other write surface.
  *
- *   POST /api/roll   { reason?, requested_by?, force_build? } → 202
+ *   POST /api/roll   { reason?, requested_by?, force_build?, mode? } → 202
  *                    { status: 'accepted', roll } — the roll runs in the
  *                    background; 409 while one is already in progress.
  *   GET  /api/roll   → 200 { roll } — the live record (null before the
@@ -85,6 +85,13 @@ function optStr(body: Record<string, unknown>, field: string): string | undefine
   return typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined;
 }
 
+function optMode(body: Record<string, unknown>): RollMode | undefined {
+  const value = body['mode'];
+  if (value === undefined) return undefined;
+  if (value !== 'update' && value !== 'restart') throw new Error('mode must be "update" or "restart"');
+  return value;
+}
+
 function optBool(body: Record<string, unknown>, field: string): boolean | undefined {
   const value = body[field];
   if (value === undefined) return undefined;
@@ -141,6 +148,10 @@ export function createRollServer(options: {
           const reason = optStr(body, 'reason');
           const requestedBy = optStr(body, 'requested_by');
           const forceBuild = optBool(body, 'force_build');
+          const mode = optMode(body);
+          if (mode === 'restart' && forceBuild !== undefined) {
+            throw new Error('force_build applies to an update; a restart never builds');
+          }
           if (options.controller.isBusy()) {
             json(res, 409, { error: 'roll_in_progress', roll: options.controller.state() });
             return;
@@ -149,6 +160,7 @@ export function createRollServer(options: {
             ...(reason !== undefined ? { reason } : {}),
             ...(requestedBy !== undefined ? { requestedBy } : {}),
             ...(forceBuild !== undefined ? { forceBuild } : {}),
+            ...(mode !== undefined ? { mode } : {}),
           });
           // The controller sets the preflight record synchronously before
           // its first await; the 202 carries it so followers start aligned.
