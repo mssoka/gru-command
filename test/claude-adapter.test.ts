@@ -2878,21 +2878,28 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       const fx = fixture();
       const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
       const inherited = process.env['CLAUDE_CODE_DISABLE_BACKGROUND_TASKS'];
-      delete process.env['CLAUDE_CODE_DISABLE_BACKGROUND_TASKS'];
+      // An environment that turns background tasks back on.
+      process.env['CLAUDE_CODE_DISABLE_BACKGROUND_TASKS'] = '0';
       try {
         await handle.prompt('answer plainly');
         await handle.prompt('answer plainly too', { directive: { identity: identityFor('claude-no-background'), beforeAdmission: () => {}, onAdmitted: () => {} } });
-        // Only the directive turn's CLI gets the switch; an ordinary turn keeps the CLI's own default.
-        expect(doubleInvocations(fx).map((record) => record.backgroundTasks)).toEqual([null, '1']);
-        // A CLI that offers a background task anyway gets no effect from it.
-        process.env['CLAUDE_DOUBLE_TOOL_BACKGROUND'] = '1';
-        const identity = identityFor('claude-background-refused');
-        await expect(handle.prompt('tool:Bash run it', { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } }))
-          .rejects.toThrow(/directive refused: a directive turn cannot start a background task/u);
-        expect(readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf-8')).toContain('"state":"guard-refused"');
+        // Only the directive turn's own settings carry the switch, and they outrank the
+        // environment; an ordinary turn keeps whatever the CLI inherits.
+        expect(doubleInvocations(fx).map((record) => record.backgroundTasks)).toEqual(['0', '1']);
+        // A CLI that offers a background task anyway gets no effect from it, as a
+        // boolean or as the string the CLI also reads as true.
+        for (const [mode, requestId] of [['1', 'claude-background-refused'], ['string', 'claude-background-string']] as const) {
+          process.env['CLAUDE_DOUBLE_TOOL_BACKGROUND'] = mode;
+          const identity = identityFor(requestId);
+          await expect(handle.prompt('tool:Bash run it', { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } }), mode)
+            .rejects.toThrow(/directive refused: a directive turn cannot start a background task/u);
+          expect(handle.inspectDirective!(identity), mode).toMatchObject({ state: 'unknown' });
+        }
+        expect(readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf-8').match(/"state":"guard-refused"/gu)).toHaveLength(2);
         expect(allowed(handle.sessionFile!)).toBe(false);
       } finally {
-        if (inherited !== undefined) process.env['CLAUDE_CODE_DISABLE_BACKGROUND_TASKS'] = inherited;
+        if (inherited === undefined) delete process.env['CLAUDE_CODE_DISABLE_BACKGROUND_TASKS'];
+        else process.env['CLAUDE_CODE_DISABLE_BACKGROUND_TASKS'] = inherited;
         await handle.dispose();
       }
     });

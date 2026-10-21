@@ -562,16 +562,17 @@ type ClaudeFrame = Record<string, unknown>;
 
 /** The CLI's own background-task completion (#471). Under
  * --replay-user-messages Claude Code replays it as an `isReplay` user frame
- * that it tags `origin.kind: 'task-notification'`, with one
- * `<task-notification>` block as its content. It is a runtime event, not a
- * prompt: it never admits a directive and never counts as another prompt in
- * its turn. Any other replayed user frame still does. */
+ * that it tags `origin.kind: 'task-notification'`, its content a string that
+ * is exactly one `<task-notification>` block (Claude Code 2.1.306, recorded
+ * in test/fixtures/claude-stream/task-notifications.jsonl). It is a runtime
+ * event, not a prompt: it never admits a directive and never counts as
+ * another prompt in its turn. Any other replayed user frame still does. */
 export function isClaudeTaskNotification(frame: ClaudeFrame, sessionId: string): boolean {
   const origin = frame['origin'];
   const content = (frame['message'] as { content?: unknown } | undefined)?.content;
   return frame['type'] === 'user' && frame['isReplay'] === true && frame['session_id'] === sessionId && frame['parent_tool_use_id'] == null &&
     typeof origin === 'object' && origin !== null && (origin as Record<string, unknown>)['kind'] === 'task-notification' &&
-    typeof content === 'string' && /^<task-notification>[\s\S]*<\/task-notification>$/u.test(content.trim());
+    typeof content === 'string' && /^<task-notification>(?:(?!<\/?task-notification>)[\s\S])*<\/task-notification>$/u.test(content.trim());
 }
 
 /** The bound turn after its exact recorded prefix, frame by frame and read

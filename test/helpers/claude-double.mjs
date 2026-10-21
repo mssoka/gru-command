@@ -64,7 +64,8 @@
  *                               re-stamped), e.g. test/fixtures/claude-stream/
  *   CLAUDE_DOUBLE_ECHO=mutate|skip  the prompt echo carries other text, or never comes
  *   CLAUDE_DOUBLE_TOOL_INPUT_DRIFT=1 the permission request names other input than the tool_use
- *   CLAUDE_DOUBLE_TOOL_BACKGROUND=1  the tool_use asks for run_in_background
+ *   CLAUDE_DOUBLE_TOOL_BACKGROUND=1|string  the tool_use asks for run_in_background
+ *                               (true, or the string "true" the real CLI coerces)
  *   CLAUDE_DOUBLE_TASK_NOTIFICATION=after-echo|before-echo|before-echo-tool|foreign
  *                               a background task's notification replay right
  *                               after the echo; two before it (a resumed
@@ -72,6 +73,8 @@
  *                               then a tool that asks the host before the echo;
  *                               or, after the echo, a replayed prompt that is
  *                               no notification
+ * The invocation record's `backgroundTasks` is CLAUDE_CODE_DISABLE_BACKGROUND_TASKS
+ * as the real CLI resolves it: the --settings env over the process environment.
  */
 import process from 'node:process';
 import { Buffer } from 'node:buffer';
@@ -165,12 +168,20 @@ function promptFromStdin() {
   return { prompt, images };
 }
 
+/** CLAUDE_CODE_DISABLE_BACKGROUND_TASKS as the CLI resolves it (#471): the
+ * --settings env outranks the inherited environment. */
+function resolvedBackgroundSwitch() {
+  const settingsFile = flagValue('--settings');
+  const settings = settingsFile ? JSON.parse(readFileSync(settingsFile, 'utf8')) : {};
+  return settings.env?.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS ?? process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS ?? null;
+}
+
 function recordInvocation(prompt, images) {
   const logFile = process.env['CLAUDE_DOUBLE_LOG'];
   if (!logFile) return;
   appendFileSync(
     logFile,
-    `${JSON.stringify({ argv, cwd: process.cwd(), prompt, images, sessionId, stdin: stdinText, backgroundTasks: process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS ?? null })}\n`,
+    `${JSON.stringify({ argv, cwd: process.cwd(), prompt, images, sessionId, stdin: stdinText, backgroundTasks: resolvedBackgroundSwitch() })}\n`,
     'utf8',
   );
 }
@@ -293,7 +304,8 @@ async function emitToolTurn(toolName, toolError = false) {
     });
     streamEvent({ type: 'content_block_stop', index: 0 });
   }
-  const input = process.env.CLAUDE_DOUBLE_TOOL_BACKGROUND === '1' ? { command: 'ls', run_in_background: true } : { command: 'ls' };
+  const background = { '1': true, string: 'true' }[process.env.CLAUDE_DOUBLE_TOOL_BACKGROUND ?? ''];
+  const input = background === undefined ? { command: 'ls' } : { command: 'ls', run_in_background: background };
   // The COMPLETE assistant frame still arrives — the adapter must not
   // double-announce this tool call.
   out(
@@ -462,6 +474,8 @@ async function run() {
   } else {
     out(initFrame());
     const notified = process.env.CLAUDE_DOUBLE_TASK_NOTIFICATION;
+    // Hypothetical orderings: CLI 2.1.306 was not seen replaying a dead turn's
+    // notifications on --resume (its resumed turn echoed nothing at all, #472).
     if (notified === 'before-echo') { taskNotification('bgdouble1'); taskNotification('bgdouble2'); }
     if (notified === 'before-echo-tool') {
       taskNotification('bgdouble1');

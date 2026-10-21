@@ -83,7 +83,7 @@ import {
   type DirectiveProducer,
   type DirectiveTurnIdentity,
 } from './directive-checkpoint.js';
-import { CLAUDE_DIRECTIVE_ENV, ClaudeDirectivePermissionChannel, privateClaudeDirectiveSettings, type ClaudeToolDecision, type ClaudeToolRequest } from './claude-directive.js';
+import { ClaudeDirectivePermissionChannel, privateClaudeDirectiveSettings, type ClaudeToolDecision, type ClaudeToolRequest } from './claude-directive.js';
 import { resolveGitCommit } from '../dispatch/perkins-review/artifacts.js';
 import { CLAUDE_NATIVE_PROVIDER } from '../provider-recovery/classify.js';
 
@@ -1962,8 +1962,10 @@ export class ClaudeCodeHandle implements AgentHandle {
       if (turn.failure !== null || turn.admitted === null) {
         throw new DirectiveCheckpointError('native directive actual admission has not been published; tool effects refused');
       }
-      // Background tasks are off in a directive turn (#471); a CLI that offers one anyway is refused by name.
-      if (request.input['run_in_background'] === true) {
+      // Background tasks are off in a directive turn (#471); a CLI that offers one anyway is refused by
+      // name. Anything but absent or false: the CLI also reads the string "true" as true.
+      const background = request.input['run_in_background'];
+      if (background !== undefined && background !== false) {
         throw new DirectiveCheckpointError('a directive turn cannot start a background task: its completion would outlive the turn');
       }
       turn.directive.beforeAdmission();
@@ -2167,11 +2169,10 @@ export class ClaudeCodeHandle implements AgentHandle {
         // The CLI child is an independent physical controller of the turn:
         // only its observed close (at this handle's cessation) proves it gone.
         if (turn !== null) recordDirectiveIndependentController(turn.producer);
-        const env = turn === null ? params.reviewAuthEnv : { ...(params.reviewAuthEnv ?? process.env), ...CLAUDE_DIRECTIVE_ENV };
         child = (params.spawnProcess ?? spawn)(params.binary, args, {
           cwd: params.cwd,
           stdio: ['pipe', 'pipe', 'pipe'],
-          ...(env !== undefined ? { env } : {}),
+          ...(params.reviewAuthEnv !== undefined ? { env: params.reviewAuthEnv } : {}),
         });
       } catch (error) {
         // Synchronous spawn faults (async ENOENT arrives via 'error').

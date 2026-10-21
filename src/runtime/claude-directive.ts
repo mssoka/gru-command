@@ -13,20 +13,23 @@ import { isVerificationProducer, workerVerificationRefusal, type WorkerVerificat
  * is durably in the transcript and the directive's authority still holds.
  */
 
-/** Private settings for one directive turn: every listed tool asks the host.
- * A worker-verification lane keeps its Bash hook (the explanation). */
+/** A directive turn's CLI environment (#471): no background tasks. The CLI
+ * waits for a running task after the turn's result and then answers its
+ * completion in an unprompted turn of its own, after the directive is over
+ * and with no host left to decide its tools. It rides in the turn's own
+ * `--settings`, which a lane's or the operator's settings `env` cannot
+ * override (the process environment can be). */
+export const CLAUDE_DIRECTIVE_ENV: Readonly<Record<string, string>> = { CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1' };
+
+/** Private settings for one directive turn: every listed tool asks the host,
+ * and background tasks are off. A worker-verification lane keeps its Bash
+ * hook (the explanation). */
 export function privateClaudeDirectiveSettings(tools: readonly string[], verification?: WorkerVerificationPolicy): {
   readonly file: string;
   dispose(): void;
 } {
-  return privateClaudeAskSettings(tools, verification, 'gru-directive-');
+  return privateClaudeAskSettings(tools, verification, 'gru-directive-', CLAUDE_DIRECTIVE_ENV);
 }
-
-/** A directive turn's CLI environment (#471): no background tasks. The CLI
- * waits for a running task after the turn's result and then answers its
- * completion in an unprompted turn of its own, after the directive is over
- * and with no host left to decide its tools. */
-export const CLAUDE_DIRECTIVE_ENV: Readonly<Record<string, string>> = { CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1' };
 
 export interface ClaudeToolRequest {
   readonly toolUseId: string;
