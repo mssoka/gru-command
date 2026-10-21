@@ -21,6 +21,7 @@ import { SessionStore } from '../src/sessions/store.js';
 import { createWorkflowSessionBinder, ownedFallbackReviewResources, registeredWorkflowLane, serviceWorkflowAuthority } from '../src/workflows/session.js';
 import { loadBundledWorkflowRuntime, renderWorkflow, writeWorkflowManifest } from '../src/workflows/runtime.js';
 import { makeWorkflowLane } from './helpers/workflow-lane.js';
+import { NO_REVIEW_OWNER_LEDGER } from './helpers/no-review-owner-ledger.js';
 
 const repoRoot = join(import.meta.dirname, '..');
 const roots: string[] = [];
@@ -49,7 +50,7 @@ function host(runtimeId: RuntimeId, f: ReturnType<typeof fixture>, authority?: P
     override runtimeIdFor(): RuntimeId { return runtimeId; }
     override runtimeFor(): AgentRuntime { return adapter; }
   }
-  const registry = new HostRegistry(serviceRegistryOptions({ config, store: new SessionStore(f.dataDir),
+  const registry = new HostRegistry(serviceRegistryOptions({ reviewOwnerCessation: NO_REVIEW_OWNER_LEDGER, config, store: new SessionStore(f.dataDir),
     ...(verificationConfigFile !== undefined ? { verificationConfigFile } : {}),
     ...(authority ?? { workflowLaneFor: () => f.lane }) }));
   return { seen, registry };
@@ -454,7 +455,7 @@ describe('registered scheduled verification policy transport', () => {
   });
   it('review-1 production registry binder carries loaded instance config independently of relocated data', () => {
     const f = verificationLane(); roots.push(f.root);
-    const options = serviceRegistryOptions({ config: f.config, store: new SessionStore(f.dataDir),
+    const options = serviceRegistryOptions({ reviewOwnerCessation: NO_REVIEW_OWNER_LEDGER, config: f.config, store: new SessionStore(f.dataDir),
       verificationConfigFile: configPathFor(f.config.instanceDir), workflowLaneFor: () => f.lane, workflowBuildFor: () => false });
     const session = options.workflowRuntime!({ agentId: 'original-worker' });
     expect(session.workerVerification!.configFile).toBe(f.session.workerVerification!.configFile);

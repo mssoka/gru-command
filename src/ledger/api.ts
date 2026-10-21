@@ -1377,6 +1377,14 @@ export class LedgerApi {
         this.uniqueRoundReviewOwnerMarker(marker.roundId)?.seq !== marker.seq) {
         throw new Error(`review-owner cessation (${input.source}) for generation ${input.generation} binds no unique round owner marker; nothing recorded`);
       }
+      // Recorded once: a concurrent proof (or a late repeat) returns the record.
+      const existing = (this.db.prepare('SELECT * FROM events WHERE round_id = ? AND kind = ? ORDER BY seq ASC')
+        .all(marker.roundId, REVIEW_OWNER_CEASED_KIND) as Row[]).map((row) => this.eventFromRow(row)).find((event) => {
+        const record = event.payload as Record<string, unknown> | null;
+        return record !== null && typeof record === 'object' && record['source'] === input.source && record['generation'] === input.generation &&
+          (input.source === 'adapter' ? record['agentId'] === input.agentId : record['pid'] === input.pid);
+      });
+      if (existing !== undefined) return existing;
       return this.appendEvent({
         kind: REVIEW_OWNER_CEASED_KIND, jobId: marker.jobId, roundId: marker.roundId,
         agentId: input.source === 'adapter' ? input.agentId : null,

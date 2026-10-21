@@ -368,6 +368,7 @@ describe('installed Perkins runtime identity', () => {
         options: {
           ledger, worktrees: port, spawner, reviewArtifactRoot: artifacts,
           reconcileReviewAgent: async () => true,
+          proveReviewHostExit: async () => ({ ok: false as const, problem: 'this fixture proves no dead host' }),
           reviewPreflight: async () => ({ ok: true as const, failures: [],
             reviewModel: { role: 'perkins' as const, modelRef: 'stub/stable-model', settings: {},
               authEnv: {}, routingSha256: 'stable-offline-endpoint' }, reviewThinkingLevel: 'high' }),

@@ -187,12 +187,13 @@ function processCwds(): Map<number, string> | null {
  * its cwd is the tree (Perkins r1 B3: argv-only enumeration removed
  * trees under live agents). */
 export function psEnumerator(treePath: string): readonly TreeProcess[] {
-  return treeProcesses(treePath, execFileSyncGuard('ps', ['-axo', 'pid=,command=']), processCwds());
+  return treeProcesses(treePath, listedProcesses(execFileSyncGuard('ps', ['-axo', 'pid=,command='])), processCwds());
 }
 
 /** The processes a `ps -axo pid=,command=` listing and the per-process
  * cwds tie to a tree (by argv path boundary, or by cwd). */
-function treeProcesses(treePath: string, out: string, cwds: Map<number, string> | null): readonly TreeProcess[] {
+function treeProcesses(treePath: string, listed: readonly { readonly pid: number; readonly command: string }[],
+  cwds: Map<number, string> | null): readonly TreeProcess[] {
   // Compare against BOTH the registered path and its realpath: the OS
   // reports resolved paths (/var → /private/var) while argv keeps the
   // spelling the spawner used.
@@ -203,7 +204,7 @@ function treeProcesses(treePath: string, out: string, cwds: Map<number, string> 
     /* the sweep's own guards handle a missing tree */
   }
   const processes: TreeProcess[] = [];
-  for (const { pid, command } of listedProcesses(out)) {
+  for (const { pid, command } of listed) {
     // Registry paths only: every match names the registered tree itself.
     if ([...candidates].some((candidate) => commandReferencesTree(command, candidate))) {
       processes.push({ pid, command, evidence: 'argv' });
@@ -332,9 +333,10 @@ export async function processTableAsync(opts: ProcessListingOptions): Promise<Pr
   if (cwds.status === 'rejected') opts.onCwdError(cwds.reason);
   const out = listed.value;
   const cwdMap = cwds.status === 'fulfilled' ? cwds.value : null;
+  const processes = listedProcesses(out);
   return {
-    rootedIn: (treePath) => treeProcesses(treePath, out, cwdMap),
-    naming: (token) => listedProcesses(out).filter((entry) => entry.command.includes(token))
+    rootedIn: (treePath) => treeProcesses(treePath, processes, cwdMap),
+    naming: (token) => processes.filter((entry) => entry.command.includes(token))
       .map((entry) => ({ ...entry, evidence: 'argv' as const })),
     cwdsListed: cwdMap !== null,
   };

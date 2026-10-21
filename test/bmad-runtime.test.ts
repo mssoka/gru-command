@@ -38,6 +38,7 @@ import { RuntimeRegistry, serviceRegistryOptions } from '../src/runtime/registry
 import { loadBundledWorkflowRuntime } from '../src/workflows/runtime.js';
 import type { AgentHandle, AgentRuntime, ManagedSkillSet, SpawnOptions } from '../src/runtime/types.js';
 import type { SessionStore } from '../src/sessions/store.js';
+import { NO_REVIEW_OWNER_LEDGER } from './helpers/no-review-owner-ledger.js';
 
 /**
  * The GC-managed BMAD runtime (issue #283): a pinned upstream bundle plus
@@ -546,7 +547,7 @@ describe('job binding', () => {
     // The options main.ts builds its registry from bind a minion's lane under the data dir.
     const home = tempDir('gru-command-bmad-service-');
     const config = loadConfig({ GRU_COMMAND_HOME: home });
-    const options = serviceRegistryOptions({ config, store: {} as SessionStore,
+    const options = serviceRegistryOptions({ config, store: {} as SessionStore, reviewOwnerCessation: NO_REVIEW_OWNER_LEDGER,
       workflowLaneFor: () => serviceRecord,
     });
     const seen: Array<ManagedSkillSet | undefined> = [];

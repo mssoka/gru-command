@@ -72,7 +72,7 @@ that proves it on each adapter.
 | `dispose-releases-lock` | Dispose stops the turn and releases the session lock | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts` |
 | `cessation-proven` | Adapter-owned proof (pi: a confirmed idle; Claude: the original child's close) makes disposal `ceased` | `test/runtime-cessation-evidence.test.ts` | `test/runtime-claude-cessation-ownership.test.ts` |
 | `cessation-unproven-holds-permit` | Without that proof, evidence stays `unknown` and the resident permit is held as debt | `test/runtime-positive-cessation-ownership.test.ts` | `test/runtime-claude-cessation-ownership.test.ts` |
-| `review-owner-durable-cessation` | A review session's `ceased` evidence is recorded in the ledger against its round's owner marker (#464), so a restarted service still accepts it and the round's replacement is admitted | `test/pi-adapter.test.ts` | `test/review-owner-cessation.test.ts` |
+| `review-owner-durable-cessation` | A review session's `ceased` evidence is recorded in the ledger against its round's owner marker (#464), so a restarted registry still accepts that owner as ceased, even when the host pid looks alive | `test/pi-adapter.test.ts` | `test/review-owner-cessation.test.ts` |
 | `scheduled-verification` | The #315 guard refuses a scheduled-verification producer before it runs | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts` |
 | `spawn-cwd` | A session is rooted at the explicit project cwd, never the workspace root | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts` |
 | `blind-transcript-reader` | The blind-access reader pairs each read result with the file its call named, read from each runtime's real persisted record shape | `test/blind-review.test.ts` | `test/blind-review.test.ts` |
@@ -200,18 +200,25 @@ writes each runtime's own record shape during a resumed turn.
     tools run inside that host;
   - Claude Code never accepts PID death alone, because its CLI child can
     outlive the host. It needs the **dead-host proof** instead:
-    - the marker's host pid is dead;
+    - the marker's host is gone. Its pid is dead, or the pid now belongs to
+      a process that started after the marker was written (a reused pid), or
+      this service restarted under the same pid;
     - no live process is rooted (argv or cwd) in the round's review
       worktree;
     - no live process names one of the round's session ids, registered or
-      found as a session file in the round's session directory;
-    - no session lock of the round is held by a live pid.
+      found as a session file in the round's session directory. Every
+      session registers before its first turn, and a Claude CLI runs only
+      during a turn with its session id in argv;
+    - no session lock of the round is held by a live pid. A lock the gone
+      host itself left is free, whatever hostname it recorded.
 
-  Any of this evidence that cannot be read refuses (an unlisted process
-  table, unknown working directories, an unreadable lock). A passing proof is
-  recorded once as `round.review-owner-ceased` (source `host-exit`, with the
-  evidence it checked), so it is never re-decided. A refusal names what is
-  still alive, and every later review request re-checks it
+  Evidence that cannot be read refuses: the process table, or the working
+  directories as a listing, cannot be read; an unreadable session directory;
+  an unreadable lock. A passing proof is recorded once as
+  `round.review-owner-ceased` (source `host-exit`, with the evidence it
+  checked), so it is never re-decided. A refusal names what is still alive or
+  what to clear, for example a lock file to remove once no process holds it.
+  Every later review request re-checks
   (`test/review-owner-cessation.test.ts`).
 
 ## Rollout of the default change

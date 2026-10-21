@@ -79,10 +79,11 @@ describe('prune-stale-dist', () => {
     // transaction (dist/worktrees/creation-intent.js); #446 the
     // default-branch CI alert (dist/repos/default-branch-ci.js); #455 the job
     // execution stop that proves (or refuses to claim) producer cessation
-    // (dist/dispatch/job-stop.js).
-    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5221);
+    // (dist/dispatch/job-stop.js); #464 the review-owner dead-host proof
+    // (dist/runtime/review-host-exit.js).
+    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5222);
     expect(createHash('sha256').update(`${[...PUBLIC_REVIEW_EXECUTABLE_PATHS].sort().join('\n')}\n`).digest('hex'))
-      .toBe('40b15f489869e6fc05229011ae7ffa899ce25e3e8b0dcd852ce69fe46cad4587');
+      .toBe('17c65ea06c01cfb94994bca8bb738c0455179ecc08ff2769831cc9e9c4715451');
     const root = fixtureRoot();
     touch(root, 'src/worktrees/handoff.ts'); touch(root, 'dist/worktrees/handoff.js');
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', dependencies: {} }));

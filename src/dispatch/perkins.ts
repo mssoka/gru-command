@@ -2678,7 +2678,8 @@ export class WaveRunner {
       sessions: agents.map((agent) => ({ agentId: agent.id, sessionFile: agent.sessionFile })),
     });
     if (!proof.ok) return { ids: left, detail: ` (dead-host proof refused: ${proof.problem})` };
-    return { ids: await unproven(), detail: '' };
+    const still = await unproven();
+    return { ids: still, detail: still.length === 0 ? '' : ' (the dead-host proof is recorded, but the runtime does not accept it)' };
   }
 
   /** True when a MATERIAL amendment was accepted after `seq`: anything
@@ -3635,7 +3636,7 @@ export class WaveRunner {
       !validReviewOwnerGeneration(payload['generation'])) return null;
     return {
       roundId: round.id, runtimeId: payload['runtimeId'], pid: payload['pid'] as number,
-      generation: payload['generation'],
+      generation: payload['generation'], recordedAt: event.ts,
     };
   }
 
@@ -5547,9 +5548,10 @@ export class WaveRunner {
         // once its evidence does (the named process exits).
         const unproven = await this.unprovenReviewOwners(oldRound, marker, agents);
         if (unproven.ids.length > 0) {
+          const more = unproven.ids.length > 1 ? ` (and ${String(unproven.ids.length - 1)} more session(s))` : '';
           throw new Error(agents.length === 0
-            ? `review owner marker from round ${oldRound.id} may still run before agent registration; reconcile runtime cessation before replacement${unproven.detail}`
-            : `review owner ${unproven.ids[0]!} from round ${oldRound.id} may still run; reconcile runtime cessation before starting a replacement writer${unproven.detail}`);
+            ? `review owner marker from round ${oldRound.id} may still run before agent registration; a replacement starts only once its cessation is proven${unproven.detail}`
+            : `review owner ${unproven.ids[0]!}${more} from round ${oldRound.id} may still run; a replacement writer starts only once its cessation is proven${unproven.detail}`);
         }
       }
     }
@@ -5842,13 +5844,16 @@ export class WaveRunner {
             ? 'review setup withdrawn: an approved material change or the lane writer superseded this candidate'
             : 'review setup interrupted by service shutdown; frozen proof is incomplete';
           this.opts.ledger.abortReviewSetupWithoutSpawn(round.id);
-          const artifacts = this.writeInterruptedArtifacts(round.id, superseded ? 'superseded' : 'service_shutdown_setup', note);
+          // Only shutdown or supersession aborts a setup: a shutdown's cut is
+          // the restart's clean abort, re-armed after boot (#464).
+          const reason = superseded ? 'superseded' : 'service_restart';
+          const artifacts = this.writeInterruptedArtifacts(round.id, reason, note);
           this.opts.ledger.appendCustomEvent({
             kind: 'round.perkins-incomplete',
             jobId: job.id,
             roundId: round.id,
             payload: {
-              reason: superseded ? 'superseded' : 'service_shutdown_setup',
+              reason,
               artifactDirectory: artifacts.directory,
               reportFile: artifacts.reportFile,
             },
@@ -6245,6 +6250,14 @@ export class WaveRunner {
           kind: 'round.residency-cancelled', jobId: job.id, roundId: round.id,
           payload: { error: String(error) },
         });
+        // A shutdown that cut the wait for resident slots is the restart's
+        // clean abort too, re-armed after boot (#464).
+        if (this.shuttingDown && !(signal.reason instanceof ReviewSupersededError)) {
+          this.opts.ledger.appendCustomEvent({
+            kind: 'round.perkins-incomplete', jobId: job.id, roundId: round.id,
+            payload: { reason: 'service_restart', error: String(error).slice(0, 500) },
+          });
+        }
       }
       throw error;
     } finally {
@@ -7283,7 +7296,7 @@ export class WaveRunner {
         : {}),
     };
     } catch (error) {
-      return this.finalizationIncomplete(job, round, lenses, frozenReview, error, provisional);
+      return this.finalizationIncomplete(job, round, lenses, frozenReview, error, provisional, signal.aborted && this.shuttingDown);
     }
   }
 
@@ -7345,6 +7358,9 @@ export class WaveRunner {
     frozenReview: FrozenReview,
     error: unknown,
     provisional?: LensAccounting,
+    /** A graceful service shutdown cut the round (#464): the restart's
+     * clean abort, re-armed after boot. */
+    shutdownCut = false,
   ): WaveOutcome {
     const detail = `Perkins finalization failed: ${String(error)}`.replace(/[\r\n]+/gu, ' ').slice(0, 500);
     // R7-1: a DURABLY COMMITTED verdict outranks any later failure — a
@@ -7451,7 +7467,7 @@ export class WaveRunner {
         kind: 'round.perkins-incomplete',
         jobId: job.id,
         roundId: round.id,
-        payload: { reason: 'finalization_error', error: detail, reportFile, executionFacts },
+        payload: { reason: shutdownCut ? 'service_restart' : 'finalization_error', error: detail, reportFile, executionFacts },
       });
     } catch (ledgerError) {
       this.log('error', 'could not persist finalization INCOMPLETE event', {

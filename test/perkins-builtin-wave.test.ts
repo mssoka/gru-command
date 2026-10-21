@@ -887,6 +887,8 @@ describe('WaveRunner built-in Perkins production path', () => {
     await pending.catch(() => {});
     expect(ledger2.getRound(waiting!.id)?.status).toBe('aborted');
     expect(ledger2.latestRoundEvent(waiting!.id, 'round.residency-cancelled')).not.toBeNull();
+    // #464: the shutdown's cut is the restart's clean abort, re-armed after boot.
+    expect(ledger2.latestRoundEvent(waiting!.id, 'round.perkins-incomplete')?.payload).toMatchObject({ reason: 'service_restart' });
     expect(ledger2.uniqueRoundNoSpawnReceipt(waiting!.id)).not.toBeNull();
     expect(spawner).not.toHaveBeenCalled();
   });
@@ -986,7 +988,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(await observedBeginning).toBeInstanceOf(Error);
     expect(ledger.getRound(round.id)?.status).toBe('aborted');
     expect(ledger.latestRoundEvent(round.id, 'round.perkins-incomplete')?.payload).toMatchObject({
-      reason: 'service_shutdown_setup',
+      reason: 'service_restart',
     });
     expect(readFileSync(join(artifacts, round.id, 'perkins-report.md'), 'utf8')).toContain('INCOMPLETE');
     expect(port.getWorktree(round.id)?.status).toBe('swept');
@@ -2962,7 +2964,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     await expect(new WaveRunner({
       ledger, worktrees: port, spawner: makeSpawner(secondSessions, []),
       reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/prior-continuity'),
-    }).runRound({ jobId: job.id })).rejects.toThrow(/may still run; reconcile runtime cessation/);
+    }).runRound({ jobId: job.id })).rejects.toThrow(/may still run; a replacement writer starts only once its cessation is proven/);
     expect(ledger.listRounds(job.id)).toHaveLength(roundCount);
 
     let thirdAuditSeen = false;
@@ -3709,7 +3711,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(fixture.ledger.uniqueRoundReviewOwnerMarker(first.round.id)).toBeNull();
     const replacement = fixture.fake({ childAnswer: () => '[]', specialists: [] });
     await expect(fixture.wave('fixture-model-v1', replacement.spawner).runRound({ jobId: fixture.jobId }))
-      .rejects.toThrow(/may still run; reconcile runtime cessation/);
+      .rejects.toThrow(/may still run; a replacement writer starts only once its cessation is proven/);
     expect(replacement.leadCalls).toHaveLength(0);
     expect(fixture.ledger.listRounds(fixture.jobId)).toHaveLength(1);
   }, 180_000);

@@ -20,7 +20,10 @@ import { disposePhases, type DisposableTarget } from './disposal.js';
 import { publishSpawnRegistration } from './spawn-registration.js';
 import { notifyDisposalSettlement } from './disposal-observation.js';
 import { processTableAsync, type ProcessTable } from '../worktrees/manager.js';
-import { pidState, proveReviewHostExit, type ReviewHostExitEvidence, type ReviewHostExitInput, type ReviewHostExitResult } from './review-host-exit.js';
+import {
+  hostedByThisProcess, pidStartedAt, pidState, proveReviewHostExit,
+  type ReviewHostExitEvidence, type ReviewHostExitInput, type ReviewHostExitResult,
+} from './review-host-exit.js';
 
 export { WorkerDisposalInProgressError };
 
@@ -83,6 +86,10 @@ export interface ReviewOwnerMarker {
   readonly runtimeId: string;
   readonly pid: number;
   readonly generation: string;
+  /** When the marker was written (its ledger event's time): a pid that now
+   * names a process started later, or this process restarted under it, is
+   * not the marker's host (#464). */
+  readonly recordedAt?: string;
 }
 
 function validReviewOwnerMarker(marker: ReviewOwnerMarker | null): marker is ReviewOwnerMarker {
@@ -133,7 +140,8 @@ export interface RuntimeRegistryOptions {
   /** Review-reservation close settle window (default 30s, named
    * CLOSE_SETTLE_MS). Expiration fails closed and retains capacity. */
   readonly closeSettleMs?: number;
-  /** OS probe override for deterministic death/live/unknown tests only. */
+  /** OS probe override for deterministic death/live/unknown tests only; the
+   * dead-host proof also asks it about session-lock holders. */
   readonly ownerProcessProbe?: (pid: number) => 'dead' | 'alive' | 'unknown';
   /** Durable review-owner cessation (#464); without it a restart keeps no
    * cessation proof and no dead-host proof can be recorded. */
@@ -162,7 +170,10 @@ export interface RuntimeRegistryOptions {
 /** New jobs use GC-owned resources; retained historical bindings keep their bytes.
  * The caller supplies ledger/registry authority, never a directory-name guess. */
 export function serviceRegistryOptions(
-  base: Pick<RuntimeRegistryOptions, 'config' | 'store' | 'log' | 'reviewOwnerCessation'> & {
+  base: Pick<RuntimeRegistryOptions, 'config' | 'store' | 'log'> & {
+    /** Required (#464): a service registry without it loses review-owner
+     * cessation on every restart. */
+    readonly reviewOwnerCessation: ReviewOwnerCessationLedger;
     readonly config: { readonly dataDir: string };
     readonly workflowLaneFor: (options: SpawnOptions) => WorktreeLane | null;
     readonly workflowBuildFor?: (lane: WorktreeLane) => boolean;
@@ -275,20 +286,21 @@ export class RuntimeRegistry {
   async proveReviewHostExit(input: ReviewHostExitInput): Promise<ReviewHostExitResult> {
     const { marker } = input;
     if (!validReviewOwnerMarker(marker)) return { ok: false, problem: 'its owner marker is malformed' };
-    if (marker.pid === process.pid) {
+    if (hostedByThisProcess(marker)) {
       return { ok: false, problem: 'its host is this process, so only its own adapter evidence proves cessation' };
     }
     const ledger = this.opts.reviewOwnerCessation;
     if (ledger === undefined) return { ok: false, problem: 'no durable cessation record is wired to keep a dead-host proof' };
-    const probe = this.opts.ownerProcessProbe ?? pidState;
     const result = await proveReviewHostExit(input, {
-      pidState: probe,
+      pidState: this.opts.ownerProcessProbe ?? pidState,
+      pidStartedAt,
       processTable: this.opts.processTable ?? (() => processTableAsync({
         onCwdError: (error) => this.log('warn', 'dead-host proof could not list process working directories', { error: String(error) }),
       })),
       // Review owners are Perkins sessions rooted at the review worktree.
       sessionDir: (cwd) => this.opts.store.sessionDirFor('perkins', cwd),
       lockFileFor: (sessionFile) => this.opts.store.lockFileFor(sessionFile),
+      heldHere: (sessionFile) => this.opts.store.isHeld(sessionFile),
     });
     if (!result.ok) return result;
     try {
@@ -297,7 +309,8 @@ export class RuntimeRegistry {
       return { ok: false, problem: `the dead-host proof passed but could not be recorded (${String(error)})` };
     }
     this.log('info', 'review owner proven gone by dead-host proof', {
-      round: marker.roundId, pid: marker.pid, runtime: marker.runtimeId, sessions: result.evidence.sessionIds.length,
+      round: marker.roundId, pid: marker.pid, runtime: marker.runtimeId, host: result.evidence.host,
+      sessions: result.evidence.sessionIds.length,
     });
     return result;
   }

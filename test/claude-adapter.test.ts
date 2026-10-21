@@ -26,6 +26,7 @@ import { deterministicFailureClass } from '../src/decisions/questions.js';
 import { classifyProviderRejection, providerSupportsSensor } from '../src/provider-recovery/classify.js';
 import { RuntimeRegistry, serviceRegistryOptions } from '../src/runtime/registry.js';
 import { makeWorkflowLane } from './helpers/workflow-lane.js';
+import { NO_REVIEW_OWNER_LEDGER } from './helpers/no-review-owner-ledger.js';
 import { makeFallbackRuntimeHarness } from './helpers/fallback-runtime.js';
 import {
   ClaudeControlTranslator,
@@ -1253,7 +1254,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     const dataDir = realpathSync(fx.home);
     const h = makeFallbackRuntimeHarness((role, opts) => registry.spawn(role, opts), dataDir);
     class ClaudeRegistry extends RuntimeRegistry { override runtimeIdFor() { return 'claude-code' as const; } }
-    const registry = new ClaudeRegistry({ ...serviceRegistryOptions({ config: loadConfig({ GRU_COMMAND_HOME: dataDir }), store: fx.store,
+    const registry = new ClaudeRegistry({ ...serviceRegistryOptions({ reviewOwnerCessation: NO_REVIEW_OWNER_LEDGER, config: loadConfig({ GRU_COMMAND_HOME: dataDir }), store: fx.store,
       workflowLaneFor: h.authority.workflowLaneFor, workflowBuildFor: h.authority.workflowBuildFor }),
       claude: { binary: DOUBLE, reviewSettingsFile: join(dataDir, 'absent-review-settings.json') },
     });
@@ -1285,7 +1286,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     mkdirSync(join(f.lane.path, '_bmad/custom'), { recursive: true });
     writeFileSync(join(f.lane.path, '_bmad/custom/config.toml'), 'NOT TOML');
     class ClaudeRegistry extends RuntimeRegistry { override runtimeIdFor() { return 'claude-code' as const; } }
-    const claude = new ClaudeRegistry({ ...serviceRegistryOptions({ config, store: new SessionStore(f.dataDir),
+    const claude = new ClaudeRegistry({ ...serviceRegistryOptions({ reviewOwnerCessation: NO_REVIEW_OWNER_LEDGER, config, store: new SessionStore(f.dataDir),
       workflowLaneFor: () => f.lane }), claude: { binary: DOUBLE } });
     const first = await claude.spawn('minion', { cwd: f.lane.path, agentId: 'same-worker' });
     try {
