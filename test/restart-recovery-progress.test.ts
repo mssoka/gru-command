@@ -1,7 +1,7 @@
 import { bindOriginalRebriefSdkOwner, markHistoricalDirectiveFixture } from './helpers/directive-native-fixture.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
-import { appendFileSync, closeSync, constants, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, truncateSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, constants, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, truncateSync, writeFileSync, writeSync } from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { tmpdir } from 'node:os';
@@ -100,6 +100,19 @@ class NativeFixture {
 
 /** The minion the fixture registers and its registry spawns by default. */
 const FIXTURE_MINION = 'logical-minion';
+
+const NATIVE_TRANSCRIPT_LIMIT = 32 * 1024 * 1024;
+/** Earlier work past the native transcript limit (#469): `row(index, filler)`
+ * appended until the session file is larger than the limit; returns how many. */
+function historyPastTranscriptLimit(file: string, row: (index: number, filler: string) => Record<string, unknown>): number {
+  const filler = 'x'.repeat(256 * 1024);
+  const fd = openSync(file, 'a');
+  try {
+    let count = 0;
+    for (let size = statSync(file).size; size <= NATIVE_TRANSCRIPT_LIMIT + 1024 * 1024; count += 1) size += writeSync(fd, `${JSON.stringify(row(count, filler))}\n`);
+    return count;
+  } finally { closeSync(fd); }
+}
 
 async function fixture(kind: 'directive' | 'rebrief' = 'directive', nativeCwd = true, report = false) {
   const dir = mkdtempSync(join(tmpdir(), 'gru-restart-progress-'));
@@ -620,22 +633,29 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     } finally { if (timer !== undefined) clearTimeout(timer); if (writer !== null) closeSync(writer); child.kill('SIGTERM'); }
   });
 
-  it('refuses oversized native transcripts before parsing or checkpointing', async () => {
+  it('refuses an oversized directive turn before checkpointing; its admission and the session header still read (#469)', async () => {
     const f = await fixture(); f.seed();
-    truncateSync(f.file, 32 * 1024 * 1024 + 1);
-    expect(() => inspectDirectiveCheckpoint(f.file, f.identity)).toThrow(/native transcript exceeds the .* inspection limit/);
-    expect(() => inspectDirectiveAdmission(f.file, f.identity)).toThrow(/native transcript exceeds the .* inspection limit/);
-    expect(() => readDirectiveSessionHeader(f.file)).toThrow(/native transcript exceeds the .* inspection limit/);
+    truncateSync(f.file, statSync(f.file).size + 32 * 1024 * 1024 + 1);
+    expect(() => inspectDirectiveCheckpoint(f.file, f.identity)).toThrow(/native directive turn exceeds the .* inspection limit/);
+    // Admission reads only its receipt; the oversized rest is not its evidence.
+    expect(inspectDirectiveAdmission(f.file, f.identity)).toMatchObject({ identity: f.identity, userEntryId: expect.any(String) });
+    expect(readDirectiveSessionHeader(f.file)).toMatchObject({ type: 'session', id: f.native.sessionId, cwd: f.lane.path });
   });
 
   it('refuses a native transcript holding invalid UTF-8 instead of decoding it into matching evidence (#363 S04-1-02)', async () => {
     const f = await fixture(); f.seed();
     // A byte that is no UTF-8 at all, inside an otherwise well-formed entry:
     // a lenient decode reads it as U+FFFD and the entry still parses.
-    appendFileSync(f.file, Buffer.concat([Buffer.from('{"type":"custom","note":"'), Buffer.from([0xff]), Buffer.from('"}\n')]));
+    const invalid = (prefix: string) => Buffer.concat([Buffer.from(prefix), Buffer.from([0xff]), Buffer.from('"}\n')]);
+    appendFileSync(f.file, invalid('{"type":"custom","note":"'));
     expect(() => inspectDirectiveCheckpoint(f.file, f.identity)).toThrow(/native transcript is not valid UTF-8/);
-    expect(() => inspectDirectiveAdmission(f.file, f.identity)).toThrow(/native transcript is not valid UTF-8/);
-    expect(() => readDirectiveSessionHeader(f.file)).toThrow(/native transcript is not valid UTF-8/);
+    // Admission reads only its receipt (#469): the corrupted entry after it is
+    // never decoded, so it is never evidence either way.
+    expect(inspectDirectiveAdmission(f.file, f.identity)).toMatchObject({ identity: f.identity, userEntryId: expect.any(String) });
+    // The header is read alone (#469): the invalid byte must be its own.
+    const header = await fixture();
+    writeFileSync(header.file, invalid(`{"type":"session","id":"${header.native.sessionId}","cwd":"`));
+    expect(() => readDirectiveSessionHeader(header.file)).toThrow(/native transcript is not valid UTF-8/);
     // A leading BOM is decoded exactly as before (kept, never stripped): the
     // header it precedes is still no JSON.
     const bom = await fixture(); bom.seed();
@@ -654,9 +674,12 @@ describe('restart-recovery-progress — exact native request matrix', () => {
   });
 
   it('refuses excessive JSONL entry counts before splitting the evidence into arrays', async () => {
+    // A directive turn is read only as far as its walk (#469): the first
+    // id-less entry refuses it long before the 250,001st. The turn entry
+    // limit itself is pinned in test/directive-transcript-bounds.test.ts.
     const transcript = await fixture(); transcript.seed();
-    writeFileSync(transcript.file, '{}\n'.repeat(250_001));
-    expect(() => inspectDirectiveCheckpoint(transcript.file, transcript.identity)).toThrow(/native transcript exceeds the entry inspection limit/);
+    appendFileSync(transcript.file, '{}\n'.repeat(250_001));
+    expect(inspectDirectiveCheckpoint(transcript.file, transcript.identity)).toEqual({ state: 'unknown', reason: 'native checkpoint has a malformed or duplicate entry identity' });
 
     const association = await fixture(); association.seed();
     writeFileSync(`${association.file}.directives.jsonl`, '{}\n'.repeat(100_001));
@@ -665,6 +688,21 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     const producer = await fixture(); producer.seed();
     writeFileSync(`${producer.file}.producers.jsonl`, '{}\n'.repeat(100_001));
     expect(() => inspectDirectiveProducers(producer.file, producer.identity)).toThrow(/native producer journal exceeds the entry inspection limit/);
+  });
+
+  it('a pi session past the transcript limit still takes a directive end to end: only its own turn is inspected (#469)', async () => {
+    const f = await fixture();
+    const count = historyPastTranscriptLimit(f.file, (index, filler) => ({ type: 'message', id: `history-${index}`, parentId: index === 0 ? null : `history-${index - 1}`,
+      message: index % 2 === 0 ? { role: 'user', content: [{ type: 'text', text: filler }] } : { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: filler }] } }));
+    await executeAcceptedDirective(f.deps, f.intent.requestId);
+    const row = f.ledger.getDirective(f.intent.requestId)!;
+    expect(row.failReason).toBeNull();
+    expect(row).toMatchObject({ state: 'settled', nativeTarget: { sessionFile: f.file }, nativeBinding: { runtime: 'pi', baseline: `history-${count - 1}`, userEntryId: expect.any(String) } });
+    expect(inspectDirectiveCheckpoint(f.file, f.identity)).toMatchObject({ state: 'terminal', ok: true });
+    expect(statSync(f.file).size).toBeGreaterThan(NATIVE_TRANSCRIPT_LIMIT);
+    // The large session itself was resumed, never swapped for a fresh one.
+    expect(f.spawns).toEqual([expect.objectContaining({ agentId: FIXTURE_MINION, resumeFile: f.file })]);
+    expect(f.native.prompts).toHaveLength(1); expect(f.native.prompts[0]).not.toMatch(/^Fresh minion re-brief/u); expect(f.native.continuations).toBe(0);
   });
 
   // Kinds are the registered owner-required ones: the attention registry routes
@@ -1192,6 +1230,25 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     assertClaudeDirectiveDelivery('directive'));
   it('a Claude Code minion takes a re-brief end to end through a fresh session (#424)', () =>
     assertClaudeDirectiveDelivery('rebrief'));
+
+  it('a Claude Code session past the transcript limit still takes a directive end to end: only its own turn is inspected (#469)', async () => {
+    const scene = await claudeDirectiveScene('directive', 'tool:Read finish the approved scope');
+    const { ledger, intent } = scene;
+    try {
+      // Earlier CLI turns under the session's own id, past the limit.
+      const sessionId = readDirectiveSessionHeader(scene.sessionFile).id;
+      historyPastTranscriptLimit(scene.sessionFile, (index, filler) => ({ type: 'assistant', uuid: `history-${index}`, session_id: sessionId,
+        message: { role: 'assistant', content: [{ type: 'text', text: filler }] } }));
+      await executeAcceptedDirective(scene.deps, intent.requestId);
+      const row = ledger.getDirective(intent.requestId)!;
+      expect(row.failReason).toBeNull();
+      expect(row).toMatchObject({ state: 'settled', nativeTarget: { sessionFile: scene.sessionFile }, nativeBinding: { runtime: 'claude-code', userEntryId: expect.any(String) } });
+      expect(inspectDirectiveCheckpoint(scene.sessionFile, ledger.directiveTurnIdentity(intent.requestId))).toMatchObject({ state: 'terminal', ok: true });
+      expect(statSync(scene.sessionFile).size).toBeGreaterThan(NATIVE_TRANSCRIPT_LIMIT);
+      // One CLI turn, with the echo and the permission ask.
+      expect(scene.turns().map((turn) => turn.argv.includes('--replay-user-messages'))).toEqual([true]);
+    } finally { await scene.cleanup(); }
+  });
 
   it('an interrupted Claude directive is never resumed or replayed: it stays admitted and Gru gets the recovery card (#424)', async () => {
     const scene = await claudeDirectiveScene('directive', 'die-after-echo finish the approved scope');

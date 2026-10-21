@@ -32,38 +32,50 @@ export type DirectiveCheckpoint =
 export class DirectiveCheckpointError extends Error {
   constructor(message: string) { super(message); this.name = 'DirectiveCheckpointError'; }
 }
+/** Bounds a directive's own turn (#469), never the session before it. */
 const MAX_NATIVE_TRANSCRIPT_BYTES = 32 * 1024 * 1024;
 const MAX_NATIVE_TRANSCRIPT_ENTRIES = 250_000;
+const MAX_NATIVE_HEADER_BYTES = 64 * 1024;
 const MAX_DIRECTIVE_JOURNAL_BYTES = 4 * 1024 * 1024;
 const MAX_DIRECTIVE_JOURNAL_ENTRIES = 100_000;
 const MAX_NATIVE_LOCK_BYTES = 4 * 1024;
-function readBoundedUtf8(path: string, limit: number, label: string): string {
+const READ_CHUNK_BYTES = 64 * 1024;
+// Fatal decoding (#363 S04-1-02): a lenient decode turns invalid bytes into
+// U+FFFD, so corrupted evidence could hash like a genuine prompt. ignoreBOM
+// keeps a leading U+FEFF, exactly as the lenient decode did.
+function utf8Decoder() { return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }); }
+function decodeEvidence(bytes: Uint8Array, label: string, decoder = utf8Decoder()): string {
+  try { return decoder.decode(bytes); }
+  catch { throw new DirectiveCheckpointError(`${label} is not valid UTF-8; corrupted bytes are never evidence`); }
+}
+/** Refuses anything but a regular file before its first read: a FIFO blocks. */
+function openRegularFile(path: string, label: string): number {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
   try {
-    const stat = fstatSync(fd);
-    if (!stat.isFile()) throw new DirectiveCheckpointError(`${label} is not a regular file; bounded inspection requires durable file evidence`);
-    const initialSize = stat.size;
-    if (initialSize > limit) throw new DirectiveCheckpointError(`${label} exceeds the ${limit}-byte inspection limit`);
-    const chunks: Buffer[] = [];
-    let total = 0;
-    for (;;) {
-      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, limit + 1 - total));
-      const count = readSync(fd, chunk, 0, chunk.length, null);
-      if (count === 0) break;
-      total += count;
-      if (total > limit) throw new DirectiveCheckpointError(`${label} exceeds the ${limit}-byte inspection limit`);
-      chunks.push(chunk.subarray(0, count));
-    }
-    if (fstatSync(fd).size !== total) throw new DirectiveCheckpointError(`${label} changed during bounded inspection`);
-    // Fatal decoding (#363 S04-1-02): a lenient decode turns invalid bytes
-    // into U+FFFD, so corrupted evidence could hash like a genuine prompt.
-    try {
-      // ignoreBOM keeps a leading U+FEFF, exactly as the lenient decode did.
-      return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(Buffer.concat(chunks, total));
-    } catch {
-      throw new DirectiveCheckpointError(`${label} is not valid UTF-8; corrupted bytes are never evidence`);
-    }
-  } finally { closeSync(fd); }
+    if (!fstatSync(fd).isFile()) throw new DirectiveCheckpointError(`${label} is not a regular file; bounded inspection requires durable file evidence`);
+    return fd;
+  } catch (error) { closeSync(fd); throw error; }
+}
+/** Bytes from `offset` to the end, refused past `limit` before and while
+ * reading. The file must still end exactly where the read did. */
+function readBoundedBytes(fd: number, offset: number, limit: number, label: string): Buffer {
+  if (fstatSync(fd).size - offset > limit) throw new DirectiveCheckpointError(`${label} exceeds the ${limit}-byte inspection limit`);
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for (;;) {
+    const chunk = Buffer.allocUnsafe(Math.min(READ_CHUNK_BYTES, limit + 1 - total));
+    const count = readSync(fd, chunk, 0, chunk.length, offset + total);
+    if (count === 0) break;
+    total += count;
+    if (total > limit) throw new DirectiveCheckpointError(`${label} exceeds the ${limit}-byte inspection limit`);
+    chunks.push(chunk.subarray(0, count));
+  }
+  if (fstatSync(fd).size !== offset + total) throw new DirectiveCheckpointError(`${label} changed during bounded inspection`);
+  return Buffer.concat(chunks, total);
+}
+function readBoundedUtf8(path: string, limit: number, label: string): string {
+  const fd = openRegularFile(path, label);
+  try { return decodeEvidence(readBoundedBytes(fd, 0, limit, label), label); } finally { closeSync(fd); }
 }
 function assertEntryLimit(text: string, limit: number, label: string): void {
   let entries = 0;
@@ -96,21 +108,155 @@ interface NativeEntry {
   readonly modelId?: unknown;
   readonly thinkingLevel?: unknown;
 }
-function entries(path: string): NativeEntry[] {
-  const text = readBoundedUtf8(path, MAX_NATIVE_TRANSCRIPT_BYTES, 'native transcript');
-  if (text !== '' && !text.endsWith('\n')) throw new DirectiveCheckpointError('native transcript has a partial entry');
-  assertEntryLimit(text, MAX_NATIVE_TRANSCRIPT_ENTRIES, 'native transcript');
-  if (text.trim() === '') return [];
-  const lines = text.trimEnd().split('\n');
-  return lines.map((line) => JSON.parse(line) as NativeEntry);
+/*
+ * Native transcripts grow for a session's whole life (#469), so inspection
+ * never holds one whole. The header is its first line. The session before a
+ * directive's baseline is streamed past: pi keeps only its entry ids, Claude
+ * re-hashes its exact bytes. The directive's own turn after the baseline is
+ * read only as far as an inspection walks, and only the lines read count
+ * against the transcript byte and entry limits, so a session's later work
+ * never refuses an earlier directive.
+ */
+const HEADER_OVERSIZED = `native session header exceeds the ${MAX_NATIVE_HEADER_BYTES}-byte inspection limit`;
+const ENTRY_OVERSIZED = `native transcript entry exceeds the ${MAX_NATIVE_TRANSCRIPT_BYTES}-byte inspection limit`;
+function withNativeTranscript<T>(file: string, inspect: (fd: number) => T): T {
+  const fd = openRegularFile(file, 'native transcript');
+  try { return inspect(fd); } finally { closeSync(fd); }
 }
-/** Header facts use the same bounded read as checkpoint inspection. They
- * identify a session/cwd, never admission, completion or work authority. */
+/** Complete lines read on demand from `start`, each bounded and fatally
+ * decoded. A torn final line is never decoded: it only sets `partial`. */
+class NativeLines {
+  private readonly decoder = utf8Decoder();
+  private readonly buffer = Buffer.allocUnsafe(READ_CHUNK_BYTES);
+  private chunk = this.buffer.subarray(0, 0);
+  private position: number;
+  private count = 0;
+  /** The offset after the last complete line read. */
+  end: number;
+  partial = false;
+  constructor(private readonly fd: number, start: number) { this.position = start; this.end = start; }
+  /** The next complete line, or null at the end; one longer than `limit` bytes refuses. */
+  next(limit: number, oversized: string): string | null {
+    const pieces: Buffer[] = [];
+    let bytes = 0;
+    for (;;) {
+      if (this.chunk.length === 0) {
+        const count = readSync(this.fd, this.buffer, 0, this.buffer.length, this.position);
+        if (count === 0) {
+          if (fstatSync(this.fd).size !== this.position) throw new DirectiveCheckpointError('native transcript changed during bounded inspection');
+          if (bytes > 0) this.partial = true;
+          return null;
+        }
+        this.position += count;
+        this.chunk = this.buffer.subarray(0, count);
+      }
+      const newline = this.chunk.indexOf(10);
+      const piece = newline < 0 ? this.chunk : this.chunk.subarray(0, newline);
+      bytes += piece.length;
+      if (bytes > limit) throw new DirectiveCheckpointError(oversized);
+      if (newline < 0) {
+        pieces.push(Buffer.from(piece)); // the read buffer is reused
+        this.chunk = this.chunk.subarray(this.chunk.length);
+        continue;
+      }
+      this.chunk = this.chunk.subarray(newline + 1);
+      this.end += bytes + 1;
+      this.count += 1;
+      return decodeEvidence(pieces.length === 0 ? piece : Buffer.concat([...pieces, piece], bytes), 'native transcript', this.decoder);
+    }
+  }
+  /** The next line of the session itself: the header within its own bound, then entries. */
+  nextEntry(): string | null {
+    return this.count === 0 ? this.next(MAX_NATIVE_HEADER_BYTES, HEADER_OVERSIZED) : this.next(MAX_NATIVE_TRANSCRIPT_BYTES, ENTRY_OVERSIZED);
+  }
+}
+/** The first line alone, never the session after it. */
+function nativeHeaderLine(fd: number): string {
+  const line = new NativeLines(fd, 0).nextEntry();
+  if (line === null) throw new DirectiveCheckpointError('native transcript has no complete session header');
+  return line;
+}
+/** A directive's own turn after its baseline, read on demand within the
+ * transcript limits. `accepted` ends at a torn final line (a partial tail
+ * cannot undo an accepted prefix); `whole` refuses it. */
+class NativeTurn {
+  private readonly lines: NativeLines;
+  private count = 0;
+  private scope = 'native directive turn';
+  constructor(fd: number, private start: number, private readonly tail: 'whole' | 'accepted') { this.lines = new NativeLines(fd, start); }
+  /** The turn ended at the last line read. What is read after it only looks
+   * ahead, under its own bound and its own name: it is never charged to,
+   * nor refused as, this turn. */
+  end(): void { this.start = this.lines.end; this.count = 0; this.scope = 'native lookahead after the directive turn'; }
+  /** The turn's next line, or undefined at its end. */
+  next(): string | undefined {
+    const line = this.lines.next(MAX_NATIVE_TRANSCRIPT_BYTES - (this.lines.end - this.start) - 1, `${this.scope} exceeds the ${MAX_NATIVE_TRANSCRIPT_BYTES}-byte inspection limit`);
+    if (line === null) {
+      if (this.lines.partial && this.tail === 'whole') throw new DirectiveCheckpointError('native transcript has a partial entry');
+      return undefined;
+    }
+    if (++this.count > MAX_NATIVE_TRANSCRIPT_ENTRIES) throw new DirectiveCheckpointError(`${this.scope} exceeds the entry inspection limit`);
+    return line;
+  }
+}
+/** The pi turn's entry at `index`: `malformed` without a unique, non-empty
+ * id; undefined past the turn's end. */
+type PiTurn = (index: number) => NativeEntry | 'malformed' | undefined;
+/** A pi transcript split after its `baseline` entry (after the header when
+ * null). Entries through the split are kept only as their ids. */
+interface PiTranscript {
+  readonly header: NativeEntry | null;
+  /** Every id through the baseline, the header's included. */
+  readonly ids: ReadonlySet<string>;
+  /** An entry through the baseline has no unique, non-empty id. */
+  readonly malformed: boolean;
+  /** Null without the baseline. */
+  readonly turn: PiTurn | null;
+  /** The turn ended at the last entry read (see NativeTurn.end). */
+  readonly endTurn: () => void;
+}
+function withPiTranscript<T>(file: string, baseline: string | null, tail: 'whole' | 'accepted', inspect: (transcript: PiTranscript) => T): T {
+  return withNativeTranscript(file, (fd) => {
+    const lines = new NativeLines(fd, 0);
+    const first = lines.nextEntry();
+    const header = first === null ? null : JSON.parse(first) as NativeEntry | null;
+    const ids = new Set<string>();
+    if (typeof header?.id === 'string') ids.add(header.id);
+    const fresh = (entry: NativeEntry | null, seen?: ReadonlySet<string>): entry is NativeEntry =>
+      !!entry && typeof entry.id === 'string' && entry.id !== '' && !ids.has(entry.id) && !seen?.has(entry.id);
+    let malformed = false;
+    let found = first !== null && baseline === null;
+    while (!found) {
+      const line = lines.nextEntry();
+      if (line === null) break;
+      const entry = JSON.parse(line) as NativeEntry | null;
+      if (!fresh(entry)) { malformed = true; continue; }
+      ids.add(entry.id);
+      found = entry.id === baseline;
+    }
+    if (!found) {
+      if (lines.partial && tail === 'whole') throw new DirectiveCheckpointError('native transcript has a partial entry');
+      return inspect({ header, ids, malformed, turn: null, endTurn: () => {} });
+    }
+    const after = new NativeTurn(fd, lines.end, tail);
+    const seen = new Set<string>();
+    const entries: (NativeEntry | 'malformed')[] = [];
+    const turn: PiTurn = (index) => {
+      while (entries.length <= index) {
+        const line = after.next();
+        if (line === undefined) return undefined;
+        const entry = JSON.parse(line) as NativeEntry | null;
+        if (fresh(entry, seen)) { seen.add(entry.id); entries.push(entry); } else entries.push('malformed');
+      }
+      return entries[index];
+    };
+    return inspect({ header, ids, malformed, turn, endTurn: () => after.end() });
+  });
+}
+/** Header facts come from the first line alone. They identify a session/cwd,
+ * never admission, completion or work authority. */
 export function readDirectiveSessionHeader(file: string): { readonly type?: unknown; readonly id?: unknown; readonly cwd?: unknown } {
-  const text = readBoundedUtf8(file, MAX_NATIVE_TRANSCRIPT_BYTES, 'native transcript');
-  const end = text.indexOf('\n');
-  if (end < 0) throw new DirectiveCheckpointError('native transcript has no complete session header');
-  const header = JSON.parse(text.slice(0, end)) as unknown;
+  const header = JSON.parse(withNativeTranscript(file, nativeHeaderLine)) as unknown;
   if (typeof header !== 'object' || header === null) throw new DirectiveCheckpointError('native session header is malformed');
   return header;
 }
@@ -132,11 +278,21 @@ export function prepareDirectiveBinding(input: {
   if (!input.authorityManifest) throw new DirectiveCheckpointError('directive requires a bound native role/cwd/tool/model authority manifest');
   const prior = readDirectiveBinding(input.sessionFile, input.identity.requestId);
   if (prior !== null) throw new DirectiveCheckpointError(`request ${input.identity.requestId} already has native association — inspect it; never replay`);
-  const native = entries(input.sessionFile);
+  // The baseline is the last entry: the whole session streams past, one line at a time.
+  const baseline = withNativeTranscript(input.sessionFile, (fd) => {
+    const lines = new NativeLines(fd, 0);
+    let last: string | null = null;
+    for (let line = lines.nextEntry(); line !== null; line = lines.nextEntry()) {
+      const entry = JSON.parse(line) as NativeEntry;
+      if (entry.type !== 'session') last = entry.id ?? null;
+    }
+    if (lines.partial) throw new DirectiveCheckpointError('native transcript has a partial entry');
+    return last;
+  });
   const content = [ { type: 'text', text: input.text },
     ...(input.images ?? []).map((image) => ({ type: 'image', data: image.data, mimeType: image.mediaType })) ];
   const binding: DirectiveNativeBinding = { identity: input.identity, runtime: input.runtime, agentId: input.agentId,
-    sessionId: input.sessionId, sessionFile: input.sessionFile, baseline: native.filter((entry) => entry.type !== 'session').at(-1)?.id ?? null,
+    sessionId: input.sessionId, sessionFile: input.sessionFile, baseline,
     promptHash: contentHash(content), userEntryId: null, authorityManifest: input.authorityManifest };
   appendBinding(binding);
   return binding;
@@ -171,25 +327,26 @@ function readDirectiveBindings(file: string): readonly DirectiveNativeBinding[] 
 export function readDirectiveBinding(file: string, requestId: string): DirectiveNativeBinding | null {
   return readDirectiveBindings(file).find((row) => row.identity.requestId === requestId) ?? null;
 }
-function hasLaterBoundRequest(file: string, native: readonly NativeEntry[], identity: DirectiveTurnIdentity, checkpointId: string): boolean {
+/** Reads only the few entries after the checkpoint (#469); a read refusal
+ * propagates, a binding that does not read back is no later request. */
+function hasLaterBoundRequest(file: string, native: PiTurn, identity: DirectiveTurnIdentity, checkpointIndex: number): boolean {
+  const checkpoint = native(checkpointIndex);
+  if (typeof checkpoint !== 'object') return false;
+  let baseline = checkpoint.id;
+  let nextIndex = checkpointIndex + 1;
+  // These controls change the NEXT request's model, not the completed
+  // request's ancestry. No branch, compaction or unbound effect is skipped.
+  for (let control = native(nextIndex); typeof control === 'object' && (control.type === 'model_change' || control.type === 'thinking_level_change'); control = native(nextIndex)) {
+    if (control.parentId !== baseline || control.type === 'model_change' &&
+        (typeof control.provider !== 'string' || !control.provider.trim() || typeof control.modelId !== 'string' || !control.modelId.trim()) ||
+        control.type === 'thinking_level_change' && (typeof control.thinkingLevel !== 'string' ||
+          !['off', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(control.thinkingLevel))) return false;
+    baseline = control.id;
+    nextIndex += 1;
+  }
+  const immediate = native(nextIndex);
+  if (typeof immediate !== 'object' || immediate.type !== 'message' || immediate.message?.role !== 'user' || immediate.parentId !== baseline || !Array.isArray(immediate.message.content)) return false;
   try {
-    const checkpointIndex = native.findIndex((entry) => entry.id === checkpointId);
-    if (checkpointIndex < 0) return false;
-    let baseline = checkpointId;
-    let nextIndex = checkpointIndex + 1;
-    // These controls change the NEXT request's model, not the completed
-    // request's ancestry. No branch, compaction or unbound effect is skipped.
-    while (native[nextIndex]?.type === 'model_change' || native[nextIndex]?.type === 'thinking_level_change') {
-      const control = native[nextIndex]!;
-      if (control.parentId !== baseline || control.type === 'model_change' &&
-          (typeof control.provider !== 'string' || !control.provider.trim() || typeof control.modelId !== 'string' || !control.modelId.trim()) ||
-          control.type === 'thinking_level_change' && (typeof control.thinkingLevel !== 'string' ||
-            !['off', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(control.thinkingLevel))) return false;
-      baseline = control.id;
-      nextIndex += 1;
-    }
-    const immediate = native[nextIndex];
-    if (immediate?.type !== 'message' || immediate.message?.role !== 'user' || immediate.parentId !== baseline || !Array.isArray(immediate.message.content)) return false;
     const hash = contentHash(immediate.message.content);
     const matching = readDirectiveBindings(file).filter((candidate) => candidate.identity.requestId !== identity.requestId &&
       candidate.identity.jobId === identity.jobId && candidate.baseline === baseline && candidate.promptHash === hash &&
@@ -212,28 +369,24 @@ export function inspectDirectiveAdmission(file: string, identity: DirectiveTurnI
   if (binding === null || !isDeepStrictEqual(binding.identity, identity)) throw new DirectiveCheckpointError('exact native admission association unavailable');
   if (binding.runtime === 'claude-code') return inspectClaudeDirectiveAdmission(file, binding);
   if (binding.runtime !== 'pi') throw new DirectiveCheckpointError('exact native admission association unavailable');
-  const text = readBoundedUtf8(file, MAX_NATIVE_TRANSCRIPT_BYTES, 'native transcript');
-  assertEntryLimit(text, MAX_NATIVE_TRANSCRIPT_ENTRIES, 'native transcript');
-  const lines = text.split('\n'); lines.pop(); // a partial tail cannot undo an accepted prefix
-  const header = JSON.parse(lines[0] ?? 'null') as NativeEntry | null;
+  return withPiTranscript(file, binding.baseline, 'accepted', (transcript) => admitPiDirective(file, binding, transcript));
+}
+/** Pi admission: the exact user receipt directly after the baseline, the
+ * turn's first entry and the only one read. */
+function admitPiDirective(file: string, binding: DirectiveNativeBinding, { header, malformed, turn }: PiTranscript): DirectiveNativeBinding {
   if (header?.type !== 'session' || header.id !== binding.sessionId) throw new DirectiveCheckpointError('native admission session identity mismatch');
-  let baselineFound = binding.baseline === null;
-  const ids = new Set<string>([header.id]);
-  for (const line of lines.slice(1)) {
-    const entry = JSON.parse(line) as NativeEntry;
-    if (!entry || typeof entry.id !== 'string' || !entry.id || ids.has(entry.id)) throw new DirectiveCheckpointError('malformed/rebound native admission prefix');
-    ids.add(entry.id);
-    if (!baselineFound) { baselineFound = entry.id === binding.baseline; continue; }
-    if (entry.type !== 'message' || entry.message?.role !== 'user' || entry.parentId !== binding.baseline || !Array.isArray(entry.message.content) ||
-        contentHash(entry.message.content) !== binding.promptHash || binding.userEntryId !== null && binding.userEntryId !== entry.id) {
-      throw new DirectiveCheckpointError('actual native admission user receipt unavailable/changed');
-    }
-    syncFile(file);
-    const admitted = { ...binding, userEntryId: entry.id };
-    if (binding.userEntryId === null) appendBinding(admitted);
-    return admitted;
+  if (malformed) throw new DirectiveCheckpointError('malformed/rebound native admission prefix');
+  const entry = turn?.(0);
+  if (entry === undefined) throw new DirectiveCheckpointError('actual native admission user receipt unavailable');
+  if (entry === 'malformed') throw new DirectiveCheckpointError('malformed/rebound native admission prefix');
+  if (entry.type !== 'message' || entry.message?.role !== 'user' || entry.parentId !== binding.baseline || !Array.isArray(entry.message.content) ||
+      contentHash(entry.message.content) !== binding.promptHash || binding.userEntryId !== null && binding.userEntryId !== entry.id) {
+    throw new DirectiveCheckpointError('actual native admission user receipt unavailable/changed');
   }
-  throw new DirectiveCheckpointError('actual native admission user receipt unavailable');
+  syncFile(file);
+  const admitted = { ...binding, userEntryId: entry.id };
+  if (binding.userEntryId === null) appendBinding(admitted);
+  return admitted;
 }
 
 /** Native transcript readback owns proof. Pi entries are tree-linked: only
@@ -246,17 +399,19 @@ export function inspectDirectiveCheckpoint(file: string, identity: DirectiveTurn
   if (binding === null || !isDeepStrictEqual(binding.identity, identity)) return unknown('exact native request association unavailable');
   if (binding.runtime === 'claude-code') return inspectClaudeDirectiveCheckpoint(file, binding);
   if (binding.runtime !== 'pi') return unknown('exact native request association unavailable');
-  const native = entries(file);
-  const header = native[0] as (NativeEntry & { readonly id?: string }) | undefined;
+  return withPiTranscript(file, binding.baseline, 'whole', (transcript) => piDirectiveCheckpoint(file, binding, transcript));
+}
+/** The walk reads the turn only up to its own end (#469): its terminal and
+ * the few entries that show what follows it. */
+function piDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding, { header, malformed, turn: native, endTurn }: PiTranscript): DirectiveCheckpoint {
+  const { identity } = binding;
+  const unknown = (reason: string): DirectiveCheckpoint => ({ state: 'unknown', reason });
+  const MALFORMED = 'native checkpoint has a malformed or duplicate entry identity';
   if (header?.type !== 'session' || header.id !== binding.sessionId) return unknown('native session identity mismatch');
-  const ids = new Set<string>([header.id]);
-  for (const entry of native.slice(1)) {
-    if (!entry || typeof entry.id !== 'string' || entry.id === '' || ids.has(entry.id)) return unknown('native checkpoint has a malformed or duplicate entry identity');
-    ids.add(entry.id);
-  }
-  const start = binding.baseline === null ? 1 : native.findIndex((entry) => entry.id === binding.baseline) + 1;
-  if (start <= 0) return unknown('native baseline unavailable');
-  const user = native[start];
+  if (malformed) return unknown(MALFORMED);
+  if (native === null) return unknown('native baseline unavailable');
+  const user = native(0);
+  if (user === 'malformed') return unknown(MALFORMED);
   if (user?.type !== 'message' || user.message?.role !== 'user' || user.parentId !== binding.baseline ||
       contentHash(user.message.content) !== binding.promptHash || !user.id) return unknown('actual native request receipt unavailable');
   if (binding.userEntryId !== null && user.id !== binding.userEntryId) return unknown('native request receipt changed');
@@ -269,13 +424,16 @@ export function inspectDirectiveCheckpoint(file: string, identity: DirectiveTurn
   const pending = new Map<string, string>();
   let lastMessage = user.message;
   let terminal = false;
-  for (const entry of native.slice(start + 1)) {
+  for (let index = 1; ; index += 1) {
+    const entry = native(index);
+    if (entry === undefined) break;
+    if (entry === 'malformed') return unknown(MALFORMED);
     if (terminal) {
       // A later user entry is not part of this completed turn when its own
       // distinct, durably read-back admission binds it. Keep the earlier
       // checkpoint readable without treating an unbound/replayed user tail
       // as proof that the old request completed.
-      if (hasLaterBoundRequest(file, native, identity, parent)) {
+      if (hasLaterBoundRequest(file, native, identity, index - 1)) {
         const ok = lastMessage.stopReason === 'stop';
         return { state: 'terminal', binding: admitted, checkpointId: parent, ok,
           error: ok ? null : String(lastMessage.errorMessage ?? `native stopReason: ${String(lastMessage.stopReason)}`) };
@@ -296,6 +454,8 @@ export function inspectDirectiveCheckpoint(file: string, identity: DirectiveTurn
       if (pending.size === 0) {
         if (!['stop', 'error', 'aborted', 'length'].includes(String(message.stopReason))) return unknown('malformed native assistant terminal');
         terminal = true;
+        // Whatever follows (a later request, its controls) is lookahead.
+        endTurn();
       }
     } else if (message.role === 'toolResult') {
       if (typeof message.toolCallId !== 'string' || !pending.has(message.toolCallId) || pending.get(message.toolCallId) !== message.toolName || typeof message.isError !== 'boolean') return unknown('unmatched/malformed native tool result');
@@ -328,15 +488,47 @@ export function inspectDirectiveCheckpoint(file: string, identity: DirectiveTurn
  */
 const CLAUDE_BASELINE = /^prefix:(0|[1-9][0-9]*):([a-f0-9]{64})$/;
 
-function claudeTranscriptPrefix(text: string): string {
-  const bytes = Buffer.from(text, 'utf8');
-  return `prefix:${String(bytes.length)}:${createHash('sha256').update(bytes).digest('hex')}`;
+/** The exact prefix a new Claude directive binds: the whole transcript,
+ * hashed and fatally decoded as it streams past, ending on a complete frame. */
+function claudeTranscriptPrefix(fd: number): string {
+  const hash = createHash('sha256');
+  const decoder = utf8Decoder();
+  const validate = (bytes?: Uint8Array): void => {
+    try { decoder.decode(bytes, { stream: bytes !== undefined }); }
+    catch { throw new DirectiveCheckpointError('native transcript is not valid UTF-8; corrupted bytes are never evidence'); }
+  };
+  const chunk = Buffer.allocUnsafe(READ_CHUNK_BYTES);
+  let length = 0;
+  let last = -1;
+  for (let count = readSync(fd, chunk, 0, chunk.length, 0); count > 0; count = readSync(fd, chunk, 0, chunk.length, length)) {
+    const bytes = chunk.subarray(0, count);
+    validate(bytes);
+    hash.update(bytes);
+    length += count;
+    last = bytes[count - 1]!;
+  }
+  validate();
+  if (fstatSync(fd).size !== length) throw new DirectiveCheckpointError('native transcript changed during bounded inspection');
+  if (last !== 10) throw new DirectiveCheckpointError('native transcript has a partial entry');
+  return `prefix:${String(length)}:${hash.digest('hex')}`;
 }
 
-function claudeHeader(text: string, sessionId: string): void {
-  const end = text.indexOf('\n');
+/** sha256 of the first `length` bytes, streamed; null when the transcript is shorter. */
+function nativePrefixHash(fd: number, length: number): string | null {
+  const hash = createHash('sha256');
+  const chunk = Buffer.allocUnsafe(READ_CHUNK_BYTES);
+  for (let position = 0; position < length;) {
+    const count = readSync(fd, chunk, 0, Math.min(chunk.length, length - position), position);
+    if (count === 0) return null;
+    hash.update(chunk.subarray(0, count));
+    position += count;
+  }
+  return hash.digest('hex');
+}
+
+function claudeHeader(line: string, sessionId: string): void {
   let header: unknown = null;
-  try { header = end < 0 ? null : JSON.parse(text.slice(0, end)) as unknown; } catch { header = null; }
+  try { header = JSON.parse(line) as unknown; } catch { header = null; }
   const record = typeof header === 'object' && header !== null ? header as Record<string, unknown> : null;
   if (record?.['type'] !== 'session' || record['id'] !== sessionId || record['runtime'] !== 'claude-code' || typeof record['cwd'] !== 'string') {
     throw new DirectiveCheckpointError('claude-code transcript has no exact GC session header for this session');
@@ -354,156 +546,183 @@ export function prepareClaudeDirectiveBinding(input: {
   if (readDirectiveBinding(input.sessionFile, input.identity.requestId) !== null) {
     throw new DirectiveCheckpointError(`request ${input.identity.requestId} already has native association — inspect it; never replay`);
   }
-  const text = readBoundedUtf8(input.sessionFile, MAX_NATIVE_TRANSCRIPT_BYTES, 'native transcript');
-  if (!text.endsWith('\n')) throw new DirectiveCheckpointError('native transcript has a partial entry');
-  assertEntryLimit(text, MAX_NATIVE_TRANSCRIPT_ENTRIES, 'native transcript');
-  claudeHeader(text, input.sessionId);
+  const baseline = withNativeTranscript(input.sessionFile, (fd) => {
+    const prefix = claudeTranscriptPrefix(fd);
+    claudeHeader(nativeHeaderLine(fd), input.sessionId);
+    return prefix;
+  });
   const binding: DirectiveNativeBinding = { identity: input.identity, runtime: 'claude-code', agentId: input.agentId, sessionId: input.sessionId,
-    sessionFile: input.sessionFile, baseline: claudeTranscriptPrefix(text), promptHash: contentHash(input.content), userEntryId: null,
+    sessionFile: input.sessionFile, baseline, promptHash: contentHash(input.content), userEntryId: null,
     authorityManifest: input.authorityManifest };
   appendBinding(binding);
   return binding;
 }
 
 type ClaudeFrame = Record<string, unknown>;
+/** The bound turn after its exact recorded prefix, frame by frame and read
+ * only as far as an inspection walks (#469): `malformed` for a line that is
+ * no JSON object, undefined past the turn's end. `echo` indexes its
+ * admission receipt. */
+interface ClaudeTurn {
+  readonly frame: (index: number) => ClaudeFrame | 'malformed' | undefined;
+  readonly echo: number;
+  readonly receipt: string;
+}
 
-/** The frames the bound turn appended after its exact recorded prefix, and
- * the index of its admission echo (or a reason there is none). A partial
- * tail cannot undo an accepted prefix. */
-function claudeTurn(file: string, binding: DirectiveNativeBinding): { readonly frames: readonly ClaudeFrame[]; readonly echo: number } | { readonly refused: string } {
+/** Runs `inspect` over the turn the binding's exact prefix starts, or
+ * `refused` with the reason there is none. A partial tail cannot undo an
+ * accepted prefix. */
+function withClaudeTurn<T>(file: string, binding: DirectiveNativeBinding, inspect: (turn: ClaudeTurn) => T, refused: (reason: string) => T): T {
   const prefix = CLAUDE_BASELINE.exec(binding.baseline ?? '');
-  if (prefix === null) return { refused: 'claude-code association has no exact transcript prefix' };
-  const text = readBoundedUtf8(file, MAX_NATIVE_TRANSCRIPT_BYTES, 'native transcript');
-  assertEntryLimit(text, MAX_NATIVE_TRANSCRIPT_ENTRIES, 'native transcript');
-  const bytes = Buffer.from(text, 'utf8');
+  if (prefix === null) return refused('claude-code association has no exact transcript prefix');
   const length = Number(prefix[1]);
-  if (bytes.length < length || createHash('sha256').update(bytes.subarray(0, length)).digest('hex') !== prefix[2]) {
-    return { refused: 'the native transcript before the directive changed' };
-  }
-  try { claudeHeader(text, binding.sessionId); }
-  catch (error) {
-    if (!(error instanceof DirectiveCheckpointError)) throw error;
-    return { refused: error.message };
-  }
-  const lines = bytes.subarray(length).toString('utf8').split('\n');
-  lines.pop(); // a partial tail cannot undo an accepted prefix
-  const frames: ClaudeFrame[] = [];
-  for (const line of lines) {
-    let frame: unknown;
-    try { frame = JSON.parse(line) as unknown; } catch { return { refused: 'malformed native frame after the directive prefix' }; }
-    if (typeof frame !== 'object' || frame === null || Array.isArray(frame)) return { refused: 'malformed native frame after the directive prefix' };
-    frames.push(frame as ClaudeFrame);
-  }
-  let init = false;
-  for (const [index, frame] of frames.entries()) {
-    const type = frame['type'];
-    if (type === 'system') {
-      if (frame['subtype'] === 'init') {
-        if (frame['session_id'] !== binding.sessionId) return { refused: 'native session identity mismatch' };
-        init = true;
+  return withNativeTranscript(file, (fd) => {
+    if (nativePrefixHash(fd, length) !== prefix[2]) return refused('the native transcript before the directive changed');
+    try { claudeHeader(nativeHeaderLine(fd), binding.sessionId); }
+    catch (error) {
+      if (!(error instanceof DirectiveCheckpointError)) throw error;
+      return refused(error.message);
+    }
+    const lines = new NativeTurn(fd, length, 'accepted');
+    const frames: (ClaudeFrame | 'malformed')[] = [];
+    const frame = (index: number): ClaudeFrame | 'malformed' | undefined => {
+      while (frames.length <= index) {
+        const line = lines.next();
+        if (line === undefined) return undefined;
+        let parsed: unknown;
+        try { parsed = JSON.parse(line) as unknown; } catch { parsed = null; }
+        frames.push(typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) ? parsed as ClaudeFrame : 'malformed');
       }
-      continue;
-    }
-    if (type === 'user') {
-      const message = frame['message'] as { content?: unknown } | undefined;
-      if (!init || frame['isReplay'] !== true || frame['session_id'] !== binding.sessionId || frame['parent_tool_use_id'] != null ||
-          typeof frame['uuid'] !== 'string' || frame['uuid'] === '' || !Array.isArray(message?.content) ||
-          contentHash(message.content) !== binding.promptHash || (binding.userEntryId !== null && binding.userEntryId !== frame['uuid'])) {
-        return { refused: 'actual native admission user receipt unavailable/changed' };
+      return frames[index];
+    };
+    let init = false;
+    for (let index = 0; ; index += 1) {
+      const current = frame(index);
+      if (current === undefined) return refused('actual native admission user receipt unavailable');
+      if (current === 'malformed') return refused('malformed native frame after the directive prefix');
+      const type = current['type'];
+      if (type === 'system') {
+        if (current['subtype'] === 'init') {
+          if (current['session_id'] !== binding.sessionId) return refused('native session identity mismatch');
+          init = true;
+        }
+        continue;
       }
-      return { frames, echo: index };
+      if (type === 'user') {
+        const message = current['message'] as { content?: unknown } | undefined;
+        if (!init || current['isReplay'] !== true || current['session_id'] !== binding.sessionId || current['parent_tool_use_id'] != null ||
+            typeof current['uuid'] !== 'string' || current['uuid'] === '' || !Array.isArray(message?.content) ||
+            contentHash(message.content) !== binding.promptHash || (binding.userEntryId !== null && binding.userEntryId !== current['uuid'])) {
+          return refused('actual native admission user receipt unavailable/changed');
+        }
+        return inspect({ frame, echo: index, receipt: current['uuid'] });
+      }
+      // Before its own echo the turn may only announce itself.
+      if (type === 'assistant' || type === 'result' || type === 'control_request' || type === 'stream_event') {
+        return refused('the native turn proceeded without an exact admission receipt');
+      }
     }
-    // Before its own echo the turn may only announce itself.
-    if (type === 'assistant' || type === 'result' || type === 'control_request' || type === 'stream_event') {
-      return { refused: 'the native turn proceeded without an exact admission receipt' };
-    }
-  }
-  return { refused: 'actual native admission user receipt unavailable' };
+  });
+}
+
+/** Publishes the read-back admission once the echo is durable. */
+function admitClaudeDirective(file: string, binding: DirectiveNativeBinding, turn: ClaudeTurn): DirectiveNativeBinding {
+  syncFile(file);
+  const admitted = { ...binding, userEntryId: turn.receipt };
+  if (binding.userEntryId === null) appendBinding(admitted);
+  return admitted;
 }
 
 function inspectClaudeDirectiveAdmission(file: string, binding: DirectiveNativeBinding): DirectiveNativeBinding {
-  const turn = claudeTurn(file, binding);
-  if ('refused' in turn) throw new DirectiveCheckpointError(turn.refused);
-  syncFile(file);
-  const admitted = { ...binding, userEntryId: turn.frames[turn.echo]!['uuid'] as string };
-  if (binding.userEntryId === null) appendBinding(admitted);
-  return admitted;
+  return withClaudeTurn(file, binding, (turn) => admitClaudeDirective(file, binding, turn), (reason) => { throw new DirectiveCheckpointError(reason); });
 }
 
 /** Terminal at the turn's own `result` frame, or unknown. Never resumable. */
 function inspectClaudeDirectiveCheckpoint(file: string, binding: DirectiveNativeBinding): DirectiveCheckpoint {
   const unknown = (reason: string): DirectiveCheckpoint => ({ state: 'unknown', reason });
-  const turn = claudeTurn(file, binding);
-  if ('refused' in turn) return unknown(turn.refused);
-  syncFile(file);
-  const admitted = { ...binding, userEntryId: turn.frames[turn.echo]!['uuid'] as string };
-  if (binding.userEntryId === null) appendBinding(admitted);
-  if (producerReceipts(file).some((row) => row.state === 'guard-refused' && isDeepStrictEqual(row.producer.identity, binding.identity))) {
-    return unknown('native directive execution/authority boundary refused; exact turn remains incomplete');
-  }
-  const pending = new Map<string, string>();
-  for (const frame of turn.frames.slice(turn.echo + 1)) {
-    const type = frame['type'];
-    const message = frame['message'] as { content?: unknown } | undefined;
-    const blocks = Array.isArray(message?.content) ? message.content as Record<string, unknown>[] : [];
-    if (type === 'assistant') {
-      for (const block of blocks) {
-        if (block['type'] !== 'tool_use') continue;
-        if (typeof block['id'] !== 'string' || block['id'] === '' || typeof block['name'] !== 'string' || block['name'] === '' ||
-            typeof block['input'] !== 'object' || block['input'] === null || pending.has(block['id'])) return unknown('malformed native tool identity');
-        pending.set(block['id'], block['name']);
-      }
-    } else if (type === 'user') {
-      if (frame['isReplay'] === true) return unknown('another prompt entered the directive turn');
-      for (const block of blocks) {
-        if (block['type'] !== 'tool_result') continue;
-        if (typeof block['tool_use_id'] !== 'string' || !pending.has(block['tool_use_id'])) return unknown('unmatched/malformed native tool result');
-        if (block['is_error'] === true) return unknown('native tool error requires a recovery judgment');
-        pending.delete(block['tool_use_id']);
-      }
-    } else if (type === 'control_request') {
-      const request = frame['request'] as Record<string, unknown> | undefined;
-      if (request?.['subtype'] === 'can_use_tool' && (typeof request['tool_use_id'] !== 'string' || !pending.has(request['tool_use_id']))) {
-        return unknown('a tool permission request names no recorded tool intent');
-      }
-    } else if (type === 'system' && frame['subtype'] === 'init') {
-      return unknown('a new native turn began before the directive turn reached its result');
-    } else if (type === 'result') {
-      if (frame['session_id'] !== binding.sessionId || typeof frame['uuid'] !== 'string' || frame['uuid'] === '') return unknown('malformed native result');
-      const ok = frame['subtype'] === 'success' && frame['is_error'] === false;
-      if (ok && pending.size > 0) return unknown('native tool effects/results are incomplete');
-      return { state: 'terminal', binding: admitted, checkpointId: frame['uuid'], ok,
-        error: ok ? null : String(typeof frame['result'] === 'string' && frame['result'] !== '' ? frame['result'] : `native result: ${String(frame['subtype'])}`) };
+  return withClaudeTurn(file, binding, (turn) => {
+    const admitted = admitClaudeDirective(file, binding, turn);
+    if (producerReceipts(file).some((row) => row.state === 'guard-refused' && isDeepStrictEqual(row.producer.identity, binding.identity))) {
+      return unknown('native directive execution/authority boundary refused; exact turn remains incomplete');
     }
-  }
-  return unknown('native directive turn has no result yet');
+    const pending = new Map<string, string>();
+    for (let index = turn.echo + 1; ; index += 1) {
+      const frame = turn.frame(index);
+      if (frame === undefined) break;
+      if (frame === 'malformed') return unknown('malformed native frame after the directive prefix');
+      const type = frame['type'];
+      const message = frame['message'] as { content?: unknown } | undefined;
+      const blocks = Array.isArray(message?.content) ? message.content as Record<string, unknown>[] : [];
+      if (type === 'assistant') {
+        for (const block of blocks) {
+          if (block['type'] !== 'tool_use') continue;
+          if (typeof block['id'] !== 'string' || block['id'] === '' || typeof block['name'] !== 'string' || block['name'] === '' ||
+              typeof block['input'] !== 'object' || block['input'] === null || pending.has(block['id'])) return unknown('malformed native tool identity');
+          pending.set(block['id'], block['name']);
+        }
+      } else if (type === 'user') {
+        if (frame['isReplay'] === true) return unknown('another prompt entered the directive turn');
+        for (const block of blocks) {
+          if (block['type'] !== 'tool_result') continue;
+          if (typeof block['tool_use_id'] !== 'string' || !pending.has(block['tool_use_id'])) return unknown('unmatched/malformed native tool result');
+          if (block['is_error'] === true) return unknown('native tool error requires a recovery judgment');
+          pending.delete(block['tool_use_id']);
+        }
+      } else if (type === 'control_request') {
+        const request = frame['request'] as Record<string, unknown> | undefined;
+        if (request?.['subtype'] === 'can_use_tool' && (typeof request['tool_use_id'] !== 'string' || !pending.has(request['tool_use_id']))) {
+          return unknown('a tool permission request names no recorded tool intent');
+        }
+      } else if (type === 'system' && frame['subtype'] === 'init') {
+        return unknown('a new native turn began before the directive turn reached its result');
+      } else if (type === 'result') {
+        if (frame['session_id'] !== binding.sessionId || typeof frame['uuid'] !== 'string' || frame['uuid'] === '') return unknown('malformed native result');
+        const ok = frame['subtype'] === 'success' && frame['is_error'] === false;
+        if (ok && pending.size > 0) return unknown('native tool effects/results are incomplete');
+        return { state: 'terminal', binding: admitted, checkpointId: frame['uuid'], ok,
+          error: ok ? null : String(typeof frame['result'] === 'string' && frame['result'] !== '' ? frame['result'] : `native result: ${String(frame['subtype'])}`) };
+      }
+    }
+    return unknown('native directive turn has no result yet');
+  }, unknown);
 }
 
 /** The exact tool intent a Claude permission request names is durably in the
- * transcript, within the admitted turn, before the host allows it. */
+ * transcript, within the admitted turn, before the host allows it. Admission
+ * and intent come from one read of the transcript. */
 export function assertClaudeDirectiveToolIntent(file: string, identity: DirectiveTurnIdentity, toolUseId: string, toolName: string, input: unknown): void {
-  const binding = inspectDirectiveAdmission(file, identity);
-  const turn = claudeTurn(file, binding);
-  if ('refused' in turn) throw new DirectiveCheckpointError(turn.refused);
-  const resolved = new Set<string>();
-  let intent: Record<string, unknown> | null = null;
-  for (const frame of turn.frames.slice(turn.echo + 1)) {
-    const blocks = Array.isArray((frame['message'] as { content?: unknown } | undefined)?.content)
-      ? (frame['message'] as { content: Record<string, unknown>[] }).content : [];
-    if (frame['type'] === 'assistant') {
-      for (const block of blocks) {
-        if (block['type'] !== 'tool_use' || block['id'] !== toolUseId) continue;
-        if (intent !== null) throw new DirectiveCheckpointError('native tool intent is ambiguous: its tool_use id repeats in the turn');
-        intent = block;
+  validateDirectiveIdentity(identity);
+  const binding = readDirectiveBinding(file, identity.requestId);
+  if (binding === null || !isDeepStrictEqual(binding.identity, identity) || binding.runtime !== 'claude-code') {
+    throw new DirectiveCheckpointError('exact native admission association unavailable');
+  }
+  const refuse = (reason: string): never => { throw new DirectiveCheckpointError(reason); };
+  withClaudeTurn(file, binding, (turn) => {
+    admitClaudeDirective(file, binding, turn);
+    const resolved = new Set<string>();
+    let intent: Record<string, unknown> | null = null;
+    for (let index = turn.echo + 1; ; index += 1) {
+      const frame = turn.frame(index);
+      if (frame === undefined) break;
+      if (frame === 'malformed') refuse('malformed native frame after the directive prefix');
+      const current = frame as ClaudeFrame;
+      const blocks = Array.isArray((current['message'] as { content?: unknown } | undefined)?.content)
+        ? (current['message'] as { content: Record<string, unknown>[] }).content : [];
+      if (current['type'] === 'assistant') {
+        for (const block of blocks) {
+          if (block['type'] !== 'tool_use' || block['id'] !== toolUseId) continue;
+          if (intent !== null) refuse('native tool intent is ambiguous: its tool_use id repeats in the turn');
+          intent = block;
+        }
       }
+      if (current['type'] === 'user') for (const block of blocks) { if (block['type'] === 'tool_result' && typeof block['tool_use_id'] === 'string') resolved.add(block['tool_use_id']); }
+      if (current['type'] === 'result') refuse('the directive turn already reached its result');
     }
-    if (frame['type'] === 'user') for (const block of blocks) { if (block['type'] === 'tool_result' && typeof block['tool_use_id'] === 'string') resolved.add(block['tool_use_id']); }
-    if (frame['type'] === 'result') throw new DirectiveCheckpointError('the directive turn already reached its result');
-  }
-  if (intent === null || resolved.has(toolUseId) || intent['name'] !== toolName || !isDeepStrictEqual(intent['input'], input)) {
-    throw new DirectiveCheckpointError('native tool intent is not persisted before execution or its invocation/results changed');
-  }
-  syncFile(file);
+    if (intent === null || resolved.has(toolUseId) || intent['name'] !== toolName || !isDeepStrictEqual(intent['input'], input)) {
+      refuse('native tool intent is not persisted before execution or its invocation/results changed');
+    }
+    syncFile(file);
+  }, refuse);
 }
 
 /** Physical native host ownership; logical minion identity is not an incarnation. */
@@ -658,7 +877,23 @@ export function recordDirectiveIndependentController(producer: DirectiveProducer
 export function flushDirectiveToolIntent(file: string, assistantMessage: unknown, toolCall: {
   readonly id: string; readonly name: string; readonly arguments: unknown;
 }, identity: DirectiveTurnIdentity, executionMode: 'sequential' | 'parallel' = 'sequential'): void {
-  const native = entries(file);
+  validateDirectiveIdentity(identity);
+  const prepared = readDirectiveBinding(file, identity.requestId);
+  if (prepared === null || !isDeepStrictEqual(prepared.identity, identity) || prepared.runtime !== 'pi') {
+    throw new DirectiveCheckpointError('exact native admission association unavailable');
+  }
+  const refuse = (): never => { throw new DirectiveCheckpointError('native tool intent is not persisted before execution or its invocation/results changed'); };
+  // One read (#469): the admission and the live turn, receipt first, every
+  // entry with its own unique id.
+  const { binding, native } = withPiTranscript(file, prepared.baseline, 'whole', (transcript) => {
+    const admitted = admitPiDirective(file, prepared, transcript);
+    const entries: NativeEntry[] = [];
+    for (let entry = transcript.turn!(0); entry !== undefined; entry = transcript.turn!(entries.length)) {
+      if (entry === 'malformed') refuse();
+      entries.push(entry as NativeEntry);
+    }
+    return { binding: admitted, native: entries };
+  });
   let index = native.length - 1;
   // Sequential batches persist results between preparations; the pinned SDK
   // prepares every parallel call before executing any or persisting results.
@@ -666,7 +901,6 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
   while (index >= 0 && native[index]?.type === 'message' && native[index]?.message?.role === 'toolResult') index -= 1;
   const invocation = native[index];
   const content = invocation?.message?.content;
-  const refuse = (): never => { throw new DirectiveCheckpointError('native tool intent is not persisted before execution or its invocation/results changed'); };
   if (invocation?.type !== 'message' || !invocation.id || invocation.message?.role !== 'assistant' || invocation.message.stopReason !== 'toolUse' ||
       !isDeepStrictEqual(invocation.message, JSON.parse(JSON.stringify(assistantMessage))) || !Array.isArray(content)) refuse();
   const pending = new Map<string, Record<string, unknown>>();
@@ -686,16 +920,13 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
     pending.delete(id as string);
     parent = result.id;
   }
-  const binding = inspectDirectiveAdmission(file, identity);
-  const start = native.findIndex((entry) => entry.id === binding.userEntryId);
-  if (start < 1 || start >= index) refuse();
+  if (native[0]?.id !== binding.userEntryId || index < 1) refuse();
   let ancestor = binding.userEntryId;
   const chainPending = new Map<string, string>();
-  const ids = new Set(native.slice(0, start + 1).map((entry) => entry.id));
-  for (const entry of native.slice(start + 1)) {
+  for (const entry of native.slice(1)) {
     const message = entry.message;
-    if (entry.type !== 'message' || !entry.id || ids.has(entry.id) || entry.parentId !== ancestor || !message) refuse();
-    ids.add(entry.id); ancestor = entry.id;
+    if (entry.type !== 'message' || entry.parentId !== ancestor || !message) refuse();
+    ancestor = entry.id;
     if (message!.role === 'assistant') {
       if (chainPending.size > 0 || message!.stopReason !== 'toolUse' || !Array.isArray(message!.content)) refuse();
       for (const block of message!.content as Record<string, unknown>[]) {
