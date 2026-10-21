@@ -66,6 +66,8 @@ async function run(
         ...process.env,
         ...env,
         ...(env.HOME ? { XDG_CONFIG_HOME: join(env.HOME, '.config') } : {}),
+        // Likewise the `gru` launcher: never into a runner-set bin dir.
+        ...(env.HOME ? { GRU_COMMAND_BIN_DIR: join(env.HOME, '.local', 'bin') } : {}),
         npm_config_update_notifier: 'false',
         npm_config_progress: 'false',
       },
@@ -348,6 +350,7 @@ function writeLauncher(options: LauncherOptions): string {
   const exports: Record<string, string> = {
     HOME: options.home,
     XDG_CONFIG_HOME: join(options.home, '.config'),
+    GRU_COMMAND_BIN_DIR: join(options.home, '.local', 'bin'),
     GRU_COMMAND_HOME: options.instance,
     ...(options.seam === undefined
       ? {}
@@ -1131,8 +1134,9 @@ describe('install.sh setup mode (one-line path)', () => {
       env: { ...process.env, HOME: home },
       encoding: 'utf-8',
     });
-    expect(stdout).toContain("delegating the restart to 'gru roll'");
-    expect(readFileSync(rollLog, 'utf-8')).toBe('argv:roll\n');
+    expect(stdout).toContain("delegating the restart to 'gru roll --no-wait'");
+    // The relaunch ends this shell with the service: it never waits for verification.
+    expect(readFileSync(rollLog, 'utf-8')).toBe('argv:roll --no-wait\n');
     const calls = existsSync(managerLog) ? readFileSync(managerLog, 'utf-8') : '';
     expect(calls).not.toMatch(/^unload/m);
     expect(calls).not.toMatch(/^load/m);
@@ -1350,10 +1354,16 @@ describe('install.sh setup mode (one-line path)', () => {
     writeFileSync(unit, rendered.stdout);
     expect((await run(join(fixture, 'install.sh'), ['--uninstall'], env)).status).toBe(0);
     expect(existsSync(unit)).toBe(false);
+    // --service refreshes a stale launcher of ours with the unit (#463).
+    const launcher = join(home, '.local', 'bin', 'gru');
+    mkdirSync(dirname(launcher), { recursive: true });
+    writeFileSync(launcher, "#!/bin/sh\n# gru-command launcher (managed by install.sh)\nexec '/opt/previous-node/bin/node' '/elsewhere/dist/cli/service.js' \"$@\"\n", { mode: 0o755 });
     expect((await run(join(fixture, 'install.sh'), ['--service'], env)).status).toBe(0);
     expect(readFileSync(unit, 'utf-8')).toBe(rendered.stdout);
-    // --service refreshes the launcher with the unit (#463), after --uninstall removed it.
-    expect(readFileSync(join(home, '.local', 'bin', 'gru'), 'utf-8')).toContain(`GRU_COMMAND_HOME='${instance}'`);
+    const refreshed = readFileSync(launcher, 'utf-8');
+    expect(refreshed).toContain(`GRU_COMMAND_HOME='${instance}'`);
+    expect(refreshed).toContain(`'${fixture}/dist/cli/service.js' "$@"`);
+    expect(refreshed).not.toContain('/opt/previous-node');
   });
 
   it('inside a clone: no flags clone the product — deps+build+wizard only', async () => {

@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { delimiter, dirname, join } from 'node:path';
+import { join } from 'node:path';
 import type { GruCommandConfig } from '../config.js';
 import type { BuildInfo } from '../build-info.js';
 import type { DeployDriftView } from '../board/deploy-drift.js';
@@ -23,12 +23,15 @@ export function installerRunnerFor(packageRoot: string): InstallerRunner {
       process.stderr.write(`gru: ${packageRoot} is not a Gru Command checkout (no install.sh) — reinstall with the one-line installer\n`);
       return 1;
     }
-    // install.sh takes `node` from PATH, as ./install.sh --update does: the
-    // shell's node wins (a Node upgrade is picked up), and the node this
-    // command runs on is the fallback for a shell that has none. Appended,
-    // so nothing else install.sh looks up (python3, git, npm) is shadowed.
-    const path = [process.env['PATH'], dirname(process.execPath)].filter((entry) => entry !== undefined && entry !== '').join(delimiter);
-    const result = spawnSync('bash', [script, ...args], { stdio: 'inherit', env: { ...process.env, PATH: path } });
+    // install.sh uses the shell's node, as running it yourself would; the
+    // node this command runs on (GRU_COMMAND_NODE) stands in only when the
+    // shell has none or one below the minimum. Run from the checkout, so a
+    // version manager never picks a node from the caller's directory.
+    const result = spawnSync('bash', [script, ...args], {
+      cwd: packageRoot,
+      stdio: 'inherit',
+      env: { ...process.env, GRU_COMMAND_NODE: process.execPath },
+    });
     if (result.error !== undefined) {
       process.stderr.write(`gru: could not run ${script}: ${result.error.message}\n`);
       return 1;

@@ -351,7 +351,7 @@ export async function runServiceCli(
       `gru: service unreachable at ${base} (${String((error as Error).message)}) — ` +
         'the self-roll requires the running OS service; check it with gru status, start it with gru start',
     );
-    if (options.action === 'restart') configChangeHint(deps.stderr);
+    configChangeHint(deps.stderr);
     return 1;
   }
   let body: RollApiBody;
@@ -380,8 +380,10 @@ export async function runServiceCli(
     deps.stderr(
       `gru: roll refused (HTTP ${res.status}): ${body.detail ?? body.error ?? 'unknown error'}`,
     );
-    // 401: a new token; 503: a token added where none was; 404: the port now names another listener.
-    if (options.action === 'restart' && [401, 404, 503].includes(res.status)) configChangeHint(deps.stderr);
+    // Anything but our own validation error (400) may be the edited config
+    // talking: a new token (401), one added where none was (503), or the new
+    // port reaching another listener (404, 405, 500, ...).
+    if (res.status !== 400) configChangeHint(deps.stderr);
     return 1;
   }
   if (!options.wait) return 0;
@@ -506,7 +508,7 @@ async function foreignHealthListener(
 function configChangeHint(stderr: (line: string) => void): void {
   stderr(
     'if config.toml changed [server] host/port or [auth] token, the running service still uses the old ' +
-      'values and cannot be reached this way: apply the edit with gru restart --now',
+      'values and cannot be reached this way: apply the edit with gru restart --now, from a terminal outside the service',
   );
 }
 

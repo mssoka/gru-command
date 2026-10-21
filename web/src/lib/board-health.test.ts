@@ -90,7 +90,7 @@ describe('deploy drift math — the card that catches a 43-commit-behind service
     expect(card.flag).toBe('UPDATE AVAILABLE');
     expect(card.tone).toBe('alert');
     expect(card.detail).toContain('contains v1.0.1');
-    expect(card.detail).toContain('update with gru update (or ./install.sh --update in the deploy clone)');
+    expect(card.detail).toContain('update with gru update (or ./install.sh --update in the Gru Command checkout)');
     expect(card.detail).not.toContain('gru-service');
     expect(card.titleAttr).toContain('older than release v1.0.2');
   });

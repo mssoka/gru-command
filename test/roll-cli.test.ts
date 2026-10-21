@@ -208,15 +208,15 @@ describe('gru roll follow loop', () => {
     expect(await runServiceCli(['restart'], down.deps)).toBe(1);
     expect(down.stderr.join('\n')).toContain('start it with gru start');
     expect(down.stderr.join('\n')).toContain('apply the edit with gru restart --now');
-    for (const status of [401, 404, 503]) {
+    for (const [command, status] of [['restart', 401], ['restart', 404], ['restart', 503], ['restart', 500], ['roll', 401]] as const) {
       const rejected = await harness({ post: jsonResponse(status, { error: 'refused' }) });
-      expect(await runServiceCli(['restart'], rejected.deps)).toBe(1);
-      expect(rejected.stderr.join('\n')).toContain('[auth] token');
+      expect(await runServiceCli([command], rejected.deps)).toBe(1);
+      expect(rejected.stderr.join('\n')).toContain('apply the edit with gru restart --now, from a terminal outside the service');
     }
-    // A plain roll keeps its own refusal without the restart hint.
-    const roll = await harness({ post: jsonResponse(401, { error: 'unauthorized' }) });
-    expect(await runServiceCli(['roll'], roll.deps)).toBe(1);
-    expect(roll.stderr.join('\n')).not.toContain('gru restart --now');
+    // Our own validation error is not the config talking.
+    const invalid = await harness({ post: jsonResponse(400, { error: 'bad_request', detail: 'mode must be "update" or "restart"' }) });
+    expect(await runServiceCli(['restart'], invalid.deps)).toBe(1);
+    expect(invalid.stderr.join('\n')).not.toContain('gru restart --now');
   });
 
   it('gru restart refuses, non-zero, while another roll is in progress — it never attaches to it', async () => {

@@ -18,7 +18,7 @@
 #                                    case-insensitive). Run from inside the
 #                                    managed service (an agent-owned shell),
 #                                    the restart is delegated to
-#                                    `gru-service roll` — never unload/load:
+#                                    `gru roll --no-wait` — never unload/load:
 #                                    launchd SIGTERMs the job's whole process
 #                                    group, killing the updater before it can
 #                                    reload the unit (observed 2026-09-23)
@@ -26,7 +26,8 @@
 #   ./install.sh --answers '<json>'  fresh non-interactive setup overrides;
 #                                    secrets are forbidden in answers
 #   ./install.sh --force             allow wizard/config replacement with backup
-#   ./install.sh --service           register + start the OS service only
+#   ./install.sh --service           register + start the OS service (and
+#                                    refresh the `gru` command for it)
 #                                    (the E7 path; also how the wizard
 #                                    registers the service — one mechanism)
 #   ./install.sh --print             render the unit to stdout; change nothing
@@ -40,7 +41,7 @@
 #                                    in flight are cut and resumed by boot
 #                                    recovery (`gru restart` drains first)
 #
-# Setup and update also install the `gru` command: a small launcher in
+# Setup, update and --service also install the `gru` command: a launcher in
 # ~/.local/bin that runs this checkout's CLI from any directory (`gru
 # update`, `gru restart`, `gru status`, ...). A `gru` there that this
 # installer did not write is never replaced.
@@ -135,23 +136,34 @@ fi
 # Resolve node to its REAL path: version managers (fnm/nvm/asdf) put
 # ephemeral per-shell symlinks on PATH — a service unit pointing at one
 # breaks on the next shell. The resolved install path is stable.
-NODE_BIN="$(command -v node || true)"
-if [[ -n "$NODE_BIN" ]]; then
-  # Resolve the executable symlink too, not just its parent directory:
-  # fnm's per-shell bin can disappear after the installing shell exits.
-  resolved="$("$NODE_BIN" -p 'require("node:fs").realpathSync(process.execPath)' 2>/dev/null || true)"
-  [[ -n "$resolved" && -x "$resolved" ]] && NODE_BIN="$resolved"
-fi
+node_ok() {
+  "$NODE_BIN" -e 'const [M,m]=process.versions.node.split(".").map(Number);
+    if (M < 22 || (M === 22 && m < 19)) process.exit(1)' 2>/dev/null
+}
+
+# The shell's node, as running this script yourself would use. `gru` hands
+# over the node it runs on as GRU_COMMAND_NODE (#463): used only when the
+# shell has no node, or one older than the minimum (a non-interactive ssh
+# or cron shell without the version manager loaded).
+select_node_bin() {
+  local resolved
+  NODE_BIN="$(command -v node || true)"
+  if [[ -n "$NODE_BIN" ]]; then
+    # Resolve the executable symlink too, not just its parent directory:
+    # fnm's per-shell bin can disappear after the installing shell exits.
+    resolved="$("$NODE_BIN" -p 'require("node:fs").realpathSync(process.execPath)' 2>/dev/null || true)"
+    [[ -n "$resolved" && -x "$resolved" ]] && NODE_BIN="$resolved"
+  fi
+  if [[ -n "${GRU_COMMAND_NODE:-}" && -x "$GRU_COMMAND_NODE" ]] && { [[ -z "$NODE_BIN" ]] || ! node_ok; }; then
+    NODE_BIN="$GRU_COMMAND_NODE"
+  fi
+}
+select_node_bin
 
 if [[ -z "$NODE_BIN" ]]; then
   err "node was not found on PATH — install Node.js >= 22.19 first (https://nodejs.org)"
   exit 1
 fi
-
-node_ok() {
-  "$NODE_BIN" -e 'const [M,m]=process.versions.node.split(".").map(Number);
-    if (M < 22 || (M === 22 && m < 19)) process.exit(1)' 2>/dev/null
-}
 
 detect_os() {
   case "$(uname -s)" in
@@ -505,11 +517,10 @@ require_owned_unit() {
 refuse_inside_service() {
   if inside_managed_service_pgroup; then
     err "cannot $1 the service from inside it: the service manager would end this command with it"
-    if [[ "$1" == "restart" ]]; then
-      err "use 'gru restart --no-wait' instead: the service drains in-flight work and relaunches itself (its drain counts this session's own turn, so waiting on it would only wait out the drain bound)"
-    else
-      err "run 'gru stop' from a terminal outside the service"
-    fi
+    case "$1" in
+      restart) err "use 'gru restart --no-wait' instead: the service drains in-flight work and relaunches itself (its drain counts this session's own turn, so waiting on it would only wait out the drain bound)" ;;
+      *) err "run 'gru $1' from a terminal outside the service" ;;
+    esac
     exit 1
   fi
 }
@@ -599,19 +610,24 @@ sh_single_quote() {
 
 # The launcher pins this install's node, checkout and instance directory, the
 # three the unit runs with (an explicit GRU_COMMAND_HOME still wins). If the
-# checkout or node is gone it names the repair, instead of a bare error.
+# checkout, its build or the node is gone it names that repair, instead of a
+# bare error; the repair command carries the instance it was installed for.
 write_launcher() {
-  local node cli setup
+  local node cli setup repair
   node="$(sh_single_quote "$NODE_BIN")"
   cli="$(sh_single_quote "$REPO_ROOT/dist/cli/service.js")"
   setup="$(sh_single_quote "$REPO_ROOT/install.sh")"
+  repair="$(sh_single_quote "GRU_COMMAND_HOME=$INSTANCE_DIR $REPO_ROOT/install.sh --update")"
   printf '#!/bin/sh\n%s\n' "$LAUNCHER_MARKER"
   printf 'if [ -z "${GRU_COMMAND_HOME:-}" ]; then GRU_COMMAND_HOME=%s; export GRU_COMMAND_HOME; fi\n' "$(sh_single_quote "$INSTANCE_DIR")"
-  printf 'if [ ! -f %s ]; then\n' "$cli"
+  printf 'if [ ! -f %s ]; then\n' "$setup"
   printf '  printf %s %s >&2\n' "'gru: the Gru Command checkout at %s is gone; reinstall it with the one-line installer\\n'" "$(sh_single_quote "$REPO_ROOT")"
   printf '  exit 1\nfi\n'
+  printf 'if [ ! -f %s ]; then\n' "$cli"
+  printf '  printf %s %s >&2\n' "'gru: this install is not built; rebuild it with: %s\\n'" "$repair"
+  printf '  exit 1\nfi\n'
   printf 'if [ ! -x %s ]; then\n' "$node"
-  printf '  printf %s %s %s >&2\n' "'gru: the Node.js it was installed with (%s) is gone; run %s --update from a shell with Node.js 22.19+\\n'" "$node" "$setup"
+  printf '  printf %s %s %s >&2\n' "'gru: the Node.js it was installed with (%s) is gone; from a shell with a current Node.js run: %s\\n'" "$node" "$repair"
   printf '  exit 1\nfi\n'
   printf 'exec %s %s "$@"\n' "$node" "$cli"
 }
@@ -628,6 +644,11 @@ link_cli() {
   # or update around it (the service reconciliation still has to run).
   if ! mkdir -p "$BIN_DIR" 2>/dev/null || ! staged="$(mktemp "$BIN_DIR/.gru.XXXXXX" 2>/dev/null)"; then
     err "could not install the 'gru' command in $BIN_DIR; continuing without it"
+    return 0
+  fi
+  # Unchanged (an update, or the wizard's --service right after setup): quiet.
+  if is_our_launcher "$launcher" && write_launcher | cmp -s - "$launcher"; then
+    rm -f "$staged"
     return 0
   fi
   if ! write_launcher > "$staged" || ! chmod 755 "$staged" || ! mv -f "$staged" "$launcher"; then
@@ -818,8 +839,8 @@ prompt_register_service() {
 # the service's own roll path: preflight already ran here, the roll drains,
 # writes the swap marker, exits 75 (restart-worthy for launchd KeepAlive
 # {SuccessfulExit=false} and systemd Restart=on-failure), and the
-# relaunched build verifies itself; the CLI waits for /health to report
-# the target build SHA and only then exits 0.
+# relaunched build verifies itself. The CLI does not wait (#463): the
+# relaunch ends this shell with the service, before any verification.
 restart_owned_service_in_service() {
   local cli="$REPO_ROOT/dist/cli/service.js"
   if [[ ! -f "$cli" ]]; then
@@ -827,8 +848,12 @@ restart_owned_service_in_service() {
     err "a successful build produces it; run this update from a terminal instead"
     exit 1
   fi
-  echo "update is running inside the managed service — delegating the restart to 'gru roll'…"
-  "$NODE_BIN" "$cli" roll
+  # --no-wait: this shell is a child of the service, so the relaunch ends it
+  # before it could verify anything; waiting would only sit out the drain,
+  # which counts this session's own turn.
+  echo "update is running inside the managed service — delegating the restart to 'gru roll --no-wait'…"
+  "$NODE_BIN" "$cli" roll --no-wait
+  echo "the service relaunches itself once its drain settles; check it afterwards with: gru status"
 }
 
 # Restart an OWNED installed unit (the owned arm of the updater).

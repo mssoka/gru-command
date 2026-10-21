@@ -38,7 +38,7 @@ The OS service manager is the SERVICE's out-of-band watcher (SPEC ruling
 
 ```bash
 ./install.sh              # full setup (deps + build → wizard)
-./install.sh --service    # register + start the service (launchd/systemd)
+./install.sh --service    # register + start the service (launchd/systemd), refresh gru
 ./install.sh --print      # render the platform unit; change nothing
 ./install.sh --uninstall  # stop the service and remove the unit (and the gru launcher)
 ./install.sh --stop       # stop the owned service (down until --start, a reboot or next login)
@@ -69,17 +69,18 @@ the relaunch and the `/health` check. Use it to apply `config.toml` edits.
 `gru restart --now` restarts through the service manager at once; boot
 recovery resumes the turns it cut.
 
-`gru update` runs the deploy clone's `install.sh --update` on your shell's
-Node.js, exactly as running it there would, so a Node upgrade is picked up;
-only a shell with no `node` falls back to the Node.js `gru` was installed
-with.
+`gru update` runs the deploy clone's `install.sh --update` from that
+checkout, on your shell's Node.js as running it yourself would (a Node
+upgrade is picked up, and the unit and launcher move to it). A shell with
+no `node`, or one older than 22.19, falls back to the Node.js `gru` runs
+on.
 
 From inside the service (an agent's shell), `gru stop` and
 `gru restart --now` refuse, because the service manager would end them with
-the service. Use `gru restart --no-wait` and `gru roll --no-wait` there
-(`gru update` from inside hands off to a waiting `gru roll`): the drain
-counts the calling session's own turn, so waiting would only sit out the
-drain bound. The CLI reads the instance's `config.toml` to reach the
+the service. Use `gru restart --no-wait` there; `gru update` from inside
+already hands off to `gru roll --no-wait`. The drain counts the calling
+session's own turn, and the relaunch ends that shell with the service, so
+waiting would only sit out the drain bound and never see the result. The CLI reads the instance's `config.toml` to reach the
 service, so an edit to `[server]` host/port or `[auth]` token is applied
 with `gru restart --now` from a terminal — the service cannot apply it from
 inside, and that restart cuts the turns in flight.

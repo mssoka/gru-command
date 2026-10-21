@@ -494,7 +494,7 @@ async function lockLedger(realData: string | null): Promise<LedgerProbe> {
   if (realData === null) return { kind: 'absent' };
   const file = join(realData, LEDGER_DIR, 'ledger.db');
   if (!existsSync(file)) return { kind: 'absent' };
-  // Loaded only here: `gru-service roll` never touches the ledger.
+  // Loaded only here: `gru roll` never touches the ledger.
   const { DatabaseSync } = await import('node:sqlite');
   let db: InstanceType<typeof DatabaseSync> | null = null;
   try {

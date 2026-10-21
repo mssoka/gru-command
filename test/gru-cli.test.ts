@@ -1,6 +1,6 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { loadConfig, type GruCommandConfig } from '../src/config.js';
 import type { BuildInfo } from '../src/build-info.js';
@@ -118,33 +118,20 @@ describe('gru update / stop / start / restart --now hand off to install.sh', () 
     expect(h.stderr.join('\n')).toContain('restart --now takes no other options');
   });
 
-  it('runs the real install.sh with exactly those flags and its exit code; the shell\'s node wins, the pinned one is the fallback', () => {
-    const root = mkdtempSync(join(tmpdir(), 'gru-command-installer-'));
+  it('runs the real install.sh from its checkout with exactly those flags, hands over its own node, and returns the exit code', () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'gru-command-installer-')));
     cleanupDirs.push(root);
     const record = join(root, 'record.txt');
     writeFileSync(join(root, 'install.sh'),
-      `printf '%s\\n' "$*" "$(command -v node)" > ${JSON.stringify(record)}\nexit 7\n`);
-    // A PATH with bash and nothing else, and one with a different node first.
-    const bashOnly = join(root, 'bash-only');
-    mkdirSync(bashOnly);
-    symlinkSync('/bin/bash', join(bashOnly, 'bash'));
-    const shellNode = join(root, 'shell-node');
-    mkdirSync(shellNode);
-    writeFileSync(join(shellNode, 'node'), '#!/bin/sh\n', { mode: 0o755 });
-    const recorded = (path: string): readonly string[] => {
-      const original = process.env['PATH'];
-      process.env['PATH'] = path;
-      try {
-        expect(installerRunnerFor(root)(['--stop'])).toBe(7);
-      } finally {
-        process.env['PATH'] = original;
-      }
-      return readFileSync(record, 'utf8').trimEnd().split('\n');
-    };
-    const [args, fallback] = recorded(bashOnly);
+      `printf '%s\\n' "$*" "$GRU_COMMAND_NODE" "$(pwd -P)" "$PATH" > ${JSON.stringify(record)}\nexit 7\n`);
+    expect(installerRunnerFor(root)(['--stop'])).toBe(7);
+    const [args, node, cwd, path] = readFileSync(record, 'utf8').trimEnd().split('\n');
     expect(args).toBe('--stop');
-    expect(dirname(fallback!)).toBe(dirname(process.execPath));
-    expect(recorded(`${shellNode}:${bashOnly}`)[1]).toBe(join(shellNode, 'node'));
+    // install.sh decides: the shell's node, or this one when the shell's is missing or too old.
+    expect(node).toBe(process.execPath);
+    // From the checkout, so a version manager never picks a node from the caller's directory.
+    expect(cwd).toBe(root);
+    expect(path).toBe(process.env['PATH']);
   });
 
   it('every subcommand answers --help with usage and exit 0, running nothing', async () => {

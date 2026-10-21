@@ -248,7 +248,7 @@ const PINS: Record<string, number> = {
   'incident.test.ts': 12,
   'identity.test.ts': 3,
   'install-one-line.test.ts': 50,
-  'install.test.ts': 23,
+  'install.test.ts': 25,
   'intake-approval-packaged.test.ts': 2,
   'intake-approval.test.ts': 31,
   'intake-breakdown.test.ts': 42,

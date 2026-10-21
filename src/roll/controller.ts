@@ -384,11 +384,11 @@ export class RollController {
     await this.refuseForeignListener(state);
     const built = readBuildInfo(this.opts.repoRoot).rev;
     if (built === null) {
-      throw new Error('the deploy clone has no build stamp (dist/build-rev.json) — run `gru update` to build it, then restart');
+      throw new Error('the deploy clone has no build stamp (dist/build-rev.json) — run `gru update` (or ./install.sh --update in the checkout) to build it, then restart');
     }
     for (const artifact of REQUIRED_ARTIFACTS) {
       if (!existsSync(join(this.opts.repoRoot, artifact))) {
-        throw new Error(`a restart needs a complete build, but ${artifact} is missing — run \`gru update\``);
+        throw new Error(`a restart needs a complete build, but ${artifact} is missing — run \`gru update\` (or ./install.sh --update in the checkout)`);
       }
     }
     const preflight = {

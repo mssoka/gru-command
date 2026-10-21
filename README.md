@@ -283,7 +283,7 @@ workflow selection. [docs/BMAD-RUNTIME.md](docs/BMAD-RUNTIME.md) covers:
 
 ```bash
 npm start               # serve the web UI + /health on the configured bind
-./install.sh --service  # register + start as a login OS service
+./install.sh --service  # register + start as a login OS service (and refresh gru)
 ./install.sh --uninstall
 ```
 
