@@ -2569,16 +2569,17 @@ describe('WaveRunner built-in Perkins production path', () => {
     const wave = new WaveRunner({ ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner, reviewArtifactRoot: artifacts });
     expect(await wave.recoverInterruptedRounds()).toBe(1);
     expect(ledger.getRound(round.id)?.status).toBe('aborted');
-    // gh-169: a pending round with zero children aborts as ONE parent
-    // incident — every lens stays pending (not-started), none is error.
+    // #466: a round that never went live spawned nothing — a setup
+    // interruption with the no-spawn receipt, never a parent incident. Every
+    // lens stays pending (not-started), none is error.
     const abortedChips = ledger.getRound(round.id)?.lenses ?? [];
     expect(abortedChips.every((chip) => chip.state === 'pending')).toBe(true);
-    const pendingIncident = ledger.listEvents({ limit: 200 }).find((event) => event.kind === 'round.parent-incident' && event.roundId === round.id);
-    expect(pendingIncident?.payload).toMatchObject({ startedAttempts: 0, startedLenses: [] });
+    expect(ledger.uniqueRoundNoSpawnReceipt(round.id)?.payload).toMatchObject({ roundId: round.id, ownerGeneration: null });
+    expect(ledger.latestRoundEvent(round.id, 'round.parent-incident')).toBeNull();
     // P6: the missing-lane restart report also states the execution facts
     // (zero started, every lens never started).
     const missingLaneReport = readFileSync(join(artifacts, round.id, 'perkins-report.md'), 'utf8');
-    expect(missingLaneReport).toContain('**Parent incident**');
+    expect(missingLaneReport).toContain('**Setup interruption**');
     expect(missingLaneReport).toContain('0 journaled attempt(s) started (0 of 2 lenses: none)');
     expect(missingLaneReport).toContain('2 lens(es) never started (blind, security)');
     expect(existsSync(join(artifacts, round.id, 'restart-recovery.json'))).toBe(true);
@@ -3864,6 +3865,77 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(fake.leadCalls).toHaveLength(0);
   }, 180_000);
 
+  // #466: a crash after admission but before the round goes live leaves a
+  // pending round with no agents or starts. Startup recovery proves it spawned
+  // nothing, so the job's replacement review is admitted.
+  it.each([
+    { slug: 'no-lane', stage: 'before its review lane registered', reason: 'service_restart_missing_review_lane', marker: false },
+    { slug: 'no-marker', stage: 'after its review lane, before the owner marker', reason: 'service_restart', marker: false },
+    { slug: 'marker', stage: 'after the owner marker, before going live', reason: 'service_restart', marker: true },
+  ])('records a no-spawn receipt at startup for a setup that crashed $stage (#466)', async ({ slug, reason, marker }) => {
+    const fixture = integrityHarness(`perkins-setup-crash-${slug}`);
+    await fixture.prepare();
+    let crash!: () => void;
+    const crashed = new Promise<void>((resolveCrash) => { crash = resolveCrash; });
+    const die = (): Promise<never> => { crash(); return new Promise<never>(() => {}); };
+    const createReview = fixture.port.createReviewWorktree.bind(fixture.port);
+    if (!marker) {
+      vi.spyOn(fixture.port, 'createReviewWorktree').mockImplementationOnce(async (input) => {
+        if (reason === 'service_restart') await createReview(input);
+        return die();
+      });
+    }
+    const dying = fixture.fake({ childAnswer: () => '[]', specialists: [] });
+    // The marker variant dies awaiting resident slots, after the marker and
+    // before beginSpawn records the round live.
+    void fixture.wave('fixture-model-v1', dying.spawner, 'high', 'fixture-runtime-v1', 'fixture-safe-route', 'pi', undefined,
+      marker ? die : undefined).runRound({ jobId: fixture.jobId }).catch(() => {});
+    await crashed;
+    const [round] = fixture.ledger.listRounds(fixture.jobId);
+    expect(round?.status).toBe('pending');
+    const owner = fixture.ledger.uniqueRoundReviewOwnerMarker(round!.id);
+    expect(owner !== null).toBe(marker);
+
+    // The restarted service: a fresh runner over the same ledger and lanes.
+    expect(await fixture.wave('fixture-model-v1', dying.spawner).recoverInterruptedRounds()).toBe(1);
+    expect(fixture.ledger.getRound(round!.id)?.status).toBe('aborted');
+    expect(fixture.ledger.uniqueRoundNoSpawnReceipt(round!.id)?.payload).toMatchObject({
+      roundId: round!.id, ownerGeneration: (owner?.payload as { generation?: string } | undefined)?.generation ?? null,
+    });
+    expect(fixture.ledger.latestRoundEvent(round!.id, 'round.parent-incident')).toBeNull();
+    expect(fixture.ledger.latestRoundEvent(round!.id, 'round.perkins-incomplete')?.payload).toMatchObject({ reason });
+    expect(dying.leadCalls).toHaveLength(0);
+    const replacement = fixture.fake({ childAnswer: () => '[]', specialists: [] });
+    await fixture.wave('fixture-model-v1', replacement.spawner).runRound({ jobId: fixture.jobId });
+    expect(replacement.leadCalls).toHaveLength(1);
+    expect(fixture.ledger.listRounds(fixture.jobId)).toHaveLength(2);
+  }, 180_000);
+
+  it('never records a no-spawn receipt at startup for a round that went live before the crash (#466)', async () => {
+    const fixture = integrityHarness('perkins-live-crash-no-receipt');
+    await fixture.prepare();
+    let crash!: () => void;
+    const crashed = new Promise<void>((resolveCrash) => { crash = resolveCrash; });
+    // The process dies inside the lead spawn: live, marker written, no agent.
+    const dying: AgentSpawner = async () => { crash(); return new Promise<never>(() => {}); };
+    void fixture.wave('fixture-model-v1', dying).runRound({ jobId: fixture.jobId }).catch(() => {});
+    await crashed;
+    const [round] = fixture.ledger.listRounds(fixture.jobId);
+    expect(round?.status).toBe('live');
+    expect(fixture.ledger.uniqueRoundReviewOwnerMarker(round!.id)).not.toBeNull();
+
+    expect(await fixture.wave('fixture-model-v1', dying).recoverInterruptedRounds()).toBe(1);
+    expect(fixture.ledger.getRound(round!.id)?.status).toBe('aborted');
+    expect(fixture.ledger.latestRoundEvent(round!.id, 'round.review-no-spawn')).toBeNull();
+    expect(fixture.ledger.latestRoundEvent(round!.id, 'round.parent-incident')).not.toBeNull();
+    expect(fixture.ledger.latestRoundEvent(round!.id, 'round.perkins-incomplete')?.payload).toMatchObject({ reason: 'service_restart' });
+    // With no receipt, the replacement still waits on the marker's cessation proof.
+    const unproven = new WaveRunner({ ledger: fixture.ledger, worktrees: fixture.port, spawner: dying,
+      reviewArtifactRoot: fixture.artifacts, reconcileReviewAgent: async () => false });
+    await expect(unproven.runRound({ jobId: fixture.jobId })).rejects.toThrow(/marker.*may still run/);
+    expect(fixture.ledger.listRounds(fixture.jobId)).toHaveLength(1);
+  }, 180_000);
+
   it('blocks an unreceipted legacy freeze with unknown ownership and retains same-head charged starts', async () => {
     const fixture = integrityHarness('perkins-legacy-freeze');
     await fixture.prepare();
@@ -3989,7 +4061,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(fixture.ledger.uniqueRoundNoSpawnReceipt(failed.id)).toBeNull();
     const third = fixture.fake({ childAnswer: () => '[]', specialists: [] });
     await expect(fixture.wave('fixture-model-v1', third.spawner).runRound({ jobId: fixture.jobId, force: true }))
-      .rejects.toThrow(/contradictory or duplicate no-spawn and owner evidence/);
+      .rejects.toThrow(/contradictory or duplicate no-spawn and owner evidence.*inspect the round's round\.review-no-spawn and round\.review-owner events and its agents in <data_dir>\/ledger\/ledger\.db/);
     expect(third.leadCalls).toHaveLength(0);
   }, 180_000);
 

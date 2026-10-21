@@ -3504,7 +3504,7 @@ export class WaveRunner {
       // Pre-abort classification: a live chip is a started child even when
       // its journal write was lost to the crash (P5).
       const preAbortFacts = this.interruptedExecutionFacts(round, round.lenses.map((chip) => chip.lens as PerkinsLens));
-      this.abortRound(round, note);
+      this.abortInterruptedRound(round, note);
       // A round a restart caught mid-supersession (owner rule 3) keeps its
       // true classification: superseded, never a clean service restart.
       const restartReason = this.opts.ledger.latestRoundEvent(round.id, 'round.superseded') !== null ? 'superseded' : 'service_restart';
@@ -3560,7 +3560,7 @@ export class WaveRunner {
         await this.reconcileInterruptedPublication(round);
         const note = 'review interrupted before its detached worktree was durably registered; required proof is incomplete';
         const preAbortFacts = this.interruptedExecutionFacts(round, round.lenses.map((chip) => chip.lens as PerkinsLens));
-        this.abortRound(round, note);
+        this.abortInterruptedRound(round, note);
         const restartReason = this.opts.ledger.latestRoundEvent(round.id, 'round.superseded') !== null
           ? 'superseded' : 'service_restart_missing_review_lane';
         const artifacts = this.writeInterruptedArtifacts(round.id, restartReason, note, preAbortFacts);
@@ -3591,6 +3591,17 @@ export class WaveRunner {
       }
     }
     return recovered;
+  }
+
+  /** Startup recovery's abort (#466). A round that never went `live` spawned
+   * nothing: `beginSpawn` commits `live` before any spawner runs. It aborts
+   * with the atomic no-spawn receipt the replacement gate trusts, even when
+   * the crash beat its owner marker. A live round keeps the parent-incident
+   * abort and never gets a receipt; its marker binds the cessation proof. A
+   * refused receipt throws and leaves the round pending for inspection. */
+  private abortInterruptedRound(round: RoundRecord, note: string): void {
+    if (round.status === 'pending') this.opts.ledger.abortReviewSetupWithoutSpawn(round.id);
+    else this.abortRound(round, note);
   }
 
   /** A write-once pre-spawn event, not a ledger lifecycle state, binds
@@ -5508,7 +5519,7 @@ export class WaveRunner {
         (marker !== null || this.opts.ledger.latestRoundEvent(oldRound.id, 'round.review-owner') === null) &&
         this.opts.ledger.listRoundSpecialistStarts(oldRound.id).length === 0;
       if (this.opts.ledger.latestRoundEvent(oldRound.id, 'round.review-no-spawn') !== null && !noSpawn) {
-        throw new Error(`review round ${oldRound.id} has contradictory or duplicate no-spawn and owner evidence; reconcile ownership manually`);
+        throw new Error(`review round ${oldRound.id} has contradictory or duplicate no-spawn and owner evidence, which only a ledger defect produces — inspect the round's round.review-no-spawn and round.review-owner events and its agents in <data_dir>/ledger/ledger.db (read-only), then reconcile ownership manually`);
       }
       if (!noSpawn && marker === null && agents.length === 0) {
         throw new Error(`review round ${oldRound.id} has no trusted no-spawn proof or owner marker; ownership is unknown (including a possible spawn-before-registration crash) — reconcile cessation manually before replacement`);
