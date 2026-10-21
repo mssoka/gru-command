@@ -259,6 +259,56 @@ degenerate into check-failed movement.
   durably terminalizes the round as INCOMPLETE. It can
   neither post nor record approval. Startup reconciliation marks interrupted
   rounds INCOMPLETE and releases their owned detached lanes.
+- A round cut by a graceful service shutdown records its INCOMPLETE reason
+  as `service_restart` (#464). Startup recovery uses the same reason for a
+  round that a crash interrupted. It applies at every stage:
+  - during setup;
+  - while waiting for resident slots;
+  - mid-review;
+  - after the workflow returned, before finalization;
+  - during report delivery.
+
+  A supersession, recorded or in flight, is never labelled
+  `service_restart`; setup and mid-review cuts record `superseded`, as
+  startup recovery does. Silas's `clean-abort-service-restart` row then
+  re-arms the round on the unchanged delivered head after boot.
+
+  A round cut during delivery keeps its delivery failure beside the reason,
+  and stays held while its in-flight post is unreconciled. The next start
+  asks the provider, read-only, as startup recovery does for a live round.
+  Each later start asks again while the lookup cannot answer.
+  - **Proven absent:** the row opens.
+  - **Proven landed:** the post is retained uncredited and the round stays
+    held for manual reconciliation; no later start asks again.
+
+  A refused re-arm keeps the row, and each sweep tries again.
+- A replacement round is admitted only once every earlier round's review
+  owner is proven ceased. Ledger disposal state is not proof.
+  - **Durable record.** When the owning process's adapter reports a review
+    session `ceased`, the process writes `round.review-owner-ceased`
+    (source `adapter`), bound to the round's unique owner marker. A
+    restarted service still accepts it (#464).
+  - **Dead-host proof.** An owner hosted by another process that left no
+    record (a crash, or a round older than the record) may instead be
+    proven gone. Claude Code needs all of these:
+    - the host is gone. Its pid is dead, or the process now holding it has
+      a different start identity from the one the marker recorded: a reused
+      pid, or this service restarted under that pid. A marker with no
+      identity under another live process's pid refuses;
+    - no live process is rooted (argv or cwd) in the round's review
+      worktree;
+    - no live process names one of the round's session ids;
+    - no session lock of the round is held by a live pid other than the gone
+      host.
+
+    pi still accepts its host's OS-proven death. Unreadable evidence
+    refuses. A passing proof is recorded once (source `host-exit`), so it is
+    never re-decided. The same proof clears a writer that is waiting on a
+    supersession a restart interrupted.
+  - **Refusal.** A refused request answers 400. The refusal names a
+    process that may still run, or a file to clear, where there is one.
+    Every later request re-checks. See [RUNTIME-PARITY.md](./RUNTIME-PARITY.md) ("A
+    review owner from another process").
 - The base is changed source only when the locally resolved base ref no
   longer contains the frozen merge-base (rewritten past it) or no longer
   resolves; nothing is fetched, so a host-side rewrite counts once it is
@@ -856,7 +906,8 @@ the judgment; the dispatch surface is the mechanical hand.
   computed from the ledger: delivered jobs with no PR registered; PRs
   whose follow-up delivery proves the lane head moved past the newest
   round's reviewed target (first review AND re-review after a fix round);
-  or a proven `service_restart` abort on the unchanged delivered head,
+  or a proven `service_restart` abort on the unchanged delivered head (a
+  round cut by a graceful shutdown, or found interrupted at startup),
   once per source round under `clean-abort-service-restart`. Other aborts
   and unchanged heads warrant no round. The re-arm is bound to the proved
   delivered head: an explicit `target_ref` must name that sha and an

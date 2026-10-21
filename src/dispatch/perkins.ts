@@ -29,6 +29,7 @@ import {
 import type { AgentSpawner } from './service.js';
 import type { EventBus } from '../events/bus.js';
 import { validReviewOwnerGeneration, type ResidentReviewRound, type ReviewOwnerMarker } from '../runtime/registry.js';
+import { firstFive, thisProcessIdentity, type ReviewHostExitInput, type ReviewHostExitResult } from '../runtime/review-host-exit.js';
 import { settleRetries, type PacingGate, type PacingLease, type RateLimitBackoffPolicy, type RetrySettlement } from '../runtime/pacing.js';
 import { isExactOriginBranchSpelling } from '../worktrees/manager.js';
 import { loadWorktreeManifest } from '../worktrees/manifest.js';
@@ -68,6 +69,7 @@ import {
   parsePublicationIdentityPayload,
   parsePublicationRebindUnresolvedPayload,
   parsePublicationReceiptEvidencePayload,
+  pendingPublicationAttempt,
   reviewEventMatchesVerdict,
   type PublicationAttemptPayload,
   type PublicationReceiptEvidencePayload,
@@ -1829,6 +1831,10 @@ export interface WaveRunnerOptions {
   readonly reviewThinkingLevel?: () => string;
   /** Runtime-owned proof that an interrupted owner has actually ceased. */
   readonly reconcileReviewAgent?: (agentId: string, marker: ReviewOwnerMarker | null) => Promise<boolean>;
+  /** #464: the runtime's dead-host proof for an owner whose host is gone
+   * without a durable cessation record; a passing proof is recorded, so
+   * `reconcileReviewAgent` then answers from that record. */
+  readonly proveReviewHostExit?: (input: ReviewHostExitInput) => Promise<ReviewHostExitResult>;
   readonly maxConcurrentChildren?: number;
   /** Ledger bus used to admit a worker's durable handoff after its turn delivers. */
   readonly bus?: EventBus;
@@ -2600,6 +2606,35 @@ export class WaveRunner {
     return roundIds.length === 0 && operations === 0 && !unprovenFallback ? null : { roundIds, operations };
   }
 
+  /** #464: a graceful service shutdown, not a supersession, cut this round:
+   * the restart's clean abort (`service_restart`), re-armed after boot. A
+   * supersession wins, durable or in flight, as startup recovery rules. */
+  private shutdownCut(roundId: string, signal: AbortSignal): boolean {
+    return this.shuttingDown && !(signal.reason instanceof ReviewSupersededError) &&
+      this.opts.ledger.latestRoundEvent(roundId, 'round.superseded') === null;
+  }
+
+  /** A restart's clean abort whose in-flight post the provider can still
+   * answer (#464): a delivery cut, or a startup recovery whose lookup failed.
+   * A post already proven present (or a rebinding left unresolved) stays
+   * held without asking again. */
+  private deliveryCutUnreconciled(roundId: string): boolean {
+    const incomplete = this.opts.ledger.latestRoundEvent(roundId, 'round.perkins-incomplete');
+    const payload = incomplete?.payload as { reason?: unknown } | null | undefined;
+    return payload?.reason === 'service_restart' &&
+      pendingPublicationAttempt(this.opts.ledger, roundId)?.kind === 'unresolved-attempt';
+  }
+
+  /** Why an aborted signal cut this round: a supersession (in flight or
+   * recorded) first, then a graceful shutdown, else an honest `cancelled`
+   * that is never re-armed. */
+  private interruptionReason(roundId: string, signal: AbortSignal): 'superseded' | 'service_restart' | 'cancelled' {
+    if (signal.reason instanceof ReviewSupersededError || this.opts.ledger.latestRoundEvent(roundId, 'round.superseded') !== null) {
+      return 'superseded';
+    }
+    return this.shutdownCut(roundId, signal) ? 'service_restart' : 'cancelled';
+  }
+
   /** True while a superseded round's stop is not PROVEN: no confirmation
    * newer than its supersession (or its last unconfirmed re-proof). A
    * restart that interrupted the pass leaves exactly this shape. */
@@ -2642,14 +2677,40 @@ export class WaveRunner {
     if (marker === null && agents.length === 0) {
       return `round ${round.id} has neither a no-spawn proof nor an owner marker — a spawn before registration cannot be ruled out`;
     }
-    if (marker !== null && agents.length === 0 && await this.opts.reconcileReviewAgent?.('', marker) !== true) {
-      return `round ${round.id}'s review owner may still run before agent registration`;
-    }
-    const running: string[] = [];
-    for (const agent of agents) {
-      if (await this.opts.reconcileReviewAgent?.(agent.id, marker) !== true) running.push(agent.id);
-    }
-    return running.length === 0 ? null : `round ${round.id} review session(s) ${running.join(', ')} not proven ceased`;
+    const unproven = await this.unprovenReviewOwners(round, marker, agents);
+    if (unproven.ids.length === 0) return null;
+    return agents.length === 0
+      ? `round ${round.id}'s review owner may still run before agent registration${unproven.detail}`
+      : `round ${round.id} review session(s) ${unproven.ids.join(', ')} not proven ceased${unproven.detail}`;
+  }
+
+  /** The round's review sessions (or `''`, its owner before any session
+   * registered) not proven ceased. The runtime answers first: this
+   * process's adapter evidence, or the durable record the owning process
+   * wrote (#464). An owner the runtime cannot clear may still be proven
+   * gone by its dead-host proof, which the runtime records before the
+   * runtime is asked again. `detail` is the proof's refusal, ready to
+   * append to a message ('' when the proof never ran). */
+  private async unprovenReviewOwners(round: RoundRecord, marker: ReviewOwnerMarker | null,
+    agents: readonly { readonly id: string; readonly sessionFile: string | null }[]): Promise<{ readonly ids: readonly string[]; readonly detail: string }> {
+    const owners = agents.length === 0 ? [''] : agents.map((agent) => agent.id);
+    const unproven = async (): Promise<string[]> => {
+      const left: string[] = [];
+      for (const id of owners) if (await this.opts.reconcileReviewAgent?.(id, marker) !== true) left.push(id);
+      return left;
+    };
+    const left = await unproven();
+    if (left.length === 0 || marker === null || this.opts.proveReviewHostExit === undefined) return { ids: left, detail: '' };
+    const lane = this.opts.worktrees.getWorktree(round.id);
+    const proof = await this.opts.proveReviewHostExit({
+      marker,
+      worktreePath: lane?.kind === 'review' ? lane.path : null,
+      sessions: agents.map((agent) => ({ agentId: agent.id, sessionFile: agent.sessionFile })),
+    });
+    if (!proof.ok) return { ids: left, detail: ` (dead-host proof refused: ${proof.problem})` };
+    const still = await unproven();
+    const named = firstFive(still.map((id) => id === '' ? 'the unregistered owner' : id));
+    return { ids: still, detail: still.length === 0 ? '' : ` (the dead-host proof is recorded, but this service's cessation check still refuses ${named}; the service is miswired: its dead-host proof and cessation check must come from one runtime registry)` };
   }
 
   /** True when a MATERIAL amendment was accepted after `seq`: anything
@@ -3540,6 +3601,19 @@ export class WaveRunner {
 
     for (const job of this.opts.ledger.listJobs()) {
       for (const round of this.opts.ledger.listRounds(job.id)) {
+        // #464: a shutdown that cut delivery left the round aborted with its
+        // post unreconciled. Ask the provider now (nothing POSTs), so its
+        // clean-abort re-arm opens once the post is proven absent.
+        if (round.status === 'aborted' && this.deliveryCutUnreconciled(round.id)) {
+          try {
+            await this.reconcileInterruptedPublication(round);
+          } catch (error) {
+            this.log('error', 'startup reconciliation of a delivery cut failed; its re-arm stays held', { round: round.id, error: String(error) });
+            this.escalate(`Perkins publication for round ${round.id} could not be reconciled after restart`,
+              `${String(error)} — the clean-abort re-arm stays held until the next start reconciles it`, { jobId: round.jobId, roundId: round.id });
+          }
+          continue;
+        }
         if ((round.status !== 'pending' && round.status !== 'live') || registeredRoundIds.has(round.id)) continue;
         // One failing row must never abort startup recovery of the
         // remaining rounds (same discipline as the lane loop above): a
@@ -3634,6 +3708,7 @@ export class WaveRunner {
     return {
       roundId: round.id, runtimeId: payload['runtimeId'], pid: payload['pid'] as number,
       generation: payload['generation'],
+      ...(typeof payload['hostIdentity'] === 'string' ? { hostIdentity: payload['hostIdentity'] } : {}),
     };
   }
 
@@ -5540,13 +5615,15 @@ export class WaveRunner {
       if (!noSpawn && marker === null && agents.length === 0) {
         throw new Error(`review round ${oldRound.id} has no trusted no-spawn proof or owner marker; ownership is unknown (including a possible spawn-before-registration crash) — reconcile cessation manually before replacement`);
       }
-      if (!noSpawn && marker !== null && agents.length === 0 &&
-        await this.opts.reconcileReviewAgent?.('', marker) !== true) {
-        throw new Error(`review owner marker from round ${oldRound.id} may still run before agent registration; reconcile runtime cessation before replacement`);
-      }
-      for (const agent of agents) {
-        if (await this.opts.reconcileReviewAgent?.(agent.id, marker) !== true) {
-          throw new Error(`review owner ${agent.id} from round ${oldRound.id} may still run; reconcile runtime cessation before starting a replacement writer`);
+      if (!noSpawn) {
+        // Re-checked on every request: a refused dead-host proof clears
+        // once its evidence does (the named process exits).
+        const unproven = await this.unprovenReviewOwners(oldRound, marker, agents);
+        if (unproven.ids.length > 0) {
+          const more = unproven.ids.length > 1 ? ` (and ${String(unproven.ids.length - 1)} more session(s))` : '';
+          throw new Error(agents.length === 0
+            ? `review owner marker from round ${oldRound.id} may still run before agent registration; a replacement starts only once its cessation is proven${unproven.detail}`
+            : `review owner ${unproven.ids[0]!}${more} from round ${oldRound.id} may still run; a replacement writer starts only once its cessation is proven${unproven.detail}`);
         }
       }
     }
@@ -5730,11 +5807,13 @@ export class WaveRunner {
       // Durable runtime provenance BEFORE any lead/child may spawn. The
       // generation binds same-process adapter cessation; a restarted Pi
       // service may instead prove its old in-process host PID has exited.
+      // The host's start identity tells a later process a reused pid (or
+      // this service restarted under it) from the live host (#464).
       if (runtime?.id === 'pi' || runtime?.id === 'claude-code') {
         this.opts.ledger.appendCustomEvent({
           kind: 'round.review-owner', jobId: job.id, roundId: round.id,
           payload: { roundId: round.id, targetSha, runtimeId: runtime.id,
-            pid: process.pid, generation: randomUUID() },
+            pid: process.pid, generation: randomUUID(), hostIdentity: thisProcessIdentity() },
         });
       }
       // ADMISSION PREFLIGHT (gh-169 Stage 4): validate the complete frozen
@@ -5831,21 +5910,25 @@ export class WaveRunner {
     } catch (error) {
       const failures: unknown[] = [error];
       const interrupted = this.shuttingDown || setupSignal.aborted;
-      // Owner rule 3: a superseded setup is withdrawn, not a shutdown.
-      const superseded = setupSignal.reason instanceof ReviewSupersededError;
       try {
         if (interrupted) {
-          const note = superseded
+          // A shutdown's cut is the restart's clean abort, re-armed after
+          // boot (#464); a supersession is withdrawn; anything else is named
+          // honestly and never re-armed.
+          const reason = this.interruptionReason(round.id, setupSignal);
+          const note = reason === 'superseded'
             ? 'review setup withdrawn: an approved material change or the lane writer superseded this candidate'
-            : 'review setup interrupted by service shutdown; frozen proof is incomplete';
+            : reason === 'service_restart'
+              ? 'review setup interrupted by service shutdown; frozen proof is incomplete'
+              : 'review setup cancelled; frozen proof is incomplete';
           this.opts.ledger.abortReviewSetupWithoutSpawn(round.id);
-          const artifacts = this.writeInterruptedArtifacts(round.id, superseded ? 'superseded' : 'service_shutdown_setup', note);
+          const artifacts = this.writeInterruptedArtifacts(round.id, reason, note);
           this.opts.ledger.appendCustomEvent({
             kind: 'round.perkins-incomplete',
             jobId: job.id,
             roundId: round.id,
             payload: {
-              reason: superseded ? 'superseded' : 'service_shutdown_setup',
+              reason,
               artifactDirectory: artifacts.directory,
               reportFile: artifacts.reportFile,
             },
@@ -6242,6 +6325,22 @@ export class WaveRunner {
           kind: 'round.residency-cancelled', jobId: job.id, roundId: round.id,
           payload: { error: String(error) },
         });
+        // A shutdown that cut the wait for resident slots is the restart's
+        // clean abort too, re-armed after boot (#464). Its record never masks
+        // the cancellation being rethrown.
+        if (this.shutdownCut(round.id, signal)) {
+          try {
+            const note = 'review interrupted by service shutdown while waiting for resident slots; no reviewer spawned';
+            const artifacts = this.writeInterruptedArtifacts(round.id, 'service_restart', note);
+            this.opts.ledger.appendCustomEvent({
+              kind: 'round.perkins-incomplete', jobId: job.id, roundId: round.id,
+              payload: { reason: 'service_restart', error: String(error).replace(/[\r\n]+/gu, ' ').slice(0, 500),
+                artifactDirectory: artifacts.directory, reportFile: artifacts.reportFile },
+            });
+          } catch (recordError) {
+            this.log('error', 'could not record the shutdown cut of a resident-slot wait', { round: round.id, error: String(recordError) });
+          }
+        }
       }
       throw error;
     } finally {
@@ -6602,7 +6701,10 @@ export class WaveRunner {
         payload: {
           // A superseded round (owner rule 3) is routine history, never a
           // clean-abort re-arm candidate or an action-required incident.
-          reason: signal.reason instanceof ReviewSupersededError ? 'superseded' : signal.aborted ? 'cancelled' : 'workflow_error',
+          // One cut by a graceful service shutdown is the restart's clean
+          // abort (#464), which Silas re-arms on the unchanged head after
+          // boot, exactly as startup recovery's own `service_restart`.
+          reason: signal.aborted ? this.interruptionReason(round.id, signal) : 'workflow_error',
           error: detail.slice(0, 500),
           reportFile,
           executionFacts,
@@ -7227,13 +7329,20 @@ export class WaveRunner {
           round: round.id, error: hostReportWriteFailed,
         });
       }
+      const deliveryFailure = verdict === null ? 'review_incomplete' : deliveryFailureKind;
+      const deliveryCut = signal.aborted && this.shutdownCut(round.id, signal);
       try {
         this.opts.ledger.appendCustomEvent({
           kind: 'round.perkins-incomplete',
           jobId: job.id,
           roundId: round.id,
           payload: {
-            reason: verdict === null ? 'review_incomplete' : deliveryFailureKind,
+            // A shutdown that cut delivery is the restart's clean abort
+            // (#464); the pending-publication guard still holds a re-arm
+            // until the in-flight post is reconciled.
+            reason: deliveryCut ? 'service_restart' : deliveryFailure,
+            // The delivery failure itself stays on record under a restart cut.
+            ...(deliveryCut ? { deliveryFailure } : {}),
             reportFile,
             executionFacts: executionFactsLine,
             ...(hostReportWriteFailed !== null ? { hostReportWriteFailed } : {}),
@@ -7276,7 +7385,7 @@ export class WaveRunner {
         : {}),
     };
     } catch (error) {
-      return this.finalizationIncomplete(job, round, lenses, frozenReview, error, provisional);
+      return this.finalizationIncomplete(job, round, lenses, frozenReview, error, provisional, signal.aborted && this.shutdownCut(round.id, signal));
     }
   }
 
@@ -7338,6 +7447,9 @@ export class WaveRunner {
     frozenReview: FrozenReview,
     error: unknown,
     provisional?: LensAccounting,
+    /** A graceful service shutdown cut the round (#464): the restart's
+     * clean abort, re-armed after boot. */
+    shutdownCut = false,
   ): WaveOutcome {
     const detail = `Perkins finalization failed: ${String(error)}`.replace(/[\r\n]+/gu, ' ').slice(0, 500);
     // R7-1: a DURABLY COMMITTED verdict outranks any later failure — a
@@ -7444,7 +7556,7 @@ export class WaveRunner {
         kind: 'round.perkins-incomplete',
         jobId: job.id,
         roundId: round.id,
-        payload: { reason: 'finalization_error', error: detail, reportFile, executionFacts },
+        payload: { reason: shutdownCut ? 'service_restart' : 'finalization_error', error: detail, reportFile, executionFacts },
       });
     } catch (ledgerError) {
       this.log('error', 'could not persist finalization INCOMPLETE event', {

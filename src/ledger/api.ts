@@ -898,6 +898,11 @@ export interface WorktreeRecord {
   readonly updatedAt: string;
 }
 
+/** Durable review-owner cessation (#464): recorded only through
+ * `recordReviewOwnerCessation`, which binds it to the round's owner
+ * marker, never as a custom event. */
+export const REVIEW_OWNER_CEASED_KIND = 'round.review-owner-ceased';
+
 // ------------------------------------------------------------------
 // Pending re-briefs (Silas follow-through restart safety): the durable
 // request marker written BEFORE a re-brief worker is spawned. Each marker
@@ -1352,6 +1357,69 @@ export class LedgerApi {
       "SELECT * FROM events WHERE round_id = ? AND kind = 'round.review-owner' ORDER BY seq ASC LIMIT 2",
     ).all(roundId) as Row[];
     return rows.length === 1 ? this.eventFromRow(rows[0]!) : null;
+  }
+
+  /** Durable review-owner cessation (#464), bound to the round's unique
+   * owner marker. `adapter`: the owning process saw its adapter report one
+   * review session ceased (the record keeps the observer's pid, never
+   * requires it: a session id exists only in the process that spawned it).
+   * `host-exit`: a later process proved the marker's host and every
+   * session of the round gone. A record that binds no unique marker is
+   * refused by name, and nothing is written. */
+  recordReviewOwnerCessation(input:
+    | { readonly source: 'adapter'; readonly agentId: string; readonly generation: string }
+    | { readonly source: 'host-exit'; readonly roundId: string; readonly generation: string; readonly pid: number;
+      readonly hostIdentity: string | null; readonly evidence: Readonly<Record<string, unknown>> }): EventRecord {
+    return this.transaction(() => {
+      const candidates = input.source === 'adapter'
+        ? this.db.prepare(
+          "SELECT * FROM events WHERE kind = 'round.review-owner' AND json_extract(payload, '$.generation') = ? ORDER BY seq ASC LIMIT 2",
+        ).all(input.generation) as Row[]
+        : this.db.prepare(
+          "SELECT * FROM events WHERE round_id = ? AND kind = 'round.review-owner' ORDER BY seq ASC LIMIT 2",
+        ).all(input.roundId) as Row[];
+      const marker = candidates.length === 1 ? this.eventFromRow(candidates[0]!) : null;
+      const owner = marker?.payload as { generation?: unknown; pid?: unknown; hostIdentity?: unknown } | null | undefined;
+      if (marker === null || marker.roundId === null || owner?.generation !== input.generation ||
+        // The proof judged exactly this marker's host: its pid and identity.
+        (input.source === 'host-exit' && (owner.pid !== input.pid || (owner.hostIdentity ?? null) !== input.hostIdentity)) ||
+        (input.source === 'adapter' && input.agentId.trim() === '') ||
+        this.uniqueRoundReviewOwnerMarker(marker.roundId)?.seq !== marker.seq) {
+        throw new Error(`review-owner cessation (${input.source}) for generation ${input.generation} binds no unique round owner marker; nothing recorded`);
+      }
+      // Recorded once: a concurrent proof (or a late repeat) returns the record.
+      const existing = (this.db.prepare('SELECT * FROM events WHERE round_id = ? AND kind = ? ORDER BY seq ASC')
+        .all(marker.roundId, REVIEW_OWNER_CEASED_KIND) as Row[]).map((row) => this.eventFromRow(row)).find((event) => {
+        const record = event.payload as Record<string, unknown> | null;
+        return record !== null && typeof record === 'object' && record['source'] === input.source && record['generation'] === input.generation &&
+          (input.source === 'adapter' ? record['agentId'] === input.agentId : record['pid'] === input.pid);
+      });
+      if (existing !== undefined) return existing;
+      return this.appendEvent({
+        kind: REVIEW_OWNER_CEASED_KIND, jobId: marker.jobId, roundId: marker.roundId,
+        agentId: input.source === 'adapter' ? input.agentId : null,
+        payload: input.source === 'adapter'
+          ? { source: 'adapter', roundId: marker.roundId, agentId: input.agentId, generation: input.generation, observerPid: process.pid }
+          : { source: 'host-exit', roundId: marker.roundId, generation: input.generation, pid: input.pid,
+            observerPid: process.pid, evidence: input.evidence },
+      });
+    });
+  }
+
+  /** Whether a durable record proves `agentId` ceased under exactly this
+   * owner marker. A `host-exit` proof covers the whole owner, including
+   * `''` (the owner before any session registered); an `adapter` record
+   * covers only its own session. */
+  reviewOwnerCessationRecorded(agentId: string, marker: { readonly roundId: string; readonly generation: string; readonly pid: number }): boolean {
+    const rows = this.db.prepare('SELECT * FROM events WHERE round_id = ? AND kind = ? ORDER BY seq ASC')
+      .all(marker.roundId, REVIEW_OWNER_CEASED_KIND) as Row[];
+    return rows.some((row) => {
+      const record = this.eventFromRow(row).payload as Record<string, unknown> | null;
+      if (record === null || typeof record !== 'object' || record['roundId'] !== marker.roundId ||
+        record['generation'] !== marker.generation) return false;
+      if (record['source'] === 'host-exit') return record['pid'] === marker.pid;
+      return record['source'] === 'adapter' && agentId !== '' && record['agentId'] === agentId;
+    });
   }
 
   /** A single ledger-bound negative proof for a setup that never initiated
@@ -3018,6 +3086,9 @@ export class LedgerApi {
         roundId: current.roundId,
         payload: { id, from: current.status, to: status, ...(note !== undefined ? { note } : {}) },
       });
+      // #464: a swept tree holds no process; what is still recorded live
+      // left on its own, in the same transaction as the sweep.
+      if (status === 'swept') this.recordWorktreeProcessesExited({ worktreeId: id, pids: 'all-live', reason: 'worktree-swept' });
       return this.getWorktree(id) as WorktreeRecord;
     });
   }
@@ -3090,6 +3161,12 @@ export class LedgerApi {
     }
     this.transaction(() => {
       const ts = nowIso();
+      // #464: a row that exited returns to live only through a pause's fresh
+      // enumeration of a process rooted in the tree again (never by pid
+      // liveness), and the event says so.
+      const exited = this.db.prepare("SELECT 1 FROM worktree_processes WHERE worktree_id = ? AND pid = ? AND state = 'exited'");
+      const revived = input.state === 'live'
+        ? input.processes.map((proc) => proc.pid).filter((pid) => exited.get(input.worktreeId, pid) !== undefined) : [];
       const upsert = this.db.prepare(
         `INSERT INTO worktree_processes (worktree_id, pid, command, evidence, state, first_seen, last_seen)
          VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -3107,8 +3184,43 @@ export class LedgerApi {
           id: input.worktreeId,
           state: input.state,
           pids: input.processes.map((proc) => proc.pid),
+          ...(revived.length > 0 ? { revived } : {}),
         },
       });
+    });
+  }
+
+  /** #464: recorded `live` processes that left the tree move to `exited`
+   * with one audited event:
+   * - `not-enumerated`: named pids a release's fresh enumeration no longer
+   *   finds rooted in the tree, and that are dead;
+   * - `worktree-swept`: every remaining live row of a swept tree, except the
+   *   `registry` rows their own reconcile owns.
+   * Rows already out of `live` are untouched. Returns the pids moved. */
+  recordWorktreeProcessesExited(input:
+    | { readonly worktreeId: string; readonly reason: 'not-enumerated'; readonly pids: readonly number[] }
+    | { readonly worktreeId: string; readonly reason: 'worktree-swept'; readonly pids: 'all-live' }): readonly number[] {
+    return this.transaction(() => {
+      const worktree = this.getWorktree(input.worktreeId);
+      if (worktree === null) throw new RecordNotFound(`worktree "${input.worktreeId}" not found`);
+      if (input.reason === 'worktree-swept' && worktree.status !== 'swept') {
+        throw new Error(`worktree "${input.worktreeId}" is ${worktree.status}, not swept: its processes are not proven gone`);
+      }
+      const live = (this.db.prepare("SELECT pid FROM worktree_processes WHERE worktree_id = ? AND state = 'live' AND evidence <> 'registry' ORDER BY pid")
+        .all(input.worktreeId) as Row[]).map((row) => Number(row.pid));
+      const wanted = input.pids === 'all-live' ? null : new Set(input.pids);
+      const moved = live.filter((pid) => wanted === null || wanted.has(pid));
+      if (moved.length === 0) return [];
+      const ts = nowIso();
+      const exit = this.db.prepare("UPDATE worktree_processes SET state = 'exited', last_seen = ? WHERE worktree_id = ? AND pid = ? AND state = 'live'");
+      for (const pid of moved) exit.run(ts, input.worktreeId, pid);
+      this.appendEvent({
+        kind: 'worktree.processes-exited',
+        jobId: worktree.jobId,
+        roundId: worktree.roundId,
+        payload: { id: input.worktreeId, pids: moved, reason: input.reason },
+      });
+      return moved;
     });
   }
 
@@ -4144,6 +4256,9 @@ export class LedgerApi {
     // moveWorktreeRepo records, together (#427 PR 2b).
     if (fields.kind === REPO_MOVED_KIND || fields.kind === HANDOFF_REBOUND_KIND) {
       throw new Error(`${fields.kind} is recorded only with a lane's repository move (moveWorktreeRepo), never as a custom event`);
+    }
+    if (fields.kind === REVIEW_OWNER_CEASED_KIND) {
+      throw new Error(`${fields.kind} is recorded only through recordReviewOwnerCessation, which binds it to the round's owner marker, never as a custom event`);
     }
     return this.transaction(() => {
       if (fields.kind === 'silas.directive-producer-ceased' || fields.kind === 'silas.directive-producer-unknown') {
@@ -9675,12 +9790,14 @@ export class LedgerApi {
     if (rounds.length > 0) {
       blockers.push(`live review round(s): ${rounds.map((round) => `${round.id} (${round.status})`).join(', ')}`);
     }
+    // #464: a swept lane runs nothing; a row it left `live` (recorded
+    // before sweeps moved them to `exited`) never fences a writer.
     const liveProcesses = this.db
       .prepare(
         `SELECT DISTINCT p.worktree_id AS worktree_id, p.pid AS pid
            FROM worktree_processes p
            JOIN worktrees w ON w.id = p.worktree_id
-          WHERE p.state = 'live' AND (w.job_id = ? OR p.worktree_id = ?)
+          WHERE p.state = 'live' AND w.status <> 'swept' AND (w.job_id = ? OR p.worktree_id = ?)
           ORDER BY p.worktree_id, p.pid`,
       )
       .all(row.jobId, laneId) as Row[];

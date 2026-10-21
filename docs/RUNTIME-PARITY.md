@@ -72,6 +72,7 @@ that proves it on each adapter.
 | `dispose-releases-lock` | Dispose stops the turn and releases the session lock | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts` |
 | `cessation-proven` | Adapter-owned proof (pi: a confirmed idle; Claude: the original child's close) makes disposal `ceased` | `test/runtime-cessation-evidence.test.ts` | `test/runtime-claude-cessation-ownership.test.ts` |
 | `cessation-unproven-holds-permit` | Without that proof, evidence stays `unknown` and the resident permit is held as debt | `test/runtime-positive-cessation-ownership.test.ts` | `test/runtime-claude-cessation-ownership.test.ts` |
+| `review-owner-durable-cessation` | A review session's `ceased` evidence is recorded in the ledger against its round's owner marker (#464), so a restarted registry still accepts that owner as ceased, even when the host pid looks alive | `test/pi-adapter.test.ts` | `test/review-owner-cessation.test.ts` |
 | `scheduled-verification` | The #315 guard refuses a scheduled-verification producer before it runs | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts` |
 | `spawn-cwd` | A session is rooted at the explicit project cwd, never the workspace root | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts` |
 | `blind-transcript-reader` | The blind-access reader pairs each read result with the file its call named, read from each runtime's real persisted record shape | `test/blind-review.test.ts` | `test/blind-review.test.ts` |
@@ -187,6 +188,62 @@ writes each runtime's own record shape during a resumed turn.
 - **Directive content.** A Claude directive is text only (an image is refused
   by name): the CLI may transform an image, which would break the byte-exact
   echo admission binds.
+- **A review owner from another process (#464).** A replacement Perkins round
+  starts only once every earlier round's review owner is proven ceased. On
+  both runtimes the proof is either this process's adapter evidence or the
+  durable `round.review-owner-ceased` record that the owning process wrote when
+  its adapter reported a session `ceased`
+  (`review-owner-durable-cessation`). That record is what a graceful restart
+  leaves. Without it (a crash, or a round older than the record), the
+  runtimes differ:
+  - pi accepts the OS-proven death of the owner's host pid, because its review
+    tools run inside that host;
+  - Claude Code never accepts PID death alone, because its CLI child can
+    outlive the host. It needs the **dead-host proof** instead:
+    - the marker's host is gone. Its pid is dead, or the process now
+      holding it has a different start identity from the one the marker
+      recorded. That covers a reused pid, and this service restarted under
+      the same pid. The identity is the kernel's own record of the start,
+      so clock and timezone changes never move it:
+      - Linux: the boot id plus the start ticks in `/proc/<pid>/stat`;
+      - macOS: `ps -o lstart` read in UTC.
+
+      Other platforms get no identity. The service reads its own identity
+      once, at boot, and keeps that answer, warning when it cannot read
+      one. Every marker this service writes carries the identity it kept.
+      A marker under this service's own pid with another identity, or with
+      none, was therefore left by an earlier process. When the service has
+      no identity of its own, it treats every same-pid marker as its own. A
+      marker with no identity under another live process's pid refuses;
+    - no live process is rooted (argv or cwd) in the round's review
+      worktree;
+    - no live process names one of the round's session ids, registered or
+      found as a session file in the round's session directory. Every
+      session registers before its first turn, and a Claude CLI runs only
+      during a turn with its session id in argv;
+    - no session lock of the round is held by a live pid, or by this
+      process. A lock the gone host itself left is free, whatever hostname
+      it recorded.
+
+  Unreadable evidence refuses. That includes:
+  - a process table that cannot be listed;
+  - working directories that cannot be listed;
+  - a session directory that cannot be read;
+  - an unreadable lock, or one that names no pid.
+
+  A passing proof is recorded once as `round.review-owner-ceased` (source
+  `host-exit`), so it is never re-decided. The record keeps the evidence it
+  checked and how the host was found gone (`dead`, `pid-reused` or
+  `restarted`). For the last two it also keeps the two start identities it
+  compared.
+
+  On pi, PID death answers first. When it cannot, because the pid is reused
+  or this service restarted under it, the dead-host proof clears the pi
+  owner too. A writer waiting on a supersession that a restart interrupted
+  is cleared by the same proof. A refusal names what is still alive where
+  there is a process, or the file to clear where there is one, for example a
+  lock file to remove once no process holds it. Every later review request
+  re-checks (`test/review-owner-cessation.test.ts`).
 
 ## Rollout of the default change
 
@@ -210,4 +267,5 @@ writes each runtime's own record shape during a resumed turn.
 - **Recorded runtime ids.** A review-owner marker records the runtime that
   wrote it and is judged by that runtime's rules, never by the current default.
   A Claude marker is never released by PID death alone
-  (`test/perkins-builtin-wave.test.ts`, `reviewOwnerCeased` for `claude-code`).
+  (`test/perkins-builtin-wave.test.ts`, `reviewOwnerCeased` for `claude-code`);
+  see "A review owner from another process" under Differences by design.

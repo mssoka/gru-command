@@ -9,8 +9,9 @@ import { afterAll, describe, expect, it, vi } from 'vitest';
 import { configPathFor, loadConfig } from '../src/config.js';
 import { PiRuntime, normalizeSessionPath, type PiRuntimeOptions } from '../src/runtime/pi-adapter.js';
 import type { WorkerVerificationPolicy } from '../src/runtime/worker-verification-policy.js';
-import { RuntimeRegistry, applyThinkingFallback, serviceRegistryOptions } from '../src/runtime/registry.js';
+import { RuntimeRegistry, applyThinkingFallback, ledgerReviewOwnerCessation, serviceRegistryOptions } from '../src/runtime/registry.js';
 import { makeWorkflowLane } from './helpers/workflow-lane.js';
+import { NO_REVIEW_OWNER_LEDGER } from './helpers/no-review-owner-ledger.js';
 import { makeFallbackRuntimeHarness } from './helpers/fallback-runtime.js';
 import { LockBusyError, SessionStore } from '../src/sessions/store.js';
 import { capabilitiesForModelInput, type AgentHandle, type RuntimeEvent } from '../src/runtime/types.js';
@@ -858,7 +859,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     ledger.addJob({ id: f.lane.id, repo: f.lane.repoName, title: 'original job', briefing: 'original contract' });
     ledger.registerWorktree(f.lane);
     const authority = serviceWorkflowAuthority(dataDir, () => ledger);
-    const registry = new RuntimeRegistry({ ...serviceRegistryOptions({ config: { ...fx.config, dataDir }, store: fx.store,
+    const registry = new RuntimeRegistry({ ...serviceRegistryOptions({ reviewOwnerCessation: NO_REVIEW_OWNER_LEDGER, config: { ...fx.config, dataDir }, store: fx.store,
       workflowLaneFor: authority.workflowLaneFor, workflowBuildFor: authority.workflowBuildFor, workflowAgentFor: authority.workflowAgentFor }),
       pi: { agentDir: fx.agentDir, modelRuntime: fx.modelRuntime },
     });
@@ -888,7 +889,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     }
     mkdirSync(join(f.lane.path, '_bmad/custom'), { recursive: true });
     writeFileSync(join(f.lane.path, '_bmad/custom/config.toml'), 'NOT TOML');
-    const registry = new RuntimeRegistry({ ...serviceRegistryOptions({ config: { ...fx.config, dataDir: f.dataDir },
+    const registry = new RuntimeRegistry({ ...serviceRegistryOptions({ reviewOwnerCessation: NO_REVIEW_OWNER_LEDGER, config: { ...fx.config, dataDir: f.dataDir },
       store: new SessionStore(f.dataDir), workflowLaneFor: () => f.lane }),
       pi: { agentDir: fx.agentDir, modelRuntime: fx.modelRuntime },
     });
@@ -2467,6 +2468,42 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     }
   });
 
+  it('a restarted registry accepts a pi review owner its host saw cease, even while that host pid still looks alive #contract:review-owner-durable-cessation:pi', async () => {
+    const fx = await fixture([], ['text'], { configExtra: '[models.roles]\nperkins = "default"\n' });
+    writeFileSync(join(fx.agentDir, 'settings.json'), JSON.stringify({ defaultProvider: 'gru-stub', defaultModel: 'stub-model' }));
+    const { LedgerApi } = await import('../src/ledger/api.js');
+    const { LedgerDb } = await import('../src/ledger/db.js');
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'gru-pi-owner-cessation-db-')));
+    try {
+      const ledger = new LedgerApi(db.handle);
+      ledger.addJob({ id: 'job-pi-owner', repo: 'fixture', title: 'pi owner', baseBranch: 'main', briefing: 'review' });
+      const round = ledger.addRound({ jobId: 'job-pi-owner', targetRef: 'a'.repeat(40), lenses: ['blind'] });
+      // The owner marker names another host pid, as a restart finds it.
+      const marker = { roundId: round.id, runtimeId: 'pi', pid: process.ppid, generation: randomUUID() };
+      ledger.appendCustomEvent({ kind: 'round.review-owner', jobId: 'job-pi-owner', roundId: round.id,
+        payload: { ...marker, targetSha: 'a'.repeat(40) } });
+      const cessation = ledgerReviewOwnerCessation(() => ledger);
+      const owner = new RuntimeRegistry({ config: fx.config, store: fx.store,
+        pi: { agentDir: fx.agentDir, modelRuntime: fx.modelRuntime }, reviewOwnerCessation: cessation });
+      const lead = await owner.spawn('perkins', {
+        reviewLead: { systemPrompt: 'lead', tools: [], nativeTools: [] },
+        reviewModel: await owner.prepareReviewModel('perkins'), reviewOwnerGeneration: marker.generation,
+      });
+      await lead.dispose();
+      expect(ledger.latestRoundEvent(round.id, 'round.review-owner-ceased')?.payload)
+        .toMatchObject({ source: 'adapter', agentId: lead.id, generation: marker.generation });
+      // A live (or reused) host pid cannot answer; only the durable record can.
+      const restarted = new RuntimeRegistry({ config: fx.config, store: fx.store, reviewOwnerCessation: cessation,
+        ownerProcessProbe: () => 'alive' });
+      expect(restarted.reviewOwnerCeased(lead.id, marker)).toBe(true);
+      expect(restarted.reviewOwnerCeased(lead.id, { ...marker, generation: randomUUID() })).toBe(false);
+      expect(new RuntimeRegistry({ config: fx.config, store: fx.store, ownerProcessProbe: () => 'alive' })
+        .reviewOwnerCeased(lead.id, marker)).toBe(false);
+    } finally {
+      db.close();
+    }
+  });
+
   it('registry preflight selects the perkins role model and the same cached adapter used by spawn', async () => {
     const fx = await fixture([], ['text'], { configExtra: '[models.roles]\nperkins = "gru-stub/custom/group-model"\n' });
     const original = fx.modelRuntime.getModel.bind(fx.modelRuntime);
@@ -3643,7 +3680,7 @@ describe('spawn cwd (SPEC ruling 17 — dispatch roots in the project)', () => {
     ]);
     const dataDir = realpathSync(fx.home);
     const h = makeFallbackRuntimeHarness((role, opts) => registry.spawn(role, opts), dataDir);
-    const registry = new RuntimeRegistry({ ...serviceRegistryOptions({ config: { ...fx.config, dataDir }, store: fx.store,
+    const registry = new RuntimeRegistry({ ...serviceRegistryOptions({ reviewOwnerCessation: NO_REVIEW_OWNER_LEDGER, config: { ...fx.config, dataDir }, store: fx.store,
       workflowLaneFor: h.authority.workflowLaneFor, workflowBuildFor: h.authority.workflowBuildFor }),
       pi: { agentDir: fx.agentDir, modelRuntime: fx.modelRuntime },
     });
@@ -3669,7 +3706,7 @@ describe('spawn cwd (SPEC ruling 17 — dispatch roots in the project)', () => {
     ]);
     const dataDir = realpathSync(fx.home);
     const h = makeFallbackRuntimeHarness((role, opts) => registry.spawn(role, opts), dataDir);
-    const registry = new RuntimeRegistry({ ...serviceRegistryOptions({ config: { ...fx.config, dataDir }, store: fx.store,
+    const registry = new RuntimeRegistry({ ...serviceRegistryOptions({ reviewOwnerCessation: NO_REVIEW_OWNER_LEDGER, config: { ...fx.config, dataDir }, store: fx.store,
       workflowLaneFor: h.authority.workflowLaneFor, workflowBuildFor: h.authority.workflowBuildFor }),
       pi: { agentDir: fx.agentDir, modelRuntime: fx.modelRuntime },
     });

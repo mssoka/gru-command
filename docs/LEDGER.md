@@ -164,7 +164,7 @@ publishes it on the in-process event bus (`src/events/bus.ts`).
 | `job.review-handoff-withdrawn` | requestSeq, reason — a queued review request withdrawn because an approved material change made its candidate obsolete (terminal for restart resume) |
 | `round.review-inputs-frozen` | acceptance version/base+effective hashes/amendment ids, evidence attachment hashes (no pixels, no paths), bound CI record state |
 | `round.admission-preflight` | ok, full check list (`head-binding`, `frozen-packet:<file>`, `spec-context`, `verification-evidence`, `ci-evidence`, `evidence:<id>`), and on refusal the exhaustive named missing-input list — recorded after the freeze receipts and BEFORE any lead/child spawn (gh-169) |
-| `round.review-owner` | owner marker, written once before any lead/child may spawn (a duplicate is a ledger defect: it refuses the no-spawn receipt and blocks replacement): roundId, targetSha, runtimeId (`pi`/`claude-code`), pid, generation — binds the runtime host whose cessation a replacement round must prove |
+| `round.review-owner` | owner marker, written once before any lead/child may spawn (a duplicate is a ledger defect: it refuses the no-spawn receipt and blocks replacement): roundId, targetSha, runtimeId (`pi`/`claude-code`), pid, generation, hostIdentity (the host's start identity, #464) — binds the runtime host whose cessation a replacement round must prove |
 | `round.review-no-spawn` | the negative owner receipt, written atomically with the abort of a round that never went live (setup refusal, interruption, or startup recovery, #466): roundId, generation, ownerGeneration (the marker's generation, or null without one) — the replacement gate's trusted no-spawn proof |
 | `round.parent-incident` | exactly ONE per parent-aborted round: note, startedAttempts, startedLenses, notStartedLenses — a lead disconnect is one parent incident; never-started lenses keep their `pending` chip (not-started ≠ failed execution) (gh-169). A never-live round whose no-spawn receipt the ledger refuses at startup recovery gets one too, its note naming the refusal (#466) |
 | `job.review-handoff-conflict` / `job.review-handoff-superseded` | request seq + folded scope; a differing evidence set is recorded as count + opaque request fingerprint, never paths |
@@ -655,6 +655,22 @@ decision id that held the incident, `duplicate` the incident key already
 woken, `failed` the bounded-retry exhaustion that escalated. The board
 wakes tracker and the #214 yield report (wakes/day, avoided share) read
 this stream; nothing avoids a wake silently.
+
+### Lane process rows that exited on their own (#464)
+
+Migration 30 (`worktree-processes-exited`) rebuilds `worktree_processes`
+to allow a third state, `exited`, next to `live` and `killed`. A row
+moves there in two cases:
+- a release's fresh enumeration no longer finds its process rooted in
+  the tree, and the pid is dead;
+- the tree is swept (`registry` rows excepted).
+
+Each move is audited by a `worktree.processes-exited` event naming the
+pids and the reason. Pid liveness never returns a row to `live`; only a
+pause that finds a process rooted in the tree again does (`revived`).
+The migration also moves the rows that sweeps left `live` under
+already-swept trees, with one audited event per tree. The directive
+producer fence counts only `live` rows of lanes that are not swept.
 
 ### Exact directive/rebrief restart progress
 

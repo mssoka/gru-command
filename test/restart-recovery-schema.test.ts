@@ -37,11 +37,14 @@ function assertShape(db: LedgerDb): void {
 
 describe('GH286 approved integration schema', () => {
   it('preserves every landed migration and the exact original native SQL with unique contiguous ids through28', () => {
-    expect(MIGRATIONS.map(({ id }) => id)).toEqual(Array.from({ length: 29 }, (_, index) => index + 1));
-    expect(new Set(MIGRATIONS.map(({ id }) => id)).size).toBe(29);
+    expect(MIGRATIONS.map(({ id }) => id)).toEqual(Array.from({ length: 30 }, (_, index) => index + 1));
+    expect(new Set(MIGRATIONS.map(({ id }) => id)).size).toBe(30);
     expect(hash(JSON.stringify(MIGRATIONS.slice(0, 27)))).toBe('3771e4175b5a3080bdff216886e4cc00722083af185eddec184f15f5281400d2');
     expect(MIGRATIONS[27]).toMatchObject({ id: 28, name: 'directive-native-progress' });
     expect(MIGRATIONS[28]).toMatchObject({ id: 29, name: 'notification-owner-decisions' });
+    expect(MIGRATIONS[29]).toMatchObject({ id: 30, name: 'worktree-processes-exited' });
+    // A landed table rebuild is immutable: its exact SQL is pinned (#464).
+    expect(hash(MIGRATIONS[29]!.sql)).toBe('c565137621d2940683321d684c746a2a5fef27690f15340c38248f3378e9d1c8');
     expect(hash(MIGRATIONS[27]!.sql)).toBe('3fe446722711a74bcb5ae577b7b47ed8f65f243ea5f059fbc3ebff1250ea546e');
   });
 

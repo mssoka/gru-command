@@ -99,9 +99,12 @@ export function commandReferencesTree(command: string, treePath: string): boolea
   return pattern.test(command);
 }
 
-/** A process cwd belongs to the tree when it IS the tree or sits under it. */
+/** A process cwd belongs to the tree when it IS the tree or sits under it.
+ * Linux names a removed directory `<path> (deleted)`: a process that
+ * outlived its swept tree is still rooted in it (#464). */
 function cwdInsideTree(cwd: string, treePath: string): boolean {
-  return cwd === treePath || cwd.startsWith(`${treePath}/`);
+  const path = cwd.endsWith(' (deleted)') ? cwd.slice(0, -' (deleted)'.length) : cwd;
+  return path === treePath || path.startsWith(`${treePath}/`);
 }
 
 /** Liveness without EPERM confusion (EPERM still proves the pid exists). */
@@ -184,12 +187,13 @@ function processCwds(): Map<number, string> | null {
  * its cwd is the tree (Perkins r1 B3: argv-only enumeration removed
  * trees under live agents). */
 export function psEnumerator(treePath: string): readonly TreeProcess[] {
-  return treeProcesses(treePath, execFileSyncGuard('ps', ['-axo', 'pid=,command=']), processCwds());
+  return treeProcesses(treePath, listedProcesses(execFileSyncGuard('ps', ['-axo', 'pid=,command='])), processCwds());
 }
 
 /** The processes a `ps -axo pid=,command=` listing and the per-process
  * cwds tie to a tree (by argv path boundary, or by cwd). */
-function treeProcesses(treePath: string, out: string, cwds: Map<number, string> | null): readonly TreeProcess[] {
+function treeProcesses(treePath: string, listed: readonly { readonly pid: number; readonly command: string }[],
+  cwds: Map<number, string> | null): readonly TreeProcess[] {
   // Compare against BOTH the registered path and its realpath: the OS
   // reports resolved paths (/var → /private/var) while argv keeps the
   // spelling the spawner used.
@@ -197,17 +201,19 @@ function treeProcesses(treePath: string, out: string, cwds: Map<number, string> 
   try {
     candidates.add(realpathSync(treePath));
   } catch {
-    /* the sweep's own guards handle a missing tree */
+    // A swept tree is resolved through its nearest surviving ancestor, so a
+    // process that outlived it is still matched by its resolved cwd (#464).
+    for (let ancestor = dirname(treePath); ; ancestor = dirname(ancestor)) {
+      try {
+        candidates.add(join(realpathSync(ancestor), relative(ancestor, treePath)));
+        break;
+      } catch {
+        if (dirname(ancestor) === ancestor) break; /* the sweep's own guards handle a missing tree */
+      }
+    }
   }
   const processes: TreeProcess[] = [];
-  for (const line of out.split('\n')) {
-    const trimmed = line.trim();
-    if (trimmed === '') continue;
-    const space = trimmed.indexOf(' ');
-    if (space <= 0) continue;
-    const pid = Number(trimmed.slice(0, space));
-    const command = trimmed.slice(space + 1).trim();
-    if (!Number.isInteger(pid) || pid === process.pid) continue;
+  for (const { pid, command } of listed) {
     // Registry paths only: every match names the registered tree itself.
     if ([...candidates].some((candidate) => commandReferencesTree(command, candidate))) {
       processes.push({ pid, command, evidence: 'argv' });
@@ -221,6 +227,22 @@ function treeProcesses(treePath: string, out: string, cwds: Map<number, string> 
     }
   }
   return processes;
+}
+
+/** Every other process a `ps -axo pid=,command=` listing names. */
+function listedProcesses(out: string): readonly { readonly pid: number; readonly command: string }[] {
+  const listed: { pid: number; command: string }[] = [];
+  for (const line of out.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed === '') continue;
+    const space = trimmed.indexOf(' ');
+    if (space <= 0) continue;
+    const pid = Number(trimmed.slice(0, space));
+    const command = trimmed.slice(space + 1).trim();
+    if (!Number.isInteger(pid) || pid === process.pid) continue;
+    listed.push({ pid, command });
+  }
+  return listed;
 }
 
 function execFileSyncGuard(bin: string, args: readonly string[]): string {
@@ -295,6 +317,22 @@ export interface ProcessListingOptions {
  * any number of trees (#427 PR 3: the disk budget lists once per pass, not
  * once per lane). */
 export async function processListingAsync(opts: ProcessListingOptions): Promise<(treePath: string) => readonly TreeProcess[]> {
+  return (await processTableAsync(opts)).rootedIn;
+}
+
+/** {@link processListingAsync}'s one listing, which also answers which
+ * processes name a token in their command line (#464: a Claude review CLI
+ * carries its session id in argv). `cwdsListed` is false when no working
+ * directories were read (`onCwdError` was told, or the platform has no
+ * source), so a caller that needs the whole picture refuses rather than
+ * trusting argv alone. */
+export interface ProcessTable {
+  readonly rootedIn: (treePath: string) => readonly TreeProcess[];
+  readonly naming: (token: string) => readonly TreeProcess[];
+  readonly cwdsListed: boolean;
+}
+
+export async function processTableAsync(opts: ProcessListingOptions): Promise<ProcessTable> {
   const timeoutMs = opts.timeoutMs ?? 30_000;
   const [listed, cwds] = await Promise.allSettled([
     execFileBounded('ps', ['-axo', 'pid=,command='], timeoutMs),
@@ -304,7 +342,13 @@ export async function processListingAsync(opts: ProcessListingOptions): Promise<
   if (cwds.status === 'rejected') opts.onCwdError(cwds.reason);
   const out = listed.value;
   const cwdMap = cwds.status === 'fulfilled' ? cwds.value : null;
-  return (treePath) => treeProcesses(treePath, out, cwdMap);
+  const processes = listedProcesses(out);
+  return {
+    rootedIn: (treePath) => treeProcesses(treePath, processes, cwdMap),
+    naming: (token) => processes.filter((entry) => entry.command.includes(token))
+      .map((entry) => ({ ...entry, evidence: 'argv' as const })),
+    cwdsListed: cwdMap !== null,
+  };
 }
 
 export interface SweepPreservation {
@@ -2569,6 +2613,16 @@ export class WorktreeManager {
     // could not read working directories, #427 PR 3).
     const rooted = attempt.budget === null ? this.enumerate(row.path) : await this.enumerateAsync(row.path);
     const processes = rooted.filter((proc) => !reaped.includes(proc.pid));
+    // #464: a recorded process this enumeration no longer finds rooted here,
+    // and that is dead, left on its own. Its row leaves `live`, so it can
+    // never fence a writer. One still alive stays live (an enumeration that
+    // could not read working directories cannot clear it) until the tree is
+    // swept; the reaper owns registry rows.
+    const enumerated = new Set(rooted.map((proc) => proc.pid));
+    const gone = this.opts.ledger.listWorktreeProcesses(row.id)
+      .filter((proc) => proc.state === 'live' && proc.evidence !== 'registry' && !enumerated.has(proc.pid) && !pidAlive(proc.pid))
+      .map((proc) => proc.pid);
+    if (gone.length > 0) this.opts.ledger.recordWorktreeProcessesExited({ worktreeId: row.id, pids: gone, reason: 'not-enumerated' });
     // A release nobody answers refuses instead of pausing (#427 PR 3): the
     // caller's catch withdraws the preserve copy, and the tree is retained.
     if (processes.length > 0 && refuse) throw new LaneLiveProcessError(row.path, processes);
