@@ -991,10 +991,20 @@ function claudeHeaderOf(head: string): { readonly id: string; readonly cwd: stri
   }
 }
 
+/**
+ * Markup the Claude CLI reserves for its own user frames (#472). Its
+ * --replay-user-messages never echoes a user message whose text holds one of
+ * these opening tags, or starts with a teammate message — read from Claude
+ * Code 2.1.306's replay filter. A directive quoting one (a re-brief warning
+ * against `<task-notification>`) would never be admitted.
+ */
+const CLAUDE_RESERVED_TAG = /<\/?(?:task-notification|tick|bash-stdout|bash-stderr|local-command-stdout|local-command-stderr|teammate-message)(?=[\s/>])[^<>]*>?/gu;
+
 /** A directive's exact user content (#424): always an array, text only, so
- * the CLI's echo binds it byte for byte. */
+ * the CLI's echo binds it byte for byte. Markup the CLI reserves is written
+ * as entities (#472), which the model reads the same and the CLI echoes. */
 export function claudeDirectiveContent(text: string): readonly StreamFrame[] {
-  return [{ type: 'text', text }];
+  return [{ type: 'text', text: text.replace(CLAUDE_RESERVED_TAG, (tag) => tag.replaceAll('<', '&lt;').replaceAll('>', '&gt;')) }];
 }
 
 /** The stdin user frame for one prompt (image blocks first, then text). */
@@ -1922,6 +1932,12 @@ export class ClaudeCodeHandle implements AgentHandle {
         directive.onAdmitted(binding);
         turn.admitted = binding;
       }).catch((error: unknown) => this.failDirective(turn, error, abortTurn));
+      return;
+    }
+    // Before its echo the turn may only announce itself (the checkpoint's own
+    // rule): an answer first can never be admitted, so it ends here (#472).
+    if (turn.admission === null && turn.failure === null && (frame['type'] === 'assistant' || frame['type'] === 'stream_event')) {
+      this.failDirective(turn, new DirectiveCheckpointError('the Claude CLI began answering without echoing the directive instruction (--replay-user-messages withholds text holding markup the CLI reserves), so its admission cannot be proven'), abortTurn);
       return;
     }
     if (frame['type'] === 'result' && frame['subtype'] === 'success' && frame['is_error'] === false) {

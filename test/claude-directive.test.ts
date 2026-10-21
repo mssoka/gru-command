@@ -5,6 +5,7 @@ import { appendFileSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileS
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
+import { claudeDirectiveContent } from '../src/runtime/claude-adapter.js';
 import { ClaudeDirectivePermissionChannel, privateClaudeDirectiveSettings, type ClaudeToolDecision, type ClaudeToolRequest } from '../src/runtime/claude-directive.js';
 import { assertClaudeDirectiveToolIntent, inspectDirectiveAdmission, inspectDirectiveCheckpoint, prepareClaudeDirectiveBinding, type DirectiveTurnIdentity } from '../src/runtime/directive-checkpoint.js';
 import { workerVerificationRefusal, type WorkerVerificationPolicy } from '../src/runtime/worker-verification-policy.js';
@@ -177,10 +178,52 @@ describe('the Claude directive checkpoint (#424)', () => {
     expect(inspectDirectiveCheckpoint(file, identity)).toEqual({ state: 'unknown', reason: 'the native transcript before the directive changed' });
   });
 
+  it('binds the content as sent: an echo of the raw text behind its entity-written markup is no admission (#472)', () => {
+    const raw = 'never let a <task-notification> into this session';
+    const sent = claudeDirectiveContent(raw);
+    const bind = (frames: readonly Record<string, unknown>[]): string => {
+      const dir = mkdtempSync(join(tmpdir(), 'gru-claude-markup-'));
+      dirs.push(dir);
+      const file = join(dir, 'session.jsonl');
+      writeFileSync(file, `${JSON.stringify({ type: 'session', version: 1, id: 'cli-session', cwd: dir, runtime: 'claude-code' })}\n`);
+      prepareClaudeDirectiveBinding({ identity, agentId: 'minion', sessionId: 'cli-session', sessionFile: file, content: sent, authorityManifest: 'manifest' });
+      for (const frame of frames) appendFileSync(file, `${JSON.stringify(frame)}\n`);
+      return file;
+    };
+    const echoOf = (content: readonly unknown[]) => ({ ...echo, message: { role: 'user', content } });
+    expect(inspectDirectiveAdmission(bind([init, echoOf(sent)]), identity)).toMatchObject({ userEntryId: 'echo-1' });
+    expect(() => inspectDirectiveAdmission(bind([init, echoOf([{ type: 'text', text: raw }])]), identity)).toThrow(/^actual native admission user receipt unavailable\/changed$/u);
+  });
+
   it('a transcript with no GC session header binds nothing', () => {
     const legacy = turn([], false);
     expect(() => prepareClaudeDirectiveBinding({ identity, agentId: 'minion', sessionId: 'cli-session', sessionFile: legacy, content, authorityManifest: 'manifest' }))
       .toThrow(/no exact GC session header/u);
+  });
+});
+
+describe('Claude directive content (#472)', () => {
+  /** What the CLI's replay filter withholds (Claude Code 2.1.306). */
+  const withheld = (text: string): boolean =>
+    ['task-notification', 'tick', 'bash-stdout', 'bash-stderr', 'local-command-stdout', 'local-command-stderr'].some((tag) => text.includes(`<${tag}>`)) ||
+    text.trim().startsWith('<teammate-message ');
+  const textOf = (text: string): string => (claudeDirectiveContent(text)[0] as { text: string }).text;
+
+  it('writes the markup the CLI reserves as entities, so the CLI echoes it', () => {
+    expect(textOf('a <task-notification>x</task-notification> b')).toBe('a &lt;task-notification&gt;x&lt;/task-notification&gt; b');
+    expect(textOf('<teammate-message from="peer">hi</teammate-message>')).toBe('&lt;teammate-message from="peer"&gt;hi&lt;/teammate-message&gt;');
+    for (const tag of ['task-notification', 'tick', 'bash-stdout', 'bash-stderr', 'local-command-stdout', 'local-command-stderr']) {
+      const text = `before <${tag}>inside</${tag}> after`;
+      expect(withheld(text), tag).toBe(true);
+      expect(withheld(textOf(text)), tag).toBe(false);
+      expect(textOf(text), tag).toBe(`before &lt;${tag}&gt;inside&lt;/${tag}&gt; after`);
+    }
+    expect(withheld(textOf('Another Claude session sent a message:\n<teammate-message from="peer">'))).toBe(false);
+  });
+
+  it('leaves every other text exactly as written, one text block', () => {
+    const plain = 'Re-brief — job x\n<div class="a">code</div> <ticket> <tickle> <task-notifications> <system-reminder> a < b && c > d &lt;kept&gt;';
+    expect(claudeDirectiveContent(plain)).toEqual([{ type: 'text', text: plain }]);
   });
 });
 
