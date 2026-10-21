@@ -633,11 +633,12 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     } finally { if (timer !== undefined) clearTimeout(timer); if (writer !== null) closeSync(writer); child.kill('SIGTERM'); }
   });
 
-  it('refuses an oversized directive turn before parsing or checkpointing; the session header still reads (#469)', async () => {
+  it('refuses an oversized directive turn before checkpointing; its admission and the session header still read (#469)', async () => {
     const f = await fixture(); f.seed();
     truncateSync(f.file, statSync(f.file).size + 32 * 1024 * 1024 + 1);
     expect(() => inspectDirectiveCheckpoint(f.file, f.identity)).toThrow(/native directive turn exceeds the .* inspection limit/);
-    expect(() => inspectDirectiveAdmission(f.file, f.identity)).toThrow(/native directive turn exceeds the .* inspection limit/);
+    // Admission reads only its receipt; the oversized rest is not its evidence.
+    expect(inspectDirectiveAdmission(f.file, f.identity)).toMatchObject({ identity: f.identity, userEntryId: expect.any(String) });
     expect(readDirectiveSessionHeader(f.file)).toMatchObject({ type: 'session', id: f.native.sessionId, cwd: f.lane.path });
   });
 
@@ -648,7 +649,9 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     const invalid = (prefix: string) => Buffer.concat([Buffer.from(prefix), Buffer.from([0xff]), Buffer.from('"}\n')]);
     appendFileSync(f.file, invalid('{"type":"custom","note":"'));
     expect(() => inspectDirectiveCheckpoint(f.file, f.identity)).toThrow(/native transcript is not valid UTF-8/);
-    expect(() => inspectDirectiveAdmission(f.file, f.identity)).toThrow(/native transcript is not valid UTF-8/);
+    // Admission reads only its receipt (#469): the corrupted entry after it is
+    // never decoded, so it is never evidence either way.
+    expect(inspectDirectiveAdmission(f.file, f.identity)).toMatchObject({ identity: f.identity, userEntryId: expect.any(String) });
     // The header is read alone (#469): the invalid byte must be its own.
     const header = await fixture();
     writeFileSync(header.file, invalid(`{"type":"session","id":"${header.native.sessionId}","cwd":"`));
@@ -671,9 +674,12 @@ describe('restart-recovery-progress — exact native request matrix', () => {
   });
 
   it('refuses excessive JSONL entry counts before splitting the evidence into arrays', async () => {
+    // A directive turn is read only as far as its walk (#469): the first
+    // id-less entry refuses it long before the 250,001st. The turn entry
+    // limit itself is pinned in test/directive-transcript-bounds.test.ts.
     const transcript = await fixture(); transcript.seed();
     appendFileSync(transcript.file, '{}\n'.repeat(250_001));
-    expect(() => inspectDirectiveCheckpoint(transcript.file, transcript.identity)).toThrow(/native directive turn exceeds the entry inspection limit/);
+    expect(inspectDirectiveCheckpoint(transcript.file, transcript.identity)).toEqual({ state: 'unknown', reason: 'native checkpoint has a malformed or duplicate entry identity' });
 
     const association = await fixture(); association.seed();
     writeFileSync(`${association.file}.directives.jsonl`, '{}\n'.repeat(100_001));
@@ -694,7 +700,9 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(row).toMatchObject({ state: 'settled', nativeTarget: { sessionFile: f.file }, nativeBinding: { runtime: 'pi', baseline: `history-${count - 1}`, userEntryId: expect.any(String) } });
     expect(inspectDirectiveCheckpoint(f.file, f.identity)).toMatchObject({ state: 'terminal', ok: true });
     expect(statSync(f.file).size).toBeGreaterThan(NATIVE_TRANSCRIPT_LIMIT);
-    expect(f.native.prompts).toHaveLength(1); expect(f.native.continuations).toBe(0);
+    // The large session itself was resumed, never swapped for a fresh one.
+    expect(f.spawns).toEqual([expect.objectContaining({ agentId: FIXTURE_MINION, resumeFile: f.file })]);
+    expect(f.native.prompts).toHaveLength(1); expect(f.native.prompts[0]).not.toMatch(/^Fresh minion re-brief/u); expect(f.native.continuations).toBe(0);
   });
 
   // Kinds are the registered owner-required ones: the attention registry routes
