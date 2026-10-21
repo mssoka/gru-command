@@ -440,14 +440,20 @@ describe('the pi tool fence reads its own admission and the whole live turn (#46
     expect(() => flushDirectiveToolIntent(parented, invocation, toolCall, identity)).toThrow(RECEIPT_CHANGED);
   });
 
-  it('refuses a call whose result reuses a history id, or a torn live tail', () => {
-    const reused = sessionFile(piHeader);
-    piEntry(reused, 'h0', null, prompt('earlier'));
-    preparePi(reused);
-    const asked = piEntry(reused, 'invocation', piEntry(reused, 'receipt', 'h0', prompt(text)), invocation);
-    expect(() => flushDirectiveToolIntent(reused, invocation, toolCall, identity)).not.toThrow();
-    piEntry(reused, 'h0', asked, toolResult('call-1'));
-    expect(() => flushDirectiveToolIntent(reused, invocation, toolCall, identity)).toThrow(NOT_PERSISTED);
+  it('refuses a call whose batch sibling\'s result reuses a history id, or a torn live tail', () => {
+    // A sequential batch: call-1 settled, call-2 next. Only the id of
+    // call-1's result differs between the accepted and the refused case.
+    const second = { ...toolCall, id: 'call-2' };
+    const batch = { ...invocation, content: [toolCall, second] };
+    for (const [id, refused] of [['result-1', false], ['h0', true]] as const) {
+      const file = sessionFile(piHeader);
+      piEntry(file, 'h0', null, prompt('earlier'));
+      preparePi(file);
+      piEntry(file, id, piEntry(file, 'invocation', piEntry(file, 'receipt', 'h0', prompt(text)), batch), toolResult('call-1'));
+      const flush = () => flushDirectiveToolIntent(file, batch, second, identity);
+      if (refused) expect(flush, id).toThrow(NOT_PERSISTED);
+      else expect(flush, id).not.toThrow();
+    }
 
     const torn = sessionFile(piHeader);
     preparePi(torn);
@@ -542,6 +548,19 @@ describe('limits at their exact boundaries (#469)', () => {
     expect(() => inspectDirectiveCheckpoint(turnOfLines(250_001), identity)).toThrow(/^native directive turn exceeds the entry inspection limit$/u);
   });
 
+  it('pi: a turn of exactly 32 MiB, its receipt included, is read; one byte more refuses', () => {
+    const turn = (bytes: number) => {
+      const file = sessionFile(piHeader);
+      preparePi(file);
+      const receipt = `${JSON.stringify({ type: 'message', id: 'receipt-a', parentId: null, message: prompt(text) })}\n`;
+      const terminal = (body: string) => `${JSON.stringify({ type: 'message', id: 'answer-a', parentId: 'receipt-a', message: { ...answer, content: [{ type: 'text', text: body }] } })}\n`;
+      appendFileSync(file, receipt + terminal('x'.repeat(bytes - Buffer.byteLength(receipt) - Buffer.byteLength(terminal('')))));
+      return file;
+    };
+    expect(inspectDirectiveCheckpoint(turn(LIMIT), identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: 'answer-a' });
+    expect(() => inspectDirectiveCheckpoint(turn(LIMIT + 1), identity)).toThrow(/^native directive turn exceeds the 33554432-byte inspection limit$/u);
+  });
+
   it('a header line of exactly 64 KiB is read; one byte more refuses', () => {
     const header = (bytes: number) => {
       const line = (cwd: string) => JSON.stringify({ ...piHeader, cwd });
@@ -551,15 +570,28 @@ describe('limits at their exact boundaries (#469)', () => {
     expect(() => readDirectiveSessionHeader(header(64 * 1024 + 1))).toThrow(/^native session header exceeds the 65536-byte inspection limit$/u);
   });
 
-  it('pi: a lookahead past a terminal has its own entry bound, never the earlier turn\'s', () => {
-    const file = sessionFile(piHeader);
-    preparePi(file);
-    const final = piEntry(file, 'answer-a', piEntry(file, 'receipt-a', null, prompt(text)), answer);
-    // The turn holds 2 entries; 249,999 controls and the next receipt make 250,000 more.
-    appendRows(file, 249_999, (index) => ({ type: 'thinking_level_change', id: `level-${index}`, parentId: index === 0 ? final : `level-${index - 1}`, thinkingLevel: 'low' }));
-    preparePi(file, laterIdentity, 'the next approved step');
-    piEntry(file, 'receipt-b', 'level-249998', prompt('the next approved step'));
-    expect(inspectDirectiveAdmission(file, laterIdentity)).toMatchObject({ userEntryId: 'receipt-b' });
-    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: final });
+  it('pi: a lookahead past a terminal has its own bound and its own name, never the earlier turn\'s', () => {
+    /** A 2-entry turn, then `controls` controls and the next directive's receipt. */
+    const lookahead = (controls: number) => {
+      const file = sessionFile(piHeader);
+      preparePi(file);
+      const final = piEntry(file, 'answer-a', piEntry(file, 'receipt-a', null, prompt(text)), answer);
+      appendRows(file, controls, (index) => ({ type: 'thinking_level_change', id: `level-${index}`, parentId: index === 0 ? final : `level-${index - 1}`, thinkingLevel: 'low' }));
+      preparePi(file, laterIdentity, 'the next approved step');
+      piEntry(file, 'receipt-b', `level-${controls - 1}`, prompt('the next approved step'));
+      expect(inspectDirectiveAdmission(file, laterIdentity)).toMatchObject({ userEntryId: 'receipt-b' });
+      return { file, final };
+    };
+    // 249,999 controls and the receipt are 250,000 lookahead entries: within their own bound.
+    const within = lookahead(249_999);
+    expect(inspectDirectiveCheckpoint(within.file, identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: within.final });
+    // One more is past it, and refused as the lookahead, never as the 2-entry turn.
+    expect(() => inspectDirectiveCheckpoint(lookahead(250_000).file, identity)).toThrow(/^native lookahead after the directive turn exceeds the entry inspection limit$/u);
+
+    const bytes = sessionFile(piHeader);
+    preparePi(bytes);
+    const final = piEntry(bytes, 'answer-a', piEntry(bytes, 'receipt-a', null, prompt(text)), answer);
+    piEntry(bytes, 'huge', final, prompt('x'.repeat(LIMIT)));
+    expect(() => inspectDirectiveCheckpoint(bytes, identity)).toThrow(/^native lookahead after the directive turn exceeds the 33554432-byte inspection limit$/u);
   });
 });

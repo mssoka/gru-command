@@ -281,19 +281,23 @@ continuations and `/recover` successors.
   inspection walks:
   - admission stops at its receipt;
   - a checkpoint stops at its result, or at its terminal plus the next
-    bound request (that lookahead is never charged to the turn);
+    bound request;
   - a tool fence reads the live turn.
 
   Only the turn's own lines count against 32 MiB and 250,000 entries, so a
-  session's later growth never pushes an earlier directive past the limits.
+  session's later growth never pushes an earlier directive past its limits.
+  A pi checkpoint's lookahead past its terminal (the next request and its
+  model/thinking controls) has its own 32 MiB / 250,000-entry bound and is
+  refused under its own name, as the lookahead, never as the turn.
 
-What is still refused by name:
+What is still refused by name, wherever a walk reads it:
 
-- a directive turn past either limit;
-- a torn entry, invalid UTF-8, or a reused or missing entry id, wherever a
-  walk reads it;
-- a missing baseline;
-- for Claude Code, a changed byte prefix.
+- on both runtimes, a directive turn past either limit and invalid UTF-8;
+- on pi, a torn entry, a reused or missing entry id, and a missing
+  baseline;
+- on Claude Code, a changed byte prefix and a line that is no JSON object.
+  A torn final line only ends a Claude walk, because the live writer may be
+  mid-frame. Frame uuids are not checked for uniqueness.
 
 A pi entry that is not JSON still fails as a JSON parse error, as it did
 before #469.

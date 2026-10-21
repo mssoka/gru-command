@@ -119,7 +119,6 @@ interface NativeEntry {
  */
 const HEADER_OVERSIZED = `native session header exceeds the ${MAX_NATIVE_HEADER_BYTES}-byte inspection limit`;
 const ENTRY_OVERSIZED = `native transcript entry exceeds the ${MAX_NATIVE_TRANSCRIPT_BYTES}-byte inspection limit`;
-const TURN_OVERSIZED = `native directive turn exceeds the ${MAX_NATIVE_TRANSCRIPT_BYTES}-byte inspection limit`;
 function withNativeTranscript<T>(file: string, inspect: (fd: number) => T): T {
   const fd = openRegularFile(file, 'native transcript');
   try { return inspect(fd); } finally { closeSync(fd); }
@@ -183,18 +182,20 @@ function nativeHeaderLine(fd: number): string {
 class NativeTurn {
   private readonly lines: NativeLines;
   private count = 0;
+  private scope = 'native directive turn';
   constructor(fd: number, private start: number, private readonly tail: 'whole' | 'accepted') { this.lines = new NativeLines(fd, start); }
   /** The turn ended at the last line read. What is read after it only looks
-   * ahead, under its own bound: it is never charged to this turn. */
-  end(): void { this.start = this.lines.end; this.count = 0; }
+   * ahead, under its own bound and its own name: it is never charged to,
+   * nor refused as, this turn. */
+  end(): void { this.start = this.lines.end; this.count = 0; this.scope = 'native lookahead after the directive turn'; }
   /** The turn's next line, or undefined at its end. */
   next(): string | undefined {
-    const line = this.lines.next(MAX_NATIVE_TRANSCRIPT_BYTES - (this.lines.end - this.start) - 1, TURN_OVERSIZED);
+    const line = this.lines.next(MAX_NATIVE_TRANSCRIPT_BYTES - (this.lines.end - this.start) - 1, `${this.scope} exceeds the ${MAX_NATIVE_TRANSCRIPT_BYTES}-byte inspection limit`);
     if (line === null) {
       if (this.lines.partial && this.tail === 'whole') throw new DirectiveCheckpointError('native transcript has a partial entry');
       return undefined;
     }
-    if (++this.count > MAX_NATIVE_TRANSCRIPT_ENTRIES) throw new DirectiveCheckpointError('native directive turn exceeds the entry inspection limit');
+    if (++this.count > MAX_NATIVE_TRANSCRIPT_ENTRIES) throw new DirectiveCheckpointError(`${this.scope} exceeds the entry inspection limit`);
     return line;
   }
 }
