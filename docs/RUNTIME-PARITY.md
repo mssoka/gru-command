@@ -203,11 +203,16 @@ writes each runtime's own record shape during a resumed turn.
     - the marker's host is gone. Its pid is dead, or the process now
       holding it has a different start identity from the one the marker
       recorded. That covers a reused pid, and this service restarted under
-      the same pid. The identity is Linux's boot id plus the start ticks in
-      `/proc/<pid>/stat`; elsewhere it is `ps -o lstart` read in UTC. Both
-      are the kernel's own record, so clock and timezone changes never move
-      them. A marker written before the identity existed, under a live pid,
-      refuses;
+      the same pid. The identity is the kernel's own record of the start,
+      so clock and timezone changes never move it:
+      - Linux: the boot id plus the start ticks in `/proc/<pid>/stat`;
+      - macOS: `ps -o lstart` read in UTC.
+
+      Other platforms get no identity. The service reads its own identity
+      at boot and warns when it cannot. Every marker this service writes
+      carries the identity, so a marker under this service's own pid with
+      another identity, or with none, was left by an earlier process. A
+      marker with no identity under a live pid of another process refuses;
     - no live process is rooted (argv or cwd) in the round's review
       worktree;
     - no live process names one of the round's session ids, registered or
@@ -225,9 +230,11 @@ writes each runtime's own record shape during a resumed turn.
   - an unreadable lock, or one that names no pid.
 
   A passing proof is recorded once as `round.review-owner-ceased` (source
-  `host-exit`). The record keeps the evidence it checked and how the host was
-  found gone (`dead`, `pid-reused` or `restarted`), so it is never
-  re-decided. The same proof clears a writer that is waiting on a
+  `host-exit`), so it is never re-decided. The record keeps the evidence it
+  checked and how the host was found gone (`dead`, `pid-reused` or
+  `restarted`). For the last two it also keeps the two start identities it
+  compared. On pi, PID death answers first; the same proof clears a pi
+  owner whose pid is reused or under which this service restarted. The same proof clears a writer that is waiting on a
   supersession a restart interrupted. A refusal names what is still alive
   where there is a process, or the file to clear where there is one, for
   example a lock file to remove once no process holds it. Every later review

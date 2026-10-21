@@ -1103,4 +1103,29 @@ export const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE notifications ADD COLUMN decided_option TEXT;
     `,
   },
+  {
+    // #464: a recorded lane process that left its tree on its own (no
+    // longer enumerated there, or its tree swept) moves to `exited`, which
+    // nothing turns back to `live`. SQLite cannot widen a CHECK in place, so
+    // the table is rebuilt; nothing references it.
+    id: 30,
+    name: 'worktree-processes-exited',
+    sql: `
+      CREATE TABLE worktree_processes_new (
+        worktree_id TEXT NOT NULL REFERENCES worktrees(id),
+        pid         INTEGER NOT NULL,
+        command     TEXT NOT NULL,
+        evidence    TEXT NOT NULL CHECK (evidence IN ('argv','cwd','registry')),
+        state       TEXT NOT NULL CHECK (state IN ('live','killed','exited')),
+        first_seen  TEXT NOT NULL,
+        last_seen   TEXT NOT NULL,
+        PRIMARY KEY (worktree_id, pid)
+      );
+      INSERT INTO worktree_processes_new (worktree_id, pid, command, evidence, state, first_seen, last_seen)
+        SELECT worktree_id, pid, command, evidence, state, first_seen, last_seen FROM worktree_processes;
+      DROP TABLE worktree_processes;
+      ALTER TABLE worktree_processes_new RENAME TO worktree_processes;
+      CREATE INDEX idx_worktree_processes_wt ON worktree_processes(worktree_id);
+    `,
+  },
 ];

@@ -1061,6 +1061,62 @@ describe('worktree manager: sweep (ruling 18c)', () => {
     }
   });
 
+  it('a paused sweep whose processes exit on their own moves their rows to exited, audited, and a plain release sweeps (#464)', async () => {
+    const h = harness();
+    const repo = h.make();
+    ledgerJob(h, 'job-transient', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-transient' });
+    // The live case: a probe runner and its git, then git's ssh child by cwd.
+    let alive = [9619, 9644, 9645];
+    h.enumerator.mockImplementation(() => [
+      { pid: 9619, command: `node -e probe ${row.path}`, evidence: 'argv' as const },
+      { pid: 9644, command: `git -C ${row.path} ls-remote --exit-code origin`, evidence: 'argv' as const },
+      { pid: 9645, command: 'ssh git@github.com git-upload-pack', evidence: 'cwd' as const },
+    ].filter((proc) => alive.includes(proc.pid)));
+    const states = () => Object.fromEntries(h.ledger.listWorktreeProcesses(row.id).map((proc) => [proc.pid, proc.state]));
+    const exits = () => h.ledger.listEvents({ limit: 500 }).filter((event) => event.kind === 'worktree.processes-exited').map((event) => event.payload);
+    const kill = vi.spyOn(process, 'kill');
+    try {
+      expect((await h.manager.release({ worktreeId: row.id })).status).toBe('paused');
+      expect(states()).toEqual({ 9619: 'live', 9644: 'live', 9645: 'live' });
+      // One exits: the re-release still pauses on the rest; the gone row leaves live.
+      alive = [9644, 9645];
+      expect((await h.manager.release({ worktreeId: row.id })).status).toBe('paused');
+      expect(states()).toEqual({ 9619: 'exited', 9644: 'live', 9645: 'live' });
+      // All exit: a plain release sweeps, and nothing was ever killed.
+      alive = [];
+      expect((await h.manager.release({ worktreeId: row.id })).status).toBe('swept');
+      expect(states()).toEqual({ 9619: 'exited', 9644: 'exited', 9645: 'exited' });
+      expect(exits()).toEqual([ // newest first
+        { id: row.id, pids: [9644, 9645], reason: 'not-enumerated' },
+        { id: row.id, pids: [9619], reason: 'not-enumerated' },
+      ]);
+      expect(kill).not.toHaveBeenCalled();
+    } finally {
+      kill.mockRestore();
+    }
+    // A later process under a recycled pid never revives an exited row.
+    h.ledger.recordWorktreeProcesses({ worktreeId: row.id, processes: [{ pid: 9619, command: 'unrelated daemon', evidence: 'argv' }], state: 'live' });
+    expect(h.ledger.listWorktreeProcesses(row.id).find((proc) => proc.pid === 9619)).toMatchObject({ state: 'exited', command: `node -e probe ${row.path}` });
+    expect(h.ledger.listEvents({ limit: 500 }).find((event) => event.kind === 'worktree.processes')?.payload)
+      .toMatchObject({ pids: [9619], kept_exited: [9619] });
+  });
+
+  it('a tree that reaches swept leaves no process recorded live (#464)', async () => {
+    const h = harness();
+    const repo = h.make();
+    ledgerJob(h, 'job-swept-rows', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-swept-rows' });
+    h.ledger.recordWorktreeProcesses({ worktreeId: row.id, processes: [
+      { pid: 7001, command: 'watcher', evidence: 'argv' }, { pid: 7002, command: 'server', evidence: 'cwd' },
+    ], state: 'live' });
+    h.ledger.recordWorktreeProcesses({ worktreeId: row.id, processes: [{ pid: 7002, command: 'server', evidence: 'cwd' }], state: 'killed' });
+    h.ledger.setWorktreeStatus(row.id, 'swept', 'fixture sweep');
+    expect(h.ledger.listWorktreeProcesses(row.id).map((proc) => [proc.pid, proc.state])).toEqual([[7001, 'exited'], [7002, 'killed']]);
+    expect(h.ledger.listEvents({ limit: 500 }).filter((event) => event.kind === 'worktree.processes-exited').map((event) => event.payload))
+      .toEqual([{ id: row.id, pids: [7001], reason: 'worktree-swept' }]);
+  });
+
   it('confirmKill kills EXACTLY the enumerated pids after re-check, then completes the sweep', async () => {
     const h = harness();
     const repo = h.make();

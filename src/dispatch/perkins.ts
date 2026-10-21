@@ -69,6 +69,7 @@ import {
   parsePublicationIdentityPayload,
   parsePublicationRebindUnresolvedPayload,
   parsePublicationReceiptEvidencePayload,
+  pendingPublicationAttempt,
   reviewEventMatchesVerdict,
   type PublicationAttemptPayload,
   type PublicationReceiptEvidencePayload,
@@ -2613,6 +2614,25 @@ export class WaveRunner {
       this.opts.ledger.latestRoundEvent(roundId, 'round.superseded') === null;
   }
 
+  /** A round a graceful shutdown cut during delivery, whose in-flight post
+   * is still unreconciled (#464). */
+  private deliveryCutUnreconciled(roundId: string): boolean {
+    const incomplete = this.opts.ledger.latestRoundEvent(roundId, 'round.perkins-incomplete');
+    const payload = incomplete?.payload as { reason?: unknown; deliveryFailure?: unknown } | null | undefined;
+    return payload?.reason === 'service_restart' && payload.deliveryFailure !== undefined &&
+      pendingPublicationAttempt(this.opts.ledger, roundId) !== null;
+  }
+
+  /** Why an aborted signal cut this round: a supersession (in flight or
+   * recorded) first, then a graceful shutdown, else an honest `cancelled`
+   * that is never re-armed. */
+  private interruptionReason(roundId: string, signal: AbortSignal): 'superseded' | 'service_restart' | 'cancelled' {
+    if (signal.reason instanceof ReviewSupersededError || this.opts.ledger.latestRoundEvent(roundId, 'round.superseded') !== null) {
+      return 'superseded';
+    }
+    return this.shutdownCut(roundId, signal) ? 'service_restart' : 'cancelled';
+  }
+
   /** True while a superseded round's stop is not PROVEN: no confirmation
    * newer than its supersession (or its last unconfirmed re-proof). A
    * restart that interrupted the pass leaves exactly this shape. */
@@ -2687,7 +2707,9 @@ export class WaveRunner {
     });
     if (!proof.ok) return { ids: left, detail: ` (dead-host proof refused: ${proof.problem})` };
     const still = await unproven();
-    return { ids: still, detail: still.length === 0 ? '' : ` (the dead-host proof is recorded, but the runtime still refuses ${still.map((id) => id === '' ? 'the unregistered owner' : id).join(', ')}: its owner proof and its cessation check must read one ledger)` };
+    const named = still.slice(0, 5).map((id) => id === '' ? 'the unregistered owner' : id).join(', ') +
+      (still.length > 5 ? ` and ${String(still.length - 5)} more` : '');
+    return { ids: still, detail: still.length === 0 ? '' : ` (the dead-host proof is recorded, but this service's cessation check still refuses ${named}; the service is miswired: its dead-host proof and cessation check must come from one runtime registry)` };
   }
 
   /** True when a MATERIAL amendment was accepted after `seq`: anything
@@ -3578,6 +3600,19 @@ export class WaveRunner {
 
     for (const job of this.opts.ledger.listJobs()) {
       for (const round of this.opts.ledger.listRounds(job.id)) {
+        // #464: a shutdown that cut delivery left the round aborted with its
+        // post unreconciled. Ask the provider now (nothing POSTs), so its
+        // clean-abort re-arm opens once the post is proven absent.
+        if (round.status === 'aborted' && this.deliveryCutUnreconciled(round.id)) {
+          try {
+            await this.reconcileInterruptedPublication(round);
+          } catch (error) {
+            this.log('error', 'startup reconciliation of a delivery cut failed; its re-arm stays held', { round: round.id, error: String(error) });
+            this.escalate(`Perkins publication for round ${round.id} could not be reconciled after restart`,
+              `${String(error)} — the clean-abort re-arm stays held until the next start reconciles it`, { jobId: job.id, roundId: round.id });
+          }
+          continue;
+        }
         if ((round.status !== 'pending' && round.status !== 'live') || registeredRoundIds.has(round.id)) continue;
         // One failing row must never abort startup recovery of the
         // remaining rounds (same discipline as the lane loop above): a
@@ -5847,19 +5882,18 @@ export class WaveRunner {
     } catch (error) {
       const failures: unknown[] = [error];
       const interrupted = this.shuttingDown || setupSignal.aborted;
-      // Owner rule 3: a superseded setup is withdrawn, not a shutdown.
-      const superseded = setupSignal.reason instanceof ReviewSupersededError;
       try {
         if (interrupted) {
-          const note = superseded
+          // A shutdown's cut is the restart's clean abort, re-armed after
+          // boot (#464); a supersession is withdrawn; anything else is named
+          // honestly and never re-armed.
+          const reason = this.interruptionReason(round.id, setupSignal);
+          const note = reason === 'superseded'
             ? 'review setup withdrawn: an approved material change or the lane writer superseded this candidate'
-            : 'review setup interrupted by service shutdown; frozen proof is incomplete';
+            : reason === 'service_restart'
+              ? 'review setup interrupted by service shutdown; frozen proof is incomplete'
+              : 'review setup cancelled; frozen proof is incomplete';
           this.opts.ledger.abortReviewSetupWithoutSpawn(round.id);
-          // Only shutdown or supersession aborts a setup: a shutdown's cut is
-          // the restart's clean abort, re-armed after boot (#464). Anything
-          // else is named honestly and never re-armed.
-          const reason = this.shutdownCut(round.id, setupSignal) ? 'service_restart'
-            : superseded || this.opts.ledger.latestRoundEvent(round.id, 'round.superseded') !== null ? 'superseded' : 'cancelled';
           const artifacts = this.writeInterruptedArtifacts(round.id, reason, note);
           this.opts.ledger.appendCustomEvent({
             kind: 'round.perkins-incomplete',
@@ -6642,10 +6676,7 @@ export class WaveRunner {
           // One cut by a graceful service shutdown is the restart's clean
           // abort (#464), which Silas re-arms on the unchanged head after
           // boot, exactly as startup recovery's own `service_restart`.
-          reason: signal.reason instanceof ReviewSupersededError ? 'superseded'
-            : signal.aborted ? (this.shutdownCut(round.id, signal) ? 'service_restart'
-              : this.opts.ledger.latestRoundEvent(round.id, 'round.superseded') !== null ? 'superseded' : 'cancelled')
-            : 'workflow_error',
+          reason: signal.aborted ? this.interruptionReason(round.id, signal) : 'workflow_error',
           error: detail.slice(0, 500),
           reportFile,
           executionFacts,
@@ -7281,6 +7312,9 @@ export class WaveRunner {
             // until the in-flight post is reconciled.
             reason: signal.aborted && this.shutdownCut(round.id, signal) ? 'service_restart'
               : verdict === null ? 'review_incomplete' : deliveryFailureKind,
+            // The delivery failure itself stays on record under a restart cut.
+            ...(signal.aborted && this.shutdownCut(round.id, signal)
+              ? { deliveryFailure: verdict === null ? 'review_incomplete' : deliveryFailureKind } : {}),
             reportFile,
             executionFacts: executionFactsLine,
             ...(hostReportWriteFailed !== null ? { hostReportWriteFailed } : {}),

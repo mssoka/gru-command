@@ -201,12 +201,15 @@ function treeProcesses(treePath: string, listed: readonly { readonly pid: number
   try {
     candidates.add(realpathSync(treePath));
   } catch {
-    // A swept tree is resolved through its parent, so a process that
-    // outlived it is still matched by its resolved cwd (#464).
-    try {
-      candidates.add(join(realpathSync(dirname(treePath)), basename(treePath)));
-    } catch {
-      /* the sweep's own guards handle a missing tree */
+    // A swept tree is resolved through its nearest surviving ancestor, so a
+    // process that outlived it is still matched by its resolved cwd (#464).
+    for (let ancestor = dirname(treePath); ; ancestor = dirname(ancestor)) {
+      try {
+        candidates.add(join(realpathSync(ancestor), relative(ancestor, treePath)));
+        break;
+      } catch {
+        if (dirname(ancestor) === ancestor) break; /* the sweep's own guards handle a missing tree */
+      }
     }
   }
   const processes: TreeProcess[] = [];
@@ -2610,6 +2613,14 @@ export class WorktreeManager {
     // could not read working directories, #427 PR 3).
     const rooted = attempt.budget === null ? this.enumerate(row.path) : await this.enumerateAsync(row.path);
     const processes = rooted.filter((proc) => !reaped.includes(proc.pid));
+    // #464: a recorded process this enumeration no longer finds rooted here
+    // left on its own (the sweep trusts the same enumeration). Its row leaves
+    // `live`, so it can never fence a writer; the reaper owns registry rows.
+    const enumerated = new Set(rooted.map((proc) => proc.pid));
+    const gone = this.opts.ledger.listWorktreeProcesses(row.id)
+      .filter((proc) => proc.state === 'live' && proc.evidence !== 'registry' && !enumerated.has(proc.pid))
+      .map((proc) => proc.pid);
+    if (gone.length > 0) this.opts.ledger.recordWorktreeProcessesExited({ worktreeId: row.id, pids: gone, reason: 'not-enumerated' });
     // A release nobody answers refuses instead of pausing (#427 PR 3): the
     // caller's catch withdraws the preserve copy, and the tree is retained.
     if (processes.length > 0 && refuse) throw new LaneLiveProcessError(row.path, processes);

@@ -14,15 +14,17 @@ import type { ReviewOwnerMarker } from './registry.js';
  *
  * - the marker's host is gone: its pid is dead, or the process now holding
  *   it has a different start identity than the one the marker recorded (a
- *   reused pid, or this service restarted under the same pid);
+ *   reused pid, or this service restarted under the same pid). A marker
+ *   with no identity under a live foreign pid cannot be told apart and
+ *   refuses;
  * - no live process is rooted (argv or cwd) in the round's review worktree;
  * - no live process names one of the round's session ids (a Claude review
  *   CLI carries `--session-id`/`--resume <id>` in argv);
- * - no session lock of the round is held by a live pid other than the gone
- *   host.
+ * - no session lock of the round is held by this process, or by a live pid
+ *   other than the gone host.
  *
- * Evidence that cannot be read refuses; every later review request
- * re-checks.
+ * Evidence that cannot be read refuses, naming the file to clear where
+ * there is one; every later review request re-checks.
  */
 
 /** What a later process knows of a review owner's sessions. */
@@ -41,6 +43,10 @@ export interface ReviewHostExitEvidence {
   readonly sessionFiles: number;
   /** How the host was found gone. */
   readonly host: 'dead' | 'pid-reused' | 'restarted';
+  /** The start identities compared (`pid-reused`, `restarted`): the one the
+   * marker recorded and the one now holding the pid. */
+  readonly markerIdentity?: string | null;
+  readonly observedIdentity?: string | null;
 }
 
 export type ReviewHostExitResult =
@@ -61,61 +67,78 @@ export interface ReviewHostExitProbes {
 
 const SESSION_FILE = /_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/u;
 
-/** Linux: the boot id and the start time in clock ticks since boot, from
- * `/proc/<pid>/stat` (field 22, counted past the parenthesized name). */
+/** The start time in clock ticks since boot from one `/proc/<pid>/stat`
+ * line: field 22, counted past the parenthesized name (which may itself hold
+ * spaces or parentheses). */
+export function linuxStartTicks(stat: string): string | null {
+  const close = stat.lastIndexOf(')');
+  if (close === -1) return null;
+  const ticks = stat.slice(close + 2).split(' ')[19];
+  return ticks !== undefined && /^\d+$/u.test(ticks) ? ticks : null;
+}
+
+/** Linux: the boot id and the start ticks of `/proc/<pid>/stat`. */
 function linuxIdentity(pid: number): string | null {
   try {
-    const stat = readFileSync(`/proc/${String(pid)}/stat`, 'utf8');
-    const ticks = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19];
+    const ticks = linuxStartTicks(readFileSync(`/proc/${String(pid)}/stat`, 'utf8'));
     const boot = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
-    return ticks === undefined || !/^\d+$/u.test(ticks) || boot === '' ? null : `linux:${boot}:${ticks}`;
+    return ticks === null || boot === '' ? null : `linux:${boot}:${ticks}`;
   } catch {
     return null;
   }
 }
 
+/** macOS keeps a process's start as an absolute time, which `ps` prints in
+ * the zone it is given: read in UTC it never moves. (The BSDs derive it
+ * from a boot time a clock step adjusts, so they get no identity.) */
+const PS = '/bin/ps';
 const PS_START = ['-o', 'lstart=', '-p'] as const;
 const PS_ENV = { ...process.env, TZ: 'UTC', LC_ALL: 'C' };
 
 /** A clock-free start identity for the process now holding `pid`: Linux's
- * boot id and start ticks; elsewhere `ps -o lstart` in UTC, the kernel's
- * stored start time, which later clock or timezone changes do not move.
- * Null when it cannot be read. */
+ * boot id and start ticks, or macOS's UTC `ps -o lstart`. Null when it
+ * cannot be read, or on any other platform. */
 export async function processIdentity(pid: number): Promise<string | null> {
   if (process.platform === 'linux') return linuxIdentity(pid);
+  if (process.platform !== 'darwin') return null;
   return new Promise((resolve) => {
-    execFile('ps', [...PS_START, String(pid)], { encoding: 'utf8', timeout: 10_000, env: PS_ENV }, (error, stdout) => {
+    execFile(PS, [...PS_START, String(pid)], { encoding: 'utf8', timeout: 10_000, env: PS_ENV }, (error, stdout) => {
       const started = error === null ? stdout.trim() : '';
       resolve(started === '' ? null : `ps:${started}`);
     });
   });
 }
 
-let ownIdentity: string | null | undefined;
+let ownIdentity: string | undefined;
 
-/** This process's start identity, read once (synchronously: the owner
- * marker is written where setup must not yield). */
+/** This process's start identity, read synchronously (the owner marker is
+ * written where setup must not yield) and kept once read. A failed read is
+ * retried at the next call, never cached; the service reads it at boot so a
+ * failure is reported there. */
 export function thisProcessIdentity(): string | null {
   if (ownIdentity !== undefined) return ownIdentity;
+  let read: string | null = null;
   if (process.platform === 'linux') {
-    ownIdentity = linuxIdentity(process.pid);
-  } else {
+    read = linuxIdentity(process.pid);
+  } else if (process.platform === 'darwin') {
     try {
-      const started = execFileSync('ps', [...PS_START, String(process.pid)], { encoding: 'utf8', timeout: 10_000, env: PS_ENV }).trim();
-      ownIdentity = started === '' ? null : `ps:${started}`;
+      const started = execFileSync(PS, [...PS_START, String(process.pid)], { encoding: 'utf8', timeout: 10_000, env: PS_ENV }).trim();
+      read = started === '' ? null : `ps:${started}`;
     } catch {
-      ownIdentity = null;
+      read = null;
     }
   }
-  return ownIdentity;
+  if (read !== null) ownIdentity = read;
+  return read;
 }
 
 /** Whether THIS process hosts the marker's owner (its own adapter evidence
- * then decides, never a dead-host proof). A marker under this pid with a
- * different recorded identity was left by an earlier process; one with no
- * identity to compare is treated as this process's own. */
+ * then decides, never a dead-host proof). Every marker this process writes
+ * carries its identity, so one under this pid with another identity, or
+ * with none, was left by an earlier process; only when this process cannot
+ * read its own identity is a same-pid marker taken as its own. */
 export function hostedByThisProcess(marker: ReviewOwnerMarker, own: string | null = thisProcessIdentity()): boolean {
-  return marker.pid === process.pid && (marker.hostIdentity === undefined || own === null || marker.hostIdentity === own);
+  return marker.pid === process.pid && (own === null || marker.hostIdentity === own);
 }
 
 /** OS liveness: EPERM still proves the pid exists. */
@@ -134,14 +157,15 @@ function named(processes: readonly TreeProcess[]): string {
   return processes.length > 5 ? `${shown} and ${String(processes.length - 5)} more` : shown;
 }
 
-type HostCheck = { readonly gone: ReviewHostExitEvidence['host'] } | { readonly problem: string };
+type HostCheck =
+  | { readonly gone: ReviewHostExitEvidence['host']; readonly observedIdentity?: string | null }
+  | { readonly problem: string };
 
 /** The marker's host is gone: dead, its pid now held by a process with
- * another start identity, or this service restarted under that pid (the
- * caller has already ruled out this process hosting it). */
+ * another start identity, or this service restarted under that pid. */
 async function hostGone(marker: ReviewOwnerMarker, probes: ReviewHostExitProbes): Promise<HostCheck> {
   const pid = String(marker.pid);
-  if (marker.pid === process.pid) return { gone: 'restarted' };
+  if (marker.pid === process.pid) return { gone: 'restarted', observedIdentity: thisProcessIdentity() };
   const state = probes.pidState(marker.pid);
   if (state === 'dead') return { gone: 'dead' };
   if (state === 'unknown') return { problem: `its host pid ${pid} cannot be probed` };
@@ -152,7 +176,7 @@ async function hostGone(marker: ReviewOwnerMarker, probes: ReviewHostExitProbes)
   if (identity === null) return { problem: `its host pid ${pid} is alive and its start identity cannot be read` };
   return identity === marker.hostIdentity
     ? { problem: `its host pid ${pid} is still running; the replacement starts once it exits` }
-    : { gone: 'pid-reused' };
+    : { gone: 'pid-reused', observedIdentity: identity };
 }
 
 /** Every session the round may own: its registered sessions, plus any
@@ -216,6 +240,9 @@ function heldLock(sessionFile: string, host: number, probes: ReviewHostExitProbe
 
 export async function proveReviewHostExit(input: ReviewHostExitInput, probes: ReviewHostExitProbes): Promise<ReviewHostExitResult> {
   const { marker } = input;
+  if (hostedByThisProcess(marker)) {
+    return { ok: false, problem: 'its host is this process, so only its own adapter evidence proves cessation' };
+  }
   const host = await hostGone(marker, probes);
   if ('problem' in host) return { ok: false, problem: host.problem };
   if (input.worktreePath === null) return { ok: false, problem: `round ${marker.roundId} has no registered review worktree to check` };
@@ -244,6 +271,9 @@ export async function proveReviewHostExit(input: ReviewHostExitInput, probes: Re
   }
   return {
     ok: true,
-    evidence: { worktreePath: input.worktreePath, sessionIds: [...sessions.ids].sort(), sessionFiles: sessions.files.size, host: host.gone },
+    evidence: {
+      worktreePath: input.worktreePath, sessionIds: [...sessions.ids].sort(), sessionFiles: sessions.files.size, host: host.gone,
+      ...(host.gone === 'dead' ? {} : { markerIdentity: marker.hostIdentity ?? null, observedIdentity: host.observedIdentity ?? null }),
+    },
   };
 }

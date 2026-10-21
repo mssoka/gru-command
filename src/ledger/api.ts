@@ -3077,6 +3077,9 @@ export class LedgerApi {
         roundId: current.roundId,
         payload: { id, from: current.status, to: status, ...(note !== undefined ? { note } : {}) },
       });
+      // #464: a swept tree holds no process; what is still recorded live
+      // left on its own, in the same transaction as the sweep.
+      if (status === 'swept') this.recordWorktreeProcessesExited({ worktreeId: id, pids: 'all-live', reason: 'worktree-swept' });
       return this.getWorktree(id) as WorktreeRecord;
     });
   }
@@ -3149,13 +3152,18 @@ export class LedgerApi {
     }
     this.transaction(() => {
       const ts = nowIso();
+      const keptExited = input.processes.map((proc) => proc.pid).filter((pid) =>
+        this.db.prepare("SELECT 1 FROM worktree_processes WHERE worktree_id = ? AND pid = ? AND state = 'exited'").get(input.worktreeId, pid) !== undefined);
       const upsert = this.db.prepare(
         `INSERT INTO worktree_processes (worktree_id, pid, command, evidence, state, first_seen, last_seen)
          VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (worktree_id, pid) DO UPDATE SET
-           state = excluded.state,
-           command = excluded.command,
-           last_seen = excluded.last_seen`,
+           -- #464: an exited row is final; a later process under a recycled pid
+           -- never revives the row (its own fresh enumeration still pauses
+           -- a sweep).
+           state = CASE WHEN worktree_processes.state = 'exited' THEN 'exited' ELSE excluded.state END,
+           command = CASE WHEN worktree_processes.state = 'exited' THEN worktree_processes.command ELSE excluded.command END,
+           last_seen = CASE WHEN worktree_processes.state = 'exited' THEN worktree_processes.last_seen ELSE excluded.last_seen END`,
       );
       for (const proc of input.processes) {
         upsert.run(input.worktreeId, proc.pid, proc.command, proc.evidence, input.state, ts, ts);
@@ -3166,8 +3174,40 @@ export class LedgerApi {
           id: input.worktreeId,
           state: input.state,
           pids: input.processes.map((proc) => proc.pid),
+          ...(keptExited.length > 0 ? { kept_exited: keptExited } : {}),
         },
       });
+    });
+  }
+
+  /** #464: recorded `live` processes that left the tree on their own move
+   * to `exited` with one audited event: `not-enumerated` when a sweep's
+   * fresh enumeration no longer finds them rooted in it, `worktree-swept`
+   * when the tree is gone. Rows already out of `live` are untouched.
+   * Returns the pids moved. */
+  recordWorktreeProcessesExited(input: {
+    readonly worktreeId: string;
+    readonly pids: readonly number[] | 'all-live';
+    readonly reason: 'not-enumerated' | 'worktree-swept';
+  }): readonly number[] {
+    return this.transaction(() => {
+      const worktree = this.getWorktree(input.worktreeId);
+      if (worktree === null) throw new RecordNotFound(`worktree "${input.worktreeId}" not found`);
+      const live = (this.db.prepare("SELECT pid FROM worktree_processes WHERE worktree_id = ? AND state = 'live' ORDER BY pid")
+        .all(input.worktreeId) as Row[]).map((row) => Number(row.pid));
+      const wanted = input.pids === 'all-live' ? null : new Set(input.pids);
+      const moved = live.filter((pid) => wanted === null || wanted.has(pid));
+      if (moved.length === 0) return [];
+      const ts = nowIso();
+      const exit = this.db.prepare("UPDATE worktree_processes SET state = 'exited', last_seen = ? WHERE worktree_id = ? AND pid = ? AND state = 'live'");
+      for (const pid of moved) exit.run(ts, input.worktreeId, pid);
+      this.appendEvent({
+        kind: 'worktree.processes-exited',
+        jobId: worktree.jobId,
+        roundId: worktree.roundId,
+        payload: { id: input.worktreeId, pids: moved, reason: input.reason },
+      });
+      return moved;
     });
   }
 
@@ -9737,12 +9777,14 @@ export class LedgerApi {
     if (rounds.length > 0) {
       blockers.push(`live review round(s): ${rounds.map((round) => `${round.id} (${round.status})`).join(', ')}`);
     }
+    // #464: a swept lane runs nothing; a row it left `live` (recorded
+    // before sweeps moved them to `exited`) never fences a writer.
     const liveProcesses = this.db
       .prepare(
         `SELECT DISTINCT p.worktree_id AS worktree_id, p.pid AS pid
            FROM worktree_processes p
            JOIN worktrees w ON w.id = p.worktree_id
-          WHERE p.state = 'live' AND (w.job_id = ? OR p.worktree_id = ?)
+          WHERE p.state = 'live' AND w.status <> 'swept' AND (w.job_id = ? OR p.worktree_id = ?)
           ORDER BY p.worktree_id, p.pid`,
       )
       .all(row.jobId, laneId) as Row[];

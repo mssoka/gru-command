@@ -250,11 +250,16 @@ degenerate into check-failed movement.
   - after the workflow returned, before finalization;
   - during report delivery.
 
-  A supersession, recorded or in flight, still records `superseded`, as
+  A supersession, recorded or in flight, is never labelled
+  `service_restart`; setup and mid-review cuts record `superseded`, as
   startup recovery does. Silas's `clean-abort-service-restart` row then
-  re-arms the round on the unchanged delivered head after boot. A round cut
-  during delivery waits until its in-flight post is reconciled. A refused
-  re-arm keeps the row, and each sweep tries again.
+  re-arms the round on the unchanged delivered head after boot.
+
+  A round cut during delivery keeps its delivery failure beside the reason,
+  and stays held while its in-flight post is unreconciled. The next start
+  asks the provider, read-only, as startup recovery does for a live round.
+  Once the post is proven absent, the row opens. A refused re-arm keeps the
+  row, and each sweep tries again.
 - A replacement round is admitted only once every earlier round's review
   owner is proven ceased. Ledger disposal state is not proof.
   - **Durable record.** When the owning process's adapter reports a review
@@ -266,7 +271,8 @@ degenerate into check-failed movement.
     proven gone. Claude Code needs all of these:
     - the host is gone. Its pid is dead, or the process now holding it has
       a different start identity from the one the marker recorded: a reused
-      pid, or this service restarted under that pid;
+      pid, or this service restarted under that pid. A marker with no
+      identity under another live process's pid refuses;
     - no live process is rooted (argv or cwd) in the round's review
       worktree;
     - no live process names one of the round's session ids;

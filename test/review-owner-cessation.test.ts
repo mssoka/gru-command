@@ -1,6 +1,6 @@
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { hostname, tmpdir } from 'node:os';
@@ -10,13 +10,14 @@ import { configPathFor, DEFAULT_SILAS_CONFIG, loadConfig } from '../src/config.j
 import { WaveRunner, type WaveOutcome } from '../src/dispatch/perkins.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
 import type { AgentSpawner, DispatchService } from '../src/dispatch/service.js';
+import { pendingPublicationAttempt } from '../src/dispatch/publication-evidence.js';
 import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
 import type { WorktreeLane } from '../src/dispatch/worktree-port.js';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi, REVIEW_OWNER_CEASED_KIND } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { RuntimeRegistry, ledgerReviewOwnerCessation, type ResidentReviewRound, type ReviewOwnerCessationLedger, type ReviewOwnerMarker } from '../src/runtime/registry.js';
-import { processIdentity, thisProcessIdentity } from '../src/runtime/review-host-exit.js';
+import { linuxStartTicks, processIdentity, thisProcessIdentity } from '../src/runtime/review-host-exit.js';
 import type { AgentHandle } from '../src/runtime/types.js';
 import { SessionStore } from '../src/sessions/store.js';
 import { processTableAsync, type ProcessTable } from '../src/worktrees/manager.js';
@@ -353,8 +354,8 @@ describe('review-owner cessation survives a restart (#464)', () => {
     const post = await serveReview(f, registry, { reconcileReviewAgent: async () => false });
     const refused = await post({ job_id: f.jobId, target_ref: f.target });
     expect(refused.status).toBe(400);
-    expect(refusal(refused)).toContain(`(the dead-host proof is recorded, but the runtime still refuses ${agentId}: ` +
-      'its owner proof and its cessation check must read one ledger)');
+    expect(refusal(refused)).toContain(`(the dead-host proof is recorded, but this service's cessation check still refuses ${agentId}; ` +
+      'the service is miswired: its dead-host proof and cessation check must come from one runtime registry)');
     expect(hostExitRecords(f)).toHaveLength(1);
   }, 60_000);
 
@@ -415,30 +416,53 @@ describe('review-owner cessation survives a restart (#464)', () => {
     await expect(restartedRegistry(f, host('ps:anything')).proveReviewHostExit(at(legacy))).resolves.toEqual({ ok: false,
       problem: `its host pid ${pid} is still running (the marker records no host identity to tell a reused pid apart); the replacement starts once it exits` });
     expect(hostExitRecords(f)).toEqual([]);
-    // Another start identity under the host's pid: a reused pid.
-    await expect(restartedRegistry(f, host('ps:Fri Oct 23 00:00:00 2026')).proveReviewHostExit(at(f.marker)))
-      .resolves.toMatchObject({ ok: true, evidence: { host: 'pid-reused' } });
-    // This pid: its own identity (or none to compare) is this process, whose
-    // adapter evidence alone decides; another identity is an earlier process.
-    const own = 'its host is this process, so only its own adapter evidence proves cessation';
-    await expect(restartedRegistry(f, clean).proveReviewHostExit(at(otherRound(f, process.pid, thisProcessIdentity() ?? undefined))))
-      .resolves.toEqual({ ok: false, problem: own });
-    await expect(restartedRegistry(f, clean).proveReviewHostExit(at(otherRound(f, process.pid)))).resolves.toEqual({ ok: false, problem: own });
+    // Another start identity under the host's pid: a reused pid, with both
+    // identities on record.
+    await expect(restartedRegistry(f, host('ps:Fri Oct 23 00:00:00 2026')).proveReviewHostExit(at(f.marker))).resolves.toMatchObject({
+      ok: true, evidence: { host: 'pid-reused', markerIdentity: OTHER_HOST, observedIdentity: 'ps:Fri Oct 23 00:00:00 2026' },
+    });
+    // A marker from before identities existed, under a dead pid, is proven
+    // gone and recorded like any other.
+    const legacyDead = otherRound(f, DEAD_PID);
+    const legacyRegistry = restartedRegistry(f, clean);
+    await expect(legacyRegistry.proveReviewHostExit(at(legacyDead))).resolves.toMatchObject({ ok: true, evidence: { host: 'dead' } });
+    expect(legacyRegistry.reviewOwnerCeased('', legacyDead)).toBe(true);
+    // This pid: its own identity is this process, whose adapter evidence
+    // alone decides. Every marker this process writes carries that identity,
+    // so one with another identity, or none, was left by an earlier process.
+    await expect(restartedRegistry(f, clean).proveReviewHostExit(at(otherRound(f, process.pid, thisProcessIdentity()!))))
+      .resolves.toEqual({ ok: false, problem: 'its host is this process, so only its own adapter evidence proves cessation' });
     const earlier = otherRound(f, process.pid, OTHER_HOST);
     const restarted = restartedRegistry(f, clean);
-    await expect(restarted.proveReviewHostExit(at(earlier))).resolves.toMatchObject({ ok: true, evidence: { host: 'restarted' } });
+    await expect(restarted.proveReviewHostExit(at(earlier))).resolves.toMatchObject({
+      ok: true, evidence: { host: 'restarted', markerIdentity: OTHER_HOST, observedIdentity: thisProcessIdentity() },
+    });
     expect(restarted.reviewOwnerCeased('', earlier)).toBe(true);
+    await expect(restartedRegistry(f, clean).proveReviewHostExit(at(otherRound(f, process.pid)))).resolves.toMatchObject({
+      ok: true, evidence: { host: 'restarted', markerIdentity: null },
+    });
     // The record binds the marker's own host identity, never one a caller claims.
     expect(() => f.ledger.recordReviewOwnerCessation({ source: 'host-exit', roundId: earlier.roundId, generation: earlier.generation,
       pid: process.pid, hostIdentity: 'ps:forged', evidence: {} })).toThrow(/binds no unique round owner marker/u);
     expect(hostExitRecords(f).map((event) => (event.payload as { evidence: { host: string } }).evidence.host).sort())
-      .toEqual(['pid-reused', 'restarted']);
+      .toEqual(['dead', 'pid-reused', 'restarted', 'restarted']);
   }, 120_000);
+
+  it('the Linux start ticks are read past a process name holding spaces and parentheses', () => {
+    const fields = (ticks: string) => `S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 ${ticks} 20 21`;
+    expect(linuxStartTicks(`4242 (node) ${fields('987654')}`)).toBe('987654');
+    expect(linuxStartTicks(`4242 (tmux: server) ) x) ${fields('31337')}`)).toBe('31337');
+    expect(linuxStartTicks(`4242 (node) ${fields('not-a-number')}`)).toBeNull();
+    expect(linuxStartTicks('garbage with no name')).toBeNull();
+  });
 
   it('a process start identity is clock-free, per process, and absent for a dead pid', async () => {
     const own = thisProcessIdentity();
     expect(own).not.toBeNull();
     expect(await processIdentity(process.pid)).toBe(own);
+    // macOS start times are whole seconds: start the child in a later one.
+    const wait = 1_100 - process.uptime() * 1000;
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
     const child = liveProcess([], temp('owner-cessation-identity-'));
     const childIdentity = await processIdentity(child.pid!);
     expect(childIdentity).not.toBeNull();
@@ -552,8 +576,15 @@ describe('review-owner cessation survives a restart (#464)', () => {
     const rooted = [expect.objectContaining({ pid: child.pid, evidence: 'cwd' })];
     expect((await table(`${tree} (deleted)`)).rootedIn(tree)).toEqual(rooted);
     expect((await table(`${tree}/src (deleted)`)).rootedIn(tree)).toEqual(rooted);
-    // The OS reports the resolved path (macOS: /var → /private/var).
-    expect((await table(`${join(realpathSync(parent), 'review-round-1')} (deleted)`)).rootedIn(tree)).toEqual(rooted);
+    // The OS reports the resolved path: a tree registered through a symlink
+    // (macOS: /var → /private/var) is still matched once swept, through its
+    // nearest surviving ancestor.
+    const linked = join(temp('owner-cessation-link-'), 'data');
+    symlinkSync(parent, linked);
+    expect((await table(`${join(realpathSync(parent), 'review-round-1')} (deleted)`)).rootedIn(join(linked, 'review-round-1'))).toEqual(rooted);
+    // The tree's parent swept too: the next surviving ancestor resolves it.
+    expect((await table(`${join(realpathSync(parent), 'gone-parent', 'review-round-2')} (deleted)`))
+      .rootedIn(join(linked, 'gone-parent', 'review-round-2'))).toEqual(rooted);
     expect((await table(`${tree}-2 (deleted)`)).rootedIn(tree)).toEqual([]);
     const listed = await table(`${tree}-2`);
     expect(listed.naming('owner-cessation-token')).toEqual([expect.objectContaining({ pid: child.pid, evidence: 'argv' })]);
@@ -611,8 +642,12 @@ describe('a graceful shutdown\'s cut is the restart\'s clean abort at every stag
     const shutdown = runner.shutdown();
     release();
     await shutdown;
-    expect(await beginning).toBeInstanceOf(Error);
-    await expectCleanAbortRearm(f, f.ledger.listRounds(f.jobId)[0]!.id);
+    expect(await beginning).toMatchObject({ message: expect.stringMatching(/shut/u) });
+    const roundId = f.ledger.listRounds(f.jobId)[0]!.id;
+    const recorded = f.ledger.latestRoundEvent(roundId, 'round.perkins-incomplete')?.payload as { reportFile: string; artifactDirectory: string };
+    expect(JSON.parse(readFileSync(join(recorded.artifactDirectory, 'restart-recovery.json'), 'utf8'))).toMatchObject({ reason: 'service_restart' });
+    expect(readFileSync(recorded.reportFile, 'utf8')).toContain('review setup interrupted by service shutdown');
+    await expectCleanAbortRearm(f, roundId);
   }, 120_000);
 
   it('while waiting for resident slots', async () => {
@@ -631,19 +666,44 @@ describe('a graceful shutdown\'s cut is the restart\'s clean abort at every stag
     await runner.shutdown();
     await begun.run.catch(() => {});
     expect(f.ledger.latestRoundEvent(begun.round.id, 'round.residency-cancelled')).not.toBeNull();
+    const recorded = f.ledger.latestRoundEvent(begun.round.id, 'round.perkins-incomplete')?.payload as { reportFile: string; artifactDirectory: string };
+    expect(existsSync(join(recorded.artifactDirectory, 'restart-recovery.json'))).toBe(true);
+    expect(readFileSync(recorded.reportFile, 'utf8')).toContain('waiting for resident slots');
     await expectCleanAbortRearm(f, begun.round.id);
   }, 120_000);
 
-  it('mid-review', async () => {
+  it('mid-review, under a claude-code owner marker carrying this process\'s start identity', async () => {
     const f = await reviewJob('owner-cessation-cut-review');
+    let leadStarted!: () => void;
+    const started = new Promise<void>((resolve) => { leadStarted = resolve; });
+    const runner = wave(f, { spawner: hangingSpawner(() => leadStarted()),
+      reviewRuntimeIdentity: () => ({ id: 'claude-code', version: 'test-runtime' }) });
+    const running = runner.runRound({ jobId: f.jobId });
+    await started;
+    await runner.shutdown();
+    const outcome = await running as WaveOutcome;
+    expect(f.ledger.uniqueRoundReviewOwnerMarker(outcome.round.id)?.payload).toMatchObject({
+      runtimeId: 'claude-code', pid: process.pid, hostIdentity: thisProcessIdentity(),
+    });
+    await expectCleanAbortRearm(f, outcome.round.id);
+  }, 120_000);
+
+  it('a recorded supersession wins over the shutdown that cut the round: superseded, never re-armed', async () => {
+    const f = await reviewJob('owner-cessation-cut-superseded');
     let leadStarted!: () => void;
     const started = new Promise<void>((resolve) => { leadStarted = resolve; });
     const runner = wave(f, { spawner: hangingSpawner(() => leadStarted()) });
     const running = runner.runRound({ jobId: f.jobId });
     await started;
+    const roundId = f.ledger.listRounds(f.jobId)[0]!.id;
+    // A restart-interrupted supersession: recorded, its abort not yet sent.
+    f.ledger.appendCustomEvent({ kind: 'round.superseded', jobId: f.jobId, roundId,
+      payload: { reason: 'material amendment #1 accepted', by: 'gru', status: 'live', settled_specialists: [] } });
     await runner.shutdown();
-    const outcome = await running as WaveOutcome;
-    await expectCleanAbortRearm(f, outcome.round.id);
+    await running;
+    expect(f.ledger.latestRoundEvent(roundId, 'round.perkins-incomplete')?.payload).toMatchObject({ reason: 'superseded' });
+    f.ledger.setJobPr(f.jobId, 'https://git.example.invalid/acme/fixture/pull/464');
+    expect((await digestOf(f)).prWithoutReview.filter((row) => row.cleanAbort !== undefined)).toEqual([]);
   }, 120_000);
 
   it('after the workflow returned, before finalization', async () => {
@@ -673,7 +733,7 @@ describe('a graceful shutdown\'s cut is the restart\'s clean abort at every stag
     await expectCleanAbortRearm(f, outcome.round.id);
   }, 120_000);
 
-  it('during report delivery, held from re-arm while the in-flight post is unreconciled', async () => {
+  it('during report delivery: held from re-arm until the next start proves the in-flight post absent', async () => {
     const f = await reviewJob('owner-cessation-cut-delivery');
     const origin = join(temp('owner-cessation-origin-'), 'origin.git');
     execFileSync('git', ['init', '--bare', '--quiet', origin], { stdio: 'ignore' });
@@ -681,16 +741,36 @@ describe('a graceful shutdown\'s cut is the restart\'s clean abort at every stag
     f.repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/review']);
     f.ledger.setJobPr(f.jobId, 'https://git.example.invalid/acme/fixture/pull/464');
     const service: { wave?: WaveRunner; stopping?: Promise<void> } = {};
+    const artifacts = temp('owner-cessation-delivery-art-');
     service.wave = wave(f, {
+      reviewArtifactRoot: artifacts,
       spawner: fakeWholeSpawner(temp('owner-cessation-delivery-sessions-'), { childAnswer: () => '[]', specialists: [] }).spawner,
       prHeadProbe: async () => ({ headRefName: 'feature/review', headSha: f.target }),
       // The shutdown lands inside the provider write, which then fails.
-      poster: { post: async () => { service.stopping = service.wave?.shutdown(); throw new Error('connection reset by shutdown'); } },
+      poster: { post: async (call: { readonly onPreparedIdentity?: (actor: string) => void }) => {
+        call.onPreparedIdentity?.('gru-bot');
+        service.stopping = service.wave?.shutdown();
+        throw new Error('connection reset by shutdown');
+      } },
     });
     const outcome = await service.wave.runRound({ jobId: f.jobId }) as WaveOutcome;
     await service.stopping;
     expect(outcome.round.status).toBe('aborted');
-    expect(f.ledger.latestRoundEvent(outcome.round.id, 'round.perkins-incomplete')?.payload).toMatchObject({ reason: 'service_restart' });
+    expect(f.ledger.latestRoundEvent(outcome.round.id, 'round.perkins-incomplete')?.payload).toMatchObject({
+      reason: 'service_restart', deliveryFailure: 'report_not_posted',
+    });
+    // The post may have landed: no re-arm while it is unreconciled.
+    expect(pendingPublicationAttempt(f.ledger, outcome.round.id)).not.toBeNull();
     expect((await digestOf(f)).prWithoutReview).toEqual([]);
+    // The next start asks the provider (nothing POSTs); proven absent, the
+    // clean-abort re-arm opens.
+    const restarted = wave(f, { reviewArtifactRoot: artifacts,
+      poster: { post: async () => { throw new Error('a restart never posts'); },
+        reconcile: async (call: { readonly onLookupIdentity?: (actor: string) => void }) => { call.onLookupIdentity?.('gru-bot'); return null; } } });
+    await restarted.recoverInterruptedRounds();
+    expect(pendingPublicationAttempt(f.ledger, outcome.round.id)).toBeNull();
+    expect((await digestOf(f)).prWithoutReview).toMatchObject([
+      { jobId: f.jobId, cleanAbort: { roundId: outcome.round.id, ruleId: 'clean-abort-service-restart' } },
+    ]);
   }, 120_000);
 });

@@ -654,6 +654,17 @@ woken, `failed` the bounded-retry exhaustion that escalated. The board
 wakes tracker and the #214 yield report (wakes/day, avoided share) read
 this stream; nothing avoids a wake silently.
 
+### Lane process rows that exited on their own (#464)
+
+Migration 30 (`worktree-processes-exited`) rebuilds `worktree_processes`
+to allow a third state, `exited`, next to `live` and `killed`. A row
+moves there when a release's fresh enumeration no longer finds its
+process rooted in the tree, or when the tree is swept. The move is
+audited by a `worktree.processes-exited` event naming the pids and the
+reason, and nothing returns the row to `live`. The directive producer
+fence counts only `live` rows of lanes that are not swept. Rows a sweep
+left `live` before this migration therefore fence nothing either.
+
 ### Exact directive/rebrief restart progress
 
 Migration 28 (`directive-native-progress`) is additive/nullable. Historical

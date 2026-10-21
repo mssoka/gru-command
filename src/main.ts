@@ -7,6 +7,7 @@ import { loadOrCreateIdentity } from './identity.js';
 import { startServiceShutdown, type ServiceShutdownState } from './service-shutdown.js';
 import { Logger } from './logger.js';
 import { RuntimeRegistry, ledgerReviewOwnerCessation, serviceRegistryOptions } from './runtime/registry.js';
+import { thisProcessIdentity } from './runtime/review-host-exit.js';
 import { resolvePacingPolicy } from './runtime/pacing.js';
 import { SessionStore } from './sessions/store.js';
 import { LedgerDb } from './ledger/db.js';
@@ -410,6 +411,13 @@ async function main(): Promise<number> {
     reviewOwnerCessation: ledgerReviewOwnerCessation(() => ledger),
   }));
   const growth = registry.boot();
+  // #464: review-owner markers carry this process's start identity. Read it
+  // now, so a failure is loud at boot, not inside a review setup.
+  if (thisProcessIdentity() === null) {
+    logger.log('warn', 'process start identity cannot be read; review-owner markers carry none, so a restart under the same pid cannot prove their host gone', {
+      pid: process.pid, platform: process.platform,
+    });
+  }
   state.store = store;
   state.registry = registry;
   logger.info('session store ready', {

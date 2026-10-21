@@ -81,6 +81,20 @@ paths ONLY — never id-proximity, never labels. Every pid a pause or a
 confirmed kill is grounded on lands in the registry, so the ask always
 names exactly what was live.
 
+A recorded process row leaves `live` in one of three ways (#464):
+- **`killed`**: a confirmed kill, or the verification scheduler's
+  reconcile of its own `registry` rows;
+- **`exited`, `not-enumerated`**: a release's fresh enumeration no longer
+  finds the process rooted in the tree. This is the enumeration the sweep
+  itself trusts. The reaper keeps `registry` rows;
+- **`exited`, `worktree-swept`**: the tree reached `swept`, in the same
+  transaction.
+
+Each transition is audited as a `worktree.processes-exited` event naming
+the pids and the reason. `exited` is final. A later process that happens
+to reuse the pid never revives the row; a fresh enumeration still pauses
+the sweep on it, by its own evidence.
+
 The orchestrator's OWN spawned services land there too: the verification
 scheduler records every run it spawns for a lane (pid + argv, evidence
 `registry`) and reconciles it on exit. A service the orchestrator started

@@ -48,6 +48,29 @@ describe('ledger db + migration runner', () => {
     upgraded.close();
   });
 
+  it('upgrades a v29 ledger keeping every lane process row, and admits the exited state (#464)', () => {
+    const dir = tmpDir();
+    const old = new LedgerDb(dir, { migrations: MIGRATIONS.slice(0, 29) });
+    old.handle.prepare(`INSERT INTO worktrees (id, kind, repo_path, repo_name, path, branch, sha, status, created_at, updated_at)
+      VALUES ('wt', 'review', '/r', 'r', '/r/wt', NULL, 'abc', 'swept', 't', 't')`).run();
+    const row = old.handle.prepare(`INSERT INTO worktree_processes (worktree_id, pid, command, evidence, state, first_seen, last_seen)
+      VALUES ('wt', ?, ?, ?, ?, 't1', 't2')`);
+    row.run(9619, 'node -e probe', 'argv', 'live');
+    row.run(9645, 'ssh git@host', 'cwd', 'killed');
+    expect(() => row.run(1, 'x', 'argv', 'exited')).toThrow(/CHECK constraint/u);
+    old.close();
+    const upgraded = new LedgerDb(dir);
+    expect(upgraded.handle.prepare('SELECT pid, command, evidence, state, first_seen, last_seen FROM worktree_processes ORDER BY pid').all()).toEqual([
+      { pid: 9619, command: 'node -e probe', evidence: 'argv', state: 'live', first_seen: 't1', last_seen: 't2' },
+      { pid: 9645, command: 'ssh git@host', evidence: 'cwd', state: 'killed', first_seen: 't1', last_seen: 't2' },
+    ]);
+    upgraded.handle.prepare("UPDATE worktree_processes SET state = 'exited' WHERE pid = 9619").run();
+    expect(() => upgraded.handle.prepare("UPDATE worktree_processes SET state = 'gone' WHERE pid = 9619").run()).toThrow(/CHECK constraint/u);
+    expect(upgraded.handle.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_worktree_processes_wt'").get()).toBeDefined();
+    expect(upgraded.handle.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+    upgraded.close();
+  });
+
   it('upgrades a pre-retirement ledger keeping existing directive rows live and readable', () => {
     const dir = tmpDir();
     const old = new LedgerDb(dir, { migrations: MIGRATIONS.slice(0, 22) });

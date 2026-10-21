@@ -1888,3 +1888,46 @@ describe('review round 7 — latest evidence and quiet withdrawal', () => {
     expect(escalations).toEqual([]);
   });
 });
+
+describe('#464 — a review lane swept over processes that exited never fences the next directive', () => {
+  const TRANSIENT = (lanePath: string) => [
+    { pid: 9619, command: `node -e probe ${lanePath}`, evidence: 'argv' },
+    { pid: 9644, command: `git -C ${lanePath} ls-remote --exit-code origin`, evidence: 'argv' },
+    { pid: 9645, command: 'ssh git@github.com git-upload-pack', evidence: 'cwd' },
+  ];
+
+  async function interruptedReviewLane(jobId: string) {
+    const h = await plainLane(jobId);
+    deliver(h.ledger, h.jobId);
+    const round = h.ledger.addRound({ jobId: h.jobId, targetRef: h.repo.head(), lenses: ['blind'] });
+    const lane = await h.port.createReviewWorktree({ repoPath: h.repo.path, roundId: round.id, ref: h.repo.head(), jobId: h.jobId });
+    h.ledger.setRoundStatus(round.id, 'aborted');
+    return { h, lane };
+  }
+
+  it('a paused sweep over transient processes, a plain release, then a directive is admitted and settles', async () => {
+    const { h, lane } = await interruptedReviewLane('job-transient-sweep');
+    // The sweep paused on three processes rooted in the review lane.
+    h.ledger.recordWorktreeProcesses({ worktreeId: lane.id, processes: TRANSIENT(lane.path), state: 'live' });
+    h.ledger.setWorktreeStatus(lane.id, 'paused', 'sweep paused: 3 live process(es) — acknowledge to proceed');
+    // They exited on their own; a plain release sweeps the lane.
+    await h.port.release({ worktreeId: lane.id });
+    expect(h.ledger.listWorktreeProcesses(lane.id).map((proc) => proc.state)).toEqual(['exited', 'exited', 'exited']);
+    const { port } = await serve(h);
+    const res = await post(port, '/api/silas/directive', { job_id: h.jobId, directive: 'Rebuild after the amendment.', request_id: 'rebuild-464' });
+    expect(res.status).toBe(202);
+    expect(await settledDirective(h.ledger, 'rebuild-464')).toBe('settled');
+  });
+
+  it('rows a sweep left live before the fix never fence a directive either', async () => {
+    const { h, lane } = await interruptedReviewLane('job-stale-rows');
+    await h.port.release({ worktreeId: lane.id });
+    // The live case's ledger: the lane is swept, its three rows still live.
+    h.ledger.recordWorktreeProcesses({ worktreeId: lane.id, processes: TRANSIENT(lane.path), state: 'live' });
+    expect(h.ledger.listWorktreeProcesses(lane.id).map((proc) => proc.state)).toEqual(['live', 'live', 'live']);
+    const { port } = await serve(h);
+    const res = await post(port, '/api/silas/directive', { job_id: h.jobId, directive: 'Rebuild after the amendment.', request_id: 'rebuild-stale-464' });
+    expect(res.status).toBe(202);
+    expect(await settledDirective(h.ledger, 'rebuild-stale-464')).toBe('settled');
+  });
+});

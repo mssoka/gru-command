@@ -21,7 +21,7 @@ import { publishSpawnRegistration } from './spawn-registration.js';
 import { notifyDisposalSettlement } from './disposal-observation.js';
 import { processTableAsync, type ProcessTable } from '../worktrees/manager.js';
 import {
-  hostedByThisProcess, pidState, processIdentity, proveReviewHostExit,
+  pidState, processIdentity, proveReviewHostExit,
   type ReviewHostExitEvidence, type ReviewHostExitInput, type ReviewHostExitResult,
 } from './review-host-exit.js';
 
@@ -288,9 +288,6 @@ export class RuntimeRegistry {
   async proveReviewHostExit(input: ReviewHostExitInput): Promise<ReviewHostExitResult> {
     const { marker } = input;
     if (!validReviewOwnerMarker(marker)) return { ok: false, problem: 'its owner marker is malformed' };
-    if (hostedByThisProcess(marker)) {
-      return { ok: false, problem: 'its host is this process, so only its own adapter evidence proves cessation' };
-    }
     const ledger = this.opts.reviewOwnerCessation;
     if (ledger === undefined) return { ok: false, problem: 'no durable cessation record is wired to keep a dead-host proof' };
     const result = await proveReviewHostExit(input, {
