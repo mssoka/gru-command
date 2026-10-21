@@ -40,11 +40,37 @@ The OS service manager is the SERVICE's out-of-band watcher (SPEC ruling
 ./install.sh              # full setup (deps + build → wizard)
 ./install.sh --service    # register + start the service (launchd/systemd)
 ./install.sh --print      # render the platform unit; change nothing
-./install.sh --uninstall  # stop the service and remove the unit
-gru-service roll          # self-roll: pull + rebuild + relaunch + verify
-gru-service version       # installed version + build SHA (offline; --json)
-gru-service reset         # service stopped: remove GC lanes, empty the data dir, keep config.toml
+./install.sh --uninstall  # stop the service and remove the unit (and the gru launcher)
+./install.sh --stop       # stop the owned service (down until --start or next login)
+./install.sh --start      # start it
+./install.sh --restart    # restart it now (turns in flight resume through boot recovery)
 ```
+
+Install and update also write the `gru` launcher to `~/.local/bin` (or
+`GRU_COMMAND_BIN_DIR`). It runs the deploy clone's CLI with the same pinned
+Node as the unit, from any directory, and the installer never replaces a
+`gru` there that it did not write:
+
+```bash
+gru update                # install.sh --update from anywhere
+gru restart [--now]       # graceful by default: drain, relaunch the same build, verify
+gru stop | gru start      # install.sh --stop / --start
+gru status [--json]       # running vs installed build, drift from main; exit 1 when down
+gru logs [-f] [-n N]      # the service log
+gru roll                  # self-roll: pull + rebuild + relaunch + verify
+gru version               # installed version + build SHA (offline; --json)
+gru reset                 # service stopped: remove GC lanes, empty the data dir, keep config.toml
+```
+
+`gru restart` is the self-roll in restart mode: no pull and no build, the
+same bounded drain (`[roll] drain_timeout_ms`, default 15 minutes; new
+turns are not held back, so a busy fleet may wait the whole bound), then
+the relaunch and the `/health` check. Use it to apply `config.toml` edits.
+`gru restart --now` restarts through the service manager at once; boot
+recovery resumes the turns it cut. From inside the service (an agent's
+shell), `gru stop` and `gru restart --now` refuse, because the service
+manager would end them with the service; `gru restart` and `gru update`
+work there.
 
 **Noticing a release.** The board's `deploy` check is the operator-facing
 update signal. Every 5 minutes the service reads `origin/main` and the
@@ -57,10 +83,10 @@ The check starts from the revision stamped into `dist/build-rev.json` at
 build time (never the live `git HEAD`), falls back to the last fetched
 refs when origin is unreachable (the fallback is named once; a count that
 could not be proven shows the full error), and reports `unknown` rather
-than guessing. `gru-service version` prints the version stamped at build
+than guessing. `gru version` prints the version stamped at build
 time plus the build SHA, with no config read and no network.
 
-The service can also roll **itself** — `gru-service roll` (CLI) or
+The service can also roll **itself** — `gru roll` (CLI) or
 `POST /api/roll` (pairing-token guarded) pulls and rebuilds the deploy
 clone while the old process keeps serving, drains in-flight review
 rounds and agent turns (bounded), writes the swap marker, exits 75 so
@@ -74,9 +100,9 @@ and rollback safety: [FLOW.md](./FLOW.md#self-roll-the-service-deploys-itself).
 macOS (launchd):
 
 ```bash
-launchctl list | grep gru-command          # status
-launchctl kickstart -k gui/$(id -u)/com.gru-command.service   # restart
-tail -f ~/.gru-command/logs/service.log    # the structured stream
+launchctl list | grep gru-command          # status (or: gru status)
+launchctl kickstart -k gui/$(id -u)/com.gru-command.service   # restart now (or: gru restart --now)
+tail -f ~/.gru-command/logs/service.log    # the structured stream (or: gru logs -f)
 ```
 
 Linux (systemd user unit):
@@ -106,9 +132,9 @@ defenses, each with its own loud failure:
   anything else refuses at boot, named. The test/e2e harness does exactly
   this for every service it spawns.
 - **The roll preflight checks listener ownership.** If any pid other than
-  the service itself listens on the instance port, `gru-service roll`
-  (and `POST /api/roll`) fails in preflight with an action-required
-  notification; the old service keeps serving. The `gru-service` follow-up
+  the service itself listens on the instance port, `gru roll` and
+  `gru restart` (and `POST /api/roll`) fail in preflight with an
+  action-required notification; the old service keeps serving. The `gru` follow-up
   trusts `/health` only when the listener pid is the process that adopted
   the roll — a squatter answering 200 is never read as success.
 - **Boot checks the listener pid.** A service that binds but finds a

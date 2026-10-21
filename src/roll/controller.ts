@@ -11,6 +11,7 @@ import {
   type RollMarker,
   type RollPhase,
   type RollState,
+  type RollMode,
   type RollWorkItem,
   updateRollState,
   writeRollMarker,
@@ -152,7 +153,7 @@ export class RollController {
    * with the old service still serving. Throws RollBusyError when a roll
    * is already in progress in this process.
    */
-  async roll(input: { reason?: string; requestedBy?: string; forceBuild?: boolean } = {}): Promise<RollState> {
+  async roll(input: { reason?: string; requestedBy?: string; forceBuild?: boolean; mode?: RollMode } = {}): Promise<RollState> {
     if (this.busy) throw new RollBusyError();
     this.busy = true;
     try {
@@ -162,13 +163,14 @@ export class RollController {
     }
   }
 
-  private async runRoll(input: { reason?: string; requestedBy?: string; forceBuild?: boolean }): Promise<RollState> {
+  private async runRoll(input: { reason?: string; requestedBy?: string; forceBuild?: boolean; mode?: RollMode }): Promise<RollState> {
     const startedMs = this.now();
     const rollId = (this.opts.newId ?? randomUUID)();
     let state: RollState = {
       schemaVersion: ROLL_RECORD_SCHEMA_VERSION,
       rollId,
       phase: 'preflight',
+      mode: input.mode ?? 'update',
       reason: input.reason ?? null,
       requestedBy: input.requestedBy ?? 'operator',
       repoRoot: this.opts.repoRoot,
@@ -185,6 +187,7 @@ export class RollController {
     this.current = state;
     this.log('info', 'roll begin', {
       roll_id: rollId,
+      mode: state.mode,
       repo_root: this.opts.repoRoot,
       reason: state.reason,
       requested_by: state.requestedBy,
@@ -192,7 +195,9 @@ export class RollController {
     });
 
     try {
-      state = await this.preflight(state, input.forceBuild === true);
+      state = state.mode === 'restart'
+        ? await this.restartPreflight(state)
+        : await this.preflight(state, input.forceBuild === true);
     } catch (error) {
       return this.fail(state, 'preflight', error);
     }
@@ -217,25 +222,7 @@ export class RollController {
     const started = this.now();
     const cwd = this.opts.repoRoot;
 
-    // (0) Port ownership FIRST (owner incident 2026-09-23): a foreign
-    // listener on the instance port makes the post-swap /health
-    // verification meaningless (the squatter answers). Refuse before any
-    // pull/build — the old service keeps serving.
-    const foreign = await this.opts.probeForeignListener?.();
-    if (foreign !== undefined && foreign !== null) {
-      try {
-        this.opts.onForeignListener?.(foreign);
-      } catch (error) {
-        this.log('error', 'foreign-listener escalation failed', {
-          roll_id: state.rollId,
-          error: detailOf(error),
-        });
-      }
-      throw new Error(
-        `the instance port is held by a foreign process (pid ${foreign.pid}` +
-          `${foreign.command === '' ? '' : `, ${foreign.command}`}) — refusing to roll; stop the squatter first (action required)`,
-      );
-    }
+    await this.refuseForeignListener(state);
 
     const fromSha = await this.git(cwd, ['rev-parse', 'HEAD'], 'preflight');
     const dirty = await this.run('git', ['status', '--porcelain', '--untracked-files=normal'], {
@@ -388,6 +375,56 @@ export class RollController {
     return next;
   }
 
+  /** A restart (#463) relaunches the build already on disk: no dirty-tree
+   * check, no pull, no build. Its target is that build's own stamp, which
+   * the relaunched service must report on /health. */
+  private async restartPreflight(state: RollState): Promise<RollState> {
+    const started = this.now();
+    await this.refuseForeignListener(state);
+    const built = this.opts.readBuiltSha();
+    if (built === null) {
+      throw new Error('the deploy clone has no build stamp (dist/build-rev.json) — run `gru update` to build it, then restart');
+    }
+    for (const artifact of REQUIRED_ARTIFACTS) {
+      if (!existsSync(join(this.opts.repoRoot, artifact))) {
+        throw new Error(`a restart needs a complete build, but ${artifact} is missing — run \`gru update\``);
+      }
+    }
+    const preflight = {
+      fromSha: built,
+      toSha: built,
+      pulled: false,
+      rebuilt: false,
+      skippedBuildReason: `restart: relaunching the build at ${built}`,
+      durationMs: this.now() - started,
+    };
+    this.log('info', 'roll preflight complete (restart: no pull, no build)', { roll_id: state.rollId, sha: built });
+    const next = updateRollState(this.opts.dataDir, state, { phase: 'drain', fromSha: built, toSha: built, preflight }, this.now);
+    this.current = next;
+    return next;
+  }
+
+  /** Port ownership FIRST (owner incident 2026-09-23): a foreign listener
+   * on the instance port makes the post-swap /health verification
+   * meaningless (the squatter answers). Refuse before any pull/build — the
+   * old service keeps serving. */
+  private async refuseForeignListener(state: RollState): Promise<void> {
+    const foreign = await this.opts.probeForeignListener?.();
+    if (foreign === undefined || foreign === null) return;
+    try {
+      this.opts.onForeignListener?.(foreign);
+    } catch (error) {
+      this.log('error', 'foreign-listener escalation failed', {
+        roll_id: state.rollId,
+        error: detailOf(error),
+      });
+    }
+    throw new Error(
+      `the instance port is held by a foreign process (pid ${foreign.pid}` +
+        `${foreign.command === '' ? '' : `, ${foreign.command}`}) — refusing to roll; stop the squatter first (action required)`,
+    );
+  }
+
   // ------------------------------------------------------------------
   // c. swap — marker on disk, then hand control to the relaunch path
   // ------------------------------------------------------------------
@@ -395,9 +432,17 @@ export class RollController {
   private async swap(state: RollState): Promise<RollState> {
     const toSha = state.toSha;
     if (toSha === null) throw new Error('swap without a preflight target sha');
-    const head = await this.git(this.opts.repoRoot, ['rev-parse', 'HEAD'], 'swap');
-    if (head !== toSha) {
-      throw new Error(`checkout moved after preflight: expected ${toSha}, found ${head}`);
+    if (state.mode === 'restart') {
+      // A restart never reads git: the relaunch runs whatever dist holds.
+      const built = this.opts.readBuiltSha();
+      if (built !== toSha) {
+        throw new Error(`the build changed during the restart drain: expected ${toSha}, found ${built ?? 'no build stamp'}`);
+      }
+    } else {
+      const head = await this.git(this.opts.repoRoot, ['rev-parse', 'HEAD'], 'swap');
+      if (head !== toSha) {
+        throw new Error(`checkout moved after preflight: expected ${toSha}, found ${head}`);
+      }
     }
     const marker: RollMarker = {
       schemaVersion: ROLL_RECORD_SCHEMA_VERSION,

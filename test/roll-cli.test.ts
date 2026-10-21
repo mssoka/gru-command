@@ -17,7 +17,7 @@ import type { RollState } from '../src/roll/state.js';
 import { VERSION } from '../src/version.js';
 
 /**
- * `gru-service roll`: argument contract, service URL resolution, and the
+ * `gru roll` / `gru restart`: argument contract, service URL resolution, and the
  * follow loop — accepted → phase transitions → done → /health build-sha
  * verification. Exit 0 means the relaunched service really reports the
  * target build; every ambiguity (refused, failed, unreachable, unverified
@@ -74,10 +74,12 @@ function jsonResponse(status: number, body: unknown): Response {
 }
 
 interface CliHarness {
-  readonly deps: ServiceCliDeps;
+  readonly deps: Partial<ServiceCliDeps>;
   readonly stdout: string[];
   readonly stderr: string[];
   readonly requests: string[];
+  /** POST bodies, in order. */
+  readonly bodies: unknown[];
   readonly clock: { now: number };
 }
 
@@ -91,11 +93,13 @@ async function harness(script: {
   const stdout: string[] = [];
   const stderr: string[] = [];
   const requests: string[] = [];
+  const bodies: unknown[] = [];
   const clock = { now: 1_000_000 };
   let pollIndex = 0;
-  const fetchFn: typeof fetch = async (input) => {
+  const fetchFn: typeof fetch = async (input, init) => {
     const url = String(input);
     requests.push(url);
+    if (typeof init?.body === 'string') bodies.push(JSON.parse(init.body));
     if (url.endsWith('/api/roll') && requests.filter((r) => r.endsWith('/api/roll')).length === 1) {
       if (script.post === 'unreachable') throw new Error('connect ECONNREFUSED');
       return script.post.clone();
@@ -122,15 +126,16 @@ async function harness(script: {
     stdout,
     stderr,
     requests,
+    bodies,
     clock,
   };
 }
 
-describe('gru-service roll argument contract', () => {
+describe('gru roll argument contract', () => {
   it('rejects a missing command and unknown commands with usage', () => {
     const missing = parseServiceArgs([]);
     expect(missing.ok).toBe(false);
-    const unknown = parseServiceArgs(['restart']);
+    const unknown = parseServiceArgs(['reload']);
     expect(unknown.ok).toBe(false);
     if (!unknown.ok) expect(unknown.error).toContain('unknown command');
   });
@@ -166,7 +171,7 @@ describe('gru-service roll argument contract', () => {
   });
 });
 
-describe('gru-service roll target resolution', () => {
+describe('gru roll target resolution', () => {
   it('dials loopback for wildcard binds and brackets IPv6 hosts', () => {
     expect(dialHost('0.0.0.0')).toBe('127.0.0.1');
     expect(dialHost('127.0.0.1')).toBe('127.0.0.1');
@@ -181,7 +186,22 @@ describe('gru-service roll target resolution', () => {
   });
 });
 
-describe('gru-service roll follow loop', () => {
+describe('gru roll follow loop', () => {
+  it('gru restart (#463) is the same follow in restart mode: the body asks for no pull or build', async () => {
+    const restartState = (phase: RollState['phase']): RollState => ({ ...rollState(phase), mode: 'restart', fromSha: 'b'.repeat(40) });
+    const h = await harness({
+      post: jsonResponse(202, { status: 'accepted', roll: restartState('preflight') }),
+      polls: [jsonResponse(200, { roll: restartState('drain') }), jsonResponse(200, { roll: restartState('done') })],
+      health: jsonResponse(200, { build: { rev: 'b'.repeat(40) } }),
+    });
+    const code = await runServiceCli(['restart', '--reason', 'config edit'], h.deps);
+    expect(code).toBe(0);
+    expect(h.bodies).toEqual([{ requested_by: 'gru-service-cli', reason: 'config edit', mode: 'restart' }]);
+    expect(h.stdout.join('\n')).toContain(`restarted on build ${'b'.repeat(40)} (verified on /health)`);
+    const parsed = parseServiceArgs(['restart', '--no-wait', '--json']);
+    expect(parsed.ok && parsed.options.action).toBe('restart');
+  });
+
   it('exits 0 only after /health reports the target build sha', async () => {
     const h = await harness({
       post: jsonResponse(202, { status: 'accepted', roll: rollState('preflight') }),
@@ -196,6 +216,8 @@ describe('gru-service roll follow loop', () => {
     expect(code).toBe(0);
     expect(h.stdout.join('\n')).toContain(`rolled ${'a'.repeat(40)} → ${'b'.repeat(40)} (verified on /health)`);
     expect(h.stderr).toEqual([]);
+    // An update roll's body is unchanged: no mode.
+    expect(h.bodies).toEqual([{ requested_by: 'gru-service-cli' }]);
   });
 
   it('--no-wait returns right after the 202 acceptance', async () => {
@@ -287,7 +309,7 @@ describe('gru-service roll follow loop', () => {
   });
 });
 
-describe('gru-service version — the installed build identity, offline', () => {
+describe('gru version — the installed build identity, offline', () => {
   const INFO: VersionInfo = {
     service: 'gru-command',
     version: '1.0.1',
@@ -341,7 +363,7 @@ describe('gru-service version — the installed build identity, offline', () => 
 
     stderr.length = 0;
     expect(runVersionCli(['--help'], deps)).toBe(0);
-    expect(stderr.join('\n')).toContain('gru-service version');
+    expect(stderr.join('\n')).toContain('usage: gru version');
   });
 
   it('reports the version stamped at build time, not a newer checkout package', async () => {

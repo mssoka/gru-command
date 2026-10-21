@@ -23,6 +23,10 @@ export const ROLL_RECORD_SCHEMA_VERSION = 1;
 
 export type RollPhase = 'preflight' | 'drain' | 'swap' | 'verify' | 'done' | 'failed';
 
+/** `update` pulls and rebuilds before the drain; `restart` (#463, `gru
+ * restart`) relaunches the build already on disk: no pull, no build. */
+export type RollMode = 'update' | 'restart';
+
 export interface RollPreflightRecord {
   readonly fromSha: string;
   readonly toSha: string;
@@ -66,6 +70,8 @@ export interface RollState {
   readonly schemaVersion: number;
   readonly rollId: string;
   readonly phase: RollPhase;
+  /** Absent on records written before #463, which were all updates. */
+  readonly mode?: RollMode;
   readonly reason: string | null;
   readonly requestedBy: string;
   readonly repoRoot: string;

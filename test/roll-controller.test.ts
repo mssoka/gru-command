@@ -284,6 +284,66 @@ describe('roll controller drain + swap', () => {
     expect(scripted.calls.some((call) => call.startsWith('npm '))).toBe(false);
   });
 
+  it('restart mode (#463) relaunches the installed build: no git status/pull, no npm, the stamp is the target', async () => {
+    const fix = fixture();
+    stampBuild(fix.repoRoot, SHA_C);
+    // HEAD has moved past the build: a restart must still target the build on disk.
+    const scripted = scriptedRunner({ heads: [SHA_A] });
+    const { controller, swaps } = makeController(fix, { runner: scripted.run, readBuiltSha: () => SHA_C });
+    const state = await controller.roll({ mode: 'restart', requestedBy: 'gru' });
+    expect(state.phase).toBe('swap');
+    expect(state.mode).toBe('restart');
+    expect(state.preflight).toMatchObject({ fromSha: SHA_C, toSha: SHA_C, pulled: false, rebuilt: false });
+    expect(scripted.calls).toEqual([]);
+    expect(readRollMarker(fix.dataDir)?.toSha).toBe(SHA_C);
+    expect(readRollState(fix.dataDir)?.mode).toBe('restart');
+    expect(swaps).toEqual(['swap']);
+  });
+
+  it('restart mode fails loud without a build stamp or with an incomplete build, and when the build changes mid-drain', async () => {
+    const unstamped = fixture();
+    const noStamp = makeController(unstamped, { runner: scriptedRunner({ heads: [SHA_A] }).run, readBuiltSha: () => null });
+    const failed = await noStamp.controller.roll({ mode: 'restart' });
+    expect(failed.phase).toBe('failed');
+    expect(failed.error?.detail).toContain('no build stamp');
+    expect(readRollMarker(unstamped.dataDir)).toBeNull();
+
+    const partial = fixture();
+    rmSync(join(partial.repoRoot, 'dist', 'main.js'));
+    const incomplete = makeController(partial, { runner: scriptedRunner({ heads: [SHA_A] }).run, readBuiltSha: () => SHA_C });
+    const missing = await incomplete.controller.roll({ mode: 'restart' });
+    expect(missing.phase).toBe('failed');
+    expect(missing.error?.detail).toContain('dist/main.js is missing');
+
+    const moving = fixture();
+    let built = SHA_C;
+    const rebuiltMidDrain = makeController(moving, {
+      runner: scriptedRunner({ heads: [SHA_A] }).run,
+      readBuiltSha: () => built,
+      probeInFlight: async () => { built = SHA_B; return []; },
+    });
+    const changed = await rebuiltMidDrain.controller.roll({ mode: 'restart' });
+    expect(changed.phase).toBe('failed');
+    expect(changed.error).toMatchObject({ phase: 'swap' });
+    expect(changed.error?.detail).toContain('the build changed during the restart drain');
+    expect(readRollMarker(moving.dataDir)).toBeNull();
+  });
+
+  it('restart mode still refuses a foreign listener on the instance port first', async () => {
+    const fix = fixture();
+    const escalated: number[] = [];
+    const { controller } = makeController(fix, {
+      runner: scriptedRunner({ heads: [SHA_A] }).run,
+      readBuiltSha: () => SHA_C,
+      probeForeignListener: async () => ({ pid: 4242, command: 'squatter' }),
+      onForeignListener: (owner) => { escalated.push(owner.pid); },
+    });
+    const state = await controller.roll({ mode: 'restart' });
+    expect(state.phase).toBe('failed');
+    expect(state.error?.detail).toContain('foreign process (pid 4242');
+    expect(escalated).toEqual([4242]);
+  });
+
   it('drain waits for in-flight work and proceeds as soon as it settles', async () => {
     const fix = fixture();
     const scripted = scriptedRunner({ heads: [SHA_A, SHA_B, SHA_B], onBuild: () => stampBuild(fix.repoRoot, SHA_B) });

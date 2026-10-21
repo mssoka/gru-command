@@ -8,40 +8,76 @@ import { SERVICE_NAME, VERSION } from '../version.js';
 import { defaultListenerProbe, type ListenerOwner, type ListenerProbe } from '../listener-probe.js';
 import type { RollState } from '../roll/state.js';
 import { runResetCli, type ResetCliDeps } from './reset.js';
+import { defaultPackageRoot } from '../build-info.js';
+import {
+  defaultTail,
+  installerRunnerFor,
+  isInstallerCommand,
+  runInstallerCli,
+  runLogsCli,
+  runRestartNowCli,
+  runStatusCli,
+  type InstallerRunner,
+} from './operator.js';
 
 /**
- * `gru-service` — the operator CLI for the service's own lifecycle.
+ * `gru` — the operator CLI for the service's own lifecycle (#463). The
+ * installer puts a `gru` launcher on PATH; `gru-service` is the same entry
+ * under its older name.
  *
- *   gru-service roll [--no-wait] [--json] [--reason <text>] [--timeout-ms <n>]
- *   gru-service version [--json]                 (offline: no service needed)
- *   gru-service --version                        (alias of version)
- *   gru-service reset [--yes] [--delete-branches] [--delete-refs]   (src/cli/reset.ts)
+ *   gru update [--no-interact]     the deploy clone's install.sh --update
+ *   gru restart [--now] [roll options]
+ *   gru stop | gru start           install.sh --stop / --start
+ *   gru status [--json]            running build, installed build, drift
+ *   gru logs [-f] [-n <lines>]     the service log
+ *   gru roll [--no-wait] [--json] [--reason <text>] [--timeout-ms <n>]
+ *   gru version [--json]           (offline: no service needed)
+ *   gru --version                  (alias of version)
+ *   gru reset [--yes] [--delete-branches] [--delete-refs]   (src/cli/reset.ts)
  *
  * The roll command asks the running service to roll itself (POST
  * /api/roll, operator-guarded with the pairing token) and — unless
  * --no-wait — follows the roll record until the relaunched service
  * reports the target build SHA on /health. An accepted roll always
  * completes the service-side handoff even if this CLI is interrupted:
- * exit 75 signals the OS service manager to relaunch the unit.
+ * exit 75 signals the OS service manager to relaunch the unit. `restart`
+ * is the same roll in restart mode: no pull and no build, so the service
+ * drains and relaunches its current build.
  */
 
 const DEFAULT_FOLLOW_TIMEOUT_MS = 30 * 60_000;
 const POLL_INTERVAL_MS = 2_000;
 const HEALTH_VERIFY_TIMEOUT_MS = 60_000;
 
-const USAGE = `usage: gru-service roll [--no-wait] [--json] [--reason <text>] [--timeout-ms <n>]
-       gru-service version [--json]   (or --version / -v)
-       gru-service reset [--yes] [--delete-branches] [--delete-refs]
+const USAGE = `usage: gru <command> [options]
 
-  roll   pull + rebuild the deploy clone on the running service, drain
-         in-flight work, then let the OS service manager relaunch it into
-         the new build. Exit 0 only after /health reports the target SHA.
-  reset  with the service stopped: remove every GC lane from the managed
-         repositories and empty the data directory, keeping config.toml
-         (gru-service reset --help).
+  update [--no-interact]   pull main, rebuild, and restart the service
+                           (the deploy clone's install.sh --update)
+  restart [--now]          relaunch the service on the build it already has,
+                           e.g. after editing config.toml. It first waits for
+                           in-flight turns to settle (up to [roll]
+                           drain_timeout_ms); --now restarts at once and boot
+                           recovery resumes the turns it cut. Also takes
+                           --no-wait, --json, --reason and --timeout-ms.
+  stop                     stop the service; it stays down until gru start or
+                           your next login
+  start                    start the service
+  status [--json]          running build, installed build, and how far behind
+                           main; exits 1 when the service is not running
+  logs [-f] [-n <lines>]   show the service log (-f follows it)
+  version [--json]         the installed version and build SHA (offline)
+  reset [--yes] [--delete-branches] [--delete-refs]
+                           with the service stopped: remove every GC lane from
+                           the managed repositories and empty the data
+                           directory, keeping config.toml (gru reset --help)
+  roll [--no-wait] [--json] [--reason <text>] [--timeout-ms <n>]
+                           update through the running service: pull and
+                           rebuild, drain, relaunch, and verify on /health
+
+  gru-service is the same command under its older name.
 `;
 
-const VERSION_USAGE = `usage: gru-service version [--json]
+const VERSION_USAGE = `usage: gru version [--json]
 
   version  print the installed GC version and the build stamp this
            installation was compiled from (no config, no network).
@@ -85,7 +121,7 @@ export interface VersionCliDeps {
   readonly build: () => BuildInfo;
 }
 
-/** `gru-service version [--json]`: offline, strict, no config read. */
+/** `gru version [--json]`: offline, strict, no config read. */
 export function runVersionCli(args: readonly string[], deps: VersionCliDeps): number {
   let json = false;
   for (const arg of args) {
@@ -94,7 +130,7 @@ export function runVersionCli(args: readonly string[], deps: VersionCliDeps): nu
       deps.stderr(VERSION_USAGE.trimEnd());
       return 0;
     } else {
-      deps.stderr(`gru-service: unknown argument: ${arg}`);
+      deps.stderr(`gru: unknown argument: ${arg}`);
       deps.stderr(VERSION_USAGE.trimEnd());
       return 2;
     }
@@ -104,7 +140,8 @@ export function runVersionCli(args: readonly string[], deps: VersionCliDeps): nu
 }
 
 export interface ServiceCliOptions {
-  readonly action: 'roll';
+  /** `restart` is a roll in restart mode: no pull, no build. */
+  readonly action: 'roll' | 'restart';
   readonly wait: boolean;
   readonly json: boolean;
   readonly reason: string | null;
@@ -123,8 +160,9 @@ export function parseServiceArgs(argv: readonly string[]): ServiceCliParse {
   if (args[0] === '-h' || args[0] === '--help') {
     return { ok: false, error: '', help: true };
   }
-  if (args[0] !== 'roll') {
-    return { ok: false, error: `unknown command: ${args[0]}`, help: true };
+  const action = args[0];
+  if (action !== 'roll' && action !== 'restart') {
+    return { ok: false, error: `unknown command: ${action}`, help: true };
   }
   args.shift();
   let wait = true;
@@ -153,7 +191,7 @@ export function parseServiceArgs(argv: readonly string[]): ServiceCliParse {
       return { ok: false, error: `unknown argument: ${arg}`, help: true };
     }
   }
-  return { ok: true, options: { action: 'roll', wait, json, reason, timeoutMs } };
+  return { ok: true, options: { action, wait, json, reason, timeoutMs } };
 }
 
 /** Host to DIAL (a wildcard bind is dialed on loopback). */
@@ -179,10 +217,19 @@ export interface ServiceCliDeps {
    * reports done, the /health answer is only trusted when the port's
    * listener is the adopted process (pid match), never a squatter. */
   readonly probeListeners: ListenerProbe;
+  /** The deploy clone's install.sh (update, stop, start, restart --now). */
+  readonly runInstaller: InstallerRunner;
+  /** `tail` for `gru logs`. */
+  readonly runTail: (args: readonly string[]) => number;
+  /** The installed (on-disk) build stamp, for `gru status`. */
+  readonly installedBuild: () => BuildInfo;
 }
 
 function defaultDeps(): ServiceCliDeps {
   return {
+    runInstaller: installerRunnerFor(defaultPackageRoot()),
+    runTail: defaultTail,
+    installedBuild: readBuildInfo,
     loadConfig: () => loadConfig(),
     fetchFn: (input, init) => fetch(input, init),
     stdout: (line) => process.stdout.write(`${line}\n`),
@@ -203,7 +250,9 @@ interface RollApiBody {
 function phaseLine(state: RollState): string {
   switch (state.phase) {
     case 'preflight':
-      return 'preflight: pulling and rebuilding the deploy clone (old build keeps serving)…';
+      return state.mode === 'restart'
+        ? 'preflight: checking the installed build (restart: no pull, no build)…'
+        : 'preflight: pulling and rebuilding the deploy clone (old build keeps serving)…';
     case 'drain': {
       const inFlight = state.drain?.inFlightAtStart.length ?? 0;
       return inFlight > 0
@@ -241,9 +290,14 @@ export async function runServiceCli(
     return runResetCli(argv.slice(1), { ...shared, ...reset });
   }
   const deps: ServiceCliDeps = { ...defaultDeps(), ...overrides };
+  const command = argv[0];
+  if (isInstallerCommand(command)) return runInstallerCli(command, argv.slice(1), deps);
+  if (command === 'restart' && argv.includes('--now')) return runRestartNowCli(argv.slice(1), deps);
+  if (command === 'status') return runStatusCli(argv.slice(1), { ...deps, baseUrl: serviceBaseUrl });
+  if (command === 'logs') return runLogsCli(argv.slice(1), deps);
   const parsed = parseServiceArgs(argv);
   if (!parsed.ok) {
-    if (parsed.error !== '') deps.stderr(`gru-service: ${parsed.error}`);
+    if (parsed.error !== '') deps.stderr(`gru: ${parsed.error}`);
     if (parsed.help) deps.stderr(USAGE.trimEnd());
     return parsed.help && parsed.error === '' ? 0 : 2;
   }
@@ -253,11 +307,11 @@ export async function runServiceCli(
   try {
     config = deps.loadConfig();
   } catch (error) {
-    deps.stderr(`gru-service: cannot load instance config: ${String((error as Error).message)}`);
+    deps.stderr(`gru: cannot load instance config: ${String((error as Error).message)}`);
     return 1;
   }
   if (config.server.port === 0) {
-    deps.stderr('gru-service: the instance binds an ephemeral port; run the roll from the service side (POST /api/roll)');
+    deps.stderr('gru: the instance binds an ephemeral port; run the roll from the service side (POST /api/roll)');
     return 1;
   }
   const base = serviceBaseUrl(config);
@@ -284,11 +338,12 @@ export async function runServiceCli(
       body: JSON.stringify({
         requested_by: 'gru-service-cli',
         ...(options.reason !== null ? { reason: options.reason } : {}),
+        ...(options.action === 'restart' ? { mode: 'restart' } : {}),
       }),
     });
   } catch (error) {
     deps.stderr(
-      `gru-service: service unreachable at ${base} (${String((error as Error).message)}) — ` +
+      `gru: service unreachable at ${base} (${String((error as Error).message)}) — ` +
         'the self-roll requires the running OS service',
     );
     return 1;
@@ -308,7 +363,7 @@ export async function runServiceCli(
     emit('attached', state);
   } else {
     deps.stderr(
-      `gru-service: roll refused (HTTP ${res.status}): ${body.detail ?? body.error ?? 'unknown error'}`,
+      `gru: roll refused (HTTP ${res.status}): ${body.detail ?? body.error ?? 'unknown error'}`,
     );
     return 1;
   }
@@ -321,7 +376,7 @@ export async function runServiceCli(
   for (;;) {
     if (deps.now() > deadline) {
       deps.stderr(
-        `gru-service: roll did not complete within ${options.timeoutMs} ms ` +
+        `gru: roll did not complete within ${options.timeoutMs} ms ` +
           `(last phase: ${state?.phase ?? 'unknown'}, last error: ${state?.error?.detail ?? 'none'})`,
       );
       bailHint(deps.stderr, state);
@@ -351,17 +406,19 @@ export async function runServiceCli(
         const foreign = await foreignHealthListener(deps, config, state);
         if (foreign !== null) {
           deps.stderr(
-            `gru-service: /health reports the target build but the listener on ` +
+            `gru: /health reports the target build but the listener on ` +
               `${dialHost(config.server.host)}:${config.server.port} is pid ${foreign.pid}` +
               `${foreign.command === '' ? '' : ` (${foreign.command})`}, not the relaunched service ` +
               `(pid ${state.verify?.pid ?? 'unknown'}) — a foreign listener answered. ` +
-              'Action required: stop the squatter process and re-run gru-service roll.',
+              `Action required: stop the squatter process and re-run gru ${options.action}.`,
           );
           bailHint(deps.stderr, state);
           return 1;
         }
         if (options.json) {
           deps.stdout(JSON.stringify({ event: 'verified', roll: state, build_sha: health }));
+        } else if (state.mode === 'restart') {
+          deps.stdout(`restarted on build ${state.toSha} (verified on /health)`);
         } else {
           deps.stdout(`rolled ${state.fromSha ?? 'unknown'} → ${state.toSha} (verified on /health)`);
         }
@@ -369,7 +426,7 @@ export async function runServiceCli(
       }
       if (deps.now() > healthDeadline) {
         deps.stderr(
-          `gru-service: roll record is done but /health does not report the target build ` +
+          `gru: roll record is done but /health does not report the target build ` +
             `(expected ${expectedSha ?? 'unknown'}, got ${health ?? 'unreachable'})`,
         );
         bailHint(deps.stderr, state);
@@ -433,7 +490,7 @@ function bailHint(stderr: (line: string) => void, state: RollState | null): void
   stderr(
     `bail: the swap marker is the only handoff state — to return the service, restore the ` +
       `checkout, rebuild (npm ci && npm run build && npm run build:web in ${root}), and ` +
-      'restart the unit (launchctl kickstart -k gui/$(id -u)/com.gru-command.service | systemctl --user restart gru-command)',
+      'restart the unit (gru restart --now)',
   );
 }
 
@@ -453,7 +510,7 @@ if (invokedAsCli) {
   runServiceCli(process.argv.slice(2))
     .then((code) => process.exit(code))
     .catch((error: unknown) => {
-      process.stderr.write(`gru-service: ${String((error as Error).message)}\n`);
+      process.stderr.write(`gru: ${String((error as Error).message)}\n`);
       process.exit(1);
     });
 }

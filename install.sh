@@ -31,6 +31,19 @@
 #                                    registers the service — one mechanism)
 #   ./install.sh --print             render the unit to stdout; change nothing
 #   ./install.sh --uninstall         stop the service and remove the unit
+#                                    (and the `gru` command it installed)
+#   ./install.sh --stop              stop the owned service; it stays down
+#                                    until --start or the next login
+#   ./install.sh --start             start the owned service (no-op when
+#                                    it already runs)
+#   ./install.sh --restart           restart the owned service NOW; turns
+#                                    in flight are cut and resumed by boot
+#                                    recovery (`gru restart` drains first)
+#
+# Setup and update also install the `gru` command: a small launcher in
+# ~/.local/bin that runs this checkout's CLI from any directory (`gru
+# update`, `gru restart`, `gru status`, ...). A `gru` there that this
+# installer did not write is never replaced.
 #
 # Everything is resolved ABSOLUTELY at install time (repo root, node
 # binary, instance dir) — service managers do not inherit your shell
@@ -39,6 +52,7 @@
 # Test/install seams (also handy for real users):
 #   GRU_COMMAND_ORIGIN   clone URL when piped (default: the GitHub repo)
 #   GRU_COMMAND_TARGET   clone destination    (default: ~/gru-command)
+#   GRU_COMMAND_BIN_DIR  where the `gru` launcher goes (default: ~/.local/bin)
 #   GRU_COMMAND_REVIEW_PYTHON  macOS: pinned absolute Python 3 path used by
 #                                    the launchd service for review identity.
 #                                    Setup/update/service require a working
@@ -53,6 +67,8 @@ REPO_ROOT="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
 INSTANCE_DIR="${GRU_COMMAND_HOME:-$HOME/.gru-command}"
 CLONE_ORIGIN="${GRU_COMMAND_ORIGIN:-https://github.com/mssoka/gru-command.git}"
 CLONE_TARGET="${GRU_COMMAND_TARGET:-$HOME/gru-command}"
+BIN_DIR="${GRU_COMMAND_BIN_DIR:-$HOME/.local/bin}"
+LAUNCHER_MARKER="# gru-command launcher (managed by install.sh)"
 MODE="setup"
 ANSWERS=""
 ANSWERS_SET=0
@@ -79,6 +95,9 @@ while [[ $# -gt 0 ]]; do
     --print) MODE="print" ; shift ;;
     --uninstall) MODE="uninstall" ; shift ;;
     --service) MODE="service" ; shift ;;
+    --start) MODE="start" ; shift ;;
+    --stop) MODE="stop" ; shift ;;
+    --restart) MODE="restart" ; shift ;;
     --update) UPDATE_REQUESTED=1; shift ;;
     --no-interact) NO_INTERACT=1; shift ;;
     --force) FORCE=1; shift ;;
@@ -88,7 +107,7 @@ while [[ $# -gt 0 ]]; do
     --answers=*)
       ANSWERS="${1#--answers=}"; ANSWERS_SET=1; NO_INTERACT=1; shift ;;
     -h|--help) usage; exit 0 ;;
-    *) err "unknown flag: $1 (valid: --update, --no-interact, --answers <json>, --force, --service, --print, --uninstall, -h|--help)"; exit 2 ;;
+    *) err "unknown flag: $1 (valid: --update, --no-interact, --answers <json>, --force, --service, --start, --stop, --restart, --print, --uninstall, -h|--help)"; exit 2 ;;
   esac
 done
 
@@ -464,6 +483,150 @@ uninstall_systemd() {
 }
 
 # ---------------------------------------------------------------------------
+# Service lifecycle for the `gru` command (#463): stop, start and an
+# immediate restart act on the OWNED unit only, never a foreign or absent one.
+# ---------------------------------------------------------------------------
+require_owned_unit() {
+  case "$(service_ownership)" in
+    owned) ;;
+    absent)
+      err "no Gru Command service is installed — register it with: $REPO_ROOT/install.sh --service"
+      exit 1
+      ;;
+    *)
+      err "refusing to touch unrelated service unit: $(service_target)"
+      exit 1
+      ;;
+  esac
+}
+
+# The service manager ends the whole service, this command included, so a
+# stop or immediate restart from an agent-owned shell would die half-way.
+refuse_inside_service() {
+  if inside_managed_service_pgroup; then
+    err "cannot $1 the service from inside it: the service manager would end this command with it"
+    err "use 'gru restart' instead: it drains in-flight work and the service relaunches itself"
+    exit 1
+  fi
+}
+
+running_service_pid() {
+  local pid
+  pid="$(managed_service_pid)"
+  [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 0 )) && printf '%s' "$pid"
+}
+
+launchd_job_loaded() {
+  "$LAUNCHCTL_BIN" list 2>/dev/null | awk -v label="$LABEL" '$3 == label { found = 1 } END { exit found ? 0 : 1 }'
+}
+
+stop_service() {
+  require_owned_unit
+  refuse_inside_service stop
+  case "$OS" in
+    darwin) "$LAUNCHCTL_BIN" unload "$(service_target)" ;;
+    linux) "$SYSTEMCTL_BIN" --user stop gru-command.service ;;
+  esac
+  echo "stopped the Gru Command service; it stays down until 'gru start' or your next login"
+}
+
+start_service() {
+  local pid
+  require_owned_unit
+  if pid="$(running_service_pid)"; then
+    echo "the Gru Command service is already running (pid $pid)"
+    return 0
+  fi
+  case "$OS" in
+    darwin)
+      if launchd_job_loaded; then
+        "$LAUNCHCTL_BIN" kickstart "gui/$(id -u)/$LABEL"
+      else
+        "$LAUNCHCTL_BIN" load "$(service_target)"
+      fi
+      ;;
+    linux) "$SYSTEMCTL_BIN" --user start gru-command.service ;;
+  esac
+  echo "started the Gru Command service"
+}
+
+restart_service_now() {
+  require_owned_unit
+  refuse_inside_service restart
+  case "$OS" in
+    darwin)
+      if launchd_job_loaded; then
+        "$LAUNCHCTL_BIN" kickstart -k "gui/$(id -u)/$LABEL"
+      else
+        "$LAUNCHCTL_BIN" load "$(service_target)"
+      fi
+      ;;
+    linux) "$SYSTEMCTL_BIN" --user restart gru-command.service ;;
+  esac
+  echo "restarted the Gru Command service; turns that were in flight resume through boot recovery"
+}
+
+# ---------------------------------------------------------------------------
+# The `gru` command (#463): a launcher, not a symlink — the compiled CLI is
+# not executable, and a terminal's `node` can differ from the service's, so
+# it pins this install's node exactly as the unit does. The marker line is
+# the ownership proof: a `gru` without it is someone else's and is left alone.
+# ---------------------------------------------------------------------------
+launcher_path() {
+  printf '%s/gru' "$BIN_DIR"
+}
+
+is_our_launcher() {
+  [[ -f "$1" && ! -L "$1" ]] && grep -qxF "$LAUNCHER_MARKER" "$1"
+}
+
+sh_single_quote() {
+  local quote="'"
+  printf "'%s'" "${1//$quote/$quote\\$quote$quote}"
+}
+
+link_cli() {
+  local launcher found
+  launcher="$(launcher_path)"
+  if [[ -e "$launcher" || -L "$launcher" ]] && ! is_our_launcher "$launcher"; then
+    err "not installing the 'gru' command: $launcher exists and was not written by this installer"
+    err "rename or remove it, then re-run install.sh to get 'gru'"
+    return 0
+  fi
+  mkdir -p "$BIN_DIR"
+  {
+    printf '#!/bin/sh\n%s\n' "$LAUNCHER_MARKER"
+    printf 'exec %s %s "$@"\n' "$(sh_single_quote "$NODE_BIN")" "$(sh_single_quote "$REPO_ROOT/dist/cli/service.js")"
+  } > "$launcher.tmp"
+  chmod 755 "$launcher.tmp"
+  mv -f "$launcher.tmp" "$launcher"
+  echo "installed the 'gru' command: $launcher"
+  case ":$PATH:" in
+    *":$BIN_DIR:"*)
+      found="$(command -v gru 2>/dev/null || true)"
+      if [[ -n "$found" && ! "$found" -ef "$launcher" ]]; then
+        err "another 'gru' comes first on your PATH: $found — run $launcher, or put $BIN_DIR earlier in PATH"
+      fi
+      ;;
+    *)
+      echo "note: $BIN_DIR is not on your PATH; add this line to your shell profile:"
+      echo "  export PATH=\"$BIN_DIR:\$PATH\""
+      ;;
+  esac
+}
+
+unlink_cli() {
+  local launcher
+  launcher="$(launcher_path)"
+  if is_our_launcher "$launcher"; then
+    rm -f "$launcher"
+    echo "removed the 'gru' command: $launcher"
+  elif [[ -e "$launcher" || -L "$launcher" ]]; then
+    echo "left $launcher in place: this installer did not write it"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Full setup (E9): the one-line-install pipeline. When this script runs
 # from a download/pipe (no checkout around it), clone first and re-exec
 # inside the clone; inside a checkout, deps+build if needed, then wizard.
@@ -629,7 +792,7 @@ restart_owned_service_in_service() {
     err "a successful build produces it; run this update from a terminal instead"
     exit 1
   fi
-  echo "update is running inside the managed service — delegating the restart to 'gru-service roll'…"
+  echo "update is running inside the managed service — delegating the restart to 'gru roll'…"
   "$NODE_BIN" "$cli" roll
 }
 
@@ -726,6 +889,7 @@ run_setup() {
   fi
 
   build_product
+  link_cli
 
   # A configured instance is an update, never a request to regenerate user
   # settings.
@@ -796,7 +960,11 @@ case "$MODE" in
       darwin) uninstall_launchd ;;
       *) uninstall_systemd ;;
     esac
+    unlink_cli
     ;;
+  start) start_service ;;
+  stop) stop_service ;;
+  restart) restart_service_now ;;
   service)
     if ! node_ok; then
       err "node >= 22.19 required, found $("$NODE_BIN" --version) — upgrade Node.js first"
