@@ -1,5 +1,5 @@
 import { StringDecoder } from 'node:string_decoder';
-import type { RuntimeEvent } from './types.js';
+import type { ContextUsage, RuntimeEvent } from './types.js';
 
 /**
  * stream-json (NDJSON) layer for the claude-code adapter (EPICS E3 story 1).
@@ -10,10 +10,10 @@ import type { RuntimeEvent } from './types.js';
  *
  * Frame shapes (verified against the CLI reference + headless docs):
  *   system/init      { type:'system', subtype:'init', session_id, cwd, tools, model, ... }
- *   assistant        { type:'assistant', message:{ content: Block[] }, session_id?, parent_tool_use_id? }
+ *   assistant        { type:'assistant', message:{ id, model, content: Block[], usage }, session_id?, parent_tool_use_id? }
  *   user             { type:'user', message:{ content: Block[] | string }, ... }  (tool_result blocks)
  *   stream_event     { type:'stream_event', event: <raw Anthropic SSE>, session_id }  (--include-partial-messages)
- *   result           { type:'result', subtype, is_error, result?, session_id?, ... }  (always last)
+ *   result           { type:'result', subtype, is_error, result?, session_id?, modelUsage?, ... }  (always last)
  *   rate_limit_event / tool_progress / hook events / api_retry — informational.
  */
 
@@ -124,6 +124,22 @@ function httpStatus(value: unknown): number | null {
   return typeof value === 'number' && Number.isInteger(value) && value >= 100 && value <= 599 ? value : null;
 }
 
+/** One API call's whole prompt as the provider reported it (#461): its three
+ * input fields, never output. Null when the model or any field is missing or
+ * malformed — a partial sum would understate the context. */
+function promptOccupancy(message: StreamFrame): { readonly tokens: number; readonly model: string } | null {
+  const usage = message['usage'];
+  const model = message['model'];
+  if (typeof usage !== 'object' || usage === null || typeof model !== 'string' || model === '') return null;
+  let tokens = 0;
+  for (const field of ['input_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens']) {
+    const value = (usage as StreamFrame)[field];
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) return null;
+    tokens += value;
+  }
+  return { tokens, model };
+}
+
 /** Machine-frame reader for native Claude controls such as `/compact`.
  * Unlike a turn translator it has no content event surface by design:
  * assistant text/tool frames are consumed as command output and can never
@@ -230,6 +246,10 @@ export class ClaudeTurnTranslator {
   private initInfo: InitInfo | null = null;
   private resultInfo: ResultInfo | null = null;
   private apiErrorInfo: ApiErrorInfo | null = null;
+  /** The latest main-thread API call's prompt size and model (#461). */
+  private occupancy: { readonly tokens: number; readonly model: string } | null = null;
+  /** The result frame's per-model usage, which carries each context window. */
+  private modelUsage: StreamFrame | null = null;
 
   /** The system/init frame's info, once seen. */
   get init(): InitInfo | null {
@@ -246,9 +266,33 @@ export class ClaudeTurnTranslator {
     return this.apiErrorInfo;
   }
 
+  /** Provider-reported context usage after this turn (#461): the latest
+   * main-thread call's whole prompt over the result's window for that call's
+   * model. Null until both halves are present and well formed — no window
+   * table, no estimate. Also null after a turn whose result is an error
+   * (owner ruling 2026-10-21: an errored turn leaves no measurement), and when the
+   * prompt exceeds the window: a call that succeeded fit its window, so the
+   * window cannot be that call's. */
+  get contextUsage(): ContextUsage | null {
+    if (this.occupancy === null || this.modelUsage === null || this.resultInfo?.isError !== false) return null;
+    const { tokens, model } = this.occupancy;
+    const entry = Object.hasOwn(this.modelUsage, model) ? this.modelUsage[model] : undefined;
+    const contextWindow = typeof entry === 'object' && entry !== null ? (entry as StreamFrame)['contextWindow'] : undefined;
+    if (typeof contextWindow !== 'number' || !Number.isSafeInteger(contextWindow) || contextWindow <= 0) return null;
+    if (tokens > contextWindow) return null;
+    return { tokens, contextWindow, percent: (tokens * 100) / contextWindow };
+  }
+
   /** Consume one parsed frame; returns the interface events it implies. */
   ingest(frame: StreamFrame): RuntimeEvent[] {
     const type = frame['type'];
+    // A native compaction of the main thread inside the turn (auto-compact)
+    // replaces the context the earlier calls measured: only a call after it
+    // measures again. A subagent's compaction is another context.
+    if (((type === 'system' && frame['subtype'] === 'compact_boundary') || type === 'compact_boundary') &&
+        (frame['parent_tool_use_id'] ?? null) === null) {
+      this.occupancy = null;
+    }
     switch (type) {
       case 'system':
         return this.ingestSystem(frame);
@@ -296,6 +340,11 @@ export class ClaudeTurnTranslator {
       text: typeof frame['result'] === 'string' ? frame['result'] : null,
       apiErrorStatus: httpStatus(frame['api_error_status']),
     };
+    // Its token counts are cumulative over the turn; only the windows are read.
+    const modelUsage = frame['modelUsage'];
+    this.modelUsage = typeof modelUsage === 'object' && modelUsage !== null && !Array.isArray(modelUsage)
+      ? modelUsage as StreamFrame
+      : null;
     return [];
   }
 
@@ -318,6 +367,15 @@ export class ClaudeTurnTranslator {
         status: httpStatus(frame['api_error_status']),
       };
       return [];
+    }
+    // Context occupancy (#461): each content block of one API message repeats
+    // that call's usage, so the latest main-thread frame replaces, never adds.
+    // Subagent frames (a parent tool call) measure another context, and a
+    // zero-token prompt is no API call: the CLI's own `<synthetic>` replies
+    // ("No response requested.") report all-zero usage.
+    if ((frame['parent_tool_use_id'] ?? null) === null) {
+      const call = promptOccupancy(message as StreamFrame);
+      if (call === null || call.tokens > 0) this.occupancy = call;
     }
     // Dedupe granularity: per message id when partials carry ids, else the
     // turn-global per-kind flags.

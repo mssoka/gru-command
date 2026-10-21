@@ -1283,7 +1283,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     }
   });
 
-  it('exposes native context usage and a failed native compact keeps the same session usable', async () => {
+  it('exposes native context usage and a failed native compact keeps the same session usable #contract:context-usage:pi', async () => {
     const fx = await fixture([{ deltas: ['one'] }, { deltas: ['two'] }]);
     const handle = await fx.runtime.spawn('gru');
     try {

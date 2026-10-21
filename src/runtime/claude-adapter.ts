@@ -53,6 +53,7 @@ import type {
   AgentHandle,
   AgentRuntime,
   AgentState,
+  ContextUsage,
   PendingTurn,
   PromptOptions,
   RuntimeEvent,
@@ -1045,6 +1046,9 @@ export class ClaudeCodeHandle implements AgentHandle {
   /** Long-tool heartbeats: an open tool call keeps the event surface alive. */
   private readonly toolHeartbeat: ToolHeartbeat;
   private compacting = false;
+  /** The latest turn's provider-reported context usage (#461). Null from the
+   * start of a turn or compaction until a turn ends with a measured result. */
+  private contextUsage: ContextUsage | null = null;
   private readonly listeners = new Set<RuntimeEventListener>();
   private disposed = false;
   /** Per-disposal-generation cessation evidence (identity: the ORIGINAL
@@ -1215,9 +1219,11 @@ export class ClaudeCodeHandle implements AgentHandle {
 
   isCompacting = (): boolean => this.compacting;
 
-  /** Claude's print transport exposes no trustworthy whole-context usage.
-   * Deliberately omit getContextUsage rather than deriving a percentage from
-   * per-turn token counts or transcript bytes. */
+  /** Measured live from the latest turn's stream-json (#461): the last
+   * main-thread API call's usage over the result's window for its model. Never
+   * seeded from transcripts, so a fresh or resumed handle reports null until
+   * its first measured turn. */
+  getContextUsage = (): ContextUsage | null => (this.disposed ? null : this.contextUsage);
 
   compact = async (): Promise<void> => {
     this.assertLive();
@@ -1227,6 +1233,8 @@ export class ClaudeCodeHandle implements AgentHandle {
     if (this.live !== null || this.preparingTurn || this.compacting) {
       throw new Error('agent session is busy; compaction requires an idle session');
     }
+    // The old measurement no longer describes the context, whatever the outcome.
+    this.contextUsage = null;
     this.compacting = true;
     this.emit({ type: 'compaction_start' });
     try {
@@ -1847,6 +1855,8 @@ export class ClaudeCodeHandle implements AgentHandle {
     // the slot (#424): its authority holds, its producer is prepared, and its
     // exact association is durable. A refusal here leaves no effect.
     const turn = directive === undefined ? null : this.prepareDirectiveTurn(text, directive);
+    // Only this turn's own result may measure the context it leaves behind.
+    this.contextUsage = null;
     this.setState('spawning');
     // The accepted prompt is the pending turn from this moment — through a
     // project-mode check too — so a supervisor capture never misses it.
@@ -2231,6 +2241,8 @@ export class ClaudeCodeHandle implements AgentHandle {
           failTurn('claude completed without an init frame — session identity never verified');
         }
         if (!failed && result !== null) {
+          // Set before turn_end, so an idle snapshot already reads it.
+          this.contextUsage = translator.contextUsage;
           this.emit({ type: 'turn_end' });
           if (result.isError) {
             // In-band error (pi W7 parity): the turn COMPLETED with an

@@ -172,6 +172,27 @@ describe('chat context control rendering', () => {
     expect([compact.disabled, fresh.disabled]).toEqual([true, true]);
   });
 
+  it('renders a claude-code measurement as a rounded percentage (#461)', () => {
+    const view = new ChatView(() => true);
+    view.bindControls(vi.fn(() => true));
+    view.setControlsConnected(true);
+    const snapshot = parseServerFrame(JSON.stringify({
+      type: 'context',
+      epoch: 0,
+      replay_floor_seq: 0,
+      state: 'idle',
+      usage: { tokens: 77_909, context_window: 1_000_000, percent: 7.7909 },
+      compact_supported: true,
+      session_active: true,
+      writer: true,
+    }));
+    if (snapshot?.type !== 'context') throw new Error('claude context did not parse');
+    view.setContext(snapshot);
+    const status = document.getElementById('chat-context-status')!;
+    expect(status.textContent).toBe('8% context');
+    expect(status.getAttribute('title')).toBe('77,909 of 1,000,000 tokens');
+  });
+
   it('renders authoritative usage and announces optimistic New chat progress accessibly', async () => {
     const view = new ChatView(() => true);
     const request = vi.fn(() => true);

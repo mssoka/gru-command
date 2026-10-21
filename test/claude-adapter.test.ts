@@ -83,6 +83,7 @@ const DOUBLE_ENV_KEYS = [
   'CLAUDE_DOUBLE_WORKFLOW_CANDIDATE',
   'CLAUDE_DOUBLE_EXPECT_REVIEW_MODEL',
   'CLAUDE_DOUBLE_EXPECT_REVIEW_AUTH',
+  'CLAUDE_DOUBLE_REPLAY',
 ] as const;
 
 const cleanupDirs: string[] = [];
@@ -285,10 +286,11 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     const handle = await fx.runtime.spawn('gru');
     try {
       const events = collect(handle);
-      expect(handle.getContextUsage).toBeUndefined();
+      expect(handle.getContextUsage?.()).toBeNull();
       expect(handle.canCompact?.()).toBe(false);
+      // The double's own frames carry no provider window: nothing is measured.
       await handle.prompt('establish the session');
-      expect(handle.getContextUsage).toBeUndefined();
+      expect(handle.getContextUsage?.()).toBeNull();
       expect(handle.canCompact?.()).toBe(true);
       const textBefore = deltas(events, 'text_delta').join('');
       const contentEventsBefore = events.filter(
@@ -3271,6 +3273,245 @@ describe('ClaudeControlTranslator (pure)', () => {
     translator.ingest({ type: 'system', subtype: 'compact_boundary' });
     expect(translator.compactSucceeded).toBe(false);
     expect(translator.compactFailure).toBe('first failure');
+  });
+});
+
+/** One Gru turn recorded from Claude Code 2.1.305, content trimmed: two API
+ * calls whose blocks repeat their usage, then the result. Two lines are
+ * synthesized from the recorded shape: the last call's closing text block
+ * (the recorded call ended in a tool call) and the subagent frame. */
+const RECORDED_TURN = join(import.meta.dirname, 'fixtures', 'claude-stream', 'context-usage-turn.jsonl');
+const recordedFrames = (): StreamFrame[] =>
+  readFileSync(RECORDED_TURN, 'utf8').split('\n').filter((line) => line.trim() !== '').map((line) => JSON.parse(line) as StreamFrame);
+/** The last main-thread call: 2 + 643 + 77,264 of claude-opus-5-5's 1,000,000. */
+const MEASURED = { tokens: 77_909, contextWindow: 1_000_000, percent: 7.7909 };
+
+describe('Claude context usage from recorded stream-json (#461)', () => {
+  const measure = (frames: readonly StreamFrame[]) => {
+    const t = new ClaudeTurnTranslator();
+    for (const frame of frames) t.ingest(frame);
+    return t.contextUsage;
+  };
+  const messageOf = (frame: StreamFrame) => frame['message'] as StreamFrame;
+  const isMain = (frame: StreamFrame) => frame['type'] === 'assistant' && frame['parent_tool_use_id'] === null;
+  const lastMainIndex = (frames: readonly StreamFrame[]) => frames.map(isMain).lastIndexOf(true);
+  /** The recorded turn with its result frame rebuilt by `edit`. */
+  const withResult = (edit: (result: StreamFrame) => StreamFrame) =>
+    recordedFrames().map((frame) => (frame['type'] === 'result' ? edit(frame) : frame));
+  /** The recorded turn ending in the CLI's in-band API error: its synthetic
+   * message, then an is_error result that still carries the window. */
+  const inBandErrorTurn = () => {
+    const frames = recordedFrames();
+    const result = frames.pop()!;
+    const synthetic = {
+      type: 'assistant', parent_tool_use_id: null, session_id: 'recorded-session', is_api_error_message: true, error: 'rate_limit', api_error_status: 429,
+      message: { id: 'msg_synthetic', model: '<synthetic>', role: 'assistant', content: [{ type: 'text', text: "You've hit your limit" }],
+        usage: { input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 } },
+    };
+    return [...frames, synthetic, { ...result, is_error: true, api_error_status: 429 }];
+  };
+  /** The recorded turn with the LAST main-thread frame's usage rebuilt by `edit`. */
+  const withLastUsage = (edit: (usage: StreamFrame) => StreamFrame) => {
+    const frames = recordedFrames();
+    const last = lastMainIndex(frames);
+    const message = messageOf(frames[last]!);
+    frames[last] = { ...frames[last]!, message: { ...message, usage: edit(message['usage'] as StreamFrame) } };
+    return frames;
+  };
+
+  it('measures the latest main-thread call against the result window for its model', () => {
+    expect(measure(recordedFrames())).toEqual(MEASURED);
+  });
+
+  it('counts repeated blocks of one API message once, and the last call of the turn wins', () => {
+    const frames = recordedFrames();
+    const lastMain = frames[lastMainIndex(frames)]!;
+    expect(measure([...frames.slice(0, -1), lastMain, lastMain, frames.at(-1)!])).toEqual(MEASURED);
+    // The later call wins even when it is the smaller one (latest, not largest).
+    const firstCall = frames.filter((frame) => isMain(frame) && messageOf(frame)['id'] === 'msg_011CgEJhS5MsRc98HWnziMaQ');
+    const reordered = [...frames.filter((frame) => !firstCall.includes(frame) && frame['type'] !== 'result'), ...firstCall, frames.at(-1)!];
+    expect(measure(reordered)).toEqual({ tokens: 2 + 1_803 + 75_461, contextWindow: 1_000_000, percent: 7.7266 });
+  });
+
+  it('subagent frames never change the measurement', () => {
+    const frames = recordedFrames();
+    const subagent = frames.find((frame) => frame['type'] === 'assistant' && frame['parent_tool_use_id'] !== null)!;
+    expect(subagent).toBeDefined();
+    expect(measure(frames)).toEqual(MEASURED);
+    // The same frame on the main thread would have counted: the parent is what excludes it.
+    const asMain = frames.map((frame) => (frame === subagent ? { ...frame, parent_tool_use_id: null } : frame));
+    expect(measure(asMain)?.tokens).toBe(3 + 5_000 + 150_000);
+  });
+
+  it('a result without the window for that model measures nothing', () => {
+    expect(measure(recordedFrames().filter((frame) => frame['type'] !== 'result'))).toBeNull();
+    expect(measure(withResult(({ modelUsage: _dropped, ...result }) => result))).toBeNull();
+    expect(measure(withResult((result) => ({ ...result, modelUsage: { 'claude-other-model': { contextWindow: 1_000_000 } } })))).toBeNull();
+    for (const contextWindow of [0, -1, 1.5, '1000000', null, undefined]) {
+      expect(measure(withResult((result) => ({ ...result, modelUsage: { 'claude-opus-5-5': { contextWindow } } })))).toBeNull();
+    }
+  });
+
+  it('malformed usage on the latest main-thread frame measures nothing rather than an older call', () => {
+    expect(measure(withLastUsage(({ cache_read_input_tokens: _dropped, ...usage }) => usage))).toBeNull();
+    expect(measure(withLastUsage((usage) => ({ ...usage, input_tokens: -2 })))).toBeNull();
+    expect(measure(withLastUsage((usage) => ({ ...usage, cache_creation_input_tokens: '643' })))).toBeNull();
+    const frames = recordedFrames();
+    const last = lastMainIndex(frames);
+    const { model: _dropped, ...message } = messageOf(frames[last]!);
+    frames[last] = { ...frames[last]!, message };
+    expect(measure(frames)).toBeNull();
+  });
+
+  it('an errored turn measures nothing (owner ruling 2026-10-21)', () => {
+    expect(measure(inBandErrorTurn())).toBeNull();
+    expect(measure(withResult((result) => ({ ...result, is_error: true })))).toBeNull();
+  });
+
+  it('a zero-token synthetic reply is no API call and never replaces the measurement', () => {
+    const frames = recordedFrames();
+    const result = frames.pop()!;
+    // The CLI's own unflagged reply, as Claude Code transcripts record it.
+    const noResponse = {
+      type: 'assistant', parent_tool_use_id: null, session_id: 'recorded-session',
+      message: { id: 'msg_no_response', model: '<synthetic>', role: 'assistant', content: [{ type: 'text', text: 'No response requested.' }],
+        usage: { input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 } },
+    };
+    expect(measure([...frames, noResponse, result])).toEqual(MEASURED);
+    // A turn whose only reply is synthetic made no API call: nothing measures it.
+    expect(measure([noResponse, result])).toBeNull();
+  });
+
+  it('a native compaction inside the turn resets the measurement until a later call', () => {
+    const frames = recordedFrames();
+    const result = frames.pop()!;
+    const boundary = { type: 'system', subtype: 'compact_boundary', session_id: 'recorded-session' };
+    expect(measure([...frames, boundary, result])).toBeNull();
+    expect(measure([...frames, { type: 'compact_boundary', session_id: 'recorded-session' }, result])).toBeNull();
+    const lastMain = frames[lastMainIndex(frames)]!;
+    expect(measure([...frames, boundary, lastMain, result])).toEqual(MEASURED);
+    // A subagent's compaction (a synthesized shape) is another context: the main measurement stands.
+    expect(measure([...frames, { ...boundary, parent_tool_use_id: 'toolu_subagent_context_461' }, result])).toEqual(MEASURED);
+  });
+
+  it('with several models in the result, the main-thread call reads its own model\'s window', () => {
+    const frames = withResult((result) => ({
+      ...result,
+      modelUsage: { 'claude-haiku-4-5': { contextWindow: 200_000 }, ...(result['modelUsage'] as StreamFrame), 'claude-sonnet-5-5': { contextWindow: 400_000 } },
+    }));
+    expect(measure(frames)).toEqual(MEASURED);
+  });
+
+  it('a prompt larger than the reported window measures nothing: that window cannot be the call\'s', () => {
+    const frames = withResult((result) => ({ ...result, modelUsage: { 'claude-opus-5-5': { contextWindow: 50_000 } } }));
+    expect(measure(frames)).toBeNull();
+    const exact = withResult((result) => ({ ...result, modelUsage: { 'claude-opus-5-5': { contextWindow: 77_909 } } }));
+    expect(measure(exact)).toEqual({ tokens: 77_909, contextWindow: 77_909, percent: 100 });
+  });
+
+  it('a fresh handle is unmeasured; a replayed turn measures; a turn without a result clears it #contract:context-usage:claude-code', async () => {
+    const fx = fixture();
+    const handle = await fx.runtime.spawn('gru');
+    try {
+      expect(handle.getContextUsage?.()).toBeNull();
+      process.env['CLAUDE_DOUBLE_REPLAY'] = RECORDED_TURN;
+      const events = collect(handle);
+      await handle.prompt('measure this turn');
+      expect(deltas(events, 'text_delta').join('')).toContain('Recorded turn answer.');
+      expect(handle.getContextUsage?.()).toEqual(MEASURED);
+      // A running turn has no current measurement, and a turn the provider did
+      // not measure (the double's own frames carry no window) leaves none behind.
+      delete process.env['CLAUDE_DOUBLE_REPLAY'];
+      const release = join(fx.home, 'release-measured-hold');
+      const held = handle.prompt(`hold:${release}`);
+      await waitFor(() => handle.health().state === 'streaming');
+      expect(handle.getContextUsage?.()).toBeNull();
+      writeFileSync(release, '');
+      await held;
+      expect(handle.getContextUsage?.()).toBeNull();
+      process.env['CLAUDE_DOUBLE_REPLAY'] = RECORDED_TURN;
+      await handle.prompt('measure again');
+      expect(handle.getContextUsage?.()).toEqual(MEASURED);
+      // A turn that dies without a result frame leaves none behind either.
+      await expect(handle.prompt('crash')).rejects.toThrow();
+      expect(handle.getContextUsage?.()).toBeNull();
+    } finally {
+      await handle.dispose();
+    }
+    expect(handle.getContextUsage?.()).toBeNull();
+  });
+
+  it('compaction clears the measurement until the next measured turn, whether it succeeds or fails', async () => {
+    const fx = fixture();
+    const handle = await fx.runtime.spawn('gru');
+    try {
+      process.env['CLAUDE_DOUBLE_REPLAY'] = RECORDED_TURN;
+      await handle.prompt('measure before compact');
+      expect(handle.getContextUsage?.()).toEqual(MEASURED);
+      const release = join(fx.home, 'release-compact');
+      process.env['CLAUDE_DOUBLE_COMPACT_HOLD_FILE'] = release;
+      const compacting = handle.compact!();
+      await waitFor(() => handle.isCompacting?.() === true);
+      expect(handle.getContextUsage?.()).toBeNull();
+      writeFileSync(release, '');
+      await compacting;
+      delete process.env['CLAUDE_DOUBLE_COMPACT_HOLD_FILE'];
+      expect(handle.getContextUsage?.()).toBeNull();
+      await handle.prompt('measure after compact');
+      expect(handle.getContextUsage?.()).toEqual(MEASURED);
+
+      process.env['CLAUDE_DOUBLE_COMPACT_ERROR'] = '1';
+      await expect(handle.compact!()).rejects.toThrow(/native compact failed/);
+      expect(handle.getContextUsage?.()).toBeNull();
+      delete process.env['CLAUDE_DOUBLE_COMPACT_ERROR'];
+      await handle.prompt('measure after failed compact');
+      expect(handle.getContextUsage?.()).toEqual(MEASURED);
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('an in-band error leaves the handle in error with no measurement; the next measured turn restores it', async () => {
+    const fx = fixture();
+    const handle = await fx.runtime.spawn('gru');
+    try {
+      process.env['CLAUDE_DOUBLE_REPLAY'] = RECORDED_TURN;
+      await handle.prompt('measure first');
+      expect(handle.getContextUsage?.()).toEqual(MEASURED);
+      const errored = join(fx.home, 'in-band-error-turn.jsonl');
+      writeFileSync(errored, inBandErrorTurn().map((frame) => JSON.stringify(frame)).join('\n'));
+      process.env['CLAUDE_DOUBLE_REPLAY'] = errored;
+      await handle.prompt('hit the limit');
+      expect(handle.health().state).toBe('error');
+      expect(handle.getContextUsage?.()).toBeNull();
+      process.env['CLAUDE_DOUBLE_REPLAY'] = RECORDED_TURN;
+      await handle.prompt('after the limit resets');
+      expect(handle.getContextUsage?.()).toEqual(MEASURED);
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('a resumed session is unmeasured before its first turn, never seeded from its transcript', async () => {
+    const fx = fixture();
+    const first = await fx.runtime.spawn('gru');
+    try {
+      process.env['CLAUDE_DOUBLE_REPLAY'] = RECORDED_TURN;
+      await first.prompt('measure, then restart');
+      expect(first.getContextUsage?.()).toEqual(MEASURED);
+    } finally {
+      await first.dispose();
+    }
+    const file = first.sessionFile!;
+    expect(readFileSync(file, 'utf8')).toContain('"cache_read_input_tokens":77264');
+    const resumed = await fx.runtime.spawn('gru', { resumeFile: file });
+    try {
+      expect(resumed.getContextUsage?.()).toBeNull();
+      await resumed.prompt('first turn after restart');
+      expect(resumed.getContextUsage?.()).toEqual(MEASURED);
+    } finally {
+      await resumed.dispose();
+    }
   });
 });
 

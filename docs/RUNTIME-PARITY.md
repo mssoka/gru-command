@@ -68,6 +68,7 @@ that proves it on each adapter.
 | `isolated-review-tools` | An isolated review gets exactly its review tools; ambient runtime resources are stripped | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts` |
 | `review-native-tools` | A lens session gets exactly its declared product-native tools: in-process for pi, a scoped MCP bridge for Claude | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts` |
 | `compaction` | Native compaction keeps the same session identity | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts` |
+| `context-usage` | While idle, the handle reports the runtime's own context usage (tokens, window, percent), or `null` when it has no current value. pi reports `AgentSession.getContextUsage()`. Claude Code (#461) reports the latest main-thread call's prompt `usage` over the result frame's `modelUsage` window, with no estimate and no window table, and is `null` until a turn ends measured (its `null` cases are listed in `docs/RUNTIMES.md`) | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts` |
 | `dispose-releases-lock` | Dispose stops the turn and releases the session lock | `test/pi-adapter.test.ts` | `test/claude-adapter.test.ts` |
 | `cessation-proven` | Adapter-owned proof (pi: a confirmed idle; Claude: the original child's close) makes disposal `ceased` | `test/runtime-cessation-evidence.test.ts` | `test/runtime-claude-cessation-ownership.test.ts` |
 | `cessation-unproven-holds-permit` | Without that proof, evidence stays `unknown` and the resident permit is held as debt | `test/runtime-positive-cessation-ownership.test.ts` | `test/runtime-claude-cessation-ownership.test.ts` |
@@ -108,6 +109,7 @@ no counterpart on the other runtime.
 | `test/claude-adapter.test.ts` | NdjsonParser (pure) | adapter-internal |
 | `test/claude-adapter.test.ts` | ClaudeControlTranslator (pure) | adapter-internal |
 | `test/claude-adapter.test.ts` | ClaudeTurnTranslator (pure) | adapter-internal |
+| `test/claude-adapter.test.ts` | Claude context usage from recorded stream-json (#461) | context-usage |
 | `test/claude-adapter.test.ts` | ReviewMcpBridge bounded protocol failures | review-native-tools |
 | `test/claude-adapter.test.ts` | spawn cwd (SPEC ruling 17 — dispatch roots in the project) | spawn-cwd |
 | `test/claude-adapter.test.ts` | isolated-review confinement guards | isolated-review-tools |

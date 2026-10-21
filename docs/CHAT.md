@@ -171,10 +171,25 @@ history always reads "the turn died here," never an open stream.
 
 ## Context usage, Compact, and New chat
 
-The context row is a control/status surface, not chat content. Pi reports
-native `getContextUsage()` values while idle; Claude print mode does not
-expose a trustworthy whole-context measure, so it reports unavailable.
-No adapter or UI reconstructs usage from streamed deltas.
+The context row is a control/status surface, not chat content. While Gru
+is idle it shows the runtime's own `getContextUsage()` value as
+`N% context`; the server and UI never compute one themselves.
+
+- **Pi** reports its native session's `getContextUsage()`.
+- **Claude** measures each turn live from its stream-json (see
+  [RUNTIMES.md](RUNTIMES.md#context-controls)). The number is the prompt the
+  turn's last main-thread API call sent, so that call's own reply is not yet
+  counted. The window is the one the result frame reports for that model.
+  There is no estimate and no model-to-window table.
+  Its pill reads "Context unavailable" until a turn ends measured, so it
+  is unavailable:
+  - after a fresh spawn, a restart's resume, a New chat or a compaction;
+  - after a turn that ended in an error, such as a usage limit or a
+    too-long prompt (owner ruling 2026-10-21);
+  - after a turn that made no API call, or whose result carries no window
+    that fits its prompt.
+
+Compact context and New chat are the row's controls:
 
 - **Compact context** invokes the active provider's native control in the
   same session. Pi uses its SDK compactor; Claude executes a dedicated

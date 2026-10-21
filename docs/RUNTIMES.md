@@ -70,8 +70,35 @@ single-operation queue.
   and emits exactly one failed terminal if disposal wins. The terminal event is
   the result authority (missing/failed terminals reject), and the adapter
   verifies the session id/file did not change.
-- **Claude Code:** print mode does not expose trustworthy whole-context
-  usage, so usage is deliberately unavailable. Compaction runs native
+- **Claude Code:** usage is measured live from each turn's stream-json and
+  never seeded from transcripts (#461).
+  - `tokens` is `input_tokens + cache_creation_input_tokens +
+    cache_read_input_tokens` of the turn's latest main-thread assistant
+    frame: the prompt that call sent, without its own reply. The blocks of
+    one API message repeat that call's usage, so the latest frame replaces
+    and never adds.
+  - These frames never count:
+    - frames with a `parent_tool_use_id`, which belong to subagents;
+    - the CLI's flagged API-error message;
+    - zero-token frames, which are the CLI's own `<synthetic>` replies such
+      as "No response requested.".
+  - A main-thread `compact_boundary` inside a turn resets the measurement
+    until a later call.
+  - `contextWindow` is the result frame's
+    `modelUsage[<that frame's model>].contextWindow`. That map's token
+    counts are cumulative over the turn and are not used.
+  - Usage is `null` when any of these holds:
+    - the turn made no API call, or its latest main-thread frame has
+      malformed usage or no model;
+    - the window is missing;
+    - the prompt exceeds the window (a call that succeeded fit its window,
+      so that window cannot be the call's);
+    - the turn's result is an error (owner ruling 2026-10-21: an errored
+      turn leaves no measurement);
+    - a turn or compaction has started, until a turn ends with a measured
+      result;
+    - the handle is fresh or resumed and has not yet had such a turn.
+- **Claude Code compaction** runs native
   `/compact` through a dedicated `--resume <same uuid>` machine-output
   process. Its frames append to the same product transcript for forensics,
   but a control-only translator suppresses all command output from chat.
