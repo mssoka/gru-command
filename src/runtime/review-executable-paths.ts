@@ -2742,6 +2742,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/runtime/review-build-identity.js",
   "dist/runtime/review-directory-entries.js",
   "dist/runtime/review-executable-paths.js",
+  "dist/runtime/review-host-exit.js",
   "dist/runtime/review-mcp-bridge.js",
   "dist/runtime/review-mcp-server.mjs",
   "dist/runtime/review-model-identity.js",

@@ -22,7 +22,10 @@ export function createServiceReviewWave(input: {
     runtimeIdFor(role: 'perkins'): string;
     reviewThinkingLevel(role: 'perkins'): string;
   };
-  readonly options: Omit<WaveRunnerOptions, 'reviewRuntimeIdentity' | 'reviewThinkingLevel'>;
+  /** The runtime's owner-cessation proofs are required (#464): a service
+   * wave without them blocks every replacement after a restart. */
+  readonly options: Omit<WaveRunnerOptions, 'reviewRuntimeIdentity' | 'reviewThinkingLevel'> &
+    Required<Pick<WaveRunnerOptions, 'reconcileReviewAgent' | 'proveReviewHostExit'>>;
 }): WaveRunner {
   const { registry, options } = input;
   return new WaveRunner({

@@ -2,6 +2,7 @@ import { captureCwdHandoff } from '../worktrees/handoff.js';
 import { RUNTIME_IDS, resolveSpawnPolicy, type Role, type RuntimeId } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { GrowthReport, SessionStore } from '../sessions/store.js';
+import type { LedgerApi } from '../ledger/api.js';
 import type { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { PiRuntime, normalizeSessionPath } from './pi-adapter.js';
 import { ClaudeCodeRuntime } from './claude-adapter.js';
@@ -18,6 +19,11 @@ import { QuarantinedPublicationError, WorkerDisposalInProgressError } from './wo
 import { disposePhases, type DisposableTarget } from './disposal.js';
 import { publishSpawnRegistration } from './spawn-registration.js';
 import { notifyDisposalSettlement } from './disposal-observation.js';
+import { processTableAsync, type ProcessTable } from '../worktrees/manager.js';
+import {
+  pidState, processIdentity, proveReviewHostExit,
+  type ReviewHostExitEvidence, type ReviewHostExitInput, type ReviewHostExitResult,
+} from './review-host-exit.js';
 
 export { WorkerDisposalInProgressError };
 
@@ -80,6 +86,45 @@ export interface ReviewOwnerMarker {
   readonly runtimeId: string;
   readonly pid: number;
   readonly generation: string;
+  /** The host process's start identity when it wrote the marker (#464): a
+   * live pid with another identity is a reused pid, or this service
+   * restarted under it. Absent on markers written before it existed. */
+  readonly hostIdentity?: string;
+}
+
+function validReviewOwnerMarker(marker: ReviewOwnerMarker | null): marker is ReviewOwnerMarker {
+  return marker !== null && Number.isSafeInteger(marker.pid) && marker.pid > 0 &&
+    validReviewOwnerGeneration(marker.generation) && marker.roundId.trim() !== '';
+}
+
+/** Durable review-owner cessation (#464). The registry owns no ledger; the
+ * host binds this to it, so a restarted service keeps what the owning
+ * process proved. */
+export interface ReviewOwnerCessationLedger {
+  /** The owning process saw its adapter report this review session ceased. */
+  readonly recordAdapterCessation: (observation: { readonly agentId: string; readonly generation: string }) => void;
+  /** A later process proved the marker's host and every session gone. */
+  readonly recordHostExit: (marker: ReviewOwnerMarker, evidence: ReviewHostExitEvidence) => void;
+  /** Whether a durable record proves `agentId` ('' = the owner before any
+   * session registered) ceased under exactly this marker. */
+  readonly recorded: (agentId: string, marker: ReviewOwnerMarker) => boolean;
+}
+
+/** {@link ReviewOwnerCessationLedger} bound to the ledger, read lazily:
+ * the service opens its ledger after the registry. */
+export function ledgerReviewOwnerCessation(
+  ledger: () => Pick<LedgerApi, 'recordReviewOwnerCessation' | 'reviewOwnerCessationRecorded'>,
+): ReviewOwnerCessationLedger {
+  return {
+    recordAdapterCessation: ({ agentId, generation }) => {
+      ledger().recordReviewOwnerCessation({ source: 'adapter', agentId, generation });
+    },
+    recordHostExit: (marker, evidence) => {
+      ledger().recordReviewOwnerCessation({ source: 'host-exit', roundId: marker.roundId, generation: marker.generation,
+        pid: marker.pid, hostIdentity: marker.hostIdentity ?? null, evidence: { ...evidence } });
+    },
+    recorded: (agentId, marker) => ledger().reviewOwnerCessationRecorded(agentId, marker),
+  };
 }
 
 export interface RuntimeRegistryOptions {
@@ -95,8 +140,16 @@ export interface RuntimeRegistryOptions {
   /** Review-reservation close settle window (default 30s, named
    * CLOSE_SETTLE_MS). Expiration fails closed and retains capacity. */
   readonly closeSettleMs?: number;
-  /** OS probe override for deterministic death/live/unknown tests only. */
+  /** OS probe override for deterministic death/live/unknown tests only; the
+   * dead-host proof also asks it about session-lock holders. */
   readonly ownerProcessProbe?: (pid: number) => 'dead' | 'alive' | 'unknown';
+  /** Durable review-owner cessation (#464); without it a restart keeps no
+   * cessation proof and no dead-host proof can be recorded. */
+  readonly reviewOwnerCessation?: ReviewOwnerCessationLedger;
+  /** Process-table override for the dead-host proof (tests only). */
+  readonly processTable?: () => Promise<ProcessTable>;
+  /** Process start-identity override for the dead-host proof (tests only). */
+  readonly processIdentity?: (pid: number) => Promise<string | null>;
   /** Durable relay for reclaim-failure observations (one per handle per
    * drain epoch). The registry owns no ledger; the host wires this. */
   readonly reclaimFailureSink?: (observation: {
@@ -120,6 +173,9 @@ export interface RuntimeRegistryOptions {
  * The caller supplies ledger/registry authority, never a directory-name guess. */
 export function serviceRegistryOptions(
   base: Pick<RuntimeRegistryOptions, 'config' | 'store' | 'log'> & {
+    /** Required (#464): a service registry without it loses review-owner
+     * cessation on every restart. */
+    readonly reviewOwnerCessation: ReviewOwnerCessationLedger;
     readonly config: { readonly dataDir: string };
     readonly workflowLaneFor: (options: SpawnOptions) => WorktreeLane | null;
     readonly workflowBuildFor?: (lane: WorktreeLane) => boolean;
@@ -196,13 +252,15 @@ export class RuntimeRegistry {
   /** Pi isolated review tools and host-native callbacks run inside this
    * hosting process; an OS-proven dead host cannot issue another write.
    * Claude can leave an independently running child, so PID death is NEVER
-   * cessation proof for Claude. A live/reused/unknown PID blocks unless the
-   * current process observed adapter-owned cessation for this generation. */
+   * cessation proof for Claude. A live/reused/unknown PID blocks unless
+   * adapter-owned cessation for this generation was observed: by this
+   * process, or durably by the owning one (#464), whose record also holds
+   * a dead-host proof a later process kept ({@link proveReviewHostExit}). */
   reviewOwnerCeased(agentId: string, marker: ReviewOwnerMarker | null): boolean {
-    if (marker === null || !Number.isSafeInteger(marker.pid) || marker.pid <= 0 ||
-      !validReviewOwnerGeneration(marker.generation) || marker.roundId.trim() === '') return false;
-    if (marker.pid === process.pid) return this.ceasedReviewOwners.get(agentId) === marker.generation;
-    if (marker.runtimeId !== 'pi') return false;
+    if (!validReviewOwnerMarker(marker)) return false;
+    if (marker.pid === process.pid && this.ceasedReviewOwners.get(agentId) === marker.generation) return true;
+    if (this.durablyCeased(agentId, marker)) return true;
+    if (marker.pid === process.pid || marker.runtimeId !== 'pi') return false;
     try {
       if (this.opts.ownerProcessProbe !== undefined) return this.opts.ownerProcessProbe(marker.pid) === 'dead';
       process.kill(marker.pid, 0);
@@ -210,6 +268,50 @@ export class RuntimeRegistry {
     } catch (error) {
       return (error as NodeJS.ErrnoException).code === 'ESRCH';
     }
+  }
+
+  private durablyCeased(agentId: string, marker: ReviewOwnerMarker): boolean {
+    try {
+      return this.opts.reviewOwnerCessation?.recorded(agentId, marker) === true;
+    } catch (error) {
+      this.log('error', 'durable review-owner cessation is unreadable; ownership stays unproven', {
+        round: marker.roundId, agent: agentId, error: String(error),
+      });
+      return false;
+    }
+  }
+
+  /** The dead-host proof (#464) for a review owner hosted by ANOTHER
+   * process that left no durable cessation record. A passing proof is
+   * recorded before it is reported, so the next reconciliation reads the
+   * record instead of re-deciding; one that cannot be recorded refuses. */
+  async proveReviewHostExit(input: ReviewHostExitInput): Promise<ReviewHostExitResult> {
+    const { marker } = input;
+    if (!validReviewOwnerMarker(marker)) return { ok: false, problem: 'its owner marker is malformed' };
+    const ledger = this.opts.reviewOwnerCessation;
+    if (ledger === undefined) return { ok: false, problem: 'no durable cessation record is wired to keep a dead-host proof' };
+    const result = await proveReviewHostExit(input, {
+      pidState: this.opts.ownerProcessProbe ?? pidState,
+      processIdentity: this.opts.processIdentity ?? processIdentity,
+      processTable: this.opts.processTable ?? (() => processTableAsync({
+        onCwdError: (error) => this.log('warn', 'dead-host proof could not list process working directories', { error: String(error) }),
+      })),
+      // Review owners are Perkins sessions rooted at the review worktree.
+      sessionDir: (cwd) => this.opts.store.sessionDirFor('perkins', cwd),
+      lockFileFor: (sessionFile) => this.opts.store.lockFileFor(sessionFile),
+      heldHere: (sessionFile) => this.opts.store.isHeld(sessionFile),
+    });
+    if (!result.ok) return result;
+    try {
+      ledger.recordHostExit(marker, result.evidence);
+    } catch (error) {
+      return { ok: false, problem: `the dead-host proof passed but could not be recorded (${String(error)})` };
+    }
+    this.log('info', 'review owner proven gone by dead-host proof', {
+      round: marker.roundId, pid: marker.pid, runtime: marker.runtimeId, host: result.evidence.host,
+      sessions: result.evidence.sessionIds.length,
+    });
+    return result;
   }
   private readonly agentListeners = new Set<AgentEventListener>();
   private readonly opts: RuntimeRegistryOptions;
@@ -724,12 +826,22 @@ export class RuntimeRegistry {
     const releaseHandle = (): void => {
       if (released) return;
       released = true;
+      let ceased = false;
       try {
-        if (options.reviewOwnerGeneration !== undefined && handle.cessationEvidence?.() === 'ceased') {
-          this.ceasedReviewOwners.set(handle.id, options.reviewOwnerGeneration);
-        }
+        ceased = options.reviewOwnerGeneration !== undefined && handle.cessationEvidence?.() === 'ceased';
       } catch {
         // Missing or failing adapter evidence remains unknown.
+      }
+      if (ceased && options.reviewOwnerGeneration !== undefined) {
+        this.ceasedReviewOwners.set(handle.id, options.reviewOwnerGeneration);
+        // Durable too (#464): a restart must not lose what this owner saw.
+        try {
+          this.opts.reviewOwnerCessation?.recordAdapterCessation({ agentId: handle.id, generation: options.reviewOwnerGeneration });
+        } catch (error) {
+          this.log('error', 'review-owner cessation could not be recorded; a restarted service must prove the host gone instead', {
+            agent: handle.id, error: String(error),
+          });
+        }
       }
       this.handles.delete(resident);
       this.unpublished.delete(resident);

@@ -62,7 +62,8 @@ the caller supplies expectations only:
 - **No verification producer**: no unsettled verification run.
 - **No review/source ownership**: no `pending`/`live` review round.
 - **No live lane process**: no `worktree_processes` row in `live` state
-  for the job's lanes.
+  for the job's lanes that are not swept. A swept lane runs nothing, so a
+  row it left `live` never fences (#464).
 - **No correlated terminal receipt**: a `job.delivered` correlated to the
   request is refused (`terminal_receipt_present`) — normal settlement owns
   it.

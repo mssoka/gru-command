@@ -1103,4 +1103,44 @@ export const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE notifications ADD COLUMN decided_option TEXT;
     `,
   },
+  {
+    // #464: a recorded lane process that left its tree (no longer
+    // enumerated there and dead, or its tree swept) moves to `exited`. SQLite
+    // cannot widen a CHECK in place, so the table is rebuilt; nothing
+    // references it. Rows already stranded under swept trees move now.
+    id: 30,
+    name: 'worktree-processes-exited',
+    sql: `
+      CREATE TABLE worktree_processes_new (
+        worktree_id TEXT NOT NULL REFERENCES worktrees(id),
+        pid         INTEGER NOT NULL,
+        command     TEXT NOT NULL,
+        evidence    TEXT NOT NULL CHECK (evidence IN ('argv','cwd','registry')),
+        state       TEXT NOT NULL CHECK (state IN ('live','killed','exited')),
+        first_seen  TEXT NOT NULL,
+        last_seen   TEXT NOT NULL,
+        PRIMARY KEY (worktree_id, pid)
+      );
+      INSERT INTO worktree_processes_new (worktree_id, pid, command, evidence, state, first_seen, last_seen)
+        SELECT worktree_id, pid, command, evidence, state, first_seen, last_seen FROM worktree_processes;
+      DROP TABLE worktree_processes;
+      ALTER TABLE worktree_processes_new RENAME TO worktree_processes;
+      CREATE INDEX idx_worktree_processes_wt ON worktree_processes(worktree_id);
+      -- Rows a sweep already left live under a swept tree exited with it,
+      -- each tree's move audited like a live sweep's (registry rows stay
+      -- with their own reconcile).
+      INSERT INTO events (ts, kind, agent_id, job_id, round_id, lens, payload)
+        SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'worktree.processes-exited', NULL, w.job_id, w.round_id, NULL,
+               json_object('id', w.id, 'pids', json_group_array(p.pid), 'reason', 'worktree-swept')
+          FROM worktrees w
+          JOIN (SELECT worktree_id, pid FROM worktree_processes WHERE state = 'live' AND evidence <> 'registry' ORDER BY pid) p
+            ON p.worktree_id = w.id
+         WHERE w.status = 'swept'
+         GROUP BY w.id
+         ORDER BY w.id;
+      UPDATE worktree_processes SET state = 'exited'
+       WHERE state = 'live' AND evidence <> 'registry'
+         AND worktree_id IN (SELECT id FROM worktrees WHERE status = 'swept');
+    `,
+  },
 ];

@@ -6,7 +6,8 @@ import { configPathFor, loadConfig, ConfigError } from './config.js';
 import { loadOrCreateIdentity } from './identity.js';
 import { startServiceShutdown, type ServiceShutdownState } from './service-shutdown.js';
 import { Logger } from './logger.js';
-import { RuntimeRegistry, serviceRegistryOptions } from './runtime/registry.js';
+import { RuntimeRegistry, ledgerReviewOwnerCessation, serviceRegistryOptions } from './runtime/registry.js';
+import { thisProcessIdentity } from './runtime/review-host-exit.js';
 import { resolvePacingPolicy } from './runtime/pacing.js';
 import { SessionStore } from './sessions/store.js';
 import { LedgerDb } from './ledger/db.js';
@@ -398,6 +399,13 @@ async function main(): Promise<number> {
   // Lazy authoritative records preserve boot order; dispatch and fallback use
   // the same tested assignment and deliverable-selection wiring.
   const workflowAuthority = serviceWorkflowAuthority(config.dataDir, () => ledger, undefined, configPathFor(config.instanceDir));
+  // #464: review-owner markers carry this process's start identity, read
+  // once here, before anything can write one, so a failure is loud at boot.
+  if (thisProcessIdentity() === null) {
+    logger.log('warn', 'process start identity cannot be read; review-owner markers carry none, so a restart under the same pid cannot prove their host gone', {
+      pid: process.pid, platform: process.platform,
+    });
+  }
   const registry = new RuntimeRegistry(serviceRegistryOptions({
     config,
     store,
@@ -406,6 +414,8 @@ async function main(): Promise<number> {
     workflowBuildFor: workflowAuthority.workflowBuildFor,
     workflowAgentFor: workflowAuthority.workflowAgentFor,
     log: (level, msg, fields) => logger.log(level, msg, fields),
+    // #464: review-owner cessation outlives the process that observed it.
+    reviewOwnerCessation: ledgerReviewOwnerCessation(() => ledger),
   }));
   const growth = registry.boot();
   state.store = store;
@@ -1333,6 +1343,7 @@ async function main(): Promise<number> {
     poster: createStartupVerdictPoster(config),
     reserveReviewRound: (signal) => registry.reserveReviewRound(signal),
     reconcileReviewAgent: async (agentId, marker) => registry.reviewOwnerCeased(agentId, marker),
+    proveReviewHostExit: (proofInput) => registry.proveReviewHostExit(proofInput),
     maxConcurrentChildren: config.review.maxConcurrentChildren,
     bus,
     reviewArtifactRoot: join(config.dataDir, 'reviews'),
