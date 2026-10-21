@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { ClaudeDirectivePermissionChannel, privateClaudeDirectiveSettings, type ClaudeToolDecision, type ClaudeToolRequest } from '../src/runtime/claude-directive.js';
-import { assertClaudeDirectiveToolIntent, inspectDirectiveCheckpoint, prepareClaudeDirectiveBinding, type DirectiveTurnIdentity } from '../src/runtime/directive-checkpoint.js';
+import { assertClaudeDirectiveToolIntent, inspectDirectiveAdmission, inspectDirectiveCheckpoint, prepareClaudeDirectiveBinding, type DirectiveTurnIdentity } from '../src/runtime/directive-checkpoint.js';
 import { workerVerificationRefusal, type WorkerVerificationPolicy } from '../src/runtime/worker-verification-policy.js';
 
 /**
@@ -112,15 +112,15 @@ describe('the Claude directive permission channel (#424)', () => {
 describe('the Claude directive checkpoint (#424)', () => {
   const identity: DirectiveTurnIdentity = { requestId: 'claude-unit', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64), jobId: 'job-unit', workRevision: 0, authorityEpoch: 0 };
   const content = [{ type: 'text', text: 'follow the approved correction' }];
-  /** A transcript with GC's header, a bound directive, and then `frames`. */
-  function turn(frames: readonly Record<string, unknown>[], header = true): string {
+  /** A transcript with GC's header, a bound directive, and then `frames` (a string is a raw line). */
+  function turn(frames: readonly (Record<string, unknown> | string)[], header = true): string {
     const dir = mkdtempSync(join(tmpdir(), 'gru-claude-checkpoint-'));
     dirs.push(dir);
     const file = join(dir, 'session.jsonl');
     // A legacy transcript starts with the CLI's own frames, not GC's header.
     writeFileSync(file, `${JSON.stringify(header ? { type: 'session', version: 1, id: 'cli-session', cwd: dir, runtime: 'claude-code' } : { type: 'system', subtype: 'init', session_id: 'cli-session' })}\n`);
     if (header) prepareClaudeDirectiveBinding({ identity, agentId: 'minion', sessionId: 'cli-session', sessionFile: file, content, authorityManifest: 'manifest' });
-    for (const frame of frames) appendFileSync(file, `${JSON.stringify(frame)}\n`);
+    for (const frame of frames) appendFileSync(file, `${typeof frame === 'string' ? frame : JSON.stringify(frame)}\n`);
     return file;
   }
   const init = { type: 'system', subtype: 'init', session_id: 'cli-session' };
@@ -140,6 +140,10 @@ describe('the Claude directive checkpoint (#424)', () => {
       [init, echo, use('t1'), use('t1'), done],
       [init, echo, use('t1'), { ...result('t1'), message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'no', is_error: true }] } }, done],
       [init, { ...echo, message: { role: 'user', content: [{ type: 'text', text: 'something else' }] } }, done],
+      // A line that is no JSON object, read anywhere the walk reads (#469).
+      [init, echo, use('t1'), 'not json', result('t1'), done],
+      [init, echo, use('t1'), '[1,2]', result('t1'), done],
+      [init, 'not json', echo, done],
     ].map((frames) => inspectDirectiveCheckpoint(turn(frames), identity));
     for (const proof of reasons) expect(proof.state).toBe('unknown');
     expect(reasons.map((proof) => (proof as { reason: string }).reason)).toEqual([
@@ -148,7 +152,11 @@ describe('the Claude directive checkpoint (#424)', () => {
       'malformed native tool identity',
       'native tool error requires a recovery judgment',
       'actual native admission user receipt unavailable/changed',
+      'malformed native frame after the directive prefix',
+      'malformed native frame after the directive prefix',
+      'malformed native frame after the directive prefix',
     ]);
+    expect(() => inspectDirectiveAdmission(turn([init, 'not json', echo]), identity)).toThrow(/^malformed native frame after the directive prefix$/u);
   });
 
   it('refuses a tool whose intent is not recorded, changed, already settled, or ambiguous', () => {
@@ -158,6 +166,8 @@ describe('the Claude directive checkpoint (#424)', () => {
     expect(() => assertClaudeDirectiveToolIntent(file, identity, 't2', 'Read', { file_path: '/x' })).toThrow(/not persisted before execution/u);
     expect(() => assertClaudeDirectiveToolIntent(turn([init, echo, use('t1'), result('t1')]), identity, 't1', 'Read', { file_path: '/x' })).toThrow(/not persisted before execution/u);
     expect(() => assertClaudeDirectiveToolIntent(turn([init, echo, use('t1'), use('t1')]), identity, 't1', 'Read', { file_path: '/x' })).toThrow(/ambiguous/u);
+    expect(() => assertClaudeDirectiveToolIntent(turn([init, echo, use('t1'), 'not json']), identity, 't1', 'Read', { file_path: '/x' }))
+      .toThrow(/^malformed native frame after the directive prefix$/u);
   });
 
   it('a transcript whose bound prefix changed (its header included) makes the checkpoint unknown, never a throw', () => {

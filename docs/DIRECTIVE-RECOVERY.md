@@ -268,6 +268,40 @@ journal is `<session.jsonl>.directives.jsonl`; native receipt identity and
 its role/cwd/tool/model authority manifest are validated on readback.
 Unknown/malformed/partial evidence is never repaired by guesswork.
 
+Readback is bounded by the directive's own turn, never by the session's age
+(#469), so a long-lived minion still takes directives, revision
+continuations and `/recover` successors.
+
+- **Header.** It is the first line alone, at most 64 KiB, on every path.
+- **Before the baseline.** The transcript is streamed past, never held
+  whole. pi keeps only the entry ids up to the baseline entry and checks
+  them for uniqueness; each pi entry there is bounded at 32 MiB. Claude
+  Code re-hashes the exact byte prefix.
+- **The turn.** The turn after the baseline is read only as far as the
+  inspection walks:
+  - admission stops at its receipt;
+  - a checkpoint stops at its result, or at its terminal plus the next
+    bound request;
+  - a tool fence reads the live turn.
+
+  Only the turn's own lines count against 32 MiB and 250,000 entries, so a
+  session's later growth never pushes an earlier directive past its limits.
+  A pi checkpoint's lookahead past its terminal (the next request and its
+  model/thinking controls) has its own 32 MiB / 250,000-entry bound and is
+  refused under its own name, as the lookahead, never as the turn.
+
+What is still refused by name, wherever a walk reads it:
+
+- on both runtimes, a directive turn past either limit and invalid UTF-8;
+- on pi, a torn entry, a reused or missing entry id, and a missing
+  baseline;
+- on Claude Code, a changed byte prefix and a line that is no JSON object.
+  A torn final line only ends a Claude walk, because the live writer may be
+  mid-frame. Frame uuids are not checked for uniqueness.
+
+A pi entry that is not JSON still fails as a JSON parse error, as it did
+before #469.
+
 Boot and bounded deterministic reconsideration inspect correlated ledger
 completion, then exact native completion, **before** considering execution.
 A proven native user or complete successful tool-results checkpoint can
