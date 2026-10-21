@@ -1505,7 +1505,8 @@ async function main(): Promise<number> {
   const strandedRecovery = ledger.reopenStrandedRecoveryDebts();
   if (strandedRecovery.reopened > 0) logger.info('stranded directive recovery debt reopened', { reopened: strandedRecovery.reopened });
   for (const failure of strandedRecovery.failures) {
-    logger.log('error', 'stranded directive recovery debt could not be reopened', { successor: failure.successorId, error: failure.error });
+    logger.log('error', 'stranded directive recovery debt could not be reopened', { job: failure.jobId, request: failure.predecessorId,
+      successor: failure.successorId, error: failure.error });
   }
   const directiveProgress = new DirectiveProgressService({ ledger, registry, worktrees: worktreeManager, notifications, observeBlindTurn,
     clearLaneForWriter: (input) => wave.clearLaneForWriter(input),

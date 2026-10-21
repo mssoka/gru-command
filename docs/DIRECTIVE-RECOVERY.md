@@ -442,9 +442,11 @@ worker starts and no work revision or current authority is required. An
 identical replay returns `idempotent: true` and appends nothing. There
 is no age policy: an orphan settles only through this explicit call.
 
-The retired request takes no new successor, so Gru starts the follow-up
-work itself as a fresh request (`POST /api/silas/directive` or
-`/api/silas/rebrief`) and reconciles once that request is admitted.
+The retired request takes no new successor. Gru first checks the job for
+a later request that already carries the work, live or admitted, and uses
+it; only when there is none does Gru start one itself (`POST
+/api/silas/directive` or `/api/silas/rebrief`). It reconciles once that
+request is admitted.
 
 A request retired **by** a `successor` or `rebrief-successor` decision
 has already used its debt's generation on that decision. If the named

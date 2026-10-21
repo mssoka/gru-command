@@ -2293,7 +2293,8 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     const preHookRetire = (requestId: string) => f.db.handle.prepare(`UPDATE pending_directives SET state = 'retired', retired_at = ?, retired_by = 'gru',
       retire_reason = 'pre-#470 build: never admitted', retire_expected_state = 'dispatching', retire_expected_head = ? WHERE request_id = ?`)
       .run(new Date().toISOString(), resolveGitCommit(f.lane.path, 'HEAD'), requestId);
-    // An admitted successor settles its predecessor; retiring it later strands nothing.
+    // An admitted successor settled its predecessor at admission. Its row is
+    // flipped to retired directly: the repair keys on admission, never state.
     await executeAcceptedDirective(f.deps, f.successor.requestId);
     expect(f.ledger.getObligation(f.debt.id)?.state).toBe('settled');
     preHookRetire(f.successor.requestId);
@@ -2313,16 +2314,21 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     };
     const first = strand('stranded-one'); const second = strand('stranded-two');
     const card = (requestId: string) => f.ledger.findNotificationByKind(`silas.directive-unreconciled.${requestId}`, 'active');
-    // One row that refuses is reported by name and leaves the others repairing.
-    const history = f.ledger.recoveryDecisionHistory.bind(f.ledger);
-    const malformed = vi.spyOn(f.ledger, 'recoveryDecisionHistory').mockImplementation((kind, id) => {
-      if (id === 'stranded-one') throw new Error('malformed decision history');
-      return history(kind, id);
+    // A row that fails AFTER its writes (audit event, superseded debt, new
+    // incarnation) rolls all of them back, is reported by name, and leaves
+    // the other rows repairing.
+    const lookup = f.ledger.findNotificationByKind.bind(f.ledger);
+    const failing = vi.spyOn(f.ledger, 'findNotificationByKind').mockImplementation((kind, mode) => {
+      if (kind === 'silas.directive-unreconciled.stranded-one') throw new Error('notification store unreadable');
+      return lookup(kind, mode);
     });
-    expect(f.ledger.reopenStrandedRecoveryDebts()).toEqual({ reopened: 1,
-      failures: [{ successorId: 'stranded-one-successor', error: expect.stringContaining('malformed decision history') }] });
-    malformed.mockRestore();
-    expect(f.ledger.recoveryObligation(f.intent.jobId, 'directive', 'stranded-one')).toMatchObject({ id: first.id, state: 'open' });
+    const watermark = f.ledger.latestEventSeq();
+    expect(f.ledger.reopenStrandedRecoveryDebts()).toEqual({ reopened: 1, failures: [{ jobId: f.intent.jobId, predecessorId: 'stranded-one',
+      successorId: 'stranded-one-successor', error: expect.stringContaining('notification store unreadable') }] });
+    failing.mockRestore();
+    expect(f.ledger.recoveryObligation(f.intent.jobId, 'directive', 'stranded-one')).toMatchObject({ id: first.id, state: 'open', generation: first.generation });
+    expect(f.ledger.listEvents({ limit: 500 }).filter((event) => event.seq > watermark && event.kind === 'silas.directive-recovery-reopened')
+      .map((event) => (event.payload as { request_id: string }).request_id)).toEqual(['stranded-two']);
     expect(card('stranded-one')).not.toBeNull();
     const reopened = f.ledger.recoveryObligation(f.intent.jobId, 'directive', 'stranded-two')!;
     expect(reopened.generation).toBeGreaterThan(second.generation); expect(f.ledger.getObligation(second.id)?.state).toBe('closed');

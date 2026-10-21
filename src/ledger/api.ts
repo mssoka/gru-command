@@ -9510,7 +9510,7 @@ export class LedgerApi {
       // The old card names the consumed generation and advises a successor
       // the retired request can no longer take. An open reopened debt reaches
       // Gru through the obligation mailbox; a suspended one does not, so its
-      // card stays as the pointer until the debt is resumed.
+      // card stays as the only pointer to the debt (read its generation back).
       const card = this.findNotificationByKind(`silas.directive-unreconciled.${requestId}`, 'active');
       if (reopenedDebt.state !== 'suspended' && card?.routing === 'action-required') this.resolveNotificationById(card.id, 'directive-recovery-reopened');
       reopened += 1;
@@ -9522,15 +9522,17 @@ export class LedgerApi {
    * unadmitted before the terminal-transition hook existed. Idempotent. Each
    * successor repairs in its own transaction; one that refuses is reported
    * by name and never blocks the others or the service start. */
-  reopenStrandedRecoveryDebts(): { readonly reopened: number; readonly failures: readonly { readonly successorId: string; readonly error: string }[] } {
-    const successors = (this.db.prepare(`SELECT DISTINCT s.request_id FROM pending_directives p
+  reopenStrandedRecoveryDebts(): { readonly reopened: number; readonly failures: readonly {
+    readonly jobId: string; readonly predecessorId: string; readonly successorId: string; readonly error: string }[] } {
+    const rows = this.db.prepare(`SELECT DISTINCT p.job_id, p.request_id AS predecessor_id, s.request_id AS successor_id FROM pending_directives p
       JOIN pending_directives s ON s.request_id = json_extract(p.recovery_decision, '$.successorId')
-      WHERE s.admission_seq IS NULL AND s.state IN ('failed', 'retired')`).all() as Row[]).map((row) => str(row.request_id));
+      WHERE s.admission_seq IS NULL AND s.state IN ('failed', 'retired') ORDER BY p.rowid`).all() as Row[];
     let reopened = 0;
-    const failures: { readonly successorId: string; readonly error: string }[] = [];
-    for (const successorId of successors) {
+    const failures: { readonly jobId: string; readonly predecessorId: string; readonly successorId: string; readonly error: string }[] = [];
+    for (const row of rows) {
+      const successorId = str(row.successor_id);
       try { reopened += this.transaction(() => this.reopenStrandedRecoveryDebt(this.getDirective(successorId) as DirectiveRequestRecord)); }
-      catch (error) { failures.push({ successorId, error: String(error) }); }
+      catch (error) { failures.push({ jobId: str(row.job_id), predecessorId: str(row.predecessor_id), successorId, error: String(error) }); }
     }
     return { reopened, failures };
   }
