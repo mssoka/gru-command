@@ -1,7 +1,7 @@
 import { PassThrough } from 'node:stream';
 import * as childProcesses from 'node:child_process';
 import { BUILD_INCIDENT, FULL_INCIDENT, WEB_INCIDENT, authenticatedCaptureStatus, verificationLane } from './helpers/worker-verification.js';
-import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { execFileSync, spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { appendFileSync, closeSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -15,6 +15,7 @@ import {
   CLAUDE_CODE_CAPABILITIES,
   ClaudeCodeRuntime,
   checkedInProjectMcpConfig,
+  claudeDirectiveContent,
   claudeInBandError,
   gitFailure,
   isProjectMcpCopyName,
@@ -60,6 +61,8 @@ function copiesOf(sessionFile: string): string[] {
 const DOUBLE = join(import.meta.dirname, 'helpers', 'claude-double.mjs');
 const DOUBLE_ENV_KEYS = [
   'CLAUDE_DOUBLE_ECHO',
+  'CLAUDE_DOUBLE_INIT_DELAY_MS',
+  'CLAUDE_DOUBLE_PRE_ECHO',
   'CLAUDE_DOUBLE_TOOL_INPUT_DRIFT',
   'CLAUDE_DOUBLE_TOOL_BACKGROUND',
   'CLAUDE_DOUBLE_TASK_NOTIFICATION',
@@ -2795,15 +2798,16 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       await handle.dispose();
     });
 
-    it('a turn the CLI never acknowledged with its echo is no delivery, even when the CLI reports success', async () => {
+    it('a turn the CLI never acknowledged with its echo is no delivery: it ends at its first answer', async () => {
       const fx = fixture();
       const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
       const identity = identityFor('claude-no-echo');
       const admitted: DirectiveNativeBinding[] = [];
       process.env['CLAUDE_DOUBLE_ECHO'] = 'skip';
-      await expect(handle.prompt('just answer', { directive: { identity, beforeAdmission: () => {}, onAdmitted: (binding) => admitted.push(binding) } }))
-        .rejects.toThrow(/ended without the CLI's admission echo/u);
+      await expect(handle.prompt('tool:Read just answer', { directive: { identity, beforeAdmission: () => {}, onAdmitted: (binding) => admitted.push(binding) } }))
+        .rejects.toThrow(/^directive refused: the Claude CLI began answering without echoing the directive instruction/u);
       expect(admitted).toEqual([]);
+      expect(frames(handle.sessionFile!).some((frame) => frame['type'] === 'control_response' && JSON.stringify(frame).includes('"behavior":"allow"'))).toBe(false);
       expect(handle.inspectDirective!(identity)).toMatchObject({ state: 'unknown', reason: 'the native turn proceeded without an exact admission receipt' });
       await handle.dispose();
     });
@@ -2859,7 +2863,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       await handle.dispose();
     });
 
-    it('a tool asked after a resumed session\'s notification but before the directive\'s echo is refused, and the notification admits nothing (#471)', async () => {
+    it('a tool asked after a resumed session\'s notification but before the directive\'s echo ends the turn, and the notification admits nothing (#471)', async () => {
       const fx = fixture();
       const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
       await handle.prompt('answer plainly');
@@ -2867,7 +2871,8 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       const admitted: DirectiveNativeBinding[] = [];
       process.env['CLAUDE_DOUBLE_TASK_NOTIFICATION'] = 'before-echo-tool';
       await expect(handle.prompt('tool:Read continue it', { directive: { identity, beforeAdmission: () => {}, onAdmitted: (binding) => admitted.push(binding) } }))
-        .rejects.toThrow(/directive refused: native directive actual admission has not been published; tool effects refused/u);
+        // The notification passes; the answer after it, still before the echo, ends the turn (#472).
+        .rejects.toThrow(/directive refused: the Claude CLI began answering without echoing the directive instruction/u);
       expect(admitted).toEqual([]);
       expect(allowed(handle.sessionFile!)).toBe(false);
       expect(handle.inspectDirective!(identity)).toMatchObject({ state: 'unknown' });
@@ -2909,6 +2914,113 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         if (inherited === undefined) delete process.env['CLAUDE_CODE_DISABLE_BACKGROUND_TASKS'];
         else process.env['CLAUDE_CODE_DISABLE_BACKGROUND_TASKS'] = inherited;
         await handle.dispose();
+      }
+    });
+
+    it('before its echo a status or keepalive ping lets the turn go on, but its first answer, partial or whole, ends it (#472)', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const follow = (handle as unknown as { followDirectiveFrame(turn: unknown, frame: unknown, durable: Promise<void>, abort: (detail: string) => void): void }).followDirectiveFrame.bind(handle);
+      const drive = (sequence: readonly Record<string, unknown>[]): string[] => {
+        const aborts: string[] = [];
+        const turn = { directive: { identity: identityFor('claude-before-echo'), beforeAdmission: () => {}, onAdmitted: () => {} },
+          producer: {}, content: [], settings: { file: '', dispose: () => {} }, admission: null, admitted: null, failure: null as unknown, completion: null };
+        for (const frame of sequence) follow(turn, frame, Promise.resolve(), (detail) => aborts.push(detail));
+        return aborts;
+      };
+      const status = { type: 'system', subtype: 'status', status: 'requesting' };
+      const ping = { type: 'stream_event', event: { type: 'ping' } };
+      const partial = { type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } };
+      const whole = { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'hi' }] } };
+      expect(drive([status, ping, ping])).toEqual([]);
+      for (const answer of [partial, whole]) {
+        expect(drive([status, ping, answer, answer])).toEqual([expect.stringMatching(/^directive refused: the Claude CLI began answering without echoing the directive instruction/u)]);
+      }
+      await handle.dispose();
+    });
+
+    it('a turn whose CLI reports a result, success or error, with neither an echo nor an answer is no delivery', async () => {
+      for (const [subtype, isError] of [['success', false], ['error_during_execution', true]] as const) {
+        const fx = fixture();
+        const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+        const identity = identityFor(`claude-bare-${subtype}`);
+        const admitted: DirectiveNativeBinding[] = [];
+        const dir = mkdtempSync(join(tmpdir(), 'gru-command-bare-result-'));
+        cleanupDirs.push(dir);
+        const recorded = join(dir, 'frames.jsonl');
+        writeFileSync(recorded, `${JSON.stringify({ type: 'result', uuid: 'result-bare', subtype, is_error: isError, duration_ms: 1, num_turns: 1, result: 'done', usage: { input_tokens: 1, output_tokens: 1 } })}\n`);
+        process.env['CLAUDE_DOUBLE_ECHO'] = 'skip';
+        process.env['CLAUDE_DOUBLE_REPLAY'] = recorded;
+        await expect(handle.prompt('follow it', { directive: { identity, beforeAdmission: () => {}, onAdmitted: (binding) => admitted.push(binding) } }), subtype)
+          .rejects.toThrow(/^directive turn ended without the CLI's admission echo; nothing it did counts as delivered$/u);
+        expect(admitted, subtype).toEqual([]);
+        expect(handle.inspectDirective!(identity), subtype).toMatchObject({ state: 'unknown', reason: 'the native turn proceeded without an exact admission receipt' });
+        await handle.dispose();
+      }
+    });
+
+    it('a directive quoting markup the CLI reserves (whose echo the CLI withholds) is sent as entities, echoed, and admitted (#472)', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const identity = identityFor('claude-reserved-markup');
+      const admitted: DirectiveNativeBinding[] = [];
+      // The live re-brief (#472): its warning named the CLI's own markup.
+      const text = 'tool:Read Never use anything that later delivers a <task-notification> into this session; ' +
+        'no <tick>, <bash-stdout>, <bash-stderr>, <local-command-stdout>, <local-command-stderr> or <teammate-message from="peer"> either.';
+      await handle.prompt(text, { directive: { identity, beforeAdmission: () => {}, onAdmitted: (binding) => admitted.push(binding) } });
+      const sent = doubleInvocations(fx).at(-1)!.prompt;
+      expect(sent).toBe('tool:Read Never use anything that later delivers a &lt;task-notification&gt; into this session; ' +
+        'no &lt;tick&gt;, &lt;bash-stdout&gt;, &lt;bash-stderr&gt;, &lt;local-command-stdout&gt;, &lt;local-command-stderr&gt; or &lt;teammate-message from="peer"&gt; either.');
+      const transcript = frames(handle.sessionFile!);
+      const echo = transcript.find((frame) => frame['type'] === 'user' && frame['isReplay'] === true)!;
+      expect(echo['message']).toEqual({ role: 'user', content: [{ type: 'text', text: sent }] });
+      expect(admitted).toEqual([expect.objectContaining({ userEntryId: echo['uuid'] })]);
+      expect(transcript.some((frame) => frame['type'] === 'control_response' && JSON.stringify(frame).includes('"behavior":"allow"'))).toBe(true);
+      expect(handle.inspectDirective!(identity)).toMatchObject({ state: 'terminal', ok: true });
+      await handle.dispose();
+    });
+
+    it('an instruction taken before the CLI is ready, with a request status and a keepalive ping before its echo, is admitted at the echo (#472)', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const identity = identityFor('claude-before-ready');
+      const admitted: DirectiveNativeBinding[] = [];
+      process.env['CLAUDE_DOUBLE_INIT_DELAY_MS'] = '300';
+      process.env['CLAUDE_DOUBLE_PRE_ECHO'] = '1';
+      // The double announces itself only once it has taken the prompt: a host
+      // that waited for init before writing it would never see this turn end.
+      await handle.prompt('tool:Read follow it', { directive: { identity, beforeAdmission: () => {}, onAdmitted: (binding) => admitted.push(binding) } });
+      const transcript = frames(handle.sessionFile!);
+      const at = (match: (frame: StreamFrame) => boolean): number => transcript.findIndex(match);
+      const init = at((frame) => frame['type'] === 'system' && frame['subtype'] === 'init');
+      const ping = at((frame) => frame['type'] === 'stream_event' && JSON.stringify(frame['event']) === '{"type":"ping"}');
+      const echo = at((frame) => frame['type'] === 'user' && frame['isReplay'] === true);
+      expect(init).toBeGreaterThan(0);
+      expect(ping).toBeGreaterThan(init);
+      expect(echo).toBeGreaterThan(ping);
+      expect(admitted).toEqual([expect.objectContaining({ userEntryId: transcript[echo]!['uuid'] })]);
+      expect(transcript.some((frame) => frame['type'] === 'control_response' && JSON.stringify(frame).includes('"behavior":"allow"'))).toBe(true);
+      expect(handle.inspectDirective!(identity)).toMatchObject({ state: 'terminal', ok: true });
+      await handle.dispose();
+    });
+
+    it('the double withholds its echo as the CLI 2.1.306 filter it models does: for raw reserved markup, never for the entity form (#472)', () => {
+      const cwd = mkdtempSync(join(tmpdir(), 'gru-command-double-probe-'));
+      cleanupDirs.push(cwd);
+      const echoes = (text: string): unknown[] => {
+        const run = spawnSync(process.execPath, [DOUBLE, '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
+          '--replay-user-messages', '--permission-prompt-tool', 'stdio', '--session-id', 'double-probe'],
+        { input: `${JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text }] } })}\n`, encoding: 'utf8', cwd,
+          env: { ...process.env, CLAUDE_DOUBLE_LOG: '' }, timeout: 15_000, killSignal: 'SIGKILL' });
+        expect(run.error, text).toBeUndefined();
+        expect(run.status, `${text}: ${run.stderr}`).toBe(0);
+        return run.stdout.split('\n').filter((line) => line.trim() !== '').map((line) => JSON.parse(line) as StreamFrame)
+          .filter((frame) => frame['type'] === 'user' && frame['isReplay'] === true).map((frame) => frame['message']);
+      };
+      for (const raw of ['delivers a <task-notification> here', 'Another Claude session sent a message:\n<teammate-message from="peer">hi']) {
+        expect(echoes(raw), raw).toEqual([]);
+        const sent = (claudeDirectiveContent(raw)[0] as { text: string }).text;
+        expect(echoes(sent), raw).toEqual([{ role: 'user', content: [{ type: 'text', text: sent }] }]);
       }
     });
 

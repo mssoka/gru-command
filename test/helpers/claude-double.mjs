@@ -30,7 +30,8 @@
  *   "tool-error:<name>" — the same loop whose tool_result is an error
  *
  * With --replay-user-messages (a directive turn, #424) the double echoes the
- * prompt after init (`isReplay: true`, a uuid) and echoes every
+ * prompt after init (`isReplay: true`, a uuid) — unless its text holds markup
+ * the real CLI reserves, which that CLI never echoes (#472) — and echoes every
  * control_response the host writes; with --permission-prompt-tool stdio and a
  * --settings `permissions.ask` naming the tool, every tool_use asks the host
  * (can_use_tool) after its assistant frame and honours the decision.
@@ -63,6 +64,8 @@
  *                               file's recorded stream-json frames (session id
  *                               re-stamped), e.g. test/fixtures/claude-stream/
  *   CLAUDE_DOUBLE_ECHO=mutate|skip  the prompt echo carries other text, or never comes
+ *   CLAUDE_DOUBLE_INIT_DELAY_MS=<ms> wait this long after taking the prompt before init
+ *   CLAUDE_DOUBLE_PRE_ECHO=1    a request status and a keepalive ping between init and the echo
  *   CLAUDE_DOUBLE_TOOL_INPUT_DRIFT=1 the permission request names other input than the tool_use
  *   CLAUDE_DOUBLE_TOOL_BACKGROUND=1|string|string-false  the tool_use carries
  *                               run_in_background: true, or the string "true" or
@@ -333,11 +336,20 @@ async function emitToolTurn(toolName, toolError = false) {
   await emitTextTurn(denied ? 'tool refused' : 'tool done');
 }
 
+/** Claude Code 2.1.306's replay filter (#472): a user message whose text holds
+ * markup the CLI reserves for itself is taken, but never echoed. */
+function replayWithheld(content) {
+  const text = (typeof content === 'string' ? content : content.filter((block) => block?.type === 'text').map((block) => block.text).join('\n')).trim();
+  return ['task-notification', 'tick', 'bash-stdout', 'bash-stderr', 'local-command-stdout', 'local-command-stderr'].some((tag) => text.includes(`<${tag}>`)) ||
+    text.startsWith('<teammate-message ') ||
+    text.startsWith('Another Claude session sent a message') && text.startsWith('<teammate-message ', text.indexOf('\n') + 1);
+}
+
 /** The CLI's own echo of the prompt it accepted (--replay-user-messages). */
 function echoPrompt() {
   if (!replay || process.env.CLAUDE_DOUBLE_ECHO === 'skip') return;
   const frame = stdinText.split('\n').filter((line) => line.trim() !== '').map((line) => JSON.parse(line)).find((entry) => entry.type === 'user');
-  if (frame === undefined) return;
+  if (frame === undefined || replayWithheld(frame.message.content)) return;
   const message = process.env.CLAUDE_DOUBLE_ECHO === 'mutate'
     ? { ...frame.message, content: [{ type: 'text', text: 'not what the host sent' }] }
     : frame.message;
@@ -476,7 +488,16 @@ async function run() {
     delete init.session_id;
     out(init);
   } else {
+    // A CLI still starting up (hooks, plugins) has already taken its prompt.
+    const initDelayMs = Number(process.env['CLAUDE_DOUBLE_INIT_DELAY_MS'] ?? '0');
+    if (Number.isFinite(initDelayMs) && initDelayMs > 0) await delay(initDelayMs);
     out(initFrame());
+    if (process.env['CLAUDE_DOUBLE_PRE_ECHO'] === '1') {
+      // What the real CLI may write before its echo: the request status, and
+      // the keepalive ping it streams while that request stalls.
+      out({ type: 'system', subtype: 'status', status: 'requesting', session_id: sessionId, uuid: randomUUID() });
+      streamEvent({ type: 'ping' });
+    }
     const notified = process.env.CLAUDE_DOUBLE_TASK_NOTIFICATION;
     // Hypothetical orderings: CLI 2.1.306 was not seen replaying a dead turn's
     // notifications on --resume (its resumed turn echoed nothing at all, #472).

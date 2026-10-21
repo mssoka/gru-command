@@ -82,6 +82,7 @@ import {
   type DirectiveNativeBinding,
   type DirectiveProducer,
   type DirectiveTurnIdentity,
+  claudeAnswerFrame,
 } from './directive-checkpoint.js';
 import { ClaudeDirectivePermissionChannel, privateClaudeDirectiveSettings, type ClaudeToolDecision, type ClaudeToolRequest } from './claude-directive.js';
 import { resolveGitCommit } from '../dispatch/perkins-review/artifacts.js';
@@ -992,10 +993,24 @@ function claudeHeaderOf(head: string): { readonly id: string; readonly cwd: stri
   }
 }
 
+/**
+ * The opening tags the Claude CLI reserves for its own user frames (#472). Its
+ * --replay-user-messages never echoes a user message whose text holds one of
+ * the first six, or starts with a teammate message — read from Claude Code
+ * 2.1.306's replay filter. A directive quoting one (a re-brief warning against
+ * `<task-notification>`) would never be admitted. `<teammate-message ` (a space
+ * after the name, as the CLI checks) is matched wherever it stands, through the
+ * next `>` on its line unless a `<` comes first. A later CLI that reserves more
+ * fails loud at the turn's first answer, never silently.
+ */
+const CLAUDE_RESERVED_TAG = /<(?:task-notification|tick|bash-stdout|bash-stderr|local-command-stdout|local-command-stderr)>|<teammate-message [^<>\n]*>?/gu;
+
 /** A directive's exact user content (#424): always an array, text only, so
- * the CLI's echo binds it byte for byte. */
+ * the CLI's echo binds it byte for byte. Only the reserved opening tags are
+ * written as entities (#472); the CLI echoes those, and the rest of the text
+ * reaches the model as written. */
 export function claudeDirectiveContent(text: string): readonly StreamFrame[] {
-  return [{ type: 'text', text }];
+  return [{ type: 'text', text: text.replace(CLAUDE_RESERVED_TAG, (tag) => tag.replaceAll('<', '&lt;').replaceAll('>', '&gt;')) }];
 }
 
 /** The stdin user frame for one prompt (image blocks first, then text). */
@@ -1925,6 +1940,12 @@ export class ClaudeCodeHandle implements AgentHandle {
         directive.onAdmitted(binding);
         turn.admitted = binding;
       }).catch((error: unknown) => this.failDirective(turn, error, abortTurn));
+      return;
+    }
+    // Before its echo the turn may only announce itself (the checkpoint's own
+    // rule): an answer first can never be admitted, so it ends here (#472).
+    if (turn.admission === null && turn.failure === null && claudeAnswerFrame(frame)) {
+      this.failDirective(turn, new DirectiveCheckpointError('the Claude CLI began answering without echoing the directive instruction (--replay-user-messages), so its admission cannot be proven; look for markup in it that this CLI reserves for its own frames'), abortTurn);
       return;
     }
     if (frame['type'] === 'result' && frame['subtype'] === 'success' && frame['is_error'] === false) {
