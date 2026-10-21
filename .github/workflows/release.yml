@@ -22,7 +22,7 @@ jobs:
         with:
           node-version: '22'
 
-      # The board's deploy chip and `gru-service version` read the build's
+      # The board's deploy chip and `gru version` read the build's
       # package version; a tag that disagrees makes every update message
       # lie. Prereleases are not releases here — skip them, don't fail.
       - name: Verify the tag names the packaged version

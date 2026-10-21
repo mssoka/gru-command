@@ -16,6 +16,16 @@ import type { DeployDriftView } from '../board/deploy-drift.js';
 /** Run the deploy clone's install.sh with these flags; its exit code. */
 export type InstallerRunner = (args: readonly string[]) => number;
 
+/** The caller's directory, or null when it was deleted under them (an agent
+ * shell left in a reclaimed lane): install.sh then names absolute paths. */
+export function callerDirectory(cwd: () => string = () => process.cwd()): string | null {
+  try {
+    return cwd();
+  } catch {
+    return null;
+  }
+}
+
 export function installerRunnerFor(packageRoot: string): InstallerRunner {
   return (args) => {
     const script = join(packageRoot, 'install.sh');
@@ -27,11 +37,12 @@ export function installerRunnerFor(packageRoot: string): InstallerRunner {
     // node this command runs on (GRU_COMMAND_NODE) stands in only when the
     // shell has none or one below the minimum. Run from the checkout, so a
     // version manager never picks a node from the caller's directory.
+    const launchPwd = callerDirectory();
     const result = spawnSync('bash', [script, ...args], {
       cwd: packageRoot,
       stdio: 'inherit',
       // The caller's directory, for hints install.sh prints to them.
-      env: { ...process.env, GRU_COMMAND_NODE: process.execPath, GRU_COMMAND_LAUNCH_PWD: process.cwd() },
+      env: { ...process.env, GRU_COMMAND_NODE: process.execPath, ...(launchPwd === null ? {} : { GRU_COMMAND_LAUNCH_PWD: launchPwd }) },
     });
     if (result.error !== undefined) {
       process.stderr.write(`gru: could not run ${script}: ${result.error.message}\n`);

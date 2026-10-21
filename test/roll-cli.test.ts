@@ -294,7 +294,7 @@ describe('gru roll follow loop', () => {
       polls: [jsonResponse(200, { roll: rollState('preflight') }), jsonResponse(200, { roll: rollState('drain') })],
     });
     expect(await runServiceCli(['roll', '--detach'], h.deps)).toBe(0);
-    expect(h.stdout.join('\n')).toContain('roll roll-cli-1 passed preflight; the service relaunches once its drain settles');
+    expect(h.stdout.join('\n')).toContain('roll roll-cli-1 passed preflight; the service relaunches once its drain settles, unless the roll fails later');
     expect(h.requests.some((url) => url.endsWith('/health'))).toBe(false);
     const failed = { ...rollState('failed'), error: { phase: 'preflight' as const, detail: 'refusing to roll a dirty deploy clone' } };
     const refused = await harness({
@@ -304,6 +304,28 @@ describe('gru roll follow loop', () => {
     expect(await runServiceCli(['restart', '--detach'], refused.deps)).toBe(1);
     expect(refused.stdout.join('\n')).toContain('refusing to roll a dirty deploy clone');
     expect(parseServiceArgs(['roll', '--detach', '--no-wait']).ok).toBe(false);
+  });
+
+  it('--detach answers only for its own roll, says so on a deadline, and emits a detached JSON event', async () => {
+    const replaced = await harness({
+      post: jsonResponse(202, { status: 'accepted', roll: rollState('preflight') }),
+      polls: [jsonResponse(200, { roll: { ...rollState('drain'), rollId: 'someone-elses-roll' } })],
+    });
+    expect(await runServiceCli(['roll', '--detach'], replaced.deps)).toBe(1);
+    expect(replaced.stderr.join('\n')).toContain('roll roll-cli-1 was replaced by roll someone-elses-roll before it passed preflight');
+    const slow = await harness({
+      post: jsonResponse(202, { status: 'accepted', roll: rollState('preflight') }),
+      polls: [jsonResponse(200, { roll: rollState('preflight') })],
+    });
+    expect(await runServiceCli(['roll', '--detach', '--timeout-ms', '5000'], slow.deps)).toBe(1);
+    expect(slow.stderr.join('\n')).toContain('is still in preflight after 5000 ms; it continues on the service');
+    expect(slow.stderr.join('\n')).not.toContain('bail:');
+    const json = await harness({
+      post: jsonResponse(202, { status: 'accepted', roll: rollState('preflight') }),
+      polls: [jsonResponse(200, { roll: rollState('drain') })],
+    });
+    expect(await runServiceCli(['roll', '--detach', '--json'], json.deps)).toBe(0);
+    expect(JSON.parse(json.stdout.at(-1)!)).toMatchObject({ event: 'detached', roll: { phase: 'drain', rollId: 'roll-cli-1' } });
   });
 
   it('a done record whose /health sha never matches times out non-zero with the bail hint', async () => {

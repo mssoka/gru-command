@@ -987,6 +987,18 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(existsSync(seam.unit)).toBe(false);
   }, 400_000);
 
+  it.skipIf(!ptyCapable)('run the way gru runs it (from the checkout, the caller\'s directory handed over), the declined hint is still absolute (#463)', () => {
+    const { home, target, instance, seam } = stageConfiguredAbsentUnit();
+    const elsewhere = tempDir('gru-command-hint-launch-pwd-');
+    const launcher = writeLauncher({
+      home, instance, seam, cwd: target, command: 'exec bash ./install.sh',
+      extraExports: { GRU_COMMAND_LAUNCH_PWD: elsewhere },
+    });
+    const output = ptyRun(launcher, 'n\\r');
+    expect(output).toMatch(/no service installed or running — \/\S+\/gru-command\/install\.sh --service registers it later/);
+    expect(output).not.toContain('— ./install.sh --service');
+  }, 400_000);
+
   it.skipIf(!ptyCapable)('prompt_register_service leaves a caller-held fd 3 intact (#36)', () => {
     const home = tempDir('gru-command-fd3-');
     const keep = join(home, 'fd3-keep.txt');
@@ -1135,7 +1147,7 @@ describe('install.sh setup mode (one-line path)', () => {
       encoding: 'utf-8',
     });
     expect(stdout).toContain("delegating the restart to 'gru roll --detach'");
-    expect(stdout).toContain('the service relaunches itself once its drain settles; check it afterwards with: gru status');
+    expect(stdout).toContain('the service relaunches itself once its drain settles, unless the roll fails later; check it with gru status and gru logs');
     // Through preflight only: the relaunch ends this shell with the service.
     expect(readFileSync(rollLog, 'utf-8')).toBe('argv:roll --detach\n');
     const calls = existsSync(managerLog) ? readFileSync(managerLog, 'utf-8') : '';
@@ -1143,6 +1155,53 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(calls).not.toMatch(/^load/m);
     expect(calls).not.toContain('daemon-reload');
     expect(calls).not.toContain('restart gru-command');
+  });
+
+  it('an in-service roll the service refuses fails the update, named, and never claims a relaunch (#463)', async () => {
+    // Function-level pin for the delegation branch: the in-service process
+    // group IS detected (fake manager reports our own pgid), the unit IS
+    // owned, and the served restart must be the roll CLI — never the unit
+    // lifecycle calls. Ownership itself is covered by its own tests; this
+    // exercises the branch on every pty-less machine (Linux CI included).
+    const home = tempDir('gru-command-in-service-fn-');
+    const instance = join(home, '.gru-command');
+    const { manager, managerLog } = inServiceManagerSeam(home);
+    const rollLog = join(home, 'roll.log');
+    const repoRoot = tempDir('gru-command-in-service-repo-');
+    const installScript = join(import.meta.dirname, '..', 'install.sh');
+    mkdirSync(join(repoRoot, 'dist', 'cli'), { recursive: true });
+    writeFileSync(
+      join(repoRoot, 'dist', 'cli', 'service.js'),
+      [
+        '#!/usr/bin/env node',
+        "require('node:fs').appendFileSync(process.env.GRU_ROLL_LOG, `argv:${process.argv.slice(2).join(' ')}\n`);",
+        'process.exit(1);',
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+    const script = [
+      `REPO_ROOT=${shellQuote(repoRoot)}`,
+      'set -euo pipefail',
+      'err() { echo "install.sh: $*" >&2; }',
+      `OS=${process.platform === 'darwin' ? 'darwin' : 'linux'}`,
+      `LABEL=com.gru-command.service`,
+      `INSTANCE_DIR=${shellQuote(instance)}`,
+      `NODE_BIN=${shellQuote(process.execPath)}`,
+      `LAUNCHCTL_BIN=${shellQuote(manager)}`,
+      `SYSTEMCTL_BIN=${shellQuote(manager)}`,
+      `GRU_MANAGER_LOG=${shellQuote(managerLog)}`,
+      `GRU_ROLL_LOG=${shellQuote(rollLog)}`,
+      `export GRU_MANAGER_LOG GRU_ROLL_LOG`,
+      `eval "$(sed -n '/^managed_service_pid()/,/^}/p' ${shellQuote(installScript)}; sed -n '/^inside_managed_service_pgroup()/,/^}/p' ${shellQuote(installScript)}; sed -n '/^restart_owned_service_in_service()/,/^}/p' ${shellQuote(installScript)}; sed -n '/^install_service()/,/^}/p' ${shellQuote(installScript)}; sed -n '/^restart_owned_service()/,/^}/p' ${shellQuote(installScript)})"`,
+      `restart_owned_service`,
+      '',
+    ].join('\n');
+    const result = spawnSync('bash', ['-c', script], { env: { ...process.env, HOME: home }, encoding: 'utf-8' });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('the service refused the roll: the new build is on disk but the service still runs the old one');
+    expect(result.stdout).not.toContain('relaunches itself');
+    expect(readFileSync(rollLog, 'utf-8')).toBe('argv:roll --detach\n');
   });
 
   it.skipIf(!ptyCapable)('in-service pty update (absent unit): no prompt hang — auto-registers with a notice', () => {

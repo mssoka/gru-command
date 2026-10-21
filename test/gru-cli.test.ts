@@ -6,7 +6,7 @@ import { loadConfig, type GruCommandConfig } from '../src/config.js';
 import type { BuildInfo } from '../src/build-info.js';
 import type { DeployDriftView } from '../src/board/deploy-drift.js';
 import { runServiceCli, type ServiceCliDeps } from '../src/cli/service.js';
-import { deployLine, formatUptime, installerRunnerFor } from '../src/cli/operator.js';
+import { callerDirectory, deployLine, formatUptime, installerRunnerFor } from '../src/cli/operator.js';
 
 /**
  * The `gru` operator subcommands (#463) beyond the roll itself: update,
@@ -144,6 +144,11 @@ describe('gru update / stop / start / restart --now hand off to install.sh', () 
     expect(h.installer).toEqual([]);
     expect(h.tails).toEqual([]);
     expect(h.stderr.filter((line) => line.startsWith('usage: gru <command>'))).toHaveLength(6);
+  });
+
+  it('a caller directory deleted under the shell is no crash: install.sh just gets none', () => {
+    expect(callerDirectory(() => '/somewhere')).toBe('/somewhere');
+    expect(callerDirectory(() => { throw Object.assign(new Error('ENOENT: no such file or directory, uv_cwd'), { code: 'ENOENT' }); })).toBeNull();
   });
 
   it('a package root without install.sh is a named refusal, not a crash', () => {

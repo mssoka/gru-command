@@ -1124,7 +1124,8 @@ non-interactive shell can drive safely by hand. Two triggers, one state
 machine:
 
 - `gru roll` (CLI; `dist/cli/service.js`, also the `gru` / `gru-service`
-  bin) — wait mode follows the roll to verified completion.
+  bin) — wait mode follows the roll to verified completion; `--detach`
+  follows it through preflight only, for a caller inside the service.
 - `POST /api/roll` (operator-guarded, pairing token).
 
 A roll has a mode. `update` (the default) is the path below. `restart`

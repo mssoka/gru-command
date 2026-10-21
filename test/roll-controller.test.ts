@@ -307,6 +307,7 @@ describe('roll controller drain + swap', () => {
     const failed = await noStamp.controller.roll({ mode: 'restart' });
     expect(failed.phase).toBe('failed');
     expect(failed.error?.detail).toContain('no build stamp');
+    expect(failed.error?.detail).toContain(`build it with ${join(unstamped.repoRoot, 'install.sh')} --update`);
     expect(readRollMarker(unstamped.dataDir)).toBeNull();
 
     const partial = fixture();
@@ -316,6 +317,7 @@ describe('roll controller drain + swap', () => {
     const missing = await incomplete.controller.roll({ mode: 'restart' });
     expect(missing.phase).toBe('failed');
     expect(missing.error?.detail).toContain('dist/main.js is missing');
+    expect(missing.error?.detail).toContain(`rebuild with ${join(partial.repoRoot, 'install.sh')} --update`);
 
     const moving = fixture();
     stampBuild(moving.repoRoot, SHA_C);

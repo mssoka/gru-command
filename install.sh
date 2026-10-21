@@ -151,24 +151,32 @@ node_ok() {
 select_node_bin() {
   local resolved
   NODE_BIN="$(command -v node || true)"
+  BUILD_NODE_DIR=""
   if [[ -n "$NODE_BIN" ]]; then
     # Resolve the executable symlink too, not just its parent directory:
     # fnm's per-shell bin can disappear after the installing shell exits.
     resolved="$("$NODE_BIN" -p 'require("node:fs").realpathSync(process.execPath)' 2>/dev/null || true)"
     [[ -n "$resolved" && -x "$resolved" ]] && NODE_BIN="$resolved"
   fi
-  if [[ -n "${GRU_COMMAND_NODE:-}" && -x "$GRU_COMMAND_NODE" ]] && { [[ -z "$NODE_BIN" ]] || ! node_ok; }; then
+  if [[ "${GRU_COMMAND_NODE:-}" == /* && -x "$GRU_COMMAND_NODE" ]] && { [[ -z "$NODE_BIN" ]] || ! node_ok; }; then
     NODE_BIN="$GRU_COMMAND_NODE"
-    # npm and the build's own `node` steps resolve through PATH: this
-    # install's directory (npm lives beside Node) comes first for them too.
-    PATH="${NODE_BIN%/*}:$PATH"
-    export PATH
+    # npm and the build's own `node` steps resolve through PATH: the build
+    # (and only the build) finds them beside this node — see with_build_path.
+    BUILD_NODE_DIR="${NODE_BIN%/*}"
   fi
+}
+
+# Run one build command with the chosen node's directory first on PATH when
+# that node was handed over (npm lives beside Node); everything else this
+# script looks up (python3, git, gru) keeps the caller's PATH.
+with_build_path() {
+  local -x PATH="${BUILD_NODE_DIR:+$BUILD_NODE_DIR:}$PATH"
+  "$@"
 }
 select_node_bin
 
 if [[ -z "$NODE_BIN" ]]; then
-  err "node was not found on PATH — install Node.js >= 22.19 first (https://nodejs.org)${GRU_COMMAND_NODE:+ (the node gru handed over, $GRU_COMMAND_NODE, is not executable)}"
+  err "node was not found on PATH — install Node.js >= 22.19 first (https://nodejs.org)${GRU_COMMAND_NODE:+ (the node gru handed over, $GRU_COMMAND_NODE, is missing, not executable or not an absolute path)}"
   exit 1
 fi
 
@@ -635,7 +643,7 @@ write_launcher() {
   printf '  printf %s %s >&2\n' "'gru: this install is not built; rebuild it (this also pulls main and restarts the service) with: %s\\n'" "$repair"
   printf '  exit 1\nfi\n'
   printf 'if [ ! -x %s ]; then\n' "$node"
-  printf '  printf %s %s %s >&2\n' "'gru: the Node.js it was installed with (%s) is gone; from a shell with a current Node.js run: %s\\n'" "$node" "$repair"
+  printf '  printf %s %s %s >&2\n' "'gru: the Node.js it was installed with (%s) is gone; from a shell with a current Node.js run (this also pulls main and restarts the service): %s\\n'" "$node" "$repair"
   printf '  exit 1\nfi\n'
   printf 'exec %s %s "$@"\n' "$node" "$cli"
 }
@@ -671,15 +679,12 @@ link_cli() {
         ;;
     esac
   fi
-  # Another `gru` ahead of ours on PATH, whenever it appeared, is reported.
-  case ":$PATH:" in
-    *":$BIN_DIR:"*)
-      found="$(command -v gru 2>/dev/null || true)"
-      if [[ -n "$found" && ! "$found" -ef "$launcher" ]]; then
-        err "another 'gru' comes first on your PATH: $found — run $launcher, or put $BIN_DIR earlier in PATH"
-      fi
-      ;;
-  esac
+  # Another `gru` the shell would run instead of ours, whenever it appeared
+  # (ahead of ours, or found while ours is off PATH), is reported.
+  found="$(command -v gru 2>/dev/null || true)"
+  if [[ -n "$found" && ! "$found" -ef "$launcher" ]]; then
+    err "your shell runs another 'gru': $found — run $launcher, or put $BIN_DIR earlier in PATH"
+  fi
 }
 
 unlink_cli() {
@@ -765,15 +770,15 @@ build_product() {
     # Reproducible and non-mutating: `npm install` can rewrite a stale root
     # package version in package-lock.json, making the managed checkout
     # dirty and causing the next safe update to refuse itself.
-    npm ci --no-audit --no-fund
+    with_build_path npm ci --no-audit --no-fund
   else
-    npm install --no-audit --no-fund
+    with_build_path npm install --no-audit --no-fund
   fi
   echo "building service and local CLIs…"
-  npm run build
+  with_build_path npm run build
   if "$NODE_BIN" -e "const p=require('./package.json'); process.exit(p.scripts?.['build:web'] ? 0 : 1)"; then
     echo "building web UI…"
-    npm run build:web
+    with_build_path npm run build:web
   fi
   for artifact in dist/main.js dist/wizard/main.js dist/cli/config-generate.js dist/runtime/review-mcp-server.mjs resources/perkins-code-review/policy.json tools/verify-perkins-resource.mjs; do
     if [[ ! -f "$artifact" ]]; then
@@ -865,8 +870,11 @@ restart_owned_service_in_service() {
   # relaunch ends it before it could verify anything, and waiting would only
   # sit out the drain, which counts this session's own turn.
   echo "update is running inside the managed service — delegating the restart to 'gru roll --detach'…"
-  "$NODE_BIN" "$cli" roll --detach
-  echo "the service relaunches itself once its drain settles; check it afterwards with: gru status"
+  if ! "$NODE_BIN" "$cli" roll --detach; then
+    err "the service refused the roll: the new build is on disk but the service still runs the old one — see the roll's error above, then run gru update again"
+    exit 1
+  fi
+  echo "the service relaunches itself once its drain settles, unless the roll fails later; check it with gru status and gru logs"
 }
 
 # Restart an OWNED installed unit (the owned arm of the updater).

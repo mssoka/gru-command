@@ -4,7 +4,7 @@
  * dist/build-rev.json. Reading git HEAD at boot would lie after a pull
  * without a rebuild — the deploy-drift card renders exactly this file.
  *
- * The package version is stamped too: `gru-service version` must report
+ * The package version is stamped too: `gru version` must report
  * the version the build actually shipped, not a newer package.json left
  * by a pull that was never rebuilt.
  *

@@ -301,7 +301,7 @@ gru status              # running build, installed build, how far behind main
 gru logs -f             # follow the service log
 gru version             # installed version + build SHA (offline; --json)
 gru reset               # with the service stopped: remove GC's lanes, empty the data dir, keep config.toml
-gru roll                # the self-roll gru update uses inside the service
+gru roll [--detach]     # the self-roll; inside the service use --detach (gru update does)
 ```
 
 `gru-service` is the same command under its older name. A `gru` already in

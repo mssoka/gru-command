@@ -30,7 +30,7 @@ import {
  *   gru stop | gru start           install.sh --stop / --start
  *   gru status [--json]            running build, installed build, drift
  *   gru logs [-f] [-n <lines>]     the service log
- *   gru roll [--no-wait] [--json] [--reason <text>] [--timeout-ms <n>]
+ *   gru roll [--no-wait | --detach] [--json] [--reason <text>] [--timeout-ms <n>]
  *   gru version [--json]           (offline: no service needed)
  *   gru --version                  (alias of version)
  *   gru reset [--yes] [--delete-branches] [--delete-refs]   (src/cli/reset.ts)
@@ -38,7 +38,8 @@ import {
  * The roll command asks the running service to roll itself (POST
  * /api/roll, operator-guarded with the pairing token) and — unless
  * --no-wait — follows the roll record until the relaunched service
- * reports the target build SHA on /health. An accepted roll always
+ * reports the target build SHA on /health; --detach follows it only through
+ * preflight (for a caller the relaunch would end). An accepted roll always
  * completes the service-side handoff even if this CLI is interrupted:
  * exit 75 signals the OS service manager to relaunch the unit. `restart`
  * is the same roll in restart mode: no pull and no build, so the service
@@ -401,9 +402,19 @@ export async function runServiceCli(
 
   // --- follow ------------------------------------------------------------
   const deadline = deps.now() + options.timeoutMs;
+  // --detach answers for exactly the roll it accepted (or attached to).
+  const followedId = state?.rollId ?? null;
   let lastPhase: string | null = null;
   let healthDeadline: number | null = null;
   for (;;) {
+    if (options.detach && followedId !== null && state !== null && state.rollId !== followedId) {
+      deps.stderr(`gru: roll ${followedId} was replaced by roll ${state.rollId} before it passed preflight; its outcome is unknown — check gru status and gru logs`);
+      return 1;
+    }
+    if (options.detach && deps.now() > deadline) {
+      deps.stderr(`gru: roll ${followedId ?? ''} is still in ${state?.phase ?? 'an unknown phase'} after ${options.timeoutMs} ms; it continues on the service — check gru status and gru logs`);
+      return 1;
+    }
     if (deps.now() > deadline) {
       deps.stderr(
         `gru: roll did not complete within ${options.timeoutMs} ms ` +
@@ -422,7 +433,7 @@ export async function runServiceCli(
     }
     if (options.detach && state !== null && state.phase !== 'preflight') {
       if (options.json) deps.stdout(JSON.stringify({ event: 'detached', roll: state }));
-      else deps.stdout(`roll ${state.rollId} passed preflight; the service relaunches once its drain settles (check it with gru status)`);
+      else deps.stdout(`roll ${state.rollId} passed preflight; the service relaunches once its drain settles, unless the roll fails later (check it with gru status and gru logs)`);
       return 0;
     }
     if (state !== null && state.phase === 'done') {

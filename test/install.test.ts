@@ -413,7 +413,7 @@ describe('the gru launcher (#463)', () => {
     const gru = () => spawnSync(join(bin, 'gru'), ['version'], { encoding: 'utf8' });
     expect(launcherShell({ ...vars, NODE_BIN: join(clone, 'gone', 'node') }, 'link_cli').status).toBe(0);
     expect(gru()).toMatchObject({ status: 1 });
-    expect(gru().stderr).toContain(`is gone; from a shell with a current Node.js run: ${repair}`);
+    expect(gru().stderr).toContain(`is gone; from a shell with a current Node.js run (this also pulls main and restarts the service): ${repair}`);
     expect(launcherShell(vars, 'link_cli').status).toBe(0);
     rmSync(join(clone, 'dist', 'cli', 'service.js'));
     expect(gru()).toMatchObject({ status: 1 });
@@ -447,7 +447,10 @@ describe('the gru launcher (#463)', () => {
     const shadowed = launcherShell(vars, 'link_cli', `${decoys}:${bin}:${process.env.PATH ?? ''}`);
     expect(shadowed.status).toBe(0);
     expect(shadowed.stdout).toBe('');
-    expect(shadowed.stderr).toContain(`another 'gru' comes first on your PATH: ${decoys}/gru`);
+    expect(shadowed.stderr).toContain(`your shell runs another 'gru': ${decoys}/gru`);
+    // Ours off PATH entirely while another gru is on it: typing gru runs that one, so say so.
+    const offPath = launcherShell(vars, 'link_cli', `${decoys}:${process.env.PATH ?? ''}`);
+    expect(offPath.stderr).toContain(`your shell runs another 'gru': ${decoys}/gru`);
   });
 
   it('an unchanged launcher that lost its exec bit is repaired; one already current needs no writable bin dir', () => {
@@ -489,11 +492,9 @@ describe('install.sh node selection (#463)', () => {
     expect(start).toBeGreaterThanOrEqual(0);
     return text.slice(start + 1, text.indexOf('\n}\n', start) + 2);
   }
-  /** install.sh's node_ok + select_node_bin, with PATH holding only `dir`:
-   * the node chosen, and the npm the build would then find (`|`-joined when asked). */
-  function selected(dir: string, gruNode?: string, withNpm = false): string {
-    const report = withNpm ? 'printf %s "$NODE_BIN|$(command -v npm)"' : 'printf %s "$NODE_BIN"';
-    const script = [functionSource('node_ok'), functionSource('select_node_bin'), 'select_node_bin', report].join('\n');
+  /** install.sh's node_ok + select_node_bin, with PATH holding only `dir`; `then` runs after. */
+  function selected(dir: string, gruNode?: string, then = 'printf %s "$NODE_BIN"'): string {
+    const script = [functionSource('node_ok'), functionSource('select_node_bin'), functionSource('with_build_path'), 'select_node_bin', then].join('\n');
     return spawnSync(bash, ['-c', script], {
       encoding: 'utf8',
       env: { PATH: dir, ...(gruNode === undefined ? {} : { GRU_COMMAND_NODE: gruNode }) },
@@ -517,19 +518,41 @@ describe('install.sh node selection (#463)', () => {
     expect(selected(old)).toBe(join(old, 'node'));
     // A current shell node wins over the handed-over one (a Node upgrade is picked up).
     expect(selected(current, join(old, 'node'))).toBe(realpathSync(process.execPath));
-    // A handed-over node that is not executable is no fallback.
+    // A handed-over node that is missing, or not an absolute path, is no fallback.
     expect(selected(none, join(root, 'missing', 'node'))).toBe('');
+    expect(selected(none, 'node')).toBe('');
   });
 
-  it('when the handed-over node is chosen, npm and node for the build come from beside it', () => {
+  it('when the handed-over node is chosen, the build (and only the build) finds npm and node beside it', () => {
     const root = mkdtempSync(join(tmpdir(), 'gru-node-npm-'));
     cleanupDirs.push(root);
-    const none = join(root, 'none');
+    const old = join(root, 'old');
     const install = join(root, 'node-install', 'bin');
-    mkdirSync(none);
+    mkdirSync(old);
     mkdirSync(install, { recursive: true });
+    // The shell's own Node.js 18 and its npm.
+    writeFileSync(join(old, 'node'), '#!/bin/sh\ncase "$1" in -p) echo "$0" ;; *) exit 1 ;; esac\n', { mode: 0o755 });
+    writeFileSync(join(old, 'npm'), '#!/bin/sh\n', { mode: 0o755 });
     symlinkSync(process.execPath, join(install, 'node'));
     writeFileSync(join(install, 'npm'), '#!/bin/sh\n', { mode: 0o755 });
-    expect(selected(none, join(install, 'node'), true)).toBe(`${join(install, 'node')}|${join(install, 'npm')}`);
+    const report = 'with_build_path /bin/sh -c \'printf "%s|%s|" "$(command -v npm)" "$(command -v node)"\'; printf %s "$(command -v npm)"';
+    expect(selected(old, join(install, 'node'), report))
+      .toBe(`${join(install, 'npm')}|${join(install, 'node')}|${join(old, 'npm')}`);
+  });
+});
+
+describe('install.sh without a usable node (#463)', () => {
+  it('names a handed-over node that cannot stand in', () => {
+    const tools = mkdtempSync(join(tmpdir(), 'gru-no-node-'));
+    cleanupDirs.push(tools);
+    for (const tool of ['bash', 'dirname']) {
+      symlinkSync(execFileSync('/bin/sh', ['-c', `command -v ${tool}`], { encoding: 'utf8' }).trim(), join(tools, tool));
+    }
+    const result = spawnSync(join(tools, 'bash'), [join(repoRoot, 'install.sh'), '--print'], {
+      encoding: 'utf8',
+      env: { PATH: tools, HOME: tools, GRU_COMMAND_NODE: join(tools, 'missing', 'node') },
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`the node gru handed over, ${join(tools, 'missing', 'node')}, is missing, not executable or not an absolute path`);
   });
 });
