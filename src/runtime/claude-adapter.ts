@@ -1963,9 +1963,10 @@ export class ClaudeCodeHandle implements AgentHandle {
         throw new DirectiveCheckpointError('native directive actual admission has not been published; tool effects refused');
       }
       // Background tasks are off in a directive turn (#471); a CLI that offers one anyway is refused by
-      // name. Anything but absent or false: the CLI also reads the string "true" as true.
+      // name. The CLI reads the strings "true"/"false" as booleans; anything else that is not plainly
+      // a foreground call is refused too.
       const background = request.input['run_in_background'];
-      if (background !== undefined && background !== false) {
+      if (background !== undefined && background !== false && background !== 'false') {
         throw new DirectiveCheckpointError('a directive turn cannot start a background task: its completion would outlive the turn');
       }
       turn.directive.beforeAdmission();

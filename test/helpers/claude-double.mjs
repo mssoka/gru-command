@@ -64,8 +64,9 @@
  *                               re-stamped), e.g. test/fixtures/claude-stream/
  *   CLAUDE_DOUBLE_ECHO=mutate|skip  the prompt echo carries other text, or never comes
  *   CLAUDE_DOUBLE_TOOL_INPUT_DRIFT=1 the permission request names other input than the tool_use
- *   CLAUDE_DOUBLE_TOOL_BACKGROUND=1|string  the tool_use asks for run_in_background
- *                               (true, or the string "true" the real CLI coerces)
+ *   CLAUDE_DOUBLE_TOOL_BACKGROUND=1|string|string-false  the tool_use carries
+ *                               run_in_background: true, or the string "true" or
+ *                               "false" the real CLI coerces
  *   CLAUDE_DOUBLE_TASK_NOTIFICATION=after-echo|before-echo|before-echo-tool|foreign
  *                               a background task's notification replay right
  *                               after the echo; two before it (a resumed
@@ -74,7 +75,9 @@
  *                               or, after the echo, a replayed prompt that is
  *                               no notification
  * The invocation record's `backgroundTasks` is CLAUDE_CODE_DISABLE_BACKGROUND_TASKS
- * as the real CLI resolves it: the --settings env over the process environment.
+ * as the real CLI resolves it (probed on 2.1.306): the --settings env, then the
+ * cwd's .claude/settings.local.json and .claude/settings.json env, then the
+ * process environment (user and managed settings are not modelled).
  */
 import process from 'node:process';
 import { Buffer } from 'node:buffer';
@@ -168,12 +171,13 @@ function promptFromStdin() {
   return { prompt, images };
 }
 
-/** CLAUDE_CODE_DISABLE_BACKGROUND_TASKS as the CLI resolves it (#471): the
- * --settings env outranks the inherited environment. */
+/** CLAUDE_CODE_DISABLE_BACKGROUND_TASKS as the CLI resolves it (#471): each
+ * settings env outranks the inherited environment, and --settings outranks
+ * the local and project settings. */
 function resolvedBackgroundSwitch() {
-  const settingsFile = flagValue('--settings');
-  const settings = settingsFile ? JSON.parse(readFileSync(settingsFile, 'utf8')) : {};
-  return settings.env?.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS ?? process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS ?? null;
+  const envOf = (file) => (file !== undefined && existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')).env : undefined);
+  const layers = [flagValue('--settings'), `${process.cwd()}/.claude/settings.local.json`, `${process.cwd()}/.claude/settings.json`].map(envOf);
+  return [...layers, process.env].map((env) => env?.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS).find((value) => value !== undefined) ?? null;
 }
 
 function recordInvocation(prompt, images) {
@@ -304,7 +308,7 @@ async function emitToolTurn(toolName, toolError = false) {
     });
     streamEvent({ type: 'content_block_stop', index: 0 });
   }
-  const background = { '1': true, string: 'true' }[process.env.CLAUDE_DOUBLE_TOOL_BACKGROUND ?? ''];
+  const background = { '1': true, string: 'true', 'string-false': 'false' }[process.env.CLAUDE_DOUBLE_TOOL_BACKGROUND ?? ''];
   const input = background === undefined ? { command: 'ls' } : { command: 'ls', run_in_background: background };
   // The COMPLETE assistant frame still arrives — the adapter must not
   // double-announce this tool call.

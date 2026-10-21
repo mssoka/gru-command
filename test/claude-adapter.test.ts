@@ -2878,13 +2878,15 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       const fx = fixture();
       const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
       const inherited = process.env['CLAUDE_CODE_DISABLE_BACKGROUND_TASKS'];
-      // An environment that turns background tasks back on.
-      process.env['CLAUDE_CODE_DISABLE_BACKGROUND_TASKS'] = '0';
+      delete process.env['CLAUDE_CODE_DISABLE_BACKGROUND_TASKS'];
+      // The lane's checked-in settings turn background tasks back on; they outrank the process environment.
+      mkdirSync(join(fx.workspace, '.claude'));
+      writeFileSync(join(fx.workspace, '.claude', 'settings.json'), JSON.stringify({ env: { CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '0' } }));
       try {
         await handle.prompt('answer plainly');
         await handle.prompt('answer plainly too', { directive: { identity: identityFor('claude-no-background'), beforeAdmission: () => {}, onAdmitted: () => {} } });
-        // Only the directive turn's own settings carry the switch, and they outrank the
-        // environment; an ordinary turn keeps whatever the CLI inherits.
+        // Only the directive turn's own --settings carry the switch, and they outrank the
+        // lane's settings; an ordinary turn keeps what the lane chose.
         expect(doubleInvocations(fx).map((record) => record.backgroundTasks)).toEqual(['0', '1']);
         // A CLI that offers a background task anyway gets no effect from it, as a
         // boolean or as the string the CLI also reads as true.
@@ -2897,6 +2899,12 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         }
         expect(readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf-8').match(/"state":"guard-refused"/gu)).toHaveLength(2);
         expect(allowed(handle.sessionFile!)).toBe(false);
+        // The string the CLI reads as false is an ordinary foreground call.
+        process.env['CLAUDE_DOUBLE_TOOL_BACKGROUND'] = 'string-false';
+        const foreground = identityFor('claude-background-false');
+        await handle.prompt('tool:Bash run it', { directive: { identity: foreground, beforeAdmission: () => {}, onAdmitted: () => {} } });
+        expect(allowed(handle.sessionFile!)).toBe(true);
+        expect(handle.inspectDirective!(foreground)).toMatchObject({ state: 'terminal', ok: true });
       } finally {
         if (inherited === undefined) delete process.env['CLAUDE_CODE_DISABLE_BACKGROUND_TASKS'];
         else process.env['CLAUDE_CODE_DISABLE_BACKGROUND_TASKS'] = inherited;

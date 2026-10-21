@@ -197,9 +197,10 @@ writes each runtime's own record shape during a resumed turn.
   and a tool asked for before that echo is refused and ends the turn. It never
   counts as a second prompt either. Any other replayed user frame still does.
   A directive turn also sets `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` in its
-  own `--settings` env. That env outranks user, project and local settings;
-  the process environment would not. A tool request asking for
-  `run_in_background` anyway is refused by name and ends the directive turn.
+  own `--settings` env. That env outranks user, project and local settings
+  (managed policy settings still outrank it); the process environment would
+  not. A tool request asking for `run_in_background` anyway is refused by
+  name and ends the directive turn.
   The reason: the CLI waits for a running task after the turn's result, then
   answers its completion in an unprompted turn of its own, after the directive
   is over and with no host left to decide its tools.
