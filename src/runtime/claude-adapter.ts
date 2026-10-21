@@ -997,9 +997,10 @@ function claudeHeaderOf(head: string): { readonly id: string; readonly cwd: stri
  * --replay-user-messages never echoes a user message whose text holds one of
  * the first six, or starts with a teammate message — read from Claude Code
  * 2.1.306's replay filter. A directive quoting one (a re-brief warning against
- * `<task-notification>`) would never be admitted. A teammate message's opening
- * tag is matched wherever it stands, through its `>` on the same line. A later
- * CLI that reserves more fails loud at the turn's first answer, never silently.
+ * `<task-notification>`) would never be admitted. `<teammate-message ` (a space
+ * after the name, as the CLI checks) is matched wherever it stands, through the
+ * next `>` on its line unless a `<` comes first. A later CLI that reserves more
+ * fails loud at the turn's first answer, never silently.
  */
 const CLAUDE_RESERVED_TAG = /<(?:task-notification|tick|bash-stdout|bash-stderr|local-command-stdout|local-command-stderr)>|<teammate-message [^<>\n]*>?/gu;
 

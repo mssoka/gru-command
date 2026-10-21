@@ -192,9 +192,10 @@ writes each runtime's own record shape during a resumed turn.
   `<bash-stdout>`, `<bash-stderr>`, `<local-command-stdout>`,
   `<local-command-stderr>`, or a leading `<teammate-message …>`), so those
   tags reach the minion as entities (`&lt;task-notification&gt;`) and the
-  rest of the text as written (#472). A `<teammate-message …>` opening tag
-  becomes entities wherever it stands, up to its `>` on the same line. A literal `&lt;tick&gt;` and `<tick>`
-  therefore look alike to the minion.
+  rest of the text as written (#472). `<teammate-message ` (a space after the
+  name, as the CLI checks) becomes entities wherever it stands, through the
+  next `>` on its line unless a `<` comes first. A literal `&lt;tick&gt;` and
+  `<tick>` therefore look alike to the minion.
 - **A review owner from another process (#464).** A replacement Perkins round
   starts only once every earlier round's review owner is proven ceased. On
   both runtimes the proof is either this process's adapter evidence or the
