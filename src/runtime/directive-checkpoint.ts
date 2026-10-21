@@ -32,38 +32,50 @@ export type DirectiveCheckpoint =
 export class DirectiveCheckpointError extends Error {
   constructor(message: string) { super(message); this.name = 'DirectiveCheckpointError'; }
 }
+/** Bounds a directive's own turn (#469), never the session before it. */
 const MAX_NATIVE_TRANSCRIPT_BYTES = 32 * 1024 * 1024;
 const MAX_NATIVE_TRANSCRIPT_ENTRIES = 250_000;
+const MAX_NATIVE_HEADER_BYTES = 64 * 1024;
 const MAX_DIRECTIVE_JOURNAL_BYTES = 4 * 1024 * 1024;
 const MAX_DIRECTIVE_JOURNAL_ENTRIES = 100_000;
 const MAX_NATIVE_LOCK_BYTES = 4 * 1024;
-function readBoundedUtf8(path: string, limit: number, label: string): string {
+const READ_CHUNK_BYTES = 64 * 1024;
+// Fatal decoding (#363 S04-1-02): a lenient decode turns invalid bytes into
+// U+FFFD, so corrupted evidence could hash like a genuine prompt. ignoreBOM
+// keeps a leading U+FEFF, exactly as the lenient decode did.
+function utf8Decoder() { return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }); }
+function decodeEvidence(bytes: Uint8Array, label: string, decoder = utf8Decoder()): string {
+  try { return decoder.decode(bytes); }
+  catch { throw new DirectiveCheckpointError(`${label} is not valid UTF-8; corrupted bytes are never evidence`); }
+}
+/** Refuses anything but a regular file before its first read: a FIFO blocks. */
+function openRegularFile(path: string, label: string): number {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
   try {
-    const stat = fstatSync(fd);
-    if (!stat.isFile()) throw new DirectiveCheckpointError(`${label} is not a regular file; bounded inspection requires durable file evidence`);
-    const initialSize = stat.size;
-    if (initialSize > limit) throw new DirectiveCheckpointError(`${label} exceeds the ${limit}-byte inspection limit`);
-    const chunks: Buffer[] = [];
-    let total = 0;
-    for (;;) {
-      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, limit + 1 - total));
-      const count = readSync(fd, chunk, 0, chunk.length, null);
-      if (count === 0) break;
-      total += count;
-      if (total > limit) throw new DirectiveCheckpointError(`${label} exceeds the ${limit}-byte inspection limit`);
-      chunks.push(chunk.subarray(0, count));
-    }
-    if (fstatSync(fd).size !== total) throw new DirectiveCheckpointError(`${label} changed during bounded inspection`);
-    // Fatal decoding (#363 S04-1-02): a lenient decode turns invalid bytes
-    // into U+FFFD, so corrupted evidence could hash like a genuine prompt.
-    try {
-      // ignoreBOM keeps a leading U+FEFF, exactly as the lenient decode did.
-      return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(Buffer.concat(chunks, total));
-    } catch {
-      throw new DirectiveCheckpointError(`${label} is not valid UTF-8; corrupted bytes are never evidence`);
-    }
-  } finally { closeSync(fd); }
+    if (!fstatSync(fd).isFile()) throw new DirectiveCheckpointError(`${label} is not a regular file; bounded inspection requires durable file evidence`);
+    return fd;
+  } catch (error) { closeSync(fd); throw error; }
+}
+/** Bytes from `offset` to the end, refused past `limit` before and while
+ * reading. The file must still end exactly where the read did. */
+function readBoundedBytes(fd: number, offset: number, limit: number, label: string): Buffer {
+  if (fstatSync(fd).size - offset > limit) throw new DirectiveCheckpointError(`${label} exceeds the ${limit}-byte inspection limit`);
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for (;;) {
+    const chunk = Buffer.allocUnsafe(Math.min(READ_CHUNK_BYTES, limit + 1 - total));
+    const count = readSync(fd, chunk, 0, chunk.length, offset + total);
+    if (count === 0) break;
+    total += count;
+    if (total > limit) throw new DirectiveCheckpointError(`${label} exceeds the ${limit}-byte inspection limit`);
+    chunks.push(chunk.subarray(0, count));
+  }
+  if (fstatSync(fd).size !== offset + total) throw new DirectiveCheckpointError(`${label} changed during bounded inspection`);
+  return Buffer.concat(chunks, total);
+}
+function readBoundedUtf8(path: string, limit: number, label: string): string {
+  const fd = openRegularFile(path, label);
+  try { return decodeEvidence(readBoundedBytes(fd, 0, limit, label), label); } finally { closeSync(fd); }
 }
 function assertEntryLimit(text: string, limit: number, label: string): void {
   let entries = 0;
@@ -96,21 +108,117 @@ interface NativeEntry {
   readonly modelId?: unknown;
   readonly thinkingLevel?: unknown;
 }
-function entries(path: string): NativeEntry[] {
-  const text = readBoundedUtf8(path, MAX_NATIVE_TRANSCRIPT_BYTES, 'native transcript');
-  if (text !== '' && !text.endsWith('\n')) throw new DirectiveCheckpointError('native transcript has a partial entry');
-  assertEntryLimit(text, MAX_NATIVE_TRANSCRIPT_ENTRIES, 'native transcript');
-  if (text.trim() === '') return [];
-  const lines = text.trimEnd().split('\n');
-  return lines.map((line) => JSON.parse(line) as NativeEntry);
+/*
+ * Native transcripts grow for a session's whole life (#469), so inspection
+ * never holds one whole. The header is read as its first line; the session
+ * before a directive is streamed one bounded line at a time (pi) or hashed
+ * (Claude); only the directive's own turn after its baseline is held, within
+ * the transcript byte and entry limits.
+ */
+function withNativeTranscript<T>(file: string, inspect: (fd: number) => T): T {
+  const fd = openRegularFile(file, 'native transcript');
+  try { return inspect(fd); } finally { closeSync(fd); }
 }
-/** Header facts use the same bounded read as checkpoint inspection. They
- * identify a session/cwd, never admission, completion or work authority. */
+/** The first line only, never the session after it. */
+function nativeHeaderLine(fd: number): string {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for (;;) {
+    const chunk = Buffer.allocUnsafe(Math.min(READ_CHUNK_BYTES, MAX_NATIVE_HEADER_BYTES + 1 - total));
+    const count = readSync(fd, chunk, 0, chunk.length, total);
+    if (count === 0) throw new DirectiveCheckpointError('native transcript has no complete session header');
+    const end = chunk.subarray(0, count).indexOf(10);
+    chunks.push(chunk.subarray(0, end < 0 ? count : end));
+    total += end < 0 ? count : end;
+    if (end >= 0) return decodeEvidence(Buffer.concat(chunks, total), 'native transcript');
+    if (total > MAX_NATIVE_HEADER_BYTES) throw new DirectiveCheckpointError(`native session header exceeds the ${MAX_NATIVE_HEADER_BYTES}-byte inspection limit`);
+  }
+}
+/** The directive's own turn: every byte after `offset`, within the limits. */
+function nativeTurnText(fd: number, offset: number): string {
+  const text = decodeEvidence(readBoundedBytes(fd, offset, MAX_NATIVE_TRANSCRIPT_BYTES, 'native directive turn'), 'native transcript');
+  assertEntryLimit(text, MAX_NATIVE_TRANSCRIPT_ENTRIES, 'native directive turn');
+  return text;
+}
+/** Streams complete lines from the start, each bounded and fatally decoded,
+ * until `visit` returns true. `end` is the offset after the line that stopped
+ * the scan, null when the transcript ended first (`partial`: on a torn line). */
+function scanNativeLines(fd: number, visit: (line: string) => boolean): { readonly end: number | null; readonly partial: boolean } {
+  const decoder = utf8Decoder();
+  const buffer = Buffer.allocUnsafe(READ_CHUNK_BYTES);
+  const pending: Buffer[] = [];
+  let pendingBytes = 0;
+  let position = 0;
+  const oversized = (): never => { throw new DirectiveCheckpointError(`native transcript entry exceeds the ${MAX_NATIVE_TRANSCRIPT_BYTES}-byte inspection limit`); };
+  for (;;) {
+    const count = readSync(fd, buffer, 0, buffer.length, position);
+    if (count === 0) {
+      if (fstatSync(fd).size !== position) throw new DirectiveCheckpointError('native transcript changed during bounded inspection');
+      return { end: null, partial: pendingBytes > 0 };
+    }
+    const chunk = buffer.subarray(0, count);
+    let start = 0;
+    for (let newline = chunk.indexOf(10); newline >= 0; newline = chunk.indexOf(10, start)) {
+      const piece = chunk.subarray(start, newline);
+      if (pendingBytes + piece.length > MAX_NATIVE_TRANSCRIPT_BYTES) oversized();
+      const line = decodeEvidence(pending.length === 0 ? piece : Buffer.concat([...pending.splice(0), piece], pendingBytes + piece.length), 'native transcript', decoder);
+      pendingBytes = 0;
+      start = newline + 1;
+      if (visit(line)) return { end: position + start, partial: false };
+    }
+    if (start < count) {
+      pendingBytes += count - start;
+      if (pendingBytes > MAX_NATIVE_TRANSCRIPT_BYTES) oversized();
+      pending.push(Buffer.from(chunk.subarray(start))); // the read buffer is reused
+    }
+    position += count;
+  }
+}
+/** A pi transcript split after its `baseline` entry (after the header when
+ * null). Entries up to the split are kept only as their ids. */
+interface PiTranscript {
+  readonly header: NativeEntry | null;
+  /** Every id through the baseline, the header's included. */
+  readonly ids: ReadonlySet<string>;
+  /** An entry through the baseline has no unique, non-empty id. */
+  readonly malformed: boolean;
+  /** The directive's own turn as complete lines; null without the baseline. */
+  readonly turn: readonly string[] | null;
+}
+/** `accepted` drops a torn final line (a partial tail cannot undo an
+ * accepted prefix); `whole` refuses it. */
+function piTranscript(file: string, baseline: string | null, tail: 'whole' | 'accepted'): PiTranscript {
+  return withNativeTranscript(file, (fd) => {
+    let header = undefined as NativeEntry | null | undefined;
+    let malformed = false as boolean;
+    const ids = new Set<string>();
+    const scan = scanNativeLines(fd, (line) => {
+      const entry = JSON.parse(line) as NativeEntry | null;
+      if (header === undefined) {
+        header = entry;
+        if (typeof entry?.id === 'string') ids.add(entry.id);
+        return baseline === null;
+      }
+      if (!entry || typeof entry.id !== 'string' || entry.id === '' || ids.has(entry.id)) { malformed = true; return false; }
+      ids.add(entry.id);
+      return entry.id === baseline;
+    });
+    const partial = (): never => { throw new DirectiveCheckpointError('native transcript has a partial entry'); };
+    if (scan.end === null) {
+      if (scan.partial && tail === 'whole') partial();
+      return { header: header ?? null, ids, malformed, turn: null };
+    }
+    const text = nativeTurnText(fd, scan.end);
+    if (tail === 'whole' && text !== '' && !text.endsWith('\n')) partial();
+    const turn = text.split('\n');
+    turn.pop();
+    return { header: header ?? null, ids, malformed, turn };
+  });
+}
+/** Header facts come from the first line alone. They identify a session/cwd,
+ * never admission, completion or work authority. */
 export function readDirectiveSessionHeader(file: string): { readonly type?: unknown; readonly id?: unknown; readonly cwd?: unknown } {
-  const text = readBoundedUtf8(file, MAX_NATIVE_TRANSCRIPT_BYTES, 'native transcript');
-  const end = text.indexOf('\n');
-  if (end < 0) throw new DirectiveCheckpointError('native transcript has no complete session header');
-  const header = JSON.parse(text.slice(0, end)) as unknown;
+  const header = JSON.parse(withNativeTranscript(file, nativeHeaderLine)) as unknown;
   if (typeof header !== 'object' || header === null) throw new DirectiveCheckpointError('native session header is malformed');
   return header;
 }
@@ -132,11 +240,21 @@ export function prepareDirectiveBinding(input: {
   if (!input.authorityManifest) throw new DirectiveCheckpointError('directive requires a bound native role/cwd/tool/model authority manifest');
   const prior = readDirectiveBinding(input.sessionFile, input.identity.requestId);
   if (prior !== null) throw new DirectiveCheckpointError(`request ${input.identity.requestId} already has native association — inspect it; never replay`);
-  const native = entries(input.sessionFile);
+  // The baseline is the last entry: the whole session streams past, one line at a time.
+  const baseline = withNativeTranscript(input.sessionFile, (fd) => {
+    let last = null as string | null;
+    const scan = scanNativeLines(fd, (line) => {
+      const entry = JSON.parse(line) as NativeEntry;
+      if (entry.type !== 'session') last = entry.id ?? null;
+      return false;
+    });
+    if (scan.partial) throw new DirectiveCheckpointError('native transcript has a partial entry');
+    return last;
+  });
   const content = [ { type: 'text', text: input.text },
     ...(input.images ?? []).map((image) => ({ type: 'image', data: image.data, mimeType: image.mediaType })) ];
   const binding: DirectiveNativeBinding = { identity: input.identity, runtime: input.runtime, agentId: input.agentId,
-    sessionId: input.sessionId, sessionFile: input.sessionFile, baseline: native.filter((entry) => entry.type !== 'session').at(-1)?.id ?? null,
+    sessionId: input.sessionId, sessionFile: input.sessionFile, baseline,
     promptHash: contentHash(content), userEntryId: null, authorityManifest: input.authorityManifest };
   appendBinding(binding);
   return binding;
@@ -212,28 +330,22 @@ export function inspectDirectiveAdmission(file: string, identity: DirectiveTurnI
   if (binding === null || !isDeepStrictEqual(binding.identity, identity)) throw new DirectiveCheckpointError('exact native admission association unavailable');
   if (binding.runtime === 'claude-code') return inspectClaudeDirectiveAdmission(file, binding);
   if (binding.runtime !== 'pi') throw new DirectiveCheckpointError('exact native admission association unavailable');
-  const text = readBoundedUtf8(file, MAX_NATIVE_TRANSCRIPT_BYTES, 'native transcript');
-  assertEntryLimit(text, MAX_NATIVE_TRANSCRIPT_ENTRIES, 'native transcript');
-  const lines = text.split('\n'); lines.pop(); // a partial tail cannot undo an accepted prefix
-  const header = JSON.parse(lines[0] ?? 'null') as NativeEntry | null;
+  const native = piTranscript(file, binding.baseline, 'accepted');
+  const header = native.header;
   if (header?.type !== 'session' || header.id !== binding.sessionId) throw new DirectiveCheckpointError('native admission session identity mismatch');
-  let baselineFound = binding.baseline === null;
-  const ids = new Set<string>([header.id]);
-  for (const line of lines.slice(1)) {
-    const entry = JSON.parse(line) as NativeEntry;
-    if (!entry || typeof entry.id !== 'string' || !entry.id || ids.has(entry.id)) throw new DirectiveCheckpointError('malformed/rebound native admission prefix');
-    ids.add(entry.id);
-    if (!baselineFound) { baselineFound = entry.id === binding.baseline; continue; }
-    if (entry.type !== 'message' || entry.message?.role !== 'user' || entry.parentId !== binding.baseline || !Array.isArray(entry.message.content) ||
-        contentHash(entry.message.content) !== binding.promptHash || binding.userEntryId !== null && binding.userEntryId !== entry.id) {
-      throw new DirectiveCheckpointError('actual native admission user receipt unavailable/changed');
-    }
-    syncFile(file);
-    const admitted = { ...binding, userEntryId: entry.id };
-    if (binding.userEntryId === null) appendBinding(admitted);
-    return admitted;
+  if (native.malformed) throw new DirectiveCheckpointError('malformed/rebound native admission prefix');
+  const line = native.turn?.[0];
+  if (line === undefined) throw new DirectiveCheckpointError('actual native admission user receipt unavailable');
+  const entry = JSON.parse(line) as NativeEntry;
+  if (!entry || typeof entry.id !== 'string' || !entry.id || native.ids.has(entry.id)) throw new DirectiveCheckpointError('malformed/rebound native admission prefix');
+  if (entry.type !== 'message' || entry.message?.role !== 'user' || entry.parentId !== binding.baseline || !Array.isArray(entry.message.content) ||
+      contentHash(entry.message.content) !== binding.promptHash || binding.userEntryId !== null && binding.userEntryId !== entry.id) {
+    throw new DirectiveCheckpointError('actual native admission user receipt unavailable/changed');
   }
-  throw new DirectiveCheckpointError('actual native admission user receipt unavailable');
+  syncFile(file);
+  const admitted = { ...binding, userEntryId: entry.id };
+  if (binding.userEntryId === null) appendBinding(admitted);
+  return admitted;
 }
 
 /** Native transcript readback owns proof. Pi entries are tree-linked: only
@@ -246,17 +358,19 @@ export function inspectDirectiveCheckpoint(file: string, identity: DirectiveTurn
   if (binding === null || !isDeepStrictEqual(binding.identity, identity)) return unknown('exact native request association unavailable');
   if (binding.runtime === 'claude-code') return inspectClaudeDirectiveCheckpoint(file, binding);
   if (binding.runtime !== 'pi') return unknown('exact native request association unavailable');
-  const native = entries(file);
-  const header = native[0] as (NativeEntry & { readonly id?: string }) | undefined;
+  const transcript = piTranscript(file, binding.baseline, 'whole');
+  // The directive's own turn: its receipt first, then everything after it.
+  const native = (transcript.turn ?? []).map((line) => JSON.parse(line) as NativeEntry);
+  const header = transcript.header;
   if (header?.type !== 'session' || header.id !== binding.sessionId) return unknown('native session identity mismatch');
-  const ids = new Set<string>([header.id]);
-  for (const entry of native.slice(1)) {
-    if (!entry || typeof entry.id !== 'string' || entry.id === '' || ids.has(entry.id)) return unknown('native checkpoint has a malformed or duplicate entry identity');
+  if (transcript.malformed) return unknown('native checkpoint has a malformed or duplicate entry identity');
+  const ids = new Set<string>();
+  for (const entry of native) {
+    if (!entry || typeof entry.id !== 'string' || entry.id === '' || transcript.ids.has(entry.id) || ids.has(entry.id)) return unknown('native checkpoint has a malformed or duplicate entry identity');
     ids.add(entry.id);
   }
-  const start = binding.baseline === null ? 1 : native.findIndex((entry) => entry.id === binding.baseline) + 1;
-  if (start <= 0) return unknown('native baseline unavailable');
-  const user = native[start];
+  if (transcript.turn === null) return unknown('native baseline unavailable');
+  const user = native[0];
   if (user?.type !== 'message' || user.message?.role !== 'user' || user.parentId !== binding.baseline ||
       contentHash(user.message.content) !== binding.promptHash || !user.id) return unknown('actual native request receipt unavailable');
   if (binding.userEntryId !== null && user.id !== binding.userEntryId) return unknown('native request receipt changed');
@@ -269,7 +383,7 @@ export function inspectDirectiveCheckpoint(file: string, identity: DirectiveTurn
   const pending = new Map<string, string>();
   let lastMessage = user.message;
   let terminal = false;
-  for (const entry of native.slice(start + 1)) {
+  for (const entry of native.slice(1)) {
     if (terminal) {
       // A later user entry is not part of this completed turn when its own
       // distinct, durably read-back admission binds it. Keep the earlier
@@ -328,15 +442,47 @@ export function inspectDirectiveCheckpoint(file: string, identity: DirectiveTurn
  */
 const CLAUDE_BASELINE = /^prefix:(0|[1-9][0-9]*):([a-f0-9]{64})$/;
 
-function claudeTranscriptPrefix(text: string): string {
-  const bytes = Buffer.from(text, 'utf8');
-  return `prefix:${String(bytes.length)}:${createHash('sha256').update(bytes).digest('hex')}`;
+/** The exact prefix a new Claude directive binds: the whole transcript,
+ * hashed and fatally decoded as it streams past, ending on a complete frame. */
+function claudeTranscriptPrefix(fd: number): string {
+  const hash = createHash('sha256');
+  const decoder = utf8Decoder();
+  const validate = (bytes?: Uint8Array): void => {
+    try { decoder.decode(bytes, { stream: bytes !== undefined }); }
+    catch { throw new DirectiveCheckpointError('native transcript is not valid UTF-8; corrupted bytes are never evidence'); }
+  };
+  const chunk = Buffer.allocUnsafe(READ_CHUNK_BYTES);
+  let length = 0;
+  let last = -1;
+  for (let count = readSync(fd, chunk, 0, chunk.length, 0); count > 0; count = readSync(fd, chunk, 0, chunk.length, length)) {
+    const bytes = chunk.subarray(0, count);
+    validate(bytes);
+    hash.update(bytes);
+    length += count;
+    last = bytes[count - 1]!;
+  }
+  validate();
+  if (fstatSync(fd).size !== length) throw new DirectiveCheckpointError('native transcript changed during bounded inspection');
+  if (last !== 10) throw new DirectiveCheckpointError('native transcript has a partial entry');
+  return `prefix:${String(length)}:${hash.digest('hex')}`;
 }
 
-function claudeHeader(text: string, sessionId: string): void {
-  const end = text.indexOf('\n');
+/** sha256 of the first `length` bytes, streamed; null when the transcript is shorter. */
+function nativePrefixHash(fd: number, length: number): string | null {
+  const hash = createHash('sha256');
+  const chunk = Buffer.allocUnsafe(READ_CHUNK_BYTES);
+  for (let position = 0; position < length;) {
+    const count = readSync(fd, chunk, 0, Math.min(chunk.length, length - position), position);
+    if (count === 0) return null;
+    hash.update(chunk.subarray(0, count));
+    position += count;
+  }
+  return hash.digest('hex');
+}
+
+function claudeHeader(line: string, sessionId: string): void {
   let header: unknown = null;
-  try { header = end < 0 ? null : JSON.parse(text.slice(0, end)) as unknown; } catch { header = null; }
+  try { header = JSON.parse(line) as unknown; } catch { header = null; }
   const record = typeof header === 'object' && header !== null ? header as Record<string, unknown> : null;
   if (record?.['type'] !== 'session' || record['id'] !== sessionId || record['runtime'] !== 'claude-code' || typeof record['cwd'] !== 'string') {
     throw new DirectiveCheckpointError('claude-code transcript has no exact GC session header for this session');
@@ -354,12 +500,13 @@ export function prepareClaudeDirectiveBinding(input: {
   if (readDirectiveBinding(input.sessionFile, input.identity.requestId) !== null) {
     throw new DirectiveCheckpointError(`request ${input.identity.requestId} already has native association — inspect it; never replay`);
   }
-  const text = readBoundedUtf8(input.sessionFile, MAX_NATIVE_TRANSCRIPT_BYTES, 'native transcript');
-  if (!text.endsWith('\n')) throw new DirectiveCheckpointError('native transcript has a partial entry');
-  assertEntryLimit(text, MAX_NATIVE_TRANSCRIPT_ENTRIES, 'native transcript');
-  claudeHeader(text, input.sessionId);
+  const baseline = withNativeTranscript(input.sessionFile, (fd) => {
+    const prefix = claudeTranscriptPrefix(fd);
+    claudeHeader(nativeHeaderLine(fd), input.sessionId);
+    return prefix;
+  });
   const binding: DirectiveNativeBinding = { identity: input.identity, runtime: 'claude-code', agentId: input.agentId, sessionId: input.sessionId,
-    sessionFile: input.sessionFile, baseline: claudeTranscriptPrefix(text), promptHash: contentHash(input.content), userEntryId: null,
+    sessionFile: input.sessionFile, baseline, promptHash: contentHash(input.content), userEntryId: null,
     authorityManifest: input.authorityManifest };
   appendBinding(binding);
   return binding;
@@ -373,19 +520,20 @@ type ClaudeFrame = Record<string, unknown>;
 function claudeTurn(file: string, binding: DirectiveNativeBinding): { readonly frames: readonly ClaudeFrame[]; readonly echo: number } | { readonly refused: string } {
   const prefix = CLAUDE_BASELINE.exec(binding.baseline ?? '');
   if (prefix === null) return { refused: 'claude-code association has no exact transcript prefix' };
-  const text = readBoundedUtf8(file, MAX_NATIVE_TRANSCRIPT_BYTES, 'native transcript');
-  assertEntryLimit(text, MAX_NATIVE_TRANSCRIPT_ENTRIES, 'native transcript');
-  const bytes = Buffer.from(text, 'utf8');
   const length = Number(prefix[1]);
-  if (bytes.length < length || createHash('sha256').update(bytes.subarray(0, length)).digest('hex') !== prefix[2]) {
-    return { refused: 'the native transcript before the directive changed' };
-  }
-  try { claudeHeader(text, binding.sessionId); }
-  catch (error) {
-    if (!(error instanceof DirectiveCheckpointError)) throw error;
-    return { refused: error.message };
-  }
-  const lines = bytes.subarray(length).toString('utf8').split('\n');
+  // The prefix is hashed as it streams; only the turn after it is held.
+  const read = withNativeTranscript(file, (fd): { readonly text: string } | { readonly refused: string } => {
+    if (nativePrefixHash(fd, length) !== prefix[2]) return { refused: 'the native transcript before the directive changed' };
+    const text = nativeTurnText(fd, length);
+    try { claudeHeader(nativeHeaderLine(fd), binding.sessionId); }
+    catch (error) {
+      if (!(error instanceof DirectiveCheckpointError)) throw error;
+      return { refused: error.message };
+    }
+    return { text };
+  });
+  if ('refused' in read) return read;
+  const lines = read.text.split('\n');
   lines.pop(); // a partial tail cannot undo an accepted prefix
   const frames: ClaudeFrame[] = [];
   for (const line of lines) {
@@ -658,7 +806,10 @@ export function recordDirectiveIndependentController(producer: DirectiveProducer
 export function flushDirectiveToolIntent(file: string, assistantMessage: unknown, toolCall: {
   readonly id: string; readonly name: string; readonly arguments: unknown;
 }, identity: DirectiveTurnIdentity, executionMode: 'sequential' | 'parallel' = 'sequential'): void {
-  const native = entries(file);
+  const binding = inspectDirectiveAdmission(file, identity);
+  const transcript = piTranscript(file, binding.baseline, 'whole');
+  // The admitted turn only (#469): its receipt first, then everything after it.
+  const native = (transcript.turn ?? []).map((line) => JSON.parse(line) as NativeEntry);
   let index = native.length - 1;
   // Sequential batches persist results between preparations; the pinned SDK
   // prepares every parallel call before executing any or persisting results.
@@ -686,15 +837,13 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
     pending.delete(id as string);
     parent = result.id;
   }
-  const binding = inspectDirectiveAdmission(file, identity);
-  const start = native.findIndex((entry) => entry.id === binding.userEntryId);
-  if (start < 1 || start >= index) refuse();
+  if (native[0]?.id !== binding.userEntryId || index < 1) refuse();
   let ancestor = binding.userEntryId;
   const chainPending = new Map<string, string>();
-  const ids = new Set(native.slice(0, start + 1).map((entry) => entry.id));
-  for (const entry of native.slice(start + 1)) {
+  const ids = new Set([native[0]!.id]);
+  for (const entry of native.slice(1)) {
     const message = entry.message;
-    if (entry.type !== 'message' || !entry.id || ids.has(entry.id) || entry.parentId !== ancestor || !message) refuse();
+    if (entry.type !== 'message' || !entry.id || transcript.ids.has(entry.id) || ids.has(entry.id) || entry.parentId !== ancestor || !message) refuse();
     ids.add(entry.id); ancestor = entry.id;
     if (message!.role === 'assistant') {
       if (chainPending.size > 0 || message!.stopReason !== 'toolUse' || !Array.isArray(message!.content)) refuse();

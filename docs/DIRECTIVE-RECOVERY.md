@@ -268,6 +268,16 @@ journal is `<session.jsonl>.directives.jsonl`; native receipt identity and
 its role/cwd/tool/model authority manifest are validated on readback.
 Unknown/malformed/partial evidence is never repaired by guesswork.
 
+Readback is bounded by the directive's own turn, never by the session's age
+(#469), so a long-lived minion still takes directives, revision
+continuations and `/recover` successors. The session header is read as the
+first line alone (at most 64 KiB). The transcript before the bound baseline
+is streamed past without being held: pi checks each entry's unique id up to
+the baseline entry, and Claude Code re-hashes the exact byte prefix. Only
+the turn after the baseline is held, within 32 MiB and 250,000 entries. A
+turn past either limit, a single entry over 32 MiB, a changed prefix or a
+missing baseline is still refused by name.
+
 Boot and bounded deterministic reconsideration inspect correlated ledger
 completion, then exact native completion, **before** considering execution.
 A proven native user or complete successful tool-results checkpoint can
