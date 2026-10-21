@@ -43,6 +43,8 @@ describe('GH286 approved integration schema', () => {
     expect(MIGRATIONS[27]).toMatchObject({ id: 28, name: 'directive-native-progress' });
     expect(MIGRATIONS[28]).toMatchObject({ id: 29, name: 'notification-owner-decisions' });
     expect(MIGRATIONS[29]).toMatchObject({ id: 30, name: 'worktree-processes-exited' });
+    // A landed table rebuild is immutable: its exact SQL is pinned (#464).
+    expect(hash(MIGRATIONS[29]!.sql)).toBe('c565137621d2940683321d684c746a2a5fef27690f15340c38248f3378e9d1c8');
     expect(hash(MIGRATIONS[27]!.sql)).toBe('3fe446722711a74bcb5ae577b7b47ed8f65f243ea5f059fbc3ebff1250ea546e');
   });
 

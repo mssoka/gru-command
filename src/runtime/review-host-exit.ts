@@ -109,34 +109,36 @@ export async function processIdentity(pid: number): Promise<string | null> {
   });
 }
 
-let ownIdentity: string | undefined;
+let ownIdentity: string | null | undefined;
 
-/** This process's start identity, read synchronously (the owner marker is
- * written where setup must not yield) and kept once read. A failed read is
- * retried at the next call, never cached; the service reads it at boot so a
- * failure is reported there. */
+/** This process's start identity, read once, synchronously (the owner
+ * marker is written where setup must not yield; the service reads it at
+ * boot, so a failure is reported there). The first answer is kept for the
+ * life of the process, an unreadable one included: every marker this
+ * process writes then carries the same identity, or none, and is always
+ * recognized as its own. */
 export function thisProcessIdentity(): string | null {
   if (ownIdentity !== undefined) return ownIdentity;
-  let read: string | null = null;
   if (process.platform === 'linux') {
-    read = linuxIdentity(process.pid);
+    ownIdentity = linuxIdentity(process.pid);
   } else if (process.platform === 'darwin') {
     try {
       const started = execFileSync(PS, [...PS_START, String(process.pid)], { encoding: 'utf8', timeout: 10_000, env: PS_ENV }).trim();
-      read = started === '' ? null : `ps:${started}`;
+      ownIdentity = started === '' ? null : `ps:${started}`;
     } catch {
-      read = null;
+      ownIdentity = null;
     }
+  } else {
+    ownIdentity = null;
   }
-  if (read !== null) ownIdentity = read;
-  return read;
+  return ownIdentity;
 }
 
 /** Whether THIS process hosts the marker's owner (its own adapter evidence
  * then decides, never a dead-host proof). Every marker this process writes
- * carries its identity, so one under this pid with another identity, or
- * with none, was left by an earlier process; only when this process cannot
- * read its own identity is a same-pid marker taken as its own. */
+ * carries its own (kept) identity, so one under this pid with another
+ * identity, or with none, was left by an earlier process. When this process
+ * has no identity, every same-pid marker is taken as its own. */
 export function hostedByThisProcess(marker: ReviewOwnerMarker, own: string | null = thisProcessIdentity()): boolean {
   return marker.pid === process.pid && (own === null || marker.hostIdentity === own);
 }
@@ -152,9 +154,14 @@ export function pidState(pid: number): 'dead' | 'alive' | 'unknown' {
   }
 }
 
+/** The first five items, and how many more there are. */
+export function firstFive(items: readonly string[]): string {
+  const shown = items.slice(0, 5).join(', ');
+  return items.length > 5 ? `${shown} and ${String(items.length - 5)} more` : shown;
+}
+
 function named(processes: readonly TreeProcess[]): string {
-  const shown = processes.slice(0, 5).map((entry) => `pid ${String(entry.pid)} (${entry.evidence})`).join(', ');
-  return processes.length > 5 ? `${shown} and ${String(processes.length - 5)} more` : shown;
+  return firstFive(processes.map((entry) => `pid ${String(entry.pid)} (${entry.evidence})`));
 }
 
 type HostCheck =

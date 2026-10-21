@@ -2613,12 +2613,14 @@ export class WorktreeManager {
     // could not read working directories, #427 PR 3).
     const rooted = attempt.budget === null ? this.enumerate(row.path) : await this.enumerateAsync(row.path);
     const processes = rooted.filter((proc) => !reaped.includes(proc.pid));
-    // #464: a recorded process this enumeration no longer finds rooted here
-    // left on its own (the sweep trusts the same enumeration). Its row leaves
-    // `live`, so it can never fence a writer; the reaper owns registry rows.
+    // #464: a recorded process this enumeration no longer finds rooted here,
+    // and that is dead, left on its own. Its row leaves `live`, so it can
+    // never fence a writer. One still alive stays live (an enumeration that
+    // could not read working directories cannot clear it) until the tree is
+    // swept; the reaper owns registry rows.
     const enumerated = new Set(rooted.map((proc) => proc.pid));
     const gone = this.opts.ledger.listWorktreeProcesses(row.id)
-      .filter((proc) => proc.state === 'live' && proc.evidence !== 'registry' && !enumerated.has(proc.pid))
+      .filter((proc) => proc.state === 'live' && proc.evidence !== 'registry' && !enumerated.has(proc.pid) && !pidAlive(proc.pid))
       .map((proc) => proc.pid);
     if (gone.length > 0) this.opts.ledger.recordWorktreeProcessesExited({ worktreeId: row.id, pids: gone, reason: 'not-enumerated' });
     // A release nobody answers refuses instead of pausing (#427 PR 3): the

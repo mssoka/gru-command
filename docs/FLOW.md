@@ -258,8 +258,12 @@ degenerate into check-failed movement.
   A round cut during delivery keeps its delivery failure beside the reason,
   and stays held while its in-flight post is unreconciled. The next start
   asks the provider, read-only, as startup recovery does for a live round.
-  Once the post is proven absent, the row opens. A refused re-arm keeps the
-  row, and each sweep tries again.
+  Each later start asks again while the lookup cannot answer.
+  - **Proven absent:** the row opens.
+  - **Proven landed:** the post is retained uncredited and the round stays
+    held for manual reconciliation; no later start asks again.
+
+  A refused re-arm keeps the row, and each sweep tries again.
 - A replacement round is admitted only once every earlier round's review
   owner is proven ceased. Ledger disposal state is not proof.
   - **Durable record.** When the owning process's adapter reports a review

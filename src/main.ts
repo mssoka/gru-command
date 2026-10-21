@@ -399,6 +399,13 @@ async function main(): Promise<number> {
   // Lazy authoritative records preserve boot order; dispatch and fallback use
   // the same tested assignment and deliverable-selection wiring.
   const workflowAuthority = serviceWorkflowAuthority(config.dataDir, () => ledger, undefined, configPathFor(config.instanceDir));
+  // #464: review-owner markers carry this process's start identity, read
+  // once here, before anything can write one, so a failure is loud at boot.
+  if (thisProcessIdentity() === null) {
+    logger.log('warn', 'process start identity cannot be read; review-owner markers carry none, so a restart under the same pid cannot prove their host gone', {
+      pid: process.pid, platform: process.platform,
+    });
+  }
   const registry = new RuntimeRegistry(serviceRegistryOptions({
     config,
     store,
@@ -411,13 +418,6 @@ async function main(): Promise<number> {
     reviewOwnerCessation: ledgerReviewOwnerCessation(() => ledger),
   }));
   const growth = registry.boot();
-  // #464: review-owner markers carry this process's start identity. Read it
-  // now, so a failure is loud at boot, not inside a review setup.
-  if (thisProcessIdentity() === null) {
-    logger.log('warn', 'process start identity cannot be read; review-owner markers carry none, so a restart under the same pid cannot prove their host gone', {
-      pid: process.pid, platform: process.platform,
-    });
-  }
   state.store = store;
   state.registry = registry;
   logger.info('session store ready', {

@@ -48,7 +48,7 @@ describe('ledger db + migration runner', () => {
     upgraded.close();
   });
 
-  it('upgrades a v29 ledger keeping every lane process row, and admits the exited state (#464)', () => {
+  it('upgrades a v29 ledger keeping every lane process row, exiting those a sweep stranded, and admits the exited state (#464)', () => {
     const dir = tmpDir();
     const old = new LedgerDb(dir, { migrations: MIGRATIONS.slice(0, 29) });
     old.handle.prepare(`INSERT INTO worktrees (id, kind, repo_path, repo_name, path, branch, sha, status, created_at, updated_at)
@@ -56,16 +56,30 @@ describe('ledger db + migration runner', () => {
     const row = old.handle.prepare(`INSERT INTO worktree_processes (worktree_id, pid, command, evidence, state, first_seen, last_seen)
       VALUES ('wt', ?, ?, ?, ?, 't1', 't2')`);
     row.run(9619, 'node -e probe', 'argv', 'live');
+    row.run(9644, 'git ls-remote', 'argv', 'live');
     row.run(9645, 'ssh git@host', 'cwd', 'killed');
+    row.run(9700, 'npm test', 'registry', 'live');
+    old.handle.prepare(`INSERT INTO worktrees (id, kind, repo_path, repo_name, path, branch, sha, status, created_at, updated_at)
+      VALUES ('wt-active', 'job', '/r', 'r', '/r/active', 'b', 'abc', 'active', 't', 't')`).run();
+    old.handle.prepare(`INSERT INTO worktree_processes (worktree_id, pid, command, evidence, state, first_seen, last_seen)
+      VALUES ('wt-active', 8001, 'dev server', 'cwd', 'live', 't1', 't2')`).run();
     expect(() => row.run(1, 'x', 'argv', 'exited')).toThrow(/CHECK constraint/u);
     old.close();
     const upgraded = new LedgerDb(dir);
-    expect(upgraded.handle.prepare('SELECT pid, command, evidence, state, first_seen, last_seen FROM worktree_processes ORDER BY pid').all()).toEqual([
-      { pid: 9619, command: 'node -e probe', evidence: 'argv', state: 'live', first_seen: 't1', last_seen: 't2' },
-      { pid: 9645, command: 'ssh git@host', evidence: 'cwd', state: 'killed', first_seen: 't1', last_seen: 't2' },
+    // Rows a sweep left live under a swept tree exited with it, audited; the
+    // registry row stays with its own reconcile, an active tree's row stays.
+    expect(upgraded.handle.prepare('SELECT worktree_id, pid, command, evidence, state, first_seen, last_seen FROM worktree_processes ORDER BY pid').all()).toEqual([
+      { worktree_id: 'wt-active', pid: 8001, command: 'dev server', evidence: 'cwd', state: 'live', first_seen: 't1', last_seen: 't2' },
+      { worktree_id: 'wt', pid: 9619, command: 'node -e probe', evidence: 'argv', state: 'exited', first_seen: 't1', last_seen: 't2' },
+      { worktree_id: 'wt', pid: 9644, command: 'git ls-remote', evidence: 'argv', state: 'exited', first_seen: 't1', last_seen: 't2' },
+      { worktree_id: 'wt', pid: 9645, command: 'ssh git@host', evidence: 'cwd', state: 'killed', first_seen: 't1', last_seen: 't2' },
+      { worktree_id: 'wt', pid: 9700, command: 'npm test', evidence: 'registry', state: 'live', first_seen: 't1', last_seen: 't2' },
     ]);
-    upgraded.handle.prepare("UPDATE worktree_processes SET state = 'exited' WHERE pid = 9619").run();
-    expect(() => upgraded.handle.prepare("UPDATE worktree_processes SET state = 'gone' WHERE pid = 9619").run()).toThrow(/CHECK constraint/u);
+    const audited = upgraded.handle.prepare("SELECT ts, payload FROM events WHERE kind = 'worktree.processes-exited'").all() as { ts: string; payload: string }[];
+    expect(audited.map((event) => JSON.parse(event.payload) as unknown)).toEqual([{ id: 'wt', pids: [9619, 9644], reason: 'worktree-swept' }]);
+    expect(audited[0]!.ts).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u);
+    upgraded.handle.prepare("UPDATE worktree_processes SET state = 'exited' WHERE pid = 9700").run();
+    expect(() => upgraded.handle.prepare("UPDATE worktree_processes SET state = 'gone' WHERE pid = 9700").run()).toThrow(/CHECK constraint/u);
     expect(upgraded.handle.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_worktree_processes_wt'").get()).toBeDefined();
     expect(upgraded.handle.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
     upgraded.close();

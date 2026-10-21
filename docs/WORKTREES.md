@@ -85,15 +85,18 @@ A recorded process row leaves `live` in one of three ways (#464):
 - **`killed`**: a confirmed kill, or the verification scheduler's
   reconcile of its own `registry` rows;
 - **`exited`, `not-enumerated`**: a release's fresh enumeration no longer
-  finds the process rooted in the tree. This is the enumeration the sweep
-  itself trusts. The reaper keeps `registry` rows;
-- **`exited`, `worktree-swept`**: the tree reached `swept`, in the same
-  transaction.
+  finds the process rooted in the tree, and its pid is dead. A process
+  still alive keeps its row `live` until the tree is swept, because an
+  enumeration that could not read working directories cannot clear it;
+- **`exited`, `worktree-swept`**: the tree reached `swept`. Every
+  remaining row moves in the same transaction, except `registry` rows,
+  which their own reconcile owns.
 
-Each transition is audited as a `worktree.processes-exited` event naming
-the pids and the reason. `exited` is final. A later process that happens
-to reuse the pid never revives the row; a fresh enumeration still pauses
-the sweep on it, by its own evidence.
+Each move is audited as a `worktree.processes-exited` event naming the
+pids and the reason. Pid liveness never returns a row to `live`. Only a
+pause's fresh enumeration can: it found a process rooted in the tree
+again under that pid, so it is a lane process. Its `worktree.processes`
+event names those pids as `revived`.
 
 The orchestrator's OWN spawned services land there too: the verification
 scheduler records every run it spawns for a lane (pid + argv, evidence

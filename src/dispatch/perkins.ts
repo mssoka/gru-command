@@ -29,7 +29,7 @@ import {
 import type { AgentSpawner } from './service.js';
 import type { EventBus } from '../events/bus.js';
 import { validReviewOwnerGeneration, type ResidentReviewRound, type ReviewOwnerMarker } from '../runtime/registry.js';
-import { thisProcessIdentity, type ReviewHostExitInput, type ReviewHostExitResult } from '../runtime/review-host-exit.js';
+import { firstFive, thisProcessIdentity, type ReviewHostExitInput, type ReviewHostExitResult } from '../runtime/review-host-exit.js';
 import { settleRetries, type PacingGate, type PacingLease, type RateLimitBackoffPolicy, type RetrySettlement } from '../runtime/pacing.js';
 import { isExactOriginBranchSpelling } from '../worktrees/manager.js';
 import { loadWorktreeManifest } from '../worktrees/manifest.js';
@@ -2614,13 +2614,15 @@ export class WaveRunner {
       this.opts.ledger.latestRoundEvent(roundId, 'round.superseded') === null;
   }
 
-  /** A round a graceful shutdown cut during delivery, whose in-flight post
-   * is still unreconciled (#464). */
+  /** A restart's clean abort whose in-flight post the provider can still
+   * answer (#464): a delivery cut, or a startup recovery whose lookup failed.
+   * A post already proven present (or a rebinding left unresolved) stays
+   * held without asking again. */
   private deliveryCutUnreconciled(roundId: string): boolean {
     const incomplete = this.opts.ledger.latestRoundEvent(roundId, 'round.perkins-incomplete');
-    const payload = incomplete?.payload as { reason?: unknown; deliveryFailure?: unknown } | null | undefined;
-    return payload?.reason === 'service_restart' && payload.deliveryFailure !== undefined &&
-      pendingPublicationAttempt(this.opts.ledger, roundId) !== null;
+    const payload = incomplete?.payload as { reason?: unknown } | null | undefined;
+    return payload?.reason === 'service_restart' &&
+      pendingPublicationAttempt(this.opts.ledger, roundId)?.kind === 'unresolved-attempt';
   }
 
   /** Why an aborted signal cut this round: a supersession (in flight or
@@ -2707,8 +2709,7 @@ export class WaveRunner {
     });
     if (!proof.ok) return { ids: left, detail: ` (dead-host proof refused: ${proof.problem})` };
     const still = await unproven();
-    const named = still.slice(0, 5).map((id) => id === '' ? 'the unregistered owner' : id).join(', ') +
-      (still.length > 5 ? ` and ${String(still.length - 5)} more` : '');
+    const named = firstFive(still.map((id) => id === '' ? 'the unregistered owner' : id));
     return { ids: still, detail: still.length === 0 ? '' : ` (the dead-host proof is recorded, but this service's cessation check still refuses ${named}; the service is miswired: its dead-host proof and cessation check must come from one runtime registry)` };
   }
 
@@ -3609,7 +3610,7 @@ export class WaveRunner {
           } catch (error) {
             this.log('error', 'startup reconciliation of a delivery cut failed; its re-arm stays held', { round: round.id, error: String(error) });
             this.escalate(`Perkins publication for round ${round.id} could not be reconciled after restart`,
-              `${String(error)} — the clean-abort re-arm stays held until the next start reconciles it`, { jobId: job.id, roundId: round.id });
+              `${String(error)} — the clean-abort re-arm stays held until the next start reconciles it`, { jobId: round.jobId, roundId: round.id });
           }
           continue;
         }
@@ -7301,6 +7302,8 @@ export class WaveRunner {
           round: round.id, error: hostReportWriteFailed,
         });
       }
+      const deliveryFailure = verdict === null ? 'review_incomplete' : deliveryFailureKind;
+      const deliveryCut = signal.aborted && this.shutdownCut(round.id, signal);
       try {
         this.opts.ledger.appendCustomEvent({
           kind: 'round.perkins-incomplete',
@@ -7310,11 +7313,9 @@ export class WaveRunner {
             // A shutdown that cut delivery is the restart's clean abort
             // (#464); the pending-publication guard still holds a re-arm
             // until the in-flight post is reconciled.
-            reason: signal.aborted && this.shutdownCut(round.id, signal) ? 'service_restart'
-              : verdict === null ? 'review_incomplete' : deliveryFailureKind,
+            reason: deliveryCut ? 'service_restart' : deliveryFailure,
             // The delivery failure itself stays on record under a restart cut.
-            ...(signal.aborted && this.shutdownCut(round.id, signal)
-              ? { deliveryFailure: verdict === null ? 'review_incomplete' : deliveryFailureKind } : {}),
+            ...(deliveryCut ? { deliveryFailure } : {}),
             reportFile,
             executionFacts: executionFactsLine,
             ...(hostReportWriteFailed !== null ? { hostReportWriteFailed } : {}),

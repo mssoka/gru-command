@@ -209,10 +209,12 @@ writes each runtime's own record shape during a resumed turn.
       - macOS: `ps -o lstart` read in UTC.
 
       Other platforms get no identity. The service reads its own identity
-      at boot and warns when it cannot. Every marker this service writes
-      carries the identity, so a marker under this service's own pid with
-      another identity, or with none, was left by an earlier process. A
-      marker with no identity under a live pid of another process refuses;
+      once, at boot, and keeps that answer, warning when it cannot read
+      one. Every marker this service writes carries the identity it kept.
+      A marker under this service's own pid with another identity, or with
+      none, was therefore left by an earlier process. When the service has
+      no identity of its own, it treats every same-pid marker as its own. A
+      marker with no identity under another live process's pid refuses;
     - no live process is rooted (argv or cwd) in the round's review
       worktree;
     - no live process names one of the round's session ids, registered or
@@ -233,12 +235,15 @@ writes each runtime's own record shape during a resumed turn.
   `host-exit`), so it is never re-decided. The record keeps the evidence it
   checked and how the host was found gone (`dead`, `pid-reused` or
   `restarted`). For the last two it also keeps the two start identities it
-  compared. On pi, PID death answers first; the same proof clears a pi
-  owner whose pid is reused or under which this service restarted. The same proof clears a writer that is waiting on a
-  supersession a restart interrupted. A refusal names what is still alive
-  where there is a process, or the file to clear where there is one, for
-  example a lock file to remove once no process holds it. Every later review
-  request re-checks (`test/review-owner-cessation.test.ts`).
+  compared.
+
+  On pi, PID death answers first. When it cannot, because the pid is reused
+  or this service restarted under it, the dead-host proof clears the pi
+  owner too. A writer waiting on a supersession that a restart interrupted
+  is cleared by the same proof. A refusal names what is still alive where
+  there is a process, or the file to clear where there is one, for example a
+  lock file to remove once no process holds it. Every later review request
+  re-checks (`test/review-owner-cessation.test.ts`).
 
 ## Rollout of the default change
 

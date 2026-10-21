@@ -3152,18 +3152,19 @@ export class LedgerApi {
     }
     this.transaction(() => {
       const ts = nowIso();
-      const keptExited = input.processes.map((proc) => proc.pid).filter((pid) =>
-        this.db.prepare("SELECT 1 FROM worktree_processes WHERE worktree_id = ? AND pid = ? AND state = 'exited'").get(input.worktreeId, pid) !== undefined);
+      // #464: a row that exited returns to live only through a pause's fresh
+      // enumeration of a process rooted in the tree again (never by pid
+      // liveness), and the event says so.
+      const exited = this.db.prepare("SELECT 1 FROM worktree_processes WHERE worktree_id = ? AND pid = ? AND state = 'exited'");
+      const revived = input.state === 'live'
+        ? input.processes.map((proc) => proc.pid).filter((pid) => exited.get(input.worktreeId, pid) !== undefined) : [];
       const upsert = this.db.prepare(
         `INSERT INTO worktree_processes (worktree_id, pid, command, evidence, state, first_seen, last_seen)
          VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (worktree_id, pid) DO UPDATE SET
-           -- #464: an exited row is final; a later process under a recycled pid
-           -- never revives the row (its own fresh enumeration still pauses
-           -- a sweep).
-           state = CASE WHEN worktree_processes.state = 'exited' THEN 'exited' ELSE excluded.state END,
-           command = CASE WHEN worktree_processes.state = 'exited' THEN worktree_processes.command ELSE excluded.command END,
-           last_seen = CASE WHEN worktree_processes.state = 'exited' THEN worktree_processes.last_seen ELSE excluded.last_seen END`,
+           state = excluded.state,
+           command = excluded.command,
+           last_seen = excluded.last_seen`,
       );
       for (const proc of input.processes) {
         upsert.run(input.worktreeId, proc.pid, proc.command, proc.evidence, input.state, ts, ts);
@@ -3174,26 +3175,29 @@ export class LedgerApi {
           id: input.worktreeId,
           state: input.state,
           pids: input.processes.map((proc) => proc.pid),
-          ...(keptExited.length > 0 ? { kept_exited: keptExited } : {}),
+          ...(revived.length > 0 ? { revived } : {}),
         },
       });
     });
   }
 
-  /** #464: recorded `live` processes that left the tree on their own move
-   * to `exited` with one audited event: `not-enumerated` when a sweep's
-   * fresh enumeration no longer finds them rooted in it, `worktree-swept`
-   * when the tree is gone. Rows already out of `live` are untouched.
-   * Returns the pids moved. */
-  recordWorktreeProcessesExited(input: {
-    readonly worktreeId: string;
-    readonly pids: readonly number[] | 'all-live';
-    readonly reason: 'not-enumerated' | 'worktree-swept';
-  }): readonly number[] {
+  /** #464: recorded `live` processes that left the tree move to `exited`
+   * with one audited event:
+   * - `not-enumerated`: named pids a release's fresh enumeration no longer
+   *   finds rooted in the tree, and that are dead;
+   * - `worktree-swept`: every remaining live row of a swept tree, except the
+   *   `registry` rows their own reconcile owns.
+   * Rows already out of `live` are untouched. Returns the pids moved. */
+  recordWorktreeProcessesExited(input:
+    | { readonly worktreeId: string; readonly reason: 'not-enumerated'; readonly pids: readonly number[] }
+    | { readonly worktreeId: string; readonly reason: 'worktree-swept'; readonly pids: 'all-live' }): readonly number[] {
     return this.transaction(() => {
       const worktree = this.getWorktree(input.worktreeId);
       if (worktree === null) throw new RecordNotFound(`worktree "${input.worktreeId}" not found`);
-      const live = (this.db.prepare("SELECT pid FROM worktree_processes WHERE worktree_id = ? AND state = 'live' ORDER BY pid")
+      if (input.reason === 'worktree-swept' && worktree.status !== 'swept') {
+        throw new Error(`worktree "${input.worktreeId}" is ${worktree.status}, not swept: its processes are not proven gone`);
+      }
+      const live = (this.db.prepare("SELECT pid FROM worktree_processes WHERE worktree_id = ? AND state = 'live' AND evidence <> 'registry' ORDER BY pid")
         .all(input.worktreeId) as Row[]).map((row) => Number(row.pid));
       const wanted = input.pids === 'all-live' ? null : new Set(input.pids);
       const moved = live.filter((pid) => wanted === null || wanted.has(pid));
