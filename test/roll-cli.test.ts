@@ -202,6 +202,13 @@ describe('gru roll follow loop', () => {
     expect(parsed.ok && parsed.options.action).toBe('restart');
   });
 
+  it('gru restart refuses, non-zero, while another roll is in progress — it never attaches to it', async () => {
+    const h = await harness({ post: jsonResponse(409, { error: 'roll_in_progress', roll: rollState('drain') }) });
+    expect(await runServiceCli(['restart'], h.deps)).toBe(1);
+    expect(h.stderr.join('\n')).toContain('a roll is already in progress (update, drain)');
+    expect(h.requests.filter((url) => url.endsWith('/api/roll'))).toHaveLength(1);
+  });
+
   it('exits 0 only after /health reports the target build sha', async () => {
     const h = await harness({
       post: jsonResponse(202, { status: 'accepted', roll: rollState('preflight') }),

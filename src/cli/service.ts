@@ -357,6 +357,15 @@ export async function runServiceCli(
   if (res.status === 202) {
     state = body.roll ?? null;
     emit('accepted', state);
+  } else if (res.status === 409 && options.action === 'restart') {
+    // Attaching would follow someone else's roll (an update pulls and
+    // rebuilds); a restart asks for exactly one relaunch of the current build.
+    const busy = body.roll ?? null;
+    deps.stderr(
+      `gru: a roll is already in progress (${busy?.mode ?? 'update'}${busy === null ? '' : `, ${busy.phase}`}) — ` +
+        'it relaunches the service when it finishes; check with gru status, then restart again if you still need to',
+    );
+    return 1;
   } else if (res.status === 409) {
     state = body.roll ?? null;
     if (!options.json) deps.stdout('a roll is already in progress — attaching to it');
