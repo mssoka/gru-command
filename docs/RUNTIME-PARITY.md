@@ -188,6 +188,17 @@ writes each runtime's own record shape during a resumed turn.
 - **Directive content.** A Claude directive is text only (an image is refused
   by name): the CLI may transform an image, which would break the byte-exact
   echo admission binds.
+- **Background tasks in a directive turn (#471).** Claude Code replays a
+  background task's completion as a user frame it tags
+  `origin.kind: "task-notification"`. That frame is a runtime event, not a
+  prompt. It never admits a directive; a resumed session that replays a dead
+  turn's notifications first is still admitted only at its own echo. It never
+  counts as a second prompt either. Any other replayed user frame still does.
+  A directive turn also runs with `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`,
+  and a tool request asking for `run_in_background` is refused by name. The
+  reason: the CLI waits for a running task after the turn's result, then
+  answers its completion in an unprompted turn of its own, after the directive
+  is over and with no host left to decide its tools.
 - **A review owner from another process (#464).** A replacement Perkins round
   starts only once every earlier round's review owner is proven ceased. On
   both runtimes the proof is either this process's adapter evidence or the

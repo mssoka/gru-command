@@ -61,6 +61,8 @@ const DOUBLE = join(import.meta.dirname, 'helpers', 'claude-double.mjs');
 const DOUBLE_ENV_KEYS = [
   'CLAUDE_DOUBLE_ECHO',
   'CLAUDE_DOUBLE_TOOL_INPUT_DRIFT',
+  'CLAUDE_DOUBLE_TOOL_BACKGROUND',
+  'CLAUDE_DOUBLE_TASK_NOTIFICATION',
   'CLAUDE_DOUBLE_PERMISSION_MALFORMED',
   'CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL',
   'CLAUDE_DOUBLE_COMPACT_VERIFICATION',
@@ -160,6 +162,7 @@ function doubleInvocations(fx: Fixture): {
   images: number;
   sessionId: string;
   stdin: string;
+  backgroundTasks: string | null;
 }[] {
   if (!existsSync(fx.doubleLog)) return [];
   const records: {
@@ -169,6 +172,7 @@ function doubleInvocations(fx: Fixture): {
     images: number;
     sessionId: string;
     stdin: string;
+    backgroundTasks: string | null;
   }[] = [];
   for (const raw of readFileSync(fx.doubleLog, 'utf-8').split('\n')) {
     const line = raw.trim();
@@ -2802,6 +2806,95 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       expect(admitted).toEqual([]);
       expect(handle.inspectDirective!(identity)).toMatchObject({ state: 'unknown', reason: 'the native turn proceeded without an exact admission receipt' });
       await handle.dispose();
+    });
+
+    const allowed = (file: string): boolean => frames(file).some((frame) => frame['type'] === 'control_response' && JSON.stringify(frame).includes('"behavior":"allow"'));
+    const replays = (file: string): StreamFrame[] => frames(file).filter((frame) => frame['type'] === 'user' && frame['isReplay'] === true);
+    const originOf = (frame: StreamFrame): string => (frame['origin'] as { kind?: string } | undefined)?.kind ?? 'echo';
+
+    it('a background task\'s notification after the echo is the CLI\'s runtime event: the turn goes on, its tools work, and it completes (#471)', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const identity = identityFor('claude-notified');
+      const admitted: DirectiveNativeBinding[] = [];
+      process.env['CLAUDE_DOUBLE_TASK_NOTIFICATION'] = 'after-echo';
+      await handle.prompt('tool:Read follow it', { directive: { identity, beforeAdmission: () => {}, onAdmitted: (binding) => admitted.push(binding) } });
+      const file = handle.sessionFile!;
+      expect(replays(file).map(originOf)).toEqual(['echo', 'task-notification']);
+      expect(admitted).toEqual([expect.objectContaining({ userEntryId: replays(file)[0]!['uuid'] })]);
+      expect(allowed(file)).toBe(true);
+      const result = frames(file).find((frame) => frame['type'] === 'result')!;
+      expect(handle.inspectDirective!(identity)).toMatchObject({ state: 'terminal', ok: true, checkpointId: result['uuid'] });
+      expect(readDirectiveCompletion(file, identity, result['uuid'] as string)).not.toBeNull();
+      await handle.dispose();
+    });
+
+    it('a replayed prompt that is no task notification still fails the admitted turn: the guard keeps its purpose (#471)', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const identity = identityFor('claude-foreign-prompt');
+      process.env['CLAUDE_DOUBLE_TASK_NOTIFICATION'] = 'foreign';
+      await expect(handle.prompt('tool:Read follow it', { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } }))
+        .rejects.toThrow(/directive refused: a second prompt entered the directive turn/u);
+      expect(allowed(handle.sessionFile!)).toBe(false);
+      expect(handle.inspectDirective!(identity)).toMatchObject({ state: 'unknown' });
+      await handle.dispose();
+    });
+
+    it('a resumed session that replays a dead turn\'s task notifications first admits the directive only at its own echo (#471)', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      await handle.prompt('answer plainly'); // the next turn resumes this session
+      const identity = identityFor('claude-resumed-notified');
+      const admitted: DirectiveNativeBinding[] = [];
+      process.env['CLAUDE_DOUBLE_TASK_NOTIFICATION'] = 'before-echo';
+      await handle.prompt('tool:Read continue it', { directive: { identity, beforeAdmission: () => {}, onAdmitted: (binding) => admitted.push(binding) } });
+      expect(doubleInvocations(fx).at(-1)!.argv).toContain('--resume');
+      const file = handle.sessionFile!;
+      expect(replays(file).map(originOf)).toEqual(['task-notification', 'task-notification', 'echo']);
+      // The echo, never a notification, is the receipt; the tool after it is allowed.
+      expect(admitted).toEqual([expect.objectContaining({ userEntryId: replays(file)[2]!['uuid'] })]);
+      expect(allowed(file)).toBe(true);
+      expect(handle.inspectDirective!(identity)).toMatchObject({ state: 'terminal', ok: true });
+      await handle.dispose();
+    });
+
+    it('a tool asked after a resumed session\'s notification but before the directive\'s echo is refused, and the notification admits nothing (#471)', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      await handle.prompt('answer plainly');
+      const identity = identityFor('claude-early-tool');
+      const admitted: DirectiveNativeBinding[] = [];
+      process.env['CLAUDE_DOUBLE_TASK_NOTIFICATION'] = 'before-echo-tool';
+      await expect(handle.prompt('tool:Read continue it', { directive: { identity, beforeAdmission: () => {}, onAdmitted: (binding) => admitted.push(binding) } }))
+        .rejects.toThrow(/directive refused: native directive actual admission has not been published; tool effects refused/u);
+      expect(admitted).toEqual([]);
+      expect(allowed(handle.sessionFile!)).toBe(false);
+      expect(handle.inspectDirective!(identity)).toMatchObject({ state: 'unknown' });
+      await handle.dispose();
+    });
+
+    it('a directive turn cannot start a background task: its CLI runs with them disabled, and a tool asking for one is refused by name (#471)', async () => {
+      const fx = fixture();
+      const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+      const inherited = process.env['CLAUDE_CODE_DISABLE_BACKGROUND_TASKS'];
+      delete process.env['CLAUDE_CODE_DISABLE_BACKGROUND_TASKS'];
+      try {
+        await handle.prompt('answer plainly');
+        await handle.prompt('answer plainly too', { directive: { identity: identityFor('claude-no-background'), beforeAdmission: () => {}, onAdmitted: () => {} } });
+        // Only the directive turn's CLI gets the switch; an ordinary turn keeps the CLI's own default.
+        expect(doubleInvocations(fx).map((record) => record.backgroundTasks)).toEqual([null, '1']);
+        // A CLI that offers a background task anyway gets no effect from it.
+        process.env['CLAUDE_DOUBLE_TOOL_BACKGROUND'] = '1';
+        const identity = identityFor('claude-background-refused');
+        await expect(handle.prompt('tool:Bash run it', { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } }))
+          .rejects.toThrow(/directive refused: a directive turn cannot start a background task/u);
+        expect(readFileSync(`${handle.sessionFile!}.producers.jsonl`, 'utf-8')).toContain('"state":"guard-refused"');
+        expect(allowed(handle.sessionFile!)).toBe(false);
+      } finally {
+        if (inherited !== undefined) process.env['CLAUDE_CODE_DISABLE_BACKGROUND_TASKS'] = inherited;
+        await handle.dispose();
+      }
     });
 
     it('a directive is text only: an image, or no text, is refused before anything is bound', async () => {

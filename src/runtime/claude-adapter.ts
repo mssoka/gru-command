@@ -69,6 +69,7 @@ import {
   DirectiveCheckpointError,
   inspectDirectiveAdmission,
   inspectDirectiveCheckpoint,
+  isClaudeTaskNotification,
   prepareClaudeDirectiveBinding,
   prepareDirectiveProducer as prepareNativeDirectiveProducer,
   readDirectiveBinding,
@@ -82,7 +83,7 @@ import {
   type DirectiveProducer,
   type DirectiveTurnIdentity,
 } from './directive-checkpoint.js';
-import { ClaudeDirectivePermissionChannel, privateClaudeDirectiveSettings, type ClaudeToolDecision, type ClaudeToolRequest } from './claude-directive.js';
+import { CLAUDE_DIRECTIVE_ENV, ClaudeDirectivePermissionChannel, privateClaudeDirectiveSettings, type ClaudeToolDecision, type ClaudeToolRequest } from './claude-directive.js';
 import { resolveGitCommit } from '../dispatch/perkins-review/artifacts.js';
 import { CLAUDE_NATIVE_PROVIDER } from '../provider-recovery/classify.js';
 
@@ -1911,6 +1912,8 @@ export class ClaudeCodeHandle implements AgentHandle {
   private followDirectiveFrame(turn: DirectiveTurn, frame: StreamFrame, durable: Promise<void>, abortTurn: (detail: string) => void): void {
     const { directive, producer } = turn;
     if (frame['type'] === 'user' && frame['isReplay'] === true) {
+      // The CLI's own task notification is neither the echo nor a second prompt (#471).
+      if (isClaudeTaskNotification(frame, this.params.sessionId)) return;
       if (turn.admission !== null) {
         this.failDirective(turn, new DirectiveCheckpointError('a second prompt entered the directive turn'), abortTurn);
         return;
@@ -1958,6 +1961,10 @@ export class ClaudeCodeHandle implements AgentHandle {
       await turn.admission;
       if (turn.failure !== null || turn.admitted === null) {
         throw new DirectiveCheckpointError('native directive actual admission has not been published; tool effects refused');
+      }
+      // Background tasks are off in a directive turn (#471); a CLI that offers one anyway is refused by name.
+      if (request.input['run_in_background'] === true) {
+        throw new DirectiveCheckpointError('a directive turn cannot start a background task: its completion would outlive the turn');
       }
       turn.directive.beforeAdmission();
       if (readDirectiveBinding(this.sessionFile, turn.directive.identity.requestId)?.authorityManifest !== this.directiveAuthorityManifest()) {
@@ -2160,10 +2167,11 @@ export class ClaudeCodeHandle implements AgentHandle {
         // The CLI child is an independent physical controller of the turn:
         // only its observed close (at this handle's cessation) proves it gone.
         if (turn !== null) recordDirectiveIndependentController(turn.producer);
+        const env = turn === null ? params.reviewAuthEnv : { ...(params.reviewAuthEnv ?? process.env), ...CLAUDE_DIRECTIVE_ENV };
         child = (params.spawnProcess ?? spawn)(params.binary, args, {
           cwd: params.cwd,
           stdio: ['pipe', 'pipe', 'pipe'],
-          ...(params.reviewAuthEnv !== undefined ? { env: params.reviewAuthEnv } : {}),
+          ...(env !== undefined ? { env } : {}),
         });
       } catch (error) {
         // Synchronous spawn faults (async ENOENT arrives via 'error').

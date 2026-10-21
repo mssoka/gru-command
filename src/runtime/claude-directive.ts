@@ -22,6 +22,12 @@ export function privateClaudeDirectiveSettings(tools: readonly string[], verific
   return privateClaudeAskSettings(tools, verification, 'gru-directive-');
 }
 
+/** A directive turn's CLI environment (#471): no background tasks. The CLI
+ * waits for a running task after the turn's result and then answers its
+ * completion in an unprompted turn of its own, after the directive is over
+ * and with no host left to decide its tools. */
+export const CLAUDE_DIRECTIVE_ENV: Readonly<Record<string, string>> = { CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1' };
+
 export interface ClaudeToolRequest {
   readonly toolUseId: string;
   readonly toolName: string;
