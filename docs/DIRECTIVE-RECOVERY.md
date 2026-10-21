@@ -426,9 +426,10 @@ changes. A legacy marker's `/recover` refuses this kind with 400.
 The settlement proves admission, not completion: the later request may
 still be running or may end without delivery. Lane identity is the
 job's lane id, which is the job id, so "same lane" means the job's one
-live lane still exists and is the lane the retirement bound. Native
-admission itself requires that single live lane, its registered branch
-and a session started in its checkout, so a later admission ran there.
+live lane still exists under the id the retirement bound. Native
+admission itself requires the job's single live lane at that moment, its
+registered branch and a session started in its checkout; a lane swept and
+re-created under the same id between the two would not be told apart.
 A pre-revision (legacy) request has no known revision and cannot be
 reconciled; that refusal is deliberate.
 
@@ -441,15 +442,27 @@ worker starts and no work revision or current authority is required. An
 identical replay returns `idempotent: true` and appends nothing. There
 is no age policy: an orphan settles only through this explicit call.
 
+The retired request takes no new successor, so Gru starts the follow-up
+work itself as a fresh request (`POST /api/silas/directive` or
+`/api/silas/rebrief`) and reconciles once that request is admitted.
+
 A request retired **by** a `successor` or `rebrief-successor` decision
 has already used its debt's generation on that decision. If the named
 successor then ends without native admission (a positive no-effect
 failure, or its own retirement), it can never settle the debt. In the
-same transaction the ledger closes that debt as `superseded` and opens
-the next incarnation with a fresh generation. The new incarnation's next
-action names `reconcile-admitted`, and Gru settles it as above once a
-later request carrying the work is admitted. The old generation stays
-consumed: replaying any other decision for it is refused as a conflict.
+same transaction the ledger records `silas.directive-recovery-reopened`,
+closes that debt as `superseded` and opens the next incarnation with a
+fresh generation (still suspended if the old one was, or while the job
+is parked). The new incarnation's next action tells Gru to begin a fresh
+request carrying the work and then use `reconcile-admitted`; the old
+action-required card, which names the consumed generation, is resolved
+and the reopened debt is swept like any recovery debt. The old
+generation stays consumed: replaying any other decision for it is
+refused as a conflict. A chain is handled link by link: when Gru
+recovers a stuck successor B with C, retiring B reopens A's debt, C's
+admission settles B's debt directly, and Gru reconciles A against C.
+At boot the service reopens, once, any debt left stranded this way by a
+build that predates this behaviour (`reopenStrandedRecoveryDebts`).
 
 Historical `pending_rebriefs` retain their original markers and audit.
 Their old blind replay/fresh-session boot pipeline is removed. Spent

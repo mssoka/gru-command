@@ -253,7 +253,11 @@ approved follow-through>" }`; it takes the same fences as a successor.
 When the request is already retired and a later request carrying its work
 was actually admitted on the lane, settle the debt with `decision: { "kind":
 "reconcile-admitted", "admitted_request_id": "<that request>" }`; it starts
-no work and takes no `expected_work_revision` or contract SHA. Historical marker cards use the corresponding
+no work and takes no `expected_work_revision` or contract SHA. A retired
+request takes no new successor: when no later admitted request exists yet,
+begin one yourself through the normal directive or rebrief route, then
+reconcile. If a named successor ended without admission, the debt reopens
+at a new generation; read it again before you reconcile. Historical marker cards use the corresponding
 `/api/silas/rebriefs/<marker_id>` readback/recover route. A successor is
 accepted atomically with guarded retirement, and actual admission—not
 acceptance or retirement—settles the handoff debt. Generic Ops holds,

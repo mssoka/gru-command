@@ -2753,7 +2753,7 @@ describe('fresh-session successor and orphaned recovery debt (#470)', () => {
     seedJob(h, 'other-job');
     h.ledger.beginDirectiveIntent({ jobId: 'other-job', requestId: 'other-job-request', directive: 'other approved work', holder: 'gru' });
     admitNativeDirectiveFixture(h.ledger, 'other-job-request', 'other-job-minion', join(h.dir, 'native-sessions', 'other-job-minion.jsonl'));
-    await refuse('other-job-request', /not one/u);
+    await refuse('other-job-request', /belongs to job other-job, not rt-agencies-motion/u);
     const admitted = await rebrief('rebrief:rt-agencies-motion:rev3-fresh-session');
     expect(admitted).toMatchObject({ requestKind: 'rebrief', workRevision: 3 });
     // The defect: neither the retirement nor the later admission settled the debt.
