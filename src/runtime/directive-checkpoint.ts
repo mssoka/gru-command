@@ -618,11 +618,18 @@ function withClaudeTurn<T>(file: string, binding: DirectiveNativeBinding, inspec
         return inspect({ frame, echo: index, receipt: current['uuid'] });
       }
       // Before its own echo the turn may only announce itself.
-      if (type === 'assistant' || type === 'result' || type === 'control_request' || type === 'stream_event') {
+      if (type === 'result' || type === 'control_request' || claudeAnswerFrame(current)) {
         return refused('the native turn proceeded without an exact admission receipt');
       }
     }
   });
+}
+
+/** Model output — not the keepalive ping the CLI streams while a request
+ * stalls, which may precede its echo (#472). */
+export function claudeAnswerFrame(frame: Readonly<Record<string, unknown>>): boolean {
+  return frame['type'] === 'assistant' ||
+    frame['type'] === 'stream_event' && (frame['event'] as { type?: unknown } | undefined)?.type !== 'ping';
 }
 
 /** Publishes the read-back admission once the echo is durable. */
