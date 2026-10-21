@@ -4000,8 +4000,10 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(fixture.ledger.getRound(round.id)?.status).toBe('aborted');
     expect(fixture.ledger.latestRoundEvent(round.id, 'round.review-no-spawn')).toBeNull();
     // The round's own record names the refusal, not only the escalation.
-    expect((fixture.ledger.latestRoundEvent(round.id, 'round.parent-incident')?.payload as { note?: string } | undefined)?.note)
-      .toContain('cannot prove no review owner started');
+    const incidents = fixture.ledger.listEvents({ limit: 500 })
+      .filter((event) => event.kind === 'round.parent-incident' && event.roundId === round.id);
+    expect(incidents).toHaveLength(1);
+    expect((incidents[0]?.payload as { note?: string } | undefined)?.note).toContain('cannot prove no review owner started');
     expect(readFileSync(join(fixture.artifacts, round.id, 'perkins-report.md'), 'utf8')).toContain('**Parent incident**');
     expect(fixture.ledger.latestRoundEvent(round.id, 'round.perkins-incomplete')?.payload).toMatchObject({ reason });
     expect(escalations.filter((line) => line.startsWith(`Review round ${round.id} has no no-spawn proof after service restart`) &&
@@ -4014,6 +4016,63 @@ describe('WaveRunner built-in Perkins production path', () => {
     refuseNoSpawnProofAtStartup(true, 'service_restart'), 180_000);
   it('aborts a pending round whose no-spawn proof the ledger refuses like a live one, escalated (#466, no review lane)',
     refuseNoSpawnProofAtStartup(false, 'service_restart_missing_review_lane'), 180_000);
+
+  /** #466 fault fixtures: a pending round with a registered review lane (and
+   * optionally a duplicate owner marker the receipt refuses), plus a fresh
+   * restarted runner per call that records every escalation. */
+  const pendingRoundAtRestart = async (slug: string, duplicateMarker: boolean) => {
+    const fixture = integrityHarness(slug);
+    await fixture.prepare();
+    const round = fixture.ledger.addRound({ jobId: fixture.jobId, targetRef: fixture.target, lenses: ['blind'] });
+    if (duplicateMarker) {
+      for (const generation of ['12345678-1234-4234-8234-123456789abc', '87654321-4321-4321-8321-cba987654321']) {
+        fixture.ledger.appendCustomEvent({ kind: 'round.review-owner', jobId: fixture.jobId, roundId: round.id,
+          payload: { roundId: round.id, targetSha: fixture.target, runtimeId: 'pi', pid: process.pid, generation } });
+      }
+    }
+    await fixture.port.createReviewWorktree({ repoPath: fixture.repo.path, roundId: round.id, ref: fixture.target, jobId: fixture.jobId });
+    const escalations: string[] = [];
+    const restart = () => new WaveRunner({ ledger: fixture.ledger, worktrees: fixture.port, spawner: vi.fn() as unknown as AgentSpawner,
+      reviewArtifactRoot: fixture.artifacts, escalate: (title, detail) => escalations.push(`${title}: ${detail}`) });
+    const unprocessed = (line: string) => line.startsWith(`Review round ${round.id} could not be processed during startup recovery`);
+    return { fixture, round, escalations, restart, unprocessed };
+  };
+
+  it('leaves a pending round pending when its no-spawn abort hits a ledger fault, and receipts it on the next restart (#466)', async () => {
+    const { fixture, round, escalations, restart, unprocessed } = await pendingRoundAtRestart('perkins-no-spawn-fault', false);
+    // A busy ledger inside the receipt's transaction is a fault, not a refusal.
+    const busy = vi.spyOn(fixture.ledger, 'setRoundStatus').mockImplementationOnce(() => { throw new Error('database is locked'); });
+    expect(await restart().recoverInterruptedRounds()).toBe(0);
+    busy.mockRestore();
+    expect(fixture.ledger.getRound(round.id)?.status).toBe('pending');
+    expect(fixture.ledger.latestRoundEvent(round.id, 'round.review-no-spawn')).toBeNull();
+    expect(fixture.ledger.latestRoundEvent(round.id, 'round.parent-incident')).toBeNull();
+    expect(fixture.port.getWorktree(round.id)?.status).toBe('active');
+    expect(escalations.filter((line) => unprocessed(line) && line.includes('database is locked'))).toHaveLength(1);
+    expect(escalations.some((line) => line.includes('has no no-spawn proof'))).toBe(false);
+
+    expect(await restart().recoverInterruptedRounds()).toBe(1);
+    expect(fixture.ledger.getRound(round.id)?.status).toBe('aborted');
+    expect(fixture.ledger.uniqueRoundNoSpawnReceipt(round.id)).not.toBeNull();
+    expect(fixture.ledger.latestRoundEvent(round.id, 'round.parent-incident')).toBeNull();
+  }, 180_000);
+
+  it('escalates a refused no-spawn proof only once its live-round abort commits (#466)', async () => {
+    const { fixture, round, escalations, restart, unprocessed } = await pendingRoundAtRestart('perkins-refused-abort-fault', true);
+    // The refusal comes first; the fault hits the fallback abort's status write.
+    const busy = vi.spyOn(fixture.ledger, 'setRoundStatus').mockImplementationOnce(() => { throw new Error('database is locked'); });
+    expect(await restart().recoverInterruptedRounds()).toBe(0);
+    busy.mockRestore();
+    expect(fixture.ledger.getRound(round.id)?.status).toBe('pending');
+    expect(escalations.filter(unprocessed)).toHaveLength(1);
+    expect(escalations.some((line) => line.includes('has no no-spawn proof'))).toBe(false);
+
+    expect(await restart().recoverInterruptedRounds()).toBe(1);
+    expect(fixture.ledger.getRound(round.id)?.status).toBe('aborted');
+    expect(fixture.ledger.listEvents({ limit: 500 })
+      .filter((event) => event.kind === 'round.parent-incident' && event.roundId === round.id)).toHaveLength(1);
+    expect(escalations.filter((line) => line.includes('has no no-spawn proof'))).toHaveLength(1);
+  }, 180_000);
 
   it('blocks an unreceipted legacy freeze with unknown ownership and retains same-head charged starts', async () => {
     const fixture = integrityHarness('perkins-legacy-freeze');

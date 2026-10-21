@@ -3614,7 +3614,7 @@ export class WaveRunner {
       this.abortRound(round, `${note}; ${error.message}`);
       this.escalate(
         `Review round ${round.id} has no no-spawn proof after service restart`,
-        `${error.message} — it was aborted as a round that went live; a replacement review is admitted only once its ownership is proven`,
+        `${error.message} — it was aborted the way a live round is (a parent incident, no receipt); a replacement review is admitted only once its ownership is proven — inspect the round's round.review-owner and round.review-no-spawn events and its agents in <data_dir>/ledger/ledger.db`,
         { jobId: round.jobId, roundId: round.id },
       );
     }
